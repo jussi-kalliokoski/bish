@@ -56,6 +56,7 @@ pub enum Command {
 #[derive(Debug, Clone)]
 pub struct Pipeline {
     pub commands: Vec<Command>,
+    pub negate: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -193,13 +194,23 @@ impl Parser {
     }
 
     fn parse_pipeline(&mut self) -> Result<Pipeline, String> {
+        let negate = if let Some(Tok::Word(chunks)) = self.peek() {
+            if matches!(chunks.as_slice(), [Chunk::Str(s)] if s == "!") {
+                self.advance();
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
         let mut commands = vec![self.parse_command()?];
         while matches!(self.peek(), Some(Tok::Pipe)) {
             self.advance();
             self.skip_newlines();
             commands.push(self.parse_command()?);
         }
-        Ok(Pipeline { commands })
+        Ok(Pipeline { commands, negate })
     }
 
     fn parse_command(&mut self) -> Result<Command, String> {

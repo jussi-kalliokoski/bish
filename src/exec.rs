@@ -73,6 +73,17 @@ impl Shell {
     }
 
     fn run_pipeline(&mut self, pipeline: &Pipeline, background: bool) -> ExecResult {
+        let result = self.run_pipeline_inner(pipeline, background);
+        if pipeline.negate {
+            return match result {
+                ExecResult::Status(s) => ExecResult::Status(if s == 0 { 1 } else { 0 }),
+                signal => signal,
+            };
+        }
+        result
+    }
+
+    fn run_pipeline_inner(&mut self, pipeline: &Pipeline, background: bool) -> ExecResult {
         if pipeline.commands.len() == 1 {
             return self.run_command(&pipeline.commands[0], background);
         }
@@ -93,7 +104,7 @@ impl Shell {
 
     fn run_command(&mut self, cmd: &parser::Command, background: bool) -> ExecResult {
         match cmd {
-            parser::Command::Simple(sc) => ExecResult::Status(self.run_single(sc, background)),
+            parser::Command::Simple(sc) => self.run_single(sc, background),
             parser::Command::If { branches, else_branch, .. } => self.run_if(branches, else_branch),
             parser::Command::While { cond, body, until, .. } => self.run_while(cond, body, *until),
             parser::Command::For { var, words, body, .. } => {
@@ -189,7 +200,7 @@ impl Shell {
         ExecResult::Status(0)
     }
 
-    fn run_single(&mut self, cmd: &SimpleCommand, background: bool) -> i32 {
+    fn run_single(&mut self, cmd: &SimpleCommand, background: bool) -> ExecResult {
         if cmd.words.is_empty() {
             for (name, val) in &cmd.assigns {
                 let v = self.expand_word(val);
@@ -201,7 +212,7 @@ impl Shell {
                 // side effect only: create/truncate/append the target files
                 let _ = self.resolve_redirects(cmd);
             }
-            return 0;
+            return ExecResult::Status(0);
         }
 
         let argv: Vec<String> = cmd.words.iter().map(|w| self.expand_word(w)).collect();
@@ -210,8 +221,22 @@ impl Shell {
         // Builtins ignore per-command redirects for now: their output goes
         // straight to the shell's own stdio.
         match name.as_str() {
-            "cd" => return builtins::cd(&argv[1..]),
-            "export" => return builtins::export(&argv[1..]),
+            "cd" => return ExecResult::Status(builtins::cd(&argv[1..])),
+            "export" => return ExecResult::Status(builtins::export(&argv[1..])),
+            "break" => return builtins::break_loop(&argv[1..]),
+            "continue" => return builtins::continue_loop(&argv[1..]),
+            "test" => return ExecResult::Status(builtins::test(&argv[1..])),
+            "[" | "[[" => {
+                let closer = if name == "[" { "]" } else { "]]" };
+                let mut a = argv[1..].to_vec();
+                if a.last().map(|s| s.as_str()) == Some(closer) {
+                    a.pop();
+                } else {
+                    eprintln!("ash: {}: missing closing {}", name, closer);
+                    return ExecResult::Status(2);
+                }
+                return ExecResult::Status(builtins::test(&a));
+            }
             "exit" => {
                 let code = argv
                     .get(1)
@@ -226,7 +251,7 @@ impl Shell {
             Ok(r) => r,
             Err(e) => {
                 eprintln!("ash: {}", e);
-                return 1;
+                return ExecResult::Status(1);
             }
         };
 
@@ -245,20 +270,20 @@ impl Shell {
                     std::thread::spawn(move || {
                         let _ = child.wait();
                     });
-                    0
+                    ExecResult::Status(0)
                 } else {
                     match child.wait() {
-                        Ok(status) => status.code().unwrap_or(1),
+                        Ok(status) => ExecResult::Status(status.code().unwrap_or(1)),
                         Err(e) => {
                             eprintln!("ash: {}", e);
-                            1
+                            ExecResult::Status(1)
                         }
                     }
                 }
             }
             Err(e) => {
                 eprintln!("ash: {}: {}", name, e);
-                127
+                ExecResult::Status(127)
             }
         }
     }
