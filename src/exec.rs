@@ -2,7 +2,29 @@ use std::process::{Command, Stdio};
 
 use crate::builtins;
 use crate::lexer::Chunk;
-use crate::parser::{AndOr, Combinator, Pipeline, Program, Redirect, Sep, SimpleCommand, Word};
+use crate::parser::{
+    self, AndOr, Combinator, Pipeline, Program, Redirect, Sep, SimpleCommand, Word,
+};
+
+#[derive(Debug, Clone, Copy)]
+pub enum ExecResult {
+    Status(i32),
+    Break(u32),
+    Continue(u32),
+}
+
+impl ExecResult {
+    fn status(self) -> i32 {
+        match self {
+            ExecResult::Status(s) => s,
+            ExecResult::Break(_) | ExecResult::Continue(_) => 0,
+        }
+    }
+
+    fn is_signal(self) -> bool {
+        matches!(self, ExecResult::Break(_) | ExecResult::Continue(_))
+    }
+}
 
 pub struct Shell {
     pub last_status: i32,
@@ -13,32 +35,158 @@ impl Shell {
         Shell { last_status: 0 }
     }
 
-    pub fn run_program(&mut self, prog: &Program) {
+    pub fn run_program(&mut self, prog: &Program) -> ExecResult {
+        let mut result = ExecResult::Status(self.last_status);
         for item in prog {
             let background = matches!(item.sep, Sep::Background);
-            self.run_and_or(&item.and_or, background);
+            result = self.run_and_or(&item.and_or, background);
+            self.last_status = result.status();
+            if result.is_signal() {
+                return result;
+            }
         }
+        result
     }
 
-    fn run_and_or(&mut self, and_or: &AndOr, background: bool) {
-        let mut status = self.run_pipeline(&and_or.first, background);
+    fn run_and_or(&mut self, and_or: &AndOr, background: bool) -> ExecResult {
+        let mut result = self.run_pipeline(&and_or.first, background);
+        self.last_status = result.status();
+        if result.is_signal() {
+            return result;
+        }
+        let mut status = result.status();
         for (comb, pipeline) in &and_or.rest {
             let should_run = match comb {
                 Combinator::And => status == 0,
                 Combinator::Or => status != 0,
             };
             if should_run {
-                status = self.run_pipeline(pipeline, background);
+                result = self.run_pipeline(pipeline, background);
+                self.last_status = result.status();
+                if result.is_signal() {
+                    return result;
+                }
+                status = result.status();
             }
         }
-        self.last_status = status;
+        ExecResult::Status(status)
     }
 
-    fn run_pipeline(&mut self, pipeline: &Pipeline, background: bool) -> i32 {
+    fn run_pipeline(&mut self, pipeline: &Pipeline, background: bool) -> ExecResult {
         if pipeline.commands.len() == 1 {
-            return self.run_single(&pipeline.commands[0], background);
+            return self.run_command(&pipeline.commands[0], background);
         }
-        self.run_multi(pipeline, background)
+        if pipeline.commands.iter().any(|c| !matches!(c, parser::Command::Simple(_))) {
+            eprintln!("ash: piping compound commands is not supported yet");
+            return ExecResult::Status(1);
+        }
+        let simples: Vec<SimpleCommand> = pipeline
+            .commands
+            .iter()
+            .map(|c| match c {
+                parser::Command::Simple(sc) => sc.clone(),
+                _ => unreachable!(),
+            })
+            .collect();
+        ExecResult::Status(self.run_multi(&simples, background))
+    }
+
+    fn run_command(&mut self, cmd: &parser::Command, background: bool) -> ExecResult {
+        match cmd {
+            parser::Command::Simple(sc) => ExecResult::Status(self.run_single(sc, background)),
+            parser::Command::If { branches, else_branch, .. } => self.run_if(branches, else_branch),
+            parser::Command::While { cond, body, until, .. } => self.run_while(cond, body, *until),
+            parser::Command::For { var, words, body, .. } => {
+                let var = var.clone();
+                let words = words.clone();
+                self.run_for(&var, &words, body)
+            }
+            parser::Command::Case { word, arms, .. } => self.run_case(word, arms),
+            parser::Command::Group(prog, _redirects) => self.run_program(prog),
+        }
+    }
+
+    fn run_if(&mut self, branches: &[(Program, Program)], else_branch: &Option<Program>) -> ExecResult {
+        for (cond, body) in branches {
+            let cond_result = self.run_program(cond);
+            if cond_result.is_signal() {
+                return cond_result;
+            }
+            if cond_result.status() == 0 {
+                return self.run_program(body);
+            }
+        }
+        if let Some(else_body) = else_branch {
+            return self.run_program(else_body);
+        }
+        ExecResult::Status(0)
+    }
+
+    fn run_while(&mut self, cond: &Program, body: &Program, until: bool) -> ExecResult {
+        loop {
+            let cond_result = self.run_program(cond);
+            if cond_result.is_signal() {
+                return cond_result;
+            }
+            let keep_going = if until { cond_result.status() != 0 } else { cond_result.status() == 0 };
+            if !keep_going {
+                break;
+            }
+            match self.run_program(body) {
+                ExecResult::Break(n) => {
+                    if n > 1 {
+                        return ExecResult::Break(n - 1);
+                    }
+                    break;
+                }
+                ExecResult::Continue(n) => {
+                    if n > 1 {
+                        return ExecResult::Continue(n - 1);
+                    }
+                    continue;
+                }
+                ExecResult::Status(s) => self.last_status = s,
+            }
+        }
+        ExecResult::Status(self.last_status)
+    }
+
+    fn run_for(&mut self, var: &str, words: &[Word], body: &Program) -> ExecResult {
+        for w in words {
+            let val = self.expand_word(w);
+            unsafe {
+                std::env::set_var(var, val);
+            }
+            match self.run_program(body) {
+                ExecResult::Break(n) => {
+                    if n > 1 {
+                        return ExecResult::Break(n - 1);
+                    }
+                    break;
+                }
+                ExecResult::Continue(n) => {
+                    if n > 1 {
+                        return ExecResult::Continue(n - 1);
+                    }
+                    continue;
+                }
+                ExecResult::Status(s) => self.last_status = s,
+            }
+        }
+        ExecResult::Status(self.last_status)
+    }
+
+    fn run_case(&mut self, word: &Word, arms: &[(Vec<Word>, Program)]) -> ExecResult {
+        let val = self.expand_word(word);
+        for (patterns, body) in arms {
+            for p in patterns {
+                let pat = self.expand_word(p);
+                if pat == "*" || pat == val {
+                    return self.run_program(body);
+                }
+            }
+        }
+        ExecResult::Status(0)
     }
 
     fn run_single(&mut self, cmd: &SimpleCommand, background: bool) -> i32 {
@@ -115,12 +263,12 @@ impl Shell {
         }
     }
 
-    fn run_multi(&mut self, pipeline: &Pipeline, background: bool) -> i32 {
-        let n = pipeline.commands.len();
+    fn run_multi(&mut self, commands: &[SimpleCommand], background: bool) -> i32 {
+        let n = commands.len();
         let mut children: Vec<std::process::Child> = Vec::with_capacity(n);
         let mut prev_stdout: Option<Stdio> = None;
 
-        for (i, cmd) in pipeline.commands.iter().enumerate() {
+        for (i, cmd) in commands.iter().enumerate() {
             if cmd.words.is_empty() {
                 eprintln!("ash: syntax error in pipeline");
                 kill_all(children);

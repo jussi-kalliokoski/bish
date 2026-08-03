@@ -23,7 +23,9 @@ pub fn run(shell: &mut Shell) {
                 }
                 match Lexer::new(trimmed).tokenize() {
                     Ok(toks) => match Parser::new(toks).parse_program() {
-                        Ok(prog) => shell.run_program(&prog),
+                        Ok(prog) => {
+                            shell.run_program(&prog);
+                        }
                         Err(e) => eprintln!("ash: syntax error: {}", e),
                     },
                     Err(e) => eprintln!("ash: syntax error: {}", e),

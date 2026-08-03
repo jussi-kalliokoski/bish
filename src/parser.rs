@@ -21,9 +21,41 @@ pub struct SimpleCommand {
     pub redirects: Vec<Redirect>,
 }
 
+// Compound commands carry their own trailing redirects (e.g. `done < file`,
+// `{ ...; } > file`), parsed right after the closing keyword/brace. Not yet
+// applied at exec time (see exec.rs) -- parsed now so the grammar is right
+// and wiring it up later doesn't require another parser pass.
+#[derive(Debug, Clone)]
+pub enum Command {
+    Simple(SimpleCommand),
+    If {
+        branches: Vec<(Program, Program)>,
+        else_branch: Option<Program>,
+        redirects: Vec<Redirect>,
+    },
+    While {
+        cond: Program,
+        body: Program,
+        until: bool,
+        redirects: Vec<Redirect>,
+    },
+    For {
+        var: String,
+        words: Vec<Word>,
+        body: Program,
+        redirects: Vec<Redirect>,
+    },
+    Case {
+        word: Word,
+        arms: Vec<(Vec<Word>, Program)>,
+        redirects: Vec<Redirect>,
+    },
+    Group(Program, Vec<Redirect>),
+}
+
 #[derive(Debug, Clone)]
 pub struct Pipeline {
-    pub commands: Vec<SimpleCommand>,
+    pub commands: Vec<Command>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -74,10 +106,41 @@ impl Parser {
         t
     }
 
+    fn expect(&mut self, want: Tok) -> Result<(), String> {
+        match self.advance() {
+            Some(t) if t == want => Ok(()),
+            other => Err(format!("expected {:?}, got {:?}", want, other)),
+        }
+    }
+
+    fn at_any(&self, stops: &[Tok]) -> bool {
+        match self.peek() {
+            Some(t) => stops.contains(t),
+            None => false,
+        }
+    }
+
     pub fn parse_program(&mut self) -> Result<Program, String> {
+        let prog = self.parse_list_until(&[])?;
+        if let Some(other) = self.peek() {
+            return Err(format!("unexpected token: {:?}", other));
+        }
+        Ok(prog)
+    }
+
+    // Parses a list of ListItems until the next token (after skipping
+    // separators) matches one of `stops`, or (if `stops` is empty) until
+    // end of input. Does not consume the stop token.
+    fn parse_list_until(&mut self, stops: &[Tok]) -> Result<Program, String> {
         let mut items = Vec::new();
         self.skip_terminators();
-        while self.peek().is_some() {
+        while !self.at_any(stops) {
+            if self.peek().is_none() {
+                if stops.is_empty() {
+                    break;
+                }
+                return Err(format!("unexpected end of input, expected one of {:?}", stops));
+            }
             let and_or = self.parse_and_or()?;
             let sep = match self.peek() {
                 Some(Tok::Amp) => {
@@ -88,8 +151,7 @@ impl Parser {
                     self.advance();
                     Sep::Seq
                 }
-                None => Sep::Seq,
-                Some(other) => return Err(format!("unexpected token: {:?}", other)),
+                _ => Sep::Seq,
             };
             items.push(ListItem { and_or, sep });
             self.skip_terminators();
@@ -131,13 +193,174 @@ impl Parser {
     }
 
     fn parse_pipeline(&mut self) -> Result<Pipeline, String> {
-        let mut commands = vec![self.parse_simple_command()?];
+        let mut commands = vec![self.parse_command()?];
         while matches!(self.peek(), Some(Tok::Pipe)) {
             self.advance();
             self.skip_newlines();
-            commands.push(self.parse_simple_command()?);
+            commands.push(self.parse_command()?);
         }
         Ok(Pipeline { commands })
+    }
+
+    fn parse_command(&mut self) -> Result<Command, String> {
+        match self.peek() {
+            Some(Tok::KwIf) => self.parse_if(),
+            Some(Tok::KwWhile) => self.parse_while(false),
+            Some(Tok::KwUntil) => self.parse_while(true),
+            Some(Tok::KwFor) => self.parse_for(),
+            Some(Tok::KwCase) => self.parse_case(),
+            Some(Tok::LBrace) => self.parse_group(),
+            _ => Ok(Command::Simple(self.parse_simple_command()?)),
+        }
+    }
+
+    fn parse_if(&mut self) -> Result<Command, String> {
+        self.advance(); // KwIf
+        let mut branches = Vec::new();
+
+        let cond = self.parse_list_until(&[Tok::KwThen])?;
+        self.expect(Tok::KwThen)?;
+        let body = self.parse_list_until(&[Tok::KwElif, Tok::KwElse, Tok::KwFi])?;
+        branches.push((cond, body));
+
+        loop {
+            match self.peek() {
+                Some(Tok::KwElif) => {
+                    self.advance();
+                    let c = self.parse_list_until(&[Tok::KwThen])?;
+                    self.expect(Tok::KwThen)?;
+                    let b = self.parse_list_until(&[Tok::KwElif, Tok::KwElse, Tok::KwFi])?;
+                    branches.push((c, b));
+                }
+                Some(Tok::KwElse) => {
+                    self.advance();
+                    let else_body = self.parse_list_until(&[Tok::KwFi])?;
+                    self.expect(Tok::KwFi)?;
+                    let redirects = self.parse_trailing_redirects()?;
+                    return Ok(Command::If { branches, else_branch: Some(else_body), redirects });
+                }
+                Some(Tok::KwFi) => {
+                    self.advance();
+                    let redirects = self.parse_trailing_redirects()?;
+                    return Ok(Command::If { branches, else_branch: None, redirects });
+                }
+                other => return Err(format!("expected elif/else/fi, got {:?}", other)),
+            }
+        }
+    }
+
+    fn parse_while(&mut self, until: bool) -> Result<Command, String> {
+        self.advance(); // KwWhile / KwUntil
+        let cond = self.parse_list_until(&[Tok::KwDo])?;
+        self.expect(Tok::KwDo)?;
+        let body = self.parse_list_until(&[Tok::KwDone])?;
+        self.expect(Tok::KwDone)?;
+        let redirects = self.parse_trailing_redirects()?;
+        Ok(Command::While { cond, body, until, redirects })
+    }
+
+    fn parse_for(&mut self) -> Result<Command, String> {
+        self.advance(); // KwFor
+        let var = match self.advance() {
+            Some(Tok::Word(chunks)) => word_to_plain_name(&chunks)
+                .ok_or_else(|| "expected a plain variable name after 'for'".to_string())?,
+            other => return Err(format!("expected variable name after 'for', got {:?}", other)),
+        };
+        self.skip_terminators();
+
+        let mut words = Vec::new();
+        if matches!(self.peek(), Some(Tok::KwIn)) {
+            self.advance();
+            while let Some(Tok::Word(_)) = self.peek() {
+                if let Some(Tok::Word(chunks)) = self.advance() {
+                    words.push(Word { chunks });
+                }
+            }
+            if matches!(self.peek(), Some(Tok::Semi) | Some(Tok::Newline)) {
+                self.advance();
+            }
+        }
+        // No "in ...": bash iterates "$@" here. Positional params land in
+        // M3; until then this is an empty (zero-iteration) loop.
+        self.skip_terminators();
+        self.expect(Tok::KwDo)?;
+        let body = self.parse_list_until(&[Tok::KwDone])?;
+        self.expect(Tok::KwDone)?;
+        let redirects = self.parse_trailing_redirects()?;
+        Ok(Command::For { var, words, body, redirects })
+    }
+
+    fn parse_case(&mut self) -> Result<Command, String> {
+        self.advance(); // KwCase
+        let word = self.expect_word()?;
+        self.skip_terminators();
+        self.expect(Tok::KwIn)?;
+        self.skip_terminators();
+
+        let mut arms = Vec::new();
+        while !matches!(self.peek(), Some(Tok::KwEsac)) {
+            let mut patterns = vec![self.expect_word()?];
+            while matches!(self.peek(), Some(Tok::Pipe)) {
+                self.advance();
+                patterns.push(self.expect_word()?);
+            }
+            self.expect(Tok::RParen)?;
+            self.skip_terminators();
+            let body = self.parse_list_until(&[Tok::DSemi, Tok::KwEsac])?;
+            if matches!(self.peek(), Some(Tok::DSemi)) {
+                self.advance();
+            }
+            self.skip_terminators();
+            arms.push((patterns, body));
+        }
+        self.expect(Tok::KwEsac)?;
+        let redirects = self.parse_trailing_redirects()?;
+        Ok(Command::Case { word, arms, redirects })
+    }
+
+    fn parse_group(&mut self) -> Result<Command, String> {
+        self.advance(); // LBrace
+        let body = self.parse_list_until(&[Tok::RBrace])?;
+        self.expect(Tok::RBrace)?;
+        let redirects = self.parse_trailing_redirects()?;
+        Ok(Command::Group(body, redirects))
+    }
+
+    fn parse_trailing_redirects(&mut self) -> Result<Vec<Redirect>, String> {
+        let mut redirects = Vec::new();
+        loop {
+            match self.peek() {
+                Some(Tok::RedirOut { append }) => {
+                    let append = *append;
+                    self.advance();
+                    let word = self.expect_word()?;
+                    redirects.push(Redirect::Out { word, append });
+                }
+                Some(Tok::RedirIn) => {
+                    self.advance();
+                    let word = self.expect_word()?;
+                    redirects.push(Redirect::In(word));
+                }
+                Some(Tok::RedirErr { append }) => {
+                    let append = *append;
+                    self.advance();
+                    let word = self.expect_word()?;
+                    redirects.push(Redirect::Err { word, append });
+                }
+                Some(Tok::RedirBoth { append }) => {
+                    let append = *append;
+                    self.advance();
+                    let word = self.expect_word()?;
+                    redirects.push(Redirect::Both { word, append });
+                }
+                Some(Tok::DupErrToOut) => {
+                    self.advance();
+                    redirects.push(Redirect::DupErrToOut);
+                }
+                _ => break,
+            }
+        }
+        Ok(redirects)
     }
 
     fn parse_simple_command(&mut self) -> Result<SimpleCommand, String> {
@@ -217,6 +440,15 @@ fn word_as_assignment(w: &Word) -> Option<(String, Word)> {
             let mut rest_chunks = vec![Chunk::Str(s[eq + 1..].to_string())];
             rest_chunks.extend(w.chunks[1..].iter().cloned());
             return Some((name.to_string(), Word { chunks: rest_chunks }));
+        }
+    }
+    None
+}
+
+fn word_to_plain_name(chunks: &[Chunk]) -> Option<String> {
+    if let [Chunk::Str(s)] = chunks {
+        if is_valid_ident(s) {
+            return Some(s.clone());
         }
     }
     None

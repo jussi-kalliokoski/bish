@@ -15,6 +15,7 @@ pub enum Tok {
     And,
     Or,
     Semi,
+    DSemi,
     Amp,
     RedirOut { append: bool },
     RedirIn,
@@ -22,6 +23,43 @@ pub enum Tok {
     RedirBoth { append: bool },
     DupErrToOut,
     Newline,
+    LBrace,
+    RBrace,
+    RParen,
+    KwIf,
+    KwThen,
+    KwElif,
+    KwElse,
+    KwFi,
+    KwWhile,
+    KwUntil,
+    KwDo,
+    KwDone,
+    KwFor,
+    KwIn,
+    KwCase,
+    KwEsac,
+    KwFunction,
+}
+
+fn keyword(s: &str) -> Option<Tok> {
+    Some(match s {
+        "if" => Tok::KwIf,
+        "then" => Tok::KwThen,
+        "elif" => Tok::KwElif,
+        "else" => Tok::KwElse,
+        "fi" => Tok::KwFi,
+        "while" => Tok::KwWhile,
+        "until" => Tok::KwUntil,
+        "do" => Tok::KwDo,
+        "done" => Tok::KwDone,
+        "for" => Tok::KwFor,
+        "in" => Tok::KwIn,
+        "case" => Tok::KwCase,
+        "esac" => Tok::KwEsac,
+        "function" => Tok::KwFunction,
+        _ => return None,
+    })
 }
 
 pub struct Lexer<'a> {
@@ -78,7 +116,24 @@ impl<'a> Lexer<'a> {
                 }
                 Some(';') => {
                     self.chars.next();
-                    toks.push(Tok::Semi);
+                    if self.chars.peek().copied() == Some(';') {
+                        self.chars.next();
+                        toks.push(Tok::DSemi);
+                    } else {
+                        toks.push(Tok::Semi);
+                    }
+                }
+                Some(')') => {
+                    self.chars.next();
+                    toks.push(Tok::RParen);
+                }
+                Some('{') if self.next_char_is_word_boundary() => {
+                    self.chars.next();
+                    toks.push(Tok::LBrace);
+                }
+                Some('}') if self.next_char_is_word_boundary() => {
+                    self.chars.next();
+                    toks.push(Tok::RBrace);
                 }
                 Some('>') => {
                     self.chars.next();
@@ -109,6 +164,12 @@ impl<'a> Lexer<'a> {
                 }
                 _ => {
                     let word = self.read_word()?;
+                    if let [Chunk::Str(s)] = word.as_slice() {
+                        if let Some(kw) = keyword(s) {
+                            toks.push(kw);
+                            continue;
+                        }
+                    }
                     toks.push(Tok::Word(word));
                 }
             }
@@ -130,6 +191,15 @@ impl<'a> Lexer<'a> {
         it.next()
     }
 
+    fn next_char_is_word_boundary(&self) -> bool {
+        let mut it = self.chars.clone();
+        it.next(); // the brace itself
+        match it.next() {
+            None => true,
+            Some(c) => c == ' ' || c == '\t' || c == '\n' || c == ';' || c == '|' || c == '&' || c == ')',
+        }
+    }
+
     fn skip_spaces(&mut self) {
         while let Some(c) = self.chars.peek().copied() {
             if c == ' ' || c == '\t' {
@@ -148,7 +218,7 @@ impl<'a> Lexer<'a> {
             match self.chars.peek().copied() {
                 None => break,
                 Some(c) if c == ' ' || c == '\t' || c == '\n' => break,
-                Some('|') | Some('&') | Some(';') | Some('<') | Some('>') | Some('#') => break,
+                Some('|') | Some('&') | Some(';') | Some('<') | Some('>') | Some('#') | Some(')') => break,
                 Some('\'') => {
                     self.chars.next();
                     loop {
