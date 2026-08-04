@@ -130,10 +130,21 @@ fn serialize_word(w: &Word) -> String {
 fn serialize_chunk(c: &Chunk) -> String {
     match c {
         Chunk::Str(s) => quote_literal(s),
-        Chunk::Var(name) => format!("${{{}}}", name),
-        Chunk::Sub(raw) => format!("$({})", raw),
-        Chunk::Arith(raw) => format!("$(({}))", raw),
-        Chunk::VarExpand { name, op } => serialize_var_op(name, op),
+        Chunk::Var { name, quoted } => wrap_quoted(format!("${{{}}}", name), *quoted),
+        Chunk::Sub { raw, quoted } => wrap_quoted(format!("$({})", raw), *quoted),
+        Chunk::Arith { raw, quoted } => wrap_quoted(format!("$(({}))", raw), *quoted),
+        Chunk::VarExpand { name, op, quoted } => wrap_quoted(serialize_var_op(name, op), *quoted),
+    }
+}
+
+// Preserves quoted-ness across the preamble round-trip (see
+// exec.rs::functions_preamble) so a re-parsed expansion keeps the same
+// word-splitting eligibility it had in the original source.
+fn wrap_quoted(s: String, quoted: bool) -> String {
+    if quoted {
+        format!("\"{}\"", s)
+    } else {
+        s
     }
 }
 

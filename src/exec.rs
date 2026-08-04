@@ -642,13 +642,13 @@ impl Shell {
         for c in &w.chunks {
             match c {
                 Chunk::Str(t) => s.push_str(t),
-                Chunk::Var(name) => s.push_str(&self.lookup_var(name)),
-                Chunk::Sub(raw) => s.push_str(&self.run_command_substitution(raw)),
-                Chunk::Arith(raw) => match arith::eval(raw, self) {
+                Chunk::Var { name, .. } => s.push_str(&self.lookup_var(name)),
+                Chunk::Sub { raw, .. } => s.push_str(&self.run_command_substitution(raw)),
+                Chunk::Arith { raw, .. } => match arith::eval(raw, self) {
                     Ok(v) => s.push_str(&v.to_string()),
                     Err(e) => eprintln!("ash: (({})): {}", raw, e),
                 },
-                Chunk::VarExpand { name, op } => {
+                Chunk::VarExpand { name, op, .. } => {
                     let name = name.clone();
                     let op = op.clone();
                     s.push_str(&self.eval_var_op(&name, &op));
@@ -656,6 +656,63 @@ impl Shell {
             }
         }
         s
+    }
+
+    // Bash word-splitting: unquoted expansion results are split on
+    // whitespace (IFS, hardcoded to the default here) into separate fields;
+    // literal text (whether from quotes or plain source) never splits, since
+    // unquoted literal whitespace would already have ended the word at the
+    // lexer level. Only used where splitting actually applies (command
+    // argv, `for` word-lists) -- assignment RHS, case words, redirect
+    // targets, etc. still go through plain expand_word.
+    fn expand_word_split(&mut self, w: &Word) -> Vec<String> {
+        let mut fields: Vec<String> = Vec::new();
+        let mut current: Option<String> = None;
+        for c in &w.chunks {
+            match c {
+                Chunk::Str(t) => current.get_or_insert_with(String::new).push_str(t),
+                Chunk::Var { name, quoted } => {
+                    // "$@" is a special case even when quoted: it expands
+                    // to one field per positional parameter (as if each
+                    // were individually double-quoted), not one joined
+                    // string -- unlike "$*", which does join. Unquoted $@
+                    // falls through to the normal joined-then-split path,
+                    // matching bash (both $@ and $* behave the same
+                    // unquoted).
+                    if name == "@" && *quoted {
+                        let parts = self.arg_frames.last().cloned().unwrap_or_default();
+                        append_parts(&mut fields, &mut current, &parts);
+                    } else {
+                        let v = self.lookup_var(name);
+                        append_splittable(&mut fields, &mut current, &v, *quoted);
+                    }
+                }
+                Chunk::Sub { raw, quoted } => {
+                    let v = self.run_command_substitution(raw);
+                    append_splittable(&mut fields, &mut current, &v, *quoted);
+                }
+                Chunk::Arith { raw, quoted } => {
+                    let v = match arith::eval(raw, self) {
+                        Ok(n) => n.to_string(),
+                        Err(e) => {
+                            eprintln!("ash: (({})): {}", raw, e);
+                            String::new()
+                        }
+                    };
+                    append_splittable(&mut fields, &mut current, &v, *quoted);
+                }
+                Chunk::VarExpand { name, op, quoted } => {
+                    let name = name.clone();
+                    let op = op.clone();
+                    let v = self.eval_var_op(&name, &op);
+                    append_splittable(&mut fields, &mut current, &v, *quoted);
+                }
+            }
+        }
+        if let Some(c) = current {
+            fields.push(c);
+        }
+        fields
     }
 
     // Re-lexes and expands a captured raw operand (the "word"/"pattern"
@@ -733,14 +790,19 @@ impl Shell {
     fn expand_words(&mut self, words: &[Word]) -> Vec<String> {
         let mut out = Vec::new();
         for w in words {
-            let s = self.expand_word(w);
             if w.globbable {
+                // globbable implies no quoting/expansion at all in the word
+                // (see Word::globbable), so splitting can't apply here --
+                // glob-check the single literal value as before.
+                let s = self.expand_word(w);
                 if let Some(matches) = glob::expand(&s) {
                     out.extend(matches);
                     continue;
                 }
+                out.push(s);
+            } else {
+                out.extend(self.expand_word_split(w));
             }
-            out.push(s);
         }
         out
     }
@@ -881,6 +943,59 @@ fn here_string_file(content: &str) -> Result<std::fs::File, String> {
     let f = std::fs::File::open(&path).map_err(|e| format!("here-string: {}", e))?;
     let _ = std::fs::remove_file(&path);
     Ok(f)
+}
+
+// Appends an expansion's value `v` to the in-progress word-split state.
+// Quoted values are never split (appended verbatim, like literal text).
+// Unquoted values are split on whitespace: interior separators end the
+// current field and start a new one; leading/trailing whitespace in `v`
+// forces a boundary even when the adjacent side has zero-or-one resulting
+// parts (e.g. `pre$x` where x=" y " must split into "pre" and "y", not
+// "prey"). A purely empty-or-whitespace unquoted value contributes nothing
+// (matching bash: an unquoted unset/empty variable standing alone
+// contributes zero arguments, not one empty one).
+fn append_splittable(fields: &mut Vec<String>, current: &mut Option<String>, v: &str, quoted: bool) {
+    if quoted {
+        current.get_or_insert_with(String::new).push_str(v);
+        return;
+    }
+    let leading_ws = v.starts_with(char::is_whitespace);
+    let trailing_ws = v.ends_with(char::is_whitespace);
+    let parts: Vec<&str> = v.split_whitespace().collect();
+    if parts.is_empty() {
+        if !v.is_empty() {
+            if let Some(c) = current.take() {
+                fields.push(c);
+            }
+        }
+        return;
+    }
+    if leading_ws {
+        if let Some(c) = current.take() {
+            fields.push(c);
+        }
+    }
+    for (i, part) in parts.iter().enumerate() {
+        if i > 0 {
+            fields.push(current.take().unwrap_or_default());
+        }
+        current.get_or_insert_with(String::new).push_str(part);
+    }
+    if trailing_ws {
+        fields.push(current.take().unwrap_or_default());
+    }
+}
+
+// Like append_splittable, but for "$@": the parts are already well-defined
+// (one per positional parameter, never re-split even if a param contains
+// whitespace) rather than derived by splitting a joined string.
+fn append_parts(fields: &mut Vec<String>, current: &mut Option<String>, parts: &[String]) {
+    for (i, part) in parts.iter().enumerate() {
+        if i > 0 {
+            fields.push(current.take().unwrap_or_default());
+        }
+        current.get_or_insert_with(String::new).push_str(part);
+    }
 }
 
 fn strip_prefix_glob(s: &str, pattern: &str, longest: bool) -> String {

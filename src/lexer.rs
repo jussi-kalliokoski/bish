@@ -2,16 +2,20 @@
 // sequencing, quoting, and $VAR expansion. No globbing, no command
 // substitution, no here-docs yet -- those come with later iterations.
 
+// `quoted` records whether this expansion appeared inside "..." (or is
+// otherwise not subject to word-splitting) -- exec.rs's expand_word_split
+// only splits unquoted expansion results on IFS, matching bash: `"$x"`
+// never splits even if $x contains spaces, but bare `$x` does.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Chunk {
     Str(String),
-    Var(String),
+    Var { name: String, quoted: bool },
     // Raw, not-yet-parsed source text of a $(...) or `...` command
     // substitution -- re-tokenized/parsed/run recursively at expansion time.
-    Sub(String),
+    Sub { raw: String, quoted: bool },
     // Raw source text of a $((...)) arithmetic expansion.
-    Arith(String),
-    VarExpand { name: String, op: VarOp },
+    Arith { raw: String, quoted: bool },
+    VarExpand { name: String, op: VarOp, quoted: bool },
 }
 
 // The operand ("word"/"pattern") of each variant is kept as raw source text
@@ -393,7 +397,7 @@ impl<'a> Lexer<'a> {
             probe.next();
             if matches!(probe.peek().copied(), None | Some('/') | Some(' ') | Some('\t') | Some('\n')) {
                 self.chars.next();
-                chunks.push(Chunk::Var("HOME".to_string()));
+                chunks.push(Chunk::Var { name: "HOME".to_string(), quoted: false });
             }
         }
 
@@ -431,13 +435,13 @@ impl<'a> Lexer<'a> {
                                 if !buf.is_empty() {
                                     chunks.push(Chunk::Str(std::mem::take(&mut buf)));
                                 }
-                                self.push_var(&mut chunks, &mut buf)?;
+                                self.push_var(&mut chunks, &mut buf, true)?;
                             }
                             Some('`') => {
                                 if !buf.is_empty() {
                                     chunks.push(Chunk::Str(std::mem::take(&mut buf)));
                                 }
-                                chunks.push(Chunk::Sub(self.capture_backtick()?));
+                                chunks.push(Chunk::Sub { raw: self.capture_backtick()?, quoted: true });
                             }
                             Some(c) => buf.push(c),
                         }
@@ -456,7 +460,7 @@ impl<'a> Lexer<'a> {
                     if !buf.is_empty() {
                         chunks.push(Chunk::Str(std::mem::take(&mut buf)));
                     }
-                    self.push_var(&mut chunks, &mut buf)?;
+                    self.push_var(&mut chunks, &mut buf, false)?;
                 }
                 Some('`') => {
                     plain = false;
@@ -464,7 +468,7 @@ impl<'a> Lexer<'a> {
                     if !buf.is_empty() {
                         chunks.push(Chunk::Str(std::mem::take(&mut buf)));
                     }
-                    chunks.push(Chunk::Sub(self.capture_backtick()?));
+                    chunks.push(Chunk::Sub { raw: self.capture_backtick()?, quoted: false });
                 }
                 Some(c) => {
                     self.chars.next();
@@ -486,14 +490,14 @@ impl<'a> Lexer<'a> {
     // expansion, or ${...} parameter expansion) after the '$' has already
     // been consumed, and pushes the appropriate Chunk, or a literal "$" if
     // nothing valid follows.
-    fn push_var(&mut self, chunks: &mut Vec<Chunk>, buf: &mut String) -> Result<(), String> {
+    fn push_var(&mut self, chunks: &mut Vec<Chunk>, buf: &mut String, quoted: bool) -> Result<(), String> {
         if self.chars.peek().copied() == Some('(') {
             self.chars.next();
             if self.chars.peek().copied() == Some('(') {
                 self.chars.next();
-                chunks.push(Chunk::Arith(self.capture_double_paren()?));
+                chunks.push(Chunk::Arith { raw: self.capture_double_paren()?, quoted });
             } else {
-                chunks.push(Chunk::Sub(self.capture_balanced_parens()?));
+                chunks.push(Chunk::Sub { raw: self.capture_balanced_parens()?, quoted });
             }
             return Ok(());
         }
@@ -512,10 +516,10 @@ impl<'a> Lexer<'a> {
                     if name.is_empty() {
                         buf.push('$');
                     } else {
-                        chunks.push(Chunk::Var(name));
+                        chunks.push(Chunk::Var { name, quoted });
                     }
                 }
-                BraceContent::Op(name, op) => chunks.push(Chunk::VarExpand { name, op }),
+                BraceContent::Op(name, op) => chunks.push(Chunk::VarExpand { name, op, quoted }),
             }
             return Ok(());
         }
@@ -523,7 +527,7 @@ impl<'a> Lexer<'a> {
         if name.is_empty() {
             buf.push('$');
         } else {
-            chunks.push(Chunk::Var(name));
+            chunks.push(Chunk::Var { name, quoted });
         }
         Ok(())
     }
