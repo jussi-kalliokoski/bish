@@ -12,7 +12,8 @@ fn main() {
 
     if args.len() >= 3 && args[1] == "-c" {
         let script_name = args.get(3).cloned().unwrap_or_else(|| "ash".to_string());
-        shell.set_script_args(script_name, args[4..].to_vec());
+        let positional = args.get(4..).map(|s| s.to_vec()).unwrap_or_default();
+        shell.set_script_args(script_name, positional);
         std::process::exit(run_source(&mut shell, &args[2]));
     }
 

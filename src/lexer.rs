@@ -6,6 +6,9 @@
 pub enum Chunk {
     Str(String),
     Var(String),
+    // Raw, not-yet-parsed source text of a $(...) or `...` command
+    // substitution -- re-tokenized/parsed/run recursively at expansion time.
+    Sub(String),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -27,6 +30,8 @@ pub enum Tok {
     RBrace,
     LParen,
     RParen,
+    // Raw, not-yet-parsed source text of a (...) subshell pipeline stage.
+    Subshell(String),
     KwIf,
     KwThen,
     KwElif,
@@ -126,7 +131,15 @@ impl<'a> Lexer<'a> {
                 }
                 Some('(') => {
                     self.chars.next();
-                    toks.push(Tok::LParen);
+                    if self.chars.peek().copied() == Some(')') {
+                        // empty parens: function-def syntax `name()`
+                        self.chars.next();
+                        toks.push(Tok::LParen);
+                        toks.push(Tok::RParen);
+                    } else {
+                        let raw = self.capture_balanced_parens()?;
+                        toks.push(Tok::Subshell(raw));
+                    }
                 }
                 Some(')') => {
                     self.chars.next();
@@ -207,6 +220,91 @@ impl<'a> Lexer<'a> {
         }
     }
 
+    // Called with one '(' already consumed (depth 1). Scans forward,
+    // honoring nested parens and quotes, and returns the raw text up to
+    // (not including) the matching close paren. Shared by $(...) command
+    // substitution and (...) subshells -- neither is tokenized/parsed until
+    // the substitution actually runs.
+    fn capture_balanced_parens(&mut self) -> Result<String, String> {
+        let mut depth = 1;
+        let mut s = String::new();
+        loop {
+            match self.chars.next() {
+                None => return Err("unterminated '('".to_string()),
+                Some('(') => {
+                    depth += 1;
+                    s.push('(');
+                }
+                Some(')') => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                    s.push(')');
+                }
+                Some('\'') => {
+                    s.push('\'');
+                    loop {
+                        match self.chars.next() {
+                            None => return Err("unterminated single quote".to_string()),
+                            Some('\'') => {
+                                s.push('\'');
+                                break;
+                            }
+                            Some(c) => s.push(c),
+                        }
+                    }
+                }
+                Some('"') => {
+                    s.push('"');
+                    loop {
+                        match self.chars.next() {
+                            None => return Err("unterminated double quote".to_string()),
+                            Some('"') => {
+                                s.push('"');
+                                break;
+                            }
+                            Some('\\') => {
+                                s.push('\\');
+                                if let Some(n) = self.chars.next() {
+                                    s.push(n);
+                                }
+                            }
+                            Some(c) => s.push(c),
+                        }
+                    }
+                }
+                Some('\\') => {
+                    s.push('\\');
+                    if let Some(n) = self.chars.next() {
+                        s.push(n);
+                    }
+                }
+                Some(c) => s.push(c),
+            }
+        }
+        Ok(s)
+    }
+
+    fn capture_backtick(&mut self) -> Result<String, String> {
+        let mut s = String::new();
+        loop {
+            match self.chars.next() {
+                None => return Err("unterminated '`'".to_string()),
+                Some('`') => break,
+                Some('\\') => match self.chars.peek().copied() {
+                    Some(n) if n == '`' || n == '\\' || n == '$' => {
+                        self.chars.next();
+                        s.push(n);
+                    }
+                    _ => s.push('\\'),
+                },
+                Some(c) => s.push(c),
+            }
+        }
+        Ok(s)
+    }
+
     fn skip_spaces(&mut self) {
         while let Some(c) = self.chars.peek().copied() {
             if c == ' ' || c == '\t' {
@@ -260,7 +358,13 @@ impl<'a> Lexer<'a> {
                                 if !buf.is_empty() {
                                     chunks.push(Chunk::Str(std::mem::take(&mut buf)));
                                 }
-                                self.push_var(&mut chunks, &mut buf);
+                                self.push_var(&mut chunks, &mut buf)?;
+                            }
+                            Some('`') => {
+                                if !buf.is_empty() {
+                                    chunks.push(Chunk::Str(std::mem::take(&mut buf)));
+                                }
+                                chunks.push(Chunk::Sub(self.capture_backtick()?));
                             }
                             Some(c) => buf.push(c),
                         }
@@ -279,7 +383,15 @@ impl<'a> Lexer<'a> {
                     if !buf.is_empty() {
                         chunks.push(Chunk::Str(std::mem::take(&mut buf)));
                     }
-                    self.push_var(&mut chunks, &mut buf);
+                    self.push_var(&mut chunks, &mut buf)?;
+                }
+                Some('`') => {
+                    plain = false;
+                    self.chars.next();
+                    if !buf.is_empty() {
+                        chunks.push(Chunk::Str(std::mem::take(&mut buf)));
+                    }
+                    chunks.push(Chunk::Sub(self.capture_backtick()?));
                 }
                 Some(c) => {
                     self.chars.next();
@@ -297,15 +409,22 @@ impl<'a> Lexer<'a> {
         Ok((chunks, plain))
     }
 
-    // Consumes a variable reference after the '$' has already been consumed
-    // and pushes either a Chunk::Var, or a literal "$" if nothing valid follows.
-    fn push_var(&mut self, chunks: &mut Vec<Chunk>, buf: &mut String) {
+    // Consumes a variable reference (or $(...) command substitution) after
+    // the '$' has already been consumed, and pushes the appropriate Chunk,
+    // or a literal "$" if nothing valid follows.
+    fn push_var(&mut self, chunks: &mut Vec<Chunk>, buf: &mut String) -> Result<(), String> {
+        if self.chars.peek().copied() == Some('(') {
+            self.chars.next();
+            chunks.push(Chunk::Sub(self.capture_balanced_parens()?));
+            return Ok(());
+        }
         let name = self.read_var_name();
         if name.is_empty() {
             buf.push('$');
         } else {
             chunks.push(Chunk::Var(name));
         }
+        Ok(())
     }
 
     fn read_var_name(&mut self) -> String {

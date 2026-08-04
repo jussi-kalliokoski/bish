@@ -142,6 +142,46 @@ impl Shell {
                 self.functions.insert(name.clone(), (**body).clone());
                 ExecResult::Status(0)
             }
+            parser::Command::Subshell(raw, _redirects) => ExecResult::Status(self.run_subshell(raw)),
+        }
+    }
+
+    // (...) subshells self-exec the ash binary on the raw captured source,
+    // inheriting env but not sharing process state -- real bash subshells
+    // are forked children too, so mutations inside (cd, variables) must not
+    // leak back into the parent. Spawning a real child process gets that
+    // isolation for free instead of a separate snapshot/restore mechanism.
+    fn run_subshell(&self, raw: &str) -> i32 {
+        let exe = match std::env::current_exe() {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("ash: subshell: {}", e);
+                return 1;
+            }
+        };
+        match Command::new(exe).arg("-c").arg(raw).status() {
+            Ok(status) => status.code().unwrap_or(1),
+            Err(e) => {
+                eprintln!("ash: subshell: {}", e);
+                1
+            }
+        }
+    }
+
+    fn run_command_substitution(&self, raw: &str) -> String {
+        let exe = match std::env::current_exe() {
+            Ok(p) => p,
+            Err(_) => return String::new(),
+        };
+        match Command::new(exe).arg("-c").arg(raw).output() {
+            Ok(out) => {
+                let mut s = String::from_utf8_lossy(&out.stdout).into_owned();
+                while s.ends_with('\n') {
+                    s.pop();
+                }
+                s
+            }
+            Err(_) => String::new(),
         }
     }
 
@@ -441,6 +481,7 @@ impl Shell {
             match c {
                 Chunk::Str(t) => s.push_str(t),
                 Chunk::Var(name) => s.push_str(&self.lookup_var(name)),
+                Chunk::Sub(raw) => s.push_str(&self.run_command_substitution(raw)),
             }
         }
         s

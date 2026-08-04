@@ -52,6 +52,9 @@ pub enum Command {
     },
     Group(Program, Vec<Redirect>),
     FuncDef { name: String, body: Box<Command> },
+    // Raw, not-yet-parsed source text of a (...) subshell -- tokenized and
+    // parsed lazily, recursively, when it actually runs (see exec.rs).
+    Subshell(String, Vec<Redirect>),
 }
 
 #[derive(Debug, Clone)]
@@ -224,6 +227,14 @@ impl Parser {
             Some(Tok::LBrace) => self.parse_group(),
             Some(Tok::KwFunction) => self.parse_function_kw(),
             Some(Tok::Word(_)) if self.looks_like_func_def() => self.parse_function_paren(),
+            Some(Tok::Subshell(_)) => {
+                let raw = match self.advance() {
+                    Some(Tok::Subshell(raw)) => raw,
+                    _ => unreachable!(),
+                };
+                let redirects = self.parse_trailing_redirects()?;
+                Ok(Command::Subshell(raw, redirects))
+            }
             _ => Ok(Command::Simple(self.parse_simple_command()?)),
         }
     }
