@@ -6,7 +6,7 @@ use crate::builtins;
 use crate::glob;
 use crate::lexer::{Chunk, VarOp};
 use crate::parser::{
-    self, AndOr, Combinator, ListItem, Pipeline, Program, Redirect, Sep, SimpleCommand, Word,
+    self, AndOr, AssignMode, Combinator, ListItem, Pipeline, Program, Redirect, Sep, SimpleCommand, Word,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -43,9 +43,12 @@ pub struct Shell {
     // matches an existing local of the same name, matching bash semantics.
     var_scopes: Vec<HashMap<String, String>>,
     script_name: String,
-    // Indexed arrays (`arr=(...)`). Global only in v1 -- no `local` arrays,
-    // no sparse/associative arrays, no `+=`/`arr[i]=` mutation yet.
-    arrays: HashMap<String, Vec<String>>,
+    // Indexed arrays (`arr=(...)`). A BTreeMap (not Vec) so arrays are
+    // genuinely sparse like bash's: `arr[10]=x` doesn't materialize empty
+    // strings for indices 0..9, and `${#arr[@]}` counts only what's
+    // actually set. Global only in v1 -- no `local` arrays, no associative
+    // arrays.
+    arrays: HashMap<String, std::collections::BTreeMap<usize, String>>,
     // `trap CMD EXIT` handler. Only EXIT is implemented -- real signal traps
     // (INT/TERM/...) would need OS signal-handling machinery this
     // dependency-free, single-process design doesn't have; `trap` warns
@@ -322,7 +325,7 @@ impl Shell {
         for (name, items) in &self.arrays {
             s.push_str(name);
             s.push_str("=(");
-            for item in items {
+            for item in items.values() {
                 s.push_str(&crate::serialize::quote_literal(item));
                 s.push(' ');
             }
@@ -533,13 +536,38 @@ impl Shell {
 
     fn run_single(&mut self, cmd: &SimpleCommand, background: bool) -> ExecResult {
         if cmd.words.is_empty() {
-            for (name, val) in &cmd.assigns {
+            for (name, mode, val) in &cmd.assigns {
                 let v = self.expand_word(val);
-                self.assign_var(name, v);
+                match mode {
+                    AssignMode::Set => self.assign_var(name, v),
+                    AssignMode::Append => {
+                        let mut cur = self.lookup_var(name);
+                        cur.push_str(&v);
+                        self.assign_var(name, cur);
+                    }
+                }
             }
-            for (name, items) in &cmd.array_assigns {
+            for (name, mode, items) in &cmd.array_assigns {
                 let values: Vec<String> = items.iter().map(|w| self.expand_word(w)).collect();
-                self.arrays.insert(name.clone(), values);
+                match mode {
+                    AssignMode::Set => {
+                        let map: std::collections::BTreeMap<usize, String> =
+                            values.into_iter().enumerate().collect();
+                        self.arrays.insert(name.clone(), map);
+                    }
+                    AssignMode::Append => {
+                        let map = self.arrays.entry(name.clone()).or_default();
+                        let mut next = map.keys().next_back().map(|k| k + 1).unwrap_or(0);
+                        for v in values {
+                            map.insert(next, v);
+                            next += 1;
+                        }
+                    }
+                }
+            }
+            for (name, index, val) in &cmd.index_assigns {
+                let v = self.expand_word(val);
+                self.array_set_index(name, index, v);
             }
             if !cmd.redirects.is_empty() {
                 // side effect only: create/truncate/append the target files
@@ -715,8 +743,13 @@ impl Shell {
 
         let mut command = Command::new(&name);
         command.args(&argv[1..]);
-        for (k, val) in &cmd.assigns {
-            command.env(k, self.expand_word(val));
+        for (k, mode, val) in &cmd.assigns {
+            let v = self.expand_word(val);
+            let v = match mode {
+                AssignMode::Set => v,
+                AssignMode::Append => self.lookup_var(k) + &v,
+            };
+            command.env(k, v);
         }
         command.stdin(redirs.stdin.unwrap_or_else(Stdio::inherit));
         command.stdout(redirs.stdout.unwrap_or_else(Stdio::inherit));
@@ -781,8 +814,13 @@ impl Shell {
                     };
                     let mut command = Command::new(&argv[0]);
                     command.args(&argv[1..]);
-                    for (k, val) in &sc.assigns {
-                        command.env(k, self.expand_word(val));
+                    for (k, mode, val) in &sc.assigns {
+                        let v = self.expand_word(val);
+                        let v = match mode {
+                            AssignMode::Set => v,
+                            AssignMode::Append => self.lookup_var(k) + &v,
+                        };
+                        command.env(k, v);
                     }
                     command.stdin(redirs.stdin.unwrap_or(default_stdin));
                     command.stdout(redirs.stdout.unwrap_or(default_stdout));
@@ -871,24 +909,31 @@ impl Shell {
                     let index = index.clone();
                     s.push_str(&self.array_length(&name, &index).to_string());
                 }
+                Chunk::ArrayVarExpand { name, index, op, .. } => {
+                    let name = name.clone();
+                    let index = index.clone();
+                    let op = op.clone();
+                    s.push_str(&self.eval_array_var_op(&name, &index, &op));
+                }
             }
         }
         s
     }
 
-    // index "@"/"*" joins all elements with a space (used outside the
-    // splitting-aware path, where "@" vs "*" can't be distinguished anyway);
-    // any other index is evaluated as an arithmetic expression (so
-    // `${arr[i+1]}` works) and looked up 0-based.
+    // index "@"/"*" joins all elements (in index order) with a space (used
+    // outside the splitting-aware path, where "@" vs "*" can't be
+    // distinguished anyway); any other index is evaluated as an arithmetic
+    // expression (so `${arr[i+1]}` works) and looked up 0-based. A gap
+    // index (never set) reads back as empty, same as an unset scalar.
     fn array_element(&mut self, name: &str, index: &str) -> String {
         if index == "@" || index == "*" {
-            return self.arrays.get(name).cloned().unwrap_or_default().join(" ");
+            return self.array_all(name).join(" ");
         }
         match arith::eval(index, self) {
             Ok(i) if i >= 0 => self
                 .arrays
                 .get(name)
-                .and_then(|v| v.get(i as usize))
+                .and_then(|m| m.get(&(i as usize)))
                 .cloned()
                 .unwrap_or_default(),
             _ => String::new(),
@@ -896,22 +941,37 @@ impl Shell {
     }
 
     fn array_all(&self, name: &str) -> Vec<String> {
-        self.arrays.get(name).cloned().unwrap_or_default()
+        self.arrays.get(name).map(|m| m.values().cloned().collect()).unwrap_or_default()
     }
 
+    // "@"/"*" counts only set elements (real bash arrays are sparse --
+    // `arr[10]=x` alone gives a length of 1, not 11).
     fn array_length(&mut self, name: &str, index: &str) -> usize {
         if index == "@" || index == "*" {
-            return self.arrays.get(name).map(|v| v.len()).unwrap_or(0);
+            return self.arrays.get(name).map(|m| m.len()).unwrap_or(0);
         }
         match arith::eval(index, self) {
             Ok(i) if i >= 0 => self
                 .arrays
                 .get(name)
-                .and_then(|v| v.get(i as usize))
+                .and_then(|m| m.get(&(i as usize)))
                 .map(|s| s.chars().count())
                 .unwrap_or(0),
             _ => 0,
         }
+    }
+
+    // `arr[i]=value`. Sets exactly that index -- no resizing/filling, since
+    // the array is a sparse map, matching bash (gaps stay genuinely unset).
+    fn array_set_index(&mut self, name: &str, index: &str, value: String) {
+        let i = match arith::eval(index, self) {
+            Ok(i) if i >= 0 => i as usize,
+            _ => {
+                eprintln!("ash: {}: bad array index: {}", name, index);
+                return;
+            }
+        };
+        self.arrays.entry(name.to_string()).or_default().insert(i, value);
     }
 
     // Bash word-splitting: unquoted expansion results are split on
@@ -987,6 +1047,13 @@ impl Shell {
                     let v = self.array_length(&name, &index).to_string();
                     append_splittable(&mut fields, &mut current, &v, true);
                 }
+                Chunk::ArrayVarExpand { name, index, op, quoted } => {
+                    let name = name.clone();
+                    let index = index.clone();
+                    let op = op.clone();
+                    let v = self.eval_array_var_op(&name, &index, &op);
+                    append_splittable(&mut fields, &mut current, &v, *quoted);
+                }
             }
         }
         if let Some(c) = current {
@@ -1038,6 +1105,59 @@ impl Shell {
                 if cur.is_empty() {
                     let msg = self.expand_raw(word);
                     eprintln!("ash: {}: {}", name, msg);
+                    String::new()
+                } else {
+                    cur
+                }
+            }
+            VarOp::AltIfSet { word, .. } => {
+                if !cur.is_empty() {
+                    self.expand_raw(word)
+                } else {
+                    String::new()
+                }
+            }
+            VarOp::RemovePrefix { pattern, longest } => {
+                let pattern = self.expand_raw(pattern);
+                strip_prefix_glob(&cur, &pattern, *longest)
+            }
+            VarOp::RemoveSuffix { pattern, longest } => {
+                let pattern = self.expand_raw(pattern);
+                strip_suffix_glob(&cur, &pattern, *longest)
+            }
+        }
+    }
+
+    // Same operators as eval_var_op, but reading (and, for :=, writing)
+    // one array element instead of a scalar variable. "@"/"*" indices are
+    // treated as the joined-all-elements string, matching how they behave
+    // as a plain (non-splitting-aware) expansion elsewhere.
+    fn eval_array_var_op(&mut self, name: &str, index: &str, op: &VarOp) -> String {
+        let cur = self.array_element(name, index);
+        match op {
+            VarOp::Length => cur.chars().count().to_string(),
+            VarOp::Default { word, .. } => {
+                if cur.is_empty() {
+                    self.expand_raw(word)
+                } else {
+                    cur
+                }
+            }
+            VarOp::AssignDefault { word, .. } => {
+                if cur.is_empty() {
+                    let v = self.expand_raw(word);
+                    if index != "@" && index != "*" {
+                        self.array_set_index(name, index, v.clone());
+                    }
+                    v
+                } else {
+                    cur
+                }
+            }
+            VarOp::ErrorIfUnset { word, .. } => {
+                if cur.is_empty() {
+                    let msg = self.expand_raw(word);
+                    eprintln!("ash: {}[{}]: {}", name, index, msg);
                     String::new()
                 } else {
                     cur

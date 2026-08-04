@@ -6,7 +6,7 @@
 // to round-trip whatever a function body can contain.
 
 use crate::lexer::{Chunk, VarOp};
-use crate::parser::{AndOr, Combinator, Command, ListItem, Pipeline, Redirect, Sep, SimpleCommand, Word};
+use crate::parser::{AndOr, AssignMode, Combinator, Command, ListItem, Pipeline, Redirect, Sep, SimpleCommand, Word};
 
 pub fn serialize_program(prog: &[ListItem]) -> String {
     let mut s = String::new();
@@ -97,12 +97,17 @@ pub fn serialize_command(cmd: &Command) -> String {
 
 fn serialize_simple(sc: &SimpleCommand) -> String {
     let mut parts: Vec<String> = Vec::new();
-    for (name, val) in &sc.assigns {
-        parts.push(format!("{}={}", name, serialize_word(val)));
+    for (name, mode, val) in &sc.assigns {
+        let op = if *mode == AssignMode::Append { "+=" } else { "=" };
+        parts.push(format!("{}{}{}", name, op, serialize_word(val)));
     }
-    for (name, items) in &sc.array_assigns {
+    for (name, mode, items) in &sc.array_assigns {
+        let op = if *mode == AssignMode::Append { "+=" } else { "=" };
         let words: Vec<String> = items.iter().map(serialize_word).collect();
-        parts.push(format!("{}=({})", name, words.join(" ")));
+        parts.push(format!("{}{}({})", name, op, words.join(" ")));
+    }
+    for (name, index, val) in &sc.index_assigns {
+        parts.push(format!("{}[{}]={}", name, index, serialize_word(val)));
     }
     for w in &sc.words {
         parts.push(serialize_word(w));
@@ -144,6 +149,9 @@ fn serialize_chunk(c: &Chunk) -> String {
         Chunk::VarExpand { name, op, quoted } => wrap_quoted(serialize_var_op(name, op), *quoted),
         Chunk::ArrayVar { name, index, quoted } => wrap_quoted(format!("${{{}[{}]}}", name, index), *quoted),
         Chunk::ArrayLength { name, index } => format!("${{#{}[{}]}}", name, index),
+        Chunk::ArrayVarExpand { name, index, op, quoted } => {
+            wrap_quoted(serialize_array_var_op(name, index, op), *quoted)
+        }
     }
 }
 
@@ -179,4 +187,9 @@ fn serialize_var_op(name: &str, op: &VarOp) -> String {
             format!("${{{}{}{}}}", name, if *longest { "%%" } else { "%" }, pattern)
         }
     }
+}
+
+fn serialize_array_var_op(name: &str, index: &str, op: &VarOp) -> String {
+    let full = format!("{}[{}]", name, index);
+    serialize_var_op(&full, op)
 }

@@ -18,12 +18,14 @@ pub enum Chunk {
     VarExpand { name: String, op: VarOp, quoted: bool },
     // ${name[index]} -- index is raw text: "@"/"*" (all elements, one
     // element per field like $@/$*) or an arithmetic expression evaluated
-    // at access time (so ${arr[i+1]} works). No operator chaining on array
-    // elements in v1 (no ${arr[0]:-default}).
+    // at access time (so ${arr[i+1]} works).
     ArrayVar { name: String, index: String, quoted: bool },
     // ${#name[index]} -- index "@"/"*" gives the array length; a specific
     // index gives that element's string length.
     ArrayLength { name: String, index: String },
+    // ${name[index]:-word} and friends -- same operators as VarExpand, but
+    // reading from the array element instead of a scalar.
+    ArrayVarExpand { name: String, index: String, op: VarOp, quoted: bool },
 }
 
 // The operand ("word"/"pattern") of each variant is kept as raw source text
@@ -671,6 +673,9 @@ impl<'a> Lexer<'a> {
                 BraceContent::Op(name, op) => chunks.push(Chunk::VarExpand { name, op, quoted }),
                 BraceContent::ArrayIndex(name, index) => chunks.push(Chunk::ArrayVar { name, index, quoted }),
                 BraceContent::ArrayLength(name, index) => chunks.push(Chunk::ArrayLength { name, index }),
+                BraceContent::ArrayOp(name, index, op) => {
+                    chunks.push(Chunk::ArrayVarExpand { name, index, op, quoted })
+                }
             }
             return Ok(());
         }
@@ -760,13 +765,14 @@ enum BraceContent {
     Op(String, VarOp),
     ArrayIndex(String, String),
     ArrayLength(String, String),
+    ArrayOp(String, String, VarOp),
 }
 
-// `name[index]` -- name must be a plain identifier; index is everything up
-// to (and requiring) a closing ']' at the very end of `s`, so operator
-// chaining after an array element (${arr[0]:-x}) isn't matched here and
-// falls through to the scalar path unchanged.
-fn try_split_array(s: &str) -> Option<(String, String)> {
+// `name[index]rest` -- name must be a plain identifier; returns whatever
+// text follows the closing ']' (empty if nothing does) so the caller can
+// decide between a bare array access and one with an operator suffix
+// (${arr[0]:-x}).
+fn try_split_array(s: &str) -> Option<(String, String, &str)> {
     let bracket = s.find('[')?;
     let name = &s[..bracket];
     let mut nc = name.chars();
@@ -776,10 +782,40 @@ fn try_split_array(s: &str) -> Option<(String, String)> {
     }
     let rest = &s[bracket + 1..];
     let close = rest.find(']')?;
-    if close + 1 != rest.len() {
-        return None;
+    Some((name.to_string(), rest[..close].to_string(), &rest[close + 1..]))
+}
+
+// Shared by the scalar and array paths: parses the operator suffix that
+// follows a name (or `name[index]`) inside `${...}`.
+fn parse_operator_suffix(rest: &str) -> Option<VarOp> {
+    macro_rules! op {
+        ($prefix:expr, $variant:ident, $colon:expr) => {
+            if let Some(w) = rest.strip_prefix($prefix) {
+                return Some(VarOp::$variant { word: w.to_string(), colon: $colon });
+            }
+        };
     }
-    Some((name.to_string(), rest[..close].to_string()))
+    op!(":-", Default, true);
+    op!(":=", AssignDefault, true);
+    op!(":?", ErrorIfUnset, true);
+    op!(":+", AltIfSet, true);
+    if let Some(w) = rest.strip_prefix("##") {
+        return Some(VarOp::RemovePrefix { pattern: w.to_string(), longest: true });
+    }
+    if let Some(w) = rest.strip_prefix('#') {
+        return Some(VarOp::RemovePrefix { pattern: w.to_string(), longest: false });
+    }
+    if let Some(w) = rest.strip_prefix("%%") {
+        return Some(VarOp::RemoveSuffix { pattern: w.to_string(), longest: true });
+    }
+    if let Some(w) = rest.strip_prefix('%') {
+        return Some(VarOp::RemoveSuffix { pattern: w.to_string(), longest: false });
+    }
+    op!("-", Default, false);
+    op!("=", AssignDefault, false);
+    op!("?", ErrorIfUnset, false);
+    op!("+", AltIfSet, false);
+    None
 }
 
 // Parses the text captured between `${` and `}`. `${#VAR}` (length) is
@@ -787,15 +823,25 @@ fn try_split_array(s: &str) -> Option<(String, String)> {
 // operator on an empty name.
 fn parse_brace_content(inner: &str) -> BraceContent {
     if let Some(rest) = inner.strip_prefix('#') {
-        if let Some((name, index)) = try_split_array(rest) {
-            return BraceContent::ArrayLength(name, index);
+        if let Some((name, index, after)) = try_split_array(rest) {
+            if after.is_empty() {
+                return BraceContent::ArrayLength(name, index);
+            }
         }
         if !rest.is_empty() {
             return BraceContent::Op(rest.to_string(), VarOp::Length);
         }
     }
-    if let Some((name, index)) = try_split_array(inner) {
-        return BraceContent::ArrayIndex(name, index);
+    if let Some((name, index, after)) = try_split_array(inner) {
+        if after.is_empty() {
+            return BraceContent::ArrayIndex(name, index);
+        }
+        if let Some(op) = parse_operator_suffix(after) {
+            return BraceContent::ArrayOp(name, index, op);
+        }
+        // Unrecognized operator after an array index: fall through to the
+        // scalar path below, which will end up treating the whole thing as
+        // a best-effort literal name (same fallback as the scalar case).
     }
 
     let mut name_end = 0;
@@ -819,34 +865,9 @@ fn parse_brace_content(inner: &str) -> BraceContent {
     if rest.is_empty() {
         return BraceContent::Plain(name);
     }
-
-    macro_rules! op {
-        ($prefix:expr, $variant:ident, $colon:expr) => {
-            if let Some(w) = rest.strip_prefix($prefix) {
-                return BraceContent::Op(name, VarOp::$variant { word: w.to_string(), colon: $colon });
-            }
-        };
+    if let Some(op) = parse_operator_suffix(rest) {
+        return BraceContent::Op(name, op);
     }
-    op!(":-", Default, true);
-    op!(":=", AssignDefault, true);
-    op!(":?", ErrorIfUnset, true);
-    op!(":+", AltIfSet, true);
-    if let Some(w) = rest.strip_prefix("##") {
-        return BraceContent::Op(name, VarOp::RemovePrefix { pattern: w.to_string(), longest: true });
-    }
-    if let Some(w) = rest.strip_prefix('#') {
-        return BraceContent::Op(name, VarOp::RemovePrefix { pattern: w.to_string(), longest: false });
-    }
-    if let Some(w) = rest.strip_prefix("%%") {
-        return BraceContent::Op(name, VarOp::RemoveSuffix { pattern: w.to_string(), longest: true });
-    }
-    if let Some(w) = rest.strip_prefix('%') {
-        return BraceContent::Op(name, VarOp::RemoveSuffix { pattern: w.to_string(), longest: false });
-    }
-    op!("-", Default, false);
-    op!("=", AssignDefault, false);
-    op!("?", ErrorIfUnset, false);
-    op!("+", AltIfSet, false);
 
     // Unrecognized operator syntax: fall back to treating the whole thing
     // as a literal (best-effort; will just look up a likely-nonexistent

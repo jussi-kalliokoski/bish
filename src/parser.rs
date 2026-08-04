@@ -17,12 +17,23 @@ pub enum Redirect {
     HereDoc(Word),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum AssignMode {
+    Set,
+    Append,
+}
+
 #[derive(Debug, Clone)]
 pub struct SimpleCommand {
-    pub assigns: Vec<(String, Word)>,
-    // `name=(word word ...)` array literals -- kept separate from `assigns`
-    // since array values don't fit the scalar Word model.
-    pub array_assigns: Vec<(String, Vec<Word>)>,
+    pub assigns: Vec<(String, AssignMode, Word)>,
+    // `name=(word word ...)` / `name+=(word word ...)` array literals --
+    // kept separate from `assigns` since array values don't fit the scalar
+    // Word model.
+    pub array_assigns: Vec<(String, AssignMode, Vec<Word>)>,
+    // `name[index]=value` -- index is raw text (an arithmetic expression,
+    // evaluated at assignment time), kept separate since it targets one
+    // array element rather than the whole variable.
+    pub index_assigns: Vec<(String, String, Word)>,
     pub words: Vec<Word>,
     pub redirects: Vec<Redirect>,
 }
@@ -458,6 +469,7 @@ impl Parser {
     fn parse_simple_command(&mut self) -> Result<SimpleCommand, String> {
         let mut assigns = Vec::new();
         let mut array_assigns = Vec::new();
+        let mut index_assigns = Vec::new();
         let mut words = Vec::new();
         let mut redirects = Vec::new();
         let mut in_assign_phase = true;
@@ -471,11 +483,16 @@ impl Parser {
                     };
                     let w = Word { chunks, globbable };
                     if in_assign_phase {
-                        if let Some((name, val)) = word_as_assignment(&w) {
-                            // `name=(...)` array literal: the lexer already
-                            // captured the parenthesized content as a raw
-                            // Subshell token (no space allowed between `=`
-                            // and `(`, matching bash's own syntax rule).
+                        if let Some((name, index, val)) = word_as_index_assignment(&w) {
+                            index_assigns.push((name, index, val));
+                            continue;
+                        }
+                        if let Some((name, mode, val)) = word_as_assignment(&w) {
+                            // `name=(...)` / `name+=(...)` array literal:
+                            // the lexer already captured the parenthesized
+                            // content as a raw Subshell token (no space
+                            // allowed between `=`/`+=` and `(`, matching
+                            // bash's own syntax rule).
                             if is_empty_word(&val) {
                                 if let Some(Tok::Subshell(_)) = self.peek() {
                                     let raw = match self.advance() {
@@ -483,11 +500,11 @@ impl Parser {
                                         _ => unreachable!(),
                                     };
                                     let items = split_array_literal_words(&raw)?;
-                                    array_assigns.push((name, items));
+                                    array_assigns.push((name, mode, items));
                                     continue;
                                 }
                             }
-                            assigns.push((name, val));
+                            assigns.push((name, mode, val));
                             continue;
                         }
                         in_assign_phase = false;
@@ -537,10 +554,15 @@ impl Parser {
             }
         }
 
-        if assigns.is_empty() && array_assigns.is_empty() && words.is_empty() && redirects.is_empty() {
+        if assigns.is_empty()
+            && array_assigns.is_empty()
+            && index_assigns.is_empty()
+            && words.is_empty()
+            && redirects.is_empty()
+        {
             return Err("expected command".to_string());
         }
-        Ok(SimpleCommand { assigns, array_assigns, words, redirects })
+        Ok(SimpleCommand { assigns, array_assigns, index_assigns, words, redirects })
     }
 
     fn expect_word(&mut self) -> Result<Word, String> {
@@ -551,18 +573,47 @@ impl Parser {
     }
 }
 
-fn word_as_assignment(w: &Word) -> Option<(String, Word)> {
+fn word_as_assignment(w: &Word) -> Option<(String, AssignMode, Word)> {
     let first = w.chunks.first()?;
     if let Chunk::Str(s) = first {
         let eq = s.find('=')?;
-        let name = &s[..eq];
+        let (name, mode) = if let Some(n) = s[..eq].strip_suffix('+') {
+            (n, AssignMode::Append)
+        } else {
+            (&s[..eq], AssignMode::Set)
+        };
         if is_valid_ident(name) {
             let mut rest_chunks = vec![Chunk::Str(s[eq + 1..].to_string())];
             rest_chunks.extend(w.chunks[1..].iter().cloned());
             // Assignment RHS is never glob-expanded in bash, regardless of
             // whether the original word would have been.
-            return Some((name.to_string(), Word { chunks: rest_chunks, globbable: false }));
+            return Some((name.to_string(), mode, Word { chunks: rest_chunks, globbable: false }));
         }
+    }
+    None
+}
+
+// `name[index]=value` -- the whole `name[index]=` prefix must land in a
+// single leading literal chunk, so `arr[i]=x` works (the common case: `i`
+// resolves as a bare identifier in the index's arithmetic context, no `$`
+// needed) but a `$`-containing index like `arr[$i]=x` isn't recognized here
+// (falls through to being read as a plain word instead).
+fn word_as_index_assignment(w: &Word) -> Option<(String, String, Word)> {
+    let first = w.chunks.first()?;
+    if let Chunk::Str(s) = first {
+        let bracket = s.find('[')?;
+        let name = &s[..bracket];
+        if !is_valid_ident(name) {
+            return None;
+        }
+        let after_bracket = &s[bracket + 1..];
+        let close = after_bracket.find(']')?;
+        let index = after_bracket[..close].to_string();
+        let after_close = &after_bracket[close + 1..];
+        let value_start = after_close.strip_prefix('=')?;
+        let mut rest_chunks = vec![Chunk::Str(value_start.to_string())];
+        rest_chunks.extend(w.chunks[1..].iter().cloned());
+        return Some((name.to_string(), index, Word { chunks: rest_chunks, globbable: false }));
     }
     None
 }
