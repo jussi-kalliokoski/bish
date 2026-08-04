@@ -573,7 +573,7 @@ impl Parser {
     }
 }
 
-fn word_as_assignment(w: &Word) -> Option<(String, AssignMode, Word)> {
+pub(crate) fn word_as_assignment(w: &Word) -> Option<(String, AssignMode, Word)> {
     let first = w.chunks.first()?;
     if let Chunk::Str(s) = first {
         let eq = s.find('=')?;

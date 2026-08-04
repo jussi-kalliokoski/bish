@@ -51,6 +51,43 @@ fn tokenize(src: &str) -> Result<Vec<Tok>, String> {
             toks.push(Tok::Ident(chars[start..i].iter().collect()));
             continue;
         }
+        if c == '$' {
+            i += 1;
+            if i < chars.len() && chars[i] == '{' {
+                i += 1;
+                let start = i;
+                while i < chars.len() && chars[i] != '}' {
+                    i += 1;
+                }
+                toks.push(Tok::Ident(chars[start..i].iter().collect()));
+                if i < chars.len() {
+                    i += 1;
+                }
+                continue;
+            }
+            if i < chars.len() && chars[i].is_ascii_digit() {
+                let start = i;
+                while i < chars.len() && chars[i].is_ascii_digit() {
+                    i += 1;
+                }
+                toks.push(Tok::Ident(chars[start..i].iter().collect()));
+                continue;
+            }
+            if i < chars.len() && (chars[i].is_alphabetic() || chars[i] == '_') {
+                let start = i;
+                while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') {
+                    i += 1;
+                }
+                toks.push(Tok::Ident(chars[start..i].iter().collect()));
+                continue;
+            }
+            if i < chars.len() && "#?@*$!".contains(chars[i]) {
+                toks.push(Tok::Ident(chars[i].to_string()));
+                i += 1;
+                continue;
+            }
+            return Err("bad substitution in arithmetic expression".to_string());
+        }
         if c == '(' {
             toks.push(Tok::LParen);
             i += 1;

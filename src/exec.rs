@@ -55,6 +55,22 @@ pub struct Shell {
     // rather than silently no-oping for those instead of pretending to
     // support them.
     exit_trap: Option<String>,
+    // `set -e`/`-u`/`-x`/`-o pipefail`.
+    opt_errexit: bool,
+    opt_nounset: bool,
+    opt_xtrace: bool,
+    opt_pipefail: bool,
+    // Suppresses errexit while >0 -- set around if/while/until conditions
+    // and negated (`!`) pipelines, the cases POSIX explicitly exempts from
+    // triggering -e (a failing condition is meant to be checked, not
+    // treated as a fatal error).
+    suppress_errexit: u32,
+    // Set by run_single around a command's own word-expansion so mid-
+    // expansion diagnostics (nounset's "unbound variable", etc) go to that
+    // command's own `2>` target instead of unconditionally to the shell's
+    // real stderr, matching bash routing its own error messages through
+    // the command's redirects too.
+    current_stderr_target: Option<String>,
 }
 
 impl Shell {
@@ -67,6 +83,12 @@ impl Shell {
             script_name: "ash".to_string(),
             arrays: HashMap::new(),
             exit_trap: None,
+            opt_errexit: false,
+            opt_nounset: false,
+            opt_xtrace: false,
+            opt_pipefail: false,
+            suppress_errexit: 0,
+            current_stderr_target: None,
         }
     }
 
@@ -201,6 +223,77 @@ impl Shell {
         0
     }
 
+    // set [-euxo pipefail] [--] [args...]. Combined single-char flags
+    // (-eu, -ex, -eux) work; `-o name` must be its own token (not combined
+    // into a cluster with other short flags) -- a bounded v1 simplification.
+    fn run_set(&mut self, args: &[String]) -> i32 {
+        let mut idx = 0;
+        let mut saw_dashdash = false;
+        while idx < args.len() {
+            let a = &args[idx];
+            if a == "--" {
+                saw_dashdash = true;
+                idx += 1;
+                break;
+            }
+            if let Some(rest) = a.strip_prefix('-').filter(|r| !r.is_empty()) {
+                if rest == "o" {
+                    if let Some(optname) = args.get(idx + 1) {
+                        self.apply_shell_option(optname, true);
+                        idx += 2;
+                        continue;
+                    }
+                }
+                for c in rest.chars() {
+                    self.apply_shell_flag(c, true);
+                }
+                idx += 1;
+                continue;
+            }
+            if let Some(rest) = a.strip_prefix('+').filter(|r| !r.is_empty()) {
+                if rest == "o" {
+                    if let Some(optname) = args.get(idx + 1) {
+                        self.apply_shell_option(optname, false);
+                        idx += 2;
+                        continue;
+                    }
+                }
+                for c in rest.chars() {
+                    self.apply_shell_flag(c, false);
+                }
+                idx += 1;
+                continue;
+            }
+            break;
+        }
+        if saw_dashdash || idx < args.len() {
+            let new_args = args[idx..].to_vec();
+            if let Some(frame) = self.arg_frames.last_mut() {
+                *frame = new_args;
+            }
+        }
+        0
+    }
+
+    fn apply_shell_flag(&mut self, c: char, on: bool) {
+        match c {
+            'e' => self.opt_errexit = on,
+            'u' => self.opt_nounset = on,
+            'x' => self.opt_xtrace = on,
+            _ => {}
+        }
+    }
+
+    fn apply_shell_option(&mut self, name: &str, on: bool) {
+        match name {
+            "pipefail" => self.opt_pipefail = on,
+            "errexit" => self.opt_errexit = on,
+            "nounset" => self.opt_nounset = on,
+            "xtrace" => self.opt_xtrace = on,
+            _ => {}
+        }
+    }
+
     pub fn set_script_args(&mut self, name: String, args: Vec<String>) {
         self.script_name = name;
         self.arg_frames = vec![args];
@@ -214,6 +307,16 @@ impl Shell {
             self.last_status = result.status();
             if result.is_signal() {
                 return result;
+            }
+            // `set -e`: abort on any failing top-level statement, except
+            // while suppressed (if/while/until conditions, negated
+            // pipelines -- POSIX exempts those explicitly). Checking once
+            // per ListItem here (the *overall* and-or result) rather than
+            // per-pipeline also naturally exempts non-last commands in a
+            // &&/|| chain, since only the chain's final status reaches here.
+            if self.opt_errexit && self.suppress_errexit == 0 && result.status() != 0 {
+                self.run_exit_trap();
+                std::process::exit(result.status());
             }
         }
         result
@@ -244,14 +347,18 @@ impl Shell {
     }
 
     fn run_pipeline(&mut self, pipeline: &Pipeline, background: bool) -> ExecResult {
-        let result = self.run_pipeline_inner(pipeline, background);
         if pipeline.negate {
+            // POSIX exempts a `!`-negated pipeline's own failure from -e
+            // (that's usually the whole point of negating it).
+            self.suppress_errexit += 1;
+            let result = self.run_pipeline_inner(pipeline, background);
+            self.suppress_errexit -= 1;
             return match result {
                 ExecResult::Status(s) => ExecResult::Status(if s == 0 { 1 } else { 0 }),
                 signal => signal,
             };
         }
-        result
+        self.run_pipeline_inner(pipeline, background)
     }
 
     fn run_pipeline_inner(&mut self, pipeline: &Pipeline, background: bool) -> ExecResult {
@@ -262,14 +369,7 @@ impl Shell {
     }
 
     fn run_command(&mut self, cmd: &parser::Command, background: bool) -> ExecResult {
-        let redirects: &[Redirect] = match cmd {
-            parser::Command::If { redirects, .. } => redirects,
-            parser::Command::While { redirects, .. } => redirects,
-            parser::Command::For { redirects, .. } => redirects,
-            parser::Command::Case { redirects, .. } => redirects,
-            parser::Command::Group(_, redirects) => redirects,
-            _ => &[],
-        };
+        let redirects: &[Redirect] = command_own_redirects(cmd);
         if !redirects.is_empty() {
             return self.run_compound_redirected(cmd, redirects, background);
         }
@@ -381,6 +481,14 @@ impl Shell {
                 s.push(' ');
             }
             s.push_str(")\n");
+        }
+        if let Some(frame) = self.arg_frames.last() {
+            s.push_str("set --");
+            for a in frame {
+                s.push(' ');
+                s.push_str(&crate::serialize::quote_literal(a));
+            }
+            s.push('\n');
         }
         for (name, body) in &self.functions {
             let def = parser::Command::FuncDef { name: name.clone(), body: Box::new(body.clone()) };
@@ -504,7 +612,9 @@ impl Shell {
 
     fn run_if(&mut self, branches: &[(Program, Program)], else_branch: &Option<Program>) -> ExecResult {
         for (cond, body) in branches {
+            self.suppress_errexit += 1;
             let cond_result = self.run_program(cond);
+            self.suppress_errexit -= 1;
             if cond_result.is_signal() {
                 return cond_result;
             }
@@ -519,8 +629,11 @@ impl Shell {
     }
 
     fn run_while(&mut self, cond: &Program, body: &Program, until: bool) -> ExecResult {
+        let mut ran_body = false;
         loop {
+            self.suppress_errexit += 1;
             let cond_result = self.run_program(cond);
+            self.suppress_errexit -= 1;
             if cond_result.is_signal() {
                 return cond_result;
             }
@@ -528,6 +641,7 @@ impl Shell {
             if !keep_going {
                 break;
             }
+            ran_body = true;
             match self.run_program(body) {
                 ExecResult::Break(n) => {
                     if n > 1 {
@@ -545,12 +659,18 @@ impl Shell {
                 ret @ ExecResult::Return(_) => return ret,
             }
         }
-        ExecResult::Status(self.last_status)
+        if ran_body {
+            ExecResult::Status(self.last_status)
+        } else {
+            ExecResult::Status(0)
+        }
     }
 
     fn run_for(&mut self, var: &str, words: &[Word], body: &Program) -> ExecResult {
         let values = self.expand_words(words);
+        let mut ran_body = false;
         for val in values {
+            ran_body = true;
             self.assign_var(var, val);
             match self.run_program(body) {
                 ExecResult::Break(n) => {
@@ -569,7 +689,11 @@ impl Shell {
                 ret @ ExecResult::Return(_) => return ret,
             }
         }
-        ExecResult::Status(self.last_status)
+        if ran_body {
+            ExecResult::Status(self.last_status)
+        } else {
+            ExecResult::Status(0)
+        }
     }
 
     fn run_case(&mut self, word: &Word, arms: &[(Vec<Word>, Program)]) -> ExecResult {
@@ -627,11 +751,36 @@ impl Shell {
             return ExecResult::Status(0);
         }
 
-        let argv: Vec<String> = self.expand_words(&cmd.words);
+        let saved_stderr_target = self.current_stderr_target.take();
+        self.current_stderr_target = self.peek_stderr_target(&cmd.redirects);
+        let first_word_literal = match cmd.words[0].chunks.as_slice() {
+            [Chunk::Str(s)] => Some(s.as_str()),
+            _ => None,
+        };
+        let argv: Vec<String> = if matches!(first_word_literal, Some("local") | Some("export")) {
+            // Assignment-builtins: `NAME=value` arguments must not be
+            // word-split on the expanded value (bash treats them like any
+            // other assignment), unlike a normal builtin's arguments.
+            let mut v = vec![first_word_literal.unwrap().to_string()];
+            for w in &cmd.words[1..] {
+                if let Some((name, _mode, val_word)) = parser::word_as_assignment(w) {
+                    v.push(format!("{}={}", name, self.expand_word(&val_word)));
+                } else {
+                    v.push(self.expand_word(w));
+                }
+            }
+            v
+        } else {
+            self.expand_words(&cmd.words)
+        };
+        self.current_stderr_target = saved_stderr_target;
         if argv.is_empty() {
             // Every word vanished (e.g. the command was just an unquoted
             // empty/unset variable) -- matches bash: nothing runs.
             return ExecResult::Status(0);
+        }
+        if self.opt_xtrace {
+            eprintln!("+ {}", argv.join(" "));
         }
         let name = argv[0].clone();
 
@@ -778,6 +927,7 @@ impl Shell {
             }
             "getopts" => return self.run_getopts(&argv[1..]),
             "unset" => return ExecResult::Status(self.run_unset(&argv[1..])),
+            "set" => return ExecResult::Status(self.run_set(&argv[1..])),
             _ => {}
         }
 
@@ -889,12 +1039,25 @@ impl Shell {
                             return 1;
                         }
                     };
+                    let own_redirects = command_own_redirects(other);
+                    let redirs = if own_redirects.is_empty() {
+                        ResolvedRedirs { stdin: None, stdout: None, stderr: None }
+                    } else {
+                        match self.resolve_redirect_list(own_redirects) {
+                            Ok(r) => r,
+                            Err(e) => {
+                                eprintln!("ash: {}", e);
+                                kill_all(children);
+                                return 1;
+                            }
+                        }
+                    };
                     let script = self.functions_preamble() + &crate::serialize::serialize_command(other);
                     let mut command = Command::new(exe);
                     command.arg("-c").arg(script);
-                    command.stdin(default_stdin);
-                    command.stdout(default_stdout);
-                    command.stderr(Stdio::inherit());
+                    command.stdin(redirs.stdin.unwrap_or(default_stdin));
+                    command.stdout(redirs.stdout.unwrap_or(default_stdout));
+                    command.stderr(redirs.stderr.unwrap_or_else(Stdio::inherit));
                     command
                 }
             };
@@ -924,16 +1087,25 @@ impl Shell {
         }
 
         let mut status = 0;
+        let mut pipefail_status = 0;
         for mut c in children {
-            match c.wait() {
-                Ok(s) => status = s.code().unwrap_or(1),
+            let code = match c.wait() {
+                Ok(s) => s.code().unwrap_or(1),
                 Err(e) => {
                     eprintln!("ash: {}", e);
-                    status = 1;
+                    1
                 }
+            };
+            status = code;
+            if code != 0 {
+                pipefail_status = code;
             }
         }
-        status
+        if self.opt_pipefail {
+            pipefail_status
+        } else {
+            status
+        }
     }
 
     fn expand_word(&mut self, w: &Word) -> String {
@@ -941,7 +1113,11 @@ impl Shell {
         for c in &w.chunks {
             match c {
                 Chunk::Str(t) => s.push_str(t),
-                Chunk::Var { name, .. } => s.push_str(&self.lookup_var(name)),
+                Chunk::Var { name, .. } => {
+                    let name = name.clone();
+                    self.check_nounset(&name);
+                    s.push_str(&self.lookup_var(&name));
+                }
                 Chunk::Sub { raw, .. } => s.push_str(&self.run_command_substitution(raw)),
                 Chunk::Arith { raw, .. } => match arith::eval(raw, self) {
                     Ok(v) => s.push_str(&v.to_string()),
@@ -1052,7 +1228,9 @@ impl Shell {
                         let parts = self.arg_frames.last().cloned().unwrap_or_default();
                         append_parts(&mut fields, &mut current, &parts);
                     } else {
-                        let v = self.lookup_var(name);
+                        let name = name.clone();
+                        self.check_nounset(&name);
+                        let v = self.lookup_var(&name);
                         append_splittable(&mut fields, &mut current, &v, *quoted);
                     }
                 }
@@ -1284,6 +1462,32 @@ impl Shell {
         }
     }
 
+    // `set -u`: only a *bare* $VAR/${VAR} reference to a truly-unset name
+    // triggers this -- ${VAR:-default}/${VAR-default}/${VAR?msg} etc are
+    // explicitly exempt in bash (checking for unset is their whole point),
+    // so this is only called from the plain Chunk::Var expansion sites, not
+    // from eval_var_op/eval_array_var_op.
+    fn check_nounset(&mut self, name: &str) {
+        if !self.opt_nounset {
+            return;
+        }
+        let is_special = matches!(name, "?" | "0" | "#" | "@" | "*")
+            || (!name.is_empty() && name.chars().all(|c| c.is_ascii_digit()));
+        if is_special {
+            return;
+        }
+        for scope in &self.var_scopes {
+            if scope.contains_key(name) {
+                return;
+            }
+        }
+        if std::env::var(name).is_err() {
+            eprintln!("ash: {}: unbound variable", name);
+            self.run_exit_trap();
+            std::process::exit(1);
+        }
+    }
+
     // Plain assignment targets the global (process-env) variable, unless it
     // shadows an existing `local` of the same name in the current function
     // scope -- matching bash, where functions don't auto-localize vars.
@@ -1308,14 +1512,19 @@ impl Shell {
     // `2>` redirect entirely -- real bash routes them through it too. Falls
     // back to the shell's real stderr when there's no stderr redirect.
     fn write_command_error(&mut self, cmd: &SimpleCommand, msg: &str) {
+        let target = self.peek_stderr_target(&cmd.redirects);
+        write_diagnostic(&target, msg);
+    }
+
+    fn peek_stderr_target(&mut self, redirects: &[Redirect]) -> Option<String> {
         let mut target: Option<String> = None;
-        for r in &cmd.redirects {
+        for r in redirects {
             match r {
                 Redirect::Err { word, .. } | Redirect::Both { word, .. } => {
                     target = Some(self.expand_word(word));
                 }
                 Redirect::DupErrToOut => {
-                    for r2 in &cmd.redirects {
+                    for r2 in redirects {
                         if let Redirect::Out { word, .. } = r2 {
                             target = Some(self.expand_word(word));
                         }
@@ -1324,17 +1533,7 @@ impl Shell {
                 _ => {}
             }
         }
-        match target {
-            Some(path) => {
-                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
-                    use std::io::Write;
-                    let _ = writeln!(f, "{}", msg);
-                } else {
-                    eprintln!("{}", msg);
-                }
-            }
-            None => eprintln!("{}", msg),
-        }
+        target
     }
 
     fn resolve_redirect_list(&mut self, redirects: &[Redirect]) -> Result<ResolvedRedirs, String> {
@@ -1372,9 +1571,8 @@ impl Shell {
                 }
                 Redirect::Both { word, append } => {
                     let p = self.expand_word(word);
-                    stdout_target = Some((p.clone(), *append));
-                    stderr_target = Some((p, *append));
-                    dup_err_to_out = false;
+                    stdout_target = Some((p, *append));
+                    dup_err_to_out = true;
                 }
                 Redirect::DupErrToOut => dup_err_to_out = true,
             }
@@ -1390,23 +1588,26 @@ impl Shell {
                 None => None,
             }
         };
-        let stdout = match &stdout_target {
-            Some((p, append)) => Some(Stdio::from(open_out(p, *append)?)),
+        let stdout_file: Option<std::fs::File> = match &stdout_target {
+            Some((p, append)) => Some(open_out(p, *append)?),
             None => None,
         };
-        let stderr = if dup_err_to_out {
-            // True fd-dup onto a pipe destination isn't modeled yet; only
-            // the common `> file 2>&1` shape is honored in v1.
-            match &stdout_target {
-                Some((p, append)) => Some(Stdio::from(open_out(p, *append)?)),
+        // Share the real file description (via dup, not a second open) so
+        // stdout/stderr writes interleave through one file offset, matching
+        // `2>&1`'s true fd-dup semantics instead of corrupting each other.
+        let stderr_file: Option<std::fs::File> = if dup_err_to_out {
+            match &stdout_file {
+                Some(f) => Some(f.try_clone().map_err(|e| e.to_string())?),
                 None => None,
             }
         } else {
             match &stderr_target {
-                Some((p, append)) => Some(Stdio::from(open_out(p, *append)?)),
+                Some((p, append)) => Some(open_out(p, *append)?),
                 None => None,
             }
         };
+        let stdout = stdout_file.map(Stdio::from);
+        let stderr = stderr_file.map(Stdio::from);
 
         Ok(ResolvedRedirs { stdin, stdout, stderr })
     }
@@ -1530,9 +1731,38 @@ fn open_out(path: &str, append: bool) -> Result<std::fs::File, String> {
         .map_err(|e| format!("{}: {}", path, e))
 }
 
+fn command_own_redirects(cmd: &parser::Command) -> &[Redirect] {
+    match cmd {
+        parser::Command::If { redirects, .. } => redirects,
+        parser::Command::While { redirects, .. } => redirects,
+        parser::Command::For { redirects, .. } => redirects,
+        parser::Command::Case { redirects, .. } => redirects,
+        parser::Command::Group(_, redirects) => redirects,
+        parser::Command::Subshell(_, redirects) => redirects,
+        parser::Command::Arith(_, redirects) => redirects,
+        _ => &[],
+    }
+}
+
 fn kill_all(children: Vec<std::process::Child>) {
     for mut c in children {
         let _ = c.kill();
         let _ = c.wait();
+    }
+}
+
+// Shared by write_command_error and check_nounset: writes to `target`'s
+// file (append) if set, else falls back to the shell's real stderr.
+fn write_diagnostic(target: &Option<String>, msg: &str) {
+    match target {
+        Some(path) => {
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+                use std::io::Write;
+                let _ = writeln!(f, "{}", msg);
+            } else {
+                eprintln!("{}", msg);
+            }
+        }
+        None => eprintln!("{}", msg),
     }
 }
