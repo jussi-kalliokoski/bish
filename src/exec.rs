@@ -55,6 +55,11 @@ pub struct Shell {
     // array is read or written.
     assoc_arrays: HashMap<String, std::collections::BTreeMap<String, String>>,
     assoc_names: std::collections::HashSet<String>,
+    // `readonly NAME`. Checked by assign_var, the single write path plain
+    // assignment/local/export/declare/arithmetic-assignment/read/getopts
+    // all funnel through, so marking a name here blocks writes everywhere
+    // at once.
+    readonly_names: std::collections::HashSet<String>,
     // `trap CMD EXIT` handler. Only EXIT is implemented -- real signal traps
     // (INT/TERM/...) would need OS signal-handling machinery this
     // dependency-free, single-process design doesn't have; `trap` warns
@@ -90,6 +95,7 @@ impl Shell {
             arrays: HashMap::new(),
             assoc_arrays: HashMap::new(),
             assoc_names: std::collections::HashSet::new(),
+            readonly_names: std::collections::HashSet::new(),
             exit_trap: None,
             opt_errexit: false,
             opt_nounset: false,
@@ -181,8 +187,11 @@ impl Shell {
     }
 
     // unset [-f|-v] NAME... Also accepts `arr[i]` to remove one element
-    // without touching the rest of the array.
-    fn run_unset(&mut self, args: &[String]) -> i32 {
+    // without touching the rest of the array. `stderr_target` mirrors real
+    // bash routing this error through the command's own `2>` (confirmed via
+    // a clean bash probe) -- unlike nounset/plain-assignment errors, which
+    // always go to real stderr since they happen before any redirect setup.
+    fn run_unset(&mut self, args: &[String], stderr_target: &Option<String>) -> i32 {
         let mut only_funcs = false;
         let mut only_vars = false;
         let mut names: Vec<&String> = Vec::new();
@@ -216,6 +225,10 @@ impl Shell {
                     continue;
                 }
             }
+            if self.readonly_names.contains(n.as_str()) {
+                write_diagnostic(stderr_target, &format!("ash: unset: {}: cannot unset: readonly variable", n));
+                continue;
+            }
             self.arrays.remove(n.as_str());
             self.assoc_arrays.remove(n.as_str());
             self.assoc_names.remove(n.as_str());
@@ -244,15 +257,20 @@ impl Shell {
     // accepted but not tracked -- no attribute enforcement, matching how
     // `local`'s scoping-only semantics already work here.
     fn run_declare(&mut self, args: &[String]) -> i32 {
-        let mut assoc_mode = false;
+        let mut array_mode: Option<bool> = None; // Some(true)=-A, Some(false)=-a
+        let mut readonly_flag = false;
         for a in args {
             match a.as_str() {
                 "-A" => {
-                    assoc_mode = true;
+                    array_mode = Some(true);
                     continue;
                 }
                 "-a" => {
-                    assoc_mode = false;
+                    array_mode = Some(false);
+                    continue;
+                }
+                "-r" => {
+                    readonly_flag = true;
                     continue;
                 }
                 _ => {}
@@ -264,14 +282,45 @@ impl Shell {
                 Some(eq) => (a[..eq].to_string(), Some(a[eq + 1..].to_string())),
                 None => (a.clone(), None),
             };
-            if assoc_mode {
-                self.assoc_names.insert(name.clone());
-                self.assoc_arrays.entry(name).or_default();
-            } else if let Some(v) = val {
-                self.assign_var(&name, v);
-            } else if self.lookup_var(&name).is_empty() && std::env::var(&name).is_err() {
-                self.assign_var(&name, String::new());
+            match array_mode {
+                Some(true) => {
+                    self.assoc_names.insert(name.clone());
+                    self.assoc_arrays.entry(name.clone()).or_default();
+                }
+                Some(false) => {
+                    self.arrays.entry(name.clone()).or_default();
+                }
+                None => {
+                    if let Some(v) = val {
+                        self.assign_var(&name, v);
+                    } else if self.lookup_var(&name).is_empty() && std::env::var(&name).is_err() {
+                        self.assign_var(&name, String::new());
+                    }
+                }
             }
+            if readonly_flag {
+                self.readonly_names.insert(name);
+            }
+        }
+        0
+    }
+
+    // readonly NAME[=value]... Marks each name so assign_var refuses future
+    // writes. The initializing assignment (if any) happens before the name
+    // is added to readonly_names, so it isn't rejected by its own call.
+    fn run_readonly(&mut self, args: &[String]) -> i32 {
+        for a in args {
+            if a.starts_with('-') {
+                continue;
+            }
+            let (name, val) = match a.find('=') {
+                Some(eq) => (a[..eq].to_string(), Some(a[eq + 1..].to_string())),
+                None => (a.clone(), None),
+            };
+            if let Some(v) = val {
+                self.assign_var(&name, v);
+            }
+            self.readonly_names.insert(name);
         }
         0
     }
@@ -560,6 +609,11 @@ impl Shell {
                 s.push(' ');
                 s.push_str(&crate::serialize::quote_literal(a));
             }
+            s.push('\n');
+        }
+        for name in &self.readonly_names {
+            s.push_str("readonly ");
+            s.push_str(name);
             s.push('\n');
         }
         for (name, body) in &self.functions {
@@ -891,7 +945,7 @@ impl Shell {
         };
         let argv: Vec<String> = if matches!(
             first_word_literal,
-            Some("local") | Some("export") | Some("declare") | Some("typeset")
+            Some("local") | Some("export") | Some("declare") | Some("typeset") | Some("readonly")
         ) {
             // Assignment-builtins: `NAME=value` arguments must not be
             // word-split on the expanded value (bash treats them like any
@@ -972,12 +1026,42 @@ impl Shell {
                     eprintln!("ash: local: can only be used inside a function");
                     return ExecResult::Status(1);
                 }
+                // `-a`/`-A` name an array rather than a scalar. Arrays have
+                // no scoped storage in this shell (see `arrays`/
+                // `assoc_arrays` on Shell) -- declaring one here just
+                // registers it in the same global maps `declare -a`/`-A`
+                // would, so it's visible after the function returns too,
+                // unlike a real local scalar. Documented gap, not a crash.
+                let mut array_mode: Option<bool> = None;
                 for a in &argv[1..] {
+                    match a.as_str() {
+                        "-a" => {
+                            array_mode = Some(false);
+                            continue;
+                        }
+                        "-A" => {
+                            array_mode = Some(true);
+                            continue;
+                        }
+                        _ if a.starts_with('-') => continue,
+                        _ => {}
+                    }
                     let (n, v) = match a.find('=') {
-                        Some(eq) => (a[..eq].to_string(), a[eq + 1..].to_string()),
-                        None => (a.clone(), String::new()),
+                        Some(eq) => (a[..eq].to_string(), Some(a[eq + 1..].to_string())),
+                        None => (a.clone(), None),
                     };
-                    self.var_scopes.last_mut().unwrap().insert(n, v);
+                    match array_mode {
+                        Some(true) => {
+                            self.assoc_names.insert(n.clone());
+                            self.assoc_arrays.entry(n).or_default();
+                        }
+                        Some(false) => {
+                            self.arrays.entry(n).or_default();
+                        }
+                        None => {
+                            self.var_scopes.last_mut().unwrap().insert(n, v.unwrap_or_default());
+                        }
+                    }
                 }
                 return ExecResult::Status(0);
             }
@@ -1061,9 +1145,13 @@ impl Shell {
                 return ExecResult::Status(0);
             }
             "getopts" => return self.run_getopts(&argv[1..]),
-            "unset" => return ExecResult::Status(self.run_unset(&argv[1..])),
+            "unset" => {
+                let target = self.peek_stderr_target(&cmd.redirects);
+                return ExecResult::Status(self.run_unset(&argv[1..], &target));
+            }
             "set" => return ExecResult::Status(self.run_set(&argv[1..])),
             "declare" | "typeset" => return ExecResult::Status(self.run_declare(&argv[1..])),
+            "readonly" => return ExecResult::Status(self.run_readonly(&argv[1..])),
             _ => {}
         }
 
@@ -1731,6 +1819,10 @@ impl Shell {
     // shadows an existing `local` of the same name in the current function
     // scope -- matching bash, where functions don't auto-localize vars.
     fn assign_var(&mut self, name: &str, value: String) {
+        if self.readonly_names.contains(name) {
+            eprintln!("ash: {}: readonly variable", name);
+            return;
+        }
         for scope in self.var_scopes.iter_mut().rev() {
             if scope.contains_key(name) {
                 scope.insert(name.to_string(), value);
