@@ -100,6 +100,10 @@ fn serialize_simple(sc: &SimpleCommand) -> String {
     for (name, val) in &sc.assigns {
         parts.push(format!("{}={}", name, serialize_word(val)));
     }
+    for (name, items) in &sc.array_assigns {
+        let words: Vec<String> = items.iter().map(serialize_word).collect();
+        parts.push(format!("{}=({})", name, words.join(" ")));
+    }
     for w in &sc.words {
         parts.push(serialize_word(w));
     }
@@ -138,6 +142,8 @@ fn serialize_chunk(c: &Chunk) -> String {
         Chunk::Sub { raw, quoted } => wrap_quoted(format!("$({})", raw), *quoted),
         Chunk::Arith { raw, quoted } => wrap_quoted(format!("$(({}))", raw), *quoted),
         Chunk::VarExpand { name, op, quoted } => wrap_quoted(serialize_var_op(name, op), *quoted),
+        Chunk::ArrayVar { name, index, quoted } => wrap_quoted(format!("${{{}[{}]}}", name, index), *quoted),
+        Chunk::ArrayLength { name, index } => format!("${{#{}[{}]}}", name, index),
     }
 }
 

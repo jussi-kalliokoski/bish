@@ -16,6 +16,14 @@ pub enum Chunk {
     // Raw source text of a $((...)) arithmetic expansion.
     Arith { raw: String, quoted: bool },
     VarExpand { name: String, op: VarOp, quoted: bool },
+    // ${name[index]} -- index is raw text: "@"/"*" (all elements, one
+    // element per field like $@/$*) or an arithmetic expression evaluated
+    // at access time (so ${arr[i+1]} works). No operator chaining on array
+    // elements in v1 (no ${arr[0]:-default}).
+    ArrayVar { name: String, index: String, quoted: bool },
+    // ${#name[index]} -- index "@"/"*" gives the array length; a specific
+    // index gives that element's string length.
+    ArrayLength { name: String, index: String },
 }
 
 // The operand ("word"/"pattern") of each variant is kept as raw source text
@@ -661,6 +669,8 @@ impl<'a> Lexer<'a> {
                     }
                 }
                 BraceContent::Op(name, op) => chunks.push(Chunk::VarExpand { name, op, quoted }),
+                BraceContent::ArrayIndex(name, index) => chunks.push(Chunk::ArrayVar { name, index, quoted }),
+                BraceContent::ArrayLength(name, index) => chunks.push(Chunk::ArrayLength { name, index }),
             }
             return Ok(());
         }
@@ -748,6 +758,28 @@ fn expand_heredoc_chunks(body: &str) -> Result<Vec<Chunk>, String> {
 enum BraceContent {
     Plain(String),
     Op(String, VarOp),
+    ArrayIndex(String, String),
+    ArrayLength(String, String),
+}
+
+// `name[index]` -- name must be a plain identifier; index is everything up
+// to (and requiring) a closing ']' at the very end of `s`, so operator
+// chaining after an array element (${arr[0]:-x}) isn't matched here and
+// falls through to the scalar path unchanged.
+fn try_split_array(s: &str) -> Option<(String, String)> {
+    let bracket = s.find('[')?;
+    let name = &s[..bracket];
+    let mut nc = name.chars();
+    let first = nc.next()?;
+    if !(first.is_alphabetic() || first == '_') || !nc.all(|c| c.is_alphanumeric() || c == '_') {
+        return None;
+    }
+    let rest = &s[bracket + 1..];
+    let close = rest.find(']')?;
+    if close + 1 != rest.len() {
+        return None;
+    }
+    Some((name.to_string(), rest[..close].to_string()))
 }
 
 // Parses the text captured between `${` and `}`. `${#VAR}` (length) is
@@ -755,9 +787,15 @@ enum BraceContent {
 // operator on an empty name.
 fn parse_brace_content(inner: &str) -> BraceContent {
     if let Some(rest) = inner.strip_prefix('#') {
+        if let Some((name, index)) = try_split_array(rest) {
+            return BraceContent::ArrayLength(name, index);
+        }
         if !rest.is_empty() {
             return BraceContent::Op(rest.to_string(), VarOp::Length);
         }
+    }
+    if let Some((name, index)) = try_split_array(inner) {
+        return BraceContent::ArrayIndex(name, index);
     }
 
     let mut name_end = 0;

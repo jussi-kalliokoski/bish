@@ -1,4 +1,4 @@
-use crate::lexer::{Chunk, Tok};
+use crate::lexer::{Chunk, Lexer, Tok};
 
 #[derive(Debug, Clone)]
 pub struct Word {
@@ -20,6 +20,9 @@ pub enum Redirect {
 #[derive(Debug, Clone)]
 pub struct SimpleCommand {
     pub assigns: Vec<(String, Word)>,
+    // `name=(word word ...)` array literals -- kept separate from `assigns`
+    // since array values don't fit the scalar Word model.
+    pub array_assigns: Vec<(String, Vec<Word>)>,
     pub words: Vec<Word>,
     pub redirects: Vec<Redirect>,
 }
@@ -454,6 +457,7 @@ impl Parser {
 
     fn parse_simple_command(&mut self) -> Result<SimpleCommand, String> {
         let mut assigns = Vec::new();
+        let mut array_assigns = Vec::new();
         let mut words = Vec::new();
         let mut redirects = Vec::new();
         let mut in_assign_phase = true;
@@ -468,6 +472,21 @@ impl Parser {
                     let w = Word { chunks, globbable };
                     if in_assign_phase {
                         if let Some((name, val)) = word_as_assignment(&w) {
+                            // `name=(...)` array literal: the lexer already
+                            // captured the parenthesized content as a raw
+                            // Subshell token (no space allowed between `=`
+                            // and `(`, matching bash's own syntax rule).
+                            if is_empty_word(&val) {
+                                if let Some(Tok::Subshell(_)) = self.peek() {
+                                    let raw = match self.advance() {
+                                        Some(Tok::Subshell(r)) => r,
+                                        _ => unreachable!(),
+                                    };
+                                    let items = split_array_literal_words(&raw)?;
+                                    array_assigns.push((name, items));
+                                    continue;
+                                }
+                            }
                             assigns.push((name, val));
                             continue;
                         }
@@ -518,10 +537,10 @@ impl Parser {
             }
         }
 
-        if assigns.is_empty() && words.is_empty() && redirects.is_empty() {
+        if assigns.is_empty() && array_assigns.is_empty() && words.is_empty() && redirects.is_empty() {
             return Err("expected command".to_string());
         }
-        Ok(SimpleCommand { assigns, words, redirects })
+        Ok(SimpleCommand { assigns, array_assigns, words, redirects })
     }
 
     fn expect_word(&mut self) -> Result<Word, String> {
@@ -546,6 +565,27 @@ fn word_as_assignment(w: &Word) -> Option<(String, Word)> {
         }
     }
     None
+}
+
+fn is_empty_word(w: &Word) -> bool {
+    matches!(w.chunks.as_slice(), [Chunk::Str(s)] if s.is_empty()) || w.chunks.is_empty()
+}
+
+// Re-lexes the raw captured text of an array literal's `(...)` body as a
+// plain whitespace-separated word list. Reuses the general word tokenizer
+// (rather than a bespoke splitter) so quoting/expansions inside the literal
+// (`arr=("$x" 'lit' $(cmd))`) work exactly like anywhere else.
+fn split_array_literal_words(raw: &str) -> Result<Vec<Word>, String> {
+    let toks = Lexer::new(raw).tokenize()?;
+    let mut words = Vec::new();
+    for t in toks {
+        match t {
+            Tok::Word(chunks, globbable) => words.push(Word { chunks, globbable }),
+            Tok::Newline => {}
+            other => return Err(format!("unexpected token in array literal: {:?}", other)),
+        }
+    }
+    Ok(words)
 }
 
 fn word_to_plain_name(chunks: &[Chunk]) -> Option<String> {

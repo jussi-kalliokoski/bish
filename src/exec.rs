@@ -43,6 +43,9 @@ pub struct Shell {
     // matches an existing local of the same name, matching bash semantics.
     var_scopes: Vec<HashMap<String, String>>,
     script_name: String,
+    // Indexed arrays (`arr=(...)`). Global only in v1 -- no `local` arrays,
+    // no sparse/associative arrays, no `+=`/`arr[i]=` mutation yet.
+    arrays: HashMap<String, Vec<String>>,
 }
 
 impl Shell {
@@ -53,6 +56,7 @@ impl Shell {
             arg_frames: vec![Vec::new()],
             var_scopes: Vec::new(),
             script_name: "ash".to_string(),
+            arrays: HashMap::new(),
         }
     }
 
@@ -227,6 +231,15 @@ impl Shell {
             s.push('=');
             s.push_str(&crate::serialize::quote_literal(v));
             s.push('\n');
+        }
+        for (name, items) in &self.arrays {
+            s.push_str(name);
+            s.push_str("=(");
+            for item in items {
+                s.push_str(&crate::serialize::quote_literal(item));
+                s.push(' ');
+            }
+            s.push_str(")\n");
         }
         for (name, body) in &self.functions {
             let def = parser::Command::FuncDef { name: name.clone(), body: Box::new(body.clone()) };
@@ -436,6 +449,10 @@ impl Shell {
             for (name, val) in &cmd.assigns {
                 let v = self.expand_word(val);
                 self.assign_var(name, v);
+            }
+            for (name, items) in &cmd.array_assigns {
+                let values: Vec<String> = items.iter().map(|w| self.expand_word(w)).collect();
+                self.arrays.insert(name.clone(), values);
             }
             if !cmd.redirects.is_empty() {
                 // side effect only: create/truncate/append the target files
@@ -738,9 +755,57 @@ impl Shell {
                     let op = op.clone();
                     s.push_str(&self.eval_var_op(&name, &op));
                 }
+                Chunk::ArrayVar { name, index, .. } => {
+                    let name = name.clone();
+                    let index = index.clone();
+                    s.push_str(&self.array_element(&name, &index));
+                }
+                Chunk::ArrayLength { name, index } => {
+                    let name = name.clone();
+                    let index = index.clone();
+                    s.push_str(&self.array_length(&name, &index).to_string());
+                }
             }
         }
         s
+    }
+
+    // index "@"/"*" joins all elements with a space (used outside the
+    // splitting-aware path, where "@" vs "*" can't be distinguished anyway);
+    // any other index is evaluated as an arithmetic expression (so
+    // `${arr[i+1]}` works) and looked up 0-based.
+    fn array_element(&mut self, name: &str, index: &str) -> String {
+        if index == "@" || index == "*" {
+            return self.arrays.get(name).cloned().unwrap_or_default().join(" ");
+        }
+        match arith::eval(index, self) {
+            Ok(i) if i >= 0 => self
+                .arrays
+                .get(name)
+                .and_then(|v| v.get(i as usize))
+                .cloned()
+                .unwrap_or_default(),
+            _ => String::new(),
+        }
+    }
+
+    fn array_all(&self, name: &str) -> Vec<String> {
+        self.arrays.get(name).cloned().unwrap_or_default()
+    }
+
+    fn array_length(&mut self, name: &str, index: &str) -> usize {
+        if index == "@" || index == "*" {
+            return self.arrays.get(name).map(|v| v.len()).unwrap_or(0);
+        }
+        match arith::eval(index, self) {
+            Ok(i) if i >= 0 => self
+                .arrays
+                .get(name)
+                .and_then(|v| v.get(i as usize))
+                .map(|s| s.chars().count())
+                .unwrap_or(0),
+            _ => 0,
+        }
     }
 
     // Bash word-splitting: unquoted expansion results are split on
@@ -791,6 +856,30 @@ impl Shell {
                     let op = op.clone();
                     let v = self.eval_var_op(&name, &op);
                     append_splittable(&mut fields, &mut current, &v, *quoted);
+                }
+                Chunk::ArrayVar { name, index, quoted } => {
+                    // "${arr[@]}" is the array analog of "$@": one field per
+                    // element even though it's quoted. "${arr[*]}" (quoted
+                    // or not) and unquoted "${arr[@]}" join with a space
+                    // first, like $*.
+                    if index == "@" && *quoted {
+                        let items = self.array_all(name);
+                        append_parts(&mut fields, &mut current, &items);
+                    } else if index == "@" || index == "*" {
+                        let joined = self.array_all(name).join(" ");
+                        append_splittable(&mut fields, &mut current, &joined, *quoted);
+                    } else {
+                        let name = name.clone();
+                        let index = index.clone();
+                        let v = self.array_element(&name, &index);
+                        append_splittable(&mut fields, &mut current, &v, *quoted);
+                    }
+                }
+                Chunk::ArrayLength { name, index } => {
+                    let name = name.clone();
+                    let index = index.clone();
+                    let v = self.array_length(&name, &index).to_string();
+                    append_splittable(&mut fields, &mut current, &v, true);
                 }
             }
         }
