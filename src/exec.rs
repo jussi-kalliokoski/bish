@@ -207,9 +207,9 @@ impl Shell {
                             map.remove(&key);
                         }
                     } else if let Ok(i) = arith::eval(idx_expr, self) {
-                        if i >= 0 {
+                        if let Some(idx) = self.resolve_array_index(&arr_name, i) {
                             if let Some(map) = self.arrays.get_mut(&arr_name) {
-                                map.remove(&(i as usize));
+                                map.remove(&idx);
                             }
                         }
                     }
@@ -433,7 +433,13 @@ impl Shell {
             parser::Command::For { var, words, body, .. } => {
                 let var = var.clone();
                 let words = words.clone();
-                self.run_for(&var, &words, body)
+                self.run_for(&var, words.as_deref(), body)
+            }
+            parser::Command::CFor { init, cond, step, body, .. } => {
+                let init = init.clone();
+                let cond = cond.clone();
+                let step = step.clone();
+                self.run_cfor(&init, &cond, &step, body)
             }
             parser::Command::Case { word, arms, .. } => self.run_case(word, arms),
             parser::Command::Group(prog, _redirects) => self.run_program(prog),
@@ -732,8 +738,11 @@ impl Shell {
         }
     }
 
-    fn run_for(&mut self, var: &str, words: &[Word], body: &Program) -> ExecResult {
-        let values = self.expand_words(words);
+    fn run_for(&mut self, var: &str, words: Option<&[Word]>, body: &Program) -> ExecResult {
+        let values = match words {
+            Some(words) => self.expand_words(words),
+            None => self.arg_frames.last().cloned().unwrap_or_default(),
+        };
         let mut ran_body = false;
         for val in values {
             ran_body = true;
@@ -753,6 +762,63 @@ impl Shell {
                 }
                 ExecResult::Status(s) => self.last_status = s,
                 ret @ ExecResult::Return(_) => return ret,
+            }
+        }
+        if ran_body {
+            ExecResult::Status(self.last_status)
+        } else {
+            ExecResult::Status(0)
+        }
+    }
+
+    // `for ((init; cond; step)); do body; done`. Unlike run_for/run_while,
+    // `continue` must still run `step` before re-checking `cond` -- so the
+    // Continue arm falls through to the step evaluation below instead of
+    // looping straight back like a plain `while`'s `continue` does.
+    fn run_cfor(&mut self, init: &str, cond: &str, step: &str, body: &Program) -> ExecResult {
+        if !init.is_empty() {
+            if let Err(e) = arith::eval(init, self) {
+                eprintln!("ash: (({})): {}", init, e);
+                return ExecResult::Status(1);
+            }
+        }
+        let mut ran_body = false;
+        loop {
+            let keep_going = if cond.is_empty() {
+                true
+            } else {
+                match arith::eval(cond, self) {
+                    Ok(v) => v != 0,
+                    Err(e) => {
+                        eprintln!("ash: (({})): {}", cond, e);
+                        return ExecResult::Status(1);
+                    }
+                }
+            };
+            if !keep_going {
+                break;
+            }
+            ran_body = true;
+            match self.run_program(body) {
+                ExecResult::Break(n) => {
+                    if n > 1 {
+                        return ExecResult::Break(n - 1);
+                    }
+                    break;
+                }
+                ExecResult::Continue(n) => {
+                    if n > 1 {
+                        return ExecResult::Continue(n - 1);
+                    }
+                }
+                ExecResult::Status(s) => self.last_status = s,
+                ret @ ExecResult::Return(_) => return ret,
+            }
+            if !step.is_empty() {
+                if let Err(e) = arith::eval(step, self) {
+                    eprintln!("ash: (({})): {}", step, e);
+                    return ExecResult::Status(1);
+                }
             }
         }
         if ran_body {
@@ -1247,6 +1313,24 @@ impl Shell {
         }
     }
 
+    // Negative indices count back from the end: bash defines them as
+    // relative to one greater than the array's maximum set index, so -1 is
+    // the last (highest-index) element. Only meaningful for indexed arrays
+    // -- associative-array indices are plain string keys, never resolved
+    // here.
+    fn resolve_array_index(&self, name: &str, i: i64) -> Option<usize> {
+        if i >= 0 {
+            return Some(i as usize);
+        }
+        let max = *self.arrays.get(name)?.keys().next_back()?;
+        let resolved = max as i64 + 1 + i;
+        if resolved >= 0 {
+            Some(resolved as usize)
+        } else {
+            None
+        }
+    }
+
     fn array_element(&mut self, name: &str, index: &str) -> String {
         if index == "@" || index == "*" {
             return self.array_all(name).join(" ");
@@ -1256,13 +1340,11 @@ impl Shell {
             return self.assoc_arrays.get(name).and_then(|m| m.get(&key)).cloned().unwrap_or_default();
         }
         match arith::eval(index, self) {
-            Ok(i) if i >= 0 => self
-                .arrays
-                .get(name)
-                .and_then(|m| m.get(&(i as usize)))
-                .cloned()
-                .unwrap_or_default(),
-            _ => String::new(),
+            Ok(i) => match self.resolve_array_index(name, i) {
+                Some(idx) => self.arrays.get(name).and_then(|m| m.get(&idx)).cloned().unwrap_or_default(),
+                None => String::new(),
+            },
+            Err(_) => String::new(),
         }
     }
 
@@ -1299,13 +1381,16 @@ impl Shell {
                 .unwrap_or(0);
         }
         match arith::eval(index, self) {
-            Ok(i) if i >= 0 => self
-                .arrays
-                .get(name)
-                .and_then(|m| m.get(&(i as usize)))
-                .map(|s| s.chars().count())
-                .unwrap_or(0),
-            _ => 0,
+            Ok(i) => match self.resolve_array_index(name, i) {
+                Some(idx) => self
+                    .arrays
+                    .get(name)
+                    .and_then(|m| m.get(&idx))
+                    .map(|s| s.chars().count())
+                    .unwrap_or(0),
+                None => 0,
+            },
+            Err(_) => 0,
         }
     }
 
@@ -1318,8 +1403,14 @@ impl Shell {
             return;
         }
         let i = match arith::eval(index, self) {
-            Ok(i) if i >= 0 => i as usize,
-            _ => {
+            Ok(i) => match self.resolve_array_index(name, i) {
+                Some(idx) => idx,
+                None => {
+                    eprintln!("ash: {}: bad array index: {}", name, index);
+                    return;
+                }
+            },
+            Err(_) => {
                 eprintln!("ash: {}: bad array index: {}", name, index);
                 return;
             }
@@ -1907,6 +1998,7 @@ fn command_own_redirects(cmd: &parser::Command) -> &[Redirect] {
         parser::Command::If { redirects, .. } => redirects,
         parser::Command::While { redirects, .. } => redirects,
         parser::Command::For { redirects, .. } => redirects,
+        parser::Command::CFor { redirects, .. } => redirects,
         parser::Command::Case { redirects, .. } => redirects,
         parser::Command::Group(_, redirects) => redirects,
         parser::Command::Subshell(_, redirects) => redirects,

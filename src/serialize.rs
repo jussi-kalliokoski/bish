@@ -70,9 +70,20 @@ pub fn serialize_command(cmd: &Command) -> String {
             s
         }
         Command::For { var, words, body, .. } => {
-            let mut s = format!("for {} in ", var);
-            s.push_str(&words.iter().map(serialize_word).collect::<Vec<_>>().join(" "));
-            s.push_str("\ndo\n");
+            let mut s = format!("for {} ", var);
+            if let Some(words) = words {
+                s.push_str("in ");
+                s.push_str(&words.iter().map(serialize_word).collect::<Vec<_>>().join(" "));
+                s.push('\n');
+            }
+            s.push_str("do\n");
+            s.push_str(&serialize_program(body));
+            s.push_str("done");
+            s
+        }
+        Command::CFor { init, cond, step, body, .. } => {
+            let mut s = format!("for (({}; {}; {}))\n", init, cond, step);
+            s.push_str("do\n");
             s.push_str(&serialize_program(body));
             s.push_str("done");
             s

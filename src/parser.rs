@@ -58,7 +58,17 @@ pub enum Command {
     },
     For {
         var: String,
-        words: Vec<Word>,
+        // `None` means the `in ...` clause was omitted entirely (bash
+        // iterates "$@" in that case); `Some(vec)` is an explicit list,
+        // which may itself be empty (`for x in; do ...` -- zero iterations).
+        words: Option<Vec<Word>>,
+        body: Program,
+        redirects: Vec<Redirect>,
+    },
+    CFor {
+        init: String,
+        cond: String,
+        step: String,
         body: Program,
         redirects: Vec<Redirect>,
     },
@@ -349,6 +359,22 @@ impl Parser {
 
     fn parse_for(&mut self) -> Result<Command, String> {
         self.advance(); // KwFor
+        if let Some(Tok::Arith(_)) = self.peek() {
+            let raw = match self.advance() {
+                Some(Tok::Arith(raw)) => raw,
+                _ => unreachable!(),
+            };
+            let mut parts = raw.splitn(3, ';');
+            let init = parts.next().unwrap_or("").trim().to_string();
+            let cond = parts.next().unwrap_or("").trim().to_string();
+            let step = parts.next().unwrap_or("").trim().to_string();
+            self.skip_terminators();
+            self.expect(Tok::KwDo)?;
+            let body = self.parse_list_until(&[Tok::KwDone])?;
+            self.expect(Tok::KwDone)?;
+            let redirects = self.parse_trailing_redirects()?;
+            return Ok(Command::CFor { init, cond, step, body, redirects });
+        }
         let var = match self.advance() {
             Some(Tok::Word(chunks, _)) => word_to_plain_name(&chunks)
                 .ok_or_else(|| "expected a plain variable name after 'for'".to_string())?,
@@ -356,20 +382,21 @@ impl Parser {
         };
         self.skip_terminators();
 
-        let mut words = Vec::new();
+        let mut words = None;
         if matches!(self.peek(), Some(Tok::KwIn)) {
             self.advance();
+            let mut list = Vec::new();
             while let Some(Tok::Word(_, _)) = self.peek() {
                 if let Some(Tok::Word(chunks, globbable)) = self.advance() {
-                    words.push(Word { chunks, globbable });
+                    list.push(Word { chunks, globbable });
                 }
             }
             if matches!(self.peek(), Some(Tok::Semi) | Some(Tok::Newline)) {
                 self.advance();
             }
+            words = Some(list);
         }
-        // No "in ...": bash iterates "$@" here. Positional params land in
-        // M3; until then this is an empty (zero-iteration) loop.
+        // No "in ...": bash iterates "$@" here (words stays None).
         self.skip_terminators();
         self.expect(Tok::KwDo)?;
         let body = self.parse_list_until(&[Tok::KwDone])?;
