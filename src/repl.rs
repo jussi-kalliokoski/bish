@@ -21,6 +21,7 @@ pub fn run(shell: &mut Shell) {
                 if !buffer.is_empty() {
                     eprintln!("ash: syntax error: unexpected end of input");
                 }
+                shell.run_exit_trap();
                 break;
             }
             Ok(_) => {

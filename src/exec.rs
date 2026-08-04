@@ -46,6 +46,12 @@ pub struct Shell {
     // Indexed arrays (`arr=(...)`). Global only in v1 -- no `local` arrays,
     // no sparse/associative arrays, no `+=`/`arr[i]=` mutation yet.
     arrays: HashMap<String, Vec<String>>,
+    // `trap CMD EXIT` handler. Only EXIT is implemented -- real signal traps
+    // (INT/TERM/...) would need OS signal-handling machinery this
+    // dependency-free, single-process design doesn't have; `trap` warns
+    // rather than silently no-oping for those instead of pretending to
+    // support them.
+    exit_trap: Option<String>,
 }
 
 impl Shell {
@@ -57,7 +63,88 @@ impl Shell {
             var_scopes: Vec::new(),
             script_name: "ash".to_string(),
             arrays: HashMap::new(),
+            exit_trap: None,
         }
+    }
+
+    pub fn run_exit_trap(&mut self) {
+        if let Some(cmd) = self.exit_trap.take() {
+            self.run_source_here(&cmd, "trap");
+        }
+    }
+
+    // getopts optstring name [args...]. Options requiring an argument are
+    // marked with a trailing ':' in optstring (e.g. "ab:c"); a leading ':'
+    // switches to "silent" error mode (custom handling via OPTARG/'?'/':'
+    // instead of a printed message), matching bash.
+    fn run_getopts(&mut self, args: &[String]) -> ExecResult {
+        let optstring = args.first().cloned().unwrap_or_default();
+        let varname = match args.get(1) {
+            Some(v) => v.clone(),
+            None => {
+                eprintln!("ash: getopts: usage: getopts optstring name [args]");
+                return ExecResult::Status(2);
+            }
+        };
+        let positional: Vec<String> =
+            if args.len() > 2 { args[2..].to_vec() } else { self.arg_frames.last().cloned().unwrap_or_default() };
+
+        let optind: usize = self.lookup_var("OPTIND").trim().parse().unwrap_or(1);
+        let idx = optind.saturating_sub(1);
+
+        if idx >= positional.len() {
+            return ExecResult::Status(1);
+        }
+        let cur = positional[idx].clone();
+        if !cur.starts_with('-') || cur == "-" {
+            return ExecResult::Status(1);
+        }
+        if cur == "--" {
+            self.assign_var("OPTIND", (optind + 1).to_string());
+            return ExecResult::Status(1);
+        }
+
+        let opt_char = cur.chars().nth(1).unwrap_or('?');
+        let silent = optstring.starts_with(':');
+        let spec = optstring.trim_start_matches(':');
+
+        let Some(pos) = spec.find(opt_char) else {
+            if silent {
+                self.assign_var(&varname, "?".to_string());
+                self.assign_var("OPTARG", opt_char.to_string());
+            } else {
+                eprintln!("ash: getopts: illegal option -- '{}'", opt_char);
+                self.assign_var(&varname, "?".to_string());
+            }
+            self.assign_var("OPTIND", (optind + 1).to_string());
+            return ExecResult::Status(0);
+        };
+
+        let needs_arg = spec.as_bytes().get(pos + 1) == Some(&b':');
+        if needs_arg {
+            let rest: String = cur.chars().skip(2).collect();
+            if !rest.is_empty() {
+                self.assign_var("OPTARG", rest);
+                self.assign_var("OPTIND", (optind + 1).to_string());
+            } else if idx + 1 < positional.len() {
+                self.assign_var("OPTARG", positional[idx + 1].clone());
+                self.assign_var("OPTIND", (optind + 2).to_string());
+            } else {
+                if silent {
+                    self.assign_var(&varname, ":".to_string());
+                    self.assign_var("OPTARG", opt_char.to_string());
+                } else {
+                    eprintln!("ash: getopts: option requires an argument -- '{}'", opt_char);
+                    self.assign_var(&varname, "?".to_string());
+                }
+                self.assign_var("OPTIND", (optind + 1).to_string());
+                return ExecResult::Status(0);
+            }
+        } else {
+            self.assign_var("OPTIND", (optind + 1).to_string());
+        }
+        self.assign_var(&varname, opt_char.to_string());
+        ExecResult::Status(0)
     }
 
     pub fn set_script_args(&mut self, name: String, args: Vec<String>) {
@@ -536,6 +623,7 @@ impl Shell {
                     .get(1)
                     .and_then(|s| s.parse::<i32>().ok())
                     .unwrap_or(self.last_status);
+                self.run_exit_trap();
                 std::process::exit(code);
             }
             "read" => {
@@ -592,6 +680,24 @@ impl Shell {
                     }
                 }
             }
+            "trap" => {
+                if argv.len() < 3 {
+                    return ExecResult::Status(0);
+                }
+                let cmd_str = argv[1].clone();
+                for sig in &argv[2..] {
+                    if sig == "EXIT" {
+                        self.exit_trap = Some(cmd_str.clone());
+                    } else {
+                        eprintln!(
+                            "ash: trap: signal '{}' is not supported yet (only EXIT is honored)",
+                            sig
+                        );
+                    }
+                }
+                return ExecResult::Status(0);
+            }
+            "getopts" => return self.run_getopts(&argv[1..]),
             _ => {}
         }
 

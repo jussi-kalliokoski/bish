@@ -47,6 +47,7 @@ fn run_source(shell: &mut exec::Shell, src: &str) -> i32 {
         Ok(toks) => match parser::Parser::new(toks).parse_program() {
             Ok(prog) => {
                 shell.run_program(&prog);
+                shell.run_exit_trap();
                 shell.last_status
             }
             Err(e) => {
