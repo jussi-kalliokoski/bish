@@ -55,7 +55,10 @@ pub enum Tok {
     RedirBoth { append: bool },
     DupErrToOut,
     HereString,
-    HereDocUnsupported,
+    // Placeholder pushed at the `<<WORD` site; patched in place with the
+    // real (already expansion-processed) body once the line's newline is
+    // reached (see Lexer::pending_heredocs).
+    HereDoc(Vec<Chunk>),
     Newline,
     LBrace,
     RBrace,
@@ -103,11 +106,16 @@ fn keyword(s: &str) -> Option<Tok> {
 
 pub struct Lexer<'a> {
     chars: std::iter::Peekable<std::str::Chars<'a>>,
+    // (index into `toks`, delimiter, strip-leading-tabs, expand-in-body) for
+    // each `<<`/`<<-` seen on the current logical line, resolved once the
+    // line's terminating newline is reached (see the body-capture comment
+    // below for why this two-phase approach is needed).
+    pending_heredocs: Vec<(usize, String, bool, bool)>,
 }
 
 impl<'a> Lexer<'a> {
     pub fn new(src: &'a str) -> Self {
-        Lexer { chars: src.chars().peekable() }
+        Lexer { chars: src.chars().peekable(), pending_heredocs: Vec::new() }
     }
 
     pub fn tokenize(mut self) -> Result<Vec<Tok>, String> {
@@ -127,6 +135,24 @@ impl<'a> Lexer<'a> {
                 Some('\n') => {
                     self.chars.next();
                     toks.push(Tok::Newline);
+                    // A `<<WORD` redirect's body is the lines immediately
+                    // following the line it appeared on, not the text right
+                    // after the operator -- so the operator is tokenized
+                    // where it appears (as a placeholder), and the body is
+                    // only captured once we reach this newline, then patched
+                    // into the already-pushed placeholder token.
+                    if !self.pending_heredocs.is_empty() {
+                        let pending = std::mem::take(&mut self.pending_heredocs);
+                        for (tok_idx, delim, strip_tabs, expand) in pending {
+                            let body = self.capture_heredoc_body(&delim, strip_tabs);
+                            let chunks = if expand {
+                                expand_heredoc_chunks(&body)?
+                            } else {
+                                vec![Chunk::Str(body)]
+                            };
+                            toks[tok_idx] = Tok::HereDoc(chunks);
+                        }
+                    }
                 }
                 Some('|') => {
                     self.chars.next();
@@ -206,13 +232,15 @@ impl<'a> Lexer<'a> {
                             self.chars.next();
                             toks.push(Tok::HereString);
                         } else {
-                            // Real here-docs (<<, <<-) aren't implemented
-                            // yet -- surface a clear error instead of a
-                            // confusing downstream parse failure.
-                            if self.chars.peek().copied() == Some('-') {
+                            let strip_tabs = self.chars.peek().copied() == Some('-');
+                            if strip_tabs {
                                 self.chars.next();
                             }
-                            toks.push(Tok::HereDocUnsupported);
+                            self.skip_spaces();
+                            let (delim, expand) = self.read_heredoc_delimiter();
+                            let tok_idx = toks.len();
+                            toks.push(Tok::HereDoc(vec![Chunk::Str(String::new())]));
+                            self.pending_heredocs.push((tok_idx, delim, strip_tabs, expand));
                         }
                     } else {
                         toks.push(Tok::RedirIn);
@@ -369,6 +397,70 @@ impl<'a> Lexer<'a> {
             }
         }
         Ok(s)
+    }
+
+    // Reads the delimiter word after `<<`/`<<-`. Only the common forms are
+    // supported: a bare identifier-like word, or one fully wrapped in single
+    // or double quotes -- either quote form suppresses expansion in the
+    // body (matching bash: any quoting anywhere in the delimiter disables
+    // it), a bare word allows it.
+    fn read_heredoc_delimiter(&mut self) -> (String, bool) {
+        match self.chars.peek().copied() {
+            Some(q @ ('\'' | '"')) => {
+                self.chars.next();
+                let mut s = String::new();
+                while let Some(c) = self.chars.next() {
+                    if c == q {
+                        break;
+                    }
+                    s.push(c);
+                }
+                (s, false)
+            }
+            _ => {
+                let mut s = String::new();
+                while let Some(c) = self.chars.peek().copied() {
+                    if c.is_whitespace() || matches!(c, ';' | '|' | '&' | '<' | '>' | '(' | ')') {
+                        break;
+                    }
+                    s.push(c);
+                    self.chars.next();
+                }
+                (s, true)
+            }
+        }
+    }
+
+    // Reads raw lines (bypassing normal tokenization entirely) until one
+    // equals the delimiter, per bash here-doc rules. `strip_tabs` (the `<<-`
+    // form) strips leading tabs from both the delimiter comparison and the
+    // retained body lines.
+    fn capture_heredoc_body(&mut self, delimiter: &str, strip_tabs: bool) -> String {
+        let mut body = String::new();
+        loop {
+            let mut line = String::new();
+            let mut saw_newline = false;
+            loop {
+                match self.chars.next() {
+                    None => break,
+                    Some('\n') => {
+                        saw_newline = true;
+                        break;
+                    }
+                    Some(c) => line.push(c),
+                }
+            }
+            let compare = if strip_tabs { line.trim_start_matches('\t') } else { line.as_str() };
+            if compare == delimiter {
+                break;
+            }
+            body.push_str(compare);
+            body.push('\n');
+            if !saw_newline {
+                break; // EOF without a closing delimiter -- best-effort stop
+            }
+        }
+        body
     }
 
     fn skip_spaces(&mut self) {
@@ -548,6 +640,60 @@ impl<'a> Lexer<'a> {
             name
         }
     }
+}
+
+// Expands $VAR / $(...) / `...` / $((...)) within an expansion-enabled
+// here-doc body. Can't reuse read_word directly since it breaks words on
+// unquoted newlines/whitespace -- a heredoc body must keep embedded
+// newlines as literal content, not word separators. Backslash escaping
+// here mirrors double-quote semantics (only \$, \\, \` are special).
+// Expansions are marked `quoted: true` since the body is used verbatim as
+// stdin text, never word-split.
+fn expand_heredoc_chunks(body: &str) -> Result<Vec<Chunk>, String> {
+    let mut lexer = Lexer::new(body);
+    let mut chunks: Vec<Chunk> = Vec::new();
+    let mut buf = String::new();
+    loop {
+        match lexer.chars.peek().copied() {
+            None => break,
+            Some('\\') => {
+                lexer.chars.next();
+                match lexer.chars.next() {
+                    Some(n) if n == '$' || n == '\\' || n == '`' => buf.push(n),
+                    Some(n) => {
+                        buf.push('\\');
+                        buf.push(n);
+                    }
+                    None => buf.push('\\'),
+                }
+            }
+            Some('$') => {
+                lexer.chars.next();
+                if !buf.is_empty() {
+                    chunks.push(Chunk::Str(std::mem::take(&mut buf)));
+                }
+                lexer.push_var(&mut chunks, &mut buf, true)?;
+            }
+            Some('`') => {
+                lexer.chars.next();
+                if !buf.is_empty() {
+                    chunks.push(Chunk::Str(std::mem::take(&mut buf)));
+                }
+                chunks.push(Chunk::Sub { raw: lexer.capture_backtick()?, quoted: true });
+            }
+            Some(c) => {
+                lexer.chars.next();
+                buf.push(c);
+            }
+        }
+    }
+    if !buf.is_empty() {
+        chunks.push(Chunk::Str(buf));
+    }
+    if chunks.is_empty() {
+        chunks.push(Chunk::Str(String::new()));
+    }
+    Ok(chunks)
 }
 
 enum BraceContent {

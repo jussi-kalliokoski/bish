@@ -117,6 +117,10 @@ fn serialize_redirect(r: &Redirect) -> String {
         Redirect::Both { word, append } => format!("&{}{}", if *append { ">>" } else { ">" }, serialize_word(word)),
         Redirect::DupErrToOut => "2>&1".to_string(),
         Redirect::HereString(w) => format!("<<<{}", serialize_word(w)),
+        // Re-emit as an equivalent here-string: by serialization time the
+        // body is already fully captured, so a real <<DELIM...DELIM block
+        // isn't needed to reproduce the same runtime content.
+        Redirect::HereDoc(w) => format!("<<<{}", serialize_word(w)),
     }
 }
 

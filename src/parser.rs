@@ -14,6 +14,7 @@ pub enum Redirect {
     Both { word: Word, append: bool },
     DupErrToOut,
     HereString(Word),
+    HereDoc(Word),
 }
 
 #[derive(Debug, Clone)]
@@ -438,8 +439,12 @@ impl Parser {
                     let word = self.expect_word()?;
                     redirects.push(Redirect::HereString(word));
                 }
-                Some(Tok::HereDocUnsupported) => {
-                    return Err("here-docs (<<, <<-) aren't supported yet; use <<< for a here-string".to_string());
+                Some(Tok::HereDoc(_)) => {
+                    let chunks = match self.advance() {
+                        Some(Tok::HereDoc(c)) => c,
+                        _ => unreachable!(),
+                    };
+                    redirects.push(Redirect::HereDoc(Word { chunks, globbable: false }));
                 }
                 _ => break,
             }
@@ -502,8 +507,12 @@ impl Parser {
                     let word = self.expect_word()?;
                     redirects.push(Redirect::HereString(word));
                 }
-                Some(Tok::HereDocUnsupported) => {
-                    return Err("here-docs (<<, <<-) aren't supported yet; use <<< for a here-string".to_string());
+                Some(Tok::HereDoc(_)) => {
+                    let chunks = match self.advance() {
+                        Some(Tok::HereDoc(c)) => c,
+                        _ => unreachable!(),
+                    };
+                    redirects.push(Redirect::HereDoc(Word { chunks, globbable: false }));
                 }
                 _ => break,
             }

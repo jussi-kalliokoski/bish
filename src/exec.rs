@@ -166,6 +166,10 @@ impl Shell {
                     content.push('\n');
                     return Box::new(std::io::Cursor::new(content.into_bytes()));
                 }
+                Redirect::HereDoc(w) => {
+                    let content = self.expand_word(w);
+                    return Box::new(std::io::Cursor::new(content.into_bytes()));
+                }
                 Redirect::In(w) => {
                     let p = self.expand_word(w);
                     return match std::fs::File::open(&p) {
@@ -948,6 +952,12 @@ impl Shell {
                     let mut content = self.expand_word(w);
                     content.push('\n');
                     here_string = Some(content);
+                    stdin_path = None;
+                }
+                Redirect::HereDoc(w) => {
+                    // Body already ends in '\n' from capture_heredoc_body;
+                    // reuses the same temp-file Stdio plumbing as <<<.
+                    here_string = Some(self.expand_word(w));
                     stdin_path = None;
                 }
                 Redirect::Out { word, append } => {
