@@ -1253,11 +1253,27 @@ impl Shell {
                     Ok(0) => return ExecResult::Status(1),
                     Ok(_) => {
                         let line = line.trim_end_matches(['\n', '\r']);
-                        let mut names = &argv[1..];
-                        while names.first().map(|s| s.as_str()) == Some("-r") {
-                            names = &names[1..];
+                        let mut array_name: Option<&str> = None;
+                        let mut names: Vec<&str> = Vec::new();
+                        let mut i = 1;
+                        while i < argv.len() {
+                            match argv[i].as_str() {
+                                "-r" => i += 1,
+                                "-a" => {
+                                    array_name = argv.get(i + 1).map(|s| s.as_str());
+                                    i += 2;
+                                }
+                                other => {
+                                    names.push(other);
+                                    i += 1;
+                                }
+                            }
                         }
-                        if names.is_empty() {
+                        if let Some(arr) = array_name {
+                            let map: std::collections::BTreeMap<usize, String> =
+                                line.split_whitespace().map(|s| s.to_string()).enumerate().collect();
+                            self.arrays.insert(arr.to_string(), map);
+                        } else if names.is_empty() {
                             self.assign_var("REPLY", line.to_string());
                         } else {
                             let mut rest = line.trim_start();
