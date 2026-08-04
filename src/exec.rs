@@ -49,6 +49,12 @@ pub struct Shell {
     // actually set. Global only in v1 -- no `local` arrays, no associative
     // arrays.
     arrays: HashMap<String, std::collections::BTreeMap<usize, String>>,
+    // Associative arrays (`declare -A name`). Kept in a separate map from
+    // `arrays` since their keys are arbitrary strings, not indices -- a name
+    // in `assoc_names` is looked up here instead of `arrays` everywhere an
+    // array is read or written.
+    assoc_arrays: HashMap<String, std::collections::BTreeMap<String, String>>,
+    assoc_names: std::collections::HashSet<String>,
     // `trap CMD EXIT` handler. Only EXIT is implemented -- real signal traps
     // (INT/TERM/...) would need OS signal-handling machinery this
     // dependency-free, single-process design doesn't have; `trap` warns
@@ -82,6 +88,8 @@ impl Shell {
             var_scopes: Vec::new(),
             script_name: "ash".to_string(),
             arrays: HashMap::new(),
+            assoc_arrays: HashMap::new(),
+            assoc_names: std::collections::HashSet::new(),
             exit_trap: None,
             opt_errexit: false,
             opt_nounset: false,
@@ -192,10 +200,15 @@ impl Shell {
             }
             if let Some(bracket) = n.find('[') {
                 if let Some(idx_expr) = n.strip_suffix(']').map(|s| &s[bracket + 1..]) {
-                    let arr_name = &n[..bracket];
-                    if let Ok(i) = arith::eval(idx_expr, self) {
+                    let arr_name = n[..bracket].to_string();
+                    if self.assoc_names.contains(&arr_name) {
+                        let key = self.expand_index_as_string(idx_expr);
+                        if let Some(map) = self.assoc_arrays.get_mut(&arr_name) {
+                            map.remove(&key);
+                        }
+                    } else if let Ok(i) = arith::eval(idx_expr, self) {
                         if i >= 0 {
-                            if let Some(map) = self.arrays.get_mut(arr_name) {
+                            if let Some(map) = self.arrays.get_mut(&arr_name) {
                                 map.remove(&(i as usize));
                             }
                         }
@@ -204,6 +217,8 @@ impl Shell {
                 }
             }
             self.arrays.remove(n.as_str());
+            self.assoc_arrays.remove(n.as_str());
+            self.assoc_names.remove(n.as_str());
             let mut removed_local = false;
             for scope in self.var_scopes.iter_mut().rev() {
                 if scope.remove(n.as_str()).is_some() {
@@ -218,6 +233,44 @@ impl Shell {
             }
             if !only_vars {
                 self.functions.remove(n.as_str());
+            }
+        }
+        0
+    }
+
+    // declare/typeset [-A|-a] [NAME|NAME=value]... Only the `-A` (associative
+    // array) and `-a` (indexed array, mostly a no-op since that's already
+    // the default) flags are recognized; other flags (-i/-r/-x/...) are
+    // accepted but not tracked -- no attribute enforcement, matching how
+    // `local`'s scoping-only semantics already work here.
+    fn run_declare(&mut self, args: &[String]) -> i32 {
+        let mut assoc_mode = false;
+        for a in args {
+            match a.as_str() {
+                "-A" => {
+                    assoc_mode = true;
+                    continue;
+                }
+                "-a" => {
+                    assoc_mode = false;
+                    continue;
+                }
+                _ => {}
+            }
+            if a.starts_with('-') {
+                continue;
+            }
+            let (name, val) = match a.find('=') {
+                Some(eq) => (a[..eq].to_string(), Some(a[eq + 1..].to_string())),
+                None => (a.clone(), None),
+            };
+            if assoc_mode {
+                self.assoc_names.insert(name.clone());
+                self.assoc_arrays.entry(name).or_default();
+            } else if let Some(v) = val {
+                self.assign_var(&name, v);
+            } else if self.lookup_var(&name).is_empty() && std::env::var(&name).is_err() {
+                self.assign_var(&name, String::new());
             }
         }
         0
@@ -481,6 +534,19 @@ impl Shell {
                 s.push(' ');
             }
             s.push_str(")\n");
+        }
+        for (name, map) in &self.assoc_arrays {
+            s.push_str("declare -A ");
+            s.push_str(name);
+            s.push('\n');
+            for (k, v) in map {
+                s.push_str(name);
+                s.push('[');
+                s.push_str(&crate::serialize::quote_literal(k));
+                s.push_str("]=");
+                s.push_str(&crate::serialize::quote_literal(v));
+                s.push('\n');
+            }
         }
         if let Some(frame) = self.arg_frames.last() {
             s.push_str("set --");
@@ -757,7 +823,10 @@ impl Shell {
             [Chunk::Str(s)] => Some(s.as_str()),
             _ => None,
         };
-        let argv: Vec<String> = if matches!(first_word_literal, Some("local") | Some("export")) {
+        let argv: Vec<String> = if matches!(
+            first_word_literal,
+            Some("local") | Some("export") | Some("declare") | Some("typeset")
+        ) {
             // Assignment-builtins: `NAME=value` arguments must not be
             // word-split on the expanded value (bash treats them like any
             // other assignment), unlike a normal builtin's arguments.
@@ -928,6 +997,7 @@ impl Shell {
             "getopts" => return self.run_getopts(&argv[1..]),
             "unset" => return ExecResult::Status(self.run_unset(&argv[1..])),
             "set" => return ExecResult::Status(self.run_set(&argv[1..])),
+            "declare" | "typeset" => return ExecResult::Status(self.run_declare(&argv[1..])),
             _ => {}
         }
 
@@ -1154,9 +1224,28 @@ impl Shell {
     // distinguished anyway); any other index is evaluated as an arithmetic
     // expression (so `${arr[i+1]}` works) and looked up 0-based. A gap
     // index (never set) reads back as empty, same as an unset scalar.
+    // Associative-array indices are literal (expandable) strings, not
+    // arithmetic expressions -- re-lex the raw index text as a standalone
+    // word and expand it, same machinery `split_array_literal_words` uses.
+    fn expand_index_as_string(&mut self, index: &str) -> String {
+        match crate::lexer::Lexer::new(index).tokenize() {
+            Ok(toks) => match toks.into_iter().next() {
+                Some(crate::lexer::Tok::Word(chunks, _)) => {
+                    self.expand_word(&Word { chunks, globbable: false })
+                }
+                _ => index.to_string(),
+            },
+            Err(_) => index.to_string(),
+        }
+    }
+
     fn array_element(&mut self, name: &str, index: &str) -> String {
         if index == "@" || index == "*" {
             return self.array_all(name).join(" ");
+        }
+        if self.assoc_names.contains(name) {
+            let key = self.expand_index_as_string(index);
+            return self.assoc_arrays.get(name).and_then(|m| m.get(&key)).cloned().unwrap_or_default();
         }
         match arith::eval(index, self) {
             Ok(i) if i >= 0 => self
@@ -1170,6 +1259,9 @@ impl Shell {
     }
 
     fn array_all(&self, name: &str) -> Vec<String> {
+        if let Some(m) = self.assoc_arrays.get(name) {
+            return m.values().cloned().collect();
+        }
         self.arrays.get(name).map(|m| m.values().cloned().collect()).unwrap_or_default()
     }
 
@@ -1177,7 +1269,19 @@ impl Shell {
     // `arr[10]=x` alone gives a length of 1, not 11).
     fn array_length(&mut self, name: &str, index: &str) -> usize {
         if index == "@" || index == "*" {
+            if let Some(m) = self.assoc_arrays.get(name) {
+                return m.len();
+            }
             return self.arrays.get(name).map(|m| m.len()).unwrap_or(0);
+        }
+        if self.assoc_names.contains(name) {
+            let key = self.expand_index_as_string(index);
+            return self
+                .assoc_arrays
+                .get(name)
+                .and_then(|m| m.get(&key))
+                .map(|s| s.chars().count())
+                .unwrap_or(0);
         }
         match arith::eval(index, self) {
             Ok(i) if i >= 0 => self
@@ -1193,6 +1297,11 @@ impl Shell {
     // `arr[i]=value`. Sets exactly that index -- no resizing/filling, since
     // the array is a sparse map, matching bash (gaps stay genuinely unset).
     fn array_set_index(&mut self, name: &str, index: &str, value: String) {
+        if self.assoc_names.contains(name) {
+            let key = self.expand_index_as_string(index);
+            self.assoc_arrays.entry(name.to_string()).or_default().insert(key, value);
+            return;
+        }
         let i = match arith::eval(index, self) {
             Ok(i) if i >= 0 => i as usize,
             _ => {
