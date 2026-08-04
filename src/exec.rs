@@ -150,6 +150,57 @@ impl Shell {
         ExecResult::Status(0)
     }
 
+    // unset [-f|-v] NAME... Also accepts `arr[i]` to remove one element
+    // without touching the rest of the array.
+    fn run_unset(&mut self, args: &[String]) -> i32 {
+        let mut only_funcs = false;
+        let mut only_vars = false;
+        let mut names: Vec<&String> = Vec::new();
+        for a in args {
+            match a.as_str() {
+                "-f" => only_funcs = true,
+                "-v" => only_vars = true,
+                _ => names.push(a),
+            }
+        }
+        for n in names {
+            if only_funcs {
+                self.functions.remove(n.as_str());
+                continue;
+            }
+            if let Some(bracket) = n.find('[') {
+                if let Some(idx_expr) = n.strip_suffix(']').map(|s| &s[bracket + 1..]) {
+                    let arr_name = &n[..bracket];
+                    if let Ok(i) = arith::eval(idx_expr, self) {
+                        if i >= 0 {
+                            if let Some(map) = self.arrays.get_mut(arr_name) {
+                                map.remove(&(i as usize));
+                            }
+                        }
+                    }
+                    continue;
+                }
+            }
+            self.arrays.remove(n.as_str());
+            let mut removed_local = false;
+            for scope in self.var_scopes.iter_mut().rev() {
+                if scope.remove(n.as_str()).is_some() {
+                    removed_local = true;
+                    break;
+                }
+            }
+            if !removed_local {
+                unsafe {
+                    std::env::remove_var(n);
+                }
+            }
+            if !only_vars {
+                self.functions.remove(n.as_str());
+            }
+        }
+        0
+    }
+
     pub fn set_script_args(&mut self, name: String, args: Vec<String>) {
         self.script_name = name;
         self.arg_frames = vec![args];
@@ -726,6 +777,7 @@ impl Shell {
                 return ExecResult::Status(0);
             }
             "getopts" => return self.run_getopts(&argv[1..]),
+            "unset" => return ExecResult::Status(self.run_unset(&argv[1..])),
             _ => {}
         }
 
@@ -773,7 +825,8 @@ impl Shell {
                 }
             }
             Err(e) => {
-                eprintln!("ash: {}: {}", name, e);
+                let msg = format!("ash: {}: {}", name, e);
+                self.write_command_error(cmd, &msg);
                 ExecResult::Status(127)
             }
         }
@@ -1248,6 +1301,40 @@ impl Shell {
 
     fn resolve_redirects(&mut self, cmd: &SimpleCommand) -> Result<ResolvedRedirs, String> {
         self.resolve_redirect_list(&cmd.redirects)
+    }
+
+    // Diagnostics for a command that never got to inherit its own stdio
+    // (e.g. spawn() failing with "not found") would otherwise bypass a
+    // `2>` redirect entirely -- real bash routes them through it too. Falls
+    // back to the shell's real stderr when there's no stderr redirect.
+    fn write_command_error(&mut self, cmd: &SimpleCommand, msg: &str) {
+        let mut target: Option<String> = None;
+        for r in &cmd.redirects {
+            match r {
+                Redirect::Err { word, .. } | Redirect::Both { word, .. } => {
+                    target = Some(self.expand_word(word));
+                }
+                Redirect::DupErrToOut => {
+                    for r2 in &cmd.redirects {
+                        if let Redirect::Out { word, .. } = r2 {
+                            target = Some(self.expand_word(word));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        match target {
+            Some(path) => {
+                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+                    use std::io::Write;
+                    let _ = writeln!(f, "{}", msg);
+                } else {
+                    eprintln!("{}", msg);
+                }
+            }
+            None => eprintln!("{}", msg),
+        }
     }
 
     fn resolve_redirect_list(&mut self, redirects: &[Redirect]) -> Result<ResolvedRedirs, String> {
