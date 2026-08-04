@@ -155,6 +155,54 @@ impl Shell {
         }
     }
 
+    // `read` is a builtin, so it can't go through the normal Stdio-based
+    // redirect machinery (that's built for handing stdio to a *child*
+    // process, not reading in-process). Special-cased here since `read x
+    // <<< "..."` is too common a pattern to leave broken.
+    fn read_input_source(&mut self, cmd: &SimpleCommand) -> Box<dyn std::io::BufRead> {
+        for r in cmd.redirects.iter().rev() {
+            match r {
+                Redirect::HereString(w) => {
+                    let mut content = self.expand_word(w);
+                    content.push('\n');
+                    return Box::new(std::io::Cursor::new(content.into_bytes()));
+                }
+                Redirect::In(w) => {
+                    let p = self.expand_word(w);
+                    return match std::fs::File::open(&p) {
+                        Ok(f) => Box::new(std::io::BufReader::new(f)),
+                        Err(e) => {
+                            eprintln!("ash: {}: {}", p, e);
+                            Box::new(std::io::Cursor::new(Vec::new()))
+                        }
+                    };
+                }
+                _ => continue,
+            }
+        }
+        Box::new(std::io::BufReader::new(std::io::stdin()))
+    }
+
+    // Shared by `eval` and `source`/`.` -- both run source text in the
+    // CURRENT shell (unlike command substitution/subshells, which self-exec
+    // a child process), so `eval`/sourced scripts can set variables,
+    // functions, or cwd in the calling shell.
+    fn run_source_here(&mut self, src: &str, label: &str) -> ExecResult {
+        match crate::lexer::Lexer::new(src).tokenize() {
+            Ok(toks) => match crate::parser::Parser::new(toks).parse_program() {
+                Ok(prog) => self.run_program(&prog),
+                Err(e) => {
+                    eprintln!("ash: {}: syntax error: {}", label, e);
+                    ExecResult::Status(2)
+                }
+            },
+            Err(e) => {
+                eprintln!("ash: {}: syntax error: {}", label, e);
+                ExecResult::Status(2)
+            }
+        }
+    }
+
     // (...) subshells self-exec the ash binary on the raw captured source,
     // inheriting env but not sharing process state -- real bash subshells
     // are forked children too, so mutations inside (cd, variables) must not
@@ -373,6 +421,60 @@ impl Shell {
                     .and_then(|s| s.parse::<i32>().ok())
                     .unwrap_or(self.last_status);
                 std::process::exit(code);
+            }
+            "read" => {
+                let mut reader = self.read_input_source(cmd);
+                let mut line = String::new();
+                match std::io::BufRead::read_line(&mut *reader, &mut line) {
+                    Ok(0) => return ExecResult::Status(1),
+                    Ok(_) => {
+                        let line = line.trim_end_matches(['\n', '\r']);
+                        let names = &argv[1..];
+                        if names.is_empty() {
+                            self.assign_var("REPLY", line.to_string());
+                        } else {
+                            let mut rest = line.trim_start();
+                            for (i, n) in names.iter().enumerate() {
+                                if i == names.len() - 1 {
+                                    self.assign_var(n, rest.trim_end().to_string());
+                                } else {
+                                    match rest.find(char::is_whitespace) {
+                                        Some(pos) => {
+                                            self.assign_var(n, rest[..pos].to_string());
+                                            rest = rest[pos..].trim_start();
+                                        }
+                                        None => {
+                                            self.assign_var(n, rest.to_string());
+                                            rest = "";
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        return ExecResult::Status(0);
+                    }
+                    Err(_) => return ExecResult::Status(1),
+                }
+            }
+            "eval" => {
+                let src = argv[1..].join(" ");
+                return self.run_source_here(&src, "eval");
+            }
+            "source" | "." => {
+                let path = match argv.get(1) {
+                    Some(p) => p.clone(),
+                    None => {
+                        eprintln!("ash: {}: filename argument required", name);
+                        return ExecResult::Status(2);
+                    }
+                };
+                match std::fs::read_to_string(&path) {
+                    Ok(src) => return self.run_source_here(&src, &path),
+                    Err(e) => {
+                        eprintln!("ash: {}: {}", path, e);
+                        return ExecResult::Status(1);
+                    }
+                }
             }
             _ => {}
         }
@@ -648,11 +750,21 @@ impl Shell {
         let mut stdout_target: Option<(String, bool)> = None;
         let mut stderr_target: Option<(String, bool)> = None;
         let mut stdin_path: Option<String> = None;
+        let mut here_string: Option<String> = None;
         let mut dup_err_to_out = false;
 
         for r in &cmd.redirects {
             match r {
-                Redirect::In(w) => stdin_path = Some(self.expand_word(w)),
+                Redirect::In(w) => {
+                    stdin_path = Some(self.expand_word(w));
+                    here_string = None;
+                }
+                Redirect::HereString(w) => {
+                    let mut content = self.expand_word(w);
+                    content.push('\n');
+                    here_string = Some(content);
+                    stdin_path = None;
+                }
                 Redirect::Out { word, append } => {
                     stdout_target = Some((self.expand_word(word), *append));
                     dup_err_to_out = false;
@@ -671,11 +783,15 @@ impl Shell {
             }
         }
 
-        let stdin = match stdin_path {
-            Some(p) => Some(Stdio::from(
-                std::fs::File::open(&p).map_err(|e| format!("{}: {}", p, e))?,
-            )),
-            None => None,
+        let stdin = if let Some(content) = here_string {
+            Some(Stdio::from(here_string_file(&content)?))
+        } else {
+            match stdin_path {
+                Some(p) => Some(Stdio::from(
+                    std::fs::File::open(&p).map_err(|e| format!("{}: {}", p, e))?,
+                )),
+                None => None,
+            }
         };
         let stdout = match &stdout_target {
             Some((p, append)) => Some(Stdio::from(open_out(p, *append)?)),
@@ -713,6 +829,20 @@ struct ResolvedRedirs {
     stdin: Option<Stdio>,
     stdout: Option<Stdio>,
     stderr: Option<Stdio>,
+}
+
+// Here-strings need a real Stdio for the child process; simplest portable
+// way to hand it literal content is a temp file, unlinked immediately after
+// opening (the open fd keeps the data alive on unix even once unlinked).
+fn here_string_file(content: &str) -> Result<std::fs::File, String> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!("ash-herestring-{}-{}", std::process::id(), n));
+    std::fs::write(&path, content).map_err(|e| format!("here-string: {}", e))?;
+    let f = std::fs::File::open(&path).map_err(|e| format!("here-string: {}", e))?;
+    let _ = std::fs::remove_file(&path);
+    Ok(f)
 }
 
 fn strip_prefix_glob(s: &str, pattern: &str, longest: bool) -> String {

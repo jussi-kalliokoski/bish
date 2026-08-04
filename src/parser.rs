@@ -13,6 +13,7 @@ pub enum Redirect {
     Err { word: Word, append: bool },
     Both { word: Word, append: bool },
     DupErrToOut,
+    HereString(Word),
 }
 
 #[derive(Debug, Clone)]
@@ -432,6 +433,14 @@ impl Parser {
                     self.advance();
                     redirects.push(Redirect::DupErrToOut);
                 }
+                Some(Tok::HereString) => {
+                    self.advance();
+                    let word = self.expect_word()?;
+                    redirects.push(Redirect::HereString(word));
+                }
+                Some(Tok::HereDocUnsupported) => {
+                    return Err("here-docs (<<, <<-) aren't supported yet; use <<< for a here-string".to_string());
+                }
                 _ => break,
             }
         }
@@ -487,6 +496,14 @@ impl Parser {
                 Some(Tok::DupErrToOut) => {
                     self.advance();
                     redirects.push(Redirect::DupErrToOut);
+                }
+                Some(Tok::HereString) => {
+                    self.advance();
+                    let word = self.expect_word()?;
+                    redirects.push(Redirect::HereString(word));
+                }
+                Some(Tok::HereDocUnsupported) => {
+                    return Err("here-docs (<<, <<-) aren't supported yet; use <<< for a here-string".to_string());
                 }
                 _ => break,
             }

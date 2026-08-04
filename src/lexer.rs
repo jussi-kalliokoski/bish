@@ -50,6 +50,8 @@ pub enum Tok {
     RedirErr { append: bool },
     RedirBoth { append: bool },
     DupErrToOut,
+    HereString,
+    HereDocUnsupported,
     Newline,
     LBrace,
     RBrace,
@@ -194,7 +196,23 @@ impl<'a> Lexer<'a> {
                 }
                 Some('<') => {
                     self.chars.next();
-                    toks.push(Tok::RedirIn);
+                    if self.chars.peek().copied() == Some('<') {
+                        self.chars.next();
+                        if self.chars.peek().copied() == Some('<') {
+                            self.chars.next();
+                            toks.push(Tok::HereString);
+                        } else {
+                            // Real here-docs (<<, <<-) aren't implemented
+                            // yet -- surface a clear error instead of a
+                            // confusing downstream parse failure.
+                            if self.chars.peek().copied() == Some('-') {
+                                self.chars.next();
+                            }
+                            toks.push(Tok::HereDocUnsupported);
+                        }
+                    } else {
+                        toks.push(Tok::RedirIn);
+                    }
                 }
                 Some('2') if self.peek_is_fd2_redirect() => {
                     self.chars.next(); // '2'
@@ -367,6 +385,17 @@ impl<'a> Lexer<'a> {
         let mut chunks: Vec<Chunk> = Vec::new();
         let mut buf = String::new();
         let mut plain = true;
+
+        // Tilde expansion: only the bare `~` / `~/...` form at the very
+        // start of a word (no `~user` lookup).
+        if self.chars.peek().copied() == Some('~') {
+            let mut probe = self.chars.clone();
+            probe.next();
+            if matches!(probe.peek().copied(), None | Some('/') | Some(' ') | Some('\t') | Some('\n')) {
+                self.chars.next();
+                chunks.push(Chunk::Var("HOME".to_string()));
+            }
+        }
 
         loop {
             match self.chars.peek().copied() {
