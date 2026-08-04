@@ -104,6 +104,13 @@ pub enum Tok {
     KwCase,
     KwEsac,
     KwFunction,
+    // `[[`/`]]` are recognized here (not left as plain Word tokens) so the
+    // parser can treat everything between them as a single test expression
+    // -- otherwise `&&`/`||` inside `[[ ]]` would be swallowed by the outer
+    // AndOr grammar and silently split one logical `[[ ]]` into two
+    // commands.
+    KwLBracket2,
+    KwRBracket2,
 }
 
 fn keyword(s: &str) -> Option<Tok> {
@@ -122,6 +129,8 @@ fn keyword(s: &str) -> Option<Tok> {
         "case" => Tok::KwCase,
         "esac" => Tok::KwEsac,
         "function" => Tok::KwFunction,
+        "[[" => Tok::KwLBracket2,
+        "]]" => Tok::KwRBracket2,
         _ => return None,
     })
 }

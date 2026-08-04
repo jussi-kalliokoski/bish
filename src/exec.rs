@@ -505,6 +505,7 @@ impl Shell {
                     ExecResult::Status(1)
                 }
             },
+            parser::Command::Test(atoms, _redirects) => self.run_test(atoms),
         }
     }
 
@@ -896,6 +897,78 @@ impl Shell {
         ExecResult::Status(0)
     }
 
+    // `[[ expr ]]`. Real recursive-descent precedence over the flat
+    // TestAtom stream the parser built: NOT binds tightest, then simple
+    // tests (unary/binary), then AND, then OR (loosest) -- matching bash.
+    fn run_test(&mut self, atoms: &[parser::TestAtom]) -> ExecResult {
+        let mut pos = 0;
+        match self.eval_test_or(atoms, &mut pos) {
+            Ok(b) => ExecResult::Status(if b { 0 } else { 1 }),
+            Err(e) => {
+                eprintln!("ash: [[: {}", e);
+                ExecResult::Status(2)
+            }
+        }
+    }
+
+    fn eval_test_or(&mut self, atoms: &[parser::TestAtom], pos: &mut usize) -> Result<bool, String> {
+        let mut result = self.eval_test_and(atoms, pos)?;
+        while matches!(atoms.get(*pos), Some(parser::TestAtom::Or)) {
+            *pos += 1;
+            let rhs = self.eval_test_and(atoms, pos)?;
+            result = result || rhs;
+        }
+        Ok(result)
+    }
+
+    fn eval_test_and(&mut self, atoms: &[parser::TestAtom], pos: &mut usize) -> Result<bool, String> {
+        let mut result = self.eval_test_unary(atoms, pos)?;
+        while matches!(atoms.get(*pos), Some(parser::TestAtom::And)) {
+            *pos += 1;
+            let rhs = self.eval_test_unary(atoms, pos)?;
+            result = result && rhs;
+        }
+        Ok(result)
+    }
+
+    fn eval_test_unary(&mut self, atoms: &[parser::TestAtom], pos: &mut usize) -> Result<bool, String> {
+        if matches!(atoms.get(*pos), Some(parser::TestAtom::Not)) {
+            *pos += 1;
+            return Ok(!self.eval_test_unary(atoms, pos)?);
+        }
+        self.eval_test_primary(atoms, pos)
+    }
+
+    fn eval_test_primary(&mut self, atoms: &[parser::TestAtom], pos: &mut usize) -> Result<bool, String> {
+        match atoms.get(*pos) {
+            Some(parser::TestAtom::Group(inner)) => {
+                *pos += 1;
+                let mut ipos = 0;
+                self.eval_test_or(inner, &mut ipos)
+            }
+            Some(parser::TestAtom::Word(_)) => {
+                let mut words = Vec::new();
+                while let Some(parser::TestAtom::Word(w)) = atoms.get(*pos) {
+                    words.push(self.expand_word(w));
+                    *pos += 1;
+                }
+                Ok(self.eval_simple_test(&words))
+            }
+            other => Err(format!("syntax error near {:?}", other)),
+        }
+    }
+
+    fn eval_simple_test(&mut self, words: &[String]) -> bool {
+        match words {
+            [] => false,
+            [s] => !s.is_empty(),
+            [op, a] => builtins::unary(op, a),
+            [a, op, b] if op == "=~" => crate::regex::is_match(a, b),
+            [a, op, b] => builtins::binary(a, op, b, true),
+            _ => !words.is_empty(),
+        }
+    }
+
     fn run_single(&mut self, cmd: &SimpleCommand, background: bool) -> ExecResult {
         if cmd.words.is_empty() {
             for (name, mode, val) in &cmd.assigns {
@@ -995,16 +1068,18 @@ impl Shell {
             "break" => return builtins::break_loop(&argv[1..]),
             "continue" => return builtins::continue_loop(&argv[1..]),
             "test" => return ExecResult::Status(builtins::test(&argv[1..], false)),
-            "[" | "[[" => {
-                let closer = if name == "[" { "]" } else { "]]" };
+            // `[[` is a keyword (see lexer.rs/parser.rs Command::Test), not
+            // a plain command name, so it never reaches this dispatch --
+            // only bracket-style `[ ... ]` (the `test` alias) does.
+            "[" => {
                 let mut a = argv[1..].to_vec();
-                if a.last().map(|s| s.as_str()) == Some(closer) {
+                if a.last().map(|s| s.as_str()) == Some("]") {
                     a.pop();
                 } else {
-                    eprintln!("ash: {}: missing closing {}", name, closer);
+                    eprintln!("ash: [: missing closing ]");
                     return ExecResult::Status(2);
                 }
-                return ExecResult::Status(builtins::test(&a, name == "[["));
+                return ExecResult::Status(builtins::test(&a, false));
             }
             "return" => {
                 let code = argv.get(1).and_then(|s| s.parse::<i32>().ok()).unwrap_or(self.last_status);
@@ -2134,6 +2209,7 @@ fn command_own_redirects(cmd: &parser::Command) -> &[Redirect] {
         parser::Command::Group(_, redirects) => redirects,
         parser::Command::Subshell(_, redirects) => redirects,
         parser::Command::Arith(_, redirects) => redirects,
+        parser::Command::Test(_, redirects) => redirects,
         _ => &[],
     }
 }

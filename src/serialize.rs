@@ -103,7 +103,23 @@ pub fn serialize_command(cmd: &Command) -> String {
         Command::FuncDef { name, body } => format!("{}() {}", name, serialize_command(body)),
         Command::Subshell(raw, _) => format!("({})", raw),
         Command::Arith(raw, _) => format!("(({}))", raw),
+        Command::Test(atoms, _) => format!("[[ {} ]]", serialize_test_atoms(atoms)),
     }
+}
+
+fn serialize_test_atoms(atoms: &[crate::parser::TestAtom]) -> String {
+    use crate::parser::TestAtom;
+    atoms
+        .iter()
+        .map(|a| match a {
+            TestAtom::Word(w) => serialize_word(w),
+            TestAtom::And => "&&".to_string(),
+            TestAtom::Or => "||".to_string(),
+            TestAtom::Not => "!".to_string(),
+            TestAtom::Group(g) => format!("( {} )", serialize_test_atoms(g)),
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn serialize_simple(sc: &SimpleCommand) -> String {

@@ -84,6 +84,21 @@ pub enum Command {
     Subshell(String, Vec<Redirect>),
     // Standalone ((expr)) arithmetic command.
     Arith(String, Vec<Redirect>),
+    // `[[ expr ]]`. Parsed as a flat token stream rather than folded into
+    // an expression tree here -- exec.rs's evaluator does the actual
+    // precedence handling (NOT > binary tests > AND > OR), same
+    // deferred-evaluation spirit as Subshell/Arith.
+    Test(Vec<TestAtom>, Vec<Redirect>),
+}
+
+#[derive(Debug, Clone)]
+pub enum TestAtom {
+    Word(Word),
+    And,
+    Or,
+    Not,
+    // A parenthesized sub-expression, e.g. `( a == b )` inside `[[ ]]`.
+    Group(Vec<TestAtom>),
 }
 
 #[derive(Debug, Clone)]
@@ -272,8 +287,66 @@ impl Parser {
                 let redirects = self.parse_trailing_redirects()?;
                 Ok(Command::Arith(raw, redirects))
             }
+            Some(Tok::KwLBracket2) => self.parse_double_bracket(),
             _ => Ok(Command::Simple(self.parse_simple_command()?)),
         }
+    }
+
+    // `[[ expr ]]`. Collects a flat TestAtom stream up to the matching
+    // `]]`, treating `&&`/`||`/a bare `!` word as test-expression operators
+    // instead of the shell-level combinators/pipeline-negation they'd
+    // normally be -- this is what actually keeps `[[ a && b ]]` from being
+    // split into two separate commands by the outer AndOr grammar.
+    fn parse_double_bracket(&mut self) -> Result<Command, String> {
+        self.advance(); // KwLBracket2
+        let atoms = self.parse_test_atoms()?;
+        match self.advance() {
+            Some(Tok::KwRBracket2) => {}
+            other => return Err(format!("expected ']]', got {:?}", other)),
+        }
+        let redirects = self.parse_trailing_redirects()?;
+        Ok(Command::Test(atoms, redirects))
+    }
+
+    fn parse_test_atoms(&mut self) -> Result<Vec<TestAtom>, String> {
+        let mut atoms = Vec::new();
+        loop {
+            match self.peek() {
+                Some(Tok::KwRBracket2) | None => break,
+                Some(Tok::And) => {
+                    self.advance();
+                    atoms.push(TestAtom::And);
+                }
+                Some(Tok::Or) => {
+                    self.advance();
+                    atoms.push(TestAtom::Or);
+                }
+                Some(Tok::Subshell(_)) => {
+                    let raw = match self.advance() {
+                        Some(Tok::Subshell(raw)) => raw,
+                        _ => unreachable!(),
+                    };
+                    let inner_toks = Lexer::new(&raw).tokenize()?;
+                    let mut inner = Parser::new(inner_toks);
+                    let group = inner.parse_test_atoms()?;
+                    atoms.push(TestAtom::Group(group));
+                }
+                Some(Tok::Word(chunks, plain)) if *plain && matches!(chunks.as_slice(), [Chunk::Str(s)] if s == "!") =>
+                {
+                    self.advance();
+                    atoms.push(TestAtom::Not);
+                }
+                Some(Tok::Word(_, _)) => {
+                    let w = self.expect_word()?;
+                    atoms.push(TestAtom::Word(w));
+                }
+                Some(Tok::Newline) => {
+                    self.advance();
+                }
+                other => return Err(format!("unexpected token in '[[ ]]': {:?}", other)),
+            }
+        }
+        Ok(atoms)
     }
 
     fn looks_like_func_def(&self) -> bool {

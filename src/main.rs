@@ -4,6 +4,7 @@ mod exec;
 mod glob;
 mod lexer;
 mod parser;
+mod regex;
 mod repl;
 mod serialize;
 

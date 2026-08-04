@@ -90,7 +90,7 @@ fn eval_simple(args: &[String], use_glob: bool) -> bool {
     }
 }
 
-fn unary(op: &str, a: &str) -> bool {
+pub(crate) fn unary(op: &str, a: &str) -> bool {
     let path = std::path::Path::new(a);
     match op {
         "-e" => path.exists(),
@@ -115,7 +115,7 @@ fn is_executable(a: &str) -> bool {
     std::fs::metadata(a).is_ok()
 }
 
-fn binary(a: &str, op: &str, b: &str, use_glob: bool) -> bool {
+pub(crate) fn binary(a: &str, op: &str, b: &str, use_glob: bool) -> bool {
     match op {
         "=" | "==" if use_glob => crate::glob::matches(b, a),
         "!=" if use_glob => !crate::glob::matches(b, a),
