@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 
 use crate::arith;
@@ -1152,6 +1153,44 @@ impl Shell {
             "set" => return ExecResult::Status(self.run_set(&argv[1..])),
             "declare" | "typeset" => return ExecResult::Status(self.run_declare(&argv[1..])),
             "readonly" => return ExecResult::Status(self.run_readonly(&argv[1..])),
+            // exec CMD [args...] replaces this process image entirely (no
+            // fork, no return on success) -- exactly what real bash does,
+            // and available here as safe std (CommandExt::exec wraps
+            // execvp, distinct from the fork() this shell avoids). Bare
+            // `exec` with no command (only used to permanently redirect the
+            // current shell's own stdio) isn't implemented -- that needs
+            // real fd dup2 onto this process, which safe std has no path
+            // to; it's a no-op here rather than silently wrong.
+            "exec" if argv.len() > 1 => {
+                let redirs = match self.resolve_redirects(cmd) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        eprintln!("ash: {}", e);
+                        return ExecResult::Status(1);
+                    }
+                };
+                let mut command = Command::new(&argv[1]);
+                command.args(&argv[2..]);
+                if let Some(s) = redirs.stdin {
+                    command.stdin(s);
+                }
+                if let Some(s) = redirs.stdout {
+                    command.stdout(s);
+                }
+                if let Some(s) = redirs.stderr {
+                    command.stderr(s);
+                }
+                let err = command.exec();
+                eprintln!("ash: exec: {}: {}", argv[1], err);
+                // Real bash: a non-interactive shell exits immediately when
+                // exec fails to find/run the command, and (confirmed via a
+                // clean probe against bash 5.0.17) leaves $? at whatever it
+                // already was rather than setting 127 -- surprising, but
+                // that's what it actually does.
+                self.run_exit_trap();
+                std::process::exit(self.last_status);
+            }
+            "exec" => return ExecResult::Status(0),
             _ => {}
         }
 
