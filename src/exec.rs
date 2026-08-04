@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::process::{Command, Stdio};
 
 use crate::builtins;
@@ -11,28 +12,51 @@ pub enum ExecResult {
     Status(i32),
     Break(u32),
     Continue(u32),
+    Return(i32),
 }
 
 impl ExecResult {
     fn status(self) -> i32 {
         match self {
             ExecResult::Status(s) => s,
+            ExecResult::Return(s) => s,
             ExecResult::Break(_) | ExecResult::Continue(_) => 0,
         }
     }
 
     fn is_signal(self) -> bool {
-        matches!(self, ExecResult::Break(_) | ExecResult::Continue(_))
+        matches!(self, ExecResult::Break(_) | ExecResult::Continue(_) | ExecResult::Return(_))
     }
 }
 
 pub struct Shell {
     pub last_status: i32,
+    functions: HashMap<String, parser::Command>,
+    // Stack of positional-parameter frames; last() is the current scope
+    // ($0 is tracked separately since it's never shifted/reassigned by calls).
+    arg_frames: Vec<Vec<String>>,
+    // Stack of `local` overlays; empty unless we're inside a function call.
+    // A name only lives here if `local` explicitly declared it -- plain
+    // assignment still targets the global (process-env) variable unless it
+    // matches an existing local of the same name, matching bash semantics.
+    var_scopes: Vec<HashMap<String, String>>,
+    script_name: String,
 }
 
 impl Shell {
     pub fn new() -> Self {
-        Shell { last_status: 0 }
+        Shell {
+            last_status: 0,
+            functions: HashMap::new(),
+            arg_frames: vec![Vec::new()],
+            var_scopes: Vec::new(),
+            script_name: "ash".to_string(),
+        }
+    }
+
+    pub fn set_script_args(&mut self, name: String, args: Vec<String>) {
+        self.script_name = name;
+        self.arg_frames = vec![args];
     }
 
     pub fn run_program(&mut self, prog: &Program) -> ExecResult {
@@ -114,6 +138,22 @@ impl Shell {
             }
             parser::Command::Case { word, arms, .. } => self.run_case(word, arms),
             parser::Command::Group(prog, _redirects) => self.run_program(prog),
+            parser::Command::FuncDef { name, body } => {
+                self.functions.insert(name.clone(), (**body).clone());
+                ExecResult::Status(0)
+            }
+        }
+    }
+
+    fn call_function(&mut self, body: &parser::Command, call_args: Vec<String>) -> ExecResult {
+        self.arg_frames.push(call_args);
+        self.var_scopes.push(HashMap::new());
+        let result = self.run_command(body, false);
+        self.var_scopes.pop();
+        self.arg_frames.pop();
+        match result {
+            ExecResult::Return(code) => ExecResult::Status(code),
+            other => other,
         }
     }
 
@@ -157,6 +197,7 @@ impl Shell {
                     continue;
                 }
                 ExecResult::Status(s) => self.last_status = s,
+                ret @ ExecResult::Return(_) => return ret,
             }
         }
         ExecResult::Status(self.last_status)
@@ -165,9 +206,7 @@ impl Shell {
     fn run_for(&mut self, var: &str, words: &[Word], body: &Program) -> ExecResult {
         for w in words {
             let val = self.expand_word(w);
-            unsafe {
-                std::env::set_var(var, val);
-            }
+            self.assign_var(var, val);
             match self.run_program(body) {
                 ExecResult::Break(n) => {
                     if n > 1 {
@@ -182,6 +221,7 @@ impl Shell {
                     continue;
                 }
                 ExecResult::Status(s) => self.last_status = s,
+                ret @ ExecResult::Return(_) => return ret,
             }
         }
         ExecResult::Status(self.last_status)
@@ -204,9 +244,7 @@ impl Shell {
         if cmd.words.is_empty() {
             for (name, val) in &cmd.assigns {
                 let v = self.expand_word(val);
-                unsafe {
-                    std::env::set_var(name, v);
-                }
+                self.assign_var(name, v);
             }
             if !cmd.redirects.is_empty() {
                 // side effect only: create/truncate/append the target files
@@ -237,6 +275,36 @@ impl Shell {
                 }
                 return ExecResult::Status(builtins::test(&a));
             }
+            "return" => {
+                let code = argv.get(1).and_then(|s| s.parse::<i32>().ok()).unwrap_or(self.last_status);
+                if self.var_scopes.is_empty() {
+                    eprintln!("ash: return: can only 'return' from a function");
+                    return ExecResult::Status(code);
+                }
+                return ExecResult::Return(code);
+            }
+            "shift" => {
+                let n = argv.get(1).and_then(|s| s.parse::<usize>().ok()).unwrap_or(1);
+                if let Some(frame) = self.arg_frames.last_mut() {
+                    let drain = n.min(frame.len());
+                    frame.drain(0..drain);
+                }
+                return ExecResult::Status(0);
+            }
+            "local" => {
+                if self.var_scopes.is_empty() {
+                    eprintln!("ash: local: can only be used inside a function");
+                    return ExecResult::Status(1);
+                }
+                for a in &argv[1..] {
+                    let (n, v) = match a.find('=') {
+                        Some(eq) => (a[..eq].to_string(), a[eq + 1..].to_string()),
+                        None => (a.clone(), String::new()),
+                    };
+                    self.var_scopes.last_mut().unwrap().insert(n, v);
+                }
+                return ExecResult::Status(0);
+            }
             "exit" => {
                 let code = argv
                     .get(1)
@@ -245,6 +313,10 @@ impl Shell {
                 std::process::exit(code);
             }
             _ => {}
+        }
+
+        if let Some(body) = self.functions.get(&name).cloned() {
+            return self.call_function(&body, argv[1..].to_vec());
         }
 
         let redirs = match self.resolve_redirects(cmd) {
@@ -368,16 +440,49 @@ impl Shell {
         for c in &w.chunks {
             match c {
                 Chunk::Str(t) => s.push_str(t),
-                Chunk::Var(name) => {
-                    if name == "?" {
-                        s.push_str(&self.last_status.to_string());
-                    } else if let Ok(v) = std::env::var(name) {
-                        s.push_str(&v);
-                    }
-                }
+                Chunk::Var(name) => s.push_str(&self.lookup_var(name)),
             }
         }
         s
+    }
+
+    fn lookup_var(&self, name: &str) -> String {
+        match name {
+            "?" => self.last_status.to_string(),
+            "0" => self.script_name.clone(),
+            "#" => self.arg_frames.last().map(|a| a.len()).unwrap_or(0).to_string(),
+            "@" | "*" => self.arg_frames.last().map(|a| a.join(" ")).unwrap_or_default(),
+            _ if !name.is_empty() && name.chars().all(|c| c.is_ascii_digit()) => {
+                let idx: usize = name.parse().unwrap_or(0);
+                idx.checked_sub(1)
+                    .and_then(|i| self.arg_frames.last().and_then(|a| a.get(i)))
+                    .cloned()
+                    .unwrap_or_default()
+            }
+            _ => {
+                for scope in self.var_scopes.iter().rev() {
+                    if let Some(v) = scope.get(name) {
+                        return v.clone();
+                    }
+                }
+                std::env::var(name).unwrap_or_default()
+            }
+        }
+    }
+
+    // Plain assignment targets the global (process-env) variable, unless it
+    // shadows an existing `local` of the same name in the current function
+    // scope -- matching bash, where functions don't auto-localize vars.
+    fn assign_var(&mut self, name: &str, value: String) {
+        for scope in self.var_scopes.iter_mut().rev() {
+            if scope.contains_key(name) {
+                scope.insert(name.to_string(), value);
+                return;
+            }
+        }
+        unsafe {
+            std::env::set_var(name, value);
+        }
     }
 
     fn resolve_redirects(&self, cmd: &SimpleCommand) -> Result<ResolvedRedirs, String> {

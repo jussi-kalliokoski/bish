@@ -51,6 +51,7 @@ pub enum Command {
         redirects: Vec<Redirect>,
     },
     Group(Program, Vec<Redirect>),
+    FuncDef { name: String, body: Box<Command> },
 }
 
 #[derive(Debug, Clone)]
@@ -221,8 +222,49 @@ impl Parser {
             Some(Tok::KwFor) => self.parse_for(),
             Some(Tok::KwCase) => self.parse_case(),
             Some(Tok::LBrace) => self.parse_group(),
+            Some(Tok::KwFunction) => self.parse_function_kw(),
+            Some(Tok::Word(_)) if self.looks_like_func_def() => self.parse_function_paren(),
             _ => Ok(Command::Simple(self.parse_simple_command()?)),
         }
+    }
+
+    fn looks_like_func_def(&self) -> bool {
+        if let Some(Tok::Word(chunks)) = self.toks.get(self.pos) {
+            if word_to_plain_name(chunks).is_some() {
+                return matches!(self.toks.get(self.pos + 1), Some(Tok::LParen))
+                    && matches!(self.toks.get(self.pos + 2), Some(Tok::RParen));
+            }
+        }
+        false
+    }
+
+    fn parse_function_paren(&mut self) -> Result<Command, String> {
+        let name = match self.advance() {
+            Some(Tok::Word(chunks)) => word_to_plain_name(&chunks).unwrap(),
+            _ => unreachable!(),
+        };
+        self.advance(); // LParen
+        self.advance(); // RParen
+        self.skip_terminators();
+        let body = self.parse_command()?;
+        Ok(Command::FuncDef { name, body: Box::new(body) })
+    }
+
+    fn parse_function_kw(&mut self) -> Result<Command, String> {
+        self.advance(); // KwFunction
+        let name = match self.advance() {
+            Some(Tok::Word(chunks)) => {
+                word_to_plain_name(&chunks).ok_or_else(|| "expected a plain function name".to_string())?
+            }
+            other => return Err(format!("expected function name, got {:?}", other)),
+        };
+        if matches!(self.peek(), Some(Tok::LParen)) {
+            self.advance();
+            self.expect(Tok::RParen)?;
+        }
+        self.skip_terminators();
+        let body = self.parse_command()?;
+        Ok(Command::FuncDef { name, body: Box::new(body) })
     }
 
     fn parse_if(&mut self) -> Result<Command, String> {

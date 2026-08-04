@@ -11,11 +11,14 @@ fn main() {
     let mut shell = exec::Shell::new();
 
     if args.len() >= 3 && args[1] == "-c" {
+        let script_name = args.get(3).cloned().unwrap_or_else(|| "ash".to_string());
+        shell.set_script_args(script_name, args[4..].to_vec());
         std::process::exit(run_source(&mut shell, &args[2]));
     }
 
     if args.len() >= 2 {
         let path = &args[1];
+        shell.set_script_args(path.clone(), args[2..].to_vec());
         match std::fs::read_to_string(path) {
             Ok(src) => std::process::exit(run_source(&mut shell, &src)),
             Err(e) => {

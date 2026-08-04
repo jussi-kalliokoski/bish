@@ -25,6 +25,7 @@ pub enum Tok {
     Newline,
     LBrace,
     RBrace,
+    LParen,
     RParen,
     KwIf,
     KwThen,
@@ -123,6 +124,10 @@ impl<'a> Lexer<'a> {
                         toks.push(Tok::Semi);
                     }
                 }
+                Some('(') => {
+                    self.chars.next();
+                    toks.push(Tok::LParen);
+                }
                 Some(')') => {
                     self.chars.next();
                     toks.push(Tok::RParen);
@@ -163,11 +168,13 @@ impl<'a> Lexer<'a> {
                     }
                 }
                 _ => {
-                    let word = self.read_word()?;
-                    if let [Chunk::Str(s)] = word.as_slice() {
-                        if let Some(kw) = keyword(s) {
-                            toks.push(kw);
-                            continue;
+                    let (word, plain) = self.read_word()?;
+                    if plain {
+                        if let [Chunk::Str(s)] = word.as_slice() {
+                            if let Some(kw) = keyword(s) {
+                                toks.push(kw);
+                                continue;
+                            }
                         }
                     }
                     toks.push(Tok::Word(word));
@@ -210,16 +217,22 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    fn read_word(&mut self) -> Result<Vec<Chunk>, String> {
+    // Returns the word's chunks plus whether it was written with no
+    // quoting/escaping at all -- only a fully "plain" word is eligible for
+    // reserved-word (keyword) recognition, matching bash: `"if"` or `\if`
+    // is always a literal word, never the `if` keyword.
+    fn read_word(&mut self) -> Result<(Vec<Chunk>, bool), String> {
         let mut chunks: Vec<Chunk> = Vec::new();
         let mut buf = String::new();
+        let mut plain = true;
 
         loop {
             match self.chars.peek().copied() {
                 None => break,
                 Some(c) if c == ' ' || c == '\t' || c == '\n' => break,
-                Some('|') | Some('&') | Some(';') | Some('<') | Some('>') | Some('#') | Some(')') => break,
+                Some('|') | Some('&') | Some(';') | Some('<') | Some('>') | Some('#') | Some('(') | Some(')') => break,
                 Some('\'') => {
+                    plain = false;
                     self.chars.next();
                     loop {
                         match self.chars.next() {
@@ -230,6 +243,7 @@ impl<'a> Lexer<'a> {
                     }
                 }
                 Some('"') => {
+                    plain = false;
                     self.chars.next();
                     loop {
                         match self.chars.next() {
@@ -253,12 +267,14 @@ impl<'a> Lexer<'a> {
                     }
                 }
                 Some('\\') => {
+                    plain = false;
                     self.chars.next();
                     if let Some(n) = self.chars.next() {
                         buf.push(n);
                     }
                 }
                 Some('$') => {
+                    plain = false;
                     self.chars.next();
                     if !buf.is_empty() {
                         chunks.push(Chunk::Str(std::mem::take(&mut buf)));
@@ -278,7 +294,7 @@ impl<'a> Lexer<'a> {
         if chunks.is_empty() {
             chunks.push(Chunk::Str(String::new()));
         }
-        Ok(chunks)
+        Ok((chunks, plain))
     }
 
     // Consumes a variable reference after the '$' has already been consumed
@@ -304,9 +320,8 @@ impl<'a> Lexer<'a> {
                 name.push(c);
             }
             name
-        } else if self.chars.peek().copied() == Some('?') {
-            self.chars.next();
-            "?".to_string()
+        } else if matches!(self.chars.peek().copied(), Some('?') | Some('#') | Some('@') | Some('*') | Some('$') | Some('!')) {
+            self.chars.next().unwrap().to_string()
         } else {
             let mut name = String::new();
             while let Some(c) = self.chars.peek().copied() {
