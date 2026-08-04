@@ -6,7 +6,7 @@ use crate::builtins;
 use crate::glob;
 use crate::lexer::{Chunk, VarOp};
 use crate::parser::{
-    self, AndOr, Combinator, Pipeline, Program, Redirect, Sep, SimpleCommand, Word,
+    self, AndOr, Combinator, ListItem, Pipeline, Program, Redirect, Sep, SimpleCommand, Word,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -203,11 +203,47 @@ impl Shell {
         }
     }
 
-    // (...) subshells self-exec the ash binary on the raw captured source,
-    // inheriting env but not sharing process state -- real bash subshells
-    // are forked children too, so mutations inside (cd, variables) must not
-    // leak back into the parent. Spawning a real child process gets that
-    // isolation for free instead of a separate snapshot/restore mechanism.
+    // Functions and `local` variables live only in this process's memory, so
+    // a self-exec'd child (see run_subshell/run_command_substitution below)
+    // starts with no knowledge of them -- unlike a real fork, which
+    // duplicates the whole process (this is exactly why e.g. `$(fib
+    // $((n-1)))` works in bash even when `n` is a local var: the forked
+    // child inherits it for free). Re-declaring visible locals and every
+    // currently-known function at the top of the child's script closes that
+    // gap without needing unsafe fork(2) or a separate IPC channel.
+    fn functions_preamble(&self) -> String {
+        let mut s = String::new();
+        let mut flattened: HashMap<&str, &str> = HashMap::new();
+        for scope in &self.var_scopes {
+            for (k, v) in scope {
+                flattened.insert(k.as_str(), v.as_str());
+            }
+        }
+        for (k, v) in &flattened {
+            s.push_str(k);
+            s.push('=');
+            s.push_str(&crate::serialize::quote_literal(v));
+            s.push('\n');
+        }
+        for (name, body) in &self.functions {
+            let def = parser::Command::FuncDef { name: name.clone(), body: Box::new(body.clone()) };
+            s.push_str(&crate::serialize::serialize_program(&[ListItem {
+                and_or: AndOr {
+                    first: Pipeline { commands: vec![def], negate: false },
+                    rest: Vec::new(),
+                },
+                sep: Sep::Seq,
+            }]));
+        }
+        s
+    }
+
+    // (...) subshells self-exec the ash binary on the raw captured source
+    // (plus the function preamble), inheriting env but not sharing process
+    // state -- real bash subshells are forked children too, so mutations
+    // inside (cd, variables) must not leak back into the parent. Spawning a
+    // real child process gets that isolation for free instead of a separate
+    // snapshot/restore mechanism.
     fn run_subshell(&self, raw: &str) -> i32 {
         let exe = match std::env::current_exe() {
             Ok(p) => p,
@@ -216,7 +252,8 @@ impl Shell {
                 return 1;
             }
         };
-        match Command::new(exe).arg("-c").arg(raw).status() {
+        let script = self.functions_preamble() + raw;
+        match Command::new(exe).arg("-c").arg(script).status() {
             Ok(status) => status.code().unwrap_or(1),
             Err(e) => {
                 eprintln!("ash: subshell: {}", e);
@@ -230,7 +267,8 @@ impl Shell {
             Ok(p) => p,
             Err(_) => return String::new(),
         };
-        match Command::new(exe).arg("-c").arg(raw).output() {
+        let script = self.functions_preamble() + raw;
+        match Command::new(exe).arg("-c").arg(script).output() {
             Ok(out) => {
                 let mut s = String::from_utf8_lossy(&out.stdout).into_owned();
                 while s.ends_with('\n') {

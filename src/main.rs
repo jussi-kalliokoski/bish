@@ -5,6 +5,7 @@ mod glob;
 mod lexer;
 mod parser;
 mod repl;
+mod serialize;
 
 use std::io::{IsTerminal, Read};
 
