@@ -117,6 +117,17 @@ impl Shell {
     }
 
     fn run_command(&mut self, cmd: &parser::Command, background: bool) -> ExecResult {
+        let redirects: &[Redirect] = match cmd {
+            parser::Command::If { redirects, .. } => redirects,
+            parser::Command::While { redirects, .. } => redirects,
+            parser::Command::For { redirects, .. } => redirects,
+            parser::Command::Case { redirects, .. } => redirects,
+            parser::Command::Group(_, redirects) => redirects,
+            _ => &[],
+        };
+        if !redirects.is_empty() {
+            return self.run_compound_redirected(cmd, redirects, background);
+        }
         match cmd {
             parser::Command::Simple(sc) => self.run_single(sc, background),
             parser::Command::If { branches, else_branch, .. } => self.run_if(branches, else_branch),
@@ -246,6 +257,59 @@ impl Shell {
             Err(e) => {
                 eprintln!("ash: subshell: {}", e);
                 1
+            }
+        }
+    }
+
+    // Compound commands (if/while/for/case/group) with a trailing redirect
+    // (`{ ...; } > file`, `done < file`) self-exec too, same as pipeline
+    // stages -- avoids needing unsafe fd-dup2 to redirect this process's own
+    // stdio for a nested block. serialize_command drops the redirects when
+    // reconstructing the child's script (they're applied here, at spawn
+    // time, instead), so the child doesn't re-trigger this same path.
+    // Trade-off: unlike real bash, state changes inside (cd, variables)
+    // won't propagate back to the parent in this specific case.
+    fn run_compound_redirected(&mut self, cmd: &parser::Command, redirects: &[Redirect], background: bool) -> ExecResult {
+        let redirs = match self.resolve_redirect_list(redirects) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("ash: {}", e);
+                return ExecResult::Status(1);
+            }
+        };
+        let exe = match std::env::current_exe() {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("ash: {}", e);
+                return ExecResult::Status(1);
+            }
+        };
+        let script = self.functions_preamble() + &crate::serialize::serialize_command(cmd);
+        let mut command = Command::new(exe);
+        command.arg("-c").arg(script);
+        command.stdin(redirs.stdin.unwrap_or_else(Stdio::inherit));
+        command.stdout(redirs.stdout.unwrap_or_else(Stdio::inherit));
+        command.stderr(redirs.stderr.unwrap_or_else(Stdio::inherit));
+        match command.spawn() {
+            Ok(mut child) => {
+                if background {
+                    std::thread::spawn(move || {
+                        let _ = child.wait();
+                    });
+                    ExecResult::Status(0)
+                } else {
+                    match child.wait() {
+                        Ok(status) => ExecResult::Status(status.code().unwrap_or(1)),
+                        Err(e) => {
+                            eprintln!("ash: {}", e);
+                            ExecResult::Status(1)
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("ash: {}", e);
+                ExecResult::Status(127)
             }
         }
     }
@@ -864,13 +928,17 @@ impl Shell {
     }
 
     fn resolve_redirects(&mut self, cmd: &SimpleCommand) -> Result<ResolvedRedirs, String> {
+        self.resolve_redirect_list(&cmd.redirects)
+    }
+
+    fn resolve_redirect_list(&mut self, redirects: &[Redirect]) -> Result<ResolvedRedirs, String> {
         let mut stdout_target: Option<(String, bool)> = None;
         let mut stderr_target: Option<(String, bool)> = None;
         let mut stdin_path: Option<String> = None;
         let mut here_string: Option<String> = None;
         let mut dup_err_to_out = false;
 
-        for r in &cmd.redirects {
+        for r in redirects {
             match r {
                 Redirect::In(w) => {
                     stdin_path = Some(self.expand_word(w));
