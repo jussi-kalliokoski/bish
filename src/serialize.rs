@@ -42,7 +42,7 @@ fn serialize_pipeline(p: &Pipeline) -> String {
     s
 }
 
-fn serialize_command(cmd: &Command) -> String {
+pub fn serialize_command(cmd: &Command) -> String {
     match cmd {
         Command::Simple(sc) => serialize_simple(sc),
         Command::If { branches, else_branch, .. } => {

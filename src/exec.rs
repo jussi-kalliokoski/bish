@@ -113,19 +113,7 @@ impl Shell {
         if pipeline.commands.len() == 1 {
             return self.run_command(&pipeline.commands[0], background);
         }
-        if pipeline.commands.iter().any(|c| !matches!(c, parser::Command::Simple(_))) {
-            eprintln!("ash: piping compound commands is not supported yet");
-            return ExecResult::Status(1);
-        }
-        let simples: Vec<SimpleCommand> = pipeline
-            .commands
-            .iter()
-            .map(|c| match c {
-                parser::Command::Simple(sc) => sc.clone(),
-                _ => unreachable!(),
-            })
-            .collect();
-        ExecResult::Status(self.run_multi(&simples, background))
+        ExecResult::Status(self.run_multi(&pipeline.commands, background))
     }
 
     fn run_command(&mut self, cmd: &parser::Command, background: bool) -> ExecResult {
@@ -389,6 +377,11 @@ impl Shell {
         }
 
         let argv: Vec<String> = self.expand_words(&cmd.words);
+        if argv.is_empty() {
+            // Every word vanished (e.g. the command was just an unquoted
+            // empty/unset variable) -- matches bash: nothing runs.
+            return ExecResult::Status(0);
+        }
         let name = argv[0].clone();
 
         // Builtins ignore per-command redirects for now: their output goes
@@ -562,43 +555,67 @@ impl Shell {
         }
     }
 
-    fn run_multi(&mut self, commands: &[SimpleCommand], background: bool) -> i32 {
+    // Every pipeline stage is a separate process by necessity (that's what
+    // makes piping possible at all), so compound-command stages self-exec
+    // just like Subshell already does -- this is actually the *correct*
+    // bash semantics too: piped stages always fork, even in real bash.
+    fn run_multi(&mut self, commands: &[parser::Command], background: bool) -> i32 {
         let n = commands.len();
         let mut children: Vec<std::process::Child> = Vec::with_capacity(n);
         let mut prev_stdout: Option<Stdio> = None;
 
         for (i, cmd) in commands.iter().enumerate() {
-            if cmd.words.is_empty() {
-                eprintln!("ash: syntax error in pipeline");
-                kill_all(children);
-                return 1;
-            }
-            let argv: Vec<String> = self.expand_words(&cmd.words);
+            let is_last = i == n - 1;
+            let default_stdin = prev_stdout.take().unwrap_or_else(Stdio::inherit);
+            let default_stdout = if is_last { Stdio::inherit() } else { Stdio::piped() };
 
-            let redirs = match self.resolve_redirects(cmd) {
-                Ok(r) => r,
-                Err(e) => {
-                    eprintln!("ash: {}", e);
-                    kill_all(children);
-                    return 1;
+            let mut command = match cmd {
+                parser::Command::Simple(sc) => {
+                    if sc.words.is_empty() {
+                        eprintln!("ash: syntax error in pipeline");
+                        kill_all(children);
+                        return 1;
+                    }
+                    let argv: Vec<String> = self.expand_words(&sc.words);
+                    if argv.is_empty() {
+                        continue;
+                    }
+                    let redirs = match self.resolve_redirects(sc) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            eprintln!("ash: {}", e);
+                            kill_all(children);
+                            return 1;
+                        }
+                    };
+                    let mut command = Command::new(&argv[0]);
+                    command.args(&argv[1..]);
+                    for (k, val) in &sc.assigns {
+                        command.env(k, self.expand_word(val));
+                    }
+                    command.stdin(redirs.stdin.unwrap_or(default_stdin));
+                    command.stdout(redirs.stdout.unwrap_or(default_stdout));
+                    command.stderr(redirs.stderr.unwrap_or_else(Stdio::inherit));
+                    command
+                }
+                other => {
+                    let exe = match std::env::current_exe() {
+                        Ok(p) => p,
+                        Err(e) => {
+                            eprintln!("ash: {}", e);
+                            kill_all(children);
+                            return 1;
+                        }
+                    };
+                    let script = self.functions_preamble() + &crate::serialize::serialize_command(other);
+                    let mut command = Command::new(exe);
+                    command.arg("-c").arg(script);
+                    command.stdin(default_stdin);
+                    command.stdout(default_stdout);
+                    command.stderr(Stdio::inherit());
+                    command
                 }
             };
-
-            let is_last = i == n - 1;
-            let stdin = redirs.stdin.or(prev_stdout.take()).unwrap_or_else(Stdio::inherit);
-            let stdout = redirs
-                .stdout
-                .unwrap_or_else(|| if is_last { Stdio::inherit() } else { Stdio::piped() });
-            let stderr = redirs.stderr.unwrap_or_else(Stdio::inherit);
-
-            let mut command = Command::new(&argv[0]);
-            command.args(&argv[1..]);
-            for (k, val) in &cmd.assigns {
-                command.env(k, self.expand_word(val));
-            }
-            command.stdin(stdin);
-            command.stdout(stdout);
-            command.stderr(stderr);
 
             match command.spawn() {
                 Ok(mut child) => {
@@ -608,7 +625,7 @@ impl Shell {
                     children.push(child);
                 }
                 Err(e) => {
-                    eprintln!("ash: {}: {}", argv[0], e);
+                    eprintln!("ash: {}", e);
                     kill_all(children);
                     return 127;
                 }
