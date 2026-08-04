@@ -9,6 +9,8 @@ pub enum Chunk {
     // Raw, not-yet-parsed source text of a $(...) or `...` command
     // substitution -- re-tokenized/parsed/run recursively at expansion time.
     Sub(String),
+    // Raw source text of a $((...)) arithmetic expansion.
+    Arith(String),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -32,6 +34,8 @@ pub enum Tok {
     RParen,
     // Raw, not-yet-parsed source text of a (...) subshell pipeline stage.
     Subshell(String),
+    // Raw source text of a standalone ((...)) arithmetic command.
+    Arith(String),
     KwIf,
     KwThen,
     KwElif,
@@ -136,6 +140,10 @@ impl<'a> Lexer<'a> {
                         self.chars.next();
                         toks.push(Tok::LParen);
                         toks.push(Tok::RParen);
+                    } else if self.chars.peek().copied() == Some('(') {
+                        self.chars.next();
+                        let raw = self.capture_double_paren()?;
+                        toks.push(Tok::Arith(raw));
                     } else {
                         let raw = self.capture_balanced_parens()?;
                         toks.push(Tok::Subshell(raw));
@@ -286,6 +294,19 @@ impl<'a> Lexer<'a> {
         Ok(s)
     }
 
+    // Called with BOTH opening parens of `((...))` already consumed by the
+    // caller. Captures the inner expression text and consumes the matching
+    // final ')' (capture_balanced_parens stops after the first of the two
+    // closing parens, since it only tracks the depth opened by the second
+    // '(').
+    fn capture_double_paren(&mut self) -> Result<String, String> {
+        let raw = self.capture_balanced_parens()?;
+        if self.chars.peek().copied() == Some(')') {
+            self.chars.next();
+        }
+        Ok(raw)
+    }
+
     fn capture_backtick(&mut self) -> Result<String, String> {
         let mut s = String::new();
         loop {
@@ -415,7 +436,12 @@ impl<'a> Lexer<'a> {
     fn push_var(&mut self, chunks: &mut Vec<Chunk>, buf: &mut String) -> Result<(), String> {
         if self.chars.peek().copied() == Some('(') {
             self.chars.next();
-            chunks.push(Chunk::Sub(self.capture_balanced_parens()?));
+            if self.chars.peek().copied() == Some('(') {
+                self.chars.next();
+                chunks.push(Chunk::Arith(self.capture_double_paren()?));
+            } else {
+                chunks.push(Chunk::Sub(self.capture_balanced_parens()?));
+            }
             return Ok(());
         }
         let name = self.read_var_name();

@@ -55,6 +55,8 @@ pub enum Command {
     // Raw, not-yet-parsed source text of a (...) subshell -- tokenized and
     // parsed lazily, recursively, when it actually runs (see exec.rs).
     Subshell(String, Vec<Redirect>),
+    // Standalone ((expr)) arithmetic command.
+    Arith(String, Vec<Redirect>),
 }
 
 #[derive(Debug, Clone)]
@@ -234,6 +236,14 @@ impl Parser {
                 };
                 let redirects = self.parse_trailing_redirects()?;
                 Ok(Command::Subshell(raw, redirects))
+            }
+            Some(Tok::Arith(_)) => {
+                let raw = match self.advance() {
+                    Some(Tok::Arith(raw)) => raw,
+                    _ => unreachable!(),
+                };
+                let redirects = self.parse_trailing_redirects()?;
+                Ok(Command::Arith(raw, redirects))
             }
             _ => Ok(Command::Simple(self.parse_simple_command()?)),
         }

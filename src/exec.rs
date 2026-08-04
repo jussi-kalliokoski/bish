@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::process::{Command, Stdio};
 
+use crate::arith;
 use crate::builtins;
 use crate::lexer::Chunk;
 use crate::parser::{
@@ -143,6 +144,13 @@ impl Shell {
                 ExecResult::Status(0)
             }
             parser::Command::Subshell(raw, _redirects) => ExecResult::Status(self.run_subshell(raw)),
+            parser::Command::Arith(raw, _redirects) => match arith::eval(raw, self) {
+                Ok(v) => ExecResult::Status(if v != 0 { 0 } else { 1 }),
+                Err(e) => {
+                    eprintln!("ash: (({})): {}", raw, e);
+                    ExecResult::Status(1)
+                }
+            },
         }
     }
 
@@ -301,6 +309,19 @@ impl Shell {
         match name.as_str() {
             "cd" => return ExecResult::Status(builtins::cd(&argv[1..])),
             "export" => return ExecResult::Status(builtins::export(&argv[1..])),
+            "let" => {
+                let mut last = 0i64;
+                for a in &argv[1..] {
+                    match arith::eval(a, self) {
+                        Ok(v) => last = v,
+                        Err(e) => {
+                            eprintln!("ash: let: {}", e);
+                            return ExecResult::Status(2);
+                        }
+                    }
+                }
+                return ExecResult::Status(if last != 0 { 0 } else { 1 });
+            }
             "break" => return builtins::break_loop(&argv[1..]),
             "continue" => return builtins::continue_loop(&argv[1..]),
             "test" => return ExecResult::Status(builtins::test(&argv[1..])),
@@ -475,13 +496,17 @@ impl Shell {
         status
     }
 
-    fn expand_word(&self, w: &Word) -> String {
+    fn expand_word(&mut self, w: &Word) -> String {
         let mut s = String::new();
         for c in &w.chunks {
             match c {
                 Chunk::Str(t) => s.push_str(t),
                 Chunk::Var(name) => s.push_str(&self.lookup_var(name)),
                 Chunk::Sub(raw) => s.push_str(&self.run_command_substitution(raw)),
+                Chunk::Arith(raw) => match arith::eval(raw, self) {
+                    Ok(v) => s.push_str(&v.to_string()),
+                    Err(e) => eprintln!("ash: (({})): {}", raw, e),
+                },
             }
         }
         s
@@ -526,7 +551,7 @@ impl Shell {
         }
     }
 
-    fn resolve_redirects(&self, cmd: &SimpleCommand) -> Result<ResolvedRedirs, String> {
+    fn resolve_redirects(&mut self, cmd: &SimpleCommand) -> Result<ResolvedRedirs, String> {
         let mut stdout_target: Option<(String, bool)> = None;
         let mut stderr_target: Option<(String, bool)> = None;
         let mut stdin_path: Option<String> = None;
@@ -578,6 +603,16 @@ impl Shell {
         };
 
         Ok(ResolvedRedirs { stdin, stdout, stderr })
+    }
+}
+
+impl arith::VarContext for Shell {
+    fn get(&self, name: &str) -> i64 {
+        self.lookup_var(name).trim().parse().unwrap_or(0)
+    }
+
+    fn set(&mut self, name: &str, value: i64) {
+        self.assign_var(name, value.to_string());
     }
 }
 
