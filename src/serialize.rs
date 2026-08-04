@@ -152,6 +152,8 @@ fn serialize_chunk(c: &Chunk) -> String {
         Chunk::ArrayVarExpand { name, index, op, quoted } => {
             wrap_quoted(serialize_array_var_op(name, index, op), *quoted)
         }
+        Chunk::Indirect { name, quoted } => wrap_quoted(format!("${{!{}}}", name), *quoted),
+        Chunk::ArrayKeys { name, quoted } => wrap_quoted(format!("${{!{}[@]}}", name), *quoted),
     }
 }
 

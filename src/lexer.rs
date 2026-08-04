@@ -26,6 +26,13 @@ pub enum Chunk {
     // ${name[index]:-word} and friends -- same operators as VarExpand, but
     // reading from the array element instead of a scalar.
     ArrayVarExpand { name: String, index: String, op: VarOp, quoted: bool },
+    // ${!name} -- indirect expansion: look up the variable NAMED by the
+    // current value of `name` (one level only, same as bash).
+    Indirect { name: String, quoted: bool },
+    // ${!name[@]} / ${!name[*]} -- the array's keys/indices, not its values
+    // (indexed arrays: their set indices as decimal strings; associative:
+    // their string keys), one field per key like ${name[@]}.
+    ArrayKeys { name: String, quoted: bool },
 }
 
 // The operand ("word"/"pattern") of each variant is kept as raw source text
@@ -72,7 +79,6 @@ pub enum Tok {
     Newline,
     LBrace,
     RBrace,
-    LParen,
     RParen,
     // Raw, not-yet-parsed source text of a (...) subshell pipeline stage.
     Subshell(String),
@@ -200,12 +206,7 @@ impl<'a> Lexer<'a> {
                 }
                 Some('(') => {
                     self.chars.next();
-                    if self.chars.peek().copied() == Some(')') {
-                        // empty parens: function-def syntax `name()`
-                        self.chars.next();
-                        toks.push(Tok::LParen);
-                        toks.push(Tok::RParen);
-                    } else if self.chars.peek().copied() == Some('(') {
+                    if self.chars.peek().copied() == Some('(') {
                         self.chars.next();
                         let raw = self.capture_double_paren()?;
                         toks.push(Tok::Arith(raw));
@@ -676,6 +677,8 @@ impl<'a> Lexer<'a> {
                 BraceContent::ArrayOp(name, index, op) => {
                     chunks.push(Chunk::ArrayVarExpand { name, index, op, quoted })
                 }
+                BraceContent::Indirect(name) => chunks.push(Chunk::Indirect { name, quoted }),
+                BraceContent::ArrayKeys(name) => chunks.push(Chunk::ArrayKeys { name, quoted }),
             }
             return Ok(());
         }
@@ -766,6 +769,8 @@ enum BraceContent {
     ArrayIndex(String, String),
     ArrayLength(String, String),
     ArrayOp(String, String, VarOp),
+    Indirect(String),
+    ArrayKeys(String),
 }
 
 // `name[index]rest` -- name must be a plain identifier; returns whatever
@@ -822,6 +827,19 @@ fn parse_operator_suffix(rest: &str) -> Option<VarOp> {
 // checked first since '#' would otherwise be read as the RemovePrefix
 // operator on an empty name.
 fn parse_brace_content(inner: &str) -> BraceContent {
+    if let Some(rest) = inner.strip_prefix('!') {
+        if let Some((name, index, after)) = try_split_array(rest) {
+            if after.is_empty() && (index == "@" || index == "*") {
+                return BraceContent::ArrayKeys(name);
+            }
+        } else if !rest.is_empty() {
+            let mut chars = rest.chars();
+            let first = chars.next().unwrap();
+            if (first.is_alphabetic() || first == '_') && chars.all(|c| c.is_alphanumeric() || c == '_') {
+                return BraceContent::Indirect(rest.to_string());
+            }
+        }
+    }
     if let Some(rest) = inner.strip_prefix('#') {
         if let Some((name, index, after)) = try_split_array(rest) {
             if after.is_empty() {

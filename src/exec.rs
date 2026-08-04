@@ -1214,6 +1214,14 @@ impl Shell {
                     let op = op.clone();
                     s.push_str(&self.eval_array_var_op(&name, &index, &op));
                 }
+                Chunk::Indirect { name, .. } => {
+                    let target = self.lookup_var(name);
+                    s.push_str(&self.lookup_var(&target));
+                }
+                Chunk::ArrayKeys { name, .. } => {
+                    let name = name.clone();
+                    s.push_str(&self.array_keys(&name).join(" "));
+                }
             }
         }
         s
@@ -1256,6 +1264,13 @@ impl Shell {
                 .unwrap_or_default(),
             _ => String::new(),
         }
+    }
+
+    fn array_keys(&self, name: &str) -> Vec<String> {
+        if let Some(m) = self.assoc_arrays.get(name) {
+            return m.keys().cloned().collect();
+        }
+        self.arrays.get(name).map(|m| m.keys().map(|k| k.to_string()).collect()).unwrap_or_default()
     }
 
     fn array_all(&self, name: &str) -> Vec<String> {
@@ -1393,6 +1408,22 @@ impl Shell {
                     let op = op.clone();
                     let v = self.eval_array_var_op(&name, &index, &op);
                     append_splittable(&mut fields, &mut current, &v, *quoted);
+                }
+                Chunk::Indirect { name, quoted } => {
+                    let target = self.lookup_var(name);
+                    let v = self.lookup_var(&target);
+                    append_splittable(&mut fields, &mut current, &v, *quoted);
+                }
+                Chunk::ArrayKeys { name, quoted } => {
+                    // Same @-vs-* / quoted-vs-not splitting rules as
+                    // ${arr[@]}: "@" quoted is one field per key.
+                    if *quoted {
+                        let items = self.array_keys(name);
+                        append_parts(&mut fields, &mut current, &items);
+                    } else {
+                        let joined = self.array_keys(name).join(" ");
+                        append_splittable(&mut fields, &mut current, &joined, *quoted);
+                    }
                 }
             }
         }

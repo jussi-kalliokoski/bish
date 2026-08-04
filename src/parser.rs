@@ -269,8 +269,7 @@ impl Parser {
     fn looks_like_func_def(&self) -> bool {
         if let Some(Tok::Word(chunks, _)) = self.toks.get(self.pos) {
             if word_to_plain_name(chunks).is_some() {
-                return matches!(self.toks.get(self.pos + 1), Some(Tok::LParen))
-                    && matches!(self.toks.get(self.pos + 2), Some(Tok::RParen));
+                return matches!(self.toks.get(self.pos + 1), Some(Tok::Subshell(raw)) if raw.is_empty());
             }
         }
         false
@@ -281,8 +280,7 @@ impl Parser {
             Some(Tok::Word(chunks, _)) => word_to_plain_name(&chunks).unwrap(),
             _ => unreachable!(),
         };
-        self.advance(); // LParen
-        self.advance(); // RParen
+        self.advance(); // empty Subshell("") standing in for `()`
         self.skip_terminators();
         let body = self.parse_command()?;
         Ok(Command::FuncDef { name, body: Box::new(body) })
@@ -296,9 +294,8 @@ impl Parser {
             }
             other => return Err(format!("expected function name, got {:?}", other)),
         };
-        if matches!(self.peek(), Some(Tok::LParen)) {
+        if matches!(self.peek(), Some(Tok::Subshell(raw)) if raw.is_empty()) {
             self.advance();
-            self.expect(Tok::RParen)?;
         }
         self.skip_terminators();
         let body = self.parse_command()?;
