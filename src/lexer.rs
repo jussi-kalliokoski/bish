@@ -269,6 +269,15 @@ impl<'a> Lexer<'a> {
                                 toks.push(kw);
                                 continue;
                             }
+                            if s.contains('{') {
+                                let expanded = brace_expand(s);
+                                if expanded.len() > 1 || expanded[0] != *s {
+                                    for e in expanded {
+                                        toks.push(Tok::Word(vec![Chunk::Str(e)], true));
+                                    }
+                                    continue;
+                                }
+                            }
                         }
                     }
                     toks.push(Tok::Word(word, plain));
@@ -392,6 +401,40 @@ impl<'a> Lexer<'a> {
                         s.push(n);
                     }
                     _ => s.push('\\'),
+                },
+                Some(c) => s.push(c),
+            }
+        }
+        Ok(s)
+    }
+
+    // Reads a $'...' ANSI-C quoted string (opening $' already consumed).
+    // Result is a plain literal -- no further $ expansion happens inside,
+    // matching bash. Common C-style escapes only (no \xHH/\uHHHH/octal).
+    fn read_ansi_c_string(&mut self) -> Result<String, String> {
+        let mut s = String::new();
+        loop {
+            match self.chars.next() {
+                None => return Err("unterminated $'...'".to_string()),
+                Some('\'') => break,
+                Some('\\') => match self.chars.next() {
+                    Some('n') => s.push('\n'),
+                    Some('t') => s.push('\t'),
+                    Some('r') => s.push('\r'),
+                    Some('\\') => s.push('\\'),
+                    Some('\'') => s.push('\''),
+                    Some('"') => s.push('"'),
+                    Some('a') => s.push('\x07'),
+                    Some('b') => s.push('\x08'),
+                    Some('e') => s.push('\x1b'),
+                    Some('f') => s.push('\x0c'),
+                    Some('v') => s.push('\x0b'),
+                    Some('0') => s.push('\0'),
+                    Some(other) => {
+                        s.push('\\');
+                        s.push(other);
+                    }
+                    None => return Err("unterminated $'...'".to_string()),
                 },
                 Some(c) => s.push(c),
             }
@@ -545,6 +588,12 @@ impl<'a> Lexer<'a> {
                     if let Some(n) = self.chars.next() {
                         buf.push(n);
                     }
+                }
+                Some('$') if self.peek2() == Some('\'') => {
+                    plain = false;
+                    self.chars.next(); // '$'
+                    self.chars.next(); // '\''
+                    buf.push_str(&self.read_ansi_c_string()?);
                 }
                 Some('$') => {
                     plain = false;
@@ -765,4 +814,97 @@ fn parse_brace_content(inner: &str) -> BraceContent {
     // as a literal (best-effort; will just look up a likely-nonexistent
     // variable name rather than crashing).
     BraceContent::Plain(inner.to_string())
+}
+
+// Brace expansion ({a,b,c}, {1..5}, {a..e}, and nested combinations).
+// Scoped to fully literal, unquoted words only (see the tokenize() call
+// site) -- bash technically allows brace expansion alongside other
+// expansions in the same word, but that's a rare combination not worth the
+// added complexity here.
+fn brace_expand(s: &str) -> Vec<String> {
+    if let Some((prefix, items, suffix)) = split_brace_group(s) {
+        let mut result = Vec::new();
+        for item in items {
+            for combined in brace_expand(&format!("{}{}{}", prefix, item, suffix)) {
+                result.push(combined);
+            }
+        }
+        if !result.is_empty() {
+            return result;
+        }
+    }
+    vec![s.to_string()]
+}
+
+fn split_brace_group(s: &str) -> Option<(String, Vec<String>, String)> {
+    let chars: Vec<char> = s.chars().collect();
+    let start = chars.iter().position(|&c| c == '{')?;
+    let mut depth = 0;
+    let mut end = None;
+    for (i, &c) in chars.iter().enumerate().skip(start) {
+        match c {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    end = Some(i);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let end = end?;
+    let prefix: String = chars[..start].iter().collect();
+    let inner: String = chars[start + 1..end].iter().collect();
+    let suffix: String = chars[end + 1..].iter().collect();
+
+    if let Some(items) = try_brace_range(&inner) {
+        return Some((prefix, items, suffix));
+    }
+    let items = split_top_level_commas(&inner);
+    if items.len() > 1 {
+        return Some((prefix, items, suffix));
+    }
+    None
+}
+
+fn try_brace_range(inner: &str) -> Option<Vec<String>> {
+    let parts: Vec<&str> = inner.splitn(2, "..").collect();
+    if parts.len() != 2 {
+        return None;
+    }
+    if let (Ok(a), Ok(b)) = (parts[0].parse::<i64>(), parts[1].parse::<i64>()) {
+        let items = if a <= b { (a..=b).collect::<Vec<_>>() } else { (b..=a).rev().collect::<Vec<_>>() };
+        return Some(items.into_iter().map(|n| n.to_string()).collect());
+    }
+    let (ca, cb): (Vec<char>, Vec<char>) = (parts[0].chars().collect(), parts[1].chars().collect());
+    if ca.len() == 1 && cb.len() == 1 {
+        let (a, b) = (ca[0] as u32, cb[0] as u32);
+        let range: Vec<u32> = if a <= b { (a..=b).collect() } else { (b..=a).rev().collect() };
+        return Some(range.into_iter().filter_map(char::from_u32).map(String::from).collect());
+    }
+    None
+}
+
+fn split_top_level_commas(s: &str) -> Vec<String> {
+    let mut items = Vec::new();
+    let mut depth = 0;
+    let mut cur = String::new();
+    for c in s.chars() {
+        match c {
+            '{' => {
+                depth += 1;
+                cur.push(c);
+            }
+            '}' => {
+                depth -= 1;
+                cur.push(c);
+            }
+            ',' if depth == 0 => items.push(std::mem::take(&mut cur)),
+            _ => cur.push(c),
+        }
+    }
+    items.push(cur);
+    items
 }
