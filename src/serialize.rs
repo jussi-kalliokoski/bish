@@ -188,6 +188,15 @@ fn serialize_var_op(name: &str, op: &VarOp) -> String {
         VarOp::RemoveSuffix { pattern, longest } => {
             format!("${{{}{}{}}}", name, if *longest { "%%" } else { "%" }, pattern)
         }
+        VarOp::CaseConvert { pattern, upper, all } => {
+            let op = match (*upper, *all) {
+                (true, true) => "^^",
+                (true, false) => "^",
+                (false, true) => ",,",
+                (false, false) => ",",
+            };
+            format!("${{{}{}{}}}", name, op, pattern)
+        }
     }
 }
 

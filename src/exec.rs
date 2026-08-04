@@ -1496,6 +1496,10 @@ impl Shell {
                 let pattern = self.expand_raw(pattern);
                 strip_suffix_glob(&cur, &pattern, *longest)
             }
+            VarOp::CaseConvert { pattern, upper, all } => {
+                let pattern = self.expand_raw(pattern);
+                apply_case_convert(&cur, &pattern, *upper, *all)
+            }
         }
     }
 
@@ -1548,6 +1552,10 @@ impl Shell {
             VarOp::RemoveSuffix { pattern, longest } => {
                 let pattern = self.expand_raw(pattern);
                 strip_suffix_glob(&cur, &pattern, *longest)
+            }
+            VarOp::CaseConvert { pattern, upper, all } => {
+                let pattern = self.expand_raw(pattern);
+                apply_case_convert(&cur, &pattern, *upper, *all)
             }
         }
     }
@@ -1859,6 +1867,29 @@ fn strip_suffix_glob(s: &str, pattern: &str, longest: bool) -> String {
         }
     }
     s.to_string()
+}
+
+// `${V^pattern}` family. An empty pattern (the common `${V^^}` shape with
+// nothing after it) matches every character; otherwise each candidate
+// character is matched against the pattern with the same glob matcher
+// `case` patterns use. `all` picks every matching char vs just the first.
+fn apply_case_convert(cur: &str, pattern: &str, upper: bool, all: bool) -> String {
+    let mut result = String::with_capacity(cur.len());
+    let mut first = true;
+    for ch in cur.chars() {
+        let convert = (all || first) && (pattern.is_empty() || glob::matches(pattern, &ch.to_string()));
+        if convert {
+            if upper {
+                result.extend(ch.to_uppercase());
+            } else {
+                result.extend(ch.to_lowercase());
+            }
+        } else {
+            result.push(ch);
+        }
+        first = false;
+    }
+    result
 }
 
 fn open_out(path: &str, append: bool) -> Result<std::fs::File, String> {

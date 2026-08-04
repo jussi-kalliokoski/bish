@@ -51,6 +51,12 @@ pub enum VarOp {
     AltIfSet { word: String, colon: bool },
     RemovePrefix { pattern: String, longest: bool },
     RemoveSuffix { pattern: String, longest: bool },
+    // ${V^pattern}/${V^^pattern}/${V,pattern}/${V,,pattern} -- `upper`
+    // picks the direction, `all` picks first-char-only vs every char. An
+    // empty pattern (the common case, e.g. `${V^^}`) means "any character";
+    // otherwise the pattern is matched against each candidate char with the
+    // same glob matcher `case` patterns use.
+    CaseConvert { pattern: String, upper: bool, all: bool },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -820,6 +826,18 @@ fn parse_operator_suffix(rest: &str) -> Option<VarOp> {
     op!("=", AssignDefault, false);
     op!("?", ErrorIfUnset, false);
     op!("+", AltIfSet, false);
+    if let Some(w) = rest.strip_prefix("^^") {
+        return Some(VarOp::CaseConvert { pattern: w.to_string(), upper: true, all: true });
+    }
+    if let Some(w) = rest.strip_prefix('^') {
+        return Some(VarOp::CaseConvert { pattern: w.to_string(), upper: true, all: false });
+    }
+    if let Some(w) = rest.strip_prefix(",,") {
+        return Some(VarOp::CaseConvert { pattern: w.to_string(), upper: false, all: true });
+    }
+    if let Some(w) = rest.strip_prefix(',') {
+        return Some(VarOp::CaseConvert { pattern: w.to_string(), upper: false, all: false });
+    }
     None
 }
 
