@@ -3,7 +3,8 @@ use std::process::{Command, Stdio};
 
 use crate::arith;
 use crate::builtins;
-use crate::lexer::Chunk;
+use crate::glob;
+use crate::lexer::{Chunk, VarOp};
 use crate::parser::{
     self, AndOr, Combinator, Pipeline, Program, Redirect, Sep, SimpleCommand, Word,
 };
@@ -252,8 +253,8 @@ impl Shell {
     }
 
     fn run_for(&mut self, var: &str, words: &[Word], body: &Program) -> ExecResult {
-        for w in words {
-            let val = self.expand_word(w);
+        let values = self.expand_words(words);
+        for val in values {
             self.assign_var(var, val);
             match self.run_program(body) {
                 ExecResult::Break(n) => {
@@ -280,7 +281,7 @@ impl Shell {
         for (patterns, body) in arms {
             for p in patterns {
                 let pat = self.expand_word(p);
-                if pat == "*" || pat == val {
+                if glob::matches(&pat, &val) {
                     return self.run_program(body);
                 }
             }
@@ -301,7 +302,7 @@ impl Shell {
             return ExecResult::Status(0);
         }
 
-        let argv: Vec<String> = cmd.words.iter().map(|w| self.expand_word(w)).collect();
+        let argv: Vec<String> = self.expand_words(&cmd.words);
         let name = argv[0].clone();
 
         // Builtins ignore per-command redirects for now: their output goes
@@ -324,7 +325,7 @@ impl Shell {
             }
             "break" => return builtins::break_loop(&argv[1..]),
             "continue" => return builtins::continue_loop(&argv[1..]),
-            "test" => return ExecResult::Status(builtins::test(&argv[1..])),
+            "test" => return ExecResult::Status(builtins::test(&argv[1..], false)),
             "[" | "[[" => {
                 let closer = if name == "[" { "]" } else { "]]" };
                 let mut a = argv[1..].to_vec();
@@ -334,7 +335,7 @@ impl Shell {
                     eprintln!("ash: {}: missing closing {}", name, closer);
                     return ExecResult::Status(2);
                 }
-                return ExecResult::Status(builtins::test(&a));
+                return ExecResult::Status(builtins::test(&a, name == "[["));
             }
             "return" => {
                 let code = argv.get(1).and_then(|s| s.parse::<i32>().ok()).unwrap_or(self.last_status);
@@ -432,7 +433,7 @@ impl Shell {
                 kill_all(children);
                 return 1;
             }
-            let argv: Vec<String> = cmd.words.iter().map(|w| self.expand_word(w)).collect();
+            let argv: Vec<String> = self.expand_words(&cmd.words);
 
             let redirs = match self.resolve_redirects(cmd) {
                 Ok(r) => r,
@@ -507,9 +508,101 @@ impl Shell {
                     Ok(v) => s.push_str(&v.to_string()),
                     Err(e) => eprintln!("ash: (({})): {}", raw, e),
                 },
+                Chunk::VarExpand { name, op } => {
+                    let name = name.clone();
+                    let op = op.clone();
+                    s.push_str(&self.eval_var_op(&name, &op));
+                }
             }
         }
         s
+    }
+
+    // Re-lexes and expands a captured raw operand (the "word"/"pattern"
+    // half of a ${...} expansion), so it can itself contain further $
+    // expansions. Multiple resulting words are concatenated with no
+    // separator, approximating "the operand as a single expandable value".
+    fn expand_raw(&mut self, raw: &str) -> String {
+        match crate::lexer::Lexer::new(raw).tokenize() {
+            Ok(toks) => {
+                let mut s = String::new();
+                for t in toks {
+                    if let crate::lexer::Tok::Word(chunks, _) = t {
+                        s.push_str(&self.expand_word(&Word { chunks, globbable: false }));
+                    }
+                }
+                s
+            }
+            Err(_) => raw.to_string(),
+        }
+    }
+
+    fn eval_var_op(&mut self, name: &str, op: &VarOp) -> String {
+        let cur = self.lookup_var(name);
+        match op {
+            VarOp::Length => cur.chars().count().to_string(),
+            VarOp::Default { word, .. } => {
+                if cur.is_empty() {
+                    self.expand_raw(word)
+                } else {
+                    cur
+                }
+            }
+            VarOp::AssignDefault { word, .. } => {
+                if cur.is_empty() {
+                    let v = self.expand_raw(word);
+                    self.assign_var(name, v.clone());
+                    v
+                } else {
+                    cur
+                }
+            }
+            VarOp::ErrorIfUnset { word, .. } => {
+                if cur.is_empty() {
+                    let msg = self.expand_raw(word);
+                    eprintln!("ash: {}: {}", name, msg);
+                    String::new()
+                } else {
+                    cur
+                }
+            }
+            VarOp::AltIfSet { word, .. } => {
+                if !cur.is_empty() {
+                    self.expand_raw(word)
+                } else {
+                    String::new()
+                }
+            }
+            VarOp::RemovePrefix { pattern, longest } => {
+                let pattern = self.expand_raw(pattern);
+                strip_prefix_glob(&cur, &pattern, *longest)
+            }
+            VarOp::RemoveSuffix { pattern, longest } => {
+                let pattern = self.expand_raw(pattern);
+                strip_suffix_glob(&cur, &pattern, *longest)
+            }
+        }
+    }
+
+    // Expands a simple-command's words into argv, applying filesystem
+    // pathname (glob) expansion to any word that's both glob-eligible
+    // (no quoting/escaping/expansion at all -- see Word::globbable) and
+    // actually contains metacharacters. A pattern with no filesystem
+    // matches is kept as its literal text, matching bash's default
+    // (nullglob-off) behavior.
+    fn expand_words(&mut self, words: &[Word]) -> Vec<String> {
+        let mut out = Vec::new();
+        for w in words {
+            let s = self.expand_word(w);
+            if w.globbable {
+                if let Some(matches) = glob::expand(&s) {
+                    out.extend(matches);
+                    continue;
+                }
+            }
+            out.push(s);
+        }
+        out
     }
 
     fn lookup_var(&self, name: &str) -> String {
@@ -620,6 +713,31 @@ struct ResolvedRedirs {
     stdin: Option<Stdio>,
     stdout: Option<Stdio>,
     stderr: Option<Stdio>,
+}
+
+fn strip_prefix_glob(s: &str, pattern: &str, longest: bool) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    let lens: Vec<usize> = if longest { (0..=chars.len()).rev().collect() } else { (0..=chars.len()).collect() };
+    for len in lens {
+        let candidate: String = chars[..len].iter().collect();
+        if glob::matches(pattern, &candidate) {
+            return chars[len..].iter().collect();
+        }
+    }
+    s.to_string()
+}
+
+fn strip_suffix_glob(s: &str, pattern: &str, longest: bool) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    let n = chars.len();
+    let lens: Vec<usize> = if longest { (0..=n).rev().collect() } else { (0..=n).collect() };
+    for len in lens {
+        let candidate: String = chars[n - len..].iter().collect();
+        if glob::matches(pattern, &candidate) {
+            return chars[..n - len].iter().collect();
+        }
+    }
+    s.to_string()
 }
 
 fn open_out(path: &str, append: bool) -> Result<std::fs::File, String> {

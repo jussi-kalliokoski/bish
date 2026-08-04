@@ -3,6 +3,7 @@ use crate::lexer::{Chunk, Tok};
 #[derive(Debug, Clone)]
 pub struct Word {
     pub chunks: Vec<Chunk>,
+    pub globbable: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -200,7 +201,7 @@ impl Parser {
     }
 
     fn parse_pipeline(&mut self) -> Result<Pipeline, String> {
-        let negate = if let Some(Tok::Word(chunks)) = self.peek() {
+        let negate = if let Some(Tok::Word(chunks, _)) = self.peek() {
             if matches!(chunks.as_slice(), [Chunk::Str(s)] if s == "!") {
                 self.advance();
                 true
@@ -228,7 +229,7 @@ impl Parser {
             Some(Tok::KwCase) => self.parse_case(),
             Some(Tok::LBrace) => self.parse_group(),
             Some(Tok::KwFunction) => self.parse_function_kw(),
-            Some(Tok::Word(_)) if self.looks_like_func_def() => self.parse_function_paren(),
+            Some(Tok::Word(_, _)) if self.looks_like_func_def() => self.parse_function_paren(),
             Some(Tok::Subshell(_)) => {
                 let raw = match self.advance() {
                     Some(Tok::Subshell(raw)) => raw,
@@ -250,7 +251,7 @@ impl Parser {
     }
 
     fn looks_like_func_def(&self) -> bool {
-        if let Some(Tok::Word(chunks)) = self.toks.get(self.pos) {
+        if let Some(Tok::Word(chunks, _)) = self.toks.get(self.pos) {
             if word_to_plain_name(chunks).is_some() {
                 return matches!(self.toks.get(self.pos + 1), Some(Tok::LParen))
                     && matches!(self.toks.get(self.pos + 2), Some(Tok::RParen));
@@ -261,7 +262,7 @@ impl Parser {
 
     fn parse_function_paren(&mut self) -> Result<Command, String> {
         let name = match self.advance() {
-            Some(Tok::Word(chunks)) => word_to_plain_name(&chunks).unwrap(),
+            Some(Tok::Word(chunks, _)) => word_to_plain_name(&chunks).unwrap(),
             _ => unreachable!(),
         };
         self.advance(); // LParen
@@ -274,7 +275,7 @@ impl Parser {
     fn parse_function_kw(&mut self) -> Result<Command, String> {
         self.advance(); // KwFunction
         let name = match self.advance() {
-            Some(Tok::Word(chunks)) => {
+            Some(Tok::Word(chunks, _)) => {
                 word_to_plain_name(&chunks).ok_or_else(|| "expected a plain function name".to_string())?
             }
             other => return Err(format!("expected function name, got {:?}", other)),
@@ -336,7 +337,7 @@ impl Parser {
     fn parse_for(&mut self) -> Result<Command, String> {
         self.advance(); // KwFor
         let var = match self.advance() {
-            Some(Tok::Word(chunks)) => word_to_plain_name(&chunks)
+            Some(Tok::Word(chunks, _)) => word_to_plain_name(&chunks)
                 .ok_or_else(|| "expected a plain variable name after 'for'".to_string())?,
             other => return Err(format!("expected variable name after 'for', got {:?}", other)),
         };
@@ -345,9 +346,9 @@ impl Parser {
         let mut words = Vec::new();
         if matches!(self.peek(), Some(Tok::KwIn)) {
             self.advance();
-            while let Some(Tok::Word(_)) = self.peek() {
-                if let Some(Tok::Word(chunks)) = self.advance() {
-                    words.push(Word { chunks });
+            while let Some(Tok::Word(_, _)) = self.peek() {
+                if let Some(Tok::Word(chunks, globbable)) = self.advance() {
+                    words.push(Word { chunks, globbable });
                 }
             }
             if matches!(self.peek(), Some(Tok::Semi) | Some(Tok::Newline)) {
@@ -445,12 +446,12 @@ impl Parser {
 
         loop {
             match self.peek() {
-                Some(Tok::Word(_)) => {
-                    let chunks = match self.advance() {
-                        Some(Tok::Word(c)) => c,
+                Some(Tok::Word(_, _)) => {
+                    let (chunks, globbable) = match self.advance() {
+                        Some(Tok::Word(c, g)) => (c, g),
                         _ => unreachable!(),
                     };
-                    let w = Word { chunks };
+                    let w = Word { chunks, globbable };
                     if in_assign_phase {
                         if let Some((name, val)) = word_as_assignment(&w) {
                             assigns.push((name, val));
@@ -499,7 +500,7 @@ impl Parser {
 
     fn expect_word(&mut self) -> Result<Word, String> {
         match self.advance() {
-            Some(Tok::Word(chunks)) => Ok(Word { chunks }),
+            Some(Tok::Word(chunks, globbable)) => Ok(Word { chunks, globbable }),
             other => Err(format!("expected word, got {:?}", other)),
         }
     }
@@ -513,7 +514,9 @@ fn word_as_assignment(w: &Word) -> Option<(String, Word)> {
         if is_valid_ident(name) {
             let mut rest_chunks = vec![Chunk::Str(s[eq + 1..].to_string())];
             rest_chunks.extend(w.chunks[1..].iter().cloned());
-            return Some((name.to_string(), Word { chunks: rest_chunks }));
+            // Assignment RHS is never glob-expanded in bash, regardless of
+            // whether the original word would have been.
+            return Some((name.to_string(), Word { chunks: rest_chunks, globbable: false }));
         }
     }
     None

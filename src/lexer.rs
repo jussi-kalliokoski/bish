@@ -11,11 +11,34 @@ pub enum Chunk {
     Sub(String),
     // Raw source text of a $((...)) arithmetic expansion.
     Arith(String),
+    VarExpand { name: String, op: VarOp },
+}
+
+// The operand ("word"/"pattern") of each variant is kept as raw source text
+// and re-expanded/glob-matched at evaluation time (see exec.rs), same
+// deferred-parsing approach as Sub/Arith. `colon` distinguishes `${V:-x}`
+// (triggers on unset-or-empty) from `${V-x}` (triggers on unset only) --
+// v1 treats both the same (unset and empty are conflated throughout the
+// shell's variable lookup), so `colon` is currently unused but kept for
+// when that distinction is implemented.
+#[derive(Debug, Clone, PartialEq)]
+pub enum VarOp {
+    Length,
+    Default { word: String, colon: bool },
+    AssignDefault { word: String, colon: bool },
+    ErrorIfUnset { word: String, colon: bool },
+    AltIfSet { word: String, colon: bool },
+    RemovePrefix { pattern: String, longest: bool },
+    RemoveSuffix { pattern: String, longest: bool },
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Tok {
-    Word(Vec<Chunk>),
+    // Word(chunks, globbable) -- globbable is true only if the word had no
+    // quoting/escaping/expansion at all (see read_word); a word that's
+    // partly quoted never glob-expands in v1, a conservative
+    // under-globbing simplification vs. bash's per-character quote tracking.
+    Word(Vec<Chunk>, bool),
     Pipe,
     And,
     Or,
@@ -198,7 +221,7 @@ impl<'a> Lexer<'a> {
                             }
                         }
                     }
-                    toks.push(Tok::Word(word));
+                    toks.push(Tok::Word(word, plain));
                 }
             }
         }
@@ -430,9 +453,10 @@ impl<'a> Lexer<'a> {
         Ok((chunks, plain))
     }
 
-    // Consumes a variable reference (or $(...) command substitution) after
-    // the '$' has already been consumed, and pushes the appropriate Chunk,
-    // or a literal "$" if nothing valid follows.
+    // Consumes a variable reference (command substitution, arithmetic
+    // expansion, or ${...} parameter expansion) after the '$' has already
+    // been consumed, and pushes the appropriate Chunk, or a literal "$" if
+    // nothing valid follows.
     fn push_var(&mut self, chunks: &mut Vec<Chunk>, buf: &mut String) -> Result<(), String> {
         if self.chars.peek().copied() == Some('(') {
             self.chars.next();
@@ -441,6 +465,28 @@ impl<'a> Lexer<'a> {
                 chunks.push(Chunk::Arith(self.capture_double_paren()?));
             } else {
                 chunks.push(Chunk::Sub(self.capture_balanced_parens()?));
+            }
+            return Ok(());
+        }
+        if self.chars.peek().copied() == Some('{') {
+            self.chars.next();
+            let mut inner = String::new();
+            while let Some(c) = self.chars.peek().copied() {
+                self.chars.next();
+                if c == '}' {
+                    break;
+                }
+                inner.push(c);
+            }
+            match parse_brace_content(&inner) {
+                BraceContent::Plain(name) => {
+                    if name.is_empty() {
+                        buf.push('$');
+                    } else {
+                        chunks.push(Chunk::Var(name));
+                    }
+                }
+                BraceContent::Op(name, op) => chunks.push(Chunk::VarExpand { name, op }),
             }
             return Ok(());
         }
@@ -454,18 +500,7 @@ impl<'a> Lexer<'a> {
     }
 
     fn read_var_name(&mut self) -> String {
-        if self.chars.peek().copied() == Some('{') {
-            self.chars.next();
-            let mut name = String::new();
-            while let Some(c) = self.chars.peek().copied() {
-                self.chars.next();
-                if c == '}' {
-                    break;
-                }
-                name.push(c);
-            }
-            name
-        } else if matches!(self.chars.peek().copied(), Some('?') | Some('#') | Some('@') | Some('*') | Some('$') | Some('!')) {
+        if matches!(self.chars.peek().copied(), Some('?') | Some('#') | Some('@') | Some('*') | Some('$') | Some('!')) {
             self.chars.next().unwrap().to_string()
         } else {
             let mut name = String::new();
@@ -480,4 +515,75 @@ impl<'a> Lexer<'a> {
             name
         }
     }
+}
+
+enum BraceContent {
+    Plain(String),
+    Op(String, VarOp),
+}
+
+// Parses the text captured between `${` and `}`. `${#VAR}` (length) is
+// checked first since '#' would otherwise be read as the RemovePrefix
+// operator on an empty name.
+fn parse_brace_content(inner: &str) -> BraceContent {
+    if let Some(rest) = inner.strip_prefix('#') {
+        if !rest.is_empty() {
+            return BraceContent::Op(rest.to_string(), VarOp::Length);
+        }
+    }
+
+    let mut name_end = 0;
+    let mut chars = inner.char_indices();
+    if let Some((_, c)) = chars.next() {
+        if matches!(c, '?' | '#' | '@' | '*' | '$' | '!') {
+            name_end = c.len_utf8();
+        } else if c.is_alphanumeric() || c == '_' {
+            name_end = c.len_utf8();
+            for (i, c) in chars {
+                if c.is_alphanumeric() || c == '_' {
+                    name_end = i + c.len_utf8();
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+    let name = inner[..name_end].to_string();
+    let rest = &inner[name_end..];
+    if rest.is_empty() {
+        return BraceContent::Plain(name);
+    }
+
+    macro_rules! op {
+        ($prefix:expr, $variant:ident, $colon:expr) => {
+            if let Some(w) = rest.strip_prefix($prefix) {
+                return BraceContent::Op(name, VarOp::$variant { word: w.to_string(), colon: $colon });
+            }
+        };
+    }
+    op!(":-", Default, true);
+    op!(":=", AssignDefault, true);
+    op!(":?", ErrorIfUnset, true);
+    op!(":+", AltIfSet, true);
+    if let Some(w) = rest.strip_prefix("##") {
+        return BraceContent::Op(name, VarOp::RemovePrefix { pattern: w.to_string(), longest: true });
+    }
+    if let Some(w) = rest.strip_prefix('#') {
+        return BraceContent::Op(name, VarOp::RemovePrefix { pattern: w.to_string(), longest: false });
+    }
+    if let Some(w) = rest.strip_prefix("%%") {
+        return BraceContent::Op(name, VarOp::RemoveSuffix { pattern: w.to_string(), longest: true });
+    }
+    if let Some(w) = rest.strip_prefix('%') {
+        return BraceContent::Op(name, VarOp::RemoveSuffix { pattern: w.to_string(), longest: false });
+    }
+    op!("-", Default, false);
+    op!("=", AssignDefault, false);
+    op!("?", ErrorIfUnset, false);
+    op!("+", AltIfSet, false);
+
+    // Unrecognized operator syntax: fall back to treating the whole thing
+    // as a literal (best-effort; will just look up a likely-nonexistent
+    // variable name rather than crashing).
+    BraceContent::Plain(inner.to_string())
 }

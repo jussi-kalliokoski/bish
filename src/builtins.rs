@@ -42,17 +42,17 @@ pub fn continue_loop(args: &[String]) -> crate::exec::ExecResult {
     crate::exec::ExecResult::Continue(n)
 }
 
-// `==` is literal-equality only until M6's glob matcher lands (bash's `[[`
-// does pattern matching on `==`).
-pub fn test(args: &[String]) -> i32 {
-    if eval_test_expr(args) {
+// `use_glob` is true for `[[` (bash pattern-matches `==`/`!=`) and false for
+// `[`/`test` (POSIX literal-equality).
+pub fn test(args: &[String], use_glob: bool) -> i32 {
+    if eval_test_expr(args, use_glob) {
         0
     } else {
         1
     }
 }
 
-fn eval_test_expr(args: &[String]) -> bool {
+fn eval_test_expr(args: &[String], use_glob: bool) -> bool {
     // Split on top-level -a/-o (no parens support). Not strictly
     // POSIX-precedence-correct, but covers real-world usage.
     let mut clauses: Vec<Vec<String>> = vec![Vec::new()];
@@ -65,9 +65,9 @@ fn eval_test_expr(args: &[String]) -> bool {
             clauses.last_mut().unwrap().push(a.clone());
         }
     }
-    let mut result = eval_simple(&clauses[0]);
+    let mut result = eval_simple(&clauses[0], use_glob);
     for (i, comb) in combinators.iter().enumerate() {
-        let next = eval_simple(&clauses[i + 1]);
+        let next = eval_simple(&clauses[i + 1], use_glob);
         result = match *comb {
             "-a" => result && next,
             "-o" => result || next,
@@ -77,15 +77,15 @@ fn eval_test_expr(args: &[String]) -> bool {
     result
 }
 
-fn eval_simple(args: &[String]) -> bool {
+fn eval_simple(args: &[String], use_glob: bool) -> bool {
     if args.first().map(|s| s.as_str()) == Some("!") {
-        return !eval_simple(&args[1..]);
+        return !eval_simple(&args[1..], use_glob);
     }
     match args {
         [] => false,
         [s] => !s.is_empty(),
         [op, a] => unary(op, a),
-        [a, op, b] => binary(a, op, b),
+        [a, op, b] => binary(a, op, b, use_glob),
         _ => !args.is_empty(),
     }
 }
@@ -115,8 +115,10 @@ fn is_executable(a: &str) -> bool {
     std::fs::metadata(a).is_ok()
 }
 
-fn binary(a: &str, op: &str, b: &str) -> bool {
+fn binary(a: &str, op: &str, b: &str, use_glob: bool) -> bool {
     match op {
+        "=" | "==" if use_glob => crate::glob::matches(b, a),
+        "!=" if use_glob => !crate::glob::matches(b, a),
         "=" | "==" => a == b,
         "!=" => a != b,
         "-eq" => num(a) == num(b),

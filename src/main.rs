@@ -1,6 +1,7 @@
 mod arith;
 mod builtins;
 mod exec;
+mod glob;
 mod lexer;
 mod parser;
 mod repl;
