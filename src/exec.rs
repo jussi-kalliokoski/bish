@@ -61,6 +61,13 @@ pub struct Shell {
     // all funnel through, so marking a name here blocks writes everywhere
     // at once.
     readonly_names: std::collections::HashSet<String>,
+    // `>(cmd)` substitutions queued by the command currently being built,
+    // to run (reading the temp file back) once it finishes; see
+    // run_proc_sub_out/drain_proc_subs.
+    proc_sub_out_pending: Vec<(String, String)>,
+    // Every proc-sub temp file created for the command currently being
+    // built, deleted once it finishes (drain_proc_subs).
+    proc_sub_cleanup: Vec<String>,
     // `trap CMD EXIT` handler. Only EXIT is implemented -- real signal traps
     // (INT/TERM/...) would need OS signal-handling machinery this
     // dependency-free, single-process design doesn't have; `trap` warns
@@ -97,6 +104,8 @@ impl Shell {
             assoc_arrays: HashMap::new(),
             assoc_names: std::collections::HashSet::new(),
             readonly_names: std::collections::HashSet::new(),
+            proc_sub_out_pending: Vec::new(),
+            proc_sub_cleanup: Vec::new(),
             exit_trap: None,
             opt_errexit: false,
             opt_nounset: false,
@@ -538,7 +547,16 @@ impl Shell {
                 _ => continue,
             }
         }
-        Box::new(std::io::BufReader::new(std::io::stdin()))
+        // NOT `BufReader::new(stdin())` -- that wraps stdin in a fresh,
+        // throwaway read-ahead buffer on every `read` call. A single
+        // read_line() can pull far more than one line into that buffer in
+        // one syscall; whatever it read past the first line is then lost
+        // when the wrapper is dropped at the end of this call, so a `while
+        // read` loop would silently only ever see its first line. Stdin's
+        // own lock reuses the shared, persistent buffer behind
+        // std::io::stdin() instead, so nothing already-read is discarded
+        // between calls.
+        Box::new(std::io::stdin().lock())
     }
 
     // Shared by `eval` and `source`/`.` -- both run source text in the
@@ -726,6 +744,73 @@ impl Shell {
         }
     }
 
+    // `<(cmd)`: runs cmd to completion now, capturing its stdout into a
+    // temp file, and substitutes that file's path. Real bash streams this
+    // concurrently through a FIFO; see the ProcSubIn/ProcSubOut doc comment
+    // in lexer.rs for why this shell uses a temp file instead. The path is
+    // queued for cleanup (self.proc_sub_cleanup) once the enclosing command
+    // has finished reading it.
+    fn run_proc_sub_in(&mut self, raw: &str) -> String {
+        let path = proc_sub_temp_path();
+        let exe = match std::env::current_exe() {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("ash: process substitution: {}", e);
+                return String::new();
+            }
+        };
+        let file = match std::fs::File::create(&path) {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!("ash: process substitution: {}", e);
+                return String::new();
+            }
+        };
+        let script = self.functions_preamble() + raw;
+        match Command::new(exe).arg("-c").arg(script).stdout(Stdio::from(file)).status() {
+            Ok(_) => {}
+            Err(e) => eprintln!("ash: process substitution: {}", e),
+        }
+        let path_str = path.to_string_lossy().into_owned();
+        self.proc_sub_cleanup.push(path_str.clone());
+        path_str
+    }
+
+    // `>(cmd)`: substitutes a temp file path immediately (so the enclosing
+    // command can write to it like any other file), and queues cmd to run
+    // reading that file back once the enclosing command finishes -- correct
+    // data flow, but sequential rather than concurrent (see lexer.rs).
+    fn run_proc_sub_out(&mut self, raw: &str) -> String {
+        let path = proc_sub_temp_path();
+        if let Err(e) = std::fs::File::create(&path) {
+            eprintln!("ash: process substitution: {}", e);
+            return String::new();
+        }
+        let path_str = path.to_string_lossy().into_owned();
+        self.proc_sub_out_pending.push((path_str.clone(), raw.to_string()));
+        path_str
+    }
+
+    // Runs any `>(cmd)` substitutions queued by the command that just
+    // finished, then deletes every proc-sub temp file used this round.
+    fn drain_proc_subs(&mut self) {
+        if !self.proc_sub_out_pending.is_empty() {
+            let pending = std::mem::take(&mut self.proc_sub_out_pending);
+            for (path, raw) in pending {
+                if let Ok(exe) = std::env::current_exe() {
+                    let script = self.functions_preamble() + &raw;
+                    if let Ok(file) = std::fs::File::open(&path) {
+                        let _ = Command::new(exe).arg("-c").arg(script).stdin(Stdio::from(file)).status();
+                    }
+                }
+                self.proc_sub_cleanup.push(path);
+            }
+        }
+        for path in self.proc_sub_cleanup.drain(..) {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
     fn call_function(&mut self, body: &parser::Command, call_args: Vec<String>) -> ExecResult {
         self.arg_frames.push(call_args);
         self.var_scopes.push(HashMap::new());
@@ -758,6 +843,14 @@ impl Shell {
 
     fn run_while(&mut self, cond: &Program, body: &Program, until: bool) -> ExecResult {
         let mut ran_body = false;
+        // Tracked separately from self.last_status: evaluating `cond` runs
+        // a real command through run_program, which unconditionally
+        // overwrites self.last_status as a side effect (needed so `$?`
+        // reads right *during* that command) -- including on the final,
+        // loop-ending check. Without this, a loop's reported exit status
+        // would reflect that failing condition check instead of the body's
+        // last status, which is what bash actually reports.
+        let mut last_body_status = 0;
         loop {
             self.suppress_errexit += 1;
             let cond_result = self.run_program(cond);
@@ -783,12 +876,16 @@ impl Shell {
                     }
                     continue;
                 }
-                ExecResult::Status(s) => self.last_status = s,
+                ExecResult::Status(s) => {
+                    self.last_status = s;
+                    last_body_status = s;
+                }
                 ret @ ExecResult::Return(_) => return ret,
             }
         }
         if ran_body {
-            ExecResult::Status(self.last_status)
+            self.last_status = last_body_status;
+            ExecResult::Status(last_body_status)
         } else {
             ExecResult::Status(0)
         }
@@ -1156,7 +1253,10 @@ impl Shell {
                     Ok(0) => return ExecResult::Status(1),
                     Ok(_) => {
                         let line = line.trim_end_matches(['\n', '\r']);
-                        let names = &argv[1..];
+                        let mut names = &argv[1..];
+                        while names.first().map(|s| s.as_str()) == Some("-r") {
+                            names = &names[1..];
+                        }
                         if names.is_empty() {
                             self.assign_var("REPLY", line.to_string());
                         } else {
@@ -1303,18 +1403,21 @@ impl Shell {
                     });
                     ExecResult::Status(0)
                 } else {
-                    match child.wait() {
+                    let result = match child.wait() {
                         Ok(status) => ExecResult::Status(status.code().unwrap_or(1)),
                         Err(e) => {
                             eprintln!("ash: {}", e);
                             ExecResult::Status(1)
                         }
-                    }
+                    };
+                    self.drain_proc_subs();
+                    result
                 }
             }
             Err(e) => {
                 let msg = format!("ash: {}: {}", name, e);
                 self.write_command_error(cmd, &msg);
+                self.drain_proc_subs();
                 ExecResult::Status(127)
             }
         }
@@ -1489,6 +1592,14 @@ impl Shell {
                 Chunk::ArrayKeys { name, .. } => {
                     let name = name.clone();
                     s.push_str(&self.array_keys(&name).join(" "));
+                }
+                Chunk::ProcSubIn { raw } => {
+                    let raw = raw.clone();
+                    s.push_str(&self.run_proc_sub_in(&raw));
+                }
+                Chunk::ProcSubOut { raw } => {
+                    let raw = raw.clone();
+                    s.push_str(&self.run_proc_sub_out(&raw));
                 }
             }
         }
@@ -1717,6 +1828,16 @@ impl Shell {
                         let joined = self.array_keys(name).join(" ");
                         append_splittable(&mut fields, &mut current, &joined, *quoted);
                     }
+                }
+                Chunk::ProcSubIn { raw } => {
+                    let raw = raw.clone();
+                    let v = self.run_proc_sub_in(&raw);
+                    append_splittable(&mut fields, &mut current, &v, true);
+                }
+                Chunk::ProcSubOut { raw } => {
+                    let raw = raw.clone();
+                    let v = self.run_proc_sub_out(&raw);
+                    append_splittable(&mut fields, &mut current, &v, true);
                 }
             }
         }
@@ -2077,6 +2198,13 @@ struct ResolvedRedirs {
 // Here-strings need a real Stdio for the child process; simplest portable
 // way to hand it literal content is a temp file, unlinked immediately after
 // opening (the open fd keeps the data alive on unix even once unlinked).
+fn proc_sub_temp_path() -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!("ash-procsub-{}-{}", std::process::id(), n))
+}
+
 fn here_string_file(content: &str) -> Result<std::fs::File, String> {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);

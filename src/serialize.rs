@@ -181,6 +181,8 @@ fn serialize_chunk(c: &Chunk) -> String {
         }
         Chunk::Indirect { name, quoted } => wrap_quoted(format!("${{!{}}}", name), *quoted),
         Chunk::ArrayKeys { name, quoted } => wrap_quoted(format!("${{!{}[@]}}", name), *quoted),
+        Chunk::ProcSubIn { raw } => format!("<({})", raw),
+        Chunk::ProcSubOut { raw } => format!(">({})", raw),
     }
 }
 

@@ -33,6 +33,16 @@ pub enum Chunk {
     // (indexed arrays: their set indices as decimal strings; associative:
     // their string keys), one field per key like ${name[@]}.
     ArrayKeys { name: String, quoted: bool },
+    // <(cmd) / >(cmd) process substitution. Real bash backs these with a
+    // FIFO/`/dev/fd/N` so the substituted command streams concurrently;
+    // that needs fd-passing into a spawned child, which isn't available
+    // from safe std without unsafe pre_exec plumbing. Approximated instead
+    // with a temp file: ProcSubIn runs `cmd` to completion and substitutes
+    // the file it wrote; ProcSubOut substitutes the file path immediately
+    // and runs `cmd` reading it back after the enclosing command finishes.
+    // Correct data flow, but not concurrent -- documented gap.
+    ProcSubIn { raw: String },
+    ProcSubOut { raw: String },
 }
 
 // The operand ("word"/"pattern") of each variant is kept as raw source text
@@ -244,6 +254,12 @@ impl<'a> Lexer<'a> {
                 }
                 Some('>') => {
                     self.chars.next();
+                    if self.chars.peek().copied() == Some('(') {
+                        self.chars.next();
+                        let raw = self.capture_balanced_parens()?;
+                        toks.push(Tok::Word(vec![Chunk::ProcSubOut { raw }], false));
+                        continue;
+                    }
                     let append = self.chars.peek().copied() == Some('>');
                     if append {
                         self.chars.next();
@@ -252,6 +268,12 @@ impl<'a> Lexer<'a> {
                 }
                 Some('<') => {
                     self.chars.next();
+                    if self.chars.peek().copied() == Some('(') {
+                        self.chars.next();
+                        let raw = self.capture_balanced_parens()?;
+                        toks.push(Tok::Word(vec![Chunk::ProcSubIn { raw }], false));
+                        continue;
+                    }
                     if self.chars.peek().copied() == Some('<') {
                         self.chars.next();
                         if self.chars.peek().copied() == Some('<') {
