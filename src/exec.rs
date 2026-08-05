@@ -1481,28 +1481,124 @@ impl Shell {
                 std::process::exit(code);
             }
             "read" => {
+                let mut array_name: Option<&str> = None;
+                let mut names: Vec<&str> = Vec::new();
+                let mut prompt: Option<&str> = None;
+                let mut nchars: Option<usize> = None;
+                let mut delim: u8 = b'\n';
+                // -s (silent/no-echo) needs raw termios manipulation to
+                // suppress terminal echo, which isn't implementable without
+                // hand-rolling the platform's struct termios layout (risky
+                // to get right without the libc crate, and this project's
+                // bash-diff test methodology has no real tty to exercise it
+                // against anyway) -- accepted and parsed, but not yet
+                // functional, same scoped-gap treatment as mapfile's -s/-u.
+                let mut i = 1;
+                while i < argv.len() {
+                    match argv[i].as_str() {
+                        "-r" | "-s" => i += 1,
+                        "-a" => {
+                            array_name = argv.get(i + 1).map(|s| s.as_str());
+                            i += 2;
+                        }
+                        "-p" => {
+                            prompt = argv.get(i + 1).map(|s| s.as_str());
+                            i += 2;
+                        }
+                        "-n" | "-N" => {
+                            nchars = argv.get(i + 1).and_then(|s| s.parse::<usize>().ok());
+                            i += 2;
+                        }
+                        "-d" => {
+                            delim = argv.get(i + 1).and_then(|s| s.bytes().next()).unwrap_or(b'\n');
+                            i += 2;
+                        }
+                        "-t" => {
+                            // Parsed and consumed for arg-shape compatibility;
+                            // actual timeout enforcement happens below, but
+                            // only against real stdin (see is_real_stdin).
+                            i += 2;
+                        }
+                        other => {
+                            names.push(other);
+                            i += 1;
+                        }
+                    }
+                }
+                let timeout_secs = argv.iter().position(|a| a == "-t").and_then(|p| argv.get(p + 1)).and_then(|s| s.parse::<f64>().ok());
+                let is_real_stdin = !cmd
+                    .redirects
+                    .iter()
+                    .any(|r| matches!(r, Redirect::In(_) | Redirect::HereString(_) | Redirect::HereDoc(_)));
+                if let Some(p) = prompt {
+                    if is_real_stdin && stdin_is_tty() {
+                        eprint!("{}", p);
+                        let _ = std::io::Write::flush(&mut std::io::stderr());
+                    }
+                }
+                if let Some(secs) = timeout_secs {
+                    if is_real_stdin {
+                        let ms = (secs * 1000.0).max(0.0) as i32;
+                        if !stdin_ready(ms) {
+                            return ExecResult::Status(1);
+                        }
+                    }
+                    // A non-stdin source (file/heredoc/here-string redirect)
+                    // has no pollable fd for a meaningful timeout check, so
+                    // -t against those is treated as immediately ready.
+                }
+
                 let mut reader = self.read_input_source(cmd);
-                let mut line = String::new();
-                match std::io::BufRead::read_line(&mut *reader, &mut line) {
-                    Ok(0) => return ExecResult::Status(1),
-                    Ok(_) => {
-                        let line = line.trim_end_matches(['\n', '\r']);
-                        let mut array_name: Option<&str> = None;
-                        let mut names: Vec<&str> = Vec::new();
-                        let mut i = 1;
-                        while i < argv.len() {
-                            match argv[i].as_str() {
-                                "-r" => i += 1,
-                                "-a" => {
-                                    array_name = argv.get(i + 1).map(|s| s.as_str());
-                                    i += 2;
-                                }
-                                other => {
-                                    names.push(other);
-                                    i += 1;
-                                }
+                // Real bash: a line/char-count read that runs into EOF
+                // before seeing its delimiter (or before nchars is reached)
+                // still populates the variable(s) with whatever partial
+                // data it got, but returns non-zero -- `clean` tracks which
+                // case this was, `got` carries the (possibly empty,
+                // possibly partial) data regardless.
+                let (got, clean): (Option<String>, bool) = if let Some(n) = nchars {
+                    let mut buf = Vec::with_capacity(n);
+                    let mut hit_eof = false;
+                    for _ in 0..n {
+                        let mut b = [0u8; 1];
+                        match std::io::Read::read(&mut *reader, &mut b) {
+                            Ok(0) => {
+                                hit_eof = true;
+                                break;
+                            }
+                            Ok(_) => buf.push(b[0]),
+                            Err(_) => {
+                                hit_eof = true;
+                                break;
                             }
                         }
+                    }
+                    if buf.is_empty() && hit_eof {
+                        (None, false)
+                    } else {
+                        (Some(String::from_utf8_lossy(&buf).into_owned()), !hit_eof)
+                    }
+                } else {
+                    let mut buf: Vec<u8> = Vec::new();
+                    match std::io::BufRead::read_until(&mut *reader, delim, &mut buf) {
+                        Ok(0) => (None, false),
+                        Ok(_) => {
+                            let hit_delim = buf.last() == Some(&delim);
+                            if hit_delim {
+                                buf.pop();
+                                if delim == b'\n' && buf.last() == Some(&b'\r') {
+                                    buf.pop();
+                                }
+                            }
+                            (Some(String::from_utf8_lossy(&buf).into_owned()), hit_delim)
+                        }
+                        Err(_) => (None, false),
+                    }
+                };
+
+                return match got {
+                    None => ExecResult::Status(1),
+                    Some(line) => {
+                        let line = line.as_str();
                         let ifs = self.get_ifs();
                         if let Some(arr) = array_name {
                             let (parts, ..) = ifs_tokenize(line, &ifs);
@@ -1531,10 +1627,9 @@ impl Shell {
                                 }
                             }
                         }
-                        return ExecResult::Status(0);
+                        ExecResult::Status(if clean { 0 } else { 1 })
                     }
-                    Err(_) => return ExecResult::Status(1),
-                }
+                };
             }
             // mapfile/readarray [-t] [name]. Reads lines from stdin (or
             // this command's own `<` redirect, via the same
@@ -2778,6 +2873,37 @@ fn get_hostname() -> String {
         return s.trim_end().to_string();
     }
     std::env::var("HOSTNAME").unwrap_or_default()
+}
+
+// `read -p`'s prompt only displays when input is coming from a terminal
+// (bash-documented behavior), and `read -t`'s timeout is only meaningfully
+// pollable against a real fd (stdin), not a shell-internal here-doc/file
+// Cursor -- both need to know if fd 0 is an actual tty/pollable descriptor.
+#[repr(C)]
+struct PollFd {
+    fd: i32,
+    events: i16,
+    revents: i16,
+}
+
+fn stdin_is_tty() -> bool {
+    unsafe extern "C" {
+        fn isatty(fd: i32) -> i32;
+    }
+    unsafe { isatty(0) != 0 }
+}
+
+// Polls fd 0 for readability, waiting up to `timeout_ms` (0 = check without
+// waiting). Used by `read -t` to implement its timeout without needing a
+// second thread or signal handling.
+fn stdin_ready(timeout_ms: i32) -> bool {
+    const POLLIN: i16 = 0x0001;
+    unsafe extern "C" {
+        fn poll(fds: *mut PollFd, nfds: u64, timeout: i32) -> i32;
+    }
+    let mut pfd = PollFd { fd: 0, events: POLLIN, revents: 0 };
+    let r = unsafe { poll(&mut pfd as *mut PollFd, 1, timeout_ms) };
+    r > 0 && (pfd.revents & POLLIN) != 0
 }
 
 fn dup2_stderr_to_stdout(command: &mut Command) {
