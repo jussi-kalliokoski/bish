@@ -5,7 +5,7 @@
 // function table. Doesn't need to be a general pretty-printer: just needs
 // to round-trip whatever a function body can contain.
 
-use crate::lexer::{Chunk, VarOp};
+use crate::lexer::{Chunk, ReplaceAnchor, VarOp};
 use crate::parser::{AndOr, AssignMode, Combinator, Command, ListItem, Pipeline, Redirect, Sep, SimpleCommand, Word};
 
 pub fn serialize_program(prog: &[ListItem]) -> String {
@@ -225,6 +225,19 @@ fn serialize_var_op(name: &str, op: &VarOp) -> String {
                 (false, false) => ",",
             };
             format!("${{{}{}{}}}", name, op, pattern)
+        }
+        VarOp::Substring { offset, length } => match length {
+            Some(l) => format!("${{{}:{}:{}}}", name, offset, l),
+            None => format!("${{{}:{}}}", name, offset),
+        },
+        VarOp::Replace { pattern, repl, global, anchor } => {
+            let slashes = if *global { "//" } else { "/" };
+            let anchor_ch = match anchor {
+                ReplaceAnchor::None => "",
+                ReplaceAnchor::Start => "#",
+                ReplaceAnchor::End => "%",
+            };
+            format!("${{{}{}{}{}/{}}}", name, slashes, anchor_ch, pattern, repl)
         }
     }
 }

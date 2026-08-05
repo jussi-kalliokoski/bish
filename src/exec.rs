@@ -5,7 +5,7 @@ use std::process::{Command, Stdio};
 use crate::arith;
 use crate::builtins;
 use crate::glob;
-use crate::lexer::{Chunk, VarOp};
+use crate::lexer::{Chunk, ReplaceAnchor, VarOp};
 use crate::parser::{
     self, AndOr, AssignMode, Combinator, ListItem, Pipeline, Program, Redirect, Sep, SimpleCommand, Word,
 };
@@ -1244,6 +1244,14 @@ impl Shell {
         // Builtins ignore per-command redirects for now: their output goes
         // straight to the shell's own stdio.
         match name.as_str() {
+            // POSIX special builtin: does nothing, exits 0. Its arguments
+            // are still expanded (already done via argv above) for side
+            // effects like `: ${x:=default}`; this shell's builtins don't
+            // yet honor their own redirects (see the comment on the
+            // `Builtins ignore per-command redirects` note elsewhere in
+            // this file), so `: > file` won't truncate `file` here, same
+            // limitation as every other builtin.
+            ":" => return ExecResult::Status(0),
             "cd" => return ExecResult::Status(builtins::cd(&argv[1..])),
             "export" => return ExecResult::Status(builtins::export(&argv[1..])),
             "let" => {
@@ -1783,6 +1791,26 @@ impl Shell {
         }
     }
 
+    // Array-element analog of var_is_set: is this specific index actually
+    // present in the (sparse) array, not just reading back empty because
+    // it was never set.
+    fn array_element_is_set(&mut self, name: &str, index: &str) -> bool {
+        if index == "@" || index == "*" {
+            return !self.array_all(name).is_empty();
+        }
+        if self.assoc_names.contains(name) {
+            let key = self.expand_index_as_string(index);
+            return self.assoc_arrays.get(name).is_some_and(|m| m.contains_key(&key));
+        }
+        match arith::eval(index, self) {
+            Ok(i) => match self.resolve_array_index(name, i) {
+                Some(idx) => self.arrays.get(name).is_some_and(|m| m.contains_key(&idx)),
+                None => false,
+            },
+            Err(_) => false,
+        }
+    }
+
     fn array_keys(&self, name: &str) -> Vec<String> {
         if let Some(m) = self.assoc_arrays.get(name) {
             return m.keys().cloned().collect();
@@ -1992,15 +2020,17 @@ impl Shell {
         let cur = self.lookup_var(name);
         match op {
             VarOp::Length => cur.chars().count().to_string(),
-            VarOp::Default { word, .. } => {
-                if cur.is_empty() {
+            VarOp::Default { word, colon } => {
+                let trigger = if *colon { cur.is_empty() } else { !self.var_is_set(name) };
+                if trigger {
                     self.expand_raw(word)
                 } else {
                     cur
                 }
             }
-            VarOp::AssignDefault { word, .. } => {
-                if cur.is_empty() {
+            VarOp::AssignDefault { word, colon } => {
+                let trigger = if *colon { cur.is_empty() } else { !self.var_is_set(name) };
+                if trigger {
                     let v = self.expand_raw(word);
                     self.assign_var(name, v.clone());
                     v
@@ -2008,8 +2038,9 @@ impl Shell {
                     cur
                 }
             }
-            VarOp::ErrorIfUnset { word, .. } => {
-                if cur.is_empty() {
+            VarOp::ErrorIfUnset { word, colon } => {
+                let trigger = if *colon { cur.is_empty() } else { !self.var_is_set(name) };
+                if trigger {
                     let msg = self.expand_raw(word);
                     eprintln!("ash: {}: {}", name, msg);
                     String::new()
@@ -2017,8 +2048,9 @@ impl Shell {
                     cur
                 }
             }
-            VarOp::AltIfSet { word, .. } => {
-                if !cur.is_empty() {
+            VarOp::AltIfSet { word, colon } => {
+                let set_enough = if *colon { !cur.is_empty() } else { self.var_is_set(name) };
+                if set_enough {
                     self.expand_raw(word)
                 } else {
                     String::new()
@@ -2035,6 +2067,16 @@ impl Shell {
             VarOp::CaseConvert { pattern, upper, all } => {
                 let pattern = self.expand_raw(pattern);
                 apply_case_convert(&cur, &pattern, *upper, *all)
+            }
+            VarOp::Substring { offset, length } => {
+                let off = arith::eval(offset, self).unwrap_or(0);
+                let len = length.as_ref().and_then(|l| arith::eval(l, self).ok());
+                substring_expand(&cur, off, len)
+            }
+            VarOp::Replace { pattern, repl, global, anchor } => {
+                let pattern = self.expand_raw(pattern);
+                let repl = self.expand_raw(repl);
+                glob_replace(&cur, &pattern, &repl, *global, *anchor)
             }
         }
     }
@@ -2047,15 +2089,17 @@ impl Shell {
         let cur = self.array_element(name, index);
         match op {
             VarOp::Length => cur.chars().count().to_string(),
-            VarOp::Default { word, .. } => {
-                if cur.is_empty() {
+            VarOp::Default { word, colon } => {
+                let trigger = if *colon { cur.is_empty() } else { !self.array_element_is_set(name, index) };
+                if trigger {
                     self.expand_raw(word)
                 } else {
                     cur
                 }
             }
-            VarOp::AssignDefault { word, .. } => {
-                if cur.is_empty() {
+            VarOp::AssignDefault { word, colon } => {
+                let trigger = if *colon { cur.is_empty() } else { !self.array_element_is_set(name, index) };
+                if trigger {
                     let v = self.expand_raw(word);
                     if index != "@" && index != "*" {
                         self.array_set_index(name, index, v.clone());
@@ -2065,8 +2109,9 @@ impl Shell {
                     cur
                 }
             }
-            VarOp::ErrorIfUnset { word, .. } => {
-                if cur.is_empty() {
+            VarOp::ErrorIfUnset { word, colon } => {
+                let trigger = if *colon { cur.is_empty() } else { !self.array_element_is_set(name, index) };
+                if trigger {
                     let msg = self.expand_raw(word);
                     eprintln!("ash: {}[{}]: {}", name, index, msg);
                     String::new()
@@ -2074,8 +2119,9 @@ impl Shell {
                     cur
                 }
             }
-            VarOp::AltIfSet { word, .. } => {
-                if !cur.is_empty() {
+            VarOp::AltIfSet { word, colon } => {
+                let set_enough = if *colon { !cur.is_empty() } else { self.array_element_is_set(name, index) };
+                if set_enough {
                     self.expand_raw(word)
                 } else {
                     String::new()
@@ -2092,6 +2138,16 @@ impl Shell {
             VarOp::CaseConvert { pattern, upper, all } => {
                 let pattern = self.expand_raw(pattern);
                 apply_case_convert(&cur, &pattern, *upper, *all)
+            }
+            VarOp::Substring { offset, length } => {
+                let off = arith::eval(offset, self).unwrap_or(0);
+                let len = length.as_ref().and_then(|l| arith::eval(l, self).ok());
+                substring_expand(&cur, off, len)
+            }
+            VarOp::Replace { pattern, repl, global, anchor } => {
+                let pattern = self.expand_raw(pattern);
+                let repl = self.expand_raw(repl);
+                glob_replace(&cur, &pattern, &repl, *global, *anchor)
             }
         }
     }
@@ -2155,21 +2211,30 @@ impl Shell {
         if !self.opt_nounset {
             return;
         }
+        if self.var_is_set(name) {
+            return;
+        }
+        eprintln!("ash: {}: unbound variable", name);
+        self.run_exit_trap();
+        std::process::exit(1);
+    }
+
+    // Whether `name` is a variable that's actually been assigned, as
+    // opposed to merely evaluating to an empty string -- the distinction
+    // `${V-x}`/`${V+x}` (unset only) need vs. `${V:-x}`/`${V:+x}` (unset OR
+    // empty). Special/positional parameters always count as set.
+    fn var_is_set(&self, name: &str) -> bool {
         let is_special = matches!(name, "?" | "0" | "#" | "@" | "*")
             || (!name.is_empty() && name.chars().all(|c| c.is_ascii_digit()));
         if is_special {
-            return;
+            return true;
         }
         for scope in &self.var_scopes {
             if scope.contains_key(name) {
-                return;
+                return true;
             }
         }
-        if std::env::var(name).is_err() {
-            eprintln!("ash: {}: unbound variable", name);
-            self.run_exit_trap();
-            std::process::exit(1);
-        }
+        std::env::var(name).is_ok()
     }
 
     // Plain assignment targets the global (process-env) variable, unless it
@@ -2464,6 +2529,104 @@ fn apply_case_convert(cur: &str, pattern: &str, upper: bool, all: bool) -> Strin
         first = false;
     }
     result
+}
+
+// `${V:offset}` / `${V:offset:length}`. Character-indexed (not byte), same
+// as everywhere else length/indexing happens in this shell. Negative
+// offset counts back from the end; negative length is an end position
+// counted from the end too (bash: "an offset from the end of the string"),
+// not an error.
+fn substring_expand(s: &str, offset: i64, length: Option<i64>) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    let n = chars.len() as i64;
+    let start = if offset < 0 { (n + offset).max(0) } else { offset.min(n) };
+    let end = match length {
+        None => n,
+        Some(l) if l < 0 => (n + l).max(start),
+        Some(l) => (start + l).min(n),
+    };
+    if end <= start {
+        return String::new();
+    }
+    chars[start as usize..end as usize].iter().collect()
+}
+
+// Finds the leftmost-longest glob match of `pattern` in `chars` at or
+// after `start_from`, honoring `anchor` (Start/End restrict the search to
+// that specific boundary, matching how `#`/`%` pattern-stripping anchors
+// its own search). Returns the matched (start, end) character range.
+fn find_glob_match(chars: &[char], start_from: usize, pattern: &str, anchor: ReplaceAnchor) -> Option<(usize, usize)> {
+    let n = chars.len();
+    match anchor {
+        ReplaceAnchor::Start => {
+            if start_from > 0 {
+                return None;
+            }
+            (start_from..=n).rev().find_map(|end| {
+                let candidate: String = chars[start_from..end].iter().collect();
+                glob::matches(pattern, &candidate).then_some((start_from, end))
+            })
+        }
+        ReplaceAnchor::End => (start_from..=n).find_map(|s| {
+            let candidate: String = chars[s..n].iter().collect();
+            glob::matches(pattern, &candidate).then_some((s, n))
+        }),
+        ReplaceAnchor::None => {
+            for s in start_from..=n {
+                if let Some((s0, e0)) = (s..=n).rev().find_map(|end| {
+                    let candidate: String = chars[s..end].iter().collect();
+                    glob::matches(pattern, &candidate).then_some((s, end))
+                }) {
+                    return Some((s0, e0));
+                }
+            }
+            None
+        }
+    }
+}
+
+// `${V/pat/repl}` (first match), `${V//pat/repl}` (all matches),
+// `${V/#pat/repl}` / `${V/%pat/repl}` (anchored -- always a single check,
+// `global` doesn't apply to them since an anchored match can only occur
+// once).
+fn glob_replace(s: &str, pattern: &str, repl: &str, global: bool, anchor: ReplaceAnchor) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    if matches!(anchor, ReplaceAnchor::Start | ReplaceAnchor::End) {
+        return match find_glob_match(&chars, 0, pattern, anchor) {
+            Some((s0, e0)) => {
+                let mut out: String = chars[..s0].iter().collect();
+                out.push_str(repl);
+                out.extend(&chars[e0..]);
+                out
+            }
+            None => s.to_string(),
+        };
+    }
+    let mut out = String::new();
+    let mut pos = 0;
+    loop {
+        match find_glob_match(&chars, pos, pattern, ReplaceAnchor::None) {
+            Some((s0, e0)) => {
+                out.extend(&chars[pos..s0]);
+                out.push_str(repl);
+                // An empty match (a pattern like a bare "*" can't produce
+                // one here since matching is greedy-longest, but stay
+                // defensive) must still advance, or this loops forever.
+                pos = if e0 > s0 { e0 } else { e0 + 1 };
+                if !global || pos > chars.len() {
+                    if pos <= chars.len() {
+                        out.extend(&chars[pos..]);
+                    }
+                    break;
+                }
+            }
+            None => {
+                out.extend(&chars[pos..]);
+                break;
+            }
+        }
+    }
+    out
 }
 
 fn open_out(path: &str, append: bool) -> Result<std::fs::File, String> {

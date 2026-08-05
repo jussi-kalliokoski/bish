@@ -79,6 +79,27 @@ pub enum VarOp {
     // otherwise the pattern is matched against each candidate char with the
     // same glob matcher `case` patterns use.
     CaseConvert { pattern: String, upper: bool, all: bool },
+    // ${V:offset} / ${V:offset:length}. offset/length are raw arithmetic
+    // expression text, evaluated at expansion time so `${V:$i:$n}` works.
+    // A negative offset counts from the end; a negative length is an end
+    // position counted from the end too (bash: "an offset from the end of
+    // the string"), not an error -- both match real bash's substring
+    // semantics exactly (see substring_expand in exec.rs).
+    Substring { offset: String, length: Option<String> },
+    // ${V/pat/repl}, ${V//pat/repl}, ${V/#pat/repl}, ${V/%pat/repl} --
+    // `global` picks first-match vs all-matches, `anchor` restricts the
+    // match to the start/end of the string (mirrors RemovePrefix/
+    // RemoveSuffix's pattern-matching, but for substitution instead of
+    // deletion). pattern/repl are raw text, expanded at match/substitution
+    // time.
+    Replace { pattern: String, repl: String, global: bool, anchor: ReplaceAnchor },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ReplaceAnchor {
+    None,
+    Start,
+    End,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -946,6 +967,35 @@ fn parse_operator_suffix(rest: &str) -> Option<VarOp> {
     op!(":=", AssignDefault, true);
     op!(":?", ErrorIfUnset, true);
     op!(":+", AltIfSet, true);
+    // ${V:offset} / ${V:offset:length} -- only reached once the four ":x"
+    // operators above have failed to match, so `${V:-x}` (default) still
+    // takes precedence over reading `-x` as a substring offset; bash's own
+    // disambiguation rule is that a *negative* offset needs a space before
+    // it (`${V: -1}`) for exactly this reason.
+    if let Some(spec) = rest.strip_prefix(':') {
+        return Some(match spec.find(':') {
+            Some(idx) => {
+                VarOp::Substring { offset: spec[..idx].to_string(), length: Some(spec[idx + 1..].to_string()) }
+            }
+            None => VarOp::Substring { offset: spec.to_string(), length: None },
+        });
+    }
+    if let Some(spec) = rest.strip_prefix("//") {
+        let (pattern, repl) = split_replace_spec(spec);
+        return Some(VarOp::Replace { pattern, repl, global: true, anchor: ReplaceAnchor::None });
+    }
+    if let Some(spec) = rest.strip_prefix('/') {
+        if let Some(pat_rest) = spec.strip_prefix('#') {
+            let (pattern, repl) = split_replace_spec(pat_rest);
+            return Some(VarOp::Replace { pattern, repl, global: false, anchor: ReplaceAnchor::Start });
+        }
+        if let Some(pat_rest) = spec.strip_prefix('%') {
+            let (pattern, repl) = split_replace_spec(pat_rest);
+            return Some(VarOp::Replace { pattern, repl, global: false, anchor: ReplaceAnchor::End });
+        }
+        let (pattern, repl) = split_replace_spec(spec);
+        return Some(VarOp::Replace { pattern, repl, global: false, anchor: ReplaceAnchor::None });
+    }
     if let Some(w) = rest.strip_prefix("##") {
         return Some(VarOp::RemovePrefix { pattern: w.to_string(), longest: true });
     }
@@ -975,6 +1025,25 @@ fn parse_operator_suffix(rest: &str) -> Option<VarOp> {
         return Some(VarOp::CaseConvert { pattern: w.to_string(), upper: false, all: false });
     }
     None
+}
+
+// Splits "pattern/repl" on the first unescaped '/' (a backslash-escaped
+// `\/` in the pattern, e.g. matching a literal path separator, doesn't end
+// it). No trailing '/' at all (`${V/pat}`) means "replace with nothing"
+// (deletion), matching bash.
+fn split_replace_spec(spec: &str) -> (String, String) {
+    let chars: Vec<char> = spec.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        match chars[i] {
+            '\\' if i + 1 < chars.len() => i += 2,
+            '/' => {
+                return (chars[..i].iter().collect(), chars[i + 1..].iter().collect());
+            }
+            _ => i += 1,
+        }
+    }
+    (spec.to_string(), String::new())
 }
 
 // Parses the text captured between `${` and `}`. `${#VAR}` (length) is
