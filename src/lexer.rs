@@ -1170,18 +1170,31 @@ fn split_brace_group(s: &str) -> Option<(String, Vec<String>, String)> {
 }
 
 fn try_brace_range(inner: &str) -> Option<Vec<String>> {
-    let parts: Vec<&str> = inner.splitn(2, "..").collect();
-    if parts.len() != 2 {
+    // {start..end} or {start..end..step} -- step's sign doesn't affect
+    // direction (bash always steps toward `end` from `start`; the range's
+    // own ordering decides ascending vs descending), so only its magnitude
+    // is used.
+    let parts: Vec<&str> = inner.splitn(3, "..").collect();
+    if parts.len() < 2 {
         return None;
     }
+    let step: usize = match parts.get(2) {
+        Some(s) => match s.parse::<i64>() {
+            Ok(0) | Err(_) => return None,
+            Ok(s) => s.unsigned_abs() as usize,
+        },
+        None => 1,
+    };
     if let (Ok(a), Ok(b)) = (parts[0].parse::<i64>(), parts[1].parse::<i64>()) {
-        let items = if a <= b { (a..=b).collect::<Vec<_>>() } else { (b..=a).rev().collect::<Vec<_>>() };
+        let items: Vec<i64> =
+            if a <= b { (a..=b).step_by(step).collect() } else { (b..=a).rev().step_by(step).collect() };
         return Some(items.into_iter().map(|n| n.to_string()).collect());
     }
     let (ca, cb): (Vec<char>, Vec<char>) = (parts[0].chars().collect(), parts[1].chars().collect());
     if ca.len() == 1 && cb.len() == 1 {
         let (a, b) = (ca[0] as u32, cb[0] as u32);
-        let range: Vec<u32> = if a <= b { (a..=b).collect() } else { (b..=a).rev().collect() };
+        let range: Vec<u32> =
+            if a <= b { (a..=b).step_by(step).collect() } else { (b..=a).rev().step_by(step).collect() };
         return Some(range.into_iter().filter_map(char::from_u32).map(String::from).collect());
     }
     None
