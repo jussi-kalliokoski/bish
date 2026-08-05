@@ -340,6 +340,20 @@ impl Parser {
                     let w = self.expect_word()?;
                     atoms.push(TestAtom::Word(w));
                 }
+                // `<`/`>` inside `[[ ]]` are bash's lexicographic string
+                // comparison operators, not redirects -- but the lexer
+                // still tokenizes them as Tok::RedirIn/RedirOut
+                // unconditionally (it has no notion of "inside `[[ ]]`"),
+                // so they're translated back into literal "<"/">" words
+                // here instead.
+                Some(Tok::RedirIn) => {
+                    self.advance();
+                    atoms.push(TestAtom::Word(Word { chunks: vec![Chunk::Str("<".to_string())], globbable: false }));
+                }
+                Some(Tok::RedirOut { append: false }) => {
+                    self.advance();
+                    atoms.push(TestAtom::Word(Word { chunks: vec![Chunk::Str(">".to_string())], globbable: false }));
+                }
                 Some(Tok::Newline) => {
                     self.advance();
                 }

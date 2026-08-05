@@ -1,3 +1,6 @@
+#[cfg(unix)]
+use std::os::unix::fs::FileTypeExt;
+
 pub fn cd(args: &[String]) -> i32 {
     let old = std::env::current_dir().ok().map(|p| p.to_string_lossy().into_owned());
     let target = if let Some(dir) = args.first() {
@@ -124,8 +127,23 @@ pub(crate) fn unary(op: &str, a: &str) -> bool {
         "-x" => is_executable(a),
         "-z" => a.is_empty(),
         "-n" => !a.is_empty(),
+        "-s" => std::fs::metadata(a).map(|m| m.len() > 0).unwrap_or(false),
+        "-L" | "-h" => std::fs::symlink_metadata(a).map(|m| m.file_type().is_symlink()).unwrap_or(false),
+        "-p" => file_type_is(a, |ft| ft.is_fifo()),
+        "-S" => file_type_is(a, |ft| ft.is_socket()),
+        "-b" => file_type_is(a, |ft| ft.is_block_device()),
+        "-c" => file_type_is(a, |ft| ft.is_char_device()),
         _ => false,
     }
+}
+
+#[cfg(unix)]
+fn file_type_is(a: &str, pred: impl Fn(&std::fs::FileType) -> bool) -> bool {
+    std::fs::metadata(a).map(|m| pred(&m.file_type())).unwrap_or(false)
+}
+#[cfg(not(unix))]
+fn file_type_is(_a: &str, _pred: impl Fn(&std::fs::FileType) -> bool) -> bool {
+    false
 }
 
 #[cfg(unix)]
@@ -145,14 +163,43 @@ pub(crate) fn binary(a: &str, op: &str, b: &str, use_glob: bool) -> bool {
         "!=" if use_glob => !crate::glob::matches(b, a),
         "=" | "==" => a == b,
         "!=" => a != b,
+        "<" => a < b,
+        ">" => a > b,
         "-eq" => num(a) == num(b),
         "-ne" => num(a) != num(b),
         "-lt" => num(a) < num(b),
         "-le" => num(a) <= num(b),
         "-gt" => num(a) > num(b),
         "-ge" => num(a) >= num(b),
+        "-nt" => file_newer(a, b),
+        "-ot" => file_newer(b, a),
+        "-ef" => files_same(a, b),
         _ => false,
     }
+}
+
+fn file_newer(a: &str, b: &str) -> bool {
+    let ma = std::fs::metadata(a).and_then(|m| m.modified());
+    let mb = std::fs::metadata(b).and_then(|m| m.modified());
+    match (ma, mb) {
+        (Ok(ta), Ok(tb)) => ta > tb,
+        // bash: -nt is true if a exists and b doesn't.
+        (Ok(_), Err(_)) => true,
+        _ => false,
+    }
+}
+
+#[cfg(unix)]
+fn files_same(a: &str, b: &str) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (std::fs::metadata(a), std::fs::metadata(b)) {
+        (Ok(ma), Ok(mb)) => ma.dev() == mb.dev() && ma.ino() == mb.ino(),
+        _ => false,
+    }
+}
+#[cfg(not(unix))]
+fn files_same(a: &str, b: &str) -> bool {
+    std::fs::canonicalize(a).ok() == std::fs::canonicalize(b).ok()
 }
 
 fn num(s: &str) -> i64 {
