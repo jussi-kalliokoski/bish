@@ -32,14 +32,43 @@ fn tokenize(src: &str) -> Result<Vec<Tok>, String> {
         }
         if c.is_ascii_digit() {
             let start = i;
+            if c == '0' && i + 1 < chars.len() && (chars[i + 1] == 'x' || chars[i + 1] == 'X') {
+                i += 2;
+                let hstart = i;
+                while i < chars.len() && chars[i].is_ascii_hexdigit() {
+                    i += 1;
+                }
+                let n = i64::from_str_radix(&chars[hstart..i].iter().collect::<String>(), 16)
+                    .map_err(|_| "bad hex number in arithmetic expression".to_string())?;
+                toks.push(Tok::Num(n));
+                continue;
+            }
             while i < chars.len() && chars[i].is_ascii_digit() {
                 i += 1;
             }
-            let n: i64 = chars[start..i]
-                .iter()
-                .collect::<String>()
-                .parse()
-                .map_err(|_| "bad number in arithmetic expression".to_string())?;
+            // base#digits (e.g. 16#FF, 2#101) -- the base is what was just
+            // scanned as plain decimal digits.
+            if i < chars.len() && chars[i] == '#' {
+                let base: u32 = chars[start..i].iter().collect::<String>().parse().unwrap_or(10);
+                i += 1;
+                let dstart = i;
+                while i < chars.len() && chars[i].is_alphanumeric() {
+                    i += 1;
+                }
+                let digits: String = chars[dstart..i].iter().collect();
+                let n = i64::from_str_radix(&digits, base)
+                    .map_err(|_| format!("bad base-{} number in arithmetic expression", base))?;
+                toks.push(Tok::Num(n));
+                continue;
+            }
+            let digits: String = chars[start..i].iter().collect();
+            // Leading-zero octal (bash: 010 is 8, not 10); a bare "0" (or
+            // "00") still just parses as 0 either way.
+            let n: i64 = if digits.len() > 1 && digits.starts_with('0') {
+                i64::from_str_radix(&digits, 8).map_err(|_| "bad octal number in arithmetic expression".to_string())?
+            } else {
+                digits.parse().map_err(|_| "bad number in arithmetic expression".to_string())?
+            };
             toks.push(Tok::Num(n));
             continue;
         }
@@ -108,9 +137,18 @@ fn tokenize(src: &str) -> Result<Vec<Tok>, String> {
             i += 1;
             continue;
         }
+        let three: String = chars[i..(i + 3).min(chars.len())].iter().collect();
+        const THREE_CHAR_OPS: [&str; 2] = ["<<=", ">>="];
+        if THREE_CHAR_OPS.contains(&three.as_str()) {
+            toks.push(Tok::Op(three));
+            i += 3;
+            continue;
+        }
         let two: String = chars[i..(i + 2).min(chars.len())].iter().collect();
-        const TWO_CHAR_OPS: [&str; 10] =
-            ["==", "!=", "<=", ">=", "&&", "||", "<<", ">>", "++", "--"];
+        const TWO_CHAR_OPS: [&str; 19] = [
+            "==", "!=", "<=", ">=", "&&", "||", "<<", ">>", "++", "--", "**", "+=", "-=", "*=", "/=", "%=", "&=",
+            "|=", "^=",
+        ];
         if TWO_CHAR_OPS.contains(&two.as_str()) {
             toks.push(Tok::Op(two));
             i += 2;
@@ -156,11 +194,43 @@ impl<'a> Parser<'a> {
 
     fn parse_assign(&mut self) -> Result<i64, String> {
         if let Tok::Ident(name) = self.peek().clone() {
-            if self.toks.get(self.pos + 1) == Some(&Tok::Op("=".to_string())) {
-                self.pos += 2;
-                let val = self.parse_assign()?;
-                self.ctx.set(&name, val);
-                return Ok(val);
+            if let Some(Tok::Op(op)) = self.toks.get(self.pos + 1).cloned() {
+                if op == "=" {
+                    self.pos += 2;
+                    let val = self.parse_assign()?;
+                    self.ctx.set(&name, val);
+                    return Ok(val);
+                }
+                if matches!(op.as_str(), "+=" | "-=" | "*=" | "/=" | "%=" | "<<=" | ">>=" | "&=" | "|=" | "^=") {
+                    self.pos += 2;
+                    let rhs = self.parse_assign()?;
+                    let cur = self.ctx.get(&name);
+                    let new_val = match op.as_str() {
+                        "+=" => cur.wrapping_add(rhs),
+                        "-=" => cur.wrapping_sub(rhs),
+                        "*=" => cur.wrapping_mul(rhs),
+                        "/=" => {
+                            if rhs == 0 {
+                                return Err("division by zero".to_string());
+                            }
+                            cur / rhs
+                        }
+                        "%=" => {
+                            if rhs == 0 {
+                                return Err("division by zero".to_string());
+                            }
+                            cur % rhs
+                        }
+                        "<<=" => cur << rhs,
+                        ">>=" => cur >> rhs,
+                        "&=" => cur & rhs,
+                        "|=" => cur | rhs,
+                        "^=" => cur ^ rhs,
+                        _ => unreachable!(),
+                    };
+                    self.ctx.set(&name, new_val);
+                    return Ok(new_val);
+                }
             }
         }
         self.parse_ternary()
@@ -313,22 +383,22 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_mul(&mut self) -> Result<i64, String> {
-        let mut v = self.parse_unary()?;
+        let mut v = self.parse_pow()?;
         loop {
             if self.peek_op("*") {
                 self.advance();
-                let r = self.parse_unary()?;
+                let r = self.parse_pow()?;
                 v = v.wrapping_mul(r);
             } else if self.peek_op("/") {
                 self.advance();
-                let r = self.parse_unary()?;
+                let r = self.parse_pow()?;
                 if r == 0 {
                     return Err("division by zero".to_string());
                 }
                 v /= r;
             } else if self.peek_op("%") {
                 self.advance();
-                let r = self.parse_unary()?;
+                let r = self.parse_pow()?;
                 if r == 0 {
                     return Err("division by zero".to_string());
                 }
@@ -338,6 +408,22 @@ impl<'a> Parser<'a> {
             }
         }
         Ok(v)
+    }
+
+    // `**` binds tighter than `* / %` but looser than unary +/-/!/~, and is
+    // right-associative (2**3**2 is 2**(3**2) = 512, not (2**3)**2 = 64) --
+    // matching bash's precedence and associativity exactly.
+    fn parse_pow(&mut self) -> Result<i64, String> {
+        let base = self.parse_unary()?;
+        if self.peek_op("**") {
+            self.advance();
+            let exp = self.parse_pow()?;
+            if exp < 0 {
+                return Err("exponent less than 0".to_string());
+            }
+            return Ok(ipow(base, exp as u64));
+        }
+        Ok(base)
     }
 
     fn parse_unary(&mut self) -> Result<i64, String> {
@@ -409,6 +495,22 @@ impl<'a> Parser<'a> {
             other => Err(format!("unexpected token in arithmetic expression: {:?}", other)),
         }
     }
+}
+
+// Wrapping integer exponentiation (matches how +/-/* already wrap here
+// rather than panicking on overflow, since bash's arithmetic is
+// fixed-width and just wraps).
+fn ipow(base: i64, mut exp: u64) -> i64 {
+    let mut result: i64 = 1;
+    let mut b = base;
+    while exp > 0 {
+        if exp & 1 == 1 {
+            result = result.wrapping_mul(b);
+        }
+        b = b.wrapping_mul(b);
+        exp >>= 1;
+    }
+    result
 }
 
 pub fn eval(src: &str, ctx: &mut dyn VarContext) -> Result<i64, String> {
