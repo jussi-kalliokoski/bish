@@ -61,6 +61,10 @@ pub struct Shell {
     // all funnel through, so marking a name here blocks writes everywhere
     // at once.
     readonly_names: std::collections::HashSet<String>,
+    // `declare -i`/`local -i`: assignments to these names are evaluated as
+    // arithmetic expressions instead of stored as literal text (checked in
+    // assign_var, the single write path).
+    integer_names: std::collections::HashSet<String>,
     // `>(cmd)` substitutions queued by the command currently being built,
     // to run (reading the temp file back) once it finishes; see
     // run_proc_sub_out/drain_proc_subs.
@@ -118,6 +122,7 @@ impl Shell {
             assoc_arrays: HashMap::new(),
             assoc_names: std::collections::HashSet::new(),
             readonly_names: std::collections::HashSet::new(),
+            integer_names: std::collections::HashSet::new(),
             proc_sub_out_pending: Vec::new(),
             proc_sub_cleanup: Vec::new(),
             rng_state: {
@@ -286,14 +291,14 @@ impl Shell {
         0
     }
 
-    // declare/typeset [-A|-a] [NAME|NAME=value]... Only the `-A` (associative
-    // array) and `-a` (indexed array, mostly a no-op since that's already
-    // the default) flags are recognized; other flags (-i/-r/-x/...) are
-    // accepted but not tracked -- no attribute enforcement, matching how
-    // `local`'s scoping-only semantics already work here.
+    // declare/typeset [-A|-a|-i|-r] [NAME|NAME=value]... `-x` isn't tracked
+    // separately since every variable already lives in the process env
+    // here; other real bash flags (-u/-l/-n/-p/...) are accepted but not
+    // enforced.
     fn run_declare(&mut self, args: &[String]) -> i32 {
         let mut array_mode: Option<bool> = None; // Some(true)=-A, Some(false)=-a
         let mut readonly_flag = false;
+        let mut integer_flag = false;
         for a in args {
             match a.as_str() {
                 "-A" => {
@@ -308,6 +313,10 @@ impl Shell {
                     readonly_flag = true;
                     continue;
                 }
+                "-i" => {
+                    integer_flag = true;
+                    continue;
+                }
                 _ => {}
             }
             if a.starts_with('-') {
@@ -317,6 +326,9 @@ impl Shell {
                 Some(eq) => (a[..eq].to_string(), Some(a[eq + 1..].to_string())),
                 None => (a.clone(), None),
             };
+            if integer_flag {
+                self.integer_names.insert(name.clone());
+            }
             match array_mode {
                 Some(true) => {
                     self.assoc_names.insert(name.clone());
@@ -1337,6 +1349,7 @@ impl Shell {
                 // would, so it's visible after the function returns too,
                 // unlike a real local scalar. Documented gap, not a crash.
                 let mut array_mode: Option<bool> = None;
+                let mut integer_flag = false;
                 for a in &argv[1..] {
                     match a.as_str() {
                         "-a" => {
@@ -1347,6 +1360,10 @@ impl Shell {
                             array_mode = Some(true);
                             continue;
                         }
+                        "-i" => {
+                            integer_flag = true;
+                            continue;
+                        }
                         _ if a.starts_with('-') => continue,
                         _ => {}
                     }
@@ -1354,6 +1371,9 @@ impl Shell {
                         Some(eq) => (a[..eq].to_string(), Some(a[eq + 1..].to_string())),
                         None => (a.clone(), None),
                     };
+                    if integer_flag {
+                        self.integer_names.insert(n.clone());
+                    }
                     match array_mode {
                         Some(true) => {
                             self.assoc_names.insert(n.clone());
@@ -1363,7 +1383,9 @@ impl Shell {
                             self.arrays.entry(n).or_default();
                         }
                         None => {
-                            self.var_scopes.last_mut().unwrap().insert(n, v.unwrap_or_default());
+                            let v = v.unwrap_or_default();
+                            let v = if integer_flag { arith::eval(&v, self).unwrap_or(0).to_string() } else { v };
+                            self.var_scopes.last_mut().unwrap().insert(n, v);
                         }
                     }
                 }
@@ -2412,6 +2434,11 @@ impl Shell {
             }
             return;
         }
+        // `declare -i`/`local -i`: the assigned text is evaluated as an
+        // arithmetic expression rather than stored literally (bash: `n="2+3"`
+        // on an integer-attribute variable stores 5, not the string "2+3").
+        let value =
+            if self.integer_names.contains(name) { arith::eval(&value, self).unwrap_or(0).to_string() } else { value };
         for scope in self.var_scopes.iter_mut().rev() {
             if scope.contains_key(name) {
                 scope.insert(name.to_string(), value);
