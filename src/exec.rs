@@ -119,11 +119,12 @@ pub struct Shell {
     // rather than silently no-oping for those instead of pretending to
     // support them.
     exit_trap: Option<String>,
-    // `set -e`/`-u`/`-x`/`-o pipefail`.
+    // `set -e`/`-u`/`-x`/`-o pipefail`/`-f`.
     opt_errexit: bool,
     opt_nounset: bool,
     opt_xtrace: bool,
     opt_pipefail: bool,
+    opt_noglob: bool,
     // Suppresses errexit while >0 -- set around if/while/until conditions
     // and negated (`!`) pipelines, the cases POSIX explicitly exempts from
     // triggering -e (a failing condition is meant to be checked, not
@@ -172,6 +173,7 @@ impl Shell {
             opt_nounset: false,
             opt_xtrace: false,
             opt_pipefail: false,
+            opt_noglob: false,
             suppress_errexit: 0,
             current_stderr_target: None,
         }
@@ -475,6 +477,7 @@ impl Shell {
             'e' => self.opt_errexit = on,
             'u' => self.opt_nounset = on,
             'x' => self.opt_xtrace = on,
+            'f' => self.opt_noglob = on,
             _ => {}
         }
     }
@@ -485,6 +488,7 @@ impl Shell {
             "errexit" => self.opt_errexit = on,
             "nounset" => self.opt_nounset = on,
             "xtrace" => self.opt_xtrace = on,
+            "noglob" => self.opt_noglob = on,
             _ => {}
         }
     }
@@ -2573,9 +2577,11 @@ impl Shell {
                 // (see Word::globbable), so splitting can't apply here --
                 // glob-check the single literal value as before.
                 let s = self.expand_word(w);
-                if let Some(matches) = glob::expand(&s) {
-                    out.extend(matches);
-                    continue;
+                if !self.opt_noglob {
+                    if let Some(matches) = glob::expand(&s) {
+                        out.extend(matches);
+                        continue;
+                    }
                 }
                 out.push(s);
             } else {
@@ -2655,6 +2661,9 @@ impl Shell {
                 let mut s = String::new();
                 if self.opt_errexit {
                     s.push('e');
+                }
+                if self.opt_noglob {
+                    s.push('f');
                 }
                 if self.opt_nounset {
                     s.push('u');
