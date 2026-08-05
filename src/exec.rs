@@ -68,6 +68,21 @@ pub struct Shell {
     // flat (see the comment on `arrays` above).
     array_local_stack: Vec<Vec<(String, Option<std::collections::BTreeMap<usize, String>>)>>,
     assoc_local_stack: Vec<Vec<(String, Option<std::collections::BTreeMap<String, String>>)>>,
+    // `declare -n`/`local -n ref=target`: ref's own stored value is the
+    // *name* of the target variable, not user data -- lookup_var/assign_var/
+    // var_is_set all redirect through resolve_nameref for any name in this
+    // set before doing anything else, so reading/writing `ref` transparently
+    // reads/writes `target` instead. Scalars only; array-element namerefs
+    // (`declare -n ref=arr[0]`) aren't supported, a scoped gap.
+    nameref_names: std::collections::HashSet<String>,
+    // Scoping for `local -n` (mirrors array_local_stack): each frame
+    // records, for every name it nameref'd, whether that name was already
+    // a nameref beforehand -- so call_function can undo just the
+    // membership change on return without disturbing a same-named nameref
+    // the *caller* had declared. `declare -n` at top level (empty
+    // var_scopes) has no frame to push onto and just leaks globally,
+    // matching bash's own top-level `declare -n` behavior.
+    nameref_local_stack: Vec<Vec<(String, bool)>>,
     // `readonly NAME`. Checked by assign_var, the single write path plain
     // assignment/local/export/declare/arithmetic-assignment/read/getopts
     // all funnel through, so marking a name here blocks writes everywhere
@@ -135,6 +150,8 @@ impl Shell {
             assoc_names: std::collections::HashSet::new(),
             array_local_stack: Vec::new(),
             assoc_local_stack: Vec::new(),
+            nameref_names: std::collections::HashSet::new(),
+            nameref_local_stack: Vec::new(),
             readonly_names: std::collections::HashSet::new(),
             integer_names: std::collections::HashSet::new(),
             proc_sub_out_pending: Vec::new(),
@@ -313,6 +330,7 @@ impl Shell {
         let mut array_mode: Option<bool> = None; // Some(true)=-A, Some(false)=-a
         let mut readonly_flag = false;
         let mut integer_flag = false;
+        let mut nameref_flag = false;
         for a in args {
             match a.as_str() {
                 "-A" => {
@@ -331,6 +349,10 @@ impl Shell {
                     integer_flag = true;
                     continue;
                 }
+                "-n" => {
+                    nameref_flag = true;
+                    continue;
+                }
                 _ => {}
             }
             if a.starts_with('-') {
@@ -342,6 +364,16 @@ impl Shell {
             };
             if integer_flag {
                 self.integer_names.insert(name.clone());
+            }
+            if nameref_flag {
+                self.nameref_names.insert(name.clone());
+                if let Some(v) = val {
+                    self.raw_var_write(&name, v);
+                }
+                if readonly_flag {
+                    self.readonly_names.insert(name);
+                }
+                continue;
             }
             match array_mode {
                 Some(true) => {
@@ -871,8 +903,16 @@ impl Shell {
         self.var_scopes.push(HashMap::new());
         self.array_local_stack.push(Vec::new());
         self.assoc_local_stack.push(Vec::new());
+        self.nameref_local_stack.push(Vec::new());
         let result = self.run_command(body, false);
         self.var_scopes.pop();
+        if let Some(frame) = self.nameref_local_stack.pop() {
+            for (name, was_nameref) in frame.into_iter().rev() {
+                if !was_nameref {
+                    self.nameref_names.remove(&name);
+                }
+            }
+        }
         if let Some(frame) = self.array_local_stack.pop() {
             for (name, prev) in frame.into_iter().rev() {
                 match prev {
@@ -1473,6 +1513,7 @@ impl Shell {
                 // array read/write site to walk a scope chain.
                 let mut array_mode: Option<bool> = None;
                 let mut integer_flag = false;
+                let mut nameref_flag = false;
                 for a in &argv[1..] {
                     match a.as_str() {
                         "-a" => {
@@ -1487,6 +1528,10 @@ impl Shell {
                             integer_flag = true;
                             continue;
                         }
+                        "-n" => {
+                            nameref_flag = true;
+                            continue;
+                        }
                         _ if a.starts_with('-') => continue,
                         _ => {}
                     }
@@ -1494,6 +1539,13 @@ impl Shell {
                         Some(eq) => (a[..eq].to_string(), Some(a[eq + 1..].to_string())),
                         None => (a.clone(), None),
                     };
+                    if nameref_flag {
+                        let was_nameref = self.nameref_names.contains(&n);
+                        self.nameref_local_stack.last_mut().unwrap().push((n.clone(), was_nameref));
+                        self.nameref_names.insert(n.clone());
+                        self.var_scopes.last_mut().unwrap().insert(n.clone(), v.unwrap_or_default());
+                        continue;
+                    }
                     if integer_flag {
                         self.integer_names.insert(n.clone());
                     }
@@ -2533,7 +2585,58 @@ impl Shell {
         out
     }
 
+    // Reads a name's own raw stored value, bypassing nameref redirection --
+    // used to read a nameref's target-name string, and internally by
+    // resolve_nameref while following a chain.
+    fn raw_var_lookup(&self, name: &str) -> String {
+        for scope in self.var_scopes.iter().rev() {
+            if let Some(v) = scope.get(name) {
+                return v.clone();
+            }
+        }
+        std::env::var(name).unwrap_or_default()
+    }
+
+    // Writes a name's own raw value, bypassing nameref redirection -- used
+    // to set a nameref's target-name string itself (assign_var, by
+    // contrast, is what a nameref's *reads/writes* get redirected through).
+    fn raw_var_write(&mut self, name: &str, value: String) {
+        for scope in self.var_scopes.iter_mut().rev() {
+            if scope.contains_key(name) {
+                scope.insert(name.to_string(), value);
+                return;
+            }
+        }
+        unsafe {
+            std::env::set_var(name, value);
+        }
+    }
+
+    // Follows a `declare -n`/`local -n` chain to the final target name,
+    // capped to guard against a self-referential or circular nameref (bash
+    // detects and errors on these; ash just stops following rather than
+    // looping forever).
+    fn resolve_nameref(&self, name: &str) -> String {
+        let mut current = name.to_string();
+        let mut hops = 0;
+        while self.nameref_names.contains(&current) && hops < 16 {
+            let target = self.raw_var_lookup(&current);
+            if target.is_empty() || target == current {
+                break;
+            }
+            current = target;
+            hops += 1;
+        }
+        current
+    }
+
     fn lookup_var(&mut self, name: &str) -> String {
+        if self.nameref_names.contains(name) {
+            let target = self.resolve_nameref(name);
+            if target != name {
+                return self.lookup_var(&target);
+            }
+        }
         match name {
             "?" => self.last_status.to_string(),
             "0" => self.script_name.clone(),
@@ -2687,6 +2790,13 @@ impl Shell {
     // `${V-x}`/`${V+x}` (unset only) need vs. `${V:-x}`/`${V:+x}` (unset OR
     // empty). Special/positional parameters always count as set.
     fn var_is_set(&self, name: &str) -> bool {
+        let resolved;
+        let name = if self.nameref_names.contains(name) {
+            resolved = self.resolve_nameref(name);
+            resolved.as_str()
+        } else {
+            name
+        };
         // Special/positional parameters and the magic variables
         // lookup_var computes on demand (RANDOM, SECONDS, PPID, ...) are
         // always considered set, even under `set -u` -- matching bash,
@@ -2723,6 +2833,13 @@ impl Shell {
     // shadows an existing `local` of the same name in the current function
     // scope -- matching bash, where functions don't auto-localize vars.
     fn assign_var(&mut self, name: &str, value: String) {
+        let resolved;
+        let name = if self.nameref_names.contains(name) {
+            resolved = self.resolve_nameref(name);
+            resolved.as_str()
+        } else {
+            name
+        };
         if self.readonly_names.contains(name) {
             eprintln!("ash: {}: readonly variable", name);
             return;
@@ -2750,15 +2867,7 @@ impl Shell {
         // on an integer-attribute variable stores 5, not the string "2+3").
         let value =
             if self.integer_names.contains(name) { arith::eval(&value, self).unwrap_or(0).to_string() } else { value };
-        for scope in self.var_scopes.iter_mut().rev() {
-            if scope.contains_key(name) {
-                scope.insert(name.to_string(), value);
-                return;
-            }
-        }
-        unsafe {
-            std::env::set_var(name, value);
-        }
+        self.raw_var_write(name, value);
     }
 
     fn resolve_redirects(&mut self, cmd: &SimpleCommand) -> Result<ResolvedRedirs, String> {
