@@ -1,4 +1,10 @@
-// Shell-style filename glob matching: * ? [abc] [a-z] [!abc]/[^abc].
+// Shell-style filename glob matching: * ? [abc] [a-z] [!abc]/[^abc], plus
+// extglob patterns @(...) !(...) +(...) *(...) ?(...). Real bash gates
+// extglob behind `shopt -s extglob`; ash doesn't track shopt state yet, so
+// these are recognized unconditionally -- a strict superset of default
+// bash behavior that only diverges for scripts that use a literal pattern
+// like `!(foo)` as ordinary text without ever enabling extglob, which is
+// vanishingly rare in practice.
 // Shared by pathname expansion, `case` patterns, and `[[ ]]`'s `==`/`!=`.
 
 pub fn matches(pattern: &str, text: &str) -> bool {
@@ -8,6 +14,11 @@ pub fn matches(pattern: &str, text: &str) -> bool {
 fn match_here(pat: &[u8], text: &[u8]) -> bool {
     if pat.is_empty() {
         return text.is_empty();
+    }
+    if matches!(pat[0], b'@' | b'!' | b'+' | b'*' | b'?') && pat.len() > 1 && pat[1] == b'(' {
+        if let Some((alts, group, rest)) = find_group(&pat[1..]) {
+            return match_extglob(pat[0], &alts, group, rest, text);
+        }
     }
     match pat[0] {
         b'*' => {
@@ -25,6 +36,77 @@ fn match_here(pat: &[u8], text: &[u8]) -> bool {
             None => !text.is_empty() && text[0] == b'[' && match_here(&pat[1..], &text[1..]),
         },
         c => !text.is_empty() && text[0] == c && match_here(&pat[1..], &text[1..]),
+    }
+}
+
+// Splits a `(alt1|alt2|...)` group (pat[0] == '(') into its top-level
+// pipe-separated alternatives, honoring nested groups. Returns
+// (alternatives, the group text including its parens, the pattern text
+// after the closing paren), or None if unterminated (no matching ')').
+fn find_group(pat: &[u8]) -> Option<(Vec<&[u8]>, &[u8], &[u8])> {
+    if pat.is_empty() || pat[0] != b'(' {
+        return None;
+    }
+    let mut depth = 0i32;
+    let mut alt_start = 1;
+    let mut alts: Vec<&[u8]> = Vec::new();
+    for i in 0..pat.len() {
+        match pat[i] {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    alts.push(&pat[alt_start..i]);
+                    return Some((alts, &pat[0..=i], &pat[i + 1..]));
+                }
+            }
+            b'|' if depth == 1 => {
+                alts.push(&pat[alt_start..i]);
+                alt_start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn match_extglob(prefix: u8, alts: &[&[u8]], group: &[u8], rest: &[u8], text: &[u8]) -> bool {
+    match prefix {
+        b'@' => alts.iter().any(|alt| {
+            let mut combined = alt.to_vec();
+            combined.extend_from_slice(rest);
+            match_here(&combined, text)
+        }),
+        b'?' => {
+            match_here(rest, text)
+                || alts.iter().any(|alt| {
+                    let mut combined = alt.to_vec();
+                    combined.extend_from_slice(rest);
+                    match_here(&combined, text)
+                })
+        }
+        b'*' => {
+            match_here(rest, text)
+                || alts.iter().any(|alt| {
+                    let mut combined = alt.to_vec();
+                    combined.push(b'*');
+                    combined.extend_from_slice(group);
+                    combined.extend_from_slice(rest);
+                    match_here(&combined, text)
+                })
+        }
+        b'+' => alts.iter().any(|alt| {
+            let mut combined = alt.to_vec();
+            combined.push(b'*');
+            combined.extend_from_slice(group);
+            combined.extend_from_slice(rest);
+            match_here(&combined, text)
+        }),
+        b'!' => (0..=text.len()).any(|i| {
+            let excluded = alts.iter().any(|alt| match_here(alt, &text[..i]));
+            !excluded && match_here(rest, &text[i..])
+        }),
+        _ => unreachable!(),
     }
 }
 
@@ -73,6 +155,7 @@ fn match_class(pat: &[u8], c: Option<u8>) -> Option<(bool, &[u8])> {
 
 pub fn has_meta(s: &str) -> bool {
     s.chars().any(|c| c == '*' || c == '?' || c == '[')
+        || ["@(", "!(", "+("].iter().any(|p| s.contains(p))
 }
 
 // Expands a glob pattern against the filesystem. Only the final path
