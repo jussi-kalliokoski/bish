@@ -1313,6 +1313,64 @@ impl Shell {
             // this file), so `: > file` won't truncate `file` here, same
             // limitation as every other builtin.
             ":" => return ExecResult::Status(0),
+            // command [-v|-V] name [args...]. -v/-V (by far the dominant
+            // real-world use, e.g. `command -v git >/dev/null`) report
+            // what `name` resolves to without running it. Bare `command
+            // name args...` runs it, bypassing shell functions -- the
+            // other thing `command` is for -- by spawning directly as an
+            // external process; unlike real bash this also bypasses
+            // builtins of the same name, a simplification accepted since
+            // this shell doesn't have many commonly-shadowed builtins.
+            "command" => {
+                let mut i = 1;
+                let mut mode_v = false;
+                let mut mode_vv = false;
+                while i < argv.len() {
+                    match argv[i].as_str() {
+                        "-v" => {
+                            mode_v = true;
+                            i += 1;
+                        }
+                        "-V" => {
+                            mode_vv = true;
+                            i += 1;
+                        }
+                        "-p" => i += 1,
+                        _ => break,
+                    }
+                }
+                if mode_v || mode_vv {
+                    return ExecResult::Status(match argv.get(i) {
+                        Some(n) => self.command_v(n, mode_vv),
+                        None => 1,
+                    });
+                }
+                if i >= argv.len() {
+                    return ExecResult::Status(0);
+                }
+                let mut ext = Command::new(&argv[i]);
+                ext.args(&argv[i + 1..]);
+                return match ext.status() {
+                    Ok(status) => ExecResult::Status(status.code().unwrap_or(1)),
+                    Err(e) => {
+                        eprintln!("ash: command: {}: {}", argv[i], e);
+                        ExecResult::Status(127)
+                    }
+                };
+            }
+            "type" => return ExecResult::Status(self.run_type(&argv[1..])),
+            // No command-path cache exists to manage -- every exec
+            // re-resolves PATH via Command::status() itself -- so this is
+            // a documented no-op rather than a real cache: `hash -r`
+            // (clear) and bare `hash cmd` (remember) both just succeed.
+            // Bare `hash` with no args normally lists the cache; ours is
+            // always empty, so that's the one output bash-compat requires.
+            "hash" => {
+                if argv.len() == 1 {
+                    println!("hash: hash table empty");
+                }
+                return ExecResult::Status(0);
+            }
             "cd" => return ExecResult::Status(builtins::cd(&argv[1..])),
             "export" => return ExecResult::Status(builtins::export(&argv[1..])),
             "let" => {
@@ -1693,8 +1751,36 @@ impl Shell {
                             return 1;
                         }
                     };
-                    let mut command = Command::new(&argv[0]);
-                    command.args(&argv[1..]);
+                    // Builtins and shell functions aren't real executables,
+                    // so they can't be Command::new'd directly. Route them
+                    // through the same self-exec trick used for compound
+                    // commands below, replaying the *already-expanded*
+                    // argv as single-quoted literals so the child doesn't
+                    // re-run any command substitution/glob/etc a second
+                    // time.
+                    let mut command = if is_known_builtin(&argv[0]) || self.functions.contains_key(&argv[0]) {
+                        let exe = match std::env::current_exe() {
+                            Ok(p) => p,
+                            Err(e) => {
+                                eprintln!("ash: {}", e);
+                                kill_all(children);
+                                return 1;
+                            }
+                        };
+                        let script_line: String = argv
+                            .iter()
+                            .map(|a| crate::serialize::quote_literal(a))
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        let script = self.functions_preamble() + &script_line;
+                        let mut command = Command::new(exe);
+                        command.arg("-c").arg(script);
+                        command
+                    } else {
+                        let mut command = Command::new(&argv[0]);
+                        command.args(&argv[1..]);
+                        command
+                    };
                     for (k, mode, val) in &sc.assigns {
                         let v = self.expand_word(val);
                         let v = match mode {
@@ -2373,6 +2459,67 @@ impl Shell {
     // from eval_var_op/eval_array_var_op.
     // xorshift64* -- simple, fast, no external RNG crate. Bash's $RANDOM
     // range is 0..32767.
+    // `command -v`/`-V name`: reports what `name` resolves to (function,
+    // builtin, or a PATH-resolved executable) without running it. Prints
+    // nothing and returns 1 if it doesn't resolve to anything, matching
+    // bash -- this is what makes `command -v foo >/dev/null` work as an
+    // existence check.
+    fn command_v(&mut self, name: &str, verbose: bool) -> i32 {
+        if self.functions.contains_key(name) {
+            println!("{}", if verbose { format!("{} is a function", name) } else { name.to_string() });
+            return 0;
+        }
+        if is_known_builtin(name) {
+            println!("{}", if verbose { format!("{} is a shell builtin", name) } else { name.to_string() });
+            return 0;
+        }
+        match resolve_in_path(name) {
+            Some(p) => {
+                println!("{}", if verbose { format!("{} is {}", name, p) } else { p });
+                0
+            }
+            None => 1,
+        }
+    }
+
+    // type [-p] name... A scoped subset of real bash's `type`: reports
+    // function/builtin/PATH-resolved-executable, or "not found" (status
+    // 1). `-a`/`-t` are accepted but not distinguished from the default.
+    fn run_type(&mut self, args: &[String]) -> i32 {
+        let mut path_only = false;
+        let mut names: Vec<&String> = Vec::new();
+        for a in args {
+            match a.as_str() {
+                "-p" | "-P" => path_only = true,
+                "-a" | "-t" => {}
+                _ => names.push(a),
+            }
+        }
+        let mut status = 0;
+        for name in names {
+            if self.functions.contains_key(name.as_str()) {
+                if !path_only {
+                    println!("{} is a function", name);
+                }
+                continue;
+            }
+            if is_known_builtin(name) {
+                if !path_only {
+                    println!("{} is a shell builtin", name);
+                }
+                continue;
+            }
+            match resolve_in_path(name) {
+                Some(p) => println!("{}", if path_only { p } else { format!("{} is {}", name, p) }),
+                None => {
+                    eprintln!("ash: type: {}: not found", name);
+                    status = 1;
+                }
+            }
+        }
+        status
+    }
+
     fn next_random(&mut self) -> u32 {
         let mut x = self.rng_state;
         x ^= x << 13;
@@ -2960,6 +3107,76 @@ fn glob_replace(s: &str, pattern: &str, repl: &str, global: bool, anchor: Replac
         }
     }
     out
+}
+
+// Kept in sync with run_single's builtin dispatch match by hand -- used
+// only by `command -v`/`type` to classify a name, not to actually run
+// anything, so a name missing from this list just means those two
+// diagnostic builtins under-report it as an external/not-found rather
+// than anything actually breaking.
+const KNOWN_BUILTINS: &[&str] = &[
+    ":",
+    "cd",
+    "export",
+    "let",
+    "break",
+    "continue",
+    "test",
+    "[",
+    "[[",
+    "return",
+    "shift",
+    "local",
+    "exit",
+    "read",
+    "mapfile",
+    "readarray",
+    "eval",
+    "source",
+    ".",
+    "trap",
+    "getopts",
+    "unset",
+    "set",
+    "declare",
+    "typeset",
+    "readonly",
+    "exec",
+    "command",
+    "type",
+    "hash",
+];
+
+fn is_known_builtin(name: &str) -> bool {
+    KNOWN_BUILTINS.contains(&name)
+}
+
+fn resolve_in_path(name: &str) -> Option<String> {
+    if name.contains('/') {
+        return if std::path::Path::new(name).is_file() { Some(name.to_string()) } else { None };
+    }
+    let path_var = std::env::var("PATH").unwrap_or_default();
+    for dir in path_var.split(':') {
+        let candidate = std::path::Path::new(dir).join(name);
+        if !candidate.is_file() {
+            continue;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            match std::fs::metadata(&candidate) {
+                Ok(meta) if meta.permissions().mode() & 0o111 != 0 => {
+                    return Some(candidate.to_string_lossy().into_owned());
+                }
+                _ => continue,
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            return Some(candidate.to_string_lossy().into_owned());
+        }
+    }
+    None
 }
 
 fn open_out(path: &str, append: bool) -> Result<std::fs::File, String> {
