@@ -47,8 +47,11 @@ pub struct Shell {
     // Indexed arrays (`arr=(...)`). A BTreeMap (not Vec) so arrays are
     // genuinely sparse like bash's: `arr[10]=x` doesn't materialize empty
     // strings for indices 0..9, and `${#arr[@]}` counts only what's
-    // actually set. Global only in v1 -- no `local` arrays, no associative
-    // arrays.
+    // actually set. Kept as one flat global map (every read/write site
+    // just indexes straight into it) rather than a var_scopes-style stack,
+    // since only `local -a`/`-A` need scoping at all -- see
+    // array_local_stack/assoc_local_stack below for how that's retrofitted
+    // via save/restore instead of a parallel lookup chain.
     arrays: HashMap<String, std::collections::BTreeMap<usize, String>>,
     // Associative arrays (`declare -A name`). Kept in a separate map from
     // `arrays` since their keys are arbitrary strings, not indices -- a name
@@ -56,6 +59,15 @@ pub struct Shell {
     // array is read or written.
     assoc_arrays: HashMap<String, std::collections::BTreeMap<String, String>>,
     assoc_names: std::collections::HashSet<String>,
+    // One frame per active function call (pushed/popped alongside
+    // var_scopes in call_function). `local -a`/`-A name` snapshots the
+    // array's pre-local value here (None if it didn't exist) before
+    // resetting it to empty, so returning from the function restores
+    // whatever the caller had -- a save/restore shadow rather than a real
+    // nested scope chain, since `arrays`/`assoc_arrays` themselves stay
+    // flat (see the comment on `arrays` above).
+    array_local_stack: Vec<Vec<(String, Option<std::collections::BTreeMap<usize, String>>)>>,
+    assoc_local_stack: Vec<Vec<(String, Option<std::collections::BTreeMap<String, String>>)>>,
     // `readonly NAME`. Checked by assign_var, the single write path plain
     // assignment/local/export/declare/arithmetic-assignment/read/getopts
     // all funnel through, so marking a name here blocks writes everywhere
@@ -121,6 +133,8 @@ impl Shell {
             arrays: HashMap::new(),
             assoc_arrays: HashMap::new(),
             assoc_names: std::collections::HashSet::new(),
+            array_local_stack: Vec::new(),
+            assoc_local_stack: Vec::new(),
             readonly_names: std::collections::HashSet::new(),
             integer_names: std::collections::HashSet::new(),
             proc_sub_out_pending: Vec::new(),
@@ -855,8 +869,35 @@ impl Shell {
     fn call_function(&mut self, body: &parser::Command, call_args: Vec<String>) -> ExecResult {
         self.arg_frames.push(call_args);
         self.var_scopes.push(HashMap::new());
+        self.array_local_stack.push(Vec::new());
+        self.assoc_local_stack.push(Vec::new());
         let result = self.run_command(body, false);
         self.var_scopes.pop();
+        if let Some(frame) = self.array_local_stack.pop() {
+            for (name, prev) in frame.into_iter().rev() {
+                match prev {
+                    Some(v) => {
+                        self.arrays.insert(name, v);
+                    }
+                    None => {
+                        self.arrays.remove(&name);
+                    }
+                }
+            }
+        }
+        if let Some(frame) = self.assoc_local_stack.pop() {
+            for (name, prev) in frame.into_iter().rev() {
+                match prev {
+                    Some(v) => {
+                        self.assoc_arrays.insert(name, v);
+                    }
+                    None => {
+                        self.assoc_arrays.remove(&name);
+                        self.assoc_names.remove(&name);
+                    }
+                }
+            }
+        }
         self.arg_frames.pop();
         match result {
             ExecResult::Return(code) => ExecResult::Status(code),
@@ -1423,12 +1464,13 @@ impl Shell {
                     eprintln!("ash: local: can only be used inside a function");
                     return ExecResult::Status(1);
                 }
-                // `-a`/`-A` name an array rather than a scalar. Arrays have
-                // no scoped storage in this shell (see `arrays`/
-                // `assoc_arrays` on Shell) -- declaring one here just
-                // registers it in the same global maps `declare -a`/`-A`
-                // would, so it's visible after the function returns too,
-                // unlike a real local scalar. Documented gap, not a crash.
+                // `-a`/`-A` name an array rather than a scalar. `arrays`/
+                // `assoc_arrays` themselves stay flat maps (see the
+                // comments on those fields), but the pre-local value is
+                // snapshotted onto array_local_stack/assoc_local_stack so
+                // call_function can restore it when the function returns --
+                // giving `local -a`/`-A` real scoping without needing every
+                // array read/write site to walk a scope chain.
                 let mut array_mode: Option<bool> = None;
                 let mut integer_flag = false;
                 for a in &argv[1..] {
@@ -1457,11 +1499,15 @@ impl Shell {
                     }
                     match array_mode {
                         Some(true) => {
+                            let prev = self.assoc_arrays.remove(&n);
+                            self.assoc_local_stack.last_mut().unwrap().push((n.clone(), prev));
                             self.assoc_names.insert(n.clone());
-                            self.assoc_arrays.entry(n).or_default();
+                            self.assoc_arrays.insert(n, std::collections::BTreeMap::new());
                         }
                         Some(false) => {
-                            self.arrays.entry(n).or_default();
+                            let prev = self.arrays.remove(&n);
+                            self.array_local_stack.last_mut().unwrap().push((n.clone(), prev));
+                            self.arrays.insert(n, std::collections::BTreeMap::new());
                         }
                         None => {
                             let v = v.unwrap_or_default();
