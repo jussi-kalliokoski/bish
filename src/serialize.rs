@@ -90,11 +90,15 @@ pub fn serialize_command(cmd: &Command) -> String {
         }
         Command::Case { word, arms, .. } => {
             let mut s = format!("case {} in\n", serialize_word(word));
-            for (patterns, body) in arms {
+            for (patterns, body, term) in arms {
                 s.push_str(&patterns.iter().map(serialize_word).collect::<Vec<_>>().join("|"));
                 s.push_str(")\n");
                 s.push_str(&serialize_program(body));
-                s.push_str(";;\n");
+                s.push_str(match term {
+                    crate::parser::CaseTerm::Stop => ";;\n",
+                    crate::parser::CaseTerm::FallThrough => ";&\n",
+                    crate::parser::CaseTerm::Continue => ";;&\n",
+                });
             }
             s.push_str("esac");
             s

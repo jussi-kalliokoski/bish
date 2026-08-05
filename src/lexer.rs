@@ -114,6 +114,10 @@ pub enum Tok {
     Or,
     Semi,
     DSemi,
+    // `;&` (case: fall through to the next arm's body unconditionally) and
+    // `;;&` (case: keep testing subsequent patterns instead of stopping).
+    SemiAmp,
+    DSemiAmp,
     Amp,
     RedirOut { append: bool },
     RedirIn,
@@ -278,7 +282,15 @@ impl<'a> Lexer<'a> {
                     self.chars.next();
                     if self.chars.peek().copied() == Some(';') {
                         self.chars.next();
-                        toks.push(Tok::DSemi);
+                        if self.chars.peek().copied() == Some('&') {
+                            self.chars.next();
+                            toks.push(Tok::DSemiAmp);
+                        } else {
+                            toks.push(Tok::DSemi);
+                        }
+                    } else if self.chars.peek().copied() == Some('&') {
+                        self.chars.next();
+                        toks.push(Tok::SemiAmp);
                     } else {
                         toks.push(Tok::Semi);
                     }

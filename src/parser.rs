@@ -74,7 +74,7 @@ pub enum Command {
     },
     Case {
         word: Word,
-        arms: Vec<(Vec<Word>, Program)>,
+        arms: Vec<(Vec<Word>, Program, CaseTerm)>,
         redirects: Vec<Redirect>,
     },
     Group(Program, Vec<Redirect>),
@@ -89,6 +89,17 @@ pub enum Command {
     // precedence handling (NOT > binary tests > AND > OR), same
     // deferred-evaluation spirit as Subshell/Arith.
     Test(Vec<TestAtom>, Vec<Redirect>),
+}
+
+// What happens after a case arm's body finishes: `;;` stops (the normal
+// case), `;&` falls through into the *next* arm's body unconditionally
+// (no pattern test), `;;&` keeps testing subsequent patterns from the top
+// (doesn't stop, but doesn't skip the pattern match either).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum CaseTerm {
+    Stop,
+    FallThrough,
+    Continue,
 }
 
 #[derive(Debug, Clone)]
@@ -508,12 +519,26 @@ impl Parser {
             }
             self.expect(Tok::RParen)?;
             self.skip_terminators();
-            let body = self.parse_list_until(&[Tok::DSemi, Tok::KwEsac])?;
-            if matches!(self.peek(), Some(Tok::DSemi)) {
-                self.advance();
-            }
+            let body = self.parse_list_until(&[Tok::DSemi, Tok::SemiAmp, Tok::DSemiAmp, Tok::KwEsac])?;
+            let term = match self.peek() {
+                Some(Tok::DSemi) => {
+                    self.advance();
+                    CaseTerm::Stop
+                }
+                Some(Tok::SemiAmp) => {
+                    self.advance();
+                    CaseTerm::FallThrough
+                }
+                Some(Tok::DSemiAmp) => {
+                    self.advance();
+                    CaseTerm::Continue
+                }
+                // No explicit terminator before `esac` (the last arm may
+                // omit `;;` entirely) -- behaves like `;;`.
+                _ => CaseTerm::Stop,
+            };
             self.skip_terminators();
-            arms.push((patterns, body));
+            arms.push((patterns, body, term));
         }
         self.expect(Tok::KwEsac)?;
         let redirects = self.parse_trailing_redirects()?;

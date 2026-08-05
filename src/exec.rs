@@ -1022,17 +1022,40 @@ impl Shell {
         }
     }
 
-    fn run_case(&mut self, word: &Word, arms: &[(Vec<Word>, Program)]) -> ExecResult {
+    fn run_case(&mut self, word: &Word, arms: &[(Vec<Word>, Program, parser::CaseTerm)]) -> ExecResult {
         let val = self.expand_word(word);
-        for (patterns, body) in arms {
-            for p in patterns {
-                let pat = self.expand_word(p);
-                if glob::matches(&pat, &val) {
-                    return self.run_program(body);
+        let mut i = 0;
+        // Set by `;&`: run the next arm's body unconditionally, skipping
+        // its pattern test entirely (unlike `;;&`, which just resumes
+        // normal pattern testing at the next arm without forcing a run).
+        let mut force_run = false;
+        let mut last_body_status = 0;
+        while i < arms.len() {
+            let (patterns, body, term) = &arms[i];
+            let should_run = force_run
+                || patterns.iter().any(|p| {
+                    let pat = self.expand_word(p);
+                    glob::matches(&pat, &val)
+                });
+            if should_run {
+                match self.run_program(body) {
+                    ExecResult::Status(s) => {
+                        self.last_status = s;
+                        last_body_status = s;
+                    }
+                    other => return other,
                 }
+                match term {
+                    parser::CaseTerm::Stop => return ExecResult::Status(last_body_status),
+                    parser::CaseTerm::FallThrough => force_run = true,
+                    parser::CaseTerm::Continue => force_run = false,
+                }
+            } else {
+                force_run = false;
             }
+            i += 1;
         }
-        ExecResult::Status(0)
+        ExecResult::Status(last_body_status)
     }
 
     // `[[ expr ]]`. Real recursive-descent precedence over the flat
