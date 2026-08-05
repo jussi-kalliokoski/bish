@@ -702,6 +702,9 @@ impl Shell {
         command.stdin(redirs.stdin.unwrap_or_else(Stdio::inherit));
         command.stdout(redirs.stdout.unwrap_or_else(Stdio::inherit));
         command.stderr(redirs.stderr.unwrap_or_else(Stdio::inherit));
+        if redirs.dup_stderr_to_stdout {
+            dup2_stderr_to_stdout(&mut command);
+        }
         match command.spawn() {
             Ok(mut child) => {
                 if background {
@@ -1504,6 +1507,9 @@ impl Shell {
         command.stdin(redirs.stdin.unwrap_or_else(Stdio::inherit));
         command.stdout(redirs.stdout.unwrap_or_else(Stdio::inherit));
         command.stderr(redirs.stderr.unwrap_or_else(Stdio::inherit));
+        if redirs.dup_stderr_to_stdout {
+            dup2_stderr_to_stdout(&mut command);
+        }
 
         match command.spawn() {
             Ok(mut child) => {
@@ -1579,6 +1585,9 @@ impl Shell {
                     command.stdin(redirs.stdin.unwrap_or(default_stdin));
                     command.stdout(redirs.stdout.unwrap_or(default_stdout));
                     command.stderr(redirs.stderr.unwrap_or_else(Stdio::inherit));
+                    if redirs.dup_stderr_to_stdout {
+                        dup2_stderr_to_stdout(&mut command);
+                    }
                     command
                 }
                 other => {
@@ -1592,7 +1601,7 @@ impl Shell {
                     };
                     let own_redirects = command_own_redirects(other);
                     let redirs = if own_redirects.is_empty() {
-                        ResolvedRedirs { stdin: None, stdout: None, stderr: None }
+                        ResolvedRedirs { stdin: None, stdout: None, stderr: None, dup_stderr_to_stdout: false }
                     } else {
                         match self.resolve_redirect_list(own_redirects) {
                             Ok(r) => r,
@@ -1609,6 +1618,9 @@ impl Shell {
                     command.stdin(redirs.stdin.unwrap_or(default_stdin));
                     command.stdout(redirs.stdout.unwrap_or(default_stdout));
                     command.stderr(redirs.stderr.unwrap_or_else(Stdio::inherit));
+                    if redirs.dup_stderr_to_stdout {
+                        dup2_stderr_to_stdout(&mut command);
+                    }
                     command
                 }
             };
@@ -2268,14 +2280,12 @@ impl Shell {
             Some((p, append)) => Some(open_out(p, *append)?),
             None => None,
         };
-        // Share the real file description (via dup, not a second open) so
-        // stdout/stderr writes interleave through one file offset, matching
-        // `2>&1`'s true fd-dup semantics instead of corrupting each other.
+        // `2>&1`'s actual fd-dup happens via dup2_stderr_to_stdout at each
+        // spawn site instead of resolving a Stdio here -- see
+        // ResolvedRedirs::dup_stderr_to_stdout for why (a pipe destination
+        // can't be "opened" the way a file can).
         let stderr_file: Option<std::fs::File> = if dup_err_to_out {
-            match &stdout_file {
-                Some(f) => Some(f.try_clone().map_err(|e| e.to_string())?),
-                None => None,
-            }
+            None
         } else {
             match &stderr_target {
                 Some((p, append)) => Some(open_out(p, *append)?),
@@ -2285,7 +2295,7 @@ impl Shell {
         let stdout = stdout_file.map(Stdio::from);
         let stderr = stderr_file.map(Stdio::from);
 
-        Ok(ResolvedRedirs { stdin, stdout, stderr })
+        Ok(ResolvedRedirs { stdin, stdout, stderr, dup_stderr_to_stdout: dup_err_to_out })
     }
 }
 
@@ -2303,6 +2313,35 @@ struct ResolvedRedirs {
     stdin: Option<Stdio>,
     stdout: Option<Stdio>,
     stderr: Option<Stdio>,
+    // True fd-dup of whatever stdout ends up being -- a pipe, a file, or
+    // inherited -- applied via a dup2 pre_exec hook at each spawn site
+    // (see dup2_stderr_to_stdout). Stdio has no "duplicate of a sibling
+    // fd" variant, so this is the only way `2>&1` can share stdout's
+    // *actual* destination rather than a second, independently-opened
+    // handle to it; it's what makes `cmd 2>&1 | other` correctly merge
+    // stderr into the pipe, not just the `cmd > file 2>&1` shape.
+    dup_stderr_to_stdout: bool,
+}
+
+// dup2(1, 2) in the child, after fork but before exec -- so fd 2 becomes a
+// genuine duplicate of whatever fd 1 was just set up to be (Command's own
+// stdio setup runs before pre_exec hooks). A single async-signal-safe
+// syscall with no allocation, which is exactly what's safe to do in this
+// narrow post-fork window; declared directly via extern "C" rather than
+// pulling in the `libc` crate, since libc is already linked into any
+// dynamically-linked Unix binary regardless.
+fn dup2_stderr_to_stdout(command: &mut Command) {
+    unsafe extern "C" {
+        fn dup2(oldfd: i32, newfd: i32) -> i32;
+    }
+    unsafe {
+        command.pre_exec(|| {
+            if dup2(1, 2) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
 }
 
 // Here-strings need a real Stdio for the child process; simplest portable
