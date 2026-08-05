@@ -169,7 +169,7 @@ fn serialize_word(w: &Word) -> String {
 
 fn serialize_chunk(c: &Chunk) -> String {
     match c {
-        Chunk::Str(s) => quote_literal(s),
+        Chunk::Str(s) | Chunk::LiteralStr(s) => quote_literal(s),
         Chunk::Var { name, quoted } => wrap_quoted(format!("${{{}}}", name), *quoted),
         Chunk::Sub { raw, quoted } => wrap_quoted(format!("$({})", raw), *quoted),
         Chunk::Arith { raw, quoted } => wrap_quoted(format!("$(({}))", raw), *quoted),

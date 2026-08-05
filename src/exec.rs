@@ -1044,26 +1044,120 @@ impl Shell {
                 self.eval_test_or(inner, &mut ipos)
             }
             Some(parser::TestAtom::Word(_)) => {
-                let mut words = Vec::new();
+                let mut word_atoms: Vec<&Word> = Vec::new();
                 while let Some(parser::TestAtom::Word(w)) = atoms.get(*pos) {
-                    words.push(self.expand_word(w));
+                    word_atoms.push(w);
                     *pos += 1;
                 }
-                Ok(self.eval_simple_test(&words))
+                Ok(self.eval_simple_test(&word_atoms))
             }
             other => Err(format!("syntax error near {:?}", other)),
         }
     }
 
-    fn eval_simple_test(&mut self, words: &[String]) -> bool {
+    fn eval_simple_test(&mut self, words: &[&Word]) -> bool {
         match words {
             [] => false,
-            [s] => !s.is_empty(),
-            [op, a] => builtins::unary(op, a),
-            [a, op, b] if op == "=~" => crate::regex::is_match(a, b),
-            [a, op, b] => builtins::binary(a, op, b, true),
+            [s] => !self.expand_word(s).is_empty(),
+            [op, a] => {
+                let op = self.expand_word(op);
+                let a = self.expand_word(a);
+                builtins::unary(&op, &a)
+            }
+            [a, op, b] => {
+                let op = self.expand_word(op);
+                let a = self.expand_word(a);
+                if op == "=~" {
+                    let pattern = self.expand_regex_operand(b);
+                    crate::regex::is_match(&a, &pattern)
+                } else {
+                    let b = self.expand_word(b);
+                    builtins::binary(&a, &op, &b, true)
+                }
+            }
             _ => !words.is_empty(),
         }
+    }
+
+    // The RHS of `[[ str =~ pattern ]]`. Quoting (or backslash-escaping)
+    // any part of `pattern` in the source forces that part to match
+    // literally instead of as regex syntax -- real bash's documented
+    // behavior for `=~`. Mirrors expand_word's chunk loop, but escapes
+    // each chunk's own text for the regex engine when that chunk is
+    // individually quoted (Chunk::LiteralStr, or any other chunk's own
+    // `quoted` flag), leaving unquoted chunks as raw regex syntax -- so
+    // e.g. `^[0-9]+\.[0-9]+$` keeps `^`/`[0-9]`/`+`/`$` as regex metachars
+    // while the backslash-escaped `.` matches only a literal dot.
+    fn expand_regex_operand(&mut self, w: &Word) -> String {
+        let mut out = String::new();
+        for c in &w.chunks {
+            match c {
+                Chunk::Str(t) => out.push_str(t),
+                Chunk::LiteralStr(t) => out.push_str(&crate::regex::escape(t)),
+                Chunk::Var { name, quoted } => {
+                    let name = name.clone();
+                    self.check_nounset(&name);
+                    let v = self.lookup_var(&name);
+                    out.push_str(&if *quoted { crate::regex::escape(&v) } else { v });
+                }
+                Chunk::Sub { raw, quoted } => {
+                    let v = self.run_command_substitution(raw);
+                    out.push_str(&if *quoted { crate::regex::escape(&v) } else { v });
+                }
+                Chunk::Arith { raw, quoted } => match arith::eval(raw, self) {
+                    Ok(v) => {
+                        let v = v.to_string();
+                        out.push_str(&if *quoted { crate::regex::escape(&v) } else { v });
+                    }
+                    Err(e) => eprintln!("ash: (({})): {}", raw, e),
+                },
+                Chunk::VarExpand { name, op, quoted } => {
+                    let name = name.clone();
+                    let op = op.clone();
+                    let v = self.eval_var_op(&name, &op);
+                    out.push_str(&if *quoted { crate::regex::escape(&v) } else { v });
+                }
+                Chunk::ArrayVar { name, index, quoted } => {
+                    let name = name.clone();
+                    let index = index.clone();
+                    let v = self.array_element(&name, &index);
+                    out.push_str(&if *quoted { crate::regex::escape(&v) } else { v });
+                }
+                Chunk::ArrayLength { name, index } => {
+                    let name = name.clone();
+                    let index = index.clone();
+                    out.push_str(&self.array_length(&name, &index).to_string());
+                }
+                Chunk::ArrayVarExpand { name, index, op, quoted } => {
+                    let name = name.clone();
+                    let index = index.clone();
+                    let op = op.clone();
+                    let v = self.eval_array_var_op(&name, &index, &op);
+                    out.push_str(&if *quoted { crate::regex::escape(&v) } else { v });
+                }
+                Chunk::Indirect { name, quoted } => {
+                    let target = self.lookup_var(name);
+                    let v = self.lookup_var(&target);
+                    out.push_str(&if *quoted { crate::regex::escape(&v) } else { v });
+                }
+                Chunk::ArrayKeys { name, quoted } => {
+                    let name = name.clone();
+                    let v = self.array_keys(&name).join(" ");
+                    out.push_str(&if *quoted { crate::regex::escape(&v) } else { v });
+                }
+                Chunk::ProcSubIn { raw } => {
+                    let raw = raw.clone();
+                    let v = self.run_proc_sub_in(&raw);
+                    out.push_str(&crate::regex::escape(&v));
+                }
+                Chunk::ProcSubOut { raw } => {
+                    let raw = raw.clone();
+                    let v = self.run_proc_sub_out(&raw);
+                    out.push_str(&crate::regex::escape(&v));
+                }
+            }
+        }
+        out
     }
 
     fn run_single(&mut self, cmd: &SimpleCommand, background: bool) -> ExecResult {
@@ -1569,7 +1663,7 @@ impl Shell {
         let mut s = String::new();
         for c in &w.chunks {
             match c {
-                Chunk::Str(t) => s.push_str(t),
+                Chunk::Str(t) | Chunk::LiteralStr(t) => s.push_str(t),
                 Chunk::Var { name, .. } => {
                     let name = name.clone();
                     self.check_nounset(&name);
@@ -1759,7 +1853,7 @@ impl Shell {
         let mut current: Option<String> = None;
         for c in &w.chunks {
             match c {
-                Chunk::Str(t) => current.get_or_insert_with(String::new).push_str(t),
+                Chunk::Str(t) | Chunk::LiteralStr(t) => current.get_or_insert_with(String::new).push_str(t),
                 Chunk::Var { name, quoted } => {
                     // "$@" is a special case even when quoted: it expands
                     // to one field per positional parameter (as if each

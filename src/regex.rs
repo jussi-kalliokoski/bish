@@ -192,6 +192,22 @@ fn match_star(inner: &Re, s: &[char], pos: usize, depth: usize, k: &dyn Fn(usize
     k(pos)
 }
 
+// Escapes every character `parse` treats as a metacharacter, so the result
+// -- fed back through `parse` -- matches only the literal input text. Used
+// for `[[ ]]`'s `=~` when the pattern operand was quoted/escaped in the
+// source (bash: quoting any part of a `=~` pattern forces that part to
+// match literally instead of as regex).
+pub fn escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if ".^$*+?()[]{}|\\".contains(c) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
 // `[[ str =~ pattern ]]`: true if `pattern` matches anywhere in `str`
 // (unanchored, like ERE regexec), honoring explicit `^`/`$` when present.
 pub fn is_match(text: &str, pattern: &str) -> bool {

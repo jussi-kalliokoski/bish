@@ -43,6 +43,18 @@ pub enum Chunk {
     // Correct data flow, but not concurrent -- documented gap.
     ProcSubIn { raw: String },
     ProcSubOut { raw: String },
+    // A literal run of text that was quoted or backslash-escaped in the
+    // source, ONLY ever produced while lexing a `[[ ... =~ pattern ]]`
+    // operand (relaxed mode in read_word). Plain Chunk::Str can't carry
+    // this distinction -- quoted and unquoted literal runs normally merge
+    // losslessly into one Chunk::Str, since ordinary word-splitting never
+    // needs to tell them apart. The =~ operand does: quoting/escaping part
+    // of a regex pattern forces that part to match literally instead of
+    // as regex syntax (see expand_regex_operand in exec.rs), so this
+    // variant exists to keep those runs distinguishable from the
+    // surrounding unquoted regex syntax. Treated identically to
+    // Chunk::Str everywhere else (word-splitting, serialization).
+    LiteralStr(String),
 }
 
 // The operand ("word"/"pattern") of each variant is kept as raw source text
@@ -634,17 +646,29 @@ impl<'a> Lexer<'a> {
                 Some('\'') => {
                     plain = false;
                     self.chars.next();
+                    let mut lit = String::new();
                     loop {
                         match self.chars.next() {
                             None => return Err("unterminated single quote".to_string()),
                             Some('\'') => break,
-                            Some(c) => buf.push(c),
+                            Some(c) => lit.push(c),
                         }
+                    }
+                    if relaxed {
+                        if !buf.is_empty() {
+                            chunks.push(Chunk::Str(std::mem::take(&mut buf)));
+                        }
+                        if !lit.is_empty() {
+                            chunks.push(Chunk::LiteralStr(lit));
+                        }
+                    } else {
+                        buf.push_str(&lit);
                     }
                 }
                 Some('"') => {
                     plain = false;
                     self.chars.next();
+                    let mut lit = String::new();
                     loop {
                         match self.chars.next() {
                             None => return Err("unterminated double quote".to_string()),
@@ -652,23 +676,46 @@ impl<'a> Lexer<'a> {
                             Some('\\') => match self.chars.peek().copied() {
                                 Some(n) if n == '"' || n == '\\' || n == '$' => {
                                     self.chars.next();
-                                    buf.push(n);
+                                    lit.push(n);
                                 }
-                                _ => buf.push('\\'),
+                                _ => lit.push('\\'),
                             },
                             Some('$') => {
                                 if !buf.is_empty() {
                                     chunks.push(Chunk::Str(std::mem::take(&mut buf)));
                                 }
-                                self.push_var(&mut chunks, &mut buf, true)?;
+                                if !lit.is_empty() {
+                                    let taken = std::mem::take(&mut lit);
+                                    chunks.push(if relaxed { Chunk::LiteralStr(taken) } else { Chunk::Str(taken) });
+                                }
+                                // Pass `lit` (now empty), not `buf`: if
+                                // nothing valid follows the `$`, push_var's
+                                // fallback writes a literal "$" back into
+                                // whatever buffer it's given -- it must
+                                // land in the quoted accumulator here, or a
+                                // trailing "$" (e.g. a regex end-anchor
+                                // written *inside* quotes) would wrongly
+                                // lose its quoted-ness.
+                                self.push_var(&mut chunks, &mut lit, true)?;
                             }
                             Some('`') => {
                                 if !buf.is_empty() {
                                     chunks.push(Chunk::Str(std::mem::take(&mut buf)));
                                 }
+                                if !lit.is_empty() {
+                                    let taken = std::mem::take(&mut lit);
+                                    chunks.push(if relaxed { Chunk::LiteralStr(taken) } else { Chunk::Str(taken) });
+                                }
                                 chunks.push(Chunk::Sub { raw: self.capture_backtick()?, quoted: true });
                             }
-                            Some(c) => buf.push(c),
+                            Some(c) => lit.push(c),
+                        }
+                    }
+                    if !lit.is_empty() {
+                        if relaxed {
+                            chunks.push(Chunk::LiteralStr(lit));
+                        } else {
+                            buf.push_str(&lit);
                         }
                     }
                 }
@@ -676,7 +723,14 @@ impl<'a> Lexer<'a> {
                     plain = false;
                     self.chars.next();
                     if let Some(n) = self.chars.next() {
-                        buf.push(n);
+                        if relaxed {
+                            if !buf.is_empty() {
+                                chunks.push(Chunk::Str(std::mem::take(&mut buf)));
+                            }
+                            chunks.push(Chunk::LiteralStr(n.to_string()));
+                        } else {
+                            buf.push(n);
+                        }
                     }
                 }
                 Some('$') if self.peek2() == Some('\'') => {
@@ -686,12 +740,13 @@ impl<'a> Lexer<'a> {
                     buf.push_str(&self.read_ansi_c_string()?);
                 }
                 Some('$') => {
-                    plain = false;
                     self.chars.next();
                     if !buf.is_empty() {
                         chunks.push(Chunk::Str(std::mem::take(&mut buf)));
                     }
-                    self.push_var(&mut chunks, &mut buf, false)?;
+                    if self.push_var(&mut chunks, &mut buf, false)? {
+                        plain = false;
+                    }
                 }
                 Some('`') => {
                     plain = false;
@@ -721,7 +776,13 @@ impl<'a> Lexer<'a> {
     // expansion, or ${...} parameter expansion) after the '$' has already
     // been consumed, and pushes the appropriate Chunk, or a literal "$" if
     // nothing valid follows.
-    fn push_var(&mut self, chunks: &mut Vec<Chunk>, buf: &mut String, quoted: bool) -> Result<(), String> {
+    // Returns whether a real expansion chunk was produced, as opposed to
+    // falling back to a literal "$" (e.g. a trailing `$` with nothing
+    // valid after it, like a regex end-anchor). Callers that track a
+    // word's "plain" (unquoted/unescaped) status use this to avoid
+    // treating a bare literal `$` as if the word had been quoted or
+    // escaped -- see the unquoted `$` case in read_word().
+    fn push_var(&mut self, chunks: &mut Vec<Chunk>, buf: &mut String, quoted: bool) -> Result<bool, String> {
         if self.chars.peek().copied() == Some('(') {
             self.chars.next();
             if self.chars.peek().copied() == Some('(') {
@@ -730,7 +791,7 @@ impl<'a> Lexer<'a> {
             } else {
                 chunks.push(Chunk::Sub { raw: self.capture_balanced_parens()?, quoted });
             }
-            return Ok(());
+            return Ok(true);
         }
         if self.chars.peek().copied() == Some('{') {
             self.chars.next();
@@ -746,6 +807,7 @@ impl<'a> Lexer<'a> {
                 BraceContent::Plain(name) => {
                     if name.is_empty() {
                         buf.push('$');
+                        return Ok(false);
                     } else {
                         chunks.push(Chunk::Var { name, quoted });
                     }
@@ -759,15 +821,16 @@ impl<'a> Lexer<'a> {
                 BraceContent::Indirect(name) => chunks.push(Chunk::Indirect { name, quoted }),
                 BraceContent::ArrayKeys(name) => chunks.push(Chunk::ArrayKeys { name, quoted }),
             }
-            return Ok(());
+            return Ok(true);
         }
         let name = self.read_var_name();
         if name.is_empty() {
             buf.push('$');
+            Ok(false)
         } else {
             chunks.push(Chunk::Var { name, quoted });
+            Ok(true)
         }
-        Ok(())
     }
 
     fn read_var_name(&mut self) -> String {
