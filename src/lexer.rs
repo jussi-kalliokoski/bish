@@ -152,17 +152,38 @@ pub struct Lexer<'a> {
     // line's terminating newline is reached (see the body-capture comment
     // below for why this two-phase approach is needed).
     pending_heredocs: Vec<(usize, String, bool, bool)>,
+    // How many `[[`s we're currently nested inside (tracked so `=~`'s
+    // special word-reading below only kicks in there, not for a stray
+    // `=~` word elsewhere).
+    bracket2_depth: u32,
+    // Set right after emitting the `=~` word while inside `[[ ]]`; makes
+    // the *next* word read via read_word(relaxed: true) instead of the
+    // normal dispatch. See the =~ handling in tokenize().
+    regex_operand_next: bool,
 }
 
 impl<'a> Lexer<'a> {
     pub fn new(src: &'a str) -> Self {
-        Lexer { chars: src.chars().peekable(), pending_heredocs: Vec::new() }
+        Lexer {
+            chars: src.chars().peekable(),
+            pending_heredocs: Vec::new(),
+            bracket2_depth: 0,
+            regex_operand_next: false,
+        }
     }
 
     pub fn tokenize(mut self) -> Result<Vec<Tok>, String> {
         let mut toks = Vec::new();
         loop {
             self.skip_spaces();
+            if self.regex_operand_next {
+                self.regex_operand_next = false;
+                if self.chars.peek().is_some() {
+                    let (word, plain) = self.read_word(true)?;
+                    toks.push(Tok::Word(word, plain));
+                }
+                continue;
+            }
             match self.chars.peek().copied() {
                 None => break,
                 Some('#') => {
@@ -310,12 +331,20 @@ impl<'a> Lexer<'a> {
                     }
                 }
                 _ => {
-                    let (word, plain) = self.read_word()?;
+                    let (word, plain) = self.read_word(false)?;
                     if plain {
                         if let [Chunk::Str(s)] = word.as_slice() {
                             if let Some(kw) = keyword(s) {
+                                match kw {
+                                    Tok::KwLBracket2 => self.bracket2_depth += 1,
+                                    Tok::KwRBracket2 => self.bracket2_depth = self.bracket2_depth.saturating_sub(1),
+                                    _ => {}
+                                }
                                 toks.push(kw);
                                 continue;
+                            }
+                            if self.bracket2_depth > 0 && s == "=~" {
+                                self.regex_operand_next = true;
                             }
                             if s.contains('{') {
                                 let expanded = brace_expand(s);
@@ -568,7 +597,17 @@ impl<'a> Lexer<'a> {
     // quoting/escaping at all -- only a fully "plain" word is eligible for
     // reserved-word (keyword) recognition, matching bash: `"if"` or `\if`
     // is always a literal word, never the `if` keyword.
-    fn read_word(&mut self) -> Result<(Vec<Chunk>, bool), String> {
+    // `relaxed` is used for exactly one thing: the right-hand operand of
+    // `[[ ... =~ pattern ]]`. A regex pattern routinely contains `|`, `(`,
+    // `)` (alternation, grouping) that otherwise mean pipe/subshell to this
+    // lexer -- but real bash exempts exactly those three from operator
+    // tokenization for an unquoted =~ operand and nothing else (confirmed
+    // empirically: bash accepts `=~ ^(cat|dog)$` unquoted but rejects bare
+    // `&`/`<`/`>` there with a syntax error, same as it would anywhere
+    // else in `[[ ]]`), so this mirrors that narrow exemption rather than
+    // relaxing every shell metacharacter. Whitespace and `]]` still end
+    // the word normally.
+    fn read_word(&mut self, relaxed: bool) -> Result<(Vec<Chunk>, bool), String> {
         let mut chunks: Vec<Chunk> = Vec::new();
         let mut buf = String::new();
         let mut plain = true;
@@ -588,6 +627,9 @@ impl<'a> Lexer<'a> {
             match self.chars.peek().copied() {
                 None => break,
                 Some(c) if c == ' ' || c == '\t' || c == '\n' => break,
+                Some('|') | Some('(') | Some(')') if relaxed => {
+                    buf.push(self.chars.next().unwrap());
+                }
                 Some('|') | Some('&') | Some(';') | Some('<') | Some('>') | Some('#') | Some('(') | Some(')') => break,
                 Some('\'') => {
                     plain = false;
