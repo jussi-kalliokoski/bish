@@ -1374,26 +1374,29 @@ impl Shell {
                                 }
                             }
                         }
+                        let ifs = self.get_ifs();
                         if let Some(arr) = array_name {
+                            let (parts, ..) = ifs_tokenize(line, &ifs);
                             let map: std::collections::BTreeMap<usize, String> =
-                                line.split_whitespace().map(|s| s.to_string()).enumerate().collect();
+                                parts.into_iter().enumerate().collect();
                             self.arrays.insert(arr.to_string(), map);
                         } else if names.is_empty() {
                             self.assign_var("REPLY", line.to_string());
                         } else {
-                            let mut rest = line.trim_start();
+                            let is_ifs_ws = |c: char| c.is_whitespace() && ifs.contains(c);
+                            let mut rest = line.trim_start_matches(is_ifs_ws).to_string();
                             for (i, n) in names.iter().enumerate() {
                                 if i == names.len() - 1 {
-                                    self.assign_var(n, rest.trim_end().to_string());
+                                    self.assign_var(n, rest.trim_end_matches(is_ifs_ws).to_string());
                                 } else {
-                                    match rest.find(char::is_whitespace) {
-                                        Some(pos) => {
-                                            self.assign_var(n, rest[..pos].to_string());
-                                            rest = rest[pos..].trim_start();
+                                    match ifs_next_field(&rest, &ifs) {
+                                        Some((field, remainder)) => {
+                                            self.assign_var(n, field);
+                                            rest = remainder;
                                         }
                                         None => {
-                                            self.assign_var(n, rest.to_string());
-                                            rest = "";
+                                            self.assign_var(n, rest.clone());
+                                            rest = String::new();
                                         }
                                     }
                                 }
@@ -1889,6 +1892,7 @@ impl Shell {
     // argv, `for` word-lists) -- assignment RHS, case words, redirect
     // targets, etc. still go through plain expand_word.
     fn expand_word_split(&mut self, w: &Word) -> Vec<String> {
+        let ifs = self.get_ifs();
         let mut fields: Vec<String> = Vec::new();
         let mut current: Option<String> = None;
         for c in &w.chunks {
@@ -1909,12 +1913,12 @@ impl Shell {
                         let name = name.clone();
                         self.check_nounset(&name);
                         let v = self.lookup_var(&name);
-                        append_splittable(&mut fields, &mut current, &v, *quoted);
+                        append_splittable(&mut fields, &mut current, &v, *quoted, &ifs);
                     }
                 }
                 Chunk::Sub { raw, quoted } => {
                     let v = self.run_command_substitution(raw);
-                    append_splittable(&mut fields, &mut current, &v, *quoted);
+                    append_splittable(&mut fields, &mut current, &v, *quoted, &ifs);
                 }
                 Chunk::Arith { raw, quoted } => {
                     let v = match arith::eval(raw, self) {
@@ -1924,13 +1928,13 @@ impl Shell {
                             String::new()
                         }
                     };
-                    append_splittable(&mut fields, &mut current, &v, *quoted);
+                    append_splittable(&mut fields, &mut current, &v, *quoted, &ifs);
                 }
                 Chunk::VarExpand { name, op, quoted } => {
                     let name = name.clone();
                     let op = op.clone();
                     let v = self.eval_var_op(&name, &op);
-                    append_splittable(&mut fields, &mut current, &v, *quoted);
+                    append_splittable(&mut fields, &mut current, &v, *quoted, &ifs);
                 }
                 Chunk::ArrayVar { name, index, quoted } => {
                     // "${arr[@]}" is the array analog of "$@": one field per
@@ -1942,31 +1946,31 @@ impl Shell {
                         append_parts(&mut fields, &mut current, &items);
                     } else if index == "@" || index == "*" {
                         let joined = self.array_all(name).join(" ");
-                        append_splittable(&mut fields, &mut current, &joined, *quoted);
+                        append_splittable(&mut fields, &mut current, &joined, *quoted, &ifs);
                     } else {
                         let name = name.clone();
                         let index = index.clone();
                         let v = self.array_element(&name, &index);
-                        append_splittable(&mut fields, &mut current, &v, *quoted);
+                        append_splittable(&mut fields, &mut current, &v, *quoted, &ifs);
                     }
                 }
                 Chunk::ArrayLength { name, index } => {
                     let name = name.clone();
                     let index = index.clone();
                     let v = self.array_length(&name, &index).to_string();
-                    append_splittable(&mut fields, &mut current, &v, true);
+                    append_splittable(&mut fields, &mut current, &v, true, &ifs);
                 }
                 Chunk::ArrayVarExpand { name, index, op, quoted } => {
                     let name = name.clone();
                     let index = index.clone();
                     let op = op.clone();
                     let v = self.eval_array_var_op(&name, &index, &op);
-                    append_splittable(&mut fields, &mut current, &v, *quoted);
+                    append_splittable(&mut fields, &mut current, &v, *quoted, &ifs);
                 }
                 Chunk::Indirect { name, quoted } => {
                     let target = self.lookup_var(name);
                     let v = self.lookup_var(&target);
-                    append_splittable(&mut fields, &mut current, &v, *quoted);
+                    append_splittable(&mut fields, &mut current, &v, *quoted, &ifs);
                 }
                 Chunk::ArrayKeys { name, quoted } => {
                     // Same @-vs-* / quoted-vs-not splitting rules as
@@ -1976,18 +1980,18 @@ impl Shell {
                         append_parts(&mut fields, &mut current, &items);
                     } else {
                         let joined = self.array_keys(name).join(" ");
-                        append_splittable(&mut fields, &mut current, &joined, *quoted);
+                        append_splittable(&mut fields, &mut current, &joined, *quoted, &ifs);
                     }
                 }
                 Chunk::ProcSubIn { raw } => {
                     let raw = raw.clone();
                     let v = self.run_proc_sub_in(&raw);
-                    append_splittable(&mut fields, &mut current, &v, true);
+                    append_splittable(&mut fields, &mut current, &v, true, &ifs);
                 }
                 Chunk::ProcSubOut { raw } => {
                     let raw = raw.clone();
                     let v = self.run_proc_sub_out(&raw);
-                    append_splittable(&mut fields, &mut current, &v, true);
+                    append_splittable(&mut fields, &mut current, &v, true, &ifs);
                 }
             }
         }
@@ -1995,6 +1999,17 @@ impl Shell {
             fields.push(c);
         }
         fields
+    }
+
+    // The default IFS (" \t\n") when the variable is truly unset; its
+    // actual value (which may be empty, meaning "don't split at all")
+    // whenever it's been assigned, even to "".
+    fn get_ifs(&self) -> String {
+        if self.var_is_set("IFS") {
+            self.lookup_var("IFS")
+        } else {
+            " \t\n".to_string()
+        }
     }
 
     // Re-lexes and expands a captured raw operand (the "word"/"pattern"
@@ -2439,23 +2454,118 @@ fn here_string_file(content: &str) -> Result<std::fs::File, String> {
 // "prey"). A purely empty-or-whitespace unquoted value contributes nothing
 // (matching bash: an unquoted unset/empty variable standing alone
 // contributes zero arguments, not one empty one).
-fn append_splittable(fields: &mut Vec<String>, current: &mut Option<String>, v: &str, quoted: bool) {
+// Real bash IFS semantics: a run of IFS-whitespace characters (IFS chars
+// that are also whitespace) collapses into a single delimiter and is
+// trimmed from the very start/end of the value; each occurrence of an
+// IFS *non*-whitespace character (e.g. ':') is its own separate delimiter,
+// significant even with nothing but another separator on either side (so
+// "a::b" with IFS=":" is three fields: "a", "", "b"). A whitespace run
+// immediately touching a non-whitespace separator on either side is
+// absorbed into that same delimiter ("a : b" with IFS=" :" is "a","b" --
+// not "a","","b"). Returns (parts, leading_sep, trailing_sep): the two
+// bools tell the caller whether the first/last part is a complete,
+// standalone field or should stitch onto whatever's pending from an
+// adjacent chunk (see append_splittable).
+fn ifs_tokenize(v: &str, ifs: &str) -> (Vec<String>, bool, bool) {
+    let is_ws = |c: char| c.is_whitespace() && ifs.contains(c);
+    let is_sep = |c: char| ifs.contains(c);
+    let chars: Vec<char> = v.chars().collect();
+    let n = chars.len();
+
+    let mut i = 0;
+    while i < n && is_ws(chars[i]) {
+        i += 1;
+    }
+    let leading_sep = i > 0;
+    if i >= n {
+        return (Vec::new(), leading_sep, false);
+    }
+
+    let mut parts = Vec::new();
+    let mut trailing_sep = false;
+    loop {
+        let start = i;
+        while i < n && !is_sep(chars[i]) {
+            i += 1;
+        }
+        parts.push(chars[start..i].iter().collect::<String>());
+        if i >= n {
+            break;
+        }
+        while i < n && is_ws(chars[i]) {
+            i += 1;
+        }
+        if i < n && is_sep(chars[i]) {
+            i += 1;
+            while i < n && is_ws(chars[i]) {
+                i += 1;
+            }
+        }
+        if i >= n {
+            // A delimiter at the very end of the string is dropped
+            // without producing a trailing empty field -- unlike an
+            // *embedded* separator (e.g. "a::b" is still "a","","b"),
+            // confirmed against real bash: "a:" with IFS=":" splits to
+            // exactly one field, "a", not ["a", ""].
+            trailing_sep = true;
+            break;
+        }
+    }
+    (parts, leading_sep, trailing_sep)
+}
+
+// Finds the next IFS-delimited field in `s` (which is assumed to already
+// have any leading separator trimmed), returning (field, remainder-with-
+// its-own-leading-separator-trimmed). None if `s` contains no further
+// delimiter at all. Used by `read NAME1 NAME2 ...`, which needs the
+// untouched remainder text for its last variable rather than a fully
+// re-tokenized-and-rejoined value.
+fn ifs_next_field(s: &str, ifs: &str) -> Option<(String, String)> {
+    let is_ws = |c: char| c.is_whitespace() && ifs.contains(c);
+    let is_sep = |c: char| ifs.contains(c);
+    let chars: Vec<char> = s.chars().collect();
+    let n = chars.len();
+    let mut i = 0;
+    while i < n && !is_sep(chars[i]) {
+        i += 1;
+    }
+    if i >= n {
+        return None;
+    }
+    let field: String = chars[..i].iter().collect();
+    while i < n && is_ws(chars[i]) {
+        i += 1;
+    }
+    if i < n && is_sep(chars[i]) {
+        i += 1;
+        while i < n && is_ws(chars[i]) {
+            i += 1;
+        }
+    }
+    Some((field, chars[i..].iter().collect()))
+}
+
+fn append_splittable(fields: &mut Vec<String>, current: &mut Option<String>, v: &str, quoted: bool, ifs: &str) {
     if quoted {
         current.get_or_insert_with(String::new).push_str(v);
         return;
     }
-    let leading_ws = v.starts_with(char::is_whitespace);
-    let trailing_ws = v.ends_with(char::is_whitespace);
-    let parts: Vec<&str> = v.split_whitespace().collect();
+    if v.is_empty() {
+        return;
+    }
+    if ifs.is_empty() {
+        // IFS set to the empty string: no splitting at all.
+        current.get_or_insert_with(String::new).push_str(v);
+        return;
+    }
+    let (parts, leading_sep, trailing_sep) = ifs_tokenize(v, ifs);
     if parts.is_empty() {
-        if !v.is_empty() {
-            if let Some(c) = current.take() {
-                fields.push(c);
-            }
+        if let Some(c) = current.take() {
+            fields.push(c);
         }
         return;
     }
-    if leading_ws {
+    if leading_sep {
         if let Some(c) = current.take() {
             fields.push(c);
         }
@@ -2466,7 +2576,7 @@ fn append_splittable(fields: &mut Vec<String>, current: &mut Option<String>, v: 
         }
         current.get_or_insert_with(String::new).push_str(part);
     }
-    if trailing_ws {
+    if trailing_sep {
         fields.push(current.take().unwrap_or_default());
     }
 }
