@@ -1433,6 +1433,44 @@ impl Shell {
                     Err(_) => return ExecResult::Status(1),
                 }
             }
+            // mapfile/readarray [-t] [name]. Reads lines from stdin (or
+            // this command's own `<` redirect, via the same
+            // read_input_source machinery `read` uses) into an indexed
+            // array, one element per line -- default array name MAPFILE.
+            // Only `-t` (strip trailing newlines) is recognized; other
+            // real bash flags (-n/-O/-s/-C/-c/-u/-d) are accepted and
+            // ignored rather than erroring, a scoped subset covering the
+            // overwhelmingly common `mapfile -t arr < file` usage.
+            "mapfile" | "readarray" => {
+                let mut strip_newline = false;
+                let mut array_name = "MAPFILE".to_string();
+                for a in &argv[1..] {
+                    match a.as_str() {
+                        "-t" => strip_newline = true,
+                        other if !other.starts_with('-') => array_name = other.to_string(),
+                        _ => {}
+                    }
+                }
+                let mut reader = self.read_input_source(cmd);
+                let mut map = std::collections::BTreeMap::new();
+                let mut idx = 0usize;
+                loop {
+                    let mut line = String::new();
+                    match std::io::BufRead::read_line(&mut *reader, &mut line) {
+                        Ok(0) => break,
+                        Ok(_) => {
+                            if strip_newline {
+                                line = line.trim_end_matches(['\n', '\r']).to_string();
+                            }
+                            map.insert(idx, line);
+                            idx += 1;
+                        }
+                        Err(_) => break,
+                    }
+                }
+                self.arrays.insert(array_name, map);
+                return ExecResult::Status(0);
+            }
             "eval" => {
                 let src = argv[1..].join(" ");
                 return self.run_source_here(&src, "eval");
