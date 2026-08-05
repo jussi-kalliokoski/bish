@@ -1,6 +1,20 @@
 pub fn cd(args: &[String]) -> i32 {
+    let old = std::env::current_dir().ok().map(|p| p.to_string_lossy().into_owned());
     let target = if let Some(dir) = args.first() {
-        dir.clone()
+        if dir == "-" {
+            match std::env::var("OLDPWD") {
+                Ok(p) => {
+                    println!("{}", p);
+                    p
+                }
+                Err(_) => {
+                    eprintln!("cd: OLDPWD not set");
+                    return 1;
+                }
+            }
+        } else {
+            dir.clone()
+        }
     } else {
         match std::env::var("HOME") {
             Ok(h) => h,
@@ -11,7 +25,17 @@ pub fn cd(args: &[String]) -> i32 {
         }
     };
     match std::env::set_current_dir(&target) {
-        Ok(()) => 0,
+        Ok(()) => {
+            unsafe {
+                if let Some(o) = old {
+                    std::env::set_var("OLDPWD", o);
+                }
+                if let Ok(new_pwd) = std::env::current_dir() {
+                    std::env::set_var("PWD", new_pwd.to_string_lossy().into_owned());
+                }
+            }
+            0
+        }
         Err(e) => {
             eprintln!("cd: {}: {}", target, e);
             1

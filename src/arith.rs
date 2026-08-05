@@ -4,7 +4,7 @@
 // operators) so reusing the shell tokenizer would just add indirection.
 
 pub trait VarContext {
-    fn get(&self, name: &str) -> i64;
+    fn get(&mut self, name: &str) -> i64;
     fn set(&mut self, name: &str, value: i64);
 }
 

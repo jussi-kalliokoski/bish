@@ -855,7 +855,7 @@ impl<'a> Lexer<'a> {
     }
 
     fn read_var_name(&mut self) -> String {
-        if matches!(self.chars.peek().copied(), Some('?') | Some('#') | Some('@') | Some('*') | Some('$') | Some('!')) {
+        if matches!(self.chars.peek().copied(), Some('?') | Some('#') | Some('@') | Some('*') | Some('$') | Some('!') | Some('-')) {
             self.chars.next().unwrap().to_string()
         } else {
             let mut name = String::new();
@@ -1088,7 +1088,7 @@ fn parse_brace_content(inner: &str) -> BraceContent {
     let mut name_end = 0;
     let mut chars = inner.char_indices();
     if let Some((_, c)) = chars.next() {
-        if matches!(c, '?' | '#' | '@' | '*' | '$' | '!') {
+        if matches!(c, '?' | '#' | '@' | '*' | '$' | '!' | '-') {
             name_end = c.len_utf8();
         } else if c.is_alphanumeric() || c == '_' {
             name_end = c.len_utf8();

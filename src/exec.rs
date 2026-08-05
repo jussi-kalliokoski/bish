@@ -68,6 +68,20 @@ pub struct Shell {
     // Every proc-sub temp file created for the command currently being
     // built, deleted once it finishes (drain_proc_subs).
     proc_sub_cleanup: Vec<String>,
+    // $RANDOM: xorshift64* state, reseeded from the current time at
+    // startup (no external RNG crate). Advanced on every read.
+    rng_state: u64,
+    // $SECONDS: wall-clock time the shell started, so `$SECONDS` reads as
+    // elapsed-since-start by default. `SECONDS=n` (bash lets you reset the
+    // counter) is handled by assign_var recording an offset instead of
+    // trying to rewind this.
+    shell_start: std::time::Instant,
+    seconds_offset: i64,
+    // $!: PID of the most recently backgrounded command. There's no job
+    // table (job control is out of scope), just this one slot -- enough
+    // for the extremely common `cmd & ...; wait $!`-adjacent `$!` reads,
+    // though `wait` itself isn't implemented.
+    last_bg_pid: Option<u32>,
     // `trap CMD EXIT` handler. Only EXIT is implemented -- real signal traps
     // (INT/TERM/...) would need OS signal-handling machinery this
     // dependency-free, single-process design doesn't have; `trap` warns
@@ -106,6 +120,17 @@ impl Shell {
             readonly_names: std::collections::HashSet::new(),
             proc_sub_out_pending: Vec::new(),
             proc_sub_cleanup: Vec::new(),
+            rng_state: {
+                let seed = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos() as u64)
+                    .unwrap_or(0x2545F4914F6CDD1D)
+                    ^ (std::process::id() as u64).wrapping_mul(0x9E3779B97F4A7C15);
+                if seed == 0 { 0x2545F4914F6CDD1D } else { seed }
+            },
+            shell_start: std::time::Instant::now(),
+            seconds_offset: 0,
+            last_bg_pid: None,
             exit_trap: None,
             opt_errexit: false,
             opt_nounset: false,
@@ -708,6 +733,7 @@ impl Shell {
         match command.spawn() {
             Ok(mut child) => {
                 if background {
+                    self.last_bg_pid = Some(child.id());
                     std::thread::spawn(move || {
                         let _ = child.wait();
                     });
@@ -1525,6 +1551,7 @@ impl Shell {
         match command.spawn() {
             Ok(mut child) => {
                 if background {
+                    self.last_bg_pid = Some(child.id());
                     std::thread::spawn(move || {
                         let _ = child.wait();
                     });
@@ -1652,6 +1679,9 @@ impl Shell {
         }
 
         if background {
+            // $!: bash reports the PID of the *last* command in a
+            // backgrounded pipeline.
+            self.last_bg_pid = children.last().map(|c| c.id());
             std::thread::spawn(move || {
                 for mut c in children {
                     let _ = c.wait();
@@ -2004,7 +2034,7 @@ impl Shell {
     // The default IFS (" \t\n") when the variable is truly unset; its
     // actual value (which may be empty, meaning "don't split at all")
     // whenever it's been assigned, even to "".
-    fn get_ifs(&self) -> String {
+    fn get_ifs(&mut self) -> String {
         if self.var_is_set("IFS") {
             self.lookup_var("IFS")
         } else {
@@ -2193,12 +2223,34 @@ impl Shell {
         out
     }
 
-    fn lookup_var(&self, name: &str) -> String {
+    fn lookup_var(&mut self, name: &str) -> String {
         match name {
             "?" => self.last_status.to_string(),
             "0" => self.script_name.clone(),
             "#" => self.arg_frames.last().map(|a| a.len()).unwrap_or(0).to_string(),
             "@" | "*" => self.arg_frames.last().map(|a| a.join(" ")).unwrap_or_default(),
+            // $$/$!/$RANDOM/$SECONDS/$- are always computed live, never
+            // read back from var_scopes/env, matching how bash treats them
+            // as effectively magic rather than ordinary settable
+            // variables (SECONDS is the one partial exception -- see
+            // assign_var's special-case for `SECONDS=n`).
+            "$" => std::process::id().to_string(),
+            "!" => self.last_bg_pid.map(|p| p.to_string()).unwrap_or_default(),
+            "RANDOM" => self.next_random().to_string(),
+            "SECONDS" => (self.shell_start.elapsed().as_secs() as i64 + self.seconds_offset).to_string(),
+            "-" => {
+                let mut s = String::new();
+                if self.opt_errexit {
+                    s.push('e');
+                }
+                if self.opt_nounset {
+                    s.push('u');
+                }
+                if self.opt_xtrace {
+                    s.push('x');
+                }
+                s
+            }
             _ if !name.is_empty() && name.chars().all(|c| c.is_ascii_digit()) => {
                 let idx: usize = name.parse().unwrap_or(0);
                 idx.checked_sub(1)
@@ -2212,7 +2264,21 @@ impl Shell {
                         return v.clone();
                     }
                 }
-                std::env::var(name).unwrap_or_default()
+                if let Ok(v) = std::env::var(name) {
+                    return v;
+                }
+                // Startup-populated-in-real-bash variables: computed on
+                // demand here instead, but still overridable by a normal
+                // assignment (checked above) since that's the common bash
+                // behavior for all of these once actually set.
+                match name {
+                    "BASH_VERSION" => "5.2.21(1)-release".to_string(),
+                    "PPID" => unsafe { getppid() }.to_string(),
+                    "UID" => unsafe { getuid() }.to_string(),
+                    "EUID" => unsafe { geteuid() }.to_string(),
+                    "HOSTNAME" => get_hostname(),
+                    _ => String::new(),
+                }
             }
         }
     }
@@ -2222,6 +2288,17 @@ impl Shell {
     // explicitly exempt in bash (checking for unset is their whole point),
     // so this is only called from the plain Chunk::Var expansion sites, not
     // from eval_var_op/eval_array_var_op.
+    // xorshift64* -- simple, fast, no external RNG crate. Bash's $RANDOM
+    // range is 0..32767.
+    fn next_random(&mut self) -> u32 {
+        let mut x = self.rng_state;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.rng_state = x;
+        ((x >> 33) % 32768) as u32
+    }
+
     fn check_nounset(&mut self, name: &str) {
         if !self.opt_nounset {
             return;
@@ -2239,8 +2316,27 @@ impl Shell {
     // `${V-x}`/`${V+x}` (unset only) need vs. `${V:-x}`/`${V:+x}` (unset OR
     // empty). Special/positional parameters always count as set.
     fn var_is_set(&self, name: &str) -> bool {
-        let is_special = matches!(name, "?" | "0" | "#" | "@" | "*")
-            || (!name.is_empty() && name.chars().all(|c| c.is_ascii_digit()));
+        // Special/positional parameters and the magic variables
+        // lookup_var computes on demand (RANDOM, SECONDS, PPID, ...) are
+        // always considered set, even under `set -u` -- matching bash,
+        // which never treats these as unbound.
+        let is_special = matches!(
+            name,
+            "?" | "0"
+                | "#"
+                | "@"
+                | "*"
+                | "$"
+                | "!"
+                | "-"
+                | "RANDOM"
+                | "SECONDS"
+                | "BASH_VERSION"
+                | "PPID"
+                | "UID"
+                | "EUID"
+                | "HOSTNAME"
+        ) || (!name.is_empty() && name.chars().all(|c| c.is_ascii_digit()));
         if is_special {
             return true;
         }
@@ -2258,6 +2354,24 @@ impl Shell {
     fn assign_var(&mut self, name: &str, value: String) {
         if self.readonly_names.contains(name) {
             eprintln!("ash: {}: readonly variable", name);
+            return;
+        }
+        // `SECONDS=n` resets the elapsed-time counter to start counting
+        // from n, matching bash -- lookup_var computes it live rather
+        // than storing it, so the assignment records an offset instead of
+        // writing a var_scopes/env entry.
+        if name == "SECONDS" {
+            if let Ok(n) = value.trim().parse::<i64>() {
+                self.seconds_offset = n - self.shell_start.elapsed().as_secs() as i64;
+            }
+            return;
+        }
+        // `RANDOM=n` reseeds the generator, matching bash (rather than
+        // making $RANDOM a static value forever).
+        if name == "RANDOM" {
+            if let Ok(n) = value.trim().parse::<u64>() {
+                self.rng_state = if n == 0 { 0x2545F4914F6CDD1D } else { n };
+            }
             return;
         }
         for scope in self.var_scopes.iter_mut().rev() {
@@ -2380,7 +2494,7 @@ impl Shell {
 }
 
 impl arith::VarContext for Shell {
-    fn get(&self, name: &str) -> i64 {
+    fn get(&mut self, name: &str) -> i64 {
         self.lookup_var(name).trim().parse().unwrap_or(0)
     }
 
@@ -2410,6 +2524,27 @@ struct ResolvedRedirs {
 // narrow post-fork window; declared directly via extern "C" rather than
 // pulling in the `libc` crate, since libc is already linked into any
 // dynamically-linked Unix binary regardless.
+// $PPID/$UID/$EUID: raw libc calls declared directly via extern "C" (same
+// justification as dup2_stderr_to_stdout -- libc is already linked into
+// any dynamically-linked Unix binary, no external crate needed) since std
+// has no portable getppid/getuid/geteuid wrapper.
+unsafe extern "C" {
+    fn getppid() -> i32;
+    fn getuid() -> u32;
+    fn geteuid() -> u32;
+}
+
+// $HOSTNAME: bash populates this at startup from uname(); Linux exposes
+// the same value via this proc file, which avoids yet another raw
+// syscall. Falls back to the HOSTNAME env var (some environments export
+// it already) and then to empty.
+fn get_hostname() -> String {
+    if let Ok(s) = std::fs::read_to_string("/proc/sys/kernel/hostname") {
+        return s.trim_end().to_string();
+    }
+    std::env::var("HOSTNAME").unwrap_or_default()
+}
+
 fn dup2_stderr_to_stdout(command: &mut Command) {
     unsafe extern "C" {
         fn dup2(oldfd: i32, newfd: i32) -> i32;
