@@ -15,6 +15,15 @@ fn match_here(pat: &[u8], text: &[u8]) -> bool {
     if pat.is_empty() {
         return text.is_empty();
     }
+    // Backslash-escape: `\c` matches a literal `c`, whatever `c` is (even
+    // one of the metacharacters below). Needed so a pattern built from a
+    // partly-quoted word (see escape() and expand_glob_pattern in exec.rs)
+    // can represent "this piece is literal text" for the quoted chunks
+    // while unquoted chunks stay real glob syntax, mirroring how the same
+    // word is already handled for the `=~` regex operand.
+    if pat[0] == b'\\' && pat.len() > 1 {
+        return !text.is_empty() && text[0] == pat[1] && match_here(&pat[2..], &text[1..]);
+    }
     if matches!(pat[0], b'@' | b'!' | b'+' | b'*' | b'?') && pat.len() > 1 && pat[1] == b'(' {
         if let Some((alts, group, rest)) = find_group(&pat[1..]) {
             return match_extglob(pat[0], &alts, group, rest, text);
@@ -156,6 +165,23 @@ fn match_class(pat: &[u8], c: Option<u8>) -> Option<(bool, &[u8])> {
 pub fn has_meta(s: &str) -> bool {
     s.chars().any(|c| c == '*' || c == '?' || c == '[')
         || ["@(", "!(", "+("].iter().any(|p| s.contains(p))
+}
+
+// Escapes every character match_here treats specially, so the result --
+// spliced into a larger pattern -- matches only the literal input text.
+// Used by expand_glob_pattern (exec.rs) to render a word's quoted/expanded
+// chunks as inert literal text within an otherwise-real glob pattern built
+// from the word's unquoted chunks, the same per-chunk approach already
+// used for `[[ =~ ]]`'s regex operand (see regex::escape).
+pub fn escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if "*?[\\@!+(".contains(c) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
 }
 
 // Expands a glob pattern against the filesystem. Only the final path

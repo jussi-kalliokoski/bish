@@ -3070,13 +3070,30 @@ impl Shell {
     // lexer level. Only used where splitting actually applies (command
     // argv, `for` word-lists) -- assignment RHS, case words, redirect
     // targets, etc. still go through plain expand_word.
-    fn expand_word_split(&mut self, w: &Word) -> Vec<String> {
+    // Returns (fields, patterns): `fields` is the word-split display text,
+    // exactly as before; `patterns` is an index-aligned second copy of the
+    // same fields but with every *quoted* chunk's contribution escaped via
+    // glob::escape (unquoted chunks -- including their expansion results,
+    // e.g. an unquoted `$var` whose value happens to contain `*` -- stay
+    // raw glob syntax). expand_words glob-expands each field against its
+    // paired pattern, falling back to the literal field text when the
+    // pattern has no metachars or no filesystem matches. Building both in
+    // one pass (rather than a second, expand_regex_operand-style walk)
+    // matters here specifically because this function's expansions can
+    // have side effects (command substitution, ${x:=default}, `$((x++))`)
+    // that must not run twice.
+    fn expand_word_split(&mut self, w: &Word) -> (Vec<String>, Vec<String>) {
         let ifs = self.get_ifs();
         let mut fields: Vec<String> = Vec::new();
         let mut current: Option<String> = None;
+        let mut patterns: Vec<String> = Vec::new();
+        let mut pattern_current: Option<String> = None;
         for c in &w.chunks {
             match c {
-                Chunk::Str(t) | Chunk::LiteralStr(t) => current.get_or_insert_with(String::new).push_str(t),
+                Chunk::Str(t) | Chunk::LiteralStr(t) => {
+                    current.get_or_insert_with(String::new).push_str(t);
+                    pattern_current.get_or_insert_with(String::new).push_str(t);
+                }
                 Chunk::Var { name, quoted } => {
                     // "$@" is a special case even when quoted: it expands
                     // to one field per positional parameter (as if each
@@ -3087,17 +3104,17 @@ impl Shell {
                     // unquoted).
                     if name == "@" && *quoted {
                         let parts = self.arg_frames.last().cloned().unwrap_or_default();
-                        append_parts(&mut fields, &mut current, &parts);
+                        append_parts_glob(&mut fields, &mut current, &mut patterns, &mut pattern_current, &parts);
                     } else {
                         let name = name.clone();
                         self.check_nounset(&name);
                         let v = self.lookup_var(&name);
-                        append_splittable(&mut fields, &mut current, &v, *quoted, &ifs);
+                        append_splittable_glob(&mut fields, &mut current, &mut patterns, &mut pattern_current, &v, *quoted, &ifs);
                     }
                 }
                 Chunk::Sub { raw, quoted } => {
                     let v = self.run_command_substitution(raw);
-                    append_splittable(&mut fields, &mut current, &v, *quoted, &ifs);
+                    append_splittable_glob(&mut fields, &mut current, &mut patterns, &mut pattern_current, &v, *quoted, &ifs);
                 }
                 Chunk::Arith { raw, quoted } => {
                     let v = match arith::eval(raw, self) {
@@ -3107,13 +3124,13 @@ impl Shell {
                             String::new()
                         }
                     };
-                    append_splittable(&mut fields, &mut current, &v, *quoted, &ifs);
+                    append_splittable_glob(&mut fields, &mut current, &mut patterns, &mut pattern_current, &v, *quoted, &ifs);
                 }
                 Chunk::VarExpand { name, op, quoted } => {
                     let name = name.clone();
                     let op = op.clone();
                     let v = self.eval_var_op(&name, &op);
-                    append_splittable(&mut fields, &mut current, &v, *quoted, &ifs);
+                    append_splittable_glob(&mut fields, &mut current, &mut patterns, &mut pattern_current, &v, *quoted, &ifs);
                 }
                 Chunk::ArrayVar { name, index, quoted } => {
                     // "${arr[@]}" is the array analog of "$@": one field per
@@ -3122,62 +3139,65 @@ impl Shell {
                     // first, like $*.
                     if index == "@" && *quoted {
                         let items = self.array_all(name);
-                        append_parts(&mut fields, &mut current, &items);
+                        append_parts_glob(&mut fields, &mut current, &mut patterns, &mut pattern_current, &items);
                     } else if index == "@" || index == "*" {
                         let joined = self.array_all(name).join(" ");
-                        append_splittable(&mut fields, &mut current, &joined, *quoted, &ifs);
+                        append_splittable_glob(&mut fields, &mut current, &mut patterns, &mut pattern_current, &joined, *quoted, &ifs);
                     } else {
                         let name = name.clone();
                         let index = index.clone();
                         let v = self.array_element(&name, &index);
-                        append_splittable(&mut fields, &mut current, &v, *quoted, &ifs);
+                        append_splittable_glob(&mut fields, &mut current, &mut patterns, &mut pattern_current, &v, *quoted, &ifs);
                     }
                 }
                 Chunk::ArrayLength { name, index } => {
                     let name = name.clone();
                     let index = index.clone();
                     let v = self.array_length(&name, &index).to_string();
-                    append_splittable(&mut fields, &mut current, &v, true, &ifs);
+                    append_splittable_glob(&mut fields, &mut current, &mut patterns, &mut pattern_current, &v, true, &ifs);
                 }
                 Chunk::ArrayVarExpand { name, index, op, quoted } => {
                     let name = name.clone();
                     let index = index.clone();
                     let op = op.clone();
                     let v = self.eval_array_var_op(&name, &index, &op);
-                    append_splittable(&mut fields, &mut current, &v, *quoted, &ifs);
+                    append_splittable_glob(&mut fields, &mut current, &mut patterns, &mut pattern_current, &v, *quoted, &ifs);
                 }
                 Chunk::Indirect { name, quoted } => {
                     let target = self.lookup_var(name);
                     let v = self.lookup_var(&target);
-                    append_splittable(&mut fields, &mut current, &v, *quoted, &ifs);
+                    append_splittable_glob(&mut fields, &mut current, &mut patterns, &mut pattern_current, &v, *quoted, &ifs);
                 }
                 Chunk::ArrayKeys { name, quoted } => {
                     // Same @-vs-* / quoted-vs-not splitting rules as
                     // ${arr[@]}: "@" quoted is one field per key.
                     if *quoted {
                         let items = self.array_keys(name);
-                        append_parts(&mut fields, &mut current, &items);
+                        append_parts_glob(&mut fields, &mut current, &mut patterns, &mut pattern_current, &items);
                     } else {
                         let joined = self.array_keys(name).join(" ");
-                        append_splittable(&mut fields, &mut current, &joined, *quoted, &ifs);
+                        append_splittable_glob(&mut fields, &mut current, &mut patterns, &mut pattern_current, &joined, *quoted, &ifs);
                     }
                 }
                 Chunk::ProcSubIn { raw } => {
                     let raw = raw.clone();
                     let v = self.run_proc_sub_in(&raw);
-                    append_splittable(&mut fields, &mut current, &v, true, &ifs);
+                    append_splittable_glob(&mut fields, &mut current, &mut patterns, &mut pattern_current, &v, true, &ifs);
                 }
                 Chunk::ProcSubOut { raw } => {
                     let raw = raw.clone();
                     let v = self.run_proc_sub_out(&raw);
-                    append_splittable(&mut fields, &mut current, &v, true, &ifs);
+                    append_splittable_glob(&mut fields, &mut current, &mut patterns, &mut pattern_current, &v, true, &ifs);
                 }
             }
         }
         if let Some(c) = current {
             fields.push(c);
         }
-        fields
+        if let Some(c) = pattern_current {
+            patterns.push(c);
+        }
+        (fields, patterns)
     }
 
     // The default IFS (" \t\n") when the variable is truly unset; its
@@ -3368,7 +3388,17 @@ impl Shell {
                 }
                 out.push(s);
             } else {
-                out.extend(self.expand_word_split(w));
+                let (fields, patterns) = self.expand_word_split(w);
+                if self.opt_noglob {
+                    out.extend(fields);
+                } else {
+                    for (f, p) in fields.into_iter().zip(patterns.into_iter()) {
+                        match glob::expand(&p) {
+                            Some(matches) => out.extend(matches),
+                            None => out.push(f),
+                        }
+                    }
+                }
             }
         }
         out
@@ -4584,6 +4614,43 @@ fn append_parts(fields: &mut Vec<String>, current: &mut Option<String>, parts: &
         }
         current.get_or_insert_with(String::new).push_str(part);
     }
+}
+
+// Pairs append_splittable's field-boundary logic with a second, escaped
+// copy of the same value for glob-pattern purposes (see expand_word_split).
+// glob::escape only ever inserts backslashes before `*?[\@!+(`, none of
+// which are whitespace, so splitting the escaped copy on the same IFS
+// lands on the same boundaries as splitting `v` itself -- except in the
+// pathological case of an IFS that itself contains one of those
+// characters, an accepted, exceedingly rare edge case.
+fn append_splittable_glob(
+    fields: &mut Vec<String>,
+    current: &mut Option<String>,
+    patterns: &mut Vec<String>,
+    pattern_current: &mut Option<String>,
+    v: &str,
+    quoted: bool,
+    ifs: &str,
+) {
+    append_splittable(fields, current, v, quoted, ifs);
+    let p = if quoted { crate::glob::escape(v) } else { v.to_string() };
+    append_splittable(patterns, pattern_current, &p, quoted, ifs);
+}
+
+// append_parts' counterpart to append_splittable_glob. "$@"/array-keys
+// parts always arrive already-quoted (that's why append_parts exists, as
+// opposed to append_splittable), so every part is escaped for the pattern
+// copy -- these fields are never glob-eligible.
+fn append_parts_glob(
+    fields: &mut Vec<String>,
+    current: &mut Option<String>,
+    patterns: &mut Vec<String>,
+    pattern_current: &mut Option<String>,
+    parts: &[String],
+) {
+    append_parts(fields, current, parts);
+    let escaped: Vec<String> = parts.iter().map(|p| crate::glob::escape(p)).collect();
+    append_parts(patterns, pattern_current, &escaped);
 }
 
 fn strip_prefix_glob(s: &str, pattern: &str, longest: bool) -> String {
