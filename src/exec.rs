@@ -2548,11 +2548,7 @@ impl Shell {
             // exec CMD [args...] replaces this process image entirely (no
             // fork, no return on success) -- exactly what real bash does,
             // and available here as safe std (CommandExt::exec wraps
-            // execvp, distinct from the fork() this shell avoids). Bare
-            // `exec` with no command (only used to permanently redirect the
-            // current shell's own stdio) isn't implemented -- that needs
-            // real fd dup2 onto this process, which safe std has no path
-            // to; it's a no-op here rather than silently wrong.
+            // execvp, distinct from the fork() this shell avoids).
             "exec" if argv.len() > 1 => {
                 let redirs = match self.resolve_redirects(cmd) {
                     Ok(r) => r,
@@ -2572,6 +2568,14 @@ impl Shell {
                 if let Some(s) = redirs.stderr {
                     command.stderr(s);
                 }
+                // Numbered-fd forms (`exec cmd 3>file`) can't go through
+                // apply_fd_redirects' pre_exec hook -- CommandExt::exec
+                // below is a direct execve of *this* process, no fork, so
+                // there's no child to install a pre_exec closure into.
+                if let Err(e) = apply_fds_to_self(redirs.dup_stderr_to_stdout, redirs.extra_fds) {
+                    eprintln!("ash: exec: {}", e);
+                    return ExecResult::Status(1);
+                }
                 let err = command.exec();
                 eprintln!("ash: exec: {}: {}", argv[1], err);
                 // Real bash: a non-interactive shell exits immediately when
@@ -2582,7 +2586,27 @@ impl Shell {
                 self.run_exit_trap();
                 std::process::exit(self.last_status);
             }
-            "exec" => return ExecResult::Status(0),
+            // Bare `exec` (no command word): persistently applies its
+            // numbered-fd redirects (`exec 3>file`, `exec 3>&1`,
+            // `exec 3>&-`) to this shell's own process, so subsequently
+            // spawned commands inherit them -- e.g. the classic
+            // `exec 3>&1 1>logfile; cmd; exec 1>&3 3>&-` log-redirection
+            // idiom. Plain `exec > file` (implicit fd 0/1/2) isn't covered
+            // here -- see apply_fds_to_self's doc comment.
+            "exec" => {
+                let redirs = match self.resolve_redirects(cmd) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        eprintln!("ash: {}", e);
+                        return ExecResult::Status(1);
+                    }
+                };
+                if let Err(e) = apply_fds_to_self(redirs.dup_stderr_to_stdout, redirs.extra_fds) {
+                    eprintln!("ash: exec: {}", e);
+                    return ExecResult::Status(1);
+                }
+                return ExecResult::Status(0);
+            }
             _ => {}
         }
 
@@ -4155,6 +4179,68 @@ fn stdin_ready(timeout_ms: i32) -> bool {
 // the normal src != dst case, since dup2 already clears it there) makes
 // this correct regardless of whether the dup2 was a genuine duplicate or
 // this same-fd no-op.
+// Applies numbered-fd redirects (dup2/close) directly to *this* process,
+// for `exec`'s redirect-only form (`exec 3>file`, `exec 3>&1`, `exec
+// 3>&-`) -- unlike every other spawn site in this file, there's no pre_exec
+// hook here since nothing is being forked; this just runs the same dup2/
+// close logic inline, before continuing (bare exec) or before calling
+// CommandExt::exec (exec CMD). Scoped to the numbered-fd forms specifically
+// (extra_fds/dup_stderr_to_stdout) -- plain `exec > file` (implicit fd
+// 0/1/2) goes through a completely different Option<Stdio>-based resolution
+// path elsewhere in this file that isn't wired up to apply to the current
+// process, a separate, narrower remaining gap.
+fn apply_fds_to_self(dup_stderr_to_stdout: bool, extra_fds: Vec<ExtraFd>) -> Result<(), String> {
+    unsafe extern "C" {
+        fn dup2(oldfd: i32, newfd: i32) -> i32;
+        fn close(fd: i32) -> i32;
+    }
+    if dup_stderr_to_stdout {
+        if unsafe { dup2(1, 2) } == -1 {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        clear_cloexec(2);
+    }
+    for ef in extra_fds {
+        match ef {
+            ExtraFd::Open { fd, file } => {
+                let srcfd = std::os::unix::io::AsRawFd::as_raw_fd(&file);
+                if unsafe { dup2(srcfd, fd) } == -1 {
+                    return Err(std::io::Error::last_os_error().to_string());
+                }
+                clear_cloexec(fd);
+                // Unlike apply_fd_redirects' pre_exec path (where the
+                // process image gets replaced by execve right after,
+                // bypassing Rust-level Drop entirely, .exec() failure
+                // notwithstanding -- and even then via _exit, not normal
+                // unwinding), this function returns normally and lets its
+                // locals drop like any other Rust code. If `file`'s own fd
+                // happened to already equal the target (a real
+                // possibility, same as the pre_exec case), dropping it
+                // here would close the very fd this function exists to
+                // keep open -- forget it instead so it isn't closed out
+                // from under the persisted redirect. When source != target
+                // there's no such risk, and letting `file` drop normally
+                // correctly closes the now-redundant source descriptor.
+                if srcfd == fd {
+                    std::mem::forget(file);
+                }
+            }
+            ExtraFd::Dup { fd, source } => {
+                if unsafe { dup2(source, fd) } == -1 {
+                    return Err(std::io::Error::last_os_error().to_string());
+                }
+                clear_cloexec(fd);
+            }
+            ExtraFd::Close(fd) => {
+                if unsafe { close(fd) } == -1 {
+                    return Err(std::io::Error::last_os_error().to_string());
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn clear_cloexec(fd: i32) {
     unsafe extern "C" {
         fn fcntl(fd: i32, cmd: i32, arg: i32) -> i32;
