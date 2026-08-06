@@ -2587,12 +2587,13 @@ impl Shell {
                 std::process::exit(self.last_status);
             }
             // Bare `exec` (no command word): persistently applies its
-            // numbered-fd redirects (`exec 3>file`, `exec 3>&1`,
-            // `exec 3>&-`) to this shell's own process, so subsequently
-            // spawned commands inherit them -- e.g. the classic
-            // `exec 3>&1 1>logfile; cmd; exec 1>&3 3>&-` log-redirection
-            // idiom. Plain `exec > file` (implicit fd 0/1/2) isn't covered
-            // here -- see apply_fds_to_self's doc comment.
+            // redirects -- numbered-fd (`exec 3>file`, `exec 3>&1`,
+            // `exec 3>&-`) and plain fd 0/1/2 (`exec > file`,
+            // `exec 2>>err.log`) alike -- to this shell's own process, so
+            // subsequently spawned commands inherit them. Covers idioms
+            // like `exec > logfile 2>&1` (whole-script output redirection)
+            // and the `exec 3>&1 1>logfile; cmd; exec 1>&3 3>&-` fd-
+            // juggling trick.
             "exec" => {
                 let redirs = match self.resolve_redirects(cmd) {
                     Ok(r) => r,
@@ -2601,6 +2602,17 @@ impl Shell {
                         return ExecResult::Status(1);
                     }
                 };
+                let (stdin, stdout, stderr) = match self.resolve_plain_fd012(&cmd.redirects) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        eprintln!("ash: {}", e);
+                        return ExecResult::Status(1);
+                    }
+                };
+                if let Err(e) = apply_fd012_to_self(stdin, stdout, stderr) {
+                    eprintln!("ash: exec: {}", e);
+                    return ExecResult::Status(1);
+                }
                 if let Err(e) = apply_fds_to_self(redirs.dup_stderr_to_stdout, redirs.extra_fds) {
                     eprintln!("ash: exec: {}", e);
                     return ExecResult::Status(1);
@@ -3676,6 +3688,74 @@ impl Shell {
         target
     }
 
+    // The plain-fd-0/1/2 half of `exec`'s redirect-only form (`exec >
+    // file`, `exec 2>> file`, `exec < file`, `exec &> file`) -- a
+    // dedicated resolver rather than reusing resolve_redirect_list's
+    // Option<Stdio> output because Stdio doesn't expose its underlying fd
+    // for this function's caller (apply_fds_to_self) to dup2 onto 0/1/2 of
+    // *this* process; it needs the raw File instead. Mirrors
+    // resolve_redirect_list's In/Out/Err/Both handling (last-one-wins per
+    // fd, matching real bash), skipping the numbered-fd/DupErrToOut forms
+    // since those are already covered by resolve_redirects' own
+    // extra_fds/dup_stderr_to_stdout, computed separately by the caller
+    // from the same redirect list.
+    fn resolve_plain_fd012(
+        &mut self,
+        redirects: &[Redirect],
+    ) -> Result<(Option<std::fs::File>, Option<std::fs::File>, Option<std::fs::File>), String> {
+        let mut stdin_path: Option<String> = None;
+        let mut here_string: Option<String> = None;
+        let mut stdout_target: Option<(String, bool)> = None;
+        let mut stderr_target: Option<(String, bool)> = None;
+        for r in redirects {
+            match r {
+                Redirect::In(w) => {
+                    stdin_path = Some(self.expand_word(w));
+                    here_string = None;
+                }
+                Redirect::HereString(w) => {
+                    let mut content = self.expand_word(w);
+                    content.push('\n');
+                    here_string = Some(content);
+                    stdin_path = None;
+                }
+                Redirect::HereDoc(w) => {
+                    here_string = Some(self.expand_word(w));
+                    stdin_path = None;
+                }
+                Redirect::Out { word, append } => {
+                    stdout_target = Some((self.expand_word(word), *append));
+                }
+                Redirect::Err { word, append } => {
+                    stderr_target = Some((self.expand_word(word), *append));
+                }
+                Redirect::Both { word, append } => {
+                    let p = self.expand_word(word);
+                    stdout_target = Some((p.clone(), *append));
+                    stderr_target = Some((p, *append));
+                }
+                _ => {}
+            }
+        }
+        let stdin = if let Some(content) = here_string {
+            Some(here_string_file(&content)?)
+        } else {
+            match stdin_path {
+                Some(p) => Some(std::fs::File::open(&p).map_err(|e| format!("{}: {}", p, e))?),
+                None => None,
+            }
+        };
+        let stdout = match stdout_target {
+            Some((p, append)) => Some(open_out(&p, append)?),
+            None => None,
+        };
+        let stderr = match stderr_target {
+            Some((p, append)) => Some(open_out(&p, append)?),
+            None => None,
+        };
+        Ok((stdin, stdout, stderr))
+    }
+
     fn resolve_redirect_list(&mut self, redirects: &[Redirect]) -> Result<ResolvedRedirs, String> {
         let mut stdout_target: Option<(String, bool)> = None;
         let mut stderr_target: Option<(String, bool)> = None;
@@ -4236,6 +4316,33 @@ fn apply_fds_to_self(dup_stderr_to_stdout: bool, extra_fds: Vec<ExtraFd>) -> Res
                     return Err(std::io::Error::last_os_error().to_string());
                 }
             }
+        }
+    }
+    Ok(())
+}
+
+// Persists resolve_plain_fd012's raw Files onto this process's own fd
+// 0/1/2, for `exec`'s redirect-only form. Same dup2 + clear_cloexec +
+// forget-on-self-dup pattern as apply_fds_to_self, and for the same
+// reasons (no execve immediately follows to bypass Rust's normal Drop
+// glue the way the pre_exec-based spawn path is protected).
+fn apply_fd012_to_self(
+    stdin: Option<std::fs::File>,
+    stdout: Option<std::fs::File>,
+    stderr: Option<std::fs::File>,
+) -> Result<(), String> {
+    unsafe extern "C" {
+        fn dup2(oldfd: i32, newfd: i32) -> i32;
+    }
+    for (target, file) in [(0, stdin), (1, stdout), (2, stderr)] {
+        let Some(file) = file else { continue };
+        let srcfd = std::os::unix::io::AsRawFd::as_raw_fd(&file);
+        if unsafe { dup2(srcfd, target) } == -1 {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        clear_cloexec(target);
+        if srcfd == target {
+            std::mem::forget(file);
         }
     }
     Ok(())
