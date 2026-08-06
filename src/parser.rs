@@ -15,6 +15,13 @@ pub enum Redirect {
     DupErrToOut,
     HereString(Word),
     HereDoc(Word),
+    // Arbitrary-fd forms: `N>file`/`N>>file`/`N<file` and `N>&M`/`N<&M`.
+    // Only per-command (not the persistent shell-level `exec N>file` form,
+    // which would need fds kept open for the rest of the shell's life --
+    // a documented, separate gap).
+    FdOut { fd: u32, word: Word, append: bool },
+    FdIn { fd: u32, word: Word },
+    FdDup { fd: u32, target: u32 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -584,6 +591,23 @@ impl Parser {
                     self.advance();
                     redirects.push(Redirect::DupErrToOut);
                 }
+                Some(Tok::RedirFdOut { fd, append }) => {
+                    let (fd, append) = (*fd, *append);
+                    self.advance();
+                    let word = self.expect_word()?;
+                    redirects.push(Redirect::FdOut { fd, word, append });
+                }
+                Some(Tok::RedirFdIn { fd }) => {
+                    let fd = *fd;
+                    self.advance();
+                    let word = self.expect_word()?;
+                    redirects.push(Redirect::FdIn { fd, word });
+                }
+                Some(Tok::RedirFdDup { fd, target }) => {
+                    let (fd, target) = (*fd, *target);
+                    self.advance();
+                    redirects.push(Redirect::FdDup { fd, target });
+                }
                 Some(Tok::HereString) => {
                     self.advance();
                     let word = self.expect_word()?;
@@ -673,6 +697,23 @@ impl Parser {
                 Some(Tok::DupErrToOut) => {
                     self.advance();
                     redirects.push(Redirect::DupErrToOut);
+                }
+                Some(Tok::RedirFdOut { fd, append }) => {
+                    let (fd, append) = (*fd, *append);
+                    self.advance();
+                    let word = self.expect_word()?;
+                    redirects.push(Redirect::FdOut { fd, word, append });
+                }
+                Some(Tok::RedirFdIn { fd }) => {
+                    let fd = *fd;
+                    self.advance();
+                    let word = self.expect_word()?;
+                    redirects.push(Redirect::FdIn { fd, word });
+                }
+                Some(Tok::RedirFdDup { fd, target }) => {
+                    let (fd, target) = (*fd, *target);
+                    self.advance();
+                    redirects.push(Redirect::FdDup { fd, target });
                 }
                 Some(Tok::HereString) => {
                     self.advance();

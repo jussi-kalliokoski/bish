@@ -964,9 +964,7 @@ impl Shell {
         command.stdin(redirs.stdin.unwrap_or_else(Stdio::inherit));
         command.stdout(redirs.stdout.unwrap_or_else(Stdio::inherit));
         command.stderr(redirs.stderr.unwrap_or_else(Stdio::inherit));
-        if redirs.dup_stderr_to_stdout {
-            dup2_stderr_to_stdout(&mut command);
-        }
+        apply_fd_redirects(&mut command, redirs.dup_stderr_to_stdout, redirs.extra_fds);
         match command.spawn() {
             Ok(mut child) => {
                 if background {
@@ -2104,9 +2102,7 @@ impl Shell {
         command.stdin(redirs.stdin.unwrap_or_else(Stdio::inherit));
         command.stdout(redirs.stdout.unwrap_or_else(Stdio::inherit));
         command.stderr(redirs.stderr.unwrap_or_else(Stdio::inherit));
-        if redirs.dup_stderr_to_stdout {
-            dup2_stderr_to_stdout(&mut command);
-        }
+        apply_fd_redirects(&mut command, redirs.dup_stderr_to_stdout, redirs.extra_fds);
 
         match command.spawn() {
             Ok(mut child) => {
@@ -2211,9 +2207,7 @@ impl Shell {
                     command.stdin(redirs.stdin.unwrap_or(default_stdin));
                     command.stdout(redirs.stdout.unwrap_or(default_stdout));
                     command.stderr(redirs.stderr.unwrap_or_else(Stdio::inherit));
-                    if redirs.dup_stderr_to_stdout {
-                        dup2_stderr_to_stdout(&mut command);
-                    }
+                    apply_fd_redirects(&mut command, redirs.dup_stderr_to_stdout, redirs.extra_fds);
                     command
                 }
                 other => {
@@ -2227,7 +2221,13 @@ impl Shell {
                     };
                     let own_redirects = command_own_redirects(other);
                     let redirs = if own_redirects.is_empty() {
-                        ResolvedRedirs { stdin: None, stdout: None, stderr: None, dup_stderr_to_stdout: false }
+                        ResolvedRedirs {
+                            stdin: None,
+                            stdout: None,
+                            stderr: None,
+                            dup_stderr_to_stdout: false,
+                            extra_fds: Vec::new(),
+                        }
                     } else {
                         match self.resolve_redirect_list(own_redirects) {
                             Ok(r) => r,
@@ -2244,9 +2244,7 @@ impl Shell {
                     command.stdin(redirs.stdin.unwrap_or(default_stdin));
                     command.stdout(redirs.stdout.unwrap_or(default_stdout));
                     command.stderr(redirs.stderr.unwrap_or_else(Stdio::inherit));
-                    if redirs.dup_stderr_to_stdout {
-                        dup2_stderr_to_stdout(&mut command);
-                    }
+                    apply_fd_redirects(&mut command, redirs.dup_stderr_to_stdout, redirs.extra_fds);
                     command
                 }
             };
@@ -3153,6 +3151,7 @@ impl Shell {
         let mut stdin_path: Option<String> = None;
         let mut here_string: Option<String> = None;
         let mut dup_err_to_out = false;
+        let mut extra_fds: Vec<ExtraFd> = Vec::new();
 
         for r in redirects {
             match r {
@@ -3186,6 +3185,19 @@ impl Shell {
                     dup_err_to_out = true;
                 }
                 Redirect::DupErrToOut => dup_err_to_out = true,
+                Redirect::FdOut { fd, word, append } => {
+                    let p = self.expand_word(word);
+                    let file = open_out(&p, *append)?;
+                    extra_fds.push(ExtraFd::Open { fd: *fd as i32, file });
+                }
+                Redirect::FdIn { fd, word } => {
+                    let p = self.expand_word(word);
+                    let file = std::fs::File::open(&p).map_err(|e| format!("{}: {}", p, e))?;
+                    extra_fds.push(ExtraFd::Open { fd: *fd as i32, file });
+                }
+                Redirect::FdDup { fd, target } => {
+                    extra_fds.push(ExtraFd::Dup { fd: *fd as i32, source: *target as i32 });
+                }
             }
         }
 
@@ -3218,7 +3230,7 @@ impl Shell {
         let stdout = stdout_file.map(Stdio::from);
         let stderr = stderr_file.map(Stdio::from);
 
-        Ok(ResolvedRedirs { stdin, stdout, stderr, dup_stderr_to_stdout: dup_err_to_out })
+        Ok(ResolvedRedirs { stdin, stdout, stderr, dup_stderr_to_stdout: dup_err_to_out, extra_fds })
     }
 }
 
@@ -3244,6 +3256,21 @@ struct ResolvedRedirs {
     // handle to it; it's what makes `cmd 2>&1 | other` correctly merge
     // stderr into the pipe, not just the `cmd > file 2>&1` shape.
     dup_stderr_to_stdout: bool,
+    // Arbitrary-fd redirects (`3>file`, `4<&0`, ...), applied via the same
+    // dup2-in-pre_exec approach as dup_stderr_to_stdout, in source order,
+    // *after* dup_stderr_to_stdout -- see apply_fd_redirects. Scoped gap:
+    // since these run after stdin/stdout/stderr's own Command-builder setup
+    // rather than interleaved with it, a numbered-fd redirect that's meant
+    // to capture fd 0/1/2's state *before* a later plain `>`/`<` redirect
+    // in the same command changes it (the classic `3>&1 1>log 2>&3`
+    // fd-juggling idiom) won't see the pre-redirect value. Every ordering
+    // that doesn't depend on that interleaving works correctly.
+    extra_fds: Vec<ExtraFd>,
+}
+
+enum ExtraFd {
+    Open { fd: i32, file: std::fs::File },
+    Dup { fd: i32, source: i32 },
 }
 
 // dup2(1, 2) in the child, after fork but before exec -- so fd 2 becomes a
@@ -3305,14 +3332,30 @@ fn stdin_ready(timeout_ms: i32) -> bool {
     r > 0 && (pfd.revents & POLLIN) != 0
 }
 
-fn dup2_stderr_to_stdout(command: &mut Command) {
+// Single pre_exec hook covering both dup_stderr_to_stdout and any
+// numbered-fd redirects -- CommandExt::pre_exec isn't documented as safe to
+// call more than once per Command, so every fd-dup need for a given spawn
+// funnels through this one closure instead of stacking separate calls.
+fn apply_fd_redirects(command: &mut Command, dup_stderr_to_stdout: bool, extra_fds: Vec<ExtraFd>) {
+    if !dup_stderr_to_stdout && extra_fds.is_empty() {
+        return;
+    }
     unsafe extern "C" {
         fn dup2(oldfd: i32, newfd: i32) -> i32;
     }
     unsafe {
-        command.pre_exec(|| {
-            if dup2(1, 2) == -1 {
+        command.pre_exec(move || {
+            if dup_stderr_to_stdout && dup2(1, 2) == -1 {
                 return Err(std::io::Error::last_os_error());
+            }
+            for ef in &extra_fds {
+                let (src, dst) = match ef {
+                    ExtraFd::Open { fd, file } => (std::os::unix::io::AsRawFd::as_raw_fd(file), *fd),
+                    ExtraFd::Dup { fd, source } => (*source, *fd),
+                };
+                if dup2(src, dst) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
             }
             Ok(())
         });

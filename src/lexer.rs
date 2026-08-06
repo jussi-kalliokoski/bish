@@ -124,6 +124,13 @@ pub enum Tok {
     RedirErr { append: bool },
     RedirBoth { append: bool },
     DupErrToOut,
+    // Arbitrary-fd redirects: `N>`/`N>>`/`N<`/`N>&M`/`N<&M`. The fd=2 forms
+    // (`2>`, `2>>`, `2>&1`) stay on the dedicated tokens above -- this is
+    // for every other explicit fd number, plus `2<`/`2>&M` (M != 1), which
+    // the fd=2 fast path above doesn't cover.
+    RedirFdOut { fd: u32, append: bool },
+    RedirFdIn { fd: u32 },
+    RedirFdDup { fd: u32, target: u32 },
     HereString,
     // Placeholder pushed at the `<<WORD` site; patched in place with the
     // real (already expansion-processed) body once the line's newline is
@@ -375,6 +382,43 @@ impl<'a> Lexer<'a> {
                         toks.push(Tok::RedirErr { append });
                     }
                 }
+                // Any other explicit fd number (0,1,3-9,...; also covers
+                // `2<`/`2>&M` for M != 1, which the fd=2 fast path above
+                // doesn't handle) immediately followed by `>`/`<` with no
+                // intervening whitespace -- e.g. `3>file`, `4<&0`. A digit
+                // with no immediately-following `>`/`<` (an ordinary
+                // numeric word, or a redirect target's own value) isn't
+                // touched by this arm and falls through to read_word below
+                // as before.
+                Some(c) if c.is_ascii_digit() && self.peek_numbered_fd_redirect().is_some() => {
+                    let (fd, ndigits) = self.peek_numbered_fd_redirect().unwrap();
+                    for _ in 0..ndigits {
+                        self.chars.next();
+                    }
+                    match self.chars.next() {
+                        Some('>') => {
+                            if self.chars.peek().copied() == Some('&') {
+                                self.chars.next();
+                                toks.push(Tok::RedirFdDup { fd, target: self.read_fd_number() });
+                            } else {
+                                let append = self.chars.peek().copied() == Some('>');
+                                if append {
+                                    self.chars.next();
+                                }
+                                toks.push(Tok::RedirFdOut { fd, append });
+                            }
+                        }
+                        Some('<') => {
+                            if self.chars.peek().copied() == Some('&') {
+                                self.chars.next();
+                                toks.push(Tok::RedirFdDup { fd, target: self.read_fd_number() });
+                            } else {
+                                toks.push(Tok::RedirFdIn { fd });
+                            }
+                        }
+                        _ => unreachable!(),
+                    }
+                }
                 _ => {
                     let (word, plain) = self.read_word(false)?;
                     if plain {
@@ -415,6 +459,47 @@ impl<'a> Lexer<'a> {
             return false;
         }
         it.next() == Some('>')
+    }
+
+    // Looks ahead for a digit run immediately followed by `>`/`<` (no
+    // consumption). Returns the fd number and how many digit characters it
+    // spanned -- needed separately from the number itself since a leading
+    // zero (`007>`) would otherwise desync consumption from `fd.to_string()`.
+    fn peek_numbered_fd_redirect(&self) -> Option<(u32, usize)> {
+        let mut it = self.chars.clone();
+        let mut digits = String::new();
+        while let Some(c) = it.clone().next() {
+            if c.is_ascii_digit() {
+                digits.push(c);
+                it.next();
+            } else {
+                break;
+            }
+        }
+        if digits.is_empty() {
+            return None;
+        }
+        match it.next() {
+            Some('>') | Some('<') => digits.parse::<u32>().ok().map(|n| (n, digits.len())),
+            _ => None,
+        }
+    }
+
+    // Consumes a target fd number after `>&`/`<&` (e.g. the `1` in `3>&1`).
+    // No digits (`3>&-` or a malformed redirect) yields fd 0, matching the
+    // rest of this codebase's "best-effort, don't hard-fail the lexer"
+    // stance elsewhere -- fd close (`>&-`) isn't otherwise implemented.
+    fn read_fd_number(&mut self) -> u32 {
+        let mut s = String::new();
+        while let Some(c) = self.chars.peek().copied() {
+            if c.is_ascii_digit() {
+                s.push(c);
+                self.chars.next();
+            } else {
+                break;
+            }
+        }
+        s.parse().unwrap_or(0)
     }
 
     fn peek2(&self) -> Option<char> {

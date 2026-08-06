@@ -161,6 +161,11 @@ fn serialize_redirect(r: &Redirect) -> String {
         // body is already fully captured, so a real <<DELIM...DELIM block
         // isn't needed to reproduce the same runtime content.
         Redirect::HereDoc(w) => format!("<<<{}", serialize_word(w)),
+        Redirect::FdOut { fd, word, append } => {
+            format!("{}{}{}", fd, if *append { ">>" } else { ">" }, serialize_word(word))
+        }
+        Redirect::FdIn { fd, word } => format!("{}<{}", fd, serialize_word(word)),
+        Redirect::FdDup { fd, target } => format!("{}>&{}", fd, target),
     }
 }
 
