@@ -148,16 +148,36 @@ pub struct Shell {
     // trying to rewind this.
     shell_start: std::time::Instant,
     seconds_offset: i64,
-    // $!: PID of the most recently backgrounded command. There's no job
-    // table (job control is out of scope), just this one slot -- enough
-    // for the extremely common `cmd & ...; wait $!`-adjacent `$!` reads,
-    // though `wait` itself isn't implemented.
+    // $!: PID of the most recently backgrounded command (the last stage,
+    // for a backgrounded pipeline -- matches bash). Mirrors `jobs.last()`'s
+    // PID; kept as its own field since it needs to keep reporting the same
+    // PID even after that job is reaped out of the table by `wait`/`jobs`.
     last_bg_pid: Option<u32>,
-    // `trap CMD EXIT` handler. Only EXIT is implemented -- real signal traps
-    // (INT/TERM/...) would need OS signal-handling machinery this
-    // dependency-free, single-process design doesn't have; `trap` warns
-    // rather than silently no-oping for those instead of pretending to
-    // support them.
+    // Background jobs (`cmd &`), tracked well enough for `jobs`/`fg`/`bg`/
+    // `wait`/`kill %N` to work against real child processes. What's
+    // explicitly NOT here: real terminal job control -- no process-group
+    // creation, no `tcsetpgrp` foreground reassignment, no SIGTSTP/Ctrl-Z
+    // suspend-to-stopped. That's all specifically about a human at a
+    // keyboard hitting Ctrl-Z and expecting the terminal to hand control
+    // back and forth between the shell and a job; it doesn't affect
+    // whether a *script* runs correctly (scripts don't self-suspend), and
+    // getting process-group/terminal reassignment wrong risks leaving a
+    // real terminal in a broken state -- a bad trade for a feature that
+    // isn't script-compatibility-relevant in the first place. `fg`/`bg`
+    // here just mean "wait for" / "leave running", not the full terminal
+    // dance.
+    jobs: Vec<Job>,
+    next_job_id: u32,
+    // `trap CMD SIGNAL`. EXIT is handled separately (exit_trap below) since
+    // it isn't a real OS signal. Everything else here is a genuine
+    // sigaction-installed handler (see install_trap_handler) -- the numeric
+    // signal is the key since that's what the handler's async-signal-safe
+    // bookkeeping (PENDING_SIGNALS) uses; SIGNAL_NAMES maps both directions
+    // for `trap`'s own name-based syntax.
+    traps: std::collections::HashMap<i32, TrapAction>,
+    // `trap CMD EXIT` handler. Not a real signal (there's no SIGEXIT), so
+    // it's run directly wherever the shell is about to terminate rather
+    // than through the sigaction/PENDING_SIGNALS machinery.
     exit_trap: Option<String>,
     // `set -e`/`-u`/`-x`/`-o pipefail`/`-f`.
     opt_errexit: bool,
@@ -165,6 +185,12 @@ pub struct Shell {
     opt_xtrace: bool,
     opt_pipefail: bool,
     opt_noglob: bool,
+    // `set -m`/`-o monitor`: real bash's `fg`/`bg` refuse to run at all
+    // ("no job control") unless this is on -- confirmed against real bash,
+    // which defaults it off for a non-interactive script (only real
+    // interactive shells, or a script that explicitly opts in, get it).
+    // `jobs`/`wait`/`kill` aren't gated by this; only fg/bg are.
+    opt_monitor: bool,
     // Suppresses errexit while >0 -- set around if/while/until conditions
     // and negated (`!`) pipelines, the cases POSIX explicitly exempts from
     // triggering -e (a failing condition is meant to be checked, not
@@ -214,12 +240,16 @@ impl Shell {
             shell_start: std::time::Instant::now(),
             seconds_offset: 0,
             last_bg_pid: None,
+            jobs: Vec::new(),
+            next_job_id: 1,
+            traps: std::collections::HashMap::new(),
             exit_trap: None,
             opt_errexit: false,
             opt_nounset: false,
             opt_xtrace: false,
             opt_pipefail: false,
             opt_noglob: false,
+            opt_monitor: false,
             suppress_errexit: 0,
             current_stderr_target: None,
         }
@@ -229,6 +259,199 @@ impl Shell {
         if let Some(cmd) = self.exit_trap.take() {
             self.run_source_here(&cmd, "trap");
         }
+    }
+
+    // Resolves a job spec (%N, %%/%+  current, %-  previous, %name  prefix
+    // match on the job's command text) to an index into self.jobs. Bare
+    // job numbers without the `%` are also accepted, matching bash's own
+    // leniency in `fg`/`bg`/`wait`.
+    // Registers a freshly spawned background job (one child for a plain
+    // backgrounded command, several for a backgrounded pipeline) in the
+    // job table, and updates $! to the last child's PID (bash's own
+    // convention for a backgrounded pipeline).
+    fn push_job(&mut self, children: Vec<std::process::Child>, cmd_text: String) {
+        let pids: Vec<u32> = children.iter().map(|c| c.id()).collect();
+        self.last_bg_pid = pids.last().copied();
+        let id = self.next_job_id;
+        self.next_job_id += 1;
+        self.jobs.push(Job { id, pids, children, cmd_text });
+    }
+
+    fn resolve_job_spec(&self, spec: &str) -> Option<usize> {
+        let rest = spec.strip_prefix('%').unwrap_or(spec);
+        if rest.is_empty() || rest == "%" || rest == "+" {
+            return if self.jobs.is_empty() { None } else { Some(self.jobs.len() - 1) };
+        }
+        if rest == "-" {
+            return if self.jobs.len() >= 2 { Some(self.jobs.len() - 2) } else { None };
+        }
+        if let Ok(n) = rest.parse::<u32>() {
+            return self.jobs.iter().position(|j| j.id == n);
+        }
+        self.jobs.iter().position(|j| j.cmd_text.starts_with(rest))
+    }
+
+    fn run_jobs(&mut self, _args: &[String]) -> i32 {
+        let last_idx = self.jobs.len().checked_sub(1);
+        let prev_idx = self.jobs.len().checked_sub(2);
+        let mut to_remove = Vec::new();
+        for (i, job) in self.jobs.iter_mut().enumerate() {
+            let mark = if Some(i) == last_idx {
+                "+"
+            } else if Some(i) == prev_idx {
+                "-"
+            } else {
+                " "
+            };
+            match job.poll() {
+                Some(_) => {
+                    println!("[{}]{}  Done                    {} &", job.id, mark, job.cmd_text);
+                    to_remove.push(i);
+                }
+                None => {
+                    println!("[{}]{}  Running                 {} &", job.id, mark, job.cmd_text);
+                }
+            }
+        }
+        for i in to_remove.into_iter().rev() {
+            self.jobs.remove(i);
+        }
+        0
+    }
+
+    // `fg` doesn't reassociate the terminal's controlling process group
+    // (see the comment on the `jobs` field) -- it just blocks until the
+    // job finishes, in this process, and reports its exit status. Scripts
+    // don't distinguish that from real terminal foregrounding since they
+    // never interactively signal the job via the keyboard anyway.
+    fn run_fg(&mut self, args: &[String]) -> i32 {
+        if !self.opt_monitor {
+            eprintln!("ash: fg: no job control");
+            return 1;
+        }
+        let idx = match args.first() {
+            Some(spec) => self.resolve_job_spec(spec),
+            None => self.jobs.len().checked_sub(1),
+        };
+        match idx {
+            Some(i) => {
+                let cmd_text = self.jobs[i].cmd_text.clone();
+                println!("{}", cmd_text);
+                let mut job = self.jobs.remove(i);
+                job.wait()
+            }
+            None => {
+                eprintln!("ash: fg: no current job");
+                1
+            }
+        }
+    }
+
+    // Every job this shell tracks is, by construction, already running --
+    // there's no SIGTSTP/Ctrl-Z support (see the `jobs` field comment), so
+    // nothing ever reaches a genuine Stopped state for `bg` to resume.
+    // Confirmed against real bash: `bg` on an already-running job doesn't
+    // resume anything, it just reports "already in background" and
+    // returns 0 -- exactly the one case this implementation can ever
+    // reach, so that's what it always does.
+    fn run_bg(&mut self, args: &[String]) -> i32 {
+        if !self.opt_monitor {
+            eprintln!("ash: bg: no job control");
+            return 1;
+        }
+        let idx = match args.first() {
+            Some(spec) => self.resolve_job_spec(spec),
+            None => self.jobs.len().checked_sub(1),
+        };
+        match idx {
+            Some(i) => {
+                eprintln!("ash: bg: job {} already in background", self.jobs[i].id);
+                0
+            }
+            None => {
+                eprintln!("ash: bg: no current job");
+                1
+            }
+        }
+    }
+
+    // `wait` with no operands waits for every active job and always
+    // returns 0 (POSIX-specified, confirmed against real bash); with
+    // operands, waits for just those and returns the *last* one's status.
+    fn run_wait(&mut self, args: &[String]) -> i32 {
+        if args.is_empty() {
+            while !self.jobs.is_empty() {
+                let mut job = self.jobs.remove(0);
+                job.wait();
+            }
+            return 0;
+        }
+        let mut status = 0;
+        for a in args {
+            if let Some(idx) = self.resolve_job_spec(a) {
+                let mut job = self.jobs.remove(idx);
+                status = job.wait();
+                continue;
+            }
+            match a.parse::<u32>() {
+                Ok(pid) => match self.jobs.iter().position(|j| j.pids.contains(&pid)) {
+                    Some(idx) => {
+                        let mut job = self.jobs.remove(idx);
+                        status = job.wait();
+                    }
+                    None => {
+                        eprintln!("ash: wait: pid {} is not a child of this shell", pid);
+                        status = 127;
+                    }
+                },
+                Err(_) => {
+                    eprintln!("ash: wait: {}: no such job", a);
+                    status = 127;
+                }
+            }
+        }
+        status
+    }
+
+    // kill [-SIGNAME|-N] pid|%job ... Negative PIDs (process-group kill)
+    // aren't specially handled -- see the `jobs` field comment on why real
+    // process-group management is out of scope here.
+    fn run_kill(&mut self, args: &[String]) -> i32 {
+        let mut sig = 15; // SIGTERM
+        let mut targets: Vec<&String> = Vec::new();
+        for a in args {
+            if let Some(rest) = a.strip_prefix('-') {
+                if rest == "l" {
+                    for (name, num) in SIGNAL_NAMES {
+                        println!("{}) SIG{}", num, name);
+                    }
+                    return 0;
+                }
+                if let Some(n) = signal_number(rest) {
+                    sig = n;
+                    continue;
+                }
+            }
+            targets.push(a);
+        }
+        let mut status = 0;
+        for t in targets {
+            if let Some(idx) = t.strip_prefix('%').and_then(|_| self.resolve_job_spec(t)) {
+                let pids = self.jobs[idx].pids.clone();
+                for pid in pids {
+                    send_signal(pid, sig);
+                }
+            } else if let Ok(pid) = t.parse::<i32>() {
+                if !send_signal(pid as u32, sig) {
+                    eprintln!("ash: kill: ({}) - No such process", pid);
+                    status = 1;
+                }
+            } else {
+                eprintln!("ash: kill: {}: arguments must be process or job IDs", t);
+                status = 1;
+            }
+        }
+        status
     }
 
     // getopts optstring name [args...]. Options requiring an argument are
@@ -672,6 +895,7 @@ impl Shell {
             'u' => self.opt_nounset = on,
             'x' => self.opt_xtrace = on,
             'f' => self.opt_noglob = on,
+            'm' => self.opt_monitor = on,
             _ => {}
         }
     }
@@ -683,6 +907,7 @@ impl Shell {
             "nounset" => self.opt_nounset = on,
             "xtrace" => self.opt_xtrace = on,
             "noglob" => self.opt_noglob = on,
+            "monitor" => self.opt_monitor = on,
             _ => {}
         }
     }
@@ -692,9 +917,32 @@ impl Shell {
         self.arg_frames = vec![args];
     }
 
+    // Runs any trapped signal's handler code for signals that arrived
+    // since the last check (see the comment on PENDING_SIGNALS for why
+    // this poll-at-checkpoints approach exists instead of running trap
+    // code directly from the signal handler). Called once per top-level
+    // statement in run_program -- frequent enough to feel responsive for
+    // real scripts, without needing signal-safety anywhere outside the
+    // one-line handler itself.
+    fn check_pending_signals(&mut self) {
+        let pending = PENDING_SIGNALS.swap(0, std::sync::atomic::Ordering::SeqCst);
+        if pending == 0 {
+            return;
+        }
+        for sig in 0..32 {
+            if pending & (1 << sig) == 0 {
+                continue;
+            }
+            if let Some(TrapAction::Run(code)) = self.traps.get(&sig).cloned() {
+                self.run_source_here(&code, "trap");
+            }
+        }
+    }
+
     pub fn run_program(&mut self, prog: &Program) -> ExecResult {
         let mut result = ExecResult::Status(self.last_status);
         for item in prog {
+            self.check_pending_signals();
             let background = matches!(item.sep, Sep::Background);
             result = self.run_and_or(&item.and_or, background);
             self.last_status = result.status();
@@ -792,7 +1040,7 @@ impl Shell {
                 self.functions.insert(name.clone(), (**body).clone());
                 ExecResult::Status(0)
             }
-            parser::Command::Subshell(raw, _redirects) => ExecResult::Status(self.run_subshell(raw)),
+            parser::Command::Subshell(raw, _redirects) => ExecResult::Status(self.run_subshell(raw, background)),
             parser::Command::Arith(raw, _redirects) => match arith::eval(raw, self) {
                 Ok(v) => ExecResult::Status(if v != 0 { 0 } else { 1 }),
                 Err(e) => {
@@ -941,7 +1189,7 @@ impl Shell {
     // inside (cd, variables) must not leak back into the parent. Spawning a
     // real child process gets that isolation for free instead of a separate
     // snapshot/restore mechanism.
-    fn run_subshell(&self, raw: &str) -> i32 {
+    fn run_subshell(&mut self, raw: &str, background: bool) -> i32 {
         let exe = match std::env::current_exe() {
             Ok(p) => p,
             Err(e) => {
@@ -950,11 +1198,24 @@ impl Shell {
             }
         };
         let script = self.functions_preamble() + raw;
-        match Command::new(exe).arg("-c").arg(script).status() {
-            Ok(status) => status.code().unwrap_or(1),
-            Err(e) => {
-                eprintln!("ash: subshell: {}", e);
-                1
+        if background {
+            match Command::new(exe).arg("-c").arg(script).spawn() {
+                Ok(child) => {
+                    self.push_job(vec![child], format!("({})", raw));
+                    0
+                }
+                Err(e) => {
+                    eprintln!("ash: subshell: {}", e);
+                    1
+                }
+            }
+        } else {
+            match Command::new(exe).arg("-c").arg(script).status() {
+                Ok(status) => exit_code_from_status(status),
+                Err(e) => {
+                    eprintln!("ash: subshell: {}", e);
+                    1
+                }
             }
         }
     }
@@ -990,16 +1251,15 @@ impl Shell {
         command.stderr(redirs.stderr.unwrap_or_else(Stdio::inherit));
         apply_fd_redirects(&mut command, redirs.dup_stderr_to_stdout, redirs.extra_fds);
         match command.spawn() {
-            Ok(mut child) => {
+            Ok(child) => {
                 if background {
-                    self.last_bg_pid = Some(child.id());
-                    std::thread::spawn(move || {
-                        let _ = child.wait();
-                    });
+                    let cmd_text = crate::serialize::serialize_command(cmd);
+                    self.push_job(vec![child], cmd_text);
                     ExecResult::Status(0)
                 } else {
+                    let mut child = child;
                     match child.wait() {
-                        Ok(status) => ExecResult::Status(status.code().unwrap_or(1)),
+                        Ok(status) => ExecResult::Status(exit_code_from_status(status)),
                         Err(e) => {
                             eprintln!("ash: {}", e);
                             ExecResult::Status(1)
@@ -1714,7 +1974,7 @@ impl Shell {
                 let mut ext = Command::new(&argv[i]);
                 ext.args(&argv[i + 1..]);
                 return match ext.status() {
-                    Ok(status) => ExecResult::Status(status.code().unwrap_or(1)),
+                    Ok(status) => ExecResult::Status(exit_code_from_status(status)),
                     Err(e) => {
                         eprintln!("ash: command: {}: {}", argv[i], e);
                         ExecResult::Status(127)
@@ -2171,22 +2431,61 @@ impl Shell {
                 }
             }
             "trap" => {
+                if argv.len() == 1 || argv.get(1).map(|s| s == "-p").unwrap_or(false) {
+                    if let Some(code) = &self.exit_trap {
+                        println!("trap -- {} EXIT", crate::serialize::quote_literal(code));
+                    }
+                    let mut entries: Vec<(i32, TrapAction)> =
+                        self.traps.iter().map(|(k, v)| (*k, v.clone())).collect();
+                    entries.sort_by_key(|(n, _)| *n);
+                    for (n, action) in entries {
+                        match action {
+                            TrapAction::Run(code) => {
+                                println!("trap -- {} SIG{}", crate::serialize::quote_literal(&code), signal_name(n))
+                            }
+                            TrapAction::Ignore => println!("trap -- '' SIG{}", signal_name(n)),
+                        }
+                    }
+                    return ExecResult::Status(0);
+                }
                 if argv.len() < 3 {
                     return ExecResult::Status(0);
                 }
                 let cmd_str = argv[1].clone();
                 for sig in &argv[2..] {
-                    if sig == "EXIT" {
-                        self.exit_trap = Some(cmd_str.clone());
+                    if sig == "EXIT" || sig == "0" {
+                        self.exit_trap = if cmd_str == "-" { None } else { Some(cmd_str.clone()) };
+                        continue;
+                    }
+                    let num = match signal_number(sig) {
+                        Some(n) => n,
+                        None => {
+                            eprintln!("ash: trap: {}: invalid signal specification", sig);
+                            continue;
+                        }
+                    };
+                    if num == 9 || num == 19 {
+                        eprintln!("ash: trap: {}: cannot trap", sig);
+                        continue;
+                    }
+                    if cmd_str == "-" {
+                        self.traps.remove(&num);
+                        sigaction_raw(num, SIG_DFL);
+                    } else if cmd_str.is_empty() {
+                        self.traps.insert(num, TrapAction::Ignore);
+                        sigaction_raw(num, SIG_IGN);
                     } else {
-                        eprintln!(
-                            "ash: trap: signal '{}' is not supported yet (only EXIT is honored)",
-                            sig
-                        );
+                        self.traps.insert(num, TrapAction::Run(cmd_str.clone()));
+                        sigaction_raw(num, record_pending_signal as *const () as usize);
                     }
                 }
                 return ExecResult::Status(0);
             }
+            "jobs" => return ExecResult::Status(self.run_jobs(&argv[1..])),
+            "fg" => return ExecResult::Status(self.run_fg(&argv[1..])),
+            "bg" => return ExecResult::Status(self.run_bg(&argv[1..])),
+            "wait" => return ExecResult::Status(self.run_wait(&argv[1..])),
+            "kill" => return ExecResult::Status(self.run_kill(&argv[1..])),
             "getopts" => return self.run_getopts(&argv[1..]),
             "unset" => {
                 let target = self.peek_stderr_target(&cmd.redirects);
@@ -2264,16 +2563,19 @@ impl Shell {
         apply_fd_redirects(&mut command, redirs.dup_stderr_to_stdout, redirs.extra_fds);
 
         match command.spawn() {
-            Ok(mut child) => {
+            Ok(child) => {
                 if background {
-                    self.last_bg_pid = Some(child.id());
-                    std::thread::spawn(move || {
-                        let _ = child.wait();
-                    });
+                    let mut cmd_text = argv.join(" ");
+                    for r in &cmd.redirects {
+                        cmd_text.push(' ');
+                        cmd_text.push_str(&crate::serialize::serialize_redirect(r));
+                    }
+                    self.push_job(vec![child], cmd_text);
                     ExecResult::Status(0)
                 } else {
+                    let mut child = child;
                     let result = match child.wait() {
-                        Ok(status) => ExecResult::Status(status.code().unwrap_or(1)),
+                        Ok(status) => ExecResult::Status(exit_code_from_status(status)),
                         Err(e) => {
                             eprintln!("ash: {}", e);
                             ExecResult::Status(1)
@@ -2424,14 +2726,9 @@ impl Shell {
         }
 
         if background {
-            // $!: bash reports the PID of the *last* command in a
-            // backgrounded pipeline.
-            self.last_bg_pid = children.last().map(|c| c.id());
-            std::thread::spawn(move || {
-                for mut c in children {
-                    let _ = c.wait();
-                }
-            });
+            let cmd_text =
+                commands.iter().map(crate::serialize::serialize_command).collect::<Vec<_>>().join(" | ");
+            self.push_job(children, cmd_text);
             return 0;
         }
 
@@ -2439,7 +2736,7 @@ impl Shell {
         let mut pipefail_status = 0;
         for mut c in children {
             let code = match c.wait() {
-                Ok(s) => s.code().unwrap_or(1),
+                Ok(s) => exit_code_from_status(s),
                 Err(e) => {
                     eprintln!("ash: {}", e);
                     1
@@ -3432,6 +3729,66 @@ enum ExtraFd {
     Dup { fd: i32, source: i32 },
 }
 
+// A background job (`cmd &`), one or more children (a whole pipeline when
+// backgrounded together). `children` are kept so `wait`/`jobs`/`fg` can
+// poll/block on them directly -- earlier this shell just spawned a thread
+// that blindly `.wait()`d and dropped the result, which meant nothing else
+// could ever observe a background job's completion or exit status.
+struct Job {
+    id: u32,
+    pids: Vec<u32>,
+    children: Vec<std::process::Child>,
+    cmd_text: String,
+}
+
+impl Job {
+    // Non-blocking: reaps any children that have already exited without
+    // blocking on ones that haven't. Returns the job's exit status once
+    // *every* child has exited (bash: a job composed of a pipeline is
+    // "done" when its last stage exits; this shell reports done once the
+    // whole pipeline has, and uses the last child's code, matching the
+    // pipeline exit-status convention used elsewhere in this file).
+    fn poll(&mut self) -> Option<i32> {
+        let mut all_done = true;
+        let mut last_code = 0;
+        for c in &mut self.children {
+            match c.try_wait() {
+                Ok(Some(status)) => last_code = exit_code_from_status(status),
+                Ok(None) => all_done = false,
+                Err(_) => last_code = 1,
+            }
+        }
+        if all_done { Some(last_code) } else { None }
+    }
+
+    // Blocking wait for every child in the job.
+    fn wait(&mut self) -> i32 {
+        let mut last_code = 0;
+        for c in &mut self.children {
+            match c.wait() {
+                Ok(status) => last_code = exit_code_from_status(status),
+                Err(_) => last_code = 1,
+            }
+        }
+        last_code
+    }
+}
+
+// bash's exit-status convention for a process killed by a signal is
+// 128+signum (ExitStatus::code() returns None in that case -- there's no
+// normal exit code to report -- so this falls back to the signal via
+// ExitStatusExt, matching what `$?`/`wait`/`fg` should actually show).
+fn exit_code_from_status(status: std::process::ExitStatus) -> i32 {
+    use std::os::unix::process::ExitStatusExt;
+    status.code().unwrap_or_else(|| status.signal().map(|s| 128 + s).unwrap_or(1))
+}
+
+#[derive(Clone)]
+enum TrapAction {
+    Ignore,
+    Run(String),
+}
+
 // dup2(1, 2) in the child, after fork but before exec -- so fd 2 becomes a
 // genuine duplicate of whatever fd 1 was just set up to be (Command's own
 // stdio setup runs before pre_exec hooks). A single async-signal-safe
@@ -3447,6 +3804,110 @@ unsafe extern "C" {
     fn getppid() -> i32;
     fn getuid() -> u32;
     fn geteuid() -> u32;
+}
+
+// Signal traps (`trap CMD SIGNAL`). A signal handler can only safely do
+// async-signal-safe work -- no allocation, no locks, nothing that could
+// reenter a libc function the interrupted code was mid-call in -- so the
+// handler itself does nothing but flag the signal number in this bitmask;
+// the shell's own run_program loop checks it between top-level statements
+// (see check_pending_signals) and runs the actual trap code there, in a
+// normal, fully-safe context. One consequence: a trap won't fire truly
+// asynchronously mid-syscall (e.g. while a script is blocked in `sleep` or
+// `wait`) -- only at the next between-statements checkpoint. That's a
+// real, deliberate scope boundary (not a bug): true async delivery mid-
+// blocking-call needs EINTR-aware retry logic threaded through every
+// blocking call site in this file, which is a much bigger change for a
+// scripting-focused shell where "runs between statements" already covers
+// the overwhelmingly common trap use (cleanup-on-signal, not low-latency
+// signal response).
+static PENDING_SIGNALS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+extern "C" fn record_pending_signal(sig: i32) {
+    if (0..32).contains(&sig) {
+        PENDING_SIGNALS.fetch_or(1 << sig, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+// Layout matches glibc's `struct sigaction` on Linux x86_64: handler
+// pointer, then the 128-byte sigset_t (16 u64 words -- _NSIG/64 on this
+// platform), then the int flags, then the restorer pointer (glibc's own
+// sigaction() wrapper fills this in itself before the real syscall; it
+// doesn't need to be set here).
+#[repr(C)]
+struct SigActionRaw {
+    sa_handler: usize,
+    sa_mask: [u64; 16],
+    sa_flags: i32,
+    sa_restorer: usize,
+}
+
+const SIG_DFL: usize = 0;
+const SIG_IGN: usize = 1;
+
+fn sigaction_raw(signum: i32, handler: usize) {
+    unsafe extern "C" {
+        fn sigaction(signum: i32, act: *const SigActionRaw, oldact: *mut SigActionRaw) -> i32;
+    }
+    let act = SigActionRaw { sa_handler: handler, sa_mask: [0; 16], sa_flags: 0, sa_restorer: 0 };
+    unsafe {
+        sigaction(signum, &act, std::ptr::null_mut());
+    }
+}
+
+// Name <-> number for the signals scripts actually trap. KILL (9) and
+// STOP (19) are intentionally absent -- neither can be caught or ignored,
+// matching real bash's own refusal to let `trap` touch them.
+const SIGNAL_NAMES: &[(&str, i32)] = &[
+    ("HUP", 1),
+    ("INT", 2),
+    ("QUIT", 3),
+    ("ILL", 4),
+    ("TRAP", 5),
+    ("ABRT", 6),
+    ("BUS", 7),
+    ("FPE", 8),
+    ("USR1", 10),
+    ("SEGV", 11),
+    ("USR2", 12),
+    ("PIPE", 13),
+    ("ALRM", 14),
+    ("TERM", 15),
+    ("CHLD", 17),
+    ("CONT", 18),
+    ("TSTP", 20),
+    ("TTIN", 21),
+    ("TTOU", 22),
+    ("URG", 23),
+    ("XCPU", 24),
+    ("XFSZ", 25),
+    ("VTALRM", 26),
+    ("PROF", 27),
+    ("WINCH", 28),
+    ("IO", 29),
+    ("PWR", 30),
+    ("SYS", 31),
+];
+
+// Accepts "INT", "SIGINT", or a bare number ("2"); "0"/"EXIT" is handled by
+// the caller separately since it isn't a real signal.
+fn signal_number(name: &str) -> Option<i32> {
+    let bare = name.strip_prefix("SIG").unwrap_or(name);
+    if let Some(&(_, n)) = SIGNAL_NAMES.iter().find(|(n, _)| *n == bare) {
+        return Some(n);
+    }
+    bare.parse::<i32>().ok()
+}
+
+fn signal_name(num: i32) -> String {
+    SIGNAL_NAMES.iter().find(|(_, n)| *n == num).map(|(name, _)| name.to_string()).unwrap_or_else(|| num.to_string())
+}
+
+fn send_signal(pid: u32, sig: i32) -> bool {
+    unsafe extern "C" {
+        fn kill(pid: i32, sig: i32) -> i32;
+    }
+    unsafe { kill(pid as i32, sig) == 0 }
 }
 
 // $HOSTNAME: bash populates this at startup from uname(); Linux exposes
@@ -3862,6 +4323,11 @@ const KNOWN_BUILTINS: &[&str] = &[
     "source",
     ".",
     "trap",
+    "jobs",
+    "fg",
+    "bg",
+    "wait",
+    "kill",
     "getopts",
     "unset",
     "set",

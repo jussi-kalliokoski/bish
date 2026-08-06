@@ -161,7 +161,7 @@ fn serialize_simple(sc: &SimpleCommand) -> String {
     parts.join(" ")
 }
 
-fn serialize_redirect(r: &Redirect) -> String {
+pub fn serialize_redirect(r: &Redirect) -> String {
     match r {
         Redirect::In(w) => format!("<{}", serialize_word(w)),
         Redirect::Out { word, append } => format!("{}{}", if *append { ">>" } else { ">" }, serialize_word(word)),
