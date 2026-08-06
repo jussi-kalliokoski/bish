@@ -3712,6 +3712,9 @@ impl Shell {
                         Err(_) => return Err(format!("{}: ambiguous redirect", target_str)),
                     }
                 }
+                Redirect::FdClose { fd } => {
+                    extra_fds.push(ExtraFd::Close(*fd as i32));
+                }
             }
         }
 
@@ -3785,6 +3788,7 @@ struct ResolvedRedirs {
 enum ExtraFd {
     Open { fd: i32, file: std::fs::File },
     Dup { fd: i32, source: i32 },
+    Close(i32),
 }
 
 // Associative-array storage (`declare -A`). Iterates in insertion order --
@@ -4137,12 +4141,37 @@ fn stdin_ready(timeout_ms: i32) -> bool {
 // numbered-fd redirects -- CommandExt::pre_exec isn't documented as safe to
 // call more than once per Command, so every fd-dup need for a given spawn
 // funnels through this one closure instead of stacking separate calls.
+// Real bug, found by tracing a "3>file works for every fd except 3" report
+// down to its root cause: `dup2(oldfd, newfd)` is a no-op per POSIX when
+// oldfd == newfd -- it does *not* clear FD_CLOEXEC on that descriptor. Rust
+// opens files (and pipes, e.g. for coproc) with O_CLOEXEC by default, so
+// whenever the file/pipe's own already-assigned fd number happens to
+// coincide with the redirect's target fd (a real possibility: both are
+// small numbers chosen by "next available", so collisions aren't rare),
+// dup2 silently no-ops and the fd -- despite looking open right up to the
+// exec() call -- gets closed by the kernel as part of exec's own cloexec
+// handling, instead of surviving into the child like every other target
+// fd does. Explicitly clearing FD_CLOEXEC after every dup2 (redundant for
+// the normal src != dst case, since dup2 already clears it there) makes
+// this correct regardless of whether the dup2 was a genuine duplicate or
+// this same-fd no-op.
+fn clear_cloexec(fd: i32) {
+    unsafe extern "C" {
+        fn fcntl(fd: i32, cmd: i32, arg: i32) -> i32;
+    }
+    const F_SETFD: i32 = 2;
+    unsafe {
+        fcntl(fd, F_SETFD, 0);
+    }
+}
+
 fn apply_fd_redirects(command: &mut Command, dup_stderr_to_stdout: bool, extra_fds: Vec<ExtraFd>) {
     if !dup_stderr_to_stdout && extra_fds.is_empty() {
         return;
     }
     unsafe extern "C" {
         fn dup2(oldfd: i32, newfd: i32) -> i32;
+        fn close(fd: i32) -> i32;
     }
     unsafe {
         command.pre_exec(move || {
@@ -4150,12 +4179,24 @@ fn apply_fd_redirects(command: &mut Command, dup_stderr_to_stdout: bool, extra_f
                 return Err(std::io::Error::last_os_error());
             }
             for ef in &extra_fds {
-                let (src, dst) = match ef {
-                    ExtraFd::Open { fd, file } => (std::os::unix::io::AsRawFd::as_raw_fd(file), *fd),
-                    ExtraFd::Dup { fd, source } => (*source, *fd),
-                };
-                if dup2(src, dst) == -1 {
-                    return Err(std::io::Error::last_os_error());
+                match ef {
+                    ExtraFd::Open { fd, file } => {
+                        if dup2(std::os::unix::io::AsRawFd::as_raw_fd(file), *fd) == -1 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        clear_cloexec(*fd);
+                    }
+                    ExtraFd::Dup { fd, source } => {
+                        if dup2(*source, *fd) == -1 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        clear_cloexec(*fd);
+                    }
+                    ExtraFd::Close(fd) => {
+                        if close(*fd) == -1 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                    }
                 }
             }
             Ok(())

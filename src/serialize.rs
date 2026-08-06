@@ -183,6 +183,7 @@ pub fn serialize_redirect(r: &Redirect) -> String {
         Redirect::FdIn { fd, word } => format!("{}<{}", fd, serialize_word(word)),
         Redirect::FdDup { fd, target } => format!("{}>&{}", fd, target),
         Redirect::FdDupWord { fd, word } => format!("{}>&{}", fd, serialize_word(word)),
+        Redirect::FdClose { fd } => format!("{}>&-", fd),
     }
 }
 

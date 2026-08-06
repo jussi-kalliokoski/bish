@@ -26,6 +26,8 @@ pub enum Redirect {
     // holding an fd number, like a coproc's array entries) -- word is
     // expanded and parsed as the target fd at redirect-resolution time.
     FdDupWord { fd: u32, word: Word },
+    // `[N]>&-` / `[N]<&-`: closes fd N.
+    FdClose { fd: u32 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -690,6 +692,11 @@ impl Parser {
                     let word = self.expect_word()?;
                     redirects.push(Redirect::FdDupWord { fd, word });
                 }
+                Some(Tok::RedirFdClose { fd }) => {
+                    let fd = *fd;
+                    self.advance();
+                    redirects.push(Redirect::FdClose { fd });
+                }
                 Some(Tok::HereString) => {
                     self.advance();
                     let word = self.expect_word()?;
@@ -802,6 +809,11 @@ impl Parser {
                     self.advance();
                     let word = self.expect_word()?;
                     redirects.push(Redirect::FdDupWord { fd, word });
+                }
+                Some(Tok::RedirFdClose { fd }) => {
+                    let fd = *fd;
+                    self.advance();
+                    redirects.push(Redirect::FdClose { fd });
                 }
                 Some(Tok::HereString) => {
                     self.advance();

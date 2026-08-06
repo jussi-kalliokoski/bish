@@ -141,6 +141,8 @@ pub enum Tok {
     // explicit leading digit for `N>&`/`N<&`); the target word is expanded
     // and parsed as the target fd number at redirect-resolution time.
     RedirDupWord { fd: u32 },
+    // `[N]>&-` / `[N]<&-`: closes fd N (1/0 if no leading digit).
+    RedirFdClose { fd: u32 },
     HereString,
     // Placeholder pushed at the `<<WORD` site; patched in place with the
     // real (already expansion-processed) body once the line's newline is
@@ -496,7 +498,10 @@ impl<'a> Lexer<'a> {
     // leaves the target itself to be lexed as an ordinary following word,
     // same as every other redirect operator's target.
     fn lex_dup_target(&mut self, fd: u32) -> Tok {
-        if self.chars.peek().copied().is_some_and(|c| c.is_ascii_digit()) {
+        if self.chars.peek().copied() == Some('-') {
+            self.chars.next();
+            Tok::RedirFdClose { fd }
+        } else if self.chars.peek().copied().is_some_and(|c| c.is_ascii_digit()) {
             Tok::RedirFdDup { fd, target: self.read_fd_number() }
         } else {
             Tok::RedirDupWord { fd }
@@ -536,9 +541,10 @@ impl<'a> Lexer<'a> {
     }
 
     // Consumes a target fd number after `>&`/`<&` (e.g. the `1` in `3>&1`).
-    // No digits (`3>&-` or a malformed redirect) yields fd 0, matching the
-    // rest of this codebase's "best-effort, don't hard-fail the lexer"
-    // stance elsewhere -- fd close (`>&-`) isn't otherwise implemented.
+    // Only called once lex_dup_target has already ruled out the `-` (close)
+    // case, so a malformed redirect with no digits here just yields fd 0
+    // rather than hard-failing the lexer, matching this codebase's
+    // best-effort stance elsewhere.
     fn read_fd_number(&mut self) -> u32 {
         let mut s = String::new();
         while let Some(c) = self.chars.peek().copied() {
