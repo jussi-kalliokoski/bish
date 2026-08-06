@@ -1,6 +1,145 @@
 #[cfg(unix)]
 use std::os::unix::fs::FileTypeExt;
 
+#[repr(C)]
+struct RLimit {
+    cur: u64,
+    max: u64,
+}
+
+const RLIM_INFINITY: u64 = u64::MAX;
+
+struct LimitSpec {
+    flag: char,
+    resource: i32,
+    label: &'static str,
+    unit: &'static str,
+    div: u64,
+}
+
+// Standard Linux/glibc RLIMIT_* numbers (stable ABI, safe to hardcode --
+// same "libc is already linked, no crate needed" reasoning used elsewhere
+// in this codebase for raw syscall numbers/signatures). No RLIMIT_PIPE
+// exists on Linux (pipe capacity is a per-pipe fcntl setting, not an
+// rlimit) so `-p`, which real bash reports as a fixed constant, is left
+// out of `-a` rather than fabricating a value.
+const LIMIT_SPECS: &[LimitSpec] = &[
+    LimitSpec { flag: 'c', resource: 4, label: "core file size", unit: "blocks", div: 512 },
+    LimitSpec { flag: 'd', resource: 2, label: "data seg size", unit: "kbytes", div: 1024 },
+    LimitSpec { flag: 'e', resource: 13, label: "scheduling priority", unit: "", div: 1 },
+    LimitSpec { flag: 'f', resource: 1, label: "file size", unit: "blocks", div: 512 },
+    LimitSpec { flag: 'i', resource: 11, label: "pending signals", unit: "", div: 1 },
+    LimitSpec { flag: 'l', resource: 8, label: "max locked memory", unit: "kbytes", div: 1024 },
+    LimitSpec { flag: 'm', resource: 5, label: "max memory size", unit: "kbytes", div: 1024 },
+    LimitSpec { flag: 'n', resource: 7, label: "open files", unit: "", div: 1 },
+    LimitSpec { flag: 'q', resource: 12, label: "POSIX message queues", unit: "bytes", div: 1 },
+    LimitSpec { flag: 'r', resource: 14, label: "real-time priority", unit: "", div: 1 },
+    LimitSpec { flag: 's', resource: 3, label: "stack size", unit: "kbytes", div: 1024 },
+    LimitSpec { flag: 't', resource: 0, label: "cpu time", unit: "seconds", div: 1 },
+    LimitSpec { flag: 'u', resource: 6, label: "max user processes", unit: "", div: 1 },
+    LimitSpec { flag: 'v', resource: 9, label: "virtual memory", unit: "kbytes", div: 1024 },
+    LimitSpec { flag: 'x', resource: 10, label: "file locks", unit: "", div: 1 },
+];
+
+fn fmt_limit(v: u64, div: u64) -> String {
+    if v == RLIM_INFINITY {
+        "unlimited".to_string()
+    } else {
+        (v / div.max(1)).to_string()
+    }
+}
+
+// ulimit [-HS] [-a] [-cdefilmnqrstuvx [limit]]. `-a` doesn't attempt to
+// byte-match bash's exact column alignment (its internal padding rules
+// aren't a fixed width across all entries) -- purely cosmetic output that
+// scripts don't parse, unlike the single-limit query/set forms below,
+// which do match exactly.
+pub fn ulimit(args: &[String]) -> i32 {
+    unsafe extern "C" {
+        fn getrlimit(resource: i32, rlim: *mut RLimit) -> i32;
+        fn setrlimit(resource: i32, rlim: *const RLimit) -> i32;
+    }
+    let mut hard = false;
+    let mut soft = false;
+    let mut show_all = false;
+    let mut flag: Option<char> = None;
+    let mut value: Option<String> = None;
+    for a in args {
+        if let Some(rest) = a.strip_prefix('-').filter(|r| !r.is_empty()) {
+            for c in rest.chars() {
+                match c {
+                    'H' => hard = true,
+                    'S' => soft = true,
+                    'a' => show_all = true,
+                    other => flag = Some(other),
+                }
+            }
+        } else {
+            value = Some(a.clone());
+        }
+    }
+    if show_all {
+        for spec in LIMIT_SPECS {
+            let mut rl = RLimit { cur: 0, max: 0 };
+            unsafe {
+                getrlimit(spec.resource, &mut rl);
+            }
+            let v = if hard { rl.max } else { rl.cur };
+            let unit_part = if spec.unit.is_empty() { String::new() } else { format!("{}, ", spec.unit) };
+            println!("{:<24}({}-{}) {}", spec.label, unit_part, spec.flag, fmt_limit(v, spec.div));
+        }
+        return 0;
+    }
+    let f = flag.unwrap_or('f');
+    let spec = match LIMIT_SPECS.iter().find(|s| s.flag == f) {
+        Some(s) => s,
+        None => {
+            eprintln!("ash: ulimit: -{}: invalid option", f);
+            return 1;
+        }
+    };
+    let mut rl = RLimit { cur: 0, max: 0 };
+    unsafe {
+        getrlimit(spec.resource, &mut rl);
+    }
+    match value {
+        None => {
+            let v = if hard { rl.max } else { rl.cur };
+            println!("{}", fmt_limit(v, spec.div));
+            0
+        }
+        Some(v) => {
+            let new_val: u64 = if v == "unlimited" {
+                RLIM_INFINITY
+            } else {
+                match v.parse::<u64>() {
+                    Ok(n) => n * spec.div,
+                    Err(_) => {
+                        eprintln!("ash: ulimit: {}: invalid number", v);
+                        return 1;
+                    }
+                }
+            };
+            if !soft && !hard {
+                rl.cur = new_val;
+                rl.max = new_val;
+            } else {
+                if soft {
+                    rl.cur = new_val;
+                }
+                if hard {
+                    rl.max = new_val;
+                }
+            }
+            if unsafe { setrlimit(spec.resource, &rl) } != 0 {
+                eprintln!("ash: ulimit: cannot modify limit: {}", std::io::Error::last_os_error());
+                return 1;
+            }
+            0
+        }
+    }
+}
+
 // POSIX has no query-only umask read -- `umask(new) -> previous` is the
 // only syscall shape, so reading the current value means setting a
 // throwaway mask and immediately restoring what was there.

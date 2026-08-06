@@ -1642,6 +1642,7 @@ impl Shell {
             }
             "cd" => return ExecResult::Status(builtins::cd(&argv[1..])),
             "umask" => return ExecResult::Status(builtins::umask(&argv[1..])),
+            "ulimit" => return ExecResult::Status(builtins::ulimit(&argv[1..])),
             "shopt" => return ExecResult::Status(self.run_shopt(&argv[1..])),
             "pushd" => return ExecResult::Status(self.run_pushd(&argv[1..])),
             "popd" => return ExecResult::Status(self.run_popd(&argv[1..])),
@@ -3729,6 +3730,7 @@ const KNOWN_BUILTINS: &[&str] = &[
     "pushd",
     "popd",
     "dirs",
+    "ulimit",
 ];
 
 fn is_known_builtin(name: &str) -> bool {
