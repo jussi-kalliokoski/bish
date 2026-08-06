@@ -870,29 +870,53 @@ pub(crate) fn word_as_assignment(w: &Word) -> Option<(String, AssignMode, Word)>
     None
 }
 
-// `name[index]=value` -- the whole `name[index]=` prefix must land in a
-// single leading literal chunk, so `arr[i]=x` works (the common case: `i`
-// resolves as a bare identifier in the index's arithmetic context, no `$`
-// needed) but a `$`-containing index like `arr[$i]=x` isn't recognized here
-// (falls through to being read as a plain word instead).
+// `name[index]=value` -- the whole `name[index]=` prefix must be made up of
+// literal text (a run of leading Str/LiteralStr chunks; a `$`-containing
+// index like `arr[$i]=x` isn't recognized here, falls through to being read
+// as a plain word instead), but that text no longer has to land in a
+// single chunk -- a quoted piece of the index (`arr["a b"]=x`) now lexes as
+// its own LiteralStr chunk rather than merging into its neighbors, so the
+// leading run is flattened into one string to search across, and the split
+// point after `=` is mapped back onto real chunk boundaries for the value.
 fn word_as_index_assignment(w: &Word) -> Option<(String, String, Word)> {
-    let first = w.chunks.first()?;
-    if let Chunk::Str(s) = first {
-        let bracket = s.find('[')?;
-        let name = &s[..bracket];
-        if !is_valid_ident(name) {
-            return None;
-        }
-        let after_bracket = &s[bracket + 1..];
-        let close = after_bracket.find(']')?;
-        let index = after_bracket[..close].to_string();
-        let after_close = &after_bracket[close + 1..];
-        let value_start = after_close.strip_prefix('=')?;
-        let mut rest_chunks = vec![Chunk::Str(value_start.to_string())];
-        rest_chunks.extend(w.chunks[1..].iter().cloned());
-        return Some((name.to_string(), index, Word { chunks: rest_chunks, globbable: false }));
+    let mut flat = String::new();
+    let mut bounds: Vec<(usize, usize, bool)> = Vec::new(); // (start_in_flat, chunk_idx, is_literal)
+    for (ci, c) in w.chunks.iter().enumerate() {
+        let (s, is_lit) = match c {
+            Chunk::Str(s) => (s, false),
+            Chunk::LiteralStr(s) => (s, true),
+            _ => break,
+        };
+        bounds.push((flat.len(), ci, is_lit));
+        flat.push_str(s);
     }
-    None
+    let bracket = flat.find('[')?;
+    let name = &flat[..bracket];
+    if !is_valid_ident(name) {
+        return None;
+    }
+    let after_bracket = &flat[bracket + 1..];
+    let close_rel = after_bracket.find(']')?;
+    let index = after_bracket[..close_rel].to_string();
+    let close = bracket + 1 + close_rel;
+    let value_start = flat[close + 1..].strip_prefix('=')?;
+    let value_pos = flat.len() - value_start.len();
+
+    let &(start, chunk_idx, is_lit) = bounds.iter().rfind(|&&(start, _, _)| start <= value_pos)?;
+    let chunk_text = match &w.chunks[chunk_idx] {
+        Chunk::Str(s) | Chunk::LiteralStr(s) => s,
+        _ => unreachable!(),
+    };
+    let remainder = chunk_text[value_pos - start..].to_string();
+    let mut rest_chunks = Vec::new();
+    if !remainder.is_empty() {
+        rest_chunks.push(if is_lit { Chunk::LiteralStr(remainder) } else { Chunk::Str(remainder) });
+    }
+    rest_chunks.extend(w.chunks[chunk_idx + 1..].iter().cloned());
+    if rest_chunks.is_empty() {
+        rest_chunks.push(Chunk::Str(String::new()));
+    }
+    Some((name.to_string(), index, Word { chunks: rest_chunks, globbable: false }))
 }
 
 fn is_empty_word(w: &Word) -> bool {

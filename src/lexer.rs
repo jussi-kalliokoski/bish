@@ -44,16 +44,15 @@ pub enum Chunk {
     ProcSubIn { raw: String },
     ProcSubOut { raw: String },
     // A literal run of text that was quoted or backslash-escaped in the
-    // source, ONLY ever produced while lexing a `[[ ... =~ pattern ]]`
-    // operand (relaxed mode in read_word). Plain Chunk::Str can't carry
-    // this distinction -- quoted and unquoted literal runs normally merge
-    // losslessly into one Chunk::Str, since ordinary word-splitting never
-    // needs to tell them apart. The =~ operand does: quoting/escaping part
-    // of a regex pattern forces that part to match literally instead of
-    // as regex syntax (see expand_regex_operand in exec.rs), so this
-    // variant exists to keep those runs distinguishable from the
-    // surrounding unquoted regex syntax. Treated identically to
-    // Chunk::Str everywhere else (word-splitting, serialization).
+    // source -- read_word always flushes buf and emits one of these at a
+    // quote/escape boundary rather than merging the quoted text into the
+    // surrounding Chunk::Str, so a quoted/escaped metachar next to real
+    // unquoted glob or regex syntax in the same word stays distinguishable
+    // (see expand_word_split's pattern-building and expand_regex_operand
+    // in exec.rs, both of which escape LiteralStr but not Chunk::Str).
+    // Treated identically to Chunk::Str everywhere else that just wants
+    // the plain text value (word-splitting, serialization, command-name
+    // lookup): see the `Chunk::Str(s) | Chunk::LiteralStr(s)` arms.
     LiteralStr(String),
 }
 
@@ -108,13 +107,9 @@ pub enum Tok {
     // for these. Words that don't qualify (partly quoted, or containing
     // any expansion) still glob-expand -- expand_word_split builds a
     // second, per-chunk-escaped pattern string alongside the split fields,
-    // so only quoted characters are excluded from matching. The one
-    // accepted gap: Chunk::Str merges quoted and unquoted literal runs
-    // losslessly (see LiteralStr's doc comment above), so a literal
-    // metachar written inside quotes but merged into the same Chunk::Str
-    // as adjacent unquoted glob syntax can't be told apart and is treated
-    // as raw pattern text -- rare in practice (e.g. `"a*"b*` where the
-    // first `*` should stay literal).
+    // escaping each LiteralStr chunk (quoted/escaped source text) so only
+    // its literal characters are excluded from matching, while Chunk::Str
+    // and expansion results stay real pattern syntax.
     Word(Vec<Chunk>, bool),
     Pipe,
     And,
@@ -848,15 +843,16 @@ impl<'a> Lexer<'a> {
                             Some(c) => lit.push(c),
                         }
                     }
-                    if relaxed {
-                        if !buf.is_empty() {
-                            chunks.push(Chunk::Str(std::mem::take(&mut buf)));
-                        }
-                        if !lit.is_empty() {
-                            chunks.push(Chunk::LiteralStr(lit));
-                        }
-                    } else {
-                        buf.push_str(&lit);
+                    // Always flush buf and push the quoted run as its own
+                    // LiteralStr rather than merging it into buf -- merging
+                    // would make a quoted metachar indistinguishable from
+                    // real unquoted glob/regex syntax elsewhere in the same
+                    // word (see LiteralStr's doc comment).
+                    if !buf.is_empty() {
+                        chunks.push(Chunk::Str(std::mem::take(&mut buf)));
+                    }
+                    if !lit.is_empty() {
+                        chunks.push(Chunk::LiteralStr(lit));
                     }
                 }
                 Some('"') => {
@@ -879,8 +875,7 @@ impl<'a> Lexer<'a> {
                                     chunks.push(Chunk::Str(std::mem::take(&mut buf)));
                                 }
                                 if !lit.is_empty() {
-                                    let taken = std::mem::take(&mut lit);
-                                    chunks.push(if relaxed { Chunk::LiteralStr(taken) } else { Chunk::Str(taken) });
+                                    chunks.push(Chunk::LiteralStr(std::mem::take(&mut lit)));
                                 }
                                 // Pass `lit` (now empty), not `buf`: if
                                 // nothing valid follows the `$`, push_var's
@@ -897,34 +892,28 @@ impl<'a> Lexer<'a> {
                                     chunks.push(Chunk::Str(std::mem::take(&mut buf)));
                                 }
                                 if !lit.is_empty() {
-                                    let taken = std::mem::take(&mut lit);
-                                    chunks.push(if relaxed { Chunk::LiteralStr(taken) } else { Chunk::Str(taken) });
+                                    chunks.push(Chunk::LiteralStr(std::mem::take(&mut lit)));
                                 }
                                 chunks.push(Chunk::Sub { raw: self.capture_backtick()?, quoted: true });
                             }
                             Some(c) => lit.push(c),
                         }
                     }
+                    if !buf.is_empty() {
+                        chunks.push(Chunk::Str(std::mem::take(&mut buf)));
+                    }
                     if !lit.is_empty() {
-                        if relaxed {
-                            chunks.push(Chunk::LiteralStr(lit));
-                        } else {
-                            buf.push_str(&lit);
-                        }
+                        chunks.push(Chunk::LiteralStr(lit));
                     }
                 }
                 Some('\\') => {
                     plain = false;
                     self.chars.next();
                     if let Some(n) = self.chars.next() {
-                        if relaxed {
-                            if !buf.is_empty() {
-                                chunks.push(Chunk::Str(std::mem::take(&mut buf)));
-                            }
-                            chunks.push(Chunk::LiteralStr(n.to_string()));
-                        } else {
-                            buf.push(n);
+                        if !buf.is_empty() {
+                            chunks.push(Chunk::Str(std::mem::take(&mut buf)));
                         }
+                        chunks.push(Chunk::LiteralStr(n.to_string()));
                     }
                 }
                 Some('$') if self.peek2() == Some('\'') => {

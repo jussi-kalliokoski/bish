@@ -1981,7 +1981,10 @@ impl Shell {
         let saved_stderr_target = self.current_stderr_target.take();
         self.current_stderr_target = self.peek_stderr_target(&cmd.redirects);
         let first_word_literal = match cmd.words[0].chunks.as_slice() {
-            [Chunk::Str(s)] => Some(s.as_str()),
+            // Quoting a builtin's own name doesn't stop bash from
+            // recognizing it (`"export" FOO=bar` still runs export), so
+            // this must match a fully-quoted name too, not just a bare one.
+            [Chunk::Str(s)] | [Chunk::LiteralStr(s)] => Some(s.as_str()),
             _ => None,
         };
         let argv: Vec<String> = if matches!(
@@ -2927,18 +2930,11 @@ impl Shell {
     // expression (so `${arr[i+1]}` works) and looked up 0-based. A gap
     // index (never set) reads back as empty, same as an unset scalar.
     // Associative-array indices are literal (expandable) strings, not
-    // arithmetic expressions -- re-lex the raw index text as a standalone
-    // word and expand it, same machinery `split_array_literal_words` uses.
+    // arithmetic expressions -- re-lex the raw index text and expand it,
+    // same as expand_raw (an index like `with space` re-lexes as more than
+    // one Word token; taking only the first would silently truncate it).
     fn expand_index_as_string(&mut self, index: &str) -> String {
-        match crate::lexer::Lexer::new(index).tokenize() {
-            Ok(toks) => match toks.into_iter().next() {
-                Some(crate::lexer::Tok::Word(chunks, _)) => {
-                    self.expand_word(&Word { chunks, globbable: false })
-                }
-                _ => index.to_string(),
-            },
-            Err(_) => index.to_string(),
-        }
+        self.expand_raw(index)
     }
 
     // Negative indices count back from the end: bash defines them as
@@ -3093,9 +3089,16 @@ impl Shell {
         let mut pattern_current: Option<String> = None;
         for c in &w.chunks {
             match c {
-                Chunk::Str(t) | Chunk::LiteralStr(t) => {
+                Chunk::Str(t) => {
                     current.get_or_insert_with(String::new).push_str(t);
                     pattern_current.get_or_insert_with(String::new).push_str(t);
+                }
+                Chunk::LiteralStr(t) => {
+                    // Quoted or backslash-escaped source text -- always
+                    // escaped for the pattern copy, whatever characters it
+                    // contains, so it can never itself act as a wildcard.
+                    current.get_or_insert_with(String::new).push_str(t);
+                    pattern_current.get_or_insert_with(String::new).push_str(&crate::glob::escape(t));
                 }
                 Chunk::Var { name, quoted } => {
                     // "$@" is a special case even when quoted: it expands
