@@ -1391,7 +1391,18 @@ impl Shell {
                 let a = self.expand_word(a);
                 if op == "=~" {
                     let pattern = self.expand_regex_operand(b);
-                    crate::regex::is_match(&a, &pattern)
+                    match crate::regex::match_captures(&a, &pattern) {
+                        Some(groups) => {
+                            let map: std::collections::BTreeMap<usize, String> =
+                                groups.into_iter().enumerate().collect();
+                            self.arrays.insert("BASH_REMATCH".to_string(), map);
+                            true
+                        }
+                        None => {
+                            self.arrays.remove("BASH_REMATCH");
+                            false
+                        }
+                    }
                 } else {
                     let b = self.expand_word(b);
                     builtins::binary(&a, &op, &b, true)
