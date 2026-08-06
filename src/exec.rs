@@ -83,6 +83,17 @@ pub struct Shell {
     // var_scopes) has no frame to push onto and just leaks globally,
     // matching bash's own top-level `declare -n` behavior.
     nameref_local_stack: Vec<Vec<(String, bool)>>,
+    // pushd/popd/dirs: does NOT include the current directory itself (bash
+    // convention -- `dirs` prints cwd first, then this stack). `+N`/`-N`
+    // rotation forms aren't implemented, a scoped gap.
+    dir_stack: Vec<String>,
+    // shopt -s/-u NAME: only a handful of names are meaningfully tracked
+    // (most of ash's behavior isn't actually gated by any of these -- e.g.
+    // extglob is unconditionally on, see glob.rs), but recognizing the
+    // builtin at all means `shopt -s extglob`/`shopt -s nullglob` in a
+    // script no longer fails as an unknown command, which would otherwise
+    // abort the whole script under `set -e`.
+    shopt_options: std::collections::HashSet<String>,
     // `readonly NAME`. Checked by assign_var, the single write path plain
     // assignment/local/export/declare/arithmetic-assignment/read/getopts
     // all funnel through, so marking a name here blocks writes everywhere
@@ -153,6 +164,8 @@ impl Shell {
             assoc_local_stack: Vec::new(),
             nameref_names: std::collections::HashSet::new(),
             nameref_local_stack: Vec::new(),
+            dir_stack: Vec::new(),
+            shopt_options: std::collections::HashSet::new(),
             readonly_names: std::collections::HashSet::new(),
             integer_names: std::collections::HashSet::new(),
             proc_sub_out_pending: Vec::new(),
@@ -418,6 +431,130 @@ impl Shell {
             self.readonly_names.insert(name);
         }
         0
+    }
+
+    // shopt -s/-u NAME... [-q NAME]. Most tracked names have no actual
+    // effect on ash's behavior (see the comment on shopt_options), but
+    // recognizing the builtin at all keeps `shopt -s extglob`-style
+    // defensive script preambles from failing as an unknown command.
+    // extglob is special-cased as always reporting "on", since ash's
+    // extglob support is unconditional rather than gated by this flag.
+    fn run_shopt(&mut self, args: &[String]) -> i32 {
+        let mut mode: Option<bool> = None; // Some(true)=-s, Some(false)=-u
+        let mut quiet = false;
+        let mut names: Vec<&str> = Vec::new();
+        for a in args {
+            match a.as_str() {
+                "-s" => mode = Some(true),
+                "-u" => mode = Some(false),
+                "-q" => quiet = true,
+                _ if a.starts_with('-') => {}
+                other => names.push(other),
+            }
+        }
+        let is_on = |shell: &Shell, n: &str| n == "extglob" || shell.shopt_options.contains(n);
+        match mode {
+            Some(on) => {
+                for n in &names {
+                    if on {
+                        self.shopt_options.insert(n.to_string());
+                    } else {
+                        self.shopt_options.remove(*n);
+                    }
+                }
+                0
+            }
+            None if quiet => {
+                if names.iter().all(|n| is_on(self, n)) {
+                    0
+                } else {
+                    1
+                }
+            }
+            None => {
+                for n in &names {
+                    println!("{:<15}\t{}", n, if is_on(self, n) { "on" } else { "off" });
+                }
+                0
+            }
+        }
+    }
+
+    fn run_pushd(&mut self, args: &[String]) -> i32 {
+        let target = match args.iter().find(|a| !a.starts_with('-')) {
+            Some(d) => d.clone(),
+            None => match self.dir_stack.first() {
+                Some(d) => d.clone(),
+                None => {
+                    eprintln!("ash: pushd: no other directory");
+                    return 1;
+                }
+            },
+        };
+        if !args.iter().any(|a| !a.starts_with('-')) {
+            // Bare `pushd`: rotate -- cd into the current top-of-stack,
+            // then push the old cwd back onto the front, net-swapping them.
+            self.dir_stack.remove(0);
+        }
+        let old_cwd = std::env::current_dir().ok().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
+        if builtins::cd(&[target]) != 0 {
+            return 1;
+        }
+        self.dir_stack.insert(0, old_cwd);
+        self.print_dirs(false);
+        0
+    }
+
+    fn run_popd(&mut self, _args: &[String]) -> i32 {
+        let target = match self.dir_stack.first() {
+            Some(d) => d.clone(),
+            None => {
+                eprintln!("ash: popd: directory stack empty");
+                return 1;
+            }
+        };
+        if builtins::cd(&[target]) != 0 {
+            return 1;
+        }
+        self.dir_stack.remove(0);
+        self.print_dirs(false);
+        0
+    }
+
+    fn run_dirs(&mut self, args: &[String]) -> i32 {
+        if args.iter().any(|a| a == "-c") {
+            self.dir_stack.clear();
+            return 0;
+        }
+        self.print_dirs(args.iter().any(|a| a == "-v"));
+        0
+    }
+
+    fn collapse_home(path: &str) -> String {
+        if let Ok(home) = std::env::var("HOME") {
+            if !home.is_empty() {
+                if path == home {
+                    return "~".to_string();
+                }
+                if let Some(rest) = path.strip_prefix(&format!("{}/", home)) {
+                    return format!("~/{}", rest);
+                }
+            }
+        }
+        path.to_string()
+    }
+
+    fn print_dirs(&self, vertical: bool) {
+        let cwd = std::env::current_dir().ok().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
+        let mut all = vec![cwd];
+        all.extend(self.dir_stack.iter().cloned());
+        if vertical {
+            for (i, d) in all.iter().enumerate() {
+                println!("{:2}  {}", i, Self::collapse_home(d));
+            }
+        } else {
+            println!("{}", all.iter().map(|d| Self::collapse_home(d)).collect::<Vec<_>>().join(" "));
+        }
     }
 
     // set [-euxo pipefail] [--] [args...]. Combined single-char flags
@@ -1457,6 +1594,11 @@ impl Shell {
                 return ExecResult::Status(0);
             }
             "cd" => return ExecResult::Status(builtins::cd(&argv[1..])),
+            "umask" => return ExecResult::Status(builtins::umask(&argv[1..])),
+            "shopt" => return ExecResult::Status(self.run_shopt(&argv[1..])),
+            "pushd" => return ExecResult::Status(self.run_pushd(&argv[1..])),
+            "popd" => return ExecResult::Status(self.run_popd(&argv[1..])),
+            "dirs" => return ExecResult::Status(self.run_dirs(&argv[1..])),
             "export" => return ExecResult::Status(builtins::export(&argv[1..])),
             "let" => {
                 let mut last = 0i64;
@@ -3435,6 +3577,11 @@ const KNOWN_BUILTINS: &[&str] = &[
     "command",
     "type",
     "hash",
+    "shopt",
+    "umask",
+    "pushd",
+    "popd",
+    "dirs",
 ];
 
 fn is_known_builtin(name: &str) -> bool {

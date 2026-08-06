@@ -1,6 +1,61 @@
 #[cfg(unix)]
 use std::os::unix::fs::FileTypeExt;
 
+// POSIX has no query-only umask read -- `umask(new) -> previous` is the
+// only syscall shape, so reading the current value means setting a
+// throwaway mask and immediately restoring what was there.
+pub fn umask(args: &[String]) -> i32 {
+    unsafe extern "C" {
+        fn umask(mask: u32) -> u32;
+    }
+    let symbolic = args.iter().any(|a| a == "-S");
+    match args.iter().find(|a| !a.starts_with('-')) {
+        Some(s) => match u32::from_str_radix(s, 8) {
+            Ok(m) => {
+                unsafe {
+                    umask(m);
+                }
+                0
+            }
+            Err(_) => {
+                eprintln!("ash: umask: {}: invalid octal number", s);
+                1
+            }
+        },
+        None => {
+            let cur = unsafe {
+                let prev = umask(0);
+                umask(prev);
+                prev
+            };
+            if symbolic {
+                println!("{}", umask_symbolic(cur));
+            } else {
+                println!("{:04o}", cur);
+            }
+            0
+        }
+    }
+}
+
+fn umask_symbolic(mask: u32) -> String {
+    let perm_for = |shift: u32| -> String {
+        let bits = (mask >> shift) & 0o7;
+        let mut s = String::new();
+        if bits & 0o4 == 0 {
+            s.push('r');
+        }
+        if bits & 0o2 == 0 {
+            s.push('w');
+        }
+        if bits & 0o1 == 0 {
+            s.push('x');
+        }
+        s
+    };
+    format!("u={},g={},o={}", perm_for(6), perm_for(3), perm_for(0))
+}
+
 pub fn cd(args: &[String]) -> i32 {
     let old = std::env::current_dir().ok().map(|p| p.to_string_lossy().into_owned());
     let target = if let Some(dir) = args.first() {
