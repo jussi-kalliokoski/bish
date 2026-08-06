@@ -1,6 +1,6 @@
-// Hand-rolled tokenizer for the v1 shell grammar: pipelines, redirects,
-// sequencing, quoting, and $VAR expansion. No globbing, no command
-// substitution, no here-docs yet -- those come with later iterations.
+// Hand-rolled tokenizer for bish's shell grammar: pipelines, redirects,
+// sequencing, quoting, control flow, $VAR/command/arithmetic expansion,
+// globbing, and here-docs.
 
 // `quoted` records whether this expansion appeared inside "..." (or is
 // otherwise not subject to word-splitting) -- exec.rs's expand_word_split
@@ -61,9 +61,7 @@ pub enum Chunk {
 // and re-expanded/glob-matched at evaluation time (see exec.rs), same
 // deferred-parsing approach as Sub/Arith. `colon` distinguishes `${V:-x}`
 // (triggers on unset-or-empty) from `${V-x}` (triggers on unset only) --
-// v1 treats both the same (unset and empty are conflated throughout the
-// shell's variable lookup), so `colon` is currently unused but kept for
-// when that distinction is implemented.
+// eval_var_op (exec.rs) branches on it via var_is_set vs is_empty.
 #[derive(Debug, Clone, PartialEq)]
 pub enum VarOp {
     Length,
@@ -104,10 +102,19 @@ pub enum ReplaceAnchor {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Tok {
-    // Word(chunks, globbable) -- globbable is true only if the word had no
-    // quoting/escaping/expansion at all (see read_word); a word that's
-    // partly quoted never glob-expands in v1, a conservative
-    // under-globbing simplification vs. bash's per-character quote tracking.
+    // Word(chunks, globbable) -- globbable is a fast-path flag, true only
+    // if the word had no quoting/escaping/expansion at all (see
+    // read_word); expand_words (exec.rs) takes a cheap literal-string path
+    // for these. Words that don't qualify (partly quoted, or containing
+    // any expansion) still glob-expand -- expand_word_split builds a
+    // second, per-chunk-escaped pattern string alongside the split fields,
+    // so only quoted characters are excluded from matching. The one
+    // accepted gap: Chunk::Str merges quoted and unquoted literal runs
+    // losslessly (see LiteralStr's doc comment above), so a literal
+    // metachar written inside quotes but merged into the same Chunk::Str
+    // as adjacent unquoted glob syntax can't be told apart and is treated
+    // as raw pattern text -- rare in practice (e.g. `"a*"b*` where the
+    // first `*` should stay literal).
     Word(Vec<Chunk>, bool),
     Pipe,
     And,

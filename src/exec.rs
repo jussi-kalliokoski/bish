@@ -863,7 +863,10 @@ impl Shell {
 
     // set [-euxo pipefail] [--] [args...]. Combined single-char flags
     // (-eu, -ex, -eux) work; `-o name` must be its own token (not combined
-    // into a cluster with other short flags) -- a bounded v1 simplification.
+    // into a cluster with other short flags) -- matches real bash, which
+    // also rejects e.g. `-euo pipefail` (it consumes `-o` with no argument
+    // of its own, then tries to parse "pipefail"'s remaining letters as
+    // further short flags and errors on the first invalid one).
     fn run_set(&mut self, args: &[String]) -> i32 {
         let mut idx = 0;
         let mut saw_dashdash = false;
