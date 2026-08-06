@@ -59,6 +59,24 @@ pub struct Shell {
     // array is read or written.
     assoc_arrays: HashMap<String, std::collections::BTreeMap<String, String>>,
     assoc_names: std::collections::HashSet<String>,
+    // `alias name=value`: stored and queryable (alias/unalias both work as
+    // a plain table), but NOT expanded when a command runs. Real alias
+    // expansion happens at parse time on an already-known table, textually
+    // substituting a command-position word before the rest of that line is
+    // even tokenized -- fundamentally at odds with this shell parsing an
+    // entire script upfront before executing anything (a script-mode
+    // architecture, unlike bash's line-at-a-time interactive parsing). It's
+    // also off by default in bash for non-interactive shells (needs
+    // `shopt -s expand_aliases`), so a script that never touches that
+    // option -- the overwhelming majority -- already sees this exact
+    // behavior from real bash too. Storing without expanding keeps a
+    // defensive `alias foo=... ` preamble from failing the script outright
+    // under `set -e`, without risking a half-correct expansion that only
+    // works for some control-flow shapes.
+    // Vec, not a map -- bash's own `alias` listing (and real bash's own
+    // internal table) is in definition order, not sorted, and this list is
+    // never large enough for linear lookup to matter.
+    aliases: Vec<(String, String)>,
     // One frame per active function call (pushed/popped alongside
     // var_scopes in call_function). `local -a`/`-A name` snapshots the
     // array's pre-local value here (None if it didn't exist) before
@@ -171,6 +189,7 @@ impl Shell {
             arrays: HashMap::new(),
             assoc_arrays: HashMap::new(),
             assoc_names: std::collections::HashSet::new(),
+            aliases: Vec::new(),
             array_local_stack: Vec::new(),
             assoc_local_stack: Vec::new(),
             nameref_names: std::collections::HashSet::new(),
@@ -1643,6 +1662,59 @@ impl Shell {
             "cd" => return ExecResult::Status(builtins::cd(&argv[1..])),
             "umask" => return ExecResult::Status(builtins::umask(&argv[1..])),
             "ulimit" => return ExecResult::Status(builtins::ulimit(&argv[1..])),
+            // alias/unalias: store and query only, no expansion when a
+            // command runs -- see the comment on the `aliases` field for
+            // why.
+            "alias" => {
+                if argv.len() == 1 {
+                    let mut sorted: Vec<&(String, String)> = self.aliases.iter().collect();
+                    sorted.sort_by(|a, b| a.0.cmp(&b.0));
+                    for (n, v) in sorted {
+                        println!("alias {}={}", n, crate::serialize::quote_literal(v));
+                    }
+                    return ExecResult::Status(0);
+                }
+                let mut status = 0;
+                for a in &argv[1..] {
+                    match a.find('=') {
+                        Some(eq) => {
+                            let name = a[..eq].to_string();
+                            let val = a[eq + 1..].to_string();
+                            match self.aliases.iter_mut().find(|(n, _)| *n == name) {
+                                Some(existing) => existing.1 = val,
+                                None => self.aliases.push((name, val)),
+                            }
+                        }
+                        None => match self.aliases.iter().find(|(n, _)| n == a) {
+                            Some((n, v)) => println!("alias {}={}", n, crate::serialize::quote_literal(v)),
+                            None => {
+                                eprintln!("ash: alias: {}: not found", a);
+                                status = 1;
+                            }
+                        },
+                    }
+                }
+                return ExecResult::Status(status);
+            }
+            "unalias" => {
+                if argv[1..].iter().any(|a| a == "-a") {
+                    self.aliases.clear();
+                    return ExecResult::Status(0);
+                }
+                let mut status = 0;
+                for a in &argv[1..] {
+                    match self.aliases.iter().position(|(n, _)| n == a) {
+                        Some(pos) => {
+                            self.aliases.remove(pos);
+                        }
+                        None => {
+                            eprintln!("ash: unalias: {}: not found", a);
+                            status = 1;
+                        }
+                    }
+                }
+                return ExecResult::Status(status);
+            }
             "shopt" => return ExecResult::Status(self.run_shopt(&argv[1..])),
             "pushd" => return ExecResult::Status(self.run_pushd(&argv[1..])),
             "popd" => return ExecResult::Status(self.run_popd(&argv[1..])),
@@ -3731,6 +3803,8 @@ const KNOWN_BUILTINS: &[&str] = &[
     "popd",
     "dirs",
     "ulimit",
+    "alias",
+    "unalias",
 ];
 
 fn is_known_builtin(name: &str) -> bool {
