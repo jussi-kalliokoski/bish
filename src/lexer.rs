@@ -238,6 +238,17 @@ impl<'a> Lexer<'a> {
                 self.regex_operand_next = false;
                 if self.chars.peek().is_some() {
                     let (word, plain) = self.read_word(true)?;
+                    // Real bash rejects an unquoted `<`/`>` immediately
+                    // following (no space) a `=~` regex operand with a
+                    // syntax error, confirmed empirically -- read_word's
+                    // own relaxed-mode word-breaking just stops *before*
+                    // the character without consuming it, which would
+                    // otherwise silently truncate the pattern there and
+                    // let the rest of the line be reinterpreted as
+                    // ordinary redirect/word tokens instead of erroring.
+                    if let Some(c @ ('<' | '>')) = self.chars.peek().copied() {
+                        return Err(format!("syntax error near unexpected token `{}'", c));
+                    }
                     toks.push(Tok::Word(word, plain));
                 }
                 continue;
