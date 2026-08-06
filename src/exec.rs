@@ -103,6 +103,17 @@ pub struct Shell {
     // arithmetic expressions instead of stored as literal text (checked in
     // assign_var, the single write path).
     integer_names: std::collections::HashSet<String>,
+    // `declare -u`/`-l`: assignments to these names are case-folded
+    // (checked in assign_var alongside integer_names).
+    upper_names: std::collections::HashSet<String>,
+    lower_names: std::collections::HashSet<String>,
+    // `declare -x`/`export -x NAME` on a name that's currently a `local`:
+    // globals are already unconditionally visible to children (assign_var
+    // writes them straight to the process env), so this only matters for a
+    // local -- assign_var additionally mirrors the value into the process
+    // env for any name in this set, so child processes can see it despite
+    // it living in var_scopes rather than env.
+    exported_names: std::collections::HashSet<String>,
     // `>(cmd)` substitutions queued by the command currently being built,
     // to run (reading the temp file back) once it finishes; see
     // run_proc_sub_out/drain_proc_subs.
@@ -168,6 +179,9 @@ impl Shell {
             shopt_options: std::collections::HashSet::new(),
             readonly_names: std::collections::HashSet::new(),
             integer_names: std::collections::HashSet::new(),
+            upper_names: std::collections::HashSet::new(),
+            lower_names: std::collections::HashSet::new(),
+            exported_names: std::collections::HashSet::new(),
             proc_sub_out_pending: Vec::new(),
             proc_sub_cleanup: Vec::new(),
             rng_state: {
@@ -346,6 +360,9 @@ impl Shell {
         let mut readonly_flag = false;
         let mut integer_flag = false;
         let mut nameref_flag = false;
+        let mut upper_flag = false;
+        let mut lower_flag = false;
+        let mut export_flag = false;
         for a in args {
             match a.as_str() {
                 "-A" => {
@@ -368,6 +385,18 @@ impl Shell {
                     nameref_flag = true;
                     continue;
                 }
+                "-u" => {
+                    upper_flag = true;
+                    continue;
+                }
+                "-l" => {
+                    lower_flag = true;
+                    continue;
+                }
+                "-x" => {
+                    export_flag = true;
+                    continue;
+                }
                 _ => {}
             }
             if a.starts_with('-') {
@@ -379,6 +408,15 @@ impl Shell {
             };
             if integer_flag {
                 self.integer_names.insert(name.clone());
+            }
+            if upper_flag {
+                self.upper_names.insert(name.clone());
+            }
+            if lower_flag {
+                self.lower_names.insert(name.clone());
+            }
+            if export_flag {
+                self.exported_names.insert(name.clone());
             }
             if nameref_flag {
                 self.nameref_names.insert(name.clone());
@@ -1660,6 +1698,15 @@ impl Shell {
                 let mut array_mode: Option<bool> = None;
                 let mut integer_flag = false;
                 let mut nameref_flag = false;
+                // -u/-l/-x attribute membership (like -i above) isn't
+                // unwound when the function returns -- a narrower, already-
+                // accepted gap than the array/nameref leak this function
+                // otherwise guards against, since getting a case-fold or
+                // export attribute stuck past its function is cosmetic
+                // rather than silently wrong data.
+                let mut upper_flag = false;
+                let mut lower_flag = false;
+                let mut export_flag = false;
                 for a in &argv[1..] {
                     match a.as_str() {
                         "-a" => {
@@ -1676,6 +1723,18 @@ impl Shell {
                         }
                         "-n" => {
                             nameref_flag = true;
+                            continue;
+                        }
+                        "-u" => {
+                            upper_flag = true;
+                            continue;
+                        }
+                        "-l" => {
+                            lower_flag = true;
+                            continue;
+                        }
+                        "-x" => {
+                            export_flag = true;
                             continue;
                         }
                         _ if a.starts_with('-') => continue,
@@ -1695,6 +1754,15 @@ impl Shell {
                     if integer_flag {
                         self.integer_names.insert(n.clone());
                     }
+                    if upper_flag {
+                        self.upper_names.insert(n.clone());
+                    }
+                    if lower_flag {
+                        self.lower_names.insert(n.clone());
+                    }
+                    if export_flag {
+                        self.exported_names.insert(n.clone());
+                    }
                     match array_mode {
                         Some(true) => {
                             let prev = self.assoc_arrays.remove(&n);
@@ -1710,6 +1778,18 @@ impl Shell {
                         None => {
                             let v = v.unwrap_or_default();
                             let v = if integer_flag { arith::eval(&v, self).unwrap_or(0).to_string() } else { v };
+                            let v = if upper_flag {
+                                v.to_uppercase()
+                            } else if lower_flag {
+                                v.to_lowercase()
+                            } else {
+                                v
+                            };
+                            if export_flag {
+                                unsafe {
+                                    std::env::set_var(&n, &v);
+                                }
+                            }
                             self.var_scopes.last_mut().unwrap().insert(n, v);
                         }
                     }
@@ -3018,6 +3098,19 @@ impl Shell {
         // on an integer-attribute variable stores 5, not the string "2+3").
         let value =
             if self.integer_names.contains(name) { arith::eval(&value, self).unwrap_or(0).to_string() } else { value };
+        // `declare -u`/`-l`: case-fold on every assignment.
+        let value = if self.upper_names.contains(name) {
+            value.to_uppercase()
+        } else if self.lower_names.contains(name) {
+            value.to_lowercase()
+        } else {
+            value
+        };
+        if self.exported_names.contains(name) {
+            unsafe {
+                std::env::set_var(name, &value);
+            }
+        }
         self.raw_var_write(name, value);
     }
 
