@@ -15,7 +15,7 @@ fn main() {
     let mut shell = exec::Shell::new();
 
     if args.len() >= 3 && args[1] == "-c" {
-        let script_name = args.get(3).cloned().unwrap_or_else(|| "ash".to_string());
+        let script_name = args.get(3).cloned().unwrap_or_else(|| "bish".to_string());
         let positional = args.get(4..).map(|s| s.to_vec()).unwrap_or_default();
         shell.set_script_args(script_name, positional);
         std::process::exit(run_source(&mut shell, &args[2]));
@@ -27,7 +27,7 @@ fn main() {
         match std::fs::read_to_string(path) {
             Ok(src) => std::process::exit(run_source(&mut shell, &src)),
             Err(e) => {
-                eprintln!("ash: {}: {}", path, e);
+                eprintln!("bish: {}: {}", path, e);
                 std::process::exit(1);
             }
         }
@@ -52,12 +52,12 @@ fn run_source(shell: &mut exec::Shell, src: &str) -> i32 {
                 shell.last_status
             }
             Err(e) => {
-                eprintln!("ash: syntax error: {}", e);
+                eprintln!("bish: syntax error: {}", e);
                 2
             }
         },
         Err(e) => {
-            eprintln!("ash: syntax error: {}", e);
+            eprintln!("bish: syntax error: {}", e);
             2
         }
     }

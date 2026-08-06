@@ -1,6 +1,6 @@
-// Reconstructs valid ash source text from parsed AST -- used to forward
+// Reconstructs valid bish source text from parsed AST -- used to forward
 // currently-defined functions into a self-exec'd child process for command
-// substitution / subshells (see exec.rs), since those run as a fresh `ash
+// substitution / subshells (see exec.rs), since those run as a fresh `bish
 // -c` process that otherwise has no knowledge of the parent's in-memory
 // function table. Doesn't need to be a general pretty-printer: just needs
 // to round-trip whatever a function body can contain.

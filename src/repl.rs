@@ -11,7 +11,7 @@ pub fn run(shell: &mut Shell) {
     let mut buffer = String::new();
 
     loop {
-        print!("{}", if buffer.is_empty() { "ash> " } else { "> " });
+        print!("{}", if buffer.is_empty() { "bish> " } else { "> " });
         let _ = io::stdout().flush();
 
         let mut line = String::new();
@@ -19,7 +19,7 @@ pub fn run(shell: &mut Shell) {
             Ok(0) => {
                 println!();
                 if !buffer.is_empty() {
-                    eprintln!("ash: syntax error: unexpected end of input");
+                    eprintln!("bish: syntax error: unexpected end of input");
                 }
                 shell.run_exit_trap();
                 break;
@@ -43,21 +43,21 @@ pub fn run(shell: &mut Shell) {
                         }
                         Err(e) => {
                             if !is_incomplete(&e) {
-                                eprintln!("ash: syntax error: {}", e);
+                                eprintln!("bish: syntax error: {}", e);
                                 buffer.clear();
                             }
                         }
                     },
                     Err(e) => {
                         if !is_incomplete(&e) {
-                            eprintln!("ash: syntax error: {}", e);
+                            eprintln!("bish: syntax error: {}", e);
                             buffer.clear();
                         }
                     }
                 }
             }
             Err(e) => {
-                eprintln!("ash: error reading input: {}", e);
+                eprintln!("bish: error reading input: {}", e);
                 break;
             }
         }

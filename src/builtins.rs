@@ -94,7 +94,7 @@ pub fn ulimit(args: &[String]) -> i32 {
     let spec = match LIMIT_SPECS.iter().find(|s| s.flag == f) {
         Some(s) => s,
         None => {
-            eprintln!("ash: ulimit: -{}: invalid option", f);
+            eprintln!("bish: ulimit: -{}: invalid option", f);
             return 1;
         }
     };
@@ -115,7 +115,7 @@ pub fn ulimit(args: &[String]) -> i32 {
                 match v.parse::<u64>() {
                     Ok(n) => n * spec.div,
                     Err(_) => {
-                        eprintln!("ash: ulimit: {}: invalid number", v);
+                        eprintln!("bish: ulimit: {}: invalid number", v);
                         return 1;
                     }
                 }
@@ -132,7 +132,7 @@ pub fn ulimit(args: &[String]) -> i32 {
                 }
             }
             if unsafe { setrlimit(spec.resource, &rl) } != 0 {
-                eprintln!("ash: ulimit: cannot modify limit: {}", std::io::Error::last_os_error());
+                eprintln!("bish: ulimit: cannot modify limit: {}", std::io::Error::last_os_error());
                 return 1;
             }
             0
@@ -157,7 +157,7 @@ pub fn umask(args: &[String]) -> i32 {
                 0
             }
             Err(_) => {
-                eprintln!("ash: umask: {}: invalid octal number", s);
+                eprintln!("bish: umask: {}: invalid octal number", s);
                 1
             }
         },

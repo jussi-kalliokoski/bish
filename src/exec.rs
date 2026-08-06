@@ -106,7 +106,7 @@ pub struct Shell {
     // rotation forms aren't implemented, a scoped gap.
     dir_stack: Vec<String>,
     // shopt -s/-u NAME: only a handful of names are meaningfully tracked
-    // (most of ash's behavior isn't actually gated by any of these -- e.g.
+    // (most of bish's behavior isn't actually gated by any of these -- e.g.
     // extglob is unconditionally on, see glob.rs), but recognizing the
     // builtin at all means `shopt -s extglob`/`shopt -s nullglob` in a
     // script no longer fails as an unknown command, which would otherwise
@@ -222,7 +222,7 @@ impl Shell {
             functions: HashMap::new(),
             arg_frames: vec![Vec::new()],
             var_scopes: Vec::new(),
-            script_name: "ash".to_string(),
+            script_name: "bish".to_string(),
             arrays: HashMap::new(),
             assoc_arrays: HashMap::new(),
             assoc_names: std::collections::HashSet::new(),
@@ -338,7 +338,7 @@ impl Shell {
     // never interactively signal the job via the keyboard anyway.
     fn run_fg(&mut self, args: &[String]) -> i32 {
         if !self.opt_monitor {
-            eprintln!("ash: fg: no job control");
+            eprintln!("bish: fg: no job control");
             return 1;
         }
         let idx = match args.first() {
@@ -353,7 +353,7 @@ impl Shell {
                 job.wait()
             }
             None => {
-                eprintln!("ash: fg: no current job");
+                eprintln!("bish: fg: no current job");
                 1
             }
         }
@@ -368,7 +368,7 @@ impl Shell {
     // reach, so that's what it always does.
     fn run_bg(&mut self, args: &[String]) -> i32 {
         if !self.opt_monitor {
-            eprintln!("ash: bg: no job control");
+            eprintln!("bish: bg: no job control");
             return 1;
         }
         let idx = match args.first() {
@@ -377,11 +377,11 @@ impl Shell {
         };
         match idx {
             Some(i) => {
-                eprintln!("ash: bg: job {} already in background", self.jobs[i].id);
+                eprintln!("bish: bg: job {} already in background", self.jobs[i].id);
                 0
             }
             None => {
-                eprintln!("ash: bg: no current job");
+                eprintln!("bish: bg: no current job");
                 1
             }
         }
@@ -412,12 +412,12 @@ impl Shell {
                         status = job.wait();
                     }
                     None => {
-                        eprintln!("ash: wait: pid {} is not a child of this shell", pid);
+                        eprintln!("bish: wait: pid {} is not a child of this shell", pid);
                         status = 127;
                     }
                 },
                 Err(_) => {
-                    eprintln!("ash: wait: {}: no such job", a);
+                    eprintln!("bish: wait: {}: no such job", a);
                     status = 127;
                 }
             }
@@ -455,11 +455,11 @@ impl Shell {
                 }
             } else if let Ok(pid) = t.parse::<i32>() {
                 if !send_signal(pid as u32, sig) {
-                    eprintln!("ash: kill: ({}) - No such process", pid);
+                    eprintln!("bish: kill: ({}) - No such process", pid);
                     status = 1;
                 }
             } else {
-                eprintln!("ash: kill: {}: arguments must be process or job IDs", t);
+                eprintln!("bish: kill: {}: arguments must be process or job IDs", t);
                 status = 1;
             }
         }
@@ -475,7 +475,7 @@ impl Shell {
         let varname = match args.get(1) {
             Some(v) => v.clone(),
             None => {
-                eprintln!("ash: getopts: usage: getopts optstring name [args]");
+                eprintln!("bish: getopts: usage: getopts optstring name [args]");
                 return ExecResult::Status(2);
             }
         };
@@ -506,7 +506,7 @@ impl Shell {
                 self.assign_var(&varname, "?".to_string());
                 self.assign_var("OPTARG", opt_char.to_string());
             } else {
-                eprintln!("ash: getopts: illegal option -- '{}'", opt_char);
+                eprintln!("bish: getopts: illegal option -- '{}'", opt_char);
                 self.assign_var(&varname, "?".to_string());
             }
             self.assign_var("OPTIND", (optind + 1).to_string());
@@ -527,7 +527,7 @@ impl Shell {
                     self.assign_var(&varname, ":".to_string());
                     self.assign_var("OPTARG", opt_char.to_string());
                 } else {
-                    eprintln!("ash: getopts: option requires an argument -- '{}'", opt_char);
+                    eprintln!("bish: getopts: option requires an argument -- '{}'", opt_char);
                     self.assign_var(&varname, "?".to_string());
                 }
                 self.assign_var("OPTIND", (optind + 1).to_string());
@@ -580,7 +580,7 @@ impl Shell {
                 }
             }
             if self.readonly_names.contains(n.as_str()) {
-                write_diagnostic(stderr_target, &format!("ash: unset: {}: cannot unset: readonly variable", n));
+                write_diagnostic(stderr_target, &format!("bish: unset: {}: cannot unset: readonly variable", n));
                 continue;
             }
             self.arrays.remove(n.as_str());
@@ -726,10 +726,10 @@ impl Shell {
     }
 
     // shopt -s/-u NAME... [-q NAME]. Most tracked names have no actual
-    // effect on ash's behavior (see the comment on shopt_options), but
+    // effect on bish's behavior (see the comment on shopt_options), but
     // recognizing the builtin at all keeps `shopt -s extglob`-style
     // defensive script preambles from failing as an unknown command.
-    // extglob is special-cased as always reporting "on", since ash's
+    // extglob is special-cased as always reporting "on", since bish's
     // extglob support is unconditional rather than gated by this flag.
     fn run_shopt(&mut self, args: &[String]) -> i32 {
         let mut mode: Option<bool> = None; // Some(true)=-s, Some(false)=-u
@@ -778,7 +778,7 @@ impl Shell {
             None => match self.dir_stack.first() {
                 Some(d) => d.clone(),
                 None => {
-                    eprintln!("ash: pushd: no other directory");
+                    eprintln!("bish: pushd: no other directory");
                     return 1;
                 }
             },
@@ -801,7 +801,7 @@ impl Shell {
         let target = match self.dir_stack.first() {
             Some(d) => d.clone(),
             None => {
-                eprintln!("ash: popd: directory stack empty");
+                eprintln!("bish: popd: directory stack empty");
                 return 1;
             }
         };
@@ -1056,7 +1056,7 @@ impl Shell {
             parser::Command::Arith(raw, _redirects) => match arith::eval(raw, self) {
                 Ok(v) => ExecResult::Status(if v != 0 { 0 } else { 1 }),
                 Err(e) => {
-                    eprintln!("ash: (({})): {}", raw, e);
+                    eprintln!("bish: (({})): {}", raw, e);
                     ExecResult::Status(1)
                 }
             },
@@ -1089,7 +1089,7 @@ impl Shell {
                     return match std::fs::File::open(&p) {
                         Ok(f) => Box::new(std::io::BufReader::new(f)),
                         Err(e) => {
-                            eprintln!("ash: {}: {}", p, e);
+                            eprintln!("bish: {}: {}", p, e);
                             Box::new(std::io::Cursor::new(Vec::new()))
                         }
                     };
@@ -1118,12 +1118,12 @@ impl Shell {
             Ok(toks) => match crate::parser::Parser::new(toks).parse_program() {
                 Ok(prog) => self.run_program(&prog),
                 Err(e) => {
-                    eprintln!("ash: {}: syntax error: {}", label, e);
+                    eprintln!("bish: {}: syntax error: {}", label, e);
                     ExecResult::Status(2)
                 }
             },
             Err(e) => {
-                eprintln!("ash: {}: syntax error: {}", label, e);
+                eprintln!("bish: {}: syntax error: {}", label, e);
                 ExecResult::Status(2)
             }
         }
@@ -1199,7 +1199,7 @@ impl Shell {
         s
     }
 
-    // (...) subshells self-exec the ash binary on the raw captured source
+    // (...) subshells self-exec the bish binary on the raw captured source
     // (plus the function preamble), inheriting env but not sharing process
     // state -- real bash subshells are forked children too, so mutations
     // inside (cd, variables) must not leak back into the parent. Spawning a
@@ -1209,7 +1209,7 @@ impl Shell {
         let exe = match std::env::current_exe() {
             Ok(p) => p,
             Err(e) => {
-                eprintln!("ash: subshell: {}", e);
+                eprintln!("bish: subshell: {}", e);
                 return 1;
             }
         };
@@ -1221,7 +1221,7 @@ impl Shell {
                     0
                 }
                 Err(e) => {
-                    eprintln!("ash: subshell: {}", e);
+                    eprintln!("bish: subshell: {}", e);
                     1
                 }
             }
@@ -1229,7 +1229,7 @@ impl Shell {
             match Command::new(exe).arg("-c").arg(script).status() {
                 Ok(status) => exit_code_from_status(status),
                 Err(e) => {
-                    eprintln!("ash: subshell: {}", e);
+                    eprintln!("bish: subshell: {}", e);
                     1
                 }
             }
@@ -1249,21 +1249,21 @@ impl Shell {
         let (out_r, out_w) = match std::io::pipe() {
             Ok(p) => p,
             Err(e) => {
-                eprintln!("ash: coproc: {}", e);
+                eprintln!("bish: coproc: {}", e);
                 return 1;
             }
         };
         let (in_r, in_w) = match std::io::pipe() {
             Ok(p) => p,
             Err(e) => {
-                eprintln!("ash: coproc: {}", e);
+                eprintln!("bish: coproc: {}", e);
                 return 1;
             }
         };
         let exe = match std::env::current_exe() {
             Ok(p) => p,
             Err(e) => {
-                eprintln!("ash: coproc: {}", e);
+                eprintln!("bish: coproc: {}", e);
                 return 1;
             }
         };
@@ -1288,7 +1288,7 @@ impl Shell {
                 0
             }
             Err(e) => {
-                eprintln!("ash: coproc: {}", e);
+                eprintln!("bish: coproc: {}", e);
                 1
             }
         }
@@ -1306,14 +1306,14 @@ impl Shell {
         let redirs = match self.resolve_redirect_list(redirects) {
             Ok(r) => r,
             Err(e) => {
-                eprintln!("ash: {}", e);
+                eprintln!("bish: {}", e);
                 return ExecResult::Status(1);
             }
         };
         let exe = match std::env::current_exe() {
             Ok(p) => p,
             Err(e) => {
-                eprintln!("ash: {}", e);
+                eprintln!("bish: {}", e);
                 return ExecResult::Status(1);
             }
         };
@@ -1335,14 +1335,14 @@ impl Shell {
                     match child.wait() {
                         Ok(status) => ExecResult::Status(exit_code_from_status(status)),
                         Err(e) => {
-                            eprintln!("ash: {}", e);
+                            eprintln!("bish: {}", e);
                             ExecResult::Status(1)
                         }
                     }
                 }
             }
             Err(e) => {
-                eprintln!("ash: {}", e);
+                eprintln!("bish: {}", e);
                 ExecResult::Status(127)
             }
         }
@@ -1377,21 +1377,21 @@ impl Shell {
         let exe = match std::env::current_exe() {
             Ok(p) => p,
             Err(e) => {
-                eprintln!("ash: process substitution: {}", e);
+                eprintln!("bish: process substitution: {}", e);
                 return String::new();
             }
         };
         let file = match std::fs::File::create(&path) {
             Ok(f) => f,
             Err(e) => {
-                eprintln!("ash: process substitution: {}", e);
+                eprintln!("bish: process substitution: {}", e);
                 return String::new();
             }
         };
         let script = self.functions_preamble() + raw;
         match Command::new(exe).arg("-c").arg(script).stdout(Stdio::from(file)).status() {
             Ok(_) => {}
-            Err(e) => eprintln!("ash: process substitution: {}", e),
+            Err(e) => eprintln!("bish: process substitution: {}", e),
         }
         let path_str = path.to_string_lossy().into_owned();
         self.proc_sub_cleanup.push(path_str.clone());
@@ -1405,7 +1405,7 @@ impl Shell {
     fn run_proc_sub_out(&mut self, raw: &str) -> String {
         let path = proc_sub_temp_path();
         if let Err(e) = std::fs::File::create(&path) {
-            eprintln!("ash: process substitution: {}", e);
+            eprintln!("bish: process substitution: {}", e);
             return String::new();
         }
         let path_str = path.to_string_lossy().into_owned();
@@ -1658,7 +1658,7 @@ impl Shell {
     fn run_cfor(&mut self, init: &str, cond: &str, step: &str, body: &Program) -> ExecResult {
         if !init.is_empty() {
             if let Err(e) = arith::eval(init, self) {
-                eprintln!("ash: (({})): {}", init, e);
+                eprintln!("bish: (({})): {}", init, e);
                 return ExecResult::Status(1);
             }
         }
@@ -1670,7 +1670,7 @@ impl Shell {
                 match arith::eval(cond, self) {
                     Ok(v) => v != 0,
                     Err(e) => {
-                        eprintln!("ash: (({})): {}", cond, e);
+                        eprintln!("bish: (({})): {}", cond, e);
                         return ExecResult::Status(1);
                     }
                 }
@@ -1696,7 +1696,7 @@ impl Shell {
             }
             if !step.is_empty() {
                 if let Err(e) = arith::eval(step, self) {
-                    eprintln!("ash: (({})): {}", step, e);
+                    eprintln!("bish: (({})): {}", step, e);
                     return ExecResult::Status(1);
                 }
             }
@@ -1752,7 +1752,7 @@ impl Shell {
         match self.eval_test_or(atoms, &mut pos) {
             Ok(b) => ExecResult::Status(if b { 0 } else { 1 }),
             Err(e) => {
-                eprintln!("ash: [[: {}", e);
+                eprintln!("bish: [[: {}", e);
                 ExecResult::Status(2)
             }
         }
@@ -1870,7 +1870,7 @@ impl Shell {
                         let v = v.to_string();
                         out.push_str(&if *quoted { crate::regex::escape(&v) } else { v });
                     }
-                    Err(e) => eprintln!("ash: (({})): {}", raw, e),
+                    Err(e) => eprintln!("bish: (({})): {}", raw, e),
                 },
                 Chunk::VarExpand { name, op, quoted } => {
                     let name = name.clone();
@@ -2050,7 +2050,7 @@ impl Shell {
                 return match ext.status() {
                     Ok(status) => ExecResult::Status(exit_code_from_status(status)),
                     Err(e) => {
-                        eprintln!("ash: command: {}: {}", argv[i], e);
+                        eprintln!("bish: command: {}: {}", argv[i], e);
                         ExecResult::Status(127)
                     }
                 };
@@ -2097,7 +2097,7 @@ impl Shell {
                         None => match self.aliases.iter().find(|(n, _)| n == a) {
                             Some((n, v)) => println!("alias {}={}", n, crate::serialize::quote_literal(v)),
                             None => {
-                                eprintln!("ash: alias: {}: not found", a);
+                                eprintln!("bish: alias: {}: not found", a);
                                 status = 1;
                             }
                         },
@@ -2117,7 +2117,7 @@ impl Shell {
                             self.aliases.remove(pos);
                         }
                         None => {
-                            eprintln!("ash: unalias: {}: not found", a);
+                            eprintln!("bish: unalias: {}: not found", a);
                             status = 1;
                         }
                     }
@@ -2135,7 +2135,7 @@ impl Shell {
                     match arith::eval(a, self) {
                         Ok(v) => last = v,
                         Err(e) => {
-                            eprintln!("ash: let: {}", e);
+                            eprintln!("bish: let: {}", e);
                             return ExecResult::Status(2);
                         }
                     }
@@ -2153,7 +2153,7 @@ impl Shell {
                 if a.last().map(|s| s.as_str()) == Some("]") {
                     a.pop();
                 } else {
-                    eprintln!("ash: [: missing closing ]");
+                    eprintln!("bish: [: missing closing ]");
                     return ExecResult::Status(2);
                 }
                 return ExecResult::Status(builtins::test(&a, false));
@@ -2161,7 +2161,7 @@ impl Shell {
             "return" => {
                 let code = argv.get(1).and_then(|s| s.parse::<i32>().ok()).unwrap_or(self.last_status);
                 if self.var_scopes.is_empty() {
-                    eprintln!("ash: return: can only 'return' from a function");
+                    eprintln!("bish: return: can only 'return' from a function");
                     return ExecResult::Status(code);
                 }
                 return ExecResult::Return(code);
@@ -2176,7 +2176,7 @@ impl Shell {
             }
             "local" => {
                 if self.var_scopes.is_empty() {
-                    eprintln!("ash: local: can only be used inside a function");
+                    eprintln!("bish: local: can only be used inside a function");
                     return ExecResult::Status(1);
                 }
                 // `-a`/`-A` name an array rather than a scalar. `arrays`/
@@ -2378,7 +2378,7 @@ impl Shell {
                     match self.coproc_fds.get_mut(&fd) {
                         Some(KeptFd::Read(r)) => read_line_or_chars(r, nchars, delim),
                         _ => {
-                            eprintln!("ash: read: {}: invalid file descriptor", fd);
+                            eprintln!("bish: read: {}: invalid file descriptor", fd);
                             return ExecResult::Status(1);
                         }
                     }
@@ -2469,14 +2469,14 @@ impl Shell {
                 let path = match argv.get(1) {
                     Some(p) => p.clone(),
                     None => {
-                        eprintln!("ash: {}: filename argument required", name);
+                        eprintln!("bish: {}: filename argument required", name);
                         return ExecResult::Status(2);
                     }
                 };
                 match std::fs::read_to_string(&path) {
                     Ok(src) => return self.run_source_here(&src, &path),
                     Err(e) => {
-                        eprintln!("ash: {}: {}", path, e);
+                        eprintln!("bish: {}: {}", path, e);
                         return ExecResult::Status(1);
                     }
                 }
@@ -2511,12 +2511,12 @@ impl Shell {
                     let num = match signal_number(sig) {
                         Some(n) => n,
                         None => {
-                            eprintln!("ash: trap: {}: invalid signal specification", sig);
+                            eprintln!("bish: trap: {}: invalid signal specification", sig);
                             continue;
                         }
                     };
                     if num == 9 || num == 19 {
-                        eprintln!("ash: trap: {}: cannot trap", sig);
+                        eprintln!("bish: trap: {}: cannot trap", sig);
                         continue;
                     }
                     if cmd_str == "-" {
@@ -2553,7 +2553,7 @@ impl Shell {
                 let redirs = match self.resolve_redirects(cmd) {
                     Ok(r) => r,
                     Err(e) => {
-                        eprintln!("ash: {}", e);
+                        eprintln!("bish: {}", e);
                         return ExecResult::Status(1);
                     }
                 };
@@ -2573,11 +2573,11 @@ impl Shell {
                 // below is a direct execve of *this* process, no fork, so
                 // there's no child to install a pre_exec closure into.
                 if let Err(e) = apply_fds_to_self(redirs.dup_stderr_to_stdout, redirs.extra_fds) {
-                    eprintln!("ash: exec: {}", e);
+                    eprintln!("bish: exec: {}", e);
                     return ExecResult::Status(1);
                 }
                 let err = command.exec();
-                eprintln!("ash: exec: {}: {}", argv[1], err);
+                eprintln!("bish: exec: {}: {}", argv[1], err);
                 // Real bash: a non-interactive shell exits immediately when
                 // exec fails to find/run the command, and (confirmed via a
                 // clean probe against bash 5.0.17) leaves $? at whatever it
@@ -2598,23 +2598,23 @@ impl Shell {
                 let redirs = match self.resolve_redirects(cmd) {
                     Ok(r) => r,
                     Err(e) => {
-                        eprintln!("ash: {}", e);
+                        eprintln!("bish: {}", e);
                         return ExecResult::Status(1);
                     }
                 };
                 let (stdin, stdout, stderr) = match self.resolve_plain_fd012(&cmd.redirects) {
                     Ok(f) => f,
                     Err(e) => {
-                        eprintln!("ash: {}", e);
+                        eprintln!("bish: {}", e);
                         return ExecResult::Status(1);
                     }
                 };
                 if let Err(e) = apply_fd012_to_self(stdin, stdout, stderr) {
-                    eprintln!("ash: exec: {}", e);
+                    eprintln!("bish: exec: {}", e);
                     return ExecResult::Status(1);
                 }
                 if let Err(e) = apply_fds_to_self(redirs.dup_stderr_to_stdout, redirs.extra_fds) {
-                    eprintln!("ash: exec: {}", e);
+                    eprintln!("bish: exec: {}", e);
                     return ExecResult::Status(1);
                 }
                 return ExecResult::Status(0);
@@ -2629,7 +2629,7 @@ impl Shell {
         let redirs = match self.resolve_redirects(cmd) {
             Ok(r) => r,
             Err(e) => {
-                eprintln!("ash: {}", e);
+                eprintln!("bish: {}", e);
                 return ExecResult::Status(1);
             }
         };
@@ -2664,7 +2664,7 @@ impl Shell {
                     let result = match child.wait() {
                         Ok(status) => ExecResult::Status(exit_code_from_status(status)),
                         Err(e) => {
-                            eprintln!("ash: {}", e);
+                            eprintln!("bish: {}", e);
                             ExecResult::Status(1)
                         }
                     };
@@ -2673,7 +2673,7 @@ impl Shell {
                 }
             }
             Err(e) => {
-                let msg = format!("ash: {}: {}", name, e);
+                let msg = format!("bish: {}: {}", name, e);
                 self.write_command_error(cmd, &msg);
                 self.drain_proc_subs();
                 ExecResult::Status(127)
@@ -2698,7 +2698,7 @@ impl Shell {
             let mut command = match cmd {
                 parser::Command::Simple(sc) => {
                     if sc.words.is_empty() {
-                        eprintln!("ash: syntax error in pipeline");
+                        eprintln!("bish: syntax error in pipeline");
                         kill_all(children);
                         return 1;
                     }
@@ -2709,7 +2709,7 @@ impl Shell {
                     let redirs = match self.resolve_redirects(sc) {
                         Ok(r) => r,
                         Err(e) => {
-                            eprintln!("ash: {}", e);
+                            eprintln!("bish: {}", e);
                             kill_all(children);
                             return 1;
                         }
@@ -2725,7 +2725,7 @@ impl Shell {
                         let exe = match std::env::current_exe() {
                             Ok(p) => p,
                             Err(e) => {
-                                eprintln!("ash: {}", e);
+                                eprintln!("bish: {}", e);
                                 kill_all(children);
                                 return 1;
                             }
@@ -2762,7 +2762,7 @@ impl Shell {
                     let exe = match std::env::current_exe() {
                         Ok(p) => p,
                         Err(e) => {
-                            eprintln!("ash: {}", e);
+                            eprintln!("bish: {}", e);
                             kill_all(children);
                             return 1;
                         }
@@ -2780,7 +2780,7 @@ impl Shell {
                         match self.resolve_redirect_list(own_redirects) {
                             Ok(r) => r,
                             Err(e) => {
-                                eprintln!("ash: {}", e);
+                                eprintln!("bish: {}", e);
                                 kill_all(children);
                                 return 1;
                             }
@@ -2805,7 +2805,7 @@ impl Shell {
                     children.push(child);
                 }
                 Err(e) => {
-                    eprintln!("ash: {}", e);
+                    eprintln!("bish: {}", e);
                     kill_all(children);
                     return 127;
                 }
@@ -2825,7 +2825,7 @@ impl Shell {
             let code = match c.wait() {
                 Ok(s) => exit_code_from_status(s),
                 Err(e) => {
-                    eprintln!("ash: {}", e);
+                    eprintln!("bish: {}", e);
                     1
                 }
             };
@@ -2854,7 +2854,7 @@ impl Shell {
                 Chunk::Sub { raw, .. } => s.push_str(&self.run_command_substitution(raw)),
                 Chunk::Arith { raw, .. } => match arith::eval(raw, self) {
                     Ok(v) => s.push_str(&v.to_string()),
-                    Err(e) => eprintln!("ash: (({})): {}", raw, e),
+                    Err(e) => eprintln!("bish: (({})): {}", raw, e),
                 },
                 Chunk::VarExpand { name, op, .. } => {
                     let name = name.clone();
@@ -3031,12 +3031,12 @@ impl Shell {
             Ok(i) => match self.resolve_array_index(name, i) {
                 Some(idx) => idx,
                 None => {
-                    eprintln!("ash: {}: bad array index: {}", name, index);
+                    eprintln!("bish: {}: bad array index: {}", name, index);
                     return;
                 }
             },
             Err(_) => {
-                eprintln!("ash: {}: bad array index: {}", name, index);
+                eprintln!("bish: {}: bad array index: {}", name, index);
                 return;
             }
         };
@@ -3083,7 +3083,7 @@ impl Shell {
                     let v = match arith::eval(raw, self) {
                         Ok(n) => n.to_string(),
                         Err(e) => {
-                            eprintln!("ash: (({})): {}", raw, e);
+                            eprintln!("bish: (({})): {}", raw, e);
                             String::new()
                         }
                     };
@@ -3216,7 +3216,7 @@ impl Shell {
                 let trigger = if *colon { cur.is_empty() } else { !self.var_is_set(name) };
                 if trigger {
                     let msg = self.expand_raw(word);
-                    eprintln!("ash: {}: {}", name, msg);
+                    eprintln!("bish: {}: {}", name, msg);
                     String::new()
                 } else {
                     cur
@@ -3287,7 +3287,7 @@ impl Shell {
                 let trigger = if *colon { cur.is_empty() } else { !self.array_element_is_set(name, index) };
                 if trigger {
                     let msg = self.expand_raw(word);
-                    eprintln!("ash: {}[{}]: {}", name, index, msg);
+                    eprintln!("bish: {}[{}]: {}", name, index, msg);
                     String::new()
                 } else {
                     cur
@@ -3383,7 +3383,7 @@ impl Shell {
 
     // Follows a `declare -n`/`local -n` chain to the final target name,
     // capped to guard against a self-referential or circular nameref (bash
-    // detects and errors on these; ash just stops following rather than
+    // detects and errors on these; bish just stops following rather than
     // looping forever).
     fn resolve_nameref(&self, name: &str) -> String {
         let mut current = name.to_string();
@@ -3528,7 +3528,7 @@ impl Shell {
             match resolve_in_path(name) {
                 Some(p) => println!("{}", if path_only { p } else { format!("{} is {}", name, p) }),
                 None => {
-                    eprintln!("ash: type: {}: not found", name);
+                    eprintln!("bish: type: {}: not found", name);
                     status = 1;
                 }
             }
@@ -3552,7 +3552,7 @@ impl Shell {
         if self.var_is_set(name) {
             return;
         }
-        eprintln!("ash: {}: unbound variable", name);
+        eprintln!("bish: {}: unbound variable", name);
         self.run_exit_trap();
         std::process::exit(1);
     }
@@ -3613,7 +3613,7 @@ impl Shell {
             name
         };
         if self.readonly_names.contains(name) {
-            eprintln!("ash: {}: readonly variable", name);
+            eprintln!("bish: {}: readonly variable", name);
             return;
         }
         // `SECONDS=n` resets the elapsed-time counter to start counting
@@ -4404,14 +4404,14 @@ fn proc_sub_temp_path() -> std::path::PathBuf {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!("ash-procsub-{}-{}", std::process::id(), n))
+    std::env::temp_dir().join(format!("bish-procsub-{}-{}", std::process::id(), n))
 }
 
 fn here_string_file(content: &str) -> Result<std::fs::File, String> {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let path = std::env::temp_dir().join(format!("ash-herestring-{}-{}", std::process::id(), n));
+    let path = std::env::temp_dir().join(format!("bish-herestring-{}-{}", std::process::id(), n));
     std::fs::write(&path, content).map_err(|e| format!("here-string: {}", e))?;
     let f = std::fs::File::open(&path).map_err(|e| format!("here-string: {}", e))?;
     let _ = std::fs::remove_file(&path);

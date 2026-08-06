@@ -1,6 +1,6 @@
 // Shell-style filename glob matching: * ? [abc] [a-z] [!abc]/[^abc], plus
 // extglob patterns @(...) !(...) +(...) *(...) ?(...). Real bash gates
-// extglob behind `shopt -s extglob`; ash doesn't track shopt state yet, so
+// extglob behind `shopt -s extglob`; bish doesn't track shopt state yet, so
 // these are recognized unconditionally -- a strict superset of default
 // bash behavior that only diverges for scripts that use a literal pattern
 // like `!(foo)` as ordinary text without ever enabling extglob, which is

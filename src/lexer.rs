@@ -816,7 +816,7 @@ impl<'a> Lexer<'a> {
                 // extglob: @(...) !(...) +(...) *(...) ?(...) -- the '('
                 // immediately follows one of these prefix chars (already in
                 // buf, having fallen through the default char arm below) --
-                // so ash always recognizes it as a pattern group rather
+                // so bish always recognizes it as a pattern group rather
                 // than a subshell/word boundary, unlike real bash which
                 // gates this behind `shopt -s extglob` (see glob.rs).
                 Some('(') if matches!(buf.chars().last(), Some('@') | Some('!') | Some('+') | Some('*') | Some('?')) => {
