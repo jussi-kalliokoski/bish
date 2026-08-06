@@ -79,6 +79,13 @@ pub enum Command {
         body: Program,
         redirects: Vec<Redirect>,
     },
+    Select {
+        var: String,
+        // Same `None` == "$@" convention as For::words.
+        words: Option<Vec<Word>>,
+        body: Program,
+        redirects: Vec<Redirect>,
+    },
     Case {
         word: Word,
         arms: Vec<(Vec<Word>, Program, CaseTerm)>,
@@ -285,6 +292,7 @@ impl Parser {
             Some(Tok::KwWhile) => self.parse_while(false),
             Some(Tok::KwUntil) => self.parse_while(true),
             Some(Tok::KwFor) => self.parse_for(),
+            Some(Tok::KwSelect) => self.parse_select(),
             Some(Tok::KwCase) => self.parse_case(),
             Some(Tok::LBrace) => self.parse_group(),
             Some(Tok::KwFunction) => self.parse_function_kw(),
@@ -508,6 +516,41 @@ impl Parser {
         self.expect(Tok::KwDone)?;
         let redirects = self.parse_trailing_redirects()?;
         Ok(Command::For { var, words, body, redirects })
+    }
+
+    // `select var [in word...]; do body; done` -- identical grammar to
+    // `for`'s in-list form (see parse_for above), just a different keyword
+    // and runtime behavior (a numbered menu + read loop instead of plain
+    // iteration).
+    fn parse_select(&mut self) -> Result<Command, String> {
+        self.advance(); // KwSelect
+        let var = match self.advance() {
+            Some(Tok::Word(chunks, _)) => word_to_plain_name(&chunks)
+                .ok_or_else(|| "expected a plain variable name after 'select'".to_string())?,
+            other => return Err(format!("expected variable name after 'select', got {:?}", other)),
+        };
+        self.skip_terminators();
+
+        let mut words = None;
+        if matches!(self.peek(), Some(Tok::KwIn)) {
+            self.advance();
+            let mut list = Vec::new();
+            while let Some(Tok::Word(_, _)) = self.peek() {
+                if let Some(Tok::Word(chunks, globbable)) = self.advance() {
+                    list.push(Word { chunks, globbable });
+                }
+            }
+            if matches!(self.peek(), Some(Tok::Semi) | Some(Tok::Newline)) {
+                self.advance();
+            }
+            words = Some(list);
+        }
+        self.skip_terminators();
+        self.expect(Tok::KwDo)?;
+        let body = self.parse_list_until(&[Tok::KwDone])?;
+        self.expect(Tok::KwDone)?;
+        let redirects = self.parse_trailing_redirects()?;
+        Ok(Command::Select { var, words, body, redirects })
     }
 
     fn parse_case(&mut self) -> Result<Command, String> {

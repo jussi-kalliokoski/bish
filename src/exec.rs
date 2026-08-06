@@ -781,6 +781,11 @@ impl Shell {
                 let step = step.clone();
                 self.run_cfor(&init, &cond, &step, body)
             }
+            parser::Command::Select { var, words, body, .. } => {
+                let var = var.clone();
+                let words = words.clone();
+                self.run_select(&var, words.as_deref(), body)
+            }
             parser::Command::Case { word, arms, .. } => self.run_case(word, arms),
             parser::Command::Group(prog, _redirects) => self.run_program(prog),
             parser::Command::FuncDef { name, body } => {
@@ -1239,6 +1244,76 @@ impl Shell {
             ExecResult::Status(self.last_status)
         } else {
             ExecResult::Status(0)
+        }
+    }
+
+    // `select var [in words]; do body; done`. Displays a numbered menu to
+    // stderr (never stdout, matching real bash) and reads a choice from
+    // stdin, looping until `break` or EOF. Real bash's exact behavior,
+    // confirmed empirically:
+    //  - the menu is (re)printed before the very first prompt, and again
+    //    after any BLANK line of input, but not otherwise
+    //  - a blank input line reprompts without running the body at all
+    //  - a non-blank but out-of-range/non-numeric choice still runs the
+    //    body, with `var` set to empty (REPLY still gets the raw text)
+    //  - EOF on stdin ends the loop entirely (like an implicit break),
+    //    without running the body, and the loop's status is 1
+    fn run_select(&mut self, var: &str, words: Option<&[Word]>, body: &Program) -> ExecResult {
+        let items: Vec<String> = match words {
+            Some(words) => self.expand_words(words),
+            None => self.arg_frames.last().cloned().unwrap_or_default(),
+        };
+        let print_menu = |items: &[String]| {
+            for (i, item) in items.iter().enumerate() {
+                eprintln!("{}) {}", i + 1, item);
+            }
+        };
+        print_menu(&items);
+        loop {
+            let ps3 = {
+                let v = self.lookup_var("PS3");
+                if v.is_empty() { "#? ".to_string() } else { v }
+            };
+            eprint!("{}", ps3);
+            let _ = std::io::Write::flush(&mut std::io::stderr());
+            let mut line = String::new();
+            match std::io::BufRead::read_line(&mut std::io::stdin().lock(), &mut line) {
+                // Confirmed against real bash: on EOF, `select` prints a
+                // bare newline to *stdout* (not stderr, where the menu/
+                // prompt otherwise live) before giving up -- reproducible
+                // even non-interactively, not just an interactive-terminal
+                // courtesy newline.
+                Ok(0) => {
+                    println!();
+                    return ExecResult::Status(1);
+                }
+                Ok(_) => {}
+                Err(_) => return ExecResult::Status(1),
+            }
+            let line = line.trim_end_matches(['\n', '\r']).to_string();
+            self.assign_var("REPLY", line.clone());
+            if line.trim().is_empty() {
+                print_menu(&items);
+                continue;
+            }
+            let choice = line.trim().parse::<usize>().ok().and_then(|n| n.checked_sub(1)).and_then(|i| items.get(i));
+            self.assign_var(var, choice.cloned().unwrap_or_default());
+            match self.run_program(body) {
+                ExecResult::Break(n) => {
+                    if n > 1 {
+                        return ExecResult::Break(n - 1);
+                    }
+                    return ExecResult::Status(self.last_status);
+                }
+                ExecResult::Continue(n) => {
+                    if n > 1 {
+                        return ExecResult::Continue(n - 1);
+                    }
+                    continue;
+                }
+                ExecResult::Status(s) => self.last_status = s,
+                ret @ ExecResult::Return(_) => return ret,
+            }
         }
     }
 
@@ -3855,6 +3930,7 @@ fn command_own_redirects(cmd: &parser::Command) -> &[Redirect] {
         parser::Command::While { redirects, .. } => redirects,
         parser::Command::For { redirects, .. } => redirects,
         parser::Command::CFor { redirects, .. } => redirects,
+        parser::Command::Select { redirects, .. } => redirects,
         parser::Command::Case { redirects, .. } => redirects,
         parser::Command::Group(_, redirects) => redirects,
         parser::Command::Subshell(_, redirects) => redirects,
