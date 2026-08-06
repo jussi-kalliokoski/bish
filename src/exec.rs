@@ -693,6 +693,18 @@ impl Shell {
                 None => {
                     if let Some(v) = val {
                         self.assign_var(&name, v);
+                    } else if export_flag {
+                        // Bare `declare -x NAME`/`export NAME` on an
+                        // already-set variable (commonly a local: `local
+                        // Z=inner; export Z`) -- re-assign its current
+                        // value through assign_var so exported_names'
+                        // mirror-to-env logic fires immediately, instead
+                        // of only on the variable's *next* write. The
+                        // empty-fallback branch below wouldn't reach this
+                        // case since it only fires for a name with no
+                        // value at all yet.
+                        let cur = self.lookup_var(&name);
+                        self.assign_var(&name, cur);
                     } else if self.lookup_var(&name).is_empty() && std::env::var(&name).is_err() {
                         self.assign_var(&name, String::new());
                     }
@@ -2128,7 +2140,15 @@ impl Shell {
             "pushd" => return ExecResult::Status(self.run_pushd(&argv[1..])),
             "popd" => return ExecResult::Status(self.run_popd(&argv[1..])),
             "dirs" => return ExecResult::Status(self.run_dirs(&argv[1..])),
-            "export" => return ExecResult::Status(builtins::export(&argv[1..])),
+            // `export` is equivalent to `declare -x` (real bash documents
+            // it that way) -- routing through run_declare means it shares
+            // -x's local-variable-mirroring behavior instead of the
+            // simpler, env-only handling this had before.
+            "export" => {
+                let mut declare_args = vec!["-x".to_string()];
+                declare_args.extend(argv[1..].iter().cloned());
+                return ExecResult::Status(self.run_declare(&declare_args));
+            }
             "let" => {
                 let mut last = 0i64;
                 for a in &argv[1..] {

@@ -240,19 +240,6 @@ pub fn cd(args: &[String]) -> i32 {
     }
 }
 
-// Variables are always process env vars in v1 (no local-vs-exported
-// distinction yet), so `export NAME` with no '=' is a no-op.
-pub fn export(args: &[String]) -> i32 {
-    for a in args {
-        if let Some(eq) = a.find('=') {
-            unsafe {
-                std::env::set_var(&a[..eq], &a[eq + 1..]);
-            }
-        }
-    }
-    0
-}
-
 pub fn break_loop(args: &[String]) -> crate::exec::ExecResult {
     let n = args.first().and_then(|s| s.parse::<u32>().ok()).unwrap_or(1).max(1);
     crate::exec::ExecResult::Break(n)
