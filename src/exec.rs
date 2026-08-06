@@ -57,7 +57,7 @@ pub struct Shell {
     // `arrays` since their keys are arbitrary strings, not indices -- a name
     // in `assoc_names` is looked up here instead of `arrays` everywhere an
     // array is read or written.
-    assoc_arrays: HashMap<String, std::collections::BTreeMap<String, String>>,
+    assoc_arrays: HashMap<String, OrderedMap>,
     assoc_names: std::collections::HashSet<String>,
     // `alias name=value`: stored and queryable (alias/unalias both work as
     // a plain table), but NOT expanded when a command runs. Real alias
@@ -85,7 +85,7 @@ pub struct Shell {
     // nested scope chain, since `arrays`/`assoc_arrays` themselves stay
     // flat (see the comment on `arrays` above).
     array_local_stack: Vec<Vec<(String, Option<std::collections::BTreeMap<usize, String>>)>>,
-    assoc_local_stack: Vec<Vec<(String, Option<std::collections::BTreeMap<String, String>>)>>,
+    assoc_local_stack: Vec<Vec<(String, Option<OrderedMap>)>>,
     // `declare -n`/`local -n ref=target`: ref's own stored value is the
     // *name* of the target variable, not user data -- lookup_var/assign_var/
     // var_is_set all redirect through resolve_nameref for any name in this
@@ -1164,7 +1164,7 @@ impl Shell {
             s.push_str("declare -A ");
             s.push_str(name);
             s.push('\n');
-            for (k, v) in map {
+            for (k, v) in map.iter() {
                 s.push_str(name);
                 s.push('[');
                 s.push_str(&crate::serialize::quote_literal(k));
@@ -2259,7 +2259,7 @@ impl Shell {
                             let prev = self.assoc_arrays.remove(&n);
                             self.assoc_local_stack.last_mut().unwrap().push((n.clone(), prev));
                             self.assoc_names.insert(n.clone());
-                            self.assoc_arrays.insert(n, std::collections::BTreeMap::new());
+                            self.assoc_arrays.insert(n, OrderedMap::default());
                         }
                         Some(false) => {
                             let prev = self.arrays.remove(&n);
@@ -3785,6 +3785,64 @@ struct ResolvedRedirs {
 enum ExtraFd {
     Open { fd: i32, file: std::fs::File },
     Dup { fd: i32, source: i32 },
+}
+
+// Associative-array storage (`declare -A`). Iterates in insertion order --
+// confirmed via a clean probe against real bash that its own iteration
+// order is neither insertion order nor alphabetical, but its internal
+// hash-table bucket order (stable across updates/delete-then-reinsert on a
+// given key, but not derivable without literally reimplementing bash's
+// specific hash function and bucket-growth behavior). Insertion order is
+// the more useful, predictable choice for a new implementation even though
+// it won't byte-match bash's own output for a script that happens to
+// depend on the exact order -- a genuinely rare thing to depend on, since
+// bash's own order isn't something a script author could reliably predict
+// either.
+#[derive(Default)]
+struct OrderedMap {
+    order: Vec<String>,
+    values: std::collections::HashMap<String, String>,
+}
+
+impl OrderedMap {
+    fn get(&self, key: &str) -> Option<&String> {
+        self.values.get(key)
+    }
+
+    fn contains_key(&self, key: &str) -> bool {
+        self.values.contains_key(key)
+    }
+
+    fn insert(&mut self, key: String, value: String) {
+        if !self.values.contains_key(&key) {
+            self.order.push(key.clone());
+        }
+        self.values.insert(key, value);
+    }
+
+    fn remove(&mut self, key: &str) -> Option<String> {
+        let v = self.values.remove(key);
+        if v.is_some() {
+            self.order.retain(|k| k != key);
+        }
+        v
+    }
+
+    fn keys(&self) -> impl Iterator<Item = &String> {
+        self.order.iter()
+    }
+
+    fn values(&self) -> impl Iterator<Item = &String> {
+        self.order.iter().map(move |k| self.values.get(k).unwrap())
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (&String, &String)> {
+        self.order.iter().map(move |k| (k, self.values.get(k).unwrap()))
+    }
+
+    fn len(&self) -> usize {
+        self.order.len()
+    }
 }
 
 // A background job (`cmd &`), one or more children (a whole pipeline when
