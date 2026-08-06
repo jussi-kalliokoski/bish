@@ -120,6 +120,10 @@ pub fn serialize_command(cmd: &Command) -> String {
         Command::Subshell(raw, _) => format!("({})", raw),
         Command::Arith(raw, _) => format!("(({}))", raw),
         Command::Test(atoms, _) => format!("[[ {} ]]", serialize_test_atoms(atoms)),
+        Command::Coproc { name, body } => match name {
+            Some(n) => format!("coproc {} {}", n, serialize_command(body)),
+            None => format!("coproc {}", serialize_command(body)),
+        },
     }
 }
 
@@ -178,6 +182,7 @@ pub fn serialize_redirect(r: &Redirect) -> String {
         }
         Redirect::FdIn { fd, word } => format!("{}<{}", fd, serialize_word(word)),
         Redirect::FdDup { fd, target } => format!("{}>&{}", fd, target),
+        Redirect::FdDupWord { fd, word } => format!("{}>&{}", fd, serialize_word(word)),
     }
 }
 

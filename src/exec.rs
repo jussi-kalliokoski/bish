@@ -179,6 +179,17 @@ pub struct Shell {
     // it's run directly wherever the shell is about to terminate rather
     // than through the sigaction/PENDING_SIGNALS machinery.
     exit_trap: Option<String>,
+    // `coproc`'s pipe halves that the *shell* keeps (the coprocess's own
+    // ends are handed to the child and closed here after spawn). Kept
+    // alive here, keyed by raw fd number, for as long as the coprocess
+    // might still be interacted with -- otherwise the PipeReader/Writer
+    // would drop and close the fd the moment run_coproc returns. Numbered-
+    // fd redirects on *other* commands (`cmd <&"${NAME[0]}"`) just need
+    // the fd number to still be open in this process at dup2 time, which
+    // this satisfies without those redirects needing to know anything
+    // about coproc specifically; `read -u FD` is the one thing that reads
+    // through this table directly (see run_single's "read" arm).
+    coproc_fds: std::collections::HashMap<i32, KeptFd>,
     // `set -e`/`-u`/`-x`/`-o pipefail`/`-f`.
     opt_errexit: bool,
     opt_nounset: bool,
@@ -244,6 +255,7 @@ impl Shell {
             next_job_id: 1,
             traps: std::collections::HashMap::new(),
             exit_trap: None,
+            coproc_fds: std::collections::HashMap::new(),
             opt_errexit: false,
             opt_nounset: false,
             opt_xtrace: false,
@@ -1049,6 +1061,10 @@ impl Shell {
                 }
             },
             parser::Command::Test(atoms, _redirects) => self.run_test(atoms),
+            parser::Command::Coproc { name, body } => {
+                let name = name.clone();
+                ExecResult::Status(self.run_coproc(name, body))
+            }
         }
     }
 
@@ -1216,6 +1232,64 @@ impl Shell {
                     eprintln!("ash: subshell: {}", e);
                     1
                 }
+            }
+        }
+    }
+
+    // `coproc [NAME] command` -- see the Command::Coproc doc comment for
+    // the (scoped) grammar this accepts. Runs `body` as a background
+    // process wired to two pipes: NAME[0] is an fd the shell can read the
+    // coprocess's stdout from, NAME[1] an fd it can write to the
+    // coprocess's stdin. NAME_PID gets the coprocess's PID. The coprocess
+    // is also registered as an ordinary background job (visible in
+    // `jobs`/`wait`, same as real bash).
+    fn run_coproc(&mut self, name: Option<String>, body: &parser::Command) -> i32 {
+        use std::os::fd::AsRawFd;
+        let name = name.unwrap_or_else(|| "COPROC".to_string());
+        let (out_r, out_w) = match std::io::pipe() {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("ash: coproc: {}", e);
+                return 1;
+            }
+        };
+        let (in_r, in_w) = match std::io::pipe() {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("ash: coproc: {}", e);
+                return 1;
+            }
+        };
+        let exe = match std::env::current_exe() {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("ash: coproc: {}", e);
+                return 1;
+            }
+        };
+        let script = self.functions_preamble() + &crate::serialize::serialize_command(body);
+        let mut command = Command::new(exe);
+        command.arg("-c").arg(script);
+        command.stdin(Stdio::from(in_r));
+        command.stdout(Stdio::from(out_w));
+        match command.spawn() {
+            Ok(child) => {
+                let out_r_fd = out_r.as_raw_fd();
+                let in_w_fd = in_w.as_raw_fd();
+                self.coproc_fds.insert(out_r_fd, KeptFd::Read(std::io::BufReader::new(out_r)));
+                self.coproc_fds.insert(in_w_fd, KeptFd::Write(in_w));
+                let mut map = std::collections::BTreeMap::new();
+                map.insert(0, out_r_fd.to_string());
+                map.insert(1, in_w_fd.to_string());
+                self.arrays.insert(name.clone(), map);
+                self.assign_var(&format!("{}_PID", name), child.id().to_string());
+                let cmd_text = crate::serialize::serialize_command(body);
+                self.push_job(vec![child], cmd_text);
+                0
+            }
+            Err(e) => {
+                eprintln!("ash: coproc: {}", e);
+                1
             }
         }
     }
@@ -2227,6 +2301,7 @@ impl Shell {
                 let mut prompt: Option<&str> = None;
                 let mut nchars: Option<usize> = None;
                 let mut delim: u8 = b'\n';
+                let mut read_u_flag: Option<&str> = None;
                 // -s (silent/no-echo) needs raw termios manipulation to
                 // suppress terminal echo, which isn't implementable without
                 // hand-rolling the platform's struct termios layout (risky
@@ -2260,6 +2335,10 @@ impl Shell {
                             // only against real stdin (see is_real_stdin).
                             i += 2;
                         }
+                        "-u" => {
+                            read_u_flag = argv.get(i + 1).map(|s| s.as_str());
+                            i += 2;
+                        }
                         other => {
                             names.push(other);
                             i += 1;
@@ -2289,51 +2368,23 @@ impl Shell {
                     // -t against those is treated as immediately ready.
                 }
 
-                let mut reader = self.read_input_source(cmd);
-                // Real bash: a line/char-count read that runs into EOF
-                // before seeing its delimiter (or before nchars is reached)
-                // still populates the variable(s) with whatever partial
-                // data it got, but returns non-zero -- `clean` tracks which
-                // case this was, `got` carries the (possibly empty,
-                // possibly partial) data regardless.
-                let (got, clean): (Option<String>, bool) = if let Some(n) = nchars {
-                    let mut buf = Vec::with_capacity(n);
-                    let mut hit_eof = false;
-                    for _ in 0..n {
-                        let mut b = [0u8; 1];
-                        match std::io::Read::read(&mut *reader, &mut b) {
-                            Ok(0) => {
-                                hit_eof = true;
-                                break;
-                            }
-                            Ok(_) => buf.push(b[0]),
-                            Err(_) => {
-                                hit_eof = true;
-                                break;
-                            }
+                // `-u FD` reads from a fd this shell already has open (most
+                // commonly a coproc's read end, coproc_fds[NAME[0]]) instead
+                // of the command's own stdin/redirect -- borrowed tightly in
+                // its own block so the borrow of self.coproc_fds ends before
+                // the assign_var calls below need `&mut self` again.
+                let ufd = read_u_flag.and_then(|s| s.parse::<i32>().ok());
+                let (got, clean): (Option<String>, bool) = if let Some(fd) = ufd {
+                    match self.coproc_fds.get_mut(&fd) {
+                        Some(KeptFd::Read(r)) => read_line_or_chars(r, nchars, delim),
+                        _ => {
+                            eprintln!("ash: read: {}: invalid file descriptor", fd);
+                            return ExecResult::Status(1);
                         }
-                    }
-                    if buf.is_empty() && hit_eof {
-                        (None, false)
-                    } else {
-                        (Some(String::from_utf8_lossy(&buf).into_owned()), !hit_eof)
                     }
                 } else {
-                    let mut buf: Vec<u8> = Vec::new();
-                    match std::io::BufRead::read_until(&mut *reader, delim, &mut buf) {
-                        Ok(0) => (None, false),
-                        Ok(_) => {
-                            let hit_delim = buf.last() == Some(&delim);
-                            if hit_delim {
-                                buf.pop();
-                                if delim == b'\n' && buf.last() == Some(&b'\r') {
-                                    buf.pop();
-                                }
-                            }
-                            (Some(String::from_utf8_lossy(&buf).into_owned()), hit_delim)
-                        }
-                        Err(_) => (None, false),
-                    }
+                    let mut reader = self.read_input_source(cmd);
+                    read_line_or_chars(&mut *reader, nchars, delim)
                 };
 
                 return match got {
@@ -3654,6 +3705,13 @@ impl Shell {
                 Redirect::FdDup { fd, target } => {
                     extra_fds.push(ExtraFd::Dup { fd: *fd as i32, source: *target as i32 });
                 }
+                Redirect::FdDupWord { fd, word } => {
+                    let target_str = self.expand_word(word);
+                    match target_str.trim().parse::<i32>() {
+                        Ok(source) => extra_fds.push(ExtraFd::Dup { fd: *fd as i32, source }),
+                        Err(_) => return Err(format!("{}: ambiguous redirect", target_str)),
+                    }
+                }
             }
         }
 
@@ -3731,6 +3789,25 @@ enum ExtraFd {
 
 // A background job (`cmd &`), one or more children (a whole pipeline when
 // backgrounded together). `children` are kept so `wait`/`jobs`/`fg` can
+// A coproc pipe half the shell keeps open. The read side is wrapped in a
+// persistent BufReader (not a fresh one per `read -u` call) for the same
+// reason read_input_source avoids `BufReader::new(stdin())`: a throwaway
+// wrapper's internal read-ahead buffer would silently discard whatever it
+// over-read past the first line every time it's dropped.
+enum KeptFd {
+    Read(std::io::BufReader<std::io::PipeReader>),
+    Write(std::io::PipeWriter),
+}
+
+impl std::os::fd::AsRawFd for KeptFd {
+    fn as_raw_fd(&self) -> std::os::fd::RawFd {
+        match self {
+            KeptFd::Read(r) => r.get_ref().as_raw_fd(),
+            KeptFd::Write(w) => w.as_raw_fd(),
+        }
+    }
+}
+
 // poll/block on them directly -- earlier this shell just spawned a thread
 // that blindly `.wait()`d and dropped the result, which meant nothing else
 // could ever observe a background job's completion or exit status.
@@ -3781,6 +3858,52 @@ impl Job {
 fn exit_code_from_status(status: std::process::ExitStatus) -> i32 {
     use std::os::unix::process::ExitStatusExt;
     status.code().unwrap_or_else(|| status.signal().map(|s| 128 + s).unwrap_or(1))
+}
+
+// Shared by the `read` builtin's two sources (a Box<dyn BufRead> from
+// read_input_source, or a borrowed coproc fd via `-u`) -- factored out
+// specifically so the `-u` path's borrow of self.coproc_fds can end right
+// after this call, before the caller needs `&mut self` again for
+// assign_var. Real bash: a line/char-count read that runs into EOF before
+// seeing its delimiter (or before nchars is reached) still populates the
+// variable(s) with whatever partial data it got, but returns non-zero --
+// `clean` (the bool) tracks which case this was.
+fn read_line_or_chars(reader: &mut dyn std::io::BufRead, nchars: Option<usize>, delim: u8) -> (Option<String>, bool) {
+    if let Some(n) = nchars {
+        let mut buf = Vec::with_capacity(n);
+        let mut hit_eof = false;
+        for _ in 0..n {
+            let mut b = [0u8; 1];
+            match std::io::Read::read(reader, &mut b) {
+                Ok(0) => {
+                    hit_eof = true;
+                    break;
+                }
+                Ok(_) => buf.push(b[0]),
+                Err(_) => {
+                    hit_eof = true;
+                    break;
+                }
+            }
+        }
+        if buf.is_empty() && hit_eof { (None, false) } else { (Some(String::from_utf8_lossy(&buf).into_owned()), !hit_eof) }
+    } else {
+        let mut buf: Vec<u8> = Vec::new();
+        match reader.read_until(delim, &mut buf) {
+            Ok(0) => (None, false),
+            Ok(_) => {
+                let hit_delim = buf.last() == Some(&delim);
+                if hit_delim {
+                    buf.pop();
+                    if delim == b'\n' && buf.last() == Some(&b'\r') {
+                        buf.pop();
+                    }
+                }
+                (Some(String::from_utf8_lossy(&buf).into_owned()), hit_delim)
+            }
+            Err(_) => (None, false),
+        }
+    }
 }
 
 #[derive(Clone)]

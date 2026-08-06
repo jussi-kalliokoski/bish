@@ -131,6 +131,16 @@ pub enum Tok {
     RedirFdOut { fd: u32, append: bool },
     RedirFdIn { fd: u32 },
     RedirFdDup { fd: u32, target: u32 },
+    // `[N]>&WORD` / `[N]<&WORD` where WORD isn't a bare literal digit
+    // sequence -- e.g. `>&"$fd"`, needed for anything using a dynamically-
+    // obtained fd (like a coproc's array entries) rather than a fixed
+    // number known at parse time. Same shape as RedirOut/RedirFdOut/etc:
+    // just the operator, with the target read as the *next* token via the
+    // ordinary word-lexing fallback, consumed by the parser's expect_word.
+    // `fd` is the source side (1 for a bare `>&`, 0 for a bare `<&`, or the
+    // explicit leading digit for `N>&`/`N<&`); the target word is expanded
+    // and parsed as the target fd number at redirect-resolution time.
+    RedirDupWord { fd: u32 },
     HereString,
     // Placeholder pushed at the `<<WORD` site; patched in place with the
     // real (already expansion-processed) body once the line's newline is
@@ -155,6 +165,7 @@ pub enum Tok {
     KwDone,
     KwFor,
     KwSelect,
+    KwCoproc,
     KwIn,
     KwCase,
     KwEsac,
@@ -181,6 +192,7 @@ fn keyword(s: &str) -> Option<Tok> {
         "done" => Tok::KwDone,
         "for" => Tok::KwFor,
         "select" => Tok::KwSelect,
+        "coproc" => Tok::KwCoproc,
         "in" => Tok::KwIn,
         "case" => Tok::KwCase,
         "esac" => Tok::KwEsac,
@@ -335,6 +347,11 @@ impl<'a> Lexer<'a> {
                         toks.push(Tok::Word(vec![Chunk::ProcSubOut { raw }], false));
                         continue;
                     }
+                    if self.chars.peek().copied() == Some('&') {
+                        self.chars.next();
+                        toks.push(self.lex_dup_target(1));
+                        continue;
+                    }
                     let append = self.chars.peek().copied() == Some('>');
                     if append {
                         self.chars.next();
@@ -347,6 +364,11 @@ impl<'a> Lexer<'a> {
                         self.chars.next();
                         let raw = self.capture_balanced_parens()?;
                         toks.push(Tok::Word(vec![Chunk::ProcSubIn { raw }], false));
+                        continue;
+                    }
+                    if self.chars.peek().copied() == Some('&') {
+                        self.chars.next();
+                        toks.push(self.lex_dup_target(0));
                         continue;
                     }
                     if self.chars.peek().copied() == Some('<') {
@@ -401,7 +423,7 @@ impl<'a> Lexer<'a> {
                         Some('>') => {
                             if self.chars.peek().copied() == Some('&') {
                                 self.chars.next();
-                                toks.push(Tok::RedirFdDup { fd, target: self.read_fd_number() });
+                                toks.push(self.lex_dup_target(fd));
                             } else {
                                 let append = self.chars.peek().copied() == Some('>');
                                 if append {
@@ -413,7 +435,7 @@ impl<'a> Lexer<'a> {
                         Some('<') => {
                             if self.chars.peek().copied() == Some('&') {
                                 self.chars.next();
-                                toks.push(Tok::RedirFdDup { fd, target: self.read_fd_number() });
+                                toks.push(self.lex_dup_target(fd));
                             } else {
                                 toks.push(Tok::RedirFdIn { fd });
                             }
@@ -453,6 +475,21 @@ impl<'a> Lexer<'a> {
             }
         }
         Ok(toks)
+    }
+
+    // Called with the '&' of a `>&`/`<&` dup-redirect already consumed.
+    // `fd` is the source side, already determined by the caller (1/0 for
+    // the bare forms, or the explicit leading digit). Produces the plain
+    // literal-target token when a bare digit sequence follows (the common,
+    // already-well-tested case); otherwise pushes the word-based token and
+    // leaves the target itself to be lexed as an ordinary following word,
+    // same as every other redirect operator's target.
+    fn lex_dup_target(&mut self, fd: u32) -> Tok {
+        if self.chars.peek().copied().is_some_and(|c| c.is_ascii_digit()) {
+            Tok::RedirFdDup { fd, target: self.read_fd_number() }
+        } else {
+            Tok::RedirDupWord { fd }
+        }
     }
 
     fn peek_is_fd2_redirect(&self) -> bool {

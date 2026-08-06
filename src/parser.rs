@@ -22,6 +22,10 @@ pub enum Redirect {
     FdOut { fd: u32, word: Word, append: bool },
     FdIn { fd: u32, word: Word },
     FdDup { fd: u32, target: u32 },
+    // `[N]>&WORD` / `[N]<&WORD` with a non-literal target (e.g. a variable
+    // holding an fd number, like a coproc's array entries) -- word is
+    // expanded and parsed as the target fd at redirect-resolution time.
+    FdDupWord { fd: u32, word: Word },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -86,6 +90,13 @@ pub enum Command {
         body: Program,
         redirects: Vec<Redirect>,
     },
+    // `coproc [NAME] command`. Scoped grammar (see parse_coproc): the named
+    // form is only recognized when written as `coproc NAME { ...; }` --
+    // unambiguous since `{` can't otherwise start what NAME would mean.
+    // `coproc NAME simple_command` (no braces) isn't supported; write it
+    // with braces instead. `name: None` means the unnamed form, which
+    // populates the default `COPROC` array/PID vars.
+    Coproc { name: Option<String>, body: Box<Command> },
     Case {
         word: Word,
         arms: Vec<(Vec<Word>, Program, CaseTerm)>,
@@ -293,6 +304,7 @@ impl Parser {
             Some(Tok::KwUntil) => self.parse_while(true),
             Some(Tok::KwFor) => self.parse_for(),
             Some(Tok::KwSelect) => self.parse_select(),
+            Some(Tok::KwCoproc) => self.parse_coproc(),
             Some(Tok::KwCase) => self.parse_case(),
             Some(Tok::LBrace) => self.parse_group(),
             Some(Tok::KwFunction) => self.parse_function_kw(),
@@ -553,6 +565,27 @@ impl Parser {
         Ok(Command::Select { var, words, body, redirects })
     }
 
+    // `coproc [NAME] command`. Only recognizes NAME when the token right
+    // after it is `{` (see the Command::Coproc doc comment for why that's
+    // the only unambiguous case handled) -- otherwise the word right after
+    // `coproc` is the start of the command itself, same as the unnamed
+    // form.
+    fn parse_coproc(&mut self) -> Result<Command, String> {
+        self.advance(); // KwCoproc
+        let name = if let (Some(Tok::Word(chunks, true)), Some(Tok::LBrace)) =
+            (self.toks.get(self.pos), self.toks.get(self.pos + 1))
+        {
+            let name = word_to_plain_name(chunks)
+                .ok_or_else(|| "expected a plain name after 'coproc'".to_string())?;
+            self.advance();
+            Some(name)
+        } else {
+            None
+        };
+        let body = self.parse_command()?;
+        Ok(Command::Coproc { name, body: Box::new(body) })
+    }
+
     fn parse_case(&mut self) -> Result<Command, String> {
         self.advance(); // KwCase
         let word = self.expect_word()?;
@@ -650,6 +683,12 @@ impl Parser {
                     let (fd, target) = (*fd, *target);
                     self.advance();
                     redirects.push(Redirect::FdDup { fd, target });
+                }
+                Some(Tok::RedirDupWord { fd }) => {
+                    let fd = *fd;
+                    self.advance();
+                    let word = self.expect_word()?;
+                    redirects.push(Redirect::FdDupWord { fd, word });
                 }
                 Some(Tok::HereString) => {
                     self.advance();
@@ -757,6 +796,12 @@ impl Parser {
                     let (fd, target) = (*fd, *target);
                     self.advance();
                     redirects.push(Redirect::FdDup { fd, target });
+                }
+                Some(Tok::RedirDupWord { fd }) => {
+                    let fd = *fd;
+                    self.advance();
+                    let word = self.expect_word()?;
+                    redirects.push(Redirect::FdDupWord { fd, word });
                 }
                 Some(Tok::HereString) => {
                     self.advance();
