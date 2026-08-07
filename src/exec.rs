@@ -1,6 +1,8 @@
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
+use std::rc::Rc;
 
 use crate::arith;
 use crate::builtins;
@@ -148,11 +150,6 @@ pub struct Shell {
     // trying to rewind this.
     shell_start: std::time::Instant,
     seconds_offset: i64,
-    // $!: PID of the most recently backgrounded command (the last stage,
-    // for a backgrounded pipeline -- matches bash). Mirrors `jobs.last()`'s
-    // PID; kept as its own field since it needs to keep reporting the same
-    // PID even after that job is reaped out of the table by `wait`/`jobs`.
-    last_bg_pid: Option<u32>,
     // Background jobs (`cmd &`), tracked well enough for `jobs`/`fg`/`bg`/
     // `wait`/`kill %N` to work against real child processes. What's
     // explicitly NOT here: real terminal job control -- no process-group
@@ -166,8 +163,17 @@ pub struct Shell {
     // isn't script-compatibility-relevant in the first place. `fg`/`bg`
     // here just mean "wait for" / "leave running", not the full terminal
     // dance.
-    jobs: Vec<Job>,
-    next_job_id: u32,
+    //
+    // Held behind Rc<RefCell<_>> (single-threaded, so plain interior
+    // mutability, no Arc/Mutex needed) rather than owned directly:
+    // std::process::Child (inside Job) isn't Clone, so this table can only
+    // ever be referenced, never duplicated -- the moment more than one
+    // Shell exists (planned: a `window new` virtual session sharing job
+    // control with the shell it was opened from), each one needs to point
+    // at the *same* table, not a copy of it. With only one Shell alive
+    // today, this is behaviorally invisible -- it just draws the seam that
+    // work needs.
+    jobs: Rc<RefCell<JobTable>>,
     // `trap CMD SIGNAL`. EXIT is handled separately (exit_trap below) since
     // it isn't a real OS signal. Everything else here is a genuine
     // sigaction-installed handler (see install_trap_handler) -- the numeric
@@ -267,9 +273,7 @@ impl Shell {
             },
             shell_start: std::time::Instant::now(),
             seconds_offset: 0,
-            last_bg_pid: None,
-            jobs: Vec::new(),
-            next_job_id: 1,
+            jobs: Rc::new(RefCell::new(JobTable::new())),
             traps: std::collections::HashMap::new(),
             exit_trap: None,
             coproc_fds: std::collections::HashMap::new(),
@@ -310,31 +314,34 @@ impl Shell {
     // convention for a backgrounded pipeline).
     fn push_job(&mut self, children: Vec<std::process::Child>, cmd_text: String) {
         let pids: Vec<u32> = children.iter().map(|c| c.id()).collect();
-        self.last_bg_pid = pids.last().copied();
-        let id = self.next_job_id;
-        self.next_job_id += 1;
-        self.jobs.push(Job { id, pids, children, cmd_text });
+        let mut table = self.jobs.borrow_mut();
+        table.last_bg_pid = pids.last().copied();
+        let id = table.next_job_id;
+        table.next_job_id += 1;
+        table.jobs.push(Job { id, pids, children, cmd_text });
     }
 
     fn resolve_job_spec(&self, spec: &str) -> Option<usize> {
+        let table = self.jobs.borrow();
         let rest = spec.strip_prefix('%').unwrap_or(spec);
         if rest.is_empty() || rest == "%" || rest == "+" {
-            return if self.jobs.is_empty() { None } else { Some(self.jobs.len() - 1) };
+            return if table.jobs.is_empty() { None } else { Some(table.jobs.len() - 1) };
         }
         if rest == "-" {
-            return if self.jobs.len() >= 2 { Some(self.jobs.len() - 2) } else { None };
+            return if table.jobs.len() >= 2 { Some(table.jobs.len() - 2) } else { None };
         }
         if let Ok(n) = rest.parse::<u32>() {
-            return self.jobs.iter().position(|j| j.id == n);
+            return table.jobs.iter().position(|j| j.id == n);
         }
-        self.jobs.iter().position(|j| j.cmd_text.starts_with(rest))
+        table.jobs.iter().position(|j| j.cmd_text.starts_with(rest))
     }
 
     fn run_jobs(&mut self, _args: &[String]) -> i32 {
-        let last_idx = self.jobs.len().checked_sub(1);
-        let prev_idx = self.jobs.len().checked_sub(2);
+        let mut table = self.jobs.borrow_mut();
+        let last_idx = table.jobs.len().checked_sub(1);
+        let prev_idx = table.jobs.len().checked_sub(2);
         let mut to_remove = Vec::new();
-        for (i, job) in self.jobs.iter_mut().enumerate() {
+        for (i, job) in table.jobs.iter_mut().enumerate() {
             let mark = if Some(i) == last_idx {
                 "+"
             } else if Some(i) == prev_idx {
@@ -353,7 +360,7 @@ impl Shell {
             }
         }
         for i in to_remove.into_iter().rev() {
-            self.jobs.remove(i);
+            table.jobs.remove(i);
         }
         0
     }
@@ -370,13 +377,15 @@ impl Shell {
         }
         let idx = match args.first() {
             Some(spec) => self.resolve_job_spec(spec),
-            None => self.jobs.len().checked_sub(1),
+            None => self.jobs.borrow().jobs.len().checked_sub(1),
         };
         match idx {
             Some(i) => {
-                let cmd_text = self.jobs[i].cmd_text.clone();
-                println!("{}", cmd_text);
-                let mut job = self.jobs.remove(i);
+                let mut job = {
+                    let mut table = self.jobs.borrow_mut();
+                    println!("{}", table.jobs[i].cmd_text);
+                    table.jobs.remove(i)
+                };
                 job.wait()
             }
             None => {
@@ -400,11 +409,11 @@ impl Shell {
         }
         let idx = match args.first() {
             Some(spec) => self.resolve_job_spec(spec),
-            None => self.jobs.len().checked_sub(1),
+            None => self.jobs.borrow().jobs.len().checked_sub(1),
         };
         match idx {
             Some(i) => {
-                eprintln!("bish: bg: job {} already in background", self.jobs[i].id);
+                eprintln!("bish: bg: job {} already in background", self.jobs.borrow().jobs[i].id);
                 0
             }
             None => {
@@ -419,8 +428,8 @@ impl Shell {
     // operands, waits for just those and returns the *last* one's status.
     fn run_wait(&mut self, args: &[String]) -> i32 {
         if args.is_empty() {
-            while !self.jobs.is_empty() {
-                let mut job = self.jobs.remove(0);
+            while !self.jobs.borrow().jobs.is_empty() {
+                let mut job = self.jobs.borrow_mut().jobs.remove(0);
                 job.wait();
             }
             return 0;
@@ -428,21 +437,24 @@ impl Shell {
         let mut status = 0;
         for a in args {
             if let Some(idx) = self.resolve_job_spec(a) {
-                let mut job = self.jobs.remove(idx);
+                let mut job = self.jobs.borrow_mut().jobs.remove(idx);
                 status = job.wait();
                 continue;
             }
             match a.parse::<u32>() {
-                Ok(pid) => match self.jobs.iter().position(|j| j.pids.contains(&pid)) {
-                    Some(idx) => {
-                        let mut job = self.jobs.remove(idx);
-                        status = job.wait();
+                Ok(pid) => {
+                    let idx = self.jobs.borrow().jobs.iter().position(|j| j.pids.contains(&pid));
+                    match idx {
+                        Some(idx) => {
+                            let mut job = self.jobs.borrow_mut().jobs.remove(idx);
+                            status = job.wait();
+                        }
+                        None => {
+                            eprintln!("bish: wait: pid {} is not a child of this shell", pid);
+                            status = 127;
+                        }
                     }
-                    None => {
-                        eprintln!("bish: wait: pid {} is not a child of this shell", pid);
-                        status = 127;
-                    }
-                },
+                }
                 Err(_) => {
                     eprintln!("bish: wait: {}: no such job", a);
                     status = 127;
@@ -476,7 +488,7 @@ impl Shell {
         let mut status = 0;
         for t in targets {
             if let Some(idx) = t.strip_prefix('%').and_then(|_| self.resolve_job_spec(t)) {
-                let pids = self.jobs[idx].pids.clone();
+                let pids = self.jobs.borrow().jobs[idx].pids.clone();
                 for pid in pids {
                     send_signal(pid, sig);
                 }
@@ -3623,7 +3635,7 @@ impl Shell {
             // variables (SECONDS is the one partial exception -- see
             // assign_var's special-case for `SECONDS=n`).
             "$" => std::process::id().to_string(),
-            "!" => self.last_bg_pid.map(|p| p.to_string()).unwrap_or_default(),
+            "!" => self.jobs.borrow().last_bg_pid.map(|p| p.to_string()).unwrap_or_default(),
             "RANDOM" => self.next_random().to_string(),
             "SECONDS" => (self.shell_start.elapsed().as_secs() as i64 + self.seconds_offset).to_string(),
             "-" => {
@@ -4188,6 +4200,24 @@ struct Job {
     pids: Vec<u32>,
     children: Vec<std::process::Child>,
     cmd_text: String,
+}
+
+// Backs Shell.jobs (see that field's doc comment for why this lives behind
+// Rc<RefCell<_>> instead of being owned directly).
+struct JobTable {
+    jobs: Vec<Job>,
+    next_job_id: u32,
+    // $!: PID of the most recently backgrounded command (the last stage,
+    // for a backgrounded pipeline -- matches bash). Mirrors `jobs.last()`'s
+    // PID; kept as its own field since it needs to keep reporting the same
+    // PID even after that job is reaped out of the table by `wait`/`jobs`.
+    last_bg_pid: Option<u32>,
+}
+
+impl JobTable {
+    fn new() -> Self {
+        JobTable { jobs: Vec::new(), next_job_id: 1, last_bg_pid: None }
+    }
 }
 
 impl Job {
