@@ -221,6 +221,15 @@ pub struct Shell {
     // Whether `window`-family promotion into full-screen mode has already
     // happened (see run_window/promote_if_needed) -- only ever flips once.
     promoted: bool,
+    // Mirrors the OS process's real cwd, kept in sync by run_cd/run_pushd/
+    // run_popd (which still delegate the actual directory change to
+    // std::env::set_current_dir -- this field doesn't yet let a session
+    // diverge from the process's real cwd, that only matters once
+    // multiple sessions can exist). Exists now so callers read cwd from
+    // here rather than re-querying the OS each time, and so every spawn
+    // site already passes an explicit cwd -- both wiring this milestone's
+    // later multi-session work will need without changing yet again.
+    pub cwd: std::path::PathBuf,
 }
 
 impl Shell {
@@ -274,6 +283,7 @@ impl Shell {
             current_stderr_target: None,
             restrict_to_builtins: false,
             promoted: false,
+            cwd: std::env::current_dir().unwrap_or_default(),
         }
     }
 
@@ -849,12 +859,62 @@ impl Shell {
             return;
         }
         self.promoted = true;
-        let cwd = std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_else(|_| "?".to_string());
         print!("\x1b[?1049h\x1b[2J\x1b[H");
         println!("bish window manager -- M1 stub, single window only\r");
-        println!("\x1b[7m [1] {} \x1b[0m\r", cwd);
+        println!("\x1b[7m [1] {} \x1b[0m\r", self.cwd.display());
         println!("\r");
         let _ = std::io::Write::flush(&mut std::io::stdout());
+    }
+
+    // Moved here from a builtins.rs free function once cd needed to update
+    // self.cwd (a Shell-owned field) rather than just the OS process's
+    // cwd -- matches every other builtin that needs shell state (see
+    // run_pushd/run_declare/etc, all Shell methods for the same reason).
+    // Still delegates the actual directory change to
+    // std::env::set_current_dir so path resolution/symlink/error behavior
+    // is unchanged from before; self.cwd is read back from the OS
+    // afterward rather than computed locally, so it stays exactly in sync
+    // with what the OS considers the real cwd.
+    fn run_cd(&mut self, args: &[String]) -> i32 {
+        let old = self.cwd.to_string_lossy().into_owned();
+        let target = if let Some(dir) = args.first() {
+            if dir == "-" {
+                match std::env::var("OLDPWD") {
+                    Ok(p) => {
+                        println!("{}", p);
+                        p
+                    }
+                    Err(_) => {
+                        eprintln!("cd: OLDPWD not set");
+                        return 1;
+                    }
+                }
+            } else {
+                dir.clone()
+            }
+        } else {
+            match std::env::var("HOME") {
+                Ok(h) => h,
+                Err(_) => {
+                    eprintln!("cd: HOME not set");
+                    return 1;
+                }
+            }
+        };
+        match std::env::set_current_dir(&target) {
+            Ok(()) => {
+                self.cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(&target));
+                unsafe {
+                    std::env::set_var("OLDPWD", old);
+                    std::env::set_var("PWD", self.cwd.to_string_lossy().into_owned());
+                }
+                0
+            }
+            Err(e) => {
+                eprintln!("cd: {}: {}", target, e);
+                1
+            }
+        }
     }
 
     fn run_pushd(&mut self, args: &[String]) -> i32 {
@@ -873,8 +933,8 @@ impl Shell {
             // then push the old cwd back onto the front, net-swapping them.
             self.dir_stack.remove(0);
         }
-        let old_cwd = std::env::current_dir().ok().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
-        if builtins::cd(&[target]) != 0 {
+        let old_cwd = self.cwd.to_string_lossy().into_owned();
+        if self.run_cd(&[target]) != 0 {
             return 1;
         }
         self.dir_stack.insert(0, old_cwd);
@@ -890,7 +950,7 @@ impl Shell {
                 return 1;
             }
         };
-        if builtins::cd(&[target]) != 0 {
+        if self.run_cd(&[target]) != 0 {
             return 1;
         }
         self.dir_stack.remove(0);
@@ -922,8 +982,7 @@ impl Shell {
     }
 
     fn print_dirs(&self, vertical: bool) {
-        let cwd = std::env::current_dir().ok().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
-        let mut all = vec![cwd];
+        let mut all = vec![self.cwd.to_string_lossy().into_owned()];
         all.extend(self.dir_stack.iter().cloned());
         if vertical {
             for (i, d) in all.iter().enumerate() {
@@ -1303,7 +1362,7 @@ impl Shell {
         };
         let script = self.functions_preamble() + raw;
         if background {
-            match Command::new(exe).arg("-c").arg(script).spawn() {
+            match Command::new(exe).arg("-c").arg(script).current_dir(&self.cwd).spawn() {
                 Ok(child) => {
                     self.push_job(vec![child], format!("({})", raw));
                     0
@@ -1314,7 +1373,7 @@ impl Shell {
                 }
             }
         } else {
-            match Command::new(exe).arg("-c").arg(script).status() {
+            match Command::new(exe).arg("-c").arg(script).current_dir(&self.cwd).status() {
                 Ok(status) => exit_code_from_status(status),
                 Err(e) => {
                     eprintln!("bish: subshell: {}", e);
@@ -1358,6 +1417,7 @@ impl Shell {
         let script = self.functions_preamble() + &crate::serialize::serialize_command(body);
         let mut command = Command::new(exe);
         command.arg("-c").arg(script);
+        command.current_dir(&self.cwd);
         command.stdin(Stdio::from(in_r));
         command.stdout(Stdio::from(out_w));
         match command.spawn() {
@@ -1408,6 +1468,7 @@ impl Shell {
         let script = self.functions_preamble() + &crate::serialize::serialize_command(cmd);
         let mut command = Command::new(exe);
         command.arg("-c").arg(script);
+        command.current_dir(&self.cwd);
         command.stdin(redirs.stdin.unwrap_or_else(Stdio::inherit));
         command.stdout(redirs.stdout.unwrap_or_else(Stdio::inherit));
         command.stderr(redirs.stderr.unwrap_or_else(Stdio::inherit));
@@ -1442,7 +1503,7 @@ impl Shell {
             Err(_) => return String::new(),
         };
         let script = self.functions_preamble() + raw;
-        match Command::new(exe).arg("-c").arg(script).output() {
+        match Command::new(exe).arg("-c").arg(script).current_dir(&self.cwd).output() {
             Ok(out) => {
                 let mut s = String::from_utf8_lossy(&out.stdout).into_owned();
                 while s.ends_with('\n') {
@@ -1477,7 +1538,7 @@ impl Shell {
             }
         };
         let script = self.functions_preamble() + raw;
-        match Command::new(exe).arg("-c").arg(script).stdout(Stdio::from(file)).status() {
+        match Command::new(exe).arg("-c").arg(script).current_dir(&self.cwd).stdout(Stdio::from(file)).status() {
             Ok(_) => {}
             Err(e) => eprintln!("bish: process substitution: {}", e),
         }
@@ -1510,7 +1571,7 @@ impl Shell {
                 if let Ok(exe) = std::env::current_exe() {
                     let script = self.functions_preamble() + &raw;
                     if let Ok(file) = std::fs::File::open(&path) {
-                        let _ = Command::new(exe).arg("-c").arg(script).stdin(Stdio::from(file)).status();
+                        let _ = Command::new(exe).arg("-c").arg(script).current_dir(&self.cwd).stdin(Stdio::from(file)).status();
                     }
                 }
                 self.proc_sub_cleanup.push(path);
@@ -2138,6 +2199,7 @@ impl Shell {
                 }
                 let mut ext = Command::new(&argv[i]);
                 ext.args(&argv[i + 1..]);
+                ext.current_dir(&self.cwd);
                 return match ext.status() {
                     Ok(status) => ExecResult::Status(exit_code_from_status(status)),
                     Err(e) => {
@@ -2159,7 +2221,7 @@ impl Shell {
                 }
                 return ExecResult::Status(0);
             }
-            "cd" => return ExecResult::Status(builtins::cd(&argv[1..])),
+            "cd" => return ExecResult::Status(self.run_cd(&argv[1..])),
             "umask" => return ExecResult::Status(builtins::umask(&argv[1..])),
             "ulimit" => return ExecResult::Status(builtins::ulimit(&argv[1..])),
             // alias/unalias: store and query only, no expansion when a
@@ -2748,6 +2810,7 @@ impl Shell {
 
         let mut command = Command::new(&name);
         command.args(&argv[1..]);
+        command.current_dir(&self.cwd);
         for (k, mode, val) in &cmd.assigns {
             let v = self.expand_word(val);
             let v = match mode {
@@ -2908,6 +2971,7 @@ impl Shell {
                     command
                 }
             };
+            command.current_dir(&self.cwd);
 
             match command.spawn() {
                 Ok(mut child) => {

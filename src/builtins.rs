@@ -195,51 +195,6 @@ fn umask_symbolic(mask: u32) -> String {
     format!("u={},g={},o={}", perm_for(6), perm_for(3), perm_for(0))
 }
 
-pub fn cd(args: &[String]) -> i32 {
-    let old = std::env::current_dir().ok().map(|p| p.to_string_lossy().into_owned());
-    let target = if let Some(dir) = args.first() {
-        if dir == "-" {
-            match std::env::var("OLDPWD") {
-                Ok(p) => {
-                    println!("{}", p);
-                    p
-                }
-                Err(_) => {
-                    eprintln!("cd: OLDPWD not set");
-                    return 1;
-                }
-            }
-        } else {
-            dir.clone()
-        }
-    } else {
-        match std::env::var("HOME") {
-            Ok(h) => h,
-            Err(_) => {
-                eprintln!("cd: HOME not set");
-                return 1;
-            }
-        }
-    };
-    match std::env::set_current_dir(&target) {
-        Ok(()) => {
-            unsafe {
-                if let Some(o) = old {
-                    std::env::set_var("OLDPWD", o);
-                }
-                if let Ok(new_pwd) = std::env::current_dir() {
-                    std::env::set_var("PWD", new_pwd.to_string_lossy().into_owned());
-                }
-            }
-            0
-        }
-        Err(e) => {
-            eprintln!("cd: {}: {}", target, e);
-            1
-        }
-    }
-}
-
 pub fn break_loop(args: &[String]) -> crate::exec::ExecResult {
     let n = args.first().and_then(|s| s.parse::<u32>().ok()).unwrap_or(1).max(1);
     crate::exec::ExecResult::Break(n)

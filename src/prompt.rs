@@ -17,9 +17,8 @@ const OK_COLOR: &str = "\x1b[1;32m"; // bold green
 const ERR_COLOR: &str = "\x1b[1;31m"; // bold red
 
 pub fn render(shell: &Shell) -> String {
-    let cwd = std::env::current_dir().unwrap_or_default();
     let home = std::env::var("HOME").unwrap_or_default();
-    let display = shorten_path(&cwd.to_string_lossy(), &home);
+    let display = shorten_path(&shell.cwd.to_string_lossy(), &home);
 
     let is_root = unsafe { geteuid() } == 0;
     let path_color = if is_root { ROOT_PATH_COLOR } else { PATH_COLOR };
