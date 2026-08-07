@@ -1,12 +1,15 @@
 mod arith;
 mod builtins;
+mod editor;
 mod exec;
 mod glob;
 mod lexer;
 mod parser;
+mod prompt;
 mod regex;
 mod repl;
 mod serialize;
+mod term;
 
 use std::io::{IsTerminal, Read};
 

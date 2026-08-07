@@ -1,34 +1,44 @@
-use std::io::{self, BufRead, Write};
+use std::io::{self, Write};
 
+use crate::editor::{self, ReadOutcome};
 use crate::exec::Shell;
 use crate::lexer::Lexer;
 use crate::parser::Parser;
+use crate::prompt;
+use crate::term;
 
 pub fn run(shell: &mut Shell) {
-    let stdin = io::stdin();
+    // The shell itself must survive Ctrl-C (bash's own top-level
+    // interactive behavior); a foreground child still dies/interrupts
+    // normally since exec() resets a *caught* signal like this back to
+    // default. See term::ignore_sigint's doc comment.
+    term::ignore_sigint();
+
     // Accumulates lines across a multi-line construct (unclosed if/for/
     // while/case/quote/paren) until the buffered source parses cleanly.
     let mut buffer = String::new();
 
     loop {
-        print!("{}", if buffer.is_empty() { "bish> " } else { "> " });
-        let _ = io::stdout().flush();
+        let prompt_str = if buffer.is_empty() { prompt::render(shell) } else { prompt::continuation() };
 
-        let mut line = String::new();
-        match stdin.lock().read_line(&mut line) {
-            Ok(0) => {
-                println!();
+        match editor::read_line(&prompt_str) {
+            Ok(ReadOutcome::Eof) => {
                 if !buffer.is_empty() {
                     eprintln!("bish: syntax error: unexpected end of input");
                 }
                 shell.run_exit_trap();
                 break;
             }
-            Ok(_) => {
+            Ok(ReadOutcome::Interrupted) => {
+                // Ctrl-C abandons whatever multi-line construct was
+                // pending, same as bash, and starts fresh at a new prompt.
+                buffer.clear();
+            }
+            Ok(ReadOutcome::Line(line)) => {
                 if !buffer.is_empty() {
                     buffer.push('\n');
                 }
-                buffer.push_str(line.trim_end_matches('\n'));
+                buffer.push_str(&line);
 
                 if buffer.trim().is_empty() {
                     buffer.clear();
@@ -61,6 +71,7 @@ pub fn run(shell: &mut Shell) {
                 break;
             }
         }
+        let _ = io::stdout().flush();
     }
 }
 
