@@ -123,3 +123,24 @@ impl Drop for RawGuard {
         }
     }
 }
+
+#[repr(C)]
+struct PollFd {
+    fd: i32,
+    events: i16,
+    revents: i16,
+}
+const POLLIN: i16 = 0x0001;
+
+unsafe extern "C" {
+    fn poll(fds: *mut PollFd, nfds: u64, timeout: i32) -> i32;
+}
+
+// True if a byte is available on stdin within timeout_ms. Used to tell a
+// standalone Esc keypress (nothing follows) apart from the start of a
+// terminal escape sequence (whose bytes arrive back-to-back) without
+// blocking forever on the ambiguous case.
+pub fn stdin_ready(timeout_ms: i32) -> bool {
+    let mut pfd = PollFd { fd: 0, events: POLLIN, revents: 0 };
+    unsafe { poll(&mut pfd, 1, timeout_ms) > 0 && (pfd.revents & POLLIN) != 0 }
+}

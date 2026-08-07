@@ -2,6 +2,7 @@ use std::io::{self, Write};
 
 use crate::editor::{self, ReadOutcome};
 use crate::exec::Shell;
+use crate::history::History;
 use crate::lexer::Lexer;
 use crate::parser::Parser;
 use crate::prompt;
@@ -14,6 +15,8 @@ pub fn run(shell: &mut Shell) {
     // default. See term::ignore_sigint's doc comment.
     term::ignore_sigint();
 
+    let mut history = History::load();
+
     // Accumulates lines across a multi-line construct (unclosed if/for/
     // while/case/quote/paren) until the buffered source parses cleanly.
     let mut buffer = String::new();
@@ -21,7 +24,7 @@ pub fn run(shell: &mut Shell) {
     loop {
         let prompt_str = if buffer.is_empty() { prompt::render(shell) } else { prompt::continuation() };
 
-        match editor::read_line(&prompt_str) {
+        match editor::read_line(&prompt_str, &history) {
             Ok(ReadOutcome::Eof) => {
                 if !buffer.is_empty() {
                     eprintln!("bish: syntax error: unexpected end of input");
@@ -48,6 +51,10 @@ pub fn run(shell: &mut Shell) {
                 match Lexer::new(&buffer).tokenize() {
                     Ok(toks) => match Parser::new(toks).parse_program() {
                         Ok(prog) => {
+                            // Recorded regardless of the exit status the
+                            // command ends up with -- bash and fish both
+                            // record what was typed, not what succeeded.
+                            history.record(&buffer);
                             shell.run_program(&prog);
                             buffer.clear();
                         }

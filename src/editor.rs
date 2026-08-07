@@ -13,9 +13,14 @@
 // Fixing that needs a TIOCGWINSZ ioctl and wrap-aware redraw math -- left
 // for later, same spirit as the other documented gaps in this codebase.
 
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 
+use crate::history::History;
 use crate::term;
+
+unsafe extern "C" {
+    fn read(fd: i32, buf: *mut u8, count: usize) -> isize;
+}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Key {
@@ -29,6 +34,7 @@ pub enum Key {
     Down,
     Home,
     End,
+    Escape,
     CtrlA,
     CtrlB,
     CtrlC,
@@ -43,12 +49,32 @@ pub enum Key {
     Unknown,
 }
 
-fn read_byte(stdin: &mut io::Stdin) -> io::Result<Option<u8>> {
+// How long to wait for further bytes after a lone Esc before deciding it
+// really is a standalone Esc keypress rather than the start of a sequence.
+// Real escape sequences arrive as a fast burst from the terminal; a human
+// pressing Esc alone won't have a next byte ready this soon.
+const ESCAPE_TIMEOUT_MS: i32 = 30;
+
+// Reads directly from fd 0 via a raw syscall rather than std::io::Stdin --
+// Stdin wraps its own internal BufReader, which can pull extra bytes out of
+// the kernel in a single underlying read and hand them out later purely
+// from userspace. term::stdin_ready's poll() only sees the kernel's view,
+// so mixing it with a buffered reader would make the poll check lie: bytes
+// already sitting in Stdin's buffer wouldn't show as "ready" even though
+// they're available for the very next read. Going straight to the syscall
+// keeps this consistent with what's actually been consumed.
+fn read_byte() -> io::Result<Option<u8>> {
     let mut b = [0u8; 1];
-    match stdin.read(&mut b) {
-        Ok(0) => Ok(None),
-        Ok(_) => Ok(Some(b[0])),
-        Err(e) => Err(e),
+    loop {
+        let n = unsafe { read(0, b.as_mut_ptr(), 1) };
+        if n < 0 {
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(err);
+        }
+        return Ok(if n == 0 { None } else { Some(b[0]) });
     }
 }
 
@@ -58,8 +84,8 @@ fn read_byte(stdin: &mut io::Stdin) -> io::Result<Option<u8>> {
 // a signal. Handles the escape sequences a normal terminal sends for
 // arrow/Home/End/Delete, and decodes multi-byte UTF-8 so non-ASCII input
 // doesn't get mangled.
-fn read_key(stdin: &mut io::Stdin) -> io::Result<Option<Key>> {
-    let b = match read_byte(stdin)? {
+fn read_key() -> io::Result<Option<Key>> {
+    let b = match read_byte()? {
         Some(b) => b,
         None => return Ok(None),
     };
@@ -77,28 +103,33 @@ fn read_key(stdin: &mut io::Stdin) -> io::Result<Option<Key>> {
         0x1a => Key::CtrlZ,
         b'\r' | b'\n' => Key::Enter,
         0x7f | 0x08 => Key::Backspace,
-        0x1b => return Ok(Some(read_escape(stdin)?)),
+        0x1b => return Ok(Some(read_escape()?)),
         0x20..=0x7e => Key::Char(b as char),
-        _ if b >= 0xc0 => Key::Char(read_utf8_cont(stdin, b)?),
+        _ if b >= 0xc0 => Key::Char(read_utf8_cont(b)?),
         _ => Key::Unknown,
     };
     Ok(Some(key))
 }
 
-// Escape sequence decoding: bare ESC (nothing follows within the raw
-// single-byte reads that keep arriving) is reported as Unknown -- there's
-// no notion of "wait briefly for more bytes" here, which is fine since a
-// real escape sequence's bytes arrive back-to-back from the terminal.
-fn read_escape(stdin: &mut io::Stdin) -> io::Result<Key> {
-    let b1 = match read_byte(stdin)? {
+// Escape sequence decoding. A bare Esc keypress has nothing following it;
+// poll with a short timeout at each step to tell that apart from an actual
+// sequence (whose bytes arrive back-to-back) instead of blocking forever.
+fn read_escape() -> io::Result<Key> {
+    if !term::stdin_ready(ESCAPE_TIMEOUT_MS) {
+        return Ok(Key::Escape);
+    }
+    let b1 = match read_byte()? {
         Some(b) => b,
-        None => return Ok(Key::Unknown),
+        None => return Ok(Key::Escape),
     };
     match b1 {
         b'[' | b'O' => {}
         _ => return Ok(Key::Unknown),
     }
-    let b2 = match read_byte(stdin)? {
+    if !term::stdin_ready(ESCAPE_TIMEOUT_MS) {
+        return Ok(Key::Unknown);
+    }
+    let b2 = match read_byte()? {
         Some(b) => b,
         None => return Ok(Key::Unknown),
     };
@@ -112,7 +143,9 @@ fn read_escape(stdin: &mut io::Stdin) -> io::Result<Key> {
         b'1' | b'3' | b'4' | b'7' | b'8' => {
             // CSI <n> ~ forms (e.g. "\x1b[3~" for Delete). Consume the
             // trailing '~' and map the digit we already have.
-            let _ = read_byte(stdin)?;
+            if term::stdin_ready(ESCAPE_TIMEOUT_MS) {
+                let _ = read_byte()?;
+            }
             match b2 {
                 b'3' => Key::Delete,
                 b'1' | b'7' => Key::Home,
@@ -124,7 +157,7 @@ fn read_escape(stdin: &mut io::Stdin) -> io::Result<Key> {
     })
 }
 
-fn read_utf8_cont(stdin: &mut io::Stdin, first: u8) -> io::Result<char> {
+fn read_utf8_cont(first: u8) -> io::Result<char> {
     let extra = if first >= 0xf0 {
         3
     } else if first >= 0xe0 {
@@ -134,7 +167,7 @@ fn read_utf8_cont(stdin: &mut io::Stdin, first: u8) -> io::Result<char> {
     };
     let mut buf = vec![first];
     for _ in 0..extra {
-        if let Some(b) = read_byte(stdin)? {
+        if let Some(b) = read_byte()? {
             buf.push(b);
         }
     }
@@ -208,6 +241,12 @@ impl LineEditor {
     fn as_string(&self) -> String {
         self.buf.iter().collect()
     }
+
+    // Replaces the whole buffer (history recall), cursor at the end.
+    fn set_text(&mut self, s: &str) {
+        self.buf = s.chars().collect();
+        self.cursor = self.buf.len();
+    }
 }
 
 fn redraw(prompt: &str, ed: &LineEditor) -> io::Result<()> {
@@ -235,22 +274,33 @@ pub enum ReadOutcome {
 // engaged only for the duration of this call (restored on every return
 // path via RawGuard's Drop), so a foreground command run in between calls
 // sees an entirely normal terminal.
-pub fn read_line(prompt: &str) -> io::Result<ReadOutcome> {
+pub fn read_line(prompt: &str, history: &History) -> io::Result<ReadOutcome> {
     let mut guard = Some(term::RawGuard::enable(0)?);
     let mut ed = LineEditor::new();
-    let mut stdin = io::stdin();
+
+    // Fish-style history browsing: Up/Down search backward/forward through
+    // history for entries starting with whatever was typed *before*
+    // browsing started (that original text is `prefix`, restored on Esc
+    // or on Down-ing past the newest match). Any other key -- moving the
+    // cursor, editing, submitting -- silently "locks in" the currently
+    // shown entry as ordinary buffer text and ends the browse, matching
+    // fish: the suggestion just becomes your input from that point on.
+    let mut browse: Option<(String, usize)> = None;
 
     print!("{}", prompt);
     io::stdout().flush()?;
 
     loop {
-        let key = match read_key(&mut stdin)? {
+        let key = match read_key()? {
             Some(k) => k,
             None => {
                 drop(guard.take());
                 return Ok(ReadOutcome::Eof);
             }
         };
+        if !matches!(key, Key::Up | Key::Down | Key::Escape) {
+            browse = None;
+        }
         match key {
             Key::Enter => {
                 drop(guard.take());
@@ -293,10 +343,31 @@ pub fn read_line(prompt: &str) -> io::Result<ReadOutcome> {
             Key::CtrlW => ed.kill_word_backward(),
             Key::CtrlL => print!("\x1b[H\x1b[2J"),
             Key::Char(c) => ed.insert(c),
-            // History (Up/Down) isn't implemented yet -- decoded so the
-            // key doesn't get misinterpreted as literal escape bytes, but
-            // currently a no-op.
-            Key::Up | Key::Down | Key::Unknown => {}
+            Key::Up => {
+                let prefix = browse.as_ref().map(|(p, _)| p.clone()).unwrap_or_else(|| ed.as_string());
+                let from = browse.as_ref().map(|(_, i)| *i);
+                if let Some((idx, entry)) = history.search_backward(&prefix, from) {
+                    ed.set_text(entry);
+                    browse = Some((prefix, idx));
+                }
+            }
+            Key::Down => {
+                if let Some((prefix, idx)) = browse.take() {
+                    match history.search_forward(&prefix, idx) {
+                        Some((new_idx, entry)) => {
+                            ed.set_text(entry);
+                            browse = Some((prefix, new_idx));
+                        }
+                        None => ed.set_text(&prefix),
+                    }
+                }
+            }
+            Key::Escape => {
+                if let Some((prefix, _)) = browse.take() {
+                    ed.set_text(&prefix);
+                }
+            }
+            Key::Unknown => {}
         }
         redraw(prompt, &ed)?;
     }

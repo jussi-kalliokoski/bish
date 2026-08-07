@@ -3,6 +3,7 @@ mod builtins;
 mod editor;
 mod exec;
 mod glob;
+mod history;
 mod lexer;
 mod parser;
 mod prompt;
