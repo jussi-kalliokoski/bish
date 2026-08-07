@@ -268,6 +268,10 @@ pub enum ReadOutcome {
     Line(String),
     Eof,
     Interrupted,
+    // ':' pressed on an empty line -- command mode. Reported immediately on
+    // keypress (not after Enter) so the caller can switch modes right away;
+    // see read_line's Key::Char(':') handling.
+    CommandMode,
 }
 
 // Reads one line of input interactively: prompt is printed, raw mode is
@@ -342,6 +346,12 @@ pub fn read_line(prompt: &str, history: &History) -> io::Result<ReadOutcome> {
             Key::CtrlU => ed.kill_to_start(),
             Key::CtrlW => ed.kill_word_backward(),
             Key::CtrlL => print!("\x1b[H\x1b[2J"),
+            Key::Char(':') if ed.buf.is_empty() => {
+                drop(guard.take());
+                print!("\r\n");
+                io::stdout().flush()?;
+                return Ok(ReadOutcome::CommandMode);
+            }
             Key::Char(c) => ed.insert(c),
             Key::Up => {
                 let prefix = browse.as_ref().map(|(p, _)| p.clone()).unwrap_or_else(|| ed.as_string());

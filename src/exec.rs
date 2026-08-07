@@ -213,6 +213,14 @@ pub struct Shell {
     // real stderr, matching bash routing its own error messages through
     // the command's redirects too.
     current_stderr_target: Option<String>,
+    // Set while running command-mode (`:`) input: only builtins may run
+    // directly (see the fallthrough gate in run_single, right before
+    // function lookup) -- `command NAME` is the explicit escape hatch for
+    // externals, matching its existing "force external" semantics.
+    pub restrict_to_builtins: bool,
+    // Whether `window`-family promotion into full-screen mode has already
+    // happened (see run_window/promote_if_needed) -- only ever flips once.
+    promoted: bool,
 }
 
 impl Shell {
@@ -264,7 +272,16 @@ impl Shell {
             opt_monitor: false,
             suppress_errexit: 0,
             current_stderr_target: None,
+            restrict_to_builtins: false,
+            promoted: false,
         }
+    }
+
+    // True once `window`-family promotion has switched the terminal into
+    // full-screen mode -- repl.rs checks this at exit time to know whether
+    // it needs to restore the normal screen buffer before quitting.
+    pub fn is_promoted(&self) -> bool {
+        self.promoted
     }
 
     pub fn run_exit_trap(&mut self) {
@@ -782,6 +799,62 @@ impl Shell {
                 0
             }
         }
+    }
+
+    // `window`/`w`/`win` -- the window-manager builtin. This is an M1 stub:
+    // there is no real multi-window session/ancestry model yet (that's the
+    // in-process session-cloning primitive and the Window/Frame stack
+    // planned for later), so next/previous/new/close just report the
+    // single-window state honestly rather than pretending to manage
+    // windows that don't exist yet. What IS real here: the promotion
+    // trigger and the restricted-execution/command-mode plumbing around
+    // it, which every later milestone builds on unchanged.
+    fn run_window(&mut self, args: &[String]) -> i32 {
+        self.promote_if_needed();
+        match args.first().map(String::as_str) {
+            Some("next") | Some("previous") | Some("prev") | Some("p") => {
+                println!("window: only one window open");
+                0
+            }
+            Some("new") => {
+                println!("window: new not yet supported");
+                0
+            }
+            Some("close") | Some("c") => {
+                eprintln!("bish: window close: cannot close the last window -- exit the shell instead");
+                1
+            }
+            Some(other) => {
+                eprintln!("bish: window: unknown subcommand: {}", other);
+                2
+            }
+            None => {
+                eprintln!("bish: window: missing subcommand (next/previous/new/close)");
+                2
+            }
+        }
+    }
+
+    // Draws the M1 promotion stub the first time any window-family command
+    // runs: switches to the terminal's alternate screen buffer (mode 1049)
+    // so whatever was on screen before promotion stays untouched in the
+    // real terminal's own native scrollback, then draws a plain one-tab
+    // bar. No terminal-size query here (that needs a TIOCGWINSZ ioctl,
+    // planned for the real compositor) so this can't pin the bar to the
+    // actual bottom row yet -- an acknowledged, temporary limitation of
+    // the stub, not the final design. Superseded wholesale once the real
+    // compositor lands.
+    fn promote_if_needed(&mut self) {
+        if self.promoted {
+            return;
+        }
+        self.promoted = true;
+        let cwd = std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_else(|_| "?".to_string());
+        print!("\x1b[?1049h\x1b[2J\x1b[H");
+        println!("bish window manager -- M1 stub, single window only\r");
+        println!("\x1b[7m [1] {} \x1b[0m\r", cwd);
+        println!("\r");
+        let _ = std::io::Write::flush(&mut std::io::stdout());
     }
 
     fn run_pushd(&mut self, args: &[String]) -> i32 {
@@ -2143,6 +2216,14 @@ impl Shell {
                 return ExecResult::Status(status);
             }
             "shopt" => return ExecResult::Status(self.run_shopt(&argv[1..])),
+            // Command-mode-exclusive: this extends the builtin set
+            // available there specifically, rather than being a normal
+            // shell builtin -- with the guard false, this arm doesn't
+            // match and `window` falls through to the same external-
+            // command lookup any other unrecognized name would hit.
+            "window" | "w" | "win" if self.restrict_to_builtins => {
+                return ExecResult::Status(self.run_window(&argv[1..]));
+            }
             "pushd" => return ExecResult::Status(self.run_pushd(&argv[1..])),
             "popd" => return ExecResult::Status(self.run_popd(&argv[1..])),
             "dirs" => return ExecResult::Status(self.run_dirs(&argv[1..])),
@@ -2646,6 +2727,11 @@ impl Shell {
                 return ExecResult::Status(0);
             }
             _ => {}
+        }
+
+        if self.restrict_to_builtins {
+            eprintln!("bish: {}: command mode only allows builtins -- use `command {}` to run it", name, name);
+            return ExecResult::Status(127);
         }
 
         if let Some(body) = self.functions.get(&name).cloned() {
@@ -4854,6 +4940,9 @@ const KNOWN_BUILTINS: &[&str] = &[
     "ulimit",
     "alias",
     "unalias",
+    "window",
+    "w",
+    "win",
 ];
 
 fn is_known_builtin(name: &str) -> bool {

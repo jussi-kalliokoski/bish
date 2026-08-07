@@ -4,6 +4,10 @@
 // through the file as a single line rather than fragmenting on reload).
 // editor.rs is the only consumer of the search methods, driving fish-style
 // up/down: prefix-filtered rather than plain chronological recall.
+//
+// The filename is parameterized (see History::load) so command mode can
+// keep a second, independent instance (its own file, own entries) without
+// colliding with the normal shell's history.
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -14,8 +18,10 @@ pub struct History {
 }
 
 impl History {
-    pub fn load() -> History {
-        let path = history_path();
+    // `filename` is a bare filename under $HOME, e.g. ".bish_history" for
+    // the normal shell history or ".bish_cmd_history" for command mode's.
+    pub fn load(filename: &str) -> History {
+        let path = history_path(filename);
         let mut entries = Vec::new();
         if let Some(p) = &path {
             if let Ok(content) = std::fs::read_to_string(p) {
@@ -66,8 +72,8 @@ impl History {
     }
 }
 
-fn history_path() -> Option<PathBuf> {
-    std::env::var("HOME").ok().map(|h| PathBuf::from(h).join(".bish_history"))
+fn history_path(filename: &str) -> Option<PathBuf> {
+    std::env::var("HOME").ok().map(|h| PathBuf::from(h).join(filename))
 }
 
 fn escape(s: &str) -> String {
