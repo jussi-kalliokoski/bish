@@ -38,7 +38,7 @@ fn main() {
     }
 
     if std::io::stdin().is_terminal() {
-        repl::run(&mut shell);
+        repl::run(shell);
     } else {
         let mut src = String::new();
         if std::io::stdin().read_to_string(&mut src).is_ok() {

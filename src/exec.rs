@@ -18,6 +18,19 @@ pub enum ExecResult {
     Break(u32),
     Continue(u32),
     Return(i32),
+    // `window`-family command result. Bubbles up through run_and_or/
+    // run_pipeline/run_program exactly like Break/Continue/Return, all the
+    // way to whoever called run_program -- repl.rs, which is the only
+    // thing that actually owns the session/window collection. This is
+    // deliberate, not an oversight: a session's own Shell can't hold a
+    // reference to "all sessions" (itself included) without creating an
+    // Rc<RefCell<_>> self-reference cycle that would panic the moment
+    // running code tried to borrow it while already borrowed one level up
+    // the call stack. Threading the action through the same signal
+    // mechanism control flow already uses avoids that entirely: run_window
+    // (below) only validates the request and returns it, never touches
+    // shared window state itself.
+    Window(WindowAction),
 }
 
 impl ExecResult {
@@ -26,12 +39,24 @@ impl ExecResult {
             ExecResult::Status(s) => s,
             ExecResult::Return(s) => s,
             ExecResult::Break(_) | ExecResult::Continue(_) => 0,
+            ExecResult::Window(_) => 0,
         }
     }
 
     fn is_signal(self) -> bool {
-        matches!(self, ExecResult::Break(_) | ExecResult::Continue(_) | ExecResult::Return(_))
+        matches!(self, ExecResult::Break(_) | ExecResult::Continue(_) | ExecResult::Return(_) | ExecResult::Window(_))
     }
+}
+
+// What repl.rs should do in response to a `window`-family command -- see
+// ExecResult::Window's doc comment for why this travels as a bubbled
+// signal instead of direct shared-state mutation.
+#[derive(Debug, Clone, Copy)]
+pub enum WindowAction {
+    New,
+    Next,
+    Previous,
+    Close,
 }
 
 pub struct Shell {
@@ -308,9 +333,12 @@ impl Shell {
     // (rather than execing a fresh bish process). Unlike subshells/$(),
     // which self-exec a real child process specifically for *isolation*
     // (see run_subshell's doc comment), this is the opposite goal --
-    // sharing jobs and (eventually) history is the entire point, so a
-    // real child process -- with its own PID, unable to share this
-    // process's Rc<RefCell<JobTable>> -- would be the wrong tool.
+    // sharing jobs is the entire point, so a real child process -- with
+    // its own PID, unable to share this process's Rc<RefCell<JobTable>>
+    // -- would be the wrong tool. History sharing (every session's
+    // commands landing in one interleaved timeline) isn't this
+    // function's job at all -- repl.rs handles it directly via a shared
+    // History plus a per-session boundary index, see history.rs.
     //
     // Variables/functions/aliases/options/cwd are a deep-cloned snapshot
     // of the parent at creation time: the two sessions start identical but
@@ -326,9 +354,6 @@ impl Shell {
     // target) that belongs to whatever the *parent* is presently
     // executing, not to a brand-new session that hasn't run anything yet.
     //
-    // No caller yet outside the test below -- `window new` (a later
-    // milestone) is what will actually invoke this from run_window.
-    #[allow(dead_code)]
     pub fn new_virtual_child(&self) -> Shell {
         Shell {
             last_status: 0,
@@ -906,58 +931,47 @@ impl Shell {
         }
     }
 
-    // `window`/`w`/`win` -- the window-manager builtin. This is an M1 stub:
-    // there is no real multi-window session/ancestry model yet (that's the
-    // in-process session-cloning primitive and the Window/Frame stack
-    // planned for later), so next/previous/new/close just report the
-    // single-window state honestly rather than pretending to manage
-    // windows that don't exist yet. What IS real here: the promotion
-    // trigger and the restricted-execution/command-mode plumbing around
-    // it, which every later milestone builds on unchanged.
-    fn run_window(&mut self, args: &[String]) -> i32 {
+    // `window`/`w`/`win` -- the window-manager builtin. Only validates the
+    // subcommand and triggers promotion; the actual session/window
+    // mutation happens in repl.rs, reached via the bubbled-up
+    // ExecResult::Window signal (see that variant's doc comment for why
+    // this can't just mutate shared state directly from here).
+    fn run_window(&mut self, args: &[String]) -> ExecResult {
         self.promote_if_needed();
         match args.first().map(String::as_str) {
-            Some("next") | Some("previous") | Some("prev") | Some("p") => {
-                println!("window: only one window open");
-                0
-            }
-            Some("new") => {
-                println!("window: new not yet supported");
-                0
-            }
-            Some("close") | Some("c") => {
-                eprintln!("bish: window close: cannot close the last window -- exit the shell instead");
-                1
-            }
+            Some("next") => ExecResult::Window(WindowAction::Next),
+            Some("previous") | Some("prev") | Some("p") => ExecResult::Window(WindowAction::Previous),
+            Some("new") => ExecResult::Window(WindowAction::New),
+            Some("close") | Some("c") => ExecResult::Window(WindowAction::Close),
             Some(other) => {
                 eprintln!("bish: window: unknown subcommand: {}", other);
-                2
+                ExecResult::Status(2)
             }
             None => {
                 eprintln!("bish: window: missing subcommand (next/previous/new/close)");
-                2
+                ExecResult::Status(2)
             }
         }
     }
 
-    // Draws the M1 promotion stub the first time any window-family command
-    // runs: switches to the terminal's alternate screen buffer (mode 1049)
-    // so whatever was on screen before promotion stays untouched in the
-    // real terminal's own native scrollback, then draws a plain one-tab
-    // bar. No terminal-size query here (that needs a TIOCGWINSZ ioctl,
-    // planned for the real compositor) so this can't pin the bar to the
-    // actual bottom row yet -- an acknowledged, temporary limitation of
-    // the stub, not the final design. Superseded wholesale once the real
-    // compositor lands.
+    // Switches into the terminal's alternate screen buffer (mode 1049) the
+    // first time any window-family command runs, so whatever was on
+    // screen before promotion stays untouched in the real terminal's own
+    // native scrollback. Only the screen-buffer switch happens here --
+    // drawing the actual tab bar needs the real window list/cwd-per-
+    // session, which lives in repl.rs (the only thing that can hold it
+    // without an Rc<RefCell<_>> self-reference cycle, see
+    // ExecResult::Window's doc comment), so repl.rs draws it right after
+    // this, and again after every WindowAction. No terminal-size query
+    // here either (needs a TIOCGWINSZ ioctl, planned for the real
+    // compositor), so today's redraw can't pin anything to the actual
+    // bottom row yet -- acknowledged, temporary, not the final design.
     fn promote_if_needed(&mut self) {
         if self.promoted.get() {
             return;
         }
         self.promoted.set(true);
         print!("\x1b[?1049h\x1b[2J\x1b[H");
-        println!("bish window manager -- M1 stub, single window only\r");
-        println!("\x1b[7m [1] {} \x1b[0m\r", self.cwd.display());
-        println!("\r");
         let _ = std::io::Write::flush(&mut std::io::stdout());
     }
 
@@ -1781,7 +1795,7 @@ impl Shell {
                     self.last_status = s;
                     last_body_status = s;
                 }
-                ret @ ExecResult::Return(_) => return ret,
+                ret @ (ExecResult::Return(_) | ExecResult::Window(_)) => return ret,
             }
         }
         if ran_body {
@@ -1815,7 +1829,7 @@ impl Shell {
                     continue;
                 }
                 ExecResult::Status(s) => self.last_status = s,
-                ret @ ExecResult::Return(_) => return ret,
+                ret @ (ExecResult::Return(_) | ExecResult::Window(_)) => return ret,
             }
         }
         if ran_body {
@@ -1890,7 +1904,7 @@ impl Shell {
                     continue;
                 }
                 ExecResult::Status(s) => self.last_status = s,
-                ret @ ExecResult::Return(_) => return ret,
+                ret @ (ExecResult::Return(_) | ExecResult::Window(_)) => return ret,
             }
         }
     }
@@ -1936,7 +1950,7 @@ impl Shell {
                     }
                 }
                 ExecResult::Status(s) => self.last_status = s,
-                ret @ ExecResult::Return(_) => return ret,
+                ret @ (ExecResult::Return(_) | ExecResult::Window(_)) => return ret,
             }
             if !step.is_empty() {
                 if let Err(e) = arith::eval(step, self) {
@@ -2379,7 +2393,7 @@ impl Shell {
             // match and `window` falls through to the same external-
             // command lookup any other unrecognized name would hit.
             "window" | "w" | "win" if self.restrict_to_builtins => {
-                return ExecResult::Status(self.run_window(&argv[1..]));
+                return self.run_window(&argv[1..]);
             }
             "pushd" => return ExecResult::Status(self.run_pushd(&argv[1..])),
             "popd" => return ExecResult::Status(self.run_popd(&argv[1..])),

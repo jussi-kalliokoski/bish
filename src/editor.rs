@@ -278,7 +278,11 @@ pub enum ReadOutcome {
 // engaged only for the duration of this call (restored on every return
 // path via RawGuard's Drop), so a foreground command run in between calls
 // sees an entirely normal terminal.
-pub fn read_line(prompt: &str, history: &History) -> io::Result<ReadOutcome> {
+// `history_boundary` is the calling session's cutoff into `history` (see
+// History's doc comment): Up/Down here never browse past it, so a session
+// only ever sees its own commands plus whatever's been recorded (by any
+// session sharing the same History) from its creation point forward.
+pub fn read_line(prompt: &str, history: &History, history_boundary: usize) -> io::Result<ReadOutcome> {
     let mut guard = Some(term::RawGuard::enable(0)?);
     let mut ed = LineEditor::new();
 
@@ -356,7 +360,7 @@ pub fn read_line(prompt: &str, history: &History) -> io::Result<ReadOutcome> {
             Key::Up => {
                 let prefix = browse.as_ref().map(|(p, _)| p.clone()).unwrap_or_else(|| ed.as_string());
                 let from = browse.as_ref().map(|(_, i)| *i);
-                if let Some((idx, entry)) = history.search_backward(&prefix, from) {
+                if let Some((idx, entry)) = history.search_backward(&prefix, from, history_boundary) {
                     ed.set_text(entry);
                     browse = Some((prefix, idx));
                 }

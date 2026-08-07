@@ -8,6 +8,19 @@
 // The filename is parameterized (see History::load) so command mode can
 // keep a second, independent instance (its own file, own entries) without
 // colliding with the normal shell's history.
+//
+// One History is shared (by plain reference, not Rc<RefCell<_>> -- nothing
+// inside a running Shell ever touches history, only repl.rs's own outer
+// loop does) across every session under a root: every session's commands
+// land in the same growing `entries`/file, interleaved in the order they
+// actually happened. What's per-session is a `boundary` index (that
+// session's `entries.len()` at the moment it was created), threaded
+// through search_backward/search_forward as a floor: a session only ever
+// browses its own commands plus whatever's been recorded (by any session)
+// from its creation point forward, never anything older. This gets the
+// same observable behavior as a hand-rolled persistent linked list with
+// per-session snapshot pointers, just via a plain shared Vec + an index --
+// old entries are never copied or re-walked, only sliced.
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -53,15 +66,21 @@ impl History {
     }
 
     // Nearest entry at or before index `from` (exclusive; None means
-    // "start from the newest") whose text starts with `prefix`, searching
-    // toward older entries. Used for Up.
-    pub fn search_backward(&self, prefix: &str, from: Option<usize>) -> Option<(usize, &str)> {
+    // "start from the newest"), never older than `boundary`, whose text
+    // starts with `prefix`, searching toward older entries. Used for Up.
+    pub fn search_backward(&self, prefix: &str, from: Option<usize>, boundary: usize) -> Option<(usize, &str)> {
         let end = from.unwrap_or(self.entries.len());
-        self.entries[..end].iter().enumerate().rev().find(|(_, e)| e.starts_with(prefix)).map(|(i, e)| (i, e.as_str()))
+        self.entries[boundary..end]
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, e)| e.starts_with(prefix))
+            .map(|(i, e)| (boundary + i, e.as_str()))
     }
 
     // Nearest entry after index `from` whose text starts with `prefix`,
-    // searching toward newer entries. Used for Down.
+    // searching toward newer entries. Used for Down. No `boundary` needed
+    // here -- searching forward from `from` can never land before it.
     pub fn search_forward(&self, prefix: &str, from: usize) -> Option<(usize, &str)> {
         self.entries
             .iter()
@@ -69,6 +88,12 @@ impl History {
             .skip(from + 1)
             .find(|(_, e)| e.starts_with(prefix))
             .map(|(i, e)| (i, e.as_str()))
+    }
+
+    // Snapshot for a newly-created session's `boundary`: it should only
+    // ever browse commands recorded from this point forward.
+    pub fn boundary(&self) -> usize {
+        self.entries.len()
     }
 }
 
