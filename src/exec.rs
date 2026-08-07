@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
@@ -226,7 +226,13 @@ pub struct Shell {
     pub restrict_to_builtins: bool,
     // Whether `window`-family promotion into full-screen mode has already
     // happened (see run_window/promote_if_needed) -- only ever flips once.
-    promoted: bool,
+    // Rc<Cell<_>>, not a plain bool: promotion is a whole-terminal concept
+    // ("the real screen is in full-screen mode"), not a per-session one --
+    // every virtual session sharing this root must see the same flag, or a
+    // second session invoking `window` would wrongly re-trigger the
+    // promotion stub. Cell (not RefCell) since get/set on a bool never
+    // needs borrow tracking.
+    promoted: Rc<Cell<bool>>,
     // Mirrors the OS process's real cwd, kept in sync by run_cd/run_pushd/
     // run_popd (which still delegate the actual directory change to
     // std::env::set_current_dir -- this field doesn't yet let a session
@@ -236,6 +242,19 @@ pub struct Shell {
     // site already passes an explicit cwd -- both wiring this milestone's
     // later multi-session work will need without changing yet again.
     pub cwd: std::path::PathBuf,
+}
+
+// A fresh, process/time-derived seed -- used both for a brand-new Shell
+// and for new_virtual_child's child (which deliberately does NOT inherit
+// the parent's current rng_state, so sibling sessions don't produce
+// correlated $RANDOM sequences).
+fn fresh_rng_seed() -> u64 {
+    let seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0x2545F4914F6CDD1D)
+        ^ (std::process::id() as u64).wrapping_mul(0x9E3779B97F4A7C15);
+    if seed == 0 { 0x2545F4914F6CDD1D } else { seed }
 }
 
 impl Shell {
@@ -263,14 +282,7 @@ impl Shell {
             exported_names: std::collections::HashSet::new(),
             proc_sub_out_pending: Vec::new(),
             proc_sub_cleanup: Vec::new(),
-            rng_state: {
-                let seed = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_nanos() as u64)
-                    .unwrap_or(0x2545F4914F6CDD1D)
-                    ^ (std::process::id() as u64).wrapping_mul(0x9E3779B97F4A7C15);
-                if seed == 0 { 0x2545F4914F6CDD1D } else { seed }
-            },
+            rng_state: fresh_rng_seed(),
             shell_start: std::time::Instant::now(),
             seconds_offset: 0,
             jobs: Rc::new(RefCell::new(JobTable::new())),
@@ -286,8 +298,79 @@ impl Shell {
             suppress_errexit: 0,
             current_stderr_target: None,
             restrict_to_builtins: false,
-            promoted: false,
+            promoted: Rc::new(Cell::new(false)),
             cwd: std::env::current_dir().unwrap_or_default(),
+        }
+    }
+
+    // The in-process session-cloning primitive: creates an independent but
+    // related Shell, the way `window new` creates a virtual session
+    // (rather than execing a fresh bish process). Unlike subshells/$(),
+    // which self-exec a real child process specifically for *isolation*
+    // (see run_subshell's doc comment), this is the opposite goal --
+    // sharing jobs and (eventually) history is the entire point, so a
+    // real child process -- with its own PID, unable to share this
+    // process's Rc<RefCell<JobTable>> -- would be the wrong tool.
+    //
+    // Variables/functions/aliases/options/cwd are a deep-cloned snapshot
+    // of the parent at creation time: the two sessions start identical but
+    // then evolve independently, matching a new terminal-multiplexer
+    // window starting in the same directory with the same shell state.
+    // jobs and promoted are shared (Rc::clone -- the same underlying
+    // table/flag, not a copy), matching the plan's "job control tally is
+    // shared across the shell sessions" requirement. Everything else
+    // reset below is either non-cloneable (coproc_fds holds real pipe
+    // fds, std::process::Child isn't Clone -- not applicable here but the
+    // same reasoning) or transient/invocation-scoped state (local-scope
+    // stacks, pending proc-subs, the current command's stderr-redirect
+    // target) that belongs to whatever the *parent* is presently
+    // executing, not to a brand-new session that hasn't run anything yet.
+    //
+    // No caller yet outside the test below -- `window new` (a later
+    // milestone) is what will actually invoke this from run_window.
+    #[allow(dead_code)]
+    pub fn new_virtual_child(&self) -> Shell {
+        Shell {
+            last_status: 0,
+            functions: self.functions.clone(),
+            arg_frames: vec![Vec::new()],
+            var_scopes: Vec::new(),
+            script_name: self.script_name.clone(),
+            arrays: self.arrays.clone(),
+            assoc_arrays: self.assoc_arrays.clone(),
+            assoc_names: self.assoc_names.clone(),
+            aliases: self.aliases.clone(),
+            array_local_stack: Vec::new(),
+            assoc_local_stack: Vec::new(),
+            nameref_names: self.nameref_names.clone(),
+            nameref_local_stack: Vec::new(),
+            dir_stack: self.dir_stack.clone(),
+            shopt_options: self.shopt_options.clone(),
+            readonly_names: self.readonly_names.clone(),
+            integer_names: self.integer_names.clone(),
+            upper_names: self.upper_names.clone(),
+            lower_names: self.lower_names.clone(),
+            exported_names: self.exported_names.clone(),
+            proc_sub_out_pending: Vec::new(),
+            proc_sub_cleanup: Vec::new(),
+            rng_state: fresh_rng_seed(),
+            shell_start: std::time::Instant::now(),
+            seconds_offset: 0,
+            jobs: self.jobs.clone(),
+            traps: self.traps.clone(),
+            exit_trap: self.exit_trap.clone(),
+            coproc_fds: std::collections::HashMap::new(),
+            opt_errexit: self.opt_errexit,
+            opt_nounset: self.opt_nounset,
+            opt_xtrace: self.opt_xtrace,
+            opt_pipefail: self.opt_pipefail,
+            opt_noglob: self.opt_noglob,
+            opt_monitor: self.opt_monitor,
+            suppress_errexit: 0,
+            current_stderr_target: None,
+            restrict_to_builtins: false,
+            promoted: self.promoted.clone(),
+            cwd: self.cwd.clone(),
         }
     }
 
@@ -295,7 +378,7 @@ impl Shell {
     // full-screen mode -- repl.rs checks this at exit time to know whether
     // it needs to restore the normal screen buffer before quitting.
     pub fn is_promoted(&self) -> bool {
-        self.promoted
+        self.promoted.get()
     }
 
     pub fn run_exit_trap(&mut self) {
@@ -867,10 +950,10 @@ impl Shell {
     // the stub, not the final design. Superseded wholesale once the real
     // compositor lands.
     fn promote_if_needed(&mut self) {
-        if self.promoted {
+        if self.promoted.get() {
             return;
         }
-        self.promoted = true;
+        self.promoted.set(true);
         print!("\x1b[?1049h\x1b[2J\x1b[H");
         println!("bish window manager -- M1 stub, single window only\r");
         println!("\x1b[7m [1] {} \x1b[0m\r", self.cwd.display());
@@ -4124,7 +4207,7 @@ enum ExtraFd {
 // depend on the exact order -- a genuinely rare thing to depend on, since
 // bash's own order isn't something a script author could reliably predict
 // either.
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct OrderedMap {
     order: Vec<String>,
     values: std::collections::HashMap<String, String>,
@@ -5117,5 +5200,50 @@ fn write_diagnostic(target: &Option<String>, msg: &str) {
             }
         }
         None => eprintln!("{}", msg),
+    }
+}
+
+// new_virtual_child (the M4 session-cloning primitive) has no caller yet
+// -- real `window new` wiring is later work -- so this is its only
+// exercise until then: proves the two things the whole primitive exists
+// for, in one process, with no rendering/REPL involved. `cargo test`
+// needs no external crate, matching the zero-dependency stance elsewhere.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn virtual_child_shares_jobs_and_promotion_but_not_vars() {
+        let mut parent = Shell::new();
+        parent.arrays.insert("x".to_string(), std::collections::BTreeMap::from([(0, "parent".to_string())]));
+
+        let mut child = parent.new_virtual_child();
+
+        // Independent snapshot: the child inherits a copy of the parent's
+        // vars/cwd at creation time, but the two evolve independently
+        // afterward.
+        assert!(child.arrays.contains_key("x"), "child should inherit a snapshot of the parent's arrays");
+        child.arrays.insert("y".to_string(), std::collections::BTreeMap::from([(0, "child".to_string())]));
+        assert!(!parent.arrays.contains_key("y"), "parent must not see the child's later mutations");
+
+        child.cwd = std::path::PathBuf::from("/child/only");
+        assert_ne!(parent.cwd, child.cwd, "cwd must diverge independently per session");
+
+        // Shared: a job pushed from the child is immediately visible from
+        // the parent, and vice versa -- same underlying JobTable, not a
+        // copy.
+        let real_child = Command::new("true").spawn().expect("spawn true");
+        child.push_job(vec![real_child], "true &".to_string());
+        assert_eq!(parent.jobs.borrow().jobs.len(), 1, "parent must see the job the child backgrounded");
+        assert_eq!(child.jobs.borrow().jobs.len(), 1);
+
+        // Shared: promotion flipped from one session is visible from the
+        // other -- it's a whole-terminal concept, not per-session.
+        assert!(!parent.is_promoted());
+        child.promoted.set(true);
+        assert!(parent.is_promoted(), "promotion must be visible from every session sharing this root");
+
+        // Reap the spawned process so the test doesn't leak it.
+        parent.jobs.borrow_mut().jobs[0].wait();
     }
 }
