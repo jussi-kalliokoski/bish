@@ -7,6 +7,7 @@ mod history;
 mod lexer;
 mod parser;
 mod prompt;
+mod pty;
 mod regex;
 mod repl;
 mod serialize;
