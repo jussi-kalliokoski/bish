@@ -12,6 +12,93 @@ use crate::parser::{
     self, AndOr, AssignMode, Combinator, ListItem, Pipeline, Program, Redirect, Sep, SimpleCommand, Word,
 };
 
+// Where a Shell's own output (builtin/diagnostic text -- never a spawned
+// external process's, which always writes straight to its real inherited
+// fds regardless) actually goes. `Real` -- writing directly to the
+// process's real stdout/stderr, today's only variant and exactly today's
+// existing behavior -- is deliberately the only thing this does for now.
+// The point of introducing it at all is the seam: every session's Shell
+// having its own `sink` field is what lets a *non-focused* window's
+// output eventually land in that window's own captured buffer instead of
+// whatever's on the real screen right now, once a real per-window
+// buffer/grid exists to capture it into (planned: the VT100/compositor
+// milestones). Until then this is a no-op indirection.
+#[derive(Clone, Copy)]
+enum OutputSink {
+    Real,
+}
+
+impl OutputSink {
+    fn write_out(&self, s: &str) {
+        match self {
+            // Deliberately not the print! macro (and not sh_print! either
+            // -- this is the base case every sh_print!/sh_println!/etc
+            // call bottoms out into via Shell::sink_out; routing it back
+            // through the sink macro here would recurse forever). print!
+            // panics on a write error, which happens for real the moment
+            // output is piped into something that closes its end early
+            // (`ulimit -a | head -3`, `jobs | head -1`, ...) -- every
+            // builtin's multi-line output funnels through here now, so
+            // this is the one place that needs to treat a broken pipe as
+            // "stop writing, not fatal" instead of crashing the process.
+            OutputSink::Real => {
+                use std::io::Write;
+                let _ = std::io::stdout().write_all(s.as_bytes());
+            }
+        }
+    }
+
+    fn write_err(&self, s: &str) {
+        match self {
+            OutputSink::Real => {
+                use std::io::Write;
+                let _ = std::io::stderr().write_all(s.as_bytes());
+            }
+        }
+    }
+}
+
+// Mirror std's print!/println!/eprint!/eprintln! but route through a
+// Shell's own sink instead of unconditionally going straight to the real
+// process stdout/stderr. `$self` needs `sink_out`/`sink_err` methods
+// (Shell has them); forwarding the raw `$($arg)*` tokens straight into
+// the real `format!` is what keeps this a faithful, low-risk mechanical
+// swap at every call site -- every existing format string/argument list
+// still means exactly what it did before, only the destination changes.
+macro_rules! sh_print {
+    ($self:expr, $($arg:tt)*) => {
+        $self.sink_out(&format!($($arg)*))
+    };
+}
+
+macro_rules! sh_println {
+    ($self:expr) => {
+        $self.sink_out("\n")
+    };
+    ($self:expr, $($arg:tt)*) => {{
+        let mut s = format!($($arg)*);
+        s.push('\n');
+        $self.sink_out(&s);
+    }};
+}
+
+macro_rules! sh_eprint {
+    ($self:expr, $($arg:tt)*) => {
+        $self.sink_err(&format!($($arg)*))
+    };
+}
+
+macro_rules! sh_eprintln {
+    ($self:expr) => {
+        $self.sink_err("\n")
+    };
+    ($self:expr, $($arg:tt)*) => {{
+        let mut s = format!($($arg)*);
+        s.push('\n');
+        $self.sink_err(&s);
+    }};
+}
+
 #[derive(Debug, Clone, Copy)]
 pub enum ExecResult {
     Status(i32),
@@ -267,6 +354,12 @@ pub struct Shell {
     // site already passes an explicit cwd -- both wiring this milestone's
     // later multi-session work will need without changing yet again.
     pub cwd: std::path::PathBuf,
+    // See OutputSink's doc comment. Always OutputSink::Real for now --
+    // every session's own output still goes straight to the real
+    // terminal regardless of whether that session is focused, until a
+    // real per-window buffer/grid exists to capture a non-focused one
+    // into instead.
+    sink: OutputSink,
 }
 
 // A fresh, process/time-derived seed -- used both for a brand-new Shell
@@ -325,7 +418,21 @@ impl Shell {
             restrict_to_builtins: false,
             promoted: Rc::new(Cell::new(false)),
             cwd: std::env::current_dir().unwrap_or_default(),
+            sink: OutputSink::Real,
         }
+    }
+
+    // pub: repl.rs's own top-level orchestration code (syntax-error
+    // messages tied to a specific session, command-mode diagnostics)
+    // needs these too -- it has only a handful of sites, so it calls
+    // these directly rather than pulling the sh_print!-family macros
+    // (private to this module) across the crate boundary.
+    pub fn sink_out(&self, s: &str) {
+        self.sink.write_out(s);
+    }
+
+    pub fn sink_err(&self, s: &str) {
+        self.sink.write_err(s);
     }
 
     // The in-process session-cloning primitive: creates an independent but
@@ -396,6 +503,7 @@ impl Shell {
             restrict_to_builtins: false,
             promoted: self.promoted.clone(),
             cwd: self.cwd.clone(),
+            sink: OutputSink::Real,
         }
     }
 
@@ -459,11 +567,11 @@ impl Shell {
             };
             match job.poll() {
                 Some(_) => {
-                    println!("[{}]{}  Done                    {} &", job.id, mark, job.cmd_text);
+                    sh_println!(self, "[{}]{}  Done                    {} &", job.id, mark, job.cmd_text);
                     to_remove.push(i);
                 }
                 None => {
-                    println!("[{}]{}  Running                 {} &", job.id, mark, job.cmd_text);
+                    sh_println!(self, "[{}]{}  Running                 {} &", job.id, mark, job.cmd_text);
                 }
             }
         }
@@ -480,7 +588,7 @@ impl Shell {
     // never interactively signal the job via the keyboard anyway.
     fn run_fg(&mut self, args: &[String]) -> i32 {
         if !self.opt_monitor {
-            eprintln!("bish: fg: no job control");
+            sh_eprintln!(self, "bish: fg: no job control");
             return 1;
         }
         let idx = match args.first() {
@@ -491,13 +599,13 @@ impl Shell {
             Some(i) => {
                 let mut job = {
                     let mut table = self.jobs.borrow_mut();
-                    println!("{}", table.jobs[i].cmd_text);
+                    sh_println!(self, "{}", table.jobs[i].cmd_text);
                     table.jobs.remove(i)
                 };
                 job.wait()
             }
             None => {
-                eprintln!("bish: fg: no current job");
+                sh_eprintln!(self, "bish: fg: no current job");
                 1
             }
         }
@@ -512,7 +620,7 @@ impl Shell {
     // reach, so that's what it always does.
     fn run_bg(&mut self, args: &[String]) -> i32 {
         if !self.opt_monitor {
-            eprintln!("bish: bg: no job control");
+            sh_eprintln!(self, "bish: bg: no job control");
             return 1;
         }
         let idx = match args.first() {
@@ -521,11 +629,11 @@ impl Shell {
         };
         match idx {
             Some(i) => {
-                eprintln!("bish: bg: job {} already in background", self.jobs.borrow().jobs[i].id);
+                sh_eprintln!(self, "bish: bg: job {} already in background", self.jobs.borrow().jobs[i].id);
                 0
             }
             None => {
-                eprintln!("bish: bg: no current job");
+                sh_eprintln!(self, "bish: bg: no current job");
                 1
             }
         }
@@ -558,13 +666,13 @@ impl Shell {
                             status = job.wait();
                         }
                         None => {
-                            eprintln!("bish: wait: pid {} is not a child of this shell", pid);
+                            sh_eprintln!(self, "bish: wait: pid {} is not a child of this shell", pid);
                             status = 127;
                         }
                     }
                 }
                 Err(_) => {
-                    eprintln!("bish: wait: {}: no such job", a);
+                    sh_eprintln!(self, "bish: wait: {}: no such job", a);
                     status = 127;
                 }
             }
@@ -582,7 +690,7 @@ impl Shell {
             if let Some(rest) = a.strip_prefix('-') {
                 if rest == "l" {
                     for (name, num) in SIGNAL_NAMES {
-                        println!("{}) SIG{}", num, name);
+                        sh_println!(self, "{}) SIG{}", num, name);
                     }
                     return 0;
                 }
@@ -602,11 +710,11 @@ impl Shell {
                 }
             } else if let Ok(pid) = t.parse::<i32>() {
                 if !send_signal(pid as u32, sig) {
-                    eprintln!("bish: kill: ({}) - No such process", pid);
+                    sh_eprintln!(self, "bish: kill: ({}) - No such process", pid);
                     status = 1;
                 }
             } else {
-                eprintln!("bish: kill: {}: arguments must be process or job IDs", t);
+                sh_eprintln!(self, "bish: kill: {}: arguments must be process or job IDs", t);
                 status = 1;
             }
         }
@@ -622,7 +730,7 @@ impl Shell {
         let varname = match args.get(1) {
             Some(v) => v.clone(),
             None => {
-                eprintln!("bish: getopts: usage: getopts optstring name [args]");
+                sh_eprintln!(self, "bish: getopts: usage: getopts optstring name [args]");
                 return ExecResult::Status(2);
             }
         };
@@ -653,7 +761,7 @@ impl Shell {
                 self.assign_var(&varname, "?".to_string());
                 self.assign_var("OPTARG", opt_char.to_string());
             } else {
-                eprintln!("bish: getopts: illegal option -- '{}'", opt_char);
+                sh_eprintln!(self, "bish: getopts: illegal option -- '{}'", opt_char);
                 self.assign_var(&varname, "?".to_string());
             }
             self.assign_var("OPTIND", (optind + 1).to_string());
@@ -674,7 +782,7 @@ impl Shell {
                     self.assign_var(&varname, ":".to_string());
                     self.assign_var("OPTARG", opt_char.to_string());
                 } else {
-                    eprintln!("bish: getopts: option requires an argument -- '{}'", opt_char);
+                    sh_eprintln!(self, "bish: getopts: option requires an argument -- '{}'", opt_char);
                     self.assign_var(&varname, "?".to_string());
                 }
                 self.assign_var("OPTIND", (optind + 1).to_string());
@@ -727,7 +835,7 @@ impl Shell {
                 }
             }
             if self.readonly_names.contains(n.as_str()) {
-                write_diagnostic(stderr_target, &format!("bish: unset: {}: cannot unset: readonly variable", n));
+                write_diagnostic(stderr_target, &format!("bish: unset: {}: cannot unset: readonly variable", n), self.sink);
                 continue;
             }
             self.arrays.remove(n.as_str());
@@ -924,7 +1032,7 @@ impl Shell {
             }
             None => {
                 for n in &names {
-                    println!("{:<15}\t{}", n, if is_on(self, n) { "on" } else { "off" });
+                    sh_println!(self, "{:<15}\t{}", n, if is_on(self, n) { "on" } else { "off" });
                 }
                 0
             }
@@ -944,11 +1052,11 @@ impl Shell {
             Some("new") => ExecResult::Window(WindowAction::New),
             Some("close") | Some("c") => ExecResult::Window(WindowAction::Close),
             Some(other) => {
-                eprintln!("bish: window: unknown subcommand: {}", other);
+                sh_eprintln!(self, "bish: window: unknown subcommand: {}", other);
                 ExecResult::Status(2)
             }
             None => {
-                eprintln!("bish: window: missing subcommand (next/previous/new/close)");
+                sh_eprintln!(self, "bish: window: missing subcommand (next/previous/new/close)");
                 ExecResult::Status(2)
             }
         }
@@ -971,8 +1079,140 @@ impl Shell {
             return;
         }
         self.promoted.set(true);
-        print!("\x1b[?1049h\x1b[2J\x1b[H");
+        sh_print!(self, "\x1b[?1049h\x1b[2J\x1b[H");
         let _ = std::io::Write::flush(&mut std::io::stdout());
+    }
+
+    // ulimit [-HS] [-a] [-cdefilmnqrstuvx [limit]]. `-a` doesn't attempt to
+    // byte-match bash's exact column alignment (its internal padding rules
+    // aren't a fixed width across all entries) -- purely cosmetic output
+    // that scripts don't parse, unlike the single-limit query/set forms
+    // below, which do match exactly. Moved here from a builtins.rs free
+    // function (M6) so its output goes through self.sink_out/sink_err
+    // like every other builtin's, instead of always writing straight to
+    // the real stdout/stderr regardless of which session ran it.
+    fn run_ulimit(&mut self, args: &[String]) -> i32 {
+        unsafe extern "C" {
+            fn getrlimit(resource: i32, rlim: *mut RLimit) -> i32;
+            fn setrlimit(resource: i32, rlim: *const RLimit) -> i32;
+        }
+        let mut hard = false;
+        let mut soft = false;
+        let mut show_all = false;
+        let mut flag: Option<char> = None;
+        let mut value: Option<String> = None;
+        for a in args {
+            if let Some(rest) = a.strip_prefix('-').filter(|r| !r.is_empty()) {
+                for c in rest.chars() {
+                    match c {
+                        'H' => hard = true,
+                        'S' => soft = true,
+                        'a' => show_all = true,
+                        other => flag = Some(other),
+                    }
+                }
+            } else {
+                value = Some(a.clone());
+            }
+        }
+        if show_all {
+            for spec in LIMIT_SPECS {
+                let mut rl = RLimit { cur: 0, max: 0 };
+                unsafe {
+                    getrlimit(spec.resource, &mut rl);
+                }
+                let v = if hard { rl.max } else { rl.cur };
+                let unit_part = if spec.unit.is_empty() { String::new() } else { format!("{}, ", spec.unit) };
+                sh_println!(self, "{:<24}({}-{}) {}", spec.label, unit_part, spec.flag, fmt_limit(v, spec.div));
+            }
+            return 0;
+        }
+        let f = flag.unwrap_or('f');
+        let spec = match LIMIT_SPECS.iter().find(|s| s.flag == f) {
+            Some(s) => s,
+            None => {
+                sh_eprintln!(self, "bish: ulimit: -{}: invalid option", f);
+                return 1;
+            }
+        };
+        let mut rl = RLimit { cur: 0, max: 0 };
+        unsafe {
+            getrlimit(spec.resource, &mut rl);
+        }
+        match value {
+            None => {
+                let v = if hard { rl.max } else { rl.cur };
+                sh_println!(self, "{}", fmt_limit(v, spec.div));
+                0
+            }
+            Some(v) => {
+                let new_val: u64 = if v == "unlimited" {
+                    RLIM_INFINITY
+                } else {
+                    match v.parse::<u64>() {
+                        Ok(n) => n * spec.div,
+                        Err(_) => {
+                            sh_eprintln!(self, "bish: ulimit: {}: invalid number", v);
+                            return 1;
+                        }
+                    }
+                };
+                if !soft && !hard {
+                    rl.cur = new_val;
+                    rl.max = new_val;
+                } else {
+                    if soft {
+                        rl.cur = new_val;
+                    }
+                    if hard {
+                        rl.max = new_val;
+                    }
+                }
+                if unsafe { setrlimit(spec.resource, &rl) } != 0 {
+                    sh_eprintln!(self, "bish: ulimit: cannot modify limit: {}", std::io::Error::last_os_error());
+                    return 1;
+                }
+                0
+            }
+        }
+    }
+
+    // POSIX has no query-only umask read -- `umask(new) -> previous` is the
+    // only syscall shape, so reading the current value means setting a
+    // throwaway mask and immediately restoring what was there. Moved here
+    // alongside run_ulimit for the same M6 sink reason.
+    fn run_umask(&mut self, args: &[String]) -> i32 {
+        unsafe extern "C" {
+            fn umask(mask: u32) -> u32;
+        }
+        let symbolic = args.iter().any(|a| a == "-S");
+        match args.iter().find(|a| !a.starts_with('-')) {
+            Some(s) => match u32::from_str_radix(s, 8) {
+                Ok(m) => {
+                    unsafe {
+                        umask(m);
+                    }
+                    0
+                }
+                Err(_) => {
+                    sh_eprintln!(self, "bish: umask: {}: invalid octal number", s);
+                    1
+                }
+            },
+            None => {
+                let cur = unsafe {
+                    let prev = umask(0);
+                    umask(prev);
+                    prev
+                };
+                if symbolic {
+                    sh_println!(self, "{}", umask_symbolic(cur));
+                } else {
+                    sh_println!(self, "{:04o}", cur);
+                }
+                0
+            }
+        }
     }
 
     // Moved here from a builtins.rs free function once cd needed to update
@@ -990,11 +1230,11 @@ impl Shell {
             if dir == "-" {
                 match std::env::var("OLDPWD") {
                     Ok(p) => {
-                        println!("{}", p);
+                        sh_println!(self, "{}", p);
                         p
                     }
                     Err(_) => {
-                        eprintln!("cd: OLDPWD not set");
+                        sh_eprintln!(self, "cd: OLDPWD not set");
                         return 1;
                     }
                 }
@@ -1005,7 +1245,7 @@ impl Shell {
             match std::env::var("HOME") {
                 Ok(h) => h,
                 Err(_) => {
-                    eprintln!("cd: HOME not set");
+                    sh_eprintln!(self, "cd: HOME not set");
                     return 1;
                 }
             }
@@ -1020,7 +1260,7 @@ impl Shell {
                 0
             }
             Err(e) => {
-                eprintln!("cd: {}: {}", target, e);
+                sh_eprintln!(self, "cd: {}: {}", target, e);
                 1
             }
         }
@@ -1032,7 +1272,7 @@ impl Shell {
             None => match self.dir_stack.first() {
                 Some(d) => d.clone(),
                 None => {
-                    eprintln!("bish: pushd: no other directory");
+                    sh_eprintln!(self, "bish: pushd: no other directory");
                     return 1;
                 }
             },
@@ -1055,7 +1295,7 @@ impl Shell {
         let target = match self.dir_stack.first() {
             Some(d) => d.clone(),
             None => {
-                eprintln!("bish: popd: directory stack empty");
+                sh_eprintln!(self, "bish: popd: directory stack empty");
                 return 1;
             }
         };
@@ -1095,10 +1335,10 @@ impl Shell {
         all.extend(self.dir_stack.iter().cloned());
         if vertical {
             for (i, d) in all.iter().enumerate() {
-                println!("{:2}  {}", i, Self::collapse_home(d));
+                sh_println!(self, "{:2}  {}", i, Self::collapse_home(d));
             }
         } else {
-            println!("{}", all.iter().map(|d| Self::collapse_home(d)).collect::<Vec<_>>().join(" "));
+            sh_println!(self, "{}", all.iter().map(|d| Self::collapse_home(d)).collect::<Vec<_>>().join(" "));
         }
     }
 
@@ -1312,7 +1552,7 @@ impl Shell {
             parser::Command::Arith(raw, _redirects) => match arith::eval(raw, self) {
                 Ok(v) => ExecResult::Status(if v != 0 { 0 } else { 1 }),
                 Err(e) => {
-                    eprintln!("bish: (({})): {}", raw, e);
+                    sh_eprintln!(self, "bish: (({})): {}", raw, e);
                     ExecResult::Status(1)
                 }
             },
@@ -1345,7 +1585,7 @@ impl Shell {
                     return match std::fs::File::open(&p) {
                         Ok(f) => Box::new(std::io::BufReader::new(f)),
                         Err(e) => {
-                            eprintln!("bish: {}: {}", p, e);
+                            sh_eprintln!(self, "bish: {}: {}", p, e);
                             Box::new(std::io::Cursor::new(Vec::new()))
                         }
                     };
@@ -1374,12 +1614,12 @@ impl Shell {
             Ok(toks) => match crate::parser::Parser::new(toks).parse_program() {
                 Ok(prog) => self.run_program(&prog),
                 Err(e) => {
-                    eprintln!("bish: {}: syntax error: {}", label, e);
+                    sh_eprintln!(self, "bish: {}: syntax error: {}", label, e);
                     ExecResult::Status(2)
                 }
             },
             Err(e) => {
-                eprintln!("bish: {}: syntax error: {}", label, e);
+                sh_eprintln!(self, "bish: {}: syntax error: {}", label, e);
                 ExecResult::Status(2)
             }
         }
@@ -1465,7 +1705,7 @@ impl Shell {
         let exe = match std::env::current_exe() {
             Ok(p) => p,
             Err(e) => {
-                eprintln!("bish: subshell: {}", e);
+                sh_eprintln!(self, "bish: subshell: {}", e);
                 return 1;
             }
         };
@@ -1477,7 +1717,7 @@ impl Shell {
                     0
                 }
                 Err(e) => {
-                    eprintln!("bish: subshell: {}", e);
+                    sh_eprintln!(self, "bish: subshell: {}", e);
                     1
                 }
             }
@@ -1485,7 +1725,7 @@ impl Shell {
             match Command::new(exe).arg("-c").arg(script).current_dir(&self.cwd).status() {
                 Ok(status) => exit_code_from_status(status),
                 Err(e) => {
-                    eprintln!("bish: subshell: {}", e);
+                    sh_eprintln!(self, "bish: subshell: {}", e);
                     1
                 }
             }
@@ -1505,21 +1745,21 @@ impl Shell {
         let (out_r, out_w) = match std::io::pipe() {
             Ok(p) => p,
             Err(e) => {
-                eprintln!("bish: coproc: {}", e);
+                sh_eprintln!(self, "bish: coproc: {}", e);
                 return 1;
             }
         };
         let (in_r, in_w) = match std::io::pipe() {
             Ok(p) => p,
             Err(e) => {
-                eprintln!("bish: coproc: {}", e);
+                sh_eprintln!(self, "bish: coproc: {}", e);
                 return 1;
             }
         };
         let exe = match std::env::current_exe() {
             Ok(p) => p,
             Err(e) => {
-                eprintln!("bish: coproc: {}", e);
+                sh_eprintln!(self, "bish: coproc: {}", e);
                 return 1;
             }
         };
@@ -1545,7 +1785,7 @@ impl Shell {
                 0
             }
             Err(e) => {
-                eprintln!("bish: coproc: {}", e);
+                sh_eprintln!(self, "bish: coproc: {}", e);
                 1
             }
         }
@@ -1563,14 +1803,14 @@ impl Shell {
         let redirs = match self.resolve_redirect_list(redirects) {
             Ok(r) => r,
             Err(e) => {
-                eprintln!("bish: {}", e);
+                sh_eprintln!(self, "bish: {}", e);
                 return ExecResult::Status(1);
             }
         };
         let exe = match std::env::current_exe() {
             Ok(p) => p,
             Err(e) => {
-                eprintln!("bish: {}", e);
+                sh_eprintln!(self, "bish: {}", e);
                 return ExecResult::Status(1);
             }
         };
@@ -1593,14 +1833,14 @@ impl Shell {
                     match child.wait() {
                         Ok(status) => ExecResult::Status(exit_code_from_status(status)),
                         Err(e) => {
-                            eprintln!("bish: {}", e);
+                            sh_eprintln!(self, "bish: {}", e);
                             ExecResult::Status(1)
                         }
                     }
                 }
             }
             Err(e) => {
-                eprintln!("bish: {}", e);
+                sh_eprintln!(self, "bish: {}", e);
                 ExecResult::Status(127)
             }
         }
@@ -1635,21 +1875,21 @@ impl Shell {
         let exe = match std::env::current_exe() {
             Ok(p) => p,
             Err(e) => {
-                eprintln!("bish: process substitution: {}", e);
+                sh_eprintln!(self, "bish: process substitution: {}", e);
                 return String::new();
             }
         };
         let file = match std::fs::File::create(&path) {
             Ok(f) => f,
             Err(e) => {
-                eprintln!("bish: process substitution: {}", e);
+                sh_eprintln!(self, "bish: process substitution: {}", e);
                 return String::new();
             }
         };
         let script = self.functions_preamble() + raw;
         match Command::new(exe).arg("-c").arg(script).current_dir(&self.cwd).stdout(Stdio::from(file)).status() {
             Ok(_) => {}
-            Err(e) => eprintln!("bish: process substitution: {}", e),
+            Err(e) => sh_eprintln!(self, "bish: process substitution: {}", e),
         }
         let path_str = path.to_string_lossy().into_owned();
         self.proc_sub_cleanup.push(path_str.clone());
@@ -1663,7 +1903,7 @@ impl Shell {
     fn run_proc_sub_out(&mut self, raw: &str) -> String {
         let path = proc_sub_temp_path();
         if let Err(e) = std::fs::File::create(&path) {
-            eprintln!("bish: process substitution: {}", e);
+            sh_eprintln!(self, "bish: process substitution: {}", e);
             return String::new();
         }
         let path_str = path.to_string_lossy().into_owned();
@@ -1855,18 +2095,18 @@ impl Shell {
             Some(words) => self.expand_words(words),
             None => self.arg_frames.last().cloned().unwrap_or_default(),
         };
-        let print_menu = |items: &[String]| {
+        let print_menu = |this: &Self, items: &[String]| {
             for (i, item) in items.iter().enumerate() {
-                eprintln!("{}) {}", i + 1, item);
+                sh_eprintln!(this, "{}) {}", i + 1, item);
             }
         };
-        print_menu(&items);
+        print_menu(self, &items);
         loop {
             let ps3 = {
                 let v = self.lookup_var("PS3");
                 if v.is_empty() { "#? ".to_string() } else { v }
             };
-            eprint!("{}", ps3);
+            sh_eprint!(self, "{}", ps3);
             let _ = std::io::Write::flush(&mut std::io::stderr());
             let mut line = String::new();
             match std::io::BufRead::read_line(&mut std::io::stdin().lock(), &mut line) {
@@ -1876,7 +2116,7 @@ impl Shell {
                 // even non-interactively, not just an interactive-terminal
                 // courtesy newline.
                 Ok(0) => {
-                    println!();
+                    sh_println!(self);
                     return ExecResult::Status(1);
                 }
                 Ok(_) => {}
@@ -1885,7 +2125,7 @@ impl Shell {
             let line = line.trim_end_matches(['\n', '\r']).to_string();
             self.assign_var("REPLY", line.clone());
             if line.trim().is_empty() {
-                print_menu(&items);
+                print_menu(self, &items);
                 continue;
             }
             let choice = line.trim().parse::<usize>().ok().and_then(|n| n.checked_sub(1)).and_then(|i| items.get(i));
@@ -1916,7 +2156,7 @@ impl Shell {
     fn run_cfor(&mut self, init: &str, cond: &str, step: &str, body: &Program) -> ExecResult {
         if !init.is_empty() {
             if let Err(e) = arith::eval(init, self) {
-                eprintln!("bish: (({})): {}", init, e);
+                sh_eprintln!(self, "bish: (({})): {}", init, e);
                 return ExecResult::Status(1);
             }
         }
@@ -1928,7 +2168,7 @@ impl Shell {
                 match arith::eval(cond, self) {
                     Ok(v) => v != 0,
                     Err(e) => {
-                        eprintln!("bish: (({})): {}", cond, e);
+                        sh_eprintln!(self, "bish: (({})): {}", cond, e);
                         return ExecResult::Status(1);
                     }
                 }
@@ -1954,7 +2194,7 @@ impl Shell {
             }
             if !step.is_empty() {
                 if let Err(e) = arith::eval(step, self) {
-                    eprintln!("bish: (({})): {}", step, e);
+                    sh_eprintln!(self, "bish: (({})): {}", step, e);
                     return ExecResult::Status(1);
                 }
             }
@@ -2010,7 +2250,7 @@ impl Shell {
         match self.eval_test_or(atoms, &mut pos) {
             Ok(b) => ExecResult::Status(if b { 0 } else { 1 }),
             Err(e) => {
-                eprintln!("bish: [[: {}", e);
+                sh_eprintln!(self, "bish: [[: {}", e);
                 ExecResult::Status(2)
             }
         }
@@ -2128,7 +2368,7 @@ impl Shell {
                         let v = v.to_string();
                         out.push_str(&if *quoted { crate::regex::escape(&v) } else { v });
                     }
-                    Err(e) => eprintln!("bish: (({})): {}", raw, e),
+                    Err(e) => sh_eprintln!(self, "bish: (({})): {}", raw, e),
                 },
                 Chunk::VarExpand { name, op, quoted } => {
                     let name = name.clone();
@@ -2256,7 +2496,7 @@ impl Shell {
             return ExecResult::Status(0);
         }
         if self.opt_xtrace {
-            eprintln!("+ {}", argv.join(" "));
+            sh_eprintln!(self, "+ {}", argv.join(" "));
         }
         let name = argv[0].clone();
 
@@ -2312,7 +2552,7 @@ impl Shell {
                 return match ext.status() {
                     Ok(status) => ExecResult::Status(exit_code_from_status(status)),
                     Err(e) => {
-                        eprintln!("bish: command: {}: {}", argv[i], e);
+                        sh_eprintln!(self, "bish: command: {}: {}", argv[i], e);
                         ExecResult::Status(127)
                     }
                 };
@@ -2326,13 +2566,13 @@ impl Shell {
             // always empty, so that's the one output bash-compat requires.
             "hash" => {
                 if argv.len() == 1 {
-                    println!("hash: hash table empty");
+                    sh_println!(self, "hash: hash table empty");
                 }
                 return ExecResult::Status(0);
             }
             "cd" => return ExecResult::Status(self.run_cd(&argv[1..])),
-            "umask" => return ExecResult::Status(builtins::umask(&argv[1..])),
-            "ulimit" => return ExecResult::Status(builtins::ulimit(&argv[1..])),
+            "umask" => return ExecResult::Status(self.run_umask(&argv[1..])),
+            "ulimit" => return ExecResult::Status(self.run_ulimit(&argv[1..])),
             // alias/unalias: store and query only, no expansion when a
             // command runs -- see the comment on the `aliases` field for
             // why.
@@ -2341,7 +2581,7 @@ impl Shell {
                     let mut sorted: Vec<&(String, String)> = self.aliases.iter().collect();
                     sorted.sort_by(|a, b| a.0.cmp(&b.0));
                     for (n, v) in sorted {
-                        println!("alias {}={}", n, crate::serialize::quote_literal(v));
+                        sh_println!(self, "alias {}={}", n, crate::serialize::quote_literal(v));
                     }
                     return ExecResult::Status(0);
                 }
@@ -2357,9 +2597,9 @@ impl Shell {
                             }
                         }
                         None => match self.aliases.iter().find(|(n, _)| n == a) {
-                            Some((n, v)) => println!("alias {}={}", n, crate::serialize::quote_literal(v)),
+                            Some((n, v)) => sh_println!(self, "alias {}={}", n, crate::serialize::quote_literal(v)),
                             None => {
-                                eprintln!("bish: alias: {}: not found", a);
+                                sh_eprintln!(self, "bish: alias: {}: not found", a);
                                 status = 1;
                             }
                         },
@@ -2379,7 +2619,7 @@ impl Shell {
                             self.aliases.remove(pos);
                         }
                         None => {
-                            eprintln!("bish: unalias: {}: not found", a);
+                            sh_eprintln!(self, "bish: unalias: {}: not found", a);
                             status = 1;
                         }
                     }
@@ -2413,7 +2653,7 @@ impl Shell {
                     match arith::eval(a, self) {
                         Ok(v) => last = v,
                         Err(e) => {
-                            eprintln!("bish: let: {}", e);
+                            sh_eprintln!(self, "bish: let: {}", e);
                             return ExecResult::Status(2);
                         }
                     }
@@ -2431,7 +2671,7 @@ impl Shell {
                 if a.last().map(|s| s.as_str()) == Some("]") {
                     a.pop();
                 } else {
-                    eprintln!("bish: [: missing closing ]");
+                    sh_eprintln!(self, "bish: [: missing closing ]");
                     return ExecResult::Status(2);
                 }
                 return ExecResult::Status(builtins::test(&a, false));
@@ -2439,7 +2679,7 @@ impl Shell {
             "return" => {
                 let code = argv.get(1).and_then(|s| s.parse::<i32>().ok()).unwrap_or(self.last_status);
                 if self.var_scopes.is_empty() {
-                    eprintln!("bish: return: can only 'return' from a function");
+                    sh_eprintln!(self, "bish: return: can only 'return' from a function");
                     return ExecResult::Status(code);
                 }
                 return ExecResult::Return(code);
@@ -2454,7 +2694,7 @@ impl Shell {
             }
             "local" => {
                 if self.var_scopes.is_empty() {
-                    eprintln!("bish: local: can only be used inside a function");
+                    sh_eprintln!(self, "bish: local: can only be used inside a function");
                     return ExecResult::Status(1);
                 }
                 // `-a`/`-A` name an array rather than a scalar. `arrays`/
@@ -2630,7 +2870,7 @@ impl Shell {
                     .any(|r| matches!(r, Redirect::In(_) | Redirect::HereString(_) | Redirect::HereDoc(_)));
                 if let Some(p) = prompt {
                     if is_real_stdin && stdin_is_tty() {
-                        eprint!("{}", p);
+                        sh_eprint!(self, "{}", p);
                         let _ = std::io::Write::flush(&mut std::io::stderr());
                     }
                 }
@@ -2656,7 +2896,7 @@ impl Shell {
                     match self.coproc_fds.get_mut(&fd) {
                         Some(KeptFd::Read(r)) => read_line_or_chars(r, nchars, delim),
                         _ => {
-                            eprintln!("bish: read: {}: invalid file descriptor", fd);
+                            sh_eprintln!(self, "bish: read: {}: invalid file descriptor", fd);
                             return ExecResult::Status(1);
                         }
                     }
@@ -2747,14 +2987,14 @@ impl Shell {
                 let path = match argv.get(1) {
                     Some(p) => p.clone(),
                     None => {
-                        eprintln!("bish: {}: filename argument required", name);
+                        sh_eprintln!(self, "bish: {}: filename argument required", name);
                         return ExecResult::Status(2);
                     }
                 };
                 match std::fs::read_to_string(&path) {
                     Ok(src) => return self.run_source_here(&src, &path),
                     Err(e) => {
-                        eprintln!("bish: {}: {}", path, e);
+                        sh_eprintln!(self, "bish: {}: {}", path, e);
                         return ExecResult::Status(1);
                     }
                 }
@@ -2762,7 +3002,7 @@ impl Shell {
             "trap" => {
                 if argv.len() == 1 || argv.get(1).map(|s| s == "-p").unwrap_or(false) {
                     if let Some(code) = &self.exit_trap {
-                        println!("trap -- {} EXIT", crate::serialize::quote_literal(code));
+                        sh_println!(self, "trap -- {} EXIT", crate::serialize::quote_literal(code));
                     }
                     let mut entries: Vec<(i32, TrapAction)> =
                         self.traps.iter().map(|(k, v)| (*k, v.clone())).collect();
@@ -2770,9 +3010,9 @@ impl Shell {
                     for (n, action) in entries {
                         match action {
                             TrapAction::Run(code) => {
-                                println!("trap -- {} SIG{}", crate::serialize::quote_literal(&code), signal_name(n))
+                                sh_println!(self, "trap -- {} SIG{}", crate::serialize::quote_literal(&code), signal_name(n))
                             }
-                            TrapAction::Ignore => println!("trap -- '' SIG{}", signal_name(n)),
+                            TrapAction::Ignore => sh_println!(self, "trap -- '' SIG{}", signal_name(n)),
                         }
                     }
                     return ExecResult::Status(0);
@@ -2789,12 +3029,12 @@ impl Shell {
                     let num = match signal_number(sig) {
                         Some(n) => n,
                         None => {
-                            eprintln!("bish: trap: {}: invalid signal specification", sig);
+                            sh_eprintln!(self, "bish: trap: {}: invalid signal specification", sig);
                             continue;
                         }
                     };
                     if num == 9 || num == 19 {
-                        eprintln!("bish: trap: {}: cannot trap", sig);
+                        sh_eprintln!(self, "bish: trap: {}: cannot trap", sig);
                         continue;
                     }
                     if cmd_str == "-" {
@@ -2831,7 +3071,7 @@ impl Shell {
                 let redirs = match self.resolve_redirects(cmd) {
                     Ok(r) => r,
                     Err(e) => {
-                        eprintln!("bish: {}", e);
+                        sh_eprintln!(self, "bish: {}", e);
                         return ExecResult::Status(1);
                     }
                 };
@@ -2851,11 +3091,11 @@ impl Shell {
                 // below is a direct execve of *this* process, no fork, so
                 // there's no child to install a pre_exec closure into.
                 if let Err(e) = apply_fds_to_self(redirs.dup_stderr_to_stdout, redirs.extra_fds) {
-                    eprintln!("bish: exec: {}", e);
+                    sh_eprintln!(self, "bish: exec: {}", e);
                     return ExecResult::Status(1);
                 }
                 let err = command.exec();
-                eprintln!("bish: exec: {}: {}", argv[1], err);
+                sh_eprintln!(self, "bish: exec: {}: {}", argv[1], err);
                 // Real bash: a non-interactive shell exits immediately when
                 // exec fails to find/run the command, and (confirmed via a
                 // clean probe against bash 5.0.17) leaves $? at whatever it
@@ -2876,23 +3116,23 @@ impl Shell {
                 let redirs = match self.resolve_redirects(cmd) {
                     Ok(r) => r,
                     Err(e) => {
-                        eprintln!("bish: {}", e);
+                        sh_eprintln!(self, "bish: {}", e);
                         return ExecResult::Status(1);
                     }
                 };
                 let (stdin, stdout, stderr) = match self.resolve_plain_fd012(&cmd.redirects) {
                     Ok(f) => f,
                     Err(e) => {
-                        eprintln!("bish: {}", e);
+                        sh_eprintln!(self, "bish: {}", e);
                         return ExecResult::Status(1);
                     }
                 };
                 if let Err(e) = apply_fd012_to_self(stdin, stdout, stderr) {
-                    eprintln!("bish: exec: {}", e);
+                    sh_eprintln!(self, "bish: exec: {}", e);
                     return ExecResult::Status(1);
                 }
                 if let Err(e) = apply_fds_to_self(redirs.dup_stderr_to_stdout, redirs.extra_fds) {
-                    eprintln!("bish: exec: {}", e);
+                    sh_eprintln!(self, "bish: exec: {}", e);
                     return ExecResult::Status(1);
                 }
                 return ExecResult::Status(0);
@@ -2901,7 +3141,7 @@ impl Shell {
         }
 
         if self.restrict_to_builtins {
-            eprintln!("bish: {}: command mode only allows builtins -- use `command {}` to run it", name, name);
+            sh_eprintln!(self, "bish: {}: command mode only allows builtins -- use `command {}` to run it", name, name);
             return ExecResult::Status(127);
         }
 
@@ -2912,7 +3152,7 @@ impl Shell {
         let redirs = match self.resolve_redirects(cmd) {
             Ok(r) => r,
             Err(e) => {
-                eprintln!("bish: {}", e);
+                sh_eprintln!(self, "bish: {}", e);
                 return ExecResult::Status(1);
             }
         };
@@ -2948,7 +3188,7 @@ impl Shell {
                     let result = match child.wait() {
                         Ok(status) => ExecResult::Status(exit_code_from_status(status)),
                         Err(e) => {
-                            eprintln!("bish: {}", e);
+                            sh_eprintln!(self, "bish: {}", e);
                             ExecResult::Status(1)
                         }
                     };
@@ -2982,7 +3222,7 @@ impl Shell {
             let mut command = match cmd {
                 parser::Command::Simple(sc) => {
                     if sc.words.is_empty() {
-                        eprintln!("bish: syntax error in pipeline");
+                        sh_eprintln!(self, "bish: syntax error in pipeline");
                         kill_all(children);
                         return 1;
                     }
@@ -2993,7 +3233,7 @@ impl Shell {
                     let redirs = match self.resolve_redirects(sc) {
                         Ok(r) => r,
                         Err(e) => {
-                            eprintln!("bish: {}", e);
+                            sh_eprintln!(self, "bish: {}", e);
                             kill_all(children);
                             return 1;
                         }
@@ -3009,7 +3249,7 @@ impl Shell {
                         let exe = match std::env::current_exe() {
                             Ok(p) => p,
                             Err(e) => {
-                                eprintln!("bish: {}", e);
+                                sh_eprintln!(self, "bish: {}", e);
                                 kill_all(children);
                                 return 1;
                             }
@@ -3046,7 +3286,7 @@ impl Shell {
                     let exe = match std::env::current_exe() {
                         Ok(p) => p,
                         Err(e) => {
-                            eprintln!("bish: {}", e);
+                            sh_eprintln!(self, "bish: {}", e);
                             kill_all(children);
                             return 1;
                         }
@@ -3064,7 +3304,7 @@ impl Shell {
                         match self.resolve_redirect_list(own_redirects) {
                             Ok(r) => r,
                             Err(e) => {
-                                eprintln!("bish: {}", e);
+                                sh_eprintln!(self, "bish: {}", e);
                                 kill_all(children);
                                 return 1;
                             }
@@ -3090,7 +3330,7 @@ impl Shell {
                     children.push(child);
                 }
                 Err(e) => {
-                    eprintln!("bish: {}", e);
+                    sh_eprintln!(self, "bish: {}", e);
                     kill_all(children);
                     return 127;
                 }
@@ -3110,7 +3350,7 @@ impl Shell {
             let code = match c.wait() {
                 Ok(s) => exit_code_from_status(s),
                 Err(e) => {
-                    eprintln!("bish: {}", e);
+                    sh_eprintln!(self, "bish: {}", e);
                     1
                 }
             };
@@ -3139,7 +3379,7 @@ impl Shell {
                 Chunk::Sub { raw, .. } => s.push_str(&self.run_command_substitution(raw)),
                 Chunk::Arith { raw, .. } => match arith::eval(raw, self) {
                     Ok(v) => s.push_str(&v.to_string()),
-                    Err(e) => eprintln!("bish: (({})): {}", raw, e),
+                    Err(e) => sh_eprintln!(self, "bish: (({})): {}", raw, e),
                 },
                 Chunk::VarExpand { name, op, .. } => {
                     let name = name.clone();
@@ -3309,12 +3549,12 @@ impl Shell {
             Ok(i) => match self.resolve_array_index(name, i) {
                 Some(idx) => idx,
                 None => {
-                    eprintln!("bish: {}: bad array index: {}", name, index);
+                    sh_eprintln!(self, "bish: {}: bad array index: {}", name, index);
                     return;
                 }
             },
             Err(_) => {
-                eprintln!("bish: {}: bad array index: {}", name, index);
+                sh_eprintln!(self, "bish: {}: bad array index: {}", name, index);
                 return;
             }
         };
@@ -3385,7 +3625,7 @@ impl Shell {
                     let v = match arith::eval(raw, self) {
                         Ok(n) => n.to_string(),
                         Err(e) => {
-                            eprintln!("bish: (({})): {}", raw, e);
+                            sh_eprintln!(self, "bish: (({})): {}", raw, e);
                             String::new()
                         }
                     };
@@ -3521,7 +3761,7 @@ impl Shell {
                 let trigger = if *colon { cur.is_empty() } else { !self.var_is_set(name) };
                 if trigger {
                     let msg = self.expand_raw(word);
-                    eprintln!("bish: {}: {}", name, msg);
+                    sh_eprintln!(self, "bish: {}: {}", name, msg);
                     String::new()
                 } else {
                     cur
@@ -3592,7 +3832,7 @@ impl Shell {
                 let trigger = if *colon { cur.is_empty() } else { !self.array_element_is_set(name, index) };
                 if trigger {
                     let msg = self.expand_raw(word);
-                    eprintln!("bish: {}[{}]: {}", name, index, msg);
+                    sh_eprintln!(self, "bish: {}[{}]: {}", name, index, msg);
                     String::new()
                 } else {
                     cur
@@ -3797,16 +4037,16 @@ impl Shell {
     // existence check.
     fn command_v(&mut self, name: &str, verbose: bool) -> i32 {
         if self.functions.contains_key(name) {
-            println!("{}", if verbose { format!("{} is a function", name) } else { name.to_string() });
+            sh_println!(self, "{}", if verbose { format!("{} is a function", name) } else { name.to_string() });
             return 0;
         }
         if is_known_builtin(name) {
-            println!("{}", if verbose { format!("{} is a shell builtin", name) } else { name.to_string() });
+            sh_println!(self, "{}", if verbose { format!("{} is a shell builtin", name) } else { name.to_string() });
             return 0;
         }
         match resolve_in_path(name) {
             Some(p) => {
-                println!("{}", if verbose { format!("{} is {}", name, p) } else { p });
+                sh_println!(self, "{}", if verbose { format!("{} is {}", name, p) } else { p });
                 0
             }
             None => 1,
@@ -3830,20 +4070,20 @@ impl Shell {
         for name in names {
             if self.functions.contains_key(name.as_str()) {
                 if !path_only {
-                    println!("{} is a function", name);
+                    sh_println!(self, "{} is a function", name);
                 }
                 continue;
             }
             if is_known_builtin(name) {
                 if !path_only {
-                    println!("{} is a shell builtin", name);
+                    sh_println!(self, "{} is a shell builtin", name);
                 }
                 continue;
             }
             match resolve_in_path(name) {
-                Some(p) => println!("{}", if path_only { p } else { format!("{} is {}", name, p) }),
+                Some(p) => sh_println!(self, "{}", if path_only { p } else { format!("{} is {}", name, p) }),
                 None => {
-                    eprintln!("bish: type: {}: not found", name);
+                    sh_eprintln!(self, "bish: type: {}: not found", name);
                     status = 1;
                 }
             }
@@ -3867,7 +4107,7 @@ impl Shell {
         if self.var_is_set(name) {
             return;
         }
-        eprintln!("bish: {}: unbound variable", name);
+        sh_eprintln!(self, "bish: {}: unbound variable", name);
         self.run_exit_trap();
         std::process::exit(1);
     }
@@ -3928,7 +4168,7 @@ impl Shell {
             name
         };
         if self.readonly_names.contains(name) {
-            eprintln!("bish: {}: readonly variable", name);
+            sh_eprintln!(self, "bish: {}: readonly variable", name);
             return;
         }
         // `SECONDS=n` resets the elapsed-time counter to start counting
@@ -3980,7 +4220,7 @@ impl Shell {
     // back to the shell's real stderr when there's no stderr redirect.
     fn write_command_error(&mut self, cmd: &SimpleCommand, msg: &str) {
         let target = self.peek_stderr_target(&cmd.redirects);
-        write_diagnostic(&target, msg);
+        write_diagnostic(&target, msg, self.sink);
     }
 
     fn peek_stderr_target(&mut self, redirects: &[Redirect]) -> Option<String> {
@@ -4357,6 +4597,74 @@ impl Job {
 fn exit_code_from_status(status: std::process::ExitStatus) -> i32 {
     use std::os::unix::process::ExitStatusExt;
     status.code().unwrap_or_else(|| status.signal().map(|s| 128 + s).unwrap_or(1))
+}
+
+// Support types for run_ulimit (moved from a builtins.rs free function in
+// M6 -- see that method's doc comment).
+#[repr(C)]
+struct RLimit {
+    cur: u64,
+    max: u64,
+}
+
+const RLIM_INFINITY: u64 = u64::MAX;
+
+struct LimitSpec {
+    flag: char,
+    resource: i32,
+    label: &'static str,
+    unit: &'static str,
+    div: u64,
+}
+
+// Standard Linux/glibc RLIMIT_* numbers (stable ABI, safe to hardcode --
+// same "libc is already linked, no crate needed" reasoning used elsewhere
+// in this codebase for raw syscall numbers/signatures). No RLIMIT_PIPE
+// exists on Linux (pipe capacity is a per-pipe fcntl setting, not an
+// rlimit) so `-p`, which real bash reports as a fixed constant, is left
+// out of `-a` rather than fabricating a value.
+const LIMIT_SPECS: &[LimitSpec] = &[
+    LimitSpec { flag: 'c', resource: 4, label: "core file size", unit: "blocks", div: 512 },
+    LimitSpec { flag: 'd', resource: 2, label: "data seg size", unit: "kbytes", div: 1024 },
+    LimitSpec { flag: 'e', resource: 13, label: "scheduling priority", unit: "", div: 1 },
+    LimitSpec { flag: 'f', resource: 1, label: "file size", unit: "blocks", div: 512 },
+    LimitSpec { flag: 'i', resource: 11, label: "pending signals", unit: "", div: 1 },
+    LimitSpec { flag: 'l', resource: 8, label: "max locked memory", unit: "kbytes", div: 1024 },
+    LimitSpec { flag: 'm', resource: 5, label: "max memory size", unit: "kbytes", div: 1024 },
+    LimitSpec { flag: 'n', resource: 7, label: "open files", unit: "", div: 1 },
+    LimitSpec { flag: 'q', resource: 12, label: "POSIX message queues", unit: "bytes", div: 1 },
+    LimitSpec { flag: 'r', resource: 14, label: "real-time priority", unit: "", div: 1 },
+    LimitSpec { flag: 's', resource: 3, label: "stack size", unit: "kbytes", div: 1024 },
+    LimitSpec { flag: 't', resource: 0, label: "cpu time", unit: "seconds", div: 1 },
+    LimitSpec { flag: 'u', resource: 6, label: "max user processes", unit: "", div: 1 },
+    LimitSpec { flag: 'v', resource: 9, label: "virtual memory", unit: "kbytes", div: 1024 },
+    LimitSpec { flag: 'x', resource: 10, label: "file locks", unit: "", div: 1 },
+];
+
+fn fmt_limit(v: u64, div: u64) -> String {
+    if v == RLIM_INFINITY {
+        "unlimited".to_string()
+    } else {
+        (v / div.max(1)).to_string()
+    }
+}
+
+fn umask_symbolic(mask: u32) -> String {
+    let perm_for = |shift: u32| -> String {
+        let bits = (mask >> shift) & 0o7;
+        let mut s = String::new();
+        if bits & 0o4 == 0 {
+            s.push('r');
+        }
+        if bits & 0o2 == 0 {
+            s.push('w');
+        }
+        if bits & 0o1 == 0 {
+            s.push('x');
+        }
+        s
+    };
+    format!("u={},g={},o={}", perm_for(6), perm_for(3), perm_for(0))
 }
 
 // Shared by the `read` builtin's two sources (a Box<dyn BufRead> from
@@ -5201,19 +5509,24 @@ fn kill_all(children: Vec<std::process::Child>) {
     }
 }
 
-// Shared by write_command_error and check_nounset: writes to `target`'s
-// file (append) if set, else falls back to the shell's real stderr.
-fn write_diagnostic(target: &Option<String>, msg: &str) {
+// Shared by write_command_error and unset's readonly-variable diagnostic:
+// writes to `target`'s file (append) if set, else falls back to the
+// session's own sink (still real stderr today, see OutputSink's doc
+// comment). A free function, not a Shell method, so it takes the sink
+// explicitly rather than through self.sink_err/sh_eprintln! -- both of
+// its callers already have a `&Shell`/`&mut Shell` in scope to pass
+// `.sink` from.
+fn write_diagnostic(target: &Option<String>, msg: &str, sink: OutputSink) {
     match target {
         Some(path) => {
             if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
                 use std::io::Write;
                 let _ = writeln!(f, "{}", msg);
             } else {
-                eprintln!("{}", msg);
+                sink.write_err(&format!("{}\n", msg));
             }
         }
-        None => eprintln!("{}", msg),
+        None => sink.write_err(&format!("{}\n", msg)),
     }
 }
 

@@ -65,7 +65,7 @@ pub fn run(shell: Shell) {
             Ok(ReadOutcome::Eof) => {
                 let session = sessions.get_mut(&session_id).unwrap();
                 if !session.buffer.is_empty() {
-                    eprintln!("bish: syntax error: unexpected end of input");
+                    session.shell.sink_err("bish: syntax error: unexpected end of input\n");
                 }
                 session.shell.run_exit_trap();
                 if windows.len() == 1 {
@@ -75,6 +75,12 @@ pub fn run(shell: Shell) {
                     // session is currently the only way out of promoted
                     // mode.
                     if session.shell.is_promoted() {
+                        // Direct, not session.shell.sink_out: this is a
+                        // whole-terminal action (leaving the alternate
+                        // screen buffer), the same category as
+                        // redraw_tab_bar/apply_window_action's messages
+                        // below -- always meant for the real screen, never
+                        // a session's own captured output.
                         print!("\x1b[?1049l");
                         let _ = io::stdout().flush();
                     }
@@ -144,14 +150,14 @@ pub fn run(shell: Shell) {
                             }
                             Err(e) => {
                                 if !is_incomplete(&e) {
-                                    eprintln!("bish: syntax error: {}", e);
+                                    session.shell.sink_err(&format!("bish: syntax error: {}\n", e));
                                     session.buffer.clear();
                                 }
                             }
                         },
                         Err(e) => {
                             if !is_incomplete(&e) {
-                                eprintln!("bish: syntax error: {}", e);
+                                session.shell.sink_err(&format!("bish: syntax error: {}\n", e));
                                 session.buffer.clear();
                             }
                         }
@@ -170,7 +176,7 @@ pub fn run(shell: Shell) {
                 }
             }
             Err(e) => {
-                eprintln!("bish: error reading input: {}", e);
+                sessions.get(&session_id).unwrap().shell.sink_err(&format!("bish: error reading input: {}\n", e));
                 break;
             }
         }
@@ -212,6 +218,9 @@ fn apply_window_action(
         }
         WindowAction::Close => {
             if windows.len() == 1 {
+                // Direct: a window-management error, not a specific
+                // session's own output (see redraw_tab_bar below for the
+                // same reasoning).
                 eprintln!("bish: window close: cannot close the last window -- exit the shell instead");
                 return;
             }
@@ -229,7 +238,11 @@ fn apply_window_action(
 // (index + that window's session's cwd), the current one highlighted.
 // No terminal-size query yet (needs a TIOCGWINSZ ioctl, planned for the
 // real compositor), so this can't pin itself to the actual bottom row --
-// an acknowledged, temporary limitation, not the final design.
+// an acknowledged, temporary limitation, not the final design. Writes
+// straight to the real terminal (not through any session's sink): this
+// is the multiplexer's own UI chrome, not a session's program output, so
+// it's never a candidate for per-window capture the way M6 set up
+// builtin/diagnostic output to eventually be.
 fn redraw_tab_bar(sessions: &HashMap<SessionId, SessionState>, windows: &[WindowEntry], current_window: usize) {
     let mut line = String::new();
     for (i, w) in windows.iter().enumerate() {
@@ -293,7 +306,7 @@ fn run_command_mode(shell: &mut Shell, history: &mut History) -> Option<WindowAc
                     Ok(toks) => match Parser::new(toks).parse_program() {
                         Ok(prog) => {
                             if let Some(msg) = command_mode_violation(&prog) {
-                                eprintln!("bish: {}", msg);
+                                shell.sink_err(&format!("bish: {}\n", msg));
                                 buffer.clear();
                             } else {
                                 history.record(&buffer);
@@ -308,21 +321,21 @@ fn run_command_mode(shell: &mut Shell, history: &mut History) -> Option<WindowAc
                         }
                         Err(e) => {
                             if !is_incomplete(&e) {
-                                eprintln!("bish: syntax error: {}", e);
+                                shell.sink_err(&format!("bish: syntax error: {}\n", e));
                                 buffer.clear();
                             }
                         }
                     },
                     Err(e) => {
                         if !is_incomplete(&e) {
-                            eprintln!("bish: syntax error: {}", e);
+                            shell.sink_err(&format!("bish: syntax error: {}\n", e));
                             buffer.clear();
                         }
                     }
                 }
             }
             Err(e) => {
-                eprintln!("bish: error reading input: {}", e);
+                shell.sink_err(&format!("bish: error reading input: {}\n", e));
                 return None;
             }
         }
