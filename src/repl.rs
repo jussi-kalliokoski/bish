@@ -1,26 +1,34 @@
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io::{self, Write};
+use std::rc::Rc;
 
 use crate::editor::{self, ReadOutcome};
-use crate::exec::{ExecResult, Shell, WindowAction};
+use crate::exec::{self, ExecResult, Shell, WindowAction};
 use crate::history::History;
 use crate::lexer::Lexer;
 use crate::parser::{AndOr, Command, Parser, Pipeline, Program};
 use crate::prompt;
+use crate::pty;
 use crate::term;
+use crate::vt100;
 
 type SessionId = u32;
 
 // One virtual shell session -- either the original process's own session
 // (the root, id 0) or one created by `window new` (via Shell::
 // new_virtual_child). Each has its own insert-mode multi-line
-// continuation buffer and its own history_boundary (see History's doc
-// comment): a session only ever browses commands recorded from its own
-// creation point forward, never anything from before it existed.
+// continuation buffer, its own history_boundary (see History's doc
+// comment), and its own VT100 grid: before promotion the grid sits empty
+// and unused (the session's Shell writes straight to the real terminal);
+// after promotion every session's output is captured into its own grid
+// (see apply_window_action), so switching `window`s can redraw whatever
+// that window last drew instead of showing stale/real-terminal content.
 struct SessionState {
     shell: Shell,
     buffer: String,
     history_boundary: usize,
+    screen: Rc<RefCell<vt100::Screen>>,
 }
 
 // A window's one currently-active session. Deliberately not yet a stack
@@ -29,11 +37,27 @@ struct SessionState {
 // attach an *existing* session to a second window or push an external job
 // onto one, so every window has exactly one session for now. The stack
 // becomes real once fg-into-a-window's-session and fg-into-an-external-
-// job land, alongside the real compositor that can actually make
-// switching between them visible.
+// job land (M9b), poll-driven against a job's own pty instead of today's
+// blocking `fg`.
 struct WindowEntry {
     id: u32,
     session: SessionId,
+}
+
+// Queries the real terminal's size via the same TIOCGWINSZ ioctl pty.rs
+// uses for pty slaves -- it works identically on any tty fd, including
+// our own controlling terminal (fd 0). Falls back to a conservative
+// default if the query fails (e.g. stdin somehow isn't a tty by the time
+// this runs, which main.rs already guards against before calling here).
+fn query_term_size() -> (usize, usize) {
+    match pty::get_size(0) {
+        Ok(ws) if ws.rows > 0 && ws.cols > 0 => (ws.rows as usize, ws.cols as usize),
+        _ => (24, 80),
+    }
+}
+
+fn content_rows(term_rows: usize) -> usize {
+    term_rows.saturating_sub(1).max(1)
 }
 
 pub fn run(shell: Shell) {
@@ -42,18 +66,50 @@ pub fn run(shell: Shell) {
     // normally since exec() resets a *caught* signal like this back to
     // default. See term::ignore_sigint's doc comment.
     term::ignore_sigint();
+    exec::install_winch_handler();
 
     let mut history = History::load(".bish_history");
     let mut cmd_history = History::load(".bish_cmd_history");
 
+    let (mut term_rows, mut term_cols) = query_term_size();
+
     let mut sessions: HashMap<SessionId, SessionState> = HashMap::new();
-    sessions.insert(0, SessionState { shell, buffer: String::new(), history_boundary: 0 });
+    let root_screen = Rc::new(RefCell::new(vt100::Screen::new(content_rows(term_rows), term_cols)));
+    sessions.insert(0, SessionState { shell, buffer: String::new(), history_boundary: 0, screen: root_screen });
     let mut windows: Vec<WindowEntry> = vec![WindowEntry { id: 0, session: 0 }];
     let mut current_window: usize = 0;
     let mut next_session_id: SessionId = 1;
     let mut next_window_id: u32 = 1;
+    // Flips true (and stays true) the first time any window-family
+    // command promotes the terminal -- see apply_window_action. Every
+    // session's sink is Real until then, matching today's plain behavior
+    // exactly when `:`/`window` are never invoked.
+    let mut sinks_are_grid = false;
 
     loop {
+        // Polled once per loop iteration rather than truly asynchronously:
+        // editor::read_line below blocks on the next keypress with no
+        // signal-aware select/poll of its own, so a resize that arrives
+        // mid-block is only noticed once that read returns (the user's
+        // next keystroke or Enter). A real event loop that can react to
+        // WINCH *while* blocked on input is M9b's job (the same compositor
+        // work that makes poll-driven `fg` possible) -- acknowledged,
+        // temporary, same spirit as this codebase's other documented
+        // scope boundaries.
+        if exec::take_winch() {
+            let (new_rows, new_cols) = query_term_size();
+            if (new_rows, new_cols) != (term_rows, term_cols) {
+                term_rows = new_rows;
+                term_cols = new_cols;
+                for s in sessions.values() {
+                    s.screen.borrow_mut().resize(content_rows(term_rows), term_cols);
+                }
+                if sinks_are_grid {
+                    compositor_redraw(&sessions, &windows, current_window, term_rows, term_cols);
+                }
+            }
+        }
+
         let session_id = windows[current_window].session;
         let boundary = sessions[&session_id].history_boundary;
         let prompt_str = {
@@ -78,7 +134,7 @@ pub fn run(shell: Shell) {
                         // Direct, not session.shell.sink_out: this is a
                         // whole-terminal action (leaving the alternate
                         // screen buffer), the same category as
-                        // redraw_tab_bar/apply_window_action's messages
+                        // compositor_redraw/apply_window_action's messages
                         // below -- always meant for the real screen, never
                         // a session's own captured output.
                         print!("\x1b[?1049l");
@@ -96,6 +152,9 @@ pub fn run(shell: Shell) {
                     &mut next_session_id,
                     &mut next_window_id,
                     &history,
+                    &mut sinks_are_grid,
+                    term_rows,
+                    term_cols,
                 );
             }
             Ok(ReadOutcome::Interrupted) => {
@@ -117,7 +176,16 @@ pub fn run(shell: Shell) {
                         &mut next_session_id,
                         &mut next_window_id,
                         &history,
+                        &mut sinks_are_grid,
+                        term_rows,
+                        term_cols,
                     );
+                } else if sinks_are_grid {
+                    // No window action, but command mode may still have
+                    // run ordinary builtins whose output landed in this
+                    // session's grid (e.g. `:pwd`) -- without this, that
+                    // output would sit captured but never actually drawn.
+                    compositor_redraw(&sessions, &windows, current_window, term_rows, term_cols);
                 }
             }
             Ok(ReadOutcome::Line(line)) => {
@@ -172,7 +240,20 @@ pub fn run(shell: Shell) {
                         &mut next_session_id,
                         &mut next_window_id,
                         &history,
+                        &mut sinks_are_grid,
+                        term_rows,
+                        term_cols,
                     );
+                } else if sinks_are_grid {
+                    // The common case once promoted: a normal command ran
+                    // in the focused session and its output (if any)
+                    // landed in that session's grid via its sink -- make
+                    // it visible. Nothing streams live mid-command (M9a
+                    // has no concurrent execution yet, see WindowAction's
+                    // doc comment above); the redraw happens once the
+                    // command has fully finished, same as every other
+                    // redraw trigger here.
+                    compositor_redraw(&sessions, &windows, current_window, term_rows, term_cols);
                 }
             }
             Err(e) => {
@@ -186,8 +267,10 @@ pub fn run(shell: Shell) {
 
 // Performs a `window`-family action against the real session/window
 // state repl.rs owns directly (see ExecResult::Window's doc comment in
-// exec.rs for why this can't live inside Shell itself). Redraws the tab
-// bar afterward for every action that actually changed something.
+// exec.rs for why this can't live inside Shell itself). Redraws the
+// compositor afterward for every action, including the rejected-close
+// case (its error message needs to actually become visible once
+// promoted, same as any other captured output).
 #[allow(clippy::too_many_arguments)]
 fn apply_window_action(
     action: WindowAction,
@@ -197,7 +280,27 @@ fn apply_window_action(
     next_session_id: &mut SessionId,
     next_window_id: &mut u32,
     history: &History,
+    sinks_are_grid: &mut bool,
+    term_rows: usize,
+    term_cols: usize,
 ) {
+    // One-time transition: every window-family command promotes before
+    // repl.rs ever sees the resulting action (see run_window/
+    // promote_if_needed in exec.rs), so by the time we get here the
+    // terminal is always already in the alternate screen buffer. Flip
+    // every existing session (in practice just session 0 the very first
+    // time, since any session created via `new` afterward is always
+    // created post-promotion and gets a Grid sink from birth below) from
+    // writing straight to the real terminal to capturing into its own
+    // grid instead.
+    if !*sinks_are_grid {
+        for s in sessions.values_mut() {
+            let screen = s.screen.clone();
+            s.shell.set_sink_grid(screen);
+        }
+        *sinks_are_grid = true;
+    }
+
     match action {
         WindowAction::Next => {
             *current_window = (*current_window + 1) % windows.len();
@@ -207,10 +310,12 @@ fn apply_window_action(
         }
         WindowAction::New => {
             let parent_id = windows[*current_window].session;
-            let child_shell = sessions[&parent_id].shell.new_virtual_child();
+            let mut child_shell = sessions[&parent_id].shell.new_virtual_child();
+            let screen = Rc::new(RefCell::new(vt100::Screen::new(content_rows(term_rows), term_cols)));
+            child_shell.set_sink_grid(screen.clone());
             let sid = *next_session_id;
             *next_session_id += 1;
-            sessions.insert(sid, SessionState { shell: child_shell, buffer: String::new(), history_boundary: history.boundary() });
+            sessions.insert(sid, SessionState { shell: child_shell, buffer: String::new(), history_boundary: history.boundary(), screen });
             let wid = *next_window_id;
             *next_window_id += 1;
             windows.push(WindowEntry { id: wid, session: sid });
@@ -218,10 +323,9 @@ fn apply_window_action(
         }
         WindowAction::Close => {
             if windows.len() == 1 {
-                // Direct: a window-management error, not a specific
-                // session's own output (see redraw_tab_bar below for the
-                // same reasoning).
-                eprintln!("bish: window close: cannot close the last window -- exit the shell instead");
+                let sid = windows[*current_window].session;
+                sessions[&sid].shell.sink_err("bish: window close: cannot close the last window -- exit the shell instead\n");
+                compositor_redraw(sessions, windows, *current_window, term_rows, term_cols);
                 return;
             }
             let closed_session = windows.remove(*current_window).session;
@@ -231,19 +335,98 @@ fn apply_window_action(
             }
         }
     }
-    redraw_tab_bar(sessions, windows, *current_window);
+    compositor_redraw(sessions, windows, *current_window, term_rows, term_cols);
 }
 
-// Clears the screen and draws a plain tab bar, one entry per window
-// (index + that window's session's cwd), the current one highlighted.
-// No terminal-size query yet (needs a TIOCGWINSZ ioctl, planned for the
-// real compositor), so this can't pin itself to the actual bottom row --
-// an acknowledged, temporary limitation, not the final design. Writes
-// straight to the real terminal (not through any session's sink): this
-// is the multiplexer's own UI chrome, not a session's program output, so
-// it's never a candidate for per-window capture the way M6 set up
-// builtin/diagnostic output to eventually be.
-fn redraw_tab_bar(sessions: &HashMap<SessionId, SessionState>, windows: &[WindowEntry], current_window: usize) {
+// Full redraw of the currently-focused window's grid plus the tab bar.
+// Always a full clear+redraw rather than a cell/row-level diff: M9a's
+// redraws only ever fire after a discrete event (a command finished, a
+// window switch, a resize) -- infrequent enough that flicker isn't a
+// real concern, and a full redraw is trivially correct (self-healing
+// against anything that wrote to the real terminal directly in between,
+// like editor.rs's Ctrl-L). A real diff only starts earning its keep once
+// M9b adds a continuous per-tick redraw loop (driven by a foregrounded
+// job's pty output arriving while the compositor keeps servicing
+// keystrokes/resizes) -- that's where it's planned to land.
+fn compositor_redraw(sessions: &HashMap<SessionId, SessionState>, windows: &[WindowEntry], current_window: usize, term_rows: usize, _term_cols: usize) {
+    let session_id = windows[current_window].session;
+    let screen = sessions[&session_id].screen.borrow();
+    let (rows, cols) = screen.size();
+
+    let mut out = String::new();
+    out.push_str("\x1b[2J\x1b[H");
+    for r in 0..rows {
+        render_row(&mut out, &screen, r, cols);
+        out.push_str("\r\n");
+    }
+
+    // Tab bar pinned to the terminal's real last row.
+    out.push_str(&format!("\x1b[{};1H\x1b[K", term_rows));
+    out.push_str(&tab_bar_line(sessions, windows, current_window));
+
+    let (cur_row, cur_col) = screen.cursor();
+    out.push_str(&format!("\x1b[{};{}H", cur_row + 1, cur_col + 1));
+    out.push_str(if screen.cursor_visible { "\x1b[?25h" } else { "\x1b[?25l" });
+
+    print!("{}", out);
+    let _ = io::stdout().flush();
+}
+
+fn render_row(out: &mut String, screen: &vt100::Screen, row: usize, cols: usize) {
+    let mut last: Option<(vt100::Color, vt100::Color, vt100::CellAttrs)> = None;
+    for c in 0..cols {
+        let cell = screen.cell(row, c);
+        let key = (cell.fg, cell.bg, cell.attrs);
+        if last != Some(key) {
+            out.push_str(&sgr_codes(cell.fg, cell.bg, cell.attrs));
+            last = Some(key);
+        }
+        out.push(cell.ch);
+    }
+    out.push_str("\x1b[0m");
+}
+
+// The inverse of vt100::Screen's own SGR parsing: turns a cell's resolved
+// color/attrs back into the ANSI codes that reproduce them, so the real
+// terminal ends up showing the same thing the grid recorded.
+fn sgr_codes(fg: vt100::Color, bg: vt100::Color, attrs: vt100::CellAttrs) -> String {
+    let mut codes: Vec<String> = vec!["0".to_string()];
+    if attrs.bold {
+        codes.push("1".to_string());
+    }
+    if attrs.dim {
+        codes.push("2".to_string());
+    }
+    if attrs.italic {
+        codes.push("3".to_string());
+    }
+    if attrs.underline {
+        codes.push("4".to_string());
+    }
+    if attrs.reverse {
+        codes.push("7".to_string());
+    }
+    if attrs.strikethrough {
+        codes.push("9".to_string());
+    }
+    match fg {
+        vt100::Color::Default => {}
+        vt100::Color::Indexed(i) if i < 8 => codes.push(format!("{}", 30 + i)),
+        vt100::Color::Indexed(i) if i < 16 => codes.push(format!("{}", 90 + (i - 8))),
+        vt100::Color::Indexed(i) => codes.push(format!("38;5;{}", i)),
+        vt100::Color::Rgb(r, g, b) => codes.push(format!("38;2;{};{};{}", r, g, b)),
+    }
+    match bg {
+        vt100::Color::Default => {}
+        vt100::Color::Indexed(i) if i < 8 => codes.push(format!("{}", 40 + i)),
+        vt100::Color::Indexed(i) if i < 16 => codes.push(format!("{}", 100 + (i - 8))),
+        vt100::Color::Indexed(i) => codes.push(format!("48;5;{}", i)),
+        vt100::Color::Rgb(r, g, b) => codes.push(format!("48;2;{};{};{}", r, g, b)),
+    }
+    format!("\x1b[{}m", codes.join(";"))
+}
+
+fn tab_bar_line(sessions: &HashMap<SessionId, SessionState>, windows: &[WindowEntry], current_window: usize) -> String {
     let mut line = String::new();
     for (i, w) in windows.iter().enumerate() {
         let cwd = sessions[&w.session].shell.cwd.display();
@@ -253,11 +436,7 @@ fn redraw_tab_bar(sessions: &HashMap<SessionId, SessionState>, windows: &[Window
             line.push_str(&format!(" [{}] {} ", w.id, cwd));
         }
     }
-    print!("\x1b[2J\x1b[H");
-    println!("bish window manager\r");
-    println!("{}\r", line);
-    println!("\r");
-    let _ = io::stdout().flush();
+    line
 }
 
 // Distinguishes "needs more lines" (unterminated quote/paren, or the parser

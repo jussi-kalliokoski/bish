@@ -318,6 +318,10 @@ impl Screen {
         self.alternate.resize(rows, cols);
     }
 
+    pub fn size(&self) -> (usize, usize) {
+        (self.grid().rows, self.grid().cols)
+    }
+
     fn grid(&self) -> &Grid {
         if self.using_alternate {
             &self.alternate

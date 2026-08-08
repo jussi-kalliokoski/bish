@@ -11,21 +11,49 @@ use crate::lexer::{Chunk, ReplaceAnchor, VarOp};
 use crate::parser::{
     self, AndOr, AssignMode, Combinator, ListItem, Pipeline, Program, Redirect, Sep, SimpleCommand, Word,
 };
+use crate::vt100;
 
 // Where a Shell's own output (builtin/diagnostic text -- never a spawned
 // external process's, which always writes straight to its real inherited
 // fds regardless) actually goes. `Real` -- writing directly to the
-// process's real stdout/stderr, today's only variant and exactly today's
-// existing behavior -- is deliberately the only thing this does for now.
-// The point of introducing it at all is the seam: every session's Shell
-// having its own `sink` field is what lets a *non-focused* window's
-// output eventually land in that window's own captured buffer instead of
-// whatever's on the real screen right now, once a real per-window
-// buffer/grid exists to capture it into (planned: the VT100/compositor
-// milestones). Until then this is a no-op indirection.
-#[derive(Clone, Copy)]
+// process's real stdout/stderr -- is what every session uses before
+// promotion, and after promotion for whichever session is momentarily
+// mid-transition. `Grid` -- feeding bytes into that session's own VT100
+// Screen (M8) -- is what every session uses once the M9 compositor is
+// driving the terminal: repl.rs is the only thing that can see the real
+// window list, so it's the one that flips a session's sink from Real to
+// Grid (see repl.rs's apply_window_action) and later reads the Grid back
+// out to render whichever window is currently focused.
+#[derive(Clone)]
 enum OutputSink {
     Real,
+    Grid(Rc<RefCell<vt100::Screen>>),
+}
+
+// Emulates the real terminal's ONLCR postprocessing (translating outgoing
+// LF into CRLF) for text landing in a session's Grid. Every existing
+// sh_println!-style call site was written assuming a directly-connected,
+// default-cooked-mode terminal, where the OS/tty layer inserts the \r
+// invisibly; vt100::Screen deliberately does NOT do this itself (real
+// VT100 semantics: LF moves the cursor down only, CR is separate -- M9b's
+// raw pty byte streams from curses apps need that distinction preserved,
+// since those programs explicitly manage when to emit \r). This bridges
+// the gap only at the Grid sink boundary, leaving both ends correct for
+// what they actually receive.
+fn onlcr(s: &str) -> String {
+    if !s.contains('\n') {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len() + 8);
+    let mut prev = '\0';
+    for c in s.chars() {
+        if c == '\n' && prev != '\r' {
+            out.push('\r');
+        }
+        out.push(c);
+        prev = c;
+    }
+    out
 }
 
 impl OutputSink {
@@ -45,6 +73,7 @@ impl OutputSink {
                 use std::io::Write;
                 let _ = std::io::stdout().write_all(s.as_bytes());
             }
+            OutputSink::Grid(screen) => screen.borrow_mut().feed(onlcr(s).as_bytes()),
         }
     }
 
@@ -54,6 +83,7 @@ impl OutputSink {
                 use std::io::Write;
                 let _ = std::io::stderr().write_all(s.as_bytes());
             }
+            OutputSink::Grid(screen) => screen.borrow_mut().feed(onlcr(s).as_bytes()),
         }
     }
 }
@@ -354,11 +384,8 @@ pub struct Shell {
     // site already passes an explicit cwd -- both wiring this milestone's
     // later multi-session work will need without changing yet again.
     pub cwd: std::path::PathBuf,
-    // See OutputSink's doc comment. Always OutputSink::Real for now --
-    // every session's own output still goes straight to the real
-    // terminal regardless of whether that session is focused, until a
-    // real per-window buffer/grid exists to capture a non-focused one
-    // into instead.
+    // See OutputSink's doc comment: Real until repl.rs flips it to Grid
+    // at promotion time.
     sink: OutputSink,
 }
 
@@ -433,6 +460,14 @@ impl Shell {
 
     pub fn sink_err(&self, s: &str) {
         self.sink.write_err(s);
+    }
+
+    // repl.rs calls this once per session at promotion time (and
+    // immediately for any session created afterward) to redirect that
+    // session's output into its own VT100 grid instead of the real
+    // terminal -- see OutputSink's doc comment.
+    pub fn set_sink_grid(&mut self, screen: Rc<RefCell<vt100::Screen>>) {
+        self.sink = OutputSink::Grid(screen);
     }
 
     // The in-process session-cloning primitive: creates an independent but
@@ -835,7 +870,7 @@ impl Shell {
                 }
             }
             if self.readonly_names.contains(n.as_str()) {
-                write_diagnostic(stderr_target, &format!("bish: unset: {}: cannot unset: readonly variable", n), self.sink);
+                write_diagnostic(stderr_target, &format!("bish: unset: {}: cannot unset: readonly variable", n), self.sink.clone());
                 continue;
             }
             self.arrays.remove(n.as_str());
@@ -4220,7 +4255,7 @@ impl Shell {
     // back to the shell's real stderr when there's no stderr redirect.
     fn write_command_error(&mut self, cmd: &SimpleCommand, msg: &str) {
         let target = self.peek_stderr_target(&cmd.redirects);
-        write_diagnostic(&target, msg, self.sink);
+        write_diagnostic(&target, msg, self.sink.clone());
     }
 
     fn peek_stderr_target(&mut self, redirects: &[Redirect]) -> Option<String> {
@@ -4783,6 +4818,35 @@ fn sigaction_raw(signum: i32, handler: usize) {
     unsafe {
         sigaction(signum, &act, std::ptr::null_mut());
     }
+}
+
+// SIGWINCH (terminal resize) tracking for the M9 compositor. Deliberately
+// a separate flag from PENDING_SIGNALS/traps above, not a `trap`-able
+// signal at all from the user's perspective: PENDING_SIGNALS is consumed
+// wholesale (swapped to 0) by whichever session's run_program happens to
+// call check_pending_signals next, which would silently eat a WINCH
+// notification before repl.rs -- the only thing that actually owns
+// terminal-size-dependent state (every session's Screen, the tab bar) --
+// ever saw it. Same async-signal-safety reasoning as record_pending_signal:
+// the handler only stores a bool.
+pub const SIGWINCH: i32 = 28;
+static WINCH_FLAG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+extern "C" fn record_winch(_sig: i32) {
+    WINCH_FLAG.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+// Called once, at interactive startup, so the compositor loop in repl.rs
+// can later poll take_winch() to notice terminal resizes.
+pub fn install_winch_handler() {
+    sigaction_raw(SIGWINCH, record_winch as *const () as usize);
+}
+
+// True at most once per resize -- clears the flag on read. repl.rs polls
+// this once per REPL loop iteration (see the loop's own doc comment for
+// why that's "per input iteration", not truly asynchronous, in M9a).
+pub fn take_winch() -> bool {
+    WINCH_FLAG.swap(false, std::sync::atomic::Ordering::SeqCst)
 }
 
 // Name <-> number for the signals scripts actually trap. KILL (9) and
