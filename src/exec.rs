@@ -523,6 +523,34 @@ impl Shell {
         self.sink = OutputSink::Grid(screen);
     }
 
+    // How big a freshly-opened pty (run_single's use_pty path) should be
+    // sized before a full-screen program (vim, htop, less, ...) gets to
+    // query it -- otherwise it inherits whatever posix_openpt's kernel
+    // default winsize is (effectively unset), and falls back to some
+    // small hardcoded default of its own, rendering into a tiny corner
+    // of a screen that's visually much bigger. When this session's sink
+    // is already Grid-backed, its own vt100::Screen's size *is* the
+    // right answer: repl.rs keeps that screen resized to exactly this
+    // session's current on-screen area (the whole promoted window, or
+    // its own pane's rect once split -- see snapshot_window), and pty
+    // attachment only ever happens once promoted anyway (see use_pty's
+    // own gate), so this is the common, effectively only, case in
+    // practice. Falls back to a live TIOCGWINSZ query against bish's
+    // own controlling terminal for the (should be unreachable) Real
+    // case, same default-on-failure as repl.rs's own query_term_size.
+    fn pty_size(&self) -> (u16, u16) {
+        match &self.sink {
+            OutputSink::Grid(screen) => {
+                let (rows, cols) = screen.borrow().size();
+                (rows as u16, cols as u16)
+            }
+            OutputSink::Real => match pty::get_size(0) {
+                Ok(ws) if ws.rows > 0 && ws.cols > 0 => (ws.rows, ws.cols),
+                _ => (24, 80),
+            },
+        }
+    }
+
     // The in-process session-cloning primitive: creates an independent but
     // related Shell, the way `window new` creates a virtual session
     // (rather than execing a fresh bish process). Unlike subshells/$(),
@@ -3526,6 +3554,12 @@ impl Shell {
 
         if use_pty {
             if let Ok(p) = pty::open() {
+                // Size the pty to match this session's actual on-screen
+                // area *before* the child ever gets to query it -- see
+                // Shell::pty_size's own doc comment for why an unset
+                // pty otherwise renders a full-screen program tiny.
+                let (rows, cols) = self.pty_size();
+                let _ = p.resize(rows, cols);
                 let slave_path = p.slave_path.clone();
                 return match pty::spawn_attached(command, &slave_path) {
                     Ok(child) => {
