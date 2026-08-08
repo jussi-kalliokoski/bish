@@ -789,6 +789,32 @@ impl Shell {
         self.pending_fg.take().map(FgJob)
     }
 
+    // The pty-attached counterpart to run_single's own inline Stopped-job
+    // registration for the non-pty foreground path: called by repl.rs's
+    // drive_fg_job loop when FgJob::poll_untraced reports the job it was
+    // driving has stopped (Ctrl-Z forwarded into the job's own pty, or an
+    // explicit `kill -STOP`) rather than exited. Unlike that job, this
+    // one was never in the job table at all (it bubbled straight from
+    // spawn to ExecResult::Fg, on the assumption it'd just run and exit
+    // -- see run_single's own comment on why `id: 0` there is a
+    // throwaway placeholder) -- assigns it a real one now that it
+    // actually needs to be `jobs`/`fg`/`bg`-addressable. Returns the id
+    // and cmd_text so the caller can print the bash-style "[N]+  Stopped
+    // ..." message itself (repl.rs owns which session's grid that
+    // belongs in, not this module; Job::cmd_text isn't otherwise
+    // readable from outside it either).
+    pub fn park_stopped_fg_job(&mut self, job: FgJob) -> (u32, String) {
+        let mut job = job.0;
+        job.stopped = true;
+        let mut table = self.jobs.borrow_mut();
+        let id = table.next_job_id;
+        table.next_job_id += 1;
+        job.id = id;
+        let cmd_text = job.cmd_text.clone();
+        table.jobs.push(job);
+        (id, cmd_text)
+    }
+
     // Resumes a Stopped job (Job::stopped) in place, without reclaiming
     // the real terminal for it -- SIGCONT to its process group is enough;
     // it keeps running with whatever stdio it already had (inherited from
@@ -3390,17 +3416,24 @@ impl Shell {
             };
             command.env(k, v);
         }
-        // A background job spawned while promoted, with no redirects of
-        // its own, gets attached to a fresh pty instead of the real
-        // terminal's inherited fds -- see Job::pty_master's doc comment.
-        // That's what lets `fg` (run_fg) later render its output into
-        // the fg-ing window's own grid instead of straight onto whatever
-        // the real screen happens to show (which the compositor's next
-        // redraw would just overwrite anyway). Every other case (not
+        // A job spawned while promoted, with no redirects of its own,
+        // gets attached to a fresh pty instead of the real terminal's
+        // inherited fds -- see Job::pty_master's doc comment. Without
+        // this, its output would go straight onto whatever the real
+        // screen happens to show, which the compositor's next redraw
+        // (driven only by what's actually captured in the session's
+        // grid) would just silently overwrite -- confirmed as a real,
+        // easy-to-hit bug: *any* promoted foreground external command
+        // (most commands -- echo/pwd/ls/... aren't builtins) had its
+        // output vanish this way before this covered the foreground
+        // case too, not just background. Every other case (not
         // promoted, or explicitly redirected) keeps today's inherited-
-        // stdio behavior exactly.
-        let use_pty = background
-            && self.is_promoted()
+        // stdio behavior exactly -- including a *non*-promoted
+        // foreground command, which gets M11's real-job-control
+        // tcsetpgrp/waitpid_untraced treatment further below instead;
+        // there's no compositor to interfere with there, so a pty would
+        // just be unnecessary overhead.
+        let use_pty = self.is_promoted()
             && redirs.stdin.is_none()
             && redirs.stdout.is_none()
             && redirs.stderr.is_none()
@@ -3416,8 +3449,34 @@ impl Shell {
                             cmd_text.push(' ');
                             cmd_text.push_str(&crate::serialize::serialize_redirect(r));
                         }
-                        self.push_job_with_pty(vec![child], cmd_text, Some(p.master));
-                        ExecResult::Status(0)
+                        if background {
+                            self.push_job_with_pty(vec![child], cmd_text, Some(p.master));
+                            ExecResult::Status(0)
+                        } else {
+                            // Foreground: bubble up exactly like a
+                            // backgrounded-then-explicitly-`fg`'d pty job
+                            // does (see ExecResult::Fg's doc comment) --
+                            // repl.rs's drive_fg_job already handles
+                            // rendering into the grid and forwarding
+                            // stdin (Ctrl-C/Ctrl-Z included -- see
+                            // FgJob::poll_untraced for why a Ctrl-Z here
+                            // is correctly caught as a real stop, not
+                            // silently ignored). `id: 0` is a throwaway
+                            // placeholder: this job only needs a real
+                            // job-table id if it ends up Stopped (see
+                            // Shell::park_stopped_fg_job), not just to
+                            // run and exit normally.
+                            self.pending_fg = Some(Job {
+                                id: 0,
+                                pids: vec![child.id()],
+                                children: vec![child],
+                                cmd_text,
+                                pty_master: Some(p.master),
+                                pgid: None,
+                                stopped: false,
+                            });
+                            ExecResult::Fg
+                        }
                     }
                     Err(e) => {
                         sh_eprintln!(self, "bish: {}: {}", name, e);
@@ -4970,11 +5029,16 @@ impl Job {
 // while still letting repl.rs hold and drive one.
 pub struct FgJob(Job);
 
-impl FgJob {
-    pub fn poll(&mut self) -> Option<i32> {
-        self.0.poll()
-    }
+// How FgJob::poll_untraced found the job. Named distinctly from the
+// module-private JobWaitOutcome (same shape) since this one crosses the
+// module boundary into repl.rs's public API surface.
+pub enum FgWait {
+    Running,
+    Exited(i32),
+    Stopped,
+}
 
+impl FgJob {
     pub fn wait(&mut self) -> i32 {
         self.0.wait()
     }
@@ -4984,6 +5048,66 @@ impl FgJob {
     // function's own pty_master check).
     pub fn pty_master(&mut self) -> &mut std::fs::File {
         self.0.pty_master.as_mut().expect("FgJob always has a pty_master")
+    }
+
+    // Explicitly signals this job to stop, rather than relying on
+    // forwarding a raw Ctrl-Z byte into its pty and letting ISIG
+    // generate SIGTSTP the way SIGINT/Ctrl-C already does. That natural
+    // path doesn't work here: pty::spawn_attached's pre_exec makes the
+    // job its own session leader (setsid -- required for TIOCSCTTY to
+    // succeed at all, so the pty can be its controlling terminal), which
+    // means its process group is *orphaned* relative to bish's own
+    // session (its parent isn't a member of that new session). Confirmed
+    // empirically (not just from the spec): a job in this state doesn't
+    // stop for a *default-disposition* SIGTSTP no matter how it's sent
+    // -- forwarded through the pty (ISIG), or even an unrelated `kill
+    // -TSTP` from a completely separate shell outside bish entirely all
+    // silently do nothing, while `kill -STOP` on the exact same process
+    // stops it immediately. That's the real rule (broader than "only
+    // line-discipline-generated stop signals get discarded" -- it's
+    // POSIX/Linux discarding *any* uncaught SIGTSTP/SIGTTIN/SIGTTOU
+    // delivery to an orphaned group, regardless of source), and it's
+    // exactly why Ctrl-C already worked here (SIGINT isn't subject to
+    // it) while Ctrl-Z silently didn't. SIGSTOP sidesteps this --
+    // uncatchable, so the same orphan-discard doesn't apply -- at the
+    // cost of not giving a job with its own SIGTSTP handler (a
+    // full-screen program like vim/less, saving/restoring terminal
+    // state around a stop) any chance to run it first. Accepted
+    // trade-off: every job spawned via run_single's simple-external-
+    // command path (the only thing that reaches this pty-attachment
+    // mechanism at all) is orphaned this same way, so there's no way to
+    // reach a job with such a handler AND deliver a real SIGTSTP to it
+    // in this architecture regardless.
+    pub fn send_stop(&mut self) {
+        if let Some(&pid) = self.0.pids.first() {
+            send_signal_to_pgrp(pid, SIGSTOP);
+        }
+    }
+
+    // Non-blocking, WUNTRACED-aware poll -- unlike the plain Job::poll
+    // (which wraps Child::try_wait and can never observe anything but
+    // exited/still-running), this can tell repl.rs's drive_fg_job that
+    // the job has *stopped* (Ctrl-Z forwarded into its own pty, or an
+    // explicit `kill -STOP`) instead of leaving it looking like it's
+    // still running forever -- the same M11 gap Job::poll has for the
+    // non-pty foreground path, fixed here for the pty-attached one.
+    pub fn poll_untraced(&mut self) -> FgWait {
+        let pid = self.0.pids[0];
+        let mut status: i32 = 0;
+        let r = unsafe { waitpid(pid as i32, &mut status, WNOHANG | WUNTRACED) };
+        if r == 0 {
+            return FgWait::Running;
+        }
+        if r < 0 {
+            return FgWait::Exited(1);
+        }
+        if wait_status_stopped(status) {
+            return FgWait::Stopped;
+        }
+        if wait_status_signaled(status) {
+            return FgWait::Exited(128 + wait_status_term_sig(status));
+        }
+        FgWait::Exited(wait_status_exit_code(status))
     }
 }
 
@@ -5280,6 +5404,9 @@ fn send_signal_to_pgrp(pgid: u32, sig: i32) -> bool {
 // stopped) from `fg`/`bg`. Linux/glibc's standard number, same "safe to
 // hardcode" reasoning as this file's other signal constants.
 const SIGCONT: i32 = 18;
+// SIGSTOP: used by FgJob::send_stop instead of SIGTSTP -- see its own
+// doc comment for why the catchable version doesn't reliably work here.
+const SIGSTOP: i32 = 19;
 
 unsafe extern "C" {
     fn setpgid(pid: i32, pgid: i32) -> i32;
@@ -5294,6 +5421,10 @@ unsafe extern "C" {
 // tell "stopped" apart from "still running" and "exited", hence this
 // raw waitpid wrapper instead.
 const WUNTRACED: i32 = 2;
+// WNOHANG: don't block if the child hasn't changed state -- used by
+// FgJob::poll_untraced, which (unlike waitpid_untraced) is a per-tick
+// poll, not a wait.
+const WNOHANG: i32 = 1;
 
 // How a real-job-control wait (waitpid_untraced) ended.
 enum JobWaitOutcome {

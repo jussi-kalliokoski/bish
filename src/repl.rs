@@ -504,6 +504,20 @@ fn run_fg_job_frame(
                 term_cols,
             );
         }
+        FgOutcome::Stopped => {
+            // Unlike Detached, this job doesn't go back into job_frames
+            // -- it's no longer "a window's live top frame," it's a
+            // genuine Stopped job now, addressable via jobs/fg/bg like
+            // any other (see Shell::park_stopped_fg_job).
+            windows[*current_window].stack.pop();
+            let session = sessions.get_mut(&session_id).unwrap();
+            let (id, cmd_text) = session.shell.park_stopped_fg_job(job);
+            session.shell.sink_err(&format!("\n[{}]+  Stopped                 {}\n", id, cmd_text));
+            session.shell.last_status = 148;
+            if *sinks_are_grid {
+                compositor_redraw(sessions, windows, *current_window, term_rows, term_cols);
+            }
+        }
     }
 }
 
@@ -651,6 +665,13 @@ enum FgOutcome {
     // fall into command mode so `window next`/`previous` can switch away
     // from it while it keeps running in the background).
     Detached,
+    // The job stopped (M11b: a forwarded Ctrl-Z reached its own pty's
+    // line discipline, or an explicit `kill -STOP`) rather than exiting.
+    // Unlike Detached, the caller needs to do real bookkeeping here --
+    // see run_fg_job_frame's own handling -- since this job is no longer
+    // "the thing this window is actively watching," it's a genuine
+    // Stopped job now (exec.rs's Shell::park_stopped_fg_job).
+    Stopped,
 }
 
 // Drives a job pushed as a Frame::Job: reads its pty master and feeds
@@ -698,10 +719,18 @@ fn drive_fg_job(job: &mut exec::FgJob, screen: &Rc<RefCell<vt100::Screen>>, mut 
     // guarantees this loop always comes back around.
     const MAX_READS_PER_TICK: u32 = 16;
     let outcome = loop {
-        if let Some(status) = job.poll() {
-            break FgOutcome::Exited(status);
-        }
-
+        // Drain *before* checking whether the job has ended -- a fast,
+        // freshly-spawned foreground command (M11b: `echo`, `pwd`, ...
+        // aren't builtins, so they hit this exact path now, not just a
+        // job that was already backgrounded for a while before being
+        // fg'd) can write its entire output and exit within microseconds
+        // of being spawned. Checking poll_untraced first would let this
+        // loop break on the very first iteration, before ever draining
+        // the pty -- discarding output that's already sitting in the
+        // kernel's pty buffer, silently. Draining first (every
+        // iteration, not just once) means that buffer always gets a
+        // chance to be read before this loop can decide to stop,
+        // regardless of how fast the job finishes.
         let mut made_progress = false;
         for _ in 0..MAX_READS_PER_TICK {
             match job.pty_master().read(&mut buf) {
@@ -718,6 +747,12 @@ fn drive_fg_job(job: &mut exec::FgJob, screen: &Rc<RefCell<vt100::Screen>>, mut 
             redraw();
         }
 
+        match job.poll_untraced() {
+            exec::FgWait::Exited(status) => break FgOutcome::Exited(status),
+            exec::FgWait::Stopped => break FgOutcome::Stopped,
+            exec::FgWait::Running => {}
+        }
+
         // Short poll timeout: paces this loop (avoiding a CPU-spinning
         // busy-wait) while staying responsive to both new job output and
         // new keystrokes.
@@ -727,6 +762,18 @@ fn drive_fg_job(job: &mut exec::FgJob, screen: &Rc<RefCell<vt100::Screen>>, mut 
             if n > 0 {
                 if n == 1 && buf[0] == 0 {
                     break FgOutcome::Detached;
+                }
+                // Ctrl-Z (0x1a): explicitly signaled rather than
+                // forwarded -- see FgJob::send_stop's doc comment for
+                // why the natural "just forward the byte, let the job's
+                // own pty generate SIGTSTP" trick that works for Ctrl-C
+                // doesn't work here. Not forwarded as a literal byte
+                // either: a real terminal wouldn't hand VSUSP through to
+                // the program's stdin as data, only deliver the signal
+                // it causes.
+                if n == 1 && buf[0] == 0x1a {
+                    job.send_stop();
+                    continue;
                 }
                 let _ = job.pty_master().write_all(&buf[..n as usize]);
             } else {
@@ -780,10 +827,20 @@ fn service_background_jobs(
                 Err(_) => break,
             }
         }
-        if let Some(status) = job.poll() {
-            windows[i].stack.pop();
-            job_frames.remove(&job_frame_id);
-            sessions.get_mut(&sid).unwrap().shell.last_status = status;
+        match job.poll_untraced() {
+            exec::FgWait::Exited(status) => {
+                windows[i].stack.pop();
+                job_frames.remove(&job_frame_id);
+                sessions.get_mut(&sid).unwrap().shell.last_status = status;
+            }
+            exec::FgWait::Stopped => {
+                windows[i].stack.pop();
+                let job = job_frames.remove(&job_frame_id).unwrap();
+                let (id, cmd_text) = sessions.get_mut(&sid).unwrap().shell.park_stopped_fg_job(job);
+                sessions[&sid].shell.sink_err(&format!("\n[{}]+  Stopped                 {}\n", id, cmd_text));
+                sessions.get_mut(&sid).unwrap().shell.last_status = 148;
+            }
+            exec::FgWait::Running => {}
         }
     }
 }
