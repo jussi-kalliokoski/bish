@@ -12,6 +12,7 @@ mod regex;
 mod repl;
 mod serialize;
 mod term;
+mod vt100;
 
 use std::io::{IsTerminal, Read};
 
