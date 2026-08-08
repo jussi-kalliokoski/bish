@@ -1340,8 +1340,18 @@ impl Shell {
             Some("previous") | Some("prev") | Some("p") => ExecResult::Window(WindowAction::Previous),
             Some("new") | Some("c") | Some("create") => ExecResult::Window(WindowAction::New),
             Some("close") | Some("q") | Some("quit") => ExecResult::Window(WindowAction::Close),
-            Some("split") | Some("s") => ExecResult::Window(WindowAction::Split { horizontal: true }),
-            Some("vsplit") | Some("v") => ExecResult::Window(WindowAction::Split { horizontal: false }),
+            // WindowAction::Split's own `horizontal` names the divider
+            // LINE's orientation (true = a horizontal dividing line,
+            // panes stacked top/bottom), matching vim's :split/:vsplit
+            // convention. Users read "vertical"/"horizontal" by the
+            // panes' own arrangement axis instead (stacked = panes
+            // arranged *vertically*, side by side = arranged
+            // *horizontally*) -- the opposite pairing -- so `split`/`s`
+            // maps to horizontal:false (side by side) and `vsplit`/`v`
+            // to horizontal:true (stacked), even though that looks
+            // inverted next to the field's own name.
+            Some("split") | Some("s") => ExecResult::Window(WindowAction::Split { horizontal: false }),
+            Some("vsplit") | Some("v") => ExecResult::Window(WindowAction::Split { horizontal: true }),
             Some("h") | Some("left") => ExecResult::Window(WindowAction::FocusPane(PaneDirection::Left)),
             Some("j") | Some("below") => ExecResult::Window(WindowAction::FocusPane(PaneDirection::Down)),
             Some("k") | Some("above") => ExecResult::Window(WindowAction::FocusPane(PaneDirection::Up)),

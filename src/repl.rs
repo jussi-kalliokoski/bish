@@ -941,10 +941,19 @@ fn split_focused_pane(
 // deliberately omits that other feed's trailing "\r\n", so the frozen
 // grid's cursor lands right after the prompt text, matching a genuinely
 // idle prompt waiting for input rather than one that just finished a
-// line.
+// line. Leading "\r\x1b[K": a pane can lose focus more than once over
+// its lifetime (e.g. `window k` then later `window j` back), and each
+// time this runs the grid's cursor is still sitting wherever the
+// *previous* freeze (or submitted line) left it -- without returning
+// to this row's start and clearing first, a second freeze would append
+// another copy of the prompt right after the first instead of
+// overwriting it, showing the same pane's prompt twice once focus
+// returns there. Same reasoning, and the same "safe here, not for the
+// real terminal" caveat, as the Line-outcome handler's own echo fix.
 fn freeze_idle_prompt(session: &mut SessionState) {
     let prompt_str = if session.buffer.is_empty() { prompt::render(&session.shell) } else { prompt::continuation() };
-    session.screen.borrow_mut().feed(prompt_str.as_bytes());
+    let framed = format!("\r\x1b[K{}", prompt_str);
+    session.screen.borrow_mut().feed(framed.as_bytes());
 }
 
 // Finds `target`'s Leaf within the tree and turns it into a 2-way
