@@ -112,12 +112,16 @@ pub fn run(shell: Shell) {
 
         let session_id = windows[current_window].session;
         let boundary = sessions[&session_id].history_boundary;
-        let prompt_str = {
+        let (prompt_str, armed_prompt_str) = {
             let session = &sessions[&session_id];
-            if session.buffer.is_empty() { prompt::render(&session.shell) } else { prompt::continuation() }
+            if session.buffer.is_empty() {
+                (prompt::render(&session.shell), prompt::render_command_armed(&session.shell))
+            } else {
+                (prompt::continuation(), prompt::continuation_armed())
+            }
         };
 
-        match editor::read_line(&prompt_str, &history, boundary) {
+        match editor::read_line(&prompt_str, &armed_prompt_str, &history, boundary) {
             Ok(ReadOutcome::Eof) => {
                 let session = sessions.get_mut(&session_id).unwrap();
                 if !session.buffer.is_empty() {
@@ -517,7 +521,11 @@ fn run_command_mode(shell: &mut Shell, history: &mut History) -> Option<WindowAc
     loop {
         let prompt_str = if buffer.is_empty() { ": ".to_string() } else { prompt::continuation() };
 
-        match editor::read_line(&prompt_str, history, 0) {
+        // Already fully inside command mode, so there's nothing
+        // meaningful to swap to if the ':'-arming mechanic re-triggers
+        // here (see editor::read_line's doc comment) -- same string for
+        // both, making it visually a no-op.
+        match editor::read_line(&prompt_str, &prompt_str, history, 0) {
             Ok(ReadOutcome::Eof) | Ok(ReadOutcome::Interrupted) => return None,
             // ':' at an empty command-mode prompt too -- nothing to switch
             // to, just stay here.

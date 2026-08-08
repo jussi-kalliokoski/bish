@@ -5134,8 +5134,10 @@ fn send_signal(pid: u32, sig: i32) -> bool {
 // $HOSTNAME: bash populates this at startup from uname(); Linux exposes
 // the same value via this proc file, which avoids yet another raw
 // syscall. Falls back to the HOSTNAME env var (some environments export
-// it already) and then to empty.
-fn get_hostname() -> String {
+// it already) and then to empty. pub: prompt.rs reuses this for the
+// "user@host" segment of the default prompt rather than duplicating the
+// lookup.
+pub fn get_hostname() -> String {
     if let Ok(s) = std::fs::read_to_string("/proc/sys/kernel/hostname") {
         return s.trim_end().to_string();
     }

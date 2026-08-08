@@ -282,7 +282,14 @@ pub enum ReadOutcome {
 // History's doc comment): Up/Down here never browse past it, so a session
 // only ever sees its own commands plus whatever's been recorded (by any
 // session sharing the same History) from its creation point forward.
-pub fn read_line(prompt: &str, history: &History, history_boundary: usize) -> io::Result<ReadOutcome> {
+// `armed_prompt` is shown in place of `prompt` while a virtual, not-yet-
+// materialized command-mode colon is armed (see the arming block below);
+// callers that render a full prompt (repl.rs's prompt::render/
+// render_command_armed) pass the matching pair, and callers with nothing
+// meaningful to swap to (e.g. command mode's own nested read_line, which
+// is already fully inside command mode) can just pass the same string
+// twice.
+pub fn read_line(prompt: &str, armed_prompt: &str, history: &History, history_boundary: usize) -> io::Result<ReadOutcome> {
     let mut guard = Some(term::RawGuard::enable(0)?);
     let mut ed = LineEditor::new();
 
@@ -294,6 +301,20 @@ pub fn read_line(prompt: &str, history: &History, history_boundary: usize) -> io
     // shown entry as ordinary buffer text and ends the browse, matching
     // fish: the suggestion just becomes your input from that point on.
     let mut browse: Option<(String, usize)> = None;
+
+    // ':' at an empty, unarmed buffer arms this instead of inserting a
+    // character or immediately switching modes: the prompt swaps to
+    // armed_prompt (its command-mode terminator) while the buffer itself
+    // stays untouched. What happens next depends entirely on the very
+    // next key (see the two blocks below that reference this flag) --
+    // Enter commits to real command mode, Backspace/Ctrl-C/Ctrl-D cancel
+    // back to plain shell mode, and anything else materializes the colon
+    // as a real character first (so `: some comment` still works as an
+    // ordinary shell-mode command). Matches plan.md's "Future
+    // improvements" note: entering command mode should read as the
+    // prompt itself changing, not as a character being typed, and should
+    // be reversible via Backspace before it's committed.
+    let mut cmd_mode_armed = false;
 
     print!("{}", prompt);
     io::stdout().flush()?;
@@ -309,6 +330,42 @@ pub fn read_line(prompt: &str, history: &History, history_boundary: usize) -> io
         if !matches!(key, Key::Up | Key::Down | Key::Escape) {
             browse = None;
         }
+
+        if key == Key::Char(':') && ed.buf.is_empty() && !cmd_mode_armed {
+            cmd_mode_armed = true;
+            redraw(armed_prompt, &ed)?;
+            continue;
+        }
+        if cmd_mode_armed {
+            match key {
+                // The normal way to actually enter command mode: same
+                // final outcome as this crate's original instant-trigger
+                // design, just reached one keystroke later so a change
+                // of mind (Backspace, below) can cancel it first.
+                Key::Enter => {
+                    drop(guard.take());
+                    print!("\r\n");
+                    io::stdout().flush()?;
+                    return Ok(ReadOutcome::CommandMode);
+                }
+                // Cancel: back to an ordinary empty shell-mode buffer.
+                // Backspace falls through to its own arm below, which is
+                // a harmless no-op on an already-empty buffer.
+                Key::Backspace | Key::CtrlC | Key::CtrlD => {
+                    cmd_mode_armed = false;
+                }
+                // Anything else: the user is typing a real command that
+                // happens to start with ':' (e.g. the `:` no-op builtin,
+                // `: some comment text`) -- materialize the virtual
+                // colon as a real character first, then let this key get
+                // handled completely normally below.
+                _ => {
+                    ed.insert(':');
+                    cmd_mode_armed = false;
+                }
+            }
+        }
+
         match key {
             Key::Enter => {
                 drop(guard.take());
@@ -340,8 +397,29 @@ pub fn read_line(prompt: &str, history: &History, history_boundary: usize) -> io
                 term::suspend_self();
                 guard = Some(term::RawGuard::enable(0)?);
             }
-            Key::Backspace => ed.backspace(),
-            Key::Delete => ed.delete_forward(),
+            // Deleting back down to a single leading ':' re-arms command
+            // mode -- the direct reverse of typing ':' then a space to
+            // materialize it (see plan.md's note: "deleting the space
+            // would set the user back in command mode"). Scoped
+            // narrowly to Backspace/Delete (the two "remove one
+            // character" keys), not every possible way to reach that
+            // buffer state (Ctrl-U, Ctrl-W, history recall).
+            Key::Backspace => {
+                ed.backspace();
+                if ed.buf == [':'] {
+                    ed.buf.clear();
+                    ed.cursor = 0;
+                    cmd_mode_armed = true;
+                }
+            }
+            Key::Delete => {
+                ed.delete_forward();
+                if ed.buf == [':'] {
+                    ed.buf.clear();
+                    ed.cursor = 0;
+                    cmd_mode_armed = true;
+                }
+            }
             Key::Left | Key::CtrlB => ed.move_left(),
             Key::Right | Key::CtrlF => ed.move_right(),
             Key::Home | Key::CtrlA => ed.cursor = 0,
@@ -350,12 +428,6 @@ pub fn read_line(prompt: &str, history: &History, history_boundary: usize) -> io
             Key::CtrlU => ed.kill_to_start(),
             Key::CtrlW => ed.kill_word_backward(),
             Key::CtrlL => print!("\x1b[H\x1b[2J"),
-            Key::Char(':') if ed.buf.is_empty() => {
-                drop(guard.take());
-                print!("\r\n");
-                io::stdout().flush()?;
-                return Ok(ReadOutcome::CommandMode);
-            }
             Key::Char(c) => ed.insert(c),
             Key::Up => {
                 let prefix = browse.as_ref().map(|(p, _)| p.clone()).unwrap_or_else(|| ed.as_string());
@@ -383,6 +455,6 @@ pub fn read_line(prompt: &str, history: &History, history_boundary: usize) -> io
             }
             Key::Unknown => {}
         }
-        redraw(prompt, &ed)?;
+        redraw(if cmd_mode_armed { armed_prompt } else { prompt }, &ed)?;
     }
 }

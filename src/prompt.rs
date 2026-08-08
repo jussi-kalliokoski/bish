@@ -1,31 +1,62 @@
-// Default interactive prompt, styled after fish's: the cwd with parent
-// components abbreviated to their first character and the final component
-// spelled out in full (e.g. "~/D/P/bish"), colored, with the prompt glyph
-// reflecting the last command's exit status. No git-branch segment yet --
-// there's no git integration in bish at all so far.
+// Default interactive prompt: "user@host:path_abbr <terminator> ", where
+// path_abbr abbreviates parent path components to their first character,
+// spelling out only the final one (e.g. "~/D/P/bish"), and the
+// terminator glyph is "~" for a normal user, "#" for root, or ":" while
+// editor.rs's read_line has a virtual, not-yet-materialized command-mode
+// colon armed (see render_command_armed and editor.rs's read_line for
+// the reversible-entry mechanic this exists to support -- plan.md's
+// "Future improvements" note on making command-mode entry a virtual
+// character instead of literal inserted text). No git-branch segment
+// yet -- there's no git integration in bish at all so far.
 
-use crate::exec::Shell;
+use crate::exec::{self, Shell};
 
 unsafe extern "C" {
     fn geteuid() -> u32;
 }
 
 const RESET: &str = "\x1b[0m";
+const USER_HOST_COLOR: &str = "\x1b[1;32m"; // bold green
+const ROOT_USER_HOST_COLOR: &str = "\x1b[1;31m"; // bold red, a deliberate warning color
 const PATH_COLOR: &str = "\x1b[1;36m"; // bold cyan
-const ROOT_PATH_COLOR: &str = "\x1b[1;31m"; // bold red, a deliberate warning color
+const ROOT_PATH_COLOR: &str = "\x1b[1;31m"; // bold red
 const OK_COLOR: &str = "\x1b[1;32m"; // bold green
 const ERR_COLOR: &str = "\x1b[1;31m"; // bold red
+// Deliberately distinct from both terminator colors above, so the armed/
+// command-mode state reads as "a different mode," not just a recolored
+// version of the normal prompt.
+const CMD_MODE_COLOR: &str = "\x1b[1;35m"; // bold magenta
 
-pub fn render(shell: &Shell) -> String {
+fn username() -> String {
+    std::env::var("USER").or_else(|_| std::env::var("LOGNAME")).unwrap_or_else(|_| "user".to_string())
+}
+
+// Everything before the terminator glyph -- shared by render and
+// render_command_armed so the two variants editor.rs alternates between
+// while a colon is armed never visually diverge except in that one
+// glyph.
+fn prefix(shell: &Shell, is_root: bool) -> String {
     let home = std::env::var("HOME").unwrap_or_default();
     let display = shorten_path(&shell.cwd.to_string_lossy(), &home);
-
-    let is_root = unsafe { geteuid() } == 0;
+    let uh_color = if is_root { ROOT_USER_HOST_COLOR } else { USER_HOST_COLOR };
     let path_color = if is_root { ROOT_PATH_COLOR } else { PATH_COLOR };
-    let glyph_color = if shell.last_status == 0 { OK_COLOR } else { ERR_COLOR };
-    let glyph = if is_root { "#" } else { "\u{276f}" }; // ❯
+    format!("{uh_color}{}@{}{RESET}:{path_color}{display}{RESET} ", username(), exec::get_hostname())
+}
 
-    format!("{path_color}{display}{RESET} {glyph_color}{glyph}{RESET} ")
+pub fn render(shell: &Shell) -> String {
+    let is_root = unsafe { geteuid() } == 0;
+    let glyph_color = if shell.last_status == 0 { OK_COLOR } else { ERR_COLOR };
+    let glyph = if is_root { "#" } else { "~" };
+    format!("{}{glyph_color}{glyph}{RESET} ", prefix(shell, is_root))
+}
+
+// Shown in place of render()'s output while a virtual command-mode colon
+// is armed (see editor.rs's read_line): same prefix, only the terminator
+// glyph and its color change, so entering command mode reads as "the
+// prompt itself changed," not as if a character had been typed.
+pub fn render_command_armed(shell: &Shell) -> String {
+    let is_root = unsafe { geteuid() } == 0;
+    format!("{}{CMD_MODE_COLOR}:{RESET} ", prefix(shell, is_root))
 }
 
 // Continuation-line prompt for an unfinished multi-line construct (open
@@ -33,6 +64,12 @@ pub fn render(shell: &Shell) -> String {
 // the full cwd prompt.
 pub fn continuation() -> String {
     "\x1b[2m…\x1b[0m ".to_string()
+}
+
+// Armed variant of continuation(), for the same reason render_command_
+// armed exists alongside render().
+pub fn continuation_armed() -> String {
+    format!("{CMD_MODE_COLOR}:{RESET} ")
 }
 
 fn shorten_path(cwd: &str, home: &str) -> String {
