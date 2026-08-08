@@ -1082,10 +1082,17 @@ fn sgr_codes(fg: vt100::Color, bg: vt100::Color, attrs: vt100::CellAttrs) -> Str
 // bar without holding a live borrow of `sessions` for its whole poll
 // loop (see that call site's comment for why it can't).
 fn tab_bar_snapshot(sessions: &HashMap<SessionId, SessionState>, windows: &[WindowEntry], current_window: usize) -> Vec<(u32, bool, String)> {
+    // Same abbreviation the prompt itself uses (~-substitution, parent
+    // components shortened to their first character) -- computed once
+    // per redraw rather than per window, since it only depends on $HOME.
+    let home = std::env::var("HOME").unwrap_or_default();
     windows
         .iter()
         .enumerate()
-        .map(|(i, w)| (w.id, i == current_window, sessions[&w.owning_session()].shell.cwd.display().to_string()))
+        .map(|(i, w)| {
+            let cwd = sessions[&w.owning_session()].shell.cwd.to_string_lossy();
+            (w.id, i == current_window, prompt::shorten_path(&cwd, &home))
+        })
         .collect()
 }
 

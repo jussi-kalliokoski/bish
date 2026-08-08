@@ -73,7 +73,11 @@ pub fn continuation_armed() -> String {
     format!("{CMD_MODE_COLOR}:{RESET} ")
 }
 
-fn shorten_path(cwd: &str, home: &str) -> String {
+// pub: repl.rs's tab bar reuses this directly (see its own tab_bar_
+// snapshot) so a window's path there always reads exactly like the
+// prompt's own -- same abbreviation, same "~" home substitution --
+// rather than showing the full, unshortened path.
+pub fn shorten_path(cwd: &str, home: &str) -> String {
     let (base, rest) = if !home.is_empty() && (cwd == home || cwd.starts_with(&format!("{home}/"))) {
         ("~".to_string(), cwd[home.len()..].trim_start_matches('/').to_string())
     } else {
