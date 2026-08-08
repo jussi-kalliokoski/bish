@@ -600,6 +600,17 @@ impl Shell {
         crate::term::ignore_tty_signals();
     }
 
+    // repl.rs's EOF handler uses this to decide whether to warn ("There
+    // are stopped jobs.") instead of exiting outright -- matching real
+    // bash's own behavior of refusing a plain Ctrl-D exit the first time
+    // there's a stopped job, requiring a second immediate EOF to
+    // actually confirm. Deliberately checks *stopped* jobs only, not
+    // merely-running background ones: real bash doesn't warn about
+    // those on exit either (by default, without huponexit even).
+    pub fn has_stopped_jobs(&self) -> bool {
+        self.jobs.borrow().jobs.iter().any(|j| j.stopped)
+    }
+
     // Resolves a job spec (%N, %%/%+  current, %-  previous, %name  prefix
     // match on the job's command text) to an index into self.jobs. Bare
     // job numbers without the `%` are also accepted, matching bash's own

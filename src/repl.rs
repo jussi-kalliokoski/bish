@@ -29,6 +29,13 @@ struct SessionState {
     buffer: String,
     history_boundary: usize,
     screen: Rc<RefCell<vt100::Screen>>,
+    // Set once EOF has already warned this session about stopped jobs
+    // (see the ReadOutcome::Eof handler) without actually exiting --
+    // cleared the moment a real command runs, so a *second*, immediate
+    // Ctrl-D confirms the exit the same way real bash's "There are
+    // stopped jobs." + a second EOF does, while typing anything else
+    // first re-arms the warning.
+    warned_stopped_jobs: bool,
 }
 
 type JobFrameId = u32;
@@ -143,7 +150,7 @@ pub fn run(mut shell: Shell) {
 
     let mut sessions: HashMap<SessionId, SessionState> = HashMap::new();
     let root_screen = Rc::new(RefCell::new(vt100::Screen::new(content_rows(term_rows), term_cols)));
-    sessions.insert(0, SessionState { shell, buffer: String::new(), history_boundary: 0, screen: root_screen });
+    sessions.insert(0, SessionState { shell, buffer: String::new(), history_boundary: 0, screen: root_screen, warned_stopped_jobs: false });
     let mut windows: Vec<WindowEntry> = vec![WindowEntry { id: 0, stack: vec![Frame::Session(0)] }];
     let mut current_window: usize = 0;
     let mut next_session_id: SessionId = 1;
@@ -234,6 +241,29 @@ pub fn run(mut shell: Shell) {
                 // fire the exit trap for a session that's still alive
                 // and reachable elsewhere.
                 let will_orphan = !session_referenced_elsewhere(&windows, current_window, session_id);
+                let is_final_exit = will_orphan && windows.len() == 1 && windows[current_window].stack.len() == 1;
+                // Real bash refuses a plain Ctrl-D exit the first time
+                // there's a stopped job ("There are stopped jobs."),
+                // requiring a second immediate EOF to actually confirm
+                // -- see Shell::has_stopped_jobs and
+                // SessionState::warned_stopped_jobs' own doc comments.
+                // Scoped to the genuine "about to exit the whole
+                // process" case: closing one window/frame among several
+                // doesn't lose track of any job (the table's shared
+                // across every session -- see the `jobs` field comment
+                // in exec.rs), so there's nothing to warn about there.
+                if is_final_exit {
+                    let session = sessions.get_mut(&session_id).unwrap();
+                    if session.buffer.is_empty() && session.shell.has_stopped_jobs() && !session.warned_stopped_jobs {
+                        session.shell.sink_err("bish: There are stopped jobs.\n");
+                        session.warned_stopped_jobs = true;
+                        if sinks_are_grid {
+                            compositor_redraw(&sessions, &windows, current_window, term_rows, term_cols);
+                        }
+                        let _ = io::stdout().flush();
+                        continue;
+                    }
+                }
                 let session = sessions.get_mut(&session_id).unwrap();
                 if !session.buffer.is_empty() {
                     session.shell.sink_err("bish: syntax error: unexpected end of input\n");
@@ -241,7 +271,7 @@ pub fn run(mut shell: Shell) {
                 if will_orphan {
                     session.shell.run_exit_trap();
                 }
-                if windows.len() == 1 && windows[current_window].stack.len() == 1 {
+                if is_final_exit {
                     // Last window, last frame anywhere: really exit.
                     // Restore the normal screen buffer if promotion ever
                     // switched us to the alternate one -- exiting every
@@ -277,7 +307,11 @@ pub fn run(mut shell: Shell) {
             Ok(ReadOutcome::Interrupted) => {
                 // Ctrl-C abandons whatever multi-line construct was
                 // pending, same as bash, and starts fresh at a new prompt.
-                sessions.get_mut(&session_id).unwrap().buffer.clear();
+                let session = sessions.get_mut(&session_id).unwrap();
+                session.buffer.clear();
+                // Same re-arming as a real Line -- Ctrl-C isn't an
+                // immediate repeated Ctrl-D either.
+                session.warned_stopped_jobs = false;
             }
             Ok(ReadOutcome::CommandMode(pending)) => {
                 handle_command_mode(
@@ -300,6 +334,11 @@ pub fn run(mut shell: Shell) {
                 let mut fg_pending = false;
                 {
                     let session = sessions.get_mut(&session_id).unwrap();
+                    // Any real input -- even a blank Enter -- re-arms the
+                    // stopped-jobs exit warning: only an *immediate*
+                    // second Ctrl-D, with nothing typed in between,
+                    // should confirm the exit (see the Eof handler).
+                    session.warned_stopped_jobs = false;
                     if !session.buffer.is_empty() {
                         session.buffer.push('\n');
                     }
@@ -571,7 +610,7 @@ fn apply_window_action(
             child_shell.set_sink_grid(screen.clone());
             let sid = *next_session_id;
             *next_session_id += 1;
-            sessions.insert(sid, SessionState { shell: child_shell, buffer: String::new(), history_boundary: history.boundary(), screen });
+            sessions.insert(sid, SessionState { shell: child_shell, buffer: String::new(), history_boundary: history.boundary(), screen, warned_stopped_jobs: false });
             let wid = *next_window_id;
             *next_window_id += 1;
             windows.push(WindowEntry { id: wid, stack: vec![Frame::Session(sid)] });
