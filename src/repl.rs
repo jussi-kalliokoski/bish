@@ -121,7 +121,7 @@ pub fn run(shell: Shell) {
             }
         };
 
-        match editor::read_line(&prompt_str, &armed_prompt_str, &history, boundary) {
+        match editor::read_line(&prompt_str, &armed_prompt_str, &history, boundary, false) {
             Ok(ReadOutcome::Eof) => {
                 let session = sessions.get_mut(&session_id).unwrap();
                 if !session.buffer.is_empty() {
@@ -511,11 +511,15 @@ fn is_incomplete(err: &str) -> bool {
 // editor.rs's ReadOutcome::CommandMode). Has its own history, separate
 // from the shell's, and only ever runs builtins directly -- `command NAME`
 // is the escape hatch for externals (see restrict_to_builtins in exec.rs).
-// An empty line, Ctrl-C, or Ctrl-D returns to insert mode, matching vim's
-// Ex command-line ':' + empty Enter/Esc. Returns a WindowAction if the
-// command that ran was a `window`-family one, for the caller to apply
-// against the real session/window state (which run_command_mode itself
-// has no access to).
+// One-shot, matching vim's ':' Ex command line: successfully running one
+// command drops straight back to the normal shell prompt rather than
+// looping for another (see the `_ => return None` below). An empty line,
+// Ctrl-C, Ctrl-D, or Esc (regardless of what's been typed -- see
+// read_line's esc_cancels parameter) all cancel out the same way, back to
+// insert mode with nothing run. Returns a WindowAction if the command
+// that ran was a `window`-family one, for the caller to apply against the
+// real session/window state (which run_command_mode itself has no access
+// to).
 fn run_command_mode(shell: &mut Shell, history: &mut History) -> Option<WindowAction> {
     let mut buffer = String::new();
     loop {
@@ -524,8 +528,10 @@ fn run_command_mode(shell: &mut Shell, history: &mut History) -> Option<WindowAc
         // Already fully inside command mode, so there's nothing
         // meaningful to swap to if the ':'-arming mechanic re-triggers
         // here (see editor::read_line's doc comment) -- same string for
-        // both, making it visually a no-op.
-        match editor::read_line(&prompt_str, &prompt_str, history, 0) {
+        // both, making it visually a no-op. esc_cancels: true -- like a
+        // vim ':' command line, Esc should back out of command mode the
+        // same as Ctrl-C, regardless of what's been typed.
+        match editor::read_line(&prompt_str, &prompt_str, history, 0, true) {
             Ok(ReadOutcome::Eof) | Ok(ReadOutcome::Interrupted) => return None,
             // ':' at an empty command-mode prompt too -- nothing to switch
             // to, just stay here.
@@ -552,6 +558,18 @@ fn run_command_mode(shell: &mut Shell, history: &mut History) -> Option<WindowAc
                                 let result = shell.run_program(&prog);
                                 shell.restrict_to_builtins = false;
                                 buffer.clear();
+                                // One-shot: command mode exists to run a
+                                // single command, then drop straight back
+                                // to the normal shell prompt (matching
+                                // vim's ':' Ex command line) -- every
+                                // successful-execution path below returns
+                                // rather than looping for another command.
+                                // A rejected/errored attempt (the
+                                // command_mode_violation and syntax-error
+                                // branches, above and below this one)
+                                // deliberately does NOT return, so a typo
+                                // can be retried without re-entering
+                                // command mode from scratch.
                                 match result {
                                     ExecResult::Window(action) => return Some(action),
                                     // `fg`'s poll loop needs repl.rs's own
@@ -564,8 +582,9 @@ fn run_command_mode(shell: &mut Shell, history: &mut History) -> Option<WindowAc
                                     ExecResult::Fg => {
                                         shell.sink_err("bish: fg: not supported in command mode -- use it from the normal shell prompt\n");
                                         shell.discard_pending_fg();
+                                        return None;
                                     }
-                                    _ => {}
+                                    _ => return None,
                                 }
                             }
                         }

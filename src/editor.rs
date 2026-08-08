@@ -289,7 +289,14 @@ pub enum ReadOutcome {
 // meaningful to swap to (e.g. command mode's own nested read_line, which
 // is already fully inside command mode) can just pass the same string
 // twice.
-pub fn read_line(prompt: &str, armed_prompt: &str, history: &History, history_boundary: usize) -> io::Result<ReadOutcome> {
+// `esc_cancels`: whether Esc, when there's no active history browse to
+// unwind instead, cancels the whole read (same ReadOutcome::Interrupted
+// as Ctrl-C, just without the "^C" echo). Off for the normal shell
+// prompt (Esc there stays a no-op outside of history browsing, matching
+// this crate's existing behavior); on for command mode, which -- like a
+// vim ':' command line -- should be cancelable by either Ctrl-C or Esc
+// regardless of what's been typed.
+pub fn read_line(prompt: &str, armed_prompt: &str, history: &History, history_boundary: usize, esc_cancels: bool) -> io::Result<ReadOutcome> {
     let mut guard = Some(term::RawGuard::enable(0)?);
     let mut ed = LineEditor::new();
 
@@ -448,11 +455,24 @@ pub fn read_line(prompt: &str, armed_prompt: &str, history: &History, history_bo
                     }
                 }
             }
-            Key::Escape => {
-                if let Some((prefix, _)) = browse.take() {
-                    ed.set_text(&prefix);
+            Key::Escape => match browse.take() {
+                // First priority, regardless of esc_cancels: if a history
+                // browse is active, Esc just cancels *that* and restores
+                // what was typed before it started -- matching readline/
+                // vim conventions where Esc unwinds the innermost special
+                // state before it ever means "abandon everything."
+                Some((prefix, _)) => ed.set_text(&prefix),
+                // Nothing to unwind: for callers that opted in (command
+                // mode -- see esc_cancels' doc comment), this is "cancel
+                // the prompt," same outcome as Ctrl-C.
+                None if esc_cancels => {
+                    drop(guard.take());
+                    print!("\r\n");
+                    io::stdout().flush()?;
+                    return Ok(ReadOutcome::Interrupted);
                 }
-            }
+                None => {}
+            },
             Key::Unknown => {}
         }
         redraw(if cmd_mode_armed { armed_prompt } else { prompt }, &ed)?;
