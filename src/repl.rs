@@ -303,7 +303,6 @@ pub fn run(mut shell: Shell) {
                 &mut next_session_id,
                 &mut next_window_id,
                 &mut job_frames,
-                &history,
                 &mut cmd_history,
                 &mut sinks_are_grid,
                 term_rows,
@@ -394,7 +393,6 @@ pub fn run(mut shell: Shell) {
                     &mut current_window,
                     &mut next_session_id,
                     &mut next_window_id,
-                    &history,
                     &mut sinks_are_grid,
                     term_rows,
                     term_cols,
@@ -426,7 +424,6 @@ pub fn run(mut shell: Shell) {
                     &mut current_window,
                     &mut next_session_id,
                     &mut next_window_id,
-                    &history,
                     &mut cmd_history,
                     &mut sinks_are_grid,
                     term_rows,
@@ -564,7 +561,6 @@ pub fn run(mut shell: Shell) {
                         &mut current_window,
                         &mut next_session_id,
                         &mut next_window_id,
-                        &history,
                         &mut sinks_are_grid,
                         term_rows,
                         term_cols,
@@ -594,7 +590,6 @@ pub fn run(mut shell: Shell) {
                         &mut next_session_id,
                         &mut next_window_id,
                         &mut job_frames,
-                        &history,
                         &mut cmd_history,
                         &mut sinks_are_grid,
                         term_rows,
@@ -636,7 +631,6 @@ fn handle_command_mode(
     current_window: &mut usize,
     next_session_id: &mut SessionId,
     next_window_id: &mut u32,
-    history: &History,
     cmd_history: &mut History,
     sinks_are_grid: &mut bool,
     term_rows: usize,
@@ -648,7 +642,7 @@ fn handle_command_mode(
         run_command_mode(&mut session.shell, cmd_history, pending, col_origin, width)
     };
     if let Some(action) = action {
-        apply_window_action(action, sessions, windows, current_window, next_session_id, next_window_id, history, sinks_are_grid, term_rows, term_cols);
+        apply_window_action(action, sessions, windows, current_window, next_session_id, next_window_id, sinks_are_grid, term_rows, term_cols);
     } else if *sinks_are_grid {
         // No window action, but command mode may still have run ordinary
         // builtins whose output landed in this session's grid (e.g.
@@ -676,7 +670,6 @@ fn run_fg_job_frame(
     next_session_id: &mut SessionId,
     next_window_id: &mut u32,
     job_frames: &mut HashMap<JobFrameId, exec::FgJob>,
-    history: &History,
     cmd_history: &mut History,
     sinks_are_grid: &mut bool,
     term_rows: usize,
@@ -714,7 +707,6 @@ fn run_fg_job_frame(
                 current_window,
                 next_session_id,
                 next_window_id,
-                history,
                 cmd_history,
                 sinks_are_grid,
                 term_rows,
@@ -752,7 +744,6 @@ fn apply_window_action(
     current_window: &mut usize,
     next_session_id: &mut SessionId,
     next_window_id: &mut u32,
-    history: &History,
     sinks_are_grid: &mut bool,
     term_rows: usize,
     term_cols: usize,
@@ -783,6 +774,7 @@ fn apply_window_action(
         }
         WindowAction::New => {
             let parent_id = windows[*current_window].owning_session();
+            let parent_boundary = sessions[&parent_id].history_boundary;
             let mut child_shell = sessions[&parent_id].shell.new_virtual_child();
             let screen = Rc::new(RefCell::new(vt100::Screen::new(content_rows(term_rows), term_cols)));
             child_shell.set_sink_grid(screen.clone());
@@ -794,7 +786,16 @@ fn apply_window_action(
                 SessionState {
                     shell: child_shell,
                     buffer: String::new(),
-                    history_boundary: history.boundary(),
+                    // Inherits the parent's own boundary (rather than
+                    // "now", the shared history's current tail) so a new
+                    // window/pane's Up/Down history includes everything
+                    // its parent could already see, plus anything
+                    // recorded since -- matching how a new terminal
+                    // ordinarily has your prior commands available,
+                    // instead of starting from a blank slate. See
+                    // History's own doc comment for the boundary
+                    // mechanism itself.
+                    history_boundary: parent_boundary,
                     screen,
                     warned_stopped_jobs: false,
                     dir_history: vec![child_cwd],
@@ -852,7 +853,7 @@ fn apply_window_action(
             }
         }
         WindowAction::Split { horizontal } => {
-            split_focused_pane(sessions, windows, *current_window, next_session_id, history, horizontal, term_rows, term_cols);
+            split_focused_pane(sessions, windows, *current_window, next_session_id, horizontal, term_rows, term_cols);
         }
         WindowAction::FocusPane(direction) => {
             focus_pane_direction(&mut windows[*current_window], sessions, direction, term_rows, term_cols);
@@ -875,12 +876,12 @@ fn split_focused_pane(
     windows: &mut [WindowEntry],
     current_window: usize,
     next_session_id: &mut SessionId,
-    history: &History,
     horizontal: bool,
     term_rows: usize,
     term_cols: usize,
 ) {
     let parent_id = windows[current_window].owning_session();
+    let parent_boundary = sessions[&parent_id].history_boundary;
     let mut child_shell = sessions[&parent_id].shell.new_virtual_child();
     let screen = Rc::new(RefCell::new(vt100::Screen::new(content_rows(term_rows), term_cols)));
     child_shell.set_sink_grid(screen.clone());
@@ -892,7 +893,9 @@ fn split_focused_pane(
         SessionState {
             shell: child_shell,
             buffer: String::new(),
-            history_boundary: history.boundary(),
+            // See WindowAction::New's own comment on inheriting the
+            // parent's boundary instead of "now".
+            history_boundary: parent_boundary,
             screen,
             warned_stopped_jobs: false,
             dir_history: vec![child_cwd],

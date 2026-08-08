@@ -90,12 +90,6 @@ impl History {
             .map(|(i, e)| (i, e.as_str()))
     }
 
-    // Snapshot for a newly-created session's `boundary`: it should only
-    // ever browse commands recorded from this point forward.
-    pub fn boundary(&self) -> usize {
-        self.entries.len()
-    }
-
     // `!n`: absolute, 1-based (matches how bash numbers history events).
     // None if out of range or older than `boundary` -- a session can't
     // `!`-reference an event from before it existed any more than it can
