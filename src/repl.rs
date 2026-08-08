@@ -181,6 +181,33 @@ pub fn run(shell: Shell) {
         }
 
         let session_id = windows[current_window].owning_session();
+
+        // The focused window's top frame is a running job (M10c): it was
+        // either just pushed by the fg_pending branch below, or -- the
+        // new case this milestone adds -- the user switched back to a
+        // window they'd earlier detached from (drive_fg_job's
+        // FgOutcome::Detached) while it kept running in the background.
+        // Either way, drive it the same way.
+        if let Frame::Job(job_frame_id) = *windows[current_window].stack.last().unwrap() {
+            run_fg_job_frame(
+                job_frame_id,
+                session_id,
+                &mut sessions,
+                &mut windows,
+                &mut current_window,
+                &mut next_session_id,
+                &mut next_window_id,
+                &mut job_frames,
+                &history,
+                &mut cmd_history,
+                &mut sinks_are_grid,
+                term_rows,
+                term_cols,
+            );
+            let _ = io::stdout().flush();
+            continue;
+        }
+
         let boundary = sessions[&session_id].history_boundary;
         let (prompt_str, armed_prompt_str) = {
             let session = &sessions[&session_id];
@@ -191,7 +218,9 @@ pub fn run(shell: Shell) {
             }
         };
 
-        match editor::read_line(&prompt_str, &armed_prompt_str, &history, boundary, false, None) {
+        match editor::read_line(&prompt_str, &armed_prompt_str, &history, boundary, false, None, || {
+            service_background_jobs(&mut sessions, &mut windows, &mut job_frames, current_window);
+        }) {
             Ok(ReadOutcome::Eof) => {
                 // Whether closing *this* (window, top-frame) reference
                 // would leave the session with no reference anywhere
@@ -248,30 +277,20 @@ pub fn run(shell: Shell) {
                 sessions.get_mut(&session_id).unwrap().buffer.clear();
             }
             Ok(ReadOutcome::CommandMode(pending)) => {
-                let action = {
-                    let session = sessions.get_mut(&session_id).unwrap();
-                    run_command_mode(&mut session.shell, &mut cmd_history, pending)
-                };
-                if let Some(action) = action {
-                    apply_window_action(
-                        action,
-                        &mut sessions,
-                        &mut windows,
-                        &mut current_window,
-                        &mut next_session_id,
-                        &mut next_window_id,
-                        &history,
-                        &mut sinks_are_grid,
-                        term_rows,
-                        term_cols,
-                    );
-                } else if sinks_are_grid {
-                    // No window action, but command mode may still have
-                    // run ordinary builtins whose output landed in this
-                    // session's grid (e.g. `:pwd`) -- without this, that
-                    // output would sit captured but never actually drawn.
-                    compositor_redraw(&sessions, &windows, current_window, term_rows, term_cols);
-                }
+                handle_command_mode(
+                    session_id,
+                    pending,
+                    &mut sessions,
+                    &mut windows,
+                    &mut current_window,
+                    &mut next_session_id,
+                    &mut next_window_id,
+                    &history,
+                    &mut cmd_history,
+                    &mut sinks_are_grid,
+                    term_rows,
+                    term_cols,
+                );
             }
             Ok(ReadOutcome::Line(line)) => {
                 let mut window_action = None;
@@ -338,29 +357,31 @@ pub fn run(shell: Shell) {
                     // as a real Frame::Job on the focused window's own
                     // stack -- see Frame's doc comment for why a Job
                     // frame holds an id into `job_frames` rather than
-                    // the FgJob itself -- then drive it directly here
-                    // (repl.rs owns the session/window state a redraw
-                    // needs, unlike exec.rs -- see ExecResult::Fg's doc
-                    // comment). Still fully blocking for this milestone:
-                    // switching to another window while this runs is
-                    // M10c's job, once the outer loop itself becomes
-                    // poll-based instead of just drive_fg_job's own
-                    // inner one.
+                    // the FgJob itself -- then drive it via the same
+                    // run_fg_job_frame the main loop's own top uses to
+                    // re-enter a job left running in a window the user
+                    // switched back to (M10c).
                     let fg_job = sessions.get_mut(&session_id).unwrap().shell.take_pending_fg().expect("ExecResult::Fg implies a job was stashed");
                     let job_frame_id = next_job_frame_id;
                     next_job_frame_id += 1;
                     job_frames.insert(job_frame_id, fg_job);
                     windows[current_window].stack.push(Frame::Job(job_frame_id));
 
-                    let focused_screen = sessions[&session_id].screen.clone();
-                    let tab_bar = tab_bar_line(&sessions, &windows, current_window);
-                    let status = drive_fg_job(job_frames.get_mut(&job_frame_id).unwrap(), &focused_screen, || {
-                        render_compositor_frame(&focused_screen, &tab_bar, term_rows);
-                    });
-
-                    windows[current_window].stack.pop();
-                    job_frames.remove(&job_frame_id);
-                    sessions.get_mut(&session_id).unwrap().shell.last_status = status;
+                    run_fg_job_frame(
+                        job_frame_id,
+                        session_id,
+                        &mut sessions,
+                        &mut windows,
+                        &mut current_window,
+                        &mut next_session_id,
+                        &mut next_window_id,
+                        &mut job_frames,
+                        &history,
+                        &mut cmd_history,
+                        &mut sinks_are_grid,
+                        term_rows,
+                        term_cols,
+                    );
                 } else if sinks_are_grid {
                     // The common case once promoted: a normal command ran
                     // in the focused session and its output (if any)
@@ -379,6 +400,107 @@ pub fn run(shell: Shell) {
             }
         }
         let _ = io::stdout().flush();
+    }
+}
+
+// Shared by both places command mode can be entered: the ordinary ':' at
+// a Session-frame window's own prompt, and (M10c) the detach key firing
+// while a Job frame owns the window instead. `pending` is the character
+// (if any) that committed entry -- see editor::ReadOutcome::CommandMode's
+// doc comment; always None from the detach path, since Ctrl+Space isn't
+// itself a character command mode should see as typed input.
+#[allow(clippy::too_many_arguments)]
+fn handle_command_mode(
+    session_id: SessionId,
+    pending: Option<char>,
+    sessions: &mut HashMap<SessionId, SessionState>,
+    windows: &mut Vec<WindowEntry>,
+    current_window: &mut usize,
+    next_session_id: &mut SessionId,
+    next_window_id: &mut u32,
+    history: &History,
+    cmd_history: &mut History,
+    sinks_are_grid: &mut bool,
+    term_rows: usize,
+    term_cols: usize,
+) {
+    let action = {
+        let session = sessions.get_mut(&session_id).unwrap();
+        run_command_mode(&mut session.shell, cmd_history, pending)
+    };
+    if let Some(action) = action {
+        apply_window_action(action, sessions, windows, current_window, next_session_id, next_window_id, history, sinks_are_grid, term_rows, term_cols);
+    } else if *sinks_are_grid {
+        // No window action, but command mode may still have run ordinary
+        // builtins whose output landed in this session's grid (e.g.
+        // `:pwd`) -- without this, that output would sit captured but
+        // never actually drawn.
+        compositor_redraw(sessions, windows, *current_window, term_rows, term_cols);
+    }
+}
+
+// Drives whatever job is behind `job_frame_id` -- freshly pushed by the
+// main loop's fg_pending handling, or already sitting there from an
+// earlier detach (M10c) -- via drive_fg_job, and handles however that
+// ends: the job exiting pops the frame and records its status, same as
+// M10b; the user detaching again just re-inserts the (untouched, still
+// running) job back into job_frames and drops straight into command mode
+// for this same window, so `window next`/`previous` can move away from
+// it without ever having to touch the job itself.
+#[allow(clippy::too_many_arguments)]
+fn run_fg_job_frame(
+    job_frame_id: JobFrameId,
+    session_id: SessionId,
+    sessions: &mut HashMap<SessionId, SessionState>,
+    windows: &mut Vec<WindowEntry>,
+    current_window: &mut usize,
+    next_session_id: &mut SessionId,
+    next_window_id: &mut u32,
+    job_frames: &mut HashMap<JobFrameId, exec::FgJob>,
+    history: &History,
+    cmd_history: &mut History,
+    sinks_are_grid: &mut bool,
+    term_rows: usize,
+    term_cols: usize,
+) {
+    // Taken out of job_frames (rather than borrowed via get_mut) so the
+    // on_idle closure below can freely borrow job_frames itself to
+    // service every *other* window's job -- see service_background_jobs.
+    let mut job = job_frames.remove(&job_frame_id).expect("Frame::Job always has a live job_frames entry");
+    let focused_screen = sessions[&session_id].screen.clone();
+    let tab_bar = tab_bar_line(sessions, windows, *current_window);
+    let cw = *current_window;
+    let outcome = drive_fg_job(
+        &mut job,
+        &focused_screen,
+        || render_compositor_frame(&focused_screen, &tab_bar, term_rows),
+        || service_background_jobs(sessions, windows, job_frames, cw),
+    );
+    match outcome {
+        FgOutcome::Exited(status) => {
+            windows[*current_window].stack.pop();
+            sessions.get_mut(&session_id).unwrap().shell.last_status = status;
+            if *sinks_are_grid {
+                compositor_redraw(sessions, windows, *current_window, term_rows, term_cols);
+            }
+        }
+        FgOutcome::Detached => {
+            job_frames.insert(job_frame_id, job);
+            handle_command_mode(
+                session_id,
+                None,
+                sessions,
+                windows,
+                current_window,
+                next_session_id,
+                next_window_id,
+                history,
+                cmd_history,
+                sinks_are_grid,
+                term_rows,
+                term_cols,
+            );
+        }
     }
 }
 
@@ -515,24 +637,48 @@ fn compositor_redraw(sessions: &HashMap<SessionId, SessionState>, windows: &[Win
     render_compositor_frame(&sessions[&session_id].screen, &tab_bar, term_rows);
 }
 
-// Drives a job pushed as a Frame::Job to completion: reads its pty
-// master and feeds bytes into `screen`, calls `redraw` after every batch
-// of output, and forwards raw bytes read from bish's own stdin straight
-// to the job's pty master unmodified -- the job's own pty slave termios
-// (never touched by this shell) handles things like Ctrl-C triggering
-// real SIGINT delivery to the job's process group exactly like a real
-// terminal would, no signal-forwarding code needed here. Moved here from
-// exec.rs's old Shell::drive_pending_fg (M9b) now that the job itself is
-// owned by repl.rs (see FgJob's doc comment) rather than stashed inside
-// a session's Shell -- everything else about the loop is unchanged.
+// How drive_fg_job's blocking loop ended.
+enum FgOutcome {
+    // The job itself exited or was killed (e.g. by a forwarded Ctrl-C).
+    Exited(i32),
+    // The user hit the detach key (see the Ctrl+Space comment below)
+    // instead of the job exiting. The job is left completely untouched --
+    // still running, still the top Frame::Job of whatever window it
+    // belongs to -- it's the caller's job to decide what to do next (M10c:
+    // fall into command mode so `window next`/`previous` can switch away
+    // from it while it keeps running in the background).
+    Detached,
+}
+
+// Drives a job pushed as a Frame::Job: reads its pty master and feeds
+// bytes into `screen`, calls `redraw` after every batch of output, and
+// forwards raw bytes read from bish's own stdin straight to the job's pty
+// master unmodified -- the job's own pty slave termios (never touched by
+// this shell) handles things like Ctrl-C triggering real SIGINT delivery
+// to the job's process group exactly like a real terminal would, no
+// signal-forwarding code needed here. Moved here from exec.rs's old
+// Shell::drive_pending_fg (M9b) now that the job itself is owned by
+// repl.rs (see FgJob's doc comment) rather than stashed inside a
+// session's Shell.
 //
-// Still fully blocking: switching to another window while this runs is
-// M10c's job, once the outer loop itself becomes poll-based instead of
-// just this one. No detach-and-resume-later either (matching this
-// codebase's existing "no SIGTSTP/Ctrl-Z, no genuine Stopped jobs"
-// scope, see exec.rs's run_bg doc comment) -- the only ways back to the
-// normal REPL are the job finishing or Ctrl-C interrupting it.
-fn drive_fg_job(job: &mut exec::FgJob, screen: &Rc<RefCell<vt100::Screen>>, mut redraw: impl FnMut()) -> i32 {
+// `on_idle` is called on every tick that finds neither job output nor
+// stdin input ready (M10c) -- repl.rs's caller uses it to keep other
+// windows' backgrounded jobs alive (see service_background_jobs) while
+// this one owns the terminal, the same way editor::read_line's own
+// on_idle does for a window sitting at a plain prompt.
+//
+// A raw NUL byte (Ctrl+Space in most terminals) is intercepted before
+// being forwarded and means "detach": plan.md long anticipated Ctrl+Space
+// as a control-mode trigger alongside ':', and reusing it here for
+// "hand control back to the window manager without touching the job"
+// keeps that a single, consistent gesture rather than inventing a second
+// one. Still no detach-and-*resume*-a-*stopped* job (matching this
+// codebase's existing "no SIGTSTP/Ctrl-Z, no genuine Stopped jobs" scope,
+// see exec.rs's run_bg doc comment) -- detaching here never stops the
+// job, it just stops *this shell* from actively watching it, exactly
+// like switching a real terminal multiplexer pane away from a running
+// program.
+fn drive_fg_job(job: &mut exec::FgJob, screen: &Rc<RefCell<vt100::Screen>>, mut redraw: impl FnMut(), mut on_idle: impl FnMut()) -> FgOutcome {
     use std::io::{Read, Write};
     use std::os::unix::io::AsRawFd;
 
@@ -548,9 +694,9 @@ fn drive_fg_job(job: &mut exec::FgJob, screen: &Rc<RefCell<vt100::Screen>>, mut 
     // loop's other responsibilities forever. Bounding the drain
     // guarantees this loop always comes back around.
     const MAX_READS_PER_TICK: u32 = 16;
-    let status = loop {
+    let outcome = loop {
         if let Some(status) = job.poll() {
-            break status;
+            break FgOutcome::Exited(status);
         }
 
         let mut made_progress = false;
@@ -576,15 +722,67 @@ fn drive_fg_job(job: &mut exec::FgJob, screen: &Rc<RefCell<vt100::Screen>>, mut 
         if ready {
             let n = unsafe { raw_read(0, buf.as_mut_ptr(), buf.len()) };
             if n > 0 {
+                if n == 1 && buf[0] == 0 {
+                    break FgOutcome::Detached;
+                }
                 let _ = job.pty_master().write_all(&buf[..n as usize]);
             } else {
-                break job.wait();
+                break FgOutcome::Exited(job.wait());
             }
+        } else {
+            on_idle();
         }
     };
     drop(_raw_guard);
     redraw();
-    status
+    outcome
+}
+
+// Keeps every OTHER window's fg'd job alive while `skip_window` is the
+// one actually being watched (via drive_fg_job) or typed into (via
+// editor::read_line) -- called from both of those as their on_idle hook
+// (M10c). Non-blocking, bounded the same way drive_fg_job's own drain is:
+// a firehose producer in a backgrounded window shouldn't be able to make
+// this take arbitrarily long before returning control to whichever of
+// the two loops above called it.
+fn service_background_jobs(
+    sessions: &mut HashMap<SessionId, SessionState>,
+    windows: &mut [WindowEntry],
+    job_frames: &mut HashMap<JobFrameId, exec::FgJob>,
+    skip_window: usize,
+) {
+    use std::io::Read;
+
+    const MAX_READS_PER_TICK: u32 = 16;
+    let mut buf = [0u8; 4096];
+    for i in 0..windows.len() {
+        if i == skip_window {
+            continue;
+        }
+        let job_frame_id = match windows[i].stack.last() {
+            Some(Frame::Job(id)) => *id,
+            _ => continue,
+        };
+        let sid = windows[i].owning_session();
+        let screen = sessions[&sid].screen.clone();
+        let job = match job_frames.get_mut(&job_frame_id) {
+            Some(j) => j,
+            None => continue,
+        };
+        for _ in 0..MAX_READS_PER_TICK {
+            match job.pty_master().read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => screen.borrow_mut().feed(&buf[..n]),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(_) => break,
+            }
+        }
+        if let Some(status) = job.poll() {
+            windows[i].stack.pop();
+            job_frames.remove(&job_frame_id);
+            sessions.get_mut(&sid).unwrap().shell.last_status = status;
+        }
+    }
 }
 
 // Raw stdin read for drive_fg_job. Renamed via link_name so the local
@@ -761,7 +959,14 @@ fn run_command_mode(shell: &mut Shell, history: &mut History, initial_char: Opti
         // same as Ctrl-C, regardless of what's been typed. prefill.take():
         // only the very first iteration (if entry carried a character)
         // seeds the buffer; every iteration after that starts empty.
-        match editor::read_line(&prompt_str, &prompt_str, history, 0, true, prefill.take()) {
+        // `|| {}`: unlike the main loop's own read_line call, this nested
+        // one doesn't service other windows' backgrounded jobs while
+        // idling (M10c) -- command mode is one-shot and its own prompt is
+        // normally answered in well under a poll tick, so the window
+        // during which a background job would visibly stall here is
+        // negligible; wiring sessions/windows/job_frames all the way
+        // through run_command_mode for that is scoped out for now.
+        match editor::read_line(&prompt_str, &prompt_str, history, 0, true, prefill.take(), || {}) {
             Ok(ReadOutcome::Eof) | Ok(ReadOutcome::Interrupted) => return None,
             // ':' at an empty command-mode prompt too -- nothing
             // meaningful to switch to since we're already here; just

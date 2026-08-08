@@ -157,6 +157,25 @@ fn read_escape() -> io::Result<Key> {
     })
 }
 
+// How long to wait for a keystroke before giving on_idle another chance
+// to run (see read_line's on_idle doc comment) and polling again. Short
+// enough that a job running in another window doesn't visibly stall.
+const IDLE_POLL_MS: i32 = 15;
+
+// Blocks until a key is available, but never for longer than
+// IDLE_POLL_MS at a stretch -- calls on_idle and loops back to poll again
+// in between. Once a byte is actually ready, hands off to the ordinary
+// (genuinely blocking) read_key/read_byte/read_escape machinery
+// unchanged: a real key event's remaining bytes (an escape sequence's
+// tail, a UTF-8 continuation byte) always arrive close enough behind the
+// first that there's nothing to gain by polling those sub-reads too.
+fn read_key_idle(on_idle: &mut dyn FnMut()) -> io::Result<Option<Key>> {
+    while !term::stdin_ready(IDLE_POLL_MS) {
+        on_idle();
+    }
+    read_key()
+}
+
 fn read_utf8_cont(first: u8) -> io::Result<char> {
     let extra = if first >= 0xf0 {
         3
@@ -305,6 +324,15 @@ pub enum ReadOutcome {
 // character that committed command mode (see ReadOutcome::CommandMode's
 // doc comment), so it counts as typed input instead of being lost.
 // `None` for every other caller.
+// `on_idle`: called whenever this is about to block waiting for the next
+// keystroke and none has arrived yet within one poll tick -- lets
+// repl.rs's main loop (M10c) service other windows' backgrounded fg jobs
+// (draining their pty output into their own grids, reaping them if
+// they've exited) while this window sits idle at its own prompt, instead
+// of a job elsewhere silently stalling until this read finally returns.
+// A plain `|| {}` is a correct, if inert, choice for callers with nothing
+// to service (e.g. command mode's own nested read_line -- see that call
+// site's comment on why this is scoped out there for now).
 pub fn read_line(
     prompt: &str,
     armed_prompt: &str,
@@ -312,6 +340,7 @@ pub fn read_line(
     history_boundary: usize,
     esc_cancels: bool,
     prefill: Option<char>,
+    mut on_idle: impl FnMut(),
 ) -> io::Result<ReadOutcome> {
     let mut guard = Some(term::RawGuard::enable(0)?);
     let mut ed = LineEditor::new();
@@ -352,7 +381,7 @@ pub fn read_line(
     }
 
     loop {
-        let key = match read_key()? {
+        let key = match read_key_idle(&mut on_idle)? {
             Some(k) => k,
             None => {
                 drop(guard.take());
