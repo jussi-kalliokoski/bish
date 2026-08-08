@@ -192,6 +192,13 @@ pub enum WindowAction {
     Next,
     Previous,
     Close,
+    // `window fg <window-id>`: push the target window's current top
+    // frame onto *this* window's stack too -- vim-like "the same
+    // session shown in multiple windows" (see WindowEntry::stack's doc
+    // comment in repl.rs). The u32 is the target window's id, not an
+    // index -- ids are stable identifiers, indices shift as windows
+    // close.
+    FgSession(u32),
 }
 
 pub struct Shell {
@@ -1240,12 +1247,22 @@ impl Shell {
             Some("previous") | Some("prev") | Some("p") => ExecResult::Window(WindowAction::Previous),
             Some("new") | Some("c") | Some("create") => ExecResult::Window(WindowAction::New),
             Some("close") | Some("x") | Some("exit") => ExecResult::Window(WindowAction::Close),
+            Some("fg") => match args.get(1).and_then(|a| a.parse::<u32>().ok()) {
+                Some(id) => ExecResult::Window(WindowAction::FgSession(id)),
+                None => {
+                    sh_eprintln!(self, "bish: window: fg: usage: window fg <window-id>");
+                    ExecResult::Status(2)
+                }
+            },
             Some(other) => {
                 sh_eprintln!(self, "bish: window: unknown subcommand: {}", other);
                 ExecResult::Status(2)
             }
             None => {
-                sh_eprintln!(self, "bish: window: missing subcommand (next(n)/previous/new(c,create)/close(x,exit))");
+                sh_eprintln!(
+                    self,
+                    "bish: window: missing subcommand (next(n)/previous/new(c,create)/close(x,exit)/fg <id>)"
+                );
                 ExecResult::Status(2)
             }
         }

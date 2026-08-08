@@ -31,17 +31,42 @@ struct SessionState {
     screen: Rc<RefCell<vt100::Screen>>,
 }
 
-// A window's one currently-active session. Deliberately not yet a stack
-// of sessions/jobs (the plan's eventual Frame model) -- none of the
-// `window` subcommands available so far (next/previous/new/close) ever
-// attach an *existing* session to a second window or push an external job
-// onto one, so every window has exactly one session for now. The stack
-// becomes real once fg-into-a-window's-session and fg-into-an-external-
-// job land (M9b), poll-driven against a job's own pty instead of today's
-// blocking `fg`.
+// One layer of a window's view stack. Currently only ever Session --
+// Job frames (fg-ing a background job onto a window's own stack, poll-
+// driven against the job's pty, instead of today's Shell-local
+// drive_pending_fg single-slot) land in a later milestone. A stack
+// rather than a single field is what lets `window fg <id>` push another
+// window's current frame on top of this window's own -- vim-like "the
+// same session shown in multiple windows" -- and what will give a
+// fg'd job a real "ancestry" to unwind back through once Job frames
+// exist.
+#[derive(Clone, Copy, PartialEq)]
+enum Frame {
+    Session(SessionId),
+}
+
+// A window's view stack: the last (top) entry is what's currently
+// focused/rendered there. Every window starts with exactly one frame
+// (its own session) and stays that way until `window fg` pushes
+// another. `window close` pops the top frame; the window itself is only
+// actually removed once its stack empties (see apply_window_action),
+// refused if it's the last window with nothing left to reveal
+// underneath. Since the same SessionId can legally be the top of more
+// than one window's stack at once (that's the whole point of `window
+// fg`), a session is only ever dropped from `sessions` once no window's
+// stack references it anywhere, at any depth -- see
+// close_orphaned_sessions.
 struct WindowEntry {
     id: u32,
-    session: SessionId,
+    stack: Vec<Frame>,
+}
+
+impl WindowEntry {
+    fn top_session(&self) -> SessionId {
+        match self.stack.last().expect("a window's stack is never empty") {
+            Frame::Session(id) => *id,
+        }
+    }
 }
 
 // Queries the real terminal's size via the same TIOCGWINSZ ioctl pty.rs
@@ -60,6 +85,31 @@ fn content_rows(term_rows: usize) -> usize {
     term_rows.saturating_sub(1).max(1)
 }
 
+// True if `sid` is reachable from some (window, stack-depth) pair other
+// than the exact top frame of `windows[current_window]` -- i.e. whether
+// that one reference is the *only* thing keeping the session alive. Used
+// by the EOF handler to decide whether closing this one reference would
+// actually orphan the session (and so should run its exit trap) or just
+// drop one of several still-live references to it (see WindowEntry's
+// doc comment on why the same session can appear more than once).
+fn session_referenced_elsewhere(windows: &[WindowEntry], current_window: usize, sid: SessionId) -> bool {
+    for (i, w) in windows.iter().enumerate() {
+        for (depth, frame) in w.stack.iter().enumerate() {
+            let matches = match frame {
+                Frame::Session(s) => *s == sid,
+            };
+            if !matches {
+                continue;
+            }
+            let is_the_one_reference_in_question = i == current_window && depth == w.stack.len() - 1;
+            if !is_the_one_reference_in_question {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 pub fn run(shell: Shell) {
     // The shell itself must survive Ctrl-C (bash's own top-level
     // interactive behavior); a foreground child still dies/interrupts
@@ -76,7 +126,7 @@ pub fn run(shell: Shell) {
     let mut sessions: HashMap<SessionId, SessionState> = HashMap::new();
     let root_screen = Rc::new(RefCell::new(vt100::Screen::new(content_rows(term_rows), term_cols)));
     sessions.insert(0, SessionState { shell, buffer: String::new(), history_boundary: 0, screen: root_screen });
-    let mut windows: Vec<WindowEntry> = vec![WindowEntry { id: 0, session: 0 }];
+    let mut windows: Vec<WindowEntry> = vec![WindowEntry { id: 0, stack: vec![Frame::Session(0)] }];
     let mut current_window: usize = 0;
     let mut next_session_id: SessionId = 1;
     let mut next_window_id: u32 = 1;
@@ -110,7 +160,7 @@ pub fn run(shell: Shell) {
             }
         }
 
-        let session_id = windows[current_window].session;
+        let session_id = windows[current_window].top_session();
         let boundary = sessions[&session_id].history_boundary;
         let (prompt_str, armed_prompt_str) = {
             let session = &sessions[&session_id];
@@ -123,17 +173,28 @@ pub fn run(shell: Shell) {
 
         match editor::read_line(&prompt_str, &armed_prompt_str, &history, boundary, false, None) {
             Ok(ReadOutcome::Eof) => {
+                // Whether closing *this* (window, top-frame) reference
+                // would leave the session with no reference anywhere
+                // (any window's stack, any depth) -- since `window fg`
+                // lets the same session be the top of more than one
+                // window's stack, or sit buried under another frame,
+                // EOF closing just one of those references shouldn't
+                // fire the exit trap for a session that's still alive
+                // and reachable elsewhere.
+                let will_orphan = !session_referenced_elsewhere(&windows, current_window, session_id);
                 let session = sessions.get_mut(&session_id).unwrap();
                 if !session.buffer.is_empty() {
                     session.shell.sink_err("bish: syntax error: unexpected end of input\n");
                 }
-                session.shell.run_exit_trap();
-                if windows.len() == 1 {
-                    // Last window, last session: really exit. Restore the
-                    // normal screen buffer if promotion ever switched us
-                    // to the alternate one -- exiting every active
-                    // session is currently the only way out of promoted
-                    // mode.
+                if will_orphan {
+                    session.shell.run_exit_trap();
+                }
+                if windows.len() == 1 && windows[current_window].stack.len() == 1 {
+                    // Last window, last frame anywhere: really exit.
+                    // Restore the normal screen buffer if promotion ever
+                    // switched us to the alternate one -- exiting every
+                    // active session is currently the only way out of
+                    // promoted mode.
                     if session.shell.is_promoted() {
                         // Direct, not session.shell.sink_out: this is a
                         // whole-terminal action (leaving the alternate
@@ -146,8 +207,8 @@ pub fn run(shell: Shell) {
                     }
                     break;
                 }
-                // Otherwise: EOF on a window's session closes that
-                // window, same as `window close` would.
+                // Otherwise: EOF on a window's top frame pops/closes it,
+                // same as `window close` would.
                 apply_window_action(
                     WindowAction::Close,
                     &mut sessions,
@@ -337,7 +398,7 @@ fn apply_window_action(
             *current_window = (*current_window + windows.len() - 1) % windows.len();
         }
         WindowAction::New => {
-            let parent_id = windows[*current_window].session;
+            let parent_id = windows[*current_window].top_session();
             let mut child_shell = sessions[&parent_id].shell.new_virtual_child();
             let screen = Rc::new(RefCell::new(vt100::Screen::new(content_rows(term_rows), term_cols)));
             child_shell.set_sink_grid(screen.clone());
@@ -346,24 +407,53 @@ fn apply_window_action(
             sessions.insert(sid, SessionState { shell: child_shell, buffer: String::new(), history_boundary: history.boundary(), screen });
             let wid = *next_window_id;
             *next_window_id += 1;
-            windows.push(WindowEntry { id: wid, session: sid });
+            windows.push(WindowEntry { id: wid, stack: vec![Frame::Session(sid)] });
             *current_window = windows.len() - 1;
         }
         WindowAction::Close => {
-            if windows.len() == 1 {
-                let sid = windows[*current_window].session;
+            if windows[*current_window].stack.len() > 1 {
+                // Popping a frame off this window's own stack, not
+                // closing the window -- always fine regardless of how
+                // many windows exist, and never orphans a session since
+                // what's revealed underneath was already a live frame.
+                windows[*current_window].stack.pop();
+            } else if windows.len() == 1 {
+                let sid = windows[*current_window].top_session();
                 sessions[&sid].shell.sink_err("bish: window close: cannot close the last window -- exit the shell instead\n");
                 compositor_redraw(sessions, windows, *current_window, term_rows, term_cols);
                 return;
+            } else {
+                windows.remove(*current_window);
+                if *current_window >= windows.len() {
+                    *current_window = windows.len() - 1;
+                }
+                close_orphaned_sessions(sessions, windows);
             }
-            let closed_session = windows.remove(*current_window).session;
-            sessions.remove(&closed_session);
-            if *current_window >= windows.len() {
-                *current_window = windows.len() - 1;
+        }
+        WindowAction::FgSession(target_id) => {
+            let target_frame = windows.iter().find(|w| w.id == target_id).map(|w| *w.stack.last().unwrap());
+            match target_frame {
+                Some(frame) => windows[*current_window].stack.push(frame),
+                None => {
+                    let cur_sid = windows[*current_window].top_session();
+                    sessions[&cur_sid].shell.sink_err(&format!("bish: window: fg: no such window: {}\n", target_id));
+                }
             }
         }
     }
     compositor_redraw(sessions, windows, *current_window, term_rows, term_cols);
+}
+
+// A session stops being referenced when the last window whose stack
+// contained it (at any depth, not just the top -- `window fg` can leave
+// it buried under another frame in a different window) closes. Called
+// only from the "window itself is removed" branch of Close, above --
+// no other action can ever orphan a session (New/FgSession only add
+// references; Next/Previous don't touch the stack at all).
+fn close_orphaned_sessions(sessions: &mut HashMap<SessionId, SessionState>, windows: &[WindowEntry]) {
+    let referenced: std::collections::HashSet<SessionId> =
+        windows.iter().flat_map(|w| w.stack.iter().map(|f| match f { Frame::Session(id) => *id })).collect();
+    sessions.retain(|id, _| referenced.contains(id));
 }
 
 // Full redraw of the currently-focused window's grid plus the tab bar.
@@ -379,7 +469,7 @@ fn apply_window_action(
 // implementation (render_compositor_frame) rather than risking them
 // drifting apart.
 fn compositor_redraw(sessions: &HashMap<SessionId, SessionState>, windows: &[WindowEntry], current_window: usize, term_rows: usize, _term_cols: usize) {
-    let session_id = windows[current_window].session;
+    let session_id = windows[current_window].top_session();
     let tab_bar = tab_bar_line(sessions, windows, current_window);
     render_compositor_frame(&sessions[&session_id].screen, &tab_bar, term_rows);
 }
@@ -474,7 +564,7 @@ fn tab_bar_snapshot(sessions: &HashMap<SessionId, SessionState>, windows: &[Wind
     windows
         .iter()
         .enumerate()
-        .map(|(i, w)| (w.id, i == current_window, sessions[&w.session].shell.cwd.display().to_string()))
+        .map(|(i, w)| (w.id, i == current_window, sessions[&w.top_session()].shell.cwd.display().to_string()))
         .collect()
 }
 
