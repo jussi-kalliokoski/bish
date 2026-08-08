@@ -741,6 +741,29 @@ impl Shell {
                     table.jobs.remove(i)
                 };
                 if job.pty_master.is_some() {
+                    // Real bug, found interactively: if this job was
+                    // Stopped (Ctrl-Z while it was pty-driven -- see
+                    // FgJob::send_stop), it's sitting there SIGSTOP'd
+                    // right now. Bubbling it to repl.rs's drive_fg_job
+                    // without resuming it first means that loop just
+                    // forwards keystrokes (including further Ctrl-C/
+                    // Ctrl-Z) into a pty whose sole reader is frozen and
+                    // can't act on any of them -- not even run a signal
+                    // handler, since a stopped process runs *no* code at
+                    // all until continued -- which looked like the whole
+                    // shell hanging, unrecoverable short of the
+                    // undiscoverable Ctrl+Space detach. This job's own
+                    // pgid always equals its own (single) pid -- see
+                    // Job::pgid's doc comment on why pty-attached jobs
+                    // don't separately store one -- so send_signal_to_pgrp
+                    // on that pid reaches the same process SIGCONT would
+                    // via a real pgid.
+                    if job.stopped {
+                        if let Some(&pid) = job.pids.first() {
+                            send_signal_to_pgrp(pid, SIGCONT);
+                        }
+                        job.stopped = false;
+                    }
                     self.pending_fg = Some(job);
                     return ExecResult::Fg;
                 }
@@ -852,8 +875,14 @@ impl Shell {
                 let mut table = self.jobs.borrow_mut();
                 let job = &mut table.jobs[i];
                 if job.stopped {
-                    if let Some(pgid) = job.pgid {
-                        send_signal_to_pgrp(pgid, SIGCONT);
+                    // Same fix as run_fg's own pty_master.is_some()
+                    // branch: a pty-attached job doesn't store a
+                    // separate pgid (see Job::pgid's doc comment), but
+                    // its own pid always equals its own pgid (setsid),
+                    // so send_signal_to_pgrp on that pid resumes it the
+                    // same way.
+                    if let Some(pid) = job.pgid.or_else(|| job.pids.first().copied()) {
+                        send_signal_to_pgrp(pid, SIGCONT);
                     }
                     job.stopped = false;
                     sh_println!(self, "[{}]+  {} &", job.id, job.cmd_text);
