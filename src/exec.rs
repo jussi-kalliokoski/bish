@@ -1319,7 +1319,7 @@ impl Shell {
             Some("next") | Some("n") => ExecResult::Window(WindowAction::Next),
             Some("previous") | Some("prev") | Some("p") => ExecResult::Window(WindowAction::Previous),
             Some("new") | Some("c") | Some("create") => ExecResult::Window(WindowAction::New),
-            Some("close") | Some("x") | Some("exit") => ExecResult::Window(WindowAction::Close),
+            Some("close") | Some("q") | Some("quit") => ExecResult::Window(WindowAction::Close),
             Some("fg") => match args.get(1).and_then(|a| a.parse::<u32>().ok()) {
                 Some(id) => ExecResult::Window(WindowAction::FgSession(id)),
                 None => {
@@ -1334,7 +1334,7 @@ impl Shell {
             None => {
                 sh_eprintln!(
                     self,
-                    "bish: window: missing subcommand (next(n)/previous/new(c,create)/close(x,exit)/fg <id>)"
+                    "bish: window: missing subcommand (next(n)/previous/new(c,create)/close(q,quit)/fg <id>)"
                 );
                 ExecResult::Status(2)
             }
