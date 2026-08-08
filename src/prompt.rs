@@ -1,13 +1,14 @@
-// Default interactive prompt: "user@host:path_abbr <terminator> ", where
-// path_abbr abbreviates parent path components to their first character,
-// spelling out only the final one (e.g. "~/D/P/bish"), and the
-// terminator glyph is "~" for a normal user, "#" for root, or ":" while
-// editor.rs's read_line has a virtual, not-yet-materialized command-mode
-// colon armed (see render_command_armed and editor.rs's read_line for
-// the reversible-entry mechanic this exists to support -- plan.md's
-// "Future improvements" note on making command-mode entry a virtual
-// character instead of literal inserted text). No git-branch segment
-// yet -- there's no git integration in bish at all so far.
+// Default interactive prompt: "user@host:path_abbr<terminator> " (no
+// space before the terminator, matching classic `\u@\h:\w\$ ` PS1
+// style), where path_abbr abbreviates parent path components to their
+// first character, spelling out only the final one (e.g. "~/D/P/bish"),
+// and the terminator glyph is "$" for a normal user, "#" for root, or
+// ":" while editor.rs's read_line has a virtual, not-yet-materialized
+// command-mode colon armed (see render_command_armed and editor.rs's
+// read_line for the reversible-entry mechanic this exists to support --
+// plan.md's "Future improvements" note on making command-mode entry a
+// virtual character instead of literal inserted text). No git-branch
+// segment yet -- there's no git integration in bish at all so far.
 
 use crate::exec::{self, Shell};
 
@@ -40,13 +41,13 @@ fn prefix(shell: &Shell, is_root: bool) -> String {
     let display = shorten_path(&shell.cwd.to_string_lossy(), &home);
     let uh_color = if is_root { ROOT_USER_HOST_COLOR } else { USER_HOST_COLOR };
     let path_color = if is_root { ROOT_PATH_COLOR } else { PATH_COLOR };
-    format!("{uh_color}{}@{}{RESET}:{path_color}{display}{RESET} ", username(), exec::get_hostname())
+    format!("{uh_color}{}@{}{RESET}:{path_color}{display}{RESET}", username(), exec::get_hostname())
 }
 
 pub fn render(shell: &Shell) -> String {
     let is_root = unsafe { geteuid() } == 0;
     let glyph_color = if shell.last_status == 0 { OK_COLOR } else { ERR_COLOR };
-    let glyph = if is_root { "#" } else { "~" };
+    let glyph = if is_root { "#" } else { "$" };
     format!("{}{glyph_color}{glyph}{RESET} ", prefix(shell, is_root))
 }
 
