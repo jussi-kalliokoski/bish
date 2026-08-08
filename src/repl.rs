@@ -4,7 +4,7 @@ use std::io::{self, Write};
 use std::rc::Rc;
 
 use crate::editor::{self, ReadOutcome};
-use crate::exec::{self, ExecResult, Shell, WindowAction};
+use crate::exec::{self, ExecResult, PaneDirection, Shell, WindowAction};
 use crate::history::{self, History};
 use crate::lexer::Lexer;
 use crate::parser::{AndOr, Command, Parser, Pipeline, Program};
@@ -50,7 +50,7 @@ struct SessionState {
 
 type JobFrameId = u32;
 
-// One layer of a window's view stack. Session is the vim-like "same
+// One layer of a pane's view stack. Session is the vim-like "same
 // session shown in multiple windows" case (see WindowEntry's doc
 // comment); Job is a fg'd background job, poll-driven against its own
 // pty (see exec::FgJob and drive_fg_job below) instead of blocking the
@@ -68,35 +68,106 @@ enum Frame {
     Job(JobFrameId),
 }
 
-// A window's view stack: the last (top) entry is what's currently
-// focused/rendered there. Every window starts with exactly one frame
-// (its own session) and stays that way until `window fg` pushes
-// another. `window close` pops the top frame; the window itself is only
-// actually removed once its stack empties (see apply_window_action),
-// refused if it's the last window with nothing left to reveal
-// underneath. Since the same SessionId can legally be the top of more
-// than one window's stack at once (that's the whole point of `window
-// fg`), a session is only ever dropped from `sessions` once no window's
-// stack references it anywhere, at any depth -- see
-// close_orphaned_sessions.
-struct WindowEntry {
-    id: u32,
+type PaneId = u32;
+
+// One pane of a (possibly split) window: exactly what a window's view
+// stack used to be before panes existed (see Frame's doc comment) --
+// the last (top) entry is what's currently rendered/driven in this
+// pane. `window close`/EOF pops the top frame; once a pane's stack
+// empties the pane itself closes (see apply_window_action's Close arm),
+// collapsing the split, or -- if it was the window's only pane -- falls
+// through to the existing "close the whole window" logic unchanged.
+struct Pane {
+    id: PaneId,
     stack: Vec<Frame>,
 }
 
-impl WindowEntry {
-    // The nearest Session frame at or below the top of the stack. In
-    // practice this only ever needs to look one level down (a Job frame
-    // is always pushed onto a window that already has a Session
-    // beneath it, and nothing currently pushes a *second* Job frame on
-    // top of a first), but walks generally rather than assuming that.
+impl Pane {
     fn owning_session(&self) -> SessionId {
         for frame in self.stack.iter().rev() {
             if let Frame::Session(id) = frame {
                 return *id;
             }
         }
-        panic!("a window's stack always has an underlying session frame")
+        panic!("a pane's stack always has an underlying session frame")
+    }
+}
+
+// How a window's screen area is currently divided among its panes.
+// Leaf is the common case (an unsplit window, or one of a split's
+// occupied regions); Split recurses, so nested splits (a horizontal
+// divide with one side further vsplit) are represented naturally.
+// `horizontal` names the divider's own orientation, matching vim's
+// :split (horizontal divider, panes stacked top/bottom) vs :vsplit
+// (vertical divider, panes side by side) -- see compute_regions for how
+// this becomes actual screen rectangles.
+enum PaneLayout {
+    Leaf(PaneId),
+    Split { horizontal: bool, children: Vec<PaneLayout> },
+}
+
+// A window: a set of panes (only ever more than one after `window
+// split`/`vsplit`) arranged by `layout`, with `focused_pane` marking
+// which one currently receives input and drives the prompt/job-loop --
+// everything that used to read/write a window's single `stack` now goes
+// through `stack()`/`stack_mut()`, which always resolve to the focused
+// pane's stack, so the bulk of the surrounding machinery (job driving,
+// EOF handling, `window fg`, close) needed no conceptual changes, only
+// this one indirection. Since the same SessionId can legally be the top
+// of more than one pane's stack at once (across windows via `window
+// fg`, or now within one window too), a session is only ever dropped
+// from `sessions` once no pane anywhere references it, at any depth --
+// see close_orphaned_sessions.
+struct WindowEntry {
+    id: u32,
+    layout: PaneLayout,
+    panes: Vec<Pane>,
+    focused_pane: PaneId,
+    next_pane_id: PaneId,
+}
+
+impl WindowEntry {
+    fn single(id: u32, initial_frame: Frame) -> WindowEntry {
+        WindowEntry {
+            id,
+            layout: PaneLayout::Leaf(0),
+            panes: vec![Pane { id: 0, stack: vec![initial_frame] }],
+            focused_pane: 0,
+            next_pane_id: 1,
+        }
+    }
+
+    fn pane(&self, id: PaneId) -> &Pane {
+        self.panes.iter().find(|p| p.id == id).expect("pane id always refers to a live pane in this window")
+    }
+
+    fn pane_mut(&mut self, id: PaneId) -> &mut Pane {
+        self.panes.iter_mut().find(|p| p.id == id).expect("pane id always refers to a live pane in this window")
+    }
+
+    fn focused(&self) -> &Pane {
+        self.pane(self.focused_pane)
+    }
+
+    // The focused pane's own frame stack -- everywhere this used to be
+    // a plain field access (`window.stack`) before panes existed.
+    fn stack(&self) -> &Vec<Frame> {
+        &self.focused().stack
+    }
+
+    fn stack_mut(&mut self) -> &mut Vec<Frame> {
+        let id = self.focused_pane;
+        &mut self.pane_mut(id).stack
+    }
+
+    // The nearest Session frame at or below the top of the *focused*
+    // pane's stack. In practice this only ever needs to look one level
+    // down (a Job frame is always pushed onto a stack that already has
+    // a Session beneath it, and nothing currently pushes a *second* Job
+    // frame on top of a first), but walks generally rather than
+    // assuming that.
+    fn owning_session(&self) -> SessionId {
+        self.focused().owning_session()
     }
 }
 
@@ -125,17 +196,19 @@ fn content_rows(term_rows: usize) -> usize {
 // doc comment on why the same session can appear more than once).
 fn session_referenced_elsewhere(windows: &[WindowEntry], current_window: usize, sid: SessionId) -> bool {
     for (i, w) in windows.iter().enumerate() {
-        for (depth, frame) in w.stack.iter().enumerate() {
-            let matches = match frame {
-                Frame::Session(s) => *s == sid,
-                Frame::Job(_) => false,
-            };
-            if !matches {
-                continue;
-            }
-            let is_the_one_reference_in_question = i == current_window && depth == w.stack.len() - 1;
-            if !is_the_one_reference_in_question {
-                return true;
+        for pane in &w.panes {
+            for (depth, frame) in pane.stack.iter().enumerate() {
+                let matches = match frame {
+                    Frame::Session(s) => *s == sid,
+                    Frame::Job(_) => false,
+                };
+                if !matches {
+                    continue;
+                }
+                let is_the_one_reference_in_question = i == current_window && pane.id == w.focused_pane && depth == pane.stack.len() - 1;
+                if !is_the_one_reference_in_question {
+                    return true;
+                }
             }
         }
     }
@@ -173,7 +246,7 @@ pub fn run(mut shell: Shell) {
             dir_history_index: 0,
         },
     );
-    let mut windows: Vec<WindowEntry> = vec![WindowEntry { id: 0, stack: vec![Frame::Session(0)] }];
+    let mut windows: Vec<WindowEntry> = vec![WindowEntry::single(0, Frame::Session(0))];
     let mut current_window: usize = 0;
     let mut next_session_id: SessionId = 1;
     let mut next_window_id: u32 = 1;
@@ -220,7 +293,7 @@ pub fn run(mut shell: Shell) {
         // window they'd earlier detached from (drive_fg_job's
         // FgOutcome::Detached) while it kept running in the background.
         // Either way, drive it the same way.
-        if let Frame::Job(job_frame_id) = *windows[current_window].stack.last().unwrap() {
+        if let Frame::Job(job_frame_id) = *windows[current_window].stack().last().unwrap() {
             run_fg_job_frame(
                 job_frame_id,
                 session_id,
@@ -263,7 +336,7 @@ pub fn run(mut shell: Shell) {
                 // fire the exit trap for a session that's still alive
                 // and reachable elsewhere.
                 let will_orphan = !session_referenced_elsewhere(&windows, current_window, session_id);
-                let is_final_exit = will_orphan && windows.len() == 1 && windows[current_window].stack.len() == 1;
+                let is_final_exit = will_orphan && windows.len() == 1 && windows[current_window].panes.len() == 1 && windows[current_window].stack().len() == 1;
                 // Real bash refuses a plain Ctrl-D exit the first time
                 // there's a stopped job ("There are stopped jobs."),
                 // requiring a second immediate EOF to actually confirm
@@ -494,7 +567,7 @@ pub fn run(mut shell: Shell) {
                     let job_frame_id = next_job_frame_id;
                     next_job_frame_id += 1;
                     job_frames.insert(job_frame_id, fg_job);
-                    windows[current_window].stack.push(Frame::Job(job_frame_id));
+                    windows[current_window].stack_mut().push(Frame::Job(job_frame_id));
 
                     run_fg_job_frame(
                         job_frame_id,
@@ -598,16 +671,17 @@ fn run_fg_job_frame(
     let mut job = job_frames.remove(&job_frame_id).expect("Frame::Job always has a live job_frames entry");
     let focused_screen = sessions[&session_id].screen.clone();
     let tab_bar = tab_bar_line(sessions, windows, *current_window);
+    let layout = snapshot_window(&windows[*current_window], sessions, term_rows, term_cols);
     let cw = *current_window;
     let outcome = drive_fg_job(
         &mut job,
         &focused_screen,
-        || render_compositor_frame(&focused_screen, &tab_bar, term_rows),
+        || render_compositor_frame(&layout, &tab_bar, term_rows),
         || service_background_jobs(sessions, windows, job_frames, cw),
     );
     match outcome {
         FgOutcome::Exited(status) => {
-            windows[*current_window].stack.pop();
+            windows[*current_window].stack_mut().pop();
             sessions.get_mut(&session_id).unwrap().shell.last_status = status;
             if *sinks_are_grid {
                 compositor_redraw(sessions, windows, *current_window, term_rows, term_cols);
@@ -635,7 +709,7 @@ fn run_fg_job_frame(
             // -- it's no longer "a window's live top frame," it's a
             // genuine Stopped job now, addressable via jobs/fg/bg like
             // any other (see Shell::park_stopped_fg_job).
-            windows[*current_window].stack.pop();
+            windows[*current_window].stack_mut().pop();
             let session = sessions.get_mut(&session_id).unwrap();
             let (id, cmd_text) = session.shell.park_stopped_fg_job(job);
             session.shell.sink_err(&format!("\n[{}]+  Stopped                 {}\n", id, cmd_text));
@@ -712,16 +786,25 @@ fn apply_window_action(
             );
             let wid = *next_window_id;
             *next_window_id += 1;
-            windows.push(WindowEntry { id: wid, stack: vec![Frame::Session(sid)] });
+            windows.push(WindowEntry::single(wid, Frame::Session(sid)));
             *current_window = windows.len() - 1;
         }
         WindowAction::Close => {
-            if windows[*current_window].stack.len() > 1 {
-                // Popping a frame off this window's own stack, not
-                // closing the window -- always fine regardless of how
-                // many windows exist, and never orphans a session since
-                // what's revealed underneath was already a live frame.
-                windows[*current_window].stack.pop();
+            if windows[*current_window].stack().len() > 1 {
+                // Popping a frame off the focused pane's own stack, not
+                // closing anything -- always fine regardless of how
+                // many windows/panes exist, and never orphans a session
+                // since what's revealed underneath was already a live
+                // frame.
+                windows[*current_window].stack_mut().pop();
+            } else if windows[*current_window].panes.len() > 1 {
+                // The focused pane's stack is down to just its own
+                // session with nothing else to reveal -- but it's one
+                // of several panes in a split window, so close just
+                // this pane (collapsing the split) rather than falling
+                // through to "close the whole window".
+                close_focused_pane(&mut windows[*current_window]);
+                close_orphaned_sessions(sessions, windows);
             } else if windows.len() == 1 {
                 let sid = windows[*current_window].owning_session();
                 sessions[&sid].shell.sink_err("bish: window close: cannot close the last window -- exit the shell instead\n");
@@ -736,10 +819,10 @@ fn apply_window_action(
             }
         }
         WindowAction::FgSession(target_id) => {
-            let target_frame = windows.iter().find(|w| w.id == target_id).map(|w| *w.stack.last().unwrap());
+            let target_frame = windows.iter().find(|w| w.id == target_id).map(|w| *w.stack().last().unwrap());
             let cur_sid = windows[*current_window].owning_session();
             match target_frame {
-                Some(frame @ Frame::Session(_)) => windows[*current_window].stack.push(frame),
+                Some(frame @ Frame::Session(_)) => windows[*current_window].stack_mut().push(frame),
                 // A running job is a one-place-at-a-time resource (see
                 // Frame's doc comment) -- unlike a session, it can't
                 // legitimately be shown in two windows at once.
@@ -751,8 +834,138 @@ fn apply_window_action(
                 }
             }
         }
+        WindowAction::Split { horizontal } => {
+            split_focused_pane(sessions, windows, *current_window, next_session_id, history, horizontal, term_rows, term_cols);
+        }
+        WindowAction::FocusPane(direction) => {
+            focus_pane_direction(&mut windows[*current_window], direction, term_rows, term_cols);
+        }
     }
     compositor_redraw(sessions, windows, *current_window, term_rows, term_cols);
+}
+
+// Creates a new pane in the current window by splitting the focused one
+// in two: the new half holds a freshly cloned session (the same
+// session-cloning primitive `window new` uses -- see WindowAction::New
+// above) and takes focus, matching tmux's own "split creates a new
+// shell and focuses it" convention. See PaneLayout's doc comment for
+// how `horizontal` maps to the divider's orientation, and
+// insert_sibling for why repeated same-direction splits stay flat (N
+// evenly sized panes) rather than progressively halving.
+#[allow(clippy::too_many_arguments)]
+fn split_focused_pane(
+    sessions: &mut HashMap<SessionId, SessionState>,
+    windows: &mut [WindowEntry],
+    current_window: usize,
+    next_session_id: &mut SessionId,
+    history: &History,
+    horizontal: bool,
+    term_rows: usize,
+    term_cols: usize,
+) {
+    let parent_id = windows[current_window].owning_session();
+    let mut child_shell = sessions[&parent_id].shell.new_virtual_child();
+    let screen = Rc::new(RefCell::new(vt100::Screen::new(content_rows(term_rows), term_cols)));
+    child_shell.set_sink_grid(screen.clone());
+    let child_cwd = child_shell.cwd.clone();
+    let sid = *next_session_id;
+    *next_session_id += 1;
+    sessions.insert(
+        sid,
+        SessionState {
+            shell: child_shell,
+            buffer: String::new(),
+            history_boundary: history.boundary(),
+            screen,
+            warned_stopped_jobs: false,
+            dir_history: vec![child_cwd],
+            dir_history_index: 0,
+        },
+    );
+
+    let window = &mut windows[current_window];
+    let new_pane_id = window.next_pane_id;
+    window.next_pane_id += 1;
+    window.panes.push(Pane { id: new_pane_id, stack: vec![Frame::Session(sid)] });
+
+    let focused_id = window.focused_pane;
+    let old_layout = std::mem::replace(&mut window.layout, PaneLayout::Leaf(0));
+    window.layout = insert_sibling(old_layout, focused_id, new_pane_id, horizontal);
+    window.focused_pane = new_pane_id;
+}
+
+// Finds `target`'s Leaf within the tree and turns it into a 2-way
+// Split holding the original pane plus `new_id` -- UNLESS `target` is
+// already a direct child of a Split whose own orientation matches
+// `horizontal`, in which case `new_id` is simply inserted as another
+// sibling of that same Split instead of nesting. That distinction is
+// what keeps repeated same-direction splits an even N-way division
+// (compute_regions splits one Split's area evenly among however many
+// children it has) rather than each new split only ever halving
+// whatever was there before.
+fn insert_sibling(layout: PaneLayout, target: PaneId, new_id: PaneId, horizontal: bool) -> PaneLayout {
+    match layout {
+        PaneLayout::Leaf(id) if id == target => PaneLayout::Split { horizontal, children: vec![PaneLayout::Leaf(id), PaneLayout::Leaf(new_id)] },
+        PaneLayout::Leaf(id) => PaneLayout::Leaf(id),
+        PaneLayout::Split { horizontal: h, children } => {
+            let direct_child_idx = children.iter().position(|c| matches!(c, PaneLayout::Leaf(id) if *id == target));
+            if let Some(idx) = direct_child_idx {
+                if h == horizontal {
+                    let mut children = children;
+                    children.insert(idx + 1, PaneLayout::Leaf(new_id));
+                    return PaneLayout::Split { horizontal: h, children };
+                }
+            }
+            let children = children.into_iter().map(|c| insert_sibling(c, target, new_id, horizontal)).collect();
+            PaneLayout::Split { horizontal: h, children }
+        }
+    }
+}
+
+// Removes `target`'s Leaf from the tree, collapsing any Split left with
+// only one child down to that child directly (so a 2-way split closing
+// one side goes back to a plain unsplit Leaf, and a 3-way split closing
+// one side stays a 2-way split, not a redundant 1-child Split node).
+fn remove_from_layout(layout: PaneLayout, target: PaneId) -> Option<PaneLayout> {
+    match layout {
+        PaneLayout::Leaf(id) => {
+            if id == target {
+                None
+            } else {
+                Some(PaneLayout::Leaf(id))
+            }
+        }
+        PaneLayout::Split { horizontal, children } => {
+            let new_children: Vec<PaneLayout> = children.into_iter().filter_map(|c| remove_from_layout(c, target)).collect();
+            match new_children.len() {
+                0 => None,
+                1 => new_children.into_iter().next(),
+                _ => Some(PaneLayout::Split { horizontal, children: new_children }),
+            }
+        }
+    }
+}
+
+fn first_leaf(layout: &PaneLayout) -> PaneId {
+    match layout {
+        PaneLayout::Leaf(id) => *id,
+        PaneLayout::Split { children, .. } => first_leaf(&children[0]),
+    }
+}
+
+// Closes the currently focused pane of a window that has more than one
+// -- called only once WindowAction::Close has already confirmed the
+// focused pane's own stack has nothing left to reveal underneath (see
+// its call site). Picks the new focused pane deterministically (the
+// layout tree's own first leaf) rather than trying to guess a
+// spatially "nearest" one -- simple and predictable, matching this
+// first pane-support pass's plain-layout scope.
+fn close_focused_pane(window: &mut WindowEntry) {
+    let closing = window.focused_pane;
+    let old_layout = std::mem::replace(&mut window.layout, PaneLayout::Leaf(0));
+    window.layout = remove_from_layout(old_layout, closing).expect("closing one of >1 panes always leaves at least one behind");
+    window.panes.retain(|p| p.id != closing);
+    window.focused_pane = first_leaf(&window.layout);
 }
 
 // A session stops being referenced when the last window whose stack
@@ -764,8 +977,9 @@ fn apply_window_action(
 fn close_orphaned_sessions(sessions: &mut HashMap<SessionId, SessionState>, windows: &[WindowEntry]) {
     let referenced: std::collections::HashSet<SessionId> = windows
         .iter()
-        .flat_map(|w| {
-            w.stack.iter().filter_map(|f| match f {
+        .flat_map(|w| w.panes.iter())
+        .flat_map(|p| {
+            p.stack.iter().filter_map(|f| match f {
                 Frame::Session(id) => Some(*id),
                 Frame::Job(_) => None,
             })
@@ -786,10 +1000,10 @@ fn close_orphaned_sessions(sessions: &mut HashMap<SessionId, SessionState>, wind
 // requirement, and this keeps both redraw paths sharing one
 // implementation (render_compositor_frame) rather than risking them
 // drifting apart.
-fn compositor_redraw(sessions: &HashMap<SessionId, SessionState>, windows: &[WindowEntry], current_window: usize, term_rows: usize, _term_cols: usize) {
-    let session_id = windows[current_window].owning_session();
+fn compositor_redraw(sessions: &HashMap<SessionId, SessionState>, windows: &[WindowEntry], current_window: usize, term_rows: usize, term_cols: usize) {
     let tab_bar = tab_bar_line(sessions, windows, current_window);
-    render_compositor_frame(&sessions[&session_id].screen, &tab_bar, term_rows);
+    let layout = snapshot_window(&windows[current_window], sessions, term_rows, term_cols);
+    render_compositor_frame(&layout, &tab_bar, term_rows);
 }
 
 // How drive_fg_job's blocking loop ended.
@@ -926,13 +1140,18 @@ fn drive_fg_job(job: &mut exec::FgJob, screen: &Rc<RefCell<vt100::Screen>>, mut 
     outcome
 }
 
-// Keeps every OTHER window's fg'd job alive while `skip_window` is the
-// one actually being watched (via drive_fg_job) or typed into (via
-// editor::read_line) -- called from both of those as their on_idle hook
-// (M10c). Non-blocking, bounded the same way drive_fg_job's own drain is:
-// a firehose producer in a backgrounded window shouldn't be able to make
-// this take arbitrarily long before returning control to whichever of
-// the two loops above called it.
+// Keeps every OTHER pane's fg'd job alive while (skip_window,
+// its focused pane) is the one actually being watched (via
+// drive_fg_job) or typed into (via editor::read_line) -- called from
+// both of those as their on_idle hook (M10c). A Frame::Job can end up
+// in any pane, not just the focused one of its window (the user can
+// navigate focus away via `window` h/j/k/l while it's still running),
+// so every pane of every window is checked here, not just each
+// window's single focused-pane stack. Non-blocking, bounded the same
+// way drive_fg_job's own drain is: a firehose producer in a
+// backgrounded pane shouldn't be able to make this take arbitrarily
+// long before returning control to whichever of the two loops above
+// called it.
 fn service_background_jobs(
     sessions: &mut HashMap<SessionId, SessionState>,
     windows: &mut [WindowEntry],
@@ -944,41 +1163,44 @@ fn service_background_jobs(
     const MAX_READS_PER_TICK: u32 = 16;
     let mut buf = [0u8; 4096];
     for i in 0..windows.len() {
-        if i == skip_window {
-            continue;
-        }
-        let job_frame_id = match windows[i].stack.last() {
-            Some(Frame::Job(id)) => *id,
-            _ => continue,
-        };
-        let sid = windows[i].owning_session();
-        let screen = sessions[&sid].screen.clone();
-        let job = match job_frames.get_mut(&job_frame_id) {
-            Some(j) => j,
-            None => continue,
-        };
-        for _ in 0..MAX_READS_PER_TICK {
-            match job.pty_master().read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => screen.borrow_mut().feed(&buf[..n]),
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                Err(_) => break,
+        let pane_ids: Vec<PaneId> = windows[i].panes.iter().map(|p| p.id).collect();
+        for pane_id in pane_ids {
+            if i == skip_window && pane_id == windows[i].focused_pane {
+                continue;
             }
-        }
-        match job.poll_untraced() {
-            exec::FgWait::Exited(status) => {
-                windows[i].stack.pop();
-                job_frames.remove(&job_frame_id);
-                sessions.get_mut(&sid).unwrap().shell.last_status = status;
+            let job_frame_id = match windows[i].pane(pane_id).stack.last() {
+                Some(Frame::Job(id)) => *id,
+                _ => continue,
+            };
+            let sid = windows[i].pane(pane_id).owning_session();
+            let screen = sessions[&sid].screen.clone();
+            let job = match job_frames.get_mut(&job_frame_id) {
+                Some(j) => j,
+                None => continue,
+            };
+            for _ in 0..MAX_READS_PER_TICK {
+                match job.pty_master().read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => screen.borrow_mut().feed(&buf[..n]),
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(_) => break,
+                }
             }
-            exec::FgWait::Stopped => {
-                windows[i].stack.pop();
-                let job = job_frames.remove(&job_frame_id).unwrap();
-                let (id, cmd_text) = sessions.get_mut(&sid).unwrap().shell.park_stopped_fg_job(job);
-                sessions[&sid].shell.sink_err(&format!("\n[{}]+  Stopped                 {}\n", id, cmd_text));
-                sessions.get_mut(&sid).unwrap().shell.last_status = 148;
+            match job.poll_untraced() {
+                exec::FgWait::Exited(status) => {
+                    windows[i].pane_mut(pane_id).stack.pop();
+                    job_frames.remove(&job_frame_id);
+                    sessions.get_mut(&sid).unwrap().shell.last_status = status;
+                }
+                exec::FgWait::Stopped => {
+                    windows[i].pane_mut(pane_id).stack.pop();
+                    let job = job_frames.remove(&job_frame_id).unwrap();
+                    let (id, cmd_text) = sessions.get_mut(&sid).unwrap().shell.park_stopped_fg_job(job);
+                    sessions[&sid].shell.sink_err(&format!("\n[{}]+  Stopped                 {}\n", id, cmd_text));
+                    sessions.get_mut(&sid).unwrap().shell.last_status = 148;
+                }
+                exec::FgWait::Running => {}
             }
-            exec::FgWait::Running => {}
         }
     }
 }
@@ -995,32 +1217,231 @@ unsafe extern "C" {
     fn raw_read(fd: i32, buf: *mut u8, count: usize) -> isize;
 }
 
+// A screen-coordinate rectangle within the compositor's content area
+// (everything above the pinned tab-bar row), 0-indexed. Produced by
+// compute_regions from a window's PaneLayout tree.
+#[derive(Clone, Copy)]
+struct Rect {
+    row: usize,
+    col: usize,
+    rows: usize,
+    cols: usize,
+}
+
+// One leaf pane's rendering info, resolved from a window's layout tree
+// against the real terminal size: which rectangle it occupies, a live
+// (Rc-shared, not a content copy -- see run_fg_job_frame's own comment
+// on why that matters for a job's redraw callback) reference to its
+// owning session's grid, and whether it's the focused pane (only one
+// ever is), which decides where the real cursor ends up.
+struct PaneSnapshot {
+    rect: Rect,
+    screen: Rc<RefCell<vt100::Screen>>,
+    focused: bool,
+}
+
+// Everything render_compositor_frame needs for one window: its panes'
+// resolved rectangles/screens plus the divider line segments between
+// them (see compute_regions).
+struct CompositorLayout {
+    panes: Vec<PaneSnapshot>,
+    dividers: Vec<(Rect, bool)>,
+}
+
+// Walks `layout`, splitting `area` evenly among each Split's children
+// (reserving one row/col between siblings for a divider line) down to
+// each Leaf's own rectangle. `dividers` collects the reserved divider
+// strips separately (row=true for a horizontal divider line, running
+// left-right; false for a vertical one, running top-bottom) so the
+// caller can draw them after every pane's own content, rather than
+// each Split trying to draw into space a child might otherwise want.
+fn compute_regions(layout: &PaneLayout, area: Rect, out: &mut Vec<(PaneId, Rect)>, dividers: &mut Vec<(Rect, bool)>) {
+    match layout {
+        PaneLayout::Leaf(id) => out.push((*id, area)),
+        PaneLayout::Split { horizontal, children } => {
+            let n = children.len();
+            if n == 0 {
+                return;
+            }
+            if *horizontal {
+                // Panes stacked top/bottom; the divider is the horizontal
+                // line between them.
+                let divider_rows = n - 1;
+                let usable = area.rows.saturating_sub(divider_rows);
+                let base = usable / n;
+                let mut extra = usable % n;
+                let mut row = area.row;
+                for (i, child) in children.iter().enumerate() {
+                    let mut h = base;
+                    if extra > 0 {
+                        h += 1;
+                        extra -= 1;
+                    }
+                    let h = h.max(1);
+                    compute_regions(child, Rect { row, col: area.col, rows: h, cols: area.cols }, out, dividers);
+                    row += h;
+                    if i + 1 < n {
+                        dividers.push((Rect { row, col: area.col, rows: 1, cols: area.cols }, true));
+                        row += 1;
+                    }
+                }
+            } else {
+                // Panes side by side; the divider is the vertical line
+                // between them.
+                let divider_cols = n - 1;
+                let usable = area.cols.saturating_sub(divider_cols);
+                let base = usable / n;
+                let mut extra = usable % n;
+                let mut col = area.col;
+                for (i, child) in children.iter().enumerate() {
+                    let mut w = base;
+                    if extra > 0 {
+                        w += 1;
+                        extra -= 1;
+                    }
+                    let w = w.max(1);
+                    compute_regions(child, Rect { row: area.row, col, rows: area.rows, cols: w }, out, dividers);
+                    col += w;
+                    if i + 1 < n {
+                        dividers.push((Rect { row: area.row, col, rows: area.rows, cols: 1 }, false));
+                        col += 1;
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Resolves a window's layout against the real terminal size into a
+// CompositorLayout, resizing every involved session's grid (Screen::
+// resize, same primitive SIGWINCH already uses) to match its pane's
+// actual rectangle along the way -- a session's grid always matches
+// whatever pane last displayed it, the same way a plain unsplit
+// window's grid already tracked the whole content area.
+fn snapshot_window(window: &WindowEntry, sessions: &HashMap<SessionId, SessionState>, term_rows: usize, term_cols: usize) -> CompositorLayout {
+    let area = Rect { row: 0, col: 0, rows: content_rows(term_rows), cols: term_cols };
+    let mut regions = Vec::new();
+    let mut dividers = Vec::new();
+    compute_regions(&window.layout, area, &mut regions, &mut dividers);
+
+    let panes = regions
+        .into_iter()
+        .map(|(pane_id, rect)| {
+            let sid = window.pane(pane_id).owning_session();
+            let screen = sessions[&sid].screen.clone();
+            let (srows, scols) = screen.borrow().size();
+            if (srows, scols) != (rect.rows, rect.cols) {
+                screen.borrow_mut().resize(rect.rows, rect.cols);
+            }
+            PaneSnapshot { rect, screen, focused: pane_id == window.focused_pane }
+        })
+        .collect();
+
+    CompositorLayout { panes, dividers }
+}
+
 // The actual drawing: shared by compositor_redraw (reads the tab bar
 // live from `sessions`) and drive_pending_fg's redraw callback (which
 // can't hold a live borrow of `sessions` for its whole poll loop -- see
 // that call site's comment -- so it passes a tab bar string snapshotted
-// once, up front, instead).
-fn render_compositor_frame(screen: &Rc<RefCell<vt100::Screen>>, tab_bar: &str, term_rows: usize) {
-    let screen = screen.borrow();
-    let (rows, cols) = screen.size();
-
+// once, up front, instead). Every pane in `layout` is drawn into its
+// own rectangle, followed by the divider lines between them (see
+// compute_regions) -- an unsplit window is just the single-pane case of
+// this, no divider lines drawn at all.
+fn render_compositor_frame(layout: &CompositorLayout, tab_bar: &str, term_rows: usize) {
     let mut out = String::new();
     out.push_str("\x1b[2J\x1b[H");
-    for r in 0..rows {
-        render_row(&mut out, &screen, r, cols);
-        out.push_str("\r\n");
+
+    for pane in &layout.panes {
+        let screen = pane.screen.borrow();
+        for r in 0..pane.rect.rows {
+            out.push_str(&format!("\x1b[{};{}H", pane.rect.row + r + 1, pane.rect.col + 1));
+            render_row(&mut out, &screen, r, pane.rect.cols);
+        }
+    }
+
+    for (rect, horizontal) in &layout.dividers {
+        draw_divider(&mut out, *rect, *horizontal);
     }
 
     // Tab bar pinned to the terminal's real last row.
     out.push_str(&format!("\x1b[{};1H\x1b[K", term_rows));
     out.push_str(tab_bar);
 
+    let focused = layout.panes.iter().find(|p| p.focused).expect("exactly one pane is always focused");
+    let screen = focused.screen.borrow();
     let (cur_row, cur_col) = screen.cursor();
-    out.push_str(&format!("\x1b[{};{}H", cur_row + 1, cur_col + 1));
+    out.push_str(&format!("\x1b[{};{}H", focused.rect.row + cur_row + 1, focused.rect.col + cur_col + 1));
     out.push_str(if screen.cursor_visible { "\x1b[?25h" } else { "\x1b[?25l" });
 
     print!("{}", out);
     let _ = io::stdout().flush();
+}
+
+// Draws a plain single-line divider (box-drawing characters, no color)
+// along a reserved strip from compute_regions. Nested splits can leave
+// a T-junction where one divider meets another; those get whichever
+// line is drawn second rather than a proper junction glyph -- a small,
+// accepted cosmetic gap for this first pane-support pass rather than
+// tracking junction geometry across independently-drawn divider
+// segments.
+fn draw_divider(out: &mut String, rect: Rect, horizontal: bool) {
+    if horizontal {
+        out.push_str(&format!("\x1b[{};{}H", rect.row + 1, rect.col + 1));
+        out.push_str(&"─".repeat(rect.cols));
+    } else {
+        for r in 0..rect.rows {
+            out.push_str(&format!("\x1b[{};{}H", rect.row + r + 1, rect.col + 1));
+            out.push('│');
+        }
+    }
+}
+
+// vim/tmux Ctrl-w-hjkl-style spatial pane focus: moves to whichever
+// other leaf's center lies in the requested direction from the
+// currently focused leaf's center and is closest to it, ignoring
+// anything not in that direction. A no-op if the window isn't split
+// (single leaf) or nothing qualifies (e.g. `left` from the leftmost
+// pane).
+fn focus_pane_direction(window: &mut WindowEntry, direction: PaneDirection, term_rows: usize, term_cols: usize) {
+    let area = Rect { row: 0, col: 0, rows: content_rows(term_rows), cols: term_cols };
+    let mut regions = Vec::new();
+    let mut dividers = Vec::new();
+    compute_regions(&window.layout, area, &mut regions, &mut dividers);
+    if regions.len() <= 1 {
+        return;
+    }
+    let current_rect = regions.iter().find(|(id, _)| *id == window.focused_pane).map(|(_, r)| *r).unwrap();
+    let (cx, cy) = rect_center(&current_rect);
+
+    let mut best: Option<(PaneId, i64)> = None;
+    for (id, rect) in &regions {
+        if *id == window.focused_pane {
+            continue;
+        }
+        let (ox, oy) = rect_center(rect);
+        let (dx, dy) = (ox as i64 - cx as i64, oy as i64 - cy as i64);
+        let in_direction = match direction {
+            PaneDirection::Left => dx < 0,
+            PaneDirection::Right => dx > 0,
+            PaneDirection::Up => dy < 0,
+            PaneDirection::Down => dy > 0,
+        };
+        if !in_direction {
+            continue;
+        }
+        let dist = dx.abs() + dy.abs();
+        if best.is_none_or(|(_, best_dist)| dist < best_dist) {
+            best = Some((*id, dist));
+        }
+    }
+    if let Some((id, _)) = best {
+        window.focused_pane = id;
+    }
+}
+
+fn rect_center(rect: &Rect) -> (usize, usize) {
+    (rect.col + rect.cols / 2, rect.row + rect.rows / 2)
 }
 
 fn render_row(out: &mut String, screen: &vt100::Screen, row: usize, cols: usize) {

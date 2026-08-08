@@ -200,6 +200,26 @@ pub enum WindowAction {
     // index -- ids are stable identifiers, indices shift as windows
     // close.
     FgSession(u32),
+    // `window split`/`s` (horizontal divider, panes stacked top/bottom)
+    // or `window vsplit`/`v` (vertical divider, panes side by side):
+    // divides the focused pane of the current window in two, the new
+    // half holding a freshly cloned session (same session-cloning
+    // primitive `New` already uses) and taking focus. See repl.rs's
+    // PaneLayout for how the split tree itself is represented.
+    Split { horizontal: bool },
+    // `window h/left`, `j/below`, `k/above`, `l/right`: move focus to
+    // the nearest pane in that direction from the currently focused
+    // one, vim Ctrl-w-hjkl style. A no-op if the current window isn't
+    // split, or nothing lies in that direction.
+    FocusPane(PaneDirection),
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum PaneDirection {
+    Left,
+    Right,
+    Up,
+    Down,
 }
 
 pub struct Shell {
@@ -1320,6 +1340,12 @@ impl Shell {
             Some("previous") | Some("prev") | Some("p") => ExecResult::Window(WindowAction::Previous),
             Some("new") | Some("c") | Some("create") => ExecResult::Window(WindowAction::New),
             Some("close") | Some("q") | Some("quit") => ExecResult::Window(WindowAction::Close),
+            Some("split") | Some("s") => ExecResult::Window(WindowAction::Split { horizontal: true }),
+            Some("vsplit") | Some("v") => ExecResult::Window(WindowAction::Split { horizontal: false }),
+            Some("h") | Some("left") => ExecResult::Window(WindowAction::FocusPane(PaneDirection::Left)),
+            Some("j") | Some("below") => ExecResult::Window(WindowAction::FocusPane(PaneDirection::Down)),
+            Some("k") | Some("above") => ExecResult::Window(WindowAction::FocusPane(PaneDirection::Up)),
+            Some("l") | Some("right") => ExecResult::Window(WindowAction::FocusPane(PaneDirection::Right)),
             Some("fg") => match args.get(1).and_then(|a| a.parse::<u32>().ok()) {
                 Some(id) => ExecResult::Window(WindowAction::FgSession(id)),
                 None => {
@@ -1334,7 +1360,7 @@ impl Shell {
             None => {
                 sh_eprintln!(
                     self,
-                    "bish: window: missing subcommand (next(n)/previous/new(c,create)/close(q,quit)/fg <id>)"
+                    "bish: window: missing subcommand (next(n)/previous/new(c,create)/close(q,quit)/split(s)/vsplit(v)/h(left)/j(below)/k(above)/l(right)/fg <id>)"
                 );
                 ExecResult::Status(2)
             }
