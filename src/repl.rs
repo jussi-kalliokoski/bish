@@ -190,6 +190,7 @@ pub fn run(shell: Shell) {
             }
             Ok(ReadOutcome::Line(line)) => {
                 let mut window_action = None;
+                let mut fg_pending = false;
                 {
                     let session = sessions.get_mut(&session_id).unwrap();
                     if !session.buffer.is_empty() {
@@ -212,8 +213,10 @@ pub fn run(shell: Shell) {
                                 history.record(&session.buffer);
                                 let result = session.shell.run_program(&prog);
                                 session.buffer.clear();
-                                if let ExecResult::Window(action) = result {
-                                    window_action = Some(action);
+                                match result {
+                                    ExecResult::Window(action) => window_action = Some(action),
+                                    ExecResult::Fg => fg_pending = true,
+                                    _ => {}
                                 }
                             }
                             Err(e) => {
@@ -244,13 +247,34 @@ pub fn run(shell: Shell) {
                         term_rows,
                         term_cols,
                     );
+                } else if fg_pending {
+                    // A pty-attached background job was fg'd (see
+                    // ExecResult::Fg's doc comment in exec.rs). The job
+                    // and its pty live entirely inside the focused
+                    // session's Shell (drive_pending_fg needs `&mut
+                    // self` to pump it) -- but the redraw callback it
+                    // calls needs `&sessions` for the tab bar, which
+                    // can't be borrowed at the same time as `&mut
+                    // session.shell` if `session` is a live borrow *of*
+                    // `sessions`. Snapshotting what the callback needs
+                    // (an Rc clone of the focused grid, a one-shot tab
+                    // bar string -- neither changes mid-fg, since no
+                    // other session can run while this one blocks
+                    // pumping the job) sidesteps that entirely: the
+                    // closure below holds no borrow of `sessions` at all.
+                    let focused_screen = sessions[&session_id].screen.clone();
+                    let tab_bar = tab_bar_line(&sessions, &windows, current_window);
+                    let status = sessions.get_mut(&session_id).unwrap().shell.drive_pending_fg(|| {
+                        render_compositor_frame(&focused_screen, &tab_bar, term_rows);
+                    });
+                    sessions.get_mut(&session_id).unwrap().shell.last_status = status;
                 } else if sinks_are_grid {
                     // The common case once promoted: a normal command ran
                     // in the focused session and its output (if any)
                     // landed in that session's grid via its sink -- make
-                    // it visible. Nothing streams live mid-command (M9a
-                    // has no concurrent execution yet, see WindowAction's
-                    // doc comment above); the redraw happens once the
+                    // it visible. Nothing streams live mid-command outside
+                    // of a poll-driven `fg` (the branch above -- this is
+                    // every *other* command); the redraw happens once the
                     // command has fully finished, same as every other
                     // redraw trigger here.
                     compositor_redraw(&sessions, &windows, current_window, term_rows, term_cols);
@@ -340,17 +364,29 @@ fn apply_window_action(
 
 // Full redraw of the currently-focused window's grid plus the tab bar.
 // Always a full clear+redraw rather than a cell/row-level diff: M9a's
-// redraws only ever fire after a discrete event (a command finished, a
-// window switch, a resize) -- infrequent enough that flicker isn't a
-// real concern, and a full redraw is trivially correct (self-healing
-// against anything that wrote to the real terminal directly in between,
-// like editor.rs's Ctrl-L). A real diff only starts earning its keep once
-// M9b adds a continuous per-tick redraw loop (driven by a foregrounded
-// job's pty output arriving while the compositor keeps servicing
-// keystrokes/resizes) -- that's where it's planned to land.
+// discrete-event redraws (a command finished, a window switch, a resize)
+// are infrequent enough that flicker isn't a real concern, and a full
+// redraw is trivially correct (self-healing against anything that wrote
+// to the real terminal directly in between, like editor.rs's Ctrl-L).
+// M9b's poll-driven `fg` (see drive_pending_fg below) is the first truly
+// continuous redraw loop this codebase has -- still full-redraw for now,
+// since a real cell/row diff is an optimization, not a correctness
+// requirement, and this keeps both redraw paths sharing one
+// implementation (render_compositor_frame) rather than risking them
+// drifting apart.
 fn compositor_redraw(sessions: &HashMap<SessionId, SessionState>, windows: &[WindowEntry], current_window: usize, term_rows: usize, _term_cols: usize) {
     let session_id = windows[current_window].session;
-    let screen = sessions[&session_id].screen.borrow();
+    let tab_bar = tab_bar_line(sessions, windows, current_window);
+    render_compositor_frame(&sessions[&session_id].screen, &tab_bar, term_rows);
+}
+
+// The actual drawing: shared by compositor_redraw (reads the tab bar
+// live from `sessions`) and drive_pending_fg's redraw callback (which
+// can't hold a live borrow of `sessions` for its whole poll loop -- see
+// that call site's comment -- so it passes a tab bar string snapshotted
+// once, up front, instead).
+fn render_compositor_frame(screen: &Rc<RefCell<vt100::Screen>>, tab_bar: &str, term_rows: usize) {
+    let screen = screen.borrow();
     let (rows, cols) = screen.size();
 
     let mut out = String::new();
@@ -362,7 +398,7 @@ fn compositor_redraw(sessions: &HashMap<SessionId, SessionState>, windows: &[Win
 
     // Tab bar pinned to the terminal's real last row.
     out.push_str(&format!("\x1b[{};1H\x1b[K", term_rows));
-    out.push_str(&tab_bar_line(sessions, windows, current_window));
+    out.push_str(tab_bar);
 
     let (cur_row, cur_col) = screen.cursor();
     out.push_str(&format!("\x1b[{};{}H", cur_row + 1, cur_col + 1));
@@ -426,14 +462,29 @@ fn sgr_codes(fg: vt100::Color, bg: vt100::Color, attrs: vt100::CellAttrs) -> Str
     format!("\x1b[{}m", codes.join(";"))
 }
 
+// (window_id, is_the_current_window, that window's session's cwd) -- an
+// owned snapshot so drive_pending_fg's redraw callback can build a tab
+// bar without holding a live borrow of `sessions` for its whole poll
+// loop (see that call site's comment for why it can't).
+fn tab_bar_snapshot(sessions: &HashMap<SessionId, SessionState>, windows: &[WindowEntry], current_window: usize) -> Vec<(u32, bool, String)> {
+    windows
+        .iter()
+        .enumerate()
+        .map(|(i, w)| (w.id, i == current_window, sessions[&w.session].shell.cwd.display().to_string()))
+        .collect()
+}
+
 fn tab_bar_line(sessions: &HashMap<SessionId, SessionState>, windows: &[WindowEntry], current_window: usize) -> String {
+    render_tab_bar(&tab_bar_snapshot(sessions, windows, current_window))
+}
+
+fn render_tab_bar(snapshot: &[(u32, bool, String)]) -> String {
     let mut line = String::new();
-    for (i, w) in windows.iter().enumerate() {
-        let cwd = sessions[&w.session].shell.cwd.display();
-        if i == current_window {
-            line.push_str(&format!("\x1b[7m [{}] {} \x1b[0m ", w.id, cwd));
+    for (id, current, cwd) in snapshot {
+        if *current {
+            line.push_str(&format!("\x1b[7m [{}] {} \x1b[0m ", id, cwd));
         } else {
-            line.push_str(&format!(" [{}] {} ", w.id, cwd));
+            line.push_str(&format!(" [{}] {} ", id, cwd));
         }
     }
     line
@@ -493,8 +544,20 @@ fn run_command_mode(shell: &mut Shell, history: &mut History) -> Option<WindowAc
                                 let result = shell.run_program(&prog);
                                 shell.restrict_to_builtins = false;
                                 buffer.clear();
-                                if let ExecResult::Window(action) = result {
-                                    return Some(action);
+                                match result {
+                                    ExecResult::Window(action) => return Some(action),
+                                    // `fg`'s poll loop needs repl.rs's own
+                                    // compositor state, which this nested
+                                    // read-eval loop has no access to (see
+                                    // Shell::discard_pending_fg's doc
+                                    // comment) -- reject it here instead
+                                    // of silently leaving the job stashed
+                                    // and never driven.
+                                    ExecResult::Fg => {
+                                        shell.sink_err("bish: fg: not supported in command mode -- use it from the normal shell prompt\n");
+                                        shell.discard_pending_fg();
+                                    }
+                                    _ => {}
                                 }
                             }
                         }

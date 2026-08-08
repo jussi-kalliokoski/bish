@@ -11,6 +11,8 @@ use crate::lexer::{Chunk, ReplaceAnchor, VarOp};
 use crate::parser::{
     self, AndOr, AssignMode, Combinator, ListItem, Pipeline, Program, Redirect, Sep, SimpleCommand, Word,
 };
+use crate::pty;
+use crate::term;
 use crate::vt100;
 
 // Where a Shell's own output (builtin/diagnostic text -- never a spawned
@@ -148,6 +150,19 @@ pub enum ExecResult {
     // (below) only validates the request and returns it, never touches
     // shared window state itself.
     Window(WindowAction),
+    // `fg` on a job that was spawned pty-attached (see Job::pty_master)
+    // while promoted. Bubbles up exactly like Window, for exactly the
+    // same reason: rendering the job's output into the fg-ing window's
+    // grid and redrawing the real terminal both need repl.rs's own
+    // session/window state, which a session's own Shell can't hold a
+    // reference to (see Window's doc comment). run_fg only removes the
+    // job from the table and stashes it on `self.pending_fg`; repl.rs
+    // reacts to this signal by calling Shell::drive_pending_fg, passing
+    // in a redraw callback -- the actual poll loop (reading the job's
+    // pty, feeding self.sink, forwarding stdin, checking for exit) runs
+    // inside Shell, which is the only thing with access to the private
+    // Job/pty types, but the *redrawing* stays repl.rs's job throughout.
+    Fg,
 }
 
 impl ExecResult {
@@ -156,12 +171,15 @@ impl ExecResult {
             ExecResult::Status(s) => s,
             ExecResult::Return(s) => s,
             ExecResult::Break(_) | ExecResult::Continue(_) => 0,
-            ExecResult::Window(_) => 0,
+            ExecResult::Window(_) | ExecResult::Fg => 0,
         }
     }
 
     fn is_signal(self) -> bool {
-        matches!(self, ExecResult::Break(_) | ExecResult::Continue(_) | ExecResult::Return(_) | ExecResult::Window(_))
+        matches!(
+            self,
+            ExecResult::Break(_) | ExecResult::Continue(_) | ExecResult::Return(_) | ExecResult::Window(_) | ExecResult::Fg
+        )
     }
 }
 
@@ -387,6 +405,12 @@ pub struct Shell {
     // See OutputSink's doc comment: Real until repl.rs flips it to Grid
     // at promotion time.
     sink: OutputSink,
+    // Set by run_fg immediately before returning ExecResult::Fg, taken
+    // right back out by drive_pending_fg (called by repl.rs in response
+    // to that signal) -- see ExecResult::Fg's doc comment. Not shared via
+    // Rc: only ever set and cleared within the single session that ran
+    // `fg`, never meant to be visible to any other session.
+    pending_fg: Option<Job>,
 }
 
 // A fresh, process/time-derived seed -- used both for a brand-new Shell
@@ -446,6 +470,7 @@ impl Shell {
             promoted: Rc::new(Cell::new(false)),
             cwd: std::env::current_dir().unwrap_or_default(),
             sink: OutputSink::Real,
+            pending_fg: None,
         }
     }
 
@@ -468,6 +493,18 @@ impl Shell {
     // terminal -- see OutputSink's doc comment.
     pub fn set_sink_grid(&mut self, screen: Rc<RefCell<vt100::Screen>>) {
         self.sink = OutputSink::Grid(screen);
+    }
+
+    // Used by drive_pending_fg to feed a job's raw pty output straight
+    // into the grid, bypassing sink_out's str-based onlcr translation --
+    // that translation exists for sh_println!-style text which assumes
+    // an untranslated cooked-mode terminal; a job's own pty bytes are
+    // already exactly what a real terminal would receive, \r/\n and all.
+    fn sink_screen(&self) -> Option<Rc<RefCell<vt100::Screen>>> {
+        match &self.sink {
+            OutputSink::Real => None,
+            OutputSink::Grid(screen) => Some(screen.clone()),
+        }
     }
 
     // The in-process session-cloning primitive: creates an independent but
@@ -539,6 +576,7 @@ impl Shell {
             promoted: self.promoted.clone(),
             cwd: self.cwd.clone(),
             sink: OutputSink::Real,
+            pending_fg: None,
         }
     }
 
@@ -564,12 +602,20 @@ impl Shell {
     // job table, and updates $! to the last child's PID (bash's own
     // convention for a backgrounded pipeline).
     fn push_job(&mut self, children: Vec<std::process::Child>, cmd_text: String) {
+        self.push_job_with_pty(children, cmd_text, None);
+    }
+
+    // Same as push_job, but additionally records the pty master (if any)
+    // that job's stdio is attached to -- see Job::pty_master's doc
+    // comment. Only the single-external-command background-spawn site
+    // (run_single) ever passes Some here.
+    fn push_job_with_pty(&mut self, children: Vec<std::process::Child>, cmd_text: String, pty_master: Option<std::fs::File>) {
         let pids: Vec<u32> = children.iter().map(|c| c.id()).collect();
         let mut table = self.jobs.borrow_mut();
         table.last_bg_pid = pids.last().copied();
         let id = table.next_job_id;
         table.next_job_id += 1;
-        table.jobs.push(Job { id, pids, children, cmd_text });
+        table.jobs.push(Job { id, pids, children, cmd_text, pty_master });
     }
 
     fn resolve_job_spec(&self, spec: &str) -> Option<usize> {
@@ -617,14 +663,21 @@ impl Shell {
     }
 
     // `fg` doesn't reassociate the terminal's controlling process group
-    // (see the comment on the `jobs` field) -- it just blocks until the
-    // job finishes, in this process, and reports its exit status. Scripts
-    // don't distinguish that from real terminal foregrounding since they
-    // never interactively signal the job via the keyboard anyway.
-    fn run_fg(&mut self, args: &[String]) -> i32 {
+    // (see the comment on the `jobs` field) -- for a job with no pty
+    // attached, it just blocks until the job finishes, in this process,
+    // and reports its exit status. Scripts don't distinguish that from
+    // real terminal foregrounding since they never interactively signal
+    // the job via the keyboard anyway.
+    //
+    // A job that *was* spawned pty-attached (Job::pty_master.is_some() --
+    // only true for a promoted, unredirected background job) instead
+    // bubbles ExecResult::Fg without blocking at all: see that variant's
+    // doc comment for why the actual poll loop has to happen through
+    // repl.rs's Shell::drive_pending_fg instead of directly here.
+    fn run_fg(&mut self, args: &[String]) -> ExecResult {
         if !self.opt_monitor {
             sh_eprintln!(self, "bish: fg: no job control");
-            return 1;
+            return ExecResult::Status(1);
         }
         let idx = match args.first() {
             Some(spec) => self.resolve_job_spec(spec),
@@ -637,13 +690,114 @@ impl Shell {
                     sh_println!(self, "{}", table.jobs[i].cmd_text);
                     table.jobs.remove(i)
                 };
-                job.wait()
+                if job.pty_master.is_some() {
+                    self.pending_fg = Some(job);
+                    ExecResult::Fg
+                } else {
+                    ExecResult::Status(job.wait())
+                }
             }
             None => {
                 sh_eprintln!(self, "bish: fg: no current job");
-                1
+                ExecResult::Status(1)
             }
         }
+    }
+
+    // Safety net for the one place ExecResult::Fg can arise that repl.rs
+    // doesn't drive it from directly: command mode (`:fg`) has its own
+    // separate, nested read-eval loop (run_command_mode) that can't hand
+    // off to the outer compositor the way a normal insert-mode command
+    // can (see command_mode's own doc comment) -- rather than leaving a
+    // job orphaned on self.pending_fg, repl.rs calls this to reap it with
+    // an ordinary blocking wait instead, same as if it had never had a
+    // pty attached at all.
+    pub fn discard_pending_fg(&mut self) -> i32 {
+        match self.pending_fg.take() {
+            Some(mut job) => job.wait(),
+            None => 0,
+        }
+    }
+
+    // Drives a job stashed via run_fg's ExecResult::Fg to completion.
+    // Reads the job's pty master and feeds bytes straight into this
+    // session's grid (sink_screen -- always Some here, since a pty-
+    // attached job is only ever created while promoted, and promotion
+    // never un-happens), and forwards raw bytes read from bish's own
+    // stdin straight to the job's pty master unmodified: the job's own
+    // controlling-terminal line discipline (its pty slave's default
+    // termios, never touched by this shell) handles things like Ctrl-C
+    // triggering real SIGINT delivery to the job's process group exactly
+    // like a real terminal would -- no bish-side signal-forwarding logic
+    // needed. `redraw` is called after every batch of job output; it's
+    // the only thing here that can see the session/window list this
+    // Shell can't hold a reference to (see ExecResult::Fg's doc comment).
+    //
+    // No detach-and-resume-later: once fg'd, the only ways back to the
+    // normal REPL are the job finishing or Ctrl-C interrupting it,
+    // matching this codebase's existing "no SIGTSTP/Ctrl-Z, no genuine
+    // Stopped jobs" scope (see run_bg's doc comment) -- a real detach key
+    // is future work, not attempted in this pass. Terminal-resize
+    // propagation to the job's own pty is also not attempted here (the
+    // real terminal side still resizes correctly via `redraw`'s own
+    // query -- only the job's belief about its own window size can go
+    // briefly stale if the terminal is resized while it's fg'd).
+    pub fn drive_pending_fg(&mut self, mut redraw: impl FnMut()) -> i32 {
+        use std::io::{Read, Write};
+        use std::os::unix::io::AsRawFd;
+
+        let mut job = self.pending_fg.take().expect("drive_pending_fg called without a pending fg job");
+        let screen = self.sink_screen().expect("pty-attached fg job implies a Grid sink");
+        let master_fd = job.pty_master.as_ref().expect("drive_pending_fg called on a job with no pty").as_raw_fd();
+        set_fd_nonblocking(master_fd);
+        let _raw_guard = term::RawGuard::enable(0).ok();
+
+        let mut buf = [0u8; 4096];
+        // Caps how many chunks get drained per outer-loop tick before
+        // forcing a redraw/stdin-check/exit-check. A firehose job (`yes`
+        // is the extreme case) can keep the pty's read buffer topped up
+        // indefinitely -- reading "until WouldBlock" against a producer
+        // like that means WouldBlock may never actually arrive, starving
+        // this loop's other responsibilities (redrawing, forwarding
+        // keystrokes, noticing the job has exited) forever. Bounding the
+        // drain guarantees this loop always comes back around.
+        const MAX_READS_PER_TICK: u32 = 16;
+        let status = loop {
+            if let Some(status) = job.poll() {
+                break status;
+            }
+
+            let mut made_progress = false;
+            for _ in 0..MAX_READS_PER_TICK {
+                match job.pty_master.as_mut().unwrap().read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        screen.borrow_mut().feed(&buf[..n]);
+                        made_progress = true;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(_) => break,
+                }
+            }
+            if made_progress {
+                redraw();
+            }
+
+            // Short poll timeout: paces this loop (avoiding a CPU-spinning
+            // busy-wait) while staying responsive to both new job output
+            // and new keystrokes.
+            if term::stdin_ready(10) {
+                let n = unsafe { raw_read(0, buf.as_mut_ptr(), buf.len()) };
+                if n > 0 {
+                    let _ = job.pty_master.as_ref().unwrap().write_all(&buf[..n as usize]);
+                } else {
+                    break job.wait();
+                }
+            }
+        };
+        drop(_raw_guard);
+        redraw();
+        status
     }
 
     // Every job this shell tracks is, by construction, already running --
@@ -2070,7 +2224,7 @@ impl Shell {
                     self.last_status = s;
                     last_body_status = s;
                 }
-                ret @ (ExecResult::Return(_) | ExecResult::Window(_)) => return ret,
+                ret @ (ExecResult::Return(_) | ExecResult::Window(_) | ExecResult::Fg) => return ret,
             }
         }
         if ran_body {
@@ -2104,7 +2258,7 @@ impl Shell {
                     continue;
                 }
                 ExecResult::Status(s) => self.last_status = s,
-                ret @ (ExecResult::Return(_) | ExecResult::Window(_)) => return ret,
+                ret @ (ExecResult::Return(_) | ExecResult::Window(_) | ExecResult::Fg) => return ret,
             }
         }
         if ran_body {
@@ -2179,7 +2333,7 @@ impl Shell {
                     continue;
                 }
                 ExecResult::Status(s) => self.last_status = s,
-                ret @ (ExecResult::Return(_) | ExecResult::Window(_)) => return ret,
+                ret @ (ExecResult::Return(_) | ExecResult::Window(_) | ExecResult::Fg) => return ret,
             }
         }
     }
@@ -2225,7 +2379,7 @@ impl Shell {
                     }
                 }
                 ExecResult::Status(s) => self.last_status = s,
-                ret @ (ExecResult::Return(_) | ExecResult::Window(_)) => return ret,
+                ret @ (ExecResult::Return(_) | ExecResult::Window(_) | ExecResult::Fg) => return ret,
             }
             if !step.is_empty() {
                 if let Err(e) = arith::eval(step, self) {
@@ -3086,7 +3240,7 @@ impl Shell {
                 return ExecResult::Status(0);
             }
             "jobs" => return ExecResult::Status(self.run_jobs(&argv[1..])),
-            "fg" => return ExecResult::Status(self.run_fg(&argv[1..])),
+            "fg" => return self.run_fg(&argv[1..]),
             "bg" => return ExecResult::Status(self.run_bg(&argv[1..])),
             "wait" => return ExecResult::Status(self.run_wait(&argv[1..])),
             "kill" => return ExecResult::Status(self.run_kill(&argv[1..])),
@@ -3203,6 +3357,46 @@ impl Shell {
             };
             command.env(k, v);
         }
+        // A background job spawned while promoted, with no redirects of
+        // its own, gets attached to a fresh pty instead of the real
+        // terminal's inherited fds -- see Job::pty_master's doc comment.
+        // That's what lets `fg` (run_fg) later render its output into
+        // the fg-ing window's own grid instead of straight onto whatever
+        // the real screen happens to show (which the compositor's next
+        // redraw would just overwrite anyway). Every other case (not
+        // promoted, or explicitly redirected) keeps today's inherited-
+        // stdio behavior exactly.
+        let use_pty = background
+            && self.is_promoted()
+            && redirs.stdin.is_none()
+            && redirs.stdout.is_none()
+            && redirs.stderr.is_none()
+            && redirs.extra_fds.is_empty();
+
+        if use_pty {
+            if let Ok(p) = pty::open() {
+                let slave_path = p.slave_path.clone();
+                return match pty::spawn_attached(command, &slave_path) {
+                    Ok(child) => {
+                        let mut cmd_text = argv.join(" ");
+                        for r in &cmd.redirects {
+                            cmd_text.push(' ');
+                            cmd_text.push_str(&crate::serialize::serialize_redirect(r));
+                        }
+                        self.push_job_with_pty(vec![child], cmd_text, Some(p.master));
+                        ExecResult::Status(0)
+                    }
+                    Err(e) => {
+                        sh_eprintln!(self, "bish: {}: {}", name, e);
+                        ExecResult::Status(127)
+                    }
+                };
+            }
+            // pty::open() failing (fd exhaustion, etc.) shouldn't stop the
+            // job from running at all, just from being fg-renderable
+            // later -- fall through to the ordinary inherited-stdio path.
+        }
+
         command.stdin(redirs.stdin.unwrap_or_else(Stdio::inherit));
         command.stdout(redirs.stdout.unwrap_or_else(Stdio::inherit));
         command.stderr(redirs.stderr.unwrap_or_else(Stdio::inherit));
@@ -4564,6 +4758,29 @@ impl std::os::fd::AsRawFd for KeptFd {
     }
 }
 
+// Raw, minimal I/O helpers for drive_pending_fg. Renamed via link_name the
+// same way pty.rs's `c_open` is, so the local name doesn't collide with
+// anything already in scope (drive_pending_fg also imports the `Read`
+// trait, which is a different namespace, but this keeps the pattern
+// consistent with pty.rs's own reasoning).
+unsafe extern "C" {
+    #[link_name = "read"]
+    fn raw_read(fd: i32, buf: *mut u8, count: usize) -> isize;
+    fn fcntl(fd: i32, cmd: i32, arg: i32) -> i32;
+}
+const F_GETFL: i32 = 3;
+const F_SETFL: i32 = 4;
+const O_NONBLOCK: i32 = 0o4000;
+
+// Used only for a job's pty master fd, so a poll-driven fg loop can drain
+// whatever output has arrived without ever blocking on it.
+fn set_fd_nonblocking(fd: i32) {
+    unsafe {
+        let flags = fcntl(fd, F_GETFL, 0);
+        fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+    }
+}
+
 // poll/block on them directly -- earlier this shell just spawned a thread
 // that blindly `.wait()`d and dropped the result, which meant nothing else
 // could ever observe a background job's completion or exit status.
@@ -4572,6 +4789,16 @@ struct Job {
     pids: Vec<u32>,
     children: Vec<std::process::Child>,
     cmd_text: String,
+    // Set only for a single-command background job spawned while promoted
+    // and not itself explicitly redirected (see run_single's background-
+    // spawn site) -- the pty (M7) its stdio is attached to instead of
+    // being inherited from the real terminal. `fg` (see run_fg) uses this
+    // to drive poll-based rendering into the fg-ing session's grid
+    // instead of blocking on Job::wait(); every other job (not promoted
+    // at spawn time, part of a multi-stage pipeline, or explicitly
+    // redirected) has this as None and `fg` falls back to exactly
+    // today's blocking behavior for it.
+    pty_master: Option<std::fs::File>,
 }
 
 // Backs Shell.jobs (see that field's doc comment for why this lives behind
