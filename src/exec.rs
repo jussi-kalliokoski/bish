@@ -1238,14 +1238,14 @@ impl Shell {
         match args.first().map(String::as_str) {
             Some("next") => ExecResult::Window(WindowAction::Next),
             Some("previous") | Some("prev") | Some("p") => ExecResult::Window(WindowAction::Previous),
-            Some("new") => ExecResult::Window(WindowAction::New),
-            Some("close") | Some("c") => ExecResult::Window(WindowAction::Close),
+            Some("new") | Some("c") | Some("create") => ExecResult::Window(WindowAction::New),
+            Some("close") | Some("x") | Some("exit") => ExecResult::Window(WindowAction::Close),
             Some(other) => {
                 sh_eprintln!(self, "bish: window: unknown subcommand: {}", other);
                 ExecResult::Status(2)
             }
             None => {
-                sh_eprintln!(self, "bish: window: missing subcommand (next/previous/new/close)");
+                sh_eprintln!(self, "bish: window: missing subcommand (next/previous/new(c,create)/close(x,exit))");
                 ExecResult::Status(2)
             }
         }
