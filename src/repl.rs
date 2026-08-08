@@ -339,6 +339,25 @@ pub fn run(mut shell: Shell) {
                     // second Ctrl-D, with nothing typed in between,
                     // should confirm the exit (see the Eof handler).
                     session.warned_stopped_jobs = false;
+
+                    // Feed the prompt-and-what-was-typed into the grid
+                    // itself, not just the real terminal -- editor::
+                    // read_line only ever draws it directly to the real
+                    // screen, never through the sink, so without this a
+                    // promoted session's next compositor_redraw (a full
+                    // clear-and-redraw-from-the-grid -- see that
+                    // function's own doc comment) wipes it the instant
+                    // any command finishes, even though the command's
+                    // own output now renders fine (M11b). This is what
+                    // actually makes a promoted window read as a normal
+                    // scrolling terminal -- prompt, command, output,
+                    // next prompt -- instead of only ever showing the
+                    // most recent command's output.
+                    if sinks_are_grid {
+                        let echoed = format!("{}{}\r\n", prompt_str, line);
+                        session.screen.borrow_mut().feed(echoed.as_bytes());
+                    }
+
                     if !session.buffer.is_empty() {
                         session.buffer.push('\n');
                     }
