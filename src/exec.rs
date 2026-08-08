@@ -1503,6 +1503,15 @@ impl Shell {
     // is unchanged from before; self.cwd is read back from the OS
     // afterward rather than computed locally, so it stays exactly in sync
     // with what the OS considers the real cwd.
+    // repl.rs's Alt+Left/Right/Up directory-history navigation calls
+    // this directly (bypassing the `cd` builtin's own argv/`-` parsing,
+    // since it always has a concrete absolute path already in hand) to
+    // reuse run_cd's actual directory-change logic -- path resolution,
+    // OLDPWD/PWD updates, error reporting -- rather than duplicating it.
+    pub fn cd_to(&mut self, path: &std::path::Path) -> i32 {
+        self.run_cd(&[path.to_string_lossy().into_owned()])
+    }
+
     fn run_cd(&mut self, args: &[String]) -> i32 {
         let old = self.cwd.to_string_lossy().into_owned();
         let target = if let Some(dir) = args.first() {

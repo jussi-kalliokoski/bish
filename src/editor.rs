@@ -35,6 +35,11 @@ pub enum Key {
     Home,
     End,
     Escape,
+    // xterm/tmux send these as "CSI 1 ; 3 <letter>" (modifier 3 = Alt)
+    // rather than the plain "CSI <letter>" -- see decode_csi_final.
+    AltLeft,
+    AltRight,
+    AltUp,
     CtrlA,
     CtrlB,
     CtrlC,
@@ -126,35 +131,73 @@ fn read_escape() -> io::Result<Key> {
         b'[' | b'O' => {}
         _ => return Ok(Key::Unknown),
     }
-    if !term::stdin_ready(ESCAPE_TIMEOUT_MS) {
-        return Ok(Key::Unknown);
+    // Collect parameter bytes (digits and ';') until the final byte (a
+    // letter, or '~') arrives -- covers both the simple forms (no
+    // params, e.g. "\x1b[D" for Left) and the modified ones xterm/tmux
+    // send for a Ctrl/Alt/Shift-held arrow or Home/End (e.g. "\x1b[1;3D"
+    // for Alt+Left), plus the "\x1b[<n>~" family (Delete/Home/End on
+    // some terminals) -- see decode_csi_final for how each is told
+    // apart.
+    let mut params = String::new();
+    loop {
+        if !term::stdin_ready(ESCAPE_TIMEOUT_MS) {
+            return Ok(Key::Unknown);
+        }
+        let b = match read_byte()? {
+            Some(b) => b,
+            None => return Ok(Key::Unknown),
+        };
+        if b.is_ascii_digit() || b == b';' {
+            params.push(b as char);
+            continue;
+        }
+        return Ok(decode_csi_final(&params, b));
     }
-    let b2 = match read_byte()? {
-        Some(b) => b,
-        None => return Ok(Key::Unknown),
-    };
-    Ok(match b2 {
-        b'A' => Key::Up,
-        b'B' => Key::Down,
-        b'C' => Key::Right,
-        b'D' => Key::Left,
-        b'H' => Key::Home,
-        b'F' => Key::End,
-        b'1' | b'3' | b'4' | b'7' | b'8' => {
-            // CSI <n> ~ forms (e.g. "\x1b[3~" for Delete). Consume the
-            // trailing '~' and map the digit we already have.
-            if term::stdin_ready(ESCAPE_TIMEOUT_MS) {
-                let _ = read_byte()?;
-            }
-            match b2 {
-                b'3' => Key::Delete,
-                b'1' | b'7' => Key::Home,
-                b'4' | b'8' => Key::End,
-                _ => Key::Unknown,
+}
+
+// `params` is whatever digit/';' bytes came between the CSI intro
+// ("\x1b[") and `final_byte`, e.g. "" (plain arrow), "3" (an "~"-form
+// like Delete), or "1;3" (xterm's "CSI 1 ; modifier <letter>" convention
+// for a modified arrow/Home/End -- modifier 3 is Alt; 2/4/5/6/7/8 are
+// Shift/Alt+Shift/Ctrl/Ctrl+Shift/Ctrl+Alt/Ctrl+Alt+Shift, none of which
+// this editor distinguishes from the plain key, matching its existing
+// scope of no Ctrl/Shift-arrow handling).
+fn decode_csi_final(params: &str, final_byte: u8) -> Key {
+    let parts: Vec<&str> = params.split(';').collect();
+    let alt = parts.get(1) == Some(&"3");
+    match final_byte {
+        b'A' => {
+            if alt {
+                Key::AltUp
+            } else {
+                Key::Up
             }
         }
+        b'B' => Key::Down,
+        b'C' => {
+            if alt {
+                Key::AltRight
+            } else {
+                Key::Right
+            }
+        }
+        b'D' => {
+            if alt {
+                Key::AltLeft
+            } else {
+                Key::Left
+            }
+        }
+        b'H' => Key::Home,
+        b'F' => Key::End,
+        b'~' => match parts.first().and_then(|s| s.parse::<u32>().ok()) {
+            Some(3) => Key::Delete,
+            Some(1) | Some(7) => Key::Home,
+            Some(4) | Some(8) => Key::End,
+            _ => Key::Unknown,
+        },
         _ => Key::Unknown,
-    })
+    }
 }
 
 // How long to wait for a keystroke before giving on_idle another chance
@@ -295,6 +338,22 @@ pub enum ReadOutcome {
     // actually runs. `None` when commit was via a bare Enter right after
     // arming, with nothing else typed.
     CommandMode(Option<char>),
+    // Alt+Left/Right/Up at an empty buffer -- see DirNav's own doc
+    // comment. Never fires with anything typed (see read_line's own
+    // handling), so there's no "what happens to the buffer" question.
+    DirNav(DirNav),
+}
+
+// Directory-history navigation (browser-style back/forward, plus "up to
+// parent"), triggered by Alt+Left/Right/Up. repl.rs owns the actual
+// per-session history stack and cd logic -- this just reports which
+// direction was requested, the same "editor.rs only decodes keys, the
+// caller decides what they mean" split as CommandMode/Eof/Interrupted.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum DirNav {
+    Back,
+    Forward,
+    Up,
 }
 
 // Reads one line of input interactively: prompt is printed, raw mode is
@@ -541,7 +600,31 @@ pub fn read_line(
                 }
                 None => {}
             },
-            Key::Unknown => {}
+            // Only at an empty buffer -- same reasoning as ':' arming
+            // command mode: don't let a keypress the user might not
+            // have meant to hit right now silently discard something
+            // they were in the middle of typing. Directory navigation
+            // is a "instead of typing a command" action, not something
+            // that makes sense mid-line anyway.
+            Key::AltLeft if ed.buf.is_empty() => {
+                drop(guard.take());
+                print!("\r\n");
+                io::stdout().flush()?;
+                return Ok(ReadOutcome::DirNav(DirNav::Back));
+            }
+            Key::AltRight if ed.buf.is_empty() => {
+                drop(guard.take());
+                print!("\r\n");
+                io::stdout().flush()?;
+                return Ok(ReadOutcome::DirNav(DirNav::Forward));
+            }
+            Key::AltUp if ed.buf.is_empty() => {
+                drop(guard.take());
+                print!("\r\n");
+                io::stdout().flush()?;
+                return Ok(ReadOutcome::DirNav(DirNav::Up));
+            }
+            Key::AltLeft | Key::AltRight | Key::AltUp | Key::Unknown => {}
         }
         redraw(if cmd_mode_armed { armed_prompt } else { prompt }, &ed)?;
     }

@@ -36,6 +36,16 @@ struct SessionState {
     // stopped jobs." + a second EOF does, while typing anything else
     // first re-arms the warning.
     warned_stopped_jobs: bool,
+    // Browser-style directory history for Alt+Left/Right (see
+    // push_dir_history and the ReadOutcome::DirNav handler): every
+    // directory this session's cwd has actually changed to (detected by
+    // diffing Shell::cwd before/after a command runs -- catches `cd`
+    // however it was invoked, not just a literal `cd` command), with
+    // dir_history_index marking "where we are" in that list. Seeded with
+    // the session's starting directory so Alt+Left works immediately,
+    // before any `cd` at all.
+    dir_history: Vec<std::path::PathBuf>,
+    dir_history_index: usize,
 }
 
 type JobFrameId = u32;
@@ -150,7 +160,19 @@ pub fn run(mut shell: Shell) {
 
     let mut sessions: HashMap<SessionId, SessionState> = HashMap::new();
     let root_screen = Rc::new(RefCell::new(vt100::Screen::new(content_rows(term_rows), term_cols)));
-    sessions.insert(0, SessionState { shell, buffer: String::new(), history_boundary: 0, screen: root_screen, warned_stopped_jobs: false });
+    let root_cwd = shell.cwd.clone();
+    sessions.insert(
+        0,
+        SessionState {
+            shell,
+            buffer: String::new(),
+            history_boundary: 0,
+            screen: root_screen,
+            warned_stopped_jobs: false,
+            dir_history: vec![root_cwd],
+            dir_history_index: 0,
+        },
+    );
     let mut windows: Vec<WindowEntry> = vec![WindowEntry { id: 0, stack: vec![Frame::Session(0)] }];
     let mut current_window: usize = 0;
     let mut next_session_id: SessionId = 1;
@@ -313,6 +335,14 @@ pub fn run(mut shell: Shell) {
                 // immediate repeated Ctrl-D either.
                 session.warned_stopped_jobs = false;
             }
+            Ok(ReadOutcome::DirNav(kind)) => {
+                let session = sessions.get_mut(&session_id).unwrap();
+                session.warned_stopped_jobs = false;
+                navigate_dir(session, kind);
+                if sinks_are_grid {
+                    compositor_redraw(&sessions, &windows, current_window, term_rows, term_cols);
+                }
+            }
             Ok(ReadOutcome::CommandMode(pending)) => {
                 handle_command_mode(
                     session_id,
@@ -404,7 +434,17 @@ pub fn run(mut shell: Shell) {
                                 // fish both record what was typed, not
                                 // what succeeded.
                                 history.record(&session.buffer);
+                                // Snapshotted so a directory change gets
+                                // picked up (see push_dir_history below)
+                                // regardless of how it happened -- a
+                                // literal `cd`, a function that cd's,
+                                // whatever -- rather than only hooking
+                                // the `cd` builtin itself.
+                                let cwd_before = session.shell.cwd.clone();
                                 let result = session.shell.run_program(&prog);
+                                if session.shell.cwd != cwd_before {
+                                    push_dir_history(session, session.shell.cwd.clone());
+                                }
                                 session.buffer.clear();
                                 match result {
                                     ExecResult::Window(action) => window_action = Some(action),
@@ -655,9 +695,21 @@ fn apply_window_action(
             let mut child_shell = sessions[&parent_id].shell.new_virtual_child();
             let screen = Rc::new(RefCell::new(vt100::Screen::new(content_rows(term_rows), term_cols)));
             child_shell.set_sink_grid(screen.clone());
+            let child_cwd = child_shell.cwd.clone();
             let sid = *next_session_id;
             *next_session_id += 1;
-            sessions.insert(sid, SessionState { shell: child_shell, buffer: String::new(), history_boundary: history.boundary(), screen, warned_stopped_jobs: false });
+            sessions.insert(
+                sid,
+                SessionState {
+                    shell: child_shell,
+                    buffer: String::new(),
+                    history_boundary: history.boundary(),
+                    screen,
+                    warned_stopped_jobs: false,
+                    dir_history: vec![child_cwd],
+                    dir_history_index: 0,
+                },
+            );
             let wid = *next_window_id;
             *next_window_id += 1;
             windows.push(WindowEntry { id: wid, stack: vec![Frame::Session(sid)] });
@@ -1053,6 +1105,53 @@ fn render_tab_bar(snapshot: &[(u32, bool, String)]) -> String {
     line
 }
 
+// Records a new "current" directory in this session's back/forward
+// history (Alt+Left/Right -- see SessionState::dir_history's own doc
+// comment), browser-style: anything reachable by "forward" from here is
+// discarded first, since navigating to `dir` fresh (not by walking that
+// existing forward stack) makes it stale, the same way a browser drops
+// its forward history the instant you follow a new link after going
+// back.
+fn push_dir_history(session: &mut SessionState, dir: std::path::PathBuf) {
+    session.dir_history.truncate(session.dir_history_index + 1);
+    session.dir_history.push(dir);
+    session.dir_history_index = session.dir_history.len() - 1;
+}
+
+// Alt+Left/Right/Up (editor::DirNav -- see its own doc comment). Back/
+// Forward walk dir_history without touching it (push_dir_history is
+// only for a *fresh* cd); Up computes the real parent of the current
+// cwd and treats arriving there as an ordinary fresh navigation (does
+// push, and drops any forward history), matching what typing `cd ..`
+// itself would do.
+fn navigate_dir(session: &mut SessionState, kind: editor::DirNav) {
+    match kind {
+        editor::DirNav::Back => {
+            if session.dir_history_index == 0 {
+                return;
+            }
+            session.dir_history_index -= 1;
+            let target = session.dir_history[session.dir_history_index].clone();
+            session.shell.cd_to(&target);
+        }
+        editor::DirNav::Forward => {
+            if session.dir_history_index + 1 >= session.dir_history.len() {
+                return;
+            }
+            session.dir_history_index += 1;
+            let target = session.dir_history[session.dir_history_index].clone();
+            session.shell.cd_to(&target);
+        }
+        editor::DirNav::Up => {
+            if let Some(parent) = session.shell.cwd.parent() {
+                let parent = parent.to_path_buf();
+                session.shell.cd_to(&parent);
+                push_dir_history(session, session.shell.cwd.clone());
+            }
+        }
+    }
+}
+
 // Distinguishes "needs more lines" (unterminated quote/paren, or the parser
 // ran out of tokens expecting a closing keyword like `fi`/`done`) from a
 // genuine syntax error, by checking for the exact phrasing this crate's own
@@ -1121,6 +1220,11 @@ fn run_command_mode(shell: &mut Shell, history: &mut History, initial_char: Opti
             Ok(ReadOutcome::CommandMode(pending)) => {
                 prefill = pending;
             }
+            // Directory navigation doesn't mean much inside command
+            // mode's own restricted, one-shot context -- just ignore it
+            // and keep showing this same prompt, rather than wiring
+            // sessions/dir_history all the way through here too.
+            Ok(ReadOutcome::DirNav(_)) => {}
             Ok(ReadOutcome::Line(line)) => {
                 // Same history expansion as the normal shell prompt (see
                 // history::expand's own doc comment), scoped the same
