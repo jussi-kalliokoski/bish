@@ -9,10 +9,10 @@
 // bish's own real terminal fd. Consumed by the future VT100 emulator and
 // compositor -- this module only builds and owns the pty itself.
 //
-// Not yet wired into exec.rs/repl.rs: real usage (spawning a window's
-// foregrounded job attached to its own pty) lands with the M9 compositor,
-// once there's a grid to feed the master-side bytes into. Silenced dead-
-// code warnings until then, same as any seam landed ahead of its caller.
+// Wired into exec.rs (run_single's background-job spawn path attaches a
+// pty when promoted and unredirected) and repl.rs (drives a fg'd job's
+// pty master directly). #![allow(dead_code)] stays regardless -- some
+// items here (e.g. Pty::resize) are for future callers.
 #![allow(dead_code)]
 
 use std::ffi::CString;
@@ -41,6 +41,13 @@ const O_RDWR: i32 = 0o2;
 const O_NOCTTY: i32 = 0o400;
 const F_SETFD: i32 = 2;
 const FD_CLOEXEC: i32 = 1;
+const F_GETFL: i32 = 3;
+const F_SETFL: i32 = 4;
+const O_NONBLOCK: i32 = 0o4000;
+// Linux signal number (stable/standard -- see term.rs's own comment on
+// hardcoding these) and disposition constant for resetting SIGINT below.
+const SIGINT: i32 = 2;
+const SIG_DFL: usize = 0;
 
 unsafe extern "C" {
     fn posix_openpt(flags: i32) -> i32;
@@ -50,6 +57,7 @@ unsafe extern "C" {
     fn ioctl(fd: i32, request: u64, arg: usize) -> i32;
     fn fcntl(fd: i32, cmd: i32, arg: i32) -> i32;
     fn setsid() -> i32;
+    fn signal(signum: i32, handler: usize) -> usize;
     #[link_name = "open"]
     fn c_open(path: *const i8, flags: i32, mode: i32) -> i32;
     fn close(fd: i32) -> i32;
@@ -110,6 +118,16 @@ pub fn spawn_attached(mut cmd: Command, slave_path: &str) -> io::Result<Child> {
     let path = CString::new(slave_path).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
     unsafe {
         cmd.pre_exec(move || {
+            // bish ignores SIGINT for itself (term::ignore_sigint, called
+            // once at interactive startup) so it survives Ctrl-C from its
+            // own controlling terminal -- but that disposition is
+            // inherited across fork, and POSIX only resets *handled*
+            // signals to SIG_DFL across exec; SIG_IGN is explicitly left
+            // unchanged. Without this reset, a job attached to this pty
+            // would silently inherit "ignore SIGINT" and never respond to
+            // a forwarded Ctrl-C, even though the pty's line discipline
+            // correctly raises the signal.
+            signal(SIGINT, SIG_DFL);
             if setsid() < 0 {
                 return Err(io::Error::last_os_error());
             }
@@ -148,6 +166,16 @@ pub fn set_size(fd: RawFd, rows: u16, cols: u16) -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
     Ok(())
+}
+
+// Used by a poll-driven fg loop (repl.rs's drive_fg_job) so it can drain
+// whatever output has arrived on a job's pty master without ever
+// blocking on it.
+pub fn set_nonblocking(fd: RawFd) {
+    unsafe {
+        let flags = fcntl(fd, F_GETFL, 0);
+        fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+    }
 }
 
 impl Pty {

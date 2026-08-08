@@ -31,18 +31,24 @@ struct SessionState {
     screen: Rc<RefCell<vt100::Screen>>,
 }
 
-// One layer of a window's view stack. Currently only ever Session --
-// Job frames (fg-ing a background job onto a window's own stack, poll-
-// driven against the job's pty, instead of today's Shell-local
-// drive_pending_fg single-slot) land in a later milestone. A stack
-// rather than a single field is what lets `window fg <id>` push another
-// window's current frame on top of this window's own -- vim-like "the
-// same session shown in multiple windows" -- and what will give a
-// fg'd job a real "ancestry" to unwind back through once Job frames
-// exist.
+type JobFrameId = u32;
+
+// One layer of a window's view stack. Session is the vim-like "same
+// session shown in multiple windows" case (see WindowEntry's doc
+// comment); Job is a fg'd background job, poll-driven against its own
+// pty (see exec::FgJob and drive_fg_job below) instead of blocking the
+// whole process the way exec.rs's old Shell-local drive_pending_fg did.
+// A Job frame holds an id into `job_frames` (owned by repl::run, see
+// below) rather than the FgJob itself, since -- unlike a session, which
+// can legitimately be the SAME live thing shown in two places at once --
+// a running job is inherently a one-place-at-a-time resource, and
+// keeping Frame Copy (an FgJob owns a real OS process + pty, definitely
+// not Copy) matters for how cheaply `window fg` can duplicate a Session
+// frame onto another window's stack.
 #[derive(Clone, Copy, PartialEq)]
 enum Frame {
     Session(SessionId),
+    Job(JobFrameId),
 }
 
 // A window's view stack: the last (top) entry is what's currently
@@ -62,10 +68,18 @@ struct WindowEntry {
 }
 
 impl WindowEntry {
-    fn top_session(&self) -> SessionId {
-        match self.stack.last().expect("a window's stack is never empty") {
-            Frame::Session(id) => *id,
+    // The nearest Session frame at or below the top of the stack. In
+    // practice this only ever needs to look one level down (a Job frame
+    // is always pushed onto a window that already has a Session
+    // beneath it, and nothing currently pushes a *second* Job frame on
+    // top of a first), but walks generally rather than assuming that.
+    fn owning_session(&self) -> SessionId {
+        for frame in self.stack.iter().rev() {
+            if let Frame::Session(id) = frame {
+                return *id;
+            }
         }
+        panic!("a window's stack always has an underlying session frame")
     }
 }
 
@@ -97,6 +111,7 @@ fn session_referenced_elsewhere(windows: &[WindowEntry], current_window: usize, 
         for (depth, frame) in w.stack.iter().enumerate() {
             let matches = match frame {
                 Frame::Session(s) => *s == sid,
+                Frame::Job(_) => false,
             };
             if !matches {
                 continue;
@@ -130,6 +145,11 @@ pub fn run(shell: Shell) {
     let mut current_window: usize = 0;
     let mut next_session_id: SessionId = 1;
     let mut next_window_id: u32 = 1;
+    // Owns every currently-fg'd job, keyed by the id a Frame::Job on some
+    // window's stack points to -- see Frame's doc comment for why a job
+    // isn't stored directly in the stack itself.
+    let mut job_frames: HashMap<JobFrameId, exec::FgJob> = HashMap::new();
+    let mut next_job_frame_id: JobFrameId = 1;
     // Flips true (and stays true) the first time any window-family
     // command promotes the terminal -- see apply_window_action. Every
     // session's sink is Real until then, matching today's plain behavior
@@ -160,7 +180,7 @@ pub fn run(shell: Shell) {
             }
         }
 
-        let session_id = windows[current_window].top_session();
+        let session_id = windows[current_window].owning_session();
         let boundary = sessions[&session_id].history_boundary;
         let (prompt_str, armed_prompt_str) = {
             let session = &sessions[&session_id];
@@ -314,24 +334,32 @@ pub fn run(shell: Shell) {
                     );
                 } else if fg_pending {
                     // A pty-attached background job was fg'd (see
-                    // ExecResult::Fg's doc comment in exec.rs). The job
-                    // and its pty live entirely inside the focused
-                    // session's Shell (drive_pending_fg needs `&mut
-                    // self` to pump it) -- but the redraw callback it
-                    // calls needs `&sessions` for the tab bar, which
-                    // can't be borrowed at the same time as `&mut
-                    // session.shell` if `session` is a live borrow *of*
-                    // `sessions`. Snapshotting what the callback needs
-                    // (an Rc clone of the focused grid, a one-shot tab
-                    // bar string -- neither changes mid-fg, since no
-                    // other session can run while this one blocks
-                    // pumping the job) sidesteps that entirely: the
-                    // closure below holds no borrow of `sessions` at all.
+                    // ExecResult::Fg's doc comment in exec.rs). Push it
+                    // as a real Frame::Job on the focused window's own
+                    // stack -- see Frame's doc comment for why a Job
+                    // frame holds an id into `job_frames` rather than
+                    // the FgJob itself -- then drive it directly here
+                    // (repl.rs owns the session/window state a redraw
+                    // needs, unlike exec.rs -- see ExecResult::Fg's doc
+                    // comment). Still fully blocking for this milestone:
+                    // switching to another window while this runs is
+                    // M10c's job, once the outer loop itself becomes
+                    // poll-based instead of just drive_fg_job's own
+                    // inner one.
+                    let fg_job = sessions.get_mut(&session_id).unwrap().shell.take_pending_fg().expect("ExecResult::Fg implies a job was stashed");
+                    let job_frame_id = next_job_frame_id;
+                    next_job_frame_id += 1;
+                    job_frames.insert(job_frame_id, fg_job);
+                    windows[current_window].stack.push(Frame::Job(job_frame_id));
+
                     let focused_screen = sessions[&session_id].screen.clone();
                     let tab_bar = tab_bar_line(&sessions, &windows, current_window);
-                    let status = sessions.get_mut(&session_id).unwrap().shell.drive_pending_fg(|| {
+                    let status = drive_fg_job(job_frames.get_mut(&job_frame_id).unwrap(), &focused_screen, || {
                         render_compositor_frame(&focused_screen, &tab_bar, term_rows);
                     });
+
+                    windows[current_window].stack.pop();
+                    job_frames.remove(&job_frame_id);
                     sessions.get_mut(&session_id).unwrap().shell.last_status = status;
                 } else if sinks_are_grid {
                     // The common case once promoted: a normal command ran
@@ -398,7 +426,7 @@ fn apply_window_action(
             *current_window = (*current_window + windows.len() - 1) % windows.len();
         }
         WindowAction::New => {
-            let parent_id = windows[*current_window].top_session();
+            let parent_id = windows[*current_window].owning_session();
             let mut child_shell = sessions[&parent_id].shell.new_virtual_child();
             let screen = Rc::new(RefCell::new(vt100::Screen::new(content_rows(term_rows), term_cols)));
             child_shell.set_sink_grid(screen.clone());
@@ -418,7 +446,7 @@ fn apply_window_action(
                 // what's revealed underneath was already a live frame.
                 windows[*current_window].stack.pop();
             } else if windows.len() == 1 {
-                let sid = windows[*current_window].top_session();
+                let sid = windows[*current_window].owning_session();
                 sessions[&sid].shell.sink_err("bish: window close: cannot close the last window -- exit the shell instead\n");
                 compositor_redraw(sessions, windows, *current_window, term_rows, term_cols);
                 return;
@@ -432,10 +460,16 @@ fn apply_window_action(
         }
         WindowAction::FgSession(target_id) => {
             let target_frame = windows.iter().find(|w| w.id == target_id).map(|w| *w.stack.last().unwrap());
+            let cur_sid = windows[*current_window].owning_session();
             match target_frame {
-                Some(frame) => windows[*current_window].stack.push(frame),
+                Some(frame @ Frame::Session(_)) => windows[*current_window].stack.push(frame),
+                // A running job is a one-place-at-a-time resource (see
+                // Frame's doc comment) -- unlike a session, it can't
+                // legitimately be shown in two windows at once.
+                Some(Frame::Job(_)) => {
+                    sessions[&cur_sid].shell.sink_err("bish: window: fg: that window is running a job, not a session\n");
+                }
                 None => {
-                    let cur_sid = windows[*current_window].top_session();
                     sessions[&cur_sid].shell.sink_err(&format!("bish: window: fg: no such window: {}\n", target_id));
                 }
             }
@@ -451,8 +485,15 @@ fn apply_window_action(
 // no other action can ever orphan a session (New/FgSession only add
 // references; Next/Previous don't touch the stack at all).
 fn close_orphaned_sessions(sessions: &mut HashMap<SessionId, SessionState>, windows: &[WindowEntry]) {
-    let referenced: std::collections::HashSet<SessionId> =
-        windows.iter().flat_map(|w| w.stack.iter().map(|f| match f { Frame::Session(id) => *id })).collect();
+    let referenced: std::collections::HashSet<SessionId> = windows
+        .iter()
+        .flat_map(|w| {
+            w.stack.iter().filter_map(|f| match f {
+                Frame::Session(id) => Some(*id),
+                Frame::Job(_) => None,
+            })
+        })
+        .collect();
     sessions.retain(|id, _| referenced.contains(id));
 }
 
@@ -462,16 +503,100 @@ fn close_orphaned_sessions(sessions: &mut HashMap<SessionId, SessionState>, wind
 // are infrequent enough that flicker isn't a real concern, and a full
 // redraw is trivially correct (self-healing against anything that wrote
 // to the real terminal directly in between, like editor.rs's Ctrl-L).
-// M9b's poll-driven `fg` (see drive_pending_fg below) is the first truly
+// Poll-driven `fg` (see drive_fg_job below) is the first truly
 // continuous redraw loop this codebase has -- still full-redraw for now,
 // since a real cell/row diff is an optimization, not a correctness
 // requirement, and this keeps both redraw paths sharing one
 // implementation (render_compositor_frame) rather than risking them
 // drifting apart.
 fn compositor_redraw(sessions: &HashMap<SessionId, SessionState>, windows: &[WindowEntry], current_window: usize, term_rows: usize, _term_cols: usize) {
-    let session_id = windows[current_window].top_session();
+    let session_id = windows[current_window].owning_session();
     let tab_bar = tab_bar_line(sessions, windows, current_window);
     render_compositor_frame(&sessions[&session_id].screen, &tab_bar, term_rows);
+}
+
+// Drives a job pushed as a Frame::Job to completion: reads its pty
+// master and feeds bytes into `screen`, calls `redraw` after every batch
+// of output, and forwards raw bytes read from bish's own stdin straight
+// to the job's pty master unmodified -- the job's own pty slave termios
+// (never touched by this shell) handles things like Ctrl-C triggering
+// real SIGINT delivery to the job's process group exactly like a real
+// terminal would, no signal-forwarding code needed here. Moved here from
+// exec.rs's old Shell::drive_pending_fg (M9b) now that the job itself is
+// owned by repl.rs (see FgJob's doc comment) rather than stashed inside
+// a session's Shell -- everything else about the loop is unchanged.
+//
+// Still fully blocking: switching to another window while this runs is
+// M10c's job, once the outer loop itself becomes poll-based instead of
+// just this one. No detach-and-resume-later either (matching this
+// codebase's existing "no SIGTSTP/Ctrl-Z, no genuine Stopped jobs"
+// scope, see exec.rs's run_bg doc comment) -- the only ways back to the
+// normal REPL are the job finishing or Ctrl-C interrupting it.
+fn drive_fg_job(job: &mut exec::FgJob, screen: &Rc<RefCell<vt100::Screen>>, mut redraw: impl FnMut()) -> i32 {
+    use std::io::{Read, Write};
+    use std::os::unix::io::AsRawFd;
+
+    pty::set_nonblocking(job.pty_master().as_raw_fd());
+    let _raw_guard = term::RawGuard::enable(0).ok();
+
+    let mut buf = [0u8; 4096];
+    // Caps how many chunks get drained per outer-loop tick before
+    // forcing a redraw/stdin-check/exit-check. A firehose job (`yes` is
+    // the extreme case) can keep the pty's read buffer topped up
+    // indefinitely -- reading "until WouldBlock" against a producer like
+    // that means WouldBlock may never actually arrive, starving this
+    // loop's other responsibilities forever. Bounding the drain
+    // guarantees this loop always comes back around.
+    const MAX_READS_PER_TICK: u32 = 16;
+    let status = loop {
+        if let Some(status) = job.poll() {
+            break status;
+        }
+
+        let mut made_progress = false;
+        for _ in 0..MAX_READS_PER_TICK {
+            match job.pty_master().read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    screen.borrow_mut().feed(&buf[..n]);
+                    made_progress = true;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(_) => break,
+            }
+        }
+        if made_progress {
+            redraw();
+        }
+
+        // Short poll timeout: paces this loop (avoiding a CPU-spinning
+        // busy-wait) while staying responsive to both new job output and
+        // new keystrokes.
+        let ready = term::stdin_ready(10);
+        if ready {
+            let n = unsafe { raw_read(0, buf.as_mut_ptr(), buf.len()) };
+            if n > 0 {
+                let _ = job.pty_master().write_all(&buf[..n as usize]);
+            } else {
+                break job.wait();
+            }
+        }
+    };
+    drop(_raw_guard);
+    redraw();
+    status
+}
+
+// Raw stdin read for drive_fg_job. Renamed via link_name so the local
+// name doesn't collide with anything already in scope (drive_fg_job also
+// imports the `Read` trait, a different namespace, but this keeps the
+// pattern consistent with pty.rs's own `c_open` reasoning). Deliberately
+// not going through std::io::Stdin here (its internal buffering could
+// swallow bytes term::stdin_ready's poll() wouldn't know about) -- same
+// reasoning as editor.rs's own read_byte.
+unsafe extern "C" {
+    #[link_name = "read"]
+    fn raw_read(fd: i32, buf: *mut u8, count: usize) -> isize;
 }
 
 // The actual drawing: shared by compositor_redraw (reads the tab bar
@@ -564,7 +689,7 @@ fn tab_bar_snapshot(sessions: &HashMap<SessionId, SessionState>, windows: &[Wind
     windows
         .iter()
         .enumerate()
-        .map(|(i, w)| (w.id, i == current_window, sessions[&w.top_session()].shell.cwd.display().to_string()))
+        .map(|(i, w)| (w.id, i == current_window, sessions[&w.owning_session()].shell.cwd.display().to_string()))
         .collect()
 }
 
@@ -760,3 +885,4 @@ fn command_violation(c: &Command) -> Option<&'static str> {
         Command::Group(body, _) => command_mode_violation(body),
     }
 }
+

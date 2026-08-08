@@ -60,10 +60,14 @@ unsafe extern "C" {
 
 // Makes the shell itself immune to SIGINT for the rest of the process's
 // life, the same trick real interactive shells use instead of process-
-// group/job-control plumbing: a *caught* signal (which SIG_IGN counts as)
-// is reset to its default disposition by exec() (POSIX-guaranteed), so a
-// foreground child still dies/interrupts normally on Ctrl-C while bish,
-// which keeps ignoring it, survives. Call once, at interactive startup.
+// group/job-control plumbing. This disposition is inherited by every
+// forked child *and* survives exec() -- POSIX only resets signals with a
+// real handler function back to SIG_DFL across exec; SIG_IGN is
+// explicitly preserved unchanged. So every spawn site that forks a real
+// foreground/background child (apply_fd_redirects, the `command` builtin,
+// pty::spawn_attached) must explicitly reset SIGINT to SIG_DFL in its own
+// pre_exec hook, or that child would silently inherit "ignore SIGINT" and
+// never respond to Ctrl-C. Call once, at interactive startup.
 pub fn ignore_sigint() {
     unsafe {
         signal(SIGINT, SIG_IGN);

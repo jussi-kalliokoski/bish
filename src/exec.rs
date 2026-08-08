@@ -12,7 +12,6 @@ use crate::parser::{
     self, AndOr, AssignMode, Combinator, ListItem, Pipeline, Program, Redirect, Sep, SimpleCommand, Word,
 };
 use crate::pty;
-use crate::term;
 use crate::vt100;
 
 // Where a Shell's own output (builtin/diagnostic text -- never a spawned
@@ -157,11 +156,13 @@ pub enum ExecResult {
     // session/window state, which a session's own Shell can't hold a
     // reference to (see Window's doc comment). run_fg only removes the
     // job from the table and stashes it on `self.pending_fg`; repl.rs
-    // reacts to this signal by calling Shell::drive_pending_fg, passing
-    // in a redraw callback -- the actual poll loop (reading the job's
-    // pty, feeding self.sink, forwarding stdin, checking for exit) runs
-    // inside Shell, which is the only thing with access to the private
-    // Job/pty types, but the *redrawing* stays repl.rs's job throughout.
+    // reacts to this signal by calling Shell::take_pending_fg to get an
+    // owned FgJob handle, pushing it as a Frame::Job on the current
+    // window's stack, and driving it directly (repl.rs's drive_fg_job) --
+    // unlike the Window action, this one hands over real ownership
+    // rather than just a callback, since the Frame stack needs to keep
+    // referencing the job across main-loop iterations, not just for the
+    // duration of one call.
     Fg,
 }
 
@@ -413,7 +414,7 @@ pub struct Shell {
     // at promotion time.
     sink: OutputSink,
     // Set by run_fg immediately before returning ExecResult::Fg, taken
-    // right back out by drive_pending_fg (called by repl.rs in response
+    // right back out via take_pending_fg (called by repl.rs in response
     // to that signal) -- see ExecResult::Fg's doc comment. Not shared via
     // Rc: only ever set and cleared within the single session that ran
     // `fg`, never meant to be visible to any other session.
@@ -500,18 +501,6 @@ impl Shell {
     // terminal -- see OutputSink's doc comment.
     pub fn set_sink_grid(&mut self, screen: Rc<RefCell<vt100::Screen>>) {
         self.sink = OutputSink::Grid(screen);
-    }
-
-    // Used by drive_pending_fg to feed a job's raw pty output straight
-    // into the grid, bypassing sink_out's str-based onlcr translation --
-    // that translation exists for sh_println!-style text which assumes
-    // an untranslated cooked-mode terminal; a job's own pty bytes are
-    // already exactly what a real terminal would receive, \r/\n and all.
-    fn sink_screen(&self) -> Option<Rc<RefCell<vt100::Screen>>> {
-        match &self.sink {
-            OutputSink::Real => None,
-            OutputSink::Grid(screen) => Some(screen.clone()),
-        }
     }
 
     // The in-process session-cloning primitive: creates an independent but
@@ -680,7 +669,8 @@ impl Shell {
     // only true for a promoted, unredirected background job) instead
     // bubbles ExecResult::Fg without blocking at all: see that variant's
     // doc comment for why the actual poll loop has to happen through
-    // repl.rs's Shell::drive_pending_fg instead of directly here.
+    // repl.rs's Shell::take_pending_fg + drive_fg_job instead of
+    // directly here.
     fn run_fg(&mut self, args: &[String]) -> ExecResult {
         if !self.opt_monitor {
             sh_eprintln!(self, "bish: fg: no job control");
@@ -726,85 +716,14 @@ impl Shell {
         }
     }
 
-    // Drives a job stashed via run_fg's ExecResult::Fg to completion.
-    // Reads the job's pty master and feeds bytes straight into this
-    // session's grid (sink_screen -- always Some here, since a pty-
-    // attached job is only ever created while promoted, and promotion
-    // never un-happens), and forwards raw bytes read from bish's own
-    // stdin straight to the job's pty master unmodified: the job's own
-    // controlling-terminal line discipline (its pty slave's default
-    // termios, never touched by this shell) handles things like Ctrl-C
-    // triggering real SIGINT delivery to the job's process group exactly
-    // like a real terminal would -- no bish-side signal-forwarding logic
-    // needed. `redraw` is called after every batch of job output; it's
-    // the only thing here that can see the session/window list this
-    // Shell can't hold a reference to (see ExecResult::Fg's doc comment).
-    //
-    // No detach-and-resume-later: once fg'd, the only ways back to the
-    // normal REPL are the job finishing or Ctrl-C interrupting it,
-    // matching this codebase's existing "no SIGTSTP/Ctrl-Z, no genuine
-    // Stopped jobs" scope (see run_bg's doc comment) -- a real detach key
-    // is future work, not attempted in this pass. Terminal-resize
-    // propagation to the job's own pty is also not attempted here (the
-    // real terminal side still resizes correctly via `redraw`'s own
-    // query -- only the job's belief about its own window size can go
-    // briefly stale if the terminal is resized while it's fg'd).
-    pub fn drive_pending_fg(&mut self, mut redraw: impl FnMut()) -> i32 {
-        use std::io::{Read, Write};
-        use std::os::unix::io::AsRawFd;
-
-        let mut job = self.pending_fg.take().expect("drive_pending_fg called without a pending fg job");
-        let screen = self.sink_screen().expect("pty-attached fg job implies a Grid sink");
-        let master_fd = job.pty_master.as_ref().expect("drive_pending_fg called on a job with no pty").as_raw_fd();
-        set_fd_nonblocking(master_fd);
-        let _raw_guard = term::RawGuard::enable(0).ok();
-
-        let mut buf = [0u8; 4096];
-        // Caps how many chunks get drained per outer-loop tick before
-        // forcing a redraw/stdin-check/exit-check. A firehose job (`yes`
-        // is the extreme case) can keep the pty's read buffer topped up
-        // indefinitely -- reading "until WouldBlock" against a producer
-        // like that means WouldBlock may never actually arrive, starving
-        // this loop's other responsibilities (redrawing, forwarding
-        // keystrokes, noticing the job has exited) forever. Bounding the
-        // drain guarantees this loop always comes back around.
-        const MAX_READS_PER_TICK: u32 = 16;
-        let status = loop {
-            if let Some(status) = job.poll() {
-                break status;
-            }
-
-            let mut made_progress = false;
-            for _ in 0..MAX_READS_PER_TICK {
-                match job.pty_master.as_mut().unwrap().read(&mut buf) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        screen.borrow_mut().feed(&buf[..n]);
-                        made_progress = true;
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                    Err(_) => break,
-                }
-            }
-            if made_progress {
-                redraw();
-            }
-
-            // Short poll timeout: paces this loop (avoiding a CPU-spinning
-            // busy-wait) while staying responsive to both new job output
-            // and new keystrokes.
-            if term::stdin_ready(10) {
-                let n = unsafe { raw_read(0, buf.as_mut_ptr(), buf.len()) };
-                if n > 0 {
-                    let _ = job.pty_master.as_ref().unwrap().write_all(&buf[..n as usize]);
-                } else {
-                    break job.wait();
-                }
-            }
-        };
-        drop(_raw_guard);
-        redraw();
-        status
+    // Hands ownership of a job stashed via run_fg's ExecResult::Fg to
+    // repl.rs, wrapped so its private fields (Job holds a
+    // std::process::Child, which isn't the kind of thing exec.rs wants
+    // to expose directly) stay inaccessible outside this module -- see
+    // FgJob's own doc comment for why repl.rs needs to own this at all
+    // rather than exec.rs continuing to drive it internally.
+    pub fn take_pending_fg(&mut self) -> Option<FgJob> {
+        self.pending_fg.take().map(FgJob)
     }
 
     // Every job this shell tracks is, by construction, already running --
@@ -2755,6 +2674,15 @@ impl Shell {
                 let mut ext = Command::new(&argv[i]);
                 ext.args(&argv[i + 1..]);
                 ext.current_dir(&self.cwd);
+                // See apply_fd_redirects' pre_exec comment: without this,
+                // `command foo` would inherit bish's own ignored SIGINT
+                // and never respond to Ctrl-C.
+                unsafe {
+                    ext.pre_exec(|| {
+                        sigaction_raw(2, SIG_DFL);
+                        Ok(())
+                    });
+                }
                 return match ext.status() {
                     Ok(status) => ExecResult::Status(exit_code_from_status(status)),
                     Err(e) => {
@@ -4775,29 +4703,6 @@ impl std::os::fd::AsRawFd for KeptFd {
     }
 }
 
-// Raw, minimal I/O helpers for drive_pending_fg. Renamed via link_name the
-// same way pty.rs's `c_open` is, so the local name doesn't collide with
-// anything already in scope (drive_pending_fg also imports the `Read`
-// trait, which is a different namespace, but this keeps the pattern
-// consistent with pty.rs's own reasoning).
-unsafe extern "C" {
-    #[link_name = "read"]
-    fn raw_read(fd: i32, buf: *mut u8, count: usize) -> isize;
-    fn fcntl(fd: i32, cmd: i32, arg: i32) -> i32;
-}
-const F_GETFL: i32 = 3;
-const F_SETFL: i32 = 4;
-const O_NONBLOCK: i32 = 0o4000;
-
-// Used only for a job's pty master fd, so a poll-driven fg loop can drain
-// whatever output has arrived without ever blocking on it.
-fn set_fd_nonblocking(fd: i32) {
-    unsafe {
-        let flags = fcntl(fd, F_GETFL, 0);
-        fcntl(fd, F_SETFL, flags | O_NONBLOCK);
-    }
-}
-
 // poll/block on them directly -- earlier this shell just spawned a thread
 // that blindly `.wait()`d and dropped the result, which meant nothing else
 // could ever observe a background job's completion or exit status.
@@ -4866,6 +4771,36 @@ impl Job {
             }
         }
         last_code
+    }
+}
+
+// An opaque handle to a pty-attached job, handed to repl.rs by
+// Shell::take_pending_fg once run_fg bubbles ExecResult::Fg. repl.rs is
+// what owns the session/window/grid state a redraw needs (see that
+// variant's doc comment for why exec.rs can't hold a reference to it),
+// and -- once the Frame::Job stack lets a job keep running while another
+// window is focused -- repl.rs is also what needs to keep polling it
+// across separate main-loop iterations, not just for the duration of one
+// blocking call into exec.rs. Wrapping Job (whose fields, like
+// std::process::Child, this module deliberately doesn't want to expose
+// directly) rather than making Job itself pub keeps that boundary intact
+// while still letting repl.rs hold and drive one.
+pub struct FgJob(Job);
+
+impl FgJob {
+    pub fn poll(&mut self) -> Option<i32> {
+        self.0.poll()
+    }
+
+    pub fn wait(&mut self) -> i32 {
+        self.0.wait()
+    }
+
+    // Always Some: FgJob only ever exists for a job that had
+    // Job::pty_master.is_some() at the point run_fg bubbled it (see that
+    // function's own pty_master check).
+    pub fn pty_master(&mut self) -> &mut std::fs::File {
+        self.0.pty_master.as_mut().expect("FgJob always has a pty_master")
     }
 }
 
@@ -5310,15 +5245,21 @@ fn clear_cloexec(fd: i32) {
 }
 
 fn apply_fd_redirects(command: &mut Command, dup_stderr_to_stdout: bool, extra_fds: Vec<ExtraFd>) {
-    if !dup_stderr_to_stdout && extra_fds.is_empty() {
-        return;
-    }
     unsafe extern "C" {
         fn dup2(oldfd: i32, newfd: i32) -> i32;
         fn close(fd: i32) -> i32;
     }
     unsafe {
         command.pre_exec(move || {
+            // bish ignores SIGINT for itself (term::ignore_sigint, called
+            // once at interactive startup) so Ctrl-C from its own
+            // controlling terminal doesn't kill the shell -- but that
+            // disposition is inherited across fork, and POSIX only resets
+            // *handled* signals back to SIG_DFL across exec; an ignored
+            // (SIG_IGN) disposition is explicitly left unchanged. Without
+            // this reset, every external child would silently inherit
+            // "ignore SIGINT" too and never respond to Ctrl-C.
+            sigaction_raw(2, SIG_DFL);
             if dup_stderr_to_stdout && dup2(1, 2) == -1 {
                 return Err(std::io::Error::last_os_error());
             }
