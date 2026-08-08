@@ -268,10 +268,14 @@ pub enum ReadOutcome {
     Line(String),
     Eof,
     Interrupted,
-    // ':' pressed on an empty line -- command mode. Reported immediately on
-    // keypress (not after Enter) so the caller can switch modes right away;
-    // see read_line's Key::Char(':') handling.
-    CommandMode,
+    // Commits to command mode (see the cmd_mode_armed block in read_line).
+    // The payload is the character, if any, that was typed to trigger the
+    // commit -- e.g. typing ":w new" arms on ':' then commits on 'w',
+    // which must count as command mode's own first typed character
+    // rather than being lost, so `w new` (not just `new`) is what
+    // actually runs. `None` when commit was via a bare Enter right after
+    // arming, with nothing else typed.
+    CommandMode(Option<char>),
 }
 
 // Reads one line of input interactively: prompt is printed, raw mode is
@@ -296,9 +300,24 @@ pub enum ReadOutcome {
 // this crate's existing behavior); on for command mode, which -- like a
 // vim ':' command line -- should be cancelable by either Ctrl-C or Esc
 // regardless of what's been typed.
-pub fn read_line(prompt: &str, armed_prompt: &str, history: &History, history_boundary: usize, esc_cancels: bool) -> io::Result<ReadOutcome> {
+// `prefill`: a character to seed the buffer with before the first key is
+// even read -- used by repl.rs's run_command_mode to carry forward the
+// character that committed command mode (see ReadOutcome::CommandMode's
+// doc comment), so it counts as typed input instead of being lost.
+// `None` for every other caller.
+pub fn read_line(
+    prompt: &str,
+    armed_prompt: &str,
+    history: &History,
+    history_boundary: usize,
+    esc_cancels: bool,
+    prefill: Option<char>,
+) -> io::Result<ReadOutcome> {
     let mut guard = Some(term::RawGuard::enable(0)?);
     let mut ed = LineEditor::new();
+    if let Some(c) = prefill {
+        ed.insert(c);
+    }
 
     // Fish-style history browsing: Up/Down search backward/forward through
     // history for entries starting with whatever was typed *before*
@@ -313,18 +332,24 @@ pub fn read_line(prompt: &str, armed_prompt: &str, history: &History, history_bo
     // character or immediately switching modes: the prompt swaps to
     // armed_prompt (its command-mode terminator) while the buffer itself
     // stays untouched. What happens next depends entirely on the very
-    // next key (see the two blocks below that reference this flag) --
-    // Enter commits to real command mode, Backspace/Ctrl-C/Ctrl-D cancel
-    // back to plain shell mode, and anything else materializes the colon
-    // as a real character first (so `: some comment` still works as an
-    // ordinary shell-mode command). Matches plan.md's "Future
-    // improvements" note: entering command mode should read as the
-    // prompt itself changing, not as a character being typed, and should
-    // be reversible via Backspace before it's committed.
+    // next key (see the block below that reference this flag) --
+    // Backspace/Ctrl-C/Ctrl-D cancel back to plain shell mode, Space
+    // materializes the colon as a real character (so `: some comment`
+    // still works as an ordinary shell-mode command), and anything else
+    // (Enter included) commits to real command mode, carrying that key
+    // along as command mode's own first typed character if it was one.
+    // Matches plan.md's "Future improvements" note: entering command
+    // mode should read as the prompt itself changing, not as a character
+    // being typed, and should be reversible via Backspace before it's
+    // committed.
     let mut cmd_mode_armed = false;
 
-    print!("{}", prompt);
-    io::stdout().flush()?;
+    if prefill.is_some() {
+        redraw(prompt, &ed)?;
+    } else {
+        print!("{}", prompt);
+        io::stdout().flush()?;
+    }
 
     loop {
         let key = match read_key()? {
@@ -345,30 +370,35 @@ pub fn read_line(prompt: &str, armed_prompt: &str, history: &History, history_bo
         }
         if cmd_mode_armed {
             match key {
-                // The normal way to actually enter command mode: same
-                // final outcome as this crate's original instant-trigger
-                // design, just reached one keystroke later so a change
-                // of mind (Backspace, below) can cancel it first.
-                Key::Enter => {
-                    drop(guard.take());
-                    print!("\r\n");
-                    io::stdout().flush()?;
-                    return Ok(ReadOutcome::CommandMode);
-                }
                 // Cancel: back to an ordinary empty shell-mode buffer.
                 // Backspace falls through to its own arm below, which is
                 // a harmless no-op on an already-empty buffer.
                 Key::Backspace | Key::CtrlC | Key::CtrlD => {
                     cmd_mode_armed = false;
                 }
-                // Anything else: the user is typing a real command that
-                // happens to start with ':' (e.g. the `:` no-op builtin,
-                // `: some comment text`) -- materialize the virtual
-                // colon as a real character first, then let this key get
-                // handled completely normally below.
-                _ => {
+                // Materialize as a literal ':' followed by a real space
+                // -- the one case that stays in shell mode instead of
+                // committing, so `: some comment text` still works as an
+                // ordinary invocation of the `:` no-op builtin. Falls
+                // through to this same key's own arm below, which
+                // inserts the space itself.
+                Key::Char(' ') => {
                     ed.insert(':');
                     cmd_mode_armed = false;
+                }
+                // Anything else commits to real command mode -- Enter
+                // with nothing pending (the normal way to just open
+                // command mode), or a regular character that must count
+                // as command mode's own first typed character rather
+                // than being lost, so e.g. ":w new" actually enters
+                // command mode and types "w new" there, instead of
+                // materializing as literal shell-mode text.
+                _ => {
+                    drop(guard.take());
+                    print!("\r\n");
+                    io::stdout().flush()?;
+                    let pending = if let Key::Char(c) = key { Some(c) } else { None };
+                    return Ok(ReadOutcome::CommandMode(pending));
                 }
             }
         }

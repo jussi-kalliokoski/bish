@@ -121,7 +121,7 @@ pub fn run(shell: Shell) {
             }
         };
 
-        match editor::read_line(&prompt_str, &armed_prompt_str, &history, boundary, false) {
+        match editor::read_line(&prompt_str, &armed_prompt_str, &history, boundary, false, None) {
             Ok(ReadOutcome::Eof) => {
                 let session = sessions.get_mut(&session_id).unwrap();
                 if !session.buffer.is_empty() {
@@ -166,10 +166,10 @@ pub fn run(shell: Shell) {
                 // pending, same as bash, and starts fresh at a new prompt.
                 sessions.get_mut(&session_id).unwrap().buffer.clear();
             }
-            Ok(ReadOutcome::CommandMode) => {
+            Ok(ReadOutcome::CommandMode(pending)) => {
                 let action = {
                     let session = sessions.get_mut(&session_id).unwrap();
-                    run_command_mode(&mut session.shell, &mut cmd_history)
+                    run_command_mode(&mut session.shell, &mut cmd_history, pending)
                 };
                 if let Some(action) = action {
                     apply_window_action(
@@ -511,6 +511,10 @@ fn is_incomplete(err: &str) -> bool {
 // editor.rs's ReadOutcome::CommandMode). Has its own history, separate
 // from the shell's, and only ever runs builtins directly -- `command NAME`
 // is the escape hatch for externals (see restrict_to_builtins in exec.rs).
+// `initial_char` is the character (if any) that committed entry into
+// command mode -- e.g. typing ":w new" commits on 'w', which must be
+// command mode's own first typed character, not lost (see
+// editor::ReadOutcome::CommandMode's doc comment).
 // One-shot, matching vim's ':' Ex command line: successfully running one
 // command drops straight back to the normal shell prompt rather than
 // looping for another (see the `_ => return None` below). An empty line,
@@ -520,8 +524,9 @@ fn is_incomplete(err: &str) -> bool {
 // that ran was a `window`-family one, for the caller to apply against the
 // real session/window state (which run_command_mode itself has no access
 // to).
-fn run_command_mode(shell: &mut Shell, history: &mut History) -> Option<WindowAction> {
+fn run_command_mode(shell: &mut Shell, history: &mut History, initial_char: Option<char>) -> Option<WindowAction> {
     let mut buffer = String::new();
+    let mut prefill = initial_char;
     loop {
         let prompt_str = if buffer.is_empty() { ": ".to_string() } else { prompt::continuation() };
 
@@ -530,12 +535,18 @@ fn run_command_mode(shell: &mut Shell, history: &mut History) -> Option<WindowAc
         // here (see editor::read_line's doc comment) -- same string for
         // both, making it visually a no-op. esc_cancels: true -- like a
         // vim ':' command line, Esc should back out of command mode the
-        // same as Ctrl-C, regardless of what's been typed.
-        match editor::read_line(&prompt_str, &prompt_str, history, 0, true) {
+        // same as Ctrl-C, regardless of what's been typed. prefill.take():
+        // only the very first iteration (if entry carried a character)
+        // seeds the buffer; every iteration after that starts empty.
+        match editor::read_line(&prompt_str, &prompt_str, history, 0, true, prefill.take()) {
             Ok(ReadOutcome::Eof) | Ok(ReadOutcome::Interrupted) => return None,
-            // ':' at an empty command-mode prompt too -- nothing to switch
-            // to, just stay here.
-            Ok(ReadOutcome::CommandMode) => {}
+            // ':' at an empty command-mode prompt too -- nothing
+            // meaningful to switch to since we're already here; just
+            // carry forward whatever character (if any) committed it as
+            // the next iteration's prefill, same as the outer entry.
+            Ok(ReadOutcome::CommandMode(pending)) => {
+                prefill = pending;
+            }
             Ok(ReadOutcome::Line(line)) => {
                 if !buffer.is_empty() {
                     buffer.push('\n');
