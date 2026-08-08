@@ -311,11 +311,31 @@ impl LineEditor {
     }
 }
 
-fn redraw(prompt: &str, ed: &LineEditor) -> io::Result<()> {
+// `col_origin` is the real terminal column (0-indexed) this line's own
+// column 0 actually sits at -- 0 for the ordinary case (a bare `\r`
+// already lands there), non-zero when this read_line call is running
+// inside a compositor pane that doesn't start at the terminal's left
+// edge (see read_line's own doc comment). A bare `\r` always means
+// "real column 0," which is wrong the moment a pane's own left edge
+// isn't the terminal's; `\x1b[nG` (Cursor Horizontal Absolute) moves to
+// column n of whatever row the cursor is already on instead, so it's
+// used here even for col_origin == 0 (identical effect to `\r` in that
+// case, so this is a no-op change for every non-paned caller).
+// `width`: how many columns of this row belong to this line (the
+// pane's own cols, or the real terminal's width for the ordinary
+// non-paned case). Erasing is done by overwriting exactly this many
+// columns with spaces rather than `\x1b[K` (erase to end of the
+// *physical* terminal line): the bare terminal-wide form is wrong the
+// moment another pane shares this same real row further to the right
+// -- it would wipe that pane's content too. For the ordinary
+// non-paned/full-width case this is behaviorally identical to the old
+// `\x1b[K`.
+fn redraw(prompt: &str, ed: &LineEditor, col_origin: usize, width: usize) -> io::Result<()> {
     let text: String = ed.buf.iter().collect();
     let mut out = String::new();
-    out.push('\r');
-    out.push_str("\x1b[K"); // clear from column 0 to end of line
+    out.push_str(&format!("\x1b[{}G", col_origin + 1));
+    out.push_str(&" ".repeat(width));
+    out.push_str(&format!("\x1b[{}G", col_origin + 1));
     out.push_str(prompt);
     out.push_str(&text);
     let back = ed.buf.len() - ed.cursor;
@@ -392,6 +412,18 @@ pub enum DirNav {
 // A plain `|| {}` is a correct, if inert, choice for callers with nothing
 // to service (e.g. command mode's own nested read_line -- see that call
 // site's comment on why this is scoped out there for now).
+// `col_origin`/`width`: the real terminal column this prompt's own
+// column 0 actually sits at, and how many columns of that row belong
+// to it -- see redraw's own doc comment. col_origin 0 and width equal
+// to the real terminal's width for every non-paned caller (the plain
+// terminal, or a promoted-but-unsplit window, both of which start at
+// the real column 0 and own the whole row anyway); the current focused
+// pane's own rect.col/rect.cols once a window is split (see repl.rs's
+// pane_rect). The caller is responsible for having already positioned
+// the real cursor correctly (row included) before calling this --
+// read_line only ever needs to return to *this same* row's own start
+// column while redrawing during typing, never to reposition the row
+// itself (single-line editing, see this function's own scope note).
 pub fn read_line(
     prompt: &str,
     armed_prompt: &str,
@@ -399,6 +431,8 @@ pub fn read_line(
     history_boundary: usize,
     esc_cancels: bool,
     prefill: Option<char>,
+    col_origin: usize,
+    width: usize,
     mut on_idle: impl FnMut(),
 ) -> io::Result<ReadOutcome> {
     let mut guard = Some(term::RawGuard::enable(0)?);
@@ -432,12 +466,16 @@ pub fn read_line(
     // committed.
     let mut cmd_mode_armed = false;
 
-    if prefill.is_some() {
-        redraw(prompt, &ed)?;
-    } else {
-        print!("{}", prompt);
-        io::stdout().flush()?;
-    }
+    // Always goes through the same clear-and-draw redraw(), even with
+    // nothing typed yet and no prefill: the terminal cursor at this
+    // point may already be sitting right after a compositor-frozen
+    // idle prompt for this exact pane (see repl.rs's
+    // freeze_idle_prompt) -- a bare, non-clearing print here would
+    // append a second copy right next to it instead of redrawing over
+    // it. Behaviorally identical to the old bare print for every
+    // non-paned caller (col_origin 0, width the whole terminal, buffer
+    // empty unless prefilled).
+    redraw(prompt, &ed, col_origin, width)?;
 
     loop {
         let key = match read_key_idle(&mut on_idle)? {
@@ -453,7 +491,7 @@ pub fn read_line(
 
         if key == Key::Char(':') && ed.buf.is_empty() && !cmd_mode_armed {
             cmd_mode_armed = true;
-            redraw(armed_prompt, &ed)?;
+            redraw(armed_prompt, &ed, col_origin, width)?;
             continue;
         }
         if cmd_mode_armed {
@@ -626,6 +664,6 @@ pub fn read_line(
             }
             Key::AltLeft | Key::AltRight | Key::AltUp | Key::Unknown => {}
         }
-        redraw(if cmd_mode_armed { armed_prompt } else { prompt }, &ed)?;
+        redraw(if cmd_mode_armed { armed_prompt } else { prompt }, &ed, col_origin, width)?;
     }
 }

@@ -322,8 +322,9 @@ pub fn run(mut shell: Shell) {
                 (prompt::continuation(), prompt::continuation_armed())
             }
         };
+        let (col_origin, width) = focused_col_origin(&windows[current_window], sinks_are_grid, term_rows, term_cols);
 
-        match editor::read_line(&prompt_str, &armed_prompt_str, &history, boundary, false, None, || {
+        match editor::read_line(&prompt_str, &armed_prompt_str, &history, boundary, false, None, col_origin, width, || {
             service_background_jobs(&mut sessions, &mut windows, &mut job_frames, current_window);
         }) {
             Ok(ReadOutcome::Eof) => {
@@ -484,8 +485,23 @@ pub fn run(mut shell: Shell) {
                     // line (post history::expand), matching bash's own
                     // behavior of showing what a `!!`/`!n`/etc actually
                     // resolved to, not the literal designator typed.
+                    // Leading "\r\x1b[K": this pane's grid may already
+                    // hold an *idle* prompt on this exact row -- fed in
+                    // by freeze_idle_prompt the last time this pane lost
+                    // focus (see its own doc comment), with the grid's
+                    // cursor left sitting right after it. Without
+                    // returning to this row's start and clearing first,
+                    // this feed would land right after that stale
+                    // prompt instead of overwriting it, showing two
+                    // prompts back to back the first time a command runs
+                    // in a pane that's regained focus. Safe here in a
+                    // way it wouldn't be for the real terminal (see
+                    // editor::read_line's col_origin/width): this grid
+                    // is one pane's own private, independently-sized
+                    // Screen, never shared with another pane's content
+                    // the way one real terminal row can be.
                     if sinks_are_grid {
-                        let echoed = format!("{}{}\r\n", prompt_str, line);
+                        let echoed = format!("\r\x1b[K{}{}\r\n", prompt_str, line);
                         session.screen.borrow_mut().feed(echoed.as_bytes());
                     }
 
@@ -626,9 +642,10 @@ fn handle_command_mode(
     term_rows: usize,
     term_cols: usize,
 ) {
+    let (col_origin, width) = focused_col_origin(&windows[*current_window], *sinks_are_grid, term_rows, term_cols);
     let action = {
         let session = sessions.get_mut(&session_id).unwrap();
-        run_command_mode(&mut session.shell, cmd_history, pending)
+        run_command_mode(&mut session.shell, cmd_history, pending, col_origin, width)
     };
     if let Some(action) = action {
         apply_window_action(action, sessions, windows, current_window, next_session_id, next_window_id, history, sinks_are_grid, term_rows, term_cols);
@@ -838,7 +855,7 @@ fn apply_window_action(
             split_focused_pane(sessions, windows, *current_window, next_session_id, history, horizontal, term_rows, term_cols);
         }
         WindowAction::FocusPane(direction) => {
-            focus_pane_direction(&mut windows[*current_window], direction, term_rows, term_cols);
+            focus_pane_direction(&mut windows[*current_window], sessions, direction, term_rows, term_cols);
         }
     }
     compositor_redraw(sessions, windows, *current_window, term_rows, term_cols);
@@ -891,7 +908,43 @@ fn split_focused_pane(
     let focused_id = window.focused_pane;
     let old_layout = std::mem::replace(&mut window.layout, PaneLayout::Leaf(0));
     window.layout = insert_sibling(old_layout, focused_id, new_pane_id, horizontal);
-    window.focused_pane = new_pane_id;
+
+    // The pane being split is about to lose focus to its new sibling --
+    // freeze its current idle prompt into its own grid first, or it'll
+    // render blank (see freeze_idle_prompt's own doc comment). Only
+    // when it's genuinely idle at its own prompt (top frame a Session):
+    // splitting can also be reached right after detaching from a job
+    // (M10c's Ctrl+Space drops into command mode without popping the
+    // Frame::Job -- see run_fg_job_frame's Detached arm), and that
+    // pane's grid is already being live-written by the still-running
+    // job (service_background_jobs) -- freezing a prompt there would
+    // splice a bogus prompt line into the middle of its real output.
+    if matches!(windows[current_window].stack().last(), Some(Frame::Session(_))) {
+        freeze_idle_prompt(sessions.get_mut(&parent_id).unwrap());
+    }
+    windows[current_window].focused_pane = new_pane_id;
+}
+
+// Captures a pane's *idle* prompt (nothing submitted, just sitting
+// there waiting for input) into its own session's grid. Needed only at
+// the moment a pane is about to lose focus (see this function's call
+// sites): the currently focused pane's live prompt has only ever been
+// drawn straight to the real terminal by editor::read_line, never
+// captured anywhere -- fine as long as it's the only thing on screen
+// (the plain pre-panes case), but the moment a *second*, simultaneously
+// visible pane exists, whatever real redraw happens next (sourced only
+// from grids -- see render_compositor_frame's own doc comment) would
+// show this pane blank unless its idle prompt has been fed into its
+// grid first. Mirrors exactly what the main loop's own Line-outcome
+// handler already does for a *submitted* command line, just for the
+// "about to be left idle, nothing submitted yet" case instead -- and
+// deliberately omits that other feed's trailing "\r\n", so the frozen
+// grid's cursor lands right after the prompt text, matching a genuinely
+// idle prompt waiting for input rather than one that just finished a
+// line.
+fn freeze_idle_prompt(session: &mut SessionState) {
+    let prompt_str = if session.buffer.is_empty() { prompt::render(&session.shell) } else { prompt::continuation() };
+    session.screen.borrow_mut().feed(prompt_str.as_bytes());
 }
 
 // Finds `target`'s Leaf within the tree and turns it into a 2-way
@@ -1312,6 +1365,37 @@ fn compute_regions(layout: &PaneLayout, area: Rect, out: &mut Vec<(PaneId, Rect)
     }
 }
 
+// (col_origin, width): the real terminal column the given window's
+// *focused* pane's own column 0 sits at, and how many columns of that
+// row belong to it -- see editor::read_line's own doc comment for why
+// both matter. (0, term_cols) -- the whole real terminal row --
+// whenever there's nothing to offset by: not yet promoted
+// (sinks_are_grid false -- read_line is drawing straight to the plain,
+// unpaned real terminal), or promoted but this window isn't split (a
+// single pane always owns the terminal's whole own row regardless of
+// the window's own position in a next/previous cycle, since only one
+// window is ever full-screen at a time).
+fn focused_col_origin(window: &WindowEntry, sinks_are_grid: bool, term_rows: usize, term_cols: usize) -> (usize, usize) {
+    if !sinks_are_grid || window.panes.len() <= 1 {
+        return (0, term_cols);
+    }
+    let rect = pane_rect(window, window.focused_pane, term_rows, term_cols);
+    (rect.col, rect.cols)
+}
+
+// The screen rectangle `pane_id` currently occupies within `window`,
+// resolved against the real terminal size -- the read-only half of
+// what snapshot_window computes, for callers (focused_col_origin, pane
+// focus-change handling) that only need one pane's geometry rather than
+// every pane's live screen reference too.
+fn pane_rect(window: &WindowEntry, pane_id: PaneId, term_rows: usize, term_cols: usize) -> Rect {
+    let area = Rect { row: 0, col: 0, rows: content_rows(term_rows), cols: term_cols };
+    let mut regions = Vec::new();
+    let mut dividers = Vec::new();
+    compute_regions(&window.layout, area, &mut regions, &mut dividers);
+    regions.into_iter().find(|(id, _)| *id == pane_id).map(|(_, r)| r).expect("pane id always present in its own window's layout")
+}
+
 // Resolves a window's layout against the real terminal size into a
 // CompositorLayout, resizing every involved session's grid (Screen::
 // resize, same primitive SIGWINCH already uses) to match its pane's
@@ -1397,13 +1481,23 @@ fn draw_divider(out: &mut String, rect: Rect, horizontal: bool) {
     }
 }
 
-// vim/tmux Ctrl-w-hjkl-style spatial pane focus: moves to whichever
-// other leaf's center lies in the requested direction from the
-// currently focused leaf's center and is closest to it, ignoring
-// anything not in that direction. A no-op if the window isn't split
-// (single leaf) or nothing qualifies (e.g. `left` from the leftmost
-// pane).
-fn focus_pane_direction(window: &mut WindowEntry, direction: PaneDirection, term_rows: usize, term_cols: usize) {
+// vim/tmux Ctrl-w-hjkl-style spatial pane focus: moves to the nearest
+// other leaf in the requested direction. Among candidates whose
+// perpendicular span (row range for Left/Right, column range for
+// Up/Down) actually overlaps the focused pane's own -- i.e. a pane
+// genuinely alongside it, not just diagonally off in that general
+// direction -- the nearest by primary-axis distance wins; a candidate
+// with no such overlap is only ever picked if nothing overlapping
+// exists. Plain center-to-center distance (summing both axes) would
+// pick a diagonal neighbor over a directly-adjacent one whenever the
+// diagonal one's center happened to be closer in Manhattan terms --
+// wrong the moment panes of very different sizes are adjacent (e.g. a
+// wide top pane above a narrow bottom-right one: "left" from the
+// bottom-right pane must reach the bottom-left pane beside it, not the
+// top pane above-and-to-the-left of it). A no-op if the window isn't
+// split (single leaf) or nothing qualifies (e.g. `left` from the
+// leftmost pane).
+fn focus_pane_direction(window: &mut WindowEntry, sessions: &mut HashMap<SessionId, SessionState>, direction: PaneDirection, term_rows: usize, term_cols: usize) {
     let area = Rect { row: 0, col: 0, rows: content_rows(term_rows), cols: term_cols };
     let mut regions = Vec::new();
     let mut dividers = Vec::new();
@@ -1414,7 +1508,9 @@ fn focus_pane_direction(window: &mut WindowEntry, direction: PaneDirection, term
     let current_rect = regions.iter().find(|(id, _)| *id == window.focused_pane).map(|(_, r)| *r).unwrap();
     let (cx, cy) = rect_center(&current_rect);
 
-    let mut best: Option<(PaneId, i64)> = None;
+    // (id, primary-axis distance, whether its perpendicular span
+    // overlaps the focused pane's).
+    let mut best: Option<(PaneId, i64, bool)> = None;
     for (id, rect) in &regions {
         if *id == window.focused_pane {
             continue;
@@ -1430,14 +1526,35 @@ fn focus_pane_direction(window: &mut WindowEntry, direction: PaneDirection, term
         if !in_direction {
             continue;
         }
-        let dist = dx.abs() + dy.abs();
-        if best.is_none_or(|(_, best_dist)| dist < best_dist) {
-            best = Some((*id, dist));
+        let (dist, aligned) = match direction {
+            PaneDirection::Left | PaneDirection::Right => (dx.abs(), ranges_overlap(current_rect.row, current_rect.rows, rect.row, rect.rows)),
+            PaneDirection::Up | PaneDirection::Down => (dy.abs(), ranges_overlap(current_rect.col, current_rect.cols, rect.col, rect.cols)),
+        };
+        let better = match best {
+            None => true,
+            Some((_, best_dist, best_aligned)) => (aligned && !best_aligned) || (aligned == best_aligned && dist < best_dist),
+        };
+        if better {
+            best = Some((*id, dist, aligned));
         }
     }
-    if let Some((id, _)) = best {
+    if let Some((id, _, _)) = best {
+        // The currently focused pane is about to lose focus -- freeze
+        // its idle prompt into its own grid first (see
+        // freeze_idle_prompt's own doc comment), same as split does --
+        // but only if it's genuinely idle (top frame a Session, not a
+        // still-running detached job -- see split_focused_pane's own
+        // comment on why that case must skip this).
+        if matches!(window.stack().last(), Some(Frame::Session(_))) {
+            let old_sid = window.owning_session();
+            freeze_idle_prompt(sessions.get_mut(&old_sid).unwrap());
+        }
         window.focused_pane = id;
     }
+}
+
+fn ranges_overlap(a_start: usize, a_len: usize, b_start: usize, b_len: usize) -> bool {
+    a_start < b_start + b_len && b_start < a_start + a_len
 }
 
 fn rect_center(rect: &Rect) -> (usize, usize) {
@@ -1617,8 +1734,10 @@ fn is_incomplete(err: &str) -> bool {
 // insert mode with nothing run. Returns a WindowAction if the command
 // that ran was a `window`-family one, for the caller to apply against the
 // real session/window state (which run_command_mode itself has no access
-// to).
-fn run_command_mode(shell: &mut Shell, history: &mut History, initial_char: Option<char>) -> Option<WindowAction> {
+// to). `col_origin`: see editor::read_line's own doc comment -- the
+// caller (handle_command_mode) computes this once from the real
+// session/window state this function has no access to.
+fn run_command_mode(shell: &mut Shell, history: &mut History, initial_char: Option<char>, col_origin: usize, width: usize) -> Option<WindowAction> {
     let mut buffer = String::new();
     let mut prefill = initial_char;
     loop {
@@ -1639,7 +1758,7 @@ fn run_command_mode(shell: &mut Shell, history: &mut History, initial_char: Opti
         // during which a background job would visibly stall here is
         // negligible; wiring sessions/windows/job_frames all the way
         // through run_command_mode for that is scoped out for now.
-        match editor::read_line(&prompt_str, &prompt_str, history, 0, true, prefill.take(), || {}) {
+        match editor::read_line(&prompt_str, &prompt_str, history, 0, true, prefill.take(), col_origin, width, || {}) {
             Ok(ReadOutcome::Eof) | Ok(ReadOutcome::Interrupted) => return None,
             // ':' at an empty command-mode prompt too -- nothing
             // meaningful to switch to since we're already here; just
