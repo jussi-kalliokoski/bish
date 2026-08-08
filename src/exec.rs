@@ -319,18 +319,18 @@ pub struct Shell {
     shell_start: std::time::Instant,
     seconds_offset: i64,
     // Background jobs (`cmd &`), tracked well enough for `jobs`/`fg`/`bg`/
-    // `wait`/`kill %N` to work against real child processes. What's
-    // explicitly NOT here: real terminal job control -- no process-group
-    // creation, no `tcsetpgrp` foreground reassignment, no SIGTSTP/Ctrl-Z
-    // suspend-to-stopped. That's all specifically about a human at a
-    // keyboard hitting Ctrl-Z and expecting the terminal to hand control
-    // back and forth between the shell and a job; it doesn't affect
-    // whether a *script* runs correctly (scripts don't self-suspend), and
-    // getting process-group/terminal reassignment wrong risks leaving a
-    // real terminal in a broken state -- a bad trade for a feature that
-    // isn't script-compatibility-relevant in the first place. `fg`/`bg`
-    // here just mean "wait for" / "leave running", not the full terminal
-    // dance.
+    // `wait`/`kill %N` to work against real child processes. Real
+    // terminal job control -- process-group isolation, `tcsetpgrp`
+    // foreground reassignment, genuine Ctrl-Z/SIGTSTP suspend-to-stopped
+    // -- is layered on top of this (M11, gated on `set -m`/opt_monitor)
+    // for the one case it actually matters: a single external command
+    // run_single spawns directly (see its own pre_exec setpgid hook and
+    // Job::pgid). Deliberately not extended to multi-stage pipelines
+    // (run_multi) or the self-exec'd subshell/coproc spawn sites in this
+    // pass -- those still behave as a script would expect (Ctrl-Z there
+    // does nothing useful yet), only the single-foreground-command case a
+    // human actually hits at an interactive prompt was worth the real
+    // process-group plumbing right now.
     //
     // Held behind Rc<RefCell<_>> (single-threaded, so plain interior
     // mutability, no Arc/Mutex needed) rather than owned directly:
@@ -589,6 +589,17 @@ impl Shell {
         }
     }
 
+    // Real bash enables job control (`-m`/monitor) by default for an
+    // interactive shell, no explicit `set -m` needed -- only a
+    // non-interactive script has to opt in. repl.rs calls this once for
+    // the root session at interactive startup, matching that; every
+    // `window new` virtual child then inherits it automatically the same
+    // way it inherits every other opt_* flag (see new_virtual_child).
+    pub fn enable_monitor_mode(&mut self) {
+        self.opt_monitor = true;
+        crate::term::ignore_tty_signals();
+    }
+
     // Resolves a job spec (%N, %%/%+  current, %-  previous, %name  prefix
     // match on the job's command text) to an index into self.jobs. Bare
     // job numbers without the `%` are also accepted, matching bash's own
@@ -604,14 +615,26 @@ impl Shell {
     // Same as push_job, but additionally records the pty master (if any)
     // that job's stdio is attached to -- see Job::pty_master's doc
     // comment. Only the single-external-command background-spawn site
-    // (run_single) ever passes Some here.
+    // (run_single) ever passes Some here. Never a real process-group
+    // job -- see push_job_with_pgid for that.
     fn push_job_with_pty(&mut self, children: Vec<std::process::Child>, cmd_text: String, pty_master: Option<std::fs::File>) {
+        self.push_job_full(children, cmd_text, pty_master, None);
+    }
+
+    // Same as push_job, but records the job's own isolated process group
+    // (see Job::pgid's doc comment) -- only run_single's plain
+    // (non-pty) background-spawn site ever passes Some here.
+    fn push_job_with_pgid(&mut self, children: Vec<std::process::Child>, cmd_text: String, pgid: Option<u32>) {
+        self.push_job_full(children, cmd_text, None, pgid);
+    }
+
+    fn push_job_full(&mut self, children: Vec<std::process::Child>, cmd_text: String, pty_master: Option<std::fs::File>, pgid: Option<u32>) {
         let pids: Vec<u32> = children.iter().map(|c| c.id()).collect();
         let mut table = self.jobs.borrow_mut();
         table.last_bg_pid = pids.last().copied();
         let id = table.next_job_id;
         table.next_job_id += 1;
-        table.jobs.push(Job { id, pids, children, cmd_text, pty_master });
+        table.jobs.push(Job { id, pids, children, cmd_text, pty_master, pgid, stopped: false });
     }
 
     fn resolve_job_spec(&self, spec: &str) -> Option<usize> {
@@ -642,6 +665,18 @@ impl Shell {
             } else {
                 " "
             };
+            // Checked before Job::poll -- that only ever wraps Child::
+            // try_wait, which never observes a stop (no WUNTRACED), so a
+            // job this shell has already recorded as Stopped would
+            // otherwise just look Running to it forever (see Job::
+            // stopped's own doc comment).
+            if job.stopped {
+                // No trailing " &": bash only shows that for a job
+                // actually launched with `&`, and a job stopped via
+                // Ctrl-Z from the foreground wasn't.
+                sh_println!(self, "[{}]{}  Stopped                 {}", job.id, mark, job.cmd_text);
+                continue;
+            }
             match job.poll() {
                 Some(_) => {
                     sh_println!(self, "[{}]{}  Done                    {} &", job.id, mark, job.cmd_text);
@@ -658,19 +693,26 @@ impl Shell {
         0
     }
 
-    // `fg` doesn't reassociate the terminal's controlling process group
-    // (see the comment on the `jobs` field) -- for a job with no pty
-    // attached, it just blocks until the job finishes, in this process,
-    // and reports its exit status. Scripts don't distinguish that from
-    // real terminal foregrounding since they never interactively signal
-    // the job via the keyboard anyway.
-    //
     // A job that *was* spawned pty-attached (Job::pty_master.is_some() --
-    // only true for a promoted, unredirected background job) instead
-    // bubbles ExecResult::Fg without blocking at all: see that variant's
-    // doc comment for why the actual poll loop has to happen through
-    // repl.rs's Shell::take_pending_fg + drive_fg_job instead of
-    // directly here.
+    // only true for a promoted, unredirected background job) bubbles
+    // ExecResult::Fg without blocking at all: see that variant's doc
+    // comment for why the actual poll loop has to happen through
+    // repl.rs's Shell::take_pending_fg + drive_fg_job instead of directly
+    // here.
+    //
+    // A job real job control isolated into its own process group (Job::
+    // pgid -- see its own doc comment) gets the real terminal-foregrounding
+    // dance: SIGCONT it if it was Stopped, tcsetpgrp the real terminal at
+    // it, wait watching for it to stop *again* (not just exit -- see
+    // waitpid_untraced) rather than Job::wait's plain blocking wait
+    // (which can never observe a stop), then reclaim the terminal for
+    // bish either way.
+    //
+    // Anything else (no pty, no pgid -- a multi-stage pipeline, or a job
+    // spawned before this shell ever ran under `set -m`) falls back to
+    // the original plain blocking wait: scripts don't distinguish that
+    // from real terminal foregrounding since they never interactively
+    // signal the job via the keyboard anyway.
     fn run_fg(&mut self, args: &[String]) -> ExecResult {
         if !self.opt_monitor {
             sh_eprintln!(self, "bish: fg: no job control");
@@ -689,10 +731,31 @@ impl Shell {
                 };
                 if job.pty_master.is_some() {
                     self.pending_fg = Some(job);
-                    ExecResult::Fg
-                } else {
-                    ExecResult::Status(job.wait())
+                    return ExecResult::Fg;
                 }
+                if let Some(pgid) = job.pgid {
+                    if job.stopped {
+                        send_signal_to_pgrp(pgid, SIGCONT);
+                        job.stopped = false;
+                    }
+                    pty::tcsetpgrp(0, pgid as i32).ok();
+                    let outcome = waitpid_untraced(job.pids[0]);
+                    unsafe {
+                        pty::tcsetpgrp(0, getpgrp()).ok();
+                    }
+                    return match outcome {
+                        JobWaitOutcome::Exited(status) => ExecResult::Status(status),
+                        JobWaitOutcome::Stopped(_sig) => {
+                            job.stopped = true;
+                            let id = job.id;
+                            let cmd_text = job.cmd_text.clone();
+                            self.jobs.borrow_mut().jobs.push(job);
+                            sh_println!(self, "\n[{}]+  Stopped                 {}", id, cmd_text);
+                            ExecResult::Status(148)
+                        }
+                    };
+                }
+                ExecResult::Status(job.wait())
             }
             None => {
                 sh_eprintln!(self, "bish: fg: no current job");
@@ -726,13 +789,18 @@ impl Shell {
         self.pending_fg.take().map(FgJob)
     }
 
-    // Every job this shell tracks is, by construction, already running --
-    // there's no SIGTSTP/Ctrl-Z support (see the `jobs` field comment), so
-    // nothing ever reaches a genuine Stopped state for `bg` to resume.
-    // Confirmed against real bash: `bg` on an already-running job doesn't
-    // resume anything, it just reports "already in background" and
-    // returns 0 -- exactly the one case this implementation can ever
-    // reach, so that's what it always does.
+    // Resumes a Stopped job (Job::stopped) in place, without reclaiming
+    // the real terminal for it -- SIGCONT to its process group is enough;
+    // it keeps running with whatever stdio it already had (inherited from
+    // the real terminal, same as any backgrounded command), it just isn't
+    // the terminal's foreground process group, so it won't receive
+    // further Ctrl-C/Ctrl-Z (and will itself stop again on SIGTTIN/
+    // SIGTTOU if it ever tries to read from the terminal -- ordinary
+    // kernel behavior, nothing this shell needs to implement).
+    // A job that's *already* running (no pgid at all, or pgid but not
+    // stopped) has nothing to resume -- matches real bash, confirmed:
+    // `bg` on an already-running job just reports "already in background"
+    // and returns 0.
     fn run_bg(&mut self, args: &[String]) -> i32 {
         if !self.opt_monitor {
             sh_eprintln!(self, "bish: bg: no job control");
@@ -744,7 +812,17 @@ impl Shell {
         };
         match idx {
             Some(i) => {
-                sh_eprintln!(self, "bish: bg: job {} already in background", self.jobs.borrow().jobs[i].id);
+                let mut table = self.jobs.borrow_mut();
+                let job = &mut table.jobs[i];
+                if job.stopped {
+                    if let Some(pgid) = job.pgid {
+                        send_signal_to_pgrp(pgid, SIGCONT);
+                    }
+                    job.stopped = false;
+                    sh_println!(self, "[{}]+  {} &", job.id, job.cmd_text);
+                    return 0;
+                }
+                sh_eprintln!(self, "bish: bg: job {} already in background", job.id);
                 0
             }
             None => {
@@ -757,10 +835,15 @@ impl Shell {
     // `wait` with no operands waits for every active job and always
     // returns 0 (POSIX-specified, confirmed against real bash); with
     // operands, waits for just those and returns the *last* one's status.
+    // Stopped jobs (Job::stopped) are skipped rather than waited on --
+    // Job::wait is a plain Child::wait, which (no WUNTRACED) would just
+    // block forever on a job that's merely stopped, not exited.
     fn run_wait(&mut self, args: &[String]) -> i32 {
         if args.is_empty() {
-            while !self.jobs.borrow().jobs.is_empty() {
-                let mut job = self.jobs.borrow_mut().jobs.remove(0);
+            loop {
+                let idx = self.jobs.borrow().jobs.iter().position(|j| !j.stopped);
+                let Some(idx) = idx else { break };
+                let mut job = self.jobs.borrow_mut().jobs.remove(idx);
                 job.wait();
             }
             return 0;
@@ -768,6 +851,11 @@ impl Shell {
         let mut status = 0;
         for a in args {
             if let Some(idx) = self.resolve_job_spec(a) {
+                if self.jobs.borrow().jobs[idx].stopped {
+                    sh_eprintln!(self, "bish: wait: job {} is stopped", self.jobs.borrow().jobs[idx].id);
+                    status = 127;
+                    continue;
+                }
                 let mut job = self.jobs.borrow_mut().jobs.remove(idx);
                 status = job.wait();
                 continue;
@@ -3347,16 +3435,90 @@ impl Shell {
         command.stderr(redirs.stderr.unwrap_or_else(Stdio::inherit));
         apply_fd_redirects(&mut command, redirs.dup_stderr_to_stdout, redirs.extra_fds);
 
+        // Real job control (M11), gated on `set -m` like fg/bg already are
+        // (see their own opt_monitor checks): give this single external
+        // command its own process group, seeded from its own (eventual)
+        // pid, so a signal the terminal driver generates -- Ctrl-C,
+        // Ctrl-Z -- targets only it, never bish. Set from *both* sides
+        // (here, in the child, before exec; and again from the parent
+        // right after spawn() returns below) to avoid the classic job-
+        // control race where either side might run first -- setpgid(pid,
+        // pid) is idempotent, so redundantly calling it twice is safe.
+        if self.opt_monitor {
+            unsafe {
+                command.pre_exec(|| {
+                    setpgid(0, 0);
+                    // bish ignores SIGTTIN/SIGTTOU for itself (see
+                    // term::ignore_tty_signals), a disposition that
+                    // survives exec() the same way SIGINT's does (see
+                    // apply_fd_redirects' own comment on this) -- without
+                    // resetting them back to default here, a child later
+                    // moved to the background (`bg`) that tries to read
+                    // the terminal would silently ignore SIGTTIN instead
+                    // of correctly stopping.
+                    sigaction_raw(crate::term::SIGTTIN, SIG_DFL);
+                    sigaction_raw(crate::term::SIGTTOU, SIG_DFL);
+                    Ok(())
+                });
+            }
+        }
+
         match command.spawn() {
             Ok(child) => {
+                let pid = child.id();
+                if self.opt_monitor {
+                    unsafe { setpgid(pid as i32, pid as i32) };
+                }
                 if background {
                     let mut cmd_text = argv.join(" ");
                     for r in &cmd.redirects {
                         cmd_text.push(' ');
                         cmd_text.push_str(&crate::serialize::serialize_redirect(r));
                     }
-                    self.push_job(vec![child], cmd_text);
+                    let pgid = if self.opt_monitor { Some(pid) } else { None };
+                    self.push_job_with_pgid(vec![child], cmd_text, pgid);
                     ExecResult::Status(0)
+                } else if self.opt_monitor {
+                    // Foreground, with real job control: hand the real
+                    // terminal to the child, wait watching for it to stop
+                    // (not just exit -- see waitpid_untraced), then
+                    // reclaim the terminal for bish either way.
+                    pty::tcsetpgrp(0, pid as i32).ok();
+                    let outcome = waitpid_untraced(pid);
+                    unsafe {
+                        pty::tcsetpgrp(0, getpgrp()).ok();
+                    }
+                    self.drain_proc_subs();
+                    match outcome {
+                        JobWaitOutcome::Exited(status) => ExecResult::Status(status),
+                        JobWaitOutcome::Stopped(_sig) => {
+                            let mut cmd_text = argv.join(" ");
+                            for r in &cmd.redirects {
+                                cmd_text.push(' ');
+                                cmd_text.push_str(&crate::serialize::serialize_redirect(r));
+                            }
+                            let id = {
+                                let mut table = self.jobs.borrow_mut();
+                                let id = table.next_job_id;
+                                table.next_job_id += 1;
+                                table.jobs.push(Job {
+                                    id,
+                                    pids: vec![pid],
+                                    children: vec![child],
+                                    cmd_text: cmd_text.clone(),
+                                    pty_master: None,
+                                    pgid: Some(pid),
+                                    stopped: true,
+                                });
+                                id
+                            };
+                            // Bash convention: $? = 128+signum for a
+                            // foreground job the shell caught stopping,
+                            // same family as a signal-killed exit status.
+                            sh_println!(self, "\n[{}]+  Stopped                 {}", id, cmd_text);
+                            ExecResult::Status(148)
+                        }
+                    }
                 } else {
                     let mut child = child;
                     let result = match child.wait() {
@@ -4721,6 +4883,27 @@ struct Job {
     // redirected) has this as None and `fg` falls back to exactly
     // today's blocking behavior for it.
     pty_master: Option<std::fs::File>,
+    // Real job control (M11): Some(pid) for a single external command
+    // spawned via run_single's plain (non-pty) path, where the pre_exec
+    // hook there gave it its own process group seeded from its own pid --
+    // run_fg/run_bg use this to tcsetpgrp the real terminal at it and
+    // SIGCONT it. None for everything else: a pty-attached job doesn't
+    // need this (spawn_attached's setsid already isolates it into its
+    // own session, and drive_fg_job's raw-byte forwarding lets its own
+    // pty's line discipline generate SIGTSTP/SIGINT correctly without
+    // any of this machinery), and a multi-stage pipeline's stages were
+    // never isolated this way in the first place (out of scope for this
+    // pass -- see run_multi).
+    pgid: Option<u32>,
+    // True once this job has been observed stopped (via a WUNTRACED-
+    // aware wait -- see waitpid_untraced) rather than exited. Checked by
+    // `jobs`/`wait` before touching Job::poll/wait, neither of which can
+    // ever observe a stop (Child::try_wait/wait never pass WUNTRACED, so
+    // a stopped child just looks like it's still running to them --
+    // correct for every *other* caller, since only run_fg's real-job-
+    // control path and run_single's own foreground wait ever use
+    // waitpid_untraced directly). Cleared by `fg`/`bg` resuming it.
+    stopped: bool,
 }
 
 // Backs Shell.jobs (see that field's doc comment for why this lives behind
@@ -5081,6 +5264,108 @@ fn send_signal(pid: u32, sig: i32) -> bool {
         fn kill(pid: i32, sig: i32) -> i32;
     }
     unsafe { kill(pid as i32, sig) == 0 }
+}
+
+// kill(2) with a negative pid targets the whole process group (POSIX) --
+// used to SIGCONT/SIGTERM/etc. a real-job-control job (Job::pgid) as a
+// unit, matching how the terminal driver itself would signal it.
+fn send_signal_to_pgrp(pgid: u32, sig: i32) -> bool {
+    unsafe extern "C" {
+        fn kill(pid: i32, sig: i32) -> i32;
+    }
+    unsafe { kill(-(pgid as i32), sig) == 0 }
+}
+
+// Real job control (M11): SIGCONT, used to resume a Stopped job (Job::
+// stopped) from `fg`/`bg`. Linux/glibc's standard number, same "safe to
+// hardcode" reasoning as this file's other signal constants.
+const SIGCONT: i32 = 18;
+
+unsafe extern "C" {
+    fn setpgid(pid: i32, pgid: i32) -> i32;
+    fn getpgrp() -> i32;
+    fn waitpid(pid: i32, status: *mut i32, options: i32) -> i32;
+}
+
+// WUNTRACED: makes waitpid additionally report a child that's stopped
+// (not just exited/signaled) -- Rust's Child::wait/try_wait never pass
+// this, so they can never observe a Ctrl-Z-stopped child (it just looks
+// like it's still running to them, forever). Real job control needs to
+// tell "stopped" apart from "still running" and "exited", hence this
+// raw waitpid wrapper instead.
+const WUNTRACED: i32 = 2;
+
+// How a real-job-control wait (waitpid_untraced) ended.
+enum JobWaitOutcome {
+    // Exited normally or was killed by a signal -- either way, this is
+    // the process's final status, bash-convention-encoded (128+signum
+    // for the killed case, matching exit_code_from_status elsewhere in
+    // this file).
+    Exited(i32),
+    // Stopped (Ctrl-Z or an explicit SIGSTOP/SIGTSTP/SIGTTIN/SIGTTOU),
+    // not exited -- still alive, resumable via SIGCONT. Carries the stop
+    // signal only for completeness; every caller here treats any stop
+    // the same way bash's default job control does, regardless of which
+    // of the four stop signals caused it.
+    Stopped(i32),
+}
+
+// Linux/glibc's raw wait-status bit layout (the same "stable, standard,
+// safe to hardcode" reasoning this file already applies to signal
+// numbers) -- decodes what plain libc's WIFEXITED/WEXITSTATUS/
+// WIFSIGNALED/WTERMSIG/WIFSTOPPED/WSTOPSIG macros would, since Rust's
+// std doesn't expose a way to inspect a raw waitpid status at all (only
+// ExitStatus, built from the exited/signaled cases exec_code_from_status
+// already handles -- a WUNTRACED stop has no ExitStatus representation).
+fn wait_status_exited(status: i32) -> bool {
+    (status & 0x7f) == 0
+}
+fn wait_status_exit_code(status: i32) -> i32 {
+    (status >> 8) & 0xff
+}
+fn wait_status_signaled(status: i32) -> bool {
+    let low = status & 0x7f;
+    low != 0 && low != 0x7f
+}
+fn wait_status_term_sig(status: i32) -> i32 {
+    status & 0x7f
+}
+fn wait_status_stopped(status: i32) -> bool {
+    (status & 0xff) == 0x7f
+}
+fn wait_status_stop_sig(status: i32) -> i32 {
+    (status >> 8) & 0xff
+}
+
+// Blocking wait for a single process, but (unlike Job::wait/poll, which
+// go through std::process::Child and can never ask for this) able to
+// observe it stopping instead of exiting -- see WUNTRACED. Used only for
+// pids real job control (Job::pgid) has isolated into their own process
+// group; every other job in this shell is still waited on the ordinary
+// way, via Child::wait/try_wait.
+fn waitpid_untraced(pid: u32) -> JobWaitOutcome {
+    loop {
+        let mut status: i32 = 0;
+        let r = unsafe { waitpid(pid as i32, &mut status, WUNTRACED) };
+        if r < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            // ECHILD or similar (the process is already gone some other
+            // way) -- nothing meaningful to report, but this must return
+            // *something* rather than loop forever.
+            return JobWaitOutcome::Exited(1);
+        }
+        if wait_status_stopped(status) {
+            return JobWaitOutcome::Stopped(wait_status_stop_sig(status));
+        }
+        if wait_status_signaled(status) {
+            return JobWaitOutcome::Exited(128 + wait_status_term_sig(status));
+        }
+        debug_assert!(wait_status_exited(status));
+        return JobWaitOutcome::Exited(wait_status_exit_code(status));
+    }
 }
 
 // $HOSTNAME: bash populates this at startup from uname(); Linux exposes

@@ -52,6 +52,8 @@ unsafe extern "C" {
 // hardcode rather than pulling in exec.rs's trap-oriented signal tables).
 pub const SIGINT: i32 = 2;
 pub const SIGTSTP: i32 = 20;
+pub const SIGTTIN: i32 = 21;
+pub const SIGTTOU: i32 = 22;
 const SIG_IGN: usize = 1;
 
 unsafe extern "C" {
@@ -71,6 +73,32 @@ unsafe extern "C" {
 pub fn ignore_sigint() {
     unsafe {
         signal(SIGINT, SIG_IGN);
+    }
+}
+
+// Real job control (M11): every job-control shell ignores SIGTTIN/SIGTTOU
+// for itself. Textbook reason: once the shell hands the terminal's
+// foreground status to a job (tcsetpgrp), the shell's own process group
+// becomes a *background* one relative to that terminal for as long as
+// the job holds it -- and a background process group that isn't
+// ignoring/blocking SIGTTIN/SIGTTOU gets stopped by the kernel the
+// moment it touches the terminal (SIGTTIN on any read, SIGTTOU on a
+// write if the terminal has TOSTOP set), including, in practice, right
+// around the shell's own tcsetpgrp call to reclaim the terminal once the
+// job finishes or stops -- exactly the call that's supposed to be how it
+// gets control back. Confirmed by reproducing this exact failure mode
+// (bish silently dying instead of reclaiming the terminal) without this,
+// then confirming it disappears with it -- deliberately NOT touching
+// SIGTSTP here, unlike those two: term::suspend_self's own deliberate
+// `raise(SIGTSTP)` (Ctrl-Z at a plain prompt, not a job) needs SIGTSTP's
+// default disposition to still apply, or self-suspending the shell would
+// silently stop working. Same inherits-across-exec caveat as
+// ignore_sigint applies to these too -- see exec.rs's pre_exec hooks for
+// job-controlled children, which reset them back to SIG_DFL.
+pub fn ignore_tty_signals() {
+    unsafe {
+        signal(SIGTTIN, SIG_IGN);
+        signal(SIGTTOU, SIG_IGN);
     }
 }
 

@@ -125,13 +125,16 @@ fn session_referenced_elsewhere(windows: &[WindowEntry], current_window: usize, 
     false
 }
 
-pub fn run(shell: Shell) {
+pub fn run(mut shell: Shell) {
     // The shell itself must survive Ctrl-C (bash's own top-level
     // interactive behavior); a foreground child still dies/interrupts
     // normally since exec() resets a *caught* signal like this back to
     // default. See term::ignore_sigint's doc comment.
     term::ignore_sigint();
     exec::install_winch_handler();
+    // Real bash enables job control automatically for an interactive
+    // shell -- see Shell::enable_monitor_mode's own doc comment.
+    shell.enable_monitor_mode();
 
     let mut history = History::load(".bish_history");
     let mut cmd_history = History::load(".bish_cmd_history");
