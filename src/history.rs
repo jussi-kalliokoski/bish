@@ -95,6 +95,192 @@ impl History {
     pub fn boundary(&self) -> usize {
         self.entries.len()
     }
+
+    // `!n`: absolute, 1-based (matches how bash numbers history events).
+    // None if out of range or older than `boundary` -- a session can't
+    // `!`-reference an event from before it existed any more than it can
+    // browse one with Up (see this struct's own doc comment).
+    fn entry_by_number(&self, n: usize, boundary: usize) -> Option<&str> {
+        let idx = n.checked_sub(1)?;
+        if idx < boundary {
+            return None;
+        }
+        self.entries.get(idx).map(|s| s.as_str())
+    }
+
+    // `!-n`: n events back from the most recent (1 = most recent, same
+    // as `!!`).
+    fn entry_back(&self, n: usize, boundary: usize) -> Option<&str> {
+        if n == 0 {
+            return None;
+        }
+        let idx = self.entries.len().checked_sub(n)?;
+        if idx < boundary {
+            return None;
+        }
+        self.entries.get(idx).map(|s| s.as_str())
+    }
+
+    // `!/prefix` (bish's own spelling of bash's plain `!prefix`, freeing
+    // up a bare `!word` to mean "run in a child shell" instead -- see
+    // expand's own doc comment): most recent entry starting with it.
+    fn find_starting_with(&self, prefix: &str, boundary: usize) -> Option<&str> {
+        self.entries[boundary..].iter().rev().find(|e| e.starts_with(prefix)).map(|s| s.as_str())
+    }
+
+    // `!?text`: most recent entry containing it anywhere.
+    fn find_containing(&self, substr: &str, boundary: usize) -> Option<&str> {
+        self.entries[boundary..].iter().rev().find(|e| e.contains(substr)).map(|s| s.as_str())
+    }
+}
+
+// Recognized `!`-designator, and how much of the text right after the
+// `!` it consumes -- see find_designator.
+enum Designator<'a> {
+    Bang,
+    LastArg,
+    Back(usize),
+    Number(usize),
+    Contains(&'a str),
+    StartsWith(&'a str),
+}
+
+// Tries to parse a `!`-designator starting right after the `!` itself
+// (`rest` is everything from there on). Returns the designator and how
+// many bytes of `rest` it consumes, or None if `rest` doesn't start with
+// any recognized form -- the `!` is then left alone (general scan) or,
+// if it was the line's own leading character, triggers the child-shell
+// fallback (see expand).
+fn find_designator(rest: &str) -> Option<(usize, Designator<'_>)> {
+    let mut chars = rest.chars();
+    match chars.next()? {
+        '!' => Some((1, Designator::Bang)),
+        '$' => Some((1, Designator::LastArg)),
+        '-' => {
+            let digits: String = rest[1..].chars().take_while(|c| c.is_ascii_digit()).collect();
+            if digits.is_empty() {
+                None
+            } else {
+                Some((1 + digits.len(), Designator::Back(digits.parse().ok()?)))
+            }
+        }
+        c if c.is_ascii_digit() => {
+            let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+            Some((digits.len(), Designator::Number(digits.parse().ok()?)))
+        }
+        '?' => {
+            let body = &rest[1..];
+            // `!?text?` (closed) or `!?text` up to the next blank/end.
+            if let Some(end) = body.find('?') {
+                Some((1 + end + 1, Designator::Contains(&body[..end])))
+            } else {
+                let end = body.find(char::is_whitespace).unwrap_or(body.len());
+                if end == 0 {
+                    None
+                } else {
+                    Some((1 + end, Designator::Contains(&body[..end])))
+                }
+            }
+        }
+        '/' => {
+            let body = &rest[1..];
+            let end = body.find(char::is_whitespace).unwrap_or(body.len());
+            if end == 0 {
+                None
+            } else {
+                Some((1 + end, Designator::StartsWith(&body[..end])))
+            }
+        }
+        _ => None,
+    }
+}
+
+fn resolve(kind: &Designator, history: &History, boundary: usize) -> Option<String> {
+    match kind {
+        Designator::Bang => history.entry_back(1, boundary).map(str::to_string),
+        Designator::LastArg => history.entry_back(1, boundary).and_then(|s| s.split_whitespace().next_back()).map(str::to_string),
+        Designator::Back(n) => history.entry_back(*n, boundary).map(str::to_string),
+        Designator::Number(n) => history.entry_by_number(*n, boundary).map(str::to_string),
+        Designator::Contains(s) => history.find_containing(s, boundary).map(str::to_string),
+        Designator::StartsWith(s) => history.find_starting_with(s, boundary).map(str::to_string),
+    }
+}
+
+// A freshly-typed line, after history expansion. Substituted is the
+// common case -- feed it into the lexer/parser exactly like the
+// original line. UnrecognizedBang is the "otherwise" case from expand's
+// own doc comment: the line started with a `!` that wasn't any
+// recognized designator, so the rest of it is meant to run in a child
+// shell instead -- callers decide exactly how (see expand's doc comment
+// for why that differs between the normal prompt and command mode).
+pub enum Expansion {
+    Substituted(String),
+    UnrecognizedBang(String),
+}
+
+// bash-style history expansion (`!!`, `!-n`, `!n`, `!$`, plus bish's own
+// `!?text` and `!/text` in place of bash's plain `!text`, freeing up a
+// bare `!word` at the start of a line to mean something else -- see
+// below) applied to one freshly-typed line, scoped to `boundary` the
+// same way Up/Down browsing already is (History's own doc comment).
+//
+// If the line starts with `!` and what immediately follows isn't one of
+// the five designators above, this doesn't error the way bash's own
+// "event not found" would -- instead the rest of the line (after that
+// leading `!`) is meant to run in a child shell, the same idea as vim's
+// `:!cmd` or a plain `(cmd)` subshell. What "child shell" means
+// concretely differs by caller: the normal shell prompt has no
+// restriction on what it can wrap, so `(rest)` (a real subshell) is the
+// natural fit; command mode explicitly disallows subshells (see
+// command_mode_violation), so it prepends `command ` instead --
+// consistent with command mode's own existing "builtins only, `command
+// NAME` is the escape hatch for externals" model. Both are the caller's
+// job, not this function's -- it just reports which case happened.
+//
+// Every other `!` in the line (not just a leading one) is still
+// scanned and substituted normally -- `rm !$` doesn't require the `!` to
+// be the first character.
+//
+// Returns Err with a bash-style "event not found" message if a
+// recognized designator couldn't actually be resolved (no matching
+// history entry) -- the whole line is meant to be abandoned in that
+// case, nothing runs, matching bash's own behavior.
+pub fn expand(line: &str, history: &History, boundary: usize) -> Result<Expansion, String> {
+    if !line.contains('!') {
+        return Ok(Expansion::Substituted(line.to_string()));
+    }
+
+    let trimmed = line.trim_start();
+    if let Some(rest) = trimmed.strip_prefix('!') {
+        if find_designator(rest).is_none() {
+            return Ok(Expansion::UnrecognizedBang(rest.to_string()));
+        }
+    }
+
+    let mut out = String::with_capacity(line.len());
+    let mut i = 0;
+    while i < line.len() {
+        let ch = line[i..].chars().next().unwrap();
+        if ch != '!' {
+            out.push(ch);
+            i += ch.len_utf8();
+            continue;
+        }
+        let rest = &line[i + 1..];
+        match find_designator(rest) {
+            Some((consumed, kind)) => {
+                let event_text = &rest[..consumed];
+                let resolved = resolve(&kind, history, boundary).ok_or_else(|| format!("bish: !{}: event not found", event_text))?;
+                out.push_str(&resolved);
+                i += 1 + consumed;
+            }
+            None => {
+                out.push('!');
+                i += 1;
+            }
+        }
+    }
+    Ok(Expansion::Substituted(out))
 }
 
 fn history_path(filename: &str) -> Option<PathBuf> {

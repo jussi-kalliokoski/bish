@@ -5,7 +5,7 @@ use std::rc::Rc;
 
 use crate::editor::{self, ReadOutcome};
 use crate::exec::{self, ExecResult, Shell, WindowAction};
-use crate::history::History;
+use crate::history::{self, History};
 use crate::lexer::Lexer;
 use crate::parser::{AndOr, Command, Parser, Pipeline, Program};
 use crate::prompt;
@@ -340,6 +340,31 @@ pub fn run(mut shell: Shell) {
                     // should confirm the exit (see the Eof handler).
                     session.warned_stopped_jobs = false;
 
+                    // History expansion (!!, !-n, !n, !$, !/prefix,
+                    // !?text -- see history::expand's own doc comment)
+                    // only applies to the first line of a fresh command,
+                    // never a continuation line -- a heredoc body or a
+                    // backslash-continued line could legitimately
+                    // contain a literal `!`, and there's no "start of
+                    // command" to anchor the leading-bang/child-shell
+                    // case to partway through one anyway.
+                    let line = if session.buffer.is_empty() {
+                        match history::expand(&line, &history, session.history_boundary) {
+                            Ok(history::Expansion::Substituted(s)) => s,
+                            Ok(history::Expansion::UnrecognizedBang(rest)) => format!("({})", rest),
+                            Err(msg) => {
+                                session.shell.sink_err(&format!("{}\n", msg));
+                                if sinks_are_grid {
+                                    compositor_redraw(&sessions, &windows, current_window, term_rows, term_cols);
+                                }
+                                continue;
+                            }
+                        }
+                    } else {
+                        line
+                    };
+                    let session = sessions.get_mut(&session_id).unwrap();
+
                     // Feed the prompt-and-what-was-typed into the grid
                     // itself, not just the real terminal -- editor::
                     // read_line only ever draws it directly to the real
@@ -352,7 +377,10 @@ pub fn run(mut shell: Shell) {
                     // actually makes a promoted window read as a normal
                     // scrolling terminal -- prompt, command, output,
                     // next prompt -- instead of only ever showing the
-                    // most recent command's output.
+                    // most recent command's output. Echoes the *expanded*
+                    // line (post history::expand), matching bash's own
+                    // behavior of showing what a `!!`/`!n`/etc actually
+                    // resolved to, not the literal designator typed.
                     if sinks_are_grid {
                         let echoed = format!("{}{}\r\n", prompt_str, line);
                         session.screen.borrow_mut().feed(echoed.as_bytes());
@@ -1094,6 +1122,27 @@ fn run_command_mode(shell: &mut Shell, history: &mut History, initial_char: Opti
                 prefill = pending;
             }
             Ok(ReadOutcome::Line(line)) => {
+                // Same history expansion as the normal shell prompt (see
+                // history::expand's own doc comment), scoped the same
+                // way: only the first line of a fresh command, against
+                // command mode's own separate history. Command mode
+                // disallows subshells outright (command_mode_violation
+                // below), so an unrecognized leading `!` becomes
+                // `command <rest>` here instead of `(<rest>)` -- the
+                // same "force it to run as an external" escape hatch
+                // command mode already has, not a second one.
+                let line = if buffer.is_empty() {
+                    match history::expand(&line, history, 0) {
+                        Ok(history::Expansion::Substituted(s)) => s,
+                        Ok(history::Expansion::UnrecognizedBang(rest)) => format!("command {}", rest),
+                        Err(msg) => {
+                            shell.sink_err(&format!("{}\n", msg));
+                            continue;
+                        }
+                    }
+                } else {
+                    line
+                };
                 if !buffer.is_empty() {
                     buffer.push('\n');
                 }
