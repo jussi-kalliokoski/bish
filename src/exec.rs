@@ -1236,7 +1236,7 @@ impl Shell {
     fn run_window(&mut self, args: &[String]) -> ExecResult {
         self.promote_if_needed();
         match args.first().map(String::as_str) {
-            Some("next") => ExecResult::Window(WindowAction::Next),
+            Some("next") | Some("n") => ExecResult::Window(WindowAction::Next),
             Some("previous") | Some("prev") | Some("p") => ExecResult::Window(WindowAction::Previous),
             Some("new") | Some("c") | Some("create") => ExecResult::Window(WindowAction::New),
             Some("close") | Some("x") | Some("exit") => ExecResult::Window(WindowAction::Close),
@@ -1245,7 +1245,7 @@ impl Shell {
                 ExecResult::Status(2)
             }
             None => {
-                sh_eprintln!(self, "bish: window: missing subcommand (next/previous/new(c,create)/close(x,exit))");
+                sh_eprintln!(self, "bish: window: missing subcommand (next(n)/previous/new(c,create)/close(x,exit))");
                 ExecResult::Status(2)
             }
         }
