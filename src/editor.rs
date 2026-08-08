@@ -392,11 +392,20 @@ pub fn read_line(
                 // as command mode's own first typed character rather
                 // than being lost, so e.g. ":w new" actually enters
                 // command mode and types "w new" there, instead of
-                // materializing as literal shell-mode text.
+                // materializing as literal shell-mode text. Deliberately
+                // no "\r\n" here (unlike every other return path in this
+                // function): the whole point of arming is that switching
+                // reads as the *same* prompt line's terminator changing,
+                // not a new line/new prompt appearing -- the caller's
+                // next read_line call (command mode's own, seeded with
+                // this pending character) redraws right over this same
+                // row, continuing seamlessly. See repl.rs's
+                // run_command_mode, which renders its own prompt via
+                // prompt::render_command_armed -- the identical prefix
+                // this arming redraw already showed, just re-drawn -- for
+                // exactly this reason.
                 _ => {
                     drop(guard.take());
-                    print!("\r\n");
-                    io::stdout().flush()?;
                     let pending = if let Key::Char(c) = key { Some(c) } else { None };
                     return Ok(ReadOutcome::CommandMode(pending));
                 }

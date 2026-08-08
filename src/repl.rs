@@ -515,6 +515,14 @@ fn is_incomplete(err: &str) -> bool {
 // command mode -- e.g. typing ":w new" commits on 'w', which must be
 // command mode's own first typed character, not lost (see
 // editor::ReadOutcome::CommandMode's doc comment).
+// Renders its own prompt via prompt::render_command_armed -- the exact
+// same "user@host:path" prefix the normal prompt uses, just with the
+// ':' terminator -- rather than some visually distinct "you are now in
+// a special mode" prompt: switching into command mode should read as
+// nothing more than that one terminator character changing, seamlessly
+// continuing the same line editor.rs was already drawing (see
+// read_line's arming-commit branch, which deliberately never prints a
+// newline on the way in).
 // One-shot, matching vim's ':' Ex command line: successfully running one
 // command drops straight back to the normal shell prompt rather than
 // looping for another (see the `_ => return None` below). An empty line,
@@ -528,7 +536,7 @@ fn run_command_mode(shell: &mut Shell, history: &mut History, initial_char: Opti
     let mut buffer = String::new();
     let mut prefill = initial_char;
     loop {
-        let prompt_str = if buffer.is_empty() { ": ".to_string() } else { prompt::continuation() };
+        let prompt_str = if buffer.is_empty() { prompt::render_command_armed(shell) } else { prompt::continuation() };
 
         // Already fully inside command mode, so there's nothing
         // meaningful to swap to if the ':'-arming mechanic re-triggers
