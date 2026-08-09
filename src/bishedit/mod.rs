@@ -5,6 +5,7 @@
 #![allow(dead_code)]
 
 pub mod motion;
+pub mod vimkeys;
 
 /// The first slice of bish-edit's headless core: read-only line/cursor
 /// accessors that motions operate over. Mutation (insert/delete) is a later

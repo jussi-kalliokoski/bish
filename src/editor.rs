@@ -50,6 +50,9 @@ pub enum Key {
     CtrlL,
     CtrlU,
     CtrlW,
+    // No shell line-editing use yet (unlike the other Ctrl letters above) --
+    // added for bishedit's normal-mode Ctrl-Y (scroll one line up).
+    CtrlY,
     CtrlZ,
     Unknown,
 }
@@ -105,6 +108,7 @@ fn read_key() -> io::Result<Option<Key>> {
         0x0c => Key::CtrlL,
         0x15 => Key::CtrlU,
         0x17 => Key::CtrlW,
+        0x19 => Key::CtrlY,
         0x1a => Key::CtrlZ,
         b'\r' | b'\n' => Key::Enter,
         0x7f | 0x08 => Key::Backspace,
@@ -794,7 +798,7 @@ pub fn read_line(
                 io::stdout().flush()?;
                 return Ok(ReadOutcome::DirNav(DirNav::Up));
             }
-            Key::AltLeft | Key::AltRight | Key::AltUp | Key::Unknown => {}
+            Key::AltLeft | Key::AltRight | Key::AltUp | Key::CtrlY | Key::Unknown => {}
         }
         redraw(if cmd_mode_armed { armed_prompt } else { prompt }, &ed, col_origin, width)?;
     }
