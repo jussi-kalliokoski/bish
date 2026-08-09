@@ -1,4 +1,5 @@
 mod arith;
+mod bishedit;
 mod builtins;
 mod editor;
 mod exec;
