@@ -380,10 +380,11 @@ pub enum DirNav {
 // engaged only for the duration of this call (restored on every return
 // path via RawGuard's Drop), so a foreground command run in between calls
 // sees an entirely normal terminal.
-// `history_boundary` is the calling session's cutoff into `history` (see
-// History's doc comment): Up/Down here never browse past it, so a session
-// only ever sees its own commands plus whatever's been recorded (by any
-// session sharing the same History) from its creation point forward.
+// `history` is the calling session's own History value (see its doc
+// comment): a persistent, per-session chain, so Up/Down here naturally
+// only ever sees that session's own commands plus whatever it inherited
+// at fork time -- no separate boundary/cutoff parameter needed, the
+// scope is inherent to which chain was passed in.
 // `armed_prompt` is shown in place of `prompt` while a virtual, not-yet-
 // materialized command-mode colon is armed (see the arming block below);
 // callers that render a full prompt (repl.rs's prompt::render/
@@ -428,7 +429,6 @@ pub fn read_line(
     prompt: &str,
     armed_prompt: &str,
     history: &History,
-    history_boundary: usize,
     esc_cancels: bool,
     prefill: Option<char>,
     col_origin: usize,
@@ -604,8 +604,8 @@ pub fn read_line(
             Key::Up => {
                 let prefix = browse.as_ref().map(|(p, _)| p.clone()).unwrap_or_else(|| ed.as_string());
                 let from = browse.as_ref().map(|(_, i)| *i);
-                if let Some((idx, entry)) = history.search_backward(&prefix, from, history_boundary) {
-                    ed.set_text(entry);
+                if let Some((idx, entry)) = history.search_backward(&prefix, from) {
+                    ed.set_text(&entry);
                     browse = Some((prefix, idx));
                 }
             }
@@ -613,7 +613,7 @@ pub fn read_line(
                 if let Some((prefix, idx)) = browse.take() {
                     match history.search_forward(&prefix, idx) {
                         Some((new_idx, entry)) => {
-                            ed.set_text(entry);
+                            ed.set_text(&entry);
                             browse = Some((prefix, new_idx));
                         }
                         None => ed.set_text(&prefix),

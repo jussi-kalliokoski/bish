@@ -9,25 +9,44 @@
 // keep a second, independent instance (its own file, own entries) without
 // colliding with the normal shell's history.
 //
-// One History is shared (by plain reference, not Rc<RefCell<_>> -- nothing
-// inside a running Shell ever touches history, only repl.rs's own outer
-// loop does) across every session under a root: every session's commands
-// land in the same growing `entries`/file, interleaved in the order they
-// actually happened. What's per-session is a `boundary` index (that
-// session's `entries.len()` at the moment it was created), threaded
-// through search_backward/search_forward as a floor: a session only ever
-// browses its own commands plus whatever's been recorded (by any session)
-// from its creation point forward, never anything older. This gets the
-// same observable behavior as a hand-rolled persistent linked list with
-// per-session snapshot pointers, just via a plain shared Vec + an index --
-// old entries are never copied or re-walked, only sliced.
-
+// A genuine persistent (immutable, structurally-shared) singly-linked
+// list, not a shared Vec with a per-session floor index: each entry is a
+// Node pointing at the entry before it, and a History value is just an
+// Rc handle onto its own newest Node (`tail`). Forking a session (`window
+// new`/split -- see History::fork) is an O(1) Rc clone of that pointer,
+// no copying, and from that moment the parent and child diverge --
+// record() only ever extends *this* History's own tail with a fresh
+// Node, so a command typed in one session's pane never becomes visible
+// to a sibling's, or to the parent's, own Up/Down browsing or `!`
+// expansion. This was the explicit reason for choosing a linked list
+// over a flat array in the first place: unlike a shared array + index
+// (which was tried here first, and looked observationally equivalent
+// for the single-branch case, but wasn't -- a lower-bound index into one
+// growing array can't stop a *later* sibling's entry from becoming
+// visible once appended), a persistent list's divergence is structural,
+// not just a numeric floor. Every session still shares the same on-disk
+// FILE (interleaved across every process, same as before) via each
+// History's own `path` -- forking clones that too (a cheap PathBuf
+// clone), so every fork still appends to the identical file, just with
+// an independently-diverging in-memory view.
 use std::io::Write;
 use std::path::PathBuf;
+use std::rc::Rc;
 
+struct Node {
+    entry: String,
+    prev: Option<Rc<Node>>,
+}
+
+// Clone is a plain, cheap Rc-clone of `tail` (identical to fork() below)
+// -- kept as a real derive, not just fork(), so a caller that needs a
+// standalone snapshot without the "new session" framing (e.g. repl.rs
+// taking one to pass into a call that also needs a live mutable borrow
+// of the session it came from) can just call .clone().
+#[derive(Clone)]
 pub struct History {
     path: Option<PathBuf>,
-    entries: Vec<String>,
+    tail: Option<Rc<Node>>,
 }
 
 impl History {
@@ -35,13 +54,26 @@ impl History {
     // the normal shell history or ".bish_cmd_history" for command mode's.
     pub fn load(filename: &str) -> History {
         let path = history_path(filename);
-        let mut entries = Vec::new();
+        let mut tail: Option<Rc<Node>> = None;
         if let Some(p) = &path {
             if let Ok(content) = std::fs::read_to_string(p) {
-                entries.extend(content.lines().map(unescape));
+                for line in content.lines() {
+                    tail = Some(Rc::new(Node { entry: unescape(line), prev: tail.take() }));
+                }
             }
         }
-        History { path, entries }
+        History { path, tail }
+    }
+
+    // Cheap, no-copy fork for a newly created session (`window new`/
+    // split_focused_pane): the child starts out able to see everything
+    // the parent could, via a plain Rc clone of the parent's current
+    // tail (O(1) regardless of how much history exists), but from this
+    // point on each side's own record() only ever extends its *own*
+    // tail -- see this struct's own doc comment for why that's the
+    // point of using a persistent list here at all.
+    pub fn fork(&self) -> History {
+        self.clone()
     }
 
     // Records a submitted line (regardless of whether it later succeeds or
@@ -54,10 +86,10 @@ impl History {
         if entry.trim().is_empty() {
             return;
         }
-        if self.entries.last().map(|s| s.as_str()) == Some(entry) {
+        if self.tail.as_ref().map(|n| n.entry.as_str()) == Some(entry) {
             return;
         }
-        self.entries.push(entry.to_string());
+        self.tail = Some(Rc::new(Node { entry: entry.to_string(), prev: self.tail.take() }));
         if let Some(p) = &self.path {
             if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(p) {
                 let _ = writeln!(f, "{}", escape(entry));
@@ -65,66 +97,67 @@ impl History {
         }
     }
 
+    // Walks this History's own chain into a plain, oldest-first Vec --
+    // the same shape the old flat-array design already assumed, so
+    // every lookup below can stay simple index math instead of juggling
+    // `.prev` pointers directly. Re-walked fresh on every call rather
+    // than cached: history sizes here (hundreds to low thousands of
+    // entries) make that unmeasurable, and it sidesteps any risk of a
+    // stale cache after record() extends the chain.
+    fn to_vec(&self) -> Vec<&str> {
+        let mut v = Vec::new();
+        let mut cur = &self.tail;
+        while let Some(node) = cur {
+            v.push(node.entry.as_str());
+            cur = &node.prev;
+        }
+        v.reverse();
+        v
+    }
+
     // Nearest entry at or before index `from` (exclusive; None means
-    // "start from the newest"), never older than `boundary`, whose text
-    // starts with `prefix`, searching toward older entries. Used for Up.
-    pub fn search_backward(&self, prefix: &str, from: Option<usize>, boundary: usize) -> Option<(usize, &str)> {
-        let end = from.unwrap_or(self.entries.len());
-        self.entries[boundary..end]
-            .iter()
-            .enumerate()
-            .rev()
-            .find(|(_, e)| e.starts_with(prefix))
-            .map(|(i, e)| (boundary + i, e.as_str()))
+    // "start from the newest") whose text starts with `prefix`,
+    // searching toward older entries. Used for Up.
+    pub fn search_backward(&self, prefix: &str, from: Option<usize>) -> Option<(usize, String)> {
+        let v = self.to_vec();
+        let end = from.unwrap_or(v.len());
+        v[..end].iter().enumerate().rev().find(|(_, e)| e.starts_with(prefix)).map(|(i, e)| (i, e.to_string()))
     }
 
     // Nearest entry after index `from` whose text starts with `prefix`,
-    // searching toward newer entries. Used for Down. No `boundary` needed
-    // here -- searching forward from `from` can never land before it.
-    pub fn search_forward(&self, prefix: &str, from: usize) -> Option<(usize, &str)> {
-        self.entries
-            .iter()
-            .enumerate()
-            .skip(from + 1)
-            .find(|(_, e)| e.starts_with(prefix))
-            .map(|(i, e)| (i, e.as_str()))
+    // searching toward newer entries. Used for Down.
+    pub fn search_forward(&self, prefix: &str, from: usize) -> Option<(usize, String)> {
+        let v = self.to_vec();
+        v.iter().enumerate().skip(from + 1).find(|(_, e)| e.starts_with(prefix)).map(|(i, e)| (i, e.to_string()))
     }
 
     // `!n`: absolute, 1-based (matches how bash numbers history events).
-    // None if out of range or older than `boundary` -- a session can't
-    // `!`-reference an event from before it existed any more than it can
-    // browse one with Up (see this struct's own doc comment).
-    fn entry_by_number(&self, n: usize, boundary: usize) -> Option<&str> {
+    fn entry_by_number(&self, n: usize) -> Option<String> {
         let idx = n.checked_sub(1)?;
-        if idx < boundary {
-            return None;
-        }
-        self.entries.get(idx).map(|s| s.as_str())
+        self.to_vec().get(idx).map(|s| s.to_string())
     }
 
     // `!-n`: n events back from the most recent (1 = most recent, same
     // as `!!`).
-    fn entry_back(&self, n: usize, boundary: usize) -> Option<&str> {
+    fn entry_back(&self, n: usize) -> Option<String> {
         if n == 0 {
             return None;
         }
-        let idx = self.entries.len().checked_sub(n)?;
-        if idx < boundary {
-            return None;
-        }
-        self.entries.get(idx).map(|s| s.as_str())
+        let v = self.to_vec();
+        let idx = v.len().checked_sub(n)?;
+        v.get(idx).map(|s| s.to_string())
     }
 
     // `!/prefix` (bish's own spelling of bash's plain `!prefix`, freeing
     // up a bare `!word` to mean "run in a child shell" instead -- see
     // expand's own doc comment): most recent entry starting with it.
-    fn find_starting_with(&self, prefix: &str, boundary: usize) -> Option<&str> {
-        self.entries[boundary..].iter().rev().find(|e| e.starts_with(prefix)).map(|s| s.as_str())
+    fn find_starting_with(&self, prefix: &str) -> Option<String> {
+        self.to_vec().iter().rev().find(|e| e.starts_with(prefix)).map(|s| s.to_string())
     }
 
     // `!?text`: most recent entry containing it anywhere.
-    fn find_containing(&self, substr: &str, boundary: usize) -> Option<&str> {
-        self.entries[boundary..].iter().rev().find(|e| e.contains(substr)).map(|s| s.as_str())
+    fn find_containing(&self, substr: &str) -> Option<String> {
+        self.to_vec().iter().rev().find(|e| e.contains(substr)).map(|s| s.to_string())
     }
 }
 
@@ -189,14 +222,14 @@ fn find_designator(rest: &str) -> Option<(usize, Designator<'_>)> {
     }
 }
 
-fn resolve(kind: &Designator, history: &History, boundary: usize) -> Option<String> {
+fn resolve(kind: &Designator, history: &History) -> Option<String> {
     match kind {
-        Designator::Bang => history.entry_back(1, boundary).map(str::to_string),
-        Designator::LastArg => history.entry_back(1, boundary).and_then(|s| s.split_whitespace().next_back()).map(str::to_string),
-        Designator::Back(n) => history.entry_back(*n, boundary).map(str::to_string),
-        Designator::Number(n) => history.entry_by_number(*n, boundary).map(str::to_string),
-        Designator::Contains(s) => history.find_containing(s, boundary).map(str::to_string),
-        Designator::StartsWith(s) => history.find_starting_with(s, boundary).map(str::to_string),
+        Designator::Bang => history.entry_back(1),
+        Designator::LastArg => history.entry_back(1).and_then(|s| s.split_whitespace().next_back().map(str::to_string)),
+        Designator::Back(n) => history.entry_back(*n),
+        Designator::Number(n) => history.entry_by_number(*n),
+        Designator::Contains(s) => history.find_containing(s),
+        Designator::StartsWith(s) => history.find_starting_with(s),
     }
 }
 
@@ -215,8 +248,9 @@ pub enum Expansion {
 // bash-style history expansion (`!!`, `!-n`, `!n`, `!$`, plus bish's own
 // `!?text` and `!/text` in place of bash's plain `!text`, freeing up a
 // bare `!word` at the start of a line to mean something else -- see
-// below) applied to one freshly-typed line, scoped to `boundary` the
-// same way Up/Down browsing already is (History's own doc comment).
+// below) applied to one freshly-typed line, against `history`'s own
+// scope (whatever that particular session's chain can see -- see
+// History's own doc comment).
 //
 // If the line starts with `!` and what immediately follows isn't one of
 // the five designators above, this doesn't error the way bash's own
@@ -239,7 +273,7 @@ pub enum Expansion {
 // recognized designator couldn't actually be resolved (no matching
 // history entry) -- the whole line is meant to be abandoned in that
 // case, nothing runs, matching bash's own behavior.
-pub fn expand(line: &str, history: &History, boundary: usize) -> Result<Expansion, String> {
+pub fn expand(line: &str, history: &History) -> Result<Expansion, String> {
     if !line.contains('!') {
         return Ok(Expansion::Substituted(line.to_string()));
     }
@@ -264,7 +298,7 @@ pub fn expand(line: &str, history: &History, boundary: usize) -> Result<Expansio
         match find_designator(rest) {
             Some((consumed, kind)) => {
                 let event_text = &rest[..consumed];
-                let resolved = resolve(&kind, history, boundary).ok_or_else(|| format!("bish: !{}: event not found", event_text))?;
+                let resolved = resolve(&kind, history).ok_or_else(|| format!("bish: !{}: event not found", event_text))?;
                 out.push_str(&resolved);
                 i += 1 + consumed;
             }

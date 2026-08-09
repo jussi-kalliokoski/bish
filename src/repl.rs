@@ -18,16 +18,20 @@ type SessionId = u32;
 // One virtual shell session -- either the original process's own session
 // (the root, id 0) or one created by `window new` (via Shell::
 // new_virtual_child). Each has its own insert-mode multi-line
-// continuation buffer, its own history_boundary (see History's doc
-// comment), and its own VT100 grid: before promotion the grid sits empty
-// and unused (the session's Shell writes straight to the real terminal);
-// after promotion every session's output is captured into its own grid
-// (see apply_window_action), so switching `window`s can redraw whatever
-// that window last drew instead of showing stale/real-terminal content.
+// continuation buffer, its own History (a persistent, independently-
+// diverging chain -- see History's own doc comment for why forking one
+// per session, rather than sharing one with a per-session cutoff index,
+// is what actually keeps sibling panes' commands from leaking into each
+// other's Up/Down browsing), and its own VT100 grid: before promotion
+// the grid sits empty and unused (the session's Shell writes straight to
+// the real terminal); after promotion every session's output is
+// captured into its own grid (see apply_window_action), so switching
+// `window`s can redraw whatever that window last drew instead of
+// showing stale/real-terminal content.
 struct SessionState {
     shell: Shell,
     buffer: String,
-    history_boundary: usize,
+    history: History,
     screen: Rc<RefCell<vt100::Screen>>,
     // Set once EOF has already warned this session about stopped jobs
     // (see the ReadOutcome::Eof handler) without actually exiting --
@@ -226,7 +230,6 @@ pub fn run(mut shell: Shell) {
     // shell -- see Shell::enable_monitor_mode's own doc comment.
     shell.enable_monitor_mode();
 
-    let mut history = History::load(".bish_history");
     let mut cmd_history = History::load(".bish_cmd_history");
 
     let (mut term_rows, mut term_cols) = query_term_size();
@@ -239,7 +242,7 @@ pub fn run(mut shell: Shell) {
         SessionState {
             shell,
             buffer: String::new(),
-            history_boundary: 0,
+            history: History::load(".bish_history"),
             screen: root_screen,
             warned_stopped_jobs: false,
             dir_history: vec![root_cwd],
@@ -312,7 +315,6 @@ pub fn run(mut shell: Shell) {
             continue;
         }
 
-        let boundary = sessions[&session_id].history_boundary;
         let (prompt_str, armed_prompt_str) = {
             let session = &sessions[&session_id];
             if session.buffer.is_empty() {
@@ -322,8 +324,16 @@ pub fn run(mut shell: Shell) {
             }
         };
         let (col_origin, width) = focused_col_origin(&windows[current_window], sinks_are_grid, term_rows, term_cols);
+        // A standalone snapshot, not a live borrow: on_idle below needs
+        // its own mutable borrow of `sessions` (to service other
+        // windows' jobs), which would conflict with holding this
+        // session's own History borrowed for the whole call otherwise.
+        // Nothing recorded elsewhere during this one read_line call
+        // needs to be visible mid-browse anyway (see History's own doc
+        // comment on what a clone/fork actually shares).
+        let session_history = sessions[&session_id].history.clone();
 
-        match editor::read_line(&prompt_str, &armed_prompt_str, &history, boundary, false, None, col_origin, width, || {
+        match editor::read_line(&prompt_str, &armed_prompt_str, &session_history, false, None, col_origin, width, || {
             service_background_jobs(&mut sessions, &mut windows, &mut job_frames, current_window);
         }) {
             Ok(ReadOutcome::Eof) => {
@@ -450,7 +460,7 @@ pub fn run(mut shell: Shell) {
                     // command" to anchor the leading-bang/child-shell
                     // case to partway through one anyway.
                     let line = if session.buffer.is_empty() {
-                        match history::expand(&line, &history, session.history_boundary) {
+                        match history::expand(&line, &session.history) {
                             Ok(history::Expansion::Substituted(s)) => s,
                             Ok(history::Expansion::UnrecognizedBang(rest)) => format!("({})", rest),
                             Err(msg) => {
@@ -519,7 +529,7 @@ pub fn run(mut shell: Shell) {
                                 // the command ends up with -- bash and
                                 // fish both record what was typed, not
                                 // what succeeded.
-                                history.record(&session.buffer);
+                                session.history.record(&session.buffer);
                                 // Snapshotted so a directory change gets
                                 // picked up (see push_dir_history below)
                                 // regardless of how it happened -- a
@@ -774,7 +784,7 @@ fn apply_window_action(
         }
         WindowAction::New => {
             let parent_id = windows[*current_window].owning_session();
-            let parent_boundary = sessions[&parent_id].history_boundary;
+            let child_history = sessions[&parent_id].history.fork();
             let mut child_shell = sessions[&parent_id].shell.new_virtual_child();
             let screen = Rc::new(RefCell::new(vt100::Screen::new(content_rows(term_rows), term_cols)));
             child_shell.set_sink_grid(screen.clone());
@@ -786,16 +796,12 @@ fn apply_window_action(
                 SessionState {
                     shell: child_shell,
                     buffer: String::new(),
-                    // Inherits the parent's own boundary (rather than
-                    // "now", the shared history's current tail) so a new
-                    // window/pane's Up/Down history includes everything
-                    // its parent could already see, plus anything
-                    // recorded since -- matching how a new terminal
-                    // ordinarily has your prior commands available,
-                    // instead of starting from a blank slate. See
-                    // History's own doc comment for the boundary
-                    // mechanism itself.
-                    history_boundary: parent_boundary,
+                    // A fork of the parent's own History (see its doc
+                    // comment): the new window/pane's Up/Down includes
+                    // everything the parent could already see, but from
+                    // here on diverges independently -- neither side's
+                    // later commands leak into the other's.
+                    history: child_history,
                     screen,
                     warned_stopped_jobs: false,
                     dir_history: vec![child_cwd],
@@ -881,7 +887,7 @@ fn split_focused_pane(
     term_cols: usize,
 ) {
     let parent_id = windows[current_window].owning_session();
-    let parent_boundary = sessions[&parent_id].history_boundary;
+    let child_history = sessions[&parent_id].history.fork();
     let mut child_shell = sessions[&parent_id].shell.new_virtual_child();
     let screen = Rc::new(RefCell::new(vt100::Screen::new(content_rows(term_rows), term_cols)));
     child_shell.set_sink_grid(screen.clone());
@@ -893,9 +899,9 @@ fn split_focused_pane(
         SessionState {
             shell: child_shell,
             buffer: String::new(),
-            // See WindowAction::New's own comment on inheriting the
-            // parent's boundary instead of "now".
-            history_boundary: parent_boundary,
+            // See WindowAction::New's own comment on forking the
+            // parent's History instead of starting from "now".
+            history: child_history,
             screen,
             warned_stopped_jobs: false,
             dir_history: vec![child_cwd],
@@ -1770,7 +1776,7 @@ fn run_command_mode(shell: &mut Shell, history: &mut History, initial_char: Opti
         // during which a background job would visibly stall here is
         // negligible; wiring sessions/windows/job_frames all the way
         // through run_command_mode for that is scoped out for now.
-        match editor::read_line(&prompt_str, &prompt_str, history, 0, true, prefill.take(), col_origin, width, || {}) {
+        match editor::read_line(&prompt_str, &prompt_str, history, true, prefill.take(), col_origin, width, || {}) {
             Ok(ReadOutcome::Eof) | Ok(ReadOutcome::Interrupted) => return None,
             // ':' at an empty command-mode prompt too -- nothing
             // meaningful to switch to since we're already here; just
@@ -1795,7 +1801,7 @@ fn run_command_mode(shell: &mut Shell, history: &mut History, initial_char: Opti
                 // same "force it to run as an external" escape hatch
                 // command mode already has, not a second one.
                 let line = if buffer.is_empty() {
-                    match history::expand(&line, history, 0) {
+                    match history::expand(&line, history) {
                         Ok(history::Expansion::Substituted(s)) => s,
                         Ok(history::Expansion::UnrecognizedBang(rest)) => format!("command {}", rest),
                         Err(msg) => {
