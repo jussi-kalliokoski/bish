@@ -459,6 +459,20 @@ pub enum ReadOutcome {
     // comment. Never fires with anything typed (see read_line's own
     // handling), so there's no "what happens to the buffer" question.
     DirNav(DirNav),
+    // Backspace at the start of a command-mode buffer (see the
+    // Key::Backspace arm below): command mode's own ':' terminator
+    // isn't part of the buffer itself, just a fixed prefix baked into
+    // the prompt string, so there's nothing *in* the buffer left of
+    // the cursor to backspace once it's at position 0 -- but pressing
+    // Backspace there still means something, the natural continuation
+    // of ':' arming's own reversibility (Backspace before commit
+    // already cancels arming) to *after* commit too: delete the colon
+    // itself and fall back to shell mode. The payload is whatever was
+    // still in the buffer to the right of the cursor (there can be
+    // some, e.g. after Home) -- carried over as real shell-mode text
+    // rather than discarded, with the cursor landing at its start, in
+    // the exact spot the ':' itself used to occupy.
+    ExitCommandMode(String),
 }
 
 // Directory-history navigation (browser-style back/forward, plus "up to
@@ -501,6 +515,13 @@ pub enum DirNav {
 // character that committed command mode (see ReadOutcome::CommandMode's
 // doc comment), so it counts as typed input instead of being lost.
 // `None` for every other caller.
+// `initial_text`: seeds the whole buffer with this text, cursor at
+// position 0 (not the end -- contrast with `prefill` above) -- used by
+// repl.rs's main loop to restore whatever was still in a command-mode
+// buffer after ExitCommandMode (see that variant's own doc comment for
+// why the cursor specifically belongs at the start). Empty for every
+// other caller; never meaningfully combined with a non-None `prefill`
+// in practice (they seed two different transitions).
 // `on_idle`: called whenever this is about to block waiting for the next
 // keystroke and none has arrived yet within one poll tick -- lets
 // repl.rs's main loop (M10c) service other windows' backgrounded fg jobs
@@ -528,6 +549,7 @@ pub fn read_line(
     history: &History,
     esc_cancels: bool,
     prefill: Option<char>,
+    initial_text: &str,
     col_origin: usize,
     width: usize,
     mut on_idle: impl FnMut(),
@@ -536,6 +558,10 @@ pub fn read_line(
     let mut ed = LineEditor::new();
     if let Some(c) = prefill {
         ed.insert(c);
+    }
+    if !initial_text.is_empty() {
+        ed.buf = initial_text.chars().collect();
+        ed.cursor = 0;
     }
 
     // Fish-style history browsing: Up/Down search backward/forward through
@@ -674,6 +700,15 @@ pub fn read_line(
             // character" keys), not every possible way to reach that
             // buffer state (Ctrl-U, Ctrl-W, history recall).
             Key::Backspace => {
+                if esc_cancels && ed.cursor == 0 {
+                    // esc_cancels is only ever set for a command-mode
+                    // read_line call (see its own doc comment) -- see
+                    // ReadOutcome::ExitCommandMode's doc comment for
+                    // what this means and why nothing left of the
+                    // cursor needs deleting first.
+                    drop(guard.take());
+                    return Ok(ReadOutcome::ExitCommandMode(ed.as_string()));
+                }
                 ed.backspace();
                 if ed.buf == [':'] {
                     ed.buf.clear();

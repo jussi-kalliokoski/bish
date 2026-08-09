@@ -50,6 +50,12 @@ struct SessionState {
     // before any `cd` at all.
     dir_history: Vec<std::path::PathBuf>,
     dir_history_index: usize,
+    // Leftover buffer text from exiting command mode via Backspace at
+    // its own start (see editor::ReadOutcome::ExitCommandMode's doc
+    // comment) -- drained by the main loop's own next read_line call
+    // for this session as `initial_text` (cursor at its start), then
+    // cleared. Empty the overwhelming rest of the time.
+    pending_prefill: String,
 }
 
 type JobFrameId = u32;
@@ -261,6 +267,7 @@ pub fn run(mut shell: Shell) {
             warned_stopped_jobs: false,
             dir_history: vec![root_cwd],
             dir_history_index: 0,
+            pending_prefill: String::new(),
         },
     );
     let mut windows: Vec<WindowEntry> = vec![WindowEntry::single(0, Frame::Session(0))];
@@ -346,8 +353,13 @@ pub fn run(mut shell: Shell) {
         // needs to be visible mid-browse anyway (see History's own doc
         // comment on what a clone/fork actually shares).
         let session_history = sessions[&session_id].history.clone();
+        // Leftover text from exiting command mode via Backspace (see
+        // SessionState::pending_prefill's own doc comment) -- consumed
+        // here, once, then cleared so it doesn't reappear on some later
+        // unrelated prompt.
+        let initial_text = std::mem::take(&mut sessions.get_mut(&session_id).unwrap().pending_prefill);
 
-        match editor::read_line(&prompt_str, &armed_prompt_str, &session_history, false, None, col_origin, width, || {
+        match editor::read_line(&prompt_str, &armed_prompt_str, &session_history, false, None, &initial_text, col_origin, width, || {
             service_background_jobs(&mut sessions, &mut windows, &mut job_frames, current_window);
         }) {
             Ok(ReadOutcome::Eof) => {
@@ -421,6 +433,16 @@ pub fn run(mut shell: Shell) {
                     term_rows,
                     term_cols,
                 );
+            }
+            Ok(ReadOutcome::ExitCommandMode(_)) => {
+                // Can't actually happen here: this call always passes
+                // esc_cancels=false, and ExitCommandMode is only ever
+                // produced when esc_cancels is true (see its own doc
+                // comment) -- i.e. inside run_command_mode's own nested
+                // read_line, which is where this is handled for real
+                // (see handle_command_mode's ExitToShell arm). Handled
+                // as a no-op here purely as a defensive fallback rather
+                // than unreachable!().
             }
             Ok(ReadOutcome::Interrupted) => {
                 // Ctrl-C abandons whatever multi-line construct was
@@ -661,18 +683,33 @@ fn handle_command_mode(
     term_cols: usize,
 ) {
     let (col_origin, width) = focused_col_origin(&windows[*current_window], *sinks_are_grid, term_rows, term_cols);
-    let action = {
+    let outcome = {
         let session = sessions.get_mut(&session_id).unwrap();
         run_command_mode(&mut session.shell, cmd_history, pending, col_origin, width)
     };
-    if let Some(action) = action {
-        apply_window_action(action, sessions, windows, current_window, next_session_id, next_window_id, sinks_are_grid, term_rows, term_cols);
-    } else if *sinks_are_grid {
-        // No window action, but command mode may still have run ordinary
-        // builtins whose output landed in this session's grid (e.g.
-        // `:pwd`) -- without this, that output would sit captured but
-        // never actually drawn.
-        compositor_redraw(sessions, windows, *current_window, term_rows, term_cols);
+    match outcome {
+        CommandModeOutcome::Action(action) => {
+            apply_window_action(action, sessions, windows, current_window, next_session_id, next_window_id, sinks_are_grid, term_rows, term_cols);
+        }
+        CommandModeOutcome::ExitToShell(text) => {
+            // Stashed for the main loop's own next read_line call to
+            // pick up as initial_text (cursor at its start) -- see
+            // editor::ReadOutcome::ExitCommandMode's doc comment for
+            // why the text belongs there rather than being discarded.
+            sessions.get_mut(&session_id).unwrap().pending_prefill = text;
+            if *sinks_are_grid {
+                compositor_redraw(sessions, windows, *current_window, term_rows, term_cols);
+            }
+        }
+        CommandModeOutcome::Cancelled => {
+            if *sinks_are_grid {
+                // No window action, but command mode may still have run
+                // ordinary builtins whose output landed in this
+                // session's grid (e.g. `:pwd`) -- without this, that
+                // output would sit captured but never actually drawn.
+                compositor_redraw(sessions, windows, *current_window, term_rows, term_cols);
+            }
+        }
     }
 }
 
@@ -820,6 +857,7 @@ fn apply_window_action(
                     warned_stopped_jobs: false,
                     dir_history: vec![child_cwd],
                     dir_history_index: 0,
+                    pending_prefill: String::new(),
                 },
             );
             let wid = *next_window_id;
@@ -932,6 +970,7 @@ fn split_focused_pane(
             warned_stopped_jobs: false,
             dir_history: vec![child_cwd],
             dir_history_index: 0,
+            pending_prefill: String::new(),
         },
     );
 
@@ -1923,6 +1962,14 @@ fn is_incomplete(err: &str) -> bool {
     err.starts_with("unterminated") || err.contains("unexpected end of input") || err.ends_with("None")
 }
 
+// How run_command_mode's one-shot loop ended -- see its own doc comment
+// for what each case means.
+enum CommandModeOutcome {
+    Action(WindowAction),
+    ExitToShell(String),
+    Cancelled,
+}
+
 // Command mode: entered via ':' at an empty insert-mode prompt (see
 // editor.rs's ReadOutcome::CommandMode). Has its own history, separate
 // from the shell's, and only ever runs builtins directly -- `command NAME`
@@ -1941,16 +1988,21 @@ fn is_incomplete(err: &str) -> bool {
 // newline on the way in).
 // One-shot, matching vim's ':' Ex command line: successfully running one
 // command drops straight back to the normal shell prompt rather than
-// looping for another (see the `_ => return None` below). An empty line,
-// Ctrl-C, Ctrl-D, or Esc (regardless of what's been typed -- see
+// looping for another (see the `_ => return Cancelled` below). An empty
+// line, Ctrl-C, Ctrl-D, or Esc (regardless of what's been typed -- see
 // read_line's esc_cancels parameter) all cancel out the same way, back to
-// insert mode with nothing run. Returns a WindowAction if the command
+// insert mode with nothing run. Backspace with the cursor at the buffer's
+// own start additionally exits back to shell mode *with* whatever text
+// was still there (see editor::ReadOutcome::ExitCommandMode's own doc
+// comment) -- CommandModeOutcome::ExitToShell, distinct from a plain
+// Cancelled since the caller needs to actually do something with that
+// text, not just drop it. Returns Action(WindowAction) if the command
 // that ran was a `window`-family one, for the caller to apply against the
 // real session/window state (which run_command_mode itself has no access
 // to). `col_origin`: see editor::read_line's own doc comment -- the
 // caller (handle_command_mode) computes this once from the real
 // session/window state this function has no access to.
-fn run_command_mode(shell: &mut Shell, history: &mut History, initial_char: Option<char>, col_origin: usize, width: usize) -> Option<WindowAction> {
+fn run_command_mode(shell: &mut Shell, history: &mut History, initial_char: Option<char>, col_origin: usize, width: usize) -> CommandModeOutcome {
     let mut buffer = String::new();
     let mut prefill = initial_char;
     loop {
@@ -1964,15 +2016,20 @@ fn run_command_mode(shell: &mut Shell, history: &mut History, initial_char: Opti
         // same as Ctrl-C, regardless of what's been typed. prefill.take():
         // only the very first iteration (if entry carried a character)
         // seeds the buffer; every iteration after that starts empty.
-        // `|| {}`: unlike the main loop's own read_line call, this nested
-        // one doesn't service other windows' backgrounded jobs while
-        // idling (M10c) -- command mode is one-shot and its own prompt is
-        // normally answered in well under a poll tick, so the window
-        // during which a background job would visibly stall here is
-        // negligible; wiring sessions/windows/job_frames all the way
-        // through run_command_mode for that is scoped out for now.
-        match editor::read_line(&prompt_str, &prompt_str, history, true, prefill.take(), col_origin, width, || {}) {
-            Ok(ReadOutcome::Eof) | Ok(ReadOutcome::Interrupted) => return None,
+        // `""`: command mode never receives ExitCommandMode's own
+        // leftover-text restoration (that's specifically a return trip
+        // *back* to shell mode, not something command mode itself
+        // re-enters with). `|| {}`: unlike the main loop's own read_line
+        // call, this nested one doesn't service other windows'
+        // backgrounded jobs while idling (M10c) -- command mode is
+        // one-shot and its own prompt is normally answered in well under
+        // a poll tick, so the window during which a background job would
+        // visibly stall here is negligible; wiring sessions/windows/
+        // job_frames all the way through run_command_mode for that is
+        // scoped out for now.
+        match editor::read_line(&prompt_str, &prompt_str, history, true, prefill.take(), "", col_origin, width, || {}) {
+            Ok(ReadOutcome::Eof) | Ok(ReadOutcome::Interrupted) => return CommandModeOutcome::Cancelled,
+            Ok(ReadOutcome::ExitCommandMode(text)) => return CommandModeOutcome::ExitToShell(text),
             // ':' at an empty command-mode prompt too -- nothing
             // meaningful to switch to since we're already here; just
             // carry forward whatever character (if any) committed it as
@@ -2013,7 +2070,7 @@ fn run_command_mode(shell: &mut Shell, history: &mut History, initial_char: Opti
                 buffer.push_str(&line);
 
                 if buffer.trim().is_empty() {
-                    return None;
+                    return CommandModeOutcome::Cancelled;
                 }
 
                 match Lexer::new(&buffer).tokenize() {
@@ -2041,7 +2098,7 @@ fn run_command_mode(shell: &mut Shell, history: &mut History, initial_char: Opti
                                 // can be retried without re-entering
                                 // command mode from scratch.
                                 match result {
-                                    ExecResult::Window(action) => return Some(action),
+                                    ExecResult::Window(action) => return CommandModeOutcome::Action(action),
                                     // `fg`'s poll loop needs repl.rs's own
                                     // compositor state, which this nested
                                     // read-eval loop has no access to (see
@@ -2052,9 +2109,9 @@ fn run_command_mode(shell: &mut Shell, history: &mut History, initial_char: Opti
                                     ExecResult::Fg => {
                                         shell.sink_err("bish: fg: not supported in command mode -- use it from the normal shell prompt\n");
                                         shell.discard_pending_fg();
-                                        return None;
+                                        return CommandModeOutcome::Cancelled;
                                     }
-                                    _ => return None,
+                                    _ => return CommandModeOutcome::Cancelled,
                                 }
                             }
                         }
@@ -2075,7 +2132,7 @@ fn run_command_mode(shell: &mut Shell, history: &mut History, initial_char: Opti
             }
             Err(e) => {
                 shell.sink_err(&format!("bish: error reading input: {}\n", e));
-                return None;
+                return CommandModeOutcome::Cancelled;
             }
         }
         let _ = io::stdout().flush();
