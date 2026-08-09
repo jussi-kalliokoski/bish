@@ -1,6 +1,6 @@
 use super::Buffer;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Motion {
     Left,
     Right,
@@ -46,6 +46,20 @@ pub enum Motion {
     SentenceBackward,  // (
     NextLineNonBlank,  // + or Enter
     PrevLineNonBlank,  // -
+    MatchPair,         // %
+    SetMark(char),     // m{a-z}
+    GotoMark(char),    // `{mark}
+    GotoMarkLine(char), // '{mark}
+    // Repeat via 'n'/'N' is vimkeys' job (stage 4), same as ';'/',' for
+    // FindChar: it remembers the last search (the literal string it parsed
+    // for '/'/'?', or simply that '*'/'#' was used) and re-issues the same
+    // motion, flipping direction for 'N'. For '*'/'#' this works out neatly
+    // because the word under the cursor after landing on a match is, by
+    // construction, textually identical to the word that was searched for.
+    SearchForward(String),  // /pattern<Enter>
+    SearchBackward(String), // ?pattern<Enter>
+    SearchWordForward,      // *
+    SearchWordBackward,     // #
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -467,6 +481,197 @@ fn viewport_bottom(buf: &impl Buffer) -> usize {
     (buf.viewport_top() + buf.viewport_height().saturating_sub(1)).min(buf.line_count() - 1)
 }
 
+/// For a bracket character, returns (the character that closes/opens the
+/// pair, whether `c` itself is the opening bracket).
+fn bracket_partner(c: char) -> Option<(char, bool)> {
+    match c {
+        '(' => Some((')', true)),
+        ')' => Some(('(', false)),
+        '[' => Some((']', true)),
+        ']' => Some(('[', false)),
+        '{' => Some(('}', true)),
+        '}' => Some(('{', false)),
+        _ => None,
+    }
+}
+
+/// `%`: if the cursor isn't on a bracket, scans forward on the current line
+/// only (matching vim) for the first one, then walks forward or backward
+/// through the buffer tracking nesting depth to find its partner.
+fn match_pair_once(buf: &impl Buffer, pos: (usize, usize)) -> Option<(usize, usize)> {
+    let (line, col) = pos;
+    let len = buf.line_len(line);
+    let mut start = None;
+    for c in col..len {
+        if let Some(ch) = buf.char_at(line, c) {
+            if bracket_partner(ch).is_some() {
+                start = Some((line, c));
+                break;
+            }
+        }
+    }
+    let start = start?;
+    let ch0 = buf.char_at(start.0, start.1)?;
+    let (partner_char, is_opening) = bracket_partner(ch0)?;
+    let mut depth = 1;
+    let mut cur = start;
+    loop {
+        cur = if is_opening {
+            step_forward(buf, cur)?
+        } else {
+            step_backward(buf, cur)?
+        };
+        if let Some(c) = buf.char_at(cur.0, cur.1) {
+            if c == ch0 {
+                depth += 1;
+            } else if c == partner_char {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(cur);
+                }
+            }
+        }
+    }
+}
+
+/// The word (contiguous run of word chars) at or after `pos`. If `pos`
+/// isn't on a word char, advances to the next word first, matching `*`/`#`'s
+/// vim behavior of searching from the nearest word forward.
+fn word_under_cursor(buf: &impl Buffer, pos: (usize, usize)) -> Option<String> {
+    let mut p = pos;
+    if buf.line_len(p.0) == 0 || !matches!(buf.char_at(p.0, p.1), Some(c) if is_word_char(c)) {
+        let next = word_forward_once(buf, p, false);
+        if next == p {
+            return None;
+        }
+        p = next;
+    }
+    if buf.line_len(p.0) == 0 {
+        return None;
+    }
+    if !matches!(buf.char_at(p.0, p.1), Some(c) if is_word_char(c)) {
+        return None;
+    }
+    let line = p.0;
+    let mut start_col = p.1;
+    while start_col > 0 && matches!(buf.char_at(line, start_col - 1), Some(c) if is_word_char(c)) {
+        start_col -= 1;
+    }
+    let mut end_col = p.1;
+    while end_col + 1 < buf.line_len(line)
+        && matches!(buf.char_at(line, end_col + 1), Some(c) if is_word_char(c))
+    {
+        end_col += 1;
+    }
+    Some((start_col..=end_col).filter_map(|c| buf.char_at(line, c)).collect())
+}
+
+/// Literal (non-regex) substring search -- deliberately simple, matching
+/// this milestone's "nothing fancy" scope. Matches never span line breaks.
+fn line_find(buf: &impl Buffer, line: usize, lower_bound: usize, chars: &[char]) -> Option<usize> {
+    let len = buf.line_len(line);
+    let plen = chars.len();
+    if plen == 0 || plen > len {
+        return None;
+    }
+    let max_start = len - plen;
+    if lower_bound > max_start {
+        return None;
+    }
+    (lower_bound..=max_start).find(|&start| {
+        (0..plen).all(|i| buf.char_at(line, start + i) == Some(chars[i]))
+    })
+}
+
+fn line_rfind(buf: &impl Buffer, line: usize, upper_bound: usize, chars: &[char]) -> Option<usize> {
+    let len = buf.line_len(line);
+    let plen = chars.len();
+    if plen == 0 || plen > len {
+        return None;
+    }
+    let max_start = len - plen;
+    (0..=max_start).rev().filter(|&start| start < upper_bound).find(|&start| {
+        (0..plen).all(|i| buf.char_at(line, start + i) == Some(chars[i]))
+    })
+}
+
+/// Wrapping forward search (matches vim's default 'wrapscan'): tries the
+/// rest of the current line, then every subsequent line, then wraps back
+/// around to the start of the original line.
+fn search_forward_once(buf: &impl Buffer, pos: (usize, usize), chars: &[char]) -> Option<(usize, usize)> {
+    if chars.is_empty() {
+        return None;
+    }
+    let total = buf.line_count();
+    if let Some(c) = line_find(buf, pos.0, pos.1 + 1, chars) {
+        return Some((pos.0, c));
+    }
+    for offset in 1..total {
+        let line = (pos.0 + offset) % total;
+        if let Some(c) = line_find(buf, line, 0, chars) {
+            return Some((line, c));
+        }
+    }
+    line_find(buf, pos.0, 0, chars).map(|c| (pos.0, c))
+}
+
+fn search_backward_once(buf: &impl Buffer, pos: (usize, usize), chars: &[char]) -> Option<(usize, usize)> {
+    if chars.is_empty() {
+        return None;
+    }
+    let total = buf.line_count();
+    if let Some(c) = line_rfind(buf, pos.0, pos.1, chars) {
+        return Some((pos.0, c));
+    }
+    for offset in 1..total {
+        let line = (pos.0 + total - offset) % total;
+        if let Some(c) = line_rfind(buf, line, usize::MAX, chars) {
+            return Some((line, c));
+        }
+    }
+    line_rfind(buf, pos.0, usize::MAX, chars).map(|c| (pos.0, c))
+}
+
+fn is_word_boundary_at(buf: &impl Buffer, line: usize, col: usize) -> bool {
+    !matches!(buf.char_at(line, col), Some(c) if is_word_char(c))
+}
+
+fn search_word_forward_once(buf: &impl Buffer, pos: (usize, usize), chars: &[char]) -> Option<(usize, usize)> {
+    let first = search_forward_once(buf, pos, chars)?;
+    let mut candidate = first;
+    loop {
+        let (l, c) = candidate;
+        let before_ok = c == 0 || is_word_boundary_at(buf, l, c - 1);
+        let after_ok = is_word_boundary_at(buf, l, c + chars.len());
+        if before_ok && after_ok {
+            return Some(candidate);
+        }
+        let next = search_forward_once(buf, candidate, chars)?;
+        if next == first {
+            return None;
+        }
+        candidate = next;
+    }
+}
+
+fn search_word_backward_once(buf: &impl Buffer, pos: (usize, usize), chars: &[char]) -> Option<(usize, usize)> {
+    let first = search_backward_once(buf, pos, chars)?;
+    let mut candidate = first;
+    loop {
+        let (l, c) = candidate;
+        let before_ok = c == 0 || is_word_boundary_at(buf, l, c - 1);
+        let after_ok = is_word_boundary_at(buf, l, c + chars.len());
+        if before_ok && after_ok {
+            return Some(candidate);
+        }
+        let next = search_backward_once(buf, candidate, chars)?;
+        if next == first {
+            return None;
+        }
+        candidate = next;
+    }
+}
+
 /// Applies a single motion to `buf`'s cursor. `count` is the raw count typed
 /// before the motion (`None` if the user typed no digits) -- most motions
 /// treat it as a repeat count defaulting to 1, but `GotoFirstLine`/
@@ -719,6 +924,103 @@ pub fn apply_motion(buf: &mut impl Buffer, motion: Motion, count: Option<usize>)
             let col = first_non_blank(buf, target);
             buf.set_cursor(target, col);
         }
+        Motion::MatchPair => {
+            if let Some(target) = match_pair_once(buf, buf.cursor()) {
+                buf.set_cursor(target.0, target.1);
+            }
+        }
+        Motion::SetMark(name) => {
+            let pos = buf.cursor();
+            buf.set_mark(name, pos);
+        }
+        Motion::GotoMark(name) => {
+            if let Some((l, c)) = buf.get_mark(name) {
+                let l = l.min(buf.line_count() - 1);
+                let c = c.min(last_col(buf, l));
+                buf.set_cursor(l, c);
+            }
+        }
+        Motion::GotoMarkLine(name) => {
+            if let Some((l, _)) = buf.get_mark(name) {
+                let l = l.min(buf.line_count() - 1);
+                let c = first_non_blank(buf, l);
+                buf.set_cursor(l, c);
+            }
+        }
+        Motion::SearchForward(pattern) => {
+            let chars: Vec<char> = pattern.chars().collect();
+            let mut pos = buf.cursor();
+            let mut found = None;
+            for _ in 0..n {
+                match search_forward_once(buf, pos, &chars) {
+                    Some(p) => {
+                        pos = p;
+                        found = Some(p);
+                    }
+                    None => break,
+                }
+            }
+            if let Some((l, c)) = found {
+                buf.set_cursor(l, c);
+            }
+        }
+        Motion::SearchBackward(pattern) => {
+            let chars: Vec<char> = pattern.chars().collect();
+            let mut pos = buf.cursor();
+            let mut found = None;
+            for _ in 0..n {
+                match search_backward_once(buf, pos, &chars) {
+                    Some(p) => {
+                        pos = p;
+                        found = Some(p);
+                    }
+                    None => break,
+                }
+            }
+            if let Some((l, c)) = found {
+                buf.set_cursor(l, c);
+            }
+        }
+        Motion::SearchWordForward => {
+            let pos = buf.cursor();
+            if let Some(word) = word_under_cursor(buf, pos) {
+                let chars: Vec<char> = word.chars().collect();
+                let mut cur = pos;
+                let mut found = None;
+                for _ in 0..n {
+                    match search_word_forward_once(buf, cur, &chars) {
+                        Some(p) => {
+                            cur = p;
+                            found = Some(p);
+                        }
+                        None => break,
+                    }
+                }
+                if let Some((l, c)) = found {
+                    buf.set_cursor(l, c);
+                }
+            }
+        }
+        Motion::SearchWordBackward => {
+            let pos = buf.cursor();
+            if let Some(word) = word_under_cursor(buf, pos) {
+                let chars: Vec<char> = word.chars().collect();
+                let mut cur = pos;
+                let mut found = None;
+                for _ in 0..n {
+                    match search_word_backward_once(buf, cur, &chars) {
+                        Some(p) => {
+                            cur = p;
+                            found = Some(p);
+                        }
+                        None => break,
+                    }
+                }
+                if let Some((l, c)) = found {
+                    buf.set_cursor(l, c);
+                }
+            }
+        }
     }
 }
 
@@ -731,6 +1033,7 @@ mod tests {
         cursor: (usize, usize),
         vtop: usize,
         vheight: usize,
+        marks: std::collections::HashMap<char, (usize, usize)>,
     }
 
     impl TestBuffer {
@@ -741,6 +1044,7 @@ mod tests {
                 cursor: (0, 0),
                 vtop: 0,
                 vheight: 24,
+                marks: std::collections::HashMap::new(),
             }
         }
     }
@@ -769,6 +1073,12 @@ mod tests {
         }
         fn viewport_height(&self) -> usize {
             self.vheight
+        }
+        fn set_mark(&mut self, name: char, pos: (usize, usize)) {
+            self.marks.insert(name, pos);
+        }
+        fn get_mark(&self, name: char) -> Option<(usize, usize)> {
+            self.marks.get(&name).copied()
         }
     }
 
@@ -942,8 +1252,8 @@ mod tests {
         let mut buf = TestBuffer::new("abcXdefXghi");
         buf.set_cursor(0, 0);
         let f = Motion::FindChar { ch: 'X', till: false, forward: true };
-        assert_eq!(go(&mut buf, f, None), (0, 3));
-        assert_eq!(go(&mut buf, f, None), (0, 7));
+        assert_eq!(go(&mut buf, f.clone(), None), (0, 3));
+        assert_eq!(go(&mut buf, f.clone(), None), (0, 7));
         // no third X: motion fails, cursor stays put
         assert_eq!(go(&mut buf, f, None), (0, 7));
     }
@@ -961,7 +1271,7 @@ mod tests {
         let mut buf = TestBuffer::new("abcXdefXghi");
         buf.set_cursor(0, 10);
         let big_f = Motion::FindChar { ch: 'X', till: false, forward: false };
-        assert_eq!(go(&mut buf, big_f, None), (0, 7));
+        assert_eq!(go(&mut buf, big_f.clone(), None), (0, 7));
         assert_eq!(go(&mut buf, big_f, None), (0, 3));
         buf.set_cursor(0, 10);
         let big_t = Motion::FindChar { ch: 'X', till: true, forward: false };
@@ -1090,5 +1400,81 @@ mod tests {
         assert_eq!(buf.viewport_top(), 10);
         apply_motion(&mut buf, Motion::ScrollBottom, None);
         assert_eq!(buf.viewport_top(), 6);
+    }
+
+    #[test]
+    fn match_pair_nested_brackets() {
+        let mut buf = TestBuffer::new("foo(bar[baz]qux)end");
+        buf.set_cursor(0, 0);
+        assert_eq!(go(&mut buf, Motion::MatchPair, None), (0, 15)); // scans forward to '(', lands on ')'
+        buf.set_cursor(0, 15);
+        assert_eq!(go(&mut buf, Motion::MatchPair, None), (0, 3));
+        buf.set_cursor(0, 7);
+        assert_eq!(go(&mut buf, Motion::MatchPair, None), (0, 11));
+        buf.set_cursor(0, 11);
+        assert_eq!(go(&mut buf, Motion::MatchPair, None), (0, 7));
+    }
+
+    #[test]
+    fn match_pair_no_bracket_is_a_no_op() {
+        let mut buf = TestBuffer::new("hello");
+        buf.set_cursor(0, 2);
+        assert_eq!(go(&mut buf, Motion::MatchPair, None), (0, 2));
+    }
+
+    #[test]
+    fn marks_set_and_goto() {
+        let mut buf = TestBuffer::new("abc\ndef\nghi");
+        buf.set_cursor(1, 1);
+        apply_motion(&mut buf, Motion::SetMark('a'), None);
+        buf.set_cursor(2, 2);
+        assert_eq!(go(&mut buf, Motion::GotoMark('a'), None), (1, 1));
+        buf.set_cursor(2, 2);
+        assert_eq!(go(&mut buf, Motion::GotoMarkLine('a'), None), (1, 0));
+        // an unset mark is a no-op
+        assert_eq!(go(&mut buf, Motion::GotoMark('z'), None), (1, 0));
+    }
+
+    #[test]
+    fn search_forward_and_backward_wrap() {
+        let mut buf = TestBuffer::new("foo bar foo baz foo");
+        buf.set_cursor(0, 0);
+        let fwd = Motion::SearchForward("foo".to_string());
+        assert_eq!(go(&mut buf, fwd.clone(), None), (0, 8));
+        assert_eq!(go(&mut buf, fwd.clone(), None), (0, 16));
+        assert_eq!(go(&mut buf, fwd, None), (0, 0)); // wraps around
+
+        buf.set_cursor(0, 16);
+        let back = Motion::SearchBackward("foo".to_string());
+        assert_eq!(go(&mut buf, back.clone(), None), (0, 8));
+        assert_eq!(go(&mut buf, back.clone(), None), (0, 0));
+        assert_eq!(go(&mut buf, back, None), (0, 16)); // wraps around
+    }
+
+    #[test]
+    fn search_forward_with_count() {
+        let mut buf = TestBuffer::new("foo bar foo baz foo");
+        buf.set_cursor(0, 0);
+        assert_eq!(
+            go(&mut buf, Motion::SearchForward("foo".to_string()), Some(2)),
+            (0, 16)
+        );
+    }
+
+    #[test]
+    fn search_not_found_is_a_no_op() {
+        let mut buf = TestBuffer::new("foo bar");
+        buf.set_cursor(0, 2);
+        assert_eq!(go(&mut buf, Motion::SearchForward("xyz".to_string()), None), (0, 2));
+    }
+
+    #[test]
+    fn search_word_forward_and_backward_respect_word_boundaries() {
+        // "category" contains "cat" as a substring but not as a whole word --
+        // * must skip it and land on the next real "cat".
+        let mut buf = TestBuffer::new("cat dog category cat");
+        buf.set_cursor(0, 0);
+        assert_eq!(go(&mut buf, Motion::SearchWordForward, None), (0, 17));
+        assert_eq!(go(&mut buf, Motion::SearchWordBackward, None), (0, 0));
     }
 }

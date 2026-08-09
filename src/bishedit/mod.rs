@@ -26,4 +26,9 @@ pub trait Buffer {
     fn viewport_top(&self) -> usize;
     fn set_viewport_top(&mut self, line: usize);
     fn viewport_height(&self) -> usize;
+
+    /// `m{a-z}` / `` `{mark} `` / `'{mark}`. Marks are per-buffer state, same
+    /// as the cursor and viewport -- every implementor owns its own storage.
+    fn set_mark(&mut self, name: char, pos: (usize, usize));
+    fn get_mark(&self, name: char) -> Option<(usize, usize)>;
 }
