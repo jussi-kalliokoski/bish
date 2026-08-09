@@ -330,20 +330,117 @@ impl LineEditor {
 // -- it would wipe that pane's content too. For the ordinary
 // non-paned/full-width case this is behaviorally identical to the old
 // `\x1b[K`.
+//
+// `width` also bounds how much of prompt+buffer actually gets printed:
+// once that combined text would exceed it, the real terminal's own
+// autowrap (never disabled here) would wrap the overflow to column 1 of
+// the *next* row -- fine for the non-paned case (nothing else is there
+// to collide with), but that row belongs to some other pane the moment
+// this one doesn't span the whole terminal width, so the overflowing
+// characters would render into a neighboring pane's own content. Once
+// the buffer alone is too long to fit in what's left after the prompt,
+// this horizontally scrolls just the buffer text (prompt always stays
+// fully visible) so the cursor's own position is always shown, the same
+// "long line stays on one row" behavior GNU readline itself falls back
+// to in a narrow terminal -- recomputed fresh on every redraw from the
+// cursor's current position, not a persisted scroll offset.
 fn redraw(prompt: &str, ed: &LineEditor, col_origin: usize, width: usize) -> io::Result<()> {
-    let text: String = ed.buf.iter().collect();
     let mut out = String::new();
     out.push_str(&format!("\x1b[{}G", col_origin + 1));
     out.push_str(&" ".repeat(width));
     out.push_str(&format!("\x1b[{}G", col_origin + 1));
-    out.push_str(prompt);
-    out.push_str(&text);
-    let back = ed.buf.len() - ed.cursor;
-    if back > 0 {
-        out.push_str(&format!("\x1b[{}D", back));
+
+    let prompt_len = visible_len(prompt);
+    if prompt_len >= width {
+        // The prompt alone doesn't fit this pane's width -- show as
+        // much of it as does; there's no room left for any buffer text
+        // to show anyway. A real edge case (needs a pane narrower than
+        // the prompt itself, typically a 4+ way split), not worth more
+        // than graceful degradation.
+        out.push_str(&truncate_visible(prompt, width));
+        out.push_str("\x1b[0m");
+        print!("{}", out);
+        return io::stdout().flush();
     }
+
+    out.push_str(prompt);
+    let remaining = width - prompt_len;
+    if ed.buf.len() <= remaining {
+        let text: String = ed.buf.iter().collect();
+        out.push_str(&text);
+        let back = ed.buf.len() - ed.cursor;
+        if back > 0 {
+            out.push_str(&format!("\x1b[{}D", back));
+        }
+    } else {
+        // Right-align the visible window on the cursor whenever it
+        // would otherwise fall outside what's currently shown --
+        // clamped so the window never scrolls past showing the
+        // buffer's own tail once the cursor's at or past the end
+        // (typing forward, by far the common case).
+        let window_start = ed.cursor.saturating_sub(remaining - 1).min(ed.buf.len() - remaining);
+        let window_end = (window_start + remaining).min(ed.buf.len());
+        let window: String = ed.buf[window_start..window_end].iter().collect();
+        out.push_str(&window);
+        let back = (window_end - window_start) - (ed.cursor - window_start);
+        if back > 0 {
+            out.push_str(&format!("\x1b[{}D", back));
+        }
+    }
+
     print!("{}", out);
     io::stdout().flush()
+}
+
+// How many terminal columns `s` actually occupies once drawn, not
+// counting invisible escape bytes -- `s` is always one of this crate's
+// own prompt strings, which only ever embed `\x1b[...m` SGR (color)
+// codes, so that's the only escape form this needs to recognize.
+fn visible_len(s: &str) -> usize {
+    let mut len = 0;
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' && chars.peek() == Some(&'[') {
+            chars.next();
+            for c2 in chars.by_ref() {
+                if c2 == 'm' {
+                    break;
+                }
+            }
+            continue;
+        }
+        len += 1;
+    }
+    len
+}
+
+// Like visible_len, but returns the prefix of `s` whose *visible*
+// portion is at most `max_visible` columns, preserving any embedded SGR
+// codes encountered along the way (they don't count against the
+// budget) rather than risking a mid-escape-sequence cut.
+fn truncate_visible(s: &str, max_visible: usize) -> String {
+    let mut out = String::new();
+    let mut visible = 0;
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' && chars.peek() == Some(&'[') {
+            out.push(c);
+            out.push(chars.next().unwrap());
+            for c2 in chars.by_ref() {
+                out.push(c2);
+                if c2 == 'm' {
+                    break;
+                }
+            }
+            continue;
+        }
+        if visible >= max_visible {
+            break;
+        }
+        out.push(c);
+        visible += 1;
+    }
+    out
 }
 
 pub enum ReadOutcome {
