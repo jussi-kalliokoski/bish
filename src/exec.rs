@@ -212,6 +212,39 @@ pub enum WindowAction {
     // one, vim Ctrl-w-hjkl style. A no-op if the current window isn't
     // split, or nothing lies in that direction.
     FocusPane(PaneDirection),
+    // `window =`/`balance`: resets every pane's size weight throughout
+    // the current window's whole layout tree back to even.
+    Balance,
+    // `window +`/`sizeup` and `window -`/`sizedown`: grow/shrink the
+    // focused pane's own share of its immediate parent split by one
+    // step, relative to its siblings there. A no-op if the window isn't
+    // split.
+    SizeUp,
+    SizeDown,
+    // `window size <N>`/`<N>%`/`<N>/<M>`: set the focused pane's size
+    // directly along its parent split's own axis (rows for a stacked
+    // split, columns for a side-by-side one) -- see SizeSpec's own doc
+    // comment for what each form means. A no-op if the window isn't
+    // split.
+    SetSize(SizeSpec),
+}
+
+// The parsed form of `window size <arg>`'s own argument -- see
+// run_window's own parsing for the three accepted spellings plan.md
+// documents: a bare integer is an absolute character count along the
+// parent split's axis, `N%` is a percentage of that axis, and `N/M` is
+// a plain fraction (equivalent to `(N/M)*100`%). All three ultimately
+// resolve to the same thing once applied: a target fraction of the
+// parent split's available space, converted into a size *weight*
+// relative to the other panes there (see repl.rs's set_focused_pane_
+// size) -- panes aren't given fixed sizes directly, since the whole
+// layout has to keep resizing sanely as the real terminal itself
+// resizes.
+#[derive(Debug, Clone, Copy)]
+pub enum SizeSpec {
+    Characters(usize),
+    Percent(f64),
+    Fraction(f64),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -220,6 +253,28 @@ pub enum PaneDirection {
     Right,
     Up,
     Down,
+}
+
+// `window size <arg>`'s own argument, in the three forms plan.md
+// documents: `N%` (trailing percent sign), `N/M` (a literal slash --
+// bish's own arithmetic isn't involved, this is parsed directly as two
+// integers), or a bare `N` (absolute character count). Whichever form,
+// invalid input (unparseable numbers, `/0`) is reported as `None` so
+// run_window can print one consistent usage error rather than a parse
+// panic.
+fn parse_size_spec(arg: &str) -> Option<SizeSpec> {
+    if let Some(pct) = arg.strip_suffix('%') {
+        return Some(SizeSpec::Percent(pct.parse().ok()?));
+    }
+    if let Some((n, m)) = arg.split_once('/') {
+        let n: f64 = n.parse().ok()?;
+        let m: f64 = m.parse().ok()?;
+        if m == 0.0 {
+            return None;
+        }
+        return Some(SizeSpec::Fraction(n / m));
+    }
+    Some(SizeSpec::Characters(arg.parse().ok()?))
 }
 
 pub struct Shell {
@@ -1384,6 +1439,16 @@ impl Shell {
             Some("j") | Some("below") => ExecResult::Window(WindowAction::FocusPane(PaneDirection::Down)),
             Some("k") | Some("above") => ExecResult::Window(WindowAction::FocusPane(PaneDirection::Up)),
             Some("l") | Some("right") => ExecResult::Window(WindowAction::FocusPane(PaneDirection::Right)),
+            Some("=") | Some("balance") => ExecResult::Window(WindowAction::Balance),
+            Some("+") | Some("sizeup") => ExecResult::Window(WindowAction::SizeUp),
+            Some("-") | Some("sizedown") => ExecResult::Window(WindowAction::SizeDown),
+            Some("size") => match args.get(1).and_then(|a| parse_size_spec(a)) {
+                Some(spec) => ExecResult::Window(WindowAction::SetSize(spec)),
+                None => {
+                    sh_eprintln!(self, "bish: window: size: usage: window size <N>|<N>%|<N>/<M>");
+                    ExecResult::Status(2)
+                }
+            },
             Some("fg") => match args.get(1).and_then(|a| a.parse::<u32>().ok()) {
                 Some(id) => ExecResult::Window(WindowAction::FgSession(id)),
                 None => {
@@ -1398,7 +1463,7 @@ impl Shell {
             None => {
                 sh_eprintln!(
                     self,
-                    "bish: window: missing subcommand (next(n)/previous/new(c,create)/close(q,quit)/split(s)/vsplit(v)/h(left)/j(below)/k(above)/l(right)/fg <id>)"
+                    "bish: window: missing subcommand (next(n)/previous/new(c,create)/close(q,quit)/split(s)/vsplit(v)/h(left)/j(below)/k(above)/l(right)/=(balance)/+(sizeup)/-(sizedown)/size <N|N%,N/M>/fg <id>)"
                 );
                 ExecResult::Status(2)
             }

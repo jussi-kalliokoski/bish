@@ -97,6 +97,20 @@ impl Pane {
     }
 }
 
+// One child of a Split: its own subtree, plus how large a share of the
+// split's space it gets relative to its siblings there. Weights are
+// relative, not normalized to any fixed total -- compute_regions always
+// divides a Split's available space in proportion to weight/(sum of all
+// siblings' weights), so a fresh 2-way split with both sides at the
+// default 1.0 divides evenly (1/2 each), and `window +`/`-`/`size` (see
+// repl.rs's resize_focused_pane/set_focused_pane_size) only ever need
+// to change *this* pane's own weight, never touch its siblings' -- the
+// division naturally renormalizes around whatever's there.
+struct SplitChild {
+    layout: PaneLayout,
+    weight: f64,
+}
+
 // How a window's screen area is currently divided among its panes.
 // Leaf is the common case (an unsplit window, or one of a split's
 // occupied regions); Split recurses, so nested splits (a horizontal
@@ -107,7 +121,7 @@ impl Pane {
 // this becomes actual screen rectangles.
 enum PaneLayout {
     Leaf(PaneId),
-    Split { horizontal: bool, children: Vec<PaneLayout> },
+    Split { horizontal: bool, children: Vec<SplitChild> },
 }
 
 // A window: a set of panes (only ever more than one after `window
@@ -864,6 +878,18 @@ fn apply_window_action(
         WindowAction::FocusPane(direction) => {
             focus_pane_direction(&mut windows[*current_window], sessions, direction, term_rows, term_cols);
         }
+        WindowAction::Balance => {
+            balance_panes(&mut windows[*current_window].layout);
+        }
+        WindowAction::SizeUp => {
+            resize_focused_pane(&mut windows[*current_window], RESIZE_STEP);
+        }
+        WindowAction::SizeDown => {
+            resize_focused_pane(&mut windows[*current_window], -RESIZE_STEP);
+        }
+        WindowAction::SetSize(spec) => {
+            set_focused_pane_size(&mut windows[*current_window], spec, term_rows, term_cols);
+        }
     }
     compositor_redraw(sessions, windows, *current_window, term_rows, term_cols);
 }
@@ -976,18 +1002,24 @@ fn freeze_idle_prompt(session: &mut SessionState) {
 // whatever was there before.
 fn insert_sibling(layout: PaneLayout, target: PaneId, new_id: PaneId, horizontal: bool) -> PaneLayout {
     match layout {
-        PaneLayout::Leaf(id) if id == target => PaneLayout::Split { horizontal, children: vec![PaneLayout::Leaf(id), PaneLayout::Leaf(new_id)] },
+        PaneLayout::Leaf(id) if id == target => PaneLayout::Split {
+            horizontal,
+            children: vec![SplitChild { layout: PaneLayout::Leaf(id), weight: 1.0 }, SplitChild { layout: PaneLayout::Leaf(new_id), weight: 1.0 }],
+        },
         PaneLayout::Leaf(id) => PaneLayout::Leaf(id),
         PaneLayout::Split { horizontal: h, children } => {
-            let direct_child_idx = children.iter().position(|c| matches!(c, PaneLayout::Leaf(id) if *id == target));
+            let direct_child_idx = children.iter().position(|c| matches!(&c.layout, PaneLayout::Leaf(id) if *id == target));
             if let Some(idx) = direct_child_idx {
                 if h == horizontal {
                     let mut children = children;
-                    children.insert(idx + 1, PaneLayout::Leaf(new_id));
+                    children.insert(idx + 1, SplitChild { layout: PaneLayout::Leaf(new_id), weight: 1.0 });
                     return PaneLayout::Split { horizontal: h, children };
                 }
             }
-            let children = children.into_iter().map(|c| insert_sibling(c, target, new_id, horizontal)).collect();
+            let children = children
+                .into_iter()
+                .map(|c| SplitChild { layout: insert_sibling(c.layout, target, new_id, horizontal), weight: c.weight })
+                .collect();
             PaneLayout::Split { horizontal: h, children }
         }
     }
@@ -996,7 +1028,9 @@ fn insert_sibling(layout: PaneLayout, target: PaneId, new_id: PaneId, horizontal
 // Removes `target`'s Leaf from the tree, collapsing any Split left with
 // only one child down to that child directly (so a 2-way split closing
 // one side goes back to a plain unsplit Leaf, and a 3-way split closing
-// one side stays a 2-way split, not a redundant 1-child Split node).
+// one side stays a 2-way split, not a redundant 1-child Split node --
+// the survivors keep whatever weights they already had, same as
+// closing a pane never touches its siblings' sizes).
 fn remove_from_layout(layout: PaneLayout, target: PaneId) -> Option<PaneLayout> {
     match layout {
         PaneLayout::Leaf(id) => {
@@ -1007,10 +1041,13 @@ fn remove_from_layout(layout: PaneLayout, target: PaneId) -> Option<PaneLayout> 
             }
         }
         PaneLayout::Split { horizontal, children } => {
-            let new_children: Vec<PaneLayout> = children.into_iter().filter_map(|c| remove_from_layout(c, target)).collect();
+            let new_children: Vec<SplitChild> = children
+                .into_iter()
+                .filter_map(|c| remove_from_layout(c.layout, target).map(|layout| SplitChild { layout, weight: c.weight }))
+                .collect();
             match new_children.len() {
                 0 => None,
-                1 => new_children.into_iter().next(),
+                1 => new_children.into_iter().next().map(|c| c.layout),
                 _ => Some(PaneLayout::Split { horizontal, children: new_children }),
             }
         }
@@ -1020,7 +1057,7 @@ fn remove_from_layout(layout: PaneLayout, target: PaneId) -> Option<PaneLayout> 
 fn first_leaf(layout: &PaneLayout) -> PaneId {
     match layout {
         PaneLayout::Leaf(id) => *id,
-        PaneLayout::Split { children, .. } => first_leaf(&children[0]),
+        PaneLayout::Split { children, .. } => first_leaf(&children[0].layout),
     }
 }
 
@@ -1358,13 +1395,28 @@ struct CompositorLayout {
     dividers: Vec<(Rect, bool)>,
 }
 
-// Walks `layout`, splitting `area` evenly among each Split's children
-// (reserving one row/col between siblings for a divider line) down to
-// each Leaf's own rectangle. `dividers` collects the reserved divider
-// strips separately (row=true for a horizontal divider line, running
-// left-right; false for a vertical one, running top-bottom) so the
-// caller can draw them after every pane's own content, rather than
-// each Split trying to draw into space a child might otherwise want.
+// Floor under any single child's weight when computing shares below --
+// keeps a pane resized all the way down (or a pathological/negative
+// weight from ever existing in the first place) from making its own
+// share, or another sibling's via a tiny total, degenerate. The actual
+// on-screen size still can't go below 1 row/col either way (see the
+// `.max(1)` below), this only guards the weight arithmetic itself.
+const MIN_PANE_WEIGHT: f64 = 0.05;
+
+// Walks `layout`, splitting `area` among each Split's children in
+// proportion to their own weight (reserving one row/col between
+// siblings for a divider line) down to each Leaf's own rectangle --
+// every child's default weight is 1.0 (see insert_sibling), so a plain,
+// never-resized split still divides evenly; `window +`/`-`/`size` (see
+// resize_focused_pane/set_focused_pane_size) is what actually changes
+// any of this. Whichever child's own share divides the available space
+// least evenly (last in iteration order) absorbs the rounding
+// remainder, so the total always adds back up to `area`'s own size
+// exactly. `dividers` collects the reserved divider strips separately
+// (row=true for a horizontal divider line, running left-right; false
+// for a vertical one, running top-bottom) so the caller can draw them
+// after every pane's own content, rather than each Split trying to draw
+// into space a child might otherwise want.
 fn compute_regions(layout: &PaneLayout, area: Rect, out: &mut Vec<(PaneId, Rect)>, dividers: &mut Vec<(Rect, bool)>) {
     match layout {
         PaneLayout::Leaf(id) => out.push((*id, area)),
@@ -1373,23 +1425,23 @@ fn compute_regions(layout: &PaneLayout, area: Rect, out: &mut Vec<(PaneId, Rect)
             if n == 0 {
                 return;
             }
+            let total_weight: f64 = children.iter().map(|c| c.weight.max(MIN_PANE_WEIGHT)).sum();
             if *horizontal {
                 // Panes stacked top/bottom; the divider is the horizontal
                 // line between them.
                 let divider_rows = n - 1;
                 let usable = area.rows.saturating_sub(divider_rows);
-                let base = usable / n;
-                let mut extra = usable % n;
                 let mut row = area.row;
+                let mut allocated = 0usize;
                 for (i, child) in children.iter().enumerate() {
-                    let mut h = base;
-                    if extra > 0 {
-                        h += 1;
-                        extra -= 1;
-                    }
-                    let h = h.max(1);
-                    compute_regions(child, Rect { row, col: area.col, rows: h, cols: area.cols }, out, dividers);
+                    let h = if i + 1 == n {
+                        usable.saturating_sub(allocated).max(1)
+                    } else {
+                        (((usable as f64) * child.weight.max(MIN_PANE_WEIGHT) / total_weight).round() as usize).max(1)
+                    };
+                    compute_regions(&child.layout, Rect { row, col: area.col, rows: h, cols: area.cols }, out, dividers);
                     row += h;
+                    allocated += h;
                     if i + 1 < n {
                         dividers.push((Rect { row, col: area.col, rows: 1, cols: area.cols }, true));
                         row += 1;
@@ -1400,18 +1452,17 @@ fn compute_regions(layout: &PaneLayout, area: Rect, out: &mut Vec<(PaneId, Rect)
                 // between them.
                 let divider_cols = n - 1;
                 let usable = area.cols.saturating_sub(divider_cols);
-                let base = usable / n;
-                let mut extra = usable % n;
                 let mut col = area.col;
+                let mut allocated = 0usize;
                 for (i, child) in children.iter().enumerate() {
-                    let mut w = base;
-                    if extra > 0 {
-                        w += 1;
-                        extra -= 1;
-                    }
-                    let w = w.max(1);
-                    compute_regions(child, Rect { row: area.row, col, rows: area.rows, cols: w }, out, dividers);
+                    let w = if i + 1 == n {
+                        usable.saturating_sub(allocated).max(1)
+                    } else {
+                        (((usable as f64) * child.weight.max(MIN_PANE_WEIGHT) / total_weight).round() as usize).max(1)
+                    };
+                    compute_regions(&child.layout, Rect { row: area.row, col, rows: area.rows, cols: w }, out, dividers);
                     col += w;
+                    allocated += w;
                     if i + 1 < n {
                         dividers.push((Rect { row: area.row, col, rows: area.rows, cols: 1 }, false));
                         col += 1;
@@ -1451,6 +1502,111 @@ fn pane_rect(window: &WindowEntry, pane_id: PaneId, term_rows: usize, term_cols:
     let mut dividers = Vec::new();
     compute_regions(&window.layout, area, &mut regions, &mut dividers);
     regions.into_iter().find(|(id, _)| *id == pane_id).map(|(_, r)| r).expect("pane id always present in its own window's layout")
+}
+
+// How much one `window +`/`sizeup` or `-`/`sizedown` press changes the
+// focused pane's own weight -- see SplitChild's own doc comment for why
+// changing just one pane's weight (not its siblings') is enough to
+// resize the whole split: compute_regions always divides by weight
+// *share*, so growing one pane's weight relative to an unchanged total
+// for the others already shrinks them proportionally.
+const RESIZE_STEP: f64 = 0.2;
+
+// Finds the Split node that directly contains `target` as one of its
+// own children (not a further-nested grandchild), returning that
+// Split's own orientation, a mutable handle onto its children, and
+// target's index within them -- everything resize_focused_pane/
+// set_focused_pane_size need to read or adjust *only* the target's own
+// weight. None if the window isn't split at all (target is the whole
+// layout, a bare Leaf with no enclosing Split).
+fn find_parent_split_mut(layout: &mut PaneLayout, target: PaneId) -> Option<(bool, &mut Vec<SplitChild>, usize)> {
+    match layout {
+        PaneLayout::Leaf(_) => None,
+        PaneLayout::Split { horizontal, children } => {
+            if let Some(idx) = children.iter().position(|c| matches!(&c.layout, PaneLayout::Leaf(id) if *id == target)) {
+                return Some((*horizontal, children, idx));
+            }
+            for child in children.iter_mut() {
+                if let Some(found) = find_parent_split_mut(&mut child.layout, target) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+    }
+}
+
+// `window +`/`sizeup` (delta > 0) and `-`/`sizedown` (delta < 0): grows
+// or shrinks the focused pane's own weight within its immediate parent
+// split by RESIZE_STEP, floored at MIN_PANE_WEIGHT so repeated presses
+// can never zero it out (compute_regions' own `.max(1)` on the
+// resulting *rendered* size is the other half of that guarantee -- a
+// pane can get very small, never invisible). A no-op if the window
+// isn't split.
+fn resize_focused_pane(window: &mut WindowEntry, delta: f64) {
+    let focused = window.focused_pane;
+    if let Some((_, children, idx)) = find_parent_split_mut(&mut window.layout, focused) {
+        children[idx].weight = (children[idx].weight + delta).max(MIN_PANE_WEIGHT);
+    }
+}
+
+// `window =`/`balance`: resets every pane's weight throughout the
+// whole layout tree back to the default 1.0, undoing any accumulated
+// `+`/`-`/`size` adjustments at every level, not just the focused
+// pane's own immediate split.
+fn balance_panes(layout: &mut PaneLayout) {
+    if let PaneLayout::Split { children, .. } = layout {
+        for child in children.iter_mut() {
+            child.weight = 1.0;
+            balance_panes(&mut child.layout);
+        }
+    }
+}
+
+// `window size <N>`/`<N>%`/`<N>/<M>`: sets the focused pane's size
+// directly, along whichever axis its immediate parent split actually
+// divides (rows for a stacked split, columns for a side-by-side one).
+// A no-op if the window isn't split.
+//
+// Panes are sized by *weight*, not a fixed row/col count (see
+// SplitChild's own doc comment), so "set the size" here means solving
+// for whatever weight produces the requested share: given the parent's
+// other children's weights sum to `sum_others` and stay fixed, the
+// weight that makes the focused pane's own share equal `fraction` of
+// the total is `fraction * sum_others / (1 - fraction)` (algebra: from
+// `new / (new + sum_others) = fraction`). `fraction` itself comes from
+// whichever form was given -- % and N/M are already a fraction
+// directly; a bare character count is converted by first backing out
+// the parent split's own total usable space from the focused pane's
+// *currently rendered* size and weight ratio (`axis_size * total_weight
+// / old_weight`) -- an approximation (it ignores compute_regions' own
+// "last child absorbs the rounding remainder" rule), close enough for
+// an interactively-adjusted size and self-correcting on the very next
+// resize/redraw.
+fn set_focused_pane_size(window: &mut WindowEntry, spec: exec::SizeSpec, term_rows: usize, term_cols: usize) {
+    let focused = window.focused_pane;
+    let current_rect = pane_rect(window, focused, term_rows, term_cols);
+    let Some((horizontal, children, idx)) = find_parent_split_mut(&mut window.layout, focused) else {
+        return;
+    };
+    let axis_size = if horizontal { current_rect.rows } else { current_rect.cols };
+    let old_weight = children[idx].weight.max(MIN_PANE_WEIGHT);
+    let total_weight: f64 = children.iter().map(|c| c.weight.max(MIN_PANE_WEIGHT)).sum();
+    let sum_others = (total_weight - old_weight).max(MIN_PANE_WEIGHT);
+    let fraction = match spec {
+        exec::SizeSpec::Percent(p) => p / 100.0,
+        exec::SizeSpec::Fraction(f) => f,
+        exec::SizeSpec::Characters(n) => {
+            if axis_size == 0 {
+                return;
+            }
+            let approx_total_usable = (axis_size as f64) * total_weight / old_weight;
+            (n as f64) / approx_total_usable
+        }
+    };
+    let fraction = fraction.clamp(0.05, 0.95);
+    let new_weight = fraction * sum_others / (1.0 - fraction);
+    children[idx].weight = new_weight.max(MIN_PANE_WEIGHT);
 }
 
 // Resolves a window's layout against the real terminal size into a
