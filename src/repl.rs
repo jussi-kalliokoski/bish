@@ -1198,7 +1198,46 @@ fn drive_fg_job(job: &mut exec::FgJob, screen: &Rc<RefCell<vt100::Screen>>, mut 
                     job.send_stop();
                     continue;
                 }
-                let _ = job.pty_master().write_all(&buf[..n as usize]);
+                // A lone ESC (0x1b) might be a genuine Escape keypress,
+                // or it might be the first byte of a multi-byte escape
+                // sequence (arrow/function/Home/End keys, ...) whose
+                // remaining bytes just haven't arrived in this same
+                // read yet -- common enough over tmux/nested terminals
+                // that this reliably lost arrow keys inside a fg'd job
+                // like vim: the lone ESC got forwarded on its own tick,
+                // and by the time the rest arrived (a tick or more
+                // later, since forwarding here happens immediately per
+                // read rather than gathering a whole sequence first),
+                // vim's own ESC-vs-sequence disambiguation timeout
+                // (ttimeoutlen, ~50ms by default) had already lapsed,
+                // so it took the ESC as a real Escape and then
+                // interpreted the rest as separate normal-mode keys
+                // instead of recognizing the sequence. Waiting briefly
+                // here for the rest, and forwarding the whole thing as
+                // one write, matches what a real terminal effectively
+                // guarantees (a keyboard driver emits an escape
+                // sequence's bytes as one contiguous burst).
+                let mut seq = buf[..n as usize].to_vec();
+                if n == 1 && buf[0] == 0x1b && term::stdin_ready(50) {
+                    let more = unsafe { raw_read(0, buf.as_mut_ptr(), buf.len()) };
+                    if more > 0 {
+                        seq.extend_from_slice(&buf[..more as usize]);
+                    }
+                }
+                // The real keyboard always sends arrow keys in the plain
+                // CSI form (ESC [ A/B/C/D), whether they arrived here as
+                // one single read or were just gathered above -- re-
+                // encode to SS3 (ESC O A/B/C/D) if the job has switched
+                // into DECCKM/application cursor-key mode (see Screen::
+                // app_cursor_keys' own doc comment for why bish has to
+                // do this translation itself rather than the real
+                // terminal doing it).
+                if screen.borrow().app_cursor_keys {
+                    if let [0x1b, b'[', letter @ b'A'..=b'D'] = seq.as_slice() {
+                        seq = vec![0x1b, b'O', *letter];
+                    }
+                }
+                let _ = job.pty_master().write_all(&seq);
             } else {
                 break FgOutcome::Exited(job.wait());
             }

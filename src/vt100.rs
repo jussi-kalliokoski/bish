@@ -268,6 +268,22 @@ pub struct Screen {
     pub autowrap: bool,
     pub mouse_reporting: bool,
     pub bracketed_paste: bool,
+    // DECCKM (CSI ?1h/?1l): whether the program currently expects arrow
+    // keys encoded as SS3 (ESC O A/B/C/D, "application" mode) rather
+    // than the default CSI form (ESC [ A/B/C/D). A curses program (vim,
+    // less, ...) toggles this on startup/exit via smkx/rmkx -- almost
+    // every terminfo entry (xterm, screen, ...) maps its own cursor-key
+    // *input* the same way, so a real terminal switches its own key
+    // encoding to match. bish's own compositor can't just relay a job's
+    // raw output straight to the real terminal (see render_compositor_
+    // frame's doc comment -- it re-renders from grid cell state, which
+    // is what makes multiple simultaneously-visible panes possible at
+    // all), so this DECSET request would otherwise never reach the real
+    // terminal, leaving it stuck sending the *other* encoding than
+    // whatever the job now expects. repl.rs's drive_fg_job reads this
+    // to re-encode a plain CSI arrow key it receives into SS3 before
+    // forwarding, exactly what a real terminal would have done itself.
+    pub app_cursor_keys: bool,
 
     cur_fg: Color,
     cur_bg: Color,
@@ -297,6 +313,7 @@ impl Screen {
             cursor_visible: true,
             autowrap: true,
             mouse_reporting: false,
+            app_cursor_keys: false,
             bracketed_paste: false,
             cur_fg: Color::Default,
             cur_bg: Color::Default,
@@ -820,6 +837,7 @@ impl Screen {
         };
         for &mode in params {
             match mode {
+                1 => self.app_cursor_keys = set,
                 7 => self.autowrap = set,
                 25 => self.cursor_visible = set,
                 1000 | 1002 | 1003 | 1006 => self.mouse_reporting = set,
