@@ -3,7 +3,10 @@ use std::collections::HashMap;
 use std::io::{self, Write};
 use std::rc::Rc;
 
-use crate::editor::{self, ReadOutcome};
+use crate::bishedit::motion;
+use crate::bishedit::vimkeys::{KeyOutcome, VimKeys};
+use crate::bishedit::Buffer as BisheditBuffer;
+use crate::editor::{self, Key, ReadOutcome};
 use crate::exec::{self, ExecResult, PaneDirection, Shell, WindowAction};
 use crate::history::{self, History};
 use crate::lexer::Lexer;
@@ -461,6 +464,13 @@ pub fn run(mut shell: Shell) {
                     compositor_redraw(&sessions, &windows, current_window, term_rows, term_cols);
                 }
             }
+            Ok(ReadOutcome::NormalMode) => {
+                ensure_promoted(&mut sessions, &mut sinks_are_grid);
+                if let Err(e) = run_normal_mode_navigation(session_id, &mut sessions, &mut windows, current_window, &mut job_frames, term_rows, term_cols) {
+                    sessions.get(&session_id).unwrap().shell.sink_err(&format!("bish: error reading input: {}\n", e));
+                    break;
+                }
+            }
             Ok(ReadOutcome::CommandMode(pending)) => {
                 handle_command_mode(
                     session_id,
@@ -798,6 +808,33 @@ fn run_fg_job_frame(
 // case (its error message needs to actually become visible once
 // promoted, same as any other captured output).
 #[allow(clippy::too_many_arguments)]
+// One-time transition, shared by two independent triggers: every
+// window-family command (via apply_window_action -- see its own former
+// comment, preserved in spirit here) and, as of bishedit, Ctrl+Space
+// entering normal-mode navigation (run_normal_mode_navigation), which
+// bypasses the command-dispatch path entirely and so has to trigger this
+// itself rather than relying on exec.rs's run_window having already done
+// it. `promote_if_needed` (the actual alt-screen switch) is idempotent
+// and shared (`Rc<Cell<bool>>`) across every session forked from the same
+// root, so calling it here even when exec.rs already did is harmless --
+// covers both callers with one unconditional call rather than needing to
+// know which case this is. The sink flip (every session's shell writing
+// into its own grid instead of straight to the real terminal) still only
+// happens once, guarded by `sinks_are_grid` same as before.
+fn ensure_promoted(sessions: &mut HashMap<SessionId, SessionState>, sinks_are_grid: &mut bool) {
+    if *sinks_are_grid {
+        return;
+    }
+    if let Some(s) = sessions.values_mut().next() {
+        s.shell.promote_if_needed();
+    }
+    for s in sessions.values_mut() {
+        let screen = s.screen.clone();
+        s.shell.set_sink_grid(screen);
+    }
+    *sinks_are_grid = true;
+}
+
 fn apply_window_action(
     action: WindowAction,
     sessions: &mut HashMap<SessionId, SessionState>,
@@ -809,22 +846,7 @@ fn apply_window_action(
     term_rows: usize,
     term_cols: usize,
 ) {
-    // One-time transition: every window-family command promotes before
-    // repl.rs ever sees the resulting action (see run_window/
-    // promote_if_needed in exec.rs), so by the time we get here the
-    // terminal is always already in the alternate screen buffer. Flip
-    // every existing session (in practice just session 0 the very first
-    // time, since any session created via `new` afterward is always
-    // created post-promotion and gets a Grid sink from birth below) from
-    // writing straight to the real terminal to capturing into its own
-    // grid instead.
-    if !*sinks_are_grid {
-        for s in sessions.values_mut() {
-            let screen = s.screen.clone();
-            s.shell.set_sink_grid(screen);
-        }
-        *sinks_are_grid = true;
-    }
+    ensure_promoted(sessions, sinks_are_grid);
 
     match action {
         WindowAction::Next => {
@@ -1867,6 +1889,301 @@ fn sgr_codes(fg: vt100::Color, bg: vt100::Color, attrs: vt100::CellAttrs) -> Str
     format!("\x1b[{}m", codes.join(";"))
 }
 
+// A read-only bishedit::Buffer view over a pane's own rendered content --
+// its scrollback (oldest first) followed by its live grid, addressed as
+// one flat sequence of lines (see plan.md's own description of this
+// adapter). Its own (line, col) navigation cursor is kept separate from
+// the Screen's real cursor -- motions here never touch the live
+// session's actual content or cursor, purely read-only navigation over a
+// snapshot view. Marks (m/`/') are its own small addition on top of the
+// trait's baseline; nothing else in this milestone needs per-buffer
+// storage like this yet.
+struct ScreenBuffer {
+    screen: Rc<RefCell<vt100::Screen>>,
+    cursor: (usize, usize),
+    vtop: usize,
+    vheight: usize,
+    marks: HashMap<char, (usize, usize)>,
+}
+
+impl ScreenBuffer {
+    fn new(screen: Rc<RefCell<vt100::Screen>>, vheight: usize) -> ScreenBuffer {
+        let (sb_len, cur_row, cur_col) = {
+            let s = screen.borrow();
+            let (row, col) = s.cursor();
+            (s.scrollback.len(), row, col)
+        };
+        // Starts where the live cursor currently is -- translated into
+        // this combined addressing, where scrollback lines come first --
+        // the same convention tmux copy-mode uses (enter at the current
+        // cursor position, not always at the very top).
+        let cursor = (sb_len + cur_row, cur_col);
+        let vheight = vheight.max(1);
+        let vtop = cursor.0.saturating_sub(vheight - 1);
+        ScreenBuffer { screen, cursor, vtop, vheight, marks: HashMap::new() }
+    }
+
+    // `line`'s own raw cell count -- the live grid's current width for a
+    // grid row, or that scrollback row's width *at the time it scrolled
+    // off* for a scrollback row, which can differ from the live grid's
+    // current width if the terminal was resized since. `char_at`/
+    // `line_len` trim trailing blanks off of this.
+    fn raw_len(&self, line: usize) -> usize {
+        let s = self.screen.borrow();
+        let sb_len = s.scrollback.len();
+        if line < sb_len {
+            s.scrollback[line].len()
+        } else {
+            s.size().1
+        }
+    }
+
+    fn raw_char_at(&self, line: usize, col: usize) -> Option<char> {
+        let s = self.screen.borrow();
+        let sb_len = s.scrollback.len();
+        if line < sb_len {
+            s.scrollback[line].get(col).map(|c| c.ch)
+        } else {
+            let row = line - sb_len;
+            let (rows, cols) = s.size();
+            if row < rows && col < cols {
+                Some(s.cell(row, col).ch)
+            } else {
+                None
+            }
+        }
+    }
+}
+
+impl BisheditBuffer for ScreenBuffer {
+    fn line_count(&self) -> usize {
+        let s = self.screen.borrow();
+        (s.scrollback.len() + s.size().0).max(1)
+    }
+
+    fn line_len(&self, line: usize) -> usize {
+        let raw = self.raw_len(line);
+        (0..raw).rev().find(|&c| self.raw_char_at(line, c) != Some(' ')).map(|c| c + 1).unwrap_or(0)
+    }
+
+    fn char_at(&self, line: usize, col: usize) -> Option<char> {
+        if col < self.line_len(line) {
+            self.raw_char_at(line, col)
+        } else {
+            None
+        }
+    }
+
+    fn cursor(&self) -> (usize, usize) {
+        self.cursor
+    }
+
+    fn set_cursor(&mut self, line: usize, col: usize) {
+        self.cursor = (line, col);
+    }
+
+    fn viewport_top(&self) -> usize {
+        self.vtop
+    }
+
+    fn set_viewport_top(&mut self, line: usize) {
+        self.vtop = line;
+    }
+
+    fn viewport_height(&self) -> usize {
+        self.vheight
+    }
+
+    fn set_mark(&mut self, name: char, pos: (usize, usize)) {
+        self.marks.insert(name, pos);
+    }
+
+    fn get_mark(&self, name: char) -> Option<(usize, usize)> {
+        self.marks.get(&name).copied()
+    }
+}
+
+// Adjusts `buf`'s viewport so its navigation cursor's line is visible,
+// scrolling as little as possible -- matching vim's own scrolling, which
+// only jumps when the cursor would otherwise move off-screen, not
+// recentering on every motion.
+fn scroll_to_show_cursor(buf: &mut ScreenBuffer) {
+    let (line, _) = buf.cursor();
+    let height = buf.viewport_height();
+    if line < buf.viewport_top() {
+        buf.set_viewport_top(line);
+    } else if line >= buf.viewport_top() + height {
+        buf.set_viewport_top(line + 1 - height);
+    }
+}
+
+fn render_normal_mode_row(out: &mut String, buf: &ScreenBuffer, line: usize, cols: usize) {
+    let mut last: Option<(vt100::Color, vt100::Color, vt100::CellAttrs)> = None;
+    let s = buf.screen.borrow();
+    let sb_len = s.scrollback.len();
+    for c in 0..cols {
+        let cell = if line < sb_len {
+            s.scrollback[line].get(c).copied().unwrap_or_default()
+        } else {
+            let row = line - sb_len;
+            let (rows, scols) = s.size();
+            if row < rows && c < scols {
+                s.cell(row, c)
+            } else {
+                vt100::Cell::default()
+            }
+        };
+        let key = (cell.fg, cell.bg, cell.attrs);
+        if last != Some(key) {
+            out.push_str(&sgr_codes(cell.fg, cell.bg, cell.attrs));
+            last = Some(key);
+        }
+        out.push(cell.ch);
+    }
+    out.push_str("\x1b[0m");
+}
+
+// Draws `buf`'s current viewport into `rect` (the focused pane's own
+// rectangle -- see pane_rect), reusing sgr_codes the same way render_row
+// does for a live pane. Lines past the end of the buffer's content are
+// left blank -- vim's own "~" convention for that is one more piece of
+// scope this first pass leaves out. Positions the real terminal cursor
+// at the navigation cursor's own screen location afterward.
+fn render_normal_mode_view(buf: &ScreenBuffer, rect: Rect) {
+    let total = buf.line_count();
+    let mut out = String::new();
+    for r in 0..rect.rows {
+        let line = buf.viewport_top() + r;
+        out.push_str(&format!("\x1b[{};{}H", rect.row + r + 1, rect.col + 1));
+        if line < total {
+            render_normal_mode_row(&mut out, buf, line, rect.cols);
+        } else {
+            out.push_str(&" ".repeat(rect.cols));
+        }
+    }
+    let (cl, cc) = buf.cursor();
+    let screen_row = cl.saturating_sub(buf.viewport_top()).min(rect.rows.saturating_sub(1));
+    let screen_col = cc.min(rect.cols.saturating_sub(1));
+    out.push_str(&format!("\x1b[{};{}H", rect.row + screen_row + 1, rect.col + screen_col + 1));
+    out.push_str("\x1b[?25h");
+    print!("{}", out);
+    let _ = io::stdout().flush();
+}
+
+// bishedit M1's first (and, so far, only) consumer: Ctrl+Space at an
+// empty prompt buffer (editor::ReadOutcome::NormalMode) enters this --
+// read-only cursor navigation over the focused pane's own rendered
+// content (scrollback included), vim's normal-mode motions applied via
+// bishedit::motion/vimkeys. `i` returns to the live prompt, same as vim;
+// `:q`/`:q!`/`ZZ` are accepted as the same "return to the live prompt"
+// gesture -- there is nothing here to save, so `:q!`'s force isn't
+// distinguished from a plain `:q` (see plan.md's own milestone scoping).
+// These three are recognized directly by this loop rather than routed
+// through bish's own separate `:` command mode, which is a different
+// thing entirely (running an actual shell command), not vim's Ex line.
+//
+// Not yet resumable via the Frame stack (see plan.md's own scoping
+// note): switching to another window mid-navigation and coming back
+// later is a natural follow-up, staged the same way job control itself
+// was staged across M10a-c. This pass is a simple, blocking "enter,
+// navigate, exit" loop -- other windows' backgrounded jobs are still
+// kept alive via on_idle (service_background_jobs), but their panes
+// aren't repainted live while this loop owns the screen; any staleness
+// resolves itself once normal mode exits and the next compositor_redraw
+// runs.
+fn run_normal_mode_navigation(
+    session_id: SessionId,
+    sessions: &mut HashMap<SessionId, SessionState>,
+    windows: &mut Vec<WindowEntry>,
+    current_window: usize,
+    job_frames: &mut HashMap<JobFrameId, exec::FgJob>,
+    term_rows: usize,
+    term_cols: usize,
+) -> io::Result<()> {
+    let rect = pane_rect(&windows[current_window], windows[current_window].focused_pane, term_rows, term_cols);
+    // Same reasoning as freeze_idle_prompt's other call sites (splitting,
+    // switching pane focus): this session's live prompt has only ever
+    // been drawn straight to the real terminal by editor::read_line,
+    // never captured into its own grid -- fine as long as nothing needs
+    // to read that grid back, which is exactly what's about to happen.
+    // Ctrl+Space doesn't change focus (unlike those other call sites), so
+    // without this the very first entry into normal mode in a session
+    // that's never lost focus before would render as a blank pane, not
+    // even showing the current prompt.
+    freeze_idle_prompt(sessions.get_mut(&session_id).unwrap());
+    let screen = sessions[&session_id].screen.clone();
+    let mut buf = ScreenBuffer::new(screen, rect.rows);
+    let mut vk = VimKeys::new();
+
+    let _guard = term::RawGuard::enable(0)?;
+    // Repaints the whole screen first -- necessary the very first time
+    // normal mode ever triggers promotion (the alternate screen buffer
+    // starts out blank), harmless otherwise -- then this pane's own
+    // rectangle on top of that with the scrollback view.
+    compositor_redraw(sessions, windows, current_window, term_rows, term_cols);
+    render_normal_mode_view(&buf, rect);
+
+    loop {
+        let key = match editor::read_key_idle(&mut || {
+            service_background_jobs(sessions, windows, job_frames, current_window);
+        })? {
+            Some(k) => k,
+            None => break,
+        };
+
+        match key {
+            Key::Char('i') => break,
+            Key::Char('Z') => {
+                let k2 = editor::read_key_idle(&mut || {
+                    service_background_jobs(sessions, windows, job_frames, current_window);
+                })?;
+                if k2 == Some(Key::Char('Z')) {
+                    break;
+                }
+                continue;
+            }
+            Key::Char(':') => {
+                let mut cmd = String::new();
+                loop {
+                    let k2 = match editor::read_key_idle(&mut || {
+                        service_background_jobs(sessions, windows, job_frames, current_window);
+                    })? {
+                        Some(k) => k,
+                        None => return Ok(()),
+                    };
+                    match k2 {
+                        Key::Enter => break,
+                        Key::Escape => {
+                            cmd.clear();
+                            break;
+                        }
+                        Key::Backspace => {
+                            cmd.pop();
+                        }
+                        Key::Char(c) => cmd.push(c),
+                        _ => {}
+                    }
+                }
+                if cmd == "q" || cmd == "q!" {
+                    break;
+                }
+                render_normal_mode_view(&buf, rect);
+                continue;
+            }
+            _ => {}
+        }
+
+        if let KeyOutcome::Motion(m, count) = vk.feed(key) {
+            motion::apply_motion(&mut buf, m, count);
+            scroll_to_show_cursor(&mut buf);
+            render_normal_mode_view(&buf, rect);
+        }
+    }
+
+    compositor_redraw(sessions, windows, current_window, term_rows, term_cols);
+    Ok(())
+}
+
 // (window_id, is_the_current_window, that window's session's cwd) -- an
 // owned snapshot so drive_pending_fg's redraw callback can build a tab
 // bar without holding a live borrow of `sessions` for its whole poll
@@ -2042,6 +2359,14 @@ fn run_command_mode(shell: &mut Shell, history: &mut History, initial_char: Opti
             // and keep showing this same prompt, rather than wiring
             // sessions/dir_history all the way through here too.
             Ok(ReadOutcome::DirNav(_)) => {}
+            // Same reasoning as DirNav above -- entering bishedit normal
+            // mode needs the session/window/job_frames state this nested
+            // read_line has no access to, and command mode's own buffer
+            // is empty here anyway only in the one-shot "just entered"
+            // case (esc_cancels' own Backspace-at-start handling covers
+            // leaving early), so there's nothing meaningful lost by
+            // ignoring it and continuing to show this same prompt.
+            Ok(ReadOutcome::NormalMode) => {}
             Ok(ReadOutcome::Line(line)) => {
                 // Same history expansion as the normal shell prompt (see
                 // history::expand's own doc comment), scoped the same

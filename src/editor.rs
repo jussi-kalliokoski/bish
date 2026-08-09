@@ -25,6 +25,11 @@ unsafe extern "C" {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Key {
     Char(char),
+    // Raw NUL (0x00) -- most terminals send this for Ctrl+Space. This
+    // codebase's existing convention for "step back a level" (see
+    // drive_fg_job's job-detach handling); reused here as the gesture that
+    // enters bishedit's normal-mode navigation over the current pane.
+    CtrlSpace,
     Enter,
     Backspace,
     Delete,
@@ -98,6 +103,7 @@ fn read_key() -> io::Result<Option<Key>> {
         None => return Ok(None),
     };
     let key = match b {
+        0x00 => Key::CtrlSpace,
         0x01 => Key::CtrlA,
         0x02 => Key::CtrlB,
         0x03 => Key::CtrlC,
@@ -216,7 +222,7 @@ const IDLE_POLL_MS: i32 = 15;
 // unchanged: a real key event's remaining bytes (an escape sequence's
 // tail, a UTF-8 continuation byte) always arrive close enough behind the
 // first that there's nothing to gain by polling those sub-reads too.
-fn read_key_idle(on_idle: &mut dyn FnMut()) -> io::Result<Option<Key>> {
+pub(crate) fn read_key_idle(on_idle: &mut dyn FnMut()) -> io::Result<Option<Key>> {
     while !term::stdin_ready(IDLE_POLL_MS) {
         on_idle();
     }
@@ -477,6 +483,12 @@ pub enum ReadOutcome {
     // rather than discarded, with the cursor landing at its start, in
     // the exact spot the ':' itself used to occupy.
     ExitCommandMode(String),
+    // Ctrl+Space at an empty buffer -- same "don't discard in-progress
+    // typing" gating as DirNav/':' arming above. Enters bishedit's
+    // normal-mode navigation over the current pane's own rendered content
+    // (repl.rs's run_normal_mode_navigation); `i` there returns to a fresh
+    // read_line call, same as this one would have continued into anyway.
+    NormalMode,
 }
 
 // Directory-history navigation (browser-style back/forward, plus "up to
@@ -798,7 +810,15 @@ pub fn read_line(
                 io::stdout().flush()?;
                 return Ok(ReadOutcome::DirNav(DirNav::Up));
             }
-            Key::AltLeft | Key::AltRight | Key::AltUp | Key::CtrlY | Key::Unknown => {}
+            // No trailing "\r\n" here, unlike DirNav above: entering
+            // normal mode redraws the pane's own rectangle in place (see
+            // repl.rs's run_normal_mode_navigation), not a fresh line at
+            // the real terminal's current cursor position.
+            Key::CtrlSpace if ed.buf.is_empty() => {
+                drop(guard.take());
+                return Ok(ReadOutcome::NormalMode);
+            }
+            Key::AltLeft | Key::AltRight | Key::AltUp | Key::CtrlSpace | Key::CtrlY | Key::Unknown => {}
         }
         redraw(if cmd_mode_armed { armed_prompt } else { prompt }, &ed, col_origin, width)?;
     }
