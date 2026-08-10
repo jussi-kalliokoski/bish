@@ -222,6 +222,27 @@ pub struct Lexer<'a> {
     // the *next* word read via read_word(relaxed: true) instead of the
     // normal dispatch. See the =~ handling in tokenize().
     regex_operand_next: bool,
+    // How many chars have been consumed via advance() so far -- a CHAR
+    // index (matching Vec<char>/bishedit's HighlightSpan contract), not a
+    // byte offset. Exists purely for the syntax-highlighting path
+    // (tokenize_spanned and the raw-capture-span instrumentation below);
+    // ordinary tokenize()/execution never reads it. Always tracked
+    // (unconditionally, not behind a flag) since that's simpler than
+    // threading an opt-in through every call site, and the cost is one
+    // usize increment per char already being consumed regardless.
+    pos: usize,
+    // Half-open char-index ranges (excluding delimiters) of every raw,
+    // not-yet-parsed region captured by capture_balanced_parens/
+    // capture_backtick -- i.e. exactly the source text later stashed into
+    // a Chunk::Sub/Arith/ProcSubIn/ProcSubOut/Tok::Subshell/Tok::Arith
+    // `raw` field. capture_double_paren doesn't push its own -- it just
+    // wraps a capture_balanced_parens call, whose span already covers the
+    // same raw text -- so pushing there too would desync this list from
+    // the one-span-per-raw-capturing-chunk correspondence the highlighter
+    // relies on to recurse into each nested construct in the right order.
+    // Always populated (no Option-gating), like `pos`: ordinary
+    // tokenize()/execution never reads this either.
+    raw_capture_spans: Vec<std::ops::Range<usize>>,
 }
 
 impl<'a> Lexer<'a> {
@@ -231,7 +252,23 @@ impl<'a> Lexer<'a> {
             pending_heredocs: Vec::new(),
             bracket2_depth: 0,
             regex_operand_next: false,
+            pos: 0,
+            raw_capture_spans: Vec::new(),
         }
+    }
+
+    // The one and only place that actually consumes a char from `chars` --
+    // every other call site in this file goes through this instead of
+    // calling `self.chars.next()` directly, purely so `pos` (see its own
+    // doc comment) stays accurate everywhere spans get recorded, not just
+    // at the top-level tokenize() loop. Behaviorally identical to a bare
+    // `self.chars.next()` in every other respect.
+    fn advance(&mut self) -> Option<char> {
+        let c = self.chars.next();
+        if c.is_some() {
+            self.pos += 1;
+        }
+        c
     }
 
     pub fn tokenize(mut self) -> Result<Vec<Tok>, String> {
@@ -264,11 +301,11 @@ impl<'a> Lexer<'a> {
                         if c == '\n' {
                             break;
                         }
-                        self.chars.next();
+                        self.advance();
                     }
                 }
                 Some('\n') => {
-                    self.chars.next();
+                    self.advance();
                     toks.push(Tok::Newline);
                     // A `<<WORD` redirect's body is the lines immediately
                     // following the line it appeared on, not the text right
@@ -290,24 +327,24 @@ impl<'a> Lexer<'a> {
                     }
                 }
                 Some('|') => {
-                    self.chars.next();
+                    self.advance();
                     if self.chars.peek().copied() == Some('|') {
-                        self.chars.next();
+                        self.advance();
                         toks.push(Tok::Or);
                     } else {
                         toks.push(Tok::Pipe);
                     }
                 }
                 Some('&') => {
-                    self.chars.next();
+                    self.advance();
                     if self.chars.peek().copied() == Some('&') {
-                        self.chars.next();
+                        self.advance();
                         toks.push(Tok::And);
                     } else if self.chars.peek().copied() == Some('>') {
-                        self.chars.next();
+                        self.advance();
                         let append = self.chars.peek().copied() == Some('>');
                         if append {
-                            self.chars.next();
+                            self.advance();
                         }
                         toks.push(Tok::RedirBoth { append });
                     } else {
@@ -315,26 +352,26 @@ impl<'a> Lexer<'a> {
                     }
                 }
                 Some(';') => {
-                    self.chars.next();
+                    self.advance();
                     if self.chars.peek().copied() == Some(';') {
-                        self.chars.next();
+                        self.advance();
                         if self.chars.peek().copied() == Some('&') {
-                            self.chars.next();
+                            self.advance();
                             toks.push(Tok::DSemiAmp);
                         } else {
                             toks.push(Tok::DSemi);
                         }
                     } else if self.chars.peek().copied() == Some('&') {
-                        self.chars.next();
+                        self.advance();
                         toks.push(Tok::SemiAmp);
                     } else {
                         toks.push(Tok::Semi);
                     }
                 }
                 Some('(') => {
-                    self.chars.next();
+                    self.advance();
                     if self.chars.peek().copied() == Some('(') {
-                        self.chars.next();
+                        self.advance();
                         let raw = self.capture_double_paren()?;
                         toks.push(Tok::Arith(raw));
                     } else {
@@ -343,58 +380,58 @@ impl<'a> Lexer<'a> {
                     }
                 }
                 Some(')') => {
-                    self.chars.next();
+                    self.advance();
                     toks.push(Tok::RParen);
                 }
                 Some('{') if self.next_char_is_word_boundary() => {
-                    self.chars.next();
+                    self.advance();
                     toks.push(Tok::LBrace);
                 }
                 Some('}') if self.next_char_is_word_boundary() => {
-                    self.chars.next();
+                    self.advance();
                     toks.push(Tok::RBrace);
                 }
                 Some('>') => {
-                    self.chars.next();
+                    self.advance();
                     if self.chars.peek().copied() == Some('(') {
-                        self.chars.next();
+                        self.advance();
                         let raw = self.capture_balanced_parens()?;
                         toks.push(Tok::Word(vec![Chunk::ProcSubOut { raw }], false));
                         continue;
                     }
                     if self.chars.peek().copied() == Some('&') {
-                        self.chars.next();
+                        self.advance();
                         toks.push(self.lex_dup_target(1));
                         continue;
                     }
                     let append = self.chars.peek().copied() == Some('>');
                     if append {
-                        self.chars.next();
+                        self.advance();
                     }
                     toks.push(Tok::RedirOut { append });
                 }
                 Some('<') => {
-                    self.chars.next();
+                    self.advance();
                     if self.chars.peek().copied() == Some('(') {
-                        self.chars.next();
+                        self.advance();
                         let raw = self.capture_balanced_parens()?;
                         toks.push(Tok::Word(vec![Chunk::ProcSubIn { raw }], false));
                         continue;
                     }
                     if self.chars.peek().copied() == Some('&') {
-                        self.chars.next();
+                        self.advance();
                         toks.push(self.lex_dup_target(0));
                         continue;
                     }
                     if self.chars.peek().copied() == Some('<') {
-                        self.chars.next();
+                        self.advance();
                         if self.chars.peek().copied() == Some('<') {
-                            self.chars.next();
+                            self.advance();
                             toks.push(Tok::HereString);
                         } else {
                             let strip_tabs = self.chars.peek().copied() == Some('-');
                             if strip_tabs {
-                                self.chars.next();
+                                self.advance();
                             }
                             self.skip_spaces();
                             let (delim, expand) = self.read_heredoc_delimiter();
@@ -407,16 +444,16 @@ impl<'a> Lexer<'a> {
                     }
                 }
                 Some('2') if self.peek_is_fd2_redirect() => {
-                    self.chars.next(); // '2'
-                    self.chars.next(); // '>'
+                    self.advance(); // '2'
+                    self.advance(); // '>'
                     if self.chars.peek().copied() == Some('&') && self.peek2() == Some('1') {
-                        self.chars.next(); // '&'
-                        self.chars.next(); // '1'
+                        self.advance(); // '&'
+                        self.advance(); // '1'
                         toks.push(Tok::DupErrToOut);
                     } else {
                         let append = self.chars.peek().copied() == Some('>');
                         if append {
-                            self.chars.next();
+                            self.advance();
                         }
                         toks.push(Tok::RedirErr { append });
                     }
@@ -432,24 +469,24 @@ impl<'a> Lexer<'a> {
                 Some(c) if c.is_ascii_digit() && self.peek_numbered_fd_redirect().is_some() => {
                     let (fd, ndigits) = self.peek_numbered_fd_redirect().unwrap();
                     for _ in 0..ndigits {
-                        self.chars.next();
+                        self.advance();
                     }
-                    match self.chars.next() {
+                    match self.advance() {
                         Some('>') => {
                             if self.chars.peek().copied() == Some('&') {
-                                self.chars.next();
+                                self.advance();
                                 toks.push(self.lex_dup_target(fd));
                             } else {
                                 let append = self.chars.peek().copied() == Some('>');
                                 if append {
-                                    self.chars.next();
+                                    self.advance();
                                 }
                                 toks.push(Tok::RedirFdOut { fd, append });
                             }
                         }
                         Some('<') => {
                             if self.chars.peek().copied() == Some('&') {
-                                self.chars.next();
+                                self.advance();
                                 toks.push(self.lex_dup_target(fd));
                             } else {
                                 toks.push(Tok::RedirFdIn { fd });
@@ -501,7 +538,7 @@ impl<'a> Lexer<'a> {
     // same as every other redirect operator's target.
     fn lex_dup_target(&mut self, fd: u32) -> Tok {
         if self.chars.peek().copied() == Some('-') {
-            self.chars.next();
+            self.advance();
             Tok::RedirFdClose { fd }
         } else if self.chars.peek().copied().is_some_and(|c| c.is_ascii_digit()) {
             Tok::RedirFdDup { fd, target: self.read_fd_number() }
@@ -552,7 +589,7 @@ impl<'a> Lexer<'a> {
         while let Some(c) = self.chars.peek().copied() {
             if c.is_ascii_digit() {
                 s.push(c);
-                self.chars.next();
+                self.advance();
             } else {
                 break;
             }
@@ -581,10 +618,14 @@ impl<'a> Lexer<'a> {
     // substitution and (...) subshells -- neither is tokenized/parsed until
     // the substitution actually runs.
     fn capture_balanced_parens(&mut self) -> Result<String, String> {
+        // The opening '(' this call is scoped to was already consumed by
+        // the caller, so `pos` right now is exactly the raw content's
+        // first char index -- see raw_capture_spans's own doc comment.
+        let start = self.pos;
         let mut depth = 1;
         let mut s = String::new();
         loop {
-            match self.chars.next() {
+            match self.advance() {
                 None => return Err("unterminated '('".to_string()),
                 Some('(') => {
                     depth += 1;
@@ -593,6 +634,10 @@ impl<'a> Lexer<'a> {
                 Some(')') => {
                     depth -= 1;
                     if depth == 0 {
+                        // `pos` was just bumped past the closing ')' by the
+                        // advance() above, so pos - 1 is that ')' 's own
+                        // index -- the content's exclusive end.
+                        self.raw_capture_spans.push(start..self.pos - 1);
                         break;
                     }
                     s.push(')');
@@ -600,7 +645,7 @@ impl<'a> Lexer<'a> {
                 Some('\'') => {
                     s.push('\'');
                     loop {
-                        match self.chars.next() {
+                        match self.advance() {
                             None => return Err("unterminated single quote".to_string()),
                             Some('\'') => {
                                 s.push('\'');
@@ -613,7 +658,7 @@ impl<'a> Lexer<'a> {
                 Some('"') => {
                     s.push('"');
                     loop {
-                        match self.chars.next() {
+                        match self.advance() {
                             None => return Err("unterminated double quote".to_string()),
                             Some('"') => {
                                 s.push('"');
@@ -621,7 +666,7 @@ impl<'a> Lexer<'a> {
                             }
                             Some('\\') => {
                                 s.push('\\');
-                                if let Some(n) = self.chars.next() {
+                                if let Some(n) = self.advance() {
                                     s.push(n);
                                 }
                             }
@@ -631,7 +676,7 @@ impl<'a> Lexer<'a> {
                 }
                 Some('\\') => {
                     s.push('\\');
-                    if let Some(n) = self.chars.next() {
+                    if let Some(n) = self.advance() {
                         s.push(n);
                     }
                 }
@@ -647,22 +692,32 @@ impl<'a> Lexer<'a> {
     // closing parens, since it only tracks the depth opened by the second
     // '(').
     fn capture_double_paren(&mut self) -> Result<String, String> {
+        // No separate raw_capture_spans push here: the inner
+        // capture_balanced_parens call below already records the exact
+        // same raw text's span (this function doesn't append anything to
+        // `raw` afterward, just consumes the second closing paren).
         let raw = self.capture_balanced_parens()?;
         if self.chars.peek().copied() == Some(')') {
-            self.chars.next();
+            self.advance();
         }
         Ok(raw)
     }
 
     fn capture_backtick(&mut self) -> Result<String, String> {
+        // Same reasoning as capture_balanced_parens's own `start`: the
+        // opening backtick is already consumed by the caller.
+        let start = self.pos;
         let mut s = String::new();
         loop {
-            match self.chars.next() {
+            match self.advance() {
                 None => return Err("unterminated '`'".to_string()),
-                Some('`') => break,
+                Some('`') => {
+                    self.raw_capture_spans.push(start..self.pos - 1);
+                    break;
+                }
                 Some('\\') => match self.chars.peek().copied() {
                     Some(n) if n == '`' || n == '\\' || n == '$' => {
-                        self.chars.next();
+                        self.advance();
                         s.push(n);
                     }
                     _ => s.push('\\'),
@@ -679,10 +734,10 @@ impl<'a> Lexer<'a> {
     fn read_ansi_c_string(&mut self) -> Result<String, String> {
         let mut s = String::new();
         loop {
-            match self.chars.next() {
+            match self.advance() {
                 None => return Err("unterminated $'...'".to_string()),
                 Some('\'') => break,
-                Some('\\') => match self.chars.next() {
+                Some('\\') => match self.advance() {
                     Some('n') => s.push('\n'),
                     Some('t') => s.push('\t'),
                     Some('r') => s.push('\r'),
@@ -715,9 +770,9 @@ impl<'a> Lexer<'a> {
     fn read_heredoc_delimiter(&mut self) -> (String, bool) {
         match self.chars.peek().copied() {
             Some(q @ ('\'' | '"')) => {
-                self.chars.next();
+                self.advance();
                 let mut s = String::new();
-                while let Some(c) = self.chars.next() {
+                while let Some(c) = self.advance() {
                     if c == q {
                         break;
                     }
@@ -732,7 +787,7 @@ impl<'a> Lexer<'a> {
                         break;
                     }
                     s.push(c);
-                    self.chars.next();
+                    self.advance();
                 }
                 (s, true)
             }
@@ -749,7 +804,7 @@ impl<'a> Lexer<'a> {
             let mut line = String::new();
             let mut saw_newline = false;
             loop {
-                match self.chars.next() {
+                match self.advance() {
                     None => break,
                     Some('\n') => {
                         saw_newline = true;
@@ -774,7 +829,7 @@ impl<'a> Lexer<'a> {
     fn skip_spaces(&mut self) {
         while let Some(c) = self.chars.peek().copied() {
             if c == ' ' || c == '\t' {
-                self.chars.next();
+                self.advance();
             } else {
                 break;
             }
@@ -812,7 +867,7 @@ impl<'a> Lexer<'a> {
             let mut probe = self.chars.clone();
             probe.next();
             if matches!(probe.peek().copied(), None | Some('/') | Some(' ') | Some('\t') | Some('\n')) {
-                self.chars.next();
+                self.advance();
                 chunks.push(Chunk::Var { name: "HOME".to_string(), quoted: false });
             }
         }
@@ -828,22 +883,22 @@ impl<'a> Lexer<'a> {
                 // than a subshell/word boundary, unlike real bash which
                 // gates this behind `shopt -s extglob` (see glob.rs).
                 Some('(') if matches!(buf.chars().last(), Some('@') | Some('!') | Some('+') | Some('*') | Some('?')) => {
-                    self.chars.next();
+                    self.advance();
                     let inner = self.capture_balanced_parens()?;
                     buf.push('(');
                     buf.push_str(&inner);
                     buf.push(')');
                 }
                 Some('|') | Some('(') | Some(')') if relaxed => {
-                    buf.push(self.chars.next().unwrap());
+                    buf.push(self.advance().unwrap());
                 }
                 Some('|') | Some('&') | Some(';') | Some('<') | Some('>') | Some('#') | Some('(') | Some(')') => break,
                 Some('\'') => {
                     plain = false;
-                    self.chars.next();
+                    self.advance();
                     let mut lit = String::new();
                     loop {
-                        match self.chars.next() {
+                        match self.advance() {
                             None => return Err("unterminated single quote".to_string()),
                             Some('\'') => break,
                             Some(c) => lit.push(c),
@@ -863,15 +918,15 @@ impl<'a> Lexer<'a> {
                 }
                 Some('"') => {
                     plain = false;
-                    self.chars.next();
+                    self.advance();
                     let mut lit = String::new();
                     loop {
-                        match self.chars.next() {
+                        match self.advance() {
                             None => return Err("unterminated double quote".to_string()),
                             Some('"') => break,
                             Some('\\') => match self.chars.peek().copied() {
                                 Some(n) if n == '"' || n == '\\' || n == '$' => {
-                                    self.chars.next();
+                                    self.advance();
                                     lit.push(n);
                                 }
                                 _ => lit.push('\\'),
@@ -914,8 +969,8 @@ impl<'a> Lexer<'a> {
                 }
                 Some('\\') => {
                     plain = false;
-                    self.chars.next();
-                    if let Some(n) = self.chars.next() {
+                    self.advance();
+                    if let Some(n) = self.advance() {
                         if !buf.is_empty() {
                             chunks.push(Chunk::Str(std::mem::take(&mut buf)));
                         }
@@ -924,12 +979,12 @@ impl<'a> Lexer<'a> {
                 }
                 Some('$') if self.peek2() == Some('\'') => {
                     plain = false;
-                    self.chars.next(); // '$'
-                    self.chars.next(); // '\''
+                    self.advance(); // '$'
+                    self.advance(); // '\''
                     buf.push_str(&self.read_ansi_c_string()?);
                 }
                 Some('$') => {
-                    self.chars.next();
+                    self.advance();
                     if !buf.is_empty() {
                         chunks.push(Chunk::Str(std::mem::take(&mut buf)));
                     }
@@ -939,14 +994,14 @@ impl<'a> Lexer<'a> {
                 }
                 Some('`') => {
                     plain = false;
-                    self.chars.next();
+                    self.advance();
                     if !buf.is_empty() {
                         chunks.push(Chunk::Str(std::mem::take(&mut buf)));
                     }
                     chunks.push(Chunk::Sub { raw: self.capture_backtick()?, quoted: false });
                 }
                 Some(c) => {
-                    self.chars.next();
+                    self.advance();
                     buf.push(c);
                 }
             }
@@ -973,9 +1028,9 @@ impl<'a> Lexer<'a> {
     // escaped -- see the unquoted `$` case in read_word().
     fn push_var(&mut self, chunks: &mut Vec<Chunk>, buf: &mut String, quoted: bool) -> Result<bool, String> {
         if self.chars.peek().copied() == Some('(') {
-            self.chars.next();
+            self.advance();
             if self.chars.peek().copied() == Some('(') {
-                self.chars.next();
+                self.advance();
                 chunks.push(Chunk::Arith { raw: self.capture_double_paren()?, quoted });
             } else {
                 chunks.push(Chunk::Sub { raw: self.capture_balanced_parens()?, quoted });
@@ -983,10 +1038,10 @@ impl<'a> Lexer<'a> {
             return Ok(true);
         }
         if self.chars.peek().copied() == Some('{') {
-            self.chars.next();
+            self.advance();
             let mut inner = String::new();
             while let Some(c) = self.chars.peek().copied() {
-                self.chars.next();
+                self.advance();
                 if c == '}' {
                     break;
                 }
@@ -1024,13 +1079,13 @@ impl<'a> Lexer<'a> {
 
     fn read_var_name(&mut self) -> String {
         if matches!(self.chars.peek().copied(), Some('?') | Some('#') | Some('@') | Some('*') | Some('$') | Some('!') | Some('-')) {
-            self.chars.next().unwrap().to_string()
+            self.advance().unwrap().to_string()
         } else {
             let mut name = String::new();
             while let Some(c) = self.chars.peek().copied() {
                 if c.is_alphanumeric() || c == '_' {
                     name.push(c);
-                    self.chars.next();
+                    self.advance();
                 } else {
                     break;
                 }
@@ -1038,6 +1093,339 @@ impl<'a> Lexer<'a> {
             name
         }
     }
+}
+
+// One lexed item from tokenize_spanned, carrying its own source range --
+// the highlighting-only sibling of a plain Tok. Deliberately not folded
+// into Tok itself as a `Tok::Comment` variant: keeping comments out of Tok
+// entirely means parser.rs's exhaustive matches over Tok never need to
+// account for a variant the real grammar never produces.
+// Unused outside of this file's own tests until the highlighter (a later
+// stage) becomes the first real caller -- same "build ahead of wiring"
+// staging bishedit's own modules use, just narrowly scoped here rather
+// than a module-wide allow, since lexer.rs is otherwise live execution
+// code where a stray real dead-code warning should still surface.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq)]
+pub enum SpannedItem {
+    Tok(Tok, std::ops::Range<usize>),
+    Comment(std::ops::Range<usize>),
+}
+
+#[allow(dead_code)]
+pub struct SpannedResult {
+    pub items: Vec<SpannedItem>,
+    pub raw_capture_spans: Vec<std::ops::Range<usize>>,
+    // On a lex error, `items` still holds everything collected before the
+    // error point instead of being discarded (unlike tokenize()'s own
+    // Result<_, String>) -- a syntactically incomplete line-in-progress is
+    // the common case while typing in bish's single-line editor, so it
+    // must degrade to "highlighted up to the error point, plain after",
+    // not go fully colorless.
+    pub error: Option<String>,
+}
+
+// A duplicate of tokenize()'s own dispatch loop, not a modification of it
+// -- zero risk to real command execution, since nothing here is on that
+// code path. Kept in lockstep with tokenize() by hand; see that function
+// for arm-by-arm rationale (redirect/heredoc/brace-expansion edge cases
+// etc.), which isn't re-explained here.
+#[allow(dead_code)]
+pub fn tokenize_spanned(src: &str) -> SpannedResult {
+    let mut lexer = Lexer::new(src);
+    let mut items: Vec<SpannedItem> = Vec::new();
+    let mut error: Option<String> = None;
+    'outer: loop {
+        lexer.skip_spaces();
+        let start = lexer.pos;
+        if lexer.regex_operand_next {
+            lexer.regex_operand_next = false;
+            if lexer.chars.peek().is_some() {
+                match lexer.read_word(true, false) {
+                    Ok((word, plain)) => {
+                        if let Some(c @ ('<' | '>')) = lexer.chars.peek().copied() {
+                            error = Some(format!("syntax error near unexpected token `{}'", c));
+                            break;
+                        }
+                        items.push(SpannedItem::Tok(Tok::Word(word, plain), start..lexer.pos));
+                    }
+                    Err(e) => {
+                        error = Some(e);
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        match lexer.chars.peek().copied() {
+            None => break,
+            Some('#') => {
+                while let Some(c) = lexer.chars.peek().copied() {
+                    if c == '\n' {
+                        break;
+                    }
+                    lexer.advance();
+                }
+                items.push(SpannedItem::Comment(start..lexer.pos));
+            }
+            Some('\n') => {
+                lexer.advance();
+                items.push(SpannedItem::Tok(Tok::Newline, start..lexer.pos));
+                if !lexer.pending_heredocs.is_empty() {
+                    let pending = std::mem::take(&mut lexer.pending_heredocs);
+                    for (tok_idx, delim, strip_tabs, expand) in pending {
+                        let body = lexer.capture_heredoc_body(&delim, strip_tabs);
+                        let chunks = if expand {
+                            match expand_heredoc_chunks(&body) {
+                                Ok(c) => c,
+                                Err(e) => {
+                                    error = Some(e);
+                                    break 'outer;
+                                }
+                            }
+                        } else {
+                            vec![Chunk::Str(body)]
+                        };
+                        if let SpannedItem::Tok(t, _) = &mut items[tok_idx] {
+                            *t = Tok::HereDoc(chunks);
+                        }
+                    }
+                }
+            }
+            Some('|') => {
+                lexer.advance();
+                if lexer.chars.peek().copied() == Some('|') {
+                    lexer.advance();
+                    items.push(SpannedItem::Tok(Tok::Or, start..lexer.pos));
+                } else {
+                    items.push(SpannedItem::Tok(Tok::Pipe, start..lexer.pos));
+                }
+            }
+            Some('&') => {
+                lexer.advance();
+                if lexer.chars.peek().copied() == Some('&') {
+                    lexer.advance();
+                    items.push(SpannedItem::Tok(Tok::And, start..lexer.pos));
+                } else if lexer.chars.peek().copied() == Some('>') {
+                    lexer.advance();
+                    let append = lexer.chars.peek().copied() == Some('>');
+                    if append {
+                        lexer.advance();
+                    }
+                    items.push(SpannedItem::Tok(Tok::RedirBoth { append }, start..lexer.pos));
+                } else {
+                    items.push(SpannedItem::Tok(Tok::Amp, start..lexer.pos));
+                }
+            }
+            Some(';') => {
+                lexer.advance();
+                if lexer.chars.peek().copied() == Some(';') {
+                    lexer.advance();
+                    if lexer.chars.peek().copied() == Some('&') {
+                        lexer.advance();
+                        items.push(SpannedItem::Tok(Tok::DSemiAmp, start..lexer.pos));
+                    } else {
+                        items.push(SpannedItem::Tok(Tok::DSemi, start..lexer.pos));
+                    }
+                } else if lexer.chars.peek().copied() == Some('&') {
+                    lexer.advance();
+                    items.push(SpannedItem::Tok(Tok::SemiAmp, start..lexer.pos));
+                } else {
+                    items.push(SpannedItem::Tok(Tok::Semi, start..lexer.pos));
+                }
+            }
+            Some('(') => {
+                lexer.advance();
+                if lexer.chars.peek().copied() == Some('(') {
+                    lexer.advance();
+                    match lexer.capture_double_paren() {
+                        Ok(raw) => items.push(SpannedItem::Tok(Tok::Arith(raw), start..lexer.pos)),
+                        Err(e) => {
+                            error = Some(e);
+                            break;
+                        }
+                    }
+                } else {
+                    match lexer.capture_balanced_parens() {
+                        Ok(raw) => items.push(SpannedItem::Tok(Tok::Subshell(raw), start..lexer.pos)),
+                        Err(e) => {
+                            error = Some(e);
+                            break;
+                        }
+                    }
+                }
+            }
+            Some(')') => {
+                lexer.advance();
+                items.push(SpannedItem::Tok(Tok::RParen, start..lexer.pos));
+            }
+            Some('{') if lexer.next_char_is_word_boundary() => {
+                lexer.advance();
+                items.push(SpannedItem::Tok(Tok::LBrace, start..lexer.pos));
+            }
+            Some('}') if lexer.next_char_is_word_boundary() => {
+                lexer.advance();
+                items.push(SpannedItem::Tok(Tok::RBrace, start..lexer.pos));
+            }
+            Some('>') => {
+                lexer.advance();
+                if lexer.chars.peek().copied() == Some('(') {
+                    lexer.advance();
+                    match lexer.capture_balanced_parens() {
+                        Ok(raw) => items.push(SpannedItem::Tok(
+                            Tok::Word(vec![Chunk::ProcSubOut { raw }], false),
+                            start..lexer.pos,
+                        )),
+                        Err(e) => {
+                            error = Some(e);
+                            break;
+                        }
+                    }
+                    continue;
+                }
+                if lexer.chars.peek().copied() == Some('&') {
+                    lexer.advance();
+                    let tok = lexer.lex_dup_target(1);
+                    items.push(SpannedItem::Tok(tok, start..lexer.pos));
+                    continue;
+                }
+                let append = lexer.chars.peek().copied() == Some('>');
+                if append {
+                    lexer.advance();
+                }
+                items.push(SpannedItem::Tok(Tok::RedirOut { append }, start..lexer.pos));
+            }
+            Some('<') => {
+                lexer.advance();
+                if lexer.chars.peek().copied() == Some('(') {
+                    lexer.advance();
+                    match lexer.capture_balanced_parens() {
+                        Ok(raw) => items.push(SpannedItem::Tok(
+                            Tok::Word(vec![Chunk::ProcSubIn { raw }], false),
+                            start..lexer.pos,
+                        )),
+                        Err(e) => {
+                            error = Some(e);
+                            break;
+                        }
+                    }
+                    continue;
+                }
+                if lexer.chars.peek().copied() == Some('&') {
+                    lexer.advance();
+                    let tok = lexer.lex_dup_target(0);
+                    items.push(SpannedItem::Tok(tok, start..lexer.pos));
+                    continue;
+                }
+                if lexer.chars.peek().copied() == Some('<') {
+                    lexer.advance();
+                    if lexer.chars.peek().copied() == Some('<') {
+                        lexer.advance();
+                        items.push(SpannedItem::Tok(Tok::HereString, start..lexer.pos));
+                    } else {
+                        let strip_tabs = lexer.chars.peek().copied() == Some('-');
+                        if strip_tabs {
+                            lexer.advance();
+                        }
+                        lexer.skip_spaces();
+                        let (delim, expand) = lexer.read_heredoc_delimiter();
+                        let tok_idx = items.len();
+                        items.push(SpannedItem::Tok(Tok::HereDoc(vec![Chunk::Str(String::new())]), start..lexer.pos));
+                        lexer.pending_heredocs.push((tok_idx, delim, strip_tabs, expand));
+                    }
+                } else {
+                    items.push(SpannedItem::Tok(Tok::RedirIn, start..lexer.pos));
+                }
+            }
+            Some('2') if lexer.peek_is_fd2_redirect() => {
+                lexer.advance(); // '2'
+                lexer.advance(); // '>'
+                if lexer.chars.peek().copied() == Some('&') && lexer.peek2() == Some('1') {
+                    lexer.advance(); // '&'
+                    lexer.advance(); // '1'
+                    items.push(SpannedItem::Tok(Tok::DupErrToOut, start..lexer.pos));
+                } else {
+                    let append = lexer.chars.peek().copied() == Some('>');
+                    if append {
+                        lexer.advance();
+                    }
+                    items.push(SpannedItem::Tok(Tok::RedirErr { append }, start..lexer.pos));
+                }
+            }
+            Some(c) if c.is_ascii_digit() && lexer.peek_numbered_fd_redirect().is_some() => {
+                let (fd, ndigits) = lexer.peek_numbered_fd_redirect().unwrap();
+                for _ in 0..ndigits {
+                    lexer.advance();
+                }
+                match lexer.advance() {
+                    Some('>') => {
+                        if lexer.chars.peek().copied() == Some('&') {
+                            lexer.advance();
+                            let tok = lexer.lex_dup_target(fd);
+                            items.push(SpannedItem::Tok(tok, start..lexer.pos));
+                        } else {
+                            let append = lexer.chars.peek().copied() == Some('>');
+                            if append {
+                                lexer.advance();
+                            }
+                            items.push(SpannedItem::Tok(Tok::RedirFdOut { fd, append }, start..lexer.pos));
+                        }
+                    }
+                    Some('<') => {
+                        if lexer.chars.peek().copied() == Some('&') {
+                            lexer.advance();
+                            let tok = lexer.lex_dup_target(fd);
+                            items.push(SpannedItem::Tok(tok, start..lexer.pos));
+                        } else {
+                            items.push(SpannedItem::Tok(Tok::RedirFdIn { fd }, start..lexer.pos));
+                        }
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            _ => match lexer.read_word(false, false) {
+                Ok((word, plain)) => {
+                    if plain {
+                        if let [Chunk::Str(s)] = word.as_slice() {
+                            if let Some(kw) = keyword(s) {
+                                match kw {
+                                    Tok::KwLBracket2 => lexer.bracket2_depth += 1,
+                                    Tok::KwRBracket2 => lexer.bracket2_depth = lexer.bracket2_depth.saturating_sub(1),
+                                    _ => {}
+                                }
+                                items.push(SpannedItem::Tok(kw, start..lexer.pos));
+                                continue;
+                            }
+                            if lexer.bracket2_depth > 0 && s == "=~" {
+                                lexer.regex_operand_next = true;
+                            }
+                            if s.contains('{') {
+                                let expanded = brace_expand(s);
+                                if expanded.len() > 1 || expanded[0] != *s {
+                                    // Every token expanded from one
+                                    // `{a,b,c}` source region shares that
+                                    // region's full original span rather
+                                    // than being subdivided -- the whole
+                                    // expression highlights as one unit.
+                                    let end = lexer.pos;
+                                    for e in expanded {
+                                        items.push(SpannedItem::Tok(Tok::Word(vec![Chunk::Str(e)], true), start..end));
+                                    }
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                    items.push(SpannedItem::Tok(Tok::Word(word, plain), start..lexer.pos));
+                }
+                Err(e) => {
+                    error = Some(e);
+                    break;
+                }
+            },
+        }
+    }
+    SpannedResult { items, raw_capture_spans: lexer.raw_capture_spans, error }
 }
 
 // Parses the operator-word text of a `${...}` construct (the pattern in
@@ -1426,5 +1814,77 @@ mod tests {
             parse_expansion_word("hello $v"),
             vec![Chunk::Str("hello ".to_string()), Chunk::Var { name: "v".to_string(), quoted: false }]
         );
+    }
+
+    fn spanned_text<'a>(src: &'a str, r: &std::ops::Range<usize>) -> &'a str {
+        let chars: Vec<char> = src.chars().collect();
+        &src[chars[..r.start].iter().map(|c| c.len_utf8()).sum()
+            ..chars[..r.end].iter().map(|c| c.len_utf8()).sum()]
+    }
+
+    #[test]
+    fn tokenize_spanned_comment_gets_its_own_span_to_end_of_line() {
+        let src = "echo hi # a comment";
+        let res = tokenize_spanned(src);
+        assert_eq!(res.error, None);
+        let comment = res.items.iter().find_map(|it| match it {
+            SpannedItem::Comment(r) => Some(r.clone()),
+            _ => None,
+        });
+        let r = comment.expect("expected a Comment item");
+        assert_eq!(spanned_text(src, &r), "# a comment");
+    }
+
+    #[test]
+    fn tokenize_spanned_unterminated_paren_keeps_partial_items_and_sets_error() {
+        let src = "echo $(foo";
+        let res = tokenize_spanned(src);
+        assert!(res.error.is_some());
+        // "echo" was fully lexed before the unterminated $( was hit.
+        assert!(res.items.iter().any(|it| matches!(it, SpannedItem::Tok(Tok::Word(w, true), _) if w == &vec![Chunk::Str("echo".to_string())])));
+    }
+
+    #[test]
+    fn tokenize_spanned_nested_quote_inside_substitution_recurses_via_raw_capture_spans() {
+        // The user's own motivating example: the single-quoted string
+        // inside $(...) must be independently re-lexable from its own
+        // recorded raw_capture_spans entry, not flattened into one span.
+        let src = "echo \"yooo, $(printf 'hello %' world)\"";
+        let res = tokenize_spanned(src);
+        assert_eq!(res.error, None);
+        assert_eq!(res.raw_capture_spans.len(), 1);
+        let sub_span = &res.raw_capture_spans[0];
+        let inner_src = spanned_text(src, sub_span);
+        assert_eq!(inner_src, "printf 'hello %' world");
+        // Re-lexing just the captured raw text independently finds its own
+        // quoted string -- this is the recursion mechanism the future
+        // BashHighlighter relies on.
+        let inner = tokenize_spanned(inner_src);
+        assert_eq!(inner.error, None);
+        assert!(inner.items.iter().any(|it| matches!(
+            it,
+            SpannedItem::Tok(Tok::Word(w, false), _)
+                if w.iter().any(|c| matches!(c, Chunk::LiteralStr(s) if s == "hello %"))
+        )));
+    }
+
+    #[test]
+    fn tokenize_spanned_arithmetic_gets_one_flat_span_no_recursion_artifacts() {
+        let src = "echo $((1 + 2))";
+        let res = tokenize_spanned(src);
+        assert_eq!(res.error, None);
+        // $((...)) is captured via capture_double_paren wrapping a single
+        // capture_balanced_parens call -- exactly one raw-capture span,
+        // not two (capture_double_paren must not push its own on top).
+        assert_eq!(res.raw_capture_spans.len(), 1);
+        assert_eq!(spanned_text(src, &res.raw_capture_spans[0]), "1 + 2");
+        let word = res.items.iter().find_map(|it| match it {
+            SpannedItem::Tok(Tok::Word(w, _), _) if matches!(w.as_slice(), [Chunk::Arith { .. }]) => Some(w.clone()),
+            _ => None,
+        });
+        match word.expect("expected a Word token with a Chunk::Arith").as_slice() {
+            [Chunk::Arith { raw, .. }] => assert_eq!(raw, "1 + 2"),
+            other => panic!("expected a single flat Chunk::Arith, got {:?}", other),
+        }
     }
 }
