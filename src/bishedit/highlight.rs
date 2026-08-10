@@ -183,16 +183,122 @@ fn highlight_into(text: &str, offset: usize, cwd: Option<&Path>, out: &mut Vec<H
     let chars: Vec<char> = text.chars().collect();
     let res = lexer::tokenize_spanned(text);
     let mut cursor = 0usize;
+    // Fresh per call -- every recursion level ($(...), backtick,
+    // <(...)/>(...), a (...) subshell) gets its own independent command
+    // context, never inherited from the enclosing command (e.g. `git
+    // commit $(echo -m)` starts a wholly new command inside the
+    // substitution).
+    let mut cmd_pos = CmdPos::ExpectCommand;
     for item in &res.items {
         match item {
             SpannedItem::Comment(r) => {
                 out.push(HighlightSpan { start: offset + r.start, end: offset + r.end, kind: HighlightKind::Comment, link: None });
             }
             SpannedItem::Tok(tok, span) => {
-                highlight_tok(tok, span, offset, &chars, &res.raw_capture_spans, &mut cursor, cwd, out);
+                highlight_tok(tok, span, offset, &chars, &res.raw_capture_spans, &mut cursor, cwd, &mut cmd_pos, out);
             }
         }
     }
+}
+
+// Which command-name/argument-position state a word is in, resolved from
+// `CmdPos` right before it's processed.
+enum WordRole {
+    // A leading NAME=value/NAME+=value word before the real command name
+    // -- doesn't itself get classified as a command name or argument.
+    AssignmentPrefix,
+    CommandName,
+    // `command`: the resolved command name, if the command-name word was
+    // itself a plain [Chunk::Str(_)] (None for e.g. `$CMD arg` -- no
+    // static name to look anything up against). `arg_index` is 0-based,
+    // counting only real argument words (not the command name itself).
+    Argument { command: Option<String>, arg_index: usize },
+}
+
+#[derive(Clone)]
+enum CmdPos {
+    ExpectCommand,
+    InCommand { name: Option<String>, arg_index: usize },
+}
+
+// Whether encountering this token means "a new simple command can start
+// right after this" -- i.e. resets CmdPos back to ExpectCommand. Closing
+// tokens (RBrace, RParen, KwFi, KwDone, KwLBracket2, KwRBracket2) do NOT
+// reset -- they end a group/test-expression, not start a new command list
+// on their own; a new command still needs its own `;`/`&&`/newline/etc
+// after them first. Factored out as its own pure function (rather than
+// splitting highlight_tok's existing per-kind match arms) so the reset
+// rule itself is directly unit-testable without needing to drive the
+// whole highlighter.
+fn resets_command_position(tok: &Tok) -> bool {
+    matches!(
+        tok,
+        Tok::Pipe
+            | Tok::And
+            | Tok::Or
+            | Tok::Semi
+            | Tok::DSemi
+            | Tok::SemiAmp
+            | Tok::DSemiAmp
+            | Tok::Amp
+            | Tok::LBrace
+            | Tok::Newline
+            | Tok::KwIf
+            | Tok::KwThen
+            | Tok::KwElif
+            | Tok::KwElse
+            | Tok::KwDo
+            | Tok::KwWhile
+            | Tok::KwUntil
+            | Tok::KwFor
+            | Tok::KwSelect
+            | Tok::KwCoproc
+            | Tok::KwIn
+            | Tok::KwCase
+            | Tok::KwEsac
+            | Tok::KwFunction
+    )
+}
+
+fn is_valid_ident(s: &str) -> bool {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+// `NAME=value` / `NAME+=value` shape -- a hand-duplicated check (rather
+// than reusing parser.rs's own word_as_assignment) since that operates on
+// a fully-parsed Word/Chunk shape from a different code path; this stays
+// consistent with this crate's existing precedent of a small duplicated
+// helper over coupling the editor-analysis path to the execution path
+// (tokenize_spanned's own relationship to tokenize() is the same idea).
+fn is_assignment_prefix_word(chunks: &[Chunk]) -> bool {
+    let [Chunk::Str(s)] = chunks else { return false };
+    let Some(eq) = s.find('=') else { return false };
+    let name = s[..eq].strip_suffix('+').unwrap_or(&s[..eq]);
+    is_valid_ident(name)
+}
+
+// Stub for now -- filled in by a later stage (man-page-driven flag/
+// subcommand recognition, then a file/dir Link fallback).
+fn classify_plain_argument(
+    _text: &str,
+    _word_span: &Range<usize>,
+    _command: &str,
+    _arg_index: usize,
+    _cwd: Option<&Path>,
+    _offset: usize,
+) -> Option<HighlightSpan> {
+    None
+}
+
+// Stub for now -- filled in by a later stage (printf's %s/%d/etc
+// format-directive highlighting inside its own format-string argument).
+fn builtin_refine(_command: &str, _arg_index: usize, _raw_text: &[char]) -> Vec<(Range<usize>, HighlightKind)> {
+    Vec::new()
 }
 
 fn highlight_tok(
@@ -203,8 +309,12 @@ fn highlight_tok(
     raw_spans: &[Range<usize>],
     cursor: &mut usize,
     cwd: Option<&Path>,
+    cmd_pos: &mut CmdPos,
     out: &mut Vec<HighlightSpan>,
 ) {
+    if resets_command_position(tok) {
+        *cmd_pos = CmdPos::ExpectCommand;
+    }
     let whole = |kind: HighlightKind| HighlightSpan { start: offset + span.start, end: offset + span.end, kind, link: None };
     match tok {
         Tok::KwIf
@@ -272,25 +382,55 @@ fn highlight_tok(
             out.push(whole(HighlightKind::Substitution));
         }
 
-        Tok::Word(chunks, _plain) => highlight_word(chunks, offset, chars, raw_spans, cursor, cwd, out),
+        Tok::Word(chunks, _plain) => highlight_word(chunks, span, offset, chars, raw_spans, cursor, cwd, cmd_pos, out),
     }
 }
 
 // An all-plain word ([Chunk::Str(_)], the common unquoted case with no
-// quoting/escaping/expansion at all) stays uncolored; otherwise each chunk
-// is walked in order, consuming one raw_capture_spans entry per non-Str
-// chunk (see that field's own doc comment in lexer.rs for the exact
-// invariant this relies on).
+// quoting/escaping/expansion at all) is checked against classify_plain_
+// argument (flags/subcommands/file-links -- a later stage) instead of
+// just staying uncolored; otherwise each chunk is walked in order,
+// consuming one raw_capture_spans entry per non-Str chunk (see that
+// field's own doc comment in lexer.rs for the exact invariant this relies
+// on), with LiteralStr chunks additionally offered to builtin_refine
+// (printf's %s/%d/etc -- also a later stage).
+//
+// `cmd_pos` is resolved into this word's own WordRole *before* the
+// all-plain fast path, since both branches need to know it: is this word
+// a leading NAME=value assignment (doesn't advance past ExpectCommand),
+// the command name itself (advances to InCommand), or the Nth argument
+// of an already-known command.
 fn highlight_word(
     chunks: &[Chunk],
+    word_span: &Range<usize>,
     offset: usize,
     chars: &[char],
     raw_spans: &[Range<usize>],
     cursor: &mut usize,
     cwd: Option<&Path>,
+    cmd_pos: &mut CmdPos,
     out: &mut Vec<HighlightSpan>,
 ) {
-    if let [Chunk::Str(_)] = chunks {
+    let role = match cmd_pos {
+        CmdPos::ExpectCommand if is_assignment_prefix_word(chunks) => WordRole::AssignmentPrefix,
+        CmdPos::ExpectCommand => {
+            let name = if let [Chunk::Str(s)] = chunks { Some(s.clone()) } else { None };
+            *cmd_pos = CmdPos::InCommand { name, arg_index: 0 };
+            WordRole::CommandName
+        }
+        CmdPos::InCommand { name, arg_index } => {
+            let role = WordRole::Argument { command: name.clone(), arg_index: *arg_index };
+            *arg_index += 1;
+            role
+        }
+    };
+
+    if let [Chunk::Str(s)] = chunks {
+        if let WordRole::Argument { command: Some(cmd), arg_index } = &role {
+            if let Some(span) = classify_plain_argument(s, word_span, cmd, *arg_index, cwd, offset) {
+                out.push(span);
+            }
+        }
         return;
     }
     for chunk in chunks {
@@ -300,6 +440,12 @@ fn highlight_word(
             Chunk::LiteralStr(_) => {
                 if let Some(r) = next_span(raw_spans, cursor) {
                     out.push(HighlightSpan { start: offset + r.start, end: offset + r.end, kind: HighlightKind::String, link: None });
+                    if let WordRole::Argument { command: Some(cmd), arg_index } = &role {
+                        let raw_slice = &chars[r.start..r.end];
+                        for (sub, kind) in builtin_refine(cmd, *arg_index, raw_slice) {
+                            out.push(HighlightSpan { start: offset + r.start + sub.start, end: offset + r.start + sub.end, kind, link: None });
+                        }
+                    }
                 }
             }
 
@@ -598,5 +744,75 @@ mod tests {
         ] {
             let _ = default_style(kind);
         }
+    }
+
+    fn tok(word: &str) -> Tok {
+        // Small helper for resets_command_position tests -- lexes just
+        // enough to get a real Tok of the right variant without hardcoding
+        // every enum's exact field shape by hand.
+        match lexer::Lexer::new(word).tokenize() {
+            Ok(mut toks) if toks.len() == 1 => toks.pop().unwrap(),
+            other => panic!("expected exactly one token from {word:?}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resets_command_position_on_separators_and_command_list_keywords() {
+        for src in ["|", "||", "&&", ";", ";;", "&", "{", "if", "then", "do", "while", "for"] {
+            assert!(resets_command_position(&tok(src)), "expected {src:?} to reset command position");
+        }
+        assert!(resets_command_position(&Tok::Newline));
+    }
+
+    #[test]
+    fn does_not_reset_command_position_on_closing_tokens() {
+        for src in ["}", ")", "fi", "done"] {
+            assert!(!resets_command_position(&tok(src)), "expected {src:?} to NOT reset command position");
+        }
+    }
+
+    #[test]
+    fn does_not_reset_command_position_on_an_ordinary_word() {
+        assert!(!resets_command_position(&tok("echo")));
+    }
+
+    #[test]
+    fn is_valid_ident_accepts_typical_shell_variable_names() {
+        assert!(is_valid_ident("FOO"));
+        assert!(is_valid_ident("_foo123"));
+        assert!(!is_valid_ident(""));
+        assert!(!is_valid_ident("1FOO")); // leading digit
+        assert!(!is_valid_ident("FOO-BAR")); // hyphen not allowed
+    }
+
+    fn plain_chunks(s: &str) -> Vec<Chunk> {
+        vec![Chunk::Str(s.to_string())]
+    }
+
+    #[test]
+    fn is_assignment_prefix_word_recognizes_name_equals_and_name_plus_equals() {
+        assert!(is_assignment_prefix_word(&plain_chunks("FOO=bar")));
+        assert!(is_assignment_prefix_word(&plain_chunks("FOO+=bar")));
+        assert!(is_assignment_prefix_word(&plain_chunks("FOO=")));
+    }
+
+    #[test]
+    fn is_assignment_prefix_word_rejects_invalid_shapes() {
+        assert!(!is_assignment_prefix_word(&plain_chunks("1FOO=bar"))); // invalid ident
+        assert!(!is_assignment_prefix_word(&plain_chunks("echo"))); // no '='
+        assert!(!is_assignment_prefix_word(&plain_chunks("=bar"))); // empty name
+        // Not a single plain Chunk::Str -- e.g. a word containing an
+        // expansion -- never counts as an assignment prefix here.
+        assert!(!is_assignment_prefix_word(&[Chunk::Var { name: "FOO".to_string(), quoted: false }]));
+    }
+
+    #[test]
+    fn command_name_and_argument_positions_are_not_colored_yet_since_stubs_return_nothing() {
+        // classify_plain_argument/builtin_refine are still stubs at this
+        // stage (real logic lands in later stages) -- this just confirms
+        // the state-machine wiring itself doesn't produce spurious output
+        // or panic for a representative line exercising every WordRole:
+        // an assignment prefix, a command name, and two arguments.
+        assert_eq!(kinds("FOO=bar echo one two"), vec![]);
     }
 }
