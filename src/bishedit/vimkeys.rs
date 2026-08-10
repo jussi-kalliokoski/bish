@@ -27,6 +27,17 @@ pub enum KeyOutcome {
     /// to the 5th tab" (count `Some(5)`), while bare `<C-w>gg`/`<C-w>G`
     /// (count `None`) default to the first/last tab respectively.
     Window(WindowCmd, Option<usize>),
+    /// `i`/`a`/`I`/`A`/`s`/`S`/`C`: vim's canonical normal-to-insert entry
+    /// commands. Not a `Motion` -- these don't move a cursor by themselves,
+    /// they tell the caller "stop navigating, resume editing text, and use
+    /// `apply_insert_cmd` (below) to work out exactly where/what changes
+    /// first" -- so, like `Window`, the caller applies this against
+    /// whatever it considers "the buffer" (which may not even be the same
+    /// `Buffer` a `Motion` was just applied to -- see apply_insert_cmd's own
+    /// doc comment). Any count typed before one of these (`3i`) is silently
+    /// discarded, same as it would be for a key `feed_fresh` doesn't
+    /// otherwise recognize -- there's no insert-repeat-on-exit support yet.
+    EnterInsert(InsertCmd),
     /// The key was consumed as part of an in-progress sequence (a count
     /// digit, or a prefix awaiting its next character); no motion yet.
     Pending,
@@ -34,6 +45,59 @@ pub enum KeyOutcome {
     /// in-progress count/prefix is discarded, matching vim's behavior of
     /// dropping a pending command on an invalid continuation.
     None,
+}
+
+/// `i`/`a`/`I`/`A`/`s`/`S`/`C` -- see `KeyOutcome::EnterInsert`'s own doc
+/// comment for why these are a distinct outcome rather than `Motion`s.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InsertCmd {
+    /// `i` -- insert before the cursor (i.e. resume exactly where it is).
+    Before,
+    /// `a` -- insert after the cursor.
+    After,
+    /// `I` -- insert at the start of the line.
+    LineStart,
+    /// `A` -- insert at the end of the line.
+    LineEnd,
+    /// `s` -- delete the character under the cursor, insert in its place.
+    SubstituteChar,
+    /// `S` -- clear the whole line, insert from its (now empty) start.
+    SubstituteLine,
+    /// `C` -- delete from the cursor to the end of the line, insert there.
+    ChangeToEnd,
+}
+
+/// The actual text/cursor transformation for one `InsertCmd`, against a
+/// plain `[char]` slice -- deliberately not tied to any particular `Buffer`
+/// impl (unlike `Motion`/`apply_motion`, `Buffer` has no mutation methods
+/// yet -- see bishedit's own module doc comment) or to `editor::LineEditor`
+/// specifically, so every frontend that wants real insert-entry semantics
+/// (editor.rs's own line-local Ctrl-E mode, applied to the *live* cursor;
+/// repl.rs's full-pane Ctrl+Space mode, applied to a *frozen original*
+/// cursor a navigation excursion doesn't move) shares this one
+/// implementation instead of each re-deriving the same seven cases.
+pub fn apply_insert_cmd(text: &[char], cursor: usize, cmd: InsertCmd) -> (Vec<char>, usize) {
+    let cursor = cursor.min(text.len());
+    match cmd {
+        InsertCmd::Before => (text.to_vec(), cursor),
+        InsertCmd::After => (text.to_vec(), (cursor + 1).min(text.len())),
+        InsertCmd::LineStart => (text.to_vec(), 0),
+        InsertCmd::LineEnd => (text.to_vec(), text.len()),
+        InsertCmd::SubstituteChar => {
+            let mut new_text = text.to_vec();
+            if cursor < new_text.len() {
+                new_text.remove(cursor);
+            }
+            (new_text, cursor)
+        }
+        InsertCmd::SubstituteLine => (Vec::new(), 0),
+        InsertCmd::ChangeToEnd => {
+            let mut new_text = text.to_vec();
+            new_text.truncate(cursor);
+            let len = new_text.len();
+            (new_text, len)
+        }
+    }
 }
 
 /// `<C-w>{cmd}`: the same single-letter window shortcuts the shell's own
@@ -185,6 +249,16 @@ impl VimKeys {
         KeyOutcome::Window(cmd, count)
     }
 
+    // Unlike emit()/emit_window(), the count is dropped rather than
+    // returned -- see KeyOutcome::EnterInsert's own doc comment on why a
+    // leading count on an insert-entry command has no effect yet.
+    fn emit_insert(&mut self, cmd: InsertCmd) -> KeyOutcome {
+        self.count = None;
+        self.pending = Pending::None;
+        self.last_completed = std::mem::take(&mut self.current_input);
+        KeyOutcome::EnterInsert(cmd)
+    }
+
     fn abort(&mut self) -> KeyOutcome {
         self.count = None;
         self.pending = Pending::None;
@@ -293,6 +367,13 @@ impl VimKeys {
                 self.pending = Pending::Window;
                 KeyOutcome::Pending
             }
+            Key::Char('i') => self.emit_insert(InsertCmd::Before),
+            Key::Char('a') => self.emit_insert(InsertCmd::After),
+            Key::Char('I') => self.emit_insert(InsertCmd::LineStart),
+            Key::Char('A') => self.emit_insert(InsertCmd::LineEnd),
+            Key::Char('s') => self.emit_insert(InsertCmd::SubstituteChar),
+            Key::Char('S') => self.emit_insert(InsertCmd::SubstituteLine),
+            Key::Char('C') => self.emit_insert(InsertCmd::ChangeToEnd),
             _ => self.abort(),
         }
     }
@@ -893,5 +974,93 @@ mod tests {
         vk.feed(Key::Char('g'));
         assert_eq!(vk.pending_display(), "");
         assert_eq!(vk.last_motion_display(), "^W5gg");
+    }
+
+    #[test]
+    fn insert_entry_commands() {
+        let cases = [
+            ('i', InsertCmd::Before),
+            ('a', InsertCmd::After),
+            ('I', InsertCmd::LineStart),
+            ('A', InsertCmd::LineEnd),
+            ('s', InsertCmd::SubstituteChar),
+            ('S', InsertCmd::SubstituteLine),
+            ('C', InsertCmd::ChangeToEnd),
+        ];
+        for (ch, cmd) in cases {
+            let mut vk = VimKeys::new();
+            assert_eq!(vk.feed(Key::Char(ch)), KeyOutcome::EnterInsert(cmd));
+        }
+    }
+
+    #[test]
+    fn insert_entry_discards_a_leading_count() {
+        let mut vk = VimKeys::new();
+        assert_eq!(vk.feed(Key::Char('3')), KeyOutcome::Pending);
+        assert_eq!(vk.feed(Key::Char('i')), KeyOutcome::EnterInsert(InsertCmd::Before));
+        // and doesn't leak into whatever comes next either
+        assert_eq!(vk.feed(Key::Char('w')), KeyOutcome::Motion(Motion::WordForward, None));
+    }
+
+    #[test]
+    fn insert_entry_resets_pending_state_the_same_as_emit() {
+        let mut vk = VimKeys::new();
+        vk.feed(Key::Char('2')); // count prefix
+        assert_eq!(vk.feed(Key::Char('A')), KeyOutcome::EnterInsert(InsertCmd::LineEnd));
+        assert_eq!(vk.pending_display(), "");
+        assert_eq!(vk.last_motion_display(), "2A");
+    }
+
+    #[test]
+    fn apply_insert_cmd_before_and_after_only_move_the_cursor() {
+        let text: Vec<char> = "hello".chars().collect();
+        assert_eq!(apply_insert_cmd(&text, 2, InsertCmd::Before), (text.clone(), 2));
+        assert_eq!(apply_insert_cmd(&text, 2, InsertCmd::After), (text.clone(), 3));
+        // After at the very end clamps rather than running past it
+        assert_eq!(apply_insert_cmd(&text, 5, InsertCmd::After), (text.clone(), 5));
+    }
+
+    #[test]
+    fn apply_insert_cmd_line_start_and_end() {
+        let text: Vec<char> = "hello".chars().collect();
+        assert_eq!(apply_insert_cmd(&text, 3, InsertCmd::LineStart), (text.clone(), 0));
+        assert_eq!(apply_insert_cmd(&text, 1, InsertCmd::LineEnd), (text.clone(), 5));
+    }
+
+    #[test]
+    fn apply_insert_cmd_substitute_char_removes_one_char_at_cursor() {
+        let text: Vec<char> = "hello".chars().collect();
+        let (result, cursor) = apply_insert_cmd(&text, 1, InsertCmd::SubstituteChar);
+        assert_eq!(result.iter().collect::<String>(), "hllo");
+        assert_eq!(cursor, 1);
+        // at the end, nothing to remove -- cursor stays put, text unchanged
+        let (result, cursor) = apply_insert_cmd(&text, 5, InsertCmd::SubstituteChar);
+        assert_eq!(result.iter().collect::<String>(), "hello");
+        assert_eq!(cursor, 5);
+    }
+
+    #[test]
+    fn apply_insert_cmd_substitute_line_clears_everything() {
+        let text: Vec<char> = "hello".chars().collect();
+        let (result, cursor) = apply_insert_cmd(&text, 3, InsertCmd::SubstituteLine);
+        assert!(result.is_empty());
+        assert_eq!(cursor, 0);
+    }
+
+    #[test]
+    fn apply_insert_cmd_change_to_end_truncates_from_cursor() {
+        let text: Vec<char> = "hello".chars().collect();
+        let (result, cursor) = apply_insert_cmd(&text, 2, InsertCmd::ChangeToEnd);
+        assert_eq!(result.iter().collect::<String>(), "he");
+        assert_eq!(cursor, 2);
+    }
+
+    #[test]
+    fn apply_insert_cmd_clamps_an_out_of_range_cursor() {
+        let text: Vec<char> = "hi".chars().collect();
+        // cursor well past the end of a short line shouldn't panic
+        let (result, cursor) = apply_insert_cmd(&text, 99, InsertCmd::SubstituteChar);
+        assert_eq!(result.iter().collect::<String>(), "hi");
+        assert_eq!(cursor, 2);
     }
 }

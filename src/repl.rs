@@ -291,6 +291,11 @@ pub fn run(mut shell: Shell) {
     // session's sink is Real until then, matching today's plain behavior
     // exactly when `:`/`window` are never invoked.
     let mut sinks_are_grid = false;
+    // Set only when run_normal_mode_navigation returns text/cursor to
+    // resume editing with (see its own doc comment) -- consumed by the
+    // very next editor::read_line call below, then left None again for
+    // every ordinary iteration.
+    let mut pending_initial: Option<(String, usize)> = None;
 
     loop {
         // Polled once per loop iteration rather than truly asynchronously:
@@ -357,7 +362,7 @@ pub fn run(mut shell: Shell) {
         // comment on what a clone/fork actually shares).
         let session_history = sessions[&session_id].history.clone();
 
-        match editor::read_line(&prompt_str, &session_history, false, false, col_origin, width, || {
+        match editor::read_line(&prompt_str, &session_history, false, false, pending_initial.take(), col_origin, width, || {
             service_background_jobs(&mut sessions, &mut windows, &mut job_frames, current_window);
         }) {
             Ok(ReadOutcome::Eof) => {
@@ -456,9 +461,9 @@ pub fn run(mut shell: Shell) {
                     compositor_redraw(&sessions, &windows, current_window, term_rows, term_cols);
                 }
             }
-            Ok(ReadOutcome::NormalMode) => {
+            Ok(ReadOutcome::NormalMode { text, cursor }) => {
                 ensure_promoted(&mut sessions, &mut sinks_are_grid);
-                if let Err(e) = run_normal_mode_navigation(
+                match run_normal_mode_navigation(
                     session_id,
                     &mut sessions,
                     &mut windows,
@@ -468,11 +473,16 @@ pub fn run(mut shell: Shell) {
                     &mut sinks_are_grid,
                     &mut job_frames,
                     &mut cmd_history,
+                    text,
+                    cursor,
                     term_rows,
                     term_cols,
                 ) {
-                    sessions.get(&session_id).unwrap().shell.sink_err(&format!("bish: error reading input: {}\n", e));
-                    break;
+                    Ok(resume) => pending_initial = resume,
+                    Err(e) => {
+                        sessions.get(&session_id).unwrap().shell.sink_err(&format!("bish: error reading input: {}\n", e));
+                        break;
+                    }
                 }
             }
             Ok(ReadOutcome::Line(line)) => {
@@ -1059,6 +1069,23 @@ fn freeze_idle_prompt(session: &mut SessionState) {
     let prompt_str = if session.buffer.is_empty() { prompt::render(&session.shell) } else { prompt::continuation() };
     let framed = format!("\r\x1b[K{}", prompt_str);
     session.screen.borrow_mut().feed(framed.as_bytes());
+}
+
+// Same idea as freeze_idle_prompt, but also feeds `text` -- the
+// in-progress, not-yet-submitted buffer content -- right after the
+// prompt, so run_normal_mode_navigation's pane view shows exactly what's
+// already been typed instead of just the bare prompt (see editor::
+// ReadOutcome::NormalMode's own doc comment: Ctrl+Space is no longer
+// empty-buffer-only). Returns the prompt string it used, so the caller
+// can compute `editor::visible_len` on it to know which column `text`
+// actually starts at (needed to position the resulting ScreenBuffer's
+// cursor correctly -- this function only feeds bytes into the grid, it
+// doesn't touch any ScreenBuffer itself).
+fn freeze_input_with_text(session: &mut SessionState, text: &str) -> String {
+    let prompt_str = if session.buffer.is_empty() { prompt::render(&session.shell) } else { prompt::continuation() };
+    let framed = format!("\r\x1b[K{}{}", prompt_str, text);
+    session.screen.borrow_mut().feed(framed.as_bytes());
+    prompt_str
 }
 
 // Finds `target`'s Leaf within the tree and turns it into a 2-way
@@ -2212,37 +2239,53 @@ enum PendingView {
     Transcript,
 }
 
-// bishedit M1's first (and, so far, only) consumer: Ctrl+Space at an
-// empty prompt buffer (editor::ReadOutcome::NormalMode) enters this --
-// read-only cursor navigation over the focused pane's own rendered
-// content (scrollback included), vim's normal-mode motions applied via
-// bishedit::motion/vimkeys. `i` returns to the live prompt, same as vim.
-// `:` hands off to the real command-mode feature (handle_command_mode --
-// the same one the M10c job-detach path uses) -- the only way command
-// mode is reached now that the old direct ':'-at-the-shell-prompt
-// shortcut is gone (see editor::ReadOutcome's own doc comment). `ZZ` and
-// typing exactly "q"/"q!" as a command both exit normal mode -- `ZZ`
-// directly here, "q"/"q!" via run_command_mode special-casing them as
-// vim's own Ex quit commands rather than trying to run them as shell
-// builtins (see its own doc comment). Cancelling out of the command
-// line (Ctrl-C/Esc/empty-Backspace/empty-Enter) returns to this
-// navigation instead, matching real vim staying in Normal mode after an
-// aborted ':' command. An ordinary command that actually ran
-// (CommandModeOutcome::Ran) also returns to this navigation -- command
-// mode itself is one-shot again (see its own doc comment) -- but keeps
-// that command's result on screen as a PendingView::Output overlay
-// until the very next keypress, per this session's own "go back to the
-// original mode with the last output shown until next keypress" design:
-// dark background for a successful (exit 0) command, error background
-// for a failed one, or (a silent failure -- empty output, non-zero
-// status) just a bare error-colored bar. `<C-w>{cmd}` (vimkeys'
-// KeyOutcome::Window) reuses the exact same exec.rs `WindowAction`/
-// repl.rs `apply_window_action` machinery the shell's own `window`
-// command already drives, applied `count` times -- per plan.md, running
-// one always exits normal mode too (e.g. `<C-space><C-w>n` jumps to the
-// next window and drops straight into its live prompt, not back into
-// this pane's own normal mode) -- matching what a real command-mode
-// `Action` outcome now does as well, for the same reason.
+// bishedit M1's first (and, so far, only) consumer: Ctrl+Space
+// (editor::ReadOutcome::NormalMode, unconditional now -- see its own doc
+// comment) enters this -- read-only cursor navigation over the focused
+// pane's own rendered content (scrollback included), vim's normal-mode
+// motions applied via bishedit::motion/vimkeys. `:` hands off to the
+// real command-mode feature (handle_command_mode -- the same one the
+// M10c job-detach path uses) -- the only way command mode is reached now
+// that the old direct ':'-at-the-shell-prompt shortcut is gone (see
+// editor::ReadOutcome's own doc comment). `ZZ` and typing exactly
+// "q"/"q!" as a command both exit normal mode -- `ZZ` directly here,
+// "q"/"q!" via run_command_mode special-casing them as vim's own Ex quit
+// commands rather than trying to run them as shell builtins (see its own
+// doc comment). Cancelling out of the command line (Ctrl-C/Esc/empty-
+// Backspace/empty-Enter) returns to this navigation instead, matching
+// real vim staying in Normal mode after an aborted ':' command. An
+// ordinary command that actually ran (CommandModeOutcome::Ran) also
+// returns to this navigation -- command mode itself is one-shot again
+// (see its own doc comment) -- but keeps that command's result on
+// screen as a PendingView::Output overlay until the very next keypress.
+// `<C-w>{cmd}` (vimkeys' KeyOutcome::Window) reuses the exact same
+// exec.rs `WindowAction`/repl.rs `apply_window_action` machinery the
+// shell's own `window` command already drives, applied `count` times --
+// per plan.md, running one always exits normal mode too (e.g.
+// `<C-space><C-w>n` jumps to the next window and drops straight into its
+// live prompt, not back into this pane's own normal mode) -- matching
+// what a real command-mode `Action` outcome now does as well, for the
+// same reason.
+//
+// `i`/`a`/`I`/`A`/`s`/`S`/`C` (vimkeys' `KeyOutcome::EnterInsert`) all
+// return to the live prompt, same as `ZZ` -- but per this session's own
+// "as if we were just looking around" design, they act on `initial_text`/
+// `initial_cursor` (a snapshot of exactly what was typed and where the
+// cursor was the *moment* Ctrl+Space was pressed), never on wherever
+// this function's own navigation cursor has since wandered off to in the
+// scrollback. So freely glancing around at prior output, then pressing
+// e.g. `A`, always resumes editing at the end of the *original* line --
+// not at the end of whatever line the nav cursor happens to be sitting
+// on. `apply_insert_cmd` (bishedit::vimkeys, shared with editor.rs's own
+// line-local Ctrl-E mode -- see that mode's own doc comment for the
+// contrast) does the actual text/cursor transformation. `:q` (a same-
+// window CommandModeOutcome::Quit) restores the same original text/
+// cursor, matching `ZZ`/`i`; an actual focus change (CommandModeOutcome::
+// Action, or KeyOutcome::Window) does not -- there's no per-session slot
+// to stash "unsubmitted line text" in for whatever window ends up
+// focused, so it's simply not carried over (matches today's behavior:
+// before this session, Ctrl+Space was empty-buffer-only, so a focus
+// change never had anything to lose in the first place).
 //
 // Not yet resumable via the Frame stack (see plan.md's own scoping
 // note): switching to another window mid-navigation and coming back
@@ -2264,10 +2307,13 @@ fn run_normal_mode_navigation(
     sinks_are_grid: &mut bool,
     job_frames: &mut HashMap<JobFrameId, exec::FgJob>,
     cmd_history: &mut History,
+    initial_text: String,
+    initial_cursor: usize,
     term_rows: usize,
     term_cols: usize,
-) -> io::Result<()> {
+) -> io::Result<Option<(String, usize)>> {
     let rect = pane_rect(&windows[*current_window], windows[*current_window].focused_pane, term_rows, term_cols);
+    let original_chars: Vec<char> = initial_text.chars().collect();
     // Same reasoning as freeze_idle_prompt's other call sites (splitting,
     // switching pane focus): this session's live prompt has only ever
     // been drawn straight to the real terminal by editor::read_line,
@@ -2276,10 +2322,20 @@ fn run_normal_mode_navigation(
     // Ctrl+Space doesn't change focus (unlike those other call sites), so
     // without this the very first entry into normal mode in a session
     // that's never lost focus before would render as a blank pane, not
-    // even showing the current prompt.
-    freeze_idle_prompt(sessions.get_mut(&session_id).unwrap());
+    // even showing the current prompt (or, now that this isn't empty-
+    // buffer-only, whatever had already been typed).
+    let prompt_str = freeze_input_with_text(sessions.get_mut(&session_id).unwrap(), &initial_text);
     let screen = sessions[&session_id].screen.clone();
     let mut buf = ScreenBuffer::new(screen, normal_mode_content_rows(rect));
+    // Explicitly positioned rather than trusting wherever ScreenBuffer::
+    // new's own default (or the vt100 grid's cursor, wherever feed()
+    // happened to leave it -- at the *end* of what was just fed, which is
+    // only right if the original cursor was already at the end of
+    // initial_text too) lands: the navigation cursor should start exactly
+    // where editing was interrupted, matching real vim entering Normal
+    // mode from Insert.
+    let last_line = buf.line_count().saturating_sub(1);
+    buf.set_cursor(last_line, editor::visible_len(&prompt_str) + initial_cursor);
     let mut vk = VimKeys::new();
 
     let _guard = term::RawGuard::enable(0)?;
@@ -2291,12 +2347,12 @@ fn run_normal_mode_navigation(
     render_normal_mode_frame(&buf, rect, &vk, None);
     let mut pending_view = PendingView::None;
 
-    'nav: loop {
+    let resume: Option<(String, usize)> = 'nav: loop {
         let mut key = match editor::read_key_idle(&mut || {
             service_background_jobs(sessions, windows, job_frames, *current_window);
         })? {
             Some(k) => k,
-            None => break,
+            None => break 'nav None,
         };
 
         // Resolve whatever PendingView is currently covering the screen
@@ -2314,7 +2370,7 @@ fn run_normal_mode_navigation(
                         service_background_jobs(sessions, windows, job_frames, *current_window);
                     })? {
                         Some(k) => k,
-                        None => break 'nav,
+                        None => break 'nav None,
                     };
                 }
                 PendingView::Output | PendingView::Transcript => {
@@ -2327,13 +2383,12 @@ fn run_normal_mode_navigation(
         }
 
         match key {
-            Key::Char('i') => break,
             Key::Char('Z') => {
                 let k2 = editor::read_key_idle(&mut || {
                     service_background_jobs(sessions, windows, job_frames, *current_window);
                 })?;
                 if k2 == Some(Key::Char('Z')) {
-                    break;
+                    break 'nav Some((initial_text.clone(), initial_cursor));
                 }
                 continue;
             }
@@ -2364,13 +2419,18 @@ fn run_normal_mode_navigation(
                         render_normal_mode_frame(&buf, rect, &vk, None);
                         continue;
                     }
-                    // A real command ran (possibly changing window/pane
-                    // focus -- apply_window_action already handled that),
-                    // or the user typed vim's own ":q"/":q!" -- either way
-                    // exits normal mode, matching the <C-w> leader's own
-                    // "running one exits normal mode too" behavior.
-                    CommandModeOutcome::Action(_) | CommandModeOutcome::Quit => {
-                        return Ok(());
+                    // Same window/session, same as `ZZ`/`i` -- restore
+                    // the original text/cursor (see this function's own
+                    // doc comment).
+                    CommandModeOutcome::Quit => {
+                        break 'nav Some((initial_text.clone(), initial_cursor));
+                    }
+                    // Focus may have changed (apply_window_action already
+                    // handled that) -- nothing to resume here (see this
+                    // function's own doc comment on why a focus change
+                    // doesn't carry the original text over).
+                    CommandModeOutcome::Action(_) => {
+                        return Ok(None);
                     }
                     // Back to normal mode too, per this session's own
                     // "go back to the original mode with the last output
@@ -2401,6 +2461,10 @@ fn run_normal_mode_navigation(
                 scroll_to_show_cursor(&mut buf);
                 render_normal_mode_frame(&buf, rect, &vk, None);
             }
+            KeyOutcome::EnterInsert(cmd) => {
+                let (new_chars, new_cursor) = crate::bishedit::vimkeys::apply_insert_cmd(&original_chars, initial_cursor, cmd);
+                break 'nav Some((new_chars.into_iter().collect(), new_cursor));
+            }
             KeyOutcome::Window(cmd @ (WindowCmd::GotoFirstWindow | WindowCmd::GotoLastWindow), count) => {
                 // No WindowAction equivalent -- an absolute tab-position
                 // jump, not a repeatable action -- so this sets
@@ -2411,13 +2475,14 @@ fn run_normal_mode_navigation(
                 // same freeze apply_window_action itself does up front
                 // (see freeze_focused_idle_prompt's own doc comment) --
                 // this is the one window-focus-changing path that doesn't
-                // go through apply_window_action at all.
+                // go through apply_window_action at all. Focus-changing,
+                // same as any other Window outcome -- nothing to resume.
                 freeze_focused_idle_prompt(sessions, windows, *current_window);
                 let default = if cmd == WindowCmd::GotoFirstWindow { 1 } else { windows.len() };
                 let target = count.unwrap_or(default);
                 *current_window = target.saturating_sub(1).min(windows.len().saturating_sub(1));
                 compositor_redraw(sessions, windows, *current_window, term_rows, term_cols);
-                return Ok(());
+                return Ok(None);
             }
             KeyOutcome::Window(cmd, count) => {
                 let action = window_cmd_to_action(cmd);
@@ -2437,8 +2502,8 @@ fn run_normal_mode_navigation(
                 // apply_window_action already ends with its own
                 // compositor_redraw -- nothing left to draw before
                 // returning to the (possibly now different) window's own
-                // live prompt.
-                return Ok(());
+                // live prompt. Focus-changing -- nothing to resume.
+                return Ok(None);
             }
             // Rendered on every keystroke, not just a resolved Motion --
             // the status bar needs to show a pending count/prefix (e.g.
@@ -2448,10 +2513,10 @@ fn run_normal_mode_navigation(
                 render_normal_mode_frame(&buf, rect, &vk, None);
             }
         }
-    }
+    };
 
     compositor_redraw(sessions, windows, *current_window, term_rows, term_cols);
-    Ok(())
+    Ok(resume)
 }
 
 // (window_id, is_the_current_window, that window's session's cwd) -- an
@@ -2778,6 +2843,9 @@ fn run_command_mode(
     let mut buffer = String::new();
     let mut transcript_visible = false;
     let prompt_row = command_mode_row(term_rows) + 1;
+    // Set only when Ctrl+Space fires below (see that arm's own comment) --
+    // consumed by the very next read_line call, then left None again.
+    let mut pending_initial: Option<(String, usize)> = None;
     loop {
         let prompt_str = if buffer.is_empty() { prompt::command_mode_prompt() } else { prompt::continuation() };
         print!("\x1b[{};1H", prompt_row);
@@ -2789,7 +2857,7 @@ fn run_command_mode(
         // reports: true -- command mode gives Ctrl-L its own meaning
         // (toggling the transcript view, below) rather than the
         // ordinary shell prompt's "clear the real screen."
-        match editor::read_line(&prompt_str, history, true, true, 0, term_cols, &mut || {
+        match editor::read_line(&prompt_str, history, true, true, pending_initial.take(), 0, term_cols, &mut || {
             service_background_jobs(sessions, windows, job_frames, current_window);
         }) {
             Ok(ReadOutcome::Eof) | Ok(ReadOutcome::Interrupted) => return CommandModeOutcome::Cancelled,
@@ -2800,8 +2868,17 @@ fn run_command_mode(
             Ok(ReadOutcome::DirNav(_)) => {}
             // Entering bishedit normal mode from inside command mode
             // isn't a thing (you're already navigating a screen, not a
-            // live prompt) -- ignored the same way DirNav is.
-            Ok(ReadOutcome::NormalMode) => {}
+            // live prompt) -- but unlike DirNav, this can no longer just
+            // be ignored outright: Ctrl+Space is unconditional now (see
+            // its own doc comment), so simply dropping `text`/`cursor`
+            // here would silently discard whatever had already been
+            // typed the instant this fired mid-line. Feeding it back as
+            // the next read_line call's own `initial` keeps that text
+            // right where it was -- the same "don't lose in-progress
+            // typing" guarantee every other caller of this gets.
+            Ok(ReadOutcome::NormalMode { text, cursor }) => {
+                pending_initial = Some((text, cursor));
+            }
             Ok(ReadOutcome::CtrlL) => {
                 transcript_visible = !transcript_visible;
                 if transcript_visible {

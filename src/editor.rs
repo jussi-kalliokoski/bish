@@ -13,8 +13,11 @@
 // Fixing that needs a TIOCGWINSZ ioctl and wrap-aware redraw math -- left
 // for later, same spirit as the other documented gaps in this codebase.
 
+use std::collections::HashMap;
 use std::io::{self, Write};
 
+use crate::bishedit::motion;
+use crate::bishedit::vimkeys::{self, KeyOutcome, VimKeys};
 use crate::history::History;
 use crate::term;
 
@@ -53,6 +56,9 @@ pub enum Key {
     CtrlF,
     CtrlK,
     CtrlL,
+    // Vim's insert-mode "do exactly one normal command, then return to
+    // insert" -- see run_one_shot_normal_command's own doc comment.
+    CtrlO,
     CtrlU,
     CtrlW,
     // No shell line-editing use yet (unlike the other Ctrl letters above) --
@@ -112,6 +118,7 @@ fn read_key() -> io::Result<Option<Key>> {
         0x06 => Key::CtrlF,
         0x0b => Key::CtrlK,
         0x0c => Key::CtrlL,
+        0x0f => Key::CtrlO,
         0x15 => Key::CtrlU,
         0x17 => Key::CtrlW,
         0x19 => Key::CtrlY,
@@ -406,7 +413,11 @@ fn redraw(prompt: &str, ed: &LineEditor, col_origin: usize, width: usize) -> io:
 // counting invisible escape bytes -- `s` is always one of this crate's
 // own prompt strings, which only ever embed `\x1b[...m` SGR (color)
 // codes, so that's the only escape form this needs to recognize.
-fn visible_len(s: &str) -> usize {
+// pub(crate): repl.rs's own freeze-with-text helper (Ctrl+Space with
+// in-progress text) reuses this to know how many *visible* columns a
+// colored prompt occupies, so it can position the frozen row's
+// ScreenBuffer cursor at the right column rather than guessing.
+pub(crate) fn visible_len(s: &str) -> usize {
     let mut len = 0;
     let mut chars = s.chars().peekable();
     while let Some(c) = chars.next() {
@@ -461,18 +472,23 @@ pub enum ReadOutcome {
     // comment. Never fires with anything typed (see read_line's own
     // handling), so there's no "what happens to the buffer" question.
     DirNav(DirNav),
-    // Ctrl+Space at an empty buffer -- same "don't discard in-progress
-    // typing" gating as DirNav above. Enters bishedit's normal-mode
-    // navigation over the current pane's own rendered content (repl.rs's
-    // run_normal_mode_navigation) -- the *only* way into command mode now
-    // (via normal mode's own ':', matching real vim) since the old direct
-    // ':'-at-the-shell-prompt shortcut was retired: it existed only to let
-    // command mode be reached before normal mode did, and became
-    // redundant clutter (a whole arm/materialize/commit/re-arm dance
-    // living inside ordinary shell-mode typing) the moment normal mode
-    // could get there properly. `i` in normal mode returns to a fresh
-    // read_line call, same as this one would have continued into anyway.
-    NormalMode,
+    // Ctrl+Space -- unconditional now, regardless of what's been typed
+    // (previously gated to an empty buffer only, the same "don't discard
+    // in-progress typing" reasoning DirNav above still uses). Enters
+    // bishedit's normal-mode navigation over the current pane's own
+    // rendered content (repl.rs's run_normal_mode_navigation) -- the
+    // *only* way into command mode now (via normal mode's own ':',
+    // matching real vim) since the old direct ':'-at-the-shell-prompt
+    // shortcut was retired. `text`/`cursor` are `ed.as_string()`/
+    // `ed.cursor` at the moment Ctrl+Space was pressed, so the caller can
+    // both show what's already been typed in its pane view and hand it
+    // back (via `read_line`'s own `initial` parameter) to whatever
+    // `read_line` call eventually resumes editing -- nothing is silently
+    // discarded now that this isn't empty-buffer-only anymore. `i`/`a`/
+    // `I`/`A`/`s`/`S`/`C` in normal mode all act relative to this
+    // *original* cursor (not wherever normal mode's own navigation cursor
+    // wanders off to -- see run_normal_mode_navigation's own doc comment).
+    NormalMode { text: String, cursor: usize },
     // Ctrl-L, but only when the caller opted in via `ctrl_l_reports` (see
     // that parameter's own doc comment) -- command mode's own toggle for
     // showing its whole command+output transcript. Whatever was typed so
@@ -537,17 +553,31 @@ pub enum DirNav {
 // read_line only ever needs to return to *this same* row's own start
 // column while redrawing during typing, never to reposition the row
 // itself (single-line editing, see this function's own scope note).
+// `initial`: text + cursor to preload the buffer with instead of starting
+// empty -- used to resume editing after a Ctrl+Space excursion into
+// normal-mode navigation (see `ReadOutcome::NormalMode`'s own doc
+// comment) without losing whatever had already been typed. `None` for
+// every ordinary call (a fresh prompt has nothing to preload).
 pub fn read_line(
     prompt: &str,
     history: &History,
     esc_cancels: bool,
     ctrl_l_reports: bool,
+    initial: Option<(String, usize)>,
     col_origin: usize,
     width: usize,
     mut on_idle: impl FnMut(),
 ) -> io::Result<ReadOutcome> {
     let mut guard = Some(term::RawGuard::enable(0)?);
-    let mut ed = LineEditor::new();
+    let mut ed = match initial {
+        Some((text, cursor)) => {
+            let mut e = LineEditor::new();
+            e.buf = text.chars().collect();
+            e.cursor = cursor.min(e.buf.len());
+            e
+        }
+        None => LineEditor::new(),
+    };
 
     // Fish-style history browsing: Up/Down search backward/forward through
     // history for entries starting with whatever was typed *before*
@@ -567,13 +597,23 @@ pub fn read_line(
     // every non-paned caller (col_origin 0, width the whole terminal).
     redraw(prompt, &ed, col_origin, width)?;
 
+    // Set only when Ctrl-E's or Ctrl-O's own sub-loop below reports a key
+    // it didn't consume itself (Ctrl-C/D/Z -- see run_line_normal_mode/
+    // run_one_shot_normal_command's own doc comments) -- reprocessed here
+    // through the exact same match arms that would have handled it had it
+    // been read directly, rather than duplicating that handling.
+    let mut pending_key: Option<Key> = None;
+
     loop {
-        let key = match read_key_idle(&mut on_idle)? {
+        let key = match pending_key.take() {
             Some(k) => k,
-            None => {
-                drop(guard.take());
-                return Ok(ReadOutcome::Eof);
-            }
+            None => match read_key_idle(&mut on_idle)? {
+                Some(k) => k,
+                None => {
+                    drop(guard.take());
+                    return Ok(ReadOutcome::Eof);
+                }
+            },
         };
         if !matches!(key, Key::Up | Key::Down | Key::Escape) {
             browse = None;
@@ -633,7 +673,7 @@ pub fn read_line(
             Key::Left | Key::CtrlB => ed.move_left(),
             Key::Right | Key::CtrlF => ed.move_right(),
             Key::Home | Key::CtrlA => ed.cursor = 0,
-            Key::End | Key::CtrlE => ed.cursor = ed.buf.len(),
+            Key::End => ed.cursor = ed.buf.len(),
             Key::CtrlK => ed.kill_to_end(),
             Key::CtrlU => ed.kill_to_start(),
             Key::CtrlW => ed.kill_word_backward(),
@@ -707,13 +747,224 @@ pub fn read_line(
             // No trailing "\r\n" here, unlike DirNav above: entering
             // normal mode redraws the pane's own rectangle in place (see
             // repl.rs's run_normal_mode_navigation), not a fresh line at
-            // the real terminal's current cursor position.
-            Key::CtrlSpace if ed.buf.is_empty() => {
+            // the real terminal's current cursor position. Unconditional
+            // now (used to be empty-buffer-only, matching DirNav above) --
+            // see ReadOutcome::NormalMode's own doc comment for why that
+            // gating is gone.
+            Key::CtrlSpace => {
                 drop(guard.take());
-                return Ok(ReadOutcome::NormalMode);
+                return Ok(ReadOutcome::NormalMode { text: ed.as_string(), cursor: ed.cursor });
             }
-            Key::AltLeft | Key::AltRight | Key::AltUp | Key::CtrlSpace | Key::CtrlY | Key::Unknown => {}
+            // Ctrl-E: a line-local vim Normal mode, always available
+            // (empty buffer or not) -- see run_line_normal_mode's own doc
+            // comment. Reassigned from this key's previous "move cursor to
+            // end of line" meaning (still reachable via the plain `End`
+            // key, just no longer double-bound).
+            Key::CtrlE => match run_line_normal_mode(&mut ed, prompt, col_origin, width, &mut on_idle)? {
+                LineNormalExit::ToInsert => {}
+                LineNormalExit::Propagate(k) => {
+                    pending_key = Some(k);
+                    continue;
+                }
+                LineNormalExit::Eof => {
+                    drop(guard.take());
+                    return Ok(ReadOutcome::Eof);
+                }
+            },
+            // Ctrl-O: vim's insert-mode "do exactly one normal command,
+            // then return" -- see run_one_shot_normal_command's own doc
+            // comment. Reachable directly from ordinary typing, matching
+            // real vim -- no need to already be in Ctrl-E's own mode first.
+            Key::CtrlO => {
+                if let Some(k) = run_one_shot_normal_command(&mut ed, &mut on_idle)? {
+                    pending_key = Some(k);
+                    continue;
+                }
+            }
+            Key::AltLeft | Key::AltRight | Key::AltUp | Key::CtrlY | Key::Unknown => {}
         }
         redraw(prompt, &ed, col_origin, width)?;
+    }
+}
+
+// What Ctrl-E's own line-local Normal mode (run_line_normal_mode) ended
+// with.
+enum LineNormalExit {
+    /// A motion/insert-entry command resolved, or Ctrl-E was pressed again
+    /// as a plain toggle -- back to ordinary insert typing, no key left
+    /// over to reprocess.
+    ToInsert,
+    /// Ctrl-C/D/Z -- not handled here (this function only knows vim
+    /// motions/insert-entry, not "interrupt the whole read"), handed back
+    /// to the caller to process exactly as it would have if read directly
+    /// at the top of its own loop.
+    Propagate(Key),
+    /// `read_key_idle` returned `None` (stdin closed) mid-excursion.
+    Eof,
+}
+
+// Ctrl-E: a lightweight, line-local vim Normal mode over the buffer
+// currently being typed -- no promotion, no pane/scrollback, works
+// identically whether the terminal is split or not (unlike repl.rs's
+// full-pane Ctrl+Space mode). Fully vim-authentic: motions and
+// insert-entry commands (`i`/`a`/`I`/`A`/`s`/`S`/`C`) both act on the
+// *live*, currently-navigated cursor, since this is a tight single-line
+// loop with immediate rendering -- there's no "look around elsewhere,
+// resume later" excursion the way Ctrl+Space's full-pane mode has (see
+// that mode's own doc comment in repl.rs for why *it* instead resolves
+// insert-entry against a frozen original cursor).
+fn run_line_normal_mode(
+    ed: &mut LineEditor,
+    prompt: &str,
+    col_origin: usize,
+    width: usize,
+    on_idle: &mut dyn FnMut(),
+) -> io::Result<LineNormalExit> {
+    let mut vk = VimKeys::new();
+    let mut marks: HashMap<char, (usize, usize)> = HashMap::new();
+    // Steady block cursor + a reverse-video prompt: the mode indicator.
+    // DECSCUSR isn't honored by every terminal, so the reverse-video
+    // prompt is the guaranteed-visible fallback; neither is ever emitted
+    // for a session that doesn't touch this feature.
+    print!("\x1b[2 q");
+    let decorated_prompt = format!("\x1b[7m{}\x1b[0m", prompt);
+    redraw(&decorated_prompt, ed, col_origin, width)?;
+    let exit = loop {
+        let key = match read_key_idle(on_idle)? {
+            Some(k) => k,
+            None => break LineNormalExit::Eof,
+        };
+        match key {
+            Key::CtrlC | Key::CtrlD | Key::CtrlZ => break LineNormalExit::Propagate(key),
+            Key::CtrlE => break LineNormalExit::ToInsert,
+            _ => {
+                let mut lb = LineBuffer { ed, marks: &mut marks };
+                match vk.feed(key) {
+                    KeyOutcome::Motion(m, count) => {
+                        motion::apply_motion(&mut lb, m, count);
+                    }
+                    KeyOutcome::EnterInsert(cmd) => {
+                        let (new_buf, new_cursor) = vimkeys::apply_insert_cmd(&lb.ed.buf, lb.ed.cursor, cmd);
+                        lb.ed.buf = new_buf;
+                        lb.ed.cursor = new_cursor;
+                        break LineNormalExit::ToInsert;
+                    }
+                    // <C-w> is still vimkeys' own window-leader prefix
+                    // here too, matching real vim's own Normal-mode
+                    // Ctrl-W meaning -- intentionally not special-cased
+                    // away, even though there's no window/pane state for
+                    // it to act on in this context (a harmless no-op).
+                    KeyOutcome::Window(..) | KeyOutcome::Pending | KeyOutcome::None => {}
+                }
+            }
+        }
+        redraw(&decorated_prompt, ed, col_origin, width)?;
+    };
+    print!("\x1b[6 q");
+    io::stdout().flush()?;
+    Ok(exit)
+}
+
+// Ctrl-O (vim's insert-mode "do exactly one normal command, then return
+// to insert"): reachable directly from ordinary typing, no need to
+// already be in Ctrl-E's own line-local mode first, matching real vim.
+// Reads and resolves exactly one VimKeys-recognized command -- a full
+// multi-key sequence like `2f)`, not just one keystroke -- by looping
+// until `vk.feed` stops returning `Pending`, applies it once, then always
+// returns to insert. `Some(key)` is only ever returned for Ctrl-C/D/Z,
+// handled by the caller the same way run_line_normal_mode's own
+// `Propagate` is.
+fn run_one_shot_normal_command(ed: &mut LineEditor, on_idle: &mut dyn FnMut()) -> io::Result<Option<Key>> {
+    print!("\x1b[2 q");
+    io::stdout().flush()?;
+    let mut vk = VimKeys::new();
+    let mut marks: HashMap<char, (usize, usize)> = HashMap::new();
+    let result = loop {
+        let key = match read_key_idle(on_idle)? {
+            Some(k) => k,
+            // EOF mid-command: nothing resolved to apply -- the outer
+            // loop's own next read_key_idle call will see the same EOF
+            // and handle it properly: not lossy, just deferred by one
+            // iteration.
+            None => break None,
+        };
+        match key {
+            Key::CtrlC | Key::CtrlD | Key::CtrlZ => break Some(key),
+            _ => {
+                let mut lb = LineBuffer { ed, marks: &mut marks };
+                match vk.feed(key) {
+                    KeyOutcome::Motion(m, count) => {
+                        motion::apply_motion(&mut lb, m, count);
+                        break None;
+                    }
+                    KeyOutcome::EnterInsert(cmd) => {
+                        let (new_buf, new_cursor) = vimkeys::apply_insert_cmd(&lb.ed.buf, lb.ed.cursor, cmd);
+                        lb.ed.buf = new_buf;
+                        lb.ed.cursor = new_cursor;
+                        break None;
+                    }
+                    KeyOutcome::Window(..) | KeyOutcome::None => break None,
+                    KeyOutcome::Pending => continue,
+                }
+            }
+        }
+    };
+    print!("\x1b[6 q");
+    io::stdout().flush()?;
+    Ok(result)
+}
+
+// Adapts `LineEditor`'s single line as a `bishedit::Buffer` -- just
+// enough for `motion::apply_motion` to navigate it (`line_count` always
+// 1, viewport_* degenerate -- no vertical scrolling in one line).
+// Mutation (insert-entry's own deletes) deliberately bypasses this trait
+// (it has none yet -- see bishedit's own module doc comment) and works
+// directly on `ed.buf`/`ed.cursor` via `vimkeys::apply_insert_cmd`
+// instead. `marks` is a fresh, empty map each time a `LineBuffer` is
+// constructed (once per Ctrl-E excursion or Ctrl-O one-shot) -- not
+// persisted across separate excursions, a fine simplification for a
+// short-lived command line.
+struct LineBuffer<'a> {
+    ed: &'a mut LineEditor,
+    marks: &'a mut HashMap<char, (usize, usize)>,
+}
+
+impl<'a> crate::bishedit::Buffer for LineBuffer<'a> {
+    fn line_count(&self) -> usize {
+        1
+    }
+
+    fn line_len(&self, _line: usize) -> usize {
+        self.ed.buf.len()
+    }
+
+    fn char_at(&self, _line: usize, col: usize) -> Option<char> {
+        self.ed.buf.get(col).copied()
+    }
+
+    fn cursor(&self) -> (usize, usize) {
+        (0, self.ed.cursor)
+    }
+
+    fn set_cursor(&mut self, _line: usize, col: usize) {
+        self.ed.cursor = col.min(self.ed.buf.len());
+    }
+
+    fn viewport_top(&self) -> usize {
+        0
+    }
+
+    fn set_viewport_top(&mut self, _line: usize) {}
+
+    fn viewport_height(&self) -> usize {
+        1
+    }
+
+    fn set_mark(&mut self, name: char, pos: (usize, usize)) {
+        self.marks.insert(name, pos);
+    }
+
+    fn get_mark(&self, name: char) -> Option<(usize, usize)> {
+        self.marks.get(&name).copied()
     }
 }
