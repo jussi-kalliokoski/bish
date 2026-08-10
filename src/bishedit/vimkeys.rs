@@ -13,12 +13,19 @@ pub enum KeyOutcome {
     /// A motion is ready to apply, with the raw count the user typed before
     /// it (if any).
     Motion(Motion, Option<usize>),
-    /// A Ctrl-W window command is ready to run, with the raw count typed
-    /// before it (if any) -- e.g. `2<C-w>n` is `WindowCmd::Next` with
-    /// count `Some(2)`. Not a `Motion`: these act on the frontend's own
-    /// window/pane state, not on a `Buffer`, so they're a separate
-    /// outcome the caller applies however it applies window commands
-    /// (repl.rs already has `apply_window_action` for exactly this).
+    /// A Ctrl-W window command is ready to run, with a count. Not a
+    /// `Motion`: these act on the frontend's own window/pane state, not
+    /// on a `Buffer`, so they're a separate outcome the caller applies
+    /// however it applies window commands (repl.rs already has
+    /// `apply_window_action` for exactly this). For most `WindowCmd`
+    /// variants the count is a *repeat*, typed before `<C-w>` -- e.g.
+    /// `2<C-w>n` is `WindowCmd::Next` with count `Some(2)`, "next window,
+    /// twice". `GotoFirstWindow`/`GotoLastWindow` are the exception,
+    /// mirroring `Motion::GotoFirstLine`/`GotoLastLine`: their count is
+    /// typed *inside* the `<C-w>` sequence, after it, as an absolute
+    /// 1-indexed tab position -- `<C-w>5gg` and `<C-w>5G` both mean "go
+    /// to the 5th tab" (count `Some(5)`), while bare `<C-w>gg`/`<C-w>G`
+    /// (count `None`) default to the first/last tab respectively.
     Window(WindowCmd, Option<usize>),
     /// The key was consumed as part of an in-progress sequence (a count
     /// digit, or a prefix awaiting its next character); no motion yet.
@@ -46,6 +53,10 @@ pub enum WindowCmd {
     FocusUp,
     FocusRight,
     Balance,
+    /// `<C-w>gg` / `<C-w>{N}gg`: go to the first tab, or tab N.
+    GotoFirstWindow,
+    /// `<C-w>G` / `<C-w>{N}G`: go to the last tab, or tab N.
+    GotoLastWindow,
 }
 
 #[derive(Debug, Clone)]
@@ -58,6 +69,9 @@ enum Pending {
     GotoMarkLine,
     Z,
     Window,
+    // <C-w>g -- awaiting the second 'g' of <C-w>gg, mirroring plain `gg`'s
+    // own two-key shape one level under the window leader.
+    WindowG,
     Search { forward: bool, text: String },
 }
 
@@ -152,6 +166,7 @@ impl VimKeys {
             Pending::GotoMarkLine => self.feed_mark(key, MarkKind::GotoLine),
             Pending::Z => self.feed_z(key),
             Pending::Window => self.feed_window(key),
+            Pending::WindowG => self.feed_window_g(key),
             Pending::Search { forward, text } => self.feed_search(key, forward, text),
         }
     }
@@ -324,6 +339,17 @@ impl VimKeys {
 
     fn feed_window(&mut self, key: Key) -> KeyOutcome {
         match key {
+            // Unlike a bare `<C-w>`-less count (accumulated in feed_fresh,
+            // which only applies to *repeating* a command), digits typed
+            // here -- inside the leader, before its resolving key -- are
+            // for `<C-w>{N}gg`/`<C-w>{N}G`'s absolute tab position. Stays
+            // pending, mirroring feed_fresh's own digit arm.
+            Key::Char(c) if c.is_ascii_digit() => {
+                let d = (c as u8 - b'0') as usize;
+                self.count = Some(self.count.unwrap_or(0) * 10 + d);
+                self.pending = Pending::Window;
+                KeyOutcome::Pending
+            }
             Key::Char('n') => self.emit_window(WindowCmd::Next),
             Key::Char('p') => self.emit_window(WindowCmd::Previous),
             Key::Char('c') => self.emit_window(WindowCmd::New),
@@ -335,6 +361,18 @@ impl VimKeys {
             Key::Char('k') => self.emit_window(WindowCmd::FocusUp),
             Key::Char('l') => self.emit_window(WindowCmd::FocusRight),
             Key::Char('=') => self.emit_window(WindowCmd::Balance),
+            Key::Char('g') => {
+                self.pending = Pending::WindowG;
+                KeyOutcome::Pending
+            }
+            Key::Char('G') => self.emit_window(WindowCmd::GotoLastWindow),
+            _ => self.abort(),
+        }
+    }
+
+    fn feed_window_g(&mut self, key: Key) -> KeyOutcome {
+        match key {
+            Key::Char('g') => self.emit_window(WindowCmd::GotoFirstWindow),
             _ => self.abort(),
         }
     }
@@ -803,5 +841,57 @@ mod tests {
         assert_eq!(vk.feed(Key::Char('x')), KeyOutcome::None);
         // aborted cleanly -- next key starts fresh
         assert_eq!(vk.feed(Key::Char('w')), KeyOutcome::Motion(Motion::WordForward, None));
+    }
+
+    #[test]
+    fn window_goto_first_and_last_bare() {
+        let mut vk = VimKeys::new();
+        let keys = [Key::CtrlW, Key::Char('g'), Key::Char('g')];
+        assert_eq!(last(&mut vk, &keys), KeyOutcome::Window(WindowCmd::GotoFirstWindow, None));
+
+        let mut vk = VimKeys::new();
+        assert_eq!(vk.feed(Key::CtrlW), KeyOutcome::Pending);
+        assert_eq!(vk.feed(Key::Char('G')), KeyOutcome::Window(WindowCmd::GotoLastWindow, None));
+    }
+
+    #[test]
+    fn window_goto_nth_tab() {
+        let mut vk = VimKeys::new();
+        let keys = [Key::CtrlW, Key::Char('5'), Key::Char('g'), Key::Char('g')];
+        assert_eq!(last(&mut vk, &keys), KeyOutcome::Window(WindowCmd::GotoFirstWindow, Some(5)));
+
+        let mut vk = VimKeys::new();
+        let keys = [Key::CtrlW, Key::Char('5'), Key::Char('G')];
+        assert_eq!(last(&mut vk, &keys), KeyOutcome::Window(WindowCmd::GotoLastWindow, Some(5)));
+    }
+
+    #[test]
+    fn window_goto_nth_tab_multi_digit_count() {
+        let mut vk = VimKeys::new();
+        let keys = [Key::CtrlW, Key::Char('1'), Key::Char('2'), Key::Char('G')];
+        assert_eq!(last(&mut vk, &keys), KeyOutcome::Window(WindowCmd::GotoLastWindow, Some(12)));
+    }
+
+    #[test]
+    fn window_g_unrecognized_continuation_aborts() {
+        let mut vk = VimKeys::new();
+        assert_eq!(vk.feed(Key::CtrlW), KeyOutcome::Pending);
+        assert_eq!(vk.feed(Key::Char('g')), KeyOutcome::Pending);
+        assert_eq!(vk.feed(Key::Char('x')), KeyOutcome::None); // '<C-w>gx' isn't a thing
+        assert_eq!(vk.feed(Key::Char('h')), KeyOutcome::Motion(Motion::Left, None));
+    }
+
+    #[test]
+    fn window_pending_display_shows_the_leader_and_count() {
+        let mut vk = VimKeys::new();
+        vk.feed(Key::CtrlW);
+        assert_eq!(vk.pending_display(), "^W");
+        vk.feed(Key::Char('5'));
+        assert_eq!(vk.pending_display(), "^W5");
+        vk.feed(Key::Char('g'));
+        assert_eq!(vk.pending_display(), "^W5g");
+        vk.feed(Key::Char('g'));
+        assert_eq!(vk.pending_display(), "");
+        assert_eq!(vk.last_motion_display(), "^W5gg");
     }
 }

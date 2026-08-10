@@ -846,6 +846,29 @@ fn ensure_promoted(sessions: &mut HashMap<SessionId, SessionState>, sinks_are_gr
     *sinks_are_grid = true;
 }
 
+// Freezes the currently-focused window's idle prompt into its own grid
+// (see freeze_idle_prompt's own doc comment) if it's genuinely idle (top
+// frame a Session, not a still-running detached job) -- same guard
+// split_focused_pane/focus_pane_direction already use for exactly this
+// before they move focus elsewhere. Called unconditionally up front by
+// apply_window_action (and by run_normal_mode_navigation's own
+// GotoFirstWindow/GotoLastWindow handling, which doesn't go through
+// apply_window_action at all -- see its own call site), since *any*
+// window action might be the one that switches focus away: without this,
+// a window's own live prompt -- only ever drawn straight to the real
+// terminal by editor::read_line, never captured anywhere on its own --
+// is lost the moment focus moves away and something later navigates
+// back before typing anything new there (a fresh command's own explicit
+// prompt+line grid-feed self-heals the display regardless, which is why
+// this went unnoticed until normal mode's own `<C-w>gg`/`<C-w>G` made it
+// possible to land on a window and *not* immediately type something).
+fn freeze_focused_idle_prompt(sessions: &mut HashMap<SessionId, SessionState>, windows: &[WindowEntry], current_window: usize) {
+    if matches!(windows[current_window].stack().last(), Some(Frame::Session(_))) {
+        let sid = windows[current_window].owning_session();
+        freeze_idle_prompt(sessions.get_mut(&sid).unwrap());
+    }
+}
+
 fn apply_window_action(
     action: WindowAction,
     sessions: &mut HashMap<SessionId, SessionState>,
@@ -858,6 +881,7 @@ fn apply_window_action(
     term_cols: usize,
 ) {
     ensure_promoted(sessions, sinks_are_grid);
+    freeze_focused_idle_prompt(sessions, windows, *current_window);
 
     match action {
         WindowAction::Next => {
@@ -2166,6 +2190,11 @@ fn render_normal_mode_frame(buf: &ScreenBuffer, rect: Rect, vk: &VimKeys, comman
     let _ = io::stdout().flush();
 }
 
+// `GotoFirstWindow`/`GotoLastWindow` aren't included -- they don't have a
+// `WindowAction` equivalent (an absolute tab-position jump, not a
+// repeatable action) and are handled directly in run_normal_mode_
+// navigation's own KeyOutcome::Window match, which never calls this for
+// them.
 fn window_cmd_to_action(cmd: WindowCmd) -> WindowAction {
     match cmd {
         WindowCmd::Next => WindowAction::Next,
@@ -2179,6 +2208,9 @@ fn window_cmd_to_action(cmd: WindowCmd) -> WindowAction {
         WindowCmd::FocusUp => WindowAction::FocusPane(PaneDirection::Up),
         WindowCmd::FocusRight => WindowAction::FocusPane(PaneDirection::Right),
         WindowCmd::Balance => WindowAction::Balance,
+        WindowCmd::GotoFirstWindow | WindowCmd::GotoLastWindow => {
+            unreachable!("handled directly in run_normal_mode_navigation, never reaches here")
+        }
     }
 }
 
@@ -2308,6 +2340,24 @@ fn run_normal_mode_navigation(
                 motion::apply_motion(&mut buf, m, count);
                 scroll_to_show_cursor(&mut buf);
                 render_normal_mode_frame(&buf, rect, &vk, None);
+            }
+            KeyOutcome::Window(cmd @ (WindowCmd::GotoFirstWindow | WindowCmd::GotoLastWindow), count) => {
+                // No WindowAction equivalent -- an absolute tab-position
+                // jump, not a repeatable action -- so this sets
+                // current_window directly instead of going through
+                // apply_window_action, matching Motion::GotoFirstLine/
+                // GotoLastLine's own default-vs-explicit-target split (see
+                // KeyOutcome::Window's own doc comment). Still needs the
+                // same freeze apply_window_action itself does up front
+                // (see freeze_focused_idle_prompt's own doc comment) --
+                // this is the one window-focus-changing path that doesn't
+                // go through apply_window_action at all.
+                freeze_focused_idle_prompt(sessions, windows, *current_window);
+                let default = if cmd == WindowCmd::GotoFirstWindow { 1 } else { windows.len() };
+                let target = count.unwrap_or(default);
+                *current_window = target.saturating_sub(1).min(windows.len().saturating_sub(1));
+                compositor_redraw(sessions, windows, *current_window, term_rows, term_cols);
+                return Ok(());
             }
             KeyOutcome::Window(cmd, count) => {
                 let action = window_cmd_to_action(cmd);
