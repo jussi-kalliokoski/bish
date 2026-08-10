@@ -30,6 +30,21 @@ pub enum HighlightKind {
     // $((...))'s interior (digit runs, $var refs), which has different
     // lexical rules than the shell grammar and isn't attempted here.
     Number,
+    // A plain unquoted argument recognized as one of its command's own
+    // flags (from a man-page-mined list, see manpages.rs) -- any argument
+    // position, exact string match only.
+    Flag,
+    // A plain unquoted argument recognized as the subcommand immediately
+    // following its command name (single level only, e.g. "commit" in
+    // "git commit").
+    Subcommand,
+    // A plain unquoted argument that isn't a recognized Flag/Subcommand
+    // but does resolve to a real file/directory against the shell's cwd.
+    Link,
+    // A refinement *within* a builtin's own argument text (e.g. printf's
+    // "%s") -- narrower than, and layered on top of, that argument's own
+    // base span (String, typically).
+    FormatSpecifier,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -37,6 +52,10 @@ pub struct HighlightSpan {
     pub start: usize,
     pub end: usize,
     pub kind: HighlightKind,
+    // The file:// URL for a Link-kind span; None for every other kind.
+    // Not used for anything yet (no OSC 8 terminal hyperlinks) -- carried
+    // purely as data for a future consumer.
+    pub link: Option<String>,
 }
 
 pub trait Highlighter {
@@ -75,6 +94,7 @@ pub struct StyledSpan {
 pub fn default_style(kind: HighlightKind) -> (vt100::Color, vt100::CellAttrs) {
     let bold = vt100::CellAttrs { bold: true, ..vt100::CellAttrs::default() };
     let dim = vt100::CellAttrs { dim: true, ..vt100::CellAttrs::default() };
+    let underline = vt100::CellAttrs { underline: true, ..vt100::CellAttrs::default() };
     match kind {
         HighlightKind::Keyword => (vt100::Color::Indexed(3), bold),
         HighlightKind::String => (vt100::Color::Indexed(2), vt100::CellAttrs::default()),
@@ -84,6 +104,13 @@ pub fn default_style(kind: HighlightKind) -> (vt100::Color, vt100::CellAttrs) {
         HighlightKind::Operator => (vt100::Color::Indexed(7), vt100::CellAttrs::default()),
         HighlightKind::Comment => (vt100::Color::Indexed(8), dim),
         HighlightKind::Number => (vt100::Color::Indexed(6), vt100::CellAttrs::default()),
+        // "Bold for now" per the feature request -- no new color, just
+        // weight, so a flag/subcommand match doesn't fight for attention
+        // with the actual grammar-level colors above.
+        HighlightKind::Flag => (vt100::Color::Default, bold),
+        HighlightKind::Subcommand => (vt100::Color::Default, bold),
+        HighlightKind::Link => (vt100::Color::Default, underline),
+        HighlightKind::FormatSpecifier => (vt100::Color::Indexed(1), bold),
     }
 }
 
@@ -158,7 +185,7 @@ fn highlight_into(text: &str, offset: usize, out: &mut Vec<HighlightSpan>) {
     for item in &res.items {
         match item {
             SpannedItem::Comment(r) => {
-                out.push(HighlightSpan { start: offset + r.start, end: offset + r.end, kind: HighlightKind::Comment });
+                out.push(HighlightSpan { start: offset + r.start, end: offset + r.end, kind: HighlightKind::Comment, link: None });
             }
             SpannedItem::Tok(tok, span) => {
                 highlight_tok(tok, span, offset, &chars, &res.raw_capture_spans, &mut cursor, out);
@@ -176,7 +203,7 @@ fn highlight_tok(
     cursor: &mut usize,
     out: &mut Vec<HighlightSpan>,
 ) {
-    let whole = |kind: HighlightKind| HighlightSpan { start: offset + span.start, end: offset + span.end, kind };
+    let whole = |kind: HighlightKind| HighlightSpan { start: offset + span.start, end: offset + span.end, kind, link: None };
     match tok {
         Tok::KwIf
         | Tok::KwThen
@@ -269,7 +296,7 @@ fn highlight_word(
 
             Chunk::LiteralStr(_) => {
                 if let Some(r) = next_span(raw_spans, cursor) {
-                    out.push(HighlightSpan { start: offset + r.start, end: offset + r.end, kind: HighlightKind::String });
+                    out.push(HighlightSpan { start: offset + r.start, end: offset + r.end, kind: HighlightKind::String, link: None });
                 }
             }
 
@@ -290,7 +317,7 @@ fn highlight_word(
             | Chunk::Indirect { .. }
             | Chunk::ArrayKeys { .. } => {
                 if let Some(r) = next_span(raw_spans, cursor) {
-                    out.push(HighlightSpan { start: offset + r.start, end: offset + r.end, kind: HighlightKind::Variable });
+                    out.push(HighlightSpan { start: offset + r.start, end: offset + r.end, kind: HighlightKind::Variable, link: None });
                 }
             }
 
@@ -305,8 +332,8 @@ fn highlight_word(
                 if let Some(r) = next_span(raw_spans, cursor) {
                     let is_backtick = r.start >= 1 && chars.get(r.start - 1) == Some(&'`');
                     let delim_start = if is_backtick { r.start - 1 } else { r.start.saturating_sub(2) };
-                    out.push(HighlightSpan { start: offset + delim_start, end: offset + r.start, kind: HighlightKind::Substitution });
-                    out.push(HighlightSpan { start: offset + r.end, end: offset + r.end + 1, kind: HighlightKind::Substitution });
+                    out.push(HighlightSpan { start: offset + delim_start, end: offset + r.start, kind: HighlightKind::Substitution, link: None });
+                    out.push(HighlightSpan { start: offset + r.end, end: offset + r.end + 1, kind: HighlightKind::Substitution, link: None });
                     highlight_into(raw, offset + r.start, out);
                 }
             }
@@ -320,7 +347,7 @@ fn highlight_word(
                 if let Some(r) = next_span(raw_spans, cursor) {
                     let full_start = r.start.saturating_sub(3);
                     let full_end = r.end + 2;
-                    out.push(HighlightSpan { start: offset + full_start, end: offset + full_end, kind: HighlightKind::Substitution });
+                    out.push(HighlightSpan { start: offset + full_start, end: offset + full_end, kind: HighlightKind::Substitution, link: None });
                 }
             }
 
@@ -337,8 +364,8 @@ fn highlight_word(
 fn push_procsub(raw: &str, offset: usize, raw_spans: &[Range<usize>], cursor: &mut usize, out: &mut Vec<HighlightSpan>) {
     if let Some(r) = next_span(raw_spans, cursor) {
         let delim_start = r.start.saturating_sub(2);
-        out.push(HighlightSpan { start: offset + delim_start, end: offset + r.start, kind: HighlightKind::Substitution });
-        out.push(HighlightSpan { start: offset + r.end, end: offset + r.end + 1, kind: HighlightKind::Substitution });
+        out.push(HighlightSpan { start: offset + delim_start, end: offset + r.start, kind: HighlightKind::Substitution, link: None });
+        out.push(HighlightSpan { start: offset + r.end, end: offset + r.end + 1, kind: HighlightKind::Substitution, link: None });
         highlight_into(raw, offset + r.start, out);
     }
 }
@@ -561,6 +588,10 @@ mod tests {
             HighlightKind::Substitution,
             HighlightKind::Comment,
             HighlightKind::Number,
+            HighlightKind::Flag,
+            HighlightKind::Subcommand,
+            HighlightKind::Link,
+            HighlightKind::FormatSpecifier,
         ] {
             let _ = default_style(kind);
         }
