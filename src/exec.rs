@@ -4300,21 +4300,12 @@ impl Shell {
 
     // Re-lexes and expands a captured raw operand (the "word"/"pattern"
     // half of a ${...} expansion), so it can itself contain further $
-    // expansions. Multiple resulting words are concatenated with no
-    // separator, approximating "the operand as a single expandable value".
+    // expansions. Parsed as a single word (see parse_expansion_word) --
+    // unlike a command line, unquoted whitespace inside it is literal
+    // content, not a field separator.
     fn expand_raw(&mut self, raw: &str) -> String {
-        match crate::lexer::Lexer::new(raw).tokenize() {
-            Ok(toks) => {
-                let mut s = String::new();
-                for t in toks {
-                    if let crate::lexer::Tok::Word(chunks, _) = t {
-                        s.push_str(&self.expand_word(&Word { chunks, globbable: false }));
-                    }
-                }
-                s
-            }
-            Err(_) => raw.to_string(),
-        }
+        let chunks = crate::lexer::parse_expansion_word(raw);
+        self.expand_word(&Word { chunks, globbable: false })
     }
 
     fn eval_var_op(&mut self, name: &str, op: &VarOp) -> String {

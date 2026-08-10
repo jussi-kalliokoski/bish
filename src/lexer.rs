@@ -241,7 +241,7 @@ impl<'a> Lexer<'a> {
             if self.regex_operand_next {
                 self.regex_operand_next = false;
                 if self.chars.peek().is_some() {
-                    let (word, plain) = self.read_word(true)?;
+                    let (word, plain) = self.read_word(true, false)?;
                     // Real bash rejects an unquoted `<`/`>` immediately
                     // following (no space) a `=~` regex operand with a
                     // syntax error, confirmed empirically -- read_word's
@@ -459,7 +459,7 @@ impl<'a> Lexer<'a> {
                     }
                 }
                 _ => {
-                    let (word, plain) = self.read_word(false)?;
+                    let (word, plain) = self.read_word(false, false)?;
                     if plain {
                         if let [Chunk::Str(s)] = word.as_slice() {
                             if let Some(kw) = keyword(s) {
@@ -795,7 +795,13 @@ impl<'a> Lexer<'a> {
     // else in `[[ ]]`), so this mirrors that narrow exemption rather than
     // relaxing every shell metacharacter. Whitespace and `]]` still end
     // the word normally.
-    fn read_word(&mut self, relaxed: bool) -> Result<(Vec<Chunk>, bool), String> {
+    // `literal_ws`: true for a `${...}` operator word (pattern/replacement/
+    // default text) parsed out of band via `parse_expansion_word` -- that
+    // text is a single semantic unit with no field splitting inside it, so
+    // an unquoted space there is pattern content (`${s#hello }`), not a
+    // word boundary. False (the normal command-line case) still breaks the
+    // word on whitespace.
+    fn read_word(&mut self, relaxed: bool, literal_ws: bool) -> Result<(Vec<Chunk>, bool), String> {
         let mut chunks: Vec<Chunk> = Vec::new();
         let mut buf = String::new();
         let mut plain = true;
@@ -814,7 +820,7 @@ impl<'a> Lexer<'a> {
         loop {
             match self.chars.peek().copied() {
                 None => break,
-                Some(c) if c == ' ' || c == '\t' || c == '\n' => break,
+                Some(c) if !literal_ws && (c == ' ' || c == '\t' || c == '\n') => break,
                 // extglob: @(...) !(...) +(...) *(...) ?(...) -- the '('
                 // immediately follows one of these prefix chars (already in
                 // buf, having fallen through the default char arm below) --
@@ -1034,13 +1040,24 @@ impl<'a> Lexer<'a> {
     }
 }
 
+// Parses the operator-word text of a `${...}` construct (the pattern in
+// `${v#pat}`/`${v%pat}`, the replacement/pattern in `${v/pat/rep}`, the
+// word in `${v:-word}`, etc.) for VarOp evaluation. Uses read_word's
+// `literal_ws` mode: nested expansions and quoting still work, but unlike
+// normal command-line tokenization, unquoted whitespace is literal pattern
+// content rather than a word boundary -- `${s#hello }` must strip exactly
+// "hello " (trailing space included), not just "hello".
+pub(crate) fn parse_expansion_word(raw: &str) -> Vec<Chunk> {
+    Lexer::new(raw).read_word(false, true).map(|(chunks, _)| chunks).unwrap_or_else(|_| vec![Chunk::Str(raw.to_string())])
+}
+
 // Expands $VAR / $(...) / `...` / $((...)) within an expansion-enabled
-// here-doc body. Can't reuse read_word directly since it breaks words on
-// unquoted newlines/whitespace -- a heredoc body must keep embedded
-// newlines as literal content, not word separators. Backslash escaping
-// here mirrors double-quote semantics (only \$, \\, \` are special).
-// Expansions are marked `quoted: true` since the body is used verbatim as
-// stdin text, never word-split.
+// here-doc body. Can't reuse read_word directly since a heredoc body
+// doesn't quote-process (' and " are literal there, not quote operators)
+// and must keep embedded newlines as literal content, not word separators.
+// Backslash escaping here mirrors double-quote semantics (only \$, \\, \`
+// are special). Expansions are marked `quoted: true` since the body is
+// used verbatim as stdin text, never word-split.
 fn expand_heredoc_chunks(body: &str) -> Result<Vec<Chunk>, String> {
     let mut lexer = Lexer::new(body);
     let mut chunks: Vec<Chunk> = Vec::new();
@@ -1382,4 +1399,32 @@ fn split_top_level_commas(s: &str) -> Vec<String> {
     }
     items.push(cur);
     items
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Regression: a `${var#pattern}`-style pattern is one semantic word,
+    // not a command line -- an unquoted trailing space is pattern content,
+    // not a separator to be dropped. parse_expansion_word previously went
+    // through the normal tokenize() path, which splits on whitespace and
+    // silently lost it.
+    #[test]
+    fn parse_expansion_word_preserves_trailing_space() {
+        assert_eq!(parse_expansion_word("hello "), vec![Chunk::Str("hello ".to_string())]);
+    }
+
+    #[test]
+    fn parse_expansion_word_preserves_internal_whitespace_runs() {
+        assert_eq!(parse_expansion_word("a  b"), vec![Chunk::Str("a  b".to_string())]);
+    }
+
+    #[test]
+    fn parse_expansion_word_still_expands_vars_around_literal_spaces() {
+        assert_eq!(
+            parse_expansion_word("hello $v"),
+            vec![Chunk::Str("hello ".to_string()), Chunk::Var { name: "v".to_string(), quoted: false }]
+        );
+    }
 }
