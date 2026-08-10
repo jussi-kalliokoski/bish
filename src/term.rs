@@ -176,3 +176,84 @@ pub fn stdin_ready(timeout_ms: i32) -> bool {
     let mut pfd = PollFd { fd: 0, events: POLLIN, revents: 0 };
     unsafe { poll(&mut pfd, 1, timeout_ms) > 0 && (pfd.revents & POLLIN) != 0 }
 }
+
+unsafe extern "C" {
+    fn read(fd: i32, buf: *mut u8, count: usize) -> isize;
+}
+
+fn read_one_byte() -> Option<u8> {
+    let mut b = [0u8; 1];
+    loop {
+        let n = unsafe { read(0, b.as_mut_ptr(), 1) };
+        if n < 0 {
+            if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return None;
+        }
+        return if n == 0 { None } else { Some(b[0]) };
+    }
+}
+
+// How long to wait for the terminal to answer a DSR query before giving
+// up -- generous relative to how fast a real (local) terminal emulator
+// actually answers (well under a millisecond in practice), but still
+// short enough that a terminal/environment that doesn't support DSR at
+// all (piped stdout, an unusual emulator) doesn't stall a prompt draw.
+const DSR_TIMEOUT_MS: i32 = 200;
+
+// Device Status Report (`\x1b[6n`): asks the real terminal for its own
+// actual cursor position and returns the column (1-indexed). Used by
+// repl.rs to find out whether an external command's own output (which,
+// unlike bish's own builtins, bish never sees a byte of -- it goes
+// straight from the child process to the inherited terminal fd) left
+// the cursor mid-row, the one case Shell::real_output_needs_newline
+// can't track on its own. Puts fd 0 into raw mode for the duration (the
+// reply arrives on stdin, the same as any keystroke, and needs reading
+// back before whatever line-buffering/echo mode the terminal would
+// otherwise apply to it) -- restored via RawGuard's own Drop regardless
+// of how this returns. `None` on any failure to enable raw mode, a
+// timeout (some terminals/environments don't answer DSR at all), or a
+// reply that doesn't parse as the expected `ESC [ row ; col R` -- every
+// caller treats that the same as "don't know," not as an error, and
+// just leaves the terminal alone rather than guessing.
+pub fn query_cursor_column() -> Option<usize> {
+    let _guard = RawGuard::enable(0).ok()?;
+    {
+        use std::io::Write;
+        print!("\x1b[6n");
+        std::io::stdout().flush().ok()?;
+    }
+    if !stdin_ready(DSR_TIMEOUT_MS) {
+        return None;
+    }
+    if read_one_byte()? != 0x1b {
+        return None;
+    }
+    if read_one_byte()? != b'[' {
+        return None;
+    }
+    // Row digits, up to the ';' -- not needed, just consumed so parsing
+    // can continue past them to the column.
+    loop {
+        let b = read_one_byte()?;
+        if b == b';' {
+            break;
+        }
+        if !b.is_ascii_digit() {
+            return None;
+        }
+    }
+    let mut col = String::new();
+    loop {
+        let b = read_one_byte()?;
+        if b == b'R' {
+            break;
+        }
+        if !b.is_ascii_digit() {
+            return None;
+        }
+        col.push(b as char);
+    }
+    col.parse().ok()
+}

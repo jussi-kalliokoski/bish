@@ -352,14 +352,36 @@ pub fn run(mut shell: Shell) {
         // emulator already tracks its cursor precisely, and
         // compositor_redraw always repaints from that real state, so
         // this can't come up there -- see Shell::take_needs_newline's
-        // own doc comment for what this is fixing (a builtin or external
-        // command whose output doesn't end in "\n" -- `printf foo`,
-        // `echo -n foo` -- otherwise gets silently erased by this same
-        // row's own next-prompt redraw, which assumes it already owns
-        // whatever's on this row).
-        if !sinks_are_grid && sessions[&session_id].shell.take_needs_newline() {
-            print!("\r\n");
-            let _ = io::stdout().flush();
+        // own doc comment for what this is fixing (a builtin's output
+        // that doesn't end in "\n" -- `printf foo`, `echo -n foo` --
+        // otherwise gets silently erased by this same row's own
+        // next-prompt redraw, which assumes it already owns whatever's
+        // on this row). If an *external* command ran instead (or as part
+        // of the same line -- `printf foo; ls`), take_needs_newline
+        // can't know whether its own, unobserved output left the cursor
+        // mid-row too, so fall back to actually asking the terminal (a
+        // real DSR round-trip, more expensive, which is why this isn't
+        // done unconditionally on every prompt -- see
+        // Shell::take_ran_external's own doc comment). A query that
+        // fails/times out (`None`) is treated as "assume no newline
+        // needed," the same as before this existed, rather than risking
+        // a stall.
+        if !sinks_are_grid {
+            let shell = &sessions[&session_id].shell;
+            let ran_external = shell.take_ran_external();
+            // Always drained, even when about to be superseded by the
+            // DSR query below -- otherwise a stale `true` left over from
+            // a builtin earlier in the same line (`printf foo; ls`) would
+            // leak into some *later*, unrelated prompt draw once
+            // ran_external stops being true, wrongly inserting a
+            // newline that real terminal state no longer calls for.
+            let builtin_needs_newline = shell.take_needs_newline();
+            let needs_newline =
+                if ran_external { term::query_cursor_column().is_some_and(|col| col != 1) } else { builtin_needs_newline };
+            if needs_newline {
+                print!("\r\n");
+                let _ = io::stdout().flush();
+            }
         }
         let prompt_str = {
             let session = &sessions[&session_id];

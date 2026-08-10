@@ -506,17 +506,34 @@ pub struct Shell {
     // compositor_redraw always repaints from that real state rather than
     // assuming anything about what row it owns. OutputSink::Real has no
     // such model -- it writes straight to the real terminal -- so without
-    // this, a command whose output doesn't end in "\n" (`printf foo`,
-    // `echo -n foo`, or any external command with the same shape) leaves
-    // the terminal cursor stuck mid-row, and the next prompt's own
-    // redraw() (which assumes it's redrawing a row it already owns --
-    // see its own doc comment) erases that output by writing blank
-    // padding over it before the prompt, instead of just leaving it
-    // alone or moving to a fresh line first. Cell, not a plain field:
-    // sink_out/sink_err are `&self` (not `&mut self` -- every builtin
-    // that prints goes through them, and making that `&mut` would ripple
+    // this, a builtin's output that doesn't end in "\n" (`printf foo`,
+    // `echo -n foo`) leaves the terminal cursor stuck mid-row, and the
+    // next prompt's own redraw() (which assumes it's redrawing a row it
+    // already owns -- see its own doc comment) erases that output by
+    // writing blank padding over it before the prompt, instead of just
+    // leaving it alone or moving to a fresh line first. Only covers
+    // bish's own builtins -- see ran_external_since_prompt, below, for
+    // the same problem with an *external* command's own output, which
+    // bish never sees a byte of. Cell, not a plain field: sink_out/
+    // sink_err are `&self` (not `&mut self` -- every builtin that prints
+    // goes through them, and making that `&mut` would ripple
     // everywhere), so updating this from there needs interior mutability.
     real_output_needs_newline: std::cell::Cell<bool>,
+    // Whether an external process has been spawned (with its stdout
+    // inherited straight from the real terminal -- run_single's ordinary
+    // foreground case, the `command` builtin's own spawn, or run_multi's
+    // pipeline stages) since the last time repl.rs's main loop checked.
+    // Unlike real_output_needs_newline (above), there's no way to track
+    // *whether* such a command's own output ended in a newline just by
+    // watching what bish itself writes -- an external child's stdout
+    // goes straight to the inherited fd, bypassing sink_out/sink_err
+    // entirely. So this only records that repl.rs needs to actually ask
+    // the terminal (term::query_cursor_column, a real DSR round-trip --
+    // more expensive than checking real_output_needs_newline, which is
+    // why this flag exists at all: to skip that round-trip on the common
+    // pure-builtin command, where the cheap tracking above is already
+    // enough). Same Cell-for-interior-mutability reasoning as above.
+    ran_external_since_prompt: std::cell::Cell<bool>,
     // Set by run_fg immediately before returning ExecResult::Fg, taken
     // right back out via take_pending_fg (called by repl.rs in response
     // to that signal) -- see ExecResult::Fg's doc comment. Not shared via
@@ -583,6 +600,7 @@ impl Shell {
             cwd: std::env::current_dir().unwrap_or_default(),
             sink: OutputSink::Real,
             real_output_needs_newline: std::cell::Cell::new(false),
+            ran_external_since_prompt: std::cell::Cell::new(false),
             pending_fg: None,
         }
     }
@@ -620,6 +638,25 @@ impl Shell {
     // last check.
     pub fn take_needs_newline(&self) -> bool {
         self.real_output_needs_newline.replace(false)
+    }
+
+    // Marks that an external process has just been spawned with its
+    // stdout inherited from the real terminal -- see
+    // ran_external_since_prompt's own doc comment. Called from the three
+    // sites that actually do this (run_single's ordinary foreground
+    // case, the `command` builtin, run_multi's pipeline stages), right
+    // before spawning.
+    fn note_external_spawn(&self) {
+        self.ran_external_since_prompt.set(true);
+    }
+
+    // repl.rs's main loop calls this alongside take_needs_newline, right
+    // before drawing the next prompt -- see ran_external_since_prompt's
+    // own doc comment for why this needs a real terminal query
+    // (term::query_cursor_column) rather than tracking bish's own writes
+    // the way take_needs_newline does.
+    pub fn take_ran_external(&self) -> bool {
+        self.ran_external_since_prompt.replace(false)
     }
 
     // repl.rs calls this once per session at promotion time (and
@@ -740,6 +777,7 @@ impl Shell {
             cwd: self.cwd.clone(),
             sink: OutputSink::Real,
             real_output_needs_newline: std::cell::Cell::new(false),
+            ran_external_since_prompt: std::cell::Cell::new(false),
             pending_fg: None,
         }
     }
@@ -3143,6 +3181,7 @@ impl Shell {
                         Ok(())
                     });
                 }
+                self.note_external_spawn();
                 return match ext.status() {
                     Ok(status) => ExecResult::Status(exit_code_from_status(status)),
                     Err(e) => {
@@ -3886,6 +3925,7 @@ impl Shell {
             }
         }
 
+        self.note_external_spawn();
         match command.spawn() {
             Ok(child) => {
                 let pid = child.id();
@@ -4081,6 +4121,15 @@ impl Shell {
             };
             command.current_dir(&self.cwd);
 
+            // Every pipeline stage is a genuinely separate process (even
+            // a builtin/function stage runs as a re-exec'd bish -c
+            // script -- see the `other` arm above) whose own stdout, for
+            // the last stage, is inherited straight from the real
+            // terminal -- see ran_external_since_prompt's own doc
+            // comment.
+            if is_last {
+                self.note_external_spawn();
+            }
             match command.spawn() {
                 Ok(mut child) => {
                     if !is_last {
