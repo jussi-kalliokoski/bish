@@ -1,8 +1,9 @@
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, Write};
 use std::rc::Rc;
 
+use crate::bishedit::highlight::HighlightContext;
 use crate::bishedit::motion;
 use crate::bishedit::vimkeys::{KeyOutcome, VimKeys, WindowCmd};
 use crate::bishedit::Buffer as BisheditBuffer;
@@ -398,11 +399,16 @@ pub fn run(mut shell: Shell) {
         let session_history = sessions[&session_id].history.clone();
         // Same "standalone snapshot, not a live borrow" reasoning as
         // session_history just above -- on_idle's own &mut sessions borrow
-        // below would conflict with borrowing sessions[&session_id].shell.cwd
-        // directly as a same-call argument.
+        // below would conflict with borrowing sessions[&session_id].shell's
+        // own cwd/functions directly as same-call arguments. Function
+        // *names* only, not bodies -- cheap to clone, and all the
+        // command-validity check needs (see HighlightContext's own doc
+        // comment on why aliases are deliberately not included here too).
         let cwd_snapshot = sessions[&session_id].shell.cwd.clone();
+        let known_functions: HashSet<String> = sessions[&session_id].shell.function_names().map(String::from).collect();
+        let highlight_ctx = HighlightContext { cwd: Some(cwd_snapshot.as_path()), known_functions: Some(&known_functions) };
 
-        match editor::read_line(&prompt_str, &session_history, false, false, pending_initial.take(), col_origin, width, Some(cwd_snapshot.as_path()), || {
+        match editor::read_line(&prompt_str, &session_history, false, false, pending_initial.take(), col_origin, width, highlight_ctx, || {
             service_background_jobs(&mut sessions, &mut windows, &mut job_frames, current_window);
         }) {
             Ok(ReadOutcome::Eof) => {
@@ -2857,11 +2863,17 @@ fn run_command_mode(
         // reports: true -- command mode gives Ctrl-L its own meaning
         // (toggling the transcript view, below) rather than the
         // ordinary shell prompt's "clear the real screen."
-        // cwd: None -- no single clearly-current session/cwd at this call
-        // site, and command mode types window-management subcommands, not
-        // file paths, so only file/dir Link highlighting is skipped here
-        // (flag/subcommand/printf highlighting don't need cwd at all).
-        match editor::read_line(&prompt_str, history, true, true, pending_initial.take(), 0, term_cols, None, &mut || {
+        // HighlightContext::default() (cwd/known_functions both None) --
+        // no single clearly-current session at this call site, and command
+        // mode types window-management subcommands, not shell command
+        // lines. cwd being None skips file/dir Link detection entirely;
+        // known_functions being None doesn't skip command-validity
+        // checking (that still runs against builtins/PATH), it just can't
+        // recognize a session-specific function as valid there -- a minor,
+        // accepted gap given what command mode is actually used for.
+        // Flag/subcommand/printf highlighting need neither field, so those
+        // work exactly as they do at the ordinary prompt.
+        match editor::read_line(&prompt_str, history, true, true, pending_initial.take(), 0, term_cols, HighlightContext::default(), &mut || {
             service_background_jobs(sessions, windows, job_frames, current_window);
         }) {
             Ok(ReadOutcome::Eof) | Ok(ReadOutcome::Interrupted) => return CommandModeOutcome::Cancelled,

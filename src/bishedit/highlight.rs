@@ -16,8 +16,33 @@
 use crate::bishedit::manpages;
 use crate::lexer::{self, Chunk, SpannedItem, Tok};
 use crate::vt100;
+use std::collections::HashSet;
 use std::ops::Range;
 use std::path::Path;
+
+// Session state the highlighter needs beyond the raw buffer text -- kept
+// as one small `Copy` bundle (just two Option<&T> references) rather than
+// growing the parameter list of every function in the highlight_into/
+// highlight_tok/highlight_word recursion chain by one for each new piece
+// of context a feature ends up needing (cwd today, known_functions added
+// alongside it for command-validity checking). `Default` gives callers
+// with nothing to offer (command mode's own colon-line) a plain, explicit
+// "no context" value instead of threading a `None` through every field by
+// hand.
+#[derive(Clone, Copy, Default)]
+pub struct HighlightContext<'a> {
+    pub cwd: Option<&'a Path>,
+    // The current session's own defined shell function names (not
+    // bodies) -- used by the command-validity check so calling a
+    // function you just defined doesn't show up as an "invalid command"
+    // error. Deliberately NOT extended to aliases: this shell's own
+    // `alias` builtin stores and queries aliases but never expands them
+    // at command-run time (see exec.rs's own doc comment on the
+    // `aliases` field), so an alias name would actually fail to run if
+    // typed as a command -- treating it as "valid" here would be
+    // actively misleading.
+    pub known_functions: Option<&'a HashSet<String>>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HighlightKind {
@@ -47,6 +72,14 @@ pub enum HighlightKind {
     // "%s") -- narrower than, and layered on top of, that argument's own
     // base span (String, typically).
     FormatSpecifier,
+    // A command-name word (the first word of a simple command, or
+    // whichever word follows a pipe/&&/||/;/keyword boundary) that isn't
+    // a known builtin, a defined shell function, a PATH-resolvable
+    // executable, or -- for a name containing '/' -- a directly
+    // executable file. A *valid* command name gets no new styling at all
+    // ("displayed as it was before"); this only ever fires on the
+    // negative case.
+    InvalidCommand,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -61,15 +94,15 @@ pub struct HighlightSpan {
 }
 
 pub trait Highlighter {
-    fn highlight(&self, text: &str, cwd: Option<&Path>) -> Vec<HighlightSpan>;
+    fn highlight(&self, text: &str, ctx: HighlightContext) -> Vec<HighlightSpan>;
 }
 
 pub struct BashHighlighter;
 
 impl Highlighter for BashHighlighter {
-    fn highlight(&self, text: &str, cwd: Option<&Path>) -> Vec<HighlightSpan> {
+    fn highlight(&self, text: &str, ctx: HighlightContext) -> Vec<HighlightSpan> {
         let mut out = Vec::new();
-        highlight_into(text, 0, cwd, &mut out);
+        highlight_into(text, 0, ctx, &mut out);
         out
     }
 }
@@ -113,6 +146,10 @@ pub fn default_style(kind: HighlightKind) -> (vt100::Color, vt100::CellAttrs) {
         HighlightKind::Subcommand => (vt100::Color::Default, bold),
         HighlightKind::Link => (vt100::Color::Default, underline),
         HighlightKind::FormatSpecifier => (vt100::Color::Indexed(1), bold),
+        // Plain red, not bold -- distinct enough from FormatSpecifier's
+        // bold red given the two never appear near each other, and
+        // matches "error (red text)" from the feature request literally.
+        HighlightKind::InvalidCommand => (vt100::Color::Indexed(1), vt100::CellAttrs::default()),
     }
 }
 
@@ -180,7 +217,7 @@ fn next_span(raw_spans: &[Range<usize>], cursor: &mut usize) -> Option<Range<usi
 // level from that level's own `text` (not threaded from the caller) --
 // raw_capture_spans positions are always relative to whatever text they
 // were captured from, so this stays a purely local computation.
-fn highlight_into(text: &str, offset: usize, cwd: Option<&Path>, out: &mut Vec<HighlightSpan>) {
+fn highlight_into(text: &str, offset: usize, ctx: HighlightContext, out: &mut Vec<HighlightSpan>) {
     let chars: Vec<char> = text.chars().collect();
     let res = lexer::tokenize_spanned(text);
     let mut cursor = 0usize;
@@ -190,13 +227,28 @@ fn highlight_into(text: &str, offset: usize, cwd: Option<&Path>, out: &mut Vec<H
     // commit $(echo -m)` starts a wholly new command inside the
     // substitution).
     let mut cmd_pos = CmdPos::ExpectCommand;
-    for item in &res.items {
-        match item {
+    for i in 0..res.items.len() {
+        match &res.items[i] {
             SpannedItem::Comment(r) => {
                 out.push(HighlightSpan { start: offset + r.start, end: offset + r.end, kind: HighlightKind::Comment, link: None });
             }
             SpannedItem::Tok(tok, span) => {
-                highlight_tok(tok, span, offset, &chars, &res.raw_capture_spans, &mut cursor, cwd, &mut cmd_pos, out);
+                // A CommandName word immediately followed by an empty
+                // "()" is bash's function-definition syntax (`name() {
+                // ...}` / `name () { ... }`) -- `name` there isn't being
+                // invoked as a command at all (it wouldn't even be
+                // defined yet on this very line), so command-validity
+                // checking must not apply to it. Detected by lookahead
+                // rather than real parsing, since this is still purely
+                // lexer-driven -- a heuristic, but a safe one: at worst a
+                // malformed line that merely *looks* like a function
+                // definition skips a validity check it would otherwise
+                // have gotten, never the reverse (a false "invalid", not
+                // a false "valid").
+                let is_function_def_name = matches!(cmd_pos, CmdPos::ExpectCommand)
+                    && matches!(tok, Tok::Word(chunks, _) if matches!(chunks.as_slice(), [Chunk::Str(_)]))
+                    && matches!(res.items.get(i + 1), Some(SpannedItem::Tok(Tok::Subshell(raw), _)) if raw.is_empty());
+                highlight_tok(tok, span, offset, &chars, &res.raw_capture_spans, &mut cursor, ctx, &mut cmd_pos, is_function_def_name, out);
             }
         }
     }
@@ -283,6 +335,67 @@ fn is_assignment_prefix_word(chunks: &[Chunk]) -> bool {
     is_valid_ident(name)
 }
 
+// Hand-duplicated from exec.rs's own KNOWN_BUILTINS (private, and itself
+// already documented there as "kept in sync with run_single's dispatch
+// match by hand") -- kept separate rather than exposing that list to stay
+// decoupled from the shell's execution engine, matching every other
+// editor-analysis-vs-execution split in this file. Includes "echo" and
+// "printf", which exec.rs's own list is missing (a separate, pre-existing
+// gap in that list's own `type`/`command -v` reporting -- not fixed
+// there, just not reproduced here, since getting *this* list right is
+// what stands between a real builtin and a false "invalid command" red).
+const KNOWN_BUILTINS: &[&str] = &[
+    ":", "cd", "export", "let", "break", "continue", "test", "[", "[[", "return", "shift", "local", "exit", "read", "mapfile",
+    "readarray", "eval", "source", ".", "trap", "jobs", "fg", "bg", "wait", "kill", "getopts", "unset", "set", "declare",
+    "typeset", "readonly", "exec", "command", "type", "hash", "shopt", "umask", "pushd", "popd", "dirs", "ulimit", "alias",
+    "unalias", "window", "win", "echo", "printf",
+];
+
+// A command name is valid if it's a known builtin, one of the session's
+// own defined functions, a directly executable file (for a name
+// containing '/'), or resolvable on PATH otherwise. Deliberately does NOT
+// check aliases -- see HighlightContext::known_functions's own doc
+// comment on why an alias name isn't actually safe to call "valid" in
+// this shell.
+fn is_valid_command_name(name: &str, ctx: &HighlightContext) -> bool {
+    if KNOWN_BUILTINS.contains(&name) {
+        return true;
+    }
+    if ctx.known_functions.is_some_and(|f| f.contains(name)) {
+        return true;
+    }
+    if name.contains('/') {
+        return is_executable_file(Path::new(name));
+    }
+    is_in_path(name)
+}
+
+#[cfg(unix)]
+fn is_executable_file(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    match std::fs::metadata(path) {
+        Ok(meta) => meta.is_file() && meta.permissions().mode() & 0o111 != 0,
+        Err(_) => false,
+    }
+}
+
+#[cfg(not(unix))]
+fn is_executable_file(path: &Path) -> bool {
+    path.is_file()
+}
+
+// Mirrors the PATH-walking half of exec.rs's own resolve_in_path (that
+// function is private and also handles the '/'-containing case this
+// module already splits out separately in is_valid_command_name, so it's
+// duplicated rather than reused -- same rationale as KNOWN_BUILTINS
+// above). No caching, matching exec.rs's own real spawn path, which also
+// re-resolves PATH fresh every time rather than maintaining a command
+// cache.
+fn is_in_path(name: &str) -> bool {
+    let Ok(path_var) = std::env::var("PATH") else { return false };
+    path_var.split(':').any(|dir| is_executable_file(&Path::new(dir).join(name)))
+}
+
 // Thin wrapper: resolves `command`'s man-page data (if ready yet -- see
 // manpages::query's own doc comment on why this never blocks) and
 // delegates the actual matching to classify_plain_argument_core, which
@@ -294,14 +407,14 @@ fn classify_plain_argument(
     word_span: &Range<usize>,
     command: &str,
     arg_index: usize,
-    cwd: Option<&Path>,
+    ctx: HighlightContext,
     offset: usize,
 ) -> Option<HighlightSpan> {
     let man = match manpages::query(command) {
         manpages::ManStatus::Ready(data) => Some(data),
         manpages::ManStatus::Pending | manpages::ManStatus::Missing => None,
     };
-    classify_plain_argument_core(text, word_span, arg_index, man.as_deref(), cwd, offset)
+    classify_plain_argument_core(text, word_span, arg_index, man.as_deref(), ctx.cwd, offset)
 }
 
 // Priority order, matching "if the unquoted argument is not a flag or a
@@ -446,8 +559,9 @@ fn highlight_tok(
     chars: &[char],
     raw_spans: &[Range<usize>],
     cursor: &mut usize,
-    cwd: Option<&Path>,
+    ctx: HighlightContext,
     cmd_pos: &mut CmdPos,
+    is_function_def_name: bool,
     out: &mut Vec<HighlightSpan>,
 ) {
     if resets_command_position(tok) {
@@ -506,7 +620,7 @@ fn highlight_tok(
         // delimiters); only the interior recursively highlights.
         Tok::Subshell(raw) => {
             if let Some(inner) = next_span(raw_spans, cursor) {
-                highlight_into(raw, offset + inner.start, cwd, out);
+                highlight_into(raw, offset + inner.start, ctx, out);
             }
         }
 
@@ -520,7 +634,7 @@ fn highlight_tok(
             out.push(whole(HighlightKind::Substitution));
         }
 
-        Tok::Word(chunks, _plain) => highlight_word(chunks, span, offset, chars, raw_spans, cursor, cwd, cmd_pos, out),
+        Tok::Word(chunks, _plain) => highlight_word(chunks, span, offset, chars, raw_spans, cursor, ctx, cmd_pos, is_function_def_name, out),
     }
 }
 
@@ -545,8 +659,9 @@ fn highlight_word(
     chars: &[char],
     raw_spans: &[Range<usize>],
     cursor: &mut usize,
-    cwd: Option<&Path>,
+    ctx: HighlightContext,
     cmd_pos: &mut CmdPos,
+    is_function_def_name: bool,
     out: &mut Vec<HighlightSpan>,
 ) {
     let role = match cmd_pos {
@@ -564,10 +679,29 @@ fn highlight_word(
     };
 
     if let [Chunk::Str(s)] = chunks {
-        if let WordRole::Argument { command: Some(cmd), arg_index } = &role {
-            if let Some(span) = classify_plain_argument(s, word_span, cmd, *arg_index, cwd, offset) {
-                out.push(span);
+        match &role {
+            // A *valid* command name gets no new styling at all --
+            // "displayed as it was before" -- so this only ever pushes a
+            // span on the negative case. A function-definition name
+            // (`name() { ... }`) isn't a command invocation at all --
+            // skip validity checking entirely rather than false-flagging
+            // the very name being defined on this line.
+            WordRole::CommandName => {
+                if !is_function_def_name && !is_valid_command_name(s, &ctx) {
+                    out.push(HighlightSpan {
+                        start: offset + word_span.start,
+                        end: offset + word_span.end,
+                        kind: HighlightKind::InvalidCommand,
+                        link: None,
+                    });
+                }
             }
+            WordRole::Argument { command: Some(cmd), arg_index } => {
+                if let Some(span) = classify_plain_argument(s, word_span, cmd, *arg_index, ctx, offset) {
+                    out.push(span);
+                }
+            }
+            WordRole::Argument { command: None, .. } | WordRole::AssignmentPrefix => {}
         }
         return;
     }
@@ -621,7 +755,7 @@ fn highlight_word(
                     let delim_start = if is_backtick { r.start - 1 } else { r.start.saturating_sub(2) };
                     out.push(HighlightSpan { start: offset + delim_start, end: offset + r.start, kind: HighlightKind::Substitution, link: None });
                     out.push(HighlightSpan { start: offset + r.end, end: offset + r.end + 1, kind: HighlightKind::Substitution, link: None });
-                    highlight_into(raw, offset + r.start, cwd, out);
+                    highlight_into(raw, offset + r.start, ctx, out);
                 }
             }
 
@@ -642,18 +776,18 @@ fn highlight_word(
             // recurse treatment as Chunk::Sub, but unambiguous (each
             // variant has exactly one possible delimiter pair), so no
             // peeking needed.
-            Chunk::ProcSubIn { raw } => push_procsub(raw, offset, raw_spans, cursor, cwd, out),
-            Chunk::ProcSubOut { raw } => push_procsub(raw, offset, raw_spans, cursor, cwd, out),
+            Chunk::ProcSubIn { raw } => push_procsub(raw, offset, raw_spans, cursor, ctx, out),
+            Chunk::ProcSubOut { raw } => push_procsub(raw, offset, raw_spans, cursor, ctx, out),
         }
     }
 }
 
-fn push_procsub(raw: &str, offset: usize, raw_spans: &[Range<usize>], cursor: &mut usize, cwd: Option<&Path>, out: &mut Vec<HighlightSpan>) {
+fn push_procsub(raw: &str, offset: usize, raw_spans: &[Range<usize>], cursor: &mut usize, ctx: HighlightContext, out: &mut Vec<HighlightSpan>) {
     if let Some(r) = next_span(raw_spans, cursor) {
         let delim_start = r.start.saturating_sub(2);
         out.push(HighlightSpan { start: offset + delim_start, end: offset + r.start, kind: HighlightKind::Substitution, link: None });
         out.push(HighlightSpan { start: offset + r.end, end: offset + r.end + 1, kind: HighlightKind::Substitution, link: None });
-        highlight_into(raw, offset + r.start, cwd, out);
+        highlight_into(raw, offset + r.start, ctx, out);
     }
 }
 
@@ -662,7 +796,7 @@ mod tests {
     use super::*;
 
     fn kinds(text: &str) -> Vec<(usize, usize, HighlightKind)> {
-        let mut spans = BashHighlighter.highlight(text, None);
+        let mut spans = BashHighlighter.highlight(text, HighlightContext::default());
         spans.sort_by_key(|s| (s.start, s.end));
         spans.into_iter().map(|s| (s.start, s.end, s.kind)).collect()
     }
@@ -803,7 +937,7 @@ mod tests {
         // (i.e. produce no spans, being a plain word) rather than the
         // whole line going uncolored.
         let text = "echo 'unterminated";
-        let spans = BashHighlighter.highlight(text, None);
+        let spans = BashHighlighter.highlight(text, HighlightContext::default());
         // No panic, and no spans at all is the correct result here since
         // "echo" alone is a plain, uncolored word and the unterminated
         // quote never got far enough to produce a LiteralStr chunk.
@@ -879,6 +1013,7 @@ mod tests {
             HighlightKind::Subcommand,
             HighlightKind::Link,
             HighlightKind::FormatSpecifier,
+            HighlightKind::InvalidCommand,
         ] {
             let _ = default_style(kind);
         }
@@ -1137,5 +1272,135 @@ mod tests {
         assert!(spans.contains(&(quote_start, quote_end, HighlightKind::String)), "{spans:?}");
         let pct_start = text.find("%s").unwrap();
         assert!(spans.contains(&(pct_start, pct_start + 2, HighlightKind::FormatSpecifier)), "{spans:?}");
+    }
+
+    #[test]
+    fn is_valid_command_name_recognizes_known_builtins() {
+        let ctx = HighlightContext::default();
+        for name in [":", "cd", "echo", "printf", "[[", "export", "read", "set"] {
+            assert!(is_valid_command_name(name, &ctx), "{name} should be a known builtin");
+        }
+    }
+
+    #[test]
+    fn is_valid_command_name_recognizes_a_real_path_executable() {
+        let ctx = HighlightContext::default();
+        // coreutils -- safe to assume present on any Unix test runner,
+        // same assumption this whole feature already leans on for `man`.
+        assert!(is_valid_command_name("true", &ctx));
+        assert!(is_valid_command_name("ls", &ctx));
+    }
+
+    #[test]
+    fn is_valid_command_name_rejects_an_unknown_bare_name() {
+        let ctx = HighlightContext::default();
+        assert!(!is_valid_command_name("bish-definitely-not-a-real-command-xyz", &ctx));
+    }
+
+    #[test]
+    fn is_valid_command_name_recognizes_a_known_function() {
+        let mut functions = HashSet::new();
+        functions.insert("my_func".to_string());
+        let ctx = HighlightContext { cwd: None, known_functions: Some(&functions) };
+        assert!(is_valid_command_name("my_func", &ctx));
+        assert!(!is_valid_command_name("other_func", &ctx));
+    }
+
+    #[test]
+    fn is_valid_command_name_recognizes_a_direct_executable_path() {
+        let ctx = HighlightContext::default();
+        // The test binary itself -- guaranteed to exist and be executable,
+        // and (being an absolute path) exercises the '/'-containing branch
+        // rather than the PATH-walking one.
+        let exe = std::env::current_exe().unwrap();
+        assert!(is_valid_command_name(exe.to_str().unwrap(), &ctx));
+    }
+
+    #[test]
+    fn is_valid_command_name_rejects_a_non_executable_path() {
+        let ctx = HighlightContext::default();
+        let cwd = std::env::current_dir().unwrap();
+        let toml = cwd.join("Cargo.toml");
+        // A real file, but not executable -- must fail the permission-bit
+        // check, not just "does this path exist."
+        assert!(!is_valid_command_name(toml.to_str().unwrap(), &ctx));
+    }
+
+    #[test]
+    fn is_valid_command_name_rejects_a_nonexistent_direct_path() {
+        let ctx = HighlightContext::default();
+        assert!(!is_valid_command_name("/definitely/not/a/real/path/xyz", &ctx));
+    }
+
+    #[test]
+    fn invalid_command_name_is_highlighted_red() {
+        let bogus = "bish-definitely-not-a-real-command-xyz";
+        let text = format!("{bogus} arg");
+        let spans = kinds(&text);
+        assert!(spans.contains(&(0, bogus.len(), HighlightKind::InvalidCommand)), "{spans:?}");
+    }
+
+    #[test]
+    fn valid_command_name_gets_no_new_styling() {
+        // "displayed as it was before" -- a real, PATH-resolvable command
+        // name gets no span at all, same as prior to this feature.
+        assert_eq!(kinds("true"), vec![]);
+    }
+
+    #[test]
+    fn a_call_to_a_known_function_is_not_flagged_invalid() {
+        let mut functions = HashSet::new();
+        functions.insert("my_func".to_string());
+        let ctx = HighlightContext { cwd: None, known_functions: Some(&functions) };
+        let spans = BashHighlighter.highlight("my_func arg", ctx);
+        assert!(!spans.iter().any(|s| s.kind == HighlightKind::InvalidCommand), "{spans:?}");
+    }
+
+    #[test]
+    fn command_validity_is_checked_after_every_reset_point() {
+        // Both "true" (real) and the bogus name after the pipe must be
+        // independently checked -- confirms the validity check reaches
+        // every CommandName position, not just the very first word.
+        let text = "true | bish-definitely-not-a-real-command-xyz";
+        let spans = kinds(text);
+        assert!(!spans.iter().any(|s| s.2 == HighlightKind::InvalidCommand && s.0 == 0), "{spans:?}");
+        let second_start = text.find("bish-").unwrap();
+        assert!(spans.contains(&(second_start, text.len(), HighlightKind::InvalidCommand)), "{spans:?}");
+    }
+
+    // Regression test for a real bug caught during interactive
+    // verification: a function *definition* line was flagging its own
+    // name as an invalid command, since the lexer sees "myfunc" followed
+    // by an empty "()" (bash's function-definition syntax) the exact same
+    // way it would see a nonsensical "myfunc()" command invocation -- and
+    // the function obviously isn't registered yet on the very line that
+    // defines it.
+    #[test]
+    fn function_definition_name_is_never_flagged_invalid() {
+        let text = "myfunc() { echo hi; }";
+        let spans = kinds(text);
+        assert!(!spans.iter().any(|s| s.2 == HighlightKind::InvalidCommand), "{spans:?}");
+        // Nothing at all for "myfunc" itself (not even a Flag/Subcommand/
+        // Link false match) -- just the braces/semicolon as ordinary
+        // Operators, exactly as if this feature didn't exist.
+        assert_eq!(
+            spans,
+            vec![
+                (9, 10, HighlightKind::Operator),  // '{'
+                (18, 19, HighlightKind::Operator), // ';'
+                (20, 21, HighlightKind::Operator), // '}'
+            ]
+        );
+    }
+
+    #[test]
+    fn function_definition_name_with_a_space_before_parens_is_also_recognized() {
+        // `name () { ... }` (whitespace before the parens) is equally
+        // valid bash function-definition syntax -- confirms the lookahead
+        // isn't accidentally relying on token adjacency implying no space
+        // (this tokenizer has no whitespace tokens at all, so this is
+        // really just confirming that fact holds).
+        let spans = kinds("myfunc () { :; }");
+        assert!(!spans.iter().any(|s| s.2 == HighlightKind::InvalidCommand), "{spans:?}");
     }
 }

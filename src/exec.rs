@@ -659,6 +659,16 @@ impl Shell {
         self.ran_external_since_prompt.replace(false)
     }
 
+    // Read-only access to this session's own defined function names (not
+    // bodies) -- `functions` itself stays private since callers have no
+    // business touching the parsed Command bodies directly; this exists
+    // for the syntax highlighter's command-validity check (bishedit::
+    // highlight), which needs to know a function call is valid without
+    // reaching into Shell's own execution internals.
+    pub fn function_names(&self) -> impl Iterator<Item = &str> {
+        self.functions.keys().map(String::as_str)
+    }
+
     // repl.rs calls this once per session at promotion time (and
     // immediately for any session created afterward) to redirect that
     // session's output into its own VT100 grid instead of the real
