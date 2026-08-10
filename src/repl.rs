@@ -348,6 +348,19 @@ pub fn run(mut shell: Shell) {
             continue;
         }
 
+        // Real (un-promoted) case only: OutputSink::Grid's own vt100
+        // emulator already tracks its cursor precisely, and
+        // compositor_redraw always repaints from that real state, so
+        // this can't come up there -- see Shell::take_needs_newline's
+        // own doc comment for what this is fixing (a builtin or external
+        // command whose output doesn't end in "\n" -- `printf foo`,
+        // `echo -n foo` -- otherwise gets silently erased by this same
+        // row's own next-prompt redraw, which assumes it already owns
+        // whatever's on this row).
+        if !sinks_are_grid && sessions[&session_id].shell.take_needs_newline() {
+            print!("\r\n");
+            let _ = io::stdout().flush();
+        }
         let prompt_str = {
             let session = &sessions[&session_id];
             if session.buffer.is_empty() { prompt::render(&session.shell) } else { prompt::continuation() }
