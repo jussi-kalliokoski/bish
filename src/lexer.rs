@@ -231,15 +231,28 @@ pub struct Lexer<'a> {
     // threading an opt-in through every call site, and the cost is one
     // usize increment per char already being consumed regardless.
     pos: usize,
-    // Half-open char-index ranges (excluding delimiters) of every raw,
-    // not-yet-parsed region captured by capture_balanced_parens/
-    // capture_backtick -- i.e. exactly the source text later stashed into
-    // a Chunk::Sub/Arith/ProcSubIn/ProcSubOut/Tok::Subshell/Tok::Arith
-    // `raw` field. capture_double_paren doesn't push its own -- it just
-    // wraps a capture_balanced_parens call, whose span already covers the
-    // same raw text -- so pushing there too would desync this list from
-    // the one-span-per-raw-capturing-chunk correspondence the highlighter
-    // relies on to recurse into each nested construct in the right order.
+    // Half-open char-index ranges, one per "expansion" chunk pushed while
+    // reading a word, in the same left-to-right order as the chunks
+    // themselves -- i.e. one entry per Chunk::{Sub, Arith, Var, VarExpand,
+    // ArrayVar, ArrayLength, ArrayVarExpand, Indirect, ArrayKeys} pushed
+    // via capture_balanced_parens/capture_backtick or push_var's own two
+    // non-recursive dispatch branches (the ${...} brace-content path and
+    // the bare $NAME fallback). Plain Chunk::Str/LiteralStr text isn't
+    // included here -- their source span is always recoverable without a
+    // side-channel entry (Str is a verbatim, unescaped copy of source
+    // chars; LiteralStr's boundaries fall out of the surrounding
+    // quote/escape structure a highlighter is already walking).
+    // For Sub/Arith/ProcSubIn/ProcSubOut the range excludes the
+    // construct's own delimiters ($( ), backtick, <( )/>( )) since that's
+    // the raw text a highlighter recursively re-lexes. For the terminal
+    // (non-recursive) ${...}/bare $NAME chunks, the range similarly
+    // excludes the `{`/`}` braces (or has none to exclude, for the bare
+    // form) -- same "delimiters excluded" convention either way, even
+    // though those two never get recursed into.
+    // capture_double_paren doesn't push its own -- it just wraps a
+    // capture_balanced_parens call whose span already covers the same raw
+    // text -- so pushing there too would desync the one-span-per-chunk
+    // correspondence.
     // Always populated (no Option-gating), like `pos`: ordinary
     // tokenize()/execution never reads this either.
     raw_capture_spans: Vec<std::ops::Range<usize>>,
@@ -1039,39 +1052,75 @@ impl<'a> Lexer<'a> {
         }
         if self.chars.peek().copied() == Some('{') {
             self.advance();
+            // Content span excludes the braces, same convention as
+            // capture_balanced_parens -- see raw_capture_spans's own doc
+            // comment. Recorded once we know a real chunk will be pushed
+            // (the empty-name case below returns early with none).
+            let start = self.pos;
             let mut inner = String::new();
+            // Unlike capture_balanced_parens/capture_backtick, this loop
+            // has no unterminated-input error path (matches this
+            // function's pre-existing best-effort behavior) -- so `closed`
+            // distinguishes "stopped at a real '}'" (span excludes it,
+            // same delimiter-excluded convention as elsewhere) from "ran
+            // out of input first" (span includes every char actually
+            // consumed, matching what `inner` itself already contains).
+            let mut closed = false;
             while let Some(c) = self.chars.peek().copied() {
                 self.advance();
                 if c == '}' {
+                    closed = true;
                     break;
                 }
                 inner.push(c);
             }
+            let span = start..(if closed { self.pos - 1 } else { self.pos });
             match parse_brace_content(&inner) {
                 BraceContent::Plain(name) => {
                     if name.is_empty() {
                         buf.push('$');
                         return Ok(false);
                     } else {
+                        self.raw_capture_spans.push(span);
                         chunks.push(Chunk::Var { name, quoted });
                     }
                 }
-                BraceContent::Op(name, op) => chunks.push(Chunk::VarExpand { name, op, quoted }),
-                BraceContent::ArrayIndex(name, index) => chunks.push(Chunk::ArrayVar { name, index, quoted }),
-                BraceContent::ArrayLength(name, index) => chunks.push(Chunk::ArrayLength { name, index }),
-                BraceContent::ArrayOp(name, index, op) => {
-                    chunks.push(Chunk::ArrayVarExpand { name, index, op, quoted })
+                BraceContent::Op(name, op) => {
+                    self.raw_capture_spans.push(span);
+                    chunks.push(Chunk::VarExpand { name, op, quoted });
                 }
-                BraceContent::Indirect(name) => chunks.push(Chunk::Indirect { name, quoted }),
-                BraceContent::ArrayKeys(name) => chunks.push(Chunk::ArrayKeys { name, quoted }),
+                BraceContent::ArrayIndex(name, index) => {
+                    self.raw_capture_spans.push(span);
+                    chunks.push(Chunk::ArrayVar { name, index, quoted });
+                }
+                BraceContent::ArrayLength(name, index) => {
+                    self.raw_capture_spans.push(span);
+                    chunks.push(Chunk::ArrayLength { name, index });
+                }
+                BraceContent::ArrayOp(name, index, op) => {
+                    self.raw_capture_spans.push(span);
+                    chunks.push(Chunk::ArrayVarExpand { name, index, op, quoted });
+                }
+                BraceContent::Indirect(name) => {
+                    self.raw_capture_spans.push(span);
+                    chunks.push(Chunk::Indirect { name, quoted });
+                }
+                BraceContent::ArrayKeys(name) => {
+                    self.raw_capture_spans.push(span);
+                    chunks.push(Chunk::ArrayKeys { name, quoted });
+                }
             }
             return Ok(true);
         }
+        // Bare $NAME: no delimiters at all, so the span is just the name's
+        // own char range.
+        let start = self.pos;
         let name = self.read_var_name();
         if name.is_empty() {
             buf.push('$');
             Ok(false)
         } else {
+            self.raw_capture_spans.push(start..self.pos);
             chunks.push(Chunk::Var { name, quoted });
             Ok(true)
         }
@@ -1885,6 +1934,52 @@ mod tests {
         match word.expect("expected a Word token with a Chunk::Arith").as_slice() {
             [Chunk::Arith { raw, .. }] => assert_eq!(raw, "1 + 2"),
             other => panic!("expected a single flat Chunk::Arith, got {:?}", other),
+        }
+    }
+
+    // Parity test for Stage 3's push_var instrumentation: a word built
+    // entirely from expansion constructs (no literal Str/LiteralStr text
+    // between them) should produce exactly one raw_capture_spans entry
+    // per chunk, in the same order, each substring matching what that
+    // chunk semantically represents. A missed instrumentation site would
+    // desync the two lists (either a chunk with no span, or an extra span
+    // with no corresponding chunk) -- this test would catch either.
+    #[test]
+    fn push_var_instrumentation_keeps_raw_capture_spans_in_parity_with_chunks() {
+        let src = "$a${b}$(echo c)$((1+2))${#arr[@]}";
+        let mut lexer = Lexer::new(src);
+        let (chunks, _) = lexer.read_word(false, false).unwrap();
+
+        assert_eq!(chunks.len(), 5, "unexpected chunk count: {:?}", chunks);
+        assert_eq!(
+            lexer.raw_capture_spans.len(),
+            chunks.len(),
+            "span count must match chunk count: spans={:?} chunks={:?}",
+            lexer.raw_capture_spans,
+            chunks
+        );
+
+        let expected_substrings = ["a", "b", "echo c", "1+2", "#arr[@]"];
+        for (span, expected) in lexer.raw_capture_spans.iter().zip(expected_substrings) {
+            assert_eq!(spanned_text(src, span), expected);
+        }
+
+        match chunks.as_slice() {
+            [
+                Chunk::Var { name: n0, .. },
+                Chunk::Var { name: n1, .. },
+                Chunk::Sub { raw: r2, .. },
+                Chunk::Arith { raw: r3, .. },
+                Chunk::ArrayLength { name: n4, index: i4 },
+            ] => {
+                assert_eq!(n0, "a");
+                assert_eq!(n1, "b");
+                assert_eq!(r2, "echo c");
+                assert_eq!(r3, "1+2");
+                assert_eq!(n4, "arr");
+                assert_eq!(i4, "@");
+            }
+            other => panic!("unexpected chunk shape: {:?}", other),
         }
     }
 }
