@@ -2842,6 +2842,16 @@ fn run_command_mode(
                     return CommandModeOutcome::Cancelled;
                 }
                 if trimmed == "q" || trimmed == "q!" {
+                    // Recorded same as any other command that actually
+                    // ran -- vim's own Ex quit commands, not shell
+                    // builtins, but still something the user typed and
+                    // command mode acted on, so leaving it out of the
+                    // transcript would read as if it never happened.
+                    sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry {
+                        command: trimmed,
+                        output: String::new(),
+                        status: 0,
+                    });
                     return CommandModeOutcome::Quit;
                 }
 
@@ -2866,7 +2876,26 @@ fn run_command_mode(
                                 };
                                 buffer.clear();
                                 match result {
-                                    ExecResult::Window(action) => return CommandModeOutcome::Action(action),
+                                    ExecResult::Window(action) => {
+                                        // Recorded too, same reasoning as
+                                        // "q"/"q!" above -- a `window`
+                                        // command genuinely ran (its
+                                        // WindowAction side effect is
+                                        // applied by the caller, handle_
+                                        // command_mode, which has the
+                                        // session/window state this
+                                        // function doesn't), it just
+                                        // doesn't drop CommandModeOutcome::
+                                        // Ran's own overlay treatment since
+                                        // it leaves normal mode entirely
+                                        // rather than returning to it.
+                                        sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry {
+                                            command: trimmed,
+                                            output: captured_text,
+                                            status: 0,
+                                        });
+                                        return CommandModeOutcome::Action(action);
+                                    }
                                     // `fg`'s poll loop needs repl.rs's own
                                     // compositor state, which this
                                     // restricted read-eval loop doesn't

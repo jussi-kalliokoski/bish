@@ -1708,6 +1708,106 @@ impl Shell {
         }
     }
 
+    // `echo [-neE] [arg...]`: writes each arg separated by a single
+    // space, then a trailing newline unless -n was given. Flags must
+    // come first and be one of exactly n/e/E (bundled, e.g. "-ne") --
+    // the first argument that doesn't fit that shape ends flag parsing,
+    // matching bash's own echo (no long options, no "--" special case).
+    // -e enables the same backslash escapes real bash's echo recognizes
+    // (see echo_expand_escapes); -E (the default) leaves them untouched.
+    fn run_echo(&self, args: &[String]) -> i32 {
+        let mut interpret_escapes = false;
+        let mut trailing_newline = true;
+        let mut i = 0;
+        while let Some(a) = args.get(i) {
+            if a.len() < 2 || !a.starts_with('-') || !a[1..].chars().all(|c| matches!(c, 'n' | 'e' | 'E')) {
+                break;
+            }
+            for c in a[1..].chars() {
+                match c {
+                    'n' => trailing_newline = false,
+                    'e' => interpret_escapes = true,
+                    'E' => interpret_escapes = false,
+                    _ => unreachable!(),
+                }
+            }
+            i += 1;
+        }
+
+        let mut out = String::new();
+        let mut stopped_early = false;
+        for (pos, a) in args[i..].iter().enumerate() {
+            if pos > 0 {
+                out.push(' ');
+            }
+            if interpret_escapes {
+                let (expanded, hit_c) = echo_expand_escapes(a);
+                out.push_str(&expanded);
+                if hit_c {
+                    stopped_early = true;
+                    break;
+                }
+            } else {
+                out.push_str(a);
+            }
+        }
+        if trailing_newline && !stopped_early {
+            out.push('\n');
+        }
+        sh_print!(self, "{}", out);
+        0
+    }
+
+    // `printf FORMAT [ARGS...]` / `printf -v NAME FORMAT [ARGS...]`:
+    // bash-compatible subset -- %s %d %i %o %u %x %X %c %b %q %%
+    // conversions, with "-" (left-align) and "0" (zero-pad) flags, a
+    // numeric width, and a ".precision" (applied to %s only -- a
+    // truncation length; other conversions ignore it, a minor
+    // simplification against real printf's %d minimum-digit-count
+    // behavior). FORMAT's own backslash escapes (\n, \t, ...) are
+    // always interpreted -- unlike echo, there's no -e/-E switch, POSIX
+    // printf's format string is escape-interpreted unconditionally.
+    // FORMAT is cycled -- reused from the start -- for as long as
+    // there's still at least one unconsumed argument left, matching
+    // real printf (`printf "%s\n" a b c` prints three lines); a numeric
+    // conversion given a missing or non-numeric argument is treated as
+    // 0, a string conversion given a missing one as "". -v NAME assigns
+    // the formatted result to a shell variable instead of printing it.
+    fn run_printf(&mut self, args: &[String]) -> i32 {
+        let (var_name, rest) = if args.first().map(String::as_str) == Some("-v") {
+            match args.get(1) {
+                Some(name) => (Some(name.clone()), &args[2..]),
+                None => {
+                    sh_eprintln!(self, "bish: printf: -v: option requires an argument");
+                    return 1;
+                }
+            }
+        } else {
+            (None, &args[..])
+        };
+        let Some(format) = rest.first() else {
+            sh_eprintln!(self, "bish: printf: usage: printf format [arguments]");
+            return 1;
+        };
+        let values = &rest[1..];
+
+        let mut out = String::new();
+        let mut idx = 0;
+        loop {
+            let before = idx;
+            printf_format_once(format, values, &mut idx, &mut out);
+            if idx >= values.len() || idx == before {
+                break;
+            }
+        }
+
+        match var_name {
+            Some(name) => self.assign_var(&name, out),
+            None => sh_print!(self, "{}", out),
+        }
+        0
+    }
+
     fn run_pushd(&mut self, args: &[String]) -> i32 {
         let target = match args.iter().find(|a| !a.starts_with('-')) {
             Some(d) => d.clone(),
@@ -3022,6 +3122,14 @@ impl Shell {
                 return ExecResult::Status(0);
             }
             "cd" => return ExecResult::Status(self.run_cd(&argv[1..])),
+            // Real builtins (not just something the external /bin/echo,
+            // /bin/printf would cover) -- see run_echo/run_printf's own
+            // doc comments. Matters beyond ordinary interactive use:
+            // command mode (restrict_to_builtins, below) disallows
+            // externals outright, and echo/printf are two of the most
+            // reached-for commands for producing quick output there.
+            "echo" => return ExecResult::Status(self.run_echo(&argv[1..])),
+            "printf" => return ExecResult::Status(self.run_printf(&argv[1..])),
             "umask" => return ExecResult::Status(self.run_umask(&argv[1..])),
             "ulimit" => return ExecResult::Status(self.run_ulimit(&argv[1..])),
             // alias/unalias: store and query only, no expansion when a
@@ -5312,6 +5420,218 @@ impl FgJob {
             return FgWait::Exited(128 + wait_status_term_sig(status));
         }
         FgWait::Exited(wait_status_exit_code(status))
+    }
+}
+
+// Backslash-escape expansion shared by `echo -e` and `printf`'s FORMAT
+// (see run_echo/run_printf's own doc comments) -- bash's own set:
+// \\ \a \b \e \f \n \r \t \v, \0NNN (up to 3 octal digits), \xHH (up to
+// 2 hex digits), and \c (stop all further output, including anything
+// already queued after this point in the same echo/printf call --
+// signaled via the returned bool, which run_echo checks directly and
+// run_printf's format string never actually reaches since FORMAT itself
+// doesn't support \c). An unrecognized escape (or a bare trailing
+// backslash) is left exactly as written, matching bash rather than
+// silently dropping the backslash.
+fn echo_expand_escapes(s: &str) -> (String, bool) {
+    let mut out = String::new();
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('\\') => out.push('\\'),
+            Some('a') => out.push('\u{7}'),
+            Some('b') => out.push('\u{8}'),
+            Some('c') => return (out, true),
+            Some('e') => out.push('\u{1b}'),
+            Some('f') => out.push('\u{c}'),
+            Some('n') => out.push('\n'),
+            Some('r') => out.push('\r'),
+            Some('t') => out.push('\t'),
+            Some('v') => out.push('\u{b}'),
+            Some('0') => {
+                let mut val: u32 = 0;
+                let mut n = 0;
+                while n < 3 {
+                    match chars.peek().and_then(|c| c.to_digit(8)) {
+                        Some(d) => {
+                            val = val * 8 + d;
+                            chars.next();
+                            n += 1;
+                        }
+                        None => break,
+                    }
+                }
+                out.push(char::from_u32(val).unwrap_or('\0'));
+            }
+            Some('x') => {
+                let mut val: u32 = 0;
+                let mut n = 0;
+                while n < 2 {
+                    match chars.peek().and_then(|c| c.to_digit(16)) {
+                        Some(d) => {
+                            val = val * 16 + d;
+                            chars.next();
+                            n += 1;
+                        }
+                        None => break,
+                    }
+                }
+                if n > 0 {
+                    out.push(char::from_u32(val).unwrap_or('\0'));
+                } else {
+                    out.push('\\');
+                    out.push('x');
+                }
+            }
+            Some(other) => {
+                out.push('\\');
+                out.push(other);
+            }
+            None => out.push('\\'),
+        }
+    }
+    (out, false)
+}
+
+// Wraps `s` in single quotes, escaping any embedded single quote as
+// '\'' (close, escaped-quote, reopen) -- the standard POSIX-shell-safe
+// quoting form, and what printf's own %q conversion produces.
+fn shell_quote(s: &str) -> String {
+    let mut out = String::from("'");
+    for c in s.chars() {
+        if c == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(c);
+        }
+    }
+    out.push('\'');
+    out
+}
+
+// Runs FORMAT once against `values[*idx..]`, advancing `*idx` past
+// however many of them it actually consumed, and appending the result
+// to `out` -- see run_printf's own doc comment for the conversions and
+// flags supported. Split out from run_printf so the caller can call
+// this repeatedly to cycle FORMAT over more arguments than it has
+// conversions for.
+fn printf_format_once(format: &str, values: &[String], idx: &mut usize, out: &mut String) {
+    let mut chars = format.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some('\\') => out.push('\\'),
+                Some('a') => out.push('\u{7}'),
+                Some('b') => out.push('\u{8}'),
+                Some('e') => out.push('\u{1b}'),
+                Some('f') => out.push('\u{c}'),
+                Some('n') => out.push('\n'),
+                Some('r') => out.push('\r'),
+                Some('t') => out.push('\t'),
+                Some('v') => out.push('\u{b}'),
+                Some('"') => out.push('"'),
+                Some(other) => {
+                    out.push('\\');
+                    out.push(other);
+                }
+                None => out.push('\\'),
+            }
+            continue;
+        }
+        if c != '%' {
+            out.push(c);
+            continue;
+        }
+        if chars.peek() == Some(&'%') {
+            chars.next();
+            out.push('%');
+            continue;
+        }
+
+        let mut left_align = false;
+        let mut zero_pad = false;
+        while let Some(&p) = chars.peek() {
+            match p {
+                '-' => {
+                    left_align = true;
+                    chars.next();
+                }
+                '0' => {
+                    zero_pad = true;
+                    chars.next();
+                }
+                _ => break,
+            }
+        }
+        let mut width_digits = String::new();
+        while let Some(&p) = chars.peek() {
+            if p.is_ascii_digit() {
+                width_digits.push(p);
+                chars.next();
+            } else {
+                break;
+            }
+        }
+        let width: usize = width_digits.parse().unwrap_or(0);
+        let mut precision: Option<usize> = None;
+        if chars.peek() == Some(&'.') {
+            chars.next();
+            let mut p = String::new();
+            while let Some(&d) = chars.peek() {
+                if d.is_ascii_digit() {
+                    p.push(d);
+                    chars.next();
+                } else {
+                    break;
+                }
+            }
+            precision = Some(p.parse().unwrap_or(0));
+        }
+        let Some(conv) = chars.next() else { break };
+
+        let mut next_arg = || -> String {
+            let v = values.get(*idx).cloned().unwrap_or_default();
+            *idx += 1;
+            v
+        };
+        let numeric = matches!(conv, 'd' | 'i' | 'u' | 'o' | 'x' | 'X');
+        let mut piece = match conv {
+            's' => {
+                let mut s = next_arg();
+                if let Some(p) = precision {
+                    s.truncate(p);
+                }
+                s
+            }
+            'b' => echo_expand_escapes(&next_arg()).0,
+            'c' => next_arg().chars().next().map(|c| c.to_string()).unwrap_or_default(),
+            'q' => shell_quote(&next_arg()),
+            'd' | 'i' => next_arg().trim().parse::<i64>().unwrap_or(0).to_string(),
+            'u' => (next_arg().trim().parse::<i64>().unwrap_or(0) as u64).to_string(),
+            'o' => format!("{:o}", next_arg().trim().parse::<i64>().unwrap_or(0)),
+            'x' => format!("{:x}", next_arg().trim().parse::<i64>().unwrap_or(0)),
+            'X' => format!("{:X}", next_arg().trim().parse::<i64>().unwrap_or(0)),
+            // Unrecognized conversion: emitted literally, nothing
+            // consumed -- matches bash treating it as plain text rather
+            // than silently eating an argument.
+            other => format!("%{}", other),
+        };
+        let len = piece.chars().count();
+        if len < width {
+            let pad = width - len;
+            if left_align {
+                piece.push_str(&" ".repeat(pad));
+            } else if zero_pad && numeric {
+                piece = format!("{}{}", "0".repeat(pad), piece);
+            } else {
+                piece = format!("{}{}", " ".repeat(pad), piece);
+            }
+        }
+        out.push_str(&piece);
     }
 }
 
