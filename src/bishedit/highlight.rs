@@ -2,11 +2,15 @@
 // parallel implementation (see plan.md / the approved design doc for this
 // feature) -- Highlighter is a small trait so a regex-, treesitter-, or
 // LSP-backed source can slot in later; BashHighlighter is the only
-// implementor today, driven by lexer::tokenize_spanned.
+// implementor today, driven by lexer::tokenize_spanned. Wired into
+// editor.rs's redraw() (and, since that function is shared, command
+// mode's colon-line and Ctrl-E's line-local normal-mode view get it for
+// free too).
 //
-// Not yet wired into editor.rs -- lands ahead of its consumer, same
-// "build the seam, wire it in later" pattern as several other modules in
-// this crate (vt100.rs, pty.rs before the M9 compositor).
+// #![allow(dead_code)] stays regardless of wiring -- HighlightKind::Number
+// is reserved but intentionally unpopulated (see its own doc comment),
+// and the Highlighter trait exists for future non-Bash implementors this
+// crate doesn't have yet.
 #![allow(dead_code)]
 
 use crate::lexer::{self, Chunk, SpannedItem, Tok};

@@ -16,6 +16,7 @@
 use std::collections::HashMap;
 use std::io::{self, Write};
 
+use crate::bishedit::highlight::{self, BashHighlighter, Highlighter, StyledSpan};
 use crate::bishedit::motion;
 use crate::bishedit::vimkeys::{self, KeyOutcome, VimKeys};
 use crate::history::History;
@@ -382,9 +383,30 @@ fn redraw(prompt: &str, ed: &LineEditor, col_origin: usize, width: usize) -> io:
 
     out.push_str(prompt);
     let remaining = width - prompt_len;
+
+    // Highlight the whole buffer up front, then slice the *resolved*
+    // cells for whichever window ends up visible below -- a span that
+    // starts before the horizontally-scrolled window and extends into it
+    // still renders correctly from column 0 with no separate clipping
+    // logic, since slicing happens after per-char style is already
+    // resolved (same as how the un-highlighted code already sliced
+    // Vec<char>). Recomputed fresh on every redraw, same as the rest of
+    // this function -- no caching, matching this feature's own stated
+    // out-of-scope list (a single command line's worth of recomputation
+    // per keystroke is cheap enough that it isn't worth it).
+    let buf_text: String = ed.buf.iter().collect();
+    let styled: Vec<StyledSpan> = BashHighlighter
+        .highlight(&buf_text)
+        .into_iter()
+        .map(|s| {
+            let (fg, attrs) = highlight::default_style(s.kind);
+            StyledSpan { start: s.start, end: s.end, fg, attrs }
+        })
+        .collect();
+    let cells = highlight::compose(&ed.buf, &[&styled]);
+
     if ed.buf.len() <= remaining {
-        let text: String = ed.buf.iter().collect();
-        out.push_str(&text);
+        out.push_str(&highlight::render_styled(&cells));
         let back = ed.buf.len() - ed.cursor;
         if back > 0 {
             out.push_str(&format!("\x1b[{}D", back));
@@ -397,8 +419,7 @@ fn redraw(prompt: &str, ed: &LineEditor, col_origin: usize, width: usize) -> io:
         // (typing forward, by far the common case).
         let window_start = ed.cursor.saturating_sub(remaining - 1).min(ed.buf.len() - remaining);
         let window_end = (window_start + remaining).min(ed.buf.len());
-        let window: String = ed.buf[window_start..window_end].iter().collect();
-        out.push_str(&window);
+        out.push_str(&highlight::render_styled(&cells[window_start..window_end]));
         let back = (window_end - window_start) - (ed.cursor - window_start);
         if back > 0 {
             out.push_str(&format!("\x1b[{}D", back));
