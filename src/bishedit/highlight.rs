@@ -13,6 +13,7 @@
 // crate doesn't have yet.
 #![allow(dead_code)]
 
+use crate::bishedit::manpages;
 use crate::lexer::{self, Chunk, SpannedItem, Tok};
 use crate::vt100;
 use std::ops::Range;
@@ -282,17 +283,80 @@ fn is_assignment_prefix_word(chunks: &[Chunk]) -> bool {
     is_valid_ident(name)
 }
 
-// Stub for now -- filled in by a later stage (man-page-driven flag/
-// subcommand recognition, then a file/dir Link fallback).
+// Thin wrapper: resolves `command`'s man-page data (if ready yet -- see
+// manpages::query's own doc comment on why this never blocks) and
+// delegates the actual matching to classify_plain_argument_core, which
+// takes the data directly rather than going through the real cache/thread
+// -- that's the seam this module's own tests use to stay deterministic
+// without spawning `man`.
 fn classify_plain_argument(
-    _text: &str,
-    _word_span: &Range<usize>,
-    _command: &str,
-    _arg_index: usize,
-    _cwd: Option<&Path>,
-    _offset: usize,
+    text: &str,
+    word_span: &Range<usize>,
+    command: &str,
+    arg_index: usize,
+    cwd: Option<&Path>,
+    offset: usize,
 ) -> Option<HighlightSpan> {
+    let man = match manpages::query(command) {
+        manpages::ManStatus::Ready(data) => Some(data),
+        manpages::ManStatus::Pending | manpages::ManStatus::Missing => None,
+    };
+    classify_plain_argument_core(text, word_span, arg_index, man.as_deref(), cwd, offset)
+}
+
+// Priority order, matching "if the unquoted argument is not a flag or a
+// sub-command, we'll check if it's a file": a `-`-prefixed word is
+// checked ONLY against flags (any argument position) and never falls
+// through to subcommand/file-link matching, even on a miss -- a
+// flag-shaped argument is never meaningfully a file path either.
+// Subcommand matching is gated to arg_index == 0 (the word immediately
+// after the command name) -- single-level only, per this feature's v1
+// scope. The file/dir Link fallback lands in a later stage; for now a
+// non-flag, non-subcommand argument just stays uncolored, same as today.
+fn classify_plain_argument_core(
+    text: &str,
+    word_span: &Range<usize>,
+    arg_index: usize,
+    man: Option<&manpages::ManPageData>,
+    _cwd: Option<&Path>,
+    offset: usize,
+) -> Option<HighlightSpan> {
+    let out_span = |kind: HighlightKind, link: Option<String>| HighlightSpan {
+        start: offset + word_span.start,
+        end: offset + word_span.end,
+        kind,
+        link,
+    };
+
+    if text.starts_with('-') {
+        let flag_text = strip_flag_suffix(text);
+        if let Some(man) = man {
+            if man.flags.iter().any(|f| f == flag_text) {
+                return Some(out_span(HighlightKind::Flag, None));
+            }
+        }
+        return None;
+    }
+
+    if arg_index == 0 {
+        if let Some(man) = man {
+            if man.subcommands.iter().any(|s| s == text) {
+                return Some(out_span(HighlightKind::Subcommand, None));
+            }
+        }
+    }
+
     None
+}
+
+// Strips a trailing "=value" or " <placeholder>" suffix from a `-`-
+// prefixed argument, per this feature's v1 exact-match scope (no bundled
+// short-flag decomposition, e.g. "-la" is never split into "-l"/"-a").
+// Only ever called after the caller has already confirmed `text` starts
+// with '-'.
+fn strip_flag_suffix(text: &str) -> &str {
+    let end = text.find(|c: char| c == '=' || c == ' ').unwrap_or(text.len());
+    &text[..end]
 }
 
 // Stub for now -- filled in by a later stage (printf's %s/%d/etc
@@ -807,12 +871,82 @@ mod tests {
     }
 
     #[test]
-    fn command_name_and_argument_positions_are_not_colored_yet_since_stubs_return_nothing() {
-        // classify_plain_argument/builtin_refine are still stubs at this
-        // stage (real logic lands in later stages) -- this just confirms
-        // the state-machine wiring itself doesn't produce spurious output
-        // or panic for a representative line exercising every WordRole:
-        // an assignment prefix, a command name, and two arguments.
+    fn command_name_and_argument_positions_produce_no_spurious_spans() {
+        // "one"/"two" are never going to match "echo"'s real flags or
+        // subcommands (assuming man is even present and this is the
+        // first-ever query for "echo" in this test binary run, the real
+        // manpages::query call this now makes returns Pending
+        // synchronously -- no data yet, no spans -- regardless, since
+        // classify_plain_argument only ever emits a span on an *exact*
+        // match). This is really exercising the state-machine wiring
+        // itself: an assignment prefix, a command name, and two
+        // arguments, none of which should produce spurious output.
         assert_eq!(kinds("FOO=bar echo one two"), vec![]);
+    }
+
+    fn man(flags: &[&str], subcommands: &[&str]) -> manpages::ManPageData {
+        manpages::ManPageData {
+            flags: flags.iter().map(|s| s.to_string()).collect(),
+            subcommands: subcommands.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn classify_plain_argument_core_matches_an_exact_flag_at_any_arg_index() {
+        let data = man(&["-a", "--all"], &[]);
+        let span = 5..7;
+        let got = classify_plain_argument_core("-a", &span, 3, Some(&data), None, 0);
+        assert_eq!(got, Some(HighlightSpan { start: 5, end: 7, kind: HighlightKind::Flag, link: None }));
+    }
+
+    #[test]
+    fn classify_plain_argument_core_strips_a_value_suffix_before_matching() {
+        let data = man(&["--color"], &[]);
+        let span = 0..13;
+        let got = classify_plain_argument_core("--color=auto", &span, 1, Some(&data), None, 0);
+        assert_eq!(got, Some(HighlightSpan { start: 0, end: 13, kind: HighlightKind::Flag, link: None }));
+    }
+
+    #[test]
+    fn classify_plain_argument_core_flag_miss_never_falls_through() {
+        let data = man(&["-a"], &["commit"]);
+        // "-x" doesn't match any known flag, and starting with '-' means
+        // it must never be checked against subcommands either, even at
+        // arg_index 0.
+        let got = classify_plain_argument_core("-x", &(0..2), 0, Some(&data), None, 0);
+        assert_eq!(got, None);
+    }
+
+    #[test]
+    fn classify_plain_argument_core_no_man_data_yields_no_match() {
+        let got = classify_plain_argument_core("-a", &(0..2), 0, None, None, 0);
+        assert_eq!(got, None);
+    }
+
+    #[test]
+    fn classify_plain_argument_core_matches_subcommand_only_at_arg_index_zero() {
+        let data = man(&[], &["commit", "push"]);
+        let span = 4..10;
+        assert_eq!(
+            classify_plain_argument_core("commit", &span, 0, Some(&data), None, 0),
+            Some(HighlightSpan { start: 4, end: 10, kind: HighlightKind::Subcommand, link: None })
+        );
+        // Same text, later argument position -- single-level subcommand
+        // support only, per this feature's v1 scope.
+        assert_eq!(classify_plain_argument_core("commit", &span, 1, Some(&data), None, 0), None);
+    }
+
+    #[test]
+    fn classify_plain_argument_core_offset_shifts_the_returned_span() {
+        let data = man(&["-a"], &[]);
+        let got = classify_plain_argument_core("-a", &(2..4), 0, Some(&data), None, 100);
+        assert_eq!(got, Some(HighlightSpan { start: 102, end: 104, kind: HighlightKind::Flag, link: None }));
+    }
+
+    #[test]
+    fn strip_flag_suffix_stops_at_equals_or_space() {
+        assert_eq!(strip_flag_suffix("--color=auto"), "--color");
+        assert_eq!(strip_flag_suffix("-C <path>"), "-C");
+        assert_eq!(strip_flag_suffix("-a"), "-a");
     }
 }
