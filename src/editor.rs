@@ -15,6 +15,7 @@
 
 use std::collections::HashMap;
 use std::io::{self, Write};
+use std::path::Path;
 
 use crate::bishedit::highlight::{self, BashHighlighter, Highlighter, StyledSpan};
 use crate::bishedit::motion;
@@ -362,7 +363,7 @@ impl LineEditor {
 // "long line stays on one row" behavior GNU readline itself falls back
 // to in a narrow terminal -- recomputed fresh on every redraw from the
 // cursor's current position, not a persisted scroll offset.
-fn redraw(prompt: &str, ed: &LineEditor, col_origin: usize, width: usize) -> io::Result<()> {
+fn redraw(prompt: &str, ed: &LineEditor, col_origin: usize, width: usize, cwd: Option<&Path>) -> io::Result<()> {
     let mut out = String::new();
     out.push_str(&format!("\x1b[{}G", col_origin + 1));
     out.push_str(&" ".repeat(width));
@@ -396,7 +397,7 @@ fn redraw(prompt: &str, ed: &LineEditor, col_origin: usize, width: usize) -> io:
     // per keystroke is cheap enough that it isn't worth it).
     let buf_text: String = ed.buf.iter().collect();
     let styled: Vec<StyledSpan> = BashHighlighter
-        .highlight(&buf_text)
+        .highlight(&buf_text, cwd)
         .into_iter()
         .map(|s| {
             let (fg, attrs) = highlight::default_style(s.kind);
@@ -587,6 +588,7 @@ pub fn read_line(
     initial: Option<(String, usize)>,
     col_origin: usize,
     width: usize,
+    cwd: Option<&Path>,
     mut on_idle: impl FnMut(),
 ) -> io::Result<ReadOutcome> {
     let mut guard = Some(term::RawGuard::enable(0)?);
@@ -616,7 +618,7 @@ pub fn read_line(
     // print here would append a second copy right next to it instead of
     // redrawing over it. Behaviorally identical to the old bare print for
     // every non-paned caller (col_origin 0, width the whole terminal).
-    redraw(prompt, &ed, col_origin, width)?;
+    redraw(prompt, &ed, col_origin, width, cwd)?;
 
     // Set only when Ctrl-E's or Ctrl-O's own sub-loop below reports a key
     // it didn't consume itself (Ctrl-C/D/Z -- see run_line_normal_mode/
@@ -781,7 +783,7 @@ pub fn read_line(
             // comment. Reassigned from this key's previous "move cursor to
             // end of line" meaning (still reachable via the plain `End`
             // key, just no longer double-bound).
-            Key::CtrlE => match run_line_normal_mode(&mut ed, prompt, col_origin, width, &mut on_idle)? {
+            Key::CtrlE => match run_line_normal_mode(&mut ed, prompt, col_origin, width, cwd, &mut on_idle)? {
                 LineNormalExit::ToInsert => {}
                 LineNormalExit::Propagate(k) => {
                     pending_key = Some(k);
@@ -804,7 +806,7 @@ pub fn read_line(
             }
             Key::AltLeft | Key::AltRight | Key::AltUp | Key::CtrlY | Key::Unknown => {}
         }
-        redraw(prompt, &ed, col_origin, width)?;
+        redraw(prompt, &ed, col_origin, width, cwd)?;
     }
 }
 
@@ -845,6 +847,7 @@ fn run_line_normal_mode(
     prompt: &str,
     col_origin: usize,
     width: usize,
+    cwd: Option<&Path>,
     on_idle: &mut dyn FnMut(),
 ) -> io::Result<LineNormalExit> {
     let mut vk = VimKeys::new();
@@ -857,7 +860,7 @@ fn run_line_normal_mode(
     // unwanted, sticky change to something this feature has no business
     // touching.
     let decorated_prompt = format!("\x1b[7m{}\x1b[0m", prompt);
-    redraw(&decorated_prompt, ed, col_origin, width)?;
+    redraw(&decorated_prompt, ed, col_origin, width, cwd)?;
     let exit = loop {
         let key = match read_key_idle(on_idle)? {
             Some(k) => k,
@@ -886,7 +889,7 @@ fn run_line_normal_mode(
                 }
             }
         }
-        redraw(&decorated_prompt, ed, col_origin, width)?;
+        redraw(&decorated_prompt, ed, col_origin, width, cwd)?;
     };
     Ok(exit)
 }

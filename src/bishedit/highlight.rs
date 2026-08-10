@@ -16,6 +16,7 @@
 use crate::lexer::{self, Chunk, SpannedItem, Tok};
 use crate::vt100;
 use std::ops::Range;
+use std::path::Path;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HighlightKind {
@@ -59,15 +60,15 @@ pub struct HighlightSpan {
 }
 
 pub trait Highlighter {
-    fn highlight(&self, text: &str) -> Vec<HighlightSpan>;
+    fn highlight(&self, text: &str, cwd: Option<&Path>) -> Vec<HighlightSpan>;
 }
 
 pub struct BashHighlighter;
 
 impl Highlighter for BashHighlighter {
-    fn highlight(&self, text: &str) -> Vec<HighlightSpan> {
+    fn highlight(&self, text: &str, cwd: Option<&Path>) -> Vec<HighlightSpan> {
         let mut out = Vec::new();
-        highlight_into(text, 0, &mut out);
+        highlight_into(text, 0, cwd, &mut out);
         out
     }
 }
@@ -178,7 +179,7 @@ fn next_span(raw_spans: &[Range<usize>], cursor: &mut usize) -> Option<Range<usi
 // level from that level's own `text` (not threaded from the caller) --
 // raw_capture_spans positions are always relative to whatever text they
 // were captured from, so this stays a purely local computation.
-fn highlight_into(text: &str, offset: usize, out: &mut Vec<HighlightSpan>) {
+fn highlight_into(text: &str, offset: usize, cwd: Option<&Path>, out: &mut Vec<HighlightSpan>) {
     let chars: Vec<char> = text.chars().collect();
     let res = lexer::tokenize_spanned(text);
     let mut cursor = 0usize;
@@ -188,7 +189,7 @@ fn highlight_into(text: &str, offset: usize, out: &mut Vec<HighlightSpan>) {
                 out.push(HighlightSpan { start: offset + r.start, end: offset + r.end, kind: HighlightKind::Comment, link: None });
             }
             SpannedItem::Tok(tok, span) => {
-                highlight_tok(tok, span, offset, &chars, &res.raw_capture_spans, &mut cursor, out);
+                highlight_tok(tok, span, offset, &chars, &res.raw_capture_spans, &mut cursor, cwd, out);
             }
         }
     }
@@ -201,6 +202,7 @@ fn highlight_tok(
     chars: &[char],
     raw_spans: &[Range<usize>],
     cursor: &mut usize,
+    cwd: Option<&Path>,
     out: &mut Vec<HighlightSpan>,
 ) {
     let whole = |kind: HighlightKind| HighlightSpan { start: offset + span.start, end: offset + span.end, kind, link: None };
@@ -256,7 +258,7 @@ fn highlight_tok(
         // delimiters); only the interior recursively highlights.
         Tok::Subshell(raw) => {
             if let Some(inner) = next_span(raw_spans, cursor) {
-                highlight_into(raw, offset + inner.start, out);
+                highlight_into(raw, offset + inner.start, cwd, out);
             }
         }
 
@@ -270,7 +272,7 @@ fn highlight_tok(
             out.push(whole(HighlightKind::Substitution));
         }
 
-        Tok::Word(chunks, _plain) => highlight_word(chunks, offset, chars, raw_spans, cursor, out),
+        Tok::Word(chunks, _plain) => highlight_word(chunks, offset, chars, raw_spans, cursor, cwd, out),
     }
 }
 
@@ -285,6 +287,7 @@ fn highlight_word(
     chars: &[char],
     raw_spans: &[Range<usize>],
     cursor: &mut usize,
+    cwd: Option<&Path>,
     out: &mut Vec<HighlightSpan>,
 ) {
     if let [Chunk::Str(_)] = chunks {
@@ -334,7 +337,7 @@ fn highlight_word(
                     let delim_start = if is_backtick { r.start - 1 } else { r.start.saturating_sub(2) };
                     out.push(HighlightSpan { start: offset + delim_start, end: offset + r.start, kind: HighlightKind::Substitution, link: None });
                     out.push(HighlightSpan { start: offset + r.end, end: offset + r.end + 1, kind: HighlightKind::Substitution, link: None });
-                    highlight_into(raw, offset + r.start, out);
+                    highlight_into(raw, offset + r.start, cwd, out);
                 }
             }
 
@@ -355,18 +358,18 @@ fn highlight_word(
             // recurse treatment as Chunk::Sub, but unambiguous (each
             // variant has exactly one possible delimiter pair), so no
             // peeking needed.
-            Chunk::ProcSubIn { raw } => push_procsub(raw, offset, raw_spans, cursor, out),
-            Chunk::ProcSubOut { raw } => push_procsub(raw, offset, raw_spans, cursor, out),
+            Chunk::ProcSubIn { raw } => push_procsub(raw, offset, raw_spans, cursor, cwd, out),
+            Chunk::ProcSubOut { raw } => push_procsub(raw, offset, raw_spans, cursor, cwd, out),
         }
     }
 }
 
-fn push_procsub(raw: &str, offset: usize, raw_spans: &[Range<usize>], cursor: &mut usize, out: &mut Vec<HighlightSpan>) {
+fn push_procsub(raw: &str, offset: usize, raw_spans: &[Range<usize>], cursor: &mut usize, cwd: Option<&Path>, out: &mut Vec<HighlightSpan>) {
     if let Some(r) = next_span(raw_spans, cursor) {
         let delim_start = r.start.saturating_sub(2);
         out.push(HighlightSpan { start: offset + delim_start, end: offset + r.start, kind: HighlightKind::Substitution, link: None });
         out.push(HighlightSpan { start: offset + r.end, end: offset + r.end + 1, kind: HighlightKind::Substitution, link: None });
-        highlight_into(raw, offset + r.start, out);
+        highlight_into(raw, offset + r.start, cwd, out);
     }
 }
 
@@ -375,7 +378,7 @@ mod tests {
     use super::*;
 
     fn kinds(text: &str) -> Vec<(usize, usize, HighlightKind)> {
-        let mut spans = BashHighlighter.highlight(text);
+        let mut spans = BashHighlighter.highlight(text, None);
         spans.sort_by_key(|s| (s.start, s.end));
         spans.into_iter().map(|s| (s.start, s.end, s.kind)).collect()
     }
@@ -516,7 +519,7 @@ mod tests {
         // (i.e. produce no spans, being a plain word) rather than the
         // whole line going uncolored.
         let text = "echo 'unterminated";
-        let spans = BashHighlighter.highlight(text);
+        let spans = BashHighlighter.highlight(text, None);
         // No panic, and no spans at all is the correct result here since
         // "echo" alone is a plain, uncolored word and the unterminated
         // quote never got far enough to produce a LiteralStr chunk.

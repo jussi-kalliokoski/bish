@@ -396,8 +396,13 @@ pub fn run(mut shell: Shell) {
         // needs to be visible mid-browse anyway (see History's own doc
         // comment on what a clone/fork actually shares).
         let session_history = sessions[&session_id].history.clone();
+        // Same "standalone snapshot, not a live borrow" reasoning as
+        // session_history just above -- on_idle's own &mut sessions borrow
+        // below would conflict with borrowing sessions[&session_id].shell.cwd
+        // directly as a same-call argument.
+        let cwd_snapshot = sessions[&session_id].shell.cwd.clone();
 
-        match editor::read_line(&prompt_str, &session_history, false, false, pending_initial.take(), col_origin, width, || {
+        match editor::read_line(&prompt_str, &session_history, false, false, pending_initial.take(), col_origin, width, Some(cwd_snapshot.as_path()), || {
             service_background_jobs(&mut sessions, &mut windows, &mut job_frames, current_window);
         }) {
             Ok(ReadOutcome::Eof) => {
@@ -2852,7 +2857,11 @@ fn run_command_mode(
         // reports: true -- command mode gives Ctrl-L its own meaning
         // (toggling the transcript view, below) rather than the
         // ordinary shell prompt's "clear the real screen."
-        match editor::read_line(&prompt_str, history, true, true, pending_initial.take(), 0, term_cols, &mut || {
+        // cwd: None -- no single clearly-current session/cwd at this call
+        // site, and command mode types window-management subcommands, not
+        // file paths, so only file/dir Link highlighting is skipped here
+        // (flag/subcommand/printf highlighting don't need cwd at all).
+        match editor::read_line(&prompt_str, history, true, true, pending_initial.take(), 0, term_cols, None, &mut || {
             service_background_jobs(sessions, windows, job_frames, current_window);
         }) {
             Ok(ReadOutcome::Eof) | Ok(ReadOutcome::Interrupted) => return CommandModeOutcome::Cancelled,
