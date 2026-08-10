@@ -4,6 +4,7 @@
 // stays regardless -- this crate isn't the only intended consumer long-term.
 #![allow(dead_code)]
 
+pub mod highlight;
 pub mod motion;
 pub mod vimkeys;
 

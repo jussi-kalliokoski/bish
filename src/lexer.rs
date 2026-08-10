@@ -231,24 +231,29 @@ pub struct Lexer<'a> {
     // threading an opt-in through every call site, and the cost is one
     // usize increment per char already being consumed regardless.
     pos: usize,
-    // Half-open char-index ranges, one per "expansion" chunk pushed while
-    // reading a word, in the same left-to-right order as the chunks
-    // themselves -- i.e. one entry per Chunk::{Sub, Arith, Var, VarExpand,
-    // ArrayVar, ArrayLength, ArrayVarExpand, Indirect, ArrayKeys} pushed
-    // via capture_balanced_parens/capture_backtick or push_var's own two
+    // Half-open char-index ranges, one per chunk pushed while reading a
+    // word EXCEPT plain Chunk::Str, in the same left-to-right order as the
+    // chunks themselves -- i.e. one entry per Chunk::{LiteralStr, Sub,
+    // Arith, Var, VarExpand, ArrayVar, ArrayLength, ArrayVarExpand,
+    // Indirect, ArrayKeys, ProcSubIn, ProcSubOut}, pushed by
+    // capture_balanced_parens/capture_backtick, by push_var's own two
     // non-recursive dispatch branches (the ${...} brace-content path and
-    // the bare $NAME fallback). Plain Chunk::Str/LiteralStr text isn't
-    // included here -- their source span is always recoverable without a
-    // side-channel entry (Str is a verbatim, unescaped copy of source
-    // chars; LiteralStr's boundaries fall out of the surrounding
-    // quote/escape structure a highlighter is already walking).
+    // the bare $NAME fallback), or by read_word's own three LiteralStr
+    // sites (single-quoted, double-quoted, and single-char backslash-
+    // escape runs). Chunk::Str is the one exception: its source span is
+    // always recoverable without a side-channel entry, since it's a
+    // verbatim, unescaped copy of source chars (never true for LiteralStr,
+    // whose decoded length can differ from its source span whenever a
+    // double-quote escape sequence -- \$, \\, \" -- consumed 2 source
+    // chars for 1 decoded char).
     // For Sub/Arith/ProcSubIn/ProcSubOut the range excludes the
     // construct's own delimiters ($( ), backtick, <( )/>( )) since that's
     // the raw text a highlighter recursively re-lexes. For the terminal
-    // (non-recursive) ${...}/bare $NAME chunks, the range similarly
-    // excludes the `{`/`}` braces (or has none to exclude, for the bare
-    // form) -- same "delimiters excluded" convention either way, even
-    // though those two never get recursed into.
+    // (non-recursive) LiteralStr/${...}/bare $NAME chunks, the range
+    // similarly excludes their own delimiters (quotes, `{`/`}` braces, or
+    // nothing to exclude for the bare $NAME/backslash-escape forms) --
+    // same "delimiters excluded" convention either way, even though these
+    // never get recursed into.
     // capture_double_paren doesn't push its own -- it just wraps a
     // capture_balanced_parens call whose span already covers the same raw
     // text -- so pushing there too would desync the one-span-per-chunk
@@ -909,6 +914,7 @@ impl<'a> Lexer<'a> {
                 Some('\'') => {
                     plain = false;
                     self.advance();
+                    let lit_start = self.pos;
                     let mut lit = String::new();
                     loop {
                         match self.advance() {
@@ -926,6 +932,11 @@ impl<'a> Lexer<'a> {
                         chunks.push(Chunk::Str(std::mem::take(&mut buf)));
                     }
                     if !lit.is_empty() {
+                        // pos was just bumped past the closing quote, so
+                        // pos - 1 is that quote's own index -- same
+                        // "excludes delimiters" convention as everywhere
+                        // else in raw_capture_spans.
+                        self.raw_capture_spans.push(lit_start..self.pos - 1);
                         chunks.push(Chunk::LiteralStr(lit));
                     }
                 }
@@ -933,6 +944,14 @@ impl<'a> Lexer<'a> {
                     plain = false;
                     self.advance();
                     let mut lit = String::new();
+                    // Tracks where the *current* literal run (since the
+                    // last flush) started -- unlike single quotes,
+                    // double-quote escapes ($/`/\ prefixed with a
+                    // backslash) consume 2 source chars but produce 1
+                    // decoded char, so `lit`'s own length can't be used to
+                    // recover its source span; this has to be tracked by
+                    // position, not length, across every flush point below.
+                    let mut lit_start = self.pos;
                     loop {
                         match self.advance() {
                             None => return Err("unterminated double quote".to_string()),
@@ -945,10 +964,15 @@ impl<'a> Lexer<'a> {
                                 _ => lit.push('\\'),
                             },
                             Some('$') => {
+                                // `$` was just consumed by the advance()
+                                // above, so pos - 1 is its own index -- the
+                                // literal run's exclusive end.
+                                let dollar_pos = self.pos - 1;
                                 if !buf.is_empty() {
                                     chunks.push(Chunk::Str(std::mem::take(&mut buf)));
                                 }
                                 if !lit.is_empty() {
+                                    self.raw_capture_spans.push(lit_start..dollar_pos);
                                     chunks.push(Chunk::LiteralStr(std::mem::take(&mut lit)));
                                 }
                                 // Pass `lit` (now empty), not `buf`: if
@@ -959,16 +983,26 @@ impl<'a> Lexer<'a> {
                                 // trailing "$" (e.g. a regex end-anchor
                                 // written *inside* quotes) would wrongly
                                 // lose its quoted-ness.
-                                self.push_var(&mut chunks, &mut lit, true)?;
+                                let produced = self.push_var(&mut chunks, &mut lit, true)?;
+                                // If push_var fell back to a literal "$"
+                                // (produced == false, 0 chars consumed by
+                                // push_var itself), the next literal run
+                                // actually starts AT the '$' -- not after
+                                // it -- since that's exactly what just got
+                                // written back into `lit`.
+                                lit_start = if produced { self.pos } else { dollar_pos };
                             }
                             Some('`') => {
+                                let backtick_pos = self.pos - 1;
                                 if !buf.is_empty() {
                                     chunks.push(Chunk::Str(std::mem::take(&mut buf)));
                                 }
                                 if !lit.is_empty() {
+                                    self.raw_capture_spans.push(lit_start..backtick_pos);
                                     chunks.push(Chunk::LiteralStr(std::mem::take(&mut lit)));
                                 }
                                 chunks.push(Chunk::Sub { raw: self.capture_backtick()?, quoted: true });
+                                lit_start = self.pos;
                             }
                             Some(c) => lit.push(c),
                         }
@@ -977,16 +1011,23 @@ impl<'a> Lexer<'a> {
                         chunks.push(Chunk::Str(std::mem::take(&mut buf)));
                     }
                     if !lit.is_empty() {
+                        // pos was just bumped past the closing '"'.
+                        self.raw_capture_spans.push(lit_start..self.pos - 1);
                         chunks.push(Chunk::LiteralStr(lit));
                     }
                 }
                 Some('\\') => {
                     plain = false;
+                    // The whole 2-char escape (backslash + escaped char)
+                    // maps to LiteralStr's 1-char decoded value -- the span
+                    // covers both source chars, not just the escaped one.
+                    let start = self.pos;
                     self.advance();
                     if let Some(n) = self.advance() {
                         if !buf.is_empty() {
                             chunks.push(Chunk::Str(std::mem::take(&mut buf)));
                         }
+                        self.raw_capture_spans.push(start..self.pos);
                         chunks.push(Chunk::LiteralStr(n.to_string()));
                     }
                 }
@@ -1901,8 +1942,12 @@ mod tests {
         let src = "echo \"yooo, $(printf 'hello %' world)\"";
         let res = tokenize_spanned(src);
         assert_eq!(res.error, None);
-        assert_eq!(res.raw_capture_spans.len(), 1);
-        let sub_span = &res.raw_capture_spans[0];
+        // Two entries now: the leading "yooo, " double-quoted literal run
+        // (LiteralStr instrumentation) followed by the $(...) substitution
+        // itself, in that left-to-right order.
+        assert_eq!(res.raw_capture_spans.len(), 2);
+        assert_eq!(spanned_text(src, &res.raw_capture_spans[0]), "yooo, ");
+        let sub_span = &res.raw_capture_spans[1];
         let inner_src = spanned_text(src, sub_span);
         assert_eq!(inner_src, "printf 'hello %' world");
         // Re-lexing just the captured raw text independently finds its own
@@ -1981,5 +2026,48 @@ mod tests {
             }
             other => panic!("unexpected chunk shape: {:?}", other),
         }
+    }
+
+    // LiteralStr instrumentation (added alongside the highlighter, since
+    // it's what lets quoted-string spans get colored): covers single
+    // quotes (1:1, no escapes), double quotes (escapes shrink source
+    // chars to fewer decoded chars, so this must track by position, not
+    // by `lit`'s own length), and the standalone backslash-escape case.
+    #[test]
+    fn literal_str_spans_cover_source_text_not_decoded_length() {
+        let src = r#"echo 'a b'"c\"d"\x"#;
+        let res = tokenize_spanned(src);
+        assert_eq!(res.error, None);
+
+        // Chunk::LiteralStr sources, in order: 'a b' -> "a b" (single
+        // quotes, 1:1); "c\"d" -> the double-quoted run containing an
+        // escaped quote, decoded to `c"d` (4 source chars -> 3 decoded);
+        // \x -> decoded to `x` (2 source chars, backslash + x -> 1
+        // decoded char).
+        let expected = ["a b", "c\"d", "x"];
+        assert_eq!(res.raw_capture_spans.len(), expected.len(), "spans: {:?}", res.raw_capture_spans);
+
+        // The spans must cover the *source* text (surrounding quotes
+        // excluded, but the escaping backslash included where present),
+        // which differs from the decoded chunk value in both cases above.
+        let expected_source = ["a b", "c\\\"d", "\\x"];
+        for (span, expected) in res.raw_capture_spans.iter().zip(expected_source) {
+            assert_eq!(spanned_text(src, span), expected);
+        }
+
+        let literal_strs: Vec<&String> = res
+            .items
+            .iter()
+            .filter_map(|it| match it {
+                SpannedItem::Tok(Tok::Word(w, _), _) => Some(w),
+                _ => None,
+            })
+            .flatten()
+            .filter_map(|c| match c {
+                Chunk::LiteralStr(s) => Some(s),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(literal_strs, expected.iter().collect::<Vec<_>>());
     }
 }
