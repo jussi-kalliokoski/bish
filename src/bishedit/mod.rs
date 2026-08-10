@@ -5,6 +5,7 @@
 #![allow(dead_code)]
 
 pub mod highlight;
+pub mod manpages;
 pub mod motion;
 pub mod vimkeys;
 
