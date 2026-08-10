@@ -2043,16 +2043,81 @@ fn render_normal_mode_row(out: &mut String, buf: &ScreenBuffer, line: usize, col
     out.push_str("\x1b[0m");
 }
 
-// Draws `buf`'s current viewport into `rect` (the focused pane's own
-// rectangle -- see pane_rect), reusing sgr_codes the same way render_row
-// does for a live pane. Lines past the end of the buffer's content are
-// left blank -- vim's own "~" convention for that is one more piece of
-// scope this first pass leaves out. Positions the real terminal cursor
-// at the navigation cursor's own screen location afterward.
-fn render_normal_mode_view(buf: &ScreenBuffer, rect: Rect) {
+// The focused pane's own rectangle is split between the scrollback view
+// and a one-row status bar pinned to the rectangle's own last row (see
+// render_normal_mode_frame) -- this is how many rows are left for the
+// view itself. `.max(1)`: a pane too short to spare a row for status
+// still gets *some* content rather than a zero-height, panicking view.
+fn normal_mode_content_rows(rect: Rect) -> usize {
+    rect.rows.saturating_sub(1).max(1)
+}
+
+// The status bar's left side: the search/command line while one is being
+// typed (`command_line`, e.g. ":q" or "/foo" as typed so far -- this is
+// how `:`/`/`/`?` input actually becomes visible; previously nothing was
+// drawn while typing them at all, easily read as "doesn't work"), else
+// whatever `vk` has to say about the current key sequence -- a pending
+// count/prefix in progress (e.g. "20g" mid-`20gg`), or failing that a
+// brief flash of the motion that was just applied (e.g. "[20k]"), else
+// just the bare mode indicator. A pending search ('/'/'?') is shown
+// alone, without the "-- NORMAL --" prefix, matching vim's own
+// command-line convention of replacing the mode indicator outright while
+// typing one.
+fn normal_mode_status_left(vk: &VimKeys, command_line: Option<&str>) -> String {
+    if let Some(cmd) = command_line {
+        return cmd.to_string();
+    }
+    let pending = vk.pending_display();
+    if pending.starts_with('/') || pending.starts_with('?') {
+        return pending.to_string();
+    }
+    if !pending.is_empty() {
+        return format!("-- NORMAL -- {}", pending);
+    }
+    let last = vk.last_motion_display();
+    if !last.is_empty() {
+        return format!("-- NORMAL -- [{}]", last);
+    }
+    "-- NORMAL --".to_string()
+}
+
+fn normal_mode_status_text(buf: &ScreenBuffer, vk: &VimKeys, command_line: Option<&str>, cols: usize) -> String {
+    let left = normal_mode_status_left(vk, command_line);
+    let (line, col) = buf.cursor();
+    let total = buf.line_count();
+    let right = format!("{},{}  {}/{}", line + 1, col + 1, line + 1, total);
+
+    let left_len = left.chars().count();
+    let right_len = right.chars().count();
+    let mut text = left;
+    if left_len + right_len < cols {
+        text.push_str(&" ".repeat(cols - left_len - right_len));
+        text.push_str(&right);
+    }
+    let text_len = text.chars().count();
+    match text_len.cmp(&cols) {
+        std::cmp::Ordering::Less => text.push_str(&" ".repeat(cols - text_len)),
+        std::cmp::Ordering::Greater => text = text.chars().take(cols).collect(),
+        std::cmp::Ordering::Equal => {}
+    }
+    text
+}
+
+// Draws `buf`'s current viewport plus a one-row status bar into `rect`
+// (the focused pane's own rectangle -- see pane_rect), reusing sgr_codes
+// the same way render_row does for a live pane. Lines past the end of
+// the buffer's content are left blank -- vim's own "~" convention for
+// that is one more piece of scope this first pass leaves out. Positions
+// the real terminal cursor at the navigation cursor's own screen
+// location afterward -- not the status bar, so the blinking cursor stays
+// where it's actually useful (showing position in the content) even
+// while the status bar shows a pending command/search line taking input
+// from the very same keystream.
+fn render_normal_mode_frame(buf: &ScreenBuffer, rect: Rect, vk: &VimKeys, command_line: Option<&str>) {
+    let content_rows = normal_mode_content_rows(rect);
     let total = buf.line_count();
     let mut out = String::new();
-    for r in 0..rect.rows {
+    for r in 0..content_rows {
         let line = buf.viewport_top() + r;
         out.push_str(&format!("\x1b[{};{}H", rect.row + r + 1, rect.col + 1));
         if line < total {
@@ -2061,8 +2126,15 @@ fn render_normal_mode_view(buf: &ScreenBuffer, rect: Rect) {
             out.push_str(&" ".repeat(rect.cols));
         }
     }
+
+    let status_row = rect.row + content_rows;
+    out.push_str(&format!("\x1b[{};{}H", status_row + 1, rect.col + 1));
+    out.push_str("\x1b[7m");
+    out.push_str(&normal_mode_status_text(buf, vk, command_line, rect.cols));
+    out.push_str("\x1b[0m");
+
     let (cl, cc) = buf.cursor();
-    let screen_row = cl.saturating_sub(buf.viewport_top()).min(rect.rows.saturating_sub(1));
+    let screen_row = cl.saturating_sub(buf.viewport_top()).min(content_rows.saturating_sub(1));
     let screen_col = cc.min(rect.cols.saturating_sub(1));
     out.push_str(&format!("\x1b[{};{}H", rect.row + screen_row + 1, rect.col + screen_col + 1));
     out.push_str("\x1b[?25h");
@@ -2112,7 +2184,7 @@ fn run_normal_mode_navigation(
     // even showing the current prompt.
     freeze_idle_prompt(sessions.get_mut(&session_id).unwrap());
     let screen = sessions[&session_id].screen.clone();
-    let mut buf = ScreenBuffer::new(screen, rect.rows);
+    let mut buf = ScreenBuffer::new(screen, normal_mode_content_rows(rect));
     let mut vk = VimKeys::new();
 
     let _guard = term::RawGuard::enable(0)?;
@@ -2121,7 +2193,7 @@ fn run_normal_mode_navigation(
     // starts out blank), harmless otherwise -- then this pane's own
     // rectangle on top of that with the scrollback view.
     compositor_redraw(sessions, windows, current_window, term_rows, term_cols);
-    render_normal_mode_view(&buf, rect);
+    render_normal_mode_frame(&buf, rect, &vk, None);
 
     loop {
         let key = match editor::read_key_idle(&mut || {
@@ -2142,8 +2214,15 @@ fn run_normal_mode_navigation(
                 }
                 continue;
             }
+            // ':' isn't routed through vimkeys (see run_normal_mode_
+            // navigation's own doc comment on why `:q`/`:q!` are handled
+            // directly here) -- so this loop renders its own live status
+            // bar as the command is typed, the same live-feedback
+            // treatment vimkeys' Pending::Search already gets for '/'/'?'
+            // for free via pending_display().
             Key::Char(':') => {
                 let mut cmd = String::new();
+                render_normal_mode_frame(&buf, rect, &vk, Some(":"));
                 loop {
                     let k2 = match editor::read_key_idle(&mut || {
                         service_background_jobs(sessions, windows, job_frames, current_window);
@@ -2163,21 +2242,26 @@ fn run_normal_mode_navigation(
                         Key::Char(c) => cmd.push(c),
                         _ => {}
                     }
+                    render_normal_mode_frame(&buf, rect, &vk, Some(&format!(":{}", cmd)));
                 }
                 if cmd == "q" || cmd == "q!" {
                     break;
                 }
-                render_normal_mode_view(&buf, rect);
+                render_normal_mode_frame(&buf, rect, &vk, None);
                 continue;
             }
             _ => {}
         }
 
+        // Rendered on every keystroke, not just a resolved Motion -- the
+        // status bar needs to show a pending count/prefix (e.g. "20g"
+        // mid-`20gg`) and a search's in-progress text live, not just the
+        // end result once a motion actually applies.
         if let KeyOutcome::Motion(m, count) = vk.feed(key) {
             motion::apply_motion(&mut buf, m, count);
             scroll_to_show_cursor(&mut buf);
-            render_normal_mode_view(&buf, rect);
         }
+        render_normal_mode_frame(&buf, rect, &vk, None);
     }
 
     compositor_redraw(sessions, windows, current_window, term_rows, term_cols);

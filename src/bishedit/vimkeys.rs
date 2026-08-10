@@ -40,12 +40,49 @@ enum LastSearch {
     Word { forward: bool },
 }
 
+// A short display label for keys `feed` might reasonably want to echo
+// into `current_input`'s transcript -- `None` for keys with no natural
+// short label (Delete, AltLeft/Right/Up, ...), which just don't
+// contribute to the transcript rather than being an error.
+fn key_label(key: Key) -> Option<String> {
+    Some(match key {
+        Key::Char(c) => c.to_string(),
+        Key::Left => "\u{2190}".to_string(),
+        Key::Right => "\u{2192}".to_string(),
+        Key::Up => "\u{2191}".to_string(),
+        Key::Down => "\u{2193}".to_string(),
+        Key::Home => "Home".to_string(),
+        Key::End => "End".to_string(),
+        Key::Enter => "<CR>".to_string(),
+        Key::Backspace => "<BS>".to_string(),
+        Key::Escape => "<Esc>".to_string(),
+        Key::CtrlD => "^D".to_string(),
+        Key::CtrlU => "^U".to_string(),
+        Key::CtrlF => "^F".to_string(),
+        Key::CtrlB => "^B".to_string(),
+        Key::CtrlE => "^E".to_string(),
+        Key::CtrlY => "^Y".to_string(),
+        _ => return None,
+    })
+}
+
 pub struct VimKeys {
     count: Option<usize>,
     pending: Pending,
     last_find: Option<(char, bool, bool)>, // (ch, till, forward)
     last_search_text: String,
     last_search: Option<LastSearch>,
+    // A human-readable transcript of the keys fed since the last resolved
+    // motion (or the last aborted sequence) -- e.g. "20g" while typing
+    // `20gg`, or "/cher" while typing a search. Exists purely for a
+    // frontend's status-bar display (see repl.rs's normal-mode status
+    // bar); has no effect on how keys are interpreted.
+    current_input: String,
+    // A snapshot of `current_input` taken at the moment it last resolved
+    // into a motion -- e.g. "20gg" -- kept around (not cleared) until the
+    // next key starts a new sequence, so a frontend can flash "here's what
+    // that just did" for a beat after the motion applies.
+    last_completed: String,
 }
 
 impl VimKeys {
@@ -56,10 +93,28 @@ impl VimKeys {
             last_find: None,
             last_search_text: String::new(),
             last_search: None,
+            current_input: String::new(),
+            last_completed: String::new(),
         }
     }
 
+    /// What's been typed so far toward the motion/search/command in
+    /// progress -- empty when nothing is pending. Display only.
+    pub fn pending_display(&self) -> &str {
+        &self.current_input
+    }
+
+    /// The keys that produced the most recently applied motion -- stays
+    /// populated (for a frontend to flash briefly) until the next key
+    /// starts a new sequence. Display only.
+    pub fn last_motion_display(&self) -> &str {
+        &self.last_completed
+    }
+
     pub fn feed(&mut self, key: Key) -> KeyOutcome {
+        if let Some(label) = key_label(key) {
+            self.current_input.push_str(&label);
+        }
         match std::mem::replace(&mut self.pending, Pending::None) {
             Pending::None => self.feed_fresh(key),
             Pending::G => self.feed_g(key),
@@ -75,12 +130,14 @@ impl VimKeys {
     fn emit(&mut self, motion: Motion) -> KeyOutcome {
         let count = self.count.take();
         self.pending = Pending::None;
+        self.last_completed = std::mem::take(&mut self.current_input);
         KeyOutcome::Motion(motion, count)
     }
 
     fn abort(&mut self) -> KeyOutcome {
         self.count = None;
         self.pending = Pending::None;
+        self.current_input.clear();
         KeyOutcome::None
     }
 
@@ -598,5 +655,58 @@ mod tests {
             last(&mut vk, &keys),
             KeyOutcome::Motion(Motion::FindChar { ch: 'x', till: false, forward: true }, Some(2))
         );
+    }
+
+    #[test]
+    fn pending_display_shows_count_and_prefix_as_typed() {
+        let mut vk = VimKeys::new();
+        assert_eq!(vk.pending_display(), "");
+        vk.feed(Key::Char('2'));
+        assert_eq!(vk.pending_display(), "2");
+        vk.feed(Key::Char('0'));
+        assert_eq!(vk.pending_display(), "20");
+        vk.feed(Key::Char('g'));
+        assert_eq!(vk.pending_display(), "20g");
+        vk.feed(Key::Char('g'));
+        // resolved into a motion -- nothing pending anymore
+        assert_eq!(vk.pending_display(), "");
+    }
+
+    #[test]
+    fn last_motion_display_flashes_the_completed_sequence() {
+        let mut vk = VimKeys::new();
+        assert_eq!(vk.last_motion_display(), "");
+        vk.feed(Key::Char('2'));
+        vk.feed(Key::Char('0'));
+        vk.feed(Key::Char('k'));
+        assert_eq!(vk.last_motion_display(), "20k");
+        // stays until the next sequence starts resolving
+        vk.feed(Key::Char('j'));
+        assert_eq!(vk.last_motion_display(), "j");
+    }
+
+    #[test]
+    fn aborted_sequence_clears_pending_but_not_the_last_flash() {
+        let mut vk = VimKeys::new();
+        vk.feed(Key::Char('h'));
+        assert_eq!(vk.last_motion_display(), "h");
+        vk.feed(Key::Char('g'));
+        vk.feed(Key::Char('x')); // 'gx' isn't a thing -- aborts
+        assert_eq!(vk.pending_display(), "");
+        assert_eq!(vk.last_motion_display(), "h"); // unchanged by the abort
+    }
+
+    #[test]
+    fn search_pending_display_shows_the_slash_and_typed_text() {
+        let mut vk = VimKeys::new();
+        vk.feed(Key::Char('/'));
+        assert_eq!(vk.pending_display(), "/");
+        vk.feed(Key::Char('f'));
+        vk.feed(Key::Char('o'));
+        vk.feed(Key::Char('o'));
+        assert_eq!(vk.pending_display(), "/foo");
+        vk.feed(Key::Enter);
+        assert_eq!(vk.pending_display(), "");
+        assert_eq!(vk.last_motion_display(), "/foo<CR>");
     }
 }
