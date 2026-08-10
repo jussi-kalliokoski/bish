@@ -318,7 +318,7 @@ fn classify_plain_argument_core(
     word_span: &Range<usize>,
     arg_index: usize,
     man: Option<&manpages::ManPageData>,
-    _cwd: Option<&Path>,
+    cwd: Option<&Path>,
     offset: usize,
 ) -> Option<HighlightSpan> {
     let out_span = |kind: HighlightKind, link: Option<String>| HighlightSpan {
@@ -346,7 +346,28 @@ fn classify_plain_argument_core(
         }
     }
 
-    None
+    resolve_file_link(text, cwd).map(|url| out_span(HighlightKind::Link, Some(url)))
+}
+
+// Resolves `text` (a fully-plain, unquoted argument -- never `~`-prefixed:
+// the lexer always rewrites a leading `~` into a Chunk::Var, so such a
+// word never reaches this function as a single Chunk::Str) against `cwd`
+// if relative, and checks whether it's a real file/directory. `cwd` being
+// None (command mode's own colon-line, see its call site's own doc
+// comment) means "don't know, don't guess" -- skip Link detection
+// entirely rather than resolving against this process's own cwd, which
+// can legitimately differ from the session's Shell.cwd.
+//
+// A fresh Path::exists() syscall every call, not cached -- filesystem
+// state can change moment to moment, unlike man-page content.
+fn resolve_file_link(text: &str, cwd: Option<&Path>) -> Option<String> {
+    let cwd = cwd?;
+    let candidate = if Path::new(text).is_absolute() { std::path::PathBuf::from(text) } else { cwd.join(text) };
+    if candidate.exists() {
+        Some(format!("file://{}", candidate.display()))
+    } else {
+        None
+    }
 }
 
 // Strips a trailing "=value" or " <placeholder>" suffix from a `-`-
@@ -948,5 +969,53 @@ mod tests {
         assert_eq!(strip_flag_suffix("--color=auto"), "--color");
         assert_eq!(strip_flag_suffix("-C <path>"), "-C");
         assert_eq!(strip_flag_suffix("-a"), "-a");
+    }
+
+    #[test]
+    fn resolve_file_link_finds_a_real_relative_path() {
+        let cwd = std::env::current_dir().unwrap();
+        let url = resolve_file_link("Cargo.toml", Some(&cwd));
+        assert!(url.as_deref().is_some_and(|u| u.starts_with("file://")), "{url:?}");
+    }
+
+    #[test]
+    fn resolve_file_link_returns_none_for_a_nonexistent_path() {
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(resolve_file_link("definitely-does-not-exist-xyz", Some(&cwd)), None);
+    }
+
+    #[test]
+    fn resolve_file_link_returns_none_without_a_cwd() {
+        // Command mode's own colon-line passes None -- "don't know, don't
+        // guess" rather than resolving against this process's own cwd,
+        // which can legitimately differ from the session's Shell.cwd.
+        assert_eq!(resolve_file_link("Cargo.toml", None), None);
+    }
+
+    #[test]
+    fn resolve_file_link_handles_an_absolute_path_directly() {
+        let cwd = std::env::current_dir().unwrap();
+        let abs = cwd.join("Cargo.toml");
+        let url = resolve_file_link(abs.to_str().unwrap(), Some(&cwd));
+        assert!(url.as_deref().is_some_and(|u| u.starts_with("file://")), "{url:?}");
+    }
+
+    #[test]
+    fn classify_plain_argument_core_falls_back_to_link_when_no_flag_or_subcommand_matches() {
+        let cwd = std::env::current_dir().unwrap();
+        let data = man(&[], &[]);
+        let span = 0..10;
+        match classify_plain_argument_core("Cargo.toml", &span, 1, Some(&data), Some(&cwd), 0) {
+            Some(HighlightSpan { start: 0, end: 10, kind: HighlightKind::Link, link: Some(url) }) => {
+                assert!(url.starts_with("file://"), "{url}");
+            }
+            other => panic!("expected a Link span, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_plain_argument_core_no_link_when_cwd_is_none() {
+        let data = man(&[], &[]);
+        assert_eq!(classify_plain_argument_core("Cargo.toml", &(0..10), 1, Some(&data), None, 0), None);
     }
 }
