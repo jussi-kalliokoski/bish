@@ -1956,9 +1956,22 @@ impl ScreenBuffer {
 }
 
 impl BisheditBuffer for ScreenBuffer {
+    // Deliberately *not* scrollback.len() + the grid's full (fixed) row
+    // count: a vt100::Grid is always allocated at its full height
+    // regardless of how much has actually been written into it, so any
+    // rows below wherever the terminal's own live cursor currently sits
+    // are genuinely blank padding that scrolling hasn't reached yet, not
+    // real content -- counting them let G/j/Ctrl-D/etc. navigate past the
+    // actual end of the pane's content into empty space. The live
+    // cursor's row is always real content by the time this is read: the
+    // one and only ScreenBuffer constructor call site (run_normal_mode_
+    // navigation) always calls freeze_idle_prompt immediately before
+    // building this, which guarantees something (the prompt text) is
+    // written at wherever the cursor is.
     fn line_count(&self) -> usize {
         let s = self.screen.borrow();
-        (s.scrollback.len() + s.size().0).max(1)
+        let (cursor_row, _) = s.cursor();
+        (s.scrollback.len() + cursor_row + 1).max(1)
     }
 
     fn line_len(&self, line: usize) -> usize {
