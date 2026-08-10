@@ -473,6 +473,13 @@ pub enum ReadOutcome {
     // could get there properly. `i` in normal mode returns to a fresh
     // read_line call, same as this one would have continued into anyway.
     NormalMode,
+    // Ctrl-L, but only when the caller opted in via `ctrl_l_reports` (see
+    // that parameter's own doc comment) -- command mode's own toggle for
+    // showing its whole command+output transcript. Whatever was typed so
+    // far is discarded, same simplification DirNav/NormalMode already
+    // make for their own callers with nothing meaningful to preserve
+    // across the jump.
+    CtrlL,
 }
 
 // Directory-history navigation (browser-style back/forward, plus "up to
@@ -503,6 +510,12 @@ pub enum DirNav {
 // this crate's existing behavior); on for command mode, which -- like a
 // vim ':' command line -- should be cancelable by either Ctrl-C or Esc
 // regardless of what's been typed.
+// `ctrl_l_reports`: whether Ctrl-L is reported as `ReadOutcome::CtrlL`
+// instead of this crate's usual "clear the real screen" handling. Off
+// for the normal shell prompt (Ctrl-L there keeps meaning "clear
+// screen," the readline/bash convention); on for command mode, which
+// gives Ctrl-L its own meaning (toggling the command+output transcript
+// view -- see repl.rs's run_command_mode).
 // `on_idle`: called whenever this is about to block waiting for the next
 // keystroke and none has arrived yet within one poll tick -- lets
 // repl.rs's main loop (M10c) service other windows' backgrounded fg jobs
@@ -528,6 +541,7 @@ pub fn read_line(
     prompt: &str,
     history: &History,
     esc_cancels: bool,
+    ctrl_l_reports: bool,
     col_origin: usize,
     width: usize,
     mut on_idle: impl FnMut(),
@@ -623,6 +637,10 @@ pub fn read_line(
             Key::CtrlK => ed.kill_to_end(),
             Key::CtrlU => ed.kill_to_start(),
             Key::CtrlW => ed.kill_word_backward(),
+            Key::CtrlL if ctrl_l_reports => {
+                drop(guard.take());
+                return Ok(ReadOutcome::CtrlL);
+            }
             Key::CtrlL => print!("\x1b[H\x1b[2J"),
             Key::Char(c) => ed.insert(c),
             Key::Up => {

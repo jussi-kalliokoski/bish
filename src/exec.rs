@@ -29,6 +29,14 @@ use crate::vt100;
 enum OutputSink {
     Real,
     Grid(Rc<RefCell<vt100::Screen>>),
+    // repl.rs's command mode temporarily swaps a session's sink to this
+    // while running one command, so it can show that command's own
+    // combined stdout+stderr text as a dedicated overlay (see run_
+    // command_mode) instead of it landing mixed into the pane's own
+    // grid/scrollback. No onlcr translation here (unlike Grid) -- this
+    // is plain text repl.rs renders itself by splitting on '\n', not fed
+    // into a terminal emulator that needs CRLF.
+    Capture(Rc<RefCell<String>>),
 }
 
 // Emulates the real terminal's ONLCR postprocessing (translating outgoing
@@ -75,6 +83,7 @@ impl OutputSink {
                 let _ = std::io::stdout().write_all(s.as_bytes());
             }
             OutputSink::Grid(screen) => screen.borrow_mut().feed(onlcr(s).as_bytes()),
+            OutputSink::Capture(buf) => buf.borrow_mut().push_str(s),
         }
     }
 
@@ -85,6 +94,7 @@ impl OutputSink {
                 let _ = std::io::stderr().write_all(s.as_bytes());
             }
             OutputSink::Grid(screen) => screen.borrow_mut().feed(onlcr(s).as_bytes()),
+            OutputSink::Capture(buf) => buf.borrow_mut().push_str(s),
         }
     }
 }
@@ -578,6 +588,13 @@ impl Shell {
         self.sink = OutputSink::Grid(screen);
     }
 
+    // repl.rs's run_command_mode calls this immediately before running one
+    // command, then calls set_sink_grid again immediately after to
+    // restore -- see OutputSink::Capture's own doc comment.
+    pub(crate) fn set_sink_capture(&mut self, buf: Rc<RefCell<String>>) {
+        self.sink = OutputSink::Capture(buf);
+    }
+
     // How big a freshly-opened pty (run_single's use_pty path) should be
     // sized before a full-screen program (vim, htop, less, ...) gets to
     // query it -- otherwise it inherits whatever posix_openpt's kernel
@@ -599,7 +616,12 @@ impl Shell {
                 let (rows, cols) = screen.borrow().size();
                 (rows as u16, cols as u16)
             }
-            OutputSink::Real => match pty::get_size(0) {
+            // Capture is only ever active for the brief span of running one
+            // command-mode command (restrict_to_builtins there already
+            // rules out anything that would spawn a pty-attached job), so
+            // this arm should be unreachable in practice -- falls back to
+            // the same real-terminal query Real uses rather than a panic.
+            OutputSink::Real | OutputSink::Capture(_) => match pty::get_size(0) {
                 Ok(ws) if ws.rows > 0 && ws.cols > 0 => (ws.rows, ws.cols),
                 _ => (24, 80),
             },
