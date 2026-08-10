@@ -10,6 +10,7 @@
 #![allow(dead_code)]
 
 use crate::lexer::{self, Chunk, SpannedItem, Tok};
+use crate::vt100;
 use std::ops::Range;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,6 +47,81 @@ impl Highlighter for BashHighlighter {
         highlight_into(text, 0, &mut out);
         out
     }
+}
+
+// A resolved (start, end, color, attrs) span -- the presentation-layer
+// sibling of HighlightSpan, once a HighlightKind has been mapped to an
+// actual color. Kept as its own type (rather than just carrying
+// HighlightKind through to compose) because it's the seam future
+// presentation features (selections, search highlights, inline coverage,
+// diffs, completions) plug into: any of those just needs to build its own
+// Vec<StyledSpan> and hand it to compose as one more layer, with no
+// dependency on HighlightKind or the highlighter at all.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StyledSpan {
+    pub start: usize,
+    pub end: usize,
+    pub fg: vt100::Color,
+    pub attrs: vt100::CellAttrs,
+}
+
+// Indexed(0-15), matching prompt.rs's own existing bold+low-8-ANSI
+// convention, not Rgb -- there's no light/dark-aware theme system yet to
+// make a fixed RGB choice safe.
+pub fn default_style(kind: HighlightKind) -> (vt100::Color, vt100::CellAttrs) {
+    let bold = vt100::CellAttrs { bold: true, ..vt100::CellAttrs::default() };
+    let dim = vt100::CellAttrs { dim: true, ..vt100::CellAttrs::default() };
+    match kind {
+        HighlightKind::Keyword => (vt100::Color::Indexed(3), bold),
+        HighlightKind::String => (vt100::Color::Indexed(2), vt100::CellAttrs::default()),
+        HighlightKind::Variable => (vt100::Color::Indexed(6), bold),
+        HighlightKind::Substitution => (vt100::Color::Indexed(4), bold),
+        HighlightKind::Redirect => (vt100::Color::Indexed(5), bold),
+        HighlightKind::Operator => (vt100::Color::Indexed(7), vt100::CellAttrs::default()),
+        HighlightKind::Comment => (vt100::Color::Indexed(8), dim),
+        HighlightKind::Number => (vt100::Color::Indexed(6), vt100::CellAttrs::default()),
+    }
+}
+
+// Builds one Cell per char, then paints each layer's spans over it in
+// order -- a later layer (or a later span within the same layer, though
+// BashHighlighter's own output is always non-overlapping by construction)
+// always wins for any char it covers. This is deliberately a plain
+// function, not a trait/registry: it has exactly one caller (redraw(), in
+// a later stage), which already knows its own layer set at each call
+// site -- adding a selection/search-match/diagnostic layer later is "pass
+// one more slice," not an interface change.
+pub fn compose(chars: &[char], layers: &[&[StyledSpan]]) -> Vec<vt100::Cell> {
+    let mut cells: Vec<vt100::Cell> = chars.iter().map(|&ch| vt100::Cell { ch, ..vt100::Cell::default() }).collect();
+    for layer in layers {
+        for span in layer.iter() {
+            let end = span.end.min(cells.len());
+            for cell in cells.iter_mut().take(end).skip(span.start) {
+                cell.fg = span.fg;
+                cell.attrs = span.attrs;
+            }
+        }
+    }
+    cells
+}
+
+// Turns a resolved cell sequence back into an SGR-coded string, reusing
+// vt100::sgr_codes -- the same run-coalescing step repl.rs's render_row
+// already does for a live pane's grid, just fed synthesized cells instead
+// of ones read off a Screen.
+pub fn render_styled(cells: &[vt100::Cell]) -> String {
+    let mut out = String::new();
+    let mut last: Option<(vt100::Color, vt100::Color, vt100::CellAttrs)> = None;
+    for cell in cells {
+        let key = (cell.fg, cell.bg, cell.attrs);
+        if last != Some(key) {
+            out.push_str(&vt100::sgr_codes(cell.fg, cell.bg, cell.attrs));
+            last = Some(key);
+        }
+        out.push(cell.ch);
+    }
+    out.push_str("\x1b[0m");
+    out
 }
 
 // Consumes the next raw_capture_spans entry, if any. `.get()` rather than
@@ -414,5 +490,75 @@ mod tests {
         // "echo" alone is a plain, uncolored word and the unterminated
         // quote never got far enough to produce a LiteralStr chunk.
         assert_eq!(spans, vec![]);
+    }
+
+    #[test]
+    fn compose_paints_default_uncolored_cells_for_an_empty_layer_set() {
+        let chars: Vec<char> = "abc".chars().collect();
+        let cells = compose(&chars, &[]);
+        assert_eq!(cells.len(), 3);
+        for (cell, expected) in cells.iter().zip("abc".chars()) {
+            assert_eq!(cell.ch, expected);
+            assert_eq!(cell.fg, vt100::Color::Default);
+        }
+    }
+
+    #[test]
+    fn compose_later_layer_overrides_earlier_layer_for_overlapping_chars() {
+        let chars: Vec<char> = "abc".chars().collect();
+        let base = [StyledSpan { start: 0, end: 3, fg: vt100::Color::Indexed(2), attrs: vt100::CellAttrs::default() }];
+        let overlay = [StyledSpan { start: 1, end: 2, fg: vt100::Color::Indexed(5), attrs: vt100::CellAttrs::default() }];
+        let cells = compose(&chars, &[&base, &overlay]);
+        assert_eq!(cells[0].fg, vt100::Color::Indexed(2));
+        assert_eq!(cells[1].fg, vt100::Color::Indexed(5)); // overlay wins here
+        assert_eq!(cells[2].fg, vt100::Color::Indexed(2));
+    }
+
+    #[test]
+    fn compose_span_end_past_char_count_is_clamped_not_a_panic() {
+        let chars: Vec<char> = "ab".chars().collect();
+        let layer = [StyledSpan { start: 0, end: 100, fg: vt100::Color::Indexed(1), attrs: vt100::CellAttrs::default() }];
+        let cells = compose(&chars, &[&layer]);
+        assert_eq!(cells.len(), 2);
+        assert!(cells.iter().all(|c| c.fg == vt100::Color::Indexed(1)));
+    }
+
+    #[test]
+    fn render_styled_coalesces_runs_of_identical_style_into_one_sgr_code() {
+        let chars: Vec<char> = "abcd".chars().collect();
+        // "ab" plain, "cd" colored -- two distinct runs, so exactly two
+        // SGR escapes should appear (one per run), not four (one per
+        // char).
+        let layer = [StyledSpan { start: 2, end: 4, fg: vt100::Color::Indexed(3), attrs: vt100::CellAttrs::default() }];
+        let cells = compose(&chars, &[&layer]);
+        let rendered = render_styled(&cells);
+        assert_eq!(rendered.matches('\x1b').count(), 3); // 2 style changes + 1 trailing reset
+        assert_eq!(rendered, format!("{}ab{}cd\x1b[0m", vt100::sgr_codes(vt100::Color::Default, vt100::Color::Default, vt100::CellAttrs::default()), vt100::sgr_codes(vt100::Color::Indexed(3), vt100::Color::Default, vt100::CellAttrs::default())));
+    }
+
+    #[test]
+    fn render_styled_uniform_style_emits_a_single_run() {
+        let chars: Vec<char> = "abc".chars().collect();
+        let layer = [StyledSpan { start: 0, end: 3, fg: vt100::Color::Indexed(2), attrs: vt100::CellAttrs::default() }];
+        let cells = compose(&chars, &[&layer]);
+        let rendered = render_styled(&cells);
+        // One SGR to enter the style, one to reset -- no per-char churn.
+        assert_eq!(rendered.matches('\x1b').count(), 2);
+    }
+
+    #[test]
+    fn default_style_covers_every_highlight_kind_without_panicking() {
+        for kind in [
+            HighlightKind::Keyword,
+            HighlightKind::Operator,
+            HighlightKind::Redirect,
+            HighlightKind::String,
+            HighlightKind::Variable,
+            HighlightKind::Substitution,
+            HighlightKind::Comment,
+            HighlightKind::Number,
+        ] {
+            let _ = default_style(kind);
+        }
     }
 }
