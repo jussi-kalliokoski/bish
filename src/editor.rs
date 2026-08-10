@@ -790,9 +790,8 @@ pub fn read_line(
 // What Ctrl-E's own line-local Normal mode (run_line_normal_mode) ended
 // with.
 enum LineNormalExit {
-    /// A motion/insert-entry command resolved, or Ctrl-E was pressed again
-    /// as a plain toggle -- back to ordinary insert typing, no key left
-    /// over to reprocess.
+    /// A motion/insert-entry command resolved -- back to ordinary insert
+    /// typing, no key left over to reprocess.
     ToInsert,
     /// Ctrl-C/D/Z -- not handled here (this function only knows vim
     /// motions/insert-entry, not "interrupt the whole read"), handed back
@@ -812,7 +811,14 @@ enum LineNormalExit {
 // loop with immediate rendering -- there's no "look around elsewhere,
 // resume later" excursion the way Ctrl+Space's full-pane mode has (see
 // that mode's own doc comment in repl.rs for why *it* instead resolves
-// insert-entry against a frozen original cursor).
+// insert-entry against a frozen original cursor). Ctrl-E itself is *not*
+// special-cased here as a "toggle back to insert" -- only entering this
+// mode from ordinary typing changed meaning; once inside, Ctrl-E keeps
+// its real vim Normal-mode meaning (`Motion::ScrollLineDown`, a no-op on
+// a single line but still fed through `vk.feed` like any other key,
+// unchanged). Real vim only ever returns to Insert via `i`/`a`/`I`/`A`/
+// `s`/`S`/`C` (or an explicit Escape-equivalent), never via Ctrl-E, so
+// this doesn't invent a binding vim itself doesn't have.
 fn run_line_normal_mode(
     ed: &mut LineEditor,
     prompt: &str,
@@ -822,11 +828,13 @@ fn run_line_normal_mode(
 ) -> io::Result<LineNormalExit> {
     let mut vk = VimKeys::new();
     let mut marks: HashMap<char, (usize, usize)> = HashMap::new();
-    // Steady block cursor + a reverse-video prompt: the mode indicator.
-    // DECSCUSR isn't honored by every terminal, so the reverse-video
-    // prompt is the guaranteed-visible fallback; neither is ever emitted
-    // for a session that doesn't touch this feature.
-    print!("\x1b[2 q");
+    // Reverse-video prompt: the mode indicator. Deliberately not a
+    // terminal cursor-shape change (DECSCUSR) -- that's global terminal
+    // state with no clean way to restore whatever the user's own
+    // terminal had configured before this feature ever touched it, so a
+    // forced "steady bar" on the way back out would itself be an
+    // unwanted, sticky change to something this feature has no business
+    // touching.
     let decorated_prompt = format!("\x1b[7m{}\x1b[0m", prompt);
     redraw(&decorated_prompt, ed, col_origin, width)?;
     let exit = loop {
@@ -836,7 +844,6 @@ fn run_line_normal_mode(
         };
         match key {
             Key::CtrlC | Key::CtrlD | Key::CtrlZ => break LineNormalExit::Propagate(key),
-            Key::CtrlE => break LineNormalExit::ToInsert,
             _ => {
                 let mut lb = LineBuffer { ed, marks: &mut marks };
                 match vk.feed(key) {
@@ -860,8 +867,6 @@ fn run_line_normal_mode(
         }
         redraw(&decorated_prompt, ed, col_origin, width)?;
     };
-    print!("\x1b[6 q");
-    io::stdout().flush()?;
     Ok(exit)
 }
 
@@ -871,12 +876,14 @@ fn run_line_normal_mode(
 // Reads and resolves exactly one VimKeys-recognized command -- a full
 // multi-key sequence like `2f)`, not just one keystroke -- by looping
 // until `vk.feed` stops returning `Pending`, applies it once, then always
-// returns to insert. `Some(key)` is only ever returned for Ctrl-C/D/Z,
+// returns to insert (the cursor ends up wherever that one command left
+// it -- e.g. `<C-o>b` really does leave the cursor at the start of the
+// previous word once back in insert, exactly like real vim; it isn't
+// snapped back). `Some(key)` is only ever returned for Ctrl-C/D/Z,
 // handled by the caller the same way run_line_normal_mode's own
-// `Propagate` is.
+// `Propagate` is. No terminal cursor-shape change here either -- same
+// reasoning as run_line_normal_mode's own doc comment.
 fn run_one_shot_normal_command(ed: &mut LineEditor, on_idle: &mut dyn FnMut()) -> io::Result<Option<Key>> {
-    print!("\x1b[2 q");
-    io::stdout().flush()?;
     let mut vk = VimKeys::new();
     let mut marks: HashMap<char, (usize, usize)> = HashMap::new();
     let result = loop {
@@ -909,8 +916,6 @@ fn run_one_shot_normal_command(ed: &mut LineEditor, on_idle: &mut dyn FnMut()) -
             }
         }
     };
-    print!("\x1b[6 q");
-    io::stdout().flush()?;
     Ok(result)
 }
 
