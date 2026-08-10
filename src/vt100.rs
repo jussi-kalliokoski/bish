@@ -48,6 +48,49 @@ impl Default for Cell {
     }
 }
 
+// The inverse of this module's own SGR parsing: turns a cell's resolved
+// color/attrs back into the ANSI codes that reproduce them, so the real
+// terminal ends up showing the same thing the grid recorded. Shared by
+// repl.rs's render_row (a Screen's own cells) and the syntax-highlighting
+// renderer's render_styled (synthesized StyledSpan-derived cells) -- both
+// need the same run-coalescing "cell style -> SGR escape" step.
+pub fn sgr_codes(fg: Color, bg: Color, attrs: CellAttrs) -> String {
+    let mut codes: Vec<String> = vec!["0".to_string()];
+    if attrs.bold {
+        codes.push("1".to_string());
+    }
+    if attrs.dim {
+        codes.push("2".to_string());
+    }
+    if attrs.italic {
+        codes.push("3".to_string());
+    }
+    if attrs.underline {
+        codes.push("4".to_string());
+    }
+    if attrs.reverse {
+        codes.push("7".to_string());
+    }
+    if attrs.strikethrough {
+        codes.push("9".to_string());
+    }
+    match fg {
+        Color::Default => {}
+        Color::Indexed(i) if i < 8 => codes.push(format!("{}", 30 + i)),
+        Color::Indexed(i) if i < 16 => codes.push(format!("{}", 90 + (i - 8))),
+        Color::Indexed(i) => codes.push(format!("38;5;{}", i)),
+        Color::Rgb(r, g, b) => codes.push(format!("38;2;{};{};{}", r, g, b)),
+    }
+    match bg {
+        Color::Default => {}
+        Color::Indexed(i) if i < 8 => codes.push(format!("{}", 40 + i)),
+        Color::Indexed(i) if i < 16 => codes.push(format!("{}", 100 + (i - 8))),
+        Color::Indexed(i) => codes.push(format!("48;5;{}", i)),
+        Color::Rgb(r, g, b) => codes.push(format!("48;2;{};{};{}", r, g, b)),
+    }
+    format!("\x1b[{}m", codes.join(";"))
+}
+
 // The standard DEC Special Graphics mapping (ESC ( 0), the subset curses
 // actually relies on for box-drawing (ncurses' default `acsc` string).
 fn dec_special_graphics(c: char) -> char {

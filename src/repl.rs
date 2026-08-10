@@ -1912,52 +1912,12 @@ fn render_row(out: &mut String, screen: &vt100::Screen, row: usize, cols: usize)
         let cell = screen.cell(row, c);
         let key = (cell.fg, cell.bg, cell.attrs);
         if last != Some(key) {
-            out.push_str(&sgr_codes(cell.fg, cell.bg, cell.attrs));
+            out.push_str(&vt100::sgr_codes(cell.fg, cell.bg, cell.attrs));
             last = Some(key);
         }
         out.push(cell.ch);
     }
     out.push_str("\x1b[0m");
-}
-
-// The inverse of vt100::Screen's own SGR parsing: turns a cell's resolved
-// color/attrs back into the ANSI codes that reproduce them, so the real
-// terminal ends up showing the same thing the grid recorded.
-fn sgr_codes(fg: vt100::Color, bg: vt100::Color, attrs: vt100::CellAttrs) -> String {
-    let mut codes: Vec<String> = vec!["0".to_string()];
-    if attrs.bold {
-        codes.push("1".to_string());
-    }
-    if attrs.dim {
-        codes.push("2".to_string());
-    }
-    if attrs.italic {
-        codes.push("3".to_string());
-    }
-    if attrs.underline {
-        codes.push("4".to_string());
-    }
-    if attrs.reverse {
-        codes.push("7".to_string());
-    }
-    if attrs.strikethrough {
-        codes.push("9".to_string());
-    }
-    match fg {
-        vt100::Color::Default => {}
-        vt100::Color::Indexed(i) if i < 8 => codes.push(format!("{}", 30 + i)),
-        vt100::Color::Indexed(i) if i < 16 => codes.push(format!("{}", 90 + (i - 8))),
-        vt100::Color::Indexed(i) => codes.push(format!("38;5;{}", i)),
-        vt100::Color::Rgb(r, g, b) => codes.push(format!("38;2;{};{};{}", r, g, b)),
-    }
-    match bg {
-        vt100::Color::Default => {}
-        vt100::Color::Indexed(i) if i < 8 => codes.push(format!("{}", 40 + i)),
-        vt100::Color::Indexed(i) if i < 16 => codes.push(format!("{}", 100 + (i - 8))),
-        vt100::Color::Indexed(i) => codes.push(format!("48;5;{}", i)),
-        vt100::Color::Rgb(r, g, b) => codes.push(format!("48;2;{};{};{}", r, g, b)),
-    }
-    format!("\x1b[{}m", codes.join(";"))
 }
 
 // A read-only bishedit::Buffer view over a pane's own rendered content --
@@ -2119,7 +2079,7 @@ fn render_normal_mode_row(out: &mut String, buf: &ScreenBuffer, line: usize, col
         };
         let key = (cell.fg, cell.bg, cell.attrs);
         if last != Some(key) {
-            out.push_str(&sgr_codes(cell.fg, cell.bg, cell.attrs));
+            out.push_str(&vt100::sgr_codes(cell.fg, cell.bg, cell.attrs));
             last = Some(key);
         }
         out.push(cell.ch);
