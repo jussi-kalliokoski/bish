@@ -53,6 +53,16 @@ struct SessionState {
     // before any `cd` at all.
     dir_history: Vec<std::path::PathBuf>,
     dir_history_index: usize,
+    // Every command mode has actually run in this session (successfully
+    // parsed and executed, regardless of its own exit status -- a
+    // command_mode_violation/syntax error never reaches here, matching
+    // how `history` itself only ever records something that parsed),
+    // across every separate ':' invocation -- see run_command_mode's own
+    // doc comment for why this outlives any one invocation. Viewed via
+    // Ctrl-L (render_command_transcript), both while composing a command
+    // mode line and, once one's just run, from normal mode's own
+    // pending-overlay state (run_normal_mode_navigation).
+    command_transcript: Vec<TranscriptEntry>,
 }
 
 type JobFrameId = u32;
@@ -264,6 +274,7 @@ pub fn run(mut shell: Shell) {
             warned_stopped_jobs: false,
             dir_history: vec![root_cwd],
             dir_history_index: 0,
+            command_transcript: Vec::new(),
         },
     );
     let mut windows: Vec<WindowEntry> = vec![WindowEntry::single(0, Frame::Session(0))];
@@ -677,12 +688,19 @@ fn handle_command_mode(
         CommandModeOutcome::Action(action) => {
             apply_window_action(action, sessions, windows, current_window, next_session_id, next_window_id, sinks_are_grid, term_rows, term_cols);
         }
-        CommandModeOutcome::Quit | CommandModeOutcome::Cancelled => {
+        CommandModeOutcome::Quit | CommandModeOutcome::Cancelled | CommandModeOutcome::Ran { .. } => {
             if *sinks_are_grid {
-                // No window action, but command mode may still have run
-                // ordinary builtins whose output landed in this
-                // session's grid (e.g. `:pwd`) -- without this, that
-                // output would sit captured but never actually drawn.
+                // No window action, but command mode may still have
+                // written a rejected-attempt message straight to this
+                // session's grid (a command_mode_violation/syntax error
+                // -- see run_command_mode's own doc comment; an ordinary
+                // Ran result's own output never touches the grid, it's
+                // captured -- see OutputSink::Capture) -- without this,
+                // that message would sit written but never actually
+                // drawn. Also restores the plain compositor frame under
+                // a Ran result before the caller (only normal mode's ':'
+                // handler cares) paints its own overlay on top of it --
+                // see PendingView's own doc comment.
                 compositor_redraw(sessions, windows, *current_window, term_rows, term_cols);
             }
         }
@@ -870,6 +888,7 @@ fn apply_window_action(
                     warned_stopped_jobs: false,
                     dir_history: vec![child_cwd],
                     dir_history_index: 0,
+                    command_transcript: Vec::new(),
                 },
             );
             let wid = *next_window_id;
@@ -982,6 +1001,7 @@ fn split_focused_pane(
             warned_stopped_jobs: false,
             dir_history: vec![child_cwd],
             dir_history_index: 0,
+            command_transcript: Vec::new(),
         },
     );
 
@@ -2168,23 +2188,54 @@ fn window_cmd_to_action(cmd: WindowCmd) -> WindowAction {
     }
 }
 
+// What's covering normal mode's own view right now, on top of the
+// ordinary render_normal_mode_frame -- neither is an ephemeral "blocks
+// until dismissed" prompt the way the old design's overlay-wait was;
+// both just sit on screen until the *next* keypress arrives, at which
+// point run_normal_mode_navigation's own loop resolves it away (a full
+// compositor_redraw + render_normal_mode_frame) and then goes on to
+// process that same keypress normally -- so the key that clears an
+// Output overlay is never "spent" on dismissing it, it still moves the
+// cursor/opens a new ':' line/whatever it would have done anyway. The
+// one exception: from Output specifically, Ctrl-L doesn't clear -- it
+// upgrades to Transcript instead (see the resolution loop at the top of
+// run_normal_mode_navigation), matching command mode's own prompt-time
+// Ctrl-L toggle onto the exact same session-wide command_transcript.
+#[derive(Clone, Copy, PartialEq)]
+enum PendingView {
+    None,
+    // A just-run command's result (CommandModeOutcome::Ran) -- shown via
+    // render_command_output_overlay. Also raised (with empty output) for
+    // a non-zero exit that produced no output at all, so a silent
+    // failure still gets a bare colored bar instead of no feedback.
+    Output,
+    Transcript,
+}
+
 // bishedit M1's first (and, so far, only) consumer: Ctrl+Space at an
 // empty prompt buffer (editor::ReadOutcome::NormalMode) enters this --
 // read-only cursor navigation over the focused pane's own rendered
 // content (scrollback included), vim's normal-mode motions applied via
 // bishedit::motion/vimkeys. `i` returns to the live prompt, same as vim.
 // `:` hands off to the real command-mode feature (handle_command_mode --
-// the same one the M10c job-detach path uses), positioned on this pane's
-// own status-bar row (plan.md: "the command is shown above the tab
-// bar") -- the only way command mode is reached now that the old direct
-// ':'-at-the-shell-prompt shortcut is gone (see editor::ReadOutcome's own
-// doc comment). `ZZ` and typing exactly "q"/"q!" as a command both exit
-// normal mode -- `ZZ` directly here, "q"/"q!" via run_command_mode
-// special-casing them as vim's own Ex quit commands rather than trying
-// to run them as shell builtins (see its own doc comment). Cancelling
-// out of the command line (Ctrl-C/Esc/empty-Backspace/empty-Enter)
-// returns to this navigation instead, matching real vim staying in
-// Normal mode after an aborted ':' command. `<C-w>{cmd}` (vimkeys'
+// the same one the M10c job-detach path uses) -- the only way command
+// mode is reached now that the old direct ':'-at-the-shell-prompt
+// shortcut is gone (see editor::ReadOutcome's own doc comment). `ZZ` and
+// typing exactly "q"/"q!" as a command both exit normal mode -- `ZZ`
+// directly here, "q"/"q!" via run_command_mode special-casing them as
+// vim's own Ex quit commands rather than trying to run them as shell
+// builtins (see its own doc comment). Cancelling out of the command
+// line (Ctrl-C/Esc/empty-Backspace/empty-Enter) returns to this
+// navigation instead, matching real vim staying in Normal mode after an
+// aborted ':' command. An ordinary command that actually ran
+// (CommandModeOutcome::Ran) also returns to this navigation -- command
+// mode itself is one-shot again (see its own doc comment) -- but keeps
+// that command's result on screen as a PendingView::Output overlay
+// until the very next keypress, per this session's own "go back to the
+// original mode with the last output shown until next keypress" design:
+// dark background for a successful (exit 0) command, error background
+// for a failed one, or (a silent failure -- empty output, non-zero
+// status) just a bare error-colored bar. `<C-w>{cmd}` (vimkeys'
 // KeyOutcome::Window) reuses the exact same exec.rs `WindowAction`/
 // repl.rs `apply_window_action` machinery the shell's own `window`
 // command already drives, applied `count` times -- per plan.md, running
@@ -2238,14 +2289,42 @@ fn run_normal_mode_navigation(
     // rectangle on top of that with the scrollback view.
     compositor_redraw(sessions, windows, *current_window, term_rows, term_cols);
     render_normal_mode_frame(&buf, rect, &vk, None);
+    let mut pending_view = PendingView::None;
 
-    loop {
-        let key = match editor::read_key_idle(&mut || {
+    'nav: loop {
+        let mut key = match editor::read_key_idle(&mut || {
             service_background_jobs(sessions, windows, job_frames, *current_window);
         })? {
             Some(k) => k,
             None => break,
         };
+
+        // Resolve whatever PendingView is currently covering the screen
+        // before this key does anything else -- see PendingView's own
+        // doc comment. A loop, not a single check: Ctrl-L on Output
+        // upgrades to Transcript rather than clearing, which still needs
+        // a *further* real keypress to resolve away in turn.
+        loop {
+            match pending_view {
+                PendingView::None => break,
+                PendingView::Output if key == Key::CtrlL => {
+                    pending_view = PendingView::Transcript;
+                    render_command_transcript(&sessions[&session_id].command_transcript, term_rows, term_cols);
+                    key = match editor::read_key_idle(&mut || {
+                        service_background_jobs(sessions, windows, job_frames, *current_window);
+                    })? {
+                        Some(k) => k,
+                        None => break 'nav,
+                    };
+                }
+                PendingView::Output | PendingView::Transcript => {
+                    pending_view = PendingView::None;
+                    compositor_redraw(sessions, windows, *current_window, term_rows, term_cols);
+                    render_normal_mode_frame(&buf, rect, &vk, None);
+                    break;
+                }
+            }
+        }
 
         match key {
             Key::Char('i') => break,
@@ -2292,6 +2371,24 @@ fn run_normal_mode_navigation(
                     // "running one exits normal mode too" behavior.
                     CommandModeOutcome::Action(_) | CommandModeOutcome::Quit => {
                         return Ok(());
+                    }
+                    // Back to normal mode too, per this session's own
+                    // "go back to the original mode with the last output
+                    // shown until next keypress" design -- but keep the
+                    // result visible via PendingView::Output rather than
+                    // just render_normal_mode_frame's ordinary status
+                    // bar (see PendingView's own doc comment for how
+                    // it's resolved on the very next key). handle_
+                    // command_mode has already done the baseline
+                    // compositor_redraw this paints on top of.
+                    CommandModeOutcome::Ran { output, status } => {
+                        if !output.is_empty() || status != 0 {
+                            render_command_output_overlay(&output, status, term_rows, term_cols);
+                            pending_view = PendingView::Output;
+                        } else {
+                            render_normal_mode_frame(&buf, rect, &vk, None);
+                        }
+                        continue;
                     }
                 }
             }
@@ -2452,18 +2549,17 @@ fn is_incomplete(err: &str) -> bool {
     err.starts_with("unterminated") || err.contains("unexpected end of input") || err.ends_with("None")
 }
 
-// A single completed ":"-prompt turn during command mode's own loop
-// (run_command_mode) -- one real command's invocation plus whatever it
-// printed, or a rejected attempt (a command_mode_violation or syntax
-// error, given the same treatment so the transcript reads as one
-// continuous session either way). `command` is the buffer text as it
-// was actually submitted (post history-expansion, same text that went
-// to `history.record`); `output` is the combined stdout+stderr captured
+// A single command mode has actually run (successfully parsed and
+// executed -- a command_mode_violation or syntax error never produces
+// one of these, matching how `history.record` itself only ever records
+// something that parsed). `command` is the buffer text as it was
+// actually submitted (post history-expansion, same text that went to
+// `history.record`); `output` is the combined stdout+stderr captured
 // via OutputSink::Capture (embedded newlines and all -- see render_
 // command_output_overlay/render_command_transcript for how multi-line
 // entries are laid out); `status` is Shell::last_status right after the
-// attempt (a rejected attempt is recorded as 1, matching a generic
-// shell error exit).
+// attempt. Stored in SessionState::command_transcript -- see its own
+// doc comment for why this outlives any one ':' invocation.
 struct TranscriptEntry {
     command: String,
     output: String,
@@ -2538,7 +2634,11 @@ fn styled_full_width_line(text: &str, bg: &str, fg: &str, cols: usize) -> String
 // doc comment).
 fn render_command_output_overlay(output: &str, status: i32, term_rows: usize, term_cols: usize) {
     let (bg, fg) = if status == 0 { (OUTPUT_BG, OUTPUT_FG) } else { (ERROR_BG, ERROR_FG) };
-    let all_lines: Vec<&str> = output.lines().collect();
+    // A caller-checked non-zero exit with genuinely empty output (see
+    // run_normal_mode_navigation's own doc comment on this) still gets
+    // one bare colored row -- `output.lines()` on an empty string yields
+    // nothing at all, which would otherwise mean no bar shown.
+    let all_lines: Vec<&str> = if output.is_empty() { vec![""] } else { output.lines().collect() };
     let available = command_mode_content_rows(term_rows).max(1);
     let prompt_row = command_mode_row(term_rows);
 
@@ -2565,13 +2665,16 @@ fn render_command_output_overlay(output: &str, status: i32, term_rows: usize, te
     let _ = io::stdout().flush();
 }
 
-// Fills every row above command mode's own prompt row with the whole
-// command+output transcript accumulated so far this command-mode
-// session, tail-aligned (the most recent entries at the bottom, right
-// above the prompt) so whatever just ran is always visible without
-// scrolling. Toggled by Ctrl-L (see run_command_mode's own doc
-// comment); persists across further commands until toggled off or
-// command mode exits.
+// Fills every row above command mode's own prompt row with `transcript`
+// (a session's whole SessionState::command_transcript -- every command
+// mode has actually run in this session, across every separate ':'
+// invocation, not just the current one), tail-aligned (the most recent
+// entries at the bottom, right above the prompt) so whatever just ran
+// is always visible without scrolling. Toggled by Ctrl-L, either while
+// composing a command mode line (run_command_mode) or from the
+// PendingView::Output overlay right after one's just run (run_normal_
+// mode_navigation) -- see PendingView's own doc comment for how the
+// latter is resolved away again.
 fn render_command_transcript(transcript: &[TranscriptEntry], term_rows: usize, term_cols: usize) {
     let available = command_mode_content_rows(term_rows).max(1);
     let prompt_row = command_mode_row(term_rows);
@@ -2600,65 +2703,13 @@ fn render_command_transcript(transcript: &[TranscriptEntry], term_rows: usize, t
     let _ = io::stdout().flush();
 }
 
-// Records one finished ":"-prompt turn (a real command's result, or a
-// rejected attempt given the same treatment -- see TranscriptEntry's
-// own doc comment) and shows it: if the transcript view is already
-// toggled on, just re-renders it (now one entry longer) and returns
-// immediately -- nothing to dismiss, it's a persistent background, not
-// an ephemeral overlay. Otherwise, a genuinely empty output (the common
-// case -- most builtins are silent on success) is skipped entirely, no
-// overlay shown at all; a non-empty one is shown via render_command_
-// output_overlay and this blocks for exactly one keystroke to dismiss
-// it (any key) -- except Ctrl-L, which instead turns the transcript
-// view on (showing this same entry as its own last line) rather than
-// dismissing. Dismissing via any other key restores whatever was on
-// screen before the overlay via a real compositor_redraw -- run_
-// command_mode has no cheaper way to know what belongs in those rows
-// (they can span other panes' content, not just this session's own),
-// and nothing else touches the real terminal while this blocking loop
-// owns it, so a full repaint is always correct, not just convenient.
-#[allow(clippy::too_many_arguments)]
-fn show_command_result(
-    label: String,
-    output: String,
-    status: i32,
-    transcript: &mut Vec<TranscriptEntry>,
-    transcript_visible: &mut bool,
-    sessions: &mut HashMap<SessionId, SessionState>,
-    windows: &mut Vec<WindowEntry>,
-    current_window: usize,
-    job_frames: &mut HashMap<JobFrameId, exec::FgJob>,
-    term_rows: usize,
-    term_cols: usize,
-) -> io::Result<()> {
-    transcript.push(TranscriptEntry { command: label, output: output.clone(), status });
-    if *transcript_visible {
-        render_command_transcript(transcript, term_rows, term_cols);
-        return Ok(());
-    }
-    if output.is_empty() {
-        return Ok(());
-    }
-    render_command_output_overlay(&output, status, term_rows, term_cols);
-    let dismiss = {
-        let _guard = term::RawGuard::enable(0)?;
-        editor::read_key_idle(&mut || service_background_jobs(sessions, windows, job_frames, current_window))?
-    };
-    if dismiss == Some(Key::CtrlL) {
-        *transcript_visible = true;
-        render_command_transcript(transcript, term_rows, term_cols);
-    } else {
-        compositor_redraw(sessions, windows, current_window, term_rows, term_cols);
-    }
-    Ok(())
-}
-
-// How run_command_mode's loop ended -- see its own doc comment for what
-// each case means. Copy: every variant is either data-free or carries a
-// Copy type, and handle_command_mode both matches on this itself (to
-// apply the side effect) and hands the same value back to its own
-// caller.
-#[derive(Debug, Clone, Copy)]
+// How run_command_mode's one-shot loop ended -- see its own doc comment
+// for what each case means. Not Copy (Ran carries a String) -- handle_
+// command_mode's own match only ever binds Copy data out of it (Action's
+// WindowAction; Ran's own fields are matched by callers, not by handle_
+// command_mode itself), so it can still match by value and return the
+// same `outcome` afterward without needing Clone/Copy.
+#[derive(Debug)]
 enum CommandModeOutcome {
     Action(WindowAction),
     // The user typed vim's own ":q"/":q!" -- see run_command_mode's own
@@ -2666,6 +2717,14 @@ enum CommandModeOutcome {
     // shell commands.
     Quit,
     Cancelled,
+    // An ordinary command ran to completion (regardless of its own exit
+    // status) -- already appended to the session's own command_
+    // transcript by the time this is returned. `output` is the combined
+    // stdout+stderr it produced (may be empty); `status` is Shell::
+    // last_status right after it ran. The caller (run_normal_mode_
+    // navigation) is the one that actually shows this -- see its own
+    // doc comment on PendingView for how.
+    Ran { output: String, status: i32 },
 }
 
 // Command mode: reached only via bishedit normal mode's own ':' now (see
@@ -2680,25 +2739,31 @@ enum CommandModeOutcome {
 // row directly above the tab bar (command_mode_row), spanning the
 // terminal's whole width, independent of whichever pane/window happened
 // to be focused when it was entered.
-// A persistent, multi-command loop (unlike vim's own one-shot ':' Ex
-// line): running an ordinary command shows its output (show_command_
-// result) and loops right back to this same prompt for another, rather
-// than dropping back to the caller immediately -- a one-shot overlay
-// you'd only ever see for an instant would defeat the point of having
-// one. An empty line, Ctrl-C, Ctrl-D, or Esc (regardless of what's been
-// typed -- see read_line's esc_cancels parameter) all cancel out of
-// command mode entirely, with nothing run -- and so does Backspace at
-// an empty buffer (matching real vim: Backspace on an empty Ex line
-// drops back to Normal mode -- see read_line's own Key::Backspace arm).
-// Typing exactly "q" or "q!" as the whole (complete, non-continuing)
-// line is recognized directly, *before* ever reaching the lex/parse/run
-// pipeline -- these are vim's own Ex quit commands, not shell builtins.
-// Returns Action(WindowAction) if the command that ran was a `window`-
-// family one, for the caller (handle_command_mode) to apply against the
-// real session/window state -- this function now mutates that state
-// directly too (unlike the old one-shot version): both to run commands
-// against the right session and to redraw the real screen after an
-// overlay/transcript view (see show_command_result's own doc comment).
+// One-shot, matching vim's ':' Ex command line: running an ordinary
+// command (Ran) drops straight back to the caller, same as every other
+// non-continuing outcome -- what to actually show for it is the
+// caller's job (run_normal_mode_navigation keeps it on screen until the
+// next keypress; see PendingView), not something worth looping this
+// function itself over. An empty line, Ctrl-C, Ctrl-D, or Esc
+// (regardless of what's been typed -- see read_line's esc_cancels
+// parameter) all cancel out the same way, with nothing run -- and so
+// does Backspace at an empty buffer (matching real vim: Backspace on an
+// empty Ex line drops back to Normal mode -- see read_line's own
+// Key::Backspace arm). Typing exactly "q" or "q!" as the whole
+// (complete, non-continuing) line is recognized directly, *before* ever
+// reaching the lex/parse/run pipeline -- these are vim's own Ex quit
+// commands, not shell builtins. A command_mode_violation or syntax
+// error deliberately does *not* return -- it's shown directly (sink_err)
+// and the buffer clears, so a typo can be retried at the same prompt
+// without re-entering command mode from scratch; neither one is
+// recorded to the session's command_transcript (matching how `history`
+// itself only ever records something that actually parsed).
+// Ctrl-L (ctrl_l_reports, below) toggles a view of the session's own
+// command_transcript -- accumulated across every previous ':'
+// invocation, not just this one -- while composing this line; toggled
+// off the same way, or left as-is when this function returns (the
+// caller's own compositor_redraw, wherever it ends up happening, clears
+// it).
 #[allow(clippy::too_many_arguments)]
 fn run_command_mode(
     session_id: SessionId,
@@ -2711,7 +2776,6 @@ fn run_command_mode(
     term_cols: usize,
 ) -> CommandModeOutcome {
     let mut buffer = String::new();
-    let mut transcript: Vec<TranscriptEntry> = Vec::new();
     let mut transcript_visible = false;
     let prompt_row = command_mode_row(term_rows) + 1;
     loop {
@@ -2741,7 +2805,7 @@ fn run_command_mode(
             Ok(ReadOutcome::CtrlL) => {
                 transcript_visible = !transcript_visible;
                 if transcript_visible {
-                    render_command_transcript(&transcript, term_rows, term_cols);
+                    render_command_transcript(&sessions[&session_id].command_transcript, term_rows, term_cols);
                 } else {
                     compositor_redraw(sessions, windows, current_window, term_rows, term_cols);
                 }
@@ -2761,22 +2825,7 @@ fn run_command_mode(
                         Ok(history::Expansion::Substituted(s)) => s,
                         Ok(history::Expansion::UnrecognizedBang(rest)) => format!("command {}", rest),
                         Err(msg) => {
-                            if let Err(e) = show_command_result(
-                                line.clone(),
-                                format!("bish: {}", msg),
-                                1,
-                                &mut transcript,
-                                &mut transcript_visible,
-                                sessions,
-                                windows,
-                                current_window,
-                                job_frames,
-                                term_rows,
-                                term_cols,
-                            ) {
-                                sessions[&session_id].shell.sink_err(&format!("bish: error reading input: {}\n", e));
-                                return CommandModeOutcome::Cancelled;
-                            }
+                            sessions[&session_id].shell.sink_err(&format!("{}\n", msg));
                             continue;
                         }
                     }
@@ -2800,23 +2849,8 @@ fn run_command_mode(
                     Ok(toks) => match Parser::new(toks).parse_program() {
                         Ok(prog) => {
                             if let Some(msg) = command_mode_violation(&prog) {
+                                sessions[&session_id].shell.sink_err(&format!("bish: {}\n", msg));
                                 buffer.clear();
-                                if let Err(e) = show_command_result(
-                                    trimmed,
-                                    format!("bish: {}", msg),
-                                    1,
-                                    &mut transcript,
-                                    &mut transcript_visible,
-                                    sessions,
-                                    windows,
-                                    current_window,
-                                    job_frames,
-                                    term_rows,
-                                    term_cols,
-                                ) {
-                                    sessions[&session_id].shell.sink_err(&format!("bish: error reading input: {}\n", e));
-                                    return CommandModeOutcome::Cancelled;
-                                }
                             } else {
                                 history.record(&buffer);
                                 let (result, captured_text) = {
@@ -2847,67 +2881,27 @@ fn run_command_mode(
                                     }
                                     _ => {
                                         let status = sessions[&session_id].shell.last_status;
-                                        if let Err(e) = show_command_result(
-                                            trimmed,
-                                            captured_text,
+                                        sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry {
+                                            command: trimmed,
+                                            output: captured_text.clone(),
                                             status,
-                                            &mut transcript,
-                                            &mut transcript_visible,
-                                            sessions,
-                                            windows,
-                                            current_window,
-                                            job_frames,
-                                            term_rows,
-                                            term_cols,
-                                        ) {
-                                            sessions[&session_id].shell.sink_err(&format!("bish: error reading input: {}\n", e));
-                                            return CommandModeOutcome::Cancelled;
-                                        }
+                                        });
+                                        return CommandModeOutcome::Ran { output: captured_text, status };
                                     }
                                 }
                             }
                         }
                         Err(e) => {
                             if !is_incomplete(&e) {
+                                sessions[&session_id].shell.sink_err(&format!("bish: syntax error: {}\n", e));
                                 buffer.clear();
-                                if let Err(ioerr) = show_command_result(
-                                    trimmed,
-                                    format!("bish: syntax error: {}", e),
-                                    1,
-                                    &mut transcript,
-                                    &mut transcript_visible,
-                                    sessions,
-                                    windows,
-                                    current_window,
-                                    job_frames,
-                                    term_rows,
-                                    term_cols,
-                                ) {
-                                    sessions[&session_id].shell.sink_err(&format!("bish: error reading input: {}\n", ioerr));
-                                    return CommandModeOutcome::Cancelled;
-                                }
                             }
                         }
                     },
                     Err(e) => {
                         if !is_incomplete(&e) {
+                            sessions[&session_id].shell.sink_err(&format!("bish: syntax error: {}\n", e));
                             buffer.clear();
-                            if let Err(ioerr) = show_command_result(
-                                trimmed,
-                                format!("bish: syntax error: {}", e),
-                                1,
-                                &mut transcript,
-                                &mut transcript_visible,
-                                sessions,
-                                windows,
-                                current_window,
-                                job_frames,
-                                term_rows,
-                                term_cols,
-                            ) {
-                                sessions[&session_id].shell.sink_err(&format!("bish: error reading input: {}\n", ioerr));
-                                return CommandModeOutcome::Cancelled;
-                            }
                         }
                     }
                 }
