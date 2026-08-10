@@ -13,6 +13,13 @@ pub enum KeyOutcome {
     /// A motion is ready to apply, with the raw count the user typed before
     /// it (if any).
     Motion(Motion, Option<usize>),
+    /// A Ctrl-W window command is ready to run, with the raw count typed
+    /// before it (if any) -- e.g. `2<C-w>n` is `WindowCmd::Next` with
+    /// count `Some(2)`. Not a `Motion`: these act on the frontend's own
+    /// window/pane state, not on a `Buffer`, so they're a separate
+    /// outcome the caller applies however it applies window commands
+    /// (repl.rs already has `apply_window_action` for exactly this).
+    Window(WindowCmd, Option<usize>),
     /// The key was consumed as part of an in-progress sequence (a count
     /// digit, or a prefix awaiting its next character); no motion yet.
     Pending,
@@ -20,6 +27,25 @@ pub enum KeyOutcome {
     /// in-progress count/prefix is discarded, matching vim's behavior of
     /// dropping a pending command on an invalid continuation.
     None,
+}
+
+/// `<C-w>{cmd}`: the same single-letter window shortcuts the shell's own
+/// `window` command exposes (see exec.rs's `run_window`), minus the size
+/// commands (`+`/`-`/`size`) and `fg <id>` (needs an argument beyond a
+/// single letter+count) -- matching plan.md's own scoping for this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowCmd {
+    Next,
+    Previous,
+    New,
+    Close,
+    Split,
+    VSplit,
+    FocusLeft,
+    FocusDown,
+    FocusUp,
+    FocusRight,
+    Balance,
 }
 
 #[derive(Debug, Clone)]
@@ -31,6 +57,7 @@ enum Pending {
     GotoMarkExact,
     GotoMarkLine,
     Z,
+    Window,
     Search { forward: bool, text: String },
 }
 
@@ -62,6 +89,7 @@ fn key_label(key: Key) -> Option<String> {
         Key::CtrlB => "^B".to_string(),
         Key::CtrlE => "^E".to_string(),
         Key::CtrlY => "^Y".to_string(),
+        Key::CtrlW => "^W".to_string(),
         _ => return None,
     })
 }
@@ -123,6 +151,7 @@ impl VimKeys {
             Pending::GotoMarkExact => self.feed_mark(key, MarkKind::GotoExact),
             Pending::GotoMarkLine => self.feed_mark(key, MarkKind::GotoLine),
             Pending::Z => self.feed_z(key),
+            Pending::Window => self.feed_window(key),
             Pending::Search { forward, text } => self.feed_search(key, forward, text),
         }
     }
@@ -132,6 +161,13 @@ impl VimKeys {
         self.pending = Pending::None;
         self.last_completed = std::mem::take(&mut self.current_input);
         KeyOutcome::Motion(motion, count)
+    }
+
+    fn emit_window(&mut self, cmd: WindowCmd) -> KeyOutcome {
+        let count = self.count.take();
+        self.pending = Pending::None;
+        self.last_completed = std::mem::take(&mut self.current_input);
+        KeyOutcome::Window(cmd, count)
     }
 
     fn abort(&mut self) -> KeyOutcome {
@@ -238,6 +274,10 @@ impl VimKeys {
                 self.pending = Pending::G;
                 KeyOutcome::Pending
             }
+            Key::CtrlW => {
+                self.pending = Pending::Window;
+                KeyOutcome::Pending
+            }
             _ => self.abort(),
         }
     }
@@ -278,6 +318,23 @@ impl VimKeys {
             Key::Char('z') => self.emit(Motion::ScrollCenter),
             Key::Char('t') => self.emit(Motion::ScrollTop),
             Key::Char('b') => self.emit(Motion::ScrollBottom),
+            _ => self.abort(),
+        }
+    }
+
+    fn feed_window(&mut self, key: Key) -> KeyOutcome {
+        match key {
+            Key::Char('n') => self.emit_window(WindowCmd::Next),
+            Key::Char('p') => self.emit_window(WindowCmd::Previous),
+            Key::Char('c') => self.emit_window(WindowCmd::New),
+            Key::Char('q') => self.emit_window(WindowCmd::Close),
+            Key::Char('s') => self.emit_window(WindowCmd::Split),
+            Key::Char('v') => self.emit_window(WindowCmd::VSplit),
+            Key::Char('h') => self.emit_window(WindowCmd::FocusLeft),
+            Key::Char('j') => self.emit_window(WindowCmd::FocusDown),
+            Key::Char('k') => self.emit_window(WindowCmd::FocusUp),
+            Key::Char('l') => self.emit_window(WindowCmd::FocusRight),
+            Key::Char('=') => self.emit_window(WindowCmd::Balance),
             _ => self.abort(),
         }
     }
@@ -708,5 +765,43 @@ mod tests {
         vk.feed(Key::Enter);
         assert_eq!(vk.pending_display(), "");
         assert_eq!(vk.last_motion_display(), "/foo<CR>");
+    }
+
+    #[test]
+    fn window_leader_commands() {
+        let cases = [
+            ('n', WindowCmd::Next),
+            ('p', WindowCmd::Previous),
+            ('c', WindowCmd::New),
+            ('q', WindowCmd::Close),
+            ('s', WindowCmd::Split),
+            ('v', WindowCmd::VSplit),
+            ('h', WindowCmd::FocusLeft),
+            ('j', WindowCmd::FocusDown),
+            ('k', WindowCmd::FocusUp),
+            ('l', WindowCmd::FocusRight),
+            ('=', WindowCmd::Balance),
+        ];
+        for (ch, cmd) in cases {
+            let mut vk = VimKeys::new();
+            assert_eq!(vk.feed(Key::CtrlW), KeyOutcome::Pending);
+            assert_eq!(vk.feed(Key::Char(ch)), KeyOutcome::Window(cmd, None));
+        }
+    }
+
+    #[test]
+    fn window_leader_command_with_count() {
+        let mut vk = VimKeys::new();
+        let keys = [Key::Char('2'), Key::CtrlW, Key::Char('n')];
+        assert_eq!(last(&mut vk, &keys), KeyOutcome::Window(WindowCmd::Next, Some(2)));
+    }
+
+    #[test]
+    fn window_leader_unrecognized_continuation_aborts() {
+        let mut vk = VimKeys::new();
+        assert_eq!(vk.feed(Key::CtrlW), KeyOutcome::Pending);
+        assert_eq!(vk.feed(Key::Char('x')), KeyOutcome::None);
+        // aborted cleanly -- next key starts fresh
+        assert_eq!(vk.feed(Key::Char('w')), KeyOutcome::Motion(Motion::WordForward, None));
     }
 }

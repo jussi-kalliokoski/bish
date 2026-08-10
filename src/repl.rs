@@ -4,7 +4,7 @@ use std::io::{self, Write};
 use std::rc::Rc;
 
 use crate::bishedit::motion;
-use crate::bishedit::vimkeys::{KeyOutcome, VimKeys};
+use crate::bishedit::vimkeys::{KeyOutcome, VimKeys, WindowCmd};
 use crate::bishedit::Buffer as BisheditBuffer;
 use crate::editor::{self, Key, ReadOutcome};
 use crate::exec::{self, ExecResult, PaneDirection, Shell, WindowAction};
@@ -466,7 +466,18 @@ pub fn run(mut shell: Shell) {
             }
             Ok(ReadOutcome::NormalMode) => {
                 ensure_promoted(&mut sessions, &mut sinks_are_grid);
-                if let Err(e) = run_normal_mode_navigation(session_id, &mut sessions, &mut windows, current_window, &mut job_frames, term_rows, term_cols) {
+                if let Err(e) = run_normal_mode_navigation(
+                    session_id,
+                    &mut sessions,
+                    &mut windows,
+                    &mut current_window,
+                    &mut next_session_id,
+                    &mut next_window_id,
+                    &mut sinks_are_grid,
+                    &mut job_frames,
+                    term_rows,
+                    term_cols,
+                ) {
                     sessions.get(&session_id).unwrap().shell.sink_err(&format!("bish: error reading input: {}\n", e));
                     break;
                 }
@@ -2155,6 +2166,22 @@ fn render_normal_mode_frame(buf: &ScreenBuffer, rect: Rect, vk: &VimKeys, comman
     let _ = io::stdout().flush();
 }
 
+fn window_cmd_to_action(cmd: WindowCmd) -> WindowAction {
+    match cmd {
+        WindowCmd::Next => WindowAction::Next,
+        WindowCmd::Previous => WindowAction::Previous,
+        WindowCmd::New => WindowAction::New,
+        WindowCmd::Close => WindowAction::Close,
+        WindowCmd::Split => WindowAction::Split { horizontal: false },
+        WindowCmd::VSplit => WindowAction::Split { horizontal: true },
+        WindowCmd::FocusLeft => WindowAction::FocusPane(PaneDirection::Left),
+        WindowCmd::FocusDown => WindowAction::FocusPane(PaneDirection::Down),
+        WindowCmd::FocusUp => WindowAction::FocusPane(PaneDirection::Up),
+        WindowCmd::FocusRight => WindowAction::FocusPane(PaneDirection::Right),
+        WindowCmd::Balance => WindowAction::Balance,
+    }
+}
+
 // bishedit M1's first (and, so far, only) consumer: Ctrl+Space at an
 // empty prompt buffer (editor::ReadOutcome::NormalMode) enters this --
 // read-only cursor navigation over the focused pane's own rendered
@@ -2166,6 +2193,12 @@ fn render_normal_mode_frame(buf: &ScreenBuffer, rect: Rect, vk: &VimKeys, comman
 // These three are recognized directly by this loop rather than routed
 // through bish's own separate `:` command mode, which is a different
 // thing entirely (running an actual shell command), not vim's Ex line.
+// `<C-w>{cmd}` (vimkeys' KeyOutcome::Window) reuses the exact same
+// exec.rs `WindowAction`/repl.rs `apply_window_action` machinery the
+// shell's own `window` command already drives, applied `count` times --
+// per plan.md, running one always exits normal mode too (e.g.
+// `<C-space><C-w>n` jumps to the next window and drops straight into its
+// live prompt, not back into this pane's own normal mode).
 //
 // Not yet resumable via the Frame stack (see plan.md's own scoping
 // note): switching to another window mid-navigation and coming back
@@ -2176,16 +2209,20 @@ fn render_normal_mode_frame(buf: &ScreenBuffer, rect: Rect, vk: &VimKeys, comman
 // aren't repainted live while this loop owns the screen; any staleness
 // resolves itself once normal mode exits and the next compositor_redraw
 // runs.
+#[allow(clippy::too_many_arguments)]
 fn run_normal_mode_navigation(
     session_id: SessionId,
     sessions: &mut HashMap<SessionId, SessionState>,
     windows: &mut Vec<WindowEntry>,
-    current_window: usize,
+    current_window: &mut usize,
+    next_session_id: &mut SessionId,
+    next_window_id: &mut u32,
+    sinks_are_grid: &mut bool,
     job_frames: &mut HashMap<JobFrameId, exec::FgJob>,
     term_rows: usize,
     term_cols: usize,
 ) -> io::Result<()> {
-    let rect = pane_rect(&windows[current_window], windows[current_window].focused_pane, term_rows, term_cols);
+    let rect = pane_rect(&windows[*current_window], windows[*current_window].focused_pane, term_rows, term_cols);
     // Same reasoning as freeze_idle_prompt's other call sites (splitting,
     // switching pane focus): this session's live prompt has only ever
     // been drawn straight to the real terminal by editor::read_line,
@@ -2205,12 +2242,12 @@ fn run_normal_mode_navigation(
     // normal mode ever triggers promotion (the alternate screen buffer
     // starts out blank), harmless otherwise -- then this pane's own
     // rectangle on top of that with the scrollback view.
-    compositor_redraw(sessions, windows, current_window, term_rows, term_cols);
+    compositor_redraw(sessions, windows, *current_window, term_rows, term_cols);
     render_normal_mode_frame(&buf, rect, &vk, None);
 
     loop {
         let key = match editor::read_key_idle(&mut || {
-            service_background_jobs(sessions, windows, job_frames, current_window);
+            service_background_jobs(sessions, windows, job_frames, *current_window);
         })? {
             Some(k) => k,
             None => break,
@@ -2220,7 +2257,7 @@ fn run_normal_mode_navigation(
             Key::Char('i') => break,
             Key::Char('Z') => {
                 let k2 = editor::read_key_idle(&mut || {
-                    service_background_jobs(sessions, windows, job_frames, current_window);
+                    service_background_jobs(sessions, windows, job_frames, *current_window);
                 })?;
                 if k2 == Some(Key::Char('Z')) {
                     break;
@@ -2238,7 +2275,7 @@ fn run_normal_mode_navigation(
                 render_normal_mode_frame(&buf, rect, &vk, Some(":"));
                 loop {
                     let k2 = match editor::read_key_idle(&mut || {
-                        service_background_jobs(sessions, windows, job_frames, current_window);
+                        service_background_jobs(sessions, windows, job_frames, *current_window);
                     })? {
                         Some(k) => k,
                         None => return Ok(()),
@@ -2266,18 +2303,44 @@ fn run_normal_mode_navigation(
             _ => {}
         }
 
-        // Rendered on every keystroke, not just a resolved Motion -- the
-        // status bar needs to show a pending count/prefix (e.g. "20g"
-        // mid-`20gg`) and a search's in-progress text live, not just the
-        // end result once a motion actually applies.
-        if let KeyOutcome::Motion(m, count) = vk.feed(key) {
-            motion::apply_motion(&mut buf, m, count);
-            scroll_to_show_cursor(&mut buf);
+        match vk.feed(key) {
+            KeyOutcome::Motion(m, count) => {
+                motion::apply_motion(&mut buf, m, count);
+                scroll_to_show_cursor(&mut buf);
+                render_normal_mode_frame(&buf, rect, &vk, None);
+            }
+            KeyOutcome::Window(cmd, count) => {
+                let action = window_cmd_to_action(cmd);
+                for _ in 0..count.unwrap_or(1).max(1) {
+                    apply_window_action(
+                        action,
+                        sessions,
+                        windows,
+                        current_window,
+                        next_session_id,
+                        next_window_id,
+                        sinks_are_grid,
+                        term_rows,
+                        term_cols,
+                    );
+                }
+                // apply_window_action already ends with its own
+                // compositor_redraw -- nothing left to draw before
+                // returning to the (possibly now different) window's own
+                // live prompt.
+                return Ok(());
+            }
+            // Rendered on every keystroke, not just a resolved Motion --
+            // the status bar needs to show a pending count/prefix (e.g.
+            // "20g" mid-`20gg`) and a search's in-progress text live, not
+            // just the end result once a motion actually applies.
+            KeyOutcome::Pending | KeyOutcome::None => {
+                render_normal_mode_frame(&buf, rect, &vk, None);
+            }
         }
-        render_normal_mode_frame(&buf, rect, &vk, None);
     }
 
-    compositor_redraw(sessions, windows, current_window, term_rows, term_cols);
+    compositor_redraw(sessions, windows, *current_window, term_rows, term_cols);
     Ok(())
 }
 

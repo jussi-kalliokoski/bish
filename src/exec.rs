@@ -3061,7 +3061,11 @@ impl Shell {
             // shell builtin -- with the guard false, this arm doesn't
             // match and `window` falls through to the same external-
             // command lookup any other unrecognized name would hit.
-            "window" | "w" | "win" if self.restrict_to_builtins => {
+            // "w" deliberately isn't an alias here (unlike "win") -- it's
+            // reserved for a future vim-style `:w` write command instead,
+            // matching bishedit's normal-mode Ctrl-W leader now covering
+            // window management directly (see vimkeys.rs's WindowCmd).
+            "window" | "win" if self.restrict_to_builtins => {
                 return self.run_window(&argv[1..]);
             }
             "pushd" => return ExecResult::Status(self.run_pushd(&argv[1..])),
@@ -6285,7 +6289,6 @@ const KNOWN_BUILTINS: &[&str] = &[
     "alias",
     "unalias",
     "window",
-    "w",
     "win",
 ];
 
