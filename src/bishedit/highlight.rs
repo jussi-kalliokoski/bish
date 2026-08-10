@@ -380,10 +380,63 @@ fn strip_flag_suffix(text: &str) -> &str {
     &text[..end]
 }
 
-// Stub for now -- filled in by a later stage (printf's %s/%d/etc
-// format-directive highlighting inside its own format-string argument).
-fn builtin_refine(_command: &str, _arg_index: usize, _raw_text: &[char]) -> Vec<(Range<usize>, HighlightKind)> {
-    Vec::new()
+// One match arm today (printf) -- a plain function rather than a trait/
+// registry, since the extensibility axis here is "add a match arm," which
+// this handles cleanly with no dynamic registration/discovery needed.
+// Revisit only if a second, structurally different consumer of refiners
+// shows up.
+fn builtin_refine(command: &str, arg_index: usize, raw_text: &[char]) -> Vec<(Range<usize>, HighlightKind)> {
+    match command {
+        // printf's format string is its first argument in the common
+        // case -- `printf -v NAME FORMAT ...` shifts it to arg_index 2,
+        // which this doesn't detect (a documented v1 gap: degrades to no
+        // highlighting for that call shape, never a wrong one, since
+        // arg_index 0 there is just "-v" with no '%' chars to match).
+        "printf" if arg_index == 0 => scan_printf_directives(raw_text),
+        _ => Vec::new(),
+    }
+}
+
+// Mirrors exec.rs's own printf_format_once grammar exactly, not full C
+// printf: flags are only '-' and '0' (no '+', space, '#'); width is a
+// digit run; precision is '.' plus a digit run; conversion is exactly one
+// of s b c q d i u o x X, or a literal "%%". An unrecognized conversion
+// char is skipped without emitting a span (matches printf_format_once's
+// own "emitted literally, nothing consumed" behavior) -- `i` has already
+// advanced past the '%' by then, so this can't loop forever.
+fn scan_printf_directives(text: &[char]) -> Vec<(Range<usize>, HighlightKind)> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < text.len() {
+        if text[i] != '%' {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        i += 1;
+        if i < text.len() && text[i] == '%' {
+            i += 1;
+            out.push((start..i, HighlightKind::FormatSpecifier));
+            continue;
+        }
+        while i < text.len() && matches!(text[i], '-' | '0') {
+            i += 1;
+        }
+        while i < text.len() && text[i].is_ascii_digit() {
+            i += 1;
+        }
+        if i < text.len() && text[i] == '.' {
+            i += 1;
+            while i < text.len() && text[i].is_ascii_digit() {
+                i += 1;
+            }
+        }
+        if i < text.len() && matches!(text[i], 's' | 'b' | 'c' | 'q' | 'd' | 'i' | 'u' | 'o' | 'x' | 'X') {
+            i += 1;
+            out.push((start..i, HighlightKind::FormatSpecifier));
+        }
+    }
+    out
 }
 
 fn highlight_tok(
@@ -1017,5 +1070,72 @@ mod tests {
     fn classify_plain_argument_core_no_link_when_cwd_is_none() {
         let data = man(&[], &[]);
         assert_eq!(classify_plain_argument_core("Cargo.toml", &(0..10), 1, Some(&data), None, 0), None);
+    }
+
+    fn chars_of(s: &str) -> Vec<char> {
+        s.chars().collect()
+    }
+
+    #[test]
+    fn scan_printf_directives_recognizes_every_supported_conversion() {
+        for conv in ["s", "b", "c", "q", "d", "i", "u", "o", "x", "X"] {
+            let text = format!("%{conv}");
+            let chars = chars_of(&text);
+            assert_eq!(scan_printf_directives(&chars), vec![(0..2, HighlightKind::FormatSpecifier)], "conv={conv}");
+        }
+    }
+
+    #[test]
+    fn scan_printf_directives_handles_flags_width_and_precision() {
+        assert_eq!(scan_printf_directives(&chars_of("%-10s")), vec![(0..5, HighlightKind::FormatSpecifier)]);
+        assert_eq!(scan_printf_directives(&chars_of("%05d")), vec![(0..4, HighlightKind::FormatSpecifier)]);
+        assert_eq!(scan_printf_directives(&chars_of("%5.2f")), vec![]); // 'f' isn't supported by this shell's printf
+        assert_eq!(scan_printf_directives(&chars_of("%.3s")), vec![(0..4, HighlightKind::FormatSpecifier)]);
+    }
+
+    #[test]
+    fn scan_printf_directives_treats_literal_percent_as_its_own_directive() {
+        assert_eq!(scan_printf_directives(&chars_of("100%% done")), vec![(3..5, HighlightKind::FormatSpecifier)]);
+    }
+
+    #[test]
+    fn scan_printf_directives_skips_unrecognized_conversions_without_a_span() {
+        assert_eq!(scan_printf_directives(&chars_of("%z")), vec![]);
+    }
+
+    #[test]
+    fn scan_printf_directives_does_not_panic_on_a_trailing_percent() {
+        assert_eq!(scan_printf_directives(&chars_of("done%")), vec![]);
+    }
+
+    #[test]
+    fn scan_printf_directives_finds_multiple_directives_in_order() {
+        assert_eq!(
+            scan_printf_directives(&chars_of("%s is %d years old")),
+            vec![(0..2, HighlightKind::FormatSpecifier), (6..8, HighlightKind::FormatSpecifier)]
+        );
+    }
+
+    #[test]
+    fn builtin_refine_only_fires_for_printf_at_arg_index_zero() {
+        let text = chars_of("%s");
+        assert_eq!(builtin_refine("printf", 0, &text), vec![(0..2, HighlightKind::FormatSpecifier)]);
+        // `-v NAME FORMAT` shifts the real format string to arg_index 2 --
+        // a documented v1 gap, degrading to no highlighting rather than a
+        // wrong one.
+        assert_eq!(builtin_refine("printf", 2, &text), vec![]);
+        assert_eq!(builtin_refine("echo", 0, &text), vec![]);
+    }
+
+    // The user's own example from the feature request.
+    #[test]
+    fn printf_format_specifier_is_highlighted_within_the_quoted_string() {
+        let text = "printf 'hello %s' world";
+        let spans = kinds(text);
+        let quote_start = text.find("'hello %s'").unwrap() + 1;
+        let quote_end = quote_start + "hello %s".len();
+        assert!(spans.contains(&(quote_start, quote_end, HighlightKind::String)), "{spans:?}");
+        let pct_start = text.find("%s").unwrap();
+        assert!(spans.contains(&(pct_start, pct_start + 2, HighlightKind::FormatSpecifier)), "{spans:?}");
     }
 }
