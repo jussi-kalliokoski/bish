@@ -53,12 +53,6 @@ struct SessionState {
     // before any `cd` at all.
     dir_history: Vec<std::path::PathBuf>,
     dir_history_index: usize,
-    // Leftover buffer text from exiting command mode via Backspace at
-    // its own start (see editor::ReadOutcome::ExitCommandMode's doc
-    // comment) -- drained by the main loop's own next read_line call
-    // for this session as `initial_text` (cursor at its start), then
-    // cleared. Empty the overwhelming rest of the time.
-    pending_prefill: String,
 }
 
 type JobFrameId = u32;
@@ -270,7 +264,6 @@ pub fn run(mut shell: Shell) {
             warned_stopped_jobs: false,
             dir_history: vec![root_cwd],
             dir_history_index: 0,
-            pending_prefill: String::new(),
         },
     );
     let mut windows: Vec<WindowEntry> = vec![WindowEntry::single(0, Frame::Session(0))];
@@ -339,13 +332,9 @@ pub fn run(mut shell: Shell) {
             continue;
         }
 
-        let (prompt_str, armed_prompt_str) = {
+        let prompt_str = {
             let session = &sessions[&session_id];
-            if session.buffer.is_empty() {
-                (prompt::render(&session.shell), prompt::render_command_armed(&session.shell))
-            } else {
-                (prompt::continuation(), prompt::continuation_armed())
-            }
+            if session.buffer.is_empty() { prompt::render(&session.shell) } else { prompt::continuation() }
         };
         let (col_origin, width) = focused_col_origin(&windows[current_window], sinks_are_grid, term_rows, term_cols);
         // A standalone snapshot, not a live borrow: on_idle below needs
@@ -356,13 +345,8 @@ pub fn run(mut shell: Shell) {
         // needs to be visible mid-browse anyway (see History's own doc
         // comment on what a clone/fork actually shares).
         let session_history = sessions[&session_id].history.clone();
-        // Leftover text from exiting command mode via Backspace (see
-        // SessionState::pending_prefill's own doc comment) -- consumed
-        // here, once, then cleared so it doesn't reappear on some later
-        // unrelated prompt.
-        let initial_text = std::mem::take(&mut sessions.get_mut(&session_id).unwrap().pending_prefill);
 
-        match editor::read_line(&prompt_str, &armed_prompt_str, &session_history, false, None, &initial_text, col_origin, width, || {
+        match editor::read_line(&prompt_str, &session_history, false, col_origin, width, || {
             service_background_jobs(&mut sessions, &mut windows, &mut job_frames, current_window);
         }) {
             Ok(ReadOutcome::Eof) => {
@@ -437,16 +421,6 @@ pub fn run(mut shell: Shell) {
                     term_cols,
                 );
             }
-            Ok(ReadOutcome::ExitCommandMode(_)) => {
-                // Can't actually happen here: this call always passes
-                // esc_cancels=false, and ExitCommandMode is only ever
-                // produced when esc_cancels is true (see its own doc
-                // comment) -- i.e. inside run_command_mode's own nested
-                // read_line, which is where this is handled for real
-                // (see handle_command_mode's ExitToShell arm). Handled
-                // as a no-op here purely as a defensive fallback rather
-                // than unreachable!().
-            }
             Ok(ReadOutcome::Interrupted) => {
                 // Ctrl-C abandons whatever multi-line construct was
                 // pending, same as bash, and starts fresh at a new prompt.
@@ -475,27 +449,13 @@ pub fn run(mut shell: Shell) {
                     &mut next_window_id,
                     &mut sinks_are_grid,
                     &mut job_frames,
+                    &mut cmd_history,
                     term_rows,
                     term_cols,
                 ) {
                     sessions.get(&session_id).unwrap().shell.sink_err(&format!("bish: error reading input: {}\n", e));
                     break;
                 }
-            }
-            Ok(ReadOutcome::CommandMode(pending)) => {
-                handle_command_mode(
-                    session_id,
-                    pending,
-                    &mut sessions,
-                    &mut windows,
-                    &mut current_window,
-                    &mut next_session_id,
-                    &mut next_window_id,
-                    &mut cmd_history,
-                    &mut sinks_are_grid,
-                    term_rows,
-                    term_cols,
-                );
             }
             Ok(ReadOutcome::Line(line)) => {
                 let mut window_action = None;
@@ -683,16 +643,17 @@ pub fn run(mut shell: Shell) {
     }
 }
 
-// Shared by both places command mode can be entered: the ordinary ':' at
-// a Session-frame window's own prompt, and (M10c) the detach key firing
-// while a Job frame owns the window instead. `pending` is the character
-// (if any) that committed entry -- see editor::ReadOutcome::CommandMode's
-// doc comment; always None from the detach path, since Ctrl+Space isn't
-// itself a character command mode should see as typed input.
+// Shared by both places command mode can be entered: normal mode's own
+// ':' (run_normal_mode_navigation -- the *only* typed-text path now, see
+// editor::ReadOutcome::NormalMode's doc comment), and (M10c) the detach
+// key firing while a Job frame owns the window instead. Returns the
+// underlying CommandModeOutcome so a caller that cares (only normal
+// mode's ':' handler does) can tell Quit apart from a command that just
+// ran normally -- the job-detach path ignores it, same as it always
+// ignored what command mode did before this returned anything.
 #[allow(clippy::too_many_arguments)]
 fn handle_command_mode(
     session_id: SessionId,
-    pending: Option<char>,
     sessions: &mut HashMap<SessionId, SessionState>,
     windows: &mut Vec<WindowEntry>,
     current_window: &mut usize,
@@ -702,27 +663,17 @@ fn handle_command_mode(
     sinks_are_grid: &mut bool,
     term_rows: usize,
     term_cols: usize,
-) {
+) -> CommandModeOutcome {
     let (col_origin, width) = focused_col_origin(&windows[*current_window], *sinks_are_grid, term_rows, term_cols);
     let outcome = {
         let session = sessions.get_mut(&session_id).unwrap();
-        run_command_mode(&mut session.shell, cmd_history, pending, col_origin, width)
+        run_command_mode(&mut session.shell, cmd_history, col_origin, width)
     };
     match outcome {
         CommandModeOutcome::Action(action) => {
             apply_window_action(action, sessions, windows, current_window, next_session_id, next_window_id, sinks_are_grid, term_rows, term_cols);
         }
-        CommandModeOutcome::ExitToShell(text) => {
-            // Stashed for the main loop's own next read_line call to
-            // pick up as initial_text (cursor at its start) -- see
-            // editor::ReadOutcome::ExitCommandMode's doc comment for
-            // why the text belongs there rather than being discarded.
-            sessions.get_mut(&session_id).unwrap().pending_prefill = text;
-            if *sinks_are_grid {
-                compositor_redraw(sessions, windows, *current_window, term_rows, term_cols);
-            }
-        }
-        CommandModeOutcome::Cancelled => {
+        CommandModeOutcome::Quit | CommandModeOutcome::Cancelled => {
             if *sinks_are_grid {
                 // No window action, but command mode may still have run
                 // ordinary builtins whose output landed in this
@@ -732,6 +683,7 @@ fn handle_command_mode(
             }
         }
     }
+    outcome
 }
 
 // Drives whatever job is behind `job_frame_id` -- freshly pushed by the
@@ -781,9 +733,8 @@ fn run_fg_job_frame(
         }
         FgOutcome::Detached => {
             job_frames.insert(job_frame_id, job);
-            handle_command_mode(
+            let _ = handle_command_mode(
                 session_id,
-                None,
                 sessions,
                 windows,
                 current_window,
@@ -914,7 +865,6 @@ fn apply_window_action(
                     warned_stopped_jobs: false,
                     dir_history: vec![child_cwd],
                     dir_history_index: 0,
-                    pending_prefill: String::new(),
                 },
             );
             let wid = *next_window_id;
@@ -1027,7 +977,6 @@ fn split_focused_pane(
             warned_stopped_jobs: false,
             dir_history: vec![child_cwd],
             dir_history_index: 0,
-            pending_prefill: String::new(),
         },
     );
 
@@ -2218,19 +2167,26 @@ fn window_cmd_to_action(cmd: WindowCmd) -> WindowAction {
 // empty prompt buffer (editor::ReadOutcome::NormalMode) enters this --
 // read-only cursor navigation over the focused pane's own rendered
 // content (scrollback included), vim's normal-mode motions applied via
-// bishedit::motion/vimkeys. `i` returns to the live prompt, same as vim;
-// `:q`/`:q!`/`ZZ` are accepted as the same "return to the live prompt"
-// gesture -- there is nothing here to save, so `:q!`'s force isn't
-// distinguished from a plain `:q` (see plan.md's own milestone scoping).
-// These three are recognized directly by this loop rather than routed
-// through bish's own separate `:` command mode, which is a different
-// thing entirely (running an actual shell command), not vim's Ex line.
-// `<C-w>{cmd}` (vimkeys' KeyOutcome::Window) reuses the exact same
-// exec.rs `WindowAction`/repl.rs `apply_window_action` machinery the
-// shell's own `window` command already drives, applied `count` times --
-// per plan.md, running one always exits normal mode too (e.g.
-// `<C-space><C-w>n` jumps to the next window and drops straight into its
-// live prompt, not back into this pane's own normal mode).
+// bishedit::motion/vimkeys. `i` returns to the live prompt, same as vim.
+// `:` hands off to the real command-mode feature (handle_command_mode --
+// the same one the M10c job-detach path uses), positioned on this pane's
+// own status-bar row (plan.md: "the command is shown above the tab
+// bar") -- the only way command mode is reached now that the old direct
+// ':'-at-the-shell-prompt shortcut is gone (see editor::ReadOutcome's own
+// doc comment). `ZZ` and typing exactly "q"/"q!" as a command both exit
+// normal mode -- `ZZ` directly here, "q"/"q!" via run_command_mode
+// special-casing them as vim's own Ex quit commands rather than trying
+// to run them as shell builtins (see its own doc comment). Cancelling
+// out of the command line (Ctrl-C/Esc/empty-Backspace/empty-Enter)
+// returns to this navigation instead, matching real vim staying in
+// Normal mode after an aborted ':' command. `<C-w>{cmd}` (vimkeys'
+// KeyOutcome::Window) reuses the exact same exec.rs `WindowAction`/
+// repl.rs `apply_window_action` machinery the shell's own `window`
+// command already drives, applied `count` times -- per plan.md, running
+// one always exits normal mode too (e.g. `<C-space><C-w>n` jumps to the
+// next window and drops straight into its live prompt, not back into
+// this pane's own normal mode) -- matching what a real command-mode
+// `Action` outcome now does as well, for the same reason.
 //
 // Not yet resumable via the Frame stack (see plan.md's own scoping
 // note): switching to another window mid-navigation and coming back
@@ -2251,6 +2207,7 @@ fn run_normal_mode_navigation(
     next_window_id: &mut u32,
     sinks_are_grid: &mut bool,
     job_frames: &mut HashMap<JobFrameId, exec::FgJob>,
+    cmd_history: &mut History,
     term_rows: usize,
     term_cols: usize,
 ) -> io::Result<()> {
@@ -2296,41 +2253,44 @@ fn run_normal_mode_navigation(
                 }
                 continue;
             }
-            // ':' isn't routed through vimkeys (see run_normal_mode_
-            // navigation's own doc comment on why `:q`/`:q!` are handled
-            // directly here) -- so this loop renders its own live status
-            // bar as the command is typed, the same live-feedback
-            // treatment vimkeys' Pending::Search already gets for '/'/'?'
-            // for free via pending_display().
+            // ':' isn't routed through vimkeys -- it hands off to the
+            // real command-mode feature (see this function's own doc
+            // comment), positioned on this pane's own status-bar row
+            // (plan.md: "the command is shown above the tab bar"; read_
+            // line's own redraw() only ever repositions columns within
+            // whatever row the real cursor is already on, so that row has
+            // to be set explicitly here first).
             Key::Char(':') => {
-                let mut cmd = String::new();
-                render_normal_mode_frame(&buf, rect, &vk, Some(":"));
-                loop {
-                    let k2 = match editor::read_key_idle(&mut || {
-                        service_background_jobs(sessions, windows, job_frames, *current_window);
-                    })? {
-                        Some(k) => k,
-                        None => return Ok(()),
-                    };
-                    match k2 {
-                        Key::Enter => break,
-                        Key::Escape => {
-                            cmd.clear();
-                            break;
-                        }
-                        Key::Backspace => {
-                            cmd.pop();
-                        }
-                        Key::Char(c) => cmd.push(c),
-                        _ => {}
+                let status_row = rect.row + normal_mode_content_rows(rect);
+                print!("\x1b[{};{}H", status_row + 1, rect.col + 1);
+                let _ = io::stdout().flush();
+                match handle_command_mode(
+                    session_id,
+                    sessions,
+                    windows,
+                    current_window,
+                    next_session_id,
+                    next_window_id,
+                    cmd_history,
+                    sinks_are_grid,
+                    term_rows,
+                    term_cols,
+                ) {
+                    // Matches vim: an aborted/cancelled ':' command drops
+                    // back into Normal mode, not out of it entirely.
+                    CommandModeOutcome::Cancelled => {
+                        render_normal_mode_frame(&buf, rect, &vk, None);
+                        continue;
                     }
-                    render_normal_mode_frame(&buf, rect, &vk, Some(&format!(":{}", cmd)));
+                    // A real command ran (possibly changing window/pane
+                    // focus -- apply_window_action already handled that),
+                    // or the user typed vim's own ":q"/":q!" -- either way
+                    // exits normal mode, matching the <C-w> leader's own
+                    // "running one exits normal mode too" behavior.
+                    CommandModeOutcome::Action(_) | CommandModeOutcome::Quit => {
+                        return Ok(());
+                    }
                 }
-                if cmd == "q" || cmd == "q!" {
-                    break;
-                }
-                render_normal_mode_frame(&buf, rect, &vk, None);
-                continue;
             }
             _ => {}
         }
@@ -2490,80 +2450,66 @@ fn is_incomplete(err: &str) -> bool {
 }
 
 // How run_command_mode's one-shot loop ended -- see its own doc comment
-// for what each case means.
+// for what each case means. Copy: every variant is either data-free or
+// carries a Copy type, and handle_command_mode both matches on this
+// itself (to apply the side effect) and hands the same value back to its
+// own caller.
+#[derive(Debug, Clone, Copy)]
 enum CommandModeOutcome {
     Action(WindowAction),
-    ExitToShell(String),
+    // The user typed vim's own ":q"/":q!" -- see run_command_mode's own
+    // doc comment for why these are special-cased rather than run as
+    // shell commands.
+    Quit,
     Cancelled,
 }
 
-// Command mode: entered via ':' at an empty insert-mode prompt (see
-// editor.rs's ReadOutcome::CommandMode). Has its own history, separate
-// from the shell's, and only ever runs builtins directly -- `command NAME`
-// is the escape hatch for externals (see restrict_to_builtins in exec.rs).
-// `initial_char` is the character (if any) that committed entry into
-// command mode -- e.g. typing ":w new" commits on 'w', which must be
-// command mode's own first typed character, not lost (see
-// editor::ReadOutcome::CommandMode's doc comment).
+// Command mode: reached only via bishedit normal mode's own ':' now (see
+// editor::ReadOutcome::NormalMode's doc comment and run_normal_mode_
+// navigation's own ':' handling) -- and, unchanged, via the M10c job-
+// detach path. Has its own history, separate from the shell's, and only
+// ever runs builtins directly -- `command NAME` is the escape hatch for
+// externals (see restrict_to_builtins in exec.rs).
 // Renders its own prompt via prompt::render_command_armed -- the exact
-// same "user@host:path" prefix the normal prompt uses, just with the
-// ':' terminator -- rather than some visually distinct "you are now in
-// a special mode" prompt: switching into command mode should read as
-// nothing more than that one terminator character changing, seamlessly
-// continuing the same line editor.rs was already drawing (see
-// read_line's arming-commit branch, which deliberately never prints a
-// newline on the way in).
+// same "user@host:path" prefix the normal prompt uses, just with the ':'
+// terminator, matching vim's own Ex command line.
 // One-shot, matching vim's ':' Ex command line: successfully running one
-// command drops straight back to the normal shell prompt rather than
-// looping for another (see the `_ => return Cancelled` below). An empty
-// line, Ctrl-C, Ctrl-D, or Esc (regardless of what's been typed -- see
-// read_line's esc_cancels parameter) all cancel out the same way, back to
-// insert mode with nothing run. Backspace with the cursor at the buffer's
-// own start additionally exits back to shell mode *with* whatever text
-// was still there (see editor::ReadOutcome::ExitCommandMode's own doc
-// comment) -- CommandModeOutcome::ExitToShell, distinct from a plain
-// Cancelled since the caller needs to actually do something with that
-// text, not just drop it. Returns Action(WindowAction) if the command
-// that ran was a `window`-family one, for the caller to apply against the
-// real session/window state (which run_command_mode itself has no access
-// to). `col_origin`: see editor::read_line's own doc comment -- the
-// caller (handle_command_mode) computes this once from the real
-// session/window state this function has no access to.
-fn run_command_mode(shell: &mut Shell, history: &mut History, initial_char: Option<char>, col_origin: usize, width: usize) -> CommandModeOutcome {
+// command drops straight back to the caller rather than looping for
+// another (see the `_ => return Cancelled` below). An empty line,
+// Ctrl-C, Ctrl-D, or Esc (regardless of what's been typed -- see
+// read_line's esc_cancels parameter) all cancel out the same way, with
+// nothing run -- and so does Backspace at an empty buffer now (matching
+// real vim: Backspace on an empty Ex line drops back to Normal mode --
+// see read_line's own Key::Backspace arm, which reports this as a plain
+// ReadOutcome::Interrupted, same as Ctrl-C). Typing exactly "q" or "q!"
+// as the whole (complete, non-continuing) line is recognized directly,
+// *before* ever reaching the lex/parse/run pipeline -- these are vim's
+// own Ex quit commands, not shell builtins, so it would be wrong to run
+// them through the same restricted-builtin dispatch an ordinary command
+// goes through (there's no "q" builtin; it would just fail as unknown).
+// Returns Action(WindowAction) if the command that ran was a `window`-
+// family one, for the caller to apply against the real session/window
+// state (which run_command_mode itself has no access to). `col_origin`:
+// see editor::read_line's own doc comment -- the caller
+// (handle_command_mode) computes this once from the real session/window
+// state this function has no access to.
+fn run_command_mode(shell: &mut Shell, history: &mut History, col_origin: usize, width: usize) -> CommandModeOutcome {
     let mut buffer = String::new();
-    let mut prefill = initial_char;
     loop {
         let prompt_str = if buffer.is_empty() { prompt::render_command_armed(shell) } else { prompt::continuation() };
 
-        // Already fully inside command mode, so there's nothing
-        // meaningful to swap to if the ':'-arming mechanic re-triggers
-        // here (see editor::read_line's doc comment) -- same string for
-        // both, making it visually a no-op. esc_cancels: true -- like a
-        // vim ':' command line, Esc should back out of command mode the
-        // same as Ctrl-C, regardless of what's been typed. prefill.take():
-        // only the very first iteration (if entry carried a character)
-        // seeds the buffer; every iteration after that starts empty.
-        // `""`: command mode never receives ExitCommandMode's own
-        // leftover-text restoration (that's specifically a return trip
-        // *back* to shell mode, not something command mode itself
-        // re-enters with). `|| {}`: unlike the main loop's own read_line
-        // call, this nested one doesn't service other windows'
-        // backgrounded jobs while idling (M10c) -- command mode is
-        // one-shot and its own prompt is normally answered in well under
-        // a poll tick, so the window during which a background job would
-        // visibly stall here is negligible; wiring sessions/windows/
-        // job_frames all the way through run_command_mode for that is
-        // scoped out for now.
-        match editor::read_line(&prompt_str, &prompt_str, history, true, prefill.take(), "", col_origin, width, || {}) {
+        // esc_cancels: true -- like a vim ':' command line, Esc (and now
+        // an empty-buffer Backspace too) should back out of command mode
+        // the same as Ctrl-C, regardless of what's been typed. `|| {}`:
+        // unlike the main loop's own read_line call, this nested one
+        // doesn't service other windows' backgrounded jobs while idling
+        // (M10c) -- command mode is one-shot and its own prompt is
+        // normally answered in well under a poll tick, so the window
+        // during which a background job would visibly stall here is
+        // negligible; wiring sessions/windows/job_frames all the way
+        // through run_command_mode for that is scoped out for now.
+        match editor::read_line(&prompt_str, history, true, col_origin, width, || {}) {
             Ok(ReadOutcome::Eof) | Ok(ReadOutcome::Interrupted) => return CommandModeOutcome::Cancelled,
-            Ok(ReadOutcome::ExitCommandMode(text)) => return CommandModeOutcome::ExitToShell(text),
-            // ':' at an empty command-mode prompt too -- nothing
-            // meaningful to switch to since we're already here; just
-            // carry forward whatever character (if any) committed it as
-            // the next iteration's prefill, same as the outer entry.
-            Ok(ReadOutcome::CommandMode(pending)) => {
-                prefill = pending;
-            }
             // Directory navigation doesn't mean much inside command
             // mode's own restricted, one-shot context -- just ignore it
             // and keep showing this same prompt, rather than wiring
@@ -2604,8 +2550,12 @@ fn run_command_mode(shell: &mut Shell, history: &mut History, initial_char: Opti
                 }
                 buffer.push_str(&line);
 
-                if buffer.trim().is_empty() {
+                let trimmed = buffer.trim();
+                if trimmed.is_empty() {
                     return CommandModeOutcome::Cancelled;
+                }
+                if trimmed == "q" || trimmed == "q!" {
+                    return CommandModeOutcome::Quit;
                 }
 
                 match Lexer::new(&buffer).tokenize() {

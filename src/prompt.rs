@@ -3,12 +3,10 @@
 // style), where path_abbr abbreviates parent path components to their
 // first character, spelling out only the final one (e.g. "~/D/P/bish"),
 // and the terminator glyph is "$" for a normal user, "#" for root, or
-// ":" while editor.rs's read_line has a virtual, not-yet-materialized
-// command-mode colon armed (see render_command_armed and editor.rs's
-// read_line for the reversible-entry mechanic this exists to support --
-// plan.md's "Future improvements" note on making command-mode entry a
-// virtual character instead of literal inserted text). No git-branch
-// segment yet -- there's no git integration in bish at all so far.
+// ":" for command mode's own prompt (see render_command_armed) --
+// reached only via bishedit normal mode's ':' now, not typed directly at
+// this prompt. No git-branch segment yet -- there's no git integration
+// in bish at all so far.
 
 use crate::exec::{self, Shell};
 
@@ -51,10 +49,9 @@ pub fn render(shell: &Shell) -> String {
     format!("{}{glyph_color}{glyph}{RESET} ", prefix(shell, is_root))
 }
 
-// Shown in place of render()'s output while a virtual command-mode colon
-// is armed (see editor.rs's read_line): same prefix, only the terminator
-// glyph and its color change, so entering command mode reads as "the
-// prompt itself changed," not as if a character had been typed.
+// Command mode's own prompt (repl.rs's run_command_mode): same prefix as
+// render(), only the terminator glyph and its color change, matching
+// vim's own ':' Ex command line.
 pub fn render_command_armed(shell: &Shell) -> String {
     let is_root = unsafe { geteuid() } == 0;
     format!("{}{CMD_MODE_COLOR}:{RESET} ", prefix(shell, is_root))
@@ -65,12 +62,6 @@ pub fn render_command_armed(shell: &Shell) -> String {
 // the full cwd prompt.
 pub fn continuation() -> String {
     "\x1b[2m…\x1b[0m ".to_string()
-}
-
-// Armed variant of continuation(), for the same reason render_command_
-// armed exists alongside render().
-pub fn continuation_armed() -> String {
-    format!("{CMD_MODE_COLOR}:{RESET} ")
 }
 
 // pub: repl.rs's tab bar reuses this directly (see its own tab_bar_

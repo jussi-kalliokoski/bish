@@ -457,36 +457,20 @@ pub enum ReadOutcome {
     Line(String),
     Eof,
     Interrupted,
-    // Commits to command mode (see the cmd_mode_armed block in read_line).
-    // The payload is the character, if any, that was typed to trigger the
-    // commit -- e.g. typing ":w new" arms on ':' then commits on 'w',
-    // which must count as command mode's own first typed character
-    // rather than being lost, so `w new` (not just `new`) is what
-    // actually runs. `None` when commit was via a bare Enter right after
-    // arming, with nothing else typed.
-    CommandMode(Option<char>),
     // Alt+Left/Right/Up at an empty buffer -- see DirNav's own doc
     // comment. Never fires with anything typed (see read_line's own
     // handling), so there's no "what happens to the buffer" question.
     DirNav(DirNav),
-    // Backspace at the start of a command-mode buffer (see the
-    // Key::Backspace arm below): command mode's own ':' terminator
-    // isn't part of the buffer itself, just a fixed prefix baked into
-    // the prompt string, so there's nothing *in* the buffer left of
-    // the cursor to backspace once it's at position 0 -- but pressing
-    // Backspace there still means something, the natural continuation
-    // of ':' arming's own reversibility (Backspace before commit
-    // already cancels arming) to *after* commit too: delete the colon
-    // itself and fall back to shell mode. The payload is whatever was
-    // still in the buffer to the right of the cursor (there can be
-    // some, e.g. after Home) -- carried over as real shell-mode text
-    // rather than discarded, with the cursor landing at its start, in
-    // the exact spot the ':' itself used to occupy.
-    ExitCommandMode(String),
     // Ctrl+Space at an empty buffer -- same "don't discard in-progress
-    // typing" gating as DirNav/':' arming above. Enters bishedit's
-    // normal-mode navigation over the current pane's own rendered content
-    // (repl.rs's run_normal_mode_navigation); `i` there returns to a fresh
+    // typing" gating as DirNav above. Enters bishedit's normal-mode
+    // navigation over the current pane's own rendered content (repl.rs's
+    // run_normal_mode_navigation) -- the *only* way into command mode now
+    // (via normal mode's own ':', matching real vim) since the old direct
+    // ':'-at-the-shell-prompt shortcut was retired: it existed only to let
+    // command mode be reached before normal mode did, and became
+    // redundant clutter (a whole arm/materialize/commit/re-arm dance
+    // living inside ordinary shell-mode typing) the moment normal mode
+    // could get there properly. `i` in normal mode returns to a fresh
     // read_line call, same as this one would have continued into anyway.
     NormalMode,
 }
@@ -495,7 +479,7 @@ pub enum ReadOutcome {
 // parent"), triggered by Alt+Left/Right/Up. repl.rs owns the actual
 // per-session history stack and cd logic -- this just reports which
 // direction was requested, the same "editor.rs only decodes keys, the
-// caller decides what they mean" split as CommandMode/Eof/Interrupted.
+// caller decides what they mean" split as NormalMode/Eof/Interrupted.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum DirNav {
     Back,
@@ -512,13 +496,6 @@ pub enum DirNav {
 // only ever sees that session's own commands plus whatever it inherited
 // at fork time -- no separate boundary/cutoff parameter needed, the
 // scope is inherent to which chain was passed in.
-// `armed_prompt` is shown in place of `prompt` while a virtual, not-yet-
-// materialized command-mode colon is armed (see the arming block below);
-// callers that render a full prompt (repl.rs's prompt::render/
-// render_command_armed) pass the matching pair, and callers with nothing
-// meaningful to swap to (e.g. command mode's own nested read_line, which
-// is already fully inside command mode) can just pass the same string
-// twice.
 // `esc_cancels`: whether Esc, when there's no active history browse to
 // unwind instead, cancels the whole read (same ReadOutcome::Interrupted
 // as Ctrl-C, just without the "^C" echo). Off for the normal shell
@@ -526,18 +503,6 @@ pub enum DirNav {
 // this crate's existing behavior); on for command mode, which -- like a
 // vim ':' command line -- should be cancelable by either Ctrl-C or Esc
 // regardless of what's been typed.
-// `prefill`: a character to seed the buffer with before the first key is
-// even read -- used by repl.rs's run_command_mode to carry forward the
-// character that committed command mode (see ReadOutcome::CommandMode's
-// doc comment), so it counts as typed input instead of being lost.
-// `None` for every other caller.
-// `initial_text`: seeds the whole buffer with this text, cursor at
-// position 0 (not the end -- contrast with `prefill` above) -- used by
-// repl.rs's main loop to restore whatever was still in a command-mode
-// buffer after ExitCommandMode (see that variant's own doc comment for
-// why the cursor specifically belongs at the start). Empty for every
-// other caller; never meaningfully combined with a non-None `prefill`
-// in practice (they seed two different transitions).
 // `on_idle`: called whenever this is about to block waiting for the next
 // keystroke and none has arrived yet within one poll tick -- lets
 // repl.rs's main loop (M10c) service other windows' backgrounded fg jobs
@@ -561,24 +526,14 @@ pub enum DirNav {
 // itself (single-line editing, see this function's own scope note).
 pub fn read_line(
     prompt: &str,
-    armed_prompt: &str,
     history: &History,
     esc_cancels: bool,
-    prefill: Option<char>,
-    initial_text: &str,
     col_origin: usize,
     width: usize,
     mut on_idle: impl FnMut(),
 ) -> io::Result<ReadOutcome> {
     let mut guard = Some(term::RawGuard::enable(0)?);
     let mut ed = LineEditor::new();
-    if let Some(c) = prefill {
-        ed.insert(c);
-    }
-    if !initial_text.is_empty() {
-        ed.buf = initial_text.chars().collect();
-        ed.cursor = 0;
-    }
 
     // Fish-style history browsing: Up/Down search backward/forward through
     // history for entries starting with whatever was typed *before*
@@ -589,31 +544,13 @@ pub fn read_line(
     // fish: the suggestion just becomes your input from that point on.
     let mut browse: Option<(String, usize)> = None;
 
-    // ':' at an empty, unarmed buffer arms this instead of inserting a
-    // character or immediately switching modes: the prompt swaps to
-    // armed_prompt (its command-mode terminator) while the buffer itself
-    // stays untouched. What happens next depends entirely on the very
-    // next key (see the block below that reference this flag) --
-    // Backspace/Ctrl-C/Ctrl-D cancel back to plain shell mode, Space
-    // materializes the colon as a real character (so `: some comment`
-    // still works as an ordinary shell-mode command), and anything else
-    // (Enter included) commits to real command mode, carrying that key
-    // along as command mode's own first typed character if it was one.
-    // Matches plan.md's "Future improvements" note: entering command
-    // mode should read as the prompt itself changing, not as a character
-    // being typed, and should be reversible via Backspace before it's
-    // committed.
-    let mut cmd_mode_armed = false;
-
     // Always goes through the same clear-and-draw redraw(), even with
-    // nothing typed yet and no prefill: the terminal cursor at this
-    // point may already be sitting right after a compositor-frozen
-    // idle prompt for this exact pane (see repl.rs's
-    // freeze_idle_prompt) -- a bare, non-clearing print here would
-    // append a second copy right next to it instead of redrawing over
-    // it. Behaviorally identical to the old bare print for every
-    // non-paned caller (col_origin 0, width the whole terminal, buffer
-    // empty unless prefilled).
+    // nothing typed yet: the terminal cursor at this point may already be
+    // sitting right after a compositor-frozen idle prompt for this exact
+    // pane (see repl.rs's freeze_idle_prompt) -- a bare, non-clearing
+    // print here would append a second copy right next to it instead of
+    // redrawing over it. Behaviorally identical to the old bare print for
+    // every non-paned caller (col_origin 0, width the whole terminal).
     redraw(prompt, &ed, col_origin, width)?;
 
     loop {
@@ -626,55 +563,6 @@ pub fn read_line(
         };
         if !matches!(key, Key::Up | Key::Down | Key::Escape) {
             browse = None;
-        }
-
-        if key == Key::Char(':') && ed.buf.is_empty() && !cmd_mode_armed {
-            cmd_mode_armed = true;
-            redraw(armed_prompt, &ed, col_origin, width)?;
-            continue;
-        }
-        if cmd_mode_armed {
-            match key {
-                // Cancel: back to an ordinary empty shell-mode buffer.
-                // Backspace falls through to its own arm below, which is
-                // a harmless no-op on an already-empty buffer.
-                Key::Backspace | Key::CtrlC | Key::CtrlD => {
-                    cmd_mode_armed = false;
-                }
-                // Materialize as a literal ':' followed by a real space
-                // -- the one case that stays in shell mode instead of
-                // committing, so `: some comment text` still works as an
-                // ordinary invocation of the `:` no-op builtin. Falls
-                // through to this same key's own arm below, which
-                // inserts the space itself.
-                Key::Char(' ') => {
-                    ed.insert(':');
-                    cmd_mode_armed = false;
-                }
-                // Anything else commits to real command mode -- Enter
-                // with nothing pending (the normal way to just open
-                // command mode), or a regular character that must count
-                // as command mode's own first typed character rather
-                // than being lost, so e.g. ":w new" actually enters
-                // command mode and types "w new" there, instead of
-                // materializing as literal shell-mode text. Deliberately
-                // no "\r\n" here (unlike every other return path in this
-                // function): the whole point of arming is that switching
-                // reads as the *same* prompt line's terminator changing,
-                // not a new line/new prompt appearing -- the caller's
-                // next read_line call (command mode's own, seeded with
-                // this pending character) redraws right over this same
-                // row, continuing seamlessly. See repl.rs's
-                // run_command_mode, which renders its own prompt via
-                // prompt::render_command_armed -- the identical prefix
-                // this arming redraw already showed, just re-drawn -- for
-                // exactly this reason.
-                _ => {
-                    drop(guard.take());
-                    let pending = if let Key::Char(c) = key { Some(c) } else { None };
-                    return Ok(ReadOutcome::CommandMode(pending));
-                }
-            }
         }
 
         match key {
@@ -708,38 +596,26 @@ pub fn read_line(
                 term::suspend_self();
                 guard = Some(term::RawGuard::enable(0)?);
             }
-            // Deleting back down to a single leading ':' re-arms command
-            // mode -- the direct reverse of typing ':' then a space to
-            // materialize it (see plan.md's note: "deleting the space
-            // would set the user back in command mode"). Scoped
-            // narrowly to Backspace/Delete (the two "remove one
-            // character" keys), not every possible way to reach that
-            // buffer state (Ctrl-U, Ctrl-W, history recall).
             Key::Backspace => {
-                if esc_cancels && ed.cursor == 0 {
-                    // esc_cancels is only ever set for a command-mode
-                    // read_line call (see its own doc comment) -- see
-                    // ReadOutcome::ExitCommandMode's doc comment for
-                    // what this means and why nothing left of the
-                    // cursor needs deleting first.
+                // esc_cancels is only ever set for a command-mode
+                // read_line call (see its own doc comment) -- matches
+                // real vim: Backspace on an empty Ex command line drops
+                // back out of it (here, to normal mode -- see repl.rs's
+                // run_normal_mode_navigation, the only caller that sets
+                // esc_cancels true now). Only when the buffer is truly
+                // empty, not just "cursor at 0" -- with text still to the
+                // right (e.g. after Home) Backspace has nothing to its
+                // left to delete either way, so it's a plain no-op,
+                // falling through to ed.backspace() below.
+                if esc_cancels && ed.buf.is_empty() {
                     drop(guard.take());
-                    return Ok(ReadOutcome::ExitCommandMode(ed.as_string()));
+                    print!("\r\n");
+                    io::stdout().flush()?;
+                    return Ok(ReadOutcome::Interrupted);
                 }
                 ed.backspace();
-                if ed.buf == [':'] {
-                    ed.buf.clear();
-                    ed.cursor = 0;
-                    cmd_mode_armed = true;
-                }
             }
-            Key::Delete => {
-                ed.delete_forward();
-                if ed.buf == [':'] {
-                    ed.buf.clear();
-                    ed.cursor = 0;
-                    cmd_mode_armed = true;
-                }
-            }
+            Key::Delete => ed.delete_forward(),
             Key::Left | Key::CtrlB => ed.move_left(),
             Key::Right | Key::CtrlF => ed.move_right(),
             Key::Home | Key::CtrlA => ed.cursor = 0,
@@ -820,6 +696,6 @@ pub fn read_line(
             }
             Key::AltLeft | Key::AltRight | Key::AltUp | Key::CtrlSpace | Key::CtrlY | Key::Unknown => {}
         }
-        redraw(if cmd_mode_armed { armed_prompt } else { prompt }, &ed, col_origin, width)?;
+        redraw(prompt, &ed, col_origin, width)?;
     }
 }
