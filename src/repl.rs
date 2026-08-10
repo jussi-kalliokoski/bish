@@ -2470,9 +2470,11 @@ enum CommandModeOutcome {
 // detach path. Has its own history, separate from the shell's, and only
 // ever runs builtins directly -- `command NAME` is the escape hatch for
 // externals (see restrict_to_builtins in exec.rs).
-// Renders its own prompt via prompt::render_command_armed -- the exact
-// same "user@host:path" prefix the normal prompt uses, just with the ':'
-// terminator, matching vim's own Ex command line.
+// Renders its own prompt via prompt::command_mode_prompt -- a bare ':',
+// deliberately *not* a variant of the normal shell prompt (see that
+// function's own doc comment for why: showing the full "user@host:path"
+// prefix here would misleadingly suggest you can type any command, when
+// this is a restricted, builtins-only line).
 // One-shot, matching vim's ':' Ex command line: successfully running one
 // command drops straight back to the caller rather than looping for
 // another (see the `_ => return Cancelled` below). An empty line,
@@ -2496,7 +2498,7 @@ enum CommandModeOutcome {
 fn run_command_mode(shell: &mut Shell, history: &mut History, col_origin: usize, width: usize) -> CommandModeOutcome {
     let mut buffer = String::new();
     loop {
-        let prompt_str = if buffer.is_empty() { prompt::render_command_armed(shell) } else { prompt::continuation() };
+        let prompt_str = if buffer.is_empty() { prompt::command_mode_prompt() } else { prompt::continuation() };
 
         // esc_cancels: true -- like a vim ':' command line, Esc (and now
         // an empty-buffer Backspace too) should back out of command mode

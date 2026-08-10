@@ -2,11 +2,10 @@
 // space before the terminator, matching classic `\u@\h:\w\$ ` PS1
 // style), where path_abbr abbreviates parent path components to their
 // first character, spelling out only the final one (e.g. "~/D/P/bish"),
-// and the terminator glyph is "$" for a normal user, "#" for root, or
-// ":" for command mode's own prompt (see render_command_armed) --
-// reached only via bishedit normal mode's ':' now, not typed directly at
-// this prompt. No git-branch segment yet -- there's no git integration
-// in bish at all so far.
+// and the terminator glyph is "$" for a normal user or "#" for root. No
+// git-branch segment yet -- there's no git integration in bish at all so
+// far. Command mode (see command_mode_prompt) uses a deliberately
+// different, minimal prompt rather than a variant of this one.
 
 use crate::exec::{self, Shell};
 
@@ -30,10 +29,6 @@ fn username() -> String {
     std::env::var("USER").or_else(|_| std::env::var("LOGNAME")).unwrap_or_else(|_| "user".to_string())
 }
 
-// Everything before the terminator glyph -- shared by render and
-// render_command_armed so the two variants editor.rs alternates between
-// while a colon is armed never visually diverge except in that one
-// glyph.
 fn prefix(shell: &Shell, is_root: bool) -> String {
     let home = std::env::var("HOME").unwrap_or_default();
     let display = shorten_path(&shell.cwd.to_string_lossy(), &home);
@@ -49,12 +44,14 @@ pub fn render(shell: &Shell) -> String {
     format!("{}{glyph_color}{glyph}{RESET} ", prefix(shell, is_root))
 }
 
-// Command mode's own prompt (repl.rs's run_command_mode): same prefix as
-// render(), only the terminator glyph and its color change, matching
-// vim's own ':' Ex command line.
-pub fn render_command_armed(shell: &Shell) -> String {
-    let is_root = unsafe { geteuid() } == 0;
-    format!("{}{CMD_MODE_COLOR}:{RESET} ", prefix(shell, is_root))
+// Command mode's own prompt (repl.rs's run_command_mode): deliberately
+// *not* a variant of render()'s "user@host:path$ " -- showing that full
+// prefix here read as if you were at the ordinary shell prompt able to
+// type any command, when command mode is actually a restricted, builtins-
+// only line (see restrict_to_builtins in exec.rs). A bare colon, matching
+// vim's own ':' Ex command line, doesn't carry that false suggestion.
+pub fn command_mode_prompt() -> String {
+    format!("{CMD_MODE_COLOR}:{RESET} ")
 }
 
 // Continuation-line prompt for an unfinished multi-line construct (open
