@@ -19,6 +19,7 @@ use std::io::{self, Write};
 use crate::bishedit::completion::{CompletionCandidate, CompletionProvider, CompletionRequest};
 use crate::bishedit::highlight::{self, BashHighlighter, Highlighter, HighlightContext, StyledSpan};
 use crate::bishedit::motion;
+use crate::bishedit::registers::{RegisterShape, RegisterValue, Registers};
 use crate::bishedit::suggestion::{SuggestionProvider, SuggestionRequest};
 use crate::bishedit::vimkeys::{self, KeyOutcome, VimKeys};
 use crate::history::History;
@@ -72,6 +73,9 @@ pub enum Key {
     CtrlO,
     CtrlU,
     CtrlW,
+    // Vim's insert-mode "paste this register here" -- see read_line's own
+    // Key::CtrlR arm.
+    CtrlR,
     // No shell line-editing use yet (unlike the other Ctrl letters above) --
     // added for bishedit's normal-mode Ctrl-Y (scroll one line up).
     CtrlY,
@@ -133,6 +137,7 @@ fn read_key() -> io::Result<Option<Key>> {
         0x0e => Key::CtrlN,
         0x0f => Key::CtrlO,
         0x10 => Key::CtrlP,
+        0x12 => Key::CtrlR,
         0x15 => Key::CtrlU,
         0x17 => Key::CtrlW,
         0x19 => Key::CtrlY,
@@ -990,6 +995,12 @@ pub fn read_line(
     // parameter -- threaded straight through, read_line itself never
     // interprets it beyond passing it along to every redraw call.
     row_origin: Option<(usize, usize)>,
+    // The whole-shell register table (see bishedit::registers::Registers'
+    // own doc comment) -- one instance, shared globally, threaded through
+    // here for Ctrl-R (below) and passed further into run_line_normal_mode/
+    // run_one_shot_normal_command for y/p in Ctrl-E's/Ctrl-O's own vim
+    // Normal mode.
+    registers: &mut Registers,
     mut on_idle: impl FnMut(),
 ) -> io::Result<ReadOutcome> {
     let mut guard = Some(term::RawGuard::enable(0)?);
@@ -1155,6 +1166,25 @@ pub fn read_line(
             Key::CtrlK => ed.kill_to_end(),
             Key::CtrlU => ed.kill_to_start(),
             Key::CtrlW => ed.kill_word_backward(),
+            // Vim's insert-mode <C-r>{register}: reads exactly one more
+            // key as the register name and splices that register's
+            // contents in at the cursor, literally (not as a "ghost" the
+            // way a suggestion is -- it's real buffer text immediately).
+            // Anything other than a plain char for the register name
+            // (Escape, Ctrl-C, ...) is a no-op, matching vim's own "Esc
+            // cancels a pending <C-r>" -- the next read_key_idle call
+            // simply reprocesses whatever that key would have meant on
+            // its own, same as Ctrl-E/Ctrl-O's own propagated-key pattern
+            // just below, except here there's nothing worth propagating
+            // (an aborted <C-r> is just... aborted).
+            Key::CtrlR => {
+                if let Some(Key::Char(c)) = read_key_idle(&mut on_idle)? {
+                    let text = registers.read(Some(c)).flatten_to_single_line();
+                    for ch in text.chars() {
+                        ed.insert(ch);
+                    }
+                }
+            }
             Key::CtrlL if ctrl_l_reports => {
                 drop(guard.take());
                 return Ok(ReadOutcome::CtrlL);
@@ -1251,7 +1281,7 @@ pub fn read_line(
                 let state = completion.take().unwrap();
                 ed.splice_word(state.word_start, ed.cursor, &state.original);
             }
-            Key::CtrlE => match run_line_normal_mode(&mut ed, prompt, col_origin, width, ctx, &mut on_idle)? {
+            Key::CtrlE => match run_line_normal_mode(&mut ed, prompt, col_origin, width, ctx, registers, &mut on_idle)? {
                 LineNormalExit::ToInsert => {}
                 LineNormalExit::Propagate(k) => {
                     pending_key = Some(k);
@@ -1273,7 +1303,7 @@ pub fn read_line(
             // comment. Reachable directly from ordinary typing, matching
             // real vim -- no need to already be in Ctrl-E's own mode first.
             Key::CtrlO => {
-                if let Some(k) = run_one_shot_normal_command(&mut ed, &mut on_idle)? {
+                if let Some(k) = run_one_shot_normal_command(&mut ed, registers, &mut on_idle)? {
                     pending_key = Some(k);
                     suggestion = None; // see Ctrl-E's own propagate arm
                     continue;
@@ -1361,6 +1391,7 @@ fn run_line_normal_mode(
     col_origin: usize,
     width: usize,
     ctx: HighlightContext,
+    registers: &mut Registers,
     on_idle: &mut dyn FnMut(),
 ) -> io::Result<LineNormalExit> {
     let mut vk = VimKeys::new();
@@ -1393,6 +1424,9 @@ fn run_line_normal_mode(
                         lb.ed.cursor = new_cursor;
                         break LineNormalExit::ToInsert;
                     }
+                    KeyOutcome::Operator(_op, motion, count, register) => yank_motion(&mut lb, registers, motion, count, register),
+                    KeyOutcome::OperatorLines(_op, count, register) => yank_lines(&lb, registers, count, register),
+                    KeyOutcome::Put { before, count, register } => put(&mut lb.ed.buf, &mut lb.ed.cursor, registers, before, count, register),
                     // <C-w> is still vimkeys' own window-leader prefix
                     // here too, matching real vim's own Normal-mode
                     // Ctrl-W meaning -- intentionally not special-cased
@@ -1405,6 +1439,36 @@ fn run_line_normal_mode(
         redraw(&decorated_prompt, ed, col_origin, width, ctx)?;
     };
     Ok(exit)
+}
+
+// The `y{motion}`/`yy` glue: generic over any `bishedit::Buffer`, so this
+// is shared not just by run_line_normal_mode/run_one_shot_normal_command
+// below (both drive a `LineBuffer`) but by repl.rs's own ScreenBuffer-based
+// Ctrl+Space normal mode too (yank-only there -- see that call site). `put`
+// stays private to this file: it works on a `LineEditor`'s own buffer
+// directly (not through `Buffer`), and only the LineBuffer-driven contexts
+// ever have something real to put into -- see repl.rs's own doc comment on
+// why `KeyOutcome::Put` is a deliberate no-op there.
+pub fn yank_motion(buf: &mut impl crate::bishedit::Buffer, registers: &mut Registers, motion: motion::Motion, count: Option<usize>, register: Option<char>) {
+    let Some(range) = motion::motion_range(buf, motion, count) else {
+        return;
+    };
+    let text = motion::extract_text(buf, &range);
+    let shape = if range.shape == motion::MotionShape::Linewise { RegisterShape::Line } else { RegisterShape::Char };
+    registers.write(register, RegisterValue { text, shape });
+}
+
+pub fn yank_lines(buf: &impl crate::bishedit::Buffer, registers: &mut Registers, count: Option<usize>, register: Option<char>) {
+    let text = motion::whole_lines(buf, count.unwrap_or(1).max(1));
+    registers.write(register, RegisterValue { text, shape: RegisterShape::Line });
+}
+
+fn put(buf: &mut Vec<char>, cursor: &mut usize, registers: &mut Registers, before: bool, count: Option<usize>, register: Option<char>) {
+    let value = registers.read(register);
+    let text = value.flatten_to_single_line();
+    let (new_buf, new_cursor) = vimkeys::apply_put(buf, *cursor, &text, before, count.unwrap_or(1).max(1));
+    *buf = new_buf;
+    *cursor = new_cursor;
 }
 
 // Ctrl-O (vim's insert-mode "do exactly one normal command, then return
@@ -1420,7 +1484,7 @@ fn run_line_normal_mode(
 // handled by the caller the same way run_line_normal_mode's own
 // `Propagate` is. No terminal cursor-shape change here either -- same
 // reasoning as run_line_normal_mode's own doc comment.
-fn run_one_shot_normal_command(ed: &mut LineEditor, on_idle: &mut dyn FnMut()) -> io::Result<Option<Key>> {
+fn run_one_shot_normal_command(ed: &mut LineEditor, registers: &mut Registers, on_idle: &mut dyn FnMut()) -> io::Result<Option<Key>> {
     let mut vk = VimKeys::new();
     let mut marks: HashMap<char, (usize, usize)> = HashMap::new();
     let result = loop {
@@ -1445,6 +1509,18 @@ fn run_one_shot_normal_command(ed: &mut LineEditor, on_idle: &mut dyn FnMut()) -
                         let (new_buf, new_cursor) = vimkeys::apply_insert_cmd(&lb.ed.buf, lb.ed.cursor, cmd);
                         lb.ed.buf = new_buf;
                         lb.ed.cursor = new_cursor;
+                        break None;
+                    }
+                    KeyOutcome::Operator(_op, motion, count, register) => {
+                        yank_motion(&mut lb, registers, motion, count, register);
+                        break None;
+                    }
+                    KeyOutcome::OperatorLines(_op, count, register) => {
+                        yank_lines(&lb, registers, count, register);
+                        break None;
+                    }
+                    KeyOutcome::Put { before, count, register } => {
+                        put(&mut lb.ed.buf, &mut lb.ed.cursor, registers, before, count, register);
                         break None;
                     }
                     KeyOutcome::Window(..) | KeyOutcome::None => break None,

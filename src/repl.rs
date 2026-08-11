@@ -6,6 +6,7 @@ use std::rc::Rc;
 use crate::bishedit::completion;
 use crate::bishedit::highlight::HighlightContext;
 use crate::bishedit::motion;
+use crate::bishedit::registers::Registers;
 use crate::bishedit::suggestion;
 use crate::bishedit::vimkeys::{KeyOutcome, VimKeys, WindowCmd};
 use crate::bishedit::Buffer as BisheditBuffer;
@@ -261,6 +262,12 @@ pub fn run(mut shell: Shell) {
     shell.enable_monitor_mode();
 
     let mut cmd_history = History::load(".bish_cmd_history");
+    // The whole-shell register table (yank/put/<C-r>) -- one instance,
+    // shared globally across every window/pane/session, matching both vim
+    // (registers are global to the editor instance, not per-buffer) and
+    // tmux (paste buffers are global to the server, not per-pane). See
+    // bishedit::registers::Registers' own doc comment.
+    let mut registers = Registers::new();
 
     let (mut term_rows, mut term_cols) = query_term_size();
 
@@ -344,6 +351,7 @@ pub fn run(mut shell: Shell) {
                 &mut job_frames,
                 &mut cmd_history,
                 &mut sinks_are_grid,
+                &mut registers,
                 term_rows,
                 term_cols,
             );
@@ -451,6 +459,7 @@ pub fn run(mut shell: Shell) {
             Some(&shell_suggestion),
             menu_capable,
             row_origin,
+            &mut registers,
             || {
                 service_background_jobs(&mut sessions, &mut windows, &mut job_frames, current_window);
             },
@@ -574,6 +583,7 @@ pub fn run(mut shell: Shell) {
                     &mut sinks_are_grid,
                     &mut job_frames,
                     &mut cmd_history,
+                    &mut registers,
                     text,
                     cursor,
                     term_rows,
@@ -753,6 +763,7 @@ pub fn run(mut shell: Shell) {
                         &mut job_frames,
                         &mut cmd_history,
                         &mut sinks_are_grid,
+                        &mut registers,
                         term_rows,
                         term_cols,
                     );
@@ -796,10 +807,11 @@ fn handle_command_mode(
     cmd_history: &mut History,
     sinks_are_grid: &mut bool,
     job_frames: &mut HashMap<JobFrameId, exec::FgJob>,
+    registers: &mut Registers,
     term_rows: usize,
     term_cols: usize,
 ) -> CommandModeOutcome {
-    let outcome = run_command_mode(session_id, sessions, windows, *current_window, cmd_history, job_frames, term_rows, term_cols);
+    let outcome = run_command_mode(session_id, sessions, windows, *current_window, cmd_history, job_frames, registers, term_rows, term_cols);
     match outcome {
         CommandModeOutcome::Action(action) => {
             apply_window_action(action, sessions, windows, current_window, next_session_id, next_window_id, sinks_are_grid, term_rows, term_cols);
@@ -844,6 +856,7 @@ fn run_fg_job_frame(
     job_frames: &mut HashMap<JobFrameId, exec::FgJob>,
     cmd_history: &mut History,
     sinks_are_grid: &mut bool,
+    registers: &mut Registers,
     term_rows: usize,
     term_cols: usize,
 ) {
@@ -881,6 +894,7 @@ fn run_fg_job_frame(
                 cmd_history,
                 sinks_are_grid,
                 job_frames,
+                registers,
                 term_rows,
                 term_cols,
             );
@@ -2373,6 +2387,7 @@ fn run_normal_mode_navigation(
     sinks_are_grid: &mut bool,
     job_frames: &mut HashMap<JobFrameId, exec::FgJob>,
     cmd_history: &mut History,
+    registers: &mut Registers,
     initial_text: String,
     initial_cursor: usize,
     term_rows: usize,
@@ -2476,6 +2491,7 @@ fn run_normal_mode_navigation(
                     cmd_history,
                     sinks_are_grid,
                     job_frames,
+                    registers,
                     term_rows,
                     term_cols,
                 ) {
@@ -2530,6 +2546,29 @@ fn run_normal_mode_navigation(
             KeyOutcome::EnterInsert(cmd) => {
                 let (new_chars, new_cursor) = crate::bishedit::vimkeys::apply_insert_cmd(&original_chars, initial_cursor, cmd);
                 break 'nav Some((new_chars.into_iter().collect(), new_cursor));
+            }
+            // Yank works here too -- copying text out of a pane's own
+            // scrollback/output is exactly what this read-only,
+            // tmux-copy-mode-style view is for (see ScreenBuffer's own doc
+            // comment). `<C-r>` in insert mode, or `p`/`P` in Ctrl-E's/
+            // Ctrl-O's own line-local Normal mode, are what get a yanked
+            // register back into the live prompt afterward.
+            KeyOutcome::Operator(_op, motion, count, register) => {
+                editor::yank_motion(&mut buf, registers, motion, count, register);
+                render_normal_mode_frame(&buf, rect, &vk, None);
+            }
+            KeyOutcome::OperatorLines(_op, count, register) => {
+                editor::yank_lines(&buf, registers, count, register);
+                render_normal_mode_frame(&buf, rect, &vk, None);
+            }
+            // `p`/`P` is a deliberate no-op here: `ScreenBuffer` is
+            // read-only by construction (a view over already-rendered
+            // scrollback, not an editable buffer -- see its own doc
+            // comment), and there's nothing else in this context that a
+            // put could sensibly target. Falls into the same bucket as
+            // `Pending`/`None` below.
+            KeyOutcome::Put { .. } => {
+                render_normal_mode_frame(&buf, rect, &vk, None);
             }
             KeyOutcome::Window(cmd @ (WindowCmd::GotoFirstWindow | WindowCmd::GotoLastWindow), count) => {
                 // No WindowAction equivalent -- an absolute tab-position
@@ -2903,6 +2942,7 @@ fn run_command_mode(
     current_window: usize,
     history: &mut History,
     job_frames: &mut HashMap<JobFrameId, exec::FgJob>,
+    registers: &mut Registers,
     term_rows: usize,
     term_cols: usize,
 ) -> CommandModeOutcome {
@@ -2951,6 +2991,7 @@ fn run_command_mode(
             None,
             false,
             None,
+            registers,
             &mut || {
                 service_background_jobs(sessions, windows, job_frames, current_window);
             },

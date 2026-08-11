@@ -38,6 +38,22 @@ pub enum KeyOutcome {
     /// discarded, same as it would be for a key `feed_fresh` doesn't
     /// otherwise recognize -- there's no insert-repeat-on-exit support yet.
     EnterInsert(InsertCmd),
+    /// `y{motion}` -- an operator applied to a motion's resulting range.
+    /// `register` is the explicit `"x` prefix if any (`None` means "use
+    /// the unnamed register" -- see registers.rs's own doc comment on how
+    /// that resolves).
+    Operator(Op, Motion, Option<usize>, Option<char>),
+    /// `yy` / `Y` -- an operator applied to the current line (and
+    /// `count - 1` more below it), linewise. Kept distinct from
+    /// `Operator` rather than inventing a synthetic `Motion` for "the
+    /// current line": vim's own double-tap-the-operator shorthand isn't a
+    /// cursor motion at all, it's defined operationally as "this
+    /// operator, this line" (see `motion::whole_lines`'s own doc comment).
+    OperatorLines(Op, Option<usize>, Option<char>),
+    /// `p` / `P` -- put the named (or unnamed) register's contents after
+    /// (`before: false`) or before (`before: true`) the cursor, `count`
+    /// times.
+    Put { before: bool, count: Option<usize>, register: Option<char> },
     /// The key was consumed as part of an in-progress sequence (a count
     /// digit, or a prefix awaiting its next character); no motion yet.
     Pending,
@@ -45,6 +61,40 @@ pub enum KeyOutcome {
     /// in-progress count/prefix is discarded, matching vim's behavior of
     /// dropping a pending command on an invalid continuation.
     None,
+}
+
+/// An operator awaiting a motion (`y{motion}`) or its own double-tap
+/// shorthand (`yy`). Single variant today, deliberately -- `Op::Delete`/
+/// `Op::Change` are meant to extend this later by reusing the exact same
+/// operator-pending plumbing in `VimKeys`, not by inventing a parallel one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Op {
+    Yank,
+}
+
+impl Op {
+    /// The key that both arms this operator and, pressed again at a fresh
+    /// dispatch point, triggers its whole-line shorthand (`yy`).
+    fn trigger_char(self) -> char {
+        match self {
+            Op::Yank => 'y',
+        }
+    }
+}
+
+// `[count1]`, typed before the operator, and `[count2]`, typed before the
+// motion (or as `yy`'s own repeat, `y[count2]y`), multiply together --
+// matching vim (`2y3w` yanks 6 words). `None` stands in for "1" on both
+// sides so a bare count on just one side is used as-is rather than being
+// multiplied against a phantom 1 that would've been fine anyway; the
+// `saturating_mul` just guards against a pathological huge-count product
+// panicking rather than being a realistic scenario.
+fn combine_counts(a: Option<usize>, b: Option<usize>) -> Option<usize> {
+    match (a, b) {
+        (None, None) => None,
+        (Some(x), None) | (None, Some(x)) => Some(x),
+        (Some(x), Some(y)) => Some(x.saturating_mul(y)),
+    }
 }
 
 /// `i`/`a`/`I`/`A`/`s`/`S`/`C` -- see `KeyOutcome::EnterInsert`'s own doc
@@ -100,6 +150,35 @@ pub fn apply_insert_cmd(text: &[char], cursor: usize, cmd: InsertCmd) -> (Vec<ch
     }
 }
 
+/// `p`/`P`: splices `insert_text` into `text` at the cursor, `count` times
+/// back-to-back. Mirrors `apply_insert_cmd`'s own shape exactly (a plain
+/// `[char]` slice in, a new one out -- no `Buffer` involved, matching how
+/// every real mutation in this crate works so far). `before` puts at the
+/// cursor itself (`P`); otherwise one column after it (`p`), matching
+/// vim's own after-the-cursor placement. The cursor ends on the last
+/// inserted character, vim's own rule -- repeating the same char run
+/// `count` times back-to-back rather than, say, leaving gaps, matches
+/// vim's `3p` inserting three concatenated copies as a single block.
+/// `insert_text` is expected to already be flattened to a single line by
+/// the caller (see `RegisterValue::flatten_to_single_line`) -- this
+/// function has no line concept of its own to preserve.
+pub fn apply_put(text: &[char], cursor: usize, insert_text: &str, before: bool, count: usize) -> (Vec<char>, usize) {
+    let insert_chars: Vec<char> = insert_text.chars().collect();
+    if insert_chars.is_empty() || count == 0 {
+        return (text.to_vec(), cursor);
+    }
+    let cursor = cursor.min(text.len());
+    let insert_at = if before { cursor } else { (cursor + 1).min(text.len()) };
+    let mut block = Vec::with_capacity(insert_chars.len() * count);
+    for _ in 0..count {
+        block.extend_from_slice(&insert_chars);
+    }
+    let mut new_text = text.to_vec();
+    new_text.splice(insert_at..insert_at, block.iter().copied());
+    let new_cursor = insert_at + block.len() - 1;
+    (new_text, new_cursor)
+}
+
 /// `<C-w>{cmd}`: the same single-letter window shortcuts the shell's own
 /// `window` command exposes (see exec.rs's `run_window`), minus the size
 /// commands (`+`/`-`/`size`) and `fg <id>` (needs an argument beyond a
@@ -137,6 +216,12 @@ enum Pending {
     // own two-key shape one level under the window leader.
     WindowG,
     Search { forward: bool, text: String },
+    // `"` -- awaiting exactly one register-name character
+    // (a-z/A-Z/+/"/_). Unlike every other `Pending` variant, resolving
+    // this one doesn't `emit()` anything: it stashes `pending_register`
+    // and drops straight back to `Pending::None`, ready for whatever
+    // operator or put comes next (see `feed_register`'s own doc comment).
+    Register,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -178,6 +263,23 @@ pub struct VimKeys {
     last_find: Option<(char, bool, bool)>, // (ch, till, forward)
     last_search_text: String,
     last_search: Option<LastSearch>,
+    // The operator waiting for a motion (or its own double-tap
+    // shorthand), and the count that had already accumulated in `count`
+    // at the moment it was armed -- stashed separately from `count` so a
+    // fresh count can accumulate for the motion that follows without the
+    // two clobbering each other (`2y3w`: operator_count becomes Some(2)
+    // when `y` arms, then `count` accumulates `3` fresh for `w`). See
+    // `feed`'s own doc comment for how these two combine.
+    active_operator: Option<Op>,
+    operator_count: Option<usize>,
+    // `"x` -- the register the *next* operator or put should target.
+    // Survives across `Pending::Register` resolving back to
+    // `Pending::None` (unlike `count`/`pending`, a register selection
+    // isn't itself a sub-prefix continuation, it's a modifier on whatever
+    // comes after it), and is dropped by any successfully-resolved
+    // outcome that isn't an operator or put -- matching vim silently
+    // ignoring a register prefix in front of a bare motion.
+    pending_register: Option<char>,
     // A human-readable transcript of the keys fed since the last resolved
     // motion (or the last aborted sequence) -- e.g. "20g" while typing
     // `20gg`, or "/cher" while typing a search. Exists purely for a
@@ -199,6 +301,9 @@ impl VimKeys {
             last_find: None,
             last_search_text: String::new(),
             last_search: None,
+            active_operator: None,
+            operator_count: None,
+            pending_register: None,
             current_input: String::new(),
             last_completed: String::new(),
         }
@@ -221,6 +326,76 @@ impl VimKeys {
         if let Some(label) = key_label(key) {
             self.current_input.push_str(&label);
         }
+        // A second press of the *active* operator's own trigger key, seen
+        // at a fresh dispatch point (not mid sub-prefix) -- vim's
+        // double-tap shorthand (`yy`). Entirely orthogonal to feed_inner's
+        // normal motion-resolution dispatch below, so it's checked first
+        // and short-circuits it entirely.
+        if matches!(self.pending, Pending::None) {
+            if let (Some(op), Key::Char(c)) = (self.active_operator, key) {
+                if c == op.trigger_char() {
+                    let count = combine_counts(self.operator_count.take(), self.count.take());
+                    let register = self.pending_register.take();
+                    self.active_operator = None;
+                    self.last_completed = std::mem::take(&mut self.current_input);
+                    return KeyOutcome::OperatorLines(op, count, register);
+                }
+            }
+        }
+        let outcome = self.feed_inner(key);
+        if let Some(op) = self.active_operator {
+            return match outcome {
+                // The motion that resolves an operator: fold in the count
+                // that had accumulated before the operator was armed and
+                // whatever register was selected, then hand back an
+                // Operator instead of a bare Motion. Note this doesn't
+                // check whether `m` is actually a valid operator target
+                // (see motion::motion_shape) -- an invalid one (e.g.
+                // Ctrl-D) still becomes an `Operator`, just one that
+                // later resolves to nothing when motion::motion_range
+                // rejects it, which is behaviorally identical to
+                // aborting here (no register write, no cursor move
+                // either way) without vimkeys.rs needing to reach into
+                // motion.rs's own classification.
+                KeyOutcome::Motion(m, motion_count) => {
+                    self.active_operator = None;
+                    let count = combine_counts(self.operator_count.take(), motion_count);
+                    let register = self.pending_register.take();
+                    KeyOutcome::Operator(op, m, count, register)
+                }
+                // A sub-prefix (f/F/t/T/g/`/'/...) is still resolving --
+                // stay armed, nothing to reinterpret yet.
+                KeyOutcome::Pending => KeyOutcome::Pending,
+                // Anything else (None/EnterInsert/Window) isn't a valid
+                // motion for an operator -- cancel it, matching vim's own
+                // "invalid operator continuation beeps and does nothing"
+                // behavior (consumed, not forwarded: whatever that key
+                // would have done standalone doesn't happen either).
+                _ => {
+                    self.active_operator = None;
+                    self.operator_count = None;
+                    self.pending_register = None;
+                    KeyOutcome::None
+                }
+            };
+        }
+        // No operator was pending, so `outcome` is whatever feed_inner
+        // resolved on its own. A register prefix in front of a bare
+        // motion/window-cmd/insert-entry is simply irrelevant (matches
+        // vim silently ignoring it) -- but only once something actually
+        // resolved: a `Pending` result means a sub-prefix (or the
+        // register selection itself) is still being typed, and dropping
+        // the register mid-sequence would lose it before it ever had a
+        // chance to reach an operator or put. `emit_put` already
+        // consumes it itself on the Put path, so this is a no-op there,
+        // not a second, conflicting clear.
+        if !matches!(outcome, KeyOutcome::Pending) {
+            self.pending_register = None;
+        }
+        outcome
+    }
+
+    fn feed_inner(&mut self, key: Key) -> KeyOutcome {
         match std::mem::replace(&mut self.pending, Pending::None) {
             Pending::None => self.feed_fresh(key),
             Pending::G => self.feed_g(key),
@@ -232,12 +407,20 @@ impl VimKeys {
             Pending::Window => self.feed_window(key),
             Pending::WindowG => self.feed_window_g(key),
             Pending::Search { forward, text } => self.feed_search(key, forward, text),
+            Pending::Register => self.feed_register(key),
         }
     }
 
     fn emit(&mut self, motion: Motion) -> KeyOutcome {
         let count = self.count.take();
         self.pending = Pending::None;
+        // pending_register is deliberately *not* cleared here -- this
+        // resolves a Motion, but `feed` (the only caller of feed_inner,
+        // which is what actually calls this) doesn't yet know whether an
+        // operator is waiting to fold this Motion into an Operator, which
+        // still needs the register. `feed` itself drops a leftover
+        // register after any outcome that turns out *not* to have been
+        // claimed by an operator or put.
         self.last_completed = std::mem::take(&mut self.current_input);
         KeyOutcome::Motion(motion, count)
     }
@@ -259,9 +442,29 @@ impl VimKeys {
         KeyOutcome::EnterInsert(cmd)
     }
 
+    // `y{motion}`'s first half: stashes whatever count had already
+    // accumulated (the `[count1]` in vim's `[count1]op[count2]motion`)
+    // and arms `active_operator` -- the actual resolution (into
+    // `Operator`/`OperatorLines`) happens in `feed`, above, once a motion
+    // or the double-tap shorthand resolves.
+    fn emit_operator(&mut self, op: Op) -> KeyOutcome {
+        self.operator_count = self.count.take();
+        self.active_operator = Some(op);
+        KeyOutcome::Pending
+    }
+
+    fn emit_put(&mut self, before: bool) -> KeyOutcome {
+        let count = self.count.take();
+        let register = self.pending_register.take();
+        self.pending = Pending::None;
+        self.last_completed = std::mem::take(&mut self.current_input);
+        KeyOutcome::Put { before, count, register }
+    }
+
     fn abort(&mut self) -> KeyOutcome {
         self.count = None;
         self.pending = Pending::None;
+        self.pending_register = None;
         self.current_input.clear();
         KeyOutcome::None
     }
@@ -374,6 +577,42 @@ impl VimKeys {
             Key::Char('s') => self.emit_insert(InsertCmd::SubstituteChar),
             Key::Char('S') => self.emit_insert(InsertCmd::SubstituteLine),
             Key::Char('C') => self.emit_insert(InsertCmd::ChangeToEnd),
+            Key::Char('y') => self.emit_operator(Op::Yank),
+            // `Y` is vim's own direct synonym for `yy` -- not "yank to end
+            // of line" the way `D`/`C` work relative to their lowercase
+            // motion-based forms, so it's resolved the same way the `yy`
+            // double-tap is (in `feed`, above) rather than via
+            // `emit_operator`, which only arms a *pending* operator.
+            Key::Char('Y') => {
+                let count = self.count.take();
+                let register = self.pending_register.take();
+                self.pending = Pending::None;
+                self.last_completed = std::mem::take(&mut self.current_input);
+                KeyOutcome::OperatorLines(Op::Yank, count, register)
+            }
+            Key::Char('p') => self.emit_put(false),
+            Key::Char('P') => self.emit_put(true),
+            Key::Char('"') => {
+                self.pending = Pending::Register;
+                KeyOutcome::Pending
+            }
+            _ => self.abort(),
+        }
+    }
+
+    fn feed_register(&mut self, key: Key) -> KeyOutcome {
+        match key {
+            Key::Char(c @ ('a'..='z' | 'A'..='Z' | '+' | '"' | '_')) => {
+                self.pending_register = Some(c);
+                // Deliberately *not* an `emit*` call: a register selection
+                // isn't itself a resolved command, it's a modifier waiting
+                // for whatever operator or put comes next. `self.pending`
+                // is already `Pending::None` (set by the `mem::replace` in
+                // `feed_inner` before this ran), so the very next key
+                // dispatches through `feed_fresh` as if nothing happened,
+                // except now with `pending_register` armed.
+                KeyOutcome::Pending
+            }
             _ => self.abort(),
         }
     }
@@ -1062,5 +1301,195 @@ mod tests {
         let (result, cursor) = apply_insert_cmd(&text, 99, InsertCmd::SubstituteChar);
         assert_eq!(result.iter().collect::<String>(), "hi");
         assert_eq!(cursor, 2);
+    }
+
+    #[test]
+    fn operator_plus_motion_resolves_with_no_count() {
+        let mut vk = VimKeys::new();
+        assert_eq!(vk.feed(Key::Char('y')), KeyOutcome::Pending);
+        assert_eq!(
+            vk.feed(Key::Char('w')),
+            KeyOutcome::Operator(Op::Yank, Motion::WordForward, None, None)
+        );
+    }
+
+    #[test]
+    fn operator_and_motion_counts_multiply() {
+        let mut vk = VimKeys::new();
+        let keys = [Key::Char('2'), Key::Char('y'), Key::Char('3'), Key::Char('w')];
+        assert_eq!(
+            last(&mut vk, &keys),
+            KeyOutcome::Operator(Op::Yank, Motion::WordForward, Some(6), None)
+        );
+    }
+
+    #[test]
+    fn operator_with_only_a_pre_count_or_only_a_post_count() {
+        let mut vk = VimKeys::new();
+        let keys = [Key::Char('3'), Key::Char('y'), Key::Char('w')];
+        assert_eq!(
+            last(&mut vk, &keys),
+            KeyOutcome::Operator(Op::Yank, Motion::WordForward, Some(3), None)
+        );
+
+        let mut vk = VimKeys::new();
+        let keys = [Key::Char('y'), Key::Char('3'), Key::Char('w')];
+        assert_eq!(
+            last(&mut vk, &keys),
+            KeyOutcome::Operator(Op::Yank, Motion::WordForward, Some(3), None)
+        );
+    }
+
+    #[test]
+    fn operator_through_a_sub_prefix_motion() {
+        // y then f then x -- the 'f' sub-prefix must stay armed as an
+        // operator target, not get treated as its own bare motion.
+        let mut vk = VimKeys::new();
+        assert_eq!(vk.feed(Key::Char('y')), KeyOutcome::Pending);
+        assert_eq!(vk.feed(Key::Char('f')), KeyOutcome::Pending);
+        assert_eq!(
+            vk.feed(Key::Char('x')),
+            KeyOutcome::Operator(Op::Yank, Motion::FindChar { ch: 'x', till: false, forward: true }, None, None)
+        );
+    }
+
+    #[test]
+    fn yy_double_tap_resolves_to_operator_lines() {
+        let mut vk = VimKeys::new();
+        assert_eq!(vk.feed(Key::Char('y')), KeyOutcome::Pending);
+        assert_eq!(vk.feed(Key::Char('y')), KeyOutcome::OperatorLines(Op::Yank, None, None));
+    }
+
+    #[test]
+    fn yy_and_y_capital_and_counted_variants_all_agree() {
+        let mut vk = VimKeys::new();
+        assert_eq!(vk.feed(Key::Char('Y')), KeyOutcome::OperatorLines(Op::Yank, None, None));
+
+        let mut vk = VimKeys::new();
+        let keys = [Key::Char('3'), Key::Char('y'), Key::Char('y')];
+        assert_eq!(last(&mut vk, &keys), KeyOutcome::OperatorLines(Op::Yank, Some(3), None));
+
+        let mut vk = VimKeys::new();
+        let keys = [Key::Char('y'), Key::Char('3'), Key::Char('y')];
+        assert_eq!(last(&mut vk, &keys), KeyOutcome::OperatorLines(Op::Yank, Some(3), None));
+
+        let mut vk = VimKeys::new();
+        let keys = [Key::Char('3'), Key::Char('Y')];
+        assert_eq!(last(&mut vk, &keys), KeyOutcome::OperatorLines(Op::Yank, Some(3), None));
+    }
+
+    #[test]
+    fn operator_invalid_continuation_aborts_and_does_not_leak() {
+        let mut vk = VimKeys::new();
+        assert_eq!(vk.feed(Key::Char('y')), KeyOutcome::Pending);
+        // 'i' isn't a motion -- cancels the pending operator entirely,
+        // consumed rather than also entering insert mode.
+        assert_eq!(vk.feed(Key::Char('i')), KeyOutcome::None);
+        // and the next key starts completely fresh
+        assert_eq!(vk.feed(Key::Char('w')), KeyOutcome::Motion(Motion::WordForward, None));
+    }
+
+    #[test]
+    fn operator_on_a_non_motion_target_still_resolves_but_is_inert_downstream() {
+        // Ctrl-D is a real, successfully-resolving Motion (HalfPageDown) as
+        // far as vimkeys.rs is concerned -- vimkeys.rs has no dependency on
+        // motion::motion_shape's classification, so it still wraps this
+        // into an Operator. motion::motion_range is what actually rejects
+        // Ctrl-D as an invalid operator target (see its own
+        // motion_range_returns_none_for_non_motion_targets test), making
+        // this behaviorally a no-op downstream regardless -- no register
+        // write, no cursor move -- without vimkeys.rs needing to know
+        // motion.rs's own classification rules.
+        let mut vk = VimKeys::new();
+        assert_eq!(vk.feed(Key::Char('y')), KeyOutcome::Pending);
+        assert_eq!(vk.feed(Key::CtrlD), KeyOutcome::Operator(Op::Yank, Motion::HalfPageDown, None, None));
+    }
+
+    #[test]
+    fn register_prefix_threads_into_operator_and_operator_lines() {
+        let mut vk = VimKeys::new();
+        let keys = [Key::Char('"'), Key::Char('a'), Key::Char('y'), Key::Char('w')];
+        assert_eq!(
+            last(&mut vk, &keys),
+            KeyOutcome::Operator(Op::Yank, Motion::WordForward, None, Some('a'))
+        );
+
+        let mut vk = VimKeys::new();
+        let keys = [Key::Char('"'), Key::Char('A'), Key::Char('y'), Key::Char('y')];
+        assert_eq!(last(&mut vk, &keys), KeyOutcome::OperatorLines(Op::Yank, None, Some('A')));
+    }
+
+    #[test]
+    fn register_prefix_on_a_bare_motion_is_silently_dropped() {
+        let mut vk = VimKeys::new();
+        assert_eq!(vk.feed(Key::Char('"')), KeyOutcome::Pending);
+        assert_eq!(vk.feed(Key::Char('a')), KeyOutcome::Pending);
+        assert_eq!(vk.feed(Key::Char('w')), KeyOutcome::Motion(Motion::WordForward, None));
+        // and it doesn't leak into a later put that never asked for one
+        assert_eq!(
+            vk.feed(Key::Char('p')),
+            KeyOutcome::Put { before: false, count: None, register: None }
+        );
+    }
+
+    #[test]
+    fn register_prefix_accepts_plus_quote_and_underscore() {
+        for c in ['+', '"', '_'] {
+            let mut vk = VimKeys::new();
+            let keys = [Key::Char('"'), Key::Char(c), Key::Char('p')];
+            assert_eq!(last(&mut vk, &keys), KeyOutcome::Put { before: false, count: None, register: Some(c) });
+        }
+    }
+
+    #[test]
+    fn register_prefix_with_an_invalid_name_aborts() {
+        let mut vk = VimKeys::new();
+        assert_eq!(vk.feed(Key::Char('"')), KeyOutcome::Pending);
+        assert_eq!(vk.feed(Key::Char('1')), KeyOutcome::None);
+        assert_eq!(vk.feed(Key::Char('w')), KeyOutcome::Motion(Motion::WordForward, None));
+    }
+
+    #[test]
+    fn put_before_and_after_with_count_and_register() {
+        let mut vk = VimKeys::new();
+        assert_eq!(vk.feed(Key::Char('p')), KeyOutcome::Put { before: false, count: None, register: None });
+
+        let mut vk = VimKeys::new();
+        assert_eq!(vk.feed(Key::Char('P')), KeyOutcome::Put { before: true, count: None, register: None });
+
+        let mut vk = VimKeys::new();
+        let keys = [Key::Char('3'), Key::Char('"'), Key::Char('b'), Key::Char('p')];
+        assert_eq!(last(&mut vk, &keys), KeyOutcome::Put { before: false, count: Some(3), register: Some('b') });
+    }
+
+    #[test]
+    fn apply_put_after_cursor_repeated_and_cursor_on_last_inserted_char() {
+        let text: Vec<char> = "ac".chars().collect();
+        let (result, cursor) = apply_put(&text, 0, "b", false, 2);
+        assert_eq!(result.iter().collect::<String>(), "abbc");
+        assert_eq!(cursor, 2); // last of the two inserted 'b's
+    }
+
+    #[test]
+    fn apply_put_before_cursor() {
+        let text: Vec<char> = "ac".chars().collect();
+        let (result, cursor) = apply_put(&text, 1, "b", true, 1);
+        assert_eq!(result.iter().collect::<String>(), "abc");
+        assert_eq!(cursor, 1);
+    }
+
+    #[test]
+    fn apply_put_empty_text_or_zero_count_is_a_no_op() {
+        let text: Vec<char> = "ac".chars().collect();
+        assert_eq!(apply_put(&text, 0, "", false, 3), (text.clone(), 0));
+        assert_eq!(apply_put(&text, 0, "xyz", false, 0), (text.clone(), 0));
+    }
+
+    #[test]
+    fn apply_put_on_an_empty_buffer() {
+        let text: Vec<char> = Vec::new();
+        let (result, cursor) = apply_put(&text, 0, "hi", false, 1);
+        assert_eq!(result.iter().collect::<String>(), "hi");
+        assert_eq!(cursor, 1);
     }
 }
