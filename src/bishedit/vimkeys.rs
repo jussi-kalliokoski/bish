@@ -322,6 +322,25 @@ impl VimKeys {
         &self.last_completed
     }
 
+    /// The pattern text of the last resolved `/`/`?` search -- empty if
+    /// the last search (if any) was word-based (`*`/`#`) instead, or if
+    /// there's been no search yet. A frontend rendering search-match
+    /// highlighting combines this with `pending_display()` (for a search
+    /// still being typed) and, when `last_search_is_word()` is true,
+    /// `motion::word_under_cursor` at the buffer's own current cursor --
+    /// see that function's own doc comment for why that reliably recovers
+    /// a word-search's pattern without this needing to store it itself.
+    pub fn last_search_text(&self) -> &str {
+        &self.last_search_text
+    }
+
+    /// Whether the last resolved search was word-based (`*`/`#`) rather
+    /// than pattern-based (`/`/`?`) -- see `last_search_text`'s own doc
+    /// comment for why this matters to a caller.
+    pub fn last_search_is_word(&self) -> bool {
+        matches!(self.last_search, Some(LastSearch::Word { .. }))
+    }
+
     pub fn feed(&mut self, key: Key) -> KeyOutcome {
         if let Some(label) = key_label(key) {
             self.current_input.push_str(&label);
@@ -1491,5 +1510,60 @@ mod tests {
         let (result, cursor) = apply_put(&text, 0, "hi", false, 1);
         assert_eq!(result.iter().collect::<String>(), "hi");
         assert_eq!(cursor, 1);
+    }
+
+    #[test]
+    fn last_search_text_empty_before_any_search() {
+        let vk = VimKeys::new();
+        assert_eq!(vk.last_search_text(), "");
+        assert!(!vk.last_search_is_word());
+    }
+
+    #[test]
+    fn last_search_text_after_a_pattern_search() {
+        let mut vk = VimKeys::new();
+        let keys = [Key::Char('/'), Key::Char('f'), Key::Char('o'), Key::Char('o'), Key::Enter];
+        last(&mut vk, &keys);
+        assert_eq!(vk.last_search_text(), "foo");
+        assert!(!vk.last_search_is_word());
+    }
+
+    #[test]
+    fn last_search_text_after_a_backward_pattern_search() {
+        let mut vk = VimKeys::new();
+        let keys = [Key::Char('?'), Key::Char('b'), Key::Char('a'), Key::Char('r'), Key::Enter];
+        last(&mut vk, &keys);
+        assert_eq!(vk.last_search_text(), "bar");
+        assert!(!vk.last_search_is_word());
+    }
+
+    #[test]
+    fn last_search_is_word_after_star_or_hash() {
+        let mut vk = VimKeys::new();
+        vk.feed(Key::Char('*'));
+        assert!(vk.last_search_is_word());
+
+        let mut vk = VimKeys::new();
+        vk.feed(Key::Char('#'));
+        assert!(vk.last_search_is_word());
+    }
+
+    #[test]
+    fn last_search_text_survives_n_and_capital_n_repeats() {
+        let mut vk = VimKeys::new();
+        let keys = [Key::Char('/'), Key::Char('x'), Key::Char('y'), Key::Enter];
+        last(&mut vk, &keys);
+        vk.feed(Key::Char('n'));
+        assert_eq!(vk.last_search_text(), "xy");
+        vk.feed(Key::Char('N'));
+        assert_eq!(vk.last_search_text(), "xy");
+    }
+
+    #[test]
+    fn last_search_text_stays_word_after_n_repeats_a_word_search() {
+        let mut vk = VimKeys::new();
+        vk.feed(Key::Char('*'));
+        vk.feed(Key::Char('n'));
+        assert!(vk.last_search_is_word());
     }
 }

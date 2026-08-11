@@ -537,7 +537,14 @@ fn match_pair_once(buf: &impl Buffer, pos: (usize, usize)) -> Option<(usize, usi
 /// The word (contiguous run of word chars) at or after `pos`. If `pos`
 /// isn't on a word char, advances to the next word first, matching `*`/`#`'s
 /// vim behavior of searching from the nearest word forward.
-fn word_under_cursor(buf: &impl Buffer, pos: (usize, usize)) -> Option<String> {
+///
+/// Public so a caller rendering search-match highlighting can recover the
+/// pattern a `*`/`#` search actually used: `SearchWordForward`/
+/// `SearchWordBackward`'s own doc comment already notes that the word
+/// under the cursor *after* landing on a match is, by construction,
+/// textually identical to the word that was searched for -- so there's no
+/// need for `vimkeys.rs` to separately track and expose that text itself.
+pub fn word_under_cursor(buf: &impl Buffer, pos: (usize, usize)) -> Option<String> {
     let mut p = pos;
     if buf.line_len(p.0) == 0 || !matches!(buf.char_at(p.0, p.1), Some(c) if is_word_char(c)) {
         let next = word_forward_once(buf, p, false);
@@ -581,6 +588,27 @@ fn line_find(buf: &impl Buffer, line: usize, lower_bound: usize, chars: &[char])
     (lower_bound..=max_start).find(|&start| {
         (0..plen).all(|i| buf.char_at(line, start + i) == Some(chars[i]))
     })
+}
+
+/// Every non-overlapping occurrence of `pattern` on `line`, left to right --
+/// the same convention vim's own `hlsearch` uses (a match's own end is
+/// where the search for the next one starts, so "aa" against "aaaa" finds
+/// cols 0 and 2, not 0/1/2). For search-match *highlighting* -- unrelated
+/// to, and doesn't share any state with, a live search's own cursor
+/// position via search_forward_once/search_backward_once above.
+pub fn find_matches_in_line(buf: &impl Buffer, line: usize, pattern: &str) -> Vec<(usize, usize)> {
+    let chars: Vec<char> = pattern.chars().collect();
+    if chars.is_empty() {
+        return Vec::new();
+    }
+    let mut matches = Vec::new();
+    let mut from = 0;
+    while let Some(start) = line_find(buf, line, from, &chars) {
+        let end = start + chars.len();
+        matches.push((start, end));
+        from = end;
+    }
+    matches
 }
 
 fn line_rfind(buf: &impl Buffer, line: usize, upper_bound: usize, chars: &[char]) -> Option<usize> {
@@ -1802,5 +1830,41 @@ mod tests {
         assert_eq!(r.shape, MotionShape::Exclusive);
         assert_eq!(r.to, (2, 0));
         assert_eq!(extract_text(&buf, &r), "a\n\n");
+    }
+
+    #[test]
+    fn find_matches_in_line_no_match() {
+        let buf = TestBuffer::new("foo bar baz");
+        assert_eq!(find_matches_in_line(&buf, 0, "xyz"), Vec::new());
+    }
+
+    #[test]
+    fn find_matches_in_line_single_match() {
+        let buf = TestBuffer::new("foo bar baz");
+        assert_eq!(find_matches_in_line(&buf, 0, "bar"), vec![(4, 7)]);
+    }
+
+    #[test]
+    fn find_matches_in_line_multiple_non_overlapping_matches() {
+        let buf = TestBuffer::new("foo foo foo");
+        assert_eq!(find_matches_in_line(&buf, 0, "foo"), vec![(0, 3), (4, 7), (8, 11)]);
+    }
+
+    #[test]
+    fn find_matches_in_line_does_not_report_overlapping_matches() {
+        let buf = TestBuffer::new("aaaa");
+        assert_eq!(find_matches_in_line(&buf, 0, "aa"), vec![(0, 2), (2, 4)]);
+    }
+
+    #[test]
+    fn find_matches_in_line_empty_pattern_is_empty() {
+        let buf = TestBuffer::new("foo bar");
+        assert_eq!(find_matches_in_line(&buf, 0, ""), Vec::new());
+    }
+
+    #[test]
+    fn find_matches_in_line_match_at_very_end_does_not_loop_forever() {
+        let buf = TestBuffer::new("foobar");
+        assert_eq!(find_matches_in_line(&buf, 0, "bar"), vec![(3, 6)]);
     }
 }
