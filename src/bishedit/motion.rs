@@ -1024,6 +1024,164 @@ pub fn apply_motion(buf: &mut impl Buffer, motion: Motion, count: Option<usize>)
     }
 }
 
+/// How an operator (today: yank; later: delete/change) treats a motion's
+/// resulting range -- vim's own classification (`:help exclusive`), which
+/// this mirrors motion-for-motion. `Inclusive`/`Exclusive` differ only in
+/// whether the character the cursor lands *on* is part of the range;
+/// `Linewise` ignores columns entirely and takes whole lines.
+///
+/// Known simplification: real vim also has an adjustment where an
+/// exclusive motion that ends in column 1, having started at or before the
+/// first non-blank, becomes linewise (`:help exclusive-linewise` --
+/// prevents e.g. `dw` at the last word of a line from swallowing the
+/// newline into the next line's indent). Not implemented here; it would
+/// only show up as a subtly-too-long yank in that specific situation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MotionShape {
+    Exclusive,
+    Inclusive,
+    Linewise,
+}
+
+/// `None` means `m` isn't a valid operator target at all -- either it's not
+/// really a motion (`SetMark` just records a position, it doesn't move
+/// anything), or it's one of the viewport/scroll commands (Ctrl-D/U/F/B,
+/// Ctrl-E/Y, zz/zt/zb) that real vim documents separately from motions and
+/// doesn't accept as operator targets either.
+fn motion_shape(m: &Motion) -> Option<MotionShape> {
+    use MotionShape::*;
+    Some(match m {
+        Motion::Left | Motion::Right => Exclusive,
+        Motion::Down | Motion::Up => Linewise,
+        Motion::LineStart | Motion::LineFirstNonBlank => Exclusive,
+        Motion::LineEnd | Motion::LineLastNonBlank => Inclusive,
+        Motion::GotoColumn => Exclusive,
+        Motion::GotoFirstLine | Motion::GotoLastLine => Linewise,
+        Motion::WordForward | Motion::WordForwardBig | Motion::WordBackward | Motion::WordBackwardBig => Exclusive,
+        Motion::WordEnd | Motion::WordEndBig | Motion::WordEndBackward | Motion::WordEndBackwardBig => Inclusive,
+        Motion::FindChar { forward, .. } => {
+            if *forward {
+                Inclusive
+            } else {
+                Exclusive
+            }
+        }
+        Motion::ScreenTop | Motion::ScreenMiddle | Motion::ScreenBottom => Linewise,
+        Motion::HalfPageDown
+        | Motion::HalfPageUp
+        | Motion::PageDown
+        | Motion::PageUp
+        | Motion::ScrollLineDown
+        | Motion::ScrollLineUp
+        | Motion::ScrollCenter
+        | Motion::ScrollTop
+        | Motion::ScrollBottom => return None,
+        Motion::ParagraphForward | Motion::ParagraphBackward => Exclusive,
+        Motion::SentenceForward | Motion::SentenceBackward => Exclusive,
+        Motion::NextLineNonBlank | Motion::PrevLineNonBlank => Linewise,
+        Motion::MatchPair => Inclusive,
+        Motion::SetMark(_) => return None,
+        Motion::GotoMark(_) => Exclusive,
+        Motion::GotoMarkLine(_) => Linewise,
+        Motion::SearchForward(_) | Motion::SearchBackward(_) => Exclusive,
+        Motion::SearchWordForward | Motion::SearchWordBackward => Exclusive,
+    })
+}
+
+/// A resolved operator target: `from`/`to` are already ordered (`from <=
+/// to`, regardless of which direction the motion actually moved the
+/// cursor).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MotionRange {
+    pub shape: MotionShape,
+    pub from: (usize, usize),
+    pub to: (usize, usize),
+}
+
+/// Resolves `motion` against `buf` the same way any other motion would
+/// (via the existing `apply_motion`, unchanged -- this adds zero regression
+/// risk to plain navigation), then reports the range it covered instead of
+/// just leaving the cursor at the destination. Per vim's own rule, the
+/// cursor is left at `from` (the earlier of the two endpoints) rather than
+/// wherever `apply_motion` put it -- the one exception, `yy`/`Y`, isn't a
+/// `Motion` at all and is handled by `whole_lines` instead, which leaves
+/// the cursor untouched.
+///
+/// Returns `None` if `m` isn't a valid operator target (see `motion_shape`)
+/// or if it didn't actually move the cursor (a failed find/search, or a
+/// motion that's already at its clamped boundary) -- either way, there's
+/// nothing to yank and the cursor is restored to where it started.
+pub fn motion_range(buf: &mut impl Buffer, motion: Motion, count: Option<usize>) -> Option<MotionRange> {
+    let shape = motion_shape(&motion)?;
+    let start = buf.cursor();
+    apply_motion(buf, motion, count);
+    let end = buf.cursor();
+    if start == end {
+        return None;
+    }
+    let (from, to) = if pos_lt(start, end) { (start, end) } else { (end, start) };
+    buf.set_cursor(from.0, from.1);
+    Some(MotionRange { shape, from, to })
+}
+
+/// The literal text a `MotionRange` covers. `Linewise` joins whole lines
+/// with `\n`, including a trailing one (so the result is always a sequence
+/// of complete lines, ready to be spliced back in as-is by a linewise
+/// put). `Inclusive`/`Exclusive` walk character-by-character via the same
+/// `step_forward` plain motions use, inserting `\n` exactly when a step
+/// crosses a line boundary -- `Exclusive` stops one character short of
+/// `to`, `Inclusive` includes it.
+pub fn extract_text(buf: &impl Buffer, range: &MotionRange) -> String {
+    if range.shape == MotionShape::Linewise {
+        let mut s = String::new();
+        for l in range.from.0..=range.to.0 {
+            s.push_str(&buf.line_chars(l).into_iter().collect::<String>());
+            s.push('\n');
+        }
+        return s;
+    }
+    let mut s = String::new();
+    let mut cur = range.from;
+    loop {
+        let reached_to = cur == range.to;
+        if reached_to && range.shape == MotionShape::Exclusive {
+            break;
+        }
+        if let Some(c) = buf.char_at(cur.0, cur.1) {
+            s.push(c);
+        }
+        if reached_to {
+            break;
+        }
+        let next = match step_forward(buf, cur) {
+            Some(n) => n,
+            None => break,
+        };
+        if next.0 != cur.0 {
+            s.push('\n');
+        }
+        cur = next;
+    }
+    s
+}
+
+/// `yy`/`Y`: the current line plus `count - 1` more, linewise -- vim's
+/// double-tap-the-operator shorthand, defined operationally as "this
+/// operator, this line" rather than as a real cursor motion (there's no
+/// `Motion` variant for it, and unlike every other yank the cursor doesn't
+/// move at all, so this takes `&impl Buffer` rather than `&mut impl
+/// Buffer`).
+pub fn whole_lines(buf: &impl Buffer, count: usize) -> String {
+    let (line, _) = buf.cursor();
+    let last = (line + count.max(1) - 1).min(buf.line_count().saturating_sub(1));
+    let mut s = String::new();
+    for l in line..=last {
+        s.push_str(&buf.line_chars(l).into_iter().collect::<String>());
+        s.push('\n');
+    }
+    s
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1476,5 +1634,173 @@ mod tests {
         buf.set_cursor(0, 0);
         assert_eq!(go(&mut buf, Motion::SearchWordForward, None), (0, 17));
         assert_eq!(go(&mut buf, Motion::SearchWordBackward, None), (0, 0));
+    }
+
+    #[test]
+    fn motion_shape_table() {
+        let cases: &[(Motion, Option<MotionShape>)] = &[
+            (Motion::Left, Some(MotionShape::Exclusive)),
+            (Motion::Right, Some(MotionShape::Exclusive)),
+            (Motion::Down, Some(MotionShape::Linewise)),
+            (Motion::Up, Some(MotionShape::Linewise)),
+            (Motion::LineStart, Some(MotionShape::Exclusive)),
+            (Motion::LineFirstNonBlank, Some(MotionShape::Exclusive)),
+            (Motion::LineEnd, Some(MotionShape::Inclusive)),
+            (Motion::LineLastNonBlank, Some(MotionShape::Inclusive)),
+            (Motion::GotoColumn, Some(MotionShape::Exclusive)),
+            (Motion::GotoFirstLine, Some(MotionShape::Linewise)),
+            (Motion::GotoLastLine, Some(MotionShape::Linewise)),
+            (Motion::WordForward, Some(MotionShape::Exclusive)),
+            (Motion::WordForwardBig, Some(MotionShape::Exclusive)),
+            (Motion::WordBackward, Some(MotionShape::Exclusive)),
+            (Motion::WordBackwardBig, Some(MotionShape::Exclusive)),
+            (Motion::WordEnd, Some(MotionShape::Inclusive)),
+            (Motion::WordEndBig, Some(MotionShape::Inclusive)),
+            (Motion::WordEndBackward, Some(MotionShape::Inclusive)),
+            (Motion::WordEndBackwardBig, Some(MotionShape::Inclusive)),
+            (Motion::FindChar { ch: 'x', till: false, forward: true }, Some(MotionShape::Inclusive)),
+            (Motion::FindChar { ch: 'x', till: true, forward: true }, Some(MotionShape::Inclusive)),
+            (Motion::FindChar { ch: 'x', till: false, forward: false }, Some(MotionShape::Exclusive)),
+            (Motion::FindChar { ch: 'x', till: true, forward: false }, Some(MotionShape::Exclusive)),
+            (Motion::ScreenTop, Some(MotionShape::Linewise)),
+            (Motion::ScreenMiddle, Some(MotionShape::Linewise)),
+            (Motion::ScreenBottom, Some(MotionShape::Linewise)),
+            (Motion::HalfPageDown, None),
+            (Motion::HalfPageUp, None),
+            (Motion::PageDown, None),
+            (Motion::PageUp, None),
+            (Motion::ScrollLineDown, None),
+            (Motion::ScrollLineUp, None),
+            (Motion::ScrollCenter, None),
+            (Motion::ScrollTop, None),
+            (Motion::ScrollBottom, None),
+            (Motion::ParagraphForward, Some(MotionShape::Exclusive)),
+            (Motion::ParagraphBackward, Some(MotionShape::Exclusive)),
+            (Motion::SentenceForward, Some(MotionShape::Exclusive)),
+            (Motion::SentenceBackward, Some(MotionShape::Exclusive)),
+            (Motion::NextLineNonBlank, Some(MotionShape::Linewise)),
+            (Motion::PrevLineNonBlank, Some(MotionShape::Linewise)),
+            (Motion::MatchPair, Some(MotionShape::Inclusive)),
+            (Motion::SetMark('a'), None),
+            (Motion::GotoMark('a'), Some(MotionShape::Exclusive)),
+            (Motion::GotoMarkLine('a'), Some(MotionShape::Linewise)),
+            (Motion::SearchForward("x".to_string()), Some(MotionShape::Exclusive)),
+            (Motion::SearchBackward("x".to_string()), Some(MotionShape::Exclusive)),
+            (Motion::SearchWordForward, Some(MotionShape::Exclusive)),
+            (Motion::SearchWordBackward, Some(MotionShape::Exclusive)),
+        ];
+        for (motion, expected) in cases {
+            assert_eq!(motion_shape(motion), *expected, "{:?}", motion);
+        }
+    }
+
+    #[test]
+    fn motion_range_exclusive_word_forward() {
+        let mut buf = TestBuffer::new("foo bar baz");
+        buf.set_cursor(0, 0);
+        let r = motion_range(&mut buf, Motion::WordForward, None).unwrap();
+        assert_eq!(r.shape, MotionShape::Exclusive);
+        assert_eq!((r.from, r.to), ((0, 0), (0, 4)));
+        assert_eq!(buf.cursor(), (0, 0)); // cursor left at `from`
+        assert_eq!(extract_text(&buf, &r), "foo ");
+    }
+
+    #[test]
+    fn motion_range_inclusive_word_end() {
+        let mut buf = TestBuffer::new("foo bar baz");
+        buf.set_cursor(0, 0);
+        let r = motion_range(&mut buf, Motion::WordEnd, None).unwrap();
+        assert_eq!(r.shape, MotionShape::Inclusive);
+        assert_eq!(extract_text(&buf, &r), "foo");
+    }
+
+    #[test]
+    fn motion_range_backward_motion_normalizes_from_and_to() {
+        let mut buf = TestBuffer::new("foo bar baz");
+        buf.set_cursor(0, 8); // 'b' of baz
+        let r = motion_range(&mut buf, Motion::WordBackward, None).unwrap();
+        assert_eq!((r.from, r.to), ((0, 4), (0, 8)));
+        assert_eq!(buf.cursor(), (0, 4));
+        assert_eq!(extract_text(&buf, &r), "bar ");
+    }
+
+    #[test]
+    fn motion_range_linewise_spans_whole_lines() {
+        let mut buf = TestBuffer::new("one\ntwo\nthree");
+        buf.set_cursor(0, 1);
+        let r = motion_range(&mut buf, Motion::Down, Some(1)).unwrap();
+        assert_eq!(r.shape, MotionShape::Linewise);
+        assert_eq!(extract_text(&buf, &r), "one\ntwo\n");
+    }
+
+    #[test]
+    fn motion_range_multiline_charwise_inserts_newline_at_boundary() {
+        let mut buf = TestBuffer::new("ab\ncd");
+        buf.set_cursor(0, 0);
+        let r = motion_range(&mut buf, Motion::LineEnd, Some(2)).unwrap();
+        assert_eq!(r.shape, MotionShape::Inclusive);
+        assert_eq!(extract_text(&buf, &r), "ab\ncd");
+    }
+
+    #[test]
+    fn motion_range_returns_none_for_a_no_op_motion() {
+        let mut buf = TestBuffer::new("abc");
+        buf.set_cursor(0, 0);
+        assert!(motion_range(&mut buf, Motion::Left, None).is_none());
+        assert_eq!(buf.cursor(), (0, 0));
+    }
+
+    #[test]
+    fn motion_range_returns_none_for_a_failed_find() {
+        let mut buf = TestBuffer::new("abc");
+        buf.set_cursor(0, 0);
+        let f = Motion::FindChar { ch: 'z', till: false, forward: true };
+        assert!(motion_range(&mut buf, f, None).is_none());
+        assert_eq!(buf.cursor(), (0, 0));
+    }
+
+    #[test]
+    fn motion_range_returns_none_for_non_motion_targets() {
+        let mut buf = TestBuffer::new("abc");
+        buf.set_cursor(0, 0);
+        assert!(motion_range(&mut buf, Motion::SetMark('a'), None).is_none());
+        assert!(motion_range(&mut buf, Motion::ScrollCenter, None).is_none());
+    }
+
+    #[test]
+    fn whole_lines_yy_single_and_multi_count() {
+        let mut buf = TestBuffer::new("one\ntwo\nthree");
+        buf.set_cursor(1, 2);
+        assert_eq!(whole_lines(&buf, 1), "two\n");
+        assert_eq!(buf.cursor(), (1, 2)); // never moves
+        assert_eq!(whole_lines(&buf, 2), "two\nthree\n");
+    }
+
+    #[test]
+    fn whole_lines_clamps_count_past_the_end_of_the_buffer() {
+        let mut buf = TestBuffer::new("one\ntwo");
+        buf.set_cursor(0, 0);
+        assert_eq!(whole_lines(&buf, 99), "one\ntwo\n");
+    }
+
+    #[test]
+    fn extract_text_linewise_spans_an_empty_line() {
+        let mut buf = TestBuffer::new("a\n\nb");
+        buf.set_cursor(0, 0);
+        let r = motion_range(&mut buf, Motion::GotoLastLine, None).unwrap();
+        assert_eq!(r.shape, MotionShape::Linewise);
+        assert_eq!(extract_text(&buf, &r), "a\n\nb\n");
+    }
+
+    #[test]
+    fn extract_text_charwise_crosses_an_empty_line() {
+        let mut buf = TestBuffer::new("a\n\nb");
+        buf.set_cursor(0, 0);
+        // "a" -> the empty line (its own word) -> "b": exclusive, lands on
+        // 'b' without including it.
+        let r = motion_range(&mut buf, Motion::WordForward, Some(2)).unwrap();
+        assert_eq!(r.shape, MotionShape::Exclusive);
+        assert_eq!(r.to, (2, 0));
+        assert_eq!(extract_text(&buf, &r), "a\n\n");
     }
 }
