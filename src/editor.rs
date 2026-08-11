@@ -57,6 +57,13 @@ pub enum Key {
     CtrlF,
     CtrlK,
     CtrlL,
+    // Completion cycling -- see read_line's own completion handling.
+    // BackTab is xterm's CBT sequence ("CSI Z", shift-tab); CtrlN/CtrlP
+    // are the same forward/backward pair emacs-style line editors use.
+    Tab,
+    BackTab,
+    CtrlN,
+    CtrlP,
     // Vim's insert-mode "do exactly one normal command, then return to
     // insert" -- see run_one_shot_normal_command's own doc comment.
     CtrlO,
@@ -117,9 +124,12 @@ fn read_key() -> io::Result<Option<Key>> {
         0x04 => Key::CtrlD,
         0x05 => Key::CtrlE,
         0x06 => Key::CtrlF,
+        0x09 => Key::Tab,
         0x0b => Key::CtrlK,
         0x0c => Key::CtrlL,
+        0x0e => Key::CtrlN,
         0x0f => Key::CtrlO,
+        0x10 => Key::CtrlP,
         0x15 => Key::CtrlU,
         0x17 => Key::CtrlW,
         0x19 => Key::CtrlY,
@@ -214,6 +224,7 @@ fn decode_csi_final(params: &str, final_byte: u8) -> Key {
             Some(4) | Some(8) => Key::End,
             _ => Key::Unknown,
         },
+        b'Z' => Key::BackTab,
         _ => Key::Unknown,
     }
 }
@@ -803,7 +814,11 @@ pub fn read_line(
                     continue;
                 }
             }
-            Key::AltLeft | Key::AltRight | Key::AltUp | Key::CtrlY | Key::Unknown => {}
+            // Tab/BackTab/CtrlN/CtrlP: no-op for now -- real completion
+            // dispatch is wired into this match in a later stage of the
+            // same feature; decoding lands first on its own so it's
+            // independently testable (decode_csi_final's new arm).
+            Key::AltLeft | Key::AltRight | Key::AltUp | Key::CtrlY | Key::Tab | Key::BackTab | Key::CtrlN | Key::CtrlP | Key::Unknown => {}
         }
         redraw(prompt, &ed, col_origin, width, ctx)?;
     }
@@ -994,5 +1009,33 @@ impl<'a> crate::bishedit::Buffer for LineBuffer<'a> {
 
     fn get_mark(&self, name: char) -> Option<(usize, usize)> {
         self.marks.get(&name).copied()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // decode_csi_final is a pure function, unlike read_key/read_escape
+    // (which read real bytes off stdin) -- this editor's first test
+    // module, added alongside completion's Tab/Shift-Tab decoding since
+    // that's the one piece of this stage testable without a real
+    // terminal.
+    #[test]
+    fn decode_csi_final_shift_tab_is_back_tab() {
+        assert_eq!(decode_csi_final("", b'Z'), Key::BackTab);
+    }
+
+    #[test]
+    fn decode_csi_final_plain_arrows_still_decode_correctly() {
+        assert_eq!(decode_csi_final("", b'A'), Key::Up);
+        assert_eq!(decode_csi_final("", b'B'), Key::Down);
+        assert_eq!(decode_csi_final("", b'C'), Key::Right);
+        assert_eq!(decode_csi_final("", b'D'), Key::Left);
+    }
+
+    #[test]
+    fn decode_csi_final_unrecognized_final_byte_is_unknown() {
+        assert_eq!(decode_csi_final("", b'Q'), Key::Unknown);
     }
 }
