@@ -664,28 +664,44 @@ fn build_completion_row(state: &CompletionState) -> CompletionRow {
 // restore captures an *absolute* coordinate, which goes stale the
 // moment a scroll happens between save and restore -- exactly the
 // "prompt on the terminal's last row" case this needs to survive.
-// Relative movement nets to zero rows moved regardless of what
-// scrolled in between, correct by construction. The row is always
-// erased (even when `completion` is now None), clearing a stale row
-// left over from the previous call. `\x1b[1A` restores the *row* but
-// not the column redraw() already left the real cursor at -- the
-// second compose_redraw call is the deliberately-simple way to fix
-// that, rather than duplicating redraw()'s own column math here.
+//
+// IMPORTANT, and previously wrong in this comment: relative movement
+// does NOT net to zero rows moved regardless of what scrolled in
+// between. Verified directly (bypassing this codebase entirely, driving
+// a plain terminal with raw escape sequences and tmux's own cursor-
+// position introspection as the oracle): when the cursor is genuinely
+// on the terminal's true bottom margin, `\n` scrolls the whole screen up
+// by one row but leaves the cursor's own absolute row index unchanged
+// (it stays on the now-blank bottom row) -- so the content that used to
+// be "the current row" is now one row higher than the cursor. The
+// following `\x1b[1A` then moves up by exactly one row unconditionally,
+// landing exactly on that shifted content and overwriting it -- a real,
+// deterministic, single-invocation loss of one row, not a save/restore-
+// style staleness issue. This is why `menu_was_shown` below exists:
+// since this function used to run on *every* redraw (see its own
+// removed claim above), the very first time typing/output reached the
+// terminal's true last row would permanently pull the prompt up by one
+// row, and it would never be touched again -- exactly the "the
+// terminal's true last row is never used" bug this was found while
+// fixing. Gating the whole block to only run when a completion menu is
+// actually relevant (`completion.is_some() || menu_was_shown`) doesn't
+// make a single dance invocation any safer in isolation, but it makes
+// the dance rare enough in practice (only during active completion use,
+// not on every keystroke) that this residual risk is an accepted,
+// documented gap rather than a routine failure. The row is still always
+// erased once more after a completion ends (even though `completion` is
+// already None by then), clearing a stale row left over from the
+// previous call -- `menu_was_shown` is what keeps that one extra redraw
+// gated in too. `\x1b[1A` restores the *row* but not the column
+// redraw() already left the real cursor at -- the second compose_redraw
+// call is the deliberately-simple way to fix that, rather than
+// duplicating redraw()'s own column math here.
 //
 // The "move down" step is a literal `\n`, not `\x1b[1B` (Cursor Down):
 // CUD is defined to *clamp* at the terminal's bottom margin rather than
-// scroll, unlike a real linefeed. This function runs on every redraw
-// once `menu_capable` is true (to erase a stale row even with no active
-// completion), so the very first call after a prompt lands with zero
-// rows of slack below it -- exactly what happens right after a
-// command's own output scrolls the terminal -- has to guarantee a row
-// actually exists below, scrolling for it if needed, not silently fail
-// to move and let the subsequent `\x1b[1A` land back on the *previous*
-// command's just-scrolled output row instead of a blank one. (Found via
-// interactive testing: without this, that output row got silently
-// cleared and overwritten by the next prompt.) `\x1b[1A` afterward stays
-// correct either way -- by definition there's always a row above
-// wherever the linefeed left the cursor.
+// scroll, unlike a real linefeed, which was silently corrupting the
+// *previous* command's own output row (found via interactive testing)
+// before this used `\n` instead.
 //
 // Everything is assembled into one string and written with a single
 // print!/flush, not two separate ones -- an earlier version called
@@ -702,13 +718,20 @@ fn redraw_with_completion_row(
     ed: &LineEditor,
     ghost: &str,
     completion: Option<&CompletionState>,
+    // Whether a completion menu was showing on the *previous* redraw --
+    // the dance below still has to run once more after a completion ends
+    // (Tab-accepted, Ctrl-E-discarded, or "locked in" by an unrelated
+    // key) purely to erase that stale row, even though `completion` is
+    // already None by then. See this function's own doc comment for why
+    // it must NOT run on every other redraw too.
+    menu_was_shown: bool,
     menu_capable: bool,
     col_origin: usize,
     width: usize,
     ctx: HighlightContext,
 ) -> io::Result<()> {
     let mut out = compose_redraw(prompt, ed, ghost, col_origin, width, ctx);
-    if menu_capable {
+    if menu_capable && (completion.is_some() || menu_was_shown) {
         out.push('\n');
         out.push_str(&format!("\x1b[{}G", col_origin + 1));
         out.push_str(&" ".repeat(width));
@@ -936,6 +959,16 @@ pub fn read_line(
     // needed for that case).
     let mut completion: Option<CompletionState> = None;
 
+    // Whether a completion menu was showing on the immediately-preceding
+    // redraw -- see redraw_with_completion_row's own doc comment for why
+    // this exists (its down/erase/up dance must run once more after a
+    // completion ends purely to erase the stale row, but must NOT run on
+    // every other redraw, which is what it used to do and is exactly
+    // what made the terminal's true last row permanently unreachable).
+    // Starts false: nothing has been drawn yet, so there's no stale row
+    // from a previous call to worry about.
+    let mut menu_was_shown = false;
+
     // The ghost tail currently being shown, if any -- see
     // compute_suggestion's own doc comment for why this is a plain
     // recomputed-every-redraw cache, not a persisted state machine.
@@ -953,11 +986,13 @@ pub fn read_line(
         &ed,
         suggestion.as_deref().unwrap_or(""),
         completion.as_ref(),
+        menu_was_shown,
         menu_capable,
         col_origin,
         width,
         ctx,
     )?;
+    menu_was_shown = completion.is_some();
 
     // Set only when Ctrl-E's or Ctrl-O's own sub-loop below reports a key
     // it didn't consume itself (Ctrl-C/D/Z -- see run_line_normal_mode/
@@ -1212,7 +1247,18 @@ pub fn read_line(
         // whatever the just-dispatched key actually did to the buffer/
         // completion/browse state) and before the redraw that shows it.
         suggestion = compute_suggestion(&ed, suggestion_provider, completion.is_some(), browse.is_some());
-        redraw_with_completion_row(prompt, &ed, suggestion.as_deref().unwrap_or(""), completion.as_ref(), menu_capable, col_origin, width, ctx)?;
+        redraw_with_completion_row(
+            prompt,
+            &ed,
+            suggestion.as_deref().unwrap_or(""),
+            completion.as_ref(),
+            menu_was_shown,
+            menu_capable,
+            col_origin,
+            width,
+            ctx,
+        )?;
+        menu_was_shown = completion.is_some();
     }
 }
 
