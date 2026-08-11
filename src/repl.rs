@@ -8,7 +8,7 @@ use crate::bishedit::highlight::HighlightContext;
 use crate::bishedit::motion;
 use crate::bishedit::registers::Registers;
 use crate::bishedit::suggestion;
-use crate::bishedit::vimkeys::{KeyOutcome, VimKeys, WindowCmd};
+use crate::bishedit::vimkeys::{KeyOutcome, Op, VimKeys, WindowCmd};
 use crate::bishedit::Buffer as BisheditBuffer;
 use crate::editor::{self, Key, ReadOutcome};
 use crate::exec::{self, ExecResult, PaneDirection, Shell, WindowAction};
@@ -2592,22 +2592,32 @@ fn run_normal_mode_navigation(
             // tmux-copy-mode-style view is for (see ScreenBuffer's own doc
             // comment). `<C-r>` in insert mode, or `p`/`P` in Ctrl-E's/
             // Ctrl-O's own line-local Normal mode, are what get a yanked
-            // register back into the live prompt afterward.
-            KeyOutcome::Operator(_op, motion, count, register) => {
-                editor::yank_motion(&mut buf, registers, motion, count, register);
+            // register back into the live prompt afterward. Delete/Change
+            // are inert here for the same reason `Put` is, just below:
+            // `ScreenBuffer` is read-only by construction, so there's
+            // nothing for them to mutate -- `op == Op::Yank` gates it
+            // rather than a separate match arm per `Op`, since the
+            // motion/range computation itself (and thus what gets read
+            // for a *would-be* yank) is identical either way.
+            KeyOutcome::Operator(op, motion, count, register) => {
+                if op == Op::Yank {
+                    editor::yank_motion(&mut buf, registers, motion, count, register);
+                }
                 render_normal_mode_frame(&buf, rect, &vk, None);
             }
-            KeyOutcome::OperatorLines(_op, count, register) => {
-                editor::yank_lines(&buf, registers, count, register);
+            KeyOutcome::OperatorLines(op, count, register) => {
+                if op == Op::Yank {
+                    editor::yank_lines(&buf, registers, count, register);
+                }
                 render_normal_mode_frame(&buf, rect, &vk, None);
             }
-            // `p`/`P` is a deliberate no-op here: `ScreenBuffer` is
-            // read-only by construction (a view over already-rendered
+            // `p`/`P`/`x` are all a deliberate no-op here: `ScreenBuffer`
+            // is read-only by construction (a view over already-rendered
             // scrollback, not an editable buffer -- see its own doc
             // comment), and there's nothing else in this context that a
-            // put could sensibly target. Falls into the same bucket as
-            // `Pending`/`None` below.
-            KeyOutcome::Put { .. } => {
+            // put or delete could sensibly target. Falls into the same
+            // bucket as `Pending`/`None` below.
+            KeyOutcome::Put { .. } | KeyOutcome::DeleteCharForward { .. } => {
                 render_normal_mode_frame(&buf, rect, &vk, None);
             }
             KeyOutcome::Window(cmd @ (WindowCmd::GotoFirstWindow | WindowCmd::GotoLastWindow), count) => {

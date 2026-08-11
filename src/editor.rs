@@ -22,7 +22,7 @@ use crate::bishedit::motion;
 use crate::bishedit::registers::{RegisterShape, RegisterValue, Registers};
 use crate::bishedit::suggestion::{SuggestionProvider, SuggestionRequest};
 use crate::bishedit::Buffer;
-use crate::bishedit::vimkeys::{self, KeyOutcome, VimKeys};
+use crate::bishedit::vimkeys::{self, KeyOutcome, Op, VimKeys};
 use crate::history::History;
 use crate::term;
 use crate::vt100;
@@ -1493,9 +1493,35 @@ fn run_line_normal_mode(
                         lb.ed.cursor = new_cursor;
                         break LineNormalExit::ToInsert;
                     }
-                    KeyOutcome::Operator(_op, motion, count, register) => yank_motion(&mut lb, registers, motion, count, register),
-                    KeyOutcome::OperatorLines(_op, count, register) => yank_lines(&lb, registers, count, register),
+                    KeyOutcome::Operator(op, motion, count, register) => match op {
+                        Op::Yank => yank_motion(&mut lb, registers, motion, count, register),
+                        Op::Delete => {
+                            delete_motion(&mut lb, registers, motion, count, register);
+                        }
+                        Op::Change => {
+                            let motion = redirect_cw_to_ce(&lb, &motion);
+                            if delete_motion(&mut lb, registers, motion, count, register) {
+                                break LineNormalExit::ToInsert;
+                            }
+                        }
+                    },
+                    KeyOutcome::OperatorLines(op, count, register) => match op {
+                        Op::Yank => yank_lines(&lb, registers, count, register),
+                        Op::Delete => delete_lines(&mut lb, registers, count, register),
+                        Op::Change => {
+                            delete_lines(&mut lb, registers, count, register);
+                            break LineNormalExit::ToInsert;
+                        }
+                    },
                     KeyOutcome::Put { before, count, register } => put(&mut lb.ed.buf, &mut lb.ed.cursor, registers, before, count, register),
+                    KeyOutcome::DeleteCharForward { count, register } => {
+                        let (new_buf, new_cursor, deleted) = vimkeys::apply_delete_forward(&lb.ed.buf, lb.ed.cursor, count.unwrap_or(1).max(1));
+                        lb.ed.buf = new_buf;
+                        lb.ed.cursor = new_cursor;
+                        if !deleted.is_empty() {
+                            registers.write(register, RegisterValue { text: deleted, shape: RegisterShape::Char });
+                        }
+                    }
                     // <C-w> is still vimkeys' own window-leader prefix
                     // here too, matching real vim's own Normal-mode
                     // Ctrl-W meaning -- intentionally not special-cased
@@ -1541,6 +1567,85 @@ fn put(buf: &mut Vec<char>, cursor: &mut usize, registers: &mut Registers, befor
     *cursor = new_cursor;
 }
 
+// `d{motion}`/`c{motion}`'s shared half: computes the same range
+// `yank_motion` would (writing it to a register the same way), then
+// additionally removes that text from the buffer, leaving the cursor at
+// the range's own start -- vim's own rule for both (`c{motion}` then
+// enters insert at that same position, handled by the caller). Unlike
+// `yank_motion`, this isn't generic over `impl Buffer`: mutation only
+// makes sense against a real `LineEditor`, and `ScreenBuffer`'s own
+// Normal mode never reaches this (see repl.rs's own doc comment on why
+// `Operator`/`OperatorLines` there stay yank-only regardless of `Op`).
+// Returns whether anything was actually deleted -- `Op::Change` uses this
+// to decide whether to enter insert mode at all: a motion target that
+// doesn't exist or doesn't move (`motion::motion_range` returning `None`)
+// aborts the whole `c{motion}`, the same way it already silently aborts
+// a `y{motion}`, rather than dropping into insert mode having changed
+// nothing.
+fn delete_motion(lb: &mut LineBuffer, registers: &mut Registers, motion: motion::Motion, count: Option<usize>, register: Option<char>) -> bool {
+    let Some(range) = motion::motion_range(lb, motion, count) else {
+        return false;
+    };
+    let text = motion::extract_text(lb, &range);
+    let shape = if range.shape == motion::MotionShape::Linewise { RegisterShape::Line } else { RegisterShape::Char };
+    registers.write(register, RegisterValue { text, shape });
+    let (from_col, to_col) = (range.from.1, range.to.1);
+    match range.shape {
+        // A single-line buffer's own "linewise" is always the whole
+        // buffer -- same flattening `whole_lines`/`yank_lines` already
+        // established for `yy`.
+        motion::MotionShape::Linewise => {
+            lb.ed.buf.clear();
+            lb.ed.cursor = 0;
+        }
+        motion::MotionShape::Inclusive => {
+            let end = (to_col + 1).min(lb.ed.buf.len());
+            lb.ed.buf.drain(from_col..end);
+            lb.ed.cursor = from_col.min(lb.ed.buf.len().saturating_sub(1));
+        }
+        motion::MotionShape::Exclusive => {
+            lb.ed.buf.drain(from_col..to_col);
+            lb.ed.cursor = from_col.min(lb.ed.buf.len().saturating_sub(1));
+        }
+    }
+    true
+}
+
+// `dd`/`cc`'s own whole-line shorthand -- see `delete_motion`'s own doc
+// comment on the single-line "linewise means the whole buffer"
+// flattening (same one `yank_lines`/`whole_lines` use for `yy`). Unlike
+// `delete_motion`, there's no failure case: `count` lines always exist to
+// delete (clamped to just "the" line, since there's only ever one), so
+// `Op::Change` never needs to check a return value here the way it does
+// for `delete_motion` -- `cc` always enters insert.
+fn delete_lines(lb: &mut LineBuffer, registers: &mut Registers, count: Option<usize>, register: Option<char>) {
+    let text = motion::whole_lines(lb, count.unwrap_or(1).max(1));
+    registers.write(register, RegisterValue { text, shape: RegisterShape::Line });
+    lb.ed.buf.clear();
+    lb.ed.cursor = 0;
+}
+
+// vim's own "`cw`/`cW` act like `ce`/`cE`" rule: when the cursor sits on
+// a non-blank character, changing "to the next word" would otherwise eat
+// the trailing whitespace before that word too (via `WordForward`'s own
+// exclusive-to-the-next-word-start semantics), which reads wrong when
+// what follows is about to be retyped -- vim redirects it to "to the end
+// of the current word" instead, matching what a user actually means.
+// `motion::motion_shape`'s own doc comment flagged this as deliberately
+// unhandled until a real change operator existed to need it; this is
+// that. Only ever called for `Op::Change`, and only changes anything for
+// exactly these two motions -- every other motion (and `Op::Delete`,
+// which never calls this) is unaffected, matching vim (`dw` still eats
+// the trailing whitespace; only `cw` gets the redirect).
+fn redirect_cw_to_ce(lb: &LineBuffer, motion: &motion::Motion) -> motion::Motion {
+    let on_word_char = matches!(lb.ed.buf.get(lb.ed.cursor), Some(c) if !c.is_whitespace());
+    match motion {
+        motion::Motion::WordForward if on_word_char => motion::Motion::WordEnd,
+        motion::Motion::WordForwardBig if on_word_char => motion::Motion::WordEndBig,
+        other => other.clone(),
+    }
+}
+
 // Ctrl-O (vim's insert-mode "do exactly one normal command, then return
 // to insert"): reachable directly from ordinary typing, no need to
 // already be in Ctrl-E's own line-local mode first, matching real vim.
@@ -1581,16 +1686,45 @@ fn run_one_shot_normal_command(ed: &mut LineEditor, registers: &mut Registers, o
                         lb.ed.cursor = new_cursor;
                         break None;
                     }
-                    KeyOutcome::Operator(_op, motion, count, register) => {
-                        yank_motion(&mut lb, registers, motion, count, register);
+                    // Ctrl-O already unconditionally returns to insert
+                    // after any resolved outcome, so `Op::Change` here
+                    // needs no "did it actually delete anything" check
+                    // the way run_line_normal_mode's own arm does --
+                    // `<C-o>cw` returns to insert either way, matching
+                    // Ctrl-O's own "do exactly one command, then resume
+                    // typing" contract regardless of what that command
+                    // did.
+                    KeyOutcome::Operator(op, motion, count, register) => {
+                        match op {
+                            Op::Yank => yank_motion(&mut lb, registers, motion, count, register),
+                            Op::Delete => {
+                                delete_motion(&mut lb, registers, motion, count, register);
+                            }
+                            Op::Change => {
+                                let motion = redirect_cw_to_ce(&lb, &motion);
+                                delete_motion(&mut lb, registers, motion, count, register);
+                            }
+                        }
                         break None;
                     }
-                    KeyOutcome::OperatorLines(_op, count, register) => {
-                        yank_lines(&lb, registers, count, register);
+                    KeyOutcome::OperatorLines(op, count, register) => {
+                        match op {
+                            Op::Yank => yank_lines(&lb, registers, count, register),
+                            Op::Delete | Op::Change => delete_lines(&mut lb, registers, count, register),
+                        }
                         break None;
                     }
                     KeyOutcome::Put { before, count, register } => {
                         put(&mut lb.ed.buf, &mut lb.ed.cursor, registers, before, count, register);
+                        break None;
+                    }
+                    KeyOutcome::DeleteCharForward { count, register } => {
+                        let (new_buf, new_cursor, deleted) = vimkeys::apply_delete_forward(&lb.ed.buf, lb.ed.cursor, count.unwrap_or(1).max(1));
+                        lb.ed.buf = new_buf;
+                        lb.ed.cursor = new_cursor;
+                        if !deleted.is_empty() {
+                            registers.write(register, RegisterValue { text: deleted, shape: RegisterShape::Char });
+                        }
                         break None;
                     }
                     KeyOutcome::Window(..) | KeyOutcome::None => break None,
@@ -1746,5 +1880,120 @@ mod tests {
         let out = compose_redraw("$ ", &ed, "ignored-ghost", 0, 10, HighlightContext::default(), &[]);
         assert!(!out.contains("ignored-ghost"), "{out:?}");
         assert!(!out.contains("\x1b[0;2;90m"), "{out:?}");
+    }
+
+    fn make_registers() -> Registers {
+        Registers::new_for_test()
+    }
+
+    #[test]
+    fn delete_motion_removes_an_exclusive_range_and_writes_the_register() {
+        let mut ed = make_editor("foo bar baz", 0);
+        let mut marks = HashMap::new();
+        let mut lb = LineBuffer { ed: &mut ed, marks: &mut marks };
+        let mut registers = make_registers();
+        let deleted = delete_motion(&mut lb, &mut registers, motion::Motion::WordForward, None, None);
+        assert!(deleted);
+        assert_eq!(ed.buf.iter().collect::<String>(), "bar baz");
+        assert_eq!(ed.cursor, 0);
+        let value = registers.read(None);
+        assert_eq!(value.text, "foo ");
+        assert_eq!(value.shape, RegisterShape::Char);
+    }
+
+    #[test]
+    fn delete_motion_removes_an_inclusive_range() {
+        let mut ed = make_editor("foo bar baz", 4); // 'b' of bar
+        let mut marks = HashMap::new();
+        let mut lb = LineBuffer { ed: &mut ed, marks: &mut marks };
+        let mut registers = make_registers();
+        delete_motion(&mut lb, &mut registers, motion::Motion::LineEnd, None, None);
+        assert_eq!(ed.buf.iter().collect::<String>(), "foo ");
+        assert_eq!(ed.cursor, 3);
+        assert_eq!(registers.read(None).text, "bar baz");
+    }
+
+    #[test]
+    fn delete_motion_on_a_failed_target_deletes_nothing_and_reports_false() {
+        let mut ed = make_editor("abc", 0);
+        let mut marks = HashMap::new();
+        let mut lb = LineBuffer { ed: &mut ed, marks: &mut marks };
+        let mut registers = make_registers();
+        // Left at column 0 never moves -- motion_range returns None.
+        let deleted = delete_motion(&mut lb, &mut registers, motion::Motion::Left, None, None);
+        assert!(!deleted);
+        assert_eq!(ed.buf.iter().collect::<String>(), "abc");
+        assert_eq!(registers.read(None).text, "");
+    }
+
+    #[test]
+    fn delete_motion_linewise_clears_the_whole_single_line_buffer() {
+        // `Motion::Down` is a no-op on a single-line buffer (there's only
+        // ever one line to move to -- motion_range would report "nothing
+        // moved" and delete_motion would correctly do nothing, same as
+        // the failed-target test above). `GotoFirstLine` still counts as
+        // "moved" here because it also repositions the column to the
+        // first non-blank, which is enough to give motion_range a real
+        // range to work with while still being Linewise-classified --
+        // exercising delete_motion's whole-buffer-clear branch, which
+        // ignores the specific from/to columns entirely.
+        let mut ed = make_editor("  foo bar", 5);
+        let mut marks = HashMap::new();
+        let mut lb = LineBuffer { ed: &mut ed, marks: &mut marks };
+        let mut registers = make_registers();
+        let deleted = delete_motion(&mut lb, &mut registers, motion::Motion::GotoFirstLine, None, None);
+        assert!(deleted);
+        assert!(ed.buf.is_empty());
+        assert_eq!(ed.cursor, 0);
+        assert_eq!(registers.read(None).shape, RegisterShape::Line);
+    }
+
+    #[test]
+    fn delete_lines_clears_the_buffer_and_writes_a_linewise_register() {
+        let mut ed = make_editor("foo bar", 2);
+        let mut marks = HashMap::new();
+        let mut lb = LineBuffer { ed: &mut ed, marks: &mut marks };
+        let mut registers = make_registers();
+        delete_lines(&mut lb, &mut registers, None, None);
+        assert!(ed.buf.is_empty());
+        assert_eq!(ed.cursor, 0);
+        let value = registers.read(None);
+        assert_eq!(value.text, "foo bar\n");
+        assert_eq!(value.shape, RegisterShape::Line);
+    }
+
+    #[test]
+    fn redirect_cw_to_ce_only_fires_on_a_non_blank_cursor() {
+        let mut ed = make_editor("foo bar", 0); // 'f', non-blank
+        let mut marks = HashMap::new();
+        let lb = LineBuffer { ed: &mut ed, marks: &mut marks };
+        assert_eq!(redirect_cw_to_ce(&lb, &motion::Motion::WordForward), motion::Motion::WordEnd);
+        assert_eq!(redirect_cw_to_ce(&lb, &motion::Motion::WordForwardBig), motion::Motion::WordEndBig);
+        // Unaffected motions pass through unchanged.
+        assert_eq!(redirect_cw_to_ce(&lb, &motion::Motion::LineEnd), motion::Motion::LineEnd);
+    }
+
+    #[test]
+    fn redirect_cw_to_ce_does_not_fire_on_a_blank_cursor() {
+        let mut ed = make_editor("foo bar", 3); // the space between words
+        let mut marks = HashMap::new();
+        let lb = LineBuffer { ed: &mut ed, marks: &mut marks };
+        assert_eq!(redirect_cw_to_ce(&lb, &motion::Motion::WordForward), motion::Motion::WordForward);
+    }
+
+    #[test]
+    fn change_via_delete_motion_then_insert_mirrors_the_cw_to_ce_redirect() {
+        // "cw" from the middle of "foo" should change only through the
+        // 'o' -- not through the trailing space into "bar" -- matching
+        // vim's own cw-acts-like-ce rule.
+        let mut ed = make_editor("foo bar", 1); // 'o' of foo
+        let mut marks = HashMap::new();
+        let mut lb = LineBuffer { ed: &mut ed, marks: &mut marks };
+        let mut registers = make_registers();
+        let motion = redirect_cw_to_ce(&lb, &motion::Motion::WordForward);
+        delete_motion(&mut lb, &mut registers, motion, None, None);
+        assert_eq!(ed.buf.iter().collect::<String>(), "f bar");
+        assert_eq!(ed.cursor, 1);
+        assert_eq!(registers.read(None).text, "oo");
     }
 }

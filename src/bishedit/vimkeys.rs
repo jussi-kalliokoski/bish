@@ -54,6 +54,14 @@ pub enum KeyOutcome {
     /// (`before: false`) or before (`before: true`) the cursor, `count`
     /// times.
     Put { before: bool, count: Option<usize>, register: Option<char> },
+    /// `x` -- delete `count` characters forward from the cursor. Not an
+    /// `Operator(Op::Delete, Motion::Right, ...)`: `Motion::Right`'s own
+    /// clamping refuses to move onto/past the line's last character, so
+    /// that would wrongly no-op exactly where vim's `x` still deletes.
+    /// `X` (delete backward) has no such edge case -- `Motion::Left`
+    /// already clamps correctly at column 0 -- so it stays a plain
+    /// `Operator` and needs no variant of its own.
+    DeleteCharForward { count: Option<usize>, register: Option<char> },
     /// The key was consumed as part of an in-progress sequence (a count
     /// digit, or a prefix awaiting its next character); no motion yet.
     Pending,
@@ -63,21 +71,27 @@ pub enum KeyOutcome {
     None,
 }
 
-/// An operator awaiting a motion (`y{motion}`) or its own double-tap
-/// shorthand (`yy`). Single variant today, deliberately -- `Op::Delete`/
-/// `Op::Change` are meant to extend this later by reusing the exact same
-/// operator-pending plumbing in `VimKeys`, not by inventing a parallel one.
+/// An operator awaiting a motion (`y{motion}`/`d{motion}`/`c{motion}`) or
+/// its own double-tap shorthand (`yy`/`dd`/`cc`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Op {
     Yank,
+    Delete,
+    /// `c{motion}`/`cc` -- like `Delete`, but the caller also enters
+    /// insert mode at the deletion point afterward (skipped if the
+    /// motion target was invalid/empty, same as any other failed
+    /// operator -- see `KeyOutcome::Operator`'s own doc comment on that).
+    Change,
 }
 
 impl Op {
     /// The key that both arms this operator and, pressed again at a fresh
-    /// dispatch point, triggers its whole-line shorthand (`yy`).
+    /// dispatch point, triggers its whole-line shorthand (`yy`/`dd`/`cc`).
     fn trigger_char(self) -> char {
         match self {
             Op::Yank => 'y',
+            Op::Delete => 'd',
+            Op::Change => 'c',
         }
     }
 }
@@ -177,6 +191,28 @@ pub fn apply_put(text: &[char], cursor: usize, insert_text: &str, before: bool, 
     new_text.splice(insert_at..insert_at, block.iter().copied());
     let new_cursor = insert_at + block.len() - 1;
     (new_text, new_cursor)
+}
+
+/// `x`: deletes up to `count` characters starting at the cursor, clamped
+/// to the end of the line -- vim's own primitive, not quite reducible to
+/// `d{count}l`: `l`'s own motion refuses to move onto/past the last
+/// character, so `dl` there is a no-op, but `x` on the last character
+/// still deletes it (this clamps the *starting* cursor to the last valid
+/// index first, rather than refusing to move past it the way a motion
+/// would). Returns the deleted text too, so the caller can write it to a
+/// register the same way `y`/`d{motion}` do -- empty text (nothing to
+/// delete: an empty buffer) is the caller's own signal to skip that.
+pub fn apply_delete_forward(text: &[char], cursor: usize, count: usize) -> (Vec<char>, usize, String) {
+    if text.is_empty() || count == 0 {
+        return (text.to_vec(), cursor, String::new());
+    }
+    let cursor = cursor.min(text.len() - 1);
+    let end = (cursor + count).min(text.len());
+    let deleted: String = text[cursor..end].iter().collect();
+    let mut new_text = text.to_vec();
+    new_text.drain(cursor..end);
+    let new_cursor = cursor.min(new_text.len().saturating_sub(1));
+    (new_text, new_cursor, deleted)
 }
 
 /// `<C-w>{cmd}`: the same single-letter window shortcuts the shell's own
@@ -472,6 +508,19 @@ impl VimKeys {
         KeyOutcome::Pending
     }
 
+    // `D`/`X`'s own shape: an operator applied to a *fixed* motion
+    // (`LineEnd`/`Left`), resolved immediately rather than arming a
+    // pending operator -- the same "direct emission" shortcut `Y` already
+    // uses for `yy`, just carrying an explicit `Motion` instead of going
+    // through `OperatorLines`.
+    fn emit_operator_direct(&mut self, op: Op, motion: Motion) -> KeyOutcome {
+        let count = self.count.take();
+        let register = self.pending_register.take();
+        self.pending = Pending::None;
+        self.last_completed = std::mem::take(&mut self.current_input);
+        KeyOutcome::Operator(op, motion, count, register)
+    }
+
     fn emit_put(&mut self, before: bool) -> KeyOutcome {
         let count = self.count.take();
         let register = self.pending_register.take();
@@ -608,6 +657,29 @@ impl VimKeys {
                 self.pending = Pending::None;
                 self.last_completed = std::mem::take(&mut self.current_input);
                 KeyOutcome::OperatorLines(Op::Yank, count, register)
+            }
+            Key::Char('d') => self.emit_operator(Op::Delete),
+            Key::Char('c') => self.emit_operator(Op::Change),
+            // `D`: delete from the cursor through end of line, staying in
+            // Normal mode -- vim's own `d$` shorthand. Unlike `C` (the
+            // same range, but entering insert afterward), nothing already
+            // handled this, so it's new rather than a redirect onto an
+            // existing command.
+            Key::Char('D') => self.emit_operator_direct(Op::Delete, Motion::LineEnd),
+            // `X`: delete backward -- vim's own `d{count}h` shorthand.
+            // `Motion::Left` already clamps at column 0 exactly the way
+            // `X` needs (a no-op there), so this needs no special casing
+            // the way `x` (below) does.
+            Key::Char('X') => self.emit_operator_direct(Op::Delete, Motion::Left),
+            // `x`: delete forward -- *not* `emit_operator_direct(Delete,
+            // Right)`. See `KeyOutcome::DeleteCharForward`'s own doc
+            // comment on why `Motion::Right` can't stand in for this.
+            Key::Char('x') => {
+                let count = self.count.take();
+                let register = self.pending_register.take();
+                self.pending = Pending::None;
+                self.last_completed = std::mem::take(&mut self.current_input);
+                KeyOutcome::DeleteCharForward { count, register }
             }
             Key::Char('p') => self.emit_put(false),
             Key::Char('P') => self.emit_put(true),
@@ -1565,5 +1637,151 @@ mod tests {
         vk.feed(Key::Char('*'));
         vk.feed(Key::Char('n'));
         assert!(vk.last_search_is_word());
+    }
+
+    #[test]
+    fn delete_operator_plus_motion() {
+        let mut vk = VimKeys::new();
+        assert_eq!(vk.feed(Key::Char('d')), KeyOutcome::Pending);
+        assert_eq!(
+            vk.feed(Key::Char('w')),
+            KeyOutcome::Operator(Op::Delete, Motion::WordForward, None, None)
+        );
+    }
+
+    #[test]
+    fn change_operator_plus_motion() {
+        let mut vk = VimKeys::new();
+        assert_eq!(vk.feed(Key::Char('c')), KeyOutcome::Pending);
+        assert_eq!(
+            vk.feed(Key::Char('e')),
+            KeyOutcome::Operator(Op::Change, Motion::WordEnd, None, None)
+        );
+    }
+
+    #[test]
+    fn dd_and_cc_double_tap_resolve_to_operator_lines() {
+        let mut vk = VimKeys::new();
+        assert_eq!(vk.feed(Key::Char('d')), KeyOutcome::Pending);
+        assert_eq!(vk.feed(Key::Char('d')), KeyOutcome::OperatorLines(Op::Delete, None, None));
+
+        let mut vk = VimKeys::new();
+        assert_eq!(vk.feed(Key::Char('c')), KeyOutcome::Pending);
+        assert_eq!(vk.feed(Key::Char('c')), KeyOutcome::OperatorLines(Op::Change, None, None));
+    }
+
+    #[test]
+    fn dd_and_cc_counts_multiply_like_yy() {
+        let mut vk = VimKeys::new();
+        let keys = [Key::Char('2'), Key::Char('d'), Key::Char('3'), Key::Char('d')];
+        assert_eq!(last(&mut vk, &keys), KeyOutcome::OperatorLines(Op::Delete, Some(6), None));
+    }
+
+    #[test]
+    fn capital_d_resolves_directly_to_delete_line_end() {
+        let mut vk = VimKeys::new();
+        assert_eq!(vk.feed(Key::Char('D')), KeyOutcome::Operator(Op::Delete, Motion::LineEnd, None, None));
+    }
+
+    #[test]
+    fn capital_x_resolves_directly_to_delete_left() {
+        let mut vk = VimKeys::new();
+        assert_eq!(vk.feed(Key::Char('X')), KeyOutcome::Operator(Op::Delete, Motion::Left, None, None));
+    }
+
+    #[test]
+    fn lowercase_x_resolves_to_delete_char_forward() {
+        let mut vk = VimKeys::new();
+        assert_eq!(vk.feed(Key::Char('x')), KeyOutcome::DeleteCharForward { count: None, register: None });
+
+        let mut vk = VimKeys::new();
+        let keys = [Key::Char('3'), Key::Char('x')];
+        assert_eq!(last(&mut vk, &keys), KeyOutcome::DeleteCharForward { count: Some(3), register: None });
+    }
+
+    #[test]
+    fn register_prefix_threads_into_delete_change_and_delete_char_forward() {
+        let mut vk = VimKeys::new();
+        let keys = [Key::Char('"'), Key::Char('a'), Key::Char('d'), Key::Char('w')];
+        assert_eq!(
+            last(&mut vk, &keys),
+            KeyOutcome::Operator(Op::Delete, Motion::WordForward, None, Some('a'))
+        );
+
+        let mut vk = VimKeys::new();
+        let keys = [Key::Char('"'), Key::Char('b'), Key::Char('D')];
+        assert_eq!(last(&mut vk, &keys), KeyOutcome::Operator(Op::Delete, Motion::LineEnd, None, Some('b')));
+
+        let mut vk = VimKeys::new();
+        let keys = [Key::Char('"'), Key::Char('c'), Key::Char('x')];
+        assert_eq!(last(&mut vk, &keys), KeyOutcome::DeleteCharForward { count: None, register: Some('c') });
+    }
+
+    #[test]
+    fn delete_on_a_non_motion_target_still_resolves_but_is_inert_downstream() {
+        // Same reasoning as the equivalent yank test: vimkeys.rs doesn't
+        // consult motion::motion_shape, so this still becomes an
+        // Operator -- motion::motion_range is what actually rejects it.
+        let mut vk = VimKeys::new();
+        assert_eq!(vk.feed(Key::Char('d')), KeyOutcome::Pending);
+        assert_eq!(vk.feed(Key::CtrlD), KeyOutcome::Operator(Op::Delete, Motion::HalfPageDown, None, None));
+    }
+
+    #[test]
+    fn delete_invalid_continuation_aborts_and_does_not_leak() {
+        let mut vk = VimKeys::new();
+        assert_eq!(vk.feed(Key::Char('d')), KeyOutcome::Pending);
+        assert_eq!(vk.feed(Key::Char('i')), KeyOutcome::None);
+        assert_eq!(vk.feed(Key::Char('w')), KeyOutcome::Motion(Motion::WordForward, None));
+    }
+
+    #[test]
+    fn apply_delete_forward_basic_and_counted() {
+        let text: Vec<char> = "abcdef".chars().collect();
+        let (result, cursor, deleted) = apply_delete_forward(&text, 1, 1);
+        assert_eq!(result.iter().collect::<String>(), "acdef");
+        assert_eq!(cursor, 1);
+        assert_eq!(deleted, "b");
+
+        let (result, cursor, deleted) = apply_delete_forward(&text, 0, 3);
+        assert_eq!(result.iter().collect::<String>(), "def");
+        assert_eq!(cursor, 0);
+        assert_eq!(deleted, "abc");
+    }
+
+    #[test]
+    fn apply_delete_forward_deletes_the_last_character_unlike_a_clamped_motion() {
+        let text: Vec<char> = "abc".chars().collect();
+        let (result, cursor, deleted) = apply_delete_forward(&text, 2, 1);
+        assert_eq!(result.iter().collect::<String>(), "ab");
+        assert_eq!(cursor, 1);
+        assert_eq!(deleted, "c");
+    }
+
+    #[test]
+    fn apply_delete_forward_count_clamped_to_end_of_buffer() {
+        let text: Vec<char> = "abc".chars().collect();
+        let (result, cursor, deleted) = apply_delete_forward(&text, 1, 10);
+        assert_eq!(result.iter().collect::<String>(), "a");
+        assert_eq!(cursor, 0);
+        assert_eq!(deleted, "bc");
+    }
+
+    #[test]
+    fn apply_delete_forward_on_empty_buffer_is_a_no_op() {
+        let text: Vec<char> = Vec::new();
+        let (result, cursor, deleted) = apply_delete_forward(&text, 0, 1);
+        assert!(result.is_empty());
+        assert_eq!(cursor, 0);
+        assert_eq!(deleted, "");
+    }
+
+    #[test]
+    fn apply_delete_forward_zero_count_is_a_no_op() {
+        let text: Vec<char> = "abc".chars().collect();
+        let (result, cursor, deleted) = apply_delete_forward(&text, 1, 0);
+        assert_eq!(result.iter().collect::<String>(), "abc");
+        assert_eq!(cursor, 1);
+        assert_eq!(deleted, "");
     }
 }

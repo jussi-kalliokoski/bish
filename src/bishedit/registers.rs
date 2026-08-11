@@ -280,8 +280,10 @@ impl Registers {
     // real system clipboard as a side effect of `cargo test`, clobbering
     // whatever the developer had copied, and (b) collide with each other,
     // since unlike every other backend the real clipboard is genuinely
-    // global to the OS, not scoped to one `Registers` instance.
-    fn new_for_test() -> Self {
+    // global to the OS, not scoped to one `Registers` instance. `pub(crate)`
+    // rather than private: editor.rs's own test module needs this too (for
+    // its delete/change operator tests), not just this module's own tests.
+    pub(crate) fn new_for_test() -> Self {
         Registers {
             named: HashMap::new(),
             unnamed: ClipboardBackend { tool: None, fallback: RegisterValue::default() },
