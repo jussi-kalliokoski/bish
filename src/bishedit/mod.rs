@@ -9,6 +9,7 @@ pub mod fuzzy;
 pub mod highlight;
 pub mod manpages;
 pub mod motion;
+pub mod suggestion;
 pub mod vimkeys;
 
 /// The first slice of bish-edit's headless core: read-only line/cursor
