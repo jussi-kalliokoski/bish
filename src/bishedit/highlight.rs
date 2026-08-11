@@ -283,7 +283,7 @@ enum CmdPos {
 // splitting highlight_tok's existing per-kind match arms) so the reset
 // rule itself is directly unit-testable without needing to drive the
 // whole highlighter.
-fn resets_command_position(tok: &Tok) -> bool {
+pub(crate) fn resets_command_position(tok: &Tok) -> bool {
     matches!(
         tok,
         Tok::Pipe
@@ -328,7 +328,7 @@ fn is_valid_ident(s: &str) -> bool {
 // consistent with this crate's existing precedent of a small duplicated
 // helper over coupling the editor-analysis path to the execution path
 // (tokenize_spanned's own relationship to tokenize() is the same idea).
-fn is_assignment_prefix_word(chunks: &[Chunk]) -> bool {
+pub(crate) fn is_assignment_prefix_word(chunks: &[Chunk]) -> bool {
     let [Chunk::Str(s)] = chunks else { return false };
     let Some(eq) = s.find('=') else { return false };
     let name = s[..eq].strip_suffix('+').unwrap_or(&s[..eq]);
@@ -344,7 +344,7 @@ fn is_assignment_prefix_word(chunks: &[Chunk]) -> bool {
 // gap in that list's own `type`/`command -v` reporting -- not fixed
 // there, just not reproduced here, since getting *this* list right is
 // what stands between a real builtin and a false "invalid command" red).
-const KNOWN_BUILTINS: &[&str] = &[
+pub(crate) const KNOWN_BUILTINS: &[&str] = &[
     ":", "cd", "export", "let", "break", "continue", "test", "[", "[[", "return", "shift", "local", "exit", "read", "mapfile",
     "readarray", "eval", "source", ".", "trap", "jobs", "fg", "bg", "wait", "kill", "getopts", "unset", "set", "declare",
     "typeset", "readonly", "exec", "command", "type", "hash", "shopt", "umask", "pushd", "popd", "dirs", "ulimit", "alias",
@@ -371,7 +371,7 @@ fn is_valid_command_name(name: &str, ctx: &HighlightContext) -> bool {
 }
 
 #[cfg(unix)]
-fn is_executable_file(path: &Path) -> bool {
+pub(crate) fn is_executable_file(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
     match std::fs::metadata(path) {
         Ok(meta) => meta.is_file() && meta.permissions().mode() & 0o111 != 0,
@@ -380,7 +380,7 @@ fn is_executable_file(path: &Path) -> bool {
 }
 
 #[cfg(not(unix))]
-fn is_executable_file(path: &Path) -> bool {
+pub(crate) fn is_executable_file(path: &Path) -> bool {
     path.is_file()
 }
 
@@ -394,6 +394,36 @@ fn is_executable_file(path: &Path) -> bool {
 fn is_in_path(name: &str) -> bool {
     let Ok(path_var) = std::env::var("PATH") else { return false };
     path_var.split(':').any(|dir| is_executable_file(&Path::new(dir).join(name)))
+}
+
+// Command-name completion's PATH source: every executable filename on PATH
+// that starts with `prefix`, deduplicated. Filtered by prefix *before*
+// returning (not left to the caller's fuzzy step) so a single keystroke
+// never has to score every executable on the system. One read_dir per PATH
+// directory; a directory that fails to open (stale/nonexistent entry) is
+// silently skipped, same tolerance real PATH resolution already has. The
+// same name can legitimately live in multiple PATH dirs -- only the name
+// is returned, so first-found-wins is fine and a HashSet dedups it.
+pub(crate) fn enumerate_path_matches(prefix: &str) -> Vec<String> {
+    let Ok(path_var) = std::env::var("PATH") else { return Vec::new() };
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for dir in path_var.split(':') {
+        let Ok(entries) = std::fs::read_dir(dir) else { continue };
+        for entry in entries.flatten() {
+            let Ok(name) = entry.file_name().into_string() else { continue };
+            if !name.starts_with(prefix) {
+                continue;
+            }
+            if !is_executable_file(&entry.path()) {
+                continue;
+            }
+            if seen.insert(name.clone()) {
+                out.push(name);
+            }
+        }
+    }
+    out
 }
 
 // Thin wrapper: resolves `command`'s man-page data (if ready yet -- see
@@ -1330,6 +1360,45 @@ mod tests {
     fn is_valid_command_name_rejects_a_nonexistent_direct_path() {
         let ctx = HighlightContext::default();
         assert!(!is_valid_command_name("/definitely/not/a/real/path/xyz", &ctx));
+    }
+
+    // Real temp-dir fixture: prepends a stale (nonexistent) PATH entry and a
+    // real one containing an executable + a non-executable file, restoring
+    // PATH afterward. Prepending (rather than replacing) keeps the other
+    // PATH-reading tests in this module safe even if they happen to run
+    // concurrently, since every real PATH dir they depend on is still
+    // present throughout.
+    #[test]
+    fn enumerate_path_matches_filters_by_prefix_and_executable_bit() {
+        let dir = std::env::temp_dir().join(format!("bish-completion-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe_path = dir.join("bish-test-widget");
+        std::fs::write(&exe_path, b"#!/bin/sh\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&exe_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        std::fs::write(dir.join("bish-test-plain"), b"not executable").unwrap();
+
+        let original_path = std::env::var("PATH").unwrap_or_default();
+        let stale_dir = dir.join("does-not-exist-as-a-dir");
+        let new_path = format!("{}:{}:{}", stale_dir.display(), dir.display(), original_path);
+
+        let matches = {
+            // SAFETY: no other thread in this test binary spawns child
+            // processes or otherwise depends on PATH being atomically
+            // consistent across this narrow window; the value is restored
+            // before returning.
+            unsafe { std::env::set_var("PATH", &new_path) };
+            let matches = enumerate_path_matches("bish-test-w");
+            unsafe { std::env::set_var("PATH", &original_path) };
+            matches
+        };
+
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(matches, vec!["bish-test-widget".to_string()]);
     }
 
     #[test]
