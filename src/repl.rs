@@ -6,6 +6,7 @@ use std::rc::Rc;
 use crate::bishedit::completion;
 use crate::bishedit::highlight::HighlightContext;
 use crate::bishedit::motion;
+use crate::bishedit::suggestion;
 use crate::bishedit::vimkeys::{KeyOutcome, VimKeys, WindowCmd};
 use crate::bishedit::Buffer as BisheditBuffer;
 use crate::editor::{self, Key, ReadOutcome};
@@ -411,6 +412,11 @@ pub fn run(mut shell: Shell) {
         // Same owned-snapshot pattern as highlight_ctx just above -- built
         // from the exact same locals, not re-snapshotted.
         let shell_completion = completion::ShellCompletionProvider { cwd: Some(cwd_snapshot.as_path()), known_functions: Some(&known_functions) };
+        // Same pattern again -- session_history is already the exact
+        // snapshot the suggestions engine itself needs (see History's
+        // own doc comment on why a clone here is cheap: an O(1) Rc-clone
+        // of its own tail, not a copy).
+        let shell_suggestion = suggestion::HistorySuggestionProvider { history: &session_history, cwd: Some(cwd_snapshot.as_path()) };
         // Relative-cursor-row menu tricks (a later stage) are only safe on
         // a single real terminal -- a promoted/split-pane session risks
         // spilling the extra row into a neighboring pane or the tab bar.
@@ -426,6 +432,7 @@ pub fn run(mut shell: Shell) {
             width,
             highlight_ctx,
             Some(&shell_completion),
+            Some(&shell_suggestion),
             menu_capable,
             || {
                 service_background_jobs(&mut sessions, &mut windows, &mut job_frames, current_window);
@@ -2912,6 +2919,7 @@ fn run_command_mode(
             0,
             term_cols,
             HighlightContext::default(),
+            None,
             None,
             false,
             &mut || {

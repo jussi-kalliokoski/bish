@@ -19,6 +19,7 @@ use std::io::{self, Write};
 use crate::bishedit::completion::{CompletionCandidate, CompletionProvider, CompletionRequest};
 use crate::bishedit::highlight::{self, BashHighlighter, Highlighter, HighlightContext, StyledSpan};
 use crate::bishedit::motion;
+use crate::bishedit::suggestion::{SuggestionProvider, SuggestionRequest};
 use crate::bishedit::vimkeys::{self, KeyOutcome, VimKeys};
 use crate::history::History;
 use crate::term;
@@ -404,6 +405,50 @@ fn cycle_completion(ed: &mut LineEditor, state: &mut CompletionState, backward: 
     state.selected = if backward { (state.selected + n - 1) % n } else { (state.selected + 1) % n };
     let text = state.candidates[state.selected].display.clone();
     ed.splice_word(state.word_start, ed.cursor, &text);
+}
+
+// Recomputed fresh on every redraw rather than tracked across
+// keystrokes -- same no-caching reasoning as the highlighter and the
+// completion sources (fuzzy/PATH/manpages), and, more importantly, a
+// real correctness trap avoided: by the time any match arm runs, the
+// completion reset rule above it may have already cleared `completion`,
+// so recomputing a suggestion *inside* an arm could produce one in
+// exactly the keystroke where it must not exist (suggestions aren't
+// applicable while the completion menu is active). Computing once,
+// before dispatch, and treating the result purely as "what's currently
+// rendered" sidesteps that -- the value read by Right/Ctrl-Y's own arms
+// is always exactly what was just drawn.
+//
+// Gate, all of which must hold: a provider was given; no completion is
+// active (including through the single-candidate auto-fill path, which
+// leaves `completion` None once it's spliced in -- a suggestion can
+// legitimately appear right after an auto-fill completes, correctly
+// indistinguishable from ordinary typing at that point); no history
+// browse is active (Up/Down recalls a *complete* entry -- painting a
+// ghost that extends it into a *different* command would read as noise
+// while scanning, and the moment browse resets on any other key the
+// ghost returns on its own); cursor at the buffer's end (suggestions
+// are end-of-line only, see the request's own scope); buffer non-empty.
+fn compute_suggestion(ed: &LineEditor, provider: Option<&dyn SuggestionProvider>, completion_active: bool, browsing: bool) -> Option<String> {
+    let provider = provider?;
+    if completion_active || browsing || ed.buf.is_empty() || ed.cursor != ed.buf.len() {
+        return None;
+    }
+    let line = ed.as_string();
+    let suggestion = provider.suggest(SuggestionRequest { line: &line, cursor: ed.cursor })?;
+    Some(suggestion.text.chars().skip(ed.buf.len()).collect())
+}
+
+// Turns the ghost tail currently being rendered into real buffer text.
+// Only ever reachable with the cursor already at the buffer's end --
+// the sole condition under which a suggestion is computed at all -- so
+// this is a plain append with the cursor landing right after it,
+// expressed through splice_word (the same primitive completion
+// acceptance already goes through) rather than opening a second
+// insertion path.
+fn accept_suggestion(ed: &mut LineEditor, tail: &str) {
+    let end = ed.buf.len();
+    ed.splice_word(end, end, tail);
 }
 
 // `col_origin` is the real terminal column (0-indexed) this line's own
@@ -858,6 +903,10 @@ pub fn read_line(
     // as a parameter now so both repl.rs call sites only need to change
     // their argument list once.
     completion_provider: Option<&dyn CompletionProvider>,
+    // Same "`None` for no meaningful shell context" pattern as
+    // `completion_provider` just above -- command mode's colon-line
+    // passes `None` here too.
+    suggestion_provider: Option<&dyn SuggestionProvider>,
     menu_capable: bool,
     mut on_idle: impl FnMut(),
 ) -> io::Result<ReadOutcome> {
@@ -887,6 +936,11 @@ pub fn read_line(
     // needed for that case).
     let mut completion: Option<CompletionState> = None;
 
+    // The ghost tail currently being shown, if any -- see
+    // compute_suggestion's own doc comment for why this is a plain
+    // recomputed-every-redraw cache, not a persisted state machine.
+    let mut suggestion = compute_suggestion(&ed, suggestion_provider, completion.is_some(), browse.is_some());
+
     // Always goes through the same clear-and-draw redraw(), even with
     // nothing typed yet: the terminal cursor at this point may already be
     // sitting right after a compositor-frozen idle prompt for this exact
@@ -894,7 +948,16 @@ pub fn read_line(
     // print here would append a second copy right next to it instead of
     // redrawing over it. Behaviorally identical to the old bare print for
     // every non-paned caller (col_origin 0, width the whole terminal).
-    redraw_with_completion_row(prompt, &ed, "", completion.as_ref(), menu_capable, col_origin, width, ctx)?;
+    redraw_with_completion_row(
+        prompt,
+        &ed,
+        suggestion.as_deref().unwrap_or(""),
+        completion.as_ref(),
+        menu_capable,
+        col_origin,
+        width,
+        ctx,
+    )?;
 
     // Set only when Ctrl-E's or Ctrl-O's own sub-loop below reports a key
     // it didn't consume itself (Ctrl-C/D/Z -- see run_line_normal_mode/
@@ -981,6 +1044,15 @@ pub fn read_line(
                 ed.backspace();
             }
             Key::Delete => ed.delete_forward(),
+            // Right accepts the currently-shown suggestion, turning its
+            // ghost tail into real buffer text. `suggestion` is only
+            // ever Some with the cursor already at ed.buf.len(), where
+            // the move_right() below would have been a no-op anyway --
+            // so this is a strict refinement, never shadowing a real
+            // movement. Ctrl-F is deliberately excluded: the request
+            // names the right arrow specifically, and Ctrl-F stays a
+            // pure motion with no acceptance meaning of its own.
+            Key::Right if suggestion.is_some() => accept_suggestion(&mut ed, suggestion.as_deref().unwrap()),
             Key::Left | Key::CtrlB => ed.move_left(),
             Key::Right | Key::CtrlF => ed.move_right(),
             Key::Home | Key::CtrlA => ed.cursor = 0,
@@ -1088,6 +1160,12 @@ pub fn read_line(
                 LineNormalExit::ToInsert => {}
                 LineNormalExit::Propagate(k) => {
                     pending_key = Some(k);
+                    // Neither propagated key (Ctrl-C/D/Z) reads
+                    // `suggestion`, so this is inert today -- kept
+                    // anyway so "the local always matches what's
+                    // actually on screen" holds by construction rather
+                    // than by which keys happen to propagate.
+                    suggestion = None;
                     continue;
                 }
                 LineNormalExit::Eof => {
@@ -1102,6 +1180,7 @@ pub fn read_line(
             Key::CtrlO => {
                 if let Some(k) = run_one_shot_normal_command(&mut ed, &mut on_idle)? {
                     pending_key = Some(k);
+                    suggestion = None; // see Ctrl-E's own propagate arm
                     continue;
                 }
             }
@@ -1118,9 +1197,22 @@ pub fn read_line(
                 Some(state) => cycle_completion(&mut ed, state, true),
                 None => completion = completion_provider.and_then(|p| trigger_completion(&mut ed, p, true)),
             },
+            // Ctrl-Y accepts a suggestion, the same gesture completions
+            // already use for accept. Needs no end-of-line reasoning of
+            // its own -- `suggestion` is never Some anywhere else. Can't
+            // collide with completion's own Ctrl-Y accept (not a match
+            // arm at all -- see the reset rule above): a suggestion is
+            // only ever computed while completion.is_none(), so at most
+            // one of the two is ever live at once.
+            Key::CtrlY if suggestion.is_some() => accept_suggestion(&mut ed, suggestion.as_deref().unwrap()),
             Key::AltLeft | Key::AltRight | Key::AltUp | Key::CtrlY | Key::Unknown => {}
         }
-        redraw_with_completion_row(prompt, &ed, "", completion.as_ref(), menu_capable, col_origin, width, ctx)?;
+        // Recomputed fresh every iteration -- see compute_suggestion's
+        // own doc comment. Must happen after the match (so it reflects
+        // whatever the just-dispatched key actually did to the buffer/
+        // completion/browse state) and before the redraw that shows it.
+        suggestion = compute_suggestion(&ed, suggestion_provider, completion.is_some(), browse.is_some());
+        redraw_with_completion_row(prompt, &ed, suggestion.as_deref().unwrap_or(""), completion.as_ref(), menu_capable, col_origin, width, ctx)?;
     }
 }
 
