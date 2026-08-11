@@ -570,6 +570,21 @@ fn build_completion_row(state: &CompletionState) -> CompletionRow {
 // not the column redraw() already left the real cursor at -- the
 // second redraw() call is the deliberately-simple way to fix that,
 // rather than duplicating redraw()'s own column math here.
+//
+// The "move down" step is a literal `\n`, not `\x1b[1B` (Cursor Down):
+// CUD is defined to *clamp* at the terminal's bottom margin rather than
+// scroll, unlike a real linefeed. This function runs on every redraw
+// once `menu_capable` is true (to erase a stale row even with no active
+// completion), so the very first call after a prompt lands with zero
+// rows of slack below it -- exactly what happens right after a
+// command's own output scrolls the terminal -- has to guarantee a row
+// actually exists below, scrolling for it if needed, not silently fail
+// to move and let the subsequent `\x1b[1A` land back on the *previous*
+// command's just-scrolled output row instead of a blank one. (Found via
+// interactive testing: without this, that output row got silently
+// cleared and overwritten by the next prompt.) `\x1b[1A` afterward stays
+// correct either way -- by definition there's always a row above
+// wherever the linefeed left the cursor.
 fn redraw_with_completion_row(
     prompt: &str,
     ed: &LineEditor,
@@ -585,7 +600,7 @@ fn redraw_with_completion_row(
     }
 
     let mut out = String::new();
-    out.push_str("\x1b[1B");
+    out.push('\n');
     out.push_str(&format!("\x1b[{}G", col_origin + 1));
     out.push_str(&" ".repeat(width));
     out.push_str(&format!("\x1b[{}G", col_origin + 1));
