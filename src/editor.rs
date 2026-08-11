@@ -713,6 +713,29 @@ fn build_completion_row(state: &CompletionState) -> CompletionRow {
 // to the start of the row on every single keystroke (found via the
 // user's own interactive testing). One write settles directly on the
 // final state with nothing intermediate ever rendered.
+// The completion menu row's own styled content (candidate names, bold
+// matched positions, reverse-video selection), with no positioning of
+// its own -- shared by both redraw_with_completion_row's relative
+// (plain-mode) and absolute (grid-mode) paths below, which only differ
+// in *how* they get the real cursor down to this row and back.
+fn render_menu_row_content(state: &CompletionState, width: usize) -> String {
+    let row = build_completion_row(state);
+    let cells = highlight::compose(&row.chars, &[&row.bold, &row.selected]);
+    let visible: &[vt100::Cell] = if row.chars.len() <= width {
+        &cells
+    } else {
+        // Right-anchors the window on the selected candidate's own end,
+        // same shape as redraw()'s own cursor-visibility clamp for an
+        // overlong buffer -- a long candidate list stays truncated/
+        // scrolled to `width` rather than wrapping into a neighboring
+        // pane's row.
+        let window_start = row.selected_range.end.saturating_sub(width).min(row.chars.len() - width);
+        let window_end = (window_start + width).min(row.chars.len());
+        &cells[window_start..window_end]
+    };
+    highlight::render_styled(visible)
+}
+
 fn redraw_with_completion_row(
     prompt: &str,
     ed: &LineEditor,
@@ -726,35 +749,67 @@ fn redraw_with_completion_row(
     // it must NOT run on every other redraw too.
     menu_was_shown: bool,
     menu_capable: bool,
+    // `Some((prompt_row, pane_bottom_row))` in grid/promoted mode (an
+    // unsplit window only -- see read_line's own doc comment): both
+    // absolute, 0-indexed real terminal rows, computed once by repl.rs
+    // before this whole read_line call starts (from the session's own
+    // vt100::Screen cursor, which tracks correctly independent of the
+    // real-terminal scrolling ambiguity relative movement has -- see
+    // this function's own doc comment) and constant for its duration,
+    // the same way `col_origin`/`width` already are. `pane_bottom_row`
+    // is the pane's own last row, never the tab bar's -- when there's no
+    // room below `prompt_row` to fit within it, the menu is skipped
+    // entirely rather than risking a spill. `None` in plain mode (no
+    // fixed rect to know a row against -- relative movement handles it)
+    // and for command mode's colon-line (no meaningful pane context).
+    row_origin: Option<(usize, usize)>,
     col_origin: usize,
     width: usize,
     ctx: HighlightContext,
 ) -> io::Result<()> {
     let mut out = compose_redraw(prompt, ed, ghost, col_origin, width, ctx);
     if menu_capable && (completion.is_some() || menu_was_shown) {
-        out.push('\n');
-        out.push_str(&format!("\x1b[{}G", col_origin + 1));
-        out.push_str(&" ".repeat(width));
-        out.push_str(&format!("\x1b[{}G", col_origin + 1));
-        if let Some(state) = completion {
-            let row = build_completion_row(state);
-            let cells = highlight::compose(&row.chars, &[&row.bold, &row.selected]);
-            let visible: &[vt100::Cell] = if row.chars.len() <= width {
-                &cells
-            } else {
-                // Right-anchors the window on the selected candidate's
-                // own end, same shape as redraw()'s own cursor-
-                // visibility clamp for an overlong buffer -- a long
-                // candidate list stays truncated/scrolled to `width`
-                // rather than wrapping into a neighboring pane's row.
-                let window_start = row.selected_range.end.saturating_sub(width).min(row.chars.len() - width);
-                let window_end = (window_start + width).min(row.chars.len());
-                &cells[window_start..window_end]
-            };
-            out.push_str(&highlight::render_styled(visible));
+        match row_origin {
+            // Grid/promoted mode: absolute positioning only, never
+            // relative movement -- a stray real scroll here would desync
+            // the real terminal from the session's own virtual grid,
+            // corrupting the tab bar or a neighboring pane in the
+            // meantime (the same mechanism bug the Ctrl-C fix elsewhere
+            // in this codebase addresses for a different trigger).
+            // `\x1b[{row};{col}H` jumps are unambiguous regardless of
+            // terminal scroll state, so there's no dance needed at all.
+            Some((prompt_row, pane_bottom_row)) => {
+                let menu_row = prompt_row + 1;
+                if menu_row <= pane_bottom_row {
+                    out.push_str(&format!("\x1b[{};{}H", menu_row + 1, col_origin + 1));
+                    out.push_str(&" ".repeat(width));
+                    out.push_str(&format!("\x1b[{};{}H", menu_row + 1, col_origin + 1));
+                    if let Some(state) = completion {
+                        out.push_str(&render_menu_row_content(state, width));
+                    }
+                    // Absolute jump back, not \x1b[1A -- fixes both row
+                    // and column in one unambiguous move.
+                    out.push_str(&format!("\x1b[{};{}H", prompt_row + 1, col_origin + 1));
+                    out.push_str(&compose_redraw(prompt, ed, ghost, col_origin, width, ctx));
+                }
+                // else: no room below the prompt within this pane --
+                // gracefully skip showing the menu this redraw, same
+                // degradation plain mode already has when `menu_capable`
+                // is false.
+            }
+            // Plain mode: the relative-movement dance.
+            None => {
+                out.push('\n');
+                out.push_str(&format!("\x1b[{}G", col_origin + 1));
+                out.push_str(&" ".repeat(width));
+                out.push_str(&format!("\x1b[{}G", col_origin + 1));
+                if let Some(state) = completion {
+                    out.push_str(&render_menu_row_content(state, width));
+                }
+                out.push_str("\x1b[1A");
+                out.push_str(&compose_redraw(prompt, ed, ghost, col_origin, width, ctx));
+            }
         }
-        out.push_str("\x1b[1A");
-        out.push_str(&compose_redraw(prompt, ed, ghost, col_origin, width, ctx));
     }
 
     print!("{}", out);
@@ -931,6 +986,10 @@ pub fn read_line(
     // passes `None` here too.
     suggestion_provider: Option<&dyn SuggestionProvider>,
     menu_capable: bool,
+    // See redraw_with_completion_row's own doc comment on this same
+    // parameter -- threaded straight through, read_line itself never
+    // interprets it beyond passing it along to every redraw call.
+    row_origin: Option<(usize, usize)>,
     mut on_idle: impl FnMut(),
 ) -> io::Result<ReadOutcome> {
     let mut guard = Some(term::RawGuard::enable(0)?);
@@ -988,6 +1047,7 @@ pub fn read_line(
         completion.as_ref(),
         menu_was_shown,
         menu_capable,
+        row_origin,
         col_origin,
         width,
         ctx,
@@ -1254,6 +1314,7 @@ pub fn read_line(
             completion.as_ref(),
             menu_was_shown,
             menu_capable,
+            row_origin,
             col_origin,
             width,
             ctx,

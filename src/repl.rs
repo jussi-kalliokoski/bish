@@ -417,10 +417,26 @@ pub fn run(mut shell: Shell) {
         // own doc comment on why a clone here is cheap: an O(1) Rc-clone
         // of its own tail, not a copy).
         let shell_suggestion = suggestion::HistorySuggestionProvider { history: &session_history, cwd: Some(cwd_snapshot.as_path()) };
-        // Relative-cursor-row menu tricks (a later stage) are only safe on
-        // a single real terminal -- a promoted/split-pane session risks
-        // spilling the extra row into a neighboring pane or the tab bar.
-        let menu_capable = !sinks_are_grid;
+        // Relative-cursor-row menu tricks are only safe on a single real
+        // terminal -- a promoted/split-pane session risks spilling the
+        // extra row into a neighboring pane or the tab bar. Grid/promoted
+        // mode gets its own, absolute-positioned path instead (see
+        // redraw_with_completion_row's own doc comment), scoped to an
+        // *unsplit* window only for now -- a split window's own
+        // neighbor-pane clamping is a bigger, separate design, left for
+        // later. The session's own vt100::Screen cursor already tracks
+        // which row the upcoming prompt is about to occupy correctly (fed
+        // a trailing "\r\n" every time a line is submitted), with none of
+        // real-terminal relative movement's own scrolling ambiguity, so
+        // no live query is needed to learn it.
+        let row_origin = if sinks_are_grid && windows[current_window].panes.len() <= 1 {
+            let rect = pane_rect(&windows[current_window], windows[current_window].focused_pane, term_rows, term_cols);
+            let cursor_row = sessions[&session_id].screen.borrow().cursor().0;
+            Some((rect.row + cursor_row, rect.row + rect.rows - 1))
+        } else {
+            None
+        };
+        let menu_capable = !sinks_are_grid || row_origin.is_some();
 
         match editor::read_line(
             &prompt_str,
@@ -434,6 +450,7 @@ pub fn run(mut shell: Shell) {
             Some(&shell_completion),
             Some(&shell_suggestion),
             menu_capable,
+            row_origin,
             || {
                 service_background_jobs(&mut sessions, &mut windows, &mut job_frames, current_window);
             },
@@ -2933,6 +2950,7 @@ fn run_command_mode(
             None,
             None,
             false,
+            None,
             &mut || {
                 service_background_jobs(sessions, windows, job_frames, current_window);
             },
