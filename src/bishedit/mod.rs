@@ -9,6 +9,7 @@ pub mod fuzzy;
 pub mod highlight;
 pub mod manpages;
 pub mod motion;
+pub mod registers;
 pub mod suggestion;
 pub mod vimkeys;
 
