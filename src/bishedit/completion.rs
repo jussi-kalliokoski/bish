@@ -6,8 +6,12 @@
 // candidate sources are a later stage in this same file.
 #![allow(dead_code)]
 
-use crate::bishedit::highlight::{is_assignment_prefix_word, resets_command_position};
+use crate::bishedit::fuzzy;
+use crate::bishedit::highlight::{self, is_assignment_prefix_word, resets_command_position, KNOWN_BUILTINS};
+use crate::bishedit::manpages;
 use crate::lexer::{self, Chunk, SpannedItem, Tok};
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct CompletionCandidate {
@@ -107,6 +111,162 @@ pub(crate) fn classify_word_role(prefix_text: &str) -> CmdRole {
     }
 }
 
+// Fuzzy-scores and ranks `names` against `prefix`, dropping non-matches
+// (fuzzy::fuzzy_match already handles "does this even qualify"). Ties
+// break alphabetically for a stable, predictable order rather than
+// insertion order, which would otherwise vary source to source (HashSet
+// iteration for command names, read_dir order for files).
+fn rank(prefix: &str, names: Vec<String>) -> Vec<CompletionCandidate> {
+    let mut scored: Vec<(i32, CompletionCandidate)> = names
+        .into_iter()
+        .filter_map(|name| {
+            fuzzy::fuzzy_match(prefix, &name)
+                .map(|m| (m.score, CompletionCandidate { display: name, matched_positions: m.positions }))
+        })
+        .collect();
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.display.cmp(&b.1.display)));
+    scored.into_iter().map(|(_, c)| c).collect()
+}
+
+// Thin wrapper: resolves `command`'s man-page data if ready (None
+// otherwise -- Pending/Missing both mean "nothing to offer yet"), mirroring
+// highlight.rs's own classify_plain_argument's identical resolve-then-
+// delegate shape.
+fn ready_man_data(command: &str) -> Option<std::sync::Arc<manpages::ManPageData>> {
+    match manpages::query(command) {
+        manpages::ManStatus::Ready(data) => Some(data),
+        manpages::ManStatus::Pending | manpages::ManStatus::Missing => None,
+    }
+}
+
+// Takes the man data directly rather than going through the real
+// cache/thread -- the seam this module's own tests use to stay
+// deterministic without spawning `man`, matching
+// classify_plain_argument_core's own precedent in highlight.rs.
+fn flag_candidates_core(man: Option<&manpages::ManPageData>, prefix: &str) -> Vec<CompletionCandidate> {
+    let Some(man) = man else { return Vec::new() };
+    rank(prefix, man.flags.clone())
+}
+
+// None means "no usable subcommand data" -- the caller's cue to fall
+// through to file candidates instead, per this feature's "arg 0 without
+// subcommand data completes as a file" rule.
+fn subcommand_candidates_core(man: Option<&manpages::ManPageData>, prefix: &str) -> Option<Vec<CompletionCandidate>> {
+    let man = man?;
+    if man.subcommands.is_empty() {
+        return None;
+    }
+    Some(rank(prefix, man.subcommands.clone()))
+}
+
+// The shell's own built-in completion source, built entirely on
+// infrastructure the highlighting feature already established:
+// KNOWN_BUILTINS/known_functions/enumerate_path_matches for command names,
+// manpages::query for subcommands and flags (same cache the highlighter
+// itself populates, so a command that's already been typed once tends to
+// have `Ready` data by the time its own completion is requested), and a
+// single-level `read_dir` for files. `cwd`/`known_functions` are the same
+// owned-snapshot pattern HighlightContext already uses -- borrowed here,
+// not re-snapshotted, since the caller already did that work.
+pub struct ShellCompletionProvider<'a> {
+    pub cwd: Option<&'a Path>,
+    pub known_functions: Option<&'a HashSet<String>>,
+}
+
+impl<'a> CompletionProvider for ShellCompletionProvider<'a> {
+    fn complete(&self, req: CompletionRequest) -> CompletionResult {
+        let chars: Vec<char> = req.line.chars().collect();
+        let cursor = req.cursor.min(chars.len());
+        let word_start = find_word_start(&chars, cursor);
+        let prefix: String = chars[word_start..cursor].iter().collect();
+        let prefix_text: String = chars[..word_start].iter().collect();
+
+        let candidates = match classify_word_role(&prefix_text) {
+            CmdRole::Command => self.command_name_candidates(&prefix),
+            CmdRole::Argument { command, .. } if prefix.starts_with('-') => self.flag_candidates(command.as_deref(), &prefix),
+            CmdRole::Argument { command, arg_index: 0 } => self.subcommand_or_file_candidates(command.as_deref(), &prefix),
+            CmdRole::Argument { .. } => self.file_candidates(&prefix),
+        };
+
+        CompletionResult { word_start, candidates }
+    }
+}
+
+impl<'a> ShellCompletionProvider<'a> {
+    // KNOWN_BUILTINS union known_functions union PATH -- deliberately
+    // excludes aliases; see HighlightContext::known_functions's own doc
+    // comment for why an alias name isn't safe to offer as "this will
+    // run" here (this shell's `alias` builtin never expands them at
+    // command-run time).
+    fn command_name_candidates(&self, prefix: &str) -> Vec<CompletionCandidate> {
+        let mut names: HashSet<String> = KNOWN_BUILTINS.iter().map(|s| s.to_string()).collect();
+        if let Some(functions) = self.known_functions {
+            names.extend(functions.iter().cloned());
+        }
+        names.extend(highlight::enumerate_path_matches(prefix));
+        rank(prefix, names.into_iter().collect())
+    }
+
+    // Flags only, never falling through to subcommands/files even on a
+    // miss -- exact parity with classify_plain_argument_core's own
+    // flag-never-falls-through rule in highlight.rs. No command name, or
+    // no ready man-page data yet, just yields nothing (not files: a
+    // `-`-shaped word is never meaningfully a file path either).
+    fn flag_candidates(&self, command: Option<&str>, prefix: &str) -> Vec<CompletionCandidate> {
+        let Some(cmd) = command else { return Vec::new() };
+        flag_candidates_core(ready_man_data(cmd).as_deref(), prefix)
+    }
+
+    // arg_index == 0, non-flag: subcommands if the man page actually has
+    // subcommand data, else falls through to files -- this is the `git
+    // co` case (manpages::query("git") is likely already `Ready` from
+    // highlighting the same line).
+    fn subcommand_or_file_candidates(&self, command: Option<&str>, prefix: &str) -> Vec<CompletionCandidate> {
+        if let Some(cmd) = command {
+            if let Some(candidates) = subcommand_candidates_core(ready_man_data(cmd).as_deref(), prefix) {
+                return candidates;
+            }
+        }
+        self.file_candidates(prefix)
+    }
+
+    // Splits `prefix` at its last '/' into a directory part (kept as a
+    // literal prefix of every candidate's own display string, so the
+    // returned candidates are always the *whole* replacement word, e.g.
+    // "src/fuzzy.rs" not just "fuzzy.rs") and resolves that directory
+    // against `cwd` if relative. Exactly one read_dir -- no recursion,
+    // the explicit "just the explicitly typed level" scope limit.
+    // Directories get a trailing '/' appended, both a UX convention and
+    // what invites pressing Tab again for the next level rather than this
+    // feature ever walking ahead on its own. Matching the full `prefix`
+    // against the full display (rather than just the trailing segment)
+    // works out naturally: the directory part is a literal prefix of
+    // both, so it always matches contiguously at the front, and the fuzzy
+    // step only has real work left to do on the filename itself.
+    fn file_candidates(&self, prefix: &str) -> Vec<CompletionCandidate> {
+        let Some(cwd) = self.cwd else { return Vec::new() };
+        let dir_part = match prefix.rfind('/') {
+            Some(idx) => &prefix[..idx + 1],
+            None => "",
+        };
+        let dir_path = if dir_part.is_empty() {
+            cwd.to_path_buf()
+        } else if Path::new(dir_part).is_absolute() {
+            PathBuf::from(dir_part)
+        } else {
+            cwd.join(dir_part)
+        };
+        let Ok(entries) = std::fs::read_dir(&dir_path) else { return Vec::new() };
+        let mut names = Vec::new();
+        for entry in entries.flatten() {
+            let Ok(name) = entry.file_name().into_string() else { continue };
+            let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+            names.push(format!("{dir_part}{name}{}", if is_dir { "/" } else { "" }));
+        }
+        rank(prefix, names)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -168,5 +328,132 @@ mod tests {
         // $(...) is documented out-of-scope for a guaranteed-correct
         // answer here -- only that this stays inert.
         let _ = classify_word_role("echo $(git chec");
+    }
+
+    fn display_names(candidates: Vec<CompletionCandidate>) -> Vec<String> {
+        candidates.into_iter().map(|c| c.display).collect()
+    }
+
+    #[test]
+    fn command_name_candidates_includes_known_builtins_matching_prefix() {
+        let provider = ShellCompletionProvider { cwd: None, known_functions: None };
+        let names = display_names(provider.command_name_candidates("ech"));
+        assert!(names.iter().any(|n| n == "echo"), "{names:?}");
+    }
+
+    #[test]
+    fn command_name_candidates_includes_a_known_function() {
+        // A deliberately unusual prefix (not just "my") -- this
+        // environment's real PATH (WSL interop with Windows system32)
+        // can contain unrelated executables matching short, common
+        // prefixes, which would make the assertion flaky.
+        let mut functions = HashSet::new();
+        functions.insert("zz_bish_test_func".to_string());
+        let provider = ShellCompletionProvider { cwd: None, known_functions: Some(&functions) };
+        let names = display_names(provider.command_name_candidates("zz_bish_test"));
+        assert_eq!(names, vec!["zz_bish_test_func".to_string()]);
+    }
+
+    #[test]
+    fn command_name_candidates_includes_a_real_path_executable() {
+        // coreutils -- same real-PATH assumption this whole feature
+        // already leans on elsewhere (highlight.rs's own is_in_path
+        // tests).
+        let provider = ShellCompletionProvider { cwd: None, known_functions: None };
+        let names = display_names(provider.command_name_candidates("tru"));
+        assert!(names.iter().any(|n| n == "true"), "{names:?}");
+    }
+
+    #[test]
+    fn flag_candidates_core_ranks_flags_by_prefix() {
+        let man = manpages::ManPageData {
+            flags: vec!["-l".to_string(), "--long".to_string(), "-a".to_string()],
+            subcommands: vec![],
+        };
+        let names = display_names(flag_candidates_core(Some(&man), "-l"));
+        assert_eq!(names, vec!["-l".to_string(), "--long".to_string()]);
+    }
+
+    #[test]
+    fn flag_candidates_core_yields_nothing_without_man_data() {
+        assert_eq!(flag_candidates_core(None, "-l"), Vec::new());
+    }
+
+    #[test]
+    fn subcommand_candidates_core_returns_none_when_page_has_no_subcommands() {
+        let man = manpages::ManPageData { flags: vec!["-l".to_string()], subcommands: vec![] };
+        assert_eq!(subcommand_candidates_core(Some(&man), "co"), None);
+        assert_eq!(subcommand_candidates_core(None, "co"), None);
+    }
+
+    // The plan's own literal worked example, via canned man-page data
+    // (never spawns real `man`): commit/config/count-objects should all
+    // rank above checkout for the query "co".
+    #[test]
+    fn subcommand_candidates_core_git_co_worked_example() {
+        let man = manpages::ManPageData {
+            flags: vec![],
+            subcommands: vec!["commit".to_string(), "config".to_string(), "count-objects".to_string(), "checkout".to_string()],
+        };
+        let names = display_names(subcommand_candidates_core(Some(&man), "co").unwrap());
+        assert_eq!(names.last().map(String::as_str), Some("checkout"), "{names:?}");
+        let leaders = &names[..names.len() - 1];
+        assert!(leaders.iter().any(|n| n == "commit"), "{names:?}");
+        assert!(leaders.iter().any(|n| n == "config"), "{names:?}");
+        assert!(leaders.iter().any(|n| n == "count-objects"), "{names:?}");
+    }
+
+    // Real temp-dir fixture, self-cleaning: one subdirectory and one
+    // regular file sharing a prefix, confirming both the prefix filter and
+    // the directory-gets-a-trailing-slash convention.
+    #[test]
+    fn file_candidates_lists_a_real_directory_with_prefix_filter_and_dir_slash() {
+        let dir = std::env::temp_dir().join(format!("bish-completion-files-test-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("widgets")).unwrap();
+        std::fs::write(dir.join("widget-notes.txt"), b"hi").unwrap();
+        std::fs::write(dir.join("unrelated.txt"), b"hi").unwrap();
+
+        let provider = ShellCompletionProvider { cwd: Some(&dir), known_functions: None };
+        let names = display_names(provider.file_candidates("widg"));
+
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(names.len(), 2, "{names:?}");
+        assert!(names.iter().any(|n| n == "widgets/"), "{names:?}");
+        assert!(names.iter().any(|n| n == "widget-notes.txt"), "{names:?}");
+        assert!(!names.iter().any(|n| n == "unrelated.txt"), "{names:?}");
+    }
+
+    #[test]
+    fn file_candidates_yields_nothing_without_a_cwd() {
+        let provider = ShellCompletionProvider { cwd: None, known_functions: None };
+        assert_eq!(provider.file_candidates("anything"), Vec::new());
+    }
+
+    #[test]
+    fn complete_dispatches_bare_prefix_to_command_names() {
+        let provider = ShellCompletionProvider { cwd: None, known_functions: None };
+        let result = provider.complete(CompletionRequest { line: "ech", cursor: 3 });
+        assert_eq!(result.word_start, 0);
+        let names = display_names(result.candidates);
+        assert!(names.iter().any(|n| n == "echo"), "{names:?}");
+    }
+
+    #[test]
+    fn complete_dispatches_argument_of_unknown_command_to_files() {
+        let dir = std::env::temp_dir().join(format!("bish-completion-complete-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("readme.txt"), b"hi").unwrap();
+
+        let provider = ShellCompletionProvider { cwd: Some(&dir), known_functions: None };
+        let line = "some-dynamic-cmd read";
+        let result = provider.complete(CompletionRequest { line, cursor: line.chars().count() });
+        let word_start = result.word_start;
+        let names = display_names(result.candidates);
+
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(word_start, "some-dynamic-cmd ".chars().count());
+        assert_eq!(names, vec!["readme.txt".to_string()]);
     }
 }
