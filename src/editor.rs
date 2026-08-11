@@ -440,7 +440,7 @@ fn cycle_completion(ed: &mut LineEditor, state: &mut CompletionState, backward: 
 // to in a narrow terminal -- recomputed fresh on every redraw from the
 // cursor's current position, not a persisted scroll offset.
 fn redraw(prompt: &str, ed: &LineEditor, col_origin: usize, width: usize, ctx: HighlightContext) -> io::Result<()> {
-    print!("{}", compose_redraw(prompt, ed, col_origin, width, ctx));
+    print!("{}", compose_redraw(prompt, ed, "", col_origin, width, ctx));
     io::stdout().flush()
 }
 
@@ -453,7 +453,14 @@ fn redraw(prompt: &str, ed: &LineEditor, col_origin: usize, width: usize, ctx: H
 // showing up as the cursor briefly jumping to the start of the row on
 // every keystroke. One write, one flush, matches this function's own
 // original design intent (build the whole string first, print it once).
-fn compose_redraw(prompt: &str, ed: &LineEditor, col_origin: usize, width: usize, ctx: HighlightContext) -> String {
+//
+// `ghost`: a suggestion's full, untruncated dimmed tail, rendered right
+// after the real buffer -- empty for every caller except read_line's
+// own suggestion support, and only ever non-empty when
+// `ed.cursor == ed.buf.len()` (the caller's own gate; not re-asserted
+// here). Truncated to fit *here*, not by the caller -- see the
+// `ghost_room` computation below.
+fn compose_redraw(prompt: &str, ed: &LineEditor, ghost: &str, col_origin: usize, width: usize, ctx: HighlightContext) -> String {
     let mut out = String::new();
     out.push_str(&format!("\x1b[{}G", col_origin + 1));
     out.push_str(&" ".repeat(width));
@@ -493,11 +500,44 @@ fn compose_redraw(prompt: &str, ed: &LineEditor, col_origin: usize, width: usize
             StyledSpan { start: s.start, end: s.end, fg, attrs }
         })
         .collect();
-    let cells = highlight::compose(&ed.buf, &[&styled]);
 
-    if ed.buf.len() <= remaining {
+    // `combined` is the real buffer plus as much of the ghost tail as
+    // fits in whatever's left after the buffer -- truncated here
+    // (rather than trusting the caller to have already done it) since
+    // `remaining` is only known once the prompt's own width is
+    // accounted for, right here. Zero room (an already-overlong buffer)
+    // silently drops the whole ghost rather than wrapping it into a
+    // neighboring pane's row -- a deliberate v1 simplification, not a
+    // caller contract that could be violated. Styled as two layers over
+    // one char slice -- highlight::compose already supports this (a
+    // later layer wins per-cell), so the ghost needs no new
+    // presentation machinery of its own. With ghost == "" (or zero
+    // room) this is byte-for-byte the old ed.buf-only behavior:
+    // combined == ed.buf, the ghost layer is empty, nothing changes.
+    let ghost_room = remaining.saturating_sub(ed.buf.len());
+    let mut combined = ed.buf.clone();
+    combined.extend(ghost.chars().take(ghost_room));
+    let ghost_layer = if combined.len() == ed.buf.len() {
+        Vec::new()
+    } else {
+        // Same (fg, attrs) pair default_style(HighlightKind::Comment)
+        // already uses -- this codebase's existing "greyed out" convention.
+        vec![StyledSpan {
+            start: ed.buf.len(),
+            end: combined.len(),
+            fg: vt100::Color::Indexed(8),
+            attrs: vt100::CellAttrs { dim: true, ..vt100::CellAttrs::default() },
+        }]
+    };
+    let cells = highlight::compose(&combined, &[&styled, &ghost_layer]);
+
+    if combined.len() <= remaining {
         out.push_str(&highlight::render_styled(&cells));
-        let back = ed.buf.len() - ed.cursor;
+        // Walks the real cursor back past the ghost tail (present or
+        // not) to land right after the real buffer, at ed.cursor's own
+        // position -- cursor-wise, the ghost doesn't exist. With no
+        // ghost this is exactly the old `ed.buf.len() - ed.cursor`.
+        let back = combined.len() - ed.cursor;
         if back > 0 {
             out.push_str(&format!("\x1b[{}D", back));
         }
@@ -506,7 +546,11 @@ fn compose_redraw(prompt: &str, ed: &LineEditor, col_origin: usize, width: usize
         // would otherwise fall outside what's currently shown --
         // clamped so the window never scrolls past showing the
         // buffer's own tail once the cursor's at or past the end
-        // (typing forward, by far the common case).
+        // (typing forward, by far the common case). Unreachable with a
+        // non-empty ghost in practice (the caller never truncates a
+        // ghost to fit only to have combined still overflow), but the
+        // math here is unaffected either way since it only ever
+        // references ed.buf/ed.cursor, never `combined`.
         let window_start = ed.cursor.saturating_sub(remaining - 1).min(ed.buf.len() - remaining);
         let window_end = (window_start + remaining).min(ed.buf.len());
         out.push_str(&highlight::render_styled(&cells[window_start..window_end]));
@@ -611,13 +655,14 @@ fn build_completion_row(state: &CompletionState) -> CompletionRow {
 fn redraw_with_completion_row(
     prompt: &str,
     ed: &LineEditor,
+    ghost: &str,
     completion: Option<&CompletionState>,
     menu_capable: bool,
     col_origin: usize,
     width: usize,
     ctx: HighlightContext,
 ) -> io::Result<()> {
-    let mut out = compose_redraw(prompt, ed, col_origin, width, ctx);
+    let mut out = compose_redraw(prompt, ed, ghost, col_origin, width, ctx);
     if menu_capable {
         out.push('\n');
         out.push_str(&format!("\x1b[{}G", col_origin + 1));
@@ -641,7 +686,7 @@ fn redraw_with_completion_row(
             out.push_str(&highlight::render_styled(visible));
         }
         out.push_str("\x1b[1A");
-        out.push_str(&compose_redraw(prompt, ed, col_origin, width, ctx));
+        out.push_str(&compose_redraw(prompt, ed, ghost, col_origin, width, ctx));
     }
 
     print!("{}", out);
@@ -849,7 +894,7 @@ pub fn read_line(
     // print here would append a second copy right next to it instead of
     // redrawing over it. Behaviorally identical to the old bare print for
     // every non-paned caller (col_origin 0, width the whole terminal).
-    redraw_with_completion_row(prompt, &ed, completion.as_ref(), menu_capable, col_origin, width, ctx)?;
+    redraw_with_completion_row(prompt, &ed, "", completion.as_ref(), menu_capable, col_origin, width, ctx)?;
 
     // Set only when Ctrl-E's or Ctrl-O's own sub-loop below reports a key
     // it didn't consume itself (Ctrl-C/D/Z -- see run_line_normal_mode/
@@ -1075,7 +1120,7 @@ pub fn read_line(
             },
             Key::AltLeft | Key::AltRight | Key::AltUp | Key::CtrlY | Key::Unknown => {}
         }
-        redraw_with_completion_row(prompt, &ed, completion.as_ref(), menu_capable, col_origin, width, ctx)?;
+        redraw_with_completion_row(prompt, &ed, "", completion.as_ref(), menu_capable, col_origin, width, ctx)?;
     }
 }
 
@@ -1292,5 +1337,69 @@ mod tests {
     #[test]
     fn decode_csi_final_unrecognized_final_byte_is_unknown() {
         assert_eq!(decode_csi_final("", b'Q'), Key::Unknown);
+    }
+
+    fn make_editor(text: &str, cursor: usize) -> LineEditor {
+        LineEditor { buf: text.chars().collect(), cursor }
+    }
+
+    #[test]
+    fn ghost_text_appears_in_the_composed_output() {
+        let ed = make_editor("ls", 2);
+        let out = compose_redraw("$ ", &ed, " -la", 0, 40, HighlightContext::default());
+        assert!(out.contains(" -la"), "{out:?}");
+    }
+
+    #[test]
+    fn ghost_uses_the_existing_dim_grey_convention() {
+        // Same (Indexed(8), dim) pair default_style(HighlightKind::Comment)
+        // already uses -- vt100::sgr_codes turns that into "0;2;90".
+        let ed = make_editor("ls", 2);
+        let out = compose_redraw("$ ", &ed, " -la", 0, 40, HighlightContext::default());
+        assert!(out.contains("\x1b[0;2;90m"), "{out:?}");
+    }
+
+    #[test]
+    fn cursor_walks_back_past_the_ghost_tail() {
+        let ed = make_editor("ls", 2);
+        let ghost = " -la";
+        let out = compose_redraw("$ ", &ed, ghost, 0, 40, HighlightContext::default());
+        assert!(out.contains(&format!("\x1b[{}D", ghost.chars().count())), "{out:?}");
+    }
+
+    // Regression guard for the branch-test swap from `ed.buf.len() <=
+    // remaining` to `combined.len() <= remaining`: with no ghost,
+    // combined must equal ed.buf exactly, producing byte-for-byte the
+    // same output as before this feature existed -- no stray dim
+    // styling, no extra cursor-walk distance beyond the ordinary
+    // buf.len() - cursor case (which is 0 here, cursor already at the end).
+    #[test]
+    fn empty_ghost_changes_nothing() {
+        let ed = make_editor("ls", 2);
+        let out = compose_redraw("$ ", &ed, "", 0, 40, HighlightContext::default());
+        assert!(!out.contains("\x1b[0;2;90m"), "{out:?}");
+        assert!(!out.contains('D'), "{out:?}");
+    }
+
+    #[test]
+    fn ghost_longer_than_remaining_width_truncates_rather_than_wrapping() {
+        // prompt "$ " (2 cols) + width 6 -> remaining 4; buffer "ls" (2
+        // chars) leaves exactly 2 columns of room. A 10-char ghost must
+        // be cut down to those 2 chars, not spill past the pane's width.
+        let ed = make_editor("ls", 2);
+        let out = compose_redraw("$ ", &ed, "0123456789", 0, 6, HighlightContext::default());
+        assert!(out.contains("01"), "{out:?}");
+        assert!(!out.contains("0123"), "{out:?}");
+    }
+
+    #[test]
+    fn overlong_buffer_suppresses_the_ghost_entirely() {
+        // The buffer alone already exceeds `remaining` -- compose_redraw
+        // takes the horizontal-scroll branch, which never has any room
+        // left for a ghost tail at all.
+        let ed = make_editor("a very long command line", 25);
+        let out = compose_redraw("$ ", &ed, "ignored-ghost", 0, 10, HighlightContext::default());
+        assert!(!out.contains("ignored-ghost"), "{out:?}");
+        assert!(!out.contains("\x1b[0;2;90m"), "{out:?}");
     }
 }
