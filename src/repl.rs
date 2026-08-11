@@ -2146,12 +2146,18 @@ fn scroll_to_show_cursor(buf: &mut ScreenBuffer) {
     }
 }
 
-fn render_normal_mode_row(out: &mut String, buf: &ScreenBuffer, line: usize, cols: usize) {
+// `search_matches`: (start, end) char-column ranges on this one row to
+// render in reverse video -- vim's own `hlsearch` treatment, and the same
+// mechanism (toggling `CellAttrs::reverse`) editor.rs's own Ctrl-E search
+// highlighting uses. Applied by flipping the bit on whatever attrs a cell
+// already carries (e.g. `ls --color` output keeps its own fg/bg, just
+// with reverse forced on) rather than replacing them outright.
+fn render_normal_mode_row(out: &mut String, buf: &ScreenBuffer, line: usize, cols: usize, search_matches: &[(usize, usize)]) {
     let mut last: Option<(vt100::Color, vt100::Color, vt100::CellAttrs)> = None;
     let s = buf.screen.borrow();
     let sb_len = s.scrollback.len();
     for c in 0..cols {
-        let cell = if line < sb_len {
+        let mut cell = if line < sb_len {
             s.scrollback[line].get(c).copied().unwrap_or_default()
         } else {
             let row = line - sb_len;
@@ -2162,6 +2168,9 @@ fn render_normal_mode_row(out: &mut String, buf: &ScreenBuffer, line: usize, col
                 vt100::Cell::default()
             }
         };
+        if search_matches.iter().any(|&(start, end)| c >= start && c < end) {
+            cell.attrs.reverse = true;
+        }
         let key = (cell.fg, cell.bg, cell.attrs);
         if last != Some(key) {
             out.push_str(&vt100::sgr_codes(cell.fg, cell.bg, cell.attrs));
@@ -2232,6 +2241,27 @@ fn normal_mode_status_text(buf: &ScreenBuffer, vk: &VimKeys, command_line: Optio
     text
 }
 
+// The search pattern to highlight (see render_normal_mode_row's own doc
+// comment) -- the in-progress `/`/`?` text while one is being typed
+// (incsearch-style live feedback for free), else the last resolved
+// search's own pattern, else nothing. Same rule editor.rs's own
+// normal_mode_prompt_and_matches uses for Ctrl-E's line-local Normal
+// mode, duplicated rather than shared: the two contexts drive different
+// `Buffer` impls (`LineBuffer` there, `ScreenBuffer` here), and this is
+// only a few lines either way.
+fn active_search_pattern(vk: &VimKeys, buf: &ScreenBuffer) -> Option<String> {
+    let pending = vk.pending_display();
+    if let Some(rest) = pending.strip_prefix('/').or_else(|| pending.strip_prefix('?')) {
+        return if rest.is_empty() { None } else { Some(rest.to_string()) };
+    }
+    if vk.last_search_is_word() {
+        motion::word_under_cursor(buf, buf.cursor())
+    } else {
+        let text = vk.last_search_text();
+        if text.is_empty() { None } else { Some(text.to_string()) }
+    }
+}
+
 // Draws `buf`'s current viewport plus a one-row status bar into `rect`
 // (the focused pane's own rectangle -- see pane_rect), reusing sgr_codes
 // the same way render_row does for a live pane. Lines past the end of
@@ -2245,12 +2275,22 @@ fn normal_mode_status_text(buf: &ScreenBuffer, vk: &VimKeys, command_line: Optio
 fn render_normal_mode_frame(buf: &ScreenBuffer, rect: Rect, vk: &VimKeys, command_line: Option<&str>) {
     let content_rows = normal_mode_content_rows(rect);
     let total = buf.line_count();
+    let pattern = active_search_pattern(vk, buf);
     let mut out = String::new();
     for r in 0..content_rows {
         let line = buf.viewport_top() + r;
         out.push_str(&format!("\x1b[{};{}H", rect.row + r + 1, rect.col + 1));
         if line < total {
-            render_normal_mode_row(&mut out, buf, line, rect.cols);
+            // Only the currently-visible rows are ever scanned for
+            // matches -- correct, not just an optimization: a match
+            // outside the viewport can't be seen either way, and this
+            // avoids scanning potentially large scrollback on every
+            // redraw.
+            let matches = match &pattern {
+                Some(p) => motion::find_matches_in_line(buf, line, p),
+                None => Vec::new(),
+            };
+            render_normal_mode_row(&mut out, buf, line, rect.cols, &matches);
         } else {
             out.push_str(&" ".repeat(rect.cols));
         }
