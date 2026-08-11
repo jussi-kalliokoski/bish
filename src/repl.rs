@@ -636,18 +636,23 @@ pub fn run(mut shell: Shell) {
                     match Lexer::new(&session.buffer).tokenize() {
                         Ok(toks) => match Parser::new(toks).parse_program() {
                             Ok(prog) => {
+                                // Snapshotted before recording (not just
+                                // before running) so record() can tag this
+                                // entry with the directory it's about to
+                                // run in, for the suggestions engine's
+                                // directory/sequence heuristic -- also
+                                // still used below exactly as before, to
+                                // detect a directory change regardless of
+                                // how it happened (a literal `cd`, a
+                                // function that cd's, whatever) rather
+                                // than only hooking the `cd` builtin
+                                // itself.
+                                let cwd_before = session.shell.cwd.clone();
                                 // Recorded regardless of the exit status
                                 // the command ends up with -- bash and
                                 // fish both record what was typed, not
                                 // what succeeded.
-                                session.history.record(&session.buffer);
-                                // Snapshotted so a directory change gets
-                                // picked up (see push_dir_history below)
-                                // regardless of how it happened -- a
-                                // literal `cd`, a function that cd's,
-                                // whatever -- rather than only hooking
-                                // the `cd` builtin itself.
-                                let cwd_before = session.shell.cwd.clone();
+                                session.history.record(&session.buffer, Some(&cwd_before));
                                 let result = session.shell.run_program(&prog);
                                 if session.shell.cwd != cwd_before {
                                     push_dir_history(session, session.shell.cwd.clone());
@@ -2992,7 +2997,15 @@ fn run_command_mode(
                                 sessions[&session_id].shell.sink_err(&format!("bish: {}\n", msg));
                                 buffer.clear();
                             } else {
-                                history.record(&buffer);
+                                // No meaningful shell context here -- this
+                                // is command mode's own, entirely
+                                // separate history of window-management
+                                // commands, not shell command lines, so
+                                // there's no cwd worth tagging it with
+                                // (same reasoning its own read_line call
+                                // already uses for HighlightContext::default()
+                                // and a None completion provider).
+                                history.record(&buffer, None);
                                 let (result, captured_text) = {
                                     let session = sessions.get_mut(&session_id).unwrap();
                                     let captured = Rc::new(RefCell::new(String::new()));

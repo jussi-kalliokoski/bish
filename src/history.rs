@@ -30,12 +30,36 @@
 // clone), so every fork still appends to the identical file, just with
 // an independently-diverging in-memory view.
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
+// `cwd` lands ahead of its consumer -- the suggestions engine
+// (bishedit::suggestion) wires it in as its own, later stage -- same
+// "build the seam, wire it in later" pattern already used elsewhere in
+// this codebase (manpages.rs, lexer.rs's SpannedItem).
+#[allow(dead_code)]
 struct Node {
     entry: String,
+    // The directory this entry was recorded from -- None for anything
+    // loaded from the history file (load() never has a cwd to attach;
+    // persistence for this field is deliberately deferred, see
+    // HistoryEntry's own doc comment on prev for why the same "we
+    // genuinely don't know" gate matters for sequence tracking too).
+    cwd: Option<PathBuf>,
     prev: Option<Rc<Node>>,
+}
+
+// A directory-aware, borrowed view of one entry -- see History::entries.
+// Unused until the suggestions engine's own stage wires it in.
+#[allow(dead_code)]
+pub struct HistoryEntry<'a> {
+    pub text: &'a str,
+    pub cwd: Option<&'a Path>,
+    // The entry run immediately before this one, and ONLY when both it
+    // and this one were recorded live in this session's own chain -- see
+    // entries()'s own doc comment for why disk-loaded entries never get
+    // one, even though the underlying Node chain technically links them.
+    pub prev: Option<&'a str>,
 }
 
 // Clone is a plain, cheap Rc-clone of `tail` (identical to fork() below)
@@ -58,7 +82,7 @@ impl History {
         if let Some(p) = &path {
             if let Ok(content) = std::fs::read_to_string(p) {
                 for line in content.lines() {
-                    tail = Some(Rc::new(Node { entry: unescape(line), prev: tail.take() }));
+                    tail = Some(Rc::new(Node { entry: unescape(line), cwd: None, prev: tail.take() }));
                 }
             }
         }
@@ -82,14 +106,20 @@ impl History {
     // fish's full re-dedup-and-move-to-front, but keeps the common
     // "pressed enter on the same command twice" case from cluttering
     // history, which is what this is mainly for.
-    pub fn record(&mut self, entry: &str) {
+    //
+    // `cwd`: the directory this command is about to run in, for the
+    // suggestions engine's directory/sequence heuristic (see
+    // HistoryEntry) -- None for callers with no meaningful shell context
+    // (command mode's own, entirely separate history instance, which
+    // isn't used for shell-command suggestions at all).
+    pub fn record(&mut self, entry: &str, cwd: Option<&Path>) {
         if entry.trim().is_empty() {
             return;
         }
         if self.tail.as_ref().map(|n| n.entry.as_str()) == Some(entry) {
             return;
         }
-        self.tail = Some(Rc::new(Node { entry: entry.to_string(), prev: self.tail.take() }));
+        self.tail = Some(Rc::new(Node { entry: entry.to_string(), cwd: cwd.map(Path::to_path_buf), prev: self.tail.take() }));
         if let Some(p) = &self.path {
             if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(p) {
                 let _ = writeln!(f, "{}", escape(entry));
@@ -109,6 +139,35 @@ impl History {
         let mut cur = &self.tail;
         while let Some(node) = cur {
             v.push(node.entry.as_str());
+            cur = &node.prev;
+        }
+        v.reverse();
+        v
+    }
+
+    // A directory-aware, oldest-first view for the suggestions engine
+    // (bishedit::suggestion), which needs more than to_vec()'s bare
+    // strings: which directory an entry ran in, and what immediately
+    // preceded it. Re-walked fresh every call, same "no caching, cheap
+    // enough" reasoning as to_vec() above. Unused until that engine's
+    // own stage wires it in.
+    #[allow(dead_code)]
+    pub fn entries(&self) -> Vec<HistoryEntry<'_>> {
+        let mut v = Vec::new();
+        let mut cur = &self.tail;
+        while let Some(node) = cur {
+            // `prev` is Some only when *both* this entry and the one
+            // before it were recorded live in this session's own chain
+            // (cwd.is_some() on both sides) -- a disk-loaded node's own
+            // `.prev` is just the previous *line in a file every bish
+            // process appends to concurrently*, not "the command that
+            // actually ran before this one," so it must not leak into
+            // the sequence heuristic as if it were.
+            let prev = match (&node.cwd, &node.prev) {
+                (Some(_), Some(p)) if p.cwd.is_some() => Some(p.entry.as_str()),
+                _ => None,
+            };
+            v.push(HistoryEntry { text: node.entry.as_str(), cwd: node.cwd.as_deref(), prev });
             cur = &node.prev;
         }
         v.reverse();
@@ -346,4 +405,87 @@ fn unescape(s: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // `History { path: None, tail: None }` is a fully valid, filesystem-
+    // free empty history -- record()'s own disk write is already a no-op
+    // whenever `path` is None (see record()'s own body), so every test
+    // here is deterministic with no temp files involved.
+    fn empty() -> History {
+        History { path: None, tail: None }
+    }
+
+    #[test]
+    fn record_carries_the_cwd_it_was_given() {
+        let mut h = empty();
+        let cwd = PathBuf::from("/home/user/project");
+        h.record("cargo test", Some(&cwd));
+        let entries = h.entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].text, "cargo test");
+        assert_eq!(entries[0].cwd, Some(cwd.as_path()));
+    }
+
+    // Simulates what load() produces (cwd: None throughout) without
+    // touching the filesystem -- record(entry, None) yields the exact
+    // same Node shape a disk-loaded line would.
+    #[test]
+    fn disk_loaded_shaped_chain_carries_no_cwd() {
+        let mut h = empty();
+        h.record("ls -la", None);
+        h.record("git status", None);
+        let entries = h.entries();
+        assert_eq!(entries.len(), 2);
+        assert!(entries.iter().all(|e| e.cwd.is_none()));
+    }
+
+    #[test]
+    fn prev_is_some_only_between_two_live_recorded_neighbors() {
+        let mut h = empty();
+        let cwd = PathBuf::from("/tmp/proj");
+        h.record("git status", Some(&cwd));
+        h.record("git commit", Some(&cwd));
+        let entries = h.entries();
+        assert_eq!(entries[0].prev, None); // nothing before the first entry
+        assert_eq!(entries[1].prev, Some("git status"));
+    }
+
+    #[test]
+    fn prev_is_none_for_first_live_entry_after_a_disk_loaded_tail() {
+        let mut h = empty();
+        // A disk-loaded-shaped entry (no cwd), then the first entry
+        // actually recorded live this session.
+        h.record("some old command", None);
+        let cwd = PathBuf::from("/tmp/proj");
+        h.record("cargo build", Some(&cwd));
+        let entries = h.entries();
+        assert_eq!(entries[0].prev, None);
+        // The live entry's own predecessor is the disk-loaded one, which
+        // has no cwd -- must not be reported as a real sequence link.
+        assert_eq!(entries[1].prev, None);
+    }
+
+    #[test]
+    fn fork_diverges_with_cwds_intact() {
+        let mut parent = empty();
+        let cwd_a = PathBuf::from("/tmp/a");
+        parent.record("echo parent", Some(&cwd_a));
+
+        let mut child = parent.fork();
+        let cwd_b = PathBuf::from("/tmp/b");
+        child.record("echo child", Some(&cwd_b));
+
+        let parent_entries = parent.entries();
+        assert_eq!(parent_entries.len(), 1);
+        assert_eq!(parent_entries[0].cwd, Some(cwd_a.as_path()));
+
+        let child_entries = child.entries();
+        assert_eq!(child_entries.len(), 2);
+        assert_eq!(child_entries[0].cwd, Some(cwd_a.as_path()));
+        assert_eq!(child_entries[1].cwd, Some(cwd_b.as_path()));
+    }
 }
