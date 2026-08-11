@@ -525,6 +525,17 @@ pub fn run(mut shell: Shell) {
                 // Same re-arming as a real Line -- Ctrl-C isn't an
                 // immediate repeated Ctrl-D either.
                 session.warned_stopped_jobs = false;
+                // editor::read_line's own Key::CtrlC arm prints a bare
+                // "^C\r\n" with no awareness of pane boundaries or the
+                // tab bar -- on a pane's own last row this can land on
+                // (or scroll into) the tab bar's row. compositor_redraw
+                // is a full, absolutely-positioned repaint of every pane
+                // plus the tab bar, so it's fully self-healing regardless
+                // of what state that bare print left the real terminal
+                // in -- same reasoning DirNav just below already applies.
+                if sinks_are_grid {
+                    compositor_redraw(&sessions, &windows, current_window, term_rows, term_cols);
+                }
             }
             Ok(ReadOutcome::DirNav(kind)) => {
                 let session = sessions.get_mut(&session_id).unwrap();
