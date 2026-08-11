@@ -21,6 +21,7 @@ use crate::bishedit::highlight::{self, BashHighlighter, Highlighter, HighlightCo
 use crate::bishedit::motion;
 use crate::bishedit::registers::{RegisterShape, RegisterValue, Registers};
 use crate::bishedit::suggestion::{SuggestionProvider, SuggestionRequest};
+use crate::bishedit::Buffer;
 use crate::bishedit::vimkeys::{self, KeyOutcome, VimKeys};
 use crate::history::History;
 use crate::term;
@@ -489,8 +490,13 @@ fn accept_suggestion(ed: &mut LineEditor, tail: &str) {
 // "long line stays on one row" behavior GNU readline itself falls back
 // to in a narrow terminal -- recomputed fresh on every redraw from the
 // cursor's current position, not a persisted scroll offset.
-fn redraw(prompt: &str, ed: &LineEditor, col_origin: usize, width: usize, ctx: HighlightContext) -> io::Result<()> {
-    print!("{}", compose_redraw(prompt, ed, "", col_origin, width, ctx));
+// `search_matches`: (start, end) char-column ranges within `ed.buf` to
+// highlight (reverse video) -- see compose_redraw's own doc comment on
+// this same parameter. Empty for every caller except run_line_normal_mode
+// (the only context where a vim search, and thus something worth
+// highlighting, can be in progress).
+fn redraw(prompt: &str, ed: &LineEditor, col_origin: usize, width: usize, ctx: HighlightContext, search_matches: &[(usize, usize)]) -> io::Result<()> {
+    print!("{}", compose_redraw(prompt, ed, "", col_origin, width, ctx, search_matches));
     io::stdout().flush()
 }
 
@@ -510,7 +516,17 @@ fn redraw(prompt: &str, ed: &LineEditor, col_origin: usize, width: usize, ctx: H
 // `ed.cursor == ed.buf.len()` (the caller's own gate; not re-asserted
 // here). Truncated to fit *here*, not by the caller -- see the
 // `ghost_room` computation below.
-fn compose_redraw(prompt: &str, ed: &LineEditor, ghost: &str, col_origin: usize, width: usize, ctx: HighlightContext) -> String {
+//
+// `search_matches`: (start, end) char-column ranges within `ed.buf` to
+// render in reverse video -- vim's own `hlsearch` treatment, reusing the
+// exact SGR reverse-video bit `vt100::CellAttrs`/`sgr_codes` already
+// support (it's what Ctrl-E's own mode-indicator prompt already renders
+// itself with). Composed as the *last* layer (see highlight::compose's
+// own doc comment on later layers winning), so a match visually wins over
+// both syntax highlighting and a suggestion's ghost tail wherever they
+// overlap -- matching vim, where `hlsearch` sits on top of everything
+// else. Empty for every caller with no search state to highlight.
+fn compose_redraw(prompt: &str, ed: &LineEditor, ghost: &str, col_origin: usize, width: usize, ctx: HighlightContext, search_matches: &[(usize, usize)]) -> String {
     let mut out = String::new();
     out.push_str(&format!("\x1b[{}G", col_origin + 1));
     out.push_str(&" ".repeat(width));
@@ -579,7 +595,11 @@ fn compose_redraw(prompt: &str, ed: &LineEditor, ghost: &str, col_origin: usize,
             attrs: vt100::CellAttrs { dim: true, ..vt100::CellAttrs::default() },
         }]
     };
-    let cells = highlight::compose(&combined, &[&styled, &ghost_layer]);
+    let search_layer: Vec<StyledSpan> = search_matches
+        .iter()
+        .map(|&(start, end)| StyledSpan { start, end, fg: vt100::Color::Default, attrs: vt100::CellAttrs { reverse: true, ..vt100::CellAttrs::default() } })
+        .collect();
+    let cells = highlight::compose(&combined, &[&styled, &ghost_layer, &search_layer]);
 
     if combined.len() <= remaining {
         out.push_str(&highlight::render_styled(&cells));
@@ -772,7 +792,7 @@ fn redraw_with_completion_row(
     width: usize,
     ctx: HighlightContext,
 ) -> io::Result<()> {
-    let mut out = compose_redraw(prompt, ed, ghost, col_origin, width, ctx);
+    let mut out = compose_redraw(prompt, ed, ghost, col_origin, width, ctx, &[]);
     if menu_capable && (completion.is_some() || menu_was_shown) {
         match row_origin {
             // Grid/promoted mode: absolute positioning only, never
@@ -795,7 +815,7 @@ fn redraw_with_completion_row(
                     // Absolute jump back, not \x1b[1A -- fixes both row
                     // and column in one unambiguous move.
                     out.push_str(&format!("\x1b[{};{}H", prompt_row + 1, col_origin + 1));
-                    out.push_str(&compose_redraw(prompt, ed, ghost, col_origin, width, ctx));
+                    out.push_str(&compose_redraw(prompt, ed, ghost, col_origin, width, ctx, &[]));
                 }
                 // else: no room below the prompt within this pane --
                 // gracefully skip showing the menu this redraw, same
@@ -812,7 +832,7 @@ fn redraw_with_completion_row(
                     out.push_str(&render_menu_row_content(state, width));
                 }
                 out.push_str("\x1b[1A");
-                out.push_str(&compose_redraw(prompt, ed, ghost, col_origin, width, ctx));
+                out.push_str(&compose_redraw(prompt, ed, ghost, col_origin, width, ctx, &[]));
             }
         }
     }
@@ -1368,6 +1388,54 @@ enum LineNormalExit {
     Eof,
 }
 
+// What run_line_normal_mode's own redraw call should show for its prompt,
+// and which char-columns of `ed.buf` to highlight (reverse video) for the
+// active search pattern -- computed together since both derive from the
+// same `vk.pending_display()` check, and Ctrl-E has no separate status
+// row to show search feedback on the way `normal_mode_status_left`/
+// `render_normal_mode_frame` do in repl.rs's own full-pane Normal mode,
+// so a search in progress here replaces the prompt text outright instead
+// (plain, not reverse-video -- distinguishes it from the ordinary mode
+// indicator, matching how the Ctrl+Space status bar already shows it).
+//
+// "Active" pattern, one rule for both the prompt text and the
+// highlighting: the in-progress `/`/`?` text while one is being typed
+// (incsearch-style live feedback for free), else the last resolved
+// search's own pattern, else nothing to highlight (and the ordinary
+// `decorated_prompt` to show). For a word-based last search (`*`/`#`),
+// there's no separately-stored pattern text -- `VimKeys::last_search_
+// text`'s own doc comment explains why `motion::word_under_cursor` at
+// the buffer's current cursor reliably recovers it instead.
+fn normal_mode_prompt_and_matches(
+    ed: &mut LineEditor,
+    marks: &mut HashMap<char, (usize, usize)>,
+    vk: &VimKeys,
+    decorated_prompt: &str,
+) -> (String, Vec<(usize, usize)>) {
+    let pending = vk.pending_display();
+    if let Some(rest) = pending.strip_prefix('/').or_else(|| pending.strip_prefix('?')) {
+        let matches = if rest.is_empty() {
+            Vec::new()
+        } else {
+            let lb = LineBuffer { ed, marks };
+            motion::find_matches_in_line(&lb, 0, rest)
+        };
+        return (pending.to_string(), matches);
+    }
+    let lb = LineBuffer { ed, marks };
+    let pattern = if vk.last_search_is_word() {
+        motion::word_under_cursor(&lb, lb.cursor())
+    } else {
+        let text = vk.last_search_text();
+        if text.is_empty() { None } else { Some(text.to_string()) }
+    };
+    let matches = match pattern {
+        Some(p) => motion::find_matches_in_line(&lb, 0, &p),
+        None => Vec::new(),
+    };
+    (decorated_prompt.to_string(), matches)
+}
+
 // Ctrl-E: a lightweight, line-local vim Normal mode over the buffer
 // currently being typed -- no promotion, no pane/scrollback, works
 // identically whether the terminal is split or not (unlike repl.rs's
@@ -1404,7 +1472,8 @@ fn run_line_normal_mode(
     // unwanted, sticky change to something this feature has no business
     // touching.
     let decorated_prompt = format!("\x1b[7m{}\x1b[0m", prompt);
-    redraw(&decorated_prompt, ed, col_origin, width, ctx)?;
+    let (shown, matches) = normal_mode_prompt_and_matches(ed, &mut marks, &vk, &decorated_prompt);
+    redraw(&shown, ed, col_origin, width, ctx, &matches)?;
     let exit = loop {
         let key = match read_key_idle(on_idle)? {
             Some(k) => k,
@@ -1436,7 +1505,8 @@ fn run_line_normal_mode(
                 }
             }
         }
-        redraw(&decorated_prompt, ed, col_origin, width, ctx)?;
+        let (shown, matches) = normal_mode_prompt_and_matches(ed, &mut marks, &vk, &decorated_prompt);
+        redraw(&shown, ed, col_origin, width, ctx, &matches)?;
     };
     Ok(exit)
 }
@@ -1621,7 +1691,7 @@ mod tests {
     #[test]
     fn ghost_text_appears_in_the_composed_output() {
         let ed = make_editor("ls", 2);
-        let out = compose_redraw("$ ", &ed, " -la", 0, 40, HighlightContext::default());
+        let out = compose_redraw("$ ", &ed, " -la", 0, 40, HighlightContext::default(), &[]);
         assert!(out.contains(" -la"), "{out:?}");
     }
 
@@ -1630,7 +1700,7 @@ mod tests {
         // Same (Indexed(8), dim) pair default_style(HighlightKind::Comment)
         // already uses -- vt100::sgr_codes turns that into "0;2;90".
         let ed = make_editor("ls", 2);
-        let out = compose_redraw("$ ", &ed, " -la", 0, 40, HighlightContext::default());
+        let out = compose_redraw("$ ", &ed, " -la", 0, 40, HighlightContext::default(), &[]);
         assert!(out.contains("\x1b[0;2;90m"), "{out:?}");
     }
 
@@ -1638,7 +1708,7 @@ mod tests {
     fn cursor_walks_back_past_the_ghost_tail() {
         let ed = make_editor("ls", 2);
         let ghost = " -la";
-        let out = compose_redraw("$ ", &ed, ghost, 0, 40, HighlightContext::default());
+        let out = compose_redraw("$ ", &ed, ghost, 0, 40, HighlightContext::default(), &[]);
         assert!(out.contains(&format!("\x1b[{}D", ghost.chars().count())), "{out:?}");
     }
 
@@ -1651,7 +1721,7 @@ mod tests {
     #[test]
     fn empty_ghost_changes_nothing() {
         let ed = make_editor("ls", 2);
-        let out = compose_redraw("$ ", &ed, "", 0, 40, HighlightContext::default());
+        let out = compose_redraw("$ ", &ed, "", 0, 40, HighlightContext::default(), &[]);
         assert!(!out.contains("\x1b[0;2;90m"), "{out:?}");
         assert!(!out.contains('D'), "{out:?}");
     }
@@ -1662,7 +1732,7 @@ mod tests {
         // chars) leaves exactly 2 columns of room. A 10-char ghost must
         // be cut down to those 2 chars, not spill past the pane's width.
         let ed = make_editor("ls", 2);
-        let out = compose_redraw("$ ", &ed, "0123456789", 0, 6, HighlightContext::default());
+        let out = compose_redraw("$ ", &ed, "0123456789", 0, 6, HighlightContext::default(), &[]);
         assert!(out.contains("01"), "{out:?}");
         assert!(!out.contains("0123"), "{out:?}");
     }
@@ -1673,7 +1743,7 @@ mod tests {
         // takes the horizontal-scroll branch, which never has any room
         // left for a ghost tail at all.
         let ed = make_editor("a very long command line", 25);
-        let out = compose_redraw("$ ", &ed, "ignored-ghost", 0, 10, HighlightContext::default());
+        let out = compose_redraw("$ ", &ed, "ignored-ghost", 0, 10, HighlightContext::default(), &[]);
         assert!(!out.contains("ignored-ghost"), "{out:?}");
         assert!(!out.contains("\x1b[0;2;90m"), "{out:?}");
     }
