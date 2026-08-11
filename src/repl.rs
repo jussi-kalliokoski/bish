@@ -3,6 +3,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::{self, Write};
 use std::rc::Rc;
 
+use crate::bishedit::completion;
 use crate::bishedit::highlight::HighlightContext;
 use crate::bishedit::motion;
 use crate::bishedit::vimkeys::{KeyOutcome, VimKeys, WindowCmd};
@@ -407,10 +408,29 @@ pub fn run(mut shell: Shell) {
         let cwd_snapshot = sessions[&session_id].shell.cwd.clone();
         let known_functions: HashSet<String> = sessions[&session_id].shell.function_names().map(String::from).collect();
         let highlight_ctx = HighlightContext { cwd: Some(cwd_snapshot.as_path()), known_functions: Some(&known_functions) };
+        // Same owned-snapshot pattern as highlight_ctx just above -- built
+        // from the exact same locals, not re-snapshotted.
+        let shell_completion = completion::ShellCompletionProvider { cwd: Some(cwd_snapshot.as_path()), known_functions: Some(&known_functions) };
+        // Relative-cursor-row menu tricks (a later stage) are only safe on
+        // a single real terminal -- a promoted/split-pane session risks
+        // spilling the extra row into a neighboring pane or the tab bar.
+        let menu_capable = !sinks_are_grid;
 
-        match editor::read_line(&prompt_str, &session_history, false, false, pending_initial.take(), col_origin, width, highlight_ctx, || {
-            service_background_jobs(&mut sessions, &mut windows, &mut job_frames, current_window);
-        }) {
+        match editor::read_line(
+            &prompt_str,
+            &session_history,
+            false,
+            false,
+            pending_initial.take(),
+            col_origin,
+            width,
+            highlight_ctx,
+            Some(&shell_completion),
+            menu_capable,
+            || {
+                service_background_jobs(&mut sessions, &mut windows, &mut job_frames, current_window);
+            },
+        ) {
             Ok(ReadOutcome::Eof) => {
                 // Whether closing *this* (window, top-frame) reference
                 // would leave the session with no reference anywhere
@@ -2873,9 +2893,26 @@ fn run_command_mode(
         // accepted gap given what command mode is actually used for.
         // Flag/subcommand/printf highlighting need neither field, so those
         // work exactly as they do at the ordinary prompt.
-        match editor::read_line(&prompt_str, history, true, true, pending_initial.take(), 0, term_cols, HighlightContext::default(), &mut || {
-            service_background_jobs(sessions, windows, job_frames, current_window);
-        }) {
+        // No meaningful shell-completion context here either, same
+        // reasoning as HighlightContext::default() above -- window-
+        // management subcommands, not shell command lines. menu_capable:
+        // false -- irrelevant with no provider, but also correct on its
+        // own merits (see the main prompt loop's own doc comment).
+        match editor::read_line(
+            &prompt_str,
+            history,
+            true,
+            true,
+            pending_initial.take(),
+            0,
+            term_cols,
+            HighlightContext::default(),
+            None,
+            false,
+            &mut || {
+                service_background_jobs(sessions, windows, job_frames, current_window);
+            },
+        ) {
             Ok(ReadOutcome::Eof) | Ok(ReadOutcome::Interrupted) => return CommandModeOutcome::Cancelled,
             // Directory navigation doesn't mean much inside command
             // mode's own restricted context -- just ignore it and keep

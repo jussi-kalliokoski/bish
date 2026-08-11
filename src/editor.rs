@@ -16,6 +16,7 @@
 use std::collections::HashMap;
 use std::io::{self, Write};
 
+use crate::bishedit::completion::{CompletionCandidate, CompletionProvider, CompletionRequest};
 use crate::bishedit::highlight::{self, BashHighlighter, Highlighter, HighlightContext, StyledSpan};
 use crate::bishedit::motion;
 use crate::bishedit::vimkeys::{self, KeyOutcome, VimKeys};
@@ -338,6 +339,70 @@ impl LineEditor {
         self.buf = s.chars().collect();
         self.cursor = self.buf.len();
     }
+
+    // Replaces buf[start..end] with `text`, cursor landing right after the
+    // inserted text. The one primitive both completion cycling and
+    // Ctrl-E's discard-and-revert share: a completion candidate is
+    // spliced in as real buffer content (not a separate dimmed overlay),
+    // which is what lets "keep typing" accept it for free -- the buffer
+    // is already correct, nothing special has to happen on acceptance.
+    fn splice_word(&mut self, start: usize, end: usize, text: &str) {
+        let new_chars: Vec<char> = text.chars().collect();
+        let new_len = new_chars.len();
+        self.buf.splice(start..end, new_chars);
+        self.cursor = start + new_len;
+    }
+}
+
+// Tracks an in-progress multi-candidate completion: `word_start..cursor`
+// (the buffer's *current* cursor, always kept in sync by splice_word) is
+// the currently-spliced candidate's own span, `original` is what was
+// there before completion started (restored verbatim by Ctrl-E), and
+// `selected` indexes into `candidates` for cycling. Its mere existence
+// means "more than one candidate, ghost text is currently spliced into
+// the real buffer" -- a single-candidate auto-fill never creates one
+// (see trigger_completion), matching the request's own "just fill it
+// without showing the menu" spec.
+struct CompletionState {
+    word_start: usize,
+    original: String,
+    candidates: Vec<CompletionCandidate>,
+    selected: usize,
+}
+
+// Runs the provider fresh (no caching, matching this feature's blanket
+// "recomputed every trigger" scope) and either fills the one candidate
+// directly (0 or 1 results never need a menu/cycling state at all) or
+// splices in the first (Tab/Ctrl-N) or last (Shift-Tab/Ctrl-P) of several
+// and returns tracking state for cycling.
+fn trigger_completion(ed: &mut LineEditor, provider: &dyn CompletionProvider, backward: bool) -> Option<CompletionState> {
+    let line = ed.as_string();
+    let result = provider.complete(CompletionRequest { line: &line, cursor: ed.cursor });
+    match result.candidates.len() {
+        0 => None,
+        1 => {
+            ed.splice_word(result.word_start, ed.cursor, &result.candidates[0].display);
+            None
+        }
+        n => {
+            let original: String = ed.buf[result.word_start..ed.cursor].iter().collect();
+            let selected = if backward { n - 1 } else { 0 };
+            let text = result.candidates[selected].display.clone();
+            ed.splice_word(result.word_start, ed.cursor, &text);
+            Some(CompletionState { word_start: result.word_start, original, candidates: result.candidates, selected })
+        }
+    }
+}
+
+// Removes the currently-spliced candidate's own range (word_start..cursor,
+// which splice_word always keeps in sync) and splices in the next/previous
+// one, wrapping. `state.candidates` itself never changes across a cycle --
+// only which one is currently shown.
+fn cycle_completion(ed: &mut LineEditor, state: &mut CompletionState, backward: bool) {
+    let n = state.candidates.len();
+    state.selected = if backward { (state.selected + n - 1) % n } else { (state.selected + 1) % n };
+    let text = state.candidates[state.selected].display.clone();
+    ed.splice_word(state.word_start, ed.cursor, &text);
 }
 
 // `col_origin` is the real terminal column (0-indexed) this line's own
@@ -599,6 +664,14 @@ pub fn read_line(
     col_origin: usize,
     width: usize,
     ctx: HighlightContext,
+    // `None` for callers with no meaningful shell context to complete
+    // against (command mode's own colon-line -- same clean layering
+    // HighlightContext::default() already established there). `menu_capable`
+    // is unused until a later stage wires up the actual menu row; carried
+    // as a parameter now so both repl.rs call sites only need to change
+    // their argument list once.
+    completion_provider: Option<&dyn CompletionProvider>,
+    _menu_capable: bool,
     mut on_idle: impl FnMut(),
 ) -> io::Result<ReadOutcome> {
     let mut guard = Some(term::RawGuard::enable(0)?);
@@ -620,6 +693,12 @@ pub fn read_line(
     // shown entry as ordinary buffer text and ends the browse, matching
     // fish: the suggestion just becomes your input from that point on.
     let mut browse: Option<(String, usize)> = None;
+
+    // In-progress completion state -- see CompletionState's own doc
+    // comment. `None` means either nothing's being completed, or the last
+    // trigger auto-filled a single candidate directly (no tracking
+    // needed for that case).
+    let mut completion: Option<CompletionState> = None;
 
     // Always goes through the same clear-and-draw redraw(), even with
     // nothing typed yet: the terminal cursor at this point may already be
@@ -650,6 +729,18 @@ pub fn read_line(
         };
         if !matches!(key, Key::Up | Key::Down | Key::Escape) {
             browse = None;
+        }
+        // Mirrors the browse reset immediately above: any key that isn't
+        // part of cycling/accepting/discarding a completion "locks in"
+        // whatever's currently spliced into the buffer as ordinary text
+        // and ends tracking -- the buffer is already correct, so this is
+        // the entire implementation of "keep typing accepts" (Char,
+        // Backspace, Enter, etc. all fall through to their own existing,
+        // untouched arms right after this). Ctrl-Y isn't in the exemption
+        // list either, so "accept" falls out for free with no dedicated
+        // arm of its own.
+        if completion.is_some() && !matches!(key, Key::Tab | Key::BackTab | Key::CtrlN | Key::CtrlP | Key::CtrlE | Key::Up | Key::Down) {
+            completion = None;
         }
 
         match key {
@@ -716,6 +807,11 @@ pub fn read_line(
             }
             Key::CtrlL => print!("\x1b[H\x1b[2J"),
             Key::Char(c) => ed.insert(c),
+            // Once a completion menu is active, Up/Down cycle it instead
+            // of history browsing -- the plan's own "or up and down
+            // arrows if the completion menu is already open."
+            Key::Up if completion.is_some() => cycle_completion(&mut ed, completion.as_mut().unwrap(), true),
+            Key::Down if completion.is_some() => cycle_completion(&mut ed, completion.as_mut().unwrap(), false),
             Key::Up => {
                 let prefix = browse.as_ref().map(|(p, _)| p.clone()).unwrap_or_else(|| ed.as_string());
                 let from = browse.as_ref().map(|(_, i)| *i);
@@ -793,6 +889,14 @@ pub fn read_line(
             // comment. Reassigned from this key's previous "move cursor to
             // end of line" meaning (still reachable via the plain `End`
             // key, just no longer double-bound).
+            // While a completion is active, Ctrl-E discards it (reverts
+            // to the original word) instead of its usual meaning --
+            // overloading it this way is deliberate per the feature
+            // request. Otherwise unchanged: vim's line-local Normal mode.
+            Key::CtrlE if completion.is_some() => {
+                let state = completion.take().unwrap();
+                ed.splice_word(state.word_start, ed.cursor, &state.original);
+            }
             Key::CtrlE => match run_line_normal_mode(&mut ed, prompt, col_origin, width, ctx, &mut on_idle)? {
                 LineNormalExit::ToInsert => {}
                 LineNormalExit::Propagate(k) => {
@@ -814,11 +918,20 @@ pub fn read_line(
                     continue;
                 }
             }
-            // Tab/BackTab/CtrlN/CtrlP: no-op for now -- real completion
-            // dispatch is wired into this match in a later stage of the
-            // same feature; decoding lands first on its own so it's
-            // independently testable (decode_csi_final's new arm).
-            Key::AltLeft | Key::AltRight | Key::AltUp | Key::CtrlY | Key::Tab | Key::BackTab | Key::CtrlN | Key::CtrlP | Key::Unknown => {}
+            // Tab/Ctrl-N cycle forward (or trigger a fresh completion if
+            // none is active); Shift-Tab/Ctrl-P cycle backward. Ctrl-Y
+            // needs no arm of its own -- it's not in the reset
+            // exemption list above, so "accept" already happened by the
+            // time any match arm would run.
+            Key::Tab | Key::CtrlN => match &mut completion {
+                Some(state) => cycle_completion(&mut ed, state, false),
+                None => completion = completion_provider.and_then(|p| trigger_completion(&mut ed, p, false)),
+            },
+            Key::BackTab | Key::CtrlP => match &mut completion {
+                Some(state) => cycle_completion(&mut ed, state, true),
+                None => completion = completion_provider.and_then(|p| trigger_completion(&mut ed, p, true)),
+            },
+            Key::AltLeft | Key::AltRight | Key::AltUp | Key::CtrlY | Key::Unknown => {}
         }
         redraw(prompt, &ed, col_origin, width, ctx)?;
     }

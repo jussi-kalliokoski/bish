@@ -58,9 +58,10 @@ pub fn fuzzy_match(query: &str, candidate: &str) -> Option<FuzzyMatch> {
         positions.push(found?);
     }
 
+    let query_chars: Vec<char> = query.chars().collect();
     let mut score = 0i32;
     let mut prev_pos: Option<usize> = None;
-    for &pos in &positions {
+    for (i, &pos) in positions.iter().enumerate() {
         score += 10;
         if is_boundary_start(&cand_chars, pos) {
             score += 10;
@@ -69,6 +70,17 @@ pub fn fuzzy_match(query: &str, candidate: &str) -> Option<FuzzyMatch> {
             if pos == p + 1 {
                 score += 15;
             }
+        }
+        // A small tiebreak nudge, not a real ranking factor: without it,
+        // a case-insensitive match against candidates differing only by
+        // case (e.g. "-l" vs "-L") ties on every other term above and
+        // falls back to alphabetical order, where a bare uppercase
+        // letter sorts before its lowercase counterpart in plain ASCII
+        // -- surprising when the query's own case exactly matched one of
+        // them. +1 is deliberately smaller than any other scoring term
+        // here, so it only ever breaks an otherwise-exact tie.
+        if cand_chars[pos] == query_chars[i] {
+            score += 1;
         }
         prev_pos = Some(pos);
     }
@@ -108,6 +120,18 @@ mod tests {
         let b = fuzzy_match("gc", "GIT-CHECKOUT").unwrap();
         assert_eq!(a.positions, vec![0, 4]);
         assert_eq!(b.positions, vec![0, 4]);
+    }
+
+    // Found via interactive verification: `ls -l` + Tab was completing to
+    // "-L" instead of "-l" -- both matched the case-insensitive query
+    // equally well on every other scoring term, so it fell back to plain
+    // alphabetical order, where "-L" (uppercase) sorts first. An exact-
+    // case match should win a tie like this.
+    #[test]
+    fn exact_case_match_breaks_a_tie_with_a_differently_cased_candidate() {
+        let lower = fuzzy_match("-l", "-l").unwrap();
+        let upper = fuzzy_match("-l", "-L").unwrap();
+        assert!(lower.score > upper.score, "{lower:?} vs {upper:?}");
     }
 
     #[test]
