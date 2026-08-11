@@ -440,6 +440,20 @@ fn cycle_completion(ed: &mut LineEditor, state: &mut CompletionState, backward: 
 // to in a narrow terminal -- recomputed fresh on every redraw from the
 // cursor's current position, not a persisted scroll offset.
 fn redraw(prompt: &str, ed: &LineEditor, col_origin: usize, width: usize, ctx: HighlightContext) -> io::Result<()> {
+    print!("{}", compose_redraw(prompt, ed, col_origin, width, ctx));
+    io::stdout().flush()
+}
+
+// The escape-coded string redraw() prints, split out so
+// redraw_with_completion_row can fold it into one larger string of its
+// own rather than issuing a separate print!/flush for it -- two
+// separate writes left a real, visible window between them where the
+// terminal had already rendered the intermediate "moved down, column
+// reset" state from the first write before the second one corrected it,
+// showing up as the cursor briefly jumping to the start of the row on
+// every keystroke. One write, one flush, matches this function's own
+// original design intent (build the whole string first, print it once).
+fn compose_redraw(prompt: &str, ed: &LineEditor, col_origin: usize, width: usize, ctx: HighlightContext) -> String {
     let mut out = String::new();
     out.push_str(&format!("\x1b[{}G", col_origin + 1));
     out.push_str(&" ".repeat(width));
@@ -454,8 +468,7 @@ fn redraw(prompt: &str, ed: &LineEditor, col_origin: usize, width: usize, ctx: H
         // than graceful degradation.
         out.push_str(&truncate_visible(prompt, width));
         out.push_str("\x1b[0m");
-        print!("{}", out);
-        return io::stdout().flush();
+        return out;
     }
 
     out.push_str(prompt);
@@ -503,8 +516,7 @@ fn redraw(prompt: &str, ed: &LineEditor, col_origin: usize, width: usize, ctx: H
         }
     }
 
-    print!("{}", out);
-    io::stdout().flush()
+    out
 }
 
 // Lays out a completion menu row: every candidate's own `display` joined
@@ -568,8 +580,8 @@ fn build_completion_row(state: &CompletionState) -> CompletionRow {
 // erased (even when `completion` is now None), clearing a stale row
 // left over from the previous call. `\x1b[1A` restores the *row* but
 // not the column redraw() already left the real cursor at -- the
-// second redraw() call is the deliberately-simple way to fix that,
-// rather than duplicating redraw()'s own column math here.
+// second compose_redraw call is the deliberately-simple way to fix
+// that, rather than duplicating redraw()'s own column math here.
 //
 // The "move down" step is a literal `\n`, not `\x1b[1B` (Cursor Down):
 // CUD is defined to *clamp* at the terminal's bottom margin rather than
@@ -585,6 +597,17 @@ fn build_completion_row(state: &CompletionState) -> CompletionRow {
 // cleared and overwritten by the next prompt.) `\x1b[1A` afterward stays
 // correct either way -- by definition there's always a row above
 // wherever the linefeed left the cursor.
+//
+// Everything is assembled into one string and written with a single
+// print!/flush, not two separate ones -- an earlier version called
+// redraw() (its own print!+flush) for the base row, then did a second,
+// separate print!+flush for the rest. That left a real, brief window
+// after the first flush where the terminal had already rendered the
+// intermediate "moved down a row, column reset to col_origin" state
+// before the second flush corrected it -- visible as the cursor jumping
+// to the start of the row on every single keystroke (found via the
+// user's own interactive testing). One write settles directly on the
+// final state with nothing intermediate ever rendered.
 fn redraw_with_completion_row(
     prompt: &str,
     ed: &LineEditor,
@@ -594,38 +617,35 @@ fn redraw_with_completion_row(
     width: usize,
     ctx: HighlightContext,
 ) -> io::Result<()> {
-    redraw(prompt, ed, col_origin, width, ctx)?;
-    if !menu_capable {
-        return Ok(());
+    let mut out = compose_redraw(prompt, ed, col_origin, width, ctx);
+    if menu_capable {
+        out.push('\n');
+        out.push_str(&format!("\x1b[{}G", col_origin + 1));
+        out.push_str(&" ".repeat(width));
+        out.push_str(&format!("\x1b[{}G", col_origin + 1));
+        if let Some(state) = completion {
+            let row = build_completion_row(state);
+            let cells = highlight::compose(&row.chars, &[&row.bold, &row.selected]);
+            let visible: &[vt100::Cell] = if row.chars.len() <= width {
+                &cells
+            } else {
+                // Right-anchors the window on the selected candidate's
+                // own end, same shape as redraw()'s own cursor-
+                // visibility clamp for an overlong buffer -- a long
+                // candidate list stays truncated/scrolled to `width`
+                // rather than wrapping into a neighboring pane's row.
+                let window_start = row.selected_range.end.saturating_sub(width).min(row.chars.len() - width);
+                let window_end = (window_start + width).min(row.chars.len());
+                &cells[window_start..window_end]
+            };
+            out.push_str(&highlight::render_styled(visible));
+        }
+        out.push_str("\x1b[1A");
+        out.push_str(&compose_redraw(prompt, ed, col_origin, width, ctx));
     }
 
-    let mut out = String::new();
-    out.push('\n');
-    out.push_str(&format!("\x1b[{}G", col_origin + 1));
-    out.push_str(&" ".repeat(width));
-    out.push_str(&format!("\x1b[{}G", col_origin + 1));
-    if let Some(state) = completion {
-        let row = build_completion_row(state);
-        let cells = highlight::compose(&row.chars, &[&row.bold, &row.selected]);
-        let visible: &[vt100::Cell] = if row.chars.len() <= width {
-            &cells
-        } else {
-            // Right-anchors the window on the selected candidate's own
-            // end, same shape as redraw()'s own cursor-visibility clamp
-            // for an overlong buffer -- a long candidate list stays
-            // truncated/scrolled to `width` rather than wrapping into a
-            // neighboring pane's row.
-            let window_start = row.selected_range.end.saturating_sub(width).min(row.chars.len() - width);
-            let window_end = (window_start + width).min(row.chars.len());
-            &cells[window_start..window_end]
-        };
-        out.push_str(&highlight::render_styled(visible));
-    }
-    out.push_str("\x1b[1A");
     print!("{}", out);
-    io::stdout().flush()?;
-
-    redraw(prompt, ed, col_origin, width, ctx)
+    io::stdout().flush()
 }
 
 // How many terminal columns `s` actually occupies once drawn, not
