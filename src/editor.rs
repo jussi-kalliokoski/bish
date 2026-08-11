@@ -22,6 +22,7 @@ use crate::bishedit::motion;
 use crate::bishedit::vimkeys::{self, KeyOutcome, VimKeys};
 use crate::history::History;
 use crate::term;
+use crate::vt100;
 
 unsafe extern "C" {
     fn read(fd: i32, buf: *mut u8, count: usize) -> isize;
@@ -506,6 +507,112 @@ fn redraw(prompt: &str, ed: &LineEditor, col_origin: usize, width: usize, ctx: H
     io::stdout().flush()
 }
 
+// Lays out a completion menu row: every candidate's own `display` joined
+// by spaces, a bold StyledSpan per matched character (from each
+// candidate's own `matched_positions`), and the selected candidate's
+// whole span tracked separately so it can both get a reverse-video
+// StyledSpan and anchor the width-clamping window below. Building the
+// bold layer and the reverse span as two separate compose() layers
+// (rather than merging attrs by hand) means the selected candidate's
+// bold matched-character highlighting gets overwritten by its own
+// reverse-video span where they overlap -- a minor, accepted
+// simplification, since the selected candidate already stands out via
+// reverse video on its own.
+struct CompletionRow {
+    chars: Vec<char>,
+    bold: Vec<StyledSpan>,
+    selected: Vec<StyledSpan>,
+    selected_range: std::ops::Range<usize>,
+}
+
+fn build_completion_row(state: &CompletionState) -> CompletionRow {
+    let mut text = String::new();
+    let mut bold = Vec::new();
+    let mut selected_range = 0..0;
+    for (i, candidate) in state.candidates.iter().enumerate() {
+        if i > 0 {
+            text.push(' ');
+        }
+        let start = text.chars().count();
+        for &pos in &candidate.matched_positions {
+            bold.push(StyledSpan {
+                start: start + pos,
+                end: start + pos + 1,
+                fg: vt100::Color::Default,
+                attrs: vt100::CellAttrs { bold: true, ..vt100::CellAttrs::default() },
+            });
+        }
+        text.push_str(&candidate.display);
+        let end = text.chars().count();
+        if i == state.selected {
+            selected_range = start..end;
+        }
+    }
+    let selected = vec![StyledSpan {
+        start: selected_range.start,
+        end: selected_range.end,
+        fg: vt100::Color::Default,
+        attrs: vt100::CellAttrs { reverse: true, ..vt100::CellAttrs::default() },
+    }];
+    CompletionRow { chars: text.chars().collect(), bold, selected, selected_range }
+}
+
+// Wraps redraw() with exactly one extra row for the completion menu,
+// positioned via relative cursor movement (down 1, then back up 1)
+// rather than absolute-row tracking or save/restore-cursor: save/
+// restore captures an *absolute* coordinate, which goes stale the
+// moment a scroll happens between save and restore -- exactly the
+// "prompt on the terminal's last row" case this needs to survive.
+// Relative movement nets to zero rows moved regardless of what
+// scrolled in between, correct by construction. The row is always
+// erased (even when `completion` is now None), clearing a stale row
+// left over from the previous call. `\x1b[1A` restores the *row* but
+// not the column redraw() already left the real cursor at -- the
+// second redraw() call is the deliberately-simple way to fix that,
+// rather than duplicating redraw()'s own column math here.
+fn redraw_with_completion_row(
+    prompt: &str,
+    ed: &LineEditor,
+    completion: Option<&CompletionState>,
+    menu_capable: bool,
+    col_origin: usize,
+    width: usize,
+    ctx: HighlightContext,
+) -> io::Result<()> {
+    redraw(prompt, ed, col_origin, width, ctx)?;
+    if !menu_capable {
+        return Ok(());
+    }
+
+    let mut out = String::new();
+    out.push_str("\x1b[1B");
+    out.push_str(&format!("\x1b[{}G", col_origin + 1));
+    out.push_str(&" ".repeat(width));
+    out.push_str(&format!("\x1b[{}G", col_origin + 1));
+    if let Some(state) = completion {
+        let row = build_completion_row(state);
+        let cells = highlight::compose(&row.chars, &[&row.bold, &row.selected]);
+        let visible: &[vt100::Cell] = if row.chars.len() <= width {
+            &cells
+        } else {
+            // Right-anchors the window on the selected candidate's own
+            // end, same shape as redraw()'s own cursor-visibility clamp
+            // for an overlong buffer -- a long candidate list stays
+            // truncated/scrolled to `width` rather than wrapping into a
+            // neighboring pane's row.
+            let window_start = row.selected_range.end.saturating_sub(width).min(row.chars.len() - width);
+            let window_end = (window_start + width).min(row.chars.len());
+            &cells[window_start..window_end]
+        };
+        out.push_str(&highlight::render_styled(visible));
+    }
+    out.push_str("\x1b[1A");
+    print!("{}", out);
+    io::stdout().flush()?;
+
+    redraw(prompt, ed, col_origin, width, ctx)
+}
+
 // How many terminal columns `s` actually occupies once drawn, not
 // counting invisible escape bytes -- `s` is always one of this crate's
 // own prompt strings, which only ever embed `\x1b[...m` SGR (color)
@@ -671,7 +778,7 @@ pub fn read_line(
     // as a parameter now so both repl.rs call sites only need to change
     // their argument list once.
     completion_provider: Option<&dyn CompletionProvider>,
-    _menu_capable: bool,
+    menu_capable: bool,
     mut on_idle: impl FnMut(),
 ) -> io::Result<ReadOutcome> {
     let mut guard = Some(term::RawGuard::enable(0)?);
@@ -707,7 +814,7 @@ pub fn read_line(
     // print here would append a second copy right next to it instead of
     // redrawing over it. Behaviorally identical to the old bare print for
     // every non-paned caller (col_origin 0, width the whole terminal).
-    redraw(prompt, &ed, col_origin, width, ctx)?;
+    redraw_with_completion_row(prompt, &ed, completion.as_ref(), menu_capable, col_origin, width, ctx)?;
 
     // Set only when Ctrl-E's or Ctrl-O's own sub-loop below reports a key
     // it didn't consume itself (Ctrl-C/D/Z -- see run_line_normal_mode/
@@ -933,7 +1040,7 @@ pub fn read_line(
             },
             Key::AltLeft | Key::AltRight | Key::AltUp | Key::CtrlY | Key::Unknown => {}
         }
-        redraw(prompt, &ed, col_origin, width, ctx)?;
+        redraw_with_completion_row(prompt, &ed, completion.as_ref(), menu_capable, col_origin, width, ctx)?;
     }
 }
 
