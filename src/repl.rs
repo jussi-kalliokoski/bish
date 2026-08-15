@@ -885,17 +885,35 @@ fn run_fg_job_frame(
         }
         FgOutcome::Detached => {
             job_frames.insert(job_frame_id, job);
-            let _ = handle_command_mode(
+            // Normal mode, not command mode directly -- matches what the
+            // detach key already does from a genuinely idle prompt (see
+            // editor::ReadOutcome::NormalMode), rather than a second,
+            // inconsistent "Ctrl+Space sometimes means normal mode,
+            // sometimes means command mode" behavior depending on what
+            // happened to be running. `:` still reaches command mode from
+            // here (run_normal_mode_navigation's own doc comment), so
+            // `window next`/`previous` away from this job stays exactly
+            // as reachable as before, just one keystroke further in.
+            // No initial text/cursor to resume -- this pane's top frame
+            // is Frame::Job, not a live prompt (see run_normal_mode_
+            // navigation's own `at_live_prompt` gate), so whatever this
+            // returns for "resume editing here" is meaningless and gets
+            // silently discarded anyway once the main loop sees the same
+            // Frame::Job still on top and re-drives this job instead of
+            // ever calling read_line with it.
+            let _ = run_normal_mode_navigation(
                 session_id,
                 sessions,
                 windows,
                 current_window,
                 next_session_id,
                 next_window_id,
-                cmd_history,
                 sinks_are_grid,
                 job_frames,
+                cmd_history,
                 registers,
+                String::new(),
+                0,
                 term_rows,
                 term_cols,
             );
@@ -2446,18 +2464,35 @@ fn run_normal_mode_navigation(
     // that's never lost focus before would render as a blank pane, not
     // even showing the current prompt (or, now that this isn't empty-
     // buffer-only, whatever had already been typed).
-    let prompt_str = freeze_input_with_text(sessions.get_mut(&session_id).unwrap(), &initial_text);
+    // Only freeze a synthetic prompt line in when this pane is genuinely
+    // idle at its own live prompt (top frame a Session) -- the exact same
+    // gate freeze_idle_prompt's own call sites already use, and for the
+    // same reason: reached here (M10c) is also a running job's detach
+    // key, and that pane's grid is already being live-written by
+    // drive_fg_job with the job's *real* screen -- freezing a bogus
+    // prompt line on top of it would splice fake prompt text into the
+    // middle of a fullscreen program's actual display (e.g. vim's own
+    // status line), right at wherever its cursor happened to be.
+    let at_live_prompt = matches!(windows[*current_window].stack().last(), Some(Frame::Session(_)));
     let screen = sessions[&session_id].screen.clone();
     let mut buf = ScreenBuffer::new(screen, normal_mode_content_rows(rect));
-    // Explicitly positioned rather than trusting wherever ScreenBuffer::
-    // new's own default (or the vt100 grid's cursor, wherever feed()
-    // happened to leave it -- at the *end* of what was just fed, which is
-    // only right if the original cursor was already at the end of
-    // initial_text too) lands: the navigation cursor should start exactly
-    // where editing was interrupted, matching real vim entering Normal
-    // mode from Insert.
-    let last_line = buf.line_count().saturating_sub(1);
-    buf.set_cursor(last_line, editor::visible_len(&prompt_str) + initial_cursor);
+    if at_live_prompt {
+        let prompt_str = freeze_input_with_text(sessions.get_mut(&session_id).unwrap(), &initial_text);
+        // Explicitly positioned rather than trusting wherever ScreenBuffer::
+        // new's own default (or the vt100 grid's cursor, wherever feed()
+        // happened to leave it -- at the *end* of what was just fed, which is
+        // only right if the original cursor was already at the end of
+        // initial_text too) lands: the navigation cursor should start exactly
+        // where editing was interrupted, matching real vim entering Normal
+        // mode from Insert.
+        let last_line = buf.line_count().saturating_sub(1);
+        buf.set_cursor(last_line, editor::visible_len(&prompt_str) + initial_cursor);
+    }
+    // The Job-detach case needs no repositioning at all: ScreenBuffer::
+    // new's own default cursor is already the live grid's real cursor --
+    // exactly where the job's own on-screen cursor was left, which is the
+    // only sensible place for navigation to start when there's no
+    // synthetic prompt line to land after.
     let mut vk = VimKeys::new();
 
     let _guard = term::RawGuard::enable(0)?;
