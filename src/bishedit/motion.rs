@@ -60,6 +60,34 @@ pub enum Motion {
     SearchBackward(String), // ?pattern<Enter>
     SearchWordForward,      // *
     SearchWordBackward,     // #
+    // `iw`/`aw`/`i(`/`a(`/`i"`/`a"`/... -- vim's text objects, valid only as
+    // an operator's target (`vimkeys.rs` only ever produces this while an
+    // operator is armed -- see its own doc comment on `i`/`a`'s gating).
+    // Unlike every other `Motion`, the cursor usually sits *inside* the
+    // target range rather than at one of its ends, so `motion_range` can't
+    // use its usual "apply the motion, diff the cursor before/after" trick
+    // -- it special-cases this variant to call `text_object_range` directly
+    // instead. `bool` is `around` (`a{obj}`) vs inner (`i{obj}`).
+    TextObject(TextObjectKind, bool),
+}
+
+/// The object an `i`/`a` text object names. `b`/`B` are vim's own aliases for
+/// `(`/`{` respectively (both map to `Paren`/`Brace`); tag objects (`it`/
+/// `at`) are out of scope for this pass -- rare outside markup, and this is
+/// a shell editor, not a web one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextObjectKind {
+    Word,
+    WordBig,
+    Sentence,
+    Paragraph,
+    Paren,
+    Brace,
+    Bracket,
+    Angle,
+    DoubleQuote,
+    SingleQuote,
+    Backtick,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -573,6 +601,319 @@ pub fn word_under_cursor(buf: &impl Buffer, pos: (usize, usize)) -> Option<Strin
     Some((start_col..=end_col).filter_map(|c| buf.char_at(line, c)).collect())
 }
 
+/// The chunk (contiguous run of the same `Class`) at `col` on `line`,
+/// extended `count - 1` further chunks forward -- the shared core of
+/// `iw`/`aw`/`iW`/`aW`: vim defines `[count]iw` as "the word (or
+/// punctuation-run, or blank-run -- whichever the cursor sits on) plus the
+/// next `count - 1` chunks of *any* class immediately following it".
+fn word_object_range(buf: &impl Buffer, pos: (usize, usize), big: bool, around: bool, count: Option<usize>) -> Option<MotionRange> {
+    let (line, col) = pos;
+    if buf.line_len(line) == 0 {
+        return None;
+    }
+    let col = col.min(last_col(buf, line));
+    let last = last_col(buf, line);
+    let cls = classify(buf, line, col, big);
+    let mut start = col;
+    while start > 0 && classify(buf, line, start - 1, big) == cls {
+        start -= 1;
+    }
+    let mut end = col;
+    while end < last && classify(buf, line, end + 1, big) == cls {
+        end += 1;
+    }
+    for _ in 1..count.unwrap_or(1).max(1) {
+        if end >= last {
+            break;
+        }
+        let next_cls = classify(buf, line, end + 1, big);
+        end += 1;
+        while end < last && classify(buf, line, end + 1, big) == next_cls {
+            end += 1;
+        }
+    }
+    if around {
+        if end < last && classify(buf, line, end + 1, big) == Class::Blank {
+            end += 1;
+            while end < last && classify(buf, line, end + 1, big) == Class::Blank {
+                end += 1;
+            }
+        } else if start > 0 && classify(buf, line, start - 1, big) == Class::Blank {
+            start -= 1;
+            while start > 0 && classify(buf, line, start - 1, big) == Class::Blank {
+                start -= 1;
+            }
+        }
+    }
+    Some(MotionRange { shape: MotionShape::Inclusive, from: (line, start), to: (line, end) })
+}
+
+/// `i"`/`a"`/`i'`/`a'`/`` i` ``/`` a` `` -- same-line only, matching vim
+/// (string text objects never cross a line break). Pairs up every
+/// occurrence of `quote` on the line left to right (1st+2nd, 3rd+4th, ...)
+/// and picks the first pair the cursor is at-or-before the close of --
+/// vim's own rule: inside a pair selects that pair, before all pairs
+/// selects the first, in the gap between two pairs selects the next one.
+fn quote_object_range(buf: &impl Buffer, pos: (usize, usize), quote: char, around: bool) -> Option<MotionRange> {
+    let (line, col) = pos;
+    let len = buf.line_len(line);
+    let positions: Vec<usize> = (0..len).filter(|&c| buf.char_at(line, c) == Some(quote)).collect();
+    let mut pair = None;
+    let mut i = 0;
+    while i + 1 < positions.len() {
+        let (a, b) = (positions[i], positions[i + 1]);
+        if col <= b {
+            pair = Some((a, b));
+            break;
+        }
+        i += 2;
+    }
+    let (a, b) = pair?;
+    if around {
+        let mut end = b;
+        if end < len.saturating_sub(1) && matches!(buf.char_at(line, end + 1), Some(c) if c.is_whitespace()) {
+            end += 1;
+            while end < len.saturating_sub(1) && matches!(buf.char_at(line, end + 1), Some(c) if c.is_whitespace()) {
+                end += 1;
+            }
+            return Some(MotionRange { shape: MotionShape::Inclusive, from: (line, a), to: (line, end) });
+        }
+        let mut start = a;
+        while start > 0 && matches!(buf.char_at(line, start - 1), Some(c) if c.is_whitespace()) {
+            start -= 1;
+        }
+        Some(MotionRange { shape: MotionShape::Inclusive, from: (line, start), to: (line, end) })
+    } else if b > a + 1 {
+        Some(MotionRange { shape: MotionShape::Inclusive, from: (line, a + 1), to: (line, b - 1) })
+    } else {
+        // Adjacent quotes ("") have nothing between them -- matches vim's
+        // own `di"` no-op on an empty string.
+        None
+    }
+}
+
+/// Walks forward from just after `open_pos` (already known to hold `open`),
+/// tracking nesting depth, to `open_pos`'s matching `close`.
+fn scan_matching_forward(buf: &impl Buffer, open_pos: (usize, usize), open: char, close: char) -> Option<(usize, usize)> {
+    let mut depth = 1;
+    let mut cur = open_pos;
+    loop {
+        cur = step_forward(buf, cur)?;
+        match buf.char_at(cur.0, cur.1) {
+            Some(c) if c == open => depth += 1,
+            Some(c) if c == close => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(cur);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Mirror of `scan_matching_forward`: walks backward from just before
+/// `close_pos` to its matching `open`.
+fn scan_matching_backward(buf: &impl Buffer, close_pos: (usize, usize), open: char, close: char) -> Option<(usize, usize)> {
+    let mut depth = 1;
+    let mut cur = close_pos;
+    loop {
+        cur = step_backward(buf, cur)?;
+        match buf.char_at(cur.0, cur.1) {
+            Some(c) if c == close => depth += 1,
+            Some(c) if c == open => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(cur);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Walks backward from `pos` (not itself on `open`/`close`) for the nearest
+/// `open` that isn't already balanced by a `close` seen along the way --
+/// i.e. the bracket that innermost-encloses `pos`.
+fn scan_unmatched_open_backward(buf: &impl Buffer, pos: (usize, usize), open: char, close: char) -> Option<(usize, usize)> {
+    let mut depth = 0;
+    let mut cur = pos;
+    loop {
+        cur = step_backward(buf, cur)?;
+        match buf.char_at(cur.0, cur.1) {
+            Some(c) if c == close => depth += 1,
+            Some(c) if c == open => {
+                if depth == 0 {
+                    return Some(cur);
+                }
+                depth -= 1;
+            }
+            _ => {}
+        }
+    }
+}
+
+/// The bracket pair that innermost-encloses `pos` -- `pos` sitting exactly
+/// on `open` or `close` counts as enclosed by that pair (matching vim: `%`
+/// on either paren already works the same way).
+fn find_enclosing_pair(buf: &impl Buffer, pos: (usize, usize), open: char, close: char) -> Option<((usize, usize), (usize, usize))> {
+    if let Some(c) = buf.char_at(pos.0, pos.1) {
+        if c == open {
+            return scan_matching_forward(buf, pos, open, close).map(|close_pos| (pos, close_pos));
+        }
+        if c == close {
+            return scan_matching_backward(buf, pos, open, close).map(|open_pos| (open_pos, pos));
+        }
+    }
+    let open_pos = scan_unmatched_open_backward(buf, pos, open, close)?;
+    let close_pos = scan_matching_forward(buf, open_pos, open, close)?;
+    Some((open_pos, close_pos))
+}
+
+/// `i(`/`a(`/`ib`/`ab`/`i{`/`a{`/... -- spans lines (unlike word/quote
+/// objects), tracking nesting via `find_enclosing_pair`. `count` widens
+/// outward one enclosing level per extra count, same as vim's `2i(` inside
+/// nested parens.
+fn pair_object_range(buf: &impl Buffer, pos: (usize, usize), open: char, close: char, around: bool, count: Option<usize>) -> Option<MotionRange> {
+    let n = count.unwrap_or(1).max(1);
+    let mut cur_pos = pos;
+    let mut pair = None;
+    for i in 0..n {
+        let found = find_enclosing_pair(buf, cur_pos, open, close)?;
+        pair = Some(found);
+        if i + 1 < n {
+            cur_pos = step_backward(buf, found.0)?;
+        }
+    }
+    let (open_pos, close_pos) = pair?;
+    if around {
+        Some(MotionRange { shape: MotionShape::Inclusive, from: open_pos, to: close_pos })
+    } else {
+        let inner_start = step_forward(buf, open_pos)?;
+        let inner_end = step_backward(buf, close_pos)?;
+        if pos_lt(inner_end, inner_start) {
+            // Adjacent brackets ("()") have nothing between them -- matches
+            // vim's own `di(` no-op there, same as the empty-quote case.
+            None
+        } else {
+            Some(MotionRange { shape: MotionShape::Inclusive, from: inner_start, to: inner_end })
+        }
+    }
+}
+
+/// `ip`/`ap` -- the run of contiguous lines with the same "blank or not" as
+/// the cursor's own line, `count - 1` more such runs extended forward.
+/// `around` additionally swallows one trailing blank-line run (or, only if
+/// there's none to swallow -- e.g. the buffer's last paragraph -- a leading
+/// one instead), matching vim's own "prefer trailing, fall back to
+/// leading" rule (same shape as `word_object_range`'s own `around` logic).
+fn paragraph_object_range(buf: &impl Buffer, pos: (usize, usize), around: bool, count: Option<usize>) -> Option<MotionRange> {
+    let (line, _) = pos;
+    let last = buf.line_count() - 1;
+    let is_blank = is_blank_line(buf, line);
+    let mut start = line;
+    while start > 0 && is_blank_line(buf, start - 1) == is_blank {
+        start -= 1;
+    }
+    let mut end = line;
+    while end < last && is_blank_line(buf, end + 1) == is_blank {
+        end += 1;
+    }
+    for _ in 1..count.unwrap_or(1).max(1) {
+        if end >= last {
+            break;
+        }
+        let next_is_blank = is_blank_line(buf, end + 1);
+        end += 1;
+        while end < last && is_blank_line(buf, end + 1) == next_is_blank {
+            end += 1;
+        }
+    }
+    if around && !is_blank {
+        if end < last && is_blank_line(buf, end + 1) {
+            end += 1;
+            while end < last && is_blank_line(buf, end + 1) {
+                end += 1;
+            }
+        } else if start > 0 && is_blank_line(buf, start - 1) {
+            start -= 1;
+            while start > 0 && is_blank_line(buf, start - 1) {
+                start -= 1;
+            }
+        }
+    }
+    Some(MotionRange { shape: MotionShape::Linewise, from: (start, 0), to: (end, 0) })
+}
+
+/// `is`/`as` -- the sentence (per `sentence_starts`'s own boundary rules)
+/// containing the cursor, `count - 1` more sentences extended forward.
+/// `around` includes the whitespace run up to the next sentence's start (or
+/// to the end of the buffer, for the last sentence); inner trims that back
+/// off, stopping at the last non-blank character.
+fn sentence_object_range(buf: &impl Buffer, pos: (usize, usize), around: bool, count: Option<usize>) -> Option<MotionRange> {
+    let starts = sentence_starts(buf);
+    let mut idx = 0;
+    for (i, s) in starts.iter().enumerate() {
+        if !pos_lt(pos, *s) {
+            idx = i;
+        } else {
+            break;
+        }
+    }
+    let start = starts[idx];
+    let buf_end = {
+        let last_line = buf.line_count() - 1;
+        (last_line, last_col(buf, last_line))
+    };
+    let end_idx = (idx + count.unwrap_or(1).max(1) - 1).min(starts.len() - 1);
+    // `sentence_starts` can end with a phantom "start" sitting exactly on
+    // the buffer's very last character -- `sentence_forward_once` clamps
+    // there (see its own test's "clamped on the last '.'" case) rather
+    // than reporting "no more sentences" the way it does mid-buffer, so
+    // that clamp lands in the starts list looking like a genuine next
+    // sentence. It never is one (a sentence can't both end and begin on
+    // the same single character), so it's treated as "no next sentence"
+    // here rather than truncating this object's own last sentence short.
+    let next_start = starts.get(end_idx + 1).copied().filter(|&s| s != buf_end);
+    let around_end = next_start.and_then(|ns| step_backward(buf, ns)).unwrap_or(buf_end);
+    if pos_lt(around_end, start) {
+        return None;
+    }
+    if around {
+        return Some(MotionRange { shape: MotionShape::Inclusive, from: start, to: around_end });
+    }
+    let mut end = around_end;
+    while pos_lt(start, end) {
+        match buf.char_at(end.0, end.1) {
+            Some(c) if c.is_whitespace() => end = step_backward(buf, end).unwrap_or(start),
+            _ => break,
+        }
+    }
+    Some(MotionRange { shape: MotionShape::Inclusive, from: start, to: end })
+}
+
+/// Resolves a text object (`iw`/`aw`/`i(`/`a(`/...) against the cursor's
+/// current position -- unlike `motion_range`'s usual motions, this doesn't
+/// move anything itself; see `Motion::TextObject`'s own doc comment for why
+/// `motion_range` special-cases this variant instead of going through
+/// `apply_motion`.
+pub fn text_object_range(buf: &impl Buffer, kind: TextObjectKind, around: bool, count: Option<usize>) -> Option<MotionRange> {
+    let pos = buf.cursor();
+    match kind {
+        TextObjectKind::Word => word_object_range(buf, pos, false, around, count),
+        TextObjectKind::WordBig => word_object_range(buf, pos, true, around, count),
+        TextObjectKind::Sentence => sentence_object_range(buf, pos, around, count),
+        TextObjectKind::Paragraph => paragraph_object_range(buf, pos, around, count),
+        TextObjectKind::Paren => pair_object_range(buf, pos, '(', ')', around, count),
+        TextObjectKind::Brace => pair_object_range(buf, pos, '{', '}', around, count),
+        TextObjectKind::Bracket => pair_object_range(buf, pos, '[', ']', around, count),
+        TextObjectKind::Angle => pair_object_range(buf, pos, '<', '>', around, count),
+        TextObjectKind::DoubleQuote => quote_object_range(buf, pos, '"', around),
+        TextObjectKind::SingleQuote => quote_object_range(buf, pos, '\'', around),
+        TextObjectKind::Backtick => quote_object_range(buf, pos, '`', around),
+    }
+}
+
 /// Literal (non-regex) substring search -- deliberately simple, matching
 /// this milestone's "nothing fancy" scope. Matches never span line breaks.
 fn line_find(buf: &impl Buffer, line: usize, lower_bound: usize, chars: &[char]) -> Option<usize> {
@@ -1049,6 +1390,17 @@ pub fn apply_motion(buf: &mut impl Buffer, motion: Motion, count: Option<usize>)
                 }
             }
         }
+        // Not reached by any wiring in this crate today -- `vimkeys.rs`
+        // only ever produces this while an operator is armed, which
+        // `motion_range` (below) intercepts before `apply_motion` would be
+        // called. Implemented anyway (moves to the object's start, same as
+        // `motion_range`'s own contract) so this stays correct rather than
+        // silently wrong if a future caller ever does invoke it standalone.
+        Motion::TextObject(kind, around) => {
+            if let Some(range) = text_object_range(buf, kind, around, count) {
+                buf.set_cursor(range.from.0, range.from.1);
+            }
+        }
     }
 }
 
@@ -1113,6 +1465,13 @@ fn motion_shape(m: &Motion) -> Option<MotionShape> {
         Motion::GotoMarkLine(_) => Linewise,
         Motion::SearchForward(_) | Motion::SearchBackward(_) => Exclusive,
         Motion::SearchWordForward | Motion::SearchWordBackward => Exclusive,
+        // Never actually consulted -- `motion_range` special-cases
+        // `TextObject` before this function is called at all (see
+        // `Motion::TextObject`'s own doc comment). Kept correct anyway,
+        // matching `text_object_range`'s own per-kind shape, for whatever
+        // future caller might reasonably expect `motion_shape` to be total.
+        Motion::TextObject(TextObjectKind::Paragraph, _) => Linewise,
+        Motion::TextObject(..) => Inclusive,
     })
 }
 
@@ -1140,6 +1499,16 @@ pub struct MotionRange {
 /// motion that's already at its clamped boundary) -- either way, there's
 /// nothing to yank and the cursor is restored to where it started.
 pub fn motion_range(buf: &mut impl Buffer, motion: Motion, count: Option<usize>) -> Option<MotionRange> {
+    // Text objects don't fit the "apply the motion, diff the cursor
+    // before/after" trick below -- the cursor usually sits *inside* the
+    // target range, not at one of its ends -- so they're resolved directly
+    // via `text_object_range` instead, then the cursor is parked at
+    // `range.from` to match every other motion's own contract here.
+    if let Motion::TextObject(kind, around) = motion {
+        let range = text_object_range(buf, kind, around, count)?;
+        buf.set_cursor(range.from.0, range.from.1);
+        return Some(range);
+    }
     let shape = motion_shape(&motion)?;
     let start = buf.cursor();
     apply_motion(buf, motion, count);
@@ -1866,5 +2235,147 @@ mod tests {
     fn find_matches_in_line_match_at_very_end_does_not_loop_forever() {
         let buf = TestBuffer::new("foobar");
         assert_eq!(find_matches_in_line(&buf, 0, "bar"), vec![(3, 6)]);
+    }
+
+    fn object_text(buf: &mut TestBuffer, cursor: (usize, usize), kind: TextObjectKind, around: bool, count: Option<usize>) -> Option<String> {
+        buf.set_cursor(cursor.0, cursor.1);
+        let range = text_object_range(buf, kind, around, count)?;
+        Some(extract_text(buf, &range))
+    }
+
+    #[test]
+    fn inner_and_around_word() {
+        let mut buf = TestBuffer::new("foo bar baz");
+        assert_eq!(object_text(&mut buf, (0, 1), TextObjectKind::Word, false, None), Some("foo".to_string()));
+        assert_eq!(object_text(&mut buf, (0, 1), TextObjectKind::Word, true, None), Some("foo ".to_string()));
+        // no trailing whitespace at buffer end -- `aw` falls back to
+        // leading whitespace instead.
+        assert_eq!(object_text(&mut buf, (0, 9), TextObjectKind::Word, true, None), Some(" baz".to_string()));
+    }
+
+    #[test]
+    fn word_object_on_punctuation_and_whitespace_runs() {
+        let mut buf = TestBuffer::new("foo, bar");
+        assert_eq!(object_text(&mut buf, (0, 3), TextObjectKind::Word, false, None), Some(",".to_string()));
+        assert_eq!(object_text(&mut buf, (0, 4), TextObjectKind::Word, false, None), Some(" ".to_string()));
+    }
+
+    #[test]
+    fn word_object_big_ignores_punctuation_boundaries() {
+        let mut buf = TestBuffer::new("foo.bar baz");
+        assert_eq!(object_text(&mut buf, (0, 1), TextObjectKind::Word, false, None), Some("foo".to_string()));
+        assert_eq!(object_text(&mut buf, (0, 1), TextObjectKind::WordBig, false, None), Some("foo.bar".to_string()));
+    }
+
+    #[test]
+    fn word_object_count_extends_through_following_chunks() {
+        let mut buf = TestBuffer::new("foo bar baz");
+        assert_eq!(object_text(&mut buf, (0, 1), TextObjectKind::Word, false, Some(3)), Some("foo bar".to_string()));
+        assert_eq!(object_text(&mut buf, (0, 1), TextObjectKind::Word, false, Some(4)), Some("foo bar ".to_string()));
+    }
+
+    #[test]
+    fn quote_objects_inner_and_around() {
+        let mut buf = TestBuffer::new(r#"say "hello world" now"#);
+        assert_eq!(object_text(&mut buf, (0, 7), TextObjectKind::DoubleQuote, false, None), Some("hello world".to_string()));
+        assert_eq!(object_text(&mut buf, (0, 7), TextObjectKind::DoubleQuote, true, None), Some(r#""hello world" "#.to_string()));
+        // cursor before the quotes still finds them
+        assert_eq!(object_text(&mut buf, (0, 0), TextObjectKind::DoubleQuote, false, None), Some("hello world".to_string()));
+    }
+
+    #[test]
+    fn quote_object_empty_pair_has_no_inner_but_has_around() {
+        let mut buf = TestBuffer::new(r#"x = "";"#);
+        assert_eq!(object_text(&mut buf, (0, 5), TextObjectKind::DoubleQuote, false, None), None);
+        // No whitespace trails the closing quote (`;` isn't blank), so `a"`
+        // falls back to the leading whitespace before the opening quote --
+        // same "prefer trailing, fall back to leading" rule as `aw`.
+        assert_eq!(object_text(&mut buf, (0, 5), TextObjectKind::DoubleQuote, true, None), Some(r#" """#.to_string()));
+    }
+
+    #[test]
+    fn quote_object_cursor_past_all_quotes_fails() {
+        let mut buf = TestBuffer::new(r#""a" done"#);
+        assert_eq!(object_text(&mut buf, (0, 6), TextObjectKind::DoubleQuote, false, None), None);
+    }
+
+    #[test]
+    fn paren_object_inner_and_around() {
+        let mut buf = TestBuffer::new("foo(bar, baz)qux");
+        assert_eq!(object_text(&mut buf, (0, 6), TextObjectKind::Paren, false, None), Some("bar, baz".to_string()));
+        assert_eq!(object_text(&mut buf, (0, 6), TextObjectKind::Paren, true, None), Some("(bar, baz)".to_string()));
+    }
+
+    #[test]
+    fn paren_object_cursor_on_delimiter_counts_as_inside() {
+        let mut buf = TestBuffer::new("(x)");
+        assert_eq!(object_text(&mut buf, (0, 0), TextObjectKind::Paren, false, None), Some("x".to_string()));
+        assert_eq!(object_text(&mut buf, (0, 2), TextObjectKind::Paren, false, None), Some("x".to_string()));
+    }
+
+    #[test]
+    fn paren_object_empty_has_no_inner() {
+        let mut buf = TestBuffer::new("f()");
+        assert_eq!(object_text(&mut buf, (0, 1), TextObjectKind::Paren, false, None), None);
+        assert_eq!(object_text(&mut buf, (0, 1), TextObjectKind::Paren, true, None), Some("()".to_string()));
+    }
+
+    #[test]
+    fn paren_object_nesting_and_count_widens_outward() {
+        let mut buf = TestBuffer::new("(a (b) c)");
+        assert_eq!(object_text(&mut buf, (0, 4), TextObjectKind::Paren, false, None), Some("b".to_string()));
+        assert_eq!(object_text(&mut buf, (0, 4), TextObjectKind::Paren, false, Some(2)), Some("a (b) c".to_string()));
+    }
+
+    #[test]
+    fn paren_object_spans_multiple_lines() {
+        // The open/close brackets themselves sit at the very end of line 0
+        // and the very start of line 2 -- `step_forward`/`step_backward`
+        // never land on the (virtual) newline between them, so the inner
+        // range is exactly line 1's own content, same convention every
+        // other line-crossing motion in this module already follows.
+        let mut buf = TestBuffer::new("foo(\nbar\n)baz");
+        assert_eq!(object_text(&mut buf, (1, 1), TextObjectKind::Paren, false, None), Some("bar".to_string()));
+    }
+
+    #[test]
+    fn brace_and_bracket_and_angle_objects() {
+        let mut buf = TestBuffer::new("{a}[b]<c>");
+        assert_eq!(object_text(&mut buf, (0, 1), TextObjectKind::Brace, false, None), Some("a".to_string()));
+        assert_eq!(object_text(&mut buf, (0, 4), TextObjectKind::Bracket, false, None), Some("b".to_string()));
+        assert_eq!(object_text(&mut buf, (0, 7), TextObjectKind::Angle, false, None), Some("c".to_string()));
+    }
+
+    #[test]
+    fn paragraph_object_inner_and_around() {
+        let mut buf = TestBuffer::new("one\ntwo\n\nthree\nfour\n\nfive");
+        assert_eq!(object_text(&mut buf, (0, 0), TextObjectKind::Paragraph, false, None), Some("one\ntwo\n".to_string()));
+        assert_eq!(object_text(&mut buf, (0, 0), TextObjectKind::Paragraph, true, None), Some("one\ntwo\n\n".to_string()));
+        assert_eq!(object_text(&mut buf, (3, 0), TextObjectKind::Paragraph, false, None), Some("three\nfour\n".to_string()));
+        // last paragraph has no trailing blank run -- `ap` falls back to
+        // the leading one instead.
+        assert_eq!(object_text(&mut buf, (6, 0), TextObjectKind::Paragraph, true, None), Some("\nfive\n".to_string()));
+    }
+
+    #[test]
+    fn sentence_object_inner_and_around() {
+        let mut buf = TestBuffer::new("One sentence. Two sentence. Three.");
+        assert_eq!(object_text(&mut buf, (0, 1), TextObjectKind::Sentence, false, None), Some("One sentence.".to_string()));
+        assert_eq!(object_text(&mut buf, (0, 1), TextObjectKind::Sentence, true, None), Some("One sentence. ".to_string()));
+        assert_eq!(object_text(&mut buf, (0, 14), TextObjectKind::Sentence, false, None), Some("Two sentence.".to_string()));
+        assert_eq!(object_text(&mut buf, (0, 29), TextObjectKind::Sentence, false, None), Some("Three.".to_string()));
+    }
+
+    #[test]
+    fn word_object_line_gets_left_untouched_by_text_object_variant_in_motion_shape() {
+        // `TextObject` is never dispatched through `apply_motion`'s normal
+        // callers in this crate (see the variant's own doc comment), but it
+        // must still be handled correctly for `motion_shape`/`apply_motion`
+        // to stay total -- exercised here directly rather than left
+        // entirely to the "never reached" claim.
+        let mut buf = TestBuffer::new("foo bar");
+        buf.set_cursor(0, 5);
+        apply_motion(&mut buf, Motion::TextObject(TextObjectKind::Word, false), None);
+        assert_eq!(buf.cursor(), (0, 4));
     }
 }

@@ -6,7 +6,7 @@
 // by the caller via bishedit::motion::apply_motion.
 
 use crate::editor::Key;
-use super::motion::Motion;
+use super::motion::{Motion, TextObjectKind};
 use super::registers::RegisterShape;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -258,6 +258,10 @@ enum Pending {
     Mark,
     GotoMarkExact,
     GotoMarkLine,
+    // `i`/`a` seen while an operator is armed -- awaiting the object
+    // character (`w`, `(`, `"`, ...). See `feed_fresh`'s own `i`/`a` arms
+    // for why this is only entered in that context, never standalone.
+    TextObject { around: bool },
     Z,
     Window,
     // <C-w>g -- awaiting the second 'g' of <C-w>gg, mirroring plain `gg`'s
@@ -533,6 +537,7 @@ impl VimKeys {
             Pending::Mark => self.feed_mark(key, MarkKind::Set),
             Pending::GotoMarkExact => self.feed_mark(key, MarkKind::GotoExact),
             Pending::GotoMarkLine => self.feed_mark(key, MarkKind::GotoLine),
+            Pending::TextObject { around } => self.feed_text_object(key, around),
             Pending::Z => self.feed_z(key),
             Pending::Window => self.feed_window(key),
             Pending::WindowG => self.feed_window_g(key),
@@ -726,6 +731,27 @@ impl VimKeys {
                 self.pending = Pending::Window;
                 KeyOutcome::Pending
             }
+            // `i`/`a` while an operator is armed (`diw`, `ca(`, ...) name a
+            // text object instead of entering insert mode -- vim's own
+            // dual meaning for these two keys. Gated on `active_operator`
+            // rather than checked inside `feed_text_object` itself, so a
+            // bare `i`/`a` at a fresh dispatch point keeps meaning
+            // insert-entry exactly as it always has (this arm must stay
+            // ahead of the plain `emit_insert` arms below -- first match
+            // wins). Not extended to Visual mode (`viw`) in this pass --
+            // that would need the caller to re-anchor the selection to the
+            // object's start too, which a bare `KeyOutcome::Motion` has no
+            // way to signal; `active_operator`-only keeps every existing
+            // Visual-mode call site (repl.rs/editor.rs/fileeditor.rs)
+            // untouched.
+            Key::Char('i') if self.active_operator.is_some() => {
+                self.pending = Pending::TextObject { around: false };
+                KeyOutcome::Pending
+            }
+            Key::Char('a') if self.active_operator.is_some() => {
+                self.pending = Pending::TextObject { around: true };
+                KeyOutcome::Pending
+            }
             Key::Char('i') => self.emit_insert(InsertCmd::Before),
             Key::Char('a') => self.emit_insert(InsertCmd::After),
             Key::Char('I') => self.emit_insert(InsertCmd::LineStart),
@@ -833,6 +859,30 @@ impl VimKeys {
             }),
             _ => self.abort(),
         }
+    }
+
+    // The object character after `i`/`a` while an operator is armed --
+    // resolves to `Motion::TextObject`, folded into an `Operator` by
+    // `feed`'s own existing active-operator handling exactly like any other
+    // motion (nothing new needed there). `b`/`B` are vim's own aliases for
+    // `(`/`{`; tag objects (`it`/`at`) aren't supported (see
+    // `TextObjectKind`'s own doc comment).
+    fn feed_text_object(&mut self, key: Key, around: bool) -> KeyOutcome {
+        let kind = match key {
+            Key::Char('w') => TextObjectKind::Word,
+            Key::Char('W') => TextObjectKind::WordBig,
+            Key::Char('s') => TextObjectKind::Sentence,
+            Key::Char('p') => TextObjectKind::Paragraph,
+            Key::Char('(') | Key::Char(')') | Key::Char('b') => TextObjectKind::Paren,
+            Key::Char('{') | Key::Char('}') | Key::Char('B') => TextObjectKind::Brace,
+            Key::Char('[') | Key::Char(']') => TextObjectKind::Bracket,
+            Key::Char('<') | Key::Char('>') => TextObjectKind::Angle,
+            Key::Char('"') => TextObjectKind::DoubleQuote,
+            Key::Char('\'') => TextObjectKind::SingleQuote,
+            Key::Char('`') => TextObjectKind::Backtick,
+            _ => return self.abort(),
+        };
+        self.emit(Motion::TextObject(kind, around))
     }
 
     fn feed_z(&mut self, key: Key) -> KeyOutcome {
@@ -1569,10 +1619,24 @@ mod tests {
     fn operator_invalid_continuation_aborts_and_does_not_leak() {
         let mut vk = VimKeys::new();
         assert_eq!(vk.feed(Key::Char('y')), KeyOutcome::Pending);
-        // 'i' isn't a motion -- cancels the pending operator entirely,
-        // consumed rather than also entering insert mode.
-        assert_eq!(vk.feed(Key::Char('i')), KeyOutcome::None);
+        // 'q' isn't a motion (or a text-object prefix) -- cancels the
+        // pending operator entirely.
+        assert_eq!(vk.feed(Key::Char('q')), KeyOutcome::None);
         // and the next key starts completely fresh
+        assert_eq!(vk.feed(Key::Char('w')), KeyOutcome::Motion(Motion::WordForward, None));
+    }
+
+    #[test]
+    fn operator_i_a_prefix_invalid_continuation_aborts_and_does_not_leak() {
+        let mut vk = VimKeys::new();
+        assert_eq!(vk.feed(Key::Char('y')), KeyOutcome::Pending);
+        // 'i' while an operator is armed is a text-object prefix now, not
+        // an immediate abort -- see the dedicated `text_object_*` tests
+        // for the valid continuations. An unrecognized object character
+        // still aborts the whole thing, same as any other invalid
+        // operator continuation.
+        assert_eq!(vk.feed(Key::Char('i')), KeyOutcome::Pending);
+        assert_eq!(vk.feed(Key::Char('q')), KeyOutcome::None);
         assert_eq!(vk.feed(Key::Char('w')), KeyOutcome::Motion(Motion::WordForward, None));
     }
 
@@ -1827,7 +1891,102 @@ mod tests {
     fn delete_invalid_continuation_aborts_and_does_not_leak() {
         let mut vk = VimKeys::new();
         assert_eq!(vk.feed(Key::Char('d')), KeyOutcome::Pending);
-        assert_eq!(vk.feed(Key::Char('i')), KeyOutcome::None);
+        assert_eq!(vk.feed(Key::Char('q')), KeyOutcome::None);
+        assert_eq!(vk.feed(Key::Char('w')), KeyOutcome::Motion(Motion::WordForward, None));
+    }
+
+    #[test]
+    fn text_object_only_recognized_while_an_operator_is_armed() {
+        // Bare 'i'/'a' at a fresh dispatch point still mean insert-entry --
+        // the text-object meaning only kicks in once an operator is armed.
+        let mut vk = VimKeys::new();
+        assert_eq!(vk.feed(Key::Char('i')), KeyOutcome::EnterInsert(InsertCmd::Before));
+        let mut vk = VimKeys::new();
+        assert_eq!(vk.feed(Key::Char('a')), KeyOutcome::EnterInsert(InsertCmd::After));
+    }
+
+    #[test]
+    fn diw_and_daw_resolve_to_word_text_objects() {
+        let mut vk = VimKeys::new();
+        let keys = [Key::Char('d'), Key::Char('i'), Key::Char('w')];
+        assert_eq!(
+            last(&mut vk, &keys),
+            KeyOutcome::Operator(Op::Delete, Motion::TextObject(TextObjectKind::Word, false), None, None)
+        );
+        let mut vk = VimKeys::new();
+        let keys = [Key::Char('d'), Key::Char('a'), Key::Char('w')];
+        assert_eq!(
+            last(&mut vk, &keys),
+            KeyOutcome::Operator(Op::Delete, Motion::TextObject(TextObjectKind::Word, true), None, None)
+        );
+    }
+
+    #[test]
+    fn text_object_count_combines_on_either_side() {
+        // count before the operator...
+        let mut vk = VimKeys::new();
+        let keys = [Key::Char('2'), Key::Char('c'), Key::Char('i'), Key::Char('w')];
+        assert_eq!(
+            last(&mut vk, &keys),
+            KeyOutcome::Operator(Op::Change, Motion::TextObject(TextObjectKind::Word, false), Some(2), None)
+        );
+        // ...and between the operator and the object prefix -- same result.
+        let mut vk = VimKeys::new();
+        let keys = [Key::Char('c'), Key::Char('2'), Key::Char('i'), Key::Char('w')];
+        assert_eq!(
+            last(&mut vk, &keys),
+            KeyOutcome::Operator(Op::Change, Motion::TextObject(TextObjectKind::Word, false), Some(2), None)
+        );
+    }
+
+    #[test]
+    fn text_object_register_prefix_carries_through() {
+        let mut vk = VimKeys::new();
+        let keys = [Key::Char('"'), Key::Char('a'), Key::Char('y'), Key::Char('i'), Key::Char('w')];
+        assert_eq!(
+            last(&mut vk, &keys),
+            KeyOutcome::Operator(Op::Yank, Motion::TextObject(TextObjectKind::Word, false), None, Some('a'))
+        );
+    }
+
+    #[test]
+    fn text_object_kind_aliases_and_full_set() {
+        let cases: &[(char, TextObjectKind)] = &[
+            ('w', TextObjectKind::Word),
+            ('W', TextObjectKind::WordBig),
+            ('s', TextObjectKind::Sentence),
+            ('p', TextObjectKind::Paragraph),
+            ('(', TextObjectKind::Paren),
+            (')', TextObjectKind::Paren),
+            ('b', TextObjectKind::Paren),
+            ('{', TextObjectKind::Brace),
+            ('}', TextObjectKind::Brace),
+            ('B', TextObjectKind::Brace),
+            ('[', TextObjectKind::Bracket),
+            (']', TextObjectKind::Bracket),
+            ('<', TextObjectKind::Angle),
+            ('>', TextObjectKind::Angle),
+            ('"', TextObjectKind::DoubleQuote),
+            ('\'', TextObjectKind::SingleQuote),
+            ('`', TextObjectKind::Backtick),
+        ];
+        for (ch, kind) in cases {
+            let mut vk = VimKeys::new();
+            let keys = [Key::Char('d'), Key::Char('i'), Key::Char(*ch)];
+            assert_eq!(
+                last(&mut vk, &keys),
+                KeyOutcome::Operator(Op::Delete, Motion::TextObject(*kind, false), None, None),
+                "di{ch} should resolve to {kind:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn text_object_invalid_object_char_aborts_operator() {
+        let mut vk = VimKeys::new();
+        assert_eq!(vk.feed(Key::Char('d')), KeyOutcome::Pending);
+        assert_eq!(vk.feed(Key::Char('i')), KeyOutcome::Pending);
+        assert_eq!(vk.feed(Key::Char('9')), KeyOutcome::None);
         assert_eq!(vk.feed(Key::Char('w')), KeyOutcome::Motion(Motion::WordForward, None));
     }
 
