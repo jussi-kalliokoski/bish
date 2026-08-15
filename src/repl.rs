@@ -3001,13 +3001,13 @@ fn run_normal_mode_navigation(
                 }
                 render_normal_mode_frame(&buf, rect, &vk, None);
             }
-            // `p`/`P`/`x` are all a deliberate no-op here: `ScreenBuffer`
-            // is read-only by construction (a view over already-rendered
-            // scrollback, not an editable buffer -- see its own doc
-            // comment), and there's nothing else in this context that a
-            // put or delete could sensibly target. Falls into the same
-            // bucket as `Pending`/`None` below.
-            KeyOutcome::Put { .. } | KeyOutcome::DeleteCharForward { .. } => {
+            // `p`/`P`/`x`/`J`/`gJ` are all a deliberate no-op here:
+            // `ScreenBuffer` is read-only by construction (a view over
+            // already-rendered scrollback, not an editable buffer -- see
+            // its own doc comment), and there's nothing else in this
+            // context that a put, delete, or join could sensibly target.
+            // Falls into the same bucket as `Pending`/`None` below.
+            KeyOutcome::Put { .. } | KeyOutcome::DeleteCharForward { .. } | KeyOutcome::Join { .. } => {
                 render_normal_mode_frame(&buf, rect, &vk, None);
             }
             KeyOutcome::Window(cmd @ (WindowCmd::GotoFirstWindow | WindowCmd::GotoLastWindow), count) => {

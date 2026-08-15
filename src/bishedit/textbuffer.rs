@@ -186,6 +186,45 @@ impl TextBuffer {
         text
     }
 
+    // `J`/`gJ`: joins `count` lines (minimum 2, matching vim -- a bare `J`
+    // or `1J` both just join the current line with the next one) starting
+    // at the cursor's own line. `with_space` selects vim's default
+    // whitespace-aware join (strips each joined-in line's own leading
+    // whitespace and inserts a single space, unless the current line
+    // already ends in whitespace, the joined-in line is empty, or it
+    // starts with ')') vs. `gJ`'s raw concatenation. Returns whether
+    // anything was actually joined (false at the last line, matching
+    // every other buffer command's own "nothing happened" signal).
+    // Cursor lands at the last join's own boundary, matching vim.
+    pub fn join_lines(&mut self, count: usize, with_space: bool) -> bool {
+        let (row, _) = self.cursor;
+        let available = self.lines.len().saturating_sub(1).saturating_sub(row);
+        let joins = count.max(2).saturating_sub(1).min(available);
+        if joins == 0 {
+            return false;
+        }
+        let mut join_col = self.lines[row].len();
+        for _ in 0..joins {
+            let mut next = self.lines.remove(row + 1);
+            if with_space {
+                let leading_ws = next.iter().take_while(|c| c.is_whitespace()).count();
+                next.drain(0..leading_ws);
+                let cur_ends_blank = self.lines[row].last().is_none_or(|c| c.is_whitespace());
+                let next_starts_close_paren = next.first() == Some(&')');
+                join_col = self.lines[row].len();
+                if !cur_ends_blank && !next.is_empty() && !next_starts_close_paren {
+                    self.lines[row].push(' ');
+                }
+            } else {
+                join_col = self.lines[row].len();
+            }
+            self.lines[row].extend(next);
+        }
+        self.cursor = (row, join_col.min(self.lines[row].len().saturating_sub(1)));
+        self.dirty = true;
+        true
+    }
+
     // Visual mode's own `y`: every selection, concatenated with no
     // separator -- same rule `editor.rs`'s own `yank_selections_line`/
     // repl.rs's `yank_selections` already establish (a `Linewise` part
@@ -404,6 +443,81 @@ mod tests {
         assert_eq!(text_of(&buf), "");
         assert_eq!(buf.line_count(), 1);
         assert_eq!(buf.cursor(), (0, 0));
+    }
+
+    #[test]
+    fn join_lines_default_inserts_a_space_and_strips_leading_whitespace() {
+        let mut buf = make("one\n   two\nthree");
+        buf.set_cursor(0, 0);
+        assert!(buf.join_lines(2, true));
+        assert_eq!(text_of(&buf), "one two\nthree");
+        assert_eq!(buf.cursor(), (0, 3)); // lands on the inserted space
+        assert!(buf.is_dirty());
+    }
+
+    #[test]
+    fn join_lines_no_space_when_current_line_already_ends_blank() {
+        let mut buf = make("one   \ntwo");
+        buf.set_cursor(0, 0);
+        assert!(buf.join_lines(2, true));
+        assert_eq!(text_of(&buf), "one   two");
+    }
+
+    #[test]
+    fn join_lines_no_space_before_a_leading_close_paren() {
+        let mut buf = make("foo(a\n)bar");
+        buf.set_cursor(0, 0);
+        assert!(buf.join_lines(2, true));
+        assert_eq!(text_of(&buf), "foo(a)bar");
+    }
+
+    #[test]
+    fn join_lines_empty_joined_line_adds_nothing() {
+        let mut buf = make("one\n\ntwo");
+        buf.set_cursor(0, 0);
+        assert!(buf.join_lines(2, true));
+        assert_eq!(text_of(&buf), "one\ntwo");
+    }
+
+    #[test]
+    fn gjoin_is_raw_concatenation_no_space_no_stripping() {
+        let mut buf = make("one\n   two");
+        buf.set_cursor(0, 0);
+        assert!(buf.join_lines(2, false));
+        assert_eq!(text_of(&buf), "one   two");
+    }
+
+    #[test]
+    fn join_lines_count_joins_several_lines_at_once() {
+        let mut buf = make("one\ntwo\nthree\nfour");
+        buf.set_cursor(0, 0);
+        assert!(buf.join_lines(3, true));
+        assert_eq!(text_of(&buf), "one two three\nfour");
+    }
+
+    #[test]
+    fn join_lines_count_of_one_behaves_like_two() {
+        let mut buf = make("one\ntwo\nthree");
+        buf.set_cursor(0, 0);
+        assert!(buf.join_lines(1, true));
+        assert_eq!(text_of(&buf), "one two\nthree");
+    }
+
+    #[test]
+    fn join_lines_at_the_last_line_is_a_no_op() {
+        let mut buf = make("only");
+        buf.set_cursor(0, 0);
+        assert!(!buf.join_lines(2, true));
+        assert_eq!(text_of(&buf), "only");
+        assert!(!buf.is_dirty());
+    }
+
+    #[test]
+    fn join_lines_count_past_the_end_clamps_to_the_last_line() {
+        let mut buf = make("one\ntwo\nthree");
+        buf.set_cursor(0, 0);
+        assert!(buf.join_lines(100, true));
+        assert_eq!(text_of(&buf), "one two three");
     }
 
     #[test]

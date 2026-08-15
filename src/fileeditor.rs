@@ -204,6 +204,9 @@ pub fn drive(session: &mut EditSession, rect: Rect, registers: &mut Registers, o
             },
             KeyOutcome::Put { before, count, register } => put(&mut session.buffer, registers, before, count, register),
             KeyOutcome::DeleteCharForward { count, register } => delete_char_forward(&mut session.buffer, registers, count, register),
+            KeyOutcome::Join { count, with_space } => {
+                session.buffer.join_lines(count.unwrap_or(1).max(1), with_space);
+            }
             // <C-w> is still vimkeys' own window-leader prefix here too
             // -- a harmless no-op, same reasoning as editor.rs's own
             // LineBuffer contexts: there's no window state to act on

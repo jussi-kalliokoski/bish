@@ -1678,7 +1678,10 @@ fn run_line_normal_mode(
                     // Ctrl-W meaning -- intentionally not special-cased
                     // away, even though there's no window/pane state for
                     // it to act on in this context (a harmless no-op).
-                    KeyOutcome::Window(..) | KeyOutcome::Pending | KeyOutcome::None => {}
+                    // `Join` is a no-op for the same reason: `LineBuffer`
+                    // is a single line by construction (see its own doc
+                    // comment) -- there's never a next line to join with.
+                    KeyOutcome::Window(..) | KeyOutcome::Join { .. } | KeyOutcome::Pending | KeyOutcome::None => {}
                 }
             }
         }
@@ -2008,7 +2011,9 @@ fn run_one_shot_normal_command(ed: &mut LineEditor, registers: &mut Registers, o
                     // is "do exactly one command, then resume typing"
                     // anyway, which Visual mode's whole point (extending a
                     // selection over several subsequent keys) doesn't fit.
-                    KeyOutcome::Window(..) | KeyOutcome::EnterVisual(_) | KeyOutcome::None => break None,
+                    // `Join` is a no-op here for the same single-line
+                    // reason `run_line_normal_mode`'s own arm documents.
+                    KeyOutcome::Window(..) | KeyOutcome::EnterVisual(_) | KeyOutcome::Join { .. } | KeyOutcome::None => break None,
                     KeyOutcome::Pending => continue,
                 }
             }

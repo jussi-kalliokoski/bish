@@ -63,6 +63,15 @@ pub enum KeyOutcome {
     /// already clamps correctly at column 0 -- so it stays a plain
     /// `Operator` and needs no variant of its own.
     DeleteCharForward { count: Option<usize>, register: Option<char> },
+    /// `J`/`gJ` -- join `count` lines (minimum 2, matching vim: a bare `J`
+    /// or an explicit `1J` both just join the current line with the next
+    /// one). Not a `Motion` (it mutates rather than moves) or an
+    /// `Operator` (there's no motion/target to combine with) -- its own
+    /// outcome, same tier as `Put`/`DeleteCharForward`. `with_space`
+    /// selects vim's default whitespace-aware join (`J`, strips the next
+    /// line's leading whitespace and inserts one space) vs. `gJ`'s raw
+    /// concatenation.
+    Join { count: Option<usize>, with_space: bool },
     /// `v`/`V`: enters Visual mode, charwise (`RegisterShape::Char`) or
     /// linewise (`RegisterShape::Line`), anchored at the buffer's current
     /// cursor. Reuses `registers::RegisterShape` rather than a dedicated
@@ -623,6 +632,13 @@ impl VimKeys {
         KeyOutcome::Operator(op, motion, count, register)
     }
 
+    fn emit_join(&mut self, with_space: bool) -> KeyOutcome {
+        let count = self.count.take();
+        self.pending = Pending::None;
+        self.last_completed = std::mem::take(&mut self.current_input);
+        KeyOutcome::Join { count, with_space }
+    }
+
     fn emit_put(&mut self, before: bool) -> KeyOutcome {
         let count = self.count.take();
         let register = self.pending_register.take();
@@ -818,6 +834,7 @@ impl VimKeys {
             }
             Key::Char('p') => self.emit_put(false),
             Key::Char('P') => self.emit_put(true),
+            Key::Char('J') => self.emit_join(true),
             Key::Char('"') => {
                 self.pending = Pending::Register;
                 KeyOutcome::Pending
@@ -865,6 +882,7 @@ impl VimKeys {
                 self.last_search = Some(LastSearch::Word { forward: false, bounded: false });
                 self.emit(Motion::SearchWordBackwardUnbounded)
             }
+            Key::Char('J') => self.emit_join(false),
             _ => self.abort(),
         }
     }
@@ -1234,6 +1252,29 @@ mod tests {
             last(&mut vk, &[Key::Char('\''), Key::Char('a')]),
             KeyOutcome::Motion(Motion::GotoMarkLine('a'), None)
         );
+    }
+
+    #[test]
+    fn join_and_gjoin_with_and_without_count() {
+        let mut vk = VimKeys::new();
+        assert_eq!(vk.feed(Key::Char('J')), KeyOutcome::Join { count: None, with_space: true });
+        let mut vk = VimKeys::new();
+        let keys = [Key::Char('3'), Key::Char('J')];
+        assert_eq!(last(&mut vk, &keys), KeyOutcome::Join { count: Some(3), with_space: true });
+        let mut vk = VimKeys::new();
+        let keys = [Key::Char('g'), Key::Char('J')];
+        assert_eq!(last(&mut vk, &keys), KeyOutcome::Join { count: None, with_space: false });
+        let mut vk = VimKeys::new();
+        let keys = [Key::Char('3'), Key::Char('g'), Key::Char('J')];
+        assert_eq!(last(&mut vk, &keys), KeyOutcome::Join { count: Some(3), with_space: false });
+    }
+
+    #[test]
+    fn join_as_operator_target_is_invalid_and_cancels_the_operator() {
+        let mut vk = VimKeys::new();
+        assert_eq!(vk.feed(Key::Char('d')), KeyOutcome::Pending);
+        assert_eq!(vk.feed(Key::Char('J')), KeyOutcome::None);
+        assert_eq!(vk.feed(Key::Char('w')), KeyOutcome::Motion(Motion::WordForward, None));
     }
 
     #[test]
