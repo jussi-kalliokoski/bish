@@ -403,6 +403,17 @@ fn resolve_insert_start(buf: &mut TextBuffer, cmd: InsertCmd) {
                 buf.delete_range(&range);
             }
         }
+        // `gi`: the `^` mark `run_insert_mode` sets every time Insert mode
+        // ends, clamped in case the buffer's shrunk since. Falls back to
+        // the cursor's own current position if Insert mode has never run
+        // yet this session (no mark set) -- matches vim's own "gi with no
+        // prior insert behaves like i".
+        InsertCmd::LastInsertPos => {
+            let (target_row, target_col) = buf.get_mark('^').unwrap_or((row, col));
+            let target_row = target_row.min(buf.line_count() - 1);
+            let target_col = target_col.min(buf.line_len(target_row));
+            buf.set_cursor(target_row, target_col);
+        }
     }
 }
 
@@ -424,11 +435,25 @@ fn run_insert_mode(session: &mut EditSession, rect: Rect, on_idle: &mut dyn FnMu
     loop {
         let key = match editor::read_key_idle(on_idle)? {
             Some(k) => k,
-            None => return Ok(InsertOutcome::Done),
+            None => {
+                session.buffer.set_mark('^', session.buffer.cursor());
+                return Ok(InsertOutcome::Done);
+            }
         };
         match key {
-            Key::CtrlSpace => return Ok(InsertOutcome::Detached),
-            Key::Escape => return Ok(InsertOutcome::Done),
+            // `^`: vim's own name for this mark (`:help '^`) -- wherever
+            // the cursor was the last time Insert mode ended, however it
+            // ended (typed out via Escape/EOF, or a Ctrl+Space detach
+            // mid-typing). `gi` reads it back (see resolve_insert_start's
+            // own `LastInsertPos` arm).
+            Key::CtrlSpace => {
+                session.buffer.set_mark('^', session.buffer.cursor());
+                return Ok(InsertOutcome::Detached);
+            }
+            Key::Escape => {
+                session.buffer.set_mark('^', session.buffer.cursor());
+                return Ok(InsertOutcome::Done);
+            }
             Key::Enter => {
                 let (row, col) = session.buffer.cursor();
                 session.buffer.insert_text((row, col), "\n");

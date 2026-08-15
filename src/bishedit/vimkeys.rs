@@ -157,6 +157,18 @@ pub enum InsertCmd {
     SubstituteLine,
     /// `C` -- delete from the cursor to the end of the line, insert there.
     ChangeToEnd,
+    /// `gi` -- insert at wherever Insert mode last ended (vim's own `^`
+    /// mark). Unlike every other `InsertCmd`, resolving this needs a
+    /// buffer's own marks, which `apply_insert_cmd` (below) has no access
+    /// to -- see its own doc comment on why it works over a bare `[char]`
+    /// slice. `apply_insert_cmd` treats it the same as `Before` (insert
+    /// right where the cursor already is): a reasonable fallback for the
+    /// single-line contexts that call it (the shell's own line editor,
+    /// the pane-scrollback Ctrl+Space excursion), where "the last insert
+    /// position" isn't a concept those contexts track. `fileeditor.rs`'s
+    /// own `TextBuffer`-aware `resolve_insert_start` resolves it for
+    /// real, via `Buffer::get_mark('^')`.
+    LastInsertPos,
 }
 
 /// The actual text/cursor transformation for one `InsertCmd`, against a
@@ -171,7 +183,7 @@ pub enum InsertCmd {
 pub fn apply_insert_cmd(text: &[char], cursor: usize, cmd: InsertCmd) -> (Vec<char>, usize) {
     let cursor = cursor.min(text.len());
     match cmd {
-        InsertCmd::Before => (text.to_vec(), cursor),
+        InsertCmd::Before | InsertCmd::LastInsertPos => (text.to_vec(), cursor),
         InsertCmd::After => (text.to_vec(), (cursor + 1).min(text.len())),
         InsertCmd::LineStart => (text.to_vec(), 0),
         InsertCmd::LineEnd => (text.to_vec(), text.len()),
@@ -924,6 +936,7 @@ impl VimKeys {
             }
             Key::Char('J') => self.emit_join(false),
             Key::Char('v') => self.emit_reselect_visual(),
+            Key::Char('i') => self.emit_insert(InsertCmd::LastInsertPos),
             _ => self.abort(),
         }
     }
@@ -1325,6 +1338,19 @@ mod tests {
         let mut vk = VimKeys::new();
         let keys = [Key::Char('5'), Key::Char('0'), Key::Char('%')];
         assert_eq!(last(&mut vk, &keys), KeyOutcome::Motion(Motion::GotoPercent, Some(50)));
+    }
+
+    #[test]
+    fn gi_resolves_to_last_insert_pos() {
+        let mut vk = VimKeys::new();
+        let keys = [Key::Char('g'), Key::Char('i')];
+        assert_eq!(last(&mut vk, &keys), KeyOutcome::EnterInsert(InsertCmd::LastInsertPos));
+    }
+
+    #[test]
+    fn apply_insert_cmd_last_insert_pos_falls_back_to_the_cursor() {
+        let text: Vec<char> = "hello".chars().collect();
+        assert_eq!(apply_insert_cmd(&text, 3, InsertCmd::LastInsertPos), (text.clone(), 3));
     }
 
     #[test]
