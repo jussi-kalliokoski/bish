@@ -597,6 +597,18 @@ fn highlight_tok(
     if resets_command_position(tok) {
         *cmd_pos = CmdPos::ExpectCommand;
     }
+    // `for`/`select`'s NAME and `case`'s WORD, and anything following
+    // `in` (the for/select word list, or -- lexically indistinguishable
+    // from here -- a case pattern), are never command names: they're a
+    // loop variable, a match subject, or plain list words. Route them
+    // through the same "no command in scope" state an unresolved `$CMD
+    // arg` argument already gets (WordRole::Argument{command: None,
+    // ..}), which is inert -- no validity check, no styling -- rather
+    // than the ExpectCommand state the generic reset above just set,
+    // which would flag them as invalid command names.
+    if matches!(tok, Tok::KwFor | Tok::KwSelect | Tok::KwCase | Tok::KwIn) {
+        *cmd_pos = CmdPos::InCommand { name: None, arg_index: 0 };
+    }
     let whole = |kind: HighlightKind| HighlightSpan { start: offset + span.start, end: offset + span.end, kind, link: None };
     match tok {
         Tok::KwIf
@@ -1460,6 +1472,33 @@ mod tests {
                 (20, 21, HighlightKind::Operator), // '}'
             ]
         );
+    }
+
+    // Regression test for a real bug caught during interactive
+    // verification: `for i in 1 2 3` was flagging both "i" (the loop
+    // variable, right after `for`) and "1" (the first list word, right
+    // after `in`) as invalid commands -- the generic keyword reset put
+    // cmd_pos back to ExpectCommand, and neither word is ever a command
+    // name.
+    #[test]
+    fn for_loop_variable_and_list_words_are_never_flagged_invalid() {
+        let text = "for i in 1 2 3; do echo $i; done";
+        let spans = kinds(text);
+        assert!(!spans.iter().any(|s| s.2 == HighlightKind::InvalidCommand), "{spans:?}");
+    }
+
+    #[test]
+    fn select_loop_variable_and_list_words_are_never_flagged_invalid() {
+        let text = "select i in 1 2 3; do echo $i; done";
+        let spans = kinds(text);
+        assert!(!spans.iter().any(|s| s.2 == HighlightKind::InvalidCommand), "{spans:?}");
+    }
+
+    #[test]
+    fn case_subject_word_is_never_flagged_invalid() {
+        let text = "case bogus-not-a-command in *) echo yes ;; esac";
+        let spans = kinds(text);
+        assert!(!spans.iter().any(|s| s.2 == HighlightKind::InvalidCommand), "{spans:?}");
     }
 
     #[test]
