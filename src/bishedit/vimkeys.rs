@@ -807,24 +807,25 @@ impl VimKeys {
                 self.pending = Pending::Window;
                 KeyOutcome::Pending
             }
-            // `i`/`a` while an operator is armed (`diw`, `ca(`, ...) name a
-            // text object instead of entering insert mode -- vim's own
-            // dual meaning for these two keys. Gated on `active_operator`
-            // rather than checked inside `feed_text_object` itself, so a
-            // bare `i`/`a` at a fresh dispatch point keeps meaning
-            // insert-entry exactly as it always has (this arm must stay
-            // ahead of the plain `emit_insert` arms below -- first match
-            // wins). Not extended to Visual mode (`viw`) in this pass --
-            // that would need the caller to re-anchor the selection to the
-            // object's start too, which a bare `KeyOutcome::Motion` has no
-            // way to signal; `active_operator`-only keeps every existing
-            // Visual-mode call site (repl.rs/editor.rs/fileeditor.rs)
-            // untouched.
-            Key::Char('i') if self.active_operator.is_some() => {
+            // `i`/`a` while an operator is armed (`diw`, `ca(`, ...) *or*
+            // while in Visual mode (`viw`, `va(`, ...) name a text object
+            // instead of entering insert mode -- vim's own dual meaning for
+            // these two keys. Gated rather than checked inside
+            // `feed_text_object` itself, so a bare `i`/`a` at a fresh
+            // dispatch point keeps meaning insert-entry exactly as it
+            // always has (this arm must stay ahead of the plain
+            // `emit_insert` arms below -- first match wins). The Visual-mode
+            // case still resolves to a plain `KeyOutcome::Motion` here (this
+            // crate has no notion of "re-anchor the selection" -- see
+            // `KeyOutcome::Motion`'s own doc comment); the caller is
+            // responsible for special-casing `Motion::TextObject` while
+            // `is_visual()` to move *both* ends instead of calling
+            // `apply_motion` (which only moves the cursor).
+            Key::Char('i') if self.active_operator.is_some() || self.visual.is_some() => {
                 self.pending = Pending::TextObject { around: false };
                 KeyOutcome::Pending
             }
-            Key::Char('a') if self.active_operator.is_some() => {
+            Key::Char('a') if self.active_operator.is_some() || self.visual.is_some() => {
                 self.pending = Pending::TextObject { around: true };
                 KeyOutcome::Pending
             }
@@ -2089,6 +2090,14 @@ mod tests {
         assert_eq!(vk.feed(Key::Char('i')), KeyOutcome::EnterInsert(InsertCmd::Before));
         let mut vk = VimKeys::new();
         assert_eq!(vk.feed(Key::Char('a')), KeyOutcome::EnterInsert(InsertCmd::After));
+    }
+
+    #[test]
+    fn text_object_also_recognized_in_visual_mode_with_no_operator() {
+        let mut vk = VimKeys::new();
+        vk.begin_visual(RegisterShape::Char, (0, 0));
+        let keys = [Key::Char('i'), Key::Char('w')];
+        assert_eq!(last(&mut vk, &keys), KeyOutcome::Motion(Motion::TextObject(TextObjectKind::Word, false), None));
     }
 
     #[test]

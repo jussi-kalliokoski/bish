@@ -1632,7 +1632,7 @@ fn run_line_normal_mode(
                 let mut lb = LineBuffer { ed, marks: &mut marks, selections: &mut selections };
                 match vk.feed(key) {
                     KeyOutcome::Motion(m, count) => {
-                        motion::apply_motion(&mut lb, m, count);
+                        apply_motion_or_reselect(&mut vk, &mut lb, m, count);
                     }
                     KeyOutcome::EnterInsert(cmd) => {
                         let (new_buf, new_cursor) = vimkeys::apply_insert_cmd(&lb.ed.buf, lb.ed.cursor, cmd);
@@ -1701,6 +1701,30 @@ fn run_line_normal_mode(
         redraw(&shown, ed, col_origin, width, ctx, &matches)?;
     };
     Ok(exit)
+}
+
+// `KeyOutcome::Motion`'s ordinary handling (`apply_motion`, moving the
+// cursor) except for a `Motion::TextObject` reached while in Visual mode
+// (`viw`, `va(`, ...): vimkeys.rs can only ever hand back a plain `Motion`
+// there (it never touches a `Buffer` itself), but a text object needs to
+// move *both* Visual ends -- the anchor to the object's start, the cursor
+// to its end -- not just the cursor the way every other motion does.
+// Falls through to `apply_motion` for every other case, including a
+// `TextObject` reached via an armed operator (handled entirely inside
+// `motion::motion_range`, not here). Generic over `Buffer` for the same
+// reason `yank_motion` just below is -- shared by this file's own
+// run_line_normal_mode and by repl.rs's own ScreenBuffer-based Visual
+// mode.
+pub fn apply_motion_or_reselect(vk: &mut VimKeys, buf: &mut impl crate::bishedit::Buffer, m: motion::Motion, count: Option<usize>) {
+    if let (true, motion::Motion::TextObject(kind, around)) = (vk.is_visual(), &m) {
+        if let Some(range) = motion::text_object_range(buf, *kind, *around, count) {
+            let (shape, _) = vk.visual_anchor().unwrap();
+            vk.begin_visual(shape, range.from);
+            buf.set_cursor(range.to.0, range.to.1);
+        }
+        return;
+    }
+    motion::apply_motion(buf, m, count);
 }
 
 // The `y{motion}`/`yy` glue: generic over any `bishedit::Buffer`, so this
@@ -2425,6 +2449,32 @@ mod tests {
         assert_eq!(got.from, (0, 2));
         assert_eq!(got.to, (0, 5));
         assert_eq!(got.shape, motion::MotionShape::Inclusive);
+    }
+
+    #[test]
+    fn apply_motion_or_reselect_extends_visual_selection_to_the_text_object() {
+        let mut vk = VimKeys::new();
+        vk.begin_visual(RegisterShape::Char, (0, 0));
+        let mut ed = make_editor("foo bar baz", 5); // cursor on the 'a' of "bar"
+        let mut marks = HashMap::new();
+        let mut selections: Vec<motion::MotionRange> = Vec::new();
+        let mut lb = LineBuffer { ed: &mut ed, marks: &mut marks, selections: &mut selections };
+        apply_motion_or_reselect(&mut vk, &mut lb, motion::Motion::TextObject(motion::TextObjectKind::Word, false), None);
+        // anchor jumps to the word's own start, not wherever 'v' was
+        // originally pressed -- matches vim's own viw behavior.
+        assert_eq!(vk.visual_anchor(), Some((RegisterShape::Char, (0, 4))));
+        assert_eq!(lb.cursor(), (0, 6));
+    }
+
+    #[test]
+    fn apply_motion_or_reselect_falls_through_to_apply_motion_outside_visual_mode() {
+        let mut vk = VimKeys::new();
+        let mut ed = make_editor("foo bar", 0);
+        let mut marks = HashMap::new();
+        let mut selections: Vec<motion::MotionRange> = Vec::new();
+        let mut lb = LineBuffer { ed: &mut ed, marks: &mut marks, selections: &mut selections };
+        apply_motion_or_reselect(&mut vk, &mut lb, motion::Motion::WordForward, None);
+        assert_eq!(lb.cursor(), (0, 4));
     }
 
     #[test]

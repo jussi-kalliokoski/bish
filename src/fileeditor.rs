@@ -169,7 +169,7 @@ pub fn drive(session: &mut EditSession, rect: Rect, registers: &mut Registers, o
 
         match session.vk.feed(key) {
             KeyOutcome::Motion(m, count) => {
-                motion::apply_motion(&mut session.buffer, m, count);
+                editor::apply_motion_or_reselect(&mut session.vk, &mut session.buffer, m, count);
                 scroll_to_show_cursor(&mut session.buffer);
             }
             KeyOutcome::EnterVisual(shape) => {

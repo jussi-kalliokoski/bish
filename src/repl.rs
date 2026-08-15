@@ -2962,7 +2962,7 @@ fn run_normal_mode_navigation(
 
         match vk.feed(key) {
             KeyOutcome::Motion(m, count) => {
-                motion::apply_motion(&mut buf, m, count);
+                editor::apply_motion_or_reselect(&mut vk, &mut buf, m, count);
                 scroll_to_show_cursor(&mut buf);
                 render_normal_mode_frame(&buf, rect, &vk, None);
             }
