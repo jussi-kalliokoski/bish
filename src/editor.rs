@@ -1527,7 +1527,16 @@ fn run_line_normal_mode(
                     // Ctrl-W meaning -- intentionally not special-cased
                     // away, even though there's no window/pane state for
                     // it to act on in this context (a harmless no-op).
-                    KeyOutcome::Window(..) | KeyOutcome::Pending | KeyOutcome::None => {}
+                    // Visual mode (EnterVisual) is repl.rs's own
+                    // ScreenBuffer normal mode's feature for now (see its
+                    // own doc comment) -- a no-op here, same reasoning as
+                    // Window just above: this loop never calls
+                    // `begin_visual` back, so `vk`'s own `visual` field
+                    // simply stays `None` regardless -- `v`/`V` do nothing
+                    // here, matching that the feature doesn't exist yet in
+                    // this context, rather than half-arming state nothing
+                    // here would ever read or clear.
+                    KeyOutcome::Window(..) | KeyOutcome::EnterVisual(_) | KeyOutcome::Pending | KeyOutcome::None => {}
                 }
             }
         }
@@ -1727,7 +1736,12 @@ fn run_one_shot_normal_command(ed: &mut LineEditor, registers: &mut Registers, o
                         }
                         break None;
                     }
-                    KeyOutcome::Window(..) | KeyOutcome::None => break None,
+                    // EnterVisual: a no-op here too, same reasoning as
+                    // run_line_normal_mode's own arm just above -- Ctrl-O
+                    // is "do exactly one command, then resume typing"
+                    // anyway, which Visual mode's whole point (extending a
+                    // selection over several subsequent keys) doesn't fit.
+                    KeyOutcome::Window(..) | KeyOutcome::EnterVisual(_) | KeyOutcome::None => break None,
                     KeyOutcome::Pending => continue,
                 }
             }

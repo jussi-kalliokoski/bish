@@ -7,6 +7,7 @@
 
 use crate::editor::Key;
 use super::motion::Motion;
+use super::registers::RegisterShape;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum KeyOutcome {
@@ -62,6 +63,17 @@ pub enum KeyOutcome {
     /// already clamps correctly at column 0 -- so it stays a plain
     /// `Operator` and needs no variant of its own.
     DeleteCharForward { count: Option<usize>, register: Option<char> },
+    /// `v`/`V`: enters Visual mode, charwise (`RegisterShape::Char`) or
+    /// linewise (`RegisterShape::Line`), anchored at the buffer's current
+    /// cursor. Reuses `registers::RegisterShape` rather than a dedicated
+    /// enum -- charwise/linewise is exactly the same two-way distinction a
+    /// yank's own result shape already needs, and this selection's shape
+    /// *becomes* that yank shape once it's committed. The caller must
+    /// immediately call `begin_visual` with the buffer's own current
+    /// cursor as the anchor -- this crate never touches a `Buffer` itself
+    /// (see this file's own module doc comment), so it can't read that
+    /// position on its own.
+    EnterVisual(RegisterShape),
     /// The key was consumed as part of an in-progress sequence (a count
     /// digit, or a prefix awaiting its next character); no motion yet.
     Pending,
@@ -327,6 +339,16 @@ pub struct VimKeys {
     // next key starts a new sequence, so a frontend can flash "here's what
     // that just did" for a beat after the motion applies.
     last_completed: String,
+    // Visual mode's own state: the shape (`v`/`V`) and the anchor position
+    // (the cursor at the moment Visual was entered) a caller supplied via
+    // `begin_visual`. `None` means Normal mode. Deliberately not touched
+    // by ordinary motion resolution -- a `Motion` outcome while this is
+    // `Some` is still just a `Motion`, applied by the caller exactly as it
+    // always is; only the *rendering* of what's between this anchor and
+    // the buffer's current cursor, and what `y`/`Z`/Escape do, changes,
+    // and all of that lives in the caller (repl.rs), not here -- see
+    // `is_idle`'s own doc comment for why.
+    visual: Option<(RegisterShape, (usize, usize))>,
 }
 
 impl VimKeys {
@@ -340,6 +362,7 @@ impl VimKeys {
             active_operator: None,
             operator_count: None,
             pending_register: None,
+            visual: None,
             current_input: String::new(),
             last_completed: String::new(),
         }
@@ -375,6 +398,58 @@ impl VimKeys {
     /// comment for why this matters to a caller.
     pub fn last_search_is_word(&self) -> bool {
         matches!(self.last_search, Some(LastSearch::Word { .. }))
+    }
+
+    /// Whether Visual mode is currently active.
+    pub fn is_visual(&self) -> bool {
+        self.visual.is_some()
+    }
+
+    /// Visual mode's own shape and anchor, if active -- `None` in Normal
+    /// mode. A caller combines this with the buffer's own current cursor
+    /// to know what's actually selected right now (this crate never reads
+    /// a `Buffer` itself -- see the module's own doc comment).
+    pub fn visual_anchor(&self) -> Option<(RegisterShape, (usize, usize))> {
+        self.visual
+    }
+
+    /// Enters Visual mode: called by a caller that just received
+    /// `KeyOutcome::EnterVisual(shape)`, with the buffer's own current
+    /// cursor as `anchor`.
+    pub fn begin_visual(&mut self, shape: RegisterShape, anchor: (usize, usize)) {
+        self.visual = Some((shape, anchor));
+    }
+
+    /// Leaves Visual mode -- called by a caller once it's done whatever it
+    /// needed the anchor for (committing a selection, yanking, or
+    /// cancelling).
+    pub fn end_visual(&mut self) {
+        self.visual = None;
+    }
+
+    /// Takes (consuming) whatever register a `"x` prefix selected, if any.
+    /// `feed()` already applies this itself for any outcome it resolves
+    /// internally (an `Operator`/`Put`/...); this exists for a caller that
+    /// wants to consume it *without* going through `feed()` at all -- e.g.
+    /// repl.rs's own Visual-mode `y` handling, which intercepts the key
+    /// itself (see `is_idle`'s own doc comment for why) rather than
+    /// feeding it through here.
+    pub fn take_pending_register(&mut self) -> Option<char> {
+        self.pending_register.take()
+    }
+
+    /// Whether this is a genuinely fresh dispatch point right now -- no
+    /// in-progress count, sub-prefix (`f`/`g`/`m`/a search being typed/...),
+    /// or armed operator. A caller wanting to intercept a key *itself*,
+    /// ahead of `feed()` (repl.rs already does this for `Z`/`:` -- window
+    /// management and quit aren't things this crate should own, per its
+    /// own module doc comment; Visual mode's `y`/Escape join them for the
+    /// same reason: "are there committed selections" is state this crate
+    /// deliberately never sees), needs this first -- otherwise a target
+    /// character mid `f`/`F`/`t`/`T`, or a count digit, could be wrongly
+    /// stolen instead of reaching its own sub-prefix handler.
+    pub fn is_idle(&self) -> bool {
+        matches!(self.pending, Pending::None) && self.count.is_none() && self.active_operator.is_none()
     }
 
     pub fn feed(&mut self, key: Key) -> KeyOutcome {
@@ -495,6 +570,19 @@ impl VimKeys {
         self.pending = Pending::None;
         self.last_completed = std::mem::take(&mut self.current_input);
         KeyOutcome::EnterInsert(cmd)
+    }
+
+    // `v`/`V`: same shape as emit_insert -- a count typed before entering
+    // Visual mode has no effect yet, same "not supported in this pass" as
+    // an insert-entry command's own leading count. Doesn't touch
+    // `self.visual` itself -- that only happens once the caller calls
+    // `begin_visual` back with the anchor, which this function has no way
+    // to know (see `KeyOutcome::EnterVisual`'s own doc comment).
+    fn emit_visual(&mut self, shape: RegisterShape) -> KeyOutcome {
+        self.count = None;
+        self.pending = Pending::None;
+        self.last_completed = std::mem::take(&mut self.current_input);
+        KeyOutcome::EnterVisual(shape)
     }
 
     // `y{motion}`'s first half: stashes whatever count had already
@@ -687,6 +775,14 @@ impl VimKeys {
                 self.pending = Pending::Register;
                 KeyOutcome::Pending
             }
+            // Guarded on `self.visual.is_none()`: pressing `v`/`V` again
+            // while already in Visual mode is simply ignored in this pass
+            // (falls to `_ => self.abort()` below, same as any other
+            // unrecognized key -- clears a stray count/prefix, leaves
+            // Visual mode itself untouched) -- no shape-switch/re-anchor
+            // vim nuance yet.
+            Key::Char('v') if self.visual.is_none() => self.emit_visual(RegisterShape::Char),
+            Key::Char('V') if self.visual.is_none() => self.emit_visual(RegisterShape::Line),
             _ => self.abort(),
         }
     }
@@ -1783,5 +1879,66 @@ mod tests {
         assert_eq!(result.iter().collect::<String>(), "abc");
         assert_eq!(cursor, 1);
         assert_eq!(deleted, "");
+    }
+
+    #[test]
+    fn v_and_shift_v_enter_visual_mode_charwise_and_linewise() {
+        let mut vk = VimKeys::new();
+        assert_eq!(vk.feed(Key::Char('v')), KeyOutcome::EnterVisual(RegisterShape::Char));
+        let mut vk = VimKeys::new();
+        assert_eq!(vk.feed(Key::Char('V')), KeyOutcome::EnterVisual(RegisterShape::Line));
+    }
+
+    #[test]
+    fn v_again_while_already_visual_is_ignored() {
+        let mut vk = VimKeys::new();
+        assert_eq!(vk.feed(Key::Char('v')), KeyOutcome::EnterVisual(RegisterShape::Char));
+        vk.begin_visual(RegisterShape::Char, (2, 3));
+        // A caller's own begin_visual call is what actually arms
+        // `self.visual` -- feed() alone never does (see EnterVisual's own
+        // doc comment) -- so this exercises the real "already in Visual,
+        // v/V pressed again" case a live caller would hit.
+        assert_eq!(vk.feed(Key::Char('v')), KeyOutcome::None);
+        assert_eq!(vk.feed(Key::Char('V')), KeyOutcome::None);
+        // Still in Visual mode -- an ignored `v`/`V` doesn't cancel it.
+        assert!(vk.is_visual());
+        assert_eq!(vk.visual_anchor(), Some((RegisterShape::Char, (2, 3))));
+    }
+
+    #[test]
+    fn visual_accessors_round_trip() {
+        let mut vk = VimKeys::new();
+        assert!(!vk.is_visual());
+        assert_eq!(vk.visual_anchor(), None);
+        vk.begin_visual(RegisterShape::Line, (5, 0));
+        assert!(vk.is_visual());
+        assert_eq!(vk.visual_anchor(), Some((RegisterShape::Line, (5, 0))));
+        vk.end_visual();
+        assert!(!vk.is_visual());
+        assert_eq!(vk.visual_anchor(), None);
+    }
+
+    #[test]
+    fn take_pending_register_consumes_a_quote_prefix() {
+        let mut vk = VimKeys::new();
+        assert_eq!(vk.feed(Key::Char('"')), KeyOutcome::Pending);
+        assert_eq!(vk.feed(Key::Char('a')), KeyOutcome::Pending);
+        assert_eq!(vk.take_pending_register(), Some('a'));
+        // Consumed -- a second take sees nothing left.
+        assert_eq!(vk.take_pending_register(), None);
+    }
+
+    #[test]
+    fn is_idle_is_false_mid_count_prefix_or_armed_operator() {
+        let mut vk = VimKeys::new();
+        assert!(vk.is_idle());
+        vk.feed(Key::Char('3'));
+        assert!(!vk.is_idle(), "mid a count");
+        let mut vk = VimKeys::new();
+        vk.feed(Key::Char('f'));
+        assert!(!vk.is_idle(), "mid a find-char sub-prefix");
+        let mut vk = VimKeys::new();
+        vk.feed(Key::Char('d'));
+        assert!(!vk.is_idle(), "an operator is armed, awaiting its motion");
     }
 }

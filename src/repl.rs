@@ -6,7 +6,7 @@ use std::rc::Rc;
 use crate::bishedit::completion;
 use crate::bishedit::highlight::{self, HighlightContext};
 use crate::bishedit::motion;
-use crate::bishedit::registers::Registers;
+use crate::bishedit::registers::{RegisterShape, RegisterValue, Registers};
 use crate::bishedit::suggestion;
 use crate::bishedit::vimkeys::{KeyOutcome, Op, VimKeys, WindowCmd};
 use crate::bishedit::Buffer as BisheditBuffer;
@@ -2051,6 +2051,16 @@ struct ScreenBuffer {
     vtop: usize,
     vheight: usize,
     marks: HashMap<char, (usize, usize)>,
+    // Visual mode's own committed selections (see vimkeys.rs's own
+    // `visual` field doc comment for the active, not-yet-committed one --
+    // that lives in `VimKeys`, not here, since it's just an anchor plus
+    // whatever this buffer's own live cursor already is). In commit
+    // order: `Z` pushes one, `y` reads every entry here (plus the active
+    // one) to build one concatenated yank, and both `y` and Escape clear
+    // this back to empty. A plain `Vec<motion::MotionRange>` rather than
+    // a new type -- `extract_text` already knows how to read one of these
+    // regardless of who built it.
+    selections: Vec<motion::MotionRange>,
 }
 
 impl ScreenBuffer {
@@ -2067,7 +2077,7 @@ impl ScreenBuffer {
         let cursor = (sb_len + cur_row, cur_col);
         let vheight = vheight.max(1);
         let vtop = cursor.0.saturating_sub(vheight - 1);
-        ScreenBuffer { screen, cursor, vtop, vheight, marks: HashMap::new() }
+        ScreenBuffer { screen, cursor, vtop, vheight, marks: HashMap::new(), selections: Vec::new() }
     }
 
     // `line`'s own raw cell count -- the live grid's current width for a
@@ -2177,12 +2187,36 @@ fn scroll_to_show_cursor(buf: &mut ScreenBuffer) {
     }
 }
 
+// The (start, end) char-column range `range` covers on this one `line`,
+// if any -- `None` for a line outside `range.from.0..=range.to.0`
+// entirely. `Linewise` covers the whole row; `Inclusive` (Visual mode's
+// own charwise shape -- see `active_visual_range`'s own doc comment) is
+// full-width on any line strictly between the endpoints and clamped to
+// the true from/to column on the first/last line, mirroring exactly how
+// `motion::extract_text`'s own char-walk already treats a multi-line
+// charwise range -- `to.1 + 1` since Visual charwise is inclusive of the
+// character the cursor's on, unlike most charwise motions.
+fn selection_columns_in_line(range: &motion::MotionRange, line: usize, cols: usize) -> Option<(usize, usize)> {
+    if line < range.from.0 || line > range.to.0 {
+        return None;
+    }
+    if range.shape == motion::MotionShape::Linewise {
+        return Some((0, cols));
+    }
+    let start = if line == range.from.0 { range.from.1 } else { 0 };
+    let end = if line == range.to.0 { range.to.1 + 1 } else { cols };
+    Some((start, end))
+}
+
 // `search_matches`: (start, end) char-column ranges on this one row to
 // render in reverse video -- vim's own `hlsearch` treatment, and the same
 // mechanism (toggling `CellAttrs::reverse`) editor.rs's own Ctrl-E search
 // highlighting uses. Applied by flipping the bit on whatever attrs a cell
 // already carries (e.g. `ls --color` output keeps its own fg/bg, just
-// with reverse forced on) rather than replacing them outright.
+// with reverse forced on) rather than replacing them outright. Also
+// where Visual mode's own selection highlighting piggybacks -- see
+// render_normal_mode_frame's own doc comment on why that's simply more
+// entries on this same list rather than a separate rendering pass.
 fn render_normal_mode_row(out: &mut String, buf: &ScreenBuffer, line: usize, cols: usize, search_matches: &[(usize, usize)]) {
     let mut last: Option<(vt100::Color, vt100::Color, vt100::CellAttrs)> = None;
     let s = buf.screen.borrow();
@@ -2221,6 +2255,17 @@ fn normal_mode_content_rows(rect: Rect) -> usize {
     rect.rows.saturating_sub(1).max(1)
 }
 
+// "-- NORMAL --"'s own mode-indicator text, swapped for Visual mode's two
+// shapes while `vk.is_visual()` -- matching real vim's own mode-line
+// convention (`-- VISUAL --` / `-- VISUAL LINE --`).
+fn mode_label(vk: &VimKeys) -> &'static str {
+    match vk.visual_anchor() {
+        Some((RegisterShape::Char, _)) => "-- VISUAL --",
+        Some((RegisterShape::Line, _)) => "-- VISUAL LINE --",
+        None => "-- NORMAL --",
+    }
+}
+
 // The status bar's left side: the search/command line while one is being
 // typed (`command_line`, e.g. ":q" or "/foo" as typed so far -- this is
 // how `:`/`/`/`?` input actually becomes visible; previously nothing was
@@ -2228,10 +2273,10 @@ fn normal_mode_content_rows(rect: Rect) -> usize {
 // whatever `vk` has to say about the current key sequence -- a pending
 // count/prefix in progress (e.g. "20g" mid-`20gg`), or failing that a
 // brief flash of the motion that was just applied (e.g. "[20k]"), else
-// just the bare mode indicator. A pending search ('/'/'?') is shown
-// alone, without the "-- NORMAL --" prefix, matching vim's own
-// command-line convention of replacing the mode indicator outright while
-// typing one.
+// just the bare mode indicator (`mode_label`, above). A pending search
+// ('/'/'?') is shown alone, without the mode-indicator prefix, matching
+// vim's own command-line convention of replacing the mode indicator
+// outright while typing one.
 fn normal_mode_status_left(vk: &VimKeys, command_line: Option<&str>) -> String {
     if let Some(cmd) = command_line {
         return cmd.to_string();
@@ -2240,14 +2285,15 @@ fn normal_mode_status_left(vk: &VimKeys, command_line: Option<&str>) -> String {
     if pending.starts_with('/') || pending.starts_with('?') {
         return pending.to_string();
     }
+    let label = mode_label(vk);
     if !pending.is_empty() {
-        return format!("-- NORMAL -- {}", pending);
+        return format!("{} {}", label, pending);
     }
     let last = vk.last_motion_display();
     if !last.is_empty() {
-        return format!("-- NORMAL -- [{}]", last);
+        return format!("{} [{}]", label, last);
     }
-    "-- NORMAL --".to_string()
+    label.to_string()
 }
 
 fn normal_mode_status_text(buf: &ScreenBuffer, vk: &VimKeys, command_line: Option<&str>, cols: usize) -> String {
@@ -2307,6 +2353,11 @@ fn render_normal_mode_frame(buf: &ScreenBuffer, rect: Rect, vk: &VimKeys, comman
     let content_rows = normal_mode_content_rows(rect);
     let total = buf.line_count();
     let pattern = active_search_pattern(vk, buf);
+    // Every selection currently on screen -- every committed one, plus
+    // whatever's actively being extended right now (if Visual mode is
+    // active) -- computed once up front rather than per row, same as
+    // `pattern` just above.
+    let active = active_visual_range(vk, buf);
     let mut out = String::new();
     for r in 0..content_rows {
         let line = buf.viewport_top() + r;
@@ -2317,10 +2368,19 @@ fn render_normal_mode_frame(buf: &ScreenBuffer, rect: Rect, vk: &VimKeys, comman
             // outside the viewport can't be seen either way, and this
             // avoids scanning potentially large scrollback on every
             // redraw.
-            let matches = match &pattern {
+            let mut matches = match &pattern {
                 Some(p) => motion::find_matches_in_line(buf, line, p),
                 None => Vec::new(),
             };
+            // Selections render exactly like a search match -- reverse
+            // video, same `render_normal_mode_row` mechanism -- by simply
+            // becoming more entries on this same list. No new visual
+            // style for this pass (see this feature's own plan doc).
+            for range in buf.selections.iter().chain(active.iter()) {
+                if let Some(cols) = selection_columns_in_line(range, line, rect.cols) {
+                    matches.push(cols);
+                }
+            }
             render_normal_mode_row(&mut out, buf, line, rect.cols, &matches);
         } else {
             out.push_str(&" ".repeat(rect.cols));
@@ -2552,6 +2612,61 @@ fn run_normal_mode_navigation(
         }
 
         match key {
+            // Visual mode's own `Z`/`y`/Escape -- kept at this same outer
+            // tier as `Z`/`:` below rather than inside vimkeys.rs's own
+            // `feed()`, because "is there a selection to act on" is
+            // `ScreenBuffer`-owned state (`buf.selections`) vimkeys.rs
+            // deliberately never sees (see its own module doc comment).
+            // `vk.is_idle()` guards all three: mid a sub-prefix (`f`, a
+            // count, ...) these keys keep their ordinary meaning instead
+            // (a find-char target, a count digit, ...) rather than being
+            // stolen here.
+            //
+            // `Z` (single, not `ZZ`): commits the active selection (if
+            // any -- `Z` with nothing selected yet is a harmless no-op)
+            // and returns to Normal mode, keeping every selection so far
+            // highlighted so another `v`/`V` can start the next one. Only
+            // reachable while actually in Visual mode -- `ZZ`'s existing
+            // quit-the-window meaning (the arm right below) is completely
+            // unaffected outside it.
+            Key::Char('Z') if vk.is_idle() && vk.is_visual() => {
+                if let Some(range) = active_visual_range(&vk, &buf) {
+                    buf.selections.push(range);
+                }
+                vk.end_visual();
+                render_normal_mode_frame(&buf, rect, &vk, None);
+                continue;
+            }
+            // `y`: yanks every committed selection plus the active one
+            // (if any) as one concatenated register value (see
+            // `yank_selections`' own doc comment), then clears both.
+            // Reachable either mid an active `v`/`V` selection, or from
+            // plain Normal mode right after a `Z` with nothing new
+            // started -- the `!buf.selections.is_empty()` half of this
+            // guard is exactly that second case. Falls through to
+            // vimkeys.rs's own ordinary `y`/`yy`/`y{motion}` handling
+            // (unchanged) whenever neither is true.
+            Key::Char('y') if vk.is_idle() && (vk.is_visual() || !buf.selections.is_empty()) => {
+                if let Some(range) = active_visual_range(&vk, &buf) {
+                    buf.selections.push(range);
+                }
+                let register = vk.take_pending_register();
+                yank_selections(&buf, registers, register);
+                buf.selections.clear();
+                vk.end_visual();
+                render_normal_mode_frame(&buf, rect, &vk, None);
+                continue;
+            }
+            // Escape: cancels everything -- the active selection and
+            // every previously committed one -- back to a clean Normal
+            // mode with nothing yanked. Same reachability condition as
+            // `y` just above.
+            Key::Escape if vk.is_idle() && (vk.is_visual() || !buf.selections.is_empty()) => {
+                vk.end_visual();
+                buf.selections.clear();
+                render_normal_mode_frame(&buf, rect, &vk, None);
+                continue;
+            }
             Key::Char('Z') => {
                 let k2 = editor::read_key_idle(&mut || {
                     service_background_jobs(sessions, windows, job_frames, *current_window);
@@ -2634,6 +2749,16 @@ fn run_normal_mode_navigation(
             KeyOutcome::EnterInsert(cmd) => {
                 let (new_chars, new_cursor) = crate::bishedit::vimkeys::apply_insert_cmd(&original_chars, initial_cursor, cmd);
                 break 'nav Some((new_chars.into_iter().collect(), new_cursor));
+            }
+            // `v`/`V`: arms Visual mode with the buffer's own current
+            // cursor as the anchor (vimkeys.rs can't read that itself --
+            // see `EnterVisual`'s own doc comment). Rendering (the
+            // reverse-video highlight) and what `y`/`Z`/Escape do from
+            // here on are handled by the guarded arms above, at the top
+            // of this same loop.
+            KeyOutcome::EnterVisual(shape) => {
+                vk.begin_visual(shape, buf.cursor());
+                render_normal_mode_frame(&buf, rect, &vk, None);
             }
             // Yank works here too -- copying text out of a pane's own
             // scrollback/output is exactly what this read-only,
@@ -2720,6 +2845,46 @@ fn run_normal_mode_navigation(
 
     compositor_redraw(sessions, windows, *current_window, term_rows, term_cols);
     Ok(resume)
+}
+
+// Visual mode's own active (not yet committed via `Z`) selection, if any
+// -- `vk`'s own anchor (see its `visual_anchor`'s own doc comment)
+// ordered against `buf`'s current cursor into a `MotionRange` ready for
+// `extract_text`/rendering. `RegisterShape::Char` maps to
+// `MotionShape::Inclusive` (vim's own visual charwise is inclusive of
+// both ends, unlike most charwise motions), `::Line` to `::Linewise`.
+fn active_visual_range(vk: &VimKeys, buf: &ScreenBuffer) -> Option<motion::MotionRange> {
+    let (shape, anchor) = vk.visual_anchor()?;
+    let cursor = buf.cursor();
+    let motion_shape = if shape == RegisterShape::Line { motion::MotionShape::Linewise } else { motion::MotionShape::Inclusive };
+    let (from, to) = if anchor <= cursor { (anchor, cursor) } else { (cursor, anchor) };
+    Some(motion::MotionRange { shape: motion_shape, from, to })
+}
+
+// `y` in Visual mode: every selection in `buf.selections` (already in
+// commit order -- see that field's own doc comment), concatenated with no
+// separator -- a `Linewise` part already ends in `\n` (`extract_text`
+// bakes that in), so it naturally lands on its own line; a charwise part
+// butts directly against its neighbor, matching what selecting exactly
+// that much text and nothing else implies. Shape is `Line` if *any* part
+// was `Linewise`, else `Char` -- the same "at least a full line no matter
+// what gets combined with it" rule `RegisterBackend::write`'s own
+// append-shape already uses for `"A`-style concatenation. A no-op if
+// `buf.selections` is empty (nothing was ever committed or active) --
+// the caller already gates on that before ever getting here.
+fn yank_selections(buf: &ScreenBuffer, registers: &mut Registers, register: Option<char>) {
+    if buf.selections.is_empty() {
+        return;
+    }
+    let mut text = String::new();
+    let mut shape = RegisterShape::Char;
+    for range in &buf.selections {
+        text.push_str(&motion::extract_text(buf, range));
+        if range.shape == motion::MotionShape::Linewise {
+            shape = RegisterShape::Line;
+        }
+    }
+    registers.write(register, RegisterValue { text, shape });
 }
 
 // (window_id, is_the_current_window, that window's session's cwd) -- an
@@ -3302,3 +3467,83 @@ fn command_violation(c: &Command) -> Option<&'static str> {
     }
 }
 
+
+#[cfg(test)]
+mod visual_mode_tests {
+    use super::*;
+
+    // A `ScreenBuffer` fed with `text` (`\n` normalized to `\r\n` first,
+    // matching a real pty's own line endings) -- the same construction
+    // `run_normal_mode_navigation` itself goes through
+    // (`ScreenBuffer::new` over a freshly-fed `vt100::Screen`), just
+    // without the prompt-freezing/rect machinery this module's own tests
+    // have no use for.
+    fn make_screen_buffer(text: &str) -> ScreenBuffer {
+        let screen = Rc::new(RefCell::new(vt100::Screen::new(20, 40)));
+        screen.borrow_mut().feed(text.replace('\n', "\r\n").as_bytes());
+        ScreenBuffer::new(screen, 20)
+    }
+
+    #[test]
+    fn yank_selections_concatenates_two_charwise_ranges_with_no_separator() {
+        let mut buf = make_screen_buffer("hello world\nfoo bar");
+        buf.selections = vec![
+            motion::MotionRange { shape: motion::MotionShape::Inclusive, from: (0, 0), to: (0, 4) }, // "hello"
+            motion::MotionRange { shape: motion::MotionShape::Inclusive, from: (1, 0), to: (1, 2) }, // "foo"
+        ];
+        let mut registers = Registers::new_for_test();
+        yank_selections(&buf, &mut registers, None);
+        let value = registers.read(None);
+        assert_eq!(value.text, "hellofoo");
+        assert_eq!(value.shape, RegisterShape::Char);
+    }
+
+    #[test]
+    fn yank_selections_shape_is_line_if_any_range_is_linewise() {
+        let mut buf = make_screen_buffer("hello world\nfoo bar");
+        buf.selections = vec![
+            motion::MotionRange { shape: motion::MotionShape::Inclusive, from: (0, 0), to: (0, 4) }, // "hello"
+            motion::MotionRange { shape: motion::MotionShape::Linewise, from: (1, 0), to: (1, 0) },  // whole "foo bar" line
+        ];
+        let mut registers = Registers::new_for_test();
+        yank_selections(&buf, &mut registers, None);
+        let value = registers.read(None);
+        assert_eq!(value.text, "hellofoo bar\n");
+        assert_eq!(value.shape, RegisterShape::Line);
+    }
+
+    #[test]
+    fn yank_selections_is_a_no_op_when_nothing_is_selected() {
+        let buf = make_screen_buffer("hello");
+        let mut registers = Registers::new_for_test();
+        registers.write(None, RegisterValue { text: "unchanged".to_string(), shape: RegisterShape::Char });
+        yank_selections(&buf, &mut registers, None);
+        assert_eq!(registers.read(None).text, "unchanged");
+    }
+
+    #[test]
+    fn selection_columns_in_line_linewise_spans_full_width_and_nothing_outside_its_rows() {
+        let range = motion::MotionRange { shape: motion::MotionShape::Linewise, from: (2, 3), to: (4, 1) };
+        assert_eq!(selection_columns_in_line(&range, 1, 10), None);
+        assert_eq!(selection_columns_in_line(&range, 2, 10), Some((0, 10)));
+        assert_eq!(selection_columns_in_line(&range, 3, 10), Some((0, 10)));
+        assert_eq!(selection_columns_in_line(&range, 4, 10), Some((0, 10)));
+        assert_eq!(selection_columns_in_line(&range, 5, 10), None);
+    }
+
+    #[test]
+    fn selection_columns_in_line_charwise_clamps_first_and_last_row_and_spans_full_width_between() {
+        let range = motion::MotionRange { shape: motion::MotionShape::Inclusive, from: (2, 5), to: (4, 3) };
+        assert_eq!(selection_columns_in_line(&range, 1, 10), None);
+        assert_eq!(selection_columns_in_line(&range, 2, 10), Some((5, 10)));
+        assert_eq!(selection_columns_in_line(&range, 3, 10), Some((0, 10)));
+        assert_eq!(selection_columns_in_line(&range, 4, 10), Some((0, 4)));
+        assert_eq!(selection_columns_in_line(&range, 5, 10), None);
+    }
+
+    #[test]
+    fn selection_columns_in_line_single_line_charwise_clamps_both_ends() {
+        let range = motion::MotionRange { shape: motion::MotionShape::Inclusive, from: (2, 3), to: (2, 6) };
+        assert_eq!(selection_columns_in_line(&range, 2, 10), Some((3, 7)));
+    }
+}
