@@ -283,7 +283,10 @@ enum Pending {
 #[derive(Debug, Clone, Copy)]
 enum LastSearch {
     Pattern { forward: bool },
-    Word { forward: bool },
+    // `bounded` distinguishes `*`/`#` (word-boundary search) from `g*`/`g#`
+    // (plain substring search) -- `n`/`N` need to repeat whichever kind was
+    // actually used, not silently upgrade/downgrade it.
+    Word { forward: bool, bounded: bool },
 }
 
 // A short display label for keys `feed` might reasonably want to echo
@@ -730,11 +733,11 @@ impl VimKeys {
             Key::Char('n') => self.emit_last_search(true),
             Key::Char('N') => self.emit_last_search(false),
             Key::Char('*') => {
-                self.last_search = Some(LastSearch::Word { forward: true });
+                self.last_search = Some(LastSearch::Word { forward: true, bounded: true });
                 self.emit(Motion::SearchWordForward)
             }
             Key::Char('#') => {
-                self.last_search = Some(LastSearch::Word { forward: false });
+                self.last_search = Some(LastSearch::Word { forward: false, bounded: true });
                 self.emit(Motion::SearchWordBackward)
             }
             Key::Char('z') => {
@@ -854,6 +857,14 @@ impl VimKeys {
             Key::Char('_') => self.emit(Motion::LineLastNonBlank),
             Key::Char('e') => self.emit(Motion::WordEndBackward),
             Key::Char('E') => self.emit(Motion::WordEndBackwardBig),
+            Key::Char('*') => {
+                self.last_search = Some(LastSearch::Word { forward: true, bounded: false });
+                self.emit(Motion::SearchWordForwardUnbounded)
+            }
+            Key::Char('#') => {
+                self.last_search = Some(LastSearch::Word { forward: false, bounded: false });
+                self.emit(Motion::SearchWordBackwardUnbounded)
+            }
             _ => self.abort(),
         }
     }
@@ -1025,12 +1036,13 @@ impl VimKeys {
                     Motion::SearchBackward(text)
                 })
             }
-            Some(LastSearch::Word { forward }) => {
+            Some(LastSearch::Word { forward, bounded }) => {
                 let forward = if same_direction { forward } else { !forward };
-                self.emit(if forward {
-                    Motion::SearchWordForward
-                } else {
-                    Motion::SearchWordBackward
+                self.emit(match (forward, bounded) {
+                    (true, true) => Motion::SearchWordForward,
+                    (true, false) => Motion::SearchWordForwardUnbounded,
+                    (false, true) => Motion::SearchWordBackward,
+                    (false, false) => Motion::SearchWordBackwardUnbounded,
                 })
             }
             None => self.abort(),
@@ -1343,6 +1355,19 @@ mod tests {
 
         let mut vk = VimKeys::new();
         assert_eq!(vk.feed(Key::Char('#')), KeyOutcome::Motion(Motion::SearchWordBackward, None));
+    }
+
+    #[test]
+    fn g_star_and_g_hash_word_search_with_repeat() {
+        let mut vk = VimKeys::new();
+        let keys = [Key::Char('g'), Key::Char('*')];
+        assert_eq!(last(&mut vk, &keys), KeyOutcome::Motion(Motion::SearchWordForwardUnbounded, None));
+        assert_eq!(vk.feed(Key::Char('n')), KeyOutcome::Motion(Motion::SearchWordForwardUnbounded, None));
+        assert_eq!(vk.feed(Key::Char('N')), KeyOutcome::Motion(Motion::SearchWordBackwardUnbounded, None));
+
+        let mut vk = VimKeys::new();
+        let keys = [Key::Char('g'), Key::Char('#')];
+        assert_eq!(last(&mut vk, &keys), KeyOutcome::Motion(Motion::SearchWordBackwardUnbounded, None));
     }
 
     #[test]

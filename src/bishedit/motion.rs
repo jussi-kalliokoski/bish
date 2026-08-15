@@ -61,6 +61,12 @@ pub enum Motion {
     SearchBackward(String), // ?pattern<Enter>
     SearchWordForward,      // *
     SearchWordBackward,     // #
+    // `g*`/`g#` -- same "search for the word under the cursor" idea as
+    // `*`/`#`, but a plain substring search: no `\<`/`\>` word-boundary
+    // requirement, so "foobar" also matches when the word under the
+    // cursor is "foo".
+    SearchWordForwardUnbounded,
+    SearchWordBackwardUnbounded,
     UnmatchedOpenParen,   // [(
     UnmatchedCloseParen,  // ])
     UnmatchedOpenBrace,   // [{
@@ -1495,6 +1501,50 @@ pub fn apply_motion(buf: &mut impl Buffer, motion: Motion, count: Option<usize>)
                 }
             }
         }
+        // `g*`/`g#`: identical shape to `SearchWordForward`/`SearchWordBackward`
+        // above, just via the plain (boundary-free) `search_forward_once`/
+        // `search_backward_once` instead of their word-boundary-checked
+        // siblings.
+        Motion::SearchWordForwardUnbounded => {
+            let pos = buf.cursor();
+            if let Some(word) = word_under_cursor(buf, pos) {
+                let chars: Vec<char> = word.chars().collect();
+                let mut cur = pos;
+                let mut found = None;
+                for _ in 0..n {
+                    match search_forward_once(buf, cur, &chars) {
+                        Some(p) => {
+                            cur = p;
+                            found = Some(p);
+                        }
+                        None => break,
+                    }
+                }
+                if let Some((l, c)) = found {
+                    buf.set_cursor(l, c);
+                }
+            }
+        }
+        Motion::SearchWordBackwardUnbounded => {
+            let pos = buf.cursor();
+            if let Some(word) = word_under_cursor(buf, pos) {
+                let chars: Vec<char> = word.chars().collect();
+                let mut cur = pos;
+                let mut found = None;
+                for _ in 0..n {
+                    match search_backward_once(buf, cur, &chars) {
+                        Some(p) => {
+                            cur = p;
+                            found = Some(p);
+                        }
+                        None => break,
+                    }
+                }
+                if let Some((l, c)) = found {
+                    buf.set_cursor(l, c);
+                }
+            }
+        }
         Motion::UnmatchedOpenParen => {
             if let Some((l, c)) = unmatched_backward(buf, buf.cursor(), '(', ')', n) {
                 buf.set_cursor(l, c);
@@ -1618,6 +1668,7 @@ fn motion_shape(m: &Motion) -> Option<MotionShape> {
         Motion::GotoMarkLine(_) => Linewise,
         Motion::SearchForward(_) | Motion::SearchBackward(_) => Exclusive,
         Motion::SearchWordForward | Motion::SearchWordBackward => Exclusive,
+        Motion::SearchWordForwardUnbounded | Motion::SearchWordBackwardUnbounded => Exclusive,
         Motion::UnmatchedOpenParen
         | Motion::UnmatchedCloseParen
         | Motion::UnmatchedOpenBrace
@@ -2259,6 +2310,18 @@ mod tests {
         buf.set_cursor(0, 0);
         assert_eq!(go(&mut buf, Motion::SearchWordForward, None), (0, 17));
         assert_eq!(go(&mut buf, Motion::SearchWordBackward, None), (0, 0));
+    }
+
+    #[test]
+    fn g_star_and_g_hash_ignore_word_boundaries() {
+        // Same buffer as the bounded test above, but g*/g# should land on
+        // "category"'s embedded "cat" (starting at column 8) instead of
+        // skipping past it to the next whole-word match.
+        let mut buf = TestBuffer::new("cat dog category cat");
+        buf.set_cursor(0, 0);
+        assert_eq!(go(&mut buf, Motion::SearchWordForwardUnbounded, None), (0, 8));
+        buf.set_cursor(0, 17);
+        assert_eq!(go(&mut buf, Motion::SearchWordBackwardUnbounded, None), (0, 8));
     }
 
     #[test]
