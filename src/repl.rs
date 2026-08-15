@@ -4,7 +4,7 @@ use std::io::{self, Write};
 use std::rc::Rc;
 
 use crate::bishedit::completion;
-use crate::bishedit::highlight::HighlightContext;
+use crate::bishedit::highlight::{self, HighlightContext};
 use crate::bishedit::motion;
 use crate::bishedit::registers::Registers;
 use crate::bishedit::suggestion;
@@ -664,7 +664,8 @@ pub fn run(mut shell: Shell) {
                     // Screen, never shared with another pane's content
                     // the way one real terminal row can be.
                     if sinks_are_grid {
-                        let echoed = format!("\r\x1b[K{}{}\r\n", prompt_str, line);
+                        let highlighted = highlight::render_line(&line, highlight_ctx);
+                        let echoed = format!("\r\x1b[K{}{}\r\n", prompt_str, highlighted);
                         session.screen.borrow_mut().feed(echoed.as_bytes());
                     }
 

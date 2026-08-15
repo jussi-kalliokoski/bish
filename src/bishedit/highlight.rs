@@ -194,6 +194,28 @@ pub fn render_styled(cells: &[vt100::Cell]) -> String {
     out
 }
 
+// Renders a plain source line (no prompt, no cursor, no ghost/search
+// layers) fully syntax-highlighted, as an SGR-coded string ending in a
+// reset. The same highlight -> StyledSpan -> compose -> render_styled
+// pipeline editor.rs's own compose_redraw runs for the live, being-typed
+// buffer, minus the parts only a live edit needs -- for callers that just
+// need to echo a *finished* line (e.g. into a promoted pane's grid once
+// it's been submitted) and want it to keep looking like it did while it
+// was still being typed, instead of reverting to plain text.
+pub fn render_line(text: &str, ctx: HighlightContext) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let styled: Vec<StyledSpan> = BashHighlighter
+        .highlight(text, ctx)
+        .into_iter()
+        .map(|s| {
+            let (fg, attrs) = default_style(s.kind);
+            StyledSpan { start: s.start, end: s.end, fg, attrs }
+        })
+        .collect();
+    let cells = compose(&chars, &[&styled]);
+    render_styled(&cells)
+}
+
 // Consumes the next raw_capture_spans entry, if any. `.get()` rather than
 // direct indexing: raw_capture_spans and the token stream can only desync
 // if a heredoc body (whose $VAR/$(...) expansions push spans through
@@ -1038,6 +1060,37 @@ mod tests {
         let rendered = render_styled(&cells);
         // One SGR to enter the style, one to reset -- no per-char churn.
         assert_eq!(rendered.matches('\x1b').count(), 2);
+    }
+
+    // Regression test for a real bug caught during interactive
+    // verification: a promoted/windowed pane echoed the *plain* submitted
+    // line into its grid on Enter, so a compositor redraw right after
+    // (e.g. the next command's output arriving) replaced the
+    // still-visible, syntax-highlighted line with uncolored text -- to a
+    // user it read as "pressing enter clears the highlighting." render_line
+    // is the fix's core: it must actually emit SGR codes for a line that
+    // highlight_word would style, not just echo the text back verbatim.
+    #[test]
+    fn render_line_carries_syntax_highlighting_as_sgr_codes() {
+        let rendered = render_line("if true; then echo hi; fi", HighlightContext::default());
+        assert!(rendered.contains('\x1b'), "{rendered:?}");
+        assert!(rendered.ends_with("\x1b[0m"), "{rendered:?}");
+        // Stripping every SGR sequence must round-trip back to the exact
+        // original text -- render_line adds color, never touches content.
+        let mut stripped = String::new();
+        let mut in_escape = false;
+        for ch in rendered.chars() {
+            if ch == '\x1b' {
+                in_escape = true;
+            } else if in_escape {
+                if ch == 'm' {
+                    in_escape = false;
+                }
+            } else {
+                stripped.push(ch);
+            }
+        }
+        assert_eq!(stripped, "if true; then echo hi; fi");
     }
 
     #[test]
