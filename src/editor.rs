@@ -1406,34 +1406,74 @@ enum LineNormalExit {
 // there's no separately-stored pattern text -- `VimKeys::last_search_
 // text`'s own doc comment explains why `motion::word_under_cursor` at
 // the buffer's current cursor reliably recovers it instead.
+// Visual mode's own active (not yet committed via `Z`) selection, if any
+// -- `vk`'s own anchor ordered against `lb`'s current cursor into a
+// `MotionRange` ready for `extract_text`/rendering/deletion. Mirrors
+// repl.rs's own `active_visual_range` exactly (see its doc comment for
+// why `Char` maps to `Inclusive`, `Line` to `Linewise`) -- duplicated
+// rather than shared since the two drive different `Buffer` impls
+// (`ScreenBuffer` there, `LineBuffer` here) and it's a handful of lines
+// either way.
+fn active_visual_range_line(vk: &VimKeys, lb: &LineBuffer) -> Option<motion::MotionRange> {
+    let (shape, anchor) = vk.visual_anchor()?;
+    let cursor = lb.cursor();
+    let motion_shape = if shape == RegisterShape::Line { motion::MotionShape::Linewise } else { motion::MotionShape::Inclusive };
+    let (from, to) = if anchor <= cursor { (anchor, cursor) } else { (cursor, anchor) };
+    Some(motion::MotionRange { shape: motion_shape, from, to })
+}
+
+// The (start, end) char-column range `range` covers -- always the whole
+// single line this buffer ever has, so unlike repl.rs's own
+// `selection_columns_in_line` (which has to handle a range spanning
+// several real lines) this never needs a `None`/per-line case: `Linewise`
+// is the whole buffer (same flattening `yy`/`dd`/`cc` already use for a
+// single-line buffer), `Inclusive` is just `to.1 + 1` clamped to `len`.
+fn selection_columns_line(range: &motion::MotionRange, len: usize) -> (usize, usize) {
+    if range.shape == motion::MotionShape::Linewise {
+        return (0, len);
+    }
+    (range.from.1, (range.to.1 + 1).min(len))
+}
+
 fn normal_mode_prompt_and_matches(
     ed: &mut LineEditor,
     marks: &mut HashMap<char, (usize, usize)>,
+    selections: &mut Vec<motion::MotionRange>,
     vk: &VimKeys,
     decorated_prompt: &str,
 ) -> (String, Vec<(usize, usize)>) {
     let pending = vk.pending_display();
     if let Some(rest) = pending.strip_prefix('/').or_else(|| pending.strip_prefix('?')) {
-        let matches = if rest.is_empty() {
-            Vec::new()
-        } else {
-            let lb = LineBuffer { ed, marks };
-            motion::find_matches_in_line(&lb, 0, rest)
-        };
+        let lb = LineBuffer { ed, marks, selections };
+        let mut matches = if rest.is_empty() { Vec::new() } else { motion::find_matches_in_line(&lb, 0, rest) };
+        push_selection_matches(&lb, vk, &mut matches);
         return (pending.to_string(), matches);
     }
-    let lb = LineBuffer { ed, marks };
+    let lb = LineBuffer { ed, marks, selections };
     let pattern = if vk.last_search_is_word() {
         motion::word_under_cursor(&lb, lb.cursor())
     } else {
         let text = vk.last_search_text();
         if text.is_empty() { None } else { Some(text.to_string()) }
     };
-    let matches = match pattern {
+    let mut matches = match pattern {
         Some(p) => motion::find_matches_in_line(&lb, 0, &p),
         None => Vec::new(),
     };
+    push_selection_matches(&lb, vk, &mut matches);
     (decorated_prompt.to_string(), matches)
+}
+
+// Extends `matches` (search-match column ranges, already reverse-video --
+// see `compose_redraw`'s own `search_matches` doc comment) with every
+// committed selection plus the active one, if any -- Visual mode's own
+// highlighting piggybacks on exactly the same rendering, matching
+// repl.rs's own `render_normal_mode_frame`.
+fn push_selection_matches(lb: &LineBuffer, vk: &VimKeys, matches: &mut Vec<(usize, usize)>) {
+    let len = lb.ed.buf.len();
+    for range in lb.selections.iter().chain(active_visual_range_line(vk, lb).iter()) {
+        matches.push(selection_columns_line(range, len));
+    }
 }
 
 // Ctrl-E: a lightweight, line-local vim Normal mode over the buffer
@@ -1464,6 +1504,10 @@ fn run_line_normal_mode(
 ) -> io::Result<LineNormalExit> {
     let mut vk = VimKeys::new();
     let mut marks: HashMap<char, (usize, usize)> = HashMap::new();
+    // Visual mode's own committed selections -- see `LineBuffer::
+    // selections`' own doc comment. Fresh and empty for this excursion,
+    // same as `marks` just above.
+    let mut selections: Vec<motion::MotionRange> = Vec::new();
     // Reverse-video prompt: the mode indicator. Deliberately not a
     // terminal cursor-shape change (DECSCUSR) -- that's global terminal
     // state with no clean way to restore whatever the user's own
@@ -1472,7 +1516,7 @@ fn run_line_normal_mode(
     // unwanted, sticky change to something this feature has no business
     // touching.
     let decorated_prompt = format!("\x1b[7m{}\x1b[0m", prompt);
-    let (shown, matches) = normal_mode_prompt_and_matches(ed, &mut marks, &vk, &decorated_prompt);
+    let (shown, matches) = normal_mode_prompt_and_matches(ed, &mut marks, &mut selections, &vk, &decorated_prompt);
     redraw(&shown, ed, col_origin, width, ctx, &matches)?;
     let exit = loop {
         let key = match read_key_idle(on_idle)? {
@@ -1481,8 +1525,84 @@ fn run_line_normal_mode(
         };
         match key {
             Key::CtrlC | Key::CtrlD | Key::CtrlZ => break LineNormalExit::Propagate(key),
+            // Visual mode's own `Z`/`y`/`d`/`p`/`P`/Escape -- intercepted
+            // here, ahead of `vk.feed`, for the same reason repl.rs's own
+            // identical arms are (see its own doc comment): "is there a
+            // selection to act on" is `LineBuffer`-owned state vimkeys.rs
+            // deliberately never sees. `vk.is_idle()` guards all of them:
+            // mid a sub-prefix (`f`, a count, ...) these keys keep their
+            // ordinary meaning instead.
+            //
+            // `Z` (single, not `ZZ` -- unlike repl.rs's own Normal mode,
+            // nothing here gives `Z` any other meaning to preserve):
+            // commits the active selection and returns to Normal mode,
+            // keeping every selection so far highlighted so another
+            // `v`/`V` can start the next one.
+            Key::Char('Z') if vk.is_idle() && vk.is_visual() => {
+                let lb = LineBuffer { ed, marks: &mut marks, selections: &mut selections };
+                if let Some(range) = active_visual_range_line(&vk, &lb) {
+                    lb.selections.push(range);
+                }
+                vk.end_visual();
+            }
+            // `y`: yanks every committed selection plus the active one
+            // (if any) as one concatenated register value, then clears
+            // both -- reachable either mid an active `v`/`V` selection,
+            // or from plain Normal mode right after a `Z` with nothing
+            // new started (the `!selections.is_empty()` half of the
+            // guard). Falls through to vimkeys.rs's own ordinary
+            // `y`/`yy`/`y{motion}` handling whenever neither is true.
+            Key::Char('y') if vk.is_idle() && (vk.is_visual() || !selections.is_empty()) => {
+                let lb = LineBuffer { ed, marks: &mut marks, selections: &mut selections };
+                if let Some(range) = active_visual_range_line(&vk, &lb) {
+                    lb.selections.push(range);
+                }
+                let register = vk.take_pending_register();
+                yank_selections_line(&lb, registers, register);
+                lb.selections.clear();
+                vk.end_visual();
+            }
+            // `d`: deletes every committed selection plus the active one
+            // (writing the concatenated deleted text to a register
+            // first, same as any other delete), then clears both. Same
+            // reachability as `y` just above; otherwise falls through to
+            // ordinary `d`/`dd`/`d{motion}` operator-arming.
+            Key::Char('d') if vk.is_idle() && (vk.is_visual() || !selections.is_empty()) => {
+                let mut lb = LineBuffer { ed, marks: &mut marks, selections: &mut selections };
+                if let Some(range) = active_visual_range_line(&vk, &lb) {
+                    lb.selections.push(range);
+                }
+                let register = vk.take_pending_register();
+                delete_selections(&mut lb, registers, register);
+                lb.selections.clear();
+                vk.end_visual();
+            }
+            // `p`/`P`: replaces every committed selection plus the
+            // active one with the register's content (see
+            // `put_over_selections`' own doc comment on why this
+            // broadcasts to every selection rather than mimicking real
+            // vim's single-selection swap). Same reachability as `y`/`d`;
+            // otherwise falls through to ordinary `p`/`P` put-after/
+            // before-cursor.
+            Key::Char('p') | Key::Char('P') if vk.is_idle() && (vk.is_visual() || !selections.is_empty()) => {
+                let mut lb = LineBuffer { ed, marks: &mut marks, selections: &mut selections };
+                if let Some(range) = active_visual_range_line(&vk, &lb) {
+                    lb.selections.push(range);
+                }
+                let register = vk.take_pending_register();
+                put_over_selections(&mut lb, registers, register);
+                lb.selections.clear();
+                vk.end_visual();
+            }
+            // Escape: cancels everything -- the active selection and
+            // every previously committed one -- back to a clean Normal
+            // mode with nothing yanked/deleted/replaced.
+            Key::Escape if vk.is_idle() && (vk.is_visual() || !selections.is_empty()) => {
+                vk.end_visual();
+                selections.clear();
+            }
             _ => {
-                let mut lb = LineBuffer { ed, marks: &mut marks };
+                let mut lb = LineBuffer { ed, marks: &mut marks, selections: &mut selections };
                 match vk.feed(key) {
                     KeyOutcome::Motion(m, count) => {
                         motion::apply_motion(&mut lb, m, count);
@@ -1522,25 +1642,26 @@ fn run_line_normal_mode(
                             registers.write(register, RegisterValue { text: deleted, shape: RegisterShape::Char });
                         }
                     }
+                    // `v`/`V`: arms Visual mode with the buffer's own
+                    // current cursor as the anchor (vimkeys.rs can't read
+                    // that itself -- see `EnterVisual`'s own doc
+                    // comment). Rendering (the reverse-video highlight,
+                    // via `push_selection_matches`) and what `y`/`d`/`p`/
+                    // `Z`/Escape do from here on are handled by the
+                    // guarded arms above, at the top of this same loop.
+                    KeyOutcome::EnterVisual(shape) => {
+                        vk.begin_visual(shape, lb.cursor());
+                    }
                     // <C-w> is still vimkeys' own window-leader prefix
                     // here too, matching real vim's own Normal-mode
                     // Ctrl-W meaning -- intentionally not special-cased
                     // away, even though there's no window/pane state for
                     // it to act on in this context (a harmless no-op).
-                    // Visual mode (EnterVisual) is repl.rs's own
-                    // ScreenBuffer normal mode's feature for now (see its
-                    // own doc comment) -- a no-op here, same reasoning as
-                    // Window just above: this loop never calls
-                    // `begin_visual` back, so `vk`'s own `visual` field
-                    // simply stays `None` regardless -- `v`/`V` do nothing
-                    // here, matching that the feature doesn't exist yet in
-                    // this context, rather than half-arming state nothing
-                    // here would ever read or clear.
-                    KeyOutcome::Window(..) | KeyOutcome::EnterVisual(_) | KeyOutcome::Pending | KeyOutcome::None => {}
+                    KeyOutcome::Window(..) | KeyOutcome::Pending | KeyOutcome::None => {}
                 }
             }
         }
-        let (shown, matches) = normal_mode_prompt_and_matches(ed, &mut marks, &vk, &decorated_prompt);
+        let (shown, matches) = normal_mode_prompt_and_matches(ed, &mut marks, &mut selections, &vk, &decorated_prompt);
         redraw(&shown, ed, col_origin, width, ctx, &matches)?;
     };
     Ok(exit)
@@ -1634,6 +1755,127 @@ fn delete_lines(lb: &mut LineBuffer, registers: &mut Registers, count: Option<us
     lb.ed.cursor = 0;
 }
 
+// Visual mode's own `y`: every selection in `lb.selections` (already in
+// commit order -- `Z` pushes, this reads, the caller clears afterward),
+// concatenated with no separator -- mirrors repl.rs's own
+// `yank_selections` exactly (see its doc comment for why: a `Linewise`
+// part already ends in `\n`, a charwise part butts directly against its
+// neighbor).
+fn yank_selections_line(lb: &LineBuffer, registers: &mut Registers, register: Option<char>) {
+    if lb.selections.is_empty() {
+        return;
+    }
+    let mut text = String::new();
+    let mut shape = RegisterShape::Char;
+    for range in lb.selections.iter() {
+        text.push_str(&motion::extract_text(lb, range));
+        if range.shape == motion::MotionShape::Linewise {
+            shape = RegisterShape::Line;
+        }
+    }
+    registers.write(register, RegisterValue { text, shape });
+}
+
+// Visual mode's own `d`: removes every selection from the buffer,
+// writing the concatenated deleted text to a register first (vim's own
+// "delete always yanks" rule, same as any other delete operator).
+// Returns whether anything was actually selected -- mirrors
+// `delete_motion`'s own `bool` result, though this call site never
+// checks it for a change-to-insert decision the way that one does (there
+// is no Visual `c` yet).
+fn delete_selections(lb: &mut LineBuffer, registers: &mut Registers, register: Option<char>) -> bool {
+    if lb.selections.is_empty() {
+        return false;
+    }
+    let mut text = String::new();
+    let mut shape = RegisterShape::Char;
+    for range in lb.selections.iter() {
+        text.push_str(&motion::extract_text(lb, range));
+        if range.shape == motion::MotionShape::Linewise {
+            shape = RegisterShape::Line;
+        }
+    }
+    registers.write(register, RegisterValue { text, shape });
+
+    // A `Linewise` selection (`V`) already covers the whole single-line
+    // buffer -- same flattening `yy`/`dd`/`cc` already use -- so it
+    // subsumes every other selection in the set outright; no per-range
+    // removal needed (or safe: the buffer's about to be empty either
+    // way).
+    if lb.selections.iter().any(|r| r.shape == motion::MotionShape::Linewise) {
+        lb.ed.buf.clear();
+        lb.ed.cursor = 0;
+        return true;
+    }
+
+    // Removed highest start-column first, so removing a rightward
+    // selection never shifts a still-pending leftward one's own columns
+    // -- `leftmost` is captured from the *original* (pre-removal) ranges
+    // for exactly that reason: the leftmost range's own start column
+    // never moves no matter what's removed to its right.
+    let leftmost = lb.selections.iter().map(|r| r.from.1).min().unwrap_or(0);
+    let mut ranges = lb.selections.clone();
+    ranges.sort_by_key(|r| std::cmp::Reverse(r.from.1));
+    for range in &ranges {
+        // Re-clamped to the buffer's *current* length on every iteration
+        // (not computed once up front) -- panic-safe even against
+        // pathologically overlapping selections, which nothing currently
+        // prevents the user from creating.
+        let len = lb.ed.buf.len();
+        let start = range.from.1.min(len);
+        let end = (range.to.1 + 1).min(len).max(start);
+        lb.ed.buf.drain(start..end);
+    }
+    lb.ed.cursor = leftmost.min(lb.ed.buf.len().saturating_sub(1));
+    true
+}
+
+// Visual mode's own `p`/`P` (both the same in Visual mode, matching real
+// vim: there's no "before/after the cursor" when replacing a selected
+// range, only "instead of it"): replaces *every* selection with the same
+// register content -- a deliberate departure from real vim's own
+// single-selection swap (where the replaced text lands back in the
+// register): with several selections, broadcasting one register's worth
+// of text to each -- "replace every one of these with that" -- is the
+// actually useful multi-selection behavior (and keeps the register
+// intact for pasting the same replacement again), so the old, replaced-
+// away text is simply discarded here rather than overwriting the
+// register a caller may still want. Returns whether anything was
+// actually selected/replaced.
+fn put_over_selections(lb: &mut LineBuffer, registers: &mut Registers, register: Option<char>) -> bool {
+    if lb.selections.is_empty() {
+        return false;
+    }
+    let insert_text = registers.read(register).flatten_to_single_line();
+    let insert_chars: Vec<char> = insert_text.chars().collect();
+    if insert_chars.is_empty() {
+        return false;
+    }
+
+    if lb.selections.iter().any(|r| r.shape == motion::MotionShape::Linewise) {
+        let len = insert_chars.len();
+        lb.ed.buf = insert_chars;
+        lb.ed.cursor = len.saturating_sub(1);
+        return true;
+    }
+
+    let mut ranges = lb.selections.clone();
+    ranges.sort_by_key(|r| std::cmp::Reverse(r.from.1));
+    let mut leftmost_insert_at = 0;
+    for range in &ranges {
+        let len = lb.ed.buf.len();
+        let start = range.from.1.min(len);
+        let end = (range.to.1 + 1).min(len).max(start);
+        lb.ed.buf.splice(start..end, insert_chars.iter().copied());
+        leftmost_insert_at = start;
+    }
+    // Cursor on the last character of the leftmost replacement -- the
+    // same "ends on the last inserted character" rule `apply_put`'s own
+    // doc comment already establishes for a single `p`.
+    lb.ed.cursor = (leftmost_insert_at + insert_chars.len()).saturating_sub(1).min(lb.ed.buf.len().saturating_sub(1));
+    true
+}
+
 // vim's own "`cw`/`cW` act like `ce`/`cE`" rule: when the cursor sits on
 // a non-blank character, changing "to the next word" would otherwise eat
 // the trailing whitespace before that word too (via `WordForward`'s own
@@ -1671,6 +1913,10 @@ fn redirect_cw_to_ce(lb: &LineBuffer, motion: &motion::Motion) -> motion::Motion
 fn run_one_shot_normal_command(ed: &mut LineEditor, registers: &mut Registers, on_idle: &mut dyn FnMut()) -> io::Result<Option<Key>> {
     let mut vk = VimKeys::new();
     let mut marks: HashMap<char, (usize, usize)> = HashMap::new();
+    // Never actually driven in this loop (see EnterVisual's own arm
+    // below) -- exists only because `LineBuffer` always needs one to
+    // construct, same reasoning as `marks`.
+    let mut selections: Vec<motion::MotionRange> = Vec::new();
     let result = loop {
         let key = match read_key_idle(on_idle)? {
             Some(k) => k,
@@ -1683,7 +1929,7 @@ fn run_one_shot_normal_command(ed: &mut LineEditor, registers: &mut Registers, o
         match key {
             Key::CtrlC | Key::CtrlD | Key::CtrlZ => break Some(key),
             _ => {
-                let mut lb = LineBuffer { ed, marks: &mut marks };
+                let mut lb = LineBuffer { ed, marks: &mut marks, selections: &mut selections };
                 match vk.feed(key) {
                     KeyOutcome::Motion(m, count) => {
                         motion::apply_motion(&mut lb, m, count);
@@ -1763,6 +2009,13 @@ fn run_one_shot_normal_command(ed: &mut LineEditor, registers: &mut Registers, o
 struct LineBuffer<'a> {
     ed: &'a mut LineEditor,
     marks: &'a mut HashMap<char, (usize, usize)>,
+    // Visual mode's own committed selections -- see repl.rs's own
+    // `ScreenBuffer::selections` doc comment for the shared design (a
+    // plain `Vec<motion::MotionRange>`, `Z` pushes, `y`/`d`/`p` read and
+    // clear). Fresh, empty each `LineBuffer` construction here too, same
+    // as `marks` just above -- Visual mode doesn't persist across
+    // separate Ctrl-E excursions.
+    selections: &'a mut Vec<motion::MotionRange>,
 }
 
 impl<'a> crate::bishedit::Buffer for LineBuffer<'a> {
@@ -1909,7 +2162,8 @@ mod tests {
     fn delete_motion_removes_an_exclusive_range_and_writes_the_register() {
         let mut ed = make_editor("foo bar baz", 0);
         let mut marks = HashMap::new();
-        let mut lb = LineBuffer { ed: &mut ed, marks: &mut marks };
+        let mut selections: Vec<motion::MotionRange> = Vec::new();
+        let mut lb = LineBuffer { ed: &mut ed, marks: &mut marks, selections: &mut selections };
         let mut registers = make_registers();
         let deleted = delete_motion(&mut lb, &mut registers, motion::Motion::WordForward, None, None);
         assert!(deleted);
@@ -1924,7 +2178,8 @@ mod tests {
     fn delete_motion_removes_an_inclusive_range() {
         let mut ed = make_editor("foo bar baz", 4); // 'b' of bar
         let mut marks = HashMap::new();
-        let mut lb = LineBuffer { ed: &mut ed, marks: &mut marks };
+        let mut selections: Vec<motion::MotionRange> = Vec::new();
+        let mut lb = LineBuffer { ed: &mut ed, marks: &mut marks, selections: &mut selections };
         let mut registers = make_registers();
         delete_motion(&mut lb, &mut registers, motion::Motion::LineEnd, None, None);
         assert_eq!(ed.buf.iter().collect::<String>(), "foo ");
@@ -1936,7 +2191,8 @@ mod tests {
     fn delete_motion_on_a_failed_target_deletes_nothing_and_reports_false() {
         let mut ed = make_editor("abc", 0);
         let mut marks = HashMap::new();
-        let mut lb = LineBuffer { ed: &mut ed, marks: &mut marks };
+        let mut selections: Vec<motion::MotionRange> = Vec::new();
+        let mut lb = LineBuffer { ed: &mut ed, marks: &mut marks, selections: &mut selections };
         let mut registers = make_registers();
         // Left at column 0 never moves -- motion_range returns None.
         let deleted = delete_motion(&mut lb, &mut registers, motion::Motion::Left, None, None);
@@ -1958,7 +2214,8 @@ mod tests {
         // ignores the specific from/to columns entirely.
         let mut ed = make_editor("  foo bar", 5);
         let mut marks = HashMap::new();
-        let mut lb = LineBuffer { ed: &mut ed, marks: &mut marks };
+        let mut selections: Vec<motion::MotionRange> = Vec::new();
+        let mut lb = LineBuffer { ed: &mut ed, marks: &mut marks, selections: &mut selections };
         let mut registers = make_registers();
         let deleted = delete_motion(&mut lb, &mut registers, motion::Motion::GotoFirstLine, None, None);
         assert!(deleted);
@@ -1971,7 +2228,8 @@ mod tests {
     fn delete_lines_clears_the_buffer_and_writes_a_linewise_register() {
         let mut ed = make_editor("foo bar", 2);
         let mut marks = HashMap::new();
-        let mut lb = LineBuffer { ed: &mut ed, marks: &mut marks };
+        let mut selections: Vec<motion::MotionRange> = Vec::new();
+        let mut lb = LineBuffer { ed: &mut ed, marks: &mut marks, selections: &mut selections };
         let mut registers = make_registers();
         delete_lines(&mut lb, &mut registers, None, None);
         assert!(ed.buf.is_empty());
@@ -1985,7 +2243,8 @@ mod tests {
     fn redirect_cw_to_ce_only_fires_on_a_non_blank_cursor() {
         let mut ed = make_editor("foo bar", 0); // 'f', non-blank
         let mut marks = HashMap::new();
-        let lb = LineBuffer { ed: &mut ed, marks: &mut marks };
+        let mut selections: Vec<motion::MotionRange> = Vec::new();
+        let lb = LineBuffer { ed: &mut ed, marks: &mut marks, selections: &mut selections };
         assert_eq!(redirect_cw_to_ce(&lb, &motion::Motion::WordForward), motion::Motion::WordEnd);
         assert_eq!(redirect_cw_to_ce(&lb, &motion::Motion::WordForwardBig), motion::Motion::WordEndBig);
         // Unaffected motions pass through unchanged.
@@ -1996,7 +2255,8 @@ mod tests {
     fn redirect_cw_to_ce_does_not_fire_on_a_blank_cursor() {
         let mut ed = make_editor("foo bar", 3); // the space between words
         let mut marks = HashMap::new();
-        let lb = LineBuffer { ed: &mut ed, marks: &mut marks };
+        let mut selections: Vec<motion::MotionRange> = Vec::new();
+        let lb = LineBuffer { ed: &mut ed, marks: &mut marks, selections: &mut selections };
         assert_eq!(redirect_cw_to_ce(&lb, &motion::Motion::WordForward), motion::Motion::WordForward);
     }
 
@@ -2007,12 +2267,132 @@ mod tests {
         // vim's own cw-acts-like-ce rule.
         let mut ed = make_editor("foo bar", 1); // 'o' of foo
         let mut marks = HashMap::new();
-        let mut lb = LineBuffer { ed: &mut ed, marks: &mut marks };
+        let mut selections: Vec<motion::MotionRange> = Vec::new();
+        let mut lb = LineBuffer { ed: &mut ed, marks: &mut marks, selections: &mut selections };
         let mut registers = make_registers();
         let motion = redirect_cw_to_ce(&lb, &motion::Motion::WordForward);
         delete_motion(&mut lb, &mut registers, motion, None, None);
         assert_eq!(ed.buf.iter().collect::<String>(), "f bar");
         assert_eq!(ed.cursor, 1);
         assert_eq!(registers.read(None).text, "oo");
+    }
+
+    fn range(from_col: usize, to_col: usize) -> motion::MotionRange {
+        motion::MotionRange { shape: motion::MotionShape::Inclusive, from: (0, from_col), to: (0, to_col) }
+    }
+
+    #[test]
+    fn yank_selections_line_concatenates_two_charwise_ranges_with_no_separator() {
+        let mut ed = make_editor("foo bar baz", 0);
+        let mut marks = HashMap::new();
+        let mut selections = vec![range(0, 2), range(4, 6)]; // "foo", "bar"
+        let lb = LineBuffer { ed: &mut ed, marks: &mut marks, selections: &mut selections };
+        let mut registers = make_registers();
+        yank_selections_line(&lb, &mut registers, None);
+        let value = registers.read(None);
+        assert_eq!(value.text, "foobar");
+        assert_eq!(value.shape, RegisterShape::Char);
+    }
+
+    #[test]
+    fn yank_selections_line_shape_is_line_if_any_range_is_linewise() {
+        let mut ed = make_editor("foo bar", 0);
+        let mut marks = HashMap::new();
+        let mut selections = vec![motion::MotionRange { shape: motion::MotionShape::Linewise, from: (0, 0), to: (0, 0) }];
+        let lb = LineBuffer { ed: &mut ed, marks: &mut marks, selections: &mut selections };
+        let mut registers = make_registers();
+        yank_selections_line(&lb, &mut registers, None);
+        assert_eq!(registers.read(None).shape, RegisterShape::Line);
+    }
+
+    // Regression-shaped test for the deletion-order reasoning in
+    // `delete_selections`' own doc comment: two ranges removed
+    // rightmost-first so the leftward one's own columns never shift,
+    // with the register holding both pieces concatenated in *commit*
+    // order regardless of their spatial order.
+    #[test]
+    fn delete_selections_removes_every_range_leftmost_cursor_concatenated_register() {
+        let mut ed = make_editor("foo bar baz", 0);
+        let mut marks = HashMap::new();
+        let mut selections = vec![range(0, 2), range(4, 6)]; // "foo", "bar"
+        let mut lb = LineBuffer { ed: &mut ed, marks: &mut marks, selections: &mut selections };
+        let mut registers = make_registers();
+        let deleted = delete_selections(&mut lb, &mut registers, None);
+        assert!(deleted);
+        assert_eq!(ed.buf.iter().collect::<String>(), "  baz");
+        assert_eq!(ed.cursor, 0);
+        assert_eq!(registers.read(None).text, "foobar");
+    }
+
+    #[test]
+    fn delete_selections_linewise_clears_the_whole_buffer_even_mixed_with_charwise() {
+        let mut ed = make_editor("foo bar", 0);
+        let mut marks = HashMap::new();
+        let mut selections = vec![range(0, 2), motion::MotionRange { shape: motion::MotionShape::Linewise, from: (0, 0), to: (0, 0) }];
+        let mut lb = LineBuffer { ed: &mut ed, marks: &mut marks, selections: &mut selections };
+        let mut registers = make_registers();
+        assert!(delete_selections(&mut lb, &mut registers, None));
+        assert!(ed.buf.is_empty());
+        assert_eq!(ed.cursor, 0);
+    }
+
+    #[test]
+    fn delete_selections_is_a_no_op_when_nothing_is_selected() {
+        let mut ed = make_editor("foo bar", 0);
+        let mut marks = HashMap::new();
+        let mut selections: Vec<motion::MotionRange> = Vec::new();
+        let mut lb = LineBuffer { ed: &mut ed, marks: &mut marks, selections: &mut selections };
+        let mut registers = make_registers();
+        assert!(!delete_selections(&mut lb, &mut registers, None));
+        assert_eq!(ed.buf.iter().collect::<String>(), "foo bar");
+    }
+
+    #[test]
+    fn put_over_selections_replaces_every_selection_with_the_same_register_text() {
+        let mut ed = make_editor("foo bar baz", 0);
+        let mut marks = HashMap::new();
+        let mut selections = vec![range(0, 2), range(4, 6)]; // "foo", "bar"
+        let mut lb = LineBuffer { ed: &mut ed, marks: &mut marks, selections: &mut selections };
+        let mut registers = make_registers();
+        registers.write(None, RegisterValue { text: "X".to_string(), shape: RegisterShape::Char });
+        assert!(put_over_selections(&mut lb, &mut registers, None));
+        assert_eq!(ed.buf.iter().collect::<String>(), "X X baz");
+        assert_eq!(ed.cursor, 0);
+        // The register itself is untouched -- a deliberate departure
+        // from real vim's single-selection swap (see this function's own
+        // doc comment) -- so the same replacement can be pasted again.
+        assert_eq!(registers.read(None).text, "X");
+    }
+
+    #[test]
+    fn put_over_selections_is_a_no_op_with_an_empty_register() {
+        let mut ed = make_editor("foo bar", 0);
+        let mut marks = HashMap::new();
+        let mut selections = vec![range(0, 2)];
+        let mut lb = LineBuffer { ed: &mut ed, marks: &mut marks, selections: &mut selections };
+        let mut registers = make_registers();
+        assert!(!put_over_selections(&mut lb, &mut registers, None));
+        assert_eq!(ed.buf.iter().collect::<String>(), "foo bar");
+    }
+
+    #[test]
+    fn active_visual_range_line_orders_anchor_and_cursor_regardless_of_direction() {
+        let mut vk = VimKeys::new();
+        vk.begin_visual(RegisterShape::Char, (0, 5));
+        let mut ed = make_editor("foo bar baz", 2); // cursor before the anchor
+        let mut marks = HashMap::new();
+        let mut selections: Vec<motion::MotionRange> = Vec::new();
+        let lb = LineBuffer { ed: &mut ed, marks: &mut marks, selections: &mut selections };
+        let got = active_visual_range_line(&vk, &lb).unwrap();
+        assert_eq!(got.from, (0, 2));
+        assert_eq!(got.to, (0, 5));
+        assert_eq!(got.shape, motion::MotionShape::Inclusive);
+    }
+
+    #[test]
+    fn selection_columns_line_charwise_and_linewise() {
+        assert_eq!(selection_columns_line(&range(2, 5), 11), (2, 6));
+        let linewise = motion::MotionRange { shape: motion::MotionShape::Linewise, from: (0, 0), to: (0, 0) };
+        assert_eq!(selection_columns_line(&linewise, 11), (0, 11));
     }
 }
