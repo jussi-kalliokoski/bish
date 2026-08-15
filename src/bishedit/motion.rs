@@ -1626,6 +1626,44 @@ pub enum MotionShape {
     Linewise,
 }
 
+/// Whether `m` is one of vim's own `:help jump-motions` -- the ones that
+/// record where the cursor was *before* they ran, so `Ctrl-O`/`Ctrl-I` (see
+/// `vimkeys::VimKeys::push_jump`'s own doc comment) can step back through
+/// them. Deliberately excludes the small, local motions (`h`/`j`/`k`/`l`,
+/// word motions, `f`/`t`, scrolling, sentence text-object-adjacent detail)
+/// even though several of them (e.g. `f`) can technically move the cursor
+/// a long way on a long line -- matching vim's own distinction between
+/// "a motion" and "a jump" by which commands are on this specific list,
+/// not by how far any given use of one happens to move the cursor.
+pub fn is_jump(m: &Motion) -> bool {
+    matches!(
+        m,
+        Motion::GotoFirstLine
+            | Motion::GotoLastLine
+            | Motion::GotoPercent
+            | Motion::SearchForward(_)
+            | Motion::SearchBackward(_)
+            | Motion::SearchWordForward
+            | Motion::SearchWordBackward
+            | Motion::SearchWordForwardUnbounded
+            | Motion::SearchWordBackwardUnbounded
+            | Motion::MatchPair
+            | Motion::GotoMark(_)
+            | Motion::GotoMarkLine(_)
+            | Motion::ParagraphForward
+            | Motion::ParagraphBackward
+            | Motion::SentenceForward
+            | Motion::SentenceBackward
+            | Motion::SectionForward
+            | Motion::SectionForwardEnd
+            | Motion::SectionBackward
+            | Motion::SectionBackwardEnd
+            | Motion::ScreenTop
+            | Motion::ScreenMiddle
+            | Motion::ScreenBottom
+    )
+}
+
 /// `None` means `m` isn't a valid operator target at all -- either it's not
 /// really a motion (`SetMark` just records a position, it doesn't move
 /// anything), or it's one of the viewport/scroll commands (Ctrl-D/U/F/B,
@@ -2322,6 +2360,50 @@ mod tests {
         assert_eq!(go(&mut buf, Motion::SearchWordForwardUnbounded, None), (0, 8));
         buf.set_cursor(0, 17);
         assert_eq!(go(&mut buf, Motion::SearchWordBackwardUnbounded, None), (0, 8));
+    }
+
+    #[test]
+    fn is_jump_classifies_vims_own_jump_motions() {
+        let jumps: &[Motion] = &[
+            Motion::GotoFirstLine,
+            Motion::GotoLastLine,
+            Motion::GotoPercent,
+            Motion::SearchForward("x".to_string()),
+            Motion::SearchBackward("x".to_string()),
+            Motion::SearchWordForward,
+            Motion::SearchWordBackward,
+            Motion::SearchWordForwardUnbounded,
+            Motion::SearchWordBackwardUnbounded,
+            Motion::MatchPair,
+            Motion::GotoMark('a'),
+            Motion::GotoMarkLine('a'),
+            Motion::ParagraphForward,
+            Motion::ParagraphBackward,
+            Motion::SentenceForward,
+            Motion::SentenceBackward,
+            Motion::SectionForward,
+            Motion::SectionForwardEnd,
+            Motion::SectionBackward,
+            Motion::SectionBackwardEnd,
+            Motion::ScreenTop,
+            Motion::ScreenMiddle,
+            Motion::ScreenBottom,
+        ];
+        for m in jumps {
+            assert!(is_jump(m), "{m:?} should be classified as a jump");
+        }
+        let not_jumps: &[Motion] = &[
+            Motion::Left,
+            Motion::WordForward,
+            Motion::FindChar { ch: 'x', till: false, forward: true },
+            Motion::HalfPageDown,
+            Motion::LineEnd,
+            Motion::UnmatchedOpenParen,
+            Motion::TextObject(TextObjectKind::Word, false),
+        ];
+        for m in not_jumps {
+            assert!(!is_jump(m), "{m:?} should not be classified as a jump");
+        }
     }
 
     #[test]

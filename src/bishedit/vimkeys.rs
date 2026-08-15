@@ -90,6 +90,13 @@ pub enum KeyOutcome {
     /// reasoning as `EnterVisual`'s own doc comment); a no-op if there's
     /// nothing to reselect yet.
     ReselectVisual,
+    /// `Ctrl-O`/`Ctrl-I` -- step backward/forward through the jump list.
+    /// The caller must call `vk.jump_back(buf.cursor())`/`vk.jump_forward
+    /// (buf.cursor())` (this crate owns the jump-list state -- see
+    /// `push_jump`'s own doc comment -- but never a `Buffer`) and, if it
+    /// returns `Some`, move the cursor there; a no-op at either end of the
+    /// list.
+    Jump { forward: bool },
     /// The key was consumed as part of an in-progress sequence (a count
     /// digit, or a prefix awaiting its next character); no motion yet.
     Pending,
@@ -397,6 +404,16 @@ pub struct VimKeys {
     // selection, stashed by `end_visual` whenever one ends. `None` until
     // the first Visual selection ever ends.
     last_visual: Option<VisualSelection>,
+    // `Ctrl-O`/`Ctrl-I`'s own back/forward navigation history -- a plain
+    // two-stack model (same shape a browser's own back/forward history
+    // uses), not vim's real fixed-size ring buffer with its own
+    // deduplication/staleness rules. `push_jump` (called by a caller right
+    // before applying a `motion::is_jump` motion) moves the pre-jump
+    // position onto `jump_back` and clears `jump_forward` -- a fresh jump
+    // discards any old "redo" history, same as a browser navigating to a
+    // new page after going back does.
+    jump_back: Vec<(usize, usize)>,
+    jump_forward: Vec<(usize, usize)>,
 }
 
 impl VimKeys {
@@ -412,6 +429,8 @@ impl VimKeys {
             pending_register: None,
             visual: None,
             last_visual: None,
+            jump_back: Vec::new(),
+            jump_forward: Vec::new(),
             current_input: String::new(),
             last_completed: String::new(),
         }
@@ -489,6 +508,35 @@ impl VimKeys {
     /// own doc comment for how a caller uses this.
     pub fn last_visual(&self) -> Option<VisualSelection> {
         self.last_visual
+    }
+
+    /// Records `pos` (the cursor's own position right before a
+    /// `motion::is_jump` motion is about to run) as a jump-list entry --
+    /// called by a caller ahead of applying such a motion (this crate
+    /// never touches a `Buffer` itself). Discards any `jump_forward`
+    /// history, same as a browser's own back/forward stack does once you
+    /// navigate somewhere new instead of pressing "forward".
+    pub fn push_jump(&mut self, pos: (usize, usize)) {
+        self.jump_back.push(pos);
+        self.jump_forward.clear();
+    }
+
+    /// `Ctrl-O`: steps one entry back through the jump list, if there is
+    /// one. `current` (the cursor's own position right now) is pushed onto
+    /// `jump_forward` so a following `Ctrl-I` can return here.
+    pub fn jump_back(&mut self, current: (usize, usize)) -> Option<(usize, usize)> {
+        let target = self.jump_back.pop()?;
+        self.jump_forward.push(current);
+        Some(target)
+    }
+
+    /// `Ctrl-I` (same raw byte as Tab -- see this crate's own `feed_fresh`
+    /// doc comment on why Normal mode can safely claim it): the mirror of
+    /// `jump_back`.
+    pub fn jump_forward(&mut self, current: (usize, usize)) -> Option<(usize, usize)> {
+        let target = self.jump_forward.pop()?;
+        self.jump_back.push(current);
+        Some(target)
     }
 
     /// Takes (consuming) whatever register a `"x` prefix selected, if any.
@@ -659,6 +707,13 @@ impl VimKeys {
         KeyOutcome::ReselectVisual
     }
 
+    fn emit_jump(&mut self, forward: bool) -> KeyOutcome {
+        self.count = None;
+        self.pending = Pending::None;
+        self.last_completed = std::mem::take(&mut self.current_input);
+        KeyOutcome::Jump { forward }
+    }
+
     // `y{motion}`'s first half: stashes whatever count had already
     // accumulated (the `[count1]` in vim's `[count1]op[count2]motion`)
     // and arms `active_operator` -- the actual resolution (into
@@ -819,6 +874,18 @@ impl VimKeys {
                 self.pending = Pending::Window;
                 KeyOutcome::Pending
             }
+            Key::CtrlO => self.emit_jump(false),
+            // `Ctrl-I` is indistinguishable from Tab at the raw-byte level
+            // in a standard terminal (both are 0x09 -- editor.rs's own key
+            // decoder maps that byte to `Key::Tab` unconditionally, same
+            // as real vim treats them as the same key), so this claims
+            // `Key::Tab` for jump-forward here. Safe: Tab only means
+            // completion-cycling in the shell's own *typing* loop
+            // (editor.rs's `read_line`), a separate code path this
+            // Normal-mode dispatch is never reached from -- see
+            // `run_line_normal_mode`'s own doc comment for how Ctrl-E's
+            // excursion into here relates to that loop.
+            Key::Tab => self.emit_jump(true),
             // `i`/`a` while an operator is armed (`diw`, `ca(`, ...) *or*
             // while in Visual mode (`viw`, `va(`, ...) name a text object
             // instead of entering insert mode -- vim's own dual meaning for
@@ -952,12 +1019,29 @@ impl VimKeys {
     }
 
     fn feed_mark(&mut self, key: Key, kind: MarkKind) -> KeyOutcome {
-        match key {
-            Key::Char(c) if c.is_ascii_lowercase() => self.emit(match kind {
-                MarkKind::Set => Motion::SetMark(c),
-                MarkKind::GotoExact => Motion::GotoMark(c),
-                MarkKind::GotoLine => Motion::GotoMarkLine(c),
-            }),
+        match (key, kind) {
+            (Key::Char(c), MarkKind::Set) if c.is_ascii_lowercase() => self.emit(Motion::SetMark(c)),
+            (Key::Char(c), MarkKind::GotoExact) if c.is_ascii_lowercase() => self.emit(Motion::GotoMark(c)),
+            (Key::Char(c), MarkKind::GotoLine) if c.is_ascii_lowercase() => self.emit(Motion::GotoMarkLine(c)),
+            // `^` -- vim's own last-insert-position mark (set
+            // automatically, e.g. by fileeditor.rs's `run_insert_mode` --
+            // see `gi`'s own doc comment); not settable by name (`m^`
+            // isn't a thing in real vim either), so this only appears in
+            // the two Goto arms.
+            (Key::Char('^'), MarkKind::GotoExact) => self.emit(Motion::GotoMark('^')),
+            (Key::Char('^'), MarkKind::GotoLine) => self.emit(Motion::GotoMarkLine('^')),
+            // `.` -- vim's own last-change-position mark, set
+            // automatically by every real mutation (see textbuffer.rs's
+            // own `insert_text`/`delete_range`/`join_lines`); same
+            // not-settable-by-name treatment as `^`.
+            (Key::Char('.'), MarkKind::GotoExact) => self.emit(Motion::GotoMark('.')),
+            (Key::Char('.'), MarkKind::GotoLine) => self.emit(Motion::GotoMarkLine('.')),
+            // ``` ``` / `''` -- vim's own "position before the last jump"
+            // -- see `VimKeys::push_jump`'s own doc comment for who
+            // writes it (a plain `Buffer` mark, keyed by an apostrophe a
+            // user can never set by name either).
+            (Key::Char('`'), MarkKind::GotoExact) => self.emit(Motion::GotoMark('\'')),
+            (Key::Char('\''), MarkKind::GotoLine) => self.emit(Motion::GotoMarkLine('\'')),
             _ => self.abort(),
         }
     }
@@ -1338,6 +1422,76 @@ mod tests {
         let mut vk = VimKeys::new();
         let keys = [Key::Char('5'), Key::Char('0'), Key::Char('%')];
         assert_eq!(last(&mut vk, &keys), KeyOutcome::Motion(Motion::GotoPercent, Some(50)));
+    }
+
+    #[test]
+    fn ctrl_o_and_tab_resolve_to_jump_outcomes() {
+        let mut vk = VimKeys::new();
+        assert_eq!(vk.feed(Key::CtrlO), KeyOutcome::Jump { forward: false });
+        let mut vk = VimKeys::new();
+        assert_eq!(vk.feed(Key::Tab), KeyOutcome::Jump { forward: true });
+    }
+
+    #[test]
+    fn jump_back_and_forward_round_trip() {
+        let mut vk = VimKeys::new();
+        assert_eq!(vk.jump_back((5, 0)), None); // nothing recorded yet
+        vk.push_jump((0, 0));
+        vk.push_jump((10, 0));
+        assert_eq!(vk.jump_back((20, 0)), Some((10, 0)));
+        assert_eq!(vk.jump_back((10, 0)), Some((0, 0)));
+        assert_eq!(vk.jump_back((0, 0)), None); // exhausted
+        // and back the other way
+        assert_eq!(vk.jump_forward((0, 0)), Some((10, 0)));
+        assert_eq!(vk.jump_forward((10, 0)), Some((20, 0)));
+        assert_eq!(vk.jump_forward((20, 0)), None); // exhausted
+    }
+
+    #[test]
+    fn push_jump_clears_forward_history() {
+        let mut vk = VimKeys::new();
+        vk.push_jump((0, 0));
+        assert_eq!(vk.jump_back((5, 0)), Some((0, 0)));
+        assert_eq!(vk.jump_forward((0, 0)), Some((5, 0))); // forward history exists
+        vk.push_jump((5, 0));
+        assert_eq!(vk.jump_forward((5, 0)), None); // ...until a fresh jump discards it
+    }
+
+    #[test]
+    fn backtick_backtick_and_quote_quote_resolve_to_the_apostrophe_mark() {
+        let mut vk = VimKeys::new();
+        let keys = [Key::Char('`'), Key::Char('`')];
+        assert_eq!(last(&mut vk, &keys), KeyOutcome::Motion(Motion::GotoMark('\''), None));
+        let mut vk = VimKeys::new();
+        let keys = [Key::Char('\''), Key::Char('\'')];
+        assert_eq!(last(&mut vk, &keys), KeyOutcome::Motion(Motion::GotoMarkLine('\''), None));
+    }
+
+    #[test]
+    fn caret_mark_goto_works_but_cannot_be_set_by_name() {
+        let mut vk = VimKeys::new();
+        let keys = [Key::Char('`'), Key::Char('^')];
+        assert_eq!(last(&mut vk, &keys), KeyOutcome::Motion(Motion::GotoMark('^'), None));
+        let mut vk = VimKeys::new();
+        let keys = [Key::Char('\''), Key::Char('^')];
+        assert_eq!(last(&mut vk, &keys), KeyOutcome::Motion(Motion::GotoMarkLine('^'), None));
+        // `m^` isn't a thing -- aborts like any other invalid mark-set char
+        let mut vk = VimKeys::new();
+        assert_eq!(vk.feed(Key::Char('m')), KeyOutcome::Pending);
+        assert_eq!(vk.feed(Key::Char('^')), KeyOutcome::None);
+    }
+
+    #[test]
+    fn dot_mark_goto_works_but_cannot_be_set_by_name() {
+        let mut vk = VimKeys::new();
+        let keys = [Key::Char('`'), Key::Char('.')];
+        assert_eq!(last(&mut vk, &keys), KeyOutcome::Motion(Motion::GotoMark('.'), None));
+        let mut vk = VimKeys::new();
+        let keys = [Key::Char('\''), Key::Char('.')];
+        assert_eq!(last(&mut vk, &keys), KeyOutcome::Motion(Motion::GotoMarkLine('.'), None));
+        let mut vk = VimKeys::new();
+        assert_eq!(vk.feed(Key::Char('m')), KeyOutcome::Pending);
+        assert_eq!(vk.feed(Key::Char('.')), KeyOutcome::None);
     }
 
     #[test]

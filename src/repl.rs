@@ -2987,6 +2987,17 @@ fn run_normal_mode_navigation(
                 }
                 render_normal_mode_frame(&buf, rect, &vk, None);
             }
+            KeyOutcome::Jump { forward } => {
+                let current = buf.cursor();
+                let target = if forward { vk.jump_forward(current) } else { vk.jump_back(current) };
+                if let Some((row, col)) = target {
+                    let row = row.min(buf.line_count() - 1);
+                    let col = col.min(buf.line_len(row));
+                    buf.set_cursor(row, col);
+                    scroll_to_show_cursor(&mut buf);
+                }
+                render_normal_mode_frame(&buf, rect, &vk, None);
+            }
             // Yank works here too -- copying text out of a pane's own
             // scrollback/output is exactly what this read-only,
             // tmux-copy-mode-style view is for (see ScreenBuffer's own doc

@@ -1685,6 +1685,13 @@ fn run_line_normal_mode(
                             vk.begin_visual(shape, anchor);
                         }
                     }
+                    KeyOutcome::Jump { forward } => {
+                        let current = lb.cursor();
+                        let target = if forward { vk.jump_forward(current) } else { vk.jump_back(current) };
+                        if let Some((row, col)) = target {
+                            lb.set_cursor(row, col);
+                        }
+                    }
                     // <C-w> is still vimkeys' own window-leader prefix
                     // here too, matching real vim's own Normal-mode
                     // Ctrl-W meaning -- intentionally not special-cased
@@ -1709,11 +1716,19 @@ fn run_line_normal_mode(
 // there (it never touches a `Buffer` itself), but a text object needs to
 // move *both* Visual ends -- the anchor to the object's start, the cursor
 // to its end -- not just the cursor the way every other motion does.
-// Falls through to `apply_motion` for every other case, including a
-// `TextObject` reached via an armed operator (handled entirely inside
-// `motion::motion_range`, not here). Generic over `Buffer` for the same
-// reason `yank_motion` just below is -- shared by this file's own
-// run_line_normal_mode and by repl.rs's own ScreenBuffer-based Visual
+// Also where `motion::is_jump` motions get recorded for `Ctrl-O`/`Ctrl-I`
+// (`vk.push_jump`) and vim's own ``` ``` ```/`''` mark (a plain `Buffer`
+// mark keyed by an apostrophe -- see `VimKeys::push_jump`'s and
+// `feed_mark`'s own doc comments) -- this is the one place every jump
+// motion in every Buffer-owning context already passes through, so
+// recording happens here rather than at each of this function's own
+// three call sites. Falls through to `apply_motion` for every other case,
+// including a `TextObject` reached via an armed operator (handled
+// entirely inside `motion::motion_range`, not here) -- operator targets
+// aren't jumps; the cursor ends up back at the range's own start either
+// way, not somewhere new to navigate back from. Generic over `Buffer` for
+// the same reason `yank_motion` just below is -- shared by this file's
+// own run_line_normal_mode and by repl.rs's own ScreenBuffer-based Visual
 // mode.
 pub fn apply_motion_or_reselect(vk: &mut VimKeys, buf: &mut impl crate::bishedit::Buffer, m: motion::Motion, count: Option<usize>) {
     if let (true, motion::Motion::TextObject(kind, around)) = (vk.is_visual(), &m) {
@@ -1722,6 +1737,19 @@ pub fn apply_motion_or_reselect(vk: &mut VimKeys, buf: &mut impl crate::bishedit
             vk.begin_visual(shape, range.from);
             buf.set_cursor(range.to.0, range.to.1);
         }
+        return;
+    }
+    if motion::is_jump(&m) {
+        let pos = buf.cursor();
+        vk.push_jump(pos);
+        // Applied *before* overwriting the `'` mark, not after: `` ` ` ``/
+        // `''` themselves resolve to `Motion::GotoMark('\'')`/`GotoMarkLine
+        // ('\'')`, which read that very mark inside `apply_motion` below --
+        // writing the new value first would make ``` ``` ``` a no-op
+        // (jump to wherever it already just landed, immediately clobbered
+        // by its own jump-recording).
+        motion::apply_motion(buf, m, count);
+        buf.set_mark('\'', pos);
         return;
     }
     motion::apply_motion(buf, m, count);
@@ -2049,7 +2077,7 @@ fn run_one_shot_normal_command(ed: &mut LineEditor, registers: &mut Registers, o
                     // selection over several subsequent keys) doesn't fit.
                     // `Join` is a no-op here for the same single-line
                     // reason `run_line_normal_mode`'s own arm documents.
-                    KeyOutcome::Window(..) | KeyOutcome::EnterVisual(_) | KeyOutcome::ReselectVisual | KeyOutcome::Join { .. } | KeyOutcome::None => break None,
+                    KeyOutcome::Window(..) | KeyOutcome::EnterVisual(_) | KeyOutcome::ReselectVisual | KeyOutcome::Join { .. } | KeyOutcome::Jump { .. } | KeyOutcome::None => break None,
                     KeyOutcome::Pending => continue,
                 }
             }
@@ -2464,6 +2492,32 @@ mod tests {
         // originally pressed -- matches vim's own viw behavior.
         assert_eq!(vk.visual_anchor(), Some((RegisterShape::Char, (0, 4))));
         assert_eq!(lb.cursor(), (0, 6));
+    }
+
+    #[test]
+    fn apply_motion_or_reselect_records_jump_motions() {
+        let mut vk = VimKeys::new();
+        let mut ed = make_editor("one two three four", 0);
+        let mut marks = HashMap::new();
+        let mut selections: Vec<motion::MotionRange> = Vec::new();
+        let mut lb = LineBuffer { ed: &mut ed, marks: &mut marks, selections: &mut selections };
+        apply_motion_or_reselect(&mut vk, &mut lb, motion::Motion::GotoLastLine, None);
+        // GotoLastLine on a single-line buffer doesn't move the cursor,
+        // but it's still a jump motion -- the pre-motion position (0, 0)
+        // is what gets recorded either way.
+        assert_eq!(vk.jump_back((0, 0)), Some((0, 0)));
+        assert_eq!(lb.get_mark('\''), Some((0, 0)));
+    }
+
+    #[test]
+    fn apply_motion_or_reselect_does_not_record_non_jump_motions() {
+        let mut vk = VimKeys::new();
+        let mut ed = make_editor("one two three", 0);
+        let mut marks = HashMap::new();
+        let mut selections: Vec<motion::MotionRange> = Vec::new();
+        let mut lb = LineBuffer { ed: &mut ed, marks: &mut marks, selections: &mut selections };
+        apply_motion_or_reselect(&mut vk, &mut lb, motion::Motion::WordForward, None);
+        assert_eq!(vk.jump_back((0, 4)), None);
     }
 
     #[test]

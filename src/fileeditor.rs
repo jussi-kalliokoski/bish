@@ -181,6 +181,16 @@ pub fn drive(session: &mut EditSession, rect: Rect, registers: &mut Registers, o
                     session.vk.begin_visual(shape, anchor);
                 }
             }
+            KeyOutcome::Jump { forward } => {
+                let current = session.buffer.cursor();
+                let target = if forward { session.vk.jump_forward(current) } else { session.vk.jump_back(current) };
+                if let Some((row, col)) = target {
+                    let row = row.min(session.buffer.line_count() - 1);
+                    let col = col.min(session.buffer.line_len(row));
+                    session.buffer.set_cursor(row, col);
+                    scroll_to_show_cursor(&mut session.buffer);
+                }
+            }
             KeyOutcome::EnterInsert(cmd) => {
                 resolve_insert_start(&mut session.buffer, cmd);
                 match run_insert_mode(session, rect, on_idle)? {

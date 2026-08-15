@@ -145,6 +145,11 @@ impl TextBuffer {
         };
         self.dirty = true;
         self.cursor = new_pos;
+        // `.` -- vim's own "position of the last change" mark (`` `. ``),
+        // set automatically by every mutation here rather than at each of
+        // fileeditor.rs's own many call sites -- these three methods are
+        // the only places a real edit actually happens.
+        self.marks.insert('.', new_pos);
         new_pos
     }
 
@@ -183,6 +188,7 @@ impl TextBuffer {
             }
         }
         self.dirty = true;
+        self.marks.insert('.', self.cursor);
         text
     }
 
@@ -222,6 +228,7 @@ impl TextBuffer {
         }
         self.cursor = (row, join_col.min(self.lines[row].len().saturating_sub(1)));
         self.dirty = true;
+        self.marks.insert('.', self.cursor);
         true
     }
 
@@ -443,6 +450,24 @@ mod tests {
         assert_eq!(text_of(&buf), "");
         assert_eq!(buf.line_count(), 1);
         assert_eq!(buf.cursor(), (0, 0));
+    }
+
+    #[test]
+    fn mutations_set_the_dot_mark_at_the_cursors_own_landing_spot() {
+        let mut buf = make("hello");
+        assert_eq!(buf.get_mark('.'), None);
+        let pos = buf.insert_text((0, 5), "!");
+        assert_eq!(buf.get_mark('.'), Some(pos));
+
+        let mut buf = make("one two");
+        let range = motion::MotionRange { shape: motion::MotionShape::Exclusive, from: (0, 0), to: (0, 4) };
+        buf.delete_range(&range);
+        assert_eq!(buf.get_mark('.'), Some(buf.cursor()));
+
+        let mut buf = make("one\ntwo");
+        buf.set_cursor(0, 0);
+        buf.join_lines(2, true);
+        assert_eq!(buf.get_mark('.'), Some(buf.cursor()));
     }
 
     #[test]
