@@ -541,17 +541,28 @@ pub fn run(mut shell: Shell) {
             // still false, so Ctrl-L keeps meaning "clear the real
             // screen" exactly as before, handled inside read_line itself
             // -- this arm is unreachable there, same as it always was.
-            // Once windowed/promoted, though, read_line's own raw
-            // "\x1b[H\x1b[2J" clear would wipe the compositor's own
-            // frame -- pane borders, tab bar and all -- with nothing
-            // ever repainting it afterward (a real bug: "Ctrl-L clears
-            // the tab bar"). Reporting it here instead and doing a full
-            // compositor_redraw (which repaints every pane's content
-            // *and* the tab bar from their own captured grids) gets
-            // Ctrl-L's intended "clear the screen" effect without
-            // actually destroying anything the compositor owns.
+            // Once windowed/promoted, read_line's own raw "\x1b[H\x1b[2J"
+            // clear would instead wipe the compositor's own frame -- pane
+            // borders, tab bar and all -- with nothing ever repainting it
+            // afterward, so it's reported here instead. The actual
+            // clearing has to happen on the *session's own* grid (`\x1b[H
+            // \x1b[2J` fed into it, exactly what erase_in_display(2) does
+            // for a real terminal -- see vt100.rs's own doc comment: mode
+            // 2 clears the live grid only, scrollback untouched, matching
+            // real Ctrl-L never discarding scroll-back history), not the
+            // real terminal directly -- a plain compositor_redraw() alone
+            // just repaints this pane's *current* content unchanged, which
+            // reads as "Ctrl-L does nothing." Clearing resets this
+            // session's own cursor to (0, 0) too, which is what then
+            // makes the *next* redraw show the live prompt back at the
+            // top of the pane -- compositor_redraw's own doc comment
+            // (self-healing full redraw) and render_compositor_frame's
+            // cursor positioning (always the focused pane's own screen
+            // cursor) both already key off exactly this field, so nothing
+            // else needs to change for either the unsplit or split case.
             Ok(ReadOutcome::CtrlL) => {
                 if sinks_are_grid {
+                    sessions.get_mut(&session_id).unwrap().screen.borrow_mut().feed(b"\x1b[H\x1b[2J");
                     compositor_redraw(&sessions, &windows, current_window, term_rows, term_cols);
                 }
             }
