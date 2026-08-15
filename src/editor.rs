@@ -1525,7 +1525,7 @@ fn run_line_normal_mode(
         };
         match key {
             Key::CtrlC | Key::CtrlD | Key::CtrlZ => break LineNormalExit::Propagate(key),
-            // Visual mode's own `Z`/`y`/`d`/`p`/`P`/Escape -- intercepted
+            // Visual mode's own `Z`/`y`/`d`/`c`/`p`/`P`/Escape -- intercepted
             // here, ahead of `vk.feed`, for the same reason repl.rs's own
             // identical arms are (see its own doc comment): "is there a
             // selection to act on" is `LineBuffer`-owned state vimkeys.rs
@@ -1576,6 +1576,27 @@ fn run_line_normal_mode(
                 delete_selections(&mut lb, registers, register);
                 lb.selections.clear();
                 vk.end_visual();
+            }
+            // `c`: like `d` (same deletion, same "delete always yanks"
+            // register write, reusing `delete_selections` outright), but
+            // also enters insert mode afterward -- vim's own visual `c`.
+            // Only breaks to insert if something was actually deleted,
+            // mirroring `Op::Change`'s own single-motion arm below; in
+            // practice this guard is never false here, since reaching
+            // this arm at all already means either an active selection
+            // (always yields a range) or a non-empty committed set.
+            Key::Char('c') if vk.is_idle() && (vk.is_visual() || !selections.is_empty()) => {
+                let mut lb = LineBuffer { ed, marks: &mut marks, selections: &mut selections };
+                if let Some(range) = active_visual_range_line(&vk, &lb) {
+                    lb.selections.push(range);
+                }
+                let register = vk.take_pending_register();
+                let deleted = delete_selections(&mut lb, registers, register);
+                lb.selections.clear();
+                vk.end_visual();
+                if deleted {
+                    break LineNormalExit::ToInsert;
+                }
             }
             // `p`/`P`: replaces every committed selection plus the
             // active one with the register's content (see
