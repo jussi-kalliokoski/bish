@@ -262,6 +262,10 @@ enum Pending {
     // character (`w`, `(`, `"`, ...). See `feed_fresh`'s own `i`/`a` arms
     // for why this is only entered in that context, never standalone.
     TextObject { around: bool },
+    // `[` / `]` -- vim's own bracket/section-motion leaders, awaiting the
+    // second character (`[(`, `])`, `[{`, `]}`, `[[`, `]]`, `[]`, `][`).
+    BracketOpen,
+    BracketClose,
     Z,
     Window,
     // <C-w>g -- awaiting the second 'g' of <C-w>gg, mirroring plain `gg`'s
@@ -538,6 +542,8 @@ impl VimKeys {
             Pending::GotoMarkExact => self.feed_mark(key, MarkKind::GotoExact),
             Pending::GotoMarkLine => self.feed_mark(key, MarkKind::GotoLine),
             Pending::TextObject { around } => self.feed_text_object(key, around),
+            Pending::BracketOpen => self.feed_bracket_open(key),
+            Pending::BracketClose => self.feed_bracket_close(key),
             Pending::Z => self.feed_z(key),
             Pending::Window => self.feed_window(key),
             Pending::WindowG => self.feed_window_g(key),
@@ -701,6 +707,14 @@ impl VimKeys {
                 self.pending = Pending::GotoMarkLine;
                 KeyOutcome::Pending
             }
+            Key::Char('[') => {
+                self.pending = Pending::BracketOpen;
+                KeyOutcome::Pending
+            }
+            Key::Char(']') => {
+                self.pending = Pending::BracketClose;
+                KeyOutcome::Pending
+            }
             Key::Char('/') => {
                 self.pending = Pending::Search { forward: true, text: String::new() };
                 KeyOutcome::Pending
@@ -857,6 +871,26 @@ impl VimKeys {
                 MarkKind::GotoExact => Motion::GotoMark(c),
                 MarkKind::GotoLine => Motion::GotoMarkLine(c),
             }),
+            _ => self.abort(),
+        }
+    }
+
+    fn feed_bracket_open(&mut self, key: Key) -> KeyOutcome {
+        match key {
+            Key::Char('(') => self.emit(Motion::UnmatchedOpenParen),
+            Key::Char('{') => self.emit(Motion::UnmatchedOpenBrace),
+            Key::Char('[') => self.emit(Motion::SectionBackward),
+            Key::Char(']') => self.emit(Motion::SectionBackwardEnd),
+            _ => self.abort(),
+        }
+    }
+
+    fn feed_bracket_close(&mut self, key: Key) -> KeyOutcome {
+        match key {
+            Key::Char(')') => self.emit(Motion::UnmatchedCloseParen),
+            Key::Char('}') => self.emit(Motion::UnmatchedCloseBrace),
+            Key::Char(']') => self.emit(Motion::SectionForward),
+            Key::Char('[') => self.emit(Motion::SectionForwardEnd),
             _ => self.abort(),
         }
     }
@@ -1184,6 +1218,39 @@ mod tests {
             last(&mut vk, &[Key::Char('\''), Key::Char('a')]),
             KeyOutcome::Motion(Motion::GotoMarkLine('a'), None)
         );
+    }
+
+    #[test]
+    fn bracket_leader_motions() {
+        let cases: &[(&[Key], Motion)] = &[
+            (&[Key::Char('['), Key::Char('(')], Motion::UnmatchedOpenParen),
+            (&[Key::Char(']'), Key::Char(')')], Motion::UnmatchedCloseParen),
+            (&[Key::Char('['), Key::Char('{')], Motion::UnmatchedOpenBrace),
+            (&[Key::Char(']'), Key::Char('}')], Motion::UnmatchedCloseBrace),
+            (&[Key::Char(']'), Key::Char(']')], Motion::SectionForward),
+            (&[Key::Char(']'), Key::Char('[')], Motion::SectionForwardEnd),
+            (&[Key::Char('['), Key::Char('[')], Motion::SectionBackward),
+            (&[Key::Char('['), Key::Char(']')], Motion::SectionBackwardEnd),
+        ];
+        for (keys, motion) in cases {
+            let mut vk = VimKeys::new();
+            assert_eq!(last(&mut vk, keys), KeyOutcome::Motion(motion.clone(), None), "{keys:?} should resolve to {motion:?}");
+        }
+    }
+
+    #[test]
+    fn bracket_leader_as_operator_target() {
+        let mut vk = VimKeys::new();
+        let keys = [Key::Char('d'), Key::Char('['), Key::Char('(')];
+        assert_eq!(last(&mut vk, &keys), KeyOutcome::Operator(Op::Delete, Motion::UnmatchedOpenParen, None, None));
+    }
+
+    #[test]
+    fn bracket_leader_invalid_continuation_aborts() {
+        let mut vk = VimKeys::new();
+        assert_eq!(vk.feed(Key::Char('[')), KeyOutcome::Pending);
+        assert_eq!(vk.feed(Key::Char('x')), KeyOutcome::None);
+        assert_eq!(vk.feed(Key::Char('w')), KeyOutcome::Motion(Motion::WordForward, None));
     }
 
     #[test]

@@ -60,6 +60,14 @@ pub enum Motion {
     SearchBackward(String), // ?pattern<Enter>
     SearchWordForward,      // *
     SearchWordBackward,     // #
+    UnmatchedOpenParen,   // [(
+    UnmatchedCloseParen,  // ])
+    UnmatchedOpenBrace,   // [{
+    UnmatchedCloseBrace,  // ]}
+    SectionForward,       // ]] (next line starting with '{')
+    SectionForwardEnd,    // ][ (next line starting with '}')
+    SectionBackward,      // [[ (previous line starting with '{')
+    SectionBackwardEnd,   // [] (previous line starting with '}')
     // `iw`/`aw`/`i(`/`a(`/`i"`/`a"`/... -- vim's text objects, valid only as
     // an operator's target (`vimkeys.rs` only ever produces this while an
     // operator is armed -- see its own doc comment on `i`/`a`'s gating).
@@ -770,6 +778,87 @@ fn find_enclosing_pair(buf: &impl Buffer, pos: (usize, usize), open: char, close
     Some((open_pos, close_pos))
 }
 
+/// Mirror of `scan_unmatched_open_backward`: walks forward from `pos` for
+/// the nearest `close` that isn't already balanced by an `open` seen along
+/// the way -- `[(`/`[{`'s own forward-facing sibling, `])`/`]}`.
+fn scan_unmatched_close_forward(buf: &impl Buffer, pos: (usize, usize), open: char, close: char) -> Option<(usize, usize)> {
+    let mut depth = 0;
+    let mut cur = pos;
+    loop {
+        cur = step_forward(buf, cur)?;
+        match buf.char_at(cur.0, cur.1) {
+            Some(c) if c == open => depth += 1,
+            Some(c) if c == close => {
+                if depth == 0 {
+                    return Some(cur);
+                }
+                depth -= 1;
+            }
+            _ => {}
+        }
+    }
+}
+
+/// `[(`/`[{`: `count` unmatched opening brackets backward from the cursor.
+/// Each repeat starts strictly before the previous find (`scan_unmatched_
+/// open_backward` never looks at `pos` itself, so re-feeding the same
+/// position back in naturally continues past it).
+fn unmatched_backward(buf: &impl Buffer, pos: (usize, usize), open: char, close: char, count: usize) -> Option<(usize, usize)> {
+    let mut cur = pos;
+    let mut found = None;
+    for _ in 0..count.max(1) {
+        cur = scan_unmatched_open_backward(buf, cur, open, close)?;
+        found = Some(cur);
+    }
+    found
+}
+
+/// `])`/`]}`: `count` unmatched closing brackets forward from the cursor.
+fn unmatched_forward(buf: &impl Buffer, pos: (usize, usize), open: char, close: char, count: usize) -> Option<(usize, usize)> {
+    let mut cur = pos;
+    let mut found = None;
+    for _ in 0..count.max(1) {
+        cur = scan_unmatched_close_forward(buf, cur, open, close)?;
+        found = Some(cur);
+    }
+    found
+}
+
+/// A line whose very first character is `ch` -- vim's own (language-
+/// agnostic) definition of a section boundary: `{` starts one, `}` ends
+/// one. No 'sections' option, no form-feed handling -- just the plain-text
+/// default.
+fn line_starts_with(buf: &impl Buffer, line: usize, ch: char) -> bool {
+    buf.line_len(line) > 0 && buf.char_at(line, 0) == Some(ch)
+}
+
+/// `]]`/`][`: the next line (after the cursor's own) starting with `boundary`,
+/// clamped to the buffer's last line if there isn't one -- same clamp-at-
+/// the-edge convention `paragraph_forward_once` already uses.
+fn section_forward_once(buf: &impl Buffer, line: usize, boundary: char) -> usize {
+    let last = buf.line_count() - 1;
+    let mut l = line;
+    while l < last {
+        l += 1;
+        if line_starts_with(buf, l, boundary) {
+            return l;
+        }
+    }
+    last
+}
+
+/// Mirror of `section_forward_once`, searching backward and clamping to 0.
+fn section_backward_once(buf: &impl Buffer, line: usize, boundary: char) -> usize {
+    let mut l = line;
+    while l > 0 {
+        l -= 1;
+        if line_starts_with(buf, l, boundary) {
+            return l;
+        }
+    }
+    0
+}
+
 /// `i(`/`a(`/`ib`/`ab`/`i{`/`a{`/... -- spans lines (unlike word/quote
 /// objects), tracking nesting via `find_enclosing_pair`. `count` widens
 /// outward one enclosing level per extra count, same as vim's `2i(` inside
@@ -1390,6 +1479,54 @@ pub fn apply_motion(buf: &mut impl Buffer, motion: Motion, count: Option<usize>)
                 }
             }
         }
+        Motion::UnmatchedOpenParen => {
+            if let Some((l, c)) = unmatched_backward(buf, buf.cursor(), '(', ')', n) {
+                buf.set_cursor(l, c);
+            }
+        }
+        Motion::UnmatchedCloseParen => {
+            if let Some((l, c)) = unmatched_forward(buf, buf.cursor(), '(', ')', n) {
+                buf.set_cursor(l, c);
+            }
+        }
+        Motion::UnmatchedOpenBrace => {
+            if let Some((l, c)) = unmatched_backward(buf, buf.cursor(), '{', '}', n) {
+                buf.set_cursor(l, c);
+            }
+        }
+        Motion::UnmatchedCloseBrace => {
+            if let Some((l, c)) = unmatched_forward(buf, buf.cursor(), '{', '}', n) {
+                buf.set_cursor(l, c);
+            }
+        }
+        Motion::SectionForward => {
+            let (mut line, _) = buf.cursor();
+            for _ in 0..n {
+                line = section_forward_once(buf, line, '{');
+            }
+            buf.set_cursor(line, 0);
+        }
+        Motion::SectionForwardEnd => {
+            let (mut line, _) = buf.cursor();
+            for _ in 0..n {
+                line = section_forward_once(buf, line, '}');
+            }
+            buf.set_cursor(line, 0);
+        }
+        Motion::SectionBackward => {
+            let (mut line, _) = buf.cursor();
+            for _ in 0..n {
+                line = section_backward_once(buf, line, '{');
+            }
+            buf.set_cursor(line, 0);
+        }
+        Motion::SectionBackwardEnd => {
+            let (mut line, _) = buf.cursor();
+            for _ in 0..n {
+                line = section_backward_once(buf, line, '}');
+            }
+            buf.set_cursor(line, 0);
+        }
         // Not reached by any wiring in this crate today -- `vimkeys.rs`
         // only ever produces this while an operator is armed, which
         // `motion_range` (below) intercepts before `apply_motion` would be
@@ -1465,6 +1602,14 @@ fn motion_shape(m: &Motion) -> Option<MotionShape> {
         Motion::GotoMarkLine(_) => Linewise,
         Motion::SearchForward(_) | Motion::SearchBackward(_) => Exclusive,
         Motion::SearchWordForward | Motion::SearchWordBackward => Exclusive,
+        Motion::UnmatchedOpenParen
+        | Motion::UnmatchedCloseParen
+        | Motion::UnmatchedOpenBrace
+        | Motion::UnmatchedCloseBrace => Exclusive,
+        // Same classification `ParagraphForward`/`ParagraphBackward` already
+        // use above -- vim's own section motions are their sibling, moving
+        // to a boundary line's own start rather than tracking columns.
+        Motion::SectionForward | Motion::SectionForwardEnd | Motion::SectionBackward | Motion::SectionBackwardEnd => Exclusive,
         // Never actually consulted -- `motion_range` special-cases
         // `TextObject` before this function is called at all (see
         // `Motion::TextObject`'s own doc comment). Kept correct anyway,
@@ -1975,6 +2120,63 @@ mod tests {
         let mut buf = TestBuffer::new("hello");
         buf.set_cursor(0, 2);
         assert_eq!(go(&mut buf, Motion::MatchPair, None), (0, 2));
+    }
+
+    #[test]
+    fn unmatched_paren_motions_skip_balanced_pairs() {
+        let mut buf = TestBuffer::new("(a (b) c)");
+        buf.set_cursor(0, 4); // inside the nested "(b)"
+        assert_eq!(go(&mut buf, Motion::UnmatchedOpenParen, None), (0, 3));
+        assert_eq!(go(&mut buf, Motion::UnmatchedOpenParen, None), (0, 0));
+        buf.set_cursor(0, 4);
+        assert_eq!(go(&mut buf, Motion::UnmatchedCloseParen, None), (0, 5));
+        assert_eq!(go(&mut buf, Motion::UnmatchedCloseParen, None), (0, 8));
+    }
+
+    #[test]
+    fn unmatched_paren_motion_count_repeats() {
+        let mut buf = TestBuffer::new("(a (b (c) d) e)");
+        buf.set_cursor(0, 7); // inside "(c)"
+        assert_eq!(go(&mut buf, Motion::UnmatchedOpenParen, Some(2)), (0, 3));
+    }
+
+    #[test]
+    fn unmatched_paren_motion_with_no_enclosing_bracket_is_a_no_op() {
+        let mut buf = TestBuffer::new("abc");
+        buf.set_cursor(0, 1);
+        assert_eq!(go(&mut buf, Motion::UnmatchedOpenParen, None), (0, 1));
+        assert_eq!(go(&mut buf, Motion::UnmatchedCloseParen, None), (0, 1));
+    }
+
+    #[test]
+    fn unmatched_brace_motions() {
+        let mut buf = TestBuffer::new("{ a { b } c }");
+        buf.set_cursor(0, 6); // inside the nested "{ b }"
+        assert_eq!(go(&mut buf, Motion::UnmatchedOpenBrace, None), (0, 4));
+        assert_eq!(go(&mut buf, Motion::UnmatchedCloseBrace, None), (0, 8));
+    }
+
+    #[test]
+    fn section_motions_find_lines_starting_with_brace() {
+        let mut buf = TestBuffer::new("a\n{\nb\nc\n}\nd");
+        buf.set_cursor(0, 0);
+        assert_eq!(go(&mut buf, Motion::SectionForward, None), (1, 0));
+        assert_eq!(go(&mut buf, Motion::SectionForwardEnd, None), (4, 0));
+        buf.set_cursor(5, 0);
+        assert_eq!(go(&mut buf, Motion::SectionBackward, None), (1, 0));
+        buf.set_cursor(4, 0);
+        // searches strictly backward from the current line, same as vim --
+        // sitting on a '}' line itself doesn't count as "already there".
+        assert_eq!(go(&mut buf, Motion::SectionBackwardEnd, None), (0, 0));
+    }
+
+    #[test]
+    fn section_motions_clamp_at_buffer_edges() {
+        let mut buf = TestBuffer::new("a\nb\nc");
+        buf.set_cursor(0, 0);
+        assert_eq!(go(&mut buf, Motion::SectionForward, None), (2, 0)); // no '{' anywhere -- clamps to last line
+        buf.set_cursor(2, 0);
+        assert_eq!(go(&mut buf, Motion::SectionBackward, None), (0, 0)); // clamps to first line
     }
 
     #[test]
