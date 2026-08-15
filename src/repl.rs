@@ -450,7 +450,7 @@ pub fn run(mut shell: Shell) {
             &prompt_str,
             &session_history,
             false,
-            false,
+            sinks_are_grid,
             pending_initial.take(),
             col_origin,
             width,
@@ -536,13 +536,25 @@ pub fn run(mut shell: Shell) {
                     term_cols,
                 );
             }
-            // ctrl_l_reports is false for this call (Ctrl-L at the
-            // ordinary shell prompt keeps meaning "clear the real
-            // screen," handled inside read_line itself) -- this variant
-            // is only ever produced when that flag is true (see its own
-            // doc comment), i.e. only for command mode's own nested
-            // read_line call in run_command_mode.
-            Ok(ReadOutcome::CtrlL) => unreachable!("ctrl_l_reports is false for this read_line call"),
+            // ctrl_l_reports is now `sinks_are_grid` for this call: at
+            // the plain, unwindowed prompt (sinks_are_grid false) it's
+            // still false, so Ctrl-L keeps meaning "clear the real
+            // screen" exactly as before, handled inside read_line itself
+            // -- this arm is unreachable there, same as it always was.
+            // Once windowed/promoted, though, read_line's own raw
+            // "\x1b[H\x1b[2J" clear would wipe the compositor's own
+            // frame -- pane borders, tab bar and all -- with nothing
+            // ever repainting it afterward (a real bug: "Ctrl-L clears
+            // the tab bar"). Reporting it here instead and doing a full
+            // compositor_redraw (which repaints every pane's content
+            // *and* the tab bar from their own captured grids) gets
+            // Ctrl-L's intended "clear the screen" effect without
+            // actually destroying anything the compositor owns.
+            Ok(ReadOutcome::CtrlL) => {
+                if sinks_are_grid {
+                    compositor_redraw(&sessions, &windows, current_window, term_rows, term_cols);
+                }
+            }
             Ok(ReadOutcome::Interrupted) => {
                 // Ctrl-C abandons whatever multi-line construct was
                 // pending, same as bash, and starts fresh at a new prompt.
