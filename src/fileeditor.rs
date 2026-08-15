@@ -99,34 +99,38 @@ pub fn drive(session: &mut EditSession, rect: Rect, registers: &mut Registers, o
         match key {
             Key::Char('Z') if session.vk.is_idle() && session.vk.is_visual() => {
                 commit_active_selection(session);
-                session.vk.end_visual();
+                let end_cursor = session.buffer.cursor();
+                session.vk.end_visual(end_cursor);
                 render_editor_frame(&session.buffer, &session.vk, false, rect);
                 continue;
             }
             Key::Char('y') if session.vk.is_idle() && (session.vk.is_visual() || !session.buffer.selections.is_empty()) => {
                 commit_active_selection(session);
+                let end_cursor = session.buffer.cursor();
                 let register = session.vk.take_pending_register();
                 session.buffer.yank_selections(registers, register);
                 session.buffer.selections.clear();
-                session.vk.end_visual();
+                session.vk.end_visual(end_cursor);
                 render_editor_frame(&session.buffer, &session.vk, false, rect);
                 continue;
             }
             Key::Char('d') if session.vk.is_idle() && (session.vk.is_visual() || !session.buffer.selections.is_empty()) => {
                 commit_active_selection(session);
+                let end_cursor = session.buffer.cursor();
                 let register = session.vk.take_pending_register();
                 session.buffer.delete_selections(registers, register);
                 session.buffer.selections.clear();
-                session.vk.end_visual();
+                session.vk.end_visual(end_cursor);
                 render_editor_frame(&session.buffer, &session.vk, false, rect);
                 continue;
             }
             Key::Char('c') if session.vk.is_idle() && (session.vk.is_visual() || !session.buffer.selections.is_empty()) => {
                 commit_active_selection(session);
+                let end_cursor = session.buffer.cursor();
                 let register = session.vk.take_pending_register();
                 let deleted = session.buffer.delete_selections(registers, register);
                 session.buffer.selections.clear();
-                session.vk.end_visual();
+                session.vk.end_visual(end_cursor);
                 if deleted {
                     match run_insert_mode(session, rect, on_idle)? {
                         InsertOutcome::Detached => return Ok(EditOutcome::Detached),
@@ -138,15 +142,17 @@ pub fn drive(session: &mut EditSession, rect: Rect, registers: &mut Registers, o
             }
             Key::Char('p') | Key::Char('P') if session.vk.is_idle() && (session.vk.is_visual() || !session.buffer.selections.is_empty()) => {
                 commit_active_selection(session);
+                let end_cursor = session.buffer.cursor();
                 let register = session.vk.take_pending_register();
                 session.buffer.put_over_selections(registers, register);
                 session.buffer.selections.clear();
-                session.vk.end_visual();
+                session.vk.end_visual(end_cursor);
                 render_editor_frame(&session.buffer, &session.vk, false, rect);
                 continue;
             }
             Key::Escape if session.vk.is_idle() && (session.vk.is_visual() || !session.buffer.selections.is_empty()) => {
-                session.vk.end_visual();
+                let end_cursor = session.buffer.cursor();
+                session.vk.end_visual(end_cursor);
                 session.buffer.selections.clear();
                 render_editor_frame(&session.buffer, &session.vk, false, rect);
                 continue;
@@ -168,6 +174,12 @@ pub fn drive(session: &mut EditSession, rect: Rect, registers: &mut Registers, o
             }
             KeyOutcome::EnterVisual(shape) => {
                 session.vk.begin_visual(shape, session.buffer.cursor());
+            }
+            KeyOutcome::ReselectVisual => {
+                if let Some((shape, anchor, cursor)) = session.vk.last_visual() {
+                    session.buffer.set_cursor(cursor.0, cursor.1);
+                    session.vk.begin_visual(shape, anchor);
+                }
             }
             KeyOutcome::EnterInsert(cmd) => {
                 resolve_insert_start(&mut session.buffer, cmd);

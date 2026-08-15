@@ -1543,7 +1543,8 @@ fn run_line_normal_mode(
                 if let Some(range) = active_visual_range_line(&vk, &lb) {
                     lb.selections.push(range);
                 }
-                vk.end_visual();
+                let end_cursor = lb.cursor();
+                vk.end_visual(end_cursor);
             }
             // `y`: yanks every committed selection plus the active one
             // (if any) as one concatenated register value, then clears
@@ -1558,9 +1559,10 @@ fn run_line_normal_mode(
                     lb.selections.push(range);
                 }
                 let register = vk.take_pending_register();
+                let end_cursor = lb.cursor();
                 yank_selections_line(&lb, registers, register);
                 lb.selections.clear();
-                vk.end_visual();
+                vk.end_visual(end_cursor);
             }
             // `d`: deletes every committed selection plus the active one
             // (writing the concatenated deleted text to a register
@@ -1573,9 +1575,10 @@ fn run_line_normal_mode(
                     lb.selections.push(range);
                 }
                 let register = vk.take_pending_register();
+                let end_cursor = lb.cursor();
                 delete_selections(&mut lb, registers, register);
                 lb.selections.clear();
-                vk.end_visual();
+                vk.end_visual(end_cursor);
             }
             // `c`: like `d` (same deletion, same "delete always yanks"
             // register write, reusing `delete_selections` outright), but
@@ -1591,9 +1594,10 @@ fn run_line_normal_mode(
                     lb.selections.push(range);
                 }
                 let register = vk.take_pending_register();
+                let end_cursor = lb.cursor();
                 let deleted = delete_selections(&mut lb, registers, register);
                 lb.selections.clear();
-                vk.end_visual();
+                vk.end_visual(end_cursor);
                 if deleted {
                     break LineNormalExit::ToInsert;
                 }
@@ -1611,15 +1615,17 @@ fn run_line_normal_mode(
                     lb.selections.push(range);
                 }
                 let register = vk.take_pending_register();
+                let end_cursor = lb.cursor();
                 put_over_selections(&mut lb, registers, register);
                 lb.selections.clear();
-                vk.end_visual();
+                vk.end_visual(end_cursor);
             }
             // Escape: cancels everything -- the active selection and
             // every previously committed one -- back to a clean Normal
             // mode with nothing yanked/deleted/replaced.
             Key::Escape if vk.is_idle() && (vk.is_visual() || !selections.is_empty()) => {
-                vk.end_visual();
+                let end_cursor = (0, ed.cursor);
+                vk.end_visual(end_cursor);
                 selections.clear();
             }
             _ => {
@@ -1672,6 +1678,12 @@ fn run_line_normal_mode(
                     // guarded arms above, at the top of this same loop.
                     KeyOutcome::EnterVisual(shape) => {
                         vk.begin_visual(shape, lb.cursor());
+                    }
+                    KeyOutcome::ReselectVisual => {
+                        if let Some((shape, anchor, cursor)) = vk.last_visual() {
+                            lb.set_cursor(cursor.0, cursor.1);
+                            vk.begin_visual(shape, anchor);
+                        }
                     }
                     // <C-w> is still vimkeys' own window-leader prefix
                     // here too, matching real vim's own Normal-mode
@@ -2013,7 +2025,7 @@ fn run_one_shot_normal_command(ed: &mut LineEditor, registers: &mut Registers, o
                     // selection over several subsequent keys) doesn't fit.
                     // `Join` is a no-op here for the same single-line
                     // reason `run_line_normal_mode`'s own arm documents.
-                    KeyOutcome::Window(..) | KeyOutcome::EnterVisual(_) | KeyOutcome::Join { .. } | KeyOutcome::None => break None,
+                    KeyOutcome::Window(..) | KeyOutcome::EnterVisual(_) | KeyOutcome::ReselectVisual | KeyOutcome::Join { .. } | KeyOutcome::None => break None,
                     KeyOutcome::Pending => continue,
                 }
             }

@@ -83,6 +83,13 @@ pub enum KeyOutcome {
     /// (see this file's own module doc comment), so it can't read that
     /// position on its own.
     EnterVisual(RegisterShape),
+    /// `gv` -- reselects the last Visual selection, if any (`vk.last_
+    /// visual()`'s own doc comment on when there is one). The caller must
+    /// call `buf.set_cursor(cursor)` then `vk.begin_visual(shape, anchor)`
+    /// with that tuple (this crate can't touch a `Buffer` itself -- same
+    /// reasoning as `EnterVisual`'s own doc comment); a no-op if there's
+    /// nothing to reselect yet.
+    ReselectVisual,
     /// The key was consumed as part of an in-progress sequence (a count
     /// digit, or a prefix awaiting its next character); no motion yet.
     Pending,
@@ -325,6 +332,11 @@ fn key_label(key: Key) -> Option<String> {
     })
 }
 
+// A Visual selection's own (shape, anchor, cursor) -- `gv`'s memory of the
+// last one, and what `end_visual` stashes there. A named alias rather than
+// spelling the nested tuple out at each of its two use sites below.
+type VisualSelection = (RegisterShape, (usize, usize), (usize, usize));
+
 pub struct VimKeys {
     count: Option<usize>,
     pending: Pending,
@@ -369,6 +381,10 @@ pub struct VimKeys {
     // and all of that lives in the caller (repl.rs), not here -- see
     // `is_idle`'s own doc comment for why.
     visual: Option<(RegisterShape, (usize, usize))>,
+    // `gv`'s own memory: the shape/anchor/cursor of the last Visual
+    // selection, stashed by `end_visual` whenever one ends. `None` until
+    // the first Visual selection ever ends.
+    last_visual: Option<VisualSelection>,
 }
 
 impl VimKeys {
@@ -383,6 +399,7 @@ impl VimKeys {
             operator_count: None,
             pending_register: None,
             visual: None,
+            last_visual: None,
             current_input: String::new(),
             last_completed: String::new(),
         }
@@ -442,9 +459,24 @@ impl VimKeys {
 
     /// Leaves Visual mode -- called by a caller once it's done whatever it
     /// needed the anchor for (committing a selection, yanking, or
-    /// cancelling).
-    pub fn end_visual(&mut self) {
-        self.visual = None;
+    /// cancelling). `cursor` is the buffer's own current cursor at the
+    /// moment Visual mode ends -- stashed (alongside the shape/anchor
+    /// already known) as `last_visual`, so `gv` can restore the exact
+    /// same selection later. Stashed even when leaving via Escape/cancel,
+    /// matching vim: `gv` reselects the last Visual selection regardless
+    /// of how it ended.
+    pub fn end_visual(&mut self, cursor: (usize, usize)) {
+        if let Some((shape, anchor)) = self.visual.take() {
+            self.last_visual = Some((shape, anchor, cursor));
+        }
+    }
+
+    /// `gv`'s own target, if any -- the shape/anchor/cursor of the last
+    /// Visual selection, however it most recently ended. `None` before any
+    /// Visual selection has ever ended yet. See `KeyOutcome::ReselectVisual`'s
+    /// own doc comment for how a caller uses this.
+    pub fn last_visual(&self) -> Option<VisualSelection> {
+        self.last_visual
     }
 
     /// Takes (consuming) whatever register a `"x` prefix selected, if any.
@@ -606,6 +638,13 @@ impl VimKeys {
         self.pending = Pending::None;
         self.last_completed = std::mem::take(&mut self.current_input);
         KeyOutcome::EnterVisual(shape)
+    }
+
+    fn emit_reselect_visual(&mut self) -> KeyOutcome {
+        self.count = None;
+        self.pending = Pending::None;
+        self.last_completed = std::mem::take(&mut self.current_input);
+        KeyOutcome::ReselectVisual
     }
 
     // `y{motion}`'s first half: stashes whatever count had already
@@ -883,6 +922,7 @@ impl VimKeys {
                 self.emit(Motion::SearchWordBackwardUnbounded)
             }
             Key::Char('J') => self.emit_join(false),
+            Key::Char('v') => self.emit_reselect_visual(),
             _ => self.abort(),
         }
     }
@@ -2218,9 +2258,26 @@ mod tests {
         vk.begin_visual(RegisterShape::Line, (5, 0));
         assert!(vk.is_visual());
         assert_eq!(vk.visual_anchor(), Some((RegisterShape::Line, (5, 0))));
-        vk.end_visual();
+        assert_eq!(vk.last_visual(), None);
+        vk.end_visual((7, 2));
         assert!(!vk.is_visual());
         assert_eq!(vk.visual_anchor(), None);
+        assert_eq!(vk.last_visual(), Some((RegisterShape::Line, (5, 0), (7, 2))));
+    }
+
+    #[test]
+    fn gv_reselects_the_last_visual_selection() {
+        let mut vk = VimKeys::new();
+        // Before any Visual selection has ever ended, gv is a no-op.
+        assert_eq!(vk.feed(Key::Char('g')), KeyOutcome::Pending);
+        assert_eq!(vk.feed(Key::Char('v')), KeyOutcome::ReselectVisual);
+        assert_eq!(vk.last_visual(), None);
+
+        vk.begin_visual(RegisterShape::Char, (1, 2));
+        vk.end_visual((3, 4));
+        let keys = [Key::Char('g'), Key::Char('v')];
+        assert_eq!(last(&mut vk, &keys), KeyOutcome::ReselectVisual);
+        assert_eq!(vk.last_visual(), Some((RegisterShape::Char, (1, 2), (3, 4))));
     }
 
     #[test]

@@ -2850,7 +2850,8 @@ fn run_normal_mode_navigation(
                 if let Some(range) = active_visual_range(&vk, &buf) {
                     buf.selections.push(range);
                 }
-                vk.end_visual();
+                let end_cursor = buf.cursor();
+                vk.end_visual(end_cursor);
                 render_normal_mode_frame(&buf, rect, &vk, None);
                 continue;
             }
@@ -2868,9 +2869,10 @@ fn run_normal_mode_navigation(
                     buf.selections.push(range);
                 }
                 let register = vk.take_pending_register();
+                let end_cursor = buf.cursor();
                 yank_selections(&buf, registers, register);
                 buf.selections.clear();
-                vk.end_visual();
+                vk.end_visual(end_cursor);
                 render_normal_mode_frame(&buf, rect, &vk, None);
                 continue;
             }
@@ -2879,7 +2881,8 @@ fn run_normal_mode_navigation(
             // mode with nothing yanked. Same reachability condition as
             // `y` just above.
             Key::Escape if vk.is_idle() && (vk.is_visual() || !buf.selections.is_empty()) => {
-                vk.end_visual();
+                let end_cursor = buf.cursor();
+                vk.end_visual(end_cursor);
                 buf.selections.clear();
                 render_normal_mode_frame(&buf, rect, &vk, None);
                 continue;
@@ -2975,6 +2978,13 @@ fn run_normal_mode_navigation(
             // of this same loop.
             KeyOutcome::EnterVisual(shape) => {
                 vk.begin_visual(shape, buf.cursor());
+                render_normal_mode_frame(&buf, rect, &vk, None);
+            }
+            KeyOutcome::ReselectVisual => {
+                if let Some((shape, anchor, cursor)) = vk.last_visual() {
+                    buf.set_cursor(cursor.0, cursor.1);
+                    vk.begin_visual(shape, anchor);
+                }
                 render_normal_mode_frame(&buf, rect, &vk, None);
             }
             // Yank works here too -- copying text out of a pane's own
