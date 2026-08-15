@@ -1875,8 +1875,13 @@ mod tests {
     fn overlong_buffer_suppresses_the_ghost_entirely() {
         // The buffer alone already exceeds `remaining` -- compose_redraw
         // takes the horizontal-scroll branch, which never has any room
-        // left for a ghost tail at all.
-        let ed = make_editor("a very long command line", 25);
+        // left for a ghost tail at all. Cursor at 24, the string's own
+        // length (end of buffer, same as every other make_editor call
+        // here) -- 25 panicked compose_redraw's window math with a
+        // subtract-with-overflow, since a cursor a full char past the
+        // buffer's end is a state LineEditor's own invariant never
+        // allows outside this one test's own typo.
+        let ed = make_editor("a very long command line", 24);
         let out = compose_redraw("$ ", &ed, "ignored-ghost", 0, 10, HighlightContext::default(), &[]);
         assert!(!out.contains("ignored-ghost"), "{out:?}");
         assert!(!out.contains("\x1b[0;2;90m"), "{out:?}");
