@@ -13,6 +13,7 @@ pub enum Motion {
     GotoColumn,          // | (count is the 1-indexed target column, default 1)
     GotoFirstLine,        // gg (count is the 1-indexed target line, default first)
     GotoLastLine,          // G  (count is the 1-indexed target line, default last)
+    GotoPercent,           // {count}% (only emitted when a count precedes '%' -- see vimkeys.rs)
     WordForward,            // w
     WordForwardBig,           // W
     WordBackward,              // b
@@ -1200,6 +1201,21 @@ pub fn apply_motion(buf: &mut impl Buffer, motion: Motion, count: Option<usize>)
             let col = first_non_blank(buf, target);
             buf.set_cursor(target, col);
         }
+        // `{count}%` -- only ever emitted with a count (see vimkeys.rs's
+        // own `%` handler); `count.unwrap_or(0)` below just keeps this
+        // total rather than mattering in practice. Vim's own formula:
+        // `([count] * lines + 99) / 100`, 1-indexed.
+        Motion::GotoPercent => {
+            let total = buf.line_count();
+            let target = count
+                .unwrap_or(0)
+                .saturating_mul(total)
+                .saturating_add(99)
+                / 100;
+            let target = target.saturating_sub(1).min(total.saturating_sub(1));
+            let col = first_non_blank(buf, target);
+            buf.set_cursor(target, col);
+        }
         Motion::WordForward | Motion::WordForwardBig => {
             let big = motion == Motion::WordForwardBig;
             let mut pos = buf.cursor();
@@ -1573,7 +1589,7 @@ fn motion_shape(m: &Motion) -> Option<MotionShape> {
         Motion::LineStart | Motion::LineFirstNonBlank => Exclusive,
         Motion::LineEnd | Motion::LineLastNonBlank => Inclusive,
         Motion::GotoColumn => Exclusive,
-        Motion::GotoFirstLine | Motion::GotoLastLine => Linewise,
+        Motion::GotoFirstLine | Motion::GotoLastLine | Motion::GotoPercent => Linewise,
         Motion::WordForward | Motion::WordForwardBig | Motion::WordBackward | Motion::WordBackwardBig => Exclusive,
         Motion::WordEnd | Motion::WordEndBig | Motion::WordEndBackward | Motion::WordEndBackwardBig => Inclusive,
         Motion::FindChar { forward, .. } => {
@@ -1836,6 +1852,16 @@ mod tests {
         assert_eq!(go(&mut buf, Motion::GotoFirstLine, Some(3)), (2, 2));
         assert_eq!(go(&mut buf, Motion::GotoLastLine, Some(1)), (0, 0));
         assert_eq!(go(&mut buf, Motion::GotoLastLine, Some(100)), (3, 0));
+    }
+
+    #[test]
+    fn goto_percent() {
+        let mut buf = TestBuffer::new("l0\nl1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9");
+        buf.set_cursor(0, 0);
+        assert_eq!(go(&mut buf, Motion::GotoPercent, Some(50)), (4, 0)); // (50*10+99)/100 = 5, 1-indexed
+        assert_eq!(go(&mut buf, Motion::GotoPercent, Some(1)), (0, 0));
+        assert_eq!(go(&mut buf, Motion::GotoPercent, Some(100)), (9, 0));
+        assert_eq!(go(&mut buf, Motion::GotoPercent, Some(1000)), (9, 0)); // clamped
     }
 
     #[test]

@@ -694,6 +694,10 @@ impl VimKeys {
             Key::Char(')') => self.emit(Motion::SentenceForward),
             Key::Char('+') | Key::Enter => self.emit(Motion::NextLineNonBlank),
             Key::Char('-') => self.emit(Motion::PrevLineNonBlank),
+            // A count in front of '%' means "go to that percentage of the
+            // file" instead of vim's bare bracket-matching -- distinct
+            // motions since they have nothing in common beyond the key.
+            Key::Char('%') if self.count.is_some() => self.emit(Motion::GotoPercent),
             Key::Char('%') => self.emit(Motion::MatchPair),
             Key::Char('m') => {
                 self.pending = Pending::Mark;
@@ -1218,6 +1222,15 @@ mod tests {
             last(&mut vk, &[Key::Char('\''), Key::Char('a')]),
             KeyOutcome::Motion(Motion::GotoMarkLine('a'), None)
         );
+    }
+
+    #[test]
+    fn percent_without_count_is_match_pair_with_count_is_goto_percent() {
+        let mut vk = VimKeys::new();
+        assert_eq!(vk.feed(Key::Char('%')), KeyOutcome::Motion(Motion::MatchPair, None));
+        let mut vk = VimKeys::new();
+        let keys = [Key::Char('5'), Key::Char('0'), Key::Char('%')];
+        assert_eq!(last(&mut vk, &keys), KeyOutcome::Motion(Motion::GotoPercent, Some(50)));
     }
 
     #[test]
