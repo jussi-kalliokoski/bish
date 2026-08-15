@@ -2074,12 +2074,35 @@ struct ScreenBuffer {
     selections: Vec<motion::MotionRange>,
 }
 
+// The scrollback length to use for `ScreenBuffer`'s own combined
+// addressing (see its own doc comment) -- `s.scrollback.len()` normally,
+// but `0` whenever the grid currently showing is the *alternate* screen
+// (`s.using_alternate`, set for the duration of a fullscreen program like
+// vim/less that switched into it -- see `switch_alt_screen`'s own doc
+// comment). Real scrollback belongs to the *primary* grid only (a real
+// terminal never lets you scroll into history while an alt-screen program
+// owns the display either); treating it as if it sat "above" the alt
+// screen's own rows -- what plain `s.scrollback.len()` would do -- mixes
+// stale pre-alt-screen content into the addressing ahead of the program's
+// own rows, which is exactly what made normal mode read as "hides the
+// content of the app": with any pre-existing scrollback in that pane, the
+// combined cursor position (scrollback + the program's own cursor row)
+// could land the viewport almost entirely inside the stale scrollback
+// instead of the program's own screen.
+fn addressable_scrollback_len(s: &vt100::Screen) -> usize {
+    if s.using_alternate {
+        0
+    } else {
+        s.scrollback.len()
+    }
+}
+
 impl ScreenBuffer {
     fn new(screen: Rc<RefCell<vt100::Screen>>, vheight: usize) -> ScreenBuffer {
         let (sb_len, cur_row, cur_col) = {
             let s = screen.borrow();
             let (row, col) = s.cursor();
-            (s.scrollback.len(), row, col)
+            (addressable_scrollback_len(&s), row, col)
         };
         // Starts where the live cursor currently is -- translated into
         // this combined addressing, where scrollback lines come first --
@@ -2098,7 +2121,7 @@ impl ScreenBuffer {
     // `line_len` trim trailing blanks off of this.
     fn raw_len(&self, line: usize) -> usize {
         let s = self.screen.borrow();
-        let sb_len = s.scrollback.len();
+        let sb_len = addressable_scrollback_len(&s);
         if line < sb_len {
             s.scrollback[line].len()
         } else {
@@ -2108,7 +2131,7 @@ impl ScreenBuffer {
 
     fn raw_char_at(&self, line: usize, col: usize) -> Option<char> {
         let s = self.screen.borrow();
-        let sb_len = s.scrollback.len();
+        let sb_len = addressable_scrollback_len(&s);
         if line < sb_len {
             s.scrollback[line].get(col).map(|c| c.ch)
         } else {
@@ -2139,7 +2162,7 @@ impl BisheditBuffer for ScreenBuffer {
     fn line_count(&self) -> usize {
         let s = self.screen.borrow();
         let (cursor_row, _) = s.cursor();
-        (s.scrollback.len() + cursor_row + 1).max(1)
+        (addressable_scrollback_len(&s) + cursor_row + 1).max(1)
     }
 
     fn line_len(&self, line: usize) -> usize {
@@ -2231,7 +2254,7 @@ fn selection_columns_in_line(range: &motion::MotionRange, line: usize, cols: usi
 fn render_normal_mode_row(out: &mut String, buf: &ScreenBuffer, line: usize, cols: usize, search_matches: &[(usize, usize)]) {
     let mut last: Option<(vt100::Color, vt100::Color, vt100::CellAttrs)> = None;
     let s = buf.screen.borrow();
-    let sb_len = s.scrollback.len();
+    let sb_len = addressable_scrollback_len(&s);
     for c in 0..cols {
         let mut cell = if line < sb_len {
             s.scrollback[line].get(c).copied().unwrap_or_default()
@@ -3556,5 +3579,66 @@ mod visual_mode_tests {
     fn selection_columns_in_line_single_line_charwise_clamps_both_ends() {
         let range = motion::MotionRange { shape: motion::MotionShape::Inclusive, from: (2, 3), to: (2, 6) };
         assert_eq!(selection_columns_in_line(&range, 2, 10), Some((3, 7)));
+    }
+}
+
+#[cfg(test)]
+mod alt_screen_addressing_tests {
+    use super::*;
+
+    // Regression test for a real bug caught during interactive
+    // verification ("entering window/pane normal when a fullscreen app
+    // (vim) is open hides the content of the app"): with real
+    // pre-existing scrollback in a pane before a fullscreen program
+    // starts, `addressable_scrollback_len` returning the *primary*
+    // grid's real scrollback length while the *alternate* screen is
+    // active would push the combined-addressing cursor position (and
+    // thus the viewport) mostly or entirely into that stale scrollback
+    // instead of the program's own alternate-screen rows.
+    #[test]
+    fn addressable_scrollback_len_is_zero_on_the_alternate_screen_even_with_real_scrollback() {
+        let mut screen = vt100::Screen::new(5, 20);
+        // Scroll the primary grid well past its own height so real
+        // scrollback accumulates.
+        for i in 0..20 {
+            screen.feed(format!("line {i}\r\n").as_bytes());
+        }
+        assert!(screen.scrollback.len() > 0, "primary grid should have real scrollback by now");
+        let primary_len = screen.scrollback.len();
+
+        screen.feed(b"\x1b[?1049h"); // switch to the alternate screen (vim/less/... on startup)
+        assert!(screen.using_alternate);
+        assert_eq!(addressable_scrollback_len(&screen), 0);
+
+        screen.feed(b"\x1b[?1049l"); // back to the primary screen (vim/less/... on exit)
+        assert!(!screen.using_alternate);
+        assert_eq!(addressable_scrollback_len(&screen), primary_len);
+    }
+
+    // Same bug, exercised through `ScreenBuffer` itself (the actual
+    // `Buffer` normal-mode navigation reads from) rather than the raw
+    // helper directly: with real pre-existing primary-grid scrollback,
+    // `line_count`/`char_at` must still address purely within the
+    // alternate screen's own rows while it's active, not the stale
+    // scrollback ahead of it.
+    #[test]
+    fn screen_buffer_addresses_only_the_alternate_screens_own_rows() {
+        let screen = Rc::new(RefCell::new(vt100::Screen::new(5, 20)));
+        {
+            let mut s = screen.borrow_mut();
+            for i in 0..20 {
+                s.feed(format!("line {i}\r\n").as_bytes());
+            }
+            assert!(s.scrollback.len() > 0);
+            s.feed(b"\x1b[?1049h");
+            s.feed(b"vim content here");
+        }
+        let buf = ScreenBuffer::new(screen, 5);
+        // Only the one alternate-screen row with real content -- none of
+        // the primary grid's real scrollback should be counted.
+        assert_eq!(buf.line_count(), 1);
+        assert_eq!(buf.char_at(0, 0), Some('v'));
+        let line: String = buf.line_chars(0).into_iter().collect();
+        assert_eq!(line, "vim content here");
     }
 }
