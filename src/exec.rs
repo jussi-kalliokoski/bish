@@ -174,6 +174,16 @@ pub enum ExecResult {
     // referencing the job across main-loop iterations, not just for the
     // duration of one call.
     Fg,
+    // `e [file]`. Bubbles up exactly like Fg, for exactly the same
+    // reason: a builtin has no raw-mode/keystroke/rendering access of
+    // its own, and `Registers` lives in `repl::run`'s own locals, not in
+    // `Shell` at all. Carries no payload itself (`ExecResult` stays
+    // `Copy`, same as every other variant here -- an owned `Option
+    // <String>` file path wouldn't be) -- `run_single` stashes the
+    // actual argument on `self.pending_edit` first, same as `run_fg`
+    // already does via `pending_fg`; repl.rs reacts to this signal by
+    // calling `Shell::take_pending_edit` to get it back out.
+    Edit,
 }
 
 impl ExecResult {
@@ -182,14 +192,14 @@ impl ExecResult {
             ExecResult::Status(s) => s,
             ExecResult::Return(s) => s,
             ExecResult::Break(_) | ExecResult::Continue(_) => 0,
-            ExecResult::Window(_) | ExecResult::Fg => 0,
+            ExecResult::Window(_) | ExecResult::Fg | ExecResult::Edit => 0,
         }
     }
 
     fn is_signal(self) -> bool {
         matches!(
             self,
-            ExecResult::Break(_) | ExecResult::Continue(_) | ExecResult::Return(_) | ExecResult::Window(_) | ExecResult::Fg
+            ExecResult::Break(_) | ExecResult::Continue(_) | ExecResult::Return(_) | ExecResult::Window(_) | ExecResult::Fg | ExecResult::Edit
         )
     }
 }
@@ -540,6 +550,11 @@ pub struct Shell {
     // Rc: only ever set and cleared within the single session that ran
     // `fg`, never meant to be visible to any other session.
     pending_fg: Option<Job>,
+    // Same pattern as `pending_fg` just above, for `e` -- see
+    // ExecResult::Edit's own doc comment. The outer `Option` is "was `e`
+    // just run at all" (taken by `take_pending_edit`); the inner one is
+    // "was a file argument given," `e`'s own optional parameter.
+    pending_edit: Option<Option<String>>,
 }
 
 // A fresh, process/time-derived seed -- used both for a brand-new Shell
@@ -602,6 +617,7 @@ impl Shell {
             real_output_needs_newline: std::cell::Cell::new(false),
             ran_external_since_prompt: std::cell::Cell::new(false),
             pending_fg: None,
+            pending_edit: None,
         }
     }
 
@@ -789,6 +805,7 @@ impl Shell {
             real_output_needs_newline: std::cell::Cell::new(false),
             ran_external_since_prompt: std::cell::Cell::new(false),
             pending_fg: None,
+            pending_edit: None,
         }
     }
 
@@ -1037,6 +1054,19 @@ impl Shell {
     // rather than exec.rs continuing to drive it internally.
     pub fn take_pending_fg(&mut self) -> Option<FgJob> {
         self.pending_fg.take().map(FgJob)
+    }
+
+    // See ExecResult::Edit's own doc comment. `.flatten()`'s own outer/
+    // inner meaning: `None` (never called `e`) and `Some(None)` (`e`
+    // with no file argument) both collapse to `None` here, which is
+    // exactly right -- repl.rs only ever calls this in direct response
+    // to just having received ExecResult::Edit, so "e was never run" is
+    // unreachable in practice; the two are conflated on purpose rather
+    // than kept as `Option<Option<String>>` all the way through, since a
+    // caller who already knows it's reacting to that exact signal has no
+    // use for telling them apart.
+    pub fn take_pending_edit(&mut self) -> Option<String> {
+        self.pending_edit.take().flatten()
     }
 
     // The pty-attached counterpart to run_single's own inline Stopped-job
@@ -2668,7 +2698,7 @@ impl Shell {
                     self.last_status = s;
                     last_body_status = s;
                 }
-                ret @ (ExecResult::Return(_) | ExecResult::Window(_) | ExecResult::Fg) => return ret,
+                ret @ (ExecResult::Return(_) | ExecResult::Window(_) | ExecResult::Fg | ExecResult::Edit) => return ret,
             }
         }
         if ran_body {
@@ -2702,7 +2732,7 @@ impl Shell {
                     continue;
                 }
                 ExecResult::Status(s) => self.last_status = s,
-                ret @ (ExecResult::Return(_) | ExecResult::Window(_) | ExecResult::Fg) => return ret,
+                ret @ (ExecResult::Return(_) | ExecResult::Window(_) | ExecResult::Fg | ExecResult::Edit) => return ret,
             }
         }
         if ran_body {
@@ -2777,7 +2807,7 @@ impl Shell {
                     continue;
                 }
                 ExecResult::Status(s) => self.last_status = s,
-                ret @ (ExecResult::Return(_) | ExecResult::Window(_) | ExecResult::Fg) => return ret,
+                ret @ (ExecResult::Return(_) | ExecResult::Window(_) | ExecResult::Fg | ExecResult::Edit) => return ret,
             }
         }
     }
@@ -2823,7 +2853,7 @@ impl Shell {
                     }
                 }
                 ExecResult::Status(s) => self.last_status = s,
-                ret @ (ExecResult::Return(_) | ExecResult::Window(_) | ExecResult::Fg) => return ret,
+                ret @ (ExecResult::Return(_) | ExecResult::Window(_) | ExecResult::Fg | ExecResult::Edit) => return ret,
             }
             if !step.is_empty() {
                 if let Err(e) = arith::eval(step, self) {
@@ -3214,6 +3244,13 @@ impl Shell {
                 return ExecResult::Status(0);
             }
             "cd" => return ExecResult::Status(self.run_cd(&argv[1..])),
+            // `e [file]`: bubbles up via ExecResult::Edit -- see its own
+            // doc comment, and Fg's, for why this can't just be driven
+            // from here directly.
+            "e" => {
+                self.pending_edit = Some(argv.get(1).cloned());
+                return ExecResult::Edit;
+            }
             // Real builtins (not just something the external /bin/echo,
             // /bin/printf would cover) -- see run_echo/run_printf's own
             // doc comments. Matters beyond ordinary interactive use:
@@ -6691,6 +6728,7 @@ fn glob_replace(s: &str, pattern: &str, repl: &str, global: bool, anchor: Replac
 const KNOWN_BUILTINS: &[&str] = &[
     ":",
     "cd",
+    "e",
     "export",
     "let",
     "break",

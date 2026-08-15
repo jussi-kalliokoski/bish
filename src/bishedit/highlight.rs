@@ -367,7 +367,7 @@ pub(crate) fn is_assignment_prefix_word(chunks: &[Chunk]) -> bool {
 // there, just not reproduced here, since getting *this* list right is
 // what stands between a real builtin and a false "invalid command" red).
 pub(crate) const KNOWN_BUILTINS: &[&str] = &[
-    ":", "cd", "export", "let", "break", "continue", "test", "[", "[[", "return", "shift", "local", "exit", "read", "mapfile",
+    ":", "cd", "e", "export", "let", "break", "continue", "test", "[", "[[", "return", "shift", "local", "exit", "read", "mapfile",
     "readarray", "eval", "source", ".", "trap", "jobs", "fg", "bg", "wait", "kill", "getopts", "unset", "set", "declare",
     "typeset", "readonly", "exec", "command", "type", "hash", "shopt", "umask", "pushd", "popd", "dirs", "ulimit", "alias",
     "unalias", "window", "win", "echo", "printf",

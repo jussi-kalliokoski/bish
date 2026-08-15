@@ -11,11 +11,16 @@ pub mod manpages;
 pub mod motion;
 pub mod registers;
 pub mod suggestion;
+pub mod textbuffer;
 pub mod vimkeys;
 
 /// The first slice of bish-edit's headless core: read-only line/cursor
-/// accessors that motions operate over. Mutation (insert/delete) is a later
-/// addition to this same trait, once real editing lands.
+/// accessors that motions operate over. Real editing landed as
+/// `textbuffer::TextBuffer` without extending this trait: mutation has
+/// never gone through it, even for `editor.rs`'s own single-line
+/// `LineBuffer` (which already reaches straight into its own `Vec<char>`)
+/// -- keeping it bespoke per concrete type stayed the simpler, established
+/// shape once it actually came time to add it, not a shortcut taken here.
 pub trait Buffer {
     fn line_count(&self) -> usize;
     fn line_len(&self, line: usize) -> usize;

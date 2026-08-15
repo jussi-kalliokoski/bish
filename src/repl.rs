@@ -12,6 +12,7 @@ use crate::bishedit::vimkeys::{KeyOutcome, Op, VimKeys, WindowCmd};
 use crate::bishedit::Buffer as BisheditBuffer;
 use crate::editor::{self, Key, ReadOutcome};
 use crate::exec::{self, ExecResult, PaneDirection, Shell, WindowAction};
+use crate::fileeditor;
 use crate::history::{self, History};
 use crate::lexer::Lexer;
 use crate::parser::{AndOr, Command, Parser, Pipeline, Program};
@@ -70,6 +71,7 @@ struct SessionState {
 }
 
 type JobFrameId = u32;
+type EditFrameId = u32;
 
 // One layer of a pane's view stack. Session is the vim-like "same
 // session shown in multiple windows" case (see WindowEntry's doc
@@ -82,11 +84,16 @@ type JobFrameId = u32;
 // a running job is inherently a one-place-at-a-time resource, and
 // keeping Frame Copy (an FgJob owns a real OS process + pty, definitely
 // not Copy) matters for how cheaply `window fg` can duplicate a Session
-// frame onto another window's stack.
+// frame onto another window's stack. Edit is `e`'s own equivalent of
+// Job -- a builtin editor session (fileeditor::EditSession) that can
+// likewise be detached (Ctrl+Space) and resumed later, holding an id
+// into `edit_frames` for exactly the same Copy-ness reason (a
+// TextBuffer's own content is definitely not Copy either).
 #[derive(Clone, Copy, PartialEq)]
 enum Frame {
     Session(SessionId),
     Job(JobFrameId),
+    Edit(EditFrameId),
 }
 
 type PaneId = u32;
@@ -235,7 +242,7 @@ fn session_referenced_elsewhere(windows: &[WindowEntry], current_window: usize, 
             for (depth, frame) in pane.stack.iter().enumerate() {
                 let matches = match frame {
                     Frame::Session(s) => *s == sid,
-                    Frame::Job(_) => false,
+                    Frame::Job(_) | Frame::Edit(_) => false,
                 };
                 if !matches {
                     continue;
@@ -296,6 +303,10 @@ pub fn run(mut shell: Shell) {
     // isn't stored directly in the stack itself.
     let mut job_frames: HashMap<JobFrameId, exec::FgJob> = HashMap::new();
     let mut next_job_frame_id: JobFrameId = 1;
+    // Same idea as job_frames, for `e`'s own detachable editor sessions
+    // (Frame::Edit) -- see Frame's own doc comment.
+    let mut edit_frames: HashMap<EditFrameId, fileeditor::EditSession> = HashMap::new();
+    let mut next_edit_frame_id: EditFrameId = 1;
     // Flips true (and stays true) the first time any window-family
     // command promotes the terminal -- see apply_window_action. Every
     // session's sink is Real until then, matching today's plain behavior
@@ -349,6 +360,31 @@ pub fn run(mut shell: Shell) {
                 &mut next_session_id,
                 &mut next_window_id,
                 &mut job_frames,
+                &mut cmd_history,
+                &mut sinks_are_grid,
+                &mut registers,
+                term_rows,
+                term_cols,
+            );
+            let _ = io::stdout().flush();
+            continue;
+        }
+
+        // Same idea, for a window whose top frame is a still-detached
+        // `Frame::Edit` -- either just pushed by the pending_edit
+        // handling below, or the user switched back to a window they'd
+        // earlier detached an `e` session from.
+        if let Frame::Edit(edit_frame_id) = *windows[current_window].stack().last().unwrap() {
+            run_edit_frame(
+                edit_frame_id,
+                session_id,
+                &mut sessions,
+                &mut windows,
+                &mut current_window,
+                &mut next_session_id,
+                &mut next_window_id,
+                &mut job_frames,
+                &mut edit_frames,
                 &mut cmd_history,
                 &mut sinks_are_grid,
                 &mut registers,
@@ -622,6 +658,7 @@ pub fn run(mut shell: Shell) {
             Ok(ReadOutcome::Line(line)) => {
                 let mut window_action = None;
                 let mut fg_pending = false;
+                let mut edit_pending = false;
                 {
                     let session = sessions.get_mut(&session_id).unwrap();
                     // Any real input -- even a blank Enter -- re-arms the
@@ -730,6 +767,7 @@ pub fn run(mut shell: Shell) {
                                 match result {
                                     ExecResult::Window(action) => window_action = Some(action),
                                     ExecResult::Fg => fg_pending = true,
+                                    ExecResult::Edit => edit_pending = true,
                                     _ => {}
                                 }
                             }
@@ -791,6 +829,49 @@ pub fn run(mut shell: Shell) {
                         term_rows,
                         term_cols,
                     );
+                } else if edit_pending {
+                    // `e [file]` -- see ExecResult::Edit's own doc
+                    // comment. ensure_promoted first, unconditionally:
+                    // unlike a job (which only gets a pty, and so needs
+                    // repl.rs's own compositor rendering, once already
+                    // promoted -- see exec.rs's own `use_pty` gate), `e`
+                    // always renders through the compositor/pane-rect
+                    // system from the start, one code path, no separate
+                    // "plain unpromoted real terminal" branch to
+                    // maintain -- same reasoning Ctrl+Space's own
+                    // normal-mode navigation already established.
+                    ensure_promoted(&mut sessions, &mut sinks_are_grid);
+                    let path = sessions.get_mut(&session_id).unwrap().shell.take_pending_edit();
+                    let rect = pane_rect(&windows[current_window], windows[current_window].focused_pane, term_rows, term_cols);
+                    match fileeditor::EditSession::open(path.as_deref(), normal_mode_content_rows(rect)) {
+                        Ok(session) => {
+                            let edit_frame_id = next_edit_frame_id;
+                            next_edit_frame_id += 1;
+                            edit_frames.insert(edit_frame_id, session);
+                            windows[current_window].stack_mut().push(Frame::Edit(edit_frame_id));
+
+                            run_edit_frame(
+                                edit_frame_id,
+                                session_id,
+                                &mut sessions,
+                                &mut windows,
+                                &mut current_window,
+                                &mut next_session_id,
+                                &mut next_window_id,
+                                &mut job_frames,
+                                &mut edit_frames,
+                                &mut cmd_history,
+                                &mut sinks_are_grid,
+                                &mut registers,
+                                term_rows,
+                                term_cols,
+                            );
+                        }
+                        Err(e) => {
+                            sessions.get_mut(&session_id).unwrap().shell.sink_err(&format!("bish: e: {}\n", e));
+                            compositor_redraw(&sessions, &windows, current_window, term_rows, term_cols);
+                        }
+                    }
                 } else if sinks_are_grid {
                     // The common case once promoted: a normal command ran
                     // in the focused session and its output (if any)
@@ -958,6 +1039,100 @@ fn run_fg_job_frame(
     }
 }
 
+// `e`'s own counterpart to run_fg_job_frame, above -- drives whatever
+// editor session is behind `edit_frame_id`, freshly opened by the
+// pending_edit handling below or already sitting there from an earlier
+// detach. Unlike a job, an editor session never runs on its own between
+// keystrokes, so `fileeditor::drive` renders directly rather than
+// through a callback (see its own doc comment) -- this function's only
+// job is providing `rect` and reacting to how `drive` ended.
+#[allow(clippy::too_many_arguments)]
+fn run_edit_frame(
+    edit_frame_id: EditFrameId,
+    session_id: SessionId,
+    sessions: &mut HashMap<SessionId, SessionState>,
+    windows: &mut Vec<WindowEntry>,
+    current_window: &mut usize,
+    next_session_id: &mut SessionId,
+    next_window_id: &mut u32,
+    job_frames: &mut HashMap<JobFrameId, exec::FgJob>,
+    edit_frames: &mut HashMap<EditFrameId, fileeditor::EditSession>,
+    cmd_history: &mut History,
+    sinks_are_grid: &mut bool,
+    registers: &mut Registers,
+    term_rows: usize,
+    term_cols: usize,
+) {
+    // Taken out of edit_frames (rather than borrowed via get_mut) so
+    // on_idle below can freely borrow edit_frames -- moot today (nothing
+    // in service_background_jobs touches it), but matches
+    // run_fg_job_frame's own reasoning for job_frames exactly, and keeps
+    // the two symmetric.
+    let mut session = edit_frames.remove(&edit_frame_id).expect("Frame::Edit always has a live edit_frames entry");
+    let rect = pane_rect(&windows[*current_window], windows[*current_window].focused_pane, term_rows, term_cols);
+    let cw = *current_window;
+    let outcome = fileeditor::drive(&mut session, rect, registers, &mut || service_background_jobs(sessions, windows, job_frames, cw));
+    match outcome {
+        Ok(fileeditor::EditOutcome::Quit) => {
+            windows[*current_window].stack_mut().pop();
+            if *sinks_are_grid {
+                compositor_redraw(sessions, windows, *current_window, term_rows, term_cols);
+            }
+        }
+        Ok(fileeditor::EditOutcome::Detached) => {
+            // Freezes this pane's own grid with the editor's current
+            // state -- exactly once, right here, rather than mirroring
+            // freeze_idle_prompt's own multiple call sites (one at every
+            // place focus *might* move away): unlike a live prompt, a
+            // detached editor session's content is genuinely static
+            // (nothing runs in the background the way a job does) from
+            // this exact moment until it's re-entered, at which point
+            // fileeditor::drive takes over rendering to the real
+            // terminal directly again -- so one freeze, right when it
+            // stops being driven, is both necessary and sufficient.
+            fileeditor::freeze_editor_frame(&sessions[&session_id].screen, &session.buffer, &session.vk, rect);
+            edit_frames.insert(edit_frame_id, session);
+            // Normal mode, not command mode -- same reasoning as
+            // FgOutcome::Detached's own arm just above: Ctrl+Space
+            // always means "step back to look around," regardless of
+            // what was detached from. No initial text/cursor to
+            // resume -- this pane's top frame is Frame::Edit, not a
+            // live prompt, so whatever this returns gets silently
+            // discarded once the main loop sees the same Frame::Edit
+            // still on top and re-drives this session instead of ever
+            // calling read_line with it (see run_normal_mode_
+            // navigation's own `at_live_prompt` gate).
+            let _ = run_normal_mode_navigation(
+                session_id,
+                sessions,
+                windows,
+                current_window,
+                next_session_id,
+                next_window_id,
+                sinks_are_grid,
+                job_frames,
+                cmd_history,
+                registers,
+                String::new(),
+                0,
+                term_rows,
+                term_cols,
+            );
+        }
+        Err(e) => {
+            // A real I/O error reading a key -- same treatment the main
+            // loop itself gives one (see its own read_line Err arm):
+            // sink it and drop the session; there's no good way to
+            // resume from here.
+            windows[*current_window].stack_mut().pop();
+            sessions.get_mut(&session_id).unwrap().shell.sink_err(&format!("bish: e: error reading input: {}\n", e));
+            if *sinks_are_grid {
+                compositor_redraw(sessions, windows, *current_window, term_rows, term_cols);
+            }
+        }
+    }
+}
+
 // Performs a `window`-family action against the real session/window
 // state repl.rs owns directly (see ExecResult::Window's doc comment in
 // exec.rs for why this can't live inside Shell itself). Redraws the
@@ -1107,6 +1282,12 @@ fn apply_window_action(
                 // legitimately be shown in two windows at once.
                 Some(Frame::Job(_)) => {
                     sessions[&cur_sid].shell.sink_err("bish: window: fg: that window is running a job, not a session\n");
+                }
+                // Same one-place-at-a-time reasoning as Job just above --
+                // an open editor session can't be shown in two windows
+                // simultaneously either.
+                Some(Frame::Edit(_)) => {
+                    sessions[&cur_sid].shell.sink_err("bish: window: fg: that window is running an editor, not a session\n");
                 }
                 None => {
                     sessions[&cur_sid].shell.sink_err(&format!("bish: window: fg: no such window: {}\n", target_id));
@@ -1348,7 +1529,7 @@ fn close_orphaned_sessions(sessions: &mut HashMap<SessionId, SessionState>, wind
         .flat_map(|p| {
             p.stack.iter().filter_map(|f| match f {
                 Frame::Session(id) => Some(*id),
-                Frame::Job(_) => None,
+                Frame::Job(_) | Frame::Edit(_) => None,
             })
         })
         .collect();
@@ -1625,13 +1806,15 @@ unsafe extern "C" {
 
 // A screen-coordinate rectangle within the compositor's content area
 // (everything above the pinned tab-bar row), 0-indexed. Produced by
-// compute_regions from a window's PaneLayout tree.
+// compute_regions from a window's PaneLayout tree. pub(crate): fileeditor
+// needs this shape too (a pane's own rect, exactly the same meaning) --
+// see its own `drive`/`build_editor_frame` signatures.
 #[derive(Clone, Copy)]
-struct Rect {
-    row: usize,
-    col: usize,
-    rows: usize,
-    cols: usize,
+pub(crate) struct Rect {
+    pub(crate) row: usize,
+    pub(crate) col: usize,
+    pub(crate) rows: usize,
+    pub(crate) cols: usize,
 }
 
 // One leaf pane's rendering info, resolved from a window's layout tree
@@ -3424,6 +3607,15 @@ fn run_command_mode(
                                     ExecResult::Fg => {
                                         sessions[&session_id].shell.sink_err("bish: fg: not supported in command mode -- use it from the normal shell prompt\n");
                                         sessions.get_mut(&session_id).unwrap().shell.discard_pending_fg();
+                                        return CommandModeOutcome::Cancelled;
+                                    }
+                                    // Same reasoning as Fg just above --
+                                    // this restricted read-eval loop has
+                                    // no way to drive an interactive
+                                    // editor session either.
+                                    ExecResult::Edit => {
+                                        sessions[&session_id].shell.sink_err("bish: e: not supported in command mode -- use it from the normal shell prompt\n");
+                                        sessions.get_mut(&session_id).unwrap().shell.take_pending_edit();
                                         return CommandModeOutcome::Cancelled;
                                     }
                                     _ => {

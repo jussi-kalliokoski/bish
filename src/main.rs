@@ -3,6 +3,7 @@ mod bishedit;
 mod builtins;
 mod editor;
 mod exec;
+mod fileeditor;
 mod glob;
 mod history;
 mod lexer;
