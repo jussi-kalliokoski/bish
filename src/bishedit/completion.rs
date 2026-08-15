@@ -249,7 +249,17 @@ impl<'a> ShellCompletionProvider<'a> {
             Some(idx) => &prefix[..idx + 1],
             None => "",
         };
-        let dir_path = if dir_part.is_empty() {
+        let dir_path = if let Some(rest) = dir_part.strip_prefix('~') {
+            // `~/...` -- bare-tilde home expansion, the same shape
+            // lexer.rs's own tilde expansion recognizes (no `~user`
+            // lookup). Only the filesystem lookup gets expanded: `dir_part`
+            // itself stays literal, so every candidate this returns still
+            // starts with the `~/` text the user actually typed, matching
+            // what read_line's accept step will splice back into the
+            // buffer.
+            let Ok(home) = std::env::var("HOME") else { return Vec::new() };
+            PathBuf::from(home).join(rest.trim_start_matches('/'))
+        } else if dir_part.is_empty() {
             cwd.to_path_buf()
         } else if Path::new(dir_part).is_absolute() {
             PathBuf::from(dir_part)
@@ -422,6 +432,40 @@ mod tests {
         assert!(names.iter().any(|n| n == "widgets/"), "{names:?}");
         assert!(names.iter().any(|n| n == "widget-notes.txt"), "{names:?}");
         assert!(!names.iter().any(|n| n == "unrelated.txt"), "{names:?}");
+    }
+
+    // Regression test for a real bug caught during interactive
+    // verification: `ls ~/.co<Tab>` offered nothing even when `~/.config`
+    // exists -- `dir_part` ("~/") was joined onto `cwd` literally (`~`
+    // isn't special to the filesystem), producing a nonexistent
+    // "$cwd/~/" directory that read_dir always fails to open.
+    #[test]
+    fn file_candidates_expands_a_leading_tilde_slash_for_the_lookup() {
+        let dir = std::env::temp_dir().join(format!("bish-completion-tilde-test-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join(".config")).unwrap();
+
+        let original_home = std::env::var("HOME").unwrap_or_default();
+        let names = {
+            // SAFETY: same reasoning as enumerate_path_matches_filters_by_
+            // prefix_and_executable_bit's own PATH mutation above -- no
+            // other thread in this test binary depends on HOME being
+            // atomically consistent across this narrow window, and the
+            // value is restored before returning.
+            unsafe { std::env::set_var("HOME", &dir) };
+            // cwd is deliberately a different, unrelated directory --
+            // confirms the lookup actually goes to $HOME, not cwd.
+            let provider = ShellCompletionProvider { cwd: Some(Path::new("/")), known_functions: None };
+            let names = display_names(provider.file_candidates("~/.co"));
+            unsafe { std::env::set_var("HOME", &original_home) };
+            names
+        };
+
+        std::fs::remove_dir_all(&dir).ok();
+
+        // The candidate must keep the literal "~/" prefix the user typed
+        // (not the expanded $HOME path) -- it gets spliced straight back
+        // into the buffer on accept.
+        assert_eq!(names, vec!["~/.config/".to_string()]);
     }
 
     #[test]
