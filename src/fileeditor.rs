@@ -87,6 +87,7 @@ pub fn drive(session: &mut EditSession, rect: Rect, registers: &mut Registers, o
     // (covering run_insert_mode/run_ex_command too, both nested within
     // it), not just re-acquired per sub-loop.
     let _guard = term::RawGuard::enable(0)?;
+    set_last_filename(session, registers);
     render_editor_frame(&session.buffer, &session.vk, EditorMode::Normal, rect);
     loop {
         let key = match editor::read_key_idle(on_idle)? {
@@ -144,7 +145,7 @@ pub fn drive(session: &mut EditSession, rect: Rect, registers: &mut Registers, o
                 session.buffer.selections.clear();
                 session.vk.end_visual(end_cursor);
                 if deleted {
-                    match run_insert_mode(session, rect, on_idle, false)? {
+                    match run_insert_mode(session, rect, registers, on_idle, false)? {
                         InsertOutcome::Detached => return Ok(EditOutcome::Detached),
                         InsertOutcome::Done => {}
                     }
@@ -184,7 +185,7 @@ pub fn drive(session: &mut EditSession, rect: Rect, registers: &mut Registers, o
                 continue;
             }
             Key::Char(':') if session.vk.is_idle() => {
-                if let ExOutcome::Quit = run_ex_command(session, rect, on_idle)? {
+                if let ExOutcome::Quit = run_ex_command(session, rect, registers, on_idle)? {
                     return Ok(EditOutcome::Quit);
                 }
                 render_editor_frame(&session.buffer, &session.vk, EditorMode::Normal, rect);
@@ -219,7 +220,7 @@ pub fn drive(session: &mut EditSession, rect: Rect, registers: &mut Registers, o
             }
             KeyOutcome::EnterInsert(cmd) => {
                 resolve_insert_start(&mut session.buffer, cmd);
-                match run_insert_mode(session, rect, on_idle, false)? {
+                match run_insert_mode(session, rect, registers, on_idle, false)? {
                     InsertOutcome::Detached => return Ok(EditOutcome::Detached),
                     InsertOutcome::Done => {}
                 }
@@ -232,7 +233,7 @@ pub fn drive(session: &mut EditSession, rect: Rect, registers: &mut Registers, o
                 Op::Change => {
                     let m = redirect_cw_to_ce(&session.buffer, &m);
                     if delete_motion(&mut session.buffer, registers, m, count, register) {
-                        match run_insert_mode(session, rect, on_idle, false)? {
+                        match run_insert_mode(session, rect, registers, on_idle, false)? {
                             InsertOutcome::Detached => return Ok(EditOutcome::Detached),
                             InsertOutcome::Done => {}
                         }
@@ -245,7 +246,7 @@ pub fn drive(session: &mut EditSession, rect: Rect, registers: &mut Registers, o
                 Op::Delete => delete_lines(&mut session.buffer, registers, count, register),
                 Op::Change => {
                     delete_lines(&mut session.buffer, registers, count, register);
-                    match run_insert_mode(session, rect, on_idle, false)? {
+                    match run_insert_mode(session, rect, registers, on_idle, false)? {
                         InsertOutcome::Detached => return Ok(EditOutcome::Detached),
                         InsertOutcome::Done => {}
                     }
@@ -261,7 +262,7 @@ pub fn drive(session: &mut EditSession, rect: Rect, registers: &mut Registers, o
             KeyOutcome::DeleteSurround { ch } => delete_surround(&mut session.buffer, ch),
             KeyOutcome::ChangeSurround { ch, replacement } => change_surround(&mut session.buffer, ch, replacement),
             KeyOutcome::ReplaceChar { ch, count } => replace_char(&mut session.buffer, ch, count.unwrap_or(1).max(1)),
-            KeyOutcome::EnterReplace => match run_insert_mode(session, rect, on_idle, true)? {
+            KeyOutcome::EnterReplace => match run_insert_mode(session, rect, registers, on_idle, true)? {
                 InsertOutcome::Detached => return Ok(EditOutcome::Detached),
                 InsertOutcome::Done => {}
             },
@@ -320,7 +321,7 @@ fn delete_motion(buf: &mut TextBuffer, registers: &mut Registers, m: motion::Mot
     };
     let shape = if range.shape == motion::MotionShape::Linewise { RegisterShape::Line } else { RegisterShape::Char };
     let text = buf.delete_range(&range);
-    registers.write(register, RegisterValue { text, shape });
+    registers.record_delete(register, RegisterValue { text, shape });
     true
 }
 
@@ -334,7 +335,7 @@ fn delete_motion(buf: &mut TextBuffer, registers: &mut Registers, m: motion::Mot
 fn delete_lines(buf: &mut TextBuffer, registers: &mut Registers, count: Option<usize>, register: Option<char>) {
     let count = count.unwrap_or(1).max(1);
     let text = motion::whole_lines(buf, count);
-    registers.write(register, RegisterValue { text, shape: RegisterShape::Line });
+    registers.record_delete(register, RegisterValue { text, shape: RegisterShape::Line });
     let (row, _) = buf.cursor();
     let last = (row + count - 1).min(buf.line_count().saturating_sub(1));
     let range = motion::MotionRange { shape: motion::MotionShape::Linewise, from: (row, 0), to: (last, 0) };
@@ -356,7 +357,7 @@ fn delete_char_forward(buf: &mut TextBuffer, registers: &mut Registers, count: O
     let range = motion::MotionRange { shape: motion::MotionShape::Exclusive, from: (row, start), to: (row, end) };
     let deleted = buf.delete_range(&range);
     if !deleted.is_empty() {
-        registers.write(register, RegisterValue { text: deleted, shape: RegisterShape::Char });
+        registers.record_delete(register, RegisterValue { text: deleted, shape: RegisterShape::Char });
     }
 }
 
@@ -717,14 +718,22 @@ enum InsertOutcome {
 // else (motion keys, Enter, detach/exit) behaves identically either way,
 // which is why this is a flag on the one shared loop rather than a
 // second copy of it.
-fn run_insert_mode(session: &mut EditSession, rect: Rect, on_idle: &mut dyn FnMut(), replace: bool) -> io::Result<InsertOutcome> {
+fn run_insert_mode(session: &mut EditSession, rect: Rect, registers: &mut Registers, on_idle: &mut dyn FnMut(), replace: bool) -> io::Result<InsertOutcome> {
     let mode = if replace { EditorMode::Replace } else { EditorMode::Insert };
     render_editor_frame(&session.buffer, &session.vk, mode, rect);
+    // `"."`'s own accumulator for this session -- see `Registers::
+    // set_last_insert`'s own doc comment. Best-effort: a Backspace just
+    // pops the most recently accumulated character regardless of whether
+    // it's actually erasing something typed *this* session or older
+    // pre-existing text it backed into -- real vim tracks that
+    // distinction precisely; this doesn't.
+    let mut inserted = String::new();
     loop {
         let key = match editor::read_key_idle(on_idle)? {
             Some(k) => k,
             None => {
                 session.buffer.set_mark('^', session.buffer.cursor());
+                registers.set_last_insert(inserted);
                 return Ok(InsertOutcome::Done);
             }
         };
@@ -736,15 +745,18 @@ fn run_insert_mode(session: &mut EditSession, rect: Rect, on_idle: &mut dyn FnMu
             // own `LastInsertPos` arm).
             Key::CtrlSpace => {
                 session.buffer.set_mark('^', session.buffer.cursor());
+                registers.set_last_insert(inserted);
                 return Ok(InsertOutcome::Detached);
             }
             Key::Escape => {
                 session.buffer.set_mark('^', session.buffer.cursor());
+                registers.set_last_insert(inserted);
                 return Ok(InsertOutcome::Done);
             }
             Key::Enter => {
                 let (row, col) = session.buffer.cursor();
                 session.buffer.insert_text((row, col), "\n");
+                inserted.push('\n');
             }
             // Replace mode's own Backspace: known simplification -- steps
             // the cursor back without restoring the character it walks
@@ -756,6 +768,7 @@ fn run_insert_mode(session: &mut EditSession, rect: Rect, on_idle: &mut dyn FnMu
                 if col > 0 {
                     session.buffer.set_cursor(row, col - 1);
                 }
+                inserted.pop();
             }
             Key::Backspace => {
                 let (row, col) = session.buffer.cursor();
@@ -767,6 +780,7 @@ fn run_insert_mode(session: &mut EditSession, rect: Rect, on_idle: &mut dyn FnMu
                     let range = motion::MotionRange { shape: motion::MotionShape::Exclusive, from: (row - 1, prev_len), to: (row, 0) };
                     session.buffer.delete_range(&range);
                 }
+                inserted.pop();
             }
             Key::Left => motion::apply_motion(&mut session.buffer, motion::Motion::Left, None),
             Key::Right => {
@@ -793,6 +807,7 @@ fn run_insert_mode(session: &mut EditSession, rect: Rect, on_idle: &mut dyn FnMu
                 }
                 let mut b = [0u8; 4];
                 session.buffer.insert_text((row, col), c.encode_utf8(&mut b));
+                inserted.push(c);
             }
             _ => {}
         }
@@ -806,6 +821,18 @@ enum ExOutcome {
     Quit,
 }
 
+// `"%"`: vim's own current-filename register -- refreshed here (a no-op
+// if there's no path, e.g. an unnamed buffer that still hasn't been
+// written anywhere) whenever the buffer's own path could plausibly have
+// just changed (`drive`'s own initial open, and every successful `:w`/
+// `:wq`/`:x` here, since `:w newname` can name a previously-unnamed
+// buffer).
+fn set_last_filename(session: &EditSession, registers: &mut Registers) {
+    if let Some(path) = session.buffer.path() {
+        registers.set_last_filename(path.to_string_lossy().into_owned());
+    }
+}
+
 // `:w`, `:w <path>`, `:wq`/`:x`, `:q`, `:q!` -- deliberately not
 // `editor::read_line` (which every other `:`/`/`-style prompt in this
 // codebase reuses): that needs a real `History` to browse, which nothing
@@ -814,11 +841,14 @@ enum ExOutcome {
 // print the prompt, read raw keys until Enter/Escape, nothing else
 // `read_line` offers (completion, suggestions, browsing) is needed for a
 // one-line Ex command anyway.
-fn run_ex_command(session: &mut EditSession, rect: Rect, on_idle: &mut dyn FnMut()) -> io::Result<ExOutcome> {
+fn run_ex_command(session: &mut EditSession, rect: Rect, registers: &mut Registers, on_idle: &mut dyn FnMut()) -> io::Result<ExOutcome> {
     let Some(line) = read_ex_command_line(rect, on_idle)? else {
         return Ok(ExOutcome::Continue);
     };
     let line = line.trim();
+    // `":"`: recorded regardless of what the command turns out to be
+    // (matching vim: even a failed `:nonsense` becomes the new `":`).
+    registers.set_last_ex_command(line.to_string());
     let (cmd, arg) = match line.split_once(' ') {
         Some((c, a)) => (c, Some(a.trim()).filter(|a| !a.is_empty())),
         None => (line, None),
@@ -826,13 +856,17 @@ fn run_ex_command(session: &mut EditSession, rect: Rect, on_idle: &mut dyn FnMut
     match cmd {
         "" => Ok(ExOutcome::Continue),
         "w" | "write" => {
-            if let Err(e) = session.buffer.save(arg.map(std::path::Path::new)) {
-                flash_status(&format!("E212: Can't open file for writing: {e}"), rect, on_idle)?;
+            match session.buffer.save(arg.map(std::path::Path::new)) {
+                Ok(()) => set_last_filename(session, registers),
+                Err(e) => flash_status(&format!("E212: Can't open file for writing: {e}"), rect, on_idle)?,
             }
             Ok(ExOutcome::Continue)
         }
         "wq" | "x" => match session.buffer.save(arg.map(std::path::Path::new)) {
-            Ok(()) => Ok(ExOutcome::Quit),
+            Ok(()) => {
+                set_last_filename(session, registers);
+                Ok(ExOutcome::Quit)
+            }
             Err(e) => {
                 flash_status(&format!("E212: Can't open file for writing: {e}"), rect, on_idle)?;
                 Ok(ExOutcome::Continue)

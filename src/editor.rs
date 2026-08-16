@@ -1696,7 +1696,7 @@ fn run_line_normal_mode(
                         lb.ed.buf = new_buf;
                         lb.ed.cursor = new_cursor;
                         if !deleted.is_empty() {
-                            registers.write(register, RegisterValue { text: deleted, shape: RegisterShape::Char });
+                            registers.record_delete(register, RegisterValue { text: deleted, shape: RegisterShape::Char });
                         }
                     }
                     // `v`/`V`: arms Visual mode with the buffer's own
@@ -1818,12 +1818,12 @@ pub fn yank_motion(buf: &mut impl crate::bishedit::Buffer, registers: &mut Regis
     };
     let text = motion::extract_text(buf, &range);
     let shape = if range.shape == motion::MotionShape::Linewise { RegisterShape::Line } else { RegisterShape::Char };
-    registers.write(register, RegisterValue { text, shape });
+    registers.record_yank(register, RegisterValue { text, shape });
 }
 
 pub fn yank_lines(buf: &impl crate::bishedit::Buffer, registers: &mut Registers, count: Option<usize>, register: Option<char>) {
     let text = motion::whole_lines(buf, count.unwrap_or(1).max(1));
-    registers.write(register, RegisterValue { text, shape: RegisterShape::Line });
+    registers.record_yank(register, RegisterValue { text, shape: RegisterShape::Line });
 }
 
 fn put(buf: &mut Vec<char>, cursor: &mut usize, registers: &mut Registers, before: bool, count: Option<usize>, register: Option<char>) {
@@ -1855,7 +1855,7 @@ fn delete_motion(lb: &mut LineBuffer, registers: &mut Registers, motion: motion:
     };
     let text = motion::extract_text(lb, &range);
     let shape = if range.shape == motion::MotionShape::Linewise { RegisterShape::Line } else { RegisterShape::Char };
-    registers.write(register, RegisterValue { text, shape });
+    registers.record_delete(register, RegisterValue { text, shape });
     let (from_col, to_col) = (range.from.1, range.to.1);
     match range.shape {
         // A single-line buffer's own "linewise" is always the whole
@@ -1887,7 +1887,7 @@ fn delete_motion(lb: &mut LineBuffer, registers: &mut Registers, motion: motion:
 // for `delete_motion` -- `cc` always enters insert.
 fn delete_lines(lb: &mut LineBuffer, registers: &mut Registers, count: Option<usize>, register: Option<char>) {
     let text = motion::whole_lines(lb, count.unwrap_or(1).max(1));
-    registers.write(register, RegisterValue { text, shape: RegisterShape::Line });
+    registers.record_delete(register, RegisterValue { text, shape: RegisterShape::Line });
     lb.ed.buf.clear();
     lb.ed.cursor = 0;
 }
@@ -1910,7 +1910,7 @@ fn yank_selections_line(lb: &LineBuffer, registers: &mut Registers, register: Op
             shape = RegisterShape::Line;
         }
     }
-    registers.write(register, RegisterValue { text, shape });
+    registers.record_yank(register, RegisterValue { text, shape });
 }
 
 // Visual mode's own `d`: removes every selection from the buffer,
@@ -1932,7 +1932,7 @@ fn delete_selections(lb: &mut LineBuffer, registers: &mut Registers, register: O
             shape = RegisterShape::Line;
         }
     }
-    registers.write(register, RegisterValue { text, shape });
+    registers.record_delete(register, RegisterValue { text, shape });
 
     // A `Linewise` selection (`V`) already covers the whole single-line
     // buffer -- same flattening `yy`/`dd`/`cc` already use -- so it
@@ -2335,7 +2335,7 @@ fn run_one_shot_normal_command(ed: &mut LineEditor, registers: &mut Registers, o
                         lb.ed.buf = new_buf;
                         lb.ed.cursor = new_cursor;
                         if !deleted.is_empty() {
-                            registers.write(register, RegisterValue { text: deleted, shape: RegisterShape::Char });
+                            registers.record_delete(register, RegisterValue { text: deleted, shape: RegisterShape::Char });
                         }
                         break None;
                     }

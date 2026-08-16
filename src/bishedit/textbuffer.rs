@@ -248,7 +248,7 @@ impl TextBuffer {
                 shape = RegisterShape::Line;
             }
         }
-        registers.write(register, RegisterValue { text, shape });
+        registers.record_yank(register, RegisterValue { text, shape });
     }
 
     // Visual mode's own `d`: removes every selection, writing the
@@ -274,7 +274,7 @@ impl TextBuffer {
                 shape = RegisterShape::Line;
             }
         }
-        registers.write(register, RegisterValue { text, shape });
+        registers.record_delete(register, RegisterValue { text, shape });
 
         let leftmost = self.selections.iter().map(|r| r.from).min().unwrap();
         let mut ranges = self.selections.clone();

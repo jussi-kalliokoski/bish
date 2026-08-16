@@ -11,9 +11,23 @@
 //   prefix), `Some('"')`, and `Some('+')` all resolve to the *same*
 //   `ClipboardBackend` instance, so there's nothing to keep in sync.
 //
-// Numbered registers ("1-"9, populated by delete in real vim) don't exist
-// here yet -- there's no delete operator to populate them with. Nothing in
-// this module's shape rules this out later; it just isn't built now.
+// Numbered registers: "0" holds the most recent yank, "1"-"9" a ring of
+// the most recent deletes/changes (newest at "1", each older one shifted
+// up, "9" falling off the end) -- populated via `record_yank`/
+// `record_delete` rather than plain `write`, and only when no explicit
+// `"x` prefix was given (matching vim: `"ayw` only ever touches "a, never
+// "0). Simplified relative to real vim in one way: every delete/change
+// shifts the ring here, not just ones vim itself would call "big enough"
+// -- real vim instead routes a small (single-line, charwise) delete to
+// a separate "- register and leaves the "1-"9 ring untouched for those.
+// Skipped as an unlikely-to-matter nuance for a shell's own editor.
+//
+// `.`/`%`/`:` are read-only (vim's own last-inserted-text/current-
+// filename/last-Ex-command registers) -- set directly by the specific
+// code paths that produce each (see `set_last_insert`/`set_last_filename`/
+// `set_last_ex_command`'s own doc comments), never through the ordinary
+// `write` path (`ReadOnlyBackend::write` is a no-op, matching vim's own
+// "can't be assigned to" rule for these three).
 
 use std::collections::HashMap;
 use std::io::Write;
@@ -89,6 +103,20 @@ impl RegisterBackend for InMemoryBackend {
             self.0 = value;
         }
     }
+}
+
+// `.`/`%`/`:`'s own storage -- reads back whatever was last set directly
+// via `Registers::set_last_insert`/`set_last_filename`/`set_last_ex_command`;
+// `write` (the ordinary `"x`-prefixed operator path) is a deliberate
+// no-op, since none of these three can be assigned to in real vim either.
+#[derive(Default)]
+struct ReadOnlyBackend(RegisterValue);
+
+impl RegisterBackend for ReadOnlyBackend {
+    fn read(&self) -> RegisterValue {
+        self.0.clone()
+    }
+    fn write(&mut self, _value: RegisterValue, _append: bool) {}
 }
 
 struct BlackHoleBackend;
@@ -226,13 +254,25 @@ impl RegisterBackend for ClipboardBackend {
 /// paste buffers are global to the server rather than per-pane).
 pub struct Registers {
     named: HashMap<char, InMemoryBackend>,
+    numbered: HashMap<char, InMemoryBackend>,
     unnamed: ClipboardBackend,
     black_hole: BlackHoleBackend,
+    last_insert: ReadOnlyBackend,
+    last_filename: ReadOnlyBackend,
+    last_ex_command: ReadOnlyBackend,
 }
 
 impl Registers {
     pub fn new() -> Self {
-        Registers { named: HashMap::new(), unnamed: ClipboardBackend::new(), black_hole: BlackHoleBackend }
+        Registers {
+            named: HashMap::new(),
+            numbered: HashMap::new(),
+            unnamed: ClipboardBackend::new(),
+            black_hole: BlackHoleBackend,
+            last_insert: ReadOnlyBackend::default(),
+            last_filename: ReadOnlyBackend::default(),
+            last_ex_command: ReadOnlyBackend::default(),
+        }
     }
 
     /// `name` is exactly what a `"x` prefix typed, case and all (`None` for
@@ -248,8 +288,12 @@ impl Registers {
                 (self.named.entry(c.to_ascii_lowercase()).or_default(), true)
             }
             Some(c) if c.is_ascii_lowercase() => (self.named.entry(c).or_default(), false),
+            Some(c) if c.is_ascii_digit() => (self.numbered.entry(c).or_default(), false),
+            Some('.') => (&mut self.last_insert, false),
+            Some('%') => (&mut self.last_filename, false),
+            Some(':') => (&mut self.last_ex_command, false),
             // An unrecognized register name (shouldn't reach here --
-            // vimkeys.rs only ever admits a-z/A-Z/+/"/_ into
+            // vimkeys.rs only ever admits a-z/A-Z/0-9/+/"/_/./%/: into
             // `pending_register` in the first place) falls back to the
             // unnamed register rather than panicking.
             Some(_) => (&mut self.unnamed, false),
@@ -263,6 +307,59 @@ impl Registers {
     pub fn write(&mut self, name: Option<char>, value: RegisterValue) {
         let (backend, append) = self.resolve(name);
         backend.write(value, append);
+    }
+
+    /// `y{motion}`/`yy`/Visual `y`'s own register write: exactly `write`,
+    /// plus -- only when `name` is `None` (no explicit `"x` prefix, same
+    /// gate vim itself uses) -- also updates "0 to this same value.
+    pub fn record_yank(&mut self, name: Option<char>, value: RegisterValue) {
+        if name.is_none() {
+            self.numbered.insert('0', InMemoryBackend(value.clone()));
+        }
+        self.write(name, value);
+    }
+
+    /// `d{motion}`/`dd`/`x`/Visual `d`/`c{motion}`/`cc`'s own register
+    /// write: exactly `write`, plus -- only when `name` is `None` -- shifts
+    /// the "1-"9 ring up by one (discarding whatever was in "9") and
+    /// writes this value into the now-empty "1.
+    pub fn record_delete(&mut self, name: Option<char>, value: RegisterValue) {
+        if name.is_none() {
+            for i in (1..9).rev() {
+                let from = char::from_digit(i, 10).unwrap();
+                let to = char::from_digit(i + 1, 10).unwrap();
+                let shifted = self.numbered.get(&from).map(|b| b.read()).unwrap_or_default();
+                self.numbered.insert(to, InMemoryBackend(shifted));
+            }
+            self.numbered.insert('1', InMemoryBackend(value.clone()));
+        }
+        self.write(name, value);
+    }
+
+    /// `"."`: vim's own record of the text most recently typed during an
+    /// Insert-mode (or Replace-mode) session -- set by whatever consumer
+    /// owns a real typing loop at each of that loop's own exit points
+    /// (today: only `fileeditor.rs`'s `run_insert_mode`; the shell
+    /// prompt's own "Insert mode" is really just its ordinary core typing
+    /// loop, which nothing here hooks into -- see `KeyOutcome::
+    /// EnterReplace`'s own doc comment for the same "too central a loop to
+    /// touch for this" reasoning).
+    pub fn set_last_insert(&mut self, text: String) {
+        self.last_insert.0 = RegisterValue { text, shape: RegisterShape::Char };
+    }
+
+    /// `"%"`: vim's own record of the current file's name -- set whenever
+    /// a file editor session's own path becomes known or changes (opening
+    /// a named file, or `:w`/`:wq`/`:x` naming a previously-unnamed one).
+    pub fn set_last_filename(&mut self, name: String) {
+        self.last_filename.0 = RegisterValue { text: name, shape: RegisterShape::Char };
+    }
+
+    /// `":"`: vim's own record of the last Ex command line entered -- set
+    /// whenever one is read, successful or not (matching vim: a failed
+    /// `:nonsense` still becomes the new `":`).
+    pub fn set_last_ex_command(&mut self, cmd: String) {
+        self.last_ex_command.0 = RegisterValue { text: cmd, shape: RegisterShape::Char };
     }
 }
 
@@ -286,8 +383,12 @@ impl Registers {
     pub(crate) fn new_for_test() -> Self {
         Registers {
             named: HashMap::new(),
+            numbered: HashMap::new(),
             unnamed: ClipboardBackend { tool: None, fallback: RegisterValue::default() },
             black_hole: BlackHoleBackend,
+            last_insert: ReadOnlyBackend::default(),
+            last_filename: ReadOnlyBackend::default(),
+            last_ex_command: ReadOnlyBackend::default(),
         }
     }
 }
@@ -403,6 +504,74 @@ mod tests {
     fn flatten_line_shape_without_a_trailing_newline_still_flattens() {
         let v = line_val("foo\nbar");
         assert_eq!(v.flatten_to_single_line(), "foo bar");
+    }
+
+    #[test]
+    fn record_yank_populates_register_0_only_without_an_explicit_prefix() {
+        let mut regs = Registers::new_for_test();
+        regs.record_yank(None, char_val("yanked"));
+        assert_eq!(regs.read(Some('0')).text, "yanked");
+
+        regs.record_yank(Some('a'), char_val("into-a"));
+        assert_eq!(regs.read(Some('a')).text, "into-a");
+        // an explicit register target never touches "0
+        assert_eq!(regs.read(Some('0')).text, "yanked");
+    }
+
+    #[test]
+    fn record_delete_shifts_the_numbered_ring_without_an_explicit_prefix() {
+        let mut regs = Registers::new_for_test();
+        regs.record_delete(None, char_val("first"));
+        assert_eq!(regs.read(Some('1')).text, "first");
+
+        regs.record_delete(None, char_val("second"));
+        assert_eq!(regs.read(Some('1')).text, "second");
+        assert_eq!(regs.read(Some('2')).text, "first");
+
+        regs.record_delete(None, char_val("third"));
+        assert_eq!(regs.read(Some('1')).text, "third");
+        assert_eq!(regs.read(Some('2')).text, "second");
+        assert_eq!(regs.read(Some('3')).text, "first");
+    }
+
+    #[test]
+    fn record_delete_with_an_explicit_register_never_touches_the_ring() {
+        let mut regs = Registers::new_for_test();
+        regs.record_delete(None, char_val("in-the-ring"));
+        regs.record_delete(Some('a'), char_val("into-a"));
+        assert_eq!(regs.read(Some('a')).text, "into-a");
+        assert_eq!(regs.read(Some('1')).text, "in-the-ring");
+    }
+
+    #[test]
+    fn record_delete_drops_the_oldest_entry_past_9() {
+        let mut regs = Registers::new_for_test();
+        for i in 1..=10 {
+            regs.record_delete(None, char_val(&format!("del{i}")));
+        }
+        // "1 is the most recent, "9 is the oldest still kept; "del1" (the
+        // very first delete) has fallen off the end.
+        assert_eq!(regs.read(Some('1')).text, "del10");
+        assert_eq!(regs.read(Some('9')).text, "del2");
+    }
+
+    #[test]
+    fn read_only_registers_round_trip_what_was_set() {
+        let mut regs = Registers::new_for_test();
+        regs.set_last_insert("typed text".to_string());
+        assert_eq!(regs.read(Some('.')).text, "typed text");
+        regs.set_last_filename("/tmp/example.txt".to_string());
+        assert_eq!(regs.read(Some('%')).text, "/tmp/example.txt");
+        regs.set_last_ex_command("wq".to_string());
+        assert_eq!(regs.read(Some(':')).text, "wq");
+    }
+
+    #[test]
+    fn read_only_registers_reject_ordinary_writes() {
+        let mut regs = Registers::new_for_test();
+        regs.set_last_insert("original".to_string());
+        regs.write(Some('.'), char_val("should not stick"));
+        assert_eq!(regs.read(Some('.')).text, "original");
     }
 
     #[test]

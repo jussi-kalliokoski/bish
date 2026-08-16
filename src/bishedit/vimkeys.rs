@@ -1179,7 +1179,7 @@ impl VimKeys {
 
     fn feed_register(&mut self, key: Key) -> KeyOutcome {
         match key {
-            Key::Char(c @ ('a'..='z' | 'A'..='Z' | '+' | '"' | '_')) => {
+            Key::Char(c @ ('a'..='z' | 'A'..='Z' | '0'..='9' | '+' | '"' | '_' | '.' | '%' | ':')) => {
                 self.pending_register = Some(c);
                 // Deliberately *not* an `emit*` call: a register selection
                 // isn't itself a resolved command, it's a modifier waiting
@@ -2347,8 +2347,20 @@ mod tests {
     fn register_prefix_with_an_invalid_name_aborts() {
         let mut vk = VimKeys::new();
         assert_eq!(vk.feed(Key::Char('"')), KeyOutcome::Pending);
-        assert_eq!(vk.feed(Key::Char('1')), KeyOutcome::None);
+        assert_eq!(vk.feed(Key::Char('?')), KeyOutcome::None);
         assert_eq!(vk.feed(Key::Char('w')), KeyOutcome::Motion(Motion::WordForward, None));
+    }
+
+    #[test]
+    fn register_prefix_accepts_numbered_and_read_only_register_names() {
+        for c in ['0', '5', '9', '.', '%', ':'] {
+            let mut vk = VimKeys::new();
+            let keys = [Key::Char('"'), Key::Char(c), Key::Char('p')];
+            assert_eq!(
+                last(&mut vk, &keys),
+                KeyOutcome::Put { before: false, count: None, register: Some(c) }
+            );
+        }
     }
 
     #[test]

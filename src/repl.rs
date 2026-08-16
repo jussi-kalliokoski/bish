@@ -3142,7 +3142,7 @@ fn yank_selections(buf: &ScreenBuffer, registers: &mut Registers, register: Opti
             shape = RegisterShape::Line;
         }
     }
-    registers.write(register, RegisterValue { text, shape });
+    registers.record_yank(register, RegisterValue { text, shape });
 }
 
 // (window_id, is_the_current_window, that window's session's cwd) -- an
