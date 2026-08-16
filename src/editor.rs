@@ -1669,6 +1669,9 @@ fn run_line_normal_mode(
                                 break LineNormalExit::ToInsert;
                             }
                         }
+                        Op::Lowercase | Op::Uppercase | Op::CaseToggle => {
+                            case_operator_motion(&mut lb, motion, count, case_kind_for_op(op));
+                        }
                     },
                     KeyOutcome::OperatorLines(op, count, register) => match op {
                         Op::Yank => yank_lines(&lb, registers, count, register),
@@ -1677,6 +1680,7 @@ fn run_line_normal_mode(
                             delete_lines(&mut lb, registers, count, register);
                             break LineNormalExit::ToInsert;
                         }
+                        Op::Lowercase | Op::Uppercase | Op::CaseToggle => case_operator_lines(&mut lb, case_kind_for_op(op)),
                     },
                     KeyOutcome::Put { before, count, register } => put(&mut lb.ed.buf, &mut lb.ed.cursor, registers, before, count, register),
                     KeyOutcome::DeleteCharForward { count, register } => {
@@ -2106,6 +2110,58 @@ fn change_surround(lb: &mut LineBuffer, ch: char, replacement: char) {
     lb.ed.cursor = open_col;
 }
 
+fn case_kind_for_op(op: Op) -> motion::CaseKind {
+    match op {
+        Op::Lowercase => motion::CaseKind::Lower,
+        Op::Uppercase => motion::CaseKind::Upper,
+        Op::CaseToggle => motion::CaseKind::Toggle,
+        Op::Yank | Op::Delete | Op::Change => unreachable!("case_kind_for_op is only ever called for Op::Lowercase/Uppercase/CaseToggle"),
+    }
+}
+
+// `gu{motion}`/`gU{motion}`/`g~{motion}`: transforms the case of every
+// character in the motion's resolved range, leaving the cursor at the
+// range's own start -- same "operator leaves the cursor at `from`" rule
+// `delete_motion`'s own doc comment establishes. A no-op on a failed/
+// empty target, same as any other operator.
+fn case_operator_motion(lb: &mut LineBuffer, motion: motion::Motion, count: Option<usize>, kind: motion::CaseKind) {
+    let Some(range) = motion::motion_range(lb, motion, count) else {
+        return;
+    };
+    let (from_col, to_col) = (range.from.1, range.to.1);
+    match range.shape {
+        // A single-line buffer's own "linewise" is always the whole
+        // buffer -- same flattening `delete_motion`/`yank_lines` already
+        // establish for `yy`/`dd`.
+        motion::MotionShape::Linewise => case_operator_lines(lb, kind),
+        motion::MotionShape::Inclusive => {
+            let end = (to_col + 1).min(lb.ed.buf.len());
+            for c in lb.ed.buf[from_col..end].iter_mut() {
+                *c = motion::case_transform(*c, kind);
+            }
+            lb.ed.cursor = from_col.min(lb.ed.buf.len().saturating_sub(1));
+        }
+        motion::MotionShape::Exclusive => {
+            let end = to_col.min(lb.ed.buf.len());
+            for c in lb.ed.buf[from_col..end].iter_mut() {
+                *c = motion::case_transform(*c, kind);
+            }
+            lb.ed.cursor = from_col.min(lb.ed.buf.len().saturating_sub(1));
+        }
+    }
+}
+
+// `guu`/`gUU`/`g~~`: the same whole-line shorthand `yy`/`dd`/`cc` already
+// establish (see `delete_lines`'s own doc comment) -- transforms the
+// whole (single-line) buffer. No `count` parameter: unlike `dd`/`yy`,
+// there's never more than the one line for a wider count to reach.
+fn case_operator_lines(lb: &mut LineBuffer, kind: motion::CaseKind) {
+    for c in lb.ed.buf.iter_mut() {
+        *c = motion::case_transform(*c, kind);
+    }
+    lb.ed.cursor = 0;
+}
+
 // `~`: toggles the case of `count` characters starting at the cursor,
 // then advances the cursor to just past the last one toggled (clamped
 // to the buffer's own last character) -- see `KeyOutcome::ToggleCase`'s
@@ -2234,6 +2290,9 @@ fn run_one_shot_normal_command(ed: &mut LineEditor, registers: &mut Registers, o
                                 let motion = redirect_cw_to_ce(&lb, &motion);
                                 delete_motion(&mut lb, registers, motion, count, register);
                             }
+                            Op::Lowercase | Op::Uppercase | Op::CaseToggle => {
+                                case_operator_motion(&mut lb, motion, count, case_kind_for_op(op));
+                            }
                         }
                         break None;
                     }
@@ -2241,6 +2300,7 @@ fn run_one_shot_normal_command(ed: &mut LineEditor, registers: &mut Registers, o
                         match op {
                             Op::Yank => yank_lines(&lb, registers, count, register),
                             Op::Delete | Op::Change => delete_lines(&mut lb, registers, count, register),
+                            Op::Lowercase | Op::Uppercase | Op::CaseToggle => case_operator_lines(&mut lb, case_kind_for_op(op)),
                         }
                         break None;
                     }
@@ -2722,6 +2782,38 @@ mod tests {
         let mut lb = LineBuffer { ed: &mut ed, marks: &mut marks, selections: &mut selections };
         toggle_case(&mut lb, 1);
         assert_eq!(ed.buf.iter().collect::<String>(), "");
+    }
+
+    #[test]
+    fn case_operator_motion_uppercases_a_word_and_leaves_cursor_at_start() {
+        let mut ed = make_editor("foo bar", 0);
+        let mut marks = HashMap::new();
+        let mut selections: Vec<motion::MotionRange> = Vec::new();
+        let mut lb = LineBuffer { ed: &mut ed, marks: &mut marks, selections: &mut selections };
+        case_operator_motion(&mut lb, motion::Motion::WordForward, None, motion::CaseKind::Upper);
+        assert_eq!(ed.buf.iter().collect::<String>(), "FOO bar");
+        assert_eq!(ed.cursor, 0);
+    }
+
+    #[test]
+    fn case_operator_motion_on_a_failed_target_is_a_no_op() {
+        let mut ed = make_editor("abc", 0);
+        let mut marks = HashMap::new();
+        let mut selections: Vec<motion::MotionRange> = Vec::new();
+        let mut lb = LineBuffer { ed: &mut ed, marks: &mut marks, selections: &mut selections };
+        case_operator_motion(&mut lb, motion::Motion::Left, None, motion::CaseKind::Upper);
+        assert_eq!(ed.buf.iter().collect::<String>(), "abc");
+    }
+
+    #[test]
+    fn case_operator_lines_transforms_the_whole_buffer() {
+        let mut ed = make_editor("Foo Bar", 3);
+        let mut marks = HashMap::new();
+        let mut selections: Vec<motion::MotionRange> = Vec::new();
+        let mut lb = LineBuffer { ed: &mut ed, marks: &mut marks, selections: &mut selections };
+        case_operator_lines(&mut lb, motion::CaseKind::Toggle);
+        assert_eq!(ed.buf.iter().collect::<String>(), "fOO bAR");
+        assert_eq!(ed.cursor, 0);
     }
 
     #[test]

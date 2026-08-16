@@ -169,6 +169,19 @@ pub enum Op {
     /// motion target was invalid/empty, same as any other failed
     /// operator -- see `KeyOutcome::Operator`'s own doc comment on that).
     Change,
+    /// `gu{motion}`/`guu` -- lowercases every character in the target.
+    /// Reached via `feed_g` (see its own `u` arm), not `feed_fresh`
+    /// directly -- these three are vim's own `g`-prefixed operators, the
+    /// same tier as `gJ`, just taking a motion instead of resolving
+    /// immediately. Never writes a register (neither yanks nor deletes
+    /// anything); a caller's `Operator`/`OperatorLines` handling for
+    /// these three simply ignores whatever register accompanies them.
+    Lowercase,
+    /// `gU{motion}`/`gUU` -- uppercases every character in the target.
+    Uppercase,
+    /// `g~{motion}`/`g~~` -- toggles the case of every character in the
+    /// target (vim's own per-character `~`, generalized to a motion).
+    CaseToggle,
 }
 
 /// `KeyOutcome::AddSurround`'s own target: either a motion's resolved
@@ -192,6 +205,14 @@ impl Op {
             Op::Yank => 'y',
             Op::Delete => 'd',
             Op::Change => 'c',
+            // The character right after the `g` that armed these, not
+            // `g` itself -- `guu`/`gUU`/`g~~` repeat *that* key, matching
+            // real vim (mirrors `ys`'s own `s`-not-`y` trigger for the
+            // same reason: whatever key resolved the arming, not the
+            // leader in front of it).
+            Op::Lowercase => 'u',
+            Op::Uppercase => 'U',
+            Op::CaseToggle => '~',
         }
     }
 }
@@ -1171,6 +1192,15 @@ impl VimKeys {
             Key::Char('J') => self.emit_join(false),
             Key::Char('v') => self.emit_reselect_visual(),
             Key::Char('i') => self.emit_insert(InsertCmd::LastInsertPos),
+            // `gu`/`gU`/`g~`: arms a case-transform operator, resolved
+            // exactly like `y`/`d`/`c` from here on (an ordinary motion,
+            // a text object, or the double-tap line shorthand via each
+            // one's own `trigger_char`) -- `feed`'s own active-operator
+            // handling neither knows nor cares that these three don't
+            // write a register, so no changes were needed there.
+            Key::Char('u') => self.emit_operator(Op::Lowercase),
+            Key::Char('U') => self.emit_operator(Op::Uppercase),
+            Key::Char('~') => self.emit_operator(Op::CaseToggle),
             _ => self.abort(),
         }
     }
@@ -2764,6 +2794,50 @@ mod tests {
         let mut vk = VimKeys::new();
         let keys = [Key::Char('4'), Key::Char('~')];
         assert_eq!(last(&mut vk, &keys), KeyOutcome::ToggleCase { count: Some(4) });
+    }
+
+    #[test]
+    fn gu_gu_gtilde_arm_case_operators_resolved_by_a_motion() {
+        let mut vk = VimKeys::new();
+        let keys = [Key::Char('g'), Key::Char('u'), Key::Char('w')];
+        assert_eq!(last(&mut vk, &keys), KeyOutcome::Operator(Op::Lowercase, Motion::WordForward, None, None));
+        let mut vk = VimKeys::new();
+        let keys = [Key::Char('g'), Key::Char('U'), Key::Char('w')];
+        assert_eq!(last(&mut vk, &keys), KeyOutcome::Operator(Op::Uppercase, Motion::WordForward, None, None));
+        let mut vk = VimKeys::new();
+        let keys = [Key::Char('g'), Key::Char('~'), Key::Char('w')];
+        assert_eq!(last(&mut vk, &keys), KeyOutcome::Operator(Op::CaseToggle, Motion::WordForward, None, None));
+    }
+
+    #[test]
+    fn guu_guu_capital_and_gtilde_tilde_double_tap_resolve_to_operator_lines() {
+        let mut vk = VimKeys::new();
+        let keys = [Key::Char('g'), Key::Char('u'), Key::Char('u')];
+        assert_eq!(last(&mut vk, &keys), KeyOutcome::OperatorLines(Op::Lowercase, None, None));
+        let mut vk = VimKeys::new();
+        let keys = [Key::Char('g'), Key::Char('U'), Key::Char('U')];
+        assert_eq!(last(&mut vk, &keys), KeyOutcome::OperatorLines(Op::Uppercase, None, None));
+        let mut vk = VimKeys::new();
+        let keys = [Key::Char('g'), Key::Char('~'), Key::Char('~')];
+        assert_eq!(last(&mut vk, &keys), KeyOutcome::OperatorLines(Op::CaseToggle, None, None));
+    }
+
+    #[test]
+    fn gu_text_object_and_counts_combine_like_any_other_operator() {
+        let mut vk = VimKeys::new();
+        let keys = [Key::Char('2'), Key::Char('g'), Key::Char('U'), Key::Char('i'), Key::Char('w')];
+        assert_eq!(
+            last(&mut vk, &keys),
+            KeyOutcome::Operator(Op::Uppercase, Motion::TextObject(TextObjectKind::Word, false), Some(2), None)
+        );
+    }
+
+    #[test]
+    fn gu_invalid_continuation_aborts_and_does_not_leak() {
+        let mut vk = VimKeys::new();
+        let keys = [Key::Char('g'), Key::Char('u'), Key::Escape];
+        assert_eq!(last(&mut vk, &keys), KeyOutcome::None);
+        assert_eq!(vk.feed(Key::Char('w')), KeyOutcome::Motion(Motion::WordForward, None));
     }
 
     #[test]

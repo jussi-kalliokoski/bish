@@ -238,6 +238,7 @@ pub fn drive(session: &mut EditSession, rect: Rect, registers: &mut Registers, o
                         }
                     }
                 }
+                Op::Lowercase | Op::Uppercase | Op::CaseToggle => case_operator_motion(&mut session.buffer, m, count, case_kind_for_op(op)),
             },
             KeyOutcome::OperatorLines(op, count, register) => match op {
                 Op::Yank => editor::yank_lines(&session.buffer, registers, count, register),
@@ -249,6 +250,7 @@ pub fn drive(session: &mut EditSession, rect: Rect, registers: &mut Registers, o
                         InsertOutcome::Done => {}
                     }
                 }
+                Op::Lowercase | Op::Uppercase | Op::CaseToggle => case_operator_lines(&mut session.buffer, count, case_kind_for_op(op)),
             },
             KeyOutcome::Put { before, count, register } => put(&mut session.buffer, registers, before, count, register),
             KeyOutcome::DeleteCharForward { count, register } => delete_char_forward(&mut session.buffer, registers, count, register),
@@ -478,6 +480,82 @@ fn replace_char(buf: &mut TextBuffer, ch: char, count: usize) {
     let text: String = std::iter::repeat_n(ch, count).collect();
     buf.insert_text((row, col), &text);
     buf.set_cursor(row, col + count - 1);
+}
+
+fn case_kind_for_op(op: Op) -> motion::CaseKind {
+    match op {
+        Op::Lowercase => motion::CaseKind::Lower,
+        Op::Uppercase => motion::CaseKind::Upper,
+        Op::CaseToggle => motion::CaseKind::Toggle,
+        Op::Yank | Op::Delete | Op::Change => unreachable!("case_kind_for_op is only ever called for Op::Lowercase/Uppercase/CaseToggle"),
+    }
+}
+
+// `gu{motion}`/`gU{motion}`/`g~{motion}`'s shared range transform, and
+// `guu`/`gUU`/`g~~`'s own whole-line shorthand (via a `Linewise` range
+// built the same way `delete_lines`'s own doc comment describes).
+// `Linewise` is handled one row at a time -- each row's own content is
+// replaced in place (delete then reinsert *without* any embedded `\n`,
+// so line count is never at risk) -- rather than reusing the
+// `Inclusive`/`Exclusive` branch's single `extract_text`/`delete_range`/
+// `insert_text` round trip: that branch's text can safely carry the
+// embedded `\n`s it already had (never changes line count, since
+// `motion::extract_text`'s own boundary-crossing `\n`s exactly mirror
+// what's being put back), but `Linewise`'s own trailing `\n` after the
+// *last* line would, reinserted as-is, split off a spurious extra blank
+// line where the following content should have reattached instead
+// (`put`'s own Linewise branch sidesteps this differently, by wrapping a
+// stripped body in a fresh leading/trailing `\n` itself rather than
+// reusing one already baked into extracted text -- not reusable here
+// since this needs an exact in-place replace, not a shift-everything-
+// down paste).
+fn case_operator_range(buf: &mut TextBuffer, range: &motion::MotionRange, kind: motion::CaseKind) {
+    if range.shape == motion::MotionShape::Linewise {
+        for row in range.from.0..=range.to.0 {
+            let len = buf.line_len(row);
+            if len == 0 {
+                continue;
+            }
+            // `Inclusive`/`len - 1` (the line's own last real character),
+            // not `Exclusive`/`len` (one past it): `motion::extract_text`
+            // walks forward via `step_forward`, which never lands on
+            // that virtual past-the-end column at all (see its own doc
+            // comment) -- an `Exclusive` range built to stop *there*
+            // never actually satisfies the walk's own "reached `to`"
+            // check, so it silently keeps walking into the *next* line's
+            // content instead. `delete_range`'s own splice is unaffected
+            // (it's bounded by row indices, not this walk), but the text
+            // it returns would be, and this function reinserts exactly
+            // that text -- unlike most other callers, which only care
+            // about the splice succeeding, not the returned text being
+            // pixel-perfect.
+            let line_range = motion::MotionRange { shape: motion::MotionShape::Inclusive, from: (row, 0), to: (row, len - 1) };
+            let text = buf.delete_range(&line_range);
+            let transformed: String = text.chars().map(|c| motion::case_transform(c, kind)).collect();
+            buf.insert_text((row, 0), &transformed);
+        }
+        buf.set_cursor(range.from.0, 0);
+        return;
+    }
+    let text = buf.delete_range(range);
+    let transformed: String = text.chars().map(|c| motion::case_transform(c, kind)).collect();
+    buf.insert_text(range.from, &transformed);
+    buf.set_cursor(range.from.0, range.from.1);
+}
+
+fn case_operator_motion(buf: &mut TextBuffer, m: motion::Motion, count: Option<usize>, kind: motion::CaseKind) {
+    let Some(range) = motion::motion_range(buf, m, count) else {
+        return;
+    };
+    case_operator_range(buf, &range, kind);
+}
+
+fn case_operator_lines(buf: &mut TextBuffer, count: Option<usize>, kind: motion::CaseKind) {
+    let count = count.unwrap_or(1).max(1);
+    let (row, _) = buf.cursor();
+    let last = (row + count - 1).min(buf.line_count().saturating_sub(1));
+    let range = motion::MotionRange { shape: motion::MotionShape::Linewise, from: (row, 0), to: (last, 0) };
+    case_operator_range(buf, &range, kind);
 }
 
 // `~`: toggles the case of `count` characters starting at the cursor,
