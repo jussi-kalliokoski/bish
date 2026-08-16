@@ -3033,20 +3033,21 @@ fn run_normal_mode_navigation(
                 }
                 render_normal_mode_frame(&buf, rect, &vk, None);
             }
-            // `p`/`P`/`x`/`J`/`gJ`/`ys`/`ds`/`cs` are all a deliberate
-            // no-op here: `ScreenBuffer` is read-only by construction (a
-            // view over already-rendered scrollback, not an editable
-            // buffer -- see its own doc comment), and there's nothing
-            // else in this context that a put, delete, join, or surround
-            // edit could sensibly target. Falls into the same bucket as
-            // `Pending`/`None` below.
+            // `p`/`P`/`x`/`J`/`gJ`/`ys`/`ds`/`cs`/`r`/`~` are all a
+            // deliberate no-op here: `ScreenBuffer` is read-only by
+            // construction (a view over already-rendered scrollback, not
+            // an editable buffer -- see its own doc comment), and
+            // there's nothing else in this context that any of these
+            // mutations could sensibly target. Falls into the same
+            // bucket as `Pending`/`None` below.
             KeyOutcome::Put { .. }
             | KeyOutcome::DeleteCharForward { .. }
             | KeyOutcome::Join { .. }
             | KeyOutcome::AddSurround { .. }
             | KeyOutcome::DeleteSurround { .. }
             | KeyOutcome::ChangeSurround { .. }
-            | KeyOutcome::ReplaceChar { .. } => {
+            | KeyOutcome::ReplaceChar { .. }
+            | KeyOutcome::ToggleCase { .. } => {
                 render_normal_mode_frame(&buf, rect, &vk, None);
             }
             KeyOutcome::Window(cmd @ (WindowCmd::GotoFirstWindow | WindowCmd::GotoLastWindow), count) => {

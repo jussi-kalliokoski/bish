@@ -263,6 +263,7 @@ pub fn drive(session: &mut EditSession, rect: Rect, registers: &mut Registers, o
                 InsertOutcome::Detached => return Ok(EditOutcome::Detached),
                 InsertOutcome::Done => {}
             },
+            KeyOutcome::ToggleCase { count } => toggle_case(&mut session.buffer, count.unwrap_or(1).max(1)),
             // <C-w> is still vimkeys' own window-leader prefix here too
             // -- a harmless no-op, same reasoning as editor.rs's own
             // LineBuffer contexts: there's no window state to act on
@@ -477,6 +478,26 @@ fn replace_char(buf: &mut TextBuffer, ch: char, count: usize) {
     let text: String = std::iter::repeat_n(ch, count).collect();
     buf.insert_text((row, col), &text);
     buf.set_cursor(row, col + count - 1);
+}
+
+// `~`: toggles the case of `count` characters starting at the cursor,
+// then advances the cursor to just past the last one toggled -- see
+// editor.rs's own identical-in-spirit `toggle_case`. Builds the whole
+// toggled run as one string and swaps it in via a single `delete_range`/
+// `insert_text` pair rather than `TextBuffer` having any in-place
+// per-character mutation to loop over.
+fn toggle_case(buf: &mut TextBuffer, count: usize) {
+    let (row, col) = buf.cursor();
+    let len = buf.line_len(row);
+    if col >= len {
+        return;
+    }
+    let end_col = (col + count).min(len);
+    let text: String = (col..end_col).map(|c| motion::case_transform(buf.char_at(row, c).unwrap(), motion::CaseKind::Toggle)).collect();
+    let range = motion::MotionRange { shape: motion::MotionShape::Exclusive, from: (row, col), to: (row, end_col) };
+    buf.delete_range(&range);
+    buf.insert_text((row, col), &text);
+    buf.set_cursor(row, end_col.min(buf.line_len(row).saturating_sub(1)));
 }
 
 // `p`/`P`: a linewise register (`yy`, `dd`, ...) pastes as whole new

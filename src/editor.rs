@@ -1735,6 +1735,7 @@ fn run_line_normal_mode(
                     // rs`'s own `run_insert_mode` has its own dedicated
                     // loop instead, so `R` gets the real thing there.
                     KeyOutcome::EnterReplace => break LineNormalExit::ToInsert,
+                    KeyOutcome::ToggleCase { count } => toggle_case(&mut lb, count.unwrap_or(1).max(1)),
                     KeyOutcome::Window(..) | KeyOutcome::Join { .. } | KeyOutcome::Pending | KeyOutcome::None => {}
                 }
             }
@@ -2105,6 +2106,23 @@ fn change_surround(lb: &mut LineBuffer, ch: char, replacement: char) {
     lb.ed.cursor = open_col;
 }
 
+// `~`: toggles the case of `count` characters starting at the cursor,
+// then advances the cursor to just past the last one toggled (clamped
+// to the buffer's own last character) -- see `KeyOutcome::ToggleCase`'s
+// own doc comment. A no-op on an empty buffer.
+fn toggle_case(lb: &mut LineBuffer, count: usize) {
+    let (_, col) = lb.cursor();
+    let len = lb.ed.buf.len();
+    if col >= len {
+        return;
+    }
+    let end = (col + count).min(len);
+    for c in lb.ed.buf.iter_mut().take(end).skip(col) {
+        *c = motion::case_transform(*c, motion::CaseKind::Toggle);
+    }
+    lb.ed.cursor = end.min(len.saturating_sub(1));
+}
+
 // `r{ch}`: replaces `count` characters starting at the cursor with `ch`
 // each, staying in Normal mode. Refuses (no-op) if fewer than `count`
 // characters remain on the line from the cursor onward -- matches vim:
@@ -2261,6 +2279,10 @@ fn run_one_shot_normal_command(ed: &mut LineEditor, registers: &mut Registers, o
                     // afterward anyway, matching its own "do exactly one
                     // command, then resume typing" contract regardless.
                     KeyOutcome::EnterReplace => break None,
+                    KeyOutcome::ToggleCase { count } => {
+                        toggle_case(&mut lb, count.unwrap_or(1).max(1));
+                        break None;
+                    }
                     // EnterVisual: a no-op here too, same reasoning as
                     // run_line_normal_mode's own arm just above -- Ctrl-O
                     // is "do exactly one command, then resume typing"
@@ -2668,6 +2690,38 @@ mod tests {
         replace_char(&mut lb, 'x', 5);
         assert_eq!(ed.buf.iter().collect::<String>(), "abc");
         assert_eq!(ed.cursor, 1);
+    }
+
+    #[test]
+    fn toggle_case_toggles_count_characters_and_advances_past_them() {
+        let mut ed = make_editor("abcDEF", 0);
+        let mut marks = HashMap::new();
+        let mut selections: Vec<motion::MotionRange> = Vec::new();
+        let mut lb = LineBuffer { ed: &mut ed, marks: &mut marks, selections: &mut selections };
+        toggle_case(&mut lb, 3);
+        assert_eq!(ed.buf.iter().collect::<String>(), "ABCDEF");
+        assert_eq!(ed.cursor, 3);
+    }
+
+    #[test]
+    fn toggle_case_clamps_to_the_last_character_when_count_runs_past_the_end() {
+        let mut ed = make_editor("ab", 0);
+        let mut marks = HashMap::new();
+        let mut selections: Vec<motion::MotionRange> = Vec::new();
+        let mut lb = LineBuffer { ed: &mut ed, marks: &mut marks, selections: &mut selections };
+        toggle_case(&mut lb, 5);
+        assert_eq!(ed.buf.iter().collect::<String>(), "AB");
+        assert_eq!(ed.cursor, 1);
+    }
+
+    #[test]
+    fn toggle_case_is_a_no_op_on_an_empty_buffer() {
+        let mut ed = make_editor("", 0);
+        let mut marks = HashMap::new();
+        let mut selections: Vec<motion::MotionRange> = Vec::new();
+        let mut lb = LineBuffer { ed: &mut ed, marks: &mut marks, selections: &mut selections };
+        toggle_case(&mut lb, 1);
+        assert_eq!(ed.buf.iter().collect::<String>(), "");
     }
 
     #[test]

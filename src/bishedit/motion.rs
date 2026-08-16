@@ -116,6 +116,39 @@ fn is_word_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
 }
 
+/// `~`/`gu`/`gU`/`g~`'s own shared notion of "which way to change case" --
+/// a non-alphabetic character is always left untouched by every variant
+/// (vim's own rule: only letters have a case to change).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaseKind {
+    Lower,
+    Upper,
+    Toggle,
+}
+
+/// The single-character transform every case command (`~`'s own direct
+/// per-character toggle, and `gu{motion}`/`gU{motion}`/`g~{motion}`'s
+/// operator versions) is built from. ASCII-only, matching `r`'s own
+/// scope -- a full Unicode case fold can expand one character into
+/// several (`ß` -> `SS`), which wouldn't fit this "one char in, one char
+/// out" shape any of these commands assume; non-ASCII letters simply
+/// pass through unchanged.
+pub fn case_transform(c: char, kind: CaseKind) -> char {
+    match kind {
+        CaseKind::Lower => c.to_ascii_lowercase(),
+        CaseKind::Upper => c.to_ascii_uppercase(),
+        CaseKind::Toggle => {
+            if c.is_ascii_uppercase() {
+                c.to_ascii_lowercase()
+            } else if c.is_ascii_lowercase() {
+                c.to_ascii_uppercase()
+            } else {
+                c
+            }
+        }
+    }
+}
+
 fn classify(buf: &impl Buffer, line: usize, col: usize, big: bool) -> Class {
     let ch = match buf.char_at(line, col) {
         Some(c) => c,
@@ -2891,6 +2924,23 @@ mod tests {
         buf.set_cursor(0, 5);
         apply_motion(&mut buf, Motion::TextObject(TextObjectKind::Word, false), None);
         assert_eq!(buf.cursor(), (0, 4));
+    }
+
+    #[test]
+    fn case_transform_lower_upper_toggle() {
+        assert_eq!(case_transform('a', CaseKind::Lower), 'a');
+        assert_eq!(case_transform('A', CaseKind::Lower), 'a');
+        assert_eq!(case_transform('a', CaseKind::Upper), 'A');
+        assert_eq!(case_transform('A', CaseKind::Upper), 'A');
+        assert_eq!(case_transform('a', CaseKind::Toggle), 'A');
+        assert_eq!(case_transform('A', CaseKind::Toggle), 'a');
+    }
+
+    #[test]
+    fn case_transform_leaves_non_letters_untouched() {
+        assert_eq!(case_transform('5', CaseKind::Toggle), '5');
+        assert_eq!(case_transform(' ', CaseKind::Upper), ' ');
+        assert_eq!(case_transform('_', CaseKind::Lower), '_');
     }
 
     #[test]

@@ -143,6 +143,12 @@ pub enum KeyOutcome {
     /// one-time starting position/deletion, resolved once before an
     /// ordinary insert loop begins).
     EnterReplace,
+    /// `~`: toggles the case of `count` characters starting at the
+    /// cursor (default 1), then advances the cursor to just past the
+    /// last one toggled -- clamped to the line's own last character if
+    /// that would run past it, matching vim: never crosses a line break,
+    /// never extends past what's already there.
+    ToggleCase { count: Option<usize> },
     /// The key was consumed as part of an in-progress sequence (a count
     /// digit, or a prefix awaiting its next character); no motion yet.
     Pending,
@@ -1105,6 +1111,12 @@ impl VimKeys {
                 self.pending = Pending::None;
                 self.last_completed = std::mem::take(&mut self.current_input);
                 KeyOutcome::DeleteCharForward { count, register }
+            }
+            Key::Char('~') => {
+                let count = self.count.take();
+                self.pending = Pending::None;
+                self.last_completed = std::mem::take(&mut self.current_input);
+                KeyOutcome::ToggleCase { count }
             }
             Key::Char('p') => self.emit_put(false),
             Key::Char('P') => self.emit_put(true),
@@ -2743,6 +2755,15 @@ mod tests {
     fn capital_r_resolves_to_enter_replace() {
         let mut vk = VimKeys::new();
         assert_eq!(vk.feed(Key::Char('R')), KeyOutcome::EnterReplace);
+    }
+
+    #[test]
+    fn tilde_resolves_to_toggle_case_with_count() {
+        let mut vk = VimKeys::new();
+        assert_eq!(vk.feed(Key::Char('~')), KeyOutcome::ToggleCase { count: None });
+        let mut vk = VimKeys::new();
+        let keys = [Key::Char('4'), Key::Char('~')];
+        assert_eq!(last(&mut vk, &keys), KeyOutcome::ToggleCase { count: Some(4) });
     }
 
     #[test]
