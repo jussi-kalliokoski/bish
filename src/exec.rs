@@ -2268,11 +2268,15 @@ impl Shell {
         Box::new(std::io::stdin().lock())
     }
 
-    // Shared by `eval` and `source`/`.` -- both run source text in the
-    // CURRENT shell (unlike command substitution/subshells, which self-exec
-    // a child process), so `eval`/sourced scripts can set variables,
-    // functions, or cwd in the calling shell.
-    fn run_source_here(&mut self, src: &str, label: &str) -> ExecResult {
+    // Shared by `eval`, `source`/`.`, and main.rs's own config-file loading
+    // at interactive startup -- all three run source text in the CURRENT
+    // shell (unlike command substitution/subshells, which self-exec a
+    // child process), so `eval`/sourced scripts can set variables,
+    // functions, or cwd in the calling shell. pub(crate) rather than
+    // private: main.rs lives in a sibling module and needs this exact
+    // "read then run in place" semantics for $HOME/.config/bish/
+    // config.bash, not a subprocess.
+    pub(crate) fn run_source_here(&mut self, src: &str, label: &str) -> ExecResult {
         match crate::lexer::Lexer::new(src).tokenize() {
             Ok(toks) => match crate::parser::Parser::new(toks).parse_program() {
                 Ok(prog) => self.run_program(&prog),

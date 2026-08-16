@@ -42,12 +42,39 @@ fn main() {
     }
 
     if std::io::stdin().is_terminal() {
+        load_config(&mut shell);
         repl::run(shell);
     } else {
         let mut src = String::new();
         if std::io::stdin().read_to_string(&mut src).is_ok() {
             std::process::exit(run_source(&mut shell, &src));
         }
+    }
+}
+
+// Runs $HOME/.config/bish/config.bash, if present, in the shell's own
+// top-level scope before the interactive prompt starts -- matching
+// bash's own ~/.bashrc: vars/functions/aliases it sets persist into the
+// session that follows (Shell::run_source_here, shared with `source`/`.`
+// -- see its own doc comment for why this needs that exact "run in
+// place" semantics rather than a subprocess). Only reached from the
+// interactive branch below, not `-c`/a script path/piped stdin -- same
+// as bash not sourcing ~/.bashrc for a non-interactive run. A missing
+// file is the common case, not an error, so it's silently skipped; a
+// real read failure or a syntax error inside it is reported (through
+// the shell's own stderr sink, same as any other script error) but
+// doesn't stop the shell from reaching its prompt -- config.bash is
+// just this entry point; anything else the user wants loaded, they
+// `source` themselves from inside it.
+fn load_config(shell: &mut exec::Shell) {
+    let Some(home) = std::env::var_os("HOME") else { return };
+    let path = std::path::PathBuf::from(home).join(".config/bish/config.bash");
+    match std::fs::read_to_string(&path) {
+        Ok(src) => {
+            shell.run_source_here(&src, &path.display().to_string());
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => eprintln!("bish: {}: {}", path.display(), e),
     }
 }
 
