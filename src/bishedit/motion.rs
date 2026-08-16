@@ -663,6 +663,26 @@ fn word_object_range(buf: &impl Buffer, pos: (usize, usize), big: bool, around: 
     Some(MotionRange { shape: MotionShape::Inclusive, from: (line, start), to: (line, end) })
 }
 
+/// The raw positions of the two `quote` characters `quote_object_range`
+/// (below) would resolve around/inside -- factored out so `ds"`/`cs"` (see
+/// `surround_pair_positions`) can act on exactly the delimiter characters
+/// themselves, with none of `quote_object_range`'s own around-whitespace
+/// swallowing or inner-content trimming.
+fn quote_pair_positions(buf: &impl Buffer, pos: (usize, usize), quote: char) -> Option<((usize, usize), (usize, usize))> {
+    let (line, col) = pos;
+    let len = buf.line_len(line);
+    let positions: Vec<usize> = (0..len).filter(|&c| buf.char_at(line, c) == Some(quote)).collect();
+    let mut i = 0;
+    while i + 1 < positions.len() {
+        let (a, b) = (positions[i], positions[i + 1]);
+        if col <= b {
+            return Some(((line, a), (line, b)));
+        }
+        i += 2;
+    }
+    None
+}
+
 /// `i"`/`a"`/`i'`/`a'`/`` i` ``/`` a` `` -- same-line only, matching vim
 /// (string text objects never cross a line break). Pairs up every
 /// occurrence of `quote` on the line left to right (1st+2nd, 3rd+4th, ...)
@@ -670,20 +690,9 @@ fn word_object_range(buf: &impl Buffer, pos: (usize, usize), big: bool, around: 
 /// vim's own rule: inside a pair selects that pair, before all pairs
 /// selects the first, in the gap between two pairs selects the next one.
 fn quote_object_range(buf: &impl Buffer, pos: (usize, usize), quote: char, around: bool) -> Option<MotionRange> {
-    let (line, col) = pos;
+    let (line, _) = pos;
     let len = buf.line_len(line);
-    let positions: Vec<usize> = (0..len).filter(|&c| buf.char_at(line, c) == Some(quote)).collect();
-    let mut pair = None;
-    let mut i = 0;
-    while i + 1 < positions.len() {
-        let (a, b) = (positions[i], positions[i + 1]);
-        if col <= b {
-            pair = Some((a, b));
-            break;
-        }
-        i += 2;
-    }
-    let (a, b) = pair?;
+    let ((_, a), (_, b)) = quote_pair_positions(buf, pos, quote)?;
     if around {
         let mut end = b;
         if end < len.saturating_sub(1) && matches!(buf.char_at(line, end + 1), Some(c) if c.is_whitespace()) {
@@ -1007,6 +1016,138 @@ pub fn text_object_range(buf: &impl Buffer, kind: TextObjectKind, around: bool, 
         TextObjectKind::DoubleQuote => quote_object_range(buf, pos, '"', around),
         TextObjectKind::SingleQuote => quote_object_range(buf, pos, '\'', around),
         TextObjectKind::Backtick => quote_object_range(buf, pos, '`', around),
+    }
+}
+
+/// vim-surround's own `ds`/`cs` target character -- which pair-shaped
+/// `TextObjectKind` it names, restricted to the kinds that actually have a
+/// pair of single-character delimiters to search for (`w`/`s`/`p` aren't
+/// valid `ds`/`cs` targets in the real plugin either). `b`/`B`/`r` are its
+/// own mnemonic aliases for `(`/`{`/`[` respectively; either half of a pair
+/// (`(` or `)`) names the same kind, matching how `find_enclosing_pair`
+/// itself doesn't care which side of a pair `pos` is searched from.
+pub fn surround_target_kind(ch: char) -> Option<TextObjectKind> {
+    Some(match ch {
+        '(' | ')' | 'b' => TextObjectKind::Paren,
+        '{' | '}' | 'B' => TextObjectKind::Brace,
+        '[' | ']' | 'r' => TextObjectKind::Bracket,
+        '<' | '>' => TextObjectKind::Angle,
+        '"' => TextObjectKind::DoubleQuote,
+        '\'' => TextObjectKind::SingleQuote,
+        '`' => TextObjectKind::Backtick,
+        _ => return None,
+    })
+}
+
+/// The two delimiter strings vim-surround inserts for a given trigger
+/// character -- `ys`/`cs`'s own "which character did you press" half.
+/// Pressing an *opening* bracket (`(`/`{`/`[`/`<`, or their `b`/`B`/`r`
+/// mnemonics) pads its inner side with a space (`ysiw(` -> `( word )`);
+/// its own closing counterpart inserts tight (`ysiw)` -> `(word)`), and
+/// quotes/backtick never pad either way. Any other printable, non-
+/// alphanumeric character (`*`, `_`, `=`, ...) is its own literal,
+/// unpadded pair -- vim-surround's own generic fallback for a delimiter
+/// with no dedicated meaning. Letters beyond `b`/`B`/`r` are deliberately
+/// excluded from that fallback: unlike real vim-surround (which allows
+/// any single character), reserving them avoids a typo in an unsupported
+/// tag/function-call surround (`t`, `f`, ...) silently succeeding as a
+/// literal-letter wrap instead of being rejected.
+pub fn surround_delims(ch: char) -> Option<(String, String)> {
+    Some(match ch {
+        '(' | 'b' => ("( ".to_string(), " )".to_string()),
+        ')' => ("(".to_string(), ")".to_string()),
+        '{' | 'B' => ("{ ".to_string(), " }".to_string()),
+        '}' => ("{".to_string(), "}".to_string()),
+        '[' | 'r' => ("[ ".to_string(), " ]".to_string()),
+        ']' => ("[".to_string(), "]".to_string()),
+        '<' => ("< ".to_string(), " >".to_string()),
+        '>' => ("<".to_string(), ">".to_string()),
+        '"' => ("\"".to_string(), "\"".to_string()),
+        '\'' => ("'".to_string(), "'".to_string()),
+        '`' => ("`".to_string(), "`".to_string()),
+        c if c.is_ascii_graphic() && !c.is_ascii_alphanumeric() => (c.to_string(), c.to_string()),
+        _ => return None,
+    })
+}
+
+/// The raw `(open_pos, close_pos)` of the delimiter pair `ds`/`cs` should
+/// act on for a given target kind, found relative to the buffer's own
+/// current cursor -- `find_enclosing_pair` for the four bracket kinds
+/// (already nesting-aware and multi-line), `quote_pair_positions` for the
+/// three quote kinds (same-line only, matching vim). `Word`/`WordBig`/
+/// `Sentence`/`Paragraph` never reach here (see `surround_target_kind`'s
+/// own doc comment on why those characters never resolve to a kind at
+/// all), but are listed explicitly rather than via a wildcard so this
+/// stays exhaustive if `TextObjectKind` ever grows a new pair-like kind.
+pub fn surround_pair_positions(buf: &impl Buffer, kind: TextObjectKind) -> Option<((usize, usize), (usize, usize))> {
+    let pos = buf.cursor();
+    match kind {
+        TextObjectKind::Paren => find_enclosing_pair(buf, pos, '(', ')'),
+        TextObjectKind::Brace => find_enclosing_pair(buf, pos, '{', '}'),
+        TextObjectKind::Bracket => find_enclosing_pair(buf, pos, '[', ']'),
+        TextObjectKind::Angle => find_enclosing_pair(buf, pos, '<', '>'),
+        TextObjectKind::DoubleQuote => quote_pair_positions(buf, pos, '"'),
+        TextObjectKind::SingleQuote => quote_pair_positions(buf, pos, '\''),
+        TextObjectKind::Backtick => quote_pair_positions(buf, pos, '`'),
+        TextObjectKind::Word | TextObjectKind::WordBig | TextObjectKind::Sentence | TextObjectKind::Paragraph => None,
+    }
+}
+
+/// `ds{ch}`'s own deletion span for each side of a found pair -- just the
+/// delimiter character itself, except for a bracket kind (`(`/`{`/`[`/`<`),
+/// where vim-surround also strips one immediately-adjacent space on each
+/// side (its own "probably padding `ys` added" convention -- quotes never
+/// pad, so this never extends for them). Returns `(open_range, close_range)`
+/// as two single-position `MotionRange`s, ready for two `delete_range`
+/// calls -- close side first, so removing it can never shift the open
+/// side's own position. The one-char-of-content-is-just-a-shared-pad-space
+/// case (`( )`) is guarded so both sides don't independently claim the
+/// same position: the close side wins it, the open side falls back to
+/// just its own bracket.
+pub fn surround_delete_spans(buf: &impl Buffer, kind: TextObjectKind, open_pos: (usize, usize), close_pos: (usize, usize)) -> (MotionRange, MotionRange) {
+    let pads = matches!(kind, TextObjectKind::Paren | TextObjectKind::Brace | TextObjectKind::Bracket | TextObjectKind::Angle);
+    let mut open_to = open_pos;
+    let mut close_from = close_pos;
+    if pads {
+        if let Some(after_open) = step_forward(buf, open_pos)
+            && after_open != close_pos
+            && buf.char_at(after_open.0, after_open.1) == Some(' ')
+        {
+            open_to = after_open;
+        }
+        if let Some(before_close) = step_backward(buf, close_pos)
+            && before_close != open_pos
+            && buf.char_at(before_close.0, before_close.1) == Some(' ')
+        {
+            close_from = before_close;
+        }
+        if open_to == close_from {
+            open_to = open_pos;
+        }
+    }
+    (
+        MotionRange { shape: MotionShape::Inclusive, from: open_pos, to: open_to },
+        MotionRange { shape: MotionShape::Inclusive, from: close_from, to: close_pos },
+    )
+}
+
+/// Where `ys`/`yss`/Visual-`S` (`surround_delims`) inserts each half of a
+/// new surround pair around `range` -- the close delimiter's own position
+/// first (inserting there can never shift `from`, so callers are free to
+/// apply both insertions close-then-open with no further adjustment,
+/// regardless of shape). `Linewise` follows `yss`'s own definition (see
+/// `KeyOutcome::AddSurround`'s doc comment): first non-blank of the first
+/// line through the true end of the last line, ignoring leading
+/// indentation the way vim-surround's own linewise wrap does.
+pub fn surround_insert_points(buf: &impl Buffer, range: &MotionRange) -> ((usize, usize), (usize, usize)) {
+    match range.shape {
+        MotionShape::Linewise => {
+            let open_at = (range.from.0, first_non_blank(buf, range.from.0));
+            let close_at = (range.to.0, buf.line_len(range.to.0));
+            (open_at, close_at)
+        }
+        MotionShape::Inclusive => (range.from, (range.to.0, range.to.1 + 1)),
+        MotionShape::Exclusive => (range.from, range.to),
     }
 }
 
@@ -2750,5 +2891,140 @@ mod tests {
         buf.set_cursor(0, 5);
         apply_motion(&mut buf, Motion::TextObject(TextObjectKind::Word, false), None);
         assert_eq!(buf.cursor(), (0, 4));
+    }
+
+    #[test]
+    fn surround_target_kind_maps_every_trigger_including_aliases() {
+        assert_eq!(surround_target_kind('('), Some(TextObjectKind::Paren));
+        assert_eq!(surround_target_kind(')'), Some(TextObjectKind::Paren));
+        assert_eq!(surround_target_kind('b'), Some(TextObjectKind::Paren));
+        assert_eq!(surround_target_kind('{'), Some(TextObjectKind::Brace));
+        assert_eq!(surround_target_kind('}'), Some(TextObjectKind::Brace));
+        assert_eq!(surround_target_kind('B'), Some(TextObjectKind::Brace));
+        assert_eq!(surround_target_kind('['), Some(TextObjectKind::Bracket));
+        assert_eq!(surround_target_kind(']'), Some(TextObjectKind::Bracket));
+        assert_eq!(surround_target_kind('r'), Some(TextObjectKind::Bracket));
+        assert_eq!(surround_target_kind('<'), Some(TextObjectKind::Angle));
+        assert_eq!(surround_target_kind('>'), Some(TextObjectKind::Angle));
+        assert_eq!(surround_target_kind('"'), Some(TextObjectKind::DoubleQuote));
+        assert_eq!(surround_target_kind('\''), Some(TextObjectKind::SingleQuote));
+        assert_eq!(surround_target_kind('`'), Some(TextObjectKind::Backtick));
+        // `w`/`s`/`p` name text objects but never a surround target --
+        // ds/cs only ever act on pair-shaped delimiters.
+        assert_eq!(surround_target_kind('w'), None);
+        assert_eq!(surround_target_kind('s'), None);
+        assert_eq!(surround_target_kind('p'), None);
+    }
+
+    #[test]
+    fn surround_delims_pads_the_opening_bracket_variant_only() {
+        assert_eq!(surround_delims('('), Some(("( ".to_string(), " )".to_string())));
+        assert_eq!(surround_delims(')'), Some(("(".to_string(), ")".to_string())));
+        assert_eq!(surround_delims('b'), Some(("( ".to_string(), " )".to_string())));
+        assert_eq!(surround_delims('{'), Some(("{ ".to_string(), " }".to_string())));
+        assert_eq!(surround_delims('}'), Some(("{".to_string(), "}".to_string())));
+        assert_eq!(surround_delims('['), Some(("[ ".to_string(), " ]".to_string())));
+        assert_eq!(surround_delims(']'), Some(("[".to_string(), "]".to_string())));
+        assert_eq!(surround_delims('<'), Some(("< ".to_string(), " >".to_string())));
+        assert_eq!(surround_delims('>'), Some(("<".to_string(), ">".to_string())));
+    }
+
+    #[test]
+    fn surround_delims_quotes_and_literal_fallback_never_pad() {
+        assert_eq!(surround_delims('"'), Some(("\"".to_string(), "\"".to_string())));
+        assert_eq!(surround_delims('\''), Some(("'".to_string(), "'".to_string())));
+        assert_eq!(surround_delims('`'), Some(("`".to_string(), "`".to_string())));
+        assert_eq!(surround_delims('*'), Some(("*".to_string(), "*".to_string())));
+        assert_eq!(surround_delims('_'), Some(("_".to_string(), "_".to_string())));
+    }
+
+    #[test]
+    fn surround_delims_rejects_letters_and_whitespace() {
+        // Only `b`/`B`/`r` are recognized letter aliases -- anything else
+        // (a typo, or vim-surround's own unsupported tag/function-call
+        // triggers) is rejected rather than silently becoming a literal
+        // letter wrap.
+        assert_eq!(surround_delims('t'), None);
+        assert_eq!(surround_delims('x'), None);
+        assert_eq!(surround_delims(' '), None);
+    }
+
+    #[test]
+    fn surround_pair_positions_finds_the_enclosing_bracket_pair() {
+        let mut buf = TestBuffer::new("foo (bar) baz");
+        buf.set_cursor(0, 6);
+        assert_eq!(surround_pair_positions(&buf, TextObjectKind::Paren), Some(((0, 4), (0, 8))));
+        buf.set_cursor(0, 0);
+        assert_eq!(surround_pair_positions(&buf, TextObjectKind::Paren), None);
+    }
+
+    #[test]
+    fn surround_pair_positions_finds_the_enclosing_quote_pair() {
+        let mut buf = TestBuffer::new(r#"say "hello" now"#);
+        buf.set_cursor(0, 7);
+        assert_eq!(surround_pair_positions(&buf, TextObjectKind::DoubleQuote), Some(((0, 4), (0, 10))));
+    }
+
+    #[test]
+    fn surround_pair_positions_word_kinds_are_never_valid_surround_targets() {
+        let mut buf = TestBuffer::new("foo bar");
+        buf.set_cursor(0, 1);
+        assert_eq!(surround_pair_positions(&buf, TextObjectKind::Word), None);
+        assert_eq!(surround_pair_positions(&buf, TextObjectKind::Paragraph), None);
+    }
+
+    #[test]
+    fn surround_delete_spans_strips_one_adjacent_pad_space_for_brackets() {
+        let buf = TestBuffer::new("( foo )");
+        let (open, close) = surround_delete_spans(&buf, TextObjectKind::Paren, (0, 0), (0, 6));
+        assert_eq!(open, MotionRange { shape: MotionShape::Inclusive, from: (0, 0), to: (0, 1) });
+        assert_eq!(close, MotionRange { shape: MotionShape::Inclusive, from: (0, 5), to: (0, 6) });
+    }
+
+    #[test]
+    fn surround_delete_spans_leaves_a_tight_bracket_pair_untouched() {
+        let buf = TestBuffer::new("(foo)");
+        let (open, close) = surround_delete_spans(&buf, TextObjectKind::Paren, (0, 0), (0, 4));
+        assert_eq!(open, MotionRange { shape: MotionShape::Inclusive, from: (0, 0), to: (0, 0) });
+        assert_eq!(close, MotionRange { shape: MotionShape::Inclusive, from: (0, 4), to: (0, 4) });
+    }
+
+    #[test]
+    fn surround_delete_spans_never_strips_padding_for_quotes() {
+        let buf = TestBuffer::new(r#"" foo ""#);
+        let (open, close) = surround_delete_spans(&buf, TextObjectKind::DoubleQuote, (0, 0), (0, 6));
+        assert_eq!(open, MotionRange { shape: MotionShape::Inclusive, from: (0, 0), to: (0, 0) });
+        assert_eq!(close, MotionRange { shape: MotionShape::Inclusive, from: (0, 6), to: (0, 6) });
+    }
+
+    #[test]
+    fn surround_delete_spans_a_single_shared_pad_space_is_claimed_only_once() {
+        // "( )" -- the lone character between the brackets would
+        // otherwise be claimed as padding by both sides at once.
+        let buf = TestBuffer::new("( )");
+        let (open, close) = surround_delete_spans(&buf, TextObjectKind::Paren, (0, 0), (0, 2));
+        assert_eq!(open, MotionRange { shape: MotionShape::Inclusive, from: (0, 0), to: (0, 0) });
+        assert_eq!(close, MotionRange { shape: MotionShape::Inclusive, from: (0, 1), to: (0, 2) });
+    }
+
+    #[test]
+    fn surround_insert_points_inclusive_wraps_exactly_the_range() {
+        let buf = TestBuffer::new("foo bar baz");
+        let range = MotionRange { shape: MotionShape::Inclusive, from: (0, 4), to: (0, 6) };
+        assert_eq!(surround_insert_points(&buf, &range), ((0, 4), (0, 7)));
+    }
+
+    #[test]
+    fn surround_insert_points_exclusive_wraps_up_to_but_not_including_to() {
+        let buf = TestBuffer::new("foo bar baz");
+        let range = MotionRange { shape: MotionShape::Exclusive, from: (0, 4), to: (0, 7) };
+        assert_eq!(surround_insert_points(&buf, &range), ((0, 4), (0, 7)));
+    }
+
+    #[test]
+    fn surround_insert_points_linewise_skips_leading_indentation() {
+        let buf = TestBuffer::new("  foo bar");
+        let range = MotionRange { shape: MotionShape::Linewise, from: (0, 0), to: (0, 0) };
+        assert_eq!(surround_insert_points(&buf, &range), ((0, 2), (0, 9)));
     }
 }

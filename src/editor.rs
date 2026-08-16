@@ -1620,6 +1620,24 @@ fn run_line_normal_mode(
                 lb.selections.clear();
                 vk.end_visual(end_cursor);
             }
+            // `S`: vim-surround's own "wrap the selection" -- reads one
+            // more raw key directly (the delimiter character), the same
+            // way `:` elsewhere in this codebase reads a whole Ex command
+            // line; vimkeys.rs never sees this key at all, same reason
+            // `y`/`d`/`c`/`p` don't reach it either while Visual is
+            // active (see this loop's own module doc comment).
+            Key::Char('S') if vk.is_idle() && (vk.is_visual() || !selections.is_empty()) => {
+                let mut lb = LineBuffer { ed, marks: &mut marks, selections: &mut selections };
+                if let Some(range) = active_visual_range_line(&vk, &lb) {
+                    lb.selections.push(range);
+                }
+                let end_cursor = lb.cursor();
+                if let Some(Key::Char(ch)) = read_key_idle(on_idle)? {
+                    surround_selections(&mut lb, ch);
+                }
+                lb.selections.clear();
+                vk.end_visual(end_cursor);
+            }
             // Escape: cancels everything -- the active selection and
             // every previously committed one -- back to a clean Normal
             // mode with nothing yanked/deleted/replaced.
@@ -1700,6 +1718,9 @@ fn run_line_normal_mode(
                     // `Join` is a no-op for the same reason: `LineBuffer`
                     // is a single line by construction (see its own doc
                     // comment) -- there's never a next line to join with.
+                    KeyOutcome::AddSurround { target, ch } => add_surround(&mut lb, target, ch),
+                    KeyOutcome::DeleteSurround { ch } => delete_surround(&mut lb, ch),
+                    KeyOutcome::ChangeSurround { ch, replacement } => change_surround(&mut lb, ch, replacement),
                     KeyOutcome::Window(..) | KeyOutcome::Join { .. } | KeyOutcome::Pending | KeyOutcome::None => {}
                 }
             }
@@ -1918,6 +1939,35 @@ fn delete_selections(lb: &mut LineBuffer, registers: &mut Registers, register: O
     true
 }
 
+// Visual mode's own `S{ch}` -- vim-surround's own "wrap the selection"
+// command. Wraps every committed selection plus the active one in `ch`'s
+// own delimiter pair -- "wrap every one of these", the same multi-
+// selection extension `put_over_selections`' own doc comment already
+// establishes for `p`. Highest start-column first, so wrapping a
+// rightward selection never shifts a still-pending leftward one's own
+// columns. Cursor lands on the leftmost selection's own inserted open
+// delimiter, mirroring `add_surround`'s single-target convention.
+fn surround_selections(lb: &mut LineBuffer, ch: char) {
+    if lb.selections.is_empty() {
+        return;
+    }
+    let Some((open, close)) = motion::surround_delims(ch) else {
+        return;
+    };
+    let mut ranges = lb.selections.clone();
+    ranges.sort_by_key(|r| std::cmp::Reverse(r.from.1));
+    let mut leftmost_open_at = 0;
+    for range in &ranges {
+        let (open_at, close_at) = motion::surround_insert_points(lb, range);
+        let close_col = close_at.1.min(lb.ed.buf.len());
+        lb.ed.buf.splice(close_col..close_col, close.chars());
+        let open_col = open_at.1.min(lb.ed.buf.len());
+        lb.ed.buf.splice(open_col..open_col, open.chars());
+        leftmost_open_at = open_col;
+    }
+    lb.ed.cursor = leftmost_open_at;
+}
+
 // Visual mode's own `p`/`P` (both the same in Visual mode, matching real
 // vim: there's no "before/after the cursor" when replacing a selected
 // range, only "instead of it"): replaces *every* selection with the same
@@ -1962,6 +2012,94 @@ fn put_over_selections(lb: &mut LineBuffer, registers: &mut Registers, register:
     // doc comment already establishes for a single `p`.
     lb.ed.cursor = (leftmost_insert_at + insert_chars.len()).saturating_sub(1).min(lb.ed.buf.len().saturating_sub(1));
     true
+}
+
+// `ys{motion}`/`yss`'s own target resolution: a motion resolves exactly
+// like any other operator target (`motion::motion_range`, `None` on a
+// failed/empty one -- same silent no-op `yank_motion`/`delete_motion`
+// already give a failed target); `yss` needs no such lookup at all --
+// `LineBuffer` is always exactly one line (see its own doc comment), so
+// "the current line" is simply the whole buffer, linewise, every time
+// (unlike `TextBuffer`'s own multi-line version of this same target --
+// see `fileeditor.rs`'s own `resolve_surround_target` -- `count` has
+// nothing further to extend into here).
+fn resolve_surround_target(lb: &mut LineBuffer, target: &vimkeys::SurroundTarget) -> Option<motion::MotionRange> {
+    match target {
+        vimkeys::SurroundTarget::Motion(m, count) => motion::motion_range(lb, m.clone(), *count),
+        vimkeys::SurroundTarget::Line(_) => Some(motion::MotionRange { shape: motion::MotionShape::Linewise, from: (0, 0), to: (0, 0) }),
+    }
+}
+
+// `ys{motion}{ch}`/`yss{ch}`: wraps `target`'s resolved range in `ch`'s
+// own delimiter pair. Splices the close delimiter in first, then the
+// open one -- inserting at/after `close_at` can never shift `open_at`'s
+// own column, so no further adjustment is needed regardless of shape
+// (see `motion::surround_insert_points`'s own doc comment). Cursor lands
+// on the inserted open delimiter's own first character, matching
+// vim-surround.
+fn add_surround(lb: &mut LineBuffer, target: vimkeys::SurroundTarget, ch: char) {
+    let Some(range) = resolve_surround_target(lb, &target) else {
+        return;
+    };
+    let Some((open, close)) = motion::surround_delims(ch) else {
+        return;
+    };
+    let (open_at, close_at) = motion::surround_insert_points(lb, &range);
+    let close_col = close_at.1.min(lb.ed.buf.len());
+    lb.ed.buf.splice(close_col..close_col, close.chars());
+    let open_col = open_at.1.min(lb.ed.buf.len());
+    lb.ed.buf.splice(open_col..open_col, open.chars());
+    lb.ed.cursor = open_col;
+}
+
+// `ds{ch}`: removes the nearest enclosing pair named by `ch`, plus any
+// padding `motion::surround_delete_spans` decides to strip -- close side
+// first, so removing it can never shift the open side's own column. A
+// no-op if `ch` doesn't name a valid target or no such pair encloses the
+// cursor.
+fn delete_surround(lb: &mut LineBuffer, ch: char) {
+    let Some(kind) = motion::surround_target_kind(ch) else {
+        return;
+    };
+    let Some((open_pos, close_pos)) = motion::surround_pair_positions(lb, kind) else {
+        return;
+    };
+    let (open_range, close_range) = motion::surround_delete_spans(lb, kind, open_pos, close_pos);
+    delete_char_range_line(lb, &close_range);
+    delete_char_range_line(lb, &open_range);
+    lb.ed.cursor = open_range.from.1.min(lb.ed.buf.len().saturating_sub(1));
+}
+
+// `cs{ch}{replacement}`: like `delete_surround`, but replaces the found
+// pair's own two delimiter characters with `replacement`'s pair instead
+// of removing them -- never touches any padding around them (unlike
+// `ds`).
+fn change_surround(lb: &mut LineBuffer, ch: char, replacement: char) {
+    let Some(kind) = motion::surround_target_kind(ch) else {
+        return;
+    };
+    let Some((open_pos, close_pos)) = motion::surround_pair_positions(lb, kind) else {
+        return;
+    };
+    let Some((open, close)) = motion::surround_delims(replacement) else {
+        return;
+    };
+    let close_col = close_pos.1;
+    lb.ed.buf.splice(close_col..close_col + 1, close.chars());
+    let open_col = open_pos.1;
+    lb.ed.buf.splice(open_col..open_col + 1, open.chars());
+    lb.ed.cursor = open_col;
+}
+
+// A single- or two-character-wide (`motion::surround_delete_spans`'s own
+// `Inclusive` ranges, always same-line for `LineBuffer`) removal --
+// `delete_surround`'s own primitive, kept separate from `delete_motion`
+// above since it never writes a register (`ds` doesn't yank, matching
+// vim-surround).
+fn delete_char_range_line(lb: &mut LineBuffer, range: &motion::MotionRange) {
+    let from = range.from.1.min(lb.ed.buf.len());
+    let to = (range.to.1 + 1).min(lb.ed.buf.len()).max(from);
+    lb.ed.buf.drain(from..to);
 }
 
 // vim's own "`cw`/`cW` act like `ce`/`cE`" rule: when the cursor sits on
@@ -2068,6 +2206,18 @@ fn run_one_shot_normal_command(ed: &mut LineEditor, registers: &mut Registers, o
                         if !deleted.is_empty() {
                             registers.write(register, RegisterValue { text: deleted, shape: RegisterShape::Char });
                         }
+                        break None;
+                    }
+                    KeyOutcome::AddSurround { target, ch } => {
+                        add_surround(&mut lb, target, ch);
+                        break None;
+                    }
+                    KeyOutcome::DeleteSurround { ch } => {
+                        delete_surround(&mut lb, ch);
+                        break None;
+                    }
+                    KeyOutcome::ChangeSurround { ch, replacement } => {
+                        change_surround(&mut lb, ch, replacement);
                         break None;
                     }
                     // EnterVisual: a no-op here too, same reasoning as
@@ -2327,6 +2477,134 @@ mod tests {
         let value = registers.read(None);
         assert_eq!(value.text, "foo bar\n");
         assert_eq!(value.shape, RegisterShape::Line);
+    }
+
+    #[test]
+    fn add_surround_wraps_a_motion_target_with_padding() {
+        let mut ed = make_editor("word", 0);
+        let mut marks = HashMap::new();
+        let mut selections: Vec<motion::MotionRange> = Vec::new();
+        let mut lb = LineBuffer { ed: &mut ed, marks: &mut marks, selections: &mut selections };
+        add_surround(&mut lb, vimkeys::SurroundTarget::Motion(motion::Motion::TextObject(motion::TextObjectKind::Word, false), None), '(');
+        assert_eq!(ed.buf.iter().collect::<String>(), "( word )");
+        assert_eq!(ed.cursor, 0);
+    }
+
+    #[test]
+    fn add_surround_tight_closing_variant_inserts_no_padding() {
+        let mut ed = make_editor("word", 0);
+        let mut marks = HashMap::new();
+        let mut selections: Vec<motion::MotionRange> = Vec::new();
+        let mut lb = LineBuffer { ed: &mut ed, marks: &mut marks, selections: &mut selections };
+        add_surround(&mut lb, vimkeys::SurroundTarget::Motion(motion::Motion::TextObject(motion::TextObjectKind::Word, false), None), ')');
+        assert_eq!(ed.buf.iter().collect::<String>(), "(word)");
+    }
+
+    #[test]
+    fn add_surround_yss_line_target_skips_leading_indentation() {
+        let mut ed = make_editor("  foo bar", 0);
+        let mut marks = HashMap::new();
+        let mut selections: Vec<motion::MotionRange> = Vec::new();
+        let mut lb = LineBuffer { ed: &mut ed, marks: &mut marks, selections: &mut selections };
+        add_surround(&mut lb, vimkeys::SurroundTarget::Line(None), '"');
+        assert_eq!(ed.buf.iter().collect::<String>(), "  \"foo bar\"");
+    }
+
+    #[test]
+    fn add_surround_on_a_failed_motion_target_is_a_no_op() {
+        let mut ed = make_editor("abc", 0);
+        let mut marks = HashMap::new();
+        let mut selections: Vec<motion::MotionRange> = Vec::new();
+        let mut lb = LineBuffer { ed: &mut ed, marks: &mut marks, selections: &mut selections };
+        add_surround(&mut lb, vimkeys::SurroundTarget::Motion(motion::Motion::Left, None), '(');
+        assert_eq!(ed.buf.iter().collect::<String>(), "abc");
+    }
+
+    #[test]
+    fn delete_surround_removes_the_pair_and_its_padding() {
+        let mut ed = make_editor("( word )", 3);
+        let mut marks = HashMap::new();
+        let mut selections: Vec<motion::MotionRange> = Vec::new();
+        let mut lb = LineBuffer { ed: &mut ed, marks: &mut marks, selections: &mut selections };
+        delete_surround(&mut lb, '(');
+        assert_eq!(ed.buf.iter().collect::<String>(), "word");
+        assert_eq!(ed.cursor, 0);
+    }
+
+    #[test]
+    fn delete_surround_quote_pair_leaves_no_padding_to_strip() {
+        let mut ed = make_editor(r#""word""#, 3);
+        let mut marks = HashMap::new();
+        let mut selections: Vec<motion::MotionRange> = Vec::new();
+        let mut lb = LineBuffer { ed: &mut ed, marks: &mut marks, selections: &mut selections };
+        delete_surround(&mut lb, '"');
+        assert_eq!(ed.buf.iter().collect::<String>(), "word");
+    }
+
+    #[test]
+    fn delete_surround_with_no_enclosing_pair_is_a_no_op() {
+        let mut ed = make_editor("word", 0);
+        let mut marks = HashMap::new();
+        let mut selections: Vec<motion::MotionRange> = Vec::new();
+        let mut lb = LineBuffer { ed: &mut ed, marks: &mut marks, selections: &mut selections };
+        delete_surround(&mut lb, '(');
+        assert_eq!(ed.buf.iter().collect::<String>(), "word");
+    }
+
+    #[test]
+    fn change_surround_replaces_the_delimiters_with_the_new_pair() {
+        let mut ed = make_editor(r#""word""#, 3);
+        let mut marks = HashMap::new();
+        let mut selections: Vec<motion::MotionRange> = Vec::new();
+        let mut lb = LineBuffer { ed: &mut ed, marks: &mut marks, selections: &mut selections };
+        change_surround(&mut lb, '"', '\'');
+        assert_eq!(ed.buf.iter().collect::<String>(), "'word'");
+        assert_eq!(ed.cursor, 0);
+    }
+
+    #[test]
+    fn change_surround_to_a_padded_bracket_variant() {
+        let mut ed = make_editor("(word)", 3);
+        let mut marks = HashMap::new();
+        let mut selections: Vec<motion::MotionRange> = Vec::new();
+        let mut lb = LineBuffer { ed: &mut ed, marks: &mut marks, selections: &mut selections };
+        change_surround(&mut lb, '(', '{');
+        assert_eq!(ed.buf.iter().collect::<String>(), "{ word }");
+    }
+
+    #[test]
+    fn change_surround_with_no_enclosing_pair_is_a_no_op() {
+        let mut ed = make_editor("word", 0);
+        let mut marks = HashMap::new();
+        let mut selections: Vec<motion::MotionRange> = Vec::new();
+        let mut lb = LineBuffer { ed: &mut ed, marks: &mut marks, selections: &mut selections };
+        change_surround(&mut lb, '(', '{');
+        assert_eq!(ed.buf.iter().collect::<String>(), "word");
+    }
+
+    #[test]
+    fn surround_selections_wraps_every_committed_selection() {
+        let mut ed = make_editor("foo bar baz", 0);
+        let mut marks = HashMap::new();
+        let mut selections: Vec<motion::MotionRange> = vec![
+            motion::MotionRange { shape: motion::MotionShape::Inclusive, from: (0, 0), to: (0, 2) },
+            motion::MotionRange { shape: motion::MotionShape::Inclusive, from: (0, 8), to: (0, 10) },
+        ];
+        let mut lb = LineBuffer { ed: &mut ed, marks: &mut marks, selections: &mut selections };
+        surround_selections(&mut lb, ']');
+        assert_eq!(ed.buf.iter().collect::<String>(), "[foo] bar [baz]");
+        // cursor lands on the leftmost selection's own open delimiter
+        assert_eq!(ed.cursor, 0);
+    }
+
+    #[test]
+    fn surround_selections_is_a_no_op_when_nothing_is_selected() {
+        let mut ed = make_editor("foo bar", 0);
+        let mut marks = HashMap::new();
+        let mut selections: Vec<motion::MotionRange> = Vec::new();
+        let mut lb = LineBuffer { ed: &mut ed, marks: &mut marks, selections: &mut selections };
+        surround_selections(&mut lb, '(');
+        assert_eq!(ed.buf.iter().collect::<String>(), "foo bar");
     }
 
     #[test]

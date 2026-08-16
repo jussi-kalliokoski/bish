@@ -97,6 +97,36 @@ pub enum KeyOutcome {
     /// returns `Some`, move the cursor there; a no-op at either end of the
     /// list.
     Jump { forward: bool },
+    /// `ys{motion}{ch}` / `yss{ch}` / Visual-mode `S{ch}` -- vim-surround's
+    /// own "wrap this in a delimiter pair" command. `target` names what to
+    /// wrap (a resolved motion's own range, or -- `yss`'s own shorthand --
+    /// the current line from its first non-blank through its true end);
+    /// `ch` is the delimiter character that was actually pressed (`(` and
+    /// `)` both name the same pair but insert differently padded --
+    /// `motion::surround_delims` resolves that). Visual-mode `S` never
+    /// reaches this crate as a `Motion`-typed target at all (same reason
+    /// `EnterVisual`'s own doc comment gives for `y`/`d`/`c`/`p` there): a
+    /// caller that intercepts `S` itself builds a `SurroundTarget::Motion`
+    /// wrapping a synthetic range instead, or applies the wrap directly.
+    /// Not an `Operator`: nothing here is a real motion target lookup the
+    /// way `y{motion}` is -- resolving one still needs one more raw key
+    /// (this delimiter character) that no `Motion`/`Op` alone carries, so
+    /// this outcome only appears once that key has already been read (see
+    /// `Pending::SurroundChar`'s own doc comment for how the two-stage
+    /// resolution gets there).
+    AddSurround { target: SurroundTarget, ch: char },
+    /// `ds{ch}`: removes the nearest enclosing delimiter pair named by
+    /// `ch` (`motion::surround_target_kind`'s own doc comment lists which
+    /// characters name which pair), stripping one adjacent padding space
+    /// too for a bracket pair (quotes never pad -- see `motion::
+    /// surround_delete_spans`'s own doc comment). A no-op if no such pair
+    /// encloses the cursor, or if `ch` doesn't name a valid target.
+    DeleteSurround { ch: char },
+    /// `cs{ch}{replacement}`: like `DeleteSurround`, but replaces the
+    /// found pair's own two delimiter characters with `replacement`'s
+    /// pair (`motion::surround_delims`) instead of removing them --
+    /// unlike `ds`, never touches any padding around them.
+    ChangeSurround { ch: char, replacement: char },
     /// The key was consumed as part of an in-progress sequence (a count
     /// digit, or a prefix awaiting its next character); no motion yet.
     Pending,
@@ -117,6 +147,19 @@ pub enum Op {
     /// motion target was invalid/empty, same as any other failed
     /// operator -- see `KeyOutcome::Operator`'s own doc comment on that).
     Change,
+}
+
+/// `KeyOutcome::AddSurround`'s own target: either a motion's resolved
+/// range (`ys{motion}`, carrying whatever count applied to it, mirroring
+/// `KeyOutcome::Operator`'s own `(Motion, Option<usize>)` shape) or the
+/// current line (`yss`'s own count -- `yss`/`2yss` wrap `count` lines
+/// starting at the cursor, the same "this operator, this line, `count`
+/// of them" shape `OperatorLines`'s own doc comment already establishes
+/// for `yy`/`dd`/`cc`).
+#[derive(Debug, Clone, PartialEq)]
+pub enum SurroundTarget {
+    Motion(Motion, Option<usize>),
+    Line(Option<usize>),
 }
 
 impl Op {
@@ -301,6 +344,21 @@ enum Pending {
     // second character (`[(`, `])`, `[{`, `]}`, `[[`, `]]`, `[]`, `][`).
     BracketOpen,
     BracketClose,
+    // `ys{motion}`/`yss` -- awaiting the one delimiter character after
+    // the target (a motion, or `yss`'s own current-line shorthand) has
+    // already resolved. Reached via `feed`'s own `surround_armed`
+    // handling, not through `feed_inner`'s ordinary dispatch table (see
+    // that field's own doc comment) -- but still routed through
+    // `feed_inner` like every other `Pending` variant once it's set, for
+    // one uniform place that turns "the next key" into a resolved
+    // outcome.
+    SurroundChar { target: SurroundTarget },
+    // `ds` -- awaiting its one target character (`ds(`, `ds"`, ...).
+    DeleteSurroundTarget,
+    // `cs` -- awaiting its target character.
+    ChangeSurroundTarget,
+    // `cs{ch}` -- awaiting the replacement character.
+    ChangeSurroundChar { ch: char },
     Z,
     Window,
     // <C-w>g -- awaiting the second 'g' of <C-w>gg, mirroring plain `gg`'s
@@ -371,6 +429,17 @@ pub struct VimKeys {
     // `feed`'s own doc comment for how these two combine.
     active_operator: Option<Op>,
     operator_count: Option<usize>,
+    // `ys{motion}`/`yss` -- set the moment `s` is seen right where `y`'s
+    // own double-tap (`yy`) or a motion would otherwise be expected,
+    // *without* touching `active_operator` itself (stays `Op::Yank`, so a
+    // stray second `y` here still resolves as an ordinary `yy` via the
+    // existing double-tap check). Consulted by `feed`'s own active-
+    // operator resolution to route what comes next -- an ordinary motion/
+    // text object, or `yss`'s own second `s` -- into `Pending::
+    // SurroundChar` (one more raw key, the delimiter) instead of an
+    // ordinary `Operator`/`OperatorLines`. See `KeyOutcome::AddSurround`'s
+    // own doc comment for the outcome this eventually produces.
+    surround_armed: bool,
     // `"x` -- the register the *next* operator or put should target.
     // Survives across `Pending::Register` resolving back to
     // `Pending::None` (unlike `count`/`pending`, a register selection
@@ -426,6 +495,7 @@ impl VimKeys {
             last_search: None,
             active_operator: None,
             operator_count: None,
+            surround_armed: false,
             pending_register: None,
             visual: None,
             last_visual: None,
@@ -574,6 +644,45 @@ impl VimKeys {
         // normal motion-resolution dispatch below, so it's checked first
         // and short-circuits it entirely.
         if matches!(self.pending, Pending::None) {
+            // `ys{motion}`/`yss`: `s`, seen right where `y`'s own
+            // double-tap or a motion would otherwise be expected. First
+            // press arms `surround_armed` (still `Op::Yank` underneath,
+            // so nothing else changes yet); a second `s` right after
+            // that is `yss` itself, resolved immediately here since it
+            // has no motion to wait for. See `surround_armed`'s own doc
+            // comment for how this and the resolution path below (after
+            // an ordinary motion resolves instead) connect.
+            if let (Some(Op::Yank), Key::Char('s')) = (self.active_operator, key) {
+                if self.surround_armed {
+                    let count = combine_counts(self.operator_count.take(), self.count.take());
+                    self.active_operator = None;
+                    self.surround_armed = false;
+                    self.pending_register = None;
+                    self.pending = Pending::SurroundChar { target: SurroundTarget::Line(count) };
+                    self.last_completed = std::mem::take(&mut self.current_input);
+                    return KeyOutcome::Pending;
+                }
+                self.surround_armed = true;
+                return KeyOutcome::Pending;
+            }
+            // `ds`/`cs`: `s`, seen right after `d`/`c` armed -- unlike
+            // `ys`, these never take a motion at all, so they resolve
+            // straight into their own dedicated `Pending` states instead
+            // of reusing the active-operator machinery any further.
+            if let (Some(Op::Delete), Key::Char('s')) = (self.active_operator, key) {
+                self.active_operator = None;
+                self.operator_count = None;
+                self.pending_register = None;
+                self.pending = Pending::DeleteSurroundTarget;
+                return KeyOutcome::Pending;
+            }
+            if let (Some(Op::Change), Key::Char('s')) = (self.active_operator, key) {
+                self.active_operator = None;
+                self.operator_count = None;
+                self.pending_register = None;
+                self.pending = Pending::ChangeSurroundTarget;
+                return KeyOutcome::Pending;
+            }
             if let (Some(op), Key::Char(c)) = (self.active_operator, key) {
                 if c == op.trigger_char() {
                     let count = combine_counts(self.operator_count.take(), self.count.take());
@@ -602,6 +711,16 @@ impl VimKeys {
                 KeyOutcome::Motion(m, motion_count) => {
                     self.active_operator = None;
                     let count = combine_counts(self.operator_count.take(), motion_count);
+                    // `ys{motion}`: the motion just resolved the *target*,
+                    // not the whole command -- one more raw key (the
+                    // delimiter) is still needed, so this becomes a
+                    // `Pending::SurroundChar` instead of an `Operator`.
+                    if self.surround_armed {
+                        self.surround_armed = false;
+                        self.pending_register = None;
+                        self.pending = Pending::SurroundChar { target: SurroundTarget::Motion(m, count) };
+                        return KeyOutcome::Pending;
+                    }
                     let register = self.pending_register.take();
                     KeyOutcome::Operator(op, m, count, register)
                 }
@@ -617,6 +736,7 @@ impl VimKeys {
                     self.active_operator = None;
                     self.operator_count = None;
                     self.pending_register = None;
+                    self.surround_armed = false;
                     KeyOutcome::None
                 }
             };
@@ -648,6 +768,10 @@ impl VimKeys {
             Pending::TextObject { around } => self.feed_text_object(key, around),
             Pending::BracketOpen => self.feed_bracket_open(key),
             Pending::BracketClose => self.feed_bracket_close(key),
+            Pending::SurroundChar { target } => self.feed_surround_char(key, target),
+            Pending::DeleteSurroundTarget => self.feed_delete_surround_target(key),
+            Pending::ChangeSurroundTarget => self.feed_change_surround_target(key),
+            Pending::ChangeSurroundChar { ch } => self.feed_change_surround_char(key, ch),
             Pending::Z => self.feed_z(key),
             Pending::Window => self.feed_window(key),
             Pending::WindowG => self.feed_window_g(key),
@@ -1064,6 +1188,62 @@ impl VimKeys {
             Key::Char('[') => self.emit(Motion::SectionForwardEnd),
             _ => self.abort(),
         }
+    }
+
+    // `ys{motion}`/`yss`'s own final key: the delimiter character. Any
+    // character `motion::surround_delims` doesn't recognize aborts, same
+    // as an invalid operator continuation elsewhere in this file.
+    fn feed_surround_char(&mut self, key: Key, target: SurroundTarget) -> KeyOutcome {
+        let Key::Char(c) = key else {
+            return self.abort();
+        };
+        if super::motion::surround_delims(c).is_none() {
+            return self.abort();
+        }
+        self.pending = Pending::None;
+        self.last_completed = std::mem::take(&mut self.current_input);
+        KeyOutcome::AddSurround { target, ch: c }
+    }
+
+    // `ds{ch}`'s own target character -- see `motion::surround_target_kind`
+    // for which characters are valid here.
+    fn feed_delete_surround_target(&mut self, key: Key) -> KeyOutcome {
+        let Key::Char(c) = key else {
+            return self.abort();
+        };
+        if super::motion::surround_target_kind(c).is_none() {
+            return self.abort();
+        }
+        self.pending = Pending::None;
+        self.last_completed = std::mem::take(&mut self.current_input);
+        KeyOutcome::DeleteSurround { ch: c }
+    }
+
+    // `cs{ch}...`'s own target character -- same validity rule as `ds`'s,
+    // but stays pending for one more key (the replacement) instead of
+    // resolving immediately.
+    fn feed_change_surround_target(&mut self, key: Key) -> KeyOutcome {
+        let Key::Char(c) = key else {
+            return self.abort();
+        };
+        if super::motion::surround_target_kind(c).is_none() {
+            return self.abort();
+        }
+        self.pending = Pending::ChangeSurroundChar { ch: c };
+        KeyOutcome::Pending
+    }
+
+    // `cs{ch}{replacement}`'s own final key.
+    fn feed_change_surround_char(&mut self, key: Key, ch: char) -> KeyOutcome {
+        let Key::Char(replacement) = key else {
+            return self.abort();
+        };
+        if super::motion::surround_delims(replacement).is_none() {
+            return self.abort();
+        }
+        self.pending = Pending::None;
+        self.last_completed = std::mem::take(&mut self.current_input);
+        KeyOutcome::ChangeSurround { ch, replacement }
     }
 
     // The object character after `i`/`a` while an operator is armed --
@@ -2491,5 +2671,147 @@ mod tests {
         let mut vk = VimKeys::new();
         vk.feed(Key::Char('d'));
         assert!(!vk.is_idle(), "an operator is armed, awaiting its motion");
+    }
+
+    #[test]
+    fn ys_motion_resolves_to_add_surround_with_the_motion_target() {
+        let mut vk = VimKeys::new();
+        let keys = [Key::Char('y'), Key::Char('s'), Key::Char('i'), Key::Char('w'), Key::Char('(')];
+        assert_eq!(
+            last(&mut vk, &keys),
+            KeyOutcome::AddSurround { target: SurroundTarget::Motion(Motion::TextObject(TextObjectKind::Word, false), None), ch: '(' }
+        );
+    }
+
+    #[test]
+    fn ys_with_a_simple_motion_and_count() {
+        let mut vk = VimKeys::new();
+        let keys = [Key::Char('y'), Key::Char('s'), Key::Char('3'), Key::Char('w'), Key::Char('"')];
+        assert_eq!(
+            last(&mut vk, &keys),
+            KeyOutcome::AddSurround { target: SurroundTarget::Motion(Motion::WordForward, Some(3)), ch: '"' }
+        );
+    }
+
+    #[test]
+    fn yss_resolves_to_add_surround_with_the_line_target() {
+        let mut vk = VimKeys::new();
+        let keys = [Key::Char('y'), Key::Char('s'), Key::Char('s'), Key::Char(')')];
+        assert_eq!(last(&mut vk, &keys), KeyOutcome::AddSurround { target: SurroundTarget::Line(None), ch: ')' });
+    }
+
+    #[test]
+    fn yss_carries_a_leading_count() {
+        let mut vk = VimKeys::new();
+        let keys = [Key::Char('2'), Key::Char('y'), Key::Char('s'), Key::Char('s'), Key::Char('}')];
+        assert_eq!(last(&mut vk, &keys), KeyOutcome::AddSurround { target: SurroundTarget::Line(Some(2)), ch: '}' });
+    }
+
+    #[test]
+    fn ys_invalid_delimiter_aborts_and_does_not_leak() {
+        let mut vk = VimKeys::new();
+        let keys = [Key::Char('y'), Key::Char('s'), Key::Char('i'), Key::Char('w'), Key::Char(' ')];
+        assert_eq!(last(&mut vk, &keys), KeyOutcome::None);
+        // The aborted sequence must not leak into the next command.
+        assert_eq!(vk.feed(Key::Char('w')), KeyOutcome::Motion(Motion::WordForward, None));
+    }
+
+    #[test]
+    fn ys_invalid_motion_aborts_and_does_not_leak() {
+        let mut vk = VimKeys::new();
+        // 'q' isn't a motion (or a text-object prefix) -- same invalid
+        // continuation `operator_invalid_continuation_aborts_and_does_
+        // not_leak` already exercises for a plain operator.
+        let keys = [Key::Char('y'), Key::Char('s'), Key::Char('q')];
+        assert_eq!(last(&mut vk, &keys), KeyOutcome::None);
+        assert_eq!(vk.feed(Key::Char('w')), KeyOutcome::Motion(Motion::WordForward, None));
+    }
+
+    #[test]
+    fn plain_yy_and_y_motion_are_unaffected_by_surround_support() {
+        let mut vk = VimKeys::new();
+        let keys = [Key::Char('y'), Key::Char('y')];
+        assert_eq!(last(&mut vk, &keys), KeyOutcome::OperatorLines(Op::Yank, None, None));
+        let mut vk = VimKeys::new();
+        let keys = [Key::Char('y'), Key::Char('w')];
+        assert_eq!(last(&mut vk, &keys), KeyOutcome::Operator(Op::Yank, Motion::WordForward, None, None));
+    }
+
+    #[test]
+    fn plain_s_and_capital_s_are_unaffected_outside_an_armed_yank() {
+        let mut vk = VimKeys::new();
+        assert_eq!(vk.feed(Key::Char('s')), KeyOutcome::EnterInsert(InsertCmd::SubstituteChar));
+        let mut vk = VimKeys::new();
+        assert_eq!(vk.feed(Key::Char('S')), KeyOutcome::EnterInsert(InsertCmd::SubstituteLine));
+    }
+
+    #[test]
+    fn ds_resolves_to_delete_surround() {
+        let mut vk = VimKeys::new();
+        let keys = [Key::Char('d'), Key::Char('s'), Key::Char('(')];
+        assert_eq!(last(&mut vk, &keys), KeyOutcome::DeleteSurround { ch: '(' });
+    }
+
+    #[test]
+    fn ds_invalid_target_aborts_and_does_not_leak() {
+        let mut vk = VimKeys::new();
+        let keys = [Key::Char('d'), Key::Char('s'), Key::Char('w')];
+        assert_eq!(last(&mut vk, &keys), KeyOutcome::None);
+        assert_eq!(vk.feed(Key::Char('w')), KeyOutcome::Motion(Motion::WordForward, None));
+    }
+
+    #[test]
+    fn plain_dd_and_d_motion_are_unaffected_by_surround_support() {
+        let mut vk = VimKeys::new();
+        let keys = [Key::Char('d'), Key::Char('d')];
+        assert_eq!(last(&mut vk, &keys), KeyOutcome::OperatorLines(Op::Delete, None, None));
+        let mut vk = VimKeys::new();
+        let keys = [Key::Char('d'), Key::Char('w')];
+        assert_eq!(last(&mut vk, &keys), KeyOutcome::Operator(Op::Delete, Motion::WordForward, None, None));
+    }
+
+    #[test]
+    fn cs_resolves_to_change_surround() {
+        let mut vk = VimKeys::new();
+        let keys = [Key::Char('c'), Key::Char('s'), Key::Char('"'), Key::Char('\'')];
+        assert_eq!(last(&mut vk, &keys), KeyOutcome::ChangeSurround { ch: '"', replacement: '\'' });
+    }
+
+    #[test]
+    fn cs_invalid_target_aborts_and_does_not_leak() {
+        let mut vk = VimKeys::new();
+        let keys = [Key::Char('c'), Key::Char('s'), Key::Char('x')];
+        assert_eq!(last(&mut vk, &keys), KeyOutcome::None);
+        assert_eq!(vk.feed(Key::Char('w')), KeyOutcome::Motion(Motion::WordForward, None));
+    }
+
+    #[test]
+    fn cs_invalid_replacement_aborts_and_does_not_leak() {
+        let mut vk = VimKeys::new();
+        let keys = [Key::Char('c'), Key::Char('s'), Key::Char('('), Key::Char(' ')];
+        assert_eq!(last(&mut vk, &keys), KeyOutcome::None);
+        assert_eq!(vk.feed(Key::Char('w')), KeyOutcome::Motion(Motion::WordForward, None));
+    }
+
+    #[test]
+    fn plain_cc_and_c_motion_are_unaffected_by_surround_support() {
+        let mut vk = VimKeys::new();
+        let keys = [Key::Char('c'), Key::Char('c')];
+        assert_eq!(last(&mut vk, &keys), KeyOutcome::OperatorLines(Op::Change, None, None));
+        let mut vk = VimKeys::new();
+        let keys = [Key::Char('c'), Key::Char('w')];
+        assert_eq!(last(&mut vk, &keys), KeyOutcome::Operator(Op::Change, Motion::WordForward, None, None));
+    }
+
+    #[test]
+    fn ys_register_prefix_is_dropped_not_carried_through() {
+        // Unlike y{motion}, ys/yss never write a register -- a `"x`
+        // prefix in front of one is simply irrelevant, matching vim's own
+        // "register prefix in front of something that doesn't use one is
+        // silently ignored" rule.
+        let mut vk = VimKeys::new();
+        let keys = [Key::Char('"'), Key::Char('a'), Key::Char('y'), Key::Char('s'), Key::Char('s'), Key::Char(')')];
+        assert_eq!(last(&mut vk, &keys), KeyOutcome::AddSurround { target: SurroundTarget::Line(None), ch: ')' });
+        assert_eq!(vk.take_pending_register(), None);
     }
 }

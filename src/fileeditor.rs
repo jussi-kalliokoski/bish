@@ -20,7 +20,7 @@ use std::rc::Rc;
 use crate::bishedit::motion;
 use crate::bishedit::registers::{RegisterShape, RegisterValue, Registers};
 use crate::bishedit::textbuffer::TextBuffer;
-use crate::bishedit::vimkeys::{InsertCmd, KeyOutcome, Op, VimKeys};
+use crate::bishedit::vimkeys::{InsertCmd, KeyOutcome, Op, SurroundTarget, VimKeys};
 use crate::bishedit::Buffer;
 use crate::editor::{self, Key};
 use crate::repl::Rect;
@@ -150,6 +150,20 @@ pub fn drive(session: &mut EditSession, rect: Rect, registers: &mut Registers, o
                 render_editor_frame(&session.buffer, &session.vk, false, rect);
                 continue;
             }
+            // `S`: vim-surround's own "wrap the selection" -- reads one
+            // more raw key directly (the delimiter character), same as
+            // editor.rs's own identical arm (see its doc comment).
+            Key::Char('S') if session.vk.is_idle() && (session.vk.is_visual() || !session.buffer.selections.is_empty()) => {
+                commit_active_selection(session);
+                let end_cursor = session.buffer.cursor();
+                if let Some(Key::Char(ch)) = editor::read_key_idle(on_idle)? {
+                    surround_selections(&mut session.buffer, ch);
+                }
+                session.buffer.selections.clear();
+                session.vk.end_visual(end_cursor);
+                render_editor_frame(&session.buffer, &session.vk, false, rect);
+                continue;
+            }
             Key::Escape if session.vk.is_idle() && (session.vk.is_visual() || !session.buffer.selections.is_empty()) => {
                 let end_cursor = session.buffer.cursor();
                 session.vk.end_visual(end_cursor);
@@ -229,6 +243,9 @@ pub fn drive(session: &mut EditSession, rect: Rect, registers: &mut Registers, o
             KeyOutcome::Join { count, with_space } => {
                 session.buffer.join_lines(count.unwrap_or(1).max(1), with_space);
             }
+            KeyOutcome::AddSurround { target, ch } => add_surround(&mut session.buffer, target, ch),
+            KeyOutcome::DeleteSurround { ch } => delete_surround(&mut session.buffer, ch),
+            KeyOutcome::ChangeSurround { ch, replacement } => change_surround(&mut session.buffer, ch, replacement),
             // <C-w> is still vimkeys' own window-leader prefix here too
             // -- a harmless no-op, same reasoning as editor.rs's own
             // LineBuffer contexts: there's no window state to act on
@@ -320,6 +337,111 @@ fn delete_char_forward(buf: &mut TextBuffer, registers: &mut Registers, count: O
     if !deleted.is_empty() {
         registers.write(register, RegisterValue { text: deleted, shape: RegisterShape::Char });
     }
+}
+
+// `ys{motion}`/`yss`'s own target resolution: a motion resolves exactly
+// like any other operator target (`None` on a failed/empty one, same
+// silent no-op `delete_motion` already gives); `yss`'s own current-line
+// shorthand spans `count` lines starting at the cursor -- the same "this
+// operator, this line, `count` of them" shape `delete_lines`'s own doc
+// comment already establishes for `dd`/`cc`, unlike `editor.rs`'s own
+// single-line `LineBuffer` version of this same target, where `count`
+// has nothing further to extend into.
+fn resolve_surround_target(buf: &mut TextBuffer, target: &SurroundTarget) -> Option<motion::MotionRange> {
+    match target {
+        SurroundTarget::Motion(m, count) => motion::motion_range(buf, m.clone(), *count),
+        SurroundTarget::Line(count) => {
+            let count = count.unwrap_or(1).max(1);
+            let (row, _) = buf.cursor();
+            let last = (row + count - 1).min(buf.line_count().saturating_sub(1));
+            Some(motion::MotionRange { shape: motion::MotionShape::Linewise, from: (row, 0), to: (last, 0) })
+        }
+    }
+}
+
+// `ys{motion}{ch}`/`yss{ch}`: wraps `target`'s resolved range in `ch`'s
+// own delimiter pair. Inserts the close delimiter first, then the open
+// one -- inserting at/after `close_at` can never shift `open_at`'s own
+// position, so no further adjustment is needed regardless of shape (see
+// `motion::surround_insert_points`'s own doc comment). Cursor lands on
+// the inserted open delimiter's own first character, matching
+// vim-surround.
+fn add_surround(buf: &mut TextBuffer, target: SurroundTarget, ch: char) {
+    let Some(range) = resolve_surround_target(buf, &target) else {
+        return;
+    };
+    let Some((open, close)) = motion::surround_delims(ch) else {
+        return;
+    };
+    let (open_at, close_at) = motion::surround_insert_points(buf, &range);
+    buf.insert_text(close_at, &close);
+    buf.insert_text(open_at, &open);
+    buf.set_cursor(open_at.0, open_at.1);
+}
+
+// `ds{ch}`: removes the nearest enclosing pair named by `ch`, plus any
+// padding `motion::surround_delete_spans` decides to strip -- close side
+// first, so removing it can never shift the open side's own position. A
+// no-op if `ch` doesn't name a valid target or no such pair encloses the
+// cursor.
+fn delete_surround(buf: &mut TextBuffer, ch: char) {
+    let Some(kind) = motion::surround_target_kind(ch) else {
+        return;
+    };
+    let Some((open_pos, close_pos)) = motion::surround_pair_positions(buf, kind) else {
+        return;
+    };
+    let (open_range, close_range) = motion::surround_delete_spans(buf, kind, open_pos, close_pos);
+    buf.delete_range(&close_range);
+    buf.delete_range(&open_range);
+    buf.set_cursor(open_range.from.0, open_range.from.1);
+}
+
+// `cs{ch}{replacement}`: like `delete_surround`, but replaces the found
+// pair's own two delimiter characters with `replacement`'s pair instead
+// of removing them -- never touches any padding around them (unlike
+// `ds`). Close side first, same reasoning as `add_surround`/
+// `delete_surround`.
+fn change_surround(buf: &mut TextBuffer, ch: char, replacement: char) {
+    let Some(kind) = motion::surround_target_kind(ch) else {
+        return;
+    };
+    let Some((open_pos, close_pos)) = motion::surround_pair_positions(buf, kind) else {
+        return;
+    };
+    let Some((open, close)) = motion::surround_delims(replacement) else {
+        return;
+    };
+    let close_range = motion::MotionRange { shape: motion::MotionShape::Inclusive, from: close_pos, to: close_pos };
+    buf.delete_range(&close_range);
+    buf.insert_text(close_pos, &close);
+    let open_range = motion::MotionRange { shape: motion::MotionShape::Inclusive, from: open_pos, to: open_pos };
+    buf.delete_range(&open_range);
+    buf.insert_text(open_pos, &open);
+    buf.set_cursor(open_pos.0, open_pos.1);
+}
+
+// Visual mode's own `S{ch}` -- wraps every committed selection plus the
+// active one in `ch`'s own delimiter pair, mirroring editor.rs's own
+// `surround_selections` (see its doc comment) generalized to a
+// `TextBuffer`'s multi-line selections/`insert_text`.
+fn surround_selections(buf: &mut TextBuffer, ch: char) {
+    if buf.selections.is_empty() {
+        return;
+    }
+    let Some((open, close)) = motion::surround_delims(ch) else {
+        return;
+    };
+    let mut ranges = buf.selections.clone();
+    ranges.sort_by_key(|r| std::cmp::Reverse(r.from));
+    let mut leftmost_open_at = (0, 0);
+    for range in &ranges {
+        let (open_at, close_at) = motion::surround_insert_points(buf, range);
+        buf.insert_text(close_at, &close);
+        buf.insert_text(open_at, &open);
+        leftmost_open_at = open_at;
+    }
+    buf.set_cursor(leftmost_open_at.0, leftmost_open_at.1);
 }
 
 // `p`/`P`: a linewise register (`yy`, `dd`, ...) pastes as whole new
