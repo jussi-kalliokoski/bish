@@ -81,6 +81,9 @@ pub enum Key {
     // added for bishedit's normal-mode Ctrl-Y (scroll one line up).
     CtrlY,
     CtrlZ,
+    // No shell line-editing use either -- added for bishedit's own
+    // Normal-mode number decrement (`Ctrl-X`, `Ctrl-A`'s own mirror).
+    CtrlX,
     Unknown,
 }
 
@@ -141,6 +144,7 @@ fn read_key() -> io::Result<Option<Key>> {
         0x12 => Key::CtrlR,
         0x15 => Key::CtrlU,
         0x17 => Key::CtrlW,
+        0x18 => Key::CtrlX,
         0x19 => Key::CtrlY,
         0x1a => Key::CtrlZ,
         b'\r' | b'\n' => Key::Enter,
@@ -1350,7 +1354,11 @@ pub fn read_line(
             // only ever computed while completion.is_none(), so at most
             // one of the two is ever live at once.
             Key::CtrlY if suggestion.is_some() => accept_suggestion(&mut ed, suggestion.as_deref().unwrap()),
-            Key::AltLeft | Key::AltRight | Key::AltUp | Key::CtrlY | Key::Unknown => {}
+            // Ctrl-X: no shell line-editing use (see the `Key` variant's
+            // own doc comment) -- Normal mode's own `Ctrl-A`/`Ctrl-X`
+            // (number increment/decrement) is reached via Ctrl-E's own
+            // vim excursion, same as every other Normal-mode-only key.
+            Key::AltLeft | Key::AltRight | Key::AltUp | Key::CtrlY | Key::CtrlX | Key::Unknown => {}
         }
         // Recomputed fresh every iteration -- see compute_suggestion's
         // own doc comment. Must happen after the match (so it reflects
@@ -1740,6 +1748,7 @@ fn run_line_normal_mode(
                     // loop instead, so `R` gets the real thing there.
                     KeyOutcome::EnterReplace => break LineNormalExit::ToInsert,
                     KeyOutcome::ToggleCase { count } => toggle_case(&mut lb, count.unwrap_or(1).max(1)),
+                    KeyOutcome::AdjustNumber { delta } => adjust_number(&mut lb, delta),
                     KeyOutcome::Window(..) | KeyOutcome::Join { .. } | KeyOutcome::Pending | KeyOutcome::None => {}
                 }
             }
@@ -2110,6 +2119,19 @@ fn change_surround(lb: &mut LineBuffer, ch: char, replacement: char) {
     lb.ed.cursor = open_col;
 }
 
+// `Ctrl-A`/`Ctrl-X`: adjusts the decimal number found at or after the
+// cursor by `delta`, replacing it and leaving the cursor on the new
+// number's own last digit. A no-op if there's no number on the line
+// from the cursor onward.
+fn adjust_number(lb: &mut LineBuffer, delta: i64) {
+    let Some(m) = motion::find_number(lb, lb.cursor()) else {
+        return;
+    };
+    let replacement = motion::apply_number_delta(&m, delta);
+    lb.ed.buf.splice(m.from.1..=m.to.1, replacement.chars());
+    lb.ed.cursor = m.from.1 + replacement.chars().count() - 1;
+}
+
 fn case_kind_for_op(op: Op) -> motion::CaseKind {
     match op {
         Op::Lowercase => motion::CaseKind::Lower,
@@ -2341,6 +2363,10 @@ fn run_one_shot_normal_command(ed: &mut LineEditor, registers: &mut Registers, o
                     KeyOutcome::EnterReplace => break None,
                     KeyOutcome::ToggleCase { count } => {
                         toggle_case(&mut lb, count.unwrap_or(1).max(1));
+                        break None;
+                    }
+                    KeyOutcome::AdjustNumber { delta } => {
+                        adjust_number(&mut lb, delta);
                         break None;
                     }
                     // EnterVisual: a no-op here too, same reasoning as
@@ -2814,6 +2840,38 @@ mod tests {
         case_operator_lines(&mut lb, motion::CaseKind::Toggle);
         assert_eq!(ed.buf.iter().collect::<String>(), "fOO bAR");
         assert_eq!(ed.cursor, 0);
+    }
+
+    #[test]
+    fn adjust_number_increments_and_positions_cursor_on_the_last_digit() {
+        let mut ed = make_editor("count: 41 items", 0);
+        let mut marks = HashMap::new();
+        let mut selections: Vec<motion::MotionRange> = Vec::new();
+        let mut lb = LineBuffer { ed: &mut ed, marks: &mut marks, selections: &mut selections };
+        adjust_number(&mut lb, 1);
+        assert_eq!(ed.buf.iter().collect::<String>(), "count: 42 items");
+        assert_eq!(ed.cursor, 8);
+    }
+
+    #[test]
+    fn adjust_number_decrements_and_can_grow_the_buffer() {
+        let mut ed = make_editor("x9", 1); // cursor on the '9'
+        let mut marks = HashMap::new();
+        let mut selections: Vec<motion::MotionRange> = Vec::new();
+        let mut lb = LineBuffer { ed: &mut ed, marks: &mut marks, selections: &mut selections };
+        adjust_number(&mut lb, 1);
+        assert_eq!(ed.buf.iter().collect::<String>(), "x10");
+        assert_eq!(ed.cursor, 2);
+    }
+
+    #[test]
+    fn adjust_number_with_no_number_on_the_line_is_a_no_op() {
+        let mut ed = make_editor("no digits", 0);
+        let mut marks = HashMap::new();
+        let mut selections: Vec<motion::MotionRange> = Vec::new();
+        let mut lb = LineBuffer { ed: &mut ed, marks: &mut marks, selections: &mut selections };
+        adjust_number(&mut lb, 1);
+        assert_eq!(ed.buf.iter().collect::<String>(), "no digits");
     }
 
     #[test]

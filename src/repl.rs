@@ -3047,7 +3047,8 @@ fn run_normal_mode_navigation(
             | KeyOutcome::DeleteSurround { .. }
             | KeyOutcome::ChangeSurround { .. }
             | KeyOutcome::ReplaceChar { .. }
-            | KeyOutcome::ToggleCase { .. } => {
+            | KeyOutcome::ToggleCase { .. }
+            | KeyOutcome::AdjustNumber { .. } => {
                 render_normal_mode_frame(&buf, rect, &vk, None);
             }
             KeyOutcome::Window(cmd @ (WindowCmd::GotoFirstWindow | WindowCmd::GotoLastWindow), count) => {

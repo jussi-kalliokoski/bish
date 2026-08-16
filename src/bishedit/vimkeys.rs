@@ -149,6 +149,13 @@ pub enum KeyOutcome {
     /// that would run past it, matching vim: never crosses a line break,
     /// never extends past what's already there.
     ToggleCase { count: Option<usize> },
+    /// `Ctrl-A`/`Ctrl-X`: adds `delta` (already signed -- positive for
+    /// `Ctrl-A`, negative for `Ctrl-X`, magnitude `count`) to the decimal
+    /// number found at or after the cursor on the current line (see
+    /// `motion::find_number`'s own doc comment for exactly how that's
+    /// found). A no-op if there's no number on the line from the cursor
+    /// onward.
+    AdjustNumber { delta: i64 },
     /// The key was consumed as part of an in-progress sequence (a count
     /// digit, or a prefix awaiting its next character); no motion yet.
     Pending,
@@ -1138,6 +1145,18 @@ impl VimKeys {
                 self.pending = Pending::None;
                 self.last_completed = std::mem::take(&mut self.current_input);
                 KeyOutcome::ToggleCase { count }
+            }
+            Key::CtrlA => {
+                let count = self.count.take().unwrap_or(1).max(1) as i64;
+                self.pending = Pending::None;
+                self.last_completed = std::mem::take(&mut self.current_input);
+                KeyOutcome::AdjustNumber { delta: count }
+            }
+            Key::CtrlX => {
+                let count = self.count.take().unwrap_or(1).max(1) as i64;
+                self.pending = Pending::None;
+                self.last_completed = std::mem::take(&mut self.current_input);
+                KeyOutcome::AdjustNumber { delta: -count }
             }
             Key::Char('p') => self.emit_put(false),
             Key::Char('P') => self.emit_put(true),
@@ -2838,6 +2857,20 @@ mod tests {
         let keys = [Key::Char('g'), Key::Char('u'), Key::Escape];
         assert_eq!(last(&mut vk, &keys), KeyOutcome::None);
         assert_eq!(vk.feed(Key::Char('w')), KeyOutcome::Motion(Motion::WordForward, None));
+    }
+
+    #[test]
+    fn ctrl_a_and_ctrl_x_resolve_to_signed_adjust_number() {
+        let mut vk = VimKeys::new();
+        assert_eq!(vk.feed(Key::CtrlA), KeyOutcome::AdjustNumber { delta: 1 });
+        let mut vk = VimKeys::new();
+        assert_eq!(vk.feed(Key::CtrlX), KeyOutcome::AdjustNumber { delta: -1 });
+        let mut vk = VimKeys::new();
+        let keys = [Key::Char('5'), Key::CtrlA];
+        assert_eq!(last(&mut vk, &keys), KeyOutcome::AdjustNumber { delta: 5 });
+        let mut vk = VimKeys::new();
+        let keys = [Key::Char('5'), Key::CtrlX];
+        assert_eq!(last(&mut vk, &keys), KeyOutcome::AdjustNumber { delta: -5 });
     }
 
     #[test]

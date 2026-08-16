@@ -266,6 +266,7 @@ pub fn drive(session: &mut EditSession, rect: Rect, registers: &mut Registers, o
                 InsertOutcome::Done => {}
             },
             KeyOutcome::ToggleCase { count } => toggle_case(&mut session.buffer, count.unwrap_or(1).max(1)),
+            KeyOutcome::AdjustNumber { delta } => adjust_number(&mut session.buffer, delta),
             // <C-w> is still vimkeys' own window-leader prefix here too
             // -- a harmless no-op, same reasoning as editor.rs's own
             // LineBuffer contexts: there's no window state to act on
@@ -480,6 +481,19 @@ fn replace_char(buf: &mut TextBuffer, ch: char, count: usize) {
     let text: String = std::iter::repeat_n(ch, count).collect();
     buf.insert_text((row, col), &text);
     buf.set_cursor(row, col + count - 1);
+}
+
+// `Ctrl-A`/`Ctrl-X`: see editor.rs's own identical-in-spirit
+// `adjust_number`.
+fn adjust_number(buf: &mut TextBuffer, delta: i64) {
+    let Some(m) = motion::find_number(buf, buf.cursor()) else {
+        return;
+    };
+    let replacement = motion::apply_number_delta(&m, delta);
+    let range = motion::MotionRange { shape: motion::MotionShape::Inclusive, from: m.from, to: m.to };
+    buf.delete_range(&range);
+    buf.insert_text(m.from, &replacement);
+    buf.set_cursor(m.from.0, m.from.1 + replacement.chars().count() - 1);
 }
 
 fn case_kind_for_op(op: Op) -> motion::CaseKind {

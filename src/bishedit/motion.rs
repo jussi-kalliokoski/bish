@@ -1184,6 +1184,70 @@ pub fn surround_insert_points(buf: &impl Buffer, range: &MotionRange) -> ((usize
     }
 }
 
+/// `Ctrl-A`/`Ctrl-X`'s own target: a decimal number found at or after the
+/// cursor on the current line -- `from` includes a leading `-` sign if
+/// present (`to` is always the last digit, inclusive), `value` is the
+/// parsed number, `width` is how many digit characters it has (not
+/// counting the sign). `apply_number_delta`'s own zero-padding only
+/// kicks in when `leading_zero` is set (the original text itself started
+/// with `0`, e.g. `007`) -- `width` alone isn't enough: an ordinary
+/// number like `42` also has a width (2), but vim never pads `42 - 42`
+/// back out to `00`, only a number that was genuinely zero-padded to
+/// begin with keeps that padding.
+pub struct NumberMatch {
+    pub from: (usize, usize),
+    pub to: (usize, usize),
+    pub value: i64,
+    pub width: usize,
+    pub leading_zero: bool,
+}
+
+/// Scans forward from `pos` along its own line for the first digit
+/// (`pos` itself counts, so a cursor already inside a number finds that
+/// same number rather than skipping to the next one), then expands both
+/// directions to the number's full extent -- vim's own `Ctrl-A`/`Ctrl-X`
+/// targeting rule. Decimal only (no hex/octal `nrformats` support) --
+/// deliberately simplified scope, matching `r`'s/`case_transform`'s own
+/// ASCII-only precedent elsewhere in this file. `None` if there's no
+/// digit anywhere at or after `pos` on this line, or if the number
+/// somehow doesn't fit in an `i64` (astronomically unlikely for anything
+/// actually typed).
+pub fn find_number(buf: &impl Buffer, pos: (usize, usize)) -> Option<NumberMatch> {
+    let (line, col) = pos;
+    let len = buf.line_len(line);
+    let mut start = (col..len).find(|&c| matches!(buf.char_at(line, c), Some(d) if d.is_ascii_digit()))?;
+    while start > 0 && matches!(buf.char_at(line, start - 1), Some(d) if d.is_ascii_digit()) {
+        start -= 1;
+    }
+    let negative = start > 0 && buf.char_at(line, start - 1) == Some('-');
+    let sign_col = if negative { start - 1 } else { start };
+    let mut end = start;
+    while end + 1 < len && matches!(buf.char_at(line, end + 1), Some(d) if d.is_ascii_digit()) {
+        end += 1;
+    }
+    let width = end - start + 1;
+    let digits: String = (start..=end).filter_map(|c| buf.char_at(line, c)).collect();
+    let leading_zero = width > 1 && digits.starts_with('0');
+    let magnitude: i64 = digits.parse().ok()?;
+    let value = if negative { -magnitude } else { magnitude };
+    Some(NumberMatch { from: (line, sign_col), to: (line, end), value, width, leading_zero })
+}
+
+/// The replacement text for `m` after adding `delta` to its value --
+/// zero-padded back up to `m`'s own original digit width if it was
+/// genuinely zero-padded to begin with (`m.leading_zero`) and the result
+/// needs fewer digits than that, and re-signed if it crossed zero.
+pub fn apply_number_delta(m: &NumberMatch, delta: i64) -> String {
+    let new_value = m.value.saturating_add(delta);
+    let digits = new_value.unsigned_abs().to_string();
+    let padded = if m.leading_zero && digits.len() < m.width { format!("{}{digits}", "0".repeat(m.width - digits.len())) } else { digits };
+    if new_value < 0 {
+        format!("-{padded}")
+    } else {
+        padded
+    }
+}
+
 /// Literal (non-regex) substring search -- deliberately simple, matching
 /// this milestone's "nothing fancy" scope. Matches never span line breaks.
 fn line_find(buf: &impl Buffer, line: usize, lower_bound: usize, chars: &[char]) -> Option<usize> {
@@ -2941,6 +3005,65 @@ mod tests {
         assert_eq!(case_transform('5', CaseKind::Toggle), '5');
         assert_eq!(case_transform(' ', CaseKind::Upper), ' ');
         assert_eq!(case_transform('_', CaseKind::Lower), '_');
+    }
+
+    #[test]
+    fn find_number_at_cursor_and_after_cursor() {
+        let mut buf = TestBuffer::new("abc 42 def");
+        buf.set_cursor(0, 5); // on the '2' of "42"
+        let m = find_number(&buf, buf.cursor()).unwrap();
+        assert_eq!((m.from, m.to, m.value, m.width, m.leading_zero), ((0, 4), (0, 5), 42, 2, false));
+
+        buf.set_cursor(0, 0); // before the number -- scans forward
+        let m = find_number(&buf, buf.cursor()).unwrap();
+        assert_eq!((m.from, m.to, m.value, m.width, m.leading_zero), ((0, 4), (0, 5), 42, 2, false));
+    }
+
+    #[test]
+    fn find_number_detects_a_genuine_leading_zero() {
+        let buf = TestBuffer::new("id 007 done");
+        let m = find_number(&buf, (0, 0)).unwrap();
+        assert_eq!((m.value, m.width, m.leading_zero), (7, 3, true));
+    }
+
+    #[test]
+    fn find_number_no_digits_on_the_line_is_none() {
+        let buf = TestBuffer::new("no digits here");
+        assert!(find_number(&buf, (0, 0)).is_none());
+    }
+
+    #[test]
+    fn find_number_never_crosses_a_line_break() {
+        let mut buf = TestBuffer::new("abc\n42");
+        buf.set_cursor(0, 0);
+        assert!(find_number(&buf, buf.cursor()).is_none());
+    }
+
+    #[test]
+    fn find_number_includes_a_leading_minus_sign() {
+        let buf = TestBuffer::new("x = -17;");
+        let m = find_number(&buf, (0, 6)).unwrap();
+        assert_eq!((m.from, m.to, m.value, m.width), ((0, 4), (0, 6), -17, 2));
+    }
+
+    #[test]
+    fn apply_number_delta_increments_and_decrements() {
+        let m = NumberMatch { from: (0, 0), to: (0, 1), value: 42, width: 2, leading_zero: false };
+        assert_eq!(apply_number_delta(&m, 1), "43");
+        assert_eq!(apply_number_delta(&m, -1), "41");
+        // An ordinary (non-zero-padded) number never gets padded back
+        // out, even once it shrinks below its own original width.
+        assert_eq!(apply_number_delta(&m, -42), "0");
+        assert_eq!(apply_number_delta(&m, -50), "-8");
+    }
+
+    #[test]
+    fn apply_number_delta_preserves_leading_zero_width() {
+        let m = NumberMatch { from: (0, 0), to: (0, 2), value: 7, width: 3, leading_zero: true };
+        assert_eq!(apply_number_delta(&m, 1), "008");
+        // growing past the original width drops the padding, matching vim.
+        let m = NumberMatch { from: (0, 0), to: (0, 2), value: 999, width: 3, leading_zero: true };
+        assert_eq!(apply_number_delta(&m, 1), "1000");
     }
 
     #[test]
