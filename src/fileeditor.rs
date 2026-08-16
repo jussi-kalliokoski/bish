@@ -1025,6 +1025,56 @@ fn selection_columns_in_line(range: &motion::MotionRange, line: usize, cols: usi
     Some((start, end))
 }
 
+// One column of the gutter drawn to the left of a line's own content.
+// Line numbers are the only column today, but the shape anticipates the
+// same slot holding blame/coverage/diff-marker columns later -- each is
+// just another (width, render) pair appended to GUTTER_COLUMNS, with no
+// change needed anywhere else: build_editor_frame only ever asks "how
+// wide is the whole gutter" and "render line N's gutter cells", never
+// which columns exist. `render` returns the *fully styled* cell text
+// (its own SGR codes, if it wants color/dim) so each column stays free
+// to look however it needs to -- a future diff column wants red/green,
+// not the line-number column's dim gray -- rather than this shared
+// machinery imposing one style on all of them. `None` means "blank,
+// unstyled" -- used for filler rows past the buffer's own last line,
+// matching how render_row's own caller already leaves those rows'
+// content blank too.
+struct GutterColumn {
+    width: fn(&TextBuffer) -> usize,
+    render: fn(buf: &TextBuffer, line: usize, width: usize) -> Option<String>,
+}
+
+static GUTTER_COLUMNS: &[GutterColumn] = &[GutterColumn { width: line_number_width, render: render_line_number_cell }];
+
+fn total_gutter_width(buf: &TextBuffer) -> usize {
+    GUTTER_COLUMNS.iter().map(|col| (col.width)(buf)).sum()
+}
+
+fn render_gutter(out: &mut String, buf: &TextBuffer, line: usize) {
+    for col in GUTTER_COLUMNS {
+        let width = (col.width)(buf);
+        match (col.render)(buf, line, width) {
+            Some(cell) => out.push_str(&cell),
+            None => out.push_str(&" ".repeat(width)),
+        }
+    }
+}
+
+// Vim's own gutter-width convention: as many digits as the buffer's last
+// line number needs, plus one trailing space of padding before the
+// buffer's own content starts. Grows dynamically as the buffer gains
+// lines (matching vim), rather than reserving a fixed width up front.
+fn line_number_width(buf: &TextBuffer) -> usize {
+    buf.line_count().to_string().len() + 1
+}
+
+fn render_line_number_cell(buf: &TextBuffer, line: usize, width: usize) -> Option<String> {
+    if line >= buf.line_count() {
+        return None;
+    }
+    Some(format!("\x1b[2m{:>pad$} \x1b[0m", line + 1, pad = width.saturating_sub(1)))
+}
+
 fn render_row(out: &mut String, buf: &TextBuffer, line: usize, cols: usize, highlights: &[(usize, usize)]) {
     for c in 0..cols {
         let ch = buf.char_at(line, c).unwrap_or(' ');
@@ -1062,19 +1112,26 @@ fn render_row(out: &mut String, buf: &TextBuffer, line: usize, cols: usize, high
 pub fn build_editor_frame(buf: &TextBuffer, vk: &VimKeys, mode: EditorMode, rect: Rect, row_origin: usize, col_origin: usize) -> String {
     let content_rows = editor_content_rows(rect);
     let total = buf.line_count();
+    // Reserves at least one column for content even if the gutter would
+    // otherwise want more than the whole pane -- only reachable in a
+    // pathologically narrow split, but `content_cols` below would
+    // underflow without this.
+    let gutter_width = total_gutter_width(buf).min(rect.cols.saturating_sub(1));
+    let content_cols = rect.cols - gutter_width;
     let active = if mode == EditorMode::Normal { active_visual_range(vk, buf) } else { None };
     let mut out = String::new();
     for r in 0..content_rows {
         let line = buf.viewport_top() + r;
         out.push_str(&format!("\x1b[{};{}H\x1b[K", row_origin + r + 1, col_origin + 1));
+        render_gutter(&mut out, buf, line);
         if line < total {
             let mut highlights = Vec::new();
             for range in buf.selections.iter().chain(active.iter()) {
-                if let Some(cols) = selection_columns_in_line(range, line, rect.cols) {
+                if let Some(cols) = selection_columns_in_line(range, line, content_cols) {
                     highlights.push(cols);
                 }
             }
-            render_row(&mut out, buf, line, rect.cols, &highlights);
+            render_row(&mut out, buf, line, content_cols, &highlights);
         }
     }
 
@@ -1082,7 +1139,7 @@ pub fn build_editor_frame(buf: &TextBuffer, vk: &VimKeys, mode: EditorMode, rect
 
     let (cl, cc) = buf.cursor();
     let screen_row = cl.saturating_sub(buf.viewport_top()).min(content_rows.saturating_sub(1));
-    let screen_col = cc.min(rect.cols.saturating_sub(1));
+    let screen_col = gutter_width + cc.min(content_cols.saturating_sub(1));
     out.push_str(&format!("\x1b[{};{}H\x1b[?25h", row_origin + screen_row + 1, col_origin + screen_col + 1));
     out
 }
