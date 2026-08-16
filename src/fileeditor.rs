@@ -17,6 +17,7 @@ use std::cell::RefCell;
 use std::io::{self, Write};
 use std::rc::Rc;
 
+use crate::bishedit::highlight::{self, BashHighlighter, HighlightContext, Highlighter, StyledSpan};
 use crate::bishedit::motion;
 use crate::bishedit::registers::{RegisterShape, RegisterValue, Registers};
 use crate::bishedit::textbuffer::TextBuffer;
@@ -1075,17 +1076,68 @@ fn render_line_number_cell(buf: &TextBuffer, line: usize, width: usize) -> Optio
     Some(format!("\x1b[2m{:>pad$} \x1b[0m", line + 1, pad = width.saturating_sub(1)))
 }
 
+// Language detection, v1: a bare extension check, not a content sniff --
+// `.bash` is the only recognized language today (per the feature
+// request this shipped under); anything else (an unnamed buffer, no
+// extension, a different one) renders as plain text, same as before
+// this existed. A real "detect from shebang/content" fallback, and more
+// extensions/languages, are natural follow-ups once there's more than
+// one Highlighter implementor to dispatch to (see Highlighter's own doc
+// comment -- BashHighlighter is still the only one).
+fn is_bash_file(buf: &TextBuffer) -> bool {
+    buf.path().and_then(|p| p.extension()).is_some_and(|ext| ext == "bash")
+}
+
+// Reuses editor.rs's own compose_redraw pipeline (BashHighlighter ->
+// StyledSpan -> highlight::compose -> highlight::render_styled), just
+// fed a whole line at a time instead of the live prompt buffer, and with
+// this editor's own selection highlighting (`highlights`, already
+// resolved to column ranges by build_editor_frame's own caller) as a
+// second compose() layer instead of editor.rs's ghost-text/search-match
+// ones -- exactly the extensibility compose's own doc comment describes
+// ("adding a ... layer later is 'pass one more slice'"). Reverse-video,
+// not a distinct color, for the same reason editor.rs's own Visual-mode
+// selection layer uses it: applied *after* the syntax layer, so a
+// selection reads clearly regardless of what color it's covering,
+// matching vim's own selection-over-syntax convention.
+//
+// Highlighted against the *lexer's* own re-tokenization of this one
+// line in isolation, not the whole buffer -- see BashHighlighter's own
+// module doc comment on why (built for, and so far only ever run
+// against, single-line text). A construct that genuinely spans several
+// physical lines (an unterminated quote, a heredoc body) won't color
+// correctly across that boundary; everything else -- keywords, strings,
+// variables, comments, operators, redirects -- does. HighlightContext::
+// default() (no cwd, no known_functions): same "no context to offer"
+// choice command mode's own colon-line already makes, since nothing
+// here has a live Shell to pull those from -- Flag/Subcommand/Link/
+// InvalidCommand refinements that need them simply don't fire, same as
+// there.
 fn render_row(out: &mut String, buf: &TextBuffer, line: usize, cols: usize, highlights: &[(usize, usize)]) {
-    for c in 0..cols {
-        let ch = buf.char_at(line, c).unwrap_or(' ');
-        if highlights.iter().any(|&(start, end)| c >= start && c < end) {
-            out.push_str("\x1b[7m");
-            out.push(ch);
-            out.push_str("\x1b[0m");
-        } else {
-            out.push(ch);
-        }
-    }
+    let chars: Vec<char> = (0..cols).map(|c| buf.char_at(line, c).unwrap_or(' ')).collect();
+
+    let styled: Vec<StyledSpan> = if is_bash_file(buf) {
+        let line_len = buf.line_len(line);
+        let text: String = (0..line_len).map(|c| buf.char_at(line, c).unwrap_or(' ')).collect();
+        BashHighlighter
+            .highlight(&text, HighlightContext::default())
+            .into_iter()
+            .map(|s| {
+                let (fg, attrs) = highlight::default_style(s.kind);
+                StyledSpan { start: s.start, end: s.end, fg, attrs }
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    let selected: Vec<StyledSpan> = highlights
+        .iter()
+        .map(|&(start, end)| StyledSpan { start, end, fg: vt100::Color::Default, attrs: vt100::CellAttrs { reverse: true, ..vt100::CellAttrs::default() } })
+        .collect();
+
+    let cells = highlight::compose(&chars, &[&styled, &selected]);
+    out.push_str(&highlight::render_styled(&cells));
 }
 
 // The actual rendering, factored out as a pure string-builder (build the
