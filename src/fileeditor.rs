@@ -21,7 +21,7 @@ use crate::bishedit::highlight::{self, BashHighlighter, HighlightContext, Highli
 use crate::bishedit::motion;
 use crate::bishedit::registers::{RegisterShape, RegisterValue, Registers};
 use crate::bishedit::textbuffer::TextBuffer;
-use crate::bishedit::vimkeys::{InsertCmd, KeyOutcome, Op, SurroundTarget, VimKeys};
+use crate::bishedit::vimkeys::{InsertCmd, KeyOutcome, Op, SurroundTarget, VimKeys, WindowCmd};
 use crate::bishedit::Buffer;
 use crate::editor::{self, Key};
 use crate::repl::Rect;
@@ -55,6 +55,25 @@ impl EditSession {
 pub enum EditOutcome {
     Quit,
     Detached,
+    // `<C-w>{cmd}`: vimkeys.rs has already resolved this into a concrete
+    // WindowCmd+count (the identical KeyOutcome::Window repl.rs's own
+    // run_normal_mode_navigation reaches) -- applying it needs real
+    // window/session state this loop was never given (see the KeyOutcome::
+    // Window match arm's own doc comment: "no window state to act on
+    // directly from inside this loop"). repl.rs's run_edit_frame does that,
+    // the same place plain Detached already re-inserts this session and
+    // freezes its own frame.
+    DetachedForWindowCmd(WindowCmd, Option<usize>),
+    // `:` for anything that isn't recognized as one of this editor's own
+    // w/w <path>/wq/x/q/q! commands (see run_ex_command's own doc
+    // comment) -- whatever had already been typed after the ':', so the
+    // real command mode (window subcommands, actual shell builtins) can
+    // run it instead of this editor's own limited reader rejecting it.
+    // Same "no window/session state here" reasoning as
+    // DetachedForWindowCmd. run_edit_frame seeds the real command mode's
+    // own first prompt with this text (cursor at its end) rather than
+    // dropping it, so nothing already typed is lost in the hand-off.
+    DetachedForCommand(String),
 }
 
 // What the status line (`mode_label`) and `build_editor_frame`'s own
@@ -192,13 +211,14 @@ pub fn drive(session: &mut EditSession, rect: Rect, registers: &mut Registers, o
                 render_editor_frame(&session.buffer, &session.vk, EditorMode::Normal, rect);
                 continue;
             }
-            Key::Char(':') if session.vk.is_idle() => {
-                if let ExOutcome::Quit = run_ex_command(session, rect, registers, on_idle)? {
-                    return Ok(EditOutcome::Quit);
+            Key::Char(':') if session.vk.is_idle() => match run_ex_command(session, rect, registers, on_idle)? {
+                ExOutcome::Quit => return Ok(EditOutcome::Quit),
+                ExOutcome::RunElsewhere(cmd) => return Ok(EditOutcome::DetachedForCommand(cmd)),
+                ExOutcome::Continue => {
+                    render_editor_frame(&session.buffer, &session.vk, EditorMode::Normal, rect);
+                    continue;
                 }
-                render_editor_frame(&session.buffer, &session.vk, EditorMode::Normal, rect);
-                continue;
-            }
+            },
             _ => {}
         }
 
@@ -283,14 +303,16 @@ pub fn drive(session: &mut EditSession, rect: Rect, registers: &mut Registers, o
             }
             KeyOutcome::ToggleCase { count } => toggle_case(&mut session.buffer, count.unwrap_or(1).max(1)),
             KeyOutcome::AdjustNumber { delta } => adjust_number(&mut session.buffer, delta),
-            // <C-w> is still vimkeys' own window-leader prefix here too
-            // -- a harmless no-op, same reasoning as editor.rs's own
-            // LineBuffer contexts: there's no window state to act on
-            // directly from inside this loop. Detaching first (Ctrl+
-            // Space) and using it from normal-mode navigation is how
-            // window commands actually reach this pane while `e` is
-            // open.
-            KeyOutcome::Window(..) | KeyOutcome::Pending | KeyOutcome::None => {}
+            // <C-w>: unlike editor.rs's own LineBuffer contexts (a
+            // genuine no-op there -- see that arm's own comment), this
+            // editor is a real, focusable pane, so a window command
+            // typed here should actually do something. There's no
+            // window/session state to act on directly from inside this
+            // loop, though (see EditOutcome::DetachedForWindowCmd's own
+            // doc comment), so it detaches and lets repl.rs's
+            // run_edit_frame apply it against the real thing instead.
+            KeyOutcome::Window(cmd, count) => return Ok(EditOutcome::DetachedForWindowCmd(cmd, count)),
+            KeyOutcome::Pending | KeyOutcome::None => {}
         }
         render_editor_frame(&session.buffer, &session.vk, EditorMode::Normal, rect);
     }
@@ -858,6 +880,9 @@ fn run_insert_mode(session: &mut EditSession, rect: Rect, registers: &mut Regist
 enum ExOutcome {
     Continue,
     Quit,
+    // Anything that isn't one of this function's own recognized editor
+    // commands -- see run_ex_command's own doc comment.
+    RunElsewhere(String),
 }
 
 // `"%"`: vim's own current-filename register -- refreshed here (a no-op
@@ -879,7 +904,12 @@ fn set_last_filename(session: &EditSession, registers: &mut Registers) {
 // in scope for this pass), so this is its own minimal reader instead --
 // print the prompt, read raw keys until Enter/Escape, nothing else
 // `read_line` offers (completion, suggestions, browsing) is needed for a
-// one-line Ex command anyway.
+// one-line Ex command anyway. Anything typed here that isn't one of
+// those (a window subcommand, an actual shell command) doesn't error
+// out anymore -- it comes back as `RunElsewhere` so the caller can hand
+// it to the real thing (repl.rs's own command mode) instead; this
+// reader stays deliberately narrow, it just no longer treats "not mine"
+// as "invalid."
 fn run_ex_command(session: &mut EditSession, rect: Rect, registers: &mut Registers, on_idle: &mut dyn FnMut()) -> io::Result<ExOutcome> {
     let Some(line) = read_ex_command_line(rect, on_idle)? else {
         return Ok(ExOutcome::Continue);
@@ -920,10 +950,7 @@ fn run_ex_command(session: &mut EditSession, rect: Rect, registers: &mut Registe
             }
         }
         "q!" => Ok(ExOutcome::Quit),
-        other => {
-            flash_status(&format!("E492: Not an editor command: {other}"), rect, on_idle)?;
-            Ok(ExOutcome::Continue)
-        }
+        _ => Ok(ExOutcome::RunElsewhere(line.to_string())),
     }
 }
 

@@ -915,8 +915,9 @@ fn handle_command_mode(
     registers: &mut Registers,
     term_rows: usize,
     term_cols: usize,
+    seed: Option<String>,
 ) -> CommandModeOutcome {
-    let outcome = run_command_mode(session_id, sessions, windows, *current_window, cmd_history, job_frames, registers, term_rows, term_cols);
+    let outcome = run_command_mode(session_id, sessions, windows, *current_window, cmd_history, job_frames, registers, term_rows, term_cols, seed);
     match outcome {
         CommandModeOutcome::Action(action) => {
             apply_window_action(action, sessions, windows, current_window, next_session_id, next_window_id, sinks_are_grid, term_rows, term_cols);
@@ -1118,6 +1119,52 @@ fn run_edit_frame(
                 term_rows,
                 term_cols,
             );
+        }
+        // Same "freeze, then re-insert this session" as plain Detached
+        // above -- see its own doc comment. dispatch_window_cmd then
+        // does the actual work, shared with run_normal_mode_navigation's
+        // own identical KeyOutcome::Window arm.
+        Ok(fileeditor::EditOutcome::DetachedForWindowCmd(cmd, count)) => {
+            fileeditor::freeze_editor_frame(&sessions[&session_id].screen, &session.buffer, &session.vk, rect);
+            edit_frames.insert(edit_frame_id, session);
+            dispatch_window_cmd(cmd, count, sessions, windows, current_window, next_session_id, next_window_id, sinks_are_grid, term_rows, term_cols);
+        }
+        Ok(fileeditor::EditOutcome::DetachedForCommand(cmd_text)) => {
+            // `cmd_text` seeds the real command mode's own first prompt
+            // (cursor at its end) so the already-typed command doesn't
+            // have to be retyped from scratch -- see EditOutcome::
+            // DetachedForCommand's own doc comment. handle_command_mode
+            // already redraws the compositor for Quit/Cancelled/Ran on
+            // its own; a non-empty Ran result additionally gets held on
+            // screen until the next keypress here, mirroring run_normal_
+            // mode_navigation's own PendingView::Output -- just
+            // condensed into a single wait rather than a persisted
+            // state, since this function (unlike that one) doesn't keep
+            // looping after a single command.
+            fileeditor::freeze_editor_frame(&sessions[&session_id].screen, &session.buffer, &session.vk, rect);
+            edit_frames.insert(edit_frame_id, session);
+            let outcome = handle_command_mode(
+                session_id,
+                sessions,
+                windows,
+                current_window,
+                next_session_id,
+                next_window_id,
+                cmd_history,
+                sinks_are_grid,
+                job_frames,
+                registers,
+                term_rows,
+                term_cols,
+                Some(cmd_text),
+            );
+            if let CommandModeOutcome::Ran { output, status } = outcome
+                && (!output.is_empty() || status != 0)
+            {
+                render_command_output_overlay(&output, status, term_rows, term_cols);
+                let _ = editor::read_key_idle(&mut || service_background_jobs(sessions, windows, job_frames, cw));
+                compositor_redraw(sessions, windows, *current_window, term_rows, term_cols);
+            }
         }
         Err(e) => {
             // A real I/O error reading a key -- same treatment the main
@@ -2674,9 +2721,8 @@ fn render_normal_mode_frame(buf: &ScreenBuffer, rect: Rect, vk: &VimKeys, comman
 
 // `GotoFirstWindow`/`GotoLastWindow` aren't included -- they don't have a
 // `WindowAction` equivalent (an absolute tab-position jump, not a
-// repeatable action) and are handled directly in run_normal_mode_
-// navigation's own KeyOutcome::Window match, which never calls this for
-// them.
+// repeatable action) and are handled directly in dispatch_window_cmd's
+// own match, which never calls this for them.
 fn window_cmd_to_action(cmd: WindowCmd) -> WindowAction {
     match cmd {
         WindowCmd::Next => WindowAction::Next,
@@ -2691,7 +2737,57 @@ fn window_cmd_to_action(cmd: WindowCmd) -> WindowAction {
         WindowCmd::FocusRight => WindowAction::FocusPane(PaneDirection::Right),
         WindowCmd::Balance => WindowAction::Balance,
         WindowCmd::GotoFirstWindow | WindowCmd::GotoLastWindow => {
-            unreachable!("handled directly in run_normal_mode_navigation, never reaches here")
+            unreachable!("handled directly in dispatch_window_cmd, never reaches here")
+        }
+    }
+}
+
+// Actually applies a resolved `<C-w>{cmd}` -- shared by run_normal_mode_
+// navigation's own KeyOutcome::Window arm and run_edit_frame's
+// EditOutcome::DetachedForWindowCmd (the `e` editor's own `<C-w>`, which
+// resolves the same KeyOutcome::Window but has no window/session state
+// of its own to apply it against -- see that variant's doc comment in
+// fileeditor.rs). Doesn't redraw/return anything itself beyond what
+// apply_window_action (or the GotoFirst/GotoLast branch) already does on
+// its own -- each caller decides what, if anything, to do once control
+// comes back: run_normal_mode_navigation exits its whole loop
+// afterward (nothing left to resume, a window-focus change); run_edit_
+// frame just falls through to whatever's now focused.
+#[allow(clippy::too_many_arguments)]
+fn dispatch_window_cmd(
+    cmd: WindowCmd,
+    count: Option<usize>,
+    sessions: &mut HashMap<SessionId, SessionState>,
+    windows: &mut Vec<WindowEntry>,
+    current_window: &mut usize,
+    next_session_id: &mut SessionId,
+    next_window_id: &mut u32,
+    sinks_are_grid: &mut bool,
+    term_rows: usize,
+    term_cols: usize,
+) {
+    match cmd {
+        // No WindowAction equivalent -- an absolute tab-position jump,
+        // not a repeatable action -- so this sets current_window
+        // directly instead of going through apply_window_action,
+        // matching Motion::GotoFirstLine/GotoLastLine's own default-vs-
+        // explicit-target split (see KeyOutcome::Window's own doc
+        // comment). Still needs the same freeze apply_window_action
+        // itself does up front (see freeze_focused_idle_prompt's own
+        // doc comment) -- this is the one window-focus-changing path
+        // that doesn't go through apply_window_action at all.
+        WindowCmd::GotoFirstWindow | WindowCmd::GotoLastWindow => {
+            freeze_focused_idle_prompt(sessions, windows, *current_window);
+            let default = if cmd == WindowCmd::GotoFirstWindow { 1 } else { windows.len() };
+            let target = count.unwrap_or(default);
+            *current_window = target.saturating_sub(1).min(windows.len().saturating_sub(1));
+            compositor_redraw(sessions, windows, *current_window, term_rows, term_cols);
+        }
+        _ => {
+            let action = window_cmd_to_action(cmd);
+            for _ in 0..count.unwrap_or(1).max(1) {
+                apply_window_action(action, sessions, windows, current_window, next_session_id, next_window_id, sinks_are_grid, term_rows, term_cols);
+            }
         }
     }
 }
@@ -2970,6 +3066,7 @@ fn run_normal_mode_navigation(
                     registers,
                     term_rows,
                     term_cols,
+                    None,
                 ) {
                     // Matches vim: an aborted/cancelled ':' command drops
                     // back into Normal mode, not out of it entirely.
@@ -3105,44 +3202,12 @@ fn run_normal_mode_navigation(
             | KeyOutcome::OpenLine { .. } => {
                 render_normal_mode_frame(&buf, rect, &vk, None);
             }
-            KeyOutcome::Window(cmd @ (WindowCmd::GotoFirstWindow | WindowCmd::GotoLastWindow), count) => {
-                // No WindowAction equivalent -- an absolute tab-position
-                // jump, not a repeatable action -- so this sets
-                // current_window directly instead of going through
-                // apply_window_action, matching Motion::GotoFirstLine/
-                // GotoLastLine's own default-vs-explicit-target split (see
-                // KeyOutcome::Window's own doc comment). Still needs the
-                // same freeze apply_window_action itself does up front
-                // (see freeze_focused_idle_prompt's own doc comment) --
-                // this is the one window-focus-changing path that doesn't
-                // go through apply_window_action at all. Focus-changing,
-                // same as any other Window outcome -- nothing to resume.
-                freeze_focused_idle_prompt(sessions, windows, *current_window);
-                let default = if cmd == WindowCmd::GotoFirstWindow { 1 } else { windows.len() };
-                let target = count.unwrap_or(default);
-                *current_window = target.saturating_sub(1).min(windows.len().saturating_sub(1));
-                compositor_redraw(sessions, windows, *current_window, term_rows, term_cols);
-                return Ok(None);
-            }
+            // dispatch_window_cmd does the actual work (shared with
+            // run_edit_frame's own identical need -- see its own doc
+            // comment); this loop just exits afterward, same as any
+            // other Window outcome -- a focus change, nothing to resume.
             KeyOutcome::Window(cmd, count) => {
-                let action = window_cmd_to_action(cmd);
-                for _ in 0..count.unwrap_or(1).max(1) {
-                    apply_window_action(
-                        action,
-                        sessions,
-                        windows,
-                        current_window,
-                        next_session_id,
-                        next_window_id,
-                        sinks_are_grid,
-                        term_rows,
-                        term_cols,
-                    );
-                }
-                // apply_window_action already ends with its own
-                // compositor_redraw -- nothing left to draw before
-                // returning to the (possibly now different) window's own
-                // live prompt. Focus-changing -- nothing to resume.
+                dispatch_window_cmd(cmd, count, sessions, windows, current_window, next_session_id, next_window_id, sinks_are_grid, term_rows, term_cols);
                 return Ok(None);
             }
             // Rendered on every keystroke, not just a resolved Motion --
@@ -3520,13 +3585,24 @@ fn run_command_mode(
     registers: &mut Registers,
     term_rows: usize,
     term_cols: usize,
+    // Seeds the very first prompt with already-typed text, cursor at its
+    // end -- the `e` editor's own ':' hand-off uses this (see
+    // fileeditor::EditOutcome::DetachedForCommand's own doc comment) so
+    // a command that turns out not to be one of its own w/q/wq/x/q!
+    // doesn't have to be retyped from scratch once it lands here. `None`
+    // (every other call site) starts with the ordinary empty buffer.
+    seed: Option<String>,
 ) -> CommandModeOutcome {
     let mut buffer = String::new();
     let mut transcript_visible = false;
     let prompt_row = command_mode_row(term_rows) + 1;
-    // Set only when Ctrl+Space fires below (see that arm's own comment) --
-    // consumed by the very next read_line call, then left None again.
-    let mut pending_initial: Option<(String, usize)> = None;
+    // Set from `seed` on the very first iteration, or by Ctrl+Space
+    // below (see that arm's own comment) on any later one -- consumed by
+    // the very next read_line call, then left None again either way.
+    let mut pending_initial: Option<(String, usize)> = seed.map(|s| {
+        let len = s.chars().count();
+        (s, len)
+    });
     loop {
         let prompt_str = if buffer.is_empty() { prompt::command_mode_prompt() } else { prompt::continuation() };
         print!("\x1b[{};1H", prompt_row);
