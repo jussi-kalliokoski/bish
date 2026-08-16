@@ -1088,9 +1088,96 @@ fn is_bash_file(buf: &TextBuffer) -> bool {
     buf.path().and_then(|p| p.extension()).is_some_and(|ext| ext == "bash")
 }
 
+// The buffer's own text, lines joined by '\n' -- what BashHighlighter
+// needs to see a construct that spans several physical lines (a
+// multi-line double-quoted string, a heredoc body) as the single token
+// it actually is, instead of each line's own lexer run finding a
+// dangling, unterminated piece of it with no idea what line came
+// before. Recomputed on every redraw, same as buffer_highlight_spans
+// below -- see that function's own doc comment on why that's an
+// accepted, not-yet-a-problem cost rather than something cached here.
+fn buffer_text(buf: &TextBuffer) -> String {
+    (0..buf.line_count())
+        .map(|l| (0..buf.line_len(l)).map(|c| buf.char_at(l, c).unwrap_or(' ')).collect::<String>())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+// The char offset `buffer_text`'s own joined string lands each line's
+// first character at -- a running total of line_len(l) real chars plus
+// one for the '\n' joining it to the next line. Computed once as a
+// prefix-sum vector, indexed by line number, rather than summed fresh
+// per row -- build_editor_frame's own loop calls this once and reuses
+// it, not once per visible row.
+fn line_starts(buf: &TextBuffer) -> Vec<usize> {
+    let mut starts = Vec::with_capacity(buf.line_count());
+    let mut pos = 0;
+    for l in 0..buf.line_count() {
+        starts.push(pos);
+        pos += buf.line_len(l) + 1;
+    }
+    starts
+}
+
+// Runs BashHighlighter once against the *whole* buffer text (see
+// buffer_text's own doc comment for why that, not one line at a time,
+// is what actually fixes a multi-line construct), for `.bash` files
+// only -- `is_bash_file`'s own doc comment covers everything else.
+// Recomputed on every redraw (build_editor_frame's own single call
+// site, once per keystroke) rather than cached on EditSession: this
+// editor's target files are scripts/configs, not large codebases, and
+// re-lexing one of those is well under a millisecond -- a real caching
+// need would show up as noticeable input lag first, at which point it's
+// a small, self-contained change (memoize on buf.is_dirty() going true)
+// rather than one worth guessing at up front. HighlightContext::
+// default() (no cwd, no known_functions): same "no context to offer"
+// choice command mode's own colon-line already makes, since nothing
+// here has a live Shell to pull those from -- Flag/Subcommand/Link/
+// InvalidCommand refinements that need them simply don't fire, same as
+// there.
+//
+// Not a full fix for every multi-line case: `next_span`'s own doc
+// comment (this same module) documents a pre-existing lexer position-
+// tracking gap for a heredoc body that itself contains a $VAR/$(...)
+// expansion -- content *after* such a heredoc in the same buffer can
+// still come out mis-highlighted. Narrower and pre-existing either way,
+// not something this change introduces or could fix without touching
+// lexer.rs's own heredoc-body capture.
+fn buffer_highlight_spans(buf: &TextBuffer) -> Vec<StyledSpan> {
+    if !is_bash_file(buf) {
+        return Vec::new();
+    }
+    let text = buffer_text(buf);
+    BashHighlighter
+        .highlight(&text, HighlightContext::default())
+        .into_iter()
+        .map(|s| {
+            let (fg, attrs) = highlight::default_style(s.kind);
+            StyledSpan { start: s.start, end: s.end, fg, attrs }
+        })
+        .collect()
+}
+
+// Slices `spans` (whole-buffer char offsets, from buffer_highlight_spans)
+// down to the ones actually touching [line_start, line_start + line_len)
+// -- one line's own visible extent -- translated to offsets local to
+// that line (0 = its own first character), which is what render_row's
+// `chars` array (also one line long) can actually be indexed by. A span
+// that starts on an earlier line and/or continues onto a later one
+// (exactly the multi-line case this whole pass exists for) is clamped
+// at both ends rather than dropped, so e.g. a multi-line string still
+// shows its color on every line it passes through.
+fn spans_for_line(spans: &[StyledSpan], line_start: usize, line_len: usize) -> Vec<StyledSpan> {
+    let line_end = line_start + line_len;
+    spans
+        .iter()
+        .filter(|s| s.start < line_end && s.end > line_start)
+        .map(|s| StyledSpan { start: s.start.saturating_sub(line_start), end: (s.end - line_start).min(line_len), fg: s.fg, attrs: s.attrs })
+        .collect()
+}
+
 // Reuses editor.rs's own compose_redraw pipeline (BashHighlighter ->
-// StyledSpan -> highlight::compose -> highlight::render_styled), just
-// fed a whole line at a time instead of the live prompt buffer, and with
+// StyledSpan -> highlight::compose -> highlight::render_styled), with
 // this editor's own selection highlighting (`highlights`, already
 // resolved to column ranges by build_editor_frame's own caller) as a
 // second compose() layer instead of editor.rs's ghost-text/search-match
@@ -1099,44 +1186,19 @@ fn is_bash_file(buf: &TextBuffer) -> bool {
 // not a distinct color, for the same reason editor.rs's own Visual-mode
 // selection layer uses it: applied *after* the syntax layer, so a
 // selection reads clearly regardless of what color it's covering,
-// matching vim's own selection-over-syntax convention.
-//
-// Highlighted against the *lexer's* own re-tokenization of this one
-// line in isolation, not the whole buffer -- see BashHighlighter's own
-// module doc comment on why (built for, and so far only ever run
-// against, single-line text). A construct that genuinely spans several
-// physical lines (an unterminated quote, a heredoc body) won't color
-// correctly across that boundary; everything else -- keywords, strings,
-// variables, comments, operators, redirects -- does. HighlightContext::
-// default() (no cwd, no known_functions): same "no context to offer"
-// choice command mode's own colon-line already makes, since nothing
-// here has a live Shell to pull those from -- Flag/Subcommand/Link/
-// InvalidCommand refinements that need them simply don't fire, same as
-// there.
-fn render_row(out: &mut String, buf: &TextBuffer, line: usize, cols: usize, highlights: &[(usize, usize)]) {
+// matching vim's own selection-over-syntax convention. `line_styled` is
+// this line's own slice of a whole-buffer highlight pass (see
+// spans_for_line), computed once by build_editor_frame's own caller
+// rather than per row.
+fn render_row(out: &mut String, buf: &TextBuffer, line: usize, cols: usize, line_styled: &[StyledSpan], highlights: &[(usize, usize)]) {
     let chars: Vec<char> = (0..cols).map(|c| buf.char_at(line, c).unwrap_or(' ')).collect();
-
-    let styled: Vec<StyledSpan> = if is_bash_file(buf) {
-        let line_len = buf.line_len(line);
-        let text: String = (0..line_len).map(|c| buf.char_at(line, c).unwrap_or(' ')).collect();
-        BashHighlighter
-            .highlight(&text, HighlightContext::default())
-            .into_iter()
-            .map(|s| {
-                let (fg, attrs) = highlight::default_style(s.kind);
-                StyledSpan { start: s.start, end: s.end, fg, attrs }
-            })
-            .collect()
-    } else {
-        Vec::new()
-    };
 
     let selected: Vec<StyledSpan> = highlights
         .iter()
         .map(|&(start, end)| StyledSpan { start, end, fg: vt100::Color::Default, attrs: vt100::CellAttrs { reverse: true, ..vt100::CellAttrs::default() } })
         .collect();
 
-    let cells = highlight::compose(&chars, &[&styled, &selected]);
+    let cells = highlight::compose(&chars, &[line_styled, &selected]);
     out.push_str(&highlight::render_styled(&cells));
 }
 
@@ -1171,6 +1233,11 @@ pub fn build_editor_frame(buf: &TextBuffer, vk: &VimKeys, mode: EditorMode, rect
     let gutter_width = total_gutter_width(buf).min(rect.cols.saturating_sub(1));
     let content_cols = rect.cols - gutter_width;
     let active = if mode == EditorMode::Normal { active_visual_range(vk, buf) } else { None };
+    // Computed once for the whole buffer, not per visible row -- see
+    // buffer_highlight_spans's own doc comment for why a multi-line
+    // construct needs that.
+    let whole_styled = buffer_highlight_spans(buf);
+    let starts = line_starts(buf);
     let mut out = String::new();
     for r in 0..content_rows {
         let line = buf.viewport_top() + r;
@@ -1183,7 +1250,8 @@ pub fn build_editor_frame(buf: &TextBuffer, vk: &VimKeys, mode: EditorMode, rect
                     highlights.push(cols);
                 }
             }
-            render_row(&mut out, buf, line, content_cols, &highlights);
+            let line_styled = spans_for_line(&whole_styled, starts[line], buf.line_len(line));
+            render_row(&mut out, buf, line, content_cols, &line_styled, &highlights);
         }
     }
 
