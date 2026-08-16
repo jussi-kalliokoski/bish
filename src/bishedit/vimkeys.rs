@@ -156,6 +156,17 @@ pub enum KeyOutcome {
     /// found). A no-op if there's no number on the line from the cursor
     /// onward.
     AdjustNumber { delta: i64 },
+    /// `o`/`O`: opens a fresh blank line below (`above: false`) or above
+    /// (`above: true`) the current one and enters Insert mode there. Not
+    /// an `EnterInsert(InsertCmd)`: every existing `InsertCmd` describes
+    /// where to start editing on a line that already exists -- this one
+    /// needs to *create* a line first, which only a caller backed by a
+    /// real multi-line buffer can do (see `KeyOutcome::Join`'s own doc
+    /// comment for the same "single-line `LineBuffer` has no next/
+    /// previous line" reasoning -- a no-op there, same as `Join`). Any
+    /// count typed before it is discarded, same simplification
+    /// `EnterInsert`'s own doc comment already documents for `3i`.
+    OpenLine { above: bool },
     /// The key was consumed as part of an in-progress sequence (a count
     /// digit, or a prefix awaiting its next character); no motion yet.
     Pending,
@@ -884,6 +895,14 @@ impl VimKeys {
         KeyOutcome::EnterReplace
     }
 
+    // Same shape as emit_insert -- a leading count has no effect yet.
+    fn emit_open_line(&mut self, above: bool) -> KeyOutcome {
+        self.count = None;
+        self.pending = Pending::None;
+        self.last_completed = std::mem::take(&mut self.current_input);
+        KeyOutcome::OpenLine { above }
+    }
+
     fn emit_reselect_visual(&mut self) -> KeyOutcome {
         self.count = None;
         self.pending = Pending::None;
@@ -1104,6 +1123,8 @@ impl VimKeys {
                 KeyOutcome::Pending
             }
             Key::Char('R') => self.emit_replace(),
+            Key::Char('o') => self.emit_open_line(false),
+            Key::Char('O') => self.emit_open_line(true),
             Key::Char('y') => self.emit_operator(Op::Yank),
             // `Y` is vim's own direct synonym for `yy` -- not "yank to end
             // of line" the way `D`/`C` work relative to their lowercase
@@ -2816,6 +2837,21 @@ mod tests {
     fn capital_r_resolves_to_enter_replace() {
         let mut vk = VimKeys::new();
         assert_eq!(vk.feed(Key::Char('R')), KeyOutcome::EnterReplace);
+    }
+
+    #[test]
+    fn o_and_capital_o_resolve_to_open_line() {
+        let mut vk = VimKeys::new();
+        assert_eq!(vk.feed(Key::Char('o')), KeyOutcome::OpenLine { above: false });
+        let mut vk = VimKeys::new();
+        assert_eq!(vk.feed(Key::Char('O')), KeyOutcome::OpenLine { above: true });
+    }
+
+    #[test]
+    fn open_line_discards_a_leading_count() {
+        let mut vk = VimKeys::new();
+        let keys = [Key::Char('3'), Key::Char('o')];
+        assert_eq!(last(&mut vk, &keys), KeyOutcome::OpenLine { above: false });
     }
 
     #[test]

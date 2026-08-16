@@ -3033,7 +3033,7 @@ fn run_normal_mode_navigation(
                 }
                 render_normal_mode_frame(&buf, rect, &vk, None);
             }
-            // `p`/`P`/`x`/`J`/`gJ`/`ys`/`ds`/`cs`/`r`/`~` are all a
+            // `p`/`P`/`x`/`J`/`gJ`/`ys`/`ds`/`cs`/`r`/`~`/`o`/`O` are all a
             // deliberate no-op here: `ScreenBuffer` is read-only by
             // construction (a view over already-rendered scrollback, not
             // an editable buffer -- see its own doc comment), and
@@ -3048,7 +3048,8 @@ fn run_normal_mode_navigation(
             | KeyOutcome::ChangeSurround { .. }
             | KeyOutcome::ReplaceChar { .. }
             | KeyOutcome::ToggleCase { .. }
-            | KeyOutcome::AdjustNumber { .. } => {
+            | KeyOutcome::AdjustNumber { .. }
+            | KeyOutcome::OpenLine { .. } => {
                 render_normal_mode_frame(&buf, rect, &vk, None);
             }
             KeyOutcome::Window(cmd @ (WindowCmd::GotoFirstWindow | WindowCmd::GotoLastWindow), count) => {

@@ -266,6 +266,13 @@ pub fn drive(session: &mut EditSession, rect: Rect, registers: &mut Registers, o
                 InsertOutcome::Detached => return Ok(EditOutcome::Detached),
                 InsertOutcome::Done => {}
             },
+            KeyOutcome::OpenLine { above } => {
+                open_line(&mut session.buffer, above);
+                match run_insert_mode(session, rect, registers, on_idle, false)? {
+                    InsertOutcome::Detached => return Ok(EditOutcome::Detached),
+                    InsertOutcome::Done => {}
+                }
+            }
             KeyOutcome::ToggleCase { count } => toggle_case(&mut session.buffer, count.unwrap_or(1).max(1)),
             KeyOutcome::AdjustNumber { delta } => adjust_number(&mut session.buffer, delta),
             // <C-w> is still vimkeys' own window-leader prefix here too
@@ -656,6 +663,27 @@ fn redirect_cw_to_ce(buf: &TextBuffer, m: &motion::Motion) -> motion::Motion {
 // editor.rs's own single-line `SubstituteLine` handling does, since
 // unlike `LineBuffer`, "the current line" and "the whole buffer" are not
 // the same thing here.
+// `o`/`O`: splices a bare newline in at the end of the current line
+// (`above: false`) or the start of it (`above: true`) via `insert_text`,
+// which does the actual line-splitting. For `o`, `insert_text`'s own
+// returned cursor already lands exactly right (row + 1, col 0 -- the
+// fresh empty line below). For `O` it doesn't: inserting at column 0
+// pushes the *original* content down to row + 1 and leaves the new empty
+// line at the original `row`, but `insert_text`'s "cursor right after
+// what was just inserted" convention still reports (row + 1, 0) -- the
+// pushed-down line, not the new blank one -- so this repositions
+// explicitly for that case.
+fn open_line(buf: &mut TextBuffer, above: bool) {
+    let (row, _) = buf.cursor();
+    if above {
+        buf.insert_text((row, 0), "\n");
+        buf.set_cursor(row, 0);
+    } else {
+        let len = buf.line_len(row);
+        buf.insert_text((row, len), "\n");
+    }
+}
+
 fn resolve_insert_start(buf: &mut TextBuffer, cmd: InsertCmd) {
     let (row, col) = buf.cursor();
     match cmd {

@@ -1727,9 +1727,11 @@ fn run_line_normal_mode(
                     // Ctrl-W meaning -- intentionally not special-cased
                     // away, even though there's no window/pane state for
                     // it to act on in this context (a harmless no-op).
-                    // `Join` is a no-op for the same reason: `LineBuffer`
-                    // is a single line by construction (see its own doc
-                    // comment) -- there's never a next line to join with.
+                    // `Join`/`OpenLine` (`o`/`O`) are no-ops for the same
+                    // reason: `LineBuffer` is a single line by
+                    // construction (see its own doc comment) -- there's
+                    // never a next/previous line to join with or open one
+                    // beside.
                     KeyOutcome::AddSurround { target, ch } => add_surround(&mut lb, target, ch),
                     KeyOutcome::DeleteSurround { ch } => delete_surround(&mut lb, ch),
                     KeyOutcome::ChangeSurround { ch, replacement } => change_surround(&mut lb, ch, replacement),
@@ -1749,7 +1751,7 @@ fn run_line_normal_mode(
                     KeyOutcome::EnterReplace => break LineNormalExit::ToInsert,
                     KeyOutcome::ToggleCase { count } => toggle_case(&mut lb, count.unwrap_or(1).max(1)),
                     KeyOutcome::AdjustNumber { delta } => adjust_number(&mut lb, delta),
-                    KeyOutcome::Window(..) | KeyOutcome::Join { .. } | KeyOutcome::Pending | KeyOutcome::None => {}
+                    KeyOutcome::Window(..) | KeyOutcome::Join { .. } | KeyOutcome::OpenLine { .. } | KeyOutcome::Pending | KeyOutcome::None => {}
                 }
             }
         }
@@ -2374,9 +2376,16 @@ fn run_one_shot_normal_command(ed: &mut LineEditor, registers: &mut Registers, o
                     // is "do exactly one command, then resume typing"
                     // anyway, which Visual mode's whole point (extending a
                     // selection over several subsequent keys) doesn't fit.
-                    // `Join` is a no-op here for the same single-line
-                    // reason `run_line_normal_mode`'s own arm documents.
-                    KeyOutcome::Window(..) | KeyOutcome::EnterVisual(_) | KeyOutcome::ReselectVisual | KeyOutcome::Join { .. } | KeyOutcome::Jump { .. } | KeyOutcome::None => break None,
+                    // `Join`/`OpenLine` are no-ops here for the same
+                    // single-line reason `run_line_normal_mode`'s own arm
+                    // documents.
+                    KeyOutcome::Window(..)
+                    | KeyOutcome::EnterVisual(_)
+                    | KeyOutcome::ReselectVisual
+                    | KeyOutcome::Join { .. }
+                    | KeyOutcome::OpenLine { .. }
+                    | KeyOutcome::Jump { .. }
+                    | KeyOutcome::None => break None,
                     KeyOutcome::Pending => continue,
                 }
             }
