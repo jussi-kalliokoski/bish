@@ -84,7 +84,43 @@ pub enum Key {
     // No shell line-editing use either -- added for bishedit's own
     // Normal-mode number decrement (`Ctrl-X`, `Ctrl-A`'s own mirror).
     CtrlX,
+    // An SGR (mode 1006) mouse report -- see `read_sgr_mouse`'s own doc
+    // comment for the wire format. Decoded here purely so a real mouse
+    // event arriving at any of this codebase's several `read_key`-based
+    // loops (the shell prompt's own typing loop, bishedit's normal-mode
+    // navigation, the `e` file editor) is safely consumed as one unit
+    // rather than leaking its raw digit/`;`/`M` bytes through as
+    // individual bogus keystrokes (what happened before this variant
+    // existed -- `read_escape`'s param loop had no notion of the `<`
+    // marker byte this sequence starts with). None of those loops act on
+    // it yet -- it lands in whatever catch-all bucket already exists
+    // there for an unbound key, same as `Unknown`. The one place mouse
+    // input is actually *used* is `repl.rs`'s `drive_fg_job`, which never
+    // goes through `Key` at all (it forwards raw stdin bytes straight to
+    // a foreground job's pty, mouse sequences included) -- see its own
+    // doc comment on why real-terminal mouse reporting is enabled only
+    // while that loop owns the terminal.
+    Mouse(MouseEvent),
     Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MouseEvent {
+    // The raw Cb parameter from the SGR sequence: encodes which button
+    // (bits 0-1, plus bit 6 for buttons 4-7), whether this is motion
+    // while a button is held (bit 5), and Shift/Meta/Ctrl modifiers (bits
+    // 2-4) -- xterm's own ctlseqs.txt has the full bit layout. Left
+    // un-decoded into separate fields since nothing here reads it yet;
+    // whatever eventually does (click-to-focus-pane, in a later pass)
+    // can add real accessors then instead of guessing at a shape now.
+    pub button: u16,
+    // 1-indexed column/row, matching the terminal's own coordinate
+    // convention (row 1 = top).
+    pub col: u16,
+    pub row: u16,
+    // `true` for a press/drag (final byte `M`), `false` for a release
+    // (final byte `m`).
+    pub pressed: bool,
 }
 
 // How long to wait for further bytes after a lone Esc before deciding it
@@ -172,14 +208,47 @@ fn read_escape() -> io::Result<Key> {
         b'[' | b'O' => {}
         _ => return Ok(Key::Unknown),
     }
-    // Collect parameter bytes (digits and ';') until the final byte (a
-    // letter, or '~') arrives -- covers both the simple forms (no
-    // params, e.g. "\x1b[D" for Left) and the modified ones xterm/tmux
-    // send for a Ctrl/Alt/Shift-held arrow or Home/End (e.g. "\x1b[1;3D"
-    // for Alt+Left), plus the "\x1b[<n>~" family (Delete/Home/End on
-    // some terminals) -- see decode_csi_final for how each is told
-    // apart.
-    let mut params = String::new();
+    // An SGR mouse report ("\x1b[<Cb;Cx;CyM/m") starts with a '<' marker
+    // right after the CSI intro -- unlike every other sequence this
+    // decoder handles, whose first param byte (if any) is always a digit
+    // or ';' (see the loop just below). Peeking for it here, before that
+    // loop even starts, keeps this the only place that needs to know
+    // about it.
+    if b1 == b'[' {
+        if !term::stdin_ready(ESCAPE_TIMEOUT_MS) {
+            return Ok(Key::Unknown);
+        }
+        let b2 = match read_byte()? {
+            Some(b) => b,
+            None => return Ok(Key::Unknown),
+        };
+        if b2 == b'<' {
+            return read_sgr_mouse();
+        }
+        // Not a mouse report -- fall into the ordinary param-collection
+        // loop below with `b2` as its first byte, exactly as if it had
+        // been read there in the first place.
+        return read_csi_params(String::from(b2 as char));
+    }
+    read_csi_params(String::new())
+}
+
+// Collects parameter bytes (digits and ';') until the final byte (a
+// letter, or '~') arrives -- covers both the simple forms (no params,
+// e.g. "\x1b[D" for Left) and the modified ones xterm/tmux send for a
+// Ctrl/Alt/Shift-held arrow or Home/End (e.g. "\x1b[1;3D" for Alt+Left),
+// plus the "\x1b[<n>~" family (Delete/Home/End on some terminals) -- see
+// decode_csi_final for how each is told apart. `seed` is whatever byte
+// `read_escape` already consumed while peeking for a mouse report's `<`
+// marker (empty for CSI-O sequences, which never need that peek).
+fn read_csi_params(seed: String) -> io::Result<Key> {
+    let mut params = seed;
+    if params.chars().next().is_some_and(|c| !c.is_ascii_digit() && c != ';') {
+        // The peeked byte was itself the final byte (a paramless
+        // sequence like "\x1b[H" for Home) -- nothing left to collect.
+        let final_byte = params.pop().unwrap() as u8;
+        return Ok(decode_csi_final(&params, final_byte));
+    }
     loop {
         if !term::stdin_ready(ESCAPE_TIMEOUT_MS) {
             return Ok(Key::Unknown);
@@ -193,6 +262,48 @@ fn read_escape() -> io::Result<Key> {
             continue;
         }
         return Ok(decode_csi_final(&params, b));
+    }
+}
+
+// "\x1b[<" already consumed. Collects "Cb;Cx;Cy" then a final 'M' (press
+// or drag) or 'm' (release), matching xterm's SGR (mode 1006) mouse
+// protocol -- the only mouse encoding this decoder understands (the
+// legacy X10/UTF-8 encodings some terminals still default to are out of
+// scope: they can't represent coordinates past column/row 223, and
+// nothing in this codebase enables mouse reporting on the real terminal
+// without also requesting SGR mode -- see drive_fg_job's own doc
+// comment).
+fn read_sgr_mouse() -> io::Result<Key> {
+    let mut params = String::new();
+    loop {
+        if !term::stdin_ready(ESCAPE_TIMEOUT_MS) {
+            return Ok(Key::Unknown);
+        }
+        let b = match read_byte()? {
+            Some(b) => b,
+            None => return Ok(Key::Unknown),
+        };
+        match b {
+            b'M' | b'm' => return Ok(decode_sgr_mouse_final(&params, b)),
+            b if b.is_ascii_digit() || b == b';' => params.push(b as char),
+            _ => return Ok(Key::Unknown),
+        }
+    }
+}
+
+// `params` is the "Cb;Cx;Cy" collected between "\x1b[<" and `final_byte`
+// (always 'M' or 'm' -- `read_sgr_mouse`'s own only two call sites for
+// this). Split out as a pure function, mirroring decode_csi_final's own
+// split from read_escape, so the actual parsing has unit test coverage
+// without needing real stdin bytes.
+fn decode_sgr_mouse_final(params: &str, final_byte: u8) -> Key {
+    let parts: Vec<&str> = params.split(';').collect();
+    let button = parts.first().and_then(|s| s.parse::<u16>().ok());
+    let col = parts.get(1).and_then(|s| s.parse::<u16>().ok());
+    let row = parts.get(2).and_then(|s| s.parse::<u16>().ok());
+    match (button, col, row) {
+        (Some(button), Some(col), Some(row)) => Key::Mouse(MouseEvent { button, col, row, pressed: final_byte == b'M' }),
+        _ => Key::Unknown,
     }
 }
 
@@ -1358,7 +1469,7 @@ pub fn read_line(
             // own doc comment) -- Normal mode's own `Ctrl-A`/`Ctrl-X`
             // (number increment/decrement) is reached via Ctrl-E's own
             // vim excursion, same as every other Normal-mode-only key.
-            Key::AltLeft | Key::AltRight | Key::AltUp | Key::CtrlY | Key::CtrlX | Key::Unknown => {}
+            Key::AltLeft | Key::AltRight | Key::AltUp | Key::CtrlY | Key::CtrlX | Key::Mouse(_) | Key::Unknown => {}
         }
         // Recomputed fresh every iteration -- see compute_suggestion's
         // own doc comment. Must happen after the match (so it reflects
@@ -2481,6 +2592,32 @@ mod tests {
     #[test]
     fn decode_csi_final_unrecognized_final_byte_is_unknown() {
         assert_eq!(decode_csi_final("", b'Q'), Key::Unknown);
+    }
+
+    #[test]
+    fn decode_sgr_mouse_final_press_and_release() {
+        assert_eq!(decode_sgr_mouse_final("0;12;5", b'M'), Key::Mouse(MouseEvent { button: 0, col: 12, row: 5, pressed: true }));
+        assert_eq!(decode_sgr_mouse_final("0;12;5", b'm'), Key::Mouse(MouseEvent { button: 0, col: 12, row: 5, pressed: false }));
+    }
+
+    #[test]
+    fn decode_sgr_mouse_final_carries_the_raw_button_code() {
+        // Bit 5 (0x20) set means "motion while a button is held" in SGR's
+        // own Cb encoding -- a drag, not a fresh press. This decoder
+        // deliberately doesn't interpret that bit itself (see MouseEvent's
+        // own doc comment); just confirms the raw code round-trips.
+        assert_eq!(decode_sgr_mouse_final("32;1;1", b'M'), Key::Mouse(MouseEvent { button: 32, col: 1, row: 1, pressed: true }));
+    }
+
+    #[test]
+    fn decode_sgr_mouse_final_missing_params_is_unknown() {
+        assert_eq!(decode_sgr_mouse_final("0;12", b'M'), Key::Unknown);
+        assert_eq!(decode_sgr_mouse_final("", b'M'), Key::Unknown);
+    }
+
+    #[test]
+    fn decode_sgr_mouse_final_non_numeric_params_is_unknown() {
+        assert_eq!(decode_sgr_mouse_final("x;y;z", b'M'), Key::Unknown);
     }
 
     fn make_editor(text: &str, cursor: usize) -> LineEditor {

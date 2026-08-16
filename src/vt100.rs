@@ -662,8 +662,22 @@ impl Screen {
         }
     }
 
+    // ECMA-48 reserves '<', '=', '>' and '?' (0x3C-0x3F) as CSI parameter
+    // bytes for private/experimental use -- xterm's own ctlseqs.txt uses
+    // all four this way (DEC private modes lead with '?'; SGR mouse
+    // reports, among others, lead with '<'). Treating only '?' as
+    // "private" used to mean a sequence like an SGR mouse report
+    // ("ESC[<0;5;3M", which this terminal itself only ever *emits*, never
+    // parses as input -- but a job's own stdout can still contain one,
+    // e.g. echoing back raw bytes it read from its stdin) fell through
+    // to dispatch_csi's public-sequence match instead, where 'M' happens
+    // to mean "delete N lines" (DL) -- corrupting the grid instead of
+    // being safely ignored the way an unrecognized private sequence
+    // already is (dispatch_private_mode's own final-byte match no-ops
+    // anything that isn't 'h'/'l'). Recognizing all four leaders as
+    // private closes that off in general, not just for this one case.
     fn parse_params(&self) -> (bool, Vec<i64>) {
-        let private = self.csi_raw.starts_with('?');
+        let private = self.csi_raw.starts_with(['<', '=', '>', '?']);
         let rest = if private { &self.csi_raw[1..] } else { &self.csi_raw[..] };
         let params: Vec<i64> = rest.split(';').map(|p| p.parse::<i64>().unwrap_or(0)).collect();
         (private, params)
@@ -961,6 +975,15 @@ mod tests {
     }
 
     #[test]
+    fn mouse_reporting_tracks_the_1000_1002_1003_1006_decset_group() {
+        let mut s = Screen::new(5, 10);
+        s.feed(b"\x1b[?1002h\x1b[?1006h");
+        assert!(s.mouse_reporting);
+        s.feed(b"\x1b[?1006l\x1b[?1002l\x1b[?1000l");
+        assert!(!s.mouse_reporting);
+    }
+
+    #[test]
     fn cursor_positioning_csi_h() {
         let mut s = Screen::new(5, 10);
         s.feed(b"\x1b[3;4Hy");
@@ -1001,6 +1024,23 @@ mod tests {
         assert_eq!(s.scrollback.len(), 1);
         let sb: String = s.scrollback[0].iter().map(|c| c.ch).collect::<String>().trim_end().to_string();
         assert_eq!(sb, "one");
+    }
+
+    #[test]
+    fn an_echoed_sgr_mouse_report_does_not_delete_a_line() {
+        // A job's own stdout can legitimately contain an SGR mouse report
+        // (e.g. echoing back raw bytes it read from its stdin) even
+        // though this terminal only ever *emits* one, never receives one
+        // as real input -- 'M' is also the public (non-private) final
+        // byte for DL (delete N lines), so this would previously wipe
+        // the second row instead of being safely ignored the way any
+        // other unrecognized private-marked sequence already is.
+        let mut s = Screen::new(3, 20);
+        s.feed(b"row0\r\nrow1\r\nrow2");
+        s.feed(b"\x1b[<0;5;3M");
+        assert_eq!(text_row(&s, 0), "row0");
+        assert_eq!(text_row(&s, 1), "row1");
+        assert_eq!(text_row(&s, 2), "row2");
     }
 
     #[test]

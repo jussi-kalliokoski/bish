@@ -1574,6 +1574,34 @@ enum FgOutcome {
     Stopped,
 }
 
+const MOUSE_REPORTING_ENABLE: &str = "\x1b[?1000h\x1b[?1002h\x1b[?1006h";
+const MOUSE_REPORTING_DISABLE: &str = "\x1b[?1006l\x1b[?1002l\x1b[?1000l";
+
+// Turns real-terminal mouse reporting on/off (SGR extended coordinates,
+// mode 1006, plus button-event tracking, mode 1002) to match whatever
+// the job's own program has asked for on its virtual screen (vt100::
+// Screen::mouse_reporting, set by its own DECSET 1000/1002/1003/1006
+// request -- see that field's own doc comment: all four collapse into
+// one flag there already, so this can't mirror "just clicks" vs. "every
+// motion" any more precisely than that; 1002 is a reasonable default
+// either way, tmux's own). A no-op if the wanted state already matches
+// `enabled`. Called from drive_fg_job only -- the one place a job's own
+// pty output (and thus a fresh DECSET request) is actually read while
+// this job also owns real stdin, so it's the only place enabling this on
+// the *real* terminal is ever correct (see drive_fg_job's own doc
+// comment on why it's turned back off again before returning,
+// unconditionally, rather than left however the job happened to leave
+// it).
+fn sync_mouse_reporting(enabled: &mut bool, screen: &Rc<RefCell<vt100::Screen>>) {
+    let wants = screen.borrow().mouse_reporting;
+    if wants == *enabled {
+        return;
+    }
+    print!("{}", if wants { MOUSE_REPORTING_ENABLE } else { MOUSE_REPORTING_DISABLE });
+    let _ = io::stdout().flush();
+    *enabled = wants;
+}
+
 // Drives a job pushed as a Frame::Job: reads its pty master and feeds
 // bytes into `screen`, calls `redraw` after every batch of output, and
 // forwards raw bytes read from bish's own stdin straight to the job's pty
@@ -1602,12 +1630,25 @@ enum FgOutcome {
 // job, it just stops *this shell* from actively watching it, exactly
 // like switching a real terminal multiplexer pane away from a running
 // program.
+//
+// Real mouse events (an SGR sequence typed at bish's own stdin) reach the
+// job below via the same raw-forwarding this loop already does for every
+// other byte -- see sync_mouse_reporting's own doc comment for the
+// on/off toggle that makes the real terminal actually send them.
 fn drive_fg_job(job: &mut exec::FgJob, screen: &Rc<RefCell<vt100::Screen>>, mut redraw: impl FnMut(), mut on_idle: impl FnMut()) -> FgOutcome {
     use std::io::{Read, Write};
     use std::os::unix::io::AsRawFd;
 
     pty::set_nonblocking(job.pty_master().as_raw_fd());
     let _raw_guard = term::RawGuard::enable(0).ok();
+
+    // Checked once up front (in case the job already asked for mouse
+    // reporting before this particular drive call started -- e.g.
+    // resuming a previously-detached job) and again after every batch of
+    // freshly-read output below, since that's exactly when a fresh
+    // DECSET request could have just arrived.
+    let mut mouse_enabled = false;
+    sync_mouse_reporting(&mut mouse_enabled, screen);
 
     let mut buf = [0u8; 4096];
     // Caps how many chunks get drained per outer-loop tick before
@@ -1644,6 +1685,7 @@ fn drive_fg_job(job: &mut exec::FgJob, screen: &Rc<RefCell<vt100::Screen>>, mut 
             }
         }
         if made_progress {
+            sync_mouse_reporting(&mut mouse_enabled, screen);
             redraw();
         }
 
@@ -1723,6 +1765,17 @@ fn drive_fg_job(job: &mut exec::FgJob, screen: &Rc<RefCell<vt100::Screen>>, mut 
         }
     };
     drop(_raw_guard);
+    // Unconditionally, regardless of which `break` above got here: the
+    // real terminal has no notion of "this job's own mouse mode," so
+    // leaving it enabled past this point (however the job itself might
+    // still feel about it) would leak mouse escape sequences into
+    // whatever reads stdin next -- the shell prompt, bishedit's own
+    // normal-mode navigation, .... Harmless (and cheap) to send even if
+    // it was never actually turned on.
+    if mouse_enabled {
+        print!("{MOUSE_REPORTING_DISABLE}");
+        let _ = io::stdout().flush();
+    }
     redraw();
     outcome
 }
