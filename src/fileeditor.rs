@@ -178,7 +178,14 @@ pub fn drive(session: &mut EditSession, rect: Rect, registers: &mut Registers, o
                 render_editor_frame(&session.buffer, &session.vk, EditorMode::Normal, rect);
                 continue;
             }
-            Key::Escape if session.vk.is_idle() && (session.vk.is_visual() || !session.buffer.selections.is_empty()) => {
+            // `Ctrl-C` is a plain alias for `Escape` everywhere in this
+            // editor (here, and `run_insert_mode`'s own identical arm) --
+            // unlike the shell prompt, where Ctrl-C's real SIGINT-adjacent
+            // meaning (clear the current line) is still load-bearing, an
+            // open `e` session has no such competing use for it, so it's
+            // free to also mean "back to Normal," matching vim's own
+            // Ctrl-C-also-leaves-Insert/Visual convention.
+            Key::Escape | Key::CtrlC if session.vk.is_idle() && (session.vk.is_visual() || !session.buffer.selections.is_empty()) => {
                 let end_cursor = session.buffer.cursor();
                 session.vk.end_visual(end_cursor);
                 session.buffer.selections.clear();
@@ -777,7 +784,10 @@ fn run_insert_mode(session: &mut EditSession, rect: Rect, registers: &mut Regist
                 registers.set_last_insert(inserted);
                 return Ok(InsertOutcome::Detached);
             }
-            Key::Escape => {
+            // See the identical `Escape | CtrlC` arm in `drive`'s own
+            // Visual-mode handling for why Ctrl-C is a plain alias for
+            // Escape throughout this editor.
+            Key::Escape | Key::CtrlC => {
                 session.buffer.set_mark('^', session.buffer.cursor());
                 registers.set_last_insert(inserted);
                 return Ok(InsertOutcome::Done);
