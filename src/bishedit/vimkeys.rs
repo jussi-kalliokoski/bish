@@ -127,6 +127,22 @@ pub enum KeyOutcome {
     /// pair (`motion::surround_delims`) instead of removing them --
     /// unlike `ds`, never touches any padding around them.
     ChangeSurround { ch: char, replacement: char },
+    /// `r{ch}`: replaces `count` characters starting at the cursor with
+    /// `ch` each, staying in Normal mode -- vim's own single-character
+    /// replace. The caller refuses (no-op) if fewer than `count`
+    /// characters remain on the line from the cursor onward, matching
+    /// vim: `r` never crosses a line break or extends the buffer.
+    ReplaceChar { ch: char, count: Option<usize> },
+    /// `R`: enters Replace mode at the cursor -- like Insert mode, but
+    /// each typed character overwrites the one already there (extending
+    /// the line once past its end) instead of shifting it rightward.
+    /// Not an `EnterInsert(InsertCmd)`: no repositioning is needed first
+    /// (`R` always starts exactly at the cursor), and the *typing*
+    /// itself behaves differently for as long as the mode lasts, which
+    /// `InsertCmd` has no way to express (it only ever describes a
+    /// one-time starting position/deletion, resolved once before an
+    /// ordinary insert loop begins).
+    EnterReplace,
     /// The key was consumed as part of an in-progress sequence (a count
     /// digit, or a prefix awaiting its next character); no motion yet.
     Pending,
@@ -359,6 +375,8 @@ enum Pending {
     ChangeSurroundTarget,
     // `cs{ch}` -- awaiting the replacement character.
     ChangeSurroundChar { ch: char },
+    // `r` -- awaiting its one replacement character.
+    ReplaceChar,
     Z,
     Window,
     // <C-w>g -- awaiting the second 'g' of <C-w>gg, mirroring plain `gg`'s
@@ -772,6 +790,7 @@ impl VimKeys {
             Pending::DeleteSurroundTarget => self.feed_delete_surround_target(key),
             Pending::ChangeSurroundTarget => self.feed_change_surround_target(key),
             Pending::ChangeSurroundChar { ch } => self.feed_change_surround_char(key, ch),
+            Pending::ReplaceChar => self.feed_replace_char(key),
             Pending::Z => self.feed_z(key),
             Pending::Window => self.feed_window(key),
             Pending::WindowG => self.feed_window_g(key),
@@ -822,6 +841,13 @@ impl VimKeys {
         self.pending = Pending::None;
         self.last_completed = std::mem::take(&mut self.current_input);
         KeyOutcome::EnterVisual(shape)
+    }
+
+    fn emit_replace(&mut self) -> KeyOutcome {
+        self.count = None;
+        self.pending = Pending::None;
+        self.last_completed = std::mem::take(&mut self.current_input);
+        KeyOutcome::EnterReplace
     }
 
     fn emit_reselect_visual(&mut self) -> KeyOutcome {
@@ -1039,6 +1065,11 @@ impl VimKeys {
             Key::Char('s') => self.emit_insert(InsertCmd::SubstituteChar),
             Key::Char('S') => self.emit_insert(InsertCmd::SubstituteLine),
             Key::Char('C') => self.emit_insert(InsertCmd::ChangeToEnd),
+            Key::Char('r') => {
+                self.pending = Pending::ReplaceChar;
+                KeyOutcome::Pending
+            }
+            Key::Char('R') => self.emit_replace(),
             Key::Char('y') => self.emit_operator(Op::Yank),
             // `Y` is vim's own direct synonym for `yy` -- not "yank to end
             // of line" the way `D`/`C` work relative to their lowercase
@@ -1244,6 +1275,18 @@ impl VimKeys {
         self.pending = Pending::None;
         self.last_completed = std::mem::take(&mut self.current_input);
         KeyOutcome::ChangeSurround { ch, replacement }
+    }
+
+    // `r{ch}` -- any character (no validity restriction, unlike the
+    // surround targets above: `r` can replace with literally anything).
+    fn feed_replace_char(&mut self, key: Key) -> KeyOutcome {
+        let Key::Char(c) = key else {
+            return self.abort();
+        };
+        let count = self.count.take();
+        self.pending = Pending::None;
+        self.last_completed = std::mem::take(&mut self.current_input);
+        KeyOutcome::ReplaceChar { ch: c, count }
     }
 
     // The object character after `i`/`a` while an operator is armed --
@@ -2671,6 +2714,35 @@ mod tests {
         let mut vk = VimKeys::new();
         vk.feed(Key::Char('d'));
         assert!(!vk.is_idle(), "an operator is armed, awaiting its motion");
+    }
+
+    #[test]
+    fn r_resolves_to_replace_char_with_the_typed_character_and_count() {
+        let mut vk = VimKeys::new();
+        assert_eq!(last(&mut vk, &[Key::Char('r'), Key::Char('x')]), KeyOutcome::ReplaceChar { ch: 'x', count: None });
+        let mut vk = VimKeys::new();
+        let keys = [Key::Char('3'), Key::Char('r'), Key::Char('x')];
+        assert_eq!(last(&mut vk, &keys), KeyOutcome::ReplaceChar { ch: 'x', count: Some(3) });
+    }
+
+    #[test]
+    fn r_accepts_any_character_including_punctuation() {
+        let mut vk = VimKeys::new();
+        assert_eq!(last(&mut vk, &[Key::Char('r'), Key::Char(' ')]), KeyOutcome::ReplaceChar { ch: ' ', count: None });
+    }
+
+    #[test]
+    fn r_with_a_non_char_key_aborts_and_does_not_leak() {
+        let mut vk = VimKeys::new();
+        assert_eq!(vk.feed(Key::Char('r')), KeyOutcome::Pending);
+        assert_eq!(vk.feed(Key::Left), KeyOutcome::None);
+        assert_eq!(vk.feed(Key::Char('w')), KeyOutcome::Motion(Motion::WordForward, None));
+    }
+
+    #[test]
+    fn capital_r_resolves_to_enter_replace() {
+        let mut vk = VimKeys::new();
+        assert_eq!(vk.feed(Key::Char('R')), KeyOutcome::EnterReplace);
     }
 
     #[test]

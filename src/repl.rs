@@ -2970,6 +2970,17 @@ fn run_normal_mode_navigation(
                 let (new_chars, new_cursor) = crate::bishedit::vimkeys::apply_insert_cmd(&original_chars, initial_cursor, cmd);
                 break 'nav Some((new_chars.into_iter().collect(), new_cursor));
             }
+            // `R`: degrades to a plain insert entry right at the cursor
+            // (same simplification editor.rs's own identical arm
+            // documents -- true Replace-mode overtype-as-you-type
+            // behavior would need to live in the shell's own core typing
+            // loop, which this excursion resumes into once it breaks out
+            // here, same as `EnterInsert` just above).
+            KeyOutcome::EnterReplace => {
+                let (new_chars, new_cursor) =
+                    crate::bishedit::vimkeys::apply_insert_cmd(&original_chars, initial_cursor, crate::bishedit::vimkeys::InsertCmd::Before);
+                break 'nav Some((new_chars.into_iter().collect(), new_cursor));
+            }
             // `v`/`V`: arms Visual mode with the buffer's own current
             // cursor as the anchor (vimkeys.rs can't read that itself --
             // see `EnterVisual`'s own doc comment). Rendering (the
@@ -3034,7 +3045,8 @@ fn run_normal_mode_navigation(
             | KeyOutcome::Join { .. }
             | KeyOutcome::AddSurround { .. }
             | KeyOutcome::DeleteSurround { .. }
-            | KeyOutcome::ChangeSurround { .. } => {
+            | KeyOutcome::ChangeSurround { .. }
+            | KeyOutcome::ReplaceChar { .. } => {
                 render_normal_mode_frame(&buf, rect, &vk, None);
             }
             KeyOutcome::Window(cmd @ (WindowCmd::GotoFirstWindow | WindowCmd::GotoLastWindow), count) => {

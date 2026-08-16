@@ -1721,6 +1721,20 @@ fn run_line_normal_mode(
                     KeyOutcome::AddSurround { target, ch } => add_surround(&mut lb, target, ch),
                     KeyOutcome::DeleteSurround { ch } => delete_surround(&mut lb, ch),
                     KeyOutcome::ChangeSurround { ch, replacement } => change_surround(&mut lb, ch, replacement),
+                    KeyOutcome::ReplaceChar { ch, count } => replace_char(&mut lb, ch, count.unwrap_or(1).max(1)),
+                    // `R`: degrades to an ordinary `i`-style insert entry
+                    // right at the cursor (no repositioning needed --
+                    // same as real `R`'s own starting point) rather than
+                    // true overtype-as-you-type. A deliberate
+                    // simplification: true Replace-mode typing behavior
+                    // would need to live inside `read_line`'s own typing
+                    // loop (this excursion always resumes there once it
+                    // breaks out to `ToInsert`), which is the single
+                    // highest-traffic code path in the whole shell -- not
+                    // a change to make for this one command. `fileeditor.
+                    // rs`'s own `run_insert_mode` has its own dedicated
+                    // loop instead, so `R` gets the real thing there.
+                    KeyOutcome::EnterReplace => break LineNormalExit::ToInsert,
                     KeyOutcome::Window(..) | KeyOutcome::Join { .. } | KeyOutcome::Pending | KeyOutcome::None => {}
                 }
             }
@@ -2091,6 +2105,23 @@ fn change_surround(lb: &mut LineBuffer, ch: char, replacement: char) {
     lb.ed.cursor = open_col;
 }
 
+// `r{ch}`: replaces `count` characters starting at the cursor with `ch`
+// each, staying in Normal mode. Refuses (no-op) if fewer than `count`
+// characters remain on the line from the cursor onward -- matches vim:
+// `r` never crosses a line break or extends the buffer, unlike `s`
+// (substitute, which deletes then inserts and so has no such limit).
+fn replace_char(lb: &mut LineBuffer, ch: char, count: usize) {
+    let (_, col) = lb.cursor();
+    let len = lb.ed.buf.len();
+    if count == 0 || col + count > len {
+        return;
+    }
+    for c in lb.ed.buf.iter_mut().skip(col).take(count) {
+        *c = ch;
+    }
+    lb.ed.cursor = col + count - 1;
+}
+
 // A single- or two-character-wide (`motion::surround_delete_spans`'s own
 // `Inclusive` ranges, always same-line for `LineBuffer`) removal --
 // `delete_surround`'s own primitive, kept separate from `delete_motion`
@@ -2220,6 +2251,16 @@ fn run_one_shot_normal_command(ed: &mut LineEditor, registers: &mut Registers, o
                         change_surround(&mut lb, ch, replacement);
                         break None;
                     }
+                    KeyOutcome::ReplaceChar { ch, count } => {
+                        replace_char(&mut lb, ch, count.unwrap_or(1).max(1));
+                        break None;
+                    }
+                    // `R`: same degrade-to-`i` simplification as
+                    // run_line_normal_mode's own arm (see its doc
+                    // comment) -- Ctrl-O always returns to insert
+                    // afterward anyway, matching its own "do exactly one
+                    // command, then resume typing" contract regardless.
+                    KeyOutcome::EnterReplace => break None,
                     // EnterVisual: a no-op here too, same reasoning as
                     // run_line_normal_mode's own arm just above -- Ctrl-O
                     // is "do exactly one command, then resume typing"
@@ -2605,6 +2646,28 @@ mod tests {
         let mut lb = LineBuffer { ed: &mut ed, marks: &mut marks, selections: &mut selections };
         surround_selections(&mut lb, '(');
         assert_eq!(ed.buf.iter().collect::<String>(), "foo bar");
+    }
+
+    #[test]
+    fn replace_char_replaces_count_characters_and_advances_the_cursor() {
+        let mut ed = make_editor("abcdef", 1);
+        let mut marks = HashMap::new();
+        let mut selections: Vec<motion::MotionRange> = Vec::new();
+        let mut lb = LineBuffer { ed: &mut ed, marks: &mut marks, selections: &mut selections };
+        replace_char(&mut lb, 'x', 3);
+        assert_eq!(ed.buf.iter().collect::<String>(), "axxxef");
+        assert_eq!(ed.cursor, 3);
+    }
+
+    #[test]
+    fn replace_char_refuses_when_not_enough_characters_remain() {
+        let mut ed = make_editor("abc", 1);
+        let mut marks = HashMap::new();
+        let mut selections: Vec<motion::MotionRange> = Vec::new();
+        let mut lb = LineBuffer { ed: &mut ed, marks: &mut marks, selections: &mut selections };
+        replace_char(&mut lb, 'x', 5);
+        assert_eq!(ed.buf.iter().collect::<String>(), "abc");
+        assert_eq!(ed.cursor, 1);
     }
 
     #[test]

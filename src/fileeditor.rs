@@ -56,6 +56,18 @@ pub enum EditOutcome {
     Detached,
 }
 
+// What the status line (`mode_label`) and `build_editor_frame`'s own
+// Visual-highlight gating need to know about the current mode -- `R`'s
+// own addition to what used to be a plain `insert_mode: bool` (Replace
+// behaves like Insert for both of those: no Visual selections shown,
+// `-- REPLACE --` instead of `-- INSERT --`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EditorMode {
+    Normal,
+    Insert,
+    Replace,
+}
+
 // The actual blocking loop -- called by repl.rs's `run_edit_frame`
 // whenever this pane's top frame is a `Frame::Edit`, whether that's a
 // freshly-opened session or one resumed after an earlier detach. Renders
@@ -75,7 +87,7 @@ pub fn drive(session: &mut EditSession, rect: Rect, registers: &mut Registers, o
     // (covering run_insert_mode/run_ex_command too, both nested within
     // it), not just re-acquired per sub-loop.
     let _guard = term::RawGuard::enable(0)?;
-    render_editor_frame(&session.buffer, &session.vk, false, rect);
+    render_editor_frame(&session.buffer, &session.vk, EditorMode::Normal, rect);
     loop {
         let key = match editor::read_key_idle(on_idle)? {
             Some(k) => k,
@@ -101,7 +113,7 @@ pub fn drive(session: &mut EditSession, rect: Rect, registers: &mut Registers, o
                 commit_active_selection(session);
                 let end_cursor = session.buffer.cursor();
                 session.vk.end_visual(end_cursor);
-                render_editor_frame(&session.buffer, &session.vk, false, rect);
+                render_editor_frame(&session.buffer, &session.vk, EditorMode::Normal, rect);
                 continue;
             }
             Key::Char('y') if session.vk.is_idle() && (session.vk.is_visual() || !session.buffer.selections.is_empty()) => {
@@ -111,7 +123,7 @@ pub fn drive(session: &mut EditSession, rect: Rect, registers: &mut Registers, o
                 session.buffer.yank_selections(registers, register);
                 session.buffer.selections.clear();
                 session.vk.end_visual(end_cursor);
-                render_editor_frame(&session.buffer, &session.vk, false, rect);
+                render_editor_frame(&session.buffer, &session.vk, EditorMode::Normal, rect);
                 continue;
             }
             Key::Char('d') if session.vk.is_idle() && (session.vk.is_visual() || !session.buffer.selections.is_empty()) => {
@@ -121,7 +133,7 @@ pub fn drive(session: &mut EditSession, rect: Rect, registers: &mut Registers, o
                 session.buffer.delete_selections(registers, register);
                 session.buffer.selections.clear();
                 session.vk.end_visual(end_cursor);
-                render_editor_frame(&session.buffer, &session.vk, false, rect);
+                render_editor_frame(&session.buffer, &session.vk, EditorMode::Normal, rect);
                 continue;
             }
             Key::Char('c') if session.vk.is_idle() && (session.vk.is_visual() || !session.buffer.selections.is_empty()) => {
@@ -132,12 +144,12 @@ pub fn drive(session: &mut EditSession, rect: Rect, registers: &mut Registers, o
                 session.buffer.selections.clear();
                 session.vk.end_visual(end_cursor);
                 if deleted {
-                    match run_insert_mode(session, rect, on_idle)? {
+                    match run_insert_mode(session, rect, on_idle, false)? {
                         InsertOutcome::Detached => return Ok(EditOutcome::Detached),
                         InsertOutcome::Done => {}
                     }
                 }
-                render_editor_frame(&session.buffer, &session.vk, false, rect);
+                render_editor_frame(&session.buffer, &session.vk, EditorMode::Normal, rect);
                 continue;
             }
             Key::Char('p') | Key::Char('P') if session.vk.is_idle() && (session.vk.is_visual() || !session.buffer.selections.is_empty()) => {
@@ -147,7 +159,7 @@ pub fn drive(session: &mut EditSession, rect: Rect, registers: &mut Registers, o
                 session.buffer.put_over_selections(registers, register);
                 session.buffer.selections.clear();
                 session.vk.end_visual(end_cursor);
-                render_editor_frame(&session.buffer, &session.vk, false, rect);
+                render_editor_frame(&session.buffer, &session.vk, EditorMode::Normal, rect);
                 continue;
             }
             // `S`: vim-surround's own "wrap the selection" -- reads one
@@ -161,21 +173,21 @@ pub fn drive(session: &mut EditSession, rect: Rect, registers: &mut Registers, o
                 }
                 session.buffer.selections.clear();
                 session.vk.end_visual(end_cursor);
-                render_editor_frame(&session.buffer, &session.vk, false, rect);
+                render_editor_frame(&session.buffer, &session.vk, EditorMode::Normal, rect);
                 continue;
             }
             Key::Escape if session.vk.is_idle() && (session.vk.is_visual() || !session.buffer.selections.is_empty()) => {
                 let end_cursor = session.buffer.cursor();
                 session.vk.end_visual(end_cursor);
                 session.buffer.selections.clear();
-                render_editor_frame(&session.buffer, &session.vk, false, rect);
+                render_editor_frame(&session.buffer, &session.vk, EditorMode::Normal, rect);
                 continue;
             }
             Key::Char(':') if session.vk.is_idle() => {
                 if let ExOutcome::Quit = run_ex_command(session, rect, on_idle)? {
                     return Ok(EditOutcome::Quit);
                 }
-                render_editor_frame(&session.buffer, &session.vk, false, rect);
+                render_editor_frame(&session.buffer, &session.vk, EditorMode::Normal, rect);
                 continue;
             }
             _ => {}
@@ -207,7 +219,7 @@ pub fn drive(session: &mut EditSession, rect: Rect, registers: &mut Registers, o
             }
             KeyOutcome::EnterInsert(cmd) => {
                 resolve_insert_start(&mut session.buffer, cmd);
-                match run_insert_mode(session, rect, on_idle)? {
+                match run_insert_mode(session, rect, on_idle, false)? {
                     InsertOutcome::Detached => return Ok(EditOutcome::Detached),
                     InsertOutcome::Done => {}
                 }
@@ -220,7 +232,7 @@ pub fn drive(session: &mut EditSession, rect: Rect, registers: &mut Registers, o
                 Op::Change => {
                     let m = redirect_cw_to_ce(&session.buffer, &m);
                     if delete_motion(&mut session.buffer, registers, m, count, register) {
-                        match run_insert_mode(session, rect, on_idle)? {
+                        match run_insert_mode(session, rect, on_idle, false)? {
                             InsertOutcome::Detached => return Ok(EditOutcome::Detached),
                             InsertOutcome::Done => {}
                         }
@@ -232,7 +244,7 @@ pub fn drive(session: &mut EditSession, rect: Rect, registers: &mut Registers, o
                 Op::Delete => delete_lines(&mut session.buffer, registers, count, register),
                 Op::Change => {
                     delete_lines(&mut session.buffer, registers, count, register);
-                    match run_insert_mode(session, rect, on_idle)? {
+                    match run_insert_mode(session, rect, on_idle, false)? {
                         InsertOutcome::Detached => return Ok(EditOutcome::Detached),
                         InsertOutcome::Done => {}
                     }
@@ -246,6 +258,11 @@ pub fn drive(session: &mut EditSession, rect: Rect, registers: &mut Registers, o
             KeyOutcome::AddSurround { target, ch } => add_surround(&mut session.buffer, target, ch),
             KeyOutcome::DeleteSurround { ch } => delete_surround(&mut session.buffer, ch),
             KeyOutcome::ChangeSurround { ch, replacement } => change_surround(&mut session.buffer, ch, replacement),
+            KeyOutcome::ReplaceChar { ch, count } => replace_char(&mut session.buffer, ch, count.unwrap_or(1).max(1)),
+            KeyOutcome::EnterReplace => match run_insert_mode(session, rect, on_idle, true)? {
+                InsertOutcome::Detached => return Ok(EditOutcome::Detached),
+                InsertOutcome::Done => {}
+            },
             // <C-w> is still vimkeys' own window-leader prefix here too
             // -- a harmless no-op, same reasoning as editor.rs's own
             // LineBuffer contexts: there's no window state to act on
@@ -255,7 +272,7 @@ pub fn drive(session: &mut EditSession, rect: Rect, registers: &mut Registers, o
             // open.
             KeyOutcome::Window(..) | KeyOutcome::Pending | KeyOutcome::None => {}
         }
-        render_editor_frame(&session.buffer, &session.vk, false, rect);
+        render_editor_frame(&session.buffer, &session.vk, EditorMode::Normal, rect);
     }
 }
 
@@ -444,6 +461,24 @@ fn surround_selections(buf: &mut TextBuffer, ch: char) {
     buf.set_cursor(leftmost_open_at.0, leftmost_open_at.1);
 }
 
+// `r{ch}`: replaces `count` characters starting at the cursor with `ch`
+// each -- see editor.rs's own identical-in-spirit `replace_char` for the
+// "never crosses a line break, refuses if not enough characters remain"
+// rule. Built on `delete_range`/`insert_text` (no in-place char mutation
+// exists on `TextBuffer`) rather than that one's direct `Vec<char>`
+// splice, same reasoning `change_surround`'s own doc comment gives.
+fn replace_char(buf: &mut TextBuffer, ch: char, count: usize) {
+    let (row, col) = buf.cursor();
+    if count == 0 || col + count > buf.line_len(row) {
+        return;
+    }
+    let range = motion::MotionRange { shape: motion::MotionShape::Inclusive, from: (row, col), to: (row, col + count - 1) };
+    buf.delete_range(&range);
+    let text: String = std::iter::repeat_n(ch, count).collect();
+    buf.insert_text((row, col), &text);
+    buf.set_cursor(row, col + count - 1);
+}
+
 // `p`/`P`: a linewise register (`yy`, `dd`, ...) pastes as whole new
 // line(s) below (`p`)/above (`P`) the cursor's own line; a charwise one
 // pastes inline. Built entirely on `insert_text` (which already
@@ -562,8 +597,16 @@ enum InsertOutcome {
 // uncommitted (nothing lost, just not yet escaped back to Normal),
 // matching every other mid-sequence Ctrl+Space snapshot elsewhere in
 // this codebase.
-fn run_insert_mode(session: &mut EditSession, rect: Rect, on_idle: &mut dyn FnMut()) -> io::Result<InsertOutcome> {
-    render_editor_frame(&session.buffer, &session.vk, true, rect);
+//
+// `replace` (`R` -- see `KeyOutcome::EnterReplace`'s own doc comment)
+// swaps two of this loop's own arms (`Key::Char`/`Key::Backspace`) from
+// their ordinary Insert-mode behavior to overtype instead -- everything
+// else (motion keys, Enter, detach/exit) behaves identically either way,
+// which is why this is a flag on the one shared loop rather than a
+// second copy of it.
+fn run_insert_mode(session: &mut EditSession, rect: Rect, on_idle: &mut dyn FnMut(), replace: bool) -> io::Result<InsertOutcome> {
+    let mode = if replace { EditorMode::Replace } else { EditorMode::Insert };
+    render_editor_frame(&session.buffer, &session.vk, mode, rect);
     loop {
         let key = match editor::read_key_idle(on_idle)? {
             Some(k) => k,
@@ -590,6 +633,17 @@ fn run_insert_mode(session: &mut EditSession, rect: Rect, on_idle: &mut dyn FnMu
                 let (row, col) = session.buffer.cursor();
                 session.buffer.insert_text((row, col), "\n");
             }
+            // Replace mode's own Backspace: known simplification -- steps
+            // the cursor back without restoring the character it walks
+            // back over (real vim remembers and restores each one) and
+            // never crosses a line boundary backward, unlike ordinary
+            // Insert mode's own version just below.
+            Key::Backspace if replace => {
+                let (row, col) = session.buffer.cursor();
+                if col > 0 {
+                    session.buffer.set_cursor(row, col - 1);
+                }
+            }
             Key::Backspace => {
                 let (row, col) = session.buffer.cursor();
                 if col > 0 {
@@ -615,13 +669,22 @@ fn run_insert_mode(session: &mut EditSession, rect: Rect, on_idle: &mut dyn FnMu
             Key::Down => motion::apply_motion(&mut session.buffer, motion::Motion::Down, None),
             Key::Char(c) => {
                 let (row, col) = session.buffer.cursor();
+                // Replace mode overwrites the character already at the
+                // cursor, if there is one -- deleting it first, then
+                // inserting, naturally extends the line once the cursor
+                // reaches its end (nothing left there to overwrite),
+                // matching real vim's own `R` behavior at end of line.
+                if replace && col < session.buffer.line_len(row) {
+                    let range = motion::MotionRange { shape: motion::MotionShape::Inclusive, from: (row, col), to: (row, col) };
+                    session.buffer.delete_range(&range);
+                }
                 let mut b = [0u8; 4];
                 session.buffer.insert_text((row, col), c.encode_utf8(&mut b));
             }
             _ => {}
         }
         scroll_to_show_cursor(&mut session.buffer);
-        render_editor_frame(&session.buffer, &session.vk, true, rect);
+        render_editor_frame(&session.buffer, &session.vk, mode, rect);
     }
 }
 
@@ -724,13 +787,15 @@ fn flash_status(msg: &str, rect: Rect, on_idle: &mut dyn FnMut()) -> io::Result<
     Ok(())
 }
 
-// "-- NORMAL --"/"-- VISUAL --"/"-- VISUAL LINE --"/"-- INSERT --",
-// `[+]` while the buffer has unsaved changes -- vim's own mode-line
-// convention, mirroring repl.rs's own `mode_label` plus the dirty flag
-// that context has no equivalent of.
-fn mode_label(vk: &VimKeys, insert_mode: bool) -> &'static str {
-    if insert_mode {
-        return "-- INSERT --";
+// "-- NORMAL --"/"-- VISUAL --"/"-- VISUAL LINE --"/"-- INSERT --"/
+// "-- REPLACE --", `[+]` while the buffer has unsaved changes -- vim's
+// own mode-line convention, mirroring repl.rs's own `mode_label` plus
+// the dirty flag that context has no equivalent of.
+fn mode_label(vk: &VimKeys, mode: EditorMode) -> &'static str {
+    match mode {
+        EditorMode::Insert => return "-- INSERT --",
+        EditorMode::Replace => return "-- REPLACE --",
+        EditorMode::Normal => {}
     }
     match vk.visual_anchor() {
         Some((RegisterShape::Char, _)) => "-- VISUAL --",
@@ -739,8 +804,8 @@ fn mode_label(vk: &VimKeys, insert_mode: bool) -> &'static str {
     }
 }
 
-fn status_text(buf: &TextBuffer, vk: &VimKeys, insert_mode: bool, cols: usize) -> String {
-    let label = mode_label(vk, insert_mode);
+fn status_text(buf: &TextBuffer, vk: &VimKeys, mode: EditorMode, cols: usize) -> String {
+    let label = mode_label(vk, mode);
     let pending = vk.pending_display();
     let mut left = if !pending.is_empty() {
         format!("{label} {pending}")
@@ -819,10 +884,10 @@ fn render_row(out: &mut String, buf: &TextBuffer, line: usize, cols: usize, high
 // entirely, in a split window. `rect` itself is still used for *size*
 // (`rect.rows`/`rect.cols`) either way -- only the position origin
 // changes.
-pub fn build_editor_frame(buf: &TextBuffer, vk: &VimKeys, insert_mode: bool, rect: Rect, row_origin: usize, col_origin: usize) -> String {
+pub fn build_editor_frame(buf: &TextBuffer, vk: &VimKeys, mode: EditorMode, rect: Rect, row_origin: usize, col_origin: usize) -> String {
     let content_rows = editor_content_rows(rect);
     let total = buf.line_count();
-    let active = if insert_mode { None } else { active_visual_range(vk, buf) };
+    let active = if mode == EditorMode::Normal { active_visual_range(vk, buf) } else { None };
     let mut out = String::new();
     for r in 0..content_rows {
         let line = buf.viewport_top() + r;
@@ -838,7 +903,7 @@ pub fn build_editor_frame(buf: &TextBuffer, vk: &VimKeys, insert_mode: bool, rec
         }
     }
 
-    out.push_str(&format!("\x1b[{};{}H\x1b[7m{}\x1b[0m", row_origin + content_rows + 1, col_origin + 1, status_text(buf, vk, insert_mode, rect.cols)));
+    out.push_str(&format!("\x1b[{};{}H\x1b[7m{}\x1b[0m", row_origin + content_rows + 1, col_origin + 1, status_text(buf, vk, mode, rect.cols)));
 
     let (cl, cc) = buf.cursor();
     let screen_row = cl.saturating_sub(buf.viewport_top()).min(content_rows.saturating_sub(1));
@@ -847,8 +912,8 @@ pub fn build_editor_frame(buf: &TextBuffer, vk: &VimKeys, insert_mode: bool, rec
     out
 }
 
-pub fn render_editor_frame(buf: &TextBuffer, vk: &VimKeys, insert_mode: bool, rect: Rect) {
-    print!("{}", build_editor_frame(buf, vk, insert_mode, rect, rect.row, rect.col));
+pub fn render_editor_frame(buf: &TextBuffer, vk: &VimKeys, mode: EditorMode, rect: Rect) {
+    print!("{}", build_editor_frame(buf, vk, mode, rect, rect.row, rect.col));
     let _ = io::stdout().flush();
 }
 
@@ -865,6 +930,6 @@ pub fn render_editor_frame(buf: &TextBuffer, vk: &VimKeys, insert_mode: bool, re
 // functions' simpler `\r\x1b[K`-prefixed single-row convention (this
 // content spans the pane's whole height, not just one row).
 pub fn freeze_editor_frame(screen: &Rc<RefCell<vt100::Screen>>, buf: &TextBuffer, vk: &VimKeys, rect: Rect) {
-    let framed = build_editor_frame(buf, vk, false, rect, 0, 0);
+    let framed = build_editor_frame(buf, vk, EditorMode::Normal, rect, 0, 0);
     screen.borrow_mut().feed(framed.as_bytes());
 }
