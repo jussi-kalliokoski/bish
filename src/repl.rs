@@ -1071,60 +1071,94 @@ fn run_edit_frame(
     // run_fg_job_frame's own reasoning for job_frames exactly, and keeps
     // the two symmetric.
     let session = edit_frames.remove(&edit_frame_id).expect("Frame::Edit always has a live edit_frames entry");
-    let rect = pane_rect(&windows[*current_window], windows[*current_window].focused_pane, term_rows, term_cols);
     // "%": refreshed here, once, whenever this function starts driving a
     // session -- see fileeditor::set_last_filename's own doc comment for
     // the other place (a successful :w/:wq/:x) it needs the same
     // refresh.
     fileeditor::set_last_filename(&session.buffer, registers);
-    let outcome = run_normal_mode_navigation(
-        session_id,
-        sessions,
-        windows,
-        current_window,
-        next_session_id,
-        next_window_id,
-        sinks_are_grid,
-        job_frames,
-        cmd_history,
-        registers,
-        NavStart::Edit(session.buffer, Box::new(session.vk)),
-        term_rows,
-        term_cols,
-    );
-    match outcome {
-        Ok((NavExit::Quit, _)) => {
-            windows[*current_window].stack_mut().pop();
-            if *sinks_are_grid {
-                compositor_redraw(sessions, windows, *current_window, term_rows, term_cols);
+    let mut buffer = session.buffer;
+    let mut vk = session.vk;
+    // Loops rather than returning straight after one call: a `Window`
+    // keypress (KeyOutcome::Window, handled inside run_normal_mode_
+    // navigation) always resolves to NavExit::Detached, even when
+    // dispatch_window_cmd's own action turned out to be a no-op from
+    // *this* pane's perspective (`<C-w>n` with only one window, `<C-w>h`
+    // with nowhere to go, ...) -- that loop has no way to tell a real
+    // focus change from a no-op one. See the `Detached` arm below for
+    // what goes wrong if this pane's own frame is still on top after
+    // one of those and this function returns anyway instead of noticing
+    // and just continuing to drive it.
+    loop {
+        let outcome = run_normal_mode_navigation(
+            session_id,
+            sessions,
+            windows,
+            current_window,
+            next_session_id,
+            next_window_id,
+            sinks_are_grid,
+            job_frames,
+            cmd_history,
+            registers,
+            NavStart::Edit(buffer, Box::new(vk)),
+            term_rows,
+            term_cols,
+        );
+        match outcome {
+            Ok((NavExit::Quit, _)) => {
+                windows[*current_window].stack_mut().pop();
+                if *sinks_are_grid {
+                    compositor_redraw(sessions, windows, *current_window, term_rows, term_cols);
+                }
+                return;
             }
-        }
-        // Freezes this pane's own grid with the editor's current state
-        // -- exactly once, right here, rather than mirroring
-        // freeze_idle_prompt's own multiple call sites (one at every
-        // place focus *might* move away): unlike a live prompt, a
-        // detached editor session's content is genuinely static (nothing
-        // runs in the background the way a job does) from this exact
-        // moment until it's re-entered, at which point run_normal_mode_
-        // navigation takes over rendering to the real terminal directly
-        // again -- so one freeze, right when it stops being driven, is
-        // both necessary and sufficient.
-        Ok((NavExit::Detached, Some((buffer, vk)))) => {
-            fileeditor::freeze_editor_frame(&sessions[&session_id].screen, &buffer, &vk, rect);
-            edit_frames.insert(edit_frame_id, fileeditor::EditSession { buffer, vk });
-        }
-        Ok((NavExit::Resume(..), _)) | Ok((NavExit::Detached, None)) => {
-            unreachable!("NavStart::Edit never produces NavExit::Resume, and always hands its buffer back")
-        }
-        Err(e) => {
-            // A real I/O error reading a key -- same treatment the main
-            // loop itself gives one (see its own read_line Err arm):
-            // sink it and drop the session; there's no good way to
-            // resume from here.
-            windows[*current_window].stack_mut().pop();
-            sessions.get_mut(&session_id).unwrap().shell.sink_err(&format!("bish: e: error reading input: {}\n", e));
-            if *sinks_are_grid {
-                compositor_redraw(sessions, windows, *current_window, term_rows, term_cols);
+            Ok((NavExit::Detached, Some((b, v)))) => {
+                // If this exact edit frame is still the top of the
+                // (possibly now-different) current window's own focused
+                // pane, nothing actually took over -- freezing here
+                // would bake this frame's *current* content into the
+                // session's grid for no reason, where it would then sit
+                // untouched (nothing else feeds that grid while an
+                // editor pane is being driven -- see freeze_editor_
+                // frame's own doc comment on why this is normally the
+                // *only* place that happens) until some later
+                // compositor_redraw painted it back onto the real
+                // terminal on top of whatever a genuine exit draws
+                // afterward -- exactly the "shell prompt drawn over the
+                // file's own last content" bug this loop exists to
+                // avoid. Keep driving it instead.
+                if windows[*current_window].stack().last() == Some(&Frame::Edit(edit_frame_id)) {
+                    buffer = b;
+                    vk = v;
+                    continue;
+                }
+                // A genuine focus change (or this pane now shows
+                // something else entirely, e.g. `window fg` pushed a
+                // different frame on top) -- freeze for real. Recomputed
+                // fresh rather than reusing anything computed before
+                // this loop's first iteration: a window action that
+                // *does* leave this frame on top (the branch above) can
+                // still have resized panes (`window balance`, `+`/`-`),
+                // and one that moves focus away can too.
+                let rect = pane_rect(&windows[*current_window], windows[*current_window].focused_pane, term_rows, term_cols);
+                fileeditor::freeze_editor_frame(&sessions[&session_id].screen, &b, &v, rect);
+                edit_frames.insert(edit_frame_id, fileeditor::EditSession { buffer: b, vk: v });
+                return;
+            }
+            Ok((NavExit::Resume(..), _)) | Ok((NavExit::Detached, None)) => {
+                unreachable!("NavStart::Edit never produces NavExit::Resume, and always hands its buffer back")
+            }
+            Err(e) => {
+                // A real I/O error reading a key -- same treatment the main
+                // loop itself gives one (see its own read_line Err arm):
+                // sink it and drop the session; there's no good way to
+                // resume from here.
+                windows[*current_window].stack_mut().pop();
+                sessions.get_mut(&session_id).unwrap().shell.sink_err(&format!("bish: e: error reading input: {}\n", e));
+                if *sinks_are_grid {
+                    compositor_redraw(sessions, windows, *current_window, term_rows, term_cols);
+                }
+                return;
             }
         }
     }
