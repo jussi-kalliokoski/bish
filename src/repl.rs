@@ -3982,10 +3982,11 @@ fn run_command_mode(
     term_cols: usize,
     // `Some` iff the pane driving this call is a `Frame::Edit` (the
     // unified Normal-mode loop's own `NavBuffer::Editable` -- see that
-    // enum's doc comment) -- what makes `w`/`w <path>`/`wq`/`x`/`q`/`q!`
-    // mean anything here at all: they're the file's own save/quit
-    // commands, not general window-management ones, so they only exist
-    // when there's an actual buffer for them to act on.
+    // enum's doc comment) -- what makes `w`/`w <path>`/`wq`/`x`/`q`/`q!`/
+    // `diag`/`diag clear` mean anything here at all: they're the file's
+    // own save/quit/diagnose commands, not general window-management
+    // ones, so they only exist when there's an actual buffer for them to
+    // act on.
     editing: Option<&mut TextBuffer>,
     // Seeds the very first prompt with already-typed text, cursor at its
     // end -- Ctrl+Space mid-typing (below) uses this to carry the
@@ -4177,6 +4178,39 @@ fn run_command_mode(
                                 status: 0,
                             });
                             return CommandModeOutcome::Quit;
+                        }
+                        // `diag`/`diagnose` (no argument): runs every
+                        // diagnose tool configured for this buffer's
+                        // language (fileeditor::diagnose_buffer -- see its
+                        // own doc comment for why that's a list, not one
+                        // hardcoded linter) and stashes the result on the
+                        // buffer itself, exactly where build_editor_frame's
+                        // gutter/underline rendering already reads it from
+                        // (TextBuffer::diagnostics). Same "only means
+                        // something with a real buffer" gating as w/wq/x/q
+                        // above -- there's nothing to diagnose without one.
+                        "diag" | "diagnose" if arg.is_none() => {
+                            tb.diagnostics = fileeditor::diagnose_buffer(tb);
+                            let n = tb.diagnostics.len();
+                            let output = if n == 0 { "No problems found.".to_string() } else { format!("{n} problem{} found.", if n == 1 { "" } else { "s" }) };
+                            sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry { command: trimmed, output: output.clone(), status: 0 });
+                            return CommandModeOutcome::Ran { output, status: 0 };
+                        }
+                        // `diag clear`/`diagnose clear`: drops whatever
+                        // `:diag` last found, same as it self-clears the
+                        // instant a real edit would make its positions
+                        // stale (see TextBuffer::diagnostics's own doc
+                        // comment) -- this is just the explicit, no-edit
+                        // version of that.
+                        "diag" | "diagnose" if arg == Some("clear") => {
+                            tb.diagnostics.clear();
+                            sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry { command: trimmed, output: String::new(), status: 0 });
+                            return CommandModeOutcome::Ran { output: String::new(), status: 0 };
+                        }
+                        "diag" | "diagnose" => {
+                            sessions[&session_id].shell.sink_err(&format!("bish: diag: unknown subcommand '{}' (expected: clear)\n", arg.unwrap_or_default()));
+                            buffer.clear();
+                            continue;
                         }
                         _ => {}
                     }

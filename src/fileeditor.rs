@@ -18,6 +18,7 @@ use std::io::{self, Write};
 use std::rc::Rc;
 
 use crate::bishedit::highlight::{self, BashHighlighter, HighlightContext, Highlighter, StyledSpan};
+use crate::bishedit::lint::{self, BashLinter, Linter};
 use crate::bishedit::motion;
 use crate::bishedit::registers::{RegisterShape, RegisterValue, Registers};
 use crate::bishedit::textbuffer::TextBuffer;
@@ -681,38 +682,74 @@ fn selection_columns_in_line(range: &motion::MotionRange, line: usize, cols: usi
 }
 
 // One column of the gutter drawn to the left of a line's own content.
-// Line numbers are the only column today, but the shape anticipates the
-// same slot holding blame/coverage/diff-marker columns later -- each is
-// just another (width, render) pair appended to GUTTER_COLUMNS, with no
-// change needed anywhere else: build_editor_frame only ever asks "how
-// wide is the whole gutter" and "render line N's gutter cells", never
-// which columns exist. `render` returns the *fully styled* cell text
-// (its own SGR codes, if it wants color/dim) so each column stays free
-// to look however it needs to -- a future diff column wants red/green,
-// not the line-number column's dim gray -- rather than this shared
-// machinery imposing one style on all of them. `None` means "blank,
-// unstyled" -- used for filler rows past the buffer's own last line,
-// matching how render_row's own caller already leaves those rows'
-// content blank too.
+// The diagnostic marker and line numbers are the only columns today, but
+// the shape anticipates the same slot holding blame/coverage columns
+// later -- each is just another (width, render) pair appended to
+// GUTTER_COLUMNS, with no change needed anywhere else: build_editor_frame
+// only ever asks "how wide is the whole gutter" and "render line N's
+// gutter cells", never which columns exist. `render` returns the *fully
+// styled* cell text (its own SGR codes, if it wants color/dim) so each
+// column stays free to look however it needs to -- a future diff column
+// wants red/green, not the line-number column's dim gray -- rather than
+// this shared machinery imposing one style on all of them. `None` means
+// "blank, unstyled" -- used for filler rows past the buffer's own last
+// line, matching how render_row's own caller already leaves those rows'
+// content blank too. `render` also takes `starts` (line_starts's own
+// prefix-sum, computed once per frame by build_editor_frame) since the
+// diagnostic column needs it to translate buf.diagnostics's whole-buffer
+// char offsets into "does this line's own span intersect one" -- the
+// line-number column ignores it, same as any future column that doesn't
+// need it.
 struct GutterColumn {
     width: fn(&TextBuffer) -> usize,
-    render: fn(buf: &TextBuffer, line: usize, width: usize) -> Option<String>,
+    render: fn(buf: &TextBuffer, starts: &[usize], line: usize, width: usize) -> Option<String>,
 }
 
-static GUTTER_COLUMNS: &[GutterColumn] = &[GutterColumn { width: line_number_width, render: render_line_number_cell }];
+static GUTTER_COLUMNS: &[GutterColumn] = &[
+    GutterColumn { width: diagnostic_column_width, render: render_diagnostic_cell },
+    GutterColumn { width: line_number_width, render: render_line_number_cell },
+];
 
 fn total_gutter_width(buf: &TextBuffer) -> usize {
     GUTTER_COLUMNS.iter().map(|col| (col.width)(buf)).sum()
 }
 
-fn render_gutter(out: &mut String, buf: &TextBuffer, line: usize) {
+fn render_gutter(out: &mut String, buf: &TextBuffer, starts: &[usize], line: usize) {
     for col in GUTTER_COLUMNS {
         let width = (col.width)(buf);
-        match (col.render)(buf, line, width) {
+        match (col.render)(buf, starts, line, width) {
             Some(cell) => out.push_str(&cell),
             None => out.push_str(&" ".repeat(width)),
         }
     }
+}
+
+// A fixed 2 columns (marker glyph + one padding space) -- vim's own
+// `:set signcolumn` convention, not something that needs to grow with
+// the buffer the way the line-number column does.
+fn diagnostic_column_width(_buf: &TextBuffer) -> usize {
+    2
+}
+
+// Whether any diagnostic's own char-offset range (whole-buffer text
+// offsets, same convention buffer_highlight_spans's own spans use)
+// intersects this one line's span -- same predicate diagnostic_spans_
+// for_line uses per-column below, just answering "any at all" instead of
+// "which columns" for the coarser gutter marker. Only the worst-severity
+// mark would matter once Severity grows past its current one variant;
+// diagnostic_style below is already written to make that a one-line
+// change when it does.
+fn line_has_diagnostic(buf: &TextBuffer, starts: &[usize], line: usize) -> bool {
+    let line_start = starts[line];
+    let line_end = line_start + buf.line_len(line);
+    buf.diagnostics.iter().any(|d| d.start < line_end && d.end > line_start)
+}
+
+fn render_diagnostic_cell(buf: &TextBuffer, starts: &[usize], line: usize, _width: usize) -> Option<String> {
+    if line >= buf.line_count() || !line_has_diagnostic(buf, starts, line) {
+        return None;
+    }
+    Some("\x1b[33m\u{25cf}\x1b[0m ".to_string())
 }
 
 // Vim's own gutter-width convention: as many digits as the buffer's last
@@ -723,7 +760,7 @@ fn line_number_width(buf: &TextBuffer) -> usize {
     buf.line_count().to_string().len() + 1
 }
 
-fn render_line_number_cell(buf: &TextBuffer, line: usize, width: usize) -> Option<String> {
+fn render_line_number_cell(buf: &TextBuffer, _starts: &[usize], line: usize, width: usize) -> Option<String> {
     if line >= buf.line_count() {
         return None;
     }
@@ -812,6 +849,69 @@ fn buffer_highlight_spans(buf: &TextBuffer) -> Vec<StyledSpan> {
         .collect()
 }
 
+// `:diag`'s own worker (see repl.rs's run_command_mode, the one caller):
+// runs every diagnose tool configured for this buffer's language against
+// the *whole* buffer text, same `buffer_text`/is_bash_file gate as
+// buffer_highlight_spans -- for exactly the same reason (a multi-line
+// construct needs to be seen as one thing, and `.bash` is the only
+// recognized language today). Unlike buffer_highlight_spans this isn't
+// called on every redraw: `:diag` is an explicit, user-triggered check,
+// not a live-typing overlay, so there's no per-keystroke cost to worry
+// about and the result is cached on TextBuffer::diagnostics instead of
+// recomputed here (see that field's own doc comment for why it also
+// self-clears the moment the buffer it describes actually changes).
+//
+// A plain `Vec<&dyn Linter>` rather than BashLinter called directly --
+// lint.rs's own doc comment already frames Linter as "the one shared
+// core behind bish tool check, in-editor squiggles, and bish tool
+// lsp-server," and this feature's own ask was explicit that one language
+// may eventually run more than one diagnose tool over the same buffer
+// (a style linter alongside a correctness one, say); concatenating each
+// tool's own findings here is what makes adding a second one later just
+// "add it to this list," not a structural change.
+pub(crate) fn diagnose_buffer(buf: &TextBuffer) -> Vec<lint::Diagnostic> {
+    if !is_bash_file(buf) {
+        return Vec::new();
+    }
+    let text = buffer_text(buf);
+    let linters: [&dyn Linter; 1] = [&BashLinter];
+    linters.iter().flat_map(|l| l.check(&text)).collect()
+}
+
+// Color/attrs for one diagnostic's own underline -- mirrors highlight::
+// default_style's shape exactly (severity in, presentation out), kept as
+// its own small function for the same reason that one is: Severity only
+// has one variant today (Warning), but the match is already exhaustive
+// against the real enum rather than a wildcard, so adding e.g. Error
+// later is a one-line addition here, not a search for every place
+// severity might matter.
+fn diagnostic_style(severity: lint::Severity) -> (vt100::Color, vt100::CellAttrs) {
+    let underline = vt100::CellAttrs { underline: true, ..vt100::CellAttrs::default() };
+    match severity {
+        lint::Severity::Warning => (vt100::Color::Indexed(3), underline),
+    }
+}
+
+// diagnostic_spans_for_line's own sibling to spans_for_line (see that
+// function's own doc comment for the shared shape/reasoning -- same
+// whole-buffer-char-offset convention, same per-line clamp) -- reads
+// buf.diagnostics instead of a precomputed highlight pass, and resolves
+// each one's own color from diagnostic_style instead of a single shared
+// kind-to-style mapping (a highlight pass is one Highlighter's own
+// output, always styled uniformly by HighlightKind; diagnostics can vary
+// per finding once Severity grows past its current one variant).
+fn diagnostic_spans_for_line(diagnostics: &[lint::Diagnostic], line_start: usize, line_len: usize) -> Vec<StyledSpan> {
+    let line_end = line_start + line_len;
+    diagnostics
+        .iter()
+        .filter(|d| d.start < line_end && d.end > line_start)
+        .map(|d| {
+            let (fg, attrs) = diagnostic_style(d.severity);
+            StyledSpan { start: d.start.saturating_sub(line_start), end: (d.end - line_start).min(line_len), fg, attrs }
+        })
+        .collect()
+}
+
 // Slices `spans` (whole-buffer char offsets, from buffer_highlight_spans)
 // down to the ones actually touching [line_start, line_start + line_len)
 // -- one line's own visible extent -- translated to offsets local to
@@ -843,8 +943,14 @@ fn spans_for_line(spans: &[StyledSpan], line_start: usize, line_len: usize) -> V
 // matching vim's own selection-over-syntax convention. `line_styled` is
 // this line's own slice of a whole-buffer highlight pass (see
 // spans_for_line), computed once by build_editor_frame's own caller
-// rather than per row.
-fn render_row(out: &mut String, buf: &TextBuffer, line: usize, cols: usize, line_styled: &[StyledSpan], highlights: &[(usize, usize)]) {
+// rather than per row. `diag_styled` (diagnostic_spans_for_line's own
+// per-line slice) is composed *between* syntax and selection -- after
+// the syntax layer, so a diagnostic's underline is never hidden beneath
+// its own token color, but before the selection layer, so selecting
+// text over a diagnostic still reads as a selection first (matching
+// selection's own "wins regardless of what it's covering" rule, one
+// layer up).
+fn render_row(out: &mut String, buf: &TextBuffer, line: usize, cols: usize, line_styled: &[StyledSpan], diag_styled: &[StyledSpan], highlights: &[(usize, usize)]) {
     let chars: Vec<char> = (0..cols).map(|c| buf.char_at(line, c).unwrap_or(' ')).collect();
 
     let selected: Vec<StyledSpan> = highlights
@@ -852,7 +958,7 @@ fn render_row(out: &mut String, buf: &TextBuffer, line: usize, cols: usize, line
         .map(|&(start, end)| StyledSpan { start, end, fg: vt100::Color::Default, attrs: vt100::CellAttrs { reverse: true, ..vt100::CellAttrs::default() } })
         .collect();
 
-    let cells = highlight::compose(&chars, &[line_styled, &selected]);
+    let cells = highlight::compose(&chars, &[line_styled, diag_styled, &selected]);
     out.push_str(&highlight::render_styled(&cells));
 }
 
@@ -896,7 +1002,7 @@ pub fn build_editor_frame(buf: &TextBuffer, vk: &VimKeys, mode: EditorMode, rect
     for r in 0..content_rows {
         let line = buf.viewport_top() + r;
         out.push_str(&format!("\x1b[{};{}H\x1b[K", row_origin + r + 1, col_origin + 1));
-        render_gutter(&mut out, buf, line);
+        render_gutter(&mut out, buf, &starts, line);
         if line < total {
             let mut highlights = Vec::new();
             for range in buf.selections.iter().chain(active.iter()) {
@@ -905,7 +1011,8 @@ pub fn build_editor_frame(buf: &TextBuffer, vk: &VimKeys, mode: EditorMode, rect
                 }
             }
             let line_styled = spans_for_line(&whole_styled, starts[line], buf.line_len(line));
-            render_row(&mut out, buf, line, content_cols, &line_styled, &highlights);
+            let diag_styled = diagnostic_spans_for_line(&buf.diagnostics, starts[line], buf.line_len(line));
+            render_row(&mut out, buf, line, content_cols, &line_styled, &diag_styled, &highlights);
         }
     }
 
@@ -938,4 +1045,55 @@ pub fn render_editor_frame(buf: &TextBuffer, vk: &VimKeys, mode: EditorMode, rec
 pub fn freeze_editor_frame(screen: &Rc<RefCell<vt100::Screen>>, buf: &TextBuffer, vk: &VimKeys, rect: Rect) {
     let framed = build_editor_frame(buf, vk, EditorMode::Normal, rect, 0, 0);
     screen.borrow_mut().feed(framed.as_bytes());
+}
+
+#[cfg(test)]
+mod diagnose_tests {
+    use super::*;
+
+    // `is_bash_file` keys off the path's own extension (see its own doc
+    // comment) -- `TextBuffer::new_unnamed`/`insert_text` can't produce
+    // one, so a real `.bash` temp file is what actually exercises
+    // diagnose_buffer's language gate, the same way textbuffer.rs's own
+    // `open_and_save_round_trip_a_real_file` test does for `open`/`save`.
+    fn temp_bash_buffer(tag: &str, text: &str) -> TextBuffer {
+        let dir = std::env::temp_dir().join(format!("bish-fileeditor-diag-test-{}-{tag}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("script.bash");
+        std::fs::write(&path, text).unwrap();
+        TextBuffer::open(&path, 10).unwrap()
+    }
+
+    #[test]
+    fn diagnose_buffer_runs_the_bash_linter_against_a_bash_file() {
+        let buf = temp_bash_buffer("basic", "echo $foo\n");
+        let diags = diagnose_buffer(&buf);
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].code, "unquoted-expansion");
+    }
+
+    #[test]
+    fn diagnose_buffer_is_a_noop_for_a_file_with_no_recognized_language() {
+        let mut buf = TextBuffer::new_unnamed(10);
+        buf.insert_text((0, 0), "echo $foo");
+        assert!(diagnose_buffer(&buf).is_empty());
+    }
+
+    #[test]
+    fn diagnostic_spans_for_line_clamps_to_the_requested_lines_own_extent() {
+        let diags = vec![lint::Diagnostic { start: 5, end: 9, severity: lint::Severity::Warning, code: "unquoted-expansion", message: String::new(), fix: None }];
+        let spans = diagnostic_spans_for_line(&diags, 0, 20);
+        assert_eq!(spans.len(), 1);
+        assert_eq!((spans[0].start, spans[0].end), (5, 9));
+        assert!(diagnostic_spans_for_line(&diags, 10, 20).is_empty());
+    }
+
+    #[test]
+    fn a_real_edit_clears_previously_computed_diagnostics() {
+        let mut buf = temp_bash_buffer("clears", "echo $foo\n");
+        buf.diagnostics = diagnose_buffer(&buf);
+        assert!(!buf.diagnostics.is_empty());
+        buf.insert_text((0, 0), "x");
+        assert!(buf.diagnostics.is_empty());
+    }
 }

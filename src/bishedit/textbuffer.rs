@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use super::lint;
 use super::motion;
 use super::registers::{RegisterShape, RegisterValue, Registers};
 use super::Buffer;
@@ -28,6 +29,15 @@ pub struct TextBuffer {
     // Visual mode's own committed selections -- same field, same shape,
     // same reasoning as `repl.rs`'s `ScreenBuffer::selections`.
     pub selections: Vec<motion::MotionRange>,
+    // `:diag`'s own last result (see fileeditor::diagnose_buffer) -- rides
+    // along with the buffer exactly like `selections` does (survives a
+    // Ctrl+Space detach/reattach, since both live on the one thing that
+    // does), cleared by `:diag clear` or implicitly by any real edit (see
+    // insert_text/delete_range/join_lines below): a lint::Diagnostic's
+    // start/end are char offsets into this buffer's *current* text, so
+    // keeping a stale one around past the edit that invalidated its
+    // position would just be showing the user a lie.
+    pub diagnostics: Vec<lint::Diagnostic>,
     dirty: bool,
     path: Option<PathBuf>,
 }
@@ -41,6 +51,7 @@ impl TextBuffer {
             vheight: vheight.max(1),
             marks: HashMap::new(),
             selections: Vec::new(),
+            diagnostics: Vec::new(),
             dirty: false,
             path: None,
         }
@@ -72,6 +83,7 @@ impl TextBuffer {
             vheight: vheight.max(1),
             marks: HashMap::new(),
             selections: Vec::new(),
+            diagnostics: Vec::new(),
             dirty: false,
             path: Some(path.to_path_buf()),
         })
@@ -144,11 +156,14 @@ impl TextBuffer {
             (new_row, new_col)
         };
         self.dirty = true;
+        self.diagnostics.clear();
         self.cursor = new_pos;
         // `.` -- vim's own "position of the last change" mark (`` `. ``),
         // set automatically by every mutation here rather than at each of
         // fileeditor.rs's own many call sites -- these three methods are
-        // the only places a real edit actually happens.
+        // the only places a real edit actually happens (and, per
+        // `diagnostics`'s own doc comment, the only places a stale
+        // diagnostic's position could actually go wrong).
         self.marks.insert('.', new_pos);
         new_pos
     }
@@ -188,6 +203,7 @@ impl TextBuffer {
             }
         }
         self.dirty = true;
+        self.diagnostics.clear();
         self.marks.insert('.', self.cursor);
         text
     }
@@ -228,6 +244,7 @@ impl TextBuffer {
         }
         self.cursor = (row, join_col.min(self.lines[row].len().saturating_sub(1)));
         self.dirty = true;
+        self.diagnostics.clear();
         self.marks.insert('.', self.cursor);
         true
     }
@@ -375,7 +392,7 @@ mod tests {
 
     fn make(text: &str) -> TextBuffer {
         let lines: Vec<Vec<char>> = text.split('\n').map(|l| l.chars().collect()).collect();
-        TextBuffer { lines, cursor: (0, 0), vtop: 0, vheight: 10, marks: HashMap::new(), selections: Vec::new(), dirty: false, path: None }
+        TextBuffer { lines, cursor: (0, 0), vtop: 0, vheight: 10, marks: HashMap::new(), selections: Vec::new(), diagnostics: Vec::new(), dirty: false, path: None }
     }
 
     fn text_of(buf: &TextBuffer) -> String {
