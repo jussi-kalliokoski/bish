@@ -21,6 +21,7 @@ use crate::bishedit::highlight::{self, BashHighlighter, Highlighter, HighlightCo
 use crate::bishedit::motion;
 use crate::bishedit::registers::{RegisterShape, RegisterValue, Registers};
 use crate::bishedit::suggestion::{SuggestionProvider, SuggestionRequest};
+use crate::bishedit::undo::UndoTree;
 use crate::bishedit::Buffer;
 use crate::bishedit::vimkeys::{self, KeyOutcome, Op, VimKeys};
 use crate::history::History;
@@ -1627,6 +1628,13 @@ fn run_line_normal_mode(
     // selections`' own doc comment. Fresh and empty for this excursion,
     // same as `marks` just above.
     let mut selections: Vec<motion::MotionRange> = Vec::new();
+    // `u`/`Ctrl-R` -- fresh for this excursion, same lifetime as `marks`/
+    // `selections` just above (not persisted across a *later* Ctrl-E
+    // excursion on this same line, matching how those two already don't
+    // either). Row pinned to 0 -- `LineEditor` is a single line, same
+    // `(0, ed.cursor)` convention this function already uses elsewhere
+    // (see e.g. the Escape arm's own `end_cursor`).
+    let mut undo: UndoTree<Vec<char>> = UndoTree::new(ed.buf.clone(), (0, ed.cursor));
     // Reverse-video prompt: the mode indicator. Deliberately not a
     // terminal cursor-shape change (DECSCUSR) -- that's global terminal
     // state with no clean way to restore whatever the user's own
@@ -1869,10 +1877,40 @@ fn run_line_normal_mode(
                     KeyOutcome::EnterReplace => break LineNormalExit::ToInsert,
                     KeyOutcome::ToggleCase { count } => toggle_case(&mut lb, count.unwrap_or(1).max(1)),
                     KeyOutcome::AdjustNumber { delta } => adjust_number(&mut lb, delta),
+                    // Guarded the same way repl.rs's own Undo/Redo arms
+                    // are -- see KeyOutcome::Undo's own doc comment in
+                    // vimkeys.rs for why: real vim's Visual mode binds
+                    // bare `u`/`U` to lowercase/uppercase the selection,
+                    // not implemented in this codebase today, so `u`
+                    // simply does nothing while a selection is active
+                    // rather than misfiring as undo.
+                    KeyOutcome::Undo(count) if !vk.is_visual() && lb.selections.is_empty() => {
+                        for _ in 0..count.unwrap_or(1).max(1) {
+                            let Some(snap) = undo.undo() else { break };
+                            lb.ed.buf = snap.content.clone();
+                            lb.ed.cursor = snap.cursor.1;
+                        }
+                    }
+                    KeyOutcome::Redo(count) if !vk.is_visual() && lb.selections.is_empty() => {
+                        for _ in 0..count.unwrap_or(1).max(1) {
+                            let Some(snap) = undo.redo() else { break };
+                            lb.ed.buf = snap.content.clone();
+                            lb.ed.cursor = snap.cursor.1;
+                        }
+                    }
+                    KeyOutcome::Undo(_) | KeyOutcome::Redo(_) => {}
                     KeyOutcome::Window(..) | KeyOutcome::Join { .. } | KeyOutcome::OpenLine { .. } | KeyOutcome::Pending | KeyOutcome::None => {}
                 }
             }
         }
+        // Commits a new undo-tree node if this key actually changed
+        // `ed.buf` -- a no-op otherwise (pure navigation, or an undo/redo
+        // that just made `ed.buf` match the node it moved to). Once per
+        // top-level key, same "one hook point, reached regardless of
+        // which arm ran" shape as repl.rs's own `render_nav_frame` uses
+        // for `TextBuffer::checkpoint_undo` -- see that one's own doc
+        // comment for why that's what actually defines an undo "group".
+        undo.checkpoint(&ed.buf, (0, ed.cursor));
         let (shown, matches) = normal_mode_prompt_and_matches(ed, &mut marks, &mut selections, &vk, &decorated_prompt);
         redraw(&shown, ed, col_origin, width, ctx, &matches)?;
     };
@@ -2529,12 +2567,19 @@ fn run_one_shot_normal_command(ed: &mut LineEditor, registers: &mut Registers, o
                     // `Join`/`OpenLine` are no-ops here for the same
                     // single-line reason `run_line_normal_mode`'s own arm
                     // documents.
+                    // Undo/redo aren't wired up for this one-shot excursion
+                    // (out of scope -- see bishedit::undo's own module doc
+                    // comment and this repo's own plan.md) -- a no-op here,
+                    // same as every other outcome this function doesn't
+                    // apply.
                     KeyOutcome::Window(..)
                     | KeyOutcome::EnterVisual(_)
                     | KeyOutcome::ReselectVisual
                     | KeyOutcome::Join { .. }
                     | KeyOutcome::OpenLine { .. }
                     | KeyOutcome::Jump { .. }
+                    | KeyOutcome::Undo(_)
+                    | KeyOutcome::Redo(_)
                     | KeyOutcome::None => break None,
                     KeyOutcome::Pending => continue,
                 }

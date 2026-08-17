@@ -97,6 +97,14 @@ pub enum KeyOutcome {
     /// returns `Some`, move the cursor there; a no-op at either end of the
     /// list.
     Jump { forward: bool },
+    /// `u` / `[count]u` -- undo `count` (default 1) changes. The caller
+    /// owns whatever undo tree actually exists (this crate never touches
+    /// a `Buffer`, same reasoning as every other outcome here) -- see
+    /// `bishedit::undo::UndoTree` and `TextBuffer::undo`/`redo` for the
+    /// one place that's actually implemented today.
+    Undo(Option<usize>),
+    /// `Ctrl-R` / `[count]Ctrl-R` -- redo `count` (default 1) changes.
+    Redo(Option<usize>),
     /// `ys{motion}{ch}` / `yss{ch}` / Visual-mode `S{ch}` -- vim-surround's
     /// own "wrap this in a delimiter pair" command. `target` names what to
     /// wrap (a resolved motion's own range, or -- `yss`'s own shorthand --
@@ -974,6 +982,20 @@ impl VimKeys {
         KeyOutcome::Join { count, with_space }
     }
 
+    fn emit_undo(&mut self) -> KeyOutcome {
+        let count = self.count.take();
+        self.pending = Pending::None;
+        self.last_completed = std::mem::take(&mut self.current_input);
+        KeyOutcome::Undo(count)
+    }
+
+    fn emit_redo(&mut self) -> KeyOutcome {
+        let count = self.count.take();
+        self.pending = Pending::None;
+        self.last_completed = std::mem::take(&mut self.current_input);
+        KeyOutcome::Redo(count)
+    }
+
     fn emit_put(&mut self, before: bool) -> KeyOutcome {
         let count = self.count.take();
         let register = self.pending_register.take();
@@ -1172,6 +1194,14 @@ impl VimKeys {
             // (`c == op.trigger_char()`), nothing extra needed here.
             Key::Char('>') => self.emit_operator(Op::Indent),
             Key::Char('<') => self.emit_operator(Op::Outdent),
+            // `u`/`Ctrl-R`: undo/redo -- see KeyOutcome::Undo/Redo's own
+            // doc comments. `Key::CtrlR` already exists as an editor::Key
+            // variant, but only ever handled by editor::read_line's own
+            // Insert-mode typing loop today (real vim's own
+            // `<C-r>{register}` paste-while-typing, a different context
+            // entirely from Normal-mode redo) -- no conflict.
+            Key::Char('u') => self.emit_undo(),
+            Key::CtrlR => self.emit_redo(),
             // `D`: delete from the cursor through end of line, staying in
             // Normal mode -- vim's own `d$` shorthand. Unlike `C` (the
             // same range, but entering insert afterward), nothing already

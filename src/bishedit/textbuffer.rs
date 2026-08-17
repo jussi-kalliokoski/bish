@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 use super::lint;
 use super::motion;
 use super::registers::{RegisterShape, RegisterValue, Registers};
+use super::undo::UndoTree;
 use super::Buffer;
 
 pub struct TextBuffer {
@@ -38,14 +39,24 @@ pub struct TextBuffer {
     // keeping a stale one around past the edit that invalidated its
     // position would just be showing the user a lie.
     pub diagnostics: Vec<lint::Diagnostic>,
+    // `u`/`Ctrl-R` -- a real branching tree, not a linear undo/redo stack
+    // (see bishedit::undo's own module doc comment for why). Rides along
+    // with the buffer exactly like `selections`/`diagnostics` (survives a
+    // Ctrl+Space detach/reattach), seeded with this buffer's own starting
+    // content in `new_unnamed`/`open` below. Checkpointed by
+    // `checkpoint_undo` -- see its own doc comment for exactly when that
+    // gets called and why that's what defines one undo-able "group".
+    undo: UndoTree<Vec<Vec<char>>>,
     dirty: bool,
     path: Option<PathBuf>,
 }
 
 impl TextBuffer {
     pub fn new_unnamed(vheight: usize) -> TextBuffer {
+        let lines = vec![Vec::new()];
         TextBuffer {
-            lines: vec![Vec::new()],
+            undo: UndoTree::new(lines.clone(), (0, 0)),
+            lines,
             cursor: (0, 0),
             vtop: 0,
             vheight: vheight.max(1),
@@ -77,6 +88,7 @@ impl TextBuffer {
             Err(e) => return Err(e),
         };
         Ok(TextBuffer {
+            undo: UndoTree::new(lines.clone(), (0, 0)),
             lines,
             cursor: (0, 0),
             vtop: 0,
@@ -95,6 +107,51 @@ impl TextBuffer {
 
     pub fn is_dirty(&self) -> bool {
         self.dirty
+    }
+
+    // Commits the buffer's current content/cursor as a new undo-tree node
+    // if it differs from whatever's already there -- a no-op otherwise
+    // (see UndoTree::checkpoint's own doc comment for exactly what "no-op"
+    // means and why). Called by repl.rs's `render_nav_frame`, once per
+    // top-level key dispatch in the unified Normal-mode loop -- that one
+    // call site is what actually defines an undo "group": an entire
+    // Insert-mode session (many individual `insert_text` calls) only
+    // reaches `render_nav_frame` once, after the whole session ends, so it
+    // collapses into a single checkpoint/undo step, with no changes needed
+    // to any of the individual mutation call sites themselves.
+    pub fn checkpoint_undo(&mut self) {
+        self.undo.checkpoint(&self.lines, self.cursor);
+    }
+
+    // `u`: moves to the parent node and restores its content/cursor.
+    // `false` (buffer untouched) at the tree's root -- there's nothing
+    // further back than the content this buffer started with.
+    pub fn undo(&mut self) -> bool {
+        let Some(snap) = self.undo.undo() else { return false };
+        self.lines = snap.content.clone();
+        self.cursor = snap.cursor;
+        // Positions may no longer be valid -- same reasoning insert_text/
+        // delete_range/join_lines already apply for any real edit.
+        self.diagnostics.clear();
+        // Known simplification: this doesn't try to detect "undo landed
+        // exactly back on the last-saved content" and clear `dirty` for
+        // that case -- real vim tracks a dedicated "last saved" node in
+        // the tree to do that precisely; not built here.
+        self.dirty = true;
+        true
+    }
+
+    // `Ctrl-R`: moves to the most recently created child and restores its
+    // content/cursor -- see UndoTree::redo's own doc comment for exactly
+    // which branch that is. `false` (buffer untouched) if the current node
+    // has no children (nothing to redo from here).
+    pub fn redo(&mut self) -> bool {
+        let Some(snap) = self.undo.redo() else { return false };
+        self.lines = snap.content.clone();
+        self.cursor = snap.cursor;
+        self.diagnostics.clear();
+        self.dirty = true;
+        true
     }
 
     // Writes every line joined by "\n", plus one trailing "\n" (matching
@@ -392,7 +449,18 @@ mod tests {
 
     fn make(text: &str) -> TextBuffer {
         let lines: Vec<Vec<char>> = text.split('\n').map(|l| l.chars().collect()).collect();
-        TextBuffer { lines, cursor: (0, 0), vtop: 0, vheight: 10, marks: HashMap::new(), selections: Vec::new(), diagnostics: Vec::new(), dirty: false, path: None }
+        TextBuffer {
+            undo: UndoTree::new(lines.clone(), (0, 0)),
+            lines,
+            cursor: (0, 0),
+            vtop: 0,
+            vheight: 10,
+            marks: HashMap::new(),
+            selections: Vec::new(),
+            diagnostics: Vec::new(),
+            dirty: false,
+            path: None,
+        }
     }
 
     fn text_of(buf: &TextBuffer) -> String {
@@ -641,5 +709,59 @@ mod tests {
         let mut registers = make_registers();
         assert!(!buf.put_over_selections(&mut registers, None));
         assert_eq!(text_of(&buf), "foo bar");
+    }
+
+    #[test]
+    fn checkpoint_undo_is_a_noop_with_no_edits() {
+        let mut buf = make("foo");
+        buf.checkpoint_undo();
+        assert!(!buf.undo());
+    }
+
+    #[test]
+    fn checkpoint_undo_groups_edits_between_calls() {
+        let mut buf = make("");
+        buf.insert_text((0, 0), "foo");
+        buf.checkpoint_undo();
+        buf.insert_text((0, 3), "bar");
+        buf.checkpoint_undo();
+        assert_eq!(text_of(&buf), "foobar");
+
+        // One undo restores the state after the *first* checkpoint, not
+        // all the way back to empty -- proves grouping is per checkpoint
+        // call, not per mutation.
+        assert!(buf.undo());
+        assert_eq!(text_of(&buf), "foo");
+        assert!(buf.undo());
+        assert_eq!(text_of(&buf), "");
+        assert!(!buf.undo());
+    }
+
+    #[test]
+    fn undo_redo_round_trip_content_and_cursor() {
+        let mut buf = make("");
+        buf.insert_text((0, 0), "foo");
+        buf.checkpoint_undo();
+        let cursor_after_insert = buf.cursor();
+
+        assert!(buf.undo());
+        assert_eq!(text_of(&buf), "");
+
+        assert!(buf.redo());
+        assert_eq!(text_of(&buf), "foo");
+        assert_eq!(buf.cursor(), cursor_after_insert);
+    }
+
+    #[test]
+    fn undo_clears_diagnostics() {
+        let mut buf = make("foo");
+        buf.insert_text((0, 0), "x");
+        buf.checkpoint_undo();
+        // Diagnostics computed for the *current* (post-edit) content --
+        // set directly, since insert_text/checkpoint_undo themselves don't
+        // touch this field.
+        buf.diagnostics = vec![lint::Diagnostic { start: 0, end: 1, severity: lint::Severity::Warning, code: "x", message: String::new(), fix: None }];
+        assert!(buf.undo());
+        assert!(buf.diagnostics.is_empty());
     }
 }

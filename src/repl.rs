@@ -3072,10 +3072,21 @@ fn nav_buffer_into_edit_state(buf: NavBuffer, vk: VimKeys) -> Option<(TextBuffer
 // mode specifically -- Insert/Replace mode's own rendering happens
 // inside `fileeditor::run_insert_mode`'s own nested loop instead, which
 // is the only place either of those modes is ever live.
-fn render_nav_frame(buf: &NavBuffer, vk: &VimKeys, rect: Rect) {
+// `&mut NavBuffer` (not `&NavBuffer`) specifically so the `Editable` arm
+// can call `checkpoint_undo` first -- this is the one call site every
+// top-level `KeyOutcome` arm reaches (including after `EnterInsert`/
+// `OpenLine`/`Change`'s own `fileeditor::run_insert_mode` call fully
+// returns), which is what makes it the right place to commit an undo-tree
+// node: an entire Insert-mode session collapses into a single checkpoint
+// here, not one per keystroke, with no changes needed to any of the
+// individual `Operator`/`OperatorLines`/`Put`/... arms that call this.
+fn render_nav_frame(buf: &mut NavBuffer, vk: &VimKeys, rect: Rect) {
     match buf {
         NavBuffer::ReadOnly(sb) => render_normal_mode_frame(sb, rect, vk, None),
-        NavBuffer::Editable(tb) => fileeditor::render_editor_frame(tb, vk, fileeditor::EditorMode::Normal, rect),
+        NavBuffer::Editable(tb) => {
+            tb.checkpoint_undo();
+            fileeditor::render_editor_frame(tb, vk, fileeditor::EditorMode::Normal, rect);
+        }
     }
 }
 
@@ -3180,7 +3191,7 @@ fn run_normal_mode_navigation(
     // starts out blank), harmless otherwise -- then this pane's own
     // rectangle on top of that with the current view.
     compositor_redraw(sessions, windows, *current_window, term_rows, term_cols);
-    render_nav_frame(&buf, &vk, rect);
+    render_nav_frame(&mut buf, &vk, rect);
     let mut pending_view = PendingView::None;
 
     let result: (NavExit, Option<(TextBuffer, VimKeys)>) = 'nav: loop {
@@ -3222,7 +3233,7 @@ fn run_normal_mode_navigation(
                 PendingView::Output | PendingView::Transcript => {
                     pending_view = PendingView::None;
                     compositor_redraw(sessions, windows, *current_window, term_rows, term_cols);
-                    render_nav_frame(&buf, &vk, rect);
+                    render_nav_frame(&mut buf, &vk, rect);
                     break;
                 }
             }
@@ -3260,7 +3271,7 @@ fn run_normal_mode_navigation(
                 commit_active_selection(&vk, &mut buf);
                 let end_cursor = buf.cursor();
                 vk.end_visual(end_cursor);
-                render_nav_frame(&buf, &vk, rect);
+                render_nav_frame(&mut buf, &vk, rect);
                 continue;
             }
             Key::Char('y') if vk.is_idle() && (vk.is_visual() || !buf.selections().is_empty()) => {
@@ -3274,7 +3285,7 @@ fn run_normal_mode_navigation(
                 }
                 buf.selections_mut().clear();
                 vk.end_visual(end_cursor);
-                render_nav_frame(&buf, &vk, rect);
+                render_nav_frame(&mut buf, &vk, rect);
                 continue;
             }
             Key::Char('d') if vk.is_idle() && matches!(buf, NavBuffer::Editable(_)) && (vk.is_visual() || !buf.selections().is_empty()) => {
@@ -3286,7 +3297,7 @@ fn run_normal_mode_navigation(
                 }
                 buf.selections_mut().clear();
                 vk.end_visual(end_cursor);
-                render_nav_frame(&buf, &vk, rect);
+                render_nav_frame(&mut buf, &vk, rect);
                 continue;
             }
             Key::Char('c') if vk.is_idle() && matches!(buf, NavBuffer::Editable(_)) && (vk.is_visual() || !buf.selections().is_empty()) => {
@@ -3302,7 +3313,7 @@ fn run_normal_mode_navigation(
                 if deleted && let NavBuffer::Editable(tb) = &mut buf {
                     fileeditor::run_insert_mode(tb, &mut vk, rect, registers, &mut || service_background_jobs(sessions, windows, job_frames, *current_window), false)?;
                 }
-                render_nav_frame(&buf, &vk, rect);
+                render_nav_frame(&mut buf, &vk, rect);
                 continue;
             }
             Key::Char('p') | Key::Char('P') if vk.is_idle() && matches!(buf, NavBuffer::Editable(_)) && (vk.is_visual() || !buf.selections().is_empty()) => {
@@ -3314,7 +3325,7 @@ fn run_normal_mode_navigation(
                 }
                 buf.selections_mut().clear();
                 vk.end_visual(end_cursor);
-                render_nav_frame(&buf, &vk, rect);
+                render_nav_frame(&mut buf, &vk, rect);
                 continue;
             }
             // Visual `>`/`<`: same shape as `p`/`P` just above -- shifts
@@ -3330,7 +3341,7 @@ fn run_normal_mode_navigation(
                 }
                 buf.selections_mut().clear();
                 vk.end_visual(end_cursor);
-                render_nav_frame(&buf, &vk, rect);
+                render_nav_frame(&mut buf, &vk, rect);
                 continue;
             }
             Key::Char('<') if vk.is_idle() && matches!(buf, NavBuffer::Editable(_)) && (vk.is_visual() || !buf.selections().is_empty()) => {
@@ -3341,7 +3352,7 @@ fn run_normal_mode_navigation(
                 }
                 buf.selections_mut().clear();
                 vk.end_visual(end_cursor);
-                render_nav_frame(&buf, &vk, rect);
+                render_nav_frame(&mut buf, &vk, rect);
                 continue;
             }
             Key::Char('S') if vk.is_idle() && matches!(buf, NavBuffer::Editable(_)) && (vk.is_visual() || !buf.selections().is_empty()) => {
@@ -3356,14 +3367,14 @@ fn run_normal_mode_navigation(
                 }
                 buf.selections_mut().clear();
                 vk.end_visual(end_cursor);
-                render_nav_frame(&buf, &vk, rect);
+                render_nav_frame(&mut buf, &vk, rect);
                 continue;
             }
             Key::Escape | Key::CtrlC if vk.is_idle() && (key == Key::Escape || matches!(buf, NavBuffer::Editable(_))) && (vk.is_visual() || !buf.selections().is_empty()) => {
                 let end_cursor = buf.cursor();
                 vk.end_visual(end_cursor);
                 buf.selections_mut().clear();
-                render_nav_frame(&buf, &vk, rect);
+                render_nav_frame(&mut buf, &vk, rect);
                 continue;
             }
             Key::Char('Z') => {
@@ -3388,7 +3399,7 @@ fn run_normal_mode_navigation(
                     if saved {
                         break 'nav (NavExit::Quit, nav_buffer_into_edit_state(buf, vk));
                     }
-                    render_nav_frame(&buf, &vk, rect);
+                    render_nav_frame(&mut buf, &vk, rect);
                     continue;
                 }
                 break 'nav (NavExit::Resume(initial_text.clone(), initial_cursor), nav_buffer_into_edit_state(buf, vk));
@@ -3421,7 +3432,7 @@ fn run_normal_mode_navigation(
                     // Matches vim: an aborted/cancelled ':' command drops
                     // back into Normal mode, not out of it entirely.
                     CommandModeOutcome::Cancelled => {
-                        render_nav_frame(&buf, &vk, rect);
+                        render_nav_frame(&mut buf, &vk, rect);
                         continue;
                     }
                     // Same `CommandModeOutcome::Quit` `"q"`/`"q!"` always
@@ -3458,7 +3469,7 @@ fn run_normal_mode_navigation(
                             render_command_output_overlay(&output, status, term_rows, term_cols);
                             pending_view = PendingView::Output;
                         } else {
-                            render_nav_frame(&buf, &vk, rect);
+                            render_nav_frame(&mut buf, &vk, rect);
                         }
                         continue;
                     }
@@ -3471,7 +3482,7 @@ fn run_normal_mode_navigation(
             KeyOutcome::Motion(m, count) => {
                 editor::apply_motion_or_reselect(&mut vk, &mut buf, m, count);
                 scroll_to_show_cursor(&mut buf);
-                render_nav_frame(&buf, &vk, rect);
+                render_nav_frame(&mut buf, &vk, rect);
             }
             // `ReadOnly`: hands typing back to the live prompt's own
             // editor (`apply_insert_cmd` against `original_chars`,
@@ -3489,7 +3500,7 @@ fn run_normal_mode_navigation(
                         fileeditor::resolve_insert_start(tb, cmd);
                         fileeditor::run_insert_mode(tb, &mut vk, rect, registers, &mut || service_background_jobs(sessions, windows, job_frames, *current_window), false)?;
                     }
-                    render_nav_frame(&buf, &vk, rect);
+                    render_nav_frame(&mut buf, &vk, rect);
                 } else {
                     let (new_chars, new_cursor) = crate::bishedit::vimkeys::apply_insert_cmd(&original_chars, initial_cursor, cmd);
                     break 'nav (NavExit::Resume(new_chars.into_iter().collect(), new_cursor), nav_buffer_into_edit_state(buf, vk));
@@ -3507,7 +3518,7 @@ fn run_normal_mode_navigation(
                     if let NavBuffer::Editable(tb) = &mut buf {
                         fileeditor::run_insert_mode(tb, &mut vk, rect, registers, &mut || service_background_jobs(sessions, windows, job_frames, *current_window), true)?;
                     }
-                    render_nav_frame(&buf, &vk, rect);
+                    render_nav_frame(&mut buf, &vk, rect);
                 } else {
                     let (new_chars, new_cursor) =
                         crate::bishedit::vimkeys::apply_insert_cmd(&original_chars, initial_cursor, crate::bishedit::vimkeys::InsertCmd::Before);
@@ -3522,14 +3533,14 @@ fn run_normal_mode_navigation(
             // above, at the top of this same loop.
             KeyOutcome::EnterVisual(shape) => {
                 vk.begin_visual(shape, buf.cursor());
-                render_nav_frame(&buf, &vk, rect);
+                render_nav_frame(&mut buf, &vk, rect);
             }
             KeyOutcome::ReselectVisual => {
                 if let Some((shape, anchor, cursor)) = vk.last_visual() {
                     buf.set_cursor(cursor.0, cursor.1);
                     vk.begin_visual(shape, anchor);
                 }
-                render_nav_frame(&buf, &vk, rect);
+                render_nav_frame(&mut buf, &vk, rect);
             }
             KeyOutcome::Jump { forward } => {
                 let current = buf.cursor();
@@ -3540,7 +3551,34 @@ fn run_normal_mode_navigation(
                     buf.set_cursor(row, col);
                     scroll_to_show_cursor(&mut buf);
                 }
-                render_nav_frame(&buf, &vk, rect);
+                render_nav_frame(&mut buf, &vk, rect);
+            }
+            // `u`/`Ctrl-R`: no-op for `ReadOnly`, same as every other
+            // mutating outcome. Guarded on `!vk.is_visual() &&
+            // buf.selections().is_empty()` -- real vim's Visual mode binds
+            // bare `u`/`U` to lowercase/uppercase the selection, not
+            // implemented in this codebase today (see KeyOutcome::Undo's
+            // own doc comment in vimkeys.rs), so `u` simply does nothing
+            // while a selection is active rather than misfiring as undo.
+            KeyOutcome::Undo(count) => {
+                if !vk.is_visual() && buf.selections().is_empty() && let NavBuffer::Editable(tb) = &mut buf {
+                    for _ in 0..count.unwrap_or(1).max(1) {
+                        if !tb.undo() {
+                            break;
+                        }
+                    }
+                }
+                render_nav_frame(&mut buf, &vk, rect);
+            }
+            KeyOutcome::Redo(count) => {
+                if !vk.is_visual() && buf.selections().is_empty() && let NavBuffer::Editable(tb) = &mut buf {
+                    for _ in 0..count.unwrap_or(1).max(1) {
+                        if !tb.redo() {
+                            break;
+                        }
+                    }
+                }
+                render_nav_frame(&mut buf, &vk, rect);
             }
             // Yank works for either buffer kind (`op == Op::Yank` is
             // checked first, unconditionally) -- copying text out of a
@@ -3571,7 +3609,7 @@ fn run_normal_mode_navigation(
                         Op::Yank => unreachable!("handled above"),
                     }
                 }
-                render_nav_frame(&buf, &vk, rect);
+                render_nav_frame(&mut buf, &vk, rect);
             }
             KeyOutcome::OperatorLines(op, count, register) => {
                 if op == Op::Yank {
@@ -3589,7 +3627,7 @@ fn run_normal_mode_navigation(
                         Op::Yank => unreachable!("handled above"),
                     }
                 }
-                render_nav_frame(&buf, &vk, rect);
+                render_nav_frame(&mut buf, &vk, rect);
             }
             // `p`/`P`/`x`/`J`/`gJ`/`ys`/`ds`/`cs`/`r`/`~`/`o`/`O`: all
             // mutate, so all a no-op for `ReadOnly` (same as before this
@@ -3600,62 +3638,62 @@ fn run_normal_mode_navigation(
                 if let NavBuffer::Editable(tb) = &mut buf {
                     fileeditor::put(tb, registers, before, count, register);
                 }
-                render_nav_frame(&buf, &vk, rect);
+                render_nav_frame(&mut buf, &vk, rect);
             }
             KeyOutcome::DeleteCharForward { count, register } => {
                 if let NavBuffer::Editable(tb) = &mut buf {
                     fileeditor::delete_char_forward(tb, registers, count, register);
                 }
-                render_nav_frame(&buf, &vk, rect);
+                render_nav_frame(&mut buf, &vk, rect);
             }
             KeyOutcome::Join { count, with_space } => {
                 if let NavBuffer::Editable(tb) = &mut buf {
                     tb.join_lines(count.unwrap_or(1).max(1), with_space);
                 }
-                render_nav_frame(&buf, &vk, rect);
+                render_nav_frame(&mut buf, &vk, rect);
             }
             KeyOutcome::AddSurround { target, ch } => {
                 if let NavBuffer::Editable(tb) = &mut buf {
                     fileeditor::add_surround(tb, target, ch);
                 }
-                render_nav_frame(&buf, &vk, rect);
+                render_nav_frame(&mut buf, &vk, rect);
             }
             KeyOutcome::DeleteSurround { ch } => {
                 if let NavBuffer::Editable(tb) = &mut buf {
                     fileeditor::delete_surround(tb, ch);
                 }
-                render_nav_frame(&buf, &vk, rect);
+                render_nav_frame(&mut buf, &vk, rect);
             }
             KeyOutcome::ChangeSurround { ch, replacement } => {
                 if let NavBuffer::Editable(tb) = &mut buf {
                     fileeditor::change_surround(tb, ch, replacement);
                 }
-                render_nav_frame(&buf, &vk, rect);
+                render_nav_frame(&mut buf, &vk, rect);
             }
             KeyOutcome::ReplaceChar { ch, count } => {
                 if let NavBuffer::Editable(tb) = &mut buf {
                     fileeditor::replace_char(tb, ch, count.unwrap_or(1).max(1));
                 }
-                render_nav_frame(&buf, &vk, rect);
+                render_nav_frame(&mut buf, &vk, rect);
             }
             KeyOutcome::ToggleCase { count } => {
                 if let NavBuffer::Editable(tb) = &mut buf {
                     fileeditor::toggle_case(tb, count.unwrap_or(1).max(1));
                 }
-                render_nav_frame(&buf, &vk, rect);
+                render_nav_frame(&mut buf, &vk, rect);
             }
             KeyOutcome::AdjustNumber { delta } => {
                 if let NavBuffer::Editable(tb) = &mut buf {
                     fileeditor::adjust_number(tb, delta);
                 }
-                render_nav_frame(&buf, &vk, rect);
+                render_nav_frame(&mut buf, &vk, rect);
             }
             KeyOutcome::OpenLine { above } => {
                 if let NavBuffer::Editable(tb) = &mut buf {
                     fileeditor::open_line(tb, above);
                     fileeditor::run_insert_mode(tb, &mut vk, rect, registers, &mut || service_background_jobs(sessions, windows, job_frames, *current_window), false)?;
                 }
-                render_nav_frame(&buf, &vk, rect);
+                render_nav_frame(&mut buf, &vk, rect);
             }
             // dispatch_window_cmd does the actual work (shared with
             // run_edit_frame's own identical need -- see its own doc
@@ -3672,7 +3710,7 @@ fn run_normal_mode_navigation(
             // "20g" mid-`20gg`) and a search's in-progress text live, not
             // just the end result once a motion actually applies.
             KeyOutcome::Pending | KeyOutcome::None => {
-                render_nav_frame(&buf, &vk, rect);
+                render_nav_frame(&mut buf, &vk, rect);
             }
         }
     };
