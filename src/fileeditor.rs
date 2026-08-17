@@ -21,11 +21,10 @@ use crate::bishedit::highlight::{self, BashHighlighter, HighlightContext, Highli
 use crate::bishedit::motion;
 use crate::bishedit::registers::{RegisterShape, RegisterValue, Registers};
 use crate::bishedit::textbuffer::TextBuffer;
-use crate::bishedit::vimkeys::{InsertCmd, KeyOutcome, Op, SurroundTarget, VimKeys, WindowCmd};
+use crate::bishedit::vimkeys::{InsertCmd, Op, SurroundTarget, VimKeys};
 use crate::bishedit::Buffer;
 use crate::editor::{self, Key};
 use crate::repl::Rect;
-use crate::term;
 use crate::vt100;
 
 // What `repl.rs`'s `edit_frames` side table actually holds -- not just a
@@ -50,32 +49,6 @@ impl EditSession {
     }
 }
 
-// Mirrors repl.rs's own (private) `FgOutcome`, but only two cases: no
-// `Stopped`, since there's no external process here to suspend.
-pub enum EditOutcome {
-    Quit,
-    Detached,
-    // `<C-w>{cmd}`: vimkeys.rs has already resolved this into a concrete
-    // WindowCmd+count (the identical KeyOutcome::Window repl.rs's own
-    // run_normal_mode_navigation reaches) -- applying it needs real
-    // window/session state this loop was never given (see the KeyOutcome::
-    // Window match arm's own doc comment: "no window state to act on
-    // directly from inside this loop"). repl.rs's run_edit_frame does that,
-    // the same place plain Detached already re-inserts this session and
-    // freezes its own frame.
-    DetachedForWindowCmd(WindowCmd, Option<usize>),
-    // `:` for anything that isn't recognized as one of this editor's own
-    // w/w <path>/wq/x/q/q! commands (see run_ex_command's own doc
-    // comment) -- whatever had already been typed after the ':', so the
-    // real command mode (window subcommands, actual shell builtins) can
-    // run it instead of this editor's own limited reader rejecting it.
-    // Same "no window/session state here" reasoning as
-    // DetachedForWindowCmd. run_edit_frame seeds the real command mode's
-    // own first prompt with this text (cursor at its end) rather than
-    // dropping it, so nothing already typed is lost in the hand-off.
-    DetachedForCommand(String),
-}
-
 // What the status line (`mode_label`) and `build_editor_frame`'s own
 // Visual-highlight gating need to know about the current mode -- `R`'s
 // own addition to what used to be a plain `insert_mode: bool` (Replace
@@ -88,254 +61,7 @@ pub(crate) enum EditorMode {
     Replace,
 }
 
-// The actual blocking loop -- called by repl.rs's `run_edit_frame`
-// whenever this pane's top frame is a `Frame::Edit`, whether that's a
-// freshly-opened session or one resumed after an earlier detach. Renders
-// directly (no callback indirection the way `drive_fg_job` uses one --
-// that one needs it because a job's own output arrives independently of
-// user input; this loop only ever changes in response to a key it just
-// read, so it can just render itself after each one). `on_idle` is
-// passed straight to `editor::read_key_idle`, same as every other
-// blocking key-reading loop in this codebase, so other windows'
-// background jobs keep progressing while this one owns the terminal.
-pub fn drive(session: &mut EditSession, rect: Rect, registers: &mut Registers, on_idle: &mut dyn FnMut()) -> io::Result<EditOutcome> {
-    // Without this, stdin stays in cooked/canonical mode (line-buffered,
-    // locally echoed by the tty driver itself) -- every other blocking
-    // key-reading loop in this codebase (run_normal_mode_navigation,
-    // run_line_normal_mode, ...) enables raw mode for exactly this
-    // reason, right before its own loop starts. Held for this whole call
-    // (covering run_insert_mode/run_ex_command too, both nested within
-    // it), not just re-acquired per sub-loop.
-    let _guard = term::RawGuard::enable(0)?;
-    set_last_filename(session, registers);
-    render_editor_frame(&session.buffer, &session.vk, EditorMode::Normal, rect);
-    loop {
-        let key = match editor::read_key_idle(on_idle)? {
-            Some(k) => k,
-            // EOF (stdin closed): nothing sensible to resume into --
-            // same "just stop" treatment repl.rs's own read_line-driven
-            // loops give an EOF they can't otherwise act on.
-            None => return Ok(EditOutcome::Quit),
-        };
-
-        if key == Key::CtrlSpace && session.vk.is_idle() {
-            return Ok(EditOutcome::Detached);
-        }
-
-        // Visual mode's own `Z`/`y`/`d`/`c`/`p`/`P`/Escape -- intercepted
-        // here, ahead of `vk.feed`, for the same reason editor.rs's own
-        // identical arms (`run_line_normal_mode`) already are: "is there
-        // a selection to act on" is buffer-owned state vimkeys.rs
-        // deliberately never sees. `vk.is_idle()` guards all of them:
-        // mid a sub-prefix (`f`, a count, ...) these keys keep their
-        // ordinary meaning instead.
-        match key {
-            Key::Char('Z') if session.vk.is_idle() && session.vk.is_visual() => {
-                commit_active_selection(session);
-                let end_cursor = session.buffer.cursor();
-                session.vk.end_visual(end_cursor);
-                render_editor_frame(&session.buffer, &session.vk, EditorMode::Normal, rect);
-                continue;
-            }
-            Key::Char('y') if session.vk.is_idle() && (session.vk.is_visual() || !session.buffer.selections.is_empty()) => {
-                commit_active_selection(session);
-                let end_cursor = session.buffer.cursor();
-                let register = session.vk.take_pending_register();
-                session.buffer.yank_selections(registers, register);
-                session.buffer.selections.clear();
-                session.vk.end_visual(end_cursor);
-                render_editor_frame(&session.buffer, &session.vk, EditorMode::Normal, rect);
-                continue;
-            }
-            Key::Char('d') if session.vk.is_idle() && (session.vk.is_visual() || !session.buffer.selections.is_empty()) => {
-                commit_active_selection(session);
-                let end_cursor = session.buffer.cursor();
-                let register = session.vk.take_pending_register();
-                session.buffer.delete_selections(registers, register);
-                session.buffer.selections.clear();
-                session.vk.end_visual(end_cursor);
-                render_editor_frame(&session.buffer, &session.vk, EditorMode::Normal, rect);
-                continue;
-            }
-            Key::Char('c') if session.vk.is_idle() && (session.vk.is_visual() || !session.buffer.selections.is_empty()) => {
-                commit_active_selection(session);
-                let end_cursor = session.buffer.cursor();
-                let register = session.vk.take_pending_register();
-                let deleted = session.buffer.delete_selections(registers, register);
-                session.buffer.selections.clear();
-                session.vk.end_visual(end_cursor);
-                if deleted {
-                    match run_insert_mode(session, rect, registers, on_idle, false)? {
-                        InsertOutcome::Detached => return Ok(EditOutcome::Detached),
-                        InsertOutcome::Done => {}
-                    }
-                }
-                render_editor_frame(&session.buffer, &session.vk, EditorMode::Normal, rect);
-                continue;
-            }
-            Key::Char('p') | Key::Char('P') if session.vk.is_idle() && (session.vk.is_visual() || !session.buffer.selections.is_empty()) => {
-                commit_active_selection(session);
-                let end_cursor = session.buffer.cursor();
-                let register = session.vk.take_pending_register();
-                session.buffer.put_over_selections(registers, register);
-                session.buffer.selections.clear();
-                session.vk.end_visual(end_cursor);
-                render_editor_frame(&session.buffer, &session.vk, EditorMode::Normal, rect);
-                continue;
-            }
-            // `S`: vim-surround's own "wrap the selection" -- reads one
-            // more raw key directly (the delimiter character), same as
-            // editor.rs's own identical arm (see its doc comment).
-            Key::Char('S') if session.vk.is_idle() && (session.vk.is_visual() || !session.buffer.selections.is_empty()) => {
-                commit_active_selection(session);
-                let end_cursor = session.buffer.cursor();
-                if let Some(Key::Char(ch)) = editor::read_key_idle(on_idle)? {
-                    surround_selections(&mut session.buffer, ch);
-                }
-                session.buffer.selections.clear();
-                session.vk.end_visual(end_cursor);
-                render_editor_frame(&session.buffer, &session.vk, EditorMode::Normal, rect);
-                continue;
-            }
-            // `Ctrl-C` is a plain alias for `Escape` everywhere in this
-            // editor (here, and `run_insert_mode`'s own identical arm) --
-            // unlike the shell prompt, where Ctrl-C's real SIGINT-adjacent
-            // meaning (clear the current line) is still load-bearing, an
-            // open `e` session has no such competing use for it, so it's
-            // free to also mean "back to Normal," matching vim's own
-            // Ctrl-C-also-leaves-Insert/Visual convention.
-            Key::Escape | Key::CtrlC if session.vk.is_idle() && (session.vk.is_visual() || !session.buffer.selections.is_empty()) => {
-                let end_cursor = session.buffer.cursor();
-                session.vk.end_visual(end_cursor);
-                session.buffer.selections.clear();
-                render_editor_frame(&session.buffer, &session.vk, EditorMode::Normal, rect);
-                continue;
-            }
-            Key::Char(':') if session.vk.is_idle() => match run_ex_command(session, rect, registers, on_idle)? {
-                ExOutcome::Quit => return Ok(EditOutcome::Quit),
-                ExOutcome::RunElsewhere(cmd) => return Ok(EditOutcome::DetachedForCommand(cmd)),
-                ExOutcome::Continue => {
-                    render_editor_frame(&session.buffer, &session.vk, EditorMode::Normal, rect);
-                    continue;
-                }
-            },
-            _ => {}
-        }
-
-        match session.vk.feed(key) {
-            KeyOutcome::Motion(m, count) => {
-                editor::apply_motion_or_reselect(&mut session.vk, &mut session.buffer, m, count);
-                scroll_to_show_cursor(&mut session.buffer);
-            }
-            KeyOutcome::EnterVisual(shape) => {
-                session.vk.begin_visual(shape, session.buffer.cursor());
-            }
-            KeyOutcome::ReselectVisual => {
-                if let Some((shape, anchor, cursor)) = session.vk.last_visual() {
-                    session.buffer.set_cursor(cursor.0, cursor.1);
-                    session.vk.begin_visual(shape, anchor);
-                }
-            }
-            KeyOutcome::Jump { forward } => {
-                let current = session.buffer.cursor();
-                let target = if forward { session.vk.jump_forward(current) } else { session.vk.jump_back(current) };
-                if let Some((row, col)) = target {
-                    let row = row.min(session.buffer.line_count() - 1);
-                    let col = col.min(session.buffer.line_len(row));
-                    session.buffer.set_cursor(row, col);
-                    scroll_to_show_cursor(&mut session.buffer);
-                }
-            }
-            KeyOutcome::EnterInsert(cmd) => {
-                resolve_insert_start(&mut session.buffer, cmd);
-                match run_insert_mode(session, rect, registers, on_idle, false)? {
-                    InsertOutcome::Detached => return Ok(EditOutcome::Detached),
-                    InsertOutcome::Done => {}
-                }
-            }
-            KeyOutcome::Operator(op, m, count, register) => match op {
-                Op::Yank => editor::yank_motion(&mut session.buffer, registers, m, count, register),
-                Op::Delete => {
-                    delete_motion(&mut session.buffer, registers, m, count, register);
-                }
-                Op::Change => {
-                    let m = redirect_cw_to_ce(&session.buffer, &m);
-                    if delete_motion(&mut session.buffer, registers, m, count, register) {
-                        match run_insert_mode(session, rect, registers, on_idle, false)? {
-                            InsertOutcome::Detached => return Ok(EditOutcome::Detached),
-                            InsertOutcome::Done => {}
-                        }
-                    }
-                }
-                Op::Lowercase | Op::Uppercase | Op::CaseToggle => case_operator_motion(&mut session.buffer, m, count, case_kind_for_op(op)),
-            },
-            KeyOutcome::OperatorLines(op, count, register) => match op {
-                Op::Yank => editor::yank_lines(&session.buffer, registers, count, register),
-                Op::Delete => delete_lines(&mut session.buffer, registers, count, register),
-                Op::Change => {
-                    delete_lines(&mut session.buffer, registers, count, register);
-                    match run_insert_mode(session, rect, registers, on_idle, false)? {
-                        InsertOutcome::Detached => return Ok(EditOutcome::Detached),
-                        InsertOutcome::Done => {}
-                    }
-                }
-                Op::Lowercase | Op::Uppercase | Op::CaseToggle => case_operator_lines(&mut session.buffer, count, case_kind_for_op(op)),
-            },
-            KeyOutcome::Put { before, count, register } => put(&mut session.buffer, registers, before, count, register),
-            KeyOutcome::DeleteCharForward { count, register } => delete_char_forward(&mut session.buffer, registers, count, register),
-            KeyOutcome::Join { count, with_space } => {
-                session.buffer.join_lines(count.unwrap_or(1).max(1), with_space);
-            }
-            KeyOutcome::AddSurround { target, ch } => add_surround(&mut session.buffer, target, ch),
-            KeyOutcome::DeleteSurround { ch } => delete_surround(&mut session.buffer, ch),
-            KeyOutcome::ChangeSurround { ch, replacement } => change_surround(&mut session.buffer, ch, replacement),
-            KeyOutcome::ReplaceChar { ch, count } => replace_char(&mut session.buffer, ch, count.unwrap_or(1).max(1)),
-            KeyOutcome::EnterReplace => match run_insert_mode(session, rect, registers, on_idle, true)? {
-                InsertOutcome::Detached => return Ok(EditOutcome::Detached),
-                InsertOutcome::Done => {}
-            },
-            KeyOutcome::OpenLine { above } => {
-                open_line(&mut session.buffer, above);
-                match run_insert_mode(session, rect, registers, on_idle, false)? {
-                    InsertOutcome::Detached => return Ok(EditOutcome::Detached),
-                    InsertOutcome::Done => {}
-                }
-            }
-            KeyOutcome::ToggleCase { count } => toggle_case(&mut session.buffer, count.unwrap_or(1).max(1)),
-            KeyOutcome::AdjustNumber { delta } => adjust_number(&mut session.buffer, delta),
-            // <C-w>: unlike editor.rs's own LineBuffer contexts (a
-            // genuine no-op there -- see that arm's own comment), this
-            // editor is a real, focusable pane, so a window command
-            // typed here should actually do something. There's no
-            // window/session state to act on directly from inside this
-            // loop, though (see EditOutcome::DetachedForWindowCmd's own
-            // doc comment), so it detaches and lets repl.rs's
-            // run_edit_frame apply it against the real thing instead.
-            KeyOutcome::Window(cmd, count) => return Ok(EditOutcome::DetachedForWindowCmd(cmd, count)),
-            KeyOutcome::Pending | KeyOutcome::None => {}
-        }
-        render_editor_frame(&session.buffer, &session.vk, EditorMode::Normal, rect);
-    }
-}
-
-fn commit_active_selection(session: &mut EditSession) {
-    if let Some(range) = active_visual_range(&session.vk, &session.buffer) {
-        session.buffer.selections.push(range);
-    }
-}
-
-// Visual mode's own active (not yet committed via `Z`) selection, if any
-// -- mirrors repl.rs's own `active_visual_range`/editor.rs's own
-// `active_visual_range_line` exactly, just typed to `TextBuffer`.
-fn active_visual_range(vk: &VimKeys, buf: &TextBuffer) -> Option<motion::MotionRange> {
-    let (shape, anchor) = vk.visual_anchor()?;
-    let cursor = buf.cursor();
-    let motion_shape = if shape == RegisterShape::Line { motion::MotionShape::Linewise } else { motion::MotionShape::Inclusive };
-    let (from, to) = if anchor <= cursor { (anchor, cursor) } else { (cursor, anchor) };
-    Some(motion::MotionRange { shape: motion_shape, from, to })
-}
-
-fn scroll_to_show_cursor(buf: &mut TextBuffer) {
+pub(crate) fn scroll_to_show_cursor(buf: &mut TextBuffer) {
     let (line, _) = buf.cursor();
     let height = buf.viewport_height();
     if line < buf.viewport_top() {
@@ -352,7 +78,7 @@ fn scroll_to_show_cursor(buf: &mut TextBuffer) {
 // separately), writes it to a register. Returns whether anything was
 // actually deleted, same as `editor.rs`'s own `delete_motion` -- `Change`
 // uses this to decide whether to enter insert mode at all.
-fn delete_motion(buf: &mut TextBuffer, registers: &mut Registers, m: motion::Motion, count: Option<usize>, register: Option<char>) -> bool {
+pub(crate) fn delete_motion(buf: &mut TextBuffer, registers: &mut Registers, m: motion::Motion, count: Option<usize>, register: Option<char>) -> bool {
     let Some(range) = motion::motion_range(buf, m, count) else {
         return false;
     };
@@ -369,7 +95,7 @@ fn delete_motion(buf: &mut TextBuffer, registers: &mut Registers, m: motion::Mot
 // clamping `motion::whole_lines` itself already applies, so the yanked
 // register text and the removed range always agree on which lines were
 // affected.
-fn delete_lines(buf: &mut TextBuffer, registers: &mut Registers, count: Option<usize>, register: Option<char>) {
+pub(crate) fn delete_lines(buf: &mut TextBuffer, registers: &mut Registers, count: Option<usize>, register: Option<char>) {
     let count = count.unwrap_or(1).max(1);
     let text = motion::whole_lines(buf, count);
     registers.record_delete(register, RegisterValue { text, shape: RegisterShape::Line });
@@ -383,7 +109,7 @@ fn delete_lines(buf: &mut TextBuffer, registers: &mut Registers, count: Option<u
 // to the end of the line -- vim's own primitive (see `vimkeys::
 // apply_delete_forward`'s own doc comment on why this isn't quite
 // reducible to `d{count}l`).
-fn delete_char_forward(buf: &mut TextBuffer, registers: &mut Registers, count: Option<usize>, register: Option<char>) {
+pub(crate) fn delete_char_forward(buf: &mut TextBuffer, registers: &mut Registers, count: Option<usize>, register: Option<char>) {
     let (row, col) = buf.cursor();
     let len = buf.line_len(row);
     if len == 0 {
@@ -425,7 +151,7 @@ fn resolve_surround_target(buf: &mut TextBuffer, target: &SurroundTarget) -> Opt
 // `motion::surround_insert_points`'s own doc comment). Cursor lands on
 // the inserted open delimiter's own first character, matching
 // vim-surround.
-fn add_surround(buf: &mut TextBuffer, target: SurroundTarget, ch: char) {
+pub(crate) fn add_surround(buf: &mut TextBuffer, target: SurroundTarget, ch: char) {
     let Some(range) = resolve_surround_target(buf, &target) else {
         return;
     };
@@ -443,7 +169,7 @@ fn add_surround(buf: &mut TextBuffer, target: SurroundTarget, ch: char) {
 // first, so removing it can never shift the open side's own position. A
 // no-op if `ch` doesn't name a valid target or no such pair encloses the
 // cursor.
-fn delete_surround(buf: &mut TextBuffer, ch: char) {
+pub(crate) fn delete_surround(buf: &mut TextBuffer, ch: char) {
     let Some(kind) = motion::surround_target_kind(ch) else {
         return;
     };
@@ -461,7 +187,7 @@ fn delete_surround(buf: &mut TextBuffer, ch: char) {
 // of removing them -- never touches any padding around them (unlike
 // `ds`). Close side first, same reasoning as `add_surround`/
 // `delete_surround`.
-fn change_surround(buf: &mut TextBuffer, ch: char, replacement: char) {
+pub(crate) fn change_surround(buf: &mut TextBuffer, ch: char, replacement: char) {
     let Some(kind) = motion::surround_target_kind(ch) else {
         return;
     };
@@ -484,7 +210,7 @@ fn change_surround(buf: &mut TextBuffer, ch: char, replacement: char) {
 // active one in `ch`'s own delimiter pair, mirroring editor.rs's own
 // `surround_selections` (see its doc comment) generalized to a
 // `TextBuffer`'s multi-line selections/`insert_text`.
-fn surround_selections(buf: &mut TextBuffer, ch: char) {
+pub(crate) fn surround_selections(buf: &mut TextBuffer, ch: char) {
     if buf.selections.is_empty() {
         return;
     }
@@ -509,7 +235,7 @@ fn surround_selections(buf: &mut TextBuffer, ch: char) {
 // rule. Built on `delete_range`/`insert_text` (no in-place char mutation
 // exists on `TextBuffer`) rather than that one's direct `Vec<char>`
 // splice, same reasoning `change_surround`'s own doc comment gives.
-fn replace_char(buf: &mut TextBuffer, ch: char, count: usize) {
+pub(crate) fn replace_char(buf: &mut TextBuffer, ch: char, count: usize) {
     let (row, col) = buf.cursor();
     if count == 0 || col + count > buf.line_len(row) {
         return;
@@ -523,7 +249,7 @@ fn replace_char(buf: &mut TextBuffer, ch: char, count: usize) {
 
 // `Ctrl-A`/`Ctrl-X`: see editor.rs's own identical-in-spirit
 // `adjust_number`.
-fn adjust_number(buf: &mut TextBuffer, delta: i64) {
+pub(crate) fn adjust_number(buf: &mut TextBuffer, delta: i64) {
     let Some(m) = motion::find_number(buf, buf.cursor()) else {
         return;
     };
@@ -534,7 +260,7 @@ fn adjust_number(buf: &mut TextBuffer, delta: i64) {
     buf.set_cursor(m.from.0, m.from.1 + replacement.chars().count() - 1);
 }
 
-fn case_kind_for_op(op: Op) -> motion::CaseKind {
+pub(crate) fn case_kind_for_op(op: Op) -> motion::CaseKind {
     match op {
         Op::Lowercase => motion::CaseKind::Lower,
         Op::Uppercase => motion::CaseKind::Upper,
@@ -595,14 +321,14 @@ fn case_operator_range(buf: &mut TextBuffer, range: &motion::MotionRange, kind: 
     buf.set_cursor(range.from.0, range.from.1);
 }
 
-fn case_operator_motion(buf: &mut TextBuffer, m: motion::Motion, count: Option<usize>, kind: motion::CaseKind) {
+pub(crate) fn case_operator_motion(buf: &mut TextBuffer, m: motion::Motion, count: Option<usize>, kind: motion::CaseKind) {
     let Some(range) = motion::motion_range(buf, m, count) else {
         return;
     };
     case_operator_range(buf, &range, kind);
 }
 
-fn case_operator_lines(buf: &mut TextBuffer, count: Option<usize>, kind: motion::CaseKind) {
+pub(crate) fn case_operator_lines(buf: &mut TextBuffer, count: Option<usize>, kind: motion::CaseKind) {
     let count = count.unwrap_or(1).max(1);
     let (row, _) = buf.cursor();
     let last = (row + count - 1).min(buf.line_count().saturating_sub(1));
@@ -616,7 +342,7 @@ fn case_operator_lines(buf: &mut TextBuffer, count: Option<usize>, kind: motion:
 // toggled run as one string and swaps it in via a single `delete_range`/
 // `insert_text` pair rather than `TextBuffer` having any in-place
 // per-character mutation to loop over.
-fn toggle_case(buf: &mut TextBuffer, count: usize) {
+pub(crate) fn toggle_case(buf: &mut TextBuffer, count: usize) {
     let (row, col) = buf.cursor();
     let len = buf.line_len(row);
     if col >= len {
@@ -638,7 +364,7 @@ fn toggle_case(buf: &mut TextBuffer, count: usize) {
 // bracketing the pasted text with a leading/trailing "\n" and choosing
 // the insertion column makes `insert_text`'s ordinary line-splitting
 // logic land the result in the right place either way.
-fn put(buf: &mut TextBuffer, registers: &mut Registers, before: bool, count: Option<usize>, register: Option<char>) {
+pub(crate) fn put(buf: &mut TextBuffer, registers: &mut Registers, before: bool, count: Option<usize>, register: Option<char>) {
     let value = registers.read(register);
     if value.text.is_empty() {
         return;
@@ -672,7 +398,7 @@ fn put(buf: &mut TextBuffer, registers: &mut Registers, before: bool, count: Opt
 // vim's own "`cw`/`cW` act like `ce`/`cE`" rule -- see editor.rs's own
 // `redirect_cw_to_ce` for the full reasoning (identical here, just
 // against a `TextBuffer` cursor instead of a `LineEditor` one).
-fn redirect_cw_to_ce(buf: &TextBuffer, m: &motion::Motion) -> motion::Motion {
+pub(crate) fn redirect_cw_to_ce(buf: &TextBuffer, m: &motion::Motion) -> motion::Motion {
     let (row, col) = buf.cursor();
     let on_word_char = matches!(buf.char_at(row, col), Some(c) if !c.is_whitespace());
     match m {
@@ -703,7 +429,7 @@ fn redirect_cw_to_ce(buf: &TextBuffer, m: &motion::Motion) -> motion::Motion {
 // what was just inserted" convention still reports (row + 1, 0) -- the
 // pushed-down line, not the new blank one -- so this repositions
 // explicitly for that case.
-fn open_line(buf: &mut TextBuffer, above: bool) {
+pub(crate) fn open_line(buf: &mut TextBuffer, above: bool) {
     let (row, _) = buf.cursor();
     if above {
         buf.insert_text((row, 0), "\n");
@@ -714,7 +440,7 @@ fn open_line(buf: &mut TextBuffer, above: bool) {
     }
 }
 
-fn resolve_insert_start(buf: &mut TextBuffer, cmd: InsertCmd) {
+pub(crate) fn resolve_insert_start(buf: &mut TextBuffer, cmd: InsertCmd) {
     let (row, col) = buf.cursor();
     match cmd {
         InsertCmd::Before => {}
@@ -756,29 +482,31 @@ fn resolve_insert_start(buf: &mut TextBuffer, cmd: InsertCmd) {
     }
 }
 
-enum InsertOutcome {
-    Done,
-    Detached,
-}
-
 // The typing loop once Insert mode has actually started (cursor already
 // positioned by `resolve_insert_start`, or -- for `c{motion}`/`cc`/
 // Visual `c` -- already sitting exactly where a delete just left it, no
-// repositioning needed at all). Ctrl+Space works here too, not just from
-// Normal mode -- detaching mid-insert leaves whatever was typed in place
-// uncommitted (nothing lost, just not yet escaped back to Normal),
-// matching every other mid-sequence Ctrl+Space snapshot elsewhere in
-// this codebase.
+// repositioning needed at all). Always returns to Normal mode in the
+// caller (the one real Normal-mode loop, `repl.rs`'s
+// `run_normal_mode_navigation`) once this returns -- Escape/Ctrl-C/
+// Ctrl+Space all mean exactly the same thing here (leave Insert mode),
+// and EOF does too (nothing sensible to keep typing into). Unlike a live
+// shell prompt's own Insert-mode-to-Normal-mode transition, there's no
+// second "which mode am I actually in" question to answer afterward:
+// this pane's own Normal mode is already the one true one, so Ctrl+Space
+// has nothing further to detach *to* -- it used to jump straight past
+// Normal mode to inspecting/switching other windows in one keystroke;
+// now it just means "stop typing," and reaching another window from here
+// is `<C-w>...` after this returns, same total keystroke count as before.
 //
 // `replace` (`R` -- see `KeyOutcome::EnterReplace`'s own doc comment)
 // swaps two of this loop's own arms (`Key::Char`/`Key::Backspace`) from
 // their ordinary Insert-mode behavior to overtype instead -- everything
-// else (motion keys, Enter, detach/exit) behaves identically either way,
-// which is why this is a flag on the one shared loop rather than a
-// second copy of it.
-fn run_insert_mode(session: &mut EditSession, rect: Rect, registers: &mut Registers, on_idle: &mut dyn FnMut(), replace: bool) -> io::Result<InsertOutcome> {
+// else (motion keys, Enter, exit) behaves identically either way, which
+// is why this is a flag on the one shared loop rather than a second copy
+// of it.
+pub(crate) fn run_insert_mode(buf: &mut TextBuffer, vk: &mut VimKeys, rect: Rect, registers: &mut Registers, on_idle: &mut dyn FnMut(), replace: bool) -> io::Result<()> {
     let mode = if replace { EditorMode::Replace } else { EditorMode::Insert };
-    render_editor_frame(&session.buffer, &session.vk, mode, rect);
+    render_editor_frame(buf, vk, mode, rect);
     // `"."`'s own accumulator for this session -- see `Registers::
     // set_last_insert`'s own doc comment. Best-effort: a Backspace just
     // pops the most recently accumulated character regardless of whether
@@ -790,33 +518,29 @@ fn run_insert_mode(session: &mut EditSession, rect: Rect, registers: &mut Regist
         let key = match editor::read_key_idle(on_idle)? {
             Some(k) => k,
             None => {
-                session.buffer.set_mark('^', session.buffer.cursor());
+                buf.set_mark('^', buf.cursor());
                 registers.set_last_insert(inserted);
-                return Ok(InsertOutcome::Done);
+                return Ok(());
             }
         };
         match key {
             // `^`: vim's own name for this mark (`:help '^`) -- wherever
             // the cursor was the last time Insert mode ended, however it
-            // ended (typed out via Escape/EOF, or a Ctrl+Space detach
-            // mid-typing). `gi` reads it back (see resolve_insert_start's
-            // own `LastInsertPos` arm).
-            Key::CtrlSpace => {
-                session.buffer.set_mark('^', session.buffer.cursor());
+            // ended. `gi` reads it back (see resolve_insert_start's own
+            // `LastInsertPos` arm).
+            //
+            // Ctrl-C is a plain alias for Escape throughout this editor
+            // (see the identical treatment in the unified Normal mode's
+            // own Visual-mode handling); Ctrl+Space is too, here (see
+            // this function's own doc comment).
+            Key::CtrlSpace | Key::Escape | Key::CtrlC => {
+                buf.set_mark('^', buf.cursor());
                 registers.set_last_insert(inserted);
-                return Ok(InsertOutcome::Detached);
-            }
-            // See the identical `Escape | CtrlC` arm in `drive`'s own
-            // Visual-mode handling for why Ctrl-C is a plain alias for
-            // Escape throughout this editor.
-            Key::Escape | Key::CtrlC => {
-                session.buffer.set_mark('^', session.buffer.cursor());
-                registers.set_last_insert(inserted);
-                return Ok(InsertOutcome::Done);
+                return Ok(());
             }
             Key::Enter => {
-                let (row, col) = session.buffer.cursor();
-                session.buffer.insert_text((row, col), "\n");
+                let (row, col) = buf.cursor();
+                buf.insert_text((row, col), "\n");
                 inserted.push('\n');
             }
             // Replace mode's own Backspace: known simplification -- steps
@@ -825,179 +549,72 @@ fn run_insert_mode(session: &mut EditSession, rect: Rect, registers: &mut Regist
             // never crosses a line boundary backward, unlike ordinary
             // Insert mode's own version just below.
             Key::Backspace if replace => {
-                let (row, col) = session.buffer.cursor();
+                let (row, col) = buf.cursor();
                 if col > 0 {
-                    session.buffer.set_cursor(row, col - 1);
+                    buf.set_cursor(row, col - 1);
                 }
                 inserted.pop();
             }
             Key::Backspace => {
-                let (row, col) = session.buffer.cursor();
+                let (row, col) = buf.cursor();
                 if col > 0 {
                     let range = motion::MotionRange { shape: motion::MotionShape::Exclusive, from: (row, col - 1), to: (row, col) };
-                    session.buffer.delete_range(&range);
+                    buf.delete_range(&range);
                 } else if row > 0 {
-                    let prev_len = session.buffer.line_len(row - 1);
+                    let prev_len = buf.line_len(row - 1);
                     let range = motion::MotionRange { shape: motion::MotionShape::Exclusive, from: (row - 1, prev_len), to: (row, 0) };
-                    session.buffer.delete_range(&range);
+                    buf.delete_range(&range);
                 }
                 inserted.pop();
             }
-            Key::Left => motion::apply_motion(&mut session.buffer, motion::Motion::Left, None),
+            Key::Left => motion::apply_motion(buf, motion::Motion::Left, None),
             Key::Right => {
                 // `Motion::Right` clamps at the last real character (its
                 // ordinary Normal-mode meaning); Insert mode's cursor is
                 // allowed one column past that (where the next typed
                 // char would land), so this moves it directly rather
                 // than going through the clamped motion.
-                let (row, col) = session.buffer.cursor();
-                session.buffer.set_cursor(row, (col + 1).min(session.buffer.line_len(row)));
+                let (row, col) = buf.cursor();
+                buf.set_cursor(row, (col + 1).min(buf.line_len(row)));
             }
-            Key::Up => motion::apply_motion(&mut session.buffer, motion::Motion::Up, None),
-            Key::Down => motion::apply_motion(&mut session.buffer, motion::Motion::Down, None),
+            Key::Up => motion::apply_motion(buf, motion::Motion::Up, None),
+            Key::Down => motion::apply_motion(buf, motion::Motion::Down, None),
             Key::Char(c) => {
-                let (row, col) = session.buffer.cursor();
+                let (row, col) = buf.cursor();
                 // Replace mode overwrites the character already at the
                 // cursor, if there is one -- deleting it first, then
                 // inserting, naturally extends the line once the cursor
                 // reaches its end (nothing left there to overwrite),
                 // matching real vim's own `R` behavior at end of line.
-                if replace && col < session.buffer.line_len(row) {
+                if replace && col < buf.line_len(row) {
                     let range = motion::MotionRange { shape: motion::MotionShape::Inclusive, from: (row, col), to: (row, col) };
-                    session.buffer.delete_range(&range);
+                    buf.delete_range(&range);
                 }
                 let mut b = [0u8; 4];
-                session.buffer.insert_text((row, col), c.encode_utf8(&mut b));
+                buf.insert_text((row, col), c.encode_utf8(&mut b));
                 inserted.push(c);
             }
             _ => {}
         }
-        scroll_to_show_cursor(&mut session.buffer);
-        render_editor_frame(&session.buffer, &session.vk, mode, rect);
+        scroll_to_show_cursor(buf);
+        render_editor_frame(buf, vk, mode, rect);
     }
-}
-
-enum ExOutcome {
-    Continue,
-    Quit,
-    // Anything that isn't one of this function's own recognized editor
-    // commands -- see run_ex_command's own doc comment.
-    RunElsewhere(String),
 }
 
 // `"%"`: vim's own current-filename register -- refreshed here (a no-op
 // if there's no path, e.g. an unnamed buffer that still hasn't been
 // written anywhere) whenever the buffer's own path could plausibly have
-// just changed (`drive`'s own initial open, and every successful `:w`/
-// `:wq`/`:x` here, since `:w newname` can name a previously-unnamed
-// buffer).
-fn set_last_filename(session: &EditSession, registers: &mut Registers) {
-    if let Some(path) = session.buffer.path() {
+// just changed (repl.rs's `run_edit_frame`, once when it starts driving a
+// session, and `run_command_mode`'s own `w`/`wq`/`x` handling, since `:w
+// newname` can name a previously-unnamed buffer).
+pub(crate) fn set_last_filename(buf: &TextBuffer, registers: &mut Registers) {
+    if let Some(path) = buf.path() {
         registers.set_last_filename(path.to_string_lossy().into_owned());
-    }
-}
-
-// `:w`, `:w <path>`, `:wq`/`:x`, `:q`, `:q!` -- deliberately not
-// `editor::read_line` (which every other `:`/`/`-style prompt in this
-// codebase reuses): that needs a real `History` to browse, which nothing
-// here has a sensible one to offer (no persisted Ex-command history is
-// in scope for this pass), so this is its own minimal reader instead --
-// print the prompt, read raw keys until Enter/Escape, nothing else
-// `read_line` offers (completion, suggestions, browsing) is needed for a
-// one-line Ex command anyway. Anything typed here that isn't one of
-// those (a window subcommand, an actual shell command) doesn't error
-// out anymore -- it comes back as `RunElsewhere` so the caller can hand
-// it to the real thing (repl.rs's own command mode) instead; this
-// reader stays deliberately narrow, it just no longer treats "not mine"
-// as "invalid."
-fn run_ex_command(session: &mut EditSession, rect: Rect, registers: &mut Registers, on_idle: &mut dyn FnMut()) -> io::Result<ExOutcome> {
-    let Some(line) = read_ex_command_line(rect, on_idle)? else {
-        return Ok(ExOutcome::Continue);
-    };
-    let line = line.trim();
-    // `":"`: recorded regardless of what the command turns out to be
-    // (matching vim: even a failed `:nonsense` becomes the new `":`).
-    registers.set_last_ex_command(line.to_string());
-    let (cmd, arg) = match line.split_once(' ') {
-        Some((c, a)) => (c, Some(a.trim()).filter(|a| !a.is_empty())),
-        None => (line, None),
-    };
-    match cmd {
-        "" => Ok(ExOutcome::Continue),
-        "w" | "write" => {
-            match session.buffer.save(arg.map(std::path::Path::new)) {
-                Ok(()) => set_last_filename(session, registers),
-                Err(e) => flash_status(&format!("E212: Can't open file for writing: {e}"), rect, on_idle)?,
-            }
-            Ok(ExOutcome::Continue)
-        }
-        "wq" | "x" => match session.buffer.save(arg.map(std::path::Path::new)) {
-            Ok(()) => {
-                set_last_filename(session, registers);
-                Ok(ExOutcome::Quit)
-            }
-            Err(e) => {
-                flash_status(&format!("E212: Can't open file for writing: {e}"), rect, on_idle)?;
-                Ok(ExOutcome::Continue)
-            }
-        },
-        "q" => {
-            if session.buffer.is_dirty() {
-                flash_status("E37: No write since last change (add ! to override)", rect, on_idle)?;
-                Ok(ExOutcome::Continue)
-            } else {
-                Ok(ExOutcome::Quit)
-            }
-        }
-        "q!" => Ok(ExOutcome::Quit),
-        _ => Ok(ExOutcome::RunElsewhere(line.to_string())),
     }
 }
 
 fn editor_content_rows(rect: Rect) -> usize {
     rect.rows.saturating_sub(1).max(1)
-}
-
-fn status_row(rect: Rect) -> usize {
-    rect.row + editor_content_rows(rect)
-}
-
-fn read_ex_command_line(rect: Rect, on_idle: &mut dyn FnMut()) -> io::Result<Option<String>> {
-    let row = status_row(rect);
-    let mut buf = String::new();
-    loop {
-        print!("\x1b[{};{}H\x1b[K\x1b[7m:{}\x1b[0m", row + 1, rect.col + 1, buf);
-        io::stdout().flush()?;
-        let key = match editor::read_key_idle(on_idle)? {
-            Some(k) => k,
-            None => return Ok(None),
-        };
-        match key {
-            Key::Enter => return Ok(Some(buf)),
-            Key::Escape | Key::CtrlC => return Ok(None),
-            Key::Backspace => {
-                buf.pop();
-            }
-            Key::Char(c) => buf.push(c),
-            _ => {}
-        }
-    }
-}
-
-// Shows `msg` in the status bar and waits for exactly one more keypress
-// before returning -- vim's own "Press ENTER or type command to
-// continue" convention, simplified to "any key clears it." Without this,
-// an error from a failed `:w`/`:q` would be redrawn over by the very
-// next `render_editor_frame` call before anyone could ever read it.
-fn flash_status(msg: &str, rect: Rect, on_idle: &mut dyn FnMut()) -> io::Result<()> {
-    let row = status_row(rect);
-    let cols = rect.cols;
-    let mut text: String = msg.chars().take(cols).collect();
-    text.push_str(&" ".repeat(cols.saturating_sub(text.chars().count())));
-    print!("\x1b[{};{}H\x1b[7m{}\x1b[0m", row + 1, rect.col + 1, text);
-    io::stdout().flush()?;
-    let _ = editor::read_key_idle(on_idle)?;
-    Ok(())
 }
 
 // "-- NORMAL --"/"-- VISUAL --"/"-- VISUAL LINE --"/"-- INSERT --"/
@@ -1269,7 +886,7 @@ pub fn build_editor_frame(buf: &TextBuffer, vk: &VimKeys, mode: EditorMode, rect
     // underflow without this.
     let gutter_width = total_gutter_width(buf).min(rect.cols.saturating_sub(1));
     let content_cols = rect.cols - gutter_width;
-    let active = if mode == EditorMode::Normal { active_visual_range(vk, buf) } else { None };
+    let active = if mode == EditorMode::Normal { crate::repl::active_visual_range(vk, buf) } else { None };
     // Computed once for the whole buffer, not per visible row -- see
     // buffer_highlight_spans's own doc comment for why a multi-line
     // construct needs that.

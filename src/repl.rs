@@ -8,6 +8,7 @@ use crate::bishedit::highlight::{self, HighlightContext};
 use crate::bishedit::motion;
 use crate::bishedit::registers::{RegisterShape, RegisterValue, Registers};
 use crate::bishedit::suggestion;
+use crate::bishedit::textbuffer::TextBuffer;
 use crate::bishedit::vimkeys::{KeyOutcome, Op, VimKeys, WindowCmd};
 use crate::bishedit::Buffer as BisheditBuffer;
 use crate::editor::{self, Key, ReadOutcome};
@@ -643,12 +644,12 @@ pub fn run(mut shell: Shell) {
                     &mut job_frames,
                     &mut cmd_history,
                     &mut registers,
-                    text,
-                    cursor,
+                    NavStart::Prompt { text, cursor },
                     term_rows,
                     term_cols,
                 ) {
-                    Ok(resume) => pending_initial = resume,
+                    Ok((NavExit::Resume(t, c), _)) => pending_initial = Some((t, c)),
+                    Ok((NavExit::Detached | NavExit::Quit, _)) => pending_initial = None,
                     Err(e) => {
                         sessions.get(&session_id).unwrap().shell.sink_err(&format!("bish: error reading input: {}\n", e));
                         break;
@@ -915,9 +916,10 @@ fn handle_command_mode(
     registers: &mut Registers,
     term_rows: usize,
     term_cols: usize,
+    editing: Option<&mut TextBuffer>,
     seed: Option<String>,
 ) -> CommandModeOutcome {
-    let outcome = run_command_mode(session_id, sessions, windows, *current_window, cmd_history, job_frames, registers, term_rows, term_cols, seed);
+    let outcome = run_command_mode(session_id, sessions, windows, *current_window, cmd_history, job_frames, registers, term_rows, term_cols, editing, seed);
     match outcome {
         CommandModeOutcome::Action(action) => {
             apply_window_action(action, sessions, windows, current_window, next_session_id, next_window_id, sinks_are_grid, term_rows, term_cols);
@@ -999,13 +1001,12 @@ fn run_fg_job_frame(
             // here (run_normal_mode_navigation's own doc comment), so
             // `window next`/`previous` away from this job stays exactly
             // as reachable as before, just one keystroke further in.
-            // No initial text/cursor to resume -- this pane's top frame
-            // is Frame::Job, not a live prompt (see run_normal_mode_
-            // navigation's own `at_live_prompt` gate), so whatever this
-            // returns for "resume editing here" is meaningless and gets
-            // silently discarded anyway once the main loop sees the same
-            // Frame::Job still on top and re-drives this job instead of
-            // ever calling read_line with it.
+            // NavStart::JobDetach: this pane's top frame is Frame::Job,
+            // not a live prompt, so whatever this returns for "resume
+            // editing here" is meaningless and gets silently discarded
+            // anyway once the main loop sees the same Frame::Job still
+            // on top and re-drives this job instead of ever calling
+            // read_line with it.
             let _ = run_normal_mode_navigation(
                 session_id,
                 sessions,
@@ -1017,8 +1018,7 @@ fn run_fg_job_frame(
                 job_frames,
                 cmd_history,
                 registers,
-                String::new(),
-                0,
+                NavStart::JobDetach,
                 term_rows,
                 term_cols,
             );
@@ -1043,10 +1043,11 @@ fn run_fg_job_frame(
 // `e`'s own counterpart to run_fg_job_frame, above -- drives whatever
 // editor session is behind `edit_frame_id`, freshly opened by the
 // pending_edit handling below or already sitting there from an earlier
-// detach. Unlike a job, an editor session never runs on its own between
-// keystrokes, so `fileeditor::drive` renders directly rather than
-// through a callback (see its own doc comment) -- this function's only
-// job is providing `rect` and reacting to how `drive` ended.
+// detach. `run_normal_mode_navigation` is what actually drives it (see
+// `NavBuffer`'s own doc comment -- an editor pane is that same one real
+// Normal mode, not a separate loop) -- this function's only job is
+// providing `rect`, moving the session's state in and back out, and
+// reacting to how driving it ended.
 #[allow(clippy::too_many_arguments)]
 fn run_edit_frame(
     edit_frame_id: EditFrameId,
@@ -1069,102 +1070,51 @@ fn run_edit_frame(
     // in service_background_jobs touches it), but matches
     // run_fg_job_frame's own reasoning for job_frames exactly, and keeps
     // the two symmetric.
-    let mut session = edit_frames.remove(&edit_frame_id).expect("Frame::Edit always has a live edit_frames entry");
+    let session = edit_frames.remove(&edit_frame_id).expect("Frame::Edit always has a live edit_frames entry");
     let rect = pane_rect(&windows[*current_window], windows[*current_window].focused_pane, term_rows, term_cols);
-    let cw = *current_window;
-    let outcome = fileeditor::drive(&mut session, rect, registers, &mut || service_background_jobs(sessions, windows, job_frames, cw));
+    // "%": refreshed here, once, whenever this function starts driving a
+    // session -- see fileeditor::set_last_filename's own doc comment for
+    // the other place (a successful :w/:wq/:x) it needs the same
+    // refresh.
+    fileeditor::set_last_filename(&session.buffer, registers);
+    let outcome = run_normal_mode_navigation(
+        session_id,
+        sessions,
+        windows,
+        current_window,
+        next_session_id,
+        next_window_id,
+        sinks_are_grid,
+        job_frames,
+        cmd_history,
+        registers,
+        NavStart::Edit(session.buffer, Box::new(session.vk)),
+        term_rows,
+        term_cols,
+    );
     match outcome {
-        Ok(fileeditor::EditOutcome::Quit) => {
+        Ok((NavExit::Quit, _)) => {
             windows[*current_window].stack_mut().pop();
             if *sinks_are_grid {
                 compositor_redraw(sessions, windows, *current_window, term_rows, term_cols);
             }
         }
-        Ok(fileeditor::EditOutcome::Detached) => {
-            // Freezes this pane's own grid with the editor's current
-            // state -- exactly once, right here, rather than mirroring
-            // freeze_idle_prompt's own multiple call sites (one at every
-            // place focus *might* move away): unlike a live prompt, a
-            // detached editor session's content is genuinely static
-            // (nothing runs in the background the way a job does) from
-            // this exact moment until it's re-entered, at which point
-            // fileeditor::drive takes over rendering to the real
-            // terminal directly again -- so one freeze, right when it
-            // stops being driven, is both necessary and sufficient.
-            fileeditor::freeze_editor_frame(&sessions[&session_id].screen, &session.buffer, &session.vk, rect);
-            edit_frames.insert(edit_frame_id, session);
-            // Normal mode, not command mode -- same reasoning as
-            // FgOutcome::Detached's own arm just above: Ctrl+Space
-            // always means "step back to look around," regardless of
-            // what was detached from. No initial text/cursor to
-            // resume -- this pane's top frame is Frame::Edit, not a
-            // live prompt, so whatever this returns gets silently
-            // discarded once the main loop sees the same Frame::Edit
-            // still on top and re-drives this session instead of ever
-            // calling read_line with it (see run_normal_mode_
-            // navigation's own `at_live_prompt` gate).
-            let _ = run_normal_mode_navigation(
-                session_id,
-                sessions,
-                windows,
-                current_window,
-                next_session_id,
-                next_window_id,
-                sinks_are_grid,
-                job_frames,
-                cmd_history,
-                registers,
-                String::new(),
-                0,
-                term_rows,
-                term_cols,
-            );
+        // Freezes this pane's own grid with the editor's current state
+        // -- exactly once, right here, rather than mirroring
+        // freeze_idle_prompt's own multiple call sites (one at every
+        // place focus *might* move away): unlike a live prompt, a
+        // detached editor session's content is genuinely static (nothing
+        // runs in the background the way a job does) from this exact
+        // moment until it's re-entered, at which point run_normal_mode_
+        // navigation takes over rendering to the real terminal directly
+        // again -- so one freeze, right when it stops being driven, is
+        // both necessary and sufficient.
+        Ok((NavExit::Detached, Some((buffer, vk)))) => {
+            fileeditor::freeze_editor_frame(&sessions[&session_id].screen, &buffer, &vk, rect);
+            edit_frames.insert(edit_frame_id, fileeditor::EditSession { buffer, vk });
         }
-        // Same "freeze, then re-insert this session" as plain Detached
-        // above -- see its own doc comment. dispatch_window_cmd then
-        // does the actual work, shared with run_normal_mode_navigation's
-        // own identical KeyOutcome::Window arm.
-        Ok(fileeditor::EditOutcome::DetachedForWindowCmd(cmd, count)) => {
-            fileeditor::freeze_editor_frame(&sessions[&session_id].screen, &session.buffer, &session.vk, rect);
-            edit_frames.insert(edit_frame_id, session);
-            dispatch_window_cmd(cmd, count, sessions, windows, current_window, next_session_id, next_window_id, sinks_are_grid, term_rows, term_cols);
-        }
-        Ok(fileeditor::EditOutcome::DetachedForCommand(cmd_text)) => {
-            // `cmd_text` seeds the real command mode's own first prompt
-            // (cursor at its end) so the already-typed command doesn't
-            // have to be retyped from scratch -- see EditOutcome::
-            // DetachedForCommand's own doc comment. handle_command_mode
-            // already redraws the compositor for Quit/Cancelled/Ran on
-            // its own; a non-empty Ran result additionally gets held on
-            // screen until the next keypress here, mirroring run_normal_
-            // mode_navigation's own PendingView::Output -- just
-            // condensed into a single wait rather than a persisted
-            // state, since this function (unlike that one) doesn't keep
-            // looping after a single command.
-            fileeditor::freeze_editor_frame(&sessions[&session_id].screen, &session.buffer, &session.vk, rect);
-            edit_frames.insert(edit_frame_id, session);
-            let outcome = handle_command_mode(
-                session_id,
-                sessions,
-                windows,
-                current_window,
-                next_session_id,
-                next_window_id,
-                cmd_history,
-                sinks_are_grid,
-                job_frames,
-                registers,
-                term_rows,
-                term_cols,
-                Some(cmd_text),
-            );
-            if let CommandModeOutcome::Ran { output, status } = outcome
-                && (!output.is_empty() || status != 0)
-            {
-                render_command_output_overlay(&output, status, term_rows, term_cols);
-                let _ = editor::read_key_idle(&mut || service_background_jobs(sessions, windows, job_frames, cw));
-                compositor_redraw(sessions, windows, *current_window, term_rows, term_cols);
-            }
+        Ok((NavExit::Resume(..), _)) | Ok((NavExit::Detached, None)) => {
+            unreachable!("NavStart::Edit never produces NavExit::Resume, and always hands its buffer back")
         }
         Err(e) => {
             // A real I/O error reading a key -- same treatment the main
@@ -2490,11 +2440,125 @@ impl BisheditBuffer for ScreenBuffer {
     }
 }
 
+// The one Normal-mode-navigation loop (`run_normal_mode_navigation`)
+// drives either a read-only view over a pane's own scrollback/live grid
+// (`ReadOnly`, backed by `ScreenBuffer`) or a real, mutable file buffer
+// (`Editable`, backed by `bishedit::textbuffer::TextBuffer`, while this
+// pane's top frame is a `Frame::Edit`) -- an editor pane is not a
+// different mode, it's this same Normal mode over a buffer that happens
+// to support mutation too. `impl BisheditBuffer` below delegates every
+// navigation method to whichever variant is live, which is what lets
+// every already buffer-generic helper (`motion::apply_motion`,
+// `editor::apply_motion_or_reselect`, `editor::yank_motion`, ...) work
+// unmodified against either one -- only the mutating `KeyOutcome`s
+// (`Put`, `Operator(Delete/Change)`, ...) need to match on this enum
+// directly, since mutation was never part of the shared `Buffer` trait
+// (see `TextBuffer`'s own doc comment on why that's deliberate).
+enum NavBuffer {
+    ReadOnly(ScreenBuffer),
+    Editable(TextBuffer),
+}
+
+impl NavBuffer {
+    fn selections(&self) -> &Vec<motion::MotionRange> {
+        match self {
+            NavBuffer::ReadOnly(b) => &b.selections,
+            NavBuffer::Editable(b) => &b.selections,
+        }
+    }
+
+    fn selections_mut(&mut self) -> &mut Vec<motion::MotionRange> {
+        match self {
+            NavBuffer::ReadOnly(b) => &mut b.selections,
+            NavBuffer::Editable(b) => &mut b.selections,
+        }
+    }
+
+    fn as_editable_mut(&mut self) -> Option<&mut TextBuffer> {
+        match self {
+            NavBuffer::ReadOnly(_) => None,
+            NavBuffer::Editable(b) => Some(b),
+        }
+    }
+}
+
+impl BisheditBuffer for NavBuffer {
+    fn line_count(&self) -> usize {
+        match self {
+            NavBuffer::ReadOnly(b) => b.line_count(),
+            NavBuffer::Editable(b) => b.line_count(),
+        }
+    }
+
+    fn line_len(&self, line: usize) -> usize {
+        match self {
+            NavBuffer::ReadOnly(b) => b.line_len(line),
+            NavBuffer::Editable(b) => b.line_len(line),
+        }
+    }
+
+    fn char_at(&self, line: usize, col: usize) -> Option<char> {
+        match self {
+            NavBuffer::ReadOnly(b) => b.char_at(line, col),
+            NavBuffer::Editable(b) => b.char_at(line, col),
+        }
+    }
+
+    fn cursor(&self) -> (usize, usize) {
+        match self {
+            NavBuffer::ReadOnly(b) => b.cursor(),
+            NavBuffer::Editable(b) => b.cursor(),
+        }
+    }
+
+    fn set_cursor(&mut self, line: usize, col: usize) {
+        match self {
+            NavBuffer::ReadOnly(b) => b.set_cursor(line, col),
+            NavBuffer::Editable(b) => b.set_cursor(line, col),
+        }
+    }
+
+    fn viewport_top(&self) -> usize {
+        match self {
+            NavBuffer::ReadOnly(b) => b.viewport_top(),
+            NavBuffer::Editable(b) => b.viewport_top(),
+        }
+    }
+
+    fn set_viewport_top(&mut self, line: usize) {
+        match self {
+            NavBuffer::ReadOnly(b) => b.set_viewport_top(line),
+            NavBuffer::Editable(b) => b.set_viewport_top(line),
+        }
+    }
+
+    fn viewport_height(&self) -> usize {
+        match self {
+            NavBuffer::ReadOnly(b) => b.viewport_height(),
+            NavBuffer::Editable(b) => b.viewport_height(),
+        }
+    }
+
+    fn set_mark(&mut self, name: char, pos: (usize, usize)) {
+        match self {
+            NavBuffer::ReadOnly(b) => b.set_mark(name, pos),
+            NavBuffer::Editable(b) => b.set_mark(name, pos),
+        }
+    }
+
+    fn get_mark(&self, name: char) -> Option<(usize, usize)> {
+        match self {
+            NavBuffer::ReadOnly(b) => b.get_mark(name),
+            NavBuffer::Editable(b) => b.get_mark(name),
+        }
+    }
+}
+
 // Adjusts `buf`'s viewport so its navigation cursor's line is visible,
 // scrolling as little as possible -- matching vim's own scrolling, which
 // only jumps when the cursor would otherwise move off-screen, not
 // recentering on every motion.
-fn scroll_to_show_cursor(buf: &mut ScreenBuffer) {
+fn scroll_to_show_cursor(buf: &mut impl BisheditBuffer) {
     let (line, _) = buf.cursor();
     let height = buf.viewport_height();
     if line < buf.viewport_top() {
@@ -2742,17 +2806,15 @@ fn window_cmd_to_action(cmd: WindowCmd) -> WindowAction {
     }
 }
 
-// Actually applies a resolved `<C-w>{cmd}` -- shared by run_normal_mode_
-// navigation's own KeyOutcome::Window arm and run_edit_frame's
-// EditOutcome::DetachedForWindowCmd (the `e` editor's own `<C-w>`, which
-// resolves the same KeyOutcome::Window but has no window/session state
-// of its own to apply it against -- see that variant's doc comment in
-// fileeditor.rs). Doesn't redraw/return anything itself beyond what
+// Actually applies a resolved `<C-w>{cmd}` -- called from run_normal_
+// mode_navigation's own single `KeyOutcome::Window` arm, regardless of
+// which `NavBuffer` variant produced it (a `<C-w>` typed inside a
+// `Frame::Edit` pane resolves the exact same `KeyOutcome::Window` a
+// read-only pane's own Normal mode does -- see `NavBuffer`'s own doc
+// comment). Doesn't redraw/return anything itself beyond what
 // apply_window_action (or the GotoFirst/GotoLast branch) already does on
-// its own -- each caller decides what, if anything, to do once control
-// comes back: run_normal_mode_navigation exits its whole loop
-// afterward (nothing left to resume, a window-focus change); run_edit_
-// frame just falls through to whatever's now focused.
+// its own -- the caller exits its whole loop afterward either way
+// (nothing left to resume, a window-focus change).
 #[allow(clippy::too_many_arguments)]
 fn dispatch_window_cmd(
     cmd: WindowCmd,
@@ -2873,6 +2935,98 @@ enum PendingView {
 // aren't repainted live while this loop owns the screen; any staleness
 // resolves itself once normal mode exits and the next compositor_redraw
 // runs.
+// What `run_normal_mode_navigation` is being entered to drive -- decides
+// both which `NavBuffer` variant it builds (see that enum's own doc
+// comment) and what its own `NavExit` return values actually mean once
+// it's done.
+enum NavStart {
+    // Ctrl+Space from a live shell prompt, mid-typing `text` with the
+    // cursor at `cursor` -- resumable (see `NavExit::Resume`).
+    Prompt { text: String, cursor: usize },
+    // Ctrl+Space detaching a running foreground job -- read-only, same
+    // as `Prompt`, but nothing to resume into (this pane's top frame
+    // stays `Frame::Job`, not a live prompt, so a caller-side "resume
+    // this text" would have nothing to apply it to).
+    JobDetach,
+    // Driving a `Frame::Edit` pane -- `TextBuffer`/`VimKeys` moved in for
+    // the duration, handed back (mutated) via the paired
+    // `Option<(TextBuffer, VimKeys)>` this function returns alongside
+    // its `NavExit`, regardless of which one that turns out to be.
+    // `VimKeys` is boxed only to keep this enum's own size close to its
+    // other two (unit-ish) variants -- `Prompt`'s inline `String` is by
+    // far the common case, and clippy flags an enum whose largest
+    // variant dwarfs the rest, since every `NavStart` value pays that
+    // largest variant's stack size regardless of which one it is.
+    Edit(TextBuffer, Box<VimKeys>),
+}
+
+// What happened when `run_normal_mode_navigation` returns -- interpreted
+// differently depending on which `NavStart` produced it: only `Prompt`
+// ever produces `Resume` (hand typing back to the live prompt's own
+// editor); only `Edit` ever produces `Quit` (`:q`/`:wq`/`:x`/`:q!`/`ZZ`,
+// popping the `Frame::Edit`); `Detached` covers everything else for any
+// start -- focus moved via `<C-w>`/a `:window` action, or EOF -- exactly
+// `Ok(None)`'s existing meaning before this was named.
+enum NavExit {
+    Resume(String, usize),
+    Detached,
+    Quit,
+}
+
+// Packages this loop's own `buf`/`vk` locals back up for the caller once
+// it's done with them -- `Some` iff `buf` is `NavBuffer::Editable` (i.e.
+// iff this call started from `NavStart::Edit`), so `run_edit_frame` can
+// re-stash (or, on `NavExit::Quit`, just drop) the session; `None` for
+// either `ReadOnly` start, where there's nothing to hand back (both of
+// this function's other two callers already discard this half of the
+// return value entirely).
+fn nav_buffer_into_edit_state(buf: NavBuffer, vk: VimKeys) -> Option<(TextBuffer, VimKeys)> {
+    match buf {
+        NavBuffer::Editable(tb) => Some((tb, vk)),
+        NavBuffer::ReadOnly(_) => None,
+    }
+}
+
+// Dispatches this loop's own per-keystroke redraw to whichever renderer
+// actually matches `buf`'s concrete backing -- `ScreenBuffer`'s own
+// `render_normal_mode_frame`, or `TextBuffer`'s own `fileeditor::
+// render_editor_frame` (gutter, syntax highlighting, Insert/Replace mode
+// labels, dirty flag -- everything a real file editor's Normal mode needs
+// that a read-only scrollback view never did). Always renders Normal
+// mode specifically -- Insert/Replace mode's own rendering happens
+// inside `fileeditor::run_insert_mode`'s own nested loop instead, which
+// is the only place either of those modes is ever live.
+fn render_nav_frame(buf: &NavBuffer, vk: &VimKeys, rect: Rect) {
+    match buf {
+        NavBuffer::ReadOnly(sb) => render_normal_mode_frame(sb, rect, vk, None),
+        NavBuffer::Editable(tb) => fileeditor::render_editor_frame(tb, vk, fileeditor::EditorMode::Normal, rect),
+    }
+}
+
+// Visual mode's own `Z`/`y`/`d`/`c`/`p`/`S`/Escape's shared first step:
+// if there's a currently-active (not yet committed) selection, commit it
+// -- a no-op if `vk` isn't actually mid a Visual selection right now
+// (`active_visual_range` returns `None`).
+fn commit_active_selection(vk: &VimKeys, buf: &mut NavBuffer) {
+    if let Some(range) = active_visual_range(vk, &*buf) {
+        buf.selections_mut().push(range);
+    }
+}
+
+// The one real Normal-mode loop -- drives a read-only view over a pane's
+// own scrollback/live grid (`NavStart::Prompt`/`JobDetach`, backed by
+// `NavBuffer::ReadOnly`) *or* a real, mutable file buffer
+// (`NavStart::Edit`, backed by `NavBuffer::Editable`, while this pane's
+// top frame is a `Frame::Edit`) -- an editor pane is not a categorically
+// different mode reached by detaching out of this one, it's this same
+// loop over a buffer that happens to support mutation too (see
+// `NavBuffer`'s own doc comment). Every already buffer-generic helper
+// (`motion::apply_motion`, `editor::apply_motion_or_reselect`,
+// `editor::yank_motion`/`yank_lines`, `active_visual_range`) runs
+// unmodified against either variant; only the mutating `KeyOutcome`s
+// (`Put`, `Operator`/`OperatorLines` for `Delete`/`Change`/case-ops,
+// `EnterInsert`/`EnterReplace`, ...) match on `NavBuffer` directly, since
+// mutation was never part of the shared `Buffer` trait.
 #[allow(clippy::too_many_arguments)]
 fn run_normal_mode_navigation(
     session_id: SessionId,
@@ -2885,69 +3039,87 @@ fn run_normal_mode_navigation(
     job_frames: &mut HashMap<JobFrameId, exec::FgJob>,
     cmd_history: &mut History,
     registers: &mut Registers,
-    initial_text: String,
-    initial_cursor: usize,
+    start: NavStart,
     term_rows: usize,
     term_cols: usize,
-) -> io::Result<Option<(String, usize)>> {
+) -> io::Result<(NavExit, Option<(TextBuffer, VimKeys)>)> {
     let rect = pane_rect(&windows[*current_window], windows[*current_window].focused_pane, term_rows, term_cols);
+
+    // Only `Prompt` ever has real text/cursor to resume into (see
+    // `NavExit::Resume`'s own doc comment) -- kept as empty/0 for the
+    // other two starts anyway so `EnterInsert`/`EnterReplace`/`ZZ`/`:q`'s
+    // own `ReadOnly` handling below can stay one shared implementation:
+    // for `JobDetach` those are silently discarded by this function's own
+    // caller regardless (this pane's top frame is `Frame::Job`, not a
+    // live prompt), and `Edit` never reaches that code path at all.
+    let (initial_text, initial_cursor) = match &start {
+        NavStart::Prompt { text, cursor } => (text.clone(), *cursor),
+        NavStart::JobDetach | NavStart::Edit(..) => (String::new(), 0),
+    };
     let original_chars: Vec<char> = initial_text.chars().collect();
-    // Same reasoning as freeze_idle_prompt's other call sites (splitting,
-    // switching pane focus): this session's live prompt has only ever
-    // been drawn straight to the real terminal by editor::read_line,
-    // never captured into its own grid -- fine as long as nothing needs
-    // to read that grid back, which is exactly what's about to happen.
-    // Ctrl+Space doesn't change focus (unlike those other call sites), so
-    // without this the very first entry into normal mode in a session
-    // that's never lost focus before would render as a blank pane, not
-    // even showing the current prompt (or, now that this isn't empty-
-    // buffer-only, whatever had already been typed).
-    // Only freeze a synthetic prompt line in when this pane is genuinely
-    // idle at its own live prompt (top frame a Session) -- the exact same
-    // gate freeze_idle_prompt's own call sites already use, and for the
-    // same reason: reached here (M10c) is also a running job's detach
-    // key, and that pane's grid is already being live-written by
-    // drive_fg_job with the job's *real* screen -- freezing a bogus
-    // prompt line on top of it would splice fake prompt text into the
-    // middle of a fullscreen program's actual display (e.g. vim's own
-    // status line), right at wherever its cursor happened to be.
-    let at_live_prompt = matches!(windows[*current_window].stack().last(), Some(Frame::Session(_)));
-    let screen = sessions[&session_id].screen.clone();
-    let mut buf = ScreenBuffer::new(screen, normal_mode_content_rows(rect));
-    if at_live_prompt {
-        let prompt_str = freeze_input_with_text(sessions.get_mut(&session_id).unwrap(), &initial_text);
-        // Explicitly positioned rather than trusting wherever ScreenBuffer::
-        // new's own default (or the vt100 grid's cursor, wherever feed()
-        // happened to leave it -- at the *end* of what was just fed, which is
-        // only right if the original cursor was already at the end of
-        // initial_text too) lands: the navigation cursor should start exactly
-        // where editing was interrupted, matching real vim entering Normal
-        // mode from Insert.
-        let last_line = buf.line_count().saturating_sub(1);
-        buf.set_cursor(last_line, editor::visible_len(&prompt_str) + initial_cursor);
-    }
-    // The Job-detach case needs no repositioning at all: ScreenBuffer::
-    // new's own default cursor is already the live grid's real cursor --
-    // exactly where the job's own on-screen cursor was left, which is the
-    // only sensible place for navigation to start when there's no
-    // synthetic prompt line to land after.
-    let mut vk = VimKeys::new();
+
+    let (mut buf, mut vk) = match start {
+        NavStart::Prompt { text, cursor } => {
+            // Same reasoning as freeze_idle_prompt's other call sites
+            // (splitting, switching pane focus): this session's live
+            // prompt has only ever been drawn straight to the real
+            // terminal by editor::read_line, never captured into its own
+            // grid -- fine as long as nothing needs to read that grid
+            // back, which is exactly what's about to happen. Ctrl+Space
+            // doesn't change focus (unlike those other call sites), so
+            // without this the very first entry into normal mode in a
+            // session that's never lost focus before would render as a
+            // blank pane, not even showing the current prompt (or
+            // whatever had already been typed).
+            let screen = sessions[&session_id].screen.clone();
+            let mut sb = ScreenBuffer::new(screen, normal_mode_content_rows(rect));
+            let prompt_str = freeze_input_with_text(sessions.get_mut(&session_id).unwrap(), &text);
+            // Explicitly positioned rather than trusting wherever
+            // ScreenBuffer::new's own default (or the vt100 grid's
+            // cursor, wherever feed() happened to leave it -- at the
+            // *end* of what was just fed, which is only right if the
+            // original cursor was already at the end of `text` too)
+            // lands: the navigation cursor should start exactly where
+            // editing was interrupted, matching real vim entering Normal
+            // mode from Insert.
+            let last_line = sb.line_count().saturating_sub(1);
+            sb.set_cursor(last_line, editor::visible_len(&prompt_str) + cursor);
+            (NavBuffer::ReadOnly(sb), VimKeys::new())
+        }
+        // No repositioning at all: ScreenBuffer::new's own default
+        // cursor is already the live grid's real cursor -- exactly where
+        // the job's own on-screen cursor was left, which is the only
+        // sensible place for navigation to start when there's no
+        // synthetic prompt line to land after.
+        NavStart::JobDetach => {
+            let screen = sessions[&session_id].screen.clone();
+            (NavBuffer::ReadOnly(ScreenBuffer::new(screen, normal_mode_content_rows(rect))), VimKeys::new())
+        }
+        NavStart::Edit(tb, vk0) => (NavBuffer::Editable(tb), *vk0),
+    };
 
     let _guard = term::RawGuard::enable(0)?;
     // Repaints the whole screen first -- necessary the very first time
     // normal mode ever triggers promotion (the alternate screen buffer
     // starts out blank), harmless otherwise -- then this pane's own
-    // rectangle on top of that with the scrollback view.
+    // rectangle on top of that with the current view.
     compositor_redraw(sessions, windows, *current_window, term_rows, term_cols);
-    render_normal_mode_frame(&buf, rect, &vk, None);
+    render_nav_frame(&buf, &vk, rect);
     let mut pending_view = PendingView::None;
 
-    let resume: Option<(String, usize)> = 'nav: loop {
+    let result: (NavExit, Option<(TextBuffer, VimKeys)>) = 'nav: loop {
         let mut key = match editor::read_key_idle(&mut || {
             service_background_jobs(sessions, windows, job_frames, *current_window);
         })? {
             Some(k) => k,
-            None => break 'nav None,
+            // EOF: nothing sensible to resume into for any start -- for
+            // `Edit` specifically, that means dropping the session
+            // rather than leaving it attached with no way to ever drive
+            // it again.
+            None => {
+                let exit = if matches!(buf, NavBuffer::Editable(_)) { NavExit::Quit } else { NavExit::Detached };
+                break 'nav (exit, nav_buffer_into_edit_state(buf, vk));
+            }
         };
 
         // Resolve whatever PendingView is currently covering the screen
@@ -2965,93 +3137,167 @@ fn run_normal_mode_navigation(
                         service_background_jobs(sessions, windows, job_frames, *current_window);
                     })? {
                         Some(k) => k,
-                        None => break 'nav None,
+                        None => {
+                            let exit = if matches!(buf, NavBuffer::Editable(_)) { NavExit::Quit } else { NavExit::Detached };
+                            break 'nav (exit, nav_buffer_into_edit_state(buf, vk));
+                        }
                     };
                 }
                 PendingView::Output | PendingView::Transcript => {
                     pending_view = PendingView::None;
                     compositor_redraw(sessions, windows, *current_window, term_rows, term_cols);
-                    render_normal_mode_frame(&buf, rect, &vk, None);
+                    render_nav_frame(&buf, &vk, rect);
                     break;
                 }
             }
         }
 
         match key {
-            // Visual mode's own `Z`/`y`/Escape -- kept at this same outer
-            // tier as `Z`/`:` below rather than inside vimkeys.rs's own
-            // `feed()`, because "is there a selection to act on" is
-            // `ScreenBuffer`-owned state (`buf.selections`) vimkeys.rs
-            // deliberately never sees (see its own module doc comment).
-            // `vk.is_idle()` guards all three: mid a sub-prefix (`f`, a
-            // count, ...) these keys keep their ordinary meaning instead
-            // (a find-char target, a count digit, ...) rather than being
-            // stolen here.
+            // Visual mode's own `Z`/`y`/`d`/`c`/`p`/`S`/Escape/Ctrl-C --
+            // kept at this same outer tier as `Z`(`Z`)/`:` below rather
+            // than inside vimkeys.rs's own `feed()`, because "is there a
+            // selection to act on" is `NavBuffer`-owned state
+            // (`selections`) vimkeys.rs deliberately never sees (see its
+            // own module doc comment). `vk.is_idle()` guards all of
+            // them: mid a sub-prefix (`f`, a count, ...) these keys keep
+            // their ordinary meaning instead (a find-char target, a
+            // count digit, ...) rather than being stolen here.
             //
-            // `Z` (single, not `ZZ`): commits the active selection (if
-            // any -- `Z` with nothing selected yet is a harmless no-op)
-            // and returns to Normal mode, keeping every selection so far
-            // highlighted so another `v`/`V` can start the next one. Only
-            // reachable while actually in Visual mode -- `ZZ`'s existing
-            // quit-the-window meaning (the arm right below) is completely
-            // unaffected outside it.
+            // `Z` (single, not `ZZ`)/`y`/Escape/Ctrl-C: meaningful for
+            // *either* buffer kind (committing/yanking/cancelling a
+            // selection doesn't require mutating anything), so these
+            // four apply the same way they always have for `ReadOnly`.
+            // Ctrl-C only cancels for `Editable` though (`key ==
+            // Key::Escape || matches!(buf, NavBuffer::Editable(_))`) --
+            // `ReadOnly`'s own normal-mode-navigation never gave Ctrl-C
+            // any meaning before this, and there's no reason to start
+            // now just because `Editable` also aliases it to Escape (see
+            // `fileeditor::run_insert_mode`'s own doc comment for why
+            // that alias exists there).
+            //
+            // `d`/`c`/`p`/`S` mutate a selection, so they're gated to
+            // `Editable` only (the extra `matches!` clause in each of
+            // their guards) -- for `ReadOnly` they fall through
+            // unchanged to `vk.feed`'s own ordinary operator-prefix
+            // handling, exactly as before this unification.
             Key::Char('Z') if vk.is_idle() && vk.is_visual() => {
-                if let Some(range) = active_visual_range(&vk, &buf) {
-                    buf.selections.push(range);
-                }
+                commit_active_selection(&vk, &mut buf);
                 let end_cursor = buf.cursor();
                 vk.end_visual(end_cursor);
-                render_normal_mode_frame(&buf, rect, &vk, None);
+                render_nav_frame(&buf, &vk, rect);
                 continue;
             }
-            // `y`: yanks every committed selection plus the active one
-            // (if any) as one concatenated register value (see
-            // `yank_selections`' own doc comment), then clears both.
-            // Reachable either mid an active `v`/`V` selection, or from
-            // plain Normal mode right after a `Z` with nothing new
-            // started -- the `!buf.selections.is_empty()` half of this
-            // guard is exactly that second case. Falls through to
-            // vimkeys.rs's own ordinary `y`/`yy`/`y{motion}` handling
-            // (unchanged) whenever neither is true.
-            Key::Char('y') if vk.is_idle() && (vk.is_visual() || !buf.selections.is_empty()) => {
-                if let Some(range) = active_visual_range(&vk, &buf) {
-                    buf.selections.push(range);
-                }
+            Key::Char('y') if vk.is_idle() && (vk.is_visual() || !buf.selections().is_empty()) => {
+                commit_active_selection(&vk, &mut buf);
                 let register = vk.take_pending_register();
                 let end_cursor = buf.cursor();
-                yank_selections(&buf, registers, register);
-                buf.selections.clear();
+                let selections = buf.selections().clone();
+                match &mut buf {
+                    NavBuffer::ReadOnly(sb) => yank_selections(sb, &selections, registers, register),
+                    NavBuffer::Editable(tb) => tb.yank_selections(registers, register),
+                }
+                buf.selections_mut().clear();
                 vk.end_visual(end_cursor);
-                render_normal_mode_frame(&buf, rect, &vk, None);
+                render_nav_frame(&buf, &vk, rect);
                 continue;
             }
-            // Escape: cancels everything -- the active selection and
-            // every previously committed one -- back to a clean Normal
-            // mode with nothing yanked. Same reachability condition as
-            // `y` just above.
-            Key::Escape if vk.is_idle() && (vk.is_visual() || !buf.selections.is_empty()) => {
+            Key::Char('d') if vk.is_idle() && matches!(buf, NavBuffer::Editable(_)) && (vk.is_visual() || !buf.selections().is_empty()) => {
+                commit_active_selection(&vk, &mut buf);
+                let register = vk.take_pending_register();
+                let end_cursor = buf.cursor();
+                if let NavBuffer::Editable(tb) = &mut buf {
+                    tb.delete_selections(registers, register);
+                }
+                buf.selections_mut().clear();
+                vk.end_visual(end_cursor);
+                render_nav_frame(&buf, &vk, rect);
+                continue;
+            }
+            Key::Char('c') if vk.is_idle() && matches!(buf, NavBuffer::Editable(_)) && (vk.is_visual() || !buf.selections().is_empty()) => {
+                commit_active_selection(&vk, &mut buf);
+                let register = vk.take_pending_register();
+                let end_cursor = buf.cursor();
+                let mut deleted = false;
+                if let NavBuffer::Editable(tb) = &mut buf {
+                    deleted = tb.delete_selections(registers, register);
+                }
+                buf.selections_mut().clear();
+                vk.end_visual(end_cursor);
+                if deleted && let NavBuffer::Editable(tb) = &mut buf {
+                    fileeditor::run_insert_mode(tb, &mut vk, rect, registers, &mut || service_background_jobs(sessions, windows, job_frames, *current_window), false)?;
+                }
+                render_nav_frame(&buf, &vk, rect);
+                continue;
+            }
+            Key::Char('p') | Key::Char('P') if vk.is_idle() && matches!(buf, NavBuffer::Editable(_)) && (vk.is_visual() || !buf.selections().is_empty()) => {
+                commit_active_selection(&vk, &mut buf);
+                let register = vk.take_pending_register();
+                let end_cursor = buf.cursor();
+                if let NavBuffer::Editable(tb) = &mut buf {
+                    tb.put_over_selections(registers, register);
+                }
+                buf.selections_mut().clear();
+                vk.end_visual(end_cursor);
+                render_nav_frame(&buf, &vk, rect);
+                continue;
+            }
+            Key::Char('S') if vk.is_idle() && matches!(buf, NavBuffer::Editable(_)) && (vk.is_visual() || !buf.selections().is_empty()) => {
+                commit_active_selection(&vk, &mut buf);
+                let end_cursor = buf.cursor();
+                if let NavBuffer::Editable(tb) = &mut buf
+                    && let Some(Key::Char(ch)) = editor::read_key_idle(&mut || {
+                        service_background_jobs(sessions, windows, job_frames, *current_window);
+                    })?
+                {
+                    fileeditor::surround_selections(tb, ch);
+                }
+                buf.selections_mut().clear();
+                vk.end_visual(end_cursor);
+                render_nav_frame(&buf, &vk, rect);
+                continue;
+            }
+            Key::Escape | Key::CtrlC if vk.is_idle() && (key == Key::Escape || matches!(buf, NavBuffer::Editable(_))) && (vk.is_visual() || !buf.selections().is_empty()) => {
                 let end_cursor = buf.cursor();
                 vk.end_visual(end_cursor);
-                buf.selections.clear();
-                render_normal_mode_frame(&buf, rect, &vk, None);
+                buf.selections_mut().clear();
+                render_nav_frame(&buf, &vk, rect);
                 continue;
             }
             Key::Char('Z') => {
                 let k2 = editor::read_key_idle(&mut || {
                     service_background_jobs(sessions, windows, job_frames, *current_window);
                 })?;
-                if k2 == Some(Key::Char('Z')) {
-                    break 'nav Some((initial_text.clone(), initial_cursor));
+                if k2 != Some(Key::Char('Z')) {
+                    continue;
                 }
-                continue;
+                if matches!(buf, NavBuffer::Editable(_)) {
+                    // `ZZ`: vim's own alias for `:x` -- save and quit.
+                    let mut saved = true;
+                    if let NavBuffer::Editable(tb) = &mut buf {
+                        match tb.save(None) {
+                            Ok(()) => fileeditor::set_last_filename(tb, registers),
+                            Err(e) => {
+                                sessions[&session_id].shell.sink_err(&format!("bish: E212: Can't open file for writing: {e}\n"));
+                                saved = false;
+                            }
+                        }
+                    }
+                    if saved {
+                        break 'nav (NavExit::Quit, nav_buffer_into_edit_state(buf, vk));
+                    }
+                    render_nav_frame(&buf, &vk, rect);
+                    continue;
+                }
+                break 'nav (NavExit::Resume(initial_text.clone(), initial_cursor), nav_buffer_into_edit_state(buf, vk));
             }
             // ':' isn't routed through vimkeys -- it hands off to the
-            // real command-mode feature (see this function's own doc
-            // comment), global now rather than pinned to this pane's own
-            // rect (see run_command_mode's own doc comment on the
-            // "global command mode" redesign) -- run_command_mode
-            // positions its own prompt row itself at the top of its own
-            // loop, so there's nothing to position here first.
+            // real command-mode feature, global rather than pinned to
+            // this pane's own rect (run_command_mode positions its own
+            // prompt row itself). `buf.as_editable_mut()` is what makes
+            // `w`/`wq`/`x`/`q`/`q!` mean anything there (see run_
+            // command_mode's own `editing` parameter doc comment) -- the
+            // *same* call either way, not a separate file-command parser
+            // pre-empting it.
             Key::Char(':') => {
                 match handle_command_mode(
                     session_id,
@@ -3066,42 +3312,50 @@ fn run_normal_mode_navigation(
                     registers,
                     term_rows,
                     term_cols,
+                    buf.as_editable_mut(),
                     None,
                 ) {
                     // Matches vim: an aborted/cancelled ':' command drops
                     // back into Normal mode, not out of it entirely.
                     CommandModeOutcome::Cancelled => {
-                        render_normal_mode_frame(&buf, rect, &vk, None);
+                        render_nav_frame(&buf, &vk, rect);
                         continue;
                     }
-                    // Same window/session, same as `ZZ`/`i` -- restore
-                    // the original text/cursor (see this function's own
-                    // doc comment).
+                    // Same `CommandModeOutcome::Quit` `"q"`/`"q!"` always
+                    // produced -- what it means depends on which buffer
+                    // this call is driving (see run_command_mode's own
+                    // `editing` doc comment): for `Editable`, `:q`/`:q!`/
+                    // `:wq`/`:x` genuinely quit the file; for `ReadOnly`,
+                    // same as `ZZ`/`i` -- restore the original text/
+                    // cursor rather than quitting anything.
                     CommandModeOutcome::Quit => {
-                        break 'nav Some((initial_text.clone(), initial_cursor));
+                        if matches!(buf, NavBuffer::Editable(_)) {
+                            break 'nav (NavExit::Quit, nav_buffer_into_edit_state(buf, vk));
+                        }
+                        break 'nav (NavExit::Resume(initial_text.clone(), initial_cursor), nav_buffer_into_edit_state(buf, vk));
                     }
                     // Focus may have changed (apply_window_action already
                     // handled that) -- nothing to resume here (see this
                     // function's own doc comment on why a focus change
                     // doesn't carry the original text over).
                     CommandModeOutcome::Action(_) => {
-                        return Ok(None);
+                        return Ok((NavExit::Detached, nav_buffer_into_edit_state(buf, vk)));
                     }
                     // Back to normal mode too, per this session's own
                     // "go back to the original mode with the last output
                     // shown until next keypress" design -- but keep the
                     // result visible via PendingView::Output rather than
-                    // just render_normal_mode_frame's ordinary status
-                    // bar (see PendingView's own doc comment for how
-                    // it's resolved on the very next key). handle_
-                    // command_mode has already done the baseline
-                    // compositor_redraw this paints on top of.
+                    // just render_nav_frame's ordinary status bar (see
+                    // PendingView's own doc comment for how it's resolved
+                    // on the very next key). handle_command_mode has
+                    // already done the baseline compositor_redraw this
+                    // paints on top of.
                     CommandModeOutcome::Ran { output, status } => {
                         if !output.is_empty() || status != 0 {
                             render_command_output_overlay(&output, status, term_rows, term_cols);
                             pending_view = PendingView::Output;
                         } else {
-                            render_normal_mode_frame(&buf, rect, &vk, None);
+                            render_nav_frame(&buf, &vk, rect);
                         }
                         continue;
                     }
@@ -3114,39 +3368,65 @@ fn run_normal_mode_navigation(
             KeyOutcome::Motion(m, count) => {
                 editor::apply_motion_or_reselect(&mut vk, &mut buf, m, count);
                 scroll_to_show_cursor(&mut buf);
-                render_normal_mode_frame(&buf, rect, &vk, None);
+                render_nav_frame(&buf, &vk, rect);
             }
+            // `ReadOnly`: hands typing back to the live prompt's own
+            // editor (`apply_insert_cmd` against `original_chars`,
+            // `NavExit::Resume` -- the mechanism that makes Ctrl+Space
+            // feel like a temporary excursion out of Insert mode).
+            // `Editable`: there's no live prompt underneath to resume --
+            // this pane's own Normal mode already *is* the resting
+            // state, so Insert mode is instead a nested sub-loop
+            // (`fileeditor::run_insert_mode`) that returns straight back
+            // here once it's done, same as any other mutating
+            // `KeyOutcome`.
             KeyOutcome::EnterInsert(cmd) => {
-                let (new_chars, new_cursor) = crate::bishedit::vimkeys::apply_insert_cmd(&original_chars, initial_cursor, cmd);
-                break 'nav Some((new_chars.into_iter().collect(), new_cursor));
+                if matches!(buf, NavBuffer::Editable(_)) {
+                    if let NavBuffer::Editable(tb) = &mut buf {
+                        fileeditor::resolve_insert_start(tb, cmd);
+                        fileeditor::run_insert_mode(tb, &mut vk, rect, registers, &mut || service_background_jobs(sessions, windows, job_frames, *current_window), false)?;
+                    }
+                    render_nav_frame(&buf, &vk, rect);
+                } else {
+                    let (new_chars, new_cursor) = crate::bishedit::vimkeys::apply_insert_cmd(&original_chars, initial_cursor, cmd);
+                    break 'nav (NavExit::Resume(new_chars.into_iter().collect(), new_cursor), nav_buffer_into_edit_state(buf, vk));
+                }
             }
-            // `R`: degrades to a plain insert entry right at the cursor
-            // (same simplification editor.rs's own identical arm
-            // documents -- true Replace-mode overtype-as-you-type
+            // `R`: `ReadOnly` degrades to a plain insert entry right at
+            // the cursor (same simplification editor.rs's own identical
+            // arm documents -- true Replace-mode overtype-as-you-type
             // behavior would need to live in the shell's own core typing
             // loop, which this excursion resumes into once it breaks out
-            // here, same as `EnterInsert` just above).
+            // here). `Editable` gets the real thing, via `run_insert_mode`'s
+            // own `replace: true`.
             KeyOutcome::EnterReplace => {
-                let (new_chars, new_cursor) =
-                    crate::bishedit::vimkeys::apply_insert_cmd(&original_chars, initial_cursor, crate::bishedit::vimkeys::InsertCmd::Before);
-                break 'nav Some((new_chars.into_iter().collect(), new_cursor));
+                if matches!(buf, NavBuffer::Editable(_)) {
+                    if let NavBuffer::Editable(tb) = &mut buf {
+                        fileeditor::run_insert_mode(tb, &mut vk, rect, registers, &mut || service_background_jobs(sessions, windows, job_frames, *current_window), true)?;
+                    }
+                    render_nav_frame(&buf, &vk, rect);
+                } else {
+                    let (new_chars, new_cursor) =
+                        crate::bishedit::vimkeys::apply_insert_cmd(&original_chars, initial_cursor, crate::bishedit::vimkeys::InsertCmd::Before);
+                    break 'nav (NavExit::Resume(new_chars.into_iter().collect(), new_cursor), nav_buffer_into_edit_state(buf, vk));
+                }
             }
             // `v`/`V`: arms Visual mode with the buffer's own current
             // cursor as the anchor (vimkeys.rs can't read that itself --
             // see `EnterVisual`'s own doc comment). Rendering (the
-            // reverse-video highlight) and what `y`/`Z`/Escape do from
-            // here on are handled by the guarded arms above, at the top
-            // of this same loop.
+            // reverse-video highlight) and what `y`/`Z`/Escape/`d`/`c`/
+            // `p`/`S` do from here on are handled by the guarded arms
+            // above, at the top of this same loop.
             KeyOutcome::EnterVisual(shape) => {
                 vk.begin_visual(shape, buf.cursor());
-                render_normal_mode_frame(&buf, rect, &vk, None);
+                render_nav_frame(&buf, &vk, rect);
             }
             KeyOutcome::ReselectVisual => {
                 if let Some((shape, anchor, cursor)) = vk.last_visual() {
                     buf.set_cursor(cursor.0, cursor.1);
                     vk.begin_visual(shape, anchor);
                 }
-                render_normal_mode_frame(&buf, rect, &vk, None);
+                render_nav_frame(&buf, &vk, rect);
             }
             KeyOutcome::Jump { forward } => {
                 let current = buf.cursor();
@@ -3157,71 +3437,141 @@ fn run_normal_mode_navigation(
                     buf.set_cursor(row, col);
                     scroll_to_show_cursor(&mut buf);
                 }
-                render_normal_mode_frame(&buf, rect, &vk, None);
+                render_nav_frame(&buf, &vk, rect);
             }
-            // Yank works here too -- copying text out of a pane's own
-            // scrollback/output is exactly what this read-only,
-            // tmux-copy-mode-style view is for (see ScreenBuffer's own doc
-            // comment). `<C-r>` in insert mode, or `p`/`P` in Ctrl-E's/
-            // Ctrl-O's own line-local Normal mode, are what get a yanked
-            // register back into the live prompt afterward. Delete/Change
-            // are inert here for the same reason `Put` is, just below:
-            // `ScreenBuffer` is read-only by construction, so there's
-            // nothing for them to mutate -- `op == Op::Yank` gates it
-            // rather than a separate match arm per `Op`, since the
-            // motion/range computation itself (and thus what gets read
-            // for a *would-be* yank) is identical either way.
+            // Yank works for either buffer kind (`op == Op::Yank` is
+            // checked first, unconditionally) -- copying text out of a
+            // pane's own scrollback/output is exactly what `ReadOnly`'s
+            // view is for, and it's an ordinary read against `Editable`
+            // too. `Delete`/`Change`/case-ops only mutate, so they're
+            // gated to `Editable`; for `ReadOnly` they fall into the same
+            // no-op as before this unification.
             KeyOutcome::Operator(op, motion, count, register) => {
                 if op == Op::Yank {
                     editor::yank_motion(&mut buf, registers, motion, count, register);
+                } else if let NavBuffer::Editable(tb) = &mut buf {
+                    match op {
+                        Op::Delete => {
+                            fileeditor::delete_motion(tb, registers, motion, count, register);
+                        }
+                        Op::Change => {
+                            let m = fileeditor::redirect_cw_to_ce(tb, &motion);
+                            if fileeditor::delete_motion(tb, registers, m, count, register) {
+                                fileeditor::run_insert_mode(tb, &mut vk, rect, registers, &mut || service_background_jobs(sessions, windows, job_frames, *current_window), false)?;
+                            }
+                        }
+                        Op::Lowercase | Op::Uppercase | Op::CaseToggle => {
+                            fileeditor::case_operator_motion(tb, motion, count, fileeditor::case_kind_for_op(op));
+                        }
+                        Op::Yank => unreachable!("handled above"),
+                    }
                 }
-                render_normal_mode_frame(&buf, rect, &vk, None);
+                render_nav_frame(&buf, &vk, rect);
             }
             KeyOutcome::OperatorLines(op, count, register) => {
                 if op == Op::Yank {
                     editor::yank_lines(&buf, registers, count, register);
+                } else if let NavBuffer::Editable(tb) = &mut buf {
+                    match op {
+                        Op::Delete => fileeditor::delete_lines(tb, registers, count, register),
+                        Op::Change => {
+                            fileeditor::delete_lines(tb, registers, count, register);
+                            fileeditor::run_insert_mode(tb, &mut vk, rect, registers, &mut || service_background_jobs(sessions, windows, job_frames, *current_window), false)?;
+                        }
+                        Op::Lowercase | Op::Uppercase | Op::CaseToggle => fileeditor::case_operator_lines(tb, count, fileeditor::case_kind_for_op(op)),
+                        Op::Yank => unreachable!("handled above"),
+                    }
                 }
-                render_normal_mode_frame(&buf, rect, &vk, None);
+                render_nav_frame(&buf, &vk, rect);
             }
-            // `p`/`P`/`x`/`J`/`gJ`/`ys`/`ds`/`cs`/`r`/`~`/`o`/`O` are all a
-            // deliberate no-op here: `ScreenBuffer` is read-only by
-            // construction (a view over already-rendered scrollback, not
-            // an editable buffer -- see its own doc comment), and
-            // there's nothing else in this context that any of these
-            // mutations could sensibly target. Falls into the same
-            // bucket as `Pending`/`None` below.
-            KeyOutcome::Put { .. }
-            | KeyOutcome::DeleteCharForward { .. }
-            | KeyOutcome::Join { .. }
-            | KeyOutcome::AddSurround { .. }
-            | KeyOutcome::DeleteSurround { .. }
-            | KeyOutcome::ChangeSurround { .. }
-            | KeyOutcome::ReplaceChar { .. }
-            | KeyOutcome::ToggleCase { .. }
-            | KeyOutcome::AdjustNumber { .. }
-            | KeyOutcome::OpenLine { .. } => {
-                render_normal_mode_frame(&buf, rect, &vk, None);
+            // `p`/`P`/`x`/`J`/`gJ`/`ys`/`ds`/`cs`/`r`/`~`/`o`/`O`: all
+            // mutate, so all a no-op for `ReadOnly` (same as before this
+            // unification -- a view over already-rendered scrollback,
+            // not an editable buffer), each calling the matching
+            // `fileeditor::` helper for `Editable`.
+            KeyOutcome::Put { before, count, register } => {
+                if let NavBuffer::Editable(tb) = &mut buf {
+                    fileeditor::put(tb, registers, before, count, register);
+                }
+                render_nav_frame(&buf, &vk, rect);
+            }
+            KeyOutcome::DeleteCharForward { count, register } => {
+                if let NavBuffer::Editable(tb) = &mut buf {
+                    fileeditor::delete_char_forward(tb, registers, count, register);
+                }
+                render_nav_frame(&buf, &vk, rect);
+            }
+            KeyOutcome::Join { count, with_space } => {
+                if let NavBuffer::Editable(tb) = &mut buf {
+                    tb.join_lines(count.unwrap_or(1).max(1), with_space);
+                }
+                render_nav_frame(&buf, &vk, rect);
+            }
+            KeyOutcome::AddSurround { target, ch } => {
+                if let NavBuffer::Editable(tb) = &mut buf {
+                    fileeditor::add_surround(tb, target, ch);
+                }
+                render_nav_frame(&buf, &vk, rect);
+            }
+            KeyOutcome::DeleteSurround { ch } => {
+                if let NavBuffer::Editable(tb) = &mut buf {
+                    fileeditor::delete_surround(tb, ch);
+                }
+                render_nav_frame(&buf, &vk, rect);
+            }
+            KeyOutcome::ChangeSurround { ch, replacement } => {
+                if let NavBuffer::Editable(tb) = &mut buf {
+                    fileeditor::change_surround(tb, ch, replacement);
+                }
+                render_nav_frame(&buf, &vk, rect);
+            }
+            KeyOutcome::ReplaceChar { ch, count } => {
+                if let NavBuffer::Editable(tb) = &mut buf {
+                    fileeditor::replace_char(tb, ch, count.unwrap_or(1).max(1));
+                }
+                render_nav_frame(&buf, &vk, rect);
+            }
+            KeyOutcome::ToggleCase { count } => {
+                if let NavBuffer::Editable(tb) = &mut buf {
+                    fileeditor::toggle_case(tb, count.unwrap_or(1).max(1));
+                }
+                render_nav_frame(&buf, &vk, rect);
+            }
+            KeyOutcome::AdjustNumber { delta } => {
+                if let NavBuffer::Editable(tb) = &mut buf {
+                    fileeditor::adjust_number(tb, delta);
+                }
+                render_nav_frame(&buf, &vk, rect);
+            }
+            KeyOutcome::OpenLine { above } => {
+                if let NavBuffer::Editable(tb) = &mut buf {
+                    fileeditor::open_line(tb, above);
+                    fileeditor::run_insert_mode(tb, &mut vk, rect, registers, &mut || service_background_jobs(sessions, windows, job_frames, *current_window), false)?;
+                }
+                render_nav_frame(&buf, &vk, rect);
             }
             // dispatch_window_cmd does the actual work (shared with
             // run_edit_frame's own identical need -- see its own doc
             // comment); this loop just exits afterward, same as any
-            // other Window outcome -- a focus change, nothing to resume.
+            // other Window outcome -- a focus change, nothing to resume,
+            // handing the buffer/vk back so an `Editable` caller can
+            // re-stash them.
             KeyOutcome::Window(cmd, count) => {
                 dispatch_window_cmd(cmd, count, sessions, windows, current_window, next_session_id, next_window_id, sinks_are_grid, term_rows, term_cols);
-                return Ok(None);
+                return Ok((NavExit::Detached, nav_buffer_into_edit_state(buf, vk)));
             }
             // Rendered on every keystroke, not just a resolved Motion --
             // the status bar needs to show a pending count/prefix (e.g.
             // "20g" mid-`20gg`) and a search's in-progress text live, not
             // just the end result once a motion actually applies.
             KeyOutcome::Pending | KeyOutcome::None => {
-                render_normal_mode_frame(&buf, rect, &vk, None);
+                render_nav_frame(&buf, &vk, rect);
             }
         }
     };
 
     compositor_redraw(sessions, windows, *current_window, term_rows, term_cols);
-    Ok(resume)
+    Ok(result)
 }
 
 // Visual mode's own active (not yet committed via `Z`) selection, if any
@@ -3230,7 +3580,7 @@ fn run_normal_mode_navigation(
 // `extract_text`/rendering. `RegisterShape::Char` maps to
 // `MotionShape::Inclusive` (vim's own visual charwise is inclusive of
 // both ends, unlike most charwise motions), `::Line` to `::Linewise`.
-fn active_visual_range(vk: &VimKeys, buf: &ScreenBuffer) -> Option<motion::MotionRange> {
+pub(crate) fn active_visual_range(vk: &VimKeys, buf: &impl BisheditBuffer) -> Option<motion::MotionRange> {
     let (shape, anchor) = vk.visual_anchor()?;
     let cursor = buf.cursor();
     let motion_shape = if shape == RegisterShape::Line { motion::MotionShape::Linewise } else { motion::MotionShape::Inclusive };
@@ -3247,15 +3597,18 @@ fn active_visual_range(vk: &VimKeys, buf: &ScreenBuffer) -> Option<motion::Motio
 // was `Linewise`, else `Char` -- the same "at least a full line no matter
 // what gets combined with it" rule `RegisterBackend::write`'s own
 // append-shape already uses for `"A`-style concatenation. A no-op if
-// `buf.selections` is empty (nothing was ever committed or active) --
-// the caller already gates on that before ever getting here.
-fn yank_selections(buf: &ScreenBuffer, registers: &mut Registers, register: Option<char>) {
-    if buf.selections.is_empty() {
+// `selections` is empty (nothing was ever committed or active) -- the
+// caller already gates on that before ever getting here. Generic over
+// `impl BisheditBuffer` (not just `ScreenBuffer`) so `NavBuffer`'s own
+// `ReadOnly` case can call this directly, same as `motion::extract_text`
+// itself already is.
+fn yank_selections(buf: &impl BisheditBuffer, selections: &[motion::MotionRange], registers: &mut Registers, register: Option<char>) {
+    if selections.is_empty() {
         return;
     }
     let mut text = String::new();
     let mut shape = RegisterShape::Char;
-    for range in &buf.selections {
+    for range in selections {
         text.push_str(&motion::extract_text(buf, range));
         if range.shape == motion::MotionShape::Linewise {
             shape = RegisterShape::Line;
@@ -3585,14 +3938,21 @@ fn run_command_mode(
     registers: &mut Registers,
     term_rows: usize,
     term_cols: usize,
+    // `Some` iff the pane driving this call is a `Frame::Edit` (the
+    // unified Normal-mode loop's own `NavBuffer::Editable` -- see that
+    // enum's doc comment) -- what makes `w`/`w <path>`/`wq`/`x`/`q`/`q!`
+    // mean anything here at all: they're the file's own save/quit
+    // commands, not general window-management ones, so they only exist
+    // when there's an actual buffer for them to act on.
+    editing: Option<&mut TextBuffer>,
     // Seeds the very first prompt with already-typed text, cursor at its
-    // end -- the `e` editor's own ':' hand-off uses this (see
-    // fileeditor::EditOutcome::DetachedForCommand's own doc comment) so
-    // a command that turns out not to be one of its own w/q/wq/x/q!
-    // doesn't have to be retyped from scratch once it lands here. `None`
-    // (every other call site) starts with the ordinary empty buffer.
+    // end -- Ctrl+Space mid-typing (below) uses this to carry the
+    // in-progress line into command mode's own next prompt rather than
+    // losing it. `None` (every other call site) starts with the ordinary
+    // empty buffer.
     seed: Option<String>,
 ) -> CommandModeOutcome {
+    let mut editing = editing;
     let mut buffer = String::new();
     let mut transcript_visible = false;
     let prompt_row = command_mode_row(term_rows) + 1;
@@ -3705,12 +4065,93 @@ fn run_command_mode(
                 if trimmed.is_empty() {
                     return CommandModeOutcome::Cancelled;
                 }
+                // `":"`: vim's own last-ex-command register, recorded
+                // regardless of what the command turns out to be
+                // (matching vim: even a failed `:nonsense` becomes the
+                // new `":`) -- now that `:` is genuinely one command
+                // mode, it records here rather than only when a
+                // `Frame::Edit` pane's own w/wq/x/q/q! handling ran.
+                registers.set_last_ex_command(trimmed.clone());
+
+                // `w`/`w <path>`/`wq`/`x`/`q`/`q!`: the file's own
+                // save/quit commands -- only mean anything when this
+                // call is driving a `Frame::Edit` pane (`editing` is
+                // `Some`), checked *before* the general `q`/`q!` case
+                // just below so a dirty file's own `q` can be refused
+                // instead of falling into "leave command mode" -- the
+                // caller (the unified Normal-mode loop's own `:` arm,
+                // which already knows which `NavBuffer` variant it's
+                // driving) is what gives a plain `CommandModeOutcome::
+                // Quit` its actual meaning either way, same as
+                // `dispatch_window_cmd`'s existing "one outcome, meaning
+                // depends on the caller" pattern for `<C-w>`.
+                if let Some(tb) = editing.as_deref_mut() {
+                    let (cmd, arg) = match trimmed.split_once(' ') {
+                        Some((c, a)) => (c, Some(a.trim()).filter(|a| !a.is_empty())),
+                        None => (trimmed.as_str(), None),
+                    };
+                    match cmd {
+                        "w" | "write" => match tb.save(arg.map(std::path::Path::new)) {
+                            Ok(()) => {
+                                fileeditor::set_last_filename(tb, registers);
+                                sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry {
+                                    command: trimmed,
+                                    output: String::new(),
+                                    status: 0,
+                                });
+                                return CommandModeOutcome::Ran { output: String::new(), status: 0 };
+                            }
+                            Err(e) => {
+                                sessions[&session_id].shell.sink_err(&format!("bish: E212: Can't open file for writing: {e}\n"));
+                                buffer.clear();
+                                continue;
+                            }
+                        },
+                        "wq" | "x" => match tb.save(arg.map(std::path::Path::new)) {
+                            Ok(()) => {
+                                fileeditor::set_last_filename(tb, registers);
+                                sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry {
+                                    command: trimmed,
+                                    output: String::new(),
+                                    status: 0,
+                                });
+                                return CommandModeOutcome::Quit;
+                            }
+                            Err(e) => {
+                                sessions[&session_id].shell.sink_err(&format!("bish: E212: Can't open file for writing: {e}\n"));
+                                buffer.clear();
+                                continue;
+                            }
+                        },
+                        "q" if tb.is_dirty() => {
+                            sessions[&session_id].shell.sink_err("bish: E37: No write since last change (add ! to override)\n");
+                            buffer.clear();
+                            continue;
+                        }
+                        "q" | "q!" => {
+                            sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry {
+                                command: trimmed,
+                                output: String::new(),
+                                status: 0,
+                            });
+                            return CommandModeOutcome::Quit;
+                        }
+                        _ => {}
+                    }
+                }
+
                 if trimmed == "q" || trimmed == "q!" {
-                    // Recorded same as any other command that actually
-                    // ran -- vim's own Ex quit commands, not shell
-                    // builtins, but still something the user typed and
-                    // command mode acted on, so leaving it out of the
-                    // transcript would read as if it never happened.
+                    // Only reachable when `editing` is `None` (the block
+                    // above already returns for both cases otherwise) --
+                    // this pane isn't an editor, so `q`/`q!` mean "leave
+                    // command mode" instead (the caller resumes whatever
+                    // it was navigating, same as `dispatch_window_cmd`'s
+                    // reused-outcome pattern). Recorded same as any other
+                    // command that actually ran -- vim's own Ex quit
+                    // commands, not shell builtins, but still something
+                    // the user typed and command mode acted on, so
+                    // leaving it out of the transcript would read as if
+                    // it never happened.
                     sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry {
                         command: trimmed,
                         output: String::new(),
@@ -3889,7 +4330,7 @@ mod visual_mode_tests {
             motion::MotionRange { shape: motion::MotionShape::Inclusive, from: (1, 0), to: (1, 2) }, // "foo"
         ];
         let mut registers = Registers::new_for_test();
-        yank_selections(&buf, &mut registers, None);
+        yank_selections(&buf, &buf.selections.clone(), &mut registers, None);
         let value = registers.read(None);
         assert_eq!(value.text, "hellofoo");
         assert_eq!(value.shape, RegisterShape::Char);
@@ -3903,7 +4344,7 @@ mod visual_mode_tests {
             motion::MotionRange { shape: motion::MotionShape::Linewise, from: (1, 0), to: (1, 0) },  // whole "foo bar" line
         ];
         let mut registers = Registers::new_for_test();
-        yank_selections(&buf, &mut registers, None);
+        yank_selections(&buf, &buf.selections.clone(), &mut registers, None);
         let value = registers.read(None);
         assert_eq!(value.text, "hellofoo bar\n");
         assert_eq!(value.shape, RegisterShape::Line);
@@ -3914,7 +4355,7 @@ mod visual_mode_tests {
         let buf = make_screen_buffer("hello");
         let mut registers = Registers::new_for_test();
         registers.write(None, RegisterValue { text: "unchanged".to_string(), shape: RegisterShape::Char });
-        yank_selections(&buf, &mut registers, None);
+        yank_selections(&buf, &buf.selections.clone(), &mut registers, None);
         assert_eq!(registers.read(None).text, "unchanged");
     }
 
