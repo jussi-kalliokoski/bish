@@ -22,7 +22,7 @@ use crate::bishedit::lint::{self, BashLinter, Linter};
 use crate::bishedit::motion;
 use crate::bishedit::registers::{RegisterShape, RegisterValue, Registers};
 use crate::bishedit::textbuffer::TextBuffer;
-use crate::bishedit::vimkeys::{InsertCmd, Op, SurroundTarget, VimKeys};
+use crate::bishedit::vimkeys::{InsertCmd, Op, SurroundTarget, VimKeys, INDENT_WIDTH};
 use crate::bishedit::Buffer;
 use crate::editor::{self, Key};
 use crate::repl::Rect;
@@ -104,6 +104,112 @@ pub(crate) fn delete_lines(buf: &mut TextBuffer, registers: &mut Registers, coun
     let last = (row + count - 1).min(buf.line_count().saturating_sub(1));
     let range = motion::MotionRange { shape: motion::MotionShape::Linewise, from: (row, 0), to: (last, 0) };
     buf.delete_range(&range);
+}
+
+// `>{motion}`/`>>`/Visual `>`'s own shared row-range primitive: prepends
+// INDENT_WIDTH spaces to every *non-empty* line in `from_row..=to_row` --
+// vim's own rule that shifting right never adds trailing whitespace to a
+// genuinely empty line. Callers are always some already-resolved whole-
+// line range: `>`/`<` act linewise regardless of the motion/selection
+// that produced it (see `vimkeys::Op::Indent`'s own doc comment), so
+// there's no shape/column math left to do here, just the two row bounds.
+fn indent_rows(buf: &mut TextBuffer, from_row: usize, to_row: usize) {
+    for row in from_row..=to_row {
+        if buf.line_len(row) == 0 {
+            continue;
+        }
+        buf.insert_text((row, 0), &" ".repeat(INDENT_WIDTH));
+    }
+}
+
+// `<{motion}`/`<<`/Visual `<`'s own counterpart: strips up to
+// INDENT_WIDTH columns of leading whitespace from every line in range --
+// vim's own "outdent removes at most one shiftwidth's worth" rule (a
+// line indented less than that just loses whatever it has).
+fn outdent_rows(buf: &mut TextBuffer, from_row: usize, to_row: usize) {
+    for row in from_row..=to_row {
+        let strip = (0..buf.line_len(row).min(INDENT_WIDTH)).take_while(|&c| matches!(buf.char_at(row, c), Some(' ') | Some('\t'))).count();
+        if strip == 0 {
+            continue;
+        }
+        let range = motion::MotionRange { shape: motion::MotionShape::Exclusive, from: (row, 0), to: (row, strip) };
+        buf.delete_range(&range);
+    }
+}
+
+// `>{motion}`/`<{motion}`: resolves `m` exactly like any other operator
+// target (`motion::motion_range`'s own ordinary rules -- a failed/empty
+// one is silently a no-op, same as `delete_motion`), but only ever reads
+// its resolved row bounds, never its shape/columns -- `>`/`<` always act
+// linewise (see `vimkeys::Op::Indent`'s own doc comment), unlike every
+// other operator in this file. Known simplification: real vim also
+// shortens an *exclusive* motion's own end row by one when it lands
+// exactly on column 0 of the next line (so e.g. `>j` from a line's own
+// start doesn't pull in a line the cursor only just barely touched) --
+// not implemented here, so a motion landing exactly at another line's
+// start currently includes that line too.
+pub(crate) fn indent_operator_motion(buf: &mut TextBuffer, m: motion::Motion, count: Option<usize>) {
+    let Some(range) = motion::motion_range(buf, m, count) else { return };
+    indent_rows(buf, range.from.0, range.to.0);
+    buf.set_cursor(range.from.0, 0);
+}
+
+pub(crate) fn outdent_operator_motion(buf: &mut TextBuffer, m: motion::Motion, count: Option<usize>) {
+    let Some(range) = motion::motion_range(buf, m, count) else { return };
+    outdent_rows(buf, range.from.0, range.to.0);
+    buf.set_cursor(range.from.0, 0);
+}
+
+// `>>`/`<<`'s own whole-line shorthand -- same `count` lines starting at
+// the cursor that `delete_lines`'s own doc comment already establishes
+// for `dd`/`cc`. `count` only ever selects *how many lines* are shifted,
+// never *by how much* -- `3>>` shifts 3 lines by one shiftwidth each,
+// not one line by three, matching real vim.
+pub(crate) fn indent_lines(buf: &mut TextBuffer, count: Option<usize>) {
+    let count = count.unwrap_or(1).max(1);
+    let (row, _) = buf.cursor();
+    let last = (row + count - 1).min(buf.line_count().saturating_sub(1));
+    indent_rows(buf, row, last);
+    buf.set_cursor(row, 0);
+}
+
+pub(crate) fn outdent_lines(buf: &mut TextBuffer, count: Option<usize>) {
+    let count = count.unwrap_or(1).max(1);
+    let (row, _) = buf.cursor();
+    let last = (row + count - 1).min(buf.line_count().saturating_sub(1));
+    outdent_rows(buf, row, last);
+    buf.set_cursor(row, 0);
+}
+
+// Visual mode's own `>`/`<` -- shifts every line any committed selection
+// (plus the active one, already folded into `buf.selections` by the
+// caller -- see `surround_selections`'s own doc comment for the same
+// "iterate the committed set" shape) touches, whole-line, same linewise-
+// regardless-of-shape rule as the Normal-mode operator forms above.
+// Iterated directly rather than sorted/reversed the way `delete_
+// selections` needs to: inserting/removing leading whitespace at column
+// 0 never shifts any other line's own row index, so order can't matter
+// here the way it does for a deletion that changes line count.
+pub(crate) fn indent_selections(buf: &mut TextBuffer) {
+    if buf.selections.is_empty() {
+        return;
+    }
+    let leftmost_row = buf.selections.iter().map(|r| r.from.0).min().unwrap();
+    for range in buf.selections.clone() {
+        indent_rows(buf, range.from.0, range.to.0);
+    }
+    buf.set_cursor(leftmost_row, 0);
+}
+
+pub(crate) fn outdent_selections(buf: &mut TextBuffer) {
+    if buf.selections.is_empty() {
+        return;
+    }
+    let leftmost_row = buf.selections.iter().map(|r| r.from.0).min().unwrap();
+    for range in buf.selections.clone() {
+        outdent_rows(buf, range.from.0, range.to.0);
+    }
+    buf.set_cursor(leftmost_row, 0);
 }
 
 // `x`: deletes up to `count` characters starting at the cursor, clamped
@@ -266,7 +372,9 @@ pub(crate) fn case_kind_for_op(op: Op) -> motion::CaseKind {
         Op::Lowercase => motion::CaseKind::Lower,
         Op::Uppercase => motion::CaseKind::Upper,
         Op::CaseToggle => motion::CaseKind::Toggle,
-        Op::Yank | Op::Delete | Op::Change => unreachable!("case_kind_for_op is only ever called for Op::Lowercase/Uppercase/CaseToggle"),
+        Op::Yank | Op::Delete | Op::Change | Op::Indent | Op::Outdent => {
+            unreachable!("case_kind_for_op is only ever called for Op::Lowercase/Uppercase/CaseToggle")
+        }
     }
 }
 
@@ -543,6 +651,22 @@ pub(crate) fn run_insert_mode(buf: &mut TextBuffer, vk: &mut VimKeys, rect: Rect
                 let (row, col) = buf.cursor();
                 buf.insert_text((row, col), "\n");
                 inserted.push('\n');
+            }
+            // Tab inserts spaces up to the next INDENT_WIDTH boundary
+            // (vim's own `expandtab` behavior, always on -- see
+            // INDENT_WIDTH's own doc comment on why there's no `:set` to
+            // choose a literal tab character instead). Never overtypes
+            // even in Replace mode, same as Enter just above: a literal
+            // tab byte would also break this editor's own one-char-per-
+            // column rendering model (build_editor_frame/render_row treat
+            // every buffer char as exactly one terminal column, with no
+            // tab-stop-aware expansion anywhere in that pipeline).
+            Key::Tab => {
+                let (row, col) = buf.cursor();
+                let width = INDENT_WIDTH - (col % INDENT_WIDTH);
+                let spaces = " ".repeat(width);
+                buf.insert_text((row, col), &spaces);
+                inserted.push_str(&spaces);
             }
             // Replace mode's own Backspace: known simplification -- steps
             // the cursor back without restoring the character it walks
@@ -1045,6 +1169,79 @@ pub fn render_editor_frame(buf: &TextBuffer, vk: &VimKeys, mode: EditorMode, rec
 pub fn freeze_editor_frame(screen: &Rc<RefCell<vt100::Screen>>, buf: &TextBuffer, vk: &VimKeys, rect: Rect) {
     let framed = build_editor_frame(buf, vk, EditorMode::Normal, rect, 0, 0);
     screen.borrow_mut().feed(framed.as_bytes());
+}
+
+#[cfg(test)]
+mod indent_tests {
+    use super::*;
+
+    fn buf(text: &str) -> TextBuffer {
+        let mut buf = TextBuffer::new_unnamed(10);
+        buf.insert_text((0, 0), text);
+        buf.set_cursor(0, 0);
+        buf
+    }
+
+    fn text_of(buf: &TextBuffer) -> String {
+        (0..buf.line_count()).map(|l| (0..buf.line_len(l)).map(|c| buf.char_at(l, c).unwrap()).collect::<String>()).collect::<Vec<_>>().join("\n")
+    }
+
+    #[test]
+    fn indent_rows_prepends_shiftwidth_spaces_to_every_non_empty_line() {
+        let mut b = buf("foo\n\nbar");
+        indent_rows(&mut b, 0, 2);
+        assert_eq!(text_of(&b), "    foo\n\n    bar");
+    }
+
+    #[test]
+    fn outdent_rows_strips_up_to_shiftwidth_leading_whitespace() {
+        let mut b = buf("      foo\n  bar\nbaz");
+        outdent_rows(&mut b, 0, 2);
+        assert_eq!(text_of(&b), "  foo\nbar\nbaz");
+    }
+
+    #[test]
+    fn indent_operator_motion_shifts_every_line_the_motion_touches_regardless_of_its_own_shape() {
+        // WordForward from line 0 to line 1 is an ordinary exclusive
+        // charwise motion -- >{motion} still treats its target as whole
+        // lines (see Op::Indent's own doc comment).
+        let mut b = buf("foo\nbar");
+        indent_operator_motion(&mut b, motion::Motion::WordForward, None);
+        assert_eq!(text_of(&b), "    foo\n    bar");
+        assert_eq!(b.cursor(), (0, 0));
+    }
+
+    #[test]
+    fn indent_lines_shifts_count_lines_starting_at_the_cursor_by_one_shiftwidth_each() {
+        let mut b = buf("one\ntwo\nthree");
+        indent_lines(&mut b, Some(2));
+        assert_eq!(text_of(&b), "    one\n    two\nthree");
+    }
+
+    #[test]
+    fn outdent_lines_default_count_is_one() {
+        let mut b = buf("    one\n    two");
+        outdent_lines(&mut b, None);
+        assert_eq!(text_of(&b), "one\n    two");
+    }
+
+    #[test]
+    fn indent_selections_shifts_every_committed_selection_whole_line() {
+        let mut b = buf("one\ntwo\nthree");
+        b.selections = vec![
+            motion::MotionRange { shape: motion::MotionShape::Inclusive, from: (0, 0), to: (0, 0) },
+            motion::MotionRange { shape: motion::MotionShape::Inclusive, from: (2, 0), to: (2, 0) },
+        ];
+        indent_selections(&mut b);
+        assert_eq!(text_of(&b), "    one\ntwo\n    three");
+    }
+
+    #[test]
+    fn outdent_selections_is_a_noop_with_no_selections() {
+        let mut b = buf("    one");
+        outdent_selections(&mut b);
+        assert_eq!(text_of(&b), "    one");
+    }
 }
 
 #[cfg(test)]

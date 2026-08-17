@@ -1791,6 +1791,11 @@ fn run_line_normal_mode(
                         Op::Lowercase | Op::Uppercase | Op::CaseToggle => {
                             case_operator_motion(&mut lb, motion, count, case_kind_for_op(op));
                         }
+                        // `>{motion}`/`<{motion}`: see indent_line/
+                        // outdent_line's own doc comment on why the
+                        // motion itself is ignored here.
+                        Op::Indent => indent_line(&mut lb),
+                        Op::Outdent => outdent_line(&mut lb),
                     },
                     KeyOutcome::OperatorLines(op, count, register) => match op {
                         Op::Yank => yank_lines(&lb, registers, count, register),
@@ -1800,6 +1805,8 @@ fn run_line_normal_mode(
                             break LineNormalExit::ToInsert;
                         }
                         Op::Lowercase | Op::Uppercase | Op::CaseToggle => case_operator_lines(&mut lb, case_kind_for_op(op)),
+                        Op::Indent => indent_line(&mut lb),
+                        Op::Outdent => outdent_line(&mut lb),
                     },
                     KeyOutcome::Put { before, count, register } => put(&mut lb.ed.buf, &mut lb.ed.cursor, registers, before, count, register),
                     KeyOutcome::DeleteCharForward { count, register } => {
@@ -2002,6 +2009,32 @@ fn delete_lines(lb: &mut LineBuffer, registers: &mut Registers, count: Option<us
     let text = motion::whole_lines(lb, count.unwrap_or(1).max(1));
     registers.record_delete(register, RegisterValue { text, shape: RegisterShape::Line });
     lb.ed.buf.clear();
+    lb.ed.cursor = 0;
+}
+
+// `>{motion}`/`>>`/`<{motion}`/`<<`: same "linewise means the whole
+// buffer" flattening `delete_lines`'s own doc comment establishes for
+// `dd`/`cc` -- there's only ever one line here, so both the motion form
+// and the double-tap shorthand collapse to the same "shift the one
+// line" action, and `count`/the motion itself are ignored (vim's own
+// indent amount is always exactly one shiftwidth regardless of how many
+// lines a count would otherwise select, and there's no second line for
+// a motion to extend into). A genuinely empty line is left alone, same
+// as fileeditor::indent_rows's own rule.
+fn indent_line(lb: &mut LineBuffer) {
+    if lb.ed.buf.is_empty() {
+        return;
+    }
+    lb.ed.buf.splice(0..0, std::iter::repeat_n(' ', vimkeys::INDENT_WIDTH));
+    lb.ed.cursor = 0;
+}
+
+fn outdent_line(lb: &mut LineBuffer) {
+    let strip = lb.ed.buf.iter().take(vimkeys::INDENT_WIDTH).take_while(|&&c| c == ' ' || c == '\t').count();
+    if strip == 0 {
+        return;
+    }
+    lb.ed.buf.drain(0..strip);
     lb.ed.cursor = 0;
 }
 
@@ -2250,7 +2283,9 @@ fn case_kind_for_op(op: Op) -> motion::CaseKind {
         Op::Lowercase => motion::CaseKind::Lower,
         Op::Uppercase => motion::CaseKind::Upper,
         Op::CaseToggle => motion::CaseKind::Toggle,
-        Op::Yank | Op::Delete | Op::Change => unreachable!("case_kind_for_op is only ever called for Op::Lowercase/Uppercase/CaseToggle"),
+        Op::Yank | Op::Delete | Op::Change | Op::Indent | Op::Outdent => {
+            unreachable!("case_kind_for_op is only ever called for Op::Lowercase/Uppercase/CaseToggle")
+        }
     }
 }
 
@@ -2428,6 +2463,8 @@ fn run_one_shot_normal_command(ed: &mut LineEditor, registers: &mut Registers, o
                             Op::Lowercase | Op::Uppercase | Op::CaseToggle => {
                                 case_operator_motion(&mut lb, motion, count, case_kind_for_op(op));
                             }
+                            Op::Indent => indent_line(&mut lb),
+                            Op::Outdent => outdent_line(&mut lb),
                         }
                         break None;
                     }
@@ -2436,6 +2473,8 @@ fn run_one_shot_normal_command(ed: &mut LineEditor, registers: &mut Registers, o
                             Op::Yank => yank_lines(&lb, registers, count, register),
                             Op::Delete | Op::Change => delete_lines(&mut lb, registers, count, register),
                             Op::Lowercase | Op::Uppercase | Op::CaseToggle => case_operator_lines(&mut lb, case_kind_for_op(op)),
+                            Op::Indent => indent_line(&mut lb),
+                            Op::Outdent => outdent_line(&mut lb),
                         }
                         break None;
                     }
@@ -2772,6 +2811,44 @@ mod tests {
         let value = registers.read(None);
         assert_eq!(value.text, "foo bar\n");
         assert_eq!(value.shape, RegisterShape::Line);
+    }
+
+    #[test]
+    fn indent_line_prepends_shiftwidth_spaces() {
+        let mut ed = make_editor("foo", 0);
+        let mut marks = HashMap::new();
+        let mut selections: Vec<motion::MotionRange> = Vec::new();
+        let mut lb = LineBuffer { ed: &mut ed, marks: &mut marks, selections: &mut selections };
+        indent_line(&mut lb);
+        assert_eq!(ed.buf.iter().collect::<String>(), "    foo");
+        assert_eq!(ed.cursor, 0);
+    }
+
+    #[test]
+    fn indent_line_is_a_noop_on_an_empty_line() {
+        let mut ed = make_editor("", 0);
+        let mut marks = HashMap::new();
+        let mut selections: Vec<motion::MotionRange> = Vec::new();
+        let mut lb = LineBuffer { ed: &mut ed, marks: &mut marks, selections: &mut selections };
+        indent_line(&mut lb);
+        assert!(ed.buf.is_empty());
+    }
+
+    #[test]
+    fn outdent_line_strips_up_to_shiftwidth_leading_whitespace() {
+        let mut ed = make_editor("      foo", 0);
+        let mut marks = HashMap::new();
+        let mut selections: Vec<motion::MotionRange> = Vec::new();
+        let mut lb = LineBuffer { ed: &mut ed, marks: &mut marks, selections: &mut selections };
+        outdent_line(&mut lb);
+        assert_eq!(ed.buf.iter().collect::<String>(), "  foo");
+
+        let mut ed = make_editor("  foo", 0);
+        let mut marks = HashMap::new();
+        let mut selections: Vec<motion::MotionRange> = Vec::new();
+        let mut lb = LineBuffer { ed: &mut ed, marks: &mut marks, selections: &mut selections };
+        outdent_line(&mut lb);
+        assert_eq!(ed.buf.iter().collect::<String>(), "foo");
     }
 
     #[test]

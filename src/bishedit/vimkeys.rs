@@ -178,6 +178,18 @@ pub enum KeyOutcome {
 
 /// An operator awaiting a motion (`y{motion}`/`d{motion}`/`c{motion}`) or
 /// its own double-tap shorthand (`yy`/`dd`/`cc`).
+// Vim's own `shiftwidth`/`softtabstop`, shared by every `Op::Indent`/
+// `Op::Outdent` implementation (editor.rs's LineBuffer, fileeditor.rs's
+// TextBuffer) and Insert mode's own Tab key (fileeditor::run_insert_
+// mode's `Key::Tab` arm) -- defined once, here, rather than once per
+// consumer, so shifting a line by "one indent" and pressing Tab always
+// agree on what that means. There's no `:set shiftwidth`/`:set
+// softtabstop` options system in this editor yet (see fileeditor.rs's
+// own `is_bash_file` doc comment for the same "not worth guessing at up
+// front" stance elsewhere in this crate), so this is a single hardcoded
+// default rather than a configurable one.
+pub const INDENT_WIDTH: usize = 4;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Op {
     Yank,
@@ -200,6 +212,18 @@ pub enum Op {
     /// `g~{motion}`/`g~~` -- toggles the case of every character in the
     /// target (vim's own per-character `~`, generalized to a motion).
     CaseToggle,
+    /// `>{motion}`/`>>` -- shifts every line the target touches right by
+    /// one shiftwidth. Like real vim, `>`/`<` always act linewise
+    /// regardless of the motion's own natural shape (unlike `d`/`c`/`y`/
+    /// the `g`-prefixed case operators above, which all respect it) --
+    /// a caller's `Operator`/`OperatorLines` handling for these two is
+    /// expected to always treat the target as whole lines, not consult
+    /// `motion::motion_shape` the way it might for any other operator.
+    Indent,
+    /// `<{motion}`/`<<` -- shifts every line the target touches left by
+    /// up to one shiftwidth (a line indented less than that just loses
+    /// whatever leading whitespace it has).
+    Outdent,
 }
 
 /// `KeyOutcome::AddSurround`'s own target: either a motion's resolved
@@ -231,6 +255,8 @@ impl Op {
             Op::Lowercase => 'u',
             Op::Uppercase => 'U',
             Op::CaseToggle => '~',
+            Op::Indent => '>',
+            Op::Outdent => '<',
         }
     }
 }
@@ -1140,6 +1166,12 @@ impl VimKeys {
             }
             Key::Char('d') => self.emit_operator(Op::Delete),
             Key::Char('c') => self.emit_operator(Op::Change),
+            // `>{motion}`/`>>`, `<{motion}`/`<<`: arms the same way any
+            // other operator does -- the double-tap shorthand (`>>`/`<<`)
+            // is already handled generically by `feed`'s own check above
+            // (`c == op.trigger_char()`), nothing extra needed here.
+            Key::Char('>') => self.emit_operator(Op::Indent),
+            Key::Char('<') => self.emit_operator(Op::Outdent),
             // `D`: delete from the cursor through end of line, staying in
             // Normal mode -- vim's own `d$` shorthand. Unlike `C` (the
             // same range, but entering insert afterward), nothing already
@@ -2887,6 +2919,26 @@ mod tests {
         let mut vk = VimKeys::new();
         let keys = [Key::Char('g'), Key::Char('~'), Key::Char('~')];
         assert_eq!(last(&mut vk, &keys), KeyOutcome::OperatorLines(Op::CaseToggle, None, None));
+    }
+
+    #[test]
+    fn greater_and_less_arm_indent_outdent_resolved_by_a_motion() {
+        let mut vk = VimKeys::new();
+        let keys = [Key::Char('>'), Key::Char('w')];
+        assert_eq!(last(&mut vk, &keys), KeyOutcome::Operator(Op::Indent, Motion::WordForward, None, None));
+        let mut vk = VimKeys::new();
+        let keys = [Key::Char('<'), Key::Char('w')];
+        assert_eq!(last(&mut vk, &keys), KeyOutcome::Operator(Op::Outdent, Motion::WordForward, None, None));
+    }
+
+    #[test]
+    fn greater_greater_and_less_less_double_tap_resolve_to_operator_lines() {
+        let mut vk = VimKeys::new();
+        let keys = [Key::Char('3'), Key::Char('>'), Key::Char('>')];
+        assert_eq!(last(&mut vk, &keys), KeyOutcome::OperatorLines(Op::Indent, Some(3), None));
+        let mut vk = VimKeys::new();
+        let keys = [Key::Char('<'), Key::Char('<')];
+        assert_eq!(last(&mut vk, &keys), KeyOutcome::OperatorLines(Op::Outdent, None, None));
     }
 
     #[test]

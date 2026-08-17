@@ -3283,6 +3283,33 @@ fn run_normal_mode_navigation(
                 render_nav_frame(&buf, &vk, rect);
                 continue;
             }
+            // Visual `>`/`<`: same shape as `p`/`P` just above -- shifts
+            // every committed selection (plus the active one) whole-line
+            // via fileeditor::indent_selections/outdent_selections, then
+            // drops back to Normal mode at the first shifted line, same
+            // as vim's own Visual-mode `>`/`<`.
+            Key::Char('>') if vk.is_idle() && matches!(buf, NavBuffer::Editable(_)) && (vk.is_visual() || !buf.selections().is_empty()) => {
+                commit_active_selection(&vk, &mut buf);
+                let end_cursor = buf.cursor();
+                if let NavBuffer::Editable(tb) = &mut buf {
+                    fileeditor::indent_selections(tb);
+                }
+                buf.selections_mut().clear();
+                vk.end_visual(end_cursor);
+                render_nav_frame(&buf, &vk, rect);
+                continue;
+            }
+            Key::Char('<') if vk.is_idle() && matches!(buf, NavBuffer::Editable(_)) && (vk.is_visual() || !buf.selections().is_empty()) => {
+                commit_active_selection(&vk, &mut buf);
+                let end_cursor = buf.cursor();
+                if let NavBuffer::Editable(tb) = &mut buf {
+                    fileeditor::outdent_selections(tb);
+                }
+                buf.selections_mut().clear();
+                vk.end_visual(end_cursor);
+                render_nav_frame(&buf, &vk, rect);
+                continue;
+            }
             Key::Char('S') if vk.is_idle() && matches!(buf, NavBuffer::Editable(_)) && (vk.is_visual() || !buf.selections().is_empty()) => {
                 commit_active_selection(&vk, &mut buf);
                 let end_cursor = buf.cursor();
@@ -3505,6 +3532,8 @@ fn run_normal_mode_navigation(
                         Op::Lowercase | Op::Uppercase | Op::CaseToggle => {
                             fileeditor::case_operator_motion(tb, motion, count, fileeditor::case_kind_for_op(op));
                         }
+                        Op::Indent => fileeditor::indent_operator_motion(tb, motion, count),
+                        Op::Outdent => fileeditor::outdent_operator_motion(tb, motion, count),
                         Op::Yank => unreachable!("handled above"),
                     }
                 }
@@ -3521,6 +3550,8 @@ fn run_normal_mode_navigation(
                             fileeditor::run_insert_mode(tb, &mut vk, rect, registers, &mut || service_background_jobs(sessions, windows, job_frames, *current_window), false)?;
                         }
                         Op::Lowercase | Op::Uppercase | Op::CaseToggle => fileeditor::case_operator_lines(tb, count, fileeditor::case_kind_for_op(op)),
+                        Op::Indent => fileeditor::indent_lines(tb, count),
+                        Op::Outdent => fileeditor::outdent_lines(tb, count),
                         Op::Yank => unreachable!("handled above"),
                     }
                 }
