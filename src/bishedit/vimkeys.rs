@@ -105,6 +105,13 @@ pub enum KeyOutcome {
     Undo(Option<usize>),
     /// `Ctrl-R` / `[count]Ctrl-R` -- redo `count` (default 1) changes.
     Redo(Option<usize>),
+    /// `g-` / `g+` / `[count]g-` / `[count]g+` -- real vim's own undo-tree
+    /// time travel: step `count` (default 1) positions backward
+    /// (`forward: false`) or forward (`forward: true`) through the tree's
+    /// flat *creation* history, which can reach a branch plain `u`/
+    /// `Ctrl-R` alone can't (see `bishedit::undo::UndoTree::time_travel_
+    /// back`/`forward`'s own doc comment for exactly which one).
+    UndoSeq { forward: bool, count: Option<usize> },
     /// `ys{motion}{ch}` / `yss{ch}` / Visual-mode `S{ch}` -- vim-surround's
     /// own "wrap this in a delimiter pair" command. `target` names what to
     /// wrap (a resolved motion's own range, or -- `yss`'s own shorthand --
@@ -996,6 +1003,18 @@ impl VimKeys {
         KeyOutcome::Redo(count)
     }
 
+    // `g-`/`g+` -- called from `feed_g`, which is why `self.count` still
+    // holds whatever was typed *before* the leading `g` (`3g-`): entering
+    // `Pending::G` never touches `self.count`, same as every other
+    // `g`-prefixed command that reads a count this way (`gJ`, `gu{motion}`,
+    // ...).
+    fn emit_undo_seq(&mut self, forward: bool) -> KeyOutcome {
+        let count = self.count.take();
+        self.pending = Pending::None;
+        self.last_completed = std::mem::take(&mut self.current_input);
+        KeyOutcome::UndoSeq { forward, count }
+    }
+
     fn emit_put(&mut self, before: bool) -> KeyOutcome {
         let count = self.count.take();
         let register = self.pending_register.take();
@@ -1303,6 +1322,10 @@ impl VimKeys {
             Key::Char('u') => self.emit_operator(Op::Lowercase),
             Key::Char('U') => self.emit_operator(Op::Uppercase),
             Key::Char('~') => self.emit_operator(Op::CaseToggle),
+            // `g-`/`g+`: undo-tree time travel -- see KeyOutcome::
+            // UndoSeq's own doc comment.
+            Key::Char('-') => self.emit_undo_seq(false),
+            Key::Char('+') => self.emit_undo_seq(true),
             _ => self.abort(),
         }
     }
@@ -2969,6 +2992,36 @@ mod tests {
         let mut vk = VimKeys::new();
         let keys = [Key::Char('<'), Key::Char('<')];
         assert_eq!(last(&mut vk, &keys), KeyOutcome::OperatorLines(Op::Outdent, None, None));
+    }
+
+    #[test]
+    fn u_and_ctrl_r_resolve_to_undo_redo_with_count() {
+        let mut vk = VimKeys::new();
+        assert_eq!(vk.feed(Key::Char('u')), KeyOutcome::Undo(None));
+        let mut vk = VimKeys::new();
+        assert_eq!(vk.feed(Key::CtrlR), KeyOutcome::Redo(None));
+        let mut vk = VimKeys::new();
+        let keys = [Key::Char('3'), Key::Char('u')];
+        assert_eq!(last(&mut vk, &keys), KeyOutcome::Undo(Some(3)));
+        let mut vk = VimKeys::new();
+        let keys = [Key::Char('5'), Key::CtrlR];
+        assert_eq!(last(&mut vk, &keys), KeyOutcome::Redo(Some(5)));
+    }
+
+    #[test]
+    fn g_minus_and_g_plus_resolve_to_undo_seq_with_count() {
+        let mut vk = VimKeys::new();
+        let keys = [Key::Char('g'), Key::Char('-')];
+        assert_eq!(last(&mut vk, &keys), KeyOutcome::UndoSeq { forward: false, count: None });
+        let mut vk = VimKeys::new();
+        let keys = [Key::Char('g'), Key::Char('+')];
+        assert_eq!(last(&mut vk, &keys), KeyOutcome::UndoSeq { forward: true, count: None });
+        // Count typed before the leading `g` -- `self.count` survives
+        // entering Pending::G untouched, same as gJ/gu{motion}'s own count
+        // handling.
+        let mut vk = VimKeys::new();
+        let keys = [Key::Char('4'), Key::Char('g'), Key::Char('-')];
+        assert_eq!(last(&mut vk, &keys), KeyOutcome::UndoSeq { forward: false, count: Some(4) });
     }
 
     #[test]

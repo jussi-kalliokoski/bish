@@ -1150,6 +1150,20 @@ pub fn read_line(
         None => LineEditor::new(),
     };
 
+    // `u`/`Ctrl-R`/`g-`/`g+` for this line's own Ctrl-E (`run_line_normal_
+    // mode`) and Ctrl-O (`run_one_shot_normal_command`) vim Normal-mode
+    // excursions -- shared across *both* (and across however many
+    // separate excursions of either kind happen while composing this one
+    // line), so a `<C-o>dd` is undoable via a later Ctrl-E `u` just like
+    // an edit made from inside Ctrl-E itself. Fresh per `read_line` call
+    // (never persisted past submitting/cancelling this one line), unlike
+    // `marks`/`selections` below, which stay scoped to one excursion each
+    // -- those two are what a *motion* (`` `a ``, a Visual selection)
+    // resolves against, meaningful only within the excursion that set
+    // them; undo history is meaningful for as long as the line itself
+    // exists.
+    let mut undo: UndoTree<Vec<char>> = UndoTree::new(ed.buf.clone(), (0, ed.cursor));
+
     // Fish-style history browsing: Up/Down search backward/forward through
     // history for entries starting with whatever was typed *before*
     // browsing started (that original text is `prefix`, restored on Esc
@@ -1417,7 +1431,7 @@ pub fn read_line(
                 let state = completion.take().unwrap();
                 ed.splice_word(state.word_start, ed.cursor, &state.original);
             }
-            Key::CtrlE => match run_line_normal_mode(&mut ed, prompt, col_origin, width, ctx, registers, &mut on_idle)? {
+            Key::CtrlE => match run_line_normal_mode(&mut ed, prompt, col_origin, width, ctx, registers, &mut undo, &mut on_idle)? {
                 LineNormalExit::ToInsert => {}
                 LineNormalExit::Propagate(k) => {
                     pending_key = Some(k);
@@ -1439,7 +1453,7 @@ pub fn read_line(
             // comment. Reachable directly from ordinary typing, matching
             // real vim -- no need to already be in Ctrl-E's own mode first.
             Key::CtrlO => {
-                if let Some(k) = run_one_shot_normal_command(&mut ed, registers, &mut on_idle)? {
+                if let Some(k) = run_one_shot_normal_command(&mut ed, registers, &mut undo, &mut on_idle)? {
                     pending_key = Some(k);
                     suggestion = None; // see Ctrl-E's own propagate arm
                     continue;
@@ -1613,6 +1627,7 @@ fn push_selection_matches(lb: &LineBuffer, vk: &VimKeys, matches: &mut Vec<(usiz
 // unchanged). Real vim only ever returns to Insert via `i`/`a`/`I`/`A`/
 // `s`/`S`/`C` (or an explicit Escape-equivalent), never via Ctrl-E, so
 // this doesn't invent a binding vim itself doesn't have.
+#[allow(clippy::too_many_arguments)]
 fn run_line_normal_mode(
     ed: &mut LineEditor,
     prompt: &str,
@@ -1620,6 +1635,7 @@ fn run_line_normal_mode(
     width: usize,
     ctx: HighlightContext,
     registers: &mut Registers,
+    undo: &mut UndoTree<Vec<char>>,
     on_idle: &mut dyn FnMut(),
 ) -> io::Result<LineNormalExit> {
     let mut vk = VimKeys::new();
@@ -1628,13 +1644,16 @@ fn run_line_normal_mode(
     // selections`' own doc comment. Fresh and empty for this excursion,
     // same as `marks` just above.
     let mut selections: Vec<motion::MotionRange> = Vec::new();
-    // `u`/`Ctrl-R` -- fresh for this excursion, same lifetime as `marks`/
-    // `selections` just above (not persisted across a *later* Ctrl-E
-    // excursion on this same line, matching how those two already don't
-    // either). Row pinned to 0 -- `LineEditor` is a single line, same
-    // `(0, ed.cursor)` convention this function already uses elsewhere
-    // (see e.g. the Escape arm's own `end_cursor`).
-    let mut undo: UndoTree<Vec<char>> = UndoTree::new(ed.buf.clone(), (0, ed.cursor));
+    // Checkpoints whatever was typed via *ordinary* typing since the last
+    // checkpoint (read_line's own per-character loop never calls this
+    // itself) as its own group, before this excursion's first command can
+    // add one of its own on top -- without this, `undo`'s own `current`
+    // node can be stale by an arbitrary amount of ordinary typing, and if
+    // this excursion's first edit happens to land back on that stale
+    // content by coincidence, `checkpoint` would (correctly, by its own
+    // rules) treat it as a no-op and silently lose both the typed text
+    // *and* the edit as separate undo-able steps.
+    undo.checkpoint(&ed.buf, (0, ed.cursor));
     // Reverse-video prompt: the mode indicator. Deliberately not a
     // terminal cursor-shape change (DECSCUSR) -- that's global terminal
     // state with no clean way to restore whatever the user's own
@@ -1898,7 +1917,21 @@ fn run_line_normal_mode(
                             lb.ed.cursor = snap.cursor.1;
                         }
                     }
-                    KeyOutcome::Undo(_) | KeyOutcome::Redo(_) => {}
+                    // `g-`/`g+`: unlike `u`/`Ctrl-R`, these can land on a
+                    // node in a completely different branch than the one
+                    // `undo`'s own `current` was just on -- see
+                    // UndoTree::time_travel_back/forward's own doc
+                    // comment. Same Visual-mode guard as `u`/`Ctrl-R`
+                    // just above, for the same reason.
+                    KeyOutcome::UndoSeq { forward, count } if !vk.is_visual() && lb.selections.is_empty() => {
+                        for _ in 0..count.unwrap_or(1).max(1) {
+                            let snap = if forward { undo.time_travel_forward() } else { undo.time_travel_back() };
+                            let Some(snap) = snap else { break };
+                            lb.ed.buf = snap.content.clone();
+                            lb.ed.cursor = snap.cursor.1;
+                        }
+                    }
+                    KeyOutcome::Undo(_) | KeyOutcome::Redo(_) | KeyOutcome::UndoSeq { .. } => {}
                     KeyOutcome::Window(..) | KeyOutcome::Join { .. } | KeyOutcome::OpenLine { .. } | KeyOutcome::Pending | KeyOutcome::None => {}
                 }
             }
@@ -2449,13 +2482,17 @@ fn redirect_cw_to_ce(lb: &LineBuffer, motion: &motion::Motion) -> motion::Motion
 // handled by the caller the same way run_line_normal_mode's own
 // `Propagate` is. No terminal cursor-shape change here either -- same
 // reasoning as run_line_normal_mode's own doc comment.
-fn run_one_shot_normal_command(ed: &mut LineEditor, registers: &mut Registers, on_idle: &mut dyn FnMut()) -> io::Result<Option<Key>> {
+fn run_one_shot_normal_command(ed: &mut LineEditor, registers: &mut Registers, undo: &mut UndoTree<Vec<char>>, on_idle: &mut dyn FnMut()) -> io::Result<Option<Key>> {
     let mut vk = VimKeys::new();
     let mut marks: HashMap<char, (usize, usize)> = HashMap::new();
     // Never actually driven in this loop (see EnterVisual's own arm
     // below) -- exists only because `LineBuffer` always needs one to
     // construct, same reasoning as `marks`.
     let mut selections: Vec<motion::MotionRange> = Vec::new();
+    // Same "checkpoint whatever ordinary typing did since the last
+    // checkpoint, before this excursion's own edit can add one on top"
+    // reasoning as run_line_normal_mode's own doc comment.
+    undo.checkpoint(&ed.buf, (0, ed.cursor));
     let result = loop {
         let key = match read_key_idle(on_idle)? {
             Some(k) => k,
@@ -2567,25 +2604,56 @@ fn run_one_shot_normal_command(ed: &mut LineEditor, registers: &mut Registers, o
                     // `Join`/`OpenLine` are no-ops here for the same
                     // single-line reason `run_line_normal_mode`'s own arm
                     // documents.
-                    // Undo/redo aren't wired up for this one-shot excursion
-                    // (out of scope -- see bishedit::undo's own module doc
-                    // comment and this repo's own plan.md) -- a no-op here,
-                    // same as every other outcome this function doesn't
-                    // apply.
                     KeyOutcome::Window(..)
                     | KeyOutcome::EnterVisual(_)
                     | KeyOutcome::ReselectVisual
                     | KeyOutcome::Join { .. }
                     | KeyOutcome::OpenLine { .. }
                     | KeyOutcome::Jump { .. }
-                    | KeyOutcome::Undo(_)
-                    | KeyOutcome::Redo(_)
                     | KeyOutcome::None => break None,
+                    // `<C-o>u`/`<C-o>Ctrl-R`/`<C-o>g-`/`<C-o>g+`: real vim
+                    // treats these as ordinary one-shot Normal commands
+                    // too. No Visual-mode guard needed here the way
+                    // run_line_normal_mode's own arms have one --
+                    // `EnterVisual` is a no-op just above, so `vk.is_
+                    // visual()` can never be true by the time any of
+                    // these could fire.
+                    KeyOutcome::Undo(count) => {
+                        for _ in 0..count.unwrap_or(1).max(1) {
+                            let Some(snap) = undo.undo() else { break };
+                            lb.ed.buf = snap.content.clone();
+                            lb.ed.cursor = snap.cursor.1;
+                        }
+                        break None;
+                    }
+                    KeyOutcome::Redo(count) => {
+                        for _ in 0..count.unwrap_or(1).max(1) {
+                            let Some(snap) = undo.redo() else { break };
+                            lb.ed.buf = snap.content.clone();
+                            lb.ed.cursor = snap.cursor.1;
+                        }
+                        break None;
+                    }
+                    KeyOutcome::UndoSeq { forward, count } => {
+                        for _ in 0..count.unwrap_or(1).max(1) {
+                            let snap = if forward { undo.time_travel_forward() } else { undo.time_travel_back() };
+                            let Some(snap) = snap else { break };
+                            lb.ed.buf = snap.content.clone();
+                            lb.ed.cursor = snap.cursor.1;
+                        }
+                        break None;
+                    }
                     KeyOutcome::Pending => continue,
                 }
             }
         }
     };
+    // Checkpoints once, right before returning -- this function always
+    // applies exactly one command then returns, so there's no per-
+    // iteration redraw hook to piggyback on the way run_line_normal_
+    // mode's own loop has; this is the equivalent single point reached
+    // regardless of which arm actually ran.
+    undo.checkpoint(&ed.buf, (0, ed.cursor));
     Ok(result)
 }
 

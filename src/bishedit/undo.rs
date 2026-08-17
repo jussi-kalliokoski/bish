@@ -7,7 +7,8 @@
 // edit as a sibling branch, so nothing is ever lost even if `undo`/`redo`
 // alone can't reach it anymore (see `redo`'s own doc comment for exactly
 // what `undo`/`redo` alone *can* reach -- reaching an abandoned sibling
-// branch needs real vim's own g-/g+ time travel, not built here yet).
+// branch needs real vim's own g-/g+ time travel, see `time_travel_back`/
+// `time_travel_forward` below).
 //
 // Deliberately generic over the snapshot's own content type `C` (a whole
 // multi-line buffer for `TextBuffer`, a single line for the live prompt's
@@ -48,6 +49,18 @@ impl<C: Clone + PartialEq> UndoTree<C> {
 
     pub fn current(&self) -> &Snapshot<C> {
         &self.nodes[self.current].snapshot
+    }
+
+    // An opaque, stable identifier for the current node -- stays valid
+    // forever (nodes are never removed or reordered), so a caller can
+    // stash it (e.g. "the node that was on-disk as of the last `:w`") and
+    // compare against it later regardless of how much undo/redo/time-
+    // travel navigation happens in between. Consumers should treat this
+    // as opaque, not as a real sequence number to do arithmetic on --
+    // `time_travel_back`/`forward`'s own doc comment is the one place
+    // that's allowed to know it happens to be the node's creation index.
+    pub fn current_id(&self) -> usize {
+        self.current
     }
 
     // Commits `content`/`cursor` as a new child of the current node --
@@ -91,6 +104,30 @@ impl<C: Clone + PartialEq> UndoTree<C> {
     pub fn redo(&mut self) -> Option<&Snapshot<C>> {
         let &last = self.nodes[self.current].children.last()?;
         self.current = last;
+        Some(&self.nodes[self.current].snapshot)
+    }
+
+    // `g-`/`g+`: moves to the node with the next-lower/next-higher
+    // *creation* index, regardless of which branch it's on -- real vim's
+    // own undo "sequence number" is assigned in exactly this order (the
+    // order changes were made, not tree depth), and since `checkpoint`
+    // only ever appends (nodes are never reordered or removed), a node's
+    // own position in `nodes` already *is* that sequence number; nothing
+    // extra needs tracking. This is what lets these two reach a branch
+    // `undo`/`redo` alone can't (see `redo`'s own doc comment for exactly
+    // which branch that is): they walk the flat creation history, not
+    // parent/child edges.
+    pub fn time_travel_back(&mut self) -> Option<&Snapshot<C>> {
+        let prev = self.current.checked_sub(1)?;
+        self.current = prev;
+        Some(&self.nodes[self.current].snapshot)
+    }
+
+    pub fn time_travel_forward(&mut self) -> Option<&Snapshot<C>> {
+        if self.current + 1 >= self.nodes.len() {
+            return None;
+        }
+        self.current += 1;
         Some(&self.nodes[self.current].snapshot)
     }
 }
@@ -164,5 +201,40 @@ mod tests {
         assert_eq!(t.undo().unwrap().content, 1);
         assert_eq!(t.undo().unwrap().content, 0);
         assert!(t.undo().is_none());
+    }
+
+    #[test]
+    fn time_travel_reaches_a_branch_undo_redo_alone_cannot() {
+        let mut t = UndoTree::new(0, (0, 0));
+        t.checkpoint(&1, (0, 0)); // root(0) -> A(1)
+        t.undo();
+        t.checkpoint(&2, (0, 0)); // root(0) -> B(2), a sibling of A
+        // current is now B; redo() has nothing (B is a leaf), and undo()
+        // only ever reaches root or B, never A.
+        assert!(t.redo().is_none());
+
+        // time_travel_back walks creation order instead: B(idx 2) -> A(idx 1).
+        let back = t.time_travel_back().unwrap();
+        assert_eq!(back.content, 1);
+
+        // and forward again reaches B.
+        let fwd = t.time_travel_forward().unwrap();
+        assert_eq!(fwd.content, 2);
+    }
+
+    #[test]
+    fn time_travel_back_past_the_root_returns_none() {
+        let mut t = UndoTree::new(0, (0, 0));
+        assert!(t.time_travel_back().is_none());
+        t.checkpoint(&1, (0, 0));
+        assert_eq!(t.time_travel_back().unwrap().content, 0);
+        assert!(t.time_travel_back().is_none());
+    }
+
+    #[test]
+    fn time_travel_forward_past_the_newest_node_returns_none() {
+        let mut t = UndoTree::new(0, (0, 0));
+        t.checkpoint(&1, (0, 0));
+        assert!(t.time_travel_forward().is_none());
     }
 }

@@ -3580,6 +3580,18 @@ fn run_normal_mode_navigation(
                 }
                 render_nav_frame(&mut buf, &vk, rect);
             }
+            // `g-`/`g+`: same guard as `u`/`Ctrl-R` just above, for the
+            // same reason.
+            KeyOutcome::UndoSeq { forward, count } => {
+                if !vk.is_visual() && buf.selections().is_empty() && let NavBuffer::Editable(tb) = &mut buf {
+                    for _ in 0..count.unwrap_or(1).max(1) {
+                        if !tb.time_travel(forward) {
+                            break;
+                        }
+                    }
+                }
+                render_nav_frame(&mut buf, &vk, rect);
+            }
             // Yank works for either buffer kind (`op == Op::Yank` is
             // checked first, unconditionally) -- copying text out of a
             // pane's own scrollback/output is exactly what `ReadOnly`'s

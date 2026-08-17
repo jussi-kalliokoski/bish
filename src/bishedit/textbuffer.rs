@@ -47,6 +47,19 @@ pub struct TextBuffer {
     // `checkpoint_undo` -- see its own doc comment for exactly when that
     // gets called and why that's what defines one undo-able "group".
     undo: UndoTree<Vec<Vec<char>>>,
+    // The undo-tree node id that was on disk as of the last successful
+    // `save` (or the buffer's own starting content, if never saved) --
+    // `undo()`/`redo()`/`time_travel` compare against this to decide
+    // whether landing on a given node means "this exact content is
+    // already on disk," clearing `dirty` precisely the way real vim's own
+    // undo-tree-aware `modified` flag does. Ordinary edits (insert_text/
+    // delete_range/join_lines) don't consult this at all -- they always
+    // set `dirty = true` directly, which is already correct for them (an
+    // edit either just happened or it didn't; there's no "did this
+    // particular edit happen to reproduce the saved content" question
+    // worth asking there the way there is for undo/redo/time-travel,
+    // which can legitimately land back exactly on it).
+    saved_node: usize,
     dirty: bool,
     path: Option<PathBuf>,
 }
@@ -56,6 +69,7 @@ impl TextBuffer {
         let lines = vec![Vec::new()];
         TextBuffer {
             undo: UndoTree::new(lines.clone(), (0, 0)),
+            saved_node: 0,
             lines,
             cursor: (0, 0),
             vtop: 0,
@@ -89,6 +103,7 @@ impl TextBuffer {
         };
         Ok(TextBuffer {
             undo: UndoTree::new(lines.clone(), (0, 0)),
+            saved_node: 0,
             lines,
             cursor: (0, 0),
             vtop: 0,
@@ -128,16 +143,8 @@ impl TextBuffer {
     // further back than the content this buffer started with.
     pub fn undo(&mut self) -> bool {
         let Some(snap) = self.undo.undo() else { return false };
-        self.lines = snap.content.clone();
-        self.cursor = snap.cursor;
-        // Positions may no longer be valid -- same reasoning insert_text/
-        // delete_range/join_lines already apply for any real edit.
-        self.diagnostics.clear();
-        // Known simplification: this doesn't try to detect "undo landed
-        // exactly back on the last-saved content" and clear `dirty` for
-        // that case -- real vim tracks a dedicated "last saved" node in
-        // the tree to do that precisely; not built here.
-        self.dirty = true;
+        let (content, cursor) = (snap.content.clone(), snap.cursor);
+        self.restore_snapshot(content, cursor);
         true
     }
 
@@ -147,11 +154,38 @@ impl TextBuffer {
     // has no children (nothing to redo from here).
     pub fn redo(&mut self) -> bool {
         let Some(snap) = self.undo.redo() else { return false };
-        self.lines = snap.content.clone();
-        self.cursor = snap.cursor;
-        self.diagnostics.clear();
-        self.dirty = true;
+        let (content, cursor) = (snap.content.clone(), snap.cursor);
+        self.restore_snapshot(content, cursor);
         true
+    }
+
+    // `g-`/`g+`: walks the undo tree's own flat creation history rather
+    // than parent/child edges -- see UndoTree::time_travel_back/forward's
+    // own doc comment for why that reaches branches undo/redo alone
+    // can't. `forward: false` is `g-`, `true` is `g+`. `false` (buffer
+    // untouched) at either end of that history.
+    pub fn time_travel(&mut self, forward: bool) -> bool {
+        let result = if forward { self.undo.time_travel_forward() } else { self.undo.time_travel_back() };
+        let Some(snap) = result else { return false };
+        let (content, cursor) = (snap.content.clone(), snap.cursor);
+        self.restore_snapshot(content, cursor);
+        true
+    }
+
+    // Shared tail of undo/redo/time_travel: splices a snapshot's own
+    // content/cursor back into the buffer and updates everything that
+    // depends on "what does the buffer actually contain right now."
+    fn restore_snapshot(&mut self, content: Vec<Vec<char>>, cursor: (usize, usize)) {
+        self.lines = content;
+        self.cursor = cursor;
+        // Positions may no longer be valid -- same reasoning insert_text/
+        // delete_range/join_lines already apply for any real edit.
+        self.diagnostics.clear();
+        // Save-aware: landing back exactly on the node that was on disk
+        // as of the last `:w` clears `dirty`, matching real vim's own
+        // undo-tree-aware `modified` flag -- see `saved_node`'s own doc
+        // comment.
+        self.dirty = self.undo.current_id() != self.saved_node;
     }
 
     // Writes every line joined by "\n", plus one trailing "\n" (matching
@@ -168,6 +202,14 @@ impl TextBuffer {
             self.path = Some(target.to_path_buf());
         }
         self.dirty = false;
+        // Remembers exactly what's now on disk -- see `saved_node`'s own
+        // doc comment. Safe to read here (rather than needing its own
+        // fresh checkpoint first): `self.undo.current()` and `self.lines`
+        // are always already in sync by the time any new top-level key
+        // (including the `:w` that reached this call) starts being
+        // handled -- repl.rs's own `render_nav_frame` checkpoints after
+        // *every* one, before the next key is ever read.
+        self.saved_node = self.undo.current_id();
         Ok(())
     }
 
@@ -451,6 +493,7 @@ mod tests {
         let lines: Vec<Vec<char>> = text.split('\n').map(|l| l.chars().collect()).collect();
         TextBuffer {
             undo: UndoTree::new(lines.clone(), (0, 0)),
+            saved_node: 0,
             lines,
             cursor: (0, 0),
             vtop: 0,
@@ -763,5 +806,58 @@ mod tests {
         buf.diagnostics = vec![lint::Diagnostic { start: 0, end: 1, severity: lint::Severity::Warning, code: "x", message: String::new(), fix: None }];
         assert!(buf.undo());
         assert!(buf.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn time_travel_reaches_a_branch_undo_redo_alone_cannot() {
+        let mut buf = make("");
+        buf.insert_text((0, 0), "a");
+        buf.checkpoint_undo(); // root("") -> A("a")
+        buf.undo();
+        buf.insert_text((0, 0), "b");
+        buf.checkpoint_undo(); // root("") -> B("b"), a sibling of A
+        assert_eq!(text_of(&buf), "b");
+        assert!(!buf.redo()); // B is a leaf -- nothing to redo
+
+        assert!(buf.time_travel(false)); // g- : B -> A, by creation order
+        assert_eq!(text_of(&buf), "a");
+        assert!(buf.time_travel(true)); // g+ : A -> B
+        assert_eq!(text_of(&buf), "b");
+    }
+
+    #[test]
+    fn time_travel_past_either_end_returns_false() {
+        let mut buf = make("foo");
+        assert!(!buf.time_travel(false));
+        assert!(!buf.time_travel(true));
+    }
+
+    #[test]
+    fn undo_redo_are_save_aware() {
+        let dir = std::env::temp_dir().join(format!("bish-textbuffer-undo-save-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("f.txt");
+        std::fs::write(&path, "foo\n").unwrap();
+
+        let mut buf = TextBuffer::open(&path, 10).unwrap();
+        assert!(!buf.is_dirty());
+
+        buf.insert_text((0, 3), "!");
+        buf.checkpoint_undo();
+        assert!(buf.is_dirty());
+
+        buf.save(None).unwrap();
+        assert!(!buf.is_dirty());
+
+        // Undoing away from the just-saved content is dirty again...
+        assert!(buf.undo());
+        assert!(buf.is_dirty());
+        // ...and redoing back onto it clears dirty again, without a
+        // second save -- this is exactly what a plain `dirty = true` on
+        // every undo/redo (the pre-existing simplification) couldn't do.
+        assert!(buf.redo());
+        assert!(!buf.is_dirty());
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
