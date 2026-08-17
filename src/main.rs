@@ -14,12 +14,23 @@ mod regex;
 mod repl;
 mod serialize;
 mod term;
+mod tool;
 mod vt100;
 
 use std::io::{IsTerminal, Read};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+
+    // `bish tool <subcommand>` -- checked first, ahead of every other
+    // argv-based branch below (in particular the generic `args.len() >=
+    // 2` script-path one just after), since `tool` isn't a script name
+    // to try to open. See tool.rs's own doc comment for what lives here
+    // today and what's planned alongside it.
+    if args.get(1).map(String::as_str) == Some("tool") {
+        std::process::exit(tool::run(&args[2..]));
+    }
+
     let mut shell = exec::Shell::new();
 
     if args.len() >= 3 && args[1] == "-c" {

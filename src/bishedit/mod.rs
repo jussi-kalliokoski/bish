@@ -7,6 +7,7 @@
 pub mod completion;
 pub mod fuzzy;
 pub mod highlight;
+pub mod lint;
 pub mod manpages;
 pub mod motion;
 pub mod registers;
