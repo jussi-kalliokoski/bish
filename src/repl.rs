@@ -1574,6 +1574,9 @@ enum FgOutcome {
 const MOUSE_REPORTING_ENABLE: &str = "\x1b[?1000h\x1b[?1002h\x1b[?1006h";
 const MOUSE_REPORTING_DISABLE: &str = "\x1b[?1006l\x1b[?1002l\x1b[?1000l";
 
+const BRACKETED_PASTE_ENABLE: &str = "\x1b[?2004h";
+const BRACKETED_PASTE_DISABLE: &str = "\x1b[?2004l";
+
 // Turns real-terminal mouse reporting on/off (SGR extended coordinates,
 // mode 1006, plus button-event tracking, mode 1002) to match whatever
 // the job's own program has asked for on its virtual screen (vt100::
@@ -1595,6 +1598,30 @@ fn sync_mouse_reporting(enabled: &mut bool, screen: &Rc<RefCell<vt100::Screen>>)
         return;
     }
     print!("{}", if wants { MOUSE_REPORTING_ENABLE } else { MOUSE_REPORTING_DISABLE });
+    let _ = io::stdout().flush();
+    *enabled = wants;
+}
+
+// Same idea as sync_mouse_reporting, for DECSET 2004 (bracketed paste --
+// vt100::Screen::bracketed_paste, set by the job's own \x1b[?2004h/l
+// request): without this, a job like vim asking its controlling
+// terminal to bracket pastes (so it knows to suspend autoindent for the
+// duration, rather than treating pasted text as fast typing) was asking
+// bish's own vt100::Screen -- which faithfully tracked the flag but
+// never actually told the *real* terminal to start bracketing pastes.
+// The real terminal would then hand a pasted block to bish as an
+// ordinary burst of characters, indistinguishable from typing, which
+// drive_fg_job's raw stdin-forwarding loop passes straight through to
+// the job -- so vim received it as unbracketed "typing" and mangled
+// every line with its own autoindent, even though vim did everything
+// right on its end. Mirrors sync_mouse_reporting's own on/off/cleanup
+// shape exactly, called from the same two spots.
+fn sync_bracketed_paste(enabled: &mut bool, screen: &Rc<RefCell<vt100::Screen>>) {
+    let wants = screen.borrow().bracketed_paste;
+    if wants == *enabled {
+        return;
+    }
+    print!("{}", if wants { BRACKETED_PASTE_ENABLE } else { BRACKETED_PASTE_DISABLE });
     let _ = io::stdout().flush();
     *enabled = wants;
 }
@@ -1631,7 +1658,10 @@ fn sync_mouse_reporting(enabled: &mut bool, screen: &Rc<RefCell<vt100::Screen>>)
 // Real mouse events (an SGR sequence typed at bish's own stdin) reach the
 // job below via the same raw-forwarding this loop already does for every
 // other byte -- see sync_mouse_reporting's own doc comment for the
-// on/off toggle that makes the real terminal actually send them.
+// on/off toggle that makes the real terminal actually send them. A real
+// paste reaches the job the same way, already bracketed in
+// \x1b[200~/\x1b[201~ if it asked for that too -- see
+// sync_bracketed_paste's own doc comment.
 fn drive_fg_job(job: &mut exec::FgJob, screen: &Rc<RefCell<vt100::Screen>>, mut redraw: impl FnMut(), mut on_idle: impl FnMut()) -> FgOutcome {
     use std::io::{Read, Write};
     use std::os::unix::io::AsRawFd;
@@ -1646,6 +1676,8 @@ fn drive_fg_job(job: &mut exec::FgJob, screen: &Rc<RefCell<vt100::Screen>>, mut 
     // DECSET request could have just arrived.
     let mut mouse_enabled = false;
     sync_mouse_reporting(&mut mouse_enabled, screen);
+    let mut bracketed_paste_enabled = false;
+    sync_bracketed_paste(&mut bracketed_paste_enabled, screen);
 
     let mut buf = [0u8; 4096];
     // Caps how many chunks get drained per outer-loop tick before
@@ -1683,6 +1715,7 @@ fn drive_fg_job(job: &mut exec::FgJob, screen: &Rc<RefCell<vt100::Screen>>, mut 
         }
         if made_progress {
             sync_mouse_reporting(&mut mouse_enabled, screen);
+            sync_bracketed_paste(&mut bracketed_paste_enabled, screen);
             redraw();
         }
 
@@ -1771,6 +1804,15 @@ fn drive_fg_job(job: &mut exec::FgJob, screen: &Rc<RefCell<vt100::Screen>>, mut 
     // it was never actually turned on.
     if mouse_enabled {
         print!("{MOUSE_REPORTING_DISABLE}");
+        let _ = io::stdout().flush();
+    }
+    // Same unconditional cleanup, and for the same reason: bish's own
+    // prompt (editor::read_line) never recognizes \x1b[200~/\x1b[201~ --
+    // left enabled, a paste right after this job exits would land in the
+    // next read_line call as literal garbage bytes instead of a bracketed
+    // block it knows to ignore as markers.
+    if bracketed_paste_enabled {
+        print!("{BRACKETED_PASTE_DISABLE}");
         let _ = io::stdout().flush();
     }
     redraw();
