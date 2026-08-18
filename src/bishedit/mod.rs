@@ -45,4 +45,21 @@ pub trait Buffer {
     /// as the cursor and viewport -- every implementor owns its own storage.
     fn set_mark(&mut self, name: char, pos: (usize, usize));
     fn get_mark(&self, name: char) -> Option<(usize, usize)>;
+
+    /// Whether `line`'s content is a soft-wrap continuation into
+    /// `line + 1` -- both are still separate storage lines, but joined
+    /// with no newline in between when text spanning them gets extracted
+    /// (`motion::extract_text`/`whole_lines`), and treated as one line for
+    /// `$`'s own end-of-line target. Default false: every implementor
+    /// whose storage lines are real logical lines (a real newline really
+    /// did end each one) never needs to override this. The one exception
+    /// is `repl.rs`'s `ScreenBuffer`, the sole `Buffer` backed by a
+    /// fixed-width terminal grid, where a long enough line can get cut by
+    /// autowrap rather than ending on purpose -- without this, yanking
+    /// across that cut spliced in a newline that was never actually in
+    /// the source bytes, garbling anything long enough to wrap (a long
+    /// URL, say) and making it impossible to select in one motion.
+    fn line_wraps(&self, _line: usize) -> bool {
+        false
+    }
 }

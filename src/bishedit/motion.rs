@@ -189,6 +189,18 @@ fn last_non_blank(buf: &impl Buffer, line: usize) -> usize {
     0
 }
 
+/// `$`'s own target row: walks forward past every `line_wraps` row so it
+/// always lands on the true end of the logical line, not wherever a
+/// column-width autowrap happened to cut it -- for every ordinary buffer
+/// (`line_wraps` always false) this is just `line` itself, unchanged.
+fn logical_line_end(buf: &impl Buffer, line: usize) -> usize {
+    let mut l = line;
+    while buf.line_wraps(l) && l + 1 < buf.line_count() {
+        l += 1;
+    }
+    l
+}
+
 /// Steps one character forward. Never lands on the virtual "just past the
 /// last character" slot of a line -- that slot is skipped straight through
 /// to column 0 of the next line, since it isn't a real character and vim's
@@ -1415,12 +1427,12 @@ pub fn apply_motion(buf: &mut impl Buffer, motion: Motion, count: Option<usize>)
         }
         Motion::LineEnd => {
             let (line, _) = buf.cursor();
-            let target = (line + n - 1).min(buf.line_count().saturating_sub(1));
+            let target = logical_line_end(buf, (line + n - 1).min(buf.line_count().saturating_sub(1)));
             buf.set_cursor(target, last_col(buf, target));
         }
         Motion::LineLastNonBlank => {
             let (line, _) = buf.cursor();
-            let target = (line + n - 1).min(buf.line_count().saturating_sub(1));
+            let target = logical_line_end(buf, (line + n - 1).min(buf.line_count().saturating_sub(1)));
             let col = last_non_blank(buf, target);
             buf.set_cursor(target, col);
         }
@@ -2012,16 +2024,20 @@ pub fn motion_range(buf: &mut impl Buffer, motion: Motion, count: Option<usize>)
 /// The literal text a `MotionRange` covers. `Linewise` joins whole lines
 /// with `\n`, including a trailing one (so the result is always a sequence
 /// of complete lines, ready to be spliced back in as-is by a linewise
-/// put). `Inclusive`/`Exclusive` walk character-by-character via the same
-/// `step_forward` plain motions use, inserting `\n` exactly when a step
-/// crosses a line boundary -- `Exclusive` stops one character short of
-/// `to`, `Inclusive` includes it.
+/// put) -- except across a `line_wraps` boundary, where no line actually
+/// ended there, so no `\n` is inserted either. `Inclusive`/`Exclusive`
+/// walk character-by-character via the same `step_forward` plain motions
+/// use, inserting `\n` exactly when a step crosses a real line boundary
+/// (again, not a `line_wraps` one) -- `Exclusive` stops one character
+/// short of `to`, `Inclusive` includes it.
 pub fn extract_text(buf: &impl Buffer, range: &MotionRange) -> String {
     if range.shape == MotionShape::Linewise {
         let mut s = String::new();
         for l in range.from.0..=range.to.0 {
             s.push_str(&buf.line_chars(l).into_iter().collect::<String>());
-            s.push('\n');
+            if l == range.to.0 || !buf.line_wraps(l) {
+                s.push('\n');
+            }
         }
         return s;
     }
@@ -2042,7 +2058,7 @@ pub fn extract_text(buf: &impl Buffer, range: &MotionRange) -> String {
             Some(n) => n,
             None => break,
         };
-        if next.0 != cur.0 {
+        if next.0 != cur.0 && !buf.line_wraps(cur.0) {
             s.push('\n');
         }
         cur = next;
@@ -2055,14 +2071,39 @@ pub fn extract_text(buf: &impl Buffer, range: &MotionRange) -> String {
 /// operator, this line" rather than as a real cursor motion (there's no
 /// `Motion` variant for it, and unlike every other yank the cursor doesn't
 /// move at all, so this takes `&impl Buffer` rather than `&mut impl
-/// Buffer`).
+/// Buffer`). "This line" always means the *whole* line: if the cursor
+/// happens to sit on a `line_wraps` continuation row, the range is
+/// widened back to that run's first row first, so `yy` never yanks just a
+/// column-width fragment of whatever wrapped there.
 pub fn whole_lines(buf: &impl Buffer, count: usize) -> String {
-    let (line, _) = buf.cursor();
-    let last = (line + count.max(1) - 1).min(buf.line_count().saturating_sub(1));
+    let (cursor_line, _) = buf.cursor();
+    let mut line = cursor_line;
+    while line > 0 && buf.line_wraps(line - 1) {
+        line -= 1;
+    }
+    // `count` logical lines, not physical rows -- each iteration widens
+    // `last` out to the end of whichever logical line it currently sits
+    // at the start of, then (unless this was the last one wanted) steps
+    // onto the first row of the next logical line.
+    let count = count.max(1);
+    let mut last = line;
+    for i in 0..count {
+        while buf.line_wraps(last) && last + 1 < buf.line_count() {
+            last += 1;
+        }
+        if i + 1 < count {
+            if last + 1 >= buf.line_count() {
+                break;
+            }
+            last += 1;
+        }
+    }
     let mut s = String::new();
     for l in line..=last {
         s.push_str(&buf.line_chars(l).into_iter().collect::<String>());
-        s.push('\n');
+        if l == last || !buf.line_wraps(l) {
+            s.push('\n');
+        }
     }
     s
 }
@@ -2077,6 +2118,10 @@ mod tests {
         vtop: usize,
         vheight: usize,
         marks: std::collections::HashMap<char, (usize, usize)>,
+        // Simulates a ScreenBuffer's `line_wraps` -- which lines were "cut"
+        // by column-width autowrap rather than a real line break, for
+        // tests exercising that (empty for every other test here).
+        wraps: std::collections::HashSet<usize>,
     }
 
     impl TestBuffer {
@@ -2088,6 +2133,40 @@ mod tests {
                 vtop: 0,
                 vheight: 24,
                 marks: std::collections::HashMap::new(),
+                wraps: std::collections::HashSet::new(),
+            }
+        }
+
+        // Builds a buffer from "logical lines" that autowrap: each `&str`
+        // is one real line's full text, pre-split into `width`-wide
+        // storage rows exactly like a terminal grid would, with every row
+        // but the last of each logical line marked as wrapped.
+        fn new_wrapped(logical_lines: &[&str], width: usize) -> Self {
+            let mut lines = Vec::new();
+            let mut wraps = std::collections::HashSet::new();
+            for logical in logical_lines {
+                let chars: Vec<char> = logical.chars().collect();
+                if chars.is_empty() {
+                    lines.push(Vec::new());
+                    continue;
+                }
+                let mut start = 0;
+                while start < chars.len() {
+                    let end = (start + width).min(chars.len());
+                    lines.push(chars[start..end].to_vec());
+                    if end < chars.len() {
+                        wraps.insert(lines.len() - 1);
+                    }
+                    start = end;
+                }
+            }
+            TestBuffer {
+                lines,
+                cursor: (0, 0),
+                vtop: 0,
+                vheight: 24,
+                marks: std::collections::HashMap::new(),
+                wraps,
             }
         }
     }
@@ -2122,6 +2201,9 @@ mod tests {
         }
         fn get_mark(&self, name: char) -> Option<(usize, usize)> {
             self.marks.get(&name).copied()
+        }
+        fn line_wraps(&self, line: usize) -> bool {
+            self.wraps.contains(&line)
         }
     }
 
@@ -2798,6 +2880,42 @@ mod tests {
         let r = motion_range(&mut buf, Motion::GotoLastLine, None).unwrap();
         assert_eq!(r.shape, MotionShape::Linewise);
         assert_eq!(extract_text(&buf, &r), "a\n\nb\n");
+    }
+
+    #[test]
+    fn whole_lines_yy_joins_a_wrapped_line_without_a_newline() {
+        // A single long logical line, "helloworldXYZ", autowrapped into
+        // three 5-wide storage rows: "hello", "world", "XYZ".
+        let mut buf = TestBuffer::new_wrapped(&["helloworldXYZ", "next"], 5);
+        buf.set_cursor(0, 0);
+        assert_eq!(whole_lines(&buf, 1), "helloworldXYZ\n");
+
+        // Same, but starting from the *middle* row of the wrapped run --
+        // yy still yanks the whole logical line, not just that fragment.
+        buf.set_cursor(1, 0);
+        assert_eq!(whole_lines(&buf, 1), "helloworldXYZ\n");
+
+        // count > 1 from the run's start also picks up the real next
+        // line whole, with a real newline separating the two.
+        buf.set_cursor(0, 0);
+        assert_eq!(whole_lines(&buf, 2), "helloworldXYZ\nnext\n");
+    }
+
+    #[test]
+    fn extract_text_linewise_does_not_garble_a_wrapped_run() {
+        let mut buf = TestBuffer::new_wrapped(&["helloworldXYZ"], 5);
+        buf.set_cursor(0, 0);
+        let r = MotionRange { shape: MotionShape::Linewise, from: (0, 0), to: (2, 0) };
+        assert_eq!(extract_text(&buf, &r), "helloworldXYZ\n");
+    }
+
+    #[test]
+    fn line_end_reaches_the_true_end_of_a_wrapped_line() {
+        let mut buf = TestBuffer::new_wrapped(&["helloworldXYZ"], 5);
+        buf.set_cursor(0, 0);
+        // "$" from the first storage row lands on the run's last row, at
+        // its own last real character -- not at column 4 of row 0.
+        assert_eq!(go(&mut buf, Motion::LineEnd, None), (2, 2));
     }
 
     #[test]

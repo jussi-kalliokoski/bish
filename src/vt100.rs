@@ -130,6 +130,15 @@ pub struct Grid {
     pub rows: usize,
     pub cols: usize,
     cells: Vec<Cell>,
+    // Per-row "this row's content didn't end here on purpose -- it just
+    // ran out of columns and autowrap continued it onto the next row"
+    // flag, set only by print_char's own pending_wrap-consuming branch
+    // (never by an explicit CR/LF, which always clears pending_wrap
+    // first). This is what lets a Buffer built over a Screen (ScreenBuffer
+    // in repl.rs) tell a real line break apart from a column-width
+    // artifact, so yanking/selecting a long wrapped line doesn't garble
+    // it with a newline that was never actually in the source bytes.
+    wrapped: Vec<bool>,
     pub cursor_row: usize,
     pub cursor_col: usize,
     pending_wrap: bool,
@@ -146,6 +155,7 @@ impl Grid {
             rows,
             cols,
             cells: vec![Cell::default(); rows * cols],
+            wrapped: vec![false; rows],
             cursor_row: 0,
             cursor_col: 0,
             pending_wrap: false,
@@ -164,7 +174,11 @@ impl Grid {
                 new_cells[r * cols + c] = self.cells[r * self.cols + c];
             }
         }
+        let mut new_wrapped = vec![false; rows];
+        let overlap = self.rows.min(rows);
+        new_wrapped[..overlap].copy_from_slice(&self.wrapped[..overlap]);
         self.cells = new_cells;
+        self.wrapped = new_wrapped;
         self.rows = rows;
         self.cols = cols;
         self.cursor_row = self.cursor_row.min(rows - 1);
@@ -182,21 +196,38 @@ impl Grid {
         &mut self.cells[row * self.cols + col]
     }
 
+    fn is_wrapped(&self, row: usize) -> bool {
+        self.wrapped[row]
+    }
+
+    fn set_wrapped(&mut self, row: usize, v: bool) {
+        self.wrapped[row] = v;
+    }
+
     fn clear_all(&mut self) {
         self.cells.iter_mut().for_each(|c| *c = Cell::default());
+        self.wrapped.iter_mut().for_each(|w| *w = false);
     }
 
     fn clear_row_range(&mut self, row: usize, from: usize, to_inclusive: usize) {
         for c in from..=to_inclusive.min(self.cols - 1) {
             *self.cell_mut(row, c) = Cell::default();
         }
+        // Clearing from the start of the row means whatever content used
+        // to be there (including any wrap flag it carried) is gone --
+        // otherwise a row reused for unrelated content (after a scroll,
+        // an erase, ...) could wrongly look "joined" to the row after it.
+        if from == 0 {
+            self.wrapped[row] = false;
+        }
     }
 
     // Scrolls the region [scroll_top, scroll_bottom] up by `n` lines,
     // dropping lines off the top; blank lines fill in at the bottom.
-    // Returns the dropped lines (for scrollback capture), only meaningful
-    // to the caller when the region spans the whole grid.
-    fn scroll_up(&mut self, n: usize) -> Vec<Vec<Cell>> {
+    // Returns the dropped lines plus each one's own wrapped flag (for
+    // scrollback capture), only meaningful to the caller when the region
+    // spans the whole grid.
+    fn scroll_up(&mut self, n: usize) -> Vec<(Vec<Cell>, bool)> {
         let top = self.scroll_top;
         let bottom = self.scroll_bottom;
         let region_h = bottom - top + 1;
@@ -204,12 +235,13 @@ impl Grid {
         let mut dropped = Vec::new();
         for _ in 0..n {
             let row: Vec<Cell> = (0..self.cols).map(|c| self.cell(top, c)).collect();
-            dropped.push(row);
+            dropped.push((row, self.wrapped[top]));
             for r in top..bottom {
                 for c in 0..self.cols {
                     let below = self.cell(r + 1, c);
                     *self.cell_mut(r, c) = below;
                 }
+                self.wrapped[r] = self.wrapped[r + 1];
             }
             self.clear_row_range(bottom, 0, self.cols - 1);
         }
@@ -227,6 +259,7 @@ impl Grid {
                     let above = self.cell(r - 1, c);
                     *self.cell_mut(r, c) = above;
                 }
+                self.wrapped[r] = self.wrapped[r - 1];
             }
             self.clear_row_range(top, 0, self.cols - 1);
         }
@@ -306,6 +339,12 @@ pub struct Screen {
     pub alternate: Grid,
     pub using_alternate: bool,
     pub scrollback: VecDeque<Vec<Cell>>,
+    // Parallel to `scrollback`, index-for-index -- whether that scrollback
+    // row was a soft-wrap continuation into the row after it (see Grid's
+    // own `wrapped` field doc comment). Kept as its own deque rather than
+    // folded into `scrollback`'s element type so every existing `Vec<Cell>`
+    // read site (`.len()`, indexing, `.get(col)`, ...) is untouched.
+    pub scrollback_wrapped: VecDeque<bool>,
     scrollback_limit: usize,
     pub cursor_visible: bool,
     pub autowrap: bool,
@@ -352,6 +391,7 @@ impl Screen {
             alternate: Grid::new(rows, cols),
             using_alternate: false,
             scrollback: VecDeque::new(),
+            scrollback_wrapped: VecDeque::new(),
             scrollback_limit: 5000,
             cursor_visible: true,
             autowrap: true,
@@ -400,6 +440,13 @@ impl Screen {
 
     pub fn cell(&self, row: usize, col: usize) -> Cell {
         self.grid().cell(row, col)
+    }
+
+    // Whether the currently-showing grid's `row` is a soft-wrap
+    // continuation into `row + 1` (see Grid's own `wrapped` field doc
+    // comment).
+    pub fn row_wraps(&self, row: usize) -> bool {
+        self.grid().is_wrapped(row)
     }
 
     pub fn cursor(&self) -> (usize, usize) {
@@ -503,6 +550,8 @@ impl Screen {
 
         let cols = self.grid().cols;
         if self.grid().pending_wrap {
+            let wrap_row = self.grid().cursor_row;
+            self.grid_mut().set_wrapped(wrap_row, true);
             self.line_feed_no_scroll_check();
             self.carriage_return();
             self.grid_mut().pending_wrap = false;
@@ -555,10 +604,12 @@ impl Screen {
             let full_screen = self.grid().scroll_top == 0 && self.grid().scroll_bottom == self.grid().rows - 1;
             let dropped = self.grid_mut().scroll_up(1);
             if full_screen && !self.using_alternate {
-                for line in dropped {
+                for (line, wrapped) in dropped {
                     self.scrollback.push_back(line);
+                    self.scrollback_wrapped.push_back(wrapped);
                     if self.scrollback.len() > self.scrollback_limit {
                         self.scrollback.pop_front();
+                        self.scrollback_wrapped.pop_front();
                     }
                 }
             }
@@ -731,10 +782,12 @@ impl Screen {
                 let dropped = self.grid_mut().scroll_up(param_at(0, 1) as usize);
                 let full_screen = self.grid().scroll_top == 0 && self.grid().scroll_bottom == self.grid().rows - 1;
                 if full_screen && !self.using_alternate {
-                    for line in dropped {
+                    for (line, wrapped) in dropped {
                         self.scrollback.push_back(line);
+                        self.scrollback_wrapped.push_back(wrapped);
                         if self.scrollback.len() > self.scrollback_limit {
                             self.scrollback.pop_front();
+                            self.scrollback_wrapped.pop_front();
                         }
                     }
                 }
@@ -806,6 +859,7 @@ impl Screen {
                 self.grid_mut().clear_all();
                 if mode == 3 {
                     self.scrollback.clear();
+                    self.scrollback_wrapped.clear();
                 }
             }
             _ => {}
@@ -972,6 +1026,35 @@ mod tests {
         s.feed(b"X"); // triggers pending wrap, prints on next line
         assert_eq!(text_row(&s, 0), "hello");
         assert_eq!(text_row(&s, 1), "X");
+    }
+
+    #[test]
+    fn row_wraps_marks_autowrap_but_not_an_explicit_newline() {
+        let mut s = Screen::new(3, 5);
+        // Fills row 0 exactly, then a further printable byte forces autowrap.
+        s.feed(b"helloX");
+        assert!(s.row_wraps(0));
+        assert!(!s.row_wraps(1));
+
+        // A row filled exactly and then terminated with a real newline
+        // never actually wrapped -- CR clears pending_wrap before it can
+        // fire.
+        let mut s2 = Screen::new(3, 5);
+        s2.feed(b"world\r\nY");
+        assert!(!s2.row_wraps(0));
+        assert_eq!(text_row(&s2, 1), "Y");
+    }
+
+    #[test]
+    fn row_wraps_survives_scrolling_into_scrollback() {
+        let mut s = Screen::new(2, 5);
+        // Row 0: "aaaaa" autowraps into row 1 ("bb"), then an explicit
+        // newline pushes row 0 off into scrollback.
+        s.feed(b"aaaaabb\r\nccc");
+        assert_eq!(s.scrollback.len(), 1);
+        assert!(s.scrollback_wrapped[0]);
+        let sb: String = s.scrollback[0].iter().map(|c| c.ch).collect::<String>().trim_end().to_string();
+        assert_eq!(sb, "aaaaa");
     }
 
     #[test]

@@ -2546,6 +2546,22 @@ impl BisheditBuffer for ScreenBuffer {
     fn get_mark(&self, name: char) -> Option<(usize, usize)> {
         self.marks.get(&name).copied()
     }
+
+    // A real terminal grid, unlike a text file, can autowrap a line that
+    // just ran out of columns -- see vt100::Grid's own `wrapped` field
+    // doc comment. `raw_len`/`raw_char_at` already translate this
+    // combined line index into either a scrollback row or a live grid
+    // row the same way; this just reads the matching wrapped flag
+    // instead of a cell.
+    fn line_wraps(&self, line: usize) -> bool {
+        let s = self.screen.borrow();
+        let sb_len = addressable_scrollback_len(&s);
+        if line < sb_len {
+            s.scrollback_wrapped.get(line).copied().unwrap_or(false)
+        } else {
+            s.row_wraps(line - sb_len)
+        }
+    }
 }
 
 // The one Normal-mode-navigation loop (`run_normal_mode_navigation`)
@@ -2658,6 +2674,13 @@ impl BisheditBuffer for NavBuffer {
         match self {
             NavBuffer::ReadOnly(b) => b.get_mark(name),
             NavBuffer::Editable(b) => b.get_mark(name),
+        }
+    }
+
+    fn line_wraps(&self, line: usize) -> bool {
+        match self {
+            NavBuffer::ReadOnly(b) => b.line_wraps(line),
+            NavBuffer::Editable(b) => b.line_wraps(line),
         }
     }
 }
