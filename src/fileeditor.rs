@@ -624,7 +624,12 @@ pub(crate) fn run_insert_mode(buf: &mut TextBuffer, vk: &mut VimKeys, rect: Rect
     // distinction precisely; this doesn't.
     let mut inserted = String::new();
     loop {
-        let key = match editor::read_key_idle(on_idle)? {
+        // Goes through `vk.next_key` (not a bare `read_key_idle`) so a
+        // macro recorded/replayed from Normal mode -- see its own doc
+        // comment -- still works across a full Insert-mode excursion:
+        // `run_normal_mode_navigation` calls this function inline, with
+        // the same `vk`, so nothing here needs its own bookkeeping.
+        let key = match vk.next_key(|| editor::read_key_idle(on_idle))? {
             Some(k) => k,
             None => {
                 buf.set_mark('^', buf.cursor());
@@ -762,11 +767,15 @@ fn mode_label(vk: &VimKeys, mode: EditorMode) -> &'static str {
 fn status_text(buf: &TextBuffer, vk: &VimKeys, mode: EditorMode, cols: usize) -> String {
     let label = mode_label(vk, mode);
     let pending = vk.pending_display();
+    // "recording @a" while `q{reg}` is active -- mirrors repl.rs's own
+    // `normal_mode_status_left`, the `ScreenBuffer`-backed twin of this
+    // status line.
+    let recording = vk.is_recording().map(|r| format!("recording @{r}  ")).unwrap_or_default();
     let mut left = if !pending.is_empty() {
-        format!("{label} {pending}")
+        format!("{recording}{label} {pending}")
     } else {
         let last = vk.last_motion_display();
-        if !last.is_empty() { format!("{label} [{last}]") } else { label.to_string() }
+        if !last.is_empty() { format!("{recording}{label} [{last}]") } else { format!("{recording}{label}") }
     };
     if buf.is_dirty() {
         left.push_str(" [+]");
@@ -1241,6 +1250,100 @@ mod indent_tests {
         let mut b = buf("    one");
         outdent_selections(&mut b);
         assert_eq!(text_of(&b), "    one");
+    }
+}
+
+#[cfg(test)]
+mod macro_tests {
+    use super::*;
+    use crate::bishedit::vimkeys::KeyOutcome;
+
+    fn rect() -> Rect {
+        Rect { row: 0, col: 0, rows: 24, cols: 80 }
+    }
+
+    fn text_of(buf: &TextBuffer) -> String {
+        (0..buf.line_count()).map(|l| buf.line_chars(l).into_iter().collect::<String>()).collect::<Vec<_>>().join("\n")
+    }
+
+    // Drives one `KeyOutcome` the same way `run_normal_mode_navigation`'s
+    // own big `match vk.feed(key)` does, for exactly the two variants
+    // this test needs -- a motion, or an Insert-mode excursion (which
+    // stays inline via `run_insert_mode`, same `vk` throughout, the
+    // property this test exists to exercise).
+    fn apply(buf: &mut TextBuffer, vk: &mut VimKeys, registers: &mut Registers, outcome: KeyOutcome) {
+        match outcome {
+            KeyOutcome::Motion(m, count) => motion::apply_motion(buf, m, count),
+            KeyOutcome::EnterInsert(cmd) => {
+                resolve_insert_start(buf, cmd);
+                run_insert_mode(buf, vk, rect(), registers, &mut || {}, false).unwrap();
+            }
+            other => panic!("unexpected outcome in this test: {other:?}"),
+        }
+    }
+
+    // A macro whose recorded content spans a real Insert-mode excursion
+    // (`A;<Esc>`) plus a plain motion (`j`) -- built directly via
+    // `record_key` (there's no real terminal to drive `run_insert_mode`'s
+    // own reads live in a test), but *replayed* for real: `@a` below
+    // drives the actual `run_insert_mode` call through `apply`'s
+    // `EnterInsert` arm, and that function's own reads (routed through
+    // `vk.next_key`, same as every other host read site -- see that
+    // method's own doc comment) must be served entirely from the replay
+    // queue for this to produce the right buffer content at all -- if
+    // `run_insert_mode` instead fell through to a real terminal read,
+    // it would see immediate EOF and abandon each excursion after just
+    // the `A`, never inserting the `;`.
+    #[test]
+    fn macro_replay_drives_a_real_insert_mode_excursion() {
+        let mut buf = TextBuffer::new_unnamed(10);
+        buf.insert_text((0, 0), "one\ntwo\nthree");
+        buf.set_cursor(0, 0);
+        let mut vk = VimKeys::new();
+        let mut registers = Registers::new_for_test();
+
+        vk.start_recording('a');
+        for key in [Key::Char('A'), Key::Char(';'), Key::Escape, Key::Char('j')] {
+            vk.record_key(key);
+        }
+        vk.stop_recording();
+
+        // `2@a`: replays the whole recorded sequence (Insert excursion
+        // included) twice in a row, landing on "one" then "two" (cursor
+        // starts on "one"), leaving "three" untouched.
+        assert!(vk.queue_macro_replay('a', 2));
+        while let Some(key) = vk.next_key(|| Ok(None)).unwrap() {
+            let outcome = vk.feed(key);
+            apply(&mut buf, &mut vk, &mut registers, outcome);
+        }
+
+        assert_eq!(text_of(&buf), "one;\ntwo;\nthree");
+    }
+
+    #[test]
+    fn macro_replay_count_repeats_a_pure_motion_macro() {
+        let mut buf = TextBuffer::new_unnamed(10);
+        buf.insert_text((0, 0), "one\ntwo\nthree\nfour");
+        buf.set_cursor(0, 0);
+        let mut vk = VimKeys::new();
+        let mut registers = Registers::new_for_test();
+
+        let mut scripted = std::iter::once(Key::Char('j'));
+        let mut read_live = || -> io::Result<Option<Key>> { Ok(scripted.next()) };
+
+        vk.start_recording('a');
+        let key = vk.next_key(&mut read_live).unwrap().unwrap();
+        let outcome = vk.feed(key);
+        apply(&mut buf, &mut vk, &mut registers, outcome);
+        vk.stop_recording();
+        assert_eq!(buf.cursor(), (1, 0));
+
+        assert!(vk.queue_macro_replay('a', 2));
+        while let Some(key) = vk.next_key(|| Ok(None)).unwrap() {
+            let outcome = vk.feed(key);
+            apply(&mut buf, &mut vk, &mut registers, outcome);
+        }
+        assert_eq!(buf.cursor(), (3, 0));
     }
 }
 

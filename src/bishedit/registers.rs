@@ -1,5 +1,11 @@
-// Vim's register model: named storage that yank/put (and, later, delete/
-// change/macros) read and write. Two deliberate deviations from real vim:
+// Vim's register model: named storage that yank/put/delete/change read and
+// write. Macros (`q`/`@`) ended up *not* living here, despite the name --
+// see `bishedit::vimkeys::VimKeys`'s own `macros`/`recording` fields --
+// since a macro's raw `editor::Key` sequence (arrow keys, Ctrl chords, a
+// mouse event, ...) doesn't round-trip through this module's `String`-only
+// `RegisterValue`, unlike real vim's own registers, which store a
+// recorded macro as literal text. Two further deliberate deviations from
+// real vim:
 //
 // - Registers are pluggable (`RegisterBackend`), not just a HashMap<char,
 //   String>. Today only three backends exist (plain in-memory, black-hole,

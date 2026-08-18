@@ -2797,15 +2797,18 @@ fn normal_mode_status_left(vk: &VimKeys, command_line: Option<&str>) -> String {
     if pending.starts_with('/') || pending.starts_with('?') {
         return pending.to_string();
     }
+    // "recording @a" while `q{reg}` is active, ahead of the mode label --
+    // vim's own recording indicator.
+    let recording = vk.is_recording().map(|r| format!("recording @{r}  ")).unwrap_or_default();
     let label = mode_label(vk);
     if !pending.is_empty() {
-        return format!("{} {}", label, pending);
+        return format!("{}{} {}", recording, label, pending);
     }
     let last = vk.last_motion_display();
     if !last.is_empty() {
-        return format!("{} [{}]", label, last);
+        return format!("{}{} [{}]", recording, label, last);
     }
-    label.to_string()
+    format!("{}{}", recording, label)
 }
 
 fn normal_mode_status_text(buf: &ScreenBuffer, vk: &VimKeys, command_line: Option<&str>, cols: usize) -> String {
@@ -3250,9 +3253,9 @@ fn run_normal_mode_navigation(
     let mut pending_view = PendingView::None;
 
     let result: (NavExit, Option<(TextBuffer, VimKeys)>) = 'nav: loop {
-        let mut key = match editor::read_key_idle(&mut || {
+        let mut key = match vk.next_key(|| editor::read_key_idle(&mut || {
             service_background_jobs(sessions, windows, job_frames, *current_window);
-        })? {
+        }))? {
             Some(k) => k,
             // EOF: nothing sensible to resume into for any start -- for
             // `Edit` specifically, that means dropping the session
@@ -3275,9 +3278,9 @@ fn run_normal_mode_navigation(
                 PendingView::Output if key == Key::CtrlL => {
                     pending_view = PendingView::Transcript;
                     render_command_transcript(&sessions[&session_id].command_transcript, term_rows, term_cols);
-                    key = match editor::read_key_idle(&mut || {
+                    key = match vk.next_key(|| editor::read_key_idle(&mut || {
                         service_background_jobs(sessions, windows, job_frames, *current_window);
-                    })? {
+                    }))? {
                         Some(k) => k,
                         None => {
                             let exit = if matches!(buf, NavBuffer::Editable(_)) { NavExit::Quit } else { NavExit::Detached };
@@ -3455,9 +3458,9 @@ fn run_normal_mode_navigation(
                 commit_active_selection(&vk, &mut buf);
                 let end_cursor = buf.cursor();
                 if let NavBuffer::Editable(tb) = &mut buf
-                    && let Some(Key::Char(ch)) = editor::read_key_idle(&mut || {
+                    && let Some(Key::Char(ch)) = vk.next_key(|| editor::read_key_idle(&mut || {
                         service_background_jobs(sessions, windows, job_frames, *current_window);
-                    })?
+                    }))?
                 {
                     fileeditor::surround_selections(tb, ch);
                 }
@@ -3473,10 +3476,64 @@ fn run_normal_mode_navigation(
                 render_nav_frame(&mut buf, &vk, rect);
                 continue;
             }
-            Key::Char('Z') => {
-                let k2 = editor::read_key_idle(&mut || {
+            // `q`/`@` -- macro record/replay. Host-level, same tier as
+            // every other outer-tier arm here, for the same reason: `@`
+            // needs to re-enter this exact match (Visual `y`/`d`/`Z`/`:`,
+            // and `q`/`@` themselves) for each replayed key, which only
+            // this loop -- not vimkeys.rs's own `feed()` -- can drive
+            // (see `VimKeys::next_key`'s own doc comment). No `matches!
+            // (buf, NavBuffer::Editable(_))` gate the way `d`/`c`/`p`/`S`
+            // have: recording/replaying a pure navigation-and-yank macro
+            // over read-only scrollback is just as meaningful as one that
+            // edits a file. One real gap: `i` from `ReadOnly` exits this
+            // loop entirely (see `KeyOutcome::EnterInsert`'s own arm
+            // below), silently dropping an in-progress recording along
+            // with it -- same as every other piece of `vk` state already
+            // does on that path (`nav_buffer_into_edit_state` returns
+            // `None` for `ReadOnly`).
+            //
+            // Bare `q` while already recording always stops it, full
+            // stop -- checked first so it takes priority over the "start
+            // a new recording" arm below.
+            Key::Char('q') if vk.is_idle() && vk.is_recording().is_some() => {
+                vk.stop_recording();
+                render_nav_frame(&mut buf, &vk, rect);
+                continue;
+            }
+            // `q{reg}`: starts recording. The register-name lookahead
+            // goes through `vk.next_key` too (not a bare `read_key_idle`
+            // like `S`'s delimiter), so a macro whose own recorded body
+            // contains `q{reg}` (recording-within-a-macro) still replays
+            // correctly.
+            Key::Char('q') if vk.is_idle() => {
+                if let Some(Key::Char(ch)) = vk.next_key(|| editor::read_key_idle(&mut || {
                     service_background_jobs(sessions, windows, job_frames, *current_window);
-                })?;
+                }))? && ch.is_ascii_alphabetic()
+                {
+                    vk.start_recording(ch);
+                }
+                render_nav_frame(&mut buf, &vk, rect);
+                continue;
+            }
+            // `@{reg}`/`@@`: replays. `is_idle_except_count` (not
+            // `is_idle`) plus `take_count`: unlike every other arm here,
+            // a count typed in front of `@` is a real repeat count
+            // (`3@a`), not one silently discarded.
+            Key::Char('@') if vk.is_idle_except_count() => {
+                let count = vk.take_count().unwrap_or(1).max(1);
+                if let Some(Key::Char(ch)) = vk.next_key(|| editor::read_key_idle(&mut || {
+                    service_background_jobs(sessions, windows, job_frames, *current_window);
+                }))? && (ch == '@' || ch.is_ascii_lowercase())
+                {
+                    vk.queue_macro_replay(ch, count);
+                }
+                render_nav_frame(&mut buf, &vk, rect);
+                continue;
+            }
+            Key::Char('Z') => {
+                let k2 = vk.next_key(|| editor::read_key_idle(&mut || {
+                    service_background_jobs(sessions, windows, job_frames, *current_window);
+                }))?;
                 if k2 != Some(Key::Char('Z')) {
                     continue;
                 }

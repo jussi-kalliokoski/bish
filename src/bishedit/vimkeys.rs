@@ -1,9 +1,14 @@
 // Translates a sequence of editor::Key events into bishedit::motion::Motion
 // values. This layer knows vim's specific bindings and owns the state a
 // single keypress can't (an accumulating count, a pending g/f/F/t/T/m/`/'
-// prefix awaiting one more character, an in-progress search string) -- but
-// it never touches a Buffer or a terminal. Motions themselves are applied
-// by the caller via bishedit::motion::apply_motion.
+// prefix awaiting one more character, an in-progress search string, a
+// macro recording/replay queue -- see `next_key`'s own doc comment) -- but
+// it never touches a Buffer, and only ever reaches a terminal through a
+// caller-supplied read callback (`next_key`), never directly. Motions
+// themselves are applied by the caller via bishedit::motion::apply_motion.
+
+use std::collections::{HashMap, VecDeque};
+use std::io;
 
 use crate::editor::Key;
 use super::motion::{Motion, TextObjectKind};
@@ -587,6 +592,14 @@ pub struct VimKeys {
     // new page after going back does.
     jump_back: Vec<(usize, usize)>,
     jump_forward: Vec<(usize, usize)>,
+    // `q{a-z}`/`qA-Z`/bare `q`/`@{a-z}`/`@@` -- see `next_key`'s own doc
+    // comment for how these four fields work together. Always keyed (and
+    // recorded) by the lowercase letter -- `qA` appends onto the same
+    // slot `qa`/`@a` already use, matching vim's own convention.
+    macros: HashMap<char, Vec<Key>>,
+    recording: Option<(char, Vec<Key>)>,
+    replay_queue: VecDeque<Key>,
+    last_macro_register: Option<char>,
 }
 
 impl VimKeys {
@@ -607,6 +620,10 @@ impl VimKeys {
             jump_forward: Vec::new(),
             current_input: String::new(),
             last_completed: String::new(),
+            macros: HashMap::new(),
+            recording: None,
+            replay_queue: VecDeque::new(),
+            last_macro_register: None,
         }
     }
 
@@ -736,6 +753,115 @@ impl VimKeys {
     /// stolen instead of reaching its own sub-prefix handler.
     pub fn is_idle(&self) -> bool {
         matches!(self.pending, Pending::None) && self.count.is_none() && self.active_operator.is_none()
+    }
+
+    /// `is_idle`, minus the count check -- `@`'s own gate. Unlike the
+    /// `is_idle()`-gated commands (`Z`/`S`/...), which silently discard a
+    /// count typed in front of them, `[count]@a` is a real repeat count
+    /// (see `take_count`), so `@` needs to still be recognized while one
+    /// is buffered.
+    pub fn is_idle_except_count(&self) -> bool {
+        matches!(self.pending, Pending::None) && self.active_operator.is_none()
+    }
+
+    /// Takes (consuming) whatever count had accumulated, if any -- `@`'s
+    /// own counterpart to `take_pending_register`, for a caller
+    /// intercepting a key ahead of `feed()` the same way (see
+    /// `is_idle_except_count`'s own doc comment).
+    pub fn take_count(&mut self) -> Option<usize> {
+        self.count.take()
+    }
+
+    /// Whether a `q{reg}`/`qA-Z` recording is currently in progress, and
+    /// which register (always lowercase) it's recording into.
+    pub fn is_recording(&self) -> Option<char> {
+        self.recording.as_ref().map(|(reg, _)| *reg)
+    }
+
+    /// `q{reg}`: starts recording into `reg` (lowercased). An uppercase
+    /// `reg` seeds the recording with whatever that lowercase register
+    /// already held, so the new keys land after it rather than replacing
+    /// it -- vim's own append convention. A `start_recording` call while
+    /// already recording (shouldn't happen -- the host only calls this
+    /// when `is_recording()` was already `None`) just restarts cleanly
+    /// rather than nesting, since there's no sensible way to record two
+    /// registers from the same keystream at once.
+    pub fn start_recording(&mut self, reg: char) {
+        let lower = reg.to_ascii_lowercase();
+        let seed = if reg.is_ascii_uppercase() { self.macros.get(&lower).cloned().unwrap_or_default() } else { Vec::new() };
+        self.recording = Some((lower, seed));
+    }
+
+    /// Bare `q` while recording: stops it, saving whatever was captured
+    /// (the stop key itself is never included -- the host never calls
+    /// `record_key` for it, see `next_key`'s own doc comment). A no-op if
+    /// nothing was recording.
+    pub fn stop_recording(&mut self) {
+        if let Some((reg, keys)) = self.recording.take() {
+            self.macros.insert(reg, keys);
+        }
+    }
+
+    /// Appends `key` to the in-progress recording, if any. Called by
+    /// `next_key` for every key it actually reads from the terminal --
+    /// never for one served from `replay_queue`, and never for the `q`
+    /// that stops a recording (the host consumes that one itself before
+    /// it ever reaches here). `pub(crate)` rather than private: a test
+    /// wanting to seed a macro's exact content without a real terminal to
+    /// read from (`fileeditor.rs`'s own macro_tests, driving a real
+    /// `run_insert_mode` call) calls this directly instead of routing
+    /// through `next_key`'s own real-read fallback.
+    pub(crate) fn record_key(&mut self, key: Key) {
+        if let Some((_, keys)) = &mut self.recording {
+            keys.push(key);
+        }
+    }
+
+    /// `@{reg}`/`@@`: queues `reg`'s recorded keys (repeated `count`
+    /// times) to be replayed via `next_key`, ahead of anything already
+    /// queued -- so a macro invoked from *within* another macro's own
+    /// replay plays out immediately, before the outer macro's remaining
+    /// keys. `reg == '@'` means "whatever `@` last targeted" (`@@`);
+    /// anything else becomes the new such target. Returns `false` (and
+    /// queues nothing) if `reg` doesn't resolve to a real, non-empty
+    /// register -- `@@` with nothing recorded yet, or `@x` for a letter
+    /// never recorded into -- matching this codebase's existing "quietly
+    /// no-op an invalid sequence" convention (e.g. a failed `f`) rather
+    /// than surfacing an error.
+    pub fn queue_macro_replay(&mut self, reg: char, count: usize) -> bool {
+        let target = if reg == '@' { self.last_macro_register } else { Some(reg.to_ascii_lowercase()) };
+        let Some(target) = target else { return false };
+        let Some(keys) = self.macros.get(&target).filter(|k| !k.is_empty()) else { return false };
+        self.last_macro_register = Some(target);
+        for _ in 0..count.max(1) {
+            for key in keys.iter().rev() {
+                self.replay_queue.push_front(*key);
+            }
+        }
+        true
+    }
+
+    /// The one seam every host-level key read goes through (the main
+    /// per-iteration read, every lookahead read like `S`'s delimiter or
+    /// `Z`'s second `Z`, and `fileeditor::run_insert_mode`'s own read) --
+    /// what makes macro recording/replay work without either host loop
+    /// needing its own bespoke bookkeeping. Serves a queued replay key
+    /// first, if any (`queue_macro_replay` populated it) -- a replayed
+    /// key is never re-recorded, since it's already part of whatever
+    /// produced it (this is also what keeps a macro that itself invokes
+    /// another, e.g. `@b` typed while recording `a`, correct: the two
+    /// *literal* keystrokes `@`/`b` that triggered it get recorded into
+    /// `a`, not `b`'s own expansion). Otherwise calls `read` (a real
+    /// terminal read) and records whatever it returns.
+    pub fn next_key(&mut self, mut read: impl FnMut() -> io::Result<Option<Key>>) -> io::Result<Option<Key>> {
+        if let Some(key) = self.replay_queue.pop_front() {
+            return Ok(Some(key));
+        }
+        let key = read()?;
+        if let Some(key) = key {
+            self.record_key(key);
+        }
+        Ok(key)
     }
 
     pub fn feed(&mut self, key: Key) -> KeyOutcome {
@@ -3196,5 +3322,124 @@ mod tests {
         let keys = [Key::Char('"'), Key::Char('a'), Key::Char('y'), Key::Char('s'), Key::Char('s'), Key::Char(')')];
         assert_eq!(last(&mut vk, &keys), KeyOutcome::AddSurround { target: SurroundTarget::Line(None), ch: ')' });
         assert_eq!(vk.take_pending_register(), None);
+    }
+
+    #[test]
+    fn start_stop_recording_round_trips_through_macros() {
+        let mut vk = VimKeys::new();
+        assert_eq!(vk.is_recording(), None);
+        vk.start_recording('a');
+        assert_eq!(vk.is_recording(), Some('a'));
+        vk.record_key(Key::Char('j'));
+        vk.record_key(Key::Char('k'));
+        vk.stop_recording();
+        assert_eq!(vk.is_recording(), None);
+        // Nothing to replay it with yet at this layer (queue_macro_replay
+        // is exercised separately below) -- this just confirms the
+        // recorded keys actually landed in `macros`.
+        assert!(vk.queue_macro_replay('a', 1));
+        assert_eq!(vk.next_key(|| Ok(None)).unwrap(), Some(Key::Char('j')));
+        assert_eq!(vk.next_key(|| Ok(None)).unwrap(), Some(Key::Char('k')));
+    }
+
+    #[test]
+    fn uppercase_register_appends_to_the_existing_macro() {
+        let mut vk = VimKeys::new();
+        vk.start_recording('a');
+        vk.record_key(Key::Char('x'));
+        vk.stop_recording();
+        vk.start_recording('A');
+        vk.record_key(Key::Char('y'));
+        vk.stop_recording();
+        assert!(vk.queue_macro_replay('a', 1));
+        assert_eq!(vk.next_key(|| Ok(None)).unwrap(), Some(Key::Char('x')));
+        assert_eq!(vk.next_key(|| Ok(None)).unwrap(), Some(Key::Char('y')));
+        assert_eq!(vk.next_key(|| Ok(None)).unwrap(), None);
+    }
+
+    #[test]
+    fn queue_macro_replay_repeats_count_times_and_supports_at_at() {
+        let mut vk = VimKeys::new();
+        vk.start_recording('a');
+        vk.record_key(Key::Char('x'));
+        vk.stop_recording();
+        assert!(vk.queue_macro_replay('a', 3));
+        for _ in 0..3 {
+            assert_eq!(vk.next_key(|| Ok(None)).unwrap(), Some(Key::Char('x')));
+        }
+        assert_eq!(vk.next_key(|| Ok(None)).unwrap(), None);
+        // `@@` replays whatever `@` last targeted.
+        assert!(vk.queue_macro_replay('@', 1));
+        assert_eq!(vk.next_key(|| Ok(None)).unwrap(), Some(Key::Char('x')));
+    }
+
+    #[test]
+    fn queue_macro_replay_is_a_no_op_for_an_empty_or_unset_register() {
+        let mut vk = VimKeys::new();
+        assert!(!vk.queue_macro_replay('z', 1)); // never recorded
+        assert!(!vk.queue_macro_replay('@', 1)); // @@ with nothing yet
+        vk.start_recording('a');
+        vk.stop_recording(); // recorded, but empty
+        assert!(!vk.queue_macro_replay('a', 1));
+    }
+
+    #[test]
+    fn next_key_serves_the_replay_queue_before_a_real_read_and_never_records_it() {
+        let mut vk = VimKeys::new();
+        vk.start_recording('a');
+        vk.record_key(Key::Char('x'));
+        vk.stop_recording();
+        assert!(vk.queue_macro_replay('a', 1));
+
+        // Recording a *second* macro while the first's replay is queued:
+        // the replayed 'x' must not land in this new recording, only a
+        // real read would.
+        vk.start_recording('b');
+        assert_eq!(vk.next_key(|| Ok(Some(Key::Char('Q')))).unwrap(), Some(Key::Char('x')));
+        vk.stop_recording();
+        assert!(!vk.queue_macro_replay('b', 1)); // nothing real was ever read while 'b' recorded
+
+        assert_eq!(vk.next_key(|| Ok(Some(Key::Char('Q')))).unwrap(), Some(Key::Char('Q')));
+    }
+
+    #[test]
+    fn next_key_records_a_nested_macro_invocation_literally_not_its_expansion() {
+        // Recording 'a' as: type '@', type 'b' (replays 'b', literally
+        // just those two keystrokes recorded into 'a' -- not whatever
+        // 'b' itself expands to, matching real vim).
+        let mut vk = VimKeys::new();
+        vk.start_recording('b');
+        vk.record_key(Key::Char('z'));
+        vk.stop_recording();
+
+        vk.start_recording('a');
+        vk.record_key(Key::Char('@'));
+        vk.record_key(Key::Char('b'));
+        assert!(vk.queue_macro_replay('b', 1));
+        // Draining 'b's expansion here must not touch 'a's recording.
+        assert_eq!(vk.next_key(|| Ok(None)).unwrap(), Some(Key::Char('z')));
+        vk.stop_recording();
+
+        assert!(vk.queue_macro_replay('a', 1));
+        assert_eq!(vk.next_key(|| Ok(None)).unwrap(), Some(Key::Char('@')));
+        assert_eq!(vk.next_key(|| Ok(None)).unwrap(), Some(Key::Char('b')));
+    }
+
+    #[test]
+    fn is_idle_except_count_ignores_count_but_not_pending_or_operator() {
+        let mut vk = VimKeys::new();
+        assert!(vk.is_idle_except_count());
+        vk.feed(Key::Char('3'));
+        assert!(vk.is_idle_except_count());
+        assert_eq!(vk.take_count(), Some(3));
+        assert_eq!(vk.take_count(), None);
+
+        let mut vk = VimKeys::new();
+        vk.feed(Key::Char('f')); // mid a sub-prefix
+        assert!(!vk.is_idle_except_count());
+
+        let mut vk = VimKeys::new();
+        vk.feed(Key::Char('d')); // armed operator
+        assert!(!vk.is_idle_except_count());
     }
 }
