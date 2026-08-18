@@ -124,6 +124,18 @@ pub struct MouseEvent {
     pub pressed: bool,
 }
 
+impl MouseEvent {
+    // A genuine left-button press -- not a drag (bit 5, set while a
+    // button is held during motion), not a wheel event (bit 6), not some
+    // other button (bits 0-1 != 0), and not a release (`pressed ==
+    // false`, final byte 'm'). The only gesture this codebase treats as
+    // "a click" so far -- see this method's own call sites for why
+    // everything else it decodes is deliberately left alone for now.
+    pub fn is_left_click(&self) -> bool {
+        self.pressed && self.button & 0x60 == 0 && self.button & 0x03 == 0
+    }
+}
+
 // How long to wait for further bytes after a lone Esc before deciding it
 // really is a standalone Esc keypress rather than the start of a sequence.
 // Real escape sequences arrive as a fast burst from the terminal; a human
@@ -1037,6 +1049,19 @@ pub enum ReadOutcome {
     // *original* cursor (not wherever normal mode's own navigation cursor
     // wanders off to -- see run_normal_mode_navigation's own doc comment).
     NormalMode { text: String, cursor: usize },
+    // A qualifying left click (see MouseEvent::is_left_click) anywhere
+    // during ordinary typing. Bubbled up the same way NormalMode is --
+    // read_line has no idea `windows`/panes exist at all, only its own
+    // pane's col_origin/width, so hit-testing which tab/pane the click
+    // actually landed on is entirely the caller's job (repl.rs's own
+    // hit_test_click). `text`/`cursor` are `ed.as_string()`/`ed.cursor`
+    // at the moment of the click, same reasoning as NormalMode's own
+    // fields: whatever was typed so far must not be silently discarded,
+    // even though (unlike NormalMode) resuming into the *same* buffer
+    // isn't generally what happens next -- see this outcome's own repl.rs
+    // handler for why a genuine focus change instead freezes this text
+    // into the losing pane's own grid.
+    Mouse { event: MouseEvent, text: String, cursor: usize },
     // Ctrl-L, but only when the caller opted in via `ctrl_l_reports` (see
     // that parameter's own doc comment) -- command mode's own toggle for
     // showing its whole command+output transcript. Whatever was typed so
@@ -1139,7 +1164,7 @@ pub fn read_line(
     registers: &mut Registers,
     mut on_idle: impl FnMut(),
 ) -> io::Result<ReadOutcome> {
-    let mut guard = Some(term::RawGuard::enable(0)?);
+    let mut guard = Some(term::RawGuard::enable_with_mouse(0)?);
     let mut ed = match initial {
         Some((text, cursor)) => {
             let mut e = LineEditor::new();
@@ -1278,7 +1303,7 @@ pub fn read_line(
                 // raw mode and redraw once we're resumed.
                 drop(guard.take());
                 term::suspend_self();
-                guard = Some(term::RawGuard::enable(0)?);
+                guard = Some(term::RawGuard::enable_with_mouse(0)?);
             }
             Key::Backspace => {
                 // esc_cancels is only ever set for a command-mode
@@ -1484,6 +1509,14 @@ pub fn read_line(
             // own doc comment) -- Normal mode's own `Ctrl-A`/`Ctrl-X`
             // (number increment/decrement) is reached via Ctrl-E's own
             // vim excursion, same as every other Normal-mode-only key.
+            // See ReadOutcome::Mouse's own doc comment. Non-qualifying
+            // mouse events (drags, releases, wheel, other buttons) fall
+            // through to the catch-all just below, exactly as before --
+            // safely decoded, silently ignored.
+            Key::Mouse(ev) if ev.is_left_click() => {
+                drop(guard.take());
+                return Ok(ReadOutcome::Mouse { event: ev, text: ed.as_string(), cursor: ed.cursor });
+            }
             Key::AltLeft | Key::AltRight | Key::AltUp | Key::CtrlY | Key::CtrlX | Key::Mouse(_) | Key::Unknown => {}
         }
         // Recomputed fresh every iteration -- see compute_suggestion's

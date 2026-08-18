@@ -603,6 +603,41 @@ pub fn run(mut shell: Shell) {
                     compositor_redraw(&sessions, &windows, current_window, term_rows, term_cols);
                 }
             }
+            // A qualifying left click while typing at the plain prompt --
+            // see ReadOutcome::Mouse's own doc comment for why read_line
+            // hands this straight back up rather than acting on it
+            // itself. Nothing to click on before the first promotion
+            // (see ensure_promoted's own doc comment: no tab bar, no
+            // multi-pane layout, just this one pane's whole own row) --
+            // and a miss, or a click on the already-focused tab/pane,
+            // both just resume typing exactly where it left off via
+            // `pending_initial`, the same resume mechanism NormalMode's
+            // own NavExit::Resume handling already uses below. A genuine
+            // target change freezes this session's own in-progress text
+            // into its grid first (freeze_input_with_text, not the plain
+            // freeze_focused_idle_prompt -- SessionState.buffer never
+            // mirrors read_line's own in-progress keystrokes) before
+            // switching, so nothing typed so far is lost; the *next*
+            // loop iteration's own read_line call then starts fresh for
+            // whatever session is now focused, not resuming this text
+            // there (switching panes/tabs must never relocate what was
+            // being typed into a different pane's own prompt).
+            Ok(ReadOutcome::Mouse { event, text, cursor }) => {
+                let target = if sinks_are_grid { hit_test_click(event, &sessions, &windows, current_window, term_rows, term_cols) } else { None };
+                match target {
+                    Some(ClickTarget::Window(idx)) if idx != current_window => {
+                        freeze_input_with_text(sessions.get_mut(&session_id).unwrap(), &text);
+                        current_window = idx;
+                        compositor_redraw(&sessions, &windows, current_window, term_rows, term_cols);
+                    }
+                    Some(ClickTarget::Pane(pane_id)) if pane_id != windows[current_window].focused_pane => {
+                        freeze_input_with_text(sessions.get_mut(&session_id).unwrap(), &text);
+                        windows[current_window].focused_pane = pane_id;
+                        compositor_redraw(&sessions, &windows, current_window, term_rows, term_cols);
+                    }
+                    _ => pending_initial = Some((text, cursor)),
+                }
+            }
             Ok(ReadOutcome::Interrupted) => {
                 // Ctrl-C abandons whatever multi-line construct was
                 // pending, same as bash, and starts fresh at a new prompt.
@@ -1605,9 +1640,6 @@ enum FgOutcome {
     Stopped,
 }
 
-const MOUSE_REPORTING_ENABLE: &str = "\x1b[?1000h\x1b[?1002h\x1b[?1006h";
-const MOUSE_REPORTING_DISABLE: &str = "\x1b[?1006l\x1b[?1002l\x1b[?1000l";
-
 const BRACKETED_PASTE_ENABLE: &str = "\x1b[?2004h";
 const BRACKETED_PASTE_DISABLE: &str = "\x1b[?2004l";
 
@@ -1631,7 +1663,7 @@ fn sync_mouse_reporting(enabled: &mut bool, screen: &Rc<RefCell<vt100::Screen>>)
     if wants == *enabled {
         return;
     }
-    print!("{}", if wants { MOUSE_REPORTING_ENABLE } else { MOUSE_REPORTING_DISABLE });
+    print!("{}", if wants { term::MOUSE_REPORTING_ENABLE } else { term::MOUSE_REPORTING_DISABLE });
     let _ = io::stdout().flush();
     *enabled = wants;
 }
@@ -1837,7 +1869,7 @@ fn drive_fg_job(job: &mut exec::FgJob, screen: &Rc<RefCell<vt100::Screen>>, mut 
     // normal-mode navigation, .... Harmless (and cheap) to send even if
     // it was never actually turned on.
     if mouse_enabled {
-        print!("{MOUSE_REPORTING_DISABLE}");
+        print!("{}", term::MOUSE_REPORTING_DISABLE);
         let _ = io::stdout().flush();
     }
     // Same unconditional cleanup, and for the same reason: bish's own
@@ -3185,7 +3217,7 @@ fn run_normal_mode_navigation(
         NavStart::Edit(tb, vk0) => (NavBuffer::Editable(tb), *vk0),
     };
 
-    let _guard = term::RawGuard::enable(0)?;
+    let _guard = term::RawGuard::enable_with_mouse(0)?;
     // Repaints the whole screen first -- necessary the very first time
     // normal mode ever triggers promotion (the alternate screen buffer
     // starts out blank), harmless otherwise -- then this pane's own
@@ -3237,6 +3269,47 @@ fn run_normal_mode_navigation(
                     break;
                 }
             }
+        }
+
+        // A qualifying left click (see MouseEvent::is_left_click),
+        // intercepted before vk.feed ever sees it -- mouse clicks are an
+        // orthogonal input channel to vim's own key-state-machine, same
+        // spirit as PendingView's own resolution just above. A genuine
+        // focus change exits normal mode (NavExit::Detached) exactly like
+        // the existing KeyOutcome::Window arm below already does for
+        // Ctrl-W chords -- see its own doc comment: "running one always
+        // exits normal mode too... jumps to the next window and drops
+        // straight into its live prompt, not back into this pane's own
+        // normal mode." A same-window pane-focus change via Ctrl-W h/j/
+        // k/l already detaches today, so a same-window pane click doing
+        // the same is consistent, not a new limitation. A miss, a click
+        // on the already-focused tab/pane, or a non-qualifying mouse
+        // event (drag/release/wheel/other button) is just a no-op --
+        // re-render (in case a PendingView overlay was just cleared
+        // above) and keep navigating.
+        if let Key::Mouse(ev) = key {
+            if ev.is_left_click() {
+                match hit_test_click(ev, sessions, windows, *current_window, term_rows, term_cols) {
+                    Some(ClickTarget::Window(idx)) if idx != *current_window => {
+                        freeze_focused_idle_prompt(sessions, windows, *current_window);
+                        *current_window = idx;
+                        compositor_redraw(sessions, windows, *current_window, term_rows, term_cols);
+                        return Ok((NavExit::Detached, nav_buffer_into_edit_state(buf, vk)));
+                    }
+                    Some(ClickTarget::Pane(pane_id)) if pane_id != windows[*current_window].focused_pane => {
+                        if matches!(windows[*current_window].stack().last(), Some(Frame::Session(_))) {
+                            let sid = windows[*current_window].owning_session();
+                            freeze_idle_prompt(sessions.get_mut(&sid).unwrap());
+                        }
+                        windows[*current_window].focused_pane = pane_id;
+                        compositor_redraw(sessions, windows, *current_window, term_rows, term_cols);
+                        return Ok((NavExit::Detached, nav_buffer_into_edit_state(buf, vk)));
+                    }
+                    _ => {}
+                }
+            }
+            render_nav_frame(&mut buf, &vk, rect);
+            continue 'nav;
         }
 
         match key {
@@ -3797,16 +3870,83 @@ fn tab_bar_line(sessions: &HashMap<SessionId, SessionState>, windows: &[WindowEn
     render_tab_bar(&tab_bar_snapshot(sessions, windows, current_window))
 }
 
+// The visible text of one tab's own segment -- shared by render_tab_bar
+// and tab_bar_regions so the rendered tab bar and its hit-test column
+// ranges (see hit_test_click) can never drift apart from each other.
+fn tab_segment_text(id: u32, cwd: &str) -> String {
+    format!(" [{}] {} ", id, cwd)
+}
+
 fn render_tab_bar(snapshot: &[(u32, bool, String)]) -> String {
     let mut line = String::new();
     for (id, current, cwd) in snapshot {
+        let seg = tab_segment_text(*id, cwd);
         if *current {
-            line.push_str(&format!("\x1b[7m [{}] {} \x1b[0m ", id, cwd));
+            line.push_str("\x1b[7m");
+            line.push_str(&seg);
+            line.push_str("\x1b[0m");
         } else {
-            line.push_str(&format!(" [{}] {} ", id, cwd));
+            line.push_str(&seg);
         }
     }
     line
+}
+
+// (window_id, start_col, end_col), 0-indexed and half-open, in
+// tab_bar_snapshot's own order -- for hit-testing a tab-bar click (see
+// hit_test_click) against exactly the same segment widths render_tab_bar
+// just drew, via the shared tab_segment_text helper.
+fn tab_bar_regions(snapshot: &[(u32, bool, String)]) -> Vec<(u32, usize, usize)> {
+    let mut col = 0;
+    snapshot
+        .iter()
+        .map(|(id, _, cwd)| {
+            let start = col;
+            col += tab_segment_text(*id, cwd).chars().count();
+            (*id, start, col)
+        })
+        .collect()
+}
+
+// Where a qualifying left click (see MouseEvent::is_left_click) landed:
+// the tab bar (an absolute index into `windows`, mirroring
+// dispatch_window_cmd's own GotoFirstWindow/GotoLastWindow -- there's no
+// WindowAction variant for an arbitrary-index jump either) or a pane
+// within the current window. `None` (not a variant here) covers a miss
+// -- landing on a divider strip, or off both areas entirely.
+enum ClickTarget {
+    Window(usize),
+    Pane(PaneId),
+}
+
+// Hit-tests a click's screen coordinates against the tab bar (if any),
+// then the current window's own pane layout -- shared by both places a
+// click can be acted on (repl::run's plain-prompt loop, and
+// run_normal_mode_navigation's own loop), so the two can't disagree on
+// what a given click means. `ev.row`/`ev.col` are 1-indexed (the
+// terminal's own convention -- see MouseEvent's own doc comment); `Rect`/
+// the tab bar's own row are 0-indexed, hence the -1 conversions below.
+fn hit_test_click(
+    ev: editor::MouseEvent,
+    sessions: &HashMap<SessionId, SessionState>,
+    windows: &[WindowEntry],
+    current_window: usize,
+    term_rows: usize,
+    term_cols: usize,
+) -> Option<ClickTarget> {
+    let row0 = (ev.row as usize).saturating_sub(1);
+    let col0 = (ev.col as usize).saturating_sub(1);
+    if row0 == term_rows.saturating_sub(1) {
+        let regions = tab_bar_regions(&tab_bar_snapshot(sessions, windows, current_window));
+        let (id, _, _) = regions.into_iter().find(|(_, start, end)| col0 >= *start && col0 < *end)?;
+        return Some(ClickTarget::Window(windows.iter().position(|w| w.id == id)?));
+    }
+    let area = Rect { row: 0, col: 0, rows: content_rows(term_rows), cols: term_cols };
+    let mut regions = Vec::new();
+    let mut dividers = Vec::new();
+    compute_regions(&windows[current_window].layout, area, &mut regions, &mut dividers);
+    let (pane_id, _) = regions.into_iter().find(|(_, r)| row0 >= r.row && row0 < r.row + r.rows && col0 >= r.col && col0 < r.col + r.cols)?;
+    Some(ClickTarget::Pane(pane_id))
 }
 
 // Records a new "current" directory in this session's back/forward
@@ -4182,6 +4322,15 @@ fn run_command_mode(
             // right where it was -- the same "don't lose in-progress
             // typing" guarantee every other caller of this gets.
             Ok(ReadOutcome::NormalMode { text, cursor }) => {
+                pending_initial = Some((text, cursor));
+            }
+            // Same reasoning as NormalMode just above: click-to-focus
+            // isn't a thing while editing a command-mode colon-line
+            // (you're not looking at any particular pane's content right
+            // now to click on), so just preserve whatever was typed and
+            // keep this same prompt going rather than acting on the
+            // click's own target.
+            Ok(ReadOutcome::Mouse { text, cursor, .. }) => {
                 pending_initial = Some((text, cursor));
             }
             Ok(ReadOutcome::CtrlL) => {

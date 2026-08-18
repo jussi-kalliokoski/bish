@@ -2,7 +2,7 @@
 // layout (no libc crate -- this project stays dependency-free). Shared by
 // the interactive line editor (editor.rs) and, eventually, `read -s`.
 
-use std::io;
+use std::io::{self, Write};
 
 // Matches glibc's `struct termios` (bits/termios.h) on Linux x86_64 field
 // for field; repr(C) then reproduces the same padding/alignment a C
@@ -115,6 +115,16 @@ pub fn suspend_self() {
     }
 }
 
+// Real-terminal mouse reporting (SGR extended coordinates, mode 1006,
+// plus button-event/drag tracking, mode 1002): the single shared source
+// of truth for both `RawGuard::enable_with_mouse` (bish's own UI reading
+// keys directly) and repl.rs's `sync_mouse_reporting` (mirroring a
+// foreground job's own DECSET request instead -- see that function's own
+// doc comment for why it can't just use `RawGuard` itself: it needs to
+// track ON/OFF independently of any raw-mode guard's own lifetime).
+pub const MOUSE_REPORTING_ENABLE: &str = "\x1b[?1000h\x1b[?1002h\x1b[?1006h";
+pub const MOUSE_REPORTING_DISABLE: &str = "\x1b[?1006l\x1b[?1002l\x1b[?1000l";
+
 // RAII guard: puts fd (almost always 0/stdin) into raw mode on construction,
 // restores the terminal's prior settings on drop. Raw mode here means no
 // line buffering (ICANON off), no local echo (we draw the line ourselves),
@@ -125,10 +135,33 @@ pub fn suspend_self() {
 pub struct RawGuard {
     fd: i32,
     saved: Termios,
+    // Whether this guard also turned on real mouse reporting (see
+    // `enable_with_mouse`) and so owes turning it back off on drop.
+    // `enable`'s plain callers (drive_fg_job, which manages mouse
+    // reporting itself gated on a job's own request; query_cursor_column,
+    // a microsecond DSR query with nothing to click on) leave this false.
+    mouse: bool,
 }
 
 impl RawGuard {
     pub fn enable(fd: i32) -> io::Result<RawGuard> {
+        Self::enable_impl(fd, false)
+    }
+
+    // Same as `enable`, but also puts the real terminal into mouse-report
+    // mode -- for the handful of call sites that are bish's own UI
+    // reading keys directly (read_line, run_normal_mode_navigation), as
+    // opposed to raw mode acquired for some other reason. Never held
+    // globally (see this codebase's own "raw mode is acquired
+    // independently, per call" convention) -- each such call site gets
+    // its own guard, and Drop below unwinds mouse reporting right along
+    // with the termios restore, so every one of read_line's several exit
+    // paths (Eof, Enter, Ctrl-C, Ctrl-D, Ctrl-Z, ...) gets this for free.
+    pub fn enable_with_mouse(fd: i32) -> io::Result<RawGuard> {
+        Self::enable_impl(fd, true)
+    }
+
+    fn enable_impl(fd: i32, mouse: bool) -> io::Result<RawGuard> {
         let mut saved: Termios = unsafe { std::mem::zeroed() };
         if unsafe { tcgetattr(fd, &mut saved) } != 0 {
             return Err(io::Error::last_os_error());
@@ -144,12 +177,20 @@ impl RawGuard {
         if unsafe { tcsetattr(fd, TCSANOW, &raw) } != 0 {
             return Err(io::Error::last_os_error());
         }
-        Ok(RawGuard { fd, saved })
+        if mouse {
+            print!("{MOUSE_REPORTING_ENABLE}");
+            let _ = io::stdout().flush();
+        }
+        Ok(RawGuard { fd, saved, mouse })
     }
 }
 
 impl Drop for RawGuard {
     fn drop(&mut self) {
+        if self.mouse {
+            print!("{MOUSE_REPORTING_DISABLE}");
+            let _ = io::stdout().flush();
+        }
         unsafe {
             tcsetattr(self.fd, TCSANOW, &self.saved);
         }
