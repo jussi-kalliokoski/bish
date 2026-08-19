@@ -1011,6 +1011,44 @@ pub(crate) fn diagnose_buffer(buf: &TextBuffer) -> Vec<lint::Diagnostic> {
     linters.iter().flat_map(|l| l.check(&text)).collect()
 }
 
+// A `Diagnostic`'s own flat char offset (into `buffer_text`'s joined
+// string -- the same addressing `lint::Diagnostic`/`Fix` use throughout)
+// translated into this buffer's real `(line, col)`, via the same
+// `line_starts` prefix-sum table `diagnostic_spans_for_line`'s own
+// underline rendering already builds fresh per redraw. Used by the
+// diagnostics pane (repl.rs) to jump the cursor to a selected problem,
+// and by `apply_fix` below to know where to splice its replacement.
+pub(crate) fn diagnostic_position(buf: &TextBuffer, offset: usize) -> (usize, usize) {
+    let starts = line_starts(buf);
+    let line = match starts.binary_search(&offset) {
+        Ok(l) => l,
+        Err(l) => l.saturating_sub(1),
+    };
+    let line = line.min(buf.line_count().saturating_sub(1));
+    let col = offset.saturating_sub(starts[line]).min(buf.line_len(line));
+    (line, col)
+}
+
+// Splices `diagnostic`'s own `Fix` (if it has one) into `buf` --
+// `false`, no-op, if it doesn't. The same two primitives `tool.rs`'s own
+// CLI-only `apply_fixes` (a whole sorted batch, working on a raw
+// string) uses conceptually, just against a real `TextBuffer` and for
+// exactly one diagnostic: `delete_range` already clears `buf.
+// diagnostics` as part of any real edit (same rule any other change
+// obeys), so the caller re-running `diagnose_buffer` afterward is what
+// actually produces a fresh, correctly-offset list -- patching the old
+// one in place isn't worth the risk once a splice has shifted
+// everything after it.
+pub(crate) fn apply_fix(buf: &mut TextBuffer, diagnostic: &lint::Diagnostic) -> bool {
+    let Some(fix) = &diagnostic.fix else { return false };
+    let from = diagnostic_position(buf, fix.start);
+    let to = diagnostic_position(buf, fix.end);
+    let range = motion::MotionRange { shape: motion::MotionShape::Exclusive, from, to };
+    buf.delete_range(&range);
+    buf.insert_text(from, &fix.replacement);
+    true
+}
+
 // Color/attrs for one diagnostic's own underline -- mirrors highlight::
 // default_style's shape exactly (severity in, presentation out), kept as
 // its own small function for the same reason that one is: Severity only
@@ -1395,5 +1433,42 @@ mod diagnose_tests {
         assert!(!buf.diagnostics.is_empty());
         buf.insert_text((0, 0), "x");
         assert!(buf.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn diagnostic_position_maps_a_flat_offset_to_line_and_column() {
+        let mut buf = TextBuffer::new_unnamed(10);
+        buf.insert_text((0, 0), "abc\ndefgh\nij");
+        assert_eq!(diagnostic_position(&buf, 0), (0, 0));
+        assert_eq!(diagnostic_position(&buf, 3), (0, 3)); // end of "abc"
+        assert_eq!(diagnostic_position(&buf, 4), (1, 0)); // 'd'
+        assert_eq!(diagnostic_position(&buf, 9), (1, 5)); // end of "defgh"
+        assert_eq!(diagnostic_position(&buf, 10), (2, 0)); // 'i'
+    }
+
+    #[test]
+    fn apply_fix_splices_the_replacement_and_returns_true() {
+        let mut buf = TextBuffer::new_unnamed(10);
+        buf.insert_text((0, 0), "echo $foo");
+        // "$foo" sits at flat offsets 5..9.
+        let diagnostic = lint::Diagnostic {
+            start: 5,
+            end: 9,
+            severity: lint::Severity::Warning,
+            code: "unquoted-expansion",
+            message: String::new(),
+            fix: Some(lint::Fix { start: 5, end: 9, replacement: "\"$foo\"".to_string() }),
+        };
+        assert!(apply_fix(&mut buf, &diagnostic));
+        assert_eq!(buf.line_chars(0).into_iter().collect::<String>(), "echo \"$foo\"");
+    }
+
+    #[test]
+    fn apply_fix_is_a_no_op_without_a_fix() {
+        let mut buf = TextBuffer::new_unnamed(10);
+        buf.insert_text((0, 0), "echo $foo");
+        let diagnostic = lint::Diagnostic { start: 5, end: 9, severity: lint::Severity::Warning, code: "unquoted-expansion", message: String::new(), fix: None };
+        assert!(!apply_fix(&mut buf, &diagnostic));
+        assert_eq!(buf.line_chars(0).into_iter().collect::<String>(), "echo $foo");
     }
 }

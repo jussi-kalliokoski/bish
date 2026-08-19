@@ -5,6 +5,7 @@ use std::rc::Rc;
 
 use crate::bishedit::completion;
 use crate::bishedit::highlight::{self, HighlightContext};
+use crate::bishedit::lint;
 use crate::bishedit::motion;
 use crate::bishedit::registers::{RegisterShape, RegisterValue, Registers};
 use crate::bishedit::suggestion;
@@ -89,12 +90,21 @@ type EditFrameId = u32;
 // Job -- a builtin editor session (fileeditor::EditSession) that can
 // likewise be detached (Ctrl+Space) and resumed later, holding an id
 // into `edit_frames` for exactly the same Copy-ness reason (a
-// TextBuffer's own content is definitely not Copy either).
+// TextBuffer's own content is definitely not Copy either). Diagnostics
+// is different from all three: it's never the *only* frame a pane ever
+// shows (see split_diagnostics_pane) -- it names the `:diag`-triggered
+// sibling pane that sits below a specific Edit frame's own pane,
+// browsing that same `EditFrameId`'s buffer.diagnostics. It carries no
+// persistent state of its own (unlike Job/Edit, there's no third
+// `diag_frames` map) -- everything it shows is re-read from
+// `edit_frames[&id]` fresh each time it's focused, since nothing about
+// a diagnostics list is worth preserving across a collapse.
 #[derive(Clone, Copy, PartialEq)]
 enum Frame {
     Session(SessionId),
     Job(JobFrameId),
     Edit(EditFrameId),
+    Diagnostics(EditFrameId),
 }
 
 type PaneId = u32;
@@ -131,9 +141,23 @@ impl Pane {
 // repl.rs's resize_focused_pane/set_focused_pane_size) only ever need
 // to change *this* pane's own weight, never touch its siblings' -- the
 // division naturally renormalizes around whatever's there.
+//
+// `fixed`, when `Some`, overrides all of that for this one child: it
+// always gets exactly that many rows (a horizontal split) or columns (a
+// vertical one), taken off the top before whatever's left divides among
+// the `fixed: None` siblings by weight exactly as before (see
+// compute_regions/split_sizes). `weight` is simply ignored while `fixed`
+// is set, rather than the two interacting -- there's no case yet where
+// a pane needs both "resizable" and "pinned" at once. The diagnostics
+// pane (see Frame::Diagnostics) is the one thing that uses this today,
+// toggling between `Some(1)` (collapsed, just its own title row) and
+// `Some(n)` (expanded to show its list) as it gains/loses focus -- every
+// other `SplitChild` anywhere else stays `fixed: None` and behaves
+// identically to before this field existed.
 struct SplitChild {
     layout: PaneLayout,
     weight: f64,
+    fixed: Option<usize>,
 }
 
 // How a window's screen area is currently divided among its panes.
@@ -243,7 +267,7 @@ fn session_referenced_elsewhere(windows: &[WindowEntry], current_window: usize, 
             for (depth, frame) in pane.stack.iter().enumerate() {
                 let matches = match frame {
                     Frame::Session(s) => *s == sid,
-                    Frame::Job(_) | Frame::Edit(_) => false,
+                    Frame::Job(_) | Frame::Edit(_) | Frame::Diagnostics(_) => false,
                 };
                 if !matches {
                     continue;
@@ -389,6 +413,29 @@ pub fn run(mut shell: Shell) {
                 &mut cmd_history,
                 &mut sinks_are_grid,
                 &mut registers,
+                term_rows,
+                term_cols,
+            );
+            let _ = io::stdout().flush();
+            continue;
+        }
+
+        // Same idea again, for the `:diag`-created diagnostics sibling
+        // pane (see split_diagnostics_pane) -- reached whenever the user
+        // navigates focus onto it (<C-w>j, or clicking its own
+        // collapsed title bar).
+        if let Frame::Diagnostics(edit_frame_id) = *windows[current_window].stack().last().unwrap() {
+            run_diagnostics_frame(
+                windows[current_window].focused_pane,
+                edit_frame_id,
+                &mut sessions,
+                &mut windows,
+                &mut current_window,
+                &mut next_session_id,
+                &mut next_window_id,
+                &mut job_frames,
+                &mut edit_frames,
+                &mut sinks_are_grid,
                 term_rows,
                 term_cols,
             );
@@ -954,7 +1001,7 @@ fn handle_command_mode(
     editing: Option<&mut TextBuffer>,
     seed: Option<String>,
 ) -> CommandModeOutcome {
-    let outcome = run_command_mode(session_id, sessions, windows, *current_window, cmd_history, job_frames, registers, term_rows, term_cols, editing, seed);
+    let outcome = run_command_mode(session_id, sessions, windows, *current_window, next_session_id, cmd_history, job_frames, registers, term_rows, term_cols, editing, seed);
     match outcome {
         CommandModeOutcome::Action(action) => {
             apply_window_action(action, sessions, windows, current_window, next_session_id, next_window_id, sinks_are_grid, term_rows, term_cols);
@@ -1142,6 +1189,13 @@ fn run_edit_frame(
         match outcome {
             Ok((NavExit::Quit, _)) => {
                 windows[*current_window].stack_mut().pop();
+                // A file with an open diagnostics pane (`:diag`) below
+                // it -- close that too rather than leaving an orphaned
+                // pane no `Frame::Edit` will ever point at again.
+                if let Some(diag_pane) = diagnostics_sibling(&windows[*current_window], edit_frame_id) {
+                    close_pane(&mut windows[*current_window], diag_pane);
+                    close_orphaned_sessions(sessions, windows);
+                }
                 if *sinks_are_grid {
                     compositor_redraw(sessions, windows, *current_window, term_rows, term_cols);
                 }
@@ -1197,6 +1251,266 @@ fn run_edit_frame(
             }
         }
     }
+}
+
+// The Edit-frame pane whose own diagnostics `edit_frame_id` names, if
+// it's currently live in this window -- diagnostics_sibling's own
+// mirror image, walked the other direction (from the diagnostics pane
+// back to the editor pane it belongs to, e.g. to refocus it once the
+// diagnostics pane collapses).
+fn editor_pane_for(window: &WindowEntry, edit_frame_id: EditFrameId) -> Option<PaneId> {
+    window.panes.iter().find(|p| p.stack.last() == Some(&Frame::Edit(edit_frame_id))).map(|p| p.id)
+}
+
+// How many rows the diagnostics pane's own SplitChild should claim right
+// now: collapsed to its own single title row when nothing's expanded,
+// or the whole list plus DIAG_DETAIL_ROWS more for the selected item's
+// own detail block when something is. Clamped the same way either way
+// so neither an empty list nor a huge one makes the pane degenerate or
+// swallow the whole window.
+const DIAG_DETAIL_ROWS: usize = 2;
+fn diagnostics_pane_rows(diagnostics_len: usize, expanded: bool) -> usize {
+    if expanded {
+        (diagnostics_len + DIAG_DETAIL_ROWS).clamp(3, 14)
+    } else {
+        diagnostics_len.clamp(1, 12)
+    }
+}
+
+// The diagnostics pane's own interactive list -- dispatched from repl::
+// run's main loop whenever a pane's top frame is `Frame::Diagnostics
+// (edit_frame_id)`, the same tier as run_fg_job_frame/run_edit_frame
+// just above. Deliberately not built on bishedit::Buffer/VimKeys::
+// feed's motion machinery the way run_normal_mode_navigation is (see
+// Frame::Diagnostics's own doc comment) -- a flat list with nothing to
+// edit doesn't need vim's word/line motions, registers, or Insert mode.
+// Still constructs a bare VimKeys purely to reuse its already-correct
+// `<C-w>` chord parsing (KeyOutcome::Window -> dispatch_window_cmd, the
+// exact same call every other loop makes) and its plain Motion::Down/Up
+// parsing (so `5j`/`3k` move the selection by count too, for free) --
+// every other key is intercepted before `vk.feed`, same tier run_
+// normal_mode_navigation's own Visual-mode `y`/`d`/`Z` interception
+// already uses. Selection/expanded-detail state is purely local to this
+// call (see Frame::Diagnostics's own doc comment on why it's never
+// worth persisting) -- every (re-)entry starts fresh at row 0,
+// collapsed detail.
+#[allow(clippy::too_many_arguments)]
+fn run_diagnostics_frame(
+    pane_id: PaneId,
+    edit_frame_id: EditFrameId,
+    sessions: &mut HashMap<SessionId, SessionState>,
+    windows: &mut Vec<WindowEntry>,
+    current_window: &mut usize,
+    next_session_id: &mut SessionId,
+    next_window_id: &mut u32,
+    job_frames: &mut HashMap<JobFrameId, exec::FgJob>,
+    edit_frames: &mut HashMap<EditFrameId, fileeditor::EditSession>,
+    sinks_are_grid: &mut bool,
+    term_rows: usize,
+    term_cols: usize,
+) {
+    // Every other loop that reads keys directly off the terminal
+    // (run_normal_mode_navigation, run_insert_mode, ...) holds one of
+    // these for its own duration -- without it the terminal is left in
+    // whatever mode the *previous* loop's own guard restored it to on
+    // return (cooked/canonical, echoing input back and line-buffering
+    // until Enter), which is not remotely usable for a `j`/`k`/`Enter`/
+    // `Space`-driven list. Silently returns (pane stays exactly as it
+    // last rendered) on the -- essentially unreachable in practice --
+    // chance this fails, same tolerance a failed read gets elsewhere.
+    let Ok(_guard) = term::RawGuard::enable_with_mouse(0) else { return };
+
+    let mut vk = VimKeys::new();
+    let mut selected: usize = 0;
+    let mut expanded: Option<usize> = None;
+
+    let set_rows = |windows: &mut Vec<WindowEntry>, current_window: usize, rows: usize| {
+        if let Some((_, children, idx)) = find_parent_split_mut(&mut windows[current_window].layout, pane_id) {
+            children[idx].fixed = Some(rows);
+        }
+    };
+    let diagnostics_len = edit_frames.get(&edit_frame_id).map(|s| s.buffer.diagnostics.len()).unwrap_or(0);
+    set_rows(windows, *current_window, diagnostics_pane_rows(diagnostics_len, false));
+    compositor_redraw(sessions, windows, *current_window, term_rows, term_cols);
+
+    loop {
+        let rect = pane_rect(&windows[*current_window], pane_id, term_rows, term_cols);
+        if let Some(session) = edit_frames.get(&edit_frame_id) {
+            render_diagnostics_list_frame(&session.buffer, rect, selected, expanded);
+        }
+
+        let key = match editor::read_key_idle(&mut || {
+            service_background_jobs(sessions, windows, job_frames, *current_window);
+        }) {
+            Ok(Some(k)) => k,
+            // EOF/error: nothing to resume -- leave the pane exactly as
+            // it last rendered, same as every other loop's own EOF arm.
+            Ok(None) | Err(_) => return,
+        };
+
+        if let Key::Mouse(ev) = key {
+            if ev.is_left_click() {
+                let row0 = (ev.row as usize).saturating_sub(1);
+                let diagnostics_len = edit_frames.get(&edit_frame_id).map(|s| s.buffer.diagnostics.len()).unwrap_or(0);
+                if row0 >= rect.row {
+                    let idx = row0 - rect.row;
+                    if idx < diagnostics_len {
+                        selected = idx;
+                        expanded = None;
+                    }
+                }
+            }
+            continue;
+        }
+
+        // A pane-focus-changing sibling reason to leave -- collapses
+        // back to the title row and hands focus to the editor pane this
+        // diagnostics pane belongs to, refreshing that pane's own
+        // collapsed title first so it reflects whatever's still true
+        // (only matters after `f` actually changed the count below, but
+        // cheap enough to always do).
+        let mut leave = |windows: &mut Vec<WindowEntry>, sessions: &HashMap<SessionId, SessionState>, jump: bool| {
+            if let Some(session) = edit_frames.get_mut(&edit_frame_id) {
+                if jump && let Some(d) = session.buffer.diagnostics.get(selected).cloned() {
+                    let (line, col) = fileeditor::diagnostic_position(&session.buffer, d.start);
+                    session.buffer.set_cursor(line, col);
+                }
+                let sid = windows[*current_window].pane(pane_id).owning_session();
+                render_diagnostics_title(&sessions[&sid].screen, rect.cols, &session.buffer.diagnostics);
+            }
+            set_rows(windows, *current_window, 1);
+            if let Some(editor_pane) = editor_pane_for(&windows[*current_window], edit_frame_id) {
+                windows[*current_window].focused_pane = editor_pane;
+            }
+        };
+
+        match key {
+            Key::Enter => {
+                leave(windows, sessions, true);
+                compositor_redraw(sessions, windows, *current_window, term_rows, term_cols);
+                return;
+            }
+            Key::Escape | Key::Char('q') => {
+                leave(windows, sessions, false);
+                compositor_redraw(sessions, windows, *current_window, term_rows, term_cols);
+                return;
+            }
+            Key::Char(' ') => {
+                expanded = if expanded == Some(selected) { None } else { Some(selected) };
+                let diagnostics_len = edit_frames.get(&edit_frame_id).map(|s| s.buffer.diagnostics.len()).unwrap_or(0);
+                set_rows(windows, *current_window, diagnostics_pane_rows(diagnostics_len, expanded.is_some()));
+                compositor_redraw(sessions, windows, *current_window, term_rows, term_cols);
+            }
+            // `f`: applies the selected item's own fix, only while its
+            // detail (and so the `[f] autofix` hint) is actually showing
+            // -- matches vim's own "an action only fires once its own
+            // hint is visible" convention nothing else in this codebase
+            // has yet, but is the obvious reading of "space shows...
+            // extra actions" from this feature's own spec. Re-diagnoses
+            // from scratch afterward (see apply_fix's own doc comment on
+            // why) and keeps the pane expanded, so applying several
+            // fixes in a row doesn't require re-entering each time.
+            Key::Char('f') if expanded == Some(selected) => {
+                let applied = edit_frames.get_mut(&edit_frame_id).map(|session| {
+                    let Some(d) = session.buffer.diagnostics.get(selected).cloned() else { return false };
+                    if !fileeditor::apply_fix(&mut session.buffer, &d) {
+                        return false;
+                    }
+                    session.buffer.diagnostics = fileeditor::diagnose_buffer(&session.buffer);
+                    true
+                });
+                if applied == Some(true) {
+                    let diagnostics_len = edit_frames.get(&edit_frame_id).map(|s| s.buffer.diagnostics.len()).unwrap_or(0);
+                    selected = selected.min(diagnostics_len.saturating_sub(1));
+                    expanded = None;
+                    set_rows(windows, *current_window, diagnostics_pane_rows(diagnostics_len, false));
+                    compositor_redraw(sessions, windows, *current_window, term_rows, term_cols);
+                }
+            }
+            _ => match vk.feed(key) {
+                KeyOutcome::Motion(motion::Motion::Down, count) => {
+                    let diagnostics_len = edit_frames.get(&edit_frame_id).map(|s| s.buffer.diagnostics.len()).unwrap_or(0);
+                    selected = (selected + count.unwrap_or(1).max(1)).min(diagnostics_len.saturating_sub(1));
+                    expanded = None;
+                    compositor_redraw(sessions, windows, *current_window, term_rows, term_cols);
+                }
+                KeyOutcome::Motion(motion::Motion::Up, count) => {
+                    selected = selected.saturating_sub(count.unwrap_or(1).max(1));
+                    expanded = None;
+                    compositor_redraw(sessions, windows, *current_window, term_rows, term_cols);
+                }
+                KeyOutcome::Window(cmd, count) => {
+                    dispatch_window_cmd(cmd, count, sessions, windows, current_window, next_session_id, next_window_id, sinks_are_grid, term_rows, term_cols);
+                    return;
+                }
+                _ => {}
+            },
+        }
+    }
+}
+
+// Renders the diagnostics pane's own expanded list directly to the real
+// terminal -- same "print straight to the terminal while this pane is
+// the one actually focused/driven" model run_normal_mode_navigation's
+// own render_normal_mode_frame uses (see Frame's doc comment on why
+// only the focused pane ever draws live). Hides the real cursor
+// (`\x1b[?25l`) rather than parking it somewhere arbitrary -- unlike
+// every other interactive pane in this codebase, there's no text
+// insertion point here for a blinking cursor to usefully mark.
+fn render_diagnostics_list_frame(buf: &TextBuffer, rect: Rect, selected: usize, expanded: Option<usize>) {
+    fn pad(text: &str, cols: usize) -> String {
+        let mut s: String = text.chars().take(cols).collect();
+        let len = s.chars().count();
+        if len < cols {
+            s.push_str(&" ".repeat(cols - len));
+        }
+        s
+    }
+    let mut out = String::new();
+    let mut row = 0usize;
+    if buf.diagnostics.is_empty() {
+        out.push_str(&format!("\x1b[{};{}H", rect.row + 1, rect.col + 1));
+        out.push_str(&pad("No problems found", rect.cols));
+        row = 1;
+    } else {
+        for (i, d) in buf.diagnostics.iter().enumerate() {
+            if row >= rect.rows {
+                break;
+            }
+            let (line, col) = fileeditor::diagnostic_position(buf, d.start);
+            let text = pad(&format!("{}:{}  {}", line + 1, col + 1, d.message), rect.cols);
+            out.push_str(&format!("\x1b[{};{}H", rect.row + row + 1, rect.col + 1));
+            if i == selected {
+                out.push_str("\x1b[7m");
+                out.push_str(&text);
+                out.push_str("\x1b[0m");
+            } else {
+                out.push_str(&text);
+            }
+            row += 1;
+            if expanded == Some(i) {
+                if row < rect.rows {
+                    out.push_str(&format!("\x1b[{};{}H", rect.row + row + 1, rect.col + 1));
+                    out.push_str(&pad(&format!("  [{}] {}", d.code, d.message), rect.cols));
+                    row += 1;
+                }
+                if row < rect.rows {
+                    let hint = if d.fix.is_some() { "  [space] collapse   [f] autofix" } else { "  [space] collapse" };
+                    out.push_str(&format!("\x1b[{};{}H", rect.row + row + 1, rect.col + 1));
+                    out.push_str(&pad(hint, rect.cols));
+                    row += 1;
+                }
+            }
+        }
+    }
+    while row < rect.rows {
+        out.push_str(&format!("\x1b[{};{}H", rect.row + row + 1, rect.col + 1));
+        out.push_str(&" ".repeat(rect.cols));
+        row += 1;
+    }
+    out.push_str("\x1b[?25l");
+    print!("{}", out);
+    let _ = io::stdout().flush();
 }
 
 // Performs a `window`-family action against the real session/window
@@ -1355,6 +1669,12 @@ fn apply_window_action(
                 Some(Frame::Edit(_)) => {
                     sessions[&cur_sid].shell.sink_err("bish: window: fg: that window is running an editor, not a session\n");
                 }
+                // Same reasoning again -- a diagnostics pane is scoped
+                // to the one Edit frame's own pane it sits below, not a
+                // session that could sensibly show up somewhere else.
+                Some(Frame::Diagnostics(_)) => {
+                    sessions[&cur_sid].shell.sink_err("bish: window: fg: that window is showing diagnostics, not a session\n");
+                }
                 None => {
                     sessions[&cur_sid].shell.sink_err(&format!("bish: window: fg: no such window: {}\n", target_id));
                 }
@@ -1431,7 +1751,7 @@ fn split_focused_pane(
 
     let focused_id = window.focused_pane;
     let old_layout = std::mem::replace(&mut window.layout, PaneLayout::Leaf(0));
-    window.layout = insert_sibling(old_layout, focused_id, new_pane_id, horizontal);
+    window.layout = insert_sibling(old_layout, focused_id, new_pane_id, horizontal, None);
 
     // The pane being split is about to lose focus to its new sibling --
     // freeze its current idle prompt into its own grid first, or it'll
@@ -1447,6 +1767,112 @@ fn split_focused_pane(
         freeze_idle_prompt(sessions.get_mut(&parent_id).unwrap());
     }
     windows[current_window].focused_pane = new_pane_id;
+}
+
+// `:diag`'s own sibling to split_focused_pane, just above -- same
+// "fork a session purely to give the new pane a screen to composite
+// from" pattern (see Frame's own doc comment on why every pane needs
+// one), but the new pane is never a usable shell: `Frame::Diagnostics
+// (edit_frame_id)` goes straight on top of its `Frame::Session`, it
+// starts collapsed (`fixed: Some(1)`), and -- unlike an ordinary
+// `<C-w>s`/`<C-w>v` split -- focus stays right where it was (running
+// `:diag` shouldn't yank you out of the file you're editing). Always a
+// horizontal split (the pane goes at the bottom, per the feature's own
+// name); `focused_id` is the *editor's* own pane, i.e. whichever pane
+// is currently focused when `:diag` runs (it's the one driving this
+// command in the first place).
+fn split_diagnostics_pane(
+    sessions: &mut HashMap<SessionId, SessionState>,
+    windows: &mut [WindowEntry],
+    current_window: usize,
+    next_session_id: &mut SessionId,
+    edit_frame_id: EditFrameId,
+    term_rows: usize,
+    term_cols: usize,
+) -> PaneId {
+    let parent_id = windows[current_window].owning_session();
+    let child_history = sessions[&parent_id].history.fork();
+    let mut child_shell = sessions[&parent_id].shell.new_virtual_child();
+    let screen = Rc::new(RefCell::new(vt100::Screen::new(content_rows(term_rows), term_cols)));
+    child_shell.set_sink_grid(screen.clone());
+    let child_cwd = child_shell.cwd.clone();
+    let sid = *next_session_id;
+    *next_session_id += 1;
+    sessions.insert(
+        sid,
+        SessionState {
+            shell: child_shell,
+            buffer: String::new(),
+            history: child_history,
+            screen,
+            warned_stopped_jobs: false,
+            dir_history: vec![child_cwd],
+            dir_history_index: 0,
+            command_transcript: Vec::new(),
+        },
+    );
+
+    let window = &mut windows[current_window];
+    let new_pane_id = window.next_pane_id;
+    window.next_pane_id += 1;
+    window.panes.push(Pane { id: new_pane_id, stack: vec![Frame::Session(sid), Frame::Diagnostics(edit_frame_id)] });
+
+    let focused_id = window.focused_pane;
+    let old_layout = std::mem::replace(&mut window.layout, PaneLayout::Leaf(0));
+    window.layout = insert_sibling(old_layout, focused_id, new_pane_id, true, Some(1));
+
+    new_pane_id
+}
+
+// The diagnostics sibling pane already sitting below `edit_frame_id`'s
+// own editor pane, if `:diag` has created one -- `None` before the
+// first `:diag` run, or after `:diag clear`/the file closing removed
+// it.
+fn diagnostics_sibling(window: &WindowEntry, edit_frame_id: EditFrameId) -> Option<PaneId> {
+    window.panes.iter().find(|p| p.stack.last() == Some(&Frame::Diagnostics(edit_frame_id))).map(|p| p.id)
+}
+
+// The diagnostics pane's own 1-row title, in reverse video (matching
+// the tab bar's own convention, tab_bar_line) -- fed directly into its
+// session's grid via feed(), the same mechanism freeze_editor_frame/
+// freeze_idle_prompt already use to bake static content into a pane's
+// grid outside of anything actually being "typed". Left-aligned; the
+// rest of the row is left blank (reverse video still fills it visually
+// once composited, same as how render_row already pads a styled run).
+fn render_diagnostics_title(screen: &Rc<RefCell<vt100::Screen>>, cols: usize, diagnostics: &[lint::Diagnostic]) {
+    let text = match diagnostics.len() {
+        0 => "No problems found".to_string(),
+        1 => "1 problem found".to_string(),
+        n => format!("{n} problems found"),
+    };
+    let padded = format!("{:<width$}", text, width = cols);
+    let framed = format!("\r\x1b[K\x1b[7m{}\x1b[0m", padded);
+    screen.borrow_mut().feed(framed.as_bytes());
+}
+
+// Creates the diagnostics sibling if `:diag` hasn't already (via
+// split_diagnostics_pane), then (re)writes its collapsed title and
+// repaints -- called by `:diag`'s own handler right after it recomputes
+// `tb.diagnostics`, while that buffer is still this function's own
+// caller's local (see this module's own doc comment on why that's the
+// only time this pane's content can be synced at all).
+#[allow(clippy::too_many_arguments)]
+fn sync_diagnostics_pane(
+    sessions: &mut HashMap<SessionId, SessionState>,
+    windows: &mut [WindowEntry],
+    current_window: usize,
+    next_session_id: &mut SessionId,
+    edit_frame_id: EditFrameId,
+    diagnostics: &[lint::Diagnostic],
+    term_rows: usize,
+    term_cols: usize,
+) {
+    let pane_id = diagnostics_sibling(&windows[current_window], edit_frame_id)
+        .unwrap_or_else(|| split_diagnostics_pane(sessions, windows, current_window, next_session_id, edit_frame_id, term_rows, term_cols));
+    let rect = pane_rect(&windows[current_window], pane_id, term_rows, term_cols);
+    let sid = windows[current_window].pane(pane_id).owning_session();
+    render_diagnostics_title(&sessions[&sid].screen, rect.cols, diagnostics);
+    compositor_redraw(sessions, windows, current_window, term_rows, term_cols);
 }
 
 // Captures a pane's *idle* prompt (nothing submitted, just sitting
@@ -1506,11 +1932,14 @@ fn freeze_input_with_text(session: &mut SessionState, text: &str) -> String {
 // (compute_regions splits one Split's area evenly among however many
 // children it has) rather than each new split only ever halving
 // whatever was there before.
-fn insert_sibling(layout: PaneLayout, target: PaneId, new_id: PaneId, horizontal: bool) -> PaneLayout {
+fn insert_sibling(layout: PaneLayout, target: PaneId, new_id: PaneId, horizontal: bool, new_fixed: Option<usize>) -> PaneLayout {
     match layout {
         PaneLayout::Leaf(id) if id == target => PaneLayout::Split {
             horizontal,
-            children: vec![SplitChild { layout: PaneLayout::Leaf(id), weight: 1.0 }, SplitChild { layout: PaneLayout::Leaf(new_id), weight: 1.0 }],
+            children: vec![
+                SplitChild { layout: PaneLayout::Leaf(id), weight: 1.0, fixed: None },
+                SplitChild { layout: PaneLayout::Leaf(new_id), weight: 1.0, fixed: new_fixed },
+            ],
         },
         PaneLayout::Leaf(id) => PaneLayout::Leaf(id),
         PaneLayout::Split { horizontal: h, children } => {
@@ -1518,13 +1947,13 @@ fn insert_sibling(layout: PaneLayout, target: PaneId, new_id: PaneId, horizontal
             if let Some(idx) = direct_child_idx {
                 if h == horizontal {
                     let mut children = children;
-                    children.insert(idx + 1, SplitChild { layout: PaneLayout::Leaf(new_id), weight: 1.0 });
+                    children.insert(idx + 1, SplitChild { layout: PaneLayout::Leaf(new_id), weight: 1.0, fixed: new_fixed });
                     return PaneLayout::Split { horizontal: h, children };
                 }
             }
             let children = children
                 .into_iter()
-                .map(|c| SplitChild { layout: insert_sibling(c.layout, target, new_id, horizontal), weight: c.weight })
+                .map(|c| SplitChild { layout: insert_sibling(c.layout, target, new_id, horizontal, new_fixed), weight: c.weight, fixed: c.fixed })
                 .collect();
             PaneLayout::Split { horizontal: h, children }
         }
@@ -1549,7 +1978,7 @@ fn remove_from_layout(layout: PaneLayout, target: PaneId) -> Option<PaneLayout> 
         PaneLayout::Split { horizontal, children } => {
             let new_children: Vec<SplitChild> = children
                 .into_iter()
-                .filter_map(|c| remove_from_layout(c.layout, target).map(|layout| SplitChild { layout, weight: c.weight }))
+                .filter_map(|c| remove_from_layout(c.layout, target).map(|layout| SplitChild { layout, weight: c.weight, fixed: c.fixed }))
                 .collect();
             match new_children.len() {
                 0 => None,
@@ -1575,11 +2004,22 @@ fn first_leaf(layout: &PaneLayout) -> PaneId {
 // spatially "nearest" one -- simple and predictable, matching this
 // first pane-support pass's plain-layout scope.
 fn close_focused_pane(window: &mut WindowEntry) {
-    let closing = window.focused_pane;
+    close_pane(window, window.focused_pane);
+}
+
+// Generalizes close_focused_pane to any pane in the window, not just the
+// focused one -- used to close a diagnostics sibling (never focused at
+// the moment its own Edit frame quits, see run_edit_frame's NavExit::
+// Quit arm) alongside close_focused_pane's own original call site. Only
+// reassigns `focused_pane` when `pane_id` actually was the focused one;
+// closing some *other* pane leaves focus exactly where it was.
+fn close_pane(window: &mut WindowEntry, pane_id: PaneId) {
     let old_layout = std::mem::replace(&mut window.layout, PaneLayout::Leaf(0));
-    window.layout = remove_from_layout(old_layout, closing).expect("closing one of >1 panes always leaves at least one behind");
-    window.panes.retain(|p| p.id != closing);
-    window.focused_pane = first_leaf(&window.layout);
+    window.layout = remove_from_layout(old_layout, pane_id).expect("closing one of >1 panes always leaves at least one behind");
+    window.panes.retain(|p| p.id != pane_id);
+    if window.focused_pane == pane_id {
+        window.focused_pane = first_leaf(&window.layout);
+    }
 }
 
 // A session stops being referenced when the last window whose stack
@@ -1595,7 +2035,7 @@ fn close_orphaned_sessions(sessions: &mut HashMap<SessionId, SessionState>, wind
         .flat_map(|p| {
             p.stack.iter().filter_map(|f| match f {
                 Frame::Session(id) => Some(*id),
-                Frame::Job(_) | Frame::Edit(_) => None,
+                Frame::Job(_) | Frame::Edit(_) | Frame::Diagnostics(_) => None,
             })
         })
         .collect();
@@ -2003,20 +2443,57 @@ struct CompositorLayout {
 // `.max(1)` below), this only guards the weight arithmetic itself.
 const MIN_PANE_WEIGHT: f64 = 0.05;
 
-// Walks `layout`, splitting `area` among each Split's children in
-// proportion to their own weight (reserving one row/col between
-// siblings for a divider line) down to each Leaf's own rectangle --
-// every child's default weight is 1.0 (see insert_sibling), so a plain,
-// never-resized split still divides evenly; `window +`/`-`/`size` (see
-// resize_focused_pane/set_focused_pane_size) is what actually changes
-// any of this. Whichever child's own share divides the available space
-// least evenly (last in iteration order) absorbs the rounding
-// remainder, so the total always adds back up to `area`'s own size
-// exactly. `dividers` collects the reserved divider strips separately
-// (row=true for a horizontal divider line, running left-right; false
-// for a vertical one, running top-bottom) so the caller can draw them
-// after every pane's own content, rather than each Split trying to draw
-// into space a child might otherwise want.
+// One Split's own children resolved down to how many cells each gets
+// along the split's own axis (`usable` -- the area already minus every
+// reserved divider strip): every `fixed`-child (see SplitChild's own
+// doc comment) claims its own requested count first, clamped so it can
+// never squeeze a `fixed: None` sibling below 1 cell; whatever's left
+// then divides among those weighted siblings exactly the way this used
+// to work before `fixed` existed -- proportional to weight/(sum of
+// weighted siblings' weights), with the *last* weighted child (not
+// necessarily the last child overall) absorbing the rounding remainder
+// so the weighted children's own total always adds up exactly. With no
+// `fixed` children at all (every existing call site, before this pane
+// type), `weighted_count == children.len()` and this is byte-for-byte
+// the original formula.
+fn split_sizes(children: &[SplitChild], usable: usize) -> Vec<usize> {
+    let weighted_count = children.iter().filter(|c| c.fixed.is_none()).count();
+    let mut sizes = vec![0usize; children.len()];
+    let mut budget = usable;
+    for (i, child) in children.iter().enumerate() {
+        if let Some(f) = child.fixed {
+            let reserve_for_weighted = weighted_count.min(budget);
+            let size = f.min(budget.saturating_sub(reserve_for_weighted)).max(1.min(budget));
+            sizes[i] = size;
+            budget = budget.saturating_sub(size);
+        }
+    }
+    let total_weight: f64 = children.iter().filter(|c| c.fixed.is_none()).map(|c| c.weight.max(MIN_PANE_WEIGHT)).sum();
+    let mut allocated = 0usize;
+    let mut seen = 0usize;
+    for (i, child) in children.iter().enumerate() {
+        if child.fixed.is_some() {
+            continue;
+        }
+        seen += 1;
+        let h = if seen == weighted_count {
+            budget.saturating_sub(allocated).max(1)
+        } else {
+            (((budget as f64) * child.weight.max(MIN_PANE_WEIGHT) / total_weight).round() as usize).max(1)
+        };
+        sizes[i] = h;
+        allocated += h;
+    }
+    sizes
+}
+
+// Walks `layout`, splitting `area` among each Split's children (see
+// split_sizes, above, for how much each one gets) down to each Leaf's
+// own rectangle. `dividers` collects the reserved divider strips
+// separately (row=true for a horizontal divider line, running
+// left-right; false for a vertical one, running top-bottom) so the
+// caller can draw them after every pane's own content, rather than each
+// Split trying to draw into space a child might otherwise want.
 fn compute_regions(layout: &PaneLayout, area: Rect, out: &mut Vec<(PaneId, Rect)>, dividers: &mut Vec<(Rect, bool)>) {
     match layout {
         PaneLayout::Leaf(id) => out.push((*id, area)),
@@ -2025,23 +2502,16 @@ fn compute_regions(layout: &PaneLayout, area: Rect, out: &mut Vec<(PaneId, Rect)
             if n == 0 {
                 return;
             }
-            let total_weight: f64 = children.iter().map(|c| c.weight.max(MIN_PANE_WEIGHT)).sum();
             if *horizontal {
                 // Panes stacked top/bottom; the divider is the horizontal
                 // line between them.
-                let divider_rows = n - 1;
-                let usable = area.rows.saturating_sub(divider_rows);
+                let usable = area.rows.saturating_sub(n - 1);
+                let sizes = split_sizes(children, usable);
                 let mut row = area.row;
-                let mut allocated = 0usize;
                 for (i, child) in children.iter().enumerate() {
-                    let h = if i + 1 == n {
-                        usable.saturating_sub(allocated).max(1)
-                    } else {
-                        (((usable as f64) * child.weight.max(MIN_PANE_WEIGHT) / total_weight).round() as usize).max(1)
-                    };
+                    let h = sizes[i];
                     compute_regions(&child.layout, Rect { row, col: area.col, rows: h, cols: area.cols }, out, dividers);
                     row += h;
-                    allocated += h;
                     if i + 1 < n {
                         dividers.push((Rect { row, col: area.col, rows: 1, cols: area.cols }, true));
                         row += 1;
@@ -2050,19 +2520,13 @@ fn compute_regions(layout: &PaneLayout, area: Rect, out: &mut Vec<(PaneId, Rect)
             } else {
                 // Panes side by side; the divider is the vertical line
                 // between them.
-                let divider_cols = n - 1;
-                let usable = area.cols.saturating_sub(divider_cols);
+                let usable = area.cols.saturating_sub(n - 1);
+                let sizes = split_sizes(children, usable);
                 let mut col = area.col;
-                let mut allocated = 0usize;
                 for (i, child) in children.iter().enumerate() {
-                    let w = if i + 1 == n {
-                        usable.saturating_sub(allocated).max(1)
-                    } else {
-                        (((usable as f64) * child.weight.max(MIN_PANE_WEIGHT) / total_weight).round() as usize).max(1)
-                    };
+                    let w = sizes[i];
                     compute_regions(&child.layout, Rect { row: area.row, col, rows: area.rows, cols: w }, out, dividers);
                     col += w;
-                    allocated += w;
                     if i + 1 < n {
                         dividers.push((Rect { row: area.row, col, rows: area.rows, cols: 1 }, false));
                         col += 1;
@@ -3188,7 +3652,7 @@ fn run_normal_mode_navigation(
     term_rows: usize,
     term_cols: usize,
 ) -> io::Result<(NavExit, Option<(TextBuffer, VimKeys)>)> {
-    let rect = pane_rect(&windows[*current_window], windows[*current_window].focused_pane, term_rows, term_cols);
+    let mut rect = pane_rect(&windows[*current_window], windows[*current_window].focused_pane, term_rows, term_cols);
 
     // Only `Prompt` ever has real text/cursor to resume into (see
     // `NavExit::Resume`'s own doc comment) -- kept as empty/0 for the
@@ -3253,6 +3717,15 @@ fn run_normal_mode_navigation(
     let mut pending_view = PendingView::None;
 
     let result: (NavExit, Option<(TextBuffer, VimKeys)>) = 'nav: loop {
+        // Recomputed every iteration, not just once up front: this pane's
+        // own rect can change mid-loop without this function ever
+        // exiting -- `:diag` (run from right inside this same loop's own
+        // `:` handling) can graft a sibling diagnostics pane below this
+        // one, shrinking it. Every other window/pane action that resizes
+        // anything (`<C-w>` chords, a click) already exits via
+        // `KeyOutcome::Window`/click handling, so this was never
+        // observable before `:diag` -- cheap enough to just always do.
+        rect = pane_rect(&windows[*current_window], windows[*current_window].focused_pane, term_rows, term_cols);
         let mut key = match vk.next_key(|| editor::read_key_idle(&mut || {
             service_background_jobs(sessions, windows, job_frames, *current_window);
         }))? {
@@ -3566,7 +4039,7 @@ fn run_normal_mode_navigation(
             // *same* call either way, not a separate file-command parser
             // pre-empting it.
             Key::Char(':') => {
-                match handle_command_mode(
+                let outcome = handle_command_mode(
                     session_id,
                     sessions,
                     windows,
@@ -3581,7 +4054,14 @@ fn run_normal_mode_navigation(
                     term_cols,
                     buf.as_editable_mut(),
                     None,
-                ) {
+                );
+                // `:diag` (only command that can, today) may have grafted
+                // a sibling pane in below this one -- recomputed here,
+                // not just at the top of the next loop iteration, since
+                // `Ran`'s own `render_nav_frame` call just below still
+                // needs the *current* rect, not next keystroke's.
+                rect = pane_rect(&windows[*current_window], windows[*current_window].focused_pane, term_rows, term_cols);
+                match outcome {
                     // Matches vim: an aborted/cancelled ':' command drops
                     // back into Normal mode, not out of it entirely.
                     CommandModeOutcome::Cancelled => {
@@ -4310,6 +4790,7 @@ fn run_command_mode(
     sessions: &mut HashMap<SessionId, SessionState>,
     windows: &mut Vec<WindowEntry>,
     current_window: usize,
+    next_session_id: &mut SessionId,
     history: &mut History,
     job_frames: &mut HashMap<JobFrameId, exec::FgJob>,
     registers: &mut Registers,
@@ -4537,17 +5018,55 @@ fn run_command_mode(
                             tb.diagnostics = fileeditor::diagnose_buffer(tb);
                             let n = tb.diagnostics.len();
                             let output = if n == 0 { "No problems found.".to_string() } else { format!("{n} problem{} found.", if n == 1 { "" } else { "s" }) };
-                            sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry { command: trimmed, output: output.clone(), status: 0 });
-                            return CommandModeOutcome::Ran { output, status: 0 };
+                            // Creates the collapsed diagnostics split
+                            // (see split_diagnostics_pane's own doc
+                            // comment) the first time this runs for this
+                            // file, or just refreshes its title's count
+                            // on every later run. `edit_frame_id`: this
+                            // arm is only reachable while `editing` is
+                            // `Some` (see this function's own `editing`
+                            // param doc comment), which only happens for
+                            // a `Frame::Edit` pane -- and that frame is
+                            // still on top of this window's focused
+                            // pane's own stack for the whole time this
+                            // command-mode loop is driving it.
+                            if let Some(Frame::Edit(edit_frame_id)) = windows[current_window].stack().last().copied() {
+                                sync_diagnostics_pane(sessions, windows, current_window, next_session_id, edit_frame_id, &tb.diagnostics, term_rows, term_cols);
+                            }
+                            sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry { command: trimmed, output, status: 0 });
+                            // Empty `Ran` output (not the count message
+                            // itself, still recorded above for `Ctrl-L`'s
+                            // own transcript) -- unlike every other
+                            // command here, the result of this one is
+                            // already visible as the diagnostics pane's
+                            // own persistent title bar. Returning the
+                            // count as `Ran`'s own output would draw a
+                            // second, redundant copy of it via
+                            // `render_command_output_overlay`, which
+                            // isn't pane-aware (it paints across the
+                            // *whole* terminal's own bottom rows, not
+                            // this pane's own shrunk rect) and would
+                            // paint straight over the diagnostics pane's
+                            // own divider/title the instant it ran.
+                            return CommandModeOutcome::Ran { output: String::new(), status: 0 };
                         }
                         // `diag clear`/`diagnose clear`: drops whatever
                         // `:diag` last found, same as it self-clears the
                         // instant a real edit would make its positions
                         // stale (see TextBuffer::diagnostics's own doc
                         // comment) -- this is just the explicit, no-edit
-                        // version of that.
+                        // version of that. Also closes the diagnostics
+                        // split if `:diag` had created one, back to
+                        // exactly the pre-`:diag` state rather than
+                        // leaving a stale "0 problems" bar behind.
                         "diag" | "diagnose" if arg == Some("clear") => {
                             tb.diagnostics.clear();
+                            if let Some(Frame::Edit(edit_frame_id)) = windows[current_window].stack().last().copied()
+                                && let Some(pane_id) = diagnostics_sibling(&windows[current_window], edit_frame_id)
+                            {
+                                close_pane(&mut windows[current_window], pane_id);
+                                close_orphaned_sessions(sessions, windows);
+                            }
                             sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry { command: trimmed, output: String::new(), status: 0 });
                             return CommandModeOutcome::Ran { output: String::new(), status: 0 };
                         }
@@ -4864,5 +5383,91 @@ mod alt_screen_addressing_tests {
         assert_eq!(buf.char_at(0, 0), Some('v'));
         let line: String = buf.line_chars(0).into_iter().collect();
         assert_eq!(line, "vim content here");
+    }
+}
+
+#[cfg(test)]
+mod pane_layout_tests {
+    use super::*;
+
+    fn regions(layout: &PaneLayout, area: Rect) -> Vec<(PaneId, Rect)> {
+        let mut out = Vec::new();
+        let mut dividers = Vec::new();
+        compute_regions(layout, area, &mut out, &mut dividers);
+        out
+    }
+
+    #[test]
+    fn a_fixed_child_gets_exactly_its_own_size_and_the_weighted_sibling_absorbs_the_rest() {
+        let layout = PaneLayout::Split {
+            horizontal: true,
+            children: vec![
+                SplitChild { layout: PaneLayout::Leaf(0), weight: 1.0, fixed: None },
+                SplitChild { layout: PaneLayout::Leaf(1), weight: 1.0, fixed: Some(1) },
+            ],
+        };
+        let area = Rect { row: 0, col: 0, rows: 10, cols: 20 };
+        let out = regions(&layout, area);
+        let r0 = out.iter().find(|(id, _)| *id == 0).unwrap().1;
+        let r1 = out.iter().find(|(id, _)| *id == 1).unwrap().1;
+        // 10 rows - 1 divider = 9 usable; the fixed child takes exactly
+        // 1, the lone weighted child absorbs the remaining 8.
+        assert_eq!(r1.rows, 1);
+        assert_eq!(r0.rows, 8);
+    }
+
+    #[test]
+    fn every_existing_split_still_divides_evenly_with_no_fixed_children() {
+        // Byte-for-byte the pre-`fixed`-field formula: three even
+        // weighted children in a 21-row area (20 usable after 2
+        // dividers) split 7/7/6, the last absorbing the remainder.
+        let layout = PaneLayout::Split {
+            horizontal: true,
+            children: vec![
+                SplitChild { layout: PaneLayout::Leaf(0), weight: 1.0, fixed: None },
+                SplitChild { layout: PaneLayout::Leaf(1), weight: 1.0, fixed: None },
+                SplitChild { layout: PaneLayout::Leaf(2), weight: 1.0, fixed: None },
+            ],
+        };
+        let area = Rect { row: 0, col: 0, rows: 22, cols: 20 };
+        let out = regions(&layout, area);
+        let rows_of = |id: PaneId| out.iter().find(|(i, _)| *i == id).unwrap().1.rows;
+        assert_eq!(rows_of(0) + rows_of(1) + rows_of(2), 20);
+        assert_eq!(rows_of(0), rows_of(1));
+    }
+
+    #[test]
+    fn a_fixed_request_larger_than_the_area_is_clamped_so_the_weighted_sibling_still_gets_a_row() {
+        let layout = PaneLayout::Split {
+            horizontal: true,
+            children: vec![
+                SplitChild { layout: PaneLayout::Leaf(0), weight: 1.0, fixed: None },
+                SplitChild { layout: PaneLayout::Leaf(1), weight: 1.0, fixed: Some(10) },
+            ],
+        };
+        // 3 rows - 1 divider = 2 usable; a fixed request of 10 must be
+        // clamped so the weighted sibling isn't squeezed to 0.
+        let area = Rect { row: 0, col: 0, rows: 3, cols: 20 };
+        let out = regions(&layout, area);
+        let r0 = out.iter().find(|(id, _)| *id == 0).unwrap().1;
+        let r1 = out.iter().find(|(id, _)| *id == 1).unwrap().1;
+        assert_eq!(r0.rows, 1);
+        assert_eq!(r1.rows, 1);
+    }
+
+    #[test]
+    fn a_fixed_child_works_along_the_column_axis_of_a_vertical_split_too() {
+        let layout = PaneLayout::Split {
+            horizontal: false,
+            children: vec![
+                SplitChild { layout: PaneLayout::Leaf(0), weight: 1.0, fixed: None },
+                SplitChild { layout: PaneLayout::Leaf(1), weight: 1.0, fixed: Some(5) },
+            ],
+        };
+        let area = Rect { row: 0, col: 0, rows: 10, cols: 30 };
+        let out = regions(&layout, area);
+        let r1 = out.iter().find(|(id, _)| *id == 1).unwrap().1;
+        assert_eq!(r1.cols, 5);
+        assert_eq!(r1.rows, 10);
     }
 }
