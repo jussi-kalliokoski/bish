@@ -638,9 +638,10 @@ pub(crate) fn resolve_insert_start(buf: &mut TextBuffer, cmd: InsertCmd) {
 // else (motion keys, Enter, exit) behaves identically either way, which
 // is why this is a flag on the one shared loop rather than a second copy
 // of it.
-pub(crate) fn run_insert_mode(buf: &mut TextBuffer, vk: &mut VimKeys, rect: Rect, registers: &mut Registers, on_idle: &mut dyn FnMut(), replace: bool) -> io::Result<()> {
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_insert_mode(buf: &mut TextBuffer, vk: &mut VimKeys, rect: Rect, registers: &mut Registers, on_idle: &mut dyn FnMut(), replace: bool, term_rows: usize, term_cols: usize) -> io::Result<()> {
     let mode = if replace { EditorMode::Replace } else { EditorMode::Insert };
-    render_editor_frame(buf, vk, mode, rect);
+    render_editor_frame(buf, vk, mode, rect, term_rows, term_cols);
     // `"."`'s own accumulator for this session -- see `Registers::
     // set_last_insert`'s own doc comment. Best-effort: a Backspace just
     // pops the most recently accumulated character regardless of whether
@@ -752,7 +753,7 @@ pub(crate) fn run_insert_mode(buf: &mut TextBuffer, vk: &mut VimKeys, rect: Rect
             _ => {}
         }
         scroll_to_show_cursor(buf, editor_content_cols(buf, rect));
-        render_editor_frame(buf, vk, mode, rect);
+        render_editor_frame(buf, vk, mode, rect, term_rows, term_cols);
     }
 }
 
@@ -768,8 +769,13 @@ pub(crate) fn set_last_filename(buf: &TextBuffer, registers: &mut Registers) {
     }
 }
 
+// All of this pane's own rect -- the mode-line lives in the terminal's
+// own global status row now (repl::render_global_status_row), not
+// carved out of this pane's own rect. `.max(1)`: a degenerate
+// zero-height rect still gets *some* content rather than a panicking
+// view.
 fn editor_content_rows(rect: Rect) -> usize {
-    rect.rows.saturating_sub(1).max(1)
+    rect.rows.max(1)
 }
 
 // "-- NORMAL --"/"-- VISUAL --"/"-- VISUAL LINE --"/"-- INSERT --"/
@@ -1190,11 +1196,17 @@ fn render_row(out: &mut String, buf: &TextBuffer, line: usize, hoffset: usize, c
 // The actual rendering, factored out as a pure string-builder (build the
 // whole escape-coded string first, print/feed it exactly once) --
 // mirrors repl.rs's own `compose_redraw`/`render_compositor_frame`
-// split. Content rows + one status row, real-cursor positioning at the
-// end. Reimplemented here rather than shared with repl.rs's own
-// `render_normal_mode_frame`: the two render different concrete `Buffer`
-// types (that one reads a `ScreenBuffer`'s scrollback/live-grid split
-// directly, not through the `Buffer` trait at all).
+// split. Content rows plus real-cursor positioning at the end -- no
+// status row: that's the terminal's own global one now
+// (repl::render_global_status_row), drawn separately by render_editor_
+// frame, below, since it belongs at an absolute terminal position this
+// function's own pane-relative-or-absolute `row_origin`/`col_origin`
+// duality (see just below) has no way to express for freeze_editor_
+// frame's own target. Reimplemented here rather than shared with
+// repl.rs's own `render_normal_mode_frame`: the two render different
+// concrete `Buffer` types (that one reads a `ScreenBuffer`'s
+// scrollback/live-grid split directly, not through the `Buffer` trait at
+// all).
 //
 // `row_origin`/`col_origin`: where this pane's own row 0/col 0 actually
 // lands for *this* target -- `rect.row`/`rect.col` (this pane's real
@@ -1251,8 +1263,6 @@ pub fn build_editor_frame(buf: &TextBuffer, vk: &VimKeys, mode: EditorMode, rect
         }
     }
 
-    out.push_str(&format!("\x1b[{};{}H\x1b[7m{}\x1b[0m", row_origin + content_rows + 1, col_origin + 1, status_text(buf, vk, mode, rect.cols)));
-
     let (cl, cc) = buf.cursor();
     let screen_row = cl.saturating_sub(buf.viewport_top()).min(content_rows.saturating_sub(1));
     let screen_col = gutter_width + cc.saturating_sub(hoffset).min(content_cols.saturating_sub(1));
@@ -1260,8 +1270,10 @@ pub fn build_editor_frame(buf: &TextBuffer, vk: &VimKeys, mode: EditorMode, rect
     out
 }
 
-pub fn render_editor_frame(buf: &TextBuffer, vk: &VimKeys, mode: EditorMode, rect: Rect) {
-    print!("{}", build_editor_frame(buf, vk, mode, rect, rect.row, rect.col));
+pub fn render_editor_frame(buf: &TextBuffer, vk: &VimKeys, mode: EditorMode, rect: Rect, term_rows: usize, term_cols: usize) {
+    let mut out = crate::repl::render_global_status_row(&status_text(buf, vk, mode, term_cols), term_rows);
+    out.push_str(&build_editor_frame(buf, vk, mode, rect, rect.row, rect.col));
+    print!("{}", out);
     let _ = io::stdout().flush();
 }
 
@@ -1378,7 +1390,7 @@ mod macro_tests {
             KeyOutcome::Motion(m, count) => motion::apply_motion(buf, m, count),
             KeyOutcome::EnterInsert(cmd) => {
                 resolve_insert_start(buf, cmd);
-                run_insert_mode(buf, vk, rect(), registers, &mut || {}, false).unwrap();
+                run_insert_mode(buf, vk, rect(), registers, &mut || {}, false, 24, 80).unwrap();
             }
             other => panic!("unexpected outcome in this test: {other:?}"),
         }
