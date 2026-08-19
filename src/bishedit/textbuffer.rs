@@ -26,6 +26,13 @@ pub struct TextBuffer {
     cursor: (usize, usize),
     vtop: usize,
     vheight: usize,
+    // Horizontal counterpart to vtop -- how many columns of the current
+    // line are scrolled off to the left, so `set_cursor`/motions moving
+    // past whatever width the pane last rendered don't just get clipped
+    // off-screen with no way back (see Buffer::viewport_left's own doc
+    // comment). Kept in sync by fileeditor::scroll_to_show_cursor,
+    // exactly the way vtop is.
+    hleft: usize,
     marks: HashMap<char, (usize, usize)>,
     // Visual mode's own committed selections -- same field, same shape,
     // same reasoning as `repl.rs`'s `ScreenBuffer::selections`.
@@ -74,6 +81,7 @@ impl TextBuffer {
             cursor: (0, 0),
             vtop: 0,
             vheight: vheight.max(1),
+            hleft: 0,
             marks: HashMap::new(),
             selections: Vec::new(),
             diagnostics: Vec::new(),
@@ -108,6 +116,7 @@ impl TextBuffer {
             cursor: (0, 0),
             vtop: 0,
             vheight: vheight.max(1),
+            hleft: 0,
             marks: HashMap::new(),
             selections: Vec::new(),
             diagnostics: Vec::new(),
@@ -476,6 +485,14 @@ impl Buffer for TextBuffer {
         self.vheight
     }
 
+    fn viewport_left(&self) -> usize {
+        self.hleft
+    }
+
+    fn set_viewport_left(&mut self, col: usize) {
+        self.hleft = col;
+    }
+
     fn set_mark(&mut self, name: char, pos: (usize, usize)) {
         self.marks.insert(name, pos);
     }
@@ -498,6 +515,7 @@ mod tests {
             cursor: (0, 0),
             vtop: 0,
             vheight: 10,
+            hleft: 0,
             marks: HashMap::new(),
             selections: Vec::new(),
             diagnostics: Vec::new(),

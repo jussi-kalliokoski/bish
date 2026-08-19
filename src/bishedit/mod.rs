@@ -41,6 +41,31 @@ pub trait Buffer {
     fn set_viewport_top(&mut self, line: usize);
     fn viewport_height(&self) -> usize;
 
+    /// Horizontal counterpart to `viewport_top`/`viewport_height`: how
+    /// many columns of the current line are scrolled off to the left of
+    /// whatever width the caller last rendered at. Defaults to always `0`
+    /// (an implementor that never overrides `set_viewport_left` just
+    /// keeps rendering from column 0 forever) -- correct for `ScreenBuffer`
+    /// (`repl.rs`), whose content is already fixed-width, pre-wrapped
+    /// terminal output with nothing to scroll sideways *into*; the one
+    /// implementor that needs the real thing is `TextBuffer`, where a
+    /// single logical line can run arbitrarily wider than the pane (a
+    /// long URL, an unwrapped log line, ...) with nothing else to reflow
+    /// it. Kept in sync by `fileeditor::scroll_to_show_cursor`/`repl.rs`'s
+    /// own copy for `NavBuffer`, exactly the way `viewport_top` already
+    /// is -- see those for why the width to scroll by is passed in fresh
+    /// each call rather than also being trait state here: `viewport_
+    /// height` is set once at construction and never resynced on a later
+    /// resize (`TextBuffer::vheight`/`ScreenBuffer::vheight` are both
+    /// plain fields, no setter exists for either), which is close enough
+    /// for a scroll-trigger heuristic on rows that rarely change; column
+    /// width changes on ordinary vsplit/window resizes far more often, so
+    /// this axis doesn't repeat that shortcut.
+    fn viewport_left(&self) -> usize {
+        0
+    }
+    fn set_viewport_left(&mut self, _col: usize) {}
+
     /// `m{a-z}` / `` `{mark} `` / `'{mark}`. Marks are per-buffer state, same
     /// as the cursor and viewport -- every implementor owns its own storage.
     fn set_mark(&mut self, name: char, pos: (usize, usize));

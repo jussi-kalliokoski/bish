@@ -62,14 +62,39 @@ pub(crate) enum EditorMode {
     Replace,
 }
 
-pub(crate) fn scroll_to_show_cursor(buf: &mut TextBuffer) {
-    let (line, _) = buf.cursor();
+// `content_cols`: the pane's own current content width (post-gutter),
+// same value `build_editor_frame` itself would compute for `rect` right
+// now -- see `editor_content_cols`, which every caller of this function
+// uses to get it. Passed in fresh rather than read back off `buf` (unlike
+// `viewport_height`, a stored field with no resize hook -- see Buffer::
+// viewport_left's own doc comment) so a pane resize is honored on the
+// very next keystroke instead of only once `vheight` happens to get
+// resynced some other way.
+pub(crate) fn scroll_to_show_cursor(buf: &mut TextBuffer, content_cols: usize) {
+    let (line, col) = buf.cursor();
     let height = buf.viewport_height();
     if line < buf.viewport_top() {
         buf.set_viewport_top(line);
     } else if line >= buf.viewport_top() + height {
         buf.set_viewport_top(line + 1 - height);
     }
+    let width = content_cols.max(1);
+    if col < buf.viewport_left() {
+        buf.set_viewport_left(col);
+    } else if col >= buf.viewport_left() + width {
+        buf.set_viewport_left(col + 1 - width);
+    }
+}
+
+// How many columns are actually left for `buf`'s own text after its
+// gutter (line numbers, diagnostic markers) -- the exact formula build_
+// editor_frame itself uses for `content_cols`, factored out so scroll_
+// to_show_cursor's callers (run_insert_mode, and repl.rs's own copy for
+// NavBuffer navigation) can compute the same width without duplicating
+// the gutter-clamping arithmetic.
+pub(crate) fn editor_content_cols(buf: &TextBuffer, rect: Rect) -> usize {
+    let gutter_width = total_gutter_width(buf).min(rect.cols.saturating_sub(1));
+    rect.cols - gutter_width
 }
 
 // `d{motion}`/`c{motion}`: resolves `motion` against the buffer's own
@@ -726,7 +751,7 @@ pub(crate) fn run_insert_mode(buf: &mut TextBuffer, vk: &mut VimKeys, rect: Rect
             }
             _ => {}
         }
-        scroll_to_show_cursor(buf);
+        scroll_to_show_cursor(buf, editor_content_cols(buf, rect));
         render_editor_frame(buf, vk, mode, rect);
     }
 }
@@ -800,17 +825,27 @@ fn status_text(buf: &TextBuffer, vk: &VimKeys, mode: EditorMode, cols: usize) ->
 }
 
 // The (start, end) char-column range `range` covers on this one `line`,
-// if any -- mirrors repl.rs's own `selection_columns_in_line` exactly
-// (see its doc comment), just typed to `TextBuffer`.
-fn selection_columns_in_line(range: &motion::MotionRange, line: usize, cols: usize) -> Option<(usize, usize)> {
+// if any, already rebased to be relative to `hoffset` (Buffer::
+// viewport_left) and clamped to `cols` -- i.e. directly usable as an
+// index into render_row's own viewport-window-local `chars` array,
+// unlike spans_for_line/diagnostic_spans_for_line just below, which stay
+// line-absolute and get shifted separately inside render_row itself (see
+// its own doc comment for why the two don't share one convention: a
+// Linewise selection's own `(0, cols)` is *already* viewport-local by
+// definition -- it means "the whole visible row," not "the whole line's
+// own text," so shifting it by `hoffset` again would be wrong). Once
+// mirrored exactly by repl.rs's own `selection_columns_in_line` (see its
+// doc comment); that one stays hoffset-less on purpose -- ScreenBuffer
+// never scrolls horizontally (Buffer::viewport_left's own doc comment).
+fn selection_columns_in_line(range: &motion::MotionRange, line: usize, hoffset: usize, cols: usize) -> Option<(usize, usize)> {
     if line < range.from.0 || line > range.to.0 {
         return None;
     }
     if range.shape == motion::MotionShape::Linewise {
         return Some((0, cols));
     }
-    let start = if line == range.from.0 { range.from.1 } else { 0 };
-    let end = if line == range.to.0 { range.to.1 + 1 } else { cols };
+    let start = if line == range.from.0 { range.from.1.saturating_sub(hoffset) } else { 0 };
+    let end = if line == range.to.0 { (range.to.1 + 1).saturating_sub(hoffset).min(cols) } else { cols };
     Some((start, end))
 }
 
@@ -1121,15 +1156,34 @@ fn spans_for_line(spans: &[StyledSpan], line_start: usize, line_len: usize) -> V
 // text over a diagnostic still reads as a selection first (matching
 // selection's own "wins regardless of what it's covering" rule, one
 // layer up).
-fn render_row(out: &mut String, buf: &TextBuffer, line: usize, cols: usize, line_styled: &[StyledSpan], diag_styled: &[StyledSpan], highlights: &[(usize, usize)]) {
-    let chars: Vec<char> = (0..cols).map(|c| buf.char_at(line, c).unwrap_or(' ')).collect();
+// `hoffset` (Buffer::viewport_left): `chars` is a *window* onto the
+// line, columns `hoffset..hoffset+cols`, not the line's own start --
+// `highlights` (selection_columns_in_line's own output) is already
+// expressed in that same window-local frame (its own doc comment on
+// why), but `line_styled`/`diag_styled` are still line-absolute (0 =
+// the line's own first character, per spans_for_line/diagnostic_spans_
+// for_line), so those two need rebasing by `hoffset` right here before
+// they can index into `chars` at all.
+#[allow(clippy::too_many_arguments)]
+fn render_row(out: &mut String, buf: &TextBuffer, line: usize, hoffset: usize, cols: usize, line_styled: &[StyledSpan], diag_styled: &[StyledSpan], highlights: &[(usize, usize)]) {
+    let chars: Vec<char> = (0..cols).map(|c| buf.char_at(line, hoffset + c).unwrap_or(' ')).collect();
 
     let selected: Vec<StyledSpan> = highlights
         .iter()
         .map(|&(start, end)| StyledSpan { start, end, fg: vt100::Color::Default, attrs: vt100::CellAttrs { reverse: true, ..vt100::CellAttrs::default() } })
         .collect();
 
-    let cells = highlight::compose(&chars, &[line_styled, diag_styled, &selected]);
+    fn rebase(spans: &[StyledSpan], hoffset: usize, cols: usize) -> Vec<StyledSpan> {
+        spans
+            .iter()
+            .filter(|s| s.end > hoffset && s.start < hoffset + cols)
+            .map(|s| StyledSpan { start: s.start.saturating_sub(hoffset), end: (s.end - hoffset).min(cols), fg: s.fg, attrs: s.attrs })
+            .collect()
+    }
+    let line_styled = rebase(line_styled, hoffset, cols);
+    let diag_styled = rebase(diag_styled, hoffset, cols);
+
+    let cells = highlight::compose(&chars, &[&line_styled, &diag_styled, &selected]);
     out.push_str(&highlight::render_styled(&cells));
 }
 
@@ -1163,6 +1217,16 @@ pub fn build_editor_frame(buf: &TextBuffer, vk: &VimKeys, mode: EditorMode, rect
     // underflow without this.
     let gutter_width = total_gutter_width(buf).min(rect.cols.saturating_sub(1));
     let content_cols = rect.cols - gutter_width;
+    // How far this line's own rendering is scrolled right -- see Buffer::
+    // viewport_left's own doc comment. scroll_to_show_cursor is what
+    // actually keeps this in bounds of the cursor's own column; nothing
+    // here clamps it, so a buffer that's never had a cursor move onto a
+    // long line (or whose gutter just grew, e.g. crossing a line-count
+    // digit boundary, shrinking content_cols out from under an old
+    // offset) could in principle scroll a short line's content fully off
+    // to the left -- reachable only via a resize/edit race no test below
+    // exercises, and self-correcting the moment the cursor moves again.
+    let hoffset = buf.viewport_left();
     let active = if mode == EditorMode::Normal { crate::repl::active_visual_range(vk, buf) } else { None };
     // Computed once for the whole buffer, not per visible row -- see
     // buffer_highlight_spans's own doc comment for why a multi-line
@@ -1177,13 +1241,13 @@ pub fn build_editor_frame(buf: &TextBuffer, vk: &VimKeys, mode: EditorMode, rect
         if line < total {
             let mut highlights = Vec::new();
             for range in buf.selections.iter().chain(active.iter()) {
-                if let Some(cols) = selection_columns_in_line(range, line, content_cols) {
+                if let Some(cols) = selection_columns_in_line(range, line, hoffset, content_cols) {
                     highlights.push(cols);
                 }
             }
             let line_styled = spans_for_line(&whole_styled, starts[line], buf.line_len(line));
             let diag_styled = diagnostic_spans_for_line(&buf.diagnostics, starts[line], buf.line_len(line));
-            render_row(&mut out, buf, line, content_cols, &line_styled, &diag_styled, &highlights);
+            render_row(&mut out, buf, line, hoffset, content_cols, &line_styled, &diag_styled, &highlights);
         }
     }
 
@@ -1191,7 +1255,7 @@ pub fn build_editor_frame(buf: &TextBuffer, vk: &VimKeys, mode: EditorMode, rect
 
     let (cl, cc) = buf.cursor();
     let screen_row = cl.saturating_sub(buf.viewport_top()).min(content_rows.saturating_sub(1));
-    let screen_col = gutter_width + cc.min(content_cols.saturating_sub(1));
+    let screen_col = gutter_width + cc.saturating_sub(hoffset).min(content_cols.saturating_sub(1));
     out.push_str(&format!("\x1b[{};{}H\x1b[?25h", row_origin + screen_row + 1, col_origin + screen_col + 1));
     out
 }
@@ -1470,5 +1534,68 @@ mod diagnose_tests {
         let diagnostic = lint::Diagnostic { start: 5, end: 9, severity: lint::Severity::Warning, code: "unquoted-expansion", message: String::new(), fix: None };
         assert!(!apply_fix(&mut buf, &diagnostic));
         assert_eq!(buf.line_chars(0).into_iter().collect::<String>(), "echo $foo");
+    }
+}
+
+#[cfg(test)]
+mod horizontal_scroll_tests {
+    use super::*;
+
+    fn buf(text: &str) -> TextBuffer {
+        let mut buf = TextBuffer::new_unnamed(10);
+        buf.insert_text((0, 0), text);
+        buf.set_cursor(0, 0);
+        buf
+    }
+
+    #[test]
+    fn scroll_to_show_cursor_leaves_viewport_left_at_zero_while_the_cursor_fits() {
+        let mut b = buf("hello world");
+        b.set_cursor(0, 5);
+        scroll_to_show_cursor(&mut b, 10);
+        assert_eq!(b.viewport_left(), 0);
+    }
+
+    #[test]
+    fn scroll_to_show_cursor_scrolls_right_just_far_enough_to_keep_the_cursor_visible() {
+        let mut b = buf(&"x".repeat(50));
+        b.set_cursor(0, 20);
+        scroll_to_show_cursor(&mut b, 10);
+        // The cursor (column 20) must be the *last* visible column of a
+        // 10-wide window -- vim's own "scroll exactly enough, not all the
+        // way" convention, same one viewport_top already follows.
+        assert_eq!(b.viewport_left(), 11);
+    }
+
+    #[test]
+    fn scroll_to_show_cursor_scrolls_back_left_once_the_cursor_moves_before_the_viewport() {
+        let mut b = buf(&"x".repeat(50));
+        b.set_cursor(0, 20);
+        scroll_to_show_cursor(&mut b, 10);
+        assert_eq!(b.viewport_left(), 11);
+        b.set_cursor(0, 3);
+        scroll_to_show_cursor(&mut b, 10);
+        assert_eq!(b.viewport_left(), 3);
+    }
+
+    #[test]
+    fn selection_columns_in_line_rebases_a_charwise_range_by_hoffset_and_clamps_to_cols() {
+        let range = motion::MotionRange { shape: motion::MotionShape::Inclusive, from: (0, 15), to: (0, 24) };
+        // Scrolled 10 columns right, a 10-wide window: the selection
+        // (line-absolute 15..25) becomes window-local 5..10, clamped at
+        // the window's own right edge.
+        assert_eq!(selection_columns_in_line(&range, 0, 10, 10), Some((5, 10)));
+    }
+
+    #[test]
+    fn selection_columns_in_line_clamps_a_charwise_range_starting_left_of_the_viewport() {
+        let range = motion::MotionRange { shape: motion::MotionShape::Inclusive, from: (0, 0), to: (0, 24) };
+        assert_eq!(selection_columns_in_line(&range, 0, 10, 10), Some((0, 10)));
+    }
+
+    #[test]
+    fn selection_columns_in_line_linewise_always_spans_the_full_viewport_window_regardless_of_hoffset() {
+        let range = motion::MotionRange { shape: motion::MotionShape::Linewise, from: (0, 0), to: (0, 0) };
+        assert_eq!(selection_columns_in_line(&range, 0, 37, 10), Some((0, 10)));
     }
 }

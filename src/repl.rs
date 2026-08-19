@@ -1205,7 +1205,7 @@ fn run_edit_frame(
             job_frames,
             cmd_history,
             registers,
-            NavStart::Edit(buffer, Box::new(vk)),
+            NavStart::Edit(Box::new(buffer), Box::new(vk)),
             term_rows,
             term_cols,
         );
@@ -3255,6 +3255,24 @@ impl BisheditBuffer for NavBuffer {
         }
     }
 
+    // ReadOnly's own ScreenBuffer never overrides Buffer::viewport_left's
+    // default (always 0, see that method's own doc comment) -- delegated
+    // through anyway rather than just relying on NavBuffer's own default,
+    // so Editable's real TextBuffer value is actually used.
+    fn viewport_left(&self) -> usize {
+        match self {
+            NavBuffer::ReadOnly(b) => b.viewport_left(),
+            NavBuffer::Editable(b) => b.viewport_left(),
+        }
+    }
+
+    fn set_viewport_left(&mut self, col: usize) {
+        match self {
+            NavBuffer::ReadOnly(b) => b.set_viewport_left(col),
+            NavBuffer::Editable(b) => b.set_viewport_left(col),
+        }
+    }
+
     fn set_mark(&mut self, name: char, pos: (usize, usize)) {
         match self {
             NavBuffer::ReadOnly(b) => b.set_mark(name, pos),
@@ -3280,14 +3298,35 @@ impl BisheditBuffer for NavBuffer {
 // Adjusts `buf`'s viewport so its navigation cursor's line is visible,
 // scrolling as little as possible -- matching vim's own scrolling, which
 // only jumps when the cursor would otherwise move off-screen, not
-// recentering on every motion.
-fn scroll_to_show_cursor(buf: &mut impl BisheditBuffer) {
-    let (line, _) = buf.cursor();
+// recentering on every motion. `content_cols`: this pane's own current
+// content width (see `nav_content_cols`) -- a no-op horizontally for a
+// `ReadOnly` `ScreenBuffer` (`Buffer::viewport_left`'s own doc comment
+// on why that one never actually scrolls), the real thing for `Editable`
+// (mirrors `fileeditor::scroll_to_show_cursor` exactly).
+fn scroll_to_show_cursor(buf: &mut impl BisheditBuffer, content_cols: usize) {
+    let (line, col) = buf.cursor();
     let height = buf.viewport_height();
     if line < buf.viewport_top() {
         buf.set_viewport_top(line);
     } else if line >= buf.viewport_top() + height {
         buf.set_viewport_top(line + 1 - height);
+    }
+    let width = content_cols.max(1);
+    if col < buf.viewport_left() {
+        buf.set_viewport_left(col);
+    } else if col >= buf.viewport_left() + width {
+        buf.set_viewport_left(col + 1 - width);
+    }
+}
+
+// `buf`'s own current content width for scroll_to_show_cursor's purposes
+// -- `ReadOnly`'s `ScreenBuffer` has no gutter at all (the whole pane
+// width is content), `Editable`'s `TextBuffer` does (see
+// fileeditor::editor_content_cols).
+fn nav_content_cols(buf: &NavBuffer, rect: Rect) -> usize {
+    match buf {
+        NavBuffer::ReadOnly(_) => rect.cols,
+        NavBuffer::Editable(tb) => fileeditor::editor_content_cols(tb, rect),
     }
 }
 
@@ -3678,12 +3717,15 @@ enum NavStart {
     // the duration, handed back (mutated) via the paired
     // `Option<(TextBuffer, VimKeys)>` this function returns alongside
     // its `NavExit`, regardless of which one that turns out to be.
-    // `VimKeys` is boxed only to keep this enum's own size close to its
-    // other two (unit-ish) variants -- `Prompt`'s inline `String` is by
-    // far the common case, and clippy flags an enum whose largest
+    // Both fields are boxed only to keep this enum's own size close to
+    // its other two (unit-ish) variants -- `Prompt`'s inline `String` is
+    // by far the common case, and clippy flags an enum whose largest
     // variant dwarfs the rest, since every `NavStart` value pays that
-    // largest variant's stack size regardless of which one it is.
-    Edit(TextBuffer, Box<VimKeys>),
+    // largest variant's stack size regardless of which one it is. The
+    // return type (`Option<(TextBuffer, VimKeys)>`) stays unboxed --
+    // that's a plain function return, not a value every other variant of
+    // some enum has to be sized against.
+    Edit(Box<TextBuffer>, Box<VimKeys>),
 }
 
 // What happened when `run_normal_mode_navigation` returns -- interpreted
@@ -3832,7 +3874,7 @@ fn run_normal_mode_navigation(
             let screen = sessions[&session_id].screen.clone();
             (NavBuffer::ReadOnly(ScreenBuffer::new(screen, normal_mode_content_rows(rect))), VimKeys::new())
         }
-        NavStart::Edit(tb, vk0) => (NavBuffer::Editable(tb), *vk0),
+        NavStart::Edit(tb, vk0) => (NavBuffer::Editable(*tb), *vk0),
     };
 
     let _guard = term::RawGuard::enable_with_mouse(0)?;
@@ -4242,7 +4284,8 @@ fn run_normal_mode_navigation(
         match vk.feed(key) {
             KeyOutcome::Motion(m, count) => {
                 editor::apply_motion_or_reselect(&mut vk, &mut buf, m, count);
-                scroll_to_show_cursor(&mut buf);
+                let content_cols = nav_content_cols(&buf, rect);
+                scroll_to_show_cursor(&mut buf, content_cols);
                 render_nav_frame(&mut buf, &vk, rect);
             }
             // `ReadOnly`: hands typing back to the live prompt's own
@@ -4310,7 +4353,8 @@ fn run_normal_mode_navigation(
                     let row = row.min(buf.line_count() - 1);
                     let col = col.min(buf.line_len(row));
                     buf.set_cursor(row, col);
-                    scroll_to_show_cursor(&mut buf);
+                    let content_cols = nav_content_cols(&buf, rect);
+                    scroll_to_show_cursor(&mut buf, content_cols);
                 }
                 render_nav_frame(&mut buf, &vk, rect);
             }
