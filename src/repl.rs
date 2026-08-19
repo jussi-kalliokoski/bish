@@ -149,15 +149,28 @@ impl Pane {
 // compute_regions/split_sizes). `weight` is simply ignored while `fixed`
 // is set, rather than the two interacting -- there's no case yet where
 // a pane needs both "resizable" and "pinned" at once. The diagnostics
-// pane (see Frame::Diagnostics) is the one thing that uses this today,
-// toggling between `Some(1)` (collapsed, just its own title row) and
-// `Some(n)` (expanded to show its list) as it gains/loses focus -- every
-// other `SplitChild` anywhere else stays `fixed: None` and behaves
-// identically to before this field existed.
+// pane (see Frame::Diagnostics) uses this while *expanded*, to size
+// itself to its own list content -- capped by its own caller at half of
+// whatever space was available before it expanded (see
+// diagnostics_pane_rows), so this alone can't be used to demand more
+// than half the split.
+//
+// `minimized` is a separate, more drastic state, for the same pane
+// while *collapsed*: it folds down to exactly one row/column, and --
+// unlike an ordinary `fixed: Some(1)` -- compute_regions skips
+// reserving a *separate* divider line on either side of it, since a
+// minimized pane's own single row already reads as that divider (see
+// its own doc comment for the exact rule and render_diagnostics_title
+// for what actually gets drawn into it: a title "pill" set into an
+// otherwise ordinary-looking divider line, not a full-width bar).
+// `fixed`/`weight` are simply irrelevant while `minimized` is set. Every
+// `SplitChild` anywhere else stays `fixed: None, minimized: false` and
+// behaves identically to before these fields existed.
 struct SplitChild {
     layout: PaneLayout,
     weight: f64,
     fixed: Option<usize>,
+    minimized: bool,
 }
 
 // How a window's screen area is currently divided among its panes.
@@ -1262,19 +1275,23 @@ fn editor_pane_for(window: &WindowEntry, edit_frame_id: EditFrameId) -> Option<P
     window.panes.iter().find(|p| p.stack.last() == Some(&Frame::Edit(edit_frame_id))).map(|p| p.id)
 }
 
-// How many rows the diagnostics pane's own SplitChild should claim right
-// now: collapsed to its own single title row when nothing's expanded,
-// or the whole list plus DIAG_DETAIL_ROWS more for the selected item's
-// own detail block when something is. Clamped the same way either way
-// so neither an empty list nor a huge one makes the pane degenerate or
-// swallow the whole window.
+// How many rows the diagnostics pane's own SplitChild should claim
+// while expanded (focused): sized to fit its own list content, plus
+// DIAG_DETAIL_ROWS more while the selected item's own detail block is
+// showing (see Space's own handling) -- but capped at half of `budget`
+// regardless of how long the list or the detail gets, per this
+// feature's own spec ("only the space it needs, up to 50%"). `budget`
+// is the split's own total (the editor sibling's rows *plus* the one
+// row a minimized pane's own divider-pill costs -- see SplitChild's own
+// doc comment), captured once when this pane is first focused and
+// reused for every resize during that same focus session, not
+// recomputed from the *already-shrunk* editor rect on every keystroke
+// (which would make the cap itself shrink every time the pane grew).
 const DIAG_DETAIL_ROWS: usize = 2;
-fn diagnostics_pane_rows(diagnostics_len: usize, expanded: bool) -> usize {
-    if expanded {
-        (diagnostics_len + DIAG_DETAIL_ROWS).clamp(3, 14)
-    } else {
-        diagnostics_len.clamp(1, 12)
-    }
+fn diagnostics_pane_rows(diagnostics_len: usize, show_detail: bool, budget: usize) -> usize {
+    let max_rows = (budget / 2).max(1);
+    let wanted = if show_detail { diagnostics_len + DIAG_DETAIL_ROWS } else { diagnostics_len };
+    wanted.max(1).min(max_rows)
 }
 
 // The diagnostics pane's own interactive list -- dispatched from repl::
@@ -1324,13 +1341,28 @@ fn run_diagnostics_frame(
     let mut selected: usize = 0;
     let mut expanded: Option<usize> = None;
 
-    let set_rows = |windows: &mut Vec<WindowEntry>, current_window: usize, rows: usize| {
+    // Captured once, before this pane grows at all -- see
+    // diagnostics_pane_rows's own doc comment for why this can't just
+    // be recomputed from the editor's own (by-then-shrunk) rect on
+    // every later resize instead.
+    let budget = editor_pane_for(&windows[*current_window], edit_frame_id)
+        .map(|id| pane_rect(&windows[*current_window], id, term_rows, term_cols).rows + 1)
+        .unwrap_or(term_rows);
+
+    let set_expanded = |windows: &mut Vec<WindowEntry>, current_window: usize, rows: usize| {
         if let Some((_, children, idx)) = find_parent_split_mut(&mut windows[current_window].layout, pane_id) {
+            children[idx].minimized = false;
             children[idx].fixed = Some(rows);
         }
     };
+    let set_minimized = |windows: &mut Vec<WindowEntry>, current_window: usize| {
+        if let Some((_, children, idx)) = find_parent_split_mut(&mut windows[current_window].layout, pane_id) {
+            children[idx].minimized = true;
+            children[idx].fixed = None;
+        }
+    };
     let diagnostics_len = edit_frames.get(&edit_frame_id).map(|s| s.buffer.diagnostics.len()).unwrap_or(0);
-    set_rows(windows, *current_window, diagnostics_pane_rows(diagnostics_len, false));
+    set_expanded(windows, *current_window, diagnostics_pane_rows(diagnostics_len, false, budget));
     compositor_redraw(sessions, windows, *current_window, term_rows, term_cols);
 
     loop {
@@ -1378,7 +1410,7 @@ fn run_diagnostics_frame(
                 let sid = windows[*current_window].pane(pane_id).owning_session();
                 render_diagnostics_title(&sessions[&sid].screen, rect.cols, &session.buffer.diagnostics);
             }
-            set_rows(windows, *current_window, 1);
+            set_minimized(windows, *current_window);
             if let Some(editor_pane) = editor_pane_for(&windows[*current_window], edit_frame_id) {
                 windows[*current_window].focused_pane = editor_pane;
             }
@@ -1398,7 +1430,7 @@ fn run_diagnostics_frame(
             Key::Char(' ') => {
                 expanded = if expanded == Some(selected) { None } else { Some(selected) };
                 let diagnostics_len = edit_frames.get(&edit_frame_id).map(|s| s.buffer.diagnostics.len()).unwrap_or(0);
-                set_rows(windows, *current_window, diagnostics_pane_rows(diagnostics_len, expanded.is_some()));
+                set_expanded(windows, *current_window, diagnostics_pane_rows(diagnostics_len, expanded.is_some(), budget));
                 compositor_redraw(sessions, windows, *current_window, term_rows, term_cols);
             }
             // `f`: applies the selected item's own fix, only while its
@@ -1423,7 +1455,7 @@ fn run_diagnostics_frame(
                     let diagnostics_len = edit_frames.get(&edit_frame_id).map(|s| s.buffer.diagnostics.len()).unwrap_or(0);
                     selected = selected.min(diagnostics_len.saturating_sub(1));
                     expanded = None;
-                    set_rows(windows, *current_window, diagnostics_pane_rows(diagnostics_len, false));
+                    set_expanded(windows, *current_window, diagnostics_pane_rows(diagnostics_len, false, budget));
                     compositor_redraw(sessions, windows, *current_window, term_rows, term_cols);
                 }
             }
@@ -1751,7 +1783,7 @@ fn split_focused_pane(
 
     let focused_id = window.focused_pane;
     let old_layout = std::mem::replace(&mut window.layout, PaneLayout::Leaf(0));
-    window.layout = insert_sibling(old_layout, focused_id, new_pane_id, horizontal, None);
+    window.layout = insert_sibling(old_layout, focused_id, new_pane_id, horizontal, None, false);
 
     // The pane being split is about to lose focus to its new sibling --
     // freeze its current idle prompt into its own grid first, or it'll
@@ -1774,13 +1806,13 @@ fn split_focused_pane(
 // from" pattern (see Frame's own doc comment on why every pane needs
 // one), but the new pane is never a usable shell: `Frame::Diagnostics
 // (edit_frame_id)` goes straight on top of its `Frame::Session`, it
-// starts collapsed (`fixed: Some(1)`), and -- unlike an ordinary
-// `<C-w>s`/`<C-w>v` split -- focus stays right where it was (running
-// `:diag` shouldn't yank you out of the file you're editing). Always a
-// horizontal split (the pane goes at the bottom, per the feature's own
-// name); `focused_id` is the *editor's* own pane, i.e. whichever pane
-// is currently focused when `:diag` runs (it's the one driving this
-// command in the first place).
+// starts `minimized` (see SplitChild's own doc comment), and -- unlike
+// an ordinary `<C-w>s`/`<C-w>v` split -- focus stays right where it was
+// (running `:diag` shouldn't yank you out of the file you're editing).
+// Always a horizontal split (the pane goes at the bottom, per the
+// feature's own name); `focused_id` is the *editor's* own pane, i.e.
+// whichever pane is currently focused when `:diag` runs (it's the one
+// driving this command in the first place).
 fn split_diagnostics_pane(
     sessions: &mut HashMap<SessionId, SessionState>,
     windows: &mut [WindowEntry],
@@ -1819,7 +1851,7 @@ fn split_diagnostics_pane(
 
     let focused_id = window.focused_pane;
     let old_layout = std::mem::replace(&mut window.layout, PaneLayout::Leaf(0));
-    window.layout = insert_sibling(old_layout, focused_id, new_pane_id, true, Some(1));
+    window.layout = insert_sibling(old_layout, focused_id, new_pane_id, true, None, true);
 
     new_pane_id
 }
@@ -1839,14 +1871,29 @@ fn diagnostics_sibling(window: &WindowEntry, edit_frame_id: EditFrameId) -> Opti
 // grid outside of anything actually being "typed". Left-aligned; the
 // rest of the row is left blank (reverse video still fills it visually
 // once composited, same as how render_row already pads a styled run).
+// The whole point of `minimized` (see SplitChild's own doc comment):
+// this pane's one row *is* the divider between it and the editor pane
+// above it, styled to read as one -- a short reverse-video "pill"
+// holding the title, set into an otherwise ordinary dashed divider
+// line, not a full-width bar filling the entire row (that read as its
+// own separate content line sitting *below* a real, plain divider,
+// exactly the "title shown as a separate line" this replaces).
 fn render_diagnostics_title(screen: &Rc<RefCell<vt100::Screen>>, cols: usize, diagnostics: &[lint::Diagnostic]) {
     let text = match diagnostics.len() {
         0 => "No problems found".to_string(),
         1 => "1 problem found".to_string(),
         n => format!("{n} problems found"),
     };
-    let padded = format!("{:<width$}", text, width = cols);
-    let framed = format!("\r\x1b[K\x1b[7m{}\x1b[0m", padded);
+    let pill: String = format!(" {text} ").chars().take(cols).collect();
+    let pill_len = pill.chars().count();
+    let left = 2.min(cols.saturating_sub(pill_len));
+    let right = cols.saturating_sub(pill_len + left);
+    let mut framed = String::from("\r\x1b[K");
+    framed.push_str(&"─".repeat(left));
+    framed.push_str("\x1b[7m");
+    framed.push_str(&pill);
+    framed.push_str("\x1b[0m");
+    framed.push_str(&"─".repeat(right));
     screen.borrow_mut().feed(framed.as_bytes());
 }
 
@@ -1932,13 +1979,13 @@ fn freeze_input_with_text(session: &mut SessionState, text: &str) -> String {
 // (compute_regions splits one Split's area evenly among however many
 // children it has) rather than each new split only ever halving
 // whatever was there before.
-fn insert_sibling(layout: PaneLayout, target: PaneId, new_id: PaneId, horizontal: bool, new_fixed: Option<usize>) -> PaneLayout {
+fn insert_sibling(layout: PaneLayout, target: PaneId, new_id: PaneId, horizontal: bool, new_fixed: Option<usize>, new_minimized: bool) -> PaneLayout {
     match layout {
         PaneLayout::Leaf(id) if id == target => PaneLayout::Split {
             horizontal,
             children: vec![
-                SplitChild { layout: PaneLayout::Leaf(id), weight: 1.0, fixed: None },
-                SplitChild { layout: PaneLayout::Leaf(new_id), weight: 1.0, fixed: new_fixed },
+                SplitChild { layout: PaneLayout::Leaf(id), weight: 1.0, fixed: None, minimized: false },
+                SplitChild { layout: PaneLayout::Leaf(new_id), weight: 1.0, fixed: new_fixed, minimized: new_minimized },
             ],
         },
         PaneLayout::Leaf(id) => PaneLayout::Leaf(id),
@@ -1947,13 +1994,13 @@ fn insert_sibling(layout: PaneLayout, target: PaneId, new_id: PaneId, horizontal
             if let Some(idx) = direct_child_idx {
                 if h == horizontal {
                     let mut children = children;
-                    children.insert(idx + 1, SplitChild { layout: PaneLayout::Leaf(new_id), weight: 1.0, fixed: new_fixed });
+                    children.insert(idx + 1, SplitChild { layout: PaneLayout::Leaf(new_id), weight: 1.0, fixed: new_fixed, minimized: new_minimized });
                     return PaneLayout::Split { horizontal: h, children };
                 }
             }
             let children = children
                 .into_iter()
-                .map(|c| SplitChild { layout: insert_sibling(c.layout, target, new_id, horizontal, new_fixed), weight: c.weight, fixed: c.fixed })
+                .map(|c| SplitChild { layout: insert_sibling(c.layout, target, new_id, horizontal, new_fixed, new_minimized), weight: c.weight, fixed: c.fixed, minimized: c.minimized })
                 .collect();
             PaneLayout::Split { horizontal: h, children }
         }
@@ -1978,7 +2025,7 @@ fn remove_from_layout(layout: PaneLayout, target: PaneId) -> Option<PaneLayout> 
         PaneLayout::Split { horizontal, children } => {
             let new_children: Vec<SplitChild> = children
                 .into_iter()
-                .filter_map(|c| remove_from_layout(c.layout, target).map(|layout| SplitChild { layout, weight: c.weight, fixed: c.fixed }))
+                .filter_map(|c| remove_from_layout(c.layout, target).map(|layout| SplitChild { layout, weight: c.weight, fixed: c.fixed, minimized: c.minimized }))
                 .collect();
             match new_children.len() {
                 0 => None,
@@ -2443,36 +2490,58 @@ struct CompositorLayout {
 // `.max(1)` below), this only guards the weight arithmetic itself.
 const MIN_PANE_WEIGHT: f64 = 0.05;
 
+// Whether a divider line is drawn between `children[i]` and
+// `children[i + 1]` -- every adjacent pair, except where either side is
+// `minimized` (see SplitChild's own doc comment): a minimized pane's
+// own single row already reads as the boundary between it and its
+// neighbor, so a further, separate divider line right next to it would
+// just be a redundant blank line. Shared by split_sizes (to know how
+// much of the axis dividers actually consume) and compute_regions (to
+// know where to actually draw one).
+fn dividers_after(children: &[SplitChild]) -> Vec<bool> {
+    (0..children.len().saturating_sub(1)).map(|i| !(children[i].minimized || children[i + 1].minimized)).collect()
+}
+
 // One Split's own children resolved down to how many cells each gets
 // along the split's own axis (`usable` -- the area already minus every
-// reserved divider strip): every `fixed`-child (see SplitChild's own
-// doc comment) claims its own requested count first, clamped so it can
-// never squeeze a `fixed: None` sibling below 1 cell; whatever's left
-// then divides among those weighted siblings exactly the way this used
-// to work before `fixed` existed -- proportional to weight/(sum of
-// weighted siblings' weights), with the *last* weighted child (not
-// necessarily the last child overall) absorbing the rounding remainder
-// so the weighted children's own total always adds up exactly. With no
-// `fixed` children at all (every existing call site, before this pane
-// type), `weighted_count == children.len()` and this is byte-for-byte
-// the original formula.
+// *actually drawn* divider strip, see dividers_after). A `minimized`
+// child always claims exactly one cell, first, regardless of `fixed`/
+// `weight` (both irrelevant while minimized). Of what's left, every
+// `fixed`-child (see SplitChild's own doc comment) claims its own
+// requested count next, clamped so it can never squeeze a plain
+// `fixed: None` sibling below 1 cell; whatever's left after *that* then
+// divides among those weighted siblings exactly the way this used to
+// work before `fixed`/`minimized` existed -- proportional to weight/
+// (sum of weighted siblings' weights), with the *last* weighted child
+// (not necessarily the last child overall) absorbing the rounding
+// remainder so the weighted children's own total always adds up
+// exactly. With no `fixed`/`minimized` children at all (every existing
+// call site, before this pane type), `weighted_count == children.len()`
+// and this is byte-for-byte the original formula.
 fn split_sizes(children: &[SplitChild], usable: usize) -> Vec<usize> {
-    let weighted_count = children.iter().filter(|c| c.fixed.is_none()).count();
     let mut sizes = vec![0usize; children.len()];
     let mut budget = usable;
     for (i, child) in children.iter().enumerate() {
-        if let Some(f) = child.fixed {
+        if child.minimized {
+            let size = 1.min(budget);
+            sizes[i] = size;
+            budget = budget.saturating_sub(size);
+        }
+    }
+    let weighted_count = children.iter().filter(|c| !c.minimized && c.fixed.is_none()).count();
+    for (i, child) in children.iter().enumerate() {
+        if let (false, Some(f)) = (child.minimized, child.fixed) {
             let reserve_for_weighted = weighted_count.min(budget);
             let size = f.min(budget.saturating_sub(reserve_for_weighted)).max(1.min(budget));
             sizes[i] = size;
             budget = budget.saturating_sub(size);
         }
     }
-    let total_weight: f64 = children.iter().filter(|c| c.fixed.is_none()).map(|c| c.weight.max(MIN_PANE_WEIGHT)).sum();
+    let total_weight: f64 = children.iter().filter(|c| !c.minimized && c.fixed.is_none()).map(|c| c.weight.max(MIN_PANE_WEIGHT)).sum();
     let mut allocated = 0usize;
     let mut seen = 0usize;
     for (i, child) in children.iter().enumerate() {
-        if child.fixed.is_some() {
+        if child.minimized || child.fixed.is_some() {
             continue;
         }
         seen += 1;
@@ -2493,7 +2562,9 @@ fn split_sizes(children: &[SplitChild], usable: usize) -> Vec<usize> {
 // separately (row=true for a horizontal divider line, running
 // left-right; false for a vertical one, running top-bottom) so the
 // caller can draw them after every pane's own content, rather than each
-// Split trying to draw into space a child might otherwise want.
+// Split trying to draw into space a child might otherwise want --
+// skipped entirely between a minimized child and its neighbor (see
+// dividers_after).
 fn compute_regions(layout: &PaneLayout, area: Rect, out: &mut Vec<(PaneId, Rect)>, dividers: &mut Vec<(Rect, bool)>) {
     match layout {
         PaneLayout::Leaf(id) => out.push((*id, area)),
@@ -2502,17 +2573,19 @@ fn compute_regions(layout: &PaneLayout, area: Rect, out: &mut Vec<(PaneId, Rect)
             if n == 0 {
                 return;
             }
+            let draws_divider = dividers_after(children);
+            let divider_count = draws_divider.iter().filter(|d| **d).count();
             if *horizontal {
                 // Panes stacked top/bottom; the divider is the horizontal
                 // line between them.
-                let usable = area.rows.saturating_sub(n - 1);
+                let usable = area.rows.saturating_sub(divider_count);
                 let sizes = split_sizes(children, usable);
                 let mut row = area.row;
                 for (i, child) in children.iter().enumerate() {
                     let h = sizes[i];
                     compute_regions(&child.layout, Rect { row, col: area.col, rows: h, cols: area.cols }, out, dividers);
                     row += h;
-                    if i + 1 < n {
+                    if i + 1 < n && draws_divider[i] {
                         dividers.push((Rect { row, col: area.col, rows: 1, cols: area.cols }, true));
                         row += 1;
                     }
@@ -2520,14 +2593,14 @@ fn compute_regions(layout: &PaneLayout, area: Rect, out: &mut Vec<(PaneId, Rect)
             } else {
                 // Panes side by side; the divider is the vertical line
                 // between them.
-                let usable = area.cols.saturating_sub(n - 1);
+                let usable = area.cols.saturating_sub(divider_count);
                 let sizes = split_sizes(children, usable);
                 let mut col = area.col;
                 for (i, child) in children.iter().enumerate() {
                     let w = sizes[i];
                     compute_regions(&child.layout, Rect { row: area.row, col, rows: area.rows, cols: w }, out, dividers);
                     col += w;
-                    if i + 1 < n {
+                    if i + 1 < n && draws_divider[i] {
                         dividers.push((Rect { row: area.row, col, rows: area.rows, cols: 1 }, false));
                         col += 1;
                     }
@@ -5402,8 +5475,8 @@ mod pane_layout_tests {
         let layout = PaneLayout::Split {
             horizontal: true,
             children: vec![
-                SplitChild { layout: PaneLayout::Leaf(0), weight: 1.0, fixed: None },
-                SplitChild { layout: PaneLayout::Leaf(1), weight: 1.0, fixed: Some(1) },
+                SplitChild { layout: PaneLayout::Leaf(0), weight: 1.0, fixed: None, minimized: false },
+                SplitChild { layout: PaneLayout::Leaf(1), weight: 1.0, fixed: Some(1), minimized: false },
             ],
         };
         let area = Rect { row: 0, col: 0, rows: 10, cols: 20 };
@@ -5424,9 +5497,9 @@ mod pane_layout_tests {
         let layout = PaneLayout::Split {
             horizontal: true,
             children: vec![
-                SplitChild { layout: PaneLayout::Leaf(0), weight: 1.0, fixed: None },
-                SplitChild { layout: PaneLayout::Leaf(1), weight: 1.0, fixed: None },
-                SplitChild { layout: PaneLayout::Leaf(2), weight: 1.0, fixed: None },
+                SplitChild { layout: PaneLayout::Leaf(0), weight: 1.0, fixed: None, minimized: false },
+                SplitChild { layout: PaneLayout::Leaf(1), weight: 1.0, fixed: None, minimized: false },
+                SplitChild { layout: PaneLayout::Leaf(2), weight: 1.0, fixed: None, minimized: false },
             ],
         };
         let area = Rect { row: 0, col: 0, rows: 22, cols: 20 };
@@ -5441,8 +5514,8 @@ mod pane_layout_tests {
         let layout = PaneLayout::Split {
             horizontal: true,
             children: vec![
-                SplitChild { layout: PaneLayout::Leaf(0), weight: 1.0, fixed: None },
-                SplitChild { layout: PaneLayout::Leaf(1), weight: 1.0, fixed: Some(10) },
+                SplitChild { layout: PaneLayout::Leaf(0), weight: 1.0, fixed: None, minimized: false },
+                SplitChild { layout: PaneLayout::Leaf(1), weight: 1.0, fixed: Some(10), minimized: false },
             ],
         };
         // 3 rows - 1 divider = 2 usable; a fixed request of 10 must be
@@ -5460,8 +5533,8 @@ mod pane_layout_tests {
         let layout = PaneLayout::Split {
             horizontal: false,
             children: vec![
-                SplitChild { layout: PaneLayout::Leaf(0), weight: 1.0, fixed: None },
-                SplitChild { layout: PaneLayout::Leaf(1), weight: 1.0, fixed: Some(5) },
+                SplitChild { layout: PaneLayout::Leaf(0), weight: 1.0, fixed: None, minimized: false },
+                SplitChild { layout: PaneLayout::Leaf(1), weight: 1.0, fixed: Some(5), minimized: false },
             ],
         };
         let area = Rect { row: 0, col: 0, rows: 10, cols: 30 };
@@ -5469,5 +5542,76 @@ mod pane_layout_tests {
         let r1 = out.iter().find(|(id, _)| *id == 1).unwrap().1;
         assert_eq!(r1.cols, 5);
         assert_eq!(r1.rows, 10);
+    }
+
+    fn regions_and_dividers(layout: &PaneLayout, area: Rect) -> (Vec<(PaneId, Rect)>, Vec<(Rect, bool)>) {
+        let mut out = Vec::new();
+        let mut dividers = Vec::new();
+        compute_regions(layout, area, &mut out, &mut dividers);
+        (out, dividers)
+    }
+
+    #[test]
+    fn a_minimized_child_takes_exactly_one_row_with_no_separate_divider_reserved() {
+        let layout = PaneLayout::Split {
+            horizontal: true,
+            children: vec![
+                SplitChild { layout: PaneLayout::Leaf(0), weight: 1.0, fixed: None, minimized: false },
+                SplitChild { layout: PaneLayout::Leaf(1), weight: 1.0, fixed: None, minimized: true },
+            ],
+        };
+        let area = Rect { row: 0, col: 0, rows: 10, cols: 20 };
+        let (out, dividers) = regions_and_dividers(&layout, area);
+        let r0 = out.iter().find(|(id, _)| *id == 0).unwrap().1;
+        let r1 = out.iter().find(|(id, _)| *id == 1).unwrap().1;
+        // No divider at all between them: the minimized pane's own row
+        // is the whole boundary. 0's own 9 rows + 1's own 1 row fill
+        // the entire 10-row area exactly, unlike the ordinary
+        // fixed-child case (which still reserves 1 row for a real
+        // divider on top of the fixed child's own size).
+        assert!(dividers.is_empty());
+        assert_eq!(r1.rows, 1);
+        assert_eq!(r0.rows, 9);
+        assert_eq!(r0.row, 0);
+        assert_eq!(r1.row, 9);
+    }
+
+    #[test]
+    fn minimized_ignores_its_own_fixed_and_weight() {
+        let layout = PaneLayout::Split {
+            horizontal: true,
+            children: vec![
+                SplitChild { layout: PaneLayout::Leaf(0), weight: 1.0, fixed: None, minimized: false },
+                SplitChild { layout: PaneLayout::Leaf(1), weight: 5.0, fixed: Some(4), minimized: true },
+            ],
+        };
+        let area = Rect { row: 0, col: 0, rows: 10, cols: 20 };
+        let out = regions(&layout, area);
+        let r1 = out.iter().find(|(id, _)| *id == 1).unwrap().1;
+        assert_eq!(r1.rows, 1);
+    }
+
+    #[test]
+    fn a_normal_divider_still_separates_two_ordinary_siblings_next_to_a_minimized_one() {
+        // Three children: ordinary, ordinary, minimized -- the boundary
+        // between the first two still gets a real divider; only the one
+        // next to the minimized child is skipped.
+        let layout = PaneLayout::Split {
+            horizontal: true,
+            children: vec![
+                SplitChild { layout: PaneLayout::Leaf(0), weight: 1.0, fixed: None, minimized: false },
+                SplitChild { layout: PaneLayout::Leaf(1), weight: 1.0, fixed: None, minimized: false },
+                SplitChild { layout: PaneLayout::Leaf(2), weight: 1.0, fixed: None, minimized: true },
+            ],
+        };
+        let area = Rect { row: 0, col: 0, rows: 11, cols: 20 };
+        let (out, dividers) = regions_and_dividers(&layout, area);
+        assert_eq!(dividers.len(), 1);
+        let r2 = out.iter().find(|(id, _)| *id == 2).unwrap().1;
+        assert_eq!(r2.rows, 1);
+        // 11 rows - 1 real divider - 1 minimized row = 9 usable for the
+        // two ordinary weighted siblings, split evenly.
+        let rows_of = |id: PaneId| out.iter().find(|(i, _)| *i == id).unwrap().1.rows;
+        assert_eq!(rows_of(0) + rows_of(1), 9);
     }
 }
