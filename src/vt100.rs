@@ -165,27 +165,51 @@ impl Grid {
         }
     }
 
-    fn resize(&mut self, rows: usize, cols: usize) {
+    // When shrinking rows, keeps the *bottom* `rows` of the old grid --
+    // the ones most likely to still hold the live cursor/prompt -- not
+    // the top ones: a naive top-anchored copy (this function's own
+    // previous behavior) silently threw away whatever the cursor was
+    // actually sitting on, leaving a resized-down pane showing stale
+    // top-of-screen content with a fresh prompt then written on top of
+    // it at the wrong row entirely (e.g. splitting a window that's
+    // already scrolled full of output). Growing still keeps everything,
+    // top-anchored (`src_start_row` is 0 whenever `rows >= self.rows`),
+    // since nothing needs discarding either way. Returns whatever rows
+    // this dropped off the top (each paired with its own wrapped flag,
+    // same shape as `scroll_up`'s own return) so `Screen::resize` can
+    // push them into scrollback exactly like an ordinary scroll would --
+    // this function doesn't know whether it's the primary or alternate
+    // grid (only `Screen` does), so it can't decide that itself.
+    fn resize(&mut self, rows: usize, cols: usize) -> Vec<(Vec<Cell>, bool)> {
         let rows = rows.max(1);
         let cols = cols.max(1);
-        let mut new_cells = vec![Cell::default(); rows * cols];
-        for r in 0..self.rows.min(rows) {
-            for c in 0..self.cols.min(cols) {
-                new_cells[r * cols + c] = self.cells[r * self.cols + c];
-            }
+        let overlap_rows = self.rows.min(rows);
+        let src_start_row = self.rows.saturating_sub(overlap_rows);
+        let mut dropped = Vec::with_capacity(src_start_row);
+        for r in 0..src_start_row {
+            let row: Vec<Cell> = (0..self.cols).map(|c| self.cells[r * self.cols + c]).collect();
+            dropped.push((row, self.wrapped[r]));
         }
+        let overlap_cols = self.cols.min(cols);
+        let mut new_cells = vec![Cell::default(); rows * cols];
         let mut new_wrapped = vec![false; rows];
-        let overlap = self.rows.min(rows);
-        new_wrapped[..overlap].copy_from_slice(&self.wrapped[..overlap]);
+        for r in 0..overlap_rows {
+            let src_row = src_start_row + r;
+            for c in 0..overlap_cols {
+                new_cells[r * cols + c] = self.cells[src_row * self.cols + c];
+            }
+            new_wrapped[r] = self.wrapped[src_row];
+        }
         self.cells = new_cells;
         self.wrapped = new_wrapped;
         self.rows = rows;
         self.cols = cols;
-        self.cursor_row = self.cursor_row.min(rows - 1);
+        self.cursor_row = self.cursor_row.saturating_sub(src_start_row).min(rows - 1);
         self.cursor_col = self.cursor_col.min(cols - 1);
         self.scroll_top = 0;
         self.scroll_bottom = rows - 1;
         self.pending_wrap = false;
+        dropped
     }
 
     pub fn cell(&self, row: usize, col: usize) -> Cell {
@@ -414,7 +438,24 @@ impl Screen {
     }
 
     pub fn resize(&mut self, rows: usize, cols: usize) {
-        self.primary.resize(rows, cols);
+        // The primary grid's own rows, only -- pushed into scrollback
+        // unconditionally (not gated on `using_alternate` the way
+        // line_feed_no_scroll_check's own scroll-driven push is): this
+        // is capturing *primary*'s own history regardless of which grid
+        // happens to be on screen right now (a resize while an
+        // alternate-screen app like vim is open still shrinks the real
+        // shell underneath it). The alternate grid's own dropped rows
+        // are simply discarded, matching line_feed_no_scroll_check's
+        // "alternate screen buffers don't get a scrollback" rule.
+        let dropped = self.primary.resize(rows, cols);
+        for (line, wrapped) in dropped {
+            self.scrollback.push_back(line);
+            self.scrollback_wrapped.push_back(wrapped);
+            if self.scrollback.len() > self.scrollback_limit {
+                self.scrollback.pop_front();
+                self.scrollback_wrapped.pop_front();
+            }
+        }
         self.alternate.resize(rows, cols);
     }
 
@@ -1107,6 +1148,69 @@ mod tests {
         assert_eq!(s.scrollback.len(), 1);
         let sb: String = s.scrollback[0].iter().map(|c| c.ch).collect::<String>().trim_end().to_string();
         assert_eq!(sb, "one");
+    }
+
+    #[test]
+    fn shrinking_rows_keeps_the_bottom_of_the_grid_not_the_top() {
+        // Fills every row (no scrolling yet -- exactly "a terminal
+        // that's already full of content"), then shrinks height by one.
+        // A naive top-anchored resize would keep "one"/"two" and drop
+        // "three" -- the row the live cursor is actually sitting on.
+        let mut s = Screen::new(3, 6);
+        s.feed(b"one\r\ntwo\r\nthree");
+        s.resize(2, 6);
+        assert_eq!(text_row(&s, 0), "two");
+        assert_eq!(text_row(&s, 1), "three");
+    }
+
+    #[test]
+    fn shrinking_rows_pushes_the_dropped_top_rows_into_scrollback() {
+        let mut s = Screen::new(3, 6);
+        s.feed(b"one\r\ntwo\r\nthree");
+        s.resize(2, 6);
+        assert_eq!(s.scrollback.len(), 1);
+        let sb: String = s.scrollback[0].iter().map(|c| c.ch).collect::<String>().trim_end().to_string();
+        assert_eq!(sb, "one");
+    }
+
+    #[test]
+    fn shrinking_rows_keeps_the_cursor_on_its_own_live_row() {
+        let mut s = Screen::new(3, 6);
+        s.feed(b"one\r\ntwo\r\nthree");
+        assert_eq!(s.cursor(), (2, 5));
+        s.resize(2, 6);
+        // The cursor's own row (2, "three") shifted down to row 1 along
+        // with its content -- not clamped to whatever row 1 used to
+        // hold ("two", the old middle row).
+        assert_eq!(s.cursor(), (1, 5));
+    }
+
+    #[test]
+    fn growing_rows_stays_top_anchored_with_nothing_dropped() {
+        let mut s = Screen::new(2, 6);
+        s.feed(b"one\r\ntwo");
+        s.resize(4, 6);
+        assert_eq!(text_row(&s, 0), "one");
+        assert_eq!(text_row(&s, 1), "two");
+        assert!(s.scrollback.is_empty());
+    }
+
+    #[test]
+    fn resizing_the_alternate_screen_never_pushes_its_own_content_into_scrollback() {
+        let mut s = Screen::new(3, 6);
+        s.feed(b"\x1b[?1049h"); // enter the alternate screen
+        s.feed(b"aaa\r\nbbb\r\nccc");
+        assert!(s.using_alternate);
+        s.resize(2, 6);
+        // Shrinking still drops (empty) primary rows into scrollback --
+        // that's expected and harmless (primary.rows unconditionally
+        // shrinks, see Screen::resize's own doc comment) -- what matters
+        // is that none of the *alternate* screen's own "aaa"/"bbb"/"ccc"
+        // content ever ends up there.
+        for line in &s.scrollback {
+            let text: String = line.iter().map(|c| c.ch).collect();
+            assert!(text.trim().is_empty(), "alternate screen content leaked into scrollback: {text:?}");
+        }
     }
 
     #[test]
