@@ -1173,6 +1173,16 @@ fn run_edit_frame(
     fileeditor::set_last_filename(&session.buffer, registers);
     let mut buffer = session.buffer;
     let mut vk = session.vk;
+    // Where this editor frame actually lives -- captured once, before
+    // any window command can move focus elsewhere. The Detached arm
+    // below needs this pane's own rect to freeze into, not whatever
+    // pane/window happens to be focused *after* the command that
+    // detached this one ran (that could be a sibling pane a split just
+    // switched to, or even a different window entirely after `<C-w>w`/
+    // `window next` -- `windows[*current_window].focused_pane` at that
+    // point names neither).
+    let own_window = *current_window;
+    let own_pane_id = windows[*current_window].focused_pane;
     // Loops rather than returning straight after one call: a `Window`
     // keypress (KeyOutcome::Window, handled inside run_normal_mode_
     // navigation) always resolves to NavExit::Detached, even when
@@ -1202,6 +1212,16 @@ fn run_edit_frame(
         match outcome {
             Ok((NavExit::Quit, _)) => {
                 windows[*current_window].stack_mut().pop();
+                // Reverting to a plain shell prompt in this same session
+                // -- clear whatever the editor last drew into its own
+                // screen (freeze_editor_frame always writes pane-relative
+                // from row 0, so any row at or past this editor's own
+                // last rect otherwise just sits there forever: the
+                // shell's own prompt draw, freeze_idle_prompt, only ever
+                // touches its own single line, never the rest of the
+                // grid). Matches how a real terminal full-screen program
+                // (vim, less, ...) leaves the screen on exit.
+                sessions.get_mut(&session_id).unwrap().screen.borrow_mut().feed(b"\x1b[2J\x1b[H");
                 // A file with an open diagnostics pane (`:diag`) below
                 // it -- close that too rather than leaving an orphaned
                 // pane no `Frame::Edit` will ever point at again.
@@ -1242,7 +1262,15 @@ fn run_edit_frame(
                 // *does* leave this frame on top (the branch above) can
                 // still have resized panes (`window balance`, `+`/`-`),
                 // and one that moves focus away can too.
-                let rect = pane_rect(&windows[*current_window], windows[*current_window].focused_pane, term_rows, term_cols);
+                let rect = if own_window < windows.len() && windows[own_window].panes.iter().any(|p| p.id == own_pane_id) {
+                    pane_rect(&windows[own_window], own_pane_id, term_rows, term_cols)
+                } else {
+                    // This pane (or its whole window) is gone by now --
+                    // nothing sensible to freeze into; fall back to
+                    // wherever focus actually landed rather than
+                    // indexing a pane that no longer exists.
+                    pane_rect(&windows[*current_window], windows[*current_window].focused_pane, term_rows, term_cols)
+                };
                 fileeditor::freeze_editor_frame(&sessions[&session_id].screen, &b, &v, rect);
                 edit_frames.insert(edit_frame_id, fileeditor::EditSession { buffer: b, vk: v });
                 return;
@@ -1361,8 +1389,31 @@ fn run_diagnostics_frame(
             children[idx].fixed = None;
         }
     };
+    // Whenever set_expanded/set_minimized change this pane's own size,
+    // the editor sibling's size changes right along with it (the split
+    // only has the two of them) -- but that sibling's own last frozen
+    // render (freeze_editor_frame, from run_edit_frame's own Detached
+    // arm, or an earlier call to this very closure) was addressed
+    // against whatever rect was current *then*. compositor_redraw's own
+    // resize of a pane's session screen keeps existing rows in place and
+    // either truncates or leaves the rest blank -- it does not reflow
+    // content -- so a stale frozen frame's status line (always its own
+    // rect's *last* row) ends up either clipped off (shrinking) or
+    // stranded above new blank rows (growing) once the split resizes
+    // out from under it. Re-freezing against the sibling's current rect
+    // keeps it honest across every resize this loop causes.
+    let refresh_editor_frame = |sessions: &HashMap<SessionId, SessionState>, windows: &Vec<WindowEntry>, edit_frames: &HashMap<EditFrameId, fileeditor::EditSession>, current_window: usize| {
+        let Some(editor_pane) = editor_pane_for(&windows[current_window], edit_frame_id) else { return };
+        let Some(session) = edit_frames.get(&edit_frame_id) else { return };
+        let rect = pane_rect(&windows[current_window], editor_pane, term_rows, term_cols);
+        let sid = windows[current_window].pane(editor_pane).owning_session();
+        let screen = &sessions[&sid].screen;
+        screen.borrow_mut().resize(rect.rows, rect.cols);
+        fileeditor::freeze_editor_frame(screen, &session.buffer, &session.vk, rect);
+    };
     let diagnostics_len = edit_frames.get(&edit_frame_id).map(|s| s.buffer.diagnostics.len()).unwrap_or(0);
     set_expanded(windows, *current_window, diagnostics_pane_rows(diagnostics_len, false, budget));
+    refresh_editor_frame(sessions, windows, edit_frames, *current_window);
     compositor_redraw(sessions, windows, *current_window, term_rows, term_cols);
 
     loop {
@@ -1401,7 +1452,7 @@ fn run_diagnostics_frame(
         // collapsed title first so it reflects whatever's still true
         // (only matters after `f` actually changed the count below, but
         // cheap enough to always do).
-        let mut leave = |windows: &mut Vec<WindowEntry>, sessions: &HashMap<SessionId, SessionState>, jump: bool| {
+        let leave = |windows: &mut Vec<WindowEntry>, sessions: &HashMap<SessionId, SessionState>, edit_frames: &mut HashMap<EditFrameId, fileeditor::EditSession>, jump: bool| {
             if let Some(session) = edit_frames.get_mut(&edit_frame_id) {
                 if jump && let Some(d) = session.buffer.diagnostics.get(selected).cloned() {
                     let (line, col) = fileeditor::diagnostic_position(&session.buffer, d.start);
@@ -1418,12 +1469,14 @@ fn run_diagnostics_frame(
 
         match key {
             Key::Enter => {
-                leave(windows, sessions, true);
+                leave(windows, sessions, edit_frames, true);
+                refresh_editor_frame(sessions, windows, edit_frames, *current_window);
                 compositor_redraw(sessions, windows, *current_window, term_rows, term_cols);
                 return;
             }
             Key::Escape | Key::Char('q') => {
-                leave(windows, sessions, false);
+                leave(windows, sessions, edit_frames, false);
+                refresh_editor_frame(sessions, windows, edit_frames, *current_window);
                 compositor_redraw(sessions, windows, *current_window, term_rows, term_cols);
                 return;
             }
@@ -1431,6 +1484,7 @@ fn run_diagnostics_frame(
                 expanded = if expanded == Some(selected) { None } else { Some(selected) };
                 let diagnostics_len = edit_frames.get(&edit_frame_id).map(|s| s.buffer.diagnostics.len()).unwrap_or(0);
                 set_expanded(windows, *current_window, diagnostics_pane_rows(diagnostics_len, expanded.is_some(), budget));
+                refresh_editor_frame(sessions, windows, edit_frames, *current_window);
                 compositor_redraw(sessions, windows, *current_window, term_rows, term_cols);
             }
             // `f`: applies the selected item's own fix, only while its
@@ -1456,6 +1510,7 @@ fn run_diagnostics_frame(
                     selected = selected.min(diagnostics_len.saturating_sub(1));
                     expanded = None;
                     set_expanded(windows, *current_window, diagnostics_pane_rows(diagnostics_len, false, budget));
+                    refresh_editor_frame(sessions, windows, edit_frames, *current_window);
                     compositor_redraw(sessions, windows, *current_window, term_rows, term_cols);
                 }
             }
