@@ -1094,19 +1094,27 @@ fn run_fg_job_frame(
     let tab_bar = tab_bar_line(sessions, windows, *current_window);
     let layout = snapshot_window(&windows[*current_window], sessions, term_rows, term_cols);
     let cw = *current_window;
-    let outcome = drive_fg_job(
-        &mut job,
-        &focused_screen,
-        || render_compositor_frame(&layout, &tab_bar, term_rows),
-        || service_background_jobs(sessions, windows, job_frames, cw),
-    );
-    match outcome {
+    // Loops rather than returning straight after one call: a qualifying
+    // click that turns out to be for the job itself, not bish's own UI
+    // chrome (FgOutcome::MouseClick's own doc comment), gets forwarded
+    // and this keeps driving the very same job -- every other outcome
+    // still returns straight out of this function, same as before this
+    // loop existed.
+    loop {
+        let outcome = drive_fg_job(
+            &mut job,
+            &focused_screen,
+            || render_compositor_frame(&layout, &tab_bar, term_rows),
+            || service_background_jobs(sessions, windows, job_frames, cw),
+        );
+        match outcome {
         FgOutcome::Exited(status) => {
             windows[*current_window].stack_mut().pop();
             sessions.get_mut(&session_id).unwrap().shell.last_status = status;
             if *sinks_are_grid {
                 compositor_redraw(sessions, windows, *current_window, term_rows, term_cols);
             }
+            return;
         }
         FgOutcome::Detached => {
             job_frames.insert(job_frame_id, job);
@@ -1150,6 +1158,7 @@ fn run_fg_job_frame(
             if *sinks_are_grid {
                 compositor_redraw(sessions, windows, *current_window, term_rows, term_cols);
             }
+            return;
         }
         FgOutcome::Stopped => {
             // Unlike Detached, this job doesn't go back into job_frames
@@ -1164,6 +1173,49 @@ fn run_fg_job_frame(
             if *sinks_are_grid {
                 compositor_redraw(sessions, windows, *current_window, term_rows, term_cols);
             }
+            return;
+        }
+        FgOutcome::MouseClick(ev) => {
+            // sinks_are_grid gate matches every other hit_test_click
+            // call site: there's no tab bar/pane layout to click on
+            // before the first promotion, so there's nothing to
+            // hit-test against -- falls straight to the "forward it"
+            // arm below, same as a genuine miss.
+            let target = if *sinks_are_grid {
+                hit_test_click(ev, sessions, windows, *current_window, term_rows, term_cols)
+            } else {
+                None
+            };
+            match target {
+                Some(ClickTarget::Window(idx)) if idx != *current_window => {
+                    job_frames.insert(job_frame_id, job);
+                    freeze_focused_idle_prompt(sessions, windows, *current_window);
+                    *current_window = idx;
+                    if *sinks_are_grid {
+                        compositor_redraw(sessions, windows, *current_window, term_rows, term_cols);
+                    }
+                    return;
+                }
+                Some(ClickTarget::Pane(pane_id)) if pane_id != windows[*current_window].focused_pane => {
+                    job_frames.insert(job_frame_id, job);
+                    windows[*current_window].focused_pane = pane_id;
+                    if *sinks_are_grid {
+                        compositor_redraw(sessions, windows, *current_window, term_rows, term_cols);
+                    }
+                    return;
+                }
+                // A miss, the already-focused tab/pane, or sinks_are_grid
+                // was false -- this click was for the job itself (or
+                // nothing meaningful bish owns either way). Reconstruct
+                // the exact SGR press byte drive_fg_job held back and
+                // forward it, then keep driving the same job (the
+                // enclosing loop, not a recursive call).
+                _ => {
+                    let seq = format!("\x1b[<{};{};{}M", ev.button, ev.col, ev.row);
+                    let _ = job.pty_master().write_all(seq.as_bytes());
+                }
+            }
+        }
         }
     }
 }
@@ -2213,6 +2265,19 @@ enum FgOutcome {
     // "the thing this window is actively watching," it's a genuine
     // Stopped job now (exec.rs's Shell::park_stopped_fg_job).
     Stopped,
+    // A qualifying left click (MouseEvent::is_left_click) arrived at
+    // bish's own stdin instead of being forwarded to the job -- see
+    // decode_fg_click's own doc comment for why this one gesture gets
+    // intercepted while every other byte (including every other kind of
+    // mouse event) still just goes straight through. The caller
+    // (run_fg_job_frame) hit-tests it: a miss, or a hit within the
+    // job's own pane, means it was actually meant for the job after
+    // all, and gets forwarded there before resuming; a hit elsewhere
+    // (the tab bar, a different pane) switches focus there instead,
+    // leaving the job running in the background -- the same outcome
+    // Ctrl+Space's own Detached already produces, just reached by a
+    // click instead of a keystroke.
+    MouseClick(editor::MouseEvent),
 }
 
 const BRACKETED_PASTE_ENABLE: &str = "\x1b[?2004h";
@@ -2265,6 +2330,33 @@ fn sync_bracketed_paste(enabled: &mut bool, screen: &Rc<RefCell<vt100::Screen>>)
     print!("{}", if wants { BRACKETED_PASTE_ENABLE } else { BRACKETED_PASTE_DISABLE });
     let _ = io::stdout().flush();
     *enabled = wants;
+}
+
+// A complete SGR mouse report ("\x1b[<Cb;Cx;CyM/m") decoded from the
+// *first* such report at the start of `seq`, but only when it's a
+// qualifying left click (see MouseEvent::is_left_click) -- anything
+// else (incomplete, malformed, a release/drag/wheel/other button) is
+// `None`, meaning "forward this unmodified, exactly like every other
+// byte sequence" (drive_fg_job's own call site). Deliberately scans for
+// the first 'M'/'m' rather than trusting `seq`'s own last byte: a press
+// and its paired release (or several clicks in quick succession) can
+// easily arrive in the very same read as one another over a local pty,
+// and treating the *whole* buffer as one report would garble the params
+// and silently fail to recognize a genuine click. Pure and separate
+// from drive_fg_job's own loop so the decoding itself has unit test
+// coverage without a real pty, mirroring editor.rs's own
+// decode_sgr_mouse_final split from read_sgr_mouse.
+fn decode_fg_click(seq: &[u8]) -> Option<editor::MouseEvent> {
+    if !seq.starts_with(b"\x1b[<") {
+        return None;
+    }
+    let end = seq[3..].iter().position(|b| *b == b'M' || *b == b'm')? + 3;
+    let final_byte = seq[end];
+    let params = std::str::from_utf8(&seq[3..end]).ok()?;
+    match editor::decode_sgr_mouse_final(params, final_byte) {
+        Key::Mouse(ev) if ev.is_left_click() => Some(ev),
+        _ => None,
+    }
 }
 
 // Drives a job pushed as a Frame::Job: reads its pty master and feeds
@@ -2412,6 +2504,36 @@ fn drive_fg_job(job: &mut exec::FgJob, screen: &Rc<RefCell<vt100::Screen>>, mut 
                     let more = unsafe { raw_read(0, buf.as_mut_ptr(), buf.len()) };
                     if more > 0 {
                         seq.extend_from_slice(&buf[..more as usize]);
+                    }
+                }
+                // An SGR mouse report ("\x1b[<Cb;Cx;CyM/m") -- wait for
+                // the rest if it hasn't all arrived in this same read
+                // yet (same reasoning as the lone-ESC wait just above),
+                // then decode it before deciding whether to forward: a
+                // qualifying left click (decode_fg_click's own doc
+                // comment) might be aimed at bish's own UI chrome (the
+                // tab bar, a different pane) rather than this job, and
+                // gets handed back to the caller instead of forwarded.
+                // Everything else here (a release, drag, wheel, right/
+                // middle click, or the sequence just never completing)
+                // falls straight through to the ordinary forward below,
+                // unmodified.
+                if seq.starts_with(b"\x1b[<") {
+                    // Whether the *first* report has terminated yet --
+                    // not just seq's own last byte, which a
+                    // fast-arriving paired release (or several clicks in
+                    // a row) could easily make M/m without the first
+                    // report actually being complete (decode_fg_click's
+                    // own doc comment).
+                    while !seq[3..].iter().any(|b| *b == b'M' || *b == b'm') && term::stdin_ready(50) {
+                        let more = unsafe { raw_read(0, buf.as_mut_ptr(), buf.len()) };
+                        if more <= 0 {
+                            break;
+                        }
+                        seq.extend_from_slice(&buf[..more as usize]);
+                    }
+                    if let Some(ev) = decode_fg_click(&seq) {
+                        break FgOutcome::MouseClick(ev);
                     }
                 }
                 // The real keyboard always sends arrow keys in the plain
@@ -5757,5 +5879,62 @@ mod pane_layout_tests {
         // two ordinary weighted siblings, split evenly.
         let rows_of = |id: PaneId| out.iter().find(|(i, _)| *i == id).unwrap().1.rows;
         assert_eq!(rows_of(0) + rows_of(1), 9);
+    }
+}
+
+#[cfg(test)]
+mod fg_click_tests {
+    use super::*;
+
+    #[test]
+    fn decode_fg_click_recognizes_a_qualifying_left_click() {
+        let ev = decode_fg_click(b"\x1b[<0;15;24M").unwrap();
+        assert_eq!((ev.button, ev.col, ev.row, ev.pressed), (0, 15, 24, true));
+    }
+
+    #[test]
+    fn decode_fg_click_ignores_a_release() {
+        assert!(decode_fg_click(b"\x1b[<0;15;24m").is_none());
+    }
+
+    #[test]
+    fn decode_fg_click_ignores_a_drag() {
+        // Bit 5 (0x20) set means "motion while a button is held" -- not a
+        // plain click (MouseEvent::is_left_click's own doc comment).
+        assert!(decode_fg_click(b"\x1b[<32;15;24M").is_none());
+    }
+
+    #[test]
+    fn decode_fg_click_ignores_a_wheel_event() {
+        // Bit 6 (0x40) set means a wheel button.
+        assert!(decode_fg_click(b"\x1b[<64;15;24M").is_none());
+    }
+
+    #[test]
+    fn decode_fg_click_ignores_a_right_click() {
+        assert!(decode_fg_click(b"\x1b[<2;15;24M").is_none());
+    }
+
+    #[test]
+    fn decode_fg_click_ignores_a_non_mouse_sequence() {
+        assert!(decode_fg_click(b"\x1b[A").is_none());
+        assert!(decode_fg_click(b"hello").is_none());
+    }
+
+    #[test]
+    fn decode_fg_click_ignores_an_incomplete_sequence() {
+        assert!(decode_fg_click(b"\x1b[<0;15;24").is_none());
+        assert!(decode_fg_click(b"\x1b[<").is_none());
+    }
+
+    #[test]
+    fn decode_fg_click_decodes_the_first_report_even_with_a_paired_release_concatenated_after_it() {
+        // A press and its own release commonly arrive in the very same
+        // read over a local pty -- must not treat the whole buffer as
+        // one garbled report (this exact case previously fooled the
+        // detector into missing the click entirely, see this function's
+        // own doc comment).
+        let ev = decode_fg_click(b"\x1b[<0;15;24M\x1b[<0;15;24m").unwrap();
+        assert_eq!((ev.button, ev.col, ev.row, ev.pressed), (0, 15, 24, true));
     }
 }

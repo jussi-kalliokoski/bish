@@ -309,7 +309,7 @@ fn read_sgr_mouse() -> io::Result<Key> {
 // this). Split out as a pure function, mirroring decode_csi_final's own
 // split from read_escape, so the actual parsing has unit test coverage
 // without needing real stdin bytes.
-fn decode_sgr_mouse_final(params: &str, final_byte: u8) -> Key {
+pub(crate) fn decode_sgr_mouse_final(params: &str, final_byte: u8) -> Key {
     let parts: Vec<&str> = params.split(';').collect();
     let button = parts.first().and_then(|s| s.parse::<u16>().ok());
     let col = parts.get(1).and_then(|s| s.parse::<u16>().ok());
