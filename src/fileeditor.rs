@@ -1176,13 +1176,25 @@ fn bash_format_hook(text: &str) -> Result<Vec<lint::Diagnostic>, String> {
 // one). Trimmed once here, right where the hook already knows it's
 // producing Diagnostics headed for a `TextBuffer`, rather than teaching
 // `BashFormatter` itself two different EOF conventions.
+//
+// The stripped fix can end up start == end with an empty replacement --
+// a script whose buffer content already matches canonical layout exactly
+// (`buffer_text` just never carries the trailing newline this diagnostic
+// otherwise exists to add). That diagnostic is dropped outright rather
+// than left in as a no-op `Fix`: `apply_fix`/`apply_all_fixes` count any
+// `Some(fix)` as "applied" regardless of whether it changes anything, so
+// leaving it in would make an already-formatted buffer misreport as
+// `FormatOutcome::Formatted` instead of `AlreadyFormatted`.
 fn strip_buffer_implicit_trailing_newline(text: &str, mut diagnostics: Vec<lint::Diagnostic>) -> Vec<lint::Diagnostic> {
     let end = text.chars().count();
-    if let Some(fix) = diagnostics.last_mut().and_then(|d| d.fix.as_mut())
-        && fix.end == end
-        && fix.replacement.ends_with('\n')
-    {
-        fix.replacement.pop();
+    let is_eof_newline_fix = diagnostics.last().and_then(|d| d.fix.as_ref()).is_some_and(|f| f.end == end && f.replacement.ends_with('\n'));
+    if !is_eof_newline_fix {
+        return diagnostics;
+    }
+    let fix = diagnostics.last_mut().unwrap().fix.as_mut().unwrap();
+    fix.replacement.pop();
+    if fix.start == fix.end && fix.replacement.is_empty() {
+        diagnostics.pop();
     }
     diagnostics
 }
@@ -1200,6 +1212,17 @@ fn pre_save_hooks(ft: FileType) -> &'static [PreSaveHook] {
     }
 }
 
+// Runs one hook against `buf`'s current content and applies whatever
+// fixes it reports, returning how many actually landed -- the shared
+// core both `run_pre_save_hooks` (silent, every hook in the list) and
+// `format_buffer` (`:format`, one hook surfaced with real feedback)
+// splice fixes through.
+fn run_one_hook(buf: &mut TextBuffer, hook: PreSaveHook) -> Result<usize, String> {
+    let text = buffer_text(buf);
+    let diagnostics = hook(&text)?;
+    Ok(apply_all_fixes(buf, &diagnostics))
+}
+
 // `:w`/`:wq`/`:x`'s own worker (repl.rs's run_command_mode, called right
 // before `tb.save(...)`): runs every pre-save hook this buffer's
 // filetype has, in order, applying whatever fixes each one reports
@@ -1214,11 +1237,53 @@ fn pre_save_hooks(ft: FileType) -> &'static [PreSaveHook] {
 // far more disruptive than just not reformatting it this time.
 pub(crate) fn run_pre_save_hooks(buf: &mut TextBuffer) {
     for hook in pre_save_hooks(file_type(buf)) {
-        let text = buffer_text(buf);
-        if let Ok(diagnostics) = hook(&text) {
-            apply_all_fixes(buf, &diagnostics);
+        let _ = run_one_hook(buf, *hook);
+    }
+}
+
+// `:format`/`:fmt`'s own result -- unlike the silent pre-save path
+// above, an explicit, user-triggered format command has somewhere to
+// put real feedback (repl.rs's command-output overlay/sink_err), so it
+// gets to distinguish "nothing to do" from "couldn't even try" instead
+// of collapsing both into a no-op.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum FormatOutcome {
+    Formatted,
+    AlreadyFormatted,
+    // This filetype has no pre-save hook at all (`pre_save_hooks`
+    // returns an empty slice) -- distinct from a hook running and
+    // finding nothing to change.
+    NotSupported,
+    // A hook ran and refused (`BashFormatter::check`'s own parse
+    // error, for bash's hook) -- the message is that Err's own text.
+    Error(String),
+}
+
+// `:format`/`:fmt`'s own worker (repl.rs's run_command_mode): the same
+// per-filetype hook list `run_pre_save_hooks` runs silently before every
+// save, just triggered by hand and reporting what happened instead of
+// swallowing it. Runs every hook for this filetype (today, at most one),
+// same "each sees the last one's own edits" pipeline -- but stops at the
+// first one that errors, rather than skipping just that one and moving
+// on: an explicit command asking to reformat this buffer that silently
+// formatted with only half its hooks would be a worse surprise than
+// reporting the failure and leaving the buffer exactly as it was before
+// this call (every hook here only ever mutates `buf` after fully
+// succeeding, so a later hook's error never leaves an earlier hook's own
+// edits half-applied).
+pub(crate) fn format_buffer(buf: &mut TextBuffer) -> FormatOutcome {
+    let hooks = pre_save_hooks(file_type(buf));
+    if hooks.is_empty() {
+        return FormatOutcome::NotSupported;
+    }
+    let mut applied = 0;
+    for hook in hooks {
+        match run_one_hook(buf, *hook) {
+            Ok(n) => applied += n,
+            Err(e) => return FormatOutcome::Error(e),
         }
     }
+    if applied > 0 { FormatOutcome::Formatted } else { FormatOutcome::AlreadyFormatted }
 }
 
 // Color/attrs for one diagnostic's own underline -- mirrors highlight::
@@ -1825,6 +1890,54 @@ mod pre_save_hook_tests {
     fn run_pre_save_hooks_leaves_an_unparseable_bash_buffer_untouched_rather_than_blocking_save() {
         let mut buf = buf_with_ext("if true\nthen\n", "bash");
         run_pre_save_hooks(&mut buf);
+        assert_eq!(buffer_text(&buf), "if true\nthen\n");
+    }
+
+    #[test]
+    fn format_buffer_reports_formatted_and_applies_the_fixes() {
+        let mut buf = buf_with_ext("if true\nthen\necho hi\nfi", "bash");
+        assert_eq!(format_buffer(&mut buf), FormatOutcome::Formatted);
+        assert_eq!(buffer_text(&buf), "if true; then\n\techo hi\nfi");
+    }
+
+    #[test]
+    fn format_buffer_reports_already_formatted_and_leaves_the_buffer_untouched() {
+        let mut buf = buf_with_ext("if true; then\n\techo hi\nfi", "bash");
+        assert_eq!(format_buffer(&mut buf), FormatOutcome::AlreadyFormatted);
+        assert_eq!(buffer_text(&buf), "if true; then\n\techo hi\nfi");
+    }
+
+    // `buf_with_ext`'s own buffers never round-trip through a real file on
+    // disk (it splices `insert_text` into a buffer opened against a
+    // nonexistent path) -- this one does, matching exactly what `:format`
+    // sees against a file really opened via `e`: a regression test for
+    // the "an EOF-gap fix that's already a no-op still counted as
+    // applied" bug (see `strip_buffer_implicit_trailing_newline`'s own
+    // doc comment) would only have caught it through this real load path.
+    #[test]
+    fn format_buffer_reports_already_formatted_for_a_real_file_loaded_from_disk() {
+        let dir = std::env::temp_dir().join(format!("bish-fileeditor-real-load-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("clean.bash");
+        std::fs::write(&path, "if true; then\n\techo hi\nfi\n").unwrap();
+        let mut buf = TextBuffer::open(&path, 10).unwrap();
+        assert_eq!(format_buffer(&mut buf), FormatOutcome::AlreadyFormatted);
+        assert_eq!(buffer_text(&buf), "if true; then\n\techo hi\nfi");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn format_buffer_reports_not_supported_for_a_non_bash_buffer_and_leaves_it_untouched() {
+        let mut buf = buf_with_ext("if true\nthen\necho hi\nfi", "txt");
+        assert_eq!(format_buffer(&mut buf), FormatOutcome::NotSupported);
+        assert_eq!(buffer_text(&buf), "if true\nthen\necho hi\nfi");
+    }
+
+    #[test]
+    fn format_buffer_reports_the_parse_error_for_an_unparseable_bash_buffer_and_leaves_it_untouched() {
+        let mut buf = buf_with_ext("if true\nthen\n", "bash");
+        let outcome = format_buffer(&mut buf);
+        assert!(matches!(outcome, FormatOutcome::Error(_)), "expected FormatOutcome::Error, got {outcome:?}");
         assert_eq!(buffer_text(&buf), "if true\nthen\n");
     }
 }

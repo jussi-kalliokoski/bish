@@ -5567,6 +5567,38 @@ fn run_command_mode(
                             buffer.clear();
                             continue;
                         }
+                        // `format`/`fmt`: the same per-filetype pre-save
+                        // hook `w`/`wq`/`x` already run silently right
+                        // before every save (fileeditor::run_pre_save_
+                        // hooks), just triggerable by hand and with real
+                        // feedback via the command-output overlay instead
+                        // of running invisibly. No `clear` subcommand the
+                        // way `diag` has one: there's no persistent
+                        // state this leaves behind to clear, just an
+                        // ordinary buffer edit `u` already undoes.
+                        "format" | "fmt" if arg.is_none() => {
+                            let (output, status) = match fileeditor::format_buffer(tb) {
+                                fileeditor::FormatOutcome::Formatted => ("Reformatted.".to_string(), 0),
+                                fileeditor::FormatOutcome::AlreadyFormatted => ("Already formatted.".to_string(), 0),
+                                fileeditor::FormatOutcome::NotSupported => {
+                                    sessions[&session_id].shell.sink_err("bish: format: no formatter for this filetype\n");
+                                    buffer.clear();
+                                    continue;
+                                }
+                                fileeditor::FormatOutcome::Error(e) => {
+                                    sessions[&session_id].shell.sink_err(&format!("bish: format: {e}\n"));
+                                    buffer.clear();
+                                    continue;
+                                }
+                            };
+                            sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry { command: trimmed, output: output.clone(), status });
+                            return CommandModeOutcome::Ran { output, status };
+                        }
+                        "format" | "fmt" => {
+                            sessions[&session_id].shell.sink_err(&format!("bish: format: unexpected argument '{}'\n", arg.unwrap_or_default()));
+                            buffer.clear();
+                            continue;
+                        }
                         _ => {}
                     }
                 }
