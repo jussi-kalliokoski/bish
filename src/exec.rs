@@ -1635,32 +1635,41 @@ impl Shell {
         })
     }
 
-    // bishopt [--set|-s NAME [VALUE] | --unset|-u NAME | NAME]. `registry`
-    // is threaded in as a parameter (rather than reaching for
-    // KNOWN_BISHOPTS directly) purely for testability -- the one real
-    // caller (run_single's dispatch) always passes KNOWN_BISHOPTS itself.
+    // bishopt [--quiet|-q NAME | --set|-s NAME [VALUE] | --unset|-u NAME |
+    // NAME]. `registry` is threaded in as a parameter (rather than
+    // reaching for KNOWN_BISHOPTS directly) purely for testability -- the
+    // one real caller (run_single's dispatch) always passes
+    // KNOWN_BISHOPTS itself.
     //
     // Bare `bishopt` lists every registered option's *name* only, no
     // values -- unlike shopt's own table, a bishopt's value isn't always
-    // printable text (a Bool's "value" is its exit code, not a line of
-    // output -- see the get arm below), so there's no single format that
-    // would fit every row.
+    // printable text the same way for every type (see the get arm below),
+    // so there's no single format that would fit every row.
     //
-    // Get (`bishopt NAME`, no flags): a Bool option prints nothing and
-    // reports its value as the exit status (0 = on, 1 = off, same
-    // convention `shopt -q` already uses); a Str option prints its value
-    // and exits 0. Set: `--set NAME` turns a Bool on (no value token
-    // allowed); `--set NAME VALUE` sets a Str's value (VALUE required).
-    // Giving a value to a Bool, or omitting one for a Str, is a usage
-    // error. Unset always removes the override and falls back to the
-    // option's registered default -- for a Bool that default is
+    // Get (`bishopt NAME`): a Bool option prints "on"/"off" and a Str
+    // prints its own value, both exiting 0 -- the readable default.
+    // `--quiet`/`-q` (matching `shopt -q`'s own convention, which is what
+    // prompted this) suppresses that printing; for a Bool its value
+    // becomes the exit status instead (0 = on, 1 = off), so a script can
+    // test it directly (`bishopt -q NAME && ...`) without parsing text;
+    // for a Str there's no meaningful boolean to report, so quiet Str
+    // just exits 0 once NAME is confirmed to exist.
+    //
+    // Set: `--set NAME` turns a Bool on; `--set NAME on`/`--set NAME off`
+    // sets it explicitly either way (the same "on"/"off" vocabulary get
+    // prints, so nothing new to learn) -- either spelling is optional
+    // sugar over `--unset`, not a replacement for it. `--set NAME VALUE`
+    // sets a Str's value (VALUE required, and not restricted to on/off).
+    // Any other value against a Bool, or a missing one against a Str, is
+    // a usage error. Unset always removes the override and falls back to
+    // the option's registered default -- for a Bool that default is
     // definitionally `false`, so "--unset turns it off" and "revert to
     // default" are the same operation; for a Str it reverts to whatever
     // default that option was registered with.
     fn run_bishopt(&mut self, args: &[String], registry: &[(&str, BishOptDefault)]) -> i32 {
         enum Mode<'a> {
             List,
-            Get(&'a str),
+            Get(&'a str, bool), // bool: quiet
             Set(&'a str, Option<&'a str>),
             Unset(&'a str),
         }
@@ -1669,9 +1678,10 @@ impl Shell {
             [flag, name] if flag == "--set" || flag == "-s" => Mode::Set(name, None),
             [flag, name, value] if flag == "--set" || flag == "-s" => Mode::Set(name, Some(value)),
             [flag, name] if flag == "--unset" || flag == "-u" => Mode::Unset(name),
-            [name] => Mode::Get(name),
+            [flag, name] if flag == "--quiet" || flag == "-q" => Mode::Get(name, true),
+            [name] => Mode::Get(name, false),
             _ => {
-                sh_eprintln!(self, "bish: bishopt: usage: bishopt [--set|-s NAME [VALUE] | --unset|-u NAME | NAME]");
+                sh_eprintln!(self, "bish: bishopt: usage: bishopt [--quiet|-q NAME | --set|-s NAME [VALUE] | --unset|-u NAME | NAME]");
                 return 2;
             }
         };
@@ -1682,8 +1692,11 @@ impl Shell {
                 }
                 0
             }
-            Mode::Get(name) => match self.bishopt_value(registry, name) {
+            Mode::Get(name, quiet) => match self.bishopt_value(registry, name) {
                 Some(BishOptValue::Bool(on)) => {
+                    if !quiet {
+                        sh_println!(self, "{}", if on { "on" } else { "off" });
+                    }
                     if on {
                         0
                     } else {
@@ -1691,7 +1704,9 @@ impl Shell {
                     }
                 }
                 Some(BishOptValue::Str(s)) => {
-                    sh_println!(self, "{s}");
+                    if !quiet {
+                        sh_println!(self, "{s}");
+                    }
                     0
                 }
                 None => {
@@ -1704,12 +1719,16 @@ impl Shell {
                     sh_eprintln!(self, "bish: bishopt: {name}: no such option");
                     1
                 }
-                (Some(BishOptDefault::Bool), None) => {
+                (Some(BishOptDefault::Bool), None | Some("on")) => {
                     self.bishopts.insert(name.to_string(), BishOptValue::Bool(true));
                     0
                 }
+                (Some(BishOptDefault::Bool), Some("off")) => {
+                    self.bishopts.insert(name.to_string(), BishOptValue::Bool(false));
+                    0
+                }
                 (Some(BishOptDefault::Bool), Some(_)) => {
-                    sh_eprintln!(self, "bish: bishopt: --set: {name}: a boolean option takes no value");
+                    sh_eprintln!(self, "bish: bishopt: --set: {name}: a boolean option only accepts 'on' or 'off'");
                     2
                 }
                 (Some(BishOptDefault::Str(_)), None) => {
@@ -7430,11 +7449,31 @@ mod tests {
     }
 
     #[test]
-    fn bishopt_get_on_a_bool_reports_via_exit_status_and_prints_nothing() {
+    fn bishopt_get_on_a_bool_reports_its_value_via_exit_status_either_way() {
         let mut shell = Shell::new();
         assert_eq!(shell.run_bishopt(&strs(&["verbose"]), TEST_BISHOPTS), 1, "unset bool defaults to off");
         shell.run_bishopt(&strs(&["--set", "verbose"]), TEST_BISHOPTS);
         assert_eq!(shell.run_bishopt(&strs(&["verbose"]), TEST_BISHOPTS), 0);
+    }
+
+    #[test]
+    fn bishopt_quiet_flag_behaves_like_the_bare_get_but_without_printing() {
+        let mut shell = Shell::new();
+        // -q/--quiet only changes whether get *prints* -- the exit status
+        // (what shopt -q itself is for) is identical to the bare get's.
+        assert_eq!(shell.run_bishopt(&strs(&["-q", "verbose"]), TEST_BISHOPTS), 1);
+        assert_eq!(shell.run_bishopt(&strs(&["--quiet", "greeting"]), TEST_BISHOPTS), 0, "a Str's mere existence is enough under -q");
+        shell.run_bishopt(&strs(&["--set", "verbose"]), TEST_BISHOPTS);
+        assert_eq!(shell.run_bishopt(&strs(&["-q", "verbose"]), TEST_BISHOPTS), 0);
+    }
+
+    #[test]
+    fn bishopt_set_accepts_on_and_off_as_an_alternative_to_unset_for_a_bool() {
+        let mut shell = Shell::new();
+        assert_eq!(shell.run_bishopt(&strs(&["--set", "verbose", "on"]), TEST_BISHOPTS), 0);
+        assert_eq!(shell.bishopt_value(TEST_BISHOPTS, "verbose"), Some(BishOptValue::Bool(true)));
+        assert_eq!(shell.run_bishopt(&strs(&["--set", "verbose", "off"]), TEST_BISHOPTS), 0);
+        assert_eq!(shell.bishopt_value(TEST_BISHOPTS, "verbose"), Some(BishOptValue::Bool(false)));
     }
 
     #[test]
