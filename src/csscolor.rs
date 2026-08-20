@@ -71,6 +71,74 @@ pub fn parse(input: &str) -> Result<Rgba, String> {
     named_color(&lower).ok_or_else(|| format!("{s}: not a valid CSS color"))
 }
 
+// A resolved color that's either a concrete Rgba (anything `parse` above
+// understands) or a still-symbolic reference into the *terminal's own*
+// palette (an xterm-indexed slot 0-255, of which 0-15 are typically
+// user-themed) -- bish has no fixed RGB for that, only the terminal
+// displaying it does, so it can't be folded into Rgba the way every
+// other color form here is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TermColor {
+    Rgba(Rgba),
+    Ansi(u8),
+}
+
+// Vendor-prefixed extension, CSS's own convention for "not a standard
+// property/value, but shaped like one" (`-webkit-...`, `-moz-...`) --
+// `-bish-<name>` for one of the 16 standard ANSI slots by name, or
+// `-bish-ansi(<0-255>)` for any xterm-indexed slot by number (the 16
+// named ones are just `-bish-ansi(0)`..`-bish-ansi(15)` with a memorable
+// spelling). Deliberately its own entry point, not folded into `parse`
+// above: every other color form here resolves to a concrete Rgba that
+// color-mix() etc. can do real math on, but a terminal-palette color has
+// no fixed RGB bish itself knows -- `color-mix(in srgb, -bish-red,
+// blue)` has nothing to mix *with*, so it's simply not a color `parse`
+// (what color-mix's own component parsing calls) recognizes at all;
+// only a bare top-level value can be a terminal color.
+pub fn parse_terminal(input: &str) -> Result<TermColor, String> {
+    let s = input.trim();
+    match s.strip_prefix("-bish-") {
+        Some(rest) => parse_vendor(rest),
+        None => parse(s).map(TermColor::Rgba),
+    }
+}
+
+fn parse_vendor(rest: &str) -> Result<TermColor, String> {
+    if let Some(open) = rest.find('(') {
+        if rest[..open].trim() != "ansi" || !rest.ends_with(')') {
+            return Err(format!("-bish-{rest}: unsupported vendor color function"));
+        }
+        let inner = rest[open + 1..rest.len() - 1].trim();
+        let n: u16 = inner.parse().map_err(|_| format!("-bish-ansi({inner}): expected an integer 0-255"))?;
+        return u8::try_from(n).map(TermColor::Ansi).map_err(|_| format!("-bish-ansi({n}): out of range, must be 0-255"));
+    }
+    ANSI_NAMES.iter().find(|(n, _)| *n == rest).map(|(_, idx)| TermColor::Ansi(*idx)).ok_or_else(|| format!("-bish-{rest}: not a known terminal palette color"))
+}
+
+// The 16 standard ANSI slots' conventional names -- the same 8 base +
+// "bright" variant vocabulary terminal emulators themselves use in their
+// own palette settings (iTerm2/kitty/Alacritty/...), so `-bish-red`
+// means exactly the same slot a user's own terminal config already calls
+// "red".
+const ANSI_NAMES: &[(&str, u8)] = &[
+    ("black", 0),
+    ("red", 1),
+    ("green", 2),
+    ("yellow", 3),
+    ("blue", 4),
+    ("magenta", 5),
+    ("cyan", 6),
+    ("white", 7),
+    ("bright-black", 8),
+    ("bright-red", 9),
+    ("bright-green", 10),
+    ("bright-yellow", 11),
+    ("bright-blue", 12),
+    ("bright-magenta", 13),
+    ("bright-cyan", 14),
+    ("bright-white", 15),
+];
+
 fn named_color(name: &str) -> Option<Rgba> {
     NAMED_COLORS.iter().find(|(n, _)| *n == name).map(|(_, c)| *c)
 }
@@ -694,5 +762,37 @@ mod tests {
         assert!(parse("rgb(1, 2)").is_err());
         assert!(parse("hsl(0, 50%, 200)").is_err(), "lightness without a % must fail");
         assert!(parse("rgb(1 2 3").is_err(), "unterminated function must fail");
+    }
+
+    #[test]
+    fn parse_terminal_resolves_named_ansi_slots_and_the_ansi_function() {
+        assert_eq!(parse_terminal("-bish-red").unwrap(), TermColor::Ansi(1));
+        assert_eq!(parse_terminal("-bish-bright-white").unwrap(), TermColor::Ansi(15));
+        assert_eq!(parse_terminal("-bish-ansi(200)").unwrap(), TermColor::Ansi(200));
+        assert_eq!(parse_terminal("-bish-ansi(0)").unwrap(), TermColor::Ansi(0));
+    }
+
+    #[test]
+    fn parse_terminal_falls_through_to_an_ordinary_rgba_color() {
+        assert_eq!(parse_terminal("cornflowerblue").unwrap(), TermColor::Rgba(Rgba::new(100, 149, 237, 255)));
+        assert_eq!(parse_terminal("#ff0000").unwrap(), TermColor::Rgba(Rgba::new(255, 0, 0, 255)));
+    }
+
+    #[test]
+    fn parse_terminal_rejects_unknown_vendor_names_and_out_of_range_indices() {
+        assert!(parse_terminal("-bish-not-a-real-slot").is_err());
+        assert!(parse_terminal("-bish-ansi(256)").is_err());
+        assert!(parse_terminal("-bish-ansi(nope)").is_err());
+        assert!(parse_terminal("-bish-rgb(1, 2, 3)").is_err(), "only -bish-ansi(...) is a vendor function, not every function under -bish-");
+    }
+
+    #[test]
+    fn a_vendor_terminal_color_cannot_be_used_inside_color_mix() {
+        // color-mix() parses its own component colors via `parse`, not
+        // `parse_terminal` -- there's no fixed RGB to mix a terminal
+        // palette slot with, so this must fail rather than silently
+        // treating "-bish-red" as an unrecognized (and thus ignored)
+        // color function.
+        assert!(parse("color-mix(in srgb, -bish-red, blue)").is_err());
     }
 }

@@ -1635,7 +1635,7 @@ impl Shell {
                 BishOptDefault::Bool => BishOptValue::Bool(false),
                 BishOptDefault::Str(s) => BishOptValue::Str(s.to_string()),
                 BishOptDefault::Color(s) => {
-                    let c = crate::csscolor::parse(s).unwrap_or_else(|e| panic!("KNOWN_BISHOPTS: {name}: default color {s:?} doesn't parse: {e}"));
+                    let c = crate::csscolor::parse_terminal(s).unwrap_or_else(|e| panic!("KNOWN_BISHOPTS: {name}: default color {s:?} doesn't parse: {e}"));
                     BishOptValue::Color(s.to_string(), c)
                 }
             },
@@ -1765,7 +1765,7 @@ impl Shell {
                     sh_eprintln!(self, "bish: bishopt: --set: {name}: requires a VALUE");
                     2
                 }
-                (Some(BishOptDefault::Color(_)), Some(v)) => match crate::csscolor::parse(v) {
+                (Some(BishOptDefault::Color(_)), Some(v)) => match crate::csscolor::parse_terminal(v) {
                     Ok(c) => {
                         self.bishopts.insert(name.to_string(), BishOptValue::Color(v.to_string(), c));
                         0
@@ -1788,7 +1788,9 @@ impl Shell {
     }
 
     // Resolves a bishopt Color option's current effective value as a
-    // vt100::Color::Rgb -- `None` if `name` isn't a registered Color
+    // vt100::Color -- Rgb for an ordinary CSS color, Indexed for a
+    // `-bish-*` vendor reference into the terminal's own palette (see
+    // csscolor::TermColor). `None` if `name` isn't a registered Color
     // option at all (an unknown name, or a Bool/Str one). Used by repl.rs
     // to build a session's live bishedit::highlight::ColorOverrides each
     // redraw, from bishedit::highlight::SYN_COL_OPTIONS' own list of
@@ -1797,7 +1799,8 @@ impl Shell {
     // resolved color, never the raw bishopt machinery.
     pub fn bishopt_color(&self, name: &str) -> Option<vt100::Color> {
         match self.bishopt_value(KNOWN_BISHOPTS, name)? {
-            BishOptValue::Color(_, rgba) => Some(vt100::Color::Rgb(rgba.r, rgba.g, rgba.b)),
+            BishOptValue::Color(_, crate::csscolor::TermColor::Rgba(rgba)) => Some(vt100::Color::Rgb(rgba.r, rgba.g, rgba.b)),
+            BishOptValue::Color(_, crate::csscolor::TermColor::Ansi(n)) => Some(vt100::Color::Indexed(n)),
             _ => None,
         }
     }
@@ -7220,15 +7223,16 @@ enum BishOptDefault {
 
 // A bishopt option's actual current value -- what `Shell::bishopts` maps
 // names to once they've been explicitly `--set`. Color keeps the
-// original source text alongside the parsed Rgba -- `bishopt get` prints
-// that text back verbatim (see run_bishopt's own doc comment), not a
-// re-serialization, so `--set accent cornflowerblue` reads back as
-// "cornflowerblue" rather than "#6495ed".
+// original source text alongside the parsed TermColor -- `bishopt get`
+// prints that text back verbatim (see run_bishopt's own doc comment),
+// not a re-serialization, so `--set accent cornflowerblue` reads back as
+// "cornflowerblue" rather than "#6495ed" (and `-bish-red` reads back as
+// "-bish-red", not some resolved RGB it doesn't actually have).
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum BishOptValue {
     Bool(bool),
     Str(String),
-    Color(String, crate::csscolor::Rgba),
+    Color(String, crate::csscolor::TermColor),
 }
 
 // bishopt's own known-option registry -- deliberately separate from (and
@@ -7243,24 +7247,25 @@ enum BishOptValue {
 // more dead-stub problem, unlike shopt_options' own history): each is
 // one of bishedit::highlight's own SYN_COL_OPTIONS names, read every
 // prompt redraw (see repl.rs's own construction of `highlight_ctx`) to
-// build that redraw's ColorOverrides. Their default text is a plain CSS
-// color name chosen to read as close as reasonable to what that
-// HighlightKind's own hardcoded ANSI Indexed color (bishedit::highlight::
-// default_style) typically renders as -- "typically" because an Indexed
-// color's *actual* RGB depends on the user's own terminal palette, which
-// a fixed default can only approximate; overriding a `syn_col_*` value
-// is what actually pins it to a real, terminal-independent color.
+// build that redraw's ColorOverrides. Their default text is a `-bish-*`
+// vendor color (csscolor::parse_terminal) naming the exact ANSI slot
+// that HighlightKind's own hardcoded Indexed color (bishedit::highlight::
+// default_style) already used -- so a fresh install renders identically
+// to before this option existed, still resolved by the *user's own*
+// terminal palette rather than some fixed guess at what "yellow" ought
+// to look like. `--set`-ing an ordinary CSS color (or color-mix, hsl(),
+// ...) is what actually pins it to a real, terminal-independent color.
 const KNOWN_BISHOPTS: &[(&str, BishOptDefault)] = &[
-    ("syn_col_keyword", BishOptDefault::Color("yellow")),
-    ("syn_col_operator", BishOptDefault::Color("silver")),
-    ("syn_col_redirect", BishOptDefault::Color("magenta")),
-    ("syn_col_string", BishOptDefault::Color("green")),
-    ("syn_col_variable", BishOptDefault::Color("cyan")),
-    ("syn_col_substitution", BishOptDefault::Color("blue")),
-    ("syn_col_comment", BishOptDefault::Color("gray")),
-    ("syn_col_number", BishOptDefault::Color("cyan")),
-    ("syn_col_format_specifier", BishOptDefault::Color("red")),
-    ("syn_col_invalid_command", BishOptDefault::Color("red")),
+    ("syn_col_keyword", BishOptDefault::Color("-bish-yellow")),
+    ("syn_col_operator", BishOptDefault::Color("-bish-white")),
+    ("syn_col_redirect", BishOptDefault::Color("-bish-magenta")),
+    ("syn_col_string", BishOptDefault::Color("-bish-green")),
+    ("syn_col_variable", BishOptDefault::Color("-bish-cyan")),
+    ("syn_col_substitution", BishOptDefault::Color("-bish-blue")),
+    ("syn_col_comment", BishOptDefault::Color("-bish-bright-black")),
+    ("syn_col_number", BishOptDefault::Color("-bish-cyan")),
+    ("syn_col_format_specifier", BishOptDefault::Color("-bish-red")),
+    ("syn_col_invalid_command", BishOptDefault::Color("-bish-red")),
 ];
 
 fn is_known_builtin(name: &str) -> bool {
@@ -7584,13 +7589,13 @@ mod tests {
         assert_eq!(shell.run_bishopt(&strs(&["--unset", "accent"]), TEST_BISHOPTS), 0);
         assert_eq!(shell.bishopt_value(TEST_BISHOPTS, "verbose"), Some(BishOptValue::Bool(false)));
         assert_eq!(shell.bishopt_value(TEST_BISHOPTS, "greeting"), Some(BishOptValue::Str("hi".to_string())));
-        assert_eq!(shell.bishopt_value(TEST_BISHOPTS, "accent"), Some(BishOptValue::Color("red".to_string(), crate::csscolor::Rgba::new(255, 0, 0, 255))));
+        assert_eq!(shell.bishopt_value(TEST_BISHOPTS, "accent"), Some(BishOptValue::Color("red".to_string(), crate::csscolor::TermColor::Rgba(crate::csscolor::Rgba::new(255, 0, 0, 255)))));
     }
 
     #[test]
     fn bishopt_get_on_a_color_prints_the_original_text_not_a_re_serialization() {
         let mut shell = Shell::new();
-        assert_eq!(shell.bishopt_value(TEST_BISHOPTS, "accent"), Some(BishOptValue::Color("red".to_string(), crate::csscolor::Rgba::new(255, 0, 0, 255))));
+        assert_eq!(shell.bishopt_value(TEST_BISHOPTS, "accent"), Some(BishOptValue::Color("red".to_string(), crate::csscolor::TermColor::Rgba(crate::csscolor::Rgba::new(255, 0, 0, 255)))));
 
         let buf = Rc::new(RefCell::new(String::new()));
         shell.set_sink_capture(buf.clone());
@@ -7609,15 +7614,15 @@ mod tests {
     fn bishopt_set_accepts_any_valid_css_color_syntax_including_color_mix() {
         let mut shell = Shell::new();
         assert_eq!(shell.run_bishopt(&strs(&["--set", "accent", "#00ff00"]), TEST_BISHOPTS), 0);
-        assert_eq!(shell.bishopt_value(TEST_BISHOPTS, "accent"), Some(BishOptValue::Color("#00ff00".to_string(), crate::csscolor::Rgba::new(0, 255, 0, 255))));
+        assert_eq!(shell.bishopt_value(TEST_BISHOPTS, "accent"), Some(BishOptValue::Color("#00ff00".to_string(), crate::csscolor::TermColor::Rgba(crate::csscolor::Rgba::new(0, 255, 0, 255)))));
 
         assert_eq!(shell.run_bishopt(&strs(&["--set", "accent", "rgb(0 0 255)"]), TEST_BISHOPTS), 0);
-        assert_eq!(shell.bishopt_value(TEST_BISHOPTS, "accent"), Some(BishOptValue::Color("rgb(0 0 255)".to_string(), crate::csscolor::Rgba::new(0, 0, 255, 255))));
+        assert_eq!(shell.bishopt_value(TEST_BISHOPTS, "accent"), Some(BishOptValue::Color("rgb(0 0 255)".to_string(), crate::csscolor::TermColor::Rgba(crate::csscolor::Rgba::new(0, 0, 255, 255)))));
 
         assert_eq!(shell.run_bishopt(&strs(&["--set", "accent", "color-mix(in srgb, red, blue)"]), TEST_BISHOPTS), 0);
         assert_eq!(
             shell.bishopt_value(TEST_BISHOPTS, "accent"),
-            Some(BishOptValue::Color("color-mix(in srgb, red, blue)".to_string(), crate::csscolor::Rgba::new(128, 0, 128, 255)))
+            Some(BishOptValue::Color("color-mix(in srgb, red, blue)".to_string(), crate::csscolor::TermColor::Rgba(crate::csscolor::Rgba::new(128, 0, 128, 255))))
         );
     }
 
@@ -7627,7 +7632,7 @@ mod tests {
         assert_eq!(shell.run_bishopt(&strs(&["--set", "accent", "not-a-color"]), TEST_BISHOPTS), 2);
         assert_eq!(
             shell.bishopt_value(TEST_BISHOPTS, "accent"),
-            Some(BishOptValue::Color("red".to_string(), crate::csscolor::Rgba::new(255, 0, 0, 255))),
+            Some(BishOptValue::Color("red".to_string(), crate::csscolor::TermColor::Rgba(crate::csscolor::Rgba::new(255, 0, 0, 255)))),
             "a rejected set must not overwrite the default"
         );
     }
@@ -7661,9 +7666,31 @@ mod tests {
     #[test]
     fn bishopt_color_resolves_the_default_then_an_override_then_none_for_unknown() {
         let mut shell = Shell::new();
-        assert_eq!(shell.bishopt_color("syn_col_string"), Some(vt100::Color::Rgb(0, 128, 0)), "\"green\"'s own RGB");
+        // Default is "-bish-green" (ANSI slot 2, terminal-resolved), not
+        // a fixed "green" RGB -- see KNOWN_BISHOPTS' own doc comment on
+        // why: a fresh install should render exactly as it did before
+        // syn_col_* existed.
+        assert_eq!(shell.bishopt_color("syn_col_string"), Some(vt100::Color::Indexed(2)));
         shell.run_bishopt(&strs(&["--set", "syn_col_string", "#123456"]), KNOWN_BISHOPTS);
         assert_eq!(shell.bishopt_color("syn_col_string"), Some(vt100::Color::Rgb(0x12, 0x34, 0x56)));
         assert_eq!(shell.bishopt_color("not_a_real_option"), None);
+    }
+
+    #[test]
+    fn bishopt_color_accepts_a_vendor_ansi_reference_and_reads_it_back_verbatim() {
+        let mut shell = Shell::new();
+        assert_eq!(shell.run_bishopt(&strs(&["--set", "accent", "-bish-bright-red"]), TEST_BISHOPTS), 0);
+        assert_eq!(shell.bishopt_value(TEST_BISHOPTS, "accent"), Some(BishOptValue::Color("-bish-bright-red".to_string(), crate::csscolor::TermColor::Ansi(9))));
+
+        let buf = Rc::new(RefCell::new(String::new()));
+        shell.set_sink_capture(buf.clone());
+        shell.run_bishopt(&strs(&["accent"]), TEST_BISHOPTS);
+        assert_eq!(buf.borrow().as_str(), "-bish-bright-red\n");
+    }
+
+    #[test]
+    fn bishopt_set_rejects_a_vendor_color_used_inside_color_mix() {
+        let mut shell = Shell::new();
+        assert_eq!(shell.run_bishopt(&strs(&["--set", "accent", "color-mix(in srgb, -bish-red, blue)"]), TEST_BISHOPTS), 2);
     }
 }
