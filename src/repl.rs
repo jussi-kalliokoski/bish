@@ -570,7 +570,14 @@ pub fn run(mut shell: Shell) {
         // for the whole call (which would conflict with on_idle's own
         // &mut sessions borrow below, same reasoning as session_history).
         let abbrs_snapshot = sessions[&session_id].shell.abbrs.clone();
-        let highlight_ctx = HighlightContext { cwd: Some(cwd_snapshot.as_path()), known_functions: Some(&known_functions) };
+        // Same owned-snapshot pattern again -- this redraw's live
+        // syn_col_* colors (see highlight::SYN_COL_OPTIONS/ColorOverrides
+        // and exec.rs's own Shell::bishopt_color), resolved once up front
+        // rather than re-querying the shell per span.
+        let color_overrides: highlight::ColorOverrides =
+            highlight::SYN_COL_OPTIONS.iter().filter_map(|(kind, name)| sessions[&session_id].shell.bishopt_color(name).map(|c| (*kind, c))).collect();
+        let highlight_ctx =
+            HighlightContext { cwd: Some(cwd_snapshot.as_path()), known_functions: Some(&known_functions), color_overrides: Some(&color_overrides) };
         // Same owned-snapshot pattern as highlight_ctx just above -- built
         // from the exact same locals, not re-snapshotted.
         let shell_completion = completion::ShellCompletionProvider { cwd: Some(cwd_snapshot.as_path()), known_functions: Some(&known_functions) };

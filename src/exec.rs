@@ -1787,6 +1787,21 @@ impl Shell {
         }
     }
 
+    // Resolves a bishopt Color option's current effective value as a
+    // vt100::Color::Rgb -- `None` if `name` isn't a registered Color
+    // option at all (an unknown name, or a Bool/Str one). Used by repl.rs
+    // to build a session's live bishedit::highlight::ColorOverrides each
+    // redraw, from bishedit::highlight::SYN_COL_OPTIONS' own list of
+    // names -- exposed this way (rather than BishOptValue/bishopt_value
+    // themselves, both private) since repl.rs only ever needs the
+    // resolved color, never the raw bishopt machinery.
+    pub fn bishopt_color(&self, name: &str) -> Option<vt100::Color> {
+        match self.bishopt_value(KNOWN_BISHOPTS, name)? {
+            BishOptValue::Color(_, rgba) => Some(vt100::Color::Rgb(rgba.r, rgba.g, rgba.b)),
+            _ => None,
+        }
+    }
+
     // Fish-style abbreviations: `self.abbrs`'s own doc comment covers the
     // storage/trigger split (this builtin only ever stores/queries/lists;
     // the actual expansion happens in editor.rs's read_line). Deliberately
@@ -7189,14 +7204,16 @@ fn shopt_default_on(name: &str) -> Option<bool> {
 // value would be, see `bishopt_value`); Bool has no stored default of
 // its own, see `run_bishopt`'s own doc comment on why "unset" and
 // "false" are the same state for a boolean option.
-// #[allow(dead_code)]: KNOWN_BISHOPTS starts empty (see its own doc
-// comment), so no variant is actually constructed by production code
-// yet -- only by run_bishopt's tests, which build their own small
-// registry. Drop this once a real entry lands in KNOWN_BISHOPTS.
+// #[allow(dead_code)]: no Bool or Str entry has landed in KNOWN_BISHOPTS
+// yet (only Color, for syn_col_* -- see its own doc comment), so those
+// two variants aren't actually constructed by production code, only by
+// run_bishopt's tests (which build their own small registry covering all
+// three). Drop this once a real Bool/Str entry exists.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
 enum BishOptDefault {
+    #[allow(dead_code)]
     Bool,
+    #[allow(dead_code)]
     Str(&'static str),
     Color(&'static str),
 }
@@ -7220,13 +7237,31 @@ enum BishOptValue {
 // don't fail, and its namespace is bash's own to define, not bish's --
 // mixing bish-specific settings into it risks a script written against
 // real bash silently colliding with (or being silently ignored by) a
-// bish-only setting sharing the same name. Starts empty: unlike shopt,
-// there's no external compatibility contract obligating any particular
-// name to exist here, and a registered name with no real behavior behind
-// it yet is exactly the dead-stub problem shopt_options itself had before
-// this pair of features existed -- add an entry here only once something
-// in bish actually reads it.
-const KNOWN_BISHOPTS: &[(&str, BishOptDefault)] = &[];
+// bish-only setting sharing the same name.
+//
+// The `syn_col_*` entries are the first real, behavior-gating ones (no
+// more dead-stub problem, unlike shopt_options' own history): each is
+// one of bishedit::highlight's own SYN_COL_OPTIONS names, read every
+// prompt redraw (see repl.rs's own construction of `highlight_ctx`) to
+// build that redraw's ColorOverrides. Their default text is a plain CSS
+// color name chosen to read as close as reasonable to what that
+// HighlightKind's own hardcoded ANSI Indexed color (bishedit::highlight::
+// default_style) typically renders as -- "typically" because an Indexed
+// color's *actual* RGB depends on the user's own terminal palette, which
+// a fixed default can only approximate; overriding a `syn_col_*` value
+// is what actually pins it to a real, terminal-independent color.
+const KNOWN_BISHOPTS: &[(&str, BishOptDefault)] = &[
+    ("syn_col_keyword", BishOptDefault::Color("yellow")),
+    ("syn_col_operator", BishOptDefault::Color("silver")),
+    ("syn_col_redirect", BishOptDefault::Color("magenta")),
+    ("syn_col_string", BishOptDefault::Color("green")),
+    ("syn_col_variable", BishOptDefault::Color("cyan")),
+    ("syn_col_substitution", BishOptDefault::Color("blue")),
+    ("syn_col_comment", BishOptDefault::Color("gray")),
+    ("syn_col_number", BishOptDefault::Color("cyan")),
+    ("syn_col_format_specifier", BishOptDefault::Color("red")),
+    ("syn_col_invalid_command", BishOptDefault::Color("red")),
+];
 
 fn is_known_builtin(name: &str) -> bool {
     KNOWN_BUILTINS.contains(&name)
@@ -7613,5 +7648,22 @@ mod tests {
         assert_eq!(child.bishopts, parent.bishopts);
         child.run_bishopt(&strs(&["--set", "greeting", "yo"]), TEST_BISHOPTS);
         assert!(!parent.bishopts.contains_key("greeting"), "parent must not see the child's later bishopt changes");
+    }
+
+    #[test]
+    fn every_syn_col_option_is_registered_and_defaults_to_a_valid_css_color() {
+        let shell = Shell::new();
+        for (_, name) in crate::bishedit::highlight::SYN_COL_OPTIONS {
+            assert!(shell.bishopt_color(name).is_some(), "{name} must be a registered Color option with a parseable default");
+        }
+    }
+
+    #[test]
+    fn bishopt_color_resolves_the_default_then_an_override_then_none_for_unknown() {
+        let mut shell = Shell::new();
+        assert_eq!(shell.bishopt_color("syn_col_string"), Some(vt100::Color::Rgb(0, 128, 0)), "\"green\"'s own RGB");
+        shell.run_bishopt(&strs(&["--set", "syn_col_string", "#123456"]), KNOWN_BISHOPTS);
+        assert_eq!(shell.bishopt_color("syn_col_string"), Some(vt100::Color::Rgb(0x12, 0x34, 0x56)));
+        assert_eq!(shell.bishopt_color("not_a_real_option"), None);
     }
 }

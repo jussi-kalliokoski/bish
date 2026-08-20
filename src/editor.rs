@@ -719,7 +719,7 @@ fn compose_redraw(prompt: &str, ed: &LineEditor, ghost: &str, col_origin: usize,
         .highlight(&buf_text, ctx)
         .into_iter()
         .map(|s| {
-            let (fg, attrs) = highlight::default_style(s.kind);
+            let (fg, attrs) = highlight::resolve_style(s.kind, ctx.color_overrides);
             StyledSpan { start: s.start, end: s.end, fg, attrs }
         })
         .collect();

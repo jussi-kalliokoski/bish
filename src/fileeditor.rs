@@ -1044,7 +1044,7 @@ fn buffer_highlight_spans(buf: &TextBuffer) -> Vec<StyledSpan> {
         .highlight(&text, HighlightContext::default())
         .into_iter()
         .map(|s| {
-            let (fg, attrs) = highlight::default_style(s.kind);
+            let (fg, attrs) = highlight::resolve_style(s.kind, None);
             StyledSpan { start: s.start, end: s.end, fg, attrs }
         })
         .collect()

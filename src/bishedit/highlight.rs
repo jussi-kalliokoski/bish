@@ -42,9 +42,18 @@ pub struct HighlightContext<'a> {
     // typed as a command -- treating it as "valid" here would be
     // actively misleading.
     pub known_functions: Option<&'a HashSet<String>>,
+    // Unlike cwd/known_functions above, never read by the highlight_into
+    // recursion itself (that step only ever produces a HighlightKind, not
+    // a color) -- carried on this same bundle purely because every real
+    // call site already has `ctx` in scope right where it turns those
+    // HighlightKinds into StyledSpans via resolve_style, and a second
+    // parameter threaded in parallel the whole way down would be more
+    // churn than it's worth for one more `Option<&T>`. See resolve_style/
+    // ColorOverrides/SYN_COL_OPTIONS just above default_style.
+    pub color_overrides: Option<&'a ColorOverrides>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum HighlightKind {
     Keyword,
     Operator,
@@ -153,6 +162,53 @@ pub fn default_style(kind: HighlightKind) -> (vt100::Color, vt100::CellAttrs) {
     }
 }
 
+// A session's live foreground-color overrides, keyed by HighlightKind --
+// what `bishopt`'s `syn_col_*` Color options (see exec.rs's KNOWN_
+// BISHOPTS and SYN_COL_OPTIONS just below) resolve to, once a caller with
+// an actual live Shell to read them from (repl.rs's main prompt loop) has
+// built one. A plain HashMap, not bishopt-aware itself -- this crate
+// doesn't know what a "bishopt" is (see this module's own doc comment on
+// why: a future non-shell consumer shouldn't have to bring exec.rs's
+// whole builtin-dispatch machinery along just to render highlighted
+// text), it only knows how to take a resolved color if it's given one.
+pub type ColorOverrides = std::collections::HashMap<HighlightKind, vt100::Color>;
+
+// default_style(kind), with `overrides` (if any) substituted in for just
+// the foreground color -- attrs (bold/dim/underline) stay exactly what
+// default_style itself says regardless; bishopt's Color type has no way
+// to express weight, so there's nothing to override there. `overrides:
+// None` (HighlightContext's own default -- every caller with no live
+// Shell to read from, e.g. fileeditor.rs's own buffer highlighting)
+// behaves identically to calling default_style directly.
+pub fn resolve_style(kind: HighlightKind, overrides: Option<&ColorOverrides>) -> (vt100::Color, vt100::CellAttrs) {
+    let (default_fg, attrs) = default_style(kind);
+    let fg = overrides.and_then(|o| o.get(&kind)).copied().unwrap_or(default_fg);
+    (fg, attrs)
+}
+
+// Which bishopt Color option name (see exec.rs's KNOWN_BISHOPTS) drives
+// each colorable HighlightKind's foreground -- lives here, not exec.rs,
+// since HighlightKind is this crate's own type and exec.rs otherwise has
+// no reason to depend on it. Deliberately doesn't cover every
+// HighlightKind: Flag/Subcommand/Link use vt100::Color::Default (whatever
+// the terminal's own default foreground is, not a real color) rather
+// than one of default_style's Indexed picks, and bishopt's Color type
+// can only ever produce a concrete Rgb -- there's no "inherit the
+// terminal's default" CSS color to register a default of, so those three
+// simply aren't made configurable this way.
+pub const SYN_COL_OPTIONS: &[(HighlightKind, &str)] = &[
+    (HighlightKind::Keyword, "syn_col_keyword"),
+    (HighlightKind::Operator, "syn_col_operator"),
+    (HighlightKind::Redirect, "syn_col_redirect"),
+    (HighlightKind::String, "syn_col_string"),
+    (HighlightKind::Variable, "syn_col_variable"),
+    (HighlightKind::Substitution, "syn_col_substitution"),
+    (HighlightKind::Comment, "syn_col_comment"),
+    (HighlightKind::Number, "syn_col_number"),
+    (HighlightKind::FormatSpecifier, "syn_col_format_specifier"),
+    (HighlightKind::InvalidCommand, "syn_col_invalid_command"),
+];
+
 // Builds one Cell per char, then paints each layer's spans over it in
 // order -- a later layer (or a later span within the same layer, though
 // BashHighlighter's own output is always non-overlapping by construction)
@@ -208,7 +264,7 @@ pub fn render_line(text: &str, ctx: HighlightContext) -> String {
         .highlight(text, ctx)
         .into_iter()
         .map(|s| {
-            let (fg, attrs) = default_style(s.kind);
+            let (fg, attrs) = resolve_style(s.kind, ctx.color_overrides);
             StyledSpan { start: s.start, end: s.end, fg, attrs }
         })
         .collect();
@@ -1114,6 +1170,35 @@ mod tests {
         }
     }
 
+    #[test]
+    fn resolve_style_falls_back_to_default_style_with_no_overrides() {
+        assert_eq!(resolve_style(HighlightKind::Keyword, None), default_style(HighlightKind::Keyword));
+        let empty = ColorOverrides::new();
+        assert_eq!(resolve_style(HighlightKind::Keyword, Some(&empty)), default_style(HighlightKind::Keyword));
+    }
+
+    #[test]
+    fn resolve_style_substitutes_only_the_foreground_never_the_attrs() {
+        let mut overrides = ColorOverrides::new();
+        overrides.insert(HighlightKind::Keyword, vt100::Color::Rgb(1, 2, 3));
+        let (fg, attrs) = resolve_style(HighlightKind::Keyword, Some(&overrides));
+        assert_eq!(fg, vt100::Color::Rgb(1, 2, 3));
+        assert_eq!(attrs, default_style(HighlightKind::Keyword).1, "attrs must stay whatever default_style says regardless of a color override");
+    }
+
+    #[test]
+    fn syn_col_options_never_covers_a_kind_that_uses_the_terminals_own_default_color() {
+        // Flag/Subcommand/Link all render via vt100::Color::Default in
+        // default_style -- there's no CSS color that means "inherit the
+        // terminal's own default foreground", so none of them should be
+        // bishopt-configurable this way (see SYN_COL_OPTIONS' own doc
+        // comment).
+        for uncolorable in [HighlightKind::Flag, HighlightKind::Subcommand, HighlightKind::Link] {
+            assert!(!SYN_COL_OPTIONS.iter().any(|(k, _)| *k == uncolorable));
+        }
+        assert_eq!(SYN_COL_OPTIONS.len(), 10);
+    }
+
     fn tok(word: &str) -> Tok {
         // Small helper for resets_command_position tests -- lexes just
         // enough to get a real Tok of the right variant without hardcoding
@@ -1396,7 +1481,7 @@ mod tests {
     fn is_valid_command_name_recognizes_a_known_function() {
         let mut functions = HashSet::new();
         functions.insert("my_func".to_string());
-        let ctx = HighlightContext { cwd: None, known_functions: Some(&functions) };
+        let ctx = HighlightContext { cwd: None, known_functions: Some(&functions), color_overrides: None };
         assert!(is_valid_command_name("my_func", &ctx));
         assert!(!is_valid_command_name("other_func", &ctx));
     }
@@ -1485,7 +1570,7 @@ mod tests {
     fn a_call_to_a_known_function_is_not_flagged_invalid() {
         let mut functions = HashSet::new();
         functions.insert("my_func".to_string());
-        let ctx = HighlightContext { cwd: None, known_functions: Some(&functions) };
+        let ctx = HighlightContext { cwd: None, known_functions: Some(&functions), color_overrides: None };
         let spans = BashHighlighter.highlight("my_func arg", ctx);
         assert!(!spans.iter().any(|s| s.kind == HighlightKind::InvalidCommand), "{spans:?}");
     }
