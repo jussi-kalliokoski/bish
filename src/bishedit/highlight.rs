@@ -370,7 +370,7 @@ pub(crate) const KNOWN_BUILTINS: &[&str] = &[
     ":", "cd", "e", "export", "let", "break", "continue", "test", "[", "[[", "return", "shift", "local", "exit", "read", "mapfile",
     "readarray", "eval", "source", ".", "trap", "jobs", "fg", "bg", "wait", "kill", "getopts", "unset", "set", "declare",
     "typeset", "readonly", "exec", "command", "type", "hash", "shopt", "umask", "pushd", "popd", "dirs", "ulimit", "alias",
-    "unalias", "abbr", "window", "win", "echo", "printf",
+    "unalias", "abbr", "bishopt", "window", "win", "echo", "printf",
 ];
 
 // A command name is valid if it's a known builtin, one of the session's

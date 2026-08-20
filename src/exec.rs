@@ -393,6 +393,15 @@ pub struct Shell {
     // longer fails as an unknown command, which would otherwise abort the
     // whole script under `set -e`.
     shopt_options: std::collections::HashMap<String, bool>,
+    // `bishopt --set/--unset NAME [VALUE]`: bish's own config surface, a
+    // deliberately separate namespace from shopt_options above (shopt
+    // exists only for bash-script compatibility -- see KNOWN_BISHOPTS'
+    // own doc comment for why the two shouldn't mix). Same override-only
+    // shape as shopt_options: absent means "use that option's own
+    // registered default", `--unset` removes the entry outright rather
+    // than writing the default back, so "explicitly unset" and "never
+    // touched" collapse to the same state.
+    bishopts: std::collections::HashMap<String, BishOptValue>,
     // `readonly NAME`. Checked by assign_var, the single write path plain
     // assignment/local/export/declare/arithmetic-assignment/read/getopts
     // all funnel through, so marking a name here blocks writes everywhere
@@ -605,6 +614,7 @@ impl Shell {
             nameref_local_stack: Vec::new(),
             dir_stack: Vec::new(),
             shopt_options: std::collections::HashMap::new(),
+            bishopts: std::collections::HashMap::new(),
             readonly_names: std::collections::HashSet::new(),
             integer_names: std::collections::HashSet::new(),
             upper_names: std::collections::HashSet::new(),
@@ -794,6 +804,7 @@ impl Shell {
             nameref_local_stack: Vec::new(),
             dir_stack: self.dir_stack.clone(),
             shopt_options: self.shopt_options.clone(),
+            bishopts: self.bishopts.clone(),
             readonly_names: self.readonly_names.clone(),
             integer_names: self.integer_names.clone(),
             upper_names: self.upper_names.clone(),
@@ -1603,6 +1614,119 @@ impl Shell {
                 for n in targets {
                     self.print_shopt_line(n, reusable);
                 }
+                0
+            }
+        }
+    }
+
+    // Effective value for a known bishopt name: its explicit override if
+    // one's been set, else that option's own registered default (always
+    // `false` for a Bool -- there's no separate stored default for
+    // booleans, see KNOWN_BISHOPTS' own doc comment). `None` means `name`
+    // isn't a registered option at all.
+    fn bishopt_value(&self, registry: &[(&str, BishOptDefault)], name: &str) -> Option<BishOptValue> {
+        let default = registry.iter().find(|(n, _)| *n == name)?.1;
+        Some(match self.bishopts.get(name) {
+            Some(v) => v.clone(),
+            None => match default {
+                BishOptDefault::Bool => BishOptValue::Bool(false),
+                BishOptDefault::Str(s) => BishOptValue::Str(s.to_string()),
+            },
+        })
+    }
+
+    // bishopt [--set|-s NAME [VALUE] | --unset|-u NAME | NAME]. `registry`
+    // is threaded in as a parameter (rather than reaching for
+    // KNOWN_BISHOPTS directly) purely for testability -- the one real
+    // caller (run_single's dispatch) always passes KNOWN_BISHOPTS itself.
+    //
+    // Bare `bishopt` lists every registered option's *name* only, no
+    // values -- unlike shopt's own table, a bishopt's value isn't always
+    // printable text (a Bool's "value" is its exit code, not a line of
+    // output -- see the get arm below), so there's no single format that
+    // would fit every row.
+    //
+    // Get (`bishopt NAME`, no flags): a Bool option prints nothing and
+    // reports its value as the exit status (0 = on, 1 = off, same
+    // convention `shopt -q` already uses); a Str option prints its value
+    // and exits 0. Set: `--set NAME` turns a Bool on (no value token
+    // allowed); `--set NAME VALUE` sets a Str's value (VALUE required).
+    // Giving a value to a Bool, or omitting one for a Str, is a usage
+    // error. Unset always removes the override and falls back to the
+    // option's registered default -- for a Bool that default is
+    // definitionally `false`, so "--unset turns it off" and "revert to
+    // default" are the same operation; for a Str it reverts to whatever
+    // default that option was registered with.
+    fn run_bishopt(&mut self, args: &[String], registry: &[(&str, BishOptDefault)]) -> i32 {
+        enum Mode<'a> {
+            List,
+            Get(&'a str),
+            Set(&'a str, Option<&'a str>),
+            Unset(&'a str),
+        }
+        let mode = match args {
+            [] => Mode::List,
+            [flag, name] if flag == "--set" || flag == "-s" => Mode::Set(name, None),
+            [flag, name, value] if flag == "--set" || flag == "-s" => Mode::Set(name, Some(value)),
+            [flag, name] if flag == "--unset" || flag == "-u" => Mode::Unset(name),
+            [name] => Mode::Get(name),
+            _ => {
+                sh_eprintln!(self, "bish: bishopt: usage: bishopt [--set|-s NAME [VALUE] | --unset|-u NAME | NAME]");
+                return 2;
+            }
+        };
+        match mode {
+            Mode::List => {
+                for (name, _) in registry {
+                    sh_println!(self, "{name}");
+                }
+                0
+            }
+            Mode::Get(name) => match self.bishopt_value(registry, name) {
+                Some(BishOptValue::Bool(on)) => {
+                    if on {
+                        0
+                    } else {
+                        1
+                    }
+                }
+                Some(BishOptValue::Str(s)) => {
+                    sh_println!(self, "{s}");
+                    0
+                }
+                None => {
+                    sh_eprintln!(self, "bish: bishopt: {name}: no such option");
+                    1
+                }
+            },
+            Mode::Set(name, value) => match (registry.iter().find(|(n, _)| *n == name).map(|(_, d)| *d), value) {
+                (None, _) => {
+                    sh_eprintln!(self, "bish: bishopt: {name}: no such option");
+                    1
+                }
+                (Some(BishOptDefault::Bool), None) => {
+                    self.bishopts.insert(name.to_string(), BishOptValue::Bool(true));
+                    0
+                }
+                (Some(BishOptDefault::Bool), Some(_)) => {
+                    sh_eprintln!(self, "bish: bishopt: --set: {name}: a boolean option takes no value");
+                    2
+                }
+                (Some(BishOptDefault::Str(_)), None) => {
+                    sh_eprintln!(self, "bish: bishopt: --set: {name}: requires a VALUE");
+                    2
+                }
+                (Some(BishOptDefault::Str(_)), Some(v)) => {
+                    self.bishopts.insert(name.to_string(), BishOptValue::Str(v.to_string()));
+                    0
+                }
+            },
+            Mode::Unset(name) => {
+                if !registry.iter().any(|(n, _)| *n == name) {
+                    sh_eprintln!(self, "bish: bishopt: {name}: no such option");
+                    return 1;
+                }
+                self.bishopts.remove(name);
                 0
             }
         }
@@ -3467,6 +3591,7 @@ impl Shell {
             }
             "abbr" => return ExecResult::Status(self.run_abbr(&argv[1..])),
             "shopt" => return ExecResult::Status(self.run_shopt(&argv[1..])),
+            "bishopt" => return ExecResult::Status(self.run_bishopt(&argv[1..], KNOWN_BISHOPTS)),
             // Command-mode-exclusive: this extends the builtin set
             // available there specifically, rather than being a normal
             // shell builtin -- with the guard false, this arm doesn't
@@ -6923,6 +7048,7 @@ const KNOWN_BUILTINS: &[&str] = &[
     "alias",
     "unalias",
     "abbr",
+    "bishopt",
     "window",
     "win",
 ];
@@ -7002,6 +7128,42 @@ const KNOWN_SHOPT_OPTIONS: &[(&str, bool)] = &[
 fn shopt_default_on(name: &str) -> Option<bool> {
     KNOWN_SHOPT_OPTIONS.iter().find(|(n, _)| *n == name).map(|(_, on)| *on)
 }
+
+// A bishopt option's type, plus (for Str) its own default value. Bool has
+// no stored default of its own -- see `run_bishopt`'s own doc comment on
+// why "unset" and "false" are the same state for a boolean option.
+// #[allow(dead_code)]: KNOWN_BISHOPTS starts empty (see its own doc
+// comment), so neither variant is actually constructed by production
+// code yet -- only by run_bishopt's tests, which build their own small
+// registry. Drop this once a real entry lands in KNOWN_BISHOPTS.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+enum BishOptDefault {
+    Bool,
+    Str(&'static str),
+}
+
+// A bishopt option's actual current value -- what `Shell::bishopts` maps
+// names to once they've been explicitly `--set`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BishOptValue {
+    Bool(bool),
+    Str(String),
+}
+
+// bishopt's own known-option registry -- deliberately separate from (and
+// deliberately *not* merged into) KNOWN_SHOPT_OPTIONS above: shopt exists
+// solely so a real bash script's own defensive `shopt -s foo` preambles
+// don't fail, and its namespace is bash's own to define, not bish's --
+// mixing bish-specific settings into it risks a script written against
+// real bash silently colliding with (or being silently ignored by) a
+// bish-only setting sharing the same name. Starts empty: unlike shopt,
+// there's no external compatibility contract obligating any particular
+// name to exist here, and a registered name with no real behavior behind
+// it yet is exactly the dead-stub problem shopt_options itself had before
+// this pair of features existed -- add an entry here only once something
+// in bish actually reads it.
+const KNOWN_BISHOPTS: &[(&str, BishOptDefault)] = &[];
 
 fn is_known_builtin(name: &str) -> bool {
     KNOWN_BUILTINS.contains(&name)
@@ -7254,5 +7416,70 @@ mod tests {
         assert_eq!(shell.run_shopt(&strs(&["-s"])), 0);
         assert_eq!(shell.run_shopt(&strs(&["-u"])), 0);
         assert!(shell.shopt_options.is_empty(), "-s/-u alone must only list, never mutate");
+    }
+
+    // KNOWN_BISHOPTS itself starts empty (see its own doc comment) -- a
+    // small local registry here exercises run_bishopt's real logic
+    // without needing a production entry that gates nothing yet.
+    const TEST_BISHOPTS: &[(&str, BishOptDefault)] = &[("verbose", BishOptDefault::Bool), ("greeting", BishOptDefault::Str("hi"))];
+
+    #[test]
+    fn bishopt_lists_only_names_with_no_args() {
+        let mut shell = Shell::new();
+        assert_eq!(shell.run_bishopt(&[], TEST_BISHOPTS), 0);
+    }
+
+    #[test]
+    fn bishopt_get_on_a_bool_reports_via_exit_status_and_prints_nothing() {
+        let mut shell = Shell::new();
+        assert_eq!(shell.run_bishopt(&strs(&["verbose"]), TEST_BISHOPTS), 1, "unset bool defaults to off");
+        shell.run_bishopt(&strs(&["--set", "verbose"]), TEST_BISHOPTS);
+        assert_eq!(shell.run_bishopt(&strs(&["verbose"]), TEST_BISHOPTS), 0);
+    }
+
+    #[test]
+    fn bishopt_get_on_a_str_prints_its_value_and_exits_0() {
+        let mut shell = Shell::new();
+        assert_eq!(shell.bishopt_value(TEST_BISHOPTS, "greeting"), Some(BishOptValue::Str("hi".to_string())));
+        assert_eq!(shell.run_bishopt(&strs(&["greeting"]), TEST_BISHOPTS), 0);
+        shell.run_bishopt(&strs(&["--set", "greeting", "hey"]), TEST_BISHOPTS);
+        assert_eq!(shell.bishopt_value(TEST_BISHOPTS, "greeting"), Some(BishOptValue::Str("hey".to_string())));
+    }
+
+    #[test]
+    fn bishopt_set_rejects_a_value_on_a_bool_and_a_missing_value_on_a_str() {
+        let mut shell = Shell::new();
+        assert_eq!(shell.run_bishopt(&strs(&["--set", "verbose", "true"]), TEST_BISHOPTS), 2);
+        assert_eq!(shell.run_bishopt(&strs(&["--set", "greeting"]), TEST_BISHOPTS), 2);
+        assert_eq!(shell.bishopts, std::collections::HashMap::new(), "a rejected set must not be recorded");
+    }
+
+    #[test]
+    fn bishopt_unset_reverts_to_each_types_own_default() {
+        let mut shell = Shell::new();
+        shell.run_bishopt(&strs(&["--set", "verbose"]), TEST_BISHOPTS);
+        shell.run_bishopt(&strs(&["--set", "greeting", "hey"]), TEST_BISHOPTS);
+        assert_eq!(shell.run_bishopt(&strs(&["--unset", "verbose"]), TEST_BISHOPTS), 0);
+        assert_eq!(shell.run_bishopt(&strs(&["--unset", "greeting"]), TEST_BISHOPTS), 0);
+        assert_eq!(shell.bishopt_value(TEST_BISHOPTS, "verbose"), Some(BishOptValue::Bool(false)));
+        assert_eq!(shell.bishopt_value(TEST_BISHOPTS, "greeting"), Some(BishOptValue::Str("hi".to_string())));
+    }
+
+    #[test]
+    fn bishopt_rejects_an_unregistered_name_everywhere() {
+        let mut shell = Shell::new();
+        assert_eq!(shell.run_bishopt(&strs(&["nope"]), TEST_BISHOPTS), 1);
+        assert_eq!(shell.run_bishopt(&strs(&["--set", "nope"]), TEST_BISHOPTS), 1);
+        assert_eq!(shell.run_bishopt(&strs(&["--unset", "nope"]), TEST_BISHOPTS), 1);
+    }
+
+    #[test]
+    fn new_virtual_child_inherits_a_snapshot_of_the_parents_bishopts() {
+        let mut parent = Shell::new();
+        parent.run_bishopt(&strs(&["--set", "verbose"]), TEST_BISHOPTS);
+        let mut child = parent.new_virtual_child();
+        assert_eq!(child.bishopts, parent.bishopts);
+        child.run_bishopt(&strs(&["--set", "greeting", "yo"]), TEST_BISHOPTS);
+        assert!(!parent.bishopts.contains_key("greeting"), "parent must not see the child's later bishopt changes");
     }
 }
