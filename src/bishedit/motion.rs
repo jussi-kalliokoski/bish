@@ -1,4 +1,5 @@
 use super::Buffer;
+use crate::regex::Regex;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Motion {
@@ -1260,21 +1261,14 @@ pub fn apply_number_delta(m: &NumberMatch, delta: i64) -> String {
     }
 }
 
-/// Literal (non-regex) substring search -- deliberately simple, matching
-/// this milestone's "nothing fancy" scope. Matches never span line breaks.
-fn line_find(buf: &impl Buffer, line: usize, lower_bound: usize, chars: &[char]) -> Option<usize> {
-    let len = buf.line_len(line);
-    let plen = chars.len();
-    if plen == 0 || plen > len {
-        return None;
-    }
-    let max_start = len - plen;
-    if lower_bound > max_start {
-        return None;
-    }
-    (lower_bound..=max_start).find(|&start| {
-        (0..plen).all(|i| buf.char_at(line, start + i) == Some(chars[i]))
-    })
+/// ERE search (via `crate::regex`) for `/`/`?` -- and, via an
+/// escaped-literal pattern (see `search_forward_once`'s other callers),
+/// for the plain-text word searches (`*`/`#`/`g*`/`g#`) too, so there's
+/// only one matching engine for "search" in normal mode. Matches never
+/// span line breaks.
+fn line_find(buf: &impl Buffer, line: usize, lower_bound: usize, re: &Regex) -> Option<usize> {
+    let chars = buf.line_chars(line);
+    re.find_at(&chars, lower_bound).map(|(start, _end)| start)
 }
 
 /// Every non-overlapping occurrence of `pattern` on `line`, left to right --
@@ -1284,84 +1278,77 @@ fn line_find(buf: &impl Buffer, line: usize, lower_bound: usize, chars: &[char])
 /// to, and doesn't share any state with, a live search's own cursor
 /// position via search_forward_once/search_backward_once above.
 pub fn find_matches_in_line(buf: &impl Buffer, line: usize, pattern: &str) -> Vec<(usize, usize)> {
-    let chars: Vec<char> = pattern.chars().collect();
-    if chars.is_empty() {
+    if pattern.is_empty() {
         return Vec::new();
     }
+    let re = Regex::compile(pattern);
+    let chars = buf.line_chars(line);
     let mut matches = Vec::new();
     let mut from = 0;
-    while let Some(start) = line_find(buf, line, from, &chars) {
-        let end = start + chars.len();
+    while let Some((start, end)) = re.find_at(&chars, from) {
         matches.push((start, end));
-        from = end;
+        from = end.max(start + 1); // guard against looping forever on a zero-width match
     }
     matches
 }
 
-fn line_rfind(buf: &impl Buffer, line: usize, upper_bound: usize, chars: &[char]) -> Option<usize> {
-    let len = buf.line_len(line);
-    let plen = chars.len();
-    if plen == 0 || plen > len {
-        return None;
-    }
-    let max_start = len - plen;
-    (0..=max_start).rev().filter(|&start| start < upper_bound).find(|&start| {
-        (0..plen).all(|i| buf.char_at(line, start + i) == Some(chars[i]))
-    })
+fn line_rfind(buf: &impl Buffer, line: usize, upper_bound: usize, re: &Regex) -> Option<usize> {
+    let chars = buf.line_chars(line);
+    let upper = upper_bound.min(chars.len());
+    (0..upper).rev().find(|&start| re.match_at(&chars, start).is_some())
 }
 
 /// Wrapping forward search (matches vim's default 'wrapscan'): tries the
 /// rest of the current line, then every subsequent line, then wraps back
 /// around to the start of the original line.
-fn search_forward_once(buf: &impl Buffer, pos: (usize, usize), chars: &[char]) -> Option<(usize, usize)> {
-    if chars.is_empty() {
-        return None;
-    }
+fn search_forward_once(buf: &impl Buffer, pos: (usize, usize), re: &Regex) -> Option<(usize, usize)> {
     let total = buf.line_count();
-    if let Some(c) = line_find(buf, pos.0, pos.1 + 1, chars) {
+    if let Some(c) = line_find(buf, pos.0, pos.1 + 1, re) {
         return Some((pos.0, c));
     }
     for offset in 1..total {
         let line = (pos.0 + offset) % total;
-        if let Some(c) = line_find(buf, line, 0, chars) {
+        if let Some(c) = line_find(buf, line, 0, re) {
             return Some((line, c));
         }
     }
-    line_find(buf, pos.0, 0, chars).map(|c| (pos.0, c))
+    line_find(buf, pos.0, 0, re).map(|c| (pos.0, c))
 }
 
-fn search_backward_once(buf: &impl Buffer, pos: (usize, usize), chars: &[char]) -> Option<(usize, usize)> {
-    if chars.is_empty() {
-        return None;
-    }
+fn search_backward_once(buf: &impl Buffer, pos: (usize, usize), re: &Regex) -> Option<(usize, usize)> {
     let total = buf.line_count();
-    if let Some(c) = line_rfind(buf, pos.0, pos.1, chars) {
+    if let Some(c) = line_rfind(buf, pos.0, pos.1, re) {
         return Some((pos.0, c));
     }
     for offset in 1..total {
         let line = (pos.0 + total - offset) % total;
-        if let Some(c) = line_rfind(buf, line, usize::MAX, chars) {
+        if let Some(c) = line_rfind(buf, line, usize::MAX, re) {
             return Some((line, c));
         }
     }
-    line_rfind(buf, pos.0, usize::MAX, chars).map(|c| (pos.0, c))
+    line_rfind(buf, pos.0, usize::MAX, re).map(|c| (pos.0, c))
 }
 
 fn is_word_boundary_at(buf: &impl Buffer, line: usize, col: usize) -> bool {
     !matches!(buf.char_at(line, col), Some(c) if is_word_char(c))
 }
 
-fn search_word_forward_once(buf: &impl Buffer, pos: (usize, usize), chars: &[char]) -> Option<(usize, usize)> {
-    let first = search_forward_once(buf, pos, chars)?;
+/// `*`/`#`'s own word-boundary-respecting wrapper around `search_forward_
+/// once`/`search_backward_once` -- `re` is always compiled from an
+/// *escaped* literal word (see the `Motion::SearchWordForward` arm below),
+/// so `word_len` (its char count) doubles as the matched text's length for
+/// the boundary check on either side.
+fn search_word_forward_once(buf: &impl Buffer, pos: (usize, usize), re: &Regex, word_len: usize) -> Option<(usize, usize)> {
+    let first = search_forward_once(buf, pos, re)?;
     let mut candidate = first;
     loop {
         let (l, c) = candidate;
         let before_ok = c == 0 || is_word_boundary_at(buf, l, c - 1);
-        let after_ok = is_word_boundary_at(buf, l, c + chars.len());
+        let after_ok = is_word_boundary_at(buf, l, c + word_len);
         if before_ok && after_ok {
             return Some(candidate);
         }
-        let next = search_forward_once(buf, candidate, chars)?;
+        let next = search_forward_once(buf, candidate, re)?;
         if next == first {
             return None;
         }
@@ -1369,17 +1356,17 @@ fn search_word_forward_once(buf: &impl Buffer, pos: (usize, usize), chars: &[cha
     }
 }
 
-fn search_word_backward_once(buf: &impl Buffer, pos: (usize, usize), chars: &[char]) -> Option<(usize, usize)> {
-    let first = search_backward_once(buf, pos, chars)?;
+fn search_word_backward_once(buf: &impl Buffer, pos: (usize, usize), re: &Regex, word_len: usize) -> Option<(usize, usize)> {
+    let first = search_backward_once(buf, pos, re)?;
     let mut candidate = first;
     loop {
         let (l, c) = candidate;
         let before_ok = c == 0 || is_word_boundary_at(buf, l, c - 1);
-        let after_ok = is_word_boundary_at(buf, l, c + chars.len());
+        let after_ok = is_word_boundary_at(buf, l, c + word_len);
         if before_ok && after_ok {
             return Some(candidate);
         }
-        let next = search_backward_once(buf, candidate, chars)?;
+        let next = search_backward_once(buf, candidate, re)?;
         if next == first {
             return None;
         }
@@ -1678,47 +1665,52 @@ pub fn apply_motion(buf: &mut impl Buffer, motion: Motion, count: Option<usize>)
             }
         }
         Motion::SearchForward(pattern) => {
-            let chars: Vec<char> = pattern.chars().collect();
-            let mut pos = buf.cursor();
-            let mut found = None;
-            for _ in 0..n {
-                match search_forward_once(buf, pos, &chars) {
-                    Some(p) => {
-                        pos = p;
-                        found = Some(p);
+            if !pattern.is_empty() {
+                let re = Regex::compile(&pattern);
+                let mut pos = buf.cursor();
+                let mut found = None;
+                for _ in 0..n {
+                    match search_forward_once(buf, pos, &re) {
+                        Some(p) => {
+                            pos = p;
+                            found = Some(p);
+                        }
+                        None => break,
                     }
-                    None => break,
                 }
-            }
-            if let Some((l, c)) = found {
-                buf.set_cursor(l, c);
+                if let Some((l, c)) = found {
+                    buf.set_cursor(l, c);
+                }
             }
         }
         Motion::SearchBackward(pattern) => {
-            let chars: Vec<char> = pattern.chars().collect();
-            let mut pos = buf.cursor();
-            let mut found = None;
-            for _ in 0..n {
-                match search_backward_once(buf, pos, &chars) {
-                    Some(p) => {
-                        pos = p;
-                        found = Some(p);
+            if !pattern.is_empty() {
+                let re = Regex::compile(&pattern);
+                let mut pos = buf.cursor();
+                let mut found = None;
+                for _ in 0..n {
+                    match search_backward_once(buf, pos, &re) {
+                        Some(p) => {
+                            pos = p;
+                            found = Some(p);
+                        }
+                        None => break,
                     }
-                    None => break,
                 }
-            }
-            if let Some((l, c)) = found {
-                buf.set_cursor(l, c);
+                if let Some((l, c)) = found {
+                    buf.set_cursor(l, c);
+                }
             }
         }
         Motion::SearchWordForward => {
             let pos = buf.cursor();
             if let Some(word) = word_under_cursor(buf, pos) {
-                let chars: Vec<char> = word.chars().collect();
+                let word_len = word.chars().count();
+                let re = Regex::compile(&crate::regex::escape(&word));
                 let mut cur = pos;
                 let mut found = None;
                 for _ in 0..n {
-                    match search_word_forward_once(buf, cur, &chars) {
+                    match search_word_forward_once(buf, cur, &re, word_len) {
                         Some(p) => {
                             cur = p;
                             found = Some(p);
@@ -1734,11 +1726,12 @@ pub fn apply_motion(buf: &mut impl Buffer, motion: Motion, count: Option<usize>)
         Motion::SearchWordBackward => {
             let pos = buf.cursor();
             if let Some(word) = word_under_cursor(buf, pos) {
-                let chars: Vec<char> = word.chars().collect();
+                let word_len = word.chars().count();
+                let re = Regex::compile(&crate::regex::escape(&word));
                 let mut cur = pos;
                 let mut found = None;
                 for _ in 0..n {
-                    match search_word_backward_once(buf, cur, &chars) {
+                    match search_word_backward_once(buf, cur, &re, word_len) {
                         Some(p) => {
                             cur = p;
                             found = Some(p);
@@ -1758,11 +1751,11 @@ pub fn apply_motion(buf: &mut impl Buffer, motion: Motion, count: Option<usize>)
         Motion::SearchWordForwardUnbounded => {
             let pos = buf.cursor();
             if let Some(word) = word_under_cursor(buf, pos) {
-                let chars: Vec<char> = word.chars().collect();
+                let re = Regex::compile(&crate::regex::escape(&word));
                 let mut cur = pos;
                 let mut found = None;
                 for _ in 0..n {
-                    match search_forward_once(buf, cur, &chars) {
+                    match search_forward_once(buf, cur, &re) {
                         Some(p) => {
                             cur = p;
                             found = Some(p);
@@ -1778,11 +1771,11 @@ pub fn apply_motion(buf: &mut impl Buffer, motion: Motion, count: Option<usize>)
         Motion::SearchWordBackwardUnbounded => {
             let pos = buf.cursor();
             if let Some(word) = word_under_cursor(buf, pos) {
-                let chars: Vec<char> = word.chars().collect();
+                let re = Regex::compile(&crate::regex::escape(&word));
                 let mut cur = pos;
                 let mut found = None;
                 for _ in 0..n {
-                    match search_backward_once(buf, cur, &chars) {
+                    match search_backward_once(buf, cur, &re) {
                         Some(p) => {
                             cur = p;
                             found = Some(p);
@@ -2658,6 +2651,37 @@ mod tests {
         let mut buf = TestBuffer::new("foo bar");
         buf.set_cursor(0, 2);
         assert_eq!(go(&mut buf, Motion::SearchForward("xyz".to_string()), None), (0, 2));
+    }
+
+    #[test]
+    fn search_forward_and_backward_are_full_ere_regex() {
+        // `/`/`?` now run through crate::regex, so a class/quantifier
+        // pattern like this finds "foo1"/"foo22"/"foo333" as whole matches,
+        // not just a literal substring.
+        let mut buf = TestBuffer::new("foo1 foo22 foo333");
+        buf.set_cursor(0, 0);
+        let fwd = Motion::SearchForward("foo[0-9]+".to_string());
+        assert_eq!(go(&mut buf, fwd.clone(), None), (0, 5));
+        assert_eq!(go(&mut buf, fwd, None), (0, 11));
+
+        let mut buf = TestBuffer::new("foo1 foo22 foo333");
+        buf.set_cursor(0, 17);
+        assert_eq!(go(&mut buf, Motion::SearchBackward("foo[0-9]+".to_string()), None), (0, 11));
+    }
+
+    #[test]
+    fn search_forward_honors_anchors_per_line() {
+        let mut buf = TestBuffer::new("xfoo\nfoo\nfooo");
+        buf.set_cursor(0, 0);
+        // ^foo only matches a line that *starts* with "foo" -- skips the
+        // first line's "foo" (it's at column 1, not 0) for the second's.
+        assert_eq!(go(&mut buf, Motion::SearchForward("^foo".to_string()), None), (1, 0));
+    }
+
+    #[test]
+    fn find_matches_in_line_reports_every_regex_match() {
+        let buf = TestBuffer::new("a1 a22 a333");
+        assert_eq!(find_matches_in_line(&buf, 0, "a[0-9]+"), vec![(0, 2), (3, 6), (7, 11)]);
     }
 
     #[test]

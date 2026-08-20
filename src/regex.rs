@@ -246,6 +246,52 @@ pub fn escape(s: &str) -> String {
     out
 }
 
+// Shared by `Regex::match_at` and `match_captures` below: does `re` match
+// starting at exactly `pos` (not scanning forward for the next viable
+// start)? Returns the match's own end position plus its capture slots.
+fn match_at_with_caps(re: &Re, group_count: usize, chars: &[char], pos: usize) -> Option<(usize, Vec<Option<(usize, usize)>>)> {
+    let caps: Captures = RefCell::new(vec![None; group_count + 1]);
+    let end: std::cell::Cell<Option<usize>> = std::cell::Cell::new(None);
+    let matched = match_re(re, chars, pos, &caps, &|p| {
+        end.set(Some(p));
+        true
+    });
+    matched.then(|| (end.get().unwrap(), caps.into_inner()))
+}
+
+/// A compiled pattern, reusable across many searches without reparsing --
+/// for callers (line-editor `/`/`?` search, in particular) that run the
+/// same pattern against many lines rather than matching it once against a
+/// single string the way `match_captures` below does.
+pub struct Regex {
+    re: Re,
+    group_count: usize,
+}
+
+impl Regex {
+    pub fn compile(pattern: &str) -> Regex {
+        let (re, group_count) = parse(pattern);
+        Regex { re, group_count }
+    }
+
+    /// Does this pattern match starting at exactly `pos`? Returns the
+    /// match's end position (char index) if so. Unlike `find_at`, doesn't
+    /// scan forward -- a caller wanting "the next match at or after some
+    /// position" wants `find_at`; a caller that already knows the exact
+    /// start it cares about (e.g. scanning backward one position at a
+    /// time) wants this instead.
+    pub fn match_at(&self, chars: &[char], pos: usize) -> Option<usize> {
+        match_at_with_caps(&self.re, self.group_count, chars, pos).map(|(end, _)| end)
+    }
+
+    /// Leftmost match starting at or after `from` (char index into
+    /// `chars`), ERE-style. `None` if nothing matches anywhere in
+    /// `chars[from..]`.
+    pub fn find_at(&self, chars: &[char], from: usize) -> Option<(usize, usize)> {
+        (from..=chars.len()).find_map(|start| self.match_at(chars, start).map(|end| (start, end)))
+    }
+}
+
 // `[[ str =~ pattern ]]`: true (with Some(...)) if `pattern` matches
 // anywhere in `str` (unanchored, like ERE regexec), honoring explicit
 // `^`/`$` when present. On success also returns BASH_REMATCH-style
@@ -256,17 +302,9 @@ pub fn match_captures(text: &str, pattern: &str) -> Option<Vec<String>> {
     let (re, group_count) = parse(pattern);
     let chars: Vec<char> = text.chars().collect();
     for start in 0..=chars.len() {
-        let caps: Captures = RefCell::new(vec![None; group_count + 1]);
-        let end: std::cell::Cell<Option<usize>> = std::cell::Cell::new(None);
-        let matched = match_re(&re, &chars, start, &caps, &|p| {
-            end.set(Some(p));
-            true
-        });
-        if matched {
-            let end = end.get().unwrap();
+        if let Some((end, caps)) = match_at_with_caps(&re, group_count, &chars, start) {
             let mut out = Vec::with_capacity(group_count + 1);
             out.push(chars[start..end].iter().collect());
-            let caps = caps.into_inner();
             for slot in caps.into_iter().skip(1) {
                 out.push(match slot {
                     Some((s0, e0)) => chars[s0..e0].iter().collect(),
