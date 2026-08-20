@@ -652,9 +652,19 @@ pub(crate) fn resolve_insert_start(buf: &mut TextBuffer, cmd: InsertCmd) {
 // natural redraw" caveat this codebase already accepts elsewhere for a
 // loop that's actively blocked on a keystroke.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn run_insert_mode(buf: &mut TextBuffer, vk: &mut VimKeys, rect: Rect, registers: &mut Registers, on_idle: &mut dyn FnMut(), replace: bool, term_rows: usize, term_cols: usize) -> io::Result<()> {
+pub(crate) fn run_insert_mode(
+    buf: &mut TextBuffer,
+    vk: &mut VimKeys,
+    rect: Rect,
+    registers: &mut Registers,
+    on_idle: &mut dyn FnMut(),
+    replace: bool,
+    term_rows: usize,
+    term_cols: usize,
+    color_overrides: Option<&highlight::ColorOverrides>,
+) -> io::Result<()> {
     let mode = if replace { EditorMode::Replace } else { EditorMode::Insert };
-    render_editor_frame(buf, vk, mode, rect, term_rows, term_cols);
+    render_editor_frame(buf, vk, mode, rect, term_rows, term_cols, color_overrides);
     // `"."`'s own accumulator for this session -- see `Registers::
     // set_last_insert`'s own doc comment. Best-effort: a Backspace just
     // pops the most recently accumulated character regardless of whether
@@ -766,7 +776,7 @@ pub(crate) fn run_insert_mode(buf: &mut TextBuffer, vk: &mut VimKeys, rect: Rect
             _ => {}
         }
         scroll_to_show_cursor(buf, editor_content_cols(buf, rect));
-        render_editor_frame(buf, vk, mode, rect, term_rows, term_cols);
+        render_editor_frame(buf, vk, mode, rect, term_rows, term_cols, color_overrides);
     }
 }
 
@@ -1022,11 +1032,17 @@ fn line_starts(buf: &TextBuffer) -> Vec<usize> {
 // need would show up as noticeable input lag first, at which point it's
 // a small, self-contained change (memoize on buf.is_dirty() going true)
 // rather than one worth guessing at up front. HighlightContext::
-// default() (no cwd, no known_functions): same "no context to offer"
+// default() (no cwd, no known_functions) still stands in for the
+// highlighter's own *classification* step: same "no context to offer"
 // choice command mode's own colon-line already makes, since nothing
 // here has a live Shell to pull those from -- Flag/Subcommand/Link/
 // InvalidCommand refinements that need them simply don't fire, same as
-// there.
+// there. `color_overrides` (bishopt's own syn_col_* -- see bishedit::
+// highlight::ColorOverrides/SYN_COL_OPTIONS) is a separate, later step
+// (picking a *color* for an already-classified span, not classifying
+// it), threaded in from wherever a live Shell to read it from actually
+// exists: repl.rs's own run_edit_frame, one level up from every caller
+// of this whole chain.
 //
 // Not a full fix for every multi-line case: `next_span`'s own doc
 // comment (this same module) documents a pre-existing lexer position-
@@ -1035,7 +1051,7 @@ fn line_starts(buf: &TextBuffer) -> Vec<usize> {
 // still come out mis-highlighted. Narrower and pre-existing either way,
 // not something this change introduces or could fix without touching
 // lexer.rs's own heredoc-body capture.
-fn buffer_highlight_spans(buf: &TextBuffer) -> Vec<StyledSpan> {
+fn buffer_highlight_spans(buf: &TextBuffer, color_overrides: Option<&highlight::ColorOverrides>) -> Vec<StyledSpan> {
     if !is_bash_file(buf) {
         return Vec::new();
     }
@@ -1044,7 +1060,7 @@ fn buffer_highlight_spans(buf: &TextBuffer) -> Vec<StyledSpan> {
         .highlight(&text, HighlightContext::default())
         .into_iter()
         .map(|s| {
-            let (fg, attrs) = highlight::resolve_style(s.kind, None);
+            let (fg, attrs) = highlight::resolve_style(s.kind, color_overrides);
             StyledSpan { start: s.start, end: s.end, fg, attrs }
         })
         .collect()
@@ -1416,7 +1432,15 @@ fn render_row(out: &mut String, buf: &TextBuffer, line: usize, hoffset: usize, c
 // entirely, in a split window. `rect` itself is still used for *size*
 // (`rect.rows`/`rect.cols`) either way -- only the position origin
 // changes.
-pub fn build_editor_frame(buf: &TextBuffer, vk: &VimKeys, mode: EditorMode, rect: Rect, row_origin: usize, col_origin: usize) -> String {
+pub fn build_editor_frame(
+    buf: &TextBuffer,
+    vk: &VimKeys,
+    mode: EditorMode,
+    rect: Rect,
+    row_origin: usize,
+    col_origin: usize,
+    color_overrides: Option<&highlight::ColorOverrides>,
+) -> String {
     let content_rows = editor_content_rows(rect);
     let total = buf.line_count();
     // Reserves at least one column for content even if the gutter would
@@ -1439,7 +1463,7 @@ pub fn build_editor_frame(buf: &TextBuffer, vk: &VimKeys, mode: EditorMode, rect
     // Computed once for the whole buffer, not per visible row -- see
     // buffer_highlight_spans's own doc comment for why a multi-line
     // construct needs that.
-    let whole_styled = buffer_highlight_spans(buf);
+    let whole_styled = buffer_highlight_spans(buf, color_overrides);
     let starts = line_starts(buf);
     let mut out = String::new();
     for r in 0..content_rows {
@@ -1466,9 +1490,9 @@ pub fn build_editor_frame(buf: &TextBuffer, vk: &VimKeys, mode: EditorMode, rect
     out
 }
 
-pub fn render_editor_frame(buf: &TextBuffer, vk: &VimKeys, mode: EditorMode, rect: Rect, term_rows: usize, term_cols: usize) {
+pub fn render_editor_frame(buf: &TextBuffer, vk: &VimKeys, mode: EditorMode, rect: Rect, term_rows: usize, term_cols: usize, color_overrides: Option<&highlight::ColorOverrides>) {
     let mut out = crate::repl::render_global_status_row(&status_text(buf, vk, mode, term_cols), term_rows);
-    out.push_str(&build_editor_frame(buf, vk, mode, rect, rect.row, rect.col));
+    out.push_str(&build_editor_frame(buf, vk, mode, rect, rect.row, rect.col, color_overrides));
     print!("{}", out);
     let _ = io::stdout().flush();
 }
@@ -1485,8 +1509,8 @@ pub fn render_editor_frame(buf: &TextBuffer, vk: &VimKeys, mode: EditorMode, rec
 // already-absolute-within-the-grid positioning rather than those two
 // functions' simpler `\r\x1b[K`-prefixed single-row convention (this
 // content spans the pane's whole height, not just one row).
-pub fn freeze_editor_frame(screen: &Rc<RefCell<vt100::Screen>>, buf: &TextBuffer, vk: &VimKeys, rect: Rect) {
-    let framed = build_editor_frame(buf, vk, EditorMode::Normal, rect, 0, 0);
+pub fn freeze_editor_frame(screen: &Rc<RefCell<vt100::Screen>>, buf: &TextBuffer, vk: &VimKeys, rect: Rect, color_overrides: Option<&highlight::ColorOverrides>) {
+    let framed = build_editor_frame(buf, vk, EditorMode::Normal, rect, 0, 0, color_overrides);
     screen.borrow_mut().feed(framed.as_bytes());
 }
 
@@ -1586,7 +1610,7 @@ mod macro_tests {
             KeyOutcome::Motion(m, count) => motion::apply_motion(buf, m, count),
             KeyOutcome::EnterInsert(cmd) => {
                 resolve_insert_start(buf, cmd);
-                run_insert_mode(buf, vk, rect(), registers, &mut || {}, false, 24, 80).unwrap();
+                run_insert_mode(buf, vk, rect(), registers, &mut || {}, false, 24, 80, None).unwrap();
             }
             other => panic!("unexpected outcome in this test: {other:?}"),
         }
