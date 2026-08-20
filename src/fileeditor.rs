@@ -17,6 +17,7 @@ use std::cell::RefCell;
 use std::io::{self, Write};
 use std::rc::Rc;
 
+use crate::bishedit::format::BashFormatter;
 use crate::bishedit::highlight::{self, BashHighlighter, HighlightContext, Highlighter, StyledSpan};
 use crate::bishedit::lint::{self, BashLinter, Linter};
 use crate::bishedit::motion;
@@ -960,9 +961,23 @@ fn render_line_number_cell(buf: &TextBuffer, _starts: &[usize], line: usize, wid
 // this existed. A real "detect from shebang/content" fallback, and more
 // extensions/languages, are natural follow-ups once there's more than
 // one Highlighter implementor to dispatch to (see Highlighter's own doc
-// comment -- BashHighlighter is still the only one).
+// comment -- BashHighlighter is still the only one), and are exactly
+// where a new `FileType` variant would slot in below.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FileType {
+    Bash,
+    Unknown,
+}
+
+fn file_type(buf: &TextBuffer) -> FileType {
+    match buf.path().and_then(|p| p.extension()) {
+        Some(ext) if ext == "bash" => FileType::Bash,
+        _ => FileType::Unknown,
+    }
+}
+
 fn is_bash_file(buf: &TextBuffer) -> bool {
-    buf.path().and_then(|p| p.extension()).is_some_and(|ext| ext == "bash")
+    file_type(buf) == FileType::Bash
 }
 
 // The buffer's own text, lines joined by '\n' -- what BashHighlighter
@@ -1100,6 +1115,110 @@ pub(crate) fn apply_fix(buf: &mut TextBuffer, diagnostic: &lint::Diagnostic) -> 
     buf.delete_range(&range);
     buf.insert_text(from, &fix.replacement);
     true
+}
+
+// The batch counterpart to `apply_fix` above -- what a pre-save hook
+// (below) needs, since a hook's whole point is applying every fix it
+// found in one go, not one at a time. Same sort-by-descending-start-then
+// -splice shape as tool.rs's own `apply_fixes`, just calling `apply_fix`
+// against the real buffer for each one instead of splicing a raw string:
+// every diagnostic's `start`/`end` are offsets into the *original*
+// `buffer_text(buf)`, and processing right-to-left means every edit
+// still to come sits entirely before the point already spliced, so an
+// as-yet-unapplied offset never needs adjusting for one that already
+// landed. The overlap guard is defensive, matching tool.rs's own -- no
+// current hook produces overlapping fixes, but a corrupted splice would
+// be a much worse failure mode than silently skipping one.
+fn apply_all_fixes(buf: &mut TextBuffer, diagnostics: &[lint::Diagnostic]) -> usize {
+    let mut candidates: Vec<&lint::Diagnostic> = diagnostics.iter().filter(|d| d.fix.is_some()).collect();
+    candidates.sort_by_key(|d| std::cmp::Reverse(d.fix.as_ref().unwrap().start));
+    let mut applied = 0;
+    let mut last_applied_start = usize::MAX;
+    for d in candidates {
+        let fix = d.fix.as_ref().unwrap();
+        if fix.end > last_applied_start {
+            continue;
+        }
+        apply_fix(buf, d);
+        last_applied_start = fix.start;
+        applied += 1;
+    }
+    applied
+}
+
+// One filetype's pre-save hook: given the buffer's whole text, the
+// Diagnostics (with Fixes) it wants applied before the write hits disk --
+// the same shape `Linter::check` already uses, so a hook that would also
+// make sense as a live diagnostic doesn't need a second implementation.
+// `Result`, not a plain `Vec`, because unlike a Linter a hook may refuse
+// to touch content it can't make sense of at all (`BashFormatter::
+// check`'s own doc comment: it bails on a parse error rather than guess)
+// -- `Err` just means "leave the file alone," same as a failed `bish
+// tool format` leaving its target untouched.
+type PreSaveHook = fn(&str) -> Result<Vec<lint::Diagnostic>, String>;
+
+fn bash_format_hook(text: &str) -> Result<Vec<lint::Diagnostic>, String> {
+    Ok(strip_buffer_implicit_trailing_newline(text, BashFormatter.check(text)?))
+}
+
+// A hook's own Diagnostics assume the same "exactly one trailing
+// newline is real content" convention `bish tool format`'s CLI writer
+// does -- `BashFormatter::check`'s own EOF-gap rule always intends
+// literally "\n" there, since it's producing a plain string meant to be
+// written to a file as-is. `TextBuffer::save` already adds that
+// trailing newline itself on every write (see its own doc comment: one
+// line per row, joined by "\n", plus one more at the end) -- lines
+// never store a trailing newline as their own content. Applied
+// literally, a fix reaching all the way to the end of the buffer's text
+// that still ends in '\n' would double it up as a real extra blank last
+// line (`buf.insert_text` splits on every '\n' it's given, with no idea
+// one of them was only ever meant to represent `save`'s own implicit
+// one). Trimmed once here, right where the hook already knows it's
+// producing Diagnostics headed for a `TextBuffer`, rather than teaching
+// `BashFormatter` itself two different EOF conventions.
+fn strip_buffer_implicit_trailing_newline(text: &str, mut diagnostics: Vec<lint::Diagnostic>) -> Vec<lint::Diagnostic> {
+    let end = text.chars().count();
+    if let Some(fix) = diagnostics.last_mut().and_then(|d| d.fix.as_mut())
+        && fix.end == end
+        && fix.replacement.ends_with('\n')
+    {
+        fix.replacement.pop();
+    }
+    diagnostics
+}
+
+// Which hooks run before a save, by filetype -- bash is the only
+// filetype recognized at all today (`file_type`'s own doc comment), so
+// it's the only entry with anything in its list. A future filetype adds
+// its own arm here; a future bash-only hook (or one shared across every
+// filetype, e.g. line-ending normalization) just joins this one slice --
+// no change needed to `run_pre_save_hooks` itself either way.
+fn pre_save_hooks(ft: FileType) -> &'static [PreSaveHook] {
+    match ft {
+        FileType::Bash => &[bash_format_hook],
+        FileType::Unknown => &[],
+    }
+}
+
+// `:w`/`:wq`/`:x`'s own worker (repl.rs's run_command_mode, called right
+// before `tb.save(...)`): runs every pre-save hook this buffer's
+// filetype has, in order, applying whatever fixes each one reports
+// straight to `buf` so they land in the same write. Each hook re-reads
+// `buffer_text(buf)` fresh rather than sharing one snapshot across the
+// whole loop, so a second hook already sees the first one's own edits --
+// the same "hooks compose like a pipeline" behavior a real formatter
+// followed by a real linter-fixer would need. A hook that errors (an
+// unparseable buffer, for bash's own hook) is skipped silently: this
+// runs on every save, including ones mid-edit with a script that
+// doesn't parse yet, and refusing to save over a syntax error would be
+// far more disruptive than just not reformatting it this time.
+pub(crate) fn run_pre_save_hooks(buf: &mut TextBuffer) {
+    for hook in pre_save_hooks(file_type(buf)) {
+        let text = buffer_text(buf);
+        if let Ok(diagnostics) = hook(&text) {
+            apply_all_fixes(buf, &diagnostics);
+        }
+    }
 }
 
 // Color/attrs for one diagnostic's own underline -- mirrors highlight::
@@ -1621,5 +1740,91 @@ mod horizontal_scroll_tests {
     fn selection_columns_in_line_linewise_always_spans_the_full_viewport_window_regardless_of_hoffset() {
         let range = motion::MotionRange { shape: motion::MotionShape::Linewise, from: (0, 0), to: (0, 0) };
         assert_eq!(selection_columns_in_line(&range, 0, 37, 10), Some((0, 10)));
+    }
+}
+
+#[cfg(test)]
+mod pre_save_hook_tests {
+    use super::*;
+
+    // A nonexistent path still leaves the buffer's own `path()` set (see
+    // `TextBuffer::open`'s own doc comment) -- exactly what `file_type`
+    // reads, with no real file needed for these tests. `text` is given
+    // with no trailing newline: that's the shape a buffer's own `lines`
+    // actually have for real content (`TextBuffer::open` strips exactly
+    // one trailing '\n' off whatever it reads, same as `buffer_text`
+    // never producing one either) -- a helper that instead spliced a
+    // trailing '\n' straight into `insert_text` would leave a phantom
+    // empty last line that isn't how a freshly opened file ever looks,
+    // and would silently hide the "TextBuffer::save adds its own
+    // trailing newline" issue `strip_buffer_implicit_trailing_newline`
+    // exists to handle.
+    fn buf_with_ext(text: &str, ext: &str) -> TextBuffer {
+        let path = format!("/tmp/bish-fileeditor-pre-save-hook-test.{ext}");
+        let mut buf = TextBuffer::open(std::path::Path::new(&path), 10).unwrap();
+        buf.insert_text((0, 0), text);
+        buf.set_cursor(0, 0);
+        buf
+    }
+
+    #[test]
+    fn file_type_recognizes_only_dot_bash_today() {
+        assert_eq!(file_type(&buf_with_ext("x", "bash")), FileType::Bash);
+        assert_eq!(file_type(&buf_with_ext("x", "sh")), FileType::Unknown);
+        assert_eq!(file_type(&buf_with_ext("x", "txt")), FileType::Unknown);
+        assert_eq!(file_type(&TextBuffer::new_unnamed(10)), FileType::Unknown);
+    }
+
+    #[test]
+    fn run_pre_save_hooks_reformats_a_bash_buffer_before_save() {
+        let mut buf = buf_with_ext("if true\nthen\necho hi\nfi", "bash");
+        run_pre_save_hooks(&mut buf);
+        assert_eq!(buffer_text(&buf), "if true; then\n\techo hi\nfi");
+    }
+
+    #[test]
+    fn run_pre_save_hooks_leaves_an_already_formatted_bash_buffer_untouched() {
+        let mut buf = buf_with_ext("if true; then\n\techo hi\nfi", "bash");
+        run_pre_save_hooks(&mut buf);
+        assert_eq!(buffer_text(&buf), "if true; then\n\techo hi\nfi");
+    }
+
+    // The regression case: BashFormatter::check always intends exactly
+    // one trailing newline for a plain string, but `buffer_text` (unlike
+    // a file's own on-disk bytes) never has one -- so this hook's own
+    // EOF-gap fix would want to *insert* "\n" right after the buffer's
+    // last real character. Applied literally that becomes a genuine new
+    // empty last line, which `TextBuffer::save`'s own implicit trailing
+    // newline then doubles up into a real blank line at the end of the
+    // file on disk. Asserted end-to-end through a real `save()` (not
+    // just `buffer_text`, which can't see this bug -- see
+    // `strip_buffer_implicit_trailing_newline`'s own doc comment) so a
+    // regression here fails loudly rather than just in the editor.
+    #[test]
+    fn run_pre_save_hooks_does_not_leave_a_spurious_blank_line_at_end_of_file_on_save() {
+        let dir = std::env::temp_dir().join(format!("bish-fileeditor-eof-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("script.bash");
+        std::fs::write(&path, "if true; then\n\techo hi\nfi\n").unwrap();
+        let mut buf = TextBuffer::open(&path, 10).unwrap();
+        run_pre_save_hooks(&mut buf);
+        buf.save(None).unwrap();
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(on_disk, "if true; then\n\techo hi\nfi\n");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn run_pre_save_hooks_does_nothing_for_a_non_bash_buffer() {
+        let mut buf = buf_with_ext("if true\nthen\necho hi\nfi\n", "txt");
+        run_pre_save_hooks(&mut buf);
+        assert_eq!(buffer_text(&buf), "if true\nthen\necho hi\nfi\n");
+    }
+
+    #[test]
+    fn run_pre_save_hooks_leaves_an_unparseable_bash_buffer_untouched_rather_than_blocking_save() {
+        let mut buf = buf_with_ext("if true\nthen\n", "bash");
+        run_pre_save_hooks(&mut buf);
+        assert_eq!(buffer_text(&buf), "if true\nthen\n");
     }
 }

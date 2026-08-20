@@ -5445,38 +5445,44 @@ fn run_command_mode(
                         None => (trimmed.as_str(), None),
                     };
                     match cmd {
-                        "w" | "write" => match tb.save(arg.map(std::path::Path::new)) {
-                            Ok(()) => {
-                                fileeditor::set_last_filename(tb, registers);
-                                sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry {
-                                    command: trimmed,
-                                    output: String::new(),
-                                    status: 0,
-                                });
-                                return CommandModeOutcome::Ran { output: String::new(), status: 0 };
+                        "w" | "write" => {
+                            fileeditor::run_pre_save_hooks(tb);
+                            match tb.save(arg.map(std::path::Path::new)) {
+                                Ok(()) => {
+                                    fileeditor::set_last_filename(tb, registers);
+                                    sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry {
+                                        command: trimmed,
+                                        output: String::new(),
+                                        status: 0,
+                                    });
+                                    return CommandModeOutcome::Ran { output: String::new(), status: 0 };
+                                }
+                                Err(e) => {
+                                    sessions[&session_id].shell.sink_err(&format!("bish: E212: Can't open file for writing: {e}\n"));
+                                    buffer.clear();
+                                    continue;
+                                }
                             }
-                            Err(e) => {
-                                sessions[&session_id].shell.sink_err(&format!("bish: E212: Can't open file for writing: {e}\n"));
-                                buffer.clear();
-                                continue;
+                        }
+                        "wq" | "x" => {
+                            fileeditor::run_pre_save_hooks(tb);
+                            match tb.save(arg.map(std::path::Path::new)) {
+                                Ok(()) => {
+                                    fileeditor::set_last_filename(tb, registers);
+                                    sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry {
+                                        command: trimmed,
+                                        output: String::new(),
+                                        status: 0,
+                                    });
+                                    return CommandModeOutcome::Quit;
+                                }
+                                Err(e) => {
+                                    sessions[&session_id].shell.sink_err(&format!("bish: E212: Can't open file for writing: {e}\n"));
+                                    buffer.clear();
+                                    continue;
+                                }
                             }
-                        },
-                        "wq" | "x" => match tb.save(arg.map(std::path::Path::new)) {
-                            Ok(()) => {
-                                fileeditor::set_last_filename(tb, registers);
-                                sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry {
-                                    command: trimmed,
-                                    output: String::new(),
-                                    status: 0,
-                                });
-                                return CommandModeOutcome::Quit;
-                            }
-                            Err(e) => {
-                                sessions[&session_id].shell.sink_err(&format!("bish: E212: Can't open file for writing: {e}\n"));
-                                buffer.clear();
-                                continue;
-                            }
-                        },
+                        }
                         "q" if tb.is_dirty() => {
                             sessions[&session_id].shell.sink_err("bish: E37: No write since last change (add ! to override)\n");
                             buffer.clear();
