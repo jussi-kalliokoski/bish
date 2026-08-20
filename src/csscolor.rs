@@ -139,6 +139,67 @@ const ANSI_NAMES: &[(&str, u8)] = &[
     ("bright-white", 15),
 ];
 
+// What a terminal's own color capability actually is -- ordered from
+// least to most capable so `>=` means "at least this good," the way
+// `ColorSupport::Ansi256 >= ColorSupport::Ansi16` reads naturally.
+// `TermColor::is_supported`/`pick` below are the only things that care
+// about this; detecting it for the *real* terminal bish is running in
+// is exec.rs's job (env vars, an inherently impure lookup this pure
+// parser module has no business doing itself).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ColorSupport {
+    None,
+    Ansi16,
+    Ansi256,
+    Truecolor,
+}
+
+impl TermColor {
+    // Would this exact color render as intended at this capability level
+    // -- not "would it render at all" (most terminals degrade a code
+    // they don't fully support rather than reject it outright), but
+    // "would it render as the *specific* color asked for." An Ansi slot
+    // beyond 15 needs at least a 256-color palette even though a 16-color
+    // terminal would still accept the escape code (mapping it to
+    // *something*, just not necessarily this color).
+    pub fn is_supported(self, support: ColorSupport) -> bool {
+        match self {
+            TermColor::Rgba(_) => support >= ColorSupport::Truecolor,
+            TermColor::Ansi(n) if n < 16 => support >= ColorSupport::Ansi16,
+            TermColor::Ansi(_) => support >= ColorSupport::Ansi256,
+        }
+    }
+}
+
+// CSS `font-family`'s own fallback convention, applied to color: a
+// comma-separated list of candidates in the author's own preference
+// order, e.g. "#ff0000, -bish-ansi(1), -bish-red" -- `pick` below picks
+// whichever one actually suits the terminal at hand. Reuses
+// split_top_level (paren-depth-aware) so an entry that's itself a
+// function taking commas of its own (rgb(), color-mix()) isn't split
+// apart by this list's own commas.
+pub fn parse_terminal_list(input: &str) -> Result<Vec<TermColor>, String> {
+    split_top_level(input, ',').into_iter().map(parse_terminal).collect()
+}
+
+// The first candidate that's actually supported at `support`, in the
+// list's own order -- same "first match wins, not best match" contract
+// `font-family` itself has (a browser doesn't reorder your font list by
+// quality either). Falls back to the *last* candidate if none qualify,
+// on the assumption a fallback list is written most-preferred-first,
+// least-demanding-last -- better to still send a terminal something
+// (most gracefully degrade an SGR code they can't fully honor, rather
+// than reject it) than send nothing. `candidates` empty is a caller
+// bug -- parse_terminal_list can never produce one (every split segment,
+// including "" itself, has to parse as *some* TermColor to reach Ok).
+pub fn pick(candidates: &[TermColor], support: ColorSupport) -> TermColor {
+    candidates
+        .iter()
+        .copied()
+        .find(|c| c.is_supported(support))
+        .unwrap_or_else(|| *candidates.last().expect("parse_terminal_list never produces an empty candidate list"))
+}
+
 fn named_color(name: &str) -> Option<Rgba> {
     NAMED_COLORS.iter().find(|(n, _)| *n == name).map(|(_, c)| *c)
 }
@@ -794,5 +855,46 @@ mod tests {
         // treating "-bish-red" as an unrecognized (and thus ignored)
         // color function.
         assert!(parse("color-mix(in srgb, -bish-red, blue)").is_err());
+    }
+
+    #[test]
+    fn is_supported_ranks_rgba_above_ansi_beyond_16_above_the_basic_16() {
+        let rgb = TermColor::Rgba(Rgba::new(1, 2, 3, 255));
+        let ansi200 = TermColor::Ansi(200);
+        let ansi1 = TermColor::Ansi(1);
+        assert!(!rgb.is_supported(ColorSupport::None) && !rgb.is_supported(ColorSupport::Ansi256) && rgb.is_supported(ColorSupport::Truecolor));
+        assert!(!ansi200.is_supported(ColorSupport::Ansi16) && ansi200.is_supported(ColorSupport::Ansi256) && ansi200.is_supported(ColorSupport::Truecolor));
+        assert!(!ansi1.is_supported(ColorSupport::None) && ansi1.is_supported(ColorSupport::Ansi16) && ansi1.is_supported(ColorSupport::Truecolor));
+    }
+
+    #[test]
+    fn parse_terminal_list_splits_on_top_level_commas_only() {
+        let list = parse_terminal_list("#ff0000, -bish-ansi(1), -bish-red").unwrap();
+        assert_eq!(list, vec![TermColor::Rgba(Rgba::new(255, 0, 0, 255)), TermColor::Ansi(1), TermColor::Ansi(1)]);
+
+        // rgb()'s own internal comma must not be treated as a fallback
+        // separator -- one candidate, not four broken fragments.
+        let list = parse_terminal_list("rgb(1, 2, 3)").unwrap();
+        assert_eq!(list, vec![TermColor::Rgba(Rgba::new(1, 2, 3, 255))]);
+    }
+
+    #[test]
+    fn parse_terminal_list_fails_if_any_single_candidate_is_invalid() {
+        assert!(parse_terminal_list("red, not-a-color, blue").is_err());
+        assert!(parse_terminal_list("").is_err());
+    }
+
+    #[test]
+    fn pick_takes_the_first_supported_candidate_in_the_lists_own_order() {
+        let list = parse_terminal_list("#ff0000, -bish-ansi(200), -bish-red").unwrap();
+        assert_eq!(pick(&list, ColorSupport::Truecolor), TermColor::Rgba(Rgba::new(255, 0, 0, 255)));
+        assert_eq!(pick(&list, ColorSupport::Ansi256), TermColor::Ansi(200));
+        assert_eq!(pick(&list, ColorSupport::Ansi16), TermColor::Ansi(1));
+    }
+
+    #[test]
+    fn pick_falls_back_to_the_last_candidate_when_nothing_qualifies() {
+        let list = parse_terminal_list("#ff0000, -bish-ansi(200)").unwrap();
+        assert_eq!(pick(&list, ColorSupport::None), TermColor::Ansi(200), "no candidate here suits None, so the least-demanding (last) one wins anyway");
     }
 }
