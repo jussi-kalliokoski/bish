@@ -1623,7 +1623,10 @@ impl Shell {
     // one's been set, else that option's own registered default (always
     // `false` for a Bool -- there's no separate stored default for
     // booleans, see KNOWN_BISHOPTS' own doc comment). `None` means `name`
-    // isn't a registered option at all.
+    // isn't a registered option at all. A Color default is CSS source
+    // text, parsed the same way a `--set` value is -- `.expect()` on
+    // failure is deliberate: an unparseable *registered* default is a
+    // bug in KNOWN_BISHOPTS itself, not something a user can trigger.
     fn bishopt_value(&self, registry: &[(&str, BishOptDefault)], name: &str) -> Option<BishOptValue> {
         let default = registry.iter().find(|(n, _)| *n == name)?.1;
         Some(match self.bishopts.get(name) {
@@ -1631,6 +1634,9 @@ impl Shell {
             None => match default {
                 BishOptDefault::Bool => BishOptValue::Bool(false),
                 BishOptDefault::Str(s) => BishOptValue::Str(s.to_string()),
+                BishOptDefault::Color(s) => {
+                    BishOptValue::Color(crate::csscolor::parse(s).unwrap_or_else(|e| panic!("KNOWN_BISHOPTS: {name}: default color {s:?} doesn't parse: {e}")))
+                }
             },
         })
     }
@@ -1646,26 +1652,33 @@ impl Shell {
     // printable text the same way for every type (see the get arm below),
     // so there's no single format that would fit every row.
     //
-    // Get (`bishopt NAME`): a Bool option prints "on"/"off" and a Str
-    // prints its own value, both exiting 0 -- the readable default.
-    // `--quiet`/`-q` (matching `shopt -q`'s own convention, which is what
-    // prompted this) suppresses that printing; for a Bool its value
-    // becomes the exit status instead (0 = on, 1 = off), so a script can
-    // test it directly (`bishopt -q NAME && ...`) without parsing text;
-    // for a Str there's no meaningful boolean to report, so quiet Str
-    // just exits 0 once NAME is confirmed to exist.
+    // Get (`bishopt NAME`): a Bool option prints "on"/"off", a Str prints
+    // its own value, and a Color prints its canonical `#rrggbb`/
+    // `#rrggbbaa` hex form (see crate::csscolor::Rgba::to_hex) regardless
+    // of how it was originally spelled -- all exiting 0, the readable
+    // default. `--quiet`/`-q` (matching `shopt -q`'s own convention,
+    // which is what prompted this) suppresses that printing; for a Bool
+    // its value becomes the exit status instead (0 = on, 1 = off), so a
+    // script can test it directly (`bishopt -q NAME && ...`) without
+    // parsing text; Str/Color have no meaningful boolean to report, so
+    // quiet just exits 0 once NAME is confirmed to exist.
     //
     // Set: `--set NAME` turns a Bool on; `--set NAME on`/`--set NAME off`
     // sets it explicitly either way (the same "on"/"off" vocabulary get
     // prints, so nothing new to learn) -- either spelling is optional
     // sugar over `--unset`, not a replacement for it. `--set NAME VALUE`
-    // sets a Str's value (VALUE required, and not restricted to on/off).
-    // Any other value against a Bool, or a missing one against a Str, is
-    // a usage error. Unset always removes the override and falls back to
-    // the option's registered default -- for a Bool that default is
-    // definitionally `false`, so "--unset turns it off" and "revert to
-    // default" are the same operation; for a Str it reverts to whatever
-    // default that option was registered with.
+    // sets a Str's value (VALUE required, not restricted to on/off), or
+    // a Color's -- VALUE is any valid CSS Color (crate::csscolor::parse,
+    // hand-rolled, no external crate): named colors, #hex, rgb()/hsl()/
+    // hwb(), and color-mix() for basic "color math" (srgb/hsl/hwb
+    // interpolation only -- see that module's own doc comment for what's
+    // deliberately out of scope). An unparseable color is a usage error,
+    // same as any other type mismatch here. Unset always removes the
+    // override and falls back to the option's registered default -- for
+    // a Bool that default is definitionally `false`, so "--unset turns
+    // it off" and "revert to default" are the same operation; for a Str
+    // or Color it reverts to whatever default that option was registered
+    // with.
     fn run_bishopt(&mut self, args: &[String], registry: &[(&str, BishOptDefault)]) -> i32 {
         enum Mode<'a> {
             List,
@@ -1709,6 +1722,12 @@ impl Shell {
                     }
                     0
                 }
+                Some(BishOptValue::Color(c)) => {
+                    if !quiet {
+                        sh_println!(self, "{}", c.to_hex());
+                    }
+                    0
+                }
                 None => {
                     sh_eprintln!(self, "bish: bishopt: {name}: no such option");
                     1
@@ -1739,6 +1758,20 @@ impl Shell {
                     self.bishopts.insert(name.to_string(), BishOptValue::Str(v.to_string()));
                     0
                 }
+                (Some(BishOptDefault::Color(_)), None) => {
+                    sh_eprintln!(self, "bish: bishopt: --set: {name}: requires a VALUE");
+                    2
+                }
+                (Some(BishOptDefault::Color(_)), Some(v)) => match crate::csscolor::parse(v) {
+                    Ok(c) => {
+                        self.bishopts.insert(name.to_string(), BishOptValue::Color(c));
+                        0
+                    }
+                    Err(e) => {
+                        sh_eprintln!(self, "bish: bishopt: --set: {name}: invalid color '{v}': {e}");
+                        2
+                    }
+                },
             },
             Mode::Unset(name) => {
                 if !registry.iter().any(|(n, _)| *n == name) {
@@ -7148,18 +7181,21 @@ fn shopt_default_on(name: &str) -> Option<bool> {
     KNOWN_SHOPT_OPTIONS.iter().find(|(n, _)| *n == name).map(|(_, on)| *on)
 }
 
-// A bishopt option's type, plus (for Str) its own default value. Bool has
-// no stored default of its own -- see `run_bishopt`'s own doc comment on
-// why "unset" and "false" are the same state for a boolean option.
+// A bishopt option's type, plus its own default value -- for Str and
+// Color that's the literal default text (parsed the same way a `--set`
+// value would be, see `bishopt_value`); Bool has no stored default of
+// its own, see `run_bishopt`'s own doc comment on why "unset" and
+// "false" are the same state for a boolean option.
 // #[allow(dead_code)]: KNOWN_BISHOPTS starts empty (see its own doc
-// comment), so neither variant is actually constructed by production
-// code yet -- only by run_bishopt's tests, which build their own small
+// comment), so no variant is actually constructed by production code
+// yet -- only by run_bishopt's tests, which build their own small
 // registry. Drop this once a real entry lands in KNOWN_BISHOPTS.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
 enum BishOptDefault {
     Bool,
     Str(&'static str),
+    Color(&'static str),
 }
 
 // A bishopt option's actual current value -- what `Shell::bishopts` maps
@@ -7168,6 +7204,7 @@ enum BishOptDefault {
 enum BishOptValue {
     Bool(bool),
     Str(String),
+    Color(crate::csscolor::Rgba),
 }
 
 // bishopt's own known-option registry -- deliberately separate from (and
@@ -7440,7 +7477,8 @@ mod tests {
     // KNOWN_BISHOPTS itself starts empty (see its own doc comment) -- a
     // small local registry here exercises run_bishopt's real logic
     // without needing a production entry that gates nothing yet.
-    const TEST_BISHOPTS: &[(&str, BishOptDefault)] = &[("verbose", BishOptDefault::Bool), ("greeting", BishOptDefault::Str("hi"))];
+    const TEST_BISHOPTS: &[(&str, BishOptDefault)] =
+        &[("verbose", BishOptDefault::Bool), ("greeting", BishOptDefault::Str("hi")), ("accent", BishOptDefault::Color("red"))];
 
     #[test]
     fn bishopt_lists_only_names_with_no_args() {
@@ -7498,10 +7536,41 @@ mod tests {
         let mut shell = Shell::new();
         shell.run_bishopt(&strs(&["--set", "verbose"]), TEST_BISHOPTS);
         shell.run_bishopt(&strs(&["--set", "greeting", "hey"]), TEST_BISHOPTS);
+        shell.run_bishopt(&strs(&["--set", "accent", "blue"]), TEST_BISHOPTS);
         assert_eq!(shell.run_bishopt(&strs(&["--unset", "verbose"]), TEST_BISHOPTS), 0);
         assert_eq!(shell.run_bishopt(&strs(&["--unset", "greeting"]), TEST_BISHOPTS), 0);
+        assert_eq!(shell.run_bishopt(&strs(&["--unset", "accent"]), TEST_BISHOPTS), 0);
         assert_eq!(shell.bishopt_value(TEST_BISHOPTS, "verbose"), Some(BishOptValue::Bool(false)));
         assert_eq!(shell.bishopt_value(TEST_BISHOPTS, "greeting"), Some(BishOptValue::Str("hi".to_string())));
+        assert_eq!(shell.bishopt_value(TEST_BISHOPTS, "accent"), Some(BishOptValue::Color(crate::csscolor::parse("red").unwrap())));
+    }
+
+    #[test]
+    fn bishopt_get_on_a_color_prints_the_canonical_hex_form() {
+        let mut shell = Shell::new();
+        assert_eq!(shell.bishopt_value(TEST_BISHOPTS, "accent"), Some(BishOptValue::Color(crate::csscolor::Rgba::new(255, 0, 0, 255))));
+        assert_eq!(shell.run_bishopt(&strs(&["accent"]), TEST_BISHOPTS), 0);
+        assert_eq!(shell.run_bishopt(&strs(&["-q", "accent"]), TEST_BISHOPTS), 0, "no boolean meaning, but must not error");
+    }
+
+    #[test]
+    fn bishopt_set_accepts_any_valid_css_color_syntax_including_color_mix() {
+        let mut shell = Shell::new();
+        assert_eq!(shell.run_bishopt(&strs(&["--set", "accent", "#00ff00"]), TEST_BISHOPTS), 0);
+        assert_eq!(shell.bishopt_value(TEST_BISHOPTS, "accent"), Some(BishOptValue::Color(crate::csscolor::Rgba::new(0, 255, 0, 255))));
+
+        assert_eq!(shell.run_bishopt(&strs(&["--set", "accent", "rgb(0 0 255)"]), TEST_BISHOPTS), 0);
+        assert_eq!(shell.bishopt_value(TEST_BISHOPTS, "accent"), Some(BishOptValue::Color(crate::csscolor::Rgba::new(0, 0, 255, 255))));
+
+        assert_eq!(shell.run_bishopt(&strs(&["--set", "accent", "color-mix(in srgb, red, blue)"]), TEST_BISHOPTS), 0);
+        assert_eq!(shell.bishopt_value(TEST_BISHOPTS, "accent"), Some(BishOptValue::Color(crate::csscolor::Rgba::new(128, 0, 128, 255))));
+    }
+
+    #[test]
+    fn bishopt_set_rejects_an_invalid_color_and_does_not_mutate() {
+        let mut shell = Shell::new();
+        assert_eq!(shell.run_bishopt(&strs(&["--set", "accent", "not-a-color"]), TEST_BISHOPTS), 2);
+        assert_eq!(shell.bishopt_value(TEST_BISHOPTS, "accent"), Some(BishOptValue::Color(crate::csscolor::parse("red").unwrap())), "a rejected set must not overwrite the default");
     }
 
     #[test]

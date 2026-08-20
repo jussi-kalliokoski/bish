@@ -1,6 +1,7 @@
 mod arith;
 mod bishedit;
 mod builtins;
+mod csscolor;
 mod editor;
 mod exec;
 mod fileeditor;
