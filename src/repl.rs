@@ -272,6 +272,64 @@ fn content_rows(term_rows: usize) -> usize {
     term_rows.saturating_sub(2).max(1)
 }
 
+// The one real exec::take_winch() consumer -- called from
+// service_background_jobs, which every blocking inner loop's own
+// on_idle already calls unconditionally (run_normal_mode_navigation,
+// fileeditor::run_insert_mode, run_diagnostics_frame, run_command_mode,
+// drive_fg_job), so a resize is noticed within one idle-poll tick no
+// matter which of those is currently blocking on input, not just once
+// that loop happens to return control back to run's own outer loop
+// (which calls this exact same function directly, for the same reason,
+// at its own top). Requeries the real size and, if it actually changed,
+// resizes every session's own screen to match (pane rects/hit-testing/
+// rendering everywhere then see the fresh size immediately) and every
+// still-*background*-running job's own pty to match its session's
+// (already-resized) screen -- a real terminal multiplexer propagates a
+// resize straight through to whatever's running, not just the pane
+// you're currently looking at. The currently fg'd job (if any) isn't
+// found here: run_fg_job_frame already took it out of job_frames before
+// driving it, so drive_fg_job catches that one's pty up itself, reacting
+// to this same screen resize (see its own doc comment) rather than
+// polling WINCH a second time.
+fn poll_and_apply_resize(
+    sessions: &HashMap<SessionId, SessionState>,
+    windows: &[WindowEntry],
+    job_frames: &mut HashMap<JobFrameId, exec::FgJob>,
+    term_rows: &mut usize,
+    term_cols: &mut usize,
+    sinks_are_grid: bool,
+    current_window: usize,
+) -> bool {
+    use std::os::unix::io::AsRawFd;
+    if !exec::take_winch() {
+        return false;
+    }
+    let (rows, cols) = query_term_size();
+    if (rows, cols) == (*term_rows, *term_cols) {
+        return false;
+    }
+    *term_rows = rows;
+    *term_cols = cols;
+    for s in sessions.values() {
+        s.screen.borrow_mut().resize(content_rows(*term_rows), *term_cols);
+    }
+    for window in windows {
+        for pane in &window.panes {
+            if let Some(Frame::Job(job_frame_id)) = pane.stack.last()
+                && let Some(job) = job_frames.get_mut(job_frame_id)
+            {
+                let sid = pane.owning_session();
+                let (rows, cols) = sessions[&sid].screen.borrow().size();
+                let _ = pty::set_size(job.pty_master().as_raw_fd(), rows as u16, cols as u16);
+            }
+        }
+    }
+    if sinks_are_grid {
+        compositor_redraw(sessions, windows, current_window, *term_rows, *term_cols);
+    }
+    true
+}
+
 // True if `sid` is reachable from some (window, stack-depth) pair other
 // than the exact top frame of `windows[current_window]` -- i.e. whether
 // that one reference is the *only* thing keeping the session alive. Used
@@ -371,19 +429,7 @@ pub fn run(mut shell: Shell) {
         // work that makes poll-driven `fg` possible) -- acknowledged,
         // temporary, same spirit as this codebase's other documented
         // scope boundaries.
-        if exec::take_winch() {
-            let (new_rows, new_cols) = query_term_size();
-            if (new_rows, new_cols) != (term_rows, term_cols) {
-                term_rows = new_rows;
-                term_cols = new_cols;
-                for s in sessions.values() {
-                    s.screen.borrow_mut().resize(content_rows(term_rows), term_cols);
-                }
-                if sinks_are_grid {
-                    compositor_redraw(&sessions, &windows, current_window, term_rows, term_cols);
-                }
-            }
-        }
+        poll_and_apply_resize(&sessions, &windows, &mut job_frames, &mut term_rows, &mut term_cols, sinks_are_grid, current_window);
 
         let session_id = windows[current_window].owning_session();
 
@@ -406,8 +452,8 @@ pub fn run(mut shell: Shell) {
                 &mut cmd_history,
                 &mut sinks_are_grid,
                 &mut registers,
-                term_rows,
-                term_cols,
+                &mut term_rows,
+                &mut term_cols,
             );
             let _ = io::stdout().flush();
             continue;
@@ -431,8 +477,8 @@ pub fn run(mut shell: Shell) {
                 &mut cmd_history,
                 &mut sinks_are_grid,
                 &mut registers,
-                term_rows,
-                term_cols,
+                &mut term_rows,
+                &mut term_cols,
             );
             let _ = io::stdout().flush();
             continue;
@@ -454,8 +500,8 @@ pub fn run(mut shell: Shell) {
                 &mut job_frames,
                 &mut edit_frames,
                 &mut sinks_are_grid,
-                term_rows,
-                term_cols,
+                &mut term_rows,
+                &mut term_cols,
             );
             let _ = io::stdout().flush();
             continue;
@@ -563,7 +609,7 @@ pub fn run(mut shell: Shell) {
             row_origin,
             &mut registers,
             || {
-                service_background_jobs(&mut sessions, &mut windows, &mut job_frames, current_window);
+                service_background_jobs(&mut sessions, &mut windows, &mut job_frames, current_window, &mut term_rows, &mut term_cols, sinks_are_grid);
             },
         ) {
             Ok(ReadOutcome::Eof) => {
@@ -745,8 +791,8 @@ pub fn run(mut shell: Shell) {
                     &mut cmd_history,
                     &mut registers,
                     NavStart::Prompt { text, cursor },
-                    term_rows,
-                    term_cols,
+                    &mut term_rows,
+                    &mut term_cols,
                 ) {
                     Ok((NavExit::Resume(t, c), _)) => {
                         pending_initial = Some((t, c));
@@ -945,8 +991,8 @@ pub fn run(mut shell: Shell) {
                         &mut cmd_history,
                         &mut sinks_are_grid,
                         &mut registers,
-                        term_rows,
-                        term_cols,
+                        &mut term_rows,
+                        &mut term_cols,
                     );
                 } else if edit_pending {
                     // `e [file]` -- see ExecResult::Edit's own doc
@@ -982,8 +1028,8 @@ pub fn run(mut shell: Shell) {
                                 &mut cmd_history,
                                 &mut sinks_are_grid,
                                 &mut registers,
-                                term_rows,
-                                term_cols,
+                                &mut term_rows,
+                                &mut term_cols,
                             );
                         }
                         Err(e) => {
@@ -1032,15 +1078,15 @@ fn handle_command_mode(
     sinks_are_grid: &mut bool,
     job_frames: &mut HashMap<JobFrameId, exec::FgJob>,
     registers: &mut Registers,
-    term_rows: usize,
-    term_cols: usize,
+    term_rows: &mut usize,
+    term_cols: &mut usize,
     editing: Option<&mut TextBuffer>,
     seed: Option<String>,
 ) -> CommandModeOutcome {
-    let outcome = run_command_mode(session_id, sessions, windows, *current_window, next_session_id, cmd_history, job_frames, registers, term_rows, term_cols, editing, seed);
+    let outcome = run_command_mode(session_id, sessions, windows, *current_window, next_session_id, cmd_history, job_frames, registers, term_rows, term_cols, *sinks_are_grid, editing, seed);
     match outcome {
         CommandModeOutcome::Action(action) => {
-            apply_window_action(action, sessions, windows, current_window, next_session_id, next_window_id, sinks_are_grid, term_rows, term_cols);
+            apply_window_action(action, sessions, windows, current_window, next_session_id, next_window_id, sinks_are_grid, *term_rows, *term_cols);
         }
         CommandModeOutcome::Quit | CommandModeOutcome::Cancelled | CommandModeOutcome::Ran { .. } => {
             if *sinks_are_grid {
@@ -1055,7 +1101,7 @@ fn handle_command_mode(
                 // a Ran result before the caller (only normal mode's ':'
                 // handler cares) paints its own overlay on top of it --
                 // see PendingView's own doc comment.
-                compositor_redraw(sessions, windows, *current_window, term_rows, term_cols);
+                compositor_redraw(sessions, windows, *current_window, *term_rows, *term_cols);
             }
         }
     }
@@ -1083,36 +1129,48 @@ fn run_fg_job_frame(
     cmd_history: &mut History,
     sinks_are_grid: &mut bool,
     registers: &mut Registers,
-    term_rows: usize,
-    term_cols: usize,
+    term_rows: &mut usize,
+    term_cols: &mut usize,
 ) {
     // Taken out of job_frames (rather than borrowed via get_mut) so the
     // on_idle closure below can freely borrow job_frames itself to
     // service every *other* window's job -- see service_background_jobs.
     let mut job = job_frames.remove(&job_frame_id).expect("Frame::Job always has a live job_frames entry");
     let focused_screen = sessions[&session_id].screen.clone();
-    let tab_bar = tab_bar_line(sessions, windows, *current_window);
-    let layout = snapshot_window(&windows[*current_window], sessions, term_rows, term_cols);
+    let mut tab_bar = tab_bar_line(sessions, windows, *current_window);
+    let mut layout = snapshot_window(&windows[*current_window], sessions, *term_rows, *term_cols);
     let cw = *current_window;
     // Loops rather than returning straight after one call: a qualifying
     // click that turns out to be for the job itself, not bish's own UI
-    // chrome (FgOutcome::MouseClick's own doc comment), gets forwarded
-    // and this keeps driving the very same job -- every other outcome
-    // still returns straight out of this function, same as before this
-    // loop existed.
+    // chrome (FgOutcome::MouseClick's own doc comment), or a resize
+    // (FgOutcome::Resized's own doc comment), gets handled in place and
+    // this keeps driving the very same job -- every other outcome still
+    // returns straight out of this function, same as before this loop
+    // existed.
     loop {
+        // A plain owned copy, not `term_rows` itself: the `redraw`
+        // closure below and the `on_idle` closure both close over state
+        // for this same drive_fg_job call, and on_idle needs `term_rows`
+        // as a genuine `&mut usize` (to drive service_background_jobs's
+        // own resize handling) -- capturing it a second time here, even
+        // just to read it, would conflict with that. A resize that lands
+        // mid-drive is caught by drive_fg_job itself instead (see its
+        // own doc comment) and only takes effect for *this* closure once
+        // the FgOutcome::Resized arm below re-snapshots and loops back
+        // around, at most one drive_fg_job iteration later.
+        let redraw_rows = *term_rows;
         let outcome = drive_fg_job(
             &mut job,
             &focused_screen,
-            || render_compositor_frame(&layout, &tab_bar, term_rows),
-            || service_background_jobs(sessions, windows, job_frames, cw),
+            || render_compositor_frame(&layout, &tab_bar, redraw_rows),
+            || service_background_jobs(sessions, windows, job_frames, cw, term_rows, term_cols, *sinks_are_grid),
         );
         match outcome {
         FgOutcome::Exited(status) => {
             windows[*current_window].stack_mut().pop();
             sessions.get_mut(&session_id).unwrap().shell.last_status = status;
             if *sinks_are_grid {
-                compositor_redraw(sessions, windows, *current_window, term_rows, term_cols);
+                compositor_redraw(sessions, windows, *current_window, *term_rows, *term_cols);
             }
             return;
         }
@@ -1156,7 +1214,7 @@ fn run_fg_job_frame(
             // (render_normal_mode_frame's own render_global_status_row)
             // still showing this excursion's now-stale text otherwise.
             if *sinks_are_grid {
-                compositor_redraw(sessions, windows, *current_window, term_rows, term_cols);
+                compositor_redraw(sessions, windows, *current_window, *term_rows, *term_cols);
             }
             return;
         }
@@ -1171,7 +1229,7 @@ fn run_fg_job_frame(
             session.shell.sink_err(&format!("\n[{}]+  Stopped                 {}\n", id, cmd_text));
             session.shell.last_status = 148;
             if *sinks_are_grid {
-                compositor_redraw(sessions, windows, *current_window, term_rows, term_cols);
+                compositor_redraw(sessions, windows, *current_window, *term_rows, *term_cols);
             }
             return;
         }
@@ -1182,7 +1240,7 @@ fn run_fg_job_frame(
             // hit-test against -- falls straight to the "forward it"
             // arm below, same as a genuine miss.
             let target = if *sinks_are_grid {
-                hit_test_click(ev, sessions, windows, *current_window, term_rows, term_cols)
+                hit_test_click(ev, sessions, windows, *current_window, *term_rows, *term_cols)
             } else {
                 None
             };
@@ -1192,7 +1250,7 @@ fn run_fg_job_frame(
                     freeze_focused_idle_prompt(sessions, windows, *current_window);
                     *current_window = idx;
                     if *sinks_are_grid {
-                        compositor_redraw(sessions, windows, *current_window, term_rows, term_cols);
+                        compositor_redraw(sessions, windows, *current_window, *term_rows, *term_cols);
                     }
                     return;
                 }
@@ -1200,7 +1258,7 @@ fn run_fg_job_frame(
                     job_frames.insert(job_frame_id, job);
                     windows[*current_window].focused_pane = pane_id;
                     if *sinks_are_grid {
-                        compositor_redraw(sessions, windows, *current_window, term_rows, term_cols);
+                        compositor_redraw(sessions, windows, *current_window, *term_rows, *term_cols);
                     }
                     return;
                 }
@@ -1215,6 +1273,23 @@ fn run_fg_job_frame(
                     let _ = job.pty_master().write_all(seq.as_bytes());
                 }
             }
+        }
+        FgOutcome::Resized => {
+            // service_background_jobs's own on_idle-driven WINCH handling
+            // (poll_and_apply_resize) already resized every session's
+            // screen and every *background* job's pty; drive_fg_job
+            // already caught this job's own pty up too. All that's left
+            // is this function's own pane-rects/tab-bar snapshot, taken
+            // before this loop started and now stale -- without
+            // recomputing it, the compositor would keep drawing this
+            // job's now-correctly-sized output into the old geometry
+            // until this whole function eventually returned. No redraw
+            // forced here: drive_fg_job's own redraw() fires again as
+            // soon as the job's next output arrives, which for a
+            // well-behaved full-screen program is basically immediate
+            // (TIOCSWINSZ delivers SIGWINCH to its own process group).
+            layout = snapshot_window(&windows[*current_window], sessions, *term_rows, *term_cols);
+            tab_bar = tab_bar_line(sessions, windows, *current_window);
         }
         }
     }
@@ -1242,8 +1317,8 @@ fn run_edit_frame(
     cmd_history: &mut History,
     sinks_are_grid: &mut bool,
     registers: &mut Registers,
-    term_rows: usize,
-    term_cols: usize,
+    term_rows: &mut usize,
+    term_cols: &mut usize,
 ) {
     // Taken out of edit_frames (rather than borrowed via get_mut) so
     // on_idle below can freely borrow edit_frames -- moot today (nothing
@@ -1315,7 +1390,7 @@ fn run_edit_frame(
                     close_orphaned_sessions(sessions, windows);
                 }
                 if *sinks_are_grid {
-                    compositor_redraw(sessions, windows, *current_window, term_rows, term_cols);
+                    compositor_redraw(sessions, windows, *current_window, *term_rows, *term_cols);
                 }
                 return;
             }
@@ -1348,13 +1423,13 @@ fn run_edit_frame(
                 // still have resized panes (`window balance`, `+`/`-`),
                 // and one that moves focus away can too.
                 let rect = if own_window < windows.len() && windows[own_window].panes.iter().any(|p| p.id == own_pane_id) {
-                    pane_rect(&windows[own_window], own_pane_id, term_rows, term_cols)
+                    pane_rect(&windows[own_window], own_pane_id, *term_rows, *term_cols)
                 } else {
                     // This pane (or its whole window) is gone by now --
                     // nothing sensible to freeze into; fall back to
                     // wherever focus actually landed rather than
                     // indexing a pane that no longer exists.
-                    pane_rect(&windows[*current_window], windows[*current_window].focused_pane, term_rows, term_cols)
+                    pane_rect(&windows[*current_window], windows[*current_window].focused_pane, *term_rows, *term_cols)
                 };
                 fileeditor::freeze_editor_frame(&sessions[&session_id].screen, &b, &v, rect);
                 edit_frames.insert(edit_frame_id, fileeditor::EditSession { buffer: b, vk: v });
@@ -1371,7 +1446,7 @@ fn run_edit_frame(
                 windows[*current_window].stack_mut().pop();
                 sessions.get_mut(&session_id).unwrap().shell.sink_err(&format!("bish: e: error reading input: {}\n", e));
                 if *sinks_are_grid {
-                    compositor_redraw(sessions, windows, *current_window, term_rows, term_cols);
+                    compositor_redraw(sessions, windows, *current_window, *term_rows, *term_cols);
                 }
                 return;
             }
@@ -1436,8 +1511,8 @@ fn run_diagnostics_frame(
     job_frames: &mut HashMap<JobFrameId, exec::FgJob>,
     edit_frames: &mut HashMap<EditFrameId, fileeditor::EditSession>,
     sinks_are_grid: &mut bool,
-    term_rows: usize,
-    term_cols: usize,
+    term_rows: &mut usize,
+    term_cols: &mut usize,
 ) {
     // Every other loop that reads keys directly off the terminal
     // (run_normal_mode_navigation, run_insert_mode, ...) holds one of
@@ -1459,8 +1534,8 @@ fn run_diagnostics_frame(
     // be recomputed from the editor's own (by-then-shrunk) rect on
     // every later resize instead.
     let budget = editor_pane_for(&windows[*current_window], edit_frame_id)
-        .map(|id| pane_rect(&windows[*current_window], id, term_rows, term_cols).rows + 1)
-        .unwrap_or(term_rows);
+        .map(|id| pane_rect(&windows[*current_window], id, *term_rows, *term_cols).rows + 1)
+        .unwrap_or(*term_rows);
 
     let set_expanded = |windows: &mut Vec<WindowEntry>, current_window: usize, rows: usize| {
         if let Some((_, children, idx)) = find_parent_split_mut(&mut windows[current_window].layout, pane_id) {
@@ -1487,7 +1562,13 @@ fn run_diagnostics_frame(
     // stranded above new blank rows (growing) once the split resizes
     // out from under it. Re-freezing against the sibling's current rect
     // keeps it honest across every resize this loop causes.
-    let refresh_editor_frame = |sessions: &HashMap<SessionId, SessionState>, windows: &Vec<WindowEntry>, edit_frames: &HashMap<EditFrameId, fileeditor::EditSession>, current_window: usize| {
+    // Takes term_rows/term_cols as plain parameters (fresh at each call
+    // site below), not captured -- capturing them here (even just to
+    // read) would hold a borrow alive across this closure's whole
+    // lifetime (it's called repeatedly, throughout this function), which
+    // would conflict with the on_idle closure's own need to reborrow
+    // them mutably for service_background_jobs's resize handling.
+    let refresh_editor_frame = |sessions: &HashMap<SessionId, SessionState>, windows: &Vec<WindowEntry>, edit_frames: &HashMap<EditFrameId, fileeditor::EditSession>, current_window: usize, term_rows: usize, term_cols: usize| {
         let Some(editor_pane) = editor_pane_for(&windows[current_window], edit_frame_id) else { return };
         let Some(session) = edit_frames.get(&edit_frame_id) else { return };
         let rect = pane_rect(&windows[current_window], editor_pane, term_rows, term_cols);
@@ -1498,17 +1579,17 @@ fn run_diagnostics_frame(
     };
     let diagnostics_len = edit_frames.get(&edit_frame_id).map(|s| s.buffer.diagnostics.len()).unwrap_or(0);
     set_expanded(windows, *current_window, diagnostics_pane_rows(diagnostics_len, false, budget));
-    refresh_editor_frame(sessions, windows, edit_frames, *current_window);
-    compositor_redraw(sessions, windows, *current_window, term_rows, term_cols);
+    refresh_editor_frame(sessions, windows, edit_frames, *current_window, *term_rows, *term_cols);
+    compositor_redraw(sessions, windows, *current_window, *term_rows, *term_cols);
 
     loop {
-        let rect = pane_rect(&windows[*current_window], pane_id, term_rows, term_cols);
+        let rect = pane_rect(&windows[*current_window], pane_id, *term_rows, *term_cols);
         if let Some(session) = edit_frames.get(&edit_frame_id) {
             render_diagnostics_list_frame(&session.buffer, rect, selected, expanded);
         }
 
         let key = match editor::read_key_idle(&mut || {
-            service_background_jobs(sessions, windows, job_frames, *current_window);
+            service_background_jobs(sessions, windows, job_frames, *current_window, term_rows, term_cols, *sinks_are_grid);
         }) {
             Ok(Some(k)) => k,
             // EOF/error: nothing to resume -- leave the pane exactly as
@@ -1555,22 +1636,22 @@ fn run_diagnostics_frame(
         match key {
             Key::Enter => {
                 leave(windows, sessions, edit_frames, true);
-                refresh_editor_frame(sessions, windows, edit_frames, *current_window);
-                compositor_redraw(sessions, windows, *current_window, term_rows, term_cols);
+                refresh_editor_frame(sessions, windows, edit_frames, *current_window, *term_rows, *term_cols);
+                compositor_redraw(sessions, windows, *current_window, *term_rows, *term_cols);
                 return;
             }
             Key::Escape | Key::Char('q') => {
                 leave(windows, sessions, edit_frames, false);
-                refresh_editor_frame(sessions, windows, edit_frames, *current_window);
-                compositor_redraw(sessions, windows, *current_window, term_rows, term_cols);
+                refresh_editor_frame(sessions, windows, edit_frames, *current_window, *term_rows, *term_cols);
+                compositor_redraw(sessions, windows, *current_window, *term_rows, *term_cols);
                 return;
             }
             Key::Char(' ') => {
                 expanded = if expanded == Some(selected) { None } else { Some(selected) };
                 let diagnostics_len = edit_frames.get(&edit_frame_id).map(|s| s.buffer.diagnostics.len()).unwrap_or(0);
                 set_expanded(windows, *current_window, diagnostics_pane_rows(diagnostics_len, expanded.is_some(), budget));
-                refresh_editor_frame(sessions, windows, edit_frames, *current_window);
-                compositor_redraw(sessions, windows, *current_window, term_rows, term_cols);
+                refresh_editor_frame(sessions, windows, edit_frames, *current_window, *term_rows, *term_cols);
+                compositor_redraw(sessions, windows, *current_window, *term_rows, *term_cols);
             }
             // `f`: applies the selected item's own fix, only while its
             // detail (and so the `[f] autofix` hint) is actually showing
@@ -1595,8 +1676,8 @@ fn run_diagnostics_frame(
                     selected = selected.min(diagnostics_len.saturating_sub(1));
                     expanded = None;
                     set_expanded(windows, *current_window, diagnostics_pane_rows(diagnostics_len, false, budget));
-                    refresh_editor_frame(sessions, windows, edit_frames, *current_window);
-                    compositor_redraw(sessions, windows, *current_window, term_rows, term_cols);
+                    refresh_editor_frame(sessions, windows, edit_frames, *current_window, *term_rows, *term_cols);
+                    compositor_redraw(sessions, windows, *current_window, *term_rows, *term_cols);
                 }
             }
             _ => match vk.feed(key) {
@@ -1604,15 +1685,15 @@ fn run_diagnostics_frame(
                     let diagnostics_len = edit_frames.get(&edit_frame_id).map(|s| s.buffer.diagnostics.len()).unwrap_or(0);
                     selected = (selected + count.unwrap_or(1).max(1)).min(diagnostics_len.saturating_sub(1));
                     expanded = None;
-                    compositor_redraw(sessions, windows, *current_window, term_rows, term_cols);
+                    compositor_redraw(sessions, windows, *current_window, *term_rows, *term_cols);
                 }
                 KeyOutcome::Motion(motion::Motion::Up, count) => {
                     selected = selected.saturating_sub(count.unwrap_or(1).max(1));
                     expanded = None;
-                    compositor_redraw(sessions, windows, *current_window, term_rows, term_cols);
+                    compositor_redraw(sessions, windows, *current_window, *term_rows, *term_cols);
                 }
                 KeyOutcome::Window(cmd, count) => {
-                    dispatch_window_cmd(cmd, count, sessions, windows, current_window, next_session_id, next_window_id, sinks_are_grid, term_rows, term_cols);
+                    dispatch_window_cmd(cmd, count, sessions, windows, current_window, next_session_id, next_window_id, sinks_are_grid, *term_rows, *term_cols);
                     return;
                 }
                 _ => {}
@@ -2278,6 +2359,17 @@ enum FgOutcome {
     // Ctrl+Space's own Detached already produces, just reached by a
     // click instead of a keystroke.
     MouseClick(editor::MouseEvent),
+    // This job's own screen (the same Rc<RefCell<vt100::Screen>> as
+    // `screen`, drive_fg_job's own param) changed size mid-drive --
+    // service_background_jobs's own on_idle-driven WINCH handling
+    // (poll_and_apply_resize) already applied the resize everywhere else
+    // (every session's screen, every *background* job's pty) by the time
+    // this is returned; drive_fg_job already caught this one job's own
+    // pty up to match too (see its own doc comment), so all that's left
+    // for the caller is to stop driving with whatever pane-rects/tab-bar
+    // snapshot it took before this loop started (now stale) and take a
+    // fresh one before resuming -- see run_fg_job_frame's own handling.
+    Resized,
 }
 
 const BRACKETED_PASTE_ENABLE: &str = "\x1b[?2004h";
@@ -2330,6 +2422,31 @@ fn sync_bracketed_paste(enabled: &mut bool, screen: &Rc<RefCell<vt100::Screen>>)
     print!("{}", if wants { BRACKETED_PASTE_ENABLE } else { BRACKETED_PASTE_DISABLE });
     let _ = io::stdout().flush();
     *enabled = wants;
+}
+
+// Same idea again, for this job's own pty size -- keeps it matching
+// `screen`'s own size (the source of truth: repl.rs always keeps a
+// session's screen resized to exactly its own on-screen area) instead
+// of polling SIGWINCH itself. `screen` only ever changes size from
+// *outside* drive_fg_job (service_background_jobs's own on_idle-driven
+// poll_and_apply_resize, reached via drive_fg_job's own on_idle
+// argument) -- this just needs to notice that already happened and
+// catch this one job's own pty up to match, the same way a real
+// terminal multiplexer propagates a resize straight through to whatever
+// program is running in the pane you're looking at. Returns whether it
+// changed, so the caller can stop driving with now-stale chrome
+// geometry built around the old size (see FgOutcome::Resized's own doc
+// comment) instead of silently continuing.
+fn sync_pty_size(last: &mut (u16, u16), job: &mut exec::FgJob, screen: &Rc<RefCell<vt100::Screen>>) -> bool {
+    use std::os::unix::io::AsRawFd;
+    let (rows, cols) = screen.borrow().size();
+    let (rows, cols) = (rows as u16, cols as u16);
+    if (rows, cols) == *last {
+        return false;
+    }
+    let _ = pty::set_size(job.pty_master().as_raw_fd(), rows, cols);
+    *last = (rows, cols);
+    true
 }
 
 // A complete SGR mouse report ("\x1b[<Cb;Cx;CyM/m") decoded from the
@@ -2411,6 +2528,7 @@ fn drive_fg_job(job: &mut exec::FgJob, screen: &Rc<RefCell<vt100::Screen>>, mut 
     sync_mouse_reporting(&mut mouse_enabled, screen);
     let mut bracketed_paste_enabled = false;
     sync_bracketed_paste(&mut bracketed_paste_enabled, screen);
+    let mut pty_size = { let (r, c) = screen.borrow().size(); (r as u16, c as u16) };
 
     let mut buf = [0u8; 4096];
     // Caps how many chunks get drained per outer-loop tick before
@@ -2422,6 +2540,17 @@ fn drive_fg_job(job: &mut exec::FgJob, screen: &Rc<RefCell<vt100::Screen>>, mut 
     // guarantees this loop always comes back around.
     const MAX_READS_PER_TICK: u32 = 16;
     let outcome = loop {
+        // Checked every iteration (cheap: an Rc<RefCell> borrow plus a
+        // comparison, no syscall unless it actually changed) rather than
+        // only in the idle branch below -- a firehose job can keep this
+        // loop busy draining output for a while without ever reaching
+        // that branch, and this job's own pty should still catch up
+        // promptly regardless. See sync_pty_size's own doc comment for
+        // why this doesn't need its own SIGWINCH poll.
+        if sync_pty_size(&mut pty_size, job, screen) {
+            break FgOutcome::Resized;
+        }
+
         // Drain *before* checking whether the job has ended -- a fast,
         // freshly-spawned foreground command (M11b: `echo`, `pwd`, ...
         // aren't builtins, so they hit this exact path now, not just a
@@ -2599,8 +2728,13 @@ fn service_background_jobs(
     windows: &mut [WindowEntry],
     job_frames: &mut HashMap<JobFrameId, exec::FgJob>,
     skip_window: usize,
+    term_rows: &mut usize,
+    term_cols: &mut usize,
+    sinks_are_grid: bool,
 ) {
     use std::io::Read;
+
+    poll_and_apply_resize(&*sessions, &*windows, job_frames, term_rows, term_cols, sinks_are_grid, skip_window);
 
     const MAX_READS_PER_TICK: u32 = 16;
     let mut buf = [0u8; 4096];
@@ -3971,10 +4105,10 @@ fn run_normal_mode_navigation(
     cmd_history: &mut History,
     registers: &mut Registers,
     start: NavStart,
-    term_rows: usize,
-    term_cols: usize,
+    term_rows: &mut usize,
+    term_cols: &mut usize,
 ) -> io::Result<(NavExit, Option<(TextBuffer, VimKeys)>)> {
-    let mut rect = pane_rect(&windows[*current_window], windows[*current_window].focused_pane, term_rows, term_cols);
+    let mut rect = pane_rect(&windows[*current_window], windows[*current_window].focused_pane, *term_rows, *term_cols);
 
     // Only `Prompt` ever has real text/cursor to resume into (see
     // `NavExit::Resume`'s own doc comment) -- kept as empty/0 for the
@@ -4034,8 +4168,8 @@ fn run_normal_mode_navigation(
     // normal mode ever triggers promotion (the alternate screen buffer
     // starts out blank), harmless otherwise -- then this pane's own
     // rectangle on top of that with the current view.
-    compositor_redraw(sessions, windows, *current_window, term_rows, term_cols);
-    render_nav_frame(&mut buf, &vk, rect, term_rows, term_cols);
+    compositor_redraw(sessions, windows, *current_window, *term_rows, *term_cols);
+    render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols);
     let mut pending_view = PendingView::None;
 
     let result: (NavExit, Option<(TextBuffer, VimKeys)>) = 'nav: loop {
@@ -4047,9 +4181,9 @@ fn run_normal_mode_navigation(
         // anything (`<C-w>` chords, a click) already exits via
         // `KeyOutcome::Window`/click handling, so this was never
         // observable before `:diag` -- cheap enough to just always do.
-        rect = pane_rect(&windows[*current_window], windows[*current_window].focused_pane, term_rows, term_cols);
+        rect = pane_rect(&windows[*current_window], windows[*current_window].focused_pane, *term_rows, *term_cols);
         let mut key = match vk.next_key(|| editor::read_key_idle(&mut || {
-            service_background_jobs(sessions, windows, job_frames, *current_window);
+            service_background_jobs(sessions, windows, job_frames, *current_window, term_rows, term_cols, *sinks_are_grid);
         }))? {
             Some(k) => k,
             // EOF: nothing sensible to resume into for any start -- for
@@ -4072,9 +4206,9 @@ fn run_normal_mode_navigation(
                 PendingView::None => break,
                 PendingView::Output if key == Key::CtrlL => {
                     pending_view = PendingView::Transcript;
-                    render_command_transcript(&sessions[&session_id].command_transcript, term_rows, term_cols);
+                    render_command_transcript(&sessions[&session_id].command_transcript, *term_rows, *term_cols);
                     key = match vk.next_key(|| editor::read_key_idle(&mut || {
-                        service_background_jobs(sessions, windows, job_frames, *current_window);
+                        service_background_jobs(sessions, windows, job_frames, *current_window, term_rows, term_cols, *sinks_are_grid);
                     }))? {
                         Some(k) => k,
                         None => {
@@ -4085,8 +4219,8 @@ fn run_normal_mode_navigation(
                 }
                 PendingView::Output | PendingView::Transcript => {
                     pending_view = PendingView::None;
-                    compositor_redraw(sessions, windows, *current_window, term_rows, term_cols);
-                    render_nav_frame(&mut buf, &vk, rect, term_rows, term_cols);
+                    compositor_redraw(sessions, windows, *current_window, *term_rows, *term_cols);
+                    render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols);
                     break;
                 }
             }
@@ -4110,11 +4244,11 @@ fn run_normal_mode_navigation(
         // above) and keep navigating.
         if let Key::Mouse(ev) = key {
             if ev.is_left_click() {
-                match hit_test_click(ev, sessions, windows, *current_window, term_rows, term_cols) {
+                match hit_test_click(ev, sessions, windows, *current_window, *term_rows, *term_cols) {
                     Some(ClickTarget::Window(idx)) if idx != *current_window => {
                         freeze_focused_idle_prompt(sessions, windows, *current_window);
                         *current_window = idx;
-                        compositor_redraw(sessions, windows, *current_window, term_rows, term_cols);
+                        compositor_redraw(sessions, windows, *current_window, *term_rows, *term_cols);
                         return Ok((NavExit::Detached, nav_buffer_into_edit_state(buf, vk)));
                     }
                     Some(ClickTarget::Pane(pane_id)) if pane_id != windows[*current_window].focused_pane => {
@@ -4123,13 +4257,13 @@ fn run_normal_mode_navigation(
                             freeze_idle_prompt(sessions.get_mut(&sid).unwrap());
                         }
                         windows[*current_window].focused_pane = pane_id;
-                        compositor_redraw(sessions, windows, *current_window, term_rows, term_cols);
+                        compositor_redraw(sessions, windows, *current_window, *term_rows, *term_cols);
                         return Ok((NavExit::Detached, nav_buffer_into_edit_state(buf, vk)));
                     }
                     _ => {}
                 }
             }
-            render_nav_frame(&mut buf, &vk, rect, term_rows, term_cols);
+            render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols);
             continue 'nav;
         }
 
@@ -4165,7 +4299,7 @@ fn run_normal_mode_navigation(
                 commit_active_selection(&vk, &mut buf);
                 let end_cursor = buf.cursor();
                 vk.end_visual(end_cursor);
-                render_nav_frame(&mut buf, &vk, rect, term_rows, term_cols);
+                render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols);
                 continue;
             }
             Key::Char('y') if vk.is_idle() && (vk.is_visual() || !buf.selections().is_empty()) => {
@@ -4179,7 +4313,7 @@ fn run_normal_mode_navigation(
                 }
                 buf.selections_mut().clear();
                 vk.end_visual(end_cursor);
-                render_nav_frame(&mut buf, &vk, rect, term_rows, term_cols);
+                render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols);
                 continue;
             }
             Key::Char('d') if vk.is_idle() && matches!(buf, NavBuffer::Editable(_)) && (vk.is_visual() || !buf.selections().is_empty()) => {
@@ -4191,7 +4325,7 @@ fn run_normal_mode_navigation(
                 }
                 buf.selections_mut().clear();
                 vk.end_visual(end_cursor);
-                render_nav_frame(&mut buf, &vk, rect, term_rows, term_cols);
+                render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols);
                 continue;
             }
             Key::Char('c') if vk.is_idle() && matches!(buf, NavBuffer::Editable(_)) && (vk.is_visual() || !buf.selections().is_empty()) => {
@@ -4205,9 +4339,10 @@ fn run_normal_mode_navigation(
                 buf.selections_mut().clear();
                 vk.end_visual(end_cursor);
                 if deleted && let NavBuffer::Editable(tb) = &mut buf {
-                    fileeditor::run_insert_mode(tb, &mut vk, rect, registers, &mut || service_background_jobs(sessions, windows, job_frames, *current_window), false, term_rows, term_cols)?;
+                    let (insert_term_rows, insert_term_cols) = (*term_rows, *term_cols);
+                    fileeditor::run_insert_mode(tb, &mut vk, rect, registers, &mut || service_background_jobs(sessions, windows, job_frames, *current_window, term_rows, term_cols, *sinks_are_grid), false, insert_term_rows, insert_term_cols)?;
                 }
-                render_nav_frame(&mut buf, &vk, rect, term_rows, term_cols);
+                render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols);
                 continue;
             }
             Key::Char('p') | Key::Char('P') if vk.is_idle() && matches!(buf, NavBuffer::Editable(_)) && (vk.is_visual() || !buf.selections().is_empty()) => {
@@ -4219,7 +4354,7 @@ fn run_normal_mode_navigation(
                 }
                 buf.selections_mut().clear();
                 vk.end_visual(end_cursor);
-                render_nav_frame(&mut buf, &vk, rect, term_rows, term_cols);
+                render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols);
                 continue;
             }
             // Visual `>`/`<`: same shape as `p`/`P` just above -- shifts
@@ -4235,7 +4370,7 @@ fn run_normal_mode_navigation(
                 }
                 buf.selections_mut().clear();
                 vk.end_visual(end_cursor);
-                render_nav_frame(&mut buf, &vk, rect, term_rows, term_cols);
+                render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols);
                 continue;
             }
             Key::Char('<') if vk.is_idle() && matches!(buf, NavBuffer::Editable(_)) && (vk.is_visual() || !buf.selections().is_empty()) => {
@@ -4246,7 +4381,7 @@ fn run_normal_mode_navigation(
                 }
                 buf.selections_mut().clear();
                 vk.end_visual(end_cursor);
-                render_nav_frame(&mut buf, &vk, rect, term_rows, term_cols);
+                render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols);
                 continue;
             }
             Key::Char('S') if vk.is_idle() && matches!(buf, NavBuffer::Editable(_)) && (vk.is_visual() || !buf.selections().is_empty()) => {
@@ -4254,21 +4389,21 @@ fn run_normal_mode_navigation(
                 let end_cursor = buf.cursor();
                 if let NavBuffer::Editable(tb) = &mut buf
                     && let Some(Key::Char(ch)) = vk.next_key(|| editor::read_key_idle(&mut || {
-                        service_background_jobs(sessions, windows, job_frames, *current_window);
+                        service_background_jobs(sessions, windows, job_frames, *current_window, term_rows, term_cols, *sinks_are_grid);
                     }))?
                 {
                     fileeditor::surround_selections(tb, ch);
                 }
                 buf.selections_mut().clear();
                 vk.end_visual(end_cursor);
-                render_nav_frame(&mut buf, &vk, rect, term_rows, term_cols);
+                render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols);
                 continue;
             }
             Key::Escape | Key::CtrlC if vk.is_idle() && (key == Key::Escape || matches!(buf, NavBuffer::Editable(_))) && (vk.is_visual() || !buf.selections().is_empty()) => {
                 let end_cursor = buf.cursor();
                 vk.end_visual(end_cursor);
                 buf.selections_mut().clear();
-                render_nav_frame(&mut buf, &vk, rect, term_rows, term_cols);
+                render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols);
                 continue;
             }
             // `q`/`@` -- macro record/replay. Host-level, same tier as
@@ -4292,7 +4427,7 @@ fn run_normal_mode_navigation(
             // a new recording" arm below.
             Key::Char('q') if vk.is_idle() && vk.is_recording().is_some() => {
                 vk.stop_recording();
-                render_nav_frame(&mut buf, &vk, rect, term_rows, term_cols);
+                render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols);
                 continue;
             }
             // `q{reg}`: starts recording. The register-name lookahead
@@ -4302,12 +4437,12 @@ fn run_normal_mode_navigation(
             // correctly.
             Key::Char('q') if vk.is_idle() => {
                 if let Some(Key::Char(ch)) = vk.next_key(|| editor::read_key_idle(&mut || {
-                    service_background_jobs(sessions, windows, job_frames, *current_window);
+                    service_background_jobs(sessions, windows, job_frames, *current_window, term_rows, term_cols, *sinks_are_grid);
                 }))? && ch.is_ascii_alphabetic()
                 {
                     vk.start_recording(ch);
                 }
-                render_nav_frame(&mut buf, &vk, rect, term_rows, term_cols);
+                render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols);
                 continue;
             }
             // `@{reg}`/`@@`: replays. `is_idle_except_count` (not
@@ -4317,17 +4452,17 @@ fn run_normal_mode_navigation(
             Key::Char('@') if vk.is_idle_except_count() => {
                 let count = vk.take_count().unwrap_or(1).max(1);
                 if let Some(Key::Char(ch)) = vk.next_key(|| editor::read_key_idle(&mut || {
-                    service_background_jobs(sessions, windows, job_frames, *current_window);
+                    service_background_jobs(sessions, windows, job_frames, *current_window, term_rows, term_cols, *sinks_are_grid);
                 }))? && (ch == '@' || ch.is_ascii_lowercase())
                 {
                     vk.queue_macro_replay(ch, count);
                 }
-                render_nav_frame(&mut buf, &vk, rect, term_rows, term_cols);
+                render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols);
                 continue;
             }
             Key::Char('Z') => {
                 let k2 = vk.next_key(|| editor::read_key_idle(&mut || {
-                    service_background_jobs(sessions, windows, job_frames, *current_window);
+                    service_background_jobs(sessions, windows, job_frames, *current_window, term_rows, term_cols, *sinks_are_grid);
                 }))?;
                 if k2 != Some(Key::Char('Z')) {
                     continue;
@@ -4347,7 +4482,7 @@ fn run_normal_mode_navigation(
                     if saved {
                         break 'nav (NavExit::Quit, nav_buffer_into_edit_state(buf, vk));
                     }
-                    render_nav_frame(&mut buf, &vk, rect, term_rows, term_cols);
+                    render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols);
                     continue;
                 }
                 break 'nav (NavExit::Resume(initial_text.clone(), initial_cursor), nav_buffer_into_edit_state(buf, vk));
@@ -4382,12 +4517,12 @@ fn run_normal_mode_navigation(
                 // not just at the top of the next loop iteration, since
                 // `Ran`'s own `render_nav_frame` call just below still
                 // needs the *current* rect, not next keystroke's.
-                rect = pane_rect(&windows[*current_window], windows[*current_window].focused_pane, term_rows, term_cols);
+                rect = pane_rect(&windows[*current_window], windows[*current_window].focused_pane, *term_rows, *term_cols);
                 match outcome {
                     // Matches vim: an aborted/cancelled ':' command drops
                     // back into Normal mode, not out of it entirely.
                     CommandModeOutcome::Cancelled => {
-                        render_nav_frame(&mut buf, &vk, rect, term_rows, term_cols);
+                        render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols);
                         continue;
                     }
                     // Same `CommandModeOutcome::Quit` `"q"`/`"q!"` always
@@ -4421,10 +4556,10 @@ fn run_normal_mode_navigation(
                     // paints on top of.
                     CommandModeOutcome::Ran { output, status } => {
                         if !output.is_empty() || status != 0 {
-                            render_command_output_overlay(&output, status, term_rows, term_cols);
+                            render_command_output_overlay(&output, status, *term_rows, *term_cols);
                             pending_view = PendingView::Output;
                         } else {
-                            render_nav_frame(&mut buf, &vk, rect, term_rows, term_cols);
+                            render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols);
                         }
                         continue;
                     }
@@ -4438,7 +4573,7 @@ fn run_normal_mode_navigation(
                 editor::apply_motion_or_reselect(&mut vk, &mut buf, m, count);
                 let content_cols = nav_content_cols(&buf, rect);
                 scroll_to_show_cursor(&mut buf, content_cols);
-                render_nav_frame(&mut buf, &vk, rect, term_rows, term_cols);
+                render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols);
             }
             // `ReadOnly`: hands typing back to the live prompt's own
             // editor (`apply_insert_cmd` against `original_chars`,
@@ -4454,9 +4589,10 @@ fn run_normal_mode_navigation(
                 if matches!(buf, NavBuffer::Editable(_)) {
                     if let NavBuffer::Editable(tb) = &mut buf {
                         fileeditor::resolve_insert_start(tb, cmd);
-                        fileeditor::run_insert_mode(tb, &mut vk, rect, registers, &mut || service_background_jobs(sessions, windows, job_frames, *current_window), false, term_rows, term_cols)?;
+                        let (insert_term_rows, insert_term_cols) = (*term_rows, *term_cols);
+                        fileeditor::run_insert_mode(tb, &mut vk, rect, registers, &mut || service_background_jobs(sessions, windows, job_frames, *current_window, term_rows, term_cols, *sinks_are_grid), false, insert_term_rows, insert_term_cols)?;
                     }
-                    render_nav_frame(&mut buf, &vk, rect, term_rows, term_cols);
+                    render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols);
                 } else {
                     let (new_chars, new_cursor) = crate::bishedit::vimkeys::apply_insert_cmd(&original_chars, initial_cursor, cmd);
                     break 'nav (NavExit::Resume(new_chars.into_iter().collect(), new_cursor), nav_buffer_into_edit_state(buf, vk));
@@ -4472,9 +4608,10 @@ fn run_normal_mode_navigation(
             KeyOutcome::EnterReplace => {
                 if matches!(buf, NavBuffer::Editable(_)) {
                     if let NavBuffer::Editable(tb) = &mut buf {
-                        fileeditor::run_insert_mode(tb, &mut vk, rect, registers, &mut || service_background_jobs(sessions, windows, job_frames, *current_window), true, term_rows, term_cols)?;
+                        let (insert_term_rows, insert_term_cols) = (*term_rows, *term_cols);
+                        fileeditor::run_insert_mode(tb, &mut vk, rect, registers, &mut || service_background_jobs(sessions, windows, job_frames, *current_window, term_rows, term_cols, *sinks_are_grid), true, insert_term_rows, insert_term_cols)?;
                     }
-                    render_nav_frame(&mut buf, &vk, rect, term_rows, term_cols);
+                    render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols);
                 } else {
                     let (new_chars, new_cursor) =
                         crate::bishedit::vimkeys::apply_insert_cmd(&original_chars, initial_cursor, crate::bishedit::vimkeys::InsertCmd::Before);
@@ -4489,14 +4626,14 @@ fn run_normal_mode_navigation(
             // above, at the top of this same loop.
             KeyOutcome::EnterVisual(shape) => {
                 vk.begin_visual(shape, buf.cursor());
-                render_nav_frame(&mut buf, &vk, rect, term_rows, term_cols);
+                render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols);
             }
             KeyOutcome::ReselectVisual => {
                 if let Some((shape, anchor, cursor)) = vk.last_visual() {
                     buf.set_cursor(cursor.0, cursor.1);
                     vk.begin_visual(shape, anchor);
                 }
-                render_nav_frame(&mut buf, &vk, rect, term_rows, term_cols);
+                render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols);
             }
             KeyOutcome::Jump { forward } => {
                 let current = buf.cursor();
@@ -4508,7 +4645,7 @@ fn run_normal_mode_navigation(
                     let content_cols = nav_content_cols(&buf, rect);
                     scroll_to_show_cursor(&mut buf, content_cols);
                 }
-                render_nav_frame(&mut buf, &vk, rect, term_rows, term_cols);
+                render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols);
             }
             // `u`/`Ctrl-R`: no-op for `ReadOnly`, same as every other
             // mutating outcome. Guarded on `!vk.is_visual() &&
@@ -4525,7 +4662,7 @@ fn run_normal_mode_navigation(
                         }
                     }
                 }
-                render_nav_frame(&mut buf, &vk, rect, term_rows, term_cols);
+                render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols);
             }
             KeyOutcome::Redo(count) => {
                 if !vk.is_visual() && buf.selections().is_empty() && let NavBuffer::Editable(tb) = &mut buf {
@@ -4535,7 +4672,7 @@ fn run_normal_mode_navigation(
                         }
                     }
                 }
-                render_nav_frame(&mut buf, &vk, rect, term_rows, term_cols);
+                render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols);
             }
             // `g-`/`g+`: same guard as `u`/`Ctrl-R` just above, for the
             // same reason.
@@ -4547,7 +4684,7 @@ fn run_normal_mode_navigation(
                         }
                     }
                 }
-                render_nav_frame(&mut buf, &vk, rect, term_rows, term_cols);
+                render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols);
             }
             // Yank works for either buffer kind (`op == Op::Yank` is
             // checked first, unconditionally) -- copying text out of a
@@ -4567,7 +4704,8 @@ fn run_normal_mode_navigation(
                         Op::Change => {
                             let m = fileeditor::redirect_cw_to_ce(tb, &motion);
                             if fileeditor::delete_motion(tb, registers, m, count, register) {
-                                fileeditor::run_insert_mode(tb, &mut vk, rect, registers, &mut || service_background_jobs(sessions, windows, job_frames, *current_window), false, term_rows, term_cols)?;
+                                let (insert_term_rows, insert_term_cols) = (*term_rows, *term_cols);
+                                fileeditor::run_insert_mode(tb, &mut vk, rect, registers, &mut || service_background_jobs(sessions, windows, job_frames, *current_window, term_rows, term_cols, *sinks_are_grid), false, insert_term_rows, insert_term_cols)?;
                             }
                         }
                         Op::Lowercase | Op::Uppercase | Op::CaseToggle => {
@@ -4578,7 +4716,7 @@ fn run_normal_mode_navigation(
                         Op::Yank => unreachable!("handled above"),
                     }
                 }
-                render_nav_frame(&mut buf, &vk, rect, term_rows, term_cols);
+                render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols);
             }
             KeyOutcome::OperatorLines(op, count, register) => {
                 if op == Op::Yank {
@@ -4588,7 +4726,8 @@ fn run_normal_mode_navigation(
                         Op::Delete => fileeditor::delete_lines(tb, registers, count, register),
                         Op::Change => {
                             fileeditor::delete_lines(tb, registers, count, register);
-                            fileeditor::run_insert_mode(tb, &mut vk, rect, registers, &mut || service_background_jobs(sessions, windows, job_frames, *current_window), false, term_rows, term_cols)?;
+                            let (insert_term_rows, insert_term_cols) = (*term_rows, *term_cols);
+                            fileeditor::run_insert_mode(tb, &mut vk, rect, registers, &mut || service_background_jobs(sessions, windows, job_frames, *current_window, term_rows, term_cols, *sinks_are_grid), false, insert_term_rows, insert_term_cols)?;
                         }
                         Op::Lowercase | Op::Uppercase | Op::CaseToggle => fileeditor::case_operator_lines(tb, count, fileeditor::case_kind_for_op(op)),
                         Op::Indent => fileeditor::indent_lines(tb, count),
@@ -4596,7 +4735,7 @@ fn run_normal_mode_navigation(
                         Op::Yank => unreachable!("handled above"),
                     }
                 }
-                render_nav_frame(&mut buf, &vk, rect, term_rows, term_cols);
+                render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols);
             }
             // `p`/`P`/`x`/`J`/`gJ`/`ys`/`ds`/`cs`/`r`/`~`/`o`/`O`: all
             // mutate, so all a no-op for `ReadOnly` (same as before this
@@ -4607,62 +4746,63 @@ fn run_normal_mode_navigation(
                 if let NavBuffer::Editable(tb) = &mut buf {
                     fileeditor::put(tb, registers, before, count, register);
                 }
-                render_nav_frame(&mut buf, &vk, rect, term_rows, term_cols);
+                render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols);
             }
             KeyOutcome::DeleteCharForward { count, register } => {
                 if let NavBuffer::Editable(tb) = &mut buf {
                     fileeditor::delete_char_forward(tb, registers, count, register);
                 }
-                render_nav_frame(&mut buf, &vk, rect, term_rows, term_cols);
+                render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols);
             }
             KeyOutcome::Join { count, with_space } => {
                 if let NavBuffer::Editable(tb) = &mut buf {
                     tb.join_lines(count.unwrap_or(1).max(1), with_space);
                 }
-                render_nav_frame(&mut buf, &vk, rect, term_rows, term_cols);
+                render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols);
             }
             KeyOutcome::AddSurround { target, ch } => {
                 if let NavBuffer::Editable(tb) = &mut buf {
                     fileeditor::add_surround(tb, target, ch);
                 }
-                render_nav_frame(&mut buf, &vk, rect, term_rows, term_cols);
+                render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols);
             }
             KeyOutcome::DeleteSurround { ch } => {
                 if let NavBuffer::Editable(tb) = &mut buf {
                     fileeditor::delete_surround(tb, ch);
                 }
-                render_nav_frame(&mut buf, &vk, rect, term_rows, term_cols);
+                render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols);
             }
             KeyOutcome::ChangeSurround { ch, replacement } => {
                 if let NavBuffer::Editable(tb) = &mut buf {
                     fileeditor::change_surround(tb, ch, replacement);
                 }
-                render_nav_frame(&mut buf, &vk, rect, term_rows, term_cols);
+                render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols);
             }
             KeyOutcome::ReplaceChar { ch, count } => {
                 if let NavBuffer::Editable(tb) = &mut buf {
                     fileeditor::replace_char(tb, ch, count.unwrap_or(1).max(1));
                 }
-                render_nav_frame(&mut buf, &vk, rect, term_rows, term_cols);
+                render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols);
             }
             KeyOutcome::ToggleCase { count } => {
                 if let NavBuffer::Editable(tb) = &mut buf {
                     fileeditor::toggle_case(tb, count.unwrap_or(1).max(1));
                 }
-                render_nav_frame(&mut buf, &vk, rect, term_rows, term_cols);
+                render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols);
             }
             KeyOutcome::AdjustNumber { delta } => {
                 if let NavBuffer::Editable(tb) = &mut buf {
                     fileeditor::adjust_number(tb, delta);
                 }
-                render_nav_frame(&mut buf, &vk, rect, term_rows, term_cols);
+                render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols);
             }
             KeyOutcome::OpenLine { above } => {
                 if let NavBuffer::Editable(tb) = &mut buf {
                     fileeditor::open_line(tb, above);
-                    fileeditor::run_insert_mode(tb, &mut vk, rect, registers, &mut || service_background_jobs(sessions, windows, job_frames, *current_window), false, term_rows, term_cols)?;
+                    let (insert_term_rows, insert_term_cols) = (*term_rows, *term_cols);
+                    fileeditor::run_insert_mode(tb, &mut vk, rect, registers, &mut || service_background_jobs(sessions, windows, job_frames, *current_window, term_rows, term_cols, *sinks_are_grid), false, insert_term_rows, insert_term_cols)?;
                 }
-                render_nav_frame(&mut buf, &vk, rect, term_rows, term_cols);
+                render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols);
             }
             // dispatch_window_cmd does the actual work (shared with
             // run_edit_frame's own identical need -- see its own doc
@@ -4671,7 +4811,7 @@ fn run_normal_mode_navigation(
             // handing the buffer/vk back so an `Editable` caller can
             // re-stash them.
             KeyOutcome::Window(cmd, count) => {
-                dispatch_window_cmd(cmd, count, sessions, windows, current_window, next_session_id, next_window_id, sinks_are_grid, term_rows, term_cols);
+                dispatch_window_cmd(cmd, count, sessions, windows, current_window, next_session_id, next_window_id, sinks_are_grid, *term_rows, *term_cols);
                 return Ok((NavExit::Detached, nav_buffer_into_edit_state(buf, vk)));
             }
             // Rendered on every keystroke, not just a resolved Motion --
@@ -4679,12 +4819,12 @@ fn run_normal_mode_navigation(
             // "20g" mid-`20gg`) and a search's in-progress text live, not
             // just the end result once a motion actually applies.
             KeyOutcome::Pending | KeyOutcome::None => {
-                render_nav_frame(&mut buf, &vk, rect, term_rows, term_cols);
+                render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols);
             }
         }
     };
 
-    compositor_redraw(sessions, windows, *current_window, term_rows, term_cols);
+    compositor_redraw(sessions, windows, *current_window, *term_rows, *term_cols);
     Ok(result)
 }
 
@@ -5133,8 +5273,9 @@ fn run_command_mode(
     history: &mut History,
     job_frames: &mut HashMap<JobFrameId, exec::FgJob>,
     registers: &mut Registers,
-    term_rows: usize,
-    term_cols: usize,
+    term_rows: &mut usize,
+    term_cols: &mut usize,
+    sinks_are_grid: bool,
     // `Some` iff the pane driving this call is a `Frame::Edit` (the
     // unified Normal-mode loop's own `NavBuffer::Editable` -- see that
     // enum's doc comment) -- what makes `w`/`w <path>`/`wq`/`x`/`q`/`q!`/
@@ -5153,7 +5294,6 @@ fn run_command_mode(
     let mut editing = editing;
     let mut buffer = String::new();
     let mut transcript_visible = false;
-    let prompt_row = command_mode_row(term_rows) + 1;
     // Set from `seed` on the very first iteration, or by Ctrl+Space
     // below (see that arm's own comment) on any later one -- consumed by
     // the very next read_line call, then left None again either way.
@@ -5162,6 +5302,13 @@ fn run_command_mode(
         (s, len)
     });
     loop {
+        // Recomputed every iteration (not just once up front) so a
+        // resize that arrives while this loop is blocked on a keystroke
+        // (see service_background_jobs's own on_idle-driven WINCH
+        // handling below) repositions this row correctly on the very
+        // next redraw, instead of staying pinned to wherever the old
+        // term_rows put it.
+        let prompt_row = command_mode_row(*term_rows) + 1;
         let prompt_str = if buffer.is_empty() { prompt::command_mode_prompt() } else { prompt::continuation() };
         print!("\x1b[{};1H", prompt_row);
         let _ = io::stdout().flush();
@@ -5194,7 +5341,7 @@ fn run_command_mode(
             true,
             pending_initial.take(),
             0,
-            term_cols,
+            *term_cols,
             HighlightContext::default(),
             None,
             None,
@@ -5202,7 +5349,7 @@ fn run_command_mode(
             None,
             registers,
             &mut || {
-                service_background_jobs(sessions, windows, job_frames, current_window);
+                service_background_jobs(sessions, windows, job_frames, current_window, term_rows, term_cols, sinks_are_grid);
             },
         ) {
             Ok(ReadOutcome::Eof) | Ok(ReadOutcome::Interrupted) => return CommandModeOutcome::Cancelled,
@@ -5236,9 +5383,9 @@ fn run_command_mode(
             Ok(ReadOutcome::CtrlL) => {
                 transcript_visible = !transcript_visible;
                 if transcript_visible {
-                    render_command_transcript(&sessions[&session_id].command_transcript, term_rows, term_cols);
+                    render_command_transcript(&sessions[&session_id].command_transcript, *term_rows, *term_cols);
                 } else {
-                    compositor_redraw(sessions, windows, current_window, term_rows, term_cols);
+                    compositor_redraw(sessions, windows, current_window, *term_rows, *term_cols);
                 }
             }
             Ok(ReadOutcome::Line(line)) => {
@@ -5370,7 +5517,7 @@ fn run_command_mode(
                             // pane's own stack for the whole time this
                             // command-mode loop is driving it.
                             if let Some(Frame::Edit(edit_frame_id)) = windows[current_window].stack().last().copied() {
-                                sync_diagnostics_pane(sessions, windows, current_window, next_session_id, edit_frame_id, &tb.diagnostics, term_rows, term_cols);
+                                sync_diagnostics_pane(sessions, windows, current_window, next_session_id, edit_frame_id, &tb.diagnostics, *term_rows, *term_cols);
                             }
                             sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry { command: trimmed, output, status: 0 });
                             // Empty `Ran` output (not the count message

@@ -638,6 +638,18 @@ pub(crate) fn resolve_insert_start(buf: &mut TextBuffer, cmd: InsertCmd) {
 // else (motion keys, Enter, exit) behaves identically either way, which
 // is why this is a flag on the one shared loop rather than a second copy
 // of it.
+// term_rows/term_cols are plain by-value snapshots, not &mut usize, even
+// though on_idle (built by every call site) closes over the *same*
+// underlying term_rows/term_cols one level up as &mut usize to drive
+// service_background_jobs's own resize handling -- a second, direct
+// &mut borrow of that same storage here would conflict with the
+// closure's borrow of it, since both live for this whole call. The
+// practical effect: a resize mid-insert-session is still fully applied
+// (session screen, job ptys, the caller's own term_rows/term_cols) by
+// the time this function returns, but this function's own rendering
+// keeps using the size it started with until then -- the same "next
+// natural redraw" caveat this codebase already accepts elsewhere for a
+// loop that's actively blocked on a keystroke.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_insert_mode(buf: &mut TextBuffer, vk: &mut VimKeys, rect: Rect, registers: &mut Registers, on_idle: &mut dyn FnMut(), replace: bool, term_rows: usize, term_cols: usize) -> io::Result<()> {
     let mode = if replace { EditorMode::Replace } else { EditorMode::Insert };
