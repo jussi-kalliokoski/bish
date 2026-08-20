@@ -3,22 +3,25 @@
 // machinery the shell/editor already have, reached via `bish tool ...`
 // on the real command line (see main.rs's own dispatch, which routes
 // here *before* its ordinary `-c`/script-path handling, since `tool`
-// isn't a script to run). `check` is the first subcommand; `format` and
-// `lsp-server` are the next two planned (see bishedit::lint's own doc
-// comment for why the actual rule engine lives there instead of here --
-// this module is just the CLI wrapper around it).
+// isn't a script to run). `check` and `format` are the first two
+// subcommands; `lsp-server` is next (see bishedit::lint's own doc
+// comment for why the actual rule engines live there/in
+// bishedit::format instead of here -- this module is just the CLI
+// wrapper around them).
+use crate::bishedit::format::BashFormatter;
 use crate::bishedit::lint::{BashLinter, Diagnostic, Fix, Linter};
 use std::io::{self, Read, Write};
 
 pub fn run(args: &[String]) -> i32 {
     match args.first().map(String::as_str) {
         Some("check") => run_check(&args[1..]),
+        Some("format") => run_format(&args[1..]),
         Some(other) => {
-            eprintln!("bish tool: unknown subcommand '{other}' (expected: check)");
+            eprintln!("bish tool: unknown subcommand '{other}' (expected: check, format)");
             2
         }
         None => {
-            eprintln!("bish tool: expected a subcommand (usage: bish tool check [--fix] [FILE...])");
+            eprintln!("bish tool: expected a subcommand (usage: bish tool check [--fix] [FILE...], bish tool format [--check] [FILE...])");
             2
         }
     }
@@ -112,6 +115,102 @@ fn check_file(path: &str, fix: bool) -> i32 {
     } else {
         report_remaining(path, &text, diagnostics.iter());
         if diagnostics.is_empty() { 0 } else { 1 }
+    }
+}
+
+fn print_format_usage() {
+    eprintln!("usage: bish tool format [--check] [FILE...]");
+    eprintln!("  reformats bash script(s): tabs for indentation, and `then`/`do`/`in`/`{{`");
+    eprintln!("  joined onto their own header line, one indent level per block until the");
+    eprintln!("  matching `fi`/`done`/`esac`/`}}`. With no FILE arguments, reads a single");
+    eprintln!("  script from stdin. Rewrites in place for a real file, to stdout for");
+    eprintln!("  stdin -- unless --check is given, which only reports what would change");
+    eprintln!("  (same [code] format as `bish tool check`) and writes nothing.");
+}
+
+fn run_format(args: &[String]) -> i32 {
+    let mut check_only = false;
+    let mut files: Vec<&str> = Vec::new();
+    for arg in args {
+        match arg.as_str() {
+            "--check" => check_only = true,
+            "-h" | "--help" => {
+                print_format_usage();
+                return 0;
+            }
+            other if other.starts_with('-') && other != "-" => {
+                eprintln!("bish tool format: unrecognized option '{other}'");
+                print_format_usage();
+                return 2;
+            }
+            other => files.push(other),
+        }
+    }
+
+    if files.is_empty() {
+        return format_stdin(check_only);
+    }
+
+    let mut worst = 0;
+    for path in files {
+        worst = worst.max(format_file(path, check_only));
+    }
+    worst
+}
+
+fn format_stdin(check_only: bool) -> i32 {
+    let mut text = String::new();
+    if let Err(e) = io::stdin().read_to_string(&mut text) {
+        eprintln!("bish tool format: error reading stdin: {e}");
+        return 2;
+    }
+    let diagnostics = match BashFormatter.check(&text) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("<stdin>: {e}");
+            return 2;
+        }
+    };
+    if check_only {
+        report_remaining("<stdin>", &text, diagnostics.iter());
+        if diagnostics.is_empty() { 0 } else { 1 }
+    } else {
+        let (fixed, _, remaining) = apply_fixes(&text, &diagnostics);
+        print!("{fixed}");
+        let _ = io::stdout().flush();
+        report_remaining("<stdin>", &text, remaining.iter().copied());
+        if remaining.is_empty() { 0 } else { 1 }
+    }
+}
+
+fn format_file(path: &str, check_only: bool) -> i32 {
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("bish tool format: {path}: {e}");
+            return 2;
+        }
+    };
+    let diagnostics = match BashFormatter.check(&text) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("bish tool format: {path}: {e}");
+            return 2;
+        }
+    };
+    if check_only {
+        report_remaining(path, &text, diagnostics.iter());
+        if diagnostics.is_empty() { 0 } else { 1 }
+    } else {
+        let (fixed, applied, remaining) = apply_fixes(&text, &diagnostics);
+        // Same "don't touch mtime for nothing" reasoning as check_file's
+        // own --fix path.
+        if applied > 0 && let Err(e) = std::fs::write(path, &fixed) {
+            eprintln!("bish tool format: {path}: error writing: {e}");
+            return 2;
+        }
+        report_remaining(path, &text, remaining.iter().copied());
+        if remaining.is_empty() { 0 } else { 1 }
     }
 }
 
