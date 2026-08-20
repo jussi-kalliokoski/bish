@@ -383,13 +383,16 @@ pub struct Shell {
     // convention -- `dirs` prints cwd first, then this stack). `+N`/`-N`
     // rotation forms aren't implemented, a scoped gap.
     dir_stack: Vec<String>,
-    // shopt -s/-u NAME: only a handful of names are meaningfully tracked
-    // (most of bish's behavior isn't actually gated by any of these -- e.g.
-    // extglob is unconditionally on, see glob.rs), but recognizing the
-    // builtin at all means `shopt -s extglob`/`shopt -s nullglob` in a
-    // script no longer fails as an unknown command, which would otherwise
-    // abort the whole script under `set -e`.
-    shopt_options: std::collections::HashSet<String>,
+    // shopt -s/-u NAME: explicit overrides only, keyed by name -- absent
+    // means "use that name's own default from KNOWN_SHOPT_OPTIONS", not
+    // "off" (several real bash options, e.g. cmdhist/promptvars, default
+    // on). Most of these have no actual effect on bish's behavior beyond
+    // being trackable/queryable/listable (e.g. extglob is unconditionally
+    // on regardless of this map, see glob.rs), but recognizing the names
+    // at all means `shopt -s extglob`/`shopt -s nullglob` in a script no
+    // longer fails as an unknown command, which would otherwise abort the
+    // whole script under `set -e`.
+    shopt_options: std::collections::HashMap<String, bool>,
     // `readonly NAME`. Checked by assign_var, the single write path plain
     // assignment/local/export/declare/arithmetic-assignment/read/getopts
     // all funnel through, so marking a name here blocks writes everywhere
@@ -601,7 +604,7 @@ impl Shell {
             nameref_names: std::collections::HashSet::new(),
             nameref_local_stack: Vec::new(),
             dir_stack: Vec::new(),
-            shopt_options: std::collections::HashSet::new(),
+            shopt_options: std::collections::HashMap::new(),
             readonly_names: std::collections::HashSet::new(),
             integer_names: std::collections::HashSet::new(),
             upper_names: std::collections::HashSet::new(),
@@ -1522,47 +1525,83 @@ impl Shell {
         0
     }
 
-    // shopt -s/-u NAME... [-q NAME]. Most tracked names have no actual
-    // effect on bish's behavior (see the comment on shopt_options), but
-    // recognizing the builtin at all keeps `shopt -s extglob`-style
-    // defensive script preambles from failing as an unknown command.
-    // extglob is special-cased as always reporting "on", since bish's
-    // extglob support is unconditional rather than gated by this flag.
+    // Effective on/off state for a known shopt option name: an explicit
+    // `-s`/`-u` override if there's been one this session, else that
+    // name's own default from KNOWN_SHOPT_OPTIONS. `extglob` is special-
+    // cased to always report "on" regardless of either, since bish's
+    // extglob support is unconditional (see glob.rs) rather than actually
+    // gated by this flag.
+    fn shopt_is_on(&self, name: &str) -> bool {
+        if name == "extglob" {
+            return true;
+        }
+        self.shopt_options.get(name).copied().unwrap_or_else(|| shopt_default_on(name).unwrap_or(false))
+    }
+
+    fn print_shopt_line(&mut self, name: &str, reusable: bool) {
+        let on = self.shopt_is_on(name);
+        if reusable {
+            sh_println!(self, "shopt -{} {}", if on { "s" } else { "u" }, name);
+        } else {
+            sh_println!(self, "{:<15}\t{}", name, if on { "on" } else { "off" });
+        }
+    }
+
+    // shopt [-su] [-q] [-p] [NAME ...]. Bare `shopt` lists every known
+    // option's on/off state; `shopt -s`/`shopt -u` alone list only the
+    // ones currently on/off (respectively); either with NAMEs given
+    // toggles just those. `-p` prints in the same `shopt -s/-u NAME` form
+    // that can be fed back in, instead of the plain "NAME\ton/off" table.
+    // A NAME not in KNOWN_SHOPT_OPTIONS is rejected up front, matching
+    // real bash's own "invalid shell option name" error -- see that
+    // list's own doc comment for what most of these names actually do (or
+    // don't do) in bish.
     fn run_shopt(&mut self, args: &[String]) -> i32 {
         let mut mode: Option<bool> = None; // Some(true)=-s, Some(false)=-u
         let mut quiet = false;
+        let mut reusable = false;
         let mut names: Vec<&str> = Vec::new();
         for a in args {
             match a.as_str() {
                 "-s" => mode = Some(true),
                 "-u" => mode = Some(false),
                 "-q" => quiet = true,
+                "-p" => reusable = true,
                 _ if a.starts_with('-') => {}
                 other => names.push(other),
             }
         }
-        let is_on = |shell: &Shell, n: &str| n == "extglob" || shell.shopt_options.contains(n);
+        for n in &names {
+            if shopt_default_on(n).is_none() {
+                sh_eprintln!(self, "bish: shopt: {n}: invalid shell option name");
+                return 1;
+            }
+        }
         match mode {
+            Some(on) if names.is_empty() => {
+                let matching: Vec<&str> = KNOWN_SHOPT_OPTIONS.iter().map(|(n, _)| *n).filter(|n| self.shopt_is_on(n) == on).collect();
+                for n in matching {
+                    self.print_shopt_line(n, reusable);
+                }
+                0
+            }
             Some(on) => {
                 for n in &names {
-                    if on {
-                        self.shopt_options.insert(n.to_string());
-                    } else {
-                        self.shopt_options.remove(*n);
-                    }
+                    self.shopt_options.insert(n.to_string(), on);
                 }
                 0
             }
             None if quiet => {
-                if names.iter().all(|n| is_on(self, n)) {
+                if names.iter().all(|n| self.shopt_is_on(n)) {
                     0
                 } else {
                     1
                 }
             }
             None => {
-                for n in &names {
-                    sh_println!(self, "{:<15}\t{}", n, if is_on(self, n) { "on" } else { "off" });
+                let targets: Vec<&str> = if names.is_empty() { KNOWN_SHOPT_OPTIONS.iter().map(|(n, _)| *n).collect() } else { names };
+                for n in targets {
+                    self.print_shopt_line(n, reusable);
                 }
                 0
             }
@@ -6888,6 +6927,82 @@ const KNOWN_BUILTINS: &[&str] = &[
     "win",
 ];
 
+// The names `shopt` itself recognizes, each with its own default on/off
+// state absent an explicit `-s`/`-u` override -- mirrors bash 5.x's own
+// `shopt` output for an ordinary interactive shell (`bash -c shopt`).
+// Needed for run_shopt to enumerate anything at all (bare `shopt`/`shopt
+// -s`/`shopt -u` have nothing to list without a registry), and to reject
+// a genuinely unknown name the way real bash does, rather than silently
+// treating every unrecognized string as "off". As with shopt_options
+// itself, most of these have no actual effect on bish's behavior beyond
+// being trackable -- extglob is the one name overridden elsewhere (see
+// Shell::shopt_is_on) since bish's extglob support is unconditional.
+const KNOWN_SHOPT_OPTIONS: &[(&str, bool)] = &[
+    ("array_expand_once", false),
+    ("assoc_expand_once", false),
+    ("autocd", false),
+    ("bash_source_fullpath", false),
+    ("cdable_vars", false),
+    ("cdspell", false),
+    ("checkhash", false),
+    ("checkjobs", false),
+    ("checkwinsize", true),
+    ("cmdhist", true),
+    ("compat31", false),
+    ("compat32", false),
+    ("compat40", false),
+    ("compat41", false),
+    ("compat42", false),
+    ("compat43", false),
+    ("compat44", false),
+    ("complete_fullquote", true),
+    ("direxpand", false),
+    ("dirspell", false),
+    ("dotglob", false),
+    ("execfail", false),
+    ("expand_aliases", false),
+    ("extdebug", false),
+    ("extglob", false),
+    ("extquote", true),
+    ("failglob", false),
+    ("force_fignore", true),
+    ("globasciiranges", true),
+    ("globskipdots", true),
+    ("globstar", false),
+    ("gnu_errfmt", false),
+    ("histappend", false),
+    ("histreedit", false),
+    ("histverify", false),
+    ("hostcomplete", true),
+    ("huponexit", false),
+    ("inherit_errexit", false),
+    ("interactive_comments", true),
+    ("lastpipe", false),
+    ("lithist", false),
+    ("localvar_inherit", false),
+    ("localvar_unset", false),
+    ("login_shell", false),
+    ("mailwarn", false),
+    ("no_empty_cmd_completion", false),
+    ("nocaseglob", false),
+    ("nocasematch", false),
+    ("noexpand_translation", false),
+    ("nullglob", false),
+    ("patsub_replacement", true),
+    ("progcomp", true),
+    ("progcomp_alias", false),
+    ("promptvars", true),
+    ("restricted_shell", false),
+    ("shift_verbose", false),
+    ("sourcepath", true),
+    ("varredir_close", false),
+    ("xpg_echo", false),
+];
+
+fn shopt_default_on(name: &str) -> Option<bool> {
+    KNOWN_SHOPT_OPTIONS.iter().find(|(n, _)| *n == name).map(|(_, on)| *on)
+}
+
 fn is_known_builtin(name: &str) -> bool {
     KNOWN_BUILTINS.contains(&name)
 }
@@ -7087,5 +7202,57 @@ mod tests {
         assert_eq!(child.abbrs, parent.abbrs);
         child.run_abbr(&strs(&["-a", "gs", "git", "status"]));
         assert!(!parent.abbrs.iter().any(|(n, _)| n == "gs"), "parent must not see the child's later abbr additions");
+    }
+
+    #[test]
+    fn shopt_reports_each_names_own_default_before_any_override() {
+        let shell = Shell::new();
+        assert!(!shell.shopt_is_on("nullglob"), "nullglob defaults off");
+        assert!(shell.shopt_is_on("cmdhist"), "cmdhist defaults on");
+        assert!(shell.shopt_is_on("extglob"), "extglob is always on regardless of its own listed default");
+    }
+
+    #[test]
+    fn shopt_s_and_u_override_a_names_default_either_direction() {
+        let mut shell = Shell::new();
+        assert!(!shell.shopt_is_on("nullglob"));
+        assert_eq!(shell.run_shopt(&strs(&["-s", "nullglob"])), 0);
+        assert!(shell.shopt_is_on("nullglob"));
+
+        assert!(shell.shopt_is_on("cmdhist"));
+        assert_eq!(shell.run_shopt(&strs(&["-u", "cmdhist"])), 0);
+        assert!(!shell.shopt_is_on("cmdhist"));
+    }
+
+    #[test]
+    fn shopt_q_reports_status_from_every_names_effective_state() {
+        let mut shell = Shell::new();
+        assert_eq!(shell.run_shopt(&strs(&["-q", "cmdhist", "extglob"])), 0);
+        assert_eq!(shell.run_shopt(&strs(&["-q", "cmdhist", "nullglob"])), 1);
+    }
+
+    #[test]
+    fn shopt_rejects_an_unknown_option_name() {
+        let mut shell = Shell::new();
+        assert_eq!(shell.run_shopt(&strs(&["bogus_option"])), 1);
+        assert_eq!(shell.run_shopt(&strs(&["-s", "bogus_option"])), 1);
+        assert!(shell.shopt_options.is_empty(), "a rejected name must not be recorded");
+    }
+
+    #[test]
+    fn bare_shopt_and_s_and_u_alone_enumerate_every_known_option() {
+        let mut shell = Shell::new();
+        // Bare `shopt` (no -s/-u, no names): every known option is a
+        // valid target, so this must not error and must not mutate
+        // anything -- this is the bug this whole patch exists to fix
+        // ("shopt without arguments does nothing").
+        assert_eq!(shell.run_shopt(&[]), 0);
+        assert!(shell.shopt_options.is_empty());
+
+        // `shopt -s`/`shopt -u` alone list, not toggle -- no names means
+        // nothing to turn on/off, unlike `shopt -s NAME`.
+        assert_eq!(shell.run_shopt(&strs(&["-s"])), 0);
+        assert_eq!(shell.run_shopt(&strs(&["-u"])), 0);
+        assert!(shell.shopt_options.is_empty(), "-s/-u alone must only list, never mutate");
     }
 }
