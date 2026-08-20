@@ -564,6 +564,12 @@ pub fn run(mut shell: Shell) {
         // comment on why aliases are deliberately not included here too).
         let cwd_snapshot = sessions[&session_id].shell.cwd.clone();
         let known_functions: HashSet<String> = sessions[&session_id].shell.function_names().map(String::from).collect();
+        // Same owned-snapshot pattern as cwd_snapshot/known_functions --
+        // read_line's own abbrs param needs this session's current table
+        // by the time expand_abbr_at_cursor runs, not a live borrow held
+        // for the whole call (which would conflict with on_idle's own
+        // &mut sessions borrow below, same reasoning as session_history).
+        let abbrs_snapshot = sessions[&session_id].shell.abbrs.clone();
         let highlight_ctx = HighlightContext { cwd: Some(cwd_snapshot.as_path()), known_functions: Some(&known_functions) };
         // Same owned-snapshot pattern as highlight_ctx just above -- built
         // from the exact same locals, not re-snapshotted.
@@ -608,6 +614,7 @@ pub fn run(mut shell: Shell) {
             menu_capable,
             row_origin,
             &mut registers,
+            &abbrs_snapshot,
             || {
                 service_background_jobs(&mut sessions, &mut windows, &mut job_frames, current_window, &mut term_rows, &mut term_cols, sinks_are_grid);
             },
@@ -5348,6 +5355,7 @@ fn run_command_mode(
             false,
             None,
             registers,
+            &[],
             &mut || {
                 service_background_jobs(sessions, windows, job_frames, current_window, term_rows, term_cols, sinks_are_grid);
             },

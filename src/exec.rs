@@ -342,6 +342,19 @@ pub struct Shell {
     // internal table) is in definition order, not sorted, and this list is
     // never large enough for linear lookup to matter.
     aliases: Vec<(String, String)>,
+    // `abbr -a NAME EXPANSION`: fish-style abbreviations -- unlike
+    // `aliases` above, these *do* expand, but never here in exec.rs. The
+    // trigger lives entirely in editor.rs's own read_line (Space/Enter
+    // right after typing NAME in command position splices EXPANSION into
+    // the line the user sees, before it's ever submitted) -- this table
+    // exists in `Shell` purely as the thing `abbr`'s own builtin (below)
+    // reads/writes and repl.rs snapshots per prompt to hand to read_line,
+    // same "owned-snapshot, not a live borrow" pattern as `cwd`/
+    // `function_names()` already use for `HighlightContext`/
+    // `ShellCompletionProvider`. Same Vec-not-map choice as `aliases`,
+    // same reasoning. `pub`, not private, for exactly that snapshotting
+    // (repl.rs is a different module) -- matching `cwd`'s own visibility.
+    pub abbrs: Vec<(String, String)>,
     // One frame per active function call (pushed/popped alongside
     // var_scopes in call_function). `local -a`/`-A name` snapshots the
     // array's pre-local value here (None if it didn't exist) before
@@ -582,6 +595,7 @@ impl Shell {
             assoc_arrays: HashMap::new(),
             assoc_names: std::collections::HashSet::new(),
             aliases: Vec::new(),
+            abbrs: Vec::new(),
             array_local_stack: Vec::new(),
             assoc_local_stack: Vec::new(),
             nameref_names: std::collections::HashSet::new(),
@@ -770,6 +784,7 @@ impl Shell {
             assoc_arrays: self.assoc_arrays.clone(),
             assoc_names: self.assoc_names.clone(),
             aliases: self.aliases.clone(),
+            abbrs: self.abbrs.clone(),
             array_local_stack: Vec::new(),
             assoc_local_stack: Vec::new(),
             nameref_names: self.nameref_names.clone(),
@@ -1550,6 +1565,99 @@ impl Shell {
                     sh_println!(self, "{:<15}\t{}", n, if is_on(self, n) { "on" } else { "off" });
                 }
                 0
+            }
+        }
+    }
+
+    // Fish-style abbreviations: `self.abbrs`'s own doc comment covers the
+    // storage/trigger split (this builtin only ever stores/queries/lists;
+    // the actual expansion happens in editor.rs's read_line). Deliberately
+    // scoped down from real fish's own `abbr`: no `--rename`, no
+    // `--position anywhere` (always command position, fish's own default),
+    // no `%`-cursor-placeholder tokens, no regex/function-backed
+    // abbreviations, no scope flags (`-U`/`-g`, meaningless here -- bish
+    // has no fish-variable-style scoping at all) -- just add/erase/list/
+    // show/query, the part of `abbr` people actually reach for day to day.
+    // `-a`/`--add` is optional (`abbr NAME EXPANSION` alone means add, `abbr`
+    // with a recognized name misparsed as NAME would just mean "add an
+    // abbreviation literally named `-x`" -- an accepted, unvalidated edge
+    // case, same spirit as `alias`'s own lack of name validation above).
+    // Bare `abbr` (no args at all) shows everything, matching this
+    // codebase's own `alias`'s bare-listing convention rather than real
+    // fish's (which errors) -- consistency with the sibling builtin wins
+    // here since nothing else in bish already commits to fish's own
+    // no-args-is-an-error behavior.
+    fn run_abbr(&mut self, args: &[String]) -> i32 {
+        enum Mode {
+            Add,
+            Erase,
+            List,
+            Show,
+            Query,
+        }
+        let (mode, rest) = match args.first().map(String::as_str) {
+            Some("-a") | Some("--add") => (Mode::Add, &args[1..]),
+            Some("-e") | Some("--erase") => (Mode::Erase, &args[1..]),
+            Some("-l") | Some("--list") => (Mode::List, &args[1..]),
+            Some("-s") | Some("--show") => (Mode::Show, &args[1..]),
+            Some("-q") | Some("--query") => (Mode::Query, &args[1..]),
+            None => (Mode::Show, args),
+            Some(_) => (Mode::Add, args),
+        };
+        match mode {
+            Mode::Add => {
+                let Some((name, expansion_words)) = rest.split_first() else {
+                    sh_eprintln!(self, "bish: abbr: -a: requires a NAME and an EXPANSION");
+                    return 2;
+                };
+                if expansion_words.is_empty() {
+                    sh_eprintln!(self, "bish: abbr: -a: requires an EXPANSION for '{name}'");
+                    return 2;
+                }
+                let expansion = expansion_words.join(" ");
+                match self.abbrs.iter_mut().find(|(n, _)| n == name) {
+                    Some(existing) => existing.1 = expansion,
+                    None => self.abbrs.push((name.clone(), expansion)),
+                }
+                0
+            }
+            Mode::Erase => {
+                if rest.is_empty() {
+                    sh_eprintln!(self, "bish: abbr: -e: requires a NAME");
+                    return 2;
+                }
+                let mut status = 0;
+                for name in rest {
+                    match self.abbrs.iter().position(|(n, _)| n == name) {
+                        Some(pos) => {
+                            self.abbrs.remove(pos);
+                        }
+                        None => {
+                            sh_eprintln!(self, "bish: abbr: -e: {}: no such abbreviation", name);
+                            status = 1;
+                        }
+                    }
+                }
+                status
+            }
+            Mode::List => {
+                for (name, _) in &self.abbrs {
+                    sh_println!(self, "{name}");
+                }
+                0
+            }
+            Mode::Show => {
+                for (name, expansion) in &self.abbrs {
+                    sh_println!(self, "abbr -a {} {}", crate::serialize::quote_literal(name), crate::serialize::quote_literal(expansion));
+                }
+                0
+            }
+            Mode::Query => {
+                if rest.is_empty() {
+                    sh_eprintln!(self, "bish: abbr: -q: requires at least one NAME");
+                    return 2;
+                }
+                if rest.iter().all(|name| self.abbrs.iter().any(|(n, _)| n == name)) { 0 } else { 1 }
             }
         }
     }
@@ -3318,6 +3426,7 @@ impl Shell {
                 }
                 return ExecResult::Status(status);
             }
+            "abbr" => return ExecResult::Status(self.run_abbr(&argv[1..])),
             "shopt" => return ExecResult::Status(self.run_shopt(&argv[1..])),
             // Command-mode-exclusive: this extends the builtin set
             // available there specifically, rather than being a normal
@@ -6774,6 +6883,7 @@ const KNOWN_BUILTINS: &[&str] = &[
     "ulimit",
     "alias",
     "unalias",
+    "abbr",
     "window",
     "win",
 ];
@@ -6906,5 +7016,76 @@ mod tests {
 
         // Reap the spawned process so the test doesn't leak it.
         parent.jobs.borrow_mut().jobs[0].wait();
+    }
+
+    fn strs(words: &[&str]) -> Vec<String> {
+        words.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn abbr_add_registers_a_multi_word_expansion_joined_by_single_spaces() {
+        let mut shell = Shell::new();
+        assert_eq!(shell.run_abbr(&strs(&["-a", "gco", "git", "checkout"])), 0);
+        assert_eq!(shell.abbrs, vec![("gco".to_string(), "git checkout".to_string())]);
+    }
+
+    #[test]
+    fn abbr_add_without_the_dash_a_flag_still_adds() {
+        let mut shell = Shell::new();
+        assert_eq!(shell.run_abbr(&strs(&["ll", "ls", "-la"])), 0);
+        assert_eq!(shell.abbrs, vec![("ll".to_string(), "ls -la".to_string())]);
+    }
+
+    #[test]
+    fn abbr_add_redefines_an_existing_name_in_place_rather_than_duplicating() {
+        let mut shell = Shell::new();
+        shell.run_abbr(&strs(&["-a", "gco", "git", "checkout"]));
+        shell.run_abbr(&strs(&["-a", "gco", "git", "switch"]));
+        assert_eq!(shell.abbrs, vec![("gco".to_string(), "git switch".to_string())]);
+    }
+
+    #[test]
+    fn abbr_erase_removes_a_known_name_and_reports_status_1_for_an_unknown_one() {
+        let mut shell = Shell::new();
+        shell.run_abbr(&strs(&["-a", "gco", "git", "checkout"]));
+        assert_eq!(shell.run_abbr(&strs(&["-e", "gco"])), 0);
+        assert!(shell.abbrs.is_empty());
+        assert_eq!(shell.run_abbr(&strs(&["-e", "gco"])), 1);
+    }
+
+    #[test]
+    fn abbr_query_is_zero_only_when_every_named_abbreviation_exists() {
+        let mut shell = Shell::new();
+        shell.run_abbr(&strs(&["-a", "gco", "git", "checkout"]));
+        shell.run_abbr(&strs(&["-a", "gs", "git", "status"]));
+        assert_eq!(shell.run_abbr(&strs(&["-q", "gco", "gs"])), 0);
+        assert_eq!(shell.run_abbr(&strs(&["-q", "gco", "nope"])), 1);
+    }
+
+    #[test]
+    fn abbr_list_and_show_report_status_0_without_mutating_the_table() {
+        let mut shell = Shell::new();
+        shell.run_abbr(&strs(&["-a", "gco", "git", "checkout"]));
+        assert_eq!(shell.run_abbr(&strs(&["-l"])), 0);
+        assert_eq!(shell.run_abbr(&strs(&["-s"])), 0);
+        assert_eq!(shell.run_abbr(&[]), 0);
+        assert_eq!(shell.abbrs, vec![("gco".to_string(), "git checkout".to_string())]);
+    }
+
+    #[test]
+    fn abbr_add_with_no_expansion_is_a_usage_error() {
+        let mut shell = Shell::new();
+        assert_eq!(shell.run_abbr(&strs(&["-a", "gco"])), 2);
+        assert!(shell.abbrs.is_empty());
+    }
+
+    #[test]
+    fn new_virtual_child_inherits_a_snapshot_of_the_parents_abbrs() {
+        let mut parent = Shell::new();
+        parent.run_abbr(&strs(&["-a", "gco", "git", "checkout"]));
+        let mut child = parent.new_virtual_child();
+        assert_eq!(child.abbrs, parent.abbrs);
+        child.run_abbr(&strs(&["-a", "gs", "git", "status"]));
+        assert!(!parent.abbrs.iter().any(|(n, _)| n == "gs"), "parent must not see the child's later abbr additions");
     }
 }

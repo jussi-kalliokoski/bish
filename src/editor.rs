@@ -16,7 +16,7 @@
 use std::collections::HashMap;
 use std::io::{self, Write};
 
-use crate::bishedit::completion::{CompletionCandidate, CompletionProvider, CompletionRequest};
+use crate::bishedit::completion::{self, CompletionCandidate, CompletionProvider, CompletionRequest};
 use crate::bishedit::highlight::{self, BashHighlighter, Highlighter, HighlightContext, StyledSpan};
 use crate::bishedit::motion;
 use crate::bishedit::registers::{RegisterShape, RegisterValue, Registers};
@@ -583,6 +583,35 @@ fn compute_suggestion(ed: &LineEditor, provider: Option<&dyn SuggestionProvider>
 fn accept_suggestion(ed: &mut LineEditor, tail: &str) {
     let end = ed.buf.len();
     ed.splice_word(end, end, tail);
+}
+
+// Fish-style `abbr` expansion: called right as the keystroke that would
+// end the word at the cursor arrives (Space) or would submit the whole
+// line (Enter) -- see `Shell::abbrs`'s own doc comment for the storage
+// half of this feature. Reuses completion.rs's own word-role walker
+// (`find_word_start`/`classify_word_role`) rather than inventing a
+// second "what word is this" notion: command position only, matching
+// fish's own default (`--position command`) -- an abbreviation typed as
+// an *argument* is left alone, same as a real command name would be.
+// `true` if an expansion happened (the caller's cue that the buffer
+// changed and, for Enter specifically, that this keystroke shouldn't
+// also submit the line -- fish's own "first Enter expands, second one
+// runs" behavior).
+fn expand_abbr_at_cursor(ed: &mut LineEditor, abbrs: &[(String, String)]) -> bool {
+    if abbrs.is_empty() {
+        return false;
+    }
+    let word_start = completion::find_word_start(&ed.buf, ed.cursor);
+    let prefix_text: String = ed.buf[..word_start].iter().collect();
+    if !matches!(completion::classify_word_role(&prefix_text), completion::CmdRole::Command) {
+        return false;
+    }
+    let word: String = ed.buf[word_start..ed.cursor].iter().collect();
+    let Some((_, expansion)) = abbrs.iter().find(|(name, _)| *name == word) else {
+        return false;
+    };
+    ed.splice_word(word_start, ed.cursor, expansion);
+    true
 }
 
 // `col_origin` is the real terminal column (0-indexed) this line's own
@@ -1162,6 +1191,14 @@ pub fn read_line(
     // run_one_shot_normal_command for y/p in Ctrl-E's/Ctrl-O's own vim
     // Normal mode.
     registers: &mut Registers,
+    // Fish-style abbreviations, snapshotted fresh per prompt by the
+    // caller -- same "owned snapshot, not a live borrow" pattern as
+    // `completion_provider`'s own `cwd`/`known_functions` (see
+    // `Shell::abbrs`'s own doc comment). Empty for callers with no
+    // meaningful shell context (command mode's colon-line, matching
+    // `completion_provider`/`suggestion_provider`'s own `None` there) --
+    // `expand_abbr_at_cursor` is a no-op on an empty slice either way.
+    abbrs: &[(String, String)],
     mut on_idle: impl FnMut(),
 ) -> io::Result<ReadOutcome> {
     let mut guard = Some(term::RawGuard::enable_with_mouse(0)?);
@@ -1275,6 +1312,15 @@ pub fn read_line(
         }
 
         match key {
+            // Fish's own "first Enter expands, second one runs": if the
+            // word right at the cursor is a command-position abbreviation,
+            // this Enter only expands it and falls through to the ordinary
+            // post-match redraw below instead of submitting -- the same
+            // way a real terminal expects to see its own expansion before
+            // running it, not run the un-expanded short form. A second,
+            // immediate Enter then finds nothing left to expand and
+            // submits normally.
+            Key::Enter if expand_abbr_at_cursor(&mut ed, abbrs) => {}
             Key::Enter => {
                 drop(guard.take());
                 print!("\r\n");
@@ -1365,6 +1411,16 @@ pub fn read_line(
                 return Ok(ReadOutcome::CtrlL);
             }
             Key::CtrlL => print!("\x1b[H\x1b[2J"),
+            // Space is the other abbr expansion trigger, alongside Enter
+            // above -- unlike Enter, a space is never withheld: the
+            // expansion (if any) lands first, then the space that
+            // triggered it is still inserted right after, matching fish
+            // ("gco" + Space becomes "git checkout " -- expansion plus the
+            // space that ended it, not one or the other).
+            Key::Char(' ') => {
+                expand_abbr_at_cursor(&mut ed, abbrs);
+                ed.insert(' ');
+            }
             Key::Char(c) => ed.insert(c),
             // Once a completion menu is active, Up/Down cycle it instead
             // of history browsing -- the plan's own "or up and down
@@ -3450,5 +3506,55 @@ mod tests {
         assert_eq!(selection_columns_line(&range(2, 5), 11), (2, 6));
         let linewise = motion::MotionRange { shape: motion::MotionShape::Linewise, from: (0, 0), to: (0, 0) };
         assert_eq!(selection_columns_line(&linewise, 11), (0, 11));
+    }
+
+    fn abbrs(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs.iter().map(|(n, e)| (n.to_string(), e.to_string())).collect()
+    }
+
+    #[test]
+    fn expand_abbr_at_cursor_replaces_a_known_command_position_word() {
+        let mut ed = make_editor("gco", 3);
+        let table = abbrs(&[("gco", "git checkout")]);
+        assert!(expand_abbr_at_cursor(&mut ed, &table));
+        assert_eq!(ed.as_string(), "git checkout");
+        assert_eq!(ed.cursor, "git checkout".len());
+    }
+
+    #[test]
+    fn expand_abbr_at_cursor_does_nothing_for_an_unknown_word() {
+        let mut ed = make_editor("nope", 4);
+        let table = abbrs(&[("gco", "git checkout")]);
+        assert!(!expand_abbr_at_cursor(&mut ed, &table));
+        assert_eq!(ed.as_string(), "nope");
+    }
+
+    #[test]
+    fn expand_abbr_at_cursor_does_nothing_in_argument_position() {
+        // "gco" here is the *argument* to "echo", not the command itself --
+        // fish's own default (`--position command`) leaves this alone, and
+        // so does this port (see expand_abbr_at_cursor's own doc comment).
+        let mut ed = make_editor("echo gco", 8);
+        let table = abbrs(&[("gco", "git checkout")]);
+        assert!(!expand_abbr_at_cursor(&mut ed, &table));
+        assert_eq!(ed.as_string(), "echo gco");
+    }
+
+    #[test]
+    fn expand_abbr_at_cursor_only_matches_the_word_ending_exactly_at_the_cursor() {
+        // Cursor sits right after "gc", not "gco" -- "gco" isn't the word
+        // at the cursor at all, so no expansion should fire even though
+        // "gco" appears later on the line.
+        let mut ed = make_editor("gco", 2);
+        let table = abbrs(&[("gco", "git checkout"), ("gc", "git commit")]);
+        assert!(expand_abbr_at_cursor(&mut ed, &table));
+        assert_eq!(ed.as_string(), "git commito");
+    }
+
+    #[test]
+    fn expand_abbr_at_cursor_is_a_noop_on_an_empty_table() {
+        let mut ed = make_editor("gco", 3);
+        assert!(!expand_abbr_at_cursor(&mut ed, &[]));
+        assert_eq!(ed.as_string(), "gco");
     }
 }
