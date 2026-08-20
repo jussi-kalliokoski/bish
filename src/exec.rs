@@ -1635,7 +1635,8 @@ impl Shell {
                 BishOptDefault::Bool => BishOptValue::Bool(false),
                 BishOptDefault::Str(s) => BishOptValue::Str(s.to_string()),
                 BishOptDefault::Color(s) => {
-                    BishOptValue::Color(crate::csscolor::parse(s).unwrap_or_else(|e| panic!("KNOWN_BISHOPTS: {name}: default color {s:?} doesn't parse: {e}")))
+                    let c = crate::csscolor::parse(s).unwrap_or_else(|e| panic!("KNOWN_BISHOPTS: {name}: default color {s:?} doesn't parse: {e}"));
+                    BishOptValue::Color(s.to_string(), c)
                 }
             },
         })
@@ -1653,10 +1654,12 @@ impl Shell {
     // so there's no single format that would fit every row.
     //
     // Get (`bishopt NAME`): a Bool option prints "on"/"off", a Str prints
-    // its own value, and a Color prints its canonical `#rrggbb`/
-    // `#rrggbbaa` hex form (see crate::csscolor::Rgba::to_hex) regardless
-    // of how it was originally spelled -- all exiting 0, the readable
-    // default. `--quiet`/`-q` (matching `shopt -q`'s own convention,
+    // its own value, and a Color prints back the exact text it was last
+    // `--set` to (or its registered default's own text, if never set) --
+    // not a re-serialization, so `--set accent cornflowerblue` reads back
+    // as "cornflowerblue", not "#6495ed" (BishOptValue::Color keeps that
+    // original text around for exactly this). All exit 0. `--quiet`/`-q`
+    // (matching `shopt -q`'s own convention,
     // which is what prompted this) suppresses that printing; for a Bool
     // its value becomes the exit status instead (0 = on, 1 = off), so a
     // script can test it directly (`bishopt -q NAME && ...`) without
@@ -1722,9 +1725,9 @@ impl Shell {
                     }
                     0
                 }
-                Some(BishOptValue::Color(c)) => {
+                Some(BishOptValue::Color(text, _)) => {
                     if !quiet {
-                        sh_println!(self, "{}", c.to_hex());
+                        sh_println!(self, "{text}");
                     }
                     0
                 }
@@ -1764,7 +1767,7 @@ impl Shell {
                 }
                 (Some(BishOptDefault::Color(_)), Some(v)) => match crate::csscolor::parse(v) {
                     Ok(c) => {
-                        self.bishopts.insert(name.to_string(), BishOptValue::Color(c));
+                        self.bishopts.insert(name.to_string(), BishOptValue::Color(v.to_string(), c));
                         0
                     }
                     Err(e) => {
@@ -7199,12 +7202,16 @@ enum BishOptDefault {
 }
 
 // A bishopt option's actual current value -- what `Shell::bishopts` maps
-// names to once they've been explicitly `--set`.
+// names to once they've been explicitly `--set`. Color keeps the
+// original source text alongside the parsed Rgba -- `bishopt get` prints
+// that text back verbatim (see run_bishopt's own doc comment), not a
+// re-serialization, so `--set accent cornflowerblue` reads back as
+// "cornflowerblue" rather than "#6495ed".
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum BishOptValue {
     Bool(bool),
     Str(String),
-    Color(crate::csscolor::Rgba),
+    Color(String, crate::csscolor::Rgba),
 }
 
 // bishopt's own known-option registry -- deliberately separate from (and
@@ -7542,14 +7549,24 @@ mod tests {
         assert_eq!(shell.run_bishopt(&strs(&["--unset", "accent"]), TEST_BISHOPTS), 0);
         assert_eq!(shell.bishopt_value(TEST_BISHOPTS, "verbose"), Some(BishOptValue::Bool(false)));
         assert_eq!(shell.bishopt_value(TEST_BISHOPTS, "greeting"), Some(BishOptValue::Str("hi".to_string())));
-        assert_eq!(shell.bishopt_value(TEST_BISHOPTS, "accent"), Some(BishOptValue::Color(crate::csscolor::parse("red").unwrap())));
+        assert_eq!(shell.bishopt_value(TEST_BISHOPTS, "accent"), Some(BishOptValue::Color("red".to_string(), crate::csscolor::Rgba::new(255, 0, 0, 255))));
     }
 
     #[test]
-    fn bishopt_get_on_a_color_prints_the_canonical_hex_form() {
+    fn bishopt_get_on_a_color_prints_the_original_text_not_a_re_serialization() {
         let mut shell = Shell::new();
-        assert_eq!(shell.bishopt_value(TEST_BISHOPTS, "accent"), Some(BishOptValue::Color(crate::csscolor::Rgba::new(255, 0, 0, 255))));
+        assert_eq!(shell.bishopt_value(TEST_BISHOPTS, "accent"), Some(BishOptValue::Color("red".to_string(), crate::csscolor::Rgba::new(255, 0, 0, 255))));
+
+        let buf = Rc::new(RefCell::new(String::new()));
+        shell.set_sink_capture(buf.clone());
         assert_eq!(shell.run_bishopt(&strs(&["accent"]), TEST_BISHOPTS), 0);
+        assert_eq!(buf.borrow().as_str(), "red\n", "must echo back the registered default's own text, not \"#ff0000\"");
+
+        buf.borrow_mut().clear();
+        shell.run_bishopt(&strs(&["--set", "accent", "cornflowerblue"]), TEST_BISHOPTS);
+        assert_eq!(shell.run_bishopt(&strs(&["accent"]), TEST_BISHOPTS), 0);
+        assert_eq!(buf.borrow().as_str(), "cornflowerblue\n", "must echo back what --set was actually given, not \"#6495ed\"");
+
         assert_eq!(shell.run_bishopt(&strs(&["-q", "accent"]), TEST_BISHOPTS), 0, "no boolean meaning, but must not error");
     }
 
@@ -7557,20 +7574,27 @@ mod tests {
     fn bishopt_set_accepts_any_valid_css_color_syntax_including_color_mix() {
         let mut shell = Shell::new();
         assert_eq!(shell.run_bishopt(&strs(&["--set", "accent", "#00ff00"]), TEST_BISHOPTS), 0);
-        assert_eq!(shell.bishopt_value(TEST_BISHOPTS, "accent"), Some(BishOptValue::Color(crate::csscolor::Rgba::new(0, 255, 0, 255))));
+        assert_eq!(shell.bishopt_value(TEST_BISHOPTS, "accent"), Some(BishOptValue::Color("#00ff00".to_string(), crate::csscolor::Rgba::new(0, 255, 0, 255))));
 
         assert_eq!(shell.run_bishopt(&strs(&["--set", "accent", "rgb(0 0 255)"]), TEST_BISHOPTS), 0);
-        assert_eq!(shell.bishopt_value(TEST_BISHOPTS, "accent"), Some(BishOptValue::Color(crate::csscolor::Rgba::new(0, 0, 255, 255))));
+        assert_eq!(shell.bishopt_value(TEST_BISHOPTS, "accent"), Some(BishOptValue::Color("rgb(0 0 255)".to_string(), crate::csscolor::Rgba::new(0, 0, 255, 255))));
 
         assert_eq!(shell.run_bishopt(&strs(&["--set", "accent", "color-mix(in srgb, red, blue)"]), TEST_BISHOPTS), 0);
-        assert_eq!(shell.bishopt_value(TEST_BISHOPTS, "accent"), Some(BishOptValue::Color(crate::csscolor::Rgba::new(128, 0, 128, 255))));
+        assert_eq!(
+            shell.bishopt_value(TEST_BISHOPTS, "accent"),
+            Some(BishOptValue::Color("color-mix(in srgb, red, blue)".to_string(), crate::csscolor::Rgba::new(128, 0, 128, 255)))
+        );
     }
 
     #[test]
     fn bishopt_set_rejects_an_invalid_color_and_does_not_mutate() {
         let mut shell = Shell::new();
         assert_eq!(shell.run_bishopt(&strs(&["--set", "accent", "not-a-color"]), TEST_BISHOPTS), 2);
-        assert_eq!(shell.bishopt_value(TEST_BISHOPTS, "accent"), Some(BishOptValue::Color(crate::csscolor::parse("red").unwrap())), "a rejected set must not overwrite the default");
+        assert_eq!(
+            shell.bishopt_value(TEST_BISHOPTS, "accent"),
+            Some(BishOptValue::Color("red".to_string(), crate::csscolor::Rgba::new(255, 0, 0, 255))),
+            "a rejected set must not overwrite the default"
+        );
     }
 
     #[test]

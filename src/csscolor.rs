@@ -26,7 +26,13 @@ impl Rgba {
     // Canonical text form: 6-digit hex when fully opaque (the common
     // case, and what most people mean by "a color"), 8-digit otherwise --
     // never 3/4-digit shorthand, so this is always round-trippable
-    // through `parse` without loss.
+    // through `parse` without loss. #[allow(dead_code)]: bishopt's own
+    // `get` deliberately echoes back the *original* text a color was set
+    // to rather than calling this (see exec.rs's BishOptValue::Color),
+    // but a resolved Rgba still needs a canonical serialization for
+    // whatever eventually actually *renders* a color (a prompt segment,
+    // truecolor escape codes, ...) -- this is that, kept ready for it.
+    #[allow(dead_code)]
     pub fn to_hex(self) -> String {
         if self.a == 255 {
             format!("#{:02x}{:02x}{:02x}", self.r, self.g, self.b)
