@@ -140,6 +140,24 @@ fn is_function_brace(real: &[&SpannedItem], lbrace_idx: usize) -> bool {
     }
 }
 
+// True for is_function_brace's own "no `()`" production (`function foo
+// {`) specifically -- i.e. real[lbrace_idx-1] is the function's Word and
+// real[lbrace_idx-2] is KwFunction directly, with no Subshell("") (empty
+// parens) in between. Used to decide whether normalizing to `NAME() {
+// ... }` (see Tok::KwFunction's own arm below, and the user's own
+// JS-style convention this whole rule follows) needs to synthesize `()`
+// or they're already there.
+fn function_brace_omits_parens(real: &[&SpannedItem], lbrace_idx: usize) -> bool {
+    let at = |off: usize| -> Option<&Tok> {
+        let idx = lbrace_idx.checked_sub(off)?;
+        match real.get(idx)? {
+            SpannedItem::Tok(t, _) => Some(t),
+            SpannedItem::Comment(_) => None,
+        }
+    };
+    matches!((at(1), at(2)), (Some(Tok::Word(..)), Some(Tok::KwFunction)))
+}
+
 fn indent(depth: usize) -> String {
     "\t".repeat(depth)
 }
@@ -154,6 +172,7 @@ fn describe(replacement: &str) -> String {
         " " => "expected a single space here".to_string(),
         "  " => "expected two spaces before this trailing comment".to_string(),
         "; " => "expected `;` joining this onto the previous line".to_string(),
+        "() " => "expected `()` before this function body's `{`".to_string(),
         s if s.starts_with("\n\n") => format!("expected exactly one blank line, then indentation of {} tab(s)", s.matches('\t').count()),
         s if s.starts_with('\n') => format!("expected a line break here, indented {} tab(s)", s.matches('\t').count()),
         _ => "this doesn't match bish tool format's expected layout".to_string(),
@@ -184,9 +203,18 @@ fn format_gaps(chars: &[char], real: &[&SpannedItem]) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
     let mut prev_end = 0usize;
     let mut forced_next: Option<String> = None;
+    // Set by Tok::KwFunction's own arm below when it's just pushed a
+    // dedicated fix deleting `function` -- consumed (same take()-once
+    // pattern as forced_next/prev_forced) by the very next iteration (the
+    // function's own name) to skip its generic gap diagnostic entirely,
+    // since that gap has already been folded into the deletion fix. See
+    // that arm's own doc comment for why letting both run risks an
+    // overlapping-fix conflict.
+    let mut suppress_next_gap = false;
 
     for i in 0..=real.len() {
         let prev_forced = forced_next.take();
+        let this_suppressed = std::mem::replace(&mut suppress_next_gap, false);
         let item = real.get(i).copied();
         let this_start = item.map(|it| span_of(it).start).unwrap_or(chars.len());
 
@@ -296,11 +324,71 @@ fn format_gaps(chars: &[char], real: &[&SpannedItem]) -> Vec<Diagnostic> {
                 Tok::LBrace => {
                     let is_func = is_function_brace(real, i);
                     if is_func && !comment_precedes {
-                        leading_override = Some(" ".to_string());
+                        // `function foo {` (no `()`) -- the Tok::KwFunction
+                        // arm below strips `function` itself and suppresses
+                        // its own gap check so there's nothing else to
+                        // collide with here; synthesizing `()` right in
+                        // this same gap-fix (rather than as its own,
+                        // separately-positioned fix) is what keeps this a
+                        // single, unambiguous edit at this position.
+                        let parens = if function_brace_omits_parens(real, i) { "()" } else { "" };
+                        leading_override = Some(format!("{parens} "));
                     }
                     let hd = current_depth(&stack);
                     stack.push(Block { kind: BlockKind::Brace, header_depth: hd, awaiting: None });
                     forced_next = Some(newline_at(current_depth(&stack)));
+                }
+                // `function foo { ... }` / `function foo() { ... }` ->
+                // `foo() { ... }`, matching real bash's/JS's own
+                // parenthesized style rather than the `function` keyword
+                // spelling -- the user's own convention for this rule.
+                // Only touches the brace-bodied shape (checked all the
+                // way through to a genuine LBrace, not just "the next
+                // token or two look right"): `function foo` followed by
+                // anything else (a bare command, `if`/`case`/... as the
+                // body -- valid but rare bash) isn't something dropping
+                // the keyword alone would correctly rewrite, so it's left
+                // untouched entirely, same "don't touch what isn't
+                // squarely in scope" tolerance as the heredoc-body/
+                // subshell-interior cases in this module's own doc
+                // comment.
+                //
+                // Deletes exactly `function` plus whatever gap follows it
+                // up to the function's own name -- never the gap *before*
+                // `function` itself (still resolved completely normally
+                // for this same iteration, by the code below, since
+                // deleting the keyword doesn't change how the statement
+                // it belongs to should be indented). Sets suppress_next_gap
+                // so the *next* iteration (the name) skips its own
+                // generic gap diagnostic entirely -- that gap has already
+                // been folded into this single deletion fix, and letting
+                // both run would risk two overlapping fixes fighting over
+                // the same span (see apply_fixes' own overlap handling in
+                // tool.rs) whenever the source had unusual spacing right
+                // after `function`.
+                Tok::KwFunction => {
+                    let at = |off: usize| -> Option<&Tok> {
+                        match real.get(i + off)? {
+                            SpannedItem::Tok(t, _) => Some(t),
+                            SpannedItem::Comment(_) => None,
+                        }
+                    };
+                    if matches!(at(1), Some(Tok::Word(..))) {
+                        let brace_off = if matches!(at(2), Some(Tok::Subshell(s)) if s.is_empty()) { 3 } else { 2 };
+                        if matches!(at(brace_off), Some(Tok::LBrace)) {
+                            let word_start = span_of(real[i + 1]).start;
+                            let kw_span = span_of(item.unwrap());
+                            diagnostics.push(Diagnostic {
+                                start: kw_span.start,
+                                end: word_start,
+                                severity: Severity::Warning,
+                                code: "format",
+                                message: "expected no `function` keyword here -- use `NAME() { ... }`".to_string(),
+                                fix: Some(Fix { start: kw_span.start, end: word_start, replacement: String::new() }),
+                            });
+                            suppress_next_gap = true;
+                        }
+                    }
                 }
                 Tok::KwIf => {
                     stack.push(Block { kind: BlockKind::If, header_depth: current_depth(&stack), awaiting: Some(Joiner::Then) });
@@ -318,7 +406,7 @@ fn format_gaps(chars: &[char], real: &[&SpannedItem]) -> Vec<Diagnostic> {
         // ---- Resolve the gap text for [prev_end, this_start) ----
         let actual: String = chars[prev_end..this_start].iter().collect();
         let safe_to_format = actual.chars().all(|c| c.is_whitespace() || c == ';');
-        if safe_to_format {
+        if safe_to_format && !this_suppressed {
             let intended = if item.is_none() {
                 // EOF: exactly one trailing newline.
                 "\n".to_string()
@@ -460,8 +548,47 @@ mod tests {
     #[test]
     fn function_def_both_spellings_join_the_brace() {
         assert_eq!(format_text("foo()\n{\nx\n}\n"), "foo() {\n\tx\n}\n");
-        assert_eq!(format_text("function foo\n{\nx\n}\n"), "function foo {\n\tx\n}\n");
-        assert_eq!(format_text("function foo()\n{\nx\n}\n"), "function foo() {\n\tx\n}\n");
+    }
+
+    // JS-style `NAME() { ... }` is the one canonical spelling this
+    // formatter enforces -- both of bash's other productions normalize
+    // to it, dropping `function` and synthesizing `()` when it's absent.
+    #[test]
+    fn function_keyword_spelling_without_parens_normalizes_to_name_parens_brace() {
+        assert_eq!(format_text("function foo\n{\nx\n}\n"), "foo() {\n\tx\n}\n");
+    }
+
+    #[test]
+    fn function_keyword_spelling_with_parens_normalizes_to_name_parens_brace() {
+        assert_eq!(format_text("function foo()\n{\nx\n}\n"), "foo() {\n\tx\n}\n");
+    }
+
+    #[test]
+    fn already_canonical_function_def_produces_no_diagnostics() {
+        assert!(BashFormatter.check("foo() {\n\tx\n}\n").unwrap().is_empty());
+    }
+
+    #[test]
+    fn function_keyword_spelling_normalizes_regardless_of_surrounding_whitespace() {
+        // Note: a newline right after `function` (before its own name)
+        // isn't valid bish syntax at all -- parse_function_kw doesn't
+        // skip terminators there -- so only extra *spaces* are exercised.
+        assert_eq!(format_text("function   foo   {\nx\n}\n"), "foo() {\n\tx\n}\n");
+    }
+
+    #[test]
+    fn a_function_keyword_def_whose_body_is_not_a_brace_group_is_left_untouched() {
+        // Out of scope: normalizing this would require wrapping the body
+        // in `{ ... }` too, a different (and riskier) transformation.
+        let src = "function foo echo hi\n";
+        assert!(BashFormatter.check(src).unwrap().is_empty());
+    }
+
+    #[test]
+    fn multiple_function_defs_and_ordinary_brace_groups_all_normalize_independently() {
+        let src = "function a\n{\nx\n}\nb()\n{\ny\n}\nfunction c()\n{\nz\n}\n{\nplain\n}\n";
+        let expected = "a() {\n\tx\n}\nb() {\n\ty\n}\nc() {\n\tz\n}\n{\n\tplain\n}\n";
+        assert_eq!(format_text(src), expected);
     }
 
     #[test]
