@@ -1173,6 +1173,13 @@ fn run_fg_job_frame(
     let mut tab_bar = tab_bar_line(sessions, windows, *current_window);
     let mut layout = snapshot_window(&windows[*current_window], sessions, *term_rows, *term_cols);
     let cw = *current_window;
+    // Persists across every drive_fg_job call in this loop (reset to None
+    // -- forcing the next redraw back to a full repaint -- only on
+    // FgOutcome::Resized below, alongside layout/tab_bar's own
+    // re-snapshot) so a quiet job's later output keeps diffing against
+    // what's actually already on screen instead of re-clearing every
+    // time. See render_compositor_frame_diff's own doc comment.
+    let mut frame_cache: Option<TerminalFrame> = None;
     // Loops rather than returning straight after one call: a qualifying
     // click that turns out to be for the job itself, not bish's own UI
     // chrome (FgOutcome::MouseClick's own doc comment), or a resize
@@ -1192,10 +1199,11 @@ fn run_fg_job_frame(
         // the FgOutcome::Resized arm below re-snapshots and loops back
         // around, at most one drive_fg_job iteration later.
         let redraw_rows = *term_rows;
+        let redraw_cols = *term_cols;
         let outcome = drive_fg_job(
             &mut job,
             &focused_screen,
-            || render_compositor_frame(&layout, &tab_bar, redraw_rows),
+            || render_compositor_frame_diff(&layout, &tab_bar, redraw_rows, redraw_cols, &mut frame_cache),
             || service_background_jobs(sessions, windows, job_frames, cw, term_rows, term_cols, *sinks_are_grid),
         );
         match outcome {
@@ -1324,6 +1332,17 @@ fn run_fg_job_frame(
             // (TIOCSWINSZ delivers SIGWINCH to its own process group).
             layout = snapshot_window(&windows[*current_window], sessions, *term_rows, *term_cols);
             tab_bar = tab_bar_line(sessions, windows, *current_window);
+            // The geometry frame_cache's own cells describe is no longer
+            // even the right shape -- render_compositor_frame_diff's own
+            // stale check would catch a rows/cols mismatch anyway, but
+            // resetting explicitly here is what forces the *next* redraw
+            // back to a full, self-healing repaint (matching
+            // poll_and_apply_resize's own direct compositor_redraw call,
+            // which already painted a full frame with the new geometry
+            // via a completely different path this cache knows nothing
+            // about) rather than potentially diffing against content from
+            // before the resize.
+            frame_cache = None;
         }
         }
     }
@@ -3197,6 +3216,173 @@ fn render_compositor_frame(layout: &CompositorLayout, tab_bar: &str, term_rows: 
 
     print!("{}", out);
     let _ = io::stdout().flush();
+}
+
+// A cell-by-cell snapshot of exactly what's currently painted on the real
+// terminal's compositor content area -- every pane's own screen content,
+// flattened into one term_cols-wide grid, plus the tab bar text and
+// cursor position/visibility. What render_compositor_frame_diff diffs a
+// freshly-resolved CompositorLayout against, so only genuinely-changed
+// cells get repainted -- unlike render_compositor_frame's own
+// unconditional `\x1b[2J` clear+repaint. Deliberately does *not* capture
+// divider glyphs (see render_compositor_frame_diff's own doc comment on
+// why that's fine): only ever compared against another TerminalFrame
+// built the same way, so a divider cell always reads as
+// vt100::Cell::default() on both sides and never shows up as "changed."
+struct TerminalFrame {
+    rows: usize,
+    cols: usize,
+    cells: Vec<vt100::Cell>,
+    tab_bar: String,
+    cursor: (usize, usize),
+    cursor_visible: bool,
+}
+
+impl TerminalFrame {
+    // Flattens every pane's own screen content into one rows*cols grid --
+    // the same data render_compositor_frame's own per-pane render_row
+    // loop paints, just captured as data instead of escape codes.
+    fn capture(layout: &CompositorLayout, tab_bar: &str, rows: usize, cols: usize) -> TerminalFrame {
+        let mut cells = vec![vt100::Cell::default(); rows * cols];
+        for pane in &layout.panes {
+            let screen = pane.screen.borrow();
+            for r in 0..pane.rect.rows {
+                for c in 0..pane.rect.cols {
+                    let (row, col) = (pane.rect.row + r, pane.rect.col + c);
+                    if row < rows && col < cols {
+                        cells[row * cols + col] = screen.cell(r, c);
+                    }
+                }
+            }
+        }
+        let focused = layout.panes.iter().find(|p| p.focused).expect("exactly one pane is always focused");
+        let screen = focused.screen.borrow();
+        let (cur_row, cur_col) = screen.cursor();
+        TerminalFrame {
+            rows,
+            cols,
+            cells,
+            tab_bar: tab_bar.to_string(),
+            cursor: (focused.rect.row + cur_row, focused.rect.col + cur_col),
+            cursor_visible: screen.cursor_visible,
+        }
+    }
+}
+
+// drive_fg_job's own hot redraw path (run_fg_job_frame's own redraw
+// closure) -- unlike compositor_redraw/render_compositor_frame (every
+// *discrete*-event redraw: window/pane switches, resizes, command-mode
+// overlays, ...), this fires on every single batch of a foreground job's
+// own pty output, often many times a second for a full-screen program (a
+// status line, spinner, or cursor-move tick with no actual visible
+// change). Always clearing and repainting the whole screen for that --
+// what render_compositor_frame does -- is exactly what produced the
+// reported flash (two Claude Code sessions, each in its own tab, each
+// streaming near-continuous low-level output while merely idling):
+// this instead diffs against `cache` (the previous call's own painted
+// content, see TerminalFrame) and only touches cells that actually
+// changed.
+//
+// `*cache == None` means "start fresh": either the very first redraw for
+// this job, or the caller has explicitly invalidated it (run_fg_job_frame
+// does this on FgOutcome::Resized, since the geometry a stale cache
+// describes is no longer even the right shape) -- falls back to
+// render_compositor_frame's own full clear+repaint for the same
+// self-healing property that function's own doc comment describes
+// (anything that wrote to the real terminal directly in between, like
+// editor.rs's Ctrl-L, self-heals on the next full repaint), then seeds
+// `cache` from the result so the *next* call can diff.
+//
+// Deliberately scoped to exactly this one redraw path: every other
+// redraw in this codebase (compositor_redraw's own callers -- window/
+// pane switches, resizes, command-mode overlays, the diagnostics pane,
+// ...) stays a full repaint, unchanged. Those are infrequent discrete
+// events, not a continuous loop, so there's nothing to gain and no
+// reason to widen this cache's invalidation surface to cover every other
+// function that ever writes to the real terminal directly
+// (render_diagnostics_list_frame, render_normal_mode_frame, ...) -- this
+// cache lives and dies entirely within one run_fg_job_frame call, and is
+// never read by (or invalidated on behalf of) anything else.
+fn render_compositor_frame_diff(layout: &CompositorLayout, tab_bar: &str, term_rows: usize, term_cols: usize, cache: &mut Option<TerminalFrame>) {
+    let rows = content_rows(term_rows);
+    let stale = match cache {
+        Some(prev) => prev.rows != rows || prev.cols != term_cols,
+        None => true,
+    };
+    if stale {
+        render_compositor_frame(layout, tab_bar, term_rows);
+        *cache = Some(TerminalFrame::capture(layout, tab_bar, rows, term_cols));
+        return;
+    }
+    let prev = cache.as_ref().unwrap();
+    let new_frame = TerminalFrame::capture(layout, tab_bar, rows, term_cols);
+    let out = diff_frames(prev, &new_frame, term_rows, term_cols);
+    if !out.is_empty() {
+        print!("{}", out);
+        let _ = io::stdout().flush();
+    }
+    *cache = Some(new_frame);
+}
+
+// The pure half of render_compositor_frame_diff: exactly the escape-code
+// text to write to bring the real terminal from `prev`'s own painted
+// state to `new`'s, assuming both describe the *same* `rows`/`term_cols`
+// shape (render_compositor_frame_diff's own stale check is what
+// guarantees that before this is ever called). Split out from the I/O
+// wrapper purely so this -- the actual diffing decision -- is unit
+// testable without a real terminal, matching this file's own existing
+// split between logic (compute_regions/split_sizes/render_row, all pure)
+// and thin print!-wrapping callers.
+fn diff_frames(prev: &TerminalFrame, new: &TerminalFrame, term_rows: usize, term_cols: usize) -> String {
+    let mut out = String::new();
+
+    for row in 0..new.rows {
+        let mut col = 0;
+        while col < term_cols {
+            let idx = row * term_cols + col;
+            if new.cells[idx] == prev.cells[idx] {
+                col += 1;
+                continue;
+            }
+            // Extend the dirty run while cells keep differing, then paint
+            // the whole run with one cursor move -- same style-coalescing
+            // render_row itself uses, just scoped to this sub-span rather
+            // than the whole row (a span can cross pane boundaries in a
+            // side-by-side split; the flattened grid already makes that
+            // transparent here).
+            let run_start = col;
+            while col < term_cols && new.cells[row * term_cols + col] != prev.cells[row * term_cols + col] {
+                col += 1;
+            }
+            out.push_str(&format!("\x1b[{};{}H", row + 1, run_start + 1));
+            let mut last_style: Option<(vt100::Color, vt100::Color, vt100::CellAttrs)> = None;
+            for c in run_start..col {
+                let cell = new.cells[row * term_cols + c];
+                let key = (cell.fg, cell.bg, cell.attrs);
+                if last_style != Some(key) {
+                    out.push_str(&vt100::sgr_codes(cell.fg, cell.bg, cell.attrs));
+                    last_style = Some(key);
+                }
+                out.push(cell.ch);
+            }
+        }
+    }
+
+    if new.tab_bar != prev.tab_bar {
+        out.push_str(&format!("\x1b[{};1H\x1b[K", term_rows));
+        out.push_str(&new.tab_bar);
+    }
+
+    // The cursor always needs re-asserting after painting anything above
+    // (each write already moved it), and whenever its own logical
+    // position/visibility changed even with zero cell writes (e.g. a job
+    // just moved its cursor without changing any visible glyph).
+    if !out.is_empty() || new.cursor != prev.cursor || new.cursor_visible != prev.cursor_visible {
+        out.push_str(&format!("\x1b[{};{}H", new.cursor.0 + 1, new.cursor.1 + 1));
+        out.push_str(if new.cursor_visible { "\x1b[?25h" } else { "\x1b[?25l" });
+    }
+
+    out
 }
 
 // Draws a plain single-line divider (box-drawing characters, no color)
@@ -6184,5 +6370,125 @@ mod fg_click_tests {
         // own doc comment).
         let ev = decode_fg_click(b"\x1b[<0;15;24M\x1b[<0;15;24m").unwrap();
         assert_eq!((ev.button, ev.col, ev.row, ev.pressed), (0, 15, 24, true));
+    }
+}
+
+#[cfg(test)]
+mod compositor_diff_tests {
+    use super::*;
+
+    // A blank rows*cols frame with plain-space cells everywhere, cursor
+    // parked at (0, 0) and visible -- the common starting point every
+    // test below mutates one piece of at a time.
+    fn blank(rows: usize, cols: usize) -> TerminalFrame {
+        TerminalFrame { rows, cols, cells: vec![vt100::Cell::default(); rows * cols], tab_bar: String::new(), cursor: (0, 0), cursor_visible: true }
+    }
+
+    fn set(frame: &mut TerminalFrame, row: usize, col: usize, ch: char) {
+        frame.cells[row * frame.cols + col].ch = ch;
+    }
+
+    #[test]
+    fn identical_frames_produce_no_output_at_all() {
+        let prev = blank(5, 10);
+        let new = blank(5, 10);
+        assert_eq!(diff_frames(&prev, &new, 5, 10), "");
+    }
+
+    #[test]
+    fn a_single_changed_cell_repaints_only_that_cell() {
+        let prev = blank(5, 10);
+        let mut new = blank(5, 10);
+        set(&mut new, 2, 3, 'x');
+        let out = diff_frames(&prev, &new, 5, 10);
+        // Row 2, col 3 (1-indexed: row 3, col 4), default SGR, the one
+        // changed glyph, then the cursor re-assertion (still (0,0) here,
+        // but always re-sent once anything was painted).
+        assert!(out.starts_with("\x1b[3;4H"), "{out:?}");
+        assert!(out.contains('x'), "{out:?}");
+        assert!(out.ends_with("\x1b[1;1H\x1b[?25h"), "{out:?}");
+    }
+
+    #[test]
+    fn a_contiguous_run_of_changed_cells_gets_one_cursor_move() {
+        let prev = blank(3, 10);
+        let mut new = blank(3, 10);
+        set(&mut new, 1, 2, 'a');
+        set(&mut new, 1, 3, 'b');
+        set(&mut new, 1, 4, 'c');
+        let out = diff_frames(&prev, &new, 3, 10);
+        // Exactly one cursor-position escape for the whole run (row 1
+        // col 2 => 1-indexed "2;3"), not one per changed cell.
+        assert_eq!(out.matches("\x1b[2;3H").count(), 1, "{out:?}");
+        assert!(out.contains("abc"), "{out:?}");
+    }
+
+    #[test]
+    fn two_separate_runs_on_the_same_row_get_two_cursor_moves() {
+        let prev = blank(3, 10);
+        let mut new = blank(3, 10);
+        set(&mut new, 0, 1, 'a');
+        set(&mut new, 0, 7, 'b');
+        let out = diff_frames(&prev, &new, 3, 10);
+        assert!(out.contains("\x1b[1;2H"), "{out:?}");
+        assert!(out.contains("\x1b[1;8H"), "{out:?}");
+    }
+
+    #[test]
+    fn a_changed_style_with_the_same_glyph_still_repaints() {
+        let prev = blank(2, 5);
+        let mut new = blank(2, 5);
+        new.cells[0].attrs.bold = true;
+        let out = diff_frames(&prev, &new, 2, 5);
+        assert!(out.contains("\x1b[1;1H"), "{out:?}");
+        assert!(out.contains(&vt100::sgr_codes(vt100::Color::Default, vt100::Color::Default, new.cells[0].attrs)), "{out:?}");
+    }
+
+    #[test]
+    fn tab_bar_change_alone_rewrites_only_the_tab_bar_row() {
+        let prev = blank(5, 20);
+        let mut new = blank(5, 20);
+        new.tab_bar = "[1] bish".to_string();
+        let out = diff_frames(&prev, &new, 6, 20);
+        // term_rows = 6 -> tab bar pinned to row 6, followed by the
+        // unchanged cursor's own re-assertion (still required once
+        // anything at all was painted).
+        assert_eq!(out, "\x1b[6;1H\x1b[K[1] bish\x1b[1;1H\x1b[?25h");
+    }
+
+    #[test]
+    fn cursor_move_alone_with_no_cell_or_tab_bar_change_still_repositions() {
+        let prev = blank(5, 20);
+        let mut new = blank(5, 20);
+        new.cursor = (2, 4);
+        let out = diff_frames(&prev, &new, 5, 20);
+        assert_eq!(out, "\x1b[3;5H\x1b[?25h");
+    }
+
+    #[test]
+    fn cursor_visibility_change_alone_still_repositions() {
+        let prev = blank(5, 20);
+        let mut new = blank(5, 20);
+        new.cursor_visible = false;
+        let out = diff_frames(&prev, &new, 5, 20);
+        assert_eq!(out, "\x1b[1;1H\x1b[?25l");
+    }
+
+    #[test]
+    fn a_run_can_cross_what_would_be_a_pane_boundary_in_the_flattened_grid() {
+        // diff_frames itself has no notion of panes at all -- it only
+        // ever sees the flattened per-cell grid TerminalFrame::capture
+        // already produced, so a dirty run spanning what were two
+        // side-by-side panes' columns is indistinguishable from an
+        // ordinary single-pane run. Exercises that no pane-boundary
+        // assumption ever crept into the run-extension loop.
+        let prev = blank(2, 10);
+        let mut new = blank(2, 10);
+        for col in 3..7 {
+            set(&mut new, 0, col, 'X');
+        }
+        let out = diff_frames(&prev, &new, 2, 10);
+        assert_eq!(out.matches("\x1b[1;4H").count(), 1, "{out:?}");
+        assert!(out.contains("XXXX"), "{out:?}");
     }
 }
