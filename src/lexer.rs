@@ -207,6 +207,44 @@ fn keyword(s: &str) -> Option<Tok> {
     })
 }
 
+// Reverses `keyword` above -- the literal source text a keyword token
+// stands for. This lexer has no notion of "command position": any bare
+// word exactly matching one of these names always becomes its keyword
+// token regardless of where it appears (see the tokenize() call site
+// above), so `echo function` or `case $x in if)` would otherwise fail to
+// parse at all, since "function"/"if" show up as Tok::KwFunction/Tok::KwIf
+// instead of an ordinary Tok::Word there. The parser uses this everywhere
+// it's already past the point where a bare word could legitimately start
+// a *new* command (mid-argument-list, a for/select wordlist, a case
+// pattern/subject, inside `[[ ]]`, a redirect target, ...) to fall back to
+// treating an accidentally-keyword-shaped word as the plain literal it
+// was always meant to be -- confirmed against real bash, which allows
+// exactly this (`for x in if while do done; do echo $x; done` prints each
+// of those words verbatim).
+pub(crate) fn keyword_text(tok: &Tok) -> Option<&'static str> {
+    Some(match tok {
+        Tok::KwIf => "if",
+        Tok::KwThen => "then",
+        Tok::KwElif => "elif",
+        Tok::KwElse => "else",
+        Tok::KwFi => "fi",
+        Tok::KwWhile => "while",
+        Tok::KwUntil => "until",
+        Tok::KwDo => "do",
+        Tok::KwDone => "done",
+        Tok::KwFor => "for",
+        Tok::KwSelect => "select",
+        Tok::KwCoproc => "coproc",
+        Tok::KwIn => "in",
+        Tok::KwCase => "case",
+        Tok::KwEsac => "esac",
+        Tok::KwFunction => "function",
+        Tok::KwLBracket2 => "[[",
+        Tok::KwRBracket2 => "]]",
+        _ => return None,
+    })
+}
+
 pub struct Lexer<'a> {
     chars: std::iter::Peekable<std::str::Chars<'a>>,
     // (index into `toks`, delimiter, strip-leading-tabs, expand-in-body) for

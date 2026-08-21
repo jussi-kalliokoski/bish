@@ -8396,4 +8396,80 @@ mod tests {
     // trailing space from the appended empty previous-word arg), and
     // `compgen -F myfunc -- xyz` (myfunc: `COMPREPLY=(foo bar "$2")`)
     // printed "foo\nbar\nxyz", both matching real bash exactly.
+
+    // Regression tests for a real, pre-existing bug this session's own
+    // compgen/complete work surfaced: lexer.rs's `keyword()` has no notion
+    // of command position, so a bare word exactly matching a reserved word
+    // (if/then/.../function/[[/]]) always became its keyword token
+    // regardless of where it appeared -- `echo function` failed to parse
+    // at all ("expected function name, got None"), since the leftover
+    // Tok::KwFunction got reinterpreted as starting a *new* function
+    // definition once parse_simple_command's own word-collecting loop
+    // stopped at it. Fixed via keyword_text (lexer.rs) reversing that
+    // mapping wherever the parser is already past the point where a bare
+    // word could legitimately start a new command.
+    #[test]
+    fn a_keyword_shaped_word_in_argument_position_is_an_ordinary_argument() {
+        let mut shell = Shell::new();
+        let buf = capture_output(&mut shell);
+        shell.run_source_here("echo function", "<test>");
+        assert_eq!(buf.borrow().as_str(), "function\n");
+        assert_eq!(shell.last_status, 0);
+
+        buf.borrow_mut().clear();
+        shell.run_source_here("echo if while case", "<test>");
+        assert_eq!(buf.borrow().as_str(), "if while case\n");
+    }
+
+    #[test]
+    fn a_for_loops_own_wordlist_accepts_keyword_shaped_items_including_do_and_done() {
+        // The plan's own worked example against real bash: even "do"/
+        // "done" are literal wordlist items here, since the wordlist only
+        // ends at the `;` right before the *real* `do` that opens the
+        // loop body.
+        let mut shell = Shell::new();
+        let buf = capture_output(&mut shell);
+        shell.run_source_here(r#"for x in if while do done; do echo "[$x]"; done"#, "<test>");
+        assert_eq!(buf.borrow().as_str(), "[if]\n[while]\n[do]\n[done]\n");
+    }
+
+    #[test]
+    fn a_case_pattern_and_subject_can_be_keyword_shaped_and_still_match() {
+        let mut shell = Shell::new();
+        let buf = capture_output(&mut shell);
+        shell.run_source_here(r#"case "if" in if) echo matched;; *) echo nomatch;; esac"#, "<test>");
+        assert_eq!(buf.borrow().as_str(), "matched\n");
+    }
+
+    #[test]
+    fn a_double_bracket_test_operand_can_be_keyword_shaped() {
+        let mut shell = Shell::new();
+        let buf = capture_output(&mut shell);
+        shell.run_source_here(r#"x=function; [[ $x == function ]] && echo yes"#, "<test>");
+        assert_eq!(buf.borrow().as_str(), "yes\n");
+    }
+
+    #[test]
+    fn an_assignment_prefix_suppresses_reserved_word_status_for_the_next_word() {
+        // Confirmed against real bash: `FOO=bar if` really does run a
+        // command literally named "if" (fails with "command not found"),
+        // it does not open an if-block. Exit 127 either way (command not
+        // found) is enough to confirm this parsed as Command::Simple, not
+        // as an (invalid, dangling) Command::If.
+        let mut shell = Shell::new();
+        shell.run_source_here("FOO=bar if", "<test>");
+        assert_eq!(shell.last_status, 127);
+    }
+
+    #[test]
+    fn a_genuinely_bare_unmatched_marker_keyword_is_still_a_syntax_error() {
+        // The one case the fix must NOT paper over: a `then`/`do`/`in`/...
+        // with no assignment prefix and no preceding word at all (i.e.
+        // truly the first token of a new simple command) is a syntax
+        // error in real bash (`true; then echo hi` -> "unexpected token
+        // `then'"), not a command literally named "then" to look up.
+        let mut shell = Shell::new();
+        let result = shell.run_source_here("true; then echo hi", "<test>");
+        assert!(matches!(result, ExecResult::Status(2)), "{result:?}");
+    }
 }

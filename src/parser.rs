@@ -1,4 +1,4 @@
-use crate::lexer::{Chunk, Lexer, Tok};
+use crate::lexer::{keyword_text, Chunk, Lexer, Tok};
 
 #[derive(Debug, Clone)]
 pub struct Word {
@@ -380,6 +380,15 @@ impl Parser {
                     let w = self.expect_word()?;
                     atoms.push(TestAtom::Word(w));
                 }
+                // A keyword-shaped operand (e.g. `[[ $x == function ]]`) --
+                // KwRBracket2 already has its own arm above, so anything
+                // else keyword_text recognizes here is unambiguously an
+                // ordinary operand word, not the test's own closing `]]`.
+                // See expect_word's own doc comment.
+                Some(tok) if keyword_text(tok).is_some() => {
+                    let w = self.expect_word()?;
+                    atoms.push(TestAtom::Word(w));
+                }
                 // `<`/`>` inside `[[ ]]` are bash's lexicographic string
                 // comparison operators, not redirects -- but the lexer
                 // still tokenizes them as Tok::RedirIn/RedirOut
@@ -512,12 +521,7 @@ impl Parser {
         let mut words = None;
         if matches!(self.peek(), Some(Tok::KwIn)) {
             self.advance();
-            let mut list = Vec::new();
-            while let Some(Tok::Word(_, _)) = self.peek() {
-                if let Some(Tok::Word(chunks, globbable)) = self.advance() {
-                    list.push(Word { chunks, globbable });
-                }
-            }
+            let list = self.parse_word_list();
             if matches!(self.peek(), Some(Tok::Semi) | Some(Tok::Newline)) {
                 self.advance();
             }
@@ -548,12 +552,7 @@ impl Parser {
         let mut words = None;
         if matches!(self.peek(), Some(Tok::KwIn)) {
             self.advance();
-            let mut list = Vec::new();
-            while let Some(Tok::Word(_, _)) = self.peek() {
-                if let Some(Tok::Word(chunks, globbable)) = self.advance() {
-                    list.push(Word { chunks, globbable });
-                }
-            }
+            let list = self.parse_word_list();
             if matches!(self.peek(), Some(Tok::Semi) | Some(Tok::Newline)) {
                 self.advance();
             }
@@ -565,6 +564,35 @@ impl Parser {
         self.expect(Tok::KwDone)?;
         let redirects = self.parse_trailing_redirects()?;
         Ok(Command::Select { var, words, body, redirects })
+    }
+
+    // `for`/`select`'s shared `in word...` wordlist -- keyword-shaped
+    // items included unconditionally (no "first item" gating the way
+    // parse_simple_command's own fix needs): confirmed against real bash,
+    // `for x in if while do done; do echo "[$x]"; done` prints each of
+    // those words verbatim, since none of them are in a position that
+    // could plausibly open a *new* construct -- the wordlist only ever
+    // ends at a `;`/newline (checked by the caller right after this
+    // returns), never by this loop itself recognizing a keyword. See
+    // keyword_text's own doc comment.
+    fn parse_word_list(&mut self) -> Vec<Word> {
+        let mut list = Vec::new();
+        loop {
+            match self.peek() {
+                Some(Tok::Word(_, _)) => {
+                    if let Some(Tok::Word(chunks, globbable)) = self.advance() {
+                        list.push(Word { chunks, globbable });
+                    }
+                }
+                Some(tok) if keyword_text(tok).is_some() => {
+                    let s = keyword_text(tok).unwrap().to_string();
+                    self.advance();
+                    list.push(Word { chunks: vec![Chunk::Str(s)], globbable: true });
+                }
+                _ => break,
+            }
+        }
+        list
     }
 
     // `coproc [NAME] command`. Only recognizes NAME when the token right
@@ -760,6 +788,35 @@ impl Parser {
                     }
                     words.push(w);
                 }
+                // A keyword-shaped argument word (e.g. `echo function`), or
+                // one right after a leading assignment prefix (`FOO=bar
+                // if` -- confirmed against real bash: this really does run
+                // a command literally named "if", not open an if-block;
+                // an assignment prefix suppresses reserved-word status for
+                // the word after it) -- gated on "this isn't the very
+                // first token of the whole simple command" so a genuinely
+                // bare, unexpected `then`/`do`/`in`/... (no assignment, no
+                // preceding word at all) still falls through to the
+                // default arm below and errors, matching real bash's own
+                // "unexpected token" syntax error there instead of
+                // silently accepting it as a command named "then". By
+                // construction this is never itself a NAME=value/
+                // NAME[i]=value assignment (none of these fixed literals
+                // contain '='), so there's no need to run it through
+                // word_as_assignment/word_as_index_assignment at all --
+                // just ends the assignment phase (if still active) and
+                // becomes an ordinary argument word. See expect_word's own
+                // doc comment on why the lexer produces a keyword token
+                // here in the first place.
+                Some(tok)
+                    if keyword_text(tok).is_some()
+                        && (!assigns.is_empty() || !array_assigns.is_empty() || !index_assigns.is_empty() || !words.is_empty()) =>
+                {
+                    let s = keyword_text(tok).unwrap().to_string();
+                    self.advance();
+                    in_assign_phase = false;
+                    words.push(Word { chunks: vec![Chunk::Str(s)], globbable: true });
+                }
                 Some(Tok::RedirOut { append }) => {
                     let append = *append;
                     self.advance();
@@ -842,10 +899,21 @@ impl Parser {
         Ok(SimpleCommand { assigns, array_assigns, index_assigns, words, redirects })
     }
 
+    // Also accepts a keyword token, converting it back into the literal
+    // word it stands for (see keyword_text's own doc comment) -- every
+    // call site here is already past the point where a bare word could
+    // legitimately start a new command (a redirect target, a case
+    // pattern/subject, an operand inside `[[ ]]`, ...), so a keyword token
+    // showing up here unambiguously means the lexer over-eagerly
+    // keyword-matched an ordinary literal.
     fn expect_word(&mut self) -> Result<Word, String> {
         match self.advance() {
             Some(Tok::Word(chunks, globbable)) => Ok(Word { chunks, globbable }),
-            other => Err(format!("expected word, got {:?}", other)),
+            Some(tok) => match keyword_text(&tok) {
+                Some(s) => Ok(Word { chunks: vec![Chunk::Str(s.to_string())], globbable: true }),
+                None => Err(format!("expected word, got {:?}", Some(tok))),
+            },
+            None => Err("expected word, got None".to_string()),
         }
     }
 }
