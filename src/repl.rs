@@ -577,9 +577,28 @@ pub fn run(mut shell: Shell) {
         let color_overrides = syntax_color_overrides(&sessions[&session_id].shell);
         let highlight_ctx =
             HighlightContext { cwd: Some(cwd_snapshot.as_path()), known_functions: Some(&known_functions), color_overrides: Some(&color_overrides) };
+        // Same owned-snapshot pattern as cwd_snapshot/known_functions above
+        // -- registered `complete NAME` specs, the contextual shell data
+        // (aliases, PATH commands, jobs, ...) evaluating one needs, and a
+        // functions/vars preamble for any -F/-C spec (which runs via
+        // subprocess, so this snapshot is all it needs -- see compgen.rs's
+        // own doc comment). One PATH scan per prompt (inside
+        // action_context), not per keystroke -- same cost class as
+        // known_functions/abbrs_snapshot just above.
+        let completions_snapshot = sessions[&session_id].shell.completions_snapshot();
+        let default_completion_snapshot = sessions[&session_id].shell.default_completion_snapshot();
+        let action_ctx_snapshot = sessions[&session_id].shell.action_context();
+        let preamble_snapshot = sessions[&session_id].shell.functions_preamble();
         // Same owned-snapshot pattern as highlight_ctx just above -- built
         // from the exact same locals, not re-snapshotted.
-        let shell_completion = completion::ShellCompletionProvider { cwd: Some(cwd_snapshot.as_path()), known_functions: Some(&known_functions) };
+        let shell_completion = completion::ShellCompletionProvider {
+            cwd: Some(cwd_snapshot.as_path()),
+            known_functions: Some(&known_functions),
+            completions: Some(&completions_snapshot),
+            default_completion: default_completion_snapshot.as_ref(),
+            action_ctx: Some(&action_ctx_snapshot),
+            functions_preamble: Some(&preamble_snapshot),
+        };
         // Same pattern again -- session_history is already the exact
         // snapshot the suggestions engine itself needs (see History's
         // own doc comment on why a clone here is cheap: an O(1) Rc-clone

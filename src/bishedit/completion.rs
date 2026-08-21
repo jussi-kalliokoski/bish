@@ -9,8 +9,9 @@
 use crate::bishedit::fuzzy;
 use crate::bishedit::highlight::{self, is_assignment_prefix_word, resets_command_position, KNOWN_BUILTINS};
 use crate::bishedit::manpages;
+use crate::compgen;
 use crate::lexer::{self, Chunk, SpannedItem, Tok};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -128,6 +129,28 @@ fn rank(prefix: &str, names: Vec<String>) -> Vec<CompletionCandidate> {
     scored.into_iter().map(|(_, c)| c).collect()
 }
 
+// A registered completion spec's own candidates are shown exactly as it
+// produced them, in its own order, unfiltered -- never re-run through
+// `rank`'s own fuzzy_match/drop-non-matches step, since a -F/-C source's
+// entries are deliberately not required to start with (or otherwise
+// contain, in fuzzy-subsequence order) `prefix` at all (see compgen.rs's
+// own doc comment on why -F/-C are trusted to have already applied their
+// own logic) -- fuzzy-filtering them here could silently make a real,
+// intentional COMPREPLY entry disappear from the popup. Still highlights
+// the matched prefix span when a candidate happens to actually start with
+// it (the common case for -W/-A/-G-sourced entries), for the same visual
+// bolding every other source gets.
+fn as_unranked_candidates(prefix: &str, names: Vec<String>) -> Vec<CompletionCandidate> {
+    let prefix_len = prefix.chars().count();
+    names
+        .into_iter()
+        .map(|display| {
+            let matched_positions = if display.starts_with(prefix) { (0..prefix_len).collect() } else { Vec::new() };
+            CompletionCandidate { display, matched_positions }
+        })
+        .collect()
+}
+
 // Thin wrapper: resolves `command`'s man-page data if ready (None
 // otherwise -- Pending/Missing both mean "nothing to offer yet"), mirroring
 // highlight.rs's own classify_plain_argument's identical resolve-then-
@@ -171,6 +194,21 @@ fn subcommand_candidates_core(man: Option<&manpages::ManPageData>, prefix: &str)
 pub struct ShellCompletionProvider<'a> {
     pub cwd: Option<&'a Path>,
     pub known_functions: Option<&'a HashSet<String>>,
+    // `complete NAME`-registered specs (a per-prompt snapshot of
+    // Shell::completions/default_completion -- see repl.rs's own
+    // construction site) and the contextual data (aliases, PATH commands,
+    // jobs, ...) compgen::resolve_spec needs to actually evaluate one, plus
+    // a snapshot of the caller's own functions/vars (Shell::
+    // functions_preamble's output) for -F/-C specs, which run via
+    // subprocess -- see compgen.rs's own doc comment on why this needs no
+    // live, mutably-borrowable Shell at all. `None` (rather than an empty
+    // map) is what a caller with no completions concept at all -- e.g. this
+    // module's own tests -- passes, distinct from "no specs registered
+    // yet" (an empty map still consults `default_completion` if any).
+    pub completions: Option<&'a HashMap<String, compgen::CompgenSpec>>,
+    pub default_completion: Option<&'a compgen::CompgenSpec>,
+    pub action_ctx: Option<&'a compgen::ActionContext>,
+    pub functions_preamble: Option<&'a str>,
 }
 
 impl<'a> CompletionProvider for ShellCompletionProvider<'a> {
@@ -181,7 +219,14 @@ impl<'a> CompletionProvider for ShellCompletionProvider<'a> {
         let prefix: String = chars[word_start..cursor].iter().collect();
         let prefix_text: String = chars[..word_start].iter().collect();
 
-        let candidates = match classify_word_role(&prefix_text) {
+        let role = classify_word_role(&prefix_text);
+        if let CmdRole::Argument { command, .. } = &role
+            && let Some(candidates) = self.registered_spec_candidates(command.as_deref(), &prefix)
+        {
+            return CompletionResult { word_start, candidates };
+        }
+
+        let candidates = match role {
             CmdRole::Command => self.command_name_candidates(&prefix),
             CmdRole::Argument { command, .. } if prefix.starts_with('-') => self.flag_candidates(command.as_deref(), &prefix),
             CmdRole::Argument { command, arg_index: 0 } => self.subcommand_or_file_candidates(command.as_deref(), &prefix),
@@ -193,6 +238,28 @@ impl<'a> CompletionProvider for ShellCompletionProvider<'a> {
 }
 
 impl<'a> ShellCompletionProvider<'a> {
+    // `None` means "no registered spec applies here -- fall through to the
+    // built-in flag/subcommand/file logic below"; `Some(candidates)` (even
+    // if empty) means a spec *did* match and fully owns this completion,
+    // matching real bash's own model: once a command has a registered
+    // `complete`, every one of its argument completions goes through that
+    // spec -- flags included, never blended with the built-in fallback.
+    // `command`'s own registered spec wins if one exists; the `-D` default
+    // spec (see Shell::default_completion) is the fallback for every other
+    // command, including one bish doesn't otherwise recognize at all, and
+    // even when `command` itself couldn't be resolved to a literal name
+    // (e.g. it's behind a variable).
+    fn registered_spec_candidates(&self, command: Option<&str>, prefix: &str) -> Option<Vec<CompletionCandidate>> {
+        let completions = self.completions?;
+        let spec = command.and_then(|c| completions.get(c)).or(self.default_completion)?;
+        let default_ctx = compgen::ActionContext::default();
+        let ctx = self.action_ctx.unwrap_or(&default_ctx);
+        let cwd = self.cwd.unwrap_or_else(|| Path::new("."));
+        let preamble = self.functions_preamble.unwrap_or("");
+        let names = compgen::resolve_spec(spec, prefix, ctx, cwd, preamble);
+        Some(as_unranked_candidates(prefix, names))
+    }
+
     // KNOWN_BUILTINS union known_functions union PATH -- deliberately
     // excludes aliases; see HighlightContext::known_functions's own doc
     // comment for why an alias name isn't safe to offer as "this will
@@ -346,7 +413,7 @@ mod tests {
 
     #[test]
     fn command_name_candidates_includes_known_builtins_matching_prefix() {
-        let provider = ShellCompletionProvider { cwd: None, known_functions: None };
+        let provider = ShellCompletionProvider { cwd: None, known_functions: None, completions: None, default_completion: None, action_ctx: None, functions_preamble: None };
         let names = display_names(provider.command_name_candidates("ech"));
         assert!(names.iter().any(|n| n == "echo"), "{names:?}");
     }
@@ -359,7 +426,7 @@ mod tests {
         // prefixes, which would make the assertion flaky.
         let mut functions = HashSet::new();
         functions.insert("zz_bish_test_func".to_string());
-        let provider = ShellCompletionProvider { cwd: None, known_functions: Some(&functions) };
+        let provider = ShellCompletionProvider { cwd: None, known_functions: Some(&functions), completions: None, default_completion: None, action_ctx: None, functions_preamble: None };
         let names = display_names(provider.command_name_candidates("zz_bish_test"));
         assert_eq!(names, vec!["zz_bish_test_func".to_string()]);
     }
@@ -369,7 +436,7 @@ mod tests {
         // coreutils -- same real-PATH assumption this whole feature
         // already leans on elsewhere (highlight.rs's own is_in_path
         // tests).
-        let provider = ShellCompletionProvider { cwd: None, known_functions: None };
+        let provider = ShellCompletionProvider { cwd: None, known_functions: None, completions: None, default_completion: None, action_ctx: None, functions_preamble: None };
         let names = display_names(provider.command_name_candidates("tru"));
         assert!(names.iter().any(|n| n == "true"), "{names:?}");
     }
@@ -423,7 +490,7 @@ mod tests {
         std::fs::write(dir.join("widget-notes.txt"), b"hi").unwrap();
         std::fs::write(dir.join("unrelated.txt"), b"hi").unwrap();
 
-        let provider = ShellCompletionProvider { cwd: Some(&dir), known_functions: None };
+        let provider = ShellCompletionProvider { cwd: Some(&dir), known_functions: None, completions: None, default_completion: None, action_ctx: None, functions_preamble: None };
         let names = display_names(provider.file_candidates("widg"));
 
         std::fs::remove_dir_all(&dir).ok();
@@ -454,7 +521,7 @@ mod tests {
             unsafe { std::env::set_var("HOME", &dir) };
             // cwd is deliberately a different, unrelated directory --
             // confirms the lookup actually goes to $HOME, not cwd.
-            let provider = ShellCompletionProvider { cwd: Some(Path::new("/")), known_functions: None };
+            let provider = ShellCompletionProvider { cwd: Some(Path::new("/")), known_functions: None, completions: None, default_completion: None, action_ctx: None, functions_preamble: None };
             let names = display_names(provider.file_candidates("~/.co"));
             unsafe { std::env::set_var("HOME", &original_home) };
             names
@@ -470,13 +537,13 @@ mod tests {
 
     #[test]
     fn file_candidates_yields_nothing_without_a_cwd() {
-        let provider = ShellCompletionProvider { cwd: None, known_functions: None };
+        let provider = ShellCompletionProvider { cwd: None, known_functions: None, completions: None, default_completion: None, action_ctx: None, functions_preamble: None };
         assert_eq!(provider.file_candidates("anything"), Vec::new());
     }
 
     #[test]
     fn complete_dispatches_bare_prefix_to_command_names() {
-        let provider = ShellCompletionProvider { cwd: None, known_functions: None };
+        let provider = ShellCompletionProvider { cwd: None, known_functions: None, completions: None, default_completion: None, action_ctx: None, functions_preamble: None };
         let result = provider.complete(CompletionRequest { line: "ech", cursor: 3 });
         assert_eq!(result.word_start, 0);
         let names = display_names(result.candidates);
@@ -489,7 +556,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("readme.txt"), b"hi").unwrap();
 
-        let provider = ShellCompletionProvider { cwd: Some(&dir), known_functions: None };
+        let provider = ShellCompletionProvider { cwd: Some(&dir), known_functions: None, completions: None, default_completion: None, action_ctx: None, functions_preamble: None };
         let line = "some-dynamic-cmd read";
         let result = provider.complete(CompletionRequest { line, cursor: line.chars().count() });
         let word_start = result.word_start;
@@ -499,5 +566,58 @@ mod tests {
 
         assert_eq!(word_start, "some-dynamic-cmd ".chars().count());
         assert_eq!(names, vec!["readme.txt".to_string()]);
+    }
+
+    #[test]
+    fn complete_prefers_a_registered_spec_over_the_built_in_file_fallback() {
+        let mut completions = HashMap::new();
+        completions.insert("fruit".to_string(), compgen::CompgenSpec { wordlist: Some("apple avocado banana".to_string()), ..Default::default() });
+        let provider =
+            ShellCompletionProvider { cwd: None, known_functions: None, completions: Some(&completions), default_completion: None, action_ctx: None, functions_preamble: None };
+        let line = "fruit a";
+        let result = provider.complete(CompletionRequest { line, cursor: line.chars().count() });
+        assert_eq!(display_names(result.candidates), vec!["apple".to_string(), "avocado".to_string()]);
+    }
+
+    #[test]
+    fn complete_falls_back_to_the_default_spec_for_an_unregistered_command() {
+        let default_completion = compgen::CompgenSpec { wordlist: Some("defaultA defaultB".to_string()), ..Default::default() };
+        let completions = HashMap::new();
+        let provider = ShellCompletionProvider {
+            cwd: None,
+            known_functions: None,
+            completions: Some(&completions),
+            default_completion: Some(&default_completion),
+            action_ctx: None,
+            functions_preamble: None,
+        };
+        let line = "unknowncmd12345 def";
+        let result = provider.complete(CompletionRequest { line, cursor: line.chars().count() });
+        assert_eq!(display_names(result.candidates), vec!["defaultA".to_string(), "defaultB".to_string()]);
+    }
+
+    #[test]
+    fn complete_never_consults_a_registered_spec_when_none_is_supplied() {
+        // completions: None (not Some(empty)) -- the "this caller has no
+        // completions concept at all" case, distinct from "nothing
+        // registered yet" -- must fall straight through to the built-in
+        // command-name-candidates path, same as today.
+        let provider = ShellCompletionProvider { cwd: None, known_functions: None, completions: None, default_completion: None, action_ctx: None, functions_preamble: None };
+        let line = "ech";
+        let result = provider.complete(CompletionRequest { line, cursor: line.chars().count() });
+        assert!(display_names(result.candidates).iter().any(|n| n == "echo"));
+    }
+
+    #[test]
+    fn as_unranked_candidates_keeps_every_entry_even_ones_not_starting_with_the_prefix() {
+        // The whole point of not routing a registered spec's own output
+        // through `rank`'s fuzzy_match/drop-non-matches step -- an -F/-C
+        // source is trusted to have already applied its own filtering
+        // logic, so an entry that doesn't even start with `prefix` must
+        // still come through untouched (see compgen.rs's own doc comment).
+        let out = as_unranked_candidates("xyz", vec!["foo".to_string(), "xyzzy".to_string()]);
+        assert_eq!(display_names(out.clone()), vec!["foo".to_string(), "xyzzy".to_string()]);
+        assert_eq!(out[0].matched_positions, Vec::<usize>::new(), "no highlight for a non-matching entry");
+        assert_eq!(out[1].matched_positions, vec![0, 1, 2], "highlights the matched prefix span");
     }
 }
