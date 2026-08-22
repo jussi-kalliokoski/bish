@@ -97,9 +97,8 @@ pub enum VarOp {
     // time.
     Replace { pattern: String, repl: String, global: bool, anchor: ReplaceAnchor },
     // ${V@Q}/@U/@L/@E -- bash's "parameter transformation" operators,
-    // scoped to the four that are pure string transforms of the value
-    // (see TransformKind's own doc comment for the rest of bash's set
-    // and why they're not here yet).
+    // scoped to bash's own set minus `@P` (see TransformKind's own doc
+    // comment for why that one's still missing).
     Transform(TransformKind),
 }
 
@@ -110,14 +109,11 @@ pub enum ReplaceAnchor {
     End,
 }
 
-// bash also defines `@A`/`@a`/`@P`/`@K`: `@A`/`@a` need the same
-// attribute/declare-style machinery `declare -p` does (itself a
-// separate, still-unimplemented gap); `@P` needs bash's own PS1
-// backslash-escape prompt expander, which bish's hardcoded prompt
-// doesn't implement at all; `@K` is array-specific key/value pair
-// output. All four are left unrecognized for now -- parse_operator_suffix
-// falls back to treating the whole `${...}` as a literal name, same as
-// any other unrecognized operator syntax.
+// bash also defines `@P`: bash's own PS1 backslash-escape prompt
+// expander, which bish's hardcoded prompt doesn't implement at all --
+// left unrecognized for now, same as any other unrecognized operator
+// syntax (parse_operator_suffix falls back to treating the whole
+// `${...}` as a literal name).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum TransformKind {
     // Shell-quoted so the result can be reused as input (`${v@Q}`).
@@ -128,6 +124,22 @@ pub enum TransformKind {
     // Expands backslash escape sequences in the value the same way
     // `$'...'` does (`${v@E}`).
     Escape,
+    // An assignment/`declare` statement that would recreate the
+    // parameter with its attributes and value (`${v@A}`) -- see
+    // exec.rs's transform_attributes for the exact format (matches
+    // real bash's own quote-style/attribute-prefix rules, which
+    // genuinely differ between a plain scalar and a full array).
+    Attributes,
+    // Just the attribute-flag letters (`${v@a}`), e.g. "rx" for a
+    // readonly+exported scalar, "" for a plain one.
+    AttributeFlags,
+    // `${arr[@]@K}`/`${assoc[@]@K}`: "key value key value ..." pairs
+    // (double-quoted values, matching declare -p's own array-element
+    // quoting) -- a bare name or a specific single index instead just
+    // behaves like `@Q` on that one value, matching real bash exactly
+    // (confirmed: `${arr[0]@K}` and a plain scalar `${x@K}` both give
+    // the same single-quoted result `@Q` would).
+    KeyValue,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1776,11 +1788,14 @@ fn parse_operator_suffix(rest: &str) -> Option<VarOp> {
             "U" => Some(VarOp::Transform(TransformKind::Upper)),
             "L" => Some(VarOp::Transform(TransformKind::Lower)),
             "E" => Some(VarOp::Transform(TransformKind::Escape)),
-            // `@A`/`@a`/`@P`/`@K` and anything else after '@': not
-            // recognized (see TransformKind's own doc comment) --
-            // falling back to None here, same as any other unrecognized
-            // operator syntax, lets the caller treat the whole thing as
-            // a literal name instead of silently misparsing it.
+            "A" => Some(VarOp::Transform(TransformKind::Attributes)),
+            "a" => Some(VarOp::Transform(TransformKind::AttributeFlags)),
+            "K" => Some(VarOp::Transform(TransformKind::KeyValue)),
+            // `@P` and anything else after '@': not recognized (see
+            // TransformKind's own doc comment) -- falling back to None
+            // here, same as any other unrecognized operator syntax, lets
+            // the caller treat the whole thing as a literal name instead
+            // of silently misparsing it.
             _ => None,
         };
     }

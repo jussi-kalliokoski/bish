@@ -1722,7 +1722,12 @@ impl Shell {
         status
     }
 
-    fn declare_p_line(&mut self, name: &str) -> Option<String> {
+    // The attribute-flag letters bash's own declare -p/${v@a}/${v@A} all
+    // use, in the same fixed order: array-ness (A/a, mutually exclusive)
+    // first, then i/r/x/n/u/l. Shared by declare_p_line (declare -p's
+    // own output), transform_attributes (${v@A}), and, standing alone,
+    // ${v@a} itself.
+    fn attribute_flags_string(&self, name: &str) -> String {
         let mut flags = String::new();
         if self.assoc_names.contains(name) {
             flags.push('A');
@@ -1747,6 +1752,60 @@ impl Shell {
         if self.lower_names.contains(name) {
             flags.push('l');
         }
+        flags
+    }
+
+    // ${v@A}: an assignment/`declare` statement that would recreate the
+    // named variable, matching real bash's own (slightly inconsistent)
+    // formatting rules -- confirmed against real bash:
+    // - A full array/assoc reconstruction (single_element is None and
+    //   the name is array/assoc) is identical to declare -p's own
+    //   output (double-quoted elements, always "declare -a"/"-A"
+    //   prefixed) -- bash's own bare `${arr@A}` (no subscript) actually
+    //   collapses to just the first element instead, a quirk this
+    //   deliberately doesn't replicate since reconstructing the *whole*
+    //   array is what a script reaching for @A almost certainly wants
+    //   (bish also doesn't collapse a bare `$arr` to `${arr[0]}` at
+    //   all, a separate pre-existing simplification this doesn't fix
+    //   either).
+    // - Anything else (a plain scalar, or one specific array/assoc
+    //   index via `single_element`) is single-quoted, with a leading
+    //   "declare -flags" only when there's at least one real attribute
+    //   -- a bare `name='value'` otherwise (unlike declare -p, which
+    //   always prefixes even a plain scalar with "declare --"). An
+    //   array/assoc name still shows its own -a/-A flag here even for
+    //   one specific element, matching bash's own `${arr[0]@A}` ->
+    //   `declare -a arr='1'`.
+    fn transform_attributes(&mut self, name: &str, single_element: Option<&str>) -> String {
+        let is_array = self.assoc_names.contains(name) || self.arrays.contains_key(name);
+        if is_array && single_element.is_none() {
+            return self.declare_p_line(name).unwrap_or_default();
+        }
+        let flags = self.attribute_flags_string(name);
+        let value = match single_element {
+            Some(v) => v.to_string(),
+            None => self.lookup_var(name),
+        };
+        let quoted = crate::serialize::quote_literal(&value);
+        if flags.is_empty() {
+            format!("{name}={quoted}")
+        } else {
+            format!("declare -{flags} {name}={quoted}")
+        }
+    }
+
+    // ${arr[@]@K}/${assoc[@]@K}: "key value key value ..." pairs,
+    // values double-quoted the same way declare -p's own array elements
+    // are. array_keys/array_all iterate the same underlying map, so
+    // zipping them together pairs each key with its own value.
+    fn array_key_value_pairs(&self, name: &str) -> String {
+        let keys = self.array_keys(name);
+        let values = self.array_all(name);
+        keys.iter().zip(values.iter()).map(|(k, v)| format!("{k} {}", declare_p_quote(v))).collect::<Vec<_>>().join(" ")
+    }
+
+    fn declare_p_line(&mut self, name: &str) -> Option<String> {
+        let flags = self.attribute_flags_string(name);
         let flag_str = if flags.is_empty() { "--".to_string() } else { format!("-{flags}") };
 
         if self.assoc_names.contains(name) {
@@ -5831,7 +5890,14 @@ impl Shell {
                 let repl = self.expand_raw(repl);
                 glob_replace(&cur, &pattern, &repl, *global, *anchor)
             }
-            VarOp::Transform(kind) => apply_transform(&cur, *kind),
+            VarOp::Transform(kind) => match kind {
+                TransformKind::Attributes => self.transform_attributes(name, None),
+                TransformKind::AttributeFlags => self.attribute_flags_string(name),
+                TransformKind::KeyValue => apply_transform(&cur, TransformKind::Quote),
+                TransformKind::Quote | TransformKind::Upper | TransformKind::Lower | TransformKind::Escape => {
+                    apply_transform(&cur, *kind)
+                }
+            },
         }
     }
 
@@ -5903,7 +5969,31 @@ impl Shell {
                 let repl = self.expand_raw(repl);
                 glob_replace(&cur, &pattern, &repl, *global, *anchor)
             }
-            VarOp::Transform(kind) => apply_transform(&cur, *kind),
+            VarOp::Transform(kind) => match kind {
+                TransformKind::Attributes => {
+                    // "@"/"*" (the whole array) reconstructs every
+                    // element; a specific index still shows the array's
+                    // own -a/-A attribute flag but only that one
+                    // element's value -- both confirmed against real
+                    // bash (see transform_attributes's own doc comment).
+                    if index == "@" || index == "*" {
+                        self.transform_attributes(name, None)
+                    } else {
+                        self.transform_attributes(name, Some(&cur))
+                    }
+                }
+                TransformKind::AttributeFlags => self.attribute_flags_string(name),
+                TransformKind::KeyValue => {
+                    if index == "@" || index == "*" {
+                        self.array_key_value_pairs(name)
+                    } else {
+                        apply_transform(&cur, TransformKind::Quote)
+                    }
+                }
+                TransformKind::Quote | TransformKind::Upper | TransformKind::Lower | TransformKind::Escape => {
+                    apply_transform(&cur, *kind)
+                }
+            },
         }
     }
 
@@ -7949,12 +8039,19 @@ fn declare_p_quote(value: &str) -> String {
     out
 }
 
+// Only the four pure string-transform operators -- @A/@a/@K need
+// name/attribute context this function doesn't have, so every call
+// site handles those three itself (see eval_var_op/eval_array_var_op's
+// own Transform arms) and never reaches here with them.
 fn apply_transform(cur: &str, kind: TransformKind) -> String {
     match kind {
         TransformKind::Quote => crate::serialize::quote_literal(cur),
         TransformKind::Upper => cur.to_uppercase(),
         TransformKind::Lower => cur.to_lowercase(),
         TransformKind::Escape => expand_backslash_escapes(cur),
+        TransformKind::Attributes | TransformKind::AttributeFlags | TransformKind::KeyValue => {
+            unreachable!("handled directly in eval_var_op/eval_array_var_op")
+        }
     }
 }
 
@@ -9101,6 +9198,72 @@ mod tests {
         let buf = capture_output(&mut shell);
         shell.run_source_here(r#"a=("one two" three); echo "${a[0]@Q}""#, "<test>");
         assert_eq!(buf.borrow().as_str(), "'one two'\n");
+    }
+
+    #[test]
+    fn var_transform_capital_a_reconstructs_a_scalar_assignment() {
+        let mut shell = Shell::new();
+        let buf = capture_output(&mut shell);
+        shell.run_source_here(r#"x=1; echo "${x@A}""#, "<test>");
+        assert_eq!(buf.borrow().as_str(), "x='1'\n");
+    }
+
+    #[test]
+    fn var_transform_capital_a_includes_attribute_flags_when_present() {
+        let mut shell = Shell::new();
+        let buf = capture_output(&mut shell);
+        shell.run_source_here(r#"export ex=5; echo "${ex@A}"; readonly ro=hi; echo "${ro@A}""#, "<test>");
+        assert_eq!(buf.borrow().as_str(), "declare -x ex='5'\ndeclare -r ro='hi'\n");
+    }
+
+    #[test]
+    fn var_transform_capital_a_on_an_array_reconstructs_every_element() {
+        let mut shell = Shell::new();
+        let buf = capture_output(&mut shell);
+        shell.run_source_here(r#"arr=(1 2 3); echo "${arr[@]@A}""#, "<test>");
+        assert_eq!(buf.borrow().as_str(), "declare -a arr=([0]=\"1\" [1]=\"2\" [2]=\"3\")\n");
+    }
+
+    #[test]
+    fn var_transform_capital_a_on_a_specific_array_index_keeps_the_array_flag() {
+        // Confirmed against real bash: ${arr[0]@A} -> declare -a arr='1'
+        // (still shows the array's own -a flag, but only that element).
+        let mut shell = Shell::new();
+        let buf = capture_output(&mut shell);
+        shell.run_source_here(r#"arr=(1 2 3); echo "${arr[0]@A}""#, "<test>");
+        assert_eq!(buf.borrow().as_str(), "declare -a arr='1'\n");
+    }
+
+    #[test]
+    fn var_transform_lowercase_a_gives_just_the_attribute_letters() {
+        let mut shell = Shell::new();
+        let buf = capture_output(&mut shell);
+        shell.run_source_here(r#"x=1; echo "[${x@a}]"; export ex=1; echo "${ex@a}"; arr=(1); echo "${arr@a}""#, "<test>");
+        assert_eq!(buf.borrow().as_str(), "[]\nx\na\n");
+    }
+
+    #[test]
+    fn var_transform_capital_k_on_a_scalar_behaves_like_capital_q() {
+        let mut shell = Shell::new();
+        let buf = capture_output(&mut shell);
+        shell.run_source_here(r#"x="has space"; echo "${x@K}""#, "<test>");
+        assert_eq!(buf.borrow().as_str(), "'has space'\n");
+    }
+
+    #[test]
+    fn var_transform_capital_k_on_an_array_gives_key_value_pairs() {
+        let mut shell = Shell::new();
+        let buf = capture_output(&mut shell);
+        shell.run_source_here(r#"arr=("has space" b); echo "${arr[@]@K}""#, "<test>");
+        assert_eq!(buf.borrow().as_str(), "0 \"has space\" 1 \"b\"\n");
+    }
+
+    #[test]
+    fn var_transform_capital_k_on_an_assoc_array_gives_key_value_pairs() {
+        let mut shell = Shell::new();
+        let buf = capture_output(&mut shell);
+        shell.run_source_here(r#"declare -A m=([a]=1 [b]=2); echo "${m[@]@K}""#, "<test>");
+        assert_eq!(buf.borrow().as_str(), "a \"1\" b \"2\"\n");
     }
 
     #[test]
