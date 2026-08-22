@@ -36,13 +36,43 @@ pub enum AssignMode {
     Append,
 }
 
+// One element of an array literal's parenthesized body (`arr=(1 [5]=x
+// 2)`, `assoc=([k]=v)`). `Keyed`'s index is raw, unevaluated text (an
+// arithmetic expression for a plain/indexed array, an arbitrary string
+// for an associative one -- exec.rs's apply_array_literal decides which
+// the same way array_set_index already does, by whether the name is
+// already known-associative). A plain `Positional` element continues
+// from a running "next index" counter that a `Keyed` element ahead of
+// it in the same literal bumps forward, matching bash (`(1 [5]=x 2)` ->
+// indices 0, 5, 6).
+#[derive(Debug, Clone)]
+pub enum ArrayLiteralItem {
+    Positional(Word),
+    Keyed(String, Word),
+}
+
 #[derive(Debug, Clone)]
 pub struct SimpleCommand {
     pub assigns: Vec<(String, AssignMode, Word)>,
     // `name=(word word ...)` / `name+=(word word ...)` array literals --
     // kept separate from `assigns` since array values don't fit the scalar
-    // Word model.
-    pub array_assigns: Vec<(String, AssignMode, Vec<Word>)>,
+    // Word model. Only ever populated while still in the simple command's
+    // own leading assignment-prefix position (`arr=(1 2 3) cmd` -- though
+    // see array_word_assigns below for the other place one of these can
+    // appear).
+    pub array_assigns: Vec<(String, AssignMode, Vec<ArrayLiteralItem>)>,
+    // `name=(...)` array literals appearing as a *later* word of a
+    // declare/local/export/readonly/typeset command (`declare -A
+    // m=([a]=1 [b]=2)`) -- real bash gives these builtins' own grammar
+    // special recognition for this syntax anywhere in their word list,
+    // not just in prefix-assignment position. The `usize` is the index
+    // into `words` (see below) this literal conceptually sits at -- no
+    // placeholder is pushed into `words` itself for it, so exec.rs's
+    // run_single has to interleave the two back together in order when
+    // building the final argument stream (a plain string arg vs. one of
+    // these can flip which flags -- -A vs -a -- are in effect when it's
+    // reached, so the original relative order matters).
+    pub array_word_assigns: Vec<(usize, String, AssignMode, Vec<ArrayLiteralItem>)>,
     // `name[index]=value` -- index is raw text (an arithmetic expression,
     // evaluated at assignment time), kept separate since it targets one
     // array element rather than the whole variable.
@@ -746,6 +776,7 @@ impl Parser {
     fn parse_simple_command(&mut self) -> Result<SimpleCommand, String> {
         let mut assigns = Vec::new();
         let mut array_assigns = Vec::new();
+        let mut array_word_assigns = Vec::new();
         let mut index_assigns = Vec::new();
         let mut words = Vec::new();
         let mut redirects = Vec::new();
@@ -764,27 +795,32 @@ impl Parser {
                             index_assigns.push((name, index, val));
                             continue;
                         }
+                        if let Some((name, mode, items)) = self.try_array_literal_assignment(&w)? {
+                            array_assigns.push((name, mode, items));
+                            continue;
+                        }
                         if let Some((name, mode, val)) = word_as_assignment(&w) {
-                            // `name=(...)` / `name+=(...)` array literal:
-                            // the lexer already captured the parenthesized
-                            // content as a raw Subshell token (no space
-                            // allowed between `=`/`+=` and `(`, matching
-                            // bash's own syntax rule).
-                            if is_empty_word(&val) {
-                                if let Some(Tok::Subshell(_)) = self.peek() {
-                                    let raw = match self.advance() {
-                                        Some(Tok::Subshell(r)) => r,
-                                        _ => unreachable!(),
-                                    };
-                                    let items = split_array_literal_words(&raw)?;
-                                    array_assigns.push((name, mode, items));
-                                    continue;
-                                }
-                            }
                             assigns.push((name, mode, val));
                             continue;
                         }
                         in_assign_phase = false;
+                    } else if is_declare_family_command(&words) {
+                        // `declare -A m=([a]=1 [b]=2)` -- real bash's own
+                        // grammar recognizes NAME=(...) as an array
+                        // literal anywhere in one of these five builtins'
+                        // word list, not just in leading-prefix-
+                        // assignment position (see array_word_assigns's
+                        // own doc comment on SimpleCommand). Confirmed
+                        // against real bash that an ordinary command
+                        // (`echo bar=(1 2 3)`) doesn't get this treatment
+                        // at all -- it's a syntax error there, which this
+                        // doesn't attempt to replicate (falls through to
+                        // being read as a plain word here instead, a
+                        // pre-existing, narrower divergence left alone).
+                        if let Some((name, mode, items)) = self.try_array_literal_assignment(&w)? {
+                            array_word_assigns.push((words.len(), name, mode, items));
+                            continue;
+                        }
                     }
                     words.push(w);
                 }
@@ -896,7 +932,27 @@ impl Parser {
         {
             return Err("expected command".to_string());
         }
-        Ok(SimpleCommand { assigns, array_assigns, index_assigns, words, redirects })
+        Ok(SimpleCommand { assigns, array_assigns, array_word_assigns, index_assigns, words, redirects })
+    }
+
+    // Shared by parse_simple_command's prefix-assignment path and its
+    // later-word declare-family path: if `w` is a `name=`/`name+=`-
+    // shaped word immediately followed by a `Tok::Subshell` (the
+    // lexer's raw capture of `(...)`, with no space allowed between
+    // `=`/`+=` and `(`, matching bash's own syntax rule), consumes that
+    // Subshell token and returns the parsed (name, mode, items);
+    // otherwise returns None having consumed nothing beyond `w` itself
+    // (which the caller already owns either way).
+    fn try_array_literal_assignment(&mut self, w: &Word) -> Result<Option<(String, AssignMode, Vec<ArrayLiteralItem>)>, String> {
+        let Some((name, mode, val)) = word_as_assignment(w) else { return Ok(None) };
+        if !is_empty_word(&val) || !matches!(self.peek(), Some(Tok::Subshell(_))) {
+            return Ok(None);
+        }
+        let raw = match self.advance() {
+            Some(Tok::Subshell(r)) => r,
+            _ => unreachable!(),
+        };
+        Ok(Some((name, mode, split_array_literal_words(&raw)?)))
     }
 
     // Also accepts a keyword token, converting it back into the literal
@@ -992,20 +1048,73 @@ fn is_empty_word(w: &Word) -> bool {
 }
 
 // Re-lexes the raw captured text of an array literal's `(...)` body as a
-// plain whitespace-separated word list. Reuses the general word tokenizer
+// plain whitespace-separated word list, classifying each one as a plain
+// positional element or a `[index]=value` keyed one (see
+// ArrayLiteralItem's own doc comment). Reuses the general word tokenizer
 // (rather than a bespoke splitter) so quoting/expansions inside the literal
 // (`arr=("$x" 'lit' $(cmd))`) work exactly like anywhere else.
-fn split_array_literal_words(raw: &str) -> Result<Vec<Word>, String> {
+fn split_array_literal_words(raw: &str) -> Result<Vec<ArrayLiteralItem>, String> {
     let toks = Lexer::new(raw).tokenize()?;
-    let mut words = Vec::new();
+    let mut items = Vec::new();
     for t in toks {
         match t {
-            Tok::Word(chunks, globbable) => words.push(Word { chunks, globbable }),
+            Tok::Word(chunks, globbable) => {
+                let w = Word { chunks, globbable };
+                items.push(match array_literal_item_as_index(&w) {
+                    Some((index, value)) => ArrayLiteralItem::Keyed(index, value),
+                    None => ArrayLiteralItem::Positional(w),
+                });
+            }
             Tok::Newline => {}
             other => return Err(format!("unexpected token in array literal: {:?}", other)),
         }
     }
-    Ok(words)
+    Ok(items)
+}
+
+// `[index]=value` -- one element of an array literal's body written with
+// an explicit key (`arr=([2]=x [5]=y)`, `assoc=([k]=v)`). Mirrors
+// word_as_index_assignment's own bracket/equals-splitting logic minus the
+// leading name (an array literal's own elements have no name prefix,
+// just the bracketed index itself) -- same literal-chunks-only
+// restriction on the "[index]=" prefix (an index containing a bare `$`
+// expansion, e.g. `[$i]=x`, isn't recognized here and is instead kept as
+// a plain positional element -- rare enough in practice, and matches
+// word_as_index_assignment's own precedent).
+fn array_literal_item_as_index(w: &Word) -> Option<(String, Word)> {
+    let mut flat = String::new();
+    let mut bounds: Vec<(usize, usize, bool)> = Vec::new(); // (start_in_flat, chunk_idx, is_literal)
+    for (ci, c) in w.chunks.iter().enumerate() {
+        let (s, is_lit) = match c {
+            Chunk::Str(s) => (s, false),
+            Chunk::LiteralStr(s) => (s, true),
+            _ => break,
+        };
+        bounds.push((flat.len(), ci, is_lit));
+        flat.push_str(s);
+    }
+    let rest = flat.strip_prefix('[')?;
+    let close_rel = rest.find(']')?;
+    let index = rest[..close_rel].to_string();
+    let close = 1 + close_rel;
+    let value_start = flat[close + 1..].strip_prefix('=')?;
+    let value_pos = flat.len() - value_start.len();
+
+    let &(start, chunk_idx, is_lit) = bounds.iter().rfind(|&&(start, _, _)| start <= value_pos)?;
+    let chunk_text = match &w.chunks[chunk_idx] {
+        Chunk::Str(s) | Chunk::LiteralStr(s) => s,
+        _ => unreachable!(),
+    };
+    let remainder = chunk_text[value_pos - start..].to_string();
+    let mut rest_chunks = Vec::new();
+    if !remainder.is_empty() {
+        rest_chunks.push(if is_lit { Chunk::LiteralStr(remainder) } else { Chunk::Str(remainder) });
+    }
+    rest_chunks.extend(w.chunks[chunk_idx + 1..].iter().cloned());
+    if rest_chunks.is_empty() {
+        rest_chunks.push(Chunk::Str(String::new()));
+    }
+    Some((index, Word { chunks: rest_chunks, globbable: false }))
 }
 
 fn word_to_plain_name(chunks: &[Chunk]) -> Option<String> {
@@ -1015,6 +1124,15 @@ fn word_to_plain_name(chunks: &[Chunk]) -> Option<String> {
         }
     }
     None
+}
+
+// declare/local/export/readonly/typeset: the five builtins real bash's
+// own grammar gives special recognition for a `NAME=(...)` array literal
+// appearing as a later word, not just in leading-prefix-assignment
+// position -- see array_word_assigns's own doc comment on SimpleCommand.
+fn is_declare_family_command(words: &[Word]) -> bool {
+    let Some(first) = words.first() else { return false };
+    matches!(word_to_plain_name(&first.chunks).as_deref(), Some("declare" | "local" | "export" | "readonly" | "typeset"))
 }
 
 fn is_valid_ident(s: &str) -> bool {

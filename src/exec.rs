@@ -11,7 +11,7 @@ use crate::compgen;
 use crate::glob;
 use crate::lexer::{Chunk, ReplaceAnchor, TransformKind, VarOp};
 use crate::parser::{
-    self, AndOr, AssignMode, Combinator, ListItem, Pipeline, Program, Redirect, Sep, SimpleCommand, Word,
+    self, AndOr, ArrayLiteralItem, AssignMode, Combinator, ListItem, Pipeline, Program, Redirect, Sep, SimpleCommand, Word,
 };
 use crate::pty;
 use crate::vt100;
@@ -1489,7 +1489,7 @@ impl Shell {
     // entirely (print instead of declare, see print_declared/
     // print_functions) -- checked first, same as bash effectively
     // treating them as a separate subcommand.
-    fn run_declare(&mut self, args: &[String]) -> i32 {
+    fn run_declare(&mut self, args: &[String], array_literals: &[(usize, String, AssignMode, Vec<ArrayLiteralItem>)]) -> i32 {
         if args.iter().any(|a| a == "-f" || a == "-F") {
             let names_only = args.iter().any(|a| a == "-F");
             let names: Vec<String> = args.iter().filter(|a| !a.starts_with('-')).cloned().collect();
@@ -1514,7 +1514,7 @@ impl Shell {
         let mut upper_flag = false;
         let mut lower_flag = false;
         let mut export_flag = false;
-        for a in args {
+        for (i, a) in args.iter().enumerate() {
             match a.as_str() {
                 "-A" => {
                     array_mode = Some(true);
@@ -1553,6 +1553,32 @@ impl Shell {
                     continue;
                 }
                 _ => {}
+            }
+            // `declare -A m=([a]=1 [b]=2)` -- this position is actually
+            // an array literal, not a plain `NAME`/`NAME=value` string
+            // (`a` here is just its xtrace-only display text, see
+            // array_literal_display's own doc comment). `-A`/`-a` seen
+            // so far decides which table it's declared into, matching
+            // the plain-name case just below; no flag at all falls back
+            // to whatever `name` already is (bash's own behavior:
+            // without `-A`, a bracketed key is just an arithmetic index
+            // into a plain indexed array).
+            if let Some((_, name, mode, items)) = array_literals.iter().find(|(pos, ..)| *pos == i) {
+                match array_mode {
+                    Some(true) => {
+                        self.assoc_names.insert(name.clone());
+                        self.assoc_arrays.entry(name.clone()).or_default();
+                    }
+                    Some(false) => {
+                        self.arrays.entry(name.clone()).or_default();
+                    }
+                    None => {}
+                }
+                self.apply_array_literal(name, *mode, items);
+                if readonly_flag {
+                    self.readonly_names.insert(name.clone());
+                }
+                continue;
             }
             if a.starts_with('-') {
                 continue;
@@ -4036,22 +4062,7 @@ impl Shell {
                 }
             }
             for (name, mode, items) in &cmd.array_assigns {
-                let values: Vec<String> = items.iter().map(|w| self.expand_word(w)).collect();
-                match mode {
-                    AssignMode::Set => {
-                        let map: std::collections::BTreeMap<usize, String> =
-                            values.into_iter().enumerate().collect();
-                        self.arrays.insert(name.clone(), map);
-                    }
-                    AssignMode::Append => {
-                        let map = self.arrays.entry(name.clone()).or_default();
-                        let mut next = map.keys().next_back().map(|k| k + 1).unwrap_or(0);
-                        for v in values {
-                            map.insert(next, v);
-                            next += 1;
-                        }
-                    }
-                }
+                self.apply_array_literal(name, *mode, items);
             }
             for (name, index, val) in &cmd.index_assigns {
                 let v = self.expand_word(val);
@@ -4073,6 +4084,13 @@ impl Shell {
             [Chunk::Str(s)] | [Chunk::LiteralStr(s)] => Some(s.as_str()),
             _ => None,
         };
+        // Only populated for the same assignment-builtin names as the argv
+        // branch just below (an ordinary command's cmd.array_word_assigns
+        // is always empty -- see parser.rs's is_declare_family_command).
+        // Position `p` here means "the array literal that would sit at
+        // argv[p]" -- run_declare/run_local's own arg loops splice it back
+        // in at that index instead of re-parsing a plain string there.
+        let mut array_literal_args: Vec<(usize, String, AssignMode, Vec<ArrayLiteralItem>)> = Vec::new();
         let argv: Vec<String> = if matches!(
             first_word_literal,
             Some("local") | Some("export") | Some("declare") | Some("typeset") | Some("readonly")
@@ -4081,12 +4099,26 @@ impl Shell {
             // word-split on the expanded value (bash treats them like any
             // other assignment), unlike a normal builtin's arguments.
             let mut v = vec![first_word_literal.unwrap().to_string()];
-            for w in &cmd.words[1..] {
+            let mut pending = cmd.array_word_assigns.iter().peekable();
+            for (i, w) in cmd.words[1..].iter().enumerate() {
+                let word_index = i + 1;
+                while let Some((pos, name, mode, items)) = pending.peek() {
+                    if *pos != word_index {
+                        break;
+                    }
+                    array_literal_args.push((v.len(), name.clone(), *mode, items.clone()));
+                    v.push(self.array_literal_display(name, *mode, items));
+                    pending.next();
+                }
                 if let Some((name, _mode, val_word)) = parser::word_as_assignment(w) {
                     v.push(format!("{}={}", name, self.expand_word(&val_word)));
                 } else {
                     v.push(self.expand_word(w));
                 }
+            }
+            for (_, name, mode, items) in pending {
+                array_literal_args.push((v.len(), name.clone(), *mode, items.clone()));
+                v.push(self.array_literal_display(name, *mode, items));
             }
             v
         } else {
@@ -4115,7 +4147,7 @@ impl Shell {
         {
             return self.call_function(&body, argv[1..].to_vec());
         }
-        self.dispatch_builtin_or_external(&argv, name, cmd, background, false)
+        self.dispatch_builtin_or_external(&argv, name, cmd, background, false, &array_literal_args)
     }
 
     // Split out from run_single so `builtin NAME...` (its own arm below)
@@ -4125,8 +4157,19 @@ impl Shell {
     // only for that recursive call: on no match, it reports "not a
     // shell builtin" instead of falling through to
     // restrict_to_builtins/external-spawn like the ordinary top-level
-    // path does.
-    fn dispatch_builtin_or_external(&mut self, argv: &[String], name: String, cmd: &SimpleCommand, background: bool, builtin_only: bool) -> ExecResult {
+    // path does. `array_literal_args` is the same side-channel argv's
+    // own doc comment above describes -- empty for the `builtin` arm's
+    // own recursive call (`builtin declare -A m=(...)` isn't supported,
+    // an accepted narrow gap given how rare combining the two is).
+    fn dispatch_builtin_or_external(
+        &mut self,
+        argv: &[String],
+        name: String,
+        cmd: &SimpleCommand,
+        background: bool,
+        builtin_only: bool,
+        array_literal_args: &[(usize, String, AssignMode, Vec<ArrayLiteralItem>)],
+    ) -> ExecResult {
         // Builtins ignore per-command redirects for now: their output goes
         // straight to the shell's own stdio.
         match name.as_str() {
@@ -4207,7 +4250,7 @@ impl Shell {
                     return ExecResult::Status(0);
                 }
                 let inner_name = argv[1].clone();
-                return self.dispatch_builtin_or_external(&argv[1..], inner_name, cmd, background, true);
+                return self.dispatch_builtin_or_external(&argv[1..], inner_name, cmd, background, true, &[]);
             }
             "type" => return ExecResult::Status(self.run_type(&argv[1..])),
             // No command-path cache exists to manage -- every exec
@@ -4321,7 +4364,12 @@ impl Shell {
             "export" => {
                 let mut declare_args = vec!["-x".to_string()];
                 declare_args.extend(argv[1..].iter().cloned());
-                return ExecResult::Status(self.run_declare(&declare_args));
+                // Dropping argv[0] ("export") shifts every recorded
+                // position back by one; prepending "-x" here shifts them
+                // forward by one again -- net zero, so array_literal_args
+                // (itself indexed into the *original* argv) already lines
+                // up with declare_args unchanged.
+                return ExecResult::Status(self.run_declare(&declare_args, array_literal_args));
             }
             "let" => {
                 let mut last = 0i64;
@@ -4399,7 +4447,15 @@ impl Shell {
                 // localize. Only meaningful for the scalar (non-array,
                 // non-nameref) case below.
                 let mut global_flag = false;
-                for a in &argv[1..] {
+                // array_literal_args is indexed into the *original* argv
+                // (which still has argv[0] == "local"), so every position
+                // shifts back by one to line up with argv[1..]'s own
+                // enumeration below.
+                let shifted_array_literals: Vec<_> = array_literal_args
+                    .iter()
+                    .filter_map(|(p, n, m, i)| p.checked_sub(1).map(|p2| (p2, n.clone(), *m, i.clone())))
+                    .collect();
+                for (i, a) in argv[1..].iter().enumerate() {
                     match a.as_str() {
                         "-a" => {
                             array_mode = Some(false);
@@ -4435,6 +4491,30 @@ impl Shell {
                         }
                         _ if a.starts_with('-') => continue,
                         _ => {}
+                    }
+                    // `local -A m=([a]=1 [b]=2)` -- this position is
+                    // actually an array literal (`a` here is just its
+                    // xtrace-only display text). The table-snapshot/
+                    // reset dance below is identical to the plain-name
+                    // array case; only the population step (via
+                    // apply_array_literal) is new.
+                    if let Some((_, name, mode, items)) = shifted_array_literals.iter().find(|(pos, ..)| *pos == i) {
+                        match array_mode {
+                            Some(true) => {
+                                let prev = self.assoc_arrays.remove(name);
+                                self.assoc_local_stack.last_mut().unwrap().push((name.clone(), prev));
+                                self.assoc_names.insert(name.clone());
+                                self.assoc_arrays.insert(name.clone(), OrderedMap::default());
+                            }
+                            Some(false) => {
+                                let prev = self.arrays.remove(name);
+                                self.array_local_stack.last_mut().unwrap().push((name.clone(), prev));
+                                self.arrays.insert(name.clone(), std::collections::BTreeMap::new());
+                            }
+                            None => {}
+                        }
+                        self.apply_array_literal(name, *mode, items);
+                        continue;
                     }
                     let (n, v) = match a.find('=') {
                         Some(eq) => (a[..eq].to_string(), Some(a[eq + 1..].to_string())),
@@ -4753,7 +4833,17 @@ impl Shell {
                 return ExecResult::Status(self.run_unset(&argv[1..], &target));
             }
             "set" => return ExecResult::Status(self.run_set(&argv[1..])),
-            "declare" | "typeset" => return ExecResult::Status(self.run_declare(&argv[1..])),
+            "declare" | "typeset" => {
+                // array_literal_args is indexed into the *original* argv
+                // (which still has argv[0] == "declare"/"typeset"), so
+                // every position shifts back by one to line up with
+                // argv[1..].
+                let shifted: Vec<_> = array_literal_args
+                    .iter()
+                    .filter_map(|(p, n, m, i)| p.checked_sub(1).map(|p2| (p2, n.clone(), *m, i.clone())))
+                    .collect();
+                return ExecResult::Status(self.run_declare(&argv[1..], &shifted));
+            }
             "readonly" => return ExecResult::Status(self.run_readonly(&argv[1..])),
             // exec CMD [args...] replaces this process image entirely (no
             // fork, no return on success) -- exactly what real bash does,
@@ -5399,26 +5489,105 @@ impl Shell {
 
     // `arr[i]=value`. Sets exactly that index -- no resizing/filling, since
     // the array is a sparse map, matching bash (gaps stay genuinely unset).
-    fn array_set_index(&mut self, name: &str, index: &str, value: String) {
+    // Returns the concrete indexed-array index actually written (None for
+    // an associative array, or on a bad-index error) -- used by
+    // apply_array_literal to know where a literal's own running
+    // "next index" counter should resume after an explicit `[i]=value`
+    // element.
+    fn array_set_index(&mut self, name: &str, index: &str, value: String) -> Option<usize> {
         if self.assoc_names.contains(name) {
             let key = self.expand_index_as_string(index);
             self.assoc_arrays.entry(name.to_string()).or_default().insert(key, value);
-            return;
+            return None;
         }
         let i = match arith::eval(index, self) {
             Ok(i) => match self.resolve_array_index(name, i) {
                 Some(idx) => idx,
                 None => {
                     sh_eprintln!(self, "bish: {}: bad array index: {}", name, index);
-                    return;
+                    return None;
                 }
             },
             Err(_) => {
                 sh_eprintln!(self, "bish: {}: bad array index: {}", name, index);
-                return;
+                return None;
             }
         };
         self.arrays.entry(name.to_string()).or_default().insert(i, value);
+        Some(i)
+    }
+
+    // Applies one `name=(...)`/`name+=(...)` array literal's elements to
+    // self.arrays/self.assoc_arrays (whichever `name` already is -- an
+    // indexed array unless self.assoc_names already contains it,
+    // matching how a bracketed key is interpreted the same way
+    // array_set_index already decides). Honors per-element `[index]=
+    // value` syntax alongside plain positional elements: a positional
+    // element continues from a running "next index" counter that a
+    // keyed element ahead of it bumps forward, matching bash (`(1
+    // [5]=x 2)` -> indices 0, 5, 6). Only meaningful for an indexed
+    // array -- an associative one has no positional-index concept at
+    // all, so a plain (unkeyed) element there is keyed by its own
+    // running counter's string form as a last resort (real bash errors
+    // on this instead; rare enough in practice that erroring isn't
+    // worth the extra plumbing here).
+    fn apply_array_literal(&mut self, name: &str, mode: AssignMode, items: &[ArrayLiteralItem]) {
+        let is_assoc = self.assoc_names.contains(name);
+        if mode == AssignMode::Set {
+            if is_assoc {
+                self.assoc_arrays.insert(name.to_string(), OrderedMap::default());
+            } else {
+                self.arrays.insert(name.to_string(), std::collections::BTreeMap::new());
+            }
+        }
+        let mut next_index: usize = match mode {
+            AssignMode::Append if !is_assoc => {
+                self.arrays.get(name).and_then(|m| m.keys().next_back()).map(|k| k + 1).unwrap_or(0)
+            }
+            _ => 0,
+        };
+        for item in items {
+            match item {
+                ArrayLiteralItem::Positional(w) => {
+                    let v = self.expand_word(w);
+                    if is_assoc {
+                        self.assoc_arrays.entry(name.to_string()).or_default().insert(next_index.to_string(), v);
+                    } else {
+                        self.arrays.entry(name.to_string()).or_default().insert(next_index, v);
+                    }
+                    next_index += 1;
+                }
+                ArrayLiteralItem::Keyed(index, w) => {
+                    let v = self.expand_word(w);
+                    if let Some(idx) = self.array_set_index(name, index, v) {
+                        next_index = idx + 1;
+                    }
+                }
+            }
+        }
+    }
+
+    // Reconstructs a display string for one `name=(...)`/`name+=(...)`
+    // array literal -- used only for `set -x` tracing when this appears
+    // as a later word of a declare/local/export/readonly/typeset
+    // command (see SimpleCommand::array_word_assigns's own doc
+    // comment); the actual application uses the structured items
+    // directly (apply_array_literal), never re-parses this text. Each
+    // element's expanded value is single-quote-escaped
+    // (crate::serialize::quote_literal) so embedded whitespace stays
+    // visually unambiguous; an element's own `[index]=` key (if any) is
+    // shown as its raw, unevaluated source text, matching bash's own
+    // xtrace output for an unresolved index expression.
+    fn array_literal_display(&mut self, name: &str, mode: AssignMode, items: &[ArrayLiteralItem]) -> String {
+        let op = if mode == AssignMode::Append { "+=" } else { "=" };
+        let mut parts = Vec::new();
+        for item in items {
+            parts.push(match item {
+                ArrayLiteralItem::Positional(w) => crate::serialize::quote_literal(&self.expand_word(w)),
+                ArrayLiteralItem::Keyed(index, w) => format!("[{}]={}", index, crate::serialize::quote_literal(&self.expand_word(w))),
+            });
+        }
+        format!("{name}{op}({})", parts.join(" "))
     }
 
     // Bash word-splitting: unquoted expansion results are split on
@@ -9002,7 +9171,7 @@ mod tests {
     #[test]
     fn declare_p_on_an_unset_name_errors_and_exits_1() {
         let mut shell = Shell::new();
-        let status = shell.run_declare(&strs(&["-p", "DEFINITELY_NOT_SET_XYZ"]));
+        let status = shell.run_declare(&strs(&["-p", "DEFINITELY_NOT_SET_XYZ"]), &[]);
         assert_eq!(status, 1);
     }
 
@@ -9011,7 +9180,7 @@ mod tests {
         let mut shell = Shell::new();
         shell.run_source_here("foo() { echo hi; }", "<test>");
         let buf = capture_output(&mut shell);
-        assert_eq!(shell.run_declare(&strs(&["-f", "foo"])), 0);
+        assert_eq!(shell.run_declare(&strs(&["-f", "foo"]), &[]), 0);
         let printed = buf.borrow().clone();
         assert!(printed.contains("foo"), "{printed:?}");
 
@@ -9028,14 +9197,14 @@ mod tests {
         let mut shell = Shell::new();
         shell.run_source_here("foo() { echo hi; }", "<test>");
         let buf = capture_output(&mut shell);
-        shell.run_declare(&strs(&["-F", "foo"]));
+        shell.run_declare(&strs(&["-F", "foo"]), &[]);
         assert_eq!(buf.borrow().as_str(), "declare -f foo\n");
     }
 
     #[test]
     fn declare_f_on_an_unknown_function_errors_and_exits_1() {
         let mut shell = Shell::new();
-        assert_eq!(shell.run_declare(&strs(&["-f", "not_a_real_function"])), 1);
+        assert_eq!(shell.run_declare(&strs(&["-f", "not_a_real_function"]), &[]), 1);
     }
 
     #[test]
@@ -9124,5 +9293,87 @@ mod tests {
         shell.restrict_to_builtins = true;
         let result = shell.run_source_here("not_a_real_builtin_or_function_xyz", "<test>");
         assert!(matches!(result, ExecResult::Status(127)), "{result:?}");
+    }
+
+    #[test]
+    fn array_literal_explicit_keys_are_sparse_indices_not_sequential() {
+        let mut shell = Shell::new();
+        shell.run_source_here("arr=([2]=x [5]=y)", "<test>");
+        assert_eq!(shell.arrays.get("arr").and_then(|m| m.get(&2)).map(String::as_str), Some("x"));
+        assert_eq!(shell.arrays.get("arr").and_then(|m| m.get(&5)).map(String::as_str), Some("y"));
+        assert_eq!(shell.arrays.get("arr").map(|m| m.len()), Some(2));
+    }
+
+    #[test]
+    fn array_literal_mixed_positional_and_keyed_resumes_the_running_index() {
+        // Matches real bash: (1 [5]=x 2) -> indices 0, 5, 6.
+        let mut shell = Shell::new();
+        shell.run_source_here("arr=(1 [5]=x 2)", "<test>");
+        let arr = shell.arrays.get("arr").cloned().unwrap_or_default();
+        assert_eq!(arr.get(&0).map(String::as_str), Some("1"));
+        assert_eq!(arr.get(&5).map(String::as_str), Some("x"));
+        assert_eq!(arr.get(&6).map(String::as_str), Some("2"));
+    }
+
+    #[test]
+    fn array_literal_append_continues_past_the_current_max_index() {
+        let mut shell = Shell::new();
+        shell.run_source_here("arr=(1 2 3); arr+=(4 5)", "<test>");
+        let arr = shell.arrays.get("arr").cloned().unwrap_or_default();
+        assert_eq!(arr.values().cloned().collect::<Vec<_>>(), vec!["1", "2", "3", "4", "5"]);
+    }
+
+    #[test]
+    fn array_literal_assoc_prefix_assignment_populates_declared_keys() {
+        let mut shell = Shell::new();
+        shell.run_source_here("declare -A m; m=([a]=1 [b]=2)", "<test>");
+        assert_eq!(shell.assoc_arrays.get("m").and_then(|m| m.get("a")).map(String::as_str), Some("1"));
+        assert_eq!(shell.assoc_arrays.get("m").and_then(|m| m.get("b")).map(String::as_str), Some("2"));
+    }
+
+    #[test]
+    fn declare_capital_a_with_an_inline_array_literal_as_a_later_word() {
+        // The actual gap this whole batch of work was about: `declare -A
+        // m=([a]=1 [b]=2)` used to mis-parse entirely (the parenthesized
+        // body got read as an unrelated subshell command) since array-
+        // literal recognition only applied in leading-prefix-assignment
+        // position, not to a later word of one of these five builtins.
+        let mut shell = Shell::new();
+        shell.run_source_here("declare -A m=([a]=1 [b]=2)", "<test>");
+        assert_eq!(shell.assoc_arrays.get("m").and_then(|m| m.get("a")).map(String::as_str), Some("1"));
+        assert_eq!(shell.assoc_arrays.get("m").and_then(|m| m.get("b")).map(String::as_str), Some("2"));
+    }
+
+    #[test]
+    fn declare_lowercase_a_with_an_inline_array_literal_as_a_later_word() {
+        let mut shell = Shell::new();
+        shell.run_source_here("declare -a arr=(1 2 3)", "<test>");
+        let arr = shell.arrays.get("arr").cloned().unwrap_or_default();
+        assert_eq!(arr.values().cloned().collect::<Vec<_>>(), vec!["1", "2", "3"]);
+    }
+
+    #[test]
+    fn typeset_accepts_the_same_inline_array_literal_as_declare() {
+        let mut shell = Shell::new();
+        shell.run_source_here("typeset -A m2=([x]=y)", "<test>");
+        assert_eq!(shell.assoc_arrays.get("m2").and_then(|m| m.get("x")).map(String::as_str), Some("y"));
+    }
+
+    #[test]
+    fn local_with_an_inline_array_literal_is_properly_function_scoped() {
+        let mut shell = Shell::new();
+        let buf = capture_output(&mut shell);
+        shell.run_source_here(r#"f() { local -A m=([a]=1 [b]=2); echo "${m[a]} ${m[b]}"; }; f"#, "<test>");
+        assert_eq!(buf.borrow().as_str(), "1 2\n");
+        assert!(!shell.assoc_names.contains("m"), "m must not leak out of the function");
+    }
+
+    #[test]
+    fn local_lowercase_a_with_an_inline_array_literal_is_properly_function_scoped() {
+        let mut shell = Shell::new();
+        let buf = capture_output(&mut shell);
+        shell.run_source_here(r#"f() { local -a arr=(1 2 3); echo "${arr[@]}"; }; f"#, "<test>");
+        assert_eq!(buf.borrow().as_str(), "1 2 3\n");
+        assert!(!shell.arrays.contains_key("arr"), "arr must not leak out of the function");
     }
 }

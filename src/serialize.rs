@@ -6,7 +6,7 @@
 // to round-trip whatever a function body can contain.
 
 use crate::lexer::{Chunk, ReplaceAnchor, TransformKind, VarOp};
-use crate::parser::{AndOr, AssignMode, Combinator, Command, ListItem, Pipeline, Redirect, Sep, SimpleCommand, Word};
+use crate::parser::{AndOr, ArrayLiteralItem, AssignMode, Combinator, Command, ListItem, Pipeline, Redirect, Sep, SimpleCommand, Word};
 
 pub fn serialize_program(prog: &[ListItem]) -> String {
     let mut s = String::new();
@@ -149,20 +149,45 @@ fn serialize_simple(sc: &SimpleCommand) -> String {
         parts.push(format!("{}{}{}", name, op, serialize_word(val)));
     }
     for (name, mode, items) in &sc.array_assigns {
-        let op = if *mode == AssignMode::Append { "+=" } else { "=" };
-        let words: Vec<String> = items.iter().map(serialize_word).collect();
-        parts.push(format!("{}{}({})", name, op, words.join(" ")));
+        parts.push(serialize_array_literal_assign(name, *mode, items));
     }
     for (name, index, val) in &sc.index_assigns {
         parts.push(format!("{}[{}]={}", name, index, serialize_word(val)));
     }
-    for w in &sc.words {
+    // array_word_assigns (a later-word declare-family array literal, e.g.
+    // `declare -A m=([a]=1)`) has no placeholder in `sc.words` -- it's
+    // spliced back in at its own recorded position instead, matching
+    // SimpleCommand::array_word_assigns's own doc comment.
+    let mut pending = sc.array_word_assigns.iter().peekable();
+    for (i, w) in sc.words.iter().enumerate() {
+        while let Some((pos, name, mode, items)) = pending.peek() {
+            if *pos != i {
+                break;
+            }
+            parts.push(serialize_array_literal_assign(name, *mode, items));
+            pending.next();
+        }
         parts.push(serialize_word(w));
+    }
+    for (_, name, mode, items) in pending {
+        parts.push(serialize_array_literal_assign(name, *mode, items));
     }
     for r in &sc.redirects {
         parts.push(serialize_redirect(r));
     }
     parts.join(" ")
+}
+
+fn serialize_array_literal_assign(name: &str, mode: AssignMode, items: &[ArrayLiteralItem]) -> String {
+    let op = if mode == AssignMode::Append { "+=" } else { "=" };
+    let words: Vec<String> = items
+        .iter()
+        .map(|item| match item {
+            ArrayLiteralItem::Positional(w) => serialize_word(w),
+            ArrayLiteralItem::Keyed(index, w) => format!("[{}]={}", index, serialize_word(w)),
+        })
+        .collect();
+    format!("{}{}({})", name, op, words.join(" "))
 }
 
 pub fn serialize_redirect(r: &Redirect) -> String {
