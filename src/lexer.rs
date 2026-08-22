@@ -1883,7 +1883,8 @@ fn try_brace_range(inner: &str) -> Option<Vec<String>> {
     if let (Ok(a), Ok(b)) = (parts[0].parse::<i64>(), parts[1].parse::<i64>()) {
         let items: Vec<i64> =
             if a <= b { (a..=b).step_by(step).collect() } else { (b..=a).rev().step_by(step).collect() };
-        return Some(items.into_iter().map(|n| n.to_string()).collect());
+        let pad_width = brace_range_zero_pad_width(parts[0], parts[1]);
+        return Some(items.into_iter().map(|n| format_brace_range_int(n, pad_width)).collect());
     }
     let (ca, cb): (Vec<char>, Vec<char>) = (parts[0].chars().collect(), parts[1].chars().collect());
     if ca.len() == 1 && cb.len() == 1 {
@@ -1893,6 +1894,33 @@ fn try_brace_range(inner: &str) -> Option<Vec<String>> {
         return Some(range.into_iter().filter_map(char::from_u32).map(String::from).collect());
     }
     None
+}
+
+// Zero-padding trigger: bash pads a numeric brace range's output to a
+// common field width whenever either endpoint was written with a
+// literal leading zero on a multi-digit number (`{01..5}`, `{1..05}`)
+// -- a lone "0"/"-0" doesn't count (`{-0..3}` stays unpadded). The
+// field width is just the longer endpoint's own written length, sign
+// included, so a negative endpoint reserves a column for '-' that
+// non-negative members of the same range fill with an extra zero
+// instead (`{-01..3}` -> "-01 000 001 002 003").
+fn brace_range_zero_pad_width(a: &str, b: &str) -> Option<usize> {
+    let has_leading_zero = |s: &str| {
+        let digits = s.trim_start_matches(['+', '-']);
+        digits.len() >= 2 && digits.starts_with('0')
+    };
+    if has_leading_zero(a) || has_leading_zero(b) { Some(a.chars().count().max(b.chars().count())) } else { None }
+}
+
+// Rust's own zero-padded integer formatting already places the '-'
+// before the zero-fill and counts it toward the requested width, which
+// is exactly brace_range_zero_pad_width's own field-width definition
+// above -- no separate sign handling needed here.
+fn format_brace_range_int(n: i64, pad_width: Option<usize>) -> String {
+    match pad_width {
+        Some(width) => format!("{:0width$}", n, width = width),
+        None => n.to_string(),
+    }
 }
 
 fn split_top_level_commas(s: &str) -> Vec<String> {
@@ -1920,6 +1948,37 @@ fn split_top_level_commas(s: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn brace_range_with_a_leading_zero_endpoint_pads_every_member() {
+        assert_eq!(brace_expand("{01..5}"), vec!["01", "02", "03", "04", "05"]);
+        assert_eq!(brace_expand("{1..05}"), vec!["01", "02", "03", "04", "05"]);
+        assert_eq!(brace_expand("{001..5}"), vec!["001", "002", "003", "004", "005"]);
+    }
+
+    #[test]
+    fn brace_range_zero_padding_reserves_a_sign_column_for_negative_endpoints() {
+        assert_eq!(brace_expand("{-01..3}"), vec!["-01", "000", "001", "002", "003"]);
+        assert_eq!(brace_expand("{-5..-01}"), vec!["-05", "-04", "-03", "-02", "-01"]);
+    }
+
+    #[test]
+    fn brace_range_a_lone_zero_endpoint_does_not_trigger_padding() {
+        assert_eq!(brace_expand("{0..3}"), vec!["0", "1", "2", "3"]);
+        assert_eq!(brace_expand("{-0..3}"), vec!["0", "1", "2", "3"]);
+    }
+
+    #[test]
+    fn brace_range_without_any_leading_zero_is_unpadded() {
+        assert_eq!(brace_expand("{1..5}"), vec!["1", "2", "3", "4", "5"]);
+        assert_eq!(brace_expand("{5..1}"), vec!["5", "4", "3", "2", "1"]);
+    }
+
+    #[test]
+    fn brace_range_padding_still_applies_with_a_reversed_or_stepped_range() {
+        assert_eq!(brace_expand("{5..01}"), vec!["05", "04", "03", "02", "01"]);
+        assert_eq!(brace_expand("{00..10..2}"), vec!["00", "02", "04", "06", "08", "10"]);
+    }
 
     // Regression: a `${var#pattern}`-style pattern is one semantic word,
     // not a command line -- an unquoted trailing space is pattern content,
