@@ -506,6 +506,26 @@ pub struct Shell {
     // interactive shells, or a script that explicitly opts in, get it).
     // `jobs`/`wait`/`kill` aren't gated by this; only fg/bg are.
     opt_monitor: bool,
+    // `set -r` (bash's own restricted-shell mode -- NOT the same thing
+    // as restrict_to_builtins below, which is bish's own unrelated
+    // command-mode-colon-line feature). Only a short flag in real bash
+    // -- confirmed there's no `-o restricted` name at all (`set -o`'s
+    // own listing never includes it, unlike every other `-o` name). A
+    // one-way latch: apply_shell_flag only ever turns this on, never
+    // off, matching real bash's own "turning off restricted mode is not
+    // possible" rule (confirmed: `set +r` errors there and leaves it
+    // set). See run_cd/the "exec"/"."/"source" arms in run_single,
+    // check_restricted_command_name, and open_out for what it actually
+    // enforces.
+    opt_restricted: bool,
+    // `set -o posix`: recognized and toggleable (so a script that
+    // merely checks/sets it doesn't break) but not behaviorally
+    // enforced -- real POSIX mode is dozens of small, scattered parsing/
+    // expansion differences throughout bash; this doesn't attempt that,
+    // same "accepted but not enforced" spirit as this shell's own -u/
+    // -l/-n declare attributes on names that aren't its own scalar
+    // variables.
+    opt_posix: bool,
     // Suppresses errexit while >0 -- set around if/while/until conditions
     // and negated (`!`) pipelines, the cases POSIX explicitly exempts from
     // triggering -e (a failing condition is meant to be checked, not
@@ -647,6 +667,8 @@ impl Shell {
             opt_pipefail: false,
             opt_noglob: false,
             opt_monitor: false,
+            opt_restricted: false,
+            opt_posix: false,
             suppress_errexit: 0,
             current_stderr_target: None,
             restrict_to_builtins: false,
@@ -839,6 +861,12 @@ impl Shell {
             opt_pipefail: self.opt_pipefail,
             opt_noglob: self.opt_noglob,
             opt_monitor: self.opt_monitor,
+            // Restricted mode is a shell-wide security property, not
+            // something a subshell/command-substitution child should be
+            // able to shed -- matches real bash, which keeps it in every
+            // descendant.
+            opt_restricted: self.opt_restricted,
+            opt_posix: self.opt_posix,
             suppress_errexit: 0,
             current_stderr_target: None,
             restrict_to_builtins: false,
@@ -1456,7 +1484,7 @@ impl Shell {
                     continue;
                 }
             }
-            if self.readonly_names.contains(n.as_str()) {
+            if self.readonly_names.contains(n.as_str()) || self.is_restricted_readonly_name(n) {
                 write_diagnostic(stderr_target, &format!("bish: unset: {}: cannot unset: readonly variable", n), self.sink.clone());
                 continue;
             }
@@ -2916,6 +2944,10 @@ impl Shell {
     }
 
     fn run_cd(&mut self, args: &[String]) -> i32 {
+        if self.opt_restricted {
+            sh_eprintln!(self, "bish: cd: restricted");
+            return 1;
+        }
         let old = self.cwd.to_string_lossy().into_owned();
         let target = if let Some(dir) = args.first() {
             if dir == "-" {
@@ -3195,6 +3227,15 @@ impl Shell {
             'x' => self.opt_xtrace = on,
             'f' => self.opt_noglob = on,
             'm' => self.opt_monitor = on,
+            // One-way latch: `set +r` is simply ignored rather than
+            // turning it back off (see opt_restricted's own doc
+            // comment). Real bash instead makes `set +r` itself a hard
+            // "invalid option" error -- not replicated here, since no
+            // other flag in this shell errors on an unrecognized/
+            // disallowed combination either; the net behavioral
+            // guarantee (restricted mode can't be turned off) is the
+            // part that actually matters.
+            'r' if on => self.opt_restricted = true,
             _ => {}
         }
     }
@@ -3207,6 +3248,7 @@ impl Shell {
             "xtrace" => self.opt_xtrace = on,
             "noglob" => self.opt_noglob = on,
             "monitor" => self.opt_monitor = on,
+            "posix" => self.opt_posix = on,
             _ => {}
         }
     }
@@ -4364,6 +4406,7 @@ impl Shell {
                 let mut i = 1;
                 let mut mode_v = false;
                 let mut mode_vv = false;
+                let mut mode_p = false;
                 while i < argv.len() {
                     match argv[i].as_str() {
                         "-v" => {
@@ -4374,7 +4417,10 @@ impl Shell {
                             mode_vv = true;
                             i += 1;
                         }
-                        "-p" => i += 1,
+                        "-p" => {
+                            mode_p = true;
+                            i += 1;
+                        }
                         _ => break,
                     }
                 }
@@ -4386,6 +4432,13 @@ impl Shell {
                 }
                 if i >= argv.len() {
                     return ExecResult::Status(0);
+                }
+                if self.opt_restricted && mode_p {
+                    sh_eprintln!(self, "bish: command: -p: restricted");
+                    return ExecResult::Status(1);
+                }
+                if self.check_restricted_command_name(&argv[i]) {
+                    return ExecResult::Status(1);
                 }
                 let mut ext = Command::new(&argv[i]);
                 ext.args(&argv[i + 1..]);
@@ -4933,6 +4986,10 @@ impl Shell {
                         return ExecResult::Status(2);
                     }
                 };
+                if self.opt_restricted && path.contains('/') {
+                    sh_eprintln!(self, "bish: {}: {}: restricted", name, path);
+                    return ExecResult::Status(1);
+                }
                 match std::fs::read_to_string(&path) {
                     Ok(src) => return self.run_source_here(&src, &path),
                     Err(e) => {
@@ -5021,6 +5078,10 @@ impl Shell {
             // and available here as safe std (CommandExt::exec wraps
             // execvp, distinct from the fork() this shell avoids).
             "exec" if argv.len() > 1 => {
+                if self.opt_restricted {
+                    sh_eprintln!(self, "bish: exec: restricted");
+                    return ExecResult::Status(1);
+                }
                 let redirs = match self.resolve_redirects(cmd) {
                     Ok(r) => r,
                     Err(e) => {
@@ -5101,6 +5162,10 @@ impl Shell {
         if self.restrict_to_builtins {
             sh_eprintln!(self, "bish: {}: command mode only allows builtins -- use `command {}` to run it", name, name);
             return ExecResult::Status(127);
+        }
+
+        if self.check_restricted_command_name(&name) {
+            return ExecResult::Status(1);
         }
 
         let redirs = match self.resolve_redirects(cmd) {
@@ -6229,6 +6294,9 @@ impl Shell {
                 if self.opt_xtrace {
                     s.push('x');
                 }
+                if self.opt_restricted {
+                    s.push('r');
+                }
                 s
             }
             _ if !name.is_empty() && name.chars().all(|c| c.is_ascii_digit()) => {
@@ -6421,7 +6489,7 @@ impl Shell {
         } else {
             name
         };
-        if self.readonly_names.contains(name) {
+        if self.readonly_names.contains(name) || self.is_restricted_readonly_name(name) {
             sh_eprintln!(self, "bish: {}: readonly variable", name);
             return;
         }
@@ -6516,6 +6584,52 @@ impl Shell {
     // since those are already covered by resolve_redirects' own
     // extra_fds/dup_stderr_to_stdout, computed separately by the caller
     // from the same redirect list.
+    // The one place every redirect that opens a file for *writing*
+    // funnels through (`>`/`>>`, `2>`/`2>>`, `&>`/`&>>`, `N>file`) --
+    // restricted mode's "cannot redirect output" check lives here so it
+    // covers all of them at once, rather than duplicated at each
+    // Redirect variant's own resolution site.
+    fn open_out(&self, path: &str, append: bool) -> Result<std::fs::File, String> {
+        if self.opt_restricted {
+            return Err(format!("{}: restricted: cannot redirect output", path));
+        }
+        std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .append(append)
+            .truncate(!append)
+            .open(path)
+            .map_err(|e| format!("{}: {}", path, e))
+    }
+
+    // Restricted mode: SHELL/PATH/ENV/BASH_ENV can't be set or unset --
+    // real bash enforces this by reporting exactly the same "readonly
+    // variable"/"cannot unset: readonly variable" errors a genuinely
+    // `readonly`'d name would, so this rides the same two existing
+    // readonly_names checks (assign_var_impl/run_unset) rather than a
+    // separate error path, without actually inserting these into
+    // readonly_names itself (that would make them readonly forever,
+    // including outside restricted mode, and would wrongly show up as
+    // `-r` in declare -p/${v@a}).
+    fn is_restricted_readonly_name(&self, name: &str) -> bool {
+        self.opt_restricted && matches!(name, "SHELL" | "PATH" | "ENV" | "BASH_ENV")
+    }
+
+    // Restricted mode: "cannot specify `/' in command names" -- blocks
+    // running an external command by an explicit path, whether it's an
+    // ordinary command word containing '/' or `command NAME`'s own
+    // bypass-spawn. Prints bash's own exact error text and returns true
+    // when blocked, so a call site can just
+    // `if self.check_restricted_command_name(name) { return ...; }`.
+    fn check_restricted_command_name(&mut self, name: &str) -> bool {
+        if self.opt_restricted && name.contains('/') {
+            sh_eprintln!(self, "bish: {}: restricted: cannot specify `/' in command names", name);
+            true
+        } else {
+            false
+        }
+    }
+
     fn resolve_plain_fd012(
         &mut self,
         redirects: &[Redirect],
@@ -6563,11 +6677,11 @@ impl Shell {
             }
         };
         let stdout = match stdout_target {
-            Some((p, append)) => Some(open_out(&p, append)?),
+            Some((p, append)) => Some(self.open_out(&p, append)?),
             None => None,
         };
         let stderr = match stderr_target {
-            Some((p, append)) => Some(open_out(&p, append)?),
+            Some((p, append)) => Some(self.open_out(&p, append)?),
             None => None,
         };
         Ok((stdin, stdout, stderr))
@@ -6615,7 +6729,7 @@ impl Shell {
                 Redirect::DupErrToOut => dup_err_to_out = true,
                 Redirect::FdOut { fd, word, append } => {
                     let p = self.expand_word(word);
-                    let file = open_out(&p, *append)?;
+                    let file = self.open_out(&p, *append)?;
                     extra_fds.push(ExtraFd::Open { fd: *fd as i32, file });
                 }
                 Redirect::FdIn { fd, word } => {
@@ -6650,7 +6764,7 @@ impl Shell {
             }
         };
         let stdout_file: Option<std::fs::File> = match &stdout_target {
-            Some((p, append)) => Some(open_out(p, *append)?),
+            Some((p, append)) => Some(self.open_out(p, *append)?),
             None => None,
         };
         // `2>&1`'s actual fd-dup happens via dup2_stderr_to_stdout at each
@@ -6661,7 +6775,7 @@ impl Shell {
             None
         } else {
             match &stderr_target {
-                Some((p, append)) => Some(open_out(p, *append)?),
+                Some((p, append)) => Some(self.open_out(p, *append)?),
                 None => None,
             }
         };
@@ -8499,7 +8613,7 @@ fn shopt_default_on(name: &str) -> Option<bool> {
 // with apply_shell_option's own match arms above -- only names that
 // actually gate real bish behavior, same "don't advertise a name that
 // does nothing" principle KNOWN_BISHOPTS follows for its own registry.
-const SET_O_OPTIONS: &[&str] = &["pipefail", "errexit", "nounset", "xtrace", "noglob", "monitor"];
+const SET_O_OPTIONS: &[&str] = &["pipefail", "errexit", "nounset", "xtrace", "noglob", "monitor", "posix"];
 
 // A bishopt option's type, plus its own default value -- for Str and
 // Color that's the literal default text (parsed the same way a `--set`
@@ -8625,15 +8739,6 @@ fn resolve_in_path(name: &str) -> Option<String> {
     None
 }
 
-fn open_out(path: &str, append: bool) -> Result<std::fs::File, String> {
-    std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .append(append)
-        .truncate(!append)
-        .open(path)
-        .map_err(|e| format!("{}: {}", path, e))
-}
 
 fn command_own_redirects(cmd: &parser::Command) -> &[Redirect] {
     match cmd {
@@ -9863,5 +9968,130 @@ mod tests {
         shell.run_source_here(r#"f() { local -a arr=(1 2 3); echo "${arr[@]}"; }; f"#, "<test>");
         assert_eq!(buf.borrow().as_str(), "1 2 3\n");
         assert!(!shell.arrays.contains_key("arr"), "arr must not leak out of the function");
+    }
+
+    #[test]
+    fn restricted_mode_blocks_cd() {
+        let mut shell = Shell::new();
+        shell.run_source_here("set -r", "<test>");
+        let result = shell.run_source_here("cd /tmp", "<test>");
+        assert!(matches!(result, ExecResult::Status(1)), "{result:?}");
+    }
+
+    #[test]
+    fn restricted_mode_is_a_one_way_latch() {
+        let mut shell = Shell::new();
+        shell.run_source_here("set -r; set +r", "<test>");
+        let result = shell.run_source_here("cd /tmp", "<test>");
+        assert!(matches!(result, ExecResult::Status(1)), "{result:?}");
+    }
+
+    #[test]
+    fn restricted_mode_blocks_a_slash_in_a_command_name() {
+        let mut shell = Shell::new();
+        shell.run_source_here("set -r", "<test>");
+        let result = shell.run_source_here("/bin/echo hi", "<test>");
+        assert!(matches!(result, ExecResult::Status(1)), "{result:?}");
+    }
+
+    #[test]
+    fn restricted_mode_blocks_command_dash_p() {
+        let mut shell = Shell::new();
+        shell.run_source_here("set -r", "<test>");
+        let result = shell.run_source_here("command -p echo hi", "<test>");
+        assert!(matches!(result, ExecResult::Status(1)), "{result:?}");
+    }
+
+    #[test]
+    fn restricted_mode_protects_shell_path_env_bash_env() {
+        let mut shell = Shell::new();
+        shell.run_source_here("set -r", "<test>");
+        for name in ["SHELL", "PATH", "ENV", "BASH_ENV"] {
+            let result = shell.run_source_here(&format!("{name}=/tmp"), "<test>");
+            assert!(matches!(result, ExecResult::Status(0)), "{name}: {result:?}");
+        }
+        // Still readable/unchanged, just refused as a write target.
+        assert_ne!(shell.lookup_var("PATH"), "/tmp");
+    }
+
+    #[test]
+    fn restricted_mode_blocks_unsetting_path() {
+        let mut shell = Shell::new();
+        shell.run_source_here("set -r", "<test>");
+        shell.run_source_here("unset PATH", "<test>");
+        assert!(shell.var_is_set("PATH"));
+    }
+
+    #[test]
+    fn restricted_mode_blocks_output_redirection_for_an_external_command() {
+        let mut shell = Shell::new();
+        shell.run_source_here("set -r", "<test>");
+        let result = shell.run_source_here("cat /etc/hostname > /tmp/bish_restricted_test_xyz", "<test>");
+        assert!(matches!(result, ExecResult::Status(1)), "{result:?}");
+        assert!(!std::path::Path::new("/tmp/bish_restricted_test_xyz").exists());
+    }
+
+    #[test]
+    fn restricted_mode_allows_input_redirection() {
+        // Plain `<` must not be treated as a write and refused --
+        // confirmed by exit status alone (an external command's own
+        // stdout goes straight to this process's real inherited stdio,
+        // not through capture_output's sink, so its content isn't
+        // observable from a unit test here).
+        let mut shell = Shell::new();
+        shell.run_source_here("set -r", "<test>");
+        let result = shell.run_source_here("cat < /etc/hostname", "<test>");
+        assert!(matches!(result, ExecResult::Status(0)), "{result:?}");
+    }
+
+    #[test]
+    fn restricted_mode_blocks_exec_with_a_command() {
+        let mut shell = Shell::new();
+        shell.run_source_here("set -r", "<test>");
+        let result = shell.run_source_here("exec ls", "<test>");
+        assert!(matches!(result, ExecResult::Status(1)), "{result:?}");
+    }
+
+    #[test]
+    fn restricted_mode_allows_bare_exec_and_its_own_redirects() {
+        let mut shell = Shell::new();
+        shell.run_source_here("set -r", "<test>");
+        let result = shell.run_source_here("exec", "<test>");
+        assert!(matches!(result, ExecResult::Status(0)), "{result:?}");
+    }
+
+    #[test]
+    fn restricted_mode_blocks_source_with_a_slash() {
+        let mut shell = Shell::new();
+        shell.run_source_here("set -r", "<test>");
+        let result = shell.run_source_here(". /etc/hostname", "<test>");
+        assert!(matches!(result, ExecResult::Status(1)), "{result:?}");
+        let result2 = shell.run_source_here("source /etc/hostname", "<test>");
+        assert!(matches!(result2, ExecResult::Status(1)), "{result2:?}");
+    }
+
+    #[test]
+    fn restricted_mode_persists_into_a_virtual_child() {
+        let mut shell = Shell::new();
+        shell.run_source_here("set -r", "<test>");
+        let child = shell.new_virtual_child();
+        assert!(child.opt_restricted);
+    }
+
+    #[test]
+    fn restricted_mode_shows_up_in_dollar_dash() {
+        let mut shell = Shell::new();
+        shell.run_source_here("set -r", "<test>");
+        assert!(shell.lookup_var("-").contains('r'));
+    }
+
+    #[test]
+    fn set_o_posix_is_recognized_and_toggleable() {
+        let mut shell = Shell::new();
+        let result = shell.run_source_here("set -o posix", "<test>");
+        assert!(matches!(result, ExecResult::Status(0)), "{result:?}");
+        assert!(shell.opt_posix);
+        shell.run_source_here("set +o posix", "<test>");
+        assert!(!shell.opt_posix);
     }
 }
