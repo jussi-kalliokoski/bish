@@ -9,7 +9,7 @@ use crate::bishedit::highlight;
 use crate::builtins;
 use crate::compgen;
 use crate::glob;
-use crate::lexer::{Chunk, ReplaceAnchor, VarOp};
+use crate::lexer::{Chunk, ReplaceAnchor, TransformKind, VarOp};
 use crate::parser::{
     self, AndOr, AssignMode, Combinator, ListItem, Pipeline, Program, Redirect, Sep, SimpleCommand, Word,
 };
@@ -5342,6 +5342,7 @@ impl Shell {
                 let repl = self.expand_raw(repl);
                 glob_replace(&cur, &pattern, &repl, *global, *anchor)
             }
+            VarOp::Transform(kind) => apply_transform(&cur, *kind),
         }
     }
 
@@ -5413,6 +5414,7 @@ impl Shell {
                 let repl = self.expand_raw(repl);
                 glob_replace(&cur, &pattern, &repl, *global, *anchor)
             }
+            VarOp::Transform(kind) => apply_transform(&cur, *kind),
         }
     }
 
@@ -7419,6 +7421,49 @@ fn glob_replace(s: &str, pattern: &str, repl: &str, global: bool, anchor: Replac
     out
 }
 
+fn apply_transform(cur: &str, kind: TransformKind) -> String {
+    match kind {
+        TransformKind::Quote => crate::serialize::quote_literal(cur),
+        TransformKind::Upper => cur.to_uppercase(),
+        TransformKind::Lower => cur.to_lowercase(),
+        TransformKind::Escape => expand_backslash_escapes(cur),
+    }
+}
+
+// Same escape table as the lexer's own $'...' reader (read_ansi_c_string)
+// -- an unrecognized backslash sequence passes through literally rather
+// than dropping the backslash, matching bash's own $'...' behavior.
+fn expand_backslash_escapes(s: &str) -> String {
+    let mut out = String::new();
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => out.push('\n'),
+            Some('t') => out.push('\t'),
+            Some('r') => out.push('\r'),
+            Some('\\') => out.push('\\'),
+            Some('\'') => out.push('\''),
+            Some('"') => out.push('"'),
+            Some('a') => out.push('\x07'),
+            Some('b') => out.push('\x08'),
+            Some('e') => out.push('\x1b'),
+            Some('f') => out.push('\x0c'),
+            Some('v') => out.push('\x0b'),
+            Some('0') => out.push('\0'),
+            Some(other) => {
+                out.push('\\');
+                out.push(other);
+            }
+            None => out.push('\\'),
+        }
+    }
+    out
+}
+
 // Kept in sync with run_single's builtin dispatch match by hand -- used
 // only by `command -v`/`type` to classify a name, not to actually run
 // anything, so a name missing from this list just means those two
@@ -8473,5 +8518,58 @@ mod tests {
         let mut shell = Shell::new();
         let result = shell.run_source_here("true; then echo hi", "<test>");
         assert!(matches!(result, ExecResult::Status(2)), "{result:?}");
+    }
+
+    #[test]
+    fn var_transform_q_shell_quotes_the_value() {
+        let mut shell = Shell::new();
+        let buf = capture_output(&mut shell);
+        shell.run_source_here(r#"v="hello world"; echo "${v@Q}""#, "<test>");
+        assert_eq!(buf.borrow().as_str(), "'hello world'\n");
+    }
+
+    #[test]
+    fn var_transform_u_and_l_change_case_of_the_whole_value() {
+        let mut shell = Shell::new();
+        let buf = capture_output(&mut shell);
+        shell.run_source_here(r#"v="Hello World"; echo "${v@U}"; echo "${v@L}""#, "<test>");
+        assert_eq!(buf.borrow().as_str(), "HELLO WORLD\nhello world\n");
+    }
+
+    #[test]
+    fn var_transform_e_expands_backslash_escapes_like_ansi_c_quoting() {
+        let mut shell = Shell::new();
+        let buf = capture_output(&mut shell);
+        shell.run_source_here(r#"v='a\tb\nc'; printf '%s' "${v@E}""#, "<test>");
+        assert_eq!(buf.borrow().as_str(), "a\tb\nc");
+    }
+
+    #[test]
+    fn var_transform_e_leaves_an_unrecognized_escape_untouched() {
+        let mut shell = Shell::new();
+        let buf = capture_output(&mut shell);
+        shell.run_source_here(r#"v='a\zb'; printf '%s' "${v@E}""#, "<test>");
+        assert_eq!(buf.borrow().as_str(), "a\\zb");
+    }
+
+    #[test]
+    fn an_unrecognized_at_transform_letter_falls_back_to_a_literal_name() {
+        // Matches every other "unrecognized operator syntax" case in
+        // parse_brace_content -- `${v@Z}` isn't one of the four
+        // implemented transform letters, so the whole `${...}` is
+        // treated as a best-effort literal (nonexistent) variable name
+        // rather than crashing or silently dropping the '@'.
+        let mut shell = Shell::new();
+        let buf = capture_output(&mut shell);
+        shell.run_source_here(r#"v=hi; echo "[${v@Z}]""#, "<test>");
+        assert_eq!(buf.borrow().as_str(), "[]\n");
+    }
+
+    #[test]
+    fn array_element_transform_q_quotes_just_that_element() {
+        let mut shell = Shell::new();
+        let buf = capture_output(&mut shell);
+        shell.run_source_here(r#"a=("one two" three); echo "${a[0]@Q}""#, "<test>");
+        assert_eq!(buf.borrow().as_str(), "'one two'\n");
     }
 }

@@ -90,6 +90,11 @@ pub enum VarOp {
     // deletion). pattern/repl are raw text, expanded at match/substitution
     // time.
     Replace { pattern: String, repl: String, global: bool, anchor: ReplaceAnchor },
+    // ${V@Q}/@U/@L/@E -- bash's "parameter transformation" operators,
+    // scoped to the four that are pure string transforms of the value
+    // (see TransformKind's own doc comment for the rest of bash's set
+    // and why they're not here yet).
+    Transform(TransformKind),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -97,6 +102,26 @@ pub enum ReplaceAnchor {
     None,
     Start,
     End,
+}
+
+// bash also defines `@A`/`@a`/`@P`/`@K`: `@A`/`@a` need the same
+// attribute/declare-style machinery `declare -p` does (itself a
+// separate, still-unimplemented gap); `@P` needs bash's own PS1
+// backslash-escape prompt expander, which bish's hardcoded prompt
+// doesn't implement at all; `@K` is array-specific key/value pair
+// output. All four are left unrecognized for now -- parse_operator_suffix
+// falls back to treating the whole `${...}` as a literal name, same as
+// any other unrecognized operator syntax.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum TransformKind {
+    // Shell-quoted so the result can be reused as input (`${v@Q}`).
+    Quote,
+    // Upper/lowercase the entire value (`${v@U}`/`${v@L}`).
+    Upper,
+    Lower,
+    // Expands backslash escape sequences in the value the same way
+    // `$'...'` does (`${v@E}`).
+    Escape,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1718,6 +1743,20 @@ fn parse_operator_suffix(rest: &str) -> Option<VarOp> {
     }
     if let Some(w) = rest.strip_prefix(',') {
         return Some(VarOp::CaseConvert { pattern: w.to_string(), upper: false, all: false });
+    }
+    if let Some(spec) = rest.strip_prefix('@') {
+        return match spec {
+            "Q" => Some(VarOp::Transform(TransformKind::Quote)),
+            "U" => Some(VarOp::Transform(TransformKind::Upper)),
+            "L" => Some(VarOp::Transform(TransformKind::Lower)),
+            "E" => Some(VarOp::Transform(TransformKind::Escape)),
+            // `@A`/`@a`/`@P`/`@K` and anything else after '@': not
+            // recognized (see TransformKind's own doc comment) --
+            // falling back to None here, same as any other unrecognized
+            // operator syntax, lets the caller treat the whole thing as
+            // a literal name instead of silently misparsing it.
+            _ => None,
+        };
     }
     None
 }
