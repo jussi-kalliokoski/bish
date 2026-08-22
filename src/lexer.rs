@@ -1153,6 +1153,75 @@ impl<'a> Lexer<'a> {
         Ok((chunks, plain))
     }
 
+    // Scans the raw text between `${` and its matching `}`, tracking brace
+    // depth for plain unquoted/unescaped `{`/`}` so a `}` reached only
+    // through a nested expansion -- most commonly a double-quoted
+    // alternate value that itself contains `${...}`, e.g. `${v+"${v}"}`
+    // -- isn't mistaken for the outer terminator. Quoting/escaping here
+    // mirrors capture_balanced_parens's own quote loops. Confirmed against
+    // real bash's own scanning rules: `${x:-{}}` => "{}" (plain braces
+    // still count toward depth), `${x:-\{}` => "{" (an escaped brace
+    // doesn't), `${y:-"a}b"}` => "a}b" (a quoted brace never does). No
+    // unterminated-input error path, same best-effort convention as the
+    // loop this replaces.
+    fn capture_var_expansion_body(&mut self) -> (String, bool) {
+        let mut inner = String::new();
+        let mut depth: usize = 0;
+        loop {
+            match self.advance() {
+                None => return (inner, false),
+                Some('}') if depth == 0 => return (inner, true),
+                Some('}') => {
+                    depth -= 1;
+                    inner.push('}');
+                }
+                Some('{') => {
+                    depth += 1;
+                    inner.push('{');
+                }
+                Some('\\') => {
+                    inner.push('\\');
+                    if let Some(n) = self.advance() {
+                        inner.push(n);
+                    }
+                }
+                Some('\'') => {
+                    inner.push('\'');
+                    loop {
+                        match self.advance() {
+                            None => return (inner, false),
+                            Some('\'') => {
+                                inner.push('\'');
+                                break;
+                            }
+                            Some(c) => inner.push(c),
+                        }
+                    }
+                }
+                Some('"') => {
+                    inner.push('"');
+                    loop {
+                        match self.advance() {
+                            None => return (inner, false),
+                            Some('"') => {
+                                inner.push('"');
+                                break;
+                            }
+                            Some('\\') => {
+                                inner.push('\\');
+                                if let Some(n) = self.advance() {
+                                    inner.push(n);
+                                }
+                            }
+                            Some(c) => inner.push(c),
+                        }
+                    }
+                }
+                Some(c) => inner.push(c),
+            }
+        }
+    }
+
     // Consumes a variable reference (command substitution, arithmetic
     // expansion, or ${...} parameter expansion) after the '$' has already
     // been consumed, and pushes the appropriate Chunk, or a literal "$" if
@@ -1181,23 +1250,14 @@ impl<'a> Lexer<'a> {
             // comment. Recorded once we know a real chunk will be pushed
             // (the empty-name case below returns early with none).
             let start = self.pos;
-            let mut inner = String::new();
-            // Unlike capture_balanced_parens/capture_backtick, this loop
+            // Unlike capture_balanced_parens/capture_backtick, this scan
             // has no unterminated-input error path (matches this
             // function's pre-existing best-effort behavior) -- so `closed`
             // distinguishes "stopped at a real '}'" (span excludes it,
             // same delimiter-excluded convention as elsewhere) from "ran
             // out of input first" (span includes every char actually
             // consumed, matching what `inner` itself already contains).
-            let mut closed = false;
-            while let Some(c) = self.chars.peek().copied() {
-                self.advance();
-                if c == '}' {
-                    closed = true;
-                    break;
-                }
-                inner.push(c);
-            }
+            let (inner, closed) = self.capture_var_expansion_body();
             let span = start..(if closed { self.pos - 1 } else { self.pos });
             match parse_brace_content(&inner) {
                 BraceContent::Plain(name) => {
@@ -2085,6 +2145,17 @@ mod tests {
     #[test]
     fn parse_expansion_word_preserves_internal_whitespace_runs() {
         assert_eq!(parse_expansion_word("a  b"), vec![Chunk::Str("a  b".to_string())]);
+    }
+
+    // Regression: the raw ${...} scan used to stop at the first literal
+    // '}', even one reached only through a nested expansion inside a
+    // double-quoted alternate value -- `${x:-"${x}"}` (the
+    // `${VAR+"${VAR}"}` idiom mise's own activation script uses) would
+    // mistake the inner ${x}'s own '}' for the outer terminator, leaving a
+    // stray '"' and a real closing '}' for the *next* token to choke on.
+    #[test]
+    fn tokenize_handles_a_nested_quoted_expansion_inside_a_var_op_word() {
+        assert!(Lexer::new(r#"echo ${x:-"${x}"}"#).tokenize().is_ok());
     }
 
     #[test]

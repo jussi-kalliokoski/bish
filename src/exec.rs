@@ -1720,7 +1720,10 @@ impl Shell {
                     }
                 }
                 None => {
-                    sh_eprintln!(self, "bish: declare: {}: not found", name);
+                    // Matches real bash: `declare -f`/`-F` on a name that
+                    // isn't a function just fails silently (no message),
+                    // unlike `declare -p` on a nonexistent variable below,
+                    // which does print one -- confirmed against real bash.
                     status = 1;
                 }
             }
@@ -10093,5 +10096,63 @@ mod tests {
         assert!(shell.opt_posix);
         shell.run_source_here("set +o posix", "<test>");
         assert!(!shell.opt_posix);
+    }
+
+    // Regression: a `${var op word}` expansion's raw-word scan used to stop
+    // at the first literal '}', even one reached only through a quoted
+    // nested expansion (`${x:-"${x}"}`, the `${VAR+"${VAR}"}` idiom mise's
+    // own activation script uses) -- it would mistake that inner '}' for
+    // the outer terminator and then fail with "unterminated double quote".
+    #[test]
+    fn var_op_word_with_a_nested_quoted_expansion_finds_the_real_closing_brace() {
+        let mut shell = Shell::new();
+        let buf = capture_output(&mut shell);
+        shell.run_source_here(r#"x=hi; echo ${y:-"${x}"}"#, "<test>");
+        assert_eq!(buf.borrow().as_str(), "hi\n");
+    }
+
+    #[test]
+    fn var_op_word_plain_unescaped_braces_still_count_toward_depth() {
+        let mut shell = Shell::new();
+        let buf = capture_output(&mut shell);
+        shell.run_source_here(r#"x=; echo "${x:-{}}""#, "<test>");
+        assert_eq!(buf.borrow().as_str(), "{}\n");
+    }
+
+    #[test]
+    fn var_op_word_an_escaped_brace_does_not_count_toward_depth() {
+        let mut shell = Shell::new();
+        let buf = capture_output(&mut shell);
+        shell.run_source_here(r#"x=; echo ${x:-\{}"#, "<test>");
+        assert_eq!(buf.borrow().as_str(), "{\n");
+    }
+
+    #[test]
+    fn var_op_word_a_quoted_brace_never_counts_toward_depth() {
+        let mut shell = Shell::new();
+        let buf = capture_output(&mut shell);
+        shell.run_source_here(r#"y=; echo ${y:-"a}b"}"#, "<test>");
+        assert_eq!(buf.borrow().as_str(), "a}b\n");
+        let buf = capture_output(&mut shell);
+        shell.run_source_here(r#"y=; echo ${y:-"a{b"}"#, "<test>");
+        assert_eq!(buf.borrow().as_str(), "a{b\n");
+    }
+
+    // Regression: `declare -f`/`-F` on a name that isn't a function used to
+    // print "declare: NAME: not found" to stderr -- real bash fails
+    // silently there (unlike `declare -p` on a nonexistent variable, which
+    // does print a message). This surfaced as a spurious message on every
+    // bish startup once the nested-expansion fix above let mise's own
+    // `declare -F _mise_hook >/dev/null && unset -f _mise_hook`-style guards
+    // actually run.
+    #[test]
+    fn declare_f_on_a_nonexistent_function_is_silent() {
+        let mut shell = Shell::new();
+        // capture_output's sink backs both stdout and stderr, so an empty
+        // buffer here means the builtin wrote nothing at all.
+        let buf = capture_output(&mut shell);
+        let result = shell.run_source_here("declare -F not_a_real_function_xyz", "<test>");
+        assert!(matches!(result, ExecResult::Status(1)), "{result:?}");
+        assert_eq!(buf.borrow().as_str(), "");
     }
 }
