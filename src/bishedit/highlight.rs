@@ -852,7 +852,8 @@ fn highlight_word(
             | Chunk::ArrayLength { .. }
             | Chunk::ArrayVarExpand { .. }
             | Chunk::Indirect { .. }
-            | Chunk::ArrayKeys { .. } => {
+            | Chunk::ArrayKeys { .. }
+            | Chunk::VarNamesMatchingPrefix { .. } => {
                 if let Some(r) = next_span(raw_spans, cursor) {
                     out.push(HighlightSpan { start: offset + r.start, end: offset + r.end, kind: HighlightKind::Variable, link: None });
                 }

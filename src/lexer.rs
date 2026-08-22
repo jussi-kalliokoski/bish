@@ -33,6 +33,12 @@ pub enum Chunk {
     // (indexed arrays: their set indices as decimal strings; associative:
     // their string keys), one field per key like ${name[@]}.
     ArrayKeys { name: String, quoted: bool },
+    // ${!prefix*} / ${!prefix@} -- the names of every variable (scalar or
+    // array) whose name starts with `prefix`, sorted and deduped; `at`
+    // distinguishes the two spellings the same way `quoted`+"@" already
+    // does for ArrayKeys/ArrayVar (one field per name when quoted, joined
+    // otherwise).
+    VarNamesMatchingPrefix { prefix: String, at: bool, quoted: bool },
     // <(cmd) / >(cmd) process substitution. Real bash backs these with a
     // FIFO/`/dev/fd/N` so the substituted command streams concurrently;
     // that needs fd-passing into a spawned child, which isn't available
@@ -1213,6 +1219,10 @@ impl<'a> Lexer<'a> {
                     self.raw_capture_spans.push(span);
                     chunks.push(Chunk::ArrayKeys { name, quoted });
                 }
+                BraceContent::VarNamesMatchingPrefix(prefix, at) => {
+                    self.raw_capture_spans.push(span);
+                    chunks.push(Chunk::VarNamesMatchingPrefix { prefix, at, quoted });
+                }
             }
             return Ok(true);
         }
@@ -1654,6 +1664,22 @@ enum BraceContent {
     ArrayOp(String, String, VarOp),
     Indirect(String),
     ArrayKeys(String),
+    // ${!prefix*}/${!prefix@} -- names of every variable whose name
+    // starts with `prefix`, one field per name (bool is true for the
+    // '@' spelling, matching the $@-vs-$*-style splitting distinction
+    // every other "@"/"*" index already carries elsewhere in this file).
+    VarNamesMatchingPrefix(String, bool),
+}
+
+// Same identifier-first-character rule as an ordinary variable name,
+// but allowed to be any non-empty prefix of one (used by ${!prefix*}/
+// ${!prefix@} below, where `prefix` need not itself be a complete name).
+fn is_name_prefix(s: &str) -> bool {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) if c.is_alphabetic() || c == '_' => chars.all(|c| c.is_alphanumeric() || c == '_'),
+        _ => false,
+    }
 }
 
 // `name[index]rest` -- name must be a plain identifier; returns whatever
@@ -1790,10 +1816,20 @@ fn parse_brace_content(inner: &str) -> BraceContent {
                 return BraceContent::ArrayKeys(name);
             }
         } else if !rest.is_empty() {
-            let mut chars = rest.chars();
-            let first = chars.next().unwrap();
-            if (first.is_alphabetic() || first == '_') && chars.all(|c| c.is_alphanumeric() || c == '_') {
-                return BraceContent::Indirect(rest.to_string());
+            if let Some(prefix) = rest.strip_suffix('*') {
+                if is_name_prefix(prefix) {
+                    return BraceContent::VarNamesMatchingPrefix(prefix.to_string(), false);
+                }
+            } else if let Some(prefix) = rest.strip_suffix('@') {
+                if is_name_prefix(prefix) {
+                    return BraceContent::VarNamesMatchingPrefix(prefix.to_string(), true);
+                }
+            } else {
+                let mut chars = rest.chars();
+                let first = chars.next().unwrap();
+                if (first.is_alphabetic() || first == '_') && chars.all(|c| c.is_alphanumeric() || c == '_') {
+                    return BraceContent::Indirect(rest.to_string());
+                }
             }
         }
     }

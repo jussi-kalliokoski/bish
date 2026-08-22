@@ -1839,6 +1839,24 @@ impl Shell {
         })
     }
 
+    // ${!prefix*}/${!prefix@} -- every currently-visible variable or
+    // array name starting with `prefix`, sorted and deduped (matching
+    // real bash's own sorted output). Same enumeration as
+    // action_context's own `variables`/`arrays` fields (env vars +
+    // every var_scopes frame, plus indexed/associative array names) --
+    // built fresh here rather than routed through action_context since
+    // this only needs the names, not the whole compgen::ActionContext
+    // shape.
+    fn var_names_with_prefix(&self, prefix: &str) -> Vec<String> {
+        let mut names: std::collections::BTreeSet<String> = std::env::vars().map(|(k, _)| k).collect();
+        for scope in &self.var_scopes {
+            names.extend(scope.keys().cloned());
+        }
+        names.extend(self.arrays.keys().cloned());
+        names.extend(self.assoc_arrays.keys().cloned());
+        names.into_iter().filter(|n| n.starts_with(prefix)).collect()
+    }
+
     // A snapshot of every bit of Shell state compgen.rs's contextual
     // actions (alias/arrayvar/command/enabled/export/function/job/running/
     // stopped/variable) need -- built fresh each call (compgen/complete)
@@ -3761,6 +3779,11 @@ impl Shell {
                     let v = self.array_keys(&name).join(" ");
                     out.push_str(&if *quoted { crate::regex::escape(&v) } else { v });
                 }
+                Chunk::VarNamesMatchingPrefix { prefix, quoted, .. } => {
+                    let prefix = prefix.clone();
+                    let v = self.var_names_with_prefix(&prefix).join(" ");
+                    out.push_str(&if *quoted { crate::regex::escape(&v) } else { v });
+                }
                 Chunk::ProcSubIn { raw } => {
                     let raw = raw.clone();
                     let v = self.run_proc_sub_in(&raw);
@@ -4964,6 +4987,10 @@ impl Shell {
                     let name = name.clone();
                     s.push_str(&self.array_keys(&name).join(" "));
                 }
+                Chunk::VarNamesMatchingPrefix { prefix, .. } => {
+                    let prefix = prefix.clone();
+                    s.push_str(&self.var_names_with_prefix(&prefix).join(" "));
+                }
                 Chunk::ProcSubIn { raw } => {
                     let raw = raw.clone();
                     s.push_str(&self.run_proc_sub_in(&raw));
@@ -5235,6 +5262,20 @@ impl Shell {
                         append_parts_glob(&mut fields, &mut current, &mut patterns, &mut pattern_current, &items);
                     } else {
                         let joined = self.array_keys(name).join(" ");
+                        append_splittable_glob(&mut fields, &mut current, &mut patterns, &mut pattern_current, &joined, *quoted, &ifs);
+                    }
+                }
+                Chunk::VarNamesMatchingPrefix { prefix, at, quoted } => {
+                    // Same splitting rules as ${!arr[@]}/${!arr[*]} above,
+                    // but the '@'-vs-'*' distinction is actually tracked
+                    // here (unlike ArrayKeys, which collapses both into
+                    // one shape) -- only the true "@" quoted spelling gets
+                    // one field per name.
+                    let names = self.var_names_with_prefix(prefix);
+                    if *at && *quoted {
+                        append_parts_glob(&mut fields, &mut current, &mut patterns, &mut pattern_current, &names);
+                    } else {
+                        let joined = names.join(" ");
                         append_splittable_glob(&mut fields, &mut current, &mut patterns, &mut pattern_current, &joined, *quoted, &ifs);
                     }
                 }
@@ -8571,5 +8612,29 @@ mod tests {
         let buf = capture_output(&mut shell);
         shell.run_source_here(r#"a=("one two" three); echo "${a[0]@Q}""#, "<test>");
         assert_eq!(buf.borrow().as_str(), "'one two'\n");
+    }
+
+    #[test]
+    fn prefix_names_expansion_lists_matching_variable_and_array_names_sorted() {
+        let mut shell = Shell::new();
+        let buf = capture_output(&mut shell);
+        shell.run_source_here(r#"BFOO_B=1; BFOO_A=1; BFOO_ARR=(x); echo "${!BFOO_*}""#, "<test>");
+        assert_eq!(buf.borrow().as_str(), "BFOO_A BFOO_ARR BFOO_B\n");
+    }
+
+    #[test]
+    fn prefix_names_at_form_splits_into_separate_fields_when_quoted() {
+        let mut shell = Shell::new();
+        let buf = capture_output(&mut shell);
+        shell.run_source_here(r#"CFOO_A=1; CFOO_B=2; out=(); for n in "${!CFOO_@}"; do out+=("[$n]"); done; echo "${out[@]}""#, "<test>");
+        assert_eq!(buf.borrow().as_str(), "[CFOO_A] [CFOO_B]\n");
+    }
+
+    #[test]
+    fn prefix_names_expansion_is_empty_when_nothing_matches() {
+        let mut shell = Shell::new();
+        let buf = capture_output(&mut shell);
+        shell.run_source_here(r#"echo "[${!DEFINITELY_NOT_A_REAL_PREFIX_XYZ*}]""#, "<test>");
+        assert_eq!(buf.borrow().as_str(), "[]\n");
     }
 }

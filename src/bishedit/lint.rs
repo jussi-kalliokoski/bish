@@ -402,7 +402,10 @@ fn lint_word_chunks(chunks: &[Chunk], offset: usize, chars: &[char], raw_spans: 
                     }
                 }
             }
-            Chunk::VarExpand { quoted, .. } | Chunk::ArrayVar { quoted, .. } | Chunk::ArrayVarExpand { quoted, .. } => {
+            Chunk::VarExpand { quoted, .. }
+            | Chunk::ArrayVar { quoted, .. }
+            | Chunk::ArrayVarExpand { quoted, .. }
+            | Chunk::VarNamesMatchingPrefix { quoted, .. } => {
                 if let Some(content) = next_span(raw_spans, cursor)
                     && !exempt
                     && !quoted
