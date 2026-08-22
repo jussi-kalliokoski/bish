@@ -1418,11 +1418,31 @@ impl Shell {
         0
     }
 
-    // declare/typeset [-A|-a|-i|-r] [NAME|NAME=value]... `-x` isn't tracked
-    // separately since every variable already lives in the process env
-    // here; other real bash flags (-u/-l/-n/-p/...) are accepted but not
-    // enforced.
+    // declare/typeset [-A|-a|-i|-r|-g] [NAME|NAME=value]... `-x` isn't
+    // tracked separately since every variable already lives in the
+    // process env here; other real bash flags (-u/-l/-n/...) are
+    // accepted but not enforced. `-p`/`-f`/`-F` are a different mode
+    // entirely (print instead of declare, see print_declared/
+    // print_functions) -- checked first, same as bash effectively
+    // treating them as a separate subcommand.
     fn run_declare(&mut self, args: &[String]) -> i32 {
+        if args.iter().any(|a| a == "-f" || a == "-F") {
+            let names_only = args.iter().any(|a| a == "-F");
+            let names: Vec<String> = args.iter().filter(|a| !a.starts_with('-')).cloned().collect();
+            return self.print_functions(&names, names_only);
+        }
+        if args.iter().any(|a| a == "-p") {
+            let names: Vec<String> = args.iter().filter(|a| !a.starts_with('-')).cloned().collect();
+            return self.print_declared(&names);
+        }
+        // `-g`: force the write to the true global scope even when
+        // called from inside a function -- without it, a plain
+        // declare/typeset inside a function auto-localizes exactly like
+        // `local` does (see the scalar assignment branch below), matching
+        // real bash (confirmed: `f() { declare z=5; }; f; echo "$z"`
+        // prints nothing in bash, but bish used to leak z to the global
+        // scope here before this fix).
+        let mut global_flag = false;
         let mut array_mode: Option<bool> = None; // Some(true)=-A, Some(false)=-a
         let mut readonly_flag = false;
         let mut integer_flag = false;
@@ -1462,6 +1482,10 @@ impl Shell {
                 }
                 "-x" => {
                     export_flag = true;
+                    continue;
+                }
+                "-g" => {
+                    global_flag = true;
                     continue;
                 }
                 _ => {}
@@ -1504,8 +1528,19 @@ impl Shell {
                     self.arrays.entry(name.clone()).or_default();
                 }
                 None => {
+                    // Auto-localize, matching `local`: a plain (non-`-g`)
+                    // declare/typeset inside a function creates a new
+                    // local shadow rather than falling through to the
+                    // global env. Pre-inserting an (empty, for now) entry
+                    // into the current scope makes assign_var's own
+                    // existing "write into whichever scope already
+                    // shadows this name" logic (raw_var_write) do the
+                    // right thing without needing a separate write path.
+                    if !global_flag && !self.var_scopes.is_empty() {
+                        self.var_scopes.last_mut().unwrap().entry(name.clone()).or_default();
+                    }
                     if let Some(v) = val {
-                        self.assign_var(&name, v);
+                        if global_flag { self.assign_var_global(&name, v) } else { self.assign_var(&name, v) }
                     } else if export_flag {
                         // Bare `declare -x NAME`/`export NAME` on an
                         // already-set variable (commonly a local: `local
@@ -1517,9 +1552,13 @@ impl Shell {
                         // case since it only fires for a name with no
                         // value at all yet.
                         let cur = self.lookup_var(&name);
-                        self.assign_var(&name, cur);
+                        if global_flag { self.assign_var_global(&name, cur) } else { self.assign_var(&name, cur) }
                     } else if self.lookup_var(&name).is_empty() && std::env::var(&name).is_err() {
-                        self.assign_var(&name, String::new());
+                        if global_flag {
+                            self.assign_var_global(&name, String::new())
+                        } else {
+                            self.assign_var(&name, String::new())
+                        }
                     }
                 }
             }
@@ -1528,6 +1567,126 @@ impl Shell {
             }
         }
         0
+    }
+
+    // declare -f [name...] / declare -F [name...]: print each named
+    // function's definition (or, under -F, just "declare -f NAME"); no
+    // names means every currently-defined function, sorted for
+    // deterministic output (real bash prints in definition order --
+    // sorting is simpler and good enough for what this is mainly used
+    // for: introspection/completion scripts, not byte-for-byte diffing
+    // against real bash). Reuses the exact same Command::FuncDef ->
+    // serialize_program round-trip functions_preamble already does for
+    // re-declaring functions across a subprocess boundary.
+    fn print_functions(&mut self, names: &[String], names_only: bool) -> i32 {
+        let targets: Vec<String> = if names.is_empty() {
+            let mut all: Vec<String> = self.functions.keys().cloned().collect();
+            all.sort();
+            all
+        } else {
+            names.to_vec()
+        };
+        let mut status = 0;
+        for name in targets {
+            match self.functions.get(&name).cloned() {
+                Some(body) => {
+                    if names_only {
+                        sh_println!(self, "declare -f {}", name);
+                    } else {
+                        let def = parser::Command::FuncDef { name: name.clone(), body: Box::new(body) };
+                        let src = crate::serialize::serialize_program(&[ListItem {
+                            and_or: AndOr { first: Pipeline { commands: vec![def], negate: false }, rest: Vec::new() },
+                            sep: Sep::Seq,
+                        }]);
+                        sh_println!(self, "{}", src.trim_end());
+                    }
+                }
+                None => {
+                    sh_eprintln!(self, "bish: declare: {}: not found", name);
+                    status = 1;
+                }
+            }
+        }
+        status
+    }
+
+    // declare -p [name...]: print each variable's current declare-style
+    // representation; no names means every currently-visible variable/
+    // array (globals + any locals in the current function scope),
+    // sorted for deterministic output. Unlike real bash, a variable that
+    // was `declare -i`'d but never actually assigned a value can't be
+    // distinguished from "doesn't exist" here (bish has no separate
+    // "declared but unset" state) -- such a variable just doesn't appear.
+    fn print_declared(&mut self, names: &[String]) -> i32 {
+        let targets: Vec<String> = if names.is_empty() { self.var_names_with_prefix("") } else { names.to_vec() };
+        let mut status = 0;
+        for name in targets {
+            match self.declare_p_line(&name) {
+                Some(line) => sh_println!(self, "{}", line),
+                None => {
+                    sh_eprintln!(self, "bish: declare: {}: not found", name);
+                    status = 1;
+                }
+            }
+        }
+        status
+    }
+
+    fn declare_p_line(&mut self, name: &str) -> Option<String> {
+        let mut flags = String::new();
+        if self.assoc_names.contains(name) {
+            flags.push('A');
+        } else if self.arrays.contains_key(name) {
+            flags.push('a');
+        }
+        if self.integer_names.contains(name) {
+            flags.push('i');
+        }
+        if self.readonly_names.contains(name) {
+            flags.push('r');
+        }
+        if self.exported_names.contains(name) {
+            flags.push('x');
+        }
+        if self.nameref_names.contains(name) {
+            flags.push('n');
+        }
+        if self.upper_names.contains(name) {
+            flags.push('u');
+        }
+        if self.lower_names.contains(name) {
+            flags.push('l');
+        }
+        let flag_str = if flags.is_empty() { "--".to_string() } else { format!("-{flags}") };
+
+        if self.assoc_names.contains(name) {
+            let map = self.assoc_arrays.get(name)?;
+            let mut body = String::new();
+            for (k, v) in map.iter() {
+                body.push('[');
+                body.push_str(k);
+                body.push_str("]=");
+                body.push_str(&declare_p_quote(v));
+                body.push(' ');
+            }
+            return Some(format!("declare {} {}=({})", flag_str, name, body.trim_end()));
+        }
+        if let Some(items) = self.arrays.get(name) {
+            let mut body = String::new();
+            for (idx, v) in items {
+                body.push('[');
+                body.push_str(&idx.to_string());
+                body.push_str("]=");
+                body.push_str(&declare_p_quote(v));
+                body.push(' ');
+            }
+            return Some(format!("declare {} {}=({})", flag_str, name, body.trim_end()));
+        }
+        if !self.var_is_set(name) {
+            return None;
+        }
+        let value = self.lookup_var(name);
+        Some(format!("declare {} {}={}", flag_str, name, declare_p_quote(&value)))
     }
 
     // readonly NAME[=value]... Marks each name so assign_var refuses future
@@ -4130,6 +4289,13 @@ impl Shell {
                 let mut upper_flag = false;
                 let mut lower_flag = false;
                 let mut export_flag = false;
+                // `-g`: force the write to the true global scope instead
+                // of a local shadow -- confirmed against real bash
+                // (`f() { local -g x=5; }; f; echo "$x"` prints "5"),
+                // even though `local`'s whole point is otherwise to
+                // localize. Only meaningful for the scalar (non-array,
+                // non-nameref) case below.
+                let mut global_flag = false;
                 for a in &argv[1..] {
                     match a.as_str() {
                         "-a" => {
@@ -4158,6 +4324,10 @@ impl Shell {
                         }
                         "-x" => {
                             export_flag = true;
+                            continue;
+                        }
+                        "-g" => {
+                            global_flag = true;
                             continue;
                         }
                         _ if a.starts_with('-') => continue,
@@ -4199,6 +4369,10 @@ impl Shell {
                             self.arrays.insert(n, std::collections::BTreeMap::new());
                         }
                         None => {
+                            if global_flag {
+                                self.assign_var_global(&n, v.unwrap_or_default());
+                                continue;
+                            }
                             let v = v.unwrap_or_default();
                             let v = if integer_flag { arith::eval(&v, self).unwrap_or(0).to_string() } else { v };
                             let v = if upper_flag {
@@ -5748,6 +5922,20 @@ impl Shell {
     // shadows an existing `local` of the same name in the current function
     // scope -- matching bash, where functions don't auto-localize vars.
     fn assign_var(&mut self, name: &str, value: String) {
+        self.assign_var_impl(name, value, false);
+    }
+
+    // `declare -g`/`local -g`: same readonly guard, SECONDS/RANDOM
+    // specials, integer/case-fold attributes, and export mirroring as
+    // assign_var, but always writes straight to the true global
+    // (process-env) scope, bypassing any same-named local shadow in the
+    // current function -- unlike assign_var/raw_var_write, which target
+    // whichever scope already shadows the name.
+    fn assign_var_global(&mut self, name: &str, value: String) {
+        self.assign_var_impl(name, value, true);
+    }
+
+    fn assign_var_impl(&mut self, name: &str, value: String, force_global: bool) {
         let resolved;
         let name = if self.nameref_names.contains(name) {
             resolved = self.resolve_nameref(name);
@@ -5790,6 +5978,14 @@ impl Shell {
         } else {
             value
         };
+        if force_global {
+            // Bypass any local shadow entirely -- raw_var_write would
+            // just update that shadow instead, same as plain assignment.
+            unsafe {
+                std::env::set_var(name, &value);
+            }
+            return;
+        }
         if self.exported_names.contains(name) {
             unsafe {
                 std::env::set_var(name, &value);
@@ -7462,6 +7658,23 @@ fn glob_replace(s: &str, pattern: &str, repl: &str, global: bool, anchor: Replac
     out
 }
 
+// `declare -p`'s own value quoting: double-quoted with backslash-escaped
+// '"'/'\'/'$'/'`' (matching real bash's own `declare -p` output), not
+// serialize::quote_literal's single-quote style -- the two aren't
+// interchangeable, this one specifically matches what `declare -p`
+// itself prints.
+fn declare_p_quote(value: &str) -> String {
+    let mut out = String::from("\"");
+    for c in value.chars() {
+        if matches!(c, '"' | '\\' | '$' | '`') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out.push('"');
+    out
+}
+
 fn apply_transform(cur: &str, kind: TransformKind) -> String {
     match kind {
         TransformKind::Quote => crate::serialize::quote_literal(cur),
@@ -8636,5 +8849,85 @@ mod tests {
         let buf = capture_output(&mut shell);
         shell.run_source_here(r#"echo "[${!DEFINITELY_NOT_A_REAL_PREFIX_XYZ*}]""#, "<test>");
         assert_eq!(buf.borrow().as_str(), "[]\n");
+    }
+
+    #[test]
+    fn declare_g_forces_a_global_write_from_inside_a_function() {
+        let mut shell = Shell::new();
+        shell.run_source_here(r#"f() { declare -g dtest_g_var=5; }; f"#, "<test>");
+        assert_eq!(shell.lookup_var("dtest_g_var"), "5");
+    }
+
+    #[test]
+    fn local_g_forces_a_global_write_from_inside_a_function() {
+        let mut shell = Shell::new();
+        shell.run_source_here(r#"f() { local -g ltest_g_var=5; }; f"#, "<test>");
+        assert_eq!(shell.lookup_var("ltest_g_var"), "5");
+    }
+
+    #[test]
+    fn plain_declare_without_g_auto_localizes_inside_a_function() {
+        // The bug the -g fix above was found alongside: before this, a
+        // plain (non-`-g`) declare inside a function leaked its
+        // assignment to the global scope exactly like an ordinary
+        // assignment does, instead of auto-localizing like `local`.
+        let mut shell = Shell::new();
+        shell.run_source_here(r#"f() { declare dtest_local_var=5; }; f"#, "<test>");
+        assert!(!shell.var_is_set("dtest_local_var"));
+    }
+
+    #[test]
+    fn declare_p_prints_a_scalar_array_and_assoc_array_declaration() {
+        let mut shell = Shell::new();
+        let buf = capture_output(&mut shell);
+        shell.run_source_here(r#"x=1; a=(1 2 3); declare -p x a"#, "<test>");
+        assert_eq!(buf.borrow().as_str(), "declare -- x=\"1\"\ndeclare -a a=([0]=\"1\" [1]=\"2\" [2]=\"3\")\n");
+    }
+
+    #[test]
+    fn declare_p_reflects_exported_and_readonly_attributes() {
+        let mut shell = Shell::new();
+        let buf = capture_output(&mut shell);
+        shell.run_source_here(r#"export EE=5; readonly RR=hi; declare -p EE RR"#, "<test>");
+        assert_eq!(buf.borrow().as_str(), "declare -x EE=\"5\"\ndeclare -r RR=\"hi\"\n");
+    }
+
+    #[test]
+    fn declare_p_on_an_unset_name_errors_and_exits_1() {
+        let mut shell = Shell::new();
+        let status = shell.run_declare(&strs(&["-p", "DEFINITELY_NOT_SET_XYZ"]));
+        assert_eq!(status, 1);
+    }
+
+    #[test]
+    fn declare_f_prints_a_reparsable_function_definition() {
+        let mut shell = Shell::new();
+        shell.run_source_here("foo() { echo hi; }", "<test>");
+        let buf = capture_output(&mut shell);
+        assert_eq!(shell.run_declare(&strs(&["-f", "foo"])), 0);
+        let printed = buf.borrow().clone();
+        assert!(printed.contains("foo"), "{printed:?}");
+
+        // Round-trip: what got printed should itself be valid bish that
+        // (re)defines the same function.
+        let mut shell2 = Shell::new();
+        let result = shell2.run_source_here(&printed, "<test>");
+        assert!(matches!(result, ExecResult::Status(0)), "{result:?}");
+        assert!(shell2.functions.contains_key("foo"));
+    }
+
+    #[test]
+    fn declare_capital_f_prints_only_the_function_name() {
+        let mut shell = Shell::new();
+        shell.run_source_here("foo() { echo hi; }", "<test>");
+        let buf = capture_output(&mut shell);
+        shell.run_declare(&strs(&["-F", "foo"]));
+        assert_eq!(buf.borrow().as_str(), "declare -f foo\n");
+    }
+
+    #[test]
+    fn declare_f_on_an_unknown_function_errors_and_exits_1() {
+        let mut shell = Shell::new();
+        assert_eq!(shell.run_declare(&strs(&["-f", "not_a_real_function"])), 1);
     }
 }
