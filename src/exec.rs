@@ -8930,4 +8930,29 @@ mod tests {
         let mut shell = Shell::new();
         assert_eq!(shell.run_declare(&strs(&["-f", "not_a_real_function"])), 1);
     }
+
+    #[test]
+    fn arithmetic_comma_operator_sequences_left_to_right_keeping_the_last_value() {
+        let mut shell = Shell::new();
+        let buf = capture_output(&mut shell);
+        shell.run_source_here(r#"echo $(( a=1, a=2, a=3 )); echo "$a""#, "<test>");
+        assert_eq!(buf.borrow().as_str(), "3\n3\n");
+    }
+
+    #[test]
+    fn arithmetic_comma_operator_works_inside_a_parenthesized_grouping() {
+        let mut shell = Shell::new();
+        let buf = capture_output(&mut shell);
+        shell.run_source_here(r#"echo $(( (a=1, b=2) + a + b ))"#, "<test>");
+        assert_eq!(buf.borrow().as_str(), "5\n");
+    }
+
+    #[test]
+    fn arithmetic_comma_operator_works_in_a_double_paren_statement() {
+        let mut shell = Shell::new();
+        shell.run_source_here(r#"((a=1, b=2, c=a+b))"#, "<test>");
+        assert_eq!(shell.lookup_var("a"), "1");
+        assert_eq!(shell.lookup_var("b"), "2");
+        assert_eq!(shell.lookup_var("c"), "3");
+    }
 }

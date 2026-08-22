@@ -17,6 +17,7 @@ enum Tok {
     RParen,
     Question,
     Colon,
+    Comma,
     Eof,
 }
 
@@ -137,6 +138,11 @@ fn tokenize(src: &str) -> Result<Vec<Tok>, String> {
             i += 1;
             continue;
         }
+        if c == ',' {
+            toks.push(Tok::Comma);
+            i += 1;
+            continue;
+        }
         let three: String = chars[i..(i + 3).min(chars.len())].iter().collect();
         const THREE_CHAR_OPS: [&str; 2] = ["<<=", ">>="];
         if THREE_CHAR_OPS.contains(&three.as_str()) {
@@ -189,7 +195,22 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_expr(&mut self) -> Result<i64, String> {
-        self.parse_assign()
+        self.parse_comma()
+    }
+
+    // The comma operator (`a=1, b=2, a+b`): evaluates every comma-
+    // separated subexpression left to right for its side effects,
+    // keeping only the last one's value -- bash's own semantics, valid
+    // both at the top level of ((...))/$((...)) and inside a
+    // parenthesized grouping (see parse_primary's Tok::LParen arm,
+    // which calls this same level rather than parse_assign directly).
+    fn parse_comma(&mut self) -> Result<i64, String> {
+        let mut v = self.parse_assign()?;
+        while matches!(self.peek(), Tok::Comma) {
+            self.advance();
+            v = self.parse_assign()?;
+        }
+        Ok(v)
     }
 
     fn parse_assign(&mut self) -> Result<i64, String> {
@@ -485,7 +506,7 @@ impl<'a> Parser<'a> {
                 }
             }
             Tok::LParen => {
-                let v = self.parse_assign()?;
+                let v = self.parse_comma()?;
                 match self.advance() {
                     Tok::RParen => {}
                     other => return Err(format!("expected ')', got {:?}", other)),
