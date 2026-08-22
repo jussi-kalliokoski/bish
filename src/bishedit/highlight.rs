@@ -417,11 +417,7 @@ pub(crate) fn is_assignment_prefix_word(chunks: &[Chunk]) -> bool {
 // already documented there as "kept in sync with run_single's dispatch
 // match by hand") -- kept separate rather than exposing that list to stay
 // decoupled from the shell's execution engine, matching every other
-// editor-analysis-vs-execution split in this file. Includes "echo" and
-// "printf", which exec.rs's own list is missing (a separate, pre-existing
-// gap in that list's own `type`/`command -v` reporting -- not fixed
-// there, just not reproduced here, since getting *this* list right is
-// what stands between a real builtin and a false "invalid command" red).
+// editor-analysis-vs-execution split in this file.
 pub(crate) const KNOWN_BUILTINS: &[&str] = &[
     ":", "cd", "e", "export", "let", "break", "continue", "test", "[", "[[", "return", "shift", "local", "exit", "read", "mapfile",
     "readarray", "eval", "source", ".", "trap", "jobs", "fg", "bg", "wait", "kill", "getopts", "unset", "set", "declare",

@@ -7476,6 +7476,8 @@ const KNOWN_BUILTINS: &[&str] = &[
     "compopt",
     "window",
     "win",
+    "echo",
+    "printf",
 ];
 
 // The names `shopt` itself recognizes, each with its own default on/off
