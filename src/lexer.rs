@@ -109,11 +109,6 @@ pub enum ReplaceAnchor {
     End,
 }
 
-// bash also defines `@P`: bash's own PS1 backslash-escape prompt
-// expander, which bish's hardcoded prompt doesn't implement at all --
-// left unrecognized for now, same as any other unrecognized operator
-// syntax (parse_operator_suffix falls back to treating the whole
-// `${...}` as a literal name).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum TransformKind {
     // Shell-quoted so the result can be reused as input (`${v@Q}`).
@@ -140,6 +135,13 @@ pub enum TransformKind {
     // (confirmed: `${arr[0]@K}` and a plain scalar `${x@K}` both give
     // the same single-quoted result `@Q` would).
     KeyValue,
+    // Expands the value as if it were a PS1-style prompt string (`${v@P}`)
+    // -- bash's own backslash escapes (`\u`, `\h`, `\w`, `\$`, `\t`, ...),
+    // computed fresh from the shell's live state. Deliberately not wired
+    // into bish's own actual prompt (prompt.rs stays exactly as
+    // hardcoded as it already was) -- this only ever expands a value on
+    // request, standalone, the same as every other transform operator.
+    Prompt,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1791,11 +1793,11 @@ fn parse_operator_suffix(rest: &str) -> Option<VarOp> {
             "A" => Some(VarOp::Transform(TransformKind::Attributes)),
             "a" => Some(VarOp::Transform(TransformKind::AttributeFlags)),
             "K" => Some(VarOp::Transform(TransformKind::KeyValue)),
-            // `@P` and anything else after '@': not recognized (see
-            // TransformKind's own doc comment) -- falling back to None
-            // here, same as any other unrecognized operator syntax, lets
-            // the caller treat the whole thing as a literal name instead
-            // of silently misparsing it.
+            "P" => Some(VarOp::Transform(TransformKind::Prompt)),
+            // Anything else after '@': not recognized -- falling back to
+            // None here, same as any other unrecognized operator syntax,
+            // lets the caller treat the whole thing as a literal name
+            // instead of silently misparsing it.
             _ => None,
         };
     }

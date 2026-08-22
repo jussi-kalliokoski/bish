@@ -1804,6 +1804,118 @@ impl Shell {
         keys.iter().zip(values.iter()).map(|(k, v)| format!("{k} {}", declare_p_quote(v))).collect::<Vec<_>>().join(" ")
     }
 
+    // ${v@P}: expands `s` as if it were a PS1-style prompt string --
+    // bash's own backslash escapes, computed fresh from this shell's
+    // live state (real local time, real hostname/cwd/job count, ...).
+    // Deliberately standalone from bish's own actual prompt (prompt.rs
+    // stays exactly as hardcoded as it already was) -- this exists
+    // purely as an on-request value transform, the same as every other
+    // `${v@X}` operator, not a step toward a live PS1-driven prompt.
+    // `\!`/`\#` (history/command number) always read "0": that state
+    // lives in repl.rs's SessionState, not exec::Shell, and isn't
+    // threaded down here -- a narrower, documented gap rather than
+    // plumbing an unrelated module's state into this one for it.
+    fn expand_prompt_string(&self, s: &str) -> String {
+        let mut out = String::new();
+        let mut chars = s.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c != '\\' {
+                out.push(c);
+                continue;
+            }
+            let Some(&next) = chars.peek() else {
+                out.push('\\');
+                break;
+            };
+            // \nnn: 1-3 octal digits.
+            if next.is_digit(8) {
+                let mut digits = String::new();
+                while digits.len() < 3 {
+                    match chars.peek() {
+                        Some(&d) if d.is_digit(8) => {
+                            digits.push(d);
+                            chars.next();
+                        }
+                        _ => break,
+                    }
+                }
+                if let Some(c) = u32::from_str_radix(&digits, 8).ok().and_then(char::from_u32) {
+                    out.push(c);
+                }
+                continue;
+            }
+            chars.next();
+            match next {
+                'a' => out.push('\x07'),
+                'e' => out.push('\x1b'),
+                'n' => out.push('\n'),
+                'r' => out.push('\r'),
+                '\\' => out.push('\\'),
+                // Non-printing-sequence brackets: stripped entirely,
+                // matching real bash's own ${v@P} (confirmed -- they're
+                // only meaningful for the live prompt's own cursor-
+                // column bookkeeping, which doesn't apply here).
+                '[' | ']' => {}
+                '$' => out.push(if is_effective_root() { '#' } else { '$' }),
+                'u' => out.push_str(&prompt_username()),
+                'h' => out.push_str(get_hostname().split('.').next().unwrap_or("")),
+                'H' => out.push_str(&get_hostname()),
+                'w' => out.push_str(&self.prompt_cwd(false)),
+                'W' => out.push_str(&self.prompt_cwd(true)),
+                's' => out.push_str("bish"),
+                'v' => out.push_str("5.2"),
+                'V' => out.push_str("5.2.21"),
+                'j' => out.push_str(&self.jobs.borrow().jobs.len().to_string()),
+                '!' | '#' => out.push('0'),
+                'l' => out.push_str(&tty_basename()),
+                'd' => out.push_str(&prompt_date()),
+                't' => out.push_str(&strftime("%H:%M:%S", &local_time_now())),
+                'T' => out.push_str(&strftime("%I:%M:%S", &local_time_now())),
+                '@' => out.push_str(&strftime("%I:%M %p", &local_time_now())),
+                'A' => out.push_str(&strftime("%H:%M", &local_time_now())),
+                'D' if chars.peek() == Some(&'{') => {
+                    chars.next();
+                    let mut fmt = String::new();
+                    for d in chars.by_ref() {
+                        if d == '}' {
+                            break;
+                        }
+                        fmt.push(d);
+                    }
+                    let fmt = if fmt.is_empty() { "%a %b %e %H:%M:%S %Y" } else { &fmt };
+                    out.push_str(&strftime(fmt, &local_time_now()));
+                }
+                other => {
+                    out.push('\\');
+                    out.push(other);
+                }
+            }
+        }
+        out
+    }
+
+    // `\w`/`\W`: the real bash forms (full path with `~` home
+    // substitution, or just its basename) -- deliberately not
+    // prompt.rs's own shorten_path, which uses a different, bish-
+    // specific abbreviation convention for its own hardcoded prompt.
+    fn prompt_cwd(&self, basename_only: bool) -> String {
+        let home = std::env::var("HOME").unwrap_or_default();
+        let cwd = self.cwd.to_string_lossy();
+        let display = if !home.is_empty() && (cwd == home || cwd.starts_with(&format!("{home}/"))) {
+            format!("~{}", &cwd[home.len()..])
+        } else {
+            cwd.to_string()
+        };
+        if basename_only {
+            if display == "~" || display == "/" {
+                return display;
+            }
+            display.rsplit('/').next().unwrap_or(&display).to_string()
+        } else {
+            display
+        }
+    }
+
     fn declare_p_line(&mut self, name: &str) -> Option<String> {
         let flags = self.attribute_flags_string(name);
         let flag_str = if flags.is_empty() { "--".to_string() } else { format!("-{flags}") };
@@ -5894,6 +6006,7 @@ impl Shell {
                 TransformKind::Attributes => self.transform_attributes(name, None),
                 TransformKind::AttributeFlags => self.attribute_flags_string(name),
                 TransformKind::KeyValue => apply_transform(&cur, TransformKind::Quote),
+                TransformKind::Prompt => self.expand_prompt_string(&cur),
                 TransformKind::Quote | TransformKind::Upper | TransformKind::Lower | TransformKind::Escape => {
                     apply_transform(&cur, *kind)
                 }
@@ -5990,6 +6103,7 @@ impl Shell {
                         apply_transform(&cur, TransformKind::Quote)
                     }
                 }
+                TransformKind::Prompt => self.expand_prompt_string(&cur),
                 TransformKind::Quote | TransformKind::Upper | TransformKind::Lower | TransformKind::Escape => {
                     apply_transform(&cur, *kind)
                 }
@@ -7477,6 +7591,157 @@ pub fn get_hostname() -> String {
     std::env::var("HOSTNAME").unwrap_or_default()
 }
 
+// `${v@P}`'s own `\u`/`\$` helpers -- deliberately separate from
+// prompt.rs's own username()/geteuid() (same underlying logic, but
+// this transform stays fully self-contained rather than depending on
+// the actual-prompt module, which stays untouched).
+fn prompt_username() -> String {
+    std::env::var("USER").or_else(|_| std::env::var("LOGNAME")).unwrap_or_else(|_| "user".to_string())
+}
+
+fn is_effective_root() -> bool {
+    unsafe extern "C" {
+        fn geteuid() -> u32;
+    }
+    unsafe { geteuid() == 0 }
+}
+
+// `\l`: basename of the controlling terminal's device name (bash reads
+// this from the tty itself). Best-effort -- an unresolvable tty (not a
+// real terminal, ttyname_r failing, ...) just gives an empty string,
+// same spirit as bash showing nothing useful there either in that case.
+fn tty_basename() -> String {
+    unsafe extern "C" {
+        fn ttyname_r(fd: i32, buf: *mut u8, buflen: usize) -> i32;
+    }
+    let mut buf = [0u8; 256];
+    let ok = unsafe { ttyname_r(0, buf.as_mut_ptr(), buf.len()) == 0 };
+    if !ok {
+        return String::new();
+    }
+    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    std::str::from_utf8(&buf[..end]).unwrap_or("").rsplit('/').next().unwrap_or("").to_string()
+}
+
+// The glibc/BSD `struct tm` layout (POSIX's 9 base fields plus the
+// common tm_gmtoff/tm_zone extension both platforms agree on) --
+// localtime_r writes a full struct tm's worth of bytes into its output
+// pointer regardless of what this declares, so this has to match the
+// real platform layout size-for-size, not just the fields this code
+// actually reads.
+#[repr(C)]
+struct CTm {
+    tm_sec: i32,
+    tm_min: i32,
+    tm_hour: i32,
+    tm_mday: i32,
+    tm_mon: i32,
+    tm_year: i32,
+    tm_wday: i32,
+    tm_yday: i32,
+    tm_isdst: i32,
+    tm_gmtoff: i64,
+    tm_zone: *const i8,
+}
+
+// `${v@P}`'s `\d`/`\t`/`\T`/`\@`/`\A`/`\D{...}` all need the current
+// local wall-clock time -- computed via the same raw libc FFI pattern
+// already used elsewhere in this file (e.g. stdin_is_tty/stdin_ready),
+// rather than pulling in a date/time crate for it.
+fn local_time_now() -> CTm {
+    unsafe extern "C" {
+        fn time(t: *mut i64) -> i64;
+        fn localtime_r(t: *const i64, result: *mut CTm) -> *mut CTm;
+    }
+    let mut t: i64 = 0;
+    unsafe { time(&mut t as *mut i64) };
+    let mut tm = CTm {
+        tm_sec: 0,
+        tm_min: 0,
+        tm_hour: 0,
+        tm_mday: 0,
+        tm_mon: 0,
+        tm_year: 0,
+        tm_wday: 0,
+        tm_yday: 0,
+        tm_isdst: 0,
+        tm_gmtoff: 0,
+        tm_zone: std::ptr::null(),
+    };
+    unsafe { localtime_r(&t as *const i64, &mut tm as *mut CTm) };
+    tm
+}
+
+const WEEKDAY_ABBR: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+const WEEKDAY_FULL: [&str; 7] =
+    ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+const MONTH_ABBR: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+const MONTH_FULL: [&str; 12] = [
+    "January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November",
+    "December",
+];
+
+// `\d`: bash's own default (no-arg) date format, "Weekday Month Day"
+// with the day space-padded to two columns (matching `%e`, e.g. "Tue
+// May  6" for the 6th) -- no year, no locale support (bish has none at
+// all), always English abbreviations.
+fn prompt_date() -> String {
+    let tm = local_time_now();
+    format!("{} {} {:2}", WEEKDAY_ABBR[tm.tm_wday as usize % 7], MONTH_ABBR[tm.tm_mon as usize % 12], tm.tm_mday)
+}
+
+// A small strftime subset covering the specifiers a prompt format
+// string would plausibly use -- not a general-purpose implementation
+// (no locale support, no width/padding modifiers beyond what's baked
+// into each specifier below). An unrecognized `%X` passes through
+// literally, matching this codebase's own established convention for
+// an unrecognized escape sequence elsewhere (e.g. expand_backslash_escapes).
+fn strftime(fmt: &str, tm: &CTm) -> String {
+    let year = tm.tm_year + 1900;
+    let hour24 = tm.tm_hour;
+    let hour12 = match hour24 % 12 {
+        0 => 12,
+        h => h,
+    };
+    let mut out = String::new();
+    let mut chars = fmt.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '%' {
+            out.push(c);
+            continue;
+        }
+        let Some(spec) = chars.next() else {
+            out.push('%');
+            break;
+        };
+        match spec {
+            'Y' => out.push_str(&year.to_string()),
+            'y' => out.push_str(&format!("{:02}", year.rem_euclid(100))),
+            'm' => out.push_str(&format!("{:02}", tm.tm_mon + 1)),
+            'd' => out.push_str(&format!("{:02}", tm.tm_mday)),
+            'e' => out.push_str(&format!("{:2}", tm.tm_mday)),
+            'H' => out.push_str(&format!("{:02}", hour24)),
+            'I' => out.push_str(&format!("{:02}", hour12)),
+            'M' => out.push_str(&format!("{:02}", tm.tm_min)),
+            'S' => out.push_str(&format!("{:02}", tm.tm_sec)),
+            'p' => out.push_str(if hour24 < 12 { "AM" } else { "PM" }),
+            'a' => out.push_str(WEEKDAY_ABBR[tm.tm_wday as usize % 7]),
+            'A' => out.push_str(WEEKDAY_FULL[tm.tm_wday as usize % 7]),
+            'b' => out.push_str(MONTH_ABBR[tm.tm_mon as usize % 12]),
+            'B' => out.push_str(MONTH_FULL[tm.tm_mon as usize % 12]),
+            'j' => out.push_str(&format!("{:03}", tm.tm_yday + 1)),
+            'T' => out.push_str(&format!("{:02}:{:02}:{:02}", hour24, tm.tm_min, tm.tm_sec)),
+            'F' => out.push_str(&format!("{:04}-{:02}-{:02}", year, tm.tm_mon + 1, tm.tm_mday)),
+            '%' => out.push('%'),
+            other => {
+                out.push('%');
+                out.push(other);
+            }
+        }
+    }
+    out
+}
+
 // `read -p`'s prompt only displays when input is coming from a terminal
 // (bash-documented behavior), and `read -t`'s timeout is only meaningfully
 // pollable against a real fd (stdin), not a shell-internal here-doc/file
@@ -8039,17 +8304,18 @@ fn declare_p_quote(value: &str) -> String {
     out
 }
 
-// Only the four pure string-transform operators -- @A/@a/@K need
-// name/attribute context this function doesn't have, so every call
-// site handles those three itself (see eval_var_op/eval_array_var_op's
-// own Transform arms) and never reaches here with them.
+// Only the four pure string-transform operators -- @A/@a/@K/@P all need
+// context (name/attributes, or live shell state) this function doesn't
+// have, so every call site handles those itself (see eval_var_op/
+// eval_array_var_op's own Transform arms) and never reaches here with
+// them.
 fn apply_transform(cur: &str, kind: TransformKind) -> String {
     match kind {
         TransformKind::Quote => crate::serialize::quote_literal(cur),
         TransformKind::Upper => cur.to_uppercase(),
         TransformKind::Lower => cur.to_lowercase(),
         TransformKind::Escape => expand_backslash_escapes(cur),
-        TransformKind::Attributes | TransformKind::AttributeFlags | TransformKind::KeyValue => {
+        TransformKind::Attributes | TransformKind::AttributeFlags | TransformKind::KeyValue | TransformKind::Prompt => {
             unreachable!("handled directly in eval_var_op/eval_array_var_op")
         }
     }
@@ -9264,6 +9530,65 @@ mod tests {
         let buf = capture_output(&mut shell);
         shell.run_source_here(r#"declare -A m=([a]=1 [b]=2); echo "${m[@]@K}""#, "<test>");
         assert_eq!(buf.borrow().as_str(), "a \"1\" b \"2\"\n");
+    }
+
+    #[test]
+    fn var_transform_capital_p_expands_common_prompt_escapes() {
+        let mut shell = Shell::new();
+        let buf = capture_output(&mut shell);
+        shell.run_source_here(r#"p='\u@\h:\w\$ '; echo "${p@P}""#, "<test>");
+        let expected = format!(
+            "{}@{}:{}{} \n",
+            prompt_username(),
+            get_hostname().split('.').next().unwrap_or(""),
+            shell.prompt_cwd(false),
+            if is_effective_root() { "#" } else { "$" }
+        );
+        assert_eq!(buf.borrow().as_str(), expected);
+    }
+
+    #[test]
+    fn var_transform_capital_p_strips_non_printing_sequence_brackets() {
+        let mut shell = Shell::new();
+        let buf = capture_output(&mut shell);
+        shell.run_source_here(r#"p='[\[\e[1m\]hi\[\e[0m\]]'; echo "${p@P}""#, "<test>");
+        assert_eq!(buf.borrow().as_str(), "[\x1b[1mhi\x1b[0m]\n");
+    }
+
+    #[test]
+    fn var_transform_capital_p_octal_escape() {
+        let mut shell = Shell::new();
+        let buf = capture_output(&mut shell);
+        shell.run_source_here(r#"p='\101\102'; echo "${p@P}""#, "<test>");
+        assert_eq!(buf.borrow().as_str(), "AB\n");
+    }
+
+    #[test]
+    fn var_transform_capital_p_custom_strftime_format() {
+        let mut shell = Shell::new();
+        let buf = capture_output(&mut shell);
+        shell.run_source_here(r#"p='\D{%Y}'; echo "${p@P}""#, "<test>");
+        // Just check it's a plausible 4-digit year, since we can't
+        // control the wall clock from a unit test.
+        let out = buf.borrow().clone();
+        assert_eq!(out.trim_end().len(), 4);
+        assert!(out.trim_end().chars().all(|c| c.is_ascii_digit()));
+    }
+
+    #[test]
+    fn var_transform_capital_p_unrecognized_escape_passes_through() {
+        let mut shell = Shell::new();
+        let buf = capture_output(&mut shell);
+        shell.run_source_here(r#"p='\z\q'; echo "${p@P}""#, "<test>");
+        assert_eq!(buf.borrow().as_str(), "\\z\\q\n");
+    }
+
+    #[test]
+    fn var_transform_capital_p_job_count() {
+        let mut shell = Shell::new();
+        let buf = capture_output(&mut shell);
+        shell.run_source_here(r#"p='\j'; echo "${p@P}""#, "<test>");
+        assert_eq!(buf.borrow().as_str(), "0\n");
     }
 
     #[test]

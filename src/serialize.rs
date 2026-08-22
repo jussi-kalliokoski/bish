@@ -303,6 +303,7 @@ fn serialize_var_op(name: &str, op: &VarOp) -> String {
                 TransformKind::Attributes => "A",
                 TransformKind::AttributeFlags => "a",
                 TransformKind::KeyValue => "K",
+                TransformKind::Prompt => "P",
             };
             format!("${{{}@{}}}", name, letter)
         }
