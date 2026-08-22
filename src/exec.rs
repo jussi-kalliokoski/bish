@@ -980,6 +980,70 @@ impl Shell {
         0
     }
 
+    // disown [-a|-r] [%job|pid...]: removes matching jobs from the job
+    // table without touching their children at all -- Rust's own
+    // `Child::drop` never kills a still-running process, only closes the
+    // handle, so simply removing the entry already gives disown's
+    // "stop tracking, let it keep running independently" effect. bish
+    // has no SIGHUP-on-exit for background jobs to begin with (a
+    // separate, pre-existing gap), so the other half of real disown's
+    // job -- surviving that signal -- doesn't apply here; this only
+    // affects `jobs`/`wait`/`fg`/`bg` no longer seeing the job. Bare
+    // `disown` (no flags, no specs) disowns just the current job,
+    // matching bash.
+    fn run_disown(&mut self, args: &[String]) -> i32 {
+        let mut all = false;
+        let mut running_only = false;
+        let mut specs: Vec<&String> = Vec::new();
+        for a in args {
+            match a.as_str() {
+                "-a" => all = true,
+                "-r" => running_only = true,
+                _ => specs.push(a),
+            }
+        }
+        if all {
+            self.jobs.borrow_mut().jobs.clear();
+            return 0;
+        }
+        if running_only && specs.is_empty() {
+            self.jobs.borrow_mut().jobs.retain(|j| j.stopped);
+            return 0;
+        }
+        if specs.is_empty() {
+            let mut table = self.jobs.borrow_mut();
+            if table.jobs.is_empty() {
+                sh_eprintln!(self, "bish: disown: current: no such job");
+                return 1;
+            }
+            table.jobs.pop();
+            return 0;
+        }
+        // resolve_job_spec takes its own immutable borrow of self.jobs,
+        // so every spec is resolved to an index before the single
+        // borrow_mut below that actually removes them (highest index
+        // first, so earlier removals don't shift later indices out from
+        // under this same pass).
+        let mut status = 0;
+        let mut idxs: Vec<usize> = Vec::new();
+        for s in specs {
+            match self.resolve_job_spec(s) {
+                Some(i) => idxs.push(i),
+                None => {
+                    sh_eprintln!(self, "bish: disown: {}: no such job", s);
+                    status = 1;
+                }
+            }
+        }
+        idxs.sort_unstable();
+        idxs.dedup();
+        let mut table = self.jobs.borrow_mut();
+        for idx in idxs.into_iter().rev() {
+            table.jobs.remove(idx);
+        }
+        status
+    }
+
     // A job that *was* spawned pty-attached (Job::pty_master.is_some() --
     // only true for a promoted, unredirected background job) bubbles
     // ExecResult::Fg without blocking at all: see that variant's doc
@@ -4639,6 +4703,7 @@ impl Shell {
                 return ExecResult::Status(0);
             }
             "jobs" => return ExecResult::Status(self.run_jobs(&argv[1..])),
+            "disown" => return ExecResult::Status(self.run_disown(&argv[1..])),
             "fg" => return self.run_fg(&argv[1..]),
             "bg" => return ExecResult::Status(self.run_bg(&argv[1..])),
             "wait" => return ExecResult::Status(self.run_wait(&argv[1..])),
@@ -7746,6 +7811,7 @@ const KNOWN_BUILTINS: &[&str] = &[
     ".",
     "trap",
     "jobs",
+    "disown",
     "fg",
     "bg",
     "wait",
