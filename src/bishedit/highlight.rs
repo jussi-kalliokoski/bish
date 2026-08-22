@@ -421,7 +421,7 @@ pub(crate) fn is_assignment_prefix_word(chunks: &[Chunk]) -> bool {
 pub(crate) const KNOWN_BUILTINS: &[&str] = &[
     ":", "cd", "e", "export", "let", "break", "continue", "test", "[", "[[", "return", "shift", "local", "exit", "read", "mapfile",
     "readarray", "eval", "source", ".", "trap", "jobs", "disown", "fg", "bg", "wait", "kill", "getopts", "unset", "set", "declare",
-    "typeset", "readonly", "exec", "command", "type", "hash", "shopt", "umask", "pushd", "popd", "dirs", "ulimit", "alias",
+    "typeset", "readonly", "exec", "command", "builtin", "type", "hash", "shopt", "umask", "pushd", "popd", "dirs", "ulimit", "alias",
     "unalias", "abbr", "bishopt", "compgen", "complete", "compopt", "window", "win", "echo", "printf",
 ];
 

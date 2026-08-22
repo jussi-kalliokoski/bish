@@ -4103,6 +4103,30 @@ impl Shell {
         }
         let name = argv[0].clone();
 
+        // Functions shadow builtins, matching real bash (confirmed: even
+        // POSIX "special" builtins like `export`/`return`/`break` are
+        // overridable by a same-named function there) -- `builtin NAME`
+        // (its own arm inside dispatch_builtin_or_external below) is the
+        // explicit bypass. `restrict_to_builtins` (command mode's
+        // colon-line) skips this entirely: its own contract is "only
+        // real builtins run here", not "functions still apply".
+        if !self.restrict_to_builtins
+            && let Some(body) = self.functions.get(&name).cloned()
+        {
+            return self.call_function(&body, argv[1..].to_vec());
+        }
+        self.dispatch_builtin_or_external(&argv, name, cmd, background, false)
+    }
+
+    // Split out from run_single so `builtin NAME...` (its own arm below)
+    // can re-enter just the builtin-dispatch-and-external-spawn part,
+    // bypassing run_single's own function-shadowing check above -- that
+    // bypass is the entire point of `builtin`. `builtin_only` is true
+    // only for that recursive call: on no match, it reports "not a
+    // shell builtin" instead of falling through to
+    // restrict_to_builtins/external-spawn like the ordinary top-level
+    // path does.
+    fn dispatch_builtin_or_external(&mut self, argv: &[String], name: String, cmd: &SimpleCommand, background: bool, builtin_only: bool) -> ExecResult {
         // Builtins ignore per-command redirects for now: their output goes
         // straight to the shell's own stdio.
         match name.as_str() {
@@ -4169,6 +4193,21 @@ impl Shell {
                         ExecResult::Status(127)
                     }
                 };
+            }
+            // builtin NAME [args...]: forces the real builtin even when a
+            // same-named function is defined -- the explicit bypass for
+            // the function-shadowing run_single now does by default (see
+            // its own doc comment). Unlike an ordinary command that falls
+            // back to spawning an external program when nothing matches,
+            // `builtin` never does that (builtin_only: true below) --
+            // matching bash's own "not a shell builtin" error instead.
+            // Bare `builtin` (no name) is a silent no-op, matching bash.
+            "builtin" => {
+                if argv.len() < 2 {
+                    return ExecResult::Status(0);
+                }
+                let inner_name = argv[1].clone();
+                return self.dispatch_builtin_or_external(&argv[1..], inner_name, cmd, background, true);
             }
             "type" => return ExecResult::Status(self.run_type(&argv[1..])),
             // No command-path cache exists to manage -- every exec
@@ -4793,13 +4832,14 @@ impl Shell {
             _ => {}
         }
 
+        if builtin_only {
+            sh_eprintln!(self, "bish: builtin: {}: not a shell builtin", name);
+            return ExecResult::Status(1);
+        }
+
         if self.restrict_to_builtins {
             sh_eprintln!(self, "bish: {}: command mode only allows builtins -- use `command {}` to run it", name, name);
             return ExecResult::Status(127);
-        }
-
-        if let Some(body) = self.functions.get(&name).cloned() {
-            return self.call_function(&body, argv[1..].to_vec());
         }
 
         let redirs = match self.resolve_redirects(cmd) {
@@ -7824,6 +7864,7 @@ const KNOWN_BUILTINS: &[&str] = &[
     "readonly",
     "exec",
     "command",
+    "builtin",
     "type",
     "hash",
     "shopt",
@@ -9020,5 +9061,68 @@ mod tests {
         assert_eq!(shell.lookup_var("a"), "1");
         assert_eq!(shell.lookup_var("b"), "2");
         assert_eq!(shell.lookup_var("c"), "3");
+    }
+
+    #[test]
+    fn a_function_shadows_a_same_named_builtin() {
+        // Confirmed against real bash: a user function of the same name
+        // as an ordinary builtin (even a POSIX "special" one like
+        // export/return/break) wins, with `builtin`/`command` as the
+        // explicit bypasses.
+        let mut shell = Shell::new();
+        let buf = capture_output(&mut shell);
+        shell.run_source_here(r#"cd() { echo "fake cd $1"; }; cd /somewhere"#, "<test>");
+        assert_eq!(buf.borrow().as_str(), "fake cd /somewhere\n");
+    }
+
+    #[test]
+    fn builtin_bypasses_a_shadowing_function() {
+        let mut shell = Shell::new();
+        let buf = capture_output(&mut shell);
+        shell.run_source_here(r#"cd() { echo "fake cd $1"; }; builtin cd /tmp"#, "<test>");
+        assert_eq!(buf.borrow().as_str(), "", "the function must not have run");
+        assert_eq!(shell.cwd.to_string_lossy(), "/tmp");
+    }
+
+    #[test]
+    fn builtin_on_an_unrecognized_name_errors_without_spawning_external() {
+        let mut shell = Shell::new();
+        let result = shell.run_source_here("builtin not_a_real_builtin_or_external_xyz", "<test>");
+        assert!(matches!(result, ExecResult::Status(1)), "{result:?}");
+    }
+
+    #[test]
+    fn bare_builtin_is_a_silent_noop() {
+        let mut shell = Shell::new();
+        let buf = capture_output(&mut shell);
+        let result = shell.run_source_here("builtin", "<test>");
+        assert!(matches!(result, ExecResult::Status(0)), "{result:?}");
+        assert_eq!(buf.borrow().as_str(), "");
+    }
+
+    #[test]
+    fn restrict_to_builtins_still_blocks_a_shadowing_function() {
+        // restrict_to_builtins (command mode's colon-line) means "only
+        // real builtins run here" -- unlike ordinary dispatch, it must
+        // NOT let a same-named function preempt the actual builtin.
+        let mut shell = Shell::new();
+        shell.restrict_to_builtins = true;
+        let buf = capture_output(&mut shell);
+        // Defining the function itself still works (declare/functions
+        // aren't gated); only invoking it as a command is.
+        shell.restrict_to_builtins = false;
+        shell.run_source_here("cd() { echo fake; }", "<test>");
+        shell.restrict_to_builtins = true;
+        shell.run_source_here("cd /tmp", "<test>");
+        assert_eq!(buf.borrow().as_str(), "");
+        assert_eq!(shell.cwd.to_string_lossy(), "/tmp");
+    }
+
+    #[test]
+    fn restrict_to_builtins_still_errors_on_a_genuinely_unknown_command() {
+        let mut shell = Shell::new();
+        shell.restrict_to_builtins = true;
+        let result = shell.run_source_here("not_a_real_builtin_or_function_xyz", "<test>");
+        assert!(matches!(result, ExecResult::Status(127)), "{result:?}");
     }
 }
