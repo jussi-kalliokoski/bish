@@ -625,6 +625,13 @@ pub fn run(mut shell: Shell) {
         };
         let menu_capable = !sinks_are_grid || row_origin.is_some();
 
+        // Ctrl-E's own live search input draws at the shared global
+        // status row using this exact snapshot -- a plain `(usize,
+        // usize)` copy taken before `on_idle` below gets its own `&mut`
+        // borrow of the same `term_rows`/`term_cols` (see read_line's
+        // own doc comment on this param for why a snapshot, not a live
+        // reference, is the right trade here).
+        let global_row_size = Some((term_rows, term_cols));
         match editor::read_line(
             &prompt_str,
             &session_history,
@@ -640,6 +647,7 @@ pub fn run(mut shell: Shell) {
             row_origin,
             &mut registers,
             &abbrs_snapshot,
+            global_row_size,
             || {
                 service_background_jobs(&mut sessions, &mut windows, &mut job_frames, current_window, &mut term_rows, &mut term_cols, sinks_are_grid);
             },
@@ -5328,6 +5336,20 @@ pub(crate) fn render_global_status_row(text: &str, term_rows: usize) -> String {
     format!("\x1b[{};1H\x1b[7m{}\x1b[0m", command_mode_row(term_rows) + 1, text)
 }
 
+// A true erase of the same row `render_global_status_row` draws into --
+// plain `\x1b[K`, not a reverse-video row of spaces (which would just be
+// a highlighted *empty* bar sitting there, not actually gone). For a
+// bar that's shown only sometimes within a single excursion (Ctrl-E's
+// own line-local search input, editor.rs's `run_line_normal_mode` --
+// unlike this row's other consumers, which are either always-on for the
+// whole excursion or cleaned up by a coarser `compositor_redraw` at a
+// handful of fixed transition points), calling this directly on every
+// redraw where there's nothing to show is simpler and more precise than
+// waiting for one of those coarser resets to happen to fire.
+pub(crate) fn erase_global_status_row(term_rows: usize) -> String {
+    format!("\x1b[{};1H\x1b[K", command_mode_row(term_rows) + 1)
+}
+
 // Dark background/light foreground for a successful (exit 0) command's
 // output; error background/dark foreground for a failed one -- see
 // run_command_mode's own doc comment for the request this implements.
@@ -5597,6 +5619,12 @@ fn run_command_mode(
             None,
             registers,
             &[],
+            // No global row of its own to draw into here -- this colon-
+            // line already occupies that exact row with its own prompt
+            // (see read_line's own doc comment on this param) -- so a
+            // Ctrl-E search started while composing a `:` command falls
+            // back to the original in-place prompt substitution.
+            None,
             &mut || {
                 service_background_jobs(sessions, windows, job_frames, current_window, term_rows, term_cols, sinks_are_grid);
             },

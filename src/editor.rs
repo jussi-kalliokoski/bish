@@ -25,6 +25,9 @@ use crate::bishedit::undo::UndoTree;
 use crate::bishedit::Buffer;
 use crate::bishedit::vimkeys::{self, KeyOutcome, Op, VimKeys};
 use crate::history::History;
+// Same cross-module use fileeditor.rs already makes of these two -- see
+// run_line_normal_mode's own doc comment on its `term_rows` param.
+use crate::repl::{erase_global_status_row, render_global_status_row};
 use crate::term;
 use crate::vt100;
 
@@ -1199,6 +1202,24 @@ pub fn read_line(
     // `completion_provider`/`suggestion_provider`'s own `None` there) --
     // `expand_abbr_at_cursor` is a no-op on an empty slice either way.
     abbrs: &[(String, String)],
+    // `(term_rows, term_cols)`, `Some` when Ctrl-E's own line-local
+    // Normal mode (run_line_normal_mode, below) should draw its live
+    // `/`/`?` search input at the terminal's shared global status row
+    // (`repl::render_global_status_row`/`command_mode_row` -- the same
+    // row `:` command mode and Ctrl+Space's own Normal-mode status line
+    // already use) instead of substituting it in place of the prompt --
+    // both dimensions are needed since that row spans the *terminal's*
+    // full width, not this call's own `col_origin`/`width` (which, for a
+    // split pane, is narrower). `None`: falls back to the original
+    // in-place substitution -- command mode's own colon-line already
+    // occupies that exact row with its own prompt (see that call site),
+    // so a Ctrl-E search started while composing a `:` command keeps the
+    // old behavior rather than fighting over it. A plain snapshot, not a
+    // live reference: `on_idle` below can itself resize the terminal
+    // (SIGWINCH), and a value this stale by at most one resize is a fine
+    // trade against needing `on_idle` and this to somehow share `&mut`
+    // access to the same term size.
+    global_row_size: Option<(usize, usize)>,
     mut on_idle: impl FnMut(),
 ) -> io::Result<ReadOutcome> {
     let mut guard = Some(term::RawGuard::enable_with_mouse(0)?);
@@ -1512,7 +1533,7 @@ pub fn read_line(
                 let state = completion.take().unwrap();
                 ed.splice_word(state.word_start, ed.cursor, &state.original);
             }
-            Key::CtrlE => match run_line_normal_mode(&mut ed, prompt, col_origin, width, ctx, registers, &mut undo, &mut on_idle)? {
+            Key::CtrlE => match run_line_normal_mode(&mut ed, prompt, col_origin, width, ctx, registers, &mut undo, global_row_size, &mut on_idle)? {
                 LineNormalExit::ToInsert => {}
                 LineNormalExit::Propagate(k) => {
                     pending_key = Some(k);
@@ -1658,19 +1679,27 @@ fn selection_columns_line(range: &motion::MotionRange, len: usize) -> (usize, us
     (range.from.1, (range.to.1 + 1).min(len))
 }
 
+// Returns the live `/`/`?` pattern while one's being typed (`None`
+// otherwise -- a resolved/no search yields no bar text, only inline
+// match highlighting) alongside the match ranges to highlight on the
+// command line itself either way. Used to be a single dual-purpose
+// "what to show on the prompt row" string, back when a search always
+// substituted in place of the prompt; now split apart, since
+// run_line_normal_mode only does that as a fallback when it has nowhere
+// global to draw the pattern into instead (see that function's own doc
+// comment on its `term_rows` param).
 fn normal_mode_prompt_and_matches(
     ed: &mut LineEditor,
     marks: &mut HashMap<char, (usize, usize)>,
     selections: &mut Vec<motion::MotionRange>,
     vk: &VimKeys,
-    decorated_prompt: &str,
-) -> (String, Vec<(usize, usize)>) {
+) -> (Option<String>, Vec<(usize, usize)>) {
     let pending = vk.pending_display();
     if let Some(rest) = pending.strip_prefix('/').or_else(|| pending.strip_prefix('?')) {
         let lb = LineBuffer { ed, marks, selections };
         let mut matches = if rest.is_empty() { Vec::new() } else { motion::find_matches_in_line(&lb, 0, rest) };
         push_selection_matches(&lb, vk, &mut matches);
-        return (pending.to_string(), matches);
+        return (Some(pending.to_string()), matches);
     }
     let lb = LineBuffer { ed, marks, selections };
     let pattern = if vk.last_search_is_word() {
@@ -1684,7 +1713,7 @@ fn normal_mode_prompt_and_matches(
         None => Vec::new(),
     };
     push_selection_matches(&lb, vk, &mut matches);
-    (decorated_prompt.to_string(), matches)
+    (None, matches)
 }
 
 // Extends `matches` (search-match column ranges, already reverse-video --
@@ -1696,6 +1725,38 @@ fn push_selection_matches(lb: &LineBuffer, vk: &VimKeys, matches: &mut Vec<(usiz
     let len = lb.ed.buf.len();
     for range in lb.selections.iter().chain(active_visual_range_line(vk, lb).iter()) {
         matches.push(selection_columns_line(range, len));
+    }
+}
+
+// Draws (`Some`) or erases (`None`) run_line_normal_mode's own live
+// search-pattern display at the shared global status row -- a no-op
+// when `global_row_size` itself is `None` (nothing global to draw
+// into, see that function's own doc comment on the param). Wrapped in
+// cursor save/restore (`\x1b7`/`\x1b8`): this writes to a row far from
+// wherever the just-completed `redraw` call left the real cursor, and
+// must leave it exactly where `redraw` put it, not where this leaves
+// off.
+fn draw_global_search_bar(global_row_size: Option<(usize, usize)>, bar_text: Option<&str>) {
+    let Some((term_rows, term_cols)) = global_row_size else { return };
+    let row = match bar_text {
+        Some(text) => render_global_status_row(&pad_to_width(text, term_cols), term_rows),
+        None => erase_global_status_row(term_rows),
+    };
+    print!("\x1b7{}\x1b8", row);
+    let _ = io::stdout().flush();
+}
+
+// Space-pads or truncates `text` to exactly `cols` display columns --
+// `render_global_status_row`'s own doc comment requires this of its
+// caller. Same small, duplicated-rather-than-shared shape as repl.rs's
+// own `normal_mode_status_text`/fileeditor.rs's own `status_text`, the
+// two other places that build this exact row's contents.
+fn pad_to_width(text: &str, cols: usize) -> String {
+    let len = text.chars().count();
+    match len.cmp(&cols) {
+        std::cmp::Ordering::Less => format!("{}{}", text, " ".repeat(cols - len)),
+        std::cmp::Ordering::Greater => text.chars().take(cols).collect(),
+        std::cmp::Ordering::Equal => text.to_string(),
     }
 }
 
@@ -1725,6 +1786,19 @@ fn run_line_normal_mode(
     ctx: HighlightContext,
     registers: &mut Registers,
     undo: &mut UndoTree<Vec<char>>,
+    // `(term_rows, term_cols)`: `Some` draws a `/`/`?` pattern being
+    // typed at the terminal's shared global status row
+    // (`repl::render_global_status_row`, `repl::erase_global_status_row`
+    // to blank it back out -- the same row `:` command mode and Ctrl+
+    // Space's own Normal-mode status line already use) instead of
+    // substituting it in place of this excursion's own reverse-video
+    // prompt. Threaded straight through from `read_line`'s own
+    // identically-named param -- see its doc comment for why both
+    // dimensions are needed (that row is the *terminal's* full width,
+    // not this call's own `width` above) and why this is a plain
+    // snapshot, not a live reference. `None` falls back to the original
+    // in-place substitution.
+    global_row_size: Option<(usize, usize)>,
     on_idle: &mut dyn FnMut(),
 ) -> io::Result<LineNormalExit> {
     let mut vk = VimKeys::new();
@@ -1751,8 +1825,10 @@ fn run_line_normal_mode(
     // unwanted, sticky change to something this feature has no business
     // touching.
     let decorated_prompt = format!("\x1b[7m{}\x1b[0m", prompt);
-    let (shown, matches) = normal_mode_prompt_and_matches(ed, &mut marks, &mut selections, &vk, &decorated_prompt);
+    let (bar_text, matches) = normal_mode_prompt_and_matches(ed, &mut marks, &mut selections, &vk);
+    let shown = if global_row_size.is_some() { decorated_prompt.clone() } else { bar_text.clone().unwrap_or_else(|| decorated_prompt.clone()) };
     redraw(&shown, ed, col_origin, width, ctx, &matches)?;
+    draw_global_search_bar(global_row_size, bar_text.as_deref());
     let exit = loop {
         let key = match read_key_idle(on_idle)? {
             Some(k) => k,
@@ -2037,9 +2113,19 @@ fn run_line_normal_mode(
         // for `TextBuffer::checkpoint_undo` -- see that one's own doc
         // comment for why that's what actually defines an undo "group".
         undo.checkpoint(&ed.buf, (0, ed.cursor));
-        let (shown, matches) = normal_mode_prompt_and_matches(ed, &mut marks, &mut selections, &vk, &decorated_prompt);
+        let (bar_text, matches) = normal_mode_prompt_and_matches(ed, &mut marks, &mut selections, &vk);
+        let shown = if global_row_size.is_some() { decorated_prompt.clone() } else { bar_text.clone().unwrap_or_else(|| decorated_prompt.clone()) };
         redraw(&shown, ed, col_origin, width, ctx, &matches)?;
+        draw_global_search_bar(global_row_size, bar_text.as_deref());
     };
+    // Every `break` above (ToInsert, Propagate, Eof) skips straight past
+    // the loop body's own trailing draw_global_search_bar call --
+    // without this, whatever the bar was last showing would keep
+    // sitting at the global row indefinitely once back in ordinary
+    // insert-mode typing, since nothing else calls it again until the
+    // next Ctrl-E excursion. Always erase here instead, regardless of
+    // which exit path was taken.
+    draw_global_search_bar(global_row_size, None);
     Ok(exit)
 }
 
