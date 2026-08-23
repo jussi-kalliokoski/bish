@@ -1759,7 +1759,11 @@ fn run_line_normal_mode(
             None => break LineNormalExit::Eof,
         };
         match key {
-            Key::CtrlC | Key::CtrlD | Key::CtrlZ => break LineNormalExit::Propagate(key),
+            // A search actively being typed keeps Ctrl-C for itself
+            // (see vimkeys.rs's own feed_search doc comment on its
+            // Ctrl-C arm) -- only intercepted here, before vk.feed ever
+            // sees it, when no search is in progress.
+            Key::CtrlC | Key::CtrlD | Key::CtrlZ if !vk.is_search_pending() => break LineNormalExit::Propagate(key),
             // Visual mode's own `Z`/`y`/`d`/`c`/`p`/`P`/Escape -- intercepted
             // here, ahead of `vk.feed`, for the same reason repl.rs's own
             // identical arms are (see its own doc comment): "is there a
@@ -2592,7 +2596,12 @@ fn run_one_shot_normal_command(ed: &mut LineEditor, registers: &mut Registers, u
             None => break None,
         };
         match key {
-            Key::CtrlC | Key::CtrlD | Key::CtrlZ => break Some(key),
+            // Same reasoning as run_line_normal_mode's own conditional
+            // interception: a search actively being typed keeps Ctrl-C
+            // for itself (vimkeys.rs's feed_search cancels just the
+            // search), so it's only intercepted here when no search is
+            // in progress.
+            Key::CtrlC | Key::CtrlD | Key::CtrlZ if !vk.is_search_pending() => break Some(key),
             _ => {
                 let mut lb = LineBuffer { ed, marks: &mut marks, selections: &mut selections };
                 match vk.feed(key) {

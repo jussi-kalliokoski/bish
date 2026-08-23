@@ -659,6 +659,17 @@ impl VimKeys {
         matches!(self.last_search, Some(LastSearch::Word { .. }))
     }
 
+    /// Whether a `/`/`?` pattern is actively being typed right now --
+    /// distinct from `pending_display()` being non-empty (that's also
+    /// true mid-count, mid-`g`/`Z`/`<C-w>` prefix, etc.). A caller uses
+    /// this to decide whether `Key::CtrlC`/`CtrlD`/`CtrlZ` should be
+    /// intercepted as "exit this whole mode" or left to reach `feed`
+    /// itself, where `feed_search`'s own `Key::CtrlC` arm cancels just
+    /// the search instead (see that arm's own doc comment).
+    pub fn is_search_pending(&self) -> bool {
+        matches!(self.pending, Pending::Search { .. })
+    }
+
     /// Whether Visual mode is currently active.
     pub fn is_visual(&self) -> bool {
         self.visual.is_some()
@@ -1667,6 +1678,12 @@ impl VimKeys {
                 })
             }
             Key::Escape => self.abort(),
+            // Cancels only the search, same as Escape -- callers gate
+            // their own outer Ctrl-C/D/Z interception on
+            // `is_search_pending()` precisely so this arm gets a chance
+            // to run instead of the whole mode exiting first.
+            Key::CtrlC => self.abort(),
+            Key::Backspace if text.is_empty() => self.abort(),
             Key::Backspace => {
                 text.pop();
                 self.pending = Pending::Search { forward, text };
@@ -2122,6 +2139,53 @@ mod tests {
         assert_eq!(vk.feed(Key::Escape), KeyOutcome::None);
         // back to a clean state afterward
         assert_eq!(vk.feed(Key::Char('w')), KeyOutcome::Motion(Motion::WordForward, None));
+    }
+
+    #[test]
+    fn search_ctrl_c_cancels_only_the_search() {
+        let mut vk = VimKeys::new();
+        assert_eq!(vk.feed(Key::Char('/')), KeyOutcome::Pending);
+        assert_eq!(vk.feed(Key::Char('x')), KeyOutcome::Pending);
+        assert!(vk.is_search_pending());
+        assert_eq!(vk.feed(Key::CtrlC), KeyOutcome::None);
+        assert!(!vk.is_search_pending());
+        // back to a clean state afterward, same as Escape
+        assert_eq!(vk.feed(Key::Char('w')), KeyOutcome::Motion(Motion::WordForward, None));
+    }
+
+    #[test]
+    fn search_backspace_on_empty_pattern_cancels() {
+        let mut vk = VimKeys::new();
+        assert_eq!(vk.feed(Key::Char('/')), KeyOutcome::Pending);
+        assert!(vk.is_search_pending());
+        // Nothing typed yet -- Backspace here should exit search entirely,
+        // not silently re-arm an unchanged empty pattern forever.
+        assert_eq!(vk.feed(Key::Backspace), KeyOutcome::None);
+        assert!(!vk.is_search_pending());
+        assert_eq!(vk.feed(Key::Char('w')), KeyOutcome::Motion(Motion::WordForward, None));
+    }
+
+    #[test]
+    fn search_backspace_on_non_empty_pattern_still_just_edits() {
+        let mut vk = VimKeys::new();
+        assert_eq!(vk.feed(Key::Char('/')), KeyOutcome::Pending);
+        assert_eq!(vk.feed(Key::Char('x')), KeyOutcome::Pending);
+        // First Backspace just edits "x" down to an empty pattern --
+        // still pending, not yet a cancel.
+        assert_eq!(vk.feed(Key::Backspace), KeyOutcome::Pending);
+        assert!(vk.is_search_pending());
+        // Now that the pattern is empty, the *next* Backspace cancels.
+        assert_eq!(vk.feed(Key::Backspace), KeyOutcome::None);
+        assert!(!vk.is_search_pending());
+    }
+
+    #[test]
+    fn is_search_pending_false_outside_of_search() {
+        let mut vk = VimKeys::new();
+        assert!(!vk.is_search_pending());
+        assert_eq!(vk.feed(Key::Char('2')), KeyOutcome::Pending);
+        // Mid-count is pending, but not a *search* pending.
+        assert!(!vk.is_search_pending());
     }
 
     #[test]
