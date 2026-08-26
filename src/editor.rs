@@ -52,6 +52,13 @@ pub enum Key {
     Down,
     Home,
     End,
+    // "CSI 5 ~"/"CSI 6 ~" -- see decode_csi_final. Not decoded before this
+    // existed at all (fell through to Unknown), which is why neither ever
+    // did anything in any mode (Normal or Insert) of bishedit's own file
+    // editor, or the plain shell prompt -- see run_insert_mode/vimkeys.rs's
+    // own Motion::PageUp/PageDown handling for where these actually go now.
+    PageUp,
+    PageDown,
     Escape,
     // xterm/tmux send these as "CSI 1 ; 3 <letter>" (modifier 3 = Alt)
     // rather than the plain "CSI <letter>" -- see decode_csi_final.
@@ -136,6 +143,23 @@ impl MouseEvent {
     // everything else it decodes is deliberately left alone for now.
     pub fn is_left_click(&self) -> bool {
         self.pressed && self.button & 0x60 == 0 && self.button & 0x03 == 0
+    }
+
+    // xterm's SGR mouse protocol encodes a wheel notch as button 4 (up) or
+    // 5 (down) -- bit 6 set (the same bit that also marks buttons 6/7,
+    // which this codebase has no use for and doesn't distinguish), plus
+    // bits 0-1 holding 0 or 1. Modifier bits (2-4) are masked out, same as
+    // is_left_click above -- a Shift/Ctrl/Alt-held wheel notch still
+    // scrolls. A wheel notch is always reported as a bare press (no
+    // matching release), but `pressed` is still checked here anyway --
+    // cheap insurance against a terminal that behaves differently, same
+    // spirit as is_left_click's own explicit check.
+    pub fn is_scroll_up(&self) -> bool {
+        self.pressed && self.button & 0x43 == 0x40
+    }
+
+    pub fn is_scroll_down(&self) -> bool {
+        self.pressed && self.button & 0x43 == 0x41
     }
 }
 
@@ -362,6 +386,8 @@ fn decode_csi_final(params: &str, final_byte: u8) -> Key {
             Some(3) => Key::Delete,
             Some(1) | Some(7) => Key::Home,
             Some(4) | Some(8) => Key::End,
+            Some(5) => Key::PageUp,
+            Some(6) => Key::PageDown,
             _ => Key::Unknown,
         },
         b'Z' => Key::BackTab,
@@ -1594,7 +1620,11 @@ pub fn read_line(
                 drop(guard.take());
                 return Ok(ReadOutcome::Mouse { event: ev, text: ed.as_string(), cursor: ed.cursor });
             }
-            Key::AltLeft | Key::AltRight | Key::AltUp | Key::CtrlY | Key::CtrlX | Key::Mouse(_) | Key::Unknown => {}
+            // PageUp/PageDown: no meaning at the live prompt itself (no
+            // scrollback view to page through here -- that's Ctrl+Space's
+            // own Normal-mode navigation's job), same as a real bash
+            // readline prompt not binding them either.
+            Key::AltLeft | Key::AltRight | Key::AltUp | Key::CtrlY | Key::CtrlX | Key::Mouse(_) | Key::PageUp | Key::PageDown | Key::Unknown => {}
         }
         // Recomputed fresh every iteration -- see compute_suggestion's
         // own doc comment. Must happen after the match (so it reflects
@@ -2931,6 +2961,12 @@ mod tests {
     }
 
     #[test]
+    fn decode_csi_final_tilde_form_page_up_and_down() {
+        assert_eq!(decode_csi_final("5", b'~'), Key::PageUp);
+        assert_eq!(decode_csi_final("6", b'~'), Key::PageDown);
+    }
+
+    #[test]
     fn decode_sgr_mouse_final_press_and_release() {
         assert_eq!(decode_sgr_mouse_final("0;12;5", b'M'), Key::Mouse(MouseEvent { button: 0, col: 12, row: 5, pressed: true }));
         assert_eq!(decode_sgr_mouse_final("0;12;5", b'm'), Key::Mouse(MouseEvent { button: 0, col: 12, row: 5, pressed: false }));
@@ -2954,6 +2990,35 @@ mod tests {
     #[test]
     fn decode_sgr_mouse_final_non_numeric_params_is_unknown() {
         assert_eq!(decode_sgr_mouse_final("x;y;z", b'M'), Key::Unknown);
+    }
+
+    #[test]
+    fn mouse_event_recognizes_wheel_up_and_down() {
+        let up = MouseEvent { button: 64, col: 1, row: 1, pressed: true };
+        let down = MouseEvent { button: 65, col: 1, row: 1, pressed: true };
+        assert!(up.is_scroll_up());
+        assert!(!up.is_scroll_down());
+        assert!(down.is_scroll_down());
+        assert!(!down.is_scroll_up());
+        // Neither is ever mistaken for a click.
+        assert!(!up.is_left_click());
+        assert!(!down.is_left_click());
+    }
+
+    #[test]
+    fn mouse_event_wheel_ignores_modifier_bits() {
+        // Shift/Meta/Ctrl (bits 2-4) held during a wheel notch -- still a
+        // wheel event, same as is_left_click already ignores them for an
+        // ordinary click.
+        let shift_wheel_up = MouseEvent { button: 64 | 0x04, col: 1, row: 1, pressed: true };
+        assert!(shift_wheel_up.is_scroll_up());
+    }
+
+    #[test]
+    fn mouse_event_plain_click_is_not_a_wheel_event() {
+        let click = MouseEvent { button: 0, col: 1, row: 1, pressed: true };
+        assert!(!click.is_scroll_up());
+        assert!(!click.is_scroll_down());
     }
 
     fn make_editor(text: &str, cursor: usize) -> LineEditor {

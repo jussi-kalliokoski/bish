@@ -651,6 +651,12 @@ pub(crate) fn resolve_insert_start(buf: &mut TextBuffer, cmd: InsertCmd) {
 // keeps using the size it started with until then -- the same "next
 // natural redraw" caveat this codebase already accepts elsewhere for a
 // loop that's actively blocked on a keystroke.
+// Lines scrolled per mouse wheel notch, here and in repl.rs's own
+// Normal-mode navigation wheel handling -- matches most terminals'/
+// editors' own default wheel granularity (a single line per notch reads
+// as sluggish for a fast scroll).
+pub(crate) const MOUSE_WHEEL_LINES: usize = 3;
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_insert_mode(
     buf: &mut TextBuffer,
@@ -758,6 +764,20 @@ pub(crate) fn run_insert_mode(
             }
             Key::Up => motion::apply_motion(buf, motion::Motion::Up, None),
             Key::Down => motion::apply_motion(buf, motion::Motion::Down, None),
+            // Same physical-key-as-Ctrl-F/Ctrl-B convention as Normal
+            // mode's own vimkeys.rs handling -- real vim honors
+            // PageUp/PageDown in Insert mode too, not just Normal.
+            Key::PageDown => motion::apply_motion(buf, motion::Motion::PageDown, None),
+            Key::PageUp => motion::apply_motion(buf, motion::Motion::PageUp, None),
+            // Mouse wheel: scrolls the view without otherwise touching
+            // the cursor (Motion::ScrollLineDown/Up's own behavior --
+            // only nudges the cursor back into view if scrolling would
+            // otherwise carry it off-screen), same as Ctrl-E/Ctrl-Y
+            // already do in Normal mode. MOUSE_WHEEL_LINES lines per
+            // notch, not 1 -- matches most terminals'/editors' own
+            // default wheel granularity.
+            Key::Mouse(ev) if ev.is_scroll_down() => motion::apply_motion(buf, motion::Motion::ScrollLineDown, Some(MOUSE_WHEEL_LINES)),
+            Key::Mouse(ev) if ev.is_scroll_up() => motion::apply_motion(buf, motion::Motion::ScrollLineUp, Some(MOUSE_WHEEL_LINES)),
             Key::Char(c) => {
                 let (row, col) = buf.cursor();
                 // Replace mode overwrites the character already at the

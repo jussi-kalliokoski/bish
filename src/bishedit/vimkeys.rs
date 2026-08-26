@@ -1216,8 +1216,10 @@ impl VimKeys {
             Key::Char('L') => self.emit(Motion::ScreenBottom),
             Key::CtrlD => self.emit(Motion::HalfPageDown),
             Key::CtrlU => self.emit(Motion::HalfPageUp),
-            Key::CtrlF => self.emit(Motion::PageDown),
-            Key::CtrlB => self.emit(Motion::PageUp),
+            // The physical PageDown/PageUp keys are plain synonyms for
+            // Ctrl-F/Ctrl-B, matching real vim's own convention.
+            Key::CtrlF | Key::PageDown => self.emit(Motion::PageDown),
+            Key::CtrlB | Key::PageUp => self.emit(Motion::PageUp),
             Key::CtrlE => self.emit(Motion::ScrollLineDown),
             Key::CtrlY => self.emit(Motion::ScrollLineUp),
             Key::Char('{') => self.emit(Motion::ParagraphBackward),
@@ -1808,6 +1810,14 @@ mod tests {
             let mut vk = VimKeys::new();
             assert_eq!(vk.feed(key), KeyOutcome::Motion(motion, None));
         }
+    }
+
+    #[test]
+    fn pagedown_pageup_keys_alias_to_ctrl_f_ctrl_b() {
+        let mut vk = VimKeys::new();
+        assert_eq!(vk.feed(Key::PageDown), KeyOutcome::Motion(Motion::PageDown, None));
+        let mut vk = VimKeys::new();
+        assert_eq!(vk.feed(Key::PageUp), KeyOutcome::Motion(Motion::PageUp, None));
     }
 
     #[test]

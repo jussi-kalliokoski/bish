@@ -4544,11 +4544,17 @@ fn run_normal_mode_navigation(
         // straight into its live prompt, not back into this pane's own
         // normal mode." A same-window pane-focus change via Ctrl-W h/j/
         // k/l already detaches today, so a same-window pane click doing
-        // the same is consistent, not a new limitation. A miss, a click
-        // on the already-focused tab/pane, or a non-qualifying mouse
-        // event (drag/release/wheel/other button) is just a no-op --
-        // re-render (in case a PendingView overlay was just cleared
-        // above) and keep navigating.
+        // the same is consistent, not a new limitation. A wheel notch
+        // (MouseEvent::is_scroll_up/is_scroll_down) scrolls this pane's
+        // own view -- same Motion::ScrollLineDown/Up and the same
+        // apply_motion_or_reselect/scroll_to_show_cursor/render_nav_frame
+        // sequence as an ordinary KeyOutcome::Motion below, just reached
+        // directly here since a wheel event never goes through vk.feed at
+        // all (same "orthogonal input channel" reasoning as a click). A
+        // miss, a click on the already-focused tab/pane, or a non-
+        // qualifying mouse event (drag/release/some other button) is just
+        // a no-op -- re-render (in case a PendingView overlay was just
+        // cleared above) and keep navigating.
         if let Key::Mouse(ev) = key {
             if ev.is_left_click() {
                 match hit_test_click(ev, sessions, windows, *current_window, *term_rows, *term_cols) {
@@ -4569,6 +4575,11 @@ fn run_normal_mode_navigation(
                     }
                     _ => {}
                 }
+            } else if ev.is_scroll_down() || ev.is_scroll_up() {
+                let motion = if ev.is_scroll_down() { motion::Motion::ScrollLineDown } else { motion::Motion::ScrollLineUp };
+                editor::apply_motion_or_reselect(&mut vk, &mut buf, motion, Some(fileeditor::MOUSE_WHEEL_LINES));
+                let content_cols = nav_content_cols(&buf, rect);
+                scroll_to_show_cursor(&mut buf, content_cols);
             }
             render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides);
             continue 'nav;
