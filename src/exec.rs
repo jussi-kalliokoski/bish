@@ -460,6 +460,28 @@ pub struct Shell {
     // than writing the default back, so "explicitly unset" and "never
     // touched" collapse to the same state.
     bishopts: std::collections::HashMap<String, BishOptValue>,
+    // `::bish theme begin`/`::bish theme end`'s own registry -- theme
+    // name -> the bishopt overrides captured while declaring it (see
+    // pending_theme's own doc comment for how a declaration fills this
+    // in). Consulted by bishopt_value as a second-tier default, below an
+    // explicit self.bishopts override but above KNOWN_BISHOPTS' own
+    // hardcoded one, whenever the "theme" bishopt itself (an ordinary
+    // Str option, set the normal way -- outside any declaration) names
+    // one of these. A shell-wide table, cloned into a forked child the
+    // same way bishopts itself is.
+    themes: std::collections::HashMap<String, std::collections::HashMap<String, BishOptValue>>,
+    // `Some` for the entire span between `::bish theme begin` and its
+    // matching `::bish theme end` -- every `bishopt --set NAME VALUE` in
+    // between is diverted here (keyed by NAME) instead of applying live,
+    // exactly the values that end up under a new entry in `themes` once
+    // `end` runs (see run_bish_theme_end's own doc comment for how the
+    // "theme" key specifically is pulled back out to name that entry,
+    // rather than becoming part of the theme's own opts). `None` outside
+    // a declaration -- the ordinary, overwhelmingly common state. Reset
+    // to `None` (not cloned) in a forked child: a declaration in
+    // progress is transient, top-level-only state, not something that
+    // makes sense to carry into a subshell/command-substitution mid-way.
+    pending_theme: Option<std::collections::HashMap<String, BishOptValue>>,
     // `complete NAME`: registered completion specs, by command name -- see
     // run_complete's own doc comment. Consulted both by `compgen`-adjacent
     // introspection (`complete -p`/`-r`/`compopt`) and, via a per-prompt
@@ -701,6 +723,8 @@ impl Shell {
             dir_stack: Vec::new(),
             shopt_options: std::collections::HashMap::new(),
             bishopts: std::collections::HashMap::new(),
+            themes: std::collections::HashMap::new(),
+            pending_theme: None,
             completions: std::collections::HashMap::new(),
             default_completion: None,
             readonly_names: std::collections::HashSet::new(),
@@ -898,6 +922,8 @@ impl Shell {
             dir_stack: self.dir_stack.clone(),
             shopt_options: self.shopt_options.clone(),
             bishopts: self.bishopts.clone(),
+            themes: self.themes.clone(),
+            pending_theme: None,
             completions: self.completions.clone(),
             default_completion: self.default_completion.clone(),
             readonly_names: self.readonly_names.clone(),
@@ -2143,27 +2169,57 @@ impl Shell {
         }
     }
 
-    // Effective value for a known bishopt name: its explicit override if
-    // one's been set, else that option's own registered default (always
-    // `false` for a Bool -- there's no separate stored default for
-    // booleans, see KNOWN_BISHOPTS' own doc comment). `None` means `name`
-    // isn't a registered option at all. A Color default is CSS source
-    // text, parsed the same way a `--set` value is -- `.expect()` on
-    // failure is deliberate: an unparseable *registered* default is a
+    // Effective value for a known bishopt name, in priority order: (1) its
+    // own explicit override, if one's been set; (2) else, unless `name`
+    // itself is "theme" (a theme naming itself would be circular and
+    // meaningless), whatever the currently active theme (the "theme"
+    // bishopt's own value, if any) declared for this name -- see
+    // run_bish_theme_end's own doc comment for how a theme's declared
+    // opts get there; (3) else that option's own registered default
+    // (always `false` for a Bool -- there's no separate stored default
+    // for booleans, see KNOWN_BISHOPTS' own doc comment). `None` means
+    // `name` isn't a registered option at all. A Color default is CSS
+    // source text, parsed the same way a `--set` value is -- `.expect()`
+    // on failure is deliberate: an unparseable *registered* default is a
     // bug in KNOWN_BISHOPTS itself, not something a user can trigger.
     fn bishopt_value(&self, registry: &[(&str, BishOptDefault)], name: &str) -> Option<BishOptValue> {
         let default = registry.iter().find(|(n, _)| *n == name)?.1;
-        Some(match self.bishopts.get(name) {
-            Some(v) => v.clone(),
-            None => match default {
-                BishOptDefault::Bool => BishOptValue::Bool(false),
-                BishOptDefault::Str(s) => BishOptValue::Str(s.to_string()),
-                BishOptDefault::Color(s) => {
-                    let c = crate::csscolor::parse_terminal_list(s).unwrap_or_else(|e| panic!("KNOWN_BISHOPTS: {name}: default color {s:?} doesn't parse: {e}"));
-                    BishOptValue::Color(s.to_string(), c)
-                }
-            },
+        if let Some(v) = self.bishopts.get(name) {
+            return Some(v.clone());
+        }
+        if name != "theme"
+            && let Some(BishOptValue::Str(active)) = self.bishopts.get("theme")
+            && let Some(v) = self.themes.get(active).and_then(|opts| opts.get(name))
+        {
+            return Some(v.clone());
+        }
+        Some(match default {
+            BishOptDefault::Bool => BishOptValue::Bool(false),
+            BishOptDefault::Str(s) => BishOptValue::Str(s.to_string()),
+            BishOptDefault::Color(s) => {
+                let c = crate::csscolor::parse_terminal_list(s).unwrap_or_else(|e| panic!("KNOWN_BISHOPTS: {name}: default color {s:?} doesn't parse: {e}"));
+                BishOptValue::Color(s.to_string(), c)
+            }
         })
+    }
+
+    // Every `bishopt --set` call site's actual write -- diverted into
+    // `pending_theme` (keyed by `name`, exactly like `self.bishopts`
+    // itself) instead of applying live whenever a `::bish theme
+    // begin`/`end` declaration is in progress, per that command's own
+    // doc comment. `--unset` deliberately does NOT go through this (it
+    // isn't "declaring" a value the way `--set` is -- see run_bish_
+    // theme_end's own doc comment for the full reasoning), so it always
+    // acts on live state even mid-declaration.
+    fn store_bishopt(&mut self, name: &str, value: BishOptValue) {
+        match &mut self.pending_theme {
+            Some(pending) => {
+                pending.insert(name.to_string(), value);
+            }
+            None => {
+                self.bishopts.insert(name.to_string(), value);
+            }
+        }
     }
 
     // bishopt [--quiet|-q NAME | --set|-s NAME [VALUE] | --unset|-u NAME |
@@ -2273,11 +2329,11 @@ impl Shell {
                     1
                 }
                 (Some(BishOptDefault::Bool), None | Some("on")) => {
-                    self.bishopts.insert(name.to_string(), BishOptValue::Bool(true));
+                    self.store_bishopt(name, BishOptValue::Bool(true));
                     0
                 }
                 (Some(BishOptDefault::Bool), Some("off")) => {
-                    self.bishopts.insert(name.to_string(), BishOptValue::Bool(false));
+                    self.store_bishopt(name, BishOptValue::Bool(false));
                     0
                 }
                 (Some(BishOptDefault::Bool), Some(_)) => {
@@ -2289,7 +2345,7 @@ impl Shell {
                     2
                 }
                 (Some(BishOptDefault::Str(_)), Some(v)) => {
-                    self.bishopts.insert(name.to_string(), BishOptValue::Str(v.to_string()));
+                    self.store_bishopt(name, BishOptValue::Str(v.to_string()));
                     0
                 }
                 (Some(BishOptDefault::Color(_)), None) => {
@@ -2298,7 +2354,7 @@ impl Shell {
                 }
                 (Some(BishOptDefault::Color(_)), Some(v)) => match crate::csscolor::parse_terminal_list(v) {
                     Ok(c) => {
-                        self.bishopts.insert(name.to_string(), BishOptValue::Color(v.to_string(), c));
+                        self.store_bishopt(name, BishOptValue::Color(v.to_string(), c));
                         0
                     }
                     Err(e) => {
@@ -2316,6 +2372,90 @@ impl Shell {
                 0
             }
         }
+    }
+
+    // `::bish SUBCOMMAND...`: a small namespace of its own for bish-
+    // specific commands (`theme begin`/`theme end` today) that don't
+    // read naturally as an ordinary top-level builtin name -- `theme` on
+    // its own would either collide with a real bash script's own
+    // variable/function of that name, or need its own awkward "begin"/
+    // "end" builtins polluting the global command namespace for
+    // something this narrow. `::` is never a valid start of an ordinary
+    // bash command word in practice, so `::bish` reads unambiguously as
+    // "this is bish's own thing," the same spirit as `set -o` bundling
+    // bash's own less-common toggles under one name instead of each
+    // getting its own builtin.
+    fn run_bish(&mut self, args: &[String]) -> i32 {
+        match args {
+            [sub, rest @ ..] if sub == "theme" => self.run_bish_theme(rest),
+            [] => {
+                sh_eprintln!(self, "bish: ::bish: missing subcommand (expected: theme)");
+                2
+            }
+            [other, ..] => {
+                sh_eprintln!(self, "bish: ::bish: unknown subcommand '{other}' (expected: theme)");
+                2
+            }
+        }
+    }
+
+    fn run_bish_theme(&mut self, args: &[String]) -> i32 {
+        match args {
+            [sub] if sub == "begin" => self.run_bish_theme_begin(),
+            [sub] if sub == "end" => self.run_bish_theme_end(),
+            [] => {
+                sh_eprintln!(self, "bish: ::bish theme: missing subcommand (expected: begin, end)");
+                2
+            }
+            [other, ..] => {
+                sh_eprintln!(self, "bish: ::bish theme: unknown subcommand '{other}' (expected: begin, end)");
+                2
+            }
+        }
+    }
+
+    // Starts a new theme declaration -- every `bishopt --set` from here
+    // until the matching `::bish theme end` is captured into
+    // `pending_theme` instead of applying live (see store_bishopt's own
+    // doc comment). Refuses to nest: a `begin` while one is already in
+    // progress would otherwise silently discard whatever the outer one
+    // had captured so far the moment `end` ran, with no way back --
+    // there's no real use for nesting this anyway (a theme is a flat set
+    // of opts, not something that composes from an inner declaration).
+    fn run_bish_theme_begin(&mut self) -> i32 {
+        if self.pending_theme.is_some() {
+            sh_eprintln!(self, "bish: ::bish theme: a theme declaration is already in progress -- `::bish theme end` it first");
+            return 1;
+        }
+        self.pending_theme = Some(std::collections::HashMap::new());
+        0
+    }
+
+    // Ends the current theme declaration. The captured "theme" entry (if
+    // any -- set via an ordinary `bishopt --set theme NAME` *inside* the
+    // declaration, which store_bishopt diverted here instead of applying
+    // live) names which entry of `self.themes` the rest of the captured
+    // opts get registered under; it's removed from that captured map
+    // first so a theme's own opts never include a "theme" entry pointing
+    // at itself. If "theme" was never set during the declaration, there's
+    // no name to register anything under -- the whole batch is just
+    // discarded, matching "theme behaves unset until explicitly declared
+    // inside a theme declaration" (declaring opts with no name doesn't
+    // retroactively give them one). Registering a theme here never
+    // switches to it -- that still needs its own ordinary `bishopt --set
+    // theme NAME` afterward, outside any declaration, the same way
+    // defining a theme and activating one are two separate, deliberate
+    // steps.
+    fn run_bish_theme_end(&mut self) -> i32 {
+        let Some(mut pending) = self.pending_theme.take() else {
+            sh_eprintln!(self, "bish: ::bish theme: no theme declaration in progress");
+            return 1;
+        };
+        let Some(BishOptValue::Str(name)) = pending.remove("theme") else {
+            return 0;
+        };
+        self.themes.insert(name, pending);
+        0
     }
 
     // Resolves a bishopt Color option's current effective value as a
@@ -4653,6 +4793,12 @@ impl Shell {
             "abbr" => return ExecResult::Status(self.run_abbr(&argv[1..])),
             "shopt" => return ExecResult::Status(self.run_shopt(&argv[1..])),
             "bishopt" => return ExecResult::Status(self.run_bishopt(&argv[1..], KNOWN_BISHOPTS)),
+            // `::bish SUBCOMMAND...`: a dedicated namespace for bish-
+            // specific commands that don't belong as an ordinary top-
+            // level builtin name (see run_bish's own doc comment for
+            // why) -- `theme` (begin/end a theme declaration) is the
+            // first subcommand.
+            "::bish" => return ExecResult::Status(self.run_bish(&argv[1..])),
             "compgen" => return ExecResult::Status(self.run_compgen(&argv[1..])),
             "complete" => return ExecResult::Status(self.run_complete(&argv[1..])),
             "compopt" => return ExecResult::Status(self.run_compopt(&argv[1..])),
@@ -8699,6 +8845,7 @@ const KNOWN_BUILTINS: &[&str] = &[
     "unalias",
     "abbr",
     "bishopt",
+    "::bish",
     "compgen",
     "complete",
     "compopt",
@@ -8796,16 +8943,16 @@ const SET_O_OPTIONS: &[&str] = &["pipefail", "errexit", "nounset", "xtrace", "no
 // value would be, see `bishopt_value`); Bool has no stored default of
 // its own, see `run_bishopt`'s own doc comment on why "unset" and
 // "false" are the same state for a boolean option.
-// #[allow(dead_code)]: no Bool or Str entry has landed in KNOWN_BISHOPTS
-// yet (only Color, for syn_col_* -- see its own doc comment), so those
-// two variants aren't actually constructed by production code, only by
-// run_bishopt's tests (which build their own small registry covering all
-// three). Drop this once a real Bool/Str entry exists.
+// #[allow(dead_code)]: no Bool entry has landed in KNOWN_BISHOPTS yet
+// (Color, for syn_col_*, and now Str, for "theme" -- see KNOWN_BISHOPTS'
+// own doc comments -- both have real entries), so only Bool isn't
+// actually constructed by production code, only by run_bishopt's tests
+// (which build their own small registry covering all three). Drop this
+// once a real Bool entry exists.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BishOptDefault {
     #[allow(dead_code)]
     Bool,
-    #[allow(dead_code)]
     Str(&'static str),
     Color(&'static str),
 }
@@ -8850,6 +8997,17 @@ enum BishOptValue {
 // to look like. `--set`-ing an ordinary CSS color (or color-mix, hsl(),
 // ...) is what actually pins it to a real, terminal-independent color.
 const KNOWN_BISHOPTS: &[(&str, BishOptDefault)] = &[
+    // Which `::bish theme`-declared theme (if any) is currently active --
+    // an ordinary Str option, set/unset/read the normal way (`bishopt
+    // --set theme NAME`/`--unset theme`/`bishopt theme`), *outside* any
+    // `::bish theme begin`/`end` declaration (setting it *inside* one
+    // instead names the theme being declared -- see run_bish_theme_end's
+    // own doc comment). Empty default = no active theme, same as every
+    // other Str option's "never set" state. bishopt_value special-cases
+    // this exact name to never additionally consult `self.themes` the
+    // way every other option does -- a theme naming itself would be
+    // circular and meaningless.
+    ("theme", BishOptDefault::Str("")),
     ("syn_col_keyword", BishOptDefault::Color("-bish-yellow")),
     ("syn_col_operator", BishOptDefault::Color("-bish-white")),
     ("syn_col_redirect", BishOptDefault::Color("-bish-magenta")),
@@ -9259,6 +9417,106 @@ mod tests {
         assert_eq!(child.bishopts, parent.bishopts);
         child.run_bishopt(&strs(&["--set", "greeting", "yo"]), TEST_BISHOPTS);
         assert!(!parent.bishopts.contains_key("greeting"), "parent must not see the child's later bishopt changes");
+    }
+
+    // `::bish theme begin`/`end`'s own tests -- every `bishopt --set`
+    // inside a declaration goes through TEST_BISHOPTS, exactly like every
+    // other run_bishopt test above; "theme" itself is a real KNOWN_BISHOPTS
+    // entry (bishopt_value/store_bishopt's own fallback logic doesn't
+    // depend on which registry a *different* option came from), so these
+    // set/read it directly rather than needing their own parallel entry
+    // in TEST_BISHOPTS.
+    #[test]
+    fn bish_theme_declares_a_named_theme_without_applying_its_opts_live() {
+        let mut shell = Shell::new();
+        assert_eq!(shell.run_bish(&strs(&["theme", "begin"])), 0);
+        assert_eq!(shell.run_bishopt(&strs(&["--set", "theme", "dark"]), KNOWN_BISHOPTS), 0);
+        assert_eq!(shell.run_bishopt(&strs(&["--set", "accent", "blue"]), TEST_BISHOPTS), 0);
+        assert_eq!(shell.run_bish(&strs(&["theme", "end"])), 0);
+
+        // Neither "theme" nor "accent" was actually applied live -- both
+        // still read as whatever they were before the declaration.
+        assert_eq!(shell.bishopt_value(KNOWN_BISHOPTS, "theme"), Some(BishOptValue::Str(String::new())));
+        assert_eq!(shell.bishopt_value(TEST_BISHOPTS, "accent"), Some(BishOptValue::Color("red".to_string(), vec![crate::csscolor::TermColor::Rgba(crate::csscolor::Rgba::new(255, 0, 0, 255))])));
+        // But the theme itself was registered, "theme" entry excluded.
+        let dark = shell.themes.get("dark").expect("theme must be registered");
+        assert_eq!(dark.get("accent"), Some(&BishOptValue::Color("blue".to_string(), vec![crate::csscolor::TermColor::Rgba(crate::csscolor::Rgba::new(0, 0, 255, 255))])));
+        assert!(!dark.contains_key("theme"), "a theme's own opts must not include a self-referential \"theme\" entry");
+    }
+
+    #[test]
+    fn bish_theme_end_without_ever_naming_it_discards_the_whole_declaration() {
+        let mut shell = Shell::new();
+        shell.run_bish(&strs(&["theme", "begin"]));
+        shell.run_bishopt(&strs(&["--set", "accent", "blue"]), TEST_BISHOPTS);
+        assert_eq!(shell.run_bish(&strs(&["theme", "end"])), 0);
+        assert!(shell.themes.is_empty(), "no name was ever declared, so nothing should be registered");
+        assert_eq!(shell.bishopt_value(TEST_BISHOPTS, "accent"), Some(BishOptValue::Color("red".to_string(), vec![crate::csscolor::TermColor::Rgba(crate::csscolor::Rgba::new(255, 0, 0, 255))])), "still not applied live either");
+    }
+
+    #[test]
+    fn activating_a_declared_theme_makes_its_opts_the_new_fallback_default() {
+        let mut shell = Shell::new();
+        shell.run_bish(&strs(&["theme", "begin"]));
+        shell.run_bishopt(&strs(&["--set", "theme", "dark"]), KNOWN_BISHOPTS);
+        shell.run_bishopt(&strs(&["--set", "accent", "blue"]), TEST_BISHOPTS);
+        shell.run_bish(&strs(&["theme", "end"]));
+
+        // Registering "dark" doesn't activate it by itself.
+        assert_eq!(shell.bishopt_value(TEST_BISHOPTS, "accent"), Some(BishOptValue::Color("red".to_string(), vec![crate::csscolor::TermColor::Rgba(crate::csscolor::Rgba::new(255, 0, 0, 255))])));
+
+        // Activating it (an ordinary set, outside any declaration) makes
+        // its opts the new fallback wherever nothing else was set.
+        assert_eq!(shell.run_bishopt(&strs(&["--set", "theme", "dark"]), KNOWN_BISHOPTS), 0);
+        assert_eq!(shell.bishopt_value(TEST_BISHOPTS, "accent"), Some(BishOptValue::Color("blue".to_string(), vec![crate::csscolor::TermColor::Rgba(crate::csscolor::Rgba::new(0, 0, 255, 255))])));
+
+        // An explicit override still wins over the active theme.
+        shell.run_bishopt(&strs(&["--set", "accent", "green"]), TEST_BISHOPTS);
+        assert_eq!(shell.bishopt_value(TEST_BISHOPTS, "accent"), Some(BishOptValue::Color("green".to_string(), vec![crate::csscolor::TermColor::Rgba(crate::csscolor::Rgba::new(0, 128, 0, 255))])));
+    }
+
+    #[test]
+    fn bish_theme_begin_refuses_to_nest() {
+        let mut shell = Shell::new();
+        assert_eq!(shell.run_bish(&strs(&["theme", "begin"])), 0);
+        assert_eq!(shell.run_bish(&strs(&["theme", "begin"])), 1, "a second begin while one is already in progress must be refused");
+        // The original declaration must still be intact -- a set right
+        // after the refused nested begin still lands in it.
+        shell.run_bishopt(&strs(&["--set", "theme", "t"]), KNOWN_BISHOPTS);
+        shell.run_bish(&strs(&["theme", "end"]));
+        assert!(shell.themes.contains_key("t"));
+    }
+
+    #[test]
+    fn bish_theme_end_without_a_begin_is_an_error() {
+        let mut shell = Shell::new();
+        assert_eq!(shell.run_bish(&strs(&["theme", "end"])), 1);
+    }
+
+    #[test]
+    fn bish_unset_still_applies_live_even_mid_declaration() {
+        let mut shell = Shell::new();
+        shell.run_bishopt(&strs(&["--set", "accent", "blue"]), TEST_BISHOPTS);
+        shell.run_bish(&strs(&["theme", "begin"]));
+        assert_eq!(shell.run_bishopt(&strs(&["--unset", "accent"]), TEST_BISHOPTS), 0);
+        shell.run_bish(&strs(&["theme", "end"]));
+        assert_eq!(shell.bishopt_value(TEST_BISHOPTS, "accent"), Some(BishOptValue::Color("red".to_string(), vec![crate::csscolor::TermColor::Rgba(crate::csscolor::Rgba::new(255, 0, 0, 255))])), "--unset must not have been diverted into the pending theme");
+    }
+
+    #[test]
+    fn bish_and_bish_theme_reject_unknown_subcommands() {
+        let mut shell = Shell::new();
+        assert_eq!(shell.run_bish(&strs(&["nonsense"])), 2);
+        assert_eq!(shell.run_bish(&strs(&[])), 2);
+        assert_eq!(shell.run_bish(&strs(&["theme", "nonsense"])), 2);
+        assert_eq!(shell.run_bish(&strs(&["theme"])), 2);
+    }
+
+    #[test]
+    fn double_colon_bish_dispatches_as_a_real_shell_command() {
+        let mut shell = Shell::new();
+        shell.run_source_here("::bish theme begin; bishopt --set theme fromshell; ::bish theme end", "<test>");
+        assert!(shell.themes.contains_key("fromshell"), "::bish must parse and dispatch as an ordinary command word");
     }
 
     #[test]
