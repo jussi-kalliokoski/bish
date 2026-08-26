@@ -3210,9 +3210,31 @@ fn snapshot_window(window: &WindowEntry, sessions: &HashMap<SessionId, SessionSt
 // own rectangle, followed by the divider lines between them (see
 // compute_regions) -- an unsplit window is just the single-pane case of
 // this, no divider lines drawn at all.
+//
+// Deliberately no leading `\x1b[2J` (erase-whole-display): compute_regions
+// already tiles every pane plus every divider across the entire content
+// area with no gaps, render_row always emits exactly `pane.rect.cols`
+// characters per row regardless of what those cells actually hold (a
+// blank cell still writes a space), and the tab bar's own row gets an
+// explicit `\x1b[K` first -- between those three, every single cell of
+// the real terminal is already unconditionally overwritten every call,
+// making a separate whole-screen erase pure redundant work. It used to
+// be here, and was the actual cause of a reported flash on ordinary
+// discrete redraws (e.g. Ctrl-C at the live prompt): an explicit erase
+// followed immediately by repainting the exact same content one real
+// terminal can still render as a visible blank frame in between, even
+// though nothing (or almost nothing) about the actual content changed.
 fn render_compositor_frame(layout: &CompositorLayout, tab_bar: &str, term_rows: usize) {
+    print!("{}", build_compositor_frame_output(layout, tab_bar, term_rows));
+    let _ = io::stdout().flush();
+}
+
+// render_compositor_frame's own string-building half, split out purely
+// for testability -- same "pure builder plus a thin print wrapper"
+// shape diff_frames/render_compositor_frame_diff already established.
+fn build_compositor_frame_output(layout: &CompositorLayout, tab_bar: &str, term_rows: usize) -> String {
     let mut out = String::new();
-    out.push_str("\x1b[2J\x1b[H");
+    out.push_str("\x1b[H");
 
     for pane in &layout.panes {
         let screen = pane.screen.borrow();
@@ -3236,8 +3258,7 @@ fn render_compositor_frame(layout: &CompositorLayout, tab_bar: &str, term_rows: 
     out.push_str(&format!("\x1b[{};{}H", focused.rect.row + cur_row + 1, focused.rect.col + cur_col + 1));
     out.push_str(if screen.cursor_visible { "\x1b[?25h" } else { "\x1b[?25l" });
 
-    print!("{}", out);
-    let _ = io::stdout().flush();
+    out
 }
 
 // A cell-by-cell snapshot of exactly what's currently painted on the real
@@ -6679,5 +6700,41 @@ mod terminal_frame_capture_tests {
         let frame = TerminalFrame::capture(&layout, "", 2, 3);
         assert_eq!(frame.cells[0].ch, 'a');
         assert_eq!(frame.cells[1].ch, 'b');
+    }
+}
+
+#[cfg(test)]
+mod compositor_frame_output_tests {
+    use super::*;
+
+    // Regression: render_compositor_frame used to lead with `\x1b[2J`
+    // (erase whole display) before repainting every pane/divider/the tab
+    // bar -- all of which, together, already cover every cell of the
+    // terminal unconditionally (see build_compositor_frame_output's own
+    // doc comment). That extra erase was visibly reproducible as a
+    // flash on an otherwise perfectly ordinary discrete redraw (`bish
+    // --promoted`, Enter, then Ctrl-C at the fresh prompt): an explicit
+    // clear immediately followed by repainting the *same* content one
+    // real terminal can still render as a blank frame in between.
+    #[test]
+    fn build_compositor_frame_output_never_erases_the_whole_display() {
+        let screen = Rc::new(RefCell::new(vt100::Screen::new(2, 3)));
+        let layout = CompositorLayout { panes: vec![PaneSnapshot { rect: Rect { row: 0, col: 0, rows: 2, cols: 3 }, screen, focused: true }], dividers: vec![] };
+        let out = build_compositor_frame_output(&layout, "tab", 3);
+        assert!(!out.contains("\x1b[2J"), "{out:?}");
+    }
+
+    #[test]
+    fn build_compositor_frame_output_still_paints_every_row_and_the_tab_bar() {
+        let screen = Rc::new(RefCell::new(vt100::Screen::new(2, 3)));
+        screen.borrow_mut().feed(b"ab");
+        let layout = CompositorLayout { panes: vec![PaneSnapshot { rect: Rect { row: 0, col: 0, rows: 2, cols: 3 }, screen, focused: true }], dividers: vec![] };
+        let out = build_compositor_frame_output(&layout, "[0] tab", 3);
+        assert!(out.contains("\x1b[1;1H"), "{out:?}");
+        assert!(out.contains("\x1b[2;1H"), "{out:?}");
+        assert!(out.contains("ab"), "{out:?}");
+        // Tab bar pinned to the real last row (term_rows = 3), cleared
+        // to end-of-line before its own text.
+        assert!(out.contains("\x1b[3;1H\x1b[K[0] tab"), "{out:?}");
     }
 }
