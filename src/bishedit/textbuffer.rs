@@ -57,6 +57,13 @@ pub struct TextBuffer {
     // caller's job (`:git blame` again), not something a single-line
     // edit could patch up correctly on its own.
     pub blame: Option<Vec<crate::git::BlameLine>>,
+    // `:git diff`'s own toggle state -- same shape/lifecycle as `blame`
+    // just above (`None` off, gutter column collapses to zero width;
+    // `Some` on), except sparse: only lines crate::git::diff actually
+    // marked appear as keys (0-indexed, matching `lines`/`blame`), most
+    // lines have no entry at all rather than an explicit "unchanged"
+    // marker.
+    pub diff: Option<std::collections::HashMap<usize, crate::git::DiffMark>>,
     // `u`/`Ctrl-R` -- a real branching tree, not a linear undo/redo stack
     // (see bishedit::undo's own module doc comment for why). Rides along
     // with the buffer exactly like `selections`/`diagnostics` (survives a
@@ -97,6 +104,7 @@ impl TextBuffer {
             selections: Vec::new(),
             diagnostics: Vec::new(),
             blame: None,
+            diff: None,
             dirty: false,
             path: None,
         }
@@ -133,6 +141,7 @@ impl TextBuffer {
             selections: Vec::new(),
             diagnostics: Vec::new(),
             blame: None,
+            diff: None,
             dirty: false,
             path: Some(path.to_path_buf()),
         })
@@ -204,6 +213,7 @@ impl TextBuffer {
         // delete_range/join_lines already apply for any real edit.
         self.diagnostics.clear();
         self.blame = None;
+        self.diff = None;
         // Save-aware: landing back exactly on the node that was on disk
         // as of the last `:w` clears `dirty`, matching real vim's own
         // undo-tree-aware `modified` flag -- see `saved_node`'s own doc
@@ -280,6 +290,7 @@ impl TextBuffer {
         self.dirty = true;
         self.diagnostics.clear();
         self.blame = None;
+        self.diff = None;
         self.cursor = new_pos;
         // `.` -- vim's own "position of the last change" mark (`` `. ``),
         // set automatically by every mutation here rather than at each of
@@ -328,6 +339,7 @@ impl TextBuffer {
         self.dirty = true;
         self.diagnostics.clear();
         self.blame = None;
+        self.diff = None;
         self.marks.insert('.', self.cursor);
         text
     }
@@ -370,6 +382,7 @@ impl TextBuffer {
         self.dirty = true;
         self.diagnostics.clear();
         self.blame = None;
+        self.diff = None;
         self.marks.insert('.', self.cursor);
         true
     }
@@ -537,6 +550,7 @@ mod tests {
             selections: Vec::new(),
             diagnostics: Vec::new(),
             blame: None,
+            diff: None,
             dirty: false,
             path: None,
         }

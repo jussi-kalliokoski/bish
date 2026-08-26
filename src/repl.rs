@@ -5897,9 +5897,10 @@ fn run_command_mode(
                         // implementing any of it itself, so a missing
                         // `git` on $PATH just means these features don't
                         // work, checked once up front regardless of which
-                        // subcommand was actually typed. `blame` (no
-                        // further flags/subcommand of its own yet) is the
-                        // first one: toggles fileeditor::toggle_git_blame,
+                        // subcommand was actually typed. `blame`/`diff`
+                        // (neither takes a flag/subcommand of its own
+                        // yet) each toggle their own gutter column via
+                        // fileeditor::toggle_git_blame/toggle_git_diff,
                         // whose own Ok(bool)/Err(String) already say
                         // exactly what happened and why not.
                         "git" => {
@@ -5914,7 +5915,7 @@ fn run_command_mode(
                                     None => (a, None),
                                 },
                                 None => {
-                                    sessions[&session_id].shell.sink_err("bish: git: missing subcommand (expected: blame)\n");
+                                    sessions[&session_id].shell.sink_err("bish: git: missing subcommand (expected: blame, diff)\n");
                                     buffer.clear();
                                     continue;
                                 }
@@ -5944,8 +5945,39 @@ fn run_command_mode(
                                     buffer.clear();
                                     continue;
                                 }
+                                // `diff` (no further flags/subcommand of
+                                // its own yet): same toggle shape as
+                                // `blame` above, just against
+                                // fileeditor::toggle_git_diff -- gutter
+                                // +/~/- markers for lines added/changed/
+                                // removed relative to this file's tracked
+                                // state instead of per-line authorship.
+                                "diff" if subarg.is_none() => match fileeditor::toggle_git_diff(tb) {
+                                    Ok(on) => {
+                                        let output = if on { "Diff markers on.".to_string() } else { "Diff markers off.".to_string() };
+                                        sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry {
+                                            command: trimmed,
+                                            output: output.clone(),
+                                            status: 0,
+                                        });
+                                        return CommandModeOutcome::Ran { output, status: 0 };
+                                    }
+                                    Err(e) => {
+                                        sessions[&session_id].shell.sink_err(&format!("bish: git: diff: {e}\n"));
+                                        buffer.clear();
+                                        continue;
+                                    }
+                                },
+                                "diff" => {
+                                    sessions[&session_id].shell.sink_err(&format!(
+                                        "bish: git: diff: unsupported argument '{}' (only a bare `git diff` toggle is supported for now)\n",
+                                        subarg.unwrap_or_default()
+                                    ));
+                                    buffer.clear();
+                                    continue;
+                                }
                                 other => {
-                                    sessions[&session_id].shell.sink_err(&format!("bish: git: unknown subcommand '{}' (expected: blame)\n", other));
+                                    sessions[&session_id].shell.sink_err(&format!("bish: git: unknown subcommand '{}' (expected: blame, diff)\n", other));
                                     buffer.clear();
                                     continue;
                                 }

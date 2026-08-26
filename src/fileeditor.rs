@@ -904,6 +904,7 @@ struct GutterColumn {
 
 static GUTTER_COLUMNS: &[GutterColumn] = &[
     GutterColumn { width: blame_column_width, render: render_blame_cell },
+    GutterColumn { width: diff_column_width, render: render_diff_cell },
     GutterColumn { width: diagnostic_column_width, render: render_diagnostic_cell },
     GutterColumn { width: line_number_width, render: render_line_number_cell },
 ];
@@ -946,6 +947,27 @@ fn render_blame_cell(buf: &TextBuffer, _starts: &[usize], line: usize, width: us
     let author_width = width.saturating_sub(8 + 1 + 10 + 1 + 1);
     let author: String = entry.author.chars().take(author_width).collect();
     Some(format!("\x1b[2m{} {} {:<aw$} \x1b[0m", entry.short_commit, entry.date, author, aw = author_width))
+}
+
+// `:git diff`'s own gutter column: a single marker glyph + one padding
+// space, same fixed-2 shape as diagnostic_column_width just below --
+// unlike blame's column, a diff mark never needs more than one glyph to
+// say what it means. Collapses to 0 when diff isn't currently toggled on
+// for this buffer, same reasoning as blame_column_width above (a
+// deliberate, infrequent toggle, not something that comes and goes on
+// its own the way the diagnostic sign column's own contents do).
+fn diff_column_width(buf: &TextBuffer) -> usize {
+    if buf.diff.is_some() { 2 } else { 0 }
+}
+
+fn render_diff_cell(buf: &TextBuffer, _starts: &[usize], line: usize, _width: usize) -> Option<String> {
+    let mark = buf.diff.as_ref()?.get(&line)?;
+    let (color, glyph) = match mark {
+        crate::git::DiffMark::Added => ("32", '+'),
+        crate::git::DiffMark::Changed => ("33", '~'),
+        crate::git::DiffMark::Removed => ("31", '-'),
+    };
+    Some(format!("\x1b[{color}m{glyph}\x1b[0m "))
 }
 
 // A fixed 2 columns (marker glyph + one padding space) -- vim's own
@@ -1354,6 +1376,28 @@ pub(crate) fn toggle_git_blame(buf: &mut TextBuffer) -> Result<bool, String> {
     }
     let path = path.to_path_buf();
     buf.blame = Some(crate::git::blame(&path)?);
+    Ok(true)
+}
+
+// `:git diff`'s own worker -- same "one command, two states" toggle shape
+// and same dirty-buffer/no-path/no-git refusals as toggle_git_blame just
+// above (crate::git::diff reads the file on disk too, not this buffer's
+// own in-memory content -- see its own doc comment on why there's no
+// live-buffer-vs-HEAD diffing yet).
+pub(crate) fn toggle_git_diff(buf: &mut TextBuffer) -> Result<bool, String> {
+    if buf.diff.is_some() {
+        buf.diff = None;
+        return Ok(false);
+    }
+    if buf.is_dirty() {
+        return Err("buffer has unsaved changes -- save first (diff only reflects what's on disk)".to_string());
+    }
+    let path = buf.path().ok_or_else(|| "no file name".to_string())?;
+    if !crate::git::available() {
+        return Err("git executable not found".to_string());
+    }
+    let path = path.to_path_buf();
+    buf.diff = Some(crate::git::diff(&path)?);
     Ok(true)
 }
 
@@ -2077,6 +2121,103 @@ mod git_blame_tests {
         assert_eq!(blame[0].short_commit.len(), 8);
         assert_eq!(toggle_git_blame(&mut buf).unwrap(), false);
         assert!(buf.blame.is_none());
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
+
+// `:git diff`'s own tests -- same shape/skip-if-no-git reasoning as
+// git_blame_tests above.
+#[cfg(test)]
+mod git_diff_tests {
+    use super::*;
+    use crate::git::DiffMark;
+
+    #[test]
+    fn toggle_git_diff_refuses_a_buffer_with_unsaved_changes() {
+        let mut buf = TextBuffer::open(std::path::Path::new("/tmp/bish-fileeditor-git-diff-dirty-test.txt"), 10).unwrap();
+        buf.insert_text((0, 0), "hello\n");
+        let err = toggle_git_diff(&mut buf).unwrap_err();
+        assert!(err.contains("unsaved changes"), "{err}");
+        assert!(buf.diff.is_none());
+    }
+
+    #[test]
+    fn toggle_git_diff_refuses_a_buffer_with_no_path() {
+        let mut buf = TextBuffer::new_unnamed(10);
+        let err = toggle_git_diff(&mut buf).unwrap_err();
+        assert!(err.contains("no file name"), "{err}");
+    }
+
+    fn git_run(dir: &std::path::Path, args: &[&str]) {
+        let status = std::process::Command::new("git").args(args).current_dir(dir).status().unwrap();
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    #[test]
+    fn toggle_git_diff_toggles_on_then_off_and_marks_a_changed_line() {
+        if !crate::git::available() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("bish-fileeditor-git-diff-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        git_run(&dir, &["init", "-q"]);
+        git_run(&dir, &["config", "user.email", "test@example.com"]);
+        git_run(&dir, &["config", "user.name", "Test User"]);
+        let path = dir.join("f.txt");
+        std::fs::write(&path, "one\ntwo\nthree\n").unwrap();
+        git_run(&dir, &["add", "f.txt"]);
+        git_run(&dir, &["commit", "-q", "-m", "initial"]);
+        // Change on disk (not through the buffer -- toggle_git_diff reads
+        // the real file, same as toggle_git_blame does) so there's a real
+        // diff for `git diff` to find.
+        std::fs::write(&path, "one\nCHANGED\nthree\n").unwrap();
+
+        let mut buf = TextBuffer::open(&path, 10).unwrap();
+        assert!(!buf.is_dirty());
+        assert_eq!(toggle_git_diff(&mut buf).unwrap(), true);
+        assert_eq!(buf.diff.as_ref().unwrap().get(&1), Some(&DiffMark::Changed));
+        assert_eq!(buf.diff.as_ref().unwrap().len(), 1);
+        assert_eq!(toggle_git_diff(&mut buf).unwrap(), false);
+        assert!(buf.diff.is_none());
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn toggle_git_diff_marks_every_line_added_for_an_untracked_file() {
+        if !crate::git::available() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("bish-fileeditor-git-diff-untracked-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        git_run(&dir, &["init", "-q"]);
+        let path = dir.join("new.txt");
+        std::fs::write(&path, "a\nb\n").unwrap();
+
+        let mut buf = TextBuffer::open(&path, 10).unwrap();
+        toggle_git_diff(&mut buf).unwrap();
+        let diff = buf.diff.as_ref().unwrap();
+        assert_eq!(diff.get(&0), Some(&DiffMark::Added));
+        assert_eq!(diff.get(&1), Some(&DiffMark::Added));
+        assert_eq!(diff.len(), 2);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn toggle_git_diff_errors_outside_a_git_repository() {
+        if !crate::git::available() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("bish-fileeditor-git-diff-norepo-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("f.txt");
+        std::fs::write(&path, "a\n").unwrap();
+
+        let mut buf = TextBuffer::open(&path, 10).unwrap();
+        let err = toggle_git_diff(&mut buf).unwrap_err();
+        assert!(err.to_lowercase().contains("git repository"), "{err}");
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
