@@ -903,6 +903,7 @@ struct GutterColumn {
 }
 
 static GUTTER_COLUMNS: &[GutterColumn] = &[
+    GutterColumn { width: blame_column_width, render: render_blame_cell },
     GutterColumn { width: diagnostic_column_width, render: render_diagnostic_cell },
     GutterColumn { width: line_number_width, render: render_line_number_cell },
 ];
@@ -919,6 +920,32 @@ fn render_gutter(out: &mut String, buf: &TextBuffer, starts: &[usize], line: usi
             None => out.push_str(&" ".repeat(width)),
         }
     }
+}
+
+// `:git blame`'s own gutter column: `short_commit` (8) + ' ' + `date`
+// (10, "YYYY-MM-DD") + ' ' + author (grows to fit the widest one actually
+// present, capped at BLAME_AUTHOR_MAX_WIDTH) + a trailing separator
+// space. Collapses to 0 -- no reserved space at all -- when blame isn't
+// currently toggled on for this buffer, unlike diagnostic_column_width's
+// always-reserved 2 columns (a stable sign column vim users expect to
+// never shift): blame is wide enough that reserving it unconditionally
+// would waste most of the window's width for the common case of it being
+// off, and unlike the sign column, "on" is a deliberate, infrequent user
+// toggle rather than something that comes and goes as they type.
+const BLAME_AUTHOR_MAX_WIDTH: usize = 16;
+
+fn blame_column_width(buf: &TextBuffer) -> usize {
+    let Some(blame) = &buf.blame else { return 0 };
+    let author_width = blame.iter().map(|b| b.author.chars().count()).max().unwrap_or(0).clamp(1, BLAME_AUTHOR_MAX_WIDTH);
+    8 + 1 + 10 + 1 + author_width + 1
+}
+
+fn render_blame_cell(buf: &TextBuffer, _starts: &[usize], line: usize, width: usize) -> Option<String> {
+    let blame = buf.blame.as_ref()?;
+    let entry = blame.get(line)?;
+    let author_width = width.saturating_sub(8 + 1 + 10 + 1 + 1);
+    let author: String = entry.author.chars().take(author_width).collect();
+    Some(format!("\x1b[2m{} {} {:<aw$} \x1b[0m", entry.short_commit, entry.date, author, aw = author_width))
 }
 
 // A fixed 2 columns (marker glyph + one padding space) -- vim's own
@@ -1300,6 +1327,34 @@ pub(crate) fn format_buffer(buf: &mut TextBuffer) -> FormatOutcome {
         }
     }
     if applied > 0 { FormatOutcome::Formatted } else { FormatOutcome::AlreadyFormatted }
+}
+
+// `:git blame`'s own worker (repl.rs's run_command_mode): toggles the
+// gutter's blame column off if it's currently on (`Ok(false)`), or runs a
+// fresh `git blame` and turns it on (`Ok(true)`) if it's currently off --
+// same "one command, two states" shape as vim's own `:GBlame`-style
+// plugins, just built in. Blame only ever reflects this buffer's last
+// *saved* content (crate::git::blame reads the real file from disk, not
+// this in-memory buffer), so a dirty buffer is refused outright rather
+// than silently showing blame that doesn't line up with what's on screen
+// -- same reasoning `:w`'s own dirty-buffer handling already applies
+// elsewhere, just surfaced as an Err here instead of a buffer.is_dirty()
+// special case in repl.rs.
+pub(crate) fn toggle_git_blame(buf: &mut TextBuffer) -> Result<bool, String> {
+    if buf.blame.is_some() {
+        buf.blame = None;
+        return Ok(false);
+    }
+    if buf.is_dirty() {
+        return Err("buffer has unsaved changes -- save first (blame only reflects what's on disk)".to_string());
+    }
+    let path = buf.path().ok_or_else(|| "no file name".to_string())?;
+    if !crate::git::available() {
+        return Err("git executable not found".to_string());
+    }
+    let path = path.to_path_buf();
+    buf.blame = Some(crate::git::blame(&path)?);
+    Ok(true)
 }
 
 // Color/attrs for one diagnostic's own underline -- mirrors highlight::
@@ -1963,5 +2018,66 @@ mod pre_save_hook_tests {
         let outcome = format_buffer(&mut buf);
         assert!(matches!(outcome, FormatOutcome::Error(_)), "expected FormatOutcome::Error, got {outcome:?}");
         assert_eq!(buffer_text(&buf), "if true\nthen\n");
+    }
+}
+
+// `:git blame`'s own tests -- `toggle_git_blame`'s dirty-buffer/no-path
+// checks run unconditionally (no subprocess involved), but the real
+// end-to-end round trip needs an actual git repository and a real `git`
+// on $PATH, so that one test skips itself (rather than failing) when
+// crate::git::available() says there isn't one -- matching this whole
+// feature's own "quietly unavailable, not a hard dependency" contract
+// (see git.rs's own module doc comment).
+#[cfg(test)]
+mod git_blame_tests {
+    use super::*;
+
+    #[test]
+    fn toggle_git_blame_refuses_a_buffer_with_unsaved_changes() {
+        let mut buf = TextBuffer::open(std::path::Path::new("/tmp/bish-fileeditor-git-blame-dirty-test.txt"), 10).unwrap();
+        // insert_text always marks a buffer dirty -- see its own doc comment.
+        buf.insert_text((0, 0), "hello\n");
+        let err = toggle_git_blame(&mut buf).unwrap_err();
+        assert!(err.contains("unsaved changes"), "{err}");
+        assert!(buf.blame.is_none());
+    }
+
+    #[test]
+    fn toggle_git_blame_refuses_a_buffer_with_no_path() {
+        let mut buf = TextBuffer::new_unnamed(10);
+        let err = toggle_git_blame(&mut buf).unwrap_err();
+        assert!(err.contains("no file name"), "{err}");
+    }
+
+    #[test]
+    fn toggle_git_blame_toggles_on_then_off_for_a_real_git_repo_file() {
+        if !crate::git::available() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("bish-fileeditor-git-blame-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let run = |args: &[&str]| {
+            let status = std::process::Command::new("git").args(args).current_dir(&dir).status().unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.email", "test@example.com"]);
+        run(&["config", "user.name", "Test User"]);
+        let path = dir.join("f.txt");
+        std::fs::write(&path, "one\ntwo\n").unwrap();
+        run(&["add", "f.txt"]);
+        run(&["commit", "-q", "-m", "initial"]);
+
+        let mut buf = TextBuffer::open(&path, 10).unwrap();
+        assert!(!buf.is_dirty());
+        assert_eq!(toggle_git_blame(&mut buf).unwrap(), true);
+        let blame = buf.blame.as_ref().unwrap();
+        assert_eq!(blame.len(), 2);
+        assert_eq!(blame[0].author, "Test User");
+        assert_eq!(blame[0].short_commit.len(), 8);
+        assert_eq!(toggle_git_blame(&mut buf).unwrap(), false);
+        assert!(buf.blame.is_none());
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

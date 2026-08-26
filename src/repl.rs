@@ -5890,6 +5890,67 @@ fn run_command_mode(
                             buffer.clear();
                             continue;
                         }
+                        // `git SUBCOMMAND...`: the editor's own git
+                        // integration, entirely optional (see crate::git's
+                        // own module doc comment) -- shells out to the
+                        // real `git` executable rather than bish
+                        // implementing any of it itself, so a missing
+                        // `git` on $PATH just means these features don't
+                        // work, checked once up front regardless of which
+                        // subcommand was actually typed. `blame` (no
+                        // further flags/subcommand of its own yet) is the
+                        // first one: toggles fileeditor::toggle_git_blame,
+                        // whose own Ok(bool)/Err(String) already say
+                        // exactly what happened and why not.
+                        "git" => {
+                            if !crate::git::available() {
+                                sessions[&session_id].shell.sink_err("bish: git: git executable not found\n");
+                                buffer.clear();
+                                continue;
+                            }
+                            let (subcmd, subarg) = match arg {
+                                Some(a) => match a.split_once(' ') {
+                                    Some((c, r)) => (c, Some(r.trim()).filter(|r| !r.is_empty())),
+                                    None => (a, None),
+                                },
+                                None => {
+                                    sessions[&session_id].shell.sink_err("bish: git: missing subcommand (expected: blame)\n");
+                                    buffer.clear();
+                                    continue;
+                                }
+                            };
+                            match subcmd {
+                                "blame" if subarg.is_none() => match fileeditor::toggle_git_blame(tb) {
+                                    Ok(on) => {
+                                        let output = if on { "Blame on.".to_string() } else { "Blame off.".to_string() };
+                                        sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry {
+                                            command: trimmed,
+                                            output: output.clone(),
+                                            status: 0,
+                                        });
+                                        return CommandModeOutcome::Ran { output, status: 0 };
+                                    }
+                                    Err(e) => {
+                                        sessions[&session_id].shell.sink_err(&format!("bish: git: blame: {e}\n"));
+                                        buffer.clear();
+                                        continue;
+                                    }
+                                },
+                                "blame" => {
+                                    sessions[&session_id].shell.sink_err(&format!(
+                                        "bish: git: blame: unsupported argument '{}' (only a bare `git blame` toggle is supported for now)\n",
+                                        subarg.unwrap_or_default()
+                                    ));
+                                    buffer.clear();
+                                    continue;
+                                }
+                                other => {
+                                    sessions[&session_id].shell.sink_err(&format!("bish: git: unknown subcommand '{}' (expected: blame)\n", other));
+                                    buffer.clear();
+                                    continue;
+                                }
+                            }
+                        }
                         _ => {}
                     }
                 }

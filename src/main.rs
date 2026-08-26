@@ -6,6 +6,7 @@ mod csscolor;
 mod editor;
 mod exec;
 mod fileeditor;
+mod git;
 mod glob;
 mod history;
 mod lexer;

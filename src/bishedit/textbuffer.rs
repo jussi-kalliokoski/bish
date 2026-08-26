@@ -46,6 +46,17 @@ pub struct TextBuffer {
     // keeping a stale one around past the edit that invalidated its
     // position would just be showing the user a lie.
     pub diagnostics: Vec<lint::Diagnostic>,
+    // `:git blame`'s own toggle state (see fileeditor::toggle_git_blame,
+    // and GUTTER_COLUMNS's blame column, which is what actually reads
+    // this) -- `None` means off (the gutter's blame column collapses to
+    // zero width entirely), `Some` is one crate::git::BlameLine per
+    // buffer line, indexed the same way `lines` is. Cleared on any real
+    // edit for the same reason `diagnostics` is: a line-indexed snapshot
+    // of "who last touched this line" goes stale the instant a line
+    // shifts or its content changes, and re-running `git blame` is the
+    // caller's job (`:git blame` again), not something a single-line
+    // edit could patch up correctly on its own.
+    pub blame: Option<Vec<crate::git::BlameLine>>,
     // `u`/`Ctrl-R` -- a real branching tree, not a linear undo/redo stack
     // (see bishedit::undo's own module doc comment for why). Rides along
     // with the buffer exactly like `selections`/`diagnostics` (survives a
@@ -85,6 +96,7 @@ impl TextBuffer {
             marks: HashMap::new(),
             selections: Vec::new(),
             diagnostics: Vec::new(),
+            blame: None,
             dirty: false,
             path: None,
         }
@@ -120,6 +132,7 @@ impl TextBuffer {
             marks: HashMap::new(),
             selections: Vec::new(),
             diagnostics: Vec::new(),
+            blame: None,
             dirty: false,
             path: Some(path.to_path_buf()),
         })
@@ -190,6 +203,7 @@ impl TextBuffer {
         // Positions may no longer be valid -- same reasoning insert_text/
         // delete_range/join_lines already apply for any real edit.
         self.diagnostics.clear();
+        self.blame = None;
         // Save-aware: landing back exactly on the node that was on disk
         // as of the last `:w` clears `dirty`, matching real vim's own
         // undo-tree-aware `modified` flag -- see `saved_node`'s own doc
@@ -265,6 +279,7 @@ impl TextBuffer {
         };
         self.dirty = true;
         self.diagnostics.clear();
+        self.blame = None;
         self.cursor = new_pos;
         // `.` -- vim's own "position of the last change" mark (`` `. ``),
         // set automatically by every mutation here rather than at each of
@@ -312,6 +327,7 @@ impl TextBuffer {
         }
         self.dirty = true;
         self.diagnostics.clear();
+        self.blame = None;
         self.marks.insert('.', self.cursor);
         text
     }
@@ -353,6 +369,7 @@ impl TextBuffer {
         self.cursor = (row, join_col.min(self.lines[row].len().saturating_sub(1)));
         self.dirty = true;
         self.diagnostics.clear();
+        self.blame = None;
         self.marks.insert('.', self.cursor);
         true
     }
@@ -519,6 +536,7 @@ mod tests {
             marks: HashMap::new(),
             selections: Vec::new(),
             diagnostics: Vec::new(),
+            blame: None,
             dirty: false,
             path: None,
         }
