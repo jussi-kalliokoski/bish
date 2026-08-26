@@ -22,7 +22,7 @@ mod vt100;
 use std::io::{IsTerminal, Read};
 
 fn main() {
-    let args: Vec<String> = std::env::args().collect();
+    let mut args: Vec<String> = std::env::args().collect();
 
     // `bish tool <subcommand>` -- checked first, ahead of every other
     // argv-based branch below (in particular the generic `args.len() >=
@@ -31,6 +31,20 @@ fn main() {
     // today and what's planned alongside it.
     if args.get(1).map(String::as_str) == Some("tool") {
         std::process::exit(tool::run(&args[2..]));
+    }
+
+    // `bish --promoted`: starts the interactive REPL already promoted into
+    // the windowed compositor (see repl::run's own doc comment on this
+    // param) instead of waiting for the first window-family command/
+    // Ctrl+Space. Only meaningful for the interactive branch below, so
+    // this is checked and stripped before any of `-c`/a script path/piped
+    // stdin get their turn at args[1] -- same "leading flag reserved
+    // ahead of everything else" treatment as `tool` just above. Harmless
+    // (silently ignored, `start_promoted` just never gets used) if
+    // combined with one of those non-interactive forms.
+    let start_promoted = args.get(1).map(String::as_str) == Some("--promoted");
+    if start_promoted {
+        args.remove(1);
     }
 
     let mut shell = exec::Shell::new();
@@ -56,7 +70,7 @@ fn main() {
 
     if std::io::stdin().is_terminal() {
         load_config(&mut shell);
-        repl::run(shell);
+        repl::run(shell, start_promoted);
     } else {
         let mut src = String::new();
         if std::io::stdin().read_to_string(&mut src).is_ok() {

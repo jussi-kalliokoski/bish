@@ -358,7 +358,7 @@ fn session_referenced_elsewhere(windows: &[WindowEntry], current_window: usize, 
     false
 }
 
-pub fn run(mut shell: Shell) {
+pub fn run(mut shell: Shell, start_promoted: bool) {
     // The shell itself must survive Ctrl-C (bash's own top-level
     // interactive behavior); a foreground child still dies/interrupts
     // normally since exec() resets a *caught* signal like this back to
@@ -418,6 +418,20 @@ pub fn run(mut shell: Shell) {
     // very next editor::read_line call below, then left None again for
     // every ordinary iteration.
     let mut pending_initial: Option<(String, usize)> = None;
+
+    // `bish --promoted`: same one-time transition ensure_promoted performs
+    // for the first window-family command a session runs, just done here
+    // instead so the very first prompt already has the compositor's tab
+    // bar/alt-screen up -- there's only ever the one root session at this
+    // point, so this is safe to call before the main loop even starts.
+    // The explicit compositor_redraw right after is what every other
+    // ensure_promoted call site also does (see apply_window_action) --
+    // without it, the tab bar wouldn't actually be drawn until the user's
+    // first keystroke or a resize.
+    if start_promoted {
+        ensure_promoted(&mut sessions, &mut sinks_are_grid);
+        compositor_redraw(&sessions, &windows, current_window, term_rows, term_cols);
+    }
 
     loop {
         // Polled once per loop iteration rather than truly asynchronously:

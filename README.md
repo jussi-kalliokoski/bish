@@ -26,6 +26,7 @@ cargo build --release
 
 ```sh
 ./target/release/bish              # interactive REPL
+./target/release/bish --promoted   # interactive REPL, starting in windowed/tabbed mode
 ./target/release/bish script.sh    # run a script
 ./target/release/bish -c 'echo hi' # run a one-liner
 ```
