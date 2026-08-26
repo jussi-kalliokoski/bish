@@ -212,19 +212,41 @@ impl Grid {
         dropped
     }
 
+    // Clamped, not a bounds-checked panic: a caller computing (row, col)
+    // from some other snapshot of this grid's own size (a pane rect
+    // cached before a sibling resize, say -- see repl.rs's TerminalFrame::
+    // capture for a real one that used to crash here) can legitimately
+    // race a real resize elsewhere and hand in a value that's gone stale
+    // by a row or column. Reading/writing the nearest real cell instead
+    // of panicking is what a terminal emulator embedded in an
+    // interactive shell needs here: a transient, self-healing one-frame
+    // rendering glitch from stale input is categorically better than
+    // taking the whole process down over what real callers already try
+    // hard to keep in sync (this is a last-resort safety net, not a
+    // license to skip that effort).
+    fn clamped_index(&self, row: usize, col: usize) -> usize {
+        let row = row.min(self.rows.saturating_sub(1));
+        let col = col.min(self.cols.saturating_sub(1));
+        row * self.cols + col
+    }
+
     pub fn cell(&self, row: usize, col: usize) -> Cell {
-        self.cells[row * self.cols + col]
+        self.cells[self.clamped_index(row, col)]
     }
 
     fn cell_mut(&mut self, row: usize, col: usize) -> &mut Cell {
-        &mut self.cells[row * self.cols + col]
+        let idx = self.clamped_index(row, col);
+        &mut self.cells[idx]
     }
 
+    // Clamped for the same reason clamped_index is -- a stale row from a
+    // caller racing a resize elsewhere shouldn't be able to crash this.
     fn is_wrapped(&self, row: usize) -> bool {
-        self.wrapped[row]
+        self.wrapped[row.min(self.rows.saturating_sub(1))]
     }
 
     fn set_wrapped(&mut self, row: usize, v: bool) {
+        let row = row.min(self.rows.saturating_sub(1));
         self.wrapped[row] = v;
     }
 
@@ -1283,5 +1305,27 @@ mod tests {
         let mut s = Screen::new(1, 5);
         s.feed("héllo".as_bytes());
         assert_eq!(s.cell(0, 1).ch, 'é');
+    }
+
+    // Regression: cell/cell_mut used to index self.cells[row * cols +
+    // col] with no bounds check at all, which real callers could (and,
+    // in production, did -- see repl.rs's TerminalFrame::capture) hit
+    // with a stale row/col from a size snapshot that raced a real
+    // resize. Reading/writing out of bounds must clamp to the nearest
+    // real cell instead of panicking.
+    #[test]
+    fn cell_out_of_bounds_clamps_instead_of_panicking() {
+        let s = Screen::new(2, 3);
+        // Same cell as the last real one (1, 2) -- proves this is a
+        // real clamp, not a fluke default value.
+        assert_eq!(s.cell(50, 50), s.cell(1, 2));
+        assert_eq!(s.cell(0, 50).ch, s.cell(0, 2).ch);
+        assert_eq!(s.cell(50, 0).ch, s.cell(1, 0).ch);
+    }
+
+    #[test]
+    fn row_wraps_out_of_bounds_clamps_instead_of_panicking() {
+        let s = Screen::new(2, 3);
+        assert_eq!(s.row_wraps(50), s.row_wraps(1));
     }
 }

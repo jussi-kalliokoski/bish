@@ -3264,12 +3264,28 @@ impl TerminalFrame {
     // Flattens every pane's own screen content into one rows*cols grid --
     // the same data render_compositor_frame's own per-pane render_row
     // loop paints, just captured as data instead of escape codes.
+    //
+    // `pane.rect` can be stale relative to `pane.screen`'s own *current*
+    // size by the time this runs: render_compositor_frame_diff's caller
+    // (run_fg_job_frame) only re-snapshots its whole `layout` -- rects
+    // included -- when `sync_pty_size` notices the *focused* pane's own
+    // screen size changed, but a background WINCH tick's own
+    // poll_and_apply_resize/compositor_redraw pass can resize a
+    // *sibling* pane's screen independently (e.g. a fixed-size split
+    // child, or simply a different rounding remainder) without the
+    // focused one's size moving at all -- leaving this function's own
+    // `rect` for that sibling describing a larger area than its screen
+    // now actually has. Clamping each pane's own read range to its
+    // screen's own live size (not just `pane.rect`) is what avoids
+    // reading past it -- this was a real, reproducible crash (`Screen::
+    // cell`'s own index-out-of-bounds panic) before this clamp existed.
     fn capture(layout: &CompositorLayout, tab_bar: &str, rows: usize, cols: usize) -> TerminalFrame {
         let mut cells = vec![vt100::Cell::default(); rows * cols];
         for pane in &layout.panes {
             let screen = pane.screen.borrow();
-            for r in 0..pane.rect.rows {
-                for c in 0..pane.rect.cols {
+            let (screen_rows, screen_cols) = screen.size();
+            for r in 0..pane.rect.rows.min(screen_rows) {
+                for c in 0..pane.rect.cols.min(screen_cols) {
                     let (row, col) = (pane.rect.row + r, pane.rect.col + c);
                     if row < rows && col < cols {
                         cells[row * cols + col] = screen.cell(r, c);
@@ -6625,5 +6641,43 @@ mod compositor_diff_tests {
         let out = diff_frames(&prev, &new, 2, 10);
         assert_eq!(out.matches("\x1b[1;4H").count(), 1, "{out:?}");
         assert!(out.contains("XXXX"), "{out:?}");
+    }
+}
+
+#[cfg(test)]
+mod terminal_frame_capture_tests {
+    use super::*;
+
+    // Regression: a pane's own cached `rect` (built once by
+    // run_fg_job_frame, refreshed only when the *focused* pane's screen
+    // size changes -- see TerminalFrame::capture's own doc comment) can
+    // describe a larger area than that pane's screen *currently* has,
+    // if a sibling pane's screen was independently resized in between --
+    // this used to panic inside vt100::Screen::cell with an index-out-
+    // of-bounds. `capture` must clamp to the screen's own live size
+    // instead of trusting `rect`.
+    #[test]
+    fn capture_clamps_a_panes_stale_rect_to_its_screens_own_live_size() {
+        let screen = Rc::new(RefCell::new(vt100::Screen::new(2, 3)));
+        let layout = CompositorLayout {
+            panes: vec![PaneSnapshot { rect: Rect { row: 0, col: 0, rows: 5, cols: 10 }, screen, focused: true }],
+            dividers: vec![],
+        };
+        let frame = TerminalFrame::capture(&layout, "", 5, 10);
+        assert_eq!(frame.rows, 5);
+        assert_eq!(frame.cols, 10);
+    }
+
+    #[test]
+    fn capture_still_reads_every_real_cell_when_rect_matches_the_screen() {
+        let screen = Rc::new(RefCell::new(vt100::Screen::new(2, 3)));
+        screen.borrow_mut().feed(b"ab");
+        let layout = CompositorLayout {
+            panes: vec![PaneSnapshot { rect: Rect { row: 0, col: 0, rows: 2, cols: 3 }, screen, focused: true }],
+            dividers: vec![],
+        };
+        let frame = TerminalFrame::capture(&layout, "", 2, 3);
+        assert_eq!(frame.cells[0].ch, 'a');
+        assert_eq!(frame.cells[1].ch, 'b');
     }
 }
