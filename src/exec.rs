@@ -39,6 +39,25 @@ enum OutputSink {
     // is plain text repl.rs renders itself by splitting on '\n', not fed
     // into a terminal emulator that needs CRLF.
     Capture(Rc<RefCell<String>>),
+    // dispatch_builtin_or_external's own push_builtin_output_sink installs
+    // this around a single builtin call so its sh_println!/sh_eprintln!
+    // writes honor *that command's own* `>`/`>>`/`2>`/`&>`/`2>&1`/`1>&2`
+    // redirects -- previously builtins ignored per-command redirects
+    // entirely (see plan.md), which mattered for real activation scripts
+    // (mise, nvm, ...) relying on `declare -p foo >/dev/null 2>&1`-style
+    // guards being silent. `stdout`/`stderr` are `None` when that stream
+    // has no redirect of its own, falling through to `previous`;
+    // `dup_err_to_out`/`dup_out_to_err` make one stream follow wherever
+    // the other currently resolves to (an explicit file if that stream has
+    // one, `previous`'s own stream otherwise), matching `2>&1`/`1>&2`
+    // without needing to know in advance what "wherever it goes" means.
+    Builtin {
+        previous: Box<OutputSink>,
+        stdout: Option<Rc<RefCell<std::fs::File>>>,
+        stderr: Option<Rc<RefCell<std::fs::File>>>,
+        dup_err_to_out: bool,
+        dup_out_to_err: bool,
+    },
 }
 
 // Emulates the real terminal's ONLCR postprocessing (translating outgoing
@@ -86,6 +105,25 @@ impl OutputSink {
             }
             OutputSink::Grid(screen) => screen.borrow_mut().feed(onlcr(s).as_bytes()),
             OutputSink::Capture(buf) => buf.borrow_mut().push_str(s),
+            OutputSink::Builtin { previous, stdout, stderr, dup_err_to_out: _, dup_out_to_err } => {
+                use std::io::Write;
+                if *dup_out_to_err {
+                    // `1>&2`: stdout follows wherever stderr resolves to.
+                    match stderr {
+                        Some(f) => {
+                            let _ = f.borrow_mut().write_all(s.as_bytes());
+                        }
+                        None => previous.write_err(s),
+                    }
+                } else {
+                    match stdout {
+                        Some(f) => {
+                            let _ = f.borrow_mut().write_all(s.as_bytes());
+                        }
+                        None => previous.write_out(s),
+                    }
+                }
+            }
         }
     }
 
@@ -97,6 +135,24 @@ impl OutputSink {
             }
             OutputSink::Grid(screen) => screen.borrow_mut().feed(onlcr(s).as_bytes()),
             OutputSink::Capture(buf) => buf.borrow_mut().push_str(s),
+            OutputSink::Builtin { previous, stdout, stderr, dup_err_to_out, .. } => {
+                use std::io::Write;
+                if *dup_err_to_out {
+                    match stdout {
+                        Some(f) => {
+                            let _ = f.borrow_mut().write_all(s.as_bytes());
+                        }
+                        None => previous.write_out(s),
+                    }
+                } else {
+                    match stderr {
+                        Some(f) => {
+                            let _ = f.borrow_mut().write_all(s.as_bytes());
+                        }
+                        None => previous.write_err(s),
+                    }
+                }
+            }
         }
     }
 }
@@ -784,10 +840,13 @@ impl Shell {
             }
             // Capture is only ever active for the brief span of running one
             // command-mode command (restrict_to_builtins there already
-            // rules out anything that would spawn a pty-attached job), so
-            // this arm should be unreachable in practice -- falls back to
-            // the same real-terminal query Real uses rather than a panic.
-            OutputSink::Real | OutputSink::Capture(_) => match pty::get_size(0) {
+            // rules out anything that would spawn a pty-attached job), and
+            // Builtin is only active when this same command has an output
+            // redirect of its own (use_pty's own gate above already
+            // requires none), so both arms should be unreachable in
+            // practice -- falls back to the same real-terminal query Real
+            // uses rather than a panic.
+            OutputSink::Real | OutputSink::Capture(_) | OutputSink::Builtin { .. } => match pty::get_size(0) {
                 Ok(ws) if ws.rows > 0 && ws.cols > 0 => (ws.rows, ws.cols),
                 _ => (24, 80),
             },
@@ -4366,6 +4425,35 @@ impl Shell {
         self.dispatch_builtin_or_external(&argv, name, cmd, background, false, &array_literal_args)
     }
 
+    // Thin wrapper around dispatch_builtin_or_external_impl (the actual
+    // dozens-of-arms match, below) that installs a per-command output-
+    // redirect override around the whole call -- see push_builtin_output_
+    // sink's own doc comment for exactly what it covers and why a single
+    // push/pop pair here (rather than threading a restore through every
+    // one of that match's many `return` points) is enough: every path
+    // through it either returns straight from the match (builtin output)
+    // or falls through into the external-spawn tail, whose own child
+    // process writes straight to real fds regardless of self.sink -- only
+    // the shell's *own* diagnostics along that tail (e.g. a failed spawn)
+    // are affected, which is exactly the intended, correct behavior.
+    fn dispatch_builtin_or_external(
+        &mut self,
+        argv: &[String],
+        name: String,
+        cmd: &SimpleCommand,
+        background: bool,
+        builtin_only: bool,
+        array_literal_args: &[(usize, String, AssignMode, Vec<ArrayLiteralItem>)],
+    ) -> ExecResult {
+        if let Err(e) = self.push_builtin_output_sink(&cmd.redirects) {
+            sh_eprintln!(self, "bish: {}", e);
+            return ExecResult::Status(1);
+        }
+        let result = self.dispatch_builtin_or_external_impl(argv, name, cmd, background, builtin_only, array_literal_args);
+        self.pop_builtin_output_sink();
+        result
+    }
+
     // Split out from run_single so `builtin NAME...` (its own arm below)
     // can re-enter just the builtin-dispatch-and-external-spawn part,
     // bypassing run_single's own function-shadowing check above -- that
@@ -4377,7 +4465,7 @@ impl Shell {
     // own doc comment above describes -- empty for the `builtin` arm's
     // own recursive call (`builtin declare -A m=(...)` isn't supported,
     // an accepted narrow gap given how rare combining the two is).
-    fn dispatch_builtin_or_external(
+    fn dispatch_builtin_or_external_impl(
         &mut self,
         argv: &[String],
         name: String,
@@ -4386,16 +4474,15 @@ impl Shell {
         builtin_only: bool,
         array_literal_args: &[(usize, String, AssignMode, Vec<ArrayLiteralItem>)],
     ) -> ExecResult {
-        // Builtins ignore per-command redirects for now: their output goes
-        // straight to the shell's own stdio.
         match name.as_str() {
             // POSIX special builtin: does nothing, exits 0. Its arguments
             // are still expanded (already done via argv above) for side
-            // effects like `: ${x:=default}`; this shell's builtins don't
-            // yet honor their own redirects (see the comment on the
-            // `Builtins ignore per-command redirects` note elsewhere in
-            // this file), so `: > file` won't truncate `file` here, same
-            // limitation as every other builtin.
+            // effects like `: ${x:=default}`. Its own redirects (e.g.
+            // `: > file`) still create/truncate the target, same as real
+            // bash -- a side effect of the output-sink override the outer
+            // dispatch_builtin_or_external wrapper installs regardless of
+            // which builtin ends up running, not anything special-cased
+            // here.
             ":" => return ExecResult::Status(0),
             // command [-v|-V] name [args...]. -v/-V (by far the dominant
             // real-world use, e.g. `command -v git >/dev/null`) report
@@ -6545,6 +6632,92 @@ impl Shell {
 
     fn resolve_redirects(&mut self, cmd: &SimpleCommand) -> Result<ResolvedRedirs, String> {
         self.resolve_redirect_list(&cmd.redirects)
+    }
+
+    // Installs an OutputSink::Builtin override for the duration of one
+    // dispatch_builtin_or_external call (see that wrapper and OutputSink::
+    // Builtin's own doc comment). Returns Ok(false) -- sink left untouched
+    // -- when `redirects` has nothing touching fd 1 or 2 at all, the
+    // overwhelming common case: only Out/Err/Both/DupErrToOut and their
+    // explicit `1>`/`2>`/`1>&2`/`2>&1` numbered-fd spellings count, since no
+    // builtin ever writes to any other fd (an external spawn already
+    // handles the rest in full via resolve_redirect_list/apply_fd_redirects,
+    // untouched by this). Ok(true) means the sink was swapped and the
+    // caller must call pop_builtin_output_sink when done; Err surfaces a
+    // failed `open_out` (e.g. `> /no/such/dir/f`) the same way every other
+    // redirect failure already does.
+    fn push_builtin_output_sink(&mut self, redirects: &[Redirect]) -> Result<bool, String> {
+        let mut stdout_target: Option<(String, bool)> = None;
+        let mut stderr_target: Option<(String, bool)> = None;
+        let mut dup_err_to_out = false;
+        let mut dup_out_to_err = false;
+        let mut touched = false;
+        for r in redirects {
+            match r {
+                Redirect::Out { word, append } => {
+                    stdout_target = Some((self.expand_word(word), *append));
+                    dup_out_to_err = false;
+                    touched = true;
+                }
+                Redirect::FdOut { fd, word, append } if *fd == 1 => {
+                    stdout_target = Some((self.expand_word(word), *append));
+                    dup_out_to_err = false;
+                    touched = true;
+                }
+                Redirect::Err { word, append } => {
+                    stderr_target = Some((self.expand_word(word), *append));
+                    dup_err_to_out = false;
+                    touched = true;
+                }
+                Redirect::FdOut { fd, word, append } if *fd == 2 => {
+                    stderr_target = Some((self.expand_word(word), *append));
+                    dup_err_to_out = false;
+                    touched = true;
+                }
+                Redirect::Both { word, append } => {
+                    stdout_target = Some((self.expand_word(word), *append));
+                    dup_err_to_out = true;
+                    dup_out_to_err = false;
+                    touched = true;
+                }
+                Redirect::DupErrToOut => {
+                    dup_err_to_out = true;
+                    touched = true;
+                }
+                Redirect::FdDup { fd, target } if *fd == 2 && *target == 1 => {
+                    dup_err_to_out = true;
+                    touched = true;
+                }
+                Redirect::FdDup { fd, target } if *fd == 1 && *target == 2 => {
+                    dup_out_to_err = true;
+                    touched = true;
+                }
+                _ => {}
+            }
+        }
+        if !touched {
+            return Ok(false);
+        }
+        let stdout = match &stdout_target {
+            Some((p, append)) => Some(Rc::new(RefCell::new(self.open_out(p, *append)?))),
+            None => None,
+        };
+        let stderr = match &stderr_target {
+            Some((p, append)) => Some(Rc::new(RefCell::new(self.open_out(p, *append)?))),
+            None => None,
+        };
+        let previous = std::mem::replace(&mut self.sink, OutputSink::Real);
+        self.sink = OutputSink::Builtin { previous: Box::new(previous), stdout, stderr, dup_err_to_out, dup_out_to_err };
+        Ok(true)
+    }
+
+    // Restores whatever sink push_builtin_output_sink saved -- a no-op if
+    // the sink isn't currently an OutputSink::Builtin (push returned false
+    // or was never called), so callers can invoke this unconditionally.
+    fn pop_builtin_output_sink(&mut self) {
+        if let OutputSink::Builtin { previous, .. } = &mut self.sink {
+            self.sink = *std::mem::replace(previous, Box::new(OutputSink::Real));
+        }
     }
 
     // Diagnostics for a command that never got to inherit its own stdio
@@ -10154,5 +10327,68 @@ mod tests {
         let result = shell.run_source_here("declare -F not_a_real_function_xyz", "<test>");
         assert!(matches!(result, ExecResult::Status(1)), "{result:?}");
         assert_eq!(buf.borrow().as_str(), "");
+    }
+
+    // Regression: builtins used to ignore their own per-command redirects
+    // entirely (their output always went straight to the shell's own
+    // sink) -- confirmed as a real problem via mise's own bash activation
+    // script, which relies on `declare -p foo >/dev/null 2>&1`/`declare -F
+    // foo >/dev/null`-style guards actually being silenced. These check
+    // push_builtin_output_sink/pop_builtin_output_sink (installed around
+    // every dispatch_builtin_or_external call) against real bash's own
+    // observed behavior for each redirect form.
+    #[test]
+    fn builtin_stderr_redirected_to_dev_null_leaves_the_shells_own_sink_untouched() {
+        let mut shell = Shell::new();
+        let buf = capture_output(&mut shell);
+        shell.run_source_here("declare -p not_a_real_var_xyz >/dev/null 2>&1; echo done", "<test>");
+        assert_eq!(buf.borrow().as_str(), "done\n");
+    }
+
+    #[test]
+    fn builtin_stderr_redirected_to_a_file_is_captured_there_not_in_the_shells_sink() {
+        let dir = std::env::temp_dir().join(format!("bish_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("err.txt");
+        let mut shell = Shell::new();
+        let buf = capture_output(&mut shell);
+        shell.run_source_here(&format!("declare -p not_a_real_var_xyz 2>{}; echo done", path.display()), "<test>");
+        assert_eq!(buf.borrow().as_str(), "done\n");
+        assert!(std::fs::read_to_string(&path).unwrap().contains("not_a_real_var_xyz"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn builtin_stdout_redirected_to_a_file_with_append_writes_there_not_in_the_shells_sink() {
+        let dir = std::env::temp_dir().join(format!("bish_test_{}", std::process::id() + 1));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("out.txt");
+        let mut shell = Shell::new();
+        let buf = capture_output(&mut shell);
+        shell.run_source_here(&format!("echo one >{p}; echo two >>{p}", p = path.display()), "<test>");
+        assert_eq!(buf.borrow().as_str(), "");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "one\ntwo\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn builtin_both_stdout_and_stderr_redirected_via_ampersand_gt_land_in_the_same_file() {
+        let dir = std::env::temp_dir().join(format!("bish_test_{}", std::process::id() + 2));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("both.txt");
+        let mut shell = Shell::new();
+        let buf = capture_output(&mut shell);
+        shell.run_source_here(&format!("declare -p not_a_real_var_xyz &>{}", path.display()), "<test>");
+        assert_eq!(buf.borrow().as_str(), "");
+        assert!(std::fs::read_to_string(&path).unwrap().contains("not_a_real_var_xyz"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn builtin_with_no_output_redirect_still_goes_through_the_shells_own_sink() {
+        let mut shell = Shell::new();
+        let buf = capture_output(&mut shell);
+        shell.run_source_here("echo hi", "<test>");
+        assert_eq!(buf.borrow().as_str(), "hi\n");
     }
 }
