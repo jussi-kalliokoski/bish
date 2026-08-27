@@ -1072,6 +1072,7 @@ struct GutterColumn {
 }
 
 static GUTTER_COLUMNS: &[GutterColumn] = &[
+    GutterColumn { width: breakpoint_column_width, render: render_breakpoint_cell },
     GutterColumn { width: blame_column_width, render: render_blame_cell },
     GutterColumn { width: diff_column_width, render: render_diff_cell },
     GutterColumn { width: diagnostic_column_width, render: render_diagnostic_cell },
@@ -1142,6 +1143,24 @@ fn render_diff_cell(buf: &TextBuffer, _starts: &[usize], line: usize, _width: us
 // A fixed 2 columns (marker glyph + one padding space) -- vim's own
 // `:set signcolumn` convention, not something that needs to grow with
 // the buffer the way the line-number column does.
+// `bish tool debug`'s own breakpoint column -- collapses to zero width
+// when `buf.breakpoints` is empty (the common case for an ordinary `e`-
+// opened buffer, which never touches it at all), same convention blame/
+// diff already use, unlike the diagnostic column's always-reserved 2.
+fn breakpoint_column_width(buf: &TextBuffer) -> usize {
+    if buf.breakpoints.is_empty() { 0 } else { 2 }
+}
+
+// 1-based, matching how the debugger itself (and ListItem::line) numbers
+// lines -- `line` here is the 0-indexed row every other GutterColumn
+// uses.
+fn render_breakpoint_cell(buf: &TextBuffer, _starts: &[usize], line: usize, _width: usize) -> Option<String> {
+    if line >= buf.line_count() || !buf.breakpoints.contains(&(line + 1)) {
+        return None;
+    }
+    Some("\x1b[1;31m\u{25cf}\x1b[0m ".to_string())
+}
+
 fn diagnostic_column_width(_buf: &TextBuffer) -> usize {
     2
 }

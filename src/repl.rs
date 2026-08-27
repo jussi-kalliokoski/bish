@@ -3903,7 +3903,7 @@ impl BisheditBuffer for NavBuffer {
 // `ReadOnly` `ScreenBuffer` (`Buffer::viewport_left`'s own doc comment
 // on why that one never actually scrolls), the real thing for `Editable`
 // (mirrors `fileeditor::scroll_to_show_cursor` exactly).
-fn scroll_to_show_cursor(buf: &mut impl BisheditBuffer, content_cols: usize) {
+pub(crate) fn scroll_to_show_cursor(buf: &mut impl BisheditBuffer, content_cols: usize) {
     let (line, col) = buf.cursor();
     let height = buf.viewport_height();
     if line < buf.viewport_top() {

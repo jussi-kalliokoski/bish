@@ -7,6 +7,27 @@
 // involved" style fileeditor.rs's own render_editor_frame uses before a
 // session is promoted into the windowed compositor.
 //
+// The source view itself IS the real file editor -- a genuine
+// bishedit::TextBuffer, rendered via fileeditor::build_editor_frame (the
+// exact same gutter/syntax-highlighting/cursor pipeline `e` uses), driven
+// with the real VimKeys engine so every ordinary motion (hjkl, w/b/e,
+// f/t, %, gg/G, search, marks, jumps, Visual mode + yank, ...) works
+// exactly as it does in the real editor -- just with every *mutating*
+// KeyOutcome (EnterInsert, Operator(Delete/Change/...), Put,
+// DeleteCharForward, Join, ReplaceChar, EnterReplace, ToggleCase,
+// AdjustNumber, OpenLine, surround) simply never wired to anything,
+// matching the read-only convention `NavBuffer::ReadOnly` already
+// establishes elsewhere in this codebase ("enforced by omission," not a
+// buffer-level read-only flag). This is a smaller, self-contained
+// re-derivation of repl.rs's own run_normal_mode_navigation for
+// precisely that read-only-compatible subset, rather than threading a
+// read-only flag through that much larger function (which also carries a
+// lot of window/pane/session machinery this standalone view has no
+// session or window to hook into) or faking up a whole sessions/windows
+// map just to reuse it unchanged. Two things it does not attempt: vim
+// macros (`q`/`@`) and Ctrl-W window commands -- neither is meaningful
+// without repl.rs's own window/pane state.
+//
 // The debug/dbg command-mode builtin the user asked for is this view's
 // own dedicated `:` colon-line reader (read_colon_line/dispatch_colon_
 // command below) -- not a call into repl.rs's real run_command_mode,
@@ -14,13 +35,16 @@
 // from mid-run_program (see DebugController::on_statement's own doc
 // comment for exactly why).
 
-use std::cell::RefCell;
-use std::collections::BTreeSet;
 use std::io::Write;
-use std::rc::Rc;
 
+use crate::bishedit::registers::Registers;
+use crate::bishedit::textbuffer::TextBuffer;
+use crate::bishedit::vimkeys::{KeyOutcome, Op, VimKeys};
+use crate::bishedit::Buffer as _;
 use crate::editor::{self, Key};
 use crate::exec::{DebugAction, DebugDepth, DebugHook, Shell};
+use crate::fileeditor::{self, EditorMode};
+use crate::repl::Rect;
 use crate::term;
 
 // What a paused DebugController is waiting to do next, decided the last
@@ -41,13 +65,9 @@ enum PendingStop {
 }
 
 pub struct DebugController {
-    lines: Vec<String>,
-    breakpoints: BTreeSet<usize>,
-    // 1-based -- the line the read-only view's own navigation cursor
-    // sits on, independent of whatever line execution is actually
-    // paused at (paused_at).
-    cursor_line: usize,
-    viewport_top: usize,
+    buf: TextBuffer,
+    vk: VimKeys,
+    registers: Registers,
     paused_at: Option<usize>,
     pending_stop: PendingStop,
     // Set by `q`/Escape/a failed key read while paused -- checked by
@@ -61,70 +81,32 @@ pub struct DebugController {
     status: String,
 }
 
-const GUTTER_WIDTH: usize = 4; // breakpoint marker (2) + a thin separator (2)
-
 impl DebugController {
-    fn new(src: &str, term_rows: usize, term_cols: usize) -> Self {
-        let lines: Vec<String> = src.lines().map(|s| s.to_string()).collect();
+    fn new(buf: TextBuffer, term_rows: usize, term_cols: usize) -> Self {
         DebugController {
-            lines,
-            breakpoints: BTreeSet::new(),
-            cursor_line: 1,
-            viewport_top: 0,
+            buf,
+            vk: VimKeys::new(),
+            registers: Registers::new(),
             paused_at: None,
             pending_stop: PendingStop::None,
             quit_requested: false,
             term_rows,
             term_cols,
-            status: "r/Enter: run  b: toggle breakpoint  j/k: move  :: command  q: quit".to_string(),
+            status: "r/Enter: run  b: toggle breakpoint  hjkl/w/b/gg/G/...: navigate  K: hover  ::  q: quit".to_string(),
         }
     }
 
-    fn content_rows(&self) -> usize {
-        self.term_rows.saturating_sub(1).max(1)
+    // One row reserved at the bottom for the status line/colon-line
+    // (shared, exactly like the real editor's own status row -- there's
+    // no tab bar here to also reserve a second row for).
+    fn rect(&self) -> Rect {
+        Rect { row: 0, col: 0, rows: self.term_rows.saturating_sub(1).max(1), cols: self.term_cols }
     }
 
-    fn line_number_width(&self) -> usize {
-        self.lines.len().max(1).to_string().len()
-    }
-
-    fn scroll_to_show(&mut self, line: usize) {
-        let rows = self.content_rows();
-        let idx = line.saturating_sub(1);
-        if idx < self.viewport_top {
-            self.viewport_top = idx;
-        } else if idx >= self.viewport_top + rows {
-            self.viewport_top = idx + 1 - rows;
-        }
-    }
-
-    fn render(&self, shell: Option<&Shell>) {
-        let rows = self.content_rows();
-        let num_width = self.line_number_width();
-        let mut out = String::new();
-        out.push_str("\x1b[H");
-        for r in 0..rows {
-            let idx = self.viewport_top + r;
-            out.push_str(&format!("\x1b[{};1H\x1b[K", r + 1));
-            if idx >= self.lines.len() {
-                continue;
-            }
-            let line_no = idx + 1;
-            let bp_marker = if self.breakpoints.contains(&line_no) { "\x1b[1;31m*\x1b[0m " } else { "  " };
-            let is_paused = self.paused_at == Some(line_no);
-            let is_cursor = self.cursor_line == line_no && self.paused_at.is_none();
-            let text: String = self.lines[idx].chars().take(self.term_cols.saturating_sub(GUTTER_WIDTH + num_width + 1)).collect();
-            let num = format!("{:>width$}", line_no, width = num_width);
-            if is_paused {
-                out.push_str(&format!("{}\x1b[2m{}\x1b[0m \x1b[7m{}\x1b[0m", bp_marker, num, text));
-            } else if is_cursor {
-                out.push_str(&format!("{}\x1b[2m{}\x1b[0m \x1b[4m{}\x1b[0m", bp_marker, num, text));
-            } else {
-                out.push_str(&format!("{}\x1b[2m{}\x1b[0m {}", bp_marker, num, text));
-            }
-        }
-        out.push_str(&format!("\x1b[{};1H\x1b[K\x1b[7m{}\x1b[0m", self.term_rows, truncate(&self.status, self.term_cols)));
-        let _ = shell; // reserved for a future richer status (call stack, etc.)
+    fn render(&self) {
+        let rect = self.rect();
+        let mut out = crate::repl::render_global_status_row(&self.status, self.term_rows);
+        out.push_str(&fileeditor::build_editor_frame(&self.buf, &self.vk, EditorMode::Normal, rect, rect.row, rect.col, None));
         print!("{}", out);
         let _ = std::io::stdout().flush();
     }
@@ -134,8 +116,8 @@ impl DebugController {
     }
 
     fn toggle_breakpoint(&mut self, line: usize) {
-        if !self.breakpoints.insert(line) {
-            self.breakpoints.remove(&line);
+        if !self.buf.breakpoints.insert(line) {
+            self.buf.breakpoints.remove(&line);
         }
     }
 
@@ -151,10 +133,8 @@ impl DebugController {
     fn read_colon_line(&self) -> Option<String> {
         let mut buf = String::new();
         loop {
-            let mut row = format!("\x1b[{};1H\x1b[K:{}", self.term_rows, buf);
-            print!("{}", row);
+            print!("\x1b[{};1H\x1b[K:{}", self.term_rows, buf);
             let _ = std::io::stdout().flush();
-            row.clear();
             match self.read_key()? {
                 Key::Enter => return Some(buf),
                 Key::Escape => return None,
@@ -170,37 +150,18 @@ impl DebugController {
         }
     }
 
-    // Identifier under (or starting at) the cursor's own line -- the
-    // debug view has no per-column cursor of its own (only a current
-    // *line*), so this looks for the first identifier on that line
-    // rather than a true under-the-mouse-cursor lookup; a natural follow-
-    // up once this view gains real column-level navigation.
-    fn first_identifier_on_line(&self, line: usize) -> Option<String> {
-        let text = self.lines.get(line.checked_sub(1)?)?;
-        let mut chars = text.chars().peekable();
-        loop {
-            while let Some(&c) = chars.peek() {
-                if c.is_ascii_alphabetic() || c == '_' {
-                    break;
-                }
-                chars.next();
-            }
-            if chars.peek().is_none() {
-                return None;
-            }
-            let mut ident = String::new();
-            while let Some(&c) = chars.peek() {
-                if c.is_ascii_alphanumeric() || c == '_' {
-                    ident.push(c);
-                    chars.next();
-                } else {
-                    break;
-                }
-            }
-            if !ident.is_empty() {
-                return Some(ident);
-            }
+    // Identifier under the cursor's own column on its own line -- `K`'s
+    // own hover target.
+    fn identifier_at_cursor(&self) -> Option<String> {
+        let (row, col) = self.buf.cursor();
+        let chars = self.buf.line_chars(row);
+        let is_ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
+        if col >= chars.len() || !is_ident(chars[col]) {
+            return None;
         }
+        let start = (0..=col).rev().take_while(|&i| is_ident(chars[i])).last().unwrap_or(col);
+        let end = (col..chars.len()).take_while(|&i| is_ident(chars[i])).count() + col;
+        Some(chars[start..end].iter().collect())
     }
 
     fn dispatch_colon_command(&mut self, line: &str, depth: DebugDepth, shell: &Shell) -> Option<DebugAction> {
@@ -230,7 +191,7 @@ impl DebugController {
         if let Some(rest) = line.strip_prefix("break add ").or_else(|| line.strip_prefix("b add ")) {
             match rest.trim().parse::<usize>() {
                 Ok(n) => {
-                    self.breakpoints.insert(n);
+                    self.buf.breakpoints.insert(n);
                     self.set_status(format!("breakpoint added at line {}", n));
                 }
                 Err(_) => self.set_status(format!("bish: dbg: {}: invalid line number", rest)),
@@ -238,7 +199,7 @@ impl DebugController {
         } else if let Some(rest) = line.strip_prefix("break remove ").or_else(|| line.strip_prefix("b remove ")) {
             match rest.trim().parse::<usize>() {
                 Ok(n) => {
-                    self.breakpoints.remove(&n);
+                    self.buf.breakpoints.remove(&n);
                     self.set_status(format!("breakpoint removed at line {}", n));
                 }
                 Err(_) => self.set_status(format!("bish: dbg: {}: invalid line number", rest)),
@@ -254,10 +215,89 @@ impl DebugController {
         }
         None
     }
-}
 
-fn truncate(s: &str, cols: usize) -> String {
-    s.chars().take(cols).collect()
+    // Real vim motions/search/marks/jumps/Visual-mode-plus-yank, applied
+    // directly against the real TextBuffer via the same buffer-generic
+    // helpers repl.rs's own run_normal_mode_navigation uses for the
+    // identical KeyOutcomes -- see this module's own top-of-file doc
+    // comment for exactly which outcomes this covers and why every
+    // mutating one is simply never matched at all.
+    fn handle_navigation_key(&mut self, key: Key) {
+        if self.vk.is_idle() && (self.vk.is_visual() || !self.buf.selections.is_empty()) {
+            match key {
+                Key::Char('Z') => {
+                    self.commit_active_selection();
+                    let end = self.buf.cursor();
+                    self.vk.end_visual(end);
+                    return;
+                }
+                Key::Char('y') => {
+                    self.commit_active_selection();
+                    let register = self.vk.take_pending_register();
+                    let end = self.buf.cursor();
+                    self.buf.yank_selections(&mut self.registers, register);
+                    self.buf.selections.clear();
+                    self.vk.end_visual(end);
+                    return;
+                }
+                Key::Escape | Key::CtrlC => {
+                    let end = self.buf.cursor();
+                    self.vk.end_visual(end);
+                    self.buf.selections.clear();
+                    return;
+                }
+                _ => {}
+            }
+        }
+        match self.vk.feed(key) {
+            KeyOutcome::Motion(m, count) => {
+                editor::apply_motion_or_reselect(&mut self.vk, &mut self.buf, m, count);
+                let content_cols = fileeditor::editor_content_cols(&self.buf, self.rect());
+                crate::repl::scroll_to_show_cursor(&mut self.buf, content_cols);
+            }
+            KeyOutcome::EnterVisual(shape) => {
+                let cursor = self.buf.cursor();
+                self.vk.begin_visual(shape, cursor);
+            }
+            KeyOutcome::ReselectVisual => {
+                if let Some((shape, anchor, cursor)) = self.vk.last_visual() {
+                    self.buf.set_cursor(cursor.0, cursor.1);
+                    self.vk.begin_visual(shape, anchor);
+                }
+            }
+            KeyOutcome::Jump { forward } => {
+                let current = self.buf.cursor();
+                let target = if forward { self.vk.jump_forward(current) } else { self.vk.jump_back(current) };
+                if let Some((row, col)) = target {
+                    let row = row.min(self.buf.line_count() - 1);
+                    let col = col.min(self.buf.line_len(row));
+                    self.buf.set_cursor(row, col);
+                    let content_cols = fileeditor::editor_content_cols(&self.buf, self.rect());
+                    crate::repl::scroll_to_show_cursor(&mut self.buf, content_cols);
+                }
+            }
+            KeyOutcome::Operator(Op::Yank, motion, count, register) => {
+                editor::yank_motion(&mut self.buf, &mut self.registers, motion, count, register);
+            }
+            KeyOutcome::OperatorLines(Op::Yank, count, register) => {
+                editor::yank_lines(&self.buf, &mut self.registers, count, register);
+            }
+            // Every other outcome mutates (EnterInsert, a non-Yank
+            // Operator/OperatorLines, Put, DeleteCharForward, Join,
+            // surround, ReplaceChar, EnterReplace, ToggleCase,
+            // AdjustNumber, OpenLine) or needs window/pane state this
+            // standalone view doesn't have (Window) -- silently a no-op,
+            // same "enforced by omission" convention NavBuffer::ReadOnly
+            // already establishes.
+            _ => {}
+        }
+    }
+
+    fn commit_active_selection(&mut self) {
+        if let Some(range) = crate::repl::active_visual_range(&self.vk, &self.buf) {
+            self.buf.selections.push(range);
+        }
+    }
 }
 
 impl DebugHook for DebugController {
@@ -267,7 +307,7 @@ impl DebugHook for DebugController {
     // (no event loop to hand control back to here -- this is called from
     // deep inside run_program, already borrowed by whoever called it).
     fn on_statement(&mut self, line: usize, depth: DebugDepth, shell: &Shell) -> DebugAction {
-        let should_pause = self.breakpoints.contains(&line)
+        let should_pause = self.buf.breakpoints.contains(&line)
             || match self.pending_stop {
                 PendingStop::None => false,
                 PendingStop::Anywhere => true,
@@ -278,12 +318,13 @@ impl DebugHook for DebugController {
         }
         self.pending_stop = PendingStop::None;
         self.paused_at = Some(line);
-        self.cursor_line = line;
-        self.scroll_to_show(line);
+        self.buf.set_cursor(line.saturating_sub(1), 0);
+        let content_cols = fileeditor::editor_content_cols(&self.buf, self.rect());
+        crate::repl::scroll_to_show_cursor(&mut self.buf, content_cols);
         self.set_status(format!("paused at line {} -- c: continue  n: next  s: step  K: hover  ::  q: quit", line));
 
         loop {
-            self.render(Some(shell));
+            self.render();
             let key = match self.read_key() {
                 Some(k) => k,
                 None => {
@@ -291,51 +332,52 @@ impl DebugHook for DebugController {
                     return DebugAction::Quit;
                 }
             };
-            match key {
-                Key::Char('c') => {
-                    self.paused_at = None;
-                    return DebugAction::Continue;
-                }
-                Key::Char('n') => {
-                    self.pending_stop = PendingStop::AtOrBelow(depth);
-                    self.paused_at = None;
-                    return DebugAction::StepOver;
-                }
-                Key::Char('s') => {
-                    self.pending_stop = PendingStop::Anywhere;
-                    self.paused_at = None;
-                    return DebugAction::StepInto;
-                }
-                Key::Char('q') | Key::Escape => {
-                    self.paused_at = None;
-                    self.quit_requested = true;
-                    return DebugAction::Quit;
-                }
-                Key::Char('j') | Key::Down => {
-                    self.cursor_line = (self.cursor_line + 1).min(self.lines.len().max(1));
-                    self.scroll_to_show(self.cursor_line);
-                }
-                Key::Char('k') | Key::Up => {
-                    self.cursor_line = self.cursor_line.saturating_sub(1).max(1);
-                    self.scroll_to_show(self.cursor_line);
-                }
-                Key::Char('b') => self.toggle_breakpoint(self.cursor_line),
-                Key::Char('K') => {
-                    let msg = match self.first_identifier_on_line(self.cursor_line).and_then(|name| shell.debug_peek_var(&name).map(|v| (name, v))) {
-                        Some((name, v)) => format!("{} = {}", name, v),
-                        None => "no inspectable variable on this line".to_string(),
-                    };
-                    self.set_status(msg);
-                }
-                Key::Char(':') => {
-                    if let Some(cmd) = self.read_colon_line() {
-                        if let Some(action) = self.dispatch_colon_command(&cmd, depth, shell) {
-                            return action;
-                        }
+            if self.vk.is_idle() {
+                match key {
+                    Key::Char('c') => {
+                        self.paused_at = None;
+                        return DebugAction::Continue;
                     }
+                    Key::Char('n') => {
+                        self.pending_stop = PendingStop::AtOrBelow(depth);
+                        self.paused_at = None;
+                        return DebugAction::StepOver;
+                    }
+                    Key::Char('s') => {
+                        self.pending_stop = PendingStop::Anywhere;
+                        self.paused_at = None;
+                        return DebugAction::StepInto;
+                    }
+                    Key::Char('q') => {
+                        self.paused_at = None;
+                        self.quit_requested = true;
+                        return DebugAction::Quit;
+                    }
+                    Key::Char('b') => {
+                        let line = self.buf.cursor().0 + 1;
+                        self.toggle_breakpoint(line);
+                        continue;
+                    }
+                    Key::Char('K') => {
+                        let msg = match self.identifier_at_cursor().and_then(|name| shell.debug_peek_var(&name).map(|v| (name, v))) {
+                            Some((name, v)) => format!("{} = {}", name, v),
+                            None => "no inspectable variable under the cursor".to_string(),
+                        };
+                        self.set_status(msg);
+                        continue;
+                    }
+                    Key::Char(':') => {
+                        if let Some(cmd) = self.read_colon_line() {
+                            if let Some(action) = self.dispatch_colon_command(&cmd, depth, shell) {
+                                return action;
+                            }
+                        }
+                        continue;
+                    }
+                    _ => {}
                 }
-                _ => {}
             }
+            self.handle_navigation_key(key);
         }
     }
 }
@@ -346,6 +388,17 @@ impl DebugHook for DebugController {
 // than trying to resume execution from a stopped point -- v1's scope, no
 // different from the fact this whole debugger is one-shot per process.
 pub fn run(path: &str) -> i32 {
+    let (rows, cols) = match crate::pty::get_size(0) {
+        Ok(ws) if ws.rows > 0 && ws.cols > 0 => (ws.rows as usize, ws.cols as usize),
+        _ => (24, 80),
+    };
+    let buf = match TextBuffer::open(std::path::Path::new(path), rows.saturating_sub(1).max(1)) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("bish: {}: {}", path, e);
+            return 1;
+        }
+    };
     let src = match std::fs::read_to_string(path) {
         Ok(s) => s,
         Err(e) => {
@@ -353,67 +406,71 @@ pub fn run(path: &str) -> i32 {
             return 1;
         }
     };
-    let (rows, cols) = match crate::pty::get_size(0) {
-        Ok(ws) if ws.rows > 0 && ws.cols > 0 => (ws.rows as usize, ws.cols as usize),
-        _ => (24, 80),
-    };
     let Ok(_guard) = term::RawGuard::enable_with_mouse(0) else {
         eprintln!("bish: debug: not a terminal");
         return 1;
     };
     print!("\x1b[2J");
 
-    let controller = Rc::new(RefCell::new(DebugController::new(&src, rows, cols)));
+    let controller = std::rc::Rc::new(std::cell::RefCell::new(DebugController::new(buf, rows, cols)));
     let mut shell = Shell::new();
     shell.set_script_args(path.to_string(), Vec::new());
 
-    let status = loop {
-        controller.borrow().render(None);
+    loop {
+        controller.borrow().render();
         let key = match controller.borrow().read_key() {
             Some(k) => k,
-            None => break 0,
+            None => break,
         };
-        match key {
-            Key::Char('q') | Key::Escape => break 0,
-            Key::Char('r') | Key::Enter => {
-                shell.set_debug_hook(Some(controller.clone() as Rc<RefCell<dyn DebugHook>>));
-                shell.run_source_here(&src, path);
-                shell.set_debug_hook(None);
-                if controller.borrow().quit_requested {
-                    break 0;
+        let is_idle = controller.borrow().vk.is_idle();
+        // Only `q` quits -- matching real vim, Escape is purely a "cancel
+        // whatever's pending" key (a pending count/prefix, an active
+        // Visual selection) and never exits on its own; a bare Escape
+        // with nothing pending is simply a no-op, same as in the real
+        // editor, so it's not special-cased here at all and just falls
+        // through to handle_navigation_key below like any other key.
+        if is_idle {
+            match key {
+                Key::Char('q') => break,
+                Key::Char('r') | Key::Enter => {
+                    shell.set_debug_hook(Some(controller.clone() as std::rc::Rc<std::cell::RefCell<dyn DebugHook>>));
+                    shell.run_source_here(&src, path);
+                    shell.set_debug_hook(None);
+                    if controller.borrow().quit_requested {
+                        break;
+                    }
+                    controller.borrow_mut().set_status("run finished -- r/Enter: run again  q: quit".to_string());
+                    continue;
                 }
-                controller.borrow_mut().set_status("run finished -- r/Enter: run again  q: quit".to_string());
-            }
-            Key::Char('j') | Key::Down => {
-                let mut c = controller.borrow_mut();
-                let n = c.lines.len().max(1);
-                c.cursor_line = (c.cursor_line + 1).min(n);
-                let line = c.cursor_line;
-                c.scroll_to_show(line);
-            }
-            Key::Char('k') | Key::Up => {
-                let mut c = controller.borrow_mut();
-                c.cursor_line = c.cursor_line.saturating_sub(1).max(1);
-                let line = c.cursor_line;
-                c.scroll_to_show(line);
-            }
-            Key::Char('b') => {
-                let mut c = controller.borrow_mut();
-                let line = c.cursor_line;
-                c.toggle_breakpoint(line);
-            }
-            Key::Char(':') => {
-                let cmd = controller.borrow().read_colon_line();
-                if let Some(cmd) = cmd {
-                    let depth = DebugDepth { subshell_depth: 0, call_depth: 0 };
+                Key::Char('b') => {
                     let mut c = controller.borrow_mut();
-                    c.dispatch_colon_command(&cmd, depth, &shell);
+                    let line = c.buf.cursor().0 + 1;
+                    c.toggle_breakpoint(line);
+                    continue;
                 }
+                Key::Char('K') => {
+                    let mut c = controller.borrow_mut();
+                    let msg = match c.identifier_at_cursor() {
+                        Some(name) => format!("{}: not running -- start with r/Enter to inspect live values", name),
+                        None => "no identifier under the cursor".to_string(),
+                    };
+                    c.set_status(msg);
+                    continue;
+                }
+                Key::Char(':') => {
+                    let cmd = controller.borrow().read_colon_line();
+                    if let Some(cmd) = cmd {
+                        let depth = DebugDepth { subshell_depth: 0, call_depth: 0 };
+                        controller.borrow_mut().dispatch_colon_command(&cmd, depth, &shell);
+                    }
+                    continue;
+                }
+                _ => {}
             }
-            _ => {}
         }
-    };
+        controller.borrow_mut().handle_navigation_key(key);
+    }
     print!("\x1b[2J\x1b[H");
     let _ = std::io::stdout().flush();
-    status
+    0
 }

@@ -64,6 +64,17 @@ pub struct TextBuffer {
     // lines have no entry at all rather than an explicit "unchanged"
     // marker.
     pub diff: Option<std::collections::HashMap<usize, crate::git::DiffMark>>,
+    // `bish tool debug`'s own breakpoint set (see GUTTER_COLUMNS's
+    // breakpoint column in fileeditor.rs, which is what actually reads
+    // this) -- 1-based line numbers, matching how the debugger itself
+    // reports lines. Empty (the common case: an ordinary `e`-opened
+    // buffer never touches this) collapses the gutter column to zero
+    // width, same convention `blame`/`diff` already use. Deliberately
+    // *not* cleared on edit the way diagnostics/blame/diff are -- this
+    // buffer is always read-only while under debugger control, so
+    // there's never an edit to invalidate a line-indexed breakpoint set
+    // against in the first place.
+    pub breakpoints: std::collections::BTreeSet<usize>,
     // `u`/`Ctrl-R` -- a real branching tree, not a linear undo/redo stack
     // (see bishedit::undo's own module doc comment for why). Rides along
     // with the buffer exactly like `selections`/`diagnostics` (survives a
@@ -105,6 +116,7 @@ impl TextBuffer {
             diagnostics: Vec::new(),
             blame: None,
             diff: None,
+            breakpoints: std::collections::BTreeSet::new(),
             dirty: false,
             path: None,
         }
@@ -142,6 +154,7 @@ impl TextBuffer {
             diagnostics: Vec::new(),
             blame: None,
             diff: None,
+            breakpoints: std::collections::BTreeSet::new(),
             dirty: false,
             path: Some(path.to_path_buf()),
         })
@@ -568,6 +581,7 @@ mod tests {
             diagnostics: Vec::new(),
             blame: None,
             diff: None,
+            breakpoints: std::collections::BTreeSet::new(),
             dirty: false,
             path: None,
         }
