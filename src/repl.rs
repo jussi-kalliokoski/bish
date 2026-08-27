@@ -1498,6 +1498,17 @@ fn run_edit_frame(
                 if *sinks_are_grid {
                     compositor_redraw(sessions, windows, *current_window, *term_rows, *term_cols);
                 }
+                // Command mode's own colon-line (`:q`/`:q!`/`:wq`/`:x`)
+                // paints straight to the real terminal's global status row
+                // (see run_command_mode's own doc comment on why -- it
+                // bypasses the session's vt100 grid model entirely), which
+                // means it's invisible to compositor_redraw's own grid-
+                // diffed repaint just above: nothing else ever re-touches
+                // that row on the way out, so the colon-line's own last
+                // text (literally "q!") would otherwise sit there forever
+                // once this editor pane is gone.
+                print!("{}", erase_global_status_row(*term_rows));
+                let _ = io::stdout().flush();
                 return;
             }
             Ok((NavExit::Detached, Some((b, v)))) => {
