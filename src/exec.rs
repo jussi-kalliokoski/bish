@@ -1093,6 +1093,27 @@ impl Shell {
         self.sink = OutputSink::Capture(buf);
     }
 
+    // debugger.rs's own output pane: redirects a spawned *external*
+    // process's stdout into `file` instead of the real terminal, the same
+    // way `run_in_child_shell` already does for `$(...)`/`(...)` (every
+    // real-process spawn site already falls back to spawn_stdout_stdio,
+    // which consults exactly this field) -- reused directly here rather
+    // than adding a second mechanism, just applied to this Shell itself
+    // instead of a freshly `new_virtual_child`'d one. Builtin output
+    // (echo/printf/...) doesn't go through this at all -- that's
+    // set_sink_capture's job, called alongside this with a different
+    // destination (a String buffer, not a file) for the exact same
+    // reason `run_in_child_shell` keeps its own sink/stdio_override
+    // wiring separate: they're two independent output paths that only
+    // happen to need the same treatment. Matches this codebase's
+    // existing, accepted asymmetry (also true for `$(...)`): stderr isn't
+    // captured this way, only stdout -- a spawned command's own stderr
+    // still goes straight to the real terminal (see the "always inherit"
+    // comment at every `command.stderr(...)` call site).
+    pub(crate) fn set_stdout_capture_file(&mut self, file: std::fs::File) {
+        self.stdio_override = Some(Rc::new(RefCell::new(StdioOverride { stdin: None, stdout: Some(file) })));
+    }
+
     // How big a freshly-opened pty (run_single's use_pty path) should be
     // sized before a full-screen program (vim, htop, less, ...) gets to
     // query it -- otherwise it inherits whatever posix_openpt's kernel

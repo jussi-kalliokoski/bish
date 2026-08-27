@@ -53,7 +53,9 @@
 // no explicit path the same way `:git blame`/`:git diff` already do --
 // see run_command_mode's own "dbg"/"debug" match arm.
 
-use std::io::Write;
+use std::cell::RefCell;
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::rc::Rc;
 
 use crate::bishedit::registers::Registers;
 use crate::bishedit::textbuffer::TextBuffer;
@@ -107,7 +109,42 @@ pub struct DebugController {
     term_rows: usize,
     term_cols: usize,
     status: String,
+    // The running script's own output -- combined stdout+stderr from
+    // builtins (echo/printf/...) via Shell::set_sink_capture, plus a
+    // spawned *external* process's own stdout (see ext_stdout_path's own
+    // doc comment; a spawned command's stderr still goes straight to the
+    // real terminal, the same accepted asymmetry `$(...)` already has).
+    // Rendered in its own small pane below the source view by
+    // render_output_pane -- a logical child of that view exactly the way
+    // repl.rs's own `Frame::Diagnostics` can't exist without the
+    // `Frame::Edit` pane it splits off from (see that type's own doc
+    // comment): there's no window/pane machinery here to make that
+    // relationship structural (see this module's own top-of-file doc
+    // comment on why), so it's just "the other half of render()," always
+    // drawn together, never addressable on its own. Cleared at the start
+    // of every `:run`.
+    output: Rc<RefCell<String>>,
+    // A real temp file an external process's own stdout is redirected
+    // into (Shell::set_stdout_capture_file) -- unlike builtin output,
+    // which lands directly in `output` via the sink, a spawned process
+    // writes to a real fd this shell doesn't otherwise get to intercept
+    // in-process, so this is drained into `output` instead (see
+    // drain_external_output). One path, reused (truncated) across every
+    // `:run` in this debugger session rather than a fresh temp file each
+    // time -- nothing else in this one-shot-per-process tool needs it to
+    // survive past the run that wrote it.
+    ext_stdout_path: std::path::PathBuf,
+    // How much of ext_stdout_path has already been folded into `output`
+    // -- see drain_external_output's own doc comment.
+    ext_drain_offset: u64,
 }
+
+// How many of the output pane's own lines actually show at once while
+// there's real content to show -- capped so a chatty script can't crowd
+// the source view down to nothing; the pane itself still only takes up
+// a collapsed single title row when there's no output yet at all (see
+// output_pane_rows).
+const MAX_OUTPUT_CONTENT_ROWS: usize = 8;
 
 impl DebugController {
     fn new(buf: TextBuffer, term_rows: usize, term_cols: usize) -> Self {
@@ -122,22 +159,123 @@ impl DebugController {
             term_rows,
             term_cols,
             status: "hjkl/w/b/gg/G/...: navigate  K: hover  :run  :break [line]  :quit".to_string(),
+            output: Rc::new(RefCell::new(String::new())),
+            ext_stdout_path: std::env::temp_dir().join(format!("bish-debugger-stdout-{}.tmp", std::process::id())),
+            ext_drain_offset: 0,
+        }
+    }
+
+    fn output_lines(&self) -> Vec<String> {
+        self.output.borrow().lines().map(|s| s.to_string()).collect()
+    }
+
+    // 1 (just the collapsed title) when nothing's been printed this run;
+    // otherwise the title row plus up to MAX_OUTPUT_CONTENT_ROWS of the
+    // most recent lines (a `tail -f`-style view, not a scrollable one --
+    // there's no navigation into this pane, matching its "logical child,
+    // not its own addressable thing" role).
+    fn output_pane_rows(&self) -> usize {
+        let count = self.output_lines().len();
+        if count == 0 {
+            1
+        } else {
+            1 + count.min(MAX_OUTPUT_CONTENT_ROWS)
         }
     }
 
     // One row reserved at the bottom for the status line/colon-line
     // (shared, exactly like the real editor's own status row -- there's
-    // no tab bar here to also reserve a second row for).
+    // no tab bar here to also reserve a second row for), then whatever
+    // output_pane_rows wants directly above that -- the source view gets
+    // whatever's left, with at least 3 rows kept for it regardless of
+    // how much output there is.
     fn rect(&self) -> Rect {
-        Rect { row: 0, col: 0, rows: self.term_rows.saturating_sub(1).max(1), cols: self.term_cols }
+        let total = self.term_rows.saturating_sub(1).max(1);
+        let output_rows = self.output_pane_rows().min(total.saturating_sub(3));
+        Rect { row: 0, col: 0, rows: total.saturating_sub(output_rows), cols: self.term_cols }
+    }
+
+    fn output_rect(&self) -> Rect {
+        let source = self.rect();
+        let total = self.term_rows.saturating_sub(1).max(1);
+        Rect { row: source.rows, col: 0, rows: total.saturating_sub(source.rows), cols: self.term_cols }
     }
 
     fn render(&self) {
         let rect = self.rect();
         let mut out = crate::repl::render_global_status_row(&self.status, self.term_rows);
         out.push_str(&fileeditor::build_editor_frame(&self.buf, &self.vk, EditorMode::Normal, rect, rect.row, rect.col, None));
+        out.push_str(&self.render_output_pane());
         print!("{}", out);
         let _ = std::io::stdout().flush();
+    }
+
+    // Draws the output pane's own title/divider row (same "dashes +
+    // reverse-video pill + dashes" style repl.rs's own
+    // render_diagnostics_title uses for the diagnostics pane's collapsed
+    // title -- this is the same *kind* of thing, just drawn directly
+    // instead of through repl.rs's session/window/pane machinery) plus
+    // however many of the most recent output lines currently fit.
+    fn render_output_pane(&self) -> String {
+        let orect = self.output_rect();
+        let lines = self.output_lines();
+        let title = if lines.is_empty() {
+            " output (nothing printed yet) ".to_string()
+        } else {
+            format!(" output ({} line{}) ", lines.len(), if lines.len() == 1 { "" } else { "s" })
+        };
+        let pill: String = title.chars().take(orect.cols).collect();
+        let pill_len = pill.chars().count();
+        let left = 2.min(orect.cols.saturating_sub(pill_len));
+        let right = orect.cols.saturating_sub(pill_len + left);
+        let mut out = format!("\x1b[{};{}H\x1b[K", orect.row + 1, orect.col + 1);
+        out.push_str(&"─".repeat(left));
+        out.push_str("\x1b[7m");
+        out.push_str(&pill);
+        out.push_str("\x1b[0m");
+        out.push_str(&"─".repeat(right));
+
+        let content_rows = orect.rows.saturating_sub(1);
+        let shown = &lines[lines.len().saturating_sub(content_rows)..];
+        for (i, line) in shown.iter().enumerate() {
+            out.push_str(&format!("\x1b[{};{}H\x1b[K", orect.row + 2 + i, orect.col + 1));
+            let clipped: String = line.chars().take(orect.cols).collect();
+            out.push_str(&clipped);
+        }
+        out
+    }
+
+    // Rewires `shell`'s own output paths (builtin sink + external
+    // process stdout, see `output`/`ext_stdout_path`'s own doc comments)
+    // into this controller's pane and resets both to empty -- called
+    // once at the start of every `:run`, before shell.run_source_here.
+    fn begin_capturing_output(&mut self, shell: &mut Shell) {
+        self.output.borrow_mut().clear();
+        self.ext_drain_offset = 0;
+        shell.set_sink_capture(self.output.clone());
+        if let Ok(file) = std::fs::File::create(&self.ext_stdout_path) {
+            shell.set_stdout_capture_file(file);
+        }
+    }
+
+    // Folds whatever new bytes a spawned external process has written to
+    // ext_stdout_path since the last drain into `output` (builtin output
+    // lands there directly via the sink and needs no draining) --
+    // called at the top of on_statement, before deciding whether to
+    // pause, so the pane is already current the moment a breakpoint
+    // might stop here; and once more right after run_source_here returns,
+    // to catch the very last statement's own output (on_statement only
+    // ever runs *before* a statement, never after the final one).
+    fn drain_external_output(&mut self) {
+        let Ok(mut file) = std::fs::File::open(&self.ext_stdout_path) else { return };
+        if file.seek(SeekFrom::Start(self.ext_drain_offset)).is_err() {
+            return;
+        }
+        let mut buf = Vec::new();
+        if file.read_to_end(&mut buf).is_ok() && !buf.is_empty() {
+            self.ext_drain_offset += buf.len() as u64;
+            self.output.borrow_mut().push_str(&String::from_utf8_lossy(&buf));
+        }
     }
 
     fn set_status(&mut self, s: String) {
@@ -386,6 +524,7 @@ impl DebugHook for DebugController {
     // (no event loop to hand control back to here -- this is called from
     // deep inside run_program, already borrowed by whoever called it).
     fn on_statement(&mut self, line: usize, depth: DebugDepth, shell: &Shell) -> DebugAction {
+        self.drain_external_output();
         let should_pause = self.buf.breakpoints.contains(&line)
             || match self.pending_stop {
                 PendingStop::None => false,
@@ -509,11 +648,19 @@ pub fn run(path: &str) -> i32 {
                         // already under way) is handled there instead
                         // (see its own doc comment).
                         if trimmed == "r" || trimmed == "run" {
-                            controller.borrow_mut().running = true;
+                            {
+                                let mut c = controller.borrow_mut();
+                                c.running = true;
+                                c.begin_capturing_output(&mut shell);
+                            }
                             shell.set_debug_hook(Some(controller.clone() as std::rc::Rc<std::cell::RefCell<dyn DebugHook>>));
                             shell.run_source_here(&src, path);
                             shell.set_debug_hook(None);
-                            controller.borrow_mut().running = false;
+                            {
+                                let mut c = controller.borrow_mut();
+                                c.drain_external_output();
+                                c.running = false;
+                            }
                             if controller.borrow().quit_requested {
                                 break;
                             }
@@ -532,6 +679,7 @@ pub fn run(path: &str) -> i32 {
         }
         controller.borrow_mut().handle_navigation_key(key);
     }
+    let _ = std::fs::remove_file(&controller.borrow().ext_stdout_path);
     print!("\x1b[2J\x1b[H");
     let _ = std::io::stdout().flush();
     0
