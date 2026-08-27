@@ -52,15 +52,34 @@
 // against the current (or given) file, refusing on a dirty buffer with
 // no explicit path the same way `:git blame`/`:git diff` already do --
 // see run_command_mode's own "dbg"/"debug" match arm.
+//
+// `K`'s own hover content (show_hover) tries three things in order, the
+// first that has something to say wins: (1) the identifier's live value
+// while a run is active/paused (Shell::debug_peek_var, unchanged from
+// before); (2) a godoc-style `#`-comment doc attached to its definition
+// (crate::docs -- this script's own precursor to a real LSP hover, see
+// that module's own doc comment), covering both the entry script and
+// whatever it statically `source`s; (3) a man-page snippet, for a name
+// that's an external command rather than anything this script itself
+// defines (crate::bishedit::manpages, already built for highlight.rs's
+// flag/subcommand recognition and reused here as-is -- same cache, same
+// non-blocking "Pending now, ready by the next redraw" contract). Shown
+// in a small floating popup near the cursor (render_hover_popup) rather
+// than the single-line status row the old value-only hover used --
+// needed the moment a doc comment can be several lines long, and kept
+// for the single-line cases too, so `K` behaves one consistent way
+// regardless of which of the three answered it.
 
 use std::cell::RefCell;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::rc::Rc;
 
+use crate::bishedit::manpages::{self, ManStatus};
 use crate::bishedit::registers::Registers;
 use crate::bishedit::textbuffer::TextBuffer;
 use crate::bishedit::vimkeys::{KeyOutcome, Op, VimKeys};
 use crate::bishedit::Buffer as _;
+use crate::docs::DocIndex;
 use crate::editor::{self, Key};
 use crate::exec::{DebugAction, DebugDepth, DebugHook, Shell};
 use crate::fileeditor::{self, EditorMode};
@@ -137,6 +156,18 @@ pub struct DebugController {
     // How much of ext_stdout_path has already been folded into `output`
     // -- see drain_external_output's own doc comment.
     ext_drain_offset: u64,
+    // godoc-style doc comments harvested from the script itself plus
+    // whatever it statically `source`s -- built once, up front (see
+    // `run`'s own construction site), not re-scanned per hover: this
+    // standalone view has no live-editing story for the file it's
+    // debugging (read-only, see this module's own top-of-file doc
+    // comment), so nothing here can go stale mid-session.
+    docs: DocIndex,
+    // `K`'s own popup content, one entry per already-wrapped-for-width
+    // line -- empty means nothing is showing. Cleared by any key other
+    // than `K` itself (see both call sites below); rebuilt fresh every
+    // time `K` is pressed, never appended to.
+    hover_lines: Vec<String>,
 }
 
 // How many of the output pane's own lines actually show at once while
@@ -145,9 +176,29 @@ pub struct DebugController {
 // a collapsed single title row when there's no output yet at all (see
 // output_pane_rows).
 const MAX_OUTPUT_CONTENT_ROWS: usize = 8;
+// Same idea, for the K-hover popup -- a long doc comment or man-page
+// snippet gets wrapped and truncated rather than growing to cover the
+// whole source view.
+const MAX_HOVER_LINES: usize = 12;
+
+// Plain character-level wrap (not word-aware) for one hover line into
+// however many `width`-wide rows it takes -- simple, and entirely
+// adequate for the short doc comments/man snippets this actually
+// displays; a word-aware wrap wasn't worth the extra complexity for a
+// popup this size.
+fn wrap_line(line: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return vec![line.to_string()];
+    }
+    let chars: Vec<char> = line.chars().collect();
+    if chars.is_empty() {
+        return vec![String::new()];
+    }
+    chars.chunks(width).map(|c| c.iter().collect()).collect()
+}
 
 impl DebugController {
-    fn new(buf: TextBuffer, term_rows: usize, term_cols: usize) -> Self {
+    fn new(buf: TextBuffer, term_rows: usize, term_cols: usize, docs: DocIndex) -> Self {
         DebugController {
             buf,
             vk: VimKeys::new(),
@@ -162,6 +213,8 @@ impl DebugController {
             output: Rc::new(RefCell::new(String::new())),
             ext_stdout_path: std::env::temp_dir().join(format!("bish-debugger-stdout-{}.tmp", std::process::id())),
             ext_drain_offset: 0,
+            docs,
+            hover_lines: Vec::new(),
         }
     }
 
@@ -206,6 +259,7 @@ impl DebugController {
         let mut out = crate::repl::render_global_status_row(&self.status, self.term_rows);
         out.push_str(&fileeditor::build_editor_frame(&self.buf, &self.vk, EditorMode::Normal, rect, rect.row, rect.col, None));
         out.push_str(&self.render_output_pane());
+        out.push_str(&self.render_hover_popup());
         print!("{}", out);
         let _ = std::io::stdout().flush();
     }
@@ -242,6 +296,98 @@ impl DebugController {
             let clipped: String = line.chars().take(orect.cols).collect();
             out.push_str(&clipped);
         }
+        out
+    }
+
+    // The cursor's own current screen position (row, col), accounting
+    // for scroll (viewport_top/viewport_left) and the gutter (line
+    // numbers, breakpoint markers) -- render_hover_popup's own anchor
+    // point. `editor_content_cols` is the one piece of this arithmetic
+    // fileeditor.rs already exposes; the gutter width itself is just
+    // whatever's left of `rect.cols` once that's subtracted, no need for
+    // fileeditor.rs's own (private) total_gutter_width.
+    fn cursor_screen_pos(&self) -> (usize, usize) {
+        let rect = self.rect();
+        let (row, col) = self.buf.cursor();
+        let gutter_width = rect.cols.saturating_sub(fileeditor::editor_content_cols(&self.buf, rect));
+        let screen_row = rect.row + row.saturating_sub(self.buf.viewport_top());
+        let screen_col = rect.col + gutter_width + col.saturating_sub(self.buf.viewport_left());
+        (screen_row, screen_col)
+    }
+
+    // `K`'s own hover lookup -- see this module's own top-of-file doc
+    // comment for the three things tried, in order. Always produces
+    // *some* content (falling back to "no info available") so pressing
+    // `K` on an identifier always visibly does something, the same way
+    // the old value-only hover always set a status message even for a
+    // miss.
+    fn show_hover(&mut self, name: &str, shell: &Shell) {
+        let mut lines = vec![name.to_string()];
+        if let Some(value) = shell.debug_peek_var(name) {
+            lines.push(format!("= {}", value));
+        } else if let Some(doc) = self.docs.lookup(name) {
+            let kind = match doc.kind {
+                crate::docs::SymbolKind::Function => "function",
+                crate::docs::SymbolKind::Variable => "variable",
+            };
+            lines.push(format!("{} -- {}:{}", kind, doc.file.display(), doc.line));
+            lines.extend(doc.doc.iter().cloned());
+        } else {
+            match manpages::query(name) {
+                ManStatus::Ready(data) => match &data.name_section {
+                    Some(snippet) => lines.push(snippet.clone()),
+                    None => lines.push("(found a man page, but no NAME section)".to_string()),
+                },
+                ManStatus::Pending => lines.push("looking up man page... press K again in a moment".to_string()),
+                ManStatus::Missing => lines.push("no info available".to_string()),
+            }
+        }
+        self.hover_lines = lines;
+    }
+
+    fn dismiss_hover(&mut self) {
+        self.hover_lines.clear();
+    }
+
+    // Draws `hover_lines` in a small bordered popup anchored just below
+    // the cursor's own screen position (cursor_screen_pos), flipping
+    // above it when there isn't room below -- no existing generic
+    // floating-popup primitive in this codebase to reuse (the closest
+    // precedents, the completion row and the command-output overlay, are
+    // both fixed-position, not cursor-relative), so this is a small,
+    // purpose-built one, scoped to what this one caller needs. Clamped
+    // horizontally to stay within the source view's own rect so it never
+    // overlaps the output pane or status row below it.
+    fn render_hover_popup(&self) -> String {
+        if self.hover_lines.is_empty() {
+            return String::new();
+        }
+        let source = self.rect();
+        let max_width = source.cols.saturating_sub(4).clamp(10, 60);
+        let wrapped: Vec<String> = self.hover_lines.iter().flat_map(|l| wrap_line(l, max_width)).take(MAX_HOVER_LINES).collect();
+        if wrapped.is_empty() {
+            return String::new();
+        }
+        let inner_width = wrapped.iter().map(|l| l.chars().count()).max().unwrap_or(0).max(1);
+        let box_width = (inner_width + 2).min(source.cols.max(3));
+        let box_height = wrapped.len() + 2;
+
+        let (cursor_row, cursor_col) = self.cursor_screen_pos();
+        let bottom_limit = source.row + source.rows;
+        let top = if cursor_row + 1 + box_height <= bottom_limit {
+            cursor_row + 1
+        } else {
+            cursor_row.saturating_sub(box_height).max(source.row)
+        };
+        let left = cursor_col.min((source.col + source.cols).saturating_sub(box_width));
+
+        let mut out = String::new();
+        out.push_str(&format!("\x1b[{};{}H\x1b[7m╭{}╮\x1b[0m", top + 1, left + 1, "─".repeat(box_width.saturating_sub(2))));
+        for (i, line) in wrapped.iter().enumerate() {
+            let padded = format!("{:<width$}", line, width = inner_width);
+            out.push_str(&format!("\x1b[{};{}H\x1b[7m│{}│\x1b[0m", top + 2 + i, left + 1, padded));
+        }
+        out.push_str(&format!("\x1b[{};{}H\x1b[7m╰{}╯\x1b[0m", top + box_height, left + 1, "─".repeat(box_width.saturating_sub(2))));
         out
     }
 
@@ -550,14 +696,20 @@ impl DebugHook for DebugController {
                     return DebugAction::Quit;
                 }
             };
+            // Any key other than K itself dismisses a showing hover
+            // popup -- it's a transient tooltip, not a mode, so anything
+            // else the user does just closes it and still takes effect
+            // normally (see this module's own top-of-file doc comment).
+            if !matches!(key, Key::Char('K')) {
+                self.dismiss_hover();
+            }
             if self.vk.is_idle() {
                 match key {
                     Key::Char('K') => {
-                        let msg = match self.identifier_at_cursor().and_then(|name| shell.debug_peek_var(&name).map(|v| (name, v))) {
-                            Some((name, v)) => format!("{} = {}", name, v),
-                            None => "no inspectable variable under the cursor".to_string(),
-                        };
-                        self.set_status(msg);
+                        match self.identifier_at_cursor() {
+                            Some(name) => self.show_hover(&name, shell),
+                            None => self.hover_lines = vec!["no identifier under the cursor".to_string()],
+                        }
                         continue;
                     }
                     Key::Char(':') => {
@@ -606,7 +758,8 @@ pub fn run(path: &str) -> i32 {
     };
     print!("\x1b[2J");
 
-    let controller = std::rc::Rc::new(std::cell::RefCell::new(DebugController::new(buf, rows, cols)));
+    let docs = DocIndex::build(std::path::Path::new(path));
+    let controller = std::rc::Rc::new(std::cell::RefCell::new(DebugController::new(buf, rows, cols, docs)));
     let mut shell = Shell::new();
     shell.set_script_args(path.to_string(), Vec::new());
 
@@ -616,6 +769,11 @@ pub fn run(path: &str) -> i32 {
             Some(k) => k,
             None => break,
         };
+        // See on_statement's own identical dismissal -- a hover popup is
+        // a transient tooltip, not a mode.
+        if !matches!(key, Key::Char('K')) {
+            controller.borrow_mut().dismiss_hover();
+        }
         let is_idle = controller.borrow().vk.is_idle();
         // Escape is purely a "cancel whatever's pending" key (a pending
         // count/prefix, an active Visual selection) and never exits on
@@ -629,11 +787,10 @@ pub fn run(path: &str) -> i32 {
             match key {
                 Key::Char('K') => {
                     let mut c = controller.borrow_mut();
-                    let msg = match c.identifier_at_cursor() {
-                        Some(name) => format!("{}: not running -- start with :run to inspect live values", name),
-                        None => "no identifier under the cursor".to_string(),
-                    };
-                    c.set_status(msg);
+                    match c.identifier_at_cursor() {
+                        Some(name) => c.show_hover(&name, &shell),
+                        None => c.hover_lines = vec!["no identifier under the cursor".to_string()],
+                    }
                     continue;
                 }
                 Key::Char(':') => {

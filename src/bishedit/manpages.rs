@@ -28,6 +28,14 @@ use std::sync::{Arc, Mutex, OnceLock};
 pub struct ManPageData {
     pub flags: Vec<String>,
     pub subcommands: Vec<String>,
+    // The one-line summary from the page's own "NAME" section (e.g. "ls
+    // - list directory contents"), the same text `whatis`/`apropos`
+    // show -- debugger.rs's own `K` hover uses this as its "show a
+    // snippet from the manpage" fallback for an identifier that isn't a
+    // known variable/function. `None` when the page has no such section
+    // (rare, but not every page follows the convention) rather than
+    // guessing at some other line.
+    pub name_section: Option<String>,
 }
 
 pub enum ManStatus {
@@ -105,7 +113,29 @@ fn fetch_and_parse(command: &str) -> Option<ManPageData> {
     let text = strip_overstrike(&text);
     let flags = parse_flags(&text);
     let subcommands = parse_subcommands(&text, command);
-    Some(ManPageData { flags, subcommands })
+    let name_section = parse_name_section(&text);
+    Some(ManPageData { flags, subcommands, name_section })
+}
+
+// The first non-blank line after a bare "NAME" section header, trimmed --
+// real man pages format this section as one line (e.g. "ls - list
+// directory contents"). A page with no such section (or an unusually
+// multi-line one, not attempted here) yields `None` rather than a guess.
+fn parse_name_section(text: &str) -> Option<String> {
+    let mut lines = text.lines();
+    while let Some(line) = lines.next() {
+        if line.trim() != "NAME" {
+            continue;
+        }
+        for candidate in lines.by_ref() {
+            let trimmed = candidate.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+        return None;
+    }
+    None
 }
 
 // Defensive pass for `X\x08X`-style backspace-overstrike sequences some

@@ -4,6 +4,7 @@ mod builtins;
 mod compgen;
 mod csscolor;
 mod debugger;
+mod docs;
 mod editor;
 mod exec;
 mod fileeditor;
