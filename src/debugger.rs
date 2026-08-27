@@ -33,7 +33,25 @@
 // command below) -- not a call into repl.rs's real run_command_mode,
 // which needs live `&mut sessions`/`&mut windows` access unavailable
 // from mid-run_program (see DebugController::on_statement's own doc
-// comment for exactly why).
+// comment for exactly why). Every debug-specific action (run, toggle a
+// breakpoint, continue/next/step, quit) goes through this colon-line --
+// there used to also be bare single-key shortcuts for these (b/r/c/n/s/
+// q), removed after user feedback that they silently collided with what
+// those same keys already mean as real vim motions/operators (b =
+// word-back, s = substitute, n = repeat-search, c = the change operator,
+// q = start a macro recording -- none of which worked correctly while
+// debugging before this). `K` (hover the identifier under the cursor)
+// deliberately stayed a bare key: it isn't a "debug shortcut" being
+// added on top, it's the same key vim/neovim already use to show
+// info/documentation for whatever's under the cursor (keywordprg,
+// LSP hover) -- this is simply the first thing in this codebase to give
+// that convention a real implementation, not a new one.
+//
+// `:dbg [file]`/`:debug [file]` in the real file editor's own command
+// mode (run_command_mode, repl.rs) launches this same `run` entry point
+// against the current (or given) file, refusing on a dirty buffer with
+// no explicit path the same way `:git blame`/`:git diff` already do --
+// see run_command_mode's own "dbg"/"debug" match arm.
 
 use std::io::Write;
 
@@ -70,12 +88,22 @@ pub struct DebugController {
     registers: Registers,
     paused_at: Option<usize>,
     pending_stop: PendingStop,
-    // Set by `q`/Escape/a failed key read while paused -- checked by
-    // run() after run_program returns, to distinguish "the script simply
+    // Set by `:quit`/a failed key read while paused -- checked by run()
+    // after run_program returns, to distinguish "the script simply
     // finished" from "the user asked to abandon this run" (both unwind
     // through the same ExecResult::Exit path from run_program's own
     // perspective, so this is the only way run() can tell them apart).
     quit_requested: bool,
+    // Whether a script is actually mid-execution right now (true for the
+    // whole span of run()'s own run_source_here call, including every
+    // pause in between -- not just while genuinely stopped) -- lets
+    // dispatch_colon_command give a real "not running"/"already running"
+    // answer to :continue/:next/:step/:run instead of silently doing
+    // nothing, since the same colon-line is reached from both run()'s
+    // outer "nothing started yet" loop and on_statement's own paused
+    // loop, and the two contexts disagree on which of those commands
+    // make sense.
+    running: bool,
     term_rows: usize,
     term_cols: usize,
     status: String,
@@ -90,9 +118,10 @@ impl DebugController {
             paused_at: None,
             pending_stop: PendingStop::None,
             quit_requested: false,
+            running: false,
             term_rows,
             term_cols,
-            status: "r/Enter: run  b: toggle breakpoint  hjkl/w/b/gg/G/...: navigate  K: hover  ::  q: quit".to_string(),
+            status: "hjkl/w/b/gg/G/...: navigate  K: hover  :run  :break [line]  :quit".to_string(),
         }
     }
 
@@ -164,27 +193,69 @@ impl DebugController {
         Some(chars[start..end].iter().collect())
     }
 
+    // Every debug action (run/break/continue/next/step/print/quit) is
+    // reached exclusively through here now -- see this module's own
+    // top-of-file doc comment on why the earlier bare single-key
+    // shortcuts (b/r/c/n/s/q) were removed: several of them collided
+    // with what those exact keys already mean as real vim
+    // motions/operators (b = word-back, s = substitute, n = repeat-
+    // search, c = the change operator, q = start a macro recording),
+    // which made ordinary navigation subtly broken while debugging.
+    // `K` (hover) stays a bare key -- not a debug-specific shortcut but
+    // an extension of vim/neovim's own existing convention of `K`
+    // showing info about whatever's under the cursor.
     fn dispatch_colon_command(&mut self, line: &str, depth: DebugDepth, shell: &Shell) -> Option<DebugAction> {
         let line = line.trim();
         match line {
             "c" | "continue" => {
+                if !self.running {
+                    self.set_status("bish: dbg: not running -- use :run to start".to_string());
+                    return None;
+                }
                 self.paused_at = None;
                 return Some(DebugAction::Continue);
             }
             "n" | "next" => {
+                if !self.running {
+                    self.set_status("bish: dbg: not running -- use :run to start".to_string());
+                    return None;
+                }
                 self.pending_stop = PendingStop::AtOrBelow(depth);
                 self.paused_at = None;
                 return Some(DebugAction::StepOver);
             }
             "s" | "step" => {
+                if !self.running {
+                    self.set_status("bish: dbg: not running -- use :run to start".to_string());
+                    return None;
+                }
                 self.pending_stop = PendingStop::Anywhere;
                 self.paused_at = None;
                 return Some(DebugAction::StepInto);
+            }
+            // Only ever reached here while `self.running` -- run()'s own
+            // outer loop intercepts "r"/"run" itself (it's the one place
+            // that actually has the script source/Shell to start a run
+            // with), only falling through to dispatch_colon_command for
+            // everything else, so a bare `:run` can only land here once
+            // a run is already under way.
+            "r" | "run" => {
+                self.set_status("bish: dbg: already running".to_string());
+                return None;
             }
             "q" | "quit" => {
                 self.paused_at = None;
                 self.quit_requested = true;
                 return Some(DebugAction::Quit);
+            }
+            // Bare `break`/`b` (no line number) toggles at the cursor's
+            // own current line -- the direct replacement for the old
+            // bare `b` key.
+            "b" | "break" => {
+                let line = self.buf.cursor().0 + 1;
+                self.toggle_breakpoint(line);
+                self.set_status(format!("breakpoint toggled at line {}", line));
+                return None;
             }
             _ => {}
         }
@@ -201,6 +272,14 @@ impl DebugController {
                 Ok(n) => {
                     self.buf.breakpoints.remove(&n);
                     self.set_status(format!("breakpoint removed at line {}", n));
+                }
+                Err(_) => self.set_status(format!("bish: dbg: {}: invalid line number", rest)),
+            }
+        } else if let Some(rest) = line.strip_prefix("break ").or_else(|| line.strip_prefix("b ")) {
+            match rest.trim().parse::<usize>() {
+                Ok(n) => {
+                    self.toggle_breakpoint(n);
+                    self.set_status(format!("breakpoint toggled at line {}", n));
                 }
                 Err(_) => self.set_status(format!("bish: dbg: {}: invalid line number", rest)),
             }
@@ -321,7 +400,7 @@ impl DebugHook for DebugController {
         self.buf.set_cursor(line.saturating_sub(1), 0);
         let content_cols = fileeditor::editor_content_cols(&self.buf, self.rect());
         crate::repl::scroll_to_show_cursor(&mut self.buf, content_cols);
-        self.set_status(format!("paused at line {} -- c: continue  n: next  s: step  K: hover  ::  q: quit", line));
+        self.set_status(format!("paused at line {} -- K: hover  :continue  :next  :step  :quit", line));
 
         loop {
             self.render();
@@ -334,30 +413,6 @@ impl DebugHook for DebugController {
             };
             if self.vk.is_idle() {
                 match key {
-                    Key::Char('c') => {
-                        self.paused_at = None;
-                        return DebugAction::Continue;
-                    }
-                    Key::Char('n') => {
-                        self.pending_stop = PendingStop::AtOrBelow(depth);
-                        self.paused_at = None;
-                        return DebugAction::StepOver;
-                    }
-                    Key::Char('s') => {
-                        self.pending_stop = PendingStop::Anywhere;
-                        self.paused_at = None;
-                        return DebugAction::StepInto;
-                    }
-                    Key::Char('q') => {
-                        self.paused_at = None;
-                        self.quit_requested = true;
-                        return DebugAction::Quit;
-                    }
-                    Key::Char('b') => {
-                        let line = self.buf.cursor().0 + 1;
-                        self.toggle_breakpoint(line);
-                        continue;
-                    }
                     Key::Char('K') => {
                         let msg = match self.identifier_at_cursor().and_then(|name| shell.debug_peek_var(&name).map(|v| (name, v))) {
                             Some((name, v)) => format!("{} = {}", name, v),
@@ -384,7 +439,7 @@ impl DebugHook for DebugController {
 
 // `bish tool debug <script>` -- reads the file, then drives its own
 // small event loop directly (no repl.rs session/window involved). Runs
-// the whole script (a real re-run each time `r`/Enter is pressed) rather
+// the whole script (a real re-run each time `:run` is invoked) rather
 // than trying to resume execution from a stopped point -- v1's scope, no
 // different from the fact this whole debugger is one-shot per process.
 pub fn run(path: &str) -> i32 {
@@ -423,35 +478,20 @@ pub fn run(path: &str) -> i32 {
             None => break,
         };
         let is_idle = controller.borrow().vk.is_idle();
-        // Only `q` quits -- matching real vim, Escape is purely a "cancel
-        // whatever's pending" key (a pending count/prefix, an active
-        // Visual selection) and never exits on its own; a bare Escape
-        // with nothing pending is simply a no-op, same as in the real
-        // editor, so it's not special-cased here at all and just falls
-        // through to handle_navigation_key below like any other key.
+        // Escape is purely a "cancel whatever's pending" key (a pending
+        // count/prefix, an active Visual selection) and never exits on
+        // its own; a bare Escape with nothing pending is simply a no-op,
+        // same as in the real editor, so it's not special-cased here at
+        // all and just falls through to handle_navigation_key below like
+        // any other key. `K` stays a bare key -- see dispatch_colon_
+        // command's own doc comment on why it's the one exception to
+        // "every debug action goes through `:`".
         if is_idle {
             match key {
-                Key::Char('q') => break,
-                Key::Char('r') | Key::Enter => {
-                    shell.set_debug_hook(Some(controller.clone() as std::rc::Rc<std::cell::RefCell<dyn DebugHook>>));
-                    shell.run_source_here(&src, path);
-                    shell.set_debug_hook(None);
-                    if controller.borrow().quit_requested {
-                        break;
-                    }
-                    controller.borrow_mut().set_status("run finished -- r/Enter: run again  q: quit".to_string());
-                    continue;
-                }
-                Key::Char('b') => {
-                    let mut c = controller.borrow_mut();
-                    let line = c.buf.cursor().0 + 1;
-                    c.toggle_breakpoint(line);
-                    continue;
-                }
                 Key::Char('K') => {
                     let mut c = controller.borrow_mut();
                     let msg = match c.identifier_at_cursor() {
-                        Some(name) => format!("{}: not running -- start with r/Enter to inspect live values", name),
+                        Some(name) => format!("{}: not running -- start with :run to inspect live values", name),
                         None => "no identifier under the cursor".to_string(),
                     };
                     c.set_status(msg);
@@ -460,8 +500,30 @@ pub fn run(path: &str) -> i32 {
                 Key::Char(':') => {
                     let cmd = controller.borrow().read_colon_line();
                     if let Some(cmd) = cmd {
-                        let depth = DebugDepth { subshell_depth: 0, call_depth: 0 };
-                        controller.borrow_mut().dispatch_colon_command(&cmd, depth, &shell);
+                        let trimmed = cmd.trim();
+                        // "r"/"run" is intercepted here rather than in
+                        // dispatch_colon_command: this is the one place
+                        // that actually has the script source/Shell
+                        // needed to start a run at all -- everything
+                        // else that command could mean (once a run is
+                        // already under way) is handled there instead
+                        // (see its own doc comment).
+                        if trimmed == "r" || trimmed == "run" {
+                            controller.borrow_mut().running = true;
+                            shell.set_debug_hook(Some(controller.clone() as std::rc::Rc<std::cell::RefCell<dyn DebugHook>>));
+                            shell.run_source_here(&src, path);
+                            shell.set_debug_hook(None);
+                            controller.borrow_mut().running = false;
+                            if controller.borrow().quit_requested {
+                                break;
+                            }
+                            controller.borrow_mut().set_status("run finished -- :run to run again  :quit to quit".to_string());
+                        } else {
+                            let depth = DebugDepth { subshell_depth: 0, call_depth: 0 };
+                            if let Some(DebugAction::Quit) = controller.borrow_mut().dispatch_colon_command(trimmed, depth, &shell) {
+                                break;
+                            }
+                        }
                     }
                     continue;
                 }

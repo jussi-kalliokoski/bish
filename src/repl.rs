@@ -5025,15 +5025,25 @@ fn run_normal_mode_navigation(
                     // result visible via PendingView::Output rather than
                     // just render_nav_frame's ordinary status bar (see
                     // PendingView's own doc comment for how it's resolved
-                    // on the very next key). handle_command_mode has
-                    // already done the baseline compositor_redraw this
-                    // paints on top of.
+                    // on the very next key). render_nav_frame runs first
+                    // regardless of which branch this takes -- NOT just
+                    // handle_command_mode's own baseline compositor_
+                    // redraw (which reads this pane's session grid, and
+                    // for a `NavBuffer::Editable` pane that grid is never
+                    // actually fed while the real editor content is being
+                    // driven -- see fileeditor::freeze_editor_frame's own
+                    // doc comment -- so relying on it alone painted a
+                    // blank pane under any error/output overlay). Once
+                    // this repaints the real content, the overlay (when
+                    // shown) only ever overwrites its own reserved bottom
+                    // rows on top of it (see build_command_output_
+                    // overlay's own doc comment on why it no longer
+                    // blanks anything above them).
                     CommandModeOutcome::Ran { output, status } => {
+                        render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides);
                         if !output.is_empty() || status != 0 {
                             render_command_output_overlay(&output, status, *term_rows, *term_cols);
                             pending_view = PendingView::Output;
-                        } else {
-                            render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides);
                         }
                         continue;
                     }
@@ -5649,10 +5659,19 @@ fn build_command_output_overlay(output: &str, status: i32, term_rows: usize, ter
 
     let start_row = prompt_row.saturating_sub(shown.len());
     let mut out = String::new();
-    for r in 0..start_row {
-        out.push_str(&format!("\x1b[{};1H", r + 1));
-        out.push_str(&" ".repeat(term_cols));
-    }
+    // Deliberately does NOT blank rows 0..start_row: this overlay is
+    // reused for both the plain scrollback view (nothing meaningful
+    // above it) AND Frame::Edit's own real file content (very much
+    // meaningful) -- the caller in the latter case (run_normal_mode_
+    // navigation's own CommandModeOutcome::Ran arm) never repaints the
+    // real buffer before showing an error/short-output overlay, so a
+    // blanket wipe here used to erase the visible file to a blank
+    // screen for however long the overlay stayed up. Any leftover text
+    // from a *taller* previous overlay is already handled: the very
+    // next keystroke resolves PendingView::Output with a real
+    // render_nav_frame redraw before doing anything else (see
+    // PendingView's own doc comment), so nothing stale can persist past
+    // one keypress.
     for (i, line) in shown.iter().enumerate() {
         out.push_str(&format!("\x1b[{};1H", start_row + i + 1));
         out.push_str(&styled_full_width_line(line, bg, fg, term_cols));
@@ -6151,6 +6170,62 @@ fn run_command_mode(
                             show_command_mode_error(&format!("bish: format: unexpected argument '{}'", arg.unwrap_or_default()), *term_rows, *term_cols);
                             buffer.clear();
                             continue;
+                        }
+                        // `dbg`/`debug [FILE]`: launches the standalone
+                        // script debugger (crate::debugger::run) against
+                        // FILE, or this buffer's own file when no
+                        // argument is given -- same "refuse on a dirty
+                        // buffer with no explicit path" rule `git blame`/
+                        // `git diff` already use, since the debugger reads
+                        // the file fresh off disk rather than this
+                        // buffer's own in-memory content. debugger::run
+                        // draws straight to the real terminal exactly
+                        // like this editor's own live content already
+                        // does (see its own module doc comment) -- no
+                        // window/pane of its own, it just takes over
+                        // until it exits, same as this whole call
+                        // already blocks for `w`/`format`/etc. Its own
+                        // (nested) RawGuard::enable_with_mouse re-enables
+                        // real mouse reporting on the way in and turns it
+                        // back off on the way out (Drop) -- harmless for
+                        // the termios flags themselves (already raw, see
+                        // this loop's own outer guard in run_normal_mode_
+                        // navigation) but it does leave mouse reporting
+                        // off afterward, since Drop can't know an outer
+                        // guard still wants it on -- restored explicitly
+                        // below. Returning `Ran{status: 0}` regardless of
+                        // the debugger's own return code: that code
+                        // reflects whether the debugger *tool itself* ran
+                        // (already validated below), not the debugged
+                        // script's own exit status, which has no
+                        // meaningful place in this transcript.
+                        "dbg" | "debug" => {
+                            let target = match arg {
+                                Some(p) => std::path::PathBuf::from(p),
+                                None => match tb.path() {
+                                    Some(p) => p.to_path_buf(),
+                                    None => {
+                                        show_command_mode_error("bish: dbg: no file name", *term_rows, *term_cols);
+                                        buffer.clear();
+                                        continue;
+                                    }
+                                },
+                            };
+                            if arg.is_none() && tb.is_dirty() {
+                                show_command_mode_error("bish: dbg: E37: no write since last change -- save first with :w", *term_rows, *term_cols);
+                                buffer.clear();
+                                continue;
+                            }
+                            if !target.is_file() {
+                                show_command_mode_error(&format!("bish: dbg: {}: no such file", target.display()), *term_rows, *term_cols);
+                                buffer.clear();
+                                continue;
+                            }
+                            crate::debugger::run(&target.to_string_lossy());
+                            print!("{}", term::MOUSE_REPORTING_ENABLE);
+                            let _ = io::stdout().flush();
+                            sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry { command: trimmed, output: String::new(), status: 0 });
+                            return CommandModeOutcome::Ran { output: String::new(), status: 0 };
                         }
                         // `git SUBCOMMAND...`: the editor's own git
                         // integration, entirely optional (see crate::git's
