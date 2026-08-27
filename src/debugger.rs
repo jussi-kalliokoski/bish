@@ -74,7 +74,6 @@ use std::cell::RefCell;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::rc::Rc;
 
-use crate::bishedit::manpages::{self, ManStatus};
 use crate::bishedit::registers::Registers;
 use crate::bishedit::textbuffer::TextBuffer;
 use crate::bishedit::vimkeys::{KeyOutcome, Op, VimKeys};
@@ -176,26 +175,6 @@ pub struct DebugController {
 // a collapsed single title row when there's no output yet at all (see
 // output_pane_rows).
 const MAX_OUTPUT_CONTENT_ROWS: usize = 8;
-// Same idea, for the K-hover popup -- a long doc comment or man-page
-// snippet gets wrapped and truncated rather than growing to cover the
-// whole source view.
-const MAX_HOVER_LINES: usize = 12;
-
-// Plain character-level wrap (not word-aware) for one hover line into
-// however many `width`-wide rows it takes -- simple, and entirely
-// adequate for the short doc comments/man snippets this actually
-// displays; a word-aware wrap wasn't worth the extra complexity for a
-// popup this size.
-fn wrap_line(line: &str, width: usize) -> Vec<String> {
-    if width == 0 {
-        return vec![line.to_string()];
-    }
-    let chars: Vec<char> = line.chars().collect();
-    if chars.is_empty() {
-        return vec![String::new()];
-    }
-    chars.chunks(width).map(|c| c.iter().collect()).collect()
-}
 
 impl DebugController {
     fn new(buf: TextBuffer, term_rows: usize, term_cols: usize, docs: DocIndex) -> Self {
@@ -315,34 +294,12 @@ impl DebugController {
         (screen_row, screen_col)
     }
 
-    // `K`'s own hover lookup -- see this module's own top-of-file doc
-    // comment for the three things tried, in order. Always produces
-    // *some* content (falling back to "no info available") so pressing
-    // `K` on an identifier always visibly does something, the same way
-    // the old value-only hover always set a status message even for a
-    // miss.
+    // `K`'s own hover lookup -- docs::hover_lines (shared with repl.rs's
+    // real file editor) does the actual three-tier lookup; this just
+    // supplies the one thing only a debugger session actually has, the
+    // identifier's live value.
     fn show_hover(&mut self, name: &str, shell: &Shell) {
-        let mut lines = vec![name.to_string()];
-        if let Some(value) = shell.debug_peek_var(name) {
-            lines.push(format!("= {}", value));
-        } else if let Some(doc) = self.docs.lookup(name) {
-            let kind = match doc.kind {
-                crate::docs::SymbolKind::Function => "function",
-                crate::docs::SymbolKind::Variable => "variable",
-            };
-            lines.push(format!("{} -- {}:{}", kind, doc.file.display(), doc.line));
-            lines.extend(doc.doc.iter().cloned());
-        } else {
-            match manpages::query(name) {
-                ManStatus::Ready(data) => match &data.name_section {
-                    Some(snippet) => lines.push(snippet.clone()),
-                    None => lines.push("(found a man page, but no NAME section)".to_string()),
-                },
-                ManStatus::Pending => lines.push("looking up man page... press K again in a moment".to_string()),
-                ManStatus::Missing => lines.push("no info available".to_string()),
-            }
-        }
-        self.hover_lines = lines;
+        self.hover_lines = crate::docs::hover_lines(name, shell.debug_peek_var(name).as_deref(), &self.docs);
     }
 
     fn dismiss_hover(&mut self) {
@@ -350,45 +307,11 @@ impl DebugController {
     }
 
     // Draws `hover_lines` in a small bordered popup anchored just below
-    // the cursor's own screen position (cursor_screen_pos), flipping
-    // above it when there isn't room below -- no existing generic
-    // floating-popup primitive in this codebase to reuse (the closest
-    // precedents, the completion row and the command-output overlay, are
-    // both fixed-position, not cursor-relative), so this is a small,
-    // purpose-built one, scoped to what this one caller needs. Clamped
-    // horizontally to stay within the source view's own rect so it never
-    // overlaps the output pane or status row below it.
+    // the cursor's own screen position -- see fileeditor::render_hover_
+    // popup's own doc comment (shared with repl.rs's real file editor).
     fn render_hover_popup(&self) -> String {
-        if self.hover_lines.is_empty() {
-            return String::new();
-        }
-        let source = self.rect();
-        let max_width = source.cols.saturating_sub(4).clamp(10, 60);
-        let wrapped: Vec<String> = self.hover_lines.iter().flat_map(|l| wrap_line(l, max_width)).take(MAX_HOVER_LINES).collect();
-        if wrapped.is_empty() {
-            return String::new();
-        }
-        let inner_width = wrapped.iter().map(|l| l.chars().count()).max().unwrap_or(0).max(1);
-        let box_width = (inner_width + 2).min(source.cols.max(3));
-        let box_height = wrapped.len() + 2;
-
         let (cursor_row, cursor_col) = self.cursor_screen_pos();
-        let bottom_limit = source.row + source.rows;
-        let top = if cursor_row + 1 + box_height <= bottom_limit {
-            cursor_row + 1
-        } else {
-            cursor_row.saturating_sub(box_height).max(source.row)
-        };
-        let left = cursor_col.min((source.col + source.cols).saturating_sub(box_width));
-
-        let mut out = String::new();
-        out.push_str(&format!("\x1b[{};{}H\x1b[7m╭{}╮\x1b[0m", top + 1, left + 1, "─".repeat(box_width.saturating_sub(2))));
-        for (i, line) in wrapped.iter().enumerate() {
-            let padded = format!("{:<width$}", line, width = inner_width);
-            out.push_str(&format!("\x1b[{};{}H\x1b[7m│{}│\x1b[0m", top + 2 + i, left + 1, padded));
-        }
-        out.push_str(&format!("\x1b[{};{}H\x1b[7m╰{}╯\x1b[0m", top + box_height, left + 1, "─".repeat(box_width.saturating_sub(2))));
-        out
+        fileeditor::render_hover_popup(&self.hover_lines, cursor_row, cursor_col, self.rect())
     }
 
     // Rewires `shell`'s own output paths (builtin sink + external
@@ -464,17 +387,11 @@ impl DebugController {
     }
 
     // Identifier under the cursor's own column on its own line -- `K`'s
-    // own hover target.
+    // own hover target (docs::identifier_at, shared with repl.rs's real
+    // file editor).
     fn identifier_at_cursor(&self) -> Option<String> {
         let (row, col) = self.buf.cursor();
-        let chars = self.buf.line_chars(row);
-        let is_ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
-        if col >= chars.len() || !is_ident(chars[col]) {
-            return None;
-        }
-        let start = (0..=col).rev().take_while(|&i| is_ident(chars[i])).last().unwrap_or(col);
-        let end = (col..chars.len()).take_while(|&i| is_ident(chars[i])).count() + col;
-        Some(chars[start..end].iter().collect())
+        crate::docs::identifier_at(&self.buf.line_chars(row), col)
     }
 
     // Every debug action (run/break/continue/next/step/print/quit) is
@@ -758,7 +675,7 @@ pub fn run(path: &str) -> i32 {
     };
     print!("\x1b[2J");
 
-    let docs = DocIndex::build(std::path::Path::new(path));
+    let docs = DocIndex::build_from_source(&src, std::path::Path::new(path));
     let controller = std::rc::Rc::new(std::cell::RefCell::new(DebugController::new(buf, rows, cols, docs)));
     let mut shell = Shell::new();
     shell.set_script_args(path.to_string(), Vec::new());

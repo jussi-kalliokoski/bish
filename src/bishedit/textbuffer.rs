@@ -239,11 +239,22 @@ impl TextBuffer {
     // `path` overrides `self.path` for this write and, if this buffer had
     // none yet, becomes the buffer's own path afterward -- vim's own
     // ":w newname" behavior on an unnamed buffer.
-    pub fn save(&mut self, path: Option<&Path>) -> io::Result<()> {
-        let target = path.or(self.path.as_deref()).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "No file name"))?;
+    // The buffer's own full text, `\n`-joined with a trailing newline --
+    // `save`'s own inverse (what actually gets written to disk). Also
+    // used by anything that needs an ordinary, re-parseable source
+    // string rather than this buffer's line-based representation --
+    // e.g. `K`-hover's own doc-comment lookup (repl.rs/docs.rs), which
+    // parses the *live* in-memory buffer so a not-yet-saved edit is
+    // reflected immediately, rather than requiring a `:w` first.
+    pub fn text(&self) -> String {
         let mut text: String = self.lines.iter().map(|l| l.iter().collect::<String>()).collect::<Vec<_>>().join("\n");
         text.push('\n');
-        std::fs::write(target, text)?;
+        text
+    }
+
+    pub fn save(&mut self, path: Option<&Path>) -> io::Result<()> {
+        let target = path.or(self.path.as_deref()).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "No file name"))?;
+        std::fs::write(target, self.text())?;
         if self.path.is_none() {
             self.path = Some(target.to_path_buf());
         }

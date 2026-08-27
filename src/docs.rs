@@ -52,15 +52,27 @@ pub struct DocIndex {
 }
 
 impl DocIndex {
-    // Scans `entry_path` and, recursively, every file it statically
-    // `source`s -- see this module's own doc comment. Best-effort: a
-    // file that can't be read or fails to parse just contributes nothing
-    // rather than aborting the whole scan (matching debugger.rs's own
-    // "never let a documentation feature crash the debugger" posture).
-    pub fn build(entry_path: &Path) -> DocIndex {
+    // Scans `src` (the entry script's own text -- both callers already
+    // have this in memory: debugger.rs reads the file once up front,
+    // repl.rs's live file editor takes it straight from the buffer, an
+    // unsaved edit included) and, recursively, every file it statically
+    // `source`s (those genuinely are read fresh off disk -- there's no
+    // live buffer for them to prefer) -- see this module's own doc
+    // comment. Best-effort throughout: a file that can't be read or
+    // fails to parse just contributes nothing rather than aborting the
+    // whole scan. `entry_path` is what any `source` the script itself
+    // makes gets resolved relative to, and what the entry file's own
+    // symbols are attributed to -- it doesn't need to actually exist on
+    // disk with matching content for that (a brand new, not-yet-saved
+    // buffer). Pre-seeds the visited-set with `entry_path` itself so a
+    // `source` that happens to point back at the very file being scanned
+    // re-uses `src` (and doesn't re-read what might be stale disk
+    // content, if it's actually a live buffer with unsaved changes).
+    pub fn build_from_source(src: &str, entry_path: &Path) -> DocIndex {
         let mut symbols = HashMap::new();
         let mut visited = HashSet::new();
-        scan_file(entry_path, &mut symbols, &mut visited);
+        visited.insert(std::fs::canonicalize(entry_path).unwrap_or_else(|_| entry_path.to_path_buf()));
+        scan_source(src, entry_path, &mut symbols, &mut visited);
         DocIndex { symbols }
     }
 
@@ -75,7 +87,15 @@ fn scan_file(path: &Path, symbols: &mut HashMap<String, SymbolDoc>, visited: &mu
         return; // already scanned, or a source cycle -- either way, stop here.
     }
     let Ok(src) = std::fs::read_to_string(path) else { return };
-    let Ok(toks) = Lexer::new(&src).tokenize() else { return };
+    scan_source(&src, path, symbols, visited);
+}
+
+// The shared "given source text and the path it's attributed to" half
+// of scan_file/build_from_source -- the only difference between reading
+// a file fresh off disk and scanning an already-in-memory buffer is
+// where `src` came from.
+fn scan_source(src: &str, path: &Path, symbols: &mut HashMap<String, SymbolDoc>, visited: &mut HashSet<PathBuf>) {
+    let Ok(toks) = Lexer::new(src).tokenize() else { return };
     let Ok(program) = Parser::new(toks).parse_program() else { return };
     let lines: Vec<&str> = src.lines().collect();
 
@@ -241,6 +261,58 @@ fn resolve_source_path(raw: &str, from_file: &Path) -> Option<PathBuf> {
     candidate.is_file().then_some(candidate)
 }
 
+// The identifier (`[A-Za-z0-9_]+`) touching column `col` of `chars` --
+// `K`-hover's own "what's actually under the cursor" target, shared by
+// both `K`'s callers (debugger.rs's own read-only view, repl.rs's real
+// file editor). `None` when the cursor isn't sitting on one at all.
+pub fn identifier_at(chars: &[char], col: usize) -> Option<String> {
+    let is_ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    if col >= chars.len() || !is_ident(chars[col]) {
+        return None;
+    }
+    let start = (0..=col).rev().take_while(|&i| is_ident(chars[i])).last().unwrap_or(col);
+    let end = (col..chars.len()).take_while(|&i| is_ident(chars[i])).count() + col;
+    Some(chars[start..end].iter().collect())
+}
+
+// `K`'s own shared hover content, tried in order until one has
+// something to say: (1) `live_value`, when the caller already has one
+// to offer (debugger.rs's own `Shell::debug_peek_var`, while a run is
+// active -- repl.rs's plain file editor has no running script to ask,
+// so it always passes `None` here); (2) a godoc-style doc comment from
+// `index`; (3) a man-page snippet for an external command, via
+// `bishedit::manpages`' existing cached, non-blocking `query` (never
+// spawns `man` synchronously -- see that module's own doc comment on
+// why that matters for a caller sitting in a blocking UI loop). Always
+// produces at least one line (the name itself) plus some answer, so `K`
+// visibly does something even on a miss.
+pub fn hover_lines(name: &str, live_value: Option<&str>, index: &DocIndex) -> Vec<String> {
+    let mut lines = vec![name.to_string()];
+    if let Some(value) = live_value {
+        lines.push(format!("= {}", value));
+        return lines;
+    }
+    if let Some(doc) = index.lookup(name) {
+        let kind = match doc.kind {
+            SymbolKind::Function => "function",
+            SymbolKind::Variable => "variable",
+        };
+        lines.push(format!("{} -- {}:{}", kind, doc.file.display(), doc.line));
+        lines.extend(doc.doc.iter().cloned());
+    } else {
+        use crate::bishedit::manpages::{self, ManStatus};
+        match manpages::query(name) {
+            ManStatus::Ready(data) => match &data.name_section {
+                Some(snippet) => lines.push(snippet.clone()),
+                None => lines.push("(found a man page, but no NAME section)".to_string()),
+            },
+            ManStatus::Pending => lines.push("looking up man page... press K again in a moment".to_string()),
+            ManStatus::Missing => lines.push("no info available".to_string()),
+        }
+    }
+    lines
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -256,7 +328,7 @@ mod tests {
     #[test]
     fn a_comment_block_directly_above_a_function_becomes_its_doc() {
         let path = write_temp("fn1.sh", "# greet prints a friendly greeting.\n# name: who to greet.\ngreet() {\n    echo \"hi $1\"\n}\n");
-        let index = DocIndex::build(&path);
+        let index = DocIndex::build_from_source(&std::fs::read_to_string(&path).unwrap(), &path);
         let doc = index.lookup("greet").expect("greet should have a doc");
         assert!(matches!(doc.kind, SymbolKind::Function));
         assert_eq!(doc.doc, vec!["greet prints a friendly greeting.".to_string(), "name: who to greet.".to_string()]);
@@ -265,14 +337,14 @@ mod tests {
     #[test]
     fn a_blank_line_between_the_comment_and_the_declaration_breaks_the_attachment() {
         let path = write_temp("fn2.sh", "# not attached, a blank line separates this from the function\n\ngreet() {\n    echo hi\n}\n");
-        let index = DocIndex::build(&path);
+        let index = DocIndex::build_from_source(&std::fs::read_to_string(&path).unwrap(), &path);
         assert!(index.lookup("greet").is_none());
     }
 
     #[test]
     fn a_top_level_bare_assignment_can_have_a_doc_too() {
         let path = write_temp("var1.sh", "# MAX_RETRIES caps how many times we retry.\nMAX_RETRIES=3\n");
-        let index = DocIndex::build(&path);
+        let index = DocIndex::build_from_source(&std::fs::read_to_string(&path).unwrap(), &path);
         let doc = index.lookup("MAX_RETRIES").expect("MAX_RETRIES should have a doc");
         assert!(matches!(doc.kind, SymbolKind::Variable));
         assert_eq!(doc.doc, vec!["MAX_RETRIES caps how many times we retry.".to_string()]);
@@ -281,7 +353,7 @@ mod tests {
     #[test]
     fn a_declare_form_assignment_is_recognized_too() {
         let path = write_temp("var2.sh", "# TIMEOUT bounds how long we wait.\ndeclare -i TIMEOUT=30\n");
-        let index = DocIndex::build(&path);
+        let index = DocIndex::build_from_source(&std::fs::read_to_string(&path).unwrap(), &path);
         assert!(index.lookup("TIMEOUT").is_some());
     }
 
@@ -291,7 +363,7 @@ mod tests {
         let _ = std::fs::create_dir_all(&dir);
         std::fs::write(dir.join("lib.sh"), "# helper does the real work.\nhelper() {\n    echo helping\n}\n").unwrap();
         let entry = write_temp("main1.sh", "source lib.sh\nhelper\n");
-        let index = DocIndex::build(&entry);
+        let index = DocIndex::build_from_source(&std::fs::read_to_string(&entry).unwrap(), &entry);
         let doc = index.lookup("helper").expect("helper should be found via source");
         assert_eq!(doc.doc, vec!["helper does the real work.".to_string()]);
     }
@@ -302,7 +374,7 @@ mod tests {
         let _ = std::fs::create_dir_all(&dir);
         std::fs::write(dir.join("dynlib.sh"), "# helper2 also does real work.\nhelper2() {\n    echo helping\n}\n").unwrap();
         let entry = write_temp("main2.sh", "LIB_DIR=\"$PWD\"\nsource \"$LIB_DIR/dynlib.sh\"\n");
-        let index = DocIndex::build(&entry);
+        let index = DocIndex::build_from_source(&std::fs::read_to_string(&entry).unwrap(), &entry);
         assert!(index.lookup("helper2").is_none());
     }
 
@@ -312,7 +384,7 @@ mod tests {
         let _ = std::fs::create_dir_all(&dir);
         std::fs::write(dir.join("lib3.sh"), "# from the library.\nshared() { :; }\n").unwrap();
         let entry = write_temp("main3.sh", "# from the entry script.\nshared() { :; }\nsource lib3.sh\n");
-        let index = DocIndex::build(&entry);
+        let index = DocIndex::build_from_source(&std::fs::read_to_string(&entry).unwrap(), &entry);
         assert_eq!(index.lookup("shared").unwrap().doc, vec!["from the entry script.".to_string()]);
     }
 }

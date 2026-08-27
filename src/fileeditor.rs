@@ -98,6 +98,63 @@ pub(crate) fn editor_content_cols(buf: &TextBuffer, rect: Rect) -> usize {
     rect.cols - gutter_width
 }
 
+// `K`-hover's own popup rendering, shared by debugger.rs's own read-only
+// view and repl.rs's real file editor (see docs.rs's own hover_lines for
+// the content half of this same sharing) -- no existing generic
+// floating-popup primitive in this codebase to reuse otherwise (the
+// closest precedents, the completion row and the command-output
+// overlay, are both fixed-position, not cursor-relative). Anchored just
+// below `cursor_row`/`cursor_col` (already screen-relative -- see each
+// caller's own cursor_screen_pos-style helper), flipping above when
+// there isn't room below, clamped to stay within `rect` so it never
+// overlaps whatever sits below the source view (a status row, an output
+// pane, ...).
+pub(crate) fn render_hover_popup(lines: &[String], cursor_row: usize, cursor_col: usize, rect: Rect) -> String {
+    if lines.is_empty() {
+        return String::new();
+    }
+    let max_width = rect.cols.saturating_sub(4).clamp(10, 60);
+    let wrapped: Vec<String> = lines.iter().flat_map(|l| wrap_hover_line(l, max_width)).take(12).collect();
+    if wrapped.is_empty() {
+        return String::new();
+    }
+    let inner_width = wrapped.iter().map(|l| l.chars().count()).max().unwrap_or(0).max(1);
+    let box_width = (inner_width + 2).min(rect.cols.max(3));
+    let box_height = wrapped.len() + 2;
+
+    let bottom_limit = rect.row + rect.rows;
+    let top = if cursor_row + 1 + box_height <= bottom_limit {
+        cursor_row + 1
+    } else {
+        cursor_row.saturating_sub(box_height).max(rect.row)
+    };
+    let left = cursor_col.min((rect.col + rect.cols).saturating_sub(box_width));
+
+    let mut out = String::new();
+    out.push_str(&format!("\x1b[{};{}H\x1b[7m╭{}╮\x1b[0m", top + 1, left + 1, "─".repeat(box_width.saturating_sub(2))));
+    for (i, line) in wrapped.iter().enumerate() {
+        let padded = format!("{:<width$}", line, width = inner_width);
+        out.push_str(&format!("\x1b[{};{}H\x1b[7m│{}│\x1b[0m", top + 2 + i, left + 1, padded));
+    }
+    out.push_str(&format!("\x1b[{};{}H\x1b[7m╰{}╯\x1b[0m", top + box_height, left + 1, "─".repeat(box_width.saturating_sub(2))));
+    out
+}
+
+// Plain character-level wrap (not word-aware) for one hover line into
+// however many `width`-wide rows it takes -- simple, and entirely
+// adequate for the short doc comments/man snippets this actually
+// displays.
+fn wrap_hover_line(line: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return vec![line.to_string()];
+    }
+    let chars: Vec<char> = line.chars().collect();
+    if chars.is_empty() {
+        return vec![String::new()];
+    }
+    chars.chunks(width).map(|c| c.iter().collect()).collect()
+}
+
 // `d{motion}`/`c{motion}`: resolves `motion` against the buffer's own
 // current cursor, removes that range (`TextBuffer::delete_range` already
 // does both the extraction *and* the removal in one call -- simpler than
