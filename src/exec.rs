@@ -4392,8 +4392,19 @@ impl Shell {
         let mut command = Command::new(exe);
         command.arg("-c").arg(script);
         command.current_dir(&self.cwd);
-        command.stdin(redirs.stdin.unwrap_or_else(Stdio::inherit));
-        command.stdout(redirs.stdout.unwrap_or_else(Stdio::inherit));
+        // Only the foreground case (reached here for a numbered-fd
+        // redirect this shell has no in-process model for -- see
+        // compound_redirects_are_simple's own doc comment) should honor a
+        // converted enclosing capture; a genuinely backgrounded job is a
+        // real, detached process and should inherit the real terminal
+        // regardless, same as run_multi's own backgrounded pipelines.
+        if background {
+            command.stdin(redirs.stdin.unwrap_or_else(Stdio::inherit));
+            command.stdout(redirs.stdout.unwrap_or_else(Stdio::inherit));
+        } else {
+            command.stdin(redirs.stdin.unwrap_or_else(|| self.spawn_stdin_stdio()));
+            command.stdout(redirs.stdout.unwrap_or_else(|| self.spawn_stdout_stdio()));
+        }
         command.stderr(redirs.stderr.unwrap_or_else(Stdio::inherit));
         apply_fd_redirects(&mut command, redirs.dup_stderr_to_stdout, redirs.extra_fds);
         // Real job control isolation for a *backgrounded* redirected
@@ -5240,6 +5251,18 @@ impl Shell {
                 let mut ext = Command::new(&argv[i]);
                 ext.args(&argv[i + 1..]);
                 ext.current_dir(&self.cwd);
+                // Without these, `command foo` would always inherit the
+                // real process's own stdio, invisible to a converted
+                // foreground subshell/command-substitution/proc-sub's own
+                // capture (see spawn_stdin_stdio/spawn_stdout_stdio's own
+                // doc comment) -- confirmed the hard way: `mise`'s own
+                // activation script shadows itself with a `mise()`
+                // function that calls `command "$__MISE_EXE" ...` to reach
+                // the real binary, so `$(mise hook-env ...)` from inside
+                // it went straight through this path, silently landing on
+                // the real terminal instead of being captured.
+                ext.stdin(self.spawn_stdin_stdio());
+                ext.stdout(self.spawn_stdout_stdio());
                 // See apply_fd_redirects' pre_exec comment: without this,
                 // `command foo` would inherit bish's own ignored SIGINT
                 // and never respond to Ctrl-C.
@@ -9997,6 +10020,24 @@ mod tests {
         let buf = capture_output(&mut shell);
         shell.run_source_here("echo one\necho two\necho three\n", "<test>");
         assert_eq!(buf.borrow().as_str(), "one\n", "should stop after the first statement, never reaching the third");
+    }
+
+    // The `command` builtin has its own separate external-process spawn
+    // path (distinct from run_single's), which used to always default to
+    // Stdio::inherit() -- invisible to a converted foreground subshell/
+    // command-substitution's own capture (run_in_child_shell's own
+    // stdio_override), so a real command's real output would land
+    // straight on the real terminal instead of being captured. Caught via
+    // a real shell script (`mise`'s own bash activation shadows itself
+    // with a `mise()` function that reaches the real binary via
+    // `command "$__MISE_EXE" ...`, so every `$(mise ...)` from inside its
+    // own hooks went straight through this path).
+    #[test]
+    fn command_builtin_honors_an_enclosing_command_substitution_capture() {
+        let mut shell = Shell::new();
+        let buf = capture_output(&mut shell);
+        shell.run_source_here(r#"x=$(command /bin/echo captured); echo "got:$x""#, "<test>");
+        assert_eq!(buf.borrow().as_str(), "got:captured\n");
     }
 
     fn strs(words: &[&str]) -> Vec<String> {
