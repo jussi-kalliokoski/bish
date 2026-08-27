@@ -447,6 +447,7 @@ mod tests {
             flags: vec!["-l".to_string(), "--long".to_string(), "-a".to_string()],
             subcommands: vec![],
             name_section: None,
+            flag_descriptions: std::collections::HashMap::new(),
         };
         let names = display_names(flag_candidates_core(Some(&man), "-l"));
         assert_eq!(names, vec!["-l".to_string(), "--long".to_string()]);
@@ -459,7 +460,7 @@ mod tests {
 
     #[test]
     fn subcommand_candidates_core_returns_none_when_page_has_no_subcommands() {
-        let man = manpages::ManPageData { flags: vec!["-l".to_string()], subcommands: vec![], name_section: None };
+        let man = manpages::ManPageData { flags: vec!["-l".to_string()], subcommands: vec![], name_section: None, flag_descriptions: std::collections::HashMap::new() };
         assert_eq!(subcommand_candidates_core(Some(&man), "co"), None);
         assert_eq!(subcommand_candidates_core(None, "co"), None);
     }
@@ -473,6 +474,7 @@ mod tests {
             flags: vec![],
             subcommands: vec!["commit".to_string(), "config".to_string(), "count-objects".to_string(), "checkout".to_string()],
             name_section: None,
+            flag_descriptions: std::collections::HashMap::new(),
         };
         let names = display_names(subcommand_candidates_core(Some(&man), "co").unwrap());
         assert_eq!(names.last().map(String::as_str), Some("checkout"), "{names:?}");

@@ -53,17 +53,21 @@
 // no explicit path the same way `:git blame`/`:git diff` already do --
 // see run_command_mode's own "dbg"/"debug" match arm.
 //
-// `K`'s own hover content (show_hover) tries three things in order, the
-// first that has something to say wins: (1) the identifier's live value
-// while a run is active/paused (Shell::debug_peek_var, unchanged from
-// before); (2) a godoc-style `#`-comment doc attached to its definition
-// (crate::docs -- this script's own precursor to a real LSP hover, see
-// that module's own doc comment), covering both the entry script and
-// whatever it statically `source`s; (3) a man-page snippet, for a name
-// that's an external command rather than anything this script itself
-// defines (crate::bishedit::manpages, already built for highlight.rs's
-// flag/subcommand recognition and reused here as-is -- same cache, same
-// non-blocking "Pending now, ready by the next redraw" contract). Shown
+// `K`'s own hover content (show_hover_at_cursor, docs::hover_lines_at)
+// tries, in order, the first that has something to say: (1) the
+// identifier's live value while a run is active/paused (Shell::
+// debug_peek_var, unchanged from before); (2) a godoc-style `#`-comment
+// doc attached to its definition (crate::docs -- this script's own
+// precursor to a real LSP hover, see that module's own doc comment),
+// covering both the entry script and whatever it statically `source`s;
+// (3) for a bare word that's actually sitting in a command/subcommand/
+// flag position (crate::docs::classify_word -- NOT for an identifier-
+// shaped word that's merely sitting inside a quoted string, an
+// ordinary positional argument, or anything else a man-page lookup
+// wouldn't make sense for), a man-page snippet or flag description via
+// crate::bishedit::manpages, already built for highlight.rs's own flag/
+// subcommand recognition and reused here as-is -- same cache, same
+// non-blocking "Pending now, ready by the next redraw" contract. Shown
 // in a small floating popup near the cursor (render_hover_popup) rather
 // than the single-line status row the old value-only hover used --
 // needed the moment a doc comment can be several lines long, and kept
@@ -294,12 +298,15 @@ impl DebugController {
         (screen_row, screen_col)
     }
 
-    // `K`'s own hover lookup -- docs::hover_lines (shared with repl.rs's
-    // real file editor) does the actual three-tier lookup; this just
-    // supplies the one thing only a debugger session actually has, the
-    // identifier's live value.
-    fn show_hover(&mut self, name: &str, shell: &Shell) {
-        self.hover_lines = crate::docs::hover_lines(name, shell.debug_peek_var(name).as_deref(), &self.docs);
+    // `K`'s own hover lookup -- docs::hover_lines_at (shared with
+    // repl.rs's real file editor) does the actual classification/lookup;
+    // this just supplies the cursor's own line/column and the one thing
+    // only a debugger session actually has, the identifier's live value.
+    fn show_hover_at_cursor(&mut self, shell: &Shell) {
+        let (row, col) = self.buf.cursor();
+        let chars = self.buf.line_chars(row);
+        let line_text: String = chars.iter().collect();
+        self.hover_lines = crate::docs::hover_lines_at(&chars, col, &line_text, &self.docs, |name| shell.debug_peek_var(name));
     }
 
     fn dismiss_hover(&mut self) {
@@ -384,14 +391,6 @@ impl DebugController {
                 _ => {}
             }
         }
-    }
-
-    // Identifier under the cursor's own column on its own line -- `K`'s
-    // own hover target (docs::identifier_at, shared with repl.rs's real
-    // file editor).
-    fn identifier_at_cursor(&self) -> Option<String> {
-        let (row, col) = self.buf.cursor();
-        crate::docs::identifier_at(&self.buf.line_chars(row), col)
     }
 
     // Every debug action (run/break/continue/next/step/print/quit) is
@@ -623,10 +622,7 @@ impl DebugHook for DebugController {
             if self.vk.is_idle() {
                 match key {
                     Key::Char('K') => {
-                        match self.identifier_at_cursor() {
-                            Some(name) => self.show_hover(&name, shell),
-                            None => self.hover_lines = vec!["no identifier under the cursor".to_string()],
-                        }
+                        self.show_hover_at_cursor(shell);
                         continue;
                     }
                     Key::Char(':') => {
@@ -703,11 +699,7 @@ pub fn run(path: &str) -> i32 {
         if is_idle {
             match key {
                 Key::Char('K') => {
-                    let mut c = controller.borrow_mut();
-                    match c.identifier_at_cursor() {
-                        Some(name) => c.show_hover(&name, &shell),
-                        None => c.hover_lines = vec!["no identifier under the cursor".to_string()],
-                    }
+                    controller.borrow_mut().show_hover_at_cursor(&shell);
                     continue;
                 }
                 Key::Char(':') => {

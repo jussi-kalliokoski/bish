@@ -275,40 +275,260 @@ pub fn identifier_at(chars: &[char], col: usize) -> Option<String> {
     Some(chars[start..end].iter().collect())
 }
 
-// `K`'s own shared hover content, tried in order until one has
-// something to say: (1) `live_value`, when the caller already has one
-// to offer (debugger.rs's own `Shell::debug_peek_var`, while a run is
-// active -- repl.rs's plain file editor has no running script to ask,
-// so it always passes `None` here); (2) a godoc-style doc comment from
-// `index`; (3) a man-page snippet for an external command, via
-// `bishedit::manpages`' existing cached, non-blocking `query` (never
-// spawns `man` synchronously -- see that module's own doc comment on
-// why that matters for a caller sitting in a blocking UI loop). Always
-// produces at least one line (the name itself) plus some answer, so `K`
-// visibly does something even on a miss.
-pub fn hover_lines(name: &str, live_value: Option<&str>, index: &DocIndex) -> Vec<String> {
+// `K`'s own single entry point: `chars`/`col` locate the cursor on its
+// own line (already split out by the caller -- see identifier_at's own
+// shape), `line_text` is that same line as a plain string (classify_word
+// needs to re-tokenize it), `live_value` is however the caller answers
+// "does this identifier have a live value right now" (debugger.rs asks
+// `Shell::debug_peek_var`; repl.rs's plain file editor has no running
+// script to ask, so it always answers `None`).
+//
+// A doc-commented symbol or a live value wins regardless of *where* the
+// identifier sits (a variable reference is a variable reference whether
+// it's argv[0], a flag's own argument, or buried in `${...}`) -- but
+// once neither applies, this does NOT fall back to an unconditional
+// man-page query the way an earlier version did: `classify_word` decides
+// whether the cursor is actually sitting on a command name, a
+// recognized-shape subcommand, or a flag before ever trying `man` at
+// all. Hovering a plain positional argument -- including, notably, a
+// word that only *looks* identifier-shaped because it's sitting inside
+// a quoted string ("please deploy the app") -- correctly finds nothing
+// rather than spawning a pointless `man` lookup for prose.
+pub fn hover_lines_at(chars: &[char], col: usize, line_text: &str, index: &DocIndex, live_value: impl Fn(&str) -> Option<String>) -> Vec<String> {
+    let identifier = identifier_at(chars, col);
+    if let Some(name) = &identifier {
+        if let Some(value) = live_value(name) {
+            return hover_lines(name, Some(&value), index);
+        }
+        if index.lookup(name).is_some() {
+            return hover_lines(name, None, index);
+        }
+    }
+    match classify_word(line_text, col) {
+        WordRole::Flag { command, flag } => hover_lines_for_flag(&command, &flag),
+        WordRole::Command(name) => hover_lines_for_command(&name),
+        WordRole::Subcommand { command, subcommand } => hover_lines_for_subcommand(&command, &subcommand),
+        WordRole::Other => match identifier {
+            Some(name) => vec![name, "no info available".to_string()],
+            None => vec!["no identifier under the cursor".to_string()],
+        },
+    }
+}
+
+// The value/doc-comment half of hover_lines_at, split out so a caller
+// that's already resolved one of the two (hover_lines_at itself) can
+// render it without redoing that work. `live_value` wins outright when
+// present; otherwise `index`'s own doc comment, if any. Never reached
+// with both `None` from hover_lines_at (that falls to classify_word
+// instead) -- kept defensive (a bare name, no second line) rather than
+// assuming that, in case something else ever calls this directly.
+fn hover_lines(name: &str, live_value: Option<&str>, index: &DocIndex) -> Vec<String> {
     let mut lines = vec![name.to_string()];
     if let Some(value) = live_value {
         lines.push(format!("= {}", value));
-        return lines;
-    }
-    if let Some(doc) = index.lookup(name) {
+    } else if let Some(doc) = index.lookup(name) {
         let kind = match doc.kind {
             SymbolKind::Function => "function",
             SymbolKind::Variable => "variable",
         };
         lines.push(format!("{} -- {}:{}", kind, doc.file.display(), doc.line));
         lines.extend(doc.doc.iter().cloned());
-    } else {
-        use crate::bishedit::manpages::{self, ManStatus};
-        match manpages::query(name) {
-            ManStatus::Ready(data) => match &data.name_section {
-                Some(snippet) => lines.push(snippet.clone()),
-                None => lines.push("(found a man page, but no NAME section)".to_string()),
-            },
-            ManStatus::Pending => lines.push("looking up man page... press K again in a moment".to_string()),
-            ManStatus::Missing => lines.push("no info available".to_string()),
+    }
+    lines
+}
+
+// What role the word touching `col` (0-based, in chars) of `line` plays
+// in its own command -- the gate that decides whether a man-page lookup
+// even makes sense for a bare word that isn't a known symbol. Built by
+// re-tokenizing `line` with the real lexer (`tokenize_spanned`, for its
+// byte-range-per-token -- exactly what's needed to tell "is the cursor
+// actually on this token" from plain character-class scanning, which is
+// what let a quoted string's own prose read as command-shaped before
+// this existed) and walking it left to right, tracking which command
+// (reset at every `;`/`&&`/`||`/`&`/newline) the cursor's own token
+// would belong to and how far into its argument list.
+pub enum WordRole {
+    // The word IS the command name itself (argv[0], skipping over any
+    // leading assignment-prefix words like `FOO=bar`).
+    Command(String),
+    // The word sits at the shape "the argument right after the command
+    // name, and isn't a flag" -- a plausible subcommand *position*,
+    // regardless of whether the command actually has a subcommand by
+    // this name (hover_lines_for_subcommand's own man-page query is what
+    // actually confirms or denies that).
+    Subcommand { command: String, subcommand: String },
+    // A `-x`/`--long[=value]` word, plus the command it belongs to (if
+    // any could be determined at all).
+    Flag { command: String, flag: String },
+    // Anything else: a later positional argument, a redirect target, a
+    // separator itself, or a word this couldn't classify at all (an
+    // unparseable line, most often because the cursor's own line is only
+    // half of a multi-line construct still being typed).
+    Other,
+}
+
+pub fn classify_word(line: &str, col: usize) -> WordRole {
+    let byte_col: usize = line.chars().take(col).map(|c| c.len_utf8()).sum();
+    let spanned = crate::lexer::tokenize_spanned(line);
+    let mut command: Option<String> = None;
+    // How many non-flag words have been seen since `command` was set --
+    // 0 means the *next* one is the subcommand-position candidate.
+    let mut arg_index: usize = 0;
+    for item in spanned.items {
+        let crate::lexer::SpannedItem::Tok(tok, range) = item else { continue };
+        let hit = range.contains(&byte_col);
+        match tok {
+            crate::lexer::Tok::Pipe
+            | crate::lexer::Tok::And
+            | crate::lexer::Tok::Or
+            | crate::lexer::Tok::Semi
+            | crate::lexer::Tok::DSemi
+            | crate::lexer::Tok::SemiAmp
+            | crate::lexer::Tok::DSemiAmp
+            | crate::lexer::Tok::Amp
+            | crate::lexer::Tok::Newline => {
+                if hit {
+                    return WordRole::Other;
+                }
+                command = None;
+                arg_index = 0;
+            }
+            crate::lexer::Tok::Word(chunks, globbable) => {
+                let text = word_as_literal(&Word { chunks, globbable });
+                let Some(text) = text else {
+                    if hit {
+                        return WordRole::Other;
+                    }
+                    if command.is_some() {
+                        arg_index += 1;
+                    }
+                    continue;
+                };
+                if command.is_none() && is_assignment_word(&text) {
+                    if hit {
+                        return WordRole::Other;
+                    }
+                    continue; // an assignment prefix doesn't advance command state at all
+                }
+                if looks_like_flag(&text) {
+                    if hit {
+                        return match &command {
+                            Some(cmd) => WordRole::Flag { command: cmd.clone(), flag: text },
+                            None => WordRole::Other,
+                        };
+                    }
+                    continue; // flags don't consume an arg_index slot
+                }
+                if command.is_none() {
+                    if hit {
+                        // `globbable` (Tok::Word's own second field) is
+                        // true only for a word with no quoting/escaping/
+                        // expansion at all -- a fully bareword command
+                        // name. A *quoted* word sitting in this same
+                        // position (rare, but `"$0"`-style indirection
+                        // exists) isn't a literal command name worth a
+                        // man-page lookup for, so it's Other instead --
+                        // still becomes `command` for bookkeeping below,
+                        // since whatever comes after it still needs a
+                        // command context to attribute its own flags to.
+                        return if globbable { WordRole::Command(text) } else { WordRole::Other };
+                    }
+                    command = Some(text);
+                    arg_index = 0;
+                    continue;
+                }
+                if hit {
+                    // Same reasoning as just above, for the subcommand
+                    // position -- this is exactly what caught a quoted
+                    // argument (`read -p "Your name: " USER_NAME`'s own
+                    // prompt string) being misread as command-shaped
+                    // before this existed: it sits at the "first
+                    // non-flag word after the command" position, but
+                    // it's quoted text, not a bareword subcommand name.
+                    return if arg_index == 0 && globbable {
+                        WordRole::Subcommand { command: command.clone().unwrap(), subcommand: text }
+                    } else {
+                        WordRole::Other
+                    };
+                }
+                arg_index += 1;
+            }
+            _ => {
+                if hit {
+                    return WordRole::Other;
+                }
+            }
         }
+    }
+    WordRole::Other
+}
+
+fn looks_like_flag(word: &str) -> bool {
+    word.len() > 1 && word.starts_with('-')
+}
+
+fn is_assignment_word(word: &str) -> bool {
+    match leading_identifier(word) {
+        Some(prefix) => word[prefix.len()..].starts_with('='),
+        None => false,
+    }
+}
+
+fn hover_lines_for_command(name: &str) -> Vec<String> {
+    use crate::bishedit::manpages::{self, ManStatus};
+    let mut lines = vec![name.to_string()];
+    match manpages::query(name) {
+        ManStatus::Ready(data) => match &data.name_section {
+            Some(snippet) => lines.push(snippet.clone()),
+            None => lines.push("(found a man page, but no NAME section)".to_string()),
+        },
+        ManStatus::Pending => lines.push("looking up man page... press K again in a moment".to_string()),
+        ManStatus::Missing => lines.push("no info available".to_string()),
+    }
+    lines
+}
+
+// Same idea, for a `command subcommand` pair -- tries the man page
+// convention git/apt/ip/... use for their own per-subcommand pages
+// (`command-subcommand(N)`, the same naming `bishedit::manpages::
+// parse_subcommands` already recognizes for highlight.rs's own
+// subcommand completion). A command with no such page for this word
+// (most commands, most of the time -- this is a *position*-based guess,
+// not a confirmed subcommand list) just reports "no info available",
+// same as any other miss.
+fn hover_lines_for_subcommand(command: &str, subcommand: &str) -> Vec<String> {
+    use crate::bishedit::manpages::{self, ManStatus};
+    let full = format!("{command}-{subcommand}");
+    let mut lines = vec![format!("{command} {subcommand}")];
+    match manpages::query(&full) {
+        ManStatus::Ready(data) => match &data.name_section {
+            Some(snippet) => lines.push(snippet.clone()),
+            None => lines.push(format!("(found {full}, but no NAME section)")),
+        },
+        ManStatus::Pending => lines.push("looking up man page... press K again in a moment".to_string()),
+        ManStatus::Missing => lines.push("no info available".to_string()),
+    }
+    lines
+}
+
+// A flag's own description, from the *enclosing command's* man page --
+// `bishedit::manpages::query(command)` already parses every recognized
+// flag's own description alongside its existing flags/subcommands scan
+// (`ManPageData::flag_descriptions`), so this is just a lookup once
+// that's ready, normalized through the same `extract_flag_token` the
+// man-page parser itself uses (so a script's own `--block-size=1M`
+// looks up the page's own `--block-size` entry, not a literal miss).
+fn hover_lines_for_flag(command: &str, flag: &str) -> Vec<String> {
+    use crate::bishedit::manpages::{self, ManStatus};
+    let key = manpages::extract_flag_token(flag).unwrap_or_else(|| flag.to_string());
+    let mut lines = vec![format!("{command} {flag}")];
+    match manpages::query(command) {
+        ManStatus::Ready(data) => match data.flag_descriptions.get(&key) {
+            Some(desc) => lines.push(desc.clone()),
+            None => lines.push(format!("(found a man page for {command}, but no description for {key})")),
+        },
+        ManStatus::Pending => lines.push("looking up man page... press K again in a moment".to_string()),
+        ManStatus::Missing => lines.push("no info available".to_string()),
     }
     lines
 }
@@ -386,5 +606,81 @@ mod tests {
         let entry = write_temp("main3.sh", "# from the entry script.\nshared() { :; }\nsource lib3.sh\n");
         let index = DocIndex::build_from_source(&std::fs::read_to_string(&entry).unwrap(), &entry);
         assert_eq!(index.lookup("shared").unwrap().doc, vec!["from the entry script.".to_string()]);
+    }
+}
+
+#[cfg(test)]
+mod classify_word_tests {
+    use super::*;
+
+    // `col` locates the character to classify -- tests spell it out via
+    // the byte index of a marker for readability, then convert to a
+    // char index (identical for these all-ASCII fixtures).
+    fn role_at(line: &str, marker: char) -> WordRole {
+        let col = line.find(marker).expect("marker not found in fixture");
+        classify_word(line, col)
+    }
+
+    #[test]
+    fn the_first_word_is_the_command() {
+        match role_at("read -p \"Your name: \" USER_NAME", 'r') {
+            WordRole::Command(name) => assert_eq!(name, "read"),
+            other => panic!("expected Command, got a different role: line {:?}", std::mem::discriminant(&other)),
+        }
+    }
+
+    #[test]
+    fn a_dash_prefixed_word_is_a_flag_of_the_enclosing_command() {
+        match role_at("read -p \"Your name: \" USER_NAME", 'p') {
+            WordRole::Flag { command, flag } => {
+                assert_eq!(command, "read");
+                assert_eq!(flag, "-p");
+            }
+            _ => panic!("expected Flag"),
+        }
+    }
+
+    #[test]
+    fn the_word_right_after_the_command_is_a_subcommand_candidate() {
+        match role_at("git add file.txt", 'a') {
+            WordRole::Subcommand { command, subcommand } => {
+                assert_eq!(command, "git");
+                assert_eq!(subcommand, "add");
+            }
+            _ => panic!("expected Subcommand"),
+        }
+    }
+
+    #[test]
+    fn text_inside_a_quoted_argument_is_not_command_shaped() {
+        // "Your" sits inside one single quoted shell word ("Your name:
+        // "), not as its own bareword -- must not be classified as a
+        // command/subcommand/flag at all, so K-hover never spawns a
+        // pointless `man Your` lookup for ordinary prose.
+        assert!(matches!(role_at("read -p \"Your name: \" USER_NAME", 'Y'), WordRole::Other));
+    }
+
+    #[test]
+    fn a_later_plain_argument_is_not_a_subcommand() {
+        // USER_NAME is the *second* non-flag word after `read` (after
+        // the quoted prompt string), not the first -- must not read as
+        // a subcommand position.
+        assert!(matches!(role_at("read -p \"Your name: \" USER_NAME", 'U'), WordRole::Other));
+    }
+
+    #[test]
+    fn an_assignment_prefix_word_does_not_count_as_the_command() {
+        match role_at("FOO=bar echo hi", 'e') {
+            WordRole::Command(name) => assert_eq!(name, "echo"),
+            _ => panic!("expected Command"),
+        }
+    }
+
+    #[test]
+    fn each_side_of_a_pipeline_gets_its_own_command() {
+        match role_at("cat file.txt | grep foo", 'g') {
+            WordRole::Command(name) => assert_eq!(name, "grep"),
+            _ => panic!("expected Command"),
+        }
     }
 }

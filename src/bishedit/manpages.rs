@@ -36,6 +36,16 @@ pub struct ManPageData {
     // (rare, but not every page follows the convention) rather than
     // guessing at some other line.
     pub name_section: Option<String>,
+    // A recognized flag's own description text, keyed by exactly the
+    // spelling `flags` itself uses (`extract_flag_token`'s own output --
+    // no `=value`/bundled-short-flag normalization beyond what that
+    // already does) -- `K`-hover's own "which flag, and what does it
+    // do" lookup (docs.rs), once it's already found which command a
+    // flag under the cursor belongs to. A flag with no entry here either
+    // had no description this parser could isolate, or (for a bundled
+    // short flag like the `-la` in `ls -la`) was never a `flags` entry
+    // on its own to begin with.
+    pub flag_descriptions: HashMap<String, String>,
 }
 
 pub enum ManStatus {
@@ -114,7 +124,8 @@ fn fetch_and_parse(command: &str) -> Option<ManPageData> {
     let flags = parse_flags(&text);
     let subcommands = parse_subcommands(&text, command);
     let name_section = parse_name_section(&text);
-    Some(ManPageData { flags, subcommands, name_section })
+    let flag_descriptions = parse_flag_descriptions(&text);
+    Some(ManPageData { flags, subcommands, name_section, flag_descriptions })
 }
 
 // The first non-blank line after a bare "NAME" section header, trimmed --
@@ -195,6 +206,92 @@ fn parse_flags(text: &str) -> Vec<String> {
     flags
 }
 
+// Same flag-line recognition as parse_flags, but keeping each flag's own
+// description instead of discarding it -- `K`-hover's own "what does
+// this specific flag do" (docs.rs). Real man pages split roughly two
+// ways: ls-style, with a short description trailing on the *same* line
+// past the flag list ("-c     with -lt: sort by, ..."), and git-style,
+// with the description on the following, *more*-indented line(s) until
+// either a blank line or a line back at the flag's own (shallow) indent
+// -- this handles both by taking whatever's left on the flag line
+// itself after its comma-separated flag list, then appending every
+// following more-indented line, joined with spaces into one flat
+// summary (not preserving the man page's own line breaks -- fine for a
+// short hover popup). First occurrence wins if the same flag spelling
+// somehow shows up more than once on a page.
+fn parse_flag_descriptions(text: &str) -> HashMap<String, String> {
+    let mut descriptions: HashMap<String, String> = HashMap::new();
+    let lines: Vec<&str> = text.lines().collect();
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i];
+        let trimmed = line.trim_start();
+        let indent = line.len() - trimmed.len();
+        if !trimmed.starts_with('-') || indent > 8 {
+            i += 1;
+            continue;
+        }
+        let mut flags_here = Vec::new();
+        let mut consumed = 0usize;
+        for piece in trimmed.split(',') {
+            match extract_flag_token(piece.trim()) {
+                Some(flag) => {
+                    flags_here.push(flag);
+                    consumed += piece.len() + 1; // +1 for the comma this was split on
+                }
+                None => break,
+            }
+        }
+        if flags_here.is_empty() {
+            i += 1;
+            continue;
+        }
+        let mut desc_parts: Vec<String> = Vec::new();
+        let inline = trimmed.get(consumed.min(trimmed.len())..).unwrap_or("").trim();
+        if !inline.is_empty() {
+            desc_parts.push(inline.to_string());
+        }
+        let mut j = i + 1;
+        while j < lines.len() {
+            let candidate = lines[j];
+            if candidate.trim().is_empty() {
+                break;
+            }
+            let candidate_trimmed = candidate.trim_start();
+            let candidate_indent = candidate.len() - candidate_trimmed.len();
+            // Stop at another recognized flag line -- the exact same
+            // "starts with '-', shallow indent" shape this function's
+            // own outer loop (and parse_flags) uses to recognize one in
+            // the first place, rather than comparing indent to *this*
+            // entry's own first line: that line can legitimately have a
+            // shallower indent than its own continuation/description
+            // lines expect if it's the very first line of the page
+            // text (no leading blank line for indentation to measure
+            // against) -- comparing against a fixed absolute threshold
+            // instead sidesteps that entirely.
+            if candidate_trimmed.starts_with('-') && candidate_indent <= 8 {
+                break;
+            }
+            desc_parts.push(candidate_trimmed.trim().to_string());
+            j += 1;
+        }
+        if !desc_parts.is_empty() {
+            let desc = desc_parts.join(" ");
+            for flag in &flags_here {
+                descriptions.entry(flag.clone()).or_insert_with(|| desc.clone());
+            }
+        }
+        i = j.max(i + 1);
+    }
+    descriptions
+}
+
+// `K`-hover's own normalizer (docs.rs) for a flag word straight out of a
+// script (`--block-size=1M`) down to the exact spelling this parser
+// keys `flag_descriptions` by (`--block-size`) -- same rules as this
+// module's own parse_flags/parse_flag_descriptions use internally, just
+// exposed for that one external caller.
+//
 // Extracts just the flag spelling from a piece like "-a", "--author",
 // "--block-size=SIZE", "-C <path>", or "-c     with -lt: sort by..." --
 // stops at the first '='/' '/'[' (a value suffix, a placeholder, or an
@@ -202,7 +299,7 @@ fn parse_flags(text: &str) -> Vec<String> {
 // flag. Exact-string match only, per this feature's v1 scope -- no
 // bundled short-flag decomposition (e.g. "-la" is never split into "-l"
 // and "-a").
-fn extract_flag_token(piece: &str) -> Option<String> {
+pub(crate) fn extract_flag_token(piece: &str) -> Option<String> {
     if !piece.starts_with('-') {
         return None;
     }
@@ -309,6 +406,35 @@ mod tests {
         let text = "       --block-size=SIZE\n                     a value of -1 means unlimited\n";
         let flags = parse_flags(text);
         assert_eq!(flags, vec!["--block-size".to_string()]);
+    }
+
+    #[test]
+    fn parse_flag_descriptions_handles_git_style_next_line_descriptions() {
+        let descriptions = parse_flag_descriptions(GIT_FLAGS_EXCERPT);
+        assert_eq!(descriptions.get("-C").unwrap(), "Run as if git was started in <path> instead of the current working directory.");
+        assert_eq!(descriptions.get("-c").unwrap(), "Pass a configuration parameter to the command.");
+        // Two spellings on one flag line ("-p, --paginate") both resolve
+        // to the same description.
+        assert_eq!(descriptions.get("-p").unwrap(), descriptions.get("--paginate").unwrap());
+        assert!(descriptions.get("-p").unwrap().contains("Pipe all output into less"));
+    }
+
+    #[test]
+    fn parse_flag_descriptions_handles_ls_style_multi_spelling_entries() {
+        let descriptions = parse_flag_descriptions(LS_EXCERPT);
+        assert_eq!(descriptions.get("-a").unwrap(), "do not ignore entries starting with .");
+        assert_eq!(descriptions.get("--all").unwrap(), "do not ignore entries starting with .");
+        assert_eq!(descriptions.get("--author").unwrap(), "with -l, print the author of each file");
+    }
+
+    #[test]
+    fn parse_flag_descriptions_stops_at_the_next_shallow_line() {
+        // The description for "-A, --almost-all" must not swallow the
+        // next flag's own line ("--author").
+        let descriptions = parse_flag_descriptions(LS_EXCERPT);
+        let d = descriptions.get("-A").unwrap();
+        assert!(d.contains("implied"), "{d:?}");
+        assert!(!d.contains("author"), "{d:?}");
     }
 
     const GIT_SUBCOMMANDS_EXCERPT: &str = "\

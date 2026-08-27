@@ -4962,33 +4962,29 @@ fn run_normal_mode_navigation(
                 }
                 break 'nav (NavExit::Resume(initial_text.clone(), initial_cursor), nav_buffer_into_edit_state(buf, vk));
             }
-            // `K`: hover the identifier under the cursor -- same
-            // three-tier lookup (a doc comment, then a man-page snippet)
-            // debugger.rs's own `K` already does, just without that
-            // view's first tier (a live running value: there's no
-            // script actually executing behind a plain file-editor
-            // buffer) -- see docs::hover_lines's own doc comment for
-            // what's shared between the two. Scoped to `Editable` only
-            // (matching `:help`/`:git`/`:format`'s own "only means
-            // something while editing a real file" convention) -- for
-            // `ReadOnly` scrollback navigation it just falls through to
-            // vimkeys' own handling (a no-op, since `K` isn't bound
-            // there either in real vim). Rebuilt fresh from this
-            // buffer's own *live* text every time (TextBuffer::text,
-            // not a re-read off disk) so an unsaved edit is reflected
+            // `K`: hover whatever's under the cursor -- same shared
+            // lookup (docs::hover_lines_at) debugger.rs's own `K` uses,
+            // just without that view's one extra tier (a live running
+            // value: there's no script actually executing behind a
+            // plain file-editor buffer, so `live_value` is always
+            // `|_| None` here). Scoped to `Editable` only (matching
+            // `:help`/`:git`/`:format`'s own "only means something while
+            // editing a real file" convention) -- for `ReadOnly`
+            // scrollback navigation it just falls through to vimkeys'
+            // own handling (a no-op, since `K` isn't bound there either
+            // in real vim). The doc index is rebuilt fresh from this
+            // buffer's own *live* text every time (TextBuffer::text, not
+            // a re-read off disk) so an unsaved edit is reflected
             // immediately, unlike debugger.rs's index (built once, since
             // that view is read-only for its whole session).
             Key::Char('K') if vk.is_idle() && matches!(buf, NavBuffer::Editable(_)) => {
                 let NavBuffer::Editable(tb) = &buf else { unreachable!("guarded by this arm's own match above") };
                 let (row, col) = tb.cursor();
-                let hover_lines = match docs::identifier_at(&tb.line_chars(row), col) {
-                    Some(name) => {
-                        let base_path = tb.path().map(|p| p.to_path_buf()).unwrap_or_else(|| std::env::current_dir().unwrap_or_default().join("untitled"));
-                        let index = docs::DocIndex::build_from_source(&tb.text(), &base_path);
-                        docs::hover_lines(&name, None, &index)
-                    }
-                    None => vec!["no identifier under the cursor".to_string()],
-                };
+                let chars = tb.line_chars(row);
+                let line_text: String = chars.iter().collect();
+                let base_path = tb.path().map(|p| p.to_path_buf()).unwrap_or_else(|| std::env::current_dir().unwrap_or_default().join("untitled"));
+                let index = docs::DocIndex::build_from_source(&tb.text(), &base_path);
+                let hover_lines = docs::hover_lines_at(&chars, col, &line_text, &index, |_| None);
                 let gutter_width = rect.cols.saturating_sub(fileeditor::editor_content_cols(tb, rect));
                 let cursor_row = rect.row + row.saturating_sub(tb.viewport_top());
                 let cursor_col = rect.col + gutter_width + col.saturating_sub(tb.viewport_left());

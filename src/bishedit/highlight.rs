@@ -1275,6 +1275,7 @@ mod tests {
             flags: flags.iter().map(|s| s.to_string()).collect(),
             subcommands: subcommands.iter().map(|s| s.to_string()).collect(),
             name_section: None,
+            flag_descriptions: std::collections::HashMap::new(),
         }
     }
 
