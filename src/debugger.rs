@@ -196,6 +196,31 @@ pub struct DebugController {
 // output_pane_rows).
 const MAX_OUTPUT_CONTENT_ROWS: usize = 8;
 
+// Every command dispatch_colon_command recognizes, long form first --
+// what :help lists and what read_colon_line's own live completion hint/
+// Tab-complete matches against. Short single-letter aliases (c/n/s/r/q/
+// b/p) exist for speed once you already know them; completion focuses
+// on the long forms, since not knowing what's even available at all was
+// the actual reported problem.
+const COLON_COMMANDS: &[&str] = &["run", "break", "continue", "next", "step", "print", "quit", "help"];
+const BREAK_SUBCOMMANDS: &[&str] = &["add", "remove"];
+
+// Candidate completions for whatever's typed so far in the colon-line.
+// Only ever completes the *command* word (or `break`'s own `add`/
+// `remove` subcommand) -- no completion for a trailing argument
+// (`print NAME`, a breakpoint's own line number, ...), which is why
+// `buf.contains(' ')` short-circuits to nothing once anything's typed
+// after a command that isn't `break`.
+fn colon_completions(buf: &str) -> Vec<&'static str> {
+    if let Some(rest) = buf.strip_prefix("break ").or_else(|| buf.strip_prefix("b ")) {
+        return BREAK_SUBCOMMANDS.iter().filter(|s| s.starts_with(rest)).copied().collect();
+    }
+    if buf.contains(' ') {
+        return Vec::new();
+    }
+    COLON_COMMANDS.iter().filter(|c| c.starts_with(buf)).copied().collect()
+}
+
 impl DebugController {
     fn new(buf: TextBuffer, term_rows: usize, term_cols: usize, docs: DocIndex, raw_guard: Rc<term::RawGuard>) -> Self {
         DebugController {
@@ -208,7 +233,7 @@ impl DebugController {
             running: false,
             term_rows,
             term_cols,
-            status: "hjkl/w/b/gg/G/...: navigate  K: hover  :run  :break [line]  :quit".to_string(),
+            status: "hjkl/w/b/gg/G/...: navigate  K: hover  :run  :break [line]  :help  :quit".to_string(),
             output: Rc::new(RefCell::new(String::new())),
             ext_stdout_path: std::env::temp_dir().join(format!("bish-debugger-stdout-{}.tmp", std::process::id())),
             ext_drain_offset: 0,
@@ -474,11 +499,23 @@ impl DebugController {
     // A small, dedicated colon-line reader -- not repl.rs's real command
     // mode (see this module's own top-of-file doc comment for why).
     // Enter submits, Escape/empty-Backspace cancels. No history, no
-    // completion, no multi-line continuation -- deliberately simpler than
-    // the real thing.
+    // multi-line continuation -- deliberately simpler than the real
+    // thing. Completion IS wired up, though (colon_completions):
+    // matching candidates are shown live on the status row above the
+    // colon-line as soon as `:` is pressed, even before typing anything
+    // -- what's actually available was the reported problem, not just
+    // completing a partially-remembered name -- and Tab accepts the
+    // completion once it's unambiguous.
     fn read_colon_line(&self) -> Option<String> {
         let mut buf = String::new();
         loop {
+            let completions = colon_completions(&buf);
+            let hint_row = self.term_rows.saturating_sub(1).max(1);
+            if completions.is_empty() {
+                print!("\x1b[{};1H\x1b[K", hint_row);
+            } else {
+                print!("\x1b[{};1H\x1b[K\x1b[2m{}\x1b[0m", hint_row, completions.join("  "));
+            }
             print!("\x1b[{};1H\x1b[K:{}", self.term_rows, buf);
             let _ = std::io::stdout().flush();
             match self.read_key()? {
@@ -489,6 +526,17 @@ impl DebugController {
                         return None;
                     }
                     buf.pop();
+                }
+                Key::Tab if completions.len() == 1 => {
+                    let completion = completions[0];
+                    match buf.rfind(' ') {
+                        Some(space) => {
+                            buf.truncate(space + 1);
+                            buf.push_str(completion);
+                        }
+                        None => buf = completion.to_string(),
+                    }
+                    buf.push(' ');
                 }
                 Key::Char(c) => buf.push(c),
                 _ => {}
@@ -558,6 +606,31 @@ impl DebugController {
                 let line = self.buf.cursor().0 + 1;
                 self.toggle_breakpoint(line);
                 self.set_status(format!("breakpoint toggled at line {}", line));
+                return None;
+            }
+            // `:help`/`:h`/`:?` -- shown via the same hover popup `K`
+            // uses (hover_lines/render_hover_popup), the one multi-line
+            // display surface this standalone view has; there's no
+            // command-output overlay here the way the real editor's own
+            // `:help` has (see run_command_mode's own EDITOR_HELP_TEXT).
+            // `?` is a deliberate alias matching that same convention --
+            // this colon-line has no other meaning for a bare `?` either
+            // (real `/`/`?` search is a Normal-mode motion, handled
+            // entirely by handle_navigation_key, never reaching here).
+            "help" | "h" | "?" => {
+                self.hover_lines = vec![
+                    "dbg quick reference".to_string(),
+                    "K on an identifier: hover (value / doc / man page)".to_string(),
+                    ":run              start executing the script".to_string(),
+                    ":break [line]     toggle a breakpoint (cursor's own line if omitted)".to_string(),
+                    ":break add|remove N   explicit add/remove".to_string(),
+                    ":continue         resume until the next breakpoint".to_string(),
+                    ":next             step over (don't descend into calls/subshells)".to_string(),
+                    ":step             step into".to_string(),
+                    ":print NAME       show a variable's current value".to_string(),
+                    ":quit             abandon this run / exit the debugger".to_string(),
+                    "hjkl w b gg G / search / etc: real vim navigation, unaffected".to_string(),
+                ];
                 return None;
             }
             _ => {}
@@ -714,7 +787,7 @@ impl DebugHook for DebugController {
         self.buf.set_cursor(line.saturating_sub(1), 0);
         let content_cols = fileeditor::editor_content_cols(&self.buf, self.rect());
         crate::repl::scroll_to_show_cursor(&mut self.buf, content_cols);
-        self.set_status(format!("paused at line {} -- K: hover  :continue  :next  :step  :quit", line));
+        self.set_status(format!("paused at line {} -- K: hover  :continue  :next  :step  :help  :quit", line));
 
         loop {
             self.render();
