@@ -4178,6 +4178,18 @@ impl Shell {
         // Shell-owned state either -- see current_umask's own doc
         // comment).
         let umask_before = current_umask();
+        // Same reasoning again, for fd 0/1/2 -- a bare `exec > file`/
+        // `exec 2>&1`/`exec < file` (no command word, applies its
+        // redirect persistently to *this process's own* fds rather than
+        // spawning anything -- see the "exec" builtin arm's own doc
+        // comment) used to be safely contained by the old re-exec'd
+        // design (a real separate process, discarded along with whatever
+        // it did to its own fds once it exited); in-process, it would
+        // otherwise silently repoint the real shell's own stdin/stdout/
+        // stderr forever, confirmed the hard way: `(exec > file; echo hi)`
+        // left *everything* printed after that subshell -- including in
+        // the real parent script -- redirected into `file` too.
+        let saved_fd012 = save_fd012();
 
         let result = child.run_source_here(raw, "subshell");
         // Real bash fires a subshell's own EXIT trap when it finishes
@@ -4196,6 +4208,7 @@ impl Shell {
             let _ = std::env::set_current_dir(d);
         }
         unsafe { umask(umask_before) };
+        restore_fd012(saved_fd012);
         let before_keys: std::collections::HashSet<&str> = env_before.iter().map(|(k, _)| k.as_str()).collect();
         let after_keys: Vec<String> = std::env::vars().map(|(k, _)| k).collect();
         for k in after_keys {
@@ -5915,6 +5928,43 @@ impl Shell {
                         return ExecResult::Status(1);
                     }
                 };
+                // Inside a converted foreground subshell/command-
+                // substitution/proc-sub, or a window-pane's own virtual-
+                // child Shell (subshell_depth > 0 -- see new_virtual_
+                // child's own doc comment: it's incremented for either),
+                // a literal execve would replace the one real process
+                // every sibling session/construct shares, not just "this
+                // subshell" -- a real, severe regression from the old
+                // re-exec'd design, where this call really did only ever
+                // replace that subshell's own separate child process.
+                // Falls back to spawning CMD as a real, separate child
+                // instead, matching what a genuine forked subshell's own
+                // exec would actually replace; since real `exec` never
+                // returns control to the rest of this script either way,
+                // this unwinds via the same ExecResult::Exit run_in_
+                // child_shell already uses to stop just this child
+                // without touching the real process.
+                if self.subshell_depth > 0 {
+                    let mut command = Command::new(&argv[1]);
+                    command.args(&argv[2..]);
+                    command.current_dir(&self.cwd);
+                    command.stdin(redirs.stdin.unwrap_or_else(|| self.spawn_stdin_stdio()));
+                    command.stdout(redirs.stdout.unwrap_or_else(|| self.spawn_stdout_stdio()));
+                    command.stderr(redirs.stderr.unwrap_or_else(Stdio::inherit));
+                    apply_fd_redirects(&mut command, redirs.dup_stderr_to_stdout, redirs.extra_fds);
+                    self.note_external_spawn();
+                    let status = match command.status() {
+                        Ok(status) => exit_code_from_status(status),
+                        // Same "leave $? at whatever it already was"
+                        // behavior as the real top-level case just below.
+                        Err(e) => {
+                            sh_eprintln!(self, "bish: exec: {}: {}", argv[1], e);
+                            self.last_status
+                        }
+                    };
+                    self.run_exit_trap();
+                    return ExecResult::Exit(status);
+                }
                 let mut command = Command::new(&argv[1]);
                 command.args(&argv[2..]);
                 if let Some(s) = redirs.stdin {
@@ -8572,6 +8622,39 @@ fn current_umask() -> u32 {
     cur
 }
 
+// run_in_child_shell's own snapshot/restore for fd 0/1/2, the real
+// process's own stdin/stdout/stderr -- see its own call site's doc
+// comment for why a bare `exec > file` (persistent, no-fork redirect)
+// needs this. `dup` (not dup2) gives each a fresh, arbitrary-numbered
+// duplicate fd that keeps pointing at whatever 0/1/2 currently mean,
+// regardless of what the child does to 0/1/2 themselves afterward; `-1`
+// (dup failed -- an exhausted fd table, most likely) is carried through
+// as "nothing to restore" rather than erroring, matching how a swallowed
+// `save`/`restore` failure elsewhere in this codebase degrades rather
+// than aborting the whole call.
+fn save_fd012() -> [i32; 3] {
+    unsafe extern "C" {
+        fn dup(oldfd: i32) -> i32;
+    }
+    [unsafe { dup(0) }, unsafe { dup(1) }, unsafe { dup(2) }]
+}
+
+fn restore_fd012(saved: [i32; 3]) {
+    unsafe extern "C" {
+        fn dup2(oldfd: i32, newfd: i32) -> i32;
+        fn close(fd: i32) -> i32;
+    }
+    for (target, fd) in saved.into_iter().enumerate() {
+        if fd < 0 {
+            continue;
+        }
+        unsafe {
+            dup2(fd, target as i32);
+            close(fd);
+        }
+    }
+}
+
 // Signal traps (`trap CMD SIGNAL`). A signal handler can only safely do
 // async-signal-safe work -- no allocation, no locks, nothing that could
 // reenter a libc function the interrupted code was mid-call in -- so the
@@ -10039,6 +10122,52 @@ mod tests {
         shell.run_source_here(r#"x=$(command /bin/echo captured); echo "got:$x""#, "<test>");
         assert_eq!(buf.borrow().as_str(), "got:captured\n");
     }
+
+    // `exec CMD` inside a converted foreground subshell/command-
+    // substitution used to call a literal execve, replacing the one real
+    // process the whole interactive shell (every window/pane) shares --
+    // now falls back to spawning CMD as a real, separate child instead,
+    // same as a real forked subshell's own exec would actually replace.
+    // Uses /bin/true (no output) rather than asserting on what it prints:
+    // a *spawned external process's* own stdout goes straight to a real
+    // fd, bypassing capture_output's OutputSink::Capture entirely (that
+    // only intercepts this Shell's own builtin writes) -- exactly the
+    // distinction exec_cmd_inside_a_command_substitution_is_captured
+    // just below exists to cover instead, via the real capture mechanism
+    // command substitution actually uses.
+    #[test]
+    fn exec_cmd_inside_a_subshell_does_not_kill_the_real_process() {
+        let mut shell = Shell::new();
+        let buf = capture_output(&mut shell);
+        shell.run_source_here(r#"(exec /bin/true); echo "still alive: $?""#, "<test>");
+        assert_eq!(buf.borrow().as_str(), "still alive: 0\n");
+    }
+
+    #[test]
+    fn exec_cmd_inside_a_command_substitution_is_captured() {
+        let mut shell = Shell::new();
+        let buf = capture_output(&mut shell);
+        shell.run_source_here(r#"x=$(exec /bin/echo captured); echo "got:$x""#, "<test>");
+        assert_eq!(buf.borrow().as_str(), "got:captured\n");
+    }
+
+    // Bare `exec > file` (no command word -- a persistent, no-fork
+    // redirect of *this shell's own* fd 0/1/2, applied via a real dup2 on
+    // the real process) used to leak past the subshell it ran in: since
+    // it's no longer a real separate process, nothing undid the real fd
+    // 1 repoint once the subshell finished, so *everything* printed
+    // afterward -- even in the enclosing real shell -- silently kept
+    // going into that file too. save_fd012/restore_fd012 (run_in_child_
+    // shell) now save and restore the real fd 0/1/2 around the whole
+    // call, the same way cwd/env/umask already were. Deliberately not a
+    // Rust unit test here: verifying it needs a real fd 1 (OutputSink::
+    // Real / an external process's inherited stdio, neither of which
+    // capture_output's OutputSink::Capture touches), and manipulating
+    // the real fd 1 mid-test would risk corrupting whichever *other*
+    // test happens to be writing to its own stdout in parallel in this
+    // same test binary. Confirmed manually instead: `(exec > file; echo
+    // hi); echo after` at a real prompt -- "after" reaches the real
+    // terminal, only "hi" lands in the file.
 
     fn strs(words: &[&str]) -> Vec<String> {
         words.iter().map(|s| s.to_string()).collect()
