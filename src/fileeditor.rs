@@ -717,8 +717,25 @@ pub(crate) fn run_insert_mode(
             // own Visual-mode handling); Ctrl+Space is too, here (see
             // this function's own doc comment).
             Key::CtrlSpace | Key::Escape | Key::CtrlC => {
+                // The `'^'` mark records the exact position insert mode
+                // left off at (so `gi` resumes appending from the same
+                // spot, one-past-the-last-character included) -- captured
+                // *before* the Normal-mode-only clamp just below, which
+                // must not affect it.
                 buf.set_mark('^', buf.cursor());
                 registers.set_last_insert(inserted);
+                // Normal mode's cursor can never sit *after* the last
+                // character of a line (unlike Insert mode, which allows
+                // that to append) -- clamp back by one column on the way
+                // out, same convention toggle_case's own post-edit clamp
+                // already uses. A wholly empty line (line_len 0) has
+                // nothing to clamp to but column 0, which set_cursor's
+                // own min() already leaves it at.
+                let (row, col) = buf.cursor();
+                let len = buf.line_len(row);
+                if col >= len && len > 0 {
+                    buf.set_cursor(row, len - 1);
+                }
                 return Ok(());
             }
             Key::Enter => {
@@ -2028,6 +2045,84 @@ mod multi_cursor_insert_tests {
         run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut || {}, false, 24, 80, None, &[(0, 6)]).unwrap();
 
         assert_eq!(line(&buf, 0), "X placeX ");
+    }
+}
+
+// Normal mode's cursor can never sit *after* the last character of a
+// line (only Insert mode allows that, to append) -- leaving Insert mode
+// while sitting there must pull the cursor back onto the last character
+// instead of leaving it in that Insert-only position.
+#[cfg(test)]
+mod insert_mode_exit_clamp_tests {
+    use super::*;
+
+    fn rect() -> Rect {
+        Rect { row: 0, col: 0, rows: 24, cols: 80 }
+    }
+
+    fn scripted(vk: &mut VimKeys, keys: &[Key]) {
+        vk.start_recording('a');
+        for &k in keys {
+            vk.record_key(k);
+        }
+        vk.stop_recording();
+        assert!(vk.queue_macro_replay('a', 1));
+    }
+
+    #[test]
+    fn escape_at_end_of_line_pulls_the_cursor_back_onto_the_last_char() {
+        let mut buf = TextBuffer::new_unnamed(10);
+        buf.insert_text((0, 0), "ab");
+        buf.set_cursor(0, 2); // one past 'b', a valid Insert-mode position
+        let mut vk = VimKeys::new();
+        let mut registers = Registers::new_for_test();
+        scripted(&mut vk, &[Key::Escape]);
+
+        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut || {}, false, 24, 80, None, &[]).unwrap();
+
+        assert_eq!(buf.cursor(), (0, 1), "cursor must land on 'b', not past it");
+    }
+
+    #[test]
+    fn typing_to_the_end_of_a_line_then_escaping_also_clamps() {
+        let mut buf = TextBuffer::new_unnamed(10);
+        buf.set_cursor(0, 0);
+        let mut vk = VimKeys::new();
+        let mut registers = Registers::new_for_test();
+        scripted(&mut vk, &[Key::Char('h'), Key::Char('i'), Key::Escape]);
+
+        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut || {}, false, 24, 80, None, &[]).unwrap();
+
+        assert_eq!(buf.cursor(), (0, 1), "cursor must land on the 'i', not past it");
+    }
+
+    #[test]
+    fn the_caret_mark_still_records_the_true_one_past_end_insert_position() {
+        // `gi` resumes appending from exactly where insert mode left off,
+        // which the Normal-mode clamp above must not disturb.
+        let mut buf = TextBuffer::new_unnamed(10);
+        buf.insert_text((0, 0), "ab");
+        buf.set_cursor(0, 2);
+        let mut vk = VimKeys::new();
+        let mut registers = Registers::new_for_test();
+        scripted(&mut vk, &[Key::Escape]);
+
+        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut || {}, false, 24, 80, None, &[]).unwrap();
+
+        assert_eq!(buf.get_mark('^'), Some((0, 2)));
+    }
+
+    #[test]
+    fn escape_on_a_wholly_empty_line_stays_at_column_zero() {
+        let mut buf = TextBuffer::new_unnamed(10);
+        buf.set_cursor(0, 0);
+        let mut vk = VimKeys::new();
+        let mut registers = Registers::new_for_test();
+        scripted(&mut vk, &[Key::Escape]);
+
+        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut || {}, false, 24, 80, None, &[]).unwrap();
+
+        assert_eq!(buf.cursor(), (0, 0));
     }
 }
 
