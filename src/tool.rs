@@ -17,12 +17,15 @@ pub fn run(args: &[String]) -> i32 {
         Some("check") => run_check(&args[1..]),
         Some("format") => run_format(&args[1..]),
         Some("debug") => run_debug(&args[1..]),
+        Some("edit") => run_edit(&args[1..]),
         Some(other) => {
-            eprintln!("bish tool: unknown subcommand '{other}' (expected: check, format, debug)");
+            eprintln!("bish tool: unknown subcommand '{other}' (expected: check, format, debug, edit)");
             2
         }
         None => {
-            eprintln!("bish tool: expected a subcommand (usage: bish tool check [--fix] [FILE...], bish tool format [--check] [FILE...], bish tool debug FILE)");
+            eprintln!(
+                "bish tool: expected a subcommand (usage: bish tool check [--fix] [FILE...], bish tool format [--check] [FILE...], bish tool debug FILE, bish tool edit FILE)"
+            );
             2
         }
     }
@@ -37,6 +40,22 @@ fn run_debug(args: &[String]) -> i32 {
         Some(path) => crate::debugger::run(path),
         None => {
             eprintln!("usage: bish tool debug FILE");
+            2
+        }
+    }
+}
+
+// `bish tool edit <file>` -- also a real interactive session, not a
+// one-shot pass, but unlike `debug` it reuses the real windowed editor
+// machinery directly (repl::run_edit) rather than re-deriving a subset
+// of it: there's no debugger-shaped state (breakpoints, run/step
+// control) to bolt on here, just "open this one file in the real
+// editor, without the multi-window/tab-bar chrome around it."
+fn run_edit(args: &[String]) -> i32 {
+    match args.first() {
+        Some(path) => crate::repl::run_edit(path),
+        None => {
+            eprintln!("usage: bish tool edit FILE");
             2
         }
     }

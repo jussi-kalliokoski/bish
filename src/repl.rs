@@ -1136,6 +1136,110 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
     }
 }
 
+// `bish tool edit FILE` -- a minimal, single-session, single-window
+// bootstrap that goes straight into a Frame::Edit, skipping the tab
+// bar/window-switching chrome `run()`'s own full multi-session
+// compositor loop exists for entirely (there's exactly one pane here,
+// never split, so nothing to multiplex). Reuses run_edit_frame
+// completely unchanged -- everything below it (Insert mode, every
+// operator, `:w`/`:wq`/`:git`/`:diag`, ...) is the exact same real
+// editor `e` drives, not a re-derived subset the way debugger.rs's own
+// standalone read-only view is (that one deliberately reimplements only
+// a small, non-mutating slice of Normal mode -- there'd be nothing left
+// to reuse by re-deriving the *entire* editor here instead of just
+// bootstrapping the real one).
+//
+// `ensure_promoted` is called directly (not `compositor_redraw`
+// alongside it, the way `run()`'s own startup and every real `e`
+// invocation do) -- it's what actually switches the terminal to the
+// alternate screen buffer (vim/less-style clean takeover, restored on
+// exit) via `Shell::promote_if_needed`; `render_editor_frame` (what
+// actually paints the file content) always writes straight to the real
+// terminal itself regardless of promotion, so the only thing skipping
+// `compositor_redraw` loses is the tab bar -- exactly the "without
+// windows" point of this entry point. If the user still explicitly
+// invokes a window-family command (`<C-w>`/`:split`/`window new`) from
+// inside it, that isn't specially blocked (no flag threaded through
+// run_edit_frame/run_normal_mode_navigation for it -- see debugger.rs's
+// own doc comment on why avoiding that kind of change to shared code is
+// deliberate); run_edit_frame simply returns once focus genuinely
+// leaves this one pane, and this function treats that exactly like a
+// real quit -- there's no second window/pane here for it to drive.
+pub fn run_edit(path: &str) -> i32 {
+    let mut shell = exec::Shell::new();
+    shell.enable_monitor_mode();
+    let root_cwd = shell.cwd.clone();
+
+    let mut cmd_history = History::load(".bish_cmd_history");
+    let mut registers = Registers::new();
+    let (mut term_rows, mut term_cols) = query_term_size();
+
+    let mut sessions: HashMap<SessionId, SessionState> = HashMap::new();
+    let root_screen = Rc::new(RefCell::new(vt100::Screen::new(content_rows(term_rows), term_cols)));
+    sessions.insert(
+        0,
+        SessionState {
+            shell,
+            buffer: String::new(),
+            history: History::load(".bish_history"),
+            screen: root_screen,
+            warned_stopped_jobs: false,
+            dir_history: vec![root_cwd],
+            dir_history_index: 0,
+            command_transcript: Vec::new(),
+        },
+    );
+    let mut windows: Vec<WindowEntry> = vec![WindowEntry::single(0, Frame::Session(0))];
+    let mut current_window: usize = 0;
+    let mut next_session_id: SessionId = 1;
+    let mut next_window_id: u32 = 1;
+    let mut job_frames: HashMap<JobFrameId, exec::FgJob> = HashMap::new();
+    let mut edit_frames: HashMap<EditFrameId, fileeditor::EditSession> = HashMap::new();
+    let mut sinks_are_grid = false;
+
+    ensure_promoted(&mut sessions, &mut sinks_are_grid);
+
+    let rect = pane_rect(&windows[current_window], windows[current_window].focused_pane, term_rows, term_cols);
+    let session = match fileeditor::EditSession::open(Some(path), normal_mode_content_rows(rect)) {
+        Ok(s) => s,
+        Err(e) => {
+            // Leaving promotion behind here too: promote_if_needed already
+            // switched to the alternate screen before this could fail.
+            print!("\x1b[?1049l");
+            let _ = io::stdout().flush();
+            eprintln!("bish: {}: {}", path, e);
+            return 1;
+        }
+    };
+    let edit_frame_id: EditFrameId = 1;
+    edit_frames.insert(edit_frame_id, session);
+    windows[current_window].stack_mut().push(Frame::Edit(edit_frame_id));
+
+    run_edit_frame(
+        edit_frame_id,
+        0,
+        &mut sessions,
+        &mut windows,
+        &mut current_window,
+        &mut next_session_id,
+        &mut next_window_id,
+        &mut job_frames,
+        &mut edit_frames,
+        &mut cmd_history,
+        &mut sinks_are_grid,
+        &mut registers,
+        &mut term_rows,
+        &mut term_cols,
+    );
+
+    // Same restoration run()'s own final-exit path does -- see its own
+    // doc comment on why this is a direct terminal write, not anything
+    // routed through a session's own sink.
+    print!("\x1b[?1049l");
+    let _ = io::stdout().flush();
+    0
+}
+
 // Shared by both places command mode can be entered: normal mode's own
 // ':' (run_normal_mode_navigation -- the *only* typed-text path now, see
 // editor::ReadOutcome::NormalMode's doc comment), and (M10c) the detach
