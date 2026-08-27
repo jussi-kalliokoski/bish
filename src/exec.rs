@@ -914,6 +914,26 @@ pub struct Shell {
     // Half of DebugDepth; see its own doc comment for why this can't just
     // be `var_scopes.len()` alone.
     subshell_depth: u32,
+    // This session's own remembered idea of "what the real process
+    // environment/umask should look like" -- see sync_real_state_in/out's
+    // own doc comment. Exists because ordinary (non-`local`) variable
+    // assignment and `umask` both mutate real, process-wide OS state
+    // (raw_var_write's fallback is std::env::set_var; run_umask calls the
+    // real umask(2) syscall) rather than anything Shell-owned -- fine for
+    // a single session, but every session sharing this one real process
+    // (repl.rs's `window new`/pane-split code, via new_virtual_child)
+    // would otherwise silently clobber each other's variables/umask the
+    // instant more than one of them ever runs a command. cwd doesn't need
+    // an equivalent snapshot: every real-process spawn site already
+    // passes `.current_dir(&self.cwd)` explicitly rather than relying on
+    // the inherited real cwd, so `self.cwd` (already deep-cloned by
+    // new_virtual_child, already kept live-accurate by run_cd) is by
+    // itself already enough for that half -- *except* for plain relative-
+    // path file I/O (open_out, a redirect's own `Redirect::In`, `source`,
+    // ...), which does still resolve against the real process cwd; see
+    // sync_real_state_in's own doc comment for how that's covered.
+    env_snapshot: std::collections::HashMap<String, String>,
+    umask_snapshot: u32,
 }
 
 // A fresh, process/time-derived seed -- used both for a brand-new Shell
@@ -989,6 +1009,8 @@ impl Shell {
             stdio_override: None,
             debug_hook: None,
             subshell_depth: 0,
+            env_snapshot: std::env::vars().collect(),
+            umask_snapshot: current_umask(),
         }
     }
 
@@ -1196,6 +1218,15 @@ impl Shell {
             stdio_override: None,
             debug_hook: self.debug_hook.clone(),
             subshell_depth: self.subshell_depth + 1,
+            // Captured fresh from the real process rather than cloning
+            // self.env_snapshot/umask_snapshot directly -- equal to it at
+            // this exact instant regardless (new_virtual_child only ever
+            // runs while `self` is the currently-synced-in session; see
+            // sync_real_state_in/out's own doc comment), but this is the
+            // more obviously-correct way to express "start identical to
+            // whatever the real state actually is right now."
+            env_snapshot: std::env::vars().collect(),
+            umask_snapshot: current_umask(),
         }
     }
 
@@ -3381,9 +3412,6 @@ impl Shell {
     // throwaway mask and immediately restoring what was there. Moved here
     // alongside run_ulimit for the same M6 sink reason.
     fn run_umask(&mut self, args: &[String]) -> i32 {
-        unsafe extern "C" {
-            fn umask(mask: u32) -> u32;
-        }
         let symbolic = args.iter().any(|a| a == "-S");
         match args.iter().find(|a| !a.starts_with('-')) {
             Some(s) => match u32::from_str_radix(s, 8) {
@@ -3391,6 +3419,11 @@ impl Shell {
                     unsafe {
                         umask(m);
                     }
+                    // Keep this session's own remembered umask in lockstep
+                    // -- see sync_real_state_in/out's own doc comment for
+                    // why a mutation of this real, process-wide syscall
+                    // needs a Shell-owned mirror at all.
+                    self.umask_snapshot = m;
                     0
                 }
                 Err(_) => {
@@ -3399,11 +3432,7 @@ impl Shell {
                 }
             },
             None => {
-                let cur = unsafe {
-                    let prev = umask(0);
-                    umask(prev);
-                    prev
-                };
+                let cur = current_umask();
                 if symbolic {
                     sh_println!(self, "{}", umask_symbolic(cur));
                 } else {
@@ -4146,13 +4175,9 @@ impl Shell {
         // back, matching real bash's fork isolation for env/variables.
         let env_before: Vec<(String, String)> = std::env::vars().collect();
         // Same reasoning, for `umask` (a real process-wide syscall, not
-        // Shell-owned state either -- see run_umask's own identical FFI
-        // declaration).
-        unsafe extern "C" {
-            fn umask(mask: u32) -> u32;
-        }
-        let umask_before = unsafe { umask(0) };
-        unsafe { umask(umask_before) };
+        // Shell-owned state either -- see current_umask's own doc
+        // comment).
+        let umask_before = current_umask();
 
         let result = child.run_source_here(raw, "subshell");
         // Real bash fires a subshell's own EXIT trap when it finishes
@@ -7185,6 +7210,46 @@ impl Shell {
         self.debug_hook = hook;
     }
 
+    // repl.rs's own multi-session dispatch (the only place more than one
+    // Shell ever shares this real process -- window/pane splits, all
+    // built on new_virtual_child) calls this right before running
+    // anything in this specific session, if a *different* session's
+    // Shell was the last one to run: applies this session's own
+    // remembered real cwd/env/umask onto the actual process, so that
+    // whichever session runs next sees its own variables/umask (not
+    // whatever an unrelated sibling session last left the real process
+    // in) and so that plain relative-path file I/O (open_out, a
+    // redirect's own `Redirect::In`, `source`, ...) -- which, unlike a
+    // real external-process spawn, has no explicit `.current_dir(&self.
+    // cwd)` of its own and just resolves against the real process cwd --
+    // resolves against *this* session's own cwd rather than a sibling's.
+    pub fn sync_real_state_in(&self) {
+        let _ = std::env::set_current_dir(&self.cwd);
+        let current: std::collections::HashSet<String> = std::env::vars().map(|(k, _)| k).collect();
+        for k in &current {
+            if !self.env_snapshot.contains_key(k) {
+                unsafe { std::env::remove_var(k) };
+            }
+        }
+        for (k, v) in &self.env_snapshot {
+            unsafe { std::env::set_var(k, v) };
+        }
+        unsafe { umask(self.umask_snapshot) };
+    }
+
+    // The other half of sync_real_state_in: called right after this
+    // session finishes running something, before a *different* session's
+    // turn (if any) -- captures whatever the real environment/umask
+    // actually are right now back into this session's own remembered
+    // state, so its own next turn (sync_real_state_in again) restores
+    // exactly what it just left behind. cwd needs no equivalent capture
+    // here: self.cwd is already kept live-accurate by run_cd itself,
+    // independently of any of this.
+    pub fn sync_real_state_out(&mut self) {
+        self.env_snapshot = std::env::vars().collect();
+        self.umask_snapshot = current_umask();
+    }
+
     // `set -u`: only a *bare* $VAR/${VAR} reference to a truly-unset name
     // triggers this -- ${VAR:-default}/${VAR-default}/${VAR?msg} etc are
     // explicitly exempt in bash (checking for unset is their whole point),
@@ -8471,6 +8536,17 @@ unsafe extern "C" {
     fn getppid() -> i32;
     fn getuid() -> u32;
     fn geteuid() -> u32;
+    fn umask(mask: u32) -> u32;
+}
+
+// POSIX has no query-only umask read -- `umask(new) -> previous` is the
+// only primitive -- so this immediately restores whatever it finds,
+// leaving no observable side effect (see run_umask's own identical
+// reasoning for its `umask -S`/no-args cases).
+fn current_umask() -> u32 {
+    let cur = unsafe { umask(0) };
+    unsafe { umask(cur) };
+    cur
 }
 
 // Signal traps (`trap CMD SIGNAL`). A signal handler can only safely do

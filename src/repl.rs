@@ -979,7 +979,20 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
                                 // fish both record what was typed, not
                                 // what succeeded.
                                 session.history.record(&session.buffer, Some(&cwd_before));
+                                // Every session sharing this one real
+                                // process (see new_virtual_child's own
+                                // doc comment on why "window new"/pane
+                                // splits do) needs its own variables/umask
+                                // restored onto the real process before
+                                // it runs anything, and captured back
+                                // right after -- otherwise a sibling
+                                // session's own last command silently
+                                // leaks in (or gets clobbered). Cheap and
+                                // idempotent when this session was
+                                // already the one last synced in.
+                                session.shell.sync_real_state_in();
                                 let result = session.shell.run_program(&prog);
+                                session.shell.sync_real_state_out();
                                 if session.shell.cwd != cwd_before {
                                     push_dir_history(session, session.shell.cwd.clone());
                                 }
@@ -6164,7 +6177,12 @@ fn run_command_mode(
                                     let captured = Rc::new(RefCell::new(String::new()));
                                     session.shell.set_sink_capture(captured.clone());
                                     session.shell.restrict_to_builtins = true;
+                                    // See the other run_program call site's
+                                    // own identical comment (repl.rs's main
+                                    // loop) for why this pair is needed.
+                                    session.shell.sync_real_state_in();
                                     let result = session.shell.run_program(&prog);
+                                    session.shell.sync_real_state_out();
                                     session.shell.restrict_to_builtins = false;
                                     session.shell.set_sink_grid(session.screen.clone());
                                     let text = captured.borrow().clone();
