@@ -171,6 +171,22 @@ pub struct DebugController {
     // than `K` itself (see both call sites below); rebuilt fresh every
     // time `K` is pressed, never appended to.
     hover_lines: Vec<String>,
+    // Shared with `run`'s own local (an `Rc` since both need to reach
+    // it: `run`'s own outer loop reads keys through the same guard,
+    // on_statement toggles it) -- see `suspend_raw`/`resume_raw`'s own
+    // doc comment for why a script's own statement (`read`, most
+    // visibly) needs the terminal *out* of raw mode for the bounded
+    // stretch it's actually running in, even though this whole session
+    // otherwise stays raw for the debugger's own key-at-a-time UI.
+    raw_guard: Rc<term::RawGuard>,
+    // Whether the real terminal is currently handed over to the running
+    // script rather than owned by the debugger's own UI -- see
+    // hand_off_to_script's own doc comment. Toggled exactly at the
+    // transition points (not per-statement -- most statements run with
+    // this already `true` and nothing needs to change), so a whole run
+    // with no breakpoints only ever transitions twice: once when it
+    // starts, once when it either pauses or finishes.
+    handed_off: bool,
 }
 
 // How many of the output pane's own lines actually show at once while
@@ -181,7 +197,7 @@ pub struct DebugController {
 const MAX_OUTPUT_CONTENT_ROWS: usize = 8;
 
 impl DebugController {
-    fn new(buf: TextBuffer, term_rows: usize, term_cols: usize, docs: DocIndex) -> Self {
+    fn new(buf: TextBuffer, term_rows: usize, term_cols: usize, docs: DocIndex, raw_guard: Rc<term::RawGuard>) -> Self {
         DebugController {
             buf,
             vk: VimKeys::new(),
@@ -198,6 +214,8 @@ impl DebugController {
             ext_drain_offset: 0,
             docs,
             hover_lines: Vec::new(),
+            raw_guard,
+            handed_off: false,
         }
     }
 
@@ -351,6 +369,77 @@ impl DebugController {
         if file.read_to_end(&mut buf).is_ok() && !buf.is_empty() {
             self.ext_drain_offset += buf.len() as u64;
             self.output.borrow_mut().push_str(&String::from_utf8_lossy(&buf));
+        }
+    }
+
+    // Cedes the real terminal to the script for as long as it keeps
+    // running uninterrupted -- exactly like running it outside the
+    // debugger entirely, the same way vim's own `:!command` temporarily
+    // leaves its own full-screen display for a shell command rather than
+    // trying to show both at once. This is what actually fixes a script
+    // that reads from the user (`read -p`, most visibly): cooked mode
+    // (raw_guard::suspend_raw) restores kernel-driven echo/line-editing,
+    // and a real (not captured) sink means the prompt itself shows up
+    // immediately instead of sitting invisibly in the output pane's own
+    // buffer until long after the moment it mattered -- previously,
+    // both of those were missing, which is what made the debugger look
+    // "stuck" the instant a script tried to read anything.
+    //
+    // Idempotent via `handed_off` -- only the *first* non-pausing
+    // statement since the debugger last had control actually clears the
+    // screen and swaps the sink/stdio_override; every statement after
+    // that, still running uninterrupted, is a no-op here (so an
+    // ordinary script with no breakpoints doesn't flicker/re-clear once
+    // per statement). Note this means the output pane itself goes quiet
+    // for as long as a stretch stays handed off (nothing is captured
+    // while the real terminal owns the output) -- it still does its job
+    // for the case it actually matters most, showing what a *stepped*
+    // run has printed so far while paused; a script that runs freely to
+    // completion or to its next breakpoint just behaves like it would
+    // un-debugged, directly on the real terminal, the same tradeoff
+    // vim's own `:!command` makes.
+    //
+    // A spawned external process's own stdout is un-captured here too
+    // (Shell::clear_stdio_override, undoing set_stdout_capture_file) for
+    // exactly the same reason and the same consistency: without this,
+    // only builtin output would show up live during a handoff, while an
+    // external command's own output stayed invisibly captured until the
+    // debugger reclaimed control -- confusing, since which of those two
+    // a given line is isn't something a script's own author is even
+    // thinking about.
+    fn hand_off_to_script(&mut self, shell: &mut Shell) {
+        if self.handed_off {
+            return;
+        }
+        self.handed_off = true;
+        self.raw_guard.suspend_raw();
+        shell.set_sink_real();
+        shell.clear_stdio_override();
+        print!("\x1b[2J\x1b[H\x1b[?25h(script running -- back to the debugger once it pauses or finishes)\r\n\r\n");
+        let _ = std::io::stdout().flush();
+    }
+
+    // The inverse of hand_off_to_script -- called the moment the
+    // debugger needs the terminal back (about to pause at a breakpoint,
+    // or the run just finished). No explicit redraw here: the caller's
+    // own very next render() (the pause loop's first iteration, or
+    // run()'s own outer-loop iteration once a run ends) already repaints
+    // every row from scratch, which is what actually erases whatever the
+    // script printed directly during the handoff. Re-opens
+    // ext_stdout_path in *append* mode, not begin_capturing_output's own
+    // truncating create -- this is a mid-run re-capture, not the start
+    // of a fresh `:run`, so ext_drain_offset (tracking how much of this
+    // same file has already been folded into `output`) must stay valid
+    // against whatever's already in it.
+    fn reclaim_from_script(&mut self, shell: &mut Shell) {
+        if !self.handed_off {
+            return;
+        }
+        self.handed_off = false;
+        self.raw_guard.resume_raw();
+        shell.set_sink_capture(self.output.clone());
+        if let Ok(file) = std::fs::OpenOptions::new().append(true).open(&self.ext_stdout_path) {
+            shell.set_stdout_capture_file(file);
         }
     }
 
@@ -585,7 +674,7 @@ impl DebugHook for DebugController {
     // command_mode's own nested colon-line loop does for the same reason
     // (no event loop to hand control back to here -- this is called from
     // deep inside run_program, already borrowed by whoever called it).
-    fn on_statement(&mut self, line: usize, depth: DebugDepth, shell: &Shell) -> DebugAction {
+    fn on_statement(&mut self, line: usize, depth: DebugDepth, shell: &mut Shell) -> DebugAction {
         self.drain_external_output();
         let should_pause = self.buf.breakpoints.contains(&line)
             || match self.pending_stop {
@@ -594,8 +683,18 @@ impl DebugHook for DebugController {
                 PendingStop::AtOrBelow(d) => depth <= d,
             };
         if !should_pause {
+            // This exact statement is about to actually run for real
+            // (back in run_program, right after this returns) -- hand
+            // the terminal over to it (see hand_off_to_script's own doc
+            // comment for why, and why this is a no-op past the first
+            // such statement in a row).
+            self.hand_off_to_script(shell);
             return DebugAction::Continue;
         }
+        // About to actually pause -- reclaim the terminal first (a
+        // no-op if it was never handed off, e.g. a breakpoint on this
+        // script's very first statement).
+        self.reclaim_from_script(shell);
         self.pending_stop = PendingStop::None;
         self.paused_at = Some(line);
         self.buf.set_cursor(line.saturating_sub(1), 0);
@@ -628,6 +727,17 @@ impl DebugHook for DebugController {
                     Key::Char(':') => {
                         if let Some(cmd) = self.read_colon_line() {
                             if let Some(action) = self.dispatch_colon_command(&cmd, depth, shell) {
+                                // Same reasoning as the should_pause
+                                // fast path above -- :continue/:next/
+                                // :step all mean "let the real script
+                                // resume running now," so the terminal
+                                // needs handing back over to it; :quit
+                                // doesn't run anything further, so
+                                // there's nothing to hand off to (and
+                                // this session is about to end anyway).
+                                if !matches!(action, DebugAction::Quit) {
+                                    self.hand_off_to_script(shell);
+                                }
                                 return action;
                             }
                         }
@@ -665,14 +775,19 @@ pub fn run(path: &str) -> i32 {
             return 1;
         }
     };
-    let Ok(_guard) = term::RawGuard::enable_with_mouse(0) else {
+    let Ok(guard) = term::RawGuard::enable_with_mouse(0) else {
         eprintln!("bish: debug: not a terminal");
         return 1;
     };
+    // Shared with DebugController itself (Rc, not owned outright): both
+    // this loop's own key reads and on_statement's own suspend_raw/
+    // resume_raw toggling (see that method's own doc comment) need to
+    // reach the exact same guard.
+    let guard = Rc::new(guard);
     print!("\x1b[2J");
 
     let docs = DocIndex::build_from_source(&src, std::path::Path::new(path));
-    let controller = std::rc::Rc::new(std::cell::RefCell::new(DebugController::new(buf, rows, cols, docs)));
+    let controller = std::rc::Rc::new(std::cell::RefCell::new(DebugController::new(buf, rows, cols, docs, guard)));
     let mut shell = Shell::new();
     shell.set_script_args(path.to_string(), Vec::new());
 
@@ -727,6 +842,14 @@ pub fn run(path: &str) -> i32 {
                                 c.drain_external_output();
                                 c.running = false;
                             }
+                            // Whatever the very last statement did
+                            // (on_statement's own hand_off_to_script, if
+                            // it ran without ever pausing again
+                            // afterward), this loop is back to being the
+                            // debugger's own UI now and needs the
+                            // terminal/sink reclaimed regardless of how
+                            // the run ended.
+                            controller.borrow_mut().reclaim_from_script(&mut shell);
                             if controller.borrow().quit_requested {
                                 break;
                             }

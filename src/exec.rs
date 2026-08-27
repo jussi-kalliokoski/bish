@@ -443,7 +443,16 @@ pub struct DebugDepth {
 // breakpoints, rendering, blocking key-reads) lives on the other side of
 // this trait instead, depending on exec.rs, not the reverse.
 pub trait DebugHook {
-    fn on_statement(&mut self, line: usize, depth: DebugDepth, shell: &Shell) -> DebugAction;
+    // `shell: &mut Shell`, not `&Shell` -- deciding whether to keep
+    // running needs write access, not just a read-only variable peek:
+    // when the answer is "let this statement run for real, uninterrupted"
+    // (no pause), the hook needs to actually hand the real terminal over
+    // to it (DebugController::hand_off_to_script -- Shell::set_sink_real,
+    // so e.g. `read -p`'s own prompt shows up immediately instead of
+    // sitting invisibly captured until long after the moment it
+    // mattered) and reclaim it again once it's this hook's turn to
+    // decide again.
+    fn on_statement(&mut self, line: usize, depth: DebugDepth, shell: &mut Shell) -> DebugAction;
 }
 
 // What repl.rs should do in response to a `window`-family command -- see
@@ -1093,6 +1102,16 @@ impl Shell {
         self.sink = OutputSink::Capture(buf);
     }
 
+    // debugger.rs's own "hand the real terminal to the script" moment
+    // (see DebugController::hand_off_to_script's own doc comment): a
+    // statement about to run uninterrupted -- most visibly `read -p`'s
+    // own prompt -- needs its builtin output to land on the real
+    // terminal immediately, not sit invisibly in a captured buffer until
+    // the debugger regains control long after the moment it mattered.
+    pub(crate) fn set_sink_real(&mut self) {
+        self.sink = OutputSink::Real;
+    }
+
     // debugger.rs's own output pane: redirects a spawned *external*
     // process's stdout into `file` instead of the real terminal, the same
     // way `run_in_child_shell` already does for `$(...)`/`(...)` (every
@@ -1112,6 +1131,18 @@ impl Shell {
     // comment at every `command.stderr(...)` call site).
     pub(crate) fn set_stdout_capture_file(&mut self, file: std::fs::File) {
         self.stdio_override = Some(Rc::new(RefCell::new(StdioOverride { stdin: None, stdout: Some(file) })));
+    }
+
+    // The inverse of set_stdout_capture_file -- debugger.rs's own "hand
+    // the real terminal to the script" moment (DebugController::
+    // hand_off_to_script) undoes this too, alongside set_sink_real, so a
+    // spawned external process's own stdout also goes straight to the
+    // real terminal instead of the (invisible, until later drained)
+    // capture file -- consistent with builtin output during that same
+    // window, rather than the two behaving differently depending on
+    // which kind of command happened to produce them.
+    pub(crate) fn clear_stdio_override(&mut self) {
+        self.stdio_override = None;
     }
 
     // How big a freshly-opened pty (run_single's use_pty path) should be
@@ -10077,7 +10108,7 @@ mod tests {
     }
 
     impl DebugHook for RecordingHook {
-        fn on_statement(&mut self, line: usize, depth: DebugDepth, _shell: &Shell) -> DebugAction {
+        fn on_statement(&mut self, line: usize, depth: DebugDepth, _shell: &mut Shell) -> DebugAction {
             self.calls.push((line, depth));
             DebugAction::Continue
         }
@@ -10114,7 +10145,7 @@ mod tests {
             n: u32,
         }
         impl DebugHook for QuitAfterOne {
-            fn on_statement(&mut self, _line: usize, _depth: DebugDepth, _shell: &Shell) -> DebugAction {
+            fn on_statement(&mut self, _line: usize, _depth: DebugDepth, _shell: &mut Shell) -> DebugAction {
                 self.n += 1;
                 if self.n >= 2 { DebugAction::Quit } else { DebugAction::Continue }
             }

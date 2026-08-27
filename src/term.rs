@@ -166,14 +166,7 @@ impl RawGuard {
         if unsafe { tcgetattr(fd, &mut saved) } != 0 {
             return Err(io::Error::last_os_error());
         }
-        let mut raw = saved;
-        raw.c_iflag &= !(IGNBRK | BRKINT | PARMRK | ISTRIP | INLCR | IGNCR | ICRNL | IXON);
-        raw.c_oflag &= !OPOST;
-        raw.c_lflag &= !(ECHO | ICANON | IEXTEN | ISIG);
-        raw.c_cflag &= !CSIZE;
-        raw.c_cflag |= CS8;
-        raw.c_cc[VMIN] = 1;
-        raw.c_cc[VTIME] = 0;
+        let raw = derive_raw(&saved);
         if unsafe { tcsetattr(fd, TCSANOW, &raw) } != 0 {
             return Err(io::Error::last_os_error());
         }
@@ -183,6 +176,102 @@ impl RawGuard {
         }
         Ok(RawGuard { fd, saved, mouse })
     }
+
+    // Temporarily puts the terminal back into exactly the settings it
+    // had before this guard ever went raw, without giving up the guard
+    // itself (no Drop runs, mouse reporting is untouched either way --
+    // see its own doc comment for why that specifically isn't part of
+    // this). For a caller that needs one ordinary, cooked-mode blocking
+    // read to behave the way it would outside a raw-mode session --
+    // kernel-driven echo, line editing, backspace, the works -- bish's
+    // own `read` builtin among them, which does none of that itself
+    // (unlike editor.rs's line editor, which deliberately relies on raw
+    // mode to draw its own line) and so silently breaks (invisible
+    // typing, no backspace) under a raw terminal the debugger holds for
+    // its own, unrelated reason. Pair with `resume_raw` once whatever
+    // needed cooked mode is done.
+    //
+    // Deliberately does NOT just restore `self.saved` -- a debugger
+    // session invoked from *inside* an already-raw outer session (`:dbg`
+    // launched from the real file editor's own command mode, itself
+    // already holding its own RawGuard) would have captured an
+    // *already-raw* baseline as `self.saved`, so "restoring" it would
+    // silently just reapply raw mode, not cooked mode (a real,
+    // interactively-caught bug: `read -p`'s own echo stayed broken
+    // specifically in this nested case, while working fine for a
+    // standalone `bish tool debug`, where the real terminal genuinely
+    // was cooked when the one guard captured it). Deriving cooked mode
+    // fresh from whatever the *live* termios happens to be right now --
+    // the exact inverse of derive_raw's own flag-clearing -- is correct
+    // regardless of nesting depth, since it only ever flips back on the
+    // specific bits raw mode turns off, never assumes a stored snapshot
+    // is still the right baseline to return to.
+    pub fn suspend_raw(&self) {
+        let Some(current) = query(self.fd) else { return };
+        let cooked = derive_cooked(&current);
+        unsafe {
+            tcsetattr(self.fd, TCSANOW, &cooked);
+        }
+    }
+
+    // The inverse of `suspend_raw` -- re-derives raw settings fresh from
+    // whatever the live termios is right now (same reasoning as
+    // suspend_raw's own doc comment: not from `self.saved`, which may
+    // not be this session's real cooked baseline at all in a nested
+    // invocation).
+    pub fn resume_raw(&self) {
+        let Some(current) = query(self.fd) else { return };
+        let raw = derive_raw(&current);
+        unsafe {
+            tcsetattr(self.fd, TCSANOW, &raw);
+        }
+    }
+}
+
+fn query(fd: i32) -> Option<Termios> {
+    let mut current: Termios = unsafe { std::mem::zeroed() };
+    if unsafe { tcgetattr(fd, &mut current) } != 0 {
+        return None;
+    }
+    Some(current)
+}
+
+// The raw-mode derivation `enable_impl` applies once at construction,
+// factored out so `RawGuard::resume_raw` can re-derive the identical
+// settings without duplicating the flag arithmetic.
+fn derive_raw(base: &Termios) -> Termios {
+    let mut raw = *base;
+    raw.c_iflag &= !(IGNBRK | BRKINT | PARMRK | ISTRIP | INLCR | IGNCR | ICRNL | IXON);
+    raw.c_oflag &= !OPOST;
+    raw.c_lflag &= !(ECHO | ICANON | IEXTEN | ISIG);
+    raw.c_cflag &= !CSIZE;
+    raw.c_cflag |= CS8;
+    raw.c_cc[VMIN] = 1;
+    raw.c_cc[VTIME] = 0;
+    raw
+}
+
+// NOT the literal bit-for-bit inverse of derive_raw: raw mode clears
+// IGNCR alongside ICRNL (both off, so a bare CR passes through
+// untranslated and unconsumed either way), but IGNCR and ICRNL aren't
+// independent -- POSIX has IGNCR take priority, discarding CR entirely
+// before ICRNL ever gets a say. Turning *both* back on (the naive
+// symmetric inverse, tried first here and caught by interactive
+// testing) silently ate every Enter keystroke: a script's own `read`
+// would echo whatever was typed but never see a line terminator at
+// all, hanging forever on something that looked like it should have
+// worked. Real cooked mode leaves IGNCR/INLCR/ISTRIP/PARMRK/IGNBRK/
+// BRKINT alone -- only ICANON/ECHO/ISIG/IEXTEN, OPOST, and ICRNL/IXON
+// are what actually need forcing back on for kernel-driven line
+// editing/echo to behave normally, applied to whatever the *current*
+// termios is rather than a potentially-stale stored snapshot (see
+// suspend_raw's own doc comment for why that distinction matters).
+fn derive_cooked(base: &Termios) -> Termios {
+    let mut cooked = *base;
+    cooked.c_iflag |= ICRNL | IXON;
+    cooked.c_oflag |= OPOST;
+    cooked.c_lflag |= ECHO | ICANON | IEXTEN | ISIG;
+    cooked
 }
 
 impl Drop for RawGuard {
