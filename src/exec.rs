@@ -1112,35 +1112,12 @@ impl Shell {
         self.sink = OutputSink::Real;
     }
 
-    // debugger.rs's own output pane: redirects a spawned *external*
-    // process's stdout into `file` instead of the real terminal, the same
-    // way `run_in_child_shell` already does for `$(...)`/`(...)` (every
-    // real-process spawn site already falls back to spawn_stdout_stdio,
-    // which consults exactly this field) -- reused directly here rather
-    // than adding a second mechanism, just applied to this Shell itself
-    // instead of a freshly `new_virtual_child`'d one. Builtin output
-    // (echo/printf/...) doesn't go through this at all -- that's
-    // set_sink_capture's job, called alongside this with a different
-    // destination (a String buffer, not a file) for the exact same
-    // reason `run_in_child_shell` keeps its own sink/stdio_override
-    // wiring separate: they're two independent output paths that only
-    // happen to need the same treatment. Matches this codebase's
-    // existing, accepted asymmetry (also true for `$(...)`): stderr isn't
-    // captured this way, only stdout -- a spawned command's own stderr
-    // still goes straight to the real terminal (see the "always inherit"
-    // comment at every `command.stderr(...)` call site).
-    pub(crate) fn set_stdout_capture_file(&mut self, file: std::fs::File) {
-        self.stdio_override = Some(Rc::new(RefCell::new(StdioOverride { stdin: None, stdout: Some(file) })));
-    }
-
-    // The inverse of set_stdout_capture_file -- debugger.rs's own "hand
-    // the real terminal to the script" moment (DebugController::
-    // hand_off_to_script) undoes this too, alongside set_sink_real, so a
-    // spawned external process's own stdout also goes straight to the
-    // real terminal instead of the (invisible, until later drained)
-    // capture file -- consistent with builtin output during that same
-    // window, rather than the two behaving differently depending on
-    // which kind of command happened to produce them.
+    // Undoes any `stdio_override` currently in place -- debugger.rs's own
+    // "hand the real terminal to the script" moment (PauseState::
+    // hand_off_to_script) calls this alongside set_sink_real so a
+    // spawned external process's own stdout goes straight to the real
+    // terminal too, consistent with builtin output during that same
+    // window.
     pub(crate) fn clear_stdio_override(&mut self) {
         self.stdio_override = None;
     }

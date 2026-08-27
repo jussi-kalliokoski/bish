@@ -2,66 +2,72 @@
 // script's own persistent `Shell` plus whatever else outlives a single
 // `:dbg run`/`continue`/`next`/`step`, e.g. for `:dbg print`/`K` hover
 // after a run has already finished) and `PauseState` (the `DebugHook`
-// actually installed for the *duration* of one run, holding only what a
+// actually installed for the *duration* of one run, holding what a
 // single paused-in-place moment needs).
 //
-// This used to be a completely standalone view (its own Normal-mode
-// navigation subset, its own colon-line reader, its own full-terminal
-// takeover) -- see plan.md's own note on that superseded design. It's
-// gone now: the source view is just the real, read-only `Frame::Edit`
-// pane everything else uses (repl.rs's `run_normal_mode_navigation`/
-// `run_command_mode`, gated by `TextBuffer::is_readonly` -- see that
-// field's own doc comment), and the running script gets a real sibling
-// pane (`Frame::DebugRun`, `repl.rs::split_debug_run_pane`) that becomes
-// focused while `:dbg run` (or `continue`/`next`/`step`) is actually
-// driving it.
+// This used to be a completely standalone view, then (briefly) a small
+// status pill drawn into the `Frame::DebugRun` sibling pane while
+// paused -- both superseded, see plan.md's own notes on why. The
+// deciding user feedback on the pill: pausing shouldn't show yet another
+// distinct UI at all -- it should feel like landing *in the editor* at
+// that exact line, free to navigate around and inspect things with the
+// real motions/`K`, then `:dbg continue` (or `next`/`step`) to resume.
 //
-// One thing that couldn't move: a paused breakpoint (or a statement
-// blocked on real input, e.g. `read -p`) still has to block in place,
-// same thread, inside `DebugHook::on_statement` -- see that trait's own
-// doc comment for why (exec.rs can't depend on repl.rs's window/session
-// state, and running the script as a real separate process would break
-// breakpoint visibility inside subshells/command substitutions, the
-// entire reason this whole feature runs scripts in-process to begin
-// with). `PauseState::on_statement` below is that one remaining
-// exception: it paints directly into the `Frame::DebugRun` pane's own
-// screen rect with plain positioned ANSI (`\x1b[{row};{col}H`), the same
-// *kind* of low-level primitive repl.rs's own render_diagnostics_list_
-// frame/render_output_pane use while *they're* the pane actively being
-// driven, since there's no reaching repl.rs's real compositor from here
-// either. `<C-w>` genuinely can't switch panes while this loop owns the
-// terminal -- inherent to "block in place," not an oversight.
+// `PauseState::on_statement` is still the one place that can't reach
+// repl.rs's real `Frame::Edit` pane at all (see `DebugHook`'s own doc
+// comment in exec.rs: deliberately `&mut Shell`-only, so exec.rs stays
+// decoupled from repl.rs's window/session state; and running the script
+// as a real separate process to avoid this would break breakpoint
+// visibility inside subshells/command substitutions, the entire reason
+// this whole feature runs scripts in-process). So instead of reaching
+// that pane, a pause opens its *own* `TextBuffer` (a fresh, read-only
+// re-open of the same file -- safe, since the real buffer is readonly
+// for as long as any `:dbg` session is attached, so there's nothing for
+// this second copy to ever go stale against) and drives it with the
+// exact same real machinery the actual editor pane uses underneath --
+// `VimKeys`, `editor::apply_motion_or_reselect`, Visual mode + yank,
+// `fileeditor::build_editor_frame`, `docs::hover_lines_at` for `K` --
+// painted directly into the real `Frame::Edit` pane's own rect. Visually
+// indistinguishable from actually being in that pane; the only real
+// difference is `<C-w>` can't switch panes during this one blocked
+// moment (inherent to blocking in place, not an oversight) and only
+// `:dbg <subcommand>` (not the file's own `:w`/`:git`/etc, which need
+// real `&mut sessions`/`&mut windows` this can't reach) works from its
+// colon-line.
 //
-// `:dbg run` is the only thing that ever starts a fresh execution
-// (`Shell::run_source_here`, blocking); once running, `:dbg continue`/
-// `next`/`step`/`print`/`quit`/`help` (plus single-key aliases c/n/s/q/
-// h/?, safe here since this pause loop has no vim motions of its own to
-// collide with) are read directly by `PauseState`'s own loop while
-// genuinely paused -- the *outer* `run_command_mode`'s own "dbg" arm
-// (repl.rs) can't literally reach that moment (the whole process is
-// blocked inside it), so its own `continue`/`next`/`step` cases mainly
-// exist for a consistent, honest "not running" error if typed with
-// nothing paused, sharing this same vocabulary rather than a
-// second one.
+// The running script itself still gets the real `Frame::DebugRun`
+// sibling pane (`repl.rs::split_debug_run_pane`) for as long as it's
+// actually executing uninterrupted (see `hand_off_to_script`'s own doc
+// comment) -- untouched by a pause, which only ever paints into the
+// editor pane's own separate rect.
 
-use std::cell::RefCell;
 use std::collections::BTreeSet;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::Write;
+use std::path::Path;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
+use crate::bishedit::registers::Registers;
+use crate::bishedit::textbuffer::TextBuffer;
+use crate::bishedit::vimkeys::{KeyOutcome, Op, VimKeys};
+use crate::bishedit::Buffer as _;
+use crate::docs::{self, DocIndex};
 use crate::editor::{self, Key};
 use crate::exec::{DebugAction, DebugDepth, DebugHook, Shell};
+use crate::fileeditor::{self, EditorMode};
 use crate::repl::Rect;
 use crate::term;
 
-// What a paused PauseState is waiting to do next -- see PendingStop's
-// original doc comment (unchanged from the standalone design this
-// replaces).
+// What a paused PauseState is waiting to do next.
 #[derive(Clone, Copy)]
 enum PendingStop {
+    // Not stepping -- only an explicit breakpoint stops execution.
     None,
+    // `s`/`step`: stop at the very next statement, any depth.
     Anywhere,
+    // `n`/`next`: stop at the next statement whose depth is no deeper
+    // than this -- i.e. don't stop again just because execution
+    // descended into a function call or a converted foreground subshell/
+    // command-substitution in the meantime.
     AtOrBelow(DebugDepth),
 }
 
@@ -73,27 +79,23 @@ enum PendingStop {
 // *this* `shell`) -- putting `shell` and the hook behind the *same*
 // RefCell would deadlock the instant on_statement tried to borrow itself
 // while already being called through a `run_source_here` that's holding
-// its own borrow open (see PauseState's own doc comment for why the
+// its own borrow open (see `PauseState`'s own doc comment for why the
 // hook is a separate, small `Rc<RefCell<PauseState>>` instead).
 pub struct DebugSession {
     pub(crate) shell: Shell,
     src: String,
-    src_lines: Vec<String>,
 }
-
-static NEXT_PAUSE_ID: AtomicUsize = AtomicUsize::new(0);
 
 impl DebugSession {
     // Reads `path` once, up front -- the buffer this session is attached
     // to is readonly for as long as it stays attached (repl.rs's own
     // `:dbg` handling, `TextBuffer::set_readonly`), so there's no live-
     // editing story to go stale against.
-    pub fn attach(path: &std::path::Path) -> std::io::Result<DebugSession> {
+    pub fn attach(path: &Path) -> std::io::Result<DebugSession> {
         let src = std::fs::read_to_string(path)?;
-        let src_lines: Vec<String> = src.lines().map(|s| s.to_string()).collect();
         let mut shell = Shell::new();
         shell.set_script_args(path.to_string_lossy().to_string(), Vec::new());
-        Ok(DebugSession { shell, src, src_lines })
+        Ok(DebugSession { shell, src })
     }
 
     pub fn peek_var(&self, name: &str) -> Option<String> {
@@ -103,117 +105,130 @@ impl DebugSession {
     pub fn source(&self) -> &str {
         &self.src
     }
-
-    pub fn source_lines(&self) -> &[String] {
-        &self.src_lines
-    }
 }
 
-// The DebugHook actually installed on `DebugSession::shell` for the
+// The `DebugHook` actually installed on `DebugSession::shell` for the
 // duration of exactly one `:dbg run`/`continue`/`next`/`step` call --
-// see DebugSession's own doc comment for why this is a separate `Rc<
-// RefCell<...>>` rather than living on DebugSession itself. Dropped (and
-// its own `raw_guard` along with it) the instant that call returns --
-// nothing here is meant to outlive a single run.
+// see `DebugSession`'s own doc comment for why this is a separate `Rc<
+// RefCell<...>>` rather than living on `DebugSession` itself. Dropped
+// (and its own `raw_guard`/`nav_buf` along with it) the instant that
+// call returns -- nothing here is meant to outlive a single run, except
+// the final cursor position (`nav_cursor`), read back out by the caller
+// right before dropping this.
 pub struct PauseState {
-    breakpoints: BTreeSet<usize>,
     pending_stop: PendingStop,
     paused_at: Option<usize>,
     quit_requested: bool,
-    rect: Rect,
-    src_lines: Vec<String>,
-    // The running script's own combined stdout+stderr from builtins
-    // (Shell::set_sink_capture), plus a spawned *external* process's own
-    // stdout (see ext_stdout_path) -- only actually fills up during the
-    // brief stretches this hook isn't handed off to the script (see
-    // hand_off_to_script's own doc comment): mostly the run's very first
-    // statement(s), and whatever runs again immediately after a pause,
-    // right up until the next hand-off.
-    output: Rc<RefCell<String>>,
-    ext_stdout_path: std::path::PathBuf,
-    ext_drain_offset: u64,
+    // Whether this run ever actually paused -- `nav_cursor`'s own guard
+    // against handing back a `nav_buf` cursor that was never actually
+    // navigated anywhere this run (still sitting at `TextBuffer::open`'s
+    // own default (0, 0), which would otherwise silently reset the real
+    // editor pane's cursor to the top of the file after an uneventful
+    // `:dbg run` that never hit a breakpoint at all).
+    visited: bool,
+    // The real `Frame::DebugRun` pane's own rect -- see `hand_off_to_
+    // script`'s own doc comment; untouched by a pause.
+    run_rect: Rect,
+    // The real `Frame::Edit` pane's own rect -- what a pause paints
+    // into, see this module's own top-of-file doc comment.
+    editor_rect: Rect,
+    term_rows: usize,
+    term_cols: usize,
+    // A second, independent, read-only re-open of the same file being
+    // debugged -- real navigation during a pause happens here, not on
+    // the actual editor pane's own buffer (unreachable from here at all,
+    // see this module's own top-of-file doc comment). Never diverges
+    // from the real one: both are the same readonly file, and this one
+    // is freshly re-opened for every run.
+    nav_buf: TextBuffer,
+    vk: VimKeys,
+    registers: Registers,
+    docs: DocIndex,
+    // `K`'s own popup content -- see repl.rs's identical field on the
+    // real editor pane's own Normal-mode loop for the shared convention
+    // (cleared by any key other than `K`, rebuilt fresh each press).
+    hover_lines: Vec<String>,
+    // A transient one-line message (a `:dbg print`/`help` result, or an
+    // unrecognized command) -- shown in place of the ordinary status
+    // text for exactly one render, then cleared the moment any further
+    // key arrives (whether or not that key sets a new one).
+    message: Option<String>,
     // A *nested* raw-mode guard, freshly created for this one run (not
     // the ambient one `run_normal_mode_navigation` already holds for the
-    // whole editor session) -- same reasoning debugger.rs's original
-    // standalone `run()` had for its own guard: suspend_raw/resume_raw
-    // (term.rs) were specifically fixed this session to derive fresh
-    // from the *live* termios state on every call rather than a stored
-    // snapshot, exactly so nesting like this behaves correctly.
+    // whole editor session) -- same reasoning this module's original
+    // standalone design had for its own guard: `suspend_raw`/
+    // `resume_raw` (term.rs) derive fresh from the *live* termios state
+    // on every call rather than a stored snapshot, exactly so nesting
+    // like this behaves correctly.
     raw_guard: Rc<term::RawGuard>,
     handed_off: bool,
 }
 
 impl PauseState {
-    pub fn new(breakpoints: BTreeSet<usize>, rect: Rect, src_lines: Vec<String>, raw_guard: Rc<term::RawGuard>) -> PauseState {
-        let id = NEXT_PAUSE_ID.fetch_add(1, Ordering::Relaxed);
-        PauseState {
-            breakpoints,
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        path: &Path,
+        breakpoints: BTreeSet<usize>,
+        run_rect: Rect,
+        editor_rect: Rect,
+        term_rows: usize,
+        term_cols: usize,
+        raw_guard: Rc<term::RawGuard>,
+    ) -> std::io::Result<PauseState> {
+        let mut nav_buf = TextBuffer::open(path, editor_rect.rows.max(1))?;
+        nav_buf.breakpoints = breakpoints;
+        nav_buf.set_readonly(true);
+        let docs = DocIndex::build_from_source(&nav_buf.text(), path);
+        Ok(PauseState {
             pending_stop: PendingStop::None,
             paused_at: None,
             quit_requested: false,
-            rect,
-            src_lines,
-            output: Rc::new(RefCell::new(String::new())),
-            ext_stdout_path: std::env::temp_dir().join(format!("bish-debugger-stdout-{}-{id}.tmp", std::process::id())),
-            ext_drain_offset: 0,
+            visited: false,
+            run_rect,
+            editor_rect,
+            term_rows,
+            term_cols,
+            nav_buf,
+            vk: VimKeys::new(),
+            registers: Registers::new(),
+            docs,
+            hover_lines: Vec::new(),
+            message: None,
             raw_guard,
             handed_off: false,
-        }
+        })
     }
 
     pub fn quit_requested(&self) -> bool {
         self.quit_requested
     }
 
-    // Rewires `shell`'s own output paths into this pause's own captured
-    // buffer and resets both to empty -- called once, right before
-    // `shell.run_source_here` (see repl.rs's own "dbg run"/"continue"/
-    // "next"/"step" handling).
-    pub fn begin_capturing_output(&self, shell: &mut Shell) {
-        self.output.borrow_mut().clear();
-        shell.set_sink_capture(self.output.clone());
-        if let Ok(file) = std::fs::File::create(&self.ext_stdout_path) {
-            shell.set_stdout_capture_file(file);
-        }
-    }
-
-    // Folds whatever new bytes a spawned external process has written to
-    // ext_stdout_path since the last drain into `output` -- see the
-    // original standalone design's identical method for why this needs
-    // its own file at all (builtin output lands in `output` directly via
-    // the sink and needs no draining).
-    fn drain_external_output(&mut self) {
-        let Ok(mut file) = std::fs::File::open(&self.ext_stdout_path) else { return };
-        if file.seek(SeekFrom::Start(self.ext_drain_offset)).is_err() {
-            return;
-        }
-        let mut buf = Vec::new();
-        if file.read_to_end(&mut buf).is_ok() && !buf.is_empty() {
-            self.ext_drain_offset += buf.len() as u64;
-            self.output.borrow_mut().push_str(&String::from_utf8_lossy(&buf));
-        }
-    }
-
-    pub fn cleanup_ext_stdout_path(&self) {
-        let _ = std::fs::remove_file(&self.ext_stdout_path);
-    }
-
-    fn output_lines(&self) -> Vec<String> {
-        self.output.borrow().lines().map(|s| s.to_string()).collect()
+    // The cursor's own final position within the pause's own navigation
+    // buffer -- `Some` only if a pause actually happened this run (see
+    // `visited`'s own doc comment). The caller (repl.rs's own "dbg run"
+    // arm) applies this to the *real* editor pane's own buffer once this
+    // whole call returns, so navigating around while paused leaves the
+    // cursor wherever it was left, matching how leaving any other pane
+    // and coming back works everywhere else in this codebase.
+    pub fn nav_cursor(&self) -> Option<(usize, usize)> {
+        self.visited.then(|| self.nav_buf.cursor())
     }
 
     // Cedes the real terminal to the script for as long as it keeps
-    // running uninterrupted -- see the original standalone design's
-    // identical method for the full "why" (cooked mode + a real,
-    // uncaptured sink is what actually makes `read -p`'s own prompt show
-    // up immediately). Positions at this pane's own rect origin rather
-    // than clearing the whole real terminal -- everything the script
-    // prints past that point is still, unavoidably, a real, unclipped
-    // terminal write (there's no pty layer here to actually confine a
-    // spawned process's own output to one pane's columns), matching vim's
-    // own `:!command` taking over the *whole* display for the span of an
-    // external command, just anchored to this pane's own corner instead
-    // of the very top-left.
+    // running uninterrupted -- exactly like running it outside the
+    // debugger entirely, the same way vim's own `:!command` temporarily
+    // leaves its own full-screen display for a shell command rather than
+    // trying to show both at once. This is what actually makes a script
+    // that reads from the user (`read -p`, most visibly) work: cooked
+    // mode (`raw_guard::suspend_raw`) restores kernel-driven echo/line-
+    // editing, and a real (not captured) sink means the prompt itself
+    // shows up immediately. Prints one small banner at the `Frame::
+    // DebugRun` pane's own corner the first time this fires in a row
+    // (idempotent via `handed_off`) -- everything the script prints past
+    // that point is a real, unclipped terminal write (no pty layer here
+    // to actually confine it to one pane's own columns), the same
+    // accepted tradeoff vim's own `:!command` makes, just anchored to
+    // this pane's own corner instead of the very top-left.
     fn hand_off_to_script(&mut self, shell: &mut Shell) {
         if self.handed_off {
             return;
@@ -222,81 +237,121 @@ impl PauseState {
         self.raw_guard.suspend_raw();
         shell.set_sink_real();
         shell.clear_stdio_override();
-        print!("\x1b[{};{}H\x1b[?25h(script running -- back to the debugger once it pauses or finishes)\r\n", self.rect.row + 1, self.rect.col + 1);
+        print!("\x1b[{};{}H\x1b[?25h(script running -- back to the debugger once it pauses or finishes)\r\n", self.run_rect.row + 1, self.run_rect.col + 1);
         let _ = std::io::stdout().flush();
     }
 
-    // The inverse of hand_off_to_script -- see that method's own doc
-    // comment. No explicit redraw here: the caller's own very next
-    // render() call (this loop's first iteration once paused, or
-    // repl.rs's own compositor_redraw once the whole run ends) already
-    // repaints from scratch.
-    fn reclaim_from_script(&mut self, shell: &mut Shell) {
+    // The inverse of hand_off_to_script -- puts the terminal back into
+    // raw/no-echo mode so this struct's own single-keystroke reads work
+    // for pause navigation. No explicit redraw here: the very next
+    // render_editor call (this loop's first iteration once paused)
+    // already repaints the whole editor pane's own rect from scratch.
+    fn reclaim_from_script(&mut self) {
         if !self.handed_off {
             return;
         }
         self.handed_off = false;
         self.raw_guard.resume_raw();
-        shell.set_sink_capture(self.output.clone());
-        if let Ok(file) = std::fs::OpenOptions::new().append(true).open(&self.ext_stdout_path) {
-            shell.set_stdout_capture_file(file);
-        }
     }
 
     fn read_key(&self) -> Option<Key> {
         editor::read_key_idle(&mut || {}).ok().flatten()
     }
 
-    // Draws entirely within this pause's own `rect`: a reverse-video
-    // status pill on the first row ("paused at line N: <source text>"),
-    // the most recent captured output filling whatever's left, and a
-    // colon-line/hint on the last row.
-    fn render(&self, prompt: Option<&str>) {
-        let r = self.rect;
-        if r.rows == 0 || r.cols == 0 {
-            return;
+    // The status row's own text (repl.rs's `render_global_status_row`,
+    // the exact same global row -- not a pane-local one -- the real
+    // editor uses for its own `-- NORMAL --`/position indicator): a
+    // transient `message` if one's showing, else the paused-at-line
+    // reminder, right-aligned with the cursor's own position/line count,
+    // matching `fileeditor::status_text`'s own layout convention.
+    fn status_text(&self) -> String {
+        let mut left = self.message.clone().unwrap_or_else(|| format!("-- PAUSED at line {} -- :dbg continue/next/step/print/quit/help --", self.paused_at.unwrap_or(0)));
+        let (row, col) = self.nav_buf.cursor();
+        let total = self.nav_buf.line_count();
+        let right = format!("{},{}  {}/{}", row + 1, col + 1, row + 1, total);
+        let left_len = left.chars().count();
+        let right_len = right.chars().count();
+        if left_len + right_len < self.term_cols {
+            left.push_str(&" ".repeat(self.term_cols - left_len - right_len));
+            left.push_str(&right);
+            left
+        } else {
+            left.chars().take(self.term_cols).collect()
         }
-        let status = match self.paused_at {
-            Some(line) => {
-                let text = self.src_lines.get(line.saturating_sub(1)).map(|s| s.trim()).unwrap_or("");
-                format!(" paused at line {line}: {text} ")
-            }
-            None => " dbg ".to_string(),
-        };
-        let mut out = format!("\x1b[{};{}H\x1b[K\x1b[7m", r.row + 1, r.col + 1);
-        out.push_str(&status.chars().take(r.cols).collect::<String>());
-        out.push_str("\x1b[0m");
+    }
 
-        let content_rows = r.rows.saturating_sub(2);
-        let lines = self.output_lines();
-        let shown = &lines[lines.len().saturating_sub(content_rows)..];
-        for i in 0..content_rows {
-            out.push_str(&format!("\x1b[{};{}H\x1b[K", r.row + 2 + i, r.col + 1));
-            if let Some(line) = shown.get(i) {
-                out.push_str(&line.chars().take(r.cols).collect::<String>());
+    // The cursor's own current screen position (row, col), accounting
+    // for scroll and the gutter -- render_hover_popup's own anchor
+    // point, same arithmetic repl.rs's own `K` arm uses for the real
+    // editor pane.
+    fn cursor_screen_pos(&self) -> (usize, usize) {
+        let rect = self.editor_rect;
+        let (row, col) = self.nav_buf.cursor();
+        let gutter_width = rect.cols.saturating_sub(fileeditor::editor_content_cols(&self.nav_buf, rect));
+        let screen_row = rect.row + row.saturating_sub(self.nav_buf.viewport_top());
+        let screen_col = rect.col + gutter_width + col.saturating_sub(self.nav_buf.viewport_left());
+        (screen_row, screen_col)
+    }
+
+    fn render_hover_popup(&self) -> String {
+        let (row, col) = self.cursor_screen_pos();
+        fileeditor::render_hover_popup(&self.hover_lines, row, col, self.editor_rect)
+    }
+
+    // `K`'s own hover lookup -- the exact same shared `docs::
+    // hover_lines_at` repl.rs's own real editor `K` arm uses, just with
+    // the live-value tier answered directly from `shell` (always
+    // reachable here, unlike that arm which has to go through a
+    // `debug_frames` lookup first).
+    fn show_hover(&mut self, shell: &Shell) {
+        let (row, col) = self.nav_buf.cursor();
+        let chars = self.nav_buf.line_chars(row);
+        let line_text: String = chars.iter().collect();
+        self.hover_lines = docs::hover_lines_at(&chars, col, &line_text, &self.docs, |name| shell.debug_peek_var(name));
+    }
+
+    // Draws the real editor pane's own rect from scratch: the global
+    // status row (either the ordinary paused reminder, or a colon-line
+    // being typed), the file content via the exact same `fileeditor::
+    // build_editor_frame` the real pane uses, and `K`'s own hover popup
+    // if one's showing -- then leaves the real cursor at whichever of
+    // those is actually live right now.
+    fn render_editor(&self, colon_input: Option<&str>) {
+        let status = match colon_input {
+            Some(buf) => {
+                let mut s = format!(":{buf}");
+                let len = s.chars().count();
+                if len < self.term_cols {
+                    s.push_str(&" ".repeat(self.term_cols - len));
+                } else {
+                    s = s.chars().take(self.term_cols).collect();
+                }
+                s
             }
-        }
-        if r.rows >= 2 {
-            out.push_str(&format!("\x1b[{};{}H\x1b[K", r.row + r.rows, r.col + 1));
-            match prompt {
-                Some(p) => out.push_str(&format!(":{p}")),
-                None => out.push_str("\x1b[2mc)ontinue n)ext s)tep p)rint q)uit h)elp  or `:dbg <name>`\x1b[0m"),
-            }
-        }
+            None => self.status_text(),
+        };
+        let mut out = crate::repl::render_global_status_row(&status, self.term_rows);
+        out.push_str(&fileeditor::build_editor_frame(&self.nav_buf, &self.vk, EditorMode::Normal, self.editor_rect, self.editor_rect.row, self.editor_rect.col, None));
+        out.push_str(&self.render_hover_popup());
+        let (row, col) = match colon_input {
+            Some(buf) => (self.term_rows.saturating_sub(2), 1 + buf.chars().count()),
+            None => self.cursor_screen_pos(),
+        };
+        out.push_str(&format!("\x1b[{};{}H", row + 1, col + 1));
         print!("{out}");
         let _ = std::io::stdout().flush();
     }
 
     // A small colon-line reader -- Enter submits, Escape/empty-Backspace
     // cancels, matching repl.rs's own real command-line convention just
-    // without history/multi-line continuation. `seed` pre-fills the
-    // buffer (bare `p` seeds "print ", so only the name itself needs
-    // typing); an empty Backspace still cancels once the seed itself has
-    // been backed out of, not just for a literally-empty buffer.
-    fn read_colon_line(&self, seed: &str) -> Option<String> {
-        let mut buf = seed.to_string();
+    // without history/multi-line continuation. Drawn into the global
+    // status row (render_editor's own `colon_input` branch) rather than
+    // a separate row, so it reads as "the same status line, mid-type"
+    // exactly like the real editor's own `:` does.
+    fn read_colon_line(&mut self) -> Option<String> {
+        let mut buf = String::new();
         loop {
-            self.render(Some(&buf));
+            self.render_editor(Some(&buf));
             match self.read_key()? {
                 Key::Enter => return Some(buf),
                 Key::Escape => return None,
@@ -314,53 +369,132 @@ impl PauseState {
 
     // Recognizes the exact same subcommand names/short aliases the outer
     // `:dbg` command mode does (repl.rs's own "dbg" arm) -- an optional
-    // leading "dbg " is accepted and stripped for anyone who types it out
-    // of habit, but isn't required (this whole loop's context is already
-    // unambiguous). Returns `Some(action)` only for continue/next/step/
-    // quit, since those are the only ones that actually resume the
-    // script; print/help/an unrecognized line just update what render()
-    // shows next and return `None`.
-    fn dispatch(&mut self, line: &str, depth: DebugDepth, shell: &Shell) -> (Option<DebugAction>, Option<usize>) {
+    // leading "dbg " is accepted and stripped for anyone who types it
+    // out of habit, but isn't required (this colon-line only ever means
+    // a debug command in the first place -- everything else, including
+    // real vim motions/operators, is handled entirely separately, see
+    // `handle_nav_key`). Returns `Some(action)` only for continue/next/
+    // step/quit, the only ones that actually resume the script;
+    // print/help/an unrecognized line just set `message` and return
+    // `None`.
+    fn dispatch(&mut self, line: &str, depth: DebugDepth, shell: &Shell) -> Option<DebugAction> {
         let line = line.trim().strip_prefix("dbg ").unwrap_or(line.trim()).trim();
         match line {
             "c" | "continue" => {
                 self.paused_at = None;
-                (Some(DebugAction::Continue), None)
+                Some(DebugAction::Continue)
             }
             "n" | "next" => {
                 self.pending_stop = PendingStop::AtOrBelow(depth);
                 self.paused_at = None;
-                (Some(DebugAction::StepOver), None)
+                Some(DebugAction::StepOver)
             }
             "s" | "step" => {
                 self.pending_stop = PendingStop::Anywhere;
                 self.paused_at = None;
-                (Some(DebugAction::StepInto), None)
+                Some(DebugAction::StepInto)
             }
             "q" | "quit" => {
                 self.paused_at = None;
                 self.quit_requested = true;
-                (Some(DebugAction::Quit), None)
+                Some(DebugAction::Quit)
             }
             "h" | "help" | "?" => {
-                self.output.borrow_mut().push_str(
-                    "dbg (paused): c)ontinue  n)ext  s)tep  p)rint NAME  q)uit  h)elp -- bare key or `:` then the long/short name, `dbg ` prefix optional\n",
-                );
-                (None, None)
+                self.message = Some("dbg (paused): :dbg continue|next|step|print NAME|quit|help (short c/n/s/p/q/h) -- real vim navigation otherwise, K hovers".to_string());
+                None
             }
             _ => {
                 if let Some(rest) = line.strip_prefix("print ").or_else(|| line.strip_prefix("p ")) {
                     let name = rest.trim();
-                    let msg = match shell.debug_peek_var(name) {
-                        Some(v) => format!("{name} = {v}\n"),
-                        None => format!("{name}: unset or not inspectable\n"),
-                    };
-                    self.output.borrow_mut().push_str(&msg);
+                    self.message = Some(match shell.debug_peek_var(name) {
+                        Some(v) => format!("{name} = {v}"),
+                        None => format!("{name}: unset or not inspectable"),
+                    });
                 } else if !line.is_empty() {
-                    self.output.borrow_mut().push_str(&format!("bish: dbg: unknown command: {line}\n"));
+                    self.message = Some(format!("bish: dbg: unknown command: {line}"));
                 }
-                (None, None)
+                None
             }
+        }
+    }
+
+    // Real vim motions/search/marks/jumps/Visual-mode-plus-yank, applied
+    // directly against `nav_buf` via the same buffer-generic helpers
+    // repl.rs's own `run_normal_mode_navigation` uses for the identical
+    // `KeyOutcome`s. Every mutating outcome (`EnterInsert`, a non-Yank
+    // `Operator`/`OperatorLines`, `Put`, `DeleteCharForward`, `Join`,
+    // surround, `ReplaceChar`, `EnterReplace`, `ToggleCase`,
+    // `AdjustNumber`, `OpenLine`) or one needing window/pane state this
+    // has none of (`Window`) is simply never matched at all -- the same
+    // "enforced by omission" convention `TextBuffer::readonly` already
+    // establishes for the real editor pane.
+    fn handle_nav_key(&mut self, key: Key) {
+        if self.vk.is_idle() && (self.vk.is_visual() || !self.nav_buf.selections.is_empty()) {
+            match key {
+                Key::Char('Z') => {
+                    self.commit_active_selection();
+                    let end = self.nav_buf.cursor();
+                    self.vk.end_visual(end);
+                    return;
+                }
+                Key::Char('y') => {
+                    self.commit_active_selection();
+                    let register = self.vk.take_pending_register();
+                    let end = self.nav_buf.cursor();
+                    self.nav_buf.yank_selections(&mut self.registers, register);
+                    self.nav_buf.selections.clear();
+                    self.vk.end_visual(end);
+                    return;
+                }
+                Key::Escape | Key::CtrlC => {
+                    let end = self.nav_buf.cursor();
+                    self.vk.end_visual(end);
+                    self.nav_buf.selections.clear();
+                    return;
+                }
+                _ => {}
+            }
+        }
+        match self.vk.feed(key) {
+            KeyOutcome::Motion(m, count) => {
+                editor::apply_motion_or_reselect(&mut self.vk, &mut self.nav_buf, m, count);
+                let content_cols = fileeditor::editor_content_cols(&self.nav_buf, self.editor_rect);
+                crate::repl::scroll_to_show_cursor(&mut self.nav_buf, content_cols);
+            }
+            KeyOutcome::EnterVisual(shape) => {
+                let cursor = self.nav_buf.cursor();
+                self.vk.begin_visual(shape, cursor);
+            }
+            KeyOutcome::ReselectVisual => {
+                if let Some((shape, anchor, cursor)) = self.vk.last_visual() {
+                    self.nav_buf.set_cursor(cursor.0, cursor.1);
+                    self.vk.begin_visual(shape, anchor);
+                }
+            }
+            KeyOutcome::Jump { forward } => {
+                let current = self.nav_buf.cursor();
+                let target = if forward { self.vk.jump_forward(current) } else { self.vk.jump_back(current) };
+                if let Some((row, col)) = target {
+                    let row = row.min(self.nav_buf.line_count() - 1);
+                    let col = col.min(self.nav_buf.line_len(row));
+                    self.nav_buf.set_cursor(row, col);
+                    let content_cols = fileeditor::editor_content_cols(&self.nav_buf, self.editor_rect);
+                    crate::repl::scroll_to_show_cursor(&mut self.nav_buf, content_cols);
+                }
+            }
+            KeyOutcome::Operator(Op::Yank, motion, count, register) => {
+                editor::yank_motion(&mut self.nav_buf, &mut self.registers, motion, count, register);
+            }
+            KeyOutcome::OperatorLines(Op::Yank, count, register) => {
+                editor::yank_lines(&self.nav_buf, &mut self.registers, count, register);
+            }
+            _ => {}
+        }
+    }
+
+    fn commit_active_selection(&mut self) {
+        if let Some(range) = crate::repl::active_visual_range(&self.vk, &self.nav_buf) {
+            self.nav_buf.selections.push(range);
         }
     }
 }
@@ -369,8 +503,7 @@ impl DebugHook for PauseState {
     // Blocks in place, same thread -- see this module's own top-of-file
     // doc comment.
     fn on_statement(&mut self, line: usize, depth: DebugDepth, shell: &mut Shell) -> DebugAction {
-        self.drain_external_output();
-        let should_pause = self.breakpoints.contains(&line)
+        let should_pause = self.nav_buf.breakpoints.contains(&line)
             || match self.pending_stop {
                 PendingStop::None => false,
                 PendingStop::Anywhere => true,
@@ -380,12 +513,19 @@ impl DebugHook for PauseState {
             self.hand_off_to_script(shell);
             return DebugAction::Continue;
         }
-        self.reclaim_from_script(shell);
+        // About to actually pause -- reclaim the terminal first (a
+        // no-op if it was never handed off, e.g. a breakpoint on this
+        // script's very first statement).
+        self.reclaim_from_script();
         self.pending_stop = PendingStop::None;
         self.paused_at = Some(line);
+        self.visited = true;
+        self.nav_buf.set_cursor(line.saturating_sub(1), 0);
+        let content_cols = fileeditor::editor_content_cols(&self.nav_buf, self.editor_rect);
+        crate::repl::scroll_to_show_cursor(&mut self.nav_buf, content_cols);
 
         loop {
-            self.render(None);
+            self.render_editor(None);
             let key = match self.read_key() {
                 Some(k) => k,
                 None => {
@@ -393,29 +533,40 @@ impl DebugHook for PauseState {
                     return DebugAction::Quit;
                 }
             };
-            match key {
-                Key::Char(c @ ('c' | 'n' | 's' | 'q' | 'h' | '?')) => {
-                    let (action, _) = self.dispatch(&c.to_string(), depth, shell);
-                    if let Some(action) = action {
-                        if !matches!(action, DebugAction::Quit) {
-                            self.hand_off_to_script(shell);
-                        }
-                        return action;
-                    }
-                }
-                Key::Char(c @ ('p' | ':')) => {
-                    let seed = if c == 'p' { "print " } else { "" };
-                    let Some(cmd) = self.read_colon_line(seed) else { continue };
-                    let (action, _) = self.dispatch(&cmd, depth, shell);
-                    if let Some(action) = action {
-                        if !matches!(action, DebugAction::Quit) {
-                            self.hand_off_to_script(shell);
-                        }
-                        return action;
-                    }
-                }
-                _ => {}
+            // Any key other than K itself dismisses a showing hover
+            // popup, and any key at all dismisses a showing `message` --
+            // both are transient, not a mode.
+            if !matches!(key, Key::Char('K')) {
+                self.hover_lines.clear();
             }
+            self.message = None;
+            if self.vk.is_idle() {
+                match key {
+                    Key::Char('K') => {
+                        self.show_hover(shell);
+                        continue;
+                    }
+                    Key::Char(':') => {
+                        if let Some(cmd) = self.read_colon_line() {
+                            if let Some(action) = self.dispatch(&cmd, depth, shell) {
+                                // Same reasoning `should_pause`'s own
+                                // fast path above has -- continue/next/
+                                // step all mean "let the real script
+                                // resume running now," so the terminal
+                                // needs handing back over to it; quit
+                                // doesn't run anything further.
+                                if !matches!(action, DebugAction::Quit) {
+                                    self.hand_off_to_script(shell);
+                                }
+                                return action;
+                            }
+                        }
+                        continue;
+                    }
+                    _ => {}
+                }
+            }
+            self.handle_nav_key(key);
         }
     }
 }

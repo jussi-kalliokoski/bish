@@ -6651,6 +6651,11 @@ fn run_command_mode(
                                         buffer.clear();
                                         continue;
                                     };
+                                    let Some(path) = tb.path().map(|p| p.to_path_buf()) else {
+                                        show_command_mode_error("bish: dbg: no file name", *term_rows, *term_cols);
+                                        buffer.clear();
+                                        continue;
+                                    };
                                     let pane_id = debug_run_sibling(&windows[current_window], edit_frame_id)
                                         .unwrap_or_else(|| split_debug_run_pane(sessions, windows, current_window, next_session_id, edit_frame_id, *term_rows, *term_cols).0);
                                     let budget = editor_pane_for(&windows[current_window], edit_frame_id)
@@ -6663,24 +6668,39 @@ fn run_command_mode(
                                     }
                                     windows[current_window].focused_pane = pane_id;
                                     compositor_redraw(sessions, windows, current_window, *term_rows, *term_cols);
-                                    let rect = pane_rect(&windows[current_window], pane_id, *term_rows, *term_cols);
+                                    let run_rect = pane_rect(&windows[current_window], pane_id, *term_rows, *term_cols);
+                                    // The real editor pane's own rect --
+                                    // a pause paints straight into this
+                                    // (see debugger.rs's own top-of-file
+                                    // doc comment), not `run_rect`, which
+                                    // stays reserved for the script's own
+                                    // live/handed-off output.
+                                    let Some(editor_pane) = editor_pane_for(&windows[current_window], edit_frame_id) else {
+                                        unreachable!("this whole match arm only runs while editing a real Frame::Edit pane")
+                                    };
+                                    let editor_rect = pane_rect(&windows[current_window], editor_pane, *term_rows, *term_cols);
 
-                                    let quit_requested = match term::RawGuard::enable_with_mouse(0) {
+                                    let (quit_requested, nav_cursor) = match term::RawGuard::enable_with_mouse(0) {
                                         Ok(guard) => {
-                                            let hook = Rc::new(RefCell::new(debugger::PauseState::new(tb.breakpoints.clone(), rect, session.source_lines().to_vec(), Rc::new(guard))));
-                                            hook.borrow().begin_capturing_output(&mut session.shell);
+                                            let hook = match debugger::PauseState::new(&path, tb.breakpoints.clone(), run_rect, editor_rect, *term_rows, *term_cols, Rc::new(guard)) {
+                                                Ok(h) => Rc::new(RefCell::new(h)),
+                                                Err(e) => {
+                                                    show_command_mode_error(&format!("bish: dbg: {}: {e}", path.display()), *term_rows, *term_cols);
+                                                    buffer.clear();
+                                                    continue;
+                                                }
+                                            };
                                             let src = session.source().to_string();
                                             session.shell.set_debug_hook(Some(hook.clone() as Rc<RefCell<dyn DebugHook>>));
                                             session.shell.run_source_here(&src, &trimmed);
                                             session.shell.set_debug_hook(None);
-                                            hook.borrow().cleanup_ext_stdout_path();
                                             print!("{}", term::MOUSE_REPORTING_ENABLE);
                                             let _ = io::stdout().flush();
-                                            hook.borrow().quit_requested()
+                                            (hook.borrow().quit_requested(), hook.borrow().nav_cursor())
                                         }
                                         Err(_) => {
                                             show_command_mode_error("bish: dbg: not a terminal", *term_rows, *term_cols);
-                                            false
+                                            (false, None)
                                         }
                                     };
 
@@ -6688,8 +6708,15 @@ fn run_command_mode(
                                         children[idx].minimized = true;
                                         children[idx].fixed = None;
                                     }
-                                    if let Some(editor_pane) = editor_pane_for(&windows[current_window], edit_frame_id) {
-                                        windows[current_window].focused_pane = editor_pane;
+                                    windows[current_window].focused_pane = editor_pane;
+                                    // A pause navigated `tb`'s own stand-
+                                    // in copy around (debugger.rs's own
+                                    // `nav_buf`) -- carry that cursor
+                                    // over to the real buffer so leaving
+                                    // a run this way feels like leaving
+                                    // any other pane and coming back.
+                                    if let Some((row, col)) = nav_cursor {
+                                        tb.set_cursor(row, col);
                                     }
                                     let status = if quit_requested {
                                         tb.set_readonly(false);
