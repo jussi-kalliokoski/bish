@@ -261,6 +261,20 @@ impl DebugController {
         out.push_str(&fileeditor::build_editor_frame(&self.buf, &self.vk, EditorMode::Normal, rect, rect.row, rect.col, None));
         out.push_str(&self.render_output_pane());
         out.push_str(&self.render_hover_popup());
+        // build_editor_frame already leaves the real cursor at the
+        // buffer's own correct position -- but render_output_pane (and,
+        // when showing, render_hover_popup) both draw *after* it, each
+        // ending with their own last write's position, which is what
+        // the terminal's real cursor is actually left sitting at
+        // otherwise. Left uncorrected, the buffer's cursor keeps
+        // updating internally with every motion (and the *content*
+        // redraws correctly), but the real, visible blinking cursor
+        // never moves from the output pane's own row -- indistinguishable
+        // from navigation simply not working at all. Re-positioning here,
+        // once, after everything else has drawn, is what actually keeps
+        // the visible cursor following the buffer.
+        let (row, col) = self.cursor_screen_pos();
+        out.push_str(&format!("\x1b[{};{}H", row + 1, col + 1));
         print!("{}", out);
         let _ = std::io::stdout().flush();
     }
