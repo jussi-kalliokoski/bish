@@ -16,12 +16,27 @@ pub fn run(args: &[String]) -> i32 {
     match args.first().map(String::as_str) {
         Some("check") => run_check(&args[1..]),
         Some("format") => run_format(&args[1..]),
+        Some("debug") => run_debug(&args[1..]),
         Some(other) => {
-            eprintln!("bish tool: unknown subcommand '{other}' (expected: check, format)");
+            eprintln!("bish tool: unknown subcommand '{other}' (expected: check, format, debug)");
             2
         }
         None => {
-            eprintln!("bish tool: expected a subcommand (usage: bish tool check [--fix] [FILE...], bish tool format [--check] [FILE...])");
+            eprintln!("bish tool: expected a subcommand (usage: bish tool check [--fix] [FILE...], bish tool format [--check] [FILE...], bish tool debug FILE)");
+            2
+        }
+    }
+}
+
+// `bish tool debug <script>` -- unlike check/format, this isn't a
+// one-shot, non-interactive pass: it launches a real interactive raw-
+// mode session (see debugger.rs's own doc comment for why that's a
+// small standalone view rather than repl.rs's full windowed compositor).
+fn run_debug(args: &[String]) -> i32 {
+    match args.first() {
+        Some(path) => crate::debugger::run(path),
+        None => {
+            eprintln!("usage: bish tool debug FILE");
             2
         }
     }

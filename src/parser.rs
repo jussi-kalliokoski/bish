@@ -197,18 +197,38 @@ pub enum Sep {
 pub struct ListItem {
     pub and_or: AndOr,
     pub sep: Sep,
+    // 1-based source line the statement started on -- captured once,
+    // where the *real* Parser first begins parsing this ListItem
+    // (parse_list_until), unlike the separate tokenize_spanned/lint/
+    // format/highlight span machinery, which never fed into this AST at
+    // all. Used by the debugger (exec.rs's run_program) to match against
+    // breakpoints and report the currently-executing line. `0` for a
+    // synthetically re-serialized ListItem (declare -f's print_functions,
+    // functions_preamble) that was never really parsed from source.
+    pub line: usize,
 }
 
 pub type Program = Vec<ListItem>;
 
 pub struct Parser {
     toks: Vec<Tok>,
+    // Parallel to `toks` -- lines[i] is the source line toks[i] started
+    // on. See ListItem::line's own doc comment.
+    lines: Vec<usize>,
     pos: usize,
 }
 
 impl Parser {
-    pub fn new(toks: Vec<Tok>) -> Self {
-        Parser { toks, pos: 0 }
+    pub fn new(toks: Vec<(Tok, usize)>) -> Self {
+        let (toks, lines) = toks.into_iter().unzip();
+        Parser { toks, lines, pos: 0 }
+    }
+
+    // The source line the token at the parser's current position started
+    // on -- `0` (matching ListItem::line's own "not really parsed"
+    // convention) once every token has been consumed.
+    fn current_line(&self) -> usize {
+        self.lines.get(self.pos).copied().unwrap_or(0)
     }
 
     fn peek(&self) -> Option<&Tok> {
@@ -258,6 +278,7 @@ impl Parser {
                 }
                 return Err(format!("unexpected end of input, expected one of {:?}", stops));
             }
+            let line = self.current_line();
             let and_or = self.parse_and_or()?;
             let sep = match self.peek() {
                 Some(Tok::Amp) => {
@@ -270,7 +291,7 @@ impl Parser {
                 }
                 _ => Sep::Seq,
             };
-            items.push(ListItem { and_or, sep });
+            items.push(ListItem { and_or, sep, line });
             self.skip_terminators();
         }
         Ok(items)
@@ -1056,7 +1077,7 @@ fn is_empty_word(w: &Word) -> bool {
 fn split_array_literal_words(raw: &str) -> Result<Vec<ArrayLiteralItem>, String> {
     let toks = Lexer::new(raw).tokenize()?;
     let mut items = Vec::new();
-    for t in toks {
+    for (t, _line) in toks {
         match t {
             Tok::Word(chunks, globbable) => {
                 let w = Word { chunks, globbable };
@@ -1145,4 +1166,37 @@ fn is_valid_ident(s: &str) -> bool {
         _ => return false,
     }
     chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+#[cfg(test)]
+mod line_tracking_tests {
+    use super::*;
+
+    fn lines_of(src: &str) -> Vec<usize> {
+        let toks = crate::lexer::Lexer::new(src).tokenize().expect("lex");
+        let prog = Parser::new(toks).parse_program().expect("parse");
+        prog.iter().map(|item| item.line).collect()
+    }
+
+    #[test]
+    fn top_level_statements_get_their_own_starting_line() {
+        assert_eq!(lines_of("echo a\necho b\necho c\n"), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn blank_lines_and_comments_still_advance_the_count() {
+        assert_eq!(lines_of("echo a\n\n# comment\necho b\n"), vec![1, 4]);
+    }
+
+    #[test]
+    fn a_multi_line_compound_statement_reports_the_line_it_started_on() {
+        // The whole `if ... fi` is one ListItem -- its line is where `if`
+        // itself sits, not where the block ends.
+        assert_eq!(lines_of("if true\nthen\n  echo yes\nfi\necho after\n"), vec![1, 5]);
+    }
+
+    #[test]
+    fn two_statements_on_one_line_share_that_line() {
+        assert_eq!(lines_of("echo a; echo b\necho c\n"), vec![1, 1, 2]);
+    }
 }

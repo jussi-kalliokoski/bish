@@ -988,6 +988,16 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
                                     ExecResult::Window(action) => window_action = Some(action),
                                     ExecResult::Fg => fg_pending = true,
                                     ExecResult::Edit => edit_pending = true,
+                                    // The exit trap already ran at whichever
+                                    // site produced this (see ExecResult::
+                                    // Exit's own doc comment) -- matches
+                                    // this codebase's prior behavior, where
+                                    // `exit`/`set -e`/`set -u` called
+                                    // std::process::exit directly and
+                                    // unconditionally killed the whole
+                                    // process, regardless of which
+                                    // session/pane triggered it.
+                                    ExecResult::Exit(code) => std::process::exit(code),
                                     _ => {}
                                 }
                             }
@@ -4646,19 +4656,37 @@ fn run_normal_mode_navigation(
                 render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides);
                 continue;
             }
+            // `c`: every deleted selection's own gap (delete_selections'
+            // own return, not just its bool-ish "did anything happen")
+            // gets typed into at once -- run_insert_mode's own
+            // `extra_cursors` param replicates every keystroke across
+            // all of them, not just the one `buf.cursor()` happens to
+            // land on. A single selection is just the len-1 case of the
+            // exact same call, unchanged from before this existed.
             Key::Char('c') if vk.is_idle() && matches!(buf, NavBuffer::Editable(_)) && (vk.is_visual() || !buf.selections().is_empty()) => {
                 commit_active_selection(&vk, &mut buf);
                 let register = vk.take_pending_register();
                 let end_cursor = buf.cursor();
-                let mut deleted = false;
+                let mut gaps: Vec<(usize, usize)> = Vec::new();
                 if let NavBuffer::Editable(tb) = &mut buf {
-                    deleted = tb.delete_selections(registers, register);
+                    gaps = tb.delete_selections(registers, register);
                 }
                 buf.selections_mut().clear();
                 vk.end_visual(end_cursor);
-                if deleted && let NavBuffer::Editable(tb) = &mut buf {
+                if !gaps.is_empty() && let NavBuffer::Editable(tb) = &mut buf {
                     let (insert_term_rows, insert_term_cols) = (*term_rows, *term_cols);
-                    fileeditor::run_insert_mode(tb, &mut vk, rect, registers, &mut || service_background_jobs(sessions, windows, job_frames, *current_window, term_rows, term_cols, *sinks_are_grid), false, insert_term_rows, insert_term_cols, color_overrides)?;
+                    fileeditor::run_insert_mode(
+                        tb,
+                        &mut vk,
+                        rect,
+                        registers,
+                        &mut || service_background_jobs(sessions, windows, job_frames, *current_window, term_rows, term_cols, *sinks_are_grid),
+                        false,
+                        insert_term_rows,
+                        insert_term_cols,
+                        color_overrides,
+                        &gaps[1..],
+                    )?;
                 }
                 render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides);
                 continue;
@@ -4908,7 +4936,7 @@ fn run_normal_mode_navigation(
                     if let NavBuffer::Editable(tb) = &mut buf {
                         fileeditor::resolve_insert_start(tb, cmd);
                         let (insert_term_rows, insert_term_cols) = (*term_rows, *term_cols);
-                        fileeditor::run_insert_mode(tb, &mut vk, rect, registers, &mut || service_background_jobs(sessions, windows, job_frames, *current_window, term_rows, term_cols, *sinks_are_grid), false, insert_term_rows, insert_term_cols, color_overrides)?;
+                        fileeditor::run_insert_mode(tb, &mut vk, rect, registers, &mut || service_background_jobs(sessions, windows, job_frames, *current_window, term_rows, term_cols, *sinks_are_grid), false, insert_term_rows, insert_term_cols, color_overrides, &[])?;
                     }
                     render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides);
                 } else {
@@ -4927,7 +4955,7 @@ fn run_normal_mode_navigation(
                 if matches!(buf, NavBuffer::Editable(_)) {
                     if let NavBuffer::Editable(tb) = &mut buf {
                         let (insert_term_rows, insert_term_cols) = (*term_rows, *term_cols);
-                        fileeditor::run_insert_mode(tb, &mut vk, rect, registers, &mut || service_background_jobs(sessions, windows, job_frames, *current_window, term_rows, term_cols, *sinks_are_grid), true, insert_term_rows, insert_term_cols, color_overrides)?;
+                        fileeditor::run_insert_mode(tb, &mut vk, rect, registers, &mut || service_background_jobs(sessions, windows, job_frames, *current_window, term_rows, term_cols, *sinks_are_grid), true, insert_term_rows, insert_term_cols, color_overrides, &[])?;
                     }
                     render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides);
                 } else {
@@ -5023,7 +5051,7 @@ fn run_normal_mode_navigation(
                             let m = fileeditor::redirect_cw_to_ce(tb, &motion);
                             if fileeditor::delete_motion(tb, registers, m, count, register) {
                                 let (insert_term_rows, insert_term_cols) = (*term_rows, *term_cols);
-                                fileeditor::run_insert_mode(tb, &mut vk, rect, registers, &mut || service_background_jobs(sessions, windows, job_frames, *current_window, term_rows, term_cols, *sinks_are_grid), false, insert_term_rows, insert_term_cols, color_overrides)?;
+                                fileeditor::run_insert_mode(tb, &mut vk, rect, registers, &mut || service_background_jobs(sessions, windows, job_frames, *current_window, term_rows, term_cols, *sinks_are_grid), false, insert_term_rows, insert_term_cols, color_overrides, &[])?;
                             }
                         }
                         Op::Lowercase | Op::Uppercase | Op::CaseToggle => {
@@ -5045,7 +5073,7 @@ fn run_normal_mode_navigation(
                         Op::Change => {
                             fileeditor::delete_lines(tb, registers, count, register);
                             let (insert_term_rows, insert_term_cols) = (*term_rows, *term_cols);
-                            fileeditor::run_insert_mode(tb, &mut vk, rect, registers, &mut || service_background_jobs(sessions, windows, job_frames, *current_window, term_rows, term_cols, *sinks_are_grid), false, insert_term_rows, insert_term_cols, color_overrides)?;
+                            fileeditor::run_insert_mode(tb, &mut vk, rect, registers, &mut || service_background_jobs(sessions, windows, job_frames, *current_window, term_rows, term_cols, *sinks_are_grid), false, insert_term_rows, insert_term_cols, color_overrides, &[])?;
                         }
                         Op::Lowercase | Op::Uppercase | Op::CaseToggle => fileeditor::case_operator_lines(tb, count, fileeditor::case_kind_for_op(op)),
                         Op::Indent => fileeditor::indent_lines(tb, count),
@@ -5118,7 +5146,7 @@ fn run_normal_mode_navigation(
                 if let NavBuffer::Editable(tb) = &mut buf {
                     fileeditor::open_line(tb, above);
                     let (insert_term_rows, insert_term_cols) = (*term_rows, *term_cols);
-                    fileeditor::run_insert_mode(tb, &mut vk, rect, registers, &mut || service_background_jobs(sessions, windows, job_frames, *current_window, term_rows, term_cols, *sinks_are_grid), false, insert_term_rows, insert_term_cols, color_overrides)?;
+                    fileeditor::run_insert_mode(tb, &mut vk, rect, registers, &mut || service_background_jobs(sessions, windows, job_frames, *current_window, term_rows, term_cols, *sinks_are_grid), false, insert_term_rows, insert_term_cols, color_overrides, &[])?;
                 }
                 render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides);
             }
@@ -5464,6 +5492,15 @@ fn styled_full_width_line(text: &str, bg: &str, fg: &str, cols: usize) -> String
 // a full repaint, never a diff" convention (see compositor_redraw's own
 // doc comment).
 fn render_command_output_overlay(output: &str, status: i32, term_rows: usize, term_cols: usize) {
+    print!("{}", build_command_output_overlay(output, status, term_rows, term_cols));
+    let _ = io::stdout().flush();
+}
+
+// render_command_output_overlay's own string-building half, split out
+// purely for testability -- same "pure builder plus a thin print
+// wrapper" shape build_compositor_frame_output/diff_frames already
+// established.
+fn build_command_output_overlay(output: &str, status: i32, term_rows: usize, term_cols: usize) -> String {
     let (bg, fg) = if status == 0 { (OUTPUT_BG, OUTPUT_FG) } else { (ERROR_BG, ERROR_FG) };
     // A caller-checked non-zero exit with genuinely empty output (see
     // run_normal_mode_navigation's own doc comment on this) still gets
@@ -5492,8 +5529,28 @@ fn render_command_output_overlay(output: &str, status: i32, term_rows: usize, te
         out.push_str(&format!("\x1b[{};1H", start_row + i + 1));
         out.push_str(&styled_full_width_line(line, bg, fg, term_cols));
     }
-    print!("{}", out);
-    let _ = io::stdout().flush();
+    out
+}
+
+// Shows one error message the exact same way a failed command's own
+// output would (render_command_output_overlay, status != 0 -- its own
+// error colors) -- what every "recognized but malformed input" arm
+// inside run_command_mode's own loop uses now, instead of sink_err.
+// Those arms stay in that same colon-line loop afterward (`buffer.
+// clear(); continue;`) rather than returning to the caller, so they
+// can't rely on the caller's own CommandModeOutcome::Ran-driven overlay
+// call the way a *successful* command's output does -- and sink_err
+// itself would silently go nowhere here: while a Frame::Edit pane's own
+// file-editor content is focused, it's rendered by writing straight to
+// the real terminal (render_editor_frame), bypassing the session's own
+// vt100 Screen grid model entirely until it later loses focus, exactly
+// where sink_err's Grid-sink path would otherwise land these bytes --
+// invisibly, since nothing repaints from that model again before the
+// next real keystroke arrives. A confirmed, previously-reported bug:
+// every error this function used to report this way was completely
+// silent in practice.
+fn show_command_mode_error(msg: &str, term_rows: usize, term_cols: usize) {
+    render_command_output_overlay(msg, 1, term_rows, term_cols);
 }
 
 // Fills every row above command mode's own prompt row with `transcript`
@@ -5742,7 +5799,7 @@ fn run_command_mode(
                         Ok(history::Expansion::Substituted(s)) => s,
                         Ok(history::Expansion::UnrecognizedBang(rest)) => format!("command {}", rest),
                         Err(msg) => {
-                            sessions[&session_id].shell.sink_err(&format!("{}\n", msg));
+                            show_command_mode_error(&msg, *term_rows, *term_cols);
                             continue;
                         }
                     }
@@ -5779,6 +5836,35 @@ fn run_command_mode(
                 // `dispatch_window_cmd`'s existing "one outcome, meaning
                 // depends on the caller" pattern for `<C-w>`.
                 if let Some(tb) = editing.as_deref_mut() {
+                    // `[range]s/pattern/replacement/[flags]`: checked
+                    // before the ordinary space-split (cmd, arg) parsing
+                    // just below, since this command's own syntax (an
+                    // optional leading range, then `s` glued directly to
+                    // its own delimiter -- no space at all) doesn't fit
+                    // that shape. `parse_substitute_command` returns
+                    // `None` -- not even a recognized attempt -- for
+                    // anything else (`w`, `diag`, ...), letting this
+                    // fall through to the ordinary dispatch unchanged.
+                    if let Some(parsed) = parse_substitute_command(&trimmed) {
+                        match parsed.and_then(|cmd| run_substitute(tb, &cmd)) {
+                            Ok((subs, lines)) => {
+                                let output =
+                                    format!("{subs} substitution{} on {lines} line{}", if subs == 1 { "" } else { "s" }, if lines == 1 { "" } else { "s" });
+                                sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry {
+                                    command: trimmed,
+                                    output: output.clone(),
+                                    status: 0,
+                                });
+                                return CommandModeOutcome::Ran { output, status: 0 };
+                            }
+                            Err(e) => {
+                                show_command_mode_error(&format!("bish: {e}"), *term_rows, *term_cols);
+                                buffer.clear();
+                                continue;
+                            }
+                        }
+                    }
+
                     let (cmd, arg) = match trimmed.split_once(' ') {
                         Some((c, a)) => (c, Some(a.trim()).filter(|a| !a.is_empty())),
                         None => (trimmed.as_str(), None),
@@ -5797,7 +5883,7 @@ fn run_command_mode(
                                     return CommandModeOutcome::Ran { output: String::new(), status: 0 };
                                 }
                                 Err(e) => {
-                                    sessions[&session_id].shell.sink_err(&format!("bish: E212: Can't open file for writing: {e}\n"));
+                                    show_command_mode_error(&format!("bish: E212: Can't open file for writing: {e}"), *term_rows, *term_cols);
                                     buffer.clear();
                                     continue;
                                 }
@@ -5816,14 +5902,14 @@ fn run_command_mode(
                                     return CommandModeOutcome::Quit;
                                 }
                                 Err(e) => {
-                                    sessions[&session_id].shell.sink_err(&format!("bish: E212: Can't open file for writing: {e}\n"));
+                                    show_command_mode_error(&format!("bish: E212: Can't open file for writing: {e}"), *term_rows, *term_cols);
                                     buffer.clear();
                                     continue;
                                 }
                             }
                         }
                         "q" if tb.is_dirty() => {
-                            sessions[&session_id].shell.sink_err("bish: E37: No write since last change (add ! to override)\n");
+                            show_command_mode_error("bish: E37: No write since last change (add ! to override)", *term_rows, *term_cols);
                             buffer.clear();
                             continue;
                         }
@@ -5902,7 +5988,7 @@ fn run_command_mode(
                             return CommandModeOutcome::Ran { output: String::new(), status: 0 };
                         }
                         "diag" | "diagnose" => {
-                            sessions[&session_id].shell.sink_err(&format!("bish: diag: unknown subcommand '{}' (expected: clear)\n", arg.unwrap_or_default()));
+                            show_command_mode_error(&format!("bish: diag: unknown subcommand '{}' (expected: clear)", arg.unwrap_or_default()), *term_rows, *term_cols);
                             buffer.clear();
                             continue;
                         }
@@ -5920,12 +6006,12 @@ fn run_command_mode(
                                 fileeditor::FormatOutcome::Formatted => ("Reformatted.".to_string(), 0),
                                 fileeditor::FormatOutcome::AlreadyFormatted => ("Already formatted.".to_string(), 0),
                                 fileeditor::FormatOutcome::NotSupported => {
-                                    sessions[&session_id].shell.sink_err("bish: format: no formatter for this filetype\n");
+                                    show_command_mode_error("bish: format: no formatter for this filetype", *term_rows, *term_cols);
                                     buffer.clear();
                                     continue;
                                 }
                                 fileeditor::FormatOutcome::Error(e) => {
-                                    sessions[&session_id].shell.sink_err(&format!("bish: format: {e}\n"));
+                                    show_command_mode_error(&format!("bish: format: {e}"), *term_rows, *term_cols);
                                     buffer.clear();
                                     continue;
                                 }
@@ -5934,7 +6020,7 @@ fn run_command_mode(
                             return CommandModeOutcome::Ran { output, status };
                         }
                         "format" | "fmt" => {
-                            sessions[&session_id].shell.sink_err(&format!("bish: format: unexpected argument '{}'\n", arg.unwrap_or_default()));
+                            show_command_mode_error(&format!("bish: format: unexpected argument '{}'", arg.unwrap_or_default()), *term_rows, *term_cols);
                             buffer.clear();
                             continue;
                         }
@@ -5953,7 +6039,7 @@ fn run_command_mode(
                         // exactly what happened and why not.
                         "git" => {
                             if !crate::git::available() {
-                                sessions[&session_id].shell.sink_err("bish: git: git executable not found\n");
+                                show_command_mode_error("bish: git: git executable not found", *term_rows, *term_cols);
                                 buffer.clear();
                                 continue;
                             }
@@ -5963,7 +6049,7 @@ fn run_command_mode(
                                     None => (a, None),
                                 },
                                 None => {
-                                    sessions[&session_id].shell.sink_err("bish: git: missing subcommand (expected: blame, diff)\n");
+                                    show_command_mode_error("bish: git: missing subcommand (expected: blame, diff)", *term_rows, *term_cols);
                                     buffer.clear();
                                     continue;
                                 }
@@ -5980,16 +6066,17 @@ fn run_command_mode(
                                         return CommandModeOutcome::Ran { output, status: 0 };
                                     }
                                     Err(e) => {
-                                        sessions[&session_id].shell.sink_err(&format!("bish: git: blame: {e}\n"));
+                                        show_command_mode_error(&format!("bish: git: blame: {e}"), *term_rows, *term_cols);
                                         buffer.clear();
                                         continue;
                                     }
                                 },
                                 "blame" => {
-                                    sessions[&session_id].shell.sink_err(&format!(
-                                        "bish: git: blame: unsupported argument '{}' (only a bare `git blame` toggle is supported for now)\n",
-                                        subarg.unwrap_or_default()
-                                    ));
+                                    show_command_mode_error(
+                                        &format!("bish: git: blame: unsupported argument '{}' (only a bare `git blame` toggle is supported for now)", subarg.unwrap_or_default()),
+                                        *term_rows,
+                                        *term_cols,
+                                    );
                                     buffer.clear();
                                     continue;
                                 }
@@ -6011,21 +6098,22 @@ fn run_command_mode(
                                         return CommandModeOutcome::Ran { output, status: 0 };
                                     }
                                     Err(e) => {
-                                        sessions[&session_id].shell.sink_err(&format!("bish: git: diff: {e}\n"));
+                                        show_command_mode_error(&format!("bish: git: diff: {e}"), *term_rows, *term_cols);
                                         buffer.clear();
                                         continue;
                                     }
                                 },
                                 "diff" => {
-                                    sessions[&session_id].shell.sink_err(&format!(
-                                        "bish: git: diff: unsupported argument '{}' (only a bare `git diff` toggle is supported for now)\n",
-                                        subarg.unwrap_or_default()
-                                    ));
+                                    show_command_mode_error(
+                                        &format!("bish: git: diff: unsupported argument '{}' (only a bare `git diff` toggle is supported for now)", subarg.unwrap_or_default()),
+                                        *term_rows,
+                                        *term_cols,
+                                    );
                                     buffer.clear();
                                     continue;
                                 }
                                 other => {
-                                    sessions[&session_id].shell.sink_err(&format!("bish: git: unknown subcommand '{}' (expected: blame, diff)\n", other));
+                                    show_command_mode_error(&format!("bish: git: unknown subcommand '{}' (expected: blame, diff)", other), *term_rows, *term_cols);
                                     buffer.clear();
                                     continue;
                                 }
@@ -6059,7 +6147,7 @@ fn run_command_mode(
                     Ok(toks) => match Parser::new(toks).parse_program() {
                         Ok(prog) => {
                             if let Some(msg) = command_mode_violation(&prog) {
-                                sessions[&session_id].shell.sink_err(&format!("bish: {}\n", msg));
+                                show_command_mode_error(&format!("bish: {}", msg), *term_rows, *term_cols);
                                 buffer.clear();
                             } else {
                                 // No meaningful shell context here -- this
@@ -6110,21 +6198,42 @@ fn run_command_mode(
                                     // drive (see Shell::discard_pending_
                                     // fg's doc comment) -- reject it here
                                     // instead of silently leaving the job
-                                    // stashed and never driven.
+                                    // stashed and never driven. Returns
+                                    // `Ran{status: 1}` (not `Cancelled`,
+                                    // which stays silent) so the message
+                                    // actually reaches
+                                    // render_command_output_overlay via
+                                    // the caller's own `Ran` handling --
+                                    // `Cancelled`'s own arm there never
+                                    // shows anything, and a direct paint
+                                    // from in here would just get clobbered
+                                    // by handle_command_mode's own
+                                    // unconditional post-return
+                                    // compositor_redraw before the caller
+                                    // even sees this outcome.
                                     ExecResult::Fg => {
-                                        sessions[&session_id].shell.sink_err("bish: fg: not supported in command mode -- use it from the normal shell prompt\n");
                                         sessions.get_mut(&session_id).unwrap().shell.discard_pending_fg();
-                                        return CommandModeOutcome::Cancelled;
+                                        let output = "bish: fg: not supported in command mode -- use it from the normal shell prompt".to_string();
+                                        sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry { command: trimmed, output: output.clone(), status: 1 });
+                                        return CommandModeOutcome::Ran { output, status: 1 };
                                     }
                                     // Same reasoning as Fg just above --
                                     // this restricted read-eval loop has
                                     // no way to drive an interactive
                                     // editor session either.
                                     ExecResult::Edit => {
-                                        sessions[&session_id].shell.sink_err("bish: e: not supported in command mode -- use it from the normal shell prompt\n");
                                         sessions.get_mut(&session_id).unwrap().shell.take_pending_edit();
-                                        return CommandModeOutcome::Cancelled;
+                                        let output = "bish: e: not supported in command mode -- use it from the normal shell prompt".to_string();
+                                        sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry { command: trimmed, output: output.clone(), status: 1 });
+                                        return CommandModeOutcome::Ran { output, status: 1 };
                                     }
+                                    // Matches this codebase's prior behavior
+                                    // for `exit`/`set -e`/`set -u` (see the
+                                    // other run_program call site's own
+                                    // ExecResult::Exit arm above) -- the
+                                    // exit trap already ran wherever this
+                                    // was produced.
+                                    ExecResult::Exit(code) => std::process::exit(code),
                                     _ => {
                                         let status = sessions[&session_id].shell.last_status;
                                         sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry {
@@ -6139,25 +6248,347 @@ fn run_command_mode(
                         }
                         Err(e) => {
                             if !is_incomplete(&e) {
-                                sessions[&session_id].shell.sink_err(&format!("bish: syntax error: {}\n", e));
+                                show_command_mode_error(&format!("bish: syntax error: {}", e), *term_rows, *term_cols);
                                 buffer.clear();
                             }
                         }
                     },
                     Err(e) => {
                         if !is_incomplete(&e) {
-                            sessions[&session_id].shell.sink_err(&format!("bish: syntax error: {}\n", e));
+                            show_command_mode_error(&format!("bish: syntax error: {}", e), *term_rows, *term_cols);
                             buffer.clear();
                         }
                     }
                 }
             }
+            // Same "Ran{status: 1}, not Cancelled" reasoning as the
+            // Fg/Edit arms above -- a genuine stdin read failure while
+            // composing the colon-line itself, before there was ever a
+            // real command to record to the transcript.
             Err(e) => {
-                sessions[&session_id].shell.sink_err(&format!("bish: error reading input: {}\n", e));
-                return CommandModeOutcome::Cancelled;
+                return CommandModeOutcome::Ran { output: format!("bish: error reading input: {}", e), status: 1 };
             }
         }
     }
+}
+
+// `[range]s/pattern/replacement/[flags]` -- vim's own Ex substitute
+// command. One line ref, either endpoint of a `LineRef` pair below.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum LineRef {
+    Current,
+    Last,
+    Number(usize),
+}
+
+impl LineRef {
+    // 0-indexed row, clamped to this buffer's own current bounds --
+    // `Number` is vim's own 1-indexed convention (`:1` is the first
+    // line), so it needs the -1; `Current`/`Last` are already resolved
+    // against this exact buffer.
+    fn resolve(self, current: usize, last: usize) -> usize {
+        match self {
+            LineRef::Current => current,
+            LineRef::Last => last,
+            LineRef::Number(n) => n.saturating_sub(1).min(last),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct SubstituteCmd {
+    from: LineRef,
+    to: LineRef,
+    pattern: String,
+    replacement: String,
+    global: bool,
+}
+
+fn parse_one_line_ref(chars: &[char], i: &mut usize) -> Option<LineRef> {
+    match chars.get(*i) {
+        Some('.') => {
+            *i += 1;
+            Some(LineRef::Current)
+        }
+        Some('$') => {
+            *i += 1;
+            Some(LineRef::Last)
+        }
+        Some(c) if c.is_ascii_digit() => {
+            let start = *i;
+            while chars.get(*i).is_some_and(|c| c.is_ascii_digit()) {
+                *i += 1;
+            }
+            let n: usize = chars[start..*i].iter().collect::<String>().parse().ok()?;
+            Some(LineRef::Number(n))
+        }
+        _ => None,
+    }
+}
+
+// `%` (whole buffer, shorthand for `1,$`), a single ref (`.`/`$`/`N`,
+// meaning that same line for both ends), or `ref,ref` -- `None` (not an
+// error) whenever nothing recognizable starts right at `*i`, so the
+// caller knows no explicit range was given at all (defaults to the
+// current line only, same as bare vim `:s` with no range). Deliberately
+// doesn't support `'<,'>` (visual-mode marks), `;` (range separator that
+// also moves the cursor), or relative `+N`/`-N` offsets -- see plan.md's
+// own note on this feature's scope.
+fn parse_range_prefix(chars: &[char], i: &mut usize) -> Option<(LineRef, LineRef)> {
+    if chars.get(*i) == Some(&'%') {
+        *i += 1;
+        return Some((LineRef::Number(1), LineRef::Last));
+    }
+    let from = parse_one_line_ref(chars, i)?;
+    if chars.get(*i) == Some(&',') {
+        *i += 1;
+        let to = parse_one_line_ref(chars, i).unwrap_or(from);
+        Some((from, to))
+    } else {
+        Some((from, from))
+    }
+}
+
+// Scans from `*i` up to the next unescaped `delim`, unescaping `\<delim>`
+// back to a literal `delim` along the way (vim's own rule: the delimiter
+// can appear literally in the pattern/replacement if backslash-escaped).
+// Reaching the end of input without ever finding a bare `delim` isn't an
+// error -- the *final* delimiter of a `:s` command is optional in vim
+// (`:s/foo/bar` with no trailing `/` at all is valid, same as with one)
+// -- so this just returns everything scanned either way.
+fn scan_until_delim(chars: &[char], i: &mut usize, delim: char) -> String {
+    let mut out = String::new();
+    while let Some(&c) = chars.get(*i) {
+        if c == delim {
+            *i += 1;
+            return out;
+        }
+        if c == '\\' && chars.get(*i + 1) == Some(&delim) {
+            out.push(delim);
+            *i += 2;
+            continue;
+        }
+        out.push(c);
+        *i += 1;
+    }
+    out
+}
+
+// `None`: `trimmed` doesn't even look like `[range]s...` at all (no `s`
+// right after wherever the optional range parsed to), so the caller
+// should fall through to the ordinary space-split command dispatch
+// unchanged -- this never claims a command name it doesn't fully own.
+// `Some(Err(_))`: recognizable as an attempted substitute but malformed
+// (no pattern given at all, e.g. bare `:s` or `:s/`). `Some(Ok(_))`: a
+// complete, ready-to-run command.
+fn parse_substitute_command(trimmed: &str) -> Option<Result<SubstituteCmd, String>> {
+    let chars: Vec<char> = trimmed.chars().collect();
+    let mut i = 0;
+    let (from, to) = parse_range_prefix(&chars, &mut i).unwrap_or((LineRef::Current, LineRef::Current));
+
+    if chars.get(i) != Some(&'s') {
+        return None;
+    }
+    i += 1;
+    // The delimiter itself: any punctuation works in real vim (`s#..#..#`,
+    // `s,..,..,`, ...), not just `/` -- excluding letters/digits/`\\`
+    // keeps this from misfiring on an ordinary word starting with `s`
+    // (`set`, `sort`, ...) that isn't this command at all.
+    let delim = match chars.get(i) {
+        Some(&c) if !c.is_alphanumeric() && c != '\\' => c,
+        _ => return None,
+    };
+    i += 1;
+
+    let pattern = scan_until_delim(&chars, &mut i, delim);
+    if pattern.is_empty() {
+        return Some(Err("E35: no previous regular expression".to_string()));
+    }
+    let replacement = scan_until_delim(&chars, &mut i, delim);
+    let flags: String = chars[i..].iter().collect();
+    Some(Ok(SubstituteCmd { from, to, pattern, replacement, global: flags.contains('g') }))
+}
+
+// Applies `once` (the very next appended char only, `\u`/`\l`) or,
+// failing that, `sticky` (every appended char, `\U`/`\L`, until `\E`/
+// `\e` or the end of the replacement) to each char of `s` as it's
+// pushed -- shared by every expand_replacement call site that appends
+// more than a single literal character (a backreference or `&`) so a
+// case modifier immediately preceding one still applies to the whole
+// substituted span, not just its first char.
+fn push_transformed(out: &mut String, s: &str, once: &mut Option<bool>, sticky: &mut Option<bool>) {
+    for c in s.chars() {
+        let transformed = if let Some(upper) = once.take() {
+            if upper { c.to_ascii_uppercase() } else { c.to_ascii_lowercase() }
+        } else if let Some(upper) = *sticky {
+            if upper { c.to_ascii_uppercase() } else { c.to_ascii_lowercase() }
+        } else {
+            c
+        };
+        out.push(transformed);
+    }
+}
+
+// Expands a `:s` replacement string against one match's own captures
+// (`caps[0]` is the whole match, `caps[1..]` are groups 1.. -- same
+// shape crate::regex::Regex::find_at_with_captures returns) -- vim's own
+// replacement escapes: `&`/`\0` (whole match), `\1`-`\9` (group N,
+// silently empty if that group didn't participate or doesn't exist),
+// `\\` (literal backslash), `\&` (literal &), `\r` (a real newline,
+// splitting the line -- TextBuffer::insert_text already understands an
+// embedded '\n'), `\u`/`\l`/`\U`/`\L`/`\e`/`\E` (case modifiers, see
+// push_transformed). `\=` (the expression register) is deliberately not
+// supported -- see plan.md's own note on this feature's scope.
+fn expand_replacement(replacement: &str, caps: &[String]) -> String {
+    let chars: Vec<char> = replacement.chars().collect();
+    let mut out = String::new();
+    let mut once: Option<bool> = None;
+    let mut sticky: Option<bool> = None;
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '\\' && i + 1 < chars.len() {
+            let n = chars[i + 1];
+            i += 2;
+            match n {
+                '0'..='9' => {
+                    let idx = n.to_digit(10).unwrap() as usize;
+                    let s = caps.get(idx).map(String::as_str).unwrap_or("");
+                    push_transformed(&mut out, s, &mut once, &mut sticky);
+                }
+                '\\' => push_transformed(&mut out, "\\", &mut once, &mut sticky),
+                '&' => push_transformed(&mut out, "&", &mut once, &mut sticky),
+                'r' => out.push('\n'),
+                'u' => once = Some(true),
+                'l' => once = Some(false),
+                'U' => sticky = Some(true),
+                'L' => sticky = Some(false),
+                'e' | 'E' => sticky = None,
+                other => push_transformed(&mut out, &other.to_string(), &mut once, &mut sticky),
+            }
+        } else if c == '&' {
+            let s = caps.first().map(String::as_str).unwrap_or("");
+            push_transformed(&mut out, s, &mut once, &mut sticky);
+            i += 1;
+        } else {
+            push_transformed(&mut out, &c.to_string(), &mut once, &mut sticky);
+            i += 1;
+        }
+    }
+    out
+}
+
+// One line's own worth of substitution -- every match if `global`,
+// otherwise just the first. Returns the line's new text (which may
+// itself now contain embedded newlines, from a `\r` in the replacement)
+// and how many matches were actually replaced. A zero-width match (e.g.
+// `s/x*/Y/g` against a line with no `x` at all) still advances by one
+// character afterward -- copying that character through unchanged --
+// rather than looping forever re-matching the same empty span.
+//
+// Real vim's own `g` loop never tries a match starting at exactly the
+// line's own length (one past the last char) -- confirmed against real
+// vim (`vim -es -c '%s/x*/-/g'`): "ab" -> "-a-b" (not "-a-b-"), "abb"
+// against `b*` -> "-a-" (the real, non-zero-width "bb" match already
+// consumes to the end, and nothing further is tried there either) -- the
+// *one* exception is a genuinely empty line, where position 0 (which
+// also happens to equal the line's own length) is the only position
+// there is, and vim does substitute once there (`""` -> `"-"`). Handled
+// as its own upfront special case below rather than folding it into the
+// general loop's own bound, since "try position 0" and "never try
+// position == len" would otherwise directly contradict each other for
+// that one case.
+fn substitute_line(text: &str, re: &crate::regex::Regex, replacement: &str, global: bool) -> (String, usize) {
+    let chars: Vec<char> = text.chars().collect();
+    if chars.is_empty() {
+        return match re.find_at_with_captures(&chars, 0) {
+            Some((_, _, caps)) => (expand_replacement(replacement, &caps), 1),
+            None => (String::new(), 0),
+        };
+    }
+    let mut out = String::new();
+    let mut pos = 0;
+    let mut count = 0;
+    while pos < chars.len() {
+        match re.find_at_with_captures(&chars, pos) {
+            None => {
+                out.extend(&chars[pos..]);
+                break;
+            }
+            Some((start, end, caps)) => {
+                out.extend(&chars[pos..start]);
+                out.push_str(&expand_replacement(replacement, &caps));
+                count += 1;
+                if !global {
+                    out.extend(&chars[end..]);
+                    break;
+                }
+                if end == start {
+                    if end < chars.len() {
+                        out.push(chars[end]);
+                    }
+                    pos = end + 1;
+                } else {
+                    pos = end;
+                }
+            }
+        }
+    }
+    (out, count)
+}
+
+// `:s`'s own worker: runs `cmd` against `tb`, returning (total
+// substitutions, lines actually changed) on success. `Err` is vim's own
+// "E486: Pattern not found" message when the range had at least one
+// line to search but nothing in it ever matched -- real vim's own exact
+// wording, since this is meant to read like a familiar Ex error, not a
+// bish-specific one. Processes a changed line by replacing its *entire*
+// own content in place (delete_range then insert_text, the same
+// splice-in-place TextBuffer::put_over_selections already uses) rather
+// than trying to patch around just the matched span(s) -- simplest
+// correct way to let a `\r` in the replacement split a line into several
+// without this loop needing to special-case that itself; every
+// downstream line in the range is then addressed by its own shifted row
+// (`+= 1 + however many extra lines this one's own substitution added`)
+// so a growing range is still walked correctly to its (also shifting)
+// end.
+fn run_substitute(tb: &mut TextBuffer, cmd: &SubstituteCmd) -> Result<(usize, usize), String> {
+    let last = tb.line_count().saturating_sub(1);
+    let current = tb.cursor().0;
+    let a = cmd.from.resolve(current, last);
+    let b = cmd.to.resolve(current, last);
+    // A "backwards" range (e.g. `:5,2s/.../...`) is silently normalized
+    // rather than rejected -- real vim asks for confirmation
+    // (E493/"Backwards range given, OK to swap") since there's no
+    // interactive prompt plumbed through command mode for that; just
+    // swapping is the more useful default and matches what confirming
+    // that prompt would do anyway.
+    let mut row = a.min(b);
+    let mut end = a.max(b);
+    let re = crate::regex::Regex::compile(&cmd.pattern);
+    let mut total = 0usize;
+    let mut lines_changed = 0usize;
+    while row <= end && row < tb.line_count() {
+        let original: String = tb.line_chars(row).into_iter().collect();
+        let (new_text, count) = substitute_line(&original, &re, &cmd.replacement, cmd.global);
+        if count > 0 {
+            total += count;
+            lines_changed += 1;
+            let line_len = original.chars().count();
+            let range = motion::MotionRange { shape: motion::MotionShape::Exclusive, from: (row, 0), to: (row, line_len) };
+            tb.delete_range(&range);
+            tb.insert_text((row, 0), &new_text);
+            let added = new_text.matches('\n').count();
+            end += added;
+            row += 1 + added;
+        } else {
+            row += 1;
+        }
+    }
+    if total == 0 {
+        return Err(format!("E486: Pattern not found: {}", cmd.pattern));
+    }
+    Ok((total, lines_changed))
 }
 
 // Command mode allows full control-flow syntax (if/while/for/etc -- every
@@ -6747,5 +7178,267 @@ mod compositor_frame_output_tests {
         // Tab bar pinned to the real last row (term_rows = 3), cleared
         // to end-of-line before its own text.
         assert!(out.contains("\x1b[3;1H\x1b[K[0] tab"), "{out:?}");
+    }
+}
+
+// Regression: run_command_mode's own "recognized but malformed input"
+// arms (unknown :git/:diag/:format subcommand, a failed :w, a syntax
+// error, ...) used to report via sink_err -- invisible in practice while
+// a Frame::Edit pane is focused, since that pane's own live content is
+// rendered by writing straight to the real terminal
+// (fileeditor::render_editor_frame), bypassing the session's own vt100
+// Screen grid model entirely (sink_err's Grid-sink destination) until it
+// later loses focus. show_command_mode_error is the fix: the exact same
+// direct-to-real-terminal overlay a *successful* command's own output
+// already used (build_command_output_overlay, status != 0 -> its own
+// error colors), reached without needing to return out of
+// run_command_mode's own loop the way CommandModeOutcome::Ran's overlay
+// call does.
+#[cfg(test)]
+mod command_mode_error_visibility_tests {
+    use super::*;
+
+    #[test]
+    fn build_command_output_overlay_uses_error_colors_for_nonzero_status() {
+        let out = build_command_output_overlay("bish: git: unknown subcommand 'x'", 1, 24, 80);
+        assert!(out.contains(ERROR_BG), "{out:?}");
+        assert!(out.contains(ERROR_FG), "{out:?}");
+        assert!(!out.contains(OUTPUT_BG), "{out:?}");
+        assert!(out.contains("bish: git: unknown subcommand 'x'"), "{out:?}");
+    }
+
+    #[test]
+    fn build_command_output_overlay_uses_output_colors_for_zero_status() {
+        let out = build_command_output_overlay("2 substitutions on 1 line", 0, 24, 80);
+        assert!(out.contains(OUTPUT_BG), "{out:?}");
+        assert!(!out.contains(ERROR_BG), "{out:?}");
+    }
+
+    #[test]
+    fn build_command_output_overlay_anchors_directly_above_the_prompt_row() {
+        // term_rows = 24 -> command_mode_row = 22 (0-indexed) -> the
+        // prompt itself lives at 1-indexed row 23; a single-line overlay
+        // must land immediately above that, at row 22.
+        let out = build_command_output_overlay("bish: an error", 1, 24, 80);
+        assert!(out.contains("\x1b[22;1H"), "{out:?}");
+        assert!(!out.contains("\x1b[23;1H"), "{out:?}");
+    }
+}
+
+#[cfg(test)]
+mod substitute_command_tests {
+    use super::*;
+
+    fn buf_from(text: &str) -> TextBuffer {
+        let mut buf = TextBuffer::new_unnamed(10);
+        buf.insert_text((0, 0), text);
+        buf.set_cursor(0, 0);
+        buf
+    }
+
+    fn text_of(buf: &TextBuffer) -> String {
+        (0..buf.line_count()).map(|l| buf.line_chars(l).into_iter().collect::<String>()).collect::<Vec<_>>().join("\n")
+    }
+
+    #[test]
+    fn parse_rejects_a_plain_word_starting_with_s() {
+        assert!(parse_substitute_command("set foo").is_none());
+        assert!(parse_substitute_command("sort").is_none());
+        assert!(parse_substitute_command("w").is_none());
+    }
+
+    #[test]
+    fn parse_a_bare_s_with_no_range_defaults_to_current_line() {
+        let cmd = parse_substitute_command("s/foo/bar/").unwrap().unwrap();
+        assert_eq!(cmd.from, LineRef::Current);
+        assert_eq!(cmd.to, LineRef::Current);
+        assert_eq!(cmd.pattern, "foo");
+        assert_eq!(cmd.replacement, "bar");
+        assert!(!cmd.global);
+    }
+
+    #[test]
+    fn parse_accepts_g_flag_and_a_missing_trailing_delimiter() {
+        let cmd = parse_substitute_command("s/foo/bar/g").unwrap().unwrap();
+        assert!(cmd.global);
+        // No trailing "/" at all -- still valid, matches real vim.
+        let cmd = parse_substitute_command("s/foo/bar").unwrap().unwrap();
+        assert_eq!(cmd.replacement, "bar");
+        assert!(!cmd.global);
+    }
+
+    #[test]
+    fn parse_percent_range_is_whole_buffer() {
+        let cmd = parse_substitute_command("%s/foo/bar/").unwrap().unwrap();
+        assert_eq!(cmd.from, LineRef::Number(1));
+        assert_eq!(cmd.to, LineRef::Last);
+    }
+
+    #[test]
+    fn parse_numeric_and_dot_dollar_ranges() {
+        let cmd = parse_substitute_command("5,10s/foo/bar/").unwrap().unwrap();
+        assert_eq!(cmd.from, LineRef::Number(5));
+        assert_eq!(cmd.to, LineRef::Number(10));
+        let cmd = parse_substitute_command(".,$s/foo/bar/").unwrap().unwrap();
+        assert_eq!(cmd.from, LineRef::Current);
+        assert_eq!(cmd.to, LineRef::Last);
+    }
+
+    #[test]
+    fn parse_supports_an_alternate_delimiter() {
+        // "/" is itself part of the pattern here -- "#" as the delimiter
+        // is what makes that possible without escaping.
+        let cmd = parse_substitute_command("s#/usr/bin#/opt/bin#").unwrap().unwrap();
+        assert_eq!(cmd.pattern, "/usr/bin");
+        assert_eq!(cmd.replacement, "/opt/bin");
+    }
+
+    #[test]
+    fn parse_honors_an_escaped_delimiter_inside_the_pattern() {
+        let cmd = parse_substitute_command(r"s/a\/b/c/").unwrap().unwrap();
+        assert_eq!(cmd.pattern, "a/b");
+        assert_eq!(cmd.replacement, "c");
+    }
+
+    #[test]
+    fn parse_empty_pattern_is_an_error() {
+        assert_eq!(parse_substitute_command("s//bar/").unwrap().unwrap_err(), "E35: no previous regular expression");
+    }
+
+    #[test]
+    fn expand_replacement_handles_ampersand_and_backreferences() {
+        let caps = vec!["ab".to_string(), "a".to_string(), "b".to_string()];
+        assert_eq!(expand_replacement("[&]", &caps), "[ab]");
+        assert_eq!(expand_replacement(r"\2\1", &caps), "ba");
+        assert_eq!(expand_replacement(r"\\&", &caps), "\\ab");
+        assert_eq!(expand_replacement(r"\&", &caps), "&");
+    }
+
+    #[test]
+    fn expand_replacement_case_modifiers() {
+        let caps = vec!["hello".to_string()];
+        assert_eq!(expand_replacement(r"\u&", &caps), "Hello");
+        assert_eq!(expand_replacement(r"\U&\E!", &caps), "HELLO!");
+        assert_eq!(expand_replacement(r"\l\U&", &caps), "hELLO");
+    }
+
+    #[test]
+    fn expand_replacement_r_inserts_a_real_newline() {
+        let caps = vec!["x".to_string()];
+        assert_eq!(expand_replacement(r"a\rb", &caps), "a\nb");
+    }
+
+    #[test]
+    fn substitute_line_first_match_only_without_g() {
+        let re = crate::regex::Regex::compile("o");
+        let (text, count) = substitute_line("foo bar", &re, "0", false);
+        assert_eq!(text, "f0o bar");
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn substitute_line_every_match_with_g() {
+        let re = crate::regex::Regex::compile("o");
+        let (text, count) = substitute_line("foo bar", &re, "0", true);
+        assert_eq!(text, "f00 bar");
+        assert_eq!(count, 2);
+    }
+
+    // Every case here was checked against real vim first (`vim -es -c
+    // '%s/PATTERN/-/g'`) -- see substitute_line's own doc comment for
+    // the exact commands and why the line's own end is never itself a
+    // valid zero-width match position, except when the whole line is
+    // empty.
+    #[test]
+    fn substitute_line_zero_width_match_makes_forward_progress_but_never_matches_past_the_last_char() {
+        let re = crate::regex::Regex::compile("x*");
+        let (text, count) = substitute_line("ab", &re, "-", true);
+        assert_eq!(text, "-a-b");
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn substitute_line_zero_width_on_a_single_char_line() {
+        let re = crate::regex::Regex::compile("x*");
+        let (text, count) = substitute_line("a", &re, "-", true);
+        assert_eq!(text, "-a");
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn substitute_line_zero_width_on_an_empty_line_still_substitutes_once() {
+        let re = crate::regex::Regex::compile("x*");
+        let (text, count) = substitute_line("", &re, "-", true);
+        assert_eq!(text, "-");
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn substitute_line_a_real_match_reaching_the_end_leaves_nothing_further_to_match() {
+        let re = crate::regex::Regex::compile("b*");
+        let (text, count) = substitute_line("ab", &re, "-", true);
+        assert_eq!(text, "-a-");
+        assert_eq!(count, 2);
+        let (text, count) = substitute_line("abb", &re, "-", true);
+        assert_eq!(text, "-a-");
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn run_substitute_current_line_only_by_default() {
+        let mut buf = buf_from("foo\nfoo\nfoo");
+        buf.set_cursor(1, 0);
+        let cmd = SubstituteCmd { from: LineRef::Current, to: LineRef::Current, pattern: "foo".to_string(), replacement: "bar".to_string(), global: false };
+        let (subs, lines) = run_substitute(&mut buf, &cmd).unwrap();
+        assert_eq!((subs, lines), (1, 1));
+        assert_eq!(text_of(&buf), "foo\nbar\nfoo");
+    }
+
+    #[test]
+    fn run_substitute_whole_buffer_with_global_flag() {
+        let mut buf = buf_from("foo foo\nfoo\nbaz");
+        let cmd = SubstituteCmd { from: LineRef::Number(1), to: LineRef::Last, pattern: "foo".to_string(), replacement: "X".to_string(), global: true };
+        let (subs, lines) = run_substitute(&mut buf, &cmd).unwrap();
+        assert_eq!((subs, lines), (3, 2));
+        assert_eq!(text_of(&buf), "X X\nX\nbaz");
+    }
+
+    #[test]
+    fn run_substitute_backreference_and_capture() {
+        let mut buf = buf_from("hello world");
+        let cmd = SubstituteCmd { from: LineRef::Current, to: LineRef::Current, pattern: "(hello) (world)".to_string(), replacement: r"\2 \1".to_string(), global: false };
+        run_substitute(&mut buf, &cmd).unwrap();
+        assert_eq!(text_of(&buf), "world hello");
+    }
+
+    #[test]
+    fn run_substitute_r_splits_a_line_and_still_advances_the_range_correctly() {
+        // Range is the whole 2-line buffer; line 0's own substitution
+        // splits it into two lines via \r -- line 1 (originally "b")
+        // must still be reached afterward, now at row 2.
+        let mut buf = buf_from("a,a\nb");
+        let cmd = SubstituteCmd { from: LineRef::Number(1), to: LineRef::Last, pattern: ",".to_string(), replacement: r"\r".to_string(), global: false };
+        let (subs, lines) = run_substitute(&mut buf, &cmd).unwrap();
+        assert_eq!(subs, 1);
+        assert_eq!(lines, 1);
+        assert_eq!(text_of(&buf), "a\na\nb");
+    }
+
+    #[test]
+    fn run_substitute_reports_pattern_not_found() {
+        let mut buf = buf_from("foo");
+        let cmd = SubstituteCmd { from: LineRef::Current, to: LineRef::Current, pattern: "zzz".to_string(), replacement: "x".to_string(), global: false };
+        assert_eq!(run_substitute(&mut buf, &cmd).unwrap_err(), "E486: Pattern not found: zzz");
+    }
+
+    #[test]
+    fn end_to_end_percent_s_g_via_run_command_mode_parsing_path() {
+        // Confirms the two pieces (parse + run) compose correctly, not
+        // just each in isolation.
+        let mut buf = buf_from("cat cat\ndog");
+        let parsed = parse_substitute_command("%s/cat/dog/g").unwrap().unwrap();
+        let (subs, lines) = run_substitute(&mut buf, &parsed).unwrap();
+        assert_eq!((subs, lines), (2, 1));
+        assert_eq!(text_of(&buf), "dog dog\ndog");
     }
 }

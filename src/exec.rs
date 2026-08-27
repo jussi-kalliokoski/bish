@@ -157,6 +157,119 @@ impl OutputSink {
     }
 }
 
+// A Shell's own idea of "what should an external command's stdin/stdout
+// default to when nothing more specific redirects it" -- consulted at
+// every `Stdio::inherit()` fallback site (spawn_stdin_stdio/
+// spawn_stdout_stdio below) instead of calling `Stdio::inherit()`
+// directly. Only meaningful for a Shell created by run_in_child_shell
+// (a foreground subshell/command-substitution/proc-sub now running
+// in-process instead of self-exec'ing -- see its own doc comment): once
+// that construct's own external commands stop being real *grandchild*
+// processes of a real re-exec'd child (which naturally inherited the
+// right fds for free, since `.output()`/`.status()`'s own pipe/redirect
+// was that child's real fd 1), something has to keep telling them where
+// their default stdio actually goes. `None` (the ordinary case for every
+// other Shell) means "really inherit the real process's own fds",
+// exactly matching plain `Stdio::inherit()`.
+
+// Shell::run_in_child_shell's own redirect/capture argument -- see its own
+// doc comment. `Default` (every field `None`/`false`) means "this
+// construct has no redirect of its own," inheriting the parent's current
+// output/input destination exactly.
+#[derive(Default)]
+struct ChildStdio {
+    stdout: Option<std::fs::File>,
+    stdin: Option<std::fs::File>,
+    stderr: Option<std::fs::File>,
+    dup_err_to_out: bool,
+    dup_out_to_err: bool,
+}
+
+struct StdioOverride {
+    // `Some` => read from here (a real, shared, sequentially-consumed
+    // reader) instead of the real stdin -- see SharedReaderState's own
+    // doc comment for why this needs more than a bare File.
+    stdin: Option<Rc<RefCell<SharedReaderState>>>,
+    // `Some` => write here instead of the real stdout.
+    stdout: Option<std::fs::File>,
+}
+
+// Backs a converted construct's stdin override (see StdioOverride's own
+// doc comment): the real File, plus whatever's already been pulled from
+// it via a real read() syscall but not yet consumed by a BufRead::
+// consume() call. `read_input_source`'s own doc comment explains why a
+// fresh, throwaway BufReader on every call would silently drop
+// read-ahead bytes between separate `read` builtin invocations in the
+// same `while read` loop -- this is that same problem, solved the same
+// way (one persistent buffer, reused across calls) for the case where
+// the source is this override rather than the real process's own stdin.
+struct SharedReaderState {
+    file: std::fs::File,
+    pending: Vec<u8>,
+}
+
+// A thin, freshly-built-per-call BufRead over a SharedReaderState --
+// read_input_source hands one of these out each time it's called, but
+// they all share (and correctly hand back and forth) the same
+// underlying pending-bytes buffer, so a sequence of separate calls
+// behaves like one persistent reader. Needed (rather than just handing
+// out `Rc<RefCell<SharedReaderState>>` directly wrapped in a
+// std::io::BufReader) because BufRead::fill_buf must return a `&[u8]`
+// borrowed from `&mut self` -- a RefCell borrow can't be smuggled out
+// through that signature, so this owns a local copy of "the currently
+// available slice" instead and reconciles it against the shared state
+// on fill/consume/drop.
+struct SharedStdinReader {
+    state: Rc<RefCell<SharedReaderState>>,
+    local: Vec<u8>,
+}
+
+impl std::io::Read for SharedStdinReader {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        use std::io::BufRead;
+        let buf = self.fill_buf()?;
+        let n = buf.len().min(out.len());
+        out[..n].copy_from_slice(&buf[..n]);
+        self.consume(n);
+        Ok(n)
+    }
+}
+
+impl std::io::BufRead for SharedStdinReader {
+    fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+        if self.local.is_empty() {
+            let mut state = self.state.borrow_mut();
+            if state.pending.is_empty() {
+                use std::io::Read;
+                let mut tmp = [0u8; 8192];
+                let n = state.file.read(&mut tmp)?;
+                state.pending.extend_from_slice(&tmp[..n]);
+            }
+            std::mem::swap(&mut self.local, &mut state.pending);
+        }
+        Ok(&self.local)
+    }
+
+    fn consume(&mut self, amt: usize) {
+        self.local.drain(..amt.min(self.local.len()));
+    }
+}
+
+impl Drop for SharedStdinReader {
+    fn drop(&mut self) {
+        // Hand back whatever this call fetched but never consumed (e.g.
+        // read_until found its delimiter partway through a bulk read),
+        // so the *next* SharedStdinReader -- the next `read` call in the
+        // same loop -- picks up exactly where this one left off.
+        if !self.local.is_empty() {
+            let mut state = self.state.borrow_mut();
+            let mut rest = std::mem::take(&mut self.local);
+            rest.append(&mut state.pending);
+            state.pending = rest;
+        }
+    }
+}
+
 // Mirror std's print!/println!/eprint!/eprintln! but route through a
 // Shell's own sink instead of unconditionally going straight to the real
 // process stdout/stderr. `$self` needs `sink_out`/`sink_err` methods
@@ -242,6 +355,25 @@ pub enum ExecResult {
     // already does via `pending_fg`; repl.rs reacts to this signal by
     // calling `Shell::take_pending_edit` to get it back out.
     Edit,
+    // `exit`, a failing statement under `set -e`, a `set -u` violation,
+    // or a failed `exec` -- a request to terminate *this Shell's own
+    // top-level run*, not necessarily the real OS process. Bubbles up
+    // through run_and_or/run_pipeline/run_program exactly like the other
+    // signal variants; whoever called the outermost run_program decides
+    // what "terminate" means: the real top level (main.rs's run_source,
+    // repl.rs's two run_program call sites) turns this into a genuine
+    // std::process::exit (matching this codebase's prior behavior, where
+    // these four sites called std::process::exit directly, unconditionally
+    // killing the whole process no matter which session/pane triggered
+    // it); `run_in_child_shell` (a foreground subshell/command-substitution/
+    // proc-sub running in-process, see its own doc comment) instead
+    // unwraps this as *that child's own* exit status, matching real bash's
+    // fork isolation for `(exit 3)` -- the enclosing real shell must not
+    // die just because a subshell called `exit`. The exit trap has
+    // already been run by whichever site produced this (see e.g.
+    // run_program's own errexit arm) -- nothing downstream should run it
+    // again.
+    Exit(i32),
 }
 
 impl ExecResult {
@@ -249,6 +381,7 @@ impl ExecResult {
         match self {
             ExecResult::Status(s) => s,
             ExecResult::Return(s) => s,
+            ExecResult::Exit(s) => s,
             ExecResult::Break(_) | ExecResult::Continue(_) => 0,
             ExecResult::Window(_) | ExecResult::Fg | ExecResult::Edit => 0,
         }
@@ -257,9 +390,60 @@ impl ExecResult {
     fn is_signal(self) -> bool {
         matches!(
             self,
-            ExecResult::Break(_) | ExecResult::Continue(_) | ExecResult::Return(_) | ExecResult::Window(_) | ExecResult::Fg | ExecResult::Edit
+            ExecResult::Break(_)
+                | ExecResult::Continue(_)
+                | ExecResult::Return(_)
+                | ExecResult::Window(_)
+                | ExecResult::Fg
+                | ExecResult::Edit
+                | ExecResult::Exit(_)
         )
     }
+}
+
+// What a paused DebugHook decided to do next -- see DebugHook's own doc
+// comment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DebugAction {
+    // Keep running until the next breakpoint/step condition.
+    Continue,
+    // Stop at the next statement at this *same or shallower* depth --
+    // i.e. don't stop again just because execution descended into a
+    // function call or a converted foreground subshell/command-
+    // substitution in the meantime.
+    StepOver,
+    // Stop at the very next statement, regardless of depth.
+    StepInto,
+    // Unwind the whole running program, same as a real `exit` (see
+    // ExecResult::Exit) -- used to abandon a debug run entirely (`q` in
+    // the debugger UI) without killing the real process.
+    Quit,
+}
+
+// Where the interpreter currently is, for DebugHook::on_statement's own
+// step-over/step-into bookkeeping. Compared subshell_depth first, then
+// call_depth: without the subshell half, a StepOver issued in the parent
+// at its own top level (subshell_depth 0, call_depth 0) could otherwise
+// be fooled by a converted foreground subshell/command-substitution
+// starting its own run_program at call_depth 0 too, aliasing two
+// genuinely different "frames" together.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct DebugDepth {
+    pub subshell_depth: u32,
+    pub call_depth: usize,
+}
+
+// Called once per top-level ListItem, right before run_program actually
+// runs it (see run_program's own call site) -- the single hook point
+// every executed statement passes through uniformly, at every nesting
+// depth (if/while/for/case/function bodies all recurse back through
+// run_program). Defined here (using only exec.rs-level types) rather
+// than in the concrete debugger UI module, so exec.rs doesn't gain a
+// dependency on repl.rs/bishedit -- the concrete implementation (owning
+// breakpoints, rendering, blocking key-reads) lives on the other side of
+// this trait instead, depending on exec.rs, not the reverse.
+pub trait DebugHook {
+    fn on_statement(&mut self, line: usize, depth: DebugDepth, shell: &Shell) -> DebugAction;
 }
 
 // What repl.rs should do in response to a `window`-family command -- see
@@ -531,14 +715,21 @@ pub struct Shell {
     // terminal job control -- process-group isolation, `tcsetpgrp`
     // foreground reassignment, genuine Ctrl-Z/SIGTSTP suspend-to-stopped
     // -- is layered on top of this (M11, gated on `set -m`/opt_monitor)
-    // for the one case it actually matters: a single external command
-    // run_single spawns directly (see its own pre_exec setpgid hook and
-    // Job::pgid). Deliberately not extended to multi-stage pipelines
-    // (run_multi) or the self-exec'd subshell/coproc spawn sites in this
-    // pass -- those still behave as a script would expect (Ctrl-Z there
-    // does nothing useful yet), only the single-foreground-command case a
-    // human actually hits at an interactive prompt was worth the real
-    // process-group plumbing right now.
+    // for a single foreground external command run_single spawns directly
+    // (see its own pre_exec setpgid hook, tcsetpgrp reassignment, and
+    // Job::pgid): that's the one case a human interactively suspending a
+    // running command actually hits. A *backgrounded* multi-stage
+    // pipeline (run_multi) or redirected compound command (run_
+    // compound_redirected) also gets process-group isolation (every
+    // pipeline stage sharing one group, seeded from its first stage's
+    // pid) -- enough for `kill %N`/`bg`'s own SIGCONT to correctly reach
+    // every process in the job at once, without the terminal-foreground-
+    // reassignment/stop-handling machinery a *foreground* run of either
+    // construct would additionally need (not implemented -- Ctrl-Z on a
+    // foreground pipeline/redirected compound still does nothing useful,
+    // matching a plain foreground external command before M11 added
+    // that). The self-exec'd subshell/coproc spawn sites are still
+    // deliberately left with no isolation at all, backgrounded or not.
     //
     // Held behind Rc<RefCell<_>> (single-threaded, so plain interior
     // mutability, no Arc/Mutex needed) rather than owned directly:
@@ -688,6 +879,41 @@ pub struct Shell {
     // just run at all" (taken by `take_pending_edit`); the inner one is
     // "was a file argument given," `e`'s own optional parameter.
     pending_edit: Option<Option<String>>,
+    // Set by check_nounset (a `set -u` violation) instead of calling
+    // std::process::exit directly -- that call happens deep inside word
+    // expansion (expand_word and its many callers), which has no
+    // ExecResult to bubble a signal through. Consulted at the two
+    // choke points that matter: run_single checks right after building a
+    // simple command's argv (stopping *that* command from ever
+    // dispatching/spawning using a bad expansion, the highest-value
+    // containment -- matches the immediacy std::process::exit used to
+    // give), and run_program's own per-statement loop checks as a
+    // backstop (same granularity `set -e`'s own check there already has,
+    // catching violations from expansion sites run_single's own check
+    // doesn't cover -- e.g. a `for`/`case`/arithmetic list). Not shared
+    // via Rc: each Shell (including a new_virtual_child) gets its own.
+    pending_exit: Option<i32>,
+    // See StdioOverride's own doc comment. `None` for every ordinary
+    // Shell (spawned external commands really inherit the real process's
+    // fds); set by run_in_child_shell on the Shell it builds for a
+    // converted foreground subshell/command-substitution/proc-sub. Not
+    // shared via Rc: each Shell gets its own (a nested converted
+    // construct inside another sets its own fresh override, it doesn't
+    // see or touch the enclosing one's).
+    stdio_override: Option<Rc<RefCell<StdioOverride>>>,
+    // The active debugger, if this Shell (or an ancestor it was
+    // new_virtual_child'd from) is running under one -- see DebugHook's
+    // own doc comment. Shared via Rc::clone (same treatment as `jobs`/
+    // `promoted`) so a breakpoint set from the debug session still fires
+    // inside a converted foreground subshell/command-substitution, which
+    // is otherwise a genuinely separate Shell.
+    debug_hook: Option<Rc<RefCell<dyn DebugHook>>>,
+    // How many nested foreground subshells/command-substitutions/proc-
+    // subs (run_in_child_shell) deep this Shell is, relative to the real
+    // top-level one -- incremented (never shared) by new_virtual_child.
+    // Half of DebugDepth; see its own doc comment for why this can't just
+    // be `var_scopes.len()` alone.
+    subshell_depth: u32,
 }
 
 // A fresh, process/time-derived seed -- used both for a brand-new Shell
@@ -759,6 +985,10 @@ impl Shell {
             ran_external_since_prompt: std::cell::Cell::new(false),
             pending_fg: None,
             pending_edit: None,
+            pending_exit: None,
+            stdio_override: None,
+            debug_hook: None,
+            subshell_depth: 0,
         }
     }
 
@@ -962,6 +1192,10 @@ impl Shell {
             ran_external_since_prompt: std::cell::Cell::new(false),
             pending_fg: None,
             pending_edit: None,
+            pending_exit: None,
+            stdio_override: None,
+            debug_hook: self.debug_hook.clone(),
+            subshell_depth: self.subshell_depth + 1,
         }
     }
 
@@ -1287,6 +1521,58 @@ impl Shell {
     // use for telling them apart.
     pub fn take_pending_edit(&mut self) -> Option<String> {
         self.pending_edit.take().flatten()
+    }
+
+    // See `pending_exit`'s own doc comment. Runs the exit trap exactly
+    // once, at the point the violation is actually acted on (not inside
+    // check_nounset itself, which runs from many different, sometimes
+    // re-entrant, expansion contexts).
+    fn take_pending_exit(&mut self) -> Option<ExecResult> {
+        self.pending_exit.take().map(|code| {
+            self.run_exit_trap();
+            ExecResult::Exit(code)
+        })
+    }
+
+    // The `Stdio::inherit()` fallback for a spawned external command's own
+    // stdout, honoring `stdio_override` (see its own doc comment) when
+    // set. Every real-process spawn site's `redirs.stdout.unwrap_or_else
+    // (Stdio::inherit)`-style fallback should go through this instead, so
+    // a converted foreground subshell/command-substitution/proc-sub still
+    // captures an external command's output correctly even though it's no
+    // longer itself a separate OS process with its own real fd 1.
+    fn spawn_stdout_stdio(&self) -> Stdio {
+        match &self.stdio_override {
+            Some(o) => match &o.borrow().stdout {
+                Some(f) => match f.try_clone() {
+                    Ok(f) => Stdio::from(f),
+                    Err(_) => Stdio::inherit(),
+                },
+                None => Stdio::inherit(),
+            },
+            None => Stdio::inherit(),
+        }
+    }
+
+    // Same as spawn_stdout_stdio, for stdin.
+    fn spawn_stdin_stdio(&self) -> Stdio {
+        match &self.stdio_override {
+            Some(o) => match &o.borrow().stdin {
+                // Any bytes already sitting in `pending` (fetched by this
+                // shell's own `read` but not yet consumed) are invisible
+                // to a spawned external process, which reads the real fd
+                // directly -- an accepted, pre-existing-shape limitation
+                // (real re-exec'd children have the exact same gap today
+                // via std::io::stdin()'s own read-ahead buffering; this
+                // isn't a regression this conversion introduces).
+                Some(r) => match r.borrow().file.try_clone() {
+                    Ok(f) => Stdio::from(f),
+                    Err(_) => Stdio::inherit(),
+                },
+                None => Stdio::inherit(),
+            },
+            None => Stdio::inherit(),
+        }
     }
 
     // The pty-attached counterpart to run_single's own inline Stopped-job
@@ -1800,6 +2086,7 @@ impl Shell {
                         let src = crate::serialize::serialize_program(&[ListItem {
                             and_or: AndOr { first: Pipeline { commands: vec![def], negate: false }, rest: Vec::new() },
                             sep: Sep::Seq,
+                            line: 0,
                         }]);
                         sh_println!(self, "{}", src.trim_end());
                     }
@@ -3486,9 +3773,35 @@ impl Shell {
         let mut result = ExecResult::Status(self.last_status);
         for item in prog {
             self.check_pending_signals();
+            // Clone the Rc (not borrow self.debug_hook directly) before
+            // calling into it: on_statement takes `&Shell`, and the hook
+            // itself may call back into read-only Shell methods (variable
+            // inspection for the debugger's own hover/print) -- holding a
+            // live borrow of `self.debug_hook`'s own RefCell across that
+            // call would panic the moment it tried.
+            if let Some(hook) = self.debug_hook.clone() {
+                let depth = DebugDepth { subshell_depth: self.subshell_depth, call_depth: self.var_scopes.len() };
+                match hook.borrow_mut().on_statement(item.line, depth, self) {
+                    DebugAction::Quit => {
+                        self.run_exit_trap();
+                        return ExecResult::Exit(self.last_status);
+                    }
+                    DebugAction::Continue | DebugAction::StepOver | DebugAction::StepInto => {}
+                }
+            }
             let background = matches!(item.sep, Sep::Background);
             result = self.run_and_or(&item.and_or, background);
             self.last_status = result.status();
+            // Backstop for a `set -u` violation from an expansion site
+            // run_single's own check doesn't cover (a `for`/`case` list, an
+            // arithmetic expansion, ...) -- see pending_exit's own doc
+            // comment. A no-op the vast majority of the time: run_single's
+            // check already turns the common case into `result` being
+            // ExecResult::Exit directly, which is_signal() below catches,
+            // leaving nothing here left to take.
+            if let Some(exit) = self.take_pending_exit() {
+                return exit;
+            }
             if result.is_signal() {
                 return result;
             }
@@ -3500,7 +3813,7 @@ impl Shell {
             // &&/|| chain, since only the chain's final status reaches here.
             if self.opt_errexit && self.suppress_errexit == 0 && result.status() != 0 {
                 self.run_exit_trap();
-                std::process::exit(result.status());
+                return ExecResult::Exit(result.status());
             }
         }
         result
@@ -3557,6 +3870,17 @@ impl Shell {
         if !redirects.is_empty() {
             return self.run_compound_redirected(cmd, redirects, background);
         }
+        self.run_command_body(cmd, background)
+    }
+
+    // The part of run_command that actually dispatches on `cmd`'s own
+    // variant, *after* its own redirects (if any) have already been
+    // handled -- split out so run_in_child_shell's ChildSource::Parsed
+    // case (run_compound_redirected's own in-process conversion) can run
+    // `cmd`'s content directly without re-checking command_own_redirects,
+    // which would just see the same still-attached redirects and call
+    // run_compound_redirected right back into itself, forever.
+    fn run_command_body(&mut self, cmd: &parser::Command, background: bool) -> ExecResult {
         match cmd {
             parser::Command::Simple(sc) => self.run_single(sc, background),
             parser::Command::If { branches, else_branch, .. } => self.run_if(branches, else_branch),
@@ -3626,6 +3950,17 @@ impl Shell {
                     };
                 }
                 _ => continue,
+            }
+        }
+        // A converted construct's own stdin (see StdioOverride's doc
+        // comment) takes precedence over the real process stdin -- e.g. a
+        // `while read` loop's `< file` redirect sits on the *enclosing*
+        // compound command, not on this individual `read`, so this
+        // command's own `cmd.redirects` above is empty even though stdin
+        // very much isn't the real terminal.
+        if let Some(o) = &self.stdio_override {
+            if let Some(state) = &o.borrow().stdin {
+                return Box::new(SharedStdinReader { state: state.clone(), local: Vec::new() });
             }
         }
         // NOT `BufReader::new(stdin())` -- that wraps stdin in a fresh,
@@ -3729,18 +4064,190 @@ impl Shell {
                     rest: Vec::new(),
                 },
                 sep: Sep::Seq,
+                line: 0,
             }]));
         }
         s
     }
 
-    // (...) subshells self-exec the bish binary on the raw captured source
-    // (plus the function preamble), inheriting env but not sharing process
-    // state -- real bash subshells are forked children too, so mutations
-    // inside (cd, variables) must not leak back into the parent. Spawning a
-    // real child process gets that isolation for free instead of a separate
-    // snapshot/restore mechanism.
+    // Runs `source` in a fresh, in-process Shell built via
+    // new_virtual_child (see its own doc comment) instead of self-exec'ing
+    // a real OS process -- the shared primitive behind every *foreground*
+    // (...)/`$(...)`/`<(...)`/`>(...)` construct below (run_coproc and
+    // run_multi's own pipeline stages still self-exec for real: they need
+    // genuine OS-level concurrency this single-threaded interpreter
+    // doesn't have, or -- for a backgrounded subshell -- to keep running
+    // after this call returns, which an in-process call can't do either).
+    // Since new_virtual_child already deep-clones vars/arrays/functions/
+    // etc as real Rust data, no functions_preamble()-style
+    // serialize-then-reparse round-trip is needed here at all.
+    //
+    // `stdio.stdout`, if given, is where *this* construct's own output
+    // goes (a redirect/capture belonging to this call specifically, e.g.
+    // command substitution's own capture file); if `None`, output flows
+    // to wherever the *parent* shell's own output currently goes,
+    // matching a real fork (which shares fd 1 exactly as inherited) -- a
+    // bare `(cmd)` with no `>` of its own, nested inside `$(...)`, must
+    // still land in the outer capture. Same reasoning for
+    // `stdio.stdin`/the parent's own current stdin override. `stdio.stderr`/
+    // the dup flags are only ever populated by run_compound_redirected
+    // (`{ ...; } 2> file`/`&>`/`2>&1`) -- every other caller uses
+    // ChildStdio::default() plus a stdout/stdin override.
+    fn run_in_child_shell(&mut self, raw: &str, stdio: ChildStdio) -> ExecResult {
+        let mut child = self.new_virtual_child();
+
+        let effective_stdin: Option<Rc<RefCell<SharedReaderState>>> = match stdio.stdin {
+            Some(f) => Some(Rc::new(RefCell::new(SharedReaderState { file: f, pending: Vec::new() }))),
+            None => self.stdio_override.as_ref().and_then(|o| o.borrow().stdin.clone()),
+        };
+        let effective_stdout: Option<std::fs::File> = match &stdio.stdout {
+            Some(f) => f.try_clone().ok(),
+            None => self.stdio_override.as_ref().and_then(|o| o.borrow().stdout.as_ref().and_then(|f| f.try_clone().ok())),
+        };
+        child.stdio_override = if effective_stdin.is_some() || effective_stdout.is_some() {
+            Some(Rc::new(RefCell::new(StdioOverride { stdin: effective_stdin, stdout: effective_stdout })))
+        } else {
+            None
+        };
+        // No explicit stdout/stderr override => this construct has no
+        // redirect of its own, so its sink should be *exactly* the
+        // parent's current one (already fully resolved -- Real/Grid/
+        // Capture/Builtin, whatever it is), not a fresh wrapper around it.
+        child.sink = if stdio.stdout.is_some() || stdio.stderr.is_some() || stdio.dup_err_to_out || stdio.dup_out_to_err {
+            OutputSink::Builtin {
+                previous: Box::new(self.sink.clone()),
+                stdout: stdio.stdout.as_ref().and_then(|f| f.try_clone().ok()).map(|f| Rc::new(RefCell::new(f))),
+                stderr: stdio.stderr.as_ref().and_then(|f| f.try_clone().ok()).map(|f| Rc::new(RefCell::new(f))),
+                dup_err_to_out: stdio.dup_err_to_out,
+                dup_out_to_err: stdio.dup_out_to_err,
+            }
+        } else {
+            self.sink.clone()
+        };
+
+        // The real OS cwd is process-wide, shared with the real parent,
+        // even though `child` is otherwise a fully independent Shell -- a
+        // `cd` inside this construct (`$(cd /tmp && pwd)`) must not leak
+        // back out to the real shell once this call returns.
+        let real_cwd_before = std::env::current_dir().ok();
+        // A plain (non-`local`) variable assignment isn't Shell-owned
+        // state at all -- raw_var_write's own fallback writes straight to
+        // the real process environment (see its own doc comment), which
+        // is how bish gives builtins/scripts free interop with spawned
+        // external commands. That means it's process-wide, exactly like
+        // cwd: `new_virtual_child`'s "the two sessions evolve
+        // independently" doc comment is only true for arrays/assoc-
+        // arrays/functions/etc, which really are their own Rust-owned
+        // fields -- a bare `x=2` inside this construct would otherwise
+        // permanently clobber the real parent's own `x` the moment this
+        // runs in-process instead of as a separate OS process. Snapshot
+        // and restore exactly, same technique as cwd just above: any var
+        // the child added gets removed, anything it changed gets put
+        // back, matching real bash's fork isolation for env/variables.
+        let env_before: Vec<(String, String)> = std::env::vars().collect();
+        // Same reasoning, for `umask` (a real process-wide syscall, not
+        // Shell-owned state either -- see run_umask's own identical FFI
+        // declaration).
+        unsafe extern "C" {
+            fn umask(mask: u32) -> u32;
+        }
+        let umask_before = unsafe { umask(0) };
+        unsafe { umask(umask_before) };
+
+        let result = child.run_source_here(raw, "subshell");
+        // Real bash fires a subshell's own EXIT trap when it finishes
+        // normally too, not just on an explicit `exit`/errexit (confirmed:
+        // `(trap "echo bye" EXIT; echo hi)` prints both). The re-exec'd
+        // design this replaces got this for free (main.rs's run_source
+        // unconditionally runs it after a real child process's own
+        // run_program returns) -- ExecResult::Exit's own producer already
+        // ran it before bubbling, so only run it again here for every
+        // *other* outcome, to avoid firing it twice.
+        if !matches!(result, ExecResult::Exit(_)) {
+            child.run_exit_trap();
+        }
+
+        if let Some(d) = real_cwd_before {
+            let _ = std::env::set_current_dir(d);
+        }
+        unsafe { umask(umask_before) };
+        let before_keys: std::collections::HashSet<&str> = env_before.iter().map(|(k, _)| k.as_str()).collect();
+        let after_keys: Vec<String> = std::env::vars().map(|(k, _)| k).collect();
+        for k in after_keys {
+            if !before_keys.contains(k.as_str()) {
+                unsafe { std::env::remove_var(&k) };
+            }
+        }
+        for (k, v) in &env_before {
+            unsafe { std::env::set_var(k, v) };
+        }
+
+        match result {
+            // A subshell's own `exit`/`set -e`/`set -u` must not kill the
+            // real enclosing shell -- matches real bash's fork isolation
+            // for `(exit 3)`. The exit trap already ran wherever this was
+            // produced (see ExecResult::Exit's own doc comment).
+            ExecResult::Exit(code) => ExecResult::Status(code),
+            other => other,
+        }
+    }
+
+    // run_compound_redirected's own in-process primitive -- deliberately
+    // NOT run_in_child_shell/new_virtual_child, since a redirected
+    // compound command (`{ ...; } > file`, `while ...; done < file`) is
+    // *not* a subshell: unlike `(...)`/`$(...)`, real bash shares every
+    // bit of state (variables, cwd, functions, everything) between a
+    // `{ }` group and its enclosing shell -- only stdio is different for
+    // its own duration. So this runs `cmd` directly on `self`, with
+    // `self.sink`/`self.stdio_override` temporarily swapped for exactly
+    // this call and restored after -- the same "push a temporary
+    // override, run, pop it back" shape push_builtin_output_sink/
+    // pop_builtin_output_sink already use for a single builtin's own
+    // redirects, generalized here to a whole compound command.
+    fn run_with_redirected_stdio(&mut self, cmd: &parser::Command, stdio: ChildStdio) -> ExecResult {
+        let saved_sink = self.sink.clone();
+        let saved_stdio_override = self.stdio_override.clone();
+
+        let effective_stdin: Option<Rc<RefCell<SharedReaderState>>> = match stdio.stdin {
+            Some(f) => Some(Rc::new(RefCell::new(SharedReaderState { file: f, pending: Vec::new() }))),
+            None => self.stdio_override.as_ref().and_then(|o| o.borrow().stdin.clone()),
+        };
+        let effective_stdout: Option<std::fs::File> = match &stdio.stdout {
+            Some(f) => f.try_clone().ok(),
+            None => self.stdio_override.as_ref().and_then(|o| o.borrow().stdout.as_ref().and_then(|f| f.try_clone().ok())),
+        };
+        self.stdio_override = if effective_stdin.is_some() || effective_stdout.is_some() {
+            Some(Rc::new(RefCell::new(StdioOverride { stdin: effective_stdin, stdout: effective_stdout })))
+        } else {
+            None
+        };
+        if stdio.stdout.is_some() || stdio.stderr.is_some() || stdio.dup_err_to_out || stdio.dup_out_to_err {
+            self.sink = OutputSink::Builtin {
+                previous: Box::new(saved_sink.clone()),
+                stdout: stdio.stdout.as_ref().and_then(|f| f.try_clone().ok()).map(|f| Rc::new(RefCell::new(f))),
+                stderr: stdio.stderr.as_ref().and_then(|f| f.try_clone().ok()).map(|f| Rc::new(RefCell::new(f))),
+                dup_err_to_out: stdio.dup_err_to_out,
+                dup_out_to_err: stdio.dup_out_to_err,
+            };
+        }
+
+        let result = self.run_command_body(cmd, false);
+
+        self.sink = saved_sink;
+        self.stdio_override = saved_stdio_override;
+        result
+    }
+
+    // (...) subshells run in-process now (see run_in_child_shell's own
+    // doc comment) for the foreground case; the backgrounded case still
+    // self-execs the bish binary on the raw captured source, since it
+    // needs to keep running concurrently with whatever the parent does
+    // next, which nothing in this single-threaded interpreter can do
+    // in-process.
     fn run_subshell(&mut self, raw: &str, background: bool) -> i32 {
+        if !background {
+            return self.run_in_child_shell(raw, ChildStdio::default()).status();
+        }
         let exe = match std::env::current_exe() {
             Ok(p) => p,
             Err(e) => {
@@ -3749,24 +4256,14 @@ impl Shell {
             }
         };
         let script = self.functions_preamble() + raw;
-        if background {
-            match Command::new(exe).arg("-c").arg(script).current_dir(&self.cwd).spawn() {
-                Ok(child) => {
-                    self.push_job(vec![child], format!("({})", raw));
-                    0
-                }
-                Err(e) => {
-                    sh_eprintln!(self, "bish: subshell: {}", e);
-                    1
-                }
+        match Command::new(exe).arg("-c").arg(script).current_dir(&self.cwd).spawn() {
+            Ok(child) => {
+                self.push_job(vec![child], format!("({})", raw));
+                0
             }
-        } else {
-            match Command::new(exe).arg("-c").arg(script).current_dir(&self.cwd).status() {
-                Ok(status) => exit_code_from_status(status),
-                Err(e) => {
-                    sh_eprintln!(self, "bish: subshell: {}", e);
-                    1
-                }
+            Err(e) => {
+                sh_eprintln!(self, "bish: subshell: {}", e);
+                1
             }
         }
     }
@@ -3831,14 +4328,27 @@ impl Shell {
     }
 
     // Compound commands (if/while/for/case/group) with a trailing redirect
-    // (`{ ...; } > file`, `done < file`) self-exec too, same as pipeline
-    // stages -- avoids needing unsafe fd-dup2 to redirect this process's own
-    // stdio for a nested block. serialize_command drops the redirects when
-    // reconstructing the child's script (they're applied here, at spawn
-    // time, instead), so the child doesn't re-trigger this same path.
-    // Trade-off: unlike real bash, state changes inside (cd, variables)
-    // won't propagate back to the parent in this specific case.
+    // (`{ ...; } > file`, `done < file`) run in-process now (via
+    // run_in_child_shell) for the foreground, plain-fd-0/1/2 case --
+    // avoids the re-exec round-trip and, as a side effect, keeps variable/
+    // cwd mutations inside the block visible to the rest of the script
+    // (matching a real bash `{ }` group, which is *not* a subshell).
+    // Falls back to the old self-exec'd path for anything this shell has
+    // no in-process model for: a numbered-fd redirect (no real child
+    // process here to dup2 it onto -- see resolve_simple_redirects_for_
+    // compound), or a *backgrounded* run, which needs to keep going after
+    // this call returns (nothing in this single-threaded interpreter can
+    // do that in-process).
     fn run_compound_redirected(&mut self, cmd: &parser::Command, redirects: &[Redirect], background: bool) -> ExecResult {
+        if !background && Self::compound_redirects_are_simple(redirects) {
+            return match self.resolve_simple_redirects_for_compound(redirects) {
+                Ok(stdio) => self.run_with_redirected_stdio(cmd, stdio),
+                Err(e) => {
+                    sh_eprintln!(self, "bish: {}", e);
+                    ExecResult::Status(1)
+                }
+            };
+        }
         let redirs = match self.resolve_redirect_list(redirects) {
             Ok(r) => r,
             Err(e) => {
@@ -3861,11 +4371,39 @@ impl Shell {
         command.stdout(redirs.stdout.unwrap_or_else(Stdio::inherit));
         command.stderr(redirs.stderr.unwrap_or_else(Stdio::inherit));
         apply_fd_redirects(&mut command, redirs.dup_stderr_to_stdout, redirs.extra_fds);
+        // Real job control isolation for a *backgrounded* redirected
+        // compound command only -- same reasoning/pattern as run_single's
+        // own pre_exec hook (set from both the child, here, and the
+        // parent right after spawn() returns, to avoid the classic job-
+        // control race) and run_multi's own identical treatment of a
+        // backgrounded pipeline: `kill %N`/`bg`'s own SIGCONT then
+        // targets this whole (single-process) group correctly, and a
+        // *foreground* run of this same construct is left with today's
+        // "no isolation, inherits bish's own group" behavior, since there's
+        // no tcsetpgrp/stop-handling machinery here to keep a foreground
+        // Ctrl-C routing to it once isolated.
+        if background && self.opt_monitor {
+            unsafe {
+                command.pre_exec(|| {
+                    setpgid(0, 0);
+                    sigaction_raw(crate::term::SIGTTIN, SIG_DFL);
+                    sigaction_raw(crate::term::SIGTTOU, SIG_DFL);
+                    Ok(())
+                });
+            }
+        }
         match command.spawn() {
             Ok(child) => {
                 if background {
                     let cmd_text = crate::serialize::serialize_command(cmd);
-                    self.push_job(vec![child], cmd_text);
+                    let pgid = if self.opt_monitor {
+                        let pid = child.id() as i32;
+                        unsafe { setpgid(pid, pid) };
+                        Some(pid as u32)
+                    } else {
+                        None
+                    };
+                    self.push_job_with_pgid(vec![child], cmd_text, pgid);
                     ExecResult::Status(0)
                 } else {
                     let mut child = child;
@@ -3885,22 +4423,19 @@ impl Shell {
         }
     }
 
-    fn run_command_substitution(&self, raw: &str) -> String {
-        let exe = match std::env::current_exe() {
-            Ok(p) => p,
+    fn run_command_substitution(&mut self, raw: &str) -> String {
+        let path = proc_sub_temp_path();
+        let file = match std::fs::File::create(&path) {
+            Ok(f) => f,
             Err(_) => return String::new(),
         };
-        let script = self.functions_preamble() + raw;
-        match Command::new(exe).arg("-c").arg(script).current_dir(&self.cwd).output() {
-            Ok(out) => {
-                let mut s = String::from_utf8_lossy(&out.stdout).into_owned();
-                while s.ends_with('\n') {
-                    s.pop();
-                }
-                s
-            }
-            Err(_) => String::new(),
+        self.run_in_child_shell(raw, ChildStdio { stdout: Some(file), ..Default::default() });
+        let mut s = std::fs::read_to_string(&path).unwrap_or_default();
+        let _ = std::fs::remove_file(&path);
+        while s.ends_with('\n') {
+            s.pop();
         }
+        s
     }
 
     // `<(cmd)`: runs cmd to completion now, capturing its stdout into a
@@ -3911,13 +4446,6 @@ impl Shell {
     // has finished reading it.
     fn run_proc_sub_in(&mut self, raw: &str) -> String {
         let path = proc_sub_temp_path();
-        let exe = match std::env::current_exe() {
-            Ok(p) => p,
-            Err(e) => {
-                sh_eprintln!(self, "bish: process substitution: {}", e);
-                return String::new();
-            }
-        };
         let file = match std::fs::File::create(&path) {
             Ok(f) => f,
             Err(e) => {
@@ -3925,11 +4453,7 @@ impl Shell {
                 return String::new();
             }
         };
-        let script = self.functions_preamble() + raw;
-        match Command::new(exe).arg("-c").arg(script).current_dir(&self.cwd).stdout(Stdio::from(file)).status() {
-            Ok(_) => {}
-            Err(e) => sh_eprintln!(self, "bish: process substitution: {}", e),
-        }
+        self.run_in_child_shell(raw, ChildStdio { stdout: Some(file), ..Default::default() });
         let path_str = path.to_string_lossy().into_owned();
         self.proc_sub_cleanup.push(path_str.clone());
         path_str
@@ -3956,11 +4480,8 @@ impl Shell {
         if !self.proc_sub_out_pending.is_empty() {
             let pending = std::mem::take(&mut self.proc_sub_out_pending);
             for (path, raw) in pending {
-                if let Ok(exe) = std::env::current_exe() {
-                    let script = self.functions_preamble() + &raw;
-                    if let Ok(file) = std::fs::File::open(&path) {
-                        let _ = Command::new(exe).arg("-c").arg(script).current_dir(&self.cwd).stdin(Stdio::from(file)).status();
-                    }
+                if let Ok(file) = std::fs::File::open(&path) {
+                    self.run_in_child_shell(&raw, ChildStdio { stdin: Some(file), ..Default::default() });
                 }
                 self.proc_sub_cleanup.push(path);
             }
@@ -4074,7 +4595,7 @@ impl Shell {
                     self.last_status = s;
                     last_body_status = s;
                 }
-                ret @ (ExecResult::Return(_) | ExecResult::Window(_) | ExecResult::Fg | ExecResult::Edit) => return ret,
+                ret @ (ExecResult::Return(_) | ExecResult::Window(_) | ExecResult::Fg | ExecResult::Edit | ExecResult::Exit(_)) => return ret,
             }
         }
         if ran_body {
@@ -4108,7 +4629,7 @@ impl Shell {
                     continue;
                 }
                 ExecResult::Status(s) => self.last_status = s,
-                ret @ (ExecResult::Return(_) | ExecResult::Window(_) | ExecResult::Fg | ExecResult::Edit) => return ret,
+                ret @ (ExecResult::Return(_) | ExecResult::Window(_) | ExecResult::Fg | ExecResult::Edit | ExecResult::Exit(_)) => return ret,
             }
         }
         if ran_body {
@@ -4183,7 +4704,7 @@ impl Shell {
                     continue;
                 }
                 ExecResult::Status(s) => self.last_status = s,
-                ret @ (ExecResult::Return(_) | ExecResult::Window(_) | ExecResult::Fg | ExecResult::Edit) => return ret,
+                ret @ (ExecResult::Return(_) | ExecResult::Window(_) | ExecResult::Fg | ExecResult::Edit | ExecResult::Exit(_)) => return ret,
             }
         }
     }
@@ -4229,7 +4750,7 @@ impl Shell {
                     }
                 }
                 ExecResult::Status(s) => self.last_status = s,
-                ret @ (ExecResult::Return(_) | ExecResult::Window(_) | ExecResult::Fg | ExecResult::Edit) => return ret,
+                ret @ (ExecResult::Return(_) | ExecResult::Window(_) | ExecResult::Fg | ExecResult::Edit | ExecResult::Exit(_)) => return ret,
             }
             if !step.is_empty() {
                 if let Err(e) = arith::eval(step, self) {
@@ -4487,6 +5008,9 @@ impl Shell {
                 // side effect only: create/truncate/append the target files
                 let _ = self.resolve_redirects(cmd);
             }
+            if let Some(exit) = self.take_pending_exit() {
+                return exit;
+            }
             return ExecResult::Status(0);
         }
 
@@ -4540,6 +5064,9 @@ impl Shell {
             self.expand_words(&cmd.words)
         };
         self.current_stderr_target = saved_stderr_target;
+        if let Some(exit) = self.take_pending_exit() {
+            return exit;
+        }
         if argv.is_empty() {
             // Every word vanished (e.g. the command was just an unquoted
             // empty/unset variable) -- matches bash: nothing runs.
@@ -4585,12 +5112,27 @@ impl Shell {
         builtin_only: bool,
         array_literal_args: &[(usize, String, AssignMode, Vec<ArrayLiteralItem>)],
     ) -> ExecResult {
-        if let Err(e) = self.push_builtin_output_sink(&cmd.redirects) {
-            sh_eprintln!(self, "bish: {}", e);
-            return ExecResult::Status(1);
-        }
+        // Only pop if this call's own push actually installed a new layer
+        // (`Ok(true)`) -- `self.sink` can legitimately already be
+        // `OutputSink::Builtin` when this command starts (e.g. this
+        // command runs inside a converted foreground subshell/command-
+        // substitution/proc-sub, whose own capture is exactly a Builtin
+        // sink left in place for its *whole* run, not just one command --
+        // see run_in_child_shell). Popping unconditionally would strip
+        // that unrelated, still-needed layer the moment a command with no
+        // redirect of its own (push returning `Ok(false)`, doing nothing)
+        // ran inside it.
+        let pushed = match self.push_builtin_output_sink(&cmd.redirects) {
+            Ok(pushed) => pushed,
+            Err(e) => {
+                sh_eprintln!(self, "bish: {}", e);
+                return ExecResult::Status(1);
+            }
+        };
         let result = self.dispatch_builtin_or_external_impl(argv, name, cmd, background, builtin_only, array_literal_args);
-        self.pop_builtin_output_sink();
+        if pushed {
+            self.pop_builtin_output_sink();
+        }
         result
     }
 
@@ -5042,7 +5584,7 @@ impl Shell {
                     .and_then(|s| s.parse::<i32>().ok())
                     .unwrap_or(self.last_status);
                 self.run_exit_trap();
-                std::process::exit(code);
+                return ExecResult::Exit(code);
             }
             "read" => {
                 let mut array_name: Option<&str> = None;
@@ -5352,7 +5894,7 @@ impl Shell {
                 // already was rather than setting 127 -- surprising, but
                 // that's what it actually does.
                 self.run_exit_trap();
-                std::process::exit(self.last_status);
+                return ExecResult::Exit(self.last_status);
             }
             // Bare `exec` (no command word): persistently applies its
             // redirects -- numbered-fd (`exec 3>file`, `exec 3>&1`,
@@ -5502,8 +6044,8 @@ impl Shell {
             // later -- fall through to the ordinary inherited-stdio path.
         }
 
-        command.stdin(redirs.stdin.unwrap_or_else(Stdio::inherit));
-        command.stdout(redirs.stdout.unwrap_or_else(Stdio::inherit));
+        command.stdin(redirs.stdin.unwrap_or_else(|| self.spawn_stdin_stdio()));
+        command.stdout(redirs.stdout.unwrap_or_else(|| self.spawn_stdout_stdio()));
         command.stderr(redirs.stderr.unwrap_or_else(Stdio::inherit));
         apply_fd_redirects(&mut command, redirs.dup_stderr_to_stdout, redirs.extra_fds);
 
@@ -5622,11 +6164,28 @@ impl Shell {
         let n = commands.len();
         let mut children: Vec<std::process::Child> = Vec::with_capacity(n);
         let mut prev_stdout: Option<Stdio> = None;
+        // Real job control isolation (see run_single's own identical
+        // pre_exec/setpgid pattern) for a *backgrounded* pipeline only --
+        // every stage joins the same process group, seeded from the
+        // first stage's own (eventual) pid, once it's known (`None`
+        // means "not seeded yet," i.e. this is that first stage). `kill
+        // %N`/`bg`'s own SIGCONT-to-process-group then reaches every
+        // stage at once, same as a real shell's own pipeline job.
+        // Deliberately gated on `background` too, not just opt_monitor
+        // (unlike run_single, which isolates a foreground command as
+        // well before separately reassigning the terminal's own
+        // foreground group to it): a *foreground* pipeline isn't given
+        // any of that tcsetpgrp/stop-handling machinery here, so
+        // isolating it into its own group without also doing that would
+        // just stop a foreground Ctrl-C from ever reaching it -- a
+        // regression today's "no isolation at all, inherits bish's own
+        // group" behavior doesn't have.
+        let mut pgid: Option<i32> = None;
 
         for (i, cmd) in commands.iter().enumerate() {
             let is_last = i == n - 1;
-            let default_stdin = prev_stdout.take().unwrap_or_else(Stdio::inherit);
-            let default_stdout = if is_last { Stdio::inherit() } else { Stdio::piped() };
+            let default_stdin = prev_stdout.take().unwrap_or_else(|| self.spawn_stdin_stdio());
+            let default_stdout = if is_last { self.spawn_stdout_stdio() } else { Stdio::piped() };
 
             let mut command = match cmd {
                 parser::Command::Simple(sc) => {
@@ -5731,6 +6290,22 @@ impl Shell {
             };
             command.current_dir(&self.cwd);
 
+            // Set from *both* sides (here, in the child; and again from
+            // the parent right after spawn() returns below) to avoid the
+            // classic job-control race -- same reasoning/idempotency as
+            // run_single's own identical pre_exec hook.
+            if background && self.opt_monitor {
+                let join_pgid = pgid;
+                unsafe {
+                    command.pre_exec(move || {
+                        setpgid(0, join_pgid.unwrap_or(0));
+                        sigaction_raw(crate::term::SIGTTIN, SIG_DFL);
+                        sigaction_raw(crate::term::SIGTTOU, SIG_DFL);
+                        Ok(())
+                    });
+                }
+            }
+
             // Every pipeline stage is a genuinely separate process (even
             // a builtin/function stage runs as a re-exec'd bish -c
             // script -- see the `other` arm above) whose own stdout, for
@@ -5742,6 +6317,13 @@ impl Shell {
             }
             match command.spawn() {
                 Ok(mut child) => {
+                    if background && self.opt_monitor {
+                        let cpid = child.id() as i32;
+                        unsafe { setpgid(cpid, pgid.unwrap_or(cpid)) };
+                        if pgid.is_none() {
+                            pgid = Some(cpid);
+                        }
+                    }
                     if !is_last {
                         prev_stdout = child.stdout.take().map(Stdio::from);
                     }
@@ -5758,7 +6340,7 @@ impl Shell {
         if background {
             let cmd_text =
                 commands.iter().map(crate::serialize::serialize_command).collect::<Vec<_>>().join(" | ");
-            self.push_job(children, cmd_text);
+            self.push_job_with_pgid(children, cmd_text, pgid.map(|p| p as u32));
             return 0;
         }
 
@@ -6567,6 +7149,42 @@ impl Shell {
         }
     }
 
+    // Read-only variable lookup for the debugger's own K-hover/`:dbg print`
+    // -- deliberately `&self`, unlike lookup_var (`&mut self`, since magic
+    // vars like $RANDOM mutate on read and $SECONDS reads a live clock).
+    // Scoped to named user variables only: a plain scalar (checked in
+    // var_scopes, then the real process environment -- see raw_var_write's
+    // own doc comment for why that's where an ordinary global lives),
+    // an indexed array, or an associative array. Returns `None` for a
+    // truly-unset name *or* a magic/positional one ($?, $1, $RANDOM, ...)
+    // -- inspecting those would need `&mut self` or a real side effect,
+    // out of scope for a side-effect-free hover.
+    pub(crate) fn debug_peek_var(&self, name: &str) -> Option<String> {
+        for scope in self.var_scopes.iter().rev() {
+            if let Some(v) = scope.get(name) {
+                return Some(v.clone());
+            }
+        }
+        if let Some(items) = self.arrays.get(name) {
+            return Some(format!("({})", items.values().map(|v| crate::serialize::quote_literal(v)).collect::<Vec<_>>().join(" ")));
+        }
+        if let Some(map) = self.assoc_arrays.get(name) {
+            return Some(format!(
+                "({})",
+                map.iter().map(|(k, v)| format!("[{}]={}", k, crate::serialize::quote_literal(v))).collect::<Vec<_>>().join(" ")
+            ));
+        }
+        std::env::var(name).ok()
+    }
+
+    // pub: debugger.rs (a separate module -- see DebugHook's own doc
+    // comment for why the concrete implementation lives outside exec.rs)
+    // needs to install itself as this Shell's active debugger before
+    // calling run_program.
+    pub fn set_debug_hook(&mut self, hook: Option<Rc<RefCell<dyn DebugHook>>>) {
+        self.debug_hook = hook;
+    }
+
     // `set -u`: only a *bare* $VAR/${VAR} reference to a truly-unset name
     // triggers this -- ${VAR:-default}/${VAR-default}/${VAR?msg} etc are
     // explicitly exempt in bash (checking for unset is their whole point),
@@ -6652,8 +7270,7 @@ impl Shell {
             return;
         }
         sh_eprintln!(self, "bish: {}: unbound variable", name);
-        self.run_exit_trap();
-        std::process::exit(1);
+        self.pending_exit = Some(1);
     }
 
     // Whether `name` is a variable that's actually been assigned, as
@@ -7007,6 +7624,90 @@ impl Shell {
             None => None,
         };
         Ok((stdin, stdout, stderr))
+    }
+
+    // Pure classification, no expansion/side effects: whether every
+    // redirect in `redirects` is one run_compound_redirected's in-process
+    // path (resolve_simple_redirects_for_compound) can actually handle --
+    // checked *before* attempting that resolution (rather than having it
+    // fail/fall back partway through) so a redirect target with a side
+    // effect (`{ ...; } > "$(side_effect)"`) is never expanded twice, once
+    // by a "trial" resolve and again by the re-exec fallback's own
+    // resolve_redirect_list.
+    fn compound_redirects_are_simple(redirects: &[Redirect]) -> bool {
+        redirects.iter().all(|r| {
+            matches!(
+                r,
+                Redirect::In(_)
+                    | Redirect::HereString(_)
+                    | Redirect::HereDoc(_)
+                    | Redirect::Out { .. }
+                    | Redirect::Err { .. }
+                    | Redirect::Both { .. }
+                    | Redirect::DupErrToOut
+                    | Redirect::FdOut { fd: 1, .. }
+                    | Redirect::FdOut { fd: 2, .. }
+                    | Redirect::FdDup { fd: 2, target: 1 }
+                    | Redirect::FdDup { fd: 1, target: 2 }
+            )
+        })
+    }
+
+    // Resolves `redirects` into real Files for run_compound_redirected's
+    // foreground (in-process, via run_in_child_shell) path -- the same
+    // "plain fd 0/1/2" subset push_builtin_output_sink already scopes a
+    // single builtin's own redirects to. Only ever called after
+    // compound_redirects_are_simple has already confirmed every redirect
+    // here is one of those kinds. Mirrors resolve_redirect_list's own
+    // `Both`/`DupErrToOut` treatment (a dup_err_to_out flag, not a second
+    // independent `open()` of the same path -- two separate file opens
+    // would track their own, unshared write positions, letting stdout/
+    // stderr overwrite each other).
+    fn resolve_simple_redirects_for_compound(&mut self, redirects: &[Redirect]) -> Result<ChildStdio, String> {
+        let mut stdio = ChildStdio::default();
+        let mut stdout_target: Option<(String, bool)> = None;
+        let mut stderr_target: Option<(String, bool)> = None;
+        for r in redirects {
+            match r {
+                Redirect::In(w) => {
+                    let p = self.expand_word(w);
+                    stdio.stdin = Some(std::fs::File::open(&p).map_err(|e| format!("{}: {}", p, e))?);
+                }
+                Redirect::HereString(w) => {
+                    let mut content = self.expand_word(w);
+                    content.push('\n');
+                    stdio.stdin = Some(here_string_file(&content)?);
+                }
+                Redirect::HereDoc(w) => {
+                    let content = self.expand_word(w);
+                    stdio.stdin = Some(here_string_file(&content)?);
+                }
+                Redirect::Out { word, append } | Redirect::FdOut { fd: 1, word, append } => {
+                    stdout_target = Some((self.expand_word(word), *append));
+                    stdio.dup_err_to_out = false;
+                }
+                Redirect::Err { word, append } | Redirect::FdOut { fd: 2, word, append } => {
+                    stderr_target = Some((self.expand_word(word), *append));
+                    stdio.dup_err_to_out = false;
+                }
+                Redirect::Both { word, append } => {
+                    stdout_target = Some((self.expand_word(word), *append));
+                    stdio.dup_err_to_out = true;
+                }
+                Redirect::DupErrToOut | Redirect::FdDup { fd: 2, target: 1 } => stdio.dup_err_to_out = true,
+                Redirect::FdDup { fd: 1, target: 2 } => stdio.dup_out_to_err = true,
+                _ => unreachable!("compound_redirects_are_simple already filtered these out"),
+            }
+        }
+        if let Some((p, append)) = &stdout_target {
+            stdio.stdout = Some(self.open_out(p, *append)?);
+        }
+        if !stdio.dup_err_to_out {
+            if let Some((p, append)) = &stderr_target {
+                stdio.stderr = Some(self.open_out(p, *append)?);
+            }
+        }
+        Ok(stdio)
     }
 
     fn resolve_redirect_list(&mut self, redirects: &[Redirect]) -> Result<ResolvedRedirs, String> {
@@ -9118,10 +9819,10 @@ fn write_diagnostic(target: &Option<String>, msg: &str, sink: OutputSink) {
     }
 }
 
-// new_virtual_child (the M4 session-cloning primitive) has no caller yet
-// -- real `window new` wiring is later work -- so this is its only
-// exercise until then: proves the two things the whole primitive exists
-// for, in one process, with no rendering/REPL involved. `cargo test`
+// new_virtual_child's real callers now: repl.rs's window/pane-split code,
+// and Shell::run_in_child_shell (every foreground subshell/command-
+// substitution/proc-sub). This is still useful as a headless, no-
+// rendering/REPL-needed exercise of the primitive itself. `cargo test`
 // needs no external crate, matching the zero-dependency stance elsewhere.
 #[cfg(test)]
 mod tests {
@@ -9160,6 +9861,66 @@ mod tests {
 
         // Reap the spawned process so the test doesn't leak it.
         parent.jobs.borrow_mut().jobs[0].wait();
+    }
+
+    // Records every (line, depth) DebugHook::on_statement was called with,
+    // always returning Continue -- enough to prove the hook fires for
+    // every top-level statement, at every nesting depth, including inside
+    // a converted foreground subshell/command-substitution (which is a
+    // genuinely separate Shell, only reachable here because new_
+    // virtual_child shares debug_hook via Rc::clone).
+    struct RecordingHook {
+        calls: Vec<(usize, DebugDepth)>,
+    }
+
+    impl DebugHook for RecordingHook {
+        fn on_statement(&mut self, line: usize, depth: DebugDepth, _shell: &Shell) -> DebugAction {
+            self.calls.push((line, depth));
+            DebugAction::Continue
+        }
+    }
+
+    #[test]
+    fn debug_hook_sees_every_statement_including_inside_a_converted_subshell() {
+        let hook = Rc::new(RefCell::new(RecordingHook { calls: Vec::new() }));
+        let mut shell = Shell::new();
+        shell.debug_hook = Some(hook.clone());
+        let _buf = capture_output(&mut shell);
+        shell.run_source_here("echo top\n(echo inside_subshell)\nx=$(echo inside_cmd_sub)\n", "<test>");
+
+        let calls = hook.borrow().calls.clone();
+        // 5 calls: the 3 real top-level statements, *plus* one more for
+        // each of the two constructs' own single statement running inside
+        // its converted (in-process, but genuinely separate Shell) child.
+        assert_eq!(calls.len(), 5, "{:?}", calls);
+        assert_eq!(calls[0], (1, DebugDepth { subshell_depth: 0, call_depth: 0 }), "echo top");
+        assert_eq!(calls[1], (2, DebugDepth { subshell_depth: 0, call_depth: 0 }), "the subshell statement itself");
+        // Known, accepted limitation (see plan.md): a subshell/command-
+        // substitution's raw captured text is re-lexed from a bare
+        // String with no memory of its own starting file line, so its
+        // own statement(s) report a line number relative to that capture
+        // (always starting back at 1), not the real absolute file line.
+        assert_eq!(calls[2], (1, DebugDepth { subshell_depth: 1, call_depth: 0 }), "echo inside_subshell (relative line)");
+        assert_eq!(calls[3], (3, DebugDepth { subshell_depth: 0, call_depth: 0 }), "the x=$(...) assignment itself");
+        assert_eq!(calls[4], (1, DebugDepth { subshell_depth: 1, call_depth: 0 }), "echo inside_cmd_sub (relative line)");
+    }
+
+    #[test]
+    fn debug_hook_quit_unwinds_without_killing_the_process() {
+        struct QuitAfterOne {
+            n: u32,
+        }
+        impl DebugHook for QuitAfterOne {
+            fn on_statement(&mut self, _line: usize, _depth: DebugDepth, _shell: &Shell) -> DebugAction {
+                self.n += 1;
+                if self.n >= 2 { DebugAction::Quit } else { DebugAction::Continue }
+            }
+        }
+        let mut shell = Shell::new();
+        shell.debug_hook = Some(Rc::new(RefCell::new(QuitAfterOne { n: 0 })));
+        let buf = capture_output(&mut shell);
+        shell.run_source_here("echo one\necho two\necho three\n", "<test>");
+        assert_eq!(buf.borrow().as_str(), "one\n", "should stop after the first statement, never reaching the third");
     }
 
     fn strs(words: &[&str]) -> Vec<String> {

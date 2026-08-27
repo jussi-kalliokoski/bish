@@ -657,6 +657,18 @@ pub(crate) fn resolve_insert_start(buf: &mut TextBuffer, cmd: InsertCmd) {
 // as sluggish for a fast scroll).
 pub(crate) const MOUSE_WHEEL_LINES: usize = 3;
 
+// `extra_cursors`: every position besides `buf.cursor()` itself that
+// this same Insert-mode session must also type into -- multi-selection
+// `c`'s own "replace every one of these with what I'm about to type"
+// (repl.rs's own Key::Char('c') arm passes each deleted selection's own
+// gap, other than the one `buf.cursor()` already sits on; every other
+// caller passes `&[]`, the ordinary single-cursor case this always was
+// before). `cursors[0]` is kept mirroring `buf.cursor()` throughout --
+// navigation (Left/Right/Up/Down/PageUp/PageDown/wheel) only ever moves
+// that one, matching real editors' own multi-cursor convention that
+// navigating mid-edit doesn't drag every other cursor along with it;
+// only an actual mutation (Enter/Tab/Backspace/a typed char) replicates
+// across the whole set, via apply_insert_to_all/apply_backspace_to_all.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_insert_mode(
     buf: &mut TextBuffer,
@@ -668,8 +680,10 @@ pub(crate) fn run_insert_mode(
     term_rows: usize,
     term_cols: usize,
     color_overrides: Option<&highlight::ColorOverrides>,
+    extra_cursors: &[(usize, usize)],
 ) -> io::Result<()> {
     let mode = if replace { EditorMode::Replace } else { EditorMode::Insert };
+    let mut cursors: Vec<(usize, usize)> = std::iter::once(buf.cursor()).chain(extra_cursors.iter().copied()).collect();
     render_editor_frame(buf, vk, mode, rect, term_rows, term_cols, color_overrides);
     // `"."`'s own accumulator for this session -- see `Registers::
     // set_last_insert`'s own doc comment. Best-effort: a Backspace just
@@ -708,8 +722,8 @@ pub(crate) fn run_insert_mode(
                 return Ok(());
             }
             Key::Enter => {
-                let (row, col) = buf.cursor();
-                buf.insert_text((row, col), "\n");
+                apply_insert_to_all(buf, &mut cursors, "\n");
+                buf.set_cursor(cursors[0].0, cursors[0].1);
                 inserted.push('\n');
             }
             // Tab inserts spaces up to the next INDENT_WIDTH boundary
@@ -722,37 +736,39 @@ pub(crate) fn run_insert_mode(
             // every buffer char as exactly one terminal column, with no
             // tab-stop-aware expansion anywhere in that pipeline).
             Key::Tab => {
-                let (row, col) = buf.cursor();
+                let (_, col) = buf.cursor();
                 let width = INDENT_WIDTH - (col % INDENT_WIDTH);
                 let spaces = " ".repeat(width);
-                buf.insert_text((row, col), &spaces);
+                apply_insert_to_all(buf, &mut cursors, &spaces);
+                buf.set_cursor(cursors[0].0, cursors[0].1);
                 inserted.push_str(&spaces);
             }
             // Replace mode's own Backspace: known simplification -- steps
             // the cursor back without restoring the character it walks
             // back over (real vim remembers and restores each one) and
             // never crosses a line boundary backward, unlike ordinary
-            // Insert mode's own version just below.
+            // Insert mode's own version just below. Never combined with
+            // extra_cursors in practice (only `c`, always plain Insert,
+            // ever passes any) -- moves `cursors[0]` directly rather than
+            // going through apply_backspace_to_all's own multi-cursor
+            // machinery, since there's never more than one cursor here.
             Key::Backspace if replace => {
                 let (row, col) = buf.cursor();
                 if col > 0 {
                     buf.set_cursor(row, col - 1);
                 }
+                cursors[0] = buf.cursor();
                 inserted.pop();
             }
             Key::Backspace => {
-                let (row, col) = buf.cursor();
-                if col > 0 {
-                    let range = motion::MotionRange { shape: motion::MotionShape::Exclusive, from: (row, col - 1), to: (row, col) };
-                    buf.delete_range(&range);
-                } else if row > 0 {
-                    let prev_len = buf.line_len(row - 1);
-                    let range = motion::MotionRange { shape: motion::MotionShape::Exclusive, from: (row - 1, prev_len), to: (row, 0) };
-                    buf.delete_range(&range);
-                }
+                apply_backspace_to_all(buf, &mut cursors);
+                buf.set_cursor(cursors[0].0, cursors[0].1);
                 inserted.pop();
             }
-            Key::Left => motion::apply_motion(buf, motion::Motion::Left, None),
+            Key::Left => {
+                motion::apply_motion(buf, motion::Motion::Left, None);
+                cursors[0] = buf.cursor();
+            }
             Key::Right => {
                 // `Motion::Right` clamps at the last real character (its
                 // ordinary Normal-mode meaning); Insert mode's cursor is
@@ -761,14 +777,27 @@ pub(crate) fn run_insert_mode(
                 // than going through the clamped motion.
                 let (row, col) = buf.cursor();
                 buf.set_cursor(row, (col + 1).min(buf.line_len(row)));
+                cursors[0] = buf.cursor();
             }
-            Key::Up => motion::apply_motion(buf, motion::Motion::Up, None),
-            Key::Down => motion::apply_motion(buf, motion::Motion::Down, None),
+            Key::Up => {
+                motion::apply_motion(buf, motion::Motion::Up, None);
+                cursors[0] = buf.cursor();
+            }
+            Key::Down => {
+                motion::apply_motion(buf, motion::Motion::Down, None);
+                cursors[0] = buf.cursor();
+            }
             // Same physical-key-as-Ctrl-F/Ctrl-B convention as Normal
             // mode's own vimkeys.rs handling -- real vim honors
             // PageUp/PageDown in Insert mode too, not just Normal.
-            Key::PageDown => motion::apply_motion(buf, motion::Motion::PageDown, None),
-            Key::PageUp => motion::apply_motion(buf, motion::Motion::PageUp, None),
+            Key::PageDown => {
+                motion::apply_motion(buf, motion::Motion::PageDown, None);
+                cursors[0] = buf.cursor();
+            }
+            Key::PageUp => {
+                motion::apply_motion(buf, motion::Motion::PageUp, None);
+                cursors[0] = buf.cursor();
+            }
             // Mouse wheel: scrolls the view without otherwise touching
             // the cursor (Motion::ScrollLineDown/Up's own behavior --
             // only nudges the cursor back into view if scrolling would
@@ -776,8 +805,14 @@ pub(crate) fn run_insert_mode(
             // already do in Normal mode. MOUSE_WHEEL_LINES lines per
             // notch, not 1 -- matches most terminals'/editors' own
             // default wheel granularity.
-            Key::Mouse(ev) if ev.is_scroll_down() => motion::apply_motion(buf, motion::Motion::ScrollLineDown, Some(MOUSE_WHEEL_LINES)),
-            Key::Mouse(ev) if ev.is_scroll_up() => motion::apply_motion(buf, motion::Motion::ScrollLineUp, Some(MOUSE_WHEEL_LINES)),
+            Key::Mouse(ev) if ev.is_scroll_down() => {
+                motion::apply_motion(buf, motion::Motion::ScrollLineDown, Some(MOUSE_WHEEL_LINES));
+                cursors[0] = buf.cursor();
+            }
+            Key::Mouse(ev) if ev.is_scroll_up() => {
+                motion::apply_motion(buf, motion::Motion::ScrollLineUp, Some(MOUSE_WHEEL_LINES));
+                cursors[0] = buf.cursor();
+            }
             Key::Char(c) => {
                 let (row, col) = buf.cursor();
                 // Replace mode overwrites the character already at the
@@ -785,18 +820,115 @@ pub(crate) fn run_insert_mode(
                 // inserting, naturally extends the line once the cursor
                 // reaches its end (nothing left there to overwrite),
                 // matching real vim's own `R` behavior at end of line.
+                // Same "never combined with extra_cursors" reasoning as
+                // Replace's own Backspace arm above.
                 if replace && col < buf.line_len(row) {
                     let range = motion::MotionRange { shape: motion::MotionShape::Inclusive, from: (row, col), to: (row, col) };
                     buf.delete_range(&range);
+                    let mut b = [0u8; 4];
+                    buf.insert_text((row, col), c.encode_utf8(&mut b));
+                    cursors[0] = buf.cursor();
+                } else {
+                    let mut b = [0u8; 4];
+                    apply_insert_to_all(buf, &mut cursors, c.encode_utf8(&mut b));
+                    buf.set_cursor(cursors[0].0, cursors[0].1);
                 }
-                let mut b = [0u8; 4];
-                buf.insert_text((row, col), c.encode_utf8(&mut b));
                 inserted.push(c);
             }
             _ => {}
         }
         scroll_to_show_cursor(buf, editor_content_cols(buf, rect));
         render_editor_frame(buf, vk, mode, rect, term_rows, term_cols, color_overrides);
+    }
+}
+
+// Inserts `text` (never containing more than one '\n', and only ever
+// exactly "\n" alone when it does -- Enter is the only run_insert_mode
+// caller that ever inserts a newline, and always just that one
+// character) at every position in `cursors`, replicating multi-
+// selection `c`'s own "type once, it lands everywhere" behavior (see
+// run_insert_mode's own doc comment on `extra_cursors`). Processes them
+// in ascending (row, col) order -- ascending, not descending, because
+// this is an *insertion*: text appearing at an earlier position only
+// ever pushes a later, not-yet-touched one further away, never
+// invalidates its own coordinates, so the earliest can always go first
+// and every later one's position is patched to account for it before
+// its own turn comes (the exact opposite ordering delete_selections'
+// own doc comment establishes for a *removal*, and apply_backspace_to_
+// all below, for the same underlying reason run the other way).
+fn apply_insert_to_all(buf: &mut TextBuffer, cursors: &mut [(usize, usize)], text: &str) {
+    let is_newline = text == "\n";
+    let width = text.chars().count();
+    let mut order: Vec<usize> = (0..cursors.len()).collect();
+    order.sort_by_key(|&i| cursors[i]);
+    for step in 0..order.len() {
+        let i = order[step];
+        let (row, col) = cursors[i];
+        cursors[i] = buf.insert_text((row, col), text);
+        for &j in &order[step + 1..] {
+            let (r, c) = cursors[j];
+            if is_newline {
+                // A not-yet-processed cursor on the *same* row, at or
+                // after the split column, moves onto the newly created
+                // row instead, its own column now relative to that new
+                // line's own start; anything on a strictly later row
+                // just shifts down by the one new line.
+                if r == row && c >= col {
+                    cursors[j] = (r + 1, c - col);
+                } else if r > row {
+                    cursors[j] = (r + 1, c);
+                }
+            } else if r == row && c >= col {
+                cursors[j] = (r, c + width);
+            }
+        }
+    }
+}
+
+// Backspace, replicated across every tracked cursor -- see
+// apply_insert_to_all's own doc comment for the shared shape/reasoning;
+// this is its deletion counterpart, so it processes furthest-first
+// instead (removing something at a later position can never invalidate
+// an earlier, not-yet-processed cursor's own coordinates, but the
+// reverse isn't true -- the same rule delete_selections already
+// established for a whole visual selection, applied here one character
+// at a time instead). A cursor already at the very start of the buffer
+// (row 0, col 0) is simply left alone, matching ordinary single-cursor
+// Backspace's own ordinary Insert-mode arm doing nothing there either.
+fn apply_backspace_to_all(buf: &mut TextBuffer, cursors: &mut [(usize, usize)]) {
+    let mut order: Vec<usize> = (0..cursors.len()).collect();
+    order.sort_by_key(|&i| std::cmp::Reverse(cursors[i]));
+    for step in 0..order.len() {
+        let i = order[step];
+        let (row, col) = cursors[i];
+        if col > 0 {
+            let range = motion::MotionRange { shape: motion::MotionShape::Exclusive, from: (row, col - 1), to: (row, col) };
+            buf.delete_range(&range);
+            cursors[i] = (row, col - 1);
+            for &j in &order[step + 1..] {
+                let (r, c) = cursors[j];
+                if r == row && c >= col {
+                    cursors[j] = (r, c - 1);
+                }
+            }
+        } else if row > 0 {
+            let prev_len = buf.line_len(row - 1);
+            let range = motion::MotionRange { shape: motion::MotionShape::Exclusive, from: (row - 1, prev_len), to: (row, 0) };
+            buf.delete_range(&range);
+            cursors[i] = (row - 1, prev_len);
+            for &j in &order[step + 1..] {
+                let (r, c) = cursors[j];
+                if r > row {
+                    cursors[j] = (r - 1, c);
+                } else if r == row {
+                    // A degenerate overlap (two distinct cursors both at
+                    // column 0 of the same row) -- this row is gone,
+                    // joined into row - 1, so fold this one in there
+                    // too, same as the one actually being backspaced.
+                    cursors[j] = (r - 1, prev_len + c);
+                }
+            }
+        }
     }
 }
 
@@ -1729,7 +1861,7 @@ mod macro_tests {
             KeyOutcome::Motion(m, count) => motion::apply_motion(buf, m, count),
             KeyOutcome::EnterInsert(cmd) => {
                 resolve_insert_start(buf, cmd);
-                run_insert_mode(buf, vk, rect(), registers, &mut || {}, false, 24, 80, None).unwrap();
+                run_insert_mode(buf, vk, rect(), registers, &mut || {}, false, 24, 80, None, &[]).unwrap();
             }
             other => panic!("unexpected outcome in this test: {other:?}"),
         }
@@ -1797,6 +1929,105 @@ mod macro_tests {
             apply(&mut buf, &mut vk, &mut registers, outcome);
         }
         assert_eq!(buf.cursor(), (3, 0));
+    }
+}
+
+// Regression: `c` on multiple selections used to only type into the one
+// gap `delete_selections` picked as this buffer's own new `cursor` (the
+// leftmost) -- every other deleted selection's own gap sat there
+// untouched, receiving nothing typed. run_insert_mode's own
+// `extra_cursors` param is what replicates each keystroke across every
+// one of them instead; these drive it directly (bypassing repl.rs's own
+// `c` handler, which is what actually seeds `extra_cursors` from
+// delete_selections' own return value in production, but has no real
+// terminal to read a scripted key sequence from in a test -- same
+// "record into a macro, then replay it" trick macro_tests above already
+// uses for exactly that reason).
+#[cfg(test)]
+mod multi_cursor_insert_tests {
+    use super::*;
+
+    fn rect() -> Rect {
+        Rect { row: 0, col: 0, rows: 24, cols: 80 }
+    }
+
+    fn line(buf: &TextBuffer, row: usize) -> String {
+        buf.line_chars(row).into_iter().collect()
+    }
+
+    fn scripted(vk: &mut VimKeys, keys: &[Key]) {
+        vk.start_recording('a');
+        for &k in keys {
+            vk.record_key(k);
+        }
+        vk.stop_recording();
+        assert!(vk.queue_macro_replay('a', 1));
+    }
+
+    #[test]
+    fn typing_after_a_multi_cursor_change_lands_at_every_gap() {
+        let mut buf = TextBuffer::new_unnamed(10);
+        buf.insert_text((0, 0), " one\n two\n three");
+        buf.set_cursor(0, 0);
+        let mut vk = VimKeys::new();
+        let mut registers = Registers::new_for_test();
+        scripted(&mut vk, &[Key::Char('D'), Key::Char('O'), Key::Char('N'), Key::Char('E'), Key::Escape]);
+
+        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut || {}, false, 24, 80, None, &[(1, 0), (2, 0)]).unwrap();
+
+        assert_eq!(line(&buf, 0), "DONE one");
+        assert_eq!(line(&buf, 1), "DONE two");
+        assert_eq!(line(&buf, 2), "DONE three");
+    }
+
+    #[test]
+    fn backspace_after_a_multi_cursor_change_removes_from_every_gap() {
+        let mut buf = TextBuffer::new_unnamed(10);
+        buf.insert_text((0, 0), "X one\nX two");
+        buf.set_cursor(0, 1); // right after the "X" on line 0
+        let mut vk = VimKeys::new();
+        let mut registers = Registers::new_for_test();
+        scripted(&mut vk, &[Key::Backspace, Key::Escape]);
+
+        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut || {}, false, 24, 80, None, &[(1, 1)]).unwrap();
+
+        assert_eq!(line(&buf, 0), " one");
+        assert_eq!(line(&buf, 1), " two");
+    }
+
+    #[test]
+    fn enter_after_a_multi_cursor_change_splits_every_gap_line() {
+        let mut buf = TextBuffer::new_unnamed(10);
+        buf.insert_text((0, 0), "ab\ncd");
+        buf.set_cursor(0, 1); // between 'a' and 'b'
+        let mut vk = VimKeys::new();
+        let mut registers = Registers::new_for_test();
+        scripted(&mut vk, &[Key::Enter, Key::Escape]);
+
+        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut || {}, false, 24, 80, None, &[(1, 1)]).unwrap();
+
+        assert_eq!(buf.line_count(), 4);
+        assert_eq!(line(&buf, 0), "a");
+        assert_eq!(line(&buf, 1), "b");
+        assert_eq!(line(&buf, 2), "c");
+        assert_eq!(line(&buf, 3), "d");
+    }
+
+    #[test]
+    fn two_gaps_on_the_same_row_do_not_corrupt_each_others_position() {
+        // Gaps at columns 0 and 6 of one row -- typing "X" at both must
+        // land right where each original gap was, not have the first
+        // insertion's own rightward shift throw off the second's.
+        let mut buf = TextBuffer::new_unnamed(10);
+        buf.insert_text((0, 0), " place ");
+        buf.set_cursor(0, 0);
+        let mut vk = VimKeys::new();
+        let mut registers = Registers::new_for_test();
+        scripted(&mut vk, &[Key::Char('X'), Key::Escape]);
+
+        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut || {}, false, 24, 80, None, &[(0, 6)]).unwrap();
+
+        assert_eq!(line(&buf, 0), "X placeX ");
     }
 }
 

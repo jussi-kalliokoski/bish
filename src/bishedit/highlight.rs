@@ -1201,7 +1201,7 @@ mod tests {
         // enough to get a real Tok of the right variant without hardcoding
         // every enum's exact field shape by hand.
         match lexer::Lexer::new(word).tokenize() {
-            Ok(mut toks) if toks.len() == 1 => toks.pop().unwrap(),
+            Ok(mut toks) if toks.len() == 1 => toks.pop().unwrap().0,
             other => panic!("expected exactly one token from {word:?}, got {other:?}"),
         }
     }

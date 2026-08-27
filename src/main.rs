@@ -3,6 +3,7 @@ mod bishedit;
 mod builtins;
 mod compgen;
 mod csscolor;
+mod debugger;
 mod editor;
 mod exec;
 mod fileeditor;
@@ -110,7 +111,11 @@ fn run_source(shell: &mut exec::Shell, src: &str) -> i32 {
     match lexer::Lexer::new(src).tokenize() {
         Ok(toks) => match parser::Parser::new(toks).parse_program() {
             Ok(prog) => {
-                shell.run_program(&prog);
+                if let exec::ExecResult::Exit(code) = shell.run_program(&prog) {
+                    // The exit trap already ran at whichever site produced
+                    // this (see ExecResult::Exit's own doc comment).
+                    return code;
+                }
                 shell.run_exit_trap();
                 shell.last_status
             }

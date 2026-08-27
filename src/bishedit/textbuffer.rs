@@ -417,9 +417,22 @@ impl TextBuffer {
     // of a bare column. `delete_range`'s own defensive row-clamping
     // (see its doc comment) covers the rest against any pathological
     // overlap between selections.
-    pub fn delete_selections(&mut self, registers: &mut Registers, register: Option<char>) -> bool {
+    //
+    // Returns every selection's own resulting gap position (ascending,
+    // empty iff there was nothing to delete) rather than just a bool --
+    // `d`'s own caller only cares whether that's empty, but `c`'s
+    // (repl.rs's Key::Char('c') arm) needs every one of them: the exact
+    // same "removed highest-first" rule that keeps the *lowest*
+    // position's own coordinates valid afterward (the only one the old
+    // bool-returning version exposed, as this buffer's own new cursor)
+    // applies identically to *every* lower position relative to
+    // whichever one is currently being removed, not just the very
+    // lowest overall -- so each of these is just as valid a post-
+    // deletion insertion point, letting a multi-selection `c` type the
+    // same replacement into every one of them instead of only the first.
+    pub fn delete_selections(&mut self, registers: &mut Registers, register: Option<char>) -> Vec<(usize, usize)> {
         if self.selections.is_empty() {
-            return false;
+            return Vec::new();
         }
         let mut text = String::new();
         let mut shape = RegisterShape::Char;
@@ -431,15 +444,19 @@ impl TextBuffer {
         }
         registers.record_delete(register, RegisterValue { text, shape });
 
-        let leftmost = self.selections.iter().map(|r| r.from).min().unwrap();
+        let mut froms: Vec<(usize, usize)> = self.selections.iter().map(|r| r.from).collect();
+        froms.sort();
         let mut ranges = self.selections.clone();
         ranges.sort_by_key(|r| std::cmp::Reverse(r.from));
         for range in &ranges {
             self.delete_range(range);
         }
-        let row = leftmost.0.min(self.lines.len() - 1);
-        self.cursor = (row, leftmost.1.min(self.lines[row].len()));
-        true
+        for pos in &mut froms {
+            pos.0 = pos.0.min(self.lines.len() - 1);
+            pos.1 = pos.1.min(self.lines[pos.0].len());
+        }
+        self.cursor = froms[0];
+        froms
     }
 
     // Visual mode's own `p`/`P`: replaces every selection with the
@@ -776,10 +793,19 @@ mod tests {
         let mut buf = make("foo bar\nbaz qux");
         buf.selections = vec![range((0, 0), (0, 2)), range((1, 0), (1, 2))]; // "foo", "baz"
         let mut registers = make_registers();
-        assert!(buf.delete_selections(&mut registers, None));
+        let gaps = buf.delete_selections(&mut registers, None);
+        assert_eq!(gaps, vec![(0, 0), (1, 0)]);
         assert_eq!(text_of(&buf), " bar\n qux");
         assert_eq!(registers.read(None).text, "foobaz");
         assert_eq!(buf.cursor(), (0, 0));
+    }
+
+    #[test]
+    fn delete_selections_on_an_empty_selection_list_is_a_no_op() {
+        let mut buf = make("foo bar");
+        let mut registers = make_registers();
+        assert_eq!(buf.delete_selections(&mut registers, None), Vec::<(usize, usize)>::new());
+        assert_eq!(text_of(&buf), "foo bar");
     }
 
     #[test]

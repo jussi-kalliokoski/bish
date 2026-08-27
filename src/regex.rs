@@ -290,6 +290,29 @@ impl Regex {
     pub fn find_at(&self, chars: &[char], from: usize) -> Option<(usize, usize)> {
         (from..=chars.len()).find_map(|start| self.match_at(chars, start).map(|end| (start, end)))
     }
+
+    /// Same search as `find_at`, but also returns captures in
+    /// `match_captures`'s own shape: index 0 is the whole match, indices
+    /// 1..=N are each group (empty string, not absent, for one the
+    /// winning path never entered). For a caller (`:s`'s own
+    /// substitution loop, repl.rs) that needs backreferences/`&` in a
+    /// replacement rather than just knowing a match happened.
+    pub fn find_at_with_captures(&self, chars: &[char], from: usize) -> Option<(usize, usize, Vec<String>)> {
+        for start in from..=chars.len() {
+            if let Some((end, caps)) = match_at_with_caps(&self.re, self.group_count, chars, start) {
+                let mut out = Vec::with_capacity(self.group_count + 1);
+                out.push(chars[start..end].iter().collect());
+                for slot in caps.into_iter().skip(1) {
+                    out.push(match slot {
+                        Some((s0, e0)) => chars[s0..e0].iter().collect(),
+                        None => String::new(),
+                    });
+                }
+                return Some((start, end, out));
+            }
+        }
+        None
+    }
 }
 
 // `[[ str =~ pattern ]]`: true (with Some(...)) if `pattern` matches
@@ -315,4 +338,44 @@ pub fn match_captures(text: &str, pattern: &str) -> Option<Vec<String>> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn chars(s: &str) -> Vec<char> {
+        s.chars().collect()
+    }
+
+    #[test]
+    fn find_at_with_captures_finds_the_leftmost_match_and_its_groups() {
+        let re = Regex::compile("(a+)(b)");
+        let cs = chars("xx aaab yy");
+        let (start, end, caps) = re.find_at_with_captures(&cs, 0).unwrap();
+        assert_eq!((start, end), (3, 7));
+        assert_eq!(caps, vec!["aaab".to_string(), "aaa".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn find_at_with_captures_respects_from() {
+        let re = Regex::compile("a");
+        let cs = chars("a.a.a");
+        let (start, _, _) = re.find_at_with_captures(&cs, 2).unwrap();
+        assert_eq!(start, 2);
+        assert!(re.find_at_with_captures(&cs, 5).is_none());
+    }
+
+    #[test]
+    fn find_at_with_captures_none_when_nothing_matches() {
+        let re = Regex::compile("z+");
+        assert!(re.find_at_with_captures(&chars("abc"), 0).is_none());
+    }
+
+    #[test]
+    fn find_at_with_captures_empty_string_for_a_group_that_never_matched() {
+        let re = Regex::compile("(a)|(b)");
+        let (_, _, caps) = re.find_at_with_captures(&chars("b"), 0).unwrap();
+        assert_eq!(caps, vec!["b".to_string(), String::new(), "b".to_string()]);
+    }
 }
