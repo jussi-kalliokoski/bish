@@ -64,17 +64,30 @@ pub struct TextBuffer {
     // lines have no entry at all rather than an explicit "unchanged"
     // marker.
     pub diff: Option<std::collections::HashMap<usize, crate::git::DiffMark>>,
-    // `bish tool debug`'s own breakpoint set (see GUTTER_COLUMNS's
-    // breakpoint column in fileeditor.rs, which is what actually reads
-    // this) -- 1-based line numbers, matching how the debugger itself
-    // reports lines. Empty (the common case: an ordinary `e`-opened
-    // buffer never touches this) collapses the gutter column to zero
-    // width, same convention `blame`/`diff` already use. Deliberately
-    // *not* cleared on edit the way diagnostics/blame/diff are -- this
-    // buffer is always read-only while under debugger control, so
-    // there's never an edit to invalidate a line-indexed breakpoint set
-    // against in the first place.
+    // `:dbg`'s own breakpoint set (see GUTTER_COLUMNS's breakpoint column
+    // in fileeditor.rs, which is what actually reads this) -- 1-based
+    // line numbers, matching how the debugger itself reports lines.
+    // Empty (the common case: an ordinary `e`-opened buffer never
+    // touches this) collapses the gutter column to zero width, same
+    // convention `blame`/`diff` already use. Deliberately *not* cleared
+    // on edit the way diagnostics/blame/diff are -- a buffer with any
+    // breakpoints is always `readonly` too (see that field's own doc
+    // comment) for the whole time it could have any set, so there's
+    // never an edit to invalidate a line-indexed breakpoint set against
+    // in the first place.
     pub breakpoints: std::collections::BTreeSet<usize>,
+    // Set while a `:dbg` session is attached to this buffer (repl.rs) --
+    // every mutating `KeyOutcome` arm in run_normal_mode_navigation
+    // already gates itself on `NavBuffer::Editable(tb)` individually (no
+    // single chokepoint -- see that function's own doc comment), so this
+    // is consulted as one extra condition at each of those sites rather
+    // than needing a new `NavBuffer` variant: same buffer type, same
+    // rendering/navigation/command-mode, just mutation refused. Doesn't
+    // affect `dirty`/`save` at all -- a buffer opened for debugging was
+    // never dirty to begin with (`:dbg` itself refuses to attach to one
+    // that is), and nothing here can make it dirty since nothing can
+    // mutate it while this is set.
+    readonly: bool,
     // `u`/`Ctrl-R` -- a real branching tree, not a linear undo/redo stack
     // (see bishedit::undo's own module doc comment for why). Rides along
     // with the buffer exactly like `selections`/`diagnostics` (survives a
@@ -117,6 +130,7 @@ impl TextBuffer {
             blame: None,
             diff: None,
             breakpoints: std::collections::BTreeSet::new(),
+            readonly: false,
             dirty: false,
             path: None,
         }
@@ -155,6 +169,7 @@ impl TextBuffer {
             blame: None,
             diff: None,
             breakpoints: std::collections::BTreeSet::new(),
+            readonly: false,
             dirty: false,
             path: Some(path.to_path_buf()),
         })
@@ -166,6 +181,16 @@ impl TextBuffer {
 
     pub fn is_dirty(&self) -> bool {
         self.dirty
+    }
+
+    pub fn is_readonly(&self) -> bool {
+        self.readonly
+    }
+
+    // `:dbg`'s own on/off switch (repl.rs) -- see `readonly`'s own field
+    // doc comment.
+    pub fn set_readonly(&mut self, readonly: bool) {
+        self.readonly = readonly;
     }
 
     // Commits the buffer's current content/cursor as a new undo-tree node
@@ -593,6 +618,7 @@ mod tests {
             blame: None,
             diff: None,
             breakpoints: std::collections::BTreeSet::new(),
+            readonly: false,
             dirty: false,
             path: None,
         }

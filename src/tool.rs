@@ -33,11 +33,12 @@ pub fn run(args: &[String]) -> i32 {
 
 // `bish tool debug <script>` -- unlike check/format, this isn't a
 // one-shot, non-interactive pass: it launches a real interactive raw-
-// mode session (see debugger.rs's own doc comment for why that's a
-// small standalone view rather than repl.rs's full windowed compositor).
+// mode session, same real windowed editor `bish tool edit` uses
+// (repl::run_edit_debug -- a thin wrapper that immediately attaches a
+// debug session, see debugger.rs's own top-of-file doc comment).
 fn run_debug(args: &[String]) -> i32 {
     match args.first() {
-        Some(path) => crate::debugger::run(path),
+        Some(path) => crate::repl::run_edit_debug(path),
         None => {
             eprintln!("usage: bish tool debug FILE");
             2

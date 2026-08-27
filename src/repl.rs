@@ -12,9 +12,10 @@ use crate::bishedit::suggestion;
 use crate::bishedit::textbuffer::TextBuffer;
 use crate::bishedit::vimkeys::{KeyOutcome, Op, VimKeys, WindowCmd};
 use crate::bishedit::Buffer as BisheditBuffer;
+use crate::debugger;
 use crate::docs;
 use crate::editor::{self, Key, ReadOutcome};
-use crate::exec::{self, ExecResult, PaneDirection, Shell, WindowAction};
+use crate::exec::{self, DebugHook, ExecResult, PaneDirection, Shell, WindowAction};
 use crate::fileeditor;
 use crate::history::{self, History};
 use crate::lexer::Lexer;
@@ -100,12 +101,21 @@ type EditFrameId = u32;
 // `diag_frames` map) -- everything it shows is re-read from
 // `edit_frames[&id]` fresh each time it's focused, since nothing about
 // a diagnostics list is worth preserving across a collapse.
+//
+// DebugRun is the same shape as Diagnostics (a `:dbg`-triggered sibling
+// under a specific Edit frame's own pane, named by that same
+// `EditFrameId`, see split_debug_run_pane) but -- like Job/Edit, unlike
+// Diagnostics -- it *does* carry real persistent state worth keeping
+// across a focus change (the debugged script's own Shell, output,
+// pause/run state): a `debug_frames: HashMap<EditFrameId, debugger::
+// DebugSession>` map, alongside `job_frames`/`edit_frames`.
 #[derive(Clone, Copy, PartialEq)]
 enum Frame {
     Session(SessionId),
     Job(JobFrameId),
     Edit(EditFrameId),
     Diagnostics(EditFrameId),
+    DebugRun(EditFrameId),
 }
 
 type PaneId = u32;
@@ -344,7 +354,7 @@ fn session_referenced_elsewhere(windows: &[WindowEntry], current_window: usize, 
             for (depth, frame) in pane.stack.iter().enumerate() {
                 let matches = match frame {
                     Frame::Session(s) => *s == sid,
-                    Frame::Job(_) | Frame::Edit(_) | Frame::Diagnostics(_) => false,
+                    Frame::Job(_) | Frame::Edit(_) | Frame::Diagnostics(_) | Frame::DebugRun(_) => false,
                 };
                 if !matches {
                     continue;
@@ -409,6 +419,9 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
     // (Frame::Edit) -- see Frame's own doc comment.
     let mut edit_frames: HashMap<EditFrameId, fileeditor::EditSession> = HashMap::new();
     let mut next_edit_frame_id: EditFrameId = 1;
+    // Same idea again, for `:dbg`'s own attached sessions (Frame::
+    // DebugRun) -- see Frame's own doc comment.
+    let mut debug_frames: HashMap<EditFrameId, debugger::DebugSession> = HashMap::new();
     // Flips true (and stays true) the first time any window-family
     // command promotes the terminal -- see apply_window_action. Every
     // session's sink is Real until then, matching today's plain behavior
@@ -464,6 +477,7 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
                 &mut next_session_id,
                 &mut next_window_id,
                 &mut job_frames,
+                &mut debug_frames,
                 &mut cmd_history,
                 &mut sinks_are_grid,
                 &mut registers,
@@ -489,6 +503,7 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
                 &mut next_window_id,
                 &mut job_frames,
                 &mut edit_frames,
+                &mut debug_frames,
                 &mut cmd_history,
                 &mut sinks_are_grid,
                 &mut registers,
@@ -514,6 +529,29 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
                 &mut next_window_id,
                 &mut job_frames,
                 &mut edit_frames,
+                &mut sinks_are_grid,
+                &mut term_rows,
+                &mut term_cols,
+            );
+            let _ = io::stdout().flush();
+            continue;
+        }
+
+        // Same idea again, for the `:dbg`-created debug-run sibling pane
+        // (see split_debug_run_pane) -- reached whenever the user
+        // navigates focus onto it directly while nothing is actually
+        // running (a real run takes over the terminal itself -- see
+        // run_debug_run_frame's own doc comment).
+        if let Frame::DebugRun(edit_frame_id) = *windows[current_window].stack().last().unwrap() {
+            run_debug_run_frame(
+                windows[current_window].focused_pane,
+                edit_frame_id,
+                &mut sessions,
+                &mut windows,
+                &mut current_window,
+                &mut next_session_id,
+                &mut next_window_id,
+                &debug_frames,
                 &mut sinks_are_grid,
                 &mut term_rows,
                 &mut term_cols,
@@ -843,6 +881,8 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
                     &mut next_window_id,
                     &mut sinks_are_grid,
                     &mut job_frames,
+                    None,
+                    &mut debug_frames,
                     &mut cmd_history,
                     &mut registers,
                     NavStart::Prompt { text, cursor },
@@ -1067,6 +1107,7 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
                         &mut next_session_id,
                         &mut next_window_id,
                         &mut job_frames,
+                        &mut debug_frames,
                         &mut cmd_history,
                         &mut sinks_are_grid,
                         &mut registers,
@@ -1104,6 +1145,7 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
                                 &mut next_window_id,
                                 &mut job_frames,
                                 &mut edit_frames,
+                                &mut debug_frames,
                                 &mut cmd_history,
                                 &mut sinks_are_grid,
                                 &mut registers,
@@ -1167,6 +1209,20 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
 // leaves this one pane, and this function treats that exactly like a
 // real quit -- there's no second window/pane here for it to drive.
 pub fn run_edit(path: &str) -> i32 {
+    run_edit_impl(path, false)
+}
+
+// `bish tool debug FILE`'s own thin wrapper -- reuses this same minimal
+// single-session/single-window bootstrap to open FILE, then immediately
+// attaches a debug session to it, exactly what a bare `:dbg` does inside
+// the real windowed editor. See debugger.rs's own top-of-file doc
+// comment for the rest of the shape (a real, read-only source pane plus
+// a real DebugRun sibling).
+pub fn run_edit_debug(path: &str) -> i32 {
+    run_edit_impl(path, true)
+}
+
+fn run_edit_impl(path: &str, attach_debug: bool) -> i32 {
     let mut shell = exec::Shell::new();
     shell.enable_monitor_mode();
     let root_cwd = shell.cwd.clone();
@@ -1196,12 +1252,13 @@ pub fn run_edit(path: &str) -> i32 {
     let mut next_window_id: u32 = 1;
     let mut job_frames: HashMap<JobFrameId, exec::FgJob> = HashMap::new();
     let mut edit_frames: HashMap<EditFrameId, fileeditor::EditSession> = HashMap::new();
+    let mut debug_frames: HashMap<EditFrameId, debugger::DebugSession> = HashMap::new();
     let mut sinks_are_grid = false;
 
     ensure_promoted(&mut sessions, &mut sinks_are_grid);
 
     let rect = pane_rect(&windows[current_window], windows[current_window].focused_pane, term_rows, term_cols);
-    let session = match fileeditor::EditSession::open(Some(path), normal_mode_content_rows(rect)) {
+    let mut session = match fileeditor::EditSession::open(Some(path), normal_mode_content_rows(rect)) {
         Ok(s) => s,
         Err(e) => {
             // Leaving promotion behind here too: promote_if_needed already
@@ -1213,6 +1270,23 @@ pub fn run_edit(path: &str) -> i32 {
         }
     };
     let edit_frame_id: EditFrameId = 1;
+    if attach_debug {
+        match debugger::DebugSession::attach(std::path::Path::new(path)) {
+            Ok(debug_session) => {
+                session.buffer.set_readonly(true);
+                debug_frames.insert(edit_frame_id, debug_session);
+                let (pane_id, _screen) = split_debug_run_pane(&mut sessions, &mut windows, current_window, &mut next_session_id, edit_frame_id, term_rows, term_cols);
+                let sid = windows[current_window].pane(pane_id).owning_session();
+                render_debug_run_title(&sessions[&sid].screen, term_cols, "attached -- :dbg run to start");
+            }
+            Err(e) => {
+                print!("\x1b[?1049l");
+                let _ = io::stdout().flush();
+                eprintln!("bish: dbg: {}: {}", path, e);
+                return 1;
+            }
+        }
+    }
     edit_frames.insert(edit_frame_id, session);
     windows[current_window].stack_mut().push(Frame::Edit(edit_frame_id));
 
@@ -1226,6 +1300,7 @@ pub fn run_edit(path: &str) -> i32 {
         &mut next_window_id,
         &mut job_frames,
         &mut edit_frames,
+        &mut debug_frames,
         &mut cmd_history,
         &mut sinks_are_grid,
         &mut registers,
@@ -1260,13 +1335,16 @@ fn handle_command_mode(
     cmd_history: &mut History,
     sinks_are_grid: &mut bool,
     job_frames: &mut HashMap<JobFrameId, exec::FgJob>,
+    debug_frames: &mut HashMap<EditFrameId, debugger::DebugSession>,
     registers: &mut Registers,
     term_rows: &mut usize,
     term_cols: &mut usize,
     editing: Option<&mut TextBuffer>,
     seed: Option<String>,
 ) -> CommandModeOutcome {
-    let outcome = run_command_mode(session_id, sessions, windows, *current_window, next_session_id, cmd_history, job_frames, registers, term_rows, term_cols, *sinks_are_grid, editing, seed);
+    let outcome = run_command_mode(
+        session_id, sessions, windows, *current_window, next_session_id, cmd_history, job_frames, debug_frames, registers, term_rows, term_cols, *sinks_are_grid, editing, seed,
+    );
     match outcome {
         CommandModeOutcome::Action(action) => {
             apply_window_action(action, sessions, windows, current_window, next_session_id, next_window_id, sinks_are_grid, *term_rows, *term_cols);
@@ -1309,6 +1387,7 @@ fn run_fg_job_frame(
     next_session_id: &mut SessionId,
     next_window_id: &mut u32,
     job_frames: &mut HashMap<JobFrameId, exec::FgJob>,
+    debug_frames: &mut HashMap<EditFrameId, debugger::DebugSession>,
     cmd_history: &mut History,
     sinks_are_grid: &mut bool,
     registers: &mut Registers,
@@ -1391,6 +1470,8 @@ fn run_fg_job_frame(
                 next_window_id,
                 sinks_are_grid,
                 job_frames,
+                None,
+                debug_frames,
                 cmd_history,
                 registers,
                 NavStart::JobDetach,
@@ -1517,6 +1598,7 @@ fn run_edit_frame(
     next_window_id: &mut u32,
     job_frames: &mut HashMap<JobFrameId, exec::FgJob>,
     edit_frames: &mut HashMap<EditFrameId, fileeditor::EditSession>,
+    debug_frames: &mut HashMap<EditFrameId, debugger::DebugSession>,
     cmd_history: &mut History,
     sinks_are_grid: &mut bool,
     registers: &mut Registers,
@@ -1573,6 +1655,8 @@ fn run_edit_frame(
             next_window_id,
             sinks_are_grid,
             job_frames,
+            Some(edit_frame_id),
+            debug_frames,
             cmd_history,
             registers,
             NavStart::Edit(Box::new(buffer), Box::new(vk)),
@@ -1598,6 +1682,17 @@ fn run_edit_frame(
                 // pane no `Frame::Edit` will ever point at again.
                 if let Some(diag_pane) = diagnostics_sibling(&windows[*current_window], edit_frame_id) {
                     close_pane(&mut windows[*current_window], diag_pane);
+                    close_orphaned_sessions(sessions, windows);
+                }
+                // Same idea for an attached `:dbg` session's own
+                // DebugRun sibling -- the buffer this session was
+                // attached to is going away regardless of whether
+                // `:dbg quit` was ever run explicitly, so there's
+                // nothing left for it to debug.
+                if debug_frames.remove(&edit_frame_id).is_some()
+                    && let Some(debug_pane) = debug_run_sibling(&windows[*current_window], edit_frame_id)
+                {
+                    close_pane(&mut windows[*current_window], debug_pane);
                     close_orphaned_sessions(sessions, windows);
                 }
                 if *sinks_are_grid {
@@ -1989,6 +2084,84 @@ fn render_diagnostics_list_frame(buf: &TextBuffer, rect: Rect, selected: usize, 
     let _ = io::stdout().flush();
 }
 
+// The `Frame::DebugRun` sibling's own idle view -- reached whenever the
+// user navigates focus onto it directly (`<C-w>j`, or clicking its own
+// collapsed title bar) while nothing is actually running (a real run
+// drives the terminal itself, from inside `PauseState::on_statement`/
+// repl.rs's own "dbg run"/"continue"/"next"/"step" handling -- see
+// debugger.rs's own top-of-file doc comment for why that can't go
+// through this function instead). There's nothing to select/expand here
+// the way `run_diagnostics_frame` has -- just a status line and
+// `<C-w>`/Escape/`q` to leave, so this is much smaller than that
+// function despite the shared shape.
+#[allow(clippy::too_many_arguments)]
+fn run_debug_run_frame(
+    pane_id: PaneId,
+    edit_frame_id: EditFrameId,
+    sessions: &mut HashMap<SessionId, SessionState>,
+    windows: &mut Vec<WindowEntry>,
+    current_window: &mut usize,
+    next_session_id: &mut SessionId,
+    next_window_id: &mut u32,
+    debug_frames: &HashMap<EditFrameId, debugger::DebugSession>,
+    sinks_are_grid: &mut bool,
+    term_rows: &mut usize,
+    term_cols: &mut usize,
+) {
+    let Ok(_guard) = term::RawGuard::enable_with_mouse(0) else { return };
+    let mut vk = VimKeys::new();
+
+    let leave = |windows: &mut Vec<WindowEntry>| {
+        if let Some(editor_pane) = editor_pane_for(&windows[*current_window], edit_frame_id) {
+            windows[*current_window].focused_pane = editor_pane;
+        }
+    };
+
+    // Same reasoning run_diagnostics_frame's own identical call has:
+    // whichever pane this one's *sibling* is (the editor pane) has never
+    // had this pane's own rect painted around it before now -- without
+    // this, only the rows this loop's own writes below touch would ever
+    // update, leaving the editor pane's last content sitting there at
+    // its *previous* (unshrunk) size until something else happens to
+    // trigger a full repaint.
+    compositor_redraw(sessions, windows, *current_window, *term_rows, *term_cols);
+
+    loop {
+        let rect = pane_rect(&windows[*current_window], pane_id, *term_rows, *term_cols);
+        let status = if debug_frames.contains_key(&edit_frame_id) {
+            "dbg: attached -- :dbg run to start  <C-w> to leave"
+        } else {
+            "dbg: not attached -- :dbg to attach"
+        };
+        let mut out = format!("\x1b[{};{}H\x1b[K", rect.row + 1, rect.col + 1);
+        out.push_str(&status.chars().take(rect.cols).collect::<String>());
+        for row in 1..rect.rows {
+            out.push_str(&format!("\x1b[{};{}H\x1b[K", rect.row + row + 1, rect.col + 1));
+        }
+        out.push_str("\x1b[?25l");
+        print!("{out}");
+        let _ = io::stdout().flush();
+
+        let key = match editor::read_key_idle(&mut || {}) {
+            Ok(Some(k)) => k,
+            Ok(None) | Err(_) => return,
+        };
+        match key {
+            Key::Escape | Key::Char('q') => {
+                leave(windows);
+                compositor_redraw(sessions, windows, *current_window, *term_rows, *term_cols);
+                return;
+            }
+            _ => {
+                if let KeyOutcome::Window(cmd, count) = vk.feed(key) {
+                    dispatch_window_cmd(cmd, count, sessions, windows, current_window, next_session_id, next_window_id, sinks_are_grid, *term_rows, *term_cols);
+                    return;
+                }
+            }
+        }
+    }
+}
+
 // Performs a `window`-family action against the real session/window
 // state repl.rs owns directly (see ExecResult::Window's doc comment in
 // exec.rs for why this can't live inside Shell itself). Redraws the
@@ -2151,6 +2324,11 @@ fn apply_window_action(
                 Some(Frame::Diagnostics(_)) => {
                     sessions[&cur_sid].shell.sink_err("bish: window: fg: that window is showing diagnostics, not a session\n");
                 }
+                // Same reasoning again -- the debug-run pane is scoped to
+                // the one Edit frame's own pane it sits below too.
+                Some(Frame::DebugRun(_)) => {
+                    sessions[&cur_sid].shell.sink_err("bish: window: fg: that window is running a debugged script, not a session\n");
+                }
                 None => {
                     sessions[&cur_sid].shell.sink_err(&format!("bish: window: fg: no such window: {}\n", target_id));
                 }
@@ -2306,6 +2484,88 @@ fn split_diagnostics_pane(
 // it.
 fn diagnostics_sibling(window: &WindowEntry, edit_frame_id: EditFrameId) -> Option<PaneId> {
     window.panes.iter().find(|p| p.stack.last() == Some(&Frame::Diagnostics(edit_frame_id))).map(|p| p.id)
+}
+
+// `:dbg`'s own sibling to split_diagnostics_pane, just above -- same
+// "fork a session purely to give the new pane a screen to composite
+// from" pattern, same "always horizontal, starts minimized, doesn't
+// move focus" shape (attaching a debug session shouldn't yank you out
+// of the file either). The new pane's own `SessionState.shell` is,
+// like diagnostics' own, never actually used to run anything -- it
+// exists only so this pane has a `Frame::Session` underneath
+// `DebugRun` to sit on, and a screen to composite from. The *debugged
+// script's own* Shell lives separately, in the `debugger::DebugSession`
+// this frame's own `EditFrameId` indexes into (`debug_frames`), set to
+// render into this exact same screen (`Shell::set_sink_grid`) so the
+// script's real output actually shows up in this pane the same way any
+// ordinary session's own live output does -- no bespoke ANSI-building.
+fn split_debug_run_pane(
+    sessions: &mut HashMap<SessionId, SessionState>,
+    windows: &mut [WindowEntry],
+    current_window: usize,
+    next_session_id: &mut SessionId,
+    edit_frame_id: EditFrameId,
+    term_rows: usize,
+    term_cols: usize,
+) -> (PaneId, Rc<RefCell<vt100::Screen>>) {
+    let parent_id = windows[current_window].owning_session();
+    let child_history = sessions[&parent_id].history.fork();
+    let mut child_shell = sessions[&parent_id].shell.new_virtual_child();
+    let screen = Rc::new(RefCell::new(vt100::Screen::new(content_rows(term_rows), term_cols)));
+    child_shell.set_sink_grid(screen.clone());
+    let child_cwd = child_shell.cwd.clone();
+    let sid = *next_session_id;
+    *next_session_id += 1;
+    sessions.insert(
+        sid,
+        SessionState {
+            shell: child_shell,
+            buffer: String::new(),
+            history: child_history,
+            screen: screen.clone(),
+            warned_stopped_jobs: false,
+            dir_history: vec![child_cwd],
+            dir_history_index: 0,
+            command_transcript: Vec::new(),
+        },
+    );
+
+    let window = &mut windows[current_window];
+    let new_pane_id = window.next_pane_id;
+    window.next_pane_id += 1;
+    window.panes.push(Pane { id: new_pane_id, stack: vec![Frame::Session(sid), Frame::DebugRun(edit_frame_id)] });
+
+    let focused_id = window.focused_pane;
+    let old_layout = std::mem::replace(&mut window.layout, PaneLayout::Leaf(0));
+    window.layout = insert_sibling(old_layout, focused_id, new_pane_id, true, None, true);
+
+    (new_pane_id, screen)
+}
+
+// The debug-run sibling pane already sitting below `edit_frame_id`'s
+// own editor pane, if `:dbg` has attached a session -- `None` before
+// the first `:dbg` run, or after `:dbg quit`/the file closing removed
+// it.
+fn debug_run_sibling(window: &WindowEntry, edit_frame_id: EditFrameId) -> Option<PaneId> {
+    window.panes.iter().find(|p| p.stack.last() == Some(&Frame::DebugRun(edit_frame_id))).map(|p| p.id)
+}
+
+// The debug-run pane's own 1-row collapsed title, same "dashes + reverse-
+// video pill + dashes" convention render_diagnostics_title uses -- shown
+// while idle (not actually running/paused, which draws directly instead,
+// see PauseState::render's own doc comment).
+fn render_debug_run_title(screen: &Rc<RefCell<vt100::Screen>>, cols: usize, status: &str) {
+    let pill: String = format!(" dbg: {status} ").chars().take(cols).collect();
+    let pill_len = pill.chars().count();
+    let left = 2.min(cols.saturating_sub(pill_len));
+    let right = cols.saturating_sub(pill_len + left);
+    let mut framed = String::from("\r\x1b[K");
+    framed.push_str(&"─".repeat(left));
+    framed.push_str("\x1b[7m");
+    framed.push_str(&pill);
+    framed.push_str("\x1b[0m");
+    framed.push_str(&"─".repeat(right));
+    screen.borrow_mut().feed(framed.as_bytes());
 }
 
 // The diagnostics pane's own 1-row title, in reverse video (matching
@@ -2526,7 +2786,7 @@ fn close_orphaned_sessions(sessions: &mut HashMap<SessionId, SessionState>, wind
         .flat_map(|p| {
             p.stack.iter().filter_map(|f| match f {
                 Frame::Session(id) => Some(*id),
-                Frame::Job(_) | Frame::Edit(_) | Frame::Diagnostics(_) => None,
+                Frame::Job(_) | Frame::Edit(_) | Frame::Diagnostics(_) | Frame::DebugRun(_) => None,
             })
         })
         .collect();
@@ -3906,10 +4166,41 @@ impl NavBuffer {
         }
     }
 
+    // Deliberately NOT gated on `TextBuffer::is_readonly` -- this is what
+    // feeds `run_command_mode`'s own `editing` parameter, and `:dbg`
+    // itself (a command-mode command) needs `&mut TextBuffer` access
+    // regardless of whether content mutation is currently allowed, to
+    // toggle `set_readonly`/`breakpoints` in the first place. Vim-motion
+    // content mutation is gated separately, at each individual
+    // KeyOutcome/raw-key arm below, via `as_writable_mut`.
     fn as_editable_mut(&mut self) -> Option<&mut TextBuffer> {
         match self {
             NavBuffer::ReadOnly(_) => None,
             NavBuffer::Editable(b) => Some(b),
+        }
+    }
+
+    // True only for a genuinely mutable `Editable` buffer -- false both
+    // for `ReadOnly` (matching what a bare `matches!(_, NavBuffer::
+    // Editable(_))` already meant) and for an `Editable` buffer currently
+    // under `:dbg` control (`TextBuffer::is_readonly` -- see that
+    // field's own doc comment). Every mutating `KeyOutcome`/raw-key arm
+    // in `run_normal_mode_navigation` uses this (or `as_writable_mut`)
+    // instead of matching `NavBuffer::Editable` directly, so "read-only
+    // while a debug session is attached" is enforced by omission the
+    // exact same way plain `ReadOnly` scrollback navigation already is.
+    fn is_writable(&self) -> bool {
+        match self {
+            NavBuffer::ReadOnly(_) => false,
+            NavBuffer::Editable(tb) => !tb.is_readonly(),
+        }
+    }
+
+    fn as_writable_mut(&mut self) -> Option<&mut TextBuffer> {
+        match self {
+            NavBuffer::ReadOnly(_) => None,
+            NavBuffer::Editable(tb) if !tb.is_readonly() => Some(tb),
+            NavBuffer::Editable(_) => None,
         }
     }
 }
@@ -4547,6 +4838,16 @@ fn run_normal_mode_navigation(
     next_window_id: &mut u32,
     sinks_are_grid: &mut bool,
     job_frames: &mut HashMap<JobFrameId, exec::FgJob>,
+    // `Some` iff `start` is `NavStart::Edit` -- the id `debug_frames`
+    // itself is keyed on (see Frame::DebugRun's own doc comment), needed
+    // both for `K`'s own live-value lookup below and threaded on into
+    // `handle_command_mode` so its `:dbg` handling can attach/detach a
+    // session. `None` for the other two starts (a plain prompt or a
+    // detached job's own frozen screen) -- neither has a file buffer
+    // `:dbg` could mean anything against, so `debug_frames` is simply
+    // never touched from those calls.
+    edit_frame_id: Option<EditFrameId>,
+    debug_frames: &mut HashMap<EditFrameId, debugger::DebugSession>,
     cmd_history: &mut History,
     registers: &mut Registers,
     start: NavStart,
@@ -4773,11 +5074,11 @@ fn run_normal_mode_navigation(
                 render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides);
                 continue;
             }
-            Key::Char('d') if vk.is_idle() && matches!(buf, NavBuffer::Editable(_)) && (vk.is_visual() || !buf.selections().is_empty()) => {
+            Key::Char('d') if vk.is_idle() && buf.is_writable() && (vk.is_visual() || !buf.selections().is_empty()) => {
                 commit_active_selection(&vk, &mut buf);
                 let register = vk.take_pending_register();
                 let end_cursor = buf.cursor();
-                if let NavBuffer::Editable(tb) = &mut buf {
+                if let Some(tb) = buf.as_writable_mut() {
                     tb.delete_selections(registers, register);
                 }
                 buf.selections_mut().clear();
@@ -4792,17 +5093,17 @@ fn run_normal_mode_navigation(
             // all of them, not just the one `buf.cursor()` happens to
             // land on. A single selection is just the len-1 case of the
             // exact same call, unchanged from before this existed.
-            Key::Char('c') if vk.is_idle() && matches!(buf, NavBuffer::Editable(_)) && (vk.is_visual() || !buf.selections().is_empty()) => {
+            Key::Char('c') if vk.is_idle() && buf.is_writable() && (vk.is_visual() || !buf.selections().is_empty()) => {
                 commit_active_selection(&vk, &mut buf);
                 let register = vk.take_pending_register();
                 let end_cursor = buf.cursor();
                 let mut gaps: Vec<(usize, usize)> = Vec::new();
-                if let NavBuffer::Editable(tb) = &mut buf {
+                if let Some(tb) = buf.as_writable_mut() {
                     gaps = tb.delete_selections(registers, register);
                 }
                 buf.selections_mut().clear();
                 vk.end_visual(end_cursor);
-                if !gaps.is_empty() && let NavBuffer::Editable(tb) = &mut buf {
+                if !gaps.is_empty() && let Some(tb) = buf.as_writable_mut() {
                     let (insert_term_rows, insert_term_cols) = (*term_rows, *term_cols);
                     fileeditor::run_insert_mode(
                         tb,
@@ -4820,11 +5121,11 @@ fn run_normal_mode_navigation(
                 render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides);
                 continue;
             }
-            Key::Char('p') | Key::Char('P') if vk.is_idle() && matches!(buf, NavBuffer::Editable(_)) && (vk.is_visual() || !buf.selections().is_empty()) => {
+            Key::Char('p') | Key::Char('P') if vk.is_idle() && buf.is_writable() && (vk.is_visual() || !buf.selections().is_empty()) => {
                 commit_active_selection(&vk, &mut buf);
                 let register = vk.take_pending_register();
                 let end_cursor = buf.cursor();
-                if let NavBuffer::Editable(tb) = &mut buf {
+                if let Some(tb) = buf.as_writable_mut() {
                     tb.put_over_selections(registers, register);
                 }
                 buf.selections_mut().clear();
@@ -4837,10 +5138,10 @@ fn run_normal_mode_navigation(
             // via fileeditor::indent_selections/outdent_selections, then
             // drops back to Normal mode at the first shifted line, same
             // as vim's own Visual-mode `>`/`<`.
-            Key::Char('>') if vk.is_idle() && matches!(buf, NavBuffer::Editable(_)) && (vk.is_visual() || !buf.selections().is_empty()) => {
+            Key::Char('>') if vk.is_idle() && buf.is_writable() && (vk.is_visual() || !buf.selections().is_empty()) => {
                 commit_active_selection(&vk, &mut buf);
                 let end_cursor = buf.cursor();
-                if let NavBuffer::Editable(tb) = &mut buf {
+                if let Some(tb) = buf.as_writable_mut() {
                     fileeditor::indent_selections(tb);
                 }
                 buf.selections_mut().clear();
@@ -4848,10 +5149,10 @@ fn run_normal_mode_navigation(
                 render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides);
                 continue;
             }
-            Key::Char('<') if vk.is_idle() && matches!(buf, NavBuffer::Editable(_)) && (vk.is_visual() || !buf.selections().is_empty()) => {
+            Key::Char('<') if vk.is_idle() && buf.is_writable() && (vk.is_visual() || !buf.selections().is_empty()) => {
                 commit_active_selection(&vk, &mut buf);
                 let end_cursor = buf.cursor();
-                if let NavBuffer::Editable(tb) = &mut buf {
+                if let Some(tb) = buf.as_writable_mut() {
                     fileeditor::outdent_selections(tb);
                 }
                 buf.selections_mut().clear();
@@ -4859,10 +5160,10 @@ fn run_normal_mode_navigation(
                 render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides);
                 continue;
             }
-            Key::Char('S') if vk.is_idle() && matches!(buf, NavBuffer::Editable(_)) && (vk.is_visual() || !buf.selections().is_empty()) => {
+            Key::Char('S') if vk.is_idle() && buf.is_writable() && (vk.is_visual() || !buf.selections().is_empty()) => {
                 commit_active_selection(&vk, &mut buf);
                 let end_cursor = buf.cursor();
-                if let NavBuffer::Editable(tb) = &mut buf
+                if let Some(tb) = buf.as_writable_mut()
                     && let Some(Key::Char(ch)) = vk.next_key(|| editor::read_key_idle(&mut || {
                         service_background_jobs(sessions, windows, job_frames, *current_window, term_rows, term_cols, *sinks_are_grid);
                     }))?
@@ -4945,7 +5246,7 @@ fn run_normal_mode_navigation(
                 if matches!(buf, NavBuffer::Editable(_)) {
                     // `ZZ`: vim's own alias for `:x` -- save and quit.
                     let mut saved = true;
-                    if let NavBuffer::Editable(tb) = &mut buf {
+                    if let Some(tb) = buf.as_writable_mut() {
                         match tb.save(None) {
                             Ok(()) => fileeditor::set_last_filename(tb, registers),
                             Err(e) => {
@@ -4963,20 +5264,24 @@ fn run_normal_mode_navigation(
                 break 'nav (NavExit::Resume(initial_text.clone(), initial_cursor), nav_buffer_into_edit_state(buf, vk));
             }
             // `K`: hover whatever's under the cursor -- same shared
-            // lookup (docs::hover_lines_at) debugger.rs's own `K` uses,
-            // just without that view's one extra tier (a live running
-            // value: there's no script actually executing behind a
-            // plain file-editor buffer, so `live_value` is always
-            // `|_| None` here). Scoped to `Editable` only (matching
-            // `:help`/`:git`/`:format`'s own "only means something while
-            // editing a real file" convention) -- for `ReadOnly`
-            // scrollback navigation it just falls through to vimkeys'
-            // own handling (a no-op, since `K` isn't bound there either
-            // in real vim). The doc index is rebuilt fresh from this
-            // buffer's own *live* text every time (TextBuffer::text, not
-            // a re-read off disk) so an unsaved edit is reflected
-            // immediately, unlike debugger.rs's index (built once, since
-            // that view is read-only for its whole session).
+            // lookup (docs::hover_lines_at) debugger.rs's own pause loop
+            // used to build itself. Its live-value tier now comes from
+            // `debug_frames`: `Some` iff a `:dbg` session is actually
+            // attached to *this* edit frame, in which case the hovered
+            // identifier's current value (Shell::debug_peek_var) is
+            // shown same as it always was -- `|_| None` otherwise (no
+            // session attached, or this isn't even an Edit frame at
+            // all). Scoped to `Editable` only (matching `:help`/`:git`/
+            // `:format`'s own "only means something while editing a real
+            // file" convention) -- for `ReadOnly` scrollback navigation
+            // it just falls through to vimkeys' own handling (a no-op,
+            // since `K` isn't bound there either in real vim). The doc
+            // index is rebuilt fresh from this buffer's own *live* text
+            // every time (TextBuffer::text, not a re-read off disk) so
+            // an unsaved edit is reflected immediately -- moot while a
+            // debug session is attached (readonly, so there's never an
+            // unsaved edit to reflect), but this arm is shared with the
+            // ordinary, non-debugged case too.
             Key::Char('K') if vk.is_idle() && matches!(buf, NavBuffer::Editable(_)) => {
                 let NavBuffer::Editable(tb) = &buf else { unreachable!("guarded by this arm's own match above") };
                 let (row, col) = tb.cursor();
@@ -4984,7 +5289,8 @@ fn run_normal_mode_navigation(
                 let line_text: String = chars.iter().collect();
                 let base_path = tb.path().map(|p| p.to_path_buf()).unwrap_or_else(|| std::env::current_dir().unwrap_or_default().join("untitled"));
                 let index = docs::DocIndex::build_from_source(&tb.text(), &base_path);
-                let hover_lines = docs::hover_lines_at(&chars, col, &line_text, &index, |_| None);
+                let debug_session = edit_frame_id.and_then(|id| debug_frames.get(&id));
+                let hover_lines = docs::hover_lines_at(&chars, col, &line_text, &index, |name| debug_session.and_then(|s| s.peek_var(name)));
                 let gutter_width = rect.cols.saturating_sub(fileeditor::editor_content_cols(tb, rect));
                 let cursor_row = rect.row + row.saturating_sub(tb.viewport_top());
                 let cursor_col = rect.col + gutter_width + col.saturating_sub(tb.viewport_left());
@@ -5012,6 +5318,7 @@ fn run_normal_mode_navigation(
                     cmd_history,
                     sinks_are_grid,
                     job_frames,
+                    debug_frames,
                     registers,
                     term_rows,
                     term_cols,
@@ -5103,7 +5410,7 @@ fn run_normal_mode_navigation(
             // `KeyOutcome`.
             KeyOutcome::EnterInsert(cmd) => {
                 if matches!(buf, NavBuffer::Editable(_)) {
-                    if let NavBuffer::Editable(tb) = &mut buf {
+                    if let Some(tb) = buf.as_writable_mut() {
                         fileeditor::resolve_insert_start(tb, cmd);
                         let (insert_term_rows, insert_term_cols) = (*term_rows, *term_cols);
                         fileeditor::run_insert_mode(tb, &mut vk, rect, registers, &mut || service_background_jobs(sessions, windows, job_frames, *current_window, term_rows, term_cols, *sinks_are_grid), false, insert_term_rows, insert_term_cols, color_overrides, &[])?;
@@ -5123,7 +5430,7 @@ fn run_normal_mode_navigation(
             // own `replace: true`.
             KeyOutcome::EnterReplace => {
                 if matches!(buf, NavBuffer::Editable(_)) {
-                    if let NavBuffer::Editable(tb) = &mut buf {
+                    if let Some(tb) = buf.as_writable_mut() {
                         let (insert_term_rows, insert_term_cols) = (*term_rows, *term_cols);
                         fileeditor::run_insert_mode(tb, &mut vk, rect, registers, &mut || service_background_jobs(sessions, windows, job_frames, *current_window, term_rows, term_cols, *sinks_are_grid), true, insert_term_rows, insert_term_cols, color_overrides, &[])?;
                     }
@@ -5171,7 +5478,7 @@ fn run_normal_mode_navigation(
             // own doc comment in vimkeys.rs), so `u` simply does nothing
             // while a selection is active rather than misfiring as undo.
             KeyOutcome::Undo(count) => {
-                if !vk.is_visual() && buf.selections().is_empty() && let NavBuffer::Editable(tb) = &mut buf {
+                if !vk.is_visual() && buf.selections().is_empty() && let Some(tb) = buf.as_writable_mut() {
                     for _ in 0..count.unwrap_or(1).max(1) {
                         if !tb.undo() {
                             break;
@@ -5181,7 +5488,7 @@ fn run_normal_mode_navigation(
                 render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides);
             }
             KeyOutcome::Redo(count) => {
-                if !vk.is_visual() && buf.selections().is_empty() && let NavBuffer::Editable(tb) = &mut buf {
+                if !vk.is_visual() && buf.selections().is_empty() && let Some(tb) = buf.as_writable_mut() {
                     for _ in 0..count.unwrap_or(1).max(1) {
                         if !tb.redo() {
                             break;
@@ -5193,7 +5500,7 @@ fn run_normal_mode_navigation(
             // `g-`/`g+`: same guard as `u`/`Ctrl-R` just above, for the
             // same reason.
             KeyOutcome::UndoSeq { forward, count } => {
-                if !vk.is_visual() && buf.selections().is_empty() && let NavBuffer::Editable(tb) = &mut buf {
+                if !vk.is_visual() && buf.selections().is_empty() && let Some(tb) = buf.as_writable_mut() {
                     for _ in 0..count.unwrap_or(1).max(1) {
                         if !tb.time_travel(forward) {
                             break;
@@ -5212,7 +5519,7 @@ fn run_normal_mode_navigation(
             KeyOutcome::Operator(op, motion, count, register) => {
                 if op == Op::Yank {
                     editor::yank_motion(&mut buf, registers, motion, count, register);
-                } else if let NavBuffer::Editable(tb) = &mut buf {
+                } else if let Some(tb) = buf.as_writable_mut() {
                     match op {
                         Op::Delete => {
                             fileeditor::delete_motion(tb, registers, motion, count, register);
@@ -5237,7 +5544,7 @@ fn run_normal_mode_navigation(
             KeyOutcome::OperatorLines(op, count, register) => {
                 if op == Op::Yank {
                     editor::yank_lines(&buf, registers, count, register);
-                } else if let NavBuffer::Editable(tb) = &mut buf {
+                } else if let Some(tb) = buf.as_writable_mut() {
                     match op {
                         Op::Delete => fileeditor::delete_lines(tb, registers, count, register),
                         Op::Change => {
@@ -5259,61 +5566,61 @@ fn run_normal_mode_navigation(
             // not an editable buffer), each calling the matching
             // `fileeditor::` helper for `Editable`.
             KeyOutcome::Put { before, count, register } => {
-                if let NavBuffer::Editable(tb) = &mut buf {
+                if let Some(tb) = buf.as_writable_mut() {
                     fileeditor::put(tb, registers, before, count, register);
                 }
                 render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides);
             }
             KeyOutcome::DeleteCharForward { count, register } => {
-                if let NavBuffer::Editable(tb) = &mut buf {
+                if let Some(tb) = buf.as_writable_mut() {
                     fileeditor::delete_char_forward(tb, registers, count, register);
                 }
                 render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides);
             }
             KeyOutcome::Join { count, with_space } => {
-                if let NavBuffer::Editable(tb) = &mut buf {
+                if let Some(tb) = buf.as_writable_mut() {
                     tb.join_lines(count.unwrap_or(1).max(1), with_space);
                 }
                 render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides);
             }
             KeyOutcome::AddSurround { target, ch } => {
-                if let NavBuffer::Editable(tb) = &mut buf {
+                if let Some(tb) = buf.as_writable_mut() {
                     fileeditor::add_surround(tb, target, ch);
                 }
                 render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides);
             }
             KeyOutcome::DeleteSurround { ch } => {
-                if let NavBuffer::Editable(tb) = &mut buf {
+                if let Some(tb) = buf.as_writable_mut() {
                     fileeditor::delete_surround(tb, ch);
                 }
                 render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides);
             }
             KeyOutcome::ChangeSurround { ch, replacement } => {
-                if let NavBuffer::Editable(tb) = &mut buf {
+                if let Some(tb) = buf.as_writable_mut() {
                     fileeditor::change_surround(tb, ch, replacement);
                 }
                 render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides);
             }
             KeyOutcome::ReplaceChar { ch, count } => {
-                if let NavBuffer::Editable(tb) = &mut buf {
+                if let Some(tb) = buf.as_writable_mut() {
                     fileeditor::replace_char(tb, ch, count.unwrap_or(1).max(1));
                 }
                 render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides);
             }
             KeyOutcome::ToggleCase { count } => {
-                if let NavBuffer::Editable(tb) = &mut buf {
+                if let Some(tb) = buf.as_writable_mut() {
                     fileeditor::toggle_case(tb, count.unwrap_or(1).max(1));
                 }
                 render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides);
             }
             KeyOutcome::AdjustNumber { delta } => {
-                if let NavBuffer::Editable(tb) = &mut buf {
+                if let Some(tb) = buf.as_writable_mut() {
                     fileeditor::adjust_number(tb, delta);
                 }
                 render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides);
             }
             KeyOutcome::OpenLine { above } => {
-                if let NavBuffer::Editable(tb) = &mut buf {
+                if let Some(tb) = buf.as_writable_mut() {
                     fileeditor::open_line(tb, above);
                     let (insert_term_rows, insert_term_cols) = (*term_rows, *term_cols);
                     fileeditor::run_insert_mode(tb, &mut vk, rect, registers, &mut || service_background_jobs(sessions, windows, job_frames, *current_window, term_rows, term_cols, *sinks_are_grid), false, insert_term_rows, insert_term_cols, color_overrides, &[])?;
@@ -5594,8 +5901,26 @@ Colon commands:
   :git blame       toggle a per-line blame gutter (:git diff for +/~/-)
   :format          run this file's own formatter
   :diag [clear]    toggle the diagnostics pane
-  :dbg [FILE]      open the script debugger for this (or another) file
+  :dbg             attach a read-only debug session (:dbg help for more)
   :help, :h, :?    this screen";
+
+// `:dbg help`/`:dbg h`/`:dbg ?`'s own reference text -- shown via the
+// same command-output overlay every other command's own output already
+// uses (CommandModeOutcome::Ran), not a hover popup (that was the
+// original standalone debugger's own convention, replaced along with
+// the rest of that view -- see debugger.rs's own top-of-file doc
+// comment).
+const DBG_HELP_TEXT: &str = "\
+bish dbg -- quick reference (:dbg help, :dbg h, :dbg ?)
+
+:dbg                  attach a read-only debug session to this file
+:dbg run              start executing the script
+:dbg break [line]     toggle a breakpoint (cursor's own line if omitted)
+:dbg break add|remove N   explicit add/remove
+:dbg print NAME       show a variable's current value
+:dbg quit             detach (writable again)
+While paused at a breakpoint (in the debug-run pane): c)ontinue n)ext
+s)tep p)rint q)uit h)elp -- bare key, or `:` then the long/short name";
 
 // Command mode's own row, immediately above the tab bar (see render_
 // compositor_frame's own "pinned to the terminal's real last row"
@@ -5871,6 +6196,7 @@ fn run_command_mode(
     next_session_id: &mut SessionId,
     history: &mut History,
     job_frames: &mut HashMap<JobFrameId, exec::FgJob>,
+    debug_frames: &mut HashMap<EditFrameId, debugger::DebugSession>,
     registers: &mut Registers,
     term_rows: &mut usize,
     term_cols: &mut usize,
@@ -6234,61 +6560,280 @@ fn run_command_mode(
                             buffer.clear();
                             continue;
                         }
-                        // `dbg`/`debug [FILE]`: launches the standalone
-                        // script debugger (crate::debugger::run) against
-                        // FILE, or this buffer's own file when no
-                        // argument is given -- same "refuse on a dirty
-                        // buffer with no explicit path" rule `git blame`/
-                        // `git diff` already use, since the debugger reads
-                        // the file fresh off disk rather than this
-                        // buffer's own in-memory content. debugger::run
-                        // draws straight to the real terminal exactly
-                        // like this editor's own live content already
-                        // does (see its own module doc comment) -- no
-                        // window/pane of its own, it just takes over
-                        // until it exits, same as this whole call
-                        // already blocks for `w`/`format`/etc. Its own
-                        // (nested) RawGuard::enable_with_mouse re-enables
-                        // real mouse reporting on the way in and turns it
-                        // back off on the way out (Drop) -- harmless for
-                        // the termios flags themselves (already raw, see
-                        // this loop's own outer guard in run_normal_mode_
-                        // navigation) but it does leave mouse reporting
-                        // off afterward, since Drop can't know an outer
-                        // guard still wants it on -- restored explicitly
-                        // below. Returning `Ran{status: 0}` regardless of
-                        // the debugger's own return code: that code
-                        // reflects whether the debugger *tool itself* ran
-                        // (already validated below), not the debugged
-                        // script's own exit status, which has no
-                        // meaningful place in this transcript.
+                        // `dbg`/`debug <subcommand>`: everything the
+                        // script debugger can do, nested under one
+                        // command the same way `git`'s own subcommands
+                        // are just below -- see debugger.rs's own top-of-
+                        // file doc comment for the full shape (a real,
+                        // read-only `Frame::Edit` pane for the source,
+                        // plus a real `Frame::DebugRun` sibling that
+                        // becomes focused while the script is actually
+                        // running). Every arm below needs to know which
+                        // `Frame::Edit` pane it's attaching to/detaching
+                        // from -- always this same call's own pane (this
+                        // whole `if let Some(tb) = ...` block only ever
+                        // runs while that's true, same as `diag`'s own
+                        // identical lookup just above).
                         "dbg" | "debug" => {
-                            let target = match arg {
-                                Some(p) => std::path::PathBuf::from(p),
-                                None => match tb.path() {
-                                    Some(p) => p.to_path_buf(),
-                                    None => {
-                                        show_command_mode_error("bish: dbg: no file name", *term_rows, *term_cols);
+                            let Some(Frame::Edit(edit_frame_id)) = windows[current_window].stack().last().copied() else {
+                                unreachable!("this whole match arm only runs while editing a real Frame::Edit pane")
+                            };
+                            let (subcmd, subarg) = match arg {
+                                Some(a) => match a.split_once(' ') {
+                                    Some((c, r)) => (c, Some(r.trim()).filter(|r| !r.is_empty())),
+                                    None => (a, None),
+                                },
+                                None => ("", None),
+                            };
+                            match subcmd {
+                                // Bare `:dbg`: attach. Refuses on a dirty
+                                // buffer for the same reason the original
+                                // standalone debugger did -- it reads the
+                                // file fresh off disk (DebugSession::
+                                // attach), not this buffer's own in-
+                                // memory content, so an unsaved edit
+                                // would silently debug something other
+                                // than what's on screen.
+                                "" if subarg.is_none() => {
+                                    if debug_frames.contains_key(&edit_frame_id) {
+                                        let output = "already attached -- :dbg run to start, :dbg quit to detach".to_string();
+                                        sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry { command: trimmed, output: output.clone(), status: 0 });
+                                        return CommandModeOutcome::Ran { output, status: 0 };
+                                    }
+                                    if tb.is_dirty() {
+                                        show_command_mode_error("bish: dbg: E37: no write since last change -- save first with :w", *term_rows, *term_cols);
                                         buffer.clear();
                                         continue;
                                     }
-                                },
-                            };
-                            if arg.is_none() && tb.is_dirty() {
-                                show_command_mode_error("bish: dbg: E37: no write since last change -- save first with :w", *term_rows, *term_cols);
-                                buffer.clear();
-                                continue;
+                                    let Some(path) = tb.path().map(|p| p.to_path_buf()) else {
+                                        show_command_mode_error("bish: dbg: no file name", *term_rows, *term_cols);
+                                        buffer.clear();
+                                        continue;
+                                    };
+                                    let session = match debugger::DebugSession::attach(&path) {
+                                        Ok(s) => s,
+                                        Err(e) => {
+                                            show_command_mode_error(&format!("bish: dbg: {}: {e}", path.display()), *term_rows, *term_cols);
+                                            buffer.clear();
+                                            continue;
+                                        }
+                                    };
+                                    debug_frames.insert(edit_frame_id, session);
+                                    tb.set_readonly(true);
+                                    let pane_id = debug_run_sibling(&windows[current_window], edit_frame_id)
+                                        .unwrap_or_else(|| split_debug_run_pane(sessions, windows, current_window, next_session_id, edit_frame_id, *term_rows, *term_cols).0);
+                                    let sid = windows[current_window].pane(pane_id).owning_session();
+                                    render_debug_run_title(&sessions[&sid].screen, *term_cols, "attached -- :dbg run to start");
+                                    compositor_redraw(sessions, windows, current_window, *term_rows, *term_cols);
+                                    let output = "attached -- read-only until :dbg quit; :dbg run to start, :dbg break [line] to set a breakpoint".to_string();
+                                    sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry { command: trimmed, output: output.clone(), status: 0 });
+                                    return CommandModeOutcome::Ran { output, status: 0 };
+                                }
+                                // `:dbg run`: the only thing that ever
+                                // starts a fresh execution (Shell::
+                                // run_source_here, blocking -- a paused
+                                // breakpoint blocks in place inside it,
+                                // see debugger.rs's own PauseState). A
+                                // *nested* RawGuard, same reasoning the
+                                // original standalone debugger had for
+                                // its own guard (term::RawGuard::
+                                // suspend_raw/resume_raw were specifically
+                                // fixed this session to derive fresh from
+                                // the live termios state rather than a
+                                // stored snapshot, exactly so nesting
+                                // like this is correct) -- its Drop turns
+                                // real mouse reporting back off, restored
+                                // explicitly below for the same reason
+                                // the original code did.
+                                "run" if subarg.is_none() => {
+                                    let Some(session) = debug_frames.get_mut(&edit_frame_id) else {
+                                        show_command_mode_error("bish: dbg: not attached -- use :dbg to attach", *term_rows, *term_cols);
+                                        buffer.clear();
+                                        continue;
+                                    };
+                                    let pane_id = debug_run_sibling(&windows[current_window], edit_frame_id)
+                                        .unwrap_or_else(|| split_debug_run_pane(sessions, windows, current_window, next_session_id, edit_frame_id, *term_rows, *term_cols).0);
+                                    let budget = editor_pane_for(&windows[current_window], edit_frame_id)
+                                        .map(|id| pane_rect(&windows[current_window], id, *term_rows, *term_cols).rows + 1)
+                                        .unwrap_or(*term_rows);
+                                    let rows = (budget / 2).max(6).min(budget.saturating_sub(3).max(1));
+                                    if let Some((_, children, idx)) = find_parent_split_mut(&mut windows[current_window].layout, pane_id) {
+                                        children[idx].minimized = false;
+                                        children[idx].fixed = Some(rows);
+                                    }
+                                    windows[current_window].focused_pane = pane_id;
+                                    compositor_redraw(sessions, windows, current_window, *term_rows, *term_cols);
+                                    let rect = pane_rect(&windows[current_window], pane_id, *term_rows, *term_cols);
+
+                                    let quit_requested = match term::RawGuard::enable_with_mouse(0) {
+                                        Ok(guard) => {
+                                            let hook = Rc::new(RefCell::new(debugger::PauseState::new(tb.breakpoints.clone(), rect, session.source_lines().to_vec(), Rc::new(guard))));
+                                            hook.borrow().begin_capturing_output(&mut session.shell);
+                                            let src = session.source().to_string();
+                                            session.shell.set_debug_hook(Some(hook.clone() as Rc<RefCell<dyn DebugHook>>));
+                                            session.shell.run_source_here(&src, &trimmed);
+                                            session.shell.set_debug_hook(None);
+                                            hook.borrow().cleanup_ext_stdout_path();
+                                            print!("{}", term::MOUSE_REPORTING_ENABLE);
+                                            let _ = io::stdout().flush();
+                                            hook.borrow().quit_requested()
+                                        }
+                                        Err(_) => {
+                                            show_command_mode_error("bish: dbg: not a terminal", *term_rows, *term_cols);
+                                            false
+                                        }
+                                    };
+
+                                    if let Some((_, children, idx)) = find_parent_split_mut(&mut windows[current_window].layout, pane_id) {
+                                        children[idx].minimized = true;
+                                        children[idx].fixed = None;
+                                    }
+                                    if let Some(editor_pane) = editor_pane_for(&windows[current_window], edit_frame_id) {
+                                        windows[current_window].focused_pane = editor_pane;
+                                    }
+                                    let status = if quit_requested {
+                                        tb.set_readonly(false);
+                                        debug_frames.remove(&edit_frame_id);
+                                        close_pane(&mut windows[current_window], pane_id);
+                                        close_orphaned_sessions(sessions, windows);
+                                        "quit"
+                                    } else {
+                                        let sid = windows[current_window].pane(pane_id).owning_session();
+                                        render_debug_run_title(&sessions[&sid].screen, *term_cols, "run finished -- :dbg run to run again");
+                                        "run finished"
+                                    };
+                                    compositor_redraw(sessions, windows, current_window, *term_rows, *term_cols);
+                                    let output = status.to_string();
+                                    sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry { command: trimmed, output: output.clone(), status: 0 });
+                                    return CommandModeOutcome::Ran { output, status: 0 };
+                                }
+                                // `:dbg continue`/`next`/`step`: only ever
+                                // meaningful *while* genuinely paused,
+                                // which can only happen deep inside the
+                                // blocking `:dbg run` call just above --
+                                // there's no way to reach this arm from
+                                // there (the whole process is blocked in
+                                // PauseState::on_statement's own loop
+                                // instead, which recognizes this same
+                                // vocabulary directly -- see debugger.rs's
+                                // own top-of-file doc comment). Kept here,
+                                // sharing the name, purely for an honest
+                                // error instead of "unknown subcommand".
+                                "continue" | "next" | "step" if subarg.is_none() => {
+                                    show_command_mode_error("bish: dbg: not paused -- these only work while stopped at a breakpoint", *term_rows, *term_cols);
+                                    buffer.clear();
+                                    continue;
+                                }
+                                // `:dbg break [line]` / `:dbg break add|remove N`.
+                                "break" => {
+                                    if !debug_frames.contains_key(&edit_frame_id) {
+                                        show_command_mode_error("bish: dbg: not attached -- use :dbg to attach", *term_rows, *term_cols);
+                                        buffer.clear();
+                                        continue;
+                                    }
+                                    let output = match subarg {
+                                        None => {
+                                            let line = tb.cursor().0 + 1;
+                                            if !tb.breakpoints.insert(line) {
+                                                tb.breakpoints.remove(&line);
+                                            }
+                                            format!("breakpoint toggled at line {line}")
+                                        }
+                                        Some(rest) => {
+                                            let (op, num) = match rest.split_once(' ') {
+                                                Some((o, n)) => (o, Some(n.trim())),
+                                                None => (rest, None),
+                                            };
+                                            match (op, num) {
+                                                ("add", Some(n)) => match n.parse::<usize>() {
+                                                    Ok(n) => {
+                                                        tb.breakpoints.insert(n);
+                                                        format!("breakpoint added at line {n}")
+                                                    }
+                                                    Err(_) => {
+                                                        show_command_mode_error(&format!("bish: dbg: {n}: invalid line number"), *term_rows, *term_cols);
+                                                        buffer.clear();
+                                                        continue;
+                                                    }
+                                                },
+                                                ("remove", Some(n)) => match n.parse::<usize>() {
+                                                    Ok(n) => {
+                                                        tb.breakpoints.remove(&n);
+                                                        format!("breakpoint removed at line {n}")
+                                                    }
+                                                    Err(_) => {
+                                                        show_command_mode_error(&format!("bish: dbg: {n}: invalid line number"), *term_rows, *term_cols);
+                                                        buffer.clear();
+                                                        continue;
+                                                    }
+                                                },
+                                                _ => match rest.trim().parse::<usize>() {
+                                                    Ok(n) => {
+                                                        if !tb.breakpoints.insert(n) {
+                                                            tb.breakpoints.remove(&n);
+                                                        }
+                                                        format!("breakpoint toggled at line {n}")
+                                                    }
+                                                    Err(_) => {
+                                                        show_command_mode_error(&format!("bish: dbg: {rest}: invalid line number (expected: [line], add N, remove N)"), *term_rows, *term_cols);
+                                                        buffer.clear();
+                                                        continue;
+                                                    }
+                                                },
+                                            }
+                                        }
+                                    };
+                                    sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry { command: trimmed, output: output.clone(), status: 0 });
+                                    return CommandModeOutcome::Ran { output, status: 0 };
+                                }
+                                // `:dbg print NAME`.
+                                "print" | "p" => {
+                                    let Some(session) = debug_frames.get(&edit_frame_id) else {
+                                        show_command_mode_error("bish: dbg: not attached -- use :dbg to attach", *term_rows, *term_cols);
+                                        buffer.clear();
+                                        continue;
+                                    };
+                                    let Some(name) = subarg else {
+                                        show_command_mode_error("bish: dbg: usage: dbg print NAME", *term_rows, *term_cols);
+                                        buffer.clear();
+                                        continue;
+                                    };
+                                    let output = match session.peek_var(name) {
+                                        Some(v) => format!("{name} = {v}"),
+                                        None => format!("{name}: unset or not inspectable"),
+                                    };
+                                    sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry { command: trimmed, output: output.clone(), status: 0 });
+                                    return CommandModeOutcome::Ran { output, status: 0 };
+                                }
+                                // `:dbg quit`: detach -- writable again,
+                                // drops the debug_frames entry, closes
+                                // the DebugRun sibling if one exists.
+                                "quit" | "q" if subarg.is_none() => {
+                                    if debug_frames.remove(&edit_frame_id).is_some() {
+                                        tb.set_readonly(false);
+                                        if let Some(pane_id) = debug_run_sibling(&windows[current_window], edit_frame_id) {
+                                            close_pane(&mut windows[current_window], pane_id);
+                                            close_orphaned_sessions(sessions, windows);
+                                        }
+                                        compositor_redraw(sessions, windows, current_window, *term_rows, *term_cols);
+                                    }
+                                    sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry { command: trimmed, output: String::new(), status: 0 });
+                                    return CommandModeOutcome::Ran { output: String::new(), status: 0 };
+                                }
+                                "help" | "h" | "?" if subarg.is_none() => {
+                                    sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry { command: trimmed, output: DBG_HELP_TEXT.to_string(), status: 0 });
+                                    return CommandModeOutcome::Ran { output: DBG_HELP_TEXT.to_string(), status: 0 };
+                                }
+                                _ => {
+                                    show_command_mode_error(
+                                        &format!("bish: dbg: unknown subcommand '{subcmd}' (expected: run, break, continue, next, step, print, quit, help)"),
+                                        *term_rows,
+                                        *term_cols,
+                                    );
+                                    buffer.clear();
+                                    continue;
+                                }
                             }
-                            if !target.is_file() {
-                                show_command_mode_error(&format!("bish: dbg: {}: no such file", target.display()), *term_rows, *term_cols);
-                                buffer.clear();
-                                continue;
-                            }
-                            crate::debugger::run(&target.to_string_lossy());
-                            print!("{}", term::MOUSE_REPORTING_ENABLE);
-                            let _ = io::stdout().flush();
-                            sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry { command: trimmed, output: String::new(), status: 0 });
-                            return CommandModeOutcome::Ran { output: String::new(), status: 0 };
                         }
                         // `help`/`h`/`?`: a single-screen quick reference
                         // for this editor's own motions/operators/colon
