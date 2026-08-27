@@ -5534,6 +5534,37 @@ struct TranscriptEntry {
     status: i32,
 }
 
+// `:help`/`:h`/`:?`'s own static content -- see that match arm's own doc
+// comment for the scope this deliberately stays within. Kept short
+// enough to fit one ordinary terminal's worth of command-output overlay
+// without truncating (see command_mode_content_rows) -- a genuinely
+// exhaustive reference would need real pagination/topics this feature
+// doesn't attempt.
+const EDITOR_HELP_TEXT: &str = "\
+bish editor -- quick reference (:help, :h, :?)
+
+Motion:  h j k l | w b e ge | 0 ^ $ | gg G | f F t T ; , | % | { }
+Search:  /pat  ?pat  n  N          Marks:  m{a-z}  `{mark}  '{mark}
+Jumps:   <C-o> back  <C-i> forward
+Visual:  v (char)  V (line)  <C-v> (block)  o swaps ends
+Insert:  i I a A o O  --  <Esc> exits back to Normal mode
+Operators (take a motion, or double the key for the whole line):
+         d delete  c change  y yank  > indent  < outdent  gu/gU/g~ case
+Surround: ys{motion}{char} add   cs{old}{new} change   ds{char} delete
+Registers: \"{reg} before an operator/put, e.g. \"ayy then \"ap
+Undo/redo: u / <C-r>     Put: p P     Repeat last change: .
+Hover: K on an identifier shows its live value, a doc comment, or a
+       man-page snippet for an external command
+
+Colon commands:
+  :w [FILE]        write (:wq/:x write+quit, :q quit, :q! discard+quit)
+  :s/PAT/REPL/[g]  substitute on this line (prefix a range, e.g. :%s/../../)
+  :git blame       toggle a per-line blame gutter (:git diff for +/~/-)
+  :format          run this file's own formatter
+  :diag [clear]    toggle the diagnostics pane
+  :dbg [FILE]      open the script debugger for this (or another) file
+  :help, :h, :?    this screen";
+
 // Command mode's own row, immediately above the tab bar (see render_
 // compositor_frame's own "pinned to the terminal's real last row"
 // comment) -- 0-indexed. Global, not tied to any particular pane's rect
@@ -6226,6 +6257,43 @@ fn run_command_mode(
                             let _ = io::stdout().flush();
                             sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry { command: trimmed, output: String::new(), status: 0 });
                             return CommandModeOutcome::Ran { output: String::new(), status: 0 };
+                        }
+                        // `help`/`h`/`?`: a single-screen quick reference
+                        // for this editor's own motions/operators/colon
+                        // commands -- real vim's own `:help` opens a full
+                        // multi-page manual in a split buffer; this is
+                        // deliberately much smaller in scope (one static
+                        // screen, no topics/tags/search of its own),
+                        // matching this codebase's usual "practical
+                        // subset" shape rather than building a whole help
+                        // system for a one-off ask. `?` is a real,
+                        // separate alias (not a typo-tolerant fuzzy
+                        // match) -- unlike real vim, where `?` in command
+                        // mode means "search backward" (a leftover from
+                        // ed-style line editors), bish's own colon-line
+                        // has no such meaning for a bare `?` at all (real
+                        // `/`/`?` search here is a Normal-mode motion via
+                        // vimkeys, entirely separate from this colon-line
+                        // -- see vimkeys.rs), so reusing it as a `-h`/
+                        // `--help`-style shorthand doesn't collide with
+                        // anything. Shown via the same command-output
+                        // overlay every other command's own output
+                        // already uses (`CommandModeOutcome::Ran`) --
+                        // free truncation-with-a-count-notice for a
+                        // shorter terminal, and the real content behind
+                        // it stays visible per the screen-wipe fix above.
+                        "help" | "h" | "?" if arg.is_none() => {
+                            sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry {
+                                command: trimmed,
+                                output: EDITOR_HELP_TEXT.to_string(),
+                                status: 0,
+                            });
+                            return CommandModeOutcome::Ran { output: EDITOR_HELP_TEXT.to_string(), status: 0 };
+                        }
+                        "help" | "h" | "?" => {
+                            show_command_mode_error(&format!("bish: help: unexpected argument '{}' (no help topics yet -- just `:help`)", arg.unwrap_or_default()), *term_rows, *term_cols);
+                            buffer.clear();
+                            continue;
                         }
                         // `git SUBCOMMAND...`: the editor's own git
                         // integration, entirely optional (see crate::git's
