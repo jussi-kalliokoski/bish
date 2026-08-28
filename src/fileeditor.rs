@@ -1646,6 +1646,34 @@ pub(crate) fn toggle_git_diff(buf: &mut TextBuffer) -> Result<bool, String> {
     Ok(true)
 }
 
+// `:diff`'s own worker -- unlike `toggle_git_diff` just above, this
+// needs no git repository (or even git installed) at all: it answers a
+// genuinely different question, "what have I typed in this buffer
+// since I last saved" rather than "what's changed since the last
+// commit", via a hand-rolled Myers diff (crate::diff, through git::
+// marks_from_diff for the shared DiffMark-conversion logic) between
+// this buffer's own *current, in-memory* content and what's actually
+// on disk right now. Shares the same `buf.diff`/gutter rendering
+// `toggle_git_diff` already populates -- the two are mutually exclusive
+// toggle states (turning one on turns the other off, same as any
+// single field can only hold one thing at a time), not a second,
+// independent gutter column. No dirty-buffer refusal, unlike
+// toggle_git_diff -- an unsaved buffer is exactly the interesting case
+// here, not one to refuse.
+pub(crate) fn toggle_buffer_diff(buf: &mut TextBuffer) -> Result<bool, String> {
+    if buf.diff.is_some() {
+        buf.diff = None;
+        return Ok(false);
+    }
+    let path = buf.path().ok_or_else(|| "no file name".to_string())?;
+    let on_disk = std::fs::read_to_string(path).map_err(|e| format!("{}: {}", path.display(), e))?;
+    let disk_lines: Vec<&str> = on_disk.lines().collect();
+    let current = buf.text();
+    let current_lines: Vec<&str> = current.lines().collect();
+    buf.diff = Some(crate::git::marks_from_diff(&disk_lines, &current_lines));
+    Ok(true)
+}
+
 // Color/attrs for one diagnostic's own underline -- mirrors highlight::
 // default_style's shape exactly (severity in, presentation out), kept as
 // its own small function for the same reason that one is: Severity only

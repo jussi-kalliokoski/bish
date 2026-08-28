@@ -245,6 +245,54 @@ pub fn diff(path: &Path) -> Result<HashMap<usize, DiffMark>, String> {
     Ok(parse_unified_diff(&String::from_utf8_lossy(&output.stdout)))
 }
 
+// The hand-rolled-Myers-diff counterpart to `parse_unified_diff` just
+// below -- same output shape/convention (DiffMark keyed by 0-indexed
+// *new*-side line), built from `crate::diff::diff`'s own edit script
+// instead of parsing `git diff`'s text output, for `fileeditor::
+// toggle_buffer_diff`'s own "buffer vs. what's on disk" diff (works
+// with no git repository at all, unlike `diff`/`blame` above). A
+// Delete immediately followed by an Insert (no Equal between them --
+// `crate::diff::diff`'s own coalescing already merges any run of same-
+// kind steps, so this is the only way to see both back to back) is one
+// "changed" hunk, same as a unified diff's own old_count>0/new_count>0
+// hunk; an unpaired Delete marks the single nearest surviving new-side
+// line (wherever the very next op's own `b` picks back up, or the very
+// end of the file if this Delete is the last op) as Removed, matching
+// `parse_unified_diff`'s own identical convention exactly.
+pub(crate) fn marks_from_diff(old: &[&str], new: &[&str]) -> HashMap<usize, DiffMark> {
+    let ops = crate::diff::diff(old, new);
+    let mut marks = HashMap::new();
+    let mut i = 0;
+    while i < ops.len() {
+        match ops[i] {
+            crate::diff::DiffOp::Equal { .. } => i += 1,
+            crate::diff::DiffOp::Insert { b, len } => {
+                for line in b..b + len {
+                    marks.insert(line, DiffMark::Added);
+                }
+                i += 1;
+            }
+            crate::diff::DiffOp::Delete { .. } => {
+                if let Some(crate::diff::DiffOp::Insert { b, len }) = ops.get(i + 1).copied() {
+                    for line in b..b + len {
+                        marks.insert(line, DiffMark::Changed);
+                    }
+                    i += 2;
+                } else {
+                    let new_line = match ops.get(i + 1) {
+                        Some(crate::diff::DiffOp::Equal { b, .. }) => *b,
+                        None => new.len(),
+                        _ => unreachable!("consecutive Deletes are already coalesced, and an adjacent Insert was handled above"),
+                    };
+                    marks.insert(new_line.saturating_sub(1), DiffMark::Removed);
+                    i += 1;
+                }
+            }
+        }
+    }
+    marks
+}
+
 fn first_stderr_line(stderr: &[u8], fallback: &str) -> String {
     let text = String::from_utf8_lossy(stderr);
     text.lines().next().unwrap_or(fallback).trim().to_string()
@@ -390,6 +438,38 @@ mod tests {
         let marks = parse_unified_diff(text);
         assert_eq!(marks.get(&3), Some(&DiffMark::Removed));
         assert_eq!(marks.len(), 1);
+    }
+
+    // marks_from_diff's own equivalent of the three parse_unified_diff
+    // deletion-position tests above -- same three real-git-verified
+    // attachment points (start/middle/end), just reached by feeding
+    // crate::diff's own edit script through instead of parsing git's
+    // text output.
+    #[test]
+    fn marks_from_diff_places_a_deletion_at_the_same_line_git_itself_does() {
+        // Middle: [a,b,c,d] -> [a,d] -- real `git diff -U0` attaches
+        // this to new-side line 0 ("a"), the line right before the gap.
+        assert_eq!(marks_from_diff(&["a", "b", "c", "d"], &["a", "d"]), HashMap::from([(0, DiffMark::Removed)]));
+        // End: [a,b,c,d] -> [a,b,c] -- attaches to the new last line.
+        assert_eq!(marks_from_diff(&["a", "b", "c", "d"], &["a", "b", "c"]), HashMap::from([(2, DiffMark::Removed)]));
+        // Start: [a,b,c,d] -> [b,c,d] -- no line precedes the gap, so
+        // (matching parse_unified_diff's own saturating_sub(1)) this
+        // attaches to the new first line instead.
+        assert_eq!(marks_from_diff(&["a", "b", "c", "d"], &["b", "c", "d"]), HashMap::from([(0, DiffMark::Removed)]));
+    }
+
+    #[test]
+    fn marks_from_diff_marks_a_pure_addition_and_a_changed_line() {
+        let added = marks_from_diff(&["a", "b"], &["a", "NEW1", "NEW2", "b"]);
+        assert_eq!(added, HashMap::from([(1, DiffMark::Added), (2, DiffMark::Added)]));
+
+        let changed = marks_from_diff(&["one", "two", "three"], &["one", "two", "CHANGED"]);
+        assert_eq!(changed, HashMap::from([(2, DiffMark::Changed)]));
+    }
+
+    #[test]
+    fn marks_from_diff_is_empty_for_identical_content() {
+        assert!(marks_from_diff(&["a", "b"], &["a", "b"]).is_empty());
     }
 
     #[test]

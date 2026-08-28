@@ -5899,6 +5899,7 @@ Colon commands:
   :w [FILE]        write (:wq/:x write+quit, :q quit, :q! discard+quit)
   :s/PAT/REPL/[g]  substitute on this line (prefix a range, e.g. :%s/../../)
   :git blame       toggle a per-line blame gutter (:git diff for +/~/-)
+  :diff            toggle +/~/- markers vs. what's on disk (no git needed)
   :format          run this file's own formatter
   :diag [clear]    toggle the diagnostics pane
   :dbg             attach a read-only debug session (:dbg help for more)
@@ -6525,6 +6526,38 @@ fn run_command_mode(
                         }
                         "diag" | "diagnose" => {
                             show_command_mode_error(&format!("bish: diag: unknown subcommand '{}' (expected: clear)", arg.unwrap_or_default()), *term_rows, *term_cols);
+                            buffer.clear();
+                            continue;
+                        }
+                        // `diff` (bare, no `git` prefix): the same +/~/-
+                        // gutter marker toggle `:git diff` uses, but
+                        // answering a different question -- "what have I
+                        // typed since I last saved" instead of "what's
+                        // changed since the last commit" -- via a hand-
+                        // rolled Myers diff (fileeditor::toggle_buffer_
+                        // diff) against this buffer's own on-disk content,
+                        // no git repository (or git at all) required.
+                        // Shares the same buf.diff field/gutter rendering
+                        // `:git diff` already populates, so the two are
+                        // mutually exclusive toggle states.
+                        "diff" if arg.is_none() => match fileeditor::toggle_buffer_diff(tb) {
+                            Ok(on) => {
+                                let output = if on { "Diff markers on.".to_string() } else { "Diff markers off.".to_string() };
+                                sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry {
+                                    command: trimmed,
+                                    output: output.clone(),
+                                    status: 0,
+                                });
+                                return CommandModeOutcome::Ran { output, status: 0 };
+                            }
+                            Err(e) => {
+                                show_command_mode_error(&format!("bish: diff: {e}"), *term_rows, *term_cols);
+                                buffer.clear();
+                                continue;
+                            }
+                        },
+                        "diff" => {
+                            show_command_mode_error(&format!("bish: diff: unexpected argument '{}'", arg.unwrap_or_default()), *term_rows, *term_cols);
                             buffer.clear();
                             continue;
                         }
