@@ -870,6 +870,30 @@ pub(crate) fn run_insert_mode(
                 buf.set_cursor(cursors[0].0, cursors[0].1);
                 inserted.pop();
             }
+            // Ctrl-W: delete the word before the cursor -- real vim's own
+            // Insert-mode convention (`:help i_CTRL-W`), same idea
+            // editor::LineEditor::kill_word_backward already gives the
+            // plain shell prompt. Reuses `Motion::WordBackward` +
+            // `motion_range` -- the exact same primitive Normal mode's
+            // own `db` operator is built on -- rather than a second,
+            // bespoke word-boundary implementation, so this crosses a
+            // line boundary backward exactly when `db`/plain `b` already
+            // do. Scoped to the primary cursor only, matching this
+            // function's existing "never combined with extra_cursors in
+            // practice" convention for Replace mode's own Backspace/Char
+            // arms above -- multi-selection `c` never needs a whole-word
+            // delete mid-insert. `inserted` (the `.`-repeat accumulator)
+            // is deliberately left untouched, same "best-effort, not
+            // exact" acknowledgment this function's own doc comment
+            // already makes for plain Backspace -- Ctrl-W can delete text
+            // that predates this Insert-mode session, which there's no
+            // clean way to un-accumulate.
+            Key::CtrlW => {
+                if let Some(range) = motion::motion_range(buf, motion::Motion::WordBackward, None) {
+                    buf.delete_range(&range);
+                    cursors[0] = buf.cursor();
+                }
+            }
             Key::Left => {
                 motion::apply_motion(buf, motion::Motion::Left, None);
                 cursors[0] = buf.cursor();
@@ -2312,6 +2336,97 @@ mod insert_mode_exit_clamp_tests {
         run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut || false, false, 24, 80, None, &[]).unwrap();
 
         assert_eq!(buf.cursor(), (0, 0));
+    }
+}
+
+// Ctrl-W in Insert mode: delete the word before the cursor (`:help
+// i_CTRL-W`) -- previously a silent no-op (fell through run_insert_
+// mode's own catch-all `_ => {}`, since Key::CtrlW was never matched
+// there at all; the Normal-mode `<C-w>` window-command prefix it maps
+// to elsewhere in this codebase is a different dispatch this function
+// never reaches).
+#[cfg(test)]
+mod insert_mode_ctrl_w_tests {
+    use super::*;
+
+    fn rect() -> Rect {
+        Rect { row: 0, col: 0, rows: 24, cols: 80 }
+    }
+
+    fn line(buf: &TextBuffer, row: usize) -> String {
+        buf.line_chars(row).into_iter().collect()
+    }
+
+    fn scripted(vk: &mut VimKeys, keys: &[Key]) {
+        vk.start_recording('a');
+        for &k in keys {
+            vk.record_key(k);
+        }
+        vk.stop_recording();
+        assert!(vk.queue_macro_replay('a', 1));
+    }
+
+    fn chars(s: &str) -> Vec<Key> {
+        s.chars().map(Key::Char).collect()
+    }
+
+    #[test]
+    fn deletes_the_word_before_the_cursor() {
+        let mut buf = TextBuffer::new_unnamed(10);
+        buf.set_cursor(0, 0);
+        let mut vk = VimKeys::new();
+        let mut registers = Registers::new_for_test();
+        let mut keys = chars("hello world");
+        keys.push(Key::CtrlW);
+        scripted(&mut vk, &keys);
+
+        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut || false, false, 24, 80, None, &[]).unwrap();
+
+        assert_eq!(line(&buf, 0), "hello ");
+        assert_eq!(buf.cursor(), (0, 6));
+    }
+
+    #[test]
+    fn repeated_ctrl_w_keeps_deleting_further_back() {
+        let mut buf = TextBuffer::new_unnamed(10);
+        buf.set_cursor(0, 0);
+        let mut vk = VimKeys::new();
+        let mut registers = Registers::new_for_test();
+        let mut keys = chars("hello world");
+        keys.push(Key::CtrlW);
+        keys.push(Key::CtrlW);
+        scripted(&mut vk, &keys);
+
+        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut || false, false, 24, 80, None, &[]).unwrap();
+
+        assert_eq!(line(&buf, 0), "", "both words should be gone");
+    }
+
+    #[test]
+    fn deletes_pre_existing_text_not_just_what_was_typed_this_session() {
+        let mut buf = TextBuffer::new_unnamed(10);
+        buf.insert_text((0, 0), "existing word");
+        buf.set_cursor(0, buf.line_len(0));
+        let mut vk = VimKeys::new();
+        let mut registers = Registers::new_for_test();
+        scripted(&mut vk, &[Key::CtrlW]);
+
+        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut || false, false, 24, 80, None, &[]).unwrap();
+
+        assert_eq!(line(&buf, 0), "existing ");
+    }
+
+    #[test]
+    fn at_column_zero_with_nothing_before_it_is_a_safe_no_op() {
+        let mut buf = TextBuffer::new_unnamed(10);
+        buf.set_cursor(0, 0);
+        let mut vk = VimKeys::new();
+        let mut registers = Registers::new_for_test();
+        scripted(&mut vk, &[Key::CtrlW, Key::Char('x')]);
+
+        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut || false, false, 24, 80, None, &[]).unwrap();
+
+        assert_eq!(line(&buf, 0), "x");
     }
 }
 
