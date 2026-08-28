@@ -1,6 +1,6 @@
 // Raw termios control, hand-rolled against glibc's Linux x86_64 struct
 // layout (no libc crate -- this project stays dependency-free). Shared by
-// the interactive line editor (editor.rs) and, eventually, `read -s`.
+// the interactive line editor (editor.rs) and `read -s` (exec.rs).
 
 use std::io::{self, Write};
 
@@ -280,6 +280,45 @@ impl Drop for RawGuard {
             print!("{MOUSE_REPORTING_DISABLE}");
             let _ = io::stdout().flush();
         }
+        unsafe {
+            tcsetattr(self.fd, TCSANOW, &self.saved);
+        }
+    }
+}
+
+// RAII guard: turns off local echo (ECHO) on fd (almost always 0/stdin)
+// while leaving everything else exactly as it already was -- ICANON
+// (kernel-driven line editing, so Enter/backspace still behave
+// normally), ISIG (Ctrl-C/Ctrl-Z still generate signals), IEXTEN, the
+// works. Unlike `RawGuard`, this is NOT raw mode: a caller using this
+// still gets one ordinary, kernel-buffered cooked-mode line -- just
+// without the terminal echoing typed characters back. This is exactly
+// `read -s`'s own contract (bash: read a line from the terminal
+// normally, don't show what's being typed), and nothing else in this
+// codebase needs "echo off, otherwise unchanged" -- editor.rs's own
+// line editor wants full raw mode (RawGuard) since it draws its own
+// line from scratch.
+pub struct NoEchoGuard {
+    fd: i32,
+    saved: Termios,
+}
+
+impl NoEchoGuard {
+    pub fn enable(fd: i32) -> io::Result<NoEchoGuard> {
+        let Some(saved) = query(fd) else {
+            return Err(io::Error::last_os_error());
+        };
+        let mut silent = saved;
+        silent.c_lflag &= !ECHO;
+        if unsafe { tcsetattr(fd, TCSANOW, &silent) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(NoEchoGuard { fd, saved })
+    }
+}
+
+impl Drop for NoEchoGuard {
+    fn drop(&mut self) {
         unsafe {
             tcsetattr(self.fd, TCSANOW, &self.saved);
         }

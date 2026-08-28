@@ -5683,17 +5683,23 @@ impl Shell {
                 let mut nchars: Option<usize> = None;
                 let mut delim: u8 = b'\n';
                 let mut read_u_flag: Option<&str> = None;
-                // -s (silent/no-echo) needs raw termios manipulation to
-                // suppress terminal echo, which isn't implementable without
-                // hand-rolling the platform's struct termios layout (risky
-                // to get right without the libc crate, and this project's
-                // bash-diff test methodology has no real tty to exercise it
-                // against anyway) -- accepted and parsed, but not yet
-                // functional, same scoped-gap treatment as mapfile's -s/-u.
+                // -s (silent/no-echo): suppresses terminal echo for the
+                // duration of this one read, via term::NoEchoGuard (same
+                // hand-rolled-against-glibc termios layout RawGuard already
+                // uses, no libc crate). Only meaningful against a real,
+                // interactive terminal -- gated the same way `-p`'s own
+                // prompt already is below (is_real_stdin && stdin_is_tty()),
+                // and only when this read isn't actually coming from a
+                // coproc fd (-u) instead of the terminal.
+                let mut silent = false;
                 let mut i = 1;
                 while i < argv.len() {
                     match argv[i].as_str() {
-                        "-r" | "-s" => i += 1,
+                        "-r" => i += 1,
+                        "-s" => {
+                            silent = true;
+                            i += 1;
+                        }
                         "-a" => {
                             array_name = argv.get(i + 1).map(|s| s.as_str());
                             i += 2;
@@ -5755,6 +5761,8 @@ impl Shell {
                 // its own block so the borrow of self.coproc_fds ends before
                 // the assign_var calls below need `&mut self` again.
                 let ufd = read_u_flag.and_then(|s| s.parse::<i32>().ok());
+                let _silent_guard =
+                    if silent && ufd.is_none() && is_real_stdin && stdin_is_tty() { crate::term::NoEchoGuard::enable(0).ok() } else { None };
                 let (got, clean): (Option<String>, bool) = if let Some(fd) = ufd {
                     match self.coproc_fds.get_mut(&fd) {
                         Some(KeptFd::Read(r)) => read_line_or_chars(r, nchars, delim),
