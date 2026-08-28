@@ -305,18 +305,35 @@ pub(crate) fn outdent_selections(buf: &mut TextBuffer) {
     buf.set_cursor(leftmost_row, 0);
 }
 
-// `x`: deletes up to `count` characters starting at the cursor, clamped
-// to the end of the line -- vim's own primitive (see `vimkeys::
-// apply_delete_forward`'s own doc comment on why this isn't quite
-// reducible to `d{count}l`).
+// `x`: deletes up to `count` *grapheme clusters* starting at the
+// cursor, clamped to the end of the line -- vim's own primitive (see
+// `vimkeys::apply_delete_forward`'s own doc comment on why this isn't
+// quite reducible to `d{count}l`; that's the plain shell prompt's own
+// separate, single-line, non-cluster-aware implementation of the same
+// primitive -- kept out of scope here the same way this codebase's
+// other multi-select/vim-feature work already draws that exact
+// boundary, see e.g. multi-selection `c`'s own doc comment). Cluster-,
+// not char-index-, counted: pressing `x` once on a ZWJ emoji sequence
+// deletes the *whole* glyph in one press rather than leaving broken
+// remnants behind, and `3x` deletes 3 whole clusters, not 3 raw
+// codepoints (which could otherwise split a cluster right down the
+// middle, deleting only part of it).
 pub(crate) fn delete_char_forward(buf: &mut TextBuffer, registers: &mut Registers, count: Option<usize>, register: Option<char>) {
     let (row, col) = buf.cursor();
     let len = buf.line_len(row);
     if len == 0 {
         return;
     }
-    let start = col.min(len - 1);
-    let end = (start + count.unwrap_or(1).max(1)).min(len);
+    let chars = buf.line_chars(row);
+    // Clamped to this cluster's own start first (not just the last
+    // valid char index) -- defense in depth matching char_at_col's own
+    // "never lands inside a wide char" convention, in case the cursor
+    // ever got here sitting mid-cluster through some other path.
+    let start = crate::bishedit::grapheme::cluster_range(&chars, col.min(len - 1)).0;
+    let mut end = start;
+    for _ in 0..count.unwrap_or(1).max(1) {
+        end = crate::bishedit::grapheme::next_boundary(&chars, end);
+    }
     let range = motion::MotionRange { shape: motion::MotionShape::Exclusive, from: (row, start), to: (row, end) };
     let deleted = buf.delete_range(&range);
     if !deleted.is_empty() {
@@ -2009,6 +2026,60 @@ pub fn render_editor_frame(buf: &TextBuffer, vk: &VimKeys, mode: EditorMode, rec
 pub fn freeze_editor_frame(screen: &Rc<RefCell<vt100::Screen>>, buf: &TextBuffer, vk: &VimKeys, rect: Rect, color_overrides: Option<&highlight::ColorOverrides>) {
     let framed = build_editor_frame(buf, vk, EditorMode::Normal, rect, 0, 0, color_overrides);
     screen.borrow_mut().feed(framed.as_bytes());
+}
+
+#[cfg(test)]
+mod delete_char_forward_cluster_tests {
+    use super::*;
+
+    fn buf(text: &str) -> TextBuffer {
+        let mut b = TextBuffer::new_unnamed(10);
+        b.insert_text((0, 0), text);
+        b.set_cursor(0, 0);
+        b
+    }
+
+    fn line(b: &TextBuffer, row: usize) -> String {
+        b.line_chars(row).into_iter().collect()
+    }
+
+    #[test]
+    fn x_deletes_a_whole_cluster_in_one_press() {
+        // 'a' + MAN+ZWJ+WOMAN (a 3-char cluster) + 'b'
+        let mut b = buf("a\u{1F468}\u{200D}\u{1F469}b");
+        b.set_cursor(0, 1); // on the cluster's own start
+        let mut registers = Registers::new_for_test();
+        delete_char_forward(&mut b, &mut registers, None, None);
+        assert_eq!(line(&b, 0), "ab", "the whole 3-char cluster should be gone, not just its first codepoint");
+    }
+
+    #[test]
+    fn x_with_a_count_deletes_that_many_whole_clusters() {
+        let mut b = buf("a\u{1F468}\u{200D}\u{1F469}bc");
+        b.set_cursor(0, 1);
+        let mut registers = Registers::new_for_test();
+        delete_char_forward(&mut b, &mut registers, Some(2), None);
+        assert_eq!(line(&b, 0), "ac", "should delete the cluster AND 'b' -- two whole units, not two raw codepoints");
+    }
+
+    #[test]
+    fn deleted_text_written_to_the_register_is_the_whole_cluster() {
+        let mut b = buf("\u{1F468}\u{200D}\u{1F469}");
+        b.set_cursor(0, 0);
+        let mut registers = Registers::new_for_test();
+        delete_char_forward(&mut b, &mut registers, None, None);
+        let yanked = registers.read(None);
+        assert_eq!(yanked.text, "\u{1F468}\u{200D}\u{1F469}");
+    }
+
+    #[test]
+    fn ordinary_ascii_x_is_unaffected() {
+        let mut b = buf("hello");
+        b.set_cursor(0, 1);
+        let mut registers = Registers::new_for_test();
+        delete_char_forward(&mut b, &mut registers, Some(3), None);
+        assert_eq!(line(&b, 0), "ho");
+    }
 }
 
 #[cfg(test)]

@@ -1,3 +1,4 @@
+use super::grapheme;
 use super::Buffer;
 use crate::regex::Regex;
 
@@ -164,8 +165,24 @@ fn classify(buf: &impl Buffer, line: usize, col: usize, big: bool) -> Class {
     }
 }
 
+// The rightmost column a Normal-mode cursor can ever sit at on `line`
+// -- the shared clamp point almost every motion in this file uses
+// (Left/Right, Up/Down's own column preservation, GotoLine, page
+// scrolling, ...), so fixing it here is what actually makes "the
+// cursor never lands mid-grapheme-cluster" hold everywhere at once,
+// not just for the motions that call `grapheme::next_boundary`/
+// `prev_boundary` directly. If the line's last char is part of a
+// multi-char cluster (a trailing ZWJ emoji sequence, say), the cursor's
+// own last valid position is that cluster's *start*, not its last raw
+// char index -- landing on any char index past the start would put the
+// cursor visually inside the glyph.
 fn last_col(buf: &impl Buffer, line: usize) -> usize {
-    buf.line_len(line).saturating_sub(1)
+    let len = buf.line_len(line);
+    if len == 0 {
+        return 0;
+    }
+    let chars = buf.line_chars(line);
+    grapheme::prev_boundary(&chars, len)
 }
 
 fn first_non_blank(buf: &impl Buffer, line: usize) -> usize {
@@ -1382,14 +1399,33 @@ fn search_word_backward_once(buf: &impl Buffer, pos: (usize, usize), re: &Regex,
 pub fn apply_motion(buf: &mut impl Buffer, motion: Motion, count: Option<usize>) {
     let n = count.unwrap_or(1).max(1);
     match motion {
+        // Steps by whole grapheme cluster, `n` times, rather than raw
+        // char index -- a multi-codepoint cluster (a ZWJ emoji
+        // sequence, a base char plus combining marks) is one glyph on
+        // screen, and `h`/`l` should cross it in a single press each
+        // way, never stopping mid-cluster. `prev_boundary`/
+        // `next_boundary` are themselves already idempotent at the
+        // line's own start/end (they clamp, don't panic or wrap), so
+        // repeating them `n` times naturally saturates there too, same
+        // as the old `saturating_sub`/`.min(max_col)` did.
         Motion::Left => {
             let (line, col) = buf.cursor();
-            buf.set_cursor(line, col.saturating_sub(n));
+            let chars = buf.line_chars(line);
+            let mut new_col = col;
+            for _ in 0..n {
+                new_col = grapheme::prev_boundary(&chars, new_col);
+            }
+            buf.set_cursor(line, new_col);
         }
         Motion::Right => {
             let (line, col) = buf.cursor();
+            let chars = buf.line_chars(line);
             let max_col = last_col(buf, line);
-            buf.set_cursor(line, (col + n).min(max_col));
+            let mut new_col = col;
+            for _ in 0..n {
+                new_col = grapheme::next_boundary(&chars, new_col).min(max_col);
+            }
+            buf.set_cursor(line, new_col);
         }
         Motion::Down => {
             let (line, col) = buf.cursor();
@@ -2224,6 +2260,52 @@ mod tests {
         assert_eq!(go(&mut buf, Motion::Left, None), (0, 0));
         buf.set_cursor(0, 1);
         assert_eq!(go(&mut buf, Motion::Right, Some(5)), (0, 1));
+    }
+
+    #[test]
+    fn right_crosses_a_whole_grapheme_cluster_in_one_press() {
+        // 'a' + MAN+ZWJ+WOMAN (a 3-char cluster) + 'b'
+        let mut buf = TestBuffer::new("a\u{1F468}\u{200D}\u{1F469}b");
+        buf.set_cursor(0, 0);
+        assert_eq!(go(&mut buf, Motion::Right, None), (0, 1), "lands on the cluster's own start, not its second codepoint");
+        assert_eq!(go(&mut buf, Motion::Right, None), (0, 4), "one more press crosses the whole cluster to 'b'");
+    }
+
+    #[test]
+    fn left_crosses_a_whole_grapheme_cluster_in_one_press() {
+        let mut buf = TestBuffer::new("a\u{1F468}\u{200D}\u{1F469}b");
+        buf.set_cursor(0, 4); // on 'b'
+        assert_eq!(go(&mut buf, Motion::Left, None), (0, 1), "lands on the cluster's own start, not its last codepoint");
+        assert_eq!(go(&mut buf, Motion::Left, None), (0, 0));
+    }
+
+    #[test]
+    fn right_never_lands_mid_cluster_even_with_a_count() {
+        let mut buf = TestBuffer::new("a\u{1F468}\u{200D}\u{1F469}b");
+        buf.set_cursor(0, 0);
+        // A count of 2 should land exactly on the cluster start then on
+        // 'b' -- never at index 2 or 3, which sit mid-cluster.
+        assert_eq!(go(&mut buf, Motion::Right, Some(2)), (0, 4));
+    }
+
+    #[test]
+    fn last_col_clamps_to_a_trailing_clusters_own_start() {
+        // A line ending in a 3-char cluster: the last valid Normal-mode
+        // column is where that cluster *starts* (index 1), not its last
+        // raw char index (3).
+        let mut buf = TestBuffer::new("a\u{1F468}\u{200D}\u{1F469}");
+        buf.set_cursor(0, 0);
+        assert_eq!(go(&mut buf, Motion::Right, Some(99)), (0, 1));
+    }
+
+    #[test]
+    fn ordinary_ascii_left_right_is_unaffected() {
+        // Every char here is its own single-char cluster -- must behave
+        // exactly like the old raw-char-index arithmetic.
+        let mut buf = TestBuffer::new("hello");
+        buf.set_cursor(0, 0);
+        assert_eq!(go(&mut buf, Motion::Right, Some(3)), (0, 3));
+        assert_eq!(go(&mut buf, Motion::Left, Some(2)), (0, 1));
     }
 
     #[test]

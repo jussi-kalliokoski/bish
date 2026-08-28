@@ -109,30 +109,59 @@ pub fn str_width(s: &str) -> usize {
 }
 
 // The display column a given char index within `chars` actually starts
-// at -- the sum of every earlier char's own width. `char_index` past
-// the end of `chars` is treated as "the column right after the last
-// char" (the common case: a cursor sitting one-past-the-end of a
-// line), same as indexing a line one past its last real column already
-// means elsewhere in this codebase.
+// at -- the sum of every earlier *cluster's* own width (its first
+// char's width, matching `str_width`'s own convention -- a multi-char
+// grapheme cluster occupies the space its first char would alone, not
+// each char's width stacked). `char_index` past the end of `chars` is
+// treated as "the column right after the last char" (the common case:
+// a cursor sitting one-past-the-end of a line), same as indexing a
+// line one past its last real column already means elsewhere in this
+// codebase. If `char_index` itself falls *inside* a cluster (shouldn't
+// happen once a caller's own cursor movement is grapheme-aware, but
+// handled defensively), this reports that cluster's own start column,
+// the same way a plain combining mark already contributes 0 extra
+// width of its own today.
 pub fn col_of(chars: &[char], char_index: usize) -> usize {
-    chars.iter().take(char_index).map(|&c| char_width(c)).sum()
+    let mut col = 0;
+    let mut i = 0;
+    while i < chars.len() && i < char_index {
+        let cluster_end = crate::bishedit::grapheme::next_boundary(chars, i);
+        if cluster_end > char_index {
+            break;
+        }
+        col += char_width(chars[i]);
+        i = cluster_end;
+    }
+    col
 }
 
 // The inverse of `col_of`: the first char index whose own `col_of` is
 // `>= col` -- used to find "which character is the first one visible"
 // once the viewport has scrolled to some display column, not just some
-// char index. Never lands *inside* a wide char (there's no such thing
-// as half a CJK glyph rendered on screen): if `col` points into the
-// second cell of a wide char, that char's own left cell would already
-// be scrolled out of view, so this skips past it entirely and returns
-// the *next* char's index instead of showing a half-obscured glyph.
+// char index. Never lands *inside* a wide char or a multi-char cluster
+// (there's no such thing as half a CJK glyph, or half a ZWJ emoji
+// sequence, rendered on screen): if `col` points into the second cell
+// of a cluster's own occupied span, that cluster's own first cell
+// would already be scrolled out of view, so this skips the *whole*
+// cluster and returns the next one's index instead of showing a
+// half-obscured glyph.
 pub fn char_at_col(chars: &[char], col: usize) -> usize {
     let mut acc = 0;
-    for (i, &c) in chars.iter().enumerate() {
+    let mut i = 0;
+    while i < chars.len() {
         if acc >= col {
             return i;
         }
-        acc += char_width(c);
+        let cluster_end = crate::bishedit::grapheme::next_boundary(chars, i);
+        let w = char_width(chars[i]);
+        if acc + w > col {
+            // `col` falls inside this cluster's own occupied span --
+            // skip it whole, don't just advance to its next char index
+            // (which could still be mid-cluster for a 3+ char one).
+            return cluster_end;
+        }
+        acc += w;
+        i = cluster_end;
     }
     chars.len()
 }
@@ -234,6 +263,50 @@ mod tests {
         for i in 0..=chars.len() {
             let col = col_of(&chars, i);
             assert_eq!(char_at_col(&chars, col), i);
+        }
+    }
+
+    #[test]
+    fn col_of_treats_a_zwj_cluster_as_its_first_chars_width_alone() {
+        // 'a' + MAN+ZWJ+WOMAN (3-char cluster, width 2) + 'b'
+        let chars: Vec<char> = "a\u{1F468}\u{200D}\u{1F469}b".chars().collect();
+        assert_eq!(col_of(&chars, 0), 0);
+        assert_eq!(col_of(&chars, 1), 1, "right after 'a'");
+        assert_eq!(col_of(&chars, 4), 3, "right after the whole cluster: 1 (a) + 2 (cluster), not 1 + 8");
+        // Mid-cluster char indices (defensive -- shouldn't normally be
+        // queried once a caller's own cursor movement is cluster-aware)
+        // report the cluster's own start column, same as a plain
+        // combining mark already does.
+        assert_eq!(col_of(&chars, 2), 1);
+        assert_eq!(col_of(&chars, 3), 1);
+    }
+
+    #[test]
+    fn char_at_col_skips_a_whole_cluster_not_just_one_char() {
+        let chars: Vec<char> = "a\u{1F468}\u{200D}\u{1F469}b".chars().collect();
+        assert_eq!(char_at_col(&chars, 0), 0); // 'a'
+        assert_eq!(char_at_col(&chars, 1), 1); // the cluster's own start
+        // Column 2 is the *second* cell of the cluster's own 2-column
+        // footprint -- must skip the entire 3-char cluster, not land on
+        // its second or third codepoint.
+        assert_eq!(char_at_col(&chars, 2), 4);
+        assert_eq!(char_at_col(&chars, 3), 4); // 'b' starts at column 3
+    }
+
+    #[test]
+    fn col_of_and_char_at_col_round_trip_with_a_zwj_cluster_present() {
+        let chars: Vec<char> = "hi \u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}\u{200D}\u{1F466} bye".chars().collect();
+        for i in 0..=chars.len() {
+            let col = col_of(&chars, i);
+            // Only true cluster-start indices are expected to round-trip
+            // exactly (a mid-cluster index's own col_of reports its
+            // cluster's start, and char_at_col of *that* column
+            // correctly resolves back to the cluster's start, not the
+            // original mid-cluster index) -- assert the weaker, always-
+            // true invariant instead: char_at_col(col_of(i)) is always
+            // some valid cluster-start index at or before i.
+            let back = char_at_col(&chars, col);
+            assert!(back <= i, "char_at_col(col_of({i})) = {back} should never overshoot past {i}");
         }
     }
 }
