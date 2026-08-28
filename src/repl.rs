@@ -10,6 +10,7 @@ use crate::bishedit::motion;
 use crate::bishedit::registers::{RegisterShape, RegisterValue, Registers};
 use crate::bishedit::suggestion;
 use crate::bishedit::textbuffer::TextBuffer;
+use crate::bishedit::unicode_width::col_of;
 use crate::bishedit::vimkeys::{KeyOutcome, Op, VimKeys, WindowCmd};
 use crate::bishedit::Buffer as BisheditBuffer;
 use crate::debugger;
@@ -4318,11 +4319,16 @@ pub(crate) fn scroll_to_show_cursor(buf: &mut impl BisheditBuffer, content_cols:
     } else if line >= buf.viewport_top() + height {
         buf.set_viewport_top(line + 1 - height);
     }
+    // `viewport_left` is a display column, not a char index (see
+    // bishedit::unicode_width's own doc comment) -- mirrors
+    // fileeditor::scroll_to_show_cursor exactly, see its own identical
+    // comment on why.
+    let cursor_col = col_of(&buf.line_chars(line), col);
     let width = content_cols.max(1);
-    if col < buf.viewport_left() {
-        buf.set_viewport_left(col);
-    } else if col >= buf.viewport_left() + width {
-        buf.set_viewport_left(col + 1 - width);
+    if cursor_col < buf.viewport_left() {
+        buf.set_viewport_left(cursor_col);
+    } else if cursor_col >= buf.viewport_left() + width {
+        buf.set_viewport_left(cursor_col + 1 - width);
     }
 }
 
@@ -5293,7 +5299,8 @@ fn run_normal_mode_navigation(
                 let hover_lines = docs::hover_lines_at(&chars, col, &line_text, &index, |name| debug_session.and_then(|s| s.peek_var(name)));
                 let gutter_width = rect.cols.saturating_sub(fileeditor::editor_content_cols(tb, rect));
                 let cursor_row = rect.row + row.saturating_sub(tb.viewport_top());
-                let cursor_col = rect.col + gutter_width + col.saturating_sub(tb.viewport_left());
+                let cursor_display_col = col_of(&chars, col);
+                let cursor_col = rect.col + gutter_width + cursor_display_col.saturating_sub(tb.viewport_left());
                 render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides);
                 print!("{}", fileeditor::render_hover_popup(&hover_lines, cursor_row, cursor_col, rect));
                 let _ = io::stdout().flush();

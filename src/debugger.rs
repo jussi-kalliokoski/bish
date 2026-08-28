@@ -48,6 +48,7 @@ use std::rc::Rc;
 
 use crate::bishedit::registers::Registers;
 use crate::bishedit::textbuffer::TextBuffer;
+use crate::bishedit::unicode_width::col_of;
 use crate::bishedit::vimkeys::{KeyOutcome, Op, VimKeys};
 use crate::bishedit::Buffer as _;
 use crate::docs::{self, DocIndex};
@@ -289,7 +290,8 @@ impl PauseState {
         let (row, col) = self.nav_buf.cursor();
         let gutter_width = rect.cols.saturating_sub(fileeditor::editor_content_cols(&self.nav_buf, rect));
         let screen_row = rect.row + row.saturating_sub(self.nav_buf.viewport_top());
-        let screen_col = rect.col + gutter_width + col.saturating_sub(self.nav_buf.viewport_left());
+        let cursor_col = col_of(&self.nav_buf.line_chars(row), col);
+        let screen_col = rect.col + gutter_width + cursor_col.saturating_sub(self.nav_buf.viewport_left());
         (screen_row, screen_col)
     }
 

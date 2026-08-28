@@ -89,6 +89,35 @@ pub fn str_width(s: &str) -> usize {
     s.chars().map(char_width).sum()
 }
 
+// The display column a given char index within `chars` actually starts
+// at -- the sum of every earlier char's own width. `char_index` past
+// the end of `chars` is treated as "the column right after the last
+// char" (the common case: a cursor sitting one-past-the-end of a
+// line), same as indexing a line one past its last real column already
+// means elsewhere in this codebase.
+pub fn col_of(chars: &[char], char_index: usize) -> usize {
+    chars.iter().take(char_index).map(|&c| char_width(c)).sum()
+}
+
+// The inverse of `col_of`: the first char index whose own `col_of` is
+// `>= col` -- used to find "which character is the first one visible"
+// once the viewport has scrolled to some display column, not just some
+// char index. Never lands *inside* a wide char (there's no such thing
+// as half a CJK glyph rendered on screen): if `col` points into the
+// second cell of a wide char, that char's own left cell would already
+// be scrolled out of view, so this skips past it entirely and returns
+// the *next* char's index instead of showing a half-obscured glyph.
+pub fn char_at_col(chars: &[char], col: usize) -> usize {
+    let mut acc = 0;
+    for (i, &c) in chars.iter().enumerate() {
+        if acc >= col {
+            return i;
+        }
+        acc += char_width(c);
+    }
+    chars.len()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -130,5 +159,37 @@ mod tests {
     #[test]
     fn nul_is_zero_width() {
         assert_eq!(char_width('\0'), 0);
+    }
+
+    #[test]
+    fn col_of_sums_widths_of_every_earlier_char() {
+        let chars: Vec<char> = "a中b".chars().collect(); // 1 + 2 + 1
+        assert_eq!(col_of(&chars, 0), 0);
+        assert_eq!(col_of(&chars, 1), 1); // right after "a"
+        assert_eq!(col_of(&chars, 2), 3); // right after "中" (a=1 + 中=2)
+        assert_eq!(col_of(&chars, 3), 4); // right after "b", one past the end
+    }
+
+    #[test]
+    fn char_at_col_finds_the_char_covering_a_display_column() {
+        let chars: Vec<char> = "a中b".chars().collect();
+        assert_eq!(char_at_col(&chars, 0), 0); // "a" starts at column 0
+        assert_eq!(char_at_col(&chars, 1), 1); // "中" starts at column 1
+        // Column 2 is the *second* cell of "中" -- "中" itself would
+        // already be half scrolled out of view there, so this skips
+        // past it and resolves to "b" instead of showing a half glyph.
+        assert_eq!(char_at_col(&chars, 2), 2);
+        assert_eq!(char_at_col(&chars, 3), 2); // "b" starts at column 3
+        assert_eq!(char_at_col(&chars, 4), 3); // past the end
+        assert_eq!(char_at_col(&chars, 100), 3); // clamps, doesn't panic
+    }
+
+    #[test]
+    fn col_of_and_char_at_col_round_trip_on_char_boundaries() {
+        let chars: Vec<char> = "hello 世界 world".chars().collect();
+        for i in 0..=chars.len() {
+            let col = col_of(&chars, i);
+            assert_eq!(char_at_col(&chars, col), i);
+        }
     }
 }

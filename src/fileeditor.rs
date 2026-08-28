@@ -23,6 +23,7 @@ use crate::bishedit::lint::{self, BashLinter, Linter};
 use crate::bishedit::motion;
 use crate::bishedit::registers::{RegisterShape, RegisterValue, Registers};
 use crate::bishedit::textbuffer::TextBuffer;
+use crate::bishedit::unicode_width::{char_at_col, char_width, col_of};
 use crate::bishedit::vimkeys::{InsertCmd, Op, SurroundTarget, VimKeys, INDENT_WIDTH};
 use crate::bishedit::Buffer;
 use crate::editor::{self, Key};
@@ -71,6 +72,13 @@ pub(crate) enum EditorMode {
 // viewport_left's own doc comment) so a pane resize is honored on the
 // very next keystroke instead of only once `vheight` happens to get
 // resynced some other way.
+//
+// `viewport_left` is a *display column*, not a char index (matching its
+// own doc comment's original stated intent -- see bishedit::
+// unicode_width's own doc comment for why those two aren't the same
+// number once a line has any wide/zero-width chars before the cursor).
+// The cursor's own char index is converted via `col_of` before the
+// exact same threshold comparison this function always did.
 pub(crate) fn scroll_to_show_cursor(buf: &mut TextBuffer, content_cols: usize) {
     let (line, col) = buf.cursor();
     let height = buf.viewport_height();
@@ -79,11 +87,12 @@ pub(crate) fn scroll_to_show_cursor(buf: &mut TextBuffer, content_cols: usize) {
     } else if line >= buf.viewport_top() + height {
         buf.set_viewport_top(line + 1 - height);
     }
+    let cursor_col = col_of(&buf.line_chars(line), col);
     let width = content_cols.max(1);
-    if col < buf.viewport_left() {
-        buf.set_viewport_left(col);
-    } else if col >= buf.viewport_left() + width {
-        buf.set_viewport_left(col + 1 - width);
+    if cursor_col < buf.viewport_left() {
+        buf.set_viewport_left(cursor_col);
+    } else if cursor_col >= buf.viewport_left() + width {
+        buf.set_viewport_left(cursor_col + 1 - width);
     }
 }
 
@@ -1079,28 +1088,35 @@ fn status_text(buf: &TextBuffer, vk: &VimKeys, mode: EditorMode, cols: usize) ->
     left
 }
 
-// The (start, end) char-column range `range` covers on this one `line`,
-// if any, already rebased to be relative to `hoffset` (Buffer::
-// viewport_left) and clamped to `cols` -- i.e. directly usable as an
-// index into render_row's own viewport-window-local `chars` array,
-// unlike spans_for_line/diagnostic_spans_for_line just below, which stay
-// line-absolute and get shifted separately inside render_row itself (see
-// its own doc comment for why the two don't share one convention: a
-// Linewise selection's own `(0, cols)` is *already* viewport-local by
-// definition -- it means "the whole visible row," not "the whole line's
-// own text," so shifting it by `hoffset` again would be wrong). Once
-// mirrored exactly by repl.rs's own `selection_columns_in_line` (see its
-// doc comment); that one stays hoffset-less on purpose -- ScreenBuffer
-// never scrolls horizontally (Buffer::viewport_left's own doc comment).
-fn selection_columns_in_line(range: &motion::MotionRange, line: usize, hoffset: usize, cols: usize) -> Option<(usize, usize)> {
+// The (start, end) char-index range `range` covers on this one `line`,
+// if any, already rebased to be relative to `start_char` (the char
+// index of render_row's own viewport-window-local `chars[0]` -- see
+// that function's own doc comment for why this is a char index, not a
+// display column, despite `chars` itself being a *column*-bounded
+// window: `chars` is still built by walking consecutive char indices
+// starting at `start_char`, just stopping early once the column budget
+// runs out, so every position in it corresponds 1:1 to a real char
+// index offset by `start_char` -- never a column) and clamped to
+// `cols` -- i.e. directly usable as an index into that array, unlike
+// spans_for_line/diagnostic_spans_for_line just below, which stay
+// line-absolute and get shifted separately inside render_row itself
+// (see its own doc comment for why the two don't share one convention:
+// a Linewise selection's own `(0, cols)` is *already* viewport-local by
+// definition -- it means "the whole visible row," not "the whole
+// line's own text," so shifting it by `start_char` again would be
+// wrong). Once mirrored exactly by repl.rs's own `selection_columns_
+// in_line` (see its doc comment); that one stays offset-less on purpose
+// -- ScreenBuffer never scrolls horizontally (Buffer::viewport_left's
+// own doc comment).
+fn selection_columns_in_line(range: &motion::MotionRange, line: usize, start_char: usize, cols: usize) -> Option<(usize, usize)> {
     if line < range.from.0 || line > range.to.0 {
         return None;
     }
     if range.shape == motion::MotionShape::Linewise {
         return Some((0, cols));
     }
-    let start = if line == range.from.0 { range.from.1.saturating_sub(hoffset) } else { 0 };
-    let end = if line == range.to.0 { (range.to.1 + 1).saturating_sub(hoffset).min(cols) } else { cols };
+    let start = if line == range.from.0 { range.from.1.saturating_sub(start_char) } else { 0 };
+    let end = if line == range.to.0 { (range.to.1 + 1).saturating_sub(start_char).min(cols) } else { cols };
     Some((start, end))
 }
 
@@ -1746,32 +1762,69 @@ fn spans_for_line(spans: &[StyledSpan], line_start: usize, line_len: usize) -> V
 // text over a diagnostic still reads as a selection first (matching
 // selection's own "wins regardless of what it's covering" rule, one
 // layer up).
-// `hoffset` (Buffer::viewport_left): `chars` is a *window* onto the
-// line, columns `hoffset..hoffset+cols`, not the line's own start --
-// `highlights` (selection_columns_in_line's own output) is already
-// expressed in that same window-local frame (its own doc comment on
-// why), but `line_styled`/`diag_styled` are still line-absolute (0 =
-// the line's own first character, per spans_for_line/diagnostic_spans_
-// for_line), so those two need rebasing by `hoffset` right here before
-// they can index into `chars` at all.
+// `hoffset` (Buffer::viewport_left) is a *display column*, not a char
+// index (see bishedit::unicode_width's own doc comment) -- `chars` is a
+// window onto the line covering display columns `hoffset..hoffset+cols`
+// (via `char_at_col`/accumulated width, not a flat `hoffset+c` char
+// offset, which would grab exactly `cols` *characters* regardless of
+// how many real terminal columns those actually occupy -- letting a
+// wide char anywhere in the window push real content past `cols`
+// columns and spill into whatever's rendered immediately to the right,
+// e.g. a neighboring split pane). A char that would only *partially*
+// fit at the right edge is dropped whole, same "no half a CJK glyph"
+// rule editor.rs's own `truncate_visible` already uses; any budget left
+// over after that is padded with plain spaces, matching this function's
+// own previous behavior for a short line. Still built by walking
+// *consecutive* char indices starting from `start_char` (found via
+// `char_at_col`), never skipping one in the middle -- so `chars[i]`
+// always corresponds to real char index `start_char + i`, letting
+// `highlights` (selection_columns_in_line's own output, already
+// expressed in this same `start_char`-relative frame -- see its own doc
+// comment) and the rebased `line_styled`/`diag_styled` spans below
+// align with it exactly, with no separate cell-width bookkeeping
+// needed for *those* two layers at all.
 #[allow(clippy::too_many_arguments)]
 fn render_row(out: &mut String, buf: &TextBuffer, line: usize, hoffset: usize, cols: usize, line_styled: &[StyledSpan], diag_styled: &[StyledSpan], highlights: &[(usize, usize)]) {
-    let chars: Vec<char> = (0..cols).map(|c| buf.char_at(line, hoffset + c).unwrap_or(' ')).collect();
+    let line_chars = buf.line_chars(line);
+    let start_char = char_at_col(&line_chars, hoffset);
+    let mut chars: Vec<char> = Vec::with_capacity(cols);
+    let mut used = 0;
+    let mut end_char = start_char;
+    while end_char < line_chars.len() {
+        let w = char_width(line_chars[end_char]);
+        if used + w > cols {
+            break;
+        }
+        chars.push(line_chars[end_char]);
+        used += w;
+        end_char += 1;
+    }
+    while used < cols {
+        chars.push(' ');
+        used += 1;
+    }
 
     let selected: Vec<StyledSpan> = highlights
         .iter()
         .map(|&(start, end)| StyledSpan { start, end, fg: vt100::Color::Default, attrs: vt100::CellAttrs { reverse: true, ..vt100::CellAttrs::default() } })
         .collect();
 
-    fn rebase(spans: &[StyledSpan], hoffset: usize, cols: usize) -> Vec<StyledSpan> {
+    // Clamped against `chars.len()` (the real array length after
+    // width-bounded selection/padding above), not `cols` (the column
+    // *budget* it was bounded to fit) -- the two only coincide when
+    // there's no wide char anywhere in this window; whenever there is,
+    // `chars.len() < cols` (a wide char spends 2 columns of budget for
+    // only 1 array slot), and clamping to the wider `cols` instead would
+    // hand `highlight::compose` a span end past the real end of `chars`.
+    fn rebase(spans: &[StyledSpan], start_char: usize, len: usize) -> Vec<StyledSpan> {
         spans
             .iter()
-            .filter(|s| s.end > hoffset && s.start < hoffset + cols)
-            .map(|s| StyledSpan { start: s.start.saturating_sub(hoffset), end: (s.end - hoffset).min(cols), fg: s.fg, attrs: s.attrs })
+            .filter(|s| s.end > start_char && s.start < start_char + len)
+            .map(|s| StyledSpan { start: s.start.saturating_sub(start_char), end: (s.end - start_char).min(len), fg: s.fg, attrs: s.attrs })
             .collect()
     }
-    let line_styled = rebase(line_styled, hoffset, cols);
-    let diag_styled = rebase(diag_styled, hoffset, cols);
+    let line_styled = rebase(line_styled, start_char, chars.len());
+    let diag_styled = rebase(diag_styled, start_char, chars.len());
 
     let cells = highlight::compose(&chars, &[&line_styled, &diag_styled, &selected]);
     out.push_str(&highlight::render_styled(&cells));
@@ -1843,9 +1896,15 @@ pub fn build_editor_frame(
         out.push_str(&format!("\x1b[{};{}H\x1b[K", row_origin + r + 1, col_origin + 1));
         render_gutter(&mut out, buf, &starts, line);
         if line < total {
+            // The char index render_row's own window will start
+            // rendering from for *this* line -- see selection_columns_
+            // in_line's own doc comment for why this (not `hoffset`
+            // itself) is the right rebase point once a line can have
+            // wide chars in it.
+            let start_char = char_at_col(&buf.line_chars(line), hoffset);
             let mut highlights = Vec::new();
             for range in buf.selections.iter().chain(active.iter()) {
-                if let Some(cols) = selection_columns_in_line(range, line, hoffset, content_cols) {
+                if let Some(cols) = selection_columns_in_line(range, line, start_char, content_cols) {
                     highlights.push(cols);
                 }
             }
@@ -1857,7 +1916,11 @@ pub fn build_editor_frame(
 
     let (cl, cc) = buf.cursor();
     let screen_row = cl.saturating_sub(buf.viewport_top()).min(content_rows.saturating_sub(1));
-    let screen_col = gutter_width + cc.saturating_sub(hoffset).min(content_cols.saturating_sub(1));
+    // The cursor's own real display column, not its char index -- see
+    // bishedit::unicode_width's own doc comment for why those two
+    // differ once any wide/zero-width char precedes it on this line.
+    let cursor_col = col_of(&buf.line_chars(cl), cc);
+    let screen_col = gutter_width + cursor_col.saturating_sub(hoffset).min(content_cols.saturating_sub(1));
     out.push_str(&format!("\x1b[{};{}H\x1b[?25h", row_origin + screen_row + 1, col_origin + screen_col + 1));
     out
 }
