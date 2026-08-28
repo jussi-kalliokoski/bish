@@ -13,6 +13,7 @@ use crate::bishedit::textbuffer::TextBuffer;
 use crate::bishedit::unicode_width::col_of;
 use crate::bishedit::vimkeys::{KeyOutcome, Op, VimKeys, WindowCmd};
 use crate::bishedit::Buffer as BisheditBuffer;
+use crate::browser;
 use crate::debugger;
 use crate::docs;
 use crate::editor::{self, Key, ReadOutcome};
@@ -2020,6 +2021,79 @@ fn run_diagnostics_frame(
             },
         }
     }
+}
+
+// `:browse [path]`'s own driving loop -- the terminal half of the split
+// browser.rs's module doc comment describes: that module owns the
+// listing model, the grid arithmetic and the rendering (all testable
+// without a terminal); this owns raw mode, keystrokes, and the same
+// `service_background_jobs` idle callback every other blocking loop in
+// this file already threads through, so background jobs keep draining
+// and a resize is still noticed within one poll tick while the browser
+// is what's blocking on input.
+//
+// Draws into whichever pane is focused, recomputing that pane's rect
+// every iteration (not once up front) for exactly the reason
+// run_diagnostics_frame does the same: a resize can land between two
+// keystrokes, and the very next frame has to be addressed against the
+// new rect rather than the old one.
+//
+// Restoring the pane's original content on the way out is deliberately
+// *not* this function's job -- every caller of command mode already
+// repaints the pane it was driving once an outcome comes back (see
+// run_normal_mode_navigation's own `CommandModeOutcome::Ran` arm, which
+// can't rely on `compositor_redraw` alone for a `Frame::Edit` pane), so
+// adding a redraw here would just paint the same rows twice.
+#[allow(clippy::too_many_arguments)]
+fn run_browse_frame(
+    start: &std::path::Path,
+    sessions: &mut HashMap<SessionId, SessionState>,
+    windows: &mut Vec<WindowEntry>,
+    current_window: usize,
+    job_frames: &mut HashMap<JobFrameId, exec::FgJob>,
+    term_rows: &mut usize,
+    term_cols: &mut usize,
+    sinks_are_grid: bool,
+) -> Result<Option<Vec<std::path::PathBuf>>, String> {
+    // Opened before raw mode is touched, so an unreadable path is an
+    // ordinary command-mode error at the colon line rather than a
+    // flicker into a browser that immediately backs out again.
+    let mut browser = browser::Browser::open(start)?;
+    // Same reasoning run_diagnostics_frame's own guard has: whatever
+    // loop ran last restored the terminal to cooked mode on its way
+    // out, which is unusable for a key-at-a-time grid.
+    let Ok(_guard) = term::RawGuard::enable_with_mouse(0) else {
+        return Err("not a terminal".to_string());
+    };
+    let pane_id = windows[current_window].focused_pane;
+
+    let outcome = loop {
+        let rect = pane_rect(&windows[current_window], pane_id, *term_rows, *term_cols);
+        print!("{}", browser.render(rect, *term_rows, *term_cols));
+        let _ = io::stdout().flush();
+
+        let key = match editor::read_key_idle(&mut || {
+            service_background_jobs(sessions, windows, job_frames, current_window, term_rows, term_cols, sinks_are_grid);
+        }) {
+            Ok(Some(k)) => k,
+            // EOF/error: nothing chosen, same tolerance every other
+            // loop's own EOF arm has.
+            Ok(None) | Err(_) => break None,
+        };
+
+        match browser.handle_key(key, rect) {
+            browser::Outcome::Continue => {}
+            browser::Outcome::Cancelled => break None,
+            browser::Outcome::Accepted(paths) => break Some(paths),
+        }
+    };
+
+    // `render` hides the real cursor for every frame it draws (there's
+    // no text insertion point in a grid), so put it back before handing
+    // the pane to a caller that expects to place it itself.
+    print!("\x1b[?25h");
+    let _ = io::stdout().flush();
+    Ok(outcome)
 }
 
 // Renders the diagnostics pane's own expanded list directly to the real
@@ -5986,6 +6060,8 @@ Colon commands:
   :format          run this file's own formatter
   :diag [clear]    toggle the diagnostics pane
   :dbg             attach a read-only debug session (:dbg help for more)
+  :browse [PATH]   file browser in this pane (hjkl/arrows, tab selects,
+                   / filters, enter opens, esc back)
   :help, :h, :?    this screen";
 
 // `:dbg help`/`:dbg h`/`:dbg ?`'s own reference text -- shown via the
@@ -7111,6 +7187,52 @@ fn run_command_mode(
                             }
                         }
                         _ => {}
+                    }
+                }
+
+                // `browse [path]`: the file browser, drawn into whichever
+                // pane was focused when this colon line was opened.
+                // Deliberately *outside* the `editing.is_some()` block
+                // above -- unlike `w`/`diag`/`git blame`, which only mean
+                // anything against a real file buffer, browsing is about
+                // the pane and its session's own cwd, so it works from a
+                // shell pane's Ctrl+Space excursion exactly as it does
+                // from an editor pane. Handled here rather than as a
+                // `Shell` builtin for the same reason `e`/`fg` can't be
+                // ones either (see this function's own `ExecResult::Edit`
+                // arm below): a builtin has no raw-mode, keystroke or
+                // pane-rect access at all.
+                let browse_arg = {
+                    let (cmd, arg) = match trimmed.split_once(' ') {
+                        Some((c, a)) => (c, Some(a.trim()).filter(|a| !a.is_empty())),
+                        None => (trimmed.as_str(), None),
+                    };
+                    if cmd == "browse" || cmd == "br" { Some(arg.map(|a| a.to_string())) } else { None }
+                };
+                if let Some(arg) = browse_arg {
+                    let start = browser::resolve_start(&sessions[&session_id].shell.cwd, arg.as_deref());
+                    match run_browse_frame(&start, sessions, windows, current_window, job_frames, term_rows, term_cols, sinks_are_grid) {
+                        // What to actually *do* with the chosen paths is
+                        // a later pass (see browser.rs's own scope note)
+                        // -- for now they come back as the command's own
+                        // output, which the caller already shows via
+                        // render_command_output_overlay. Cancelling
+                        // (Esc/`q`) produces no output at all, so the
+                        // pane just goes back to what it was showing.
+                        Ok(chosen) => {
+                            let output = match chosen {
+                                None => String::new(),
+                                Some(paths) if paths.is_empty() => String::new(),
+                                Some(paths) => paths.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join("\n"),
+                            };
+                            sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry { command: trimmed, output: output.clone(), status: 0 });
+                            return CommandModeOutcome::Ran { output, status: 0 };
+                        }
+                        Err(e) => {
+                            show_command_mode_error(&format!("bish: browse: {e}"), *term_rows, *term_cols);
+                            buffer.clear();
+                            continue;
+                        }
                     }
                 }
 
