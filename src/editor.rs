@@ -1043,8 +1043,17 @@ fn redraw_with_completion_row(
 // in-progress text) reuses this to know how many *visible* columns a
 // colored prompt occupies, so it can position the frozen row's
 // ScreenBuffer cursor at the right column rather than guessing.
+//
+// Grapheme-cluster-aware for the *visible* text (a ZWJ emoji sequence
+// counts once, not once per codepoint -- see bishedit::unicode_width::
+// str_width's own doc comment for the exact same fix and why): SGR
+// escapes are stripped first into a plain char buffer, then walked
+// cluster by cluster via bishedit::grapheme::next_boundary, since that
+// function needs an indexable `&[char]` slice (grapheme boundaries
+// GB11/GB12/13 look several codepoints backward) that a single-escape-
+// lookahead streaming scan can't provide directly.
 pub(crate) fn visible_len(s: &str) -> usize {
-    let mut len = 0;
+    let mut visible_chars: Vec<char> = Vec::with_capacity(s.len());
     let mut chars = s.chars().peekable();
     while let Some(c) = chars.next() {
         if c == '\x1b' && chars.peek() == Some(&'[') {
@@ -1056,7 +1065,13 @@ pub(crate) fn visible_len(s: &str) -> usize {
             }
             continue;
         }
-        len += char_width(c);
+        visible_chars.push(c);
+    }
+    let mut len = 0;
+    let mut i = 0;
+    while i < visible_chars.len() {
+        len += char_width(visible_chars[i]);
+        i = crate::bishedit::grapheme::next_boundary(&visible_chars, i);
     }
     len
 }
@@ -1064,7 +1079,21 @@ pub(crate) fn visible_len(s: &str) -> usize {
 // Like visible_len, but returns the prefix of `s` whose *visible*
 // portion is at most `max_visible` columns, preserving any embedded SGR
 // codes encountered along the way (they don't count against the
-// budget) rather than risking a mid-escape-sequence cut. A wide char
+// budget) rather than risking a mid-escape-sequence cut.
+//
+// Unlike visible_len, *not* grapheme-cluster-aware yet: this streams
+// char-by-char with only one-char lookahead (for the escape-sequence
+// check), so a truncation point could in principle land mid-cluster --
+// e.g. cutting a ZWJ emoji sequence in half. A real, deliberately
+// deferred gap (this function would need the same escapes-stripped-
+// into-a-Vec<char>-then-walked-in-clusters restructuring visible_len
+// just got, plus stitching the original escapes back into the
+// truncated result at the right points): this only ever triggers when
+// a pane is too narrow even for the prompt alone to fit -- see this
+// function's own next comment -- rare enough, and degrading to "one
+// glyph looks broken in an already-degenerate layout" rather than a
+// crash or stuck cursor, that it's not worth the complexity here yet.
+// A wide char
 // that would only *partially* fit (`max_visible` has exactly 1 column
 // left, the next char is 2 columns wide) is dropped whole rather than
 // split -- there's no such thing as half a CJK glyph, and this only
@@ -2984,6 +3013,18 @@ mod tests {
         assert_eq!(visible_len("\x1b[1;32mabc\x1b[0m"), 3);
         // A wide CJK char counts for 2, not 1.
         assert_eq!(visible_len("a中b"), 4);
+    }
+
+    #[test]
+    fn visible_len_is_grapheme_cluster_aware() {
+        // A ZWJ family emoji sequence (7 codepoints) counts as its own
+        // one-cluster width (2), not the sum of every codepoint (8) --
+        // see bishedit::unicode_width::str_width's own identical fix.
+        let family = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}\u{200D}\u{1F466}";
+        assert_eq!(visible_len(family), 2);
+        // Still correct with real SGR codes wrapped around it, and
+        // plain text on either side.
+        assert_eq!(visible_len(&format!("a\x1b[1;32m{family}\x1b[0mb")), 1 + 2 + 1);
     }
 
     #[test]

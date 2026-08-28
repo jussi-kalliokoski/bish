@@ -5,15 +5,16 @@
 // ideographs, Hangul syllables, most emoji, fullwidth forms), 1 for
 // everything else. This is deliberately the well-known "per-codepoint
 // width" model every terminal emulator and most terminal apps (tmux,
-// less, vim's own default) already use, not full Unicode grapheme-
-// cluster segmentation -- a multi-codepoint sequence (a ZWJ emoji
-// family, a base character plus several combining marks) is measured
-// char-by-char and summed here rather than treated as one cluster.
-// That's a real, harder problem (needs a second table just for
-// grapheme-break properties) genuinely deferred to a later pass if it
-// ever turns out to matter in practice; this alone already fixes the
-// much more common case (a single wide/combining char throwing off
-// cursor math by one column).
+// less, vim's own default) already use, at the single-char level --
+// `char_width` itself has no notion of a multi-codepoint sequence being
+// one cluster at all, and stays that way (real cursor motion needs a
+// char index either way, per-char, to stay addressable).
+//
+// `str_width` below *is* now grapheme-cluster-aware, via
+// `bishedit::grapheme` -- this used to be the one real gap this
+// comment flagged ("a ZWJ emoji family... measured char-by-char and
+// summed here rather than treated as one cluster... genuinely deferred
+// to a later pass"). Fixed: see `str_width`'s own doc comment.
 //
 // The range tables below are a deliberately trimmed, high-confidence
 // subset of the full Unicode East Asian Width / combining-mark
@@ -85,8 +86,26 @@ pub fn char_width(c: char) -> usize {
     1
 }
 
+// A grapheme cluster's own display width is its *first* char's width
+// alone, not the sum of every char in it -- everything else in the
+// cluster (combining marks, ZWJ, skin-tone modifiers, joined emoji)
+// renders *within* the space that first char already occupies, not
+// stacked additionally alongside it. Fixes the ZWJ-sequence gap this
+// module's own top doc comment used to flag: a family emoji (person +
+// ZWJ + person + ZWJ + child, each individually width-2) used to sum
+// to 6+ columns; it's one ~2-column glyph in any terminal that
+// understands ZWJ joining, matching real terminal behavior. Ordinary
+// text (every char its own single-char cluster) is unaffected -- this
+// reduces to the exact same per-char sum `char_width` always gave.
 pub fn str_width(s: &str) -> usize {
-    s.chars().map(char_width).sum()
+    let chars: Vec<char> = s.chars().collect();
+    let mut width = 0;
+    let mut i = 0;
+    while i < chars.len() {
+        width += char_width(chars[i]);
+        i = crate::bishedit::grapheme::next_boundary(&chars, i);
+    }
+    width
 }
 
 // The display column a given char index within `chars` actually starts
@@ -149,6 +168,31 @@ mod tests {
         assert_eq!(char_width('\u{0301}'), 0); // COMBINING ACUTE ACCENT
         // "e" + combining acute accent visually reads as one column, not two.
         assert_eq!(str_width("e\u{0301}"), 1);
+    }
+
+    #[test]
+    fn zwj_emoji_sequence_is_one_clusters_own_width_not_a_sum() {
+        // MAN + ZWJ + WOMAN + ZWJ + GIRL + ZWJ + BOY -- a "family" ZWJ
+        // sequence, 7 individually-Wide-or-zero-width chars. Naive
+        // per-char summing gives 8 (four Wide chars x2); this is one
+        // cluster, one glyph, 2 columns.
+        let family = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}\u{200D}\u{1F466}";
+        assert_eq!(str_width(family), 2);
+    }
+
+    #[test]
+    fn two_family_emoji_side_by_side_are_two_clusters_worth_of_width() {
+        let family = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}\u{200D}\u{1F466}";
+        let two = format!("{family}{family}");
+        assert_eq!(str_width(&two), 4);
+    }
+
+    #[test]
+    fn ordinary_multi_char_text_still_sums_per_char_as_before() {
+        // Every char here is its own single-char cluster, so this must
+        // reduce to exactly the same result str_width already gave
+        // before it became cluster-aware.
+        assert_eq!(str_width("中文 hello"), 4 + 1 + 5);
     }
 
     #[test]

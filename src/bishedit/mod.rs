@@ -7,6 +7,7 @@
 pub mod completion;
 pub mod format;
 pub mod fuzzy;
+pub mod grapheme;
 pub mod highlight;
 pub mod lint;
 pub mod manpages;
