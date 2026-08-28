@@ -11,6 +11,7 @@ mod fileeditor;
 mod git;
 mod glob;
 mod history;
+mod json;
 mod lexer;
 mod parser;
 mod prompt;

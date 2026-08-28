@@ -5850,6 +5850,69 @@ impl Shell {
                 self.arrays.insert(array_name, map);
                 return ExecResult::Status(0);
             }
+            // `json [-r] [PATH] [FILE]` -- a `jq`-lite convenience
+            // builtin (bash has nothing like this at all): parse JSON,
+            // optionally navigate a dotted-path query (`.foo.bar[2]`,
+            // default `.` -- identity), pretty-print the result. `-r`
+            // prints a string result raw/unquoted (everything else
+            // still pretty-printed) -- the common case for pulling one
+            // value straight into a shell variable (`name=$(json -r
+            // .name config.json)`), matching real jq's own `-r` flag.
+            // `PATH` mirrors jq's own convention exactly, including its
+            // own well-known gotcha: with exactly one positional
+            // argument, that argument is *always* the path, never a
+            // filename (`json file.json` tries to query a path literally
+            // named "file.json", it does not read that file) -- `json .
+            // file.json` is what reads a file with the identity query.
+            // See src/json.rs for the actual parser/query engine.
+            "json" => {
+                let mut raw = false;
+                let mut positional: Vec<&str> = Vec::new();
+                for a in &argv[1..] {
+                    match a.as_str() {
+                        "-r" | "--raw" => raw = true,
+                        other => positional.push(other),
+                    }
+                }
+                let path = positional.first().copied().unwrap_or(".");
+                let text = if let Some(file) = positional.get(1) {
+                    match std::fs::read_to_string(file) {
+                        Ok(t) => t,
+                        Err(e) => {
+                            sh_eprintln!(self, "bish: json: {}: {}", file, e);
+                            return ExecResult::Status(1);
+                        }
+                    }
+                } else {
+                    let mut reader = self.read_input_source(cmd);
+                    let mut buf = String::new();
+                    if let Err(e) = std::io::Read::read_to_string(&mut *reader, &mut buf) {
+                        sh_eprintln!(self, "bish: json: {}", e);
+                        return ExecResult::Status(1);
+                    }
+                    buf
+                };
+                let value = match crate::json::parse(&text) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        sh_eprintln!(self, "bish: json: {}", e);
+                        return ExecResult::Status(1);
+                    }
+                };
+                let result = match crate::json::query(&value, path) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        sh_eprintln!(self, "bish: json: {}", e);
+                        return ExecResult::Status(1);
+                    }
+                };
+                let output = match (raw, result) {
+                    (true, crate::json::Value::Str(s)) => s.clone(),
+                    _ => crate::json::pretty_print(result),
+                };
+                sh_println!(self, "{}", output);
+                return ExecResult::Status(0);
+            }
             "eval" => {
                 let src = argv[1..].join(" ");
                 return self.run_source_here(&src, "eval");
