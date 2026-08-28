@@ -12,6 +12,7 @@ mod exec;
 mod fileeditor;
 mod git;
 mod glob;
+mod hexedit;
 mod history;
 mod json;
 mod lexer;

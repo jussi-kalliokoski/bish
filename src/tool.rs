@@ -18,13 +18,14 @@ pub fn run(args: &[String]) -> i32 {
         Some("format") => run_format(&args[1..]),
         Some("debug") => run_debug(&args[1..]),
         Some("edit") => run_edit(&args[1..]),
+        Some("hex") => crate::hexedit::run(&args[1..]),
         Some(other) => {
-            eprintln!("bish tool: unknown subcommand '{other}' (expected: check, format, debug, edit)");
+            eprintln!("bish tool: unknown subcommand '{other}' (expected: check, format, debug, edit, hex)");
             2
         }
         None => {
             eprintln!(
-                "bish tool: expected a subcommand (usage: bish tool check [--fix] [FILE...], bish tool format [--check] [FILE...], bish tool debug FILE, bish tool edit FILE)"
+                "bish tool: expected a subcommand (usage: bish tool check [--fix] [FILE...], bish tool format [--check] [FILE...], bish tool debug FILE, bish tool edit FILE, bish tool hex FILE)"
             );
             2
         }
