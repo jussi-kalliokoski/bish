@@ -399,7 +399,10 @@ fn decode_csi_final(params: &str, final_byte: u8) -> Key {
 // How long to wait for a keystroke before giving on_idle another chance
 // to run (see read_line's on_idle doc comment) and polling again. Short
 // enough that a job running in another window doesn't visibly stall.
-const IDLE_POLL_MS: i32 = 15;
+// pub(crate): repl.rs's run_normal_mode_navigation needs this same
+// interval for its own pre-wait loop (see that function's own comment
+// on why it can't just reuse read_key_idle's on_idle closure directly).
+pub(crate) const IDLE_POLL_MS: i32 = 15;
 
 // Blocks until a key is available, but never for longer than
 // IDLE_POLL_MS at a stretch -- calls on_idle and loops back to poll again

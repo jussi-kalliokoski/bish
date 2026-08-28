@@ -28,6 +28,7 @@ use crate::bishedit::vimkeys::{InsertCmd, Op, SurroundTarget, VimKeys, INDENT_WI
 use crate::bishedit::Buffer;
 use crate::editor::{self, Key};
 use crate::repl::Rect;
+use crate::term;
 use crate::vt100;
 
 // What `repl.rs`'s `edit_frames` side table actually holds -- not just a
@@ -736,12 +737,18 @@ pub(crate) const MOUSE_WHEEL_LINES: usize = 3;
 // only an actual mutation (Enter/Tab/Backspace/a typed char) replicates
 // across the whole set, via apply_insert_to_all/apply_backspace_to_all.
 #[allow(clippy::too_many_arguments)]
+// `on_idle` returns `bool`: true iff a session-daemon client just
+// (re)attached this call -- see run_normal_mode_navigation's own
+// identical convention (repl.rs) and service_background_jobs's doc
+// comment for why a caller holding a live `TextBuffer`/`VimKeys` (like
+// this one) needs to know, and why `compositor_redraw` alone (already
+// run inside `on_idle` itself) isn't enough for it.
 pub(crate) fn run_insert_mode(
     buf: &mut TextBuffer,
     vk: &mut VimKeys,
     rect: Rect,
     registers: &mut Registers,
-    on_idle: &mut dyn FnMut(),
+    on_idle: &mut dyn FnMut() -> bool,
     replace: bool,
     term_rows: usize,
     term_cols: usize,
@@ -759,12 +766,27 @@ pub(crate) fn run_insert_mode(
     // distinction precisely; this doesn't.
     let mut inserted = String::new();
     loop {
+        // Waits for a byte to actually be ready *before* calling
+        // vk.next_key below, rather than passing `on_idle` as that
+        // call's own on_idle closure -- vk.next_key(&mut self, ...)
+        // holds `vk` (and this function needs `buf` too) exclusively
+        // borrowed for its whole call, which would make it impossible
+        // for `on_idle` to also redraw them from inside that call. See
+        // run_normal_mode_navigation's own identical restructuring
+        // (repl.rs) for the full reasoning -- same fix, same root cause.
+        while !term::stdin_ready(editor::IDLE_POLL_MS) {
+            if on_idle() {
+                render_editor_frame(buf, vk, mode, rect, term_rows, term_cols, color_overrides);
+            }
+        }
         // Goes through `vk.next_key` (not a bare `read_key_idle`) so a
         // macro recorded/replayed from Normal mode -- see its own doc
         // comment -- still works across a full Insert-mode excursion:
         // `run_normal_mode_navigation` calls this function inline, with
-        // the same `vk`, so nothing here needs its own bookkeeping.
-        let key = match vk.next_key(|| editor::read_key_idle(on_idle))? {
+        // the same `vk`, so nothing here needs its own bookkeeping. A
+        // byte is already known ready (just confirmed above), so this
+        // on_idle closure is never actually called.
+        let key = match vk.next_key(|| editor::read_key_idle(&mut || {}))? {
             Some(k) => k,
             None => {
                 buf.set_mark('^', buf.cursor());
@@ -2045,7 +2067,7 @@ mod macro_tests {
             KeyOutcome::Motion(m, count) => motion::apply_motion(buf, m, count),
             KeyOutcome::EnterInsert(cmd) => {
                 resolve_insert_start(buf, cmd);
-                run_insert_mode(buf, vk, rect(), registers, &mut || {}, false, 24, 80, None, &[]).unwrap();
+                run_insert_mode(buf, vk, rect(), registers, &mut || false, false, 24, 80, None, &[]).unwrap();
             }
             other => panic!("unexpected outcome in this test: {other:?}"),
         }
@@ -2157,7 +2179,7 @@ mod multi_cursor_insert_tests {
         let mut registers = Registers::new_for_test();
         scripted(&mut vk, &[Key::Char('D'), Key::Char('O'), Key::Char('N'), Key::Char('E'), Key::Escape]);
 
-        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut || {}, false, 24, 80, None, &[(1, 0), (2, 0)]).unwrap();
+        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut || false, false, 24, 80, None, &[(1, 0), (2, 0)]).unwrap();
 
         assert_eq!(line(&buf, 0), "DONE one");
         assert_eq!(line(&buf, 1), "DONE two");
@@ -2173,7 +2195,7 @@ mod multi_cursor_insert_tests {
         let mut registers = Registers::new_for_test();
         scripted(&mut vk, &[Key::Backspace, Key::Escape]);
 
-        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut || {}, false, 24, 80, None, &[(1, 1)]).unwrap();
+        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut || false, false, 24, 80, None, &[(1, 1)]).unwrap();
 
         assert_eq!(line(&buf, 0), " one");
         assert_eq!(line(&buf, 1), " two");
@@ -2188,7 +2210,7 @@ mod multi_cursor_insert_tests {
         let mut registers = Registers::new_for_test();
         scripted(&mut vk, &[Key::Enter, Key::Escape]);
 
-        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut || {}, false, 24, 80, None, &[(1, 1)]).unwrap();
+        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut || false, false, 24, 80, None, &[(1, 1)]).unwrap();
 
         assert_eq!(buf.line_count(), 4);
         assert_eq!(line(&buf, 0), "a");
@@ -2209,7 +2231,7 @@ mod multi_cursor_insert_tests {
         let mut registers = Registers::new_for_test();
         scripted(&mut vk, &[Key::Char('X'), Key::Escape]);
 
-        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut || {}, false, 24, 80, None, &[(0, 6)]).unwrap();
+        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut || false, false, 24, 80, None, &[(0, 6)]).unwrap();
 
         assert_eq!(line(&buf, 0), "X placeX ");
     }
@@ -2245,7 +2267,7 @@ mod insert_mode_exit_clamp_tests {
         let mut registers = Registers::new_for_test();
         scripted(&mut vk, &[Key::Escape]);
 
-        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut || {}, false, 24, 80, None, &[]).unwrap();
+        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut || false, false, 24, 80, None, &[]).unwrap();
 
         assert_eq!(buf.cursor(), (0, 1), "cursor must land on 'b', not past it");
     }
@@ -2258,7 +2280,7 @@ mod insert_mode_exit_clamp_tests {
         let mut registers = Registers::new_for_test();
         scripted(&mut vk, &[Key::Char('h'), Key::Char('i'), Key::Escape]);
 
-        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut || {}, false, 24, 80, None, &[]).unwrap();
+        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut || false, false, 24, 80, None, &[]).unwrap();
 
         assert_eq!(buf.cursor(), (0, 1), "cursor must land on the 'i', not past it");
     }
@@ -2274,7 +2296,7 @@ mod insert_mode_exit_clamp_tests {
         let mut registers = Registers::new_for_test();
         scripted(&mut vk, &[Key::Escape]);
 
-        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut || {}, false, 24, 80, None, &[]).unwrap();
+        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut || false, false, 24, 80, None, &[]).unwrap();
 
         assert_eq!(buf.get_mark('^'), Some((0, 2)));
     }
@@ -2287,7 +2309,7 @@ mod insert_mode_exit_clamp_tests {
         let mut registers = Registers::new_for_test();
         scripted(&mut vk, &[Key::Escape]);
 
-        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut || {}, false, 24, 80, None, &[]).unwrap();
+        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut || false, false, 24, 80, None, &[]).unwrap();
 
         assert_eq!(buf.cursor(), (0, 0));
     }

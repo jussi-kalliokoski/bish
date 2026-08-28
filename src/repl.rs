@@ -1435,7 +1435,7 @@ fn run_fg_job_frame(
             &mut job,
             &focused_screen,
             || render_compositor_frame_diff(&layout, &tab_bar, redraw_rows, redraw_cols, &mut frame_cache),
-            || service_background_jobs(sessions, windows, job_frames, cw, term_rows, term_cols, *sinks_are_grid),
+            || { service_background_jobs(sessions, windows, job_frames, cw, term_rows, term_cols, *sinks_are_grid); },
         );
         match outcome {
         FgOutcome::Exited(status) => {
@@ -3208,6 +3208,13 @@ fn drive_fg_job(job: &mut exec::FgJob, screen: &Rc<RefCell<vt100::Screen>>, mut 
 // backgrounded pane shouldn't be able to make this take arbitrarily
 // long before returning control to whichever of the two loops above
 // called it.
+// Returns true iff a session-daemon client just (re)attached this call
+// -- see the `just_attached` handling below for what that triggers here
+// (a full compositor_redraw), and its own doc comment for why that
+// alone isn't enough for a caller currently driving a grid-bypassing
+// view (a `Frame::Edit`'s own real content, see run_normal_mode_
+// navigation's own on_idle closure for the caller that needs to react
+// to this return value; every other caller correctly ignores it).
 fn service_background_jobs(
     sessions: &mut HashMap<SessionId, SessionState>,
     windows: &mut [WindowEntry],
@@ -3216,7 +3223,7 @@ fn service_background_jobs(
     term_rows: &mut usize,
     term_cols: &mut usize,
     sinks_are_grid: bool,
-) {
+) -> bool {
     use std::io::Read;
 
     // A plain no-op unless this process is running as a `bish session`
@@ -3229,8 +3236,18 @@ fn service_background_jobs(
     // ordinary incremental diff) so its own blank real terminal starts
     // correctly caught up, rather than staying empty until unrelated
     // activity happens to redraw something. See take_bridge_just_
-    // attached's own doc comment.
-    if session::take_bridge_just_attached() && sinks_are_grid {
+    // attached's own doc comment. `compositor_redraw` alone is *not*
+    // sufficient when the currently-focused pane is a `Frame::Edit`
+    // being actively driven -- its real content never feeds the
+    // session's own vt100 grid while that's happening (the exact same
+    // gap this codebase already hit once before, for command mode's own
+    // post-return redraw -- see this file's own history), so
+    // `compositor_redraw` alone would just paint that pane blank. The
+    // `bool` returned here is what lets such a caller notice and follow
+    // up with its own direct redraw of the real content it alone has
+    // access to.
+    let just_attached = session::take_bridge_just_attached();
+    if just_attached && sinks_are_grid {
         compositor_redraw(sessions, windows, skip_window, *term_rows, *term_cols);
     }
 
@@ -3279,6 +3296,7 @@ fn service_background_jobs(
             }
         }
     }
+    just_attached
 }
 
 // Raw stdin read for drive_fg_job. Renamed via link_name so the local
@@ -4951,9 +4969,37 @@ fn run_normal_mode_navigation(
         // `KeyOutcome::Window`/click handling, so this was never
         // observable before `:diag` -- cheap enough to just always do.
         rect = pane_rect(&windows[*current_window], windows[*current_window].focused_pane, *term_rows, *term_cols);
-        let mut key = match vk.next_key(|| editor::read_key_idle(&mut || {
-            service_background_jobs(sessions, windows, job_frames, *current_window, term_rows, term_cols, *sinks_are_grid);
-        }))? {
+        // Waits for a byte to actually be ready *before* calling
+        // vk.next_key below, rather than passing this same on_idle work
+        // as that call's own closure (editor::read_key_idle's usual
+        // shape, used everywhere else) -- vk.next_key(&mut self, ...)
+        // holds `vk` exclusively borrowed for its whole call, including
+        // while its own on_idle closure runs, which would make it
+        // impossible for that closure to also touch `buf`/`vk` to
+        // redraw them. Doing the wait out here instead, where neither
+        // is borrowed by anything else, is what actually lets a
+        // just-attached session client's blank real terminal get this
+        // pane's *real* content redrawn immediately -- not just once
+        // the next keystroke happens to arrive (which, for a client
+        // that reattaches and doesn't immediately type anything, could
+        // be never). Same IDLE_POLL_MS interval read_key_idle's own
+        // loop uses, so behavior is identical once a byte does arrive.
+        while !term::stdin_ready(editor::IDLE_POLL_MS) {
+            if service_background_jobs(sessions, windows, job_frames, *current_window, term_rows, term_cols, *sinks_are_grid) {
+                // compositor_redraw already ran (inside
+                // service_background_jobs), but that alone paints this
+                // pane blank if it's a `Frame::Edit` (see that
+                // function's own doc comment) -- follow up with the
+                // real thing, the exact same call this function's own
+                // entry above already makes once, up front.
+                render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides);
+            }
+        }
+        // A byte is already known ready -- read_key_idle's own internal
+        // poll will see that immediately, so this on_idle closure is
+        // never actually called; kept only to match its existing
+        // signature rather than adding a second, idle-free entry point.
+        let mut key = match vk.next_key(|| editor::read_key_idle(&mut || {}))? {
             Some(k) => k,
             // EOF: nothing sensible to resume into for any start -- for
             // `Edit` specifically, that means dropping the session

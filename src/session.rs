@@ -40,6 +40,7 @@ use std::io::{self, Read, Write};
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 unsafe extern "C" {
     fn getuid() -> u32;
@@ -343,14 +344,62 @@ impl Decoder {
     }
 }
 
-// The stateless byte relay between a daemon's own pty master and
-// whichever client socket is currently attached, if any -- see this
-// module's own top doc comment for why draining the pty master must
-// never be skipped, attached or not.
+// The byte relay between a daemon's own pty master and whichever client
+// socket is currently attached, if any.
+//
+// The pty-master-*reading* half runs on its own dedicated background
+// thread (drain_pty_master_thread below), not through the on_idle
+// mechanism every other part of this bridge uses -- found necessary the
+// hard way, via an actual reproducible hang, not assumed upfront. The
+// problem: `editor::read_line`/`vk.next_key`'s own on_idle callback
+// (`read_key_idle`, editor.rs) only runs while genuinely *waiting* for
+// the next byte -- once bytes are already sitting in the pty's read
+// queue (a paste, or any input arriving faster than one keystroke at a
+// time, which a client relaying a whole burst from its own socket read
+// absolutely can produce), every one of them gets consumed and
+// redrawn in a tight loop with no on_idle call in between. If the
+// *cumulative* redraw output from that burst exceeds the pty's own
+// kernel output-queue capacity, the shell's own next `io::stdout()`
+// write blocks -- and since nothing else was draining the master side
+// (on_idle never got a turn to), it stays blocked forever. Reproduced
+// directly: a short command (`echo hi`) never triggered this, but a
+// single `e <long path>\n` reliably hung the whole daemon. A dedicated
+// thread that does nothing but block-read the master and forward
+// whatever arrives keeps that queue draining continuously regardless
+// of what the main, single-threaded, on_idle-driven side is doing --
+// this closes the deadlock at its actual root rather than trying to
+// make every possible burst-producing code path yield more often.
+// Never touches Shell/SessionState/any Rc<RefCell> state (just raw
+// fds), so this doesn't reopen the single-threaded-by-design question
+// for anything else in this codebase -- see this module's own top doc
+// comment on why bish stays single-threaded everywhere else.
+//
+// The client-*input* direction (drain_client below) stays on the main,
+// on_idle-driven thread: writing a client's own input into the pty
+// master is comparatively small and immediately consumed by the
+// already-continuously-reading shell process on the other end, so it
+// doesn't have the same unbounded-accumulation shape -- and keeping it
+// on the main thread is what lets accept/attach/detach state
+// (`client_read`, `just_attached`) stay a single, non-atomic
+// `Option`/`bool` with no synchronization needed.
 pub struct SessionBridge {
-    pty_master: std::fs::File,
     listener: UnixListener,
-    client: Option<UnixStream>,
+    // The main thread's own handle: read from directly (drain_client),
+    // written to only via a fresh try_clone() each time a new client is
+    // accepted (see try_accept) -- kept distinct from
+    // `client_write_shared` below so accept/detach only ever need to
+    // touch this field, no lock required on the hot path most on_idle
+    // ticks actually take (no new client, no new input).
+    client_read: Option<UnixStream>,
+    // Shared with the background pty-master-draining thread -- the only
+    // thing that thread ever touches. Updated (attach: Some, detach/
+    // EOF: None) by the main thread alongside `client_read` so both
+    // always agree on whether a client is currently attached.
+    client_write: Arc<Mutex<Option<UnixStream>>>,
+    // The main thread's own pty-master handle -- writes only (client
+    // input, `Pty::set_size`); the background thread owns the read side
+    // via its own separate fd (see SessionBridge::new).
+    pty_master: std::fs::File,
     decoder: Decoder,
     // Set true the moment a connection is accepted (a first attach *or*
     // a reattach after a prior client detached); consumed once by
@@ -374,21 +423,60 @@ pub struct SessionBridge {
 // documents: a firehose producer (a job printing in a tight loop) could
 // otherwise keep this side of the bridge busy indefinitely, starving
 // every other on_idle responsibility (job draining, WINCH, the next
-// keystroke) that also needs a turn.
+// keystroke) that also needs a turn. Only bounds drain_client now --
+// the pty-master-reading side runs unbounded on its own thread, where
+// starving anything else isn't a concern at all.
 const MAX_READS_PER_TICK: u32 = 16;
 
+// The background thread's whole job: block-read `pty_master_read`
+// forever, forwarding whatever arrives to `client_write` if anyone's
+// there, discarding otherwise (see this struct's own doc comment for
+// why discarding, not buffering, and why this must never stop reading
+// regardless). A write failure (the client went away) is treated the
+// same as "no client" -- this thread never clears `client_write`
+// itself, that's the main thread's job (via drain_client's own EOF
+// detection on `client_read`); this just silently drops that one
+// forward attempt and keeps reading. Returns (ending the thread) only
+// when the pty master itself is gone, which in practice means the
+// whole daemon process is exiting.
+fn drain_pty_master_thread(mut pty_master_read: std::fs::File, client_write: Arc<Mutex<Option<UnixStream>>>) {
+    let mut buf = [0u8; 4096];
+    loop {
+        match pty_master_read.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                let msg = Message::Bytes(buf[..n].to_vec());
+                let encoded = msg.encode();
+                if let Ok(guard) = client_write.lock()
+                    && let Some(stream) = guard.as_ref()
+                {
+                    let _ = (&*stream).write_all(&encoded);
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(_) => break,
+        }
+    }
+}
+
 impl SessionBridge {
-    // `pty_master`/`listener` are both set non-blocking here, so
-    // callers don't need to remember to -- there's no correct blocking
-    // use of either from inside `service`.
+    // `listener` is set non-blocking here (the main thread's own
+    // accept/drain_client loop is never allowed to block); `pty_master`
+    // is *not* -- the main thread only ever writes to it now, and the
+    // background thread's own clone (opened here, moved into the
+    // spawned thread) stays in ordinary blocking mode on purpose, since
+    // that thread has nothing else to do while waiting anyway.
     pub fn new(pty_master: std::fs::File, listener: UnixListener) -> io::Result<SessionBridge> {
-        crate::pty::set_nonblocking(pty_master.as_raw_fd());
         listener.set_nonblocking(true)?;
-        Ok(SessionBridge { pty_master, listener, client: None, decoder: Decoder::new(), just_attached: false })
+        let pty_master_read = pty_master.try_clone()?;
+        let client_write = Arc::new(Mutex::new(None));
+        let client_write_for_thread = client_write.clone();
+        std::thread::spawn(move || drain_pty_master_thread(pty_master_read, client_write_for_thread));
+        Ok(SessionBridge { listener, client_read: None, client_write, pty_master, decoder: Decoder::new(), just_attached: false })
     }
 
     pub fn is_attached(&self) -> bool {
-        self.client.is_some()
+        self.client_read.is_some()
     }
 
     pub fn take_just_attached(&mut self) -> bool {
@@ -396,12 +484,12 @@ impl SessionBridge {
     }
 
     // Called once per on_idle tick (see service_current_bridge below).
-    // Never blocks.
+    // Never blocks -- the pty-master-draining half no longer lives
+    // here at all (see drain_pty_master_thread).
     pub fn service(&mut self) {
-        if self.client.is_none() {
+        if self.client_read.is_none() {
             self.try_accept();
         }
-        self.drain_pty_master();
         self.drain_client();
     }
 
@@ -418,9 +506,15 @@ impl SessionBridge {
                 match peer_uid(&stream) {
                     Ok(uid) if uid == current_uid() => {
                         let _ = stream.set_nonblocking(true);
-                        self.client = Some(stream);
-                        self.decoder = Decoder::new();
-                        self.just_attached = true;
+                        match stream.try_clone() {
+                            Ok(write_half) => {
+                                *self.client_write.lock().unwrap_or_else(|p| p.into_inner()) = Some(write_half);
+                                self.client_read = Some(stream);
+                                self.decoder = Decoder::new();
+                                self.just_attached = true;
+                            }
+                            Err(_) => { /* couldn't clone -- drop `stream`, try again next tick */ }
+                        }
                     }
                     _ => { /* wrong UID or the check itself failed -- drop `stream` */ }
                 }
@@ -430,31 +524,17 @@ impl SessionBridge {
         }
     }
 
-    fn drain_pty_master(&mut self) {
-        let mut buf = [0u8; 4096];
-        for _ in 0..MAX_READS_PER_TICK {
-            match self.pty_master.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    if let Some(client) = &mut self.client {
-                        let msg = Message::Bytes(buf[..n].to_vec());
-                        if client.write_all(&msg.encode()).is_err() {
-                            self.client = None;
-                        }
-                    }
-                    // No client attached: discard. Draining still has to
-                    // happen either way -- see this module's own top doc
-                    // comment on why an unattended daemon must never
-                    // stop reading its own pty master.
-                }
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                Err(_) => break,
-            }
-        }
+    // Clears both `client_read` (this struct's own handle) and
+    // `client_write` (the background thread's shared handle) together
+    // -- the one place either is ever set back to None, so the two
+    // never disagree about whether a client is attached.
+    fn detach(&mut self) {
+        self.client_read = None;
+        *self.client_write.lock().unwrap_or_else(|p| p.into_inner()) = None;
     }
 
     fn drain_client(&mut self) {
-        let Some(client) = &mut self.client else { return };
+        let Some(client) = &mut self.client_read else { return };
         let mut buf = [0u8; 4096];
         let mut disconnected = false;
         for _ in 0..MAX_READS_PER_TICK {
@@ -472,7 +552,7 @@ impl SessionBridge {
             }
         }
         if disconnected {
-            self.client = None;
+            self.detach();
             return;
         }
         loop {
@@ -482,7 +562,10 @@ impl SessionBridge {
                     // bounded by that buffer's size, same as any other
                     // pty write in this codebase (e.g. drive_fg_job
                     // forwarding a real paste/mouse sequence into a
-                    // job's own pty); not a new risk category.
+                    // job's own pty); not a new risk category (see this
+                    // struct's own doc comment for why the *other*
+                    // direction was the one that could actually
+                    // deadlock, and why this one doesn't the same way).
                     let _ = self.pty_master.write_all(&payload);
                 }
                 Ok(Some(Message::Resize { rows, cols })) => {
@@ -518,7 +601,7 @@ impl SessionBridge {
                 }
                 Ok(None) => break,
                 Err(_) => {
-                    self.client = None;
+                    self.detach();
                     break;
                 }
             }
