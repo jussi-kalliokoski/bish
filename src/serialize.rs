@@ -193,6 +193,7 @@ fn serialize_array_literal_assign(name: &str, mode: AssignMode, items: &[ArrayLi
 pub fn serialize_redirect(r: &Redirect) -> String {
     match r {
         Redirect::In(w) => format!("<{}", serialize_word(w)),
+        Redirect::InOut(w) => format!("<>{}", serialize_word(w)),
         Redirect::Out { word, append } => format!("{}{}", if *append { ">>" } else { ">" }, serialize_word(word)),
         Redirect::Err { word, append } => format!("2{}{}", if *append { ">>" } else { ">" }, serialize_word(word)),
         Redirect::Both { word, append } => format!("&{}{}", if *append { ">>" } else { ">" }, serialize_word(word)),
@@ -206,6 +207,7 @@ pub fn serialize_redirect(r: &Redirect) -> String {
             format!("{}{}{}", fd, if *append { ">>" } else { ">" }, serialize_word(word))
         }
         Redirect::FdIn { fd, word } => format!("{}<{}", fd, serialize_word(word)),
+        Redirect::FdInOut { fd, word } => format!("{}<>{}", fd, serialize_word(word)),
         Redirect::FdDup { fd, target } => format!("{}>&{}", fd, target),
         Redirect::FdDupWord { fd, word } => format!("{}>&{}", fd, serialize_word(word)),
         Redirect::FdClose { fd } => format!("{}>&-", fd),

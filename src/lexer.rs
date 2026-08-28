@@ -168,15 +168,24 @@ pub enum Tok {
     Amp,
     RedirOut { append: bool },
     RedirIn,
+    // `<>`: opens the target for *both* reading and writing, on fd 0 (or
+    // the explicit leading digit, RedirFdInOut below). Real bash's own
+    // use case this exists for is almost entirely `/dev/tcp/HOST/PORT`
+    // (see exec.rs's dev_socket_file) -- a plain `<`/`>` against that
+    // same path would each open an independent, unrelated connection,
+    // useless for a request/response protocol that needs one connection
+    // used both ways.
+    RedirInOut,
     RedirErr { append: bool },
     RedirBoth { append: bool },
     DupErrToOut,
-    // Arbitrary-fd redirects: `N>`/`N>>`/`N<`/`N>&M`/`N<&M`. The fd=2 forms
-    // (`2>`, `2>>`, `2>&1`) stay on the dedicated tokens above -- this is
-    // for every other explicit fd number, plus `2<`/`2>&M` (M != 1), which
-    // the fd=2 fast path above doesn't cover.
+    // Arbitrary-fd redirects: `N>`/`N>>`/`N<`/`N<>`/`N>&M`/`N<&M`. The fd=2
+    // forms (`2>`, `2>>`, `2>&1`) stay on the dedicated tokens above -- this
+    // is for every other explicit fd number, plus `2<`/`2<>`/`2>&M` (M !=
+    // 1), which the fd=2 fast path above doesn't cover.
     RedirFdOut { fd: u32, append: bool },
     RedirFdIn { fd: u32 },
+    RedirFdInOut { fd: u32 },
     RedirFdDup { fd: u32, target: u32 },
     // `[N]>&WORD` / `[N]<&WORD` where WORD isn't a bare literal digit
     // sequence -- e.g. `>&"$fd"`, needed for anything using a dynamically-
@@ -547,6 +556,11 @@ impl<'a> Lexer<'a> {
                         push_tok!(self.lex_dup_target(0));
                         continue;
                     }
+                    if self.chars.peek().copied() == Some('>') {
+                        self.advance();
+                        push_tok!(Tok::RedirInOut);
+                        continue;
+                    }
                     if self.chars.peek().copied() == Some('<') {
                         self.advance();
                         if self.chars.peek().copied() == Some('<') {
@@ -612,6 +626,9 @@ impl<'a> Lexer<'a> {
                             if self.chars.peek().copied() == Some('&') {
                                 self.advance();
                                 push_tok!(self.lex_dup_target(fd));
+                            } else if self.chars.peek().copied() == Some('>') {
+                                self.advance();
+                                push_tok!(Tok::RedirFdInOut { fd });
                             } else {
                                 push_tok!(Tok::RedirFdIn { fd });
                             }
@@ -1593,6 +1610,9 @@ pub fn tokenize_spanned(src: &str) -> SpannedResult {
                         items.push(SpannedItem::Tok(Tok::HereDoc(vec![Chunk::Str(String::new())]), start..lexer.pos));
                         lexer.pending_heredocs.push((tok_idx, delim, strip_tabs, expand));
                     }
+                } else if lexer.chars.peek().copied() == Some('>') {
+                    lexer.advance();
+                    items.push(SpannedItem::Tok(Tok::RedirInOut, start..lexer.pos));
                 } else {
                     items.push(SpannedItem::Tok(Tok::RedirIn, start..lexer.pos));
                 }
@@ -1636,6 +1656,9 @@ pub fn tokenize_spanned(src: &str) -> SpannedResult {
                             lexer.advance();
                             let tok = lexer.lex_dup_target(fd);
                             items.push(SpannedItem::Tok(tok, start..lexer.pos));
+                        } else if lexer.chars.peek().copied() == Some('>') {
+                            lexer.advance();
+                            items.push(SpannedItem::Tok(Tok::RedirFdInOut { fd }, start..lexer.pos));
                         } else {
                             items.push(SpannedItem::Tok(Tok::RedirFdIn { fd }, start..lexer.pos));
                         }

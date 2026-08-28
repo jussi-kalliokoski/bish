@@ -3999,10 +3999,10 @@ impl Shell {
                 }
                 Redirect::In(w) => {
                     let p = self.expand_word(w);
-                    return match std::fs::File::open(&p) {
+                    return match self.open_in(&p) {
                         Ok(f) => Box::new(std::io::BufReader::new(f)),
                         Err(e) => {
-                            sh_eprintln!(self, "bish: {}: {}", p, e);
+                            sh_eprintln!(self, "bish: {}", e);
                             Box::new(std::io::Cursor::new(Vec::new()))
                         }
                     };
@@ -7585,35 +7585,45 @@ impl Shell {
     // failed `open_out` (e.g. `> /no/such/dir/f`) the same way every other
     // redirect failure already does.
     fn push_builtin_output_sink(&mut self, redirects: &[Redirect]) -> Result<bool, String> {
-        let mut stdout_target: Option<(String, bool)> = None;
-        let mut stderr_target: Option<(String, bool)> = None;
+        // A word-based target (`>file`) or a dup onto some other already-
+        // open fd (`>&3`, most commonly a fd `exec 3<>/dev/tcp/...` left
+        // open) -- last one wins either way, matching real bash's own
+        // "later redirects override earlier ones for the same fd" rule,
+        // which two separate Option fields (one per shape) couldn't
+        // express correctly across a mix of both shapes.
+        enum Target {
+            Path(String, bool),
+            Fd(i32),
+        }
+        let mut stdout_target: Option<Target> = None;
+        let mut stderr_target: Option<Target> = None;
         let mut dup_err_to_out = false;
         let mut dup_out_to_err = false;
         let mut touched = false;
         for r in redirects {
             match r {
                 Redirect::Out { word, append } => {
-                    stdout_target = Some((self.expand_word(word), *append));
+                    stdout_target = Some(Target::Path(self.expand_word(word), *append));
                     dup_out_to_err = false;
                     touched = true;
                 }
                 Redirect::FdOut { fd, word, append } if *fd == 1 => {
-                    stdout_target = Some((self.expand_word(word), *append));
+                    stdout_target = Some(Target::Path(self.expand_word(word), *append));
                     dup_out_to_err = false;
                     touched = true;
                 }
                 Redirect::Err { word, append } => {
-                    stderr_target = Some((self.expand_word(word), *append));
+                    stderr_target = Some(Target::Path(self.expand_word(word), *append));
                     dup_err_to_out = false;
                     touched = true;
                 }
                 Redirect::FdOut { fd, word, append } if *fd == 2 => {
-                    stderr_target = Some((self.expand_word(word), *append));
+                    stderr_target = Some(Target::Path(self.expand_word(word), *append));
                     dup_err_to_out = false;
                     touched = true;
                 }
                 Redirect::Both { word, append } => {
-                    stdout_target = Some((self.expand_word(word), *append));
+                    stdout_target = Some(Target::Path(self.expand_word(word), *append));
                     dup_err_to_out = true;
                     dup_out_to_err = false;
                     touched = true;
@@ -7630,20 +7640,36 @@ impl Shell {
                     dup_out_to_err = true;
                     touched = true;
                 }
+                // Any other numbered-fd dup onto stdout/stderr (`>&3`,
+                // `2>&4`, ...) -- see dup_existing_fd's own doc comment.
+                // Only fd 1/2 as the *source* mean anything to a
+                // builtin's own output at all (a builtin never writes
+                // anywhere else), matching FdOut{1}/FdOut{2} above.
+                Redirect::FdDup { fd, target } if *fd == 1 => {
+                    stdout_target = Some(Target::Fd(*target as i32));
+                    dup_out_to_err = false;
+                    touched = true;
+                }
+                Redirect::FdDup { fd, target } if *fd == 2 => {
+                    stderr_target = Some(Target::Fd(*target as i32));
+                    dup_err_to_out = false;
+                    touched = true;
+                }
                 _ => {}
             }
         }
         if !touched {
             return Ok(false);
         }
-        let stdout = match &stdout_target {
-            Some((p, append)) => Some(Rc::new(RefCell::new(self.open_out(p, *append)?))),
-            None => None,
+        let resolve = |t: &Option<Target>| -> Result<Option<Rc<RefCell<std::fs::File>>>, String> {
+            match t {
+                Some(Target::Path(p, append)) => Ok(Some(Rc::new(RefCell::new(self.open_out(p, *append)?)))),
+                Some(Target::Fd(fd)) => Ok(dup_existing_fd(*fd).map(|f| Rc::new(RefCell::new(f)))),
+                None => Ok(None),
+            }
         };
-        let stderr = match &stderr_target {
-            Some((p, append)) => Some(Rc::new(RefCell::new(self.open_out(p, *append)?))),
-            None => None,
-        };
+        let stdout = resolve(&stdout_target)?;
+        let stderr = resolve(&stderr_target)?;
         let previous = std::mem::replace(&mut self.sink, OutputSink::Real);
         self.sink = OutputSink::Builtin { previous: Box::new(previous), stdout, stderr, dup_err_to_out, dup_out_to_err };
         Ok(true)
@@ -7707,6 +7733,9 @@ impl Shell {
         if self.opt_restricted {
             return Err(format!("{}: restricted: cannot redirect output", path));
         }
+        if let Some(result) = dev_socket_file(path) {
+            return result;
+        }
         std::fs::OpenOptions::new()
             .create(true)
             .write(true)
@@ -7714,6 +7743,40 @@ impl Shell {
             .truncate(!append)
             .open(path)
             .map_err(|e| format!("{}: {}", path, e))
+    }
+
+    // The one place every redirect that opens a file for *reading*
+    // funnels through (`<`, numbered-fd `N<`; here-strings/heredocs go
+    // through here_string_file instead, they're never a real path) --
+    // mirrors open_out's own shape/doc comment, just above. `/dev/tcp/
+    // HOST/PORT` and `/dev/udp/HOST/PORT` (see dev_socket_file) are
+    // recognized here too, not just in open_out -- real bash's own
+    // /dev/tcp works with any redirect direction, not just `<`, and
+    // `exec 3<>/dev/tcp/host/80`'s bidirectional form is actually the
+    // most common real-world shape. No restricted-mode check here,
+    // unlike open_out -- restricted mode only blocks *output*
+    // redirection (see open_out's own doc comment), reading a file is
+    // always allowed.
+    fn open_in(&self, path: &str) -> Result<std::fs::File, String> {
+        if let Some(result) = dev_socket_file(path) {
+            return result;
+        }
+        std::fs::File::open(path).map_err(|e| format!("{}: {}", path, e))
+    }
+
+    // The read+write counterpart to open_in/open_out -- bare `<>`/`N<>`'s
+    // own target (real bash: "opened for reading and writing on file
+    // descriptor n, or on file descriptor 0 if n is not specified").
+    // `/dev/tcp`/`/dev/udp` (see dev_socket_file) are recognized here
+    // too -- `<>` is in fact the operator real /dev/tcp usage actually
+    // needs (one connection used for both the request and the
+    // response), not `<`/`>` on their own, which would each open an
+    // independent, unrelated connection to the same address.
+    fn open_in_out(&self, path: &str) -> Result<std::fs::File, String> {
+        if let Some(result) = dev_socket_file(path) {
+            return result;
+        }
+        std::fs::OpenOptions::new().create(true).read(true).write(true).open(path).map_err(|e| format!("{}: {}", path, e))
     }
 
     // Restricted mode: SHELL/PATH/ENV/BASH_ENV can't be set or unset --
@@ -7748,14 +7811,20 @@ impl Shell {
         &mut self,
         redirects: &[Redirect],
     ) -> Result<(Option<std::fs::File>, Option<std::fs::File>, Option<std::fs::File>), String> {
-        let mut stdin_path: Option<String> = None;
+        // `bool`: also opened for writing (Redirect::InOut, bare `<>`) --
+        // see open_in_out's own doc comment.
+        let mut stdin_path: Option<(String, bool)> = None;
         let mut here_string: Option<String> = None;
         let mut stdout_target: Option<(String, bool)> = None;
         let mut stderr_target: Option<(String, bool)> = None;
         for r in redirects {
             match r {
                 Redirect::In(w) => {
-                    stdin_path = Some(self.expand_word(w));
+                    stdin_path = Some((self.expand_word(w), false));
+                    here_string = None;
+                }
+                Redirect::InOut(w) => {
+                    stdin_path = Some((self.expand_word(w), true));
                     here_string = None;
                 }
                 Redirect::HereString(w) => {
@@ -7786,7 +7855,8 @@ impl Shell {
             Some(here_string_file(&content)?)
         } else {
             match stdin_path {
-                Some(p) => Some(std::fs::File::open(&p).map_err(|e| format!("{}: {}", p, e))?),
+                Some((p, true)) => Some(self.open_in_out(&p)?),
+                Some((p, false)) => Some(self.open_in(&p)?),
                 None => None,
             }
         };
@@ -7846,7 +7916,7 @@ impl Shell {
             match r {
                 Redirect::In(w) => {
                     let p = self.expand_word(w);
-                    stdio.stdin = Some(std::fs::File::open(&p).map_err(|e| format!("{}: {}", p, e))?);
+                    stdio.stdin = Some(self.open_in(&p)?);
                 }
                 Redirect::HereString(w) => {
                     let mut content = self.expand_word(w);
@@ -7888,7 +7958,9 @@ impl Shell {
     fn resolve_redirect_list(&mut self, redirects: &[Redirect]) -> Result<ResolvedRedirs, String> {
         let mut stdout_target: Option<(String, bool)> = None;
         let mut stderr_target: Option<(String, bool)> = None;
-        let mut stdin_path: Option<String> = None;
+        // `bool`: also opened for writing (Redirect::InOut, bare `<>`) --
+        // see open_in_out's own doc comment.
+        let mut stdin_path: Option<(String, bool)> = None;
         let mut here_string: Option<String> = None;
         let mut dup_err_to_out = false;
         let mut extra_fds: Vec<ExtraFd> = Vec::new();
@@ -7896,7 +7968,11 @@ impl Shell {
         for r in redirects {
             match r {
                 Redirect::In(w) => {
-                    stdin_path = Some(self.expand_word(w));
+                    stdin_path = Some((self.expand_word(w), false));
+                    here_string = None;
+                }
+                Redirect::InOut(w) => {
+                    stdin_path = Some((self.expand_word(w), true));
                     here_string = None;
                 }
                 Redirect::HereString(w) => {
@@ -7932,7 +8008,12 @@ impl Shell {
                 }
                 Redirect::FdIn { fd, word } => {
                     let p = self.expand_word(word);
-                    let file = std::fs::File::open(&p).map_err(|e| format!("{}: {}", p, e))?;
+                    let file = self.open_in(&p)?;
+                    extra_fds.push(ExtraFd::Open { fd: *fd as i32, file });
+                }
+                Redirect::FdInOut { fd, word } => {
+                    let p = self.expand_word(word);
+                    let file = self.open_in_out(&p)?;
                     extra_fds.push(ExtraFd::Open { fd: *fd as i32, file });
                 }
                 Redirect::FdDup { fd, target } => {
@@ -7955,9 +8036,8 @@ impl Shell {
             Some(Stdio::from(here_string_file(&content)?))
         } else {
             match stdin_path {
-                Some(p) => Some(Stdio::from(
-                    std::fs::File::open(&p).map_err(|e| format!("{}: {}", p, e))?,
-                )),
+                Some((p, true)) => Some(Stdio::from(self.open_in_out(&p)?)),
+                Some((p, false)) => Some(Stdio::from(self.open_in(&p)?)),
                 None => None,
             }
         };
@@ -9310,6 +9390,81 @@ fn here_string_file(content: &str) -> Result<std::fs::File, String> {
     let f = std::fs::File::open(&path).map_err(|e| format!("here-string: {}", e))?;
     let _ = std::fs::remove_file(&path);
     Ok(f)
+}
+
+// `/dev/tcp/HOST/PORT` and `/dev/udp/HOST/PORT`: real bash's own special
+// pseudo-device redirect targets (`exec 3<>/dev/tcp/host/80`, most
+// commonly) -- recognized here rather than treated as real filesystem
+// paths, matching bash itself (these usually don't exist as real files
+// at all, and even on a system where /dev/tcp really is populated by a
+// kernel module, depending on that would be OS-specific in a way this
+// project doesn't want). `None` for anything that isn't exactly this
+// shape, so every caller (open_in/open_out) falls through to an
+// ordinary file open unchanged. No new dependency needed: on Unix, a
+// connected TcpStream/UdpSocket and a plain File are both just thin
+// wrappers around one real OS file descriptor supporting the same
+// read()/write() -- converting one into the other via its raw fd
+// (IntoRawFd/FromRawFd) is exactly what real bash's own C
+// implementation does under the hood too (a real socket fd, dup2'd like
+// any other).
+fn dev_socket_file(path: &str) -> Option<Result<std::fs::File, String>> {
+    let (proto, rest) = path
+        .strip_prefix("/dev/tcp/")
+        .map(|r| ("tcp", r))
+        .or_else(|| path.strip_prefix("/dev/udp/").map(|r| ("udp", r)))?;
+    let (host, port) = rest.split_once('/')?;
+    if host.is_empty() || port.is_empty() {
+        return None;
+    }
+    Some(connect_dev_socket(proto, host, port).map_err(|e| format!("{}: {}", path, e)))
+}
+
+// A builtin's own output redirected onto an arbitrary already-open fd
+// (`>&3`/`2>&4`, most commonly a fd `exec N<>/dev/tcp/...` left open --
+// see push_builtin_output_sink's own `Redirect::FdDup` handling): `fd`
+// itself is owned/managed elsewhere (opened by `exec`'s own persistent
+// redirect, eventually closed by `exec N<&-`/FdClose), so this must not
+// end up closing it once this one builtin call's own sink is popped.
+// `dup()` (unlike `dup2`) always returns a brand-new fd number pointing
+// at the same open file description, safe to wrap in an ordinary File
+// (and let its own Drop close, same as any other Rc<RefCell<File>> this
+// sink already uses) without touching the original at all -- same "dup
+// aside, use the dup, close the dup" idiom save_fd012/restore_fd012
+// already use for a similar reason. `None` on a bad/closed fd (e.g. a
+// typo'd fd number) rather than erroring -- matches this codebase's
+// existing tolerance for a swallowed save/restore failure elsewhere.
+fn dup_existing_fd(fd: i32) -> Option<std::fs::File> {
+    unsafe extern "C" {
+        fn dup(oldfd: i32) -> i32;
+    }
+    let new_fd = unsafe { dup(fd) };
+    if new_fd < 0 {
+        return None;
+    }
+    use std::os::unix::io::FromRawFd;
+    Some(unsafe { std::fs::File::from_raw_fd(new_fd) })
+}
+
+fn connect_dev_socket(proto: &str, host: &str, port: &str) -> std::io::Result<std::fs::File> {
+    use std::os::unix::io::{FromRawFd, IntoRawFd};
+    let addr = format!("{host}:{port}");
+    if proto == "tcp" {
+        let stream = std::net::TcpStream::connect(&addr)?;
+        return Ok(unsafe { std::fs::File::from_raw_fd(stream.into_raw_fd()) });
+    }
+    // UDP's own connect() just records the peer address for subsequent
+    // send()/recv() (no handshake, unlike TCP) -- never blocks on an
+    // unreachable host; a real send is what would fail if nothing's
+    // listening. Bind a wildcard on whichever address family the target
+    // actually resolved to, not a hardcoded IPv4-only "0.0.0.0" -- an
+    // IPv6-only target would otherwise fail to connect for a reason
+    // that has nothing to do with the target itself.
+    use std::net::ToSocketAddrs;
+    let target = addr.to_socket_addrs()?.next().ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "could not resolve host"))?;
+    let bind_addr = if target.is_ipv6() { "[::]:0" } else { "0.0.0.0:0" };
+    let socket = std::net::UdpSocket::bind(bind_addr)?;
+    socket.connect(target)?;
+    Ok(unsafe { std::fs::File::from_raw_fd(socket.into_raw_fd()) })
 }
 
 // Appends an expansion's value `v` to the in-progress word-split state.

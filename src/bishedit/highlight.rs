@@ -718,11 +718,13 @@ fn highlight_tok(
 
         Tok::RedirOut { .. }
         | Tok::RedirIn
+        | Tok::RedirInOut
         | Tok::RedirErr { .. }
         | Tok::RedirBoth { .. }
         | Tok::DupErrToOut
         | Tok::RedirFdOut { .. }
         | Tok::RedirFdIn { .. }
+        | Tok::RedirFdInOut { .. }
         | Tok::RedirFdDup { .. }
         | Tok::RedirDupWord { .. }
         | Tok::RedirFdClose { .. }

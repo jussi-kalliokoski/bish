@@ -9,6 +9,10 @@ pub struct Word {
 #[derive(Debug, Clone)]
 pub enum Redirect {
     In(Word),
+    // `<>`: opens the target for both reading and writing, on fd 0 --
+    // see lexer.rs's own Tok::RedirInOut doc comment for what this is
+    // actually for (almost entirely /dev/tcp/HOST/PORT).
+    InOut(Word),
     Out { word: Word, append: bool },
     Err { word: Word, append: bool },
     Both { word: Word, append: bool },
@@ -21,6 +25,13 @@ pub enum Redirect {
     // a documented, separate gap).
     FdOut { fd: u32, word: Word, append: bool },
     FdIn { fd: u32, word: Word },
+    // `N<>file`: same as InOut above, just on an explicit fd instead of
+    // the implicit 0 -- the far more common real shape in practice
+    // (`exec 3<>/dev/tcp/host/80`, then `>&3`/`<&3` to actually use it),
+    // since a bare, unnumbered `<>` only ever gives you fd 0 back, which
+    // can't be both a request-writer and a response-reader at once in
+    // any useful way without a second fd to reach it by.
+    FdInOut { fd: u32, word: Word },
     FdDup { fd: u32, target: u32 },
     // `[N]>&WORD` / `[N]<&WORD` with a non-literal target (e.g. a variable
     // holding an fd number, like a coproc's array entries) -- word is
@@ -732,6 +743,11 @@ impl Parser {
                     let word = self.expect_word()?;
                     redirects.push(Redirect::In(word));
                 }
+                Some(Tok::RedirInOut) => {
+                    self.advance();
+                    let word = self.expect_word()?;
+                    redirects.push(Redirect::InOut(word));
+                }
                 Some(Tok::RedirErr { append }) => {
                     let append = *append;
                     self.advance();
@@ -759,6 +775,12 @@ impl Parser {
                     self.advance();
                     let word = self.expect_word()?;
                     redirects.push(Redirect::FdIn { fd, word });
+                }
+                Some(Tok::RedirFdInOut { fd }) => {
+                    let fd = *fd;
+                    self.advance();
+                    let word = self.expect_word()?;
+                    redirects.push(Redirect::FdInOut { fd, word });
                 }
                 Some(Tok::RedirFdDup { fd, target }) => {
                     let (fd, target) = (*fd, *target);
@@ -885,6 +907,11 @@ impl Parser {
                     let word = self.expect_word()?;
                     redirects.push(Redirect::In(word));
                 }
+                Some(Tok::RedirInOut) => {
+                    self.advance();
+                    let word = self.expect_word()?;
+                    redirects.push(Redirect::InOut(word));
+                }
                 Some(Tok::RedirErr { append }) => {
                     let append = *append;
                     self.advance();
@@ -912,6 +939,12 @@ impl Parser {
                     self.advance();
                     let word = self.expect_word()?;
                     redirects.push(Redirect::FdIn { fd, word });
+                }
+                Some(Tok::RedirFdInOut { fd }) => {
+                    let fd = *fd;
+                    self.advance();
+                    let word = self.expect_word()?;
+                    redirects.push(Redirect::FdInOut { fd, word });
                 }
                 Some(Tok::RedirFdDup { fd, target }) => {
                     let (fd, target) = (*fd, *target);
