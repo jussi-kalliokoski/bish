@@ -1,12 +1,31 @@
 // Detachable `bish session` support -- the client/server split described
 // in ../bish-detachable-sessions.md and the approved implementation plan
-// (~/.claude/plans/melodic-sauteeing-boot.md). This module owns the
-// pieces that don't need a running daemon to exist or be tested: where a
-// session's socket/pidfile live, the framed wire protocol spoken over
-// that socket, and verifying a connecting peer's real UID before
-// trusting anything it sends. Daemonization, the actual accept loop, and
-// `main.rs`'s `bish session <subcommand>` dispatch land in a follow-up
-// commit once this foundation is in place.
+// (~/.claude/plans/melodic-sauteeing-boot.md). This module owns
+// everything specific to that split: where a session's socket/pidfile
+// live, the framed wire protocol spoken over that socket, verifying a
+// connecting peer's real UID before trusting anything it sends, the
+// daemon bootstrap (SessionBridge, run_daemon), and the client loop
+// (run_client). `main.rs`'s actual `bish session <subcommand>` argv
+// dispatch lands in a follow-up commit -- everything here is already
+// directly callable, just not yet wired to a CLI entry point.
+//
+// The daemon side deliberately does *not* require any changes to
+// repl::run or anything under it: run_daemon gives the daemon its own
+// local pty pair (pty::attach_self_to_pty) and attaches the daemon's
+// own fd 0/1/2 to the slave side, so every existing termios/ioctl/read/
+// write call in this codebase keeps working completely unmodified --
+// as far as repl::run is concerned, it has a real terminal, because it
+// does. SessionBridge is the one new piece: a stateless byte relay
+// between that pty's *master* side (which the daemon keeps) and
+// whichever client socket is currently attached, if any -- no access
+// to Shell/SessionState/any Rc<RefCell> state at all, so it's safe to
+// service from inside the single-threaded on_idle mechanism every
+// blocking loop in repl.rs already calls (service_background_jobs) via
+// service_current_bridge below, without threading a new parameter
+// through the half-dozen-plus functions between here and there. Same
+// "this process is single-threaded, so plain global state describing
+// what the whole process is doing right now is fine" reasoning
+// exec.rs's own bare `static WINCH_FLAG` already relies on.
 //
 // Same zero-external-dependency, hand-roll-it philosophy as the rest of
 // this project: `std::os::unix::net::{UnixListener, UnixStream}` is
@@ -16,14 +35,17 @@
 // new boundary).
 #![allow(dead_code)]
 
-use std::io;
+use std::cell::RefCell;
+use std::io::{self, Read, Write};
 use std::os::unix::io::AsRawFd;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 
 unsafe extern "C" {
     fn getuid() -> u32;
     fn mkdir(path: *const i8, mode: u32) -> i32;
     fn getsockopt(sockfd: i32, level: i32, optname: i32, optval: *mut u8, optlen: *mut u32) -> i32;
+    fn read(fd: i32, buf: *mut u8, count: usize) -> isize;
 }
 
 const SOL_SOCKET: i32 = 1;
@@ -261,6 +283,397 @@ impl Decoder {
         };
         Ok(Some(msg))
     }
+}
+
+// The stateless byte relay between a daemon's own pty master and
+// whichever client socket is currently attached, if any -- see this
+// module's own top doc comment for why draining the pty master must
+// never be skipped, attached or not.
+pub struct SessionBridge {
+    pty_master: std::fs::File,
+    listener: UnixListener,
+    client: Option<UnixStream>,
+    decoder: Decoder,
+    // Set true the moment a connection is accepted (a first attach *or*
+    // a reattach after a prior client detached); consumed once by
+    // take_just_attached below. repl.rs's on_idle hook uses this to
+    // trigger one explicit full repaint (compositor_redraw) right when
+    // a client connects -- repl::run's own compositor otherwise only
+    // ever sends *incremental* diffs (see compositor_diff_tests), which
+    // would leave a freshly-attached client's own blank real terminal
+    // stuck showing nothing until unrelated activity happened to redraw
+    // it. Not needed for the very first attach performed by `session
+    // new` (that one already gets a full paint for free from
+    // start_promoted's own one-time compositor_redraw at startup,
+    // before any client exists to miss it) but harmless to also fire
+    // there -- one extra repaint into a pty nothing was reading from
+    // yet.
+    just_attached: bool,
+}
+
+// Bounds how many chunks get drained per tick before returning control
+// -- same reasoning drive_fg_job's own MAX_READS_PER_TICK already
+// documents: a firehose producer (a job printing in a tight loop) could
+// otherwise keep this side of the bridge busy indefinitely, starving
+// every other on_idle responsibility (job draining, WINCH, the next
+// keystroke) that also needs a turn.
+const MAX_READS_PER_TICK: u32 = 16;
+
+impl SessionBridge {
+    // `pty_master`/`listener` are both set non-blocking here, so
+    // callers don't need to remember to -- there's no correct blocking
+    // use of either from inside `service`.
+    pub fn new(pty_master: std::fs::File, listener: UnixListener) -> io::Result<SessionBridge> {
+        crate::pty::set_nonblocking(pty_master.as_raw_fd());
+        listener.set_nonblocking(true)?;
+        Ok(SessionBridge { pty_master, listener, client: None, decoder: Decoder::new(), just_attached: false })
+    }
+
+    pub fn is_attached(&self) -> bool {
+        self.client.is_some()
+    }
+
+    pub fn take_just_attached(&mut self) -> bool {
+        std::mem::replace(&mut self.just_attached, false)
+    }
+
+    // Called once per on_idle tick (see service_current_bridge below).
+    // Never blocks.
+    pub fn service(&mut self) {
+        if self.client.is_none() {
+            self.try_accept();
+        }
+        self.drain_pty_master();
+        self.drain_client();
+    }
+
+    fn try_accept(&mut self) {
+        match self.listener.accept() {
+            Ok((stream, _addr)) => {
+                // Verified once, at connect time -- see peer_uid's own
+                // doc comment on why this is defense in depth on top of
+                // the socket directory's own 0700 permissions, not a
+                // replacement for them. A mismatched UID (only reachable
+                // at all under a misconfigured/shared runtime directory)
+                // just drops the connection rather than accepting a
+                // second, unauthenticated bridge target.
+                match peer_uid(&stream) {
+                    Ok(uid) if uid == current_uid() => {
+                        let _ = stream.set_nonblocking(true);
+                        self.client = Some(stream);
+                        self.decoder = Decoder::new();
+                        self.just_attached = true;
+                    }
+                    _ => { /* wrong UID or the check itself failed -- drop `stream` */ }
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+            Err(_) => {}
+        }
+    }
+
+    fn drain_pty_master(&mut self) {
+        let mut buf = [0u8; 4096];
+        for _ in 0..MAX_READS_PER_TICK {
+            match self.pty_master.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if let Some(client) = &mut self.client {
+                        let msg = Message::Bytes(buf[..n].to_vec());
+                        if client.write_all(&msg.encode()).is_err() {
+                            self.client = None;
+                        }
+                    }
+                    // No client attached: discard. Draining still has to
+                    // happen either way -- see this module's own top doc
+                    // comment on why an unattended daemon must never
+                    // stop reading its own pty master.
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                Err(_) => break,
+            }
+        }
+    }
+
+    fn drain_client(&mut self) {
+        let Some(client) = &mut self.client else { return };
+        let mut buf = [0u8; 4096];
+        let mut disconnected = false;
+        for _ in 0..MAX_READS_PER_TICK {
+            match client.read(&mut buf) {
+                Ok(0) => {
+                    disconnected = true;
+                    break;
+                }
+                Ok(n) => self.decoder.feed(&buf[..n]),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                Err(_) => {
+                    disconnected = true;
+                    break;
+                }
+            }
+        }
+        if disconnected {
+            self.client = None;
+            return;
+        }
+        loop {
+            match self.decoder.next_message() {
+                Ok(Some(Message::Bytes(payload))) => {
+                    // A write to the pty master's own kernel buffer --
+                    // bounded by that buffer's size, same as any other
+                    // pty write in this codebase (e.g. drive_fg_job
+                    // forwarding a real paste/mouse sequence into a
+                    // job's own pty); not a new risk category.
+                    let _ = self.pty_master.write_all(&payload);
+                }
+                Ok(Some(Message::Resize { rows, cols })) => {
+                    // Resizing via the master fd is what actually
+                    // delivers a real SIGWINCH to the slave's
+                    // controlling-terminal holder (this same daemon
+                    // process, via attach_self_to_pty) -- the existing
+                    // install_winch_handler/take_winch/
+                    // poll_and_apply_resize machinery in exec.rs/repl.rs
+                    // picks this up with zero new code.
+                    let _ = crate::pty::set_size(self.pty_master.as_raw_fd(), rows, cols);
+                }
+                Ok(Some(Message::Handshake { rows, cols, term, colorterm })) => {
+                    let _ = crate::pty::set_size(self.pty_master.as_raw_fd(), rows, cols);
+                    // detect_color_support() (exec.rs) reads these two
+                    // env vars -- setting them here is today's whole
+                    // "capability renegotiation" story (see the
+                    // implementation plan's build-order step 6 for
+                    // per-attach re-application on a *later* reattach;
+                    // this alone already covers the one-client case).
+                    if !term.is_empty() {
+                        unsafe { std::env::set_var("TERM", &term) };
+                    }
+                    if !colorterm.is_empty() {
+                        unsafe { std::env::set_var("COLORTERM", &colorterm) };
+                    }
+                }
+                Ok(Some(Message::Passthrough(_))) => {
+                    // A client never sends this direction in this
+                    // protocol (server -> client only, see Message's own
+                    // doc comment) -- tolerated as a no-op rather than
+                    // treated as malformed, in case that ever changes.
+                }
+                Ok(None) => break,
+                Err(_) => {
+                    self.client = None;
+                    break;
+                }
+            }
+        }
+    }
+}
+
+thread_local! {
+    static ACTIVE_BRIDGE: RefCell<Option<SessionBridge>> = const { RefCell::new(None) };
+}
+
+// Installs `bridge` as this process's current session bridge -- called
+// once by run_daemon, before repl::run starts.
+pub fn install_bridge(bridge: SessionBridge) {
+    ACTIVE_BRIDGE.with(|b| *b.borrow_mut() = Some(bridge));
+}
+
+// The one call service_background_jobs (repl.rs) needs -- a plain no-op
+// when this process isn't running as a session daemon, which is every
+// process except one that reached here via run_daemon below.
+pub fn service_current_bridge() {
+    ACTIVE_BRIDGE.with(|b| {
+        if let Some(bridge) = b.borrow_mut().as_mut() {
+            bridge.service();
+        }
+    });
+}
+
+// True at most once per attach (a first attach or a reattach) -- lets
+// repl.rs's own on_idle hook trigger one explicit full repaint right
+// when a client connects. See SessionBridge::just_attached's own doc
+// comment for why an incremental-diff-only compositor otherwise leaves
+// a freshly (re)attached client's blank real terminal stuck empty.
+pub fn take_bridge_just_attached() -> bool {
+    ACTIVE_BRIDGE.with(|b| b.borrow_mut().as_mut().is_some_and(|bridge| bridge.take_just_attached()))
+}
+
+// Ignores SIGHUP so a detached daemon survives whatever terminal/ssh
+// connection launched `bish session new` going away. setsid() itself
+// already happens inside pty::attach_self_to_pty (a precondition for
+// TIOCSCTTY, not something worth a second, separate call here) --
+// installing this too is cheap, standard defense-in-depth for any
+// window where the daemon is still reachable by a HUP before that takes
+// effect, the same belt-and-suspenders `nohup` itself relies on.
+fn daemonize() {
+    term::ignore_sighup();
+}
+
+use crate::term;
+
+// The daemon bootstrap: binds the session's socket, gives this process
+// its own local pty (see this module's own top doc comment for why),
+// installs the bridge, and hands off into the ordinary, completely
+// unmodified repl::run. Only returns on a genuine startup failure --
+// repl::run itself runs until the interactive shell actually exits.
+pub fn run_daemon(name: &str) -> io::Result<i32> {
+    ensure_socket_dir()?;
+    let sock_path = socket_path(name);
+    // A stale socket file left behind by a no-longer-running daemon of
+    // the same name would otherwise make `bind` fail with AddrInUse --
+    // best-effort removal here; real staleness verification (is
+    // anything actually still listening?) is build-order step 7's
+    // pidfile+flock job, not this one's.
+    let _ = std::fs::remove_file(&sock_path);
+    let listener = UnixListener::bind(&sock_path)?;
+
+    std::fs::write(pidfile_path(name), std::process::id().to_string())?;
+
+    let pty = crate::pty::open()?;
+    let slave_path = pty.slave_path.clone();
+    let bridge = SessionBridge::new(pty.master, listener)?;
+
+    daemonize();
+    crate::pty::attach_self_to_pty(&slave_path)?;
+
+    install_bridge(bridge);
+
+    let shell = crate::exec::Shell::new();
+    crate::repl::run(shell, true);
+    Ok(0)
+}
+
+// The client loop: connects to `name`'s socket, puts the *local* real
+// terminal into raw mode, sends the attach handshake, then relays bytes
+// in both directions until the connection ends or the user detaches.
+// Unlike the daemon side, this has no on_idle-style other work to
+// interleave, so it blocks genuinely indefinitely in PollSet::wait
+// rather than polling on an interval -- there is nothing else for a
+// client to usefully do while idle.
+pub fn run_client(name: &str) -> io::Result<i32> {
+    let sock_path = socket_path(name);
+    let mut stream = UnixStream::connect(&sock_path).map_err(|e| io::Error::new(e.kind(), format!("bish: session '{}' not found ({})", name, e)))?;
+
+    let (rows, cols) = crate::pty::get_size(0).map(|ws| (ws.rows, ws.cols)).unwrap_or((24, 80));
+    let handshake = Message::Handshake { rows, cols, term: std::env::var("TERM").unwrap_or_default(), colorterm: std::env::var("COLORTERM").unwrap_or_default() };
+    stream.write_all(&handshake.encode())?;
+    stream.set_nonblocking(true)?;
+
+    let _raw_guard = term::RawGuard::enable(0).ok();
+
+    // The client's own *local* terminal can be resized at any time
+    // (dragging the window, an ssh client reconnecting at a different
+    // size) -- unlike the daemon side, this process has no other
+    // on_idle-style periodic check to notice it between poll() calls
+    // (it blocks genuinely indefinitely below, on purpose: there is
+    // nothing else for a client to usefully do while idle), so SIGWINCH
+    // needs to wake this loop directly via the self-pipe trick rather
+    // than being polled.
+    let winch_pipe = crate::poll::SelfPipe::new()?;
+    crate::poll::install_sigwinch_wake(winch_pipe.write_fd());
+
+    let mut poll = crate::poll::PollSet::new();
+    poll.add(0);
+    poll.add(stream.as_raw_fd());
+    poll.add(winch_pipe.read_fd());
+
+    let mut decoder = Decoder::new();
+    let mut buf = [0u8; 4096];
+    'relay: loop {
+        let ready = poll.wait(None)?;
+        for fd in ready {
+            if fd == winch_pipe.read_fd() {
+                winch_pipe.drain();
+                if let Ok(ws) = crate::pty::get_size(0) {
+                    let msg = Message::Resize { rows: ws.rows, cols: ws.cols };
+                    if stream.write_all(&msg.encode()).is_err() {
+                        break 'relay;
+                    }
+                }
+            } else if fd == 0 {
+                let n = unsafe { read(0, buf.as_mut_ptr(), buf.len()) };
+                if n <= 0 {
+                    break 'relay;
+                }
+                // Ctrl+Space (0x00), unaccompanied by anything else in
+                // this same read -- consistent with bish's own existing
+                // in-process detach binding (see Frame's own doc comment
+                // in repl.rs), reused here for the same underlying
+                // concept rather than inventing a second one. A real
+                // multi-byte paste that happens to start with a NUL is
+                // vanishingly unlikely and not specially guarded against
+                // here, same tradeoff editor.rs's own single-byte
+                // control-key decoding already accepts elsewhere.
+                if n == 1 && buf[0] == 0x00 {
+                    break 'relay;
+                }
+                let msg = Message::Bytes(buf[..n as usize].to_vec());
+                if stream.write_all(&msg.encode()).is_err() {
+                    break 'relay;
+                }
+            } else {
+                let mut got_eof = false;
+                loop {
+                    match stream.read(&mut buf) {
+                        Ok(0) => {
+                            got_eof = true;
+                            break;
+                        }
+                        Ok(n) => decoder.feed(&buf[..n]),
+                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                        Err(_) => {
+                            got_eof = true;
+                            break;
+                        }
+                    }
+                }
+                loop {
+                    match decoder.next_message() {
+                        Ok(Some(Message::Bytes(payload))) => {
+                            let mut out = io::stdout();
+                            let _ = out.write_all(&payload);
+                            let _ = out.flush();
+                        }
+                        Ok(Some(_)) => {}
+                        Ok(None) => break,
+                        Err(_) => {
+                            got_eof = true;
+                            break;
+                        }
+                    }
+                }
+                if got_eof {
+                    break 'relay;
+                }
+            }
+        }
+    }
+    drop(_raw_guard);
+    println!("\r\n[detached from session '{}']", name);
+    Ok(0)
+}
+
+// `bish session new <name>`: spawns the daemon (a detached child
+// re-exec'ing this same binary in `--daemon` mode) and, once its socket
+// is up, attaches to it as the first client -- both in one command,
+// matching plain `tmux`'s own UX (see the implementation plan's
+// decision 1) rather than tmux's `-d`.
+pub fn run_new(name: &str) -> io::Result<i32> {
+    let exe = std::env::current_exe()?;
+    std::process::Command::new(exe).args(["session", "--daemon", name]).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn()?;
+
+    let sock_path = socket_path(name);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    loop {
+        if UnixStream::connect(&sock_path).is_ok() {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(io::Error::new(io::ErrorKind::TimedOut, format!("bish: session '{}' did not start in time", name)));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    run_client(name)
 }
 
 #[cfg(test)]

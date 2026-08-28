@@ -23,6 +23,7 @@ use crate::lexer::Lexer;
 use crate::parser::{AndOr, Command, Parser, Pipeline, Program};
 use crate::prompt;
 use crate::pty;
+use crate::session;
 use crate::term;
 use crate::vt100;
 
@@ -3217,6 +3218,21 @@ fn service_background_jobs(
     sinks_are_grid: bool,
 ) {
     use std::io::Read;
+
+    // A plain no-op unless this process is running as a `bish session`
+    // daemon (session::install_bridge was called) -- see session.rs's
+    // own module doc comment for why this one call, here, is the whole
+    // wiring needed rather than a new parameter threaded through every
+    // caller between here and repl::run.
+    session::service_current_bridge();
+    // A client just (re)connected -- force one full repaint (not the
+    // ordinary incremental diff) so its own blank real terminal starts
+    // correctly caught up, rather than staying empty until unrelated
+    // activity happens to redraw something. See take_bridge_just_
+    // attached's own doc comment.
+    if session::take_bridge_just_attached() && sinks_are_grid {
+        compositor_redraw(sessions, windows, skip_window, *term_rows, *term_cols);
+    }
 
     poll_and_apply_resize(&*sessions, &*windows, job_frames, term_rows, term_cols, sinks_are_grid, skip_window);
 

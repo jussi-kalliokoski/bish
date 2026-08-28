@@ -40,6 +40,39 @@ fn main() {
         std::process::exit(tool::run(&args[2..]));
     }
 
+    // `bish session <subcommand>` -- detachable sessions (see
+    // ../bish-detachable-sessions.md and
+    // ~/.claude/plans/melodic-sauteeing-boot.md). Same "checked ahead of
+    // the generic script-path branch" treatment as `tool` above, since
+    // `session` isn't a script name either. `--daemon <name>` is an
+    // internal bootstrap mode (`session::run_new` re-execs this same
+    // binary with it) -- not documented as user-facing here for that
+    // reason, though nothing stops a user from invoking it directly.
+    if args.get(1).map(String::as_str) == Some("session") {
+        let code = match args.get(2).map(String::as_str) {
+            Some("new") => match args.get(3) {
+                Some(name) => session::run_new(name),
+                None => Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "usage: bish session new <name>")),
+            },
+            Some("attach") => match args.get(3) {
+                Some(name) => session::run_client(name),
+                None => Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "usage: bish session attach <name>")),
+            },
+            Some("--daemon") => match args.get(3) {
+                Some(name) => session::run_daemon(name),
+                None => Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "usage: bish session --daemon <name>")),
+            },
+            _ => Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "usage: bish session {new|attach} <name>")),
+        };
+        match code {
+            Ok(c) => std::process::exit(c),
+            Err(e) => {
+                eprintln!("{}", e);
+                std::process::exit(1);
+            }
+        }
+    }
+
     // `bish --promoted`: starts the interactive REPL already promoted into
     // the windowed compositor (see repl::run's own doc comment on this
     // param) instead of waiting for the first window-family command/

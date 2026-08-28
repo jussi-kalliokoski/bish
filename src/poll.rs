@@ -175,6 +175,38 @@ pub fn wake_from_signal_handler(fd: RawFd) {
     }
 }
 
+const SIGWINCH: i32 = 28;
+static SIGWINCH_WAKE_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+unsafe extern "C" {
+    fn signal(signum: i32, handler: usize) -> usize;
+}
+
+extern "C" fn sigwinch_wake_handler(_sig: i32) {
+    let fd = SIGWINCH_WAKE_FD.load(std::sync::atomic::Ordering::SeqCst);
+    if fd >= 0 {
+        wake_from_signal_handler(fd);
+    }
+}
+
+// Installs a SIGWINCH handler that wakes `write_fd` (a SelfPipe's own
+// write_fd) directly, instead of setting a flag polled once per
+// iteration -- for a process with no other on_idle-style periodic check
+// to notice a resize between `PollSet::wait` calls (session.rs's own
+// client loop: it has nothing else to interleave, so it blocks
+// genuinely indefinitely, unlike repl::run's own exec::
+// install_winch_handler/take_winch, a different flag-based mechanism
+// for a different caller -- deliberately not reused here to avoid this
+// module depending on exec.rs for one signal number). Only one
+// installation is meaningful at a time per process, which is all any
+// current caller needs.
+pub fn install_sigwinch_wake(write_fd: RawFd) {
+    SIGWINCH_WAKE_FD.store(write_fd, std::sync::atomic::Ordering::SeqCst);
+    unsafe {
+        signal(SIGWINCH, sigwinch_wake_handler as *const () as usize);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -108,6 +108,37 @@ pub fn open() -> io::Result<Pty> {
     }
 }
 
+// Shared by spawn_attached's pre_exec closure below (a freshly forked
+// child attaching to a job's pty) and attach_self_to_pty (this same,
+// already-running process attaching *itself* to its own freshly-opened
+// pty pair, for a `bish session` daemon -- see that function's own doc
+// comment): setsid() to leave whatever session/process group is current
+// (a precondition for TIOCSCTTY to actually take), open the slave
+// fresh, make it the controlling terminal, dup2 onto 0/1/2.
+fn attach_current_process_to_pty_slave(slave_path: &CString) -> io::Result<()> {
+    unsafe {
+        if setsid() < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let slave_fd = c_open(slave_path.as_ptr(), O_RDWR, 0);
+        if slave_fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if ioctl(slave_fd, TIOCSCTTY, 0) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        for target in 0..3 {
+            if dup2(slave_fd, target) < 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        if slave_fd > 2 {
+            close(slave_fd);
+        }
+    }
+    Ok(())
+}
+
 // Spawns `cmd` with its stdin/stdout/stderr replaced by a freshly-opened
 // slave fd for `slave_path`, made its controlling terminal. Mirrors what a
 // real terminal emulator's shell-spawning does: setsid() to leave bish's
@@ -129,28 +160,27 @@ pub fn spawn_attached(mut cmd: Command, slave_path: &str) -> io::Result<Child> {
             // a forwarded Ctrl-C, even though the pty's line discipline
             // correctly raises the signal.
             signal(SIGINT, SIG_DFL);
-            if setsid() < 0 {
-                return Err(io::Error::last_os_error());
-            }
-            let slave_fd = c_open(path.as_ptr(), O_RDWR, 0);
-            if slave_fd < 0 {
-                return Err(io::Error::last_os_error());
-            }
-            if ioctl(slave_fd, TIOCSCTTY, 0) != 0 {
-                return Err(io::Error::last_os_error());
-            }
-            for target in 0..3 {
-                if dup2(slave_fd, target) < 0 {
-                    return Err(io::Error::last_os_error());
-                }
-            }
-            if slave_fd > 2 {
-                close(slave_fd);
-            }
-            Ok(())
+            attach_current_process_to_pty_slave(&path)
         });
     }
     cmd.spawn()
+}
+
+// Makes `slave_path` *this same, already-running* process's own
+// controlling terminal -- unlike spawn_attached above, there's no fork
+// here at all. Used by session.rs's daemon bootstrap to give a detached
+// `bish session` a real local pty of its own (fd 0/1/2 become the slave
+// side) so every part of this codebase that already assumes a real
+// terminal on those fds (RawGuard's raw mode, get_size/TIOCGWINSZ,
+// read_line's own raw reads) keeps working completely unmodified --
+// `repl::run` itself needs zero changes to run under a session daemon.
+// The daemon keeps `Pty::master` itself (see `Pty::open`'s own doc
+// comment on why only the path, not an fd, is kept for the slave side)
+// to bridge raw bytes against its attached client's socket; see
+// session.rs's SessionBridge for that half.
+pub fn attach_self_to_pty(slave_path: &str) -> io::Result<()> {
+    let path = CString::new(slave_path).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+    attach_current_process_to_pty_slave(&path)
 }
 
 pub fn get_size(fd: RawFd) -> io::Result<Winsize> {
