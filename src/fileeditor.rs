@@ -908,6 +908,22 @@ pub(crate) fn run_insert_mode(
                 buf.set_cursor(row, (col + 1).min(buf.line_len(row)));
                 cursors[0] = buf.cursor();
             }
+            // Alt-Left/Alt-Right: real vim's own `b`/`w` word motions,
+            // available in Insert mode too (not just Normal) -- the
+            // conventional word-navigation binding most editors give
+            // these two keys. `editor::read_line`'s own Alt-Left/Right
+            // (the plain shell prompt) keeps its separate, pre-existing
+            // meaning -- directory history browsing, only at an empty
+            // buffer -- unrelated to this buffer-editing context and
+            // deliberately left alone.
+            Key::AltLeft => {
+                motion::apply_motion(buf, motion::Motion::WordBackward, None);
+                cursors[0] = buf.cursor();
+            }
+            Key::AltRight => {
+                motion::apply_motion(buf, motion::Motion::WordForward, None);
+                cursors[0] = buf.cursor();
+            }
             Key::Up => {
                 motion::apply_motion(buf, motion::Motion::Up, None);
                 cursors[0] = buf.cursor();
@@ -2427,6 +2443,72 @@ mod insert_mode_ctrl_w_tests {
         run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut || false, false, 24, 80, None, &[]).unwrap();
 
         assert_eq!(line(&buf, 0), "x");
+    }
+}
+
+// Alt-Left/Alt-Right in Insert mode: real vim's own `b`/`w` word
+// motions, previously unhandled (silently fell through the same
+// catch-all `_ => {}` Ctrl-W did -- see this module's own commit
+// history) -- moves the cursor only, never deletes anything.
+#[cfg(test)]
+mod insert_mode_alt_word_motion_tests {
+    use super::*;
+
+    fn rect() -> Rect {
+        Rect { row: 0, col: 0, rows: 24, cols: 80 }
+    }
+
+    fn scripted(vk: &mut VimKeys, keys: &[Key]) {
+        vk.start_recording('a');
+        for &k in keys {
+            vk.record_key(k);
+        }
+        vk.stop_recording();
+        assert!(vk.queue_macro_replay('a', 1));
+    }
+
+    #[test]
+    fn alt_left_moves_the_cursor_back_a_word_without_deleting() {
+        let mut buf = TextBuffer::new_unnamed(10);
+        buf.insert_text((0, 0), "hello world");
+        buf.set_cursor(0, buf.line_len(0));
+        let mut vk = VimKeys::new();
+        let mut registers = Registers::new_for_test();
+        scripted(&mut vk, &[Key::AltLeft, Key::Escape]);
+
+        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut || false, false, 24, 80, None, &[]).unwrap();
+
+        assert_eq!(buf.line_chars(0).into_iter().collect::<String>(), "hello world", "nothing should be deleted");
+        assert_eq!(buf.cursor(), (0, 6), "cursor should land at the start of 'world', matching vim's own `b`");
+    }
+
+    #[test]
+    fn alt_right_moves_the_cursor_forward_a_word_without_deleting() {
+        let mut buf = TextBuffer::new_unnamed(10);
+        buf.insert_text((0, 0), "hello world");
+        buf.set_cursor(0, 0);
+        let mut vk = VimKeys::new();
+        let mut registers = Registers::new_for_test();
+        scripted(&mut vk, &[Key::AltRight, Key::Escape]);
+
+        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut || false, false, 24, 80, None, &[]).unwrap();
+
+        assert_eq!(buf.line_chars(0).into_iter().collect::<String>(), "hello world", "nothing should be deleted");
+        assert_eq!(buf.cursor(), (0, 6), "cursor should land at the start of 'world', matching vim's own `w`");
+    }
+
+    #[test]
+    fn alt_left_then_typing_inserts_at_the_new_word_start() {
+        let mut buf = TextBuffer::new_unnamed(10);
+        buf.insert_text((0, 0), "hello world");
+        buf.set_cursor(0, buf.line_len(0));
+        let mut vk = VimKeys::new();
+        let mut registers = Registers::new_for_test();
+        scripted(&mut vk, &[Key::AltLeft, Key::Char('X'), Key::Escape]);
+
+        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut || false, false, 24, 80, None, &[]).unwrap();
+
+        assert_eq!(buf.line_chars(0).into_iter().collect::<String>(), "hello Xworld");
     }
 }
 

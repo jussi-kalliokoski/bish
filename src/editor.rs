@@ -1531,22 +1531,30 @@ pub fn read_line(
             // they were in the middle of typing. Directory navigation
             // is a "instead of typing a command" action, not something
             // that makes sense mid-line anyway.
+            //
+            // No `\r\n` before returning (used to print one, moving to a
+            // fresh line every time) -- the caller (repl.rs) updates the
+            // session's cwd and loops back into a brand new `read_line`
+            // call with a freshly recomputed prompt string, and that
+            // call's own very first paint already goes through the same
+            // clear-and-redraw `redraw_with_completion_row` every
+            // keystroke uses (see its own call site's doc comment: "the
+            // terminal cursor at this point may already be sitting right
+            // after a ... prompt for this exact pane"). Printing a
+            // newline here defeated that -- it left the cursor one row
+            // below where the redraw would land, so instead of updating
+            // the prompt in place, every Alt-Left/Right/Up push a new,
+            // separate prompt line onto the screen instead.
             Key::AltLeft if ed.buf.is_empty() => {
                 drop(guard.take());
-                print!("\r\n");
-                io::stdout().flush()?;
                 return Ok(ReadOutcome::DirNav(DirNav::Back));
             }
             Key::AltRight if ed.buf.is_empty() => {
                 drop(guard.take());
-                print!("\r\n");
-                io::stdout().flush()?;
                 return Ok(ReadOutcome::DirNav(DirNav::Forward));
             }
             Key::AltUp if ed.buf.is_empty() => {
                 drop(guard.take());
-                print!("\r\n");
-                io::stdout().flush()?;
                 return Ok(ReadOutcome::DirNav(DirNav::Up));
             }
             // No trailing "\r\n" here, unlike DirNav above: entering
