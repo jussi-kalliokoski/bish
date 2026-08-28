@@ -21,6 +21,7 @@ mod pty;
 mod regex;
 mod repl;
 mod serialize;
+mod session;
 mod term;
 mod tool;
 mod vt100;

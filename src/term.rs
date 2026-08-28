@@ -51,6 +51,12 @@ unsafe extern "C" {
 // Linux signal numbers (stable/standard across architectures -- safe to
 // hardcode rather than pulling in exec.rs's trap-oriented signal tables).
 pub const SIGINT: i32 = 2;
+// Not yet called from anywhere -- session.rs's own daemonize (a
+// follow-up commit, once there's an actual accept loop to daemonize
+// into) is the first real caller. Same "land the seam, wire it in
+// later" pattern pty.rs's own module doc comment already names.
+#[allow(dead_code)]
+pub const SIGHUP: i32 = 1;
 pub const SIGTSTP: i32 = 20;
 pub const SIGTTIN: i32 = 21;
 pub const SIGTTOU: i32 = 22;
@@ -73,6 +79,23 @@ unsafe extern "C" {
 pub fn ignore_sigint() {
     unsafe {
         signal(SIGINT, SIG_IGN);
+    }
+}
+
+// A detached `bish session` daemon must survive the terminal that
+// launched it going away -- closing a real terminal, or the ssh
+// connection that started `bish session new` dropping, sends SIGHUP to
+// whatever's still in its foreground process group. `session::
+// daemonize` already leaves that process group behind via `setsid()`
+// before this matters in practice, but installing this too is cheap,
+// standard defense-in-depth (the same belt-and-suspenders `nohup`
+// itself relies on) against any window where the daemon is still
+// reachable by a HUP before its own setsid() has taken effect. Same
+// inherited-across-fork/exec caveat as ignore_sigint above.
+#[allow(dead_code)]
+pub fn ignore_sighup() {
+    unsafe {
+        signal(SIGHUP, SIG_IGN);
     }
 }
 
