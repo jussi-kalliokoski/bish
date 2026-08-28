@@ -3250,6 +3250,20 @@ fn service_background_jobs(
     if just_attached && sinks_are_grid {
         compositor_redraw(sessions, windows, skip_window, *term_rows, *term_cols);
     }
+    // The new client's own TERM/COLORTERM -- applied to *every*
+    // session's own remembered environment (Shell::
+    // set_terminal_capability_env), not just the currently-focused one:
+    // there's only one real attached client for the whole daemon, so a
+    // window that isn't focused right now still needs to see the
+    // update whenever it's focused later. Applying this directly via
+    // `std::env::set_var` here wouldn't stick -- see that method's own
+    // doc comment for why it has to go through each session's env_
+    // snapshot instead.
+    if let Some((term, colorterm)) = session::take_pending_capability() {
+        for session in sessions.values_mut() {
+            session.shell.set_terminal_capability_env(&term, &colorterm);
+        }
+    }
 
     poll_and_apply_resize(&*sessions, &*windows, job_frames, term_rows, term_cols, sinks_are_grid, skip_window);
 

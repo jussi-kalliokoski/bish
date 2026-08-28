@@ -416,6 +416,17 @@ pub struct SessionBridge {
     // there -- one extra repaint into a pty nothing was reading from
     // yet.
     just_attached: bool,
+    // The most recently received Handshake's own term/colorterm,
+    // consumed once by take_pending_capability below. Deliberately
+    // *not* applied directly here via `std::env::set_var` -- this
+    // bridge has no access to (and shouldn't reach into) any `Shell`'s
+    // own state, and a raw env var write would be silently undone the
+    // next time any session runs a command anyway (see exec.rs's
+    // `sync_real_state_in`/`set_terminal_capability_env`'s own doc
+    // comments for why). repl.rs's on_idle hook is what actually
+    // applies this, to every session's own remembered environment, at
+    // the same moment it notices `just_attached`.
+    pending_capability: Option<(String, String)>,
 }
 
 // Bounds how many chunks get drained per tick before returning control
@@ -472,7 +483,7 @@ impl SessionBridge {
         let client_write = Arc::new(Mutex::new(None));
         let client_write_for_thread = client_write.clone();
         std::thread::spawn(move || drain_pty_master_thread(pty_master_read, client_write_for_thread));
-        Ok(SessionBridge { listener, client_read: None, client_write, pty_master, decoder: Decoder::new(), just_attached: false })
+        Ok(SessionBridge { listener, client_read: None, client_write, pty_master, decoder: Decoder::new(), just_attached: false, pending_capability: None })
     }
 
     pub fn is_attached(&self) -> bool {
@@ -481,6 +492,10 @@ impl SessionBridge {
 
     pub fn take_just_attached(&mut self) -> bool {
         std::mem::replace(&mut self.just_attached, false)
+    }
+
+    pub fn take_pending_capability(&mut self) -> Option<(String, String)> {
+        self.pending_capability.take()
     }
 
     // Called once per on_idle tick (see service_current_bridge below).
@@ -580,18 +595,17 @@ impl SessionBridge {
                 }
                 Ok(Some(Message::Handshake { rows, cols, term, colorterm })) => {
                     let _ = crate::pty::set_size(self.pty_master.as_raw_fd(), rows, cols);
-                    // detect_color_support() (exec.rs) reads these two
-                    // env vars -- setting them here is today's whole
-                    // "capability renegotiation" story (see the
-                    // implementation plan's build-order step 6 for
-                    // per-attach re-application on a *later* reattach;
-                    // this alone already covers the one-client case).
-                    if !term.is_empty() {
-                        unsafe { std::env::set_var("TERM", &term) };
-                    }
-                    if !colorterm.is_empty() {
-                        unsafe { std::env::set_var("COLORTERM", &colorterm) };
-                    }
+                    // Stashed for repl.rs to apply to every session's
+                    // own remembered environment (Shell::
+                    // set_terminal_capability_env) -- not set directly
+                    // here. See this struct's own `pending_capability`
+                    // field doc comment for why a raw `std::env::
+                    // set_var` from inside this bridge doesn't actually
+                    // stick (confirmed the hard way: it worked for
+                    // exactly one moment, then exec.rs's own
+                    // sync_real_state_in silently undid it the next
+                    // time any session ran a command).
+                    self.pending_capability = Some((term, colorterm));
                 }
                 Ok(Some(Message::Passthrough(_))) => {
                     // A client never sends this direction in this
@@ -637,6 +651,14 @@ pub fn service_current_bridge() {
 // a freshly (re)attached client's blank real terminal stuck empty.
 pub fn take_bridge_just_attached() -> bool {
     ACTIVE_BRIDGE.with(|b| b.borrow_mut().as_mut().is_some_and(|bridge| bridge.take_just_attached()))
+}
+
+// The most recently attached client's own (term, colorterm), if any
+// arrived and hasn't been consumed yet -- see SessionBridge's own
+// `pending_capability` field doc comment for why applying this is
+// repl.rs's job, not this bridge's.
+pub fn take_pending_capability() -> Option<(String, String)> {
+    ACTIVE_BRIDGE.with(|b| b.borrow_mut().as_mut().and_then(|bridge| bridge.take_pending_capability()))
 }
 
 // Ignores SIGHUP so a detached daemon survives whatever terminal/ssh

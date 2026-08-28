@@ -7423,6 +7423,35 @@ impl Shell {
         self.umask_snapshot = current_umask();
     }
 
+    // Updates this session's own remembered `TERM`/`COLORTERM` --
+    // needed because a plain `std::env::set_var` from outside this
+    // session's own state (e.g. session.rs's own bridge, reacting to a
+    // `bish session` client's attach handshake) would otherwise be
+    // silently undone the very next time this session runs anything at
+    // all: `sync_real_state_in` unconditionally reapplies `env_snapshot`
+    // -- captured before that external change ever happened -- onto the
+    // real environment first thing every `run_program` call. This is
+    // the one correct way to change a session's env from outside it.
+    // `term` empty is treated as "leave TERM alone" (every real
+    // terminal sets it; an empty value here almost certainly means the
+    // client's own environment just didn't have it set, not a genuine
+    // request to unset bish's own already-known-good value).
+    // `colorterm` empty *does* unset it, matching real bash's own
+    // convention (COLORTERM is either unset or a real, nonempty value)
+    // -- deliberately asymmetric with `term`, since a reattach from a
+    // truecolor terminal to a plain one needs the stale truecolor
+    // capability to actually go away, not linger.
+    pub fn set_terminal_capability_env(&mut self, term: &str, colorterm: &str) {
+        if !term.is_empty() {
+            self.env_snapshot.insert("TERM".to_string(), term.to_string());
+        }
+        if colorterm.is_empty() {
+            self.env_snapshot.remove("COLORTERM");
+        } else {
+            self.env_snapshot.insert("COLORTERM".to_string(), colorterm.to_string());
+        }
+    }
+
     // `set -u`: only a *bare* $VAR/${VAR} reference to a truly-unset name
     // triggers this -- ${VAR:-default}/${VAR-default}/${VAR?msg} etc are
     // explicitly exempt in bash (checking for unset is their whole point),
