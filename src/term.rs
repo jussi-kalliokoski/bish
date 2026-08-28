@@ -325,25 +325,14 @@ impl Drop for NoEchoGuard {
     }
 }
 
-#[repr(C)]
-struct PollFd {
-    fd: i32,
-    events: i16,
-    revents: i16,
-}
-const POLLIN: i16 = 0x0001;
-
-unsafe extern "C" {
-    fn poll(fds: *mut PollFd, nfds: u64, timeout: i32) -> i32;
-}
-
 // True if a byte is available on stdin within timeout_ms. Used to tell a
 // standalone Esc keypress (nothing follows) apart from the start of a
 // terminal escape sequence (whose bytes arrive back-to-back) without
-// blocking forever on the ambiguous case.
+// blocking forever on the ambiguous case. The actual poll(2) FFI lives
+// in poll.rs (shared with the main event loop) -- this is just the
+// fixed-to-stdin convenience wrapper that predates that module.
 pub fn stdin_ready(timeout_ms: i32) -> bool {
-    let mut pfd = PollFd { fd: 0, events: POLLIN, revents: 0 };
-    unsafe { poll(&mut pfd, 1, timeout_ms) > 0 && (pfd.revents & POLLIN) != 0 }
+    crate::poll::poll_one(0, timeout_ms)
 }
 
 unsafe extern "C" {

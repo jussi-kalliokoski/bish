@@ -15,6 +15,7 @@ mod history;
 mod json;
 mod lexer;
 mod parser;
+mod poll;
 mod prompt;
 mod pty;
 mod regex;
