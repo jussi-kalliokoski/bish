@@ -251,7 +251,62 @@ impl RegisterBackend for ClipboardBackend {
                 let _ = child.wait();
             }
         }
+        write_osc52(&merged.text);
     }
+}
+
+// OSC 52 (`\x1b]52;c;<base64>\x07`): asks the real terminal itself to
+// set the system clipboard, working even over plain SSH with nothing
+// installed on the remote end -- xclip/wl-copy/pbcopy above all affect
+// whatever machine bish is actually running *on*, which over SSH is
+// the wrong one; the terminal emulator itself is always running on the
+// user's own machine regardless. Write-only by convention: OSC 52's own
+// paste-back query form (`\x1b]52;c;?\x07`) is disabled by default in
+// most terminal emulators for security reasons (letting any program
+// silently read the system clipboard is a real information leak), so
+// this is never used for `read` -- ClipboardBackend::read keeps relying
+// on a local tool for that, unchanged. Emitted *in addition to*
+// whatever local tool exists above, not instead of it: a local tool is
+// the more reliable path when bish is running directly on the user's
+// own machine (no dependency on the terminal emulator supporting OSC
+// 52 at all), OSC 52 is what actually works when it's running
+// remotely -- doing both costs nothing and covers both cases without
+// needing to guess which one applies. No-op when stdout isn't a real
+// terminal at all (a pipe/file, or a test) -- writing a raw escape
+// sequence into redirected output would just be noise, not a clipboard
+// update.
+fn write_osc52(text: &str) {
+    if !stdout_is_tty() {
+        return;
+    }
+    print!("\x1b]52;c;{}\x07", base64_encode(text.as_bytes()));
+    let _ = std::io::stdout().flush();
+}
+
+fn stdout_is_tty() -> bool {
+    unsafe extern "C" {
+        fn isatty(fd: i32) -> i32;
+    }
+    unsafe { isatty(1) != 0 }
+}
+
+const BASE64_ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+// Hand-rolled, no external crate -- same spirit as glob.rs/regex.rs.
+// Standard alphabet, `=`-padded; only ever needs to encode (OSC 52 is
+// write-only here, see write_osc52's own doc comment), so no decoder.
+fn base64_encode(data: &[u8]) -> String {
+    let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = chunk.get(1).copied();
+        let b2 = chunk.get(2).copied();
+        out.push(BASE64_ALPHABET[(b0 >> 2) as usize] as char);
+        out.push(BASE64_ALPHABET[(((b0 & 0x03) << 4) | (b1.unwrap_or(0) >> 4)) as usize] as char);
+        out.push(if let Some(b1) = b1 { BASE64_ALPHABET[(((b1 & 0x0f) << 2) | (b2.unwrap_or(0) >> 6)) as usize] as char } else { '=' });
+        out.push(if let Some(b2) = b2 { BASE64_ALPHABET[(b2 & 0x3f) as usize] as char } else { '=' });
+    }
+    out
 }
 
 /// The whole-shell register table -- one instance, shared globally across
@@ -584,5 +639,18 @@ mod tests {
     fn command_exists_finds_a_real_binary_and_rejects_a_fake_one() {
         assert!(command_exists("ls"));
         assert!(!command_exists("this-command-does-not-exist-anywhere-xyz"));
+    }
+
+    // Checked against well-known base64 test vectors (RFC 4648's own
+    // examples), covering all three padding cases (0/1/2 `=`).
+    #[test]
+    fn base64_encode_matches_known_vectors() {
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode(b"foob"), "Zm9vYg==");
+        assert_eq!(base64_encode(b"fooba"), "Zm9vYmE=");
+        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
     }
 }
