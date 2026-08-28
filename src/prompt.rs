@@ -1,11 +1,13 @@
-// Default interactive prompt: "user@host:path_abbr<terminator> " (no
-// space before the terminator, matching classic `\u@\h:\w\$ ` PS1
+// Default interactive prompt: "user@host:path_abbr (branch)<terminator> "
+// (no space before the terminator, matching classic `\u@\h:\w\$ ` PS1
 // style), where path_abbr abbreviates parent path components to their
 // first character, spelling out only the final one (e.g. "~/D/P/bish"),
-// and the terminator glyph is "$" for a normal user or "#" for root. No
-// git-branch segment yet -- there's no git integration in bish at all so
-// far. Command mode (see command_mode_prompt) uses a deliberately
-// different, minimal prompt rather than a variant of this one.
+// and the terminator glyph is "$" for a normal user or "#" for root. The
+// `(branch)` segment (git::head_status) only appears inside a real git
+// repo, colored green when the tree is clean, yellow-with-a-trailing-`*`
+// when it isn't. Command mode (see command_mode_prompt) uses a
+// deliberately different, minimal prompt rather than a variant of this
+// one.
 
 use crate::exec::{self, Shell};
 
@@ -24,9 +26,22 @@ const ERR_COLOR: &str = "\x1b[1;31m"; // bold red
 // command-mode state reads as "a different mode," not just a recolored
 // version of the normal prompt.
 const CMD_MODE_COLOR: &str = "\x1b[1;35m"; // bold magenta
+const GIT_CLEAN_COLOR: &str = "\x1b[0;32m"; // plain green -- deliberately dimmer than the bold user@host/path segments, secondary info
+const GIT_DIRTY_COLOR: &str = "\x1b[0;33m"; // plain yellow
 
 fn username() -> String {
     std::env::var("USER").or_else(|_| std::env::var("LOGNAME")).unwrap_or_else(|_| "user".to_string())
+}
+
+// `git status`'s branch/dirty segment, or empty outside a repo (or with
+// no `git` on $PATH -- `git::head_status`'s own doc comment covers why
+// those two cases aren't told apart here).
+fn git_segment(cwd: &std::path::Path) -> String {
+    match crate::git::head_status(cwd) {
+        Some(status) if status.dirty => format!(" {GIT_DIRTY_COLOR}({}*){RESET}", status.branch),
+        Some(status) => format!(" {GIT_CLEAN_COLOR}({}){RESET}", status.branch),
+        None => String::new(),
+    }
 }
 
 fn prefix(shell: &Shell, is_root: bool) -> String {
@@ -34,7 +49,7 @@ fn prefix(shell: &Shell, is_root: bool) -> String {
     let display = shorten_path(&shell.cwd.to_string_lossy(), &home);
     let uh_color = if is_root { ROOT_USER_HOST_COLOR } else { USER_HOST_COLOR };
     let path_color = if is_root { ROOT_PATH_COLOR } else { PATH_COLOR };
-    format!("{uh_color}{}@{}{RESET}:{path_color}{display}{RESET}", username(), exec::get_hostname())
+    format!("{uh_color}{}@{}{RESET}:{path_color}{display}{RESET}{}", username(), exec::get_hostname(), git_segment(&shell.cwd))
 }
 
 pub fn render(shell: &Shell) -> String {

@@ -28,6 +28,64 @@ pub fn available() -> bool {
         .is_ok_and(|s| s.success())
 }
 
+// One command prompt's worth of "where does this repo's HEAD point, and
+// is the working tree dirty" (prompt.rs's own git segment). `branch` is
+// the checked-out branch name, or (rare -- detached HEAD) the short
+// commit hash instead, matching what a human glancing at `git status`
+// would call it either way. `dirty` is true iff there's anything beyond
+// a clean `git status` (staged, unstaged, or untracked).
+pub struct HeadStatus {
+    pub branch: String,
+    pub dirty: bool,
+}
+
+// One `git status --porcelain=v2 --branch` call covers both branch name
+// (the `# branch.head` line) and dirty (whether any non-`#` line
+// follows it) at once, rather than two separate git invocations per
+// prompt render -- still a real subprocess spawn on every new prompt
+// line though (prompt::render's own call site), same accepted cost
+// real bash-prompt git plugins (starship, oh-my-zsh's git-prompt, ...)
+// all have; a config knob to disable it, or caching against some
+// "did HEAD/the index change" signal, is a reasonable follow-up if it
+// ever shows up as noticeable latency in practice, not attempted here.
+// `None` covers "git not installed" and "not inside a repo" alike --
+// prompt.rs's own caller treats both the same (no segment shown), so
+// there's no need to tell them apart.
+pub fn head_status(dir: &Path) -> Option<HeadStatus> {
+    let output = Command::new("git").arg("status").arg("--porcelain=v2").arg("--branch").current_dir(dir).stdin(Stdio::null()).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut branch = None;
+    let mut dirty = false;
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("# branch.head ") {
+            // "(detached)" while HEAD isn't on any branch -- fall back to
+            // the short commit hash below instead, same as `git status`
+            // itself would tell a human ("HEAD detached at <sha>").
+            if rest != "(detached)" {
+                branch = Some(rest.to_string());
+            }
+        } else if !line.starts_with('#') {
+            dirty = true;
+        }
+    }
+    let branch = match branch {
+        Some(b) => b,
+        None => short_head(dir)?,
+    };
+    Some(HeadStatus { branch, dirty })
+}
+
+fn short_head(dir: &Path) -> Option<String> {
+    let output = Command::new("git").arg("rev-parse").arg("--short").arg("HEAD").current_dir(dir).stdin(Stdio::null()).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
 // One buffer line's worth of `git blame` info -- deliberately minimal
 // (just enough for a gutter cell, not every field real `git blame`
 // reports): `short_commit` is the first 8 hex digits (matching `git`'s own
