@@ -46,10 +46,16 @@ unsafe extern "C" {
     fn mkdir(path: *const i8, mode: u32) -> i32;
     fn getsockopt(sockfd: i32, level: i32, optname: i32, optval: *mut u8, optlen: *mut u32) -> i32;
     fn read(fd: i32, buf: *mut u8, count: usize) -> isize;
+    fn flock(fd: i32, operation: i32) -> i32;
+    fn kill(pid: i32, sig: i32) -> i32;
 }
 
 const SOL_SOCKET: i32 = 1;
 const SO_PEERCRED: i32 = 17;
+const LOCK_EX: i32 = 2;
+const LOCK_UN: i32 = 8;
+const LOCK_NB: i32 = 4;
+const SIGTERM: i32 = 15;
 
 // Matches glibc's `struct ucred` (Linux x86_64) field for field -- same
 // "hand it straight to the syscall" reasoning term.rs's own Termios
@@ -103,6 +109,58 @@ pub fn socket_path(name: &str) -> PathBuf {
 
 pub fn pidfile_path(name: &str) -> PathBuf {
     socket_dir().join(format!("{}.pid", name))
+}
+
+// Opens (creating if needed) `name`'s pidfile, writes this process's own
+// PID into it, and takes an exclusive, non-blocking `flock` on it. The
+// returned File must simply stay alive for the rest of this process's
+// life -- dropping it releases the lock, which is exactly what tells
+// `is_daemon_alive` this daemon is gone. This is what actually lets
+// `ls`/`kill` tell a live daemon apart from a stale leftover file: the
+// file's own *content* (a PID number) can't do that on its own, since a
+// PID can be reused by an unrelated process after a crash -- see GNU
+// screen's own CVE-2023-24626 history (../bish-detachable-sessions.md's
+// research) for exactly the class of bug that comes from trusting a raw
+// PID number alone. Also doubles as the guard against two concurrent
+// `bish session new` calls for the same name racing each other: the
+// second one's own `flock` attempt fails here, before it ever touches
+// the socket file.
+fn acquire_pidfile_lock(name: &str) -> io::Result<std::fs::File> {
+    let file = std::fs::OpenOptions::new().create(true).write(true).truncate(true).open(pidfile_path(name))?;
+    if unsafe { flock(file.as_raw_fd(), LOCK_EX | LOCK_NB) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    use std::io::Write as _;
+    let mut f = &file;
+    write!(f, "{}", std::process::id())?;
+    Ok(file)
+}
+
+// True if `name`'s pidfile exists and is currently locked by a live
+// daemon -- probes with its own non-blocking exclusive-lock attempt
+// (immediately released either way, win or lose) rather than trusting
+// the file's content, for the same PID-reuse reason
+// acquire_pidfile_lock's own doc comment gives. A missing pidfile
+// (never created, or already cleaned up) is simply "not alive," not an
+// error.
+fn is_daemon_alive(name: &str) -> bool {
+    let file = match std::fs::File::open(pidfile_path(name)) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    if unsafe { flock(file.as_raw_fd(), LOCK_EX | LOCK_NB) } == 0 {
+        // Nobody else was holding it -- stale. Release our own probe
+        // lock immediately; this function only ever answers a question,
+        // it doesn't hold anything.
+        unsafe { flock(file.as_raw_fd(), LOCK_UN) };
+        false
+    } else {
+        true
+    }
+}
+
+fn read_pid(name: &str) -> Option<i32> {
+    std::fs::read_to_string(pidfile_path(name)).ok()?.trim().parse().ok()
 }
 
 // Creates `socket_dir()` (and any missing parent, e.g. a not-yet-existing
@@ -518,16 +576,18 @@ use crate::term;
 // repl::run itself runs until the interactive shell actually exits.
 pub fn run_daemon(name: &str) -> io::Result<i32> {
     ensure_socket_dir()?;
+    // Acquired first, before touching the socket at all: fails fast
+    // (AddrInUse-shaped, but really "a live daemon already owns this
+    // name") if another live daemon -- or a concurrently-racing `bish
+    // session new` for the same name -- already holds it, rather than
+    // silently stomping on a still-running session's own socket file.
+    let pidfile_lock = acquire_pidfile_lock(name)?;
+
     let sock_path = socket_path(name);
-    // A stale socket file left behind by a no-longer-running daemon of
-    // the same name would otherwise make `bind` fail with AddrInUse --
-    // best-effort removal here; real staleness verification (is
-    // anything actually still listening?) is build-order step 7's
-    // pidfile+flock job, not this one's.
+    // Now safe to remove unconditionally: holding the pidfile's own
+    // exclusive lock proves nothing live could still be bound here.
     let _ = std::fs::remove_file(&sock_path);
     let listener = UnixListener::bind(&sock_path)?;
-
-    std::fs::write(pidfile_path(name), std::process::id().to_string())?;
 
     let pty = crate::pty::open()?;
     let slave_path = pty.slave_path.clone();
@@ -540,6 +600,71 @@ pub fn run_daemon(name: &str) -> io::Result<i32> {
 
     let shell = crate::exec::Shell::new();
     crate::repl::run(shell, true);
+    // Not reached in practice (repl::run only returns by way of the
+    // whole process exiting) -- kept so a future change to repl::run's
+    // own exit story doesn't silently drop the pidfile lock early
+    // without a compiler-visible reason to reconsider this.
+    drop(pidfile_lock);
+    Ok(0)
+}
+
+// `bish session ls`: every name in the socket directory whose pidfile
+// is currently locked by a live daemon (see is_daemon_alive) -- a
+// leftover socket/pidfile pair from a daemon that already exited is
+// silently skipped, not listed as if it still existed.
+pub fn run_ls() -> io::Result<i32> {
+    let entries = match std::fs::read_dir(socket_dir()) {
+        Ok(e) => e,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(e),
+    };
+    let mut names: Vec<String> = entries
+        .flatten()
+        .filter_map(|entry| entry.file_name().to_str().and_then(|s| s.strip_suffix(".sock")).map(str::to_string))
+        .collect();
+    names.sort();
+    let mut any = false;
+    for name in names {
+        if is_daemon_alive(&name) {
+            any = true;
+            match read_pid(&name) {
+                Some(pid) => println!("{}\t(pid {})", name, pid),
+                None => println!("{}", name),
+            }
+        }
+    }
+    if !any {
+        println!("no sessions");
+    }
+    Ok(0)
+}
+
+// `bish session kill <name>`: verifies a live daemon actually holds
+// this name (see is_daemon_alive) immediately before signaling it --
+// narrows, though can't fully eliminate, the PID-reuse race any
+// pidfile-based scheme has (the daemon would have to exit *and* have
+// its exact PID reused by something else, both within this function's
+// own brief window) -- see acquire_pidfile_lock's own doc comment for
+// why this is still a meaningfully smaller risk than trusting a raw PID
+// with no liveness check at all. Sends SIGTERM (bish installs no
+// handler for it, so this terminates the daemon immediately) rather
+// than attempting a graceful in-shell shutdown -- matches what
+// tmux/screen's own kill-session already does, not a new tradeoff.
+pub fn run_kill(name: &str) -> io::Result<i32> {
+    if !is_daemon_alive(name) {
+        eprintln!("bish: session '{}' is not running", name);
+        return Ok(1);
+    }
+    let pid = match read_pid(name) {
+        Some(p) => p,
+        None => {
+            eprintln!("bish: session '{}' has no readable pidfile", name);
+            return Ok(1);
+        }
+    };
+    if unsafe { kill(pid, SIGTERM) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
     Ok(0)
 }
 
@@ -681,11 +806,34 @@ mod tests {
     use super::*;
     use std::os::unix::net::UnixStream;
 
-    #[test]
-    fn socket_dir_prefers_xdg_runtime_dir_when_set() {
+    // `XDG_RUNTIME_DIR` is process-wide mutable state, and `cargo test`
+    // runs tests in parallel by default -- every test below that reads
+    // `socket_dir()` (directly, or via any function built on it) needs
+    // to run with *this* env var pinned to a value only it controls for
+    // the duration, or two such tests racing each other will
+    // occasionally observe (and act on) each other's value. Confirmed
+    // this was a real, live flake, not just a hypothetical one, while
+    // adding the pidfile-lock tests below (a fresh `cargo test session::`
+    // run failed exactly this way on the first try). A single shared
+    // mutex, held for the whole body, is the standard fix -- serializes
+    // only these tests relative to each other, the rest of the suite
+    // stays fully parallel.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    // Runs `body` with `XDG_RUNTIME_DIR` set to `dir` (a fresh, isolated
+    // temp path, unique per call via `tag`) for its duration, holding
+    // `ENV_LOCK` throughout and restoring the env var afterward
+    // regardless of how `body` returns. `.unwrap_or_else(|p| p.into_inner())`
+    // recovers from a poisoned lock (an earlier panicking test having
+    // held it) rather than cascading that failure into every later test
+    // that also needs this same lock.
+    fn with_isolated_runtime_dir(tag: &str, body: impl FnOnce(&std::path::Path)) {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let dir = std::env::temp_dir().join(format!("bish-session-test-{}-{}", std::process::id(), tag));
         let saved = std::env::var_os("XDG_RUNTIME_DIR");
-        unsafe { std::env::set_var("XDG_RUNTIME_DIR", "/run/user/1234") };
-        assert_eq!(socket_dir(), PathBuf::from("/run/user/1234/bish"));
+        unsafe { std::env::set_var("XDG_RUNTIME_DIR", &dir) };
+        body(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
         match saved {
             Some(v) => unsafe { std::env::set_var("XDG_RUNTIME_DIR", v) },
             None => unsafe { std::env::remove_var("XDG_RUNTIME_DIR") },
@@ -693,7 +841,15 @@ mod tests {
     }
 
     #[test]
+    fn socket_dir_prefers_xdg_runtime_dir_when_set() {
+        with_isolated_runtime_dir("prefers-xdg", |dir| {
+            assert_eq!(socket_dir(), dir.join("bish"));
+        });
+    }
+
+    #[test]
     fn socket_dir_falls_back_to_tmp_when_xdg_runtime_dir_unset() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let saved = std::env::var_os("XDG_RUNTIME_DIR");
         unsafe { std::env::remove_var("XDG_RUNTIME_DIR") };
         let dir = socket_dir();
@@ -711,45 +867,29 @@ mod tests {
 
     #[test]
     fn socket_path_and_pidfile_path_are_named_consistently() {
-        let saved = std::env::var_os("XDG_RUNTIME_DIR");
-        unsafe { std::env::set_var("XDG_RUNTIME_DIR", "/run/user/1234") };
-        assert_eq!(socket_path("work"), PathBuf::from("/run/user/1234/bish/work.sock"));
-        assert_eq!(pidfile_path("work"), PathBuf::from("/run/user/1234/bish/work.pid"));
-        match saved {
-            Some(v) => unsafe { std::env::set_var("XDG_RUNTIME_DIR", v) },
-            None => unsafe { std::env::remove_var("XDG_RUNTIME_DIR") },
-        }
+        with_isolated_runtime_dir("named-consistently", |dir| {
+            assert_eq!(socket_path("work"), dir.join("bish/work.sock"));
+            assert_eq!(pidfile_path("work"), dir.join("bish/work.pid"));
+        });
     }
 
     #[test]
     fn ensure_socket_dir_creates_it_mode_0700() {
         use std::os::unix::fs::PermissionsExt;
-        let tmp = std::env::temp_dir().join(format!("bish-session-test-{}", std::process::id()));
-        let saved = std::env::var_os("XDG_RUNTIME_DIR");
-        unsafe { std::env::set_var("XDG_RUNTIME_DIR", &tmp) };
-        let dir = ensure_socket_dir().expect("ensure_socket_dir");
-        let mode = std::fs::metadata(&dir).expect("metadata").permissions().mode() & 0o777;
-        let _ = std::fs::remove_dir_all(&tmp);
-        match saved {
-            Some(v) => unsafe { std::env::set_var("XDG_RUNTIME_DIR", v) },
-            None => unsafe { std::env::remove_var("XDG_RUNTIME_DIR") },
-        }
-        assert_eq!(mode, 0o700, "expected the session socket dir to be mode 0700, got {:o}", mode);
+        with_isolated_runtime_dir("mode-0700", |_dir| {
+            let dir = ensure_socket_dir().expect("ensure_socket_dir");
+            let mode = std::fs::metadata(&dir).expect("metadata").permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700, "expected the session socket dir to be mode 0700, got {:o}", mode);
+        });
     }
 
     #[test]
     fn ensure_socket_dir_is_idempotent() {
-        let tmp = std::env::temp_dir().join(format!("bish-session-test-idem-{}", std::process::id()));
-        let saved = std::env::var_os("XDG_RUNTIME_DIR");
-        unsafe { std::env::set_var("XDG_RUNTIME_DIR", &tmp) };
-        ensure_socket_dir().expect("first call");
-        let result = ensure_socket_dir();
-        let _ = std::fs::remove_dir_all(&tmp);
-        match saved {
-            Some(v) => unsafe { std::env::set_var("XDG_RUNTIME_DIR", v) },
-            None => unsafe { std::env::remove_var("XDG_RUNTIME_DIR") },
-        }
-        assert!(result.is_ok(), "calling ensure_socket_dir a second time should succeed, got {:?}", result);
+        with_isolated_runtime_dir("idempotent", |_dir| {
+            ensure_socket_dir().expect("first call");
+            let result = ensure_socket_dir();
+            assert!(result.is_ok(), "calling ensure_socket_dir a second time should succeed, got {:?}", result);
+        });
     }
 
     #[test]
@@ -757,6 +897,51 @@ mod tests {
         let (a, _b) = UnixStream::pair().expect("socketpair");
         let uid = peer_uid(&a).expect("peer_uid");
         assert_eq!(uid, current_uid(), "a socketpair's peer is this same process");
+    }
+
+    #[test]
+    fn acquire_pidfile_lock_writes_this_processs_own_pid() {
+        with_isolated_runtime_dir("acquire", |_dir| {
+            ensure_socket_dir().expect("ensure_socket_dir");
+            let _lock = acquire_pidfile_lock("work").expect("acquire_pidfile_lock");
+            assert_eq!(read_pid("work"), Some(std::process::id() as i32));
+        });
+    }
+
+    #[test]
+    fn a_second_acquire_fails_while_the_first_lock_is_still_held() {
+        with_isolated_runtime_dir("double-acquire", |_dir| {
+            ensure_socket_dir().expect("ensure_socket_dir");
+            let _first = acquire_pidfile_lock("work").expect("first acquire");
+            // flock is associated with the open file *description*, not
+            // the process -- a second, independent open+lock attempt
+            // against the same path genuinely conflicts even though
+            // it's the same process making both calls, which is exactly
+            // what lets this simulate "a second `bish session new work`
+            // while the first is still running" faithfully.
+            let second = acquire_pidfile_lock("work");
+            assert!(second.is_err(), "a second lock attempt should fail while the first is still held");
+        });
+    }
+
+    #[test]
+    fn is_daemon_alive_tracks_whether_the_lock_is_currently_held() {
+        with_isolated_runtime_dir("liveness", |_dir| {
+            ensure_socket_dir().expect("ensure_socket_dir");
+            assert!(!is_daemon_alive("work"), "no pidfile yet -- not alive");
+            let lock = acquire_pidfile_lock("work").expect("acquire");
+            assert!(is_daemon_alive("work"), "lock held -- alive");
+            drop(lock);
+            assert!(!is_daemon_alive("work"), "lock released -- no longer alive, even though the file itself still exists");
+        });
+    }
+
+    #[test]
+    fn is_daemon_alive_is_false_for_a_name_that_was_never_created() {
+        with_isolated_runtime_dir("never-created", |_dir| {
+            ensure_socket_dir().expect("ensure_socket_dir");
+            assert!(!is_daemon_alive("nonexistent"));
+        });
     }
 
     #[test]
