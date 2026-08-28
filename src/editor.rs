@@ -22,6 +22,7 @@ use crate::bishedit::motion;
 use crate::bishedit::registers::{RegisterShape, RegisterValue, Registers};
 use crate::bishedit::suggestion::{SuggestionProvider, SuggestionRequest};
 use crate::bishedit::undo::UndoTree;
+use crate::bishedit::unicode_width::char_width;
 use crate::bishedit::Buffer;
 use crate::bishedit::vimkeys::{self, KeyOutcome, Op, VimKeys};
 use crate::history::History;
@@ -1030,7 +1031,11 @@ fn redraw_with_completion_row(
 // How many terminal columns `s` actually occupies once drawn, not
 // counting invisible escape bytes -- `s` is always one of this crate's
 // own prompt strings, which only ever embed `\x1b[...m` SGR (color)
-// codes, so that's the only escape form this needs to recognize.
+// codes, so that's the only escape form this needs to recognize. Each
+// visible char counts for its own real display width (bishedit::
+// unicode_width::char_width), not a flat 1 -- the cwd embedded in the
+// default prompt is real, user-controlled path text, wide CJK
+// characters/emoji included, not just ASCII.
 // pub(crate): repl.rs's own freeze-with-text helper (Ctrl+Space with
 // in-progress text) reuses this to know how many *visible* columns a
 // colored prompt occupies, so it can position the frozen row's
@@ -1048,7 +1053,7 @@ pub(crate) fn visible_len(s: &str) -> usize {
             }
             continue;
         }
-        len += 1;
+        len += char_width(c);
     }
     len
 }
@@ -1056,7 +1061,12 @@ pub(crate) fn visible_len(s: &str) -> usize {
 // Like visible_len, but returns the prefix of `s` whose *visible*
 // portion is at most `max_visible` columns, preserving any embedded SGR
 // codes encountered along the way (they don't count against the
-// budget) rather than risking a mid-escape-sequence cut.
+// budget) rather than risking a mid-escape-sequence cut. A wide char
+// that would only *partially* fit (`max_visible` has exactly 1 column
+// left, the next char is 2 columns wide) is dropped whole rather than
+// split -- there's no such thing as half a CJK glyph, and this only
+// ever feeds into padding/truncation math that tolerates landing one
+// column short of the budget, never one over it.
 fn truncate_visible(s: &str, max_visible: usize) -> String {
     let mut out = String::new();
     let mut visible = 0;
@@ -1073,11 +1083,12 @@ fn truncate_visible(s: &str, max_visible: usize) -> String {
             }
             continue;
         }
-        if visible >= max_visible {
+        let w = char_width(c);
+        if visible + w > max_visible {
             break;
         }
         out.push(c);
-        visible += 1;
+        visible += w;
     }
     out
 }
@@ -2953,6 +2964,29 @@ mod tests {
         assert_eq!(decode_csi_final("", b'B'), Key::Down);
         assert_eq!(decode_csi_final("", b'C'), Key::Right);
         assert_eq!(decode_csi_final("", b'D'), Key::Left);
+    }
+
+    #[test]
+    fn visible_len_counts_display_width_not_char_count() {
+        assert_eq!(visible_len("abc"), 3);
+        // Embedded SGR codes never count.
+        assert_eq!(visible_len("\x1b[1;32mabc\x1b[0m"), 3);
+        // A wide CJK char counts for 2, not 1.
+        assert_eq!(visible_len("a中b"), 4);
+    }
+
+    #[test]
+    fn truncate_visible_drops_a_wide_char_that_would_only_partially_fit() {
+        // "a" (1) + "中" (2) would need 3 columns; asking for 2 drops the
+        // wide char whole rather than splitting it.
+        assert_eq!(truncate_visible("a中b", 2), "a");
+        assert_eq!(truncate_visible("a中b", 3), "a中");
+        // A leading SGR code is preserved; truncation still stops for
+        // good once the wide char after it wouldn't fit (matching this
+        // function's own pre-existing "stop entirely, don't scan past
+        // the cut" behavior -- a trailing reset code past that point
+        // isn't included either).
+        assert_eq!(truncate_visible("\x1b[1ma中\x1b[0m", 1), "\x1b[1ma");
     }
 
     #[test]

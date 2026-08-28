@@ -15,6 +15,7 @@ pub mod registers;
 pub mod suggestion;
 pub mod textbuffer;
 pub mod undo;
+pub mod unicode_width;
 pub mod vimkeys;
 
 /// The first slice of bish-edit's headless core: read-only line/cursor
