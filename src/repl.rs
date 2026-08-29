@@ -1856,6 +1856,30 @@ fn run_fg_job_frame(
     }
 }
 
+// A pane's editor frames (`Frame::Edit`, `Frame::Hex`) render full-screen
+// over whatever the shell was showing, and freeze that same content into
+// the owning session's own vt100 grid whenever focus moves away -- which
+// would otherwise destroy the scrollback underneath it: the prompt, the
+// `e` command that opened the editor, every command before that.
+//
+// So they do exactly what a real full-screen terminal program does, using
+// the machinery `vt100::Screen` already has for it: switch that grid to
+// its *alternate* buffer on the way in and back on the way out. The
+// primary buffer is left untouched throughout, and `?1049l` restores the
+// cursor to the row the shell was about to draw its next prompt on, so
+// leaving the editor puts the pane back exactly as it was found.
+//
+// Both are idempotent (`Screen::switch_alt_screen` returns early when
+// already in the requested state), which is what lets `enter` be called
+// on every re-focus rather than only on the frame's first one.
+fn enter_alt_screen(screen: &Rc<RefCell<vt100::Screen>>) {
+    screen.borrow_mut().feed(b"\x1b[?1049h");
+}
+
+fn leave_alt_screen(screen: &Rc<RefCell<vt100::Screen>>) {
+    screen.borrow_mut().feed(b"\x1b[?1049l");
+}
+
 // `e --hex`'s own counterpart to run_edit_frame just below -- drives
 // whatever hex session is behind `hex_frame_id`, freshly opened by the
 // pending_edit handling or already sitting in `hex_frames` from an
@@ -1895,6 +1919,9 @@ fn run_hex_frame(
     // run_edit_frame/run_fg_job_frame take theirs out: it leaves the map
     // free for the on_idle closure below to borrow.
     let mut session = hex_frames.remove(&hex_frame_id).expect("Frame::Hex always has a live hex_frames entry");
+    // Same reasoning as run_edit_frame's own call -- see
+    // `enter_alt_screen`.
+    enter_alt_screen(&sessions[&session_id].screen);
     // The shell's one shared register table, moved in for as long as this
     // frame is the one being driven -- see HexSession's own `registers`
     // field doc comment.
@@ -1970,17 +1997,17 @@ fn run_hex_frame(
     session.detach_registers(registers);
     if quit {
         windows[*current_window].stack_mut().pop();
-        // Same cleanup run_edit_frame does on the way out: clear what
-        // this frame last drew into its own session's grid (freeze
-        // always writes pane-relative from row 0, so anything below
-        // would otherwise sit there forever), then erase the colon
-        // line's own last text off the global status row, which no
-        // grid-diffed repaint can reach.
-        sessions.get_mut(&session_id).unwrap().screen.borrow_mut().feed(b"\x1b[2J\x1b[H");
+        // Same cleanup run_edit_frame does on the way out, in the same
+        // order and for the same reasons: back to the primary screen
+        // (which still holds this session's scrollback), then erase the
+        // colon line's own last text off the global status row -- before
+        // the redraw, so the redraw's closing cursor placement is what
+        // the shell prompt draws against.
+        leave_alt_screen(&sessions[&session_id].screen);
+        print!("{}", erase_global_status_row(*term_rows));
         if *sinks_are_grid {
             compositor_redraw(sessions, windows, *current_window, *term_rows, *term_cols);
         }
-        print!("{}", erase_global_status_row(*term_rows));
         let _ = io::stdout().flush();
         return;
     }
@@ -2051,6 +2078,10 @@ fn run_edit_frame(
     // run_fg_job_frame's own reasoning for job_frames exactly, and keeps
     // the two symmetric.
     let session = edit_frames.remove(&edit_frame_id).expect("Frame::Edit always has a live edit_frames entry");
+    // Everything this frame draws (and everything it freezes into the
+    // session's grid on the way out) belongs on the alternate screen, not
+    // on top of the shell's scrollback -- see `enter_alt_screen`.
+    enter_alt_screen(&sessions[&session_id].screen);
     // "%": refreshed here, once, whenever this function starts driving a
     // session -- see fileeditor::set_last_filename's own doc comment for
     // the other place (a successful :w/:wq/:x) it needs the same
@@ -2107,16 +2138,12 @@ fn run_edit_frame(
         match outcome {
             Ok((NavExit::Quit, _)) => {
                 windows[*current_window].stack_mut().pop();
-                // Reverting to a plain shell prompt in this same session
-                // -- clear whatever the editor last drew into its own
-                // screen (freeze_editor_frame always writes pane-relative
-                // from row 0, so any row at or past this editor's own
-                // last rect otherwise just sits there forever: the
-                // shell's own prompt draw, freeze_idle_prompt, only ever
-                // touches its own single line, never the rest of the
-                // grid). Matches how a real terminal full-screen program
-                // (vim, less, ...) leaves the screen on exit.
-                sessions.get_mut(&session_id).unwrap().screen.borrow_mut().feed(b"\x1b[2J\x1b[H");
+                // Back to the primary screen, which still holds this
+                // session's own scrollback -- prompt, the `e` command
+                // that opened this editor, everything before it -- with
+                // the cursor restored to the row the shell was about to
+                // print its next prompt on. See `enter_alt_screen`.
+                leave_alt_screen(&sessions[&session_id].screen);
                 // A file with an open diagnostics pane (`:diag`) below
                 // it -- close that too rather than leaving an orphaned
                 // pane no `Frame::Edit` will ever point at again.
@@ -2135,19 +2162,28 @@ fn run_edit_frame(
                     close_pane(&mut windows[*current_window], debug_pane);
                     close_orphaned_sessions(sessions, windows);
                 }
-                if *sinks_are_grid {
-                    compositor_redraw(sessions, windows, *current_window, *term_rows, *term_cols);
-                }
                 // Command mode's own colon-line (`:q`/`:q!`/`:wq`/`:x`)
                 // paints straight to the real terminal's global status row
                 // (see run_command_mode's own doc comment on why -- it
                 // bypasses the session's vt100 grid model entirely), which
                 // means it's invisible to compositor_redraw's own grid-
-                // diffed repaint just above: nothing else ever re-touches
+                // diffed repaint below: nothing else ever re-touches
                 // that row on the way out, so the colon-line's own last
                 // text (literally "q!") would otherwise sit there forever
                 // once this editor pane is gone.
+                //
+                // Erased *before* the redraw, not after: this write leaves
+                // the real cursor parked on the status row, and the shell
+                // prompt that draws next positions itself by column only
+                // (editor::compose_redraw), so it would land on that row
+                // instead of where the session's own grid says. The
+                // redraw's own closing cursor placement (see
+                // build_compositor_frame_output) is what has to be the
+                // last word.
                 print!("{}", erase_global_status_row(*term_rows));
+                if *sinks_are_grid {
+                    compositor_redraw(sessions, windows, *current_window, *term_rows, *term_cols);
+                }
                 let _ = io::stdout().flush();
                 return;
             }
@@ -2188,8 +2224,24 @@ fn run_edit_frame(
                     // indexing a pane that no longer exists.
                     pane_rect(&windows[*current_window], windows[*current_window].focused_pane, *term_rows, *term_cols)
                 };
+                // Resized first: the window action that moved focus is
+                // usually a split, which made this pane narrower, and
+                // freezing a full-width frame into a grid still sized for
+                // the old rect would clip it -- exactly what
+                // run_diagnostics_frame's own refresh_editor_frame does,
+                // for the same reason.
+                sessions[&session_id].screen.borrow_mut().resize(rect.rows, rect.cols);
                 fileeditor::freeze_editor_frame(&sessions[&session_id].screen, &b, &v, rect, Some(&color_overrides));
                 edit_frames.insert(edit_frame_id, fileeditor::EditSession { buffer: b, vk: v });
+                // dispatch_window_cmd already redrew, but that ran
+                // *before* the freeze above -- so without a second one
+                // this pane keeps showing whatever its grid held a moment
+                // ago (a freshly-switched alternate screen: blank) until
+                // some unrelated activity happens to repaint it. Same
+                // ordering gap, same fix, as run_hex_frame's own.
+                if *sinks_are_grid {
+                    compositor_redraw(sessions, windows, *current_window, *term_rows, *term_cols);
+                }
                 return;
             }
             Ok((NavExit::Resume(..), _)) | Ok((NavExit::Detached, None)) => {
@@ -2201,6 +2253,7 @@ fn run_edit_frame(
                 // sink it and drop the session; there's no good way to
                 // resume from here.
                 windows[*current_window].stack_mut().pop();
+                leave_alt_screen(&sessions[&session_id].screen);
                 sessions.get_mut(&session_id).unwrap().shell.sink_err(&format!("bish: e: error reading input: {}\n", e));
                 if *sinks_are_grid {
                     compositor_redraw(sessions, windows, *current_window, *term_rows, *term_cols);
@@ -8674,6 +8727,37 @@ mod terminal_frame_capture_tests {
 #[cfg(test)]
 mod compositor_frame_output_tests {
     use super::*;
+
+    // Regression: an editor frame (`Frame::Edit`/`Frame::Hex`) used to
+    // wipe its session's whole grid on quit (`\x1b[2J\x1b[H`), destroying
+    // the shell scrollback underneath it -- the prompt, the `e` command
+    // that opened it, everything before that -- so a `bish --promoted`,
+    // `e FILE`, `:q!` sequence came back to an empty pane. It now uses
+    // the alternate screen `vt100::Screen` already implements, which is
+    // what a real full-screen terminal program does and what leaves the
+    // primary buffer (and its cursor) exactly as it was found.
+    #[test]
+    fn leaving_an_editor_frame_restores_the_shell_scrollback_under_it() {
+        let screen = Rc::new(RefCell::new(vt100::Screen::new(4, 40)));
+        let rows = || -> Vec<String> {
+            let s = screen.borrow();
+            (0..4).map(|r| (0..40).map(|c| s.cell(r, c).ch).collect::<String>().trim_end().to_string()).collect()
+        };
+        screen.borrow_mut().feed(b"$ echo hi\r\nhi\r\n$ e f.bash\r\n");
+        let before = rows();
+        let cursor_before = screen.borrow().cursor();
+        assert_eq!(before[2], "$ e f.bash");
+
+        enter_alt_screen(&screen);
+        // Whatever the editor freezes in while it owns the pane lands on
+        // the alternate buffer, not on top of any of that.
+        screen.borrow_mut().feed(b"\x1b[H  1 export FOO=1");
+        assert_ne!(rows(), before, "the alternate buffer is what shows while the editor is up");
+
+        leave_alt_screen(&screen);
+        assert_eq!(rows(), before, "quitting puts the pane back exactly as it was found");
+        assert_eq!(screen.borrow().cursor(), cursor_before, "including the row the next prompt draws on");
+    }
 
     // Regression: render_compositor_frame used to lead with `\x1b[2J`
     // (erase whole display) before repainting every pane/divider/the tab
