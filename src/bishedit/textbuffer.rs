@@ -164,22 +164,29 @@ impl TextBuffer {
     // vim's own ":e newfile" behavior (the file is created on first
     // `:w`, not on open).
     pub fn open(path: &Path, vheight: usize) -> io::Result<TextBuffer> {
-        let lines = match std::fs::read_to_string(path) {
-            Ok(text) => {
-                // A trailing newline is the normal case (the file's own
-                // last line ends in "\n", same as `save`'s own output
-                // shape below) -- stripped here so it doesn't show up as
-                // a phantom trailing empty line; anything else in the
-                // file (embedded blank lines, no trailing newline at
-                // all) is preserved exactly.
-                let text = text.strip_suffix('\n').unwrap_or(&text);
-                let lines: Vec<Vec<char>> = text.split('\n').map(|l| l.chars().collect()).collect();
-                if lines.is_empty() { vec![Vec::new()] } else { lines }
-            }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => vec![Vec::new()],
+        let text = match std::fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
             Err(e) => return Err(e),
         };
-        Ok(TextBuffer {
+        Ok(TextBuffer::from_text(path, &text, vheight))
+    }
+
+    // A buffer holding `text` but named `path` -- for content that has a
+    // path worth showing and a place worth saving to, but doesn't come
+    // from reading that path directly. Today that's compressed content
+    // (a gzip'd file, a member inside a zip), which is why every caller
+    // also marks the result readonly; see fileeditor::compressed_text.
+    pub fn from_text(path: &Path, text: &str, vheight: usize) -> TextBuffer {
+        // A trailing newline is the normal case (the file's own last
+        // line ends in "\n", same as `save`'s own output shape below) --
+        // stripped here so it doesn't show up as a phantom trailing
+        // empty line; anything else in the text (embedded blank lines,
+        // no trailing newline at all) is preserved exactly.
+        let text = text.strip_suffix('\n').unwrap_or(text);
+        let lines: Vec<Vec<char>> = text.split('\n').map(|l| l.chars().collect()).collect();
+        let lines = if lines.is_empty() { vec![Vec::new()] } else { lines };
+        TextBuffer {
             undo: UndoTree::new(lines.clone(), (0, 0)),
             saved_node: 0,
             lines,
@@ -197,7 +204,7 @@ impl TextBuffer {
             readonly: false,
             dirty: false,
             path: Some(path.to_path_buf()),
-        })
+        }
     }
 
     pub fn path(&self) -> Option<&Path> {
@@ -304,6 +311,17 @@ impl TextBuffer {
 
     pub fn save(&mut self, path: Option<&Path>) -> io::Result<()> {
         let target = path.or(self.path.as_deref()).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "No file name"))?;
+        // Vim's own rule, and the reason this guard is here rather than
+        // at the `:w` command: read-only is about *this file*, not about
+        // the text, so `:w SOMEWHERE-ELSE` still works -- which is how
+        // you get a zip member or a gzip'd file back out as an ordinary
+        // file. Enforced at the one place that writes, so no caller can
+        // forget it; with compressed buffers that matters, since writing
+        // one back to its own path would replace an archive with its own
+        // decompressed contents.
+        if self.readonly && Some(target) == self.path.as_deref() {
+            return Err(io::Error::new(io::ErrorKind::PermissionDenied, "buffer is read-only"));
+        }
         std::fs::write(target, self.text())?;
         if self.path.is_none() {
             self.path = Some(target.to_path_buf());
@@ -1028,5 +1046,42 @@ mod tests {
         assert!(!buf.is_dirty());
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // Read-only is enforced where the write happens, not at the command
+    // that asked for it, so nothing can route around it -- and `:w
+    // ELSEWHERE` deliberately still works, which is how content that
+    // can't be written back (a zip member, a gzip'd file) gets out as an
+    // ordinary file.
+    #[test]
+    fn a_readonly_buffer_refuses_to_overwrite_its_own_file_but_writes_elsewhere() {
+        let dir = std::env::temp_dir().join(format!("bish-textbuffer-ro-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let original = dir.join("source.txt");
+        std::fs::write(&original, "untouched\n").unwrap();
+
+        let mut buf = TextBuffer::from_text(&original, "replacement\n", 10);
+        buf.set_readonly(true);
+
+        let err = buf.save(None).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(std::fs::read_to_string(&original).unwrap(), "untouched\n", "the file must be exactly as it was");
+
+        let elsewhere = dir.join("copy.txt");
+        buf.save(Some(&elsewhere)).unwrap();
+        assert_eq!(std::fs::read_to_string(&elsewhere).unwrap(), "replacement\n");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn from_text_names_the_buffer_without_reading_that_path() {
+        let buf = TextBuffer::from_text(std::path::Path::new("/nonexistent/thing.txt"), "one\ntwo\n", 10);
+        assert_eq!(buf.path(), Some(std::path::Path::new("/nonexistent/thing.txt")));
+        // `text()` re-adds the trailing newline `from_text` stripped --
+        // the buffer holds two lines either way.
+        assert_eq!(buf.text(), "one\ntwo\n");
+        assert_eq!(buf.line_count(), 2);
+        assert!(!buf.is_dirty());
     }
 }

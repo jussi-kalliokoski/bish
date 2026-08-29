@@ -221,6 +221,12 @@ impl HexBuffer {
         let Some(target) = target else {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "no file name"));
         };
+        // Same rule (and same reasoning) as TextBuffer::save: read-only
+        // stops this file being overwritten, not the bytes being written
+        // somewhere else.
+        if self.readonly && Some(&target) == self.path.as_ref() {
+            return Err(io::Error::new(io::ErrorKind::PermissionDenied, "buffer is read-only"));
+        }
         std::fs::write(&target, &self.bytes)?;
         if to.is_none() || self.path.is_none() {
             self.path = Some(target);
@@ -559,12 +565,29 @@ impl HexSession {
     // `rect` only seeds the initial geometry -- every later frame
     // recomputes it (see `prepare`), so a resize or a split between two
     // keystrokes is honored on the very next one.
+    // A hex session over bytes that aren't simply what's at `path` --
+    // a member inside an archive, or a gzip'd file (see repl.rs's own
+    // open_one_edit_target). Always read-only: those bytes came out of a
+    // decompressor, and nothing here can put them back.
+    pub fn from_bytes(bytes: Vec<u8>, path: &Path, rect: Rect) -> io::Result<HexSession> {
+        let layout = compute_layout(rect.rows, rect.cols, 0, None, true);
+        let mut buf = HexBuffer::from_bytes(bytes, layout.bytes_per_row, layout.rows);
+        buf.path = Some(path.to_path_buf());
+        buf.readonly = true;
+        Ok(HexSession::from_buffer(buf))
+    }
+
     pub fn open(path: Option<&Path>, rect: Rect, readonly: bool) -> io::Result<HexSession> {
         let layout = compute_layout(rect.rows, rect.cols, 0, None, true);
         let mut buf = HexBuffer::open(path, layout.bytes_per_row, layout.rows)?;
         buf.readonly = readonly;
+        Ok(HexSession::from_buffer(buf))
+    }
+
+    // The shared tail of both constructors above.
+    fn from_buffer(buf: HexBuffer) -> HexSession {
         let undo = UndoTree::new(buf.bytes.clone(), (0, 0));
-        Ok(HexSession {
+        HexSession {
             buf,
             vk: VimKeys::new(),
             // A placeholder: `attach_registers` replaces this with the
@@ -582,7 +605,7 @@ impl HexSession {
             last_search: None,
             saved_node: 0,
             status: None,
-        })
+        }
     }
 
     // See the `registers` field's own doc comment: the shared table moves

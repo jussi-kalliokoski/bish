@@ -45,13 +45,59 @@ pub struct EditSession {
 impl EditSession {
     // `path`: `None` opens a fresh unnamed buffer; `Some` opens (or, for
     // a nonexistent path, prepares to create -- see `TextBuffer::open`'s
-    // own doc comment) that file.
+    // own doc comment) that file. Compressed content (a gzip'd file, a
+    // member inside a zip) opens read-only -- see `compressed_text`.
     pub fn open(path: Option<&str>, vheight: usize) -> io::Result<EditSession> {
         let buffer = match path {
-            Some(p) => TextBuffer::open(std::path::Path::new(p), vheight)?,
+            Some(p) => match compressed_text(p) {
+                Some(Ok(text)) => {
+                    let mut buffer = TextBuffer::from_text(std::path::Path::new(p), &text, vheight);
+                    buffer.set_readonly(true);
+                    buffer
+                }
+                Some(Err(e)) => return Err(io::Error::other(e)),
+                None => TextBuffer::open(std::path::Path::new(p), vheight)?,
+            },
             None => TextBuffer::new_unnamed(vheight),
         };
         Ok(EditSession { buffer, vk: VimKeys::new() })
+    }
+}
+
+// The text behind a path that holds compressed content -- a member
+// inside a zip (`some.zip!/dir/file.txt`) or a gzip'd file
+// (`notes.txt.gz`) -- or `None` for an ordinary path, which is every
+// caller's cue to read it the normal way.
+//
+// Read-only follows from the format, not from caution: writing either
+// one back means compressing, which crate::inflate deliberately doesn't
+// do (see its own module comment). Every caller marks the buffer
+// readonly, so `:w` refuses with the same message any other read-only
+// buffer gives rather than silently producing a corrupt archive.
+//
+// Bytes become text lossily. A member that isn't text at all comes out
+// as replacement characters, which is a legible "this isn't text" and
+// leaves `e --hex` as the way to actually look at it -- the same thing
+// opening any binary file in this editor already does.
+pub(crate) fn compressed_text(path: &str) -> Option<Result<String, String>> {
+    compressed_bytes(path).map(|r| r.map(|bytes| String::from_utf8_lossy(&bytes).into_owned()))
+}
+
+// compressed_text's own source, before the lossy text conversion -- what
+// `e --hex` on the same path wants instead (hexedit::HexBuffer::
+// from_bytes), since the whole point there is to see the real bytes.
+pub(crate) fn compressed_bytes(path: &str) -> Option<Result<Vec<u8>, String>> {
+    if let Some((archive, inner)) = crate::archive::split(path) {
+        return Some(crate::archive::read_member(&archive, &inner));
+    }
+    let as_path = std::path::Path::new(path);
+    match crate::archive::kind_of(as_path) {
+        Some(crate::archive::Kind::Gzip) => Some(crate::archive::gunzip(as_path).map(|(_, bytes)| bytes)),
+        // A zip names a directory of members, not content -- `e` browses
+        // it (repl::expand_browse_targets) rather than reaching here.
+        // `e --hex some.zip` does reach here, and wants the archive's own
+        // raw bytes, which is exactly what reading the file gives.
+        Some(crate::archive::Kind::Zip) | None => None,
     }
 }
 
@@ -1667,7 +1713,16 @@ const LANGUAGE_BY_EXTENSION: &[(&str, &str)] = &[
 ];
 
 pub(crate) fn language_of(buf: &TextBuffer) -> String {
-    let Some(ext) = buf.path().and_then(|p| p.extension()) else {
+    let Some(path) = buf.path() else { return "text".to_string() };
+    // `.gz` says how the bytes are stored, not what they are -- what a
+    // `notes.json.gz` buffer holds is JSON, and it should highlight like
+    // it. The extension underneath is the answer for every purpose here,
+    // so the compression suffix is simply stepped over.
+    let path = match path.extension() {
+        Some(ext) if ext.eq_ignore_ascii_case("gz") => std::path::Path::new(path.file_stem().unwrap_or(path.as_os_str())),
+        _ => path,
+    };
+    let Some(ext) = path.extension() else {
         return "text".to_string();
     };
     let ext = ext.to_string_lossy().to_lowercase();
@@ -1966,6 +2021,13 @@ fn run_one_hook(buf: &mut TextBuffer, hook: PreSaveHook) -> Result<usize, String
 // doesn't parse yet, and refusing to save over a syntax error would be
 // far more disruptive than just not reformatting it this time.
 pub(crate) fn run_pre_save_hooks(buf: &mut TextBuffer) {
+    // A read-only buffer's `:w` is either about to be refused, or is a
+    // `:w SOMEWHERE-ELSE` writing this content out as it stands --
+    // neither is a reason to reformat text the user was told they can't
+    // change.
+    if buf.is_readonly() {
+        return;
+    }
     for hook in pre_save_hooks(&language_of(buf)) {
         let _ = run_one_hook(buf, *hook);
     }
@@ -3435,6 +3497,69 @@ mod pre_save_hook_tests {
         assert!(buffer_highlight_spans(&toml, None).is_empty(), "a language with no highlighter renders plain");
     }
 
+    // Opening compressed content: a member inside a zip and a gzip'd
+    // file both arrive as ordinary-looking read-only buffers, named by
+    // the path that was asked for.
+    #[test]
+    fn compressed_paths_open_as_readonly_buffers_holding_the_decompressed_text() {
+        let dir = std::env::temp_dir().join(format!("bish-fileeditor-archive-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let zip = dir.join("sample.zip");
+        std::fs::write(&zip, include_bytes!("testdata/sample.zip")).unwrap();
+        let gz = dir.join("sample.txt.gz");
+        std::fs::write(&gz, include_bytes!("testdata/sample.txt.gz")).unwrap();
+
+        let member = crate::archive::join(&zip, "dir/inner.json");
+        let session = EditSession::open(Some(&member), 10).unwrap();
+        assert_eq!(buffer_text(&session.buffer), "{\"a\": 1}");
+        assert!(session.buffer.is_readonly(), "a zip member can't be written back");
+        assert_eq!(session.buffer.path(), Some(std::path::Path::new(&member)));
+
+        let path = gz.display().to_string();
+        let session = EditSession::open(Some(&path), 10).unwrap();
+        assert_eq!(buffer_text(&session.buffer), "compressed text\nsecond line");
+        assert!(session.buffer.is_readonly(), "a gzip file can't be written back");
+
+        // ...while an ordinary file in the same directory is untouched
+        // by any of this.
+        let plain = dir.join("plain.txt");
+        std::fs::write(&plain, "ordinary\n").unwrap();
+        let session = EditSession::open(Some(&plain.display().to_string()), 10).unwrap();
+        assert!(!session.buffer.is_readonly());
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_missing_member_is_an_error_rather_than_an_empty_new_buffer() {
+        let dir = std::env::temp_dir().join(format!("bish-fileeditor-archive-missing-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let zip = dir.join("sample.zip");
+        std::fs::write(&zip, include_bytes!("testdata/sample.zip")).unwrap();
+
+        // An ordinary nonexistent path opens as a new file (vim's own
+        // `:e newfile`); a nonexistent *member* can't, since there's no
+        // way to create one.
+        let opened = EditSession::open(Some(&crate::archive::join(&zip, "nope.txt")), 10);
+        let err = match opened {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("a nonexistent member must not open as a blank buffer"),
+        };
+        assert!(err.contains("no such member"), "{err}");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // `.gz` says how the bytes are stored, not what they are.
+    #[test]
+    fn language_looks_through_a_gz_suffix() {
+        assert_eq!(language_of(&buf_with_ext("x", "json.gz")), "json");
+        assert_eq!(language_of(&buf_with_ext("x", "sh.gz")), "bash");
+        assert_eq!(language_of(&buf_with_ext("x", "gz")), "text", "nothing underneath to go on");
+    }
+
     #[test]
     fn language_of_names_a_file_type_rather_than_enumerating_one() {
         assert_eq!(language_of(&buf_with_ext("x", "bash")), "bash");
@@ -3644,7 +3769,7 @@ mod git_blame_tests {
         let dir = repo_with_history("blame-rev-test");
         let mut buf = TextBuffer::open(&dir.join("f.txt"), 10).unwrap();
 
-        assert_eq!(toggle_git_blame(&mut buf, Some("HEAD~1")).unwrap(), true);
+        assert!(toggle_git_blame(&mut buf, Some("HEAD~1")).unwrap());
         let blame = buf.blame.as_ref().unwrap();
         assert_eq!(blame.len(), 3);
         assert!(blame[0].is_some(), "`one` is unchanged since HEAD~1");
@@ -3756,7 +3881,7 @@ mod git_diff_tests {
         // replaced `two` with two lines -- one changed hunk, exactly as
         // real `git diff -U0` reports it (`@@ -2 +2,2 @@`), not a change
         // plus a separate addition.
-        assert_eq!(toggle_git_diff(&mut buf, Some("HEAD~1")).unwrap(), true);
+        assert!(toggle_git_diff(&mut buf, Some("HEAD~1")).unwrap());
         let diff = buf.diff.as_ref().unwrap();
         assert_eq!(diff.get(&1), Some(&DiffMark::Changed));
         assert_eq!(diff.get(&2), Some(&DiffMark::Changed));

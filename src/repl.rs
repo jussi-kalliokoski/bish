@@ -13,6 +13,7 @@ use crate::bishedit::textbuffer::TextBuffer;
 use crate::bishedit::unicode_width::col_of;
 use crate::bishedit::vimkeys::{KeyOutcome, Op, VimKeys, WindowCmd};
 use crate::bishedit::Buffer as BisheditBuffer;
+use crate::archive;
 use crate::browser;
 use crate::debugger;
 use crate::docs;
@@ -1329,6 +1330,18 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
 // arbitrary file. A non-directory target passes through untouched, which
 // is every ordinary `e file.sh`.
 #[allow(clippy::too_many_arguments)]
+// What a failed `:w`/`:wq`/`:x` says. A read-only buffer gets vim's own
+// E45 rather than E212's "can't open file for writing", which would be
+// both wrong (nothing was opened) and unhelpful -- and it points at the
+// thing that does work, since read-only stops this file being
+// overwritten, not the text being written elsewhere (TextBuffer::save).
+fn write_error(tb: &TextBuffer, e: &io::Error) -> String {
+    if e.kind() == io::ErrorKind::PermissionDenied && tb.is_readonly() {
+        return "bish: E45: 'readonly' option is set (:w FILE writes it elsewhere)".to_string();
+    }
+    format!("bish: E212: Can't open file for writing: {e}")
+}
+
 fn expand_browse_targets(
     targets: Vec<fileeditor::EditTarget>,
     sessions: &mut HashMap<SessionId, SessionState>,
@@ -1361,7 +1374,17 @@ fn expand_browse_targets(
             continue;
         };
         let start = browser::resolve_start(&cwd, Some(&path));
-        if !start.is_dir() {
+        // A zip is browsed like a directory, and a directory inside one
+        // is too (archive::is_browsable) -- that's what makes `e
+        // some.zip` show what's in it rather than open the archive's own
+        // bytes as text.
+        //
+        // Except under `--hex`, which asks for exactly those bytes: a
+        // directory has none to show, so it still browses, but an
+        // archive does, and looking at a zip's own structure is a real
+        // reason to type `e --hex`.
+        let browsable = start.is_dir() || (!target.hex && archive::is_browsable(&start.to_string_lossy()));
+        if !browsable {
             out.push(target);
             continue;
         }
@@ -1440,6 +1463,20 @@ fn open_one_edit_target(
     rect: Rect,
 ) -> io::Result<Frame> {
     if target.hex {
+        // A member inside an archive has no path the hex editor could
+        // open, so its bytes are handed over directly -- and read-only
+        // for the same reason the text editor's are (see
+        // fileeditor::compressed_text).
+        if let Some(path) = target.path.as_deref()
+            && let Some(bytes) = fileeditor::compressed_bytes(path)
+        {
+            let bytes = bytes.map_err(io::Error::other)?;
+            let session = hexedit::HexSession::from_bytes(bytes, std::path::Path::new(path), rect)?;
+            let id = *next_hex_frame_id;
+            *next_hex_frame_id += 1;
+            hex_frames.insert(id, session);
+            return Ok(Frame::Hex(id));
+        }
         let session = hexedit::HexSession::open(target.path.as_deref().map(std::path::Path::new), rect, target.readonly)?;
         let id = *next_hex_frame_id;
         *next_hex_frame_id += 1;
@@ -1447,7 +1484,11 @@ fn open_one_edit_target(
         return Ok(Frame::Hex(id));
     }
     let mut session = fileeditor::EditSession::open(target.path.as_deref(), normal_mode_content_rows(rect))?;
-    session.buffer.set_readonly(target.readonly);
+    // `--readonly` can only ever add the restriction: EditSession::open
+    // already set it for compressed content, which isn't writable at all.
+    if target.readonly {
+        session.buffer.set_readonly(true);
+    }
     let id = *next_edit_frame_id;
     *next_edit_frame_id += 1;
     edit_frames.insert(id, session);
@@ -7138,7 +7179,9 @@ Hover: K on an identifier shows its live value, a doc comment, or a
        man-page snippet for an external command
 More:  `e FILE...` opens several files at once, the first in front;
        `e --hex FILE` opens one as raw bytes instead (own :help inside);
-       `e DIR` browses DIR and opens what you pick there
+       `e DIR` browses DIR and opens what you pick there, and so does
+       `e ARCHIVE.zip` -- members open read-only (`:w FILE` extracts
+       one); a gzip'd file opens read-only as its decompressed text
 
 Colon commands:
   :w [FILE]        write (:wq/:x write+quit, :q quit, :q! discard+quit)
@@ -7676,7 +7719,7 @@ fn run_command_mode(
                                     return CommandModeOutcome::Ran { output: String::new(), status: 0 };
                                 }
                                 Err(e) => {
-                                    show_command_mode_error(&format!("bish: E212: Can't open file for writing: {e}"), *term_rows, *term_cols);
+                                    show_command_mode_error(&write_error(tb, &e), *term_rows, *term_cols);
                                     buffer.clear();
                                     continue;
                                 }
@@ -7695,7 +7738,7 @@ fn run_command_mode(
                                     return CommandModeOutcome::Quit;
                                 }
                                 Err(e) => {
-                                    show_command_mode_error(&format!("bish: E212: Can't open file for writing: {e}"), *term_rows, *term_cols);
+                                    show_command_mode_error(&write_error(tb, &e), *term_rows, *term_cols);
                                     buffer.clear();
                                     continue;
                                 }

@@ -52,6 +52,13 @@ pub(crate) struct Entry {
     pub(crate) name: String,
     pub(crate) path: PathBuf,
     pub(crate) is_dir: bool,
+    // A zip archive, which this browser navigates *into* exactly like a
+    // directory (see `navigable`) -- the whole point of the feature, and
+    // the reason "can I descend into this" is a question of its own
+    // rather than just `is_dir`. Kept separate from `is_dir` so an
+    // archive can still be told apart on screen and, unlike a real
+    // directory, still has a size worth showing.
+    pub(crate) is_archive: bool,
     pub(crate) is_symlink: bool,
     pub(crate) is_exec: bool,
     // The synthetic ".." row -- always first, never selectable (there's
@@ -60,6 +67,13 @@ pub(crate) struct Entry {
     // typed, since it isn't a real match for anything.
     pub(crate) is_parent: bool,
     pub(crate) size: u64,
+}
+
+impl Entry {
+    // Enter descends into this rather than choosing it.
+    fn navigable(&self) -> bool {
+        self.is_dir || self.is_archive
+    }
 }
 
 // What one keystroke did, from the driving loop's point of view.
@@ -174,25 +188,27 @@ impl Browser {
     // that want it on a specific name (going up to a parent, say) call
     // `focus_name` right after.
     fn reload(&mut self) -> Result<(), String> {
-        let read = std::fs::read_dir(&self.cwd).map_err(|e| format!("{}: {e}", self.cwd.display()))?;
-        let mut entries = Vec::new();
+        let mut entries = self.read_here()?;
+        // `Path::parent` already understands a virtual path: the parent
+        // of `/a/b.zip!/dir` is `/a/b.zip!` and the parent of the
+        // archive root `/a/b.zip!` is the real directory `/a`, which is
+        // exactly the walk out of an archive this needs -- no separate
+        // case, because `!` sits inside a path component rather than
+        // acting as one.
         if let Some(parent) = self.cwd.parent() {
-            entries.push(Entry {
-                name: "..".to_string(),
-                path: parent.to_path_buf(),
-                is_dir: true,
-                is_symlink: false,
-                is_exec: false,
-                is_parent: true,
-                size: 0,
-            });
-        }
-        for dirent in read.flatten() {
-            let name = dirent.file_name().to_string_lossy().into_owned();
-            if !self.show_hidden && name.starts_with('.') {
-                continue;
-            }
-            entries.push(describe(dirent.path(), name));
+            entries.insert(
+                0,
+                Entry {
+                    name: "..".to_string(),
+                    path: parent.to_path_buf(),
+                    is_dir: true,
+                    is_archive: false,
+                    is_symlink: false,
+                    is_exec: false,
+                    is_parent: true,
+                    size: 0,
+                },
+            );
         }
         // Directories first (the ".." row is a directory too, and sorts
         // above everything by its own name), then case-insensitive by
@@ -201,13 +217,52 @@ impl Browser {
         entries.sort_by(|a, b| {
             b.is_parent
                 .cmp(&a.is_parent)
-                .then(b.is_dir.cmp(&a.is_dir))
+                .then(b.navigable().cmp(&a.navigable()))
                 .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
                 .then_with(|| a.name.cmp(&b.name))
         });
         self.entries = entries;
         self.refilter();
         Ok(())
+    }
+
+    // Everything in `cwd`, from whichever of the two things `cwd` can be.
+    // The archive half is where `e some.zip` ends up: `cwd` is a virtual
+    // path (archive::split), and the listing comes from the central
+    // directory rather than from `read_dir`. Everything downstream of
+    // here -- the grid, the filter, the selection set, Enter -- works on
+    // `Entry` and never learns the difference.
+    fn read_here(&self) -> Result<Vec<Entry>, String> {
+        let here = self.cwd.to_string_lossy().into_owned();
+        if let Some((archive, inner)) = crate::archive::split(&here) {
+            let members = crate::archive::list(&archive)?;
+            return Ok(crate::archive::list_dir(&members, &inner)
+                .into_iter()
+                .filter(|m| self.show_hidden || !m.name.starts_with('.'))
+                .map(|m| Entry {
+                    path: PathBuf::from(crate::archive::join(&archive, &join_inner(&inner, &m.name))),
+                    name: m.name,
+                    is_dir: m.is_dir,
+                    // Nesting isn't supported (see archive::split), so an
+                    // archive inside an archive is an ordinary file here.
+                    is_archive: false,
+                    is_symlink: false,
+                    is_exec: false,
+                    is_parent: false,
+                    size: m.size,
+                })
+                .collect());
+        }
+        let read = std::fs::read_dir(&self.cwd).map_err(|e| format!("{}: {e}", self.cwd.display()))?;
+        let mut entries = Vec::new();
+        for dirent in read.flatten() {
+            let name = dirent.file_name().to_string_lossy().into_owned();
+            if !self.show_hidden && name.starts_with('.') {
+                continue;
+            }
+            entries.push(describe(dirent.path(), name));
+        }
+        Ok(entries)
     }
 
     // Rebuilds `view`/`matches` from `entries` + `query`, then clamps
@@ -322,11 +377,14 @@ impl Browser {
         self.cursor = 0;
         self.scroll_col = 0;
         self.refilter();
-        // Coming *up* from a child: land on the child that was just left.
+        // Coming *up* from a child: land on the child that was just
+        // left. Stepping out of an archive root arrives here with
+        // `some.zip!`, whose trailing separator is part of the virtual
+        // path rather than of the filename it's listed under.
         if previous.parent() == Some(self.cwd.as_path())
             && let Some(name) = previous.file_name().map(|n| n.to_string_lossy().into_owned())
         {
-            self.focus_name(&name);
+            self.focus_name(name.trim_end_matches(crate::archive::SEPARATOR));
         }
     }
 
@@ -363,7 +421,7 @@ impl Browser {
             // still worth handing back.
             return if self.selected.is_empty() { Outcome::Continue } else { selection() };
         };
-        if entry.is_dir {
+        if entry.navigable() {
             let path = entry.path.clone();
             self.enter_dir(path, true);
             return Outcome::Continue;
@@ -651,7 +709,15 @@ impl Browser {
         let selected = self.selected.contains(&entry.path);
         let focused = idx == self.cursor;
 
-        let label = if entry.is_dir && !entry.is_parent { format!("{}/", entry.name) } else { entry.name.clone() };
+        // A directory's `/` and an archive's `!` are the same hint:
+        // Enter goes *into* this. `!` because that's exactly what the
+        // path gains when you do (archive::SEPARATOR).
+        let label = match entry {
+            e if e.is_parent => e.name.clone(),
+            e if e.is_dir => format!("{}/", e.name),
+            e if e.is_archive => format!("{}{}", e.name, crate::archive::SEPARATOR),
+            e => e.name.clone(),
+        };
         let name_width = width.saturating_sub(PREFIX_WIDTH + GUTTER.min(width.saturating_sub(PREFIX_WIDTH)));
         let empty = Vec::new();
         let positions = self.matches.get(idx).unwrap_or(&empty);
@@ -760,8 +826,25 @@ pub(crate) fn resolve_start(cwd: &Path, arg: Option<&str>) -> PathBuf {
     }
 }
 
+// The absolute, symlink-free spelling of wherever the browser is about
+// to sit -- extended to the two archive cases, since neither names
+// anything `fs::canonicalize` could resolve on its own.
+//
+// Naming an archive *file* lands at its root rather than failing: `e
+// some.zip` and Enter on `some.zip` both arrive here, and both mean
+// "show me what's inside", so the normalization belongs in one place
+// rather than at each of them.
 fn canonical(path: &Path) -> Result<PathBuf, String> {
-    std::fs::canonicalize(path).map_err(|e| format!("{}: {e}", path.display()))
+    let raw = path.to_string_lossy().into_owned();
+    if let Some((archive, inner)) = crate::archive::split(&raw) {
+        let archive = std::fs::canonicalize(&archive).map_err(|e| format!("{}: {e}", archive.display()))?;
+        return Ok(PathBuf::from(crate::archive::join(&archive, &inner)));
+    }
+    let real = std::fs::canonicalize(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    if crate::archive::kind_of(&real) == Some(crate::archive::Kind::Zip) {
+        return Ok(PathBuf::from(crate::archive::join(&real, "")));
+    }
+    Ok(real)
 }
 
 fn describe(path: PathBuf, name: String) -> Entry {
@@ -776,12 +859,31 @@ fn describe(path: PathBuf, name: String) -> Entry {
     let is_dir = meta.as_ref().map(|m| m.is_dir()).unwrap_or(false);
     let is_exec = meta.as_ref().map(|m| m.permissions().mode() & 0o111 != 0).unwrap_or(false) && !is_dir;
     let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
-    Entry { name, path, is_dir, is_symlink, is_exec, is_parent: false, size }
+    // By magic bytes, not by name (crate::archive::kind_of) -- so a zip
+    // called `.jar`, `.whl` or nothing at all still opens, and a `.zip`
+    // that isn't one doesn't pretend to. That's an open and a 4-byte
+    // read per file on top of the two stats this already does, which is
+    // fine for the directories a person browses and would be worth
+    // revisiting only if listing something like /usr/bin ever felt slow.
+    let is_archive = !is_dir && crate::archive::kind_of(&path) == Some(crate::archive::Kind::Zip);
+    Entry { name, path, is_dir, is_archive, is_symlink, is_exec, is_parent: false, size }
+}
+
+// Joins a directory path inside an archive with one of its children --
+// plain string work, since these are archive member names ('/'-separated
+// by the format's own definition) rather than host paths.
+fn join_inner(dir: &str, name: &str) -> String {
+    if dir.is_empty() { name.to_string() } else { format!("{dir}/{name}") }
 }
 
 fn color_for(e: &Entry) -> &'static str {
     if e.is_symlink {
         "\x1b[36m"
+    } else if e.is_archive {
+        // Its own colour rather than a directory's blue: it navigates
+        // like one, but it's still a single file on disk and everything
+        // inside it is read-only.
+        "\x1b[35m"
     } else if e.is_dir {
         "\x1b[1;34m"
     } else if e.is_exec {
@@ -842,6 +944,12 @@ fn icon_for(e: &Entry) -> char {
     }
     if e.is_dir {
         return '\u{1F4C1}';
+    }
+    // Ahead of the name-based tables below, since is_archive comes from
+    // the file's actual magic bytes -- a zip called `plugin.vsix` should
+    // still look like the archive it is.
+    if e.is_archive {
+        return '\u{1F4E6}';
     }
     let lower = e.name.to_lowercase();
     let stem = lower.split('.').next().unwrap_or("");
@@ -1364,9 +1472,112 @@ mod tests {
         assert_eq!(human_size(5 * 1024 * 1024), "5.0M");
     }
 
+    // The archive tests below all browse this one real zip (the same
+    // fixture archive.rs's own tests use, so what it contains is
+    // documented in one place): notes.txt at the root, dir/inner.json,
+    // and dir/deep/leaf.txt, with no explicit entries for the
+    // directories.
+    fn zip_in(tmp: &Tmp) -> PathBuf {
+        let path = tmp.0.join("sample.zip");
+        fs::write(&path, include_bytes!("testdata/sample.zip")).unwrap();
+        path
+    }
+
+    fn names(b: &Browser) -> Vec<String> {
+        b.view.iter().map(|&i| b.entries[i].name.clone()).collect()
+    }
+
+    #[test]
+    fn an_archive_is_listed_as_navigable_rather_than_as_a_plain_file() {
+        let tmp = Tmp::new("archive-entry");
+        zip_in(&tmp);
+        tmp.file("plain.txt", "hello\n");
+        let b = Browser::open(&tmp.0).unwrap();
+        let zip = b.entries.iter().find(|e| e.name == "sample.zip").unwrap();
+        assert!(zip.is_archive, "detected by magic bytes");
+        assert!(!zip.is_dir, "still a file on disk");
+        assert!(!b.entries.iter().find(|e| e.name == "plain.txt").unwrap().is_archive);
+        // Archives sort with the directories, since that's how they
+        // behave on Enter.
+        assert_eq!(names(&b), vec!["..", "sample.zip", "plain.txt"]);
+    }
+
+    // Opening the archive directly, the way `e sample.zip` does: the
+    // browser lands *inside* it rather than failing on a non-directory.
+    #[test]
+    fn opening_an_archive_lists_its_root() {
+        let tmp = Tmp::new("archive-root");
+        let zip = zip_in(&tmp);
+        let b = Browser::open(&zip).unwrap();
+        assert_eq!(names(&b), vec!["..", "dir", "notes.txt"]);
+        assert!(b.cwd.to_string_lossy().ends_with("sample.zip!"));
+    }
+
+    #[test]
+    fn enter_descends_through_an_archive_and_accepts_a_member_as_a_virtual_path() {
+        let tmp = Tmp::new("archive-descend");
+        zip_in(&tmp);
+        let r = rect(20, 80);
+        let mut b = Browser::open(&tmp.0).unwrap();
+
+        b.focus_name("sample.zip");
+        assert_eq!(b.handle_key(Key::Enter, r), Outcome::Continue, "Enter on an archive descends, it doesn't choose");
+        assert_eq!(names(&b), vec!["..", "dir", "notes.txt"]);
+
+        // `dir` exists only because members are named under it -- the
+        // archive has no entry of its own for it.
+        b.focus_name("dir");
+        b.handle_key(Key::Enter, r);
+        assert_eq!(names(&b), vec!["..", "deep", "inner.json"]);
+
+        b.focus_name("inner.json");
+        let chosen = b.handle_key(Key::Enter, r);
+        match chosen {
+            Outcome::Accepted(paths) => {
+                assert_eq!(paths.len(), 1);
+                let picked = paths[0].to_string_lossy().into_owned();
+                assert!(picked.ends_with("sample.zip!/dir/inner.json"), "{picked}");
+                // And it round-trips back to the archive and the member.
+                let (archive, inner) = crate::archive::split(&picked).unwrap();
+                assert_eq!(crate::archive::read_member(&archive, &inner).unwrap(), b"{\"a\": 1}\n");
+            }
+            other => panic!("expected the member to be accepted, got {other:?}"),
+        }
+    }
+
+    // Backspace walks back out the way Enter came in, ending on real
+    // disk again -- and lands on the archive it just left, the same as
+    // leaving any directory does.
+    #[test]
+    fn backspace_walks_back_out_of_an_archive_onto_disk() {
+        let tmp = Tmp::new("archive-out");
+        zip_in(&tmp);
+        let r = rect(20, 80);
+        let mut b = Browser::open(&tmp.0.join("sample.zip")).unwrap();
+        b.focus_name("dir");
+        b.handle_key(Key::Enter, r);
+        assert!(b.cwd.to_string_lossy().ends_with("sample.zip!/dir"));
+
+        b.handle_key(Key::Backspace, r);
+        assert!(b.cwd.to_string_lossy().ends_with("sample.zip!"), "{}", b.cwd.display());
+
+        b.handle_key(Key::Backspace, r);
+        assert_eq!(b.cwd, fs::canonicalize(&tmp.0).unwrap());
+        assert_eq!(b.current().map(|e| e.name.as_str()), Some("sample.zip"), "lands on what it came out of");
+    }
+
+    #[test]
+    fn a_file_that_only_looks_like_an_archive_is_left_alone() {
+        let tmp = Tmp::new("archive-fake");
+        tmp.file("fake.zip", "not really a zip\n");
+        let b = Browser::open(&tmp.0).unwrap();
+        assert!(!b.entries.iter().find(|e| e.name == "fake.zip").unwrap().is_archive);
+    }
+
     #[test]
     fn icons_pick_out_the_obvious_file_types() {
         let mk = |name: &str, is_dir: bool| Entry {
+            is_archive: false,
             name: name.to_string(),
             path: PathBuf::from(name),
             is_dir,

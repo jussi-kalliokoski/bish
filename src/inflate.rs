@@ -125,6 +125,7 @@ impl Huffman {
         // rejected too, since a decoder that ran off the end of an
         // incomplete code would read whatever came next as a symbol.
         let mut left = 1i32;
+        #[allow(clippy::needless_range_loop, reason = "`len` is a code length; the range is the alphabet, not `counts`")]
         for len in 1..=MAX_BITS {
             left <<= 1;
             left -= counts[len] as i32;
@@ -140,6 +141,9 @@ impl Huffman {
         // order, since canonical codes are assigned in increasing
         // (length, symbol) order.
         let mut offsets = [0u16; MAX_BITS + 2];
+        // `len` is a code length, not just an index -- it addresses two
+        // different arrays at two different offsets -- so iterating the
+        // slice instead would obscure exactly the thing that matters.
         for len in 1..=MAX_BITS {
             offsets[len + 1] = offsets[len] + counts[len];
         }
@@ -200,6 +204,15 @@ fn fixed_tables() -> (Huffman, Huffman) {
 // no zlib header, no gzip header -- peeling those is the container's job
 // (archive.rs).
 pub fn inflate(data: &[u8]) -> Result<Vec<u8>, String> {
+    inflate_prefix(data).map(|(out, _)| out)
+}
+
+// `inflate`, plus how many bytes of `data` the stream actually occupied
+// -- what a container needs to find whatever follows it (gzip's own
+// CRC/length trailer, and then possibly another member: see
+// archive::gunzip). A DEFLATE stream doesn't announce its own length,
+// so this is the only way to know.
+pub fn inflate_prefix(data: &[u8]) -> Result<(Vec<u8>, usize), String> {
     let mut bits = Bits::new(data);
     let mut out = Vec::new();
     loop {
@@ -217,7 +230,9 @@ pub fn inflate(data: &[u8]) -> Result<Vec<u8>, String> {
             _ => return Err("invalid DEFLATE block type".to_string()),
         }
         if last {
-            return Ok(out);
+            // Whole bytes pulled into the bit buffer but never consumed
+            // belong to whatever comes next, not to this stream.
+            return Ok((out, bits.pos - (bits.count / 8) as usize));
         }
     }
 }
@@ -338,11 +353,10 @@ fn compressed_block(bits: &mut Bits, out: &mut Vec<u8>, lit: &Huffman, dist: &Hu
                 // byte is encoded) has to see the bytes this very loop
                 // is writing. extend_from_within/copy_within would both
                 // read the pre-copy state and get it wrong.
-                let mut src = out.len() - distance;
-                for _ in 0..len {
-                    let byte = out[src];
+                let start = out.len() - distance;
+                for i in 0..len {
+                    let byte = out[start + i];
                     out.push(byte);
-                    src += 1;
                 }
             }
             _ => return Err("invalid literal/length code".to_string()),

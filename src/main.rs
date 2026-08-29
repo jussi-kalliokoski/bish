@@ -1,3 +1,4 @@
+mod archive;
 mod arith;
 mod bishedit;
 mod browser;
