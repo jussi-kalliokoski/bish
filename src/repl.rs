@@ -992,7 +992,30 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
                             compositor_redraw(&sessions, &windows, current_window, term_rows, term_cols);
                         }
                     }
-                    Ok((NavExit::Detached | NavExit::Quit, _)) => pending_initial = None,
+                    // The mode line has to go here too, not just on the
+                    // Resume arm above: `<C-w>s` from normal mode leaves
+                    // through *this* one, and whatever it hands focus to
+                    // (a fresh pane's shell prompt, most often) has
+                    // nothing of its own to draw on that row -- so a
+                    // "-- NORMAL --  i or :q to return to the prompt"
+                    // sat there telling you how to leave a mode you were
+                    // no longer in. A frame that does own that row (an
+                    // editor, a hex view) redraws it immediately.
+                    Ok((NavExit::Detached | NavExit::Quit, _)) => {
+                        pending_initial = None;
+                        print!("{}", erase_global_status_row(term_rows));
+                        // Then repaint, exactly as the Resume arm does
+                        // and for the same reason: the erase leaves the
+                        // real cursor parked on that row, and the prompt
+                        // drawn next positions itself by column only --
+                        // the repaint's own closing cursor placement has
+                        // to be the last word or the prompt lands on the
+                        // status row instead of in its pane.
+                        if sinks_are_grid {
+                            compositor_redraw(&sessions, &windows, current_window, term_rows, term_cols);
+                        }
+                        let _ = io::stdout().flush();
+                    }
                     Err(e) => {
                         sessions.get(&session_id).unwrap().shell.sink_err(&format!("bish: error reading input: {}\n", e));
                         break;
