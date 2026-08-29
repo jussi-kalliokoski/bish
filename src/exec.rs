@@ -1302,6 +1302,30 @@ impl Shell {
     // match on the job's command text) to an index into self.jobs. Bare
     // job numbers without the `%` are also accepted, matching bash's own
     // leniency in `fg`/`bg`/`wait`.
+    // The session's own grid, looked through whatever sink is temporarily
+    // installed on top of it. Reading `self.sink` directly got this
+    // wrong in exactly the case that matters here: a command with its own
+    // output redirect runs under a `Builtin` sink for its duration (see
+    // that variant's own doc comment), so `cmd >file &` recorded no grid
+    // at all and the stream it *didn't* redirect stayed invisible. The
+    // `Builtin` sink keeps what it displaced, so following that chain
+    // finds the real one.
+    //
+    // `None` for a session that was never promoted (nothing to feed) and
+    // for command mode's `Capture` (its output is a transient overlay,
+    // not the pane's scrollback -- and it can't start background jobs
+    // anyway, being restricted to builtins).
+    fn sink_grid(&self) -> Option<Rc<RefCell<vt100::Screen>>> {
+        let mut sink = &self.sink;
+        loop {
+            match sink {
+                OutputSink::Grid(screen) => return Some(screen.clone()),
+                OutputSink::Builtin { previous, .. } => sink = previous,
+                OutputSink::Real | OutputSink::Capture(_) => return None,
+            }
+        }
+    }
+
     // A pty for a *background* job's stdio, sized to this session's own
     // on-screen area. `None` when this session isn't promoted (there's no
     // grid to feed, and inherited stdio already lands where it should) or
@@ -1388,23 +1412,13 @@ impl Shell {
         self.push_job_full(children, cmd_text, pty_master, None);
     }
 
-    // Same as push_job, but records the job's own isolated process group
-    // (see Job::pgid's doc comment) -- only run_single's plain
-    // (non-pty) background-spawn site ever passes Some here.
-    fn push_job_with_pgid(&mut self, children: Vec<std::process::Child>, cmd_text: String, pgid: Option<u32>) {
-        self.push_job_full(children, cmd_text, None, pgid);
-    }
-
     fn push_job_full(&mut self, children: Vec<std::process::Child>, cmd_text: String, pty_master: Option<std::fs::File>, pgid: Option<u32>) {
         let pids: Vec<u32> = children.iter().map(|c| c.id()).collect();
         let mut table = self.jobs.borrow_mut();
         table.last_bg_pid = pids.last().copied();
         let id = table.next_job_id;
         table.next_job_id += 1;
-        let sink_screen = match &self.sink {
-            OutputSink::Grid(screen) => Some(screen.clone()),
-            _ => None,
-        };
+        let sink_screen = self.sink_grid();
         table.jobs.push(Job { id, pids, children, cmd_text, pty_master, sink_screen, nonblocking: false, pgid, stopped: false });
     }
 
@@ -4568,20 +4582,32 @@ impl Shell {
         let mut command = Command::new(exe);
         command.arg("-c").arg(script);
         command.current_dir(&self.cwd);
+        // Whichever of this job's own streams the redirects *didn't*
+        // claim goes to a pty of its own, for the same reason run_multi's
+        // backgrounded pipelines do (see background_pty): redirecting one
+        // stream says nothing about where the others should land, and
+        // inherited they write straight onto the real screen for the next
+        // repaint to wipe -- `{ cmd; } 2>err &` lost every line of stdout
+        // exactly that way. Wired as plain fds rather than through
+        // spawn_attached, whose setsid would undo the process-group
+        // isolation set up just below.
+        let bg_pty = if background { self.background_pty() } else { None };
+        let bg_slave = |pty: &Option<pty::Pty>| -> Option<Stdio> {
+            let p = pty.as_ref()?;
+            std::fs::OpenOptions::new().read(true).write(true).open(&p.slave_path).ok().map(Stdio::from)
+        };
         // Only the foreground case (reached here for a numbered-fd
         // redirect this shell has no in-process model for -- see
         // compound_redirects_are_simple's own doc comment) should honor a
-        // converted enclosing capture; a genuinely backgrounded job is a
-        // real, detached process and should inherit the real terminal
-        // regardless, same as run_multi's own backgrounded pipelines.
+        // converted enclosing capture.
         if background {
-            command.stdin(redirs.stdin.unwrap_or_else(Stdio::inherit));
-            command.stdout(redirs.stdout.unwrap_or_else(Stdio::inherit));
+            command.stdin(redirs.stdin.or_else(|| bg_slave(&bg_pty)).unwrap_or_else(Stdio::inherit));
+            command.stdout(redirs.stdout.or_else(|| bg_slave(&bg_pty)).unwrap_or_else(Stdio::inherit));
         } else {
             command.stdin(redirs.stdin.unwrap_or_else(|| self.spawn_stdin_stdio()));
             command.stdout(redirs.stdout.unwrap_or_else(|| self.spawn_stdout_stdio()));
         }
-        command.stderr(redirs.stderr.unwrap_or_else(Stdio::inherit));
+        command.stderr(redirs.stderr.or_else(|| bg_slave(&bg_pty)).unwrap_or_else(Stdio::inherit));
         apply_fd_redirects(&mut command, redirs.dup_stderr_to_stdout, redirs.extra_fds);
         // Real job control isolation for a *backgrounded* redirected
         // compound command only -- same reasoning/pattern as run_single's
@@ -4615,7 +4641,7 @@ impl Shell {
                     } else {
                         None
                     };
-                    self.push_job_with_pgid(vec![child], cmd_text, pgid);
+                    self.push_job_full(vec![child], cmd_text, bg_pty.map(|p| p.master), pgid);
                     ExecResult::Status(0)
                 } else {
                     let mut child = child;
@@ -6384,9 +6410,24 @@ impl Shell {
             // later -- fall through to the ordinary inherited-stdio path.
         }
 
-        command.stdin(redirs.stdin.unwrap_or_else(|| self.spawn_stdin_stdio()));
-        command.stdout(redirs.stdout.unwrap_or_else(|| self.spawn_stdout_stdio()));
-        command.stderr(redirs.stderr.unwrap_or_else(Stdio::inherit));
+        // Reached only when at least one stream *was* redirected (that's
+        // what ruled out the pty path above). Backgrounded, the ones that
+        // weren't redirected still need somewhere to go that isn't the real
+        // screen -- see run_compound_redirected's own identical handling
+        // for why redirecting one stream says nothing about the others.
+        let bg_pty = if background { self.background_pty() } else { None };
+        let bg_slave = |pty: &Option<pty::Pty>| -> Option<Stdio> {
+            let p = pty.as_ref()?;
+            std::fs::OpenOptions::new().read(true).write(true).open(&p.slave_path).ok().map(Stdio::from)
+        };
+        if background {
+            command.stdin(redirs.stdin.or_else(|| bg_slave(&bg_pty)).unwrap_or_else(Stdio::inherit));
+            command.stdout(redirs.stdout.or_else(|| bg_slave(&bg_pty)).unwrap_or_else(Stdio::inherit));
+        } else {
+            command.stdin(redirs.stdin.unwrap_or_else(|| self.spawn_stdin_stdio()));
+            command.stdout(redirs.stdout.unwrap_or_else(|| self.spawn_stdout_stdio()));
+        }
+        command.stderr(redirs.stderr.or_else(|| bg_slave(&bg_pty)).unwrap_or_else(Stdio::inherit));
         apply_fd_redirects(&mut command, redirs.dup_stderr_to_stdout, redirs.extra_fds);
 
         // Real job control (M11), gated on `set -m` like fg/bg already are
@@ -6431,7 +6472,7 @@ impl Shell {
                         cmd_text.push_str(&crate::serialize::serialize_redirect(r));
                     }
                     let pgid = if self.opt_monitor { Some(pid) } else { None };
-                    self.push_job_with_pgid(vec![child], cmd_text, pgid);
+                    self.push_job_full(vec![child], cmd_text, bg_pty.map(|p| p.master), pgid);
                     ExecResult::Status(0)
                 } else if self.opt_monitor {
                     // Foreground, with real job control: hand the real
@@ -10757,6 +10798,29 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(20));
         };
         assert_eq!(row0, "from-a-background-job");
+    }
+
+    #[test]
+    fn a_redirected_background_job_still_records_the_grid_for_its_other_stream() {
+        // Regression: a command with its own output redirect runs under a
+        // `Builtin` sink for its duration, so reading `self.sink`
+        // directly at push time found no grid and the stream that
+        // *wasn't* redirected stayed invisible -- `cmd >file &` losing
+        // every line of stderr. sink_grid looks through that sink to the
+        // real one underneath.
+        let mut shell = Shell::new();
+        let screen = Rc::new(RefCell::new(crate::vt100::Screen::new(6, 40)));
+        shell.set_sink_grid(screen.clone());
+        assert!(shell.sink_grid().is_some());
+        let file = Rc::new(RefCell::new(std::fs::File::create("/dev/null").unwrap()));
+        shell.sink = OutputSink::Builtin {
+            previous: Box::new(std::mem::replace(&mut shell.sink, OutputSink::Real)),
+            stdout: Some(file),
+            stderr: None,
+            dup_err_to_out: false,
+            dup_out_to_err: false,
+        };
+        assert!(shell.sink_grid().is_some(), "a per-command redirect sink must not hide the session's own grid");
     }
 
     #[test]
