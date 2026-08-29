@@ -14,8 +14,21 @@ use std::path::{Path, PathBuf};
 use super::lint;
 use super::motion;
 use super::registers::{RegisterShape, RegisterValue, Registers};
+use super::snippet;
 use super::undo::UndoTree;
 use super::Buffer;
+
+// One placeholder of a live `abbr` snippet, in this buffer's own
+// (line, column) space. `active` is the one being typed into, which the
+// renderer marks differently from the rest -- see
+// `fileeditor::build_editor_frame`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SnippetHole {
+    pub line: usize,
+    pub start: usize,
+    pub end: usize,
+    pub active: bool,
+}
 
 pub struct TextBuffer {
     // Always at least one line, matching a real file (an empty file is
@@ -37,6 +50,13 @@ pub struct TextBuffer {
     // Visual mode's own committed selections -- same field, same shape,
     // same reasoning as `repl.rs`'s `ScreenBuffer::selections`.
     pub selections: Vec<motion::MotionRange>,
+    // A live `abbr` snippet's own placeholders, for whoever draws this
+    // buffer -- same field, same "view state the buffer carries so every
+    // frame showing it agrees" reasoning as `selections` just above,
+    // which also gets a detached editor pane's frozen frame right for
+    // free. Written by fileeditor::run_insert_mode while a snippet is
+    // live and cleared the moment it ends; empty every other time.
+    pub snippet_holes: Vec<SnippetHole>,
     // `:diag`'s own last result (see fileeditor::diagnose_buffer) -- rides
     // along with the buffer exactly like `selections` does (survives a
     // Ctrl+Space detach/reattach, since both live on the one thing that
@@ -126,6 +146,7 @@ impl TextBuffer {
             hleft: 0,
             marks: HashMap::new(),
             selections: Vec::new(),
+            snippet_holes: Vec::new(),
             diagnostics: Vec::new(),
             blame: None,
             diff: None,
@@ -165,6 +186,7 @@ impl TextBuffer {
             hleft: 0,
             marks: HashMap::new(),
             selections: Vec::new(),
+            snippet_holes: Vec::new(),
             diagnostics: Vec::new(),
             blame: None,
             diff: None,
@@ -598,6 +620,22 @@ impl Buffer for TextBuffer {
     }
 }
 
+// The buffer half of a live snippet -- see bishedit::snippet's own
+// `SnippetHost` doc comment for why one line is always enough. Mirrors
+// editor.rs's own impl for the single-line prompt buffer.
+impl snippet::SnippetHost for TextBuffer {
+    fn replace_in_line(&mut self, line: usize, start: usize, end: usize, text: &str) {
+        if end > start {
+            self.delete_range(&motion::MotionRange { shape: motion::MotionShape::Exclusive, from: (line, start), to: (line, end) });
+        }
+        self.insert_text((line, start), text);
+    }
+
+    fn place_cursor(&mut self, line: usize, col: usize) {
+        self.set_cursor(line, col);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -614,6 +652,7 @@ mod tests {
             hleft: 0,
             marks: HashMap::new(),
             selections: Vec::new(),
+            snippet_holes: Vec::new(),
             diagnostics: Vec::new(),
             blame: None,
             diff: None,

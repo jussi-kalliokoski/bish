@@ -18,6 +18,7 @@ use crate::debugger;
 use crate::docs;
 use crate::editor::{self, Key, ReadOutcome};
 use crate::exec::{self, DebugHook, ExecResult, PaneDirection, Shell, WindowAction};
+use crate::bishedit::snippet;
 use crate::hexedit;
 use crate::fileeditor;
 use crate::history::{self, History};
@@ -662,7 +663,11 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
         // by the time expand_abbr_at_cursor runs, not a live borrow held
         // for the whole call (which would conflict with on_idle's own
         // &mut sessions borrow below, same reasoning as session_history).
-        let abbrs_snapshot = sessions[&session_id].shell.abbrs.clone();
+        // Narrowed to the abbreviations that target this context's own
+        // language while we're at it: a shell prompt *is* bash, which is
+        // also `abbr`'s own default, so an abbreviation written without a
+        // thought about languages is still live exactly here.
+        let abbrs_snapshot = snippet::for_language(&sessions[&session_id].shell.abbrs, snippet::DEFAULT_LANG);
         // Same owned-snapshot pattern again -- this redraw's live
         // syn_col_* colors, resolved once up front rather than
         // re-querying the shell per span. See syntax_color_overrides'
@@ -5697,6 +5702,12 @@ fn run_normal_mode_navigation(
                 vk.end_visual(end_cursor);
                 if !gaps.is_empty() && let Some(tb) = buf.as_writable_mut() {
                     let (insert_term_rows, insert_term_cols) = (*term_rows, *term_cols);
+                    // Snapshotted fresh on each entry into Insert mode, not
+                    // once for this whole navigation session: `:abbr` is
+                    // reachable from command mode right here, so a table
+                    // captured at the top would go stale the moment
+                    // someone defined one and immediately went to use it.
+                    let insert_abbrs = sessions[&session_id].shell.abbrs.clone();
                     fileeditor::run_insert_mode(
                         tb,
                         &mut vk,
@@ -5708,6 +5719,7 @@ fn run_normal_mode_navigation(
                         insert_term_cols,
                         color_overrides,
                         &gaps[1..],
+                        &insert_abbrs,
                     )?;
                 }
                 render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides);
@@ -6006,7 +6018,8 @@ fn run_normal_mode_navigation(
                     if let Some(tb) = buf.as_writable_mut() {
                         fileeditor::resolve_insert_start(tb, cmd);
                         let (insert_term_rows, insert_term_cols) = (*term_rows, *term_cols);
-                        fileeditor::run_insert_mode(tb, &mut vk, rect, registers, &mut || service_background_jobs(sessions, windows, job_frames, *current_window, term_rows, term_cols, *sinks_are_grid), false, insert_term_rows, insert_term_cols, color_overrides, &[])?;
+                        let insert_abbrs = sessions[&session_id].shell.abbrs.clone();
+                        fileeditor::run_insert_mode(tb, &mut vk, rect, registers, &mut || service_background_jobs(sessions, windows, job_frames, *current_window, term_rows, term_cols, *sinks_are_grid), false, insert_term_rows, insert_term_cols, color_overrides, &[], &insert_abbrs)?;
                     }
                     render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides);
                 } else {
@@ -6025,7 +6038,8 @@ fn run_normal_mode_navigation(
                 if matches!(buf, NavBuffer::Editable(_)) {
                     if let Some(tb) = buf.as_writable_mut() {
                         let (insert_term_rows, insert_term_cols) = (*term_rows, *term_cols);
-                        fileeditor::run_insert_mode(tb, &mut vk, rect, registers, &mut || service_background_jobs(sessions, windows, job_frames, *current_window, term_rows, term_cols, *sinks_are_grid), true, insert_term_rows, insert_term_cols, color_overrides, &[])?;
+                        let insert_abbrs = sessions[&session_id].shell.abbrs.clone();
+                        fileeditor::run_insert_mode(tb, &mut vk, rect, registers, &mut || service_background_jobs(sessions, windows, job_frames, *current_window, term_rows, term_cols, *sinks_are_grid), true, insert_term_rows, insert_term_cols, color_overrides, &[], &insert_abbrs)?;
                     }
                     render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides);
                 } else {
@@ -6121,7 +6135,8 @@ fn run_normal_mode_navigation(
                             let m = fileeditor::redirect_cw_to_ce(tb, &motion);
                             if fileeditor::delete_motion(tb, registers, m, count, register) {
                                 let (insert_term_rows, insert_term_cols) = (*term_rows, *term_cols);
-                                fileeditor::run_insert_mode(tb, &mut vk, rect, registers, &mut || service_background_jobs(sessions, windows, job_frames, *current_window, term_rows, term_cols, *sinks_are_grid), false, insert_term_rows, insert_term_cols, color_overrides, &[])?;
+                                let insert_abbrs = sessions[&session_id].shell.abbrs.clone();
+                                fileeditor::run_insert_mode(tb, &mut vk, rect, registers, &mut || service_background_jobs(sessions, windows, job_frames, *current_window, term_rows, term_cols, *sinks_are_grid), false, insert_term_rows, insert_term_cols, color_overrides, &[], &insert_abbrs)?;
                             }
                         }
                         Op::Lowercase | Op::Uppercase | Op::CaseToggle => {
@@ -6143,7 +6158,8 @@ fn run_normal_mode_navigation(
                         Op::Change => {
                             fileeditor::delete_lines(tb, registers, count, register);
                             let (insert_term_rows, insert_term_cols) = (*term_rows, *term_cols);
-                            fileeditor::run_insert_mode(tb, &mut vk, rect, registers, &mut || service_background_jobs(sessions, windows, job_frames, *current_window, term_rows, term_cols, *sinks_are_grid), false, insert_term_rows, insert_term_cols, color_overrides, &[])?;
+                            let insert_abbrs = sessions[&session_id].shell.abbrs.clone();
+                            fileeditor::run_insert_mode(tb, &mut vk, rect, registers, &mut || service_background_jobs(sessions, windows, job_frames, *current_window, term_rows, term_cols, *sinks_are_grid), false, insert_term_rows, insert_term_cols, color_overrides, &[], &insert_abbrs)?;
                         }
                         Op::Lowercase | Op::Uppercase | Op::CaseToggle => fileeditor::case_operator_lines(tb, count, fileeditor::case_kind_for_op(op)),
                         Op::Indent => fileeditor::indent_lines(tb, count),
@@ -6216,7 +6232,8 @@ fn run_normal_mode_navigation(
                 if let Some(tb) = buf.as_writable_mut() {
                     fileeditor::open_line(tb, above);
                     let (insert_term_rows, insert_term_cols) = (*term_rows, *term_cols);
-                    fileeditor::run_insert_mode(tb, &mut vk, rect, registers, &mut || service_background_jobs(sessions, windows, job_frames, *current_window, term_rows, term_cols, *sinks_are_grid), false, insert_term_rows, insert_term_cols, color_overrides, &[])?;
+                    let insert_abbrs = sessions[&session_id].shell.abbrs.clone();
+                    fileeditor::run_insert_mode(tb, &mut vk, rect, registers, &mut || service_background_jobs(sessions, windows, job_frames, *current_window, term_rows, term_cols, *sinks_are_grid), false, insert_term_rows, insert_term_cols, color_overrides, &[], &insert_abbrs)?;
                 }
                 render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides);
             }

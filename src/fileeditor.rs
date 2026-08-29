@@ -22,6 +22,8 @@ use crate::bishedit::highlight::{self, BashHighlighter, HighlightContext, Highli
 use crate::bishedit::lint::{self, BashLinter, Linter};
 use crate::bishedit::motion;
 use crate::bishedit::registers::{RegisterShape, RegisterValue, Registers};
+use crate::bishedit::snippet::{self, Abbr, LiveSnippet, Snippet, SnippetHost};
+use crate::bishedit::textbuffer;
 use crate::bishedit::textbuffer::TextBuffer;
 use crate::bishedit::unicode_width::{char_at_col, char_width, col_of};
 use crate::bishedit::vimkeys::{InsertCmd, Op, SurroundTarget, VimKeys, INDENT_WIDTH};
@@ -846,9 +848,18 @@ pub(crate) fn run_insert_mode(
     term_cols: usize,
     color_overrides: Option<&highlight::ColorOverrides>,
     extra_cursors: &[(usize, usize)],
+    // The shell's whole abbreviation table, narrowed here to the ones
+    // targeting this file's own language -- see `language_of` and
+    // `abbr --lang=`. Empty for callers with no shell behind them.
+    abbrs: &[Abbr],
 ) -> io::Result<()> {
     let mode = if replace { EditorMode::Replace } else { EditorMode::Insert };
     let mut cursors: Vec<(usize, usize)> = std::iter::once(buf.cursor()).chain(extra_cursors.iter().copied()).collect();
+    // Resolved once per Insert-mode session: the file's language can't
+    // change while it's being typed into, and neither can the table (the
+    // caller snapshots it fresh on the way in -- see repl.rs).
+    let abbrs = snippet::for_language(abbrs, &language_of(buf));
+    let mut live: Option<LiveSnippet> = None;
     render_editor_frame(buf, vk, mode, rect, term_rows, term_cols, color_overrides);
     // `"."`'s own accumulator for this session -- see `Registers::
     // set_last_insert`'s own doc comment. Best-effort: a Backspace just
@@ -886,7 +897,81 @@ pub(crate) fn run_insert_mode(
                 return Ok(());
             }
         };
+        // Any key outside a live snippet's own vocabulary accepts it as
+        // it stands and then means whatever it always meant -- the exact
+        // rule read_line already follows for the same thing at the shell
+        // prompt, and what keeps every arrow/motion/Escape arm below free
+        // of snippet-aware special cases.
+        if live.is_some()
+            && !matches!(
+                key,
+                Key::Tab | Key::BackTab | Key::CtrlN | Key::CtrlP | Key::Enter | Key::CtrlY | Key::CtrlE | Key::Backspace | Key::Char(_)
+            )
+        {
+            live.take().unwrap().accept(buf);
+            cursors[0] = buf.cursor();
+            buf.snippet_holes.clear();
+        }
+
         match key {
+            // --- a live `abbr` snippet owns these eight keys, exactly as
+            // it does at the shell prompt (editor.rs) ------------------
+            // Tab advances rather than indenting, Ctrl-E cancels back to
+            // the abbreviation name, Ctrl-Y accepts, and Enter advances
+            // except on the last placeholder in visit order, where it
+            // accepts instead of inserting a newline.
+            // Each of these resyncs `cursors[0]` from the buffer on the
+            // way out: the snippet moves the real cursor through its own
+            // model, and this function's other arms all insert at
+            // `cursors[0]` -- leaving it behind is how a keystroke right
+            // after an accept lands back where the abbreviation started
+            // (found via pty, and exactly what the invariant every other
+            // arm here already maintains exists to prevent).
+            Key::Tab | Key::CtrlN if live.is_some() => {
+                let state = live.as_mut().unwrap();
+                state.snip.advance(false);
+                state.sync(buf);
+                cursors[0] = buf.cursor();
+            }
+            Key::BackTab | Key::CtrlP if live.is_some() => {
+                let state = live.as_mut().unwrap();
+                state.snip.advance(true);
+                state.sync(buf);
+                cursors[0] = buf.cursor();
+            }
+            Key::Enter if live.as_ref().is_some_and(|s| !s.snip.at_last()) => {
+                let state = live.as_mut().unwrap();
+                state.snip.advance(false);
+                state.sync(buf);
+                cursors[0] = buf.cursor();
+            }
+            Key::Enter | Key::CtrlY if live.is_some() => {
+                live.take().unwrap().accept(buf);
+                cursors[0] = buf.cursor();
+            }
+            Key::CtrlE if live.is_some() => {
+                live.take().unwrap().cancel(buf);
+                cursors[0] = buf.cursor();
+            }
+            // Only ever eats what was typed into the active placeholder;
+            // with nothing left in it, it stops rather than chewing into
+            // the snippet's own literal text, which the model could not
+            // put back.
+            Key::Backspace if live.is_some() => {
+                let state = live.as_mut().unwrap();
+                if state.snip.backspace() {
+                    state.sync(buf);
+                    cursors[0] = buf.cursor();
+                }
+            }
+            Key::Char(c) if live.is_some() => {
+                let state = live.as_mut().unwrap();
+                state.snip.type_char(c);
+                state.sync(buf);
+                cursors[0] = buf.cursor();
+                inserted.push(c);
+            }
+
             // `^`: vim's own name for this mark (`:help '^`) -- wherever
             // the cursor was the last time Insert mode ended, however it
             // ended. `gi` reads it back (see resolve_insert_start's own
@@ -917,6 +1002,15 @@ pub(crate) fn run_insert_mode(
                     buf.set_cursor(row, len - 1);
                 }
                 return Ok(());
+            }
+            // Enter is the first of the two abbreviation triggers, same
+            // as at the shell prompt: it expands rather than inserting a
+            // newline, and a second Enter (now finding nothing to expand)
+            // does the newline. Never in Replace mode, whose whole
+            // contract is that the line's length doesn't change --
+            // splicing an expansion in would break exactly that.
+            Key::Enter if !replace && expand_abbr(buf, &abbrs, &mut live) => {
+                cursors[0] = buf.cursor();
             }
             Key::Enter => {
                 apply_insert_to_all(buf, &mut cursors, "\n");
@@ -1050,6 +1144,21 @@ pub(crate) fn run_insert_mode(
                 motion::apply_motion(buf, motion::Motion::ScrollLineUp, Some(MOUSE_WHEEL_LINES));
                 cursors[0] = buf.cursor();
             }
+            // Space is the other abbreviation trigger. Unlike a plain
+            // expansion (where the space that ended the word is still
+            // inserted right after it, matching fish), a *snippet*
+            // swallows it: the caret is already parked inside the first
+            // placeholder, where a space would be the first thing typed
+            // into it rather than anything that ended the abbreviation.
+            Key::Char(' ') if !replace && !abbrs.is_empty() && expand_abbr(buf, &abbrs, &mut live) => {
+                cursors[0] = buf.cursor();
+                if live.is_none() {
+                    let mut b = [0u8; 4];
+                    apply_insert_to_all(buf, &mut cursors, ' '.encode_utf8(&mut b));
+                    buf.set_cursor(cursors[0].0, cursors[0].1);
+                    inserted.push(' ');
+                }
+            }
             Key::Char(c) => {
                 let (row, col) = buf.cursor();
                 // Replace mode overwrites the character already at the
@@ -1074,9 +1183,59 @@ pub(crate) fn run_insert_mode(
             }
             _ => {}
         }
+        // Kept in step with the model on every iteration rather than at
+        // each of the arms above: the buffer carries these purely so
+        // whoever draws it can mark the placeholders (see
+        // TextBuffer::snippet_holes), and one place to write them is one
+        // place for them to go stale.
+        buf.snippet_holes = live.as_ref().map(snippet_holes).unwrap_or_default();
         scroll_to_show_cursor(buf, editor_content_cols(buf, rect));
         render_editor_frame(buf, vk, mode, rect, term_rows, term_cols, color_overrides);
     }
+}
+
+// A live snippet's placeholders in the buffer's own (line, column)
+// space, for the renderer.
+fn snippet_holes(live: &LiveSnippet) -> Vec<textbuffer::SnippetHole> {
+    let line = live.line();
+    live.holes().into_iter().map(|(start, end, active)| textbuffer::SnippetHole { line, start, end, active }).collect()
+}
+
+// The file editor's own half of `abbr` expansion -- editor.rs's
+// `expand_abbr_at_cursor` for a `TextBuffer` instead of a prompt line.
+//
+// One deliberate difference from the shell prompt's version: no
+// command-position gate. That gate exists because an abbreviation typed
+// as an *argument* to a real command shouldn't fire; a file has no
+// command positions at all, and running bash's own word-role classifier
+// over, say, a Rust file would be meaningless. So here an abbreviation
+// expands wherever its name is the word ending at the cursor -- which is
+// also how snippets work in every editor that has them.
+//
+// `true` if something expanded, which for Enter is also the caller's cue
+// not to insert a newline as well.
+fn expand_abbr(buf: &mut TextBuffer, abbrs: &[Abbr], live: &mut Option<LiveSnippet>) -> bool {
+    if abbrs.is_empty() || buf.is_readonly() {
+        return false;
+    }
+    let (row, col) = buf.cursor();
+    let line = buf.line_chars(row);
+    let word_start = crate::bishedit::completion::find_word_start(&line, col.min(line.len()));
+    let word: String = line[word_start..col.min(line.len())].iter().collect();
+    if word.is_empty() {
+        return false;
+    }
+    let Some(abbr) = abbrs.iter().find(|a| a.name == word) else {
+        return false;
+    };
+    match Snippet::parse(&abbr.expansion, &abbr.order) {
+        Some(snip) => *live = Some(LiveSnippet::start(snip, row, word_start, word, buf)),
+        None => {
+            buf.replace_in_line(row, word_start, col, &abbr.expansion);
+            buf.set_cursor(row, word_start + abbr.expansion.chars().count());
+        }
+    }
+    true
 }
 
 // Inserts `text` (never containing more than one '\n', and only ever
@@ -1429,29 +1588,57 @@ fn render_line_number_cell(buf: &TextBuffer, _starts: &[usize], line: usize, wid
 }
 
 // Language detection, v1: a bare extension check, not a content sniff --
-// `.bash` is the only recognized language today (per the feature
-// request this shipped under); anything else (an unnamed buffer, no
-// extension, a different one) renders as plain text, same as before
-// this existed. A real "detect from shebang/content" fallback, and more
-// extensions/languages, are natural follow-ups once there's more than
-// one Highlighter implementor to dispatch to (see Highlighter's own doc
-// comment -- BashHighlighter is still the only one), and are exactly
-// where a new `FileType` variant would slot in below.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FileType {
-    Bash,
-    Unknown,
+// no shebang or content fallback yet, which is a natural follow-up.
+//
+// A language *name*, not a file-type enum, because `abbr --lang=` is a
+// glob written by hand against it (`--lang=rust`, `--lang='*script'`,
+// `--lang='!(bash)'`) -- an enum could only ever offer the handful of
+// languages this crate happens to know about, while a name lets
+// `--lang=toml` work with nothing here having heard of TOML.
+//
+// The table below is therefore only for extensions whose name genuinely
+// *differs* from the language's; everything else is its own lowercased
+// extension. A buffer with no file at all -- a fresh `e` with no
+// argument -- is "text", which is also a language you can write
+// abbreviations for.
+const LANGUAGE_BY_EXTENSION: &[(&str, &str)] = &[
+    ("sh", "bash"),
+    ("bash", "bash"),
+    ("rs", "rust"),
+    ("py", "python"),
+    ("rb", "ruby"),
+    ("js", "javascript"),
+    ("mjs", "javascript"),
+    ("cjs", "javascript"),
+    ("ts", "typescript"),
+    ("md", "markdown"),
+    ("yml", "yaml"),
+    ("kt", "kotlin"),
+    ("hs", "haskell"),
+    ("ex", "elixir"),
+    ("exs", "elixir"),
+];
+
+pub(crate) fn language_of(buf: &TextBuffer) -> String {
+    let Some(ext) = buf.path().and_then(|p| p.extension()) else {
+        return "text".to_string();
+    };
+    let ext = ext.to_string_lossy().to_lowercase();
+    LANGUAGE_BY_EXTENSION
+        .iter()
+        .find(|(e, _)| *e == ext)
+        .map(|(_, lang)| (*lang).to_string())
+        .unwrap_or(ext)
 }
 
-fn file_type(buf: &TextBuffer) -> FileType {
-    match buf.path().and_then(|p| p.extension()) {
-        Some(ext) if ext == "bash" => FileType::Bash,
-        _ => FileType::Unknown,
-    }
-}
-
+// The one gate on bash-specific tooling (highlighting, `:diag`'s
+// linters, `:format`), now derived from `language_of` rather than from a
+// second, separate notion of what a file is -- two disagreeing answers
+// to "what language is this" in one module is exactly the kind of thing
+// that rots. A visible consequence: a `.sh` file is bash here now, where
+// the previous extension check recognized only `.bash`.
 fn is_bash_file(buf: &TextBuffer) -> bool {
-    file_type(buf) == FileType::Bash
+    language_of(buf) == snippet::DEFAULT_LANG
 }
 
 // The buffer's own text, lines joined by '\n' -- what BashHighlighter
@@ -1679,16 +1866,16 @@ fn strip_buffer_implicit_trailing_newline(text: &str, mut diagnostics: Vec<lint:
     diagnostics
 }
 
-// Which hooks run before a save, by filetype -- bash is the only
-// filetype recognized at all today (`file_type`'s own doc comment), so
-// it's the only entry with anything in its list. A future filetype adds
-// its own arm here; a future bash-only hook (or one shared across every
-// filetype, e.g. line-ending normalization) just joins this one slice --
-// no change needed to `run_pre_save_hooks` itself either way.
-fn pre_save_hooks(ft: FileType) -> &'static [PreSaveHook] {
-    match ft {
-        FileType::Bash => &[bash_format_hook],
-        FileType::Unknown => &[],
+// Which hooks run before a save, by language -- bash is the only one
+// with any tooling behind it today (see `language_of`), so it's the only
+// entry with anything in its list. A future language adds its own arm
+// here; a future bash-only hook (or one shared across every language,
+// e.g. line-ending normalization) just joins this one slice -- no change
+// needed to `run_pre_save_hooks` itself either way.
+fn pre_save_hooks(language: &str) -> &'static [PreSaveHook] {
+    match language {
+        snippet::DEFAULT_LANG => &[bash_format_hook],
+        _ => &[],
     }
 }
 
@@ -1716,7 +1903,7 @@ fn run_one_hook(buf: &mut TextBuffer, hook: PreSaveHook) -> Result<usize, String
 // doesn't parse yet, and refusing to save over a syntax error would be
 // far more disruptive than just not reformatting it this time.
 pub(crate) fn run_pre_save_hooks(buf: &mut TextBuffer) {
-    for hook in pre_save_hooks(file_type(buf)) {
+    for hook in pre_save_hooks(&language_of(buf)) {
         let _ = run_one_hook(buf, *hook);
     }
 }
@@ -1752,7 +1939,7 @@ pub(crate) enum FormatOutcome {
 // succeeding, so a later hook's error never leaves an earlier hook's own
 // edits half-applied).
 pub(crate) fn format_buffer(buf: &mut TextBuffer) -> FormatOutcome {
-    let hooks = pre_save_hooks(file_type(buf));
+    let hooks = pre_save_hooks(&language_of(buf));
     if hooks.is_empty() {
         return FormatOutcome::NotSupported;
     }
@@ -1938,7 +2125,7 @@ fn spans_for_line(spans: &[StyledSpan], line_start: usize, line_len: usize) -> V
 // align with it exactly, with no separate cell-width bookkeeping
 // needed for *those* two layers at all.
 #[allow(clippy::too_many_arguments)]
-fn render_row(out: &mut String, buf: &TextBuffer, line: usize, hoffset: usize, cols: usize, line_styled: &[StyledSpan], diag_styled: &[StyledSpan], highlights: &[(usize, usize)]) {
+fn render_row(out: &mut String, buf: &TextBuffer, line: usize, hoffset: usize, cols: usize, line_styled: &[StyledSpan], diag_styled: &[StyledSpan], highlights: &[StyledSpan]) {
     let line_chars = buf.line_chars(line);
     let start_char = char_at_col(&line_chars, hoffset);
     let mut chars: Vec<char> = Vec::with_capacity(cols);
@@ -1958,11 +2145,6 @@ fn render_row(out: &mut String, buf: &TextBuffer, line: usize, hoffset: usize, c
         used += 1;
     }
 
-    let selected: Vec<StyledSpan> = highlights
-        .iter()
-        .map(|&(start, end)| StyledSpan { start, end, fg: vt100::Color::Default, attrs: vt100::CellAttrs { reverse: true, ..vt100::CellAttrs::default() } })
-        .collect();
-
     // Clamped against `chars.len()` (the real array length after
     // width-bounded selection/padding above), not `cols` (the column
     // *budget* it was bounded to fit) -- the two only coincide when
@@ -1980,7 +2162,7 @@ fn render_row(out: &mut String, buf: &TextBuffer, line: usize, hoffset: usize, c
     let line_styled = rebase(line_styled, start_char, chars.len());
     let diag_styled = rebase(diag_styled, start_char, chars.len());
 
-    let cells = highlight::compose(&chars, &[&line_styled, &diag_styled, &selected]);
+    let cells = highlight::compose(&chars, &[&line_styled, &diag_styled, highlights]);
     out.push_str(&highlight::render_styled(&cells));
 }
 
@@ -2056,11 +2238,31 @@ pub fn build_editor_frame(
             // itself) is the right rebase point once a line can have
             // wide chars in it.
             let start_char = char_at_col(&buf.line_chars(line), hoffset);
-            let mut highlights = Vec::new();
+            let mut highlights: Vec<StyledSpan> = Vec::new();
             for range in buf.selections.iter().chain(active.iter()) {
-                if let Some(cols) = selection_columns_in_line(range, line, start_char, content_cols) {
-                    highlights.push(cols);
+                if let Some((start, end)) = selection_columns_in_line(range, line, start_char, content_cols) {
+                    highlights.push(StyledSpan { start, end, fg: vt100::Color::Default, attrs: vt100::CellAttrs { reverse: true, ..vt100::CellAttrs::default() } });
                 }
+            }
+            // A live `abbr` snippet's own placeholders, marked exactly as
+            // the shell prompt marks them (editor.rs's `snippet_layer`):
+            // reverse video on the one being typed into, underline on the
+            // rest. Rebased into the same viewport-local space
+            // selection_columns_in_line already produces, and dropped
+            // entirely when horizontal scrolling has carried the hole off
+            // this window.
+            for hole in buf.snippet_holes.iter().filter(|h| h.line == line && h.end > start_char) {
+                let start = hole.start.saturating_sub(start_char);
+                let end = (hole.end - start_char).min(content_cols);
+                if start >= end {
+                    continue;
+                }
+                let attrs = if hole.active {
+                    vt100::CellAttrs { reverse: true, ..vt100::CellAttrs::default() }
+                } else {
+                    vt100::CellAttrs { underline: true, ..vt100::CellAttrs::default() }
+                };
+                highlights.push(StyledSpan { start, end, fg: vt100::Color::Default, attrs });
             }
             let line_styled = spans_for_line(&whole_styled, starts[line], buf.line_len(line));
             let diag_styled = diagnostic_spans_for_line(&buf.diagnostics, starts[line], buf.line_len(line));
@@ -2329,7 +2531,7 @@ mod macro_tests {
             KeyOutcome::Motion(m, count) => motion::apply_motion(buf, m, count),
             KeyOutcome::EnterInsert(cmd) => {
                 resolve_insert_start(buf, cmd);
-                run_insert_mode(buf, vk, rect(), registers, &mut || false, false, 24, 80, None, &[]).unwrap();
+                run_insert_mode(buf, vk, rect(), registers, &mut || false, false, 24, 80, None, &[], &[]).unwrap();
             }
             other => panic!("unexpected outcome in this test: {other:?}"),
         }
@@ -2347,6 +2549,137 @@ mod macro_tests {
     // `run_insert_mode` instead fell through to a real terminal read,
     // it would see immediate EOF and abandon each excursion after just
     // the `A`, never inserting the `;`.
+    // `abbr` expansion inside the file editor's own Insert mode, driven
+    // through the same macro-replay queue the test just below uses --
+    // there's no real terminal here to type at, and `run_insert_mode`
+    // reads through `vk.next_key`, which serves a queued replay first.
+    fn insert_with(path: Option<&str>, keys: &[Key], abbrs: &[Abbr]) -> TextBuffer {
+        // `TextBuffer::open` on a nonexistent path prepares to create it
+        // (see its own doc comment) -- nothing is ever written here, and
+        // the path is only present so `language_of` has an extension to
+        // read.
+        let mut buf = match path {
+            Some(p) => TextBuffer::open(std::path::Path::new(p), 10).unwrap(),
+            None => TextBuffer::new_unnamed(10),
+        };
+        let mut vk = VimKeys::new();
+        let mut registers = Registers::new_for_test();
+        vk.start_recording('a');
+        for key in keys {
+            vk.record_key(*key);
+        }
+        vk.stop_recording();
+        assert!(vk.queue_macro_replay('a', 1));
+        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut || false, false, 24, 80, None, &[], abbrs).unwrap();
+        buf
+    }
+
+    fn chars(text: &str) -> Vec<Key> {
+        text.chars().map(Key::Char).collect()
+    }
+
+    #[test]
+    fn insert_mode_expands_an_abbreviation_whose_language_matches_the_file() {
+        let abbrs = vec![Abbr { lang: "rust".into(), ..Abbr::new("pl", "println!()") }];
+        let buf = insert_with(Some("main.rs"), &chars("pl "), &abbrs);
+        assert_eq!(text_of(&buf), "println!() ", "expanded, plus the space that triggered it");
+    }
+
+    #[test]
+    fn insert_mode_ignores_an_abbreviation_for_a_different_language() {
+        let abbrs = vec![Abbr { lang: "rust".into(), ..Abbr::new("pl", "println!()") }];
+        let buf = insert_with(Some("notes.md"), &chars("pl "), &abbrs);
+        assert_eq!(text_of(&buf), "pl ");
+    }
+
+    #[test]
+    fn insert_mode_expands_anywhere_in_a_line_not_only_in_command_position() {
+        // The shell prompt gates expansion to command position; a file
+        // has no command positions, so this deliberately does not.
+        let abbrs = vec![Abbr { lang: "rust".into(), ..Abbr::new("pl", "println!()") }];
+        let buf = insert_with(Some("main.rs"), &chars("let x = pl "), &abbrs);
+        assert_eq!(text_of(&buf), "let x = println!() ");
+    }
+
+    #[test]
+    fn insert_mode_drives_a_whole_snippet_with_tab_and_ctrl_y() {
+        let abbrs = vec![Abbr { lang: "rust".into(), ..Abbr::new("f", "fn %s(%s) {}") }];
+        let mut keys = chars("f ");
+        keys.extend(chars("main"));
+        keys.push(Key::Tab);
+        keys.extend(chars("argc: usize"));
+        keys.push(Key::CtrlY);
+        let buf = insert_with(Some("main.rs"), &keys, &abbrs);
+        assert_eq!(text_of(&buf), "fn main(argc: usize) {}");
+        assert!(buf.snippet_holes.is_empty(), "accepting clears what the renderer marks");
+    }
+
+    #[test]
+    fn insert_mode_snippet_enter_advances_then_accepts_without_a_newline() {
+        let abbrs = vec![Abbr { lang: "rust".into(), ..Abbr::new("f", "fn %s(%s) {}") }];
+        let mut keys = chars("f ");
+        keys.extend(chars("main"));
+        keys.push(Key::Enter);
+        keys.extend(chars("x: u8"));
+        keys.push(Key::Enter);
+        let buf = insert_with(Some("main.rs"), &keys, &abbrs);
+        assert_eq!(text_of(&buf), "fn main(x: u8) {}", "no newline anywhere -- both Enters belonged to the snippet");
+    }
+
+    #[test]
+    fn insert_mode_snippet_ctrl_e_cancels_back_to_the_abbreviation_name() {
+        let abbrs = vec![Abbr { lang: "rust".into(), ..Abbr::new("f", "fn %s() {}") }];
+        let mut keys = chars("f ");
+        keys.extend(chars("main"));
+        keys.push(Key::CtrlE);
+        let buf = insert_with(Some("main.rs"), &keys, &abbrs);
+        assert_eq!(text_of(&buf), "f");
+    }
+
+    #[test]
+    fn typing_after_an_accept_continues_from_the_end_of_the_snippet() {
+        // The regression this guards: the snippet moves the real cursor
+        // through its own model, so the multi-cursor list this function
+        // inserts at has to be resynced from the buffer -- left stale, a
+        // keystroke right after an accept lands back where the
+        // abbreviation started.
+        let abbrs = vec![Abbr { lang: "rust".into(), ..Abbr::new("f", "fn %s()") }];
+        let mut keys = chars("f ");
+        keys.extend(chars("main"));
+        keys.push(Key::CtrlY);
+        keys.extend(chars(" {}"));
+        let buf = insert_with(Some("main.rs"), &keys, &abbrs);
+        assert_eq!(text_of(&buf), "fn main() {}");
+    }
+
+    #[test]
+    fn replace_mode_does_not_expand_abbreviations() {
+        // `R`'s whole contract is that the line's length doesn't change.
+        let abbrs = vec![Abbr { lang: "rust".into(), ..Abbr::new("pl", "println!()") }];
+        let mut buf = TextBuffer::open(std::path::Path::new("main.rs"), 10).unwrap();
+        let mut vk = VimKeys::new();
+        let mut registers = Registers::new_for_test();
+        vk.start_recording('a');
+        for key in chars("pl ") {
+            vk.record_key(key);
+        }
+        vk.stop_recording();
+        assert!(vk.queue_macro_replay('a', 1));
+        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut || false, true, 24, 80, None, &[], &abbrs).unwrap();
+        assert_eq!(text_of(&buf), "pl ");
+    }
+
+    #[test]
+    fn a_live_snippet_marks_its_placeholders_for_the_renderer() {
+        let abbrs = vec![Abbr { lang: "rust".into(), ..Abbr::new("f", "fn %s(%s)") }];
+        // No accept/cancel: Insert mode ends at EOF with the snippet
+        // still live, so the marks are whatever was last written.
+        let buf = insert_with(Some("main.rs"), &chars("f "), &abbrs);
+        assert_eq!(buf.snippet_holes.len(), 2);
+        assert!(buf.snippet_holes[0].active && !buf.snippet_holes[1].active);
+        assert_eq!((buf.snippet_holes[0].start, buf.snippet_holes[0].end), (3, 5));
+    }
+
     #[test]
     fn macro_replay_drives_a_real_insert_mode_excursion() {
         let mut buf = TextBuffer::new_unnamed(10);
@@ -2441,7 +2774,7 @@ mod multi_cursor_insert_tests {
         let mut registers = Registers::new_for_test();
         scripted(&mut vk, &[Key::Char('D'), Key::Char('O'), Key::Char('N'), Key::Char('E'), Key::Escape]);
 
-        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut || false, false, 24, 80, None, &[(1, 0), (2, 0)]).unwrap();
+        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut || false, false, 24, 80, None, &[(1, 0), (2, 0)], &[]).unwrap();
 
         assert_eq!(line(&buf, 0), "DONE one");
         assert_eq!(line(&buf, 1), "DONE two");
@@ -2457,7 +2790,7 @@ mod multi_cursor_insert_tests {
         let mut registers = Registers::new_for_test();
         scripted(&mut vk, &[Key::Backspace, Key::Escape]);
 
-        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut || false, false, 24, 80, None, &[(1, 1)]).unwrap();
+        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut || false, false, 24, 80, None, &[(1, 1)], &[]).unwrap();
 
         assert_eq!(line(&buf, 0), " one");
         assert_eq!(line(&buf, 1), " two");
@@ -2472,7 +2805,7 @@ mod multi_cursor_insert_tests {
         let mut registers = Registers::new_for_test();
         scripted(&mut vk, &[Key::Enter, Key::Escape]);
 
-        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut || false, false, 24, 80, None, &[(1, 1)]).unwrap();
+        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut || false, false, 24, 80, None, &[(1, 1)], &[]).unwrap();
 
         assert_eq!(buf.line_count(), 4);
         assert_eq!(line(&buf, 0), "a");
@@ -2493,7 +2826,7 @@ mod multi_cursor_insert_tests {
         let mut registers = Registers::new_for_test();
         scripted(&mut vk, &[Key::Char('X'), Key::Escape]);
 
-        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut || false, false, 24, 80, None, &[(0, 6)]).unwrap();
+        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut || false, false, 24, 80, None, &[(0, 6)], &[]).unwrap();
 
         assert_eq!(line(&buf, 0), "X placeX ");
     }
@@ -2529,7 +2862,7 @@ mod insert_mode_exit_clamp_tests {
         let mut registers = Registers::new_for_test();
         scripted(&mut vk, &[Key::Escape]);
 
-        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut || false, false, 24, 80, None, &[]).unwrap();
+        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut || false, false, 24, 80, None, &[], &[]).unwrap();
 
         assert_eq!(buf.cursor(), (0, 1), "cursor must land on 'b', not past it");
     }
@@ -2542,7 +2875,7 @@ mod insert_mode_exit_clamp_tests {
         let mut registers = Registers::new_for_test();
         scripted(&mut vk, &[Key::Char('h'), Key::Char('i'), Key::Escape]);
 
-        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut || false, false, 24, 80, None, &[]).unwrap();
+        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut || false, false, 24, 80, None, &[], &[]).unwrap();
 
         assert_eq!(buf.cursor(), (0, 1), "cursor must land on the 'i', not past it");
     }
@@ -2558,7 +2891,7 @@ mod insert_mode_exit_clamp_tests {
         let mut registers = Registers::new_for_test();
         scripted(&mut vk, &[Key::Escape]);
 
-        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut || false, false, 24, 80, None, &[]).unwrap();
+        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut || false, false, 24, 80, None, &[], &[]).unwrap();
 
         assert_eq!(buf.get_mark('^'), Some((0, 2)));
     }
@@ -2571,7 +2904,7 @@ mod insert_mode_exit_clamp_tests {
         let mut registers = Registers::new_for_test();
         scripted(&mut vk, &[Key::Escape]);
 
-        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut || false, false, 24, 80, None, &[]).unwrap();
+        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut || false, false, 24, 80, None, &[], &[]).unwrap();
 
         assert_eq!(buf.cursor(), (0, 0));
     }
@@ -2618,7 +2951,7 @@ mod insert_mode_ctrl_w_tests {
         keys.push(Key::CtrlW);
         scripted(&mut vk, &keys);
 
-        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut || false, false, 24, 80, None, &[]).unwrap();
+        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut || false, false, 24, 80, None, &[], &[]).unwrap();
 
         assert_eq!(line(&buf, 0), "hello ");
         assert_eq!(buf.cursor(), (0, 6));
@@ -2635,7 +2968,7 @@ mod insert_mode_ctrl_w_tests {
         keys.push(Key::CtrlW);
         scripted(&mut vk, &keys);
 
-        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut || false, false, 24, 80, None, &[]).unwrap();
+        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut || false, false, 24, 80, None, &[], &[]).unwrap();
 
         assert_eq!(line(&buf, 0), "", "both words should be gone");
     }
@@ -2649,7 +2982,7 @@ mod insert_mode_ctrl_w_tests {
         let mut registers = Registers::new_for_test();
         scripted(&mut vk, &[Key::CtrlW]);
 
-        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut || false, false, 24, 80, None, &[]).unwrap();
+        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut || false, false, 24, 80, None, &[], &[]).unwrap();
 
         assert_eq!(line(&buf, 0), "existing ");
     }
@@ -2662,7 +2995,7 @@ mod insert_mode_ctrl_w_tests {
         let mut registers = Registers::new_for_test();
         scripted(&mut vk, &[Key::CtrlW, Key::Char('x')]);
 
-        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut || false, false, 24, 80, None, &[]).unwrap();
+        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut || false, false, 24, 80, None, &[], &[]).unwrap();
 
         assert_eq!(line(&buf, 0), "x");
     }
@@ -2698,7 +3031,7 @@ mod insert_mode_alt_word_motion_tests {
         let mut registers = Registers::new_for_test();
         scripted(&mut vk, &[Key::AltLeft, Key::Escape]);
 
-        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut || false, false, 24, 80, None, &[]).unwrap();
+        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut || false, false, 24, 80, None, &[], &[]).unwrap();
 
         assert_eq!(buf.line_chars(0).into_iter().collect::<String>(), "hello world", "nothing should be deleted");
         assert_eq!(buf.cursor(), (0, 6), "cursor should land at the start of 'world', matching vim's own `b`");
@@ -2713,7 +3046,7 @@ mod insert_mode_alt_word_motion_tests {
         let mut registers = Registers::new_for_test();
         scripted(&mut vk, &[Key::AltRight, Key::Escape]);
 
-        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut || false, false, 24, 80, None, &[]).unwrap();
+        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut || false, false, 24, 80, None, &[], &[]).unwrap();
 
         assert_eq!(buf.line_chars(0).into_iter().collect::<String>(), "hello world", "nothing should be deleted");
         assert_eq!(buf.cursor(), (0, 6), "cursor should land at the start of 'world', matching vim's own `w`");
@@ -2728,7 +3061,7 @@ mod insert_mode_alt_word_motion_tests {
         let mut registers = Registers::new_for_test();
         scripted(&mut vk, &[Key::AltLeft, Key::Char('X'), Key::Escape]);
 
-        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut || false, false, 24, 80, None, &[]).unwrap();
+        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut || false, false, 24, 80, None, &[], &[]).unwrap();
 
         assert_eq!(buf.line_chars(0).into_iter().collect::<String>(), "hello Xworld");
     }
@@ -2910,11 +3243,16 @@ mod pre_save_hook_tests {
     }
 
     #[test]
-    fn file_type_recognizes_only_dot_bash_today() {
-        assert_eq!(file_type(&buf_with_ext("x", "bash")), FileType::Bash);
-        assert_eq!(file_type(&buf_with_ext("x", "sh")), FileType::Unknown);
-        assert_eq!(file_type(&buf_with_ext("x", "txt")), FileType::Unknown);
-        assert_eq!(file_type(&TextBuffer::new_unnamed(10)), FileType::Unknown);
+    fn language_of_names_a_file_type_rather_than_enumerating_one() {
+        assert_eq!(language_of(&buf_with_ext("x", "bash")), "bash");
+        assert_eq!(language_of(&buf_with_ext("x", "sh")), "bash", "a .sh file is bash here too, unlike the old .bash-only check");
+        assert_eq!(language_of(&buf_with_ext("x", "rs")), "rust");
+        // No table entry needed: an unknown extension is its own name,
+        // which is what makes `abbr --lang=toml` work.
+        assert_eq!(language_of(&buf_with_ext("x", "toml")), "toml");
+        assert_eq!(language_of(&buf_with_ext("x", "TOML")), "toml", "case-folded, so `--lang=toml` matches either spelling");
+        assert_eq!(language_of(&buf_with_ext("x", "txt")), "txt");
+        assert_eq!(language_of(&TextBuffer::new_unnamed(10)), "text");
     }
 
     #[test]

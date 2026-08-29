@@ -3178,8 +3178,14 @@ impl Shell {
     // -- just add/erase/list/show/query, the part of `abbr` people
     // actually reach for day to day. An expansion *can* carry `%s`
     // placeholders, which makes it a snippet rather than plain text (see
-    // bishedit::snippet, and `parse_placeholder_order` just below for how
-    // a trailing `2 1` is told apart from two more words of expansion).
+    // bishedit::snippet, and `snippet::parse_order` for how a trailing
+    // `2 1` is told apart from two more words of expansion).
+    // `--lang=GLOB` scopes an abbreviation to the languages it's for
+    // (default `bash`, which is what the shell prompt itself counts as),
+    // so an abbreviation's identity here is `(name, lang)` and the same
+    // short name can mean one thing at a prompt and another in a Rust
+    // file. See `take_lang_flag` for why it's only recognized among the
+    // leading options.
     // `-a`/`--add` is optional (`abbr NAME EXPANSION` alone means add, `abbr`
     // with a recognized name misparsed as NAME would just mean "add an
     // abbreviation literally named `-x`" -- an accepted, unvalidated edge
@@ -3197,6 +3203,8 @@ impl Shell {
             Show,
             Query,
         }
+        let (args, lang) = snippet::take_lang_flag(args);
+        let args: &[String] = &args;
         let (mode, rest) = match args.first().map(String::as_str) {
             Some("-a") | Some("--add") => (Mode::Add, &args[1..]),
             Some("-e") | Some("--erase") => (Mode::Erase, &args[1..]),
@@ -3218,12 +3226,16 @@ impl Shell {
                 }
                 let (expansion_words, order) = snippet::parse_order(expansion_words);
                 let expansion = expansion_words.join(" ");
-                match self.abbrs.iter_mut().find(|a| a.name == *name) {
+                let lang = lang.unwrap_or_else(|| snippet::DEFAULT_LANG.to_string());
+                // Redefinition is keyed on both name *and* language: the
+                // same name under a different `--lang=` is a different
+                // abbreviation, not a replacement for this one.
+                match self.abbrs.iter_mut().find(|a| a.name == *name && a.lang == lang) {
                     Some(existing) => {
                         existing.expansion = expansion;
                         existing.order = order;
                     }
-                    None => self.abbrs.push(Abbr { name: name.clone(), expansion, order }),
+                    None => self.abbrs.push(Abbr { name: name.clone(), expansion, lang, order }),
                 }
                 0
             }
@@ -3234,14 +3246,15 @@ impl Shell {
                 }
                 let mut status = 0;
                 for name in rest {
-                    match self.abbrs.iter().position(|a| a.name == *name) {
-                        Some(pos) => {
-                            self.abbrs.remove(pos);
-                        }
-                        None => {
-                            sh_eprintln!(self, "bish: abbr: -e: {}: no such abbreviation", name);
-                            status = 1;
-                        }
+                    // With no `--lang=`, erasing a name erases it in
+                    // every language it was defined for -- "get rid of
+                    // `foo`" is what someone typing that means. With one,
+                    // only the exact `(name, lang)` entry goes.
+                    let before = self.abbrs.len();
+                    self.abbrs.retain(|a| a.name != *name || lang.as_ref().is_some_and(|l| a.lang != *l));
+                    if self.abbrs.len() == before {
+                        sh_eprintln!(self, "bish: abbr: -e: {}: no such abbreviation", name);
+                        status = 1;
                     }
                 }
                 status
@@ -3255,16 +3268,24 @@ impl Shell {
             Mode::Show => {
                 for abbr in &self.abbrs {
                     // A non-text-order permutation is printed back as the
-                    // same trailing 1-based run that set it, so `abbr -s`
-                    // stays something you can paste straight back in.
+                    // same trailing 1-based run that set it, and a
+                    // non-default language as the same `--lang=`, so
+                    // `abbr -s` stays something you can paste straight
+                    // back in.
                     let order = if abbr.order.is_empty() {
                         String::new()
                     } else {
                         abbr.order.iter().map(|i| format!(" {}", i + 1)).collect()
                     };
+                    let lang = if abbr.lang == snippet::DEFAULT_LANG {
+                        String::new()
+                    } else {
+                        format!("--lang={} ", crate::serialize::quote_literal(&abbr.lang))
+                    };
                     sh_println!(
                         self,
-                        "abbr -a {} {}{}",
+                        "abbr -a {}{} {}{}",
+                        lang,
                         crate::serialize::quote_literal(&abbr.name),
                         crate::serialize::quote_literal(&abbr.expansion),
                         order
@@ -3277,7 +3298,10 @@ impl Shell {
                     sh_eprintln!(self, "bish: abbr: -q: requires at least one NAME");
                     return 2;
                 }
-                if rest.iter().all(|name| self.abbrs.iter().any(|a| a.name == *name)) { 0 } else { 1 }
+                // `--lang=` narrows the question to that one language;
+                // without it, any language counts.
+                let hit = |a: &Abbr, name: &String| a.name == *name && lang.as_ref().is_none_or(|l| a.lang == *l);
+                if rest.iter().all(|name| self.abbrs.iter().any(|a| hit(a, name))) { 0 } else { 1 }
             }
         }
     }
@@ -10536,7 +10560,7 @@ mod tests {
     fn abbr_add_reads_a_trailing_integer_run_as_the_placeholder_order() {
         let mut shell = Shell::new();
         assert_eq!(shell.run_abbr(&strs(&["--add", "foo", "bar -x %s -y %s", "2", "1"])), 0);
-        assert_eq!(shell.abbrs, vec![Abbr { name: "foo".into(), expansion: "bar -x %s -y %s".into(), order: vec![1, 0] }]);
+        assert_eq!(shell.abbrs, vec![Abbr { order: vec![1, 0], ..Abbr::new("foo", "bar -x %s -y %s") }]);
     }
 
     #[test]
@@ -10571,6 +10595,65 @@ mod tests {
         let out = capture_output(&mut shell);
         shell.run_abbr(&strs(&["-s"]));
         assert_eq!(out.borrow().as_str(), "abbr -a 'foo' 'bar -x %s -y %s' 2 1\n");
+    }
+
+    #[test]
+    fn abbr_lang_scopes_an_abbreviation_and_the_same_name_can_mean_two_things() {
+        let mut shell = Shell::new();
+        assert_eq!(shell.run_abbr(&strs(&["-a", "p", "echo bash"])), 0);
+        assert_eq!(shell.run_abbr(&strs(&["--lang=rust", "-a", "p", "println!(\"%s\")"])), 0);
+        assert_eq!(shell.abbrs.len(), 2, "same name, different language -- two entries, not a redefinition");
+        // Redefining still replaces in place, keyed on both.
+        assert_eq!(shell.run_abbr(&strs(&["--lang=rust", "-a", "p", "dbg!(%s)"])), 0);
+        assert_eq!(shell.abbrs.len(), 2);
+        assert_eq!(shell.abbrs[1].expansion, "dbg!(%s)");
+        assert_eq!(shell.abbrs[0].lang, "bash");
+    }
+
+    #[test]
+    fn abbr_erase_without_a_lang_erases_the_name_everywhere() {
+        let mut shell = Shell::new();
+        shell.run_abbr(&strs(&["-a", "p", "one"]));
+        shell.run_abbr(&strs(&["--lang=rust", "-a", "p", "two"]));
+        shell.run_abbr(&strs(&["-a", "q", "three"]));
+        assert_eq!(shell.run_abbr(&strs(&["-e", "p"])), 0);
+        assert_eq!(shell.abbrs.iter().map(|a| a.name.as_str()).collect::<Vec<_>>(), vec!["q"]);
+    }
+
+    #[test]
+    fn abbr_erase_with_a_lang_erases_only_that_one() {
+        let mut shell = Shell::new();
+        shell.run_abbr(&strs(&["-a", "p", "one"]));
+        shell.run_abbr(&strs(&["--lang=rust", "-a", "p", "two"]));
+        assert_eq!(shell.run_abbr(&strs(&["--lang=rust", "-e", "p"])), 0);
+        assert_eq!(shell.abbrs.len(), 1);
+        assert_eq!(shell.abbrs[0].lang, "bash");
+        // ...and erasing a language it isn't defined for is a miss.
+        assert_eq!(shell.run_abbr(&strs(&["--lang=go", "-e", "p"])), 1);
+    }
+
+    #[test]
+    fn abbr_query_can_ask_about_one_language() {
+        let mut shell = Shell::new();
+        shell.run_abbr(&strs(&["--lang=rust", "-a", "p", "two"]));
+        assert_eq!(shell.run_abbr(&strs(&["-q", "p"])), 0, "any language counts without --lang");
+        assert_eq!(shell.run_abbr(&strs(&["--lang=rust", "-q", "p"])), 0);
+        assert_eq!(shell.run_abbr(&strs(&["--lang=bash", "-q", "p"])), 1);
+    }
+
+    #[test]
+    fn abbr_show_round_trips_a_language() {
+        let mut shell = Shell::new();
+        shell.run_abbr(&strs(&["--lang=!(bash)", "-a", "p", "note %s"]));
+        shell.run_abbr(&strs(&["-a", "plain", "echo hi"]));
+        let out = capture_output(&mut shell);
+        shell.run_abbr(&strs(&["-s"]));
+        assert_eq!(
+            out.borrow().as_str(),
+            // The default language is left off, so an abbreviation that
+            // never mentioned one still shows the way it always did.
+            "abbr -a --lang='!(bash)' 'p' 'note %s'\nabbr -a 'plain' 'echo hi'\n"
+        );
     }
 
     #[test]

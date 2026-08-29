@@ -20,7 +20,7 @@ use crate::bishedit::completion::{self, CompletionCandidate, CompletionProvider,
 use crate::bishedit::highlight::{self, BashHighlighter, Highlighter, HighlightContext, StyledSpan};
 use crate::bishedit::motion;
 use crate::bishedit::registers::{RegisterShape, RegisterValue, Registers};
-use crate::bishedit::snippet::{Abbr, Snippet};
+use crate::bishedit::snippet::{self, Abbr, LiveSnippet, Snippet};
 use crate::bishedit::suggestion::{SuggestionProvider, SuggestionRequest};
 use crate::bishedit::undo::UndoTree;
 use crate::bishedit::unicode_width::char_width;
@@ -619,79 +619,40 @@ fn accept_suggestion(ed: &mut LineEditor, tail: &str) {
     ed.splice_word(end, end, tail);
 }
 
-// A snippet that is currently spliced into the line, tentatively: the
-// model itself (bishedit::snippet::Snippet -- which placeholder is
-// active, what has been typed into each) plus the two things only the
-// line editor knows, namely where in `ed.buf` its rendered text sits and
-// what the line looked like before it got there.
-//
-// The invariant every method below preserves: `ed.buf[start..start+len]`
-// is exactly `snip.render()`, and the real cursor is wherever
-// `snip.caret()` says. Nothing else in read_line touches that span while
-// this is `Some`.
-struct SnippetState {
-    snip: Snippet,
-    start: usize,
-    // Char length of the currently-rendered text -- kept alongside
-    // `start` so a re-render knows what to splice *out*, without having
-    // to re-derive it from a model that has already changed.
-    len: usize,
-    // The whole line and cursor from immediately before the abbreviation
-    // expanded, restored verbatim by Ctrl-E. Same shape (and the same
-    // gesture) as `CompletionState::original`.
-    original: Vec<char>,
-    original_cursor: usize,
+// The line editor's own half of a live snippet: everything about
+// *editing* one lives in bishedit::snippet::LiveSnippet, shared with the
+// file editor, and all that's left here is the two-line buffer adapter
+// plus how it's drawn. `line` is always 0 -- this buffer is one line.
+impl snippet::SnippetHost for LineEditor {
+    fn replace_in_line(&mut self, _line: usize, start: usize, end: usize, text: &str) {
+        self.buf.splice(start..end, text.chars());
+    }
+
+    fn place_cursor(&mut self, _line: usize, col: usize) {
+        self.cursor = col;
+    }
 }
 
-impl SnippetState {
-    // Rewrites the snippet's span from the model and parks the cursor in
-    // the active placeholder. Called after every edit that touches the
-    // model, so the two can't drift.
-    fn sync(&mut self, ed: &mut LineEditor) {
-        let rendered: Vec<char> = self.snip.render().chars().collect();
-        ed.buf.splice(self.start..self.start + self.len, rendered.iter().copied());
-        self.len = rendered.len();
-        ed.cursor = self.start + self.snip.caret();
-    }
-
-    // Turns the tentative snippet into ordinary text: unfilled
-    // placeholders contribute nothing, and the cursor lands right after
-    // the result -- exactly where it would be if the whole thing had
-    // just been typed out by hand.
-    fn accept(self, ed: &mut LineEditor) {
-        let text = self.snip.accept();
-        ed.splice_word(self.start, self.start + self.len, &text);
-    }
-
-    fn cancel(self, ed: &mut LineEditor) {
-        ed.buf = self.original;
-        ed.cursor = self.original_cursor;
-    }
-
-    // The highlight layer that makes a tentative snippet read as one: the
-    // placeholder being typed into is reverse-video (the same "this is
-    // the selected one" mark the completion menu already uses), the rest
-    // are underlined. Both are drawn over whatever the syntax highlighter
-    // made of the text underneath, since a half-finished command line is
-    // routinely not valid syntax yet.
-    fn layer(&self) -> Vec<StyledSpan> {
-        let active = self.snip.active();
-        self.snip
-            .spans()
-            .into_iter()
-            .enumerate()
-            .map(|(i, (start, end))| StyledSpan {
-                start: self.start + start,
-                end: self.start + end,
-                fg: vt100::Color::Default,
-                attrs: if i == active {
-                    vt100::CellAttrs { reverse: true, ..vt100::CellAttrs::default() }
-                } else {
-                    vt100::CellAttrs { underline: true, ..vt100::CellAttrs::default() }
-                },
-            })
-            .collect()
-    }
+// The highlight layer that makes a tentative snippet read as one: the
+// placeholder being typed into is reverse-video (the same "this is the
+// selected one" mark the completion menu already uses), the rest are
+// underlined. Both are drawn over whatever the syntax highlighter made
+// of the text underneath, since a half-finished command line is
+// routinely not valid syntax yet.
+fn snippet_layer(live: &LiveSnippet) -> Vec<StyledSpan> {
+    live.holes()
+        .into_iter()
+        .map(|(start, end, active)| StyledSpan {
+            start,
+            end,
+            fg: vt100::Color::Default,
+            attrs: if active {
+                vt100::CellAttrs { reverse: true, ..vt100::CellAttrs::default() }
+            } else {
+                vt100::CellAttrs { underline: true, ..vt100::CellAttrs::default() }
+            },
+        })
+        .collect()
 }
 
 // Fish-style `abbr` expansion: called right as the keystroke that would
@@ -713,7 +674,7 @@ impl SnippetState {
 // trigger sites can keep using it as a match guard (`Key::Enter if
 // expand_abbr_at_cursor(..)`), the shape that gives Enter its
 // expand-first-submit-second behavior for free.
-fn expand_abbr_at_cursor(ed: &mut LineEditor, abbrs: &[Abbr], snippet: &mut Option<SnippetState>) -> bool {
+fn expand_abbr_at_cursor(ed: &mut LineEditor, abbrs: &[Abbr], snippet: &mut Option<LiveSnippet>) -> bool {
     if abbrs.is_empty() {
         return false;
     }
@@ -727,14 +688,7 @@ fn expand_abbr_at_cursor(ed: &mut LineEditor, abbrs: &[Abbr], snippet: &mut Opti
         return false;
     };
     match Snippet::parse(&abbr.expansion, &abbr.order) {
-        Some(snip) => {
-            let original = ed.buf.clone();
-            let original_cursor = ed.cursor;
-            ed.splice_word(word_start, ed.cursor, "");
-            let mut state = SnippetState { snip, start: word_start, len: 0, original, original_cursor };
-            state.sync(ed);
-            *snippet = Some(state);
-        }
+        Some(snip) => *snippet = Some(LiveSnippet::start(snip, 0, word_start, word, ed)),
         None => ed.splice_word(word_start, ed.cursor, &abbr.expansion),
     }
     true
@@ -808,7 +762,7 @@ fn redraw(prompt: &str, ed: &LineEditor, col_origin: usize, width: usize, ctx: H
 // `overlay`: whatever the caller wants marked up on top of the line --
 // a vim search's own matches in reverse video (`hlsearch`, see
 // `redraw`), or a live `abbr` snippet's placeholders (see
-// `SnippetState::layer`). Composed as the *last* layer (see
+// `snippet_layer`). Composed as the *last* layer (see
 // highlight::compose's own doc comment on later layers winning), so it
 // visually wins over both syntax highlighting and a suggestion's ghost
 // tail wherever they overlap -- matching vim, where `hlsearch` sits on
@@ -1079,7 +1033,7 @@ fn redraw_with_completion_row(
     width: usize,
     ctx: HighlightContext,
     // A live `abbr` snippet's own placeholder marking, empty the rest of
-    // the time -- see SnippetState::layer.
+    // the time -- see `snippet_layer`.
     overlay: &[StyledSpan],
 ) -> io::Result<()> {
     let mut out = compose_redraw(prompt, ed, ghost, col_origin, width, ctx, overlay);
@@ -1432,11 +1386,11 @@ pub fn read_line(
     let mut completion: Option<CompletionState> = None;
 
     // The `abbr` snippet currently spliced into the line, if any -- see
-    // SnippetState. Mutually exclusive with `completion` in practice
+    // bishedit::snippet::LiveSnippet. Mutually exclusive with `completion` in practice
     // (nothing can start one while the other is live), but nothing
     // depends on that beyond the redraw only ever having one extra layer
     // to draw.
-    let mut snippet: Option<SnippetState> = None;
+    let mut snippet: Option<LiveSnippet> = None;
 
     // Whether a completion menu was showing on the immediately-preceding
     // redraw -- see redraw_with_completion_row's own doc comment for why
@@ -1864,7 +1818,7 @@ pub fn read_line(
         // whatever the just-dispatched key actually did to the buffer/
         // completion/browse state) and before the redraw that shows it.
         suggestion = compute_suggestion(&ed, suggestion_provider, completion.is_some() || snippet.is_some(), browse.is_some());
-        let overlay = snippet.as_ref().map(SnippetState::layer).unwrap_or_default();
+        let overlay = snippet.as_ref().map(snippet_layer).unwrap_or_default();
         redraw_with_completion_row(
             prompt,
             &ed,
@@ -3942,7 +3896,7 @@ mod tests {
         pairs.iter().map(|(n, e)| Abbr::new(n, e)).collect()
     }
 
-    // The two trigger sites both pass a `&mut Option<SnippetState>`;
+    // The two trigger sites both pass a `&mut Option<LiveSnippet>`;
     // these tests are about plain (placeholder-free) expansions, where it
     // is never written to.
     fn expand(ed: &mut LineEditor, table: &[Abbr]) -> bool {
@@ -4006,15 +3960,15 @@ mod tests {
     // (bishedit::snippet's own tests) and the seam between the model and
     // the line editor, which is this.
 
-    fn start_snippet(line: &str, cursor: usize, expansion: &str, order: &[usize]) -> (LineEditor, SnippetState) {
+    fn start_snippet(line: &str, cursor: usize, expansion: &str, order: &[usize]) -> (LineEditor, LiveSnippet) {
         let mut ed = make_editor(line, cursor);
-        let table = vec![Abbr { name: "foo".to_string(), expansion: expansion.to_string(), order: order.to_vec() }];
+        let table = vec![Abbr { order: order.to_vec(), ..Abbr::new("foo", expansion) }];
         let mut snippet = None;
         assert!(expand_abbr_at_cursor(&mut ed, &table, &mut snippet));
         (ed, snippet.expect("an expansion with placeholders is a snippet"))
     }
 
-    fn type_text(ed: &mut LineEditor, state: &mut SnippetState, text: &str) {
+    fn type_text(ed: &mut LineEditor, state: &mut LiveSnippet, text: &str) {
         for c in text.chars() {
             state.snip.type_char(c);
             state.sync(ed);
@@ -4025,7 +3979,7 @@ mod tests {
     fn an_expansion_with_placeholders_splices_in_tentatively() {
         let (ed, state) = start_snippet("foo", 3, "bar -x %s -y %s | qoo", &[]);
         assert_eq!(ed.as_string(), "bar -x %s -y %s | qoo");
-        assert_eq!(state.start, 0);
+        assert_eq!(state.holes()[0].0, 7, "the first placeholder starts after `bar -x `");
         // The caret parks at the first placeholder, not at the end of the
         // expansion the way a plain abbreviation leaves it.
         assert_eq!(ed.cursor, 7);
@@ -4067,7 +4021,7 @@ mod tests {
     #[test]
     fn the_placeholder_layer_marks_the_active_one_differently() {
         let (_, state) = start_snippet("foo", 3, "a %s b %s", &[]);
-        let layer = state.layer();
+        let layer = snippet_layer(&state);
         assert_eq!(layer.len(), 2);
         assert!(layer[0].attrs.reverse, "the placeholder being typed into is the reverse-video one");
         assert!(!layer[1].attrs.reverse && layer[1].attrs.underline);
@@ -4076,8 +4030,7 @@ mod tests {
     #[test]
     fn the_layer_is_offset_by_where_the_snippet_actually_sits() {
         let (_, state) = start_snippet("echo hi; foo", 12, "cd %s", &[]);
-        assert_eq!(state.start, 9);
-        let layer = state.layer();
+        let layer = snippet_layer(&state);
         // "echo hi; cd " is 12 chars, then the `%s`.
         assert_eq!((layer[0].start, layer[0].end), (12, 14));
     }

@@ -22,14 +22,28 @@
 // tentative snippet legible as one.
 pub const PLACEHOLDER: &str = "%s";
 
+// The language an abbreviation targets unless `--lang=` says otherwise,
+// and the language the shell prompt itself counts as -- so an
+// abbreviation written without thinking about languages at all keeps
+// working exactly where it always did.
+pub const DEFAULT_LANG: &str = "bash";
+
 // One stored abbreviation. Lives here rather than in exec.rs so that
-// editor.rs -- which does the expanding -- can name the type without
-// depending on the shell: exec.rs owns the *table*, this is just its
-// record. See `Shell::abbrs` for the storage/trigger split.
+// editor.rs and fileeditor.rs -- which do the expanding -- can name the
+// type without depending on the shell: exec.rs owns the *table*, this is
+// just its record. See `Shell::abbrs` for the storage/trigger split.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Abbr {
     pub name: String,
     pub expansion: String,
+    // `--lang=`: a glob matched against the language of wherever
+    // expansion is being attempted -- `bash` at the shell prompt, the
+    // file's own language in the editor (see
+    // fileeditor::language_of). A glob rather than a plain name so one
+    // abbreviation can cover a family (`--lang='*script'`) or everything
+    // but one (`--lang='!(bash)'`, which the shared glob engine already
+    // understands as an extglob).
+    pub lang: String,
     // The order the expansion's placeholders are visited in: 0-based
     // indices into them in text order, a permutation of `0..n`. Empty
     // means text order, which is also what every abbreviation without
@@ -40,8 +54,25 @@ pub struct Abbr {
 
 impl Abbr {
     pub fn new(name: &str, expansion: &str) -> Abbr {
-        Abbr { name: name.to_string(), expansion: expansion.to_string(), order: Vec::new() }
+        Abbr { name: name.to_string(), expansion: expansion.to_string(), lang: DEFAULT_LANG.to_string(), order: Vec::new() }
     }
+
+    // Whether this abbreviation is live in `language`. Uses the shell's
+    // own glob engine, so `--lang=` accepts exactly what a `case` pattern
+    // does -- including `!(...)`, `@(a|b)` and character classes -- with
+    // no second pattern dialect to learn or to maintain.
+    pub fn applies_to(&self, language: &str) -> bool {
+        crate::glob::matches(&self.lang, language)
+    }
+}
+
+// The abbreviations from `table` that are live in `language`, in
+// definition order. Both trigger sites take this snapshot rather than
+// filtering at lookup time: the table is small, the filter result is
+// stable for a whole prompt (or a whole Insert-mode session), and it
+// keeps `expand_abbr_at_cursor` from needing to know what a language is.
+pub fn for_language(table: &[Abbr], language: &str) -> Vec<Abbr> {
+    table.iter().filter(|a| a.applies_to(language)).cloned().collect()
 }
 
 // A live snippet: the expansion split around its placeholders, plus what
@@ -142,6 +173,31 @@ pub fn parse_order(words: &[String]) -> (&[String], Vec<usize>) {
     let count = placeholder_count(&head.join(" "));
     let order: Vec<usize> = tail.iter().filter_map(|w| w.parse::<usize>().ok()).map(|n| n.wrapping_sub(1)).collect();
     if is_valid_order(&order, count) { (head, order) } else { (words, Vec::new()) }
+}
+
+// Pulls `--lang=GLOB` out of `abbr`'s own argument list, returning the
+// rest and the glob. Only recognized among the *leading* options -- the
+// run of `-a`/`--erase`/... flags before the NAME -- so `abbr -a foo echo
+// --lang=x` still stores four ordinary words of expansion, the same way
+// `parse_order` only reads a trailing integer run where the user
+// actually split it off. Order within that run doesn't matter: both
+// `abbr --lang=rust -a foo ...` and `abbr -a --lang=rust foo ...` work.
+pub fn take_lang_flag(args: &[String]) -> (Vec<String>, Option<String>) {
+    const MODE_FLAGS: [&str; 10] = ["-a", "--add", "-e", "--erase", "-l", "--list", "-s", "--show", "-q", "--query"];
+    let mut lang = None;
+    let mut rest = Vec::with_capacity(args.len());
+    let mut leading = true;
+    for arg in args {
+        if leading && let Some(value) = arg.strip_prefix("--lang=") {
+            lang = Some(value.to_string());
+            continue;
+        }
+        if !MODE_FLAGS.contains(&arg.as_str()) {
+            leading = false;
+        }
+        rest.push(arg.clone());
+    }
+    (rest, lang)
 }
 
 impl Snippet {
@@ -252,6 +308,91 @@ impl Snippet {
             }
         }
         out
+    }
+}
+
+// ---------------------------------------------------------------------
+// A snippet spliced into a real buffer
+// ---------------------------------------------------------------------
+
+// The one thing a live snippet needs from whatever buffer it's spliced
+// into. An `abbr` expansion is a single line by construction (`run_abbr`
+// joins its words with spaces), so a snippet never spans one either --
+// which is what lets the shell prompt's single-line `LineEditor` and the
+// file editor's multi-line `TextBuffer` share every operation below
+// instead of each growing its own copy of them.
+pub trait SnippetHost {
+    // Replace chars `[start, end)` of `line` with `text`.
+    fn replace_in_line(&mut self, line: usize, start: usize, end: usize, text: &str);
+    fn place_cursor(&mut self, line: usize, col: usize);
+}
+
+// A snippet that is currently spliced into a buffer, tentatively: the
+// model plus where its rendered text sits and what was there before it.
+//
+// The invariant every method preserves: chars `[col, col + len)` of
+// `line` are exactly `snip.render()`, and the cursor is wherever
+// `snip.caret()` says. Nothing else should touch that span while this
+// is alive.
+pub struct LiveSnippet {
+    pub snip: Snippet,
+    line: usize,
+    col: usize,
+    len: usize,
+    // The abbreviation name this replaced -- what `cancel` puts back.
+    original: String,
+}
+
+impl LiveSnippet {
+    // Replaces the abbreviation name at `[col, col + original.len())` of
+    // `line` with the snippet's first rendering, caret in the first
+    // placeholder.
+    pub fn start(snip: Snippet, line: usize, col: usize, original: String, host: &mut impl SnippetHost) -> LiveSnippet {
+        let len = original.chars().count();
+        let mut live = LiveSnippet { snip, line, col, len, original };
+        live.sync(host);
+        live
+    }
+
+    // Rewrites the span from the model and parks the cursor in the
+    // active placeholder. Called after every edit to the model, so the
+    // two can't drift.
+    pub fn sync(&mut self, host: &mut impl SnippetHost) {
+        let rendered = self.snip.render();
+        host.replace_in_line(self.line, self.col, self.col + self.len, &rendered);
+        self.len = rendered.chars().count();
+        host.place_cursor(self.line, self.col + self.snip.caret());
+    }
+
+    // Turns the tentative snippet into ordinary text: unfilled
+    // placeholders contribute nothing, and the cursor lands right after
+    // the result -- exactly where it would be had the whole thing just
+    // been typed out by hand.
+    pub fn accept(self, host: &mut impl SnippetHost) {
+        let text = self.snip.accept();
+        host.replace_in_line(self.line, self.col, self.col + self.len, &text);
+        host.place_cursor(self.line, self.col + text.chars().count());
+    }
+
+    pub fn cancel(self, host: &mut impl SnippetHost) {
+        host.replace_in_line(self.line, self.col, self.col + self.len, &self.original);
+        host.place_cursor(self.line, self.col + self.original.chars().count());
+    }
+
+    pub fn line(&self) -> usize {
+        self.line
+    }
+
+    // Every placeholder as `(start_col, end_col, is_active)` on `line` --
+    // what each of the two renderers turns into its own highlighting.
+    pub fn holes(&self) -> Vec<(usize, usize, bool)> {
+        let active = self.snip.active();
+        self.snip
+            .spans()
+            .into_iter()
+            .enumerate()
+            .map(|(i, (start, end))| (self.col + start, self.col + end, i == active))
+            .collect()
     }
 }
 
@@ -374,6 +515,60 @@ mod tests {
         let s = snip("%%s is %s");
         assert_eq!(s.render(), "%s is %s", "the escaped one is literal text, only the second is a hole");
         assert_eq!(s.spans(), vec![(6, 8)]);
+    }
+
+    fn strs(words: &[&str]) -> Vec<String> {
+        words.iter().map(|w| w.to_string()).collect()
+    }
+
+    #[test]
+    fn a_language_glob_is_the_shells_own_glob() {
+        let mut a = Abbr::new("foo", "bar");
+        assert_eq!(a.lang, DEFAULT_LANG);
+        assert!(a.applies_to("bash"));
+        assert!(!a.applies_to("rust"));
+
+        a.lang = "*script".to_string();
+        assert!(a.applies_to("javascript") && a.applies_to("typescript"));
+        assert!(!a.applies_to("rust"));
+
+        // Inverse globbing, via the extglob the shared engine already
+        // understands -- everything *except* bash.
+        a.lang = "!(bash)".to_string();
+        assert!(a.applies_to("rust") && a.applies_to("text"));
+        assert!(!a.applies_to("bash"));
+
+        a.lang = "@(rust|go)".to_string();
+        assert!(a.applies_to("rust") && a.applies_to("go") && !a.applies_to("bash"));
+
+        a.lang = "*".to_string();
+        assert!(a.applies_to("anything at all"));
+    }
+
+    #[test]
+    fn for_language_keeps_definition_order() {
+        let table = vec![
+            Abbr::new("a", "one"),
+            Abbr { lang: "rust".into(), ..Abbr::new("b", "two") },
+            Abbr { lang: "!(bash)".into(), ..Abbr::new("c", "three") },
+        ];
+        let names = |lang: &str| for_language(&table, lang).into_iter().map(|a| a.name).collect::<Vec<_>>();
+        assert_eq!(names("bash"), vec!["a"]);
+        assert_eq!(names("rust"), vec!["b", "c"]);
+        assert_eq!(names("toml"), vec!["c"]);
+    }
+
+    #[test]
+    fn the_lang_flag_is_only_read_among_the_leading_options() {
+        // Either side of the mode flag.
+        assert_eq!(take_lang_flag(&strs(&["--lang=rust", "-a", "foo", "bar"])), (strs(&["-a", "foo", "bar"]), Some("rust".into())));
+        assert_eq!(take_lang_flag(&strs(&["-a", "--lang=rust", "foo", "bar"])), (strs(&["-a", "foo", "bar"]), Some("rust".into())));
+        // With no mode flag at all (`abbr NAME EXPANSION` means add).
+        assert_eq!(take_lang_flag(&strs(&["--lang=rust", "foo", "bar"])), (strs(&["foo", "bar"]), Some("rust".into())));
+        // After the NAME it is ordinary expansion text, the same way
+        // `parse_order` only reads a trailing integer run.
+        assert_eq!(take_lang_flag(&strs(&["-a", "foo", "echo", "--lang=x"])), (strs(&["-a", "foo", "echo", "--lang=x"]), None));
+        assert_eq!(take_lang_flag(&strs(&["-a", "foo", "bar"])), (strs(&["-a", "foo", "bar"]), None));
     }
 
     #[test]
