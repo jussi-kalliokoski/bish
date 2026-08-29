@@ -165,6 +165,13 @@ impl Grid {
         }
     }
 
+    // Whether every cell of `row` is untouched -- what tells a shrink
+    // that a row below the cursor is spare space it can just discard
+    // rather than history it has to preserve.
+    fn row_is_blank(&self, row: usize) -> bool {
+        (0..self.cols).all(|c| self.cells[row * self.cols + c] == Cell::default())
+    }
+
     // When shrinking rows, keeps the *bottom* `rows` of the old grid --
     // the ones most likely to still hold the live cursor/prompt -- not
     // the top ones: a naive top-anchored copy (this function's own
@@ -172,9 +179,13 @@ impl Grid {
     // actually sitting on, leaving a resized-down pane showing stale
     // top-of-screen content with a fresh prompt then written on top of
     // it at the wrong row entirely (e.g. splitting a window that's
-    // already scrolled full of output). Growing still keeps everything,
+    // already scrolled full of output). Growing keeps everything,
     // top-anchored (`src_start_row` is 0 whenever `rows >= self.rows`),
-    // since nothing needs discarding either way. Returns whatever rows
+    // since nothing needs discarding either way -- `Screen::resize` then
+    // hands back a matching number of scrollback rows via
+    // `prepend_rows`, which is what makes a shrink and a later re-grow
+    // cancel out instead of losing what the shrink pushed away. Returns
+    // whatever rows
     // this dropped off the top (each paired with its own wrapped flag,
     // same shape as `scroll_up`'s own return) so `Screen::resize` can
     // push them into scrollback exactly like an ordinary scroll would --
@@ -184,7 +195,29 @@ impl Grid {
         let rows = rows.max(1);
         let cols = cols.max(1);
         let overlap_rows = self.rows.min(rows);
-        let src_start_row = self.rows.saturating_sub(overlap_rows);
+        // Which end a shrink takes its rows from. Blank rows *below* the
+        // cursor carry nothing, so they go first and are simply
+        // discarded -- only once those run out does anything real get
+        // pushed off the top into scrollback. That's what makes a shrink
+        // and a later re-grow cancel out for a grid that isn't full yet
+        // (a pane holding a couple of prompts and acres of blank space,
+        // which `:diag` expanding and collapsing resizes twice in a row):
+        // top-anchored dropping would push those prompts into scrollback
+        // and clamp the cursor to 0, losing where it really was, and
+        // `prepend_rows` on the way back has no way to work that out
+        // again. A grid that *is* full (the cursor on its last row --
+        // "already scrolled full of output" above) has no spare rows
+        // here, so it drops from the top exactly as before.
+        let shrink = self.rows.saturating_sub(rows);
+        let mut from_bottom = 0;
+        while from_bottom < shrink {
+            let candidate = self.rows - 1 - from_bottom;
+            if candidate <= self.cursor_row || !self.row_is_blank(candidate) {
+                break;
+            }
+            from_bottom += 1;
+        }
+        let src_start_row = shrink - from_bottom;
         let mut dropped = Vec::with_capacity(src_start_row);
         for r in 0..src_start_row {
             let row: Vec<Cell> = (0..self.cols).map(|c| self.cells[r * self.cols + c]).collect();
@@ -210,6 +243,40 @@ impl Grid {
         self.scroll_bottom = rows - 1;
         self.pending_wrap = false;
         dropped
+    }
+
+    // `resize`'s own counterpart for the growing direction: puts
+    // `restored` rows back at the top, shifting what's already here down
+    // by that many rows and carrying the cursor with it. `restored` is
+    // in top-to-bottom order, oldest first.
+    //
+    // Rows come out of a scrollback that may have been captured at a
+    // different width, so each is padded or truncated to this grid's own
+    // columns rather than assumed to fit -- a shrink-then-regrow that
+    // also changed width puts back as much of each line as there's now
+    // room for, instead of indexing past the end of it.
+    fn prepend_rows(&mut self, restored: &[(Vec<Cell>, bool)]) {
+        let n = restored.len().min(self.rows);
+        if n == 0 {
+            return;
+        }
+        let mut cells = vec![Cell::default(); self.rows * self.cols];
+        let mut wrapped = vec![false; self.rows];
+        for (r, (row, row_wrapped)) in restored[restored.len() - n..].iter().enumerate() {
+            for c in 0..self.cols.min(row.len()) {
+                cells[r * self.cols + c] = row[c];
+            }
+            wrapped[r] = *row_wrapped;
+        }
+        for r in 0..self.rows - n {
+            for c in 0..self.cols {
+                cells[(r + n) * self.cols + c] = self.cells[r * self.cols + c];
+            }
+            wrapped[r + n] = self.wrapped[r];
+        }
+        self.cells = cells;
+        self.wrapped = wrapped;
+        self.cursor_row = (self.cursor_row + n).min(self.rows - 1);
     }
 
     // Clamped, not a bounds-checked panic: a caller computing (row, col)
@@ -469,6 +536,11 @@ impl Screen {
         // shell underneath it). The alternate grid's own dropped rows
         // are simply discarded, matching line_feed_no_scroll_check's
         // "alternate screen buffers don't get a scrollback" rule.
+        // How many rows the primary grid is about to gain, read before
+        // the resize that grants them. Growing and shrinking are mutually
+        // exclusive, so at most one of this and `dropped` below is ever
+        // non-zero.
+        let grew_by = rows.max(1).saturating_sub(self.primary.rows);
         let dropped = self.primary.resize(rows, cols);
         for (line, wrapped) in dropped {
             self.scrollback.push_back(line);
@@ -477,6 +549,26 @@ impl Screen {
                 self.scrollback.pop_front();
                 self.scrollback_wrapped.pop_front();
             }
+        }
+        // The other direction: rows the grid just gained are filled from
+        // the bottom of the scrollback, so a pane that shrinks and grows
+        // back -- `:diag` expanding and collapsing, a split closing, a
+        // window made taller again -- shows exactly what it showed
+        // before, instead of the shrink's rows staying gone with blank
+        // space appearing at the bottom. Real terminals restore on growth
+        // the same way. The whole document (scrollback followed by the
+        // grid) is unchanged by the move either way, which is what keeps
+        // Ctrl+Space's own scrollback view consistent across it.
+        let restored_count = grew_by.min(self.scrollback.len());
+        if restored_count > 0 {
+            let mut restored: Vec<(Vec<Cell>, bool)> = Vec::with_capacity(restored_count);
+            for _ in 0..restored_count {
+                let line = self.scrollback.pop_back().expect("counted against scrollback's own length");
+                let wrapped = self.scrollback_wrapped.pop_back().unwrap_or(false);
+                restored.push((line, wrapped));
+            }
+            restored.reverse();
+            self.primary.prepend_rows(&restored);
         }
         self.alternate.resize(rows, cols);
     }
@@ -1208,13 +1300,73 @@ mod tests {
     }
 
     #[test]
-    fn growing_rows_stays_top_anchored_with_nothing_dropped() {
+    fn growing_rows_stays_top_anchored_when_there_is_no_history_to_restore() {
         let mut s = Screen::new(2, 6);
         s.feed(b"one\r\ntwo");
         s.resize(4, 6);
         assert_eq!(text_row(&s, 0), "one");
         assert_eq!(text_row(&s, 1), "two");
         assert!(s.scrollback.is_empty());
+    }
+
+    #[test]
+    fn growing_rows_pulls_content_back_out_of_scrollback() {
+        let mut s = Screen::new(3, 6);
+        s.feed(b"one\r\ntwo\r\nthree");
+        s.resize(2, 6);
+        assert_eq!(s.scrollback.len(), 1, "the shrink pushed \"one\" away");
+        s.resize(3, 6);
+        assert!(s.scrollback.is_empty(), "growing took it back");
+        assert_eq!(text_row(&s, 0), "one");
+        assert_eq!(text_row(&s, 1), "two");
+        assert_eq!(text_row(&s, 2), "three");
+        assert_eq!(s.cursor(), (2, 5), "and the cursor rode back down with its own row");
+    }
+
+    #[test]
+    fn shrinking_spends_spare_blank_rows_below_the_cursor_before_touching_history() {
+        // A pane holding a couple of prompts and acres of blank space --
+        // what a shell pane looks like most of the time, and what `:diag`
+        // resizes twice in a row. Nothing here is history yet, so a
+        // shrink has no business pushing any of it away.
+        let mut s = Screen::new(6, 6);
+        s.feed(b"one\r\ntwo\r\n");
+        assert_eq!(s.cursor(), (2, 0));
+        s.resize(3, 6);
+        assert!(s.scrollback.is_empty(), "the three blank rows below the cursor were the ones to give up");
+        assert_eq!(text_row(&s, 0), "one");
+        assert_eq!(text_row(&s, 1), "two");
+        assert_eq!(s.cursor(), (2, 0), "and the cursor never moved");
+    }
+
+    #[test]
+    fn a_shrink_and_a_regrow_leave_a_partly_filled_grid_exactly_as_it_was() {
+        // The `:diag` round trip, reduced: expanding the pane shrinks
+        // this grid, collapsing it grows it back, and the prompt has to
+        // still be on the row it was on -- otherwise the next one draws
+        // somewhere else and the old one stays behind as a ghost.
+        let mut s = Screen::new(8, 6);
+        s.feed(b"$ e f\r\n");
+        let before: Vec<String> = (0..8).map(|r| text_row(&s, r)).collect();
+        let cursor = s.cursor();
+        s.resize(4, 6);
+        s.resize(8, 6);
+        assert_eq!((0..8).map(|r| text_row(&s, r)).collect::<Vec<_>>(), before);
+        assert_eq!(s.cursor(), cursor);
+    }
+
+    #[test]
+    fn a_full_grid_still_round_trips_through_scrollback() {
+        // No spare rows below the cursor at all, so the shrink genuinely
+        // has to spend history -- and the regrow has to hand it back.
+        let mut s = Screen::new(3, 6);
+        s.feed(b"one\r\ntwo\r\nthree");
+        let before: Vec<String> = (0..3).map(|r| text_row(&s, r)).collect();
+        let cursor = s.cursor();
+        s.resize(2, 6);
+        s.resize(3, 6);
+        assert_eq!((0..3).map(|r| text_row(&s, r)).collect::<Vec<_>>(), before);
+        assert_eq!(s.cursor(), cursor);
     }
 
     #[test]
