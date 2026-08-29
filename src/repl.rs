@@ -881,6 +881,23 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
                         windows[current_window].focused_pane = pane_id;
                         compositor_redraw(&sessions, &windows, current_window, term_rows, term_cols);
                     }
+                    Some(ClickTarget::Divider(divider)) => {
+                        // Resume the prompt afterwards with exactly what
+                        // was typed -- a resize is not a reason to lose
+                        // it, any more than clicking the pane it's
+                        // already in would be.
+                        pending_initial = Some((text, cursor));
+                        drag_divider(
+                            &divider,
+                            &mut sessions,
+                            &mut windows,
+                            &mut job_frames,
+                            current_window,
+                            &mut term_rows,
+                            &mut term_cols,
+                            sinks_are_grid,
+                        );
+                    }
                     _ => pending_initial = Some((text, cursor)),
                 }
             }
@@ -4017,7 +4034,7 @@ struct PaneSnapshot {
 // them (see compute_regions).
 struct CompositorLayout {
     panes: Vec<PaneSnapshot>,
-    dividers: Vec<(Rect, bool)>,
+    dividers: Vec<Divider>,
 }
 
 // Floor under any single child's weight when computing shares below --
@@ -4103,7 +4120,20 @@ fn split_sizes(children: &[SplitChild], usable: usize) -> Vec<usize> {
 // Split trying to draw into space a child might otherwise want --
 // skipped entirely between a minimized child and its neighbor (see
 // dividers_after).
-fn compute_regions(layout: &PaneLayout, area: Rect, out: &mut Vec<(PaneId, Rect)>, dividers: &mut Vec<(Rect, bool)>) {
+fn compute_regions(layout: &PaneLayout, area: Rect, out: &mut Vec<(PaneId, Rect)>, dividers: &mut Vec<Divider>) {
+    compute_regions_at(layout, area, out, dividers, &mut Vec::new());
+}
+
+// compute_regions' own recursion, carrying the path from the layout root
+// down to whichever Split is being laid out right now -- each entry is
+// the child index taken at that level. A divider records that path plus
+// the index of the child it follows, which is the only way to name the
+// thing a drag has to resize: a `SplitChild` has no identity of its own,
+// and the pane ids underneath it belong to leaves that can be nested
+// arbitrarily deep. `split_axis` is the axis length that child's own size
+// is a share of, so a drag can turn a screen position straight into a
+// fraction without re-deriving the layout.
+fn compute_regions_at(layout: &PaneLayout, area: Rect, out: &mut Vec<(PaneId, Rect)>, dividers: &mut Vec<Divider>, path: &mut Vec<usize>) {
     match layout {
         PaneLayout::Leaf(id) => out.push((*id, area)),
         PaneLayout::Split { horizontal, children } => {
@@ -4121,10 +4151,19 @@ fn compute_regions(layout: &PaneLayout, area: Rect, out: &mut Vec<(PaneId, Rect)
                 let mut row = area.row;
                 for (i, child) in children.iter().enumerate() {
                     let h = sizes[i];
-                    compute_regions(&child.layout, Rect { row, col: area.col, rows: h, cols: area.cols }, out, dividers);
+                    path.push(i);
+                    compute_regions_at(&child.layout, Rect { row, col: area.col, rows: h, cols: area.cols }, out, dividers, path);
+                    path.pop();
                     row += h;
                     if i + 1 < n && draws_divider[i] {
-                        dividers.push((Rect { row, col: area.col, rows: 1, cols: area.cols }, true));
+                        dividers.push(Divider {
+                            rect: Rect { row, col: area.col, rows: 1, cols: area.cols },
+                            horizontal: true,
+                            path: path.clone(),
+                            child: i,
+                            split_start: area.row,
+                            split_axis: usable,
+                        });
                         row += 1;
                     }
                 }
@@ -4136,16 +4175,40 @@ fn compute_regions(layout: &PaneLayout, area: Rect, out: &mut Vec<(PaneId, Rect)
                 let mut col = area.col;
                 for (i, child) in children.iter().enumerate() {
                     let w = sizes[i];
-                    compute_regions(&child.layout, Rect { row: area.row, col, rows: area.rows, cols: w }, out, dividers);
+                    path.push(i);
+                    compute_regions_at(&child.layout, Rect { row: area.row, col, rows: area.rows, cols: w }, out, dividers, path);
+                    path.pop();
                     col += w;
                     if i + 1 < n && draws_divider[i] {
-                        dividers.push((Rect { row: area.row, col, rows: area.rows, cols: 1 }, false));
+                        dividers.push(Divider {
+                            rect: Rect { row: area.row, col, rows: area.rows, cols: 1 },
+                            horizontal: false,
+                            path: path.clone(),
+                            child: i,
+                            split_start: area.col,
+                            split_axis: usable,
+                        });
                         col += 1;
                     }
                 }
             }
         }
     }
+}
+
+// One divider strip, plus everything a drag needs to resize what it
+// separates -- see compute_regions_at.
+#[derive(Clone)]
+struct Divider {
+    rect: Rect,
+    horizontal: bool,
+    path: Vec<usize>,
+    child: usize,
+    // Where the owning Split's own area starts on the divider's axis, and
+    // how much of that axis its children actually divide up (the area
+    // minus the strips the dividers themselves occupy).
+    split_start: usize,
+    split_axis: usize,
 }
 
 // (col_origin, width): the real terminal column the given window's
@@ -4223,6 +4286,68 @@ const RESIZE_STEP: f64 = 0.2;
 // set_focused_pane_size need to read or adjust *only* the target's own
 // weight. None if the window isn't split at all (target is the whole
 // layout, a bare Leaf with no enclosing Split).
+// Walks `path` (see compute_regions_at) down to the Split it names.
+fn split_children_at<'a>(layout: &'a mut PaneLayout, path: &[usize]) -> Option<&'a mut Vec<SplitChild>> {
+    let mut node = layout;
+    for step in path {
+        match node {
+            PaneLayout::Split { children, .. } => node = &mut children.get_mut(*step)?.layout,
+            PaneLayout::Leaf(_) => return None,
+        }
+    }
+    match node {
+        PaneLayout::Split { children, .. } => Some(children),
+        PaneLayout::Leaf(_) => None,
+    }
+}
+
+// Gives `children[idx]` the share of its split's axis that `fraction`
+// names, by solving for the weight that produces it: split_sizes divides
+// the axis in proportion to weight/(sum of all siblings'), so a target
+// fraction f wants weight = f * sum_others / (1 - f). Clamped well short
+// of 0 and 1 so a drag to the very edge leaves both sides usable rather
+// than collapsing one -- compute_regions' own `.max(1)` would keep a pane
+// one cell tall, which is not a state anyone wants to drag back out of.
+fn set_child_weight_to_fraction(children: &mut [SplitChild], idx: usize, fraction: f64) {
+    let old_weight = children[idx].weight.max(MIN_PANE_WEIGHT);
+    let total_weight: f64 = children.iter().map(|c| c.weight.max(MIN_PANE_WEIGHT)).sum();
+    let sum_others = (total_weight - old_weight).max(MIN_PANE_WEIGHT);
+    let fraction = fraction.clamp(0.05, 0.95);
+    children[idx].weight = (fraction * sum_others / (1.0 - fraction)).max(MIN_PANE_WEIGHT);
+}
+
+// Drags `divider` to real terminal row/column `to` (whichever axis it
+// runs across), by resizing the child immediately before it. Returns
+// whether the layout actually changed, so a caller driving a stream of
+// motion events only repaints when something moved.
+//
+// A `fixed`-sized child (the diagnostics pane while expanded -- see
+// SplitChild's own doc comment) has its `fixed` set directly instead:
+// its weight is ignored while that's set, so solving for one would do
+// nothing at all.
+fn resize_split_child_to(window: &mut WindowEntry, divider: &Divider, to: usize) -> bool {
+    if divider.split_axis == 0 {
+        return false;
+    }
+    let desired = to.saturating_sub(divider.split_start).max(1).min(divider.split_axis.saturating_sub(1));
+    let Some(children) = split_children_at(&mut window.layout, &divider.path) else {
+        return false;
+    };
+    if divider.child >= children.len() {
+        return false;
+    }
+    if children[divider.child].fixed.is_some() {
+        if children[divider.child].fixed == Some(desired) {
+            return false;
+        }
+        children[divider.child].fixed = Some(desired);
+        return true;
+    }
+    let before = children[divider.child].weight;
+    set_child_weight_to_fraction(children, divider.child, desired as f64 / divider.split_axis as f64);
+    children[divider.child].weight != before
+}
+
 fn find_parent_split_mut(layout: &mut PaneLayout, target: PaneId) -> Option<(bool, &mut Vec<SplitChild>, usize)> {
     match layout {
         PaneLayout::Leaf(_) => None,
@@ -4296,7 +4421,6 @@ fn set_focused_pane_size(window: &mut WindowEntry, spec: exec::SizeSpec, term_ro
     let axis_size = if horizontal { current_rect.rows } else { current_rect.cols };
     let old_weight = children[idx].weight.max(MIN_PANE_WEIGHT);
     let total_weight: f64 = children.iter().map(|c| c.weight.max(MIN_PANE_WEIGHT)).sum();
-    let sum_others = (total_weight - old_weight).max(MIN_PANE_WEIGHT);
     let fraction = match spec {
         exec::SizeSpec::Percent(p) => p / 100.0,
         exec::SizeSpec::Fraction(f) => f,
@@ -4308,9 +4432,7 @@ fn set_focused_pane_size(window: &mut WindowEntry, spec: exec::SizeSpec, term_ro
             (n as f64) / approx_total_usable
         }
     };
-    let fraction = fraction.clamp(0.05, 0.95);
-    let new_weight = fraction * sum_others / (1.0 - fraction);
-    children[idx].weight = new_weight.max(MIN_PANE_WEIGHT);
+    set_child_weight_to_fraction(children, idx, fraction);
 }
 
 // Resolves a window's layout against the real terminal size into a
@@ -4383,8 +4505,8 @@ fn build_compositor_frame_output(layout: &CompositorLayout, tab_bar: &str, term_
         }
     }
 
-    for (rect, horizontal) in &layout.dividers {
-        draw_divider(&mut out, *rect, *horizontal);
+    for divider in &layout.dividers {
+        draw_divider(&mut out, divider.rect, divider.horizontal);
     }
 
     // Tab bar pinned to the terminal's real last row.
@@ -5764,7 +5886,12 @@ fn run_normal_mode_navigation(
     // rule, which would otherwise throw away a double-clicked word that
     // happened to be a single character long.
     let mut last_press: Option<(std::time::Instant, u16, u16)> = None;
-    let mut word_selected = false;
+    // How many presses in a row have landed on the same cell inside the
+    // double-click window: 1 places the cursor, 2 selects the word, 3
+    // selects the line. Reset by any press elsewhere, or one that came
+    // too late.
+    let mut click_streak: u32 = 0;
+    let mut ranged_selection = false;
 
     let result: (NavExit, Option<(TextBuffer, VimKeys)>) = 'nav: loop {
         // Recomputed every iteration, not just once up front: this pane's
@@ -5904,29 +6031,58 @@ fn run_normal_mode_navigation(
                     // click disarms it again on release (below), so
                     // clicking somewhere doesn't leave an empty
                     // selection behind for Escape to clear.
+                    Some(ClickTarget::Divider(divider)) => {
+                        drag_divider(&divider, sessions, windows, job_frames, *current_window, term_rows, term_cols, *sinks_are_grid);
+                        // The pane this loop is drawing into may have
+                        // changed size under it; every later frame is
+                        // addressed against `rect`, recomputed at the top
+                        // of the next iteration.
+                        render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides);
+                        continue 'nav;
+                    }
                     Some(ClickTarget::Pane(_)) => {
                         let row0 = (ev.row as usize).saturating_sub(1);
                         let col0 = (ev.col as usize).saturating_sub(1);
                         let now = std::time::Instant::now();
-                        let double = last_press
+                        let repeat = last_press
                             .is_some_and(|(at, r, c)| (r, c) == (ev.row, ev.col) && now.duration_since(at) < DOUBLE_CLICK_WINDOW);
+                        // Caps at 3: a fourth press starts over rather
+                        // than doing nothing, so click-spamming cycles
+                        // cursor / word / line instead of dead-ending.
+                        click_streak = if repeat { click_streak % 3 + 1 } else { 1 };
                         last_press = Some((now, ev.row, ev.col));
-                        word_selected = false;
+                        ranged_selection = false;
                         if place_nav_cursor_at(&mut buf, rect, row0, col0) {
                             buf.selections_mut().clear();
                             vk.end_visual(buf.cursor());
-                            // A second click on the same cell selects the
-                            // word under it -- the same `iw` text object
-                            // `viw` would give, so "double-click a word"
-                            // and "select a word" can't disagree about
-                            // where one ends.
-                            match double.then(|| motion::text_object_range(&buf, motion::TextObjectKind::Word, false, None)).flatten() {
-                                Some(range) => {
-                                    vk.begin_visual(RegisterShape::Char, range.from);
-                                    buf.set_cursor(range.to.0, range.to.1);
-                                    word_selected = true;
+                            match click_streak {
+                                // A second click on the same cell selects
+                                // the word under it -- the same `iw` text
+                                // object `viw` would give, so
+                                // "double-click a word" and "select a
+                                // word" can't disagree about where one
+                                // ends.
+                                2 => match motion::text_object_range(&buf, motion::TextObjectKind::Word, false, None) {
+                                    Some(range) => {
+                                        vk.begin_visual(RegisterShape::Char, range.from);
+                                        buf.set_cursor(range.to.0, range.to.1);
+                                        ranged_selection = true;
+                                    }
+                                    // Clicked on something with no word
+                                    // under it (blank space); fall back to
+                                    // an ordinary caret.
+                                    None => vk.begin_visual(RegisterShape::Char, buf.cursor()),
+                                },
+                                // A third selects the whole line, and
+                                // linewise -- so yanking it puts back as
+                                // its own line, the way `V` does and
+                                // unlike a charwise range that merely
+                                // happens to span one.
+                                3 => {
+                                    vk.begin_visual(RegisterShape::Line, buf.cursor());
+                                    ranged_selection = true;
                                 }
-                                None => vk.begin_visual(RegisterShape::Char, buf.cursor()),
+                                _ => vk.begin_visual(RegisterShape::Char, buf.cursor()),
                             }
                         }
                     }
@@ -5950,7 +6106,7 @@ fn run_normal_mode_navigation(
                 // selected and the armed Visual mode should just go
                 // away. A real drag leaves its selection standing, ready
                 // for `y`/`d`/`c` like any other.
-                if !word_selected
+                if !ranged_selection
                     && let Some((_, anchor)) = vk.visual_anchor()
                     && anchor == buf.cursor()
                 {
@@ -6718,6 +6874,11 @@ fn tab_bar_regions(snapshot: &[(u32, bool, String)]) -> Vec<(u32, usize, usize)>
 enum ClickTarget {
     Window(usize),
     Pane(PaneId),
+    // A press landed on the strip between two panes -- the start of a
+    // resize drag, not a focus change. Carries what
+    // `resize_split_child_to` needs to act on every motion event that
+    // follows without re-deriving the layout each time.
+    Divider(Divider),
 }
 
 // How close together two presses on the same cell have to be to count as
@@ -6789,8 +6950,92 @@ fn hit_test_click(
     let mut regions = Vec::new();
     let mut dividers = Vec::new();
     compute_regions(&windows[current_window].layout, area, &mut regions, &mut dividers);
+    // Dividers first: they sit *between* pane rectangles, so nothing here
+    // overlaps, but checking them first keeps the intent obvious -- a
+    // press on the strip is a resize, never a focus change.
+    if let Some(divider) = dividers
+        .into_iter()
+        .find(|d| row0 >= d.rect.row && row0 < d.rect.row + d.rect.rows && col0 >= d.rect.col && col0 < d.rect.col + d.rect.cols)
+    {
+        return Some(ClickTarget::Divider(divider));
+    }
     let (pane_id, _) = regions.into_iter().find(|(_, r)| row0 >= r.row && row0 < r.row + r.rows && col0 >= r.col && col0 < r.col + r.cols)?;
     Some(ClickTarget::Pane(pane_id))
+}
+
+// Drives a divider drag to completion: reads mouse events directly until
+// the button comes up, resizing on every motion that actually moves the
+// boundary and repainting as it goes, so the split follows the pointer
+// live rather than jumping once at the end.
+//
+// Runs its own read loop rather than threading drag state back through
+// whichever caller started it: a drag is a self-contained gesture with a
+// definite end (the release), and both entry points -- the plain prompt
+// and normal mode -- would otherwise each need the same three-state
+// machine carried across their own unrelated loops. Everything else
+// arriving mid-drag is ignored, including keystrokes: the terminal is
+// mid-gesture, and a stray key is far more likely to be the user
+// fumbling than a command.
+#[allow(clippy::too_many_arguments)]
+fn drag_divider(
+    divider: &Divider,
+    sessions: &mut HashMap<SessionId, SessionState>,
+    windows: &mut [WindowEntry],
+    job_frames: &mut HashMap<JobFrameId, exec::FgJob>,
+    current_window: usize,
+    term_rows: &mut usize,
+    term_cols: &mut usize,
+    sinks_are_grid: bool,
+) {
+    // Re-derived from the live layout on every motion: the first resize
+    // moves the divider itself, so a `Divider` captured at press time is
+    // stale from then on -- but its *identity* (path, child, axis) is
+    // what's being dragged and doesn't move, so only the position needs
+    // refreshing.
+    let mut current = divider.clone();
+    {
+        // Raw mode *and* mouse reporting for the duration. The prompt
+        // path arrives here after read_line has already dropped its own
+        // guard (it returns the click and exits), so without this the
+        // motion events would land in a cooked terminal and be echoed
+        // into the next prompt as literal escape text -- which is exactly
+        // what happened before this was here. Normal mode's own guard is
+        // still live; a nested one just saves and restores the same raw
+        // state.
+        let Ok(_guard) = term::RawGuard::enable_with_mouse(0) else { return };
+        while let Ok(Some(key)) = editor::read_key_idle(&mut || {
+            service_background_jobs(sessions, windows, job_frames, current_window, term_rows, term_cols, sinks_are_grid);
+        }) {
+            let Key::Mouse(ev) = key else { continue };
+            if ev.is_release() {
+                break;
+            }
+            if !ev.is_left_drag() {
+                continue;
+            }
+            let to = if current.horizontal { (ev.row as usize).saturating_sub(1) } else { (ev.col as usize).saturating_sub(1) };
+            if !resize_split_child_to(&mut windows[current_window], &current, to) {
+                continue;
+            }
+            // Refresh this divider's own geometry from the layout it just
+            // changed, matched by identity rather than position.
+            let area = Rect { row: 0, col: 0, rows: content_rows(*term_rows), cols: *term_cols };
+            let mut regions = Vec::new();
+            let mut dividers = Vec::new();
+            compute_regions(&windows[current_window].layout, area, &mut regions, &mut dividers);
+            if let Some(fresh) = dividers.into_iter().find(|d| d.path == current.path && d.child == current.child) {
+                current = fresh;
+            }
+            if sinks_are_grid {
+                compositor_redraw(sessions, windows, current_window, *term_rows, *term_cols);
+            }
+        }
+    }
+    // The guard above turned mouse reporting off on its way out, and
+    // whoever called us was mid-gesture precisely because it was on --
+    // put it back rather than leaving them blind to the next click.
+    print!("{}", term::MOUSE_REPORTING_ENABLE);
+    let _ = io::stdout().flush();
 }
 
 // Records a new "current" directory in this session's back/forward
@@ -8696,6 +8941,130 @@ mod alt_screen_addressing_tests {
 }
 
 #[cfg(test)]
+mod divider_drag_tests {
+    use super::*;
+
+    fn leaf(id: PaneId, weight: f64) -> SplitChild {
+        SplitChild { layout: PaneLayout::Leaf(id), weight, fixed: None, minimized: false }
+    }
+
+    fn window(layout: PaneLayout, panes: &[PaneId]) -> WindowEntry {
+        WindowEntry {
+            id: 0,
+            layout,
+            panes: panes.iter().map(|id| Pane { id: *id, stack: vec![Frame::Session(0)] }).collect(),
+            focused_pane: panes[0],
+            next_pane_id: panes.len() as PaneId,
+        }
+    }
+
+    fn dividers_of(w: &WindowEntry, area: Rect) -> Vec<Divider> {
+        let mut out = Vec::new();
+        let mut dividers = Vec::new();
+        compute_regions(&w.layout, area, &mut out, &mut dividers);
+        dividers
+    }
+
+    const AREA: Rect = Rect { row: 0, col: 0, rows: 20, cols: 60 };
+
+    #[test]
+    fn a_divider_names_the_child_it_follows() {
+        let w = window(PaneLayout::Split { horizontal: false, children: vec![leaf(0, 1.0), leaf(1, 1.0)] }, &[0, 1]);
+        let d = dividers_of(&w, AREA);
+        assert_eq!(d.len(), 1);
+        assert_eq!(d[0].path, Vec::<usize>::new(), "the root split");
+        assert_eq!(d[0].child, 0, "the divider follows the first child");
+        assert!(!d[0].horizontal);
+        // 60 columns minus the one the divider itself occupies.
+        assert_eq!((d[0].split_start, d[0].split_axis), (0, 59));
+    }
+
+    #[test]
+    fn a_nested_splits_divider_carries_the_path_to_reach_it() {
+        // Left half is itself split top/bottom -- its divider must name
+        // that inner split, not the outer one, or a drag would resize
+        // completely the wrong boundary.
+        let inner = PaneLayout::Split { horizontal: true, children: vec![leaf(1, 1.0), leaf(2, 1.0)] };
+        let layout = PaneLayout::Split {
+            horizontal: false,
+            children: vec![SplitChild { layout: inner, weight: 1.0, fixed: None, minimized: false }, leaf(3, 1.0)],
+        };
+        let w = window(layout, &[1, 2, 3]);
+        let d = dividers_of(&w, AREA);
+        let nested = d.iter().find(|d| d.horizontal).expect("the inner top/bottom divider");
+        assert_eq!(nested.path, vec![0], "reached by taking the outer split's first child");
+        assert_eq!(nested.child, 0);
+        let outer = d.iter().find(|d| !d.horizontal).expect("the outer left/right divider");
+        assert_eq!(outer.path, Vec::<usize>::new());
+    }
+
+    #[test]
+    fn dragging_moves_the_boundary_to_where_it_was_dropped() {
+        let mut w = window(PaneLayout::Split { horizontal: false, children: vec![leaf(0, 1.0), leaf(1, 1.0)] }, &[0, 1]);
+        let d = dividers_of(&w, AREA)[0].clone();
+        assert_eq!(d.rect.col, 30, "an even split of 59 usable columns");
+        assert!(resize_split_child_to(&mut w, &d, 15));
+        assert_eq!(dividers_of(&w, AREA)[0].rect.col, 15, "the divider followed the pointer");
+        let d = dividers_of(&w, AREA)[0].clone();
+        assert!(resize_split_child_to(&mut w, &d, 45));
+        assert_eq!(dividers_of(&w, AREA)[0].rect.col, 45);
+    }
+
+    #[test]
+    fn dragging_a_horizontal_divider_works_on_the_other_axis() {
+        let mut w = window(PaneLayout::Split { horizontal: true, children: vec![leaf(0, 1.0), leaf(1, 1.0)] }, &[0, 1]);
+        let d = dividers_of(&w, AREA)[0].clone();
+        assert!(d.horizontal);
+        assert!(resize_split_child_to(&mut w, &d, 5));
+        assert_eq!(dividers_of(&w, AREA)[0].rect.row, 5);
+    }
+
+    #[test]
+    fn dragging_past_either_end_leaves_both_panes_usable() {
+        let mut w = window(PaneLayout::Split { horizontal: false, children: vec![leaf(0, 1.0), leaf(1, 1.0)] }, &[0, 1]);
+        let d = dividers_of(&w, AREA)[0].clone();
+        resize_split_child_to(&mut w, &d, 0);
+        let col = dividers_of(&w, AREA)[0].rect.col;
+        assert!(col > 0 && col < 59, "collapsed to {col}");
+        let d = dividers_of(&w, AREA)[0].clone();
+        resize_split_child_to(&mut w, &d, 10_000);
+        let col = dividers_of(&w, AREA)[0].rect.col;
+        assert!(col > 0 && col < 59, "collapsed to {col}");
+    }
+
+    #[test]
+    fn a_fixed_size_child_is_resized_by_its_fixed_size_not_its_weight() {
+        // The diagnostics pane while expanded (see SplitChild) -- its
+        // weight is ignored entirely while `fixed` is set, so solving for
+        // one would move nothing at all.
+        let layout = PaneLayout::Split {
+            horizontal: true,
+            children: vec![SplitChild { layout: PaneLayout::Leaf(0), weight: 1.0, fixed: Some(6), minimized: false }, leaf(1, 1.0)],
+        };
+        let mut w = window(layout, &[0, 1]);
+        let d = dividers_of(&w, AREA)[0].clone();
+        assert_eq!(d.rect.row, 6);
+        assert!(resize_split_child_to(&mut w, &d, 12));
+        assert_eq!(dividers_of(&w, AREA)[0].rect.row, 12);
+        match &w.layout {
+            PaneLayout::Split { children, .. } => assert_eq!(children[0].fixed, Some(12)),
+            _ => panic!("layout shape changed"),
+        }
+    }
+
+    #[test]
+    fn a_press_on_the_strip_is_a_divider_not_the_pane_beside_it() {
+        let w = window(PaneLayout::Split { horizontal: false, children: vec![leaf(0, 1.0), leaf(1, 1.0)] }, &[0, 1]);
+        let d = dividers_of(&w, AREA)[0].clone();
+        let mut out = Vec::new();
+        let mut dividers = Vec::new();
+        compute_regions(&w.layout, AREA, &mut out, &mut dividers);
+        // Nothing overlaps: the divider column belongs to no pane rect.
+        assert!(!out.iter().any(|(_, r)| d.rect.col >= r.col && d.rect.col < r.col + r.cols));
+    }
+}
+
+#[cfg(test)]
 mod completion_menu_geometry_tests {
     use super::*;
 
@@ -8853,7 +9222,7 @@ mod pane_layout_tests {
         assert_eq!(r1.rows, 10);
     }
 
-    fn regions_and_dividers(layout: &PaneLayout, area: Rect) -> (Vec<(PaneId, Rect)>, Vec<(Rect, bool)>) {
+    fn regions_and_dividers(layout: &PaneLayout, area: Rect) -> (Vec<(PaneId, Rect)>, Vec<Divider>) {
         let mut out = Vec::new();
         let mut dividers = Vec::new();
         compute_regions(layout, area, &mut out, &mut dividers);
