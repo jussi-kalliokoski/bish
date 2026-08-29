@@ -7156,44 +7156,79 @@ struct TranscriptEntry {
     status: i32,
 }
 
-// `:help`/`:h`/`:?`'s own static content -- see that match arm's own doc
-// comment for the scope this deliberately stays within. Kept short
-// enough to fit one ordinary terminal's worth of command-output overlay
-// without truncating (see command_mode_content_rows) -- a genuinely
-// exhaustive reference would need real pagination/topics this feature
-// doesn't attempt.
-const EDITOR_HELP_TEXT: &str = "\
-bish editor -- quick reference (:help, :h, :?)
+// `:help`/`:h`/`:?`'s own content -- written in markdown and rendered
+// through crate::markdown (see `render_help`), which is the whole point
+// of having that parser: the help is now a *document*, with headings,
+// tables and emphasis, rather than hand-aligned columns of plain text
+// that had to be re-aligned by hand whenever a line changed.
+//
+// Kept short enough to fit one ordinary terminal's worth of command-
+// output overlay without truncating (see command_mode_content_rows) --
+// a genuinely exhaustive reference would need real pagination/topics
+// this feature doesn't attempt.
+const EDITOR_HELP_MARKDOWN: &str = r#"# bish editor
 
-Motion:  h j k l | w b e ge | 0 ^ $ | gg G | f F t T ; , | % | { }
-Search:  /pat  ?pat  n  N          Marks:  m{a-z}  `{mark}  '{mark}
-Jumps:   <C-o> back  <C-i> forward
-Visual:  v (char)  V (line)  <C-v> (block)  o swaps ends
-Insert:  i I a A o O  --  <Esc> exits back to Normal mode
-Operators (take a motion, or double the key for the whole line):
-         d delete  c change  y yank  > indent  < outdent  gu/gU/g~ case
-Surround: ys{motion}{char} add   cs{old}{new} change   ds{char} delete
-Registers: \"{reg} before an operator/put, e.g. \"ayy then \"ap
-Undo/redo: u / <C-r>     Put: p P     Repeat last change: .
-Hover: K on an identifier shows its live value, a doc comment, or a
-       man-page snippet for an external command
-More:  `e FILE...` opens several files at once, the first in front;
-       `e --hex FILE` opens one as raw bytes instead (own :help inside);
-       `e DIR` browses DIR and opens what you pick there, and so does
-       `e ARCHIVE.zip` -- members open read-only (`:w FILE` extracts
-       one); a gzip'd file opens read-only as its decompressed text
+## Moving around
 
-Colon commands:
-  :w [FILE]        write (:wq/:x write+quit, :q quit, :q! discard+quit)
-  :s/PAT/REPL/[g]  substitute on this line (prefix a range, e.g. :%s/../../)
-  :git blame [REV] per-line blame gutter (:git diff [REV] for +/~/-);
-                   REV defaults to the working tree/index, `· N/A` marks
-                   a line that isn't in it
-  :diff            toggle +/~/- markers vs. what's on disk (no git needed)
-  :format          run this file's own formatter
-  :diag [clear]    toggle the diagnostics pane
-  :dbg             attach a read-only debug session (:dbg help for more)
-  :help, :h, :?    this screen";
+| Keys | What |
+|:--|:--|
+| `h j k l` `w b e ge` `0 ^ $` `gg G` | motions |
+| `f F t T ; ,` `%` `{ }` | find, match, paragraph |
+| `/pat` `?pat` `n` `N` | search |
+| `m{a-z}` `` `{mark} `` `'{mark}` | marks |
+| `<C-o>` `<C-i>` | jump back / forward |
+
+## Changing things
+
+`i I a A o O` enter Insert mode; `<Esc>` returns to Normal.
+`v` `V` `<C-v>` start Visual (char, line, block); `o` swaps ends.
+
+Operators take a motion, or double the key for the whole line:
+`d` delete, `c` change, `y` yank, `>`/`<` indent, `gu`/`gU`/`g~` case.
+
+- **Surround** — `ys{motion}{char}` add, `cs{old}{new}` change, `ds{char}` delete
+- **Registers** — `"{reg}` before an operator or put, e.g. `"ayy` then `"ap`
+- **Undo / redo** — `u` and `<C-r>`; put with `p`/`P`; repeat with `.`
+- **Hover** — `K` shows a value, a doc comment, or a man page snippet
+
+## Opening files
+
+`e FILE...` opens several at once, the first in front. `e --hex FILE`
+opens one as raw bytes instead (with its own `:help`). `e DIR` browses
+and opens what you pick, and so does `e ARCHIVE.zip` — members open
+read-only, and `:w FILE` extracts one. A gzip'd file opens read-only as
+its decompressed text.
+
+## Colon commands
+
+| Command | What |
+|:--|:--|
+| `:w [FILE]` | write (`:wq`/`:x` write+quit, `:q`, `:q!`) |
+| `:s/PAT/REPL/[g]` | substitute (prefix a range, e.g. `:%s/../../`) |
+| `:git blame [REV]` | per-line blame gutter (`:git diff [REV]` for +/~/-) |
+| `:diff` | +/~/- vs. what's on disk, no git needed |
+| `:format` | run this file's own formatter |
+| `:diag [clear]` | toggle the diagnostics pane |
+| `:dbg` | attach a read-only debug session (`:dbg help`) |
+| `:preview` | render this markdown buffer |
+| `:help` | this screen |
+"#;
+
+// The help as a terminal document, rendered to the pane it will be shown
+// in. Rendered on demand rather than once: the width is the terminal's,
+// and a table has to be laid out for the width it will actually occupy.
+fn render_help(term_cols: usize) -> String {
+    render_markdown_document(EDITOR_HELP_MARKDOWN, term_cols)
+}
+
+// Shared by `:help` and `:preview` -- the same pipeline either way, which
+// is what makes the help page a real markdown document rather than a
+// special case.
+fn render_markdown_document(source: &str, term_cols: usize) -> String {
+    let doc = crate::markdown::parse(source);
+    let opts = crate::markdown::render::Options { width: term_cols.saturating_sub(2).max(20), highlight_code: true };
+    crate::markdown::render::to_lines(&doc, &opts).join("\n")
+}
 
 // `:dbg help`/`:dbg h`/`:dbg ?`'s own reference text -- shown via the
 // same command-output overlay every other command's own output already
@@ -7285,14 +7320,48 @@ fn styled_full_width_line(text: &str, bg: &str, fg: &str, cols: usize) -> String
     let mut out = String::new();
     out.push_str(bg);
     out.push_str(fg);
-    let len = text.chars().count();
+    // Measured by what the line *draws*, not by how many chars it holds:
+    // command output may contain its own SGR sequences (a rendered
+    // markdown document does -- see render_markdown_document), and
+    // counting those as text would truncate a styled line at a fraction
+    // of its real width and mis-pad the rest.
+    let len = editor::visible_len(text);
     if len >= cols {
-        out.push_str(&text.chars().take(cols).collect::<String>());
+        out.push_str(&truncate_to_width(text, cols));
     } else {
         out.push_str(text);
         out.push_str(&" ".repeat(cols - len));
     }
     out.push_str("\x1b[0m");
+    out
+}
+
+// The first `cols` *columns* of `text`, keeping every SGR sequence it
+// passes (dropping one would leave the rest of the line in whatever
+// style happened to be active).
+fn truncate_to_width(text: &str, cols: usize) -> String {
+    let mut out = String::new();
+    let mut width = 0;
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' && chars.peek() == Some(&'[') {
+            out.push(c);
+            out.push(chars.next().expect("just peeked"));
+            for c2 in chars.by_ref() {
+                out.push(c2);
+                if c2 == 'm' {
+                    break;
+                }
+            }
+            continue;
+        }
+        let w = crate::bishedit::unicode_width::char_width(c);
+        if width + w > cols {
+            break;
+        }
+        width += w;
+        out.push(c);
+    }
     out
 }
 
@@ -8219,12 +8288,36 @@ fn run_command_mode(
                         // shorter terminal, and the real content behind
                         // it stays visible per the screen-wipe fix above.
                         "help" | "h" | "?" if arg.is_none() => {
+                            let output = render_help(*term_cols);
                             sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry {
                                 command: trimmed,
-                                output: EDITOR_HELP_TEXT.to_string(),
+                                output: output.clone(),
                                 status: 0,
                             });
-                            return CommandModeOutcome::Ran { output: EDITOR_HELP_TEXT.to_string(), status: 0 };
+                            return CommandModeOutcome::Ran { output, status: 0 };
+                        }
+                        // `:preview` -- this buffer's own markdown,
+                        // rendered. The same pipeline `:help` goes
+                        // through, pointed at the file being edited
+                        // instead of at the built-in document.
+                        "preview" | "prev" if arg.is_none() => {
+                            let language = fileeditor::language_of(tb);
+                            if language != "markdown" {
+                                show_command_mode_error(
+                                    &format!("bish: preview: not a markdown file (this buffer is {language})"),
+                                    *term_rows,
+                                    *term_cols,
+                                );
+                                buffer.clear();
+                                continue;
+                            }
+                            let output = render_markdown_document(&fileeditor::buffer_source(tb), *term_cols);
+                            sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry {
+                                command: trimmed,
+                                output: output.clone(),
+                                status: 0,
+                            });
+                            return CommandModeOutcome::Ran { output, status: 0 };
                         }
                         "help" | "h" | "?" => {
                             show_command_mode_error(&format!("bish: help: unexpected argument '{}' (no help topics yet -- just `:help`)", arg.unwrap_or_default()), *term_rows, *term_cols);

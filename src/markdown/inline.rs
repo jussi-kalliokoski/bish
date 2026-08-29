@@ -425,11 +425,14 @@ impl InlineParser<'_> {
                     continue;
                 }
                 '(' => depth += 1,
+                // The paren that closes the whole `](...)` is not part
+                // of the destination -- stopping *before* decrementing
+                // is what leaves the balance check meaningful.
                 ')' => {
-                    depth -= 1;
-                    if depth < 0 {
+                    if depth == 0 {
                         break;
                     }
+                    depth -= 1;
                 }
                 _ => {}
             }
@@ -820,7 +823,12 @@ impl InlineParser<'_> {
         };
 
         let content: Vec<Inline> = self.out[opener.node + 1..closer.node].to_vec();
-        let span = open_span_end..close_span_start;
+        // The span covers the *whole* construct, delimiters included --
+        // the same convention `Code` and `Link` already follow, and what
+        // a highlighter needs in order to colour the `**` along with
+        // what's between them. The content's own extent is the children's
+        // spans.
+        let span = (open_span_end - taken)..(close_span_start + taken);
         let node = match (closer.c, taken) {
             ('~', _) => Inline::Strikethrough { content, span },
             (_, 2) => Inline::Strong { content, span },

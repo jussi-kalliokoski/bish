@@ -34,6 +34,7 @@
 
 pub mod block;
 pub mod inline;
+pub mod render;
 
 use std::ops::Range;
 
@@ -120,6 +121,8 @@ pub struct Table {
 pub enum Inline {
     Text { text: String, span: Range<usize> },
     Code { text: String, span: Range<usize> },
+    // Spans include the delimiters (`*a*`, `**a**`, `~~a~~`), the same
+    // as `Code` and `Link` -- see inline.rs's `wrap_emphasis`.
     Emph { content: Vec<Inline>, span: Range<usize> },
     Strong { content: Vec<Inline>, span: Range<usize> },
     Strikethrough { content: Vec<Inline>, span: Range<usize> },
@@ -538,7 +541,8 @@ mod tests {
         let chars: Vec<char> = src.chars().collect();
         let emph = content.iter().find(|i| matches!(i, Inline::Emph { .. })).expect("expected emphasis");
         let span = emph.span();
-        assert_eq!(chars[span.start..span.end].iter().collect::<String>(), "bee");
+        // Delimiters included -- see Inline::Emph.
+        assert_eq!(chars[span.start..span.end].iter().collect::<String>(), "*bee*");
     }
 
     #[test]

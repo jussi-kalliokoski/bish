@@ -18,7 +18,7 @@ use std::io::{self, Write};
 use std::rc::Rc;
 
 use crate::bishedit::format::BashFormatter;
-use crate::bishedit::highlight::{self, BashHighlighter, HighlightContext, Highlighter, JsonHighlighter, StyledSpan};
+use crate::bishedit::highlight::{self, HighlightContext, Highlighter, StyledSpan};
 use crate::bishedit::lint::{self, BashLinter, Linter};
 use crate::bishedit::motion;
 use crate::bishedit::registers::{RegisterShape, RegisterValue, Registers};
@@ -1751,6 +1751,10 @@ fn is_bash_file(buf: &TextBuffer) -> bool {
 // came before. Recomputed on every redraw, same as buffer_highlight_spans
 // below -- see that function's own doc comment on why that's an
 // accepted, not-yet-a-problem cost rather than something cached here.
+pub(crate) fn buffer_source(buf: &TextBuffer) -> String {
+    buffer_text(buf)
+}
+
 fn buffer_text(buf: &TextBuffer) -> String {
     (0..buf.line_count())
         .map(|l| (0..buf.line_len(l)).map(|c| buf.char_at(l, c).unwrap_or(' ')).collect::<String>())
@@ -1774,17 +1778,14 @@ fn line_starts(buf: &TextBuffer) -> Vec<usize> {
     starts
 }
 
-// Which highlighter (if any) this buffer's language has -- the one place
-// that decision is made, so adding a third language is this match arm
-// plus its Highlighter impl and nothing else. `None` for a language with
-// no highlighter, which renders exactly as it did before any of this
-// existed: plain, uncoloured text.
+// Which highlighter (if any) this buffer's language has. The table
+// itself lives in bishedit::highlight, because a fenced code block
+// inside a markdown document asks the same question about its info
+// string and the two must not answer differently. `None` for a language
+// with no highlighter, which renders exactly as it did before any of
+// this existed: plain, uncoloured text.
 fn highlighter_for(language: &str) -> Option<Box<dyn Highlighter>> {
-    match language {
-        snippet::DEFAULT_LANG => Some(Box::new(BashHighlighter)),
-        "json" => Some(Box::new(JsonHighlighter)),
-        _ => None,
-    }
+    highlight::highlighter_for_language(language)
 }
 
 // Runs this buffer's own highlighter once against the *whole* buffer
@@ -3490,6 +3491,9 @@ mod pre_save_hook_tests {
 
         let bash = buf_with_ext("if true; then echo hi; fi", "bash");
         assert!(!buffer_highlight_spans(&bash, None).is_empty(), "a .bash buffer still is");
+
+        let markdown = buf_with_ext("# Title\n\n*emphasis*\n", "md");
+        assert!(!buffer_highlight_spans(&markdown, None).is_empty(), "and a .md buffer");
 
         // Valid bash, and deliberately not highlighted as any: nothing
         // claims to know what a .toml file is.

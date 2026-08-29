@@ -96,6 +96,13 @@ pub enum HighlightKind {
     // ("displayed as it was before"); this only ever fires on the
     // negative case.
     InvalidCommand,
+    // Markdown's own three text styles. They carry no colour of their
+    // own (Color::Default) because what they mean *is* the weight or
+    // slant -- a bold heading that also changed hue would be saying two
+    // things where the document said one.
+    Emphasis,
+    Strong,
+    Struck,
     // A field name -- a JSON object's key, and whatever the equivalent
     // turns out to be in the next structured-data language. Its own kind
     // rather than reusing Variable, which means something specific and
@@ -189,6 +196,139 @@ impl Highlighter for JsonHighlighter {
     }
 }
 
+// Markdown, over crate::markdown's own parse -- the same rule the other
+// two follow: the highlighter is driven by the real parser, so what the
+// editor colours and what a preview renders can't disagree.
+//
+// This is where carrying source spans through that parser pays off. A
+// markdown highlighter written as a scan would have to re-derive
+// emphasis, and get `snake_case` and `a * b` wrong exactly where a scan
+// always does; here the spans come from the parse that already decided.
+//
+// Fenced code blocks are highlighted in *their own* language, by handing
+// the block's text to whichever Highlighter its info string names and
+// shifting the spans -- so a ```bash block inside a markdown file reads
+// exactly as a `.bash` buffer does.
+pub struct MarkdownHighlighter;
+
+impl Highlighter for MarkdownHighlighter {
+    fn highlight(&self, text: &str, ctx: HighlightContext) -> Vec<HighlightSpan> {
+        let doc = crate::markdown::parse(text);
+        let mut out = Vec::new();
+        for block in &doc.blocks {
+            markdown_block(block, text, ctx, &mut out);
+        }
+        // A link reference definition is not part of any block, so its
+        // own span has to be picked up from the document.
+        for link_ref in &doc.link_refs {
+            out.push(span(link_ref.span.clone(), HighlightKind::Link));
+        }
+        out
+    }
+}
+
+fn span(range: std::ops::Range<usize>, kind: HighlightKind) -> HighlightSpan {
+    HighlightSpan { start: range.start, end: range.end, kind, link: None }
+}
+
+fn markdown_block(block: &crate::markdown::Block, source: &str, ctx: HighlightContext, out: &mut Vec<HighlightSpan>) {
+    use crate::markdown::Block;
+    match block {
+        Block::Heading { content, span: whole, .. } => {
+            // The whole line, marker included: a heading is one thing to
+            // a reader, and colouring only the `#` would say otherwise.
+            out.push(span(whole.clone(), HighlightKind::Keyword));
+            markdown_inlines(content, out);
+        }
+        Block::Paragraph { content, .. } => markdown_inlines(content, out),
+        Block::CodeBlock { info, info_span, literal_span, .. } => {
+            out.push(span(literal_span.clone(), HighlightKind::String));
+            out.push(span(info_span.clone(), HighlightKind::Variable));
+            // ...then the block's own language painted over it.
+            let lang = info.split_whitespace().next().unwrap_or("");
+            if let Some(inner) = highlighter_for_language(lang) {
+                let chars: Vec<char> = source.chars().collect();
+                let start = literal_span.start.min(chars.len());
+                let end = literal_span.end.min(chars.len());
+                let text: String = chars[start..end].iter().collect();
+                for s in inner.highlight(&text, ctx) {
+                    out.push(HighlightSpan { start: start + s.start, end: start + s.end, kind: s.kind, link: s.link });
+                }
+            }
+        }
+        Block::HtmlBlock { span: whole, .. } => out.push(span(whole.clone(), HighlightKind::Comment)),
+        Block::ThematicBreak { span: whole } => out.push(span(whole.clone(), HighlightKind::Comment)),
+        Block::BlockQuote { blocks, .. } => {
+            for b in blocks {
+                markdown_block(b, source, ctx, out);
+            }
+        }
+        Block::List(list) => {
+            for item in &list.items {
+                out.push(span(item.marker.clone(), HighlightKind::Keyword));
+                for b in &item.blocks {
+                    markdown_block(b, source, ctx, out);
+                }
+            }
+        }
+        Block::Table(table) => {
+            for cell in table.head.iter().chain(table.rows.iter().flatten()) {
+                markdown_inlines(cell, out);
+            }
+        }
+    }
+}
+
+fn markdown_inlines(inlines: &[crate::markdown::Inline], out: &mut Vec<HighlightSpan>) {
+    use crate::markdown::Inline;
+    for inline in inlines {
+        // Each construct's own span first, then its children over the
+        // top -- `compose` lets a later span win, which is how `**a `b`
+        // c**` ends up bold with the code span still coloured.
+        match inline {
+            Inline::Code { span: s, .. } => out.push(span(s.clone(), HighlightKind::String)),
+            Inline::Emph { content, span: s } => {
+                out.push(span(s.clone(), HighlightKind::Emphasis));
+                markdown_inlines(content, out);
+            }
+            Inline::Strong { content, span: s } => {
+                out.push(span(s.clone(), HighlightKind::Strong));
+                markdown_inlines(content, out);
+            }
+            Inline::Strikethrough { content, span: s } => {
+                out.push(span(s.clone(), HighlightKind::Struck));
+                markdown_inlines(content, out);
+            }
+            Inline::Link { content, span: s, dest, .. } => {
+                let mut hs = span(s.clone(), HighlightKind::Link);
+                hs.link = Some(dest.clone());
+                out.push(hs);
+                markdown_inlines(content, out);
+            }
+            Inline::Image { alt, span: s, dest, .. } => {
+                let mut hs = span(s.clone(), HighlightKind::Link);
+                hs.link = Some(dest.clone());
+                out.push(hs);
+                markdown_inlines(alt, out);
+            }
+            Inline::Html { span: s, .. } => out.push(span(s.clone(), HighlightKind::Comment)),
+            Inline::Text { .. } | Inline::SoftBreak { .. } | Inline::HardBreak { .. } => {}
+        }
+    }
+}
+
+// Which highlighter a language name has, if any -- the one table, shared
+// by the file editor's own per-buffer choice and by fenced code blocks
+// inside a markdown document.
+pub fn highlighter_for_language(language: &str) -> Option<Box<dyn Highlighter>> {
+    match language {
+        "bash" | "sh" | "shell" => Some(Box::new(BashHighlighter)),
+        "json" => Some(Box::new(JsonHighlighter)),
+        "markdown" | "md" => Some(Box::new(MarkdownHighlighter)),
+        _ => None,
+    }
+}
+
 // A resolved (start, end, color, attrs) span -- the presentation-layer
 // sibling of HighlightSpan, once a HighlightKind has been mapped to an
 // actual color. Kept as its own type (rather than just carrying
@@ -233,6 +373,11 @@ pub fn default_style(kind: HighlightKind) -> (vt100::Color, vt100::CellAttrs) {
         // matches "error (red text)" from the feature request literally.
         HighlightKind::InvalidCommand => (vt100::Color::Indexed(1), vt100::CellAttrs::default()),
         HighlightKind::Key => (vt100::Color::Indexed(6), bold),
+        HighlightKind::Emphasis => (vt100::Color::Default, vt100::CellAttrs { italic: true, ..vt100::CellAttrs::default() }),
+        HighlightKind::Strong => (vt100::Color::Default, bold),
+        HighlightKind::Struck => {
+            (vt100::Color::Default, vt100::CellAttrs { strikethrough: true, ..vt100::CellAttrs::default() })
+        }
     }
 }
 
@@ -1276,7 +1421,14 @@ mod tests {
         // terminal's own default foreground", so none of them should be
         // bishopt-configurable this way (see SYN_COL_OPTIONS' own doc
         // comment).
-        for uncolorable in [HighlightKind::Flag, HighlightKind::Subcommand, HighlightKind::Link] {
+        for uncolorable in [
+            HighlightKind::Flag,
+            HighlightKind::Subcommand,
+            HighlightKind::Link,
+            HighlightKind::Emphasis,
+            HighlightKind::Strong,
+            HighlightKind::Struck,
+        ] {
             assert!(!SYN_COL_OPTIONS.iter().any(|(k, _)| *k == uncolorable));
         }
         // The same rule stated from the other side, so a kind added to
@@ -1825,5 +1977,67 @@ mod tests {
     #[test]
     fn json_highlights_nothing_in_empty_input() {
         assert!(json_kinds("").is_empty());
+    }
+
+    fn md_kinds(text: &str) -> Vec<(String, HighlightKind)> {
+        let chars: Vec<char> = text.chars().collect();
+        let mut spans = MarkdownHighlighter.highlight(text, HighlightContext::default());
+        spans.sort_by_key(|s| (s.start, s.end));
+        spans.into_iter().map(|s| (chars[s.start..s.end].iter().collect(), s.kind)).collect()
+    }
+
+    #[test]
+    fn markdown_highlights_a_heading_whole() {
+        assert_eq!(md_kinds("## Two\n"), vec![("## Two".to_string(), HighlightKind::Keyword)]);
+    }
+
+    // The spans include the delimiters, so `**` is bold along with what
+    // it wraps rather than left as stray punctuation.
+    #[test]
+    fn markdown_emphasis_spans_cover_their_delimiters() {
+        assert_eq!(
+            md_kinds("*a* **b** ~~c~~ `d`\n"),
+            vec![
+                ("*a*".to_string(), HighlightKind::Emphasis),
+                ("**b**".to_string(), HighlightKind::Strong),
+                ("~~c~~".to_string(), HighlightKind::Struck),
+                ("`d`".to_string(), HighlightKind::String),
+            ]
+        );
+    }
+
+    // The reason this is driven by the real parser: a scan would colour
+    // these, and be wrong.
+    #[test]
+    fn markdown_does_not_highlight_what_is_not_markup() {
+        assert!(md_kinds("snake_case_name and 2 * 3 * 4\n").is_empty());
+    }
+
+    #[test]
+    fn markdown_links_carry_their_destination() {
+        let spans = MarkdownHighlighter.highlight("[text](/dest)\n", HighlightContext::default());
+        let link = spans.iter().find(|s| s.kind == HighlightKind::Link).expect("a link");
+        assert_eq!(link.link.as_deref(), Some("/dest"));
+    }
+
+    // A fenced block is highlighted in its own language, with the spans
+    // shifted to where that block actually sits in the document.
+    #[test]
+    fn a_fenced_code_block_is_highlighted_in_its_own_language() {
+        let src = "text\n\n```bash\nif true; then echo hi; fi\n```\n";
+        let kinds = md_kinds(src);
+        assert!(
+            kinds.iter().any(|(text, kind)| text == "if" && *kind == HighlightKind::Keyword),
+            "the bash keyword inside the fence is highlighted as bash: {kinds:?}"
+        );
+        assert!(kinds.iter().any(|(text, kind)| text == "bash" && *kind == HighlightKind::Variable));
+    }
+
+    #[test]
+    fn markdown_treats_html_as_something_to_ignore() {
+        assert_eq!(
+            md_kinds("a <span>b</span>\n"),
+            vec![("<span>".to_string(), HighlightKind::Comment), ("</span>".to_string(), HighlightKind::Comment)]
+        );
     }
 }
