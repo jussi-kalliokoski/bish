@@ -5757,6 +5757,14 @@ fn run_normal_mode_navigation(
     compositor_redraw(sessions, windows, *current_window, *term_rows, *term_cols);
     render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides);
     let mut pending_view = PendingView::None;
+    // The last left press, for telling a double-click from two separate
+    // ones -- terminals report neither, so the timing and the "same cell"
+    // test have to happen here. `word_selected` suppresses the release
+    // handler's own "nothing was dragged, so drop the armed selection"
+    // rule, which would otherwise throw away a double-clicked word that
+    // happened to be a single character long.
+    let mut last_press: Option<(std::time::Instant, u16, u16)> = None;
+    let mut word_selected = false;
 
     let result: (NavExit, Option<(TextBuffer, VimKeys)>) = 'nav: loop {
         // Recomputed every iteration, not just once up front: this pane's
@@ -5899,10 +5907,27 @@ fn run_normal_mode_navigation(
                     Some(ClickTarget::Pane(_)) => {
                         let row0 = (ev.row as usize).saturating_sub(1);
                         let col0 = (ev.col as usize).saturating_sub(1);
+                        let now = std::time::Instant::now();
+                        let double = last_press
+                            .is_some_and(|(at, r, c)| (r, c) == (ev.row, ev.col) && now.duration_since(at) < DOUBLE_CLICK_WINDOW);
+                        last_press = Some((now, ev.row, ev.col));
+                        word_selected = false;
                         if place_nav_cursor_at(&mut buf, rect, row0, col0) {
                             buf.selections_mut().clear();
                             vk.end_visual(buf.cursor());
-                            vk.begin_visual(RegisterShape::Char, buf.cursor());
+                            // A second click on the same cell selects the
+                            // word under it -- the same `iw` text object
+                            // `viw` would give, so "double-click a word"
+                            // and "select a word" can't disagree about
+                            // where one ends.
+                            match double.then(|| motion::text_object_range(&buf, motion::TextObjectKind::Word, false, None)).flatten() {
+                                Some(range) => {
+                                    vk.begin_visual(RegisterShape::Char, range.from);
+                                    buf.set_cursor(range.to.0, range.to.1);
+                                    word_selected = true;
+                                }
+                                None => vk.begin_visual(RegisterShape::Char, buf.cursor()),
+                            }
                         }
                     }
                     _ => {}
@@ -5925,7 +5950,8 @@ fn run_normal_mode_navigation(
                 // selected and the armed Visual mode should just go
                 // away. A real drag leaves its selection standing, ready
                 // for `y`/`d`/`c` like any other.
-                if let Some((_, anchor)) = vk.visual_anchor()
+                if !word_selected
+                    && let Some((_, anchor)) = vk.visual_anchor()
                     && anchor == buf.cursor()
                 {
                     vk.end_visual(buf.cursor());
@@ -6693,6 +6719,13 @@ enum ClickTarget {
     Window(usize),
     Pane(PaneId),
 }
+
+// How close together two presses on the same cell have to be to count as
+// a double-click. Terminals report neither the double-click nor the
+// timing, so this is bish's own judgement -- the same order most toolkits
+// use, and deliberately paired with an exact same-cell test so a slow
+// drag across two characters can never read as one.
+const DOUBLE_CLICK_WINDOW: std::time::Duration = std::time::Duration::from_millis(400);
 
 // `fileeditor::position_at_screen`'s counterpart for a `ScreenBuffer` --
 // simpler because a read-only pane has neither a gutter nor horizontal
