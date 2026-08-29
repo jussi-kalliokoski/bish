@@ -45,6 +45,12 @@ pub trait Buffer {
     fn viewport_top(&self) -> usize;
     fn set_viewport_top(&mut self, line: usize);
     fn viewport_height(&self) -> usize;
+    /// Resyncs the stored height from whatever the caller is about to
+    /// render into. Defaults to doing nothing, for an implementor whose
+    /// height genuinely can't change (a test double); every real view
+    /// overrides it, because a pane's height changes whenever the
+    /// terminal does and nothing else tells the buffer about it.
+    fn set_viewport_height(&mut self, _rows: usize) {}
 
     /// Horizontal counterpart to `viewport_top`/`viewport_height`: how
     /// many columns of the current line are scrolled off to the left of

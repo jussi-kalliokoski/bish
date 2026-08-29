@@ -981,19 +981,32 @@ pub(crate) const MOUSE_WHEEL_LINES: usize = 3;
 // navigating mid-edit doesn't drag every other cursor along with it;
 // only an actual mutation (Enter/Tab/Backspace/a typed char) replicates
 // across the whole set, via apply_insert_to_all/apply_backspace_to_all.
+// What one idle tick reported. `None` is "nothing happened"; `Some` is
+// "repaint, into *this* geometry".
+//
+// The two travel together on purpose. A caller holding a live
+// `TextBuffer`/`VimKeys` has to know when to repaint, because
+// `compositor_redraw` (already run inside `on_idle` itself) paints a
+// driven `Frame::Edit` pane blank -- see service_background_jobs's own
+// doc comment. But the commonest reason to be told that is a terminal
+// resize, which is exactly the moment the geometry captured before
+// Insert mode began stopped describing anything real. Reporting only
+// *whether* to repaint -- as this did -- meant Insert mode faithfully
+// repainted a 38-row frame into a 20-row terminal.
+#[derive(Clone, Copy)]
+pub(crate) struct IdleRedraw {
+    pub(crate) rect: Rect,
+    pub(crate) term_rows: usize,
+    pub(crate) term_cols: usize,
+}
+
 #[allow(clippy::too_many_arguments)]
-// `on_idle` returns `bool`: true iff a session-daemon client just
-// (re)attached this call -- see run_normal_mode_navigation's own
-// identical convention (repl.rs) and service_background_jobs's doc
-// comment for why a caller holding a live `TextBuffer`/`VimKeys` (like
-// this one) needs to know, and why `compositor_redraw` alone (already
-// run inside `on_idle` itself) isn't enough for it.
 pub(crate) fn run_insert_mode(
     buf: &mut TextBuffer,
     vk: &mut VimKeys,
     rect: Rect,
     registers: &mut Registers,
-    on_idle: &mut dyn FnMut() -> bool,
+    on_idle: &mut dyn FnMut() -> Option<IdleRedraw>,
     replace: bool,
     term_rows: usize,
     term_cols: usize,
@@ -1005,6 +1018,10 @@ pub(crate) fn run_insert_mode(
     abbrs: &[Abbr],
 ) -> io::Result<()> {
     let mode = if replace { EditorMode::Replace } else { EditorMode::Insert };
+    // Rebound as mutable: an idle tick may hand back new geometry (see
+    // IdleRedraw), and every later render in this function has to use
+    // it rather than what the caller measured before Insert mode began.
+    let (mut rect, mut term_rows, mut term_cols) = (rect, term_rows, term_cols);
     let mut cursors: Vec<(usize, usize)> = std::iter::once(buf.cursor()).chain(extra_cursors.iter().copied()).collect();
     // Resolved once per Insert-mode session: the file's language can't
     // change while it's being typed into, and neither can the table (the
@@ -1029,7 +1046,15 @@ pub(crate) fn run_insert_mode(
         // run_normal_mode_navigation's own identical restructuring
         // (repl.rs) for the full reasoning -- same fix, same root cause.
         while !term::stdin_ready(editor::IDLE_POLL_MS) {
-            if on_idle() {
+            if let Some(geometry) = on_idle() {
+                rect = geometry.rect;
+                term_rows = geometry.term_rows;
+                term_cols = geometry.term_cols;
+                // A shrink can leave the cursor below the viewport, and
+                // working that out needs the new height -- which is a
+                // stored field with no resize hook of its own.
+                buf.set_viewport_height(editor_content_rows(rect));
+                scroll_to_show_cursor(buf, editor_content_cols(buf, rect));
                 render_editor_frame(buf, vk, mode, rect, term_rows, term_cols, color_overrides);
             }
         }
@@ -3009,7 +3034,7 @@ mod macro_tests {
             KeyOutcome::Motion(m, count) => motion::apply_motion(buf, m, count),
             KeyOutcome::EnterInsert(cmd) => {
                 resolve_insert_start(buf, cmd);
-                run_insert_mode(buf, vk, rect(), registers, &mut || false, false, 24, 80, None, &[], &[]).unwrap();
+                run_insert_mode(buf, vk, rect(), registers, &mut || None, false, 24, 80, None, &[], &[]).unwrap();
             }
             other => panic!("unexpected outcome in this test: {other:?}"),
         }
@@ -3048,7 +3073,7 @@ mod macro_tests {
         }
         vk.stop_recording();
         assert!(vk.queue_macro_replay('a', 1));
-        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut || false, false, 24, 80, None, &[], abbrs).unwrap();
+        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut || None, false, 24, 80, None, &[], abbrs).unwrap();
         buf
     }
 
@@ -3143,7 +3168,7 @@ mod macro_tests {
         }
         vk.stop_recording();
         assert!(vk.queue_macro_replay('a', 1));
-        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut || false, true, 24, 80, None, &[], &abbrs).unwrap();
+        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut || None, true, 24, 80, None, &[], &abbrs).unwrap();
         assert_eq!(text_of(&buf), "pl ");
     }
 
@@ -3252,7 +3277,7 @@ mod multi_cursor_insert_tests {
         let mut registers = Registers::new_for_test();
         scripted(&mut vk, &[Key::Char('D'), Key::Char('O'), Key::Char('N'), Key::Char('E'), Key::Escape]);
 
-        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut || false, false, 24, 80, None, &[(1, 0), (2, 0)], &[]).unwrap();
+        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut || None, false, 24, 80, None, &[(1, 0), (2, 0)], &[]).unwrap();
 
         assert_eq!(line(&buf, 0), "DONE one");
         assert_eq!(line(&buf, 1), "DONE two");
@@ -3268,7 +3293,7 @@ mod multi_cursor_insert_tests {
         let mut registers = Registers::new_for_test();
         scripted(&mut vk, &[Key::Backspace, Key::Escape]);
 
-        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut || false, false, 24, 80, None, &[(1, 1)], &[]).unwrap();
+        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut || None, false, 24, 80, None, &[(1, 1)], &[]).unwrap();
 
         assert_eq!(line(&buf, 0), " one");
         assert_eq!(line(&buf, 1), " two");
@@ -3283,7 +3308,7 @@ mod multi_cursor_insert_tests {
         let mut registers = Registers::new_for_test();
         scripted(&mut vk, &[Key::Enter, Key::Escape]);
 
-        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut || false, false, 24, 80, None, &[(1, 1)], &[]).unwrap();
+        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut || None, false, 24, 80, None, &[(1, 1)], &[]).unwrap();
 
         assert_eq!(buf.line_count(), 4);
         assert_eq!(line(&buf, 0), "a");
@@ -3304,7 +3329,7 @@ mod multi_cursor_insert_tests {
         let mut registers = Registers::new_for_test();
         scripted(&mut vk, &[Key::Char('X'), Key::Escape]);
 
-        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut || false, false, 24, 80, None, &[(0, 6)], &[]).unwrap();
+        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut || None, false, 24, 80, None, &[(0, 6)], &[]).unwrap();
 
         assert_eq!(line(&buf, 0), "X placeX ");
     }
@@ -3340,7 +3365,7 @@ mod insert_mode_exit_clamp_tests {
         let mut registers = Registers::new_for_test();
         scripted(&mut vk, &[Key::Escape]);
 
-        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut || false, false, 24, 80, None, &[], &[]).unwrap();
+        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut || None, false, 24, 80, None, &[], &[]).unwrap();
 
         assert_eq!(buf.cursor(), (0, 1), "cursor must land on 'b', not past it");
     }
@@ -3353,7 +3378,7 @@ mod insert_mode_exit_clamp_tests {
         let mut registers = Registers::new_for_test();
         scripted(&mut vk, &[Key::Char('h'), Key::Char('i'), Key::Escape]);
 
-        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut || false, false, 24, 80, None, &[], &[]).unwrap();
+        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut || None, false, 24, 80, None, &[], &[]).unwrap();
 
         assert_eq!(buf.cursor(), (0, 1), "cursor must land on the 'i', not past it");
     }
@@ -3369,7 +3394,7 @@ mod insert_mode_exit_clamp_tests {
         let mut registers = Registers::new_for_test();
         scripted(&mut vk, &[Key::Escape]);
 
-        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut || false, false, 24, 80, None, &[], &[]).unwrap();
+        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut || None, false, 24, 80, None, &[], &[]).unwrap();
 
         assert_eq!(buf.get_mark('^'), Some((0, 2)));
     }
@@ -3382,7 +3407,7 @@ mod insert_mode_exit_clamp_tests {
         let mut registers = Registers::new_for_test();
         scripted(&mut vk, &[Key::Escape]);
 
-        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut || false, false, 24, 80, None, &[], &[]).unwrap();
+        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut || None, false, 24, 80, None, &[], &[]).unwrap();
 
         assert_eq!(buf.cursor(), (0, 0));
     }
@@ -3429,7 +3454,7 @@ mod insert_mode_ctrl_w_tests {
         keys.push(Key::CtrlW);
         scripted(&mut vk, &keys);
 
-        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut || false, false, 24, 80, None, &[], &[]).unwrap();
+        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut || None, false, 24, 80, None, &[], &[]).unwrap();
 
         assert_eq!(line(&buf, 0), "hello ");
         assert_eq!(buf.cursor(), (0, 6));
@@ -3446,7 +3471,7 @@ mod insert_mode_ctrl_w_tests {
         keys.push(Key::CtrlW);
         scripted(&mut vk, &keys);
 
-        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut || false, false, 24, 80, None, &[], &[]).unwrap();
+        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut || None, false, 24, 80, None, &[], &[]).unwrap();
 
         assert_eq!(line(&buf, 0), "", "both words should be gone");
     }
@@ -3460,7 +3485,7 @@ mod insert_mode_ctrl_w_tests {
         let mut registers = Registers::new_for_test();
         scripted(&mut vk, &[Key::CtrlW]);
 
-        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut || false, false, 24, 80, None, &[], &[]).unwrap();
+        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut || None, false, 24, 80, None, &[], &[]).unwrap();
 
         assert_eq!(line(&buf, 0), "existing ");
     }
@@ -3473,7 +3498,7 @@ mod insert_mode_ctrl_w_tests {
         let mut registers = Registers::new_for_test();
         scripted(&mut vk, &[Key::CtrlW, Key::Char('x')]);
 
-        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut || false, false, 24, 80, None, &[], &[]).unwrap();
+        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut || None, false, 24, 80, None, &[], &[]).unwrap();
 
         assert_eq!(line(&buf, 0), "x");
     }
@@ -3509,7 +3534,7 @@ mod insert_mode_alt_word_motion_tests {
         let mut registers = Registers::new_for_test();
         scripted(&mut vk, &[Key::AltLeft, Key::Escape]);
 
-        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut || false, false, 24, 80, None, &[], &[]).unwrap();
+        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut || None, false, 24, 80, None, &[], &[]).unwrap();
 
         assert_eq!(buf.line_chars(0).into_iter().collect::<String>(), "hello world", "nothing should be deleted");
         assert_eq!(buf.cursor(), (0, 6), "cursor should land at the start of 'world', matching vim's own `b`");
@@ -3524,7 +3549,7 @@ mod insert_mode_alt_word_motion_tests {
         let mut registers = Registers::new_for_test();
         scripted(&mut vk, &[Key::AltRight, Key::Escape]);
 
-        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut || false, false, 24, 80, None, &[], &[]).unwrap();
+        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut || None, false, 24, 80, None, &[], &[]).unwrap();
 
         assert_eq!(buf.line_chars(0).into_iter().collect::<String>(), "hello world", "nothing should be deleted");
         assert_eq!(buf.cursor(), (0, 6), "cursor should land at the start of 'world', matching vim's own `w`");
@@ -3539,7 +3564,7 @@ mod insert_mode_alt_word_motion_tests {
         let mut registers = Registers::new_for_test();
         scripted(&mut vk, &[Key::AltLeft, Key::Char('X'), Key::Escape]);
 
-        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut || false, false, 24, 80, None, &[], &[]).unwrap();
+        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut || None, false, 24, 80, None, &[], &[]).unwrap();
 
         assert_eq!(buf.line_chars(0).into_iter().collect::<String>(), "hello Xworld");
     }

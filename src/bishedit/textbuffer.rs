@@ -655,6 +655,10 @@ impl Buffer for TextBuffer {
         self.vheight
     }
 
+    fn set_viewport_height(&mut self, rows: usize) {
+        self.vheight = rows.max(1);
+    }
+
     fn viewport_left(&self) -> usize {
         self.hleft
     }

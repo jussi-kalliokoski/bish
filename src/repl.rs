@@ -4016,7 +4016,14 @@ fn service_background_jobs(
         }
     }
 
-    poll_and_apply_resize(&*sessions, &*windows, job_frames, term_rows, term_cols, sinks_are_grid, skip_window);
+    // A resize repaints the compositor from the session grids, which
+    // blanks a `Frame::Edit` pane being driven for exactly the reason
+    // the just_attached comment above gives. Its answer was being
+    // discarded here, so the caller never learned to follow up -- which
+    // is what made shrinking the terminal leave an editor pane empty
+    // until the next keystroke that happened to redraw something.
+    let resized =
+        poll_and_apply_resize(&*sessions, &*windows, job_frames, term_rows, term_cols, sinks_are_grid, skip_window);
 
     const MAX_READS_PER_TICK: u32 = 16;
     let mut buf = [0u8; 4096];
@@ -4071,10 +4078,11 @@ fn service_background_jobs(
             }
         }
     }
-    // Either reason to repaint is the caller's cue to follow up with its
-    // own view redraw if it has one the grid can't express (see the
-    // just_attached comment above).
-    just_attached || bg_output
+    // Any of these is the caller's cue to follow up with its own view
+    // redraw if it has one the grid can't express (see the just_attached
+    // comment above). A resize additionally means the caller's own cached
+    // pane rect is stale, so it has to re-measure before redrawing.
+    just_attached || bg_output || resized
 }
 
 // Raw stdin read for drive_fg_job. Renamed via link_name so the local
@@ -5086,6 +5094,10 @@ impl BisheditBuffer for ScreenBuffer {
         self.vheight
     }
 
+    fn set_viewport_height(&mut self, rows: usize) {
+        self.vheight = rows.max(1);
+    }
+
     fn set_mark(&mut self, name: char, pos: (usize, usize)) {
         self.marks.insert(name, pos);
     }
@@ -5867,7 +5879,35 @@ fn apply_view_options(shell: &exec::Shell, buf: &mut TextBuffer) {
 // node: an entire Insert-mode session collapses into a single checkpoint
 // here, not one per keystroke, with no changes needed to any of the
 // individual `Operator`/`OperatorLines`/`Put`/... arms that call this.
+// Insert mode's own idle tick: service everything, and when that says
+// to repaint, hand back the geometry to repaint *into* rather than
+// letting the caller reuse what it measured before Insert mode began.
+// See fileeditor::IdleRedraw for why the two can't be separated.
+#[allow(clippy::too_many_arguments)]
+fn insert_idle(
+    sessions: &mut HashMap<SessionId, SessionState>,
+    windows: &mut [WindowEntry],
+    job_frames: &mut HashMap<JobFrameId, exec::FgJob>,
+    current_window: &mut usize,
+    term_rows: &mut usize,
+    term_cols: &mut usize,
+    sinks_are_grid: bool,
+) -> Option<fileeditor::IdleRedraw> {
+    let repaint =
+        service_background_jobs(sessions, windows, job_frames, *current_window, term_rows, term_cols, sinks_are_grid);
+    repaint.then(|| fileeditor::IdleRedraw {
+        rect: pane_rect(&windows[*current_window], windows[*current_window].focused_pane, *term_rows, *term_cols),
+        term_rows: *term_rows,
+        term_cols: *term_cols,
+    })
+}
+
 fn render_nav_frame(buf: &mut NavBuffer, vk: &VimKeys, rect: Rect, term_rows: usize, term_cols: usize, color_overrides: Option<&highlight::ColorOverrides>) {
+    // The buffer's own viewport height is a stored field with no resize
+    // hook of its own, so every redraw resyncs it from the rect actually
+    // being drawn into. Without this a shrink leaves the scroll
+    // arithmetic working from a height the pane no longer has.
+    buf.set_viewport_height(normal_mode_content_rows(rect));
     match buf {
         // ReadOnly (NavStart::Prompt/JobDetach) never carries file syntax
         // highlighting to color-override at all -- it's replaying/
@@ -6061,6 +6101,20 @@ fn run_normal_mode_navigation(
                 // function's own doc comment) -- follow up with the
                 // real thing, the exact same call this function's own
                 // entry above already makes once, up front.
+                //
+                // Re-measured first: one of the reasons that bool comes
+                // back true is a terminal resize, after which this
+                // pane's own rect -- captured once, before the loop --
+                // describes geometry that no longer exists.
+                rect = pane_rect(&windows[*current_window], windows[*current_window].focused_pane, *term_rows, *term_cols);
+                if let Some(tb) = buf.as_editable_mut() {
+                    // The height a shrink took away may have left the
+                    // cursor below the viewport; the scroll needs the
+                    // *new* height to work that out, which is why the
+                    // resync comes first.
+                    tb.set_viewport_height(normal_mode_content_rows(rect));
+                    fileeditor::scroll_to_show_cursor(tb, fileeditor::editor_content_cols(tb, rect));
+                }
                 render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides.as_ref());
             }
         }
@@ -6339,7 +6393,7 @@ fn run_normal_mode_navigation(
                         &mut vk,
                         rect,
                         registers,
-                        &mut || service_background_jobs(sessions, windows, job_frames, *current_window, term_rows, term_cols, *sinks_are_grid),
+                        &mut || insert_idle(sessions, windows, job_frames, current_window, term_rows, term_cols, *sinks_are_grid),
                         false,
                         insert_term_rows,
                         insert_term_cols,
@@ -6654,7 +6708,7 @@ fn run_normal_mode_navigation(
                         fileeditor::resolve_insert_start(tb, cmd);
                         let (insert_term_rows, insert_term_cols) = (*term_rows, *term_cols);
                         let insert_abbrs = sessions[&session_id].shell.abbrs.clone();
-                        fileeditor::run_insert_mode(tb, &mut vk, rect, registers, &mut || service_background_jobs(sessions, windows, job_frames, *current_window, term_rows, term_cols, *sinks_are_grid), false, insert_term_rows, insert_term_cols, color_overrides.as_ref(), &[], &insert_abbrs)?;
+                        fileeditor::run_insert_mode(tb, &mut vk, rect, registers, &mut || insert_idle(sessions, windows, job_frames, current_window, term_rows, term_cols, *sinks_are_grid), false, insert_term_rows, insert_term_cols, color_overrides.as_ref(), &[], &insert_abbrs)?;
                     }
                     render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides.as_ref());
                 } else {
@@ -6674,7 +6728,7 @@ fn run_normal_mode_navigation(
                     if let Some(tb) = buf.as_writable_mut() {
                         let (insert_term_rows, insert_term_cols) = (*term_rows, *term_cols);
                         let insert_abbrs = sessions[&session_id].shell.abbrs.clone();
-                        fileeditor::run_insert_mode(tb, &mut vk, rect, registers, &mut || service_background_jobs(sessions, windows, job_frames, *current_window, term_rows, term_cols, *sinks_are_grid), true, insert_term_rows, insert_term_cols, color_overrides.as_ref(), &[], &insert_abbrs)?;
+                        fileeditor::run_insert_mode(tb, &mut vk, rect, registers, &mut || insert_idle(sessions, windows, job_frames, current_window, term_rows, term_cols, *sinks_are_grid), true, insert_term_rows, insert_term_cols, color_overrides.as_ref(), &[], &insert_abbrs)?;
                     }
                     render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides.as_ref());
                 } else {
@@ -6771,7 +6825,7 @@ fn run_normal_mode_navigation(
                             if fileeditor::delete_motion(tb, registers, m, count, register) {
                                 let (insert_term_rows, insert_term_cols) = (*term_rows, *term_cols);
                                 let insert_abbrs = sessions[&session_id].shell.abbrs.clone();
-                                fileeditor::run_insert_mode(tb, &mut vk, rect, registers, &mut || service_background_jobs(sessions, windows, job_frames, *current_window, term_rows, term_cols, *sinks_are_grid), false, insert_term_rows, insert_term_cols, color_overrides.as_ref(), &[], &insert_abbrs)?;
+                                fileeditor::run_insert_mode(tb, &mut vk, rect, registers, &mut || insert_idle(sessions, windows, job_frames, current_window, term_rows, term_cols, *sinks_are_grid), false, insert_term_rows, insert_term_cols, color_overrides.as_ref(), &[], &insert_abbrs)?;
                             }
                         }
                         Op::Lowercase | Op::Uppercase | Op::CaseToggle => {
@@ -6794,7 +6848,7 @@ fn run_normal_mode_navigation(
                             fileeditor::delete_lines(tb, registers, count, register);
                             let (insert_term_rows, insert_term_cols) = (*term_rows, *term_cols);
                             let insert_abbrs = sessions[&session_id].shell.abbrs.clone();
-                            fileeditor::run_insert_mode(tb, &mut vk, rect, registers, &mut || service_background_jobs(sessions, windows, job_frames, *current_window, term_rows, term_cols, *sinks_are_grid), false, insert_term_rows, insert_term_cols, color_overrides.as_ref(), &[], &insert_abbrs)?;
+                            fileeditor::run_insert_mode(tb, &mut vk, rect, registers, &mut || insert_idle(sessions, windows, job_frames, current_window, term_rows, term_cols, *sinks_are_grid), false, insert_term_rows, insert_term_cols, color_overrides.as_ref(), &[], &insert_abbrs)?;
                         }
                         Op::Lowercase | Op::Uppercase | Op::CaseToggle => fileeditor::case_operator_lines(tb, count, fileeditor::case_kind_for_op(op)),
                         Op::Indent => fileeditor::indent_lines(tb, count),
@@ -6868,7 +6922,7 @@ fn run_normal_mode_navigation(
                     fileeditor::open_line(tb, above);
                     let (insert_term_rows, insert_term_cols) = (*term_rows, *term_cols);
                     let insert_abbrs = sessions[&session_id].shell.abbrs.clone();
-                    fileeditor::run_insert_mode(tb, &mut vk, rect, registers, &mut || service_background_jobs(sessions, windows, job_frames, *current_window, term_rows, term_cols, *sinks_are_grid), false, insert_term_rows, insert_term_cols, color_overrides.as_ref(), &[], &insert_abbrs)?;
+                    fileeditor::run_insert_mode(tb, &mut vk, rect, registers, &mut || insert_idle(sessions, windows, job_frames, current_window, term_rows, term_cols, *sinks_are_grid), false, insert_term_rows, insert_term_cols, color_overrides.as_ref(), &[], &insert_abbrs)?;
                 }
                 render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides.as_ref());
             }
