@@ -15,6 +15,7 @@ mod git;
 mod glob;
 mod hexedit;
 mod history;
+mod html;
 mod inflate;
 mod json;
 mod lexer;
