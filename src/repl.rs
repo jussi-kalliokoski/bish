@@ -3860,7 +3860,13 @@ fn service_background_jobs(
     // up with its own direct redraw of the real content it alone has
     // access to.
     let just_attached = session::take_bridge_just_attached();
-    if just_attached && sinks_are_grid {
+    // Whatever the background jobs have said since the last tick, into
+    // the grid of whichever session started each one -- see
+    // Shell::drain_background_output. One call covers every session: the
+    // job table is shared, and each job carries its own destination. Any
+    // live shell will do as the receiver; there is always at least one.
+    let bg_output = sessions.values().next().is_some_and(|s| s.shell.drain_background_output());
+    if (just_attached || bg_output) && sinks_are_grid {
         compositor_redraw(sessions, windows, skip_window, *term_rows, *term_cols);
     }
     // The new client's own TERM/COLORTERM -- applied to *every*
@@ -3933,7 +3939,10 @@ fn service_background_jobs(
             }
         }
     }
-    just_attached
+    // Either reason to repaint is the caller's cue to follow up with its
+    // own view redraw if it has one the grid can't express (see the
+    // just_attached comment above).
+    just_attached || bg_output
 }
 
 // Raw stdin read for drive_fg_job. Renamed via link_name so the local

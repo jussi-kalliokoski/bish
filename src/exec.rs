@@ -1302,6 +1302,75 @@ impl Shell {
     // match on the job's command text) to an index into self.jobs. Bare
     // job numbers without the `%` are also accepted, matching bash's own
     // leniency in `fg`/`bg`/`wait`.
+    // A pty for a *background* job's stdio, sized to this session's own
+    // on-screen area. `None` when this session isn't promoted (there's no
+    // grid to feed, and inherited stdio already lands where it should) or
+    // the pty can't be opened, in which case every caller keeps its
+    // previous behavior exactly.
+    //
+    // Why a pty and not a plain pipe: the child's own isatty() then
+    // answers what it would have with the inherited terminal, so `ls &`
+    // keeps its colors -- and, more importantly, `fg` on the job can go
+    // through the same drive_fg_job rendering path a foreground command
+    // already uses, rather than a blocking wait with nothing draining the
+    // far end.
+    fn background_pty(&self) -> Option<pty::Pty> {
+        if !self.is_promoted() {
+            return None;
+        }
+        let p = pty::open().ok()?;
+        let (rows, cols) = self.pty_size();
+        let _ = p.resize(rows, cols);
+        Some(p)
+    }
+
+    // Reads whatever the pty-backed background jobs have produced since
+    // the last call and feeds each one into the grid of the session that
+    // started it (Job::sink_screen). Returns true iff anything arrived,
+    // which is the caller's cue to repaint.
+    //
+    // Without this a background job's output simply never appeared: the
+    // pty buffer filled up invisibly and only spilled onto the screen if
+    // the job was later `fg`'d. The job table is shared by every session
+    // (see the `jobs` field's own doc comment), so one call from any live
+    // shell services all of them -- which is exactly why each job records
+    // its own destination rather than this trying to work one out.
+    pub(crate) fn drain_background_output(&self) -> bool {
+        use std::io::Read;
+        use std::os::unix::io::AsRawFd;
+        // Bounded per call, the same way repl.rs's own job-pty drain is:
+        // a firehose in the background must not be able to hold up
+        // whichever interactive loop called this.
+        const MAX_READS_PER_TICK: u32 = 16;
+        let mut buf = [0u8; 4096];
+        let mut fed = false;
+        let mut table = self.jobs.borrow_mut();
+        for job in &mut table.jobs {
+            let (Some(master), Some(screen)) = (&mut job.pty_master, &job.sink_screen) else {
+                continue;
+            };
+            if !job.nonblocking {
+                // Lazily, so no spawn site has to think about it: a
+                // blocking read here would park the whole shell on a job
+                // that simply has nothing to say yet.
+                pty::set_nonblocking(master.as_raw_fd());
+                job.nonblocking = true;
+            }
+            for _ in 0..MAX_READS_PER_TICK {
+                match master.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        screen.borrow_mut().feed(&buf[..n]);
+                        fed = true;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(_) => break,
+                }
+            }
+        }
+        fed
+    }
+
     // Registers a freshly spawned background job (one child for a plain
     // backgrounded command, several for a backgrounded pipeline) in the
     // job table, and updates $! to the last child's PID (bash's own
@@ -1332,7 +1401,11 @@ impl Shell {
         table.last_bg_pid = pids.last().copied();
         let id = table.next_job_id;
         table.next_job_id += 1;
-        table.jobs.push(Job { id, pids, children, cmd_text, pty_master, pgid, stopped: false });
+        let sink_screen = match &self.sink {
+            OutputSink::Grid(screen) => Some(screen.clone()),
+            _ => None,
+        };
+        table.jobs.push(Job { id, pids, children, cmd_text, pty_master, sink_screen, nonblocking: false, pgid, stopped: false });
     }
 
     fn resolve_job_spec(&self, spec: &str) -> Option<usize> {
@@ -4370,9 +4443,23 @@ impl Shell {
             }
         };
         let script = self.functions_preamble() + raw;
-        match Command::new(exe).arg("-c").arg(script).current_dir(&self.cwd).spawn() {
-            Ok(child) => {
-                self.push_job(vec![child], format!("({})", raw));
+        let mut command = Command::new(exe);
+        command.arg("-c").arg(script).current_dir(&self.cwd);
+        // Attached to its own pty, for exactly the reason run_single's own
+        // background spawn already is (see `use_pty` there): inherited
+        // stdio writes straight onto whatever the real screen happens to
+        // show, and the compositor's next redraw -- painted from the
+        // session's grid, which never saw a byte of it -- silently wipes
+        // it. Nothing here needs the process-group isolation that would
+        // conflict with spawn_attached's own setsid, so this gets the
+        // full treatment rather than just the fds.
+        let spawned = match self.background_pty() {
+            Some(p) => pty::spawn_attached(command, &p.slave_path).map(|child| (child, Some(p.master))),
+            None => command.spawn().map(|child| (child, None)),
+        };
+        match spawned {
+            Ok((child, master)) => {
+                self.push_job_with_pty(vec![child], format!("({})", raw), master);
                 0
             }
             Err(e) => {
@@ -6274,6 +6361,12 @@ impl Shell {
                                 children: vec![child],
                                 cmd_text,
                                 pty_master: Some(p.master),
+                                // A foreground job: drive_fg_job reads its
+                                // pty straight into the session's grid
+                                // itself, so there's nothing for the
+                                // background drain to do here.
+                                sink_screen: None,
+                                nonblocking: false,
                                 pgid: None,
                                 stopped: false,
                             });
@@ -6369,6 +6462,8 @@ impl Shell {
                                     children: vec![child],
                                     cmd_text: cmd_text.clone(),
                                     pty_master: None,
+                                    sink_screen: None,
+                                    nonblocking: false,
                                     pgid: Some(pid),
                                     stopped: true,
                                 });
@@ -6429,10 +6524,33 @@ impl Shell {
         // group" behavior doesn't have.
         let mut pgid: Option<i32> = None;
 
+        // A backgrounded pipeline's own pty (see background_pty): the
+        // first stage reads from it, the last writes to it, and every
+        // stage's stderr goes there too -- inherited, any of that would
+        // land straight on the real screen for the compositor to wipe.
+        // Wired as plain fds rather than via spawn_attached, whose setsid
+        // would undo the process-group isolation set up just below (and
+        // which `kill %N`/`bg` need to reach every stage at once).
+        let bg_pty = if background { self.background_pty() } else { None };
+        let bg_slave = |pty: &Option<pty::Pty>| -> Option<Stdio> {
+            let p = pty.as_ref()?;
+            std::fs::OpenOptions::new().read(true).write(true).open(&p.slave_path).ok().map(Stdio::from)
+        };
+
         for (i, cmd) in commands.iter().enumerate() {
             let is_last = i == n - 1;
-            let default_stdin = prev_stdout.take().unwrap_or_else(|| self.spawn_stdin_stdio());
-            let default_stdout = if is_last { self.spawn_stdout_stdio() } else { Stdio::piped() };
+            // Only the first stage takes the pty as stdin -- every other
+            // one reads the previous stage's pipe, exactly as before.
+            let default_stdin = match prev_stdout.take() {
+                Some(prev) => prev,
+                None => bg_slave(&bg_pty).unwrap_or_else(|| self.spawn_stdin_stdio()),
+            };
+            let default_stdout = if is_last {
+                bg_slave(&bg_pty).unwrap_or_else(|| self.spawn_stdout_stdio())
+            } else {
+                Stdio::piped()
+            };
+            let mut default_stderr = bg_slave(&bg_pty);
 
             let mut command = match cmd {
                 parser::Command::Simple(sc) => {
@@ -6493,7 +6611,7 @@ impl Shell {
                     }
                     command.stdin(redirs.stdin.unwrap_or(default_stdin));
                     command.stdout(redirs.stdout.unwrap_or(default_stdout));
-                    command.stderr(redirs.stderr.unwrap_or_else(Stdio::inherit));
+                    command.stderr(redirs.stderr.or_else(|| default_stderr.take()).unwrap_or_else(Stdio::inherit));
                     apply_fd_redirects(&mut command, redirs.dup_stderr_to_stdout, redirs.extra_fds);
                     command
                 }
@@ -6530,7 +6648,7 @@ impl Shell {
                     command.arg("-c").arg(script);
                     command.stdin(redirs.stdin.unwrap_or(default_stdin));
                     command.stdout(redirs.stdout.unwrap_or(default_stdout));
-                    command.stderr(redirs.stderr.unwrap_or_else(Stdio::inherit));
+                    command.stderr(redirs.stderr.or_else(|| default_stderr.take()).unwrap_or_else(Stdio::inherit));
                     apply_fd_redirects(&mut command, redirs.dup_stderr_to_stdout, redirs.extra_fds);
                     command
                 }
@@ -6587,7 +6705,10 @@ impl Shell {
         if background {
             let cmd_text =
                 commands.iter().map(crate::serialize::serialize_command).collect::<Vec<_>>().join(" | ");
-            self.push_job_with_pgid(children, cmd_text, pgid.map(|p| p as u32));
+            // Both the pgid (so `kill %N`/`bg` reach every stage at once)
+            // and the output pty, which push_job_full needs to record for
+            // the drain to find later.
+            self.push_job_full(children, cmd_text, bg_pty.map(|p| p.master), pgid.map(|p| p as u32));
             return 0;
         }
 
@@ -8342,6 +8463,19 @@ struct Job {
     // redirected) has this as None and `fg` falls back to exactly
     // today's blocking behavior for it.
     pty_master: Option<std::fs::File>,
+    // The grid this job's own output belongs in: the sink of whichever
+    // session spawned it, captured at that moment (see push_job_full).
+    // Recorded on the *job* rather than looked up later because the job
+    // table is shared by every session (see the `jobs` field's own doc
+    // comment) -- there is no "the current session" to ask by the time
+    // the output actually shows up. `None` when that session wasn't
+    // promoted, which is also exactly when there's no grid to feed and
+    // inherited stdio is already going to the right place.
+    sink_screen: Option<Rc<RefCell<crate::vt100::Screen>>>,
+    // Set to true once this job's pty master has had O_NONBLOCK applied
+    // -- done lazily on the first drain rather than at spawn, so every
+    // spawn site stays free of it.
+    nonblocking: bool,
     // Real job control (M11): Some(pid) for a single external command
     // spawned via run_single's plain (non-pty) path, where the pre_exec
     // hook there gave it its own process group seeded from its own pid --
@@ -10595,6 +10729,34 @@ mod tests {
         let out = capture_output(&mut shell);
         shell.run_abbr(&strs(&["-s"]));
         assert_eq!(out.borrow().as_str(), "abbr -a 'foo' 'bar -x %s -y %s' 2 1\n");
+    }
+
+    #[test]
+    fn a_background_jobs_output_is_routed_to_the_grid_that_spawned_it() {
+        // Regression: a `cmd &` wrote straight to the real terminal --
+        // painting over whatever the pane was showing, then being wiped
+        // by the next repaint, since the session's grid never saw a byte
+        // of it -- or, for the pty-attached case, never appeared at all
+        // because nothing drained the far end. Both now land in the grid
+        // of the session that started the job.
+        let mut shell = Shell::new();
+        let screen = Rc::new(RefCell::new(crate::vt100::Screen::new(6, 40)));
+        shell.set_sink_grid(screen.clone());
+        shell.promote_if_needed();
+        shell.run_source_here("sh -c 'echo from-a-background-job' &\n", "<test>");
+        // The child writes as soon as it can; drain until it shows up
+        // rather than racing it (the real caller does this every idle
+        // tick).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let row0 = loop {
+            shell.drain_background_output();
+            let text: String = (0..40).map(|c| screen.borrow().cell(0, c).ch).collect::<String>().trim_end().to_string();
+            if !text.is_empty() || std::time::Instant::now() > deadline {
+                break text;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        assert_eq!(row0, "from-a-background-job");
     }
 
     #[test]
