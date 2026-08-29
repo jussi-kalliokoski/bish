@@ -25,7 +25,7 @@ pub fn run(args: &[String]) -> i32 {
         }
         None => {
             eprintln!(
-                "bish tool: expected a subcommand (usage: bish tool check [--fix] [FILE...], bish tool format [--check] [FILE...], bish tool debug FILE, bish tool edit FILE, bish tool hex FILE)"
+                "bish tool: expected a subcommand (usage: bish tool check [--fix] [FILE...], bish tool format [--check] [FILE...], bish tool debug FILE, bish tool edit FILE..., bish tool hex FILE)"
             );
             2
         }
@@ -47,20 +47,25 @@ fn run_debug(args: &[String]) -> i32 {
     }
 }
 
-// `bish tool edit <file>` -- also a real interactive session, not a
+// `bish tool edit <file>...` -- also a real interactive session, not a
 // one-shot pass, but unlike `debug` it reuses the real windowed editor
 // machinery directly (repl::run_edit) rather than re-deriving a subset
 // of it: there's no debugger-shaped state (breakpoints, run/step
-// control) to bolt on here, just "open this one file in the real
-// editor, without the multi-window/tab-bar chrome around it."
+// control) to bolt on here, just "open these files in the real editor,
+// without the multi-window/tab-bar chrome around it." Argument parsing
+// is the `e` builtin's own (fileeditor::parse_edit_args), so the command
+// line and the builtin can't drift apart.
 fn run_edit(args: &[String]) -> i32 {
-    match args.first() {
-        Some(path) => crate::repl::run_edit(path),
-        None => {
-            eprintln!("usage: bish tool edit FILE");
-            2
-        }
+    if args.is_empty() {
+        eprintln!("usage: bish tool edit FILE...");
+        return 2;
     }
+    if args.iter().any(|a| a == "-h" || a == "--help") {
+        println!("usage: bish tool edit FILE...");
+        println!("  opens each FILE in the real editor, the first one in front");
+        return 0;
+    }
+    crate::repl::run_edit(args)
 }
 
 fn print_check_usage() {

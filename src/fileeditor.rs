@@ -53,6 +53,47 @@ impl EditSession {
     }
 }
 
+// One file `e` was asked to open. `e` takes several at once (`e a.sh
+// b.sh`), opening one editor frame per target on the focused pane's own
+// frame stack -- the first one named ends up on top, and closing it
+// (`:q`) reveals the next, which is exactly what that stack already does
+// for every other frame kind (see repl.rs's `Frame`).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct EditTarget {
+    // `None` is a fresh unnamed buffer -- a bare `e` with no arguments
+    // at all.
+    pub path: Option<String>,
+}
+
+// `e`'s own argument parsing, shared by the builtin (via `ExecResult::
+// Edit`) and `bish tool edit` so the two can't drift apart.
+//
+// `--` ends option parsing, the usual way, so a file whose name really
+// does start with `-` is still openable (`e -- -weird.txt`). An
+// unrecognized leading-dash argument is an error rather than a filename:
+// silently opening a buffer named `--hxe` because of a typo is a far
+// worse outcome than being told the flag isn't one.
+pub fn parse_edit_args(args: &[String]) -> Result<Vec<EditTarget>, String> {
+    let mut targets: Vec<EditTarget> = Vec::new();
+    let mut literal = false;
+    for arg in args {
+        if !literal && arg == "--" {
+            literal = true;
+            continue;
+        }
+        // `-` alone is left alone: not a flag anywhere in this codebase,
+        // and conventionally a filename-shaped stand-in for a stream.
+        if !literal && arg.starts_with('-') && arg != "-" {
+            return Err(format!("unrecognized option '{arg}'"));
+        }
+        targets.push(EditTarget { path: Some(arg.clone()) });
+    }
+    if targets.is_empty() {
+        targets.push(EditTarget::default());
+    }
+    Ok(targets)
+}
+
 // What the status line (`mode_label`) and `build_editor_frame`'s own
 // Visual-highlight gating need to know about the current mode -- `R`'s
 // own addition to what used to be a plain `insert_mode: bool` (Replace
@@ -2026,6 +2067,48 @@ pub fn render_editor_frame(buf: &TextBuffer, vk: &VimKeys, mode: EditorMode, rec
 pub fn freeze_editor_frame(screen: &Rc<RefCell<vt100::Screen>>, buf: &TextBuffer, vk: &VimKeys, rect: Rect, color_overrides: Option<&highlight::ColorOverrides>) {
     let framed = build_editor_frame(buf, vk, EditorMode::Normal, rect, 0, 0, color_overrides);
     screen.borrow_mut().feed(framed.as_bytes());
+}
+
+#[cfg(test)]
+mod edit_args_tests {
+    use super::*;
+
+    fn parse(line: &str) -> Result<Vec<EditTarget>, String> {
+        let args: Vec<String> = line.split_whitespace().map(String::from).collect();
+        parse_edit_args(&args)
+    }
+
+    fn paths(line: &str) -> Vec<Option<String>> {
+        parse(line).unwrap().into_iter().map(|t| t.path).collect()
+    }
+
+    #[test]
+    fn no_arguments_is_one_fresh_unnamed_buffer() {
+        assert_eq!(paths(""), vec![None]);
+    }
+
+    #[test]
+    fn every_file_argument_becomes_its_own_target() {
+        assert_eq!(paths("a.sh b.sh c.sh"), vec![Some("a.sh".into()), Some("b.sh".into()), Some("c.sh".into())]);
+    }
+
+    #[test]
+    fn a_typo_ed_flag_is_an_error_rather_than_a_filename() {
+        // The whole point of rejecting these: `e --hxe data.bin` quietly
+        // creating a file called `--hxe` would be much worse than a
+        // message saying the flag isn't one.
+        assert!(parse("--hxe data.bin").is_err());
+    }
+
+    #[test]
+    fn a_double_dash_lets_a_dash_leading_filename_through() {
+        assert_eq!(paths("-- --weird.txt"), vec![Some("--weird.txt".into())]);
+    }
+
+    #[test]
+    fn a_bare_dash_is_a_filename_not_a_flag() {
+        assert_eq!(paths("-"), vec![Some("-".into())]);
+    }
 }
 
 #[cfg(test)]

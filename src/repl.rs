@@ -1129,37 +1129,46 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
                     // maintain -- same reasoning Ctrl+Space's own
                     // normal-mode navigation already established.
                     ensure_promoted(&mut sessions, &mut sinks_are_grid);
-                    let path = sessions.get_mut(&session_id).unwrap().shell.take_pending_edit();
+                    let args = sessions.get_mut(&session_id).unwrap().shell.take_pending_edit();
                     let rect = pane_rect(&windows[current_window], windows[current_window].focused_pane, term_rows, term_cols);
-                    match fileeditor::EditSession::open(path.as_deref(), normal_mode_content_rows(rect)) {
-                        Ok(session) => {
-                            let edit_frame_id = next_edit_frame_id;
-                            next_edit_frame_id += 1;
-                            edit_frames.insert(edit_frame_id, session);
-                            windows[current_window].stack_mut().push(Frame::Edit(edit_frame_id));
-
-                            run_edit_frame(
-                                edit_frame_id,
-                                session_id,
-                                &mut sessions,
-                                &mut windows,
-                                &mut current_window,
-                                &mut next_session_id,
-                                &mut next_window_id,
-                                &mut job_frames,
-                                &mut edit_frames,
-                                &mut debug_frames,
-                                &mut cmd_history,
-                                &mut sinks_are_grid,
-                                &mut registers,
-                                &mut term_rows,
-                                &mut term_cols,
-                            );
-                        }
+                    let opened = match fileeditor::parse_edit_args(&args) {
+                        Ok(targets) => open_edit_targets(&targets, &mut sessions, session_id, &mut edit_frames, &mut next_edit_frame_id, rect),
                         Err(e) => {
                             sessions.get_mut(&session_id).unwrap().shell.sink_err(&format!("bish: e: {}\n", e));
-                            compositor_redraw(&sessions, &windows, current_window, term_rows, term_cols);
+                            Vec::new()
                         }
+                    };
+                    // Pushed back-to-front so the *first* file named is
+                    // the one actually on top -- `e a b` opens both, with
+                    // `a` in front and `b` revealed once it's closed,
+                    // matching `vim a b`'s own argument order.
+                    for id in opened.iter().rev() {
+                        windows[current_window].stack_mut().push(Frame::Edit(*id));
+                    }
+                    if let Some(&edit_frame_id) = opened.first() {
+                        run_edit_frame(
+                            edit_frame_id,
+                            session_id,
+                            &mut sessions,
+                            &mut windows,
+                            &mut current_window,
+                            &mut next_session_id,
+                            &mut next_window_id,
+                            &mut job_frames,
+                            &mut edit_frames,
+                            &mut debug_frames,
+                            &mut cmd_history,
+                            &mut sinks_are_grid,
+                            &mut registers,
+                            &mut term_rows,
+                            &mut term_cols,
+                        );
+                    } else {
+                        // Nothing opened at all (a bad flag, or every
+                        // named file failed) -- the pane keeps showing
+                        // its shell, with whatever was sunk above now
+                        // part of it.
+                        compositor_redraw(&sessions, &windows, current_window, term_rows, term_cols);
                     }
                 } else if sinks_are_grid {
                     // The common case once promoted: a normal command ran
@@ -1180,6 +1189,44 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
         }
         let _ = io::stdout().flush();
     }
+}
+
+// Opens every target `e` was given, in order, returning the frame ids
+// that actually came up -- shared by the `e` builtin's own handling in
+// `run()` and by `bish tool edit`'s bootstrap below, so the two open
+// files identically. Pushing those ids onto a pane's frame stack (and
+// deciding which to drive) is the caller's job: the two differ there,
+// and only there.
+//
+// A target that fails to open is reported and skipped rather than
+// abandoning the whole command -- `e a.sh missing-dir/b.sh` opening what
+// it can is both what vim does and the more useful half of the outcome.
+// The message goes to the owning session's own output, so it's still
+// there underneath once every editor frame this opened is closed again.
+fn open_edit_targets(
+    targets: &[fileeditor::EditTarget],
+    sessions: &mut HashMap<SessionId, SessionState>,
+    session_id: SessionId,
+    edit_frames: &mut HashMap<EditFrameId, fileeditor::EditSession>,
+    next_edit_frame_id: &mut EditFrameId,
+    rect: Rect,
+) -> Vec<EditFrameId> {
+    let mut opened = Vec::new();
+    for target in targets {
+        match fileeditor::EditSession::open(target.path.as_deref(), normal_mode_content_rows(rect)) {
+            Ok(session) => {
+                let id = *next_edit_frame_id;
+                *next_edit_frame_id += 1;
+                edit_frames.insert(id, session);
+                opened.push(id);
+            }
+            Err(e) => {
+                let what = target.path.as_deref().unwrap_or("<unnamed>");
+                sessions.get_mut(&session_id).unwrap().shell.sink_err(&format!("bish: e: {}: {}\n", what, e));
+            }
+        }
+    }
+    opened
 }
 
 // `bish tool edit FILE` -- a minimal, single-session, single-window
@@ -1211,8 +1258,14 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
 // deliberate); run_edit_frame simply returns once focus genuinely
 // leaves this one pane, and this function treats that exactly like a
 // real quit -- there's no second window/pane here for it to drive.
-pub fn run_edit(path: &str) -> i32 {
-    run_edit_impl(path, false)
+pub fn run_edit(args: &[String]) -> i32 {
+    match fileeditor::parse_edit_args(args) {
+        Ok(targets) => run_edit_impl(&targets, false),
+        Err(e) => {
+            eprintln!("bish tool edit: {e}");
+            2
+        }
+    }
 }
 
 // `bish tool debug FILE`'s own thin wrapper -- reuses this same minimal
@@ -1222,10 +1275,13 @@ pub fn run_edit(path: &str) -> i32 {
 // comment for the rest of the shape (a real, read-only source pane plus
 // a real DebugRun sibling).
 pub fn run_edit_debug(path: &str) -> i32 {
-    run_edit_impl(path, true)
+    run_edit_impl(&[fileeditor::EditTarget { path: Some(path.to_string()) }], true)
 }
 
-fn run_edit_impl(path: &str, attach_debug: bool) -> i32 {
+// `attach_debug` only ever comes with exactly one target (see
+// run_edit_debug just above) -- it attaches to the *first* one opened,
+// which is that same file.
+fn run_edit_impl(targets: &[fileeditor::EditTarget], attach_debug: bool) -> i32 {
     let mut shell = exec::Shell::new();
     shell.enable_monitor_mode();
     let root_cwd = shell.cwd.clone();
@@ -1261,22 +1317,31 @@ fn run_edit_impl(path: &str, attach_debug: bool) -> i32 {
     ensure_promoted(&mut sessions, &mut sinks_are_grid);
 
     let rect = pane_rect(&windows[current_window], windows[current_window].focused_pane, term_rows, term_cols);
-    let mut session = match fileeditor::EditSession::open(Some(path), normal_mode_content_rows(rect)) {
-        Ok(s) => s,
-        Err(e) => {
-            // Leaving promotion behind here too: promote_if_needed already
-            // switched to the alternate screen before this could fail.
-            print!("\x1b[?1049l");
-            let _ = io::stdout().flush();
-            eprintln!("bish: {}: {}", path, e);
-            return 1;
+    // Unlike the `e` builtin (see open_edit_targets, which reports a bad
+    // target and opens the rest), a failure here aborts the whole
+    // invocation: this is a one-shot command line, so a path that can't
+    // be opened is a usage error worth an exit status, not a note that
+    // scrolls past in a session that keeps running.
+    let mut sessions_to_open = Vec::new();
+    for (i, target) in targets.iter().enumerate() {
+        match fileeditor::EditSession::open(target.path.as_deref(), normal_mode_content_rows(rect)) {
+            Ok(s) => sessions_to_open.push((i as EditFrameId + 1, s)),
+            Err(e) => {
+                // Leaving promotion behind here too: promote_if_needed already
+                // switched to the alternate screen before this could fail.
+                print!("\x1b[?1049l");
+                let _ = io::stdout().flush();
+                eprintln!("bish: {}: {}", target.path.as_deref().unwrap_or("<unnamed>"), e);
+                return 1;
+            }
         }
-    };
+    }
     let edit_frame_id: EditFrameId = 1;
     if attach_debug {
+        let path = targets[0].path.as_deref().unwrap_or_default();
         match debugger::DebugSession::attach(std::path::Path::new(path)) {
             Ok(debug_session) => {
-                session.buffer.set_readonly(true);
+                sessions_to_open[0].1.buffer.set_readonly(true);
                 debug_frames.insert(edit_frame_id, debug_session);
                 let (pane_id, _screen) = split_debug_run_pane(&mut sessions, &mut windows, current_window, &mut next_session_id, edit_frame_id, term_rows, term_cols);
                 let sid = windows[current_window].pane(pane_id).owning_session();
@@ -1290,26 +1355,42 @@ fn run_edit_impl(path: &str, attach_debug: bool) -> i32 {
             }
         }
     }
-    edit_frames.insert(edit_frame_id, session);
-    windows[current_window].stack_mut().push(Frame::Edit(edit_frame_id));
+    let ids: Vec<EditFrameId> = sessions_to_open.iter().map(|(id, _)| *id).collect();
+    for (id, session) in sessions_to_open {
+        edit_frames.insert(id, session);
+    }
+    // Back-to-front, so the first file named is the one on top -- see
+    // the `e` builtin's own identical push in run().
+    for id in ids.iter().rev() {
+        windows[current_window].stack_mut().push(Frame::Edit(*id));
+    }
 
-    run_edit_frame(
-        edit_frame_id,
-        0,
-        &mut sessions,
-        &mut windows,
-        &mut current_window,
-        &mut next_session_id,
-        &mut next_window_id,
-        &mut job_frames,
-        &mut edit_frames,
-        &mut debug_frames,
-        &mut cmd_history,
-        &mut sinks_are_grid,
-        &mut registers,
-        &mut term_rows,
-        &mut term_cols,
-    );
+    // Loops rather than driving `edit_frame_id` once: with several files
+    // open, closing the top one has to hand control to the next frame
+    // down, which is exactly what `run()`'s own main loop does for the
+    // builtin. Terminates because run_edit_frame only ever returns once
+    // its own frame is no longer this pane's top one (it pops on `:q`,
+    // and keeps driving through a no-op detach itself -- see its own
+    // `Detached` arm).
+    while let Some(&Frame::Edit(id)) = windows[current_window].stack().last() {
+        run_edit_frame(
+            id,
+            0,
+            &mut sessions,
+            &mut windows,
+            &mut current_window,
+            &mut next_session_id,
+            &mut next_window_id,
+            &mut job_frames,
+            &mut edit_frames,
+            &mut debug_frames,
+            &mut cmd_history,
+            &mut sinks_are_grid,
+            &mut registers,
+            &mut term_rows,
+            &mut term_cols,
+        );
+    }
 
     // Same restoration run()'s own final-exit path does -- see its own
     // doc comment on why this is a direct terminal write, not anything

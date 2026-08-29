@@ -345,15 +345,15 @@ pub enum ExecResult {
     // referencing the job across main-loop iterations, not just for the
     // duration of one call.
     Fg,
-    // `e [file]`. Bubbles up exactly like Fg, for exactly the same
+    // `e [ARG...]`. Bubbles up exactly like Fg, for exactly the same
     // reason: a builtin has no raw-mode/keystroke/rendering access of
     // its own, and `Registers` lives in `repl::run`'s own locals, not in
     // `Shell` at all. Carries no payload itself (`ExecResult` stays
-    // `Copy`, same as every other variant here -- an owned `Option
-    // <String>` file path wouldn't be) -- `run_single` stashes the
-    // actual argument on `self.pending_edit` first, same as `run_fg`
-    // already does via `pending_fg`; repl.rs reacts to this signal by
-    // calling `Shell::take_pending_edit` to get it back out.
+    // `Copy`, same as every other variant here -- an owned argument
+    // vector wouldn't be) -- `run_single` stashes the actual arguments
+    // on `self.pending_edit` first, same as `run_fg` already does via
+    // `pending_fg`; repl.rs reacts to this signal by calling
+    // `Shell::take_pending_edit` to get them back out.
     Edit,
     // `exit`, a failing statement under `set -e`, a `set -u` violation,
     // or a failed `exec` -- a request to terminate *this Shell's own
@@ -884,10 +884,11 @@ pub struct Shell {
     // `fg`, never meant to be visible to any other session.
     pending_fg: Option<Job>,
     // Same pattern as `pending_fg` just above, for `e` -- see
-    // ExecResult::Edit's own doc comment. The outer `Option` is "was `e`
-    // just run at all" (taken by `take_pending_edit`); the inner one is
-    // "was a file argument given," `e`'s own optional parameter.
-    pending_edit: Option<Option<String>>,
+    // ExecResult::Edit's own doc comment. Holds `e`'s own argument
+    // vector verbatim (everything after the command word, unparsed):
+    // what those arguments *mean* is the editor's business, not the
+    // shell's -- see fileeditor::parse_edit_args.
+    pending_edit: Option<Vec<String>>,
     // Set by check_nounset (a `set -u` violation) instead of calling
     // std::process::exit directly -- that call happens deep inside word
     // expansion (expand_word and its many callers), which has no
@@ -1570,17 +1571,15 @@ impl Shell {
         self.pending_fg.take().map(FgJob)
     }
 
-    // See ExecResult::Edit's own doc comment. `.flatten()`'s own outer/
-    // inner meaning: `None` (never called `e`) and `Some(None)` (`e`
-    // with no file argument) both collapse to `None` here, which is
-    // exactly right -- repl.rs only ever calls this in direct response
-    // to just having received ExecResult::Edit, so "e was never run" is
-    // unreachable in practice; the two are conflated on purpose rather
-    // than kept as `Option<Option<String>>` all the way through, since a
+    // See ExecResult::Edit's own doc comment. `unwrap_or_default`
+    // collapses "`e` was never run" into the same empty vector a bare
+    // `e` (no arguments -- a fresh unnamed buffer) produces: repl.rs
+    // only ever calls this in direct response to just having received
+    // ExecResult::Edit, so the former is unreachable in practice, and a
     // caller who already knows it's reacting to that exact signal has no
-    // use for telling them apart.
-    pub fn take_pending_edit(&mut self) -> Option<String> {
-        self.pending_edit.take().flatten()
+    // use for telling the two apart.
+    pub fn take_pending_edit(&mut self) -> Vec<String> {
+        self.pending_edit.take().unwrap_or_default()
     }
 
     // See `pending_exit`'s own doc comment. Runs the exit trap exactly
@@ -5352,11 +5351,13 @@ impl Shell {
                 return ExecResult::Status(0);
             }
             "cd" => return ExecResult::Status(self.run_cd(&argv[1..])),
-            // `e [file]`: bubbles up via ExecResult::Edit -- see its own
-            // doc comment, and Fg's, for why this can't just be driven
-            // from here directly.
+            // `e [ARG...]`: bubbles up via ExecResult::Edit -- see its
+            // own doc comment, and Fg's, for why this can't just be
+            // driven from here directly. The arguments are passed on
+            // unparsed for the same reason: deciding what they mean
+            // needs the editor, not the shell.
             "e" => {
-                self.pending_edit = Some(argv.get(1).cloned());
+                self.pending_edit = Some(argv[1..].to_vec());
                 return ExecResult::Edit;
             }
             // Real builtins (not just something the external /bin/echo,
