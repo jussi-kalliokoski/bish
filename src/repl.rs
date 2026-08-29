@@ -704,21 +704,10 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
         // terminal -- a promoted/split-pane session risks spilling the
         // extra row into a neighboring pane or the tab bar. Grid/promoted
         // mode gets its own, absolute-positioned path instead (see
-        // redraw_with_completion_row's own doc comment), scoped to an
-        // *unsplit* window only for now -- a split window's own
-        // neighbor-pane clamping is a bigger, separate design, left for
-        // later. The session's own vt100::Screen cursor already tracks
-        // which row the upcoming prompt is about to occupy correctly (fed
-        // a trailing "\r\n" every time a line is submitted), with none of
-        // real-terminal relative movement's own scrolling ambiguity, so
-        // no live query is needed to learn it.
-        let row_origin = if sinks_are_grid && windows[current_window].panes.len() <= 1 {
-            let rect = pane_rect(&windows[current_window], windows[current_window].focused_pane, term_rows, term_cols);
-            let cursor_row = sessions[&session_id].screen.borrow().cursor().0;
-            Some((rect.row + cursor_row, rect.row + rect.rows - 1))
-        } else {
-            None
-        };
+        // redraw_with_completion_row's own doc comment and
+        // completion_menu_rows).
+        let cursor_row = sessions[&session_id].screen.borrow().cursor().0;
+        let row_origin = completion_menu_rows(&windows[current_window], sinks_are_grid, cursor_row, term_rows, term_cols);
         let menu_capable = !sinks_are_grid || row_origin.is_some();
 
         // Ctrl-E's own live search input draws at the shared global
@@ -4169,6 +4158,35 @@ fn compute_regions(layout: &PaneLayout, area: Rect, out: &mut Vec<(PaneId, Rect)
 // single pane always owns the terminal's whole own row regardless of
 // the window's own position in a next/previous cycle, since only one
 // window is ever full-screen at a time).
+// `(prompt_row, pane_bottom_row)` for the completion menu's own
+// absolute-positioned path -- both real terminal rows, 0-indexed. The
+// menu draws one row below the prompt and is skipped when that would
+// fall past the pane (see redraw_with_completion_row).
+//
+// `None` only when there's no grid at all (an unpromoted terminal),
+// where the menu falls back to its relative `\n`/draw/`\x1b[1A` dance
+// instead. This used to return `None` for a *split* window too, on the
+// grounds that a split needs neighbour-pane clamping the absolute path
+// didn't have -- but it does: `pane_bottom_row` bounds it vertically and
+// `focused_col_origin`'s own `(col, cols)` bounds it horizontally, both
+// already the focused pane's rather than the terminal's. What genuinely
+// can't be let near a pane is the *relative* path, whose newline scrolls
+// the real terminal; that one is still reached only when there are no
+// panes to spill into.
+//
+// `cursor_row` is the session's own vt100::Screen cursor row, which
+// already tracks which row the upcoming prompt will occupy (it's fed a
+// trailing "\r\n" every time a line is submitted) with none of real-
+// terminal relative movement's scrolling ambiguity -- so no live query
+// is needed to learn it.
+fn completion_menu_rows(window: &WindowEntry, sinks_are_grid: bool, cursor_row: usize, term_rows: usize, term_cols: usize) -> Option<(usize, usize)> {
+    if !sinks_are_grid {
+        return None;
+    }
+    let rect = pane_rect(window, window.focused_pane, term_rows, term_cols);
+    Some((rect.row + cursor_row, rect.row + rect.rows - 1))
+}
+
 fn focused_col_origin(window: &WindowEntry, sinks_are_grid: bool, term_rows: usize, term_cols: usize) -> (usize, usize) {
     if !sinks_are_grid || window.panes.len() <= 1 {
         return (0, term_cols);
@@ -8566,6 +8584,79 @@ mod alt_screen_addressing_tests {
         assert_eq!(buf.char_at(0, 0), Some('v'));
         let line: String = buf.line_chars(0).into_iter().collect();
         assert_eq!(line, "vim content here");
+    }
+}
+
+#[cfg(test)]
+mod completion_menu_geometry_tests {
+    use super::*;
+
+    // A window split top/bottom, focus on the lower pane.
+    fn split_window() -> WindowEntry {
+        let mut w = WindowEntry::single(0, Frame::Session(0));
+        w.layout = insert_sibling(w.layout, 0, 1, true, None, false);
+        w.panes.push(Pane { id: 1, stack: vec![Frame::Session(0)] });
+        w.next_pane_id = 2;
+        w.focused_pane = 1;
+        w
+    }
+
+    #[test]
+    fn an_unpromoted_terminal_has_no_absolute_menu_row() {
+        // The relative `\n`/draw/`\x1b[1A` dance is the only option
+        // there, and it's safe precisely because there are no panes.
+        let w = WindowEntry::single(0, Frame::Session(0));
+        assert_eq!(completion_menu_rows(&w, false, 0, 24, 80), None);
+    }
+
+    #[test]
+    fn an_unsplit_pane_menu_sits_below_the_prompt_and_above_the_tab_bar() {
+        let w = WindowEntry::single(0, Frame::Session(0));
+        // content_rows(24) == 22, so the pane owns rows 0..=21.
+        let (prompt_row, bottom) = completion_menu_rows(&w, true, 3, 24, 80).unwrap();
+        assert_eq!((prompt_row, bottom), (3, 21));
+    }
+
+    #[test]
+    fn a_split_pane_gets_a_menu_row_bounded_by_its_own_pane() {
+        // Regression: this returned None for any split window, so the
+        // menu was skipped entirely there -- Tab still cycled candidates
+        // but nothing showed them. The absolute path clamps to the pane
+        // on both axes (this row pair vertically, focused_col_origin
+        // horizontally), so a split needs no more than an unsplit one.
+        let w = split_window();
+        let rect = pane_rect(&w, 1, 24, 80);
+        let (prompt_row, bottom) = completion_menu_rows(&w, true, 2, 24, 80).unwrap();
+        assert_eq!(prompt_row, rect.row + 2, "the prompt row is the pane's own, not the terminal's");
+        assert_eq!(bottom, rect.row + rect.rows - 1, "and the menu can never be drawn past this pane");
+        assert!(bottom < content_rows(24), "which is above the global status row and the tab bar");
+        // The lower pane genuinely starts partway down the screen -- if
+        // it didn't, this test would pass without proving anything.
+        assert!(rect.row > 0);
+    }
+
+    #[test]
+    fn a_prompt_on_the_panes_last_row_leaves_no_room_and_the_menu_is_skipped() {
+        // redraw_with_completion_row draws at prompt_row + 1 and skips
+        // when that exceeds the bottom -- the documented graceful
+        // degradation, which this geometry has to keep reachable rather
+        // than reporting a row outside the pane.
+        let w = split_window();
+        let rect = pane_rect(&w, 1, 24, 80);
+        let (prompt_row, bottom) = completion_menu_rows(&w, true, rect.rows - 1, 24, 80).unwrap();
+        assert_eq!(prompt_row, bottom);
+        assert!(prompt_row + 1 > bottom, "no room below, so the menu row is skipped");
+    }
+
+    #[test]
+    fn the_menu_never_spills_horizontally_either() {
+        // The other half of the clamp: the row is drawn at col_origin for
+        // `width` columns, both of which are the focused pane's own.
+        let w = split_window();
+        let (col_origin, width) = focused_col_origin(&w, true, 24, 80);
+        let rect = pane_rect(&w, 1, 24, 80);
+        assert_eq!((col_origin, width), (rect.col, rect.cols));
+        assert!(col_origin + width <= 80);
     }
 }
 
