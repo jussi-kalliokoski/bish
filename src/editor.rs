@@ -1182,7 +1182,17 @@ fn truncate_visible(s: &str, max_visible: usize) -> String {
 pub enum ReadOutcome {
     Line(String),
     Eof,
-    Interrupted,
+    // Ctrl-C (and command mode's own Escape/Backspace cancel). `text` is
+    // whatever had been typed at that moment -- not so the caller can
+    // resume it (Ctrl-C abandons the line, that's the point) but so it
+    // can record what the terminal was actually *showing* into its own
+    // grid before repainting over it. read_line draws the prompt
+    // straight to the real screen and never through any grid, so a
+    // caller that repaints from one would otherwise blank the line
+    // Ctrl-C just echoed onto and then redraw a fresh prompt over it --
+    // a visible flash, and a `^C` that vanishes instead of staying in
+    // the scrollback the way bash leaves it.
+    Interrupted { text: String },
     // Alt+Left/Right/Up at an empty buffer -- see DirNav's own doc
     // comment. Never fires with anything typed (see read_line's own
     // handling), so there's no "what happens to the buffer" question.
@@ -1550,7 +1560,7 @@ pub fn read_line(
                 drop(guard.take());
                 print!("^C\r\n");
                 io::stdout().flush()?;
-                return Ok(ReadOutcome::Interrupted);
+                return Ok(ReadOutcome::Interrupted { text: ed.as_string() });
             }
             Key::CtrlD => {
                 if ed.buf.is_empty() {
@@ -1585,7 +1595,7 @@ pub fn read_line(
                     drop(guard.take());
                     print!("\r\n");
                     io::stdout().flush()?;
-                    return Ok(ReadOutcome::Interrupted);
+                    return Ok(ReadOutcome::Interrupted { text: ed.as_string() });
                 }
                 ed.backspace();
             }
@@ -1686,7 +1696,7 @@ pub fn read_line(
                     drop(guard.take());
                     print!("\r\n");
                     io::stdout().flush()?;
-                    return Ok(ReadOutcome::Interrupted);
+                    return Ok(ReadOutcome::Interrupted { text: ed.as_string() });
                 }
                 None => {}
             },

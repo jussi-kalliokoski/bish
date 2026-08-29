@@ -887,14 +887,8 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
                     _ => pending_initial = Some((text, cursor)),
                 }
             }
-            Ok(ReadOutcome::Interrupted) => {
-                // Ctrl-C abandons whatever multi-line construct was
-                // pending, same as bash, and starts fresh at a new prompt.
+            Ok(ReadOutcome::Interrupted { text }) => {
                 let session = sessions.get_mut(&session_id).unwrap();
-                session.buffer.clear();
-                // Same re-arming as a real Line -- Ctrl-C isn't an
-                // immediate repeated Ctrl-D either.
-                session.warned_stopped_jobs = false;
                 // editor::read_line's own Key::CtrlC arm prints a bare
                 // "^C\r\n" with no awareness of pane boundaries or the
                 // tab bar -- on a pane's own last row this can land on
@@ -903,6 +897,30 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
                 // plus the tab bar, so it's fully self-healing regardless
                 // of what state that bare print left the real terminal
                 // in -- same reasoning DirNav just below already applies.
+                //
+                // But self-healing from the *grid*, which read_line's
+                // prompt has never been written into: repainting it
+                // blanked the very line Ctrl-C had just echoed onto and
+                // the prompt above it, and the fresh prompt then drew
+                // over the top -- one blank frame in between, which is
+                // the flash. So the line is recorded into the grid
+                // first, exactly as it looked, the same way a submitted
+                // command already is (see the Line handler's own echo).
+                // That also leaves the `^C` in the scrollback rather than
+                // wiping it a frame later, which is where bash leaves it.
+                // Fed before `buffer.clear()` below: it picks the
+                // continuation prompt over the primary one off that same
+                // buffer, and what was on screen was whichever one this
+                // line was actually read with.
+                if sinks_are_grid {
+                    freeze_interrupted_line(session, &text);
+                }
+                // Ctrl-C abandons whatever multi-line construct was
+                // pending, same as bash, and starts fresh at a new prompt.
+                session.buffer.clear();
+                // Same re-arming as a real Line -- Ctrl-C isn't an
+                // immediate repeated Ctrl-D either.
+                session.warned_stopped_jobs = false;
                 if sinks_are_grid {
                     compositor_redraw(&sessions, &windows, current_window, term_rows, term_cols);
                 }
@@ -911,7 +929,16 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
                 let session = sessions.get_mut(&session_id).unwrap();
                 session.warned_stopped_jobs = false;
                 navigate_dir(session, kind);
+                // Same reasoning as Ctrl-C's own freeze just above: the
+                // prompt on screen has never been in the grid, so
+                // repainting from it would blank that row and let the
+                // redrawn prompt flash back in. DirNav only fires at an
+                // empty buffer (see its own doc comment), and the prompt
+                // this writes is already the post-`cd` one -- the same
+                // text read_line is about to draw -- so the repaint has
+                // nothing left to change.
                 if sinks_are_grid {
+                    freeze_idle_prompt(session);
                     compositor_redraw(&sessions, &windows, current_window, term_rows, term_cols);
                 }
             }
@@ -3242,6 +3269,18 @@ fn freeze_input_with_text(session: &mut SessionState, text: &str) -> String {
     let framed = format!("\r\x1b[K{}{}", prompt_str, text);
     session.screen.borrow_mut().feed(framed.as_bytes());
     prompt_str
+}
+
+// Records the line Ctrl-C just abandoned into this session's own grid,
+// exactly as the real terminal is showing it -- the prompt, whatever had
+// been typed, and the `^C` read_line echoed after it -- leaving the grid
+// cursor on the next row for the fresh prompt to be drawn on. See
+// `editor::ReadOutcome::Interrupted`'s own doc comment for why the grid
+// needs this at all, and the Line handler's own echo for the same idea
+// applied to a command that actually ran.
+fn freeze_interrupted_line(session: &mut SessionState, text: &str) {
+    freeze_input_with_text(session, text);
+    session.screen.borrow_mut().feed(b"^C\r\n");
 }
 
 // Finds `target`'s Leaf within the tree and turns it into a 2-way
@@ -6951,7 +6990,10 @@ fn run_command_mode(
                 service_background_jobs(sessions, windows, job_frames, current_window, term_rows, term_cols, sinks_are_grid);
             },
         ) {
-            Ok(ReadOutcome::Eof) | Ok(ReadOutcome::Interrupted) => return CommandModeOutcome::Cancelled,
+            // Command mode discards whatever was typed either way, so
+            // `text` is nothing to it -- see that field's own doc comment
+            // for the caller that does need it.
+            Ok(ReadOutcome::Eof) | Ok(ReadOutcome::Interrupted { .. }) => return CommandModeOutcome::Cancelled,
             // Directory navigation doesn't mean much inside command
             // mode's own restricted context -- just ignore it and keep
             // showing this same prompt, rather than wiring dir_history
@@ -8727,6 +8769,33 @@ mod terminal_frame_capture_tests {
 #[cfg(test)]
 mod compositor_frame_output_tests {
     use super::*;
+
+    // Regression: `bish --promoted`, then Ctrl-C, visibly flashed the
+    // prompt. read_line draws the prompt straight to the real terminal
+    // and never into the session's grid, so the full repaint that
+    // follows Ctrl-C painted that row blank -- taking the `^C` with it --
+    // and the fresh prompt then drew over the top, one blank frame
+    // later. Recording the abandoned line into the grid first makes the
+    // repaint draw what's already on screen, so there's nothing to
+    // flash, and leaves the `^C` in the scrollback where bash leaves it.
+    #[test]
+    fn an_interrupted_line_is_recorded_in_the_grid_the_way_the_terminal_shows_it() {
+        let screen = Rc::new(RefCell::new(vt100::Screen::new(4, 40)));
+        let mut session = SessionState {
+            shell: exec::Shell::new(),
+            buffer: String::new(),
+            history: History::load("/dev/null"),
+            screen: screen.clone(),
+            warned_stopped_jobs: false,
+            dir_history: Vec::new(),
+            dir_history_index: 0,
+            command_transcript: Vec::new(),
+        };
+        freeze_interrupted_line(&mut session, "echo hi");
+        let row0: String = (0..40).map(|c| screen.borrow().cell(0, c).ch).collect::<String>().trim_end().to_string();
+        assert!(row0.ends_with("echo hi^C"), "the abandoned line and its ^C both stay: {row0:?}");
+        assert_eq!(screen.borrow().cursor().0, 1, "and the next prompt gets the row below it");
+    }
 
     // Regression: an editor frame (`Frame::Edit`/`Frame::Hex`) used to
     // wipe its session's whole grid on quit (`\x1b[2J\x1b[H`), destroying
