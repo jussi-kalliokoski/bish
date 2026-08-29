@@ -79,6 +79,18 @@ pub struct TextBuffer {
     // or its content changes, and re-running `git blame` is the caller's
     // job (`:git blame` again), not something a single-line edit could
     // patch up correctly on its own.
+    // How this view lays out a line wider than the pane -- vim's `wrap`
+    // family, set from bishopt by whoever is driving this buffer (see
+    // repl.rs's `wrap_options`). A *view* setting rather than a document
+    // one, which is why it lives beside `vtop`/`hleft` rather than
+    // anywhere near the text.
+    pub wrap: crate::bishedit::wrap::Options,
+    // Which visual row of `vtop`'s own line the viewport starts at. Only
+    // ever non-zero with wrapping on, and only for a line tall enough to
+    // exceed the pane by itself -- without it, a minified file would
+    // scroll to the right line and then be unable to reach the cursor
+    // inside it.
+    vtop_sub: usize,
     pub blame: Option<Vec<Option<crate::git::BlameLine>>>,
     // `:git diff`'s own toggle state -- same shape/lifecycle as `blame`
     // just above (`None` off, gutter column collapses to zero width;
@@ -149,6 +161,8 @@ impl TextBuffer {
             hleft: 0,
             marks: HashMap::new(),
             selections: Vec::new(),
+            wrap: crate::bishedit::wrap::Options::default(),
+            vtop_sub: 0,
             snippet_holes: Vec::new(),
             diagnostics: Vec::new(),
             blame: None,
@@ -196,6 +210,8 @@ impl TextBuffer {
             hleft: 0,
             marks: HashMap::new(),
             selections: Vec::new(),
+            wrap: crate::bishedit::wrap::Options::default(),
+            vtop_sub: 0,
             snippet_holes: Vec::new(),
             diagnostics: Vec::new(),
             blame: None,
@@ -205,6 +221,16 @@ impl TextBuffer {
             dirty: false,
             path: Some(path.to_path_buf()),
         }
+    }
+
+    // See `vtop_sub`. Cleared whenever the top line itself moves, since
+    // an offset into a different line means nothing.
+    pub fn viewport_sub(&self) -> usize {
+        self.vtop_sub
+    }
+
+    pub fn set_viewport_sub(&mut self, sub: usize) {
+        self.vtop_sub = sub;
     }
 
     pub fn path(&self) -> Option<&Path> {
@@ -617,6 +643,11 @@ impl Buffer for TextBuffer {
     }
 
     fn set_viewport_top(&mut self, line: usize) {
+        // A sub-row offset belongs to whichever line was on top; moving
+        // the top line means it no longer names anything.
+        if line != self.vtop {
+            self.vtop_sub = 0;
+        }
         self.vtop = line;
     }
 
@@ -673,6 +704,8 @@ mod tests {
             hleft: 0,
             marks: HashMap::new(),
             selections: Vec::new(),
+            wrap: crate::bishedit::wrap::Options::default(),
+            vtop_sub: 0,
             snippet_holes: Vec::new(),
             diagnostics: Vec::new(),
             blame: None,

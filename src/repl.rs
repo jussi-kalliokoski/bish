@@ -2226,13 +2226,15 @@ fn run_edit_frame(
     fileeditor::set_last_filename(&session.buffer, registers);
     let mut buffer = session.buffer;
     let mut vk = session.vk;
-    // This whole function's own lifetime, not re-resolved per keystroke:
-    // bishopt is a plain shell builtin, unreachable from inside the modal
-    // file editor this function drives, so the owning session's colors
-    // genuinely can't change while this runs (only detaching back to a
-    // real prompt, changing them there, and re-focusing this editor --
-    // a fresh call to this same function -- could).
+    // Both of these are resolved for this whole function's own lifetime,
+    // not per keystroke: bishopt is a plain shell builtin, unreachable
+    // from inside the modal file editor this function drives, so the
+    // owning session's colors and its line-wrapping options genuinely
+    // can't change while this runs (only detaching back to a real
+    // prompt, changing them there, and re-focusing this editor -- a
+    // fresh call to this same function -- could).
     let color_overrides = syntax_color_overrides(&sessions[&session_id].shell);
+    apply_view_options(&sessions[&session_id].shell, &mut buffer);
     // Where this editor frame actually lives -- captured once, before
     // any window command can move focus elsewhere. The Detached arm
     // below needs this pane's own rect to freeze into, not whatever
@@ -5812,6 +5814,31 @@ fn nav_buffer_into_edit_state(buf: NavBuffer, vk: VimKeys) -> Option<(TextBuffer
 // then uses it.
 fn syntax_color_overrides(shell: &exec::Shell) -> highlight::ColorOverrides {
     highlight::SYN_COL_OPTIONS.iter().filter_map(|(kind, name)| shell.bishopt_color(name).map(|c| (*kind, c))).collect()
+}
+
+// How the file editor should lay out a line wider than the pane, read
+// fresh off the live shell -- same shape (and same reason) as
+// `syntax_color_overrides` just above: these are bishopts, so a
+// `bishopt --set wrap on` has to take effect on the next redraw rather
+// than on the next time a buffer happens to be opened.
+fn wrap_options(shell: &exec::Shell) -> crate::bishedit::wrap::Options {
+    crate::bishedit::wrap::Options {
+        wrap: shell.bishopt_bool("wrap"),
+        linebreak: shell.bishopt_bool("linebreak"),
+        breakindent: shell.bishopt_bool("breakindent"),
+        showbreak: shell.bishopt_str("showbreak"),
+        column: shell.bishopt_int("wrap_column").max(0) as usize,
+        sidescrolloff: shell.bishopt_int("sidescrolloff").max(0) as usize,
+        extends: shell.bishopt_str("extends"),
+        precedes: shell.bishopt_str("precedes"),
+    }
+}
+
+// Applies those to whichever buffer is about to be rendered or driven.
+// Called at the top of every editor loop iteration rather than once at
+// open, so changing an option takes effect immediately.
+fn apply_view_options(shell: &exec::Shell, buf: &mut TextBuffer) {
+    buf.wrap = wrap_options(shell);
 }
 
 // Dispatches this loop's own per-keystroke redraw to whichever renderer

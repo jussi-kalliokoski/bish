@@ -204,6 +204,10 @@ pub(crate) enum EditorMode {
 // The cursor's own char index is converted via `col_of` before the
 // exact same threshold comparison this function always did.
 pub(crate) fn scroll_to_show_cursor(buf: &mut TextBuffer, content_cols: usize) {
+    if buf.wrap.wrap {
+        scroll_wrapped(buf, content_cols);
+        return;
+    }
     let (line, col) = buf.cursor();
     let height = buf.viewport_height();
     if line < buf.viewport_top() {
@@ -213,11 +217,67 @@ pub(crate) fn scroll_to_show_cursor(buf: &mut TextBuffer, content_cols: usize) {
     }
     let cursor_col = col_of(&buf.line_chars(line), col);
     let width = content_cols.max(1);
-    if cursor_col < buf.viewport_left() {
-        buf.set_viewport_left(cursor_col);
-    } else if cursor_col >= buf.viewport_left() + width {
-        buf.set_viewport_left(cursor_col + 1 - width);
+    // `sidescrolloff`: keep this many columns visible either side of the
+    // cursor rather than letting it sit against the edge. Capped at half
+    // the pane, since a margin wider than that has no middle to keep the
+    // cursor in.
+    let margin = buf.wrap.sidescrolloff.min(width.saturating_sub(1) / 2);
+    if cursor_col < buf.viewport_left() + margin {
+        buf.set_viewport_left(cursor_col.saturating_sub(margin));
+    } else if cursor_col + margin >= buf.viewport_left() + width {
+        buf.set_viewport_left(cursor_col + margin + 1 - width);
     }
+}
+
+// The same job in visual rows: which row the cursor is on, and whether
+// the window has to move for it. Horizontal scroll is forced to zero --
+// a wrapped line has no off-screen right edge to scroll to.
+fn scroll_wrapped(buf: &mut TextBuffer, content_cols: usize) {
+    buf.set_viewport_left(0);
+    let (line, col) = buf.cursor();
+    let height = buf.viewport_height().max(1);
+    let seg = crate::bishedit::wrap::segment_of(&line_segments(buf, line, content_cols), col);
+
+    // Above the window: the cursor's own row becomes the top.
+    if line < buf.viewport_top() || (line == buf.viewport_top() && seg < buf.viewport_sub()) {
+        buf.set_viewport_top(line);
+        buf.set_viewport_sub(seg);
+        return;
+    }
+    // Below it: walk forward from the top, and if the cursor isn't
+    // reached within the pane's height, put it on the last row by
+    // walking back from it instead.
+    let mut at = (buf.viewport_top(), buf.viewport_sub());
+    for _ in 0..height {
+        if at == (line, seg) {
+            return;
+        }
+        at = next_row(buf, at, content_cols);
+    }
+    let mut top = (line, seg);
+    for _ in 1..height {
+        top = previous_row(buf, top, content_cols);
+    }
+    buf.set_viewport_top(top.0);
+    buf.set_viewport_sub(top.1);
+}
+
+fn next_row(buf: &TextBuffer, (line, sub): (usize, usize), content_cols: usize) -> (usize, usize) {
+    if sub + 1 < line_segments(buf, line, content_cols).len() {
+        (line, sub + 1)
+    } else {
+        (line + 1, 0)
+    }
+}
+
+fn previous_row(buf: &TextBuffer, (line, sub): (usize, usize), content_cols: usize) -> (usize, usize) {
+    if sub > 0 {
+        return (line, sub - 1);
+    }
+    if line == 0 {
+        return (0, 0);
+    }
+    (line - 1, line_segments(buf, line - 1, content_cols).len().saturating_sub(1))
 }
 
 // How many columns are actually left for `buf`'s own text after its
@@ -247,18 +307,28 @@ pub(crate) fn position_at_screen(buf: &TextBuffer, rect: Rect, row0: usize, col0
     if row >= editor_content_rows(rect) {
         return None;
     }
-    let line = buf.viewport_top() + row;
-    if line >= buf.line_count() {
-        return None;
-    }
     let gutter = total_gutter_width(buf).min(rect.cols.saturating_sub(1));
+    let content_cols = rect.cols - gutter;
+    // The same rows the frame drew, so a click can't land on a line the
+    // screen doesn't show there.
+    let rows = visible_rows(buf, content_cols, editor_content_rows(rect));
+    let visual = rows.get(row)?;
+    let line = visual.line;
     let x = (col0 - rect.col).saturating_sub(gutter);
     let chars = buf.line_chars(line);
+    let col = if buf.wrap.wrap {
+        // Within a wrapped row, the click is an offset into that row's
+        // own segment, past the continuation prefix.
+        let into = x.saturating_sub(visual.seg.indent);
+        let base = col_of(&chars, visual.seg.start);
+        char_at_col(&chars, base + into).min(visual.seg.end.saturating_sub(1).max(visual.seg.start))
+    } else {
+        char_at_col(&chars, buf.viewport_left() + x)
+    };
     // Normal mode's cursor can never sit past a line's last character
     // (see run_insert_mode's own exit clamp for the same rule), so an
     // overshooting click lands on it instead.
-    let col = char_at_col(&chars, buf.viewport_left() + x).min(chars.len().saturating_sub(1));
-    Some((line, col))
+    Some((line, col.min(chars.len().saturating_sub(1))))
 }
 
 pub(crate) fn editor_content_cols(buf: &TextBuffer, rect: Rect) -> usize {
@@ -1550,14 +1620,73 @@ fn total_gutter_width(buf: &TextBuffer) -> usize {
     GUTTER_COLUMNS.iter().map(|col| (col.width)(buf)).sum()
 }
 
-fn render_gutter(out: &mut String, buf: &TextBuffer, starts: &[usize], line: usize) {
+// `first` is whether this screen row is the *first* one of its buffer
+// line. Only that row gets the line number, the diff marker and the
+// rest: repeating them down a wrapped line would claim there are
+// several lines where there is one.
+fn render_gutter(out: &mut String, buf: &TextBuffer, starts: &[usize], line: usize, first: bool) {
     for col in GUTTER_COLUMNS {
         let width = (col.width)(buf);
-        match (col.render)(buf, starts, line, width) {
+        let cell = if first { (col.render)(buf, starts, line, width) } else { None };
+        match cell {
             Some(cell) => out.push_str(&cell),
             None => out.push_str(&" ".repeat(width)),
         }
     }
+}
+
+// One screen row: which buffer line, which slice of it, and whether it
+// opens that line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct VisualRow {
+    pub(crate) line: usize,
+    pub(crate) first: bool,
+    pub(crate) seg: crate::bishedit::wrap::Segment,
+}
+
+// How a buffer line is broken across screen rows. With wrapping off
+// this is always a single segment covering the whole line, and every
+// caller below then applies `viewport_left` to it exactly as before --
+// which is how one code path serves both modes.
+pub(crate) fn line_segments(buf: &TextBuffer, line: usize, content_cols: usize) -> Vec<crate::bishedit::wrap::Segment> {
+    crate::bishedit::wrap::segments(&buf.line_chars(line), content_cols, &buf.wrap)
+}
+
+// The rows a pane shows, from the buffer's own scroll position. Shared
+// by rendering, by the click-to-position inverse, and by scrolling, so
+// none of the three can disagree about what is on screen.
+pub(crate) fn visible_rows(buf: &TextBuffer, content_cols: usize, content_rows: usize) -> Vec<VisualRow> {
+    let mut rows = Vec::with_capacity(content_rows);
+    let mut line = buf.viewport_top();
+    let mut skip = buf.viewport_sub();
+    while rows.len() < content_rows && line < buf.line_count() {
+        for (i, seg) in line_segments(buf, line, content_cols).into_iter().enumerate() {
+            if i < skip {
+                continue;
+            }
+            if rows.len() >= content_rows {
+                break;
+            }
+            rows.push(VisualRow { line, first: i == 0, seg });
+        }
+        skip = 0;
+        line += 1;
+    }
+    rows
+}
+
+// What a continued row opens with: `showbreak`, then padding out to the
+// indent the layout reserved for it. Dim, because it is the editor
+// talking rather than the file.
+fn continuation_prefix(buf: &TextBuffer, indent: usize) -> String {
+    if indent == 0 {
+        return String::new();
+    }
+    let mark: String = buf.wrap.showbreak.chars().collect();
+    let mark_width: usize = mark.chars().map(char_width).sum();
+    let mark = if mark_width > indent { String::new() } else { mark };
+    let used: usize = mark.chars().map(char_width).sum();
+    format!("\x1b[2m{mark}\x1b[0m{}", " ".repeat(indent - used))
 }
 
 // `:git blame`'s own gutter column: `short_commit` (8) + ' ' + `date`
@@ -2286,14 +2415,17 @@ fn spans_for_line(spans: &[StyledSpan], line_start: usize, line_len: usize) -> V
 // comment) and the rebased `line_styled`/`diag_styled` spans below
 // align with it exactly, with no separate cell-width bookkeeping
 // needed for *those* two layers at all.
+// `start_char`/`limit` are the window of the line this row draws --
+// with wrapping off that is "from the horizontal scroll to the end of
+// the line", and with it on it is the segment the layout produced. One
+// path either way, so the two modes can't drift.
 #[allow(clippy::too_many_arguments)]
-fn render_row(out: &mut String, buf: &TextBuffer, line: usize, hoffset: usize, cols: usize, line_styled: &[StyledSpan], diag_styled: &[StyledSpan], highlights: &[StyledSpan]) {
+fn render_row(out: &mut String, buf: &TextBuffer, line: usize, start_char: usize, limit: usize, cols: usize, line_styled: &[StyledSpan], diag_styled: &[StyledSpan], highlights: &[StyledSpan]) {
     let line_chars = buf.line_chars(line);
-    let start_char = char_at_col(&line_chars, hoffset);
     let mut chars: Vec<char> = Vec::with_capacity(cols);
     let mut used = 0;
     let mut end_char = start_char;
-    while end_char < line_chars.len() {
+    while end_char < line_chars.len().min(limit) {
         let w = char_width(line_chars[end_char]);
         if used + w > cols {
             break;
@@ -2302,6 +2434,10 @@ fn render_row(out: &mut String, buf: &TextBuffer, line: usize, hoffset: usize, c
         used += w;
         end_char += 1;
     }
+    // With wrapping off, a line that continues past either edge says so
+    // -- vim's `listchars` `extends`/`precedes`, empty by default.
+    let truncated_right = end_char < line_chars.len();
+    let truncated_left = start_char > 0;
     while used < cols {
         chars.push(' ');
         used += 1;
@@ -2325,7 +2461,64 @@ fn render_row(out: &mut String, buf: &TextBuffer, line: usize, hoffset: usize, c
     let diag_styled = rebase(diag_styled, start_char, chars.len());
 
     let cells = highlight::compose(&chars, &[&line_styled, &diag_styled, highlights]);
-    out.push_str(&highlight::render_styled(&cells));
+    let mut rendered = highlight::render_styled(&cells);
+    if !buf.wrap.wrap {
+        if truncated_right && !buf.wrap.extends.is_empty() {
+            rendered = overlay_marker(&rendered, cols, &buf.wrap.extends, true);
+        }
+        if truncated_left && !buf.wrap.precedes.is_empty() {
+            rendered = overlay_marker(&rendered, cols, &buf.wrap.precedes, false);
+        }
+    }
+    out.push_str(&rendered);
+}
+
+// Puts `marker` in the row's last (or first) column, replacing whatever
+// was drawn there -- which is the point: the column it covers is content
+// the reader can't see anyway.
+fn overlay_marker(rendered: &str, cols: usize, marker: &str, at_end: bool) -> String {
+    let width: usize = marker.chars().map(char_width).sum();
+    if width == 0 || width > cols {
+        return rendered.to_string();
+    }
+    let keep = if at_end { cols - width } else { width };
+    let (head, tail) = split_rendered(rendered, keep);
+    if at_end {
+        format!("{head}\x1b[2m{marker}\x1b[0m")
+    } else {
+        format!("\x1b[2m{marker}\x1b[0m{tail}")
+    }
+}
+
+// Splits already-styled text at a display column, keeping every SGR
+// sequence it passes on both sides so neither half loses its colours.
+fn split_rendered(rendered: &str, at: usize) -> (String, String) {
+    let mut head = String::new();
+    let mut tail = String::new();
+    let mut width = 0;
+    let mut chars = rendered.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' && chars.peek() == Some(&'[') {
+            let mut esc = String::from(c);
+            esc.push(chars.next().expect("just peeked"));
+            for c2 in chars.by_ref() {
+                esc.push(c2);
+                if c2.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+            head.push_str(&esc);
+            tail.push_str(&esc);
+            continue;
+        }
+        if width < at {
+            width += char_width(c);
+            head.push(c);
+        } else {
+            tail.push(c);
+        }
+    }
+    (head, tail)
 }
 
 // The actual rendering, factored out as a pure string-builder (build the
@@ -2389,20 +2582,33 @@ pub fn build_editor_frame(
     let whole_styled = buffer_highlight_spans(buf, color_overrides);
     let starts = line_starts(buf);
     let mut out = String::new();
+    let rows = visible_rows(buf, content_cols, content_rows);
     for r in 0..content_rows {
-        let line = buf.viewport_top() + r;
         out.push_str(&format!("\x1b[{};{}H\x1b[K", row_origin + r + 1, col_origin + 1));
-        render_gutter(&mut out, buf, &starts, line);
-        if line < total {
+        let Some(row) = rows.get(r) else {
+            // Past the end of the buffer: the gutter still reserves its
+            // width so the content column doesn't jump.
+            render_gutter(&mut out, buf, &starts, total, false);
+            continue;
+        };
+        let line = row.line;
+        render_gutter(&mut out, buf, &starts, line, row.first);
+        {
             // The char index render_row's own window will start
-            // rendering from for *this* line -- see selection_columns_
+            // rendering from for *this* row -- see selection_columns_
             // in_line's own doc comment for why this (not `hoffset`
             // itself) is the right rebase point once a line can have
-            // wide chars in it.
-            let start_char = char_at_col(&buf.line_chars(line), hoffset);
+            // wide chars in it. With wrapping on the segment already
+            // says where the row starts, and there is no horizontal
+            // scroll to apply.
+            let wrapping = buf.wrap.wrap;
+            let start_char =
+                if wrapping { row.seg.start } else { char_at_col(&buf.line_chars(line), hoffset) };
+            let prefix = continuation_prefix(buf, row.seg.indent);
+            let avail = content_cols.saturating_sub(row.seg.indent);
             let mut highlights: Vec<StyledSpan> = Vec::new();
             for range in buf.selections.iter().chain(active.iter()) {
-                if let Some((start, end)) = selection_columns_in_line(range, line, start_char, content_cols) {
+                if let Some((start, end)) = selection_columns_in_line(range, line, start_char, avail) {
                     highlights.push(StyledSpan { start, end, fg: vt100::Color::Default, attrs: vt100::CellAttrs { reverse: true, ..vt100::CellAttrs::default() } });
                 }
             }
@@ -2415,7 +2621,7 @@ pub fn build_editor_frame(
             // this window.
             for hole in buf.snippet_holes.iter().filter(|h| h.line == line && h.end > start_char) {
                 let start = hole.start.saturating_sub(start_char);
-                let end = (hole.end - start_char).min(content_cols);
+                let end = (hole.end - start_char).min(avail);
                 if start >= end {
                     continue;
                 }
@@ -2428,17 +2634,38 @@ pub fn build_editor_frame(
             }
             let line_styled = spans_for_line(&whole_styled, starts[line], buf.line_len(line));
             let diag_styled = diagnostic_spans_for_line(&buf.diagnostics, starts[line], buf.line_len(line));
-            render_row(&mut out, buf, line, hoffset, content_cols, &line_styled, &diag_styled, &highlights);
+            out.push_str(&prefix);
+            let end_char = if wrapping { row.seg.end } else { buf.line_len(line) };
+            render_row(&mut out, buf, line, start_char, end_char, avail, &line_styled, &diag_styled, &highlights);
         }
     }
 
     let (cl, cc) = buf.cursor();
-    let screen_row = cl.saturating_sub(buf.viewport_top()).min(content_rows.saturating_sub(1));
+    // Found in the rows actually drawn rather than computed from the
+    // line number, so a wrapped line puts the cursor on the row its own
+    // segment landed on.
+    let cursor_row = rows.iter().position(|row| row.line == cl && row.seg.contains(cc));
+    let screen_row = match cursor_row {
+        Some(r) => r,
+        None => rows.iter().rposition(|row| row.line == cl).unwrap_or(0),
+    }
+    .min(content_rows.saturating_sub(1));
     // The cursor's own real display column, not its char index -- see
     // bishedit::unicode_width's own doc comment for why those two
     // differ once any wide/zero-width char precedes it on this line.
-    let cursor_col = col_of(&buf.line_chars(cl), cc);
-    let screen_col = gutter_width + cursor_col.saturating_sub(hoffset).min(content_cols.saturating_sub(1));
+    let chars = buf.line_chars(cl);
+    let (row_start, row_indent) = match rows.get(screen_row) {
+        Some(row) if buf.wrap.wrap => (row.seg.start, row.seg.indent),
+        _ => (0, 0),
+    };
+    let cursor_col = col_of(&chars, cc).saturating_sub(col_of(&chars, row_start));
+    let screen_col = gutter_width
+        + row_indent
+        + if buf.wrap.wrap {
+            cursor_col.min(content_cols.saturating_sub(row_indent + 1))
+        } else {
+            col_of(&chars, cc).saturating_sub(hoffset).min(content_cols.saturating_sub(1))
+        };
     out.push_str(&format!("\x1b[{};{}H\x1b[?25h", row_origin + screen_row + 1, col_origin + screen_col + 1));
     out
 }
@@ -3576,6 +3803,133 @@ mod pre_save_hook_tests {
     }
 
     // `.gz` says how the bytes are stored, not what they are.
+    // The wrap options ride on the buffer (see TextBuffer::wrap), so a
+    // test can set them directly and check the layout the frame builder
+    // produces without a terminal.
+    fn wrapped_buf(text: &str, wrap: crate::bishedit::wrap::Options) -> TextBuffer {
+        wrapped_buf_h(text, wrap, 10)
+    }
+
+    // The viewport height is fixed at construction, so a test that cares
+    // about scrolling states it up front.
+    fn wrapped_buf_h(text: &str, wrap: crate::bishedit::wrap::Options, height: usize) -> TextBuffer {
+        let mut buf = TextBuffer::new_unnamed(height);
+        buf.insert_text((0, 0), text);
+        buf.set_cursor(0, 0);
+        buf.wrap = wrap;
+        buf
+    }
+
+    fn wrap_on() -> crate::bishedit::wrap::Options {
+        crate::bishedit::wrap::Options {
+            wrap: true,
+            showbreak: String::new(),
+            breakindent: false,
+            linebreak: false,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn visible_rows_break_a_long_line_across_screen_rows() {
+        let buf = wrapped_buf("abcdefghij\nok", wrap_on());
+        let rows = visible_rows(&buf, 4, 10);
+        let shape: Vec<(usize, bool, usize, usize)> =
+            rows.iter().map(|r| (r.line, r.first, r.seg.start, r.seg.end)).collect();
+        assert_eq!(
+            shape,
+            vec![(0, true, 0, 4), (0, false, 4, 8), (0, false, 8, 10), (1, true, 0, 2)],
+            "three rows for the long line, one for the line that fits"
+        );
+    }
+
+    #[test]
+    fn without_wrapping_every_line_is_exactly_one_row() {
+        let buf = wrapped_buf("abcdefghij\nok", crate::bishedit::wrap::Options::default());
+        let rows = visible_rows(&buf, 4, 10);
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|r| r.first), "each row opens its own line");
+    }
+
+    // The frame and the click-to-position inverse have to agree, or a
+    // click lands on a different character than the one under the
+    // pointer.
+    #[test]
+    fn a_click_on_a_wrapped_row_finds_the_character_under_it() {
+        let buf = wrapped_buf("abcdefghij", wrap_on());
+        // A pane 4 columns wide *after* the gutter.
+        let gutter = total_gutter_width(&buf);
+        let rect = Rect { row: 0, col: 0, rows: 12, cols: gutter + 4 };
+        // Row 0 column 0 is 'a'; row 1 column 0 is 'e' (the second
+        // segment starts at char 4); row 2 column 1 is 'j'.
+        assert_eq!(position_at_screen(&buf, rect, 0, gutter), Some((0, 0)));
+        assert_eq!(position_at_screen(&buf, rect, 1, gutter), Some((0, 4)));
+        assert_eq!(position_at_screen(&buf, rect, 2, gutter + 1), Some((0, 9)));
+    }
+
+    // A line taller than the pane has to be scrollable *within* itself,
+    // or a minified file can scroll to the right line and then never
+    // reach the cursor inside it.
+    #[test]
+    fn scrolling_can_move_within_a_line_taller_than_the_pane() {
+        let mut buf = wrapped_buf_h(&"x".repeat(40), wrap_on(), 3);
+        // 4 columns wide -> 10 rows for this one line, in a 3-row pane.
+        buf.set_cursor(0, 39);
+        scroll_to_show_cursor(&mut buf, 4);
+        assert_eq!(buf.viewport_top(), 0, "still the only line there is");
+        assert_eq!(buf.viewport_sub(), 7, "but scrolled seven rows into it");
+        let rows = visible_rows(&buf, 4, 3);
+        assert!(rows.iter().any(|r| r.seg.contains(39)), "the cursor's own row is on screen");
+
+        // Back to the top of the line.
+        buf.set_cursor(0, 0);
+        scroll_to_show_cursor(&mut buf, 4);
+        assert_eq!(buf.viewport_sub(), 0);
+    }
+
+    #[test]
+    fn wrapping_never_scrolls_horizontally() {
+        let mut buf = wrapped_buf(&"x".repeat(40), wrap_on());
+        buf.set_viewport_left(20);
+        buf.set_cursor(0, 39);
+        scroll_to_show_cursor(&mut buf, 4);
+        assert_eq!(buf.viewport_left(), 0, "a wrapped line has no off-screen right edge");
+    }
+
+    // sidescrolloff only applies when *not* wrapping -- it is about the
+    // other way of handling a long line.
+    #[test]
+    fn sidescrolloff_keeps_columns_visible_either_side_of_the_cursor() {
+        let mut buf = wrapped_buf(&"x".repeat(80), crate::bishedit::wrap::Options {
+            sidescrolloff: 5,
+            ..Default::default()
+        });
+        buf.set_cursor(0, 40);
+        scroll_to_show_cursor(&mut buf, 20);
+        // The cursor sits 5 columns short of the right edge, not against
+        // it: viewport_left + 20 - 1 - 5 == 40.
+        assert_eq!(buf.viewport_left(), 26);
+
+        buf.set_cursor(0, 26);
+        scroll_to_show_cursor(&mut buf, 20);
+        assert_eq!(buf.viewport_left(), 21, "and five short of the left edge too");
+    }
+
+    #[test]
+    fn a_wrapped_frame_puts_the_cursor_on_its_own_row() {
+        let mut buf = wrapped_buf_h("abcdefghij", wrap_on(), 6);
+        buf.set_cursor(0, 9);
+        let gutter = total_gutter_width(&buf);
+        let rect = Rect { row: 0, col: 0, rows: 8, cols: gutter + 4 };
+        let frame = build_editor_frame(&buf, &VimKeys::new(), EditorMode::Normal, rect, 0, 0, None);
+        // Char 9 is on the third segment (8..10), second column of it.
+        assert!(
+            frame.contains(&format!("\x1b[3;{}H", gutter + 2)),
+            "expected the cursor on row 3 column {}, got:\n{frame:?}",
+            gutter + 2
+        );
+    }
+
     #[test]
     fn language_looks_through_a_gz_suffix() {
         assert_eq!(language_of(&buf_with_ext("x", "json.gz")), "json");
