@@ -410,6 +410,38 @@ mod tests {
         );
     }
 
+    // A list holds items and nothing else, so anything that isn't one
+    // has to close it -- found by the `:help` document, whose whole
+    // second half sat after a bullet list and disappeared.
+    #[test]
+    fn a_block_after_a_list_closes_it_rather_than_vanishing_into_it() {
+        assert_tree(
+            "- a\n\n## After\n\ntext\n",
+            r#"
+            ul tight:
+              item:
+                p: a
+            h2: After
+            p: text
+            "#,
+        );
+        // ...including out of a nested list, and including a block that
+        // opens rather than one that is complete in a line.
+        assert_tree(
+            "- a\n  - b\n\n> quoted\n",
+            r#"
+            ul tight:
+              item:
+                p: a
+                ul tight:
+                  item:
+                    p: b
+            quote:
+              p: quoted
+            "#,
+        );
+    }
+
     #[test]
     fn lists_tight_and_loose() {
         assert_tree(

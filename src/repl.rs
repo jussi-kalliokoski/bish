@@ -7214,20 +7214,71 @@ its decompressed text.
 | `:help` | this screen |
 "#;
 
-// The help as a terminal document, rendered to the pane it will be shown
-// in. Rendered on demand rather than once: the width is the terminal's,
-// and a table has to be laid out for the width it will actually occupy.
-fn render_help(term_cols: usize) -> String {
-    render_markdown_document(EDITOR_HELP_MARKDOWN, term_cols)
+// Shared by `:help` and `:preview` -- the same pipeline either way,
+// which is what makes the help page a real markdown document rather
+// than a special case. Rendered on demand rather than once: the width is
+// the terminal's, and a table has to be laid out for the width it will
+// actually occupy.
+fn render_markdown_document(source: &str, term_cols: usize) -> Vec<String> {
+    let doc = crate::markdown::parse(source);
+    let opts = crate::markdown::render::Options { width: term_cols.saturating_sub(1).max(20), highlight_code: true };
+    crate::markdown::render::to_lines(&doc, &opts)
 }
 
-// Shared by `:help` and `:preview` -- the same pipeline either way, which
-// is what makes the help page a real markdown document rather than a
-// special case.
-fn render_markdown_document(source: &str, term_cols: usize) -> String {
-    let doc = crate::markdown::parse(source);
-    let opts = crate::markdown::render::Options { width: term_cols.saturating_sub(2).max(20), highlight_code: true };
-    crate::markdown::render::to_lines(&doc, &opts).join("\n")
+// `:help`/`:preview`'s own driving loop: a pager over already-rendered
+// lines, taking over the terminal for its own duration and handing
+// control straight back -- the same "blocks until it exits" shape
+// `:dbg`'s own run already has, and for the same reason (a document
+// someone is reading wants the whole screen, and wants it gone
+// completely afterwards).
+//
+// The view lives in crate::pager; this is only the loop: read a key,
+// hand it over, redraw. `service_background_jobs` runs as the idle
+// callback exactly as it does in every other blocking loop here, so a
+// background job's output still lands in its own pane's grid while a
+// help page is open.
+#[allow(clippy::too_many_arguments)]
+fn run_pager(
+    title: &str,
+    source: &str,
+    sessions: &mut HashMap<SessionId, SessionState>,
+    windows: &mut Vec<WindowEntry>,
+    job_frames: &mut HashMap<JobFrameId, exec::FgJob>,
+    current_window: usize,
+    term_rows: &mut usize,
+    term_cols: &mut usize,
+    sinks_are_grid: bool,
+) {
+    let Ok(_guard) = term::RawGuard::enable_with_mouse(0) else { return };
+    let mut view = crate::pager::Pager::new(title, render_markdown_document(source, *term_cols), *term_rows, *term_cols);
+    let mut last_size = (*term_rows, *term_cols);
+    loop {
+        print!("{}", view.render(*term_rows));
+        let _ = io::stdout().flush();
+        let key = match editor::read_key_idle(&mut || {
+            service_background_jobs(sessions, windows, job_frames, current_window, term_rows, term_cols, sinks_are_grid);
+        }) {
+            Ok(Some(k)) => k,
+            // EOF/error: nothing to resume, same as every other loop's
+            // own EOF arm.
+            Ok(None) | Err(_) => break,
+        };
+        // A resize while reading re-renders the *document*, not just the
+        // view: the wrap width changed, and so did every table's layout.
+        if (*term_rows, *term_cols) != last_size {
+            last_size = (*term_rows, *term_cols);
+            let top_line = view.top_line();
+            view = crate::pager::Pager::new(title, render_markdown_document(source, *term_cols), *term_rows, *term_cols);
+            view.scroll_to(top_line);
+        }
+        if view.handle_key(key) == crate::pager::Outcome::Quit {
+            break;
+        }
+    }
+    // The guard's own Drop turns mouse reporting off; whoever called
+    // this still wants it (see every other nested-guard site here).
+    print!("{}", term::MOUSE_REPORTING_ENABLE);
+    let _ = io::stdout().flush();
 }
 
 // `:dbg help`/`:dbg h`/`:dbg ?`'s own reference text -- shown via the
@@ -8288,13 +8339,22 @@ fn run_command_mode(
                         // shorter terminal, and the real content behind
                         // it stays visible per the screen-wipe fix above.
                         "help" | "h" | "?" if arg.is_none() => {
-                            let output = render_help(*term_cols);
-                            sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry {
-                                command: trimmed,
-                                output: output.clone(),
-                                status: 0,
-                            });
-                            return CommandModeOutcome::Ran { output, status: 0 };
+                            run_pager(
+                                "bish help  (q to close)",
+                                EDITOR_HELP_MARKDOWN,
+                                sessions,
+                                windows,
+                                job_frames,
+                                current_window,
+                                term_rows,
+                                term_cols,
+                                sinks_are_grid,
+                            );
+                            // Cancelled, not Ran: the pager has already
+                            // shown everything there was to show, and an
+                            // output overlay on top of the repaint would
+                            // be a second, emptier copy of it.
+                            return CommandModeOutcome::Cancelled;
                         }
                         // `:preview` -- this buffer's own markdown,
                         // rendered. The same pipeline `:help` goes
@@ -8311,13 +8371,24 @@ fn run_command_mode(
                                 buffer.clear();
                                 continue;
                             }
-                            let output = render_markdown_document(&fileeditor::buffer_source(tb), *term_cols);
-                            sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry {
-                                command: trimmed,
-                                output: output.clone(),
-                                status: 0,
-                            });
-                            return CommandModeOutcome::Ran { output, status: 0 };
+                            let name = tb
+                                .path()
+                                .and_then(|p| p.file_name())
+                                .map(|n| n.to_string_lossy().into_owned())
+                                .unwrap_or_else(|| "preview".to_string());
+                            let source = fileeditor::buffer_source(tb);
+                            run_pager(
+                                &format!("{name}  (q to close)"),
+                                &source,
+                                sessions,
+                                windows,
+                                job_frames,
+                                current_window,
+                                term_rows,
+                                term_cols,
+                                sinks_are_grid,
+                            );
+                            return CommandModeOutcome::Cancelled;
                         }
                         "help" | "h" | "?" => {
                             show_command_mode_error(&format!("bish: help: unexpected argument '{}' (no help topics yet -- just `:help`)", arg.unwrap_or_default()), *term_rows, *term_cols);

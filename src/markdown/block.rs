@@ -287,7 +287,7 @@ impl Parser {
             self.check_html_end();
         } else if !self.blank {
             let start = self.line.start + self.offset;
-            self.stack.push(Open::new(Kind::Paragraph, start));
+            self.open_leaf(Kind::Paragraph, start);
             let rest = self.rest_of_line();
             let tip = self.stack.len() - 1;
             self.stack[tip].lines.push((rest, start));
@@ -497,7 +497,7 @@ impl Parser {
             if matches!(self.line.chars.get(self.offset), Some(' ') | Some('\t')) {
                 self.advance_columns(1);
             }
-            self.stack.push(Open::new(Kind::BlockQuote, start));
+            self.open_leaf(Kind::BlockQuote, start);
             return Some(true);
         }
         if !indented && let Some((level, marker, content, content_start)) = self.atx_heading() {
@@ -516,12 +516,9 @@ impl Parser {
             let indent = self.indent;
             self.advance_next_nonspace();
             self.advance_columns(fence_len);
-            let mut open = Open::new(
-                Kind::Code { fenced: true, fence_char, fence_len, indent, info, info_span },
-                start,
-            );
-            open.end = self.line.start + self.line.chars.len();
-            self.stack.push(open);
+            self.open_leaf(Kind::Code { fenced: true, fence_char, fence_len, indent, info, info_span }, start);
+            let tip = self.stack.len() - 1;
+            self.stack[tip].end = self.line.start + self.line.chars.len();
             self.offset = self.line.chars.len();
             self.consumed = true;
             return Some(true);
@@ -529,7 +526,7 @@ impl Parser {
         if !indented && let Some(condition) = self.html_block_start(in_paragraph) {
             self.close_unmatched(last_matched, started_any);
             let start = self.line.start + self.next_nonspace;
-            self.stack.push(Open::new(Kind::Html { condition }, start));
+            self.open_leaf(Kind::Html { condition }, start);
             return Some(true);
         }
         // A GFM table: the line under a paragraph's last line is a
@@ -566,9 +563,9 @@ impl Parser {
                         self.push_block(Raw::Paragraph { content, span: start..end });
                     }
                 }
-                let mut table = Open::new(Kind::Table { align, header: vec![header] }, table_start);
-                table.end = self.line.start + self.line.chars.len();
-                self.stack.push(table);
+                self.open_leaf(Kind::Table { align, header: vec![header] }, table_start);
+                let tip = self.stack.len() - 1;
+                self.stack[tip].end = self.line.start + self.line.chars.len();
                 self.offset = self.line.chars.len();
                 self.consumed = true;
                 return Some(true);
@@ -609,7 +606,7 @@ impl Parser {
             self.close_unmatched(last_matched, started_any);
             self.advance_columns(CODE_INDENT);
             let start = self.line.start + self.offset;
-            self.stack.push(Open::new(
+            self.open_leaf(
                 Kind::Code {
                     fenced: false,
                     fence_char: ' ',
@@ -619,7 +616,7 @@ impl Parser {
                     info_span: start..start,
                 },
                 start,
-            ));
+            );
             return Some(true);
         }
         Some(false)
@@ -954,7 +951,25 @@ impl Parser {
 
 // Closing blocks, and turning them into the AST.
 impl Parser {
+    // A list holds *items* and nothing else, so any other block closes
+    // it first -- and closes an outer list too, for a nested one. Without
+    // this a `## heading` after a list would be pushed onto the list's
+    // own `children`, which nothing ever reads, and vanish.
+    fn close_lists_for_block(&mut self) {
+        while self.stack.len() > 1 && matches!(self.stack[self.stack.len() - 1].kind, Kind::List { .. }) {
+            let target = self.stack.len() - 2;
+            self.close_to(target);
+        }
+    }
+
+    // Opening any block that is not a list or a list item.
+    fn open_leaf(&mut self, kind: Kind, start: usize) {
+        self.close_lists_for_block();
+        self.stack.push(Open::new(kind, start));
+    }
+
     fn push_block(&mut self, block: Raw) {
+        self.close_lists_for_block();
         let tip = self.stack.len() - 1;
         // A blank line inside a list item, with content on both sides of
         // it, is what makes the enclosing list loose.
