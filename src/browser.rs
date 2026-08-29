@@ -88,6 +88,11 @@ pub(crate) enum Outcome {
     // absolute, and in a stable order (selection order is the set's own
     // sorted order, not click order -- see `selected`'s type).
     Accepted(Vec<PathBuf>),
+    // Ctrl-Y: leave the browser and make *this* directory the shell's
+    // own. Only ever produced when the caller said it has a shell to
+    // change (see `set_can_change_directory`) -- browsing from `bish
+    // tool edit` is a one-shot command line with no session to move.
+    ChangeDirectory(PathBuf),
 }
 
 // The visible grid's own shape, resolved from a pane rect and whatever
@@ -156,6 +161,8 @@ pub(crate) struct Browser {
     // Whatever went wrong on the last attempted directory read, shown
     // in the status row until the next successful action.
     error: Option<String>,
+    // Whether Ctrl-Y is offered at all -- see Outcome::ChangeDirectory.
+    can_change_directory: bool,
 }
 
 impl Browser {
@@ -178,9 +185,16 @@ impl Browser {
             back: Vec::new(),
             forward: Vec::new(),
             error: None,
+            can_change_directory: false,
         };
         b.reload()?;
         Ok(b)
+    }
+
+    // Turns Ctrl-Y on. Off by default so a caller that has no shell to
+    // move can't accidentally offer a key that would do nothing.
+    pub(crate) fn set_can_change_directory(&mut self, allow: bool) {
+        self.can_change_directory = allow;
     }
 
     // Re-reads `cwd` from disk and rebuilds the filtered view. Keeps the
@@ -503,6 +517,19 @@ impl Browser {
         match key {
             Key::Escape | Key::Char('q') | Key::CtrlC => Outcome::Cancelled,
             Key::Enter => self.accept(),
+            // Ctrl-Y: take the shell here. The directory is the one
+            // being *browsed*, not whatever the cursor happens to be on
+            // -- Enter already descends, so you walk to where you want
+            // and then bring the shell along.
+            Key::CtrlY if self.can_change_directory => {
+                if crate::archive::split(&self.cwd.to_string_lossy()).is_some() {
+                    // An archive member is not a directory anything can
+                    // have as its working directory.
+                    self.error = Some("inside an archive -- nothing to cd into".to_string());
+                    return Outcome::Continue;
+                }
+                Outcome::ChangeDirectory(self.cwd.clone())
+            }
             Key::Char('/') => {
                 self.searching = true;
                 Outcome::Continue
@@ -791,7 +818,11 @@ impl Browser {
             Some(e) => format!("{}  {}", e.name, human_size(e.size)),
             None => if self.query.is_empty() { "empty directory".to_string() } else { format!("no matches for '{}'", self.query) },
         };
-        let hints = "enter open  tab select  / filter  . hidden  bksp up  esc back";
+        let hints = if self.can_change_directory {
+            "enter open  ^y cd here  tab select  / filter  . hidden  bksp up  esc back"
+        } else {
+            "enter open  tab select  / filter  . hidden  bksp up  esc back"
+        };
         let used = str_width(&detail) + str_width(hints);
         if used + GUTTER > cols {
             fit(&detail, cols)
@@ -1564,6 +1595,64 @@ mod tests {
         b.handle_key(Key::Backspace, r);
         assert_eq!(b.cwd, fs::canonicalize(&tmp.0).unwrap());
         assert_eq!(b.current().map(|e| e.name.as_str()), Some("sample.zip"), "lands on what it came out of");
+    }
+
+    // Ctrl-Y hands the shell the directory being *browsed* -- not
+    // whatever the cursor is on, since Enter already descends.
+    #[test]
+    fn ctrl_y_offers_the_directory_being_browsed() {
+        let tmp = Tmp::new("cd-here");
+        tmp.file("a.txt", "x\n");
+        let sub = tmp.dir("sub");
+        let r = rect(20, 80);
+
+        let mut b = Browser::open(&tmp.0).unwrap();
+        b.set_can_change_directory(true);
+        // With the cursor on a subdirectory, it is still *this*
+        // directory that gets handed over.
+        b.focus_name("sub");
+        match b.handle_key(Key::CtrlY, r) {
+            Outcome::ChangeDirectory(dir) => assert_eq!(dir, fs::canonicalize(&tmp.0).unwrap()),
+            other => panic!("expected a directory change, got {other:?}"),
+        }
+
+        // ...and after descending, it is the one descended into.
+        b.handle_key(Key::Enter, r);
+        match b.handle_key(Key::CtrlY, r) {
+            Outcome::ChangeDirectory(dir) => assert_eq!(dir, fs::canonicalize(&sub).unwrap()),
+            other => panic!("expected a directory change, got {other:?}"),
+        }
+    }
+
+    // Off unless the caller says it has a shell to move: `bish tool
+    // edit` has none.
+    #[test]
+    fn ctrl_y_does_nothing_when_the_caller_has_no_shell() {
+        let tmp = Tmp::new("cd-not-offered");
+        tmp.file("a.txt", "x\n");
+        let mut b = Browser::open(&tmp.0).unwrap();
+        assert_eq!(b.handle_key(Key::CtrlY, rect(20, 80)), Outcome::Continue);
+    }
+
+    // An archive member is not a directory anything can sit in.
+    #[test]
+    fn ctrl_y_inside_an_archive_says_so_rather_than_offering_a_path() {
+        let tmp = Tmp::new("cd-archive");
+        let zip = zip_in(&tmp);
+        let mut b = Browser::open(&zip).unwrap();
+        b.set_can_change_directory(true);
+        assert_eq!(b.handle_key(Key::CtrlY, rect(20, 80)), Outcome::Continue);
+        assert!(b.error.as_deref().is_some_and(|e| e.contains("archive")), "{:?}", b.error);
+    }
+
+    #[test]
+    fn the_status_hints_mention_cd_only_when_it_is_offered() {
+        let tmp = Tmp::new("cd-hint");
+        tmp.file("a.txt", "x\n");
+        let mut b = Browser::open(&tmp.0).unwrap();
+        assert!(!b.status_text(200).contains("cd here"));
+        b.set_can_change_directory(true);
+        assert!(b.status_text(200).contains("^y cd here"));
     }
 
     #[test]

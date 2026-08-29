@@ -1246,6 +1246,7 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
                             // picked out of it, before anything opens.
                             let targets = expand_browse_targets(
                                 targets,
+                                true,
                                 &mut sessions,
                                 &mut windows,
                                 session_id,
@@ -1342,8 +1343,13 @@ fn write_error(tb: &TextBuffer, e: &io::Error) -> String {
     format!("bish: E212: Can't open file for writing: {e}")
 }
 
+#[allow(clippy::too_many_arguments)]
 fn expand_browse_targets(
     targets: Vec<fileeditor::EditTarget>,
+    // Whether the browser may hand the shell a new working directory.
+    // False for `bish tool edit`, which is a one-shot command line with
+    // no session that outlives it -- see browser::Outcome.
+    can_change_directory: bool,
     sessions: &mut HashMap<SessionId, SessionState>,
     windows: &mut [WindowEntry],
     session_id: SessionId,
@@ -1397,13 +1403,33 @@ fn expand_browse_targets(
         if sinks_are_grid {
             compositor_redraw(sessions, windows, current_window, *term_rows, *term_cols);
         }
-        match run_browse_frame(&start, sessions, windows, current_window, job_frames, term_rows, term_cols, sinks_are_grid) {
-            Ok(Some(chosen)) => {
+        let browsed = run_browse_frame(
+            &start,
+            can_change_directory,
+            sessions,
+            windows,
+            current_window,
+            job_frames,
+            term_rows,
+            term_cols,
+            sinks_are_grid,
+        );
+        match browsed {
+            Ok(BrowseOutcome::Chosen(chosen)) => {
                 for picked in chosen.into_iter().rev() {
                     queue.push_front(fileeditor::EditTarget { path: Some(picked.display().to_string()), ..target.clone() });
                 }
             }
-            Ok(None) => {}
+            // Ctrl-Y: the browse produced no files to open, it moved the
+            // shell instead. Enforced by Shell::change_directory, which
+            // is also what refuses under `set -r`.
+            Ok(BrowseOutcome::ChangeDirectory(dir)) => {
+                let shell = &mut sessions.get_mut(&session_id).unwrap().shell;
+                if let Err(e) = shell.change_directory(&dir) {
+                    shell.sink_err(&format!("bish: e: cd: {}: {}\n", dir.display(), e));
+                }
+            }
+            Ok(BrowseOutcome::Nothing) => {}
             Err(e) => {
                 sessions.get_mut(&session_id).unwrap().shell.sink_err(&format!("bish: e: {}: {}\n", path, e));
             }
@@ -1591,6 +1617,9 @@ fn run_edit_impl(targets: &[fileeditor::EditTarget], attach_debug: bool) -> i32 
     // while it does.
     let targets = expand_browse_targets(
         targets.to_vec(),
+        // `bish tool edit` exits when the editor closes, so there is no
+        // shell left for a directory change to mean anything to.
+        false,
         &mut sessions,
         &mut windows,
         0,
@@ -2642,8 +2671,18 @@ fn run_diagnostics_frame(
 // nothing was chosen, so adding a redraw here would just paint the same
 // rows twice.
 #[allow(clippy::too_many_arguments)]
+// What a browse ended with. `Nothing` covers both cancelling and an EOF
+// -- neither has anything for the caller to do.
+enum BrowseOutcome {
+    Nothing,
+    Chosen(Vec<std::path::PathBuf>),
+    ChangeDirectory(std::path::PathBuf),
+}
+
+#[allow(clippy::too_many_arguments)]
 fn run_browse_frame(
     start: &std::path::Path,
+    can_change_directory: bool,
     sessions: &mut HashMap<SessionId, SessionState>,
     windows: &mut [WindowEntry],
     current_window: usize,
@@ -2651,11 +2690,12 @@ fn run_browse_frame(
     term_rows: &mut usize,
     term_cols: &mut usize,
     sinks_are_grid: bool,
-) -> Result<Option<Vec<std::path::PathBuf>>, String> {
+) -> Result<BrowseOutcome, String> {
     // Opened before raw mode is touched, so an unreadable path is an
     // ordinary command-mode error at the colon line rather than a
     // flicker into a browser that immediately backs out again.
     let mut browser = browser::Browser::open(start)?;
+    browser.set_can_change_directory(can_change_directory);
     // Same reasoning run_diagnostics_frame's own guard has: whatever
     // loop ran last restored the terminal to cooked mode on its way
     // out, which is unusable for a key-at-a-time grid.
@@ -2675,13 +2715,14 @@ fn run_browse_frame(
             Ok(Some(k)) => k,
             // EOF/error: nothing chosen, same tolerance every other
             // loop's own EOF arm has.
-            Ok(None) | Err(_) => break None,
+            Ok(None) | Err(_) => break BrowseOutcome::Nothing,
         };
 
         match browser.handle_key(key, rect) {
             browser::Outcome::Continue => {}
-            browser::Outcome::Cancelled => break None,
-            browser::Outcome::Accepted(paths) => break Some(paths),
+            browser::Outcome::Cancelled => break BrowseOutcome::Nothing,
+            browser::Outcome::Accepted(paths) => break BrowseOutcome::Chosen(paths),
+            browser::Outcome::ChangeDirectory(dir) => break BrowseOutcome::ChangeDirectory(dir),
         }
     };
 

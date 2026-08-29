@@ -3633,10 +3633,6 @@ impl Shell {
     }
 
     fn run_cd(&mut self, args: &[String]) -> i32 {
-        if self.opt_restricted {
-            sh_eprintln!(self, "bish: cd: restricted");
-            return 1;
-        }
         let old = self.cwd.to_string_lossy().into_owned();
         let target = if let Some(dir) = args.first() {
             if dir == "-" {
@@ -3662,20 +3658,50 @@ impl Shell {
                 }
             }
         };
-        match std::env::set_current_dir(&target) {
-            Ok(()) => {
-                self.cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(&target));
-                unsafe {
-                    std::env::set_var("OLDPWD", old);
-                    std::env::set_var("PWD", self.cwd.to_string_lossy().into_owned());
-                }
-                0
+        let _ = old;
+        match self.change_directory(std::path::Path::new(&target)) {
+            Ok(()) => 0,
+            Err(e) if e == RESTRICTED => {
+                sh_eprintln!(self, "bish: cd: restricted");
+                1
             }
             Err(e) => {
                 sh_eprintln!(self, "cd: {}: {}", target, e);
                 1
             }
         }
+    }
+
+    // Moving this shell to another directory -- the single write path,
+    // so everything that can do it keeps `cwd`, `OLDPWD` and `PWD` in
+    // step and nothing can route around restricted mode. `cd` is one
+    // caller; the file browser's own "make this the shell's directory"
+    // (repl.rs's expand_browse_targets) is the other, and adding it was
+    // what made a shared path worth having.
+    pub fn change_directory(&mut self, target: &std::path::Path) -> Result<(), String> {
+        if self.opt_restricted {
+            return Err(RESTRICTED.to_string());
+        }
+        let old = self.cwd.to_string_lossy().into_owned();
+        std::env::set_current_dir(target).map_err(|e| e.to_string())?;
+        self.cwd = std::env::current_dir().unwrap_or_else(|_| target.to_path_buf());
+        let new = self.cwd.to_string_lossy().into_owned();
+        unsafe {
+            std::env::set_var("OLDPWD", &old);
+            std::env::set_var("PWD", &new);
+        }
+        // ...and into this session's own remembered environment, not
+        // just the real one. `sync_real_state_in` reapplies that
+        // snapshot before every command, so a raw `set_var` made outside
+        // a command -- which is exactly what the file browser's Ctrl-Y
+        // does -- survives until the next command and is then silently
+        // reverted. (`cd` itself never saw this: it runs inside a
+        // command, and `sync_real_state_out` captures the real
+        // environment right afterwards.) Same trap, and the same fix, as
+        // `set_terminal_capability_env` below.
+        self.env_snapshot.insert("OLDPWD".to_string(), old);
+        self.env_snapshot.insert("PWD".to_string(), new);
+        Ok(())
     }
 
     // `echo [-neE] [arg...]`: writes each arg separated by a single
@@ -10402,6 +10428,10 @@ enum BishOptValue {
 // terminal palette rather than some fixed guess at what "yellow" ought
 // to look like. `--set`-ing an ordinary CSS color (or color-mix, hsl(),
 // ...) is what actually pins it to a real, terminal-independent color.
+// Shell::change_directory's own "refused by `set -r`" answer -- matched
+// by the `cd` builtin so it can keep printing the message it always has.
+const RESTRICTED: &str = "restricted";
+
 const KNOWN_BISHOPTS: &[(&str, BishOptDefault)] = &[
     // Which `::bish theme`-declared theme (if any) is currently active --
     // an ordinary Str option, set/unset/read the normal way (`bishopt
@@ -10532,6 +10562,66 @@ fn write_diagnostic(target: &Option<String>, msg: &str, sink: OutputSink) {
 // needs no external crate, matching the zero-dependency stance elsewhere.
 #[cfg(test)]
 mod tests {
+    // `change_directory` moves the real process, so these must not run
+    // beside anything else that reads or sets the cwd -- same shared-
+    // mutex fix, and the same poisoned-lock recovery, as session.rs's
+    // own ENV_LOCK.
+    static CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    // The bug this pins was found by driving the file browser through a
+    // real pty: Ctrl-Y moved the shell correctly, and then `cd -` went
+    // somewhere else entirely. `sync_real_state_in` reapplies the
+    // session's env snapshot before every command, so an `OLDPWD`
+    // written only to the real environment -- which is all a change made
+    // *outside* a command can do -- lasted exactly until the next one.
+    #[test]
+    fn changing_directory_updates_the_session_snapshot_not_just_the_environment() {
+        let _guard = CWD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let original = std::env::current_dir().expect("a working directory");
+
+        let root = std::env::temp_dir().join(format!("bish-cd-test-{}", std::process::id()));
+        let inner = root.join("inner");
+        std::fs::create_dir_all(&inner).unwrap();
+        let root_real = std::fs::canonicalize(&root).unwrap();
+        let inner_real = std::fs::canonicalize(&inner).unwrap();
+
+        let mut shell = Shell::new();
+        shell.change_directory(&root_real).expect("the temp root is a real directory");
+        shell.sync_real_state_out();
+        shell.change_directory(&inner_real).expect("the inner directory is real too");
+
+        assert_eq!(shell.cwd, inner_real);
+        assert_eq!(std::env::var("PWD").as_deref(), Ok(inner_real.to_string_lossy().as_ref()));
+        assert_eq!(std::env::var("OLDPWD").as_deref(), Ok(root_real.to_string_lossy().as_ref()));
+
+        // The part that was broken: after the session restores its own
+        // remembered environment, `cd -` still has somewhere to go.
+        shell.sync_real_state_in();
+        assert_eq!(
+            std::env::var("OLDPWD").as_deref(),
+            Ok(root_real.to_string_lossy().as_ref()),
+            "OLDPWD must survive the snapshot being reapplied"
+        );
+        assert_eq!(std::env::var("PWD").as_deref(), Ok(inner_real.to_string_lossy().as_ref()));
+
+        std::env::set_current_dir(&original).unwrap();
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    // Restricted mode refuses at the write path, so nothing that can
+    // move the shell -- including the file browser -- can route around
+    // it.
+    #[test]
+    fn a_restricted_shell_refuses_to_change_directory_at_all() {
+        let _guard = CWD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let original = std::env::current_dir().expect("a working directory");
+        let mut shell = Shell::new();
+        shell.run_source_here("set -r", "<test>");
+        let err = shell.change_directory(std::path::Path::new("/")).unwrap_err();
+        assert_eq!(err, RESTRICTED);
+        assert_eq!(std::env::current_dir().unwrap(), original, "the real process must not have moved");
+    }
+
     use super::*;
 
     #[test]
