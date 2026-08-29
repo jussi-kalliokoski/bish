@@ -1142,23 +1142,22 @@ impl Shell {
     // own controlling terminal for the (should be unreachable) Real
     // case, same default-on-failure as repl.rs's own query_term_size.
     fn pty_size(&self) -> (u16, u16) {
-        match &self.sink {
-            OutputSink::Grid(screen) => {
-                let (rows, cols) = screen.borrow().size();
-                (rows as u16, cols as u16)
-            }
-            // Capture is only ever active for the brief span of running one
-            // command-mode command (restrict_to_builtins there already
-            // rules out anything that would spawn a pty-attached job), and
-            // Builtin is only active when this same command has an output
-            // redirect of its own (use_pty's own gate above already
-            // requires none), so both arms should be unreachable in
-            // practice -- falls back to the same real-terminal query Real
-            // uses rather than a panic.
-            OutputSink::Real | OutputSink::Capture(_) | OutputSink::Builtin { .. } => match pty::get_size(0) {
-                Ok(ws) if ws.rows > 0 && ws.cols > 0 => (ws.rows, ws.cols),
-                _ => (24, 80),
-            },
+        // Through `sink_grid`, not off `self.sink` directly: a command
+        // with its own output redirect runs under a `Builtin` sink, and
+        // background_pty asks for a size in exactly that case -- read
+        // straight, this fell through to the real-terminal query below
+        // and sized a background job's pty to the whole terminal rather
+        // than to the pane it will actually be rendered in.
+        if let Some(screen) = self.sink_grid() {
+            let (rows, cols) = screen.borrow().size();
+            return (rows as u16, cols as u16);
+        }
+        // No grid at all (never promoted, or command mode's own transient
+        // Capture) -- fall back to asking the real terminal rather than
+        // guessing.
+        match pty::get_size(0) {
+            Ok(ws) if ws.rows > 0 && ws.cols > 0 => (ws.rows, ws.cols),
+            _ => (24, 80),
         }
     }
 
@@ -1373,6 +1372,16 @@ impl Shell {
             let (Some(master), Some(screen)) = (&mut job.pty_master, &job.sink_screen) else {
                 continue;
             };
+            // An editor frame has this session's screen switched to its
+            // alternate buffer for as long as it owns the pane (see
+            // repl.rs's enter_alt_screen), and that buffer is the
+            // editor's, not this job's -- feeding it here would scribble
+            // over the file being edited. The output waits in the pty
+            // until the frame closes, which is also when the primary
+            // buffer is showing again and there's somewhere for it to go.
+            if screen.borrow().using_alternate {
+                continue;
+            }
             if !job.nonblocking {
                 // Lazily, so no spawn site has to think about it: a
                 // blocking read here would park the whole shell on a job
@@ -10782,8 +10791,15 @@ mod tests {
         // of the session that started the job.
         let mut shell = Shell::new();
         let screen = Rc::new(RefCell::new(crate::vt100::Screen::new(6, 40)));
-        shell.set_sink_grid(screen.clone());
+        // In this order, matching repl.rs's own ensure_promoted:
+        // promote_if_needed writes the alternate-screen switch through
+        // the sink, and that switch belongs to the *real* terminal, not
+        // to this grid -- with the grid installed first it would land in
+        // the grid instead and leave it stuck on its own alternate
+        // buffer, which is exactly the state the drain skips.
         shell.promote_if_needed();
+        shell.set_sink_grid(screen.clone());
+        assert!(!screen.borrow().using_alternate, "the session's grid is never the one promotion switches");
         shell.run_source_here("sh -c 'echo from-a-background-job' &\n", "<test>");
         // The child writes as soon as it can; drain until it shows up
         // rather than racing it (the real caller does this every idle

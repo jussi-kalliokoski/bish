@@ -1662,7 +1662,13 @@ impl HexSession {
             &mut registers,
             &[],
             None,
-            &mut *on_idle,
+            // This colon line is drawn over a hex frame the caller
+            // repaints itself on the next key -- nothing here can put it
+            // back, so it never asks read_line to redraw.
+            &mut || {
+                on_idle();
+                false
+            },
         );
         self.registers = registers;
         if let Ok(editor::ReadOutcome::Line(line)) = outcome {

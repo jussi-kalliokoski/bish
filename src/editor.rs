@@ -1353,7 +1353,13 @@ pub fn read_line(
     // trade against needing `on_idle` and this to somehow share `&mut`
     // access to the same term size.
     global_row_size: Option<(usize, usize)>,
-    mut on_idle: impl FnMut(),
+    // Called on every idle poll tick while this prompt is waiting for a
+    // key. `true` means something repainted the screen underneath this
+    // line (see repl.rs's own closure) and the prompt has to be drawn
+    // again on top of it -- without that, a background job's output
+    // arriving mid-typing simply erased whatever had been typed until the
+    // next keystroke happened to redraw it.
+    mut on_idle: impl FnMut() -> bool,
 ) -> io::Result<ReadOutcome> {
     let mut guard = Some(term::RawGuard::enable_with_mouse(0)?);
     let mut ed = match initial {
@@ -1449,13 +1455,43 @@ pub fn read_line(
     loop {
         let key = match pending_key.take() {
             Some(k) => k,
-            None => match read_key_idle(&mut on_idle)? {
-                Some(k) => k,
-                None => {
-                    drop(guard.take());
-                    return Ok(ReadOutcome::Eof);
+            None => {
+                // Waiting for the next byte out here rather than inside
+                // read_key_idle's own on_idle, for the same reason
+                // run_normal_mode_navigation and run_insert_mode both
+                // restructured theirs: only here is everything this line
+                // is drawn from actually free to redraw with. Same
+                // IDLE_POLL_MS interval read_key_idle's own loop uses, so
+                // behavior is identical once a byte does arrive.
+                while !term::stdin_ready(IDLE_POLL_MS) {
+                    if on_idle() {
+                        let overlay = snippet.as_ref().map(snippet_layer).unwrap_or_default();
+                        redraw_with_completion_row(
+                            prompt,
+                            &ed,
+                            suggestion.as_deref().unwrap_or(""),
+                            completion.as_ref(),
+                            menu_was_shown,
+                            menu_capable,
+                            row_origin,
+                            col_origin,
+                            width,
+                            ctx,
+                            &overlay,
+                        )?;
+                    }
                 }
-            },
+                // A byte is already known ready, so this on_idle closure
+                // is never actually called -- kept only to match the
+                // existing signature.
+                match read_key_idle(&mut || {})? {
+                    Some(k) => k,
+                    None => {
+                        drop(guard.take());
+                        return Ok(ReadOutcome::Eof);
+                    }
+                }
+            }
         };
         if !matches!(key, Key::Up | Key::Down | Key::Escape) {
             browse = None;
@@ -1628,7 +1664,9 @@ pub fn read_line(
             // just below, except here there's nothing worth propagating
             // (an aborted <C-r> is just... aborted).
             Key::CtrlR => {
-                if let Some(Key::Char(c)) = read_key_idle(&mut on_idle)? {
+                if let Some(Key::Char(c)) = read_key_idle(&mut || {
+                    on_idle();
+                })? {
                     let text = registers.read(Some(c)).flatten_to_single_line();
                     for ch in text.chars() {
                         ed.insert(ch);
@@ -1756,7 +1794,9 @@ pub fn read_line(
                 let state = completion.take().unwrap();
                 ed.splice_word(state.word_start, ed.cursor, &state.original);
             }
-            Key::CtrlE => match run_line_normal_mode(&mut ed, prompt, col_origin, width, ctx, registers, &mut undo, global_row_size, &mut on_idle)? {
+            Key::CtrlE => match run_line_normal_mode(&mut ed, prompt, col_origin, width, ctx, registers, &mut undo, global_row_size, &mut || {
+                on_idle();
+            })? {
                 LineNormalExit::ToInsert => {}
                 LineNormalExit::Propagate(k) => {
                     pending_key = Some(k);
@@ -1778,7 +1818,9 @@ pub fn read_line(
             // comment. Reachable directly from ordinary typing, matching
             // real vim -- no need to already be in Ctrl-E's own mode first.
             Key::CtrlO => {
-                if let Some(k) = run_one_shot_normal_command(&mut ed, registers, &mut undo, &mut on_idle)? {
+                if let Some(k) = run_one_shot_normal_command(&mut ed, registers, &mut undo, &mut || {
+                    on_idle();
+                })? {
                     pending_key = Some(k);
                     suggestion = None; // see Ctrl-E's own propagate arm
                     continue;

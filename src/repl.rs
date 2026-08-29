@@ -746,8 +746,18 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
             &mut registers,
             &abbrs_snapshot,
             global_row_size,
+            // Repaints the panes when something arrived underneath this
+            // prompt (a background job's output, a session client
+            // reattaching) and tells read_line to put its own prompt line
+            // back on top -- neither half can do the other's, which is
+            // why the signal is threaded through rather than either side
+            // just redrawing everything.
             || {
-                service_background_jobs(&mut sessions, &mut windows, &mut job_frames, current_window, &mut term_rows, &mut term_cols, sinks_are_grid);
+                let changed = service_background_jobs(&mut sessions, &mut windows, &mut job_frames, current_window, &mut term_rows, &mut term_cols, sinks_are_grid);
+                if changed && sinks_are_grid {
+                    compositor_redraw(&sessions, &windows, current_window, term_rows, term_cols);
+                }
+                changed
             },
         ) {
             Ok(ReadOutcome::Eof) => {
@@ -3866,7 +3876,14 @@ fn service_background_jobs(
     // job table is shared, and each job carries its own destination. Any
     // live shell will do as the receiver; there is always at least one.
     let bg_output = sessions.values().next().is_some_and(|s| s.shell.drain_background_output());
-    if (just_attached || bg_output) && sinks_are_grid {
+    // Only `just_attached` repaints from in here. Background output
+    // deliberately does *not*: this function has no idea what is
+    // currently drawn over the pane, and a blind compositor_redraw
+    // wiped whatever wasn't in the grid -- a half-typed prompt, an open
+    // file browser, the diagnostics list. It's reported through the
+    // return value instead, so each caller repaints whatever it alone
+    // knows how to.
+    if just_attached && sinks_are_grid {
         compositor_redraw(sessions, windows, skip_window, *term_rows, *term_cols);
     }
     // The new client's own TERM/COLORTERM -- applied to *every*
@@ -7114,8 +7131,14 @@ fn run_command_mode(
             // Ctrl-E search started while composing a `:` command falls
             // back to the original in-place prompt substitution.
             None,
+            // Command mode's own colon line sits on the global status
+            // row with an output overlay of its own that no
+            // compositor_redraw knows how to put back, so it never asks
+            // for one -- whatever arrived shows up once this excursion
+            // ends and the caller repaints.
             &mut || {
                 service_background_jobs(sessions, windows, job_frames, current_window, term_rows, term_cols, sinks_are_grid);
+                false
             },
         ) {
             // Command mode discards whatever was typed either way, so
