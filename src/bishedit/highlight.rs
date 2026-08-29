@@ -1,11 +1,14 @@
-// Syntax highlighting, built on top of the real lexer rather than a
-// parallel implementation (see plan.md / the approved design doc for this
-// feature) -- Highlighter is a small trait so a regex-, treesitter-, or
-// LSP-backed source can slot in later; BashHighlighter is the only
-// implementor today, driven by lexer::tokenize_spanned. Wired into
+// Syntax highlighting, built on top of each language's real parser
+// rather than a parallel implementation (see plan.md / the approved
+// design doc for this feature) -- Highlighter is a small trait so a
+// regex-, treesitter-, or LSP-backed source can slot in later. Two
+// implementors today, both following that same rule: BashHighlighter
+// over lexer::tokenize_spanned, and JsonHighlighter over json::tokens,
+// which the `json` builtin's own parser is built on too. Wired into
 // editor.rs's redraw() (and, since that function is shared, command
 // mode's colon-line and Ctrl-E's line-local normal-mode view get it for
-// free too).
+// free too) and into fileeditor.rs, which picks by the buffer's own
+// language.
 //
 // #![allow(dead_code)] stays regardless of wiring -- HighlightKind::Number
 // is reserved but intentionally unpopulated (see its own doc comment),
@@ -62,9 +65,10 @@ pub enum HighlightKind {
     Variable,
     Substitution,
     Comment,
-    // Reserved, unpopulated in v1 -- would need its own small scanner over
-    // $((...))'s interior (digit runs, $var refs), which has different
-    // lexical rules than the shell grammar and isn't attempted here.
+    // Every JSON number. Still never produced for bash: that would need
+    // its own small scanner over $((...))'s interior (digit runs, $var
+    // refs), which has different lexical rules than the shell grammar
+    // and isn't attempted here.
     Number,
     // A plain unquoted argument recognized as one of its command's own
     // flags (from a man-page-mined list, see manpages.rs) -- any argument
@@ -77,9 +81,12 @@ pub enum HighlightKind {
     // A plain unquoted argument that isn't a recognized Flag/Subcommand
     // but does resolve to a real file/directory against the shell's cwd.
     Link,
-    // A refinement *within* a builtin's own argument text (e.g. printf's
-    // "%s") -- narrower than, and layered on top of, that argument's own
-    // base span (String, typically).
+    // A refinement *within* a string's own text -- narrower than, and
+    // layered on top of, that string's own base span: printf's "%s" in a
+    // builtin's argument, or a JSON string's `\n`/`\uXXXX` escape. The
+    // two are the same thing to a reader (a piece of this text that
+    // isn't literal), which is why they share a kind rather than each
+    // having their own.
     FormatSpecifier,
     // A command-name word (the first word of a simple command, or
     // whichever word follows a pipe/&&/||/;/keyword boundary) that isn't
@@ -89,6 +96,13 @@ pub enum HighlightKind {
     // ("displayed as it was before"); this only ever fires on the
     // negative case.
     InvalidCommand,
+    // A field name -- a JSON object's key, and whatever the equivalent
+    // turns out to be in the next structured-data language. Its own kind
+    // rather than reusing Variable, which means something specific and
+    // different (`$foo`, a shell expansion); they share a default colour
+    // because they play the same "this names the thing beside it" role,
+    // but stay separately themeable.
+    Key,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -112,6 +126,65 @@ impl Highlighter for BashHighlighter {
     fn highlight(&self, text: &str, ctx: HighlightContext) -> Vec<HighlightSpan> {
         let mut out = Vec::new();
         highlight_into(text, 0, ctx, &mut out);
+        out
+    }
+}
+
+// JSON, over the same json::tokens the `json` builtin's own parser reads
+// -- so what the editor paints and what `json` accepts can never drift
+// apart, the same reason BashHighlighter is driven by the real lexer.
+//
+// It ignores `ctx` entirely: cwd, known functions and command validity
+// are all shell notions with no JSON counterpart. What it does need that
+// a value parser doesn't is to keep going through nonsense, since a
+// buffer being typed is invalid JSON almost all of the time -- hence
+// working from the flat token stream rather than a parsed Value. An
+// invalid token gets no span at all: highlighting is not diagnostics,
+// and text simply going uncoloured as you type past a mistake is a
+// quieter, more honest signal than painting an error the moment a quote
+// is still open.
+pub struct JsonHighlighter;
+
+impl Highlighter for JsonHighlighter {
+    fn highlight(&self, text: &str, _ctx: HighlightContext) -> Vec<HighlightSpan> {
+        let toks = crate::json::tokens(text);
+        let mut out = Vec::new();
+        for (i, tok) in toks.iter().enumerate() {
+            let kind = match &tok.kind {
+                // The one piece of structure this needs, and one token of
+                // lookahead is all it takes: a string is a key exactly
+                // when a colon follows it. Reading it off the flat stream
+                // rather than a parse tree is what keeps it working in a
+                // buffer that doesn't parse yet.
+                crate::json::TokenKind::Str(_) => {
+                    match toks.get(i + 1).map(|t| &t.kind) {
+                        Some(crate::json::TokenKind::Colon) => HighlightKind::Key,
+                        _ => HighlightKind::String,
+                    }
+                }
+                crate::json::TokenKind::Number(_) => HighlightKind::Number,
+                crate::json::TokenKind::Bool(_) | crate::json::TokenKind::Null => HighlightKind::Keyword,
+                crate::json::TokenKind::OpenBrace
+                | crate::json::TokenKind::CloseBrace
+                | crate::json::TokenKind::OpenBracket
+                | crate::json::TokenKind::CloseBracket
+                | crate::json::TokenKind::Comma
+                | crate::json::TokenKind::Colon => HighlightKind::Operator,
+                crate::json::TokenKind::Invalid(_) => continue,
+            };
+            out.push(HighlightSpan { start: tok.start, end: tok.end, kind, link: None });
+            // Layered on top of the string's own span just above, the
+            // same way printf's format specifiers sit inside their
+            // argument -- compose paints later spans over earlier ones.
+            for esc in &tok.escapes {
+                out.push(HighlightSpan {
+                    start: esc.start,
+                    end: esc.end,
+                    kind: HighlightKind::FormatSpecifier,
+                    link: None,
+                });
+            }
+        }
         out
     }
 }
@@ -159,6 +232,7 @@ pub fn default_style(kind: HighlightKind) -> (vt100::Color, vt100::CellAttrs) {
         // bold red given the two never appear near each other, and
         // matches "error (red text)" from the feature request literally.
         HighlightKind::InvalidCommand => (vt100::Color::Indexed(1), vt100::CellAttrs::default()),
+        HighlightKind::Key => (vt100::Color::Indexed(6), bold),
     }
 }
 
@@ -207,6 +281,7 @@ pub const SYN_COL_OPTIONS: &[(HighlightKind, &str)] = &[
     (HighlightKind::Number, "syn_col_number"),
     (HighlightKind::FormatSpecifier, "syn_col_format_specifier"),
     (HighlightKind::InvalidCommand, "syn_col_invalid_command"),
+    (HighlightKind::Key, "syn_col_key"),
 ];
 
 // Builds one Cell per char, then paints each layer's spans over it in
@@ -914,6 +989,15 @@ fn push_procsub(raw: &str, offset: usize, raw_spans: &[Range<usize>], cursor: &m
 mod tests {
     use super::*;
 
+    // The text each JSON span actually covers, so a test reads as what
+    // you'd see on screen rather than as a list of offsets.
+    fn json_kinds(text: &str) -> Vec<(String, HighlightKind)> {
+        let chars: Vec<char> = text.chars().collect();
+        let mut spans = JsonHighlighter.highlight(text, HighlightContext::default());
+        spans.sort_by_key(|s| (s.start, s.end));
+        spans.into_iter().map(|s| (chars[s.start..s.end].iter().collect(), s.kind)).collect()
+    }
+
     fn kinds(text: &str) -> Vec<(usize, usize, HighlightKind)> {
         let mut spans = BashHighlighter.highlight(text, HighlightContext::default());
         spans.sort_by_key(|s| (s.start, s.end));
@@ -1195,7 +1279,16 @@ mod tests {
         for uncolorable in [HighlightKind::Flag, HighlightKind::Subcommand, HighlightKind::Link] {
             assert!(!SYN_COL_OPTIONS.iter().any(|(k, _)| *k == uncolorable));
         }
-        assert_eq!(SYN_COL_OPTIONS.len(), 10);
+        // The same rule stated from the other side, so a kind added to
+        // the table later can't quietly register a color option for
+        // something that has no color to override.
+        for (kind, option) in SYN_COL_OPTIONS {
+            assert_ne!(default_style(*kind).0, vt100::Color::Default, "{option}");
+        }
+        // Bump when a colorable kind is genuinely added (and give it its
+        // own entry in exec.rs's KNOWN_BISHOPTS too, or the option name
+        // here resolves to nothing).
+        assert_eq!(SYN_COL_OPTIONS.len(), 11);
     }
 
     fn tok(word: &str) -> Tok {
@@ -1649,5 +1742,88 @@ mod tests {
         // really just confirming that fact holds).
         let spans = kinds("myfunc () { :; }");
         assert!(!spans.iter().any(|s| s.2 == HighlightKind::InvalidCommand), "{spans:?}");
+    }
+
+    #[test]
+    fn json_highlights_keys_apart_from_string_values() {
+        assert_eq!(
+            json_kinds(r#"{"name": "bish"}"#),
+            vec![
+                ("{".to_string(), HighlightKind::Operator),
+                ("\"name\"".to_string(), HighlightKind::Key),
+                (":".to_string(), HighlightKind::Operator),
+                ("\"bish\"".to_string(), HighlightKind::String),
+                ("}".to_string(), HighlightKind::Operator),
+            ]
+        );
+    }
+
+    // A string is a key exactly when a colon follows it, which is what
+    // makes an array of strings stay strings.
+    #[test]
+    fn json_strings_in_an_array_are_not_keys() {
+        let kinds: Vec<HighlightKind> = json_kinds(r#"["a", "b"]"#).into_iter().map(|(_, k)| k).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                HighlightKind::Operator,
+                HighlightKind::String,
+                HighlightKind::Operator,
+                HighlightKind::String,
+                HighlightKind::Operator
+            ]
+        );
+    }
+
+    #[test]
+    fn json_highlights_numbers_and_the_three_literals() {
+        assert_eq!(
+            json_kinds("[1, -2.5e3, true, false, null]")
+                .into_iter()
+                .filter(|(_, k)| *k != HighlightKind::Operator)
+                .collect::<Vec<_>>(),
+            vec![
+                ("1".to_string(), HighlightKind::Number),
+                ("-2.5e3".to_string(), HighlightKind::Number),
+                ("true".to_string(), HighlightKind::Keyword),
+                ("false".to_string(), HighlightKind::Keyword),
+                ("null".to_string(), HighlightKind::Keyword),
+            ]
+        );
+    }
+
+    // The escape spans are emitted after the string's own span, which is
+    // what makes compose paint them over it rather than under.
+    #[test]
+    fn json_marks_string_escapes_inside_the_string_that_holds_them() {
+        let spans = JsonHighlighter.highlight(r#""a\nb""#, HighlightContext::default());
+        assert_eq!(spans[0].kind, HighlightKind::String);
+        assert_eq!((spans[0].start, spans[0].end), (0, 6));
+        assert_eq!(spans[1].kind, HighlightKind::FormatSpecifier);
+        assert_eq!((spans[1].start, spans[1].end), (2, 4));
+    }
+
+    // Half-typed JSON is the normal state of a buffer being edited: the
+    // mistake itself goes uncoloured, everything around it does not.
+    #[test]
+    fn json_keeps_highlighting_past_invalid_input() {
+        assert_eq!(
+            json_kinds(r#"{"a": tru, "b": 2}"#),
+            vec![
+                ("{".to_string(), HighlightKind::Operator),
+                ("\"a\"".to_string(), HighlightKind::Key),
+                (":".to_string(), HighlightKind::Operator),
+                (",".to_string(), HighlightKind::Operator),
+                ("\"b\"".to_string(), HighlightKind::Key),
+                (":".to_string(), HighlightKind::Operator),
+                ("2".to_string(), HighlightKind::Number),
+                ("}".to_string(), HighlightKind::Operator),
+            ]
+        );
+    }
+
+    #[test]
+    fn json_highlights_nothing_in_empty_input() {
+        assert!(json_kinds("").is_empty());
     }
 }

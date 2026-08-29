@@ -18,7 +18,7 @@ use std::io::{self, Write};
 use std::rc::Rc;
 
 use crate::bishedit::format::BashFormatter;
-use crate::bishedit::highlight::{self, BashHighlighter, HighlightContext, Highlighter, StyledSpan};
+use crate::bishedit::highlight::{self, BashHighlighter, HighlightContext, Highlighter, JsonHighlighter, StyledSpan};
 use crate::bishedit::lint::{self, BashLinter, Linter};
 use crate::bishedit::motion;
 use crate::bishedit::registers::{RegisterShape, RegisterValue, Registers};
@@ -1678,9 +1678,9 @@ pub(crate) fn language_of(buf: &TextBuffer) -> String {
         .unwrap_or(ext)
 }
 
-// The one gate on bash-specific tooling (highlighting, `:diag`'s
-// linters, `:format`), now derived from `language_of` rather than from a
-// second, separate notion of what a file is -- two disagreeing answers
+// The one gate on bash-specific tooling (`:diag`'s linters, `:format`),
+// derived from `language_of` rather than from a second, separate notion
+// of what a file is -- two disagreeing answers
 // to "what language is this" in one module is exactly the kind of thing
 // that rots. A visible consequence: a `.sh` file is bash here now, where
 // the previous extension check recognized only `.bash`.
@@ -1688,12 +1688,12 @@ fn is_bash_file(buf: &TextBuffer) -> bool {
     language_of(buf) == snippet::DEFAULT_LANG
 }
 
-// The buffer's own text, lines joined by '\n' -- what BashHighlighter
-// needs to see a construct that spans several physical lines (a
-// multi-line double-quoted string, a heredoc body) as the single token
-// it actually is, instead of each line's own lexer run finding a
-// dangling, unterminated piece of it with no idea what line came
-// before. Recomputed on every redraw, same as buffer_highlight_spans
+// The buffer's own text, lines joined by '\n' -- what a highlighter
+// needs to see a construct that spans several physical lines (a bash
+// heredoc body or multi-line double-quoted string, a JSON object) as
+// the single thing it actually is, instead of each line's own run
+// finding a dangling, unterminated piece of it with no idea what line
+// came before. Recomputed on every redraw, same as buffer_highlight_spans
 // below -- see that function's own doc comment on why that's an
 // accepted, not-yet-a-problem cost rather than something cached here.
 fn buffer_text(buf: &TextBuffer) -> String {
@@ -1719,10 +1719,22 @@ fn line_starts(buf: &TextBuffer) -> Vec<usize> {
     starts
 }
 
-// Runs BashHighlighter once against the *whole* buffer text (see
-// buffer_text's own doc comment for why that, not one line at a time,
-// is what actually fixes a multi-line construct), for `.bash` files
-// only -- `is_bash_file`'s own doc comment covers everything else.
+// Which highlighter (if any) this buffer's language has -- the one place
+// that decision is made, so adding a third language is this match arm
+// plus its Highlighter impl and nothing else. `None` for a language with
+// no highlighter, which renders exactly as it did before any of this
+// existed: plain, uncoloured text.
+fn highlighter_for(language: &str) -> Option<Box<dyn Highlighter>> {
+    match language {
+        snippet::DEFAULT_LANG => Some(Box::new(BashHighlighter)),
+        "json" => Some(Box::new(JsonHighlighter)),
+        _ => None,
+    }
+}
+
+// Runs this buffer's own highlighter once against the *whole* buffer
+// text (see buffer_text's own doc comment for why that, not one line at
+// a time, is what actually fixes a multi-line construct).
 // Recomputed on every redraw (build_editor_frame's own single call
 // site, once per keystroke) rather than cached on EditSession: this
 // editor's target files are scripts/configs, not large codebases, and
@@ -1733,16 +1745,17 @@ fn line_starts(buf: &TextBuffer) -> Vec<usize> {
 // default() (no cwd, no known_functions) still stands in for the
 // highlighter's own *classification* step: same "no context to offer"
 // choice command mode's own colon-line already makes, since nothing
-// here has a live Shell to pull those from -- Flag/Subcommand/Link/
-// InvalidCommand refinements that need them simply don't fire, same as
-// there. `color_overrides` (bishopt's own syn_col_* -- see bishedit::
+// here has a live Shell to pull those from -- bash's own Flag/
+// Subcommand/Link/InvalidCommand refinements that need them simply
+// don't fire, same as there; JsonHighlighter ignores the context
+// outright, having no use for any of it. `color_overrides` (bishopt's own syn_col_* -- see bishedit::
 // highlight::ColorOverrides/SYN_COL_OPTIONS) is a separate, later step
 // (picking a *color* for an already-classified span, not classifying
 // it), threaded in from wherever a live Shell to read it from actually
 // exists: repl.rs's own run_edit_frame, one level up from every caller
 // of this whole chain.
 //
-// Not a full fix for every multi-line case: `next_span`'s own doc
+// Not a full fix for every multi-line case in *bash*: `next_span`'s own doc
 // comment (this same module) documents a pre-existing lexer position-
 // tracking gap for a heredoc body that itself contains a $VAR/$(...)
 // expansion -- content *after* such a heredoc in the same buffer can
@@ -1750,11 +1763,11 @@ fn line_starts(buf: &TextBuffer) -> Vec<usize> {
 // not something this change introduces or could fix without touching
 // lexer.rs's own heredoc-body capture.
 fn buffer_highlight_spans(buf: &TextBuffer, color_overrides: Option<&highlight::ColorOverrides>) -> Vec<StyledSpan> {
-    if !is_bash_file(buf) {
+    let Some(highlighter) = highlighter_for(&language_of(buf)) else {
         return Vec::new();
-    }
+    };
     let text = buffer_text(buf);
-    BashHighlighter
+    highlighter
         .highlight(&text, HighlightContext::default())
         .into_iter()
         .map(|s| {
@@ -1766,10 +1779,13 @@ fn buffer_highlight_spans(buf: &TextBuffer, color_overrides: Option<&highlight::
 
 // `:diag`'s own worker (see repl.rs's run_command_mode, the one caller):
 // runs every diagnose tool configured for this buffer's language against
-// the *whole* buffer text, same `buffer_text`/is_bash_file gate as
-// buffer_highlight_spans -- for exactly the same reason (a multi-line
-// construct needs to be seen as one thing, and `.bash` is the only
-// recognized language today). Unlike buffer_highlight_spans this isn't
+// the *whole* buffer text, for the same reason buffer_highlight_spans
+// does (a multi-line construct needs to be seen as one thing). Still
+// gated on is_bash_file, unlike highlighting: bash is the only language
+// with a linter, and a JSON one -- which json::parse's own error, now
+// that it carries a position, is most of the way to -- is a separate
+// piece of work, not a side effect of this file's highlighting. Unlike
+// buffer_highlight_spans this isn't
 // called on every redraw: `:diag` is an explicit, user-triggered check,
 // not a live-typing overlay, so there's no per-keystroke cost to worry
 // about and the result is cached on TextBuffer::diagnostics instead of
@@ -3398,6 +3414,25 @@ mod pre_save_hook_tests {
         buf.insert_text((0, 0), text);
         buf.set_cursor(0, 0);
         buf
+    }
+
+    // The dispatch, not the highlighters themselves (each has its own
+    // tests in bishedit::highlight) -- what this pins is that the editor
+    // asks the right one and, for a language with none, quietly renders
+    // plain text instead of falling back to bash's highlighter and
+    // painting nonsense.
+    #[test]
+    fn buffer_highlighting_follows_the_buffers_own_language() {
+        let json = buf_with_ext(r#"{"a": 1}"#, "json");
+        assert!(!buffer_highlight_spans(&json, None).is_empty(), "a .json buffer is highlighted");
+
+        let bash = buf_with_ext("if true; then echo hi; fi", "bash");
+        assert!(!buffer_highlight_spans(&bash, None).is_empty(), "a .bash buffer still is");
+
+        // Valid bash, and deliberately not highlighted as any: nothing
+        // claims to know what a .toml file is.
+        let toml = buf_with_ext("if true; then echo hi; fi", "toml");
+        assert!(buffer_highlight_spans(&toml, None).is_empty(), "a language with no highlighter renders plain");
     }
 
     #[test]

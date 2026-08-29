@@ -17,6 +17,7 @@
 
 use std::fmt::Write as _;
 use std::iter::Peekable;
+use std::ops::Range;
 use std::str::Chars;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -38,23 +39,70 @@ pub enum Value {
 
 const NULL: Value = Value::Null;
 
-pub fn parse(input: &str) -> Result<Value, String> {
-    let mut p = Parser { chars: input.chars().peekable(), pos: 0 };
-    p.skip_ws();
-    let v = p.parse_value()?;
-    p.skip_ws();
-    if p.chars.peek().is_some() {
-        return Err(format!("trailing data after the JSON value (position {})", p.pos));
-    }
-    Ok(v)
+// One lexical piece of JSON, with where it sits in the input -- `start`
+// and `end` are *char* offsets (not bytes), because the one consumer that
+// cares about position is syntax highlighting, whose spans index a
+// `&[char]` (see bishedit::highlight::compose).
+//
+// The tokenizer exists so there is exactly one JSON scanner in this
+// repo: `parse` below is built on it, and so is bishedit::highlight's
+// JsonHighlighter. A highlighter needs positions and must survive
+// nonsense (a buffer mid-keystroke is nearly always invalid JSON),
+// neither of which a value parser wants to carry -- so those two needs
+// meet here, at the token, instead of in two scanners that would
+// disagree about what a string is the first time one of them grew an
+// escape rule the other didn't.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Token {
+    pub kind: TokenKind,
+    pub start: usize,
+    pub end: usize,
+    // A `Str` token's own escape sequences (`\n`, `\uXXXX`, ...) as char
+    // spans into the whole input -- what lets a highlighter mark them
+    // inside the string the way printf's `%s` is marked inside its own
+    // argument. Empty for every other kind, and ignored by `parse`,
+    // which only wants the decoded value.
+    pub escapes: Vec<Range<usize>>,
 }
 
-struct Parser<'a> {
+#[derive(Debug, Clone, PartialEq)]
+pub enum TokenKind {
+    OpenBrace,
+    CloseBrace,
+    OpenBracket,
+    CloseBracket,
+    Comma,
+    Colon,
+    // Already unescaped -- the raw source text is `start..end` if a
+    // caller wants it back.
+    Str(String),
+    Number(f64),
+    Bool(bool),
+    Null,
+    // Whatever couldn't be read as any of the above, carrying the reason
+    // for `parse` to report. Tokenizing never fails: it emits one of
+    // these and keeps going, so a half-typed buffer still tokenizes into
+    // something a highlighter can colour up to (and past) the mistake.
+    Invalid(String),
+}
+
+// Every token in `input`, whitespace dropped. Never fails -- see
+// TokenKind::Invalid.
+pub fn tokens(input: &str) -> Vec<Token> {
+    let mut lexer = Lexer { chars: input.chars().peekable(), pos: 0 };
+    let mut out = Vec::new();
+    while let Some(tok) = lexer.next_token() {
+        out.push(tok);
+    }
+    out
+}
+
+struct Lexer<'a> {
     chars: Peekable<Chars<'a>>,
     pos: usize,
 }
 
-impl<'a> Parser<'a> {
+impl Lexer<'_> {
     fn advance(&mut self) -> Option<char> {
         let c = self.chars.next();
         if c.is_some() {
@@ -63,124 +111,124 @@ impl<'a> Parser<'a> {
         c
     }
 
+    fn eat(&mut self, c: char) -> bool {
+        if self.chars.peek() == Some(&c) {
+            self.advance();
+            return true;
+        }
+        false
+    }
+
+    // JSON itself allows only space/tab/CR/LF between tokens; this
+    // accepts anything char::is_whitespace does, which is what the
+    // hand-rolled parser this replaced already did -- kept deliberately,
+    // since narrowing it would start rejecting input the `json` builtin
+    // has always accepted.
     fn skip_ws(&mut self) {
         while matches!(self.chars.peek(), Some(c) if c.is_whitespace()) {
             self.advance();
         }
     }
 
-    fn expect(&mut self, c: char) -> Result<(), String> {
-        if self.advance() == Some(c) {
-            Ok(())
-        } else {
-            Err(format!("expected '{c}' (position {})", self.pos))
-        }
-    }
-
-    fn parse_value(&mut self) -> Result<Value, String> {
+    fn next_token(&mut self) -> Option<Token> {
         self.skip_ws();
-        match self.chars.peek() {
-            Some('{') => self.parse_object(),
-            Some('[') => self.parse_array(),
-            Some('"') => self.parse_string().map(Value::Str),
-            Some('t') | Some('f') => self.parse_bool(),
-            Some('n') => self.parse_null(),
-            Some(c) if *c == '-' || c.is_ascii_digit() => self.parse_number(),
-            other => Err(format!("unexpected {other:?} (position {})", self.pos)),
-        }
-    }
-
-    fn parse_object(&mut self) -> Result<Value, String> {
-        self.expect('{')?;
-        let mut fields = Vec::new();
-        self.skip_ws();
-        if self.chars.peek() == Some(&'}') {
+        let start = self.pos;
+        let single = |kind| Some(kind);
+        let kind = match *self.chars.peek()? {
+            '{' => single(TokenKind::OpenBrace),
+            '}' => single(TokenKind::CloseBrace),
+            '[' => single(TokenKind::OpenBracket),
+            ']' => single(TokenKind::CloseBracket),
+            ',' => single(TokenKind::Comma),
+            ':' => single(TokenKind::Colon),
+            _ => None,
+        };
+        if let Some(kind) = kind {
             self.advance();
-            return Ok(Value::Object(fields));
+            return Some(Token { kind, start, end: self.pos, escapes: Vec::new() });
         }
-        loop {
-            self.skip_ws();
-            let key = self.parse_string()?;
-            self.skip_ws();
-            self.expect(':')?;
-            let value = self.parse_value()?;
-            fields.push((key, value));
-            self.skip_ws();
-            match self.advance() {
-                Some(',') => continue,
-                Some('}') => break,
-                other => return Err(format!("expected ',' or closing brace in object (got {other:?}, position {})", self.pos)),
+        let mut escapes = Vec::new();
+        let kind = match *self.chars.peek()? {
+            '"' => self.lex_string(&mut escapes),
+            c if c == '-' || c.is_ascii_digit() => self.lex_number(),
+            c if c.is_ascii_alphabetic() => self.lex_word(),
+            c => {
+                self.advance();
+                TokenKind::Invalid(format!("unexpected '{c}'"))
             }
-        }
-        Ok(Value::Object(fields))
+        };
+        Some(Token { kind, start, end: self.pos, escapes })
     }
 
-    fn parse_array(&mut self) -> Result<Value, String> {
-        self.expect('[')?;
-        let mut items = Vec::new();
-        self.skip_ws();
-        if self.chars.peek() == Some(&']') {
-            self.advance();
-            return Ok(Value::Array(items));
-        }
-        loop {
-            items.push(self.parse_value()?);
-            self.skip_ws();
-            match self.advance() {
-                Some(',') => continue,
-                Some(']') => break,
-                other => return Err(format!("expected ',' or ']' in array (got {other:?}, position {})", self.pos)),
-            }
-        }
-        Ok(Value::Array(items))
-    }
-
-    fn parse_string(&mut self) -> Result<String, String> {
-        self.expect('"')?;
+    // An unterminated string stops at the end of its line rather than
+    // swallowing the rest of the input: a raw newline inside a string is
+    // invalid JSON anyway, so this loses nothing -- and it means typing
+    // an opening quote in the editor doesn't briefly restyle every line
+    // below it.
+    fn lex_string(&mut self, escapes: &mut Vec<Range<usize>>) -> TokenKind {
+        self.advance();
         let mut s = String::new();
         loop {
-            match self.advance() {
-                None => return Err("unterminated string".to_string()),
-                Some('"') => break,
-                Some('\\') => match self.advance() {
-                    Some('"') => s.push('"'),
-                    Some('\\') => s.push('\\'),
-                    Some('/') => s.push('/'),
-                    Some('b') => s.push('\u{8}'),
-                    Some('f') => s.push('\u{c}'),
-                    Some('n') => s.push('\n'),
-                    Some('r') => s.push('\r'),
-                    Some('t') => s.push('\t'),
-                    Some('u') => {
-                        let hi = self.parse_hex4()?;
-                        // A surrogate pair (\uD800-\uDBFF followed by
-                        // \uDC00-\uDFFF) encodes one codepoint outside
-                        // the BMP (most commonly an emoji) -- combined
-                        // here rather than left as two lone surrogates,
-                        // which char::from_u32 would reject outright.
-                        if (0xD800..=0xDBFF).contains(&hi) {
-                            if self.advance() != Some('\\') || self.advance() != Some('u') {
-                                return Err("expected a low surrogate after a high surrogate".to_string());
-                            }
-                            let lo = self.parse_hex4()?;
-                            if !(0xDC00..=0xDFFF).contains(&lo) {
-                                return Err("invalid low surrogate".to_string());
-                            }
-                            let c = 0x10000 + ((hi - 0xD800) << 10) + (lo - 0xDC00);
-                            s.push(char::from_u32(c).ok_or_else(|| "invalid surrogate pair".to_string())?);
-                        } else {
-                            s.push(char::from_u32(hi).ok_or_else(|| "invalid \\u escape".to_string())?);
+            match self.chars.peek() {
+                None | Some('\n') => return TokenKind::Invalid("unterminated string".to_string()),
+                Some('"') => {
+                    self.advance();
+                    return TokenKind::Str(s);
+                }
+                Some('\\') => {
+                    let esc_start = self.pos;
+                    self.advance();
+                    match self.escape_char() {
+                        Ok(c) => {
+                            s.push(c);
+                            escapes.push(esc_start..self.pos);
                         }
+                        Err(e) => return TokenKind::Invalid(e),
                     }
-                    other => return Err(format!("invalid escape {other:?} (position {})", self.pos)),
-                },
-                Some(c) => s.push(c),
+                }
+                Some(_) => s.push(self.advance().unwrap()),
             }
         }
-        Ok(s)
     }
 
-    fn parse_hex4(&mut self) -> Result<u32, String> {
+    // Everything after a backslash inside a string.
+    fn escape_char(&mut self) -> Result<char, String> {
+        match self.advance() {
+            Some('"') => Ok('"'),
+            Some('\\') => Ok('\\'),
+            Some('/') => Ok('/'),
+            Some('b') => Ok('\u{8}'),
+            Some('f') => Ok('\u{c}'),
+            Some('n') => Ok('\n'),
+            Some('r') => Ok('\r'),
+            Some('t') => Ok('\t'),
+            Some('u') => {
+                let hi = self.hex4()?;
+                // A surrogate pair (\uD800-\uDBFF followed by
+                // \uDC00-\uDFFF) encodes one codepoint outside the BMP
+                // (most commonly an emoji) -- combined here rather than
+                // left as two lone surrogates, which char::from_u32
+                // would reject outright.
+                if (0xD800..=0xDBFF).contains(&hi) {
+                    if !self.eat('\\') || !self.eat('u') {
+                        return Err("expected a low surrogate after a high surrogate".to_string());
+                    }
+                    let lo = self.hex4()?;
+                    if !(0xDC00..=0xDFFF).contains(&lo) {
+                        return Err("invalid low surrogate".to_string());
+                    }
+                    let c = 0x10000 + ((hi - 0xD800) << 10) + (lo - 0xDC00);
+                    char::from_u32(c).ok_or_else(|| "invalid surrogate pair".to_string())
+                } else {
+                    char::from_u32(hi).ok_or_else(|| "invalid \\u escape".to_string())
+                }
+            }
+            None => Err("unterminated string".to_string()),
+            Some(c) => Err(format!("invalid escape '\\{c}'")),
+        }
+    }
+
+    fn hex4(&mut self) -> Result<u32, String> {
         let mut v = 0u32;
         for _ in 0..4 {
             let c = self.advance().ok_or_else(|| "unterminated \\u escape".to_string())?;
@@ -190,58 +238,170 @@ impl<'a> Parser<'a> {
         Ok(v)
     }
 
-    fn parse_bool(&mut self) -> Result<Value, String> {
-        if self.take_literal("true") {
-            Ok(Value::Bool(true))
-        } else if self.take_literal("false") {
-            Ok(Value::Bool(false))
-        } else {
-            Err(format!("invalid literal (position {})", self.pos))
-        }
-    }
-
-    fn parse_null(&mut self) -> Result<Value, String> {
-        if self.take_literal("null") {
-            Ok(Value::Null)
-        } else {
-            Err(format!("invalid literal (position {})", self.pos))
-        }
-    }
-
-    fn take_literal(&mut self, lit: &str) -> bool {
-        for expected in lit.chars() {
-            if self.chars.peek() != Some(&expected) {
-                return false;
-            }
-            self.advance();
-        }
-        true
-    }
-
-    fn parse_number(&mut self) -> Result<Value, String> {
+    // Deliberately more permissive than JSON's own number grammar (which
+    // rejects a leading zero, a bare `-`, and `.5`): this scans the
+    // characters a number is made of and lets f64's own parse be the
+    // judge, which is what the parser this replaced did too. Tightening
+    // it would start rejecting input the `json` builtin has accepted all
+    // along, for no benefit to anything that reads JSON rather than
+    // certifying it.
+    fn lex_number(&mut self) -> TokenKind {
         let mut raw = String::new();
         if self.chars.peek() == Some(&'-') {
             raw.push(self.advance().unwrap());
         }
-        while matches!(self.chars.peek(), Some(c) if c.is_ascii_digit()) {
-            raw.push(self.advance().unwrap());
-        }
+        let digits = |lexer: &mut Self, raw: &mut String| {
+            while matches!(lexer.chars.peek(), Some(c) if c.is_ascii_digit()) {
+                raw.push(lexer.advance().unwrap());
+            }
+        };
+        digits(self, &mut raw);
         if self.chars.peek() == Some(&'.') {
             raw.push(self.advance().unwrap());
-            while matches!(self.chars.peek(), Some(c) if c.is_ascii_digit()) {
-                raw.push(self.advance().unwrap());
-            }
+            digits(self, &mut raw);
         }
         if matches!(self.chars.peek(), Some('e') | Some('E')) {
             raw.push(self.advance().unwrap());
             if matches!(self.chars.peek(), Some('+') | Some('-')) {
                 raw.push(self.advance().unwrap());
             }
-            while matches!(self.chars.peek(), Some(c) if c.is_ascii_digit()) {
-                raw.push(self.advance().unwrap());
+            digits(self, &mut raw);
+        }
+        match raw.parse::<f64>() {
+            Ok(n) => TokenKind::Number(n),
+            Err(_) => TokenKind::Invalid(format!("invalid number '{raw}'")),
+        }
+    }
+
+    // A bare alphabetic run: one of the three JSON literals, or a word
+    // that only looks like one. Taken whole (rather than character by
+    // character against each literal in turn) so `tru` reports itself as
+    // one wrong word instead of decaying into a pile of stray-character
+    // errors -- and so a highlighter has one span to leave alone.
+    fn lex_word(&mut self) -> TokenKind {
+        let mut word = String::new();
+        while matches!(self.chars.peek(), Some(c) if c.is_ascii_alphabetic()) {
+            word.push(self.advance().unwrap());
+        }
+        match word.as_str() {
+            "true" => TokenKind::Bool(true),
+            "false" => TokenKind::Bool(false),
+            "null" => TokenKind::Null,
+            _ => TokenKind::Invalid(format!("invalid literal '{word}'")),
+        }
+    }
+}
+
+pub fn parse(input: &str) -> Result<Value, String> {
+    let mut p = Parser { toks: tokens(input).into_iter().peekable() };
+    let v = p.parse_value()?;
+    match p.toks.next() {
+        None => Ok(v),
+        Some(t) => Err(format!("trailing data after the JSON value (position {})", t.start)),
+    }
+}
+
+struct Parser {
+    toks: Peekable<std::vec::IntoIter<Token>>,
+}
+
+impl Parser {
+    fn next_token(&mut self) -> Result<Token, String> {
+        self.toks.next().ok_or_else(|| "unexpected end of input".to_string())
+    }
+
+    fn parse_value(&mut self) -> Result<Value, String> {
+        let tok = self.next_token()?;
+        let at = tok.start;
+        match tok.kind {
+            TokenKind::OpenBrace => self.parse_object(),
+            TokenKind::OpenBracket => self.parse_array(),
+            TokenKind::Str(s) => Ok(Value::Str(s)),
+            TokenKind::Number(n) => Ok(Value::Number(n)),
+            TokenKind::Bool(b) => Ok(Value::Bool(b)),
+            TokenKind::Null => Ok(Value::Null),
+            TokenKind::Invalid(reason) => Err(format!("{reason} (position {at})")),
+            other => Err(format!("unexpected {} (position {at})", describe(&other))),
+        }
+    }
+
+    // The open brace is already consumed.
+    fn parse_object(&mut self) -> Result<Value, String> {
+        let mut fields = Vec::new();
+        if matches!(self.toks.peek(), Some(t) if t.kind == TokenKind::CloseBrace) {
+            self.toks.next();
+            return Ok(Value::Object(fields));
+        }
+        loop {
+            let tok = self.next_token()?;
+            let at = tok.start;
+            let TokenKind::Str(key) = tok.kind else {
+                return Err(format!("expected a string key in object (got {}, position {at})", describe(&tok.kind)));
+            };
+            let colon = self.next_token()?;
+            if colon.kind != TokenKind::Colon {
+                return Err(format!(
+                    "expected ':' after an object key (got {}, position {})",
+                    describe(&colon.kind),
+                    colon.start
+                ));
+            }
+            fields.push((key, self.parse_value()?));
+            let tok = self.next_token()?;
+            match tok.kind {
+                TokenKind::Comma => continue,
+                TokenKind::CloseBrace => break,
+                other => {
+                    return Err(format!(
+                        "expected ',' or closing brace in object (got {}, position {})",
+                        describe(&other),
+                        tok.start
+                    ))
+                }
             }
         }
-        raw.parse::<f64>().map(Value::Number).map_err(|_| format!("invalid number '{raw}' (position {})", self.pos))
+        Ok(Value::Object(fields))
+    }
+
+    // The open bracket is already consumed.
+    fn parse_array(&mut self) -> Result<Value, String> {
+        let mut items = Vec::new();
+        if matches!(self.toks.peek(), Some(t) if t.kind == TokenKind::CloseBracket) {
+            self.toks.next();
+            return Ok(Value::Array(items));
+        }
+        loop {
+            items.push(self.parse_value()?);
+            let tok = self.next_token()?;
+            match tok.kind {
+                TokenKind::Comma => continue,
+                TokenKind::CloseBracket => break,
+                other => {
+                    return Err(format!("expected ',' or ']' in array (got {}, position {})", describe(&other), tok.start))
+                }
+            }
+        }
+        Ok(Value::Array(items))
+    }
+}
+
+// How a token reads inside a parse error -- the source spelling for
+// punctuation, a word for anything with a value in it, since printing an
+// entire nested string or number back at the reader says less about what
+// went wrong than "a string" does.
+fn describe(kind: &TokenKind) -> &'static str {
+    match kind {
+        TokenKind::OpenBrace => "'{'",
+        TokenKind::CloseBrace => "'}'",
+        TokenKind::OpenBracket => "'['",
+        TokenKind::CloseBracket => "']'",
+        TokenKind::Comma => "','",
+        TokenKind::Colon => "':'",
+        TokenKind::Str(_) => "a string",
+        TokenKind::Number(_) => "a number",
+        TokenKind::Bool(_) => "a boolean",
+        TokenKind::Null => "null",
+        TokenKind::Invalid(_) => "invalid input",
     }
 }
 
@@ -406,6 +566,75 @@ fn field<'a>(v: &'a Value, key: &str) -> &'a Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn kinds(input: &str) -> Vec<TokenKind> {
+        tokens(input).into_iter().map(|t| t.kind).collect()
+    }
+
+    // Char offsets, not bytes -- the é is two bytes and one column, and
+    // a highlighter that got this wrong would paint everything after it
+    // one position off.
+    #[test]
+    fn token_spans_are_char_offsets_covering_each_token_exactly() {
+        let toks = tokens(r#"{"é": 12}"#);
+        let spans: Vec<(usize, usize)> = toks.iter().map(|t| (t.start, t.end)).collect();
+        assert_eq!(spans, vec![(0, 1), (1, 4), (4, 5), (6, 8), (8, 9)]);
+    }
+
+    #[test]
+    fn tokenizes_every_kind_and_drops_whitespace() {
+        assert_eq!(
+            kinds("{ \"a\" : [ 1, true , null ] }"),
+            vec![
+                TokenKind::OpenBrace,
+                TokenKind::Str("a".to_string()),
+                TokenKind::Colon,
+                TokenKind::OpenBracket,
+                TokenKind::Number(1.0),
+                TokenKind::Comma,
+                TokenKind::Bool(true),
+                TokenKind::Comma,
+                TokenKind::Null,
+                TokenKind::CloseBracket,
+                TokenKind::CloseBrace,
+            ]
+        );
+    }
+
+    // The property the highlighter depends on and the parser doesn't:
+    // tokenizing never gives up, so everything after a mistake is still
+    // read as itself rather than lost.
+    #[test]
+    fn tokenizing_recovers_after_invalid_input_instead_of_stopping() {
+        let toks = kinds("[tru, 1]");
+        assert_eq!(toks[0], TokenKind::OpenBracket);
+        assert!(matches!(toks[1], TokenKind::Invalid(_)), "{:?}", toks[1]);
+        assert_eq!(toks[2..], [TokenKind::Comma, TokenKind::Number(1.0), TokenKind::CloseBracket]);
+    }
+
+    // An open quote must not swallow the rest of the buffer: a raw
+    // newline can't appear in a JSON string anyway, so ending the bad
+    // token at the line break costs nothing and keeps every line below
+    // it highlighted as itself while it's being typed.
+    #[test]
+    fn an_unterminated_string_ends_at_its_own_line() {
+        let toks = tokens("{\"a\n\"b\": 1}");
+        assert!(matches!(toks[1].kind, TokenKind::Invalid(_)), "{:?}", toks[1].kind);
+        assert_eq!(toks[1].end, 3, "stops before the newline");
+        assert_eq!(toks[2].kind, TokenKind::Str("b".to_string()));
+    }
+
+    #[test]
+    fn string_escapes_are_recorded_as_their_own_spans() {
+        let toks = tokens(r#""a\nb\u00e9""#);
+        assert_eq!(toks[0].kind, TokenKind::Str("a\nbé".to_string()));
+        assert_eq!(toks[0].escapes, vec![2..4, 5..11]);
+    }
+
+    #[test]
+    fn a_token_with_no_escapes_carries_none() {
+        assert!(tokens(r#"{"a": 1}"#).iter().all(|t| t.escapes.is_empty()));
+    }
 
     #[test]
     fn parses_every_scalar_kind() {

@@ -10424,6 +10424,7 @@ const KNOWN_BISHOPTS: &[(&str, BishOptDefault)] = &[
     ("syn_col_number", BishOptDefault::Color("-bish-cyan")),
     ("syn_col_format_specifier", BishOptDefault::Color("-bish-red")),
     ("syn_col_invalid_command", BishOptDefault::Color("-bish-red")),
+    ("syn_col_key", BishOptDefault::Color("-bish-cyan")),
 ];
 
 // Best-effort terminal color-capability detection via the same
