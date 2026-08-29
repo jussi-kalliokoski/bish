@@ -150,6 +150,21 @@ impl MouseEvent {
         self.pressed && self.button & 0x60 == 0 && self.button & 0x03 == 0
     }
 
+    // Motion reported while the left button is held (bit 5) -- what a
+    // drag is made of. Terminals only send these at all once "any-event"
+    // tracking is on (DECSET 1002, part of MOUSE_REPORTING_ENABLE), and
+    // they arrive as a stream between the press and the release.
+    pub fn is_left_drag(&self) -> bool {
+        self.pressed && self.button & 0x40 == 0 && self.button & 0x20 != 0 && self.button & 0x03 == 0
+    }
+
+    // Any button release. The final byte is what distinguishes it, not
+    // the button bits -- xterm reports which button was let go, but
+    // nothing here needs to know.
+    pub fn is_release(&self) -> bool {
+        !self.pressed
+    }
+
     // xterm's SGR mouse protocol encodes a wheel notch as button 4 (up) or
     // 5 (down) -- bit 6 set (the same bit that also marks buttons 6/7,
     // which this codebase has no use for and doesn't distinguish), plus

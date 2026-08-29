@@ -5889,7 +5889,46 @@ fn run_normal_mode_navigation(
                         compositor_redraw(sessions, windows, *current_window, *term_rows, *term_cols);
                         return Ok((NavExit::Detached, nav_buffer_into_edit_state(buf, vk)));
                     }
+                    // A click inside the pane that already has focus:
+                    // put the cursor where it landed, and arm a Visual
+                    // selection anchored there so a drag out of it
+                    // selects. A press that turns out to be a plain
+                    // click disarms it again on release (below), so
+                    // clicking somewhere doesn't leave an empty
+                    // selection behind for Escape to clear.
+                    Some(ClickTarget::Pane(_)) => {
+                        let row0 = (ev.row as usize).saturating_sub(1);
+                        let col0 = (ev.col as usize).saturating_sub(1);
+                        if place_nav_cursor_at(&mut buf, rect, row0, col0) {
+                            buf.selections_mut().clear();
+                            vk.end_visual(buf.cursor());
+                            vk.begin_visual(RegisterShape::Char, buf.cursor());
+                        }
+                    }
                     _ => {}
+                }
+            } else if ev.is_left_drag() {
+                // Dragging just moves the cursor -- the Visual selection
+                // armed by the press is anchored where it started, so it
+                // grows and shrinks on its own with no separate
+                // selection bookkeeping here at all.
+                let row0 = (ev.row as usize).saturating_sub(1);
+                let col0 = (ev.col as usize).saturating_sub(1);
+                if vk.is_visual() {
+                    place_nav_cursor_at(&mut buf, rect, row0, col0);
+                    let content_cols = nav_content_cols(&buf, rect);
+                    scroll_to_show_cursor(&mut buf, content_cols);
+                }
+            } else if ev.is_release() {
+                // A press with no drag after it: the anchor is still
+                // exactly where the cursor is, so there's nothing
+                // selected and the armed Visual mode should just go
+                // away. A real drag leaves its selection standing, ready
+                // for `y`/`d`/`c` like any other.
+                if let Some((_, anchor)) = vk.visual_anchor()
+                    && anchor == buf.cursor()
+                {
+                    vk.end_visual(buf.cursor());
                 }
             } else if ev.is_scroll_down() || ev.is_scroll_up() {
                 let motion = if ev.is_scroll_down() { motion::Motion::ScrollLineDown } else { motion::Motion::ScrollLineUp };
@@ -6653,6 +6692,42 @@ fn tab_bar_regions(snapshot: &[(u32, bool, String)]) -> Vec<(u32, usize, usize)>
 enum ClickTarget {
     Window(usize),
     Pane(PaneId),
+}
+
+// `fileeditor::position_at_screen`'s counterpart for a `ScreenBuffer` --
+// simpler because a read-only pane has neither a gutter nor horizontal
+// scrolling (see Buffer::viewport_left's own doc comment), so a column
+// maps straight through. Mirrors render_normal_mode_frame's own
+// placement exactly, the same way that one mirrors build_editor_frame's.
+fn screen_position_at(buf: &ScreenBuffer, rect: Rect, row0: usize, col0: usize) -> Option<(usize, usize)> {
+    if row0 < rect.row || col0 < rect.col || col0 >= rect.col + rect.cols {
+        return None;
+    }
+    let row = row0 - rect.row;
+    if row >= normal_mode_content_rows(rect) {
+        return None;
+    }
+    let line = buf.viewport_top() + row;
+    if line >= buf.line_count() {
+        return None;
+    }
+    Some((line, (col0 - rect.col).min(buf.line_len(line).saturating_sub(1))))
+}
+
+// Where a click inside the focused pane puts the cursor, for whichever
+// kind of buffer normal mode is driving. `true` when it actually moved.
+fn place_nav_cursor_at(buf: &mut NavBuffer, rect: Rect, row0: usize, col0: usize) -> bool {
+    let pos = match buf {
+        NavBuffer::ReadOnly(sb) => screen_position_at(sb, rect, row0, col0),
+        NavBuffer::Editable(tb) => fileeditor::position_at_screen(tb, rect, row0, col0),
+    };
+    match pos {
+        Some((line, col)) => {
+            buf.set_cursor(line, col);
+            true
+        }
+        None => false,
+    }
 }
 
 // Hit-tests a click's screen coordinates against the tab bar (if any),

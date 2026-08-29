@@ -180,6 +180,41 @@ pub(crate) fn scroll_to_show_cursor(buf: &mut TextBuffer, content_cols: usize) {
 // to_show_cursor's callers (run_insert_mode, and repl.rs's own copy for
 // NavBuffer navigation) can compute the same width without duplicating
 // the gutter-clamping arithmetic.
+// The buffer position a click at real terminal row/column `row0`/`col0`
+// (both 0-indexed) lands on, for a buffer drawn into `rect` -- the exact
+// inverse of build_editor_frame's own placement, so the two can't
+// disagree about which character is under the pointer: same gutter
+// width, same `viewport_top`/`viewport_left`, same `char_at_col`
+// translation from a display column to a char index (they differ the
+// moment a line holds anything wide).
+//
+// `None` for a click outside `rect` or below the last row that holds
+// content. A click in the gutter, or past the end of a line, resolves to
+// the nearest real position on that line rather than nothing -- which is
+// what every editor does, and what makes clicking in the rough vicinity
+// of a line feel like it worked.
+pub(crate) fn position_at_screen(buf: &TextBuffer, rect: Rect, row0: usize, col0: usize) -> Option<(usize, usize)> {
+    if row0 < rect.row || col0 < rect.col || col0 >= rect.col + rect.cols {
+        return None;
+    }
+    let row = row0 - rect.row;
+    if row >= editor_content_rows(rect) {
+        return None;
+    }
+    let line = buf.viewport_top() + row;
+    if line >= buf.line_count() {
+        return None;
+    }
+    let gutter = total_gutter_width(buf).min(rect.cols.saturating_sub(1));
+    let x = (col0 - rect.col).saturating_sub(gutter);
+    let chars = buf.line_chars(line);
+    // Normal mode's cursor can never sit past a line's last character
+    // (see run_insert_mode's own exit clamp for the same rule), so an
+    // overshooting click lands on it instead.
+    let col = char_at_col(&chars, buf.viewport_left() + x).min(chars.len().saturating_sub(1));
+    Some((line, col))
+}
+
 pub(crate) fn editor_content_cols(buf: &TextBuffer, rect: Rect) -> usize {
     let gutter_width = total_gutter_width(buf).min(rect.cols.saturating_sub(1));
     rect.cols - gutter_width
@@ -2303,6 +2338,95 @@ pub fn render_editor_frame(buf: &TextBuffer, vk: &VimKeys, mode: EditorMode, rec
 pub fn freeze_editor_frame(screen: &Rc<RefCell<vt100::Screen>>, buf: &TextBuffer, vk: &VimKeys, rect: Rect, color_overrides: Option<&highlight::ColorOverrides>) {
     let framed = build_editor_frame(buf, vk, EditorMode::Normal, rect, 0, 0, color_overrides);
     screen.borrow_mut().feed(framed.as_bytes());
+}
+
+#[cfg(test)]
+mod click_position_tests {
+    use super::*;
+
+    fn rect() -> Rect {
+        Rect { row: 2, col: 10, rows: 8, cols: 40 }
+    }
+
+    fn buf(text: &str) -> TextBuffer {
+        let mut b = TextBuffer::new_unnamed(8);
+        b.insert_text((0, 0), text);
+        b.set_cursor(0, 0);
+        b
+    }
+
+    // The gutter build_editor_frame draws for this buffer, which every
+    // expectation below has to agree with -- read from the same place
+    // rather than hardcoded, so a new gutter column can't quietly make
+    // these tests describe a layout that no longer exists.
+    fn gutter(b: &TextBuffer) -> usize {
+        total_gutter_width(b).min(rect().cols - 1)
+    }
+
+    #[test]
+    fn a_click_lands_on_the_character_under_it() {
+        let b = buf("alpha
+bravo
+charlie");
+        let g = gutter(&b);
+        // Third row of the pane, fourth character of that line.
+        assert_eq!(position_at_screen(&b, rect(), 2 + 2, 10 + g + 3), Some((2, 3)));
+    }
+
+    #[test]
+    fn a_click_outside_the_pane_is_not_this_panes_business() {
+        let b = buf("alpha
+bravo");
+        assert_eq!(position_at_screen(&b, rect(), 1, 15), None, "above");
+        assert_eq!(position_at_screen(&b, rect(), 2, 9), None, "left");
+        assert_eq!(position_at_screen(&b, rect(), 2, 50), None, "right");
+        assert_eq!(position_at_screen(&b, rect(), 2 + 8, 15), None, "below");
+    }
+
+    #[test]
+    fn a_click_below_the_last_line_hits_nothing() {
+        let b = buf("only one line");
+        assert_eq!(position_at_screen(&b, rect(), 2 + 3, 15), None);
+    }
+
+    #[test]
+    fn a_click_in_the_gutter_or_past_the_end_snaps_to_the_line() {
+        let b = buf("alpha
+bravo");
+        let g = gutter(&b);
+        assert_eq!(position_at_screen(&b, rect(), 2 + 1, 10), Some((1, 0)), "in the gutter -> line start");
+        // Well past "bravo"'s own five characters -> its last one.
+        assert_eq!(position_at_screen(&b, rect(), 2 + 1, 10 + g + 30), Some((1, 4)));
+    }
+
+    #[test]
+    fn a_click_follows_the_viewport_rather_than_the_top_of_the_buffer() {
+        let mut b = buf("a
+b
+c
+d
+e
+f
+g
+h
+i
+j");
+        b.set_viewport_top(4);
+        let g = gutter(&b);
+        assert_eq!(position_at_screen(&b, rect(), 2, 10 + g), Some((4, 0)), "the pane's first row is viewport_top");
+        assert_eq!(position_at_screen(&b, rect(), 2 + 2, 10 + g), Some((6, 0)));
+    }
+
+    #[test]
+    fn a_click_past_a_wide_character_counts_columns_not_chars() {
+        // Two double-width chars then ASCII: display column 4 is the
+        // *third* char, which is exactly the distinction char_at_col
+        // exists for -- a naive col-minus-gutter would say char 4.
+        let b = buf("你好ab");
+        let g = gutter(&b);
+        assert_eq!(position_at_screen(&b, rect(), 2, 10 + g + 4), Some((0, 2)));
+        assert_eq!(position_at_screen(&b, rect(), 2, 10 + g + 2), Some((0, 1)));
+    }
 }
 
 #[cfg(test)]
