@@ -107,203 +107,248 @@ fn fetch_and_store(command: String) {
     );
 }
 
-// Spawns `man <command>`, checking the real exit status (not just
-// "stdout was empty") since a missing man page prints its complaint to
-// stderr and produces nothing on stdout either way -- status is the only
-// reliable signal. MANWIDTH is set wide so flag/description lines don't
-// wrap mid-line, which would otherwise confuse the line-based parsers
-// below (a wrapped continuation line looks identical to an unrelated
-// prose line with no way to tell them apart here).
+// Finds and parses the page itself -- no `man` subprocess, no groff.
+// This used to spawn `man` and scan its *rendered* output, which cost
+// roughly 250ms per lookup and meant recovering structure by measuring
+// indentation. Now the page's own source is read (gunzipped with
+// crate::archive if it needs it) and run through crate::roff, so a
+// flag and its description are paired because the page's own `.TP`
+// paired them, not because they happened to line up in a column.
 fn fetch_and_parse(command: &str) -> Option<ManPageData> {
-    let output = std::process::Command::new("man").env("MANWIDTH", "1000").arg(command).output().ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let text = String::from_utf8_lossy(&output.stdout);
-    let text = strip_overstrike(&text);
-    let flags = parse_flags(&text);
-    let subcommands = parse_subcommands(&text, command);
-    let name_section = parse_name_section(&text);
-    let flag_descriptions = parse_flag_descriptions(&text);
-    Some(ManPageData { flags, subcommands, name_section, flag_descriptions })
+    let source = read_page(&find_page(command)?)?;
+    Some(extract(&crate::roff::parse(&source), command))
 }
 
-// The first non-blank line after a bare "NAME" section header, trimmed --
-// real man pages format this section as one line (e.g. "ls - list
-// directory contents"). A page with no such section (or an unusually
-// multi-line one, not attempted here) yields `None` rather than a guess.
-fn parse_name_section(text: &str) -> Option<String> {
-    let mut lines = text.lines();
-    while let Some(line) = lines.next() {
-        if line.trim() != "NAME" {
-            continue;
-        }
-        for candidate in lines.by_ref() {
-            let trimmed = candidate.trim();
-            if !trimmed.is_empty() {
-                return Some(trimmed.to_string());
+// Where man pages live: `$MANPATH` when it is set, otherwise the
+// conventional roots. No `manpath` subprocess and no config file parsing
+// -- the point of this change is to stop shelling out.
+fn man_roots() -> Vec<std::path::PathBuf> {
+    if let Ok(path) = std::env::var("MANPATH")
+        && !path.trim().is_empty()
+    {
+        return path.split(':').filter(|p| !p.is_empty()).map(std::path::PathBuf::from).collect();
+    }
+    ["/usr/share/man", "/usr/local/share/man", "/usr/local/man", "/usr/man"]
+        .iter()
+        .map(std::path::PathBuf::from)
+        .collect()
+}
+
+// Sections in the order a user means them: a bare name is a command
+// first, an admin command next, and only then the library and file
+// formats -- the same precedence `man` itself uses.
+const SECTION_ORDER: [&str; 8] = ["1", "8", "6", "5", "7", "3", "2", "4"];
+
+fn find_page(command: &str) -> Option<std::path::PathBuf> {
+    // A command with a slash or a leading dash is not a page name, and
+    // must never be turned into one.
+    if command.is_empty() || command.contains('/') || command.starts_with('-') || command.contains("..") {
+        return None;
+    }
+    let roots = man_roots();
+    for section in SECTION_ORDER {
+        for root in &roots {
+            let dir = root.join(format!("man{section}"));
+            for name in [format!("{command}.{section}"), format!("{command}.{section}.gz")] {
+                let path = dir.join(&name);
+                if path.is_file() {
+                    return Some(path);
+                }
+            }
+            // Pages with a suffixed section (`perl.1p`, `foo.3ssl`) need
+            // a scan, which only runs when the direct paths missed.
+            if let Ok(entries) = std::fs::read_dir(&dir) {
+                let prefix = format!("{command}.{section}");
+                for entry in entries.flatten() {
+                    let file = entry.file_name();
+                    let file = file.to_string_lossy();
+                    if file.starts_with(&prefix) {
+                        return Some(entry.path());
+                    }
+                }
             }
         }
-        return None;
     }
     None
 }
 
-// Defensive pass for `X\x08X`-style backspace-overstrike sequences some
-// `man`/pager/groff configurations emit for bold/underline when not
-// attached to a TTY (bold: the same char repeated around a backspace,
-// e.g. "b\x08bo\x08o"; underline: an underscore before the backspace,
-// e.g. "_\x08t"). This WSL environment's own `man` doesn't produce these
-// (piped output measured clean), but that's environment-specific --
-// stripping unconditionally is a no-op when there's nothing to strip, and
-// correct when there is, without depending on the external `col` utility.
-fn strip_overstrike(s: &str) -> String {
-    let chars: Vec<char> = s.chars().collect();
-    let mut out = String::with_capacity(chars.len());
-    let mut i = 0;
-    while i < chars.len() {
-        if i + 2 < chars.len() && chars[i + 1] == '\u{8}' {
-            // "X\x08Y" -- keep Y (the char actually meant to display;
-            // for bold X==Y, for underline Y is the real char and X is
-            // the '_' overstrike mark), drop the backspace and X.
-            out.push(chars[i + 2]);
-            i += 3;
-        } else {
-            out.push(chars[i]);
-            i += 1;
+// The page's text, gunzipped when it needs it, following the one-line
+// `.so` redirect a page like `bunzip2.1` is (its whole content is
+// `.so man1/bzip2.1`). Followed once: a redirect to a redirect is not a
+// thing real pages do, and refusing to loop matters more than serving
+// one that did.
+fn read_page(path: &std::path::Path) -> Option<String> {
+    let text = read_text(path)?;
+    let redirect = text.lines().find(|l| !l.trim().is_empty() && !l.starts_with(".\\\""))?;
+    let Some(target) = redirect.trim().strip_prefix(".so ") else { return Some(text) };
+    let target = target.trim();
+    if target.is_empty() || target.contains("..") || target.starts_with('/') {
+        return Some(text);
+    }
+    for root in man_roots() {
+        let candidate = root.join(target);
+        for path in [candidate.clone(), candidate.with_extension("gz")] {
+            if path.is_file()
+                && let Some(followed) = read_text(&path)
+            {
+                return Some(followed);
+            }
         }
     }
-    out
+    Some(text)
 }
 
-// Line-oriented flag scanner. Real man pages consistently indent flag
-// entries at a shallow, fixed column (both the ls-style "-a, --all" and
-// git-style "-C <path>" samples this was grounded against sit around
-// column 7) with their description indented further or on a later line --
-// so "starts with '-' after trimming, and the ORIGINAL line's indent is
-// shallow" is a good proxy for "this is a flag line" without needing to
-// track section context. Multiple spellings on one line ("-a, --all") are
-// comma-separated.
-fn parse_flags(text: &str) -> Vec<String> {
+fn read_text(path: &std::path::Path) -> Option<String> {
+    if path.extension().is_some_and(|e| e == "gz") {
+        let (_, bytes) = crate::archive::gunzip(path).ok()?;
+        return Some(String::from_utf8_lossy(&bytes).into_owned());
+    }
+    std::fs::read_to_string(path).ok()
+}
+
+// Everything this module wants out of a parsed page. Public so the
+// tests can drive it from roff source directly, which is what these
+// pages actually are.
+pub(crate) fn extract(doc: &crate::roff::Document, command: &str) -> ManPageData {
+    let mut tags = Vec::new();
+    collect_tagged(&doc.blocks, &mut tags);
+
     let mut flags = Vec::new();
-    for line in text.lines() {
-        let trimmed = line.trim_start();
-        if !trimmed.starts_with('-') {
-            continue;
-        }
-        let indent = line.len() - trimmed.len();
-        if indent > 8 {
-            continue;
-        }
-        for piece in trimmed.split(',') {
-            if let Some(flag) = extract_flag_token(piece.trim()) {
-                flags.push(flag);
+    let mut flag_descriptions = HashMap::new();
+    for (tag, body) in &tags {
+        // `-a, --all` and `-b [WHEN]` alike: split the tag into pieces
+        // and keep the ones that are really flags.
+        for piece in tag.split([',', '|']) {
+            let Some(token) = extract_flag_token(piece.trim()) else { continue };
+            if !flags.contains(&token) {
+                flags.push(token.clone());
+            }
+            if !body.trim().is_empty() {
+                flag_descriptions.entry(token).or_insert_with(|| body.trim().to_string());
             }
         }
     }
     flags.sort();
     flags.dedup();
-    flags
+
+    let subcommands = collect_subcommands(doc, &tags, command);
+    let name_section = name_line(doc);
+    ManPageData { flags, subcommands, name_section, flag_descriptions }
 }
 
-// Same flag-line recognition as parse_flags, but keeping each flag's own
-// description instead of discarding it -- `K`-hover's own "what does
-// this specific flag do" (docs.rs). Real man pages split roughly two
-// ways: ls-style, with a short description trailing on the *same* line
-// past the flag list ("-c     with -lt: sort by, ..."), and git-style,
-// with the description on the following, *more*-indented line(s) until
-// either a blank line or a line back at the flag's own (shallow) indent
-// -- this handles both by taking whatever's left on the flag line
-// itself after its comma-separated flag list, then appending every
-// following more-indented line, joined with spaces into one flat
-// summary (not preserving the man page's own line breaks -- fine for a
-// short hover popup). First occurrence wins if the same flag spelling
-// somehow shows up more than once on a page.
-fn parse_flag_descriptions(text: &str) -> HashMap<String, String> {
-    let mut descriptions: HashMap<String, String> = HashMap::new();
-    let lines: Vec<&str> = text.lines().collect();
-    let mut i = 0;
-    while i < lines.len() {
-        let line = lines[i];
-        let trimmed = line.trim_start();
-        let indent = line.len() - trimmed.len();
-        if !trimmed.starts_with('-') || indent > 8 {
-            i += 1;
-            continue;
-        }
-        let mut flags_here = Vec::new();
-        let mut consumed = 0usize;
-        for piece in trimmed.split(',') {
-            match extract_flag_token(piece.trim()) {
-                Some(flag) => {
-                    flags_here.push(flag);
-                    consumed += piece.len() + 1; // +1 for the comma this was split on
-                }
-                None => break,
+// Every tagged paragraph in the page, at any depth, as (tag, body text).
+fn collect_tagged(blocks: &[crate::roff::Block], out: &mut Vec<(String, String)>) {
+    use crate::roff::Block;
+    for block in blocks {
+        match block {
+            Block::Tagged { tag, blocks, .. } => {
+                let mut body = String::new();
+                collect_text(blocks, &mut body);
+                out.push((crate::roff::text_of(tag), body));
+                collect_tagged(blocks, out);
             }
+            Block::Indented { blocks, .. } => collect_tagged(blocks, out),
+            _ => {}
         }
-        if flags_here.is_empty() {
-            i += 1;
-            continue;
-        }
-        let mut desc_parts: Vec<String> = Vec::new();
-        let inline = trimmed.get(consumed.min(trimmed.len())..).unwrap_or("").trim();
-        if !inline.is_empty() {
-            desc_parts.push(inline.to_string());
-        }
-        let mut j = i + 1;
-        while j < lines.len() {
-            let candidate = lines[j];
-            if candidate.trim().is_empty() {
-                break;
-            }
-            let candidate_trimmed = candidate.trim_start();
-            let candidate_indent = candidate.len() - candidate_trimmed.len();
-            // Stop at another recognized flag line -- the exact same
-            // "starts with '-', shallow indent" shape this function's
-            // own outer loop (and parse_flags) uses to recognize one in
-            // the first place, rather than comparing indent to *this*
-            // entry's own first line: that line can legitimately have a
-            // shallower indent than its own continuation/description
-            // lines expect if it's the very first line of the page
-            // text (no leading blank line for indentation to measure
-            // against) -- comparing against a fixed absolute threshold
-            // instead sidesteps that entirely.
-            if candidate_trimmed.starts_with('-') && candidate_indent <= 8 {
-                break;
-            }
-            desc_parts.push(candidate_trimmed.trim().to_string());
-            j += 1;
-        }
-        if !desc_parts.is_empty() {
-            let desc = desc_parts.join(" ");
-            for flag in &flags_here {
-                descriptions.entry(flag.clone()).or_insert_with(|| desc.clone());
-            }
-        }
-        i = j.max(i + 1);
     }
-    descriptions
 }
 
-// `K`-hover's own normalizer (docs.rs) for a flag word straight out of a
-// script (`--block-size=1M`) down to the exact spelling this parser
-// keys `flag_descriptions` by (`--block-size`) -- same rules as this
-// module's own parse_flags/parse_flag_descriptions use internally, just
-// exposed for that one external caller.
-//
-// Extracts just the flag spelling from a piece like "-a", "--author",
-// "--block-size=SIZE", "-C <path>", or "-c     with -lt: sort by..." --
-// stops at the first '='/' '/'[' (a value suffix, a placeholder, or an
-// optional-value bracket) and validates what's left actually looks like a
-// flag. Exact-string match only, per this feature's v1 scope -- no
-// bundled short-flag decomposition (e.g. "-la" is never split into "-l"
-// and "-a").
+fn collect_text(blocks: &[crate::roff::Block], out: &mut String) {
+    use crate::roff::Block;
+    for block in blocks {
+        match block {
+            Block::Paragraph { content, .. } | Block::Heading { content, .. } => {
+                if !out.is_empty() {
+                    out.push(' ');
+                }
+                out.push_str(&crate::roff::text_of(content));
+            }
+            Block::Literal { lines, .. } => {
+                for line in lines {
+                    if !out.is_empty() {
+                        out.push(' ');
+                    }
+                    out.push_str(line.trim());
+                }
+            }
+            Block::Tagged { tag, blocks, .. } => {
+                if !out.is_empty() {
+                    out.push(' ');
+                }
+                out.push_str(&crate::roff::text_of(tag));
+                collect_text(blocks, out);
+            }
+            Block::Indented { blocks, .. } => collect_text(blocks, out),
+        }
+    }
+}
+
+// Two conventions, because tools split into two camps. git/apt/ip give
+// each subcommand its own page and cross-reference them as
+// `git-add(1)`; docker/systemctl-style tools list them as tagged
+// paragraphs in a COMMANDS section.
+fn collect_subcommands(doc: &crate::roff::Document, tags: &[(String, String)], command: &str) -> Vec<String> {
+    let mut subs = Vec::new();
+    let prefix = format!("{command}-");
+    let mut push = |name: &str| {
+        if !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+            subs.push(name.to_string());
+        }
+    };
+    for (tag, _) in tags {
+        let tag = tag.trim();
+        if let Some(rest) = tag.strip_prefix(&prefix)
+            && let Some(open) = rest.find('(')
+            && rest[open + 1..].starts_with(|c: char| c.is_ascii_digit())
+        {
+            push(&rest[..open]);
+            continue;
+        }
+        // A COMMANDS-section tag is the subcommand itself.
+        if !tag.starts_with('-') && !tag.contains(' ') {
+            push(tag);
+        }
+    }
+    for section in ["COMMANDS", "SUBCOMMANDS", "GIT COMMANDS"] {
+        for block in doc.section(section) {
+            if let crate::roff::Block::Tagged { tag, .. } = block {
+                let tag = crate::roff::text_of(tag);
+                let tag = tag.trim();
+                if let Some(rest) = tag.strip_prefix(&prefix) {
+                    push(rest.split('(').next().unwrap_or(rest));
+                } else if !tag.starts_with('-') {
+                    push(tag.split_whitespace().next().unwrap_or(tag));
+                }
+            }
+        }
+    }
+    subs.sort();
+    subs.dedup();
+    subs.retain(|s| s != command);
+    subs
+}
+
+// The NAME section's own one line -- `ls - list directory contents`.
+fn name_line(doc: &crate::roff::Document) -> Option<String> {
+    for block in doc.section("NAME") {
+        if let crate::roff::Block::Paragraph { content, .. } = block {
+            let text = crate::roff::text_of(content);
+            let text = text.trim();
+            if !text.is_empty() {
+                return Some(text.to_string());
+            }
+        }
+    }
+    None
+}
+
+// One flag out of a piece of a tag, or `None` when the piece is prose
+// that merely starts with a dash.
 pub(crate) fn extract_flag_token(piece: &str) -> Option<String> {
     if !piece.starts_with('-') {
         return None;
     }
-    let end = piece.find(|c: char| c == '=' || c == ' ' || c == '[').unwrap_or(piece.len());
+    let end = piece.find(['=', ' ', '[']).unwrap_or(piece.len());
     let token = &piece[..end];
     if token.len() < 2 || !token.chars().nth(1).is_some_and(|c| c == '-' || c.is_ascii_alphanumeric()) {
         return None;
@@ -311,181 +356,124 @@ pub(crate) fn extract_flag_token(piece: &str) -> Option<String> {
     Some(token.to_string())
 }
 
-// Recognizes only "<command>-<subcommand>(<digit>)" lines (e.g.
-// "git-add(1)") -- the naming convention git/apt/ip use for their own
-// per-subcommand man pages, matched via a whole-trimmed-line check (not
-// "appears somewhere in the line") so a prose sentence that merely
-// *mentions* git-add(1) mid-paragraph doesn't get misread as a listing.
-// The generic "COMMANDS section, bare lowercase words" fallback needed
-// for docker/kubectl/systemctl-style tools (no per-subcommand pages) is
-// deliberately not attempted -- out of scope for v1, see the plan.
-fn parse_subcommands(text: &str, command: &str) -> Vec<String> {
-    let prefix = format!("{}-", command);
-    let mut subs = Vec::new();
-    for line in text.lines() {
-        let trimmed = line.trim();
-        let Some(rest) = trimmed.strip_prefix(prefix.as_str()) else { continue };
-        let Some(paren) = rest.find('(') else { continue };
-        let (sub, tail) = rest.split_at(paren);
-        if sub.is_empty() || sub.contains(char::is_whitespace) {
-            continue;
-        }
-        let inner = &tail[1..];
-        let Some(close) = inner.find(')') else { continue };
-        if inner[..close].is_empty() || !inner[..close].chars().all(|c| c.is_ascii_digit()) {
-            continue;
-        }
-        if inner[close + 1..].trim().is_empty() {
-            subs.push(sub.to_string());
-        }
-    }
-    subs.sort();
-    subs.dedup();
-    subs
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    const LS_EXCERPT: &str = "\
-       -a, --all
-              do not ignore entries starting with .
-       -A, --almost-all
-              do not list implied . and ..
-       --author
-              with -l, print the author of each file
-       -b, --escape
-              print C-style escapes for nongraphic characters
-       --block-size=SIZE
-              with -l, scale sizes by SIZE when printing them; e.g., '--block-size=M'; see SIZE format below
-       -B, --ignore-backups
-              do not list implied entries ending with ~
-       -c     with -lt: sort by, and show, ctime (time of last modification of file  status  information);  with  -l:
-              show ctime and sort by name; otherwise: sort by ctime, newest first
-       -C     list entries by columns
-";
+    // Written as roff, because that is what a man page is. The old
+    // tests here were excerpts of `man`'s *rendered* output, which is
+    // what this module used to parse; keeping them would test a
+    // pipeline that no longer exists.
+    const LS_STYLE: &str = r#".TH LS 1 "March 2024" "GNU coreutils" "User Commands"
+.SH NAME
+ls \- list directory contents
+.SH DESCRIPTION
+.TP
+\fB\-a\fR, \fB\-\-all\fR
+do not ignore entries starting with .
+.TP
+\fB\-\-block\-size\fR=\fISIZE\fR
+with \fB\-l\fR, scale sizes by SIZE when printing them
+.TP
+\fB\-c\fR
+with \fB\-lt\fR: sort by, and show, ctime
+"#;
 
     #[test]
-    fn parse_flags_handles_ls_style_entries() {
-        let flags = parse_flags(LS_EXCERPT);
-        // Sorted ASCII order: all "--" long flags before any "-X" short
-        // flag (second char '-' < any letter), uppercase short flags
-        // before lowercase.
+    fn flags_come_from_the_pages_own_tagged_paragraphs() {
+        let data = extract(&crate::roff::parse(LS_STYLE), "ls");
+        assert_eq!(data.flags, vec!["--all", "--block-size", "-a", "-c"]);
+    }
+
+    #[test]
+    fn a_flags_description_is_the_body_its_tag_paired_it_with() {
+        let data = extract(&crate::roff::parse(LS_STYLE), "ls");
         assert_eq!(
-            flags,
-            vec![
-                "--all", "--almost-all", "--author", "--block-size", "--escape", "--ignore-backups", "-A", "-B", "-C", "-a", "-b", "-c",
-            ]
+            data.flag_descriptions.get("-a").map(String::as_str),
+            Some("do not ignore entries starting with .")
+        );
+        // Both spellings on one tag get the same description, because
+        // the page gave them one description.
+        assert_eq!(data.flag_descriptions.get("--all"), data.flag_descriptions.get("-a"));
+        assert_eq!(
+            data.flag_descriptions.get("-c").map(String::as_str),
+            Some("with \u{2d}lt: sort by, and show, ctime")
         );
     }
 
-    const GIT_FLAGS_EXCERPT: &str = "\
-       -C <path>
-           Run as if git was started in <path> instead of the current working directory.
-       -c <name>=<value>
-           Pass a configuration parameter to the command.
-       -p, --paginate
-           Pipe all output into less (or if set, $PAGER) if standard output is a terminal.
-";
-
     #[test]
-    fn parse_flags_handles_git_style_placeholder_entries() {
-        let flags = parse_flags(GIT_FLAGS_EXCERPT);
-        // Sorted ASCII order: "--paginate" (second char '-') before any
-        // "-X" short flag, then uppercase before lowercase.
-        assert_eq!(flags, vec!["--paginate".to_string(), "-C".to_string(), "-c".to_string(), "-p".to_string()]);
+    fn the_name_section_is_the_summary_line() {
+        let data = extract(&crate::roff::parse(LS_STYLE), "ls");
+        assert_eq!(data.name_section.as_deref(), Some("ls - list directory contents"));
+    }
+
+    // A dash that opens prose is not an option -- but `--`, which real
+    // pages document as the end-of-options marker, is one.
+    #[test]
+    fn prose_that_merely_starts_with_a_dash_is_not_a_flag() {
+        let page = ".SH DESCRIPTION\n.TP\n\\- a bullet point, not an option\ntext\n.TP\n\\-\\-\nend of options marker\n";
+        let data = extract(&crate::roff::parse(page), "tool");
+        assert_eq!(data.flags, vec!["--"], "the bullet is not a flag; `--` is");
+    }
+
+    // git/apt/ip give each subcommand its own page and cross-reference
+    // it by name.
+    #[test]
+    fn subcommands_are_read_from_cross_referenced_page_names() {
+        let page = ".TH GIT 1\n.SH GIT COMMANDS\n.TP\ngit-add(1)\nAdd file contents to the index\n.TP\ngit-commit(1)\nRecord changes\n";
+        let data = extract(&crate::roff::parse(page), "git");
+        assert_eq!(data.subcommands, vec!["add", "commit"]);
     }
 
     #[test]
-    fn parse_flags_ignores_prose_that_merely_starts_with_a_dash() {
-        // A deeply-indented description continuation line beginning with
-        // "-1" (e.g. explaining a negative-number option value) must not
-        // be picked up as its own flag entry -- indent alone (> 8 cols)
-        // already excludes this in real man-page formatting.
-        let text = "       --block-size=SIZE\n                     a value of -1 means unlimited\n";
-        let flags = parse_flags(text);
-        assert_eq!(flags, vec!["--block-size".to_string()]);
+    fn a_different_commands_cross_references_are_not_borrowed() {
+        let page = ".TH GIT 1\n.SH SEE ALSO\n.TP\nsvn-add(1)\nsomething else entirely\n";
+        let data = extract(&crate::roff::parse(page), "git");
+        assert!(data.subcommands.is_empty(), "{:?}", data.subcommands);
     }
 
     #[test]
-    fn parse_flag_descriptions_handles_git_style_next_line_descriptions() {
-        let descriptions = parse_flag_descriptions(GIT_FLAGS_EXCERPT);
-        assert_eq!(descriptions.get("-C").unwrap(), "Run as if git was started in <path> instead of the current working directory.");
-        assert_eq!(descriptions.get("-c").unwrap(), "Pass a configuration parameter to the command.");
-        // Two spellings on one flag line ("-p, --paginate") both resolve
-        // to the same description.
-        assert_eq!(descriptions.get("-p").unwrap(), descriptions.get("--paginate").unwrap());
-        assert!(descriptions.get("-p").unwrap().contains("Pipe all output into less"));
+    fn a_commands_section_lists_its_own_tags_as_subcommands() {
+        let page = ".TH TOOL 1\n.SH COMMANDS\n.TP\nbuild\nBuild the project\n.TP\ntest\nRun the tests\n";
+        let data = extract(&crate::roff::parse(page), "tool");
+        assert_eq!(data.subcommands, vec!["build", "test"]);
     }
 
     #[test]
-    fn parse_flag_descriptions_handles_ls_style_multi_spelling_entries() {
-        let descriptions = parse_flag_descriptions(LS_EXCERPT);
-        assert_eq!(descriptions.get("-a").unwrap(), "do not ignore entries starting with .");
-        assert_eq!(descriptions.get("--all").unwrap(), "do not ignore entries starting with .");
-        assert_eq!(descriptions.get("--author").unwrap(), "with -l, print the author of each file");
+    fn extract_flag_token_stops_at_a_value_or_a_bracket() {
+        assert_eq!(extract_flag_token("--block-size=SIZE").as_deref(), Some("--block-size"));
+        assert_eq!(extract_flag_token("--color[=WHEN]").as_deref(), Some("--color"));
+        assert_eq!(extract_flag_token("-w COLS").as_deref(), Some("-w"));
+        assert_eq!(extract_flag_token("not a flag"), None);
+        assert_eq!(extract_flag_token("-"), None);
+    }
+
+    // The end-to-end path, against whatever this machine actually has.
+    // Skipped where there are no man pages at all.
+    #[test]
+    fn reads_a_real_page_from_this_machine_with_no_subprocess() {
+        let Some(path) = find_page("ls") else { return };
+        assert!(path.exists(), "{}", path.display());
+        let source = read_page(&path).expect("a readable page");
+        let data = extract(&crate::roff::parse(&source), "ls");
+        assert!(
+            data.name_section.as_deref().is_some_and(|n| n.contains("ls")),
+            "NAME was {:?}",
+            data.name_section
+        );
+        assert!(data.flags.iter().any(|f| f == "-l"), "expected -l among {:?}", data.flags);
+        assert!(
+            data.flag_descriptions.contains_key("-l"),
+            "expected a description for -l"
+        );
     }
 
     #[test]
-    fn parse_flag_descriptions_stops_at_the_next_shallow_line() {
-        // The description for "-A, --almost-all" must not swallow the
-        // next flag's own line ("--author").
-        let descriptions = parse_flag_descriptions(LS_EXCERPT);
-        let d = descriptions.get("-A").unwrap();
-        assert!(d.contains("implied"), "{d:?}");
-        assert!(!d.contains("author"), "{d:?}");
-    }
-
-    const GIT_SUBCOMMANDS_EXCERPT: &str = "\
-   Main porcelain commands
-       git-add(1)
-           Add file contents to the index.
-
-       git-am(1)
-           Apply a series of patches from a mailbox.
-
-       This behaves the same as git-add(1) in most cases.
-";
-
-    #[test]
-    fn parse_subcommands_recognizes_cmd_dash_sub_paren_n_lines() {
-        let subs = parse_subcommands(GIT_SUBCOMMANDS_EXCERPT, "git");
-        assert_eq!(subs, vec!["add".to_string(), "am".to_string()]);
-    }
-
-    #[test]
-    fn parse_subcommands_rejects_mid_sentence_cross_references() {
-        // "This behaves the same as git-add(1) in most cases." must not
-        // contribute a duplicate/spurious entry beyond what the real
-        // listing lines already produced above -- covered by the exact
-        // dedup'd result in the previous test; this test isolates just
-        // the rejection with no real listing lines present at all.
-        let text = "       This behaves the same as git-add(1) in most cases.\n";
-        let subs = parse_subcommands(text, "git");
-        assert_eq!(subs, Vec::<String>::new());
-    }
-
-    #[test]
-    fn parse_subcommands_ignores_a_different_commands_prefix() {
-        let subs = parse_subcommands(GIT_SUBCOMMANDS_EXCERPT, "apt");
-        assert_eq!(subs, Vec::<String>::new());
-    }
-
-    #[test]
-    fn strip_overstrike_collapses_bold_and_underline_sequences() {
-        // Bold: char repeated around a backspace. Underline: '_' then
-        // backspace then the real char.
-        let bold = "b\u{8}bo\u{8}ol\u{8}ld\u{8}d";
-        assert_eq!(strip_overstrike(bold), "bold");
-        let underline = "_\u{8}t_\u{8}e_\u{8}x_\u{8}t";
-        assert_eq!(strip_overstrike(underline), "text");
-    }
-
-    #[test]
-    fn strip_overstrike_is_a_no_op_on_plain_text() {
-        let plain = "NAME\n       ls - list directory contents\n";
-        assert_eq!(strip_overstrike(plain), plain);
+    fn a_page_name_that_is_a_path_is_never_looked_up() {
+        assert!(find_page("../../etc/passwd").is_none());
+        assert!(find_page("/etc/passwd").is_none());
+        assert!(find_page("").is_none());
+        assert!(find_page("-rf").is_none());
     }
 
     #[test]
@@ -498,13 +486,11 @@ mod tests {
             ManStatus::Pending | ManStatus::Missing => {}
             ManStatus::Ready(_) => panic!("unexpectedly found a real man page for {bogus}"),
         }
-        // Poll briefly for the background fetch to land -- generous
-        // upper bound since this genuinely spawns a real `man` process.
         for _ in 0..50 {
             if matches!(query(bogus), ManStatus::Missing) {
                 return;
             }
-            std::thread::sleep(std::time::Duration::from_millis(50));
+            std::thread::sleep(std::time::Duration::from_millis(20));
         }
         panic!("expected {bogus} to resolve to Missing within the poll window");
     }

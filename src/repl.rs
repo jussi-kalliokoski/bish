@@ -7225,6 +7225,21 @@ fn render_markdown_document(source: &str, term_cols: usize) -> Vec<String> {
     crate::markdown::render::to_lines(&doc, &opts)
 }
 
+// `:preview`'s own dispatch: which languages have something to render,
+// and how. `None` for a language that has no rendered form -- which is
+// what the command reports rather than guessing at one.
+fn preview_document(language: &str, source: &str, term_cols: usize) -> Option<Vec<String>> {
+    let width = term_cols.saturating_sub(1).max(20);
+    match language {
+        "markdown" => Some(render_markdown_document(source, term_cols)),
+        "roff" => {
+            let doc = crate::roff::parse(source);
+            Some(crate::roff::render::to_lines(&doc, &crate::roff::render::Options { width }))
+        }
+        _ => None,
+    }
+}
+
 // `:help`/`:preview`'s own driving loop: a pager over already-rendered
 // lines, taking over the terminal for its own duration and handing
 // control straight back -- the same "blocks until it exits" shape
@@ -7238,9 +7253,23 @@ fn render_markdown_document(source: &str, term_cols: usize) -> Vec<String> {
 // background job's output still lands in its own pane's grid while a
 // help page is open.
 #[allow(clippy::too_many_arguments)]
+// What the pager is showing, so a resize can re-render it at the new
+// width -- which is not optional, since a table's layout and every
+// wrapped line depend on it.
+struct PagerSource {
+    language: String,
+    source: String,
+}
+
+impl PagerSource {
+    fn lines(&self, term_cols: usize) -> Vec<String> {
+        preview_document(&self.language, &self.source, term_cols).unwrap_or_default()
+    }
+}
+
 fn run_pager(
     title: &str,
-    source: &str,
+    doc: PagerSource,
     sessions: &mut HashMap<SessionId, SessionState>,
     windows: &mut Vec<WindowEntry>,
     job_frames: &mut HashMap<JobFrameId, exec::FgJob>,
@@ -7250,7 +7279,7 @@ fn run_pager(
     sinks_are_grid: bool,
 ) {
     let Ok(_guard) = term::RawGuard::enable_with_mouse(0) else { return };
-    let mut view = crate::pager::Pager::new(title, render_markdown_document(source, *term_cols), *term_rows, *term_cols);
+    let mut view = crate::pager::Pager::new(title, doc.lines(*term_cols), *term_rows, *term_cols);
     let mut last_size = (*term_rows, *term_cols);
     loop {
         print!("{}", view.render(*term_rows));
@@ -7268,7 +7297,7 @@ fn run_pager(
         if (*term_rows, *term_cols) != last_size {
             last_size = (*term_rows, *term_cols);
             let top_line = view.top_line();
-            view = crate::pager::Pager::new(title, render_markdown_document(source, *term_cols), *term_rows, *term_cols);
+            view = crate::pager::Pager::new(title, doc.lines(*term_cols), *term_rows, *term_cols);
             view.scroll_to(top_line);
         }
         if view.handle_key(key) == crate::pager::Outcome::Quit {
@@ -8341,7 +8370,10 @@ fn run_command_mode(
                         "help" | "h" | "?" if arg.is_none() => {
                             run_pager(
                                 "bish help  (q to close)",
-                                EDITOR_HELP_MARKDOWN,
+                                PagerSource {
+                                    language: "markdown".to_string(),
+                                    source: EDITOR_HELP_MARKDOWN.to_string(),
+                                },
                                 sessions,
                                 windows,
                                 job_frames,
@@ -8362,9 +8394,10 @@ fn run_command_mode(
                         // instead of at the built-in document.
                         "preview" | "prev" if arg.is_none() => {
                             let language = fileeditor::language_of(tb);
-                            if language != "markdown" {
+                            let source = fileeditor::buffer_source(tb);
+                            if preview_document(&language, &source, *term_cols).is_none() {
                                 show_command_mode_error(
-                                    &format!("bish: preview: not a markdown file (this buffer is {language})"),
+                                    &format!("bish: preview: nothing to render for a {language} file (markdown and roff have previews)"),
                                     *term_rows,
                                     *term_cols,
                                 );
@@ -8376,10 +8409,9 @@ fn run_command_mode(
                                 .and_then(|p| p.file_name())
                                 .map(|n| n.to_string_lossy().into_owned())
                                 .unwrap_or_else(|| "preview".to_string());
-                            let source = fileeditor::buffer_source(tb);
                             run_pager(
                                 &format!("{name}  (q to close)"),
-                                &source,
+                                PagerSource { language, source },
                                 sessions,
                                 windows,
                                 job_frames,

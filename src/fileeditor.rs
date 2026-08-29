@@ -1710,6 +1710,20 @@ const LANGUAGE_BY_EXTENSION: &[(&str, &str)] = &[
     ("hs", "haskell"),
     ("ex", "elixir"),
     ("exs", "elixir"),
+    // Man page sections. `ls.1`, `printf.3`, `crontab.5` are all roff
+    // source, and `language_of` looks through a `.gz` first, so a page
+    // straight out of /usr/share/man lands here too.
+    ("1", "roff"),
+    ("2", "roff"),
+    ("3", "roff"),
+    ("4", "roff"),
+    ("5", "roff"),
+    ("6", "roff"),
+    ("7", "roff"),
+    ("8", "roff"),
+    ("9", "roff"),
+    ("man", "roff"),
+    ("tmac", "roff"),
 ];
 
 pub(crate) fn language_of(buf: &TextBuffer) -> String {
@@ -3494,6 +3508,11 @@ mod pre_save_hook_tests {
 
         let markdown = buf_with_ext("# Title\n\n*emphasis*\n", "md");
         assert!(!buffer_highlight_spans(&markdown, None).is_empty(), "and a .md buffer");
+
+        // A man page section number is an extension like any other.
+        let roff = buf_with_ext(".SH NAME\nls \\- list directory contents\n", "1");
+        assert!(!buffer_highlight_spans(&roff, None).is_empty(), "and a .1 buffer");
+        assert_eq!(language_of(&roff), "roff");
 
         // Valid bash, and deliberately not highlighted as any: nothing
         // claims to know what a .toml file is.

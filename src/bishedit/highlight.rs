@@ -317,6 +317,39 @@ fn markdown_inlines(inlines: &[crate::markdown::Inline], out: &mut Vec<Highlight
     }
 }
 
+// roff -- man page source -- over crate::roff's own lexical pass, not
+// its interpreter. That distinction is the point: a highlighter must
+// colour the source as written, so the `.de` and `.ie` scaffolding a
+// generated page opens with stays visible as what it is rather than
+// being executed away.
+pub struct RoffHighlighter;
+
+impl Highlighter for RoffHighlighter {
+    fn highlight(&self, text: &str, _ctx: HighlightContext) -> Vec<HighlightSpan> {
+        use crate::roff::lexer::{lex, TokenKind};
+        lex(text)
+            .into_iter()
+            .filter_map(|token| {
+                let kind = match token.kind {
+                    TokenKind::Comment => HighlightKind::Comment,
+                    // The `.` that makes a line a request, and the
+                    // request itself: the two halves of roff's only
+                    // piece of syntax.
+                    TokenKind::Control => HighlightKind::Operator,
+                    TokenKind::Request => HighlightKind::Keyword,
+                    // `\fB`, `\(bu`, `\*[x]` -- substitutions, which
+                    // is what makes them worth telling apart from the
+                    // text they sit inside.
+                    TokenKind::Escape => HighlightKind::Substitution,
+                    TokenKind::Argument => HighlightKind::String,
+                    TokenKind::Text => return None,
+                };
+                Some(span(token.span, kind))
+            })
+            .collect()
+    }
+}
+
 // Which highlighter a language name has, if any -- the one table, shared
 // by the file editor's own per-buffer choice and by fenced code blocks
 // inside a markdown document.
@@ -325,6 +358,7 @@ pub fn highlighter_for_language(language: &str) -> Option<Box<dyn Highlighter>> 
         "bash" | "sh" | "shell" => Some(Box::new(BashHighlighter)),
         "json" => Some(Box::new(JsonHighlighter)),
         "markdown" | "md" => Some(Box::new(MarkdownHighlighter)),
+        "roff" | "man" | "troff" | "groff" => Some(Box::new(RoffHighlighter)),
         _ => None,
     }
 }
@@ -2039,5 +2073,57 @@ mod tests {
             md_kinds("a <span>b</span>\n"),
             vec![("<span>".to_string(), HighlightKind::Comment), ("</span>".to_string(), HighlightKind::Comment)]
         );
+    }
+
+    fn roff_kinds(text: &str) -> Vec<(String, HighlightKind)> {
+        let chars: Vec<char> = text.chars().collect();
+        let mut spans = RoffHighlighter.highlight(text, HighlightContext::default());
+        spans.sort_by_key(|s| (s.start, s.end));
+        spans.into_iter().map(|s| (chars[s.start..s.end].iter().collect(), s.kind)).collect()
+    }
+
+    #[test]
+    fn roff_highlights_a_control_line_by_its_parts() {
+        assert_eq!(
+            roff_kinds(".SH NAME\n"),
+            vec![
+                (".".to_string(), HighlightKind::Operator),
+                ("SH".to_string(), HighlightKind::Keyword),
+                ("NAME".to_string(), HighlightKind::String),
+            ]
+        );
+    }
+
+    #[test]
+    fn roff_highlights_escapes_inside_text() {
+        assert_eq!(
+            roff_kinds("plain \\fBbold\\fP text\n"),
+            vec![
+                ("\\fB".to_string(), HighlightKind::Substitution),
+                ("\\fP".to_string(), HighlightKind::Substitution),
+            ]
+        );
+    }
+
+    #[test]
+    fn roff_highlights_both_comment_forms() {
+        assert_eq!(
+            roff_kinds(".\\\" a whole line\ntext \\\" trailing\n"),
+            vec![
+                (".".to_string(), HighlightKind::Operator),
+                ("\\\" a whole line".to_string(), HighlightKind::Comment),
+                ("\\\" trailing".to_string(), HighlightKind::Comment),
+            ]
+        );
+    }
+
+    // The highlighter must not interpret: a page's own macro
+    // definitions stay visible as source rather than being executed
+    // away the way the parser executes them.
+    #[test]
+    fn roff_highlighting_does_not_expand_macros() {
+        let kinds = roff_kinds(".de Flag\n.B \\\\$1\n..\n.Flag x\n");
+        assert!(kinds.iter().any(|(t, k)| t == "de" && *k == HighlightKind::Keyword));
+        assert!(kinds.iter().any(|(t, k)| t == "Flag" && *k == HighlightKind::Keyword));
     }
 }

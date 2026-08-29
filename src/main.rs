@@ -27,6 +27,7 @@ mod prompt;
 mod pty;
 mod regex;
 mod repl;
+mod roff;
 mod serialize;
 mod session;
 mod term;
