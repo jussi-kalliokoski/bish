@@ -8,10 +8,13 @@
 // in-place prompt/buffer editor later (e.g. invoking $EDITOR on the
 // current input), not just a one-off REPL helper.
 //
-// Known simplification: redraw doesn't account for terminal width, so a
-// line that wraps past the terminal's column count will render oddly.
-// Fixing that needs a TIOCGWINSZ ioctl and wrap-aware redraw math -- left
-// for later, same spirit as the other documented gaps in this codebase.
+// Redraws are width-aware: `compose_redraw` is given the columns that
+// belong to this line (a pane's own width, or the whole terminal's) and
+// keeps everything inside them -- truncating the prompt if even that
+// doesn't fit, and horizontally scrolling the buffer around the cursor
+// once the line is longer than what's left. Nothing here ever wraps onto
+// a second row, which is what keeps a prompt inside a split pane from
+// spilling into its neighbour.
 
 use std::collections::HashMap;
 use std::io::{self, Write};

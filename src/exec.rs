@@ -3469,10 +3469,9 @@ impl Shell {
     // session, which lives in repl.rs (the only thing that can hold it
     // without an Rc<RefCell<_>> self-reference cycle, see
     // ExecResult::Window's doc comment), so repl.rs draws it right after
-    // this, and again after every WindowAction. No terminal-size query
-    // here either (needs a TIOCGWINSZ ioctl, planned for the real
-    // compositor), so today's redraw can't pin anything to the actual
-    // bottom row yet -- acknowledged, temporary, not the final design.
+    // this, and again after every WindowAction -- which is also what
+    // knows the terminal's real size (repl.rs queries TIOCGWINSZ and
+    // pins the tab bar to the actual last row); nothing here needs to.
     // pub(crate): also called directly by repl.rs's bishedit normal-mode
     // entry (Ctrl+Space), which bypasses run_window/the command-dispatch
     // path entirely -- see repl.rs's ensure_promoted.
@@ -8503,15 +8502,20 @@ struct Job {
     pids: Vec<u32>,
     children: Vec<std::process::Child>,
     cmd_text: String,
-    // Set only for a single-command background job spawned while promoted
-    // and not itself explicitly redirected (see run_single's background-
-    // spawn site) -- the pty (M7) its stdio is attached to instead of
-    // being inherited from the real terminal. `fg` (see run_fg) uses this
-    // to drive poll-based rendering into the fg-ing session's grid
-    // instead of blocking on Job::wait(); every other job (not promoted
-    // at spawn time, part of a multi-stage pipeline, or explicitly
-    // redirected) has this as None and `fg` falls back to exactly
-    // today's blocking behavior for it.
+    // The pty (M7) this background job's stdio is attached to instead of
+    // inheriting the real terminal's fds -- set for every background job
+    // spawned while promoted, whatever shape it is: a single external
+    // command, a subshell, a pipeline, or any of those with redirects of
+    // their own (the redirected streams still go where they were told;
+    // only the ones nothing claimed land here). `None` when the session
+    // wasn't promoted at spawn time, which is also when there's no grid
+    // to render into and inherited stdio is already going to the right
+    // place.
+    //
+    // Two things read it: `fg` (see run_fg) drives poll-based rendering
+    // into the fg-ing session's grid instead of blocking on Job::wait(),
+    // and drain_background_output keeps the job's output flowing into
+    // `sink_screen` while it stays in the background.
     pty_master: Option<std::fs::File>,
     // The grid this job's own output belongs in: the sink of whichever
     // session spawned it, captured at that moment (see push_job_full).
@@ -8534,9 +8538,11 @@ struct Job {
     // need this (spawn_attached's setsid already isolates it into its
     // own session, and drive_fg_job's raw-byte forwarding lets its own
     // pty's line discipline generate SIGTSTP/SIGINT correctly without
-    // any of this machinery), and a multi-stage pipeline's stages were
-    // never isolated this way in the first place (out of scope for this
-    // pass -- see run_multi).
+    // any of this machinery). A backgrounded pipeline sets one too (see
+    // run_multi -- every stage shares the first one's group, so `kill
+    // %N`/`bg` reach the whole job), which is why its own pty is wired as
+    // plain fds rather than through spawn_attached: that setsid would
+    // undo exactly this.
     pgid: Option<u32>,
     // True once this job has been observed stopped (via a WUNTRACED-
     // aware wait -- see waitpid_untraced) rather than exited. Checked by

@@ -465,15 +465,13 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
     }
 
     loop {
-        // Polled once per loop iteration rather than truly asynchronously:
-        // editor::read_line below blocks on the next keypress with no
-        // signal-aware select/poll of its own, so a resize that arrives
-        // mid-block is only noticed once that read returns (the user's
-        // next keystroke or Enter). A real event loop that can react to
-        // WINCH *while* blocked on input is M9b's job (the same compositor
-        // work that makes poll-driven `fg` possible) -- acknowledged,
-        // temporary, same spirit as this codebase's other documented
-        // scope boundaries.
+        // Covers the gap between one read_line call ending and the next
+        // beginning; a resize arriving *during* one is handled inside it,
+        // by the same poll_and_apply_resize reached through every
+        // blocking loop's own on_idle hook (see service_background_jobs),
+        // so it lands within a poll tick rather than waiting for the next
+        // keystroke. This comment used to claim the opposite, from before
+        // that idle hook existed.
         poll_and_apply_resize(&sessions, &windows, &mut job_frames, &mut term_rows, &mut term_cols, sinks_are_grid, current_window);
 
         let session_id = windows[current_window].owning_session();
@@ -3415,8 +3413,11 @@ fn close_orphaned_sessions(sessions: &mut HashMap<SessionId, SessionState>, wind
     sessions.retain(|id, _| referenced.contains(id));
 }
 
-// Full redraw of the currently-focused window's grid plus the tab bar.
-// Always a full clear+redraw rather than a cell/row-level diff: M9a's
+// Full redraw of the currently-focused window's grid plus the tab bar --
+// every pane row, every divider and the tab bar, which together already
+// cover every cell, so no explicit erase is involved (see
+// build_compositor_frame_output on why the `\x1b[2J` this used to lead
+// with had to go). Repaints everything rather than diffing: M9a's
 // discrete-event redraws (a command finished, a window switch, a resize)
 // are infrequent enough that flicker isn't a real concern, and a full
 // redraw is trivially correct (self-healing against anything that wrote
