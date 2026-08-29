@@ -19,6 +19,7 @@ mod html;
 mod inflate;
 mod json;
 mod lexer;
+mod markdown;
 mod parser;
 mod poll;
 mod prompt;
