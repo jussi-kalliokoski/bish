@@ -1,6 +1,6 @@
-// `:browse [path]` -- a real file browser, drawn into whichever pane was
-// focused when command mode was entered. A top-level module, the same
-// tier as fileeditor.rs/debugger.rs: a concrete interactive view, not
+// `e DIR` -- a real file browser, drawn into the focused pane so files
+// can be picked out of it and opened. A top-level module, the same tier
+// as fileeditor.rs/debugger.rs: a concrete interactive view, not
 // reusable headless logic.
 //
 // Split the same way every other interactive view in this codebase
@@ -27,11 +27,12 @@
 // navigate. Directory navigation lives on Enter (descend) and
 // Backspace/Alt-Up (parent) instead, matching a graphical browser.
 //
-// Scope, deliberately: this pass is the *view*. Enter on a file (or on
-// a multi-selection) returns the chosen paths to the caller and leaves;
-// what to actually do with them -- open in the editor, cd, feed a
-// command line -- is a later pass, which is why `Outcome::Accepted`
-// carries paths rather than performing anything itself.
+// `Outcome::Accepted` carries paths rather than performing anything with
+// them: the browser is a *chooser*, and its one caller today (`e DIR`,
+// which opens each chosen path as an editor frame -- see repl.rs's
+// expand_browse_targets) is not the only thing that shape can serve.
+// Cancelling with Esc/`q` chooses nothing, so `e DIR` then opens
+// nothing, rather than falling back to some arbitrary file.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -736,12 +737,12 @@ impl Browser {
 
 // Everything below is `Browser`-independent helper machinery.
 
-// Where `:browse [path]` should start: the argument if there is one
-// (relative paths resolved against the *session's* own cwd, not the
-// process's -- each window/pane tracks its own), otherwise that cwd
-// itself. `~`/`~/...` expand here rather than going through the shell's
-// full word expansion: command mode's colon line is typed text handed
-// straight to this command, not a parsed shell word list.
+// Where a browse should start: the argument if there is one (relative
+// paths resolved against the *session's* own cwd, not the process's --
+// each window/pane tracks its own), otherwise that cwd itself. `~`/
+// `~/...` expand here too, which is redundant for an `e` argument the
+// shell already expanded but harmless, and keeps this usable by any
+// caller with a raw path in hand.
 pub(crate) fn resolve_start(cwd: &Path, arg: Option<&str>) -> PathBuf {
     let Some(arg) = arg else { return cwd.to_path_buf() };
     let expanded = if arg == "~" || arg.starts_with("~/") {

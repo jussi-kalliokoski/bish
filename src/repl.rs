@@ -1167,18 +1167,36 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
                     // normal-mode navigation already established.
                     ensure_promoted(&mut sessions, &mut sinks_are_grid);
                     let args = sessions.get_mut(&session_id).unwrap().shell.take_pending_edit();
-                    let rect = pane_rect(&windows[current_window], windows[current_window].focused_pane, term_rows, term_cols);
                     let opened = match fileeditor::parse_edit_args(&args) {
-                        Ok(targets) => open_edit_targets(
-                            &targets,
-                            &mut sessions,
-                            session_id,
-                            &mut edit_frames,
-                            &mut next_edit_frame_id,
-                            &mut hex_frames,
-                            &mut next_hex_frame_id,
-                            rect,
-                        ),
+                        Ok(targets) => {
+                            // A directory argument turns into whatever is
+                            // picked out of it, before anything opens.
+                            let targets = expand_browse_targets(
+                                targets,
+                                &mut sessions,
+                                &mut windows,
+                                session_id,
+                                current_window,
+                                &mut job_frames,
+                                &mut term_rows,
+                                &mut term_cols,
+                                sinks_are_grid,
+                            );
+                            // Read only now: browsing blocks on real
+                            // input, so the terminal can have been
+                            // resized since this command was typed.
+                            let rect = pane_rect(&windows[current_window], windows[current_window].focused_pane, term_rows, term_cols);
+                            open_edit_targets(
+                                &targets,
+                                &mut sessions,
+                                session_id,
+                                &mut edit_frames,
+                                &mut next_edit_frame_id,
+                                &mut hex_frames,
+                                &mut next_hex_frame_id,
+                                rect,
+                            )
+                        }
                         Err(e) => {
                             sessions.get_mut(&session_id).unwrap().shell.sink_err(&format!("bish: e: {}\n", e));
                             Vec::new()
@@ -1222,6 +1240,81 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
         }
         let _ = io::stdout().flush();
     }
+}
+
+// `e DIR` -- a directory argument isn't a buffer to open, it's a place
+// to *pick* buffers from, so it's replaced here (before anything opens)
+// by one target per path chosen in the browser, each inheriting the
+// directory argument's own flags: `e --hex dumps/` browses `dumps/` and
+// opens everything picked there as hex. A directory picked *inside* the
+// browser (Tab selects one, unlike Enter, which descends into it) means
+// the same thing and is browsed in turn -- see the worklist below.
+//
+// Runs before any frame is pushed, so the browser draws over the pane's
+// ordinary shell content and hands it straight to whatever opens next.
+// Cancelling (Esc/`q`) contributes nothing -- `e some-dir/`, then
+// changing your mind, opens nothing rather than falling back to an
+// arbitrary file. A non-directory target passes through untouched, which
+// is every ordinary `e file.sh`.
+#[allow(clippy::too_many_arguments)]
+fn expand_browse_targets(
+    targets: Vec<fileeditor::EditTarget>,
+    sessions: &mut HashMap<SessionId, SessionState>,
+    windows: &mut [WindowEntry],
+    session_id: SessionId,
+    current_window: usize,
+    job_frames: &mut HashMap<JobFrameId, exec::FgJob>,
+    term_rows: &mut usize,
+    term_cols: &mut usize,
+    sinks_are_grid: bool,
+) -> Vec<fileeditor::EditTarget> {
+    // Only pay for the cwd lookup (and the stat below) when there's
+    // actually something to resolve.
+    if targets.iter().all(|t| t.path.is_none()) {
+        return targets;
+    }
+    let cwd = sessions[&session_id].shell.cwd.clone();
+    let mut out = Vec::new();
+    // A worklist rather than a plain pass, so a directory *picked in the
+    // browser* means exactly what a directory *named on the command line*
+    // means: pick from it. That keeps the rule to one sentence and means
+    // every argument eventually resolves to real files or to nothing --
+    // no path ends up handed to the editor as a buffer it can't open.
+    // Expansions go back on the front, so `e a.sh dir/ b.sh` keeps
+    // whatever came out of `dir/` between the two files.
+    let mut queue: std::collections::VecDeque<fileeditor::EditTarget> = targets.into();
+    while let Some(target) = queue.pop_front() {
+        let Some(path) = target.path.clone() else {
+            out.push(target);
+            continue;
+        };
+        let start = browser::resolve_start(&cwd, Some(&path));
+        if !start.is_dir() {
+            out.push(target);
+            continue;
+        }
+        // The pane's own global chrome (the tab bar) is drawn by the
+        // compositor, and `e` reaching here can be the very command that
+        // promoted this session -- in which case nothing has painted it
+        // yet and the browser would sit on an otherwise blank alternate
+        // screen. Every other ensure_promoted call site pairs the two for
+        // the same reason.
+        if sinks_are_grid {
+            compositor_redraw(sessions, windows, current_window, *term_rows, *term_cols);
+        }
+        match run_browse_frame(&start, sessions, windows, current_window, job_frames, term_rows, term_cols, sinks_are_grid) {
+            Ok(Some(chosen)) => {
+                for picked in chosen.into_iter().rev() {
+                    queue.push_front(fileeditor::EditTarget { path: Some(picked.display().to_string()), ..target.clone() });
+                }
+            }
+            Ok(None) => {}
+            Err(e) => {
+                sessions.get_mut(&session_id).unwrap().shell.sink_err(&format!("bish: e: {}: {}\n", path, e));
+            }
+        }
+    }
+    out
 }
 
 // Opens every target `e` was given, in order, returning the frame ids
@@ -1379,6 +1472,21 @@ fn run_edit_impl(targets: &[fileeditor::EditTarget], attach_debug: bool) -> i32 
 
     ensure_promoted(&mut sessions, &mut sinks_are_grid);
 
+    // `bish tool edit some-dir/` browses it, exactly as the builtin does
+    // -- see expand_browse_targets. `rect` is read after that, since
+    // browsing blocks on real input and the terminal can be resized
+    // while it does.
+    let targets = expand_browse_targets(
+        targets.to_vec(),
+        &mut sessions,
+        &mut windows,
+        0,
+        current_window,
+        &mut job_frames,
+        &mut term_rows,
+        &mut term_cols,
+        sinks_are_grid,
+    );
     let rect = pane_rect(&windows[current_window], windows[current_window].focused_pane, term_rows, term_cols);
     // Unlike the `e` builtin (see open_edit_targets, which reports a bad
     // target and opens the rest), a failure here aborts the whole
@@ -1386,7 +1494,7 @@ fn run_edit_impl(targets: &[fileeditor::EditTarget], attach_debug: bool) -> i32 
     // be opened is a usage error worth an exit status, not a note that
     // scrolls past in a session that keeps running.
     let mut opened: Vec<Frame> = Vec::new();
-    for target in targets {
+    for target in &targets {
         match open_one_edit_target(target, &mut edit_frames, &mut next_edit_frame_id, &mut hex_frames, &mut next_hex_frame_id, rect) {
             Ok(frame) => opened.push(frame),
             Err(e) => {
@@ -2347,7 +2455,7 @@ fn run_diagnostics_frame(
     }
 }
 
-// `:browse [path]`'s own driving loop -- the terminal half of the split
+// `e DIR`'s own browsing loop -- the terminal half of the split
 // browser.rs's module doc comment describes: that module owns the
 // listing model, the grid arithmetic and the rendering (all testable
 // without a terminal); this owns raw mode, keystrokes, and the same
@@ -2363,16 +2471,15 @@ fn run_diagnostics_frame(
 // new rect rather than the old one.
 //
 // Restoring the pane's original content on the way out is deliberately
-// *not* this function's job -- every caller of command mode already
-// repaints the pane it was driving once an outcome comes back (see
-// run_normal_mode_navigation's own `CommandModeOutcome::Ran` arm, which
-// can't rely on `compositor_redraw` alone for a `Frame::Edit` pane), so
-// adding a redraw here would just paint the same rows twice.
+// *not* this function's job -- its caller either opens editor frames
+// over the pane immediately (the ordinary outcome) or redraws it because
+// nothing was chosen, so adding a redraw here would just paint the same
+// rows twice.
 #[allow(clippy::too_many_arguments)]
 fn run_browse_frame(
     start: &std::path::Path,
     sessions: &mut HashMap<SessionId, SessionState>,
-    windows: &mut Vec<WindowEntry>,
+    windows: &mut [WindowEntry],
     current_window: usize,
     job_frames: &mut HashMap<JobFrameId, exec::FgJob>,
     term_rows: &mut usize,
@@ -2414,8 +2521,13 @@ fn run_browse_frame(
 
     // `render` hides the real cursor for every frame it draws (there's
     // no text insertion point in a grid), so put it back before handing
-    // the pane to a caller that expects to place it itself.
-    print!("\x1b[?25h");
+    // the pane to a caller that expects to place it itself. The hint
+    // line goes with it: that's the terminal's shared global status row,
+    // which lives outside every pane's rect and so is the one thing a
+    // caller's `compositor_redraw` cannot clean up on its own -- found
+    // via pty, where cancelling a browse left "esc back" sitting above a
+    // perfectly ordinary shell prompt.
+    print!("\x1b[?25h{}", erase_global_status_row(*term_rows));
     let _ = io::stdout().flush();
     Ok(outcome)
 }
@@ -6376,7 +6488,8 @@ Undo/redo: u / <C-r>     Put: p P     Repeat last change: .
 Hover: K on an identifier shows its live value, a doc comment, or a
        man-page snippet for an external command
 More:  `e FILE...` opens several files at once, the first in front;
-       `e --hex FILE` opens one as raw bytes instead (own :help inside)
+       `e --hex FILE` opens one as raw bytes instead (own :help inside);
+       `e DIR` browses DIR and opens what you pick there
 
 Colon commands:
   :w [FILE]        write (:wq/:x write+quit, :q quit, :q! discard+quit)
@@ -6386,8 +6499,6 @@ Colon commands:
   :format          run this file's own formatter
   :diag [clear]    toggle the diagnostics pane
   :dbg             attach a read-only debug session (:dbg help for more)
-  :browse [PATH]   file browser in this pane (hjkl/arrows, tab selects,
-                   / filters, enter opens, esc back)
   :help, :h, :?    this screen";
 
 // `:dbg help`/`:dbg h`/`:dbg ?`'s own reference text -- shown via the
@@ -7513,52 +7624,6 @@ fn run_command_mode(
                             }
                         }
                         _ => {}
-                    }
-                }
-
-                // `browse [path]`: the file browser, drawn into whichever
-                // pane was focused when this colon line was opened.
-                // Deliberately *outside* the `editing.is_some()` block
-                // above -- unlike `w`/`diag`/`git blame`, which only mean
-                // anything against a real file buffer, browsing is about
-                // the pane and its session's own cwd, so it works from a
-                // shell pane's Ctrl+Space excursion exactly as it does
-                // from an editor pane. Handled here rather than as a
-                // `Shell` builtin for the same reason `e`/`fg` can't be
-                // ones either (see this function's own `ExecResult::Edit`
-                // arm below): a builtin has no raw-mode, keystroke or
-                // pane-rect access at all.
-                let browse_arg = {
-                    let (cmd, arg) = match trimmed.split_once(' ') {
-                        Some((c, a)) => (c, Some(a.trim()).filter(|a| !a.is_empty())),
-                        None => (trimmed.as_str(), None),
-                    };
-                    if cmd == "browse" || cmd == "br" { Some(arg.map(|a| a.to_string())) } else { None }
-                };
-                if let Some(arg) = browse_arg {
-                    let start = browser::resolve_start(&sessions[&session_id].shell.cwd, arg.as_deref());
-                    match run_browse_frame(&start, sessions, windows, current_window, job_frames, term_rows, term_cols, sinks_are_grid) {
-                        // What to actually *do* with the chosen paths is
-                        // a later pass (see browser.rs's own scope note)
-                        // -- for now they come back as the command's own
-                        // output, which the caller already shows via
-                        // render_command_output_overlay. Cancelling
-                        // (Esc/`q`) produces no output at all, so the
-                        // pane just goes back to what it was showing.
-                        Ok(chosen) => {
-                            let output = match chosen {
-                                None => String::new(),
-                                Some(paths) if paths.is_empty() => String::new(),
-                                Some(paths) => paths.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join("\n"),
-                            };
-                            sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry { command: trimmed, output: output.clone(), status: 0 });
-                            return CommandModeOutcome::Ran { output, status: 0 };
-                        }
-                        Err(e) => {
-                            show_command_mode_error(&format!("bish: browse: {e}"), *term_rows, *term_cols);
-                            buffer.clear();
-                            continue;
-                        }
                     }
                 }
 
