@@ -20,6 +20,7 @@ use crate::bishedit::completion::{self, CompletionCandidate, CompletionProvider,
 use crate::bishedit::highlight::{self, BashHighlighter, Highlighter, HighlightContext, StyledSpan};
 use crate::bishedit::motion;
 use crate::bishedit::registers::{RegisterShape, RegisterValue, Registers};
+use crate::bishedit::snippet::{Abbr, Snippet};
 use crate::bishedit::suggestion::{SuggestionProvider, SuggestionRequest};
 use crate::bishedit::undo::UndoTree;
 use crate::bishedit::unicode_width::char_width;
@@ -618,6 +619,81 @@ fn accept_suggestion(ed: &mut LineEditor, tail: &str) {
     ed.splice_word(end, end, tail);
 }
 
+// A snippet that is currently spliced into the line, tentatively: the
+// model itself (bishedit::snippet::Snippet -- which placeholder is
+// active, what has been typed into each) plus the two things only the
+// line editor knows, namely where in `ed.buf` its rendered text sits and
+// what the line looked like before it got there.
+//
+// The invariant every method below preserves: `ed.buf[start..start+len]`
+// is exactly `snip.render()`, and the real cursor is wherever
+// `snip.caret()` says. Nothing else in read_line touches that span while
+// this is `Some`.
+struct SnippetState {
+    snip: Snippet,
+    start: usize,
+    // Char length of the currently-rendered text -- kept alongside
+    // `start` so a re-render knows what to splice *out*, without having
+    // to re-derive it from a model that has already changed.
+    len: usize,
+    // The whole line and cursor from immediately before the abbreviation
+    // expanded, restored verbatim by Ctrl-E. Same shape (and the same
+    // gesture) as `CompletionState::original`.
+    original: Vec<char>,
+    original_cursor: usize,
+}
+
+impl SnippetState {
+    // Rewrites the snippet's span from the model and parks the cursor in
+    // the active placeholder. Called after every edit that touches the
+    // model, so the two can't drift.
+    fn sync(&mut self, ed: &mut LineEditor) {
+        let rendered: Vec<char> = self.snip.render().chars().collect();
+        ed.buf.splice(self.start..self.start + self.len, rendered.iter().copied());
+        self.len = rendered.len();
+        ed.cursor = self.start + self.snip.caret();
+    }
+
+    // Turns the tentative snippet into ordinary text: unfilled
+    // placeholders contribute nothing, and the cursor lands right after
+    // the result -- exactly where it would be if the whole thing had
+    // just been typed out by hand.
+    fn accept(self, ed: &mut LineEditor) {
+        let text = self.snip.accept();
+        ed.splice_word(self.start, self.start + self.len, &text);
+    }
+
+    fn cancel(self, ed: &mut LineEditor) {
+        ed.buf = self.original;
+        ed.cursor = self.original_cursor;
+    }
+
+    // The highlight layer that makes a tentative snippet read as one: the
+    // placeholder being typed into is reverse-video (the same "this is
+    // the selected one" mark the completion menu already uses), the rest
+    // are underlined. Both are drawn over whatever the syntax highlighter
+    // made of the text underneath, since a half-finished command line is
+    // routinely not valid syntax yet.
+    fn layer(&self) -> Vec<StyledSpan> {
+        let active = self.snip.active();
+        self.snip
+            .spans()
+            .into_iter()
+            .enumerate()
+            .map(|(i, (start, end))| StyledSpan {
+                start: self.start + start,
+                end: self.start + end,
+                fg: vt100::Color::Default,
+                attrs: if i == active {
+                    vt100::CellAttrs { reverse: true, ..vt100::CellAttrs::default() }
+                } else {
+                    vt100::CellAttrs { underline: true, ..vt100::CellAttrs::default() }
+                },
+            })
+            .collect()
+    }
+}
+
 // Fish-style `abbr` expansion: called right as the keystroke that would
 // end the word at the cursor arrives (Space) or would submit the whole
 // line (Enter) -- see `Shell::abbrs`'s own doc comment for the storage
@@ -630,7 +706,14 @@ fn accept_suggestion(ed: &mut LineEditor, tail: &str) {
 // changed and, for Enter specifically, that this keystroke shouldn't
 // also submit the line -- fish's own "first Enter expands, second one
 // runs" behavior).
-fn expand_abbr_at_cursor(ed: &mut LineEditor, abbrs: &[(String, String)]) -> bool {
+//
+// An expansion carrying `%s` placeholders splices in as a live snippet
+// instead of as finished text, reported through `snippet` rather than
+// through the return value -- which stays a plain `bool` so the two
+// trigger sites can keep using it as a match guard (`Key::Enter if
+// expand_abbr_at_cursor(..)`), the shape that gives Enter its
+// expand-first-submit-second behavior for free.
+fn expand_abbr_at_cursor(ed: &mut LineEditor, abbrs: &[Abbr], snippet: &mut Option<SnippetState>) -> bool {
     if abbrs.is_empty() {
         return false;
     }
@@ -640,10 +723,20 @@ fn expand_abbr_at_cursor(ed: &mut LineEditor, abbrs: &[(String, String)]) -> boo
         return false;
     }
     let word: String = ed.buf[word_start..ed.cursor].iter().collect();
-    let Some((_, expansion)) = abbrs.iter().find(|(name, _)| *name == word) else {
+    let Some(abbr) = abbrs.iter().find(|a| a.name == word) else {
         return false;
     };
-    ed.splice_word(word_start, ed.cursor, expansion);
+    match Snippet::parse(&abbr.expansion, &abbr.order) {
+        Some(snip) => {
+            let original = ed.buf.clone();
+            let original_cursor = ed.cursor;
+            ed.splice_word(word_start, ed.cursor, "");
+            let mut state = SnippetState { snip, start: word_start, len: 0, original, original_cursor };
+            state.sync(ed);
+            *snippet = Some(state);
+        }
+        None => ed.splice_word(word_start, ed.cursor, &abbr.expansion),
+    }
     true
 }
 
@@ -681,12 +774,17 @@ fn expand_abbr_at_cursor(ed: &mut LineEditor, abbrs: &[(String, String)]) -> boo
 // to in a narrow terminal -- recomputed fresh on every redraw from the
 // cursor's current position, not a persisted scroll offset.
 // `search_matches`: (start, end) char-column ranges within `ed.buf` to
-// highlight (reverse video) -- see compose_redraw's own doc comment on
-// this same parameter. Empty for every caller except run_line_normal_mode
-// (the only context where a vim search, and thus something worth
-// highlighting, can be in progress).
+// show as reverse-video matches. Empty for every caller except
+// run_line_normal_mode (the only context where a vim search, and thus
+// something worth highlighting, can be in progress) -- turned into
+// compose_redraw's own generic `overlay` layer here rather than being a
+// second, parallel mechanism beside it.
 fn redraw(prompt: &str, ed: &LineEditor, col_origin: usize, width: usize, ctx: HighlightContext, search_matches: &[(usize, usize)]) -> io::Result<()> {
-    print!("{}", compose_redraw(prompt, ed, "", col_origin, width, ctx, search_matches));
+    let overlay: Vec<StyledSpan> = search_matches
+        .iter()
+        .map(|&(start, end)| StyledSpan { start, end, fg: vt100::Color::Default, attrs: vt100::CellAttrs { reverse: true, ..vt100::CellAttrs::default() } })
+        .collect();
+    print!("{}", compose_redraw(prompt, ed, "", col_origin, width, ctx, &overlay));
     io::stdout().flush()
 }
 
@@ -707,16 +805,15 @@ fn redraw(prompt: &str, ed: &LineEditor, col_origin: usize, width: usize, ctx: H
 // here). Truncated to fit *here*, not by the caller -- see the
 // `ghost_room` computation below.
 //
-// `search_matches`: (start, end) char-column ranges within `ed.buf` to
-// render in reverse video -- vim's own `hlsearch` treatment, reusing the
-// exact SGR reverse-video bit `vt100::CellAttrs`/`sgr_codes` already
-// support (it's what Ctrl-E's own mode-indicator prompt already renders
-// itself with). Composed as the *last* layer (see highlight::compose's
-// own doc comment on later layers winning), so a match visually wins over
-// both syntax highlighting and a suggestion's ghost tail wherever they
-// overlap -- matching vim, where `hlsearch` sits on top of everything
-// else. Empty for every caller with no search state to highlight.
-fn compose_redraw(prompt: &str, ed: &LineEditor, ghost: &str, col_origin: usize, width: usize, ctx: HighlightContext, search_matches: &[(usize, usize)]) -> String {
+// `overlay`: whatever the caller wants marked up on top of the line --
+// a vim search's own matches in reverse video (`hlsearch`, see
+// `redraw`), or a live `abbr` snippet's placeholders (see
+// `SnippetState::layer`). Composed as the *last* layer (see
+// highlight::compose's own doc comment on later layers winning), so it
+// visually wins over both syntax highlighting and a suggestion's ghost
+// tail wherever they overlap -- matching vim, where `hlsearch` sits on
+// top of everything else. Empty for every caller with nothing to mark.
+fn compose_redraw(prompt: &str, ed: &LineEditor, ghost: &str, col_origin: usize, width: usize, ctx: HighlightContext, overlay: &[StyledSpan]) -> String {
     let mut out = String::new();
     out.push_str(&format!("\x1b[{}G", col_origin + 1));
     out.push_str(&" ".repeat(width));
@@ -785,11 +882,11 @@ fn compose_redraw(prompt: &str, ed: &LineEditor, ghost: &str, col_origin: usize,
             attrs: vt100::CellAttrs { dim: true, ..vt100::CellAttrs::default() },
         }]
     };
-    let search_layer: Vec<StyledSpan> = search_matches
-        .iter()
-        .map(|&(start, end)| StyledSpan { start, end, fg: vt100::Color::Default, attrs: vt100::CellAttrs { reverse: true, ..vt100::CellAttrs::default() } })
-        .collect();
-    let cells = highlight::compose(&combined, &[&styled, &ghost_layer, &search_layer]);
+    // `overlay` last, so whatever the caller is marking up -- a vim
+    // search's own matches, a live `abbr` snippet's placeholders -- wins
+    // over the syntax highlighting underneath it, which for a
+    // half-finished command line is routinely not even valid syntax yet.
+    let cells = highlight::compose(&combined, &[&styled, &ghost_layer, overlay]);
 
     if combined.len() <= remaining {
         out.push_str(&highlight::render_styled(&cells));
@@ -981,8 +1078,11 @@ fn redraw_with_completion_row(
     col_origin: usize,
     width: usize,
     ctx: HighlightContext,
+    // A live `abbr` snippet's own placeholder marking, empty the rest of
+    // the time -- see SnippetState::layer.
+    overlay: &[StyledSpan],
 ) -> io::Result<()> {
-    let mut out = compose_redraw(prompt, ed, ghost, col_origin, width, ctx, &[]);
+    let mut out = compose_redraw(prompt, ed, ghost, col_origin, width, ctx, overlay);
     if menu_capable && (completion.is_some() || menu_was_shown) {
         match row_origin {
             // Grid/promoted mode: absolute positioning only, never
@@ -1005,7 +1105,7 @@ fn redraw_with_completion_row(
                     // Absolute jump back, not \x1b[1A -- fixes both row
                     // and column in one unambiguous move.
                     out.push_str(&format!("\x1b[{};{}H", prompt_row + 1, col_origin + 1));
-                    out.push_str(&compose_redraw(prompt, ed, ghost, col_origin, width, ctx, &[]));
+                    out.push_str(&compose_redraw(prompt, ed, ghost, col_origin, width, ctx, overlay));
                 }
                 // else: no room below the prompt within this pane --
                 // gracefully skip showing the menu this redraw, same
@@ -1022,7 +1122,7 @@ fn redraw_with_completion_row(
                     out.push_str(&render_menu_row_content(state, width));
                 }
                 out.push_str("\x1b[1A");
-                out.push_str(&compose_redraw(prompt, ed, ghost, col_origin, width, ctx, &[]));
+                out.push_str(&compose_redraw(prompt, ed, ghost, col_origin, width, ctx, overlay));
             }
         }
     }
@@ -1270,7 +1370,7 @@ pub fn read_line(
     // meaningful shell context (command mode's colon-line, matching
     // `completion_provider`/`suggestion_provider`'s own `None` there) --
     // `expand_abbr_at_cursor` is a no-op on an empty slice either way.
-    abbrs: &[(String, String)],
+    abbrs: &[Abbr],
     // `(term_rows, term_cols)`, `Some` when Ctrl-E's own line-local
     // Normal mode (run_line_normal_mode, below) should draw its live
     // `/`/`?` search input at the terminal's shared global status row
@@ -1331,6 +1431,13 @@ pub fn read_line(
     // needed for that case).
     let mut completion: Option<CompletionState> = None;
 
+    // The `abbr` snippet currently spliced into the line, if any -- see
+    // SnippetState. Mutually exclusive with `completion` in practice
+    // (nothing can start one while the other is live), but nothing
+    // depends on that beyond the redraw only ever having one extra layer
+    // to draw.
+    let mut snippet: Option<SnippetState> = None;
+
     // Whether a completion menu was showing on the immediately-preceding
     // redraw -- see redraw_with_completion_row's own doc comment for why
     // this exists (its down/erase/up dance must run once more after a
@@ -1364,6 +1471,7 @@ pub fn read_line(
         col_origin,
         width,
         ctx,
+        &[],
     )?;
     menu_was_shown = completion.is_some();
 
@@ -1400,8 +1508,75 @@ pub fn read_line(
         if completion.is_some() && !matches!(key, Key::Tab | Key::BackTab | Key::CtrlN | Key::CtrlP | Key::CtrlE | Key::Up | Key::Down) {
             completion = None;
         }
+        // The same rule one tier over, for a live snippet: any key
+        // outside its own small vocabulary (below) accepts it as it
+        // stands and then means whatever it always meant. So a Left
+        // arrow, a Ctrl-A, or a history recall doesn't have to grow a
+        // snippet-aware case of its own -- it just finds ordinary text
+        // where the placeholders were.
+        if snippet.is_some()
+            && !matches!(
+                key,
+                Key::Tab | Key::BackTab | Key::CtrlN | Key::CtrlP | Key::Enter | Key::CtrlY | Key::CtrlE | Key::Backspace | Key::Char(_)
+            )
+        {
+            snippet.take().unwrap().accept(&mut ed);
+        }
 
         match key {
+            // --- a live `abbr` snippet owns these eight keys ---------
+            // Tab/Shift-Tab and Ctrl-N/Ctrl-P step between placeholders,
+            // the same two pairs that cycle a completion menu -- there's
+            // never both at once (see the `snippet` local's own comment),
+            // so the overload costs nothing.
+            Key::Tab | Key::CtrlN if snippet.is_some() => {
+                let state = snippet.as_mut().unwrap();
+                state.snip.advance(false);
+                state.sync(&mut ed);
+            }
+            Key::BackTab | Key::CtrlP if snippet.is_some() => {
+                let state = snippet.as_mut().unwrap();
+                state.snip.advance(true);
+                state.sync(&mut ed);
+            }
+            // Enter advances like Tab, except on the last placeholder in
+            // visit order, where there's nothing left to advance *to* and
+            // it accepts instead. Accepting does not also submit: the
+            // line is left there to look over, exactly as a plain
+            // abbreviation's own first Enter leaves its expansion.
+            Key::Enter if snippet.as_ref().is_some_and(|s| !s.snip.at_last()) => {
+                let state = snippet.as_mut().unwrap();
+                state.snip.advance(false);
+                state.sync(&mut ed);
+            }
+            Key::Enter | Key::CtrlY if snippet.is_some() => {
+                snippet.take().unwrap().accept(&mut ed);
+            }
+            // Ctrl-E discards the whole thing and puts the line back the
+            // way it was, abbreviation name and all -- the same key, and
+            // the same meaning, a live completion already gives it.
+            Key::CtrlE if snippet.is_some() => {
+                snippet.take().unwrap().cancel(&mut ed);
+            }
+            // Backspace only ever eats what was typed into the active
+            // placeholder. With nothing left in it, it stops there rather
+            // than chewing into the snippet's own literal text -- which
+            // is not something the model could put back.
+            Key::Backspace if snippet.is_some() => {
+                let state = snippet.as_mut().unwrap();
+                if state.snip.backspace() {
+                    state.sync(&mut ed);
+                }
+            }
+            // Typing (space included -- a placeholder standing in for
+            // `-m "%s"`'s message wants spaces) fills the active
+            // placeholder, replacing the `%s` shown there.
+            Key::Char(c) if snippet.is_some() => {
+                let state = snippet.as_mut().unwrap();
+                state.snip.type_char(c);
+                state.sync(&mut ed);
+            }
+
             // Fish's own "first Enter expands, second one runs": if the
             // word right at the cursor is a command-position abbreviation,
             // this Enter only expands it and falls through to the ordinary
@@ -1410,7 +1585,7 @@ pub fn read_line(
             // running it, not run the un-expanded short form. A second,
             // immediate Enter then finds nothing left to expand and
             // submits normally.
-            Key::Enter if expand_abbr_at_cursor(&mut ed, abbrs) => {}
+            Key::Enter if expand_abbr_at_cursor(&mut ed, abbrs, &mut snippet) => {}
             Key::Enter => {
                 drop(guard.take());
                 print!("\r\n");
@@ -1508,8 +1683,15 @@ pub fn read_line(
             // ("gco" + Space becomes "git checkout " -- expansion plus the
             // space that ended it, not one or the other).
             Key::Char(' ') => {
-                expand_abbr_at_cursor(&mut ed, abbrs);
-                ed.insert(' ');
+                // A snippet swallows the space that triggered it: the
+                // caret is already parked inside the first placeholder,
+                // and a space there would be the first thing typed *into*
+                // it -- never what "end the abbreviation" meant. A plain
+                // expansion still gets it, unchanged.
+                expand_abbr_at_cursor(&mut ed, abbrs, &mut snippet);
+                if snippet.is_none() {
+                    ed.insert(' ');
+                }
             }
             Key::Char(c) => ed.insert(c),
             // Once a completion menu is active, Up/Down cycle it instead
@@ -1681,7 +1863,8 @@ pub fn read_line(
         // own doc comment. Must happen after the match (so it reflects
         // whatever the just-dispatched key actually did to the buffer/
         // completion/browse state) and before the redraw that shows it.
-        suggestion = compute_suggestion(&ed, suggestion_provider, completion.is_some(), browse.is_some());
+        suggestion = compute_suggestion(&ed, suggestion_provider, completion.is_some() || snippet.is_some(), browse.is_some());
+        let overlay = snippet.as_ref().map(SnippetState::layer).unwrap_or_default();
         redraw_with_completion_row(
             prompt,
             &ed,
@@ -1693,6 +1876,7 @@ pub fn read_line(
             col_origin,
             width,
             ctx,
+            &overlay,
         )?;
         menu_was_shown = completion.is_some();
     }
@@ -1797,8 +1981,8 @@ fn normal_mode_prompt_and_matches(
     (None, matches)
 }
 
-// Extends `matches` (search-match column ranges, already reverse-video --
-// see `compose_redraw`'s own `search_matches` doc comment) with every
+// Extends `matches` (search-match column ranges, rendered reverse-video
+// -- see `redraw`'s own `search_matches` doc comment) with every
 // committed selection plus the active one, if any -- Visual mode's own
 // highlighting piggybacks on exactly the same rendering, matching
 // repl.rs's own `render_normal_mode_frame`.
@@ -3754,15 +3938,25 @@ mod tests {
         assert_eq!(selection_columns_line(&linewise, 11), (0, 11));
     }
 
-    fn abbrs(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
-        pairs.iter().map(|(n, e)| (n.to_string(), e.to_string())).collect()
+    fn abbrs(pairs: &[(&str, &str)]) -> Vec<Abbr> {
+        pairs.iter().map(|(n, e)| Abbr::new(n, e)).collect()
+    }
+
+    // The two trigger sites both pass a `&mut Option<SnippetState>`;
+    // these tests are about plain (placeholder-free) expansions, where it
+    // is never written to.
+    fn expand(ed: &mut LineEditor, table: &[Abbr]) -> bool {
+        let mut snippet = None;
+        let expanded = expand_abbr_at_cursor(ed, table, &mut snippet);
+        assert!(snippet.is_none(), "a placeholder-free expansion is plain text, not a snippet");
+        expanded
     }
 
     #[test]
     fn expand_abbr_at_cursor_replaces_a_known_command_position_word() {
         let mut ed = make_editor("gco", 3);
         let table = abbrs(&[("gco", "git checkout")]);
-        assert!(expand_abbr_at_cursor(&mut ed, &table));
+        assert!(expand(&mut ed, &table));
         assert_eq!(ed.as_string(), "git checkout");
         assert_eq!(ed.cursor, "git checkout".len());
     }
@@ -3771,7 +3965,7 @@ mod tests {
     fn expand_abbr_at_cursor_does_nothing_for_an_unknown_word() {
         let mut ed = make_editor("nope", 4);
         let table = abbrs(&[("gco", "git checkout")]);
-        assert!(!expand_abbr_at_cursor(&mut ed, &table));
+        assert!(!expand(&mut ed, &table));
         assert_eq!(ed.as_string(), "nope");
     }
 
@@ -3782,7 +3976,7 @@ mod tests {
         // so does this port (see expand_abbr_at_cursor's own doc comment).
         let mut ed = make_editor("echo gco", 8);
         let table = abbrs(&[("gco", "git checkout")]);
-        assert!(!expand_abbr_at_cursor(&mut ed, &table));
+        assert!(!expand(&mut ed, &table));
         assert_eq!(ed.as_string(), "echo gco");
     }
 
@@ -3793,14 +3987,110 @@ mod tests {
         // "gco" appears later on the line.
         let mut ed = make_editor("gco", 2);
         let table = abbrs(&[("gco", "git checkout"), ("gc", "git commit")]);
-        assert!(expand_abbr_at_cursor(&mut ed, &table));
+        assert!(expand(&mut ed, &table));
         assert_eq!(ed.as_string(), "git commito");
     }
 
     #[test]
     fn expand_abbr_at_cursor_is_a_noop_on_an_empty_table() {
         let mut ed = make_editor("gco", 3);
-        assert!(!expand_abbr_at_cursor(&mut ed, &[]));
+        assert!(!expand(&mut ed, &[]));
         assert_eq!(ed.as_string(), "gco");
+    }
+
+    // --- `abbr` snippets -------------------------------------------
+    //
+    // The keystroke *dispatch* (which key advances, accepts, cancels)
+    // lives inline in read_line's own match and needs a real terminal;
+    // what's testable here is everything underneath it -- the model
+    // (bishedit::snippet's own tests) and the seam between the model and
+    // the line editor, which is this.
+
+    fn start_snippet(line: &str, cursor: usize, expansion: &str, order: &[usize]) -> (LineEditor, SnippetState) {
+        let mut ed = make_editor(line, cursor);
+        let table = vec![Abbr { name: "foo".to_string(), expansion: expansion.to_string(), order: order.to_vec() }];
+        let mut snippet = None;
+        assert!(expand_abbr_at_cursor(&mut ed, &table, &mut snippet));
+        (ed, snippet.expect("an expansion with placeholders is a snippet"))
+    }
+
+    fn type_text(ed: &mut LineEditor, state: &mut SnippetState, text: &str) {
+        for c in text.chars() {
+            state.snip.type_char(c);
+            state.sync(ed);
+        }
+    }
+
+    #[test]
+    fn an_expansion_with_placeholders_splices_in_tentatively() {
+        let (ed, state) = start_snippet("foo", 3, "bar -x %s -y %s | qoo", &[]);
+        assert_eq!(ed.as_string(), "bar -x %s -y %s | qoo");
+        assert_eq!(state.start, 0);
+        // The caret parks at the first placeholder, not at the end of the
+        // expansion the way a plain abbreviation leaves it.
+        assert_eq!(ed.cursor, 7);
+    }
+
+    #[test]
+    fn a_snippet_only_ever_rewrites_its_own_span_of_the_line() {
+        let (mut ed, mut state) = start_snippet("foo", 3, "cd %s", &[]);
+        // Text typed after the abbreviation would normally be to the
+        // right; simulate the same thing by expanding mid-line.
+        assert_eq!(ed.as_string(), "cd %s");
+        type_text(&mut ed, &mut state, "src");
+        assert_eq!(ed.as_string(), "cd src");
+        assert_eq!(ed.cursor, 6);
+    }
+
+    #[test]
+    fn accepting_leaves_the_cursor_where_typing_it_out_would_have() {
+        let (mut ed, mut state) = start_snippet("foo", 3, "bar -x %s -y %s | qoo", &[]);
+        type_text(&mut ed, &mut state, "one");
+        state.snip.advance(false);
+        state.sync(&mut ed);
+        type_text(&mut ed, &mut state, "two");
+        state.accept(&mut ed);
+        assert_eq!(ed.as_string(), "bar -x one -y two | qoo");
+        assert_eq!(ed.cursor, ed.buf.len(), "the cursor lands after the whole expansion, as if typed");
+    }
+
+    #[test]
+    fn cancelling_puts_the_abbreviation_name_back_verbatim() {
+        let (mut ed, mut state) = start_snippet("echo hi; foo", 12, "cd %s", &[]);
+        assert_eq!(ed.as_string(), "echo hi; cd %s");
+        type_text(&mut ed, &mut state, "src");
+        state.cancel(&mut ed);
+        assert_eq!(ed.as_string(), "echo hi; foo");
+        assert_eq!(ed.cursor, 12);
+    }
+
+    #[test]
+    fn the_placeholder_layer_marks_the_active_one_differently() {
+        let (_, state) = start_snippet("foo", 3, "a %s b %s", &[]);
+        let layer = state.layer();
+        assert_eq!(layer.len(), 2);
+        assert!(layer[0].attrs.reverse, "the placeholder being typed into is the reverse-video one");
+        assert!(!layer[1].attrs.reverse && layer[1].attrs.underline);
+    }
+
+    #[test]
+    fn the_layer_is_offset_by_where_the_snippet_actually_sits() {
+        let (_, state) = start_snippet("echo hi; foo", 12, "cd %s", &[]);
+        assert_eq!(state.start, 9);
+        let layer = state.layer();
+        // "echo hi; cd " is 12 chars, then the `%s`.
+        assert_eq!((layer[0].start, layer[0].end), (12, 14));
+    }
+
+    #[test]
+    fn a_reversed_order_fills_the_second_placeholder_first() {
+        let (mut ed, mut state) = start_snippet("foo", 3, "bar -x %s -y %s", &[1, 0]);
+        type_text(&mut ed, &mut state, "why");
+        assert_eq!(ed.as_string(), "bar -x %s -y why", "the caret started on the *second* hole");
+        state.snip.advance(false);
+        state.sync(&mut ed);
+        type_text(&mut ed, &mut state, "ex");
+        state.accept(&mut ed);
+        assert_eq!(ed.as_string(), "bar -x ex -y why");
     }
 }

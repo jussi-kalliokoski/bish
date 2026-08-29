@@ -13,6 +13,7 @@ pub mod lint;
 pub mod manpages;
 pub mod motion;
 pub mod registers;
+pub mod snippet;
 pub mod suggestion;
 pub mod textbuffer;
 pub mod undo;

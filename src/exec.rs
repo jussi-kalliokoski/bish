@@ -6,6 +6,7 @@ use std::rc::Rc;
 
 use crate::arith;
 use crate::bishedit::highlight;
+use crate::bishedit::snippet::{self, Abbr};
 use crate::builtins;
 use crate::compgen;
 use crate::glob;
@@ -597,15 +598,17 @@ pub struct Shell {
     // `aliases` above, these *do* expand, but never here in exec.rs. The
     // trigger lives entirely in editor.rs's own read_line (Space/Enter
     // right after typing NAME in command position splices EXPANSION into
-    // the line the user sees, before it's ever submitted) -- this table
-    // exists in `Shell` purely as the thing `abbr`'s own builtin (below)
-    // reads/writes and repl.rs snapshots per prompt to hand to read_line,
-    // same "owned-snapshot, not a live borrow" pattern as `cwd`/
-    // `function_names()` already use for `HighlightContext`/
-    // `ShellCompletionProvider`. Same Vec-not-map choice as `aliases`,
-    // same reasoning. `pub`, not private, for exactly that snapshotting
-    // (repl.rs is a different module) -- matching `cwd`'s own visibility.
-    pub abbrs: Vec<(String, String)>,
+    // the line the user sees, before it's ever submitted; an expansion
+    // with `%s` placeholders splices in as a live snippet instead -- see
+    // bishedit::snippet) -- this table exists in `Shell` purely as the
+    // thing `abbr`'s own builtin (below) reads/writes and repl.rs
+    // snapshots per prompt to hand to read_line, same "owned-snapshot,
+    // not a live borrow" pattern as `cwd`/`function_names()` already use
+    // for `HighlightContext`/`ShellCompletionProvider`. Same Vec-not-map
+    // choice as `aliases`, same reasoning. `pub`, not private, for
+    // exactly that snapshotting (repl.rs is a different module) --
+    // matching `cwd`'s own visibility.
+    pub abbrs: Vec<Abbr>,
     // One frame per active function call (pushed/popped alongside
     // var_scopes in call_function). `local -a`/`-A name` snapshots the
     // array's pre-local value here (None if it didn't exist) before
@@ -3170,10 +3173,13 @@ impl Shell {
     // the actual expansion happens in editor.rs's read_line). Deliberately
     // scoped down from real fish's own `abbr`: no `--rename`, no
     // `--position anywhere` (always command position, fish's own default),
-    // no `%`-cursor-placeholder tokens, no regex/function-backed
-    // abbreviations, no scope flags (`-U`/`-g`, meaningless here -- bish
-    // has no fish-variable-style scoping at all) -- just add/erase/list/
-    // show/query, the part of `abbr` people actually reach for day to day.
+    // no regex/function-backed abbreviations, no scope flags (`-U`/`-g`,
+    // meaningless here -- bish has no fish-variable-style scoping at all)
+    // -- just add/erase/list/show/query, the part of `abbr` people
+    // actually reach for day to day. An expansion *can* carry `%s`
+    // placeholders, which makes it a snippet rather than plain text (see
+    // bishedit::snippet, and `parse_placeholder_order` just below for how
+    // a trailing `2 1` is told apart from two more words of expansion).
     // `-a`/`--add` is optional (`abbr NAME EXPANSION` alone means add, `abbr`
     // with a recognized name misparsed as NAME would just mean "add an
     // abbreviation literally named `-x`" -- an accepted, unvalidated edge
@@ -3210,10 +3216,14 @@ impl Shell {
                     sh_eprintln!(self, "bish: abbr: -a: requires an EXPANSION for '{name}'");
                     return 2;
                 }
+                let (expansion_words, order) = snippet::parse_order(expansion_words);
                 let expansion = expansion_words.join(" ");
-                match self.abbrs.iter_mut().find(|(n, _)| n == name) {
-                    Some(existing) => existing.1 = expansion,
-                    None => self.abbrs.push((name.clone(), expansion)),
+                match self.abbrs.iter_mut().find(|a| a.name == *name) {
+                    Some(existing) => {
+                        existing.expansion = expansion;
+                        existing.order = order;
+                    }
+                    None => self.abbrs.push(Abbr { name: name.clone(), expansion, order }),
                 }
                 0
             }
@@ -3224,7 +3234,7 @@ impl Shell {
                 }
                 let mut status = 0;
                 for name in rest {
-                    match self.abbrs.iter().position(|(n, _)| n == name) {
+                    match self.abbrs.iter().position(|a| a.name == *name) {
                         Some(pos) => {
                             self.abbrs.remove(pos);
                         }
@@ -3237,14 +3247,28 @@ impl Shell {
                 status
             }
             Mode::List => {
-                for (name, _) in &self.abbrs {
-                    sh_println!(self, "{name}");
+                for abbr in &self.abbrs {
+                    sh_println!(self, "{}", abbr.name);
                 }
                 0
             }
             Mode::Show => {
-                for (name, expansion) in &self.abbrs {
-                    sh_println!(self, "abbr -a {} {}", crate::serialize::quote_literal(name), crate::serialize::quote_literal(expansion));
+                for abbr in &self.abbrs {
+                    // A non-text-order permutation is printed back as the
+                    // same trailing 1-based run that set it, so `abbr -s`
+                    // stays something you can paste straight back in.
+                    let order = if abbr.order.is_empty() {
+                        String::new()
+                    } else {
+                        abbr.order.iter().map(|i| format!(" {}", i + 1)).collect()
+                    };
+                    sh_println!(
+                        self,
+                        "abbr -a {} {}{}",
+                        crate::serialize::quote_literal(&abbr.name),
+                        crate::serialize::quote_literal(&abbr.expansion),
+                        order
+                    );
                 }
                 0
             }
@@ -3253,7 +3277,7 @@ impl Shell {
                     sh_eprintln!(self, "bish: abbr: -q: requires at least one NAME");
                     return 2;
                 }
-                if rest.iter().all(|name| self.abbrs.iter().any(|(n, _)| n == name)) { 0 } else { 1 }
+                if rest.iter().all(|name| self.abbrs.iter().any(|a| a.name == *name)) { 0 } else { 1 }
             }
         }
     }
@@ -10462,14 +10486,14 @@ mod tests {
     fn abbr_add_registers_a_multi_word_expansion_joined_by_single_spaces() {
         let mut shell = Shell::new();
         assert_eq!(shell.run_abbr(&strs(&["-a", "gco", "git", "checkout"])), 0);
-        assert_eq!(shell.abbrs, vec![("gco".to_string(), "git checkout".to_string())]);
+        assert_eq!(shell.abbrs, vec![Abbr::new("gco", "git checkout")]);
     }
 
     #[test]
     fn abbr_add_without_the_dash_a_flag_still_adds() {
         let mut shell = Shell::new();
         assert_eq!(shell.run_abbr(&strs(&["ll", "ls", "-la"])), 0);
-        assert_eq!(shell.abbrs, vec![("ll".to_string(), "ls -la".to_string())]);
+        assert_eq!(shell.abbrs, vec![Abbr::new("ll", "ls -la")]);
     }
 
     #[test]
@@ -10477,7 +10501,7 @@ mod tests {
         let mut shell = Shell::new();
         shell.run_abbr(&strs(&["-a", "gco", "git", "checkout"]));
         shell.run_abbr(&strs(&["-a", "gco", "git", "switch"]));
-        assert_eq!(shell.abbrs, vec![("gco".to_string(), "git switch".to_string())]);
+        assert_eq!(shell.abbrs, vec![Abbr::new("gco", "git switch")]);
     }
 
     #[test]
@@ -10505,7 +10529,48 @@ mod tests {
         assert_eq!(shell.run_abbr(&strs(&["-l"])), 0);
         assert_eq!(shell.run_abbr(&strs(&["-s"])), 0);
         assert_eq!(shell.run_abbr(&[]), 0);
-        assert_eq!(shell.abbrs, vec![("gco".to_string(), "git checkout".to_string())]);
+        assert_eq!(shell.abbrs, vec![Abbr::new("gco", "git checkout")]);
+    }
+
+    #[test]
+    fn abbr_add_reads_a_trailing_integer_run_as_the_placeholder_order() {
+        let mut shell = Shell::new();
+        assert_eq!(shell.run_abbr(&strs(&["--add", "foo", "bar -x %s -y %s", "2", "1"])), 0);
+        assert_eq!(shell.abbrs, vec![Abbr { name: "foo".into(), expansion: "bar -x %s -y %s".into(), order: vec![1, 0] }]);
+    }
+
+    #[test]
+    fn abbr_add_keeps_trailing_integers_as_expansion_words_unless_they_really_are_an_order() {
+        let mut shell = Shell::new();
+        // No placeholders at all: "1 2" is just more of the expansion,
+        // exactly as it was before snippets existed.
+        assert_eq!(shell.run_abbr(&strs(&["-a", "e12", "echo", "1", "2"])), 0);
+        // The right count, but not a permutation.
+        assert_eq!(shell.run_abbr(&strs(&["-a", "dup", "echo %s %s", "1", "1"])), 0);
+        // A permutation, but of the wrong length for one placeholder.
+        assert_eq!(shell.run_abbr(&strs(&["-a", "one", "echo %s", "1", "2"])), 0);
+        assert_eq!(
+            shell.abbrs,
+            vec![Abbr::new("e12", "echo 1 2"), Abbr::new("dup", "echo %s %s 1 1"), Abbr::new("one", "echo %s 1 2")]
+        );
+    }
+
+    #[test]
+    fn abbr_order_is_only_ever_found_in_separate_words() {
+        let mut shell = Shell::new();
+        // Quoted as one word, `1` is expansion text -- the only way to
+        // write an expansion that really does end in a number.
+        assert_eq!(shell.run_abbr(&strs(&["-a", "foo", "echo %s 1"])), 0);
+        assert_eq!(shell.abbrs, vec![Abbr::new("foo", "echo %s 1")]);
+    }
+
+    #[test]
+    fn abbr_show_round_trips_a_placeholder_order() {
+        let mut shell = Shell::new();
+        shell.run_abbr(&strs(&["-a", "foo", "bar -x %s -y %s", "2", "1"]));
+        let out = capture_output(&mut shell);
+        shell.run_abbr(&strs(&["-s"]));
+        assert_eq!(out.borrow().as_str(), "abbr -a 'foo' 'bar -x %s -y %s' 2 1\n");
     }
 
     #[test]
@@ -10522,7 +10587,7 @@ mod tests {
         let mut child = parent.new_virtual_child();
         assert_eq!(child.abbrs, parent.abbrs);
         child.run_abbr(&strs(&["-a", "gs", "git", "status"]));
-        assert!(!parent.abbrs.iter().any(|(n, _)| n == "gs"), "parent must not see the child's later abbr additions");
+        assert!(!parent.abbrs.iter().any(|a| a.name == "gs"), "parent must not see the child's later abbr additions");
     }
 
     #[test]
