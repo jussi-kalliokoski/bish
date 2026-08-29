@@ -966,17 +966,20 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
                         pending_initial = Some((t, c));
                         // Resuming straight back into ordinary prompt
                         // typing -- read_line's own redraw only ever
-                        // touches its own prompt line, never the global
-                        // mode-line row this excursion was just using
-                        // (render_normal_mode_frame/render_global_status_
-                        // row), so it'd otherwise sit there stale
-                        // forever. A full compositor_redraw, same as
-                        // every sibling arm here (Interrupted/DirNav/
-                        // CtrlL) -- a targeted single-row clear instead
-                        // left the real cursor parked on that row, which
-                        // read_line's own *relative* prompt redraw then
-                        // trusted as already being on row 0, landing the
-                        // live prompt on the wrong row entirely.
+                        // touches its own prompt line, and
+                        // compositor_redraw only ever paints the panes
+                        // and the tab bar, so the global mode-line row
+                        // this excursion was using (render_normal_mode_
+                        // frame/render_global_status_row) belongs to
+                        // neither and would sit there stale: a
+                        // "-- NORMAL --  i or :q to return to the
+                        // prompt" still telling you how to leave a mode
+                        // you already left. Erased explicitly, and
+                        // *before* the repaint so the repaint's own
+                        // closing cursor placement is what the prompt
+                        // then draws against -- the same ordering, for
+                        // the same reason, as run_edit_frame's own exit.
+                        print!("{}", erase_global_status_row(term_rows));
                         if sinks_are_grid {
                             compositor_redraw(&sessions, &windows, current_window, term_rows, term_cols);
                         }
@@ -3803,10 +3806,13 @@ fn drive_fg_job(job: &mut exec::FgJob, screen: &Rc<RefCell<vt100::Screen>>, mut 
     outcome
 }
 
-// Keeps every OTHER pane's fg'd job alive while (skip_window,
-// its focused pane) is the one actually being watched (via
-// drive_fg_job) or typed into (via editor::read_line) -- called from
-// both of those as their on_idle hook (M10c). A Frame::Job can end up
+// Keeps every fg'd job alive while some other loop owns the terminal --
+// called as the on_idle hook of `drive_fg_job` (watching one job),
+// `editor::read_line` (typing at a prompt), and normal mode. `skip_window`
+// names the window whose focus those loops belong to; it no longer
+// exempts that window's focused *pane* from being drained (see the loop
+// below for why that exemption was both unnecessary and harmful), only
+// steering the resize/redraw handling above. A Frame::Job can end up
 // in any pane, not just the focused one of its window (the user can
 // navigate focus away via `window` h/j/k/l while it's still running),
 // so every pane of every window is checked here, not just each
@@ -3879,9 +3885,19 @@ fn service_background_jobs(
     for i in 0..windows.len() {
         let pane_ids: Vec<PaneId> = windows[i].panes.iter().map(|p| p.id).collect();
         for pane_id in pane_ids {
-            if i == skip_window && pane_id == windows[i].focused_pane {
-                continue;
-            }
+            // No focused-pane exemption: `run_fg_job_frame` *removes* the
+            // job it's driving from `job_frames` for the whole time it
+            // holds it (re-inserting on the way out), so the lookup below
+            // already misses for a job someone else is reading -- the
+            // skip that used to be here was belt-and-braces, and it cost
+            // the one case it actually covered. Ctrl+Space out of a
+            // running job and normal mode owns that pane while nothing
+            // reads its pty: the job stalled the moment its buffer
+            // filled, and everything it had said appeared in one lump
+            // only once normal mode was left. It keeps running now, into
+            // its own session's grid, with the reader's viewport left
+            // where they put it and the mode line reporting what arrived
+            // (see ScreenBuffer::new_lines).
             let job_frame_id = match windows[i].pane(pane_id).stack.last() {
                 Some(Frame::Job(id)) => *id,
                 _ => continue,
@@ -4637,6 +4653,18 @@ struct ScreenBuffer {
     // a new type -- `extract_text` already knows how to read one of these
     // regardless of who built it.
     selections: Vec<motion::MotionRange>,
+    // `line_count()` at the moment this excursion started. Normal mode
+    // deliberately does *not* follow new output -- the whole point is to
+    // hold still while you read -- so anything the pane produces
+    // meanwhile lands below the viewport with nothing to show for it.
+    // The mode line reports the difference instead (see
+    // `normal_mode_status_text`), which is the only hint you'd otherwise
+    // get that a job you stepped away from is still talking.
+    entry_line_count: usize,
+    // The `new_lines()` value the mode line was last drawn with, so the
+    // idle loop can tell "something arrived since the last frame" from
+    // "nothing has moved" and only redraw for the former.
+    reported_new_lines: usize,
 }
 
 // The scrollback length to use for `ScreenBuffer`'s own combined
@@ -4676,7 +4704,27 @@ impl ScreenBuffer {
         let cursor = (sb_len + cur_row, cur_col);
         let vheight = vheight.max(1);
         let vtop = cursor.0.saturating_sub(vheight - 1);
-        ScreenBuffer { screen, cursor, vtop, vheight, marks: HashMap::new(), selections: Vec::new() }
+        let entry_line_count = (sb_len + cur_row + 1).max(1);
+        ScreenBuffer { screen, cursor, vtop, vheight, marks: HashMap::new(), selections: Vec::new(), entry_line_count, reported_new_lines: 0 }
+    }
+
+    // How many lines the pane has gained since this excursion started --
+    // see `entry_line_count`. Saturating rather than signed: a pane can
+    // lose lines too (a full-screen program clearing its alternate
+    // screen), and "-2 lines" is not news anyone can act on.
+    fn new_lines(&self) -> usize {
+        self.line_count().saturating_sub(self.entry_line_count)
+    }
+
+    // Whether `new_lines()` has moved since the last time this was asked
+    // -- the idle loop's cue to redraw the mode line, and nothing else.
+    fn new_lines_changed(&mut self) -> bool {
+        let now = self.new_lines();
+        if now == self.reported_new_lines {
+            return false;
+        }
+        self.reported_new_lines = now;
+        true
     }
 
     // `line`'s own raw cell count -- the live grid's current width for a
@@ -4808,6 +4856,16 @@ enum NavBuffer {
 }
 
 impl NavBuffer {
+    // See ScreenBuffer::new_lines_changed. Only a shell pane grows under
+    // the reader like this: an `Editable` buffer is a file, and nothing
+    // else is writing to it while normal mode has it.
+    fn new_lines_changed(&mut self) -> bool {
+        match self {
+            NavBuffer::ReadOnly(b) => b.new_lines_changed(),
+            NavBuffer::Editable(_) => false,
+        }
+    }
+
     fn selections(&self) -> &Vec<motion::MotionRange> {
         match self {
             NavBuffer::ReadOnly(b) => &b.selections,
@@ -5110,26 +5168,78 @@ fn normal_mode_status_left(vk: &VimKeys, command_line: Option<&str>) -> String {
     format!("{}{}", recording, label)
 }
 
+// A chip set into the mode line: drawn *un*-reversed inside a row that
+// `render_global_status_row` has already put in reverse video, so it
+// reads as an inset label rather than as more status text -- the same
+// "pill" convention render_diagnostics_title and the `dbg:` pane
+// already use, inverted because this row's background is the reversed
+// one to begin with.
+fn status_pill(text: &str) -> String {
+    format!("\x1b[27m {text} \x1b[7m")
+}
+
+// How to leave. Normal mode over a shell pane is entered with
+// Ctrl+Space and left with `i` (or any other insert command) or `:q` --
+// notably *not* Escape, which here only clears a selection, and not
+// `q`, which starts recording a macro. None of that is guessable, and
+// someone who hit Ctrl+Space without meaning to has nothing at all to go
+// on, so the mode line says it outright for as long as the mode is up.
+// The short form is for panes too narrow to fit the sentence.
+const NORMAL_MODE_EXIT_HINT: &str = "i or :q to return to the prompt";
+const NORMAL_MODE_EXIT_HINT_SHORT: &str = "i to return";
+
 fn normal_mode_status_text(buf: &ScreenBuffer, vk: &VimKeys, command_line: Option<&str>, cols: usize) -> String {
     let left = normal_mode_status_left(vk, command_line);
     let (line, col) = buf.cursor();
     let total = buf.line_count();
     let right = format!("{},{}  {}/{}", line + 1, col + 1, line + 1, total);
 
-    let left_len = left.chars().count();
+    // While a `:`/`/` line is being typed the row *is* that line: no room
+    // for chips, and nothing worth advertising either -- Escape gets you
+    // back out of one, which is the one place here it does what people
+    // expect.
+    let news = (command_line.is_none() && buf.new_lines() > 0).then(|| {
+        let n = buf.new_lines();
+        format!("+{n} new line{}", if n == 1 { "" } else { "s" })
+    });
+    let chips: Vec<Vec<String>> = if command_line.is_some() {
+        vec![Vec::new()]
+    } else {
+        // Widest first; the first set that fits wins. The exit hint is
+        // the last thing to go, and only shrinks rather than vanishing
+        // while there's any room at all -- a narrow pane is exactly
+        // where someone stuck in here has least to work with.
+        let mut candidates = Vec::new();
+        for hint in [NORMAL_MODE_EXIT_HINT, NORMAL_MODE_EXIT_HINT_SHORT] {
+            if let Some(news) = &news {
+                candidates.push(vec![hint.to_string(), news.clone()]);
+            }
+        }
+        if let Some(news) = &news {
+            candidates.push(vec![news.clone()]);
+        }
+        candidates.push(vec![NORMAL_MODE_EXIT_HINT.to_string()]);
+        candidates.push(vec![NORMAL_MODE_EXIT_HINT_SHORT.to_string()]);
+        candidates.push(Vec::new());
+        candidates
+    };
+
     let right_len = right.chars().count();
-    let mut text = left;
-    if left_len + right_len < cols {
-        text.push_str(&" ".repeat(cols - left_len - right_len));
-        text.push_str(&right);
+    for chip_set in &chips {
+        let pills: String = chip_set.iter().map(|c| status_pill(c)).collect();
+        let gap = if chip_set.is_empty() { "" } else { "  " };
+        let body = format!("{left}{gap}{pills}");
+        let body_len = editor::visible_len(&body);
+        if body_len + right_len > cols {
+            continue;
+        }
+        return format!("{body}{}{right}", " ".repeat(cols - body_len - right_len));
     }
+    // Not even the bare mode label and position fit -- same truncation
+    // this always did.
+    let text: String = left.chars().take(cols).collect();
     let text_len = text.chars().count();
-    match text_len.cmp(&cols) {
-        std::cmp::Ordering::Less => text.push_str(&" ".repeat(cols - text_len)),
-        std::cmp::Ordering::Greater => text = text.chars().take(cols).collect(),
-        std::cmp::Ordering::Equal => {}
-    }
-    text
+    format!("{text}{}", " ".repeat(cols.saturating_sub(text_len)))
 }
 
 // The search pattern to highlight (see render_normal_mode_row's own doc
@@ -5606,7 +5716,16 @@ fn run_normal_mode_navigation(
         // be never). Same IDLE_POLL_MS interval read_key_idle's own
         // loop uses, so behavior is identical once a byte does arrive.
         while !term::stdin_ready(editor::IDLE_POLL_MS) {
-            if service_background_jobs(sessions, windows, job_frames, *current_window, term_rows, term_cols, *sinks_are_grid) {
+            let attached = service_background_jobs(sessions, windows, job_frames, *current_window, term_rows, term_cols, *sinks_are_grid);
+            // A job this pane stepped away from is still producing, and
+            // the mode line's own "+N new lines below" has to keep up
+            // with it -- otherwise the count is only ever as fresh as the
+            // last keystroke, which for someone sitting still and reading
+            // is never. Redrawing costs nothing visible: the viewport
+            // stays exactly where it was put (that's the whole point of
+            // this mode), so only the status row actually changes.
+            let grew = buf.new_lines_changed();
+            if attached || grew {
                 // compositor_redraw already ran (inside
                 // service_background_jobs), but that alone paints this
                 // pane blank if it's a `Frame::Edit` (see that
@@ -8763,6 +8882,103 @@ mod terminal_frame_capture_tests {
         let frame = TerminalFrame::capture(&layout, "", 2, 3);
         assert_eq!(frame.cells[0].ch, 'a');
         assert_eq!(frame.cells[1].ch, 'b');
+    }
+}
+
+#[cfg(test)]
+mod normal_mode_status_tests {
+    use super::*;
+
+    fn nav_buffer(rows: usize, seed: &[u8]) -> ScreenBuffer {
+        let screen = Rc::new(RefCell::new(vt100::Screen::new(rows, 200)));
+        screen.borrow_mut().feed(seed);
+        ScreenBuffer::new(screen, rows)
+    }
+
+    fn status(buf: &ScreenBuffer, cols: usize) -> String {
+        let plain = normal_mode_status_text(buf, &VimKeys::new(), None, cols);
+        // The chips carry their own SGR; strip it to assert on text.
+        let mut out = String::new();
+        let mut chars = plain.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '\x1b' && chars.peek() == Some(&'[') {
+                for c2 in chars.by_ref() {
+                    if c2 == 'm' {
+                        break;
+                    }
+                }
+                continue;
+            }
+            out.push(c);
+        }
+        out
+    }
+
+    #[test]
+    fn the_mode_line_always_says_how_to_get_back_out() {
+        // The whole point: Ctrl+Space into normal mode over a shell pane
+        // is not something Escape or `q` gets you out of, so the way out
+        // has to be on screen rather than known in advance.
+        let buf = nav_buffer(10, b"$ echo hi\r\n");
+        let text = status(&buf, 100);
+        assert!(text.contains(NORMAL_MODE_EXIT_HINT), "{text:?}");
+        assert!(text.starts_with("-- NORMAL --"), "{text:?}");
+    }
+
+    #[test]
+    fn lines_arriving_while_you_read_are_reported() {
+        let mut buf = nav_buffer(10, b"$ tail -f log\r\n");
+        assert_eq!(buf.new_lines(), 0);
+        assert!(!status(&buf, 100).contains("new line"));
+        // Two more lines land in the pane after the excursion started.
+        buf.screen.borrow_mut().feed(b"one\r\ntwo\r\n");
+        assert_eq!(buf.new_lines(), 2);
+        let text = status(&buf, 100);
+        assert!(text.contains("+2 new lines"), "{text:?}");
+        assert!(text.contains(NORMAL_MODE_EXIT_HINT), "the way out doesn't stop being shown: {text:?}");
+        assert!(buf.new_lines_changed(), "the idle loop needs to know to redraw");
+        assert!(!buf.new_lines_changed(), "...but only once per change");
+    }
+
+    #[test]
+    fn one_new_line_is_singular() {
+        let buf = nav_buffer(10, b"$ \r\n");
+        buf.screen.borrow_mut().feed(b"only\r\n");
+        assert!(status(&buf, 100).contains("+1 new line "), "{:?}", status(&buf, 100));
+    }
+
+    #[test]
+    fn a_narrow_pane_shortens_the_hint_before_dropping_it() {
+        let buf = nav_buffer(10, b"$ \r\n");
+        // Wide: the sentence. Narrow: the short form. Narrower still:
+        // nothing but the mode label and position, as before.
+        assert!(status(&buf, 100).contains(NORMAL_MODE_EXIT_HINT));
+        let narrow = status(&buf, 44);
+        assert!(narrow.contains(NORMAL_MODE_EXIT_HINT_SHORT), "{narrow:?}");
+        assert!(!narrow.contains(NORMAL_MODE_EXIT_HINT), "{narrow:?}");
+        let tiny = status(&buf, 26);
+        assert!(!tiny.contains("return"), "{tiny:?}");
+        assert!(tiny.starts_with("-- NORMAL --"), "{tiny:?}");
+    }
+
+    #[test]
+    fn every_width_produces_exactly_that_many_visible_columns() {
+        let buf = nav_buffer(10, b"$ \r\n");
+        buf.screen.borrow_mut().feed(b"a\r\nb\r\n");
+        for cols in [10usize, 20, 26, 44, 60, 80, 120] {
+            let text = normal_mode_status_text(&buf, &VimKeys::new(), None, cols);
+            assert_eq!(editor::visible_len(&text), cols, "width {cols} produced {text:?}");
+        }
+    }
+
+    #[test]
+    fn a_command_line_being_typed_takes_the_whole_row() {
+        let buf = nav_buffer(10, b"$ \r\n");
+        buf.screen.borrow_mut().feed(b"late\r\n");
+        let text = normal_mode_status_text(&buf, &VimKeys::new(), Some(":w foo"), 100);
+        assert!(text.starts_with(":w foo"), "{text:?}");
+        assert!(!text.contains("return"), "no chips over a live command line: {text:?}");
+        assert!(!text.contains("new line"), "{text:?}");
     }
 }
 
