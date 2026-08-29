@@ -69,14 +69,17 @@ pub struct TextBuffer {
     // `:git blame`'s own toggle state (see fileeditor::toggle_git_blame,
     // and GUTTER_COLUMNS's blame column, which is what actually reads
     // this) -- `None` means off (the gutter's blame column collapses to
-    // zero width entirely), `Some` is one crate::git::BlameLine per
-    // buffer line, indexed the same way `lines` is. Cleared on any real
-    // edit for the same reason `diagnostics` is: a line-indexed snapshot
-    // of "who last touched this line" goes stale the instant a line
-    // shifts or its content changes, and re-running `git blame` is the
-    // caller's job (`:git blame` again), not something a single-line
-    // edit could patch up correctly on its own.
-    pub blame: Option<Vec<crate::git::BlameLine>>,
+    // zero width entirely), `Some` is one entry per buffer line, indexed
+    // the same way `lines` is. The *inner* `None` is a line git had
+    // nothing to say about: typed since the revision being blamed, or
+    // simply not in it (see fileeditor::toggle_git_blame, which lines the
+    // two up rather than assuming they match). Cleared on any real edit
+    // for the same reason `diagnostics` is: a line-indexed snapshot of
+    // "who last touched this line" goes stale the instant a line shifts
+    // or its content changes, and re-running `git blame` is the caller's
+    // job (`:git blame` again), not something a single-line edit could
+    // patch up correctly on its own.
+    pub blame: Option<Vec<Option<crate::git::BlameLine>>>,
     // `:git diff`'s own toggle state -- same shape/lifecycle as `blame`
     // just above (`None` off, gutter column collapses to zero width;
     // `Some` on), except sparse: only lines crate::git::diff actually

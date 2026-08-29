@@ -111,21 +111,118 @@ pub struct BlameLine {
 // that file's own directory would resolve. `Err` covers both "git itself
 // failed" (not a repo, file not tracked, path doesn't exist, ...) and a
 // malformed/unexpected porcelain response.
-pub fn blame(path: &Path) -> Result<Vec<BlameLine>, String> {
+pub fn blame(path: &Path, rev: Option<&str>) -> Result<Vec<BlameLine>, String> {
     let dir = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
     let filename = path.file_name().ok_or_else(|| "no filename".to_string())?;
+    let mut command = Command::new("git");
+    command.arg("blame").arg("--line-porcelain");
+    if let Some(rev) = rev {
+        command.arg(rev);
+    }
+    // `--` before the path, always: without it a revision and a filename
+    // are told apart by guesswork, and a branch and a file can share a
+    // name.
+    let output = command.arg("--").arg(filename).current_dir(dir).stdin(Stdio::null()).output().map_err(|e| format!("git: {e}"))?;
+    if !output.status.success() {
+        return Err(first_stderr_line(&output.stderr, "git blame failed"));
+    }
+    parse_line_porcelain(&String::from_utf8_lossy(&output.stdout))
+}
+
+// The committed content of `path` at `rev` -- the *other* half of what
+// blame and diff need, and the reason both work against a modified
+// buffer at all: knowing what the file looked like there is what lets
+// bish line those results up with what's actually on screen (see
+// `align_to`), rather than assuming the buffer still matches whatever
+// git was asked about.
+//
+// `rev` of `None` means the index -- `git show :path` is git's own
+// spelling for it, and the right default because a plain `git diff`
+// compares the worktree against the index too, not against HEAD.
+//
+// `Ok(None)` when the file simply isn't there at that revision (not yet
+// added, or deleted since): a real answer, not a failure -- every line is
+// then new, which is exactly what the caller should show.
+//
+// The two genuine failures -- no repository at all, and a revision that
+// doesn't resolve -- are each checked with their own small `git` call
+// first, rather than sorting them out of `git show`'s own error message
+// afterwards. `git show` reports all three cases as one indistinguishable
+// "fatal: ambiguous argument", so a typo'd revision would otherwise read
+// as "the file isn't in it" and quietly show every line as new.
+pub fn file_at_rev(path: &Path, rev: Option<&str>) -> Result<Option<String>, String> {
+    let dir = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
+    let filename = path.file_name().ok_or_else(|| "no filename".to_string())?;
+
+    let in_repo = Command::new("git")
+        .args(["rev-parse", "--is-inside-work-tree"])
+        .current_dir(dir)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| format!("git: {e}"))?;
+    if !in_repo.status.success() {
+        return Err(first_stderr_line(&in_repo.stderr, "not a git repository"));
+    }
+    if let Some(rev) = rev {
+        let resolved = Command::new("git")
+            .args(["rev-parse", "--verify", "--quiet", "--end-of-options"])
+            .arg(rev)
+            .current_dir(dir)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map_err(|e| format!("git: {e}"))?;
+        if !resolved.success() {
+            // --quiet means git printed nothing of its own to relay.
+            return Err(format!("unknown revision '{rev}'"));
+        }
+    }
+
+    // `./` makes the path cwd-relative rather than repo-root-relative,
+    // which is what lets this run from the file's own directory like
+    // every other call here.
+    let mut spec = std::ffi::OsString::from(rev.unwrap_or(""));
+    spec.push(":./");
+    spec.push(filename);
     let output = Command::new("git")
-        .arg("blame")
-        .arg("--line-porcelain")
-        .arg(filename)
+        .arg("show")
+        .arg(&spec)
         .current_dir(dir)
         .stdin(Stdio::null())
         .output()
         .map_err(|e| format!("git: {e}"))?;
     if !output.status.success() {
-        return Err(first_stderr_line(&output.stderr, "git blame failed"));
+        // Both real failures are already ruled out above, so what's left
+        // is "that path isn't in there".
+        return Ok(None);
     }
-    parse_line_porcelain(&String::from_utf8_lossy(&output.stdout))
+    Ok(Some(String::from_utf8_lossy(&output.stdout).into_owned()))
+}
+
+// Lines up per-line results computed against `old` with the buffer's own
+// `new` lines, by diffing the two: entry `i` of the result is whatever
+// `old`-side line buffer line `i` came from, or `None` for a line that
+// isn't in `old` at all.
+//
+// This is what makes `:git blame` work on a modified buffer and against
+// an arbitrary revision at once -- the two are the same problem. Blame
+// describes some committed version of the file; the buffer on screen is
+// something else (edited since, or simply a later revision), and without
+// this the two are lined up by line number, which is wrong the moment
+// anything above shifted.
+pub(crate) fn align_to(old: &[&str], new: &[&str]) -> Vec<Option<usize>> {
+    let mut out = vec![None; new.len()];
+    for op in crate::diff::diff(old, new) {
+        if let crate::diff::DiffOp::Equal { a, b, len } = op {
+            for k in 0..len {
+                if let Some(slot) = out.get_mut(b + k) {
+                    *slot = Some(a + k);
+                }
+            }
+        }
+    }
+    out
 }
 
 // `--line-porcelain` repeats every commit's full metadata for every line
@@ -175,90 +272,25 @@ pub enum DiffMark {
     Removed,
 }
 
-// Runs a unified diff against `path`'s tracked content -- `git diff -U0`
-// against HEAD/the index for a tracked file, or `git diff --no-index`
-// against `/dev/null` for one git doesn't know about yet (so a brand new,
-// not-yet-added file still shows every line as freshly Added, matching
-// real diff-gutter plugins' own "new file" convention, rather than
-// showing nothing just because there's no commit to diff against). Like
-// `blame`, this only ever reflects `path`'s content *on disk* -- there's
-// no live-buffer-vs-HEAD diffing here, so a dirty, unsaved buffer would
-// show a diff that doesn't match what's on screen; the caller
-// (fileeditor::toggle_git_diff) is what actually refuses that case, same
-// as it does for blame.
-// Explicitly checks "is this even inside a git repository" up front
-// (`git rev-parse --is-inside-work-tree`) rather than letting a plain
-// `git diff` outside one fail on its own: unlike a tracked-file diff
-// (which fails loudly by itself when there's no repo at all), the
-// untracked/`--no-index` branch below would otherwise *succeed* even
-// with no repository anywhere (that's the whole point of `--no-index`),
-// silently masking exactly the case `blame`'s own "not a git repository"
-// error surfaces -- this keeps the two features' error behavior
-// consistent instead of diff quietly doing something blame refuses.
-pub fn diff(path: &Path) -> Result<HashMap<usize, DiffMark>, String> {
-    let dir = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
-    let filename = path.file_name().ok_or_else(|| "no filename".to_string())?;
-
-    let in_repo = Command::new("git")
-        .args(["rev-parse", "--is-inside-work-tree"])
-        .current_dir(dir)
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|e| format!("git: {e}"))?;
-    if !in_repo.status.success() {
-        return Err(first_stderr_line(&in_repo.stderr, "not a git repository"));
-    }
-
-    let tracked = Command::new("git")
-        .arg("ls-files")
-        .arg("--error-unmatch")
-        .arg(filename)
-        .current_dir(dir)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success());
-
-    let output = if tracked {
-        Command::new("git").args(["diff", "--no-color", "-U0", "--"]).arg(filename).current_dir(dir).stdin(Stdio::null()).output()
-    } else {
-        Command::new("git")
-            .args(["diff", "--no-color", "-U0", "--no-index", "--", "/dev/null"])
-            .arg(filename)
-            .current_dir(dir)
-            .stdin(Stdio::null())
-            .output()
-    }
-    .map_err(|e| format!("git: {e}"))?;
-
-    // A plain tracked-file `git diff` (no --exit-code given) always exits
-    // 0 regardless of whether there were any differences; `--no-index`
-    // instead always uses 0 (identical)/1 (differences found) as its own
-    // normal pair, differences or not, per its own --help. Either way,
-    // only something beyond that small range is a real failure worth
-    // surfacing (a corrupt repo, a permissions error, ...).
-    if output.status.code().is_none_or(|c| !(0..=1).contains(&c)) {
-        return Err(first_stderr_line(&output.stderr, "git diff failed"));
-    }
-
-    Ok(parse_unified_diff(&String::from_utf8_lossy(&output.stdout)))
-}
-
-// The hand-rolled-Myers-diff counterpart to `parse_unified_diff` just
-// below -- same output shape/convention (DiffMark keyed by 0-indexed
-// *new*-side line), built from `crate::diff::diff`'s own edit script
-// instead of parsing `git diff`'s text output, for `fileeditor::
-// toggle_buffer_diff`'s own "buffer vs. what's on disk" diff (works
-// with no git repository at all, unlike `diff`/`blame` above). A
-// Delete immediately followed by an Insert (no Equal between them --
+// Every diff gutter in the editor, computed here rather than by parsing
+// `git diff`'s own text output: a DiffMark keyed by 0-indexed *new*-side
+// line, built from `crate::diff::diff`'s own edit script. Both callers
+// (`fileeditor::toggle_buffer_diff`'s "buffer vs. what's on disk" and
+// `toggle_git_diff`'s "buffer vs. some revision") hand it two plain
+// slices of lines, which is why neither needs a git repository for the
+// diffing itself and why an unsaved buffer diffs correctly -- the old
+// side is just whatever the caller fetched, and the new side is the
+// buffer as it stands.
+//
+// A Delete immediately followed by an Insert (no Equal between them --
 // `crate::diff::diff`'s own coalescing already merges any run of same-
 // kind steps, so this is the only way to see both back to back) is one
 // "changed" hunk, same as a unified diff's own old_count>0/new_count>0
 // hunk; an unpaired Delete marks the single nearest surviving new-side
 // line (wherever the very next op's own `b` picks back up, or the very
-// end of the file if this Delete is the last op) as Removed, matching
-// `parse_unified_diff`'s own identical convention exactly.
+// end of the file if this Delete is the last op) as Removed -- the same
+// attachment line real `git diff -U0` picks, verified against it in
+// marks_from_diff_places_a_deletion_at_the_same_line_git_itself_does.
 pub(crate) fn marks_from_diff(old: &[&str], new: &[&str]) -> HashMap<usize, DiffMark> {
     let ops = crate::diff::diff(old, new);
     let mut marks = HashMap::new();
@@ -296,52 +328,6 @@ pub(crate) fn marks_from_diff(old: &[&str], new: &[&str]) -> HashMap<usize, Diff
 fn first_stderr_line(stderr: &[u8], fallback: &str) -> String {
     let text = String::from_utf8_lossy(stderr);
     text.lines().next().unwrap_or(fallback).trim().to_string()
-}
-
-fn parse_unified_diff(text: &str) -> HashMap<usize, DiffMark> {
-    let mut marks = HashMap::new();
-    for line in text.lines() {
-        let Some(rest) = line.strip_prefix("@@ -") else { continue };
-        let Some((old_count, new_start, new_count)) = parse_hunk_rest(rest) else { continue };
-        if new_count == 0 {
-            // See this function's own doc comment on `diff` for why
-            // `new_start.saturating_sub(1)` is the right line in every
-            // case (deletion at the very start of the file, in the
-            // middle, or at the end).
-            marks.insert(new_start.saturating_sub(1), DiffMark::Removed);
-        } else {
-            let mark = if old_count == 0 { DiffMark::Added } else { DiffMark::Changed };
-            for i in 0..new_count {
-                marks.insert(new_start - 1 + i, mark);
-            }
-        }
-    }
-    marks
-}
-
-// Parses everything after a hunk header's own literal "@@ -" prefix --
-// `<old-start>[,<old-count>] +<new-start>[,<new-count>] @@`, optionally
-// followed by a trailing function-context hint some hunks carry (e.g.
-// "@@ ... @@ fn foo()") -- `split_once(" @@")` already stops before that,
-// so it's simply discarded rather than parsed. A count is implicitly 1
-// when its own ",<count>" part is omitted -- unified diff's own
-// convention for a single-line range. Returns `(old_count, new_start,
-// new_count)`: `old_start` itself is never needed by any caller here,
-// only the two counts (to classify the hunk) and `new_start` (to know
-// which buffer lines it actually touches).
-fn parse_hunk_rest(rest: &str) -> Option<(usize, usize, usize)> {
-    let (old_part, rest) = rest.split_once(" +")?;
-    let (new_part, _) = rest.split_once(" @@")?;
-    let (_, old_count) = parse_range(old_part)?;
-    let (new_start, new_count) = parse_range(new_part)?;
-    Some((old_count, new_start, new_count))
-}
-
-fn parse_range(s: &str) -> Option<(usize, usize)> {
-    match s.split_once(',') {
-        Some((a, b)) => Some((a.parse().ok()?, b.parse().ok()?)),
-        None => Some((s.parse().ok()?, 1)),
-    }
 }
 
 // The glibc/BSD `struct tm` layout, same as exec.rs's own CTm (kept as a
@@ -393,58 +379,12 @@ fn format_unix_date(epoch_secs: i64) -> String {
 mod tests {
     use super::*;
 
-    // Every one of these hunk shapes was checked against a real `git
-    // diff --no-color -U0` run first (see this session's own git-history
-    // for the exact repro commands) -- parse_unified_diff's own doc
-    // comment on `diff` explains why `new_start.saturating_sub(1)` is the
-    // right attachment line for a pure deletion in each of the three
-    // positions (start/middle/end of file) tested here.
-    #[test]
-    fn parse_unified_diff_marks_a_pure_addition() {
-        let text = "@@ -2,0 +3,2 @@ two\n+NEWA\n+NEWB\n";
-        let marks = parse_unified_diff(text);
-        assert_eq!(marks.get(&2), Some(&DiffMark::Added));
-        assert_eq!(marks.get(&3), Some(&DiffMark::Added));
-        assert_eq!(marks.len(), 2);
-    }
-
-    #[test]
-    fn parse_unified_diff_marks_a_changed_line() {
-        let text = "@@ -3 +3 @@ two\n-three\n+CHANGED\n";
-        let marks = parse_unified_diff(text);
-        assert_eq!(marks.get(&2), Some(&DiffMark::Changed));
-        assert_eq!(marks.len(), 1);
-    }
-
-    #[test]
-    fn parse_unified_diff_marks_a_pure_deletion_at_the_start_on_line_zero() {
-        let text = "@@ -1 +0,0 @@\n-one\n";
-        let marks = parse_unified_diff(text);
-        assert_eq!(marks.get(&0), Some(&DiffMark::Removed));
-        assert_eq!(marks.len(), 1);
-    }
-
-    #[test]
-    fn parse_unified_diff_marks_a_pure_deletion_in_the_middle_on_the_preceding_line() {
-        let text = "@@ -3 +2,0 @@ two\n-three\n";
-        let marks = parse_unified_diff(text);
-        assert_eq!(marks.get(&1), Some(&DiffMark::Removed));
-        assert_eq!(marks.len(), 1);
-    }
-
-    #[test]
-    fn parse_unified_diff_marks_a_pure_deletion_at_the_end_on_the_last_line() {
-        let text = "@@ -5 +4,0 @@ four\n-five\n";
-        let marks = parse_unified_diff(text);
-        assert_eq!(marks.get(&3), Some(&DiffMark::Removed));
-        assert_eq!(marks.len(), 1);
-    }
-
-    // marks_from_diff's own equivalent of the three parse_unified_diff
-    // deletion-position tests above -- same three real-git-verified
-    // attachment points (start/middle/end), just reached by feeding
-    // crate::diff's own edit script through instead of parsing git's
-    // text output.
+    // The three deletion-attachment points (start/middle/end of file),
+    // each checked against a real `git diff --no-color -U0` run first
+    // rather than assumed -- this is the only part of a diff gutter
+    // where "which line does a *removal* belong to" has a non-obvious
+    // answer, and matching git's own choice is what makes the markers
+    // read the way anyone used to a diff gutter expects.
     #[test]
     fn marks_from_diff_places_a_deletion_at_the_same_line_git_itself_does() {
         // Middle: [a,b,c,d] -> [a,d] -- real `git diff -U0` attaches
@@ -453,8 +393,7 @@ mod tests {
         // End: [a,b,c,d] -> [a,b,c] -- attaches to the new last line.
         assert_eq!(marks_from_diff(&["a", "b", "c", "d"], &["a", "b", "c"]), HashMap::from([(2, DiffMark::Removed)]));
         // Start: [a,b,c,d] -> [b,c,d] -- no line precedes the gap, so
-        // (matching parse_unified_diff's own saturating_sub(1)) this
-        // attaches to the new first line instead.
+        // this attaches to the new first line instead.
         assert_eq!(marks_from_diff(&["a", "b", "c", "d"], &["b", "c", "d"]), HashMap::from([(0, DiffMark::Removed)]));
     }
 
@@ -470,20 +409,6 @@ mod tests {
     #[test]
     fn marks_from_diff_is_empty_for_identical_content() {
         assert!(marks_from_diff(&["a", "b"], &["a", "b"]).is_empty());
-    }
-
-    #[test]
-    fn parse_unified_diff_ignores_non_hunk_lines_and_handles_multiple_hunks() {
-        let text = "diff --git a/f b/f\nindex 1..2 100644\n--- a/f\n+++ b/f\n@@ -1 +1 @@\n-a\n+b\n@@ -5,0 +6,1 @@\n+c\n";
-        let marks = parse_unified_diff(text);
-        assert_eq!(marks.get(&0), Some(&DiffMark::Changed));
-        assert_eq!(marks.get(&5), Some(&DiffMark::Added));
-        assert_eq!(marks.len(), 2);
-    }
-
-    #[test]
-    fn parse_unified_diff_of_empty_text_is_empty() {
-        assert!(parse_unified_diff("").is_empty());
     }
 
     #[test]

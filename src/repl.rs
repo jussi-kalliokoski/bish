@@ -7143,7 +7143,9 @@ More:  `e FILE...` opens several files at once, the first in front;
 Colon commands:
   :w [FILE]        write (:wq/:x write+quit, :q quit, :q! discard+quit)
   :s/PAT/REPL/[g]  substitute on this line (prefix a range, e.g. :%s/../../)
-  :git blame       toggle a per-line blame gutter (:git diff for +/~/-)
+  :git blame [REV] per-line blame gutter (:git diff [REV] for +/~/-);
+                   REV defaults to the working tree/index, `· N/A` marks
+                   a line that isn't in it
   :diff            toggle +/~/- markers vs. what's on disk (no git needed)
   :format          run this file's own formatter
   :diag [clear]    toggle the diagnostics pane
@@ -8193,12 +8195,16 @@ fn run_command_mode(
                         // implementing any of it itself, so a missing
                         // `git` on $PATH just means these features don't
                         // work, checked once up front regardless of which
-                        // subcommand was actually typed. `blame`/`diff`
-                        // (neither takes a flag/subcommand of its own
-                        // yet) each toggle their own gutter column via
-                        // fileeditor::toggle_git_blame/toggle_git_diff,
-                        // whose own Ok(bool)/Err(String) already say
-                        // exactly what happened and why not.
+                        // subcommand was actually typed. `blame [REV]`/
+                        // `diff [REV]` each toggle their own gutter
+                        // column via fileeditor::toggle_git_blame/
+                        // toggle_git_diff, whose own Ok(bool)/Err(String)
+                        // already say exactly what happened and why not;
+                        // the optional REV is passed through untouched
+                        // for git itself to resolve (or reject, in which
+                        // case its own message is what gets shown --
+                        // bish has no business second-guessing what
+                        // counts as a valid revision).
                         "git" => {
                             if !crate::git::available() {
                                 show_command_mode_error("bish: git: git executable not found", *term_rows, *term_cols);
@@ -8216,10 +8222,35 @@ fn run_command_mode(
                                     continue;
                                 }
                             };
+                            // A REV is one word: `git blame HEAD~2`, not
+                            // `git blame HEAD~2 something`. Caught here
+                            // rather than handed to git, whose own error
+                            // for a stray second argument would be about
+                            // its command line rather than about `:git`'s.
+                            if subarg.is_some_and(|a| a.split_whitespace().count() > 1) {
+                                show_command_mode_error(
+                                    &format!("bish: git: {subcmd}: expected at most one revision, got '{}'", subarg.unwrap_or_default()),
+                                    *term_rows,
+                                    *term_cols,
+                                );
+                                buffer.clear();
+                                continue;
+                            }
+                            // How an enabled column names what it's
+                            // showing: bare (the working tree for blame,
+                            // the index for diff -- each subcommand's own
+                            // git default) or the revision that was asked
+                            // for, so "on" against two different revisions
+                            // doesn't read identically.
+                            let against = match subarg {
+                                Some(rev) => format!(" ({rev})"),
+                                None => String::new(),
+                            };
                             match subcmd {
-                                "blame" if subarg.is_none() => match fileeditor::toggle_git_blame(tb) {
+                                "blame" => match fileeditor::toggle_git_blame(tb, subarg) {
                                     Ok(on) => {
-                                        let output = if on { "Blame on.".to_string() } else { "Blame off.".to_string() };
+                                        let output =
+                                            if on { format!("Blame on{against}.") } else { "Blame off.".to_string() };
                                         sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry {
                                             command: trimmed,
                                             output: output.clone(),
@@ -8233,25 +8264,19 @@ fn run_command_mode(
                                         continue;
                                     }
                                 },
-                                "blame" => {
-                                    show_command_mode_error(
-                                        &format!("bish: git: blame: unsupported argument '{}' (only a bare `git blame` toggle is supported for now)", subarg.unwrap_or_default()),
-                                        *term_rows,
-                                        *term_cols,
-                                    );
-                                    buffer.clear();
-                                    continue;
-                                }
-                                // `diff` (no further flags/subcommand of
-                                // its own yet): same toggle shape as
+                                // `diff [REV]`: same toggle shape as
                                 // `blame` above, just against
                                 // fileeditor::toggle_git_diff -- gutter
                                 // +/~/- markers for lines added/changed/
                                 // removed relative to this file's tracked
                                 // state instead of per-line authorship.
-                                "diff" if subarg.is_none() => match fileeditor::toggle_git_diff(tb) {
+                                "diff" => match fileeditor::toggle_git_diff(tb, subarg) {
                                     Ok(on) => {
-                                        let output = if on { "Diff markers on.".to_string() } else { "Diff markers off.".to_string() };
+                                        let output = if on {
+                                            format!("Diff markers on{against}.")
+                                        } else {
+                                            "Diff markers off.".to_string()
+                                        };
                                         sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry {
                                             command: trimmed,
                                             output: output.clone(),
@@ -8265,15 +8290,6 @@ fn run_command_mode(
                                         continue;
                                     }
                                 },
-                                "diff" => {
-                                    show_command_mode_error(
-                                        &format!("bish: git: diff: unsupported argument '{}' (only a bare `git diff` toggle is supported for now)", subarg.unwrap_or_default()),
-                                        *term_rows,
-                                        *term_cols,
-                                    );
-                                    buffer.clear();
-                                    continue;
-                                }
                                 other => {
                                     show_command_mode_error(&format!("bish: git: unknown subcommand '{}' (expected: blame, diff)", other), *term_rows, *term_cols);
                                     buffer.clear();

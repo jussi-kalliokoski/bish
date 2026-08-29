@@ -1528,16 +1528,28 @@ const BLAME_AUTHOR_MAX_WIDTH: usize = 16;
 
 fn blame_column_width(buf: &TextBuffer) -> usize {
     let Some(blame) = &buf.blame else { return 0 };
-    let author_width = blame.iter().map(|b| b.author.chars().count()).max().unwrap_or(0).clamp(1, BLAME_AUTHOR_MAX_WIDTH);
+    let author_width =
+        blame.iter().flatten().map(|b| b.author.chars().count()).max().unwrap_or(0).clamp(1, BLAME_AUTHOR_MAX_WIDTH);
     8 + 1 + 10 + 1 + author_width + 1
 }
 
+// What a line git had nothing to say about shows instead of a commit --
+// see TextBuffer::blame's own doc comment for when that happens. Marked
+// rather than left blank, and in its own colour rather than the dim grey
+// every real blame row uses, so "this line isn't in what you asked about"
+// reads at a glance instead of looking like a rendering gap.
+const BLAME_UNKNOWN: &str = "· N/A";
+
 fn render_blame_cell(buf: &TextBuffer, _starts: &[usize], line: usize, width: usize) -> Option<String> {
     let blame = buf.blame.as_ref()?;
-    let entry = blame.get(line)?;
     let author_width = width.saturating_sub(8 + 1 + 10 + 1 + 1);
-    let author: String = entry.author.chars().take(author_width).collect();
-    Some(format!("\x1b[2m{} {} {:<aw$} \x1b[0m", entry.short_commit, entry.date, author, aw = author_width))
+    match blame.get(line)? {
+        Some(entry) => {
+            let author: String = entry.author.chars().take(author_width).collect();
+            Some(format!("\x1b[2m{} {} {:<aw$} \x1b[0m", entry.short_commit, entry.date, author, aw = author_width))
+        }
+        None => Some(format!("\x1b[33m{:<8}\x1b[0m {:<10} {:<aw$} ", BLAME_UNKNOWN, "", "", aw = author_width)),
+    }
 }
 
 // `:git diff`'s own gutter column: a single marker glyph + one padding
@@ -1988,53 +2000,77 @@ pub(crate) fn format_buffer(buf: &mut TextBuffer) -> FormatOutcome {
     if applied > 0 { FormatOutcome::Formatted } else { FormatOutcome::AlreadyFormatted }
 }
 
-// `:git blame`'s own worker (repl.rs's run_command_mode): toggles the
-// gutter's blame column off if it's currently on (`Ok(false)`), or runs a
-// fresh `git blame` and turns it on (`Ok(true)`) if it's currently off --
-// same "one command, two states" shape as vim's own `:GBlame`-style
-// plugins, just built in. Blame only ever reflects this buffer's last
-// *saved* content (crate::git::blame reads the real file from disk, not
-// this in-memory buffer), so a dirty buffer is refused outright rather
-// than silently showing blame that doesn't line up with what's on screen
-// -- same reasoning `:w`'s own dirty-buffer handling already applies
-// elsewhere, just surfaced as an Err here instead of a buffer.is_dirty()
-// special case in repl.rs.
-pub(crate) fn toggle_git_blame(buf: &mut TextBuffer) -> Result<bool, String> {
+// The two things every `:git` gutter needs before it can ask git
+// anything: a buffer that has a file at all, and a git to ask.
+fn git_path(buf: &TextBuffer) -> Result<std::path::PathBuf, String> {
+    let path = buf.path().ok_or_else(|| "no file name".to_string())?.to_path_buf();
+    if !crate::git::available() {
+        return Err("git executable not found".to_string());
+    }
+    Ok(path)
+}
+
+// `:git blame [REV]`'s own worker (repl.rs's run_command_mode): toggles
+// the gutter's blame column off if it's currently on (`Ok(false)`), or
+// runs a fresh `git blame` and turns it on (`Ok(true)`) if it's currently
+// off -- same "one command, two states" shape as vim's own `:GBlame`-
+// style plugins, just built in.
+//
+// Blame describes some *committed* version of the file, which is not
+// necessarily what's on screen: the buffer may have been edited since,
+// and with a `REV` it is a different version outright. Rather than refuse
+// the first case and mis-align the second, the blame is lined up against
+// the buffer by diffing it with the content it was computed from (see
+// git::align_to). A line with no counterpart there -- typed just now, or
+// simply not present at that revision -- gets `None`, which the gutter
+// renders as its own marker rather than leaving blank (see
+// render_blame_cell).
+pub(crate) fn toggle_git_blame(buf: &mut TextBuffer, rev: Option<&str>) -> Result<bool, String> {
     if buf.blame.is_some() {
         buf.blame = None;
         return Ok(false);
     }
-    if buf.is_dirty() {
-        return Err("buffer has unsaved changes -- save first (blame only reflects what's on disk)".to_string());
-    }
-    let path = buf.path().ok_or_else(|| "no file name".to_string())?;
-    if !crate::git::available() {
-        return Err("git executable not found".to_string());
-    }
-    let path = path.to_path_buf();
-    buf.blame = Some(crate::git::blame(&path)?);
+    let path = git_path(buf)?;
+    // What the blame that comes back is indexed by. With a REV that's
+    // that revision's content; with none it's the working tree -- git
+    // blame's own default, and the file on disk rather than anything
+    // `git show` would return.
+    let old = match rev {
+        Some(rev) => crate::git::file_at_rev(&path, Some(rev))?.unwrap_or_default(),
+        None => std::fs::read_to_string(&path).map_err(|e| format!("{}: {}", path.display(), e))?,
+    };
+    let blamed = crate::git::blame(&path, rev)?;
+    let old_lines: Vec<&str> = old.lines().collect();
+    let current = buf.text();
+    let current_lines: Vec<&str> = current.lines().collect();
+    let aligned = crate::git::align_to(&old_lines, &current_lines)
+        .into_iter()
+        .map(|from| from.and_then(|i| blamed.get(i).cloned()))
+        .collect::<Vec<_>>();
+    buf.blame = Some(aligned);
     Ok(true)
 }
 
-// `:git diff`'s own worker -- same "one command, two states" toggle shape
-// and same dirty-buffer/no-path/no-git refusals as toggle_git_blame just
-// above (crate::git::diff reads the file on disk too, not this buffer's
-// own in-memory content -- see its own doc comment on why there's no
-// live-buffer-vs-HEAD diffing yet).
-pub(crate) fn toggle_git_diff(buf: &mut TextBuffer) -> Result<bool, String> {
+// `:git diff [REV]`'s own worker -- same "one command, two states" toggle
+// shape as toggle_git_blame just above, and the same reason it needs no
+// dirty-buffer refusal either: the comparison is between what git says
+// the file held at `rev` and this buffer's own *current* content, so an
+// unsaved buffer is simply part of what's being compared rather than
+// something that would make the answer wrong. A file that isn't in that
+// revision at all diffs against nothing, so every line reads as added --
+// which is what `git diff --no-index` against /dev/null said for an
+// untracked file before this, just arrived at without the special case.
+pub(crate) fn toggle_git_diff(buf: &mut TextBuffer, rev: Option<&str>) -> Result<bool, String> {
     if buf.diff.is_some() {
         buf.diff = None;
         return Ok(false);
     }
-    if buf.is_dirty() {
-        return Err("buffer has unsaved changes -- save first (diff only reflects what's on disk)".to_string());
-    }
-    let path = buf.path().ok_or_else(|| "no file name".to_string())?;
-    if !crate::git::available() {
-        return Err("git executable not found".to_string());
-    }
-    let path = path.to_path_buf();
-    buf.diff = Some(crate::git::diff(&path)?);
+    let path = git_path(buf)?;
+    let old = crate::git::file_at_rev(&path, rev)?.unwrap_or_default();
+    let old_lines: Vec<&str> = old.lines().collect();
+    let current = buf.text();
+    let current_lines: Vec<&str> = current.lines().collect();
+    buf.diff = Some(crate::git::marks_from_diff(&old_lines, &current_lines));
     Ok(true)
 }
 
@@ -2049,9 +2085,7 @@ pub(crate) fn toggle_git_diff(buf: &mut TextBuffer) -> Result<bool, String> {
 // `toggle_git_diff` already populates -- the two are mutually exclusive
 // toggle states (turning one on turns the other off, same as any
 // single field can only hold one thing at a time), not a second,
-// independent gutter column. No dirty-buffer refusal, unlike
-// toggle_git_diff -- an unsaved buffer is exactly the interesting case
-// here, not one to refuse.
+// independent gutter column.
 pub(crate) fn toggle_buffer_diff(buf: &mut TextBuffer) -> Result<bool, String> {
     if buf.diff.is_some() {
         buf.diff = None;
@@ -3481,40 +3515,20 @@ mod pre_save_hook_tests {
     }
 }
 
-// `:git blame`'s own tests -- `toggle_git_blame`'s dirty-buffer/no-path
-// checks run unconditionally (no subprocess involved), but the real
-// end-to-end round trip needs an actual git repository and a real `git`
-// on $PATH, so that one test skips itself (rather than failing) when
-// crate::git::available() says there isn't one -- matching this whole
-// feature's own "quietly unavailable, not a hard dependency" contract
-// (see git.rs's own module doc comment).
+// `:git blame`'s own tests -- the no-path check runs unconditionally (no
+// subprocess involved), but everything else here needs an actual git
+// repository and a real `git` on $PATH, so those skip themselves (rather
+// than failing) when crate::git::available() says there isn't one --
+// matching this whole feature's own "quietly unavailable, not a hard
+// dependency" contract (see git.rs's own module doc comment).
 #[cfg(test)]
 mod git_blame_tests {
     use super::*;
 
-    #[test]
-    fn toggle_git_blame_refuses_a_buffer_with_unsaved_changes() {
-        let mut buf = TextBuffer::open(std::path::Path::new("/tmp/bish-fileeditor-git-blame-dirty-test.txt"), 10).unwrap();
-        // insert_text always marks a buffer dirty -- see its own doc comment.
-        buf.insert_text((0, 0), "hello\n");
-        let err = toggle_git_blame(&mut buf).unwrap_err();
-        assert!(err.contains("unsaved changes"), "{err}");
-        assert!(buf.blame.is_none());
-    }
-
-    #[test]
-    fn toggle_git_blame_refuses_a_buffer_with_no_path() {
-        let mut buf = TextBuffer::new_unnamed(10);
-        let err = toggle_git_blame(&mut buf).unwrap_err();
-        assert!(err.contains("no file name"), "{err}");
-    }
-
-    #[test]
-    fn toggle_git_blame_toggles_on_then_off_for_a_real_git_repo_file() {
-        if !crate::git::available() {
-            return;
-        }
-        let dir = std::env::temp_dir().join(format!("bish-fileeditor-git-blame-test-{}", std::process::id()));
+    // A repo with two commits: "one\ntwo\n", then "one\nTWO\nthree\n".
+    fn repo_with_history(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("bish-fileeditor-git-{tag}-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
         std::fs::create_dir_all(&dir).unwrap();
         let run = |args: &[&str]| {
             let status = std::process::Command::new("git").args(args).current_dir(&dir).status().unwrap();
@@ -3523,19 +3537,97 @@ mod git_blame_tests {
         run(&["init", "-q"]);
         run(&["config", "user.email", "test@example.com"]);
         run(&["config", "user.name", "Test User"]);
-        let path = dir.join("f.txt");
-        std::fs::write(&path, "one\ntwo\n").unwrap();
+        std::fs::write(dir.join("f.txt"), "one\ntwo\n").unwrap();
         run(&["add", "f.txt"]);
         run(&["commit", "-q", "-m", "initial"]);
+        std::fs::write(dir.join("f.txt"), "one\nTWO\nthree\n").unwrap();
+        run(&["add", "f.txt"]);
+        run(&["commit", "-q", "-m", "second"]);
+        dir
+    }
 
-        let mut buf = TextBuffer::open(&path, 10).unwrap();
+    #[test]
+    fn toggle_git_blame_refuses_a_buffer_with_no_path() {
+        let mut buf = TextBuffer::new_unnamed(10);
+        let err = toggle_git_blame(&mut buf, None).unwrap_err();
+        assert!(err.contains("no file name"), "{err}");
+    }
+
+    #[test]
+    fn toggle_git_blame_toggles_on_then_off_for_a_real_git_repo_file() {
+        if !crate::git::available() {
+            return;
+        }
+        let dir = repo_with_history("blame-test");
+        let mut buf = TextBuffer::open(&dir.join("f.txt"), 10).unwrap();
         assert!(!buf.is_dirty());
-        assert_eq!(toggle_git_blame(&mut buf).unwrap(), true);
+        assert!(toggle_git_blame(&mut buf, None).unwrap());
         let blame = buf.blame.as_ref().unwrap();
-        assert_eq!(blame.len(), 2);
-        assert_eq!(blame[0].author, "Test User");
-        assert_eq!(blame[0].short_commit.len(), 8);
-        assert_eq!(toggle_git_blame(&mut buf).unwrap(), false);
+        assert_eq!(blame.len(), 3);
+        let first = blame[0].as_ref().unwrap();
+        assert_eq!(first.author, "Test User");
+        assert_eq!(first.short_commit.len(), 8);
+        assert!(!toggle_git_blame(&mut buf, None).unwrap());
+        assert!(buf.blame.is_none());
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // The whole point of aligning blame to the buffer rather than
+    // refusing a dirty one: a line typed just now has no blame (it's in
+    // no revision at all), and -- crucially -- every line *after* it
+    // still gets the right one despite having shifted down.
+    #[test]
+    fn toggle_git_blame_lines_up_with_a_dirty_buffer() {
+        if !crate::git::available() {
+            return;
+        }
+        let dir = repo_with_history("blame-dirty-test");
+        let mut buf = TextBuffer::open(&dir.join("f.txt"), 10).unwrap();
+        buf.insert_text((0, 0), "TYPED JUST NOW\n");
+        assert!(buf.is_dirty());
+
+        assert!(toggle_git_blame(&mut buf, None).unwrap());
+        let blame = buf.blame.as_ref().unwrap();
+        assert_eq!(blame.len(), 4);
+        assert!(blame[0].is_none(), "the typed line has no blame");
+        for (i, entry) in blame.iter().enumerate().skip(1) {
+            assert_eq!(entry.as_ref().unwrap().author, "Test User", "line {i}");
+        }
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // Blame at an older revision, against a buffer holding the *newer*
+    // content: "three" doesn't exist back there, so it gets no blame,
+    // while the two lines that do exist still line up.
+    #[test]
+    fn toggle_git_blame_at_a_revision_marks_lines_absent_from_it() {
+        if !crate::git::available() {
+            return;
+        }
+        let dir = repo_with_history("blame-rev-test");
+        let mut buf = TextBuffer::open(&dir.join("f.txt"), 10).unwrap();
+
+        assert_eq!(toggle_git_blame(&mut buf, Some("HEAD~1")).unwrap(), true);
+        let blame = buf.blame.as_ref().unwrap();
+        assert_eq!(blame.len(), 3);
+        assert!(blame[0].is_some(), "`one` is unchanged since HEAD~1");
+        assert!(blame[1].is_none(), "`TWO` only exists after HEAD~1");
+        assert!(blame[2].is_none(), "`three` only exists after HEAD~1");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn toggle_git_blame_reports_an_unknown_revision() {
+        if !crate::git::available() {
+            return;
+        }
+        let dir = repo_with_history("blame-badrev-test");
+        let mut buf = TextBuffer::open(&dir.join("f.txt"), 10).unwrap();
+        let err = toggle_git_blame(&mut buf, Some("no-such-rev")).unwrap_err();
+        assert!(err.contains("no-such-rev"), "{err}");
         assert!(buf.blame.is_none());
 
         std::fs::remove_dir_all(&dir).unwrap();
@@ -3550,18 +3642,9 @@ mod git_diff_tests {
     use crate::git::DiffMark;
 
     #[test]
-    fn toggle_git_diff_refuses_a_buffer_with_unsaved_changes() {
-        let mut buf = TextBuffer::open(std::path::Path::new("/tmp/bish-fileeditor-git-diff-dirty-test.txt"), 10).unwrap();
-        buf.insert_text((0, 0), "hello\n");
-        let err = toggle_git_diff(&mut buf).unwrap_err();
-        assert!(err.contains("unsaved changes"), "{err}");
-        assert!(buf.diff.is_none());
-    }
-
-    #[test]
     fn toggle_git_diff_refuses_a_buffer_with_no_path() {
         let mut buf = TextBuffer::new_unnamed(10);
-        let err = toggle_git_diff(&mut buf).unwrap_err();
+        let err = toggle_git_diff(&mut buf, None).unwrap_err();
         assert!(err.contains("no file name"), "{err}");
     }
 
@@ -3584,18 +3667,65 @@ mod git_diff_tests {
         std::fs::write(&path, "one\ntwo\nthree\n").unwrap();
         git_run(&dir, &["add", "f.txt"]);
         git_run(&dir, &["commit", "-q", "-m", "initial"]);
-        // Change on disk (not through the buffer -- toggle_git_diff reads
-        // the real file, same as toggle_git_blame does) so there's a real
-        // diff for `git diff` to find.
+        // Changed on disk and reloaded, so the committed content and the
+        // buffer really do differ.
         std::fs::write(&path, "one\nCHANGED\nthree\n").unwrap();
 
         let mut buf = TextBuffer::open(&path, 10).unwrap();
         assert!(!buf.is_dirty());
-        assert_eq!(toggle_git_diff(&mut buf).unwrap(), true);
+        assert!(toggle_git_diff(&mut buf, None).unwrap());
         assert_eq!(buf.diff.as_ref().unwrap().get(&1), Some(&DiffMark::Changed));
         assert_eq!(buf.diff.as_ref().unwrap().len(), 1);
-        assert_eq!(toggle_git_diff(&mut buf).unwrap(), false);
+        assert!(!toggle_git_diff(&mut buf, None).unwrap());
         assert!(buf.diff.is_none());
+
+        // ...and an *unsaved* edit counts too, which is the reason this
+        // diffs the buffer itself rather than the file on disk.
+        buf.insert_text((0, 0), "TYPED\n");
+        assert!(toggle_git_diff(&mut buf, None).unwrap());
+        let diff = buf.diff.as_ref().unwrap();
+        assert_eq!(diff.get(&0), Some(&DiffMark::Added));
+        assert_eq!(diff.get(&2), Some(&DiffMark::Changed));
+        assert_eq!(diff.len(), 2);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // `:git diff HEAD~1` against a buffer that matches HEAD exactly: the
+    // markers describe the older revision, not the index.
+    #[test]
+    fn toggle_git_diff_at_a_revision_marks_what_changed_since_it() {
+        if !crate::git::available() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("bish-fileeditor-git-diff-rev-test-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        git_run(&dir, &["init", "-q"]);
+        git_run(&dir, &["config", "user.email", "test@example.com"]);
+        git_run(&dir, &["config", "user.name", "Test User"]);
+        let path = dir.join("f.txt");
+        std::fs::write(&path, "one\ntwo\n").unwrap();
+        git_run(&dir, &["add", "f.txt"]);
+        git_run(&dir, &["commit", "-q", "-m", "initial"]);
+        std::fs::write(&path, "one\nTWO\nthree\n").unwrap();
+        git_run(&dir, &["add", "f.txt"]);
+        git_run(&dir, &["commit", "-q", "-m", "second"]);
+
+        let mut buf = TextBuffer::open(&path, 10).unwrap();
+        // Against the index (HEAD) there is nothing to show at all...
+        assert!(toggle_git_diff(&mut buf, None).unwrap());
+        assert!(buf.diff.as_ref().unwrap().is_empty());
+        assert!(!toggle_git_diff(&mut buf, None).unwrap());
+        // ...but against HEAD~1, the second line onwards is a hunk that
+        // replaced `two` with two lines -- one changed hunk, exactly as
+        // real `git diff -U0` reports it (`@@ -2 +2,2 @@`), not a change
+        // plus a separate addition.
+        assert_eq!(toggle_git_diff(&mut buf, Some("HEAD~1")).unwrap(), true);
+        let diff = buf.diff.as_ref().unwrap();
+        assert_eq!(diff.get(&1), Some(&DiffMark::Changed));
+        assert_eq!(diff.get(&2), Some(&DiffMark::Changed));
+        assert_eq!(diff.len(), 2);
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -3612,7 +3742,7 @@ mod git_diff_tests {
         std::fs::write(&path, "a\nb\n").unwrap();
 
         let mut buf = TextBuffer::open(&path, 10).unwrap();
-        toggle_git_diff(&mut buf).unwrap();
+        toggle_git_diff(&mut buf, None).unwrap();
         let diff = buf.diff.as_ref().unwrap();
         assert_eq!(diff.get(&0), Some(&DiffMark::Added));
         assert_eq!(diff.get(&1), Some(&DiffMark::Added));
@@ -3632,7 +3762,7 @@ mod git_diff_tests {
         std::fs::write(&path, "a\n").unwrap();
 
         let mut buf = TextBuffer::open(&path, 10).unwrap();
-        let err = toggle_git_diff(&mut buf).unwrap_err();
+        let err = toggle_git_diff(&mut buf, None).unwrap_err();
         assert!(err.to_lowercase().contains("git repository"), "{err}");
 
         std::fs::remove_dir_all(&dir).unwrap();
