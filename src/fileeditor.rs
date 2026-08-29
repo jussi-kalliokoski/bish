@@ -61,12 +61,29 @@ impl EditSession {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct EditTarget {
     // `None` is a fresh unnamed buffer -- a bare `e` with no arguments
-    // at all.
+    // at all, or flags with no file after them.
     pub path: Option<String>,
+    // `--hex`: open this file as raw bytes in the hex editor
+    // (hexedit::HexSession, a `Frame::Hex`) instead of as text.
+    pub hex: bool,
+    // `--readonly`: refuse every edit. Meaningful for both kinds of
+    // buffer (`TextBuffer::set_readonly`, `HexBuffer::readonly`) --
+    // opening something to look at without any chance of changing it by
+    // accident is exactly as reasonable for a script as for a core dump.
+    pub readonly: bool,
 }
 
 // `e`'s own argument parsing, shared by the builtin (via `ExecResult::
 // Edit`) and `bish tool edit` so the two can't drift apart.
+//
+// Flags are *per-file*: they attach to the file that follows them, so
+// `e script.sh --hex core.bin` opens one of each and `e --hex a.bin
+// b.bin` opens only `a.bin` as hex. Prefix binding (rather than
+// suffix, or a single mode for the whole command) is the only
+// unambiguous rule once several files can be named at once, and it's the
+// one every other command line already uses. Flags with no file after
+// them apply to a fresh unnamed buffer, so `e --hex` opens an empty one
+// to build a binary in.
 //
 // `--` ends option parsing, the usual way, so a file whose name really
 // does start with `-` is still openable (`e -- -weird.txt`). An
@@ -75,21 +92,38 @@ pub struct EditTarget {
 // worse outcome than being told the flag isn't one.
 pub fn parse_edit_args(args: &[String]) -> Result<Vec<EditTarget>, String> {
     let mut targets: Vec<EditTarget> = Vec::new();
+    let mut pending = EditTarget::default();
     let mut literal = false;
     for arg in args {
-        if !literal && arg == "--" {
-            literal = true;
-            continue;
+        if !literal {
+            match arg.as_str() {
+                "--" => {
+                    literal = true;
+                    continue;
+                }
+                "--hex" => {
+                    pending.hex = true;
+                    continue;
+                }
+                "--readonly" => {
+                    pending.readonly = true;
+                    continue;
+                }
+                // `-` alone is left alone: not a flag anywhere in this
+                // codebase, and conventionally a filename-shaped
+                // stand-in for a stream.
+                other if other.starts_with('-') && other != "-" => {
+                    return Err(format!("unrecognized option '{arg}'"));
+                }
+                _ => {}
+            }
         }
-        // `-` alone is left alone: not a flag anywhere in this codebase,
-        // and conventionally a filename-shaped stand-in for a stream.
-        if !literal && arg.starts_with('-') && arg != "-" {
-            return Err(format!("unrecognized option '{arg}'"));
-        }
-        targets.push(EditTarget { path: Some(arg.clone()) });
+        targets.push(EditTarget { path: Some(arg.clone()), ..std::mem::take(&mut pending) });
     }
-    if targets.is_empty() {
-        targets.push(EditTarget::default());
+    // Trailing flags (or no arguments at all) -- one unnamed buffer,
+    // carrying whatever was set for it.
+    if targets.is_empty() || pending != EditTarget::default() {
+        targets.push(pending);
     }
     Ok(targets)
 }
@@ -2108,6 +2142,40 @@ mod edit_args_tests {
     #[test]
     fn a_bare_dash_is_a_filename_not_a_flag() {
         assert_eq!(paths("-"), vec![Some("-".into())]);
+    }
+
+    #[test]
+    fn hex_binds_to_the_file_that_follows_it_and_no_others() {
+        let t = parse("script.sh --hex core.bin notes.txt").unwrap();
+        assert_eq!(t.len(), 3);
+        assert!(!t[0].hex, "the file before --hex is still text");
+        assert!(t[1].hex, "--hex applies to the file right after it");
+        assert!(!t[2].hex, "and stops there, rather than latching on");
+    }
+
+    #[test]
+    fn flags_compose_on_the_same_file() {
+        let t = parse("--hex --readonly core.bin").unwrap();
+        assert_eq!(t.len(), 1);
+        assert!(t[0].hex && t[0].readonly);
+    }
+
+    #[test]
+    fn a_trailing_flag_opens_a_fresh_buffer_of_that_kind() {
+        // `e --hex` with no file: an empty byte buffer to build a small
+        // binary in, not a silently-ignored flag.
+        let t = parse("--hex").unwrap();
+        assert_eq!(t.len(), 1);
+        assert_eq!(t[0].path, None);
+        assert!(t[0].hex);
+    }
+
+    #[test]
+    fn a_double_dash_stops_flag_parsing_for_good() {
+        let t = parse("-- --hex").unwrap();
+        assert_eq!(t.len(), 1);
+        assert_eq!(t[0].path, Some("--hex".into()), "after --, even a real flag is a filename");
+        assert!(!t[0].hex);
     }
 }
 

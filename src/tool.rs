@@ -18,14 +18,13 @@ pub fn run(args: &[String]) -> i32 {
         Some("format") => run_format(&args[1..]),
         Some("debug") => run_debug(&args[1..]),
         Some("edit") => run_edit(&args[1..]),
-        Some("hex") => crate::hexedit::run(&args[1..]),
         Some(other) => {
-            eprintln!("bish tool: unknown subcommand '{other}' (expected: check, format, debug, edit, hex)");
+            eprintln!("bish tool: unknown subcommand '{other}' (expected: check, format, debug, edit)");
             2
         }
         None => {
             eprintln!(
-                "bish tool: expected a subcommand (usage: bish tool check [--fix] [FILE...], bish tool format [--check] [FILE...], bish tool debug FILE, bish tool edit FILE..., bish tool hex FILE)"
+                "bish tool: expected a subcommand (usage: bish tool check [--fix] [FILE...], bish tool format [--check] [FILE...], bish tool debug FILE, bish tool edit [--hex] FILE...)"
             );
             2
         }
@@ -57,12 +56,14 @@ fn run_debug(args: &[String]) -> i32 {
 // line and the builtin can't drift apart.
 fn run_edit(args: &[String]) -> i32 {
     if args.is_empty() {
-        eprintln!("usage: bish tool edit FILE...");
+        eprintln!("usage: bish tool edit [--hex] [--readonly] FILE...");
         return 2;
     }
     if args.iter().any(|a| a == "-h" || a == "--help") {
-        println!("usage: bish tool edit FILE...");
-        println!("  opens each FILE in the real editor, the first one in front");
+        println!("usage: bish tool edit [--hex] [--readonly] FILE...");
+        println!("  opens each FILE in the real editor, the first one in front.");
+        println!("  --hex/--readonly are per-file: they apply to the FILE that follows");
+        println!("  them, so `edit script.sh --hex core.bin` opens one of each.");
         return 0;
     }
     crate::repl::run_edit(args)

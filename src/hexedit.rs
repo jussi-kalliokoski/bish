@@ -1,7 +1,17 @@
-// `bish tool hex [FILE]` -- a hex viewer/editor built on bishedit's
-// existing headless core rather than a parallel implementation of it.
-// A top-level module, the same tier as fileeditor.rs/browser.rs: a
-// concrete interactive view, not reusable headless logic.
+// `e --hex FILE` -- a hex viewer/editor built on bishedit's existing
+// headless core rather than a parallel implementation of it. A top-level
+// module, the same tier as fileeditor.rs/browser.rs: a concrete
+// interactive view, not reusable headless logic.
+//
+// Structured as the same split browser.rs's own module doc comment
+// describes: this module owns the buffer, the layout arithmetic, the key
+// handling and the rendering (all testable without a terminal), and
+// repl.rs owns the frame it lives in (`Frame::Hex`), that frame's pane
+// rect, and the loop reading real keystrokes into it (`run_hex_frame`).
+// So a hex view is a first-class editor frame -- stacked on the same
+// pane's frame stack alongside ordinary `Frame::Edit`s, left running and
+// resumed intact whenever focus moves to another pane or window --
+// rather than a separate program that owns the whole terminal.
 //
 // The whole design bet here is that a hex editor is a *buffer* with an
 // unusual rendering, not a different kind of program. So `HexBuffer`
@@ -50,18 +60,21 @@
 // for multi-gigabyte files is a different program, not a flag on this
 // one.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 use crate::bishedit::motion::{self, CaseKind, Motion, MotionRange, MotionShape};
 use crate::bishedit::registers::{RegisterShape, RegisterValue, Registers};
 use crate::bishedit::undo::UndoTree;
-use crate::bishedit::vimkeys::{InsertCmd, KeyOutcome, Op, VimKeys};
+use crate::bishedit::vimkeys::{InsertCmd, KeyOutcome, Op, VimKeys, WindowCmd};
 use crate::bishedit::Buffer;
 use crate::editor::{self, Key};
 use crate::history::History;
-use crate::term;
+use crate::repl::{render_global_status_row, Rect};
+use crate::vt100;
 
 // Bytes per group, separated by an extra space in the hex column --
 // `hexdump -C`/`xxd`'s own convention, and the reason a 16-byte row is
@@ -434,9 +447,14 @@ fn dump_width_for(bytes_per_row: usize, offset_width: usize) -> usize {
 }
 
 // `bytes_per_row: None` means auto: the widest multiple of GROUP whose
-// dump still fits the terminal, which is how a wide terminal gets 24 or
-// 32 bytes a row instead of always 16.
-pub fn compute_layout(term_rows: usize, term_cols: usize, len: usize, bytes_per_row: Option<usize>, want_inspector: bool) -> Layout {
+// dump still fits the pane, which is how a wide pane gets 24 or 32 bytes
+// a row instead of always 16.
+//
+// `rows`/`cols` are this frame's own *pane* rect, not the terminal --
+// the status line lives on the terminal's shared global status row
+// (`repl::render_global_status_row`), outside the rect entirely, so
+// unlike a full-screen tool there's no row to reserve out of it here.
+pub fn compute_layout(rows: usize, cols: usize, len: usize, bytes_per_row: Option<usize>, want_inspector: bool) -> Layout {
     let offset_width = offset_width_for(len);
     let widest_fitting = |budget: usize| -> usize {
         let mut best = GROUP;
@@ -455,24 +473,22 @@ pub fn compute_layout(term_rows: usize, term_cols: usize, len: usize, bytes_per_
         // headline feature to win 8 more bytes of dump. When the
         // inspector is wanted, the row is sized against the width left
         // over after reserving room for it, and only falls back to
-        // filling the whole terminal if even one group wouldn't fit
+        // filling the whole pane if even one group wouldn't fit
         // alongside it.
-        None if want_inspector && dump_width_for(GROUP, offset_width) + INSPECTOR_WIDTH <= term_cols => {
-            widest_fitting(term_cols - INSPECTOR_WIDTH)
+        None if want_inspector && dump_width_for(GROUP, offset_width) + INSPECTOR_WIDTH <= cols => {
+            widest_fitting(cols - INSPECTOR_WIDTH)
         }
-        None => widest_fitting(term_cols),
+        None => widest_fitting(cols),
     };
     let dump_width = dump_width_for(bpr, offset_width);
-    let inspector_col = (want_inspector && term_cols >= dump_width + INSPECTOR_WIDTH).then_some(dump_width + 2);
+    let inspector_col = (want_inspector && cols >= dump_width + INSPECTOR_WIDTH).then_some(dump_width + 2);
     Layout {
         bytes_per_row: bpr,
         offset_width,
         hex_col: offset_width + 2,
         ascii_col: offset_width + 2 + hex_span(bpr) + 1,
         dump_width,
-        // One row is reserved for the status line, matching every other
-        // full-screen view in this codebase.
-        rows: term_rows.saturating_sub(1).max(1),
+        rows: rows.max(1),
         inspector_col,
     }
 }
@@ -501,9 +517,20 @@ pub enum Endian {
     Big,
 }
 
-struct Session {
+// What repl.rs's `hex_frames` side table actually holds, exactly as
+// `fileeditor::EditSession` is what `edit_frames` holds -- the whole
+// live view, so a mid-typed nibble, an in-progress Visual selection or
+// an undo history all survive a Ctrl+Space detach and come back intact.
+pub struct HexSession {
     buf: HexBuffer,
     vk: VimKeys,
+    // The shell's own one shared register table, moved in and back out
+    // at each focus boundary (`attach_registers`/`detach_registers`)
+    // rather than borrowed: only the focused frame is ever driven, so
+    // ownership transfer is exactly equivalent to sharing and keeps
+    // every method below free of a `&mut Registers` parameter. It is
+    // what makes this module's own claim true in practice -- a `"ay`
+    // here really is the same register a `"ap` in the file editor reads.
     registers: Registers,
     undo: UndoTree<Vec<u8>>,
     mode: Mode,
@@ -526,15 +553,50 @@ struct Session {
     // leaving it stuck on forever.
     saved_node: usize,
     status: Option<String>,
-    quit: bool,
-    exit_code: i32,
-    term_rows: usize,
-    term_cols: usize,
 }
 
-impl Session {
-    fn layout(&self) -> Layout {
-        compute_layout(self.term_rows, self.term_cols, self.buf.len(), self.width_override, self.inspector)
+impl HexSession {
+    // `rect` only seeds the initial geometry -- every later frame
+    // recomputes it (see `prepare`), so a resize or a split between two
+    // keystrokes is honored on the very next one.
+    pub fn open(path: Option<&Path>, rect: Rect, readonly: bool) -> io::Result<HexSession> {
+        let layout = compute_layout(rect.rows, rect.cols, 0, None, true);
+        let mut buf = HexBuffer::open(path, layout.bytes_per_row, layout.rows)?;
+        buf.readonly = readonly;
+        let undo = UndoTree::new(buf.bytes.clone(), (0, 0));
+        Ok(HexSession {
+            buf,
+            vk: VimKeys::new(),
+            // A placeholder: `attach_registers` replaces this with the
+            // shell's own shared table the moment this frame is first
+            // driven, and it is never read before then.
+            registers: Registers::default(),
+            undo,
+            mode: Mode::Normal,
+            pane: Pane::Hex,
+            pending_nibble: None,
+            pending_replace: None,
+            width_override: None,
+            inspector: true,
+            endian: Endian::Little,
+            last_search: None,
+            saved_node: 0,
+            status: None,
+        })
+    }
+
+    // See the `registers` field's own doc comment: the shared table moves
+    // in when this frame takes focus and back out when it loses it.
+    pub fn attach_registers(&mut self, registers: &mut Registers) {
+        self.registers = std::mem::take(registers);
+    }
+
+    pub fn detach_registers(&mut self, registers: &mut Registers) {
+        *registers = std::mem::take(&mut self.registers);
+    }
+
+    fn layout(&self, rect: Rect) -> Layout {
+        compute_layout(rect.rows, rect.cols, self.buf.len(), self.width_override, self.inspector)
     }
 
     // Deliberately *not* called before each individual edit: like the
@@ -703,18 +765,30 @@ fn byte_color(b: u8) -> &'static str {
     }
 }
 
-fn render(session: &Session, layout: Layout) -> String {
+// The dump itself, addressed against `row_origin`/`col_origin` rather
+// than the terminal's own top-left -- exactly `fileeditor::
+// build_editor_frame`'s own convention, and for the same two reasons:
+// the live render passes this pane's absolute position, while `freeze`
+// passes `0`/`0` because a session's own vt100 grid is addressed
+// pane-relative (see render_compositor_frame's per-pane loop).
+//
+// Every row is padded out to `rect.cols` instead of ending with an
+// `\x1b[K`: erasing to the real end of the line would reach straight
+// across a vertical split into whoever owns the columns to the right.
+// That padding is also what makes rows past the end of the file blank
+// themselves out, with no full-screen clear anywhere in here.
+fn build_frame(session: &HexSession, layout: Layout, rect: Rect, row_origin: usize, col_origin: usize) -> String {
     let buf = &session.buf;
     let selection = session.visual_range();
     let cursor = buf.offset();
     let mut out = String::new();
-    out.push_str("\x1b[H\x1b[2J");
 
-    for screen_row in 0..layout.rows {
+    for screen_row in 0..layout.rows.min(rect.rows) {
         let row = buf.vtop + screen_row;
-        out.push_str(&format!("\x1b[{};1H", screen_row + 1));
+        out.push_str(&format!("\x1b[{};{}H", row_origin + screen_row + 1, col_origin + 1));
         let row_start = row * layout.bytes_per_row;
         if row_start > buf.len() || (row_start == buf.len() && row_start != cursor) {
+            out.push_str(&" ".repeat(rect.cols));
             continue;
         }
         out.push_str(&format!("\x1b[2m{:0width$x}\x1b[0m  ", row_start, width = layout.offset_width));
@@ -756,17 +830,18 @@ fn render(session: &Session, layout: Layout) -> String {
             }
         }
         out.push_str("\x1b[2m|\x1b[0m");
+        // Every drawn row is exactly `dump_width` columns wide (that's
+        // what dump_width_for adds up), so what's left to blank out is
+        // the rest of the pane.
+        out.push_str(&" ".repeat(rect.cols.saturating_sub(layout.dump_width)));
     }
 
     if let Some(col) = layout.inspector_col {
-        out.push_str(&render_inspector(session, layout, col));
+        out.push_str(&render_inspector(session, layout, rect, row_origin, col_origin + col));
     }
-    out.push_str(&render_status(session, layout));
     // The block cursor is drawn by this frame's own reverse-video cell,
     // so the terminal's real cursor would only ever be a second, wrong
-    // one somewhere else -- except in the ASCII pane while typing, where
-    // sitting it on the cell being edited is what makes Insert mode feel
-    // like a text field.
+    // one somewhere else.
     out.push_str("\x1b[?25l");
     out
 }
@@ -777,7 +852,7 @@ fn render(session: &Session, layout: Layout) -> String {
 // underline), so it's always obvious which of the two a keystroke will
 // land in -- the one piece of state a two-pane hex editor absolutely
 // must show.
-fn styled(text: &str, color: &str, off: usize, cursor: usize, selection: Option<(usize, usize)>, active: bool, session: &Session) -> String {
+fn styled(text: &str, color: &str, off: usize, cursor: usize, selection: Option<(usize, usize)>, active: bool, session: &HexSession) -> String {
     let selected = selection.is_some_and(|(s, e)| off >= s && off < e);
     let is_cursor = off == cursor;
     let mut out = String::new();
@@ -800,7 +875,9 @@ fn styled(text: &str, color: &str, off: usize, cursor: usize, selection: Option<
     out
 }
 
-fn render_inspector(session: &Session, layout: Layout, col: usize) -> String {
+// `col` is already absolute (the caller adds `col_origin`); `row_origin`
+// positions it against the pane the same way build_frame's own rows are.
+fn render_inspector(session: &HexSession, layout: Layout, rect: Rect, row_origin: usize, col: usize) -> String {
     let bytes = session.buf.bytes();
     let off = session.buf.offset();
     let le = session.endian == Endian::Little;
@@ -848,15 +925,15 @@ fn render_inspector(session: &Session, layout: Layout, col: usize) -> String {
         lines.push(("f64".to_string(), format_float(f64::from_bits(v))));
     }
 
-    let width = session.term_cols.saturating_sub(col);
+    let width = rect.cols.saturating_sub(layout.dump_width + 2);
     let mut out = String::new();
-    out.push_str(&format!("\x1b[1;{}H\x1b[1m{}\x1b[0m", col + 1, fit(&format!("inspector @ 0x{off:x}"), width)));
+    out.push_str(&format!("\x1b[{};{}H\x1b[1m{}\x1b[0m", row_origin + 1, col + 1, fit(&format!("inspector @ 0x{off:x}"), width)));
     for (i, (name, value)) in lines.iter().enumerate() {
         let row = i + 2;
-        if row > layout.rows {
+        if row > layout.rows.min(rect.rows) {
             break;
         }
-        out.push_str(&format!("\x1b[{};{}H", row, col + 1));
+        out.push_str(&format!("\x1b[{};{}H", row_origin + row, col + 1));
         let text = format!("{name:<7}{value}");
         out.push_str(&format!("\x1b[2m{:<7}\x1b[0m{}", name, fit(&text[7.min(text.len())..], width.saturating_sub(7))));
     }
@@ -883,7 +960,12 @@ fn format_float(v: f64) -> String {
     }
 }
 
-fn render_status(session: &Session, layout: Layout) -> String {
+// The text for the terminal's shared global status row (see
+// `repl::render_global_status_row`, which does the positioning and the
+// reverse-video styling) -- `term_cols`, not the pane's width, because
+// that row spans the whole terminal regardless of how the panes below it
+// are split.
+fn status_text(session: &HexSession, layout: Layout, term_cols: usize) -> String {
     let buf = &session.buf;
     // The file's own name, not its whole path -- same as vim's own
     // status line, and found necessary in practice: a deep absolute path
@@ -923,18 +1005,17 @@ fn render_status(session: &Session, layout: Layout) -> String {
     // whole row for one frame -- it's the same "say what just happened"
     // slot the file editor's own status line uses.
     let text = match &session.status {
-        Some(msg) => fit(msg, session.term_cols),
+        Some(msg) => fit(msg, term_cols),
         None => {
             let used = display_len(&left) + display_len(&right);
-            if used + 2 > session.term_cols {
-                fit(&left, session.term_cols)
+            if used + 2 > term_cols {
+                fit(&left, term_cols)
             } else {
-                format!("{left}{}{right}", " ".repeat(session.term_cols - used))
+                format!("{left}{}{right}", " ".repeat(term_cols - used))
             }
         }
     };
-    let padded = format!("{text}{}", " ".repeat(session.term_cols.saturating_sub(display_len(&text))));
-    format!("\x1b[{};1H\x1b[7m{}\x1b[0m", session.term_rows, padded)
+    format!("{text}{}", " ".repeat(term_cols.saturating_sub(display_len(&text))))
 }
 
 fn display_len(s: &str) -> usize {
@@ -956,7 +1037,7 @@ fn hex_digit(c: char) -> Option<u8> {
     c.to_digit(16).map(|d| d as u8)
 }
 
-impl Session {
+impl HexSession {
     fn handle_insert_key(&mut self, key: Key) {
         match key {
             Key::Escape => {
@@ -1057,13 +1138,19 @@ impl Session {
 
     fn readonly_refused(&mut self) -> bool {
         if self.buf.readonly {
-            self.status = Some("buffer is read-only (opened with --readonly)".to_string());
+            self.status = Some("buffer is read-only (opened with `e --readonly`)".to_string());
             return true;
         }
         false
     }
 
-    fn handle_outcome(&mut self, outcome: KeyOutcome, rows: usize) {
+    // Returns the `<C-w>` window command this keystroke resolved to, if
+    // any -- handled by repl.rs (which owns focus and the layout), not
+    // here. Everything else is applied in place.
+    fn handle_outcome(&mut self, outcome: KeyOutcome, rows: usize) -> Option<(WindowCmd, Option<usize>)> {
+        if let KeyOutcome::Window(cmd, count) = outcome {
+            return Some((cmd, count));
+        }
         match outcome {
             KeyOutcome::Pending | KeyOutcome::None => {}
             // `/`/`?` come through as ordinary motions from the shared key
@@ -1098,7 +1185,7 @@ impl Session {
                 if let Some(range) = motion::motion_range(&mut self.buf, m, count) {
                     let (start, end) = self.buf.byte_range(&range);
                     if op != Op::Yank && self.readonly_refused() {
-                        return;
+                        return None;
                     }
                     self.apply_op(op, start, end, register);
                 }
@@ -1109,7 +1196,7 @@ impl Session {
                 let start = row * bpr;
                 let end = ((row + count.unwrap_or(1).max(1)) * bpr).min(self.buf.len());
                 if op != Op::Yank && self.readonly_refused() {
-                    return;
+                    return None;
                 }
                 self.apply_op(op, start, end, register);
             }
@@ -1120,7 +1207,7 @@ impl Session {
             }
             KeyOutcome::DeleteCharForward { count, register } => {
                 if self.readonly_refused() {
-                    return;
+                    return None;
                 }
                 let start = self.buf.offset;
                 let end = (start + count.unwrap_or(1).max(1)).min(self.buf.len());
@@ -1142,7 +1229,7 @@ impl Session {
                 // pane intercepts `r` before `feed` ever sees it, since a
                 // byte there takes two digits (see `handle_normal_key`).
                 if self.readonly_refused() {
-                    return;
+                    return None;
                 }
                 let mut tmp = [0u8; 4];
                 let bytes = ch.encode_utf8(&mut tmp).as_bytes().to_vec();
@@ -1157,7 +1244,7 @@ impl Session {
             }
             KeyOutcome::ToggleCase { count } => {
                 if self.readonly_refused() {
-                    return;
+                    return None;
                 }
                 let start = self.buf.offset;
                 let end = (start + count.unwrap_or(1).max(1)).min(self.buf.len());
@@ -1175,7 +1262,7 @@ impl Session {
             // than saturating so 0xff+1 is 0x00.
             KeyOutcome::AdjustNumber { delta } => {
                 if self.readonly_refused() {
-                    return;
+                    return None;
                 }
                 if let Some(b) = self.buf.byte_at(self.buf.offset) {
                     let at = self.buf.offset;
@@ -1234,8 +1321,9 @@ impl Session {
             KeyOutcome::AddSurround { .. } | KeyOutcome::DeleteSurround { .. } | KeyOutcome::ChangeSurround { .. } => {
                 self.status = Some("surround has no meaning in a byte buffer".to_string())
             }
-            KeyOutcome::Window(..) => self.status = Some("bish tool hex is a single-view tool -- no windows to switch".to_string()),
+            KeyOutcome::Window(..) => unreachable!("bubbled up before this match"),
         }
+        None
     }
 
     // Visual mode's own operators, which act on the live selection rather
@@ -1270,13 +1358,10 @@ impl Session {
 // ---------------------------------------------------------------------
 
 const HELP_TEXT: &str = "\
-bish tool hex -- quick reference (:help)
-
-  Motions are bishedit's own, unchanged: h j k l | w b e W B E | 0 ^ $
-  | gg G | f F t T ; , | H M L | Ctrl-D/U/F/B | zz zt zb | m{a-z} `{m}
-  | Ctrl-O/Ctrl-I. A \"line\" is one row of bytes; a \"char\" is one byte.
-  Word motions therefore step between printable runs -- handy for
-  finding strings in a binary.
+hex editor (e --hex) -- quick reference (:help)
+  Motions are bishedit's own: h j k l | w b e W B E | 0 ^ $ | gg G | f F
+  t T ; , | H M L | Ctrl-D/U/F/B | zz zt zb | m{a-z} `{m} | Ctrl-O/I. A
+  row of bytes is a \"line\", a byte is a \"char\", so w/b hop printable runs.
 
   Tab           switch between the hex and ASCII panes
   i a I A       insert bytes (hex pane: two hex digits per byte)
@@ -1288,13 +1373,13 @@ bish tool hex -- quick reference (:help)
   u Ctrl-R      undo / redo (g- and g+ time travel too)
   / ? n N       search: /dead is bytes DE AD, /\"dead\" is literal text
 
-  :w [FILE]     write (:wq/:x write+quit, :q quit, :q! discard+quit)
-  :goto EXPR    jump to an offset -- :goto 0x1f00, :goto 4096, :goto +16
-  :0x1f00       shorthand for the same thing
-  :set width N  bytes per row (N, or `auto` to fit the terminal)
+  :w [FILE]     write (:wq/:x write+quit, :q close, :q! discard+close)
+  :goto EXPR    jump to an offset -- 0x1f00, 4096, +16, $ (or bare :0x1f00)
+  :set width N  bytes per row (N, or `auto` to fit the pane)
   :set endian   little | big -- which way the inspector reads integers
   :inspect      toggle the data inspector column
-  :help         this screen";
+  :help         this screen
+  <C-w>...      window commands: this frame stays open, like an `e` one";
 
 fn parse_offset(expr: &str, current: usize, len: usize) -> Option<usize> {
     let expr = expr.trim();
@@ -1316,11 +1401,14 @@ fn parse_offset(expr: &str, current: usize, len: usize) -> Option<usize> {
     Some(target.clamp(0, len.saturating_sub(1) as i64) as usize)
 }
 
-impl Session {
-    fn dispatch_colon(&mut self, line: &str) {
+impl HexSession {
+    // Returns `true` when the command asked to close this frame
+    // (`:q`/`:q!`/`:wq`/`:x`) -- what to actually *do* about that is
+    // repl.rs's business, since it owns the pane's frame stack.
+    fn dispatch_colon(&mut self, line: &str) -> bool {
         let line = line.trim();
         if line.is_empty() {
-            return;
+            return false;
         }
         let (cmd, arg) = match line.split_once(' ') {
             Some((c, a)) => (c, Some(a.trim()).filter(|a| !a.is_empty())),
@@ -1337,13 +1425,13 @@ impl Session {
                 Err(e) => self.status = Some(format!("bish: hex: {e}")),
             },
             "wq" | "x" => match self.buf.save(arg.map(Path::new)) {
-                Ok(()) => self.quit = true,
+                Ok(()) => return true,
                 Err(e) => self.status = Some(format!("bish: hex: {e}")),
             },
             "q" if self.buf.is_dirty() => {
                 self.status = Some("E37: No write since last change (add ! to override)".to_string());
             }
-            "q" | "q!" => self.quit = true,
+            "q" | "q!" => return true,
             "goto" | "g" => match arg.and_then(|a| parse_offset(a, self.buf.offset, self.buf.len())) {
                 Some(off) => {
                     self.vk.push_jump(self.buf.cursor());
@@ -1396,241 +1484,217 @@ impl Session {
                 None => self.status = Some(format!("bish: hex: not a command: {other}")),
             },
         }
+        false
     }
 }
 
 // ---------------------------------------------------------------------
-// Entry point
+// The frame API repl.rs drives this through
 // ---------------------------------------------------------------------
 
-pub fn run(args: &[String]) -> i32 {
-    let mut readonly = false;
-    let mut path: Option<&str> = None;
-    for arg in args {
-        match arg.as_str() {
-            "--readonly" | "-r" => readonly = true,
-            "-h" | "--help" => {
-                println!("usage: bish tool hex [--readonly] FILE");
-                println!("  a vim-keyed hex viewer/editor; :help inside for the full reference");
-                return 0;
-            }
-            other if other.starts_with('-') && other != "-" => {
-                eprintln!("bish tool hex: unrecognized option '{other}'");
-                return 2;
-            }
-            other => path = Some(other),
-        }
-    }
-    let Some(path) = path else {
-        eprintln!("usage: bish tool hex [--readonly] FILE");
-        return 2;
-    };
-
-    let (term_rows, term_cols) = match crate::pty::get_size(0) {
-        Ok(ws) if ws.rows > 0 && ws.cols > 0 => (ws.rows as usize, ws.cols as usize),
-        _ => (24, 80),
-    };
-    let layout = compute_layout(term_rows, term_cols, 0, None, true);
-    let mut buf = match HexBuffer::open(Some(Path::new(path)), layout.bytes_per_row, layout.rows) {
-        Ok(b) => b,
-        Err(e) => {
-            eprintln!("bish tool hex: {path}: {e}");
-            return 1;
-        }
-    };
-    buf.readonly = readonly;
-
-    let undo = UndoTree::new(buf.bytes.clone(), (0, 0));
-    let mut session = Session {
-        buf,
-        vk: VimKeys::new(),
-        registers: Registers::new(),
-        undo,
-        mode: Mode::Normal,
-        pane: Pane::Hex,
-        pending_nibble: None,
-        pending_replace: None,
-        width_override: None,
-        inspector: true,
-        endian: Endian::Little,
-        last_search: None,
-        saved_node: 0,
-        status: None,
-        quit: false,
-        exit_code: 0,
-        term_rows,
-        term_cols,
-    };
-
-    let Ok(_guard) = term::RawGuard::enable(0) else {
-        eprintln!("bish tool hex: not a terminal");
-        return 1;
-    };
-    crate::exec::install_winch_handler();
-    print!("\x1b[?1049h");
-    let _ = io::stdout().flush();
-
-    let cmd_history = History::load(".bish_cmd_history");
-    drive(&mut session, &cmd_history);
-
-    print!("\x1b[?25h\x1b[?1049l");
-    let _ = io::stdout().flush();
-    session.exit_code
+// How driving one keystroke ended. `Continue`/`Quit` are this view's own
+// business; `Window` is handed straight back to repl.rs, which owns
+// focus and the window layout -- exactly the split
+// `run_normal_mode_navigation`'s own `KeyOutcome::Window` arm already
+// establishes for the file editor, and (as there) the only way this view
+// is ever left without closing it.
+pub enum HexOutcome {
+    Continue,
+    Quit,
+    Window(WindowCmd, Option<usize>),
 }
 
-fn drive(session: &mut Session, cmd_history: &History) {
-    loop {
-        let layout = session.layout();
-        session.buf.set_bytes_per_row(layout.bytes_per_row);
-        session.checkpoint();
-        session.scroll_to_cursor(layout.rows);
-        print!("{}", render(session, layout));
-        let _ = io::stdout().flush();
-        // Cleared after it's been shown for exactly one frame, so the
-        // next keystroke reveals the ordinary status line again.
-        session.status = None;
-
-        let key = match editor::read_key_idle(&mut || {
-            if crate::exec::take_winch()
-                && let Ok(ws) = crate::pty::get_size(0)
-                && ws.rows > 0
-                && ws.cols > 0
-            {
-                session.term_rows = ws.rows as usize;
-                session.term_cols = ws.cols as usize;
-            }
-        }) {
-            Ok(Some(k)) => k,
-            Ok(None) | Err(_) => return,
-        };
-
-        if handle_key(session, key, layout, cmd_history) {
-            return;
-        }
-        if session.quit {
-            return;
-        }
-    }
-}
-
-// Returns `true` when the session should end.
-fn handle_key(session: &mut Session, key: Key, layout: Layout, cmd_history: &History) -> bool {
-    if matches!(session.mode, Mode::Insert | Mode::Replace) {
-        session.handle_insert_key(key);
-        return false;
+impl HexSession {
+    // Everything that has to happen before a frame can be drawn, in the
+    // one order that keeps undo honest: reflow to the pane's current
+    // width, *then* checkpoint (see `checkpoint`'s own doc comment on
+    // why this runs after the edits rather than before them), then bring
+    // the cursor back into view.
+    fn prepare(&mut self, rect: Rect) -> Layout {
+        let layout = self.layout(rect);
+        self.buf.set_bytes_per_row(layout.bytes_per_row);
+        self.checkpoint();
+        self.scroll_to_cursor(layout.rows.min(rect.rows));
+        layout
     }
 
-    // `r` in the hex pane needs two digits, which the shared key decoder
-    // can't express (`ReplaceChar` resolves after one), so it's read here
-    // instead -- the one place this editor's key handling steps outside
-    // `VimKeys`, and only for the pane where a byte genuinely takes two
-    // keystrokes.
-    if let Some(pending) = session.pending_replace {
-        match key {
-            Key::Escape => session.pending_replace = None,
-            Key::Char(c) => match hex_digit(c) {
-                Some(nib) => match pending {
-                    None => session.pending_replace = Some(Some(nib)),
-                    Some(high) => {
-                        session.pending_replace = None;
-                        if !session.readonly_refused() {
-                            let at = session.buf.offset;
-                            session.buf.overwrite_at(at, &[(high << 4) | nib]);
+    // The live render: this pane's own dump plus the terminal's shared
+    // global status row. Clears `self.status` on the way out, so a
+    // transient message (a yank count, a search result, an error) is
+    // shown for exactly one frame and the next keystroke reveals the
+    // ordinary status line again.
+    pub fn render(&mut self, rect: Rect, term_rows: usize, term_cols: usize) -> String {
+        let layout = self.prepare(rect);
+        let mut out = render_global_status_row(&status_text(self, layout, term_cols), term_rows);
+        out.push_str(&build_frame(self, layout, rect, rect.row, rect.col));
+        self.status = None;
+        out
+    }
+
+    // `fileeditor::freeze_editor_frame`'s own counterpart -- feeds this
+    // frame's current content into the owning session's vt100 grid
+    // (pane-relative, hence the `0`/`0` origin) so a compositor redraw of
+    // a pane holding a *detached* `Frame::Hex` shows the real dump
+    // instead of stale or blank rows. The global status row is
+    // deliberately not part of it: that row lives outside every pane's
+    // rect, so it isn't this grid's to hold.
+    pub fn freeze(&mut self, screen: &Rc<RefCell<vt100::Screen>>, rect: Rect) {
+        let layout = self.prepare(rect);
+        let framed = build_frame(self, layout, rect, 0, 0);
+        screen.borrow_mut().feed(framed.as_bytes());
+    }
+
+    // One keystroke. `on_idle` is the caller's own
+    // `service_background_jobs` hook, threaded in for the two places this
+    // can itself block on further input (the `:` colon line and the help
+    // screen) so background jobs keep draining and a resize is still
+    // noticed within one poll tick while either is up.
+    pub fn handle_key(
+        &mut self,
+        key: Key,
+        rect: Rect,
+        term_rows: usize,
+        term_cols: usize,
+        cmd_history: &History,
+        on_idle: &mut dyn FnMut(),
+    ) -> HexOutcome {
+        let layout = self.layout(rect);
+        if matches!(self.mode, Mode::Insert | Mode::Replace) {
+            self.handle_insert_key(key);
+            return HexOutcome::Continue;
+        }
+
+        // `r` in the hex pane needs two digits, which the shared key
+        // decoder can't express (`ReplaceChar` resolves after one), so
+        // it's read here instead -- the one place this editor's key
+        // handling steps outside `VimKeys`, and only for the pane where a
+        // byte genuinely takes two keystrokes.
+        if let Some(pending) = self.pending_replace {
+            match key {
+                Key::Escape => self.pending_replace = None,
+                Key::Char(c) => match hex_digit(c) {
+                    Some(nib) => match pending {
+                        None => self.pending_replace = Some(Some(nib)),
+                        Some(high) => {
+                            self.pending_replace = None;
+                            if !self.readonly_refused() {
+                                let at = self.buf.offset;
+                                self.buf.overwrite_at(at, &[(high << 4) | nib]);
+                            }
                         }
+                    },
+                    None => {
+                        self.pending_replace = None;
+                        self.status = Some(format!("'{c}' is not a hex digit"));
                     }
                 },
-                None => {
-                    session.pending_replace = None;
-                    session.status = Some(format!("'{c}' is not a hex digit"));
-                }
-            },
-            _ => session.pending_replace = None,
+                _ => self.pending_replace = None,
+            }
+            return HexOutcome::Continue;
         }
-        return false;
+
+        match key {
+            Key::Tab if !self.vk.is_search_pending() => {
+                self.pane = if self.pane == Pane::Hex { Pane::Ascii } else { Pane::Hex };
+                return HexOutcome::Continue;
+            }
+            Key::Char('r') if self.pane == Pane::Hex && !self.vk.is_search_pending() && self.vk.pending_display().is_empty() => {
+                self.pending_replace = Some(None);
+                return HexOutcome::Continue;
+            }
+            Key::Char(':') if !self.vk.is_search_pending() && self.vk.pending_display().is_empty() => {
+                return self.run_colon_line(rect, term_rows, term_cols, cmd_history, on_idle);
+            }
+            Key::Escape if self.mode == Mode::Visual && !self.vk.is_search_pending() => {
+                let cursor = self.buf.cursor();
+                self.vk.end_visual(cursor);
+                self.mode = Mode::Normal;
+                return HexOutcome::Continue;
+            }
+            _ => {}
+        }
+
+        if self.mode == Mode::Visual && self.vk.pending_display().is_empty() && !self.vk.is_search_pending() && self.handle_visual_key(key) {
+            return HexOutcome::Continue;
+        }
+
+        let outcome = self.vk.feed(key);
+        let window = self.handle_outcome(outcome, layout.rows.min(rect.rows));
+        // A motion in Visual mode keeps the selection live; anything that
+        // committed an operator already ended it inside `handle_outcome`.
+        if self.mode == Mode::Visual && !self.vk.is_visual() {
+            self.mode = Mode::Normal;
+        }
+        match window {
+            Some((cmd, count)) => HexOutcome::Window(cmd, count),
+            None => HexOutcome::Continue,
+        }
     }
 
-    match key {
-        Key::Tab if !session.vk.is_search_pending() => {
-            session.pane = if session.pane == Pane::Hex { Pane::Ascii } else { Pane::Hex };
-            return false;
+    // Reuses `editor::read_line` for the colon line itself, on the same
+    // shared global command row `run_command_mode`'s own `:` prompt uses,
+    // with no completion/suggestion providers -- this view's commands are
+    // its own, not the shell's.
+    fn run_colon_line(
+        &mut self,
+        rect: Rect,
+        term_rows: usize,
+        term_cols: usize,
+        cmd_history: &History,
+        on_idle: &mut dyn FnMut(),
+    ) -> HexOutcome {
+        print!("\x1b[{};1H\x1b[K\x1b[?25h", crate::repl::command_mode_row(term_rows) + 1);
+        let _ = io::stdout().flush();
+        let mut registers = std::mem::take(&mut self.registers);
+        let outcome = editor::read_line(
+            ":",
+            cmd_history,
+            true,
+            false,
+            None,
+            0,
+            term_cols,
+            crate::bishedit::highlight::HighlightContext::default(),
+            None,
+            None,
+            false,
+            None,
+            &mut registers,
+            &[],
+            None,
+            &mut *on_idle,
+        );
+        self.registers = registers;
+        if let Ok(editor::ReadOutcome::Line(line)) = outcome {
+            if matches!(line.trim(), "help" | "h" | "?") {
+                self.show_help(rect, term_rows, term_cols, on_idle);
+                return HexOutcome::Continue;
+            }
+            if self.dispatch_colon(&line) {
+                return HexOutcome::Quit;
+            }
         }
-        Key::Char('r') if session.pane == Pane::Hex && !session.vk.is_search_pending() && session.vk.pending_display().is_empty() => {
-            session.pending_replace = Some(None);
-            return false;
-        }
-        Key::Char(':') if !session.vk.is_search_pending() && session.vk.pending_display().is_empty() => {
-            run_colon_line(session, layout, cmd_history);
-            return session.quit;
-        }
-        Key::Escape if session.mode == Mode::Visual && !session.vk.is_search_pending() => {
-            let cursor = session.buf.cursor();
-            session.vk.end_visual(cursor);
-            session.mode = Mode::Normal;
-            return false;
-        }
-        _ => {}
+        HexOutcome::Continue
     }
 
-    if session.mode == Mode::Visual && session.vk.pending_display().is_empty() && !session.vk.is_search_pending() && session.handle_visual_key(key) {
-        return false;
-    }
-
-    let outcome = session.vk.feed(key);
-    session.handle_outcome(outcome, layout.rows);
-    // A motion in Visual mode keeps the selection live; anything that
-    // committed an operator already ended it inside `handle_outcome`.
-    if session.mode == Mode::Visual && !session.vk.is_visual() {
-        session.mode = Mode::Normal;
-    }
-    false
-}
-
-fn run_colon_line(session: &mut Session, _layout: Layout, cmd_history: &History) {
-    print!("\x1b[{};1H\x1b[K\x1b[?25h", session.term_rows);
-    let _ = io::stdout().flush();
-    let mut registers = std::mem::take(&mut session.registers);
-    let outcome = editor::read_line(
-        ":",
-        cmd_history,
-        true,
-        false,
-        None,
-        0,
-        session.term_cols,
-        crate::bishedit::highlight::HighlightContext::default(),
-        None,
-        None,
-        false,
-        None,
-        &mut registers,
-        &[],
-        None,
-        &mut || {},
-    );
-    session.registers = registers;
-    if let Ok(editor::ReadOutcome::Line(line)) = outcome {
-        if line.trim() == "help" || line.trim() == "h" || line.trim() == "?" {
-            show_help(session);
-            return;
+    // One curated page, dismissed by any key -- the same "one screen,
+    // not a whole help system" scope the file editor's own `:help`
+    // already sets. Drawn into this pane rather than over the whole
+    // terminal, so what's around it (a split sibling, the tab bar) stays
+    // where it is; a pane too short for the whole page simply shows as
+    // much as fits.
+    fn show_help(&mut self, rect: Rect, term_rows: usize, term_cols: usize, on_idle: &mut dyn FnMut()) {
+        let mut out = String::new();
+        let mut help = HELP_TEXT.lines();
+        for r in 0..rect.rows {
+            out.push_str(&format!("\x1b[{};{}H{}", rect.row + r + 1, rect.col + 1, fit_pad(help.next().unwrap_or(""), rect.cols)));
         }
-        session.dispatch_colon(&line);
+        out.push_str(&render_global_status_row(&fit_pad("-- press any key --", term_cols), term_rows));
+        out.push_str("\x1b[?25l");
+        print!("{out}");
+        let _ = io::stdout().flush();
+        let _ = editor::read_key_idle(on_idle);
     }
-}
-
-// One full-screen page, dismissed by any key -- the same "one curated
-// screen, not a whole help system" scope the file editor's own `:help`
-// already sets.
-fn show_help(session: &mut Session) {
-    print!("\x1b[H\x1b[2J\x1b[?25l");
-    for (i, line) in HELP_TEXT.lines().enumerate() {
-        if i + 1 >= session.term_rows {
-            break;
-        }
-        print!("\x1b[{};1H{}", i + 1, fit(line, session.term_cols));
-    }
-    print!("\x1b[{};1H\x1b[7m{}\x1b[0m", session.term_rows, fit_pad("-- press any key --", session.term_cols));
-    let _ = io::stdout().flush();
-    let _ = editor::read_key_idle(&mut || {});
 }
 
 fn fit_pad(s: &str, width: usize) -> String {
@@ -1646,13 +1710,22 @@ mod tests {
         HexBuffer::from_bytes(bytes.to_vec(), 16, 10)
     }
 
-    fn session_with(bytes: &[u8]) -> Session {
+    // The pane every test below drives its session in: `run_hex_frame`
+    // renders into a rect, not the whole terminal, so the tests use one
+    // too rather than a size the real editor never passes.
+    const RECT: Rect = Rect { row: 0, col: 0, rows: 22, cols: 100 };
+
+    fn session_with(bytes: &[u8]) -> HexSession {
         let b = buf(bytes);
         let undo = UndoTree::new(b.bytes.clone(), (0, 0));
-        Session {
+        HexSession {
             buf: b,
             vk: VimKeys::new(),
-            registers: Registers::new(),
+            // Not `Registers::new()`: that one's unnamed register is the
+            // *real* OS clipboard, which is genuinely global -- a test
+            // yanking into it races every other test (and anything else
+            // on the machine) that touches it.
+            registers: Registers::new_for_test(),
             undo,
             mode: Mode::Normal,
             pane: Pane::Hex,
@@ -1664,19 +1737,15 @@ mod tests {
             last_search: None,
             saved_node: 0,
             status: None,
-            quit: false,
-            exit_code: 0,
-            term_rows: 24,
-            term_cols: 100,
         }
     }
 
-    // Mirrors `drive`'s own loop exactly: checkpoint (which is what
-    // commits the previous key's edit to the undo tree), then handle the
-    // next key. Getting this order wrong here would make undo look
-    // broken in tests while working in the real editor, or vice versa.
-    fn feed(session: &mut Session, keys: &str) {
-        let layout = session.layout();
+    // Mirrors `run_hex_frame`'s own loop exactly: checkpoint (which is
+    // what commits the previous key's edit to the undo tree -- it runs
+    // inside `render`/`prepare` there), then handle the next key.
+    // Getting this order wrong here would make undo look broken in tests
+    // while working in the real editor, or vice versa.
+    fn feed(session: &mut HexSession, keys: &str) {
         for c in keys.chars() {
             let key = match c {
                 '\n' => Key::Enter,
@@ -1685,7 +1754,7 @@ mod tests {
                 other => Key::Char(other),
             };
             session.checkpoint();
-            handle_key(session, key, layout, &History::load("/dev/null"));
+            session.handle_key(key, RECT, 24, RECT.cols, &History::load("/dev/null"), &mut || {});
         }
     }
 
@@ -1941,9 +2010,8 @@ mod tests {
         assert_eq!(s.buf.bytes(), b"BCD");
         feed(&mut s, "u");
         assert_eq!(s.buf.bytes(), b"ABCD");
-        let layout = s.layout();
         s.checkpoint();
-        handle_key(&mut s, Key::CtrlR, layout, &History::load("/dev/null"));
+        s.handle_key(Key::CtrlR, RECT, 24, RECT.cols, &History::load("/dev/null"), &mut || {});
         assert_eq!(s.buf.bytes(), b"BCD");
     }
 
@@ -2001,12 +2069,12 @@ mod tests {
     #[test]
     fn ctrl_a_and_ctrl_x_increment_the_byte_under_the_cursor() {
         let mut s = session_with(&[0xFE]);
-        let layout = s.layout();
-        handle_key(&mut s, Key::CtrlA, layout, &History::load("/dev/null"));
+        let history = History::load("/dev/null");
+        s.handle_key(Key::CtrlA, RECT, 24, RECT.cols, &history, &mut || {});
         assert_eq!(s.buf.bytes(), &[0xFF]);
-        handle_key(&mut s, Key::CtrlA, layout, &History::load("/dev/null"));
+        s.handle_key(Key::CtrlA, RECT, 24, RECT.cols, &history, &mut || {});
         assert_eq!(s.buf.bytes(), &[0x00], "wraps rather than saturating");
-        handle_key(&mut s, Key::CtrlX, layout, &History::load("/dev/null"));
+        s.handle_key(Key::CtrlX, RECT, 24, RECT.cols, &history, &mut || {});
         assert_eq!(s.buf.bytes(), &[0xFF]);
     }
 
@@ -2094,11 +2162,9 @@ mod tests {
     fn quitting_a_modified_buffer_needs_the_bang() {
         let mut s = session_with(b"AB");
         feed(&mut s, "x");
-        s.dispatch_colon("q");
-        assert!(!s.quit);
+        assert!(!s.dispatch_colon("q"), "a dirty buffer's own `:q` must not close the frame");
         assert!(s.status.as_deref().unwrap_or_default().contains("E37"));
-        s.dispatch_colon("q!");
-        assert!(s.quit);
+        assert!(s.dispatch_colon("q!"));
     }
 
     #[test]
@@ -2139,10 +2205,8 @@ mod tests {
     #[test]
     fn a_rendered_row_looks_like_hexdump_c() {
         let mut s = session_with(b"\x7fELF\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00");
-        let layout = s.layout();
-        s.buf.set_bytes_per_row(layout.bytes_per_row);
-        let frame = plain(&render(&s, layout));
-        let row = frame.lines().find(|l| l.starts_with("00000000")).expect("offset gutter");
+        let frame = plain(&s.render(RECT, 24, RECT.cols));
+        let row = frame.lines().find(|l| l.trim_start().starts_with("00000000")).expect("offset gutter");
         assert!(row.contains("7f 45 4c 46 02 01 01 00  00 00 00 00 00 00 00 00"), "{row:?}");
         assert!(row.contains("|.ELF............|"), "{row:?}");
     }
@@ -2150,8 +2214,8 @@ mod tests {
     #[test]
     fn the_status_line_reports_the_byte_under_the_cursor_every_way() {
         let mut s = session_with(&[0x41]);
-        let layout = s.layout();
-        let text = plain(&render_status(&s, layout));
+        let layout = s.layout(RECT);
+        let text = plain(&status_text(&s, layout, RECT.cols));
         assert!(text.contains("41 'A'"), "{text:?}");
         assert!(text.contains("65"), "{text:?}");
         assert!(text.contains("0101"), "{text:?}");
@@ -2159,19 +2223,72 @@ mod tests {
         assert!(text.contains("-- NORMAL --"), "{text:?}");
         assert!(text.contains("[hex]"), "{text:?}");
         s.pane = Pane::Ascii;
-        assert!(plain(&render_status(&s, layout)).contains("[ascii]"));
+        assert!(plain(&status_text(&s, layout, RECT.cols)).contains("[ascii]"));
     }
 
     #[test]
-    fn no_rendered_row_is_wider_than_the_terminal() {
+    fn the_help_page_fits_the_pane_an_ordinary_terminal_gives() {
+        // `show_help` shows as much of the page as the pane is tall and
+        // silently drops the rest -- which, on the 24-row terminal that
+        // is still the common default, used to lose the last four lines
+        // (found via pty against the real binary). This is the guard
+        // against it happening again the next time a line is added.
+        let pane_rows = crate::repl::content_rows(24);
+        let lines: Vec<&str> = HELP_TEXT.lines().collect();
+        assert!(lines.len() <= pane_rows, "the help page is {} lines but a 24-row terminal's pane is {pane_rows}", lines.len());
+        // 80 columns, minus nothing: `fit` truncates rather than wraps,
+        // so anything wider is silently cut off mid-word.
+        for line in lines {
+            assert!(line.chars().count() <= 80, "help line {line:?} is wider than 80 columns");
+        }
+    }
+
+    #[test]
+    fn every_row_is_painted_out_to_the_pane_width() {
+        // The pane version has no full-screen clear to lean on, so each
+        // row must blank the rest of its own width itself -- including
+        // the rows past the end of a short file, which would otherwise
+        // keep showing whatever the previous frame left there.
+        let mut s = session_with(b"AB");
+        let rect = Rect { row: 0, col: 0, rows: 6, cols: 90 };
+        let frame = s.render(rect, 24, rect.cols);
+        // Row 0 is the status line (rendered first); the rest are the
+        // pane's own, and every one of them has to reach `cols`.
+        let flat = plain(&frame);
+        let rows: Vec<&str> = flat.lines().skip(2).collect();
+        assert_eq!(rows.len(), rect.rows, "one line per pane row, {rows:?}");
+        for row in rows {
+            assert_eq!(row.chars().count(), rect.cols, "row {row:?} does not paint its whole width");
+        }
+    }
+
+    #[test]
+    fn the_frame_is_addressed_against_its_pane_not_the_terminal() {
+        let mut s = session_with(b"AB");
+        let rect = Rect { row: 7, col: 30, rows: 4, cols: 60 };
+        let layout = s.prepare(rect);
+        // The live render addresses this pane's real position...
+        let live = build_frame(&s, layout, rect, rect.row, rect.col);
+        assert!(live.contains("\x1b[8;31H"), "first row should land at the pane's own top-left");
+        // ...while `freeze` addresses the session's own grid, which is
+        // pane-relative -- feeding absolute positions into it would put
+        // the content at completely the wrong cells in a split window.
+        let frozen = build_frame(&s, layout, rect, 0, 0);
+        assert!(frozen.contains("\x1b[1;1H"), "frozen frame should start at the grid's own origin");
+    }
+
+    #[test]
+    fn no_rendered_row_is_wider_than_its_pane() {
         let mut s = session_with(&(0u8..=255).collect::<Vec<u8>>());
         for cols in [80usize, 100, 140] {
-            s.term_cols = cols;
+            let rect = Rect { row: 0, col: 0, rows: 22, cols };
             s.inspector = true;
-            let layout = s.layout();
-            s.buf.set_bytes_per_row(layout.bytes_per_row);
-            for line in plain(&render(&s, layout)).lines() {
-                assert!(line.chars().count() <= cols, "row {:?} is {} wide, terminal is {cols}", line, line.chars().count());
+            // Skips the status row, which is the *terminal's* full width
+            // by design, not this pane's -- see status_text.
+            let frame = s.render(rect, 24, cols);
+            let dump = frame.split_once("\x1b[2m").map(|(_, rest)| rest.to_string()).unwrap_or(frame);
+            for line in plain(&dump).lines() {
+                assert!(line.chars().count() <= cols, "row {:?} is {} wide, the pane is {cols}", line, line.chars().count());
             }
         }
     }

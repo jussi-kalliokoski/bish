@@ -18,6 +18,7 @@ use crate::debugger;
 use crate::docs;
 use crate::editor::{self, Key, ReadOutcome};
 use crate::exec::{self, DebugHook, ExecResult, PaneDirection, Shell, WindowAction};
+use crate::hexedit;
 use crate::fileeditor;
 use crate::history::{self, History};
 use crate::lexer::Lexer;
@@ -79,6 +80,7 @@ struct SessionState {
 
 type JobFrameId = u32;
 type EditFrameId = u32;
+type HexFrameId = u32;
 
 // One layer of a pane's view stack. Session is the vim-like "same
 // session shown in multiple windows" case (see WindowEntry's doc
@@ -105,6 +107,13 @@ type EditFrameId = u32;
 // `edit_frames[&id]` fresh each time it's focused, since nothing about
 // a diagnostics list is worth preserving across a collapse.
 //
+// Hex is `e --hex`'s own frame: the same shape as Edit in every way
+// that matters here (a detachable, resumable editor view holding an id
+// into its own `hex_frames` map, for the same Copy-ness reason), just
+// over a byte buffer rather than a text one -- see hexedit.rs's own
+// module doc comment for why a hex view is a frame in this stack rather
+// than a separate program.
+//
 // DebugRun is the same shape as Diagnostics (a `:dbg`-triggered sibling
 // under a specific Edit frame's own pane, named by that same
 // `EditFrameId`, see split_debug_run_pane) but -- like Job/Edit, unlike
@@ -117,6 +126,7 @@ enum Frame {
     Session(SessionId),
     Job(JobFrameId),
     Edit(EditFrameId),
+    Hex(HexFrameId),
     Diagnostics(EditFrameId),
     DebugRun(EditFrameId),
 }
@@ -282,7 +292,7 @@ fn query_term_size() -> (usize, usize) {
 // above it, the global mode-line/command row (render_global_status_row,
 // command_mode_row) -- everything panes/compute_regions ever divide up
 // lives above both.
-fn content_rows(term_rows: usize) -> usize {
+pub(crate) fn content_rows(term_rows: usize) -> usize {
     term_rows.saturating_sub(2).max(1)
 }
 
@@ -357,7 +367,7 @@ fn session_referenced_elsewhere(windows: &[WindowEntry], current_window: usize, 
             for (depth, frame) in pane.stack.iter().enumerate() {
                 let matches = match frame {
                     Frame::Session(s) => *s == sid,
-                    Frame::Job(_) | Frame::Edit(_) | Frame::Diagnostics(_) | Frame::DebugRun(_) => false,
+                    Frame::Job(_) | Frame::Edit(_) | Frame::Hex(_) | Frame::Diagnostics(_) | Frame::DebugRun(_) => false,
                 };
                 if !matches {
                     continue;
@@ -422,6 +432,9 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
     // (Frame::Edit) -- see Frame's own doc comment.
     let mut edit_frames: HashMap<EditFrameId, fileeditor::EditSession> = HashMap::new();
     let mut next_edit_frame_id: EditFrameId = 1;
+    // `e --hex`'s own equivalent of edit_frames -- see Frame::Hex.
+    let mut hex_frames: HashMap<HexFrameId, hexedit::HexSession> = HashMap::new();
+    let mut next_hex_frame_id: HexFrameId = 1;
     // Same idea again, for `:dbg`'s own attached sessions (Frame::
     // DebugRun) -- see Frame's own doc comment.
     let mut debug_frames: HashMap<EditFrameId, debugger::DebugSession> = HashMap::new();
@@ -507,6 +520,30 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
                 &mut job_frames,
                 &mut edit_frames,
                 &mut debug_frames,
+                &mut cmd_history,
+                &mut sinks_are_grid,
+                &mut registers,
+                &mut term_rows,
+                &mut term_cols,
+            );
+            let _ = io::stdout().flush();
+            continue;
+        }
+
+        // Same idea again, for `e --hex`'s own byte-buffer frame -- see
+        // Frame::Hex, and run_hex_frame for why it can't simply reuse
+        // run_edit_frame.
+        if let Frame::Hex(hex_frame_id) = *windows[current_window].stack().last().unwrap() {
+            run_hex_frame(
+                hex_frame_id,
+                session_id,
+                &mut sessions,
+                &mut windows,
+                &mut current_window,
+                &mut next_session_id,
+                &mut next_window_id,
+                &mut job_frames,
+                &mut hex_frames,
                 &mut cmd_history,
                 &mut sinks_are_grid,
                 &mut registers,
@@ -1132,43 +1169,39 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
                     let args = sessions.get_mut(&session_id).unwrap().shell.take_pending_edit();
                     let rect = pane_rect(&windows[current_window], windows[current_window].focused_pane, term_rows, term_cols);
                     let opened = match fileeditor::parse_edit_args(&args) {
-                        Ok(targets) => open_edit_targets(&targets, &mut sessions, session_id, &mut edit_frames, &mut next_edit_frame_id, rect),
+                        Ok(targets) => open_edit_targets(
+                            &targets,
+                            &mut sessions,
+                            session_id,
+                            &mut edit_frames,
+                            &mut next_edit_frame_id,
+                            &mut hex_frames,
+                            &mut next_hex_frame_id,
+                            rect,
+                        ),
                         Err(e) => {
                             sessions.get_mut(&session_id).unwrap().shell.sink_err(&format!("bish: e: {}\n", e));
                             Vec::new()
                         }
                     };
-                    // Pushed back-to-front so the *first* file named is
-                    // the one actually on top -- `e a b` opens both, with
-                    // `a` in front and `b` revealed once it's closed,
-                    // matching `vim a b`'s own argument order.
-                    for id in opened.iter().rev() {
-                        windows[current_window].stack_mut().push(Frame::Edit(*id));
-                    }
-                    if let Some(&edit_frame_id) = opened.first() {
-                        run_edit_frame(
-                            edit_frame_id,
-                            session_id,
-                            &mut sessions,
-                            &mut windows,
-                            &mut current_window,
-                            &mut next_session_id,
-                            &mut next_window_id,
-                            &mut job_frames,
-                            &mut edit_frames,
-                            &mut debug_frames,
-                            &mut cmd_history,
-                            &mut sinks_are_grid,
-                            &mut registers,
-                            &mut term_rows,
-                            &mut term_cols,
-                        );
-                    } else {
+                    if opened.is_empty() {
                         // Nothing opened at all (a bad flag, or every
                         // named file failed) -- the pane keeps showing
                         // its shell, with whatever was sunk above now
                         // part of it.
                         compositor_redraw(&sessions, &windows, current_window, term_rows, term_cols);
+                    }
+                    // Pushed back-to-front so the *first* file named is
+                    // the one actually on top -- `e a b` opens both, with
+                    // `a` in front and `b` revealed once it's closed,
+                    // matching `vim a b`'s own argument order. Nothing is
+                    // driven from here: this loop's own top already
+                    // dispatches on whatever frame kind a pane's stack
+                    // ends up with (Edit or Hex), which is also what
+                    // hands control to the next file down once the one in
+                    // front is closed.
+                    for frame in opened.iter().rev() {
+                        windows[current_window].stack_mut().push(*frame);
                     }
                 } else if sinks_are_grid {
                     // The common case once promoted: a normal command ran
@@ -1203,23 +1236,22 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
 // it can is both what vim does and the more useful half of the outcome.
 // The message goes to the owning session's own output, so it's still
 // there underneath once every editor frame this opened is closed again.
+#[allow(clippy::too_many_arguments)]
 fn open_edit_targets(
     targets: &[fileeditor::EditTarget],
     sessions: &mut HashMap<SessionId, SessionState>,
     session_id: SessionId,
     edit_frames: &mut HashMap<EditFrameId, fileeditor::EditSession>,
     next_edit_frame_id: &mut EditFrameId,
+    hex_frames: &mut HashMap<HexFrameId, hexedit::HexSession>,
+    next_hex_frame_id: &mut HexFrameId,
     rect: Rect,
-) -> Vec<EditFrameId> {
+) -> Vec<Frame> {
     let mut opened = Vec::new();
     for target in targets {
-        match fileeditor::EditSession::open(target.path.as_deref(), normal_mode_content_rows(rect)) {
-            Ok(session) => {
-                let id = *next_edit_frame_id;
-                *next_edit_frame_id += 1;
-                edit_frames.insert(id, session);
-                opened.push(id);
-            }
+        let result = open_one_edit_target(target, edit_frames, next_edit_frame_id, hex_frames, next_hex_frame_id, rect);
+        match result {
+            Ok(frame) => opened.push(frame),
             Err(e) => {
                 let what = target.path.as_deref().unwrap_or("<unnamed>");
                 sessions.get_mut(&session_id).unwrap().shell.sink_err(&format!("bish: e: {}: {}\n", what, e));
@@ -1227,6 +1259,34 @@ fn open_edit_targets(
         }
     }
     opened
+}
+
+// The `--hex` fork: the same target either becomes a `Frame::Edit` over
+// a `TextBuffer` or a `Frame::Hex` over a `HexBuffer`. Split out from
+// open_edit_targets so `bish tool edit`'s own bootstrap -- which reports
+// a failure differently (see run_edit_impl) -- can reuse the fork
+// without reusing the reporting.
+fn open_one_edit_target(
+    target: &fileeditor::EditTarget,
+    edit_frames: &mut HashMap<EditFrameId, fileeditor::EditSession>,
+    next_edit_frame_id: &mut EditFrameId,
+    hex_frames: &mut HashMap<HexFrameId, hexedit::HexSession>,
+    next_hex_frame_id: &mut HexFrameId,
+    rect: Rect,
+) -> io::Result<Frame> {
+    if target.hex {
+        let session = hexedit::HexSession::open(target.path.as_deref().map(std::path::Path::new), rect, target.readonly)?;
+        let id = *next_hex_frame_id;
+        *next_hex_frame_id += 1;
+        hex_frames.insert(id, session);
+        return Ok(Frame::Hex(id));
+    }
+    let mut session = fileeditor::EditSession::open(target.path.as_deref(), normal_mode_content_rows(rect))?;
+    session.buffer.set_readonly(target.readonly);
+    let id = *next_edit_frame_id;
+    *next_edit_frame_id += 1;
+    edit_frames.insert(id, session);
+    Ok(Frame::Edit(id))
 }
 
 // `bish tool edit FILE` -- a minimal, single-session, single-window
@@ -1275,7 +1335,7 @@ pub fn run_edit(args: &[String]) -> i32 {
 // comment for the rest of the shape (a real, read-only source pane plus
 // a real DebugRun sibling).
 pub fn run_edit_debug(path: &str) -> i32 {
-    run_edit_impl(&[fileeditor::EditTarget { path: Some(path.to_string()) }], true)
+    run_edit_impl(&[fileeditor::EditTarget { path: Some(path.to_string()), ..Default::default() }], true)
 }
 
 // `attach_debug` only ever comes with exactly one target (see
@@ -1311,6 +1371,9 @@ fn run_edit_impl(targets: &[fileeditor::EditTarget], attach_debug: bool) -> i32 
     let mut next_window_id: u32 = 1;
     let mut job_frames: HashMap<JobFrameId, exec::FgJob> = HashMap::new();
     let mut edit_frames: HashMap<EditFrameId, fileeditor::EditSession> = HashMap::new();
+    let mut next_edit_frame_id: EditFrameId = 1;
+    let mut hex_frames: HashMap<HexFrameId, hexedit::HexSession> = HashMap::new();
+    let mut next_hex_frame_id: HexFrameId = 1;
     let mut debug_frames: HashMap<EditFrameId, debugger::DebugSession> = HashMap::new();
     let mut sinks_are_grid = false;
 
@@ -1322,10 +1385,10 @@ fn run_edit_impl(targets: &[fileeditor::EditTarget], attach_debug: bool) -> i32 
     // invocation: this is a one-shot command line, so a path that can't
     // be opened is a usage error worth an exit status, not a note that
     // scrolls past in a session that keeps running.
-    let mut sessions_to_open = Vec::new();
-    for (i, target) in targets.iter().enumerate() {
-        match fileeditor::EditSession::open(target.path.as_deref(), normal_mode_content_rows(rect)) {
-            Ok(s) => sessions_to_open.push((i as EditFrameId + 1, s)),
+    let mut opened: Vec<Frame> = Vec::new();
+    for target in targets {
+        match open_one_edit_target(target, &mut edit_frames, &mut next_edit_frame_id, &mut hex_frames, &mut next_hex_frame_id, rect) {
+            Ok(frame) => opened.push(frame),
             Err(e) => {
                 // Leaving promotion behind here too: promote_if_needed already
                 // switched to the alternate screen before this could fail.
@@ -1336,12 +1399,14 @@ fn run_edit_impl(targets: &[fileeditor::EditTarget], attach_debug: bool) -> i32 
             }
         }
     }
-    let edit_frame_id: EditFrameId = 1;
     if attach_debug {
+        // Only ever one target here (see run_edit_debug), always a text
+        // one -- `bish tool debug` has no `--hex` of its own to parse.
+        let edit_frame_id: EditFrameId = 1;
         let path = targets[0].path.as_deref().unwrap_or_default();
         match debugger::DebugSession::attach(std::path::Path::new(path)) {
             Ok(debug_session) => {
-                sessions_to_open[0].1.buffer.set_readonly(true);
+                edit_frames.get_mut(&edit_frame_id).unwrap().buffer.set_readonly(true);
                 debug_frames.insert(edit_frame_id, debug_session);
                 let (pane_id, _screen) = split_debug_run_pane(&mut sessions, &mut windows, current_window, &mut next_session_id, edit_frame_id, term_rows, term_cols);
                 let sid = windows[current_window].pane(pane_id).owning_session();
@@ -1355,14 +1420,10 @@ fn run_edit_impl(targets: &[fileeditor::EditTarget], attach_debug: bool) -> i32 
             }
         }
     }
-    let ids: Vec<EditFrameId> = sessions_to_open.iter().map(|(id, _)| *id).collect();
-    for (id, session) in sessions_to_open {
-        edit_frames.insert(id, session);
-    }
     // Back-to-front, so the first file named is the one on top -- see
     // the `e` builtin's own identical push in run().
-    for id in ids.iter().rev() {
-        windows[current_window].stack_mut().push(Frame::Edit(*id));
+    for frame in opened.iter().rev() {
+        windows[current_window].stack_mut().push(*frame);
     }
 
     // Loops rather than driving `edit_frame_id` once: with several files
@@ -1372,24 +1433,43 @@ fn run_edit_impl(targets: &[fileeditor::EditTarget], attach_debug: bool) -> i32 
     // its own frame is no longer this pane's top one (it pops on `:q`,
     // and keeps driving through a no-op detach itself -- see its own
     // `Detached` arm).
-    while let Some(&Frame::Edit(id)) = windows[current_window].stack().last() {
-        run_edit_frame(
-            id,
-            0,
-            &mut sessions,
-            &mut windows,
-            &mut current_window,
-            &mut next_session_id,
-            &mut next_window_id,
-            &mut job_frames,
-            &mut edit_frames,
-            &mut debug_frames,
-            &mut cmd_history,
-            &mut sinks_are_grid,
-            &mut registers,
-            &mut term_rows,
-            &mut term_cols,
-        );
+    loop {
+        match *windows[current_window].stack().last().unwrap() {
+            Frame::Edit(id) => run_edit_frame(
+                id,
+                0,
+                &mut sessions,
+                &mut windows,
+                &mut current_window,
+                &mut next_session_id,
+                &mut next_window_id,
+                &mut job_frames,
+                &mut edit_frames,
+                &mut debug_frames,
+                &mut cmd_history,
+                &mut sinks_are_grid,
+                &mut registers,
+                &mut term_rows,
+                &mut term_cols,
+            ),
+            Frame::Hex(id) => run_hex_frame(
+                id,
+                0,
+                &mut sessions,
+                &mut windows,
+                &mut current_window,
+                &mut next_session_id,
+                &mut next_window_id,
+                &mut job_frames,
+                &mut hex_frames,
+                &mut cmd_history,
+                &mut sinks_are_grid,
+                &mut registers,
+                &mut term_rows,
+                &mut term_cols,
+            ),
+            _ => break,
+        }
     }
 
     // Same restoration run()'s own final-exit path does -- see its own
@@ -1661,6 +1741,169 @@ fn run_fg_job_frame(
         }
         }
     }
+}
+
+// `e --hex`'s own counterpart to run_edit_frame just below -- drives
+// whatever hex session is behind `hex_frame_id`, freshly opened by the
+// pending_edit handling or already sitting in `hex_frames` from an
+// earlier focus change.
+//
+// Unlike run_edit_frame, this doesn't delegate to
+// run_normal_mode_navigation: that function is built around a
+// `NavBuffer` (a `TextBuffer` or a session's own vt100 grid), and a byte
+// buffer is neither. hexedit.rs owns the whole view instead -- this
+// function only provides `rect`, moves the session's state (and the
+// shared register table) in and back out, and reacts to how driving it
+// ended. Same split, one level up, that run_diagnostics_frame already
+// uses for its own non-NavBuffer view.
+//
+// Mouse reporting is deliberately left off (`RawGuard::enable`, not
+// `enable_with_mouse`): there's nothing in a hex dump a click means
+// anything to, and off is what makes a click send no bytes at all rather
+// than escape sequences this loop would have to swallow.
+#[allow(clippy::too_many_arguments)]
+fn run_hex_frame(
+    hex_frame_id: HexFrameId,
+    session_id: SessionId,
+    sessions: &mut HashMap<SessionId, SessionState>,
+    windows: &mut Vec<WindowEntry>,
+    current_window: &mut usize,
+    next_session_id: &mut SessionId,
+    next_window_id: &mut u32,
+    job_frames: &mut HashMap<JobFrameId, exec::FgJob>,
+    hex_frames: &mut HashMap<HexFrameId, hexedit::HexSession>,
+    cmd_history: &mut History,
+    sinks_are_grid: &mut bool,
+    registers: &mut Registers,
+    term_rows: &mut usize,
+    term_cols: &mut usize,
+) {
+    // Taken out of hex_frames rather than borrowed, for the same reason
+    // run_edit_frame/run_fg_job_frame take theirs out: it leaves the map
+    // free for the on_idle closure below to borrow.
+    let mut session = hex_frames.remove(&hex_frame_id).expect("Frame::Hex always has a live hex_frames entry");
+    // The shell's one shared register table, moved in for as long as this
+    // frame is the one being driven -- see HexSession's own `registers`
+    // field doc comment.
+    session.attach_registers(registers);
+    // Captured before any window command can move focus elsewhere --
+    // exactly run_edit_frame's own reasoning for the same two locals.
+    let own_window = *current_window;
+    let own_pane_id = windows[*current_window].focused_pane;
+
+    let Ok(_guard) = term::RawGuard::enable(0) else {
+        session.detach_registers(registers);
+        hex_frames.insert(hex_frame_id, session);
+        return;
+    };
+    // The very first entry into this frame can be the moment promotion
+    // happened, leaving the alternate screen blank -- same repaint
+    // run_normal_mode_navigation opens with, and harmless afterward.
+    compositor_redraw(sessions, windows, *current_window, *term_rows, *term_cols);
+
+    let quit = loop {
+        let rect = pane_rect(&windows[*current_window], own_pane_id, *term_rows, *term_cols);
+        print!("{}", session.render(rect, *term_rows, *term_cols));
+        let _ = io::stdout().flush();
+
+        // Waiting for the next byte out here, rather than inside
+        // read_key_idle's own on_idle, for the reason
+        // run_normal_mode_navigation's identical loop spells out: only
+        // here is `session` free for the redraw a just-attached client
+        // needs (compositor_redraw alone paints this pane blank -- its
+        // real content never feeds the session's vt100 grid while it's
+        // being driven).
+        while !term::stdin_ready(editor::IDLE_POLL_MS) {
+            if service_background_jobs(sessions, windows, job_frames, *current_window, term_rows, term_cols, *sinks_are_grid) {
+                let rect = pane_rect(&windows[*current_window], own_pane_id, *term_rows, *term_cols);
+                print!("{}", session.render(rect, *term_rows, *term_cols));
+                let _ = io::stdout().flush();
+            }
+        }
+        let key = match editor::read_key_idle(&mut || {}) {
+            Ok(Some(k)) => k,
+            // EOF/error: nothing sensible to resume into -- drop the
+            // frame the same way run_edit_frame's own Err arm does.
+            Ok(None) | Err(_) => break true,
+        };
+
+        let outcome = session.handle_key(
+            key,
+            rect,
+            *term_rows,
+            *term_cols,
+            cmd_history,
+            &mut || {
+                service_background_jobs(sessions, windows, job_frames, *current_window, term_rows, term_cols, *sinks_are_grid);
+            },
+        );
+        match outcome {
+            hexedit::HexOutcome::Continue => {}
+            hexedit::HexOutcome::Quit => break true,
+            hexedit::HexOutcome::Window(cmd, count) => {
+                dispatch_window_cmd(cmd, count, sessions, windows, current_window, next_session_id, next_window_id, sinks_are_grid, *term_rows, *term_cols);
+                // A `<C-w>` that turned out to be a no-op from this
+                // pane's perspective (`<C-w>h` with nowhere to go, ...)
+                // leaves this frame on top -- keep driving it rather
+                // than freezing and returning, exactly as
+                // run_edit_frame's own Detached arm does.
+                if windows[*current_window].stack().last() != Some(&Frame::Hex(hex_frame_id)) {
+                    break false;
+                }
+            }
+        }
+    };
+
+    session.detach_registers(registers);
+    if quit {
+        windows[*current_window].stack_mut().pop();
+        // Same cleanup run_edit_frame does on the way out: clear what
+        // this frame last drew into its own session's grid (freeze
+        // always writes pane-relative from row 0, so anything below
+        // would otherwise sit there forever), then erase the colon
+        // line's own last text off the global status row, which no
+        // grid-diffed repaint can reach.
+        sessions.get_mut(&session_id).unwrap().screen.borrow_mut().feed(b"\x1b[2J\x1b[H");
+        if *sinks_are_grid {
+            compositor_redraw(sessions, windows, *current_window, *term_rows, *term_cols);
+        }
+        print!("{}", erase_global_status_row(*term_rows));
+        let _ = io::stdout().flush();
+        return;
+    }
+
+    // Focus genuinely moved elsewhere -- freeze this frame's real
+    // content into its own pane's grid so a compositor redraw shows the
+    // dump rather than stale rows, and put the session back for whenever
+    // it's focused again. Recomputed fresh (not reused from the loop):
+    // the window command that moved focus can have resized panes too.
+    let rect = if own_window < windows.len() && windows[own_window].panes.iter().any(|p| p.id == own_pane_id) {
+        pane_rect(&windows[own_window], own_pane_id, *term_rows, *term_cols)
+    } else {
+        pane_rect(&windows[*current_window], windows[*current_window].focused_pane, *term_rows, *term_cols)
+    };
+    // Resized first: the split that moved focus made this pane narrower,
+    // and freezing a full-width frame into a grid still sized for the old
+    // rect would clip it -- run_diagnostics_frame's own refresh_editor_
+    // frame does exactly this, for exactly this reason.
+    sessions[&session_id].screen.borrow_mut().resize(rect.rows, rect.cols);
+    session.freeze(&sessions[&session_id].screen, rect);
+    hex_frames.insert(hex_frame_id, session);
+    // dispatch_window_cmd already redrew, but that was *before* the
+    // freeze above -- without a second one this pane stays blank until
+    // some unrelated activity happens to repaint it. Found via pty
+    // against the real binary: `<C-w>s` from a hex frame left its own
+    // half of the split empty until the next command ran.
+    if *sinks_are_grid {
+        compositor_redraw(sessions, windows, *current_window, *term_rows, *term_cols);
+    }
+    // The status row still holds this frame's own last status line (and
+    // any half-typed `^W` chord shown in it). Whatever takes focus next
+    // draws its own over this if it has one; a plain shell prompt
+    // doesn't, and would otherwise leave a hex status line sitting above
+    // it forever.
+    print!("{}", erase_global_status_row(*term_rows));
+    let _ = io::stdout().flush();
 }
 
 // `e`'s own counterpart to run_fg_job_frame, above -- drives whatever
@@ -2472,7 +2715,7 @@ fn apply_window_action(
                 // Same one-place-at-a-time reasoning as Job just above --
                 // an open editor session can't be shown in two windows
                 // simultaneously either.
-                Some(Frame::Edit(_)) => {
+                Some(Frame::Edit(_) | Frame::Hex(_)) => {
                     sessions[&cur_sid].shell.sink_err("bish: window: fg: that window is running an editor, not a session\n");
                 }
                 // Same reasoning again -- a diagnostics pane is scoped
@@ -2943,7 +3186,7 @@ fn close_orphaned_sessions(sessions: &mut HashMap<SessionId, SessionState>, wind
         .flat_map(|p| {
             p.stack.iter().filter_map(|f| match f {
                 Frame::Session(id) => Some(*id),
-                Frame::Job(_) | Frame::Edit(_) | Frame::Diagnostics(_) | Frame::DebugRun(_) => None,
+                Frame::Job(_) | Frame::Edit(_) | Frame::Hex(_) | Frame::Diagnostics(_) | Frame::DebugRun(_) => None,
             })
         })
         .collect();
@@ -6132,6 +6375,8 @@ Registers: \"{reg} before an operator/put, e.g. \"ayy then \"ap
 Undo/redo: u / <C-r>     Put: p P     Repeat last change: .
 Hover: K on an identifier shows its live value, a doc comment, or a
        man-page snippet for an external command
+More:  `e FILE...` opens several files at once, the first in front;
+       `e --hex FILE` opens one as raw bytes instead (own :help inside)
 
 Colon commands:
   :w [FILE]        write (:wq/:x write+quit, :q quit, :q! discard+quit)
@@ -6169,7 +6414,7 @@ s)tep p)rint q)uit h)elp -- bare key, or `:` then the long/short name";
 // -- the same row render_global_status_row draws the ordinary mode-line
 // into the rest of the time (see its own doc comment for why the two
 // never conflict).
-fn command_mode_row(term_rows: usize) -> usize {
+pub(crate) fn command_mode_row(term_rows: usize) -> usize {
     term_rows.saturating_sub(2)
 }
 
