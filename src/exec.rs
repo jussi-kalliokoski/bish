@@ -10987,6 +10987,8 @@ const KNOWN_BISHOPTS: &[(&str, BishOptDefault)] = &[
     ("ui_col_quote", BishOptDefault::Color("-bish-blue")),
     ("ui_col_error", BishOptDefault::Color("-bish-red")),
     ("ui_col_warning", BishOptDefault::Color("-bish-yellow")),
+    ("ui_col_info", BishOptDefault::Color("-bish-blue")),
+    ("ui_col_hint", BishOptDefault::Color("-bish-cyan")),
     // How the file editor handles a line wider than the pane. `wrap`
     // off is the current behaviour and vim's `nowrap`: the line scrolls
     // sideways. On, it is broken across as many rows as it needs.
@@ -11163,6 +11165,8 @@ const BISHOPT_HELP: &[(&str, &str)] = &[
     ("ui_col_quote", "Interface colour: the bar beside a rendered block quote."),
     ("ui_col_error", "Interface colour: errors, in the gutter and under the text."),
     ("ui_col_warning", "Interface colour: warnings, in the gutter and under the text."),
+    ("ui_col_info", "Interface colour: informational findings, in the gutter and under the text."),
+    ("ui_col_hint", "Interface colour: hints, in the gutter and under the text."),
     ("wrap", "Break a line too long for the pane across rows instead of scrolling sideways."),
     ("linebreak", "While wrapping, break at word boundaries rather than mid-word."),
     ("breakindent", "While wrapping, indent continued rows under the line they belong to."),

@@ -37,9 +37,14 @@ pub enum Ui {
     Code,
     Link,
     Quote,
-    /// Diagnostics, in the gutter and under the text.
+    /// Diagnostics, in the gutter and under the text. One per
+    /// `lint::Severity` variant, and `diagnostic_style` (fileeditor.rs)
+    /// matches exhaustively between the two, so the day a severity is
+    /// added is the day this list has to grow with it.
     Error,
     Warning,
+    Info,
+    Hint,
 }
 
 /// Which bishopt drives each one. Lives here rather than in `exec.rs`
@@ -65,6 +70,8 @@ pub const UI_COL_OPTIONS: &[(Ui, &str)] = &[
     (Ui::Quote, "ui_col_quote"),
     (Ui::Error, "ui_col_error"),
     (Ui::Warning, "ui_col_warning"),
+    (Ui::Info, "ui_col_info"),
+    (Ui::Hint, "ui_col_hint"),
 ];
 
 /// What each element looks like with nothing set -- exactly what the
@@ -90,6 +97,13 @@ pub fn default_style(element: Ui) -> (vt100::Color, vt100::CellAttrs) {
         Ui::Quote => (vt100::Color::Indexed(4), dim),
         Ui::Error => (vt100::Color::Indexed(1), underline),
         Ui::Warning => (vt100::Color::Indexed(3), underline),
+        // Underlined like the two above -- a finding is a finding, and
+        // the colour is what says how much it matters. Blue and cyan
+        // read as "informational" against red/yellow without competing
+        // with them for attention, which is the whole point of a
+        // severity below Warning.
+        Ui::Info => (vt100::Color::Indexed(4), underline),
+        Ui::Hint => (vt100::Color::Indexed(6), underline),
     }
 }
 

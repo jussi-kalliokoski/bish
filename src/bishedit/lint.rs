@@ -34,9 +34,24 @@ use crate::lexer::{self, Chunk, SpannedItem, Tok};
 use crate::parser;
 use std::ops::Range;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// Declared least-severe-first, and `Ord` is derived for exactly that
+// reason: a gutter cell has room for one mark but a line can hold
+// several findings, so "which mark" is `.map(|d| d.severity).max()`.
+// Nothing here sorts diagnostics for *display* by severity (they stay
+// in source order, which is what a list keyed by line wants), so this
+// ordering has no other reader to disagree with.
+//
+// The four are LSP's four, in LSP's own meaning -- bish's own linter
+// only ever emits `Warning` (its scope is deliberately "a real
+// behavioral bug or risk," see this module's header), but a language
+// server speaks all four and its findings land in the same
+// `TextBuffer::diagnostics` these are rendered from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Severity {
+    Hint,
+    Info,
     Warning,
+    Error,
 }
 
 // A single, self-contained text edit: replace `text[start..end]` (char

@@ -2219,25 +2219,30 @@ fn diagnostic_column_width(_buf: &TextBuffer) -> usize {
     2
 }
 
-// Whether any diagnostic's own char-offset range (whole-buffer text
-// offsets, same convention buffer_highlight_spans's own spans use)
-// intersects this one line's span -- same predicate diagnostic_spans_
-// for_line uses per-column below, just answering "any at all" instead of
-// "which columns" for the coarser gutter marker. Only the worst-severity
-// mark would matter once Severity grows past its current one variant;
-// diagnostic_style below is already written to make that a one-line
-// change when it does.
-fn line_has_diagnostic(buf: &TextBuffer, starts: &[usize], line: usize) -> bool {
+// The worst severity among the diagnostics whose own char-offset range
+// (whole-buffer text offsets, same convention buffer_highlight_spans's
+// own spans use) intersects this one line's span -- same predicate
+// diagnostic_spans_for_line uses per-column below, just reduced to one
+// answer for the coarser gutter marker, which has room for a single
+// mark however many findings the line actually holds. `max` is the
+// reduction because `lint::Severity` is declared least-severe-first
+// specifically so it can be (see its own doc comment).
+fn line_severity(buf: &TextBuffer, starts: &[usize], line: usize) -> Option<lint::Severity> {
     let line_start = starts[line];
     let line_end = line_start + buf.line_len(line);
-    buf.diagnostics.iter().any(|d| d.start < line_end && d.end > line_start)
+    buf.diagnostics.iter().filter(|d| d.start < line_end && d.end > line_start).map(|d| d.severity).max()
 }
 
 fn render_diagnostic_cell(buf: &TextBuffer, starts: &[usize], line: usize, _width: usize) -> Option<String> {
-    if line >= buf.line_count() || !line_has_diagnostic(buf, starts, line) {
+    if line >= buf.line_count() {
         return None;
     }
-    Some("\x1b[33m\u{25cf}\x1b[0m ".to_string())
+    let severity = line_severity(buf, starts, line)?;
+    // The gutter bullet takes the severity's own colour but not its
+    // underline -- underlining a bullet would just look like a typo.
+    let (fg, _) = crate::theme::resolve(severity_element(severity), buf.colors.as_ref());
+    let sgr = vt100::sgr_codes(fg, vt100::Color::Default, vt100::CellAttrs::default());
+    Some(format!("{sgr}\u{25cf}\x1b[0m "))
 }
 
 // Vim's own gutter-width convention: as many digits as the buffer's last
@@ -2942,16 +2947,23 @@ pub(crate) fn toggle_buffer_diff(buf: &mut TextBuffer) -> Result<bool, String> {
 
 // Color/attrs for one diagnostic's own underline -- mirrors highlight::
 // default_style's shape exactly (severity in, presentation out), kept as
-// its own small function for the same reason that one is: Severity only
-// has one variant today (Warning), but the match is already exhaustive
-// against the real enum rather than a wildcard, so adding e.g. Error
-// later is a one-line addition here, not a search for every place
-// severity might matter.
+// its own small function so severity has exactly one place it turns into
+// presentation. The match is exhaustive against the real enum rather
+// than a wildcard, which is what made growing Severity from its original
+// single `Warning` to LSP's four a one-line-per-variant change here
+// instead of a search for every place severity might matter.
 fn diagnostic_style(buf: &TextBuffer, severity: lint::Severity) -> (vt100::Color, vt100::CellAttrs) {
-    let element = match severity {
-        lint::Severity::Warning => crate::theme::Ui::Warning,
-    };
+    let element = severity_element(severity);
     crate::theme::resolve(element, buf.colors.as_ref())
+}
+
+fn severity_element(severity: lint::Severity) -> crate::theme::Ui {
+    match severity {
+        lint::Severity::Error => crate::theme::Ui::Error,
+        lint::Severity::Warning => crate::theme::Ui::Warning,
+        lint::Severity::Info => crate::theme::Ui::Info,
+        lint::Severity::Hint => crate::theme::Ui::Hint,
+    }
 }
 
 // diagnostic_spans_for_line's own sibling to spans_for_line (see that
@@ -4319,6 +4331,27 @@ mod diagnose_tests {
         assert_eq!(spans.len(), 1);
         assert_eq!((spans[0].start, spans[0].end), (5, 9));
         assert!(diagnostic_spans_for_line(&b, &diags, 10, 20).is_empty());
+    }
+
+    // The gutter has room for one mark per line; a line can hold
+    // several findings. The rule is "show the worst," which is the only
+    // reason `Severity` derives `Ord` at all.
+    #[test]
+    fn the_gutter_mark_takes_the_worst_severity_on_the_line() {
+        let mut buf = TextBuffer::new_unnamed(10);
+        buf.insert_text((0, 0), "one two\nthree");
+        let diag = |start, end, severity| lint::Diagnostic { start, end, severity, code: "x", message: String::new(), fix: None };
+        buf.diagnostics = vec![diag(0, 3, lint::Severity::Hint), diag(4, 7, lint::Severity::Error), diag(4, 7, lint::Severity::Warning)];
+        let starts = line_starts(&buf);
+        assert_eq!(line_severity(&buf, &starts, 0), Some(lint::Severity::Error));
+        // Nothing intersects the second line, so no mark at all.
+        assert_eq!(line_severity(&buf, &starts, 1), None);
+        // ...and the mark is drawn in that severity's own colour, not
+        // the hardcoded yellow this used to always be.
+        let cell = render_diagnostic_cell(&buf, &starts, 0, 2).unwrap();
+        let (fg, _) = crate::theme::resolve(crate::theme::Ui::Error, None);
+        assert!(cell.starts_with(&vt100::sgr_codes(fg, vt100::Color::Default, vt100::CellAttrs::default())), "{cell:?}");
+        assert!(render_diagnostic_cell(&buf, &starts, 1, 2).is_none());
     }
 
     #[test]
