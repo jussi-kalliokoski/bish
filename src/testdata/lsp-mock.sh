@@ -65,9 +65,11 @@ while :; do
 		uri=$(printf '%s' "$body" | sed -n 's/.*"uri":"\([^"]*\)".*/\1/p')
 		;;
 	*'"method":"textDocument/definition"'*)
-		# Line 1 of the same document, which the test opens: a
-		# same-file jump, the case that is actually wired up.
-		send '{"jsonrpc":"2.0","id":'"$id"',"result":{"uri":"'"$uri"'","range":{"start":{"line":1,"character":0},"end":{"line":1,"character":5}}}}'
+		# $2, when the test gave one, is a URI in another file, so
+		# the cross-file path can be exercised; otherwise line 1 of
+		# the document the client opened.
+		target=${2:-$uri}
+		send '{"jsonrpc":"2.0","id":'"$id"',"result":{"uri":"'"$target"'","range":{"start":{"line":1,"character":0},"end":{"line":1,"character":5}}}}'
 		;;
 	*'"method":"textDocument/hover"'*)
 		# Markdown with a fenced signature, which is the shape a real

@@ -554,6 +554,7 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
                 &mut next_window_id,
                 &mut job_frames,
                 &mut edit_frames,
+                &mut next_edit_frame_id,
                 &mut debug_frames,
                 &mut cmd_history,
                 &mut sinks_are_grid,
@@ -1060,7 +1061,14 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
                     // sat there telling you how to leave a mode you were
                     // no longer in. A frame that does own that row (an
                     // editor, a hex view) redraws it immediately.
-                    Ok((NavExit::Detached | NavExit::Quit, _)) => {
+                    // `OpenAt` is folded in here rather than handled:
+                    // it comes only from `gd`, which needs a language
+                    // server, which needs a file -- and the buffer this
+                    // call drives is the *prompt line*, which has no
+                    // path for `server_target` to resolve. So it cannot
+                    // arrive, and treating it as an ordinary detach is
+                    // the harmless reading if it ever somehow does.
+                    Ok((NavExit::Detached | NavExit::Quit | NavExit::OpenAt { .. }, _)) => {
                         pending_initial = None;
                         print!("{}", erase_global_status_row(term_rows));
                         // Then repaint, exactly as the Resume arm does
@@ -1818,6 +1826,7 @@ fn run_edit_impl(targets: &[fileeditor::EditTarget], attach_debug: bool) -> i32 
                 &mut next_window_id,
                 &mut job_frames,
                 &mut edit_frames,
+                &mut next_edit_frame_id,
                 &mut debug_frames,
                 &mut cmd_history,
                 &mut sinks_are_grid,
@@ -2325,6 +2334,9 @@ fn run_edit_frame(
     next_window_id: &mut u32,
     job_frames: &mut HashMap<JobFrameId, exec::FgJob>,
     edit_frames: &mut HashMap<EditFrameId, fileeditor::EditSession>,
+    // Needed only by the `OpenAt` arm: `gd` into another file creates a
+    // frame, and this is the counter those ids come from.
+    next_edit_frame_id: &mut EditFrameId,
     debug_frames: &mut HashMap<EditFrameId, debugger::DebugSession>,
     cmd_history: &mut History,
     sinks_are_grid: &mut bool,
@@ -2463,6 +2475,38 @@ fn run_edit_frame(
                     compositor_redraw(sessions, windows, *current_window, *term_rows, *term_cols);
                 }
                 let _ = io::stdout().flush();
+                return;
+            }
+            // `gd` landed in another file. Stash this one back exactly
+            // as a detach would, open the target as a *new* frame on
+            // top of this pane's stack, and return so the main loop
+            // starts driving it -- which makes `:q` on the new file pop
+            // straight back here, the natural "go look, then come back"
+            // shape, and one this codebase's pane stack already has.
+            Ok((NavExit::OpenAt { path, line, character, encoding }, state)) => {
+                if let Some((b, v)) = state {
+                    edit_frames.insert(edit_frame_id, fileeditor::EditSession { buffer: b, vk: v });
+                }
+                let rect = pane_rect(&windows[own_window], own_pane_id, *term_rows, *term_cols);
+                match fileeditor::EditSession::open(path.to_str(), normal_mode_content_rows(rect)) {
+                    Ok(mut opened) => {
+                        // Converted here rather than before the exit,
+                        // because turning a `(line, character)` into a
+                        // cursor needs the text of this file -- which
+                        // did not exist until a moment ago.
+                        let starts = fileeditor::line_starts_of(&opened.buffer);
+                        let offset = fileeditor::diagnostic_offset(&opened.buffer, &starts, line, character, encoding);
+                        let (row, col) = fileeditor::diagnostic_position(&opened.buffer, offset);
+                        opened.buffer.set_cursor(row, col);
+                        let id = *next_edit_frame_id;
+                        *next_edit_frame_id += 1;
+                        edit_frames.insert(id, opened);
+                        windows[own_window].pane_mut(own_pane_id).stack.push(Frame::Edit(id));
+                    }
+                    Err(e) => {
+                        sessions.get_mut(&session_id).unwrap().shell.sink_err(&format!("bish: gd: {}: {}\n", path.display(), e));
+                    }
+                }
                 return;
             }
             Ok((NavExit::Detached, Some((b, v)))) => {
@@ -6281,6 +6325,22 @@ enum NavExit {
     Resume(String, usize),
     Detached,
     Quit,
+    /// `gd` found a definition in a *different* file.
+    ///
+    /// A separate exit rather than something the navigation loop does
+    /// itself, because that loop cannot open a frame: it has neither
+    /// `edit_frames` nor the id counter, and giving it both would hand
+    /// the thing that drives one buffer the ability to create others.
+    /// Handing the request back up to `run_edit_frame`, which already
+    /// owns exactly that, is the same shape `Quit` and `Detached`
+    /// already use -- the loop reports what happened and its caller
+    /// decides what that means.
+    ///
+    /// The position is still the server's own `(line, character)` in
+    /// `encoding`, because converting it needs the text of the file
+    /// being opened, which does not exist yet at the point this is
+    /// produced.
+    OpenAt { path: PathBuf, line: usize, character: usize, encoding: crate::lsp::PositionEncoding },
 }
 
 // Packages this loop's own `buf`/`vk` locals back up for the caller once
@@ -7369,9 +7429,30 @@ fn run_normal_mode_navigation(
                         }
                         Some(_) => {
                             let location = elsewhere.expect("a target that isn't here is elsewhere");
-                            let path = crate::url::to_file_path(&location.uri).map(|p| p.display().to_string()).unwrap_or(location.uri.clone());
-                            render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides.as_ref());
-                            show_command_mode_error(&format!("definition is at {path}:{}", location.start.0 + 1), *term_rows, *term_cols);
+                            let encoding = server_encoding_for(sessions, session_id, tb).unwrap_or(crate::lsp::PositionEncoding::Utf16);
+                            match crate::url::to_file_path(&location.uri) {
+                                Some(path) => {
+                                    // The jump list is pushed here, not
+                                    // after the new file opens: it is
+                                    // this buffer's own list, and this
+                                    // is the position `Ctrl-O` should
+                                    // come back to once the reader
+                                    // returns to this file.
+                                    vk.push_jump(buf.cursor());
+                                    break 'nav (
+                                        NavExit::OpenAt { path, line: location.start.0, character: location.start.1, encoding },
+                                        nav_buffer_into_edit_state(buf, vk),
+                                    );
+                                }
+                                // A uri that isn't a local file at all
+                                // (a jar:, a zipfile:, some server's own
+                                // synthetic scheme) names nothing bish
+                                // can open, so say where it is instead.
+                                None => {
+                                    render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides.as_ref());
+                                    show_command_mode_error(&format!("definition is at {}:{}", location.uri, location.start.0 + 1), *term_rows, *term_cols);
+                                }
+                            }
                         }
                         None => {
                             render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides.as_ref());
