@@ -191,6 +191,76 @@ fn subcommand_candidates_core(man: Option<&manpages::ManPageData>, prefix: &str)
 // single-level `read_dir` for files. `cwd`/`known_functions` are the same
 // owned-snapshot pattern HighlightContext already uses -- borrowed here,
 // not re-snapshotted, since the caller already did that work.
+// Argument completion for a builtin whose arguments are bish's own to
+// define, rather than a command's on `$PATH` with a man page. `None`
+// means "not one of those, carry on"; `Some` -- even empty -- means this
+// command owns its completion outright, the same rule a registered
+// `complete` spec follows, so `bishopt --set wrap <Tab>` offers nothing
+// rather than falling through and offering files.
+//
+// `bishopt` is the whole list today. It earns its place because the
+// option registry is exactly the kind of thing nobody can be expected to
+// remember, and `bishopt` with no arguments already prints every name --
+// this just puts that same list under the key people actually press.
+pub(crate) fn builtin_argument_candidates(role: &CmdRole, prefix_text: &str, prefix: &str) -> Option<Vec<CompletionCandidate>> {
+    let CmdRole::Argument { command, arg_index } = role else { return None };
+    match command.as_deref()? {
+        "bishopt" => Some(bishopt_candidates(&preceding_args(prefix_text, *arg_index), prefix)),
+        _ => None,
+    }
+}
+
+// The `arg_index` words already typed between the command name and the
+// word being completed. Whitespace-split rather than lexed, matching the
+// same "plain characters, no quoting" tolerance `find_word_start` is
+// documented with -- an option name has never needed quoting.
+fn preceding_args(prefix_text: &str, arg_index: usize) -> Vec<String> {
+    let words: Vec<&str> = prefix_text.split_whitespace().collect();
+    words[words.len().saturating_sub(arg_index)..].iter().map(|w| w.to_string()).collect()
+}
+
+pub(crate) fn bishopt_candidates(args: &[String], prefix: &str) -> Vec<CompletionCandidate> {
+    let takes_a_name = |w: &String| matches!(w.as_str(), "--set" | "-s" | "--unset" | "-u" | "--quiet" | "-q");
+    let names = || crate::exec::bishopt_names().into_iter().map(|n| n.to_string()).collect::<Vec<_>>();
+    let strings = |vs: &[&str]| vs.iter().map(|v| v.to_string()).collect::<Vec<_>>();
+    match args {
+        // The long spellings only: `-s`/`-u`/`-q` work and are
+        // understood above, but a completion list is a menu, and a menu
+        // should show the name that says what it does.
+        [] if prefix.starts_with('-') => rank(prefix, strings(&["--set", "--unset", "--quiet"])),
+        // `bishopt <Tab>`, and `bishopt --set <Tab>`: an option name.
+        [] => rank(prefix, names()),
+        [flag] if takes_a_name(flag) => rank(prefix, names()),
+        // `bishopt --set wrap <Tab>`: the value, when there is a fixed
+        // set of them to offer.
+        [flag, name] if flag == "--set" || flag == "-s" => rank(prefix, strings(crate::exec::bishopt_values(name))),
+        // A bare `bishopt NAME` reads it and takes nothing more, and
+        // `--unset NAME` is already complete.
+        _ => Vec::new(),
+    }
+}
+
+// What the editor's own colon line gets. A full `ShellCompletionProvider`
+// has nothing to be built from there (no single current session, and
+// command mode types window-management subcommands rather than shell
+// command lines -- see run_command_mode's own doc comment), but the
+// builtins whose arguments bish defines need no shell context at all, so
+// they can be offered anywhere a line is being typed.
+pub struct BuiltinCompletionProvider;
+
+impl CompletionProvider for BuiltinCompletionProvider {
+    fn complete(&self, req: CompletionRequest) -> CompletionResult {
+        let chars: Vec<char> = req.line.chars().collect();
+        let cursor = req.cursor.min(chars.len());
+        let word_start = find_word_start(&chars, cursor);
+        let prefix: String = chars[word_start..cursor].iter().collect();
+        let prefix_text: String = chars[..word_start].iter().collect();
+        let role = classify_word_role(&prefix_text);
+        let candidates = builtin_argument_candidates(&role, &prefix_text, &prefix).unwrap_or_default();
+        CompletionResult { word_start, candidates }
+    }
+}
+
 pub struct ShellCompletionProvider<'a> {
     pub cwd: Option<&'a Path>,
     pub known_functions: Option<&'a HashSet<String>>,
@@ -223,6 +293,13 @@ impl<'a> CompletionProvider for ShellCompletionProvider<'a> {
         if let CmdRole::Argument { command, .. } = &role
             && let Some(candidates) = self.registered_spec_candidates(command.as_deref(), &prefix)
         {
+            return CompletionResult { word_start, candidates };
+        }
+        // After a user's own `complete` spec (which owns a command
+        // outright, per real bash) but before the generic flag/
+        // subcommand/file fallbacks, since those know nothing about a
+        // builtin whose arguments bish itself defines.
+        if let Some(candidates) = builtin_argument_candidates(&role, &prefix_text, &prefix) {
             return CompletionResult { word_start, candidates };
         }
 
@@ -623,5 +700,88 @@ mod tests {
         assert_eq!(display_names(out.clone()), vec!["foo".to_string(), "xyzzy".to_string()]);
         assert_eq!(out[0].matched_positions, Vec::<usize>::new(), "no highlight for a non-matching entry");
         assert_eq!(out[1].matched_positions, vec![0, 1, 2], "highlights the matched prefix span");
+    }
+
+    fn bishopt_at(line: &str) -> Vec<String> {
+        let cursor = line.chars().count();
+        BuiltinCompletionProvider
+            .complete(CompletionRequest { line, cursor })
+            .candidates
+            .into_iter()
+            .map(|c| c.display)
+            .collect()
+    }
+
+    // Ordered by `rank` like every other candidate list here, which for
+    // an empty prefix means alphabetically -- so this compares sets, and
+    // what it pins is that the list *is* the registry: nothing invented,
+    // nothing missed, and a new option completable by existing.
+    #[test]
+    fn bishopt_completes_option_names_from_the_real_registry() {
+        let names = bishopt_at("bishopt ");
+        let mut expected = crate::exec::bishopt_names();
+        expected.sort();
+        assert_eq!(names, expected, "every option, and nothing invented");
+        assert!(bishopt_at("bishopt wr").contains(&"wrap".to_string()));
+        assert!(bishopt_at("bishopt wr").contains(&"wrap_column".to_string()));
+    }
+
+    #[test]
+    fn bishopt_completes_a_name_after_every_flag_that_takes_one() {
+        for flag in ["--set", "-s", "--unset", "-u", "--quiet", "-q"] {
+            assert!(bishopt_at(&format!("bishopt {flag} tab")).contains(&"tabular".to_string()), "{flag}");
+        }
+    }
+
+    #[test]
+    fn bishopt_completes_the_flags_themselves() {
+        let mut flags = bishopt_at("bishopt --");
+        flags.sort();
+        assert_eq!(flags, vec!["--quiet", "--set", "--unset"]);
+    }
+
+    // A boolean is the one kind of option with a fixed set of values;
+    // anything else is free text, and guessing at it would be inventing.
+    #[test]
+    fn bishopt_completes_on_and_off_for_a_boolean_value_only() {
+        let mut values = bishopt_at("bishopt --set wrap ");
+        values.sort();
+        assert_eq!(values, vec!["off", "on"]);
+        assert_eq!(bishopt_at("bishopt --set showbreak "), Vec::<String>::new());
+        assert_eq!(bishopt_at("bishopt --set wrap_column "), Vec::<String>::new());
+    }
+
+    // `Some(empty)` rather than `None`: bishopt owns its own completion,
+    // so a position with nothing to offer offers nothing, instead of
+    // falling through to file names.
+    #[test]
+    fn bishopt_never_falls_through_to_files() {
+        let role = CmdRole::Argument { command: Some("bishopt".to_string()), arg_index: 3 };
+        assert_eq!(builtin_argument_candidates(&role, "bishopt --set wrap on ", ""), Some(Vec::new()));
+        assert_eq!(bishopt_at("bishopt wrap "), Vec::<String>::new());
+    }
+
+    #[test]
+    fn the_builtin_provider_says_nothing_about_anything_else() {
+        assert_eq!(bishopt_at("ls "), Vec::<String>::new());
+        assert_eq!(bishopt_at("bish"), Vec::<String>::new(), "a command name is not this provider's job");
+        assert_eq!(bishopt_at(""), Vec::<String>::new());
+    }
+
+    // The shell prompt gets the same answers through its own provider.
+    #[test]
+    fn the_shell_provider_completes_bishopt_options_too() {
+        let provider = ShellCompletionProvider {
+            cwd: None,
+            known_functions: None,
+            completions: None,
+            default_completion: None,
+            action_ctx: None,
+            functions_preamble: None,
+        };
+        let line = "bishopt --set wr";
+        let result = provider.complete(CompletionRequest { line, cursor: line.chars().count() });
+        let names: Vec<String> = result.candidates.into_iter().map(|c| c.display).collect();
+        assert!(names.contains(&"wrap".to_string()));
     }
 }

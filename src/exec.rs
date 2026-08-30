@@ -10562,6 +10562,31 @@ const KNOWN_BISHOPTS: &[(&str, BishOptDefault)] = &[
     ("gitignore", BishOptDefault::Bool(true)),
 ];
 
+// Every bishopt option name, in registry order -- the source of truth
+// for Tab completion (bishedit::completion::bishopt_candidates).
+//
+// Deliberately *not* hand-duplicated into bishedit the way KNOWN_BUILTINS
+// is. That duplication exists to keep the editor's syntax *analysis*
+// independent of the execution engine, and a name drifting out of sync
+// there costs one word's colour. Here the whole feature is "tell me which
+// options exist", so a list that can drift from the registry would
+// advertise options that aren't real and hide ones that are -- worse than
+// having no completion at all.
+pub fn bishopt_names() -> Vec<&'static str> {
+    KNOWN_BISHOPTS.iter().map(|(name, _)| *name).collect()
+}
+
+// The values `bishopt --set NAME` accepts, when they are a fixed set.
+// Only a boolean has one; a string, colour or number is free text, and
+// offering a guess at it would be inventing options rather than
+// reporting them.
+pub fn bishopt_values(name: &str) -> &'static [&'static str] {
+    match KNOWN_BISHOPTS.iter().find(|(n, _)| *n == name) {
+        Some((_, BishOptDefault::Bool(_))) => &["on", "off"],
+        _ => &[],
+    }
+}
+
 // Best-effort terminal color-capability detection via the same
 // environment variables most terminal-aware CLI tools already check --
 // no terminfo database dependency. COLORTERM=truecolor/24bit is the de

@@ -7863,11 +7863,17 @@ fn run_command_mode(
         // accepted gap given what command mode is actually used for.
         // Flag/subcommand/printf highlighting need neither field, so those
         // work exactly as they do at the ordinary prompt.
-        // No meaningful shell-completion context here either, same
-        // reasoning as HighlightContext::default() above -- window-
-        // management subcommands, not shell command lines. menu_capable:
-        // false -- irrelevant with no provider, but also correct on its
-        // own merits (see the main prompt loop's own doc comment).
+        // No meaningful *shell* completion context here, same reasoning
+        // as HighlightContext::default() above -- window-management
+        // subcommands, not shell command lines. What it does get is
+        // BuiltinCompletionProvider: the builtins whose arguments bish
+        // itself defines need no session, cwd or PATH to complete, and
+        // `:bishopt --set <Tab>` is worth as much here as at the prompt
+        // -- more, since changing a view option is something you do
+        // *while* looking at the buffer it changes. menu_capable: false
+        // -- this colon line has no row of its own to draw a menu into,
+        // so Tab cycles by splicing, which is what a one-line prompt
+        // wants anyway.
         match editor::read_line(
             &prompt_str,
             history,
@@ -7877,7 +7883,7 @@ fn run_command_mode(
             0,
             *term_cols,
             HighlightContext::default(),
-            None,
+            Some(&crate::bishedit::completion::BuiltinCompletionProvider),
             None,
             false,
             None,
