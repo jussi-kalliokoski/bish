@@ -1193,6 +1193,13 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
                                 if !session.buffer_unrecorded {
                                     session.history.record(&session.buffer, Some(&cwd_before));
                                 }
+                                // Before the command runs, and after
+                                // history has it -- a hook that times or
+                                // logs a command wants the same line
+                                // history kept, not a rewritten one.
+                                let submitted = session.buffer.clone();
+                                run_shell_hooks(&mut sessions, session_id, "shell:exec:pre", &submitted);
+                                let session = sessions.get_mut(&session_id).unwrap();
                                 // Every session sharing this one real
                                 // process (see new_virtual_child's own
                                 // doc comment on why "window new"/pane
@@ -1205,12 +1212,21 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
                                 // idempotent when this session was
                                 // already the one last synced in.
                                 session.shell.sync_real_state_in();
+                                let session = sessions.get_mut(&session_id).unwrap();
                                 let result = session.shell.run_program(&prog);
                                 session.shell.sync_real_state_out();
                                 if session.shell.cwd != cwd_before {
                                     push_dir_history(session, session.shell.cwd.clone());
                                 }
+                                let moved_to = (session.shell.cwd != cwd_before).then(|| session.shell.cwd.to_string_lossy().into_owned());
                                 session.buffer.clear();
+                                // After the command, and after the
+                                // session's own state is synced back:
+                                // a hook asking where it is should get
+                                // the answer the next prompt will show.
+                                if let Some(moved_to) = moved_to {
+                                    run_shell_hooks(&mut sessions, session_id, "shell:cwd:change", &moved_to);
+                                }
                                 match result {
                                     ExecResult::Window(action) => window_action = Some(action),
                                     ExecResult::Fg => fg_pending = true,
@@ -7570,16 +7586,36 @@ fn tab_bar_line(sessions: &HashMap<SessionId, SessionState>, windows: &[WindowEn
 // firing an event free on the overwhelmingly common path where nobody is
 // listening.
 fn run_hooks(sessions: &mut HashMap<SessionId, SessionState>, session_id: SessionId, event: &str, buf: &TextBuffer) {
-    let language = fileeditor::language_of(buf);
+    let path = buf.path().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
+    run_hooks_for(sessions, session_id, event, &fileeditor::language_of(buf), &path);
+}
+
+// The same for an event with no buffer behind it. A `shell:` event's
+// language is bash -- the prompt *is* bash, which is also what
+// `abbr --lang` defaults to, so one `--lang=bash` hook means the same
+// thing in both places.
+fn run_shell_hooks(sessions: &mut HashMap<SessionId, SessionState>, session_id: SessionId, event: &str, argument: &str) {
+    run_hooks_for(sessions, session_id, event, crate::bishedit::snippet::DEFAULT_LANG, argument);
+}
+
+fn run_hooks_for(sessions: &mut HashMap<SessionId, SessionState>, session_id: SessionId, event: &str, language: &str, argument: &str) {
     let Some(session) = sessions.get(&session_id) else { return };
-    let commands = session.shell.hooks_for(event, &language);
+    let commands = session.shell.hooks_for(event, language);
     if commands.is_empty() {
         return;
     }
-    let path = buf.path().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
+    let path = argument.to_string();
     let Some(session) = sessions.get_mut(&session_id) else { return };
+    // Anything these do can't fire more hooks -- a `shell:cwd:change`
+    // hook that `cd`s would otherwise keep triggering itself.
+    session.shell.set_firing_hooks(true);
     let captured = Rc::new(RefCell::new(String::new()));
-    session.shell.set_sink_capture(captured);
+    // Borrowed and given back, rather than set and assumed: an
+    // unpromoted session writes to the real terminal, and "restoring" it
+    // to a grid nobody paints makes every later line disappear. Found
+    // exactly that way -- `::bish hook help` printed nothing once any
+    // hook had fired.
+    let saved = session.shell.borrow_sink(captured);
     for command in commands {
         // The path as one quoted word, so a name with a space in it
         // arrives as one argument rather than several.
@@ -7594,9 +7630,8 @@ fn run_hooks(sessions: &mut HashMap<SessionId, SessionState>, session_id: Sessio
             session.shell.run_program(&prog);
         }
     }
-    // Back to the pane's own grid, which is where this session's output
-    // belongs the rest of the time.
-    session.shell.set_sink_grid(session.screen.clone());
+    session.shell.set_firing_hooks(false);
+    session.shell.return_sink(saved);
 }
 
 // The window list as the `window` builtin sees it -- pushed into every
@@ -7973,7 +8008,7 @@ its decompressed text.
 | `:dbg` | attach a read-only debug session (`:dbg help`) |
 | `:preview` | render this markdown buffer |
 | `:!CMD` | run a shell command; a space before the `!` keeps it out of history |
-| `:help` | this screen (`:help options` lists every setting) |
+| `:help` | this screen (`:help options`, `:help hooks`) |
 "#;
 
 // `:help options`, as markdown: every bishopt with what it accepts, its
@@ -7992,6 +8027,19 @@ fn options_help(shell: &exec::Shell) -> String {
     for block in described.chunks(3) {
         let [name, description, accepts] = block else { continue };
         out.push_str(&format!("## `{}`\n\n{}\n\n`{}`\n\n", name.trim(), description.trim(), accepts.trim()));
+    }
+    out
+}
+
+// `:help hooks`, as markdown -- the same event descriptions
+// `::bish hook help` prints, so a page and a command can't disagree
+// about when something fires.
+fn hooks_help() -> String {
+    let mut out = String::from(
+        "# bish hooks\n\nAttach a command to something bish does. Registered with `::bish hook add`, listed with\n`::bish hook ls`, removed by the id `add` printed.\n\n```\n::bish hook add --lang=bash editor:file:open __my_bash_stuff\n```\n\nA hook runs its command with the event's own argument appended, and its output goes\nnowhere -- a hook fires while the editor owns the terminal. `--lang` is a glob over the\nfile's language, the same shape `abbr --lang` uses.\n\n## Events\n\n",
+    );
+    for (event, description) in crate::exec::HOOK_EVENT_HELP {
+        out.push_str(&format!("### `{event}`\n\n{description}\n\n"));
     }
     out
 }
@@ -9199,12 +9247,16 @@ fn run_command_mode(
                         // generated from the option registry itself
                         // rather than written out, so a new bishopt is
                         // documented by existing.
-                        "help" | "h" | "?" if arg.is_none() || arg == Some("options") => {
-                            let options = arg == Some("options");
-                            let title = if options { "bish options  (q to close)" } else { "bish help  (q to close)" };
-                            let source = match options {
-                                true => sessions.get(&session_id).map(|s| options_help(&s.shell)).unwrap_or_default(),
-                                false => EDITOR_HELP_MARKDOWN.to_string(),
+                        "help" | "h" | "?" if arg.is_none() || arg == Some("options") || arg == Some("hooks") => {
+                            let title = match arg {
+                                Some("options") => "bish options  (q to close)",
+                                Some("hooks") => "bish hooks  (q to close)",
+                                _ => "bish help  (q to close)",
+                            };
+                            let source = match arg {
+                                Some("options") => sessions.get(&session_id).map(|s| options_help(&s.shell)).unwrap_or_default(),
+                                Some("hooks") => hooks_help(),
+                                _ => EDITOR_HELP_MARKDOWN.to_string(),
                             };
                             run_pager(
                                 title,

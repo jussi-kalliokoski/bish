@@ -472,6 +472,10 @@ pub struct WindowInfo {
 // What repl.rs should do in response to a `window`-family command -- see
 // ExecResult::Window's doc comment for why this travels as a bubbled
 // signal instead of direct shared-state mutation.
+/// Whatever a shell's output sink was before something borrowed it --
+/// opaque, so `OutputSink` itself stays private.
+pub(crate) struct SavedSink(OutputSink);
+
 /// One registered hook: what to run, when, and for which languages.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Hook {
@@ -511,7 +515,46 @@ pub struct Hook {
 /// The `editor:` namespace is deliberate rather than decorative: it
 /// leaves room for `shell:` events (a preexec, a chpwd) to exist later
 /// without renaming any of these.
-pub const HOOK_EVENTS: &[&str] = &["editor:file:open", "editor:file:write:pre", "editor:file:write:post", "editor:file:close"];
+pub const HOOK_EVENTS: &[&str] = &[
+    "editor:file:open",
+    "editor:file:write:pre",
+    "editor:file:write:post",
+    "editor:file:close",
+    "shell:exec:pre",
+    "shell:cwd:change",
+];
+
+/// `::bish hook help`: how to use it, and every event with what it
+/// means. Shared with the `:help hooks` page (repl.rs), so the two can't
+/// drift apart.
+pub fn hook_help() -> Vec<String> {
+    let mut out = vec![
+        "::bish hook ls [--lang=GLOB]           what is registered".to_string(),
+        "::bish hook add [--lang=GLOB] EVENT COMMAND...".to_string(),
+        "::bish hook rm ID                      remove one, by the id `add` printed".to_string(),
+        String::new(),
+        "A hook runs COMMAND with the event's own argument appended.".to_string(),
+        "--lang is a glob over the file's language, as `abbr --lang` uses.".to_string(),
+        String::new(),
+    ];
+    for (event, description) in HOOK_EVENT_HELP {
+        out.push(event.to_string());
+        out.push(format!("    {description}"));
+    }
+    out
+}
+
+/// One line about each event: when it fires, and what its argument is.
+/// A parallel table guarded by a test, for the same reason
+/// `BISHOPT_HELP` is one -- see `every_hook_event_is_described`.
+pub const HOOK_EVENT_HELP: &[(&str, &str)] = &[
+    ("editor:file:open", "A file has been opened in the editor and its options are resolved. Argument: the path."),
+    ("editor:file:write:pre", "A file is about to be written. Argument: the path."),
+    ("editor:file:write:post", "A file has been written to disk. Argument: the path."),
+    ("editor:file:close", "A file is about to be closed, while its buffer still exists. Argument: the path."),
+    ("shell:exec:pre", "A command line is about to run at the prompt. Argument: the command line."),
+    ("shell:cwd:change", "The working directory has changed, however it happened. Argument: the new directory."),
+];
 
 #[derive(Debug, Clone)]
 pub enum WindowAction {
@@ -681,6 +724,12 @@ pub struct Shell {
     /// split off should behave like the one you split it from.
     pub hooks: Vec<Hook>,
     next_hook_id: u64,
+    /// Set while a hook is running, so a hook that causes its own event
+    /// -- a `shell:cwd:change` hook that `cd`s, most obviously -- fires
+    /// once rather than forever. Not shared with a virtual child: a hook
+    /// that legitimately starts a subshell should not have that
+    /// subshell's own hooks suppressed.
+    firing_hooks: bool,
     // One frame per active function call (pushed/popped alongside
     // var_scopes in call_function). `local -a`/`-A name` snapshots the
     // array's pre-local value here (None if it didn't exist) before
@@ -1067,6 +1116,7 @@ impl Shell {
             abbrs: Vec::new(),
             hooks: Vec::new(),
             next_hook_id: 1,
+            firing_hooks: false,
             array_local_stack: Vec::new(),
             assoc_local_stack: Vec::new(),
             nameref_names: std::collections::HashSet::new(),
@@ -1200,6 +1250,22 @@ impl Shell {
         self.sink = OutputSink::Capture(buf);
     }
 
+    /// Redirects output into `buf` and hands back what was there, for a
+    /// caller that must put it *back* rather than assume what it was.
+    ///
+    /// `set_sink_capture` + `set_sink_grid` looks like the same thing
+    /// and isn't: a session that hasn't been promoted writes to the real
+    /// terminal, and "restoring" it to a grid nobody paints makes every
+    /// later line vanish. Whoever borrows the sink is the only one who
+    /// knows what it was.
+    pub(crate) fn borrow_sink(&mut self, buf: Rc<RefCell<String>>) -> SavedSink {
+        SavedSink(std::mem::replace(&mut self.sink, OutputSink::Capture(buf)))
+    }
+
+    pub(crate) fn return_sink(&mut self, saved: SavedSink) {
+        self.sink = saved.0;
+    }
+
     // debugger.rs's own "hand the real terminal to the script" moment
     // (see DebugController::hand_off_to_script's own doc comment): a
     // statement about to run uninterrupted -- most visibly `read -p`'s
@@ -1295,6 +1361,7 @@ impl Shell {
             abbrs: self.abbrs.clone(),
             hooks: self.hooks.clone(),
             next_hook_id: self.next_hook_id,
+            firing_hooks: false,
             array_local_stack: Vec::new(),
             assoc_local_stack: Vec::new(),
             nameref_names: self.nameref_names.clone(),
@@ -3092,7 +3159,7 @@ impl Shell {
                     return 2;
                 };
                 if !HOOK_EVENTS.contains(&event.as_str()) {
-                    sh_eprintln!(self, "bish: ::bish hook: add: unknown event '{event}' (expected: {})", HOOK_EVENTS.join(", "));
+                    sh_eprintln!(self, "bish: ::bish hook: add: unknown event '{event}' (try `::bish hook help`)");
                     return 2;
                 }
                 if command.is_empty() {
@@ -3125,8 +3192,14 @@ impl Shell {
                 }
                 0
             }
+            Some("help") | Some("--help") | Some("-h") | Some("events") => {
+                for line in hook_help() {
+                    sh_println!(self, "{line}");
+                }
+                0
+            }
             Some(other) => {
-                sh_eprintln!(self, "bish: ::bish hook: unknown subcommand '{other}' (expected: ls, add, rm)");
+                sh_eprintln!(self, "bish: ::bish hook: unknown subcommand '{other}' (expected: ls, add, rm, help)");
                 2
             }
         }
@@ -3136,11 +3209,19 @@ impl Shell {
     /// order they were added. Empty is the overwhelmingly common answer,
     /// which is what keeps firing an event free when nobody is listening.
     pub fn hooks_for(&self, event: &str, language: &str) -> Vec<String> {
+        if self.firing_hooks {
+            return Vec::new();
+        }
         self.hooks
             .iter()
             .filter(|h| h.event == event && crate::glob::matches(&h.lang, language))
             .map(|h| h.command.clone())
             .collect()
+    }
+
+    /// Brackets a run of hooks, so anything they do can't fire more.
+    pub fn set_firing_hooks(&mut self, firing: bool) {
+        self.firing_hooks = firing;
     }
 
     fn run_bish_theme(&mut self, args: &[String]) -> i32 {
@@ -13176,5 +13257,61 @@ mod tests {
         let mut shell = Shell::new();
         shell.run_hook(&strs(&["add", "editor:file:open", "lsp", "start", "--quiet"]));
         assert_eq!(shell.hooks[0].command, "lsp start --quiet");
+    }
+
+    // The one thing a parallel table gets wrong -- see the identical
+    // guard on BISHOPT_HELP.
+    #[test]
+    fn every_hook_event_is_described() {
+        let mut events: Vec<&str> = HOOK_EVENTS.to_vec();
+        let mut described: Vec<&str> = HOOK_EVENT_HELP.iter().map(|(e, _)| *e).collect();
+        events.sort_unstable();
+        described.sort_unstable();
+        assert_eq!(events, described, "HOOK_EVENTS and HOOK_EVENT_HELP disagree");
+    }
+
+    // The naming rule the whole scheme rests on: every internal node is
+    // a real prefix, so `editor:file:write` names both write moments and
+    // `shell:exec` will name both exec moments the day there are two.
+    #[test]
+    fn the_event_hierarchy_is_prefix_matchable() {
+        let with_prefix = |prefix: &str| HOOK_EVENTS.iter().filter(|e| e.starts_with(prefix)).count();
+        assert_eq!(with_prefix("editor:file:write"), 2, "pre and post are one event's two moments");
+        assert_eq!(with_prefix("editor:file"), 4);
+        assert_eq!(with_prefix("editor:"), 4);
+        assert_eq!(with_prefix("shell:"), 2);
+        // ...which is exactly what a `prewrite`/`postwrite` spelling
+        // would have cost: nothing would share a `write` prefix.
+        assert!(HOOK_EVENTS.iter().all(|e| !e.contains("prewrite") && !e.contains("postwrite")));
+    }
+
+    #[test]
+    fn hook_help_lists_every_event() {
+        let help = hook_help().join("\n");
+        for event in HOOK_EVENTS {
+            assert!(help.contains(event), "{event} is missing from the help");
+        }
+        assert!(help.contains("--lang"), "and it says what --lang is");
+    }
+
+    #[test]
+    fn shell_events_are_registrable_and_scoped_like_the_rest() {
+        let mut shell = Shell::new();
+        assert_eq!(shell.run_hook(&strs(&["add", "shell:exec:pre", "__timer"])), 0);
+        assert_eq!(shell.run_hook(&strs(&["add", "shell:cwd:change", "__ls"])), 0);
+        assert_eq!(shell.hooks_for("shell:exec:pre", "bash"), vec!["__timer"]);
+        assert_eq!(shell.hooks_for("shell:cwd:change", "bash"), vec!["__ls"]);
+    }
+
+    // A hook that causes its own event has to fire once, not forever.
+    #[test]
+    fn a_hook_cannot_trigger_more_hooks_while_it_runs() {
+        let mut shell = Shell::new();
+        shell.run_hook(&strs(&["add", "shell:cwd:change", "__cd_somewhere"]));
+        assert_eq!(shell.hooks_for("shell:cwd:change", "bash").len(), 1);
+        shell.set_firing_hooks(true);
+        assert!(shell.hooks_for("shell:cwd:change", "bash").is_empty(), "nothing fires while a hook runs");
+        shell.set_firing_hooks(false);
+        assert_eq!(shell.hooks_for("shell:cwd:change", "bash").len(), 1);
     }
 }
