@@ -26,7 +26,7 @@ use crate::bishedit::snippet::{self, Abbr, LiveSnippet, Snippet, SnippetHost};
 use crate::bishedit::textbuffer;
 use crate::bishedit::textbuffer::TextBuffer;
 use crate::bishedit::unicode_width::char_width;
-use crate::bishedit::vimkeys::{InsertCmd, Op, SurroundTarget, VimKeys, INDENT_WIDTH};
+use crate::bishedit::vimkeys::{InsertCmd, Op, SurroundTarget, VimKeys};
 use crate::bishedit::Buffer;
 use crate::editor::{self, Key};
 use crate::repl::Rect;
@@ -532,7 +532,31 @@ pub(crate) fn delete_lines(buf: &mut TextBuffer, registers: &mut Registers, coun
 }
 
 // `>{motion}`/`>>`/Visual `>`'s own shared row-range primitive: prepends
-// INDENT_WIDTH spaces to every *non-empty* line in `from_row..=to_row` --
+// One level of indent, as the characters this buffer indents with: a
+// tab when `expandtab` is off, `shiftwidth` spaces otherwise.
+fn one_indent(buf: &TextBuffer) -> String {
+    if buf.expandtab { " ".repeat(buf.shiftwidth) } else { "\t".to_string() }
+}
+
+// How many leading characters of `row` come to one indent's worth of
+// columns -- what `<<` removes. A tab counts for a whole tabstop, and a
+// line indented by less than a full level just loses what it has, which
+// is vim's own rule.
+fn outdent_chars(buf: &TextBuffer, row: usize) -> usize {
+    let mut columns = 0;
+    let mut chars = 0;
+    while columns < buf.shiftwidth {
+        match buf.char_at(row, chars) {
+            Some(' ') => columns += 1,
+            Some('\t') => columns += buf.tabstop - (columns % buf.tabstop),
+            _ => break,
+        }
+        chars += 1;
+    }
+    chars
+}
+
+// One indent's worth of characters to every *non-empty* line in `from_row..=to_row` --
 // vim's own rule that shifting right never adds trailing whitespace to a
 // genuinely empty line. Callers are always some already-resolved whole-
 // line range: `>`/`<` act linewise regardless of the motion/selection
@@ -543,7 +567,7 @@ fn indent_rows(buf: &mut TextBuffer, from_row: usize, to_row: usize) {
         if buf.line_len(row) == 0 {
             continue;
         }
-        buf.insert_text((row, 0), &" ".repeat(INDENT_WIDTH));
+        buf.insert_text((row, 0), &one_indent(buf));
     }
 }
 
@@ -553,7 +577,10 @@ fn indent_rows(buf: &mut TextBuffer, from_row: usize, to_row: usize) {
 // line indented less than that just loses whatever it has).
 fn outdent_rows(buf: &mut TextBuffer, from_row: usize, to_row: usize) {
     for row in from_row..=to_row {
-        let strip = (0..buf.line_len(row).min(INDENT_WIDTH)).take_while(|&c| matches!(buf.char_at(row, c), Some(' ') | Some('\t'))).count();
+        // In *columns*, not characters: with `expandtab` off one tab is
+        // a whole indent, so stripping `shiftwidth` characters would
+        // strip a whole shiftwidth of tabs.
+        let strip = outdent_chars(buf, row);
         if strip == 0 {
             continue;
         }
@@ -1297,22 +1324,23 @@ pub(crate) fn run_insert_mode(
                 buf.set_cursor(cursors[0].0, cursors[0].1);
                 inserted.push('\n');
             }
-            // Tab inserts spaces up to the next INDENT_WIDTH boundary
-            // (vim's own `expandtab` behavior, always on -- see
-            // INDENT_WIDTH's own doc comment on why there's no `:set` to
-            // choose a literal tab character instead). Never overtypes
-            // even in Replace mode, same as Enter just above: a literal
-            // tab byte would also break this editor's own one-char-per-
-            // column rendering model (build_editor_frame/render_row treat
-            // every buffer char as exactly one terminal column, with no
-            // tab-stop-aware expansion anywhere in that pipeline).
+            // With `expandtab` on, spaces up to the next `shiftwidth`
+            // boundary; with it off, one literal tab. Never overtypes
+            // even in Replace mode, same as Enter just above.
             Key::Tab => {
-                let (_, col) = buf.cursor();
-                let width = INDENT_WIDTH - (col % INDENT_WIDTH);
-                let spaces = " ".repeat(width);
-                apply_insert_to_all(buf, &mut cursors, &spaces);
+                let text = if buf.expandtab {
+                    let (line, col) = buf.cursor();
+                    // To the next boundary in *drawn columns*, so a tab
+                    // pressed after a literal tab lands where it looks
+                    // like it should.
+                    let at = display_column(buf, line, col);
+                    " ".repeat(buf.shiftwidth - (at % buf.shiftwidth))
+                } else {
+                    "\t".to_string()
+                };
+                apply_insert_to_all(buf, &mut cursors, &text);
                 buf.set_cursor(cursors[0].0, cursors[0].1);
-                inserted.push_str(&spaces);
+                inserted.push_str(&text);
             }
             // Replace mode's own Backspace: known simplification -- steps
             // the cursor back without restoring the character it walks
@@ -1847,10 +1875,76 @@ pub(crate) fn display_row(
     layout: Option<&crate::bishedit::tabular::Layout>,
 ) -> crate::bishedit::tabular::Row {
     let chars = buf.line_chars(line);
-    match layout {
+    let row = match layout {
         Some(layout) => crate::bishedit::tabular::row(&chars, line, layout),
         None => crate::bishedit::tabular::Row::plain(&chars),
+    };
+    expand_tabs(row, buf.tabstop)
+}
+
+// A literal tab draws as spaces to the next `tabstop` boundary, and
+// this is where that happens -- on the *drawn cells*, after the tabular
+// layout and before anything reads them.
+//
+// That placement is the whole design: the cursor, click-to-position,
+// horizontal scrolling, selections, syntax highlighting and diagnostics
+// all already address the line through `Row`'s own two maps rather than
+// through character indices (see `render_row`), so expanding a tab here
+// makes every one of them tab-aware at once. Doing it in the renderer
+// instead would leave each of those to work it out separately, which is
+// exactly the drift the drawn-cell model exists to prevent.
+//
+// Each of a tab's spaces points back at the tab itself, so a click
+// anywhere in it lands on the one character that is really there.
+fn expand_tabs(row: crate::bishedit::tabular::Row, tabstop: usize) -> crate::bishedit::tabular::Row {
+    if !row.cells.contains(&'\t') {
+        return row;
     }
+    let tabstop = tabstop.max(1);
+    let mut cells = Vec::with_capacity(row.cells.len());
+    let mut source_at = Vec::with_capacity(row.cells.len());
+    let mut column = 0usize;
+    for (i, ch) in row.cells.iter().enumerate() {
+        let source = row.source_at.get(i).copied().flatten();
+        if *ch == '\t' {
+            for _ in 0..tabstop - (column % tabstop) {
+                cells.push(' ');
+                source_at.push(source);
+                column += 1;
+            }
+            continue;
+        }
+        cells.push(*ch);
+        source_at.push(source);
+        column += char_width(*ch);
+    }
+    // Rebuilt rather than shifted: a tab's spaces all name the same
+    // source character, and the first of them is the one it maps to.
+    let mut cell_of = vec![cells.len(); row.cell_of.len()];
+    for (cell, source) in source_at.iter().enumerate().rev() {
+        if let Some(source) = source
+            && *source < cell_of.len()
+        {
+            cell_of[*source] = cell;
+        }
+    }
+    // Anything with no cell of its own (past the end) points one past
+    // it, and the maps stay monotonic.
+    let mut last = cells.len();
+    for slot in cell_of.iter_mut().rev() {
+        if *slot > last {
+            *slot = last;
+        }
+        last = *slot;
+    }
+    crate::bishedit::tabular::Row { cells, source_at, cell_of }
+}
+
+// The drawn column a character index sits at -- what Tab advances from
+// and what `scroll_to_show_cursor` measures the margin against.
+fn display_column(buf: &TextBuffer, line: usize, col: usize) -> usize {
+    let display = display_row(buf, line, tabular_layout(buf).as_ref());
+    col_at_cell(&display.cells, display.cell_of[col.min(buf.line_len(line))])
 }
 
 // Which character of the line a drawn cell belongs to. Padding belongs
@@ -4227,6 +4321,82 @@ mod horizontal_scroll_tests {
         b.insert_text((0, 0), &text);
         b.set_cursor(0, 0);
         b
+    }
+
+    fn drawn(buf: &TextBuffer, line: usize) -> String {
+        display_row(buf, line, tabular_layout(buf).as_ref()).cells.iter().collect()
+    }
+
+    #[test]
+    fn a_tab_draws_to_the_next_tabstop() {
+        let mut b = buf("\tone\n");
+        b.tabstop = 4;
+        assert_eq!(drawn(&b, 0), "    one");
+        b.tabstop = 8;
+        assert_eq!(drawn(&b, 0), "        one");
+    }
+
+    // To the next *stop*, not a fixed width -- which is the whole
+    // difference between a tab and a run of spaces.
+    #[test]
+    fn a_tab_fills_only_what_is_left_of_its_stop() {
+        let mut b = buf("ab\tc\n");
+        b.tabstop = 4;
+        assert_eq!(drawn(&b, 0), "ab  c", "two columns left of the stop");
+        let mut b = buf("abc\tx\n");
+        b.tabstop = 4;
+        assert_eq!(drawn(&b, 0), "abc x", "one");
+    }
+
+    // Every space of a tab points back at the one character that is
+    // really there, so a click anywhere in it lands somewhere real.
+    #[test]
+    fn every_column_of_a_tab_maps_back_to_the_tab() {
+        let mut b = buf("\tx\n");
+        b.tabstop = 4;
+        let row = display_row(&b, 0, tabular_layout(&b).as_ref());
+        assert_eq!(row.source_at[..4], [Some(0), Some(0), Some(0), Some(0)]);
+        assert_eq!(row.source_at[4], Some(1));
+        assert_eq!(row.cell_of[0], 0, "the tab starts at the first column");
+        assert_eq!(row.cell_of[1], 4, "and `x` starts after all of it");
+    }
+
+    #[test]
+    fn display_column_counts_what_is_drawn() {
+        let mut b = buf("\t\tx\n");
+        b.tabstop = 4;
+        assert_eq!(display_column(&b, 0, 0), 0);
+        assert_eq!(display_column(&b, 0, 1), 4);
+        assert_eq!(display_column(&b, 0, 2), 8);
+    }
+
+    #[test]
+    fn expandtab_off_indents_with_a_tab() {
+        let mut b = buf("one\n");
+        b.expandtab = false;
+        indent_rows(&mut b, 0, 0);
+        assert_eq!(buffer_text(&b), "\tone\n");
+        outdent_rows(&mut b, 0, 0);
+        assert_eq!(buffer_text(&b), "one\n");
+    }
+
+    #[test]
+    fn shiftwidth_decides_how_far_an_indent_goes() {
+        let mut b = buf("one\n");
+        b.shiftwidth = 2;
+        indent_rows(&mut b, 0, 0);
+        assert_eq!(buffer_text(&b), "  one\n");
+    }
+
+    // vim's own rule: one tab is a whole indent, so outdenting a
+    // tab-indented line takes the tab and not a shiftwidth of them.
+    #[test]
+    fn outdent_takes_one_indents_worth_of_columns_not_characters() {
+        let mut b = buf("\t\tone\n");
+        b.tabstop = 4;
+        b.shiftwidth = 4;
+        outdent_rows(&mut b, 0, 0);
+        assert_eq!(buffer_text(&b), "\tone\n");
     }
 
     #[test]

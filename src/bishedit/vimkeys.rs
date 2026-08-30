@@ -198,16 +198,18 @@ pub enum KeyOutcome {
 
 /// An operator awaiting a motion (`y{motion}`/`d{motion}`/`c{motion}`) or
 /// its own double-tap shorthand (`yy`/`dd`/`cc`).
-// Vim's own `shiftwidth`/`softtabstop`, shared by every `Op::Indent`/
-// `Op::Outdent` implementation (editor.rs's LineBuffer, fileeditor.rs's
-// TextBuffer) and Insert mode's own Tab key (fileeditor::run_insert_
-// mode's `Key::Tab` arm) -- defined once, here, rather than once per
-// consumer, so shifting a line by "one indent" and pressing Tab always
-// agree on what that means. There's no `:set shiftwidth`/`:set
-// softtabstop` options system in this editor yet (see fileeditor.rs's
-// own `is_bash_file` doc comment for the same "not worth guessing at up
-// front" stance elsewhere in this crate), so this is a single hardcoded
-// default rather than a configurable one.
+// The *default* width of one indent -- what a buffer starts with before
+// the `shiftwidth`/`tabstop` bishopts or a project's `.editorconfig`
+// have said anything (see `TextBuffer::shiftwidth`, and repl.rs's own
+// apply_shell_options/apply_editorconfig).
+//
+// A real `TextBuffer` reads its own width from itself now, so this is no
+// longer the rule everything obeys -- but it is still the one place the
+// number is written down, and `editor.rs`'s own single-line `LineBuffer`
+// still uses it directly: a shell prompt is not a file, has no path for
+// a `.editorconfig` to be about, and indenting one is a rare enough
+// gesture that giving it its own configurable width would be inventing
+// a setting nobody asked for.
 pub const INDENT_WIDTH: usize = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

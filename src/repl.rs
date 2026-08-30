@@ -6225,11 +6225,75 @@ fn wrap_options(shell: &exec::Shell) -> crate::bishedit::wrap::Options {
 // Called twice: once as run_edit_frame starts driving a buffer, and
 // again after every command-mode command, since the colon line is the
 // one way these can change while the editor holds the terminal.
+// The settings a buffer gets from the shell alone, before any
+// `.editorconfig` has a say.
+fn apply_shell_options(shell: &exec::Shell, buf: &mut TextBuffer) {
+    buf.expandtab = shell.bishopt_bool("expandtab");
+    buf.shiftwidth = shell.bishopt_int("shiftwidth").max(1) as usize;
+    buf.tabstop = shell.bishopt_int("tabstop").max(1) as usize;
+    buf.trim_trailing_whitespace = shell.bishopt_bool("trim_trailing_whitespace");
+    buf.final_newline = shell.bishopt_bool("fixendofline") || buf.final_newline;
+    match shell.bishopt_str("fileformat").as_str() {
+        "unix" => buf.eol = crate::editorconfig::Eol::Lf,
+        "dos" => buf.eol = crate::editorconfig::Eol::Crlf,
+        "mac" => buf.eol = crate::editorconfig::Eol::Cr,
+        // Empty, the default: whatever the file already had, which is
+        // the only answer that doesn't rewrite a CRLF file on first
+        // save.
+        _ => {}
+    }
+}
+
+// ...and then what the project says, when the project is allowed to say
+// it. `.editorconfig` is applied *after* the shell's own settings and
+// overwrites them, which is the `editorconfig` bishopt's whole meaning:
+// your bishopts are your preference for everywhere else, and a project
+// that has written its conventions down is being specific. Turning the
+// option off is how you take a buffer back without editing the file.
+fn apply_editorconfig(shell: &exec::Shell, buf: &mut TextBuffer) {
+    if !shell.bishopt_bool("editorconfig") {
+        return;
+    }
+    let Some(path) = buf.path().map(|p| p.to_path_buf()) else { return };
+    // Resolved against the absolute path: a `.editorconfig` cascade is
+    // about where a file *is*, and `e src/main.rs` gives a relative one.
+    let path = std::fs::canonicalize(&path).unwrap_or(path);
+    let properties = crate::editorconfig::for_file(&path);
+    if let Some(style) = properties.indent_style {
+        buf.expandtab = style == crate::editorconfig::IndentStyle::Space;
+    }
+    if let Some(width) = properties.width() {
+        buf.shiftwidth = width.max(1);
+    }
+    if let Some(width) = properties.tab_width {
+        buf.tabstop = width.max(1);
+    }
+    if let Some(eol) = properties.end_of_line {
+        buf.eol = eol;
+    }
+    if let Some(trim) = properties.trim_trailing_whitespace {
+        buf.trim_trailing_whitespace = trim;
+    }
+    if let Some(final_newline) = properties.insert_final_newline {
+        buf.final_newline = final_newline;
+    }
+    // `max_line_length` is `wrap_column` under another name -- an
+    // explicit `off` is what `wrap_column = 0` already means.
+    if let Some(max) = properties.max_line_length {
+        buf.wrap.column = max.unwrap_or(0);
+    }
+    // `charset` is deliberately not applied; see editorconfig::for_file.
+}
+
 fn apply_view_options(shell: &exec::Shell, buf: &mut TextBuffer) {
     buf.wrap = wrap_options(shell);
     buf.tabular = tabular_style(shell, &fileeditor::language_of(buf));
     buf.hyperlinks = shell.bishopt_bool("hyperlinks");
     buf.relativenumber = shell.bishopt_bool("relativenumber");
+    // In this order, and never the other way round: the shell's own
+    // settings are the base, and the project's are the override.
+    apply_shell_options(shell, buf);
+    apply_editorconfig(shell, buf);
 }
 
 // Whether this buffer's columns line up, and on what. Two conditions,

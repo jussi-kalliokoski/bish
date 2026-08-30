@@ -10589,6 +10589,28 @@ const KNOWN_BISHOPTS: &[(&str, BishOptDefault)] = &[
     // no `number` to turn off (the gutter always numbers), so this is
     // the only reading of it that leaves the option meaningful.
     ("relativenumber", BishOptDefault::Bool(false)),
+    // Whether a project's own `.editorconfig` wins over the settings
+    // just below. On, it does -- a project's conventions are the point
+    // of the file, and the settings here are your own preference for
+    // everywhere *else*. Off ignores `.editorconfig` entirely, which is
+    // how you override one from the colon line without editing it:
+    // `:bishopt --set editorconfig off` and your own settings take the
+    // buffer back on the next redraw.
+    ("editorconfig", BishOptDefault::Bool(true)),
+    // vim's names for the four things `.editorconfig` calls
+    // `indent_style`, `indent_size`, `tab_width` and
+    // `insert_final_newline`. `trim_trailing_whitespace` keeps
+    // EditorConfig's own name, since vim has nothing to borrow.
+    ("expandtab", BishOptDefault::Bool(true)),
+    ("shiftwidth", BishOptDefault::Int(4, 1..=64)),
+    ("tabstop", BishOptDefault::Int(4, 1..=64)),
+    ("fixendofline", BishOptDefault::Bool(true)),
+    ("trim_trailing_whitespace", BishOptDefault::Bool(false)),
+    // vim's `fileformat`, and the one option here whose default is
+    // *nothing*: an empty value means "whatever this file already had",
+    // which is the only answer that doesn't rewrite every line of a
+    // CRLF file the first time you save it.
+    ("fileformat", BishOptDefault::Str("")),
 ];
 
 // Every bishopt option name, in registry order -- the source of truth

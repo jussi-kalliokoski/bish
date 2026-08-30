@@ -99,6 +99,21 @@ pub struct TextBuffer {
     // The `relativenumber` bishopt: whether the gutter numbers each line
     // by its distance from the cursor's instead of absolutely.
     pub relativenumber: bool,
+    /// How this buffer indents: `expandtab` off inserts a literal tab,
+    /// `shiftwidth` is what `>>` shifts by and what Tab advances to,
+    /// `tabstop` is how wide a literal tab draws.
+    pub expandtab: bool,
+    pub shiftwidth: usize,
+    pub tabstop: usize,
+    /// Whether `:w` strips whitespace from the end of every line.
+    pub trim_trailing_whitespace: bool,
+    /// Whether the file on disk ends in a newline. Detected from what
+    /// was loaded, so a file without one keeps not having one -- and
+    /// overridden by `fixendofline`/`insert_final_newline`.
+    pub final_newline: bool,
+    /// The line ending this file is written back with. Detected on load,
+    /// so opening and saving a CRLF file leaves it a CRLF file.
+    pub eol: crate::editorconfig::Eol,
     // Which visual row of `vtop`'s own line the viewport starts at. Only
     // ever non-zero with wrapping on, and only for a line tall enough to
     // exceed the pane by itself -- without it, a minified file would
@@ -179,6 +194,12 @@ impl TextBuffer {
             tabular: None,
             hyperlinks: true,
             relativenumber: false,
+            expandtab: true,
+            shiftwidth: crate::bishedit::vimkeys::INDENT_WIDTH,
+            tabstop: crate::bishedit::vimkeys::INDENT_WIDTH,
+            trim_trailing_whitespace: false,
+            final_newline: true,
+            eol: crate::editorconfig::Eol::Lf,
             vtop_sub: 0,
             snippet_holes: Vec::new(),
             diagnostics: Vec::new(),
@@ -209,12 +230,27 @@ impl TextBuffer {
     // (a gzip'd file, a member inside a zip), which is why every caller
     // also marks the result readonly; see fileeditor::compressed_text.
     pub fn from_text(path: &Path, text: &str, vheight: usize) -> TextBuffer {
-        // A trailing newline is the normal case (the file's own last
-        // line ends in "\n", same as `save`'s own output shape below) --
-        // stripped here so it doesn't show up as a phantom trailing
-        // empty line; anything else in the text (embedded blank lines,
-        // no trailing newline at all) is preserved exactly.
-        let text = text.strip_suffix('\n').unwrap_or(text);
+        // What this file's own line ending is, before anything is
+        // normalized away -- remembered so `save` writes the same one
+        // back. Without it, opening and saving a CRLF file silently
+        // rewrote every line of it.
+        let eol = detect_eol(text);
+        // Normalized to "\n" for everything above this line: the buffer,
+        // every motion, every highlighter and every offset in this
+        // codebase assume one character per line break, and a `\r`
+        // riding along on the end of each line would be a character in
+        // the buffer that the file's own text does not have.
+        let normalized = match eol {
+            crate::editorconfig::Eol::Lf => std::borrow::Cow::Borrowed(text),
+            crate::editorconfig::Eol::Crlf => std::borrow::Cow::Owned(text.replace("\r\n", "\n")),
+            crate::editorconfig::Eol::Cr => std::borrow::Cow::Owned(text.replace('\r', "\n")),
+        };
+        // A trailing newline is the normal case -- stripped here so it
+        // doesn't show up as a phantom trailing empty line; *whether* it
+        // was there is remembered instead, so a file without one keeps
+        // not having one.
+        let final_newline = normalized.is_empty() || normalized.ends_with('\n');
+        let text = normalized.strip_suffix('\n').unwrap_or(&normalized);
         let lines: Vec<Vec<char>> = text.split('\n').map(|l| l.chars().collect()).collect();
         let lines = if lines.is_empty() { vec![Vec::new()] } else { lines };
         TextBuffer {
@@ -231,6 +267,12 @@ impl TextBuffer {
             tabular: None,
             hyperlinks: true,
             relativenumber: false,
+            eol,
+            final_newline,
+            expandtab: true,
+            shiftwidth: crate::bishedit::vimkeys::INDENT_WIDTH,
+            tabstop: crate::bishedit::vimkeys::INDENT_WIDTH,
+            trim_trailing_whitespace: false,
             vtop_sub: 0,
             snippet_holes: Vec::new(),
             diagnostics: Vec::new(),
@@ -349,6 +391,32 @@ impl TextBuffer {
     // e.g. `K`-hover's own doc-comment lookup (repl.rs/docs.rs), which
     // parses the *live* in-memory buffer so a not-yet-saved edit is
     // reflected immediately, rather than requiring a `:w` first.
+    /// The bytes this buffer writes to disk: its own text with *this
+    /// file's* line ending, trailing whitespace trimmed if asked, and a
+    /// final newline only if it should have one.
+    ///
+    /// Separate from `text()` on purpose. `text()` is what every
+    /// highlighter, linter and span offset in this codebase reads, and
+    /// it is always `\n`-separated with one trailing newline -- making
+    /// *that* depend on a file's line ending would put a `\r` into every
+    /// offset in the editor.
+    pub fn on_disk_text(&self) -> String {
+        let mut lines: Vec<String> = self.lines.iter().map(|l| l.iter().collect::<String>()).collect();
+        if self.trim_trailing_whitespace {
+            for line in lines.iter_mut() {
+                let trimmed = line.trim_end();
+                if trimmed.len() != line.len() {
+                    *line = trimmed.to_string();
+                }
+            }
+        }
+        let mut out = lines.join(self.eol.text());
+        if self.final_newline {
+            out.push_str(self.eol.text());
+        }
+        out
+    }
+
     pub fn text(&self) -> String {
         let mut text: String = self.lines.iter().map(|l| l.iter().collect::<String>()).collect::<Vec<_>>().join("\n");
         text.push('\n');
@@ -368,7 +436,7 @@ impl TextBuffer {
         if self.readonly && Some(target) == self.path.as_deref() {
             return Err(io::Error::new(io::ErrorKind::PermissionDenied, "buffer is read-only"));
         }
-        std::fs::write(target, self.text())?;
+        std::fs::write(target, self.on_disk_text())?;
         if self.path.is_none() {
             self.path = Some(target.to_path_buf());
         }
@@ -712,6 +780,21 @@ impl snippet::SnippetHost for TextBuffer {
     }
 }
 
+// Which line ending a file uses. `\r\n` anywhere wins, since a file
+// with even one is a CRLF file to every tool that reads it; a lone
+// `\r` with no `\n` at all is the old Mac ending. Everything else,
+// including an empty file, is Unix -- which is also the right default
+// for a file with no line breaks to judge by.
+fn detect_eol(text: &str) -> crate::editorconfig::Eol {
+    if text.contains("\r\n") {
+        return crate::editorconfig::Eol::Crlf;
+    }
+    if text.contains('\r') && !text.contains('\n') {
+        return crate::editorconfig::Eol::Cr;
+    }
+    crate::editorconfig::Eol::Lf
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -732,6 +815,12 @@ mod tests {
             tabular: None,
             hyperlinks: true,
             relativenumber: false,
+            expandtab: true,
+            shiftwidth: crate::bishedit::vimkeys::INDENT_WIDTH,
+            tabstop: crate::bishedit::vimkeys::INDENT_WIDTH,
+            trim_trailing_whitespace: false,
+            final_newline: true,
+            eol: crate::editorconfig::Eol::Lf,
             vtop_sub: 0,
             snippet_holes: Vec::new(),
             diagnostics: Vec::new(),
@@ -1143,5 +1232,39 @@ mod tests {
         assert_eq!(buf.text(), "one\ntwo\n");
         assert_eq!(buf.line_count(), 2);
         assert!(!buf.is_dirty());
+    }
+
+    #[test]
+    fn a_crlf_file_stays_a_crlf_file() {
+        let buf = TextBuffer::from_text(Path::new("/tmp/x"), "one\r\ntwo\r\n", 10);
+        assert_eq!(buf.eol, crate::editorconfig::Eol::Crlf);
+        assert_eq!(buf.line_count(), 2, "the \\r is not a character in the buffer");
+        assert_eq!(buf.text(), "one\ntwo\n", "everything above this reads LF");
+        assert_eq!(buf.on_disk_text(), "one\r\ntwo\r\n");
+    }
+
+    #[test]
+    fn a_file_without_a_final_newline_keeps_not_having_one() {
+        let mut buf = TextBuffer::from_text(Path::new("/tmp/x"), "one\ntwo", 10);
+        assert!(!buf.final_newline);
+        assert_eq!(buf.on_disk_text(), "one\ntwo");
+        buf.final_newline = true;
+        assert_eq!(buf.on_disk_text(), "one\ntwo\n");
+    }
+
+    #[test]
+    fn trailing_whitespace_is_trimmed_only_when_asked() {
+        let mut buf = TextBuffer::from_text(Path::new("/tmp/x"), "one   \ntwo\t\n", 10);
+        assert_eq!(buf.on_disk_text(), "one   \ntwo\t\n");
+        buf.trim_trailing_whitespace = true;
+        assert_eq!(buf.on_disk_text(), "one\ntwo\n");
+    }
+
+    // The old Mac ending, and the one case a lone `\r` means it.
+    #[test]
+    fn a_cr_only_file_round_trips() {
+        let buf = TextBuffer::from_text(Path::new("/tmp/x"), "one\rtwo\r", 10);
+        assert_eq!(buf.eol, crate::editorconfig::Eol::Cr);
+        assert_eq!(buf.on_disk_text(), "one\rtwo\r");
     }
 }
