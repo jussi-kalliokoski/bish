@@ -1423,8 +1423,12 @@ pub fn read_line(
     // arriving mid-typing simply erased whatever had been typed until the
     // next keystroke happened to redraw it.
     mut on_idle: impl FnMut() -> bool,
+    // The `mouse` bishopt. Off means reporting is never turned on at
+    // all, which is what hands the terminal's own selection back -- see
+    // term::RawGuard::enable_maybe_mouse.
+    mouse: bool,
 ) -> io::Result<ReadOutcome> {
-    let mut guard = Some(term::RawGuard::enable_with_mouse(0)?);
+    let mut guard = Some(term::RawGuard::enable_maybe_mouse(0, mouse)?);
     let mut ed = match initial {
         Some((text, cursor)) => {
             let mut e = LineEditor::new();
@@ -1677,7 +1681,7 @@ pub fn read_line(
                 // raw mode and redraw once we're resumed.
                 drop(guard.take());
                 term::suspend_self();
-                guard = Some(term::RawGuard::enable_with_mouse(0)?);
+                guard = Some(term::RawGuard::enable_maybe_mouse(0, mouse)?);
             }
             Key::Backspace => {
                 // esc_cancels is only ever set for a command-mode

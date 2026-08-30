@@ -10597,6 +10597,18 @@ const KNOWN_BISHOPTS: &[(&str, BishOptDefault)] = &[
     // `:bishopt --set editorconfig off` and your own settings take the
     // buffer back on the next redraw.
     ("editorconfig", BishOptDefault::Bool(true)),
+    // Whether bish asks the terminal to report mouse events at all.
+    // On, clicking places the cursor and dragging selects. Off is not
+    // just "ignore the mouse": reporting is never turned on, which is
+    // what gives the *terminal's own* selection back -- with reporting
+    // on, dragging is bish's gesture and there is no way to sweep a
+    // region for the system clipboard.
+    ("mouse", BishOptDefault::Bool(true)),
+    // Whether the terminal's cursor changes shape to show the mode: a
+    // block in Normal and Visual, a bar in Insert, an underline in
+    // Replace. Off leaves the cursor however the terminal draws it, for
+    // a terminal that renders one of the shapes badly or not at all.
+    ("cursorshape", BishOptDefault::Bool(true)),
     // vim's names for the four things `.editorconfig` calls
     // `indent_style`, `indent_size`, `tab_width` and
     // `insert_final_newline`. `trim_trailing_whitespace` keeps

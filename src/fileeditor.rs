@@ -532,6 +532,34 @@ pub(crate) fn delete_lines(buf: &mut TextBuffer, registers: &mut Registers, coun
 }
 
 // `>{motion}`/`>>`/Visual `>`'s own shared row-range primitive: prepends
+// The selection between two caret positions, as the `Inclusive` range
+// the rest of this editor already understands -- so an Insert-mode
+// selection renders, yanks and deletes through exactly the same code a
+// Visual one does.
+//
+// Carets sit *between* characters and a range covers characters, so the
+// later end steps back one: dragging from before `a` to before `c`
+// selects `ab`, not `abc`. `None` when the two carets are in the same
+// place, which is a cursor rather than a selection.
+fn selection_between(buf: &TextBuffer, a: (usize, usize), b: (usize, usize)) -> Option<motion::MotionRange> {
+    let (from, to) = if a <= b { (a, b) } else { (b, a) };
+    if from == to {
+        return None;
+    }
+    let to = if to.1 > 0 {
+        (to.0, to.1 - 1)
+    } else {
+        // The caret is at the start of a line, so the selection ends at
+        // the end of the one before it.
+        let previous = to.0.checked_sub(1)?;
+        (previous, buf.line_len(previous))
+    };
+    if to < from {
+        return None;
+    }
+    Some(motion::MotionRange { shape: motion::MotionShape::Inclusive, from, to })
+}
+
 // One level of indent, as the characters this buffer indents with: a
 // tab when `expandtab` is off, `shiftwidth` spaces otherwise.
 fn one_indent(buf: &TextBuffer) -> String {
@@ -1154,6 +1182,11 @@ pub(crate) fn run_insert_mode(
     // it rather than what the caller measured before Insert mode began.
     let (mut rect, mut term_rows, mut term_cols) = (rect, term_rows, term_cols);
     let mut cursors: Vec<(usize, usize)> = std::iter::once(buf.cursor()).chain(extra_cursors.iter().copied()).collect();
+    // Where a mouse drag started, while one is in progress. Insert mode
+    // gets a selection of its own -- the one a GUI editor gives you --
+    // rather than borrowing Visual mode's: Visual is a *mode*, and the
+    // point here is to select without leaving the one you are typing in.
+    let mut drag_anchor: Option<(usize, usize)> = None;
     // Resolved once per Insert-mode session: the file's language can't
     // change while it's being typed into, and neither can the table (the
     // caller snapshots it fresh on the way in -- see repl.rs).
@@ -1359,6 +1392,18 @@ pub(crate) fn run_insert_mode(
                 cursors[0] = buf.cursor();
                 inserted.pop();
             }
+            // With a selection standing, Backspace deletes *it* and
+            // leaves the caret where it was -- which is what Backspace
+            // means everywhere else a selection can exist, and the one
+            // gesture that makes selecting in Insert mode worth
+            // anything.
+            Key::Backspace if !buf.selections.is_empty() => {
+                let range = buf.selections[0];
+                buf.selections.clear();
+                buf.delete_range(&range);
+                buf.set_cursor(range.from.0, range.from.1);
+                cursors = vec![buf.cursor()];
+            }
             Key::Backspace => {
                 apply_backspace_to_all(buf, &mut cursors);
                 buf.set_cursor(cursors[0].0, cursors[0].1);
@@ -1444,6 +1489,34 @@ pub(crate) fn run_insert_mode(
             // already do in Normal mode. MOUSE_WHEEL_LINES lines per
             // notch, not 1 -- matches most terminals'/editors' own
             // default wheel granularity.
+            // A click puts the caret where you clicked and drops any
+            // selection, the same as clicking in anything else does.
+            Key::Mouse(ev) if buf.mouse && ev.is_left_click() => {
+                let (row0, col0) = ((ev.row as usize).saturating_sub(1), (ev.col as usize).saturating_sub(1));
+                if let Some((line, col)) = position_at_screen(buf, rect, row0, col0) {
+                    buf.selections.clear();
+                    buf.set_cursor(line, col);
+                    // Collapses any extra cursors: clicking says where
+                    // you want to be, which is one place.
+                    cursors = vec![(line, col)];
+                    drag_anchor = Some((line, col));
+                }
+            }
+            // ...and dragging from it selects, without leaving Insert
+            // mode. `Inclusive`, so it renders and deletes exactly the
+            // way a Visual selection already does -- there is one
+            // selection concept in this buffer, not two.
+            Key::Mouse(ev) if buf.mouse && ev.is_left_drag() => {
+                let (row0, col0) = ((ev.row as usize).saturating_sub(1), (ev.col as usize).saturating_sub(1));
+                if let Some(anchor) = drag_anchor
+                    && let Some(to) = position_at_screen(buf, rect, row0, col0)
+                {
+                    buf.set_cursor(to.0, to.1);
+                    cursors = vec![to];
+                    buf.selections = selection_between(buf, anchor, to).into_iter().collect();
+                }
+            }
+            Key::Mouse(ev) if buf.mouse && ev.is_release() => drag_anchor = None,
             Key::Mouse(ev) if ev.is_scroll_down() => {
                 motion::apply_motion(buf, motion::Motion::ScrollLineDown, Some(MOUSE_WHEEL_LINES));
                 cursors[0] = buf.cursor();
@@ -1477,6 +1550,13 @@ pub(crate) fn run_insert_mode(
                 }
             }
             Key::Char(c) => {
+                // Typing drops the selection rather than replacing it.
+                // Deliberately not the GUI behaviour: this is still a
+                // vim buffer, `u` is the only way back, and silently
+                // eating a swept region on the next keystroke is the
+                // kind of thing you only notice afterwards. Backspace
+                // is the key that deletes it, and says so.
+                buf.selections.clear();
                 let (row, col) = buf.cursor();
                 // Replace mode overwrites the character already at the
                 // cursor, if there is one -- deleting it first, then
@@ -3283,8 +3363,44 @@ pub fn build_editor_frame(
             cursor_abs.saturating_sub(hoffset).min(content_cols.saturating_sub(1))
         };
     out.push_str(&format!("\x1b[{};{}H\x1b[?25h", row_origin + screen_row + 1, col_origin + screen_col + 1));
+    out.push_str(cursor_shape(buf, mode, vk));
     out
 }
+
+// DECSCUSR (`CSI Ps SP q`): what the terminal's own cursor looks like, so
+// which mode you are in is legible without reading the status line --
+// the thing every modal editor's users learn to rely on and the one
+// piece of mode feedback that survives not looking at the bottom of the
+// screen.
+//
+// Emitted with every frame rather than once on entering a mode: a frame
+// is the only thing that reliably runs on every change, and a job's
+// output or another program's own escape sequences can have moved the
+// cursor's shape underneath us in between. It costs four bytes.
+pub(crate) fn cursor_shape(buf: &TextBuffer, mode: EditorMode, vk: &VimKeys) -> &'static str {
+    if !buf.cursorshape {
+        return "";
+    }
+    match mode {
+        // A bar sits *between* characters, which is where an insertion
+        // point actually is.
+        EditorMode::Insert => "\x1b[6 q",
+        // An underline says "this character is about to be replaced",
+        // which is exactly what Replace mode does to it.
+        EditorMode::Replace => "\x1b[4 q",
+        // Normal mode's cursor is *on* a character, so a block. Except
+        // mid-operator (`d`, `c`, `y` waiting for a motion), where an
+        // underline says the keystroke you type next means something
+        // different from usual -- the state it is easiest to forget you
+        // are in.
+        EditorMode::Normal if !vk.is_idle_except_count() && !vk.is_visual() => "\x1b[4 q",
+        EditorMode::Normal => "\x1b[2 q",
+    }
+}
+
+/// Back to whatever the terminal draws by default -- for whoever is
+/// giving the terminal back.
+pub(crate) const CURSOR_SHAPE_RESET: &str = "\x1b[0 q";
 
 pub fn render_editor_frame(buf: &TextBuffer, vk: &VimKeys, mode: EditorMode, rect: Rect, term_rows: usize, term_cols: usize, color_overrides: Option<&highlight::ColorOverrides>) {
     let mut out = crate::repl::render_global_status_row(&status_text(buf, vk, mode, term_cols), term_rows);
@@ -4325,6 +4441,62 @@ mod horizontal_scroll_tests {
 
     fn drawn(buf: &TextBuffer, line: usize) -> String {
         display_row(buf, line, tabular_layout(buf).as_ref()).cells.iter().collect()
+    }
+
+    #[test]
+    fn the_cursor_shape_says_which_mode_you_are_in() {
+        let b = buf("x\n");
+        let vk = VimKeys::new();
+        assert_eq!(cursor_shape(&b, EditorMode::Normal, &vk), "\x1b[2 q", "block");
+        assert_eq!(cursor_shape(&b, EditorMode::Insert, &vk), "\x1b[6 q", "bar");
+        assert_eq!(cursor_shape(&b, EditorMode::Replace, &vk), "\x1b[4 q", "underline");
+    }
+
+    #[test]
+    fn cursorshape_off_emits_nothing_at_all() {
+        let mut b = buf("x\n");
+        b.cursorshape = false;
+        let vk = VimKeys::new();
+        for mode in [EditorMode::Normal, EditorMode::Insert, EditorMode::Replace] {
+            assert_eq!(cursor_shape(&b, mode, &vk), "");
+        }
+    }
+
+    // Carets sit between characters and a range covers characters, so
+    // the later end steps back one: from before `a` to before `c` is
+    // `ab`, not `abc`.
+    #[test]
+    fn an_insert_mode_selection_covers_what_is_between_the_carets() {
+        let b = buf("abcdef\n");
+        let range = selection_between(&b, (0, 0), (0, 2)).unwrap();
+        assert_eq!(range.from, (0, 0));
+        assert_eq!(range.to, (0, 1), "`ab`, not `abc`");
+        assert_eq!(range.shape, motion::MotionShape::Inclusive, "the same shape Visual mode produces");
+    }
+
+    #[test]
+    fn an_insert_mode_selection_works_either_way_round() {
+        let b = buf("abcdef\n");
+        assert_eq!(selection_between(&b, (0, 4), (0, 1)), selection_between(&b, (0, 1), (0, 4)));
+    }
+
+    // A caret with nothing swept is a cursor, not an empty selection --
+    // otherwise a plain click would leave one standing for Backspace to
+    // find.
+    #[test]
+    fn a_caret_that_has_not_moved_is_not_a_selection() {
+        let b = buf("abcdef\n");
+        assert_eq!(selection_between(&b, (0, 3), (0, 3)), None);
+    }
+
+    // Dragging up to the very start of a line ends the selection at the
+    // end of the line before it.
+    #[test]
+    fn a_selection_ending_at_a_line_start_ends_on_the_previous_line() {
+        let b = buf("abc\ndef\n");
+        let range = selection_between(&b, (0, 1), (1, 0)).unwrap();
+        assert_eq!(range.from, (0, 1));
+        assert_eq!(range.to, (0, 3));
     }
 
     #[test]

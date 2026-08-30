@@ -1692,6 +1692,9 @@ impl HexSession {
                 on_idle();
                 false
             },
+            // No shell here to ask, and a hex dump has nothing you would
+            // sweep with the terminal's own selection anyway.
+            true,
         );
         self.registers = registers;
         if let Ok(editor::ReadOutcome::Line(line)) = outcome {

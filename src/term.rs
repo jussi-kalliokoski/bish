@@ -180,6 +180,15 @@ impl RawGuard {
     // its own guard, and Drop below unwinds mouse reporting right along
     // with the termios restore, so every one of read_line's several exit
     // paths (Eof, Enter, Ctrl-C, Ctrl-D, Ctrl-Z, ...) gets this for free.
+    /// Raw mode, with mouse reporting only if asked for -- the
+    /// `mouse` bishopt's own switch. Off is not "ignore the events":
+    /// reporting is never enabled, so the terminal keeps its own
+    /// click-and-drag selection, which is the whole reason to want it
+    /// off.
+    pub fn enable_maybe_mouse(fd: i32, mouse: bool) -> io::Result<RawGuard> {
+        if mouse { RawGuard::enable_with_mouse(fd) } else { RawGuard::enable(fd) }
+    }
+
     pub fn enable_with_mouse(fd: i32) -> io::Result<RawGuard> {
         Self::enable_impl(fd, true)
     }

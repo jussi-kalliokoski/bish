@@ -696,6 +696,10 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
         // --set hyperlinks off` should take effect on the next keystroke,
         // not the next shell.
         let hyperlinks = sessions[&session_id].shell.bishopt_bool("hyperlinks");
+        // Read per redraw for the same reason: `bishopt --set mouse off`
+        // should hand the terminal's own selection back on the next
+        // prompt, not the next shell.
+        let mouse = sessions[&session_id].shell.bishopt_bool("mouse");
         let highlight_ctx =
             HighlightContext {
                 cwd: Some(cwd_snapshot.as_path()),
@@ -776,6 +780,9 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
                 }
                 changed
             },
+            // The `mouse` bishopt -- off keeps the terminal's own
+            // selection working here (see enable_maybe_mouse).
+            mouse,
         ) {
             Ok(ReadOutcome::Eof) => {
                 // Whether closing *this* (window, top-frame) reference
@@ -2210,7 +2217,7 @@ fn run_hex_frame(
         // the redraw, so the redraw's closing cursor placement is what
         // the shell prompt draws against.
         leave_alt_screen(&sessions[&session_id].screen);
-        print!("{}", erase_global_status_row(*term_rows));
+        print!("{}{}", fileeditor::CURSOR_SHAPE_RESET, erase_global_status_row(*term_rows));
         if *sinks_are_grid {
             compositor_redraw(sessions, windows, *current_window, *term_rows, *term_cols);
         }
@@ -2248,7 +2255,7 @@ fn run_hex_frame(
     // draws its own over this if it has one; a plain shell prompt
     // doesn't, and would otherwise leave a hex status line sitting above
     // it forever.
-    print!("{}", erase_global_status_row(*term_rows));
+    print!("{}{}", fileeditor::CURSOR_SHAPE_RESET, erase_global_status_row(*term_rows));
     let _ = io::stdout().flush();
 }
 
@@ -2389,7 +2396,7 @@ fn run_edit_frame(
                 // redraw's own closing cursor placement (see
                 // build_compositor_frame_output) is what has to be the
                 // last word.
-                print!("{}", erase_global_status_row(*term_rows));
+                print!("{}{}", fileeditor::CURSOR_SHAPE_RESET, erase_global_status_row(*term_rows));
                 if *sinks_are_grid {
                     compositor_redraw(sessions, windows, *current_window, *term_rows, *term_cols);
                 }
@@ -2871,7 +2878,7 @@ fn run_browse_frame(
     // caller's `compositor_redraw` cannot clean up on its own -- found
     // via pty, where cancelling a browse left "esc back" sitting above a
     // perfectly ordinary shell prompt.
-    print!("\x1b[?25h{}", erase_global_status_row(*term_rows));
+    print!("\x1b[?25h{}{}", fileeditor::CURSOR_SHAPE_RESET, erase_global_status_row(*term_rows));
     let _ = io::stdout().flush();
     Ok(outcome)
 }
@@ -6290,6 +6297,8 @@ fn apply_view_options(shell: &exec::Shell, buf: &mut TextBuffer) {
     buf.tabular = tabular_style(shell, &fileeditor::language_of(buf));
     buf.hyperlinks = shell.bishopt_bool("hyperlinks");
     buf.relativenumber = shell.bishopt_bool("relativenumber");
+    buf.cursorshape = shell.bishopt_bool("cursorshape");
+    buf.mouse = shell.bishopt_bool("mouse");
     // In this order, and never the other way round: the shell's own
     // settings are the base, and the project's are the override.
     apply_shell_options(shell, buf);
@@ -6485,7 +6494,10 @@ fn run_normal_mode_navigation(
         NavStart::Edit(tb, vk0) => (NavBuffer::Editable(*tb), *vk0),
     };
 
-    let _guard = term::RawGuard::enable_with_mouse(0)?;
+    // The `mouse` bishopt: off means reporting is never enabled, so the
+    // terminal keeps its own click-and-drag selection.
+    let mouse = sessions.get(&session_id).is_none_or(|s| s.shell.bishopt_bool("mouse"));
+    let _guard = term::RawGuard::enable_maybe_mouse(0, mouse)?;
     // Repaints the whole screen first -- necessary the very first time
     // normal mode ever triggers promotion (the alternate screen buffer
     // starts out blank), harmless otherwise -- then this pane's own
@@ -8308,6 +8320,7 @@ fn run_command_mode(
         // term_rows put it.
         let prompt_row = command_mode_row(*term_rows) + 1;
         let prompt_str = if buffer.is_empty() { prompt::command_mode_prompt() } else { prompt::continuation() };
+        let mouse = sessions.get(&session_id).is_none_or(|s| s.shell.bishopt_bool("mouse"));
         print!("\x1b[{};1H", prompt_row);
         let _ = io::stdout().flush();
 
@@ -8368,6 +8381,9 @@ fn run_command_mode(
                 service_background_jobs(sessions, windows, job_frames, current_window, term_rows, term_cols, sinks_are_grid);
                 false
             },
+            // The `mouse` bishopt -- off keeps the terminal's own
+            // selection working here (see enable_maybe_mouse).
+            mouse,
         ) {
             // Command mode discards whatever was typed either way, so
             // `text` is nothing to it -- see that field's own doc comment

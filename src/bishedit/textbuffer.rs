@@ -99,6 +99,12 @@ pub struct TextBuffer {
     // The `relativenumber` bishopt: whether the gutter numbers each line
     // by its distance from the cursor's instead of absolutely.
     pub relativenumber: bool,
+    /// The `cursorshape` bishopt: whether the terminal's cursor changes
+    /// shape to show the mode.
+    pub cursorshape: bool,
+    /// The `mouse` bishopt, carried here so the frame that draws this
+    /// buffer and the loop that reads keys for it agree.
+    pub mouse: bool,
     /// How this buffer indents: `expandtab` off inserts a literal tab,
     /// `shiftwidth` is what `>>` shifts by and what Tab advances to,
     /// `tabstop` is how wide a literal tab draws.
@@ -194,6 +200,8 @@ impl TextBuffer {
             tabular: None,
             hyperlinks: true,
             relativenumber: false,
+            cursorshape: true,
+            mouse: true,
             expandtab: true,
             shiftwidth: crate::bishedit::vimkeys::INDENT_WIDTH,
             tabstop: crate::bishedit::vimkeys::INDENT_WIDTH,
@@ -267,6 +275,8 @@ impl TextBuffer {
             tabular: None,
             hyperlinks: true,
             relativenumber: false,
+            cursorshape: true,
+            mouse: true,
             eol,
             final_newline,
             expandtab: true,
@@ -815,6 +825,8 @@ mod tests {
             tabular: None,
             hyperlinks: true,
             relativenumber: false,
+            cursorshape: true,
+            mouse: true,
             expandtab: true,
             shiftwidth: crate::bishedit::vimkeys::INDENT_WIDTH,
             tabstop: crate::bishedit::vimkeys::INDENT_WIDTH,
