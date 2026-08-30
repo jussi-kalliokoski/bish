@@ -311,6 +311,10 @@ pub struct ShellCompletionProvider<'a> {
     pub default_completion: Option<&'a compgen::CompgenSpec>,
     pub action_ctx: Option<&'a compgen::ActionContext>,
     pub functions_preamble: Option<&'a str>,
+    /// The `gitignore` bishopt. `false` for a caller with no shell to
+    /// read it from, which offers everything -- the behaviour before
+    /// this existed.
+    pub honor_gitignore: bool,
 }
 
 impl<'a> CompletionProvider for ShellCompletionProvider<'a> {
@@ -470,10 +474,23 @@ impl<'a> ShellCompletionProvider<'a> {
             cwd.join(dir_part)
         };
         let Ok(entries) = std::fs::read_dir(&dir_path) else { return Vec::new() };
+        // The `gitignore` bishopt, same one the browser reads. Built
+        // once for the directory being listed rather than per entry --
+        // and only when Tab was actually pressed, so an ordinary
+        // keystroke never touches the filesystem for it.
+        let ignore = self.honor_gitignore.then(|| crate::gitignore::Stack::for_directory(&dir_path));
         let mut names = Vec::new();
         for entry in entries.flatten() {
             let Ok(name) = entry.file_name().into_string() else { continue };
             let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+            // `target/` and `node_modules/` are the whole reason to
+            // bother: a completion list they are in is a completion list
+            // you have to read past.
+            if let Some(ignore) = &ignore
+                && ignore.matched(&entry.path(), is_dir).is_ignored()
+            {
+                continue;
+            }
             names.push(format!("{dir_part}{name}{}", if is_dir { "/" } else { "" }));
         }
         rank(prefix, names)
@@ -549,7 +566,7 @@ mod tests {
 
     #[test]
     fn command_name_candidates_includes_known_builtins_matching_prefix() {
-        let provider = ShellCompletionProvider { cwd: None, known_functions: None, completions: None, default_completion: None, action_ctx: None, functions_preamble: None };
+        let provider = ShellCompletionProvider { cwd: None, known_functions: None, completions: None, default_completion: None, action_ctx: None, functions_preamble: None, honor_gitignore: false };
         let names = display_names(provider.command_name_candidates("ech"));
         assert!(names.iter().any(|n| n == "echo"), "{names:?}");
     }
@@ -562,7 +579,7 @@ mod tests {
         // prefixes, which would make the assertion flaky.
         let mut functions = HashSet::new();
         functions.insert("zz_bish_test_func".to_string());
-        let provider = ShellCompletionProvider { cwd: None, known_functions: Some(&functions), completions: None, default_completion: None, action_ctx: None, functions_preamble: None };
+        let provider = ShellCompletionProvider { cwd: None, known_functions: Some(&functions), completions: None, default_completion: None, action_ctx: None, functions_preamble: None, honor_gitignore: false };
         let names = display_names(provider.command_name_candidates("zz_bish_test"));
         assert_eq!(names, vec!["zz_bish_test_func".to_string()]);
     }
@@ -572,7 +589,7 @@ mod tests {
         // coreutils -- same real-PATH assumption this whole feature
         // already leans on elsewhere (highlight.rs's own is_in_path
         // tests).
-        let provider = ShellCompletionProvider { cwd: None, known_functions: None, completions: None, default_completion: None, action_ctx: None, functions_preamble: None };
+        let provider = ShellCompletionProvider { cwd: None, known_functions: None, completions: None, default_completion: None, action_ctx: None, functions_preamble: None, honor_gitignore: false };
         let names = display_names(provider.command_name_candidates("tru"));
         assert!(names.iter().any(|n| n == "true"), "{names:?}");
     }
@@ -630,7 +647,7 @@ mod tests {
         std::fs::write(dir.join("widget-notes.txt"), b"hi").unwrap();
         std::fs::write(dir.join("unrelated.txt"), b"hi").unwrap();
 
-        let provider = ShellCompletionProvider { cwd: Some(&dir), known_functions: None, completions: None, default_completion: None, action_ctx: None, functions_preamble: None };
+        let provider = ShellCompletionProvider { cwd: Some(&dir), known_functions: None, completions: None, default_completion: None, action_ctx: None, functions_preamble: None, honor_gitignore: false };
         let names = display_names(provider.file_candidates("widg"));
 
         std::fs::remove_dir_all(&dir).ok();
@@ -661,7 +678,7 @@ mod tests {
             unsafe { std::env::set_var("HOME", &dir) };
             // cwd is deliberately a different, unrelated directory --
             // confirms the lookup actually goes to $HOME, not cwd.
-            let provider = ShellCompletionProvider { cwd: Some(Path::new("/")), known_functions: None, completions: None, default_completion: None, action_ctx: None, functions_preamble: None };
+            let provider = ShellCompletionProvider { cwd: Some(Path::new("/")), known_functions: None, completions: None, default_completion: None, action_ctx: None, functions_preamble: None, honor_gitignore: false };
             let names = display_names(provider.file_candidates("~/.co"));
             unsafe { std::env::set_var("HOME", &original_home) };
             names
@@ -677,13 +694,13 @@ mod tests {
 
     #[test]
     fn file_candidates_yields_nothing_without_a_cwd() {
-        let provider = ShellCompletionProvider { cwd: None, known_functions: None, completions: None, default_completion: None, action_ctx: None, functions_preamble: None };
+        let provider = ShellCompletionProvider { cwd: None, known_functions: None, completions: None, default_completion: None, action_ctx: None, functions_preamble: None, honor_gitignore: false };
         assert_eq!(provider.file_candidates("anything"), Vec::new());
     }
 
     #[test]
     fn complete_dispatches_bare_prefix_to_command_names() {
-        let provider = ShellCompletionProvider { cwd: None, known_functions: None, completions: None, default_completion: None, action_ctx: None, functions_preamble: None };
+        let provider = ShellCompletionProvider { cwd: None, known_functions: None, completions: None, default_completion: None, action_ctx: None, functions_preamble: None, honor_gitignore: false };
         let result = provider.complete(CompletionRequest { line: "ech", cursor: 3 });
         assert_eq!(result.word_start, 0);
         let names = display_names(result.candidates);
@@ -696,7 +713,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("readme.txt"), b"hi").unwrap();
 
-        let provider = ShellCompletionProvider { cwd: Some(&dir), known_functions: None, completions: None, default_completion: None, action_ctx: None, functions_preamble: None };
+        let provider = ShellCompletionProvider { cwd: Some(&dir), known_functions: None, completions: None, default_completion: None, action_ctx: None, functions_preamble: None, honor_gitignore: false };
         let line = "some-dynamic-cmd read";
         let result = provider.complete(CompletionRequest { line, cursor: line.chars().count() });
         let word_start = result.word_start;
@@ -713,7 +730,7 @@ mod tests {
         let mut completions = HashMap::new();
         completions.insert("fruit".to_string(), compgen::CompgenSpec { wordlist: Some("apple avocado banana".to_string()), ..Default::default() });
         let provider =
-            ShellCompletionProvider { cwd: None, known_functions: None, completions: Some(&completions), default_completion: None, action_ctx: None, functions_preamble: None };
+            ShellCompletionProvider { cwd: None, known_functions: None, completions: Some(&completions), default_completion: None, action_ctx: None, functions_preamble: None, honor_gitignore: false };
         let line = "fruit a";
         let result = provider.complete(CompletionRequest { line, cursor: line.chars().count() });
         assert_eq!(display_names(result.candidates), vec!["apple".to_string(), "avocado".to_string()]);
@@ -730,6 +747,7 @@ mod tests {
             default_completion: Some(&default_completion),
             action_ctx: None,
             functions_preamble: None,
+            honor_gitignore: false,
         };
         let line = "unknowncmd12345 def";
         let result = provider.complete(CompletionRequest { line, cursor: line.chars().count() });
@@ -742,7 +760,7 @@ mod tests {
         // completions concept at all" case, distinct from "nothing
         // registered yet" -- must fall straight through to the built-in
         // command-name-candidates path, same as today.
-        let provider = ShellCompletionProvider { cwd: None, known_functions: None, completions: None, default_completion: None, action_ctx: None, functions_preamble: None };
+        let provider = ShellCompletionProvider { cwd: None, known_functions: None, completions: None, default_completion: None, action_ctx: None, functions_preamble: None, honor_gitignore: false };
         let line = "ech";
         let result = provider.complete(CompletionRequest { line, cursor: line.chars().count() });
         assert!(display_names(result.candidates).iter().any(|n| n == "echo"));
@@ -837,6 +855,7 @@ mod tests {
             default_completion: None,
             action_ctx: None,
             functions_preamble: None,
+            honor_gitignore: false,
         };
         let line = "bishopt --set wr";
         let result = provider.complete(CompletionRequest { line, cursor: line.chars().count() });
@@ -893,6 +912,7 @@ mod tests {
             default_completion: None,
             action_ctx: None,
             functions_preamble: None,
+            honor_gitignore: false,
         };
         let line = "ssh zzz";
         let result = provider.complete(CompletionRequest { line, cursor: line.chars().count() });
@@ -915,10 +935,47 @@ mod tests {
             default_completion: None,
             action_ctx: None,
             functions_preamble: None,
+            honor_gitignore: false,
         };
         let line = "scp zzz";
         let result = provider.complete(CompletionRequest { line, cursor: line.chars().count() });
         let names: Vec<String> = result.candidates.into_iter().map(|c| c.display).collect();
         assert!(names.iter().any(|n| n.contains("zzz-local")), "got {names:?}");
+    }
+
+    // `target/` in a completion list is a list you have to read past.
+    #[test]
+    fn file_completion_skips_gitignored_entries() {
+        let dir = std::env::temp_dir().join(format!("bish-completion-ignore-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        std::fs::create_dir_all(dir.join("target")).unwrap();
+        std::fs::write(dir.join(".gitignore"), "target/\n").unwrap();
+        std::fs::write(dir.join("tangent.txt"), "").unwrap();
+
+        let names = |honor| {
+            let provider = ShellCompletionProvider {
+                cwd: Some(&dir),
+                known_functions: None,
+                completions: None,
+                default_completion: None,
+                action_ctx: None,
+                functions_preamble: None,
+                honor_gitignore: honor,
+            };
+            let line = "cat ta";
+            provider
+                .complete(CompletionRequest { line, cursor: line.chars().count() })
+                .candidates
+                .into_iter()
+                .map(|c| c.display)
+                .collect::<Vec<_>>()
+        };
+        let offered = names(true);
+        assert!(offered.contains(&"tangent.txt".to_string()), "got {offered:?}");
+        assert!(!offered.iter().any(|n| n.starts_with("target")), "target/ is ignored: {offered:?}");
+        // ...and with the option off it is offered like anything else.
+        assert!(names(false).iter().any(|n| n.starts_with("target")));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

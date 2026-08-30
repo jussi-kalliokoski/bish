@@ -733,6 +733,7 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
         // Same owned-snapshot pattern as highlight_ctx just above -- built
         // from the exact same locals, not re-snapshotted.
         let shell_completion = completion::ShellCompletionProvider {
+            honor_gitignore: sessions[&session_id].shell.bishopt_bool("gitignore"),
             cwd: Some(cwd_snapshot.as_path()),
             known_functions: Some(&known_functions),
             completions: Some(&completions_snapshot),

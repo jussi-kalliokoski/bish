@@ -38,6 +38,7 @@ pub const SEPARATOR: char = '!';
 pub enum Kind {
     Zip,
     Gzip,
+    Tar,
 }
 
 // What `path` actually is, by its first bytes rather than its name -- a
@@ -64,8 +65,36 @@ pub fn kind_of(path: &Path) -> Option<Kind> {
         // deliberately isn't accepted -- there'd be no other volume to
         // read.
         [b'P', b'K', 3, 4] | [b'P', b'K', 5, 6] => Some(Kind::Zip),
-        _ => None,
+        // Tar has no header at all -- its "magic" is `ustar` 257 bytes
+        // in, which is why this needs a second, longer look rather than
+        // another arm above.
+        _ => is_tar_file(path).then_some(Kind::Tar),
     }
+}
+
+// Whether a file's bytes at offset 257 say `ustar`. A pre-POSIX tar has
+// nothing there and is not recognized: without the magic there is no way
+// to tell one from an arbitrary file whose 257th byte happens to be
+// interesting, and guessing wrong means showing someone a binary as a
+// directory.
+fn is_tar_file(path: &Path) -> bool {
+    use std::io::Read;
+    let Ok(mut file) = std::fs::File::open(path) else { return false };
+    let mut head = [0u8; TAR_BLOCK];
+    let Ok(read) = file.read(&mut head) else { return false };
+    read >= 265 && is_tar(&head)
+}
+
+const TAR_BLOCK: usize = 512;
+
+// The same test against bytes already in hand -- which is how a
+// `.tar.gz` is recognized: its *file* is a gzip, and only once inflated
+// can anything tell whether what is inside is a tar or an ordinary
+// file. That is the whole reason a doubly-wrapped archive needs no
+// second `!` in its path: `x.tar.gz!/dir/f` is one archive, unwrapped
+// twice on the way in.
+fn is_tar(data: &[u8]) -> bool {
+    data.len() >= 265 && &data[257..262] == b"ustar"
 }
 
 // Splits a virtual path into the archive and the member path inside it
@@ -104,9 +133,46 @@ pub fn join(archive: &Path, inner: &str) -> String {
 // A gzip file is deliberately not browsable: it holds one compressed
 // stream, not a directory of members, so there'd be exactly one thing to
 // pick out of it. It opens as a read-only buffer instead.
+// Whether this file is a directory of members rather than content: a
+// zip, a tar, or a gzip whose contents turn out to be a tar.
+//
+// That last case is the only one that costs anything -- deciding it
+// means inflating, since a `.tar.gz`'s own bytes say only "gzip". It is
+// also the only honest way to tell `notes.txt.gz` (open the text) from
+// `src.tar.gz` (browse it) without trusting the name, which is the rule
+// `kind_of` already sets for every other archive here.
+pub fn holds_members(path: &Path) -> bool {
+    match kind_of(path) {
+        Some(Kind::Zip) | Some(Kind::Tar) => true,
+        Some(Kind::Gzip) => archive_bytes(path).map(|data| is_tar(&data)).unwrap_or(false),
+        None => false,
+    }
+}
+
+// The cheap version, for a *listing* -- which icon and colour an entry
+// gets, not how it opens.
+//
+// `holds_members` is the honest answer and this one isn't: it trusts a
+// `.tar.gz`/`.tgz` name rather than inflating, because inflating every
+// gzip in a directory to decide what to draw is not a trade worth
+// making. The distinction is safe exactly because it is cosmetic --
+// pressing Enter still goes through `is_browsable`, which reads the
+// bytes, so a misnamed file is drawn wrong for a moment and still opens
+// correctly.
+pub fn looks_like_archive(path: &Path) -> bool {
+    match kind_of(path) {
+        Some(Kind::Zip) | Some(Kind::Tar) => true,
+        Some(Kind::Gzip) => {
+            let name = path.file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
+            name.ends_with(".tar.gz") || name.ends_with(".tgz")
+        }
+        None => false,
+    }
+}
+
 pub fn is_browsable(path: &str) -> bool {
     let Some((archive, inner)) = split(path) else {
-        return kind_of(Path::new(path)) == Some(Kind::Zip);
+        return holds_members(Path::new(path));
     };
     if inner.is_empty() {
         return true;
@@ -133,13 +199,29 @@ pub struct Member {
 // lists them (which is the order they were added, and what `unzip -l`
 // shows).
 pub fn list(path: &Path) -> Result<Vec<Member>, String> {
-    let data = read_file(path)?;
+    let data = archive_bytes(path)?;
     members_of(&data)
+}
+
+// The bytes an archive is actually made of: the file itself, or -- for a
+// gzip -- what is inside it. One place, so `list`, `read_member` and
+// `is_browsable` can never disagree about what a `.tar.gz` contains.
+//
+// Known cost, accepted for now: a `.tar.gz` is inflated again for every
+// member read, since nothing here holds the decompressed bytes between
+// calls. That is one inflate per file you open out of an archive, which
+// is what the read-whole-file approach above already assumes about
+// scale.
+fn archive_bytes(path: &Path) -> Result<Vec<u8>, String> {
+    match kind_of(path) {
+        Some(Kind::Gzip) => gunzip(path).map(|(_, data)| data),
+        _ => read_file(path),
+    }
 }
 
 // One member's decompressed bytes.
 pub fn read_member(path: &Path, name: &str) -> Result<Vec<u8>, String> {
-    let data = read_file(path)?;
+    let data = archive_bytes(path)?;
     let members = members_of(&data)?;
     let member = members
         .iter()
@@ -274,6 +356,85 @@ fn byte(data: &[u8], at: usize) -> Result<&u8, String> {
     data.get(at).ok_or_else(|| "truncated gzip header".to_string())
 }
 
+// A tar member is stored whole and uncompressed; this marks one so
+// `extract` can tell it from a zip member, whose `method` really is a
+// zip compression method.
+const TAR_STORED: u16 = u16::MAX;
+
+// Every member of a tar archive. Tar has no index: the members *are* the
+// file, each a 512-byte header followed by its own data padded up to the
+// next block, ending at two zero blocks (or simply at the end, since
+// plenty of writers omit them).
+fn tar_members(data: &[u8]) -> Vec<Member> {
+    let mut out = Vec::new();
+    let mut at = 0usize;
+    // GNU's answer to tar's 100-byte name field: an `L` entry whose
+    // *data* is the next entry's real name. Carried across one iteration.
+    let mut long_name: Option<String> = None;
+    while at + TAR_BLOCK <= data.len() {
+        let header = &data[at..at + TAR_BLOCK];
+        if header.iter().all(|b| *b == 0) {
+            break;
+        }
+        let size = octal_at(header, 124, 12);
+        let data_at = at + TAR_BLOCK;
+        // Padded up to the next block boundary, which is how the next
+        // header is found.
+        at = data_at + size.div_ceil(TAR_BLOCK as u64) as usize * TAR_BLOCK;
+        let typeflag = header[156];
+        if typeflag == b'L' {
+            long_name = data.get(data_at..data_at + size as usize).map(tar_string);
+            continue;
+        }
+        let name = match long_name.take() {
+            Some(name) => name,
+            None => {
+                // POSIX ustar splits a long path across `prefix` and
+                // `name`; a short one leaves the prefix empty.
+                let name = tar_string(&header[..100]);
+                match tar_string(&header[345..500]) {
+                    prefix if prefix.is_empty() => name,
+                    prefix => format!("{prefix}/{name}"),
+                }
+            }
+        };
+        if name.is_empty() {
+            continue;
+        }
+        // Everything that isn't a regular file or a directory -- links,
+        // devices, the pax/GNU metadata entries -- is skipped rather
+        // than shown: none of them has content a reader wants, and a
+        // `PaxHeader` entry in a listing is noise from the tool that
+        // wrote the archive, not part of what is in it.
+        let is_dir = typeflag == b'5' || name.ends_with('/');
+        if !is_dir && !matches!(typeflag, b'0' | 0) {
+            continue;
+        }
+        out.push(Member {
+            name: name.trim_end_matches('/').to_string(),
+            size: if is_dir { 0 } else { size },
+            is_dir,
+            method: TAR_STORED,
+            compressed_size: size,
+            local_offset: data_at as u64,
+            crc: 0,
+        });
+    }
+    out
+}
+
+// A NUL-terminated, NUL-padded field.
+fn tar_string(field: &[u8]) -> String {
+    let end = field.iter().position(|b| *b == 0).unwrap_or(field.len());
+    String::from_utf8_lossy(&field[..end]).trim().to_string()
+}
+
+// Tar's numbers are ASCII octal, space- or NUL-terminated.
+fn octal_at(header: &[u8], at: usize, len: usize) -> u64 {
+    let text = tar_string(&header[at..(at + len).min(header.len())]);
+    u64::from_str_radix(text.trim(), 8).unwrap_or(0)
+}
+
 fn read_file(path: &Path) -> Result<Vec<u8>, String> {
     // Read whole rather than seeking around it. A zip's central
     // directory is at the *end* and its members are at the front, so any
@@ -294,6 +455,9 @@ const LOCAL_SIG: u32 = 0x0403_4b50;
 const MAX_COMMENT: usize = u16::MAX as usize;
 
 fn members_of(data: &[u8]) -> Result<Vec<Member>, String> {
+    if is_tar(data) {
+        return Ok(tar_members(data));
+    }
     let eocd = find_eocd(data).ok_or("not a zip file (no end-of-central-directory record)")?;
     let count = u16::from_le_bytes([data[eocd + 10], data[eocd + 11]]) as usize;
     let offset = u32_at(data, eocd + 16)? as usize;
@@ -356,6 +520,13 @@ fn find_eocd(data: &[u8]) -> Option<usize> {
 fn extract(data: &[u8], member: &Member) -> Result<Vec<u8>, String> {
     if member.is_dir {
         return Err(format!("{}: is a directory", member.name));
+    }
+    // Tar stores its members whole and uncompressed, so a member *is* a
+    // slice -- `local_offset` is where its data starts rather than where
+    // a local header does.
+    if member.method == TAR_STORED {
+        let at = member.local_offset as usize;
+        return data.get(at..at + member.size as usize).map(|d| d.to_vec()).ok_or_else(|| "truncated tar member data".to_string());
     }
     let at = member.local_offset as usize;
     if u32_at(data, at)? != LOCAL_SIG {
@@ -569,5 +740,105 @@ mod real_world_tests {
             checked += 1;
         }
         assert!(checked > 0, "found no man pages to check against");
+    }
+
+    // A real tar, built by hand: one 512-byte header per member, data
+    // padded up to the next block.
+    fn tar_header(name: &str, size: u64, typeflag: u8) -> Vec<u8> {
+        let mut block = vec![0u8; 512];
+        block[..name.len()].copy_from_slice(name.as_bytes());
+        let octal = format!("{size:011o}\0");
+        block[124..124 + octal.len()].copy_from_slice(octal.as_bytes());
+        block[156] = typeflag;
+        block[257..262].copy_from_slice(b"ustar");
+        block
+    }
+
+    fn tar_of(entries: &[(&str, &str)]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for (name, body) in entries {
+            let is_dir = name.ends_with('/');
+            out.extend(tar_header(name, if is_dir { 0 } else { body.len() as u64 }, if is_dir { b'5' } else { b'0' }));
+            if !is_dir {
+                out.extend(body.as_bytes());
+                out.resize(out.len().div_ceil(512) * 512, 0);
+            }
+        }
+        out.extend(vec![0u8; 1024]);
+        out
+    }
+
+    #[test]
+    fn a_tar_lists_its_members() {
+        let data = tar_of(&[("a.txt", "alpha"), ("dir/", ""), ("dir/b.txt", "bravo")]);
+        assert!(is_tar(&data));
+        let members = members_of(&data).unwrap();
+        let names: Vec<&str> = members.iter().map(|m| m.name.as_str()).collect();
+        assert_eq!(names, vec!["a.txt", "dir", "dir/b.txt"]);
+        assert!(members[1].is_dir);
+        assert_eq!(members[0].size, 5);
+    }
+
+    #[test]
+    fn a_tar_member_extracts_whole() {
+        let data = tar_of(&[("a.txt", "alpha"), ("b.txt", "bravo")]);
+        let members = members_of(&data).unwrap();
+        assert_eq!(extract(&data, &members[1]).unwrap(), b"bravo");
+    }
+
+    // POSIX ustar splits a long path across `prefix` and `name`.
+    #[test]
+    fn a_ustar_prefix_is_joined_back_onto_the_name() {
+        let mut block = tar_header("deep.txt", 0, b'0');
+        let prefix = "a/very/long/path";
+        block[345..345 + prefix.len()].copy_from_slice(prefix.as_bytes());
+        let mut data = block;
+        data.extend(vec![0u8; 1024]);
+        assert_eq!(members_of(&data).unwrap()[0].name, "a/very/long/path/deep.txt");
+    }
+
+    // GNU's answer to the 100-byte name field: an `L` entry whose data
+    // is the *next* entry's real name.
+    #[test]
+    fn a_gnu_long_name_entry_names_the_member_after_it() {
+        let long = "x".repeat(140);
+        let mut data = tar_header("././@LongLink", long.len() as u64, b'L');
+        data.extend(long.as_bytes());
+        data.resize(data.len().div_ceil(512) * 512, 0);
+        data.extend(tar_header("truncated", 3, b'0'));
+        data.extend(b"abc");
+        data.resize(data.len().div_ceil(512) * 512, 0);
+        data.extend(vec![0u8; 1024]);
+        let members = members_of(&data).unwrap();
+        assert_eq!(members.len(), 1);
+        assert_eq!(members[0].name, long);
+    }
+
+    // Links, devices and the metadata entries tools write are not
+    // content anybody wants in a listing.
+    #[test]
+    fn entries_that_are_not_files_or_directories_are_skipped() {
+        let mut data = tar_header("link", 0, b'2');
+        data.extend(tar_header("real.txt", 1, b'0'));
+        data.extend(b"x");
+        data.resize(data.len().div_ceil(512) * 512, 0);
+        data.extend(vec![0u8; 1024]);
+        let members = members_of(&data).unwrap();
+        assert_eq!(members.iter().map(|m| m.name.as_str()).collect::<Vec<_>>(), vec!["real.txt"]);
+    }
+
+    #[test]
+    fn a_tar_directory_listing_is_synthesized_the_same_way_a_zips_is() {
+        let data = tar_of(&[("dir/b.txt", "bravo"), ("a.txt", "alpha")]);
+        let members = members_of(&data).unwrap();
+        let listed = list_dir(&members, "");
+        let root: Vec<&str> = listed.iter().map(|m| m.name.as_str()).collect();
+        assert_eq!(root, vec!["dir", "a.txt"], "the directory is derived even with no entry of its own");
+    }
+
+    #[test]
+    fn a_non_tar_is_not_mistaken_for_one() {
+        assert!(!is_tar(b"just some text that happens to be long enough to reach offset 257 if it kept going"));
+        assert!(!is_tar(&[0u8; 512]));
     }
 }

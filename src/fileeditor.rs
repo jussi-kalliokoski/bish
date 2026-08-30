@@ -93,11 +93,12 @@ pub(crate) fn compressed_bytes(path: &str) -> Option<Result<Vec<u8>, String>> {
     let as_path = std::path::Path::new(path);
     match crate::archive::kind_of(as_path) {
         Some(crate::archive::Kind::Gzip) => Some(crate::archive::gunzip(as_path).map(|(_, bytes)| bytes)),
-        // A zip names a directory of members, not content -- `e` browses
-        // it (repl::expand_browse_targets) rather than reaching here.
-        // `e --hex some.zip` does reach here, and wants the archive's own
-        // raw bytes, which is exactly what reading the file gives.
-        Some(crate::archive::Kind::Zip) | None => None,
+        // A zip or a tar names a directory of members, not content --
+        // `e` browses one (repl::expand_browse_targets) rather than
+        // reaching here. `e --hex some.zip` does reach here, and wants
+        // the archive's own raw bytes, which is what reading the file
+        // gives.
+        Some(crate::archive::Kind::Zip) | Some(crate::archive::Kind::Tar) | None => None,
     }
 }
 

@@ -964,7 +964,7 @@ fn canonical(path: &Path) -> Result<PathBuf, String> {
         return Ok(PathBuf::from(crate::archive::join(&archive, &inner)));
     }
     let real = std::fs::canonicalize(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    if crate::archive::kind_of(&real) == Some(crate::archive::Kind::Zip) {
+    if crate::archive::holds_members(&real) {
         return Ok(PathBuf::from(crate::archive::join(&real, "")));
     }
     Ok(real)
@@ -988,7 +988,7 @@ fn describe(path: PathBuf, name: String) -> Entry {
     // read per file on top of the two stats this already does, which is
     // fine for the directories a person browses and would be worth
     // revisiting only if listing something like /usr/bin ever felt slow.
-    let is_archive = !is_dir && crate::archive::kind_of(&path) == Some(crate::archive::Kind::Zip);
+    let is_archive = !is_dir && crate::archive::looks_like_archive(&path);
     Entry { name, path, is_dir, is_archive, is_symlink, is_exec, is_parent: false, is_ignored: false, size }
 }
 
