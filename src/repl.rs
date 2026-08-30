@@ -49,6 +49,11 @@ type SessionId = u32;
 struct SessionState {
     shell: Shell,
     buffer: String,
+    // Whether `buffer` is off the record -- see leading_space_suppresses
+    // _history. Decided on the first line of a fresh command and left
+    // alone by every continuation line, so a multi-line command begun
+    // with a leading space stays unrecorded in full.
+    buffer_unrecorded: bool,
     history: History,
     screen: Rc<RefCell<vt100::Screen>>,
     // Set once EOF has already warned this session about stopped jobs
@@ -413,6 +418,7 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
         SessionState {
             shell,
             buffer: String::new(),
+            buffer_unrecorded: false,
             history: History::load(".bish_history"),
             screen: root_screen,
             warned_stopped_jobs: false,
@@ -1049,6 +1055,13 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
                     // contain a literal `!`, and there's no "start of
                     // command" to anchor the leading-bang/child-shell
                     // case to partway through one anyway.
+                    // Same gate history expansion uses just below, and
+                    // for the same reason: this is a property of the
+                    // start of a command, and there is no such thing
+                    // partway through one.
+                    if session.buffer.is_empty() {
+                        session.buffer_unrecorded = starts_off_the_record(&line);
+                    }
                     let line = if session.buffer.is_empty() {
                         match history::expand(&line, &session.history) {
                             Ok(history::Expansion::Substituted(s)) => s,
@@ -1131,8 +1144,13 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
                                 // Recorded regardless of the exit status
                                 // the command ends up with -- bash and
                                 // fish both record what was typed, not
-                                // what succeeded.
-                                session.history.record(&session.buffer, Some(&cwd_before));
+                                // what succeeded. Unless it was typed
+                                // with a leading space, which is the one
+                                // way to ask for the opposite (see
+                                // starts_off_the_record).
+                                if !session.buffer_unrecorded {
+                                    session.history.record(&session.buffer, Some(&cwd_before));
+                                }
                                 // Every session sharing this one real
                                 // process (see new_virtual_child's own
                                 // doc comment on why "window new"/pane
@@ -1590,6 +1608,7 @@ fn run_edit_impl(targets: &[fileeditor::EditTarget], attach_debug: bool) -> i32 
         SessionState {
             shell,
             buffer: String::new(),
+            buffer_unrecorded: false,
             history: History::load(".bish_history"),
             screen: root_screen,
             warned_stopped_jobs: false,
@@ -2982,6 +3001,7 @@ fn apply_window_action(
                 SessionState {
                     shell: child_shell,
                     buffer: String::new(),
+                    buffer_unrecorded: false,
                     // A fork of the parent's own History (see its doc
                     // comment): the new window/pane's Up/Down includes
                     // everything the parent could already see, but from
@@ -3115,6 +3135,7 @@ fn split_focused_pane(
         SessionState {
             shell: child_shell,
             buffer: String::new(),
+            buffer_unrecorded: false,
             // See WindowAction::New's own comment on forking the
             // parent's History instead of starting from "now".
             history: child_history,
@@ -3185,6 +3206,7 @@ fn split_diagnostics_pane(
         SessionState {
             shell: child_shell,
             buffer: String::new(),
+            buffer_unrecorded: false,
             history: child_history,
             screen,
             warned_stopped_jobs: false,
@@ -3249,6 +3271,7 @@ fn split_debug_run_pane(
         SessionState {
             shell: child_shell,
             buffer: String::new(),
+            buffer_unrecorded: false,
             history: child_history,
             screen: screen.clone(),
             warned_stopped_jobs: false,
@@ -7380,6 +7403,7 @@ its decompressed text.
 | `:diag [clear]` | toggle the diagnostics pane |
 | `:dbg` | attach a read-only debug session (`:dbg help`) |
 | `:preview` | render this markdown buffer |
+| `:!CMD` | run a shell command; a space before the `!` keeps it out of history |
 | `:help` | this screen |
 "#;
 
@@ -7827,6 +7851,11 @@ fn run_command_mode(
 ) -> CommandModeOutcome {
     let mut editing = editing;
     let mut buffer = String::new();
+    // The colon line's own copy of the prompt's rule (see
+    // starts_off_the_record). `: !make` is remembered; `:` space `!make`
+    // runs and is forgotten -- and the space costs the bang nothing,
+    // since history::expand trims before it looks for one.
+    let mut buffer_unrecorded = false;
     let mut transcript_visible = false;
     // Set from `seed` on the very first iteration, or by Ctrl+Space
     // below (see that arm's own comment) on any later one -- consumed by
@@ -7954,6 +7983,9 @@ fn run_command_mode(
                 // `command <rest>` here instead of `(<rest>)` -- the
                 // same "force it to run as an external" escape hatch
                 // command mode already has, not a second one.
+                if buffer.is_empty() {
+                    buffer_unrecorded = starts_off_the_record(&line);
+                }
                 let line = if buffer.is_empty() {
                     match history::expand(&line, history) {
                         Ok(history::Expansion::Substituted(s)) => s,
@@ -8750,7 +8782,9 @@ fn run_command_mode(
                                 // (same reasoning its own read_line call
                                 // already uses for HighlightContext::default()
                                 // and a None completion provider).
-                                history.record(&buffer, None);
+                                if !buffer_unrecorded {
+                                    history.record(&buffer, None);
+                                }
                                 let (result, captured_text) = {
                                     let session = sessions.get_mut(&session_id).unwrap();
                                     let captured = Rc::new(RefCell::new(String::new()));
@@ -9196,6 +9230,24 @@ fn run_substitute(tb: &mut TextBuffer, cmd: &SubstituteCmd) -> Result<(usize, us
 // and would bypass the restriction entirely; function definitions would
 // leak a callable function out into normal shell mode later. Walked
 // recursively since these can be nested inside a control-flow body.
+// bash's `HISTCONTROL=ignorespace`, except always on, the way fish has
+// it -- there is no option here and none is planned. bash's default is
+// to record everything, which is a 1991 default nobody keeps; the
+// gesture is only useful if you can rely on it without having
+// configured anything first, and a shell that sometimes remembers your
+// password is worse than one that never does.
+//
+// Tab and space both count, since either is what a terminal produces
+// when someone deliberately indents a line to hide it.
+//
+// Decided on the *first* line of a fresh command only. A continuation
+// line's own leading whitespace is content -- a heredoc body's
+// indentation, most obviously -- and has nothing to say about whether
+// the command it belongs to should be remembered.
+fn starts_off_the_record(first_line: &str) -> bool {
+    first_line.starts_with([' ', '\t'])
+}
+
 fn command_mode_violation(prog: &Program) -> Option<&'static str> {
     prog.iter().find_map(|item| and_or_violation(&item.and_or))
 }
@@ -10054,6 +10106,7 @@ mod compositor_frame_output_tests {
         let mut session = SessionState {
             shell: exec::Shell::new(),
             buffer: String::new(),
+            buffer_unrecorded: false,
             history: History::load("/dev/null"),
             screen: screen.clone(),
             warned_stopped_jobs: false,
@@ -10389,5 +10442,20 @@ mod substitute_command_tests {
         let (subs, lines) = run_substitute(&mut buf, &parsed).unwrap();
         assert_eq!((subs, lines), (2, 1));
         assert_eq!(text_of(&buf), "dog dog\ndog");
+    }
+
+    // The rule itself. That it is consulted only on a fresh command's
+    // first line is the two call sites' own job -- both share the gate
+    // history expansion already uses.
+    #[test]
+    fn a_leading_space_or_tab_keeps_a_command_off_the_record() {
+        assert!(starts_off_the_record(" echo secret"));
+        assert!(starts_off_the_record("\techo secret"));
+        assert!(starts_off_the_record("  !make"), "spacebang, the case command mode cares about");
+        assert!(!starts_off_the_record("echo remembered"));
+        assert!(!starts_off_the_record("!make"));
+        assert!(!starts_off_the_record(""));
+        // Trailing and interior whitespace say nothing about it.
+        assert!(!starts_off_the_record("echo a  b "));
     }
 }
