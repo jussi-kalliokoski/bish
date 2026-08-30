@@ -521,6 +521,53 @@ fn write_pretty(out: &mut String, v: &Value, indent: usize) {
 // exactly (matching how every JSON value this shape actually came from
 // -- an integer field in the source -- would have looked to begin
 // with), the ordinary float rendering otherwise.
+/// `pretty_print`'s sibling: the same value with no whitespace at all
+/// between tokens. Shares `write_json_string`/`write_number` with it, so
+/// the two can only ever disagree about layout, never about escaping or
+/// how a whole number renders.
+///
+/// Exists for JSON that is a *message* rather than something a person
+/// reads -- a JSON-RPC body on a language server's stdin, where the
+/// framing header is a byte count of exactly this string and the
+/// indentation would be pure overhead on every keystroke's worth of
+/// document sync.
+pub fn compact_print(v: &Value) -> String {
+    let mut out = String::new();
+    write_compact(&mut out, v);
+    out
+}
+
+fn write_compact(out: &mut String, v: &Value) {
+    match v {
+        Value::Null => out.push_str("null"),
+        Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+        Value::Number(n) => write_number(out, *n),
+        Value::Str(s) => write_json_string(out, s),
+        Value::Array(items) => {
+            out.push('[');
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                write_compact(out, item);
+            }
+            out.push(']');
+        }
+        Value::Object(fields) => {
+            out.push('{');
+            for (i, (k, val)) in fields.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                write_json_string(out, k);
+                out.push(':');
+                write_compact(out, val);
+            }
+            out.push('}');
+        }
+    }
+}
+
 fn write_number(out: &mut String, n: f64) {
     if n.fract() == 0.0 && n.abs() < 1e15 {
         let _ = write!(out, "{}", n as i64);
@@ -626,6 +673,33 @@ fn field<'a>(v: &'a Value, key: &str) -> &'a Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compact_print_writes_no_whitespace_and_reparses_to_the_same_value() {
+        let src = r#"{"a":[1,2.5,null,true],"b":{"c":"x"},"d":{},"e":[]}"#;
+        let value = parse(src).unwrap();
+        let out = compact_print(&value);
+        // Field order is preserved (Value::Object is a Vec), so a
+        // round trip through a compact write is byte-identical to a
+        // source that already had no whitespace.
+        assert_eq!(out, src);
+        assert_eq!(parse(&out).unwrap(), value);
+    }
+
+    #[test]
+    fn compact_print_escapes_exactly_as_pretty_print_does() {
+        // The one property that actually matters for a wire format:
+        // whatever is in a string survives, and the two writers cannot
+        // disagree about it because they share the same escaper.
+        let nasty = Value::Object(vec![(
+            "k\u{1}\"\\\n".to_string(),
+            Value::Str("tab\there\u{7f}\u{1f600}".to_string()),
+        )]);
+        let compact = compact_print(&nasty);
+        assert_eq!(parse(&compact).unwrap(), nasty);
+        assert_eq!(parse(&pretty_print(&nasty)).unwrap(), nasty);
+        assert!(!compact.contains('\n'), "a literal newline would break a Content-Length body: {compact:?}");
+    }
 
     fn kinds(input: &str) -> Vec<TokenKind> {
         tokens(input).into_iter().map(|t| t.kind).collect()

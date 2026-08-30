@@ -24,6 +24,7 @@ mod inflate;
 mod ini;
 mod json;
 mod lexer;
+mod lsp;
 mod markdown;
 mod pager;
 mod parser;
