@@ -456,6 +456,19 @@ pub trait DebugHook {
     fn on_statement(&mut self, line: usize, depth: DebugDepth, shell: &mut Shell) -> DebugAction;
 }
 
+/// One window, as the `window` builtin sees it. A flat snapshot rather
+/// than a borrow of the real thing: `exec.rs` has no access to
+/// `repl.rs`'s window state and shouldn't grow one (see
+/// `ExecResult::Window`), and everything `ls` prints is a plain value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WindowInfo {
+    pub id: u32,
+    pub name: Option<String>,
+    pub cwd: String,
+    pub panes: usize,
+    pub current: bool,
+}
+
 // What repl.rs should do in response to a `window`-family command -- see
 // ExecResult::Window's doc comment for why this travels as a bubbled
 // signal instead of direct shared-state mutation.
@@ -469,23 +482,12 @@ pub enum WindowAction {
     /// `window rename [NAME]` -- the current window. No name clears it
     /// back to showing the cwd, which is what an unnamed window shows.
     Rename(Option<String>),
-    /// `window ls`: one tab-separated line per window, for a caller that
-    /// is a shell function rather than a person.
-    ///
-    /// Known limit: **not capturable in `$(...)`**. Every window action
-    /// is applied by the repl loop *after* the command returns (see this
-    /// enum's own doc comment on why it can't mutate that state from
-    /// here), and a command substitution's own shell has no window
-    /// manager behind it -- so the listing goes to the session's output,
-    /// where a person reads it, and a substitution gets nothing. Naming
-    /// and `select` are what a script actually needs, and both work.
-    List,
-    /// `window select NAME|ID` -- **exit status 1 when there is no such
-    /// window**, which is the whole point of it. That is what lets a
-    /// config function say `window select work || window c --name work`
-    /// and get "attach if it's there, set it up if it isn't" out of one
-    /// line.
-    Select(String),
+    /// `::bish window select NAME|ID`. Only ever produced once the
+    /// target has been found in `Shell::windows` -- a miss is an
+    /// ordinary failing builtin (status 1) rather than an action,
+    /// which is what makes `select || create` work inside a function,
+    /// a subshell or an `if`.
+    Select(usize),
     Next,
     Previous,
     Close,
@@ -864,6 +866,16 @@ pub struct Shell {
     /// from `bish script.sh`, where nothing would ever act on it and
     /// `run_program` would take it for a signal and stop early.
     pub windows_available: bool,
+    /// What windows currently exist, refreshed by the repl loop before
+    /// every command -- the same owned-snapshot pattern `cwd`,
+    /// `known_functions` and the completion context already use.
+    ///
+    /// This is what lets `window ls` be an ordinary builtin that writes
+    /// to its own sink instead of an action the repl applies afterwards,
+    /// and so what makes `$(window ls)` capture anything at all. Cloned
+    /// into a virtual child, so a substitution or a subshell sees the
+    /// same list its parent does.
+    pub windows: Vec<WindowInfo>,
     // Mirrors the OS process's real cwd, kept in sync by run_cd/run_pushd/
     // run_popd (which still delegate the actual directory change to
     // std::env::set_current_dir -- this field doesn't yet let a session
@@ -1045,6 +1057,7 @@ impl Shell {
             restrict_to_builtins: false,
             promoted: Rc::new(Cell::new(false)),
             windows_available: false,
+            windows: Vec::new(),
             cwd: std::env::current_dir().unwrap_or_default(),
             sink: OutputSink::Real,
             real_output_needs_newline: std::cell::Cell::new(false),
@@ -1274,6 +1287,7 @@ impl Shell {
             restrict_to_builtins: false,
             promoted: self.promoted.clone(),
             windows_available: self.windows_available,
+            windows: self.windows.clone(),
             cwd: self.cwd.clone(),
             sink: OutputSink::Real,
             real_output_needs_newline: std::cell::Cell::new(false),
@@ -2889,16 +2903,23 @@ impl Shell {
     // "this is bish's own thing," the same spirit as `set -o` bundling
     // bash's own less-common toggles under one name instead of each
     // getting its own builtin.
-    fn run_bish(&mut self, args: &[String]) -> i32 {
+    fn run_bish(&mut self, args: &[String]) -> ExecResult {
         match args {
-            [sub, rest @ ..] if sub == "theme" => self.run_bish_theme(rest),
+            [sub, rest @ ..] if sub == "theme" => ExecResult::Status(self.run_bish_theme(rest)),
+            // The canonical spelling of the window manager. `window`/
+            // `win` survive only as *command-mode* aliases (see
+            // run_single's own arm): a top-level builtin called `window`
+            // shadows any real `window` on `$PATH` for every script that
+            // runs under bish, and this namespace exists precisely for
+            // bish-specific commands that shouldn't spend a common word.
+            [sub, rest @ ..] if sub == "window" || sub == "win" => self.run_window(rest),
             [] => {
-                sh_eprintln!(self, "bish: ::bish: missing subcommand (expected: theme)");
-                2
+                sh_eprintln!(self, "bish: ::bish: missing subcommand (expected: theme, window)");
+                ExecResult::Status(2)
             }
             [other, ..] => {
-                sh_eprintln!(self, "bish: ::bish: unknown subcommand '{other}' (expected: theme)");
-                2
+                sh_eprintln!(self, "bish: ::bish: unknown subcommand '{other}' (expected: theme, window)");
+                ExecResult::Status(2)
             }
         }
     }
@@ -3491,7 +3512,22 @@ impl Shell {
     // mutation happens in repl.rs, reached via the bubbled-up
     // ExecResult::Window signal (see that variant's doc comment for why
     // this can't just mutate shared state directly from here).
+    // `::bish window ...` (and command mode's `window` alias). The
+    // read-only subcommands answer from `Shell::windows` right here; the
+    // rest bubble an action up to repl.rs -- and only where something is
+    // actually there to act on it, since `ExecResult::Window` is a
+    // signal `run_program` stops on and letting one escape from `bish
+    // script.sh` would end the script for no reason.
     fn run_window(&mut self, args: &[String]) -> ExecResult {
+        let result = self.run_window_inner(args);
+        if matches!(result, ExecResult::Window(_)) && !self.windows_available && !self.restrict_to_builtins {
+            sh_eprintln!(self, "bish: ::bish window: no window manager here (this needs an interactive bish)");
+            return ExecResult::Status(1);
+        }
+        result
+    }
+
+    fn run_window_inner(&mut self, args: &[String]) -> ExecResult {
         fn parse_window_name(shell: &mut Shell, subcommand: &str, rest: &[String]) -> Result<Option<String>, i32> {
             match rest.first().map(String::as_str) {
                 None => Ok(None),
@@ -3524,9 +3560,37 @@ impl Shell {
                 None => ExecResult::Window(WindowAction::Rename(None)),
                 Some(_) => ExecResult::Window(WindowAction::Rename(Some(args[1..].join(" ")))),
             },
-            Some("ls") | Some("list") => ExecResult::Window(WindowAction::List),
+            // The two that only *read*. Both answer from
+            // `Shell::windows`, which means both behave like any other
+            // builtin: `ls` writes to whatever sink it has (so
+            // `$(window ls)` captures it) and `select` fails
+            // synchronously (so `select || create` works in a function,
+            // a subshell or an `if`).
+            Some("ls") | Some("list") => {
+                for w in &self.windows.clone() {
+                    let name = w.name.clone().unwrap_or_default();
+                    let current = if w.current { "*" } else { "" };
+                    sh_println!(self, "{}\t{name}\t{}\t{}\t{current}", w.id, w.cwd, w.panes);
+                }
+                ExecResult::Status(0)
+            }
             Some("select") | Some("sel") => match args.get(1) {
-                Some(target) => ExecResult::Window(WindowAction::Select(target.clone())),
+                Some(target) => {
+                    // A name first, an id second: a name is what a config
+                    // function knows, an id is what it falls back to.
+                    let found = self
+                        .windows
+                        .iter()
+                        .position(|w| w.name.as_deref() == Some(target.as_str()))
+                        .or_else(|| self.windows.iter().position(|w| w.id.to_string() == *target));
+                    match found {
+                        Some(index) => ExecResult::Window(WindowAction::Select(index)),
+                        None => {
+                            sh_eprintln!(self, "bish: window: select: no window named '{target}'");
+                            ExecResult::Status(1)
+                        }
+                    }
+                }
                 None => {
                     sh_eprintln!(self, "bish: window: select: usage: window select <name>|<id>");
                     ExecResult::Status(2)
@@ -5747,25 +5811,25 @@ impl Shell {
             // level builtin name (see run_bish's own doc comment for
             // why) -- `theme` (begin/end a theme declaration) is the
             // first subcommand.
-            "::bish" => return ExecResult::Status(self.run_bish(&argv[1..])),
+            "::bish" => return self.run_bish(&argv[1..]),
             "compgen" => return ExecResult::Status(self.run_compgen(&argv[1..])),
             "complete" => return ExecResult::Status(self.run_complete(&argv[1..])),
             "compopt" => return ExecResult::Status(self.run_compopt(&argv[1..])),
             // Available in command mode, and at any prompt a real window
-            // manager is behind (`windows_available`). It used to be
-            // command-mode-exclusive; that was right while `window` was
-            // a gesture you made by hand, and wrong the moment it grew
-            // names and `select`, since the point of those is to be
-            // called from a shell function in your config. With both
-            // guards false the arm doesn't match and `window` falls
-            // through to the same external lookup any other unrecognized
-            // name would hit -- which is what keeps `bish script.sh`,
-            // where nothing could act on the result, out of it.
+            // manager is behind. It used to be
+            // command-mode-exclusive and is again, but for a better
+            // reason than before: `::bish window` is the canonical
+            // spelling everywhere else. A top-level builtin called
+            // `window` shadows any real `window` on `$PATH` for every
+            // script run under bish, which is a lot to charge for a
+            // shorter name. The colon line is the one place the short
+            // form costs nothing -- it runs builtins exclusively, so
+            // there is no external there for it to shadow.
             // "w" deliberately isn't an alias here (unlike "win") -- it's
             // reserved for a future vim-style `:w` write command instead,
             // matching bishedit's normal-mode Ctrl-W leader now covering
             // window management directly (see vimkeys.rs's WindowCmd).
-            "window" | "win" if self.restrict_to_builtins || self.windows_available => {
+            "window" | "win" if self.restrict_to_builtins => {
                 return self.run_window(&argv[1..]);
             }
             "pushd" => return ExecResult::Status(self.run_pushd(&argv[1..])),
@@ -11499,10 +11563,10 @@ mod tests {
     #[test]
     fn bish_theme_declares_a_named_theme_without_applying_its_opts_live() {
         let mut shell = Shell::new();
-        assert_eq!(shell.run_bish(&strs(&["theme", "begin"])), 0);
+        assert_eq!(shell.run_bish(&strs(&["theme", "begin"])).status(), 0);
         assert_eq!(shell.run_bishopt(&strs(&["--set", "theme", "dark"]), KNOWN_BISHOPTS), 0);
         assert_eq!(shell.run_bishopt(&strs(&["--set", "accent", "blue"]), &test_bishopts()), 0);
-        assert_eq!(shell.run_bish(&strs(&["theme", "end"])), 0);
+        assert_eq!(shell.run_bish(&strs(&["theme", "end"])).status(), 0);
 
         // Neither "theme" nor "accent" was actually applied live -- both
         // still read as whatever they were before the declaration.
@@ -11517,9 +11581,9 @@ mod tests {
     #[test]
     fn bish_theme_end_without_ever_naming_it_discards_the_whole_declaration() {
         let mut shell = Shell::new();
-        shell.run_bish(&strs(&["theme", "begin"]));
+        shell.run_bish(&strs(&["theme", "begin"])).status();
         shell.run_bishopt(&strs(&["--set", "accent", "blue"]), &test_bishopts());
-        assert_eq!(shell.run_bish(&strs(&["theme", "end"])), 0);
+        assert_eq!(shell.run_bish(&strs(&["theme", "end"])).status(), 0);
         assert!(shell.themes.is_empty(), "no name was ever declared, so nothing should be registered");
         assert_eq!(shell.bishopt_value(&test_bishopts(), "accent"), Some(BishOptValue::Color("red".to_string(), vec![crate::csscolor::TermColor::Rgba(crate::csscolor::Rgba::new(255, 0, 0, 255))])), "still not applied live either");
     }
@@ -11527,10 +11591,10 @@ mod tests {
     #[test]
     fn activating_a_declared_theme_makes_its_opts_the_new_fallback_default() {
         let mut shell = Shell::new();
-        shell.run_bish(&strs(&["theme", "begin"]));
+        shell.run_bish(&strs(&["theme", "begin"])).status();
         shell.run_bishopt(&strs(&["--set", "theme", "dark"]), KNOWN_BISHOPTS);
         shell.run_bishopt(&strs(&["--set", "accent", "blue"]), &test_bishopts());
-        shell.run_bish(&strs(&["theme", "end"]));
+        shell.run_bish(&strs(&["theme", "end"])).status();
 
         // Registering "dark" doesn't activate it by itself.
         assert_eq!(shell.bishopt_value(&test_bishopts(), "accent"), Some(BishOptValue::Color("red".to_string(), vec![crate::csscolor::TermColor::Rgba(crate::csscolor::Rgba::new(255, 0, 0, 255))])));
@@ -11548,38 +11612,38 @@ mod tests {
     #[test]
     fn bish_theme_begin_refuses_to_nest() {
         let mut shell = Shell::new();
-        assert_eq!(shell.run_bish(&strs(&["theme", "begin"])), 0);
-        assert_eq!(shell.run_bish(&strs(&["theme", "begin"])), 1, "a second begin while one is already in progress must be refused");
+        assert_eq!(shell.run_bish(&strs(&["theme", "begin"])).status(), 0);
+        assert_eq!(shell.run_bish(&strs(&["theme", "begin"])).status(), 1, "a second begin while one is already in progress must be refused");
         // The original declaration must still be intact -- a set right
         // after the refused nested begin still lands in it.
         shell.run_bishopt(&strs(&["--set", "theme", "t"]), KNOWN_BISHOPTS);
-        shell.run_bish(&strs(&["theme", "end"]));
+        shell.run_bish(&strs(&["theme", "end"])).status();
         assert!(shell.themes.contains_key("t"));
     }
 
     #[test]
     fn bish_theme_end_without_a_begin_is_an_error() {
         let mut shell = Shell::new();
-        assert_eq!(shell.run_bish(&strs(&["theme", "end"])), 1);
+        assert_eq!(shell.run_bish(&strs(&["theme", "end"])).status(), 1);
     }
 
     #[test]
     fn bish_unset_still_applies_live_even_mid_declaration() {
         let mut shell = Shell::new();
         shell.run_bishopt(&strs(&["--set", "accent", "blue"]), &test_bishopts());
-        shell.run_bish(&strs(&["theme", "begin"]));
+        shell.run_bish(&strs(&["theme", "begin"])).status();
         assert_eq!(shell.run_bishopt(&strs(&["--unset", "accent"]), &test_bishopts()), 0);
-        shell.run_bish(&strs(&["theme", "end"]));
+        shell.run_bish(&strs(&["theme", "end"])).status();
         assert_eq!(shell.bishopt_value(&test_bishopts(), "accent"), Some(BishOptValue::Color("red".to_string(), vec![crate::csscolor::TermColor::Rgba(crate::csscolor::Rgba::new(255, 0, 0, 255))])), "--unset must not have been diverted into the pending theme");
     }
 
     #[test]
     fn bish_and_bish_theme_reject_unknown_subcommands() {
         let mut shell = Shell::new();
-        assert_eq!(shell.run_bish(&strs(&["nonsense"])), 2);
-        assert_eq!(shell.run_bish(&strs(&[])), 2);
-        assert_eq!(shell.run_bish(&strs(&["theme", "nonsense"])), 2);
-        assert_eq!(shell.run_bish(&strs(&["theme"])), 2);
+        assert_eq!(shell.run_bish(&strs(&["nonsense"])).status(), 2);
+        assert_eq!(shell.run_bish(&strs(&[])).status(), 2);
+        assert_eq!(shell.run_bish(&strs(&["theme", "nonsense"])).status(), 2);
+        assert_eq!(shell.run_bish(&strs(&["theme"])).status(), 2);
     }
 
     #[test]

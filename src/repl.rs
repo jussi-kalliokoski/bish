@@ -417,8 +417,9 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
     // default. See term::ignore_sigint's doc comment.
     term::ignore_sigint();
     exec::install_winch_handler();
-    // This loop *is* the window manager, so the `window` builtin means
-    // something at its prompts -- see Shell::windows_available.
+    // This loop *is* the window manager, so `::bish window`'s
+    // action-producing subcommands mean something at its prompts -- see
+    // Shell::windows_available.
     shell.windows_available = true;
     // Real bash enables job control automatically for an interactive
     // shell -- see Shell::enable_monitor_mode's own doc comment.
@@ -3155,32 +3156,10 @@ fn apply_window_action(
         // window, a way to see what is there, and a way to ask for one
         // back -- see WindowAction's own doc comments.
         WindowAction::Rename(name) => windows[*current_window].name = name,
-        WindowAction::List => {
-            let listing = window_listing(sessions, windows, *current_window);
-            if let Some(session) = sessions.get(&windows[*current_window].owning_session()) {
-                session.shell.sink_out(&listing);
-            }
-        }
-        WindowAction::Select(target) => {
-            let found = windows.iter().position(|w| w.name.as_deref() == Some(target.as_str()))
-                // A name first, an id second: names are what a config
-                // function knows, ids are what it falls back to.
-                .or_else(|| windows.iter().position(|w| w.id.to_string() == target));
-            match found {
-                Some(index) => *current_window = index,
-                // The status is the whole point: `window select work ||
-                // window c --name work` is "attach if it's there, set it
-                // up if it isn't", in one line.
-                None => {
-                    if let Some(session) = sessions.get(&windows[*current_window].owning_session()) {
-                        session.shell.sink_err(&format!("bish: window: select: no window named '{target}'\n"));
-                    }
-                    if let Some(session) = sessions.get_mut(&windows[*current_window].owning_session()) {
-                        session.shell.last_status = 1;
-                    }
-                }
-            }
-        }
+        // `select` is resolved in the builtin against Shell::windows, so
+        // by the time one reaches here the index is known good -- a miss
+        // never gets this far, it is an ordinary failing command.
+        WindowAction::Select(index) => *current_window = index.min(windows.len().saturating_sub(1)),
         WindowAction::Close => {
             if windows[*current_window].stack().len() > 1 {
                 // Popping a frame off the focused pane's own stack, not
@@ -4171,6 +4150,14 @@ fn service_background_jobs(
     // up.
     for window in windows.iter_mut() {
         refresh_divider_budget(sessions, window);
+    }
+    // ...and the window list every session's `window` builtin reads.
+    // Built once from an immutable borrow, then handed to each session,
+    // so `window ls`/`select` answer about the windows that exist right
+    // now rather than about whatever they last heard.
+    let snapshot = window_snapshot(sessions, windows, skip_window);
+    for session in sessions.values_mut() {
+        session.shell.windows = snapshot.clone();
     }
 
     // A plain no-op unless this process is running as a `bish session`
@@ -7557,28 +7544,27 @@ fn tab_bar_line(sessions: &HashMap<SessionId, SessionState>, windows: &[WindowEn
     render_tab_bar(&tab_bar_snapshot(sessions, windows, current_window))
 }
 
-// `window ls`: one tab-separated line per window -- id, name (empty when
-// unnamed), cwd, pane count, and `*` for the current one.
-//
-// Tab-separated and stable rather than aligned and pretty, because the
-// caller this exists for is a shell function: `window ls | cut -f2`
-// should be a sensible thing to write. The `*` is its own column for the
-// same reason -- a marker glued to the id would have to be stripped
-// before the id could be used.
-fn window_listing(sessions: &HashMap<SessionId, SessionState>, windows: &[WindowEntry], current_window: usize) -> String {
+// The window list as the `window` builtin sees it -- pushed into every
+// session's Shell before a command runs, so `window ls` and `window
+// select` are ordinary builtins reading a snapshot rather than actions
+// the repl applies afterwards. That is the difference between
+// `$(window ls)` capturing the listing and capturing nothing.
+fn window_snapshot(sessions: &HashMap<SessionId, SessionState>, windows: &[WindowEntry], current_window: usize) -> Vec<exec::WindowInfo> {
     let home = std::env::var("HOME").unwrap_or_default();
-    let mut out = String::new();
-    for (i, window) in windows.iter().enumerate() {
-        let cwd = sessions
-            .get(&window.owning_session())
-            .map(|s| prompt::shorten_path(&s.shell.cwd.to_string_lossy(), &home))
-            .unwrap_or_default();
-        let name = window.name.clone().unwrap_or_default();
-        let panes = window.panes.len();
-        let current = if i == current_window { "*" } else { "" };
-        out.push_str(&format!("{}\t{name}\t{cwd}\t{panes}\t{current}\n", window.id));
-    }
-    out
+    windows
+        .iter()
+        .enumerate()
+        .map(|(i, window)| exec::WindowInfo {
+            id: window.id,
+            name: window.name.clone(),
+            cwd: sessions
+                .get(&window.owning_session())
+                .map(|s| prompt::shorten_path(&s.shell.cwd.to_string_lossy(), &home))
+                .unwrap_or_default(),
+            panes: window.panes.len(),
+            current: i == current_window,
+        })
+        .collect()
 }
 
 // The visible text of one tab's own segment -- shared by render_tab_bar
