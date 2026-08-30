@@ -1677,13 +1677,61 @@ fn render_gutter(out: &mut String, buf: &TextBuffer, starts: &[usize], line: usi
 //
 // Measured across the whole file, because a column that changed width
 // as you scrolled would be worse than no alignment at all. That is a
-// pass over every line per redraw; it is the same order as
-// `buffer_highlight_spans` already costs, and like that one it is worth
-// caching only once someone can feel it.
+// pass over every line per redraw -- and for markdown a whole parse of
+// the document on top, though that is the same parse
+// `buffer_highlight_spans` already runs for the same buffer on the same
+// redraw. Like that one, worth caching only once someone can feel it.
 pub(crate) fn tabular_layout(buf: &TextBuffer) -> Option<crate::bishedit::tabular::Layout> {
-    let delimiter = buf.tabular.filter(|_| !buf.wrap.wrap)?;
+    let style = buf.tabular.filter(|_| !buf.wrap.wrap)?;
     let lines: Vec<Vec<char>> = (0..buf.line_count()).map(|l| buf.line_chars(l)).collect();
-    Some(crate::bishedit::tabular::measure(lines.iter().map(|l| l.as_slice()), delimiter))
+    let lines: Vec<&[char]> = lines.iter().map(|l| l.as_slice()).collect();
+    match table_regions(buf) {
+        Some(regions) => Some(crate::bishedit::tabular::measure_regions(&lines, style, &regions)),
+        None => Some(crate::bishedit::tabular::measure(&lines, style)),
+    }
+}
+
+// Which lines of a markdown buffer are table rows, as line ranges.
+// `None` for every other language, meaning "the whole file is one
+// table" -- true of a `.csv`, where there is nothing else in the file.
+//
+// A markdown document is the other shape: most of it is prose that must
+// not be touched, and two tables in it are unrelated and must not be
+// aligned to each other. Asking the real parser rather than
+// pattern-matching lines for pipes is what keeps a pipe inside a fenced
+// code block, or in a line of prose, from being mistaken for a column.
+fn table_regions(buf: &TextBuffer) -> Option<Vec<std::ops::Range<usize>>> {
+    if language_of(buf) != "markdown" {
+        return None;
+    }
+    let text = buf.text();
+    let doc = crate::markdown::parse(&text);
+    let mut spans = Vec::new();
+    collect_table_spans(&doc.blocks, &mut spans);
+
+    // Byte offsets to line numbers, in one pass over the starts.
+    let mut starts = vec![0usize];
+    starts.extend(text.char_indices().filter(|(_, c)| *c == '\n').map(|(i, _)| i + 1));
+    let line_of = |offset: usize| starts.partition_point(|s| *s <= offset).saturating_sub(1);
+    Some(spans.into_iter().map(|s| line_of(s.start)..line_of(s.end.saturating_sub(1)) + 1).collect())
+}
+
+// Tables can sit inside a block quote or a list item, so this walks the
+// whole tree rather than only the top level.
+fn collect_table_spans(blocks: &[crate::markdown::Block], out: &mut Vec<std::ops::Range<usize>>) {
+    use crate::markdown::Block;
+    for block in blocks {
+        match block {
+            Block::Table(t) => out.push(t.span.clone()),
+            Block::BlockQuote { blocks, .. } => collect_table_spans(blocks, out),
+            Block::List(list) => {
+                for item in &list.items {
+                    collect_table_spans(&item.blocks, out);
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 // One line as it will be drawn: its own characters plus whatever padding
@@ -1696,7 +1744,7 @@ pub(crate) fn display_row(
 ) -> crate::bishedit::tabular::Row {
     let chars = buf.line_chars(line);
     match layout {
-        Some(layout) => crate::bishedit::tabular::row(&chars, layout),
+        Some(layout) => crate::bishedit::tabular::row(&chars, line, layout),
         None => crate::bishedit::tabular::Row::plain(&chars),
     }
 }
@@ -4100,7 +4148,7 @@ mod pre_save_hook_tests {
         let mut buf = TextBuffer::open(std::path::Path::new("/tmp/bish-tabular-test.csv"), 10).unwrap();
         buf.insert_text((0, 0), text);
         buf.set_cursor(0, 0);
-        buf.tabular = Some(',');
+        buf.tabular = crate::bishedit::tabular::style("csv");
         buf
     }
 

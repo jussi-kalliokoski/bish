@@ -10546,7 +10546,7 @@ const KNOWN_BISHOPTS: &[(&str, BishOptDefault)] = &[
     //
     // `*` by default, and that is not the same as "on for everything":
     // a language with no tabular form of its own is simply left alone
-    // (bishedit::tabular::delimiter says which have one), so matching
+    // (bishedit::tabular::style says which have one), so matching
     // everything means "wherever this is implemented, use it".
     ("tabular", BishOptDefault::Str("*")),
 ];

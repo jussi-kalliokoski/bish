@@ -90,7 +90,7 @@ pub struct TextBuffer {
     // glob matches. `None` for everything else, which is almost every
     // buffer. A *display* setting like `wrap`: the text is untouched,
     // only where padding is drawn between it changes.
-    pub tabular: Option<char>,
+    pub tabular: Option<crate::bishedit::tabular::Style>,
     // Which visual row of `vtop`'s own line the viewport starts at. Only
     // ever non-zero with wrapping on, and only for a line tall enough to
     // exceed the pane by itself -- without it, a minified file would
