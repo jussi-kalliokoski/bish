@@ -15,6 +15,7 @@ pub mod motion;
 pub mod registers;
 pub mod snippet;
 pub mod suggestion;
+pub mod tabular;
 pub mod textbuffer;
 pub mod undo;
 pub mod unicode_width;

@@ -25,7 +25,7 @@ use crate::bishedit::registers::{RegisterShape, RegisterValue, Registers};
 use crate::bishedit::snippet::{self, Abbr, LiveSnippet, Snippet, SnippetHost};
 use crate::bishedit::textbuffer;
 use crate::bishedit::textbuffer::TextBuffer;
-use crate::bishedit::unicode_width::{char_at_col, char_width, col_of};
+use crate::bishedit::unicode_width::char_width;
 use crate::bishedit::vimkeys::{InsertCmd, Op, SurroundTarget, VimKeys, INDENT_WIDTH};
 use crate::bishedit::Buffer;
 use crate::editor::{self, Key};
@@ -215,7 +215,10 @@ pub(crate) fn scroll_to_show_cursor(buf: &mut TextBuffer, content_cols: usize) {
     } else if line >= buf.viewport_top() + height {
         buf.set_viewport_top(line + 1 - height);
     }
-    let cursor_col = col_of(&buf.line_chars(line), col);
+    // In drawn columns, so a tabular file scrolls by what is on screen
+    // rather than by how many characters the line happens to hold.
+    let display = display_row(buf, line, tabular_layout(buf).as_ref());
+    let cursor_col = col_at_cell(&display.cells, display.cell_of[col.min(buf.line_len(line))]);
     let width = content_cols.max(1);
     // `sidescrolloff`: keep this many columns visible either side of the
     // cursor rather than letting it sit against the edge. Capped at half
@@ -316,15 +319,21 @@ pub(crate) fn position_at_screen(buf: &TextBuffer, rect: Rect, row0: usize, col0
     let line = visual.line;
     let x = (col0 - rect.col).saturating_sub(gutter);
     let chars = buf.line_chars(line);
-    let col = if buf.wrap.wrap {
+    let display = display_row(buf, line, tabular_layout(buf).as_ref());
+    let cell = if buf.wrap.wrap {
         // Within a wrapped row, the click is an offset into that row's
         // own segment, past the continuation prefix.
         let into = x.saturating_sub(visual.seg.indent);
-        let base = col_of(&chars, visual.seg.start);
-        char_at_col(&chars, base + into).min(visual.seg.end.saturating_sub(1).max(visual.seg.start))
+        let base = col_at_cell(&display.cells, display.cell_of[visual.seg.start.min(chars.len())]);
+        cell_at_col(&display.cells, base + into)
     } else {
-        char_at_col(&chars, buf.viewport_left() + x)
+        cell_at_col(&display.cells, buf.viewport_left() + x)
     };
+    // A click landing on padding belongs to the character it was
+    // inserted after -- padding is not part of the file, so there is
+    // nothing else it could mean.
+    let col = source_at_or_before(&display, cell);
+    let col = if buf.wrap.wrap { col.min(visual.seg.end.saturating_sub(1).max(visual.seg.start)) } else { col };
     // Normal mode's cursor can never sit past a line's last character
     // (see run_insert_mode's own exit clamp for the same rule), so an
     // overshooting click lands on it instead.
@@ -1660,6 +1669,91 @@ fn render_gutter(out: &mut String, buf: &TextBuffer, starts: &[usize], line: usi
     }
 }
 
+// This buffer's column layout, or `None` when it has no tabular form --
+// which covers almost every buffer, and every buffer while wrapping is
+// on (the two are different answers to "this line is wider than the
+// pane", and running both at once would align columns that have been
+// broken across rows).
+//
+// Measured across the whole file, because a column that changed width
+// as you scrolled would be worse than no alignment at all. That is a
+// pass over every line per redraw; it is the same order as
+// `buffer_highlight_spans` already costs, and like that one it is worth
+// caching only once someone can feel it.
+pub(crate) fn tabular_layout(buf: &TextBuffer) -> Option<crate::bishedit::tabular::Layout> {
+    let delimiter = buf.tabular.filter(|_| !buf.wrap.wrap)?;
+    let lines: Vec<Vec<char>> = (0..buf.line_count()).map(|l| buf.line_chars(l)).collect();
+    Some(crate::bishedit::tabular::measure(lines.iter().map(|l| l.as_slice()), delimiter))
+}
+
+// One line as it will be drawn: its own characters plus whatever padding
+// lines its columns up. Without a layout this is the line itself, which
+// is what lets everything below run one code path.
+pub(crate) fn display_row(
+    buf: &TextBuffer,
+    line: usize,
+    layout: Option<&crate::bishedit::tabular::Layout>,
+) -> crate::bishedit::tabular::Row {
+    let chars = buf.line_chars(line);
+    match layout {
+        Some(layout) => crate::bishedit::tabular::row(&chars, layout),
+        None => crate::bishedit::tabular::Row::plain(&chars),
+    }
+}
+
+// Which character of the line a drawn cell belongs to. Padding belongs
+// to the character it was inserted after, so a cursor placed on it
+// lands somewhere real.
+fn source_at_or_before(display: &crate::bishedit::tabular::Row, cell: usize) -> usize {
+    let last = display.cells.len();
+    for i in (0..=cell.min(last)).rev() {
+        if let Some(Some(source)) = display.source_at.get(i) {
+            return *source;
+        }
+    }
+    0
+}
+
+// `char_at_col`/`col_of`, over drawn cells rather than the line's own
+// characters. The two stop being the same thing the moment any padding
+// is inserted, exactly as they already differ for a wide glyph.
+fn cell_at_col(cells: &[char], col: usize) -> usize {
+    let mut used = 0;
+    for (i, c) in cells.iter().enumerate() {
+        if used >= col {
+            return i;
+        }
+        used += char_width(*c);
+    }
+    cells.len()
+}
+
+fn col_at_cell(cells: &[char], cell: usize) -> usize {
+    cells[..cell.min(cells.len())].iter().map(|c| char_width(*c)).sum()
+}
+
+// A span of the line, in characters, mapped into the window of cells
+// being drawn. Everything composed onto a row goes through this, so
+// padding shifts a highlight exactly as far as it shifts the text under
+// it. `None` when the span falls entirely outside the window.
+fn to_window(
+    display: &crate::bishedit::tabular::Row,
+    start_cell: usize,
+    avail: usize,
+    start: usize,
+    end: usize,
+) -> Option<(usize, usize)> {
+    let last = display.cell_of.len().saturating_sub(1);
+    let from = display.cell_of[start.min(last)];
+    let to = display.cell_of[end.min(last)];
+    if to <= start_cell {
+        return None;
+    }
+    let from = from.saturating_sub(start_cell);
+    let to = (to - start_cell).min(avail);
+    (from < to).then_some((from, to))
+}
+
 // One screen row: which buffer line, which slice of it, and whether it
 // opens that line.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2440,52 +2534,68 @@ fn spans_for_line(spans: &[StyledSpan], line_start: usize, line_len: usize) -> V
 // comment) and the rebased `line_styled`/`diag_styled` spans below
 // align with it exactly, with no separate cell-width bookkeeping
 // needed for *those* two layers at all.
-// `start_char`/`limit` are the window of the line this row draws --
-// with wrapping off that is "from the horizontal scroll to the end of
-// the line", and with it on it is the segment the layout produced. One
-// path either way, so the two modes can't drift.
+// Draws one screen row: the slice `start_cell..end_cell` of a line's
+// drawn cells, bounded by `cols` columns.
+//
+// Every span handed in is already expressed in this same window, in
+// cells (see `to_window`). That is deliberate: with a tabular display a
+// character index and a cell index are different numbers, and having
+// one place convert between them -- rather than each layer doing its
+// own arithmetic here -- is what keeps highlighting attached to the
+// text it highlights.
 #[allow(clippy::too_many_arguments)]
-fn render_row(out: &mut String, buf: &TextBuffer, line: usize, start_char: usize, limit: usize, cols: usize, line_styled: &[StyledSpan], diag_styled: &[StyledSpan], highlights: &[StyledSpan]) {
-    let line_chars = buf.line_chars(line);
+fn render_row(
+    out: &mut String,
+    buf: &TextBuffer,
+    display: &crate::bishedit::tabular::Row,
+    start_cell: usize,
+    end_cell: usize,
+    cols: usize,
+    line_styled: &[StyledSpan],
+    diag_styled: &[StyledSpan],
+    highlights: &[StyledSpan],
+) {
+    let limit = end_cell.min(display.cells.len());
     let mut chars: Vec<char> = Vec::with_capacity(cols);
     let mut used = 0;
-    let mut end_char = start_char;
-    while end_char < line_chars.len().min(limit) {
-        let w = char_width(line_chars[end_char]);
+    let mut at = start_cell.min(limit);
+    while at < limit {
+        let w = char_width(display.cells[at]);
         if used + w > cols {
             break;
         }
-        chars.push(line_chars[end_char]);
+        chars.push(display.cells[at]);
         used += w;
-        end_char += 1;
+        at += 1;
     }
     // With wrapping off, a line that continues past either edge says so
     // -- vim's `listchars` `extends`/`precedes`, empty by default.
-    let truncated_right = end_char < line_chars.len();
-    let truncated_left = start_char > 0;
+    let truncated_right = at < display.cells.len();
+    let truncated_left = start_cell > 0;
     while used < cols {
         chars.push(' ');
         used += 1;
     }
 
-    // Clamped against `chars.len()` (the real array length after
-    // width-bounded selection/padding above), not `cols` (the column
+    // Clamped against `chars.len()` (the real array length after the
+    // width-bounded walk and padding above), not `cols` (the column
     // *budget* it was bounded to fit) -- the two only coincide when
     // there's no wide char anywhere in this window; whenever there is,
     // `chars.len() < cols` (a wide char spends 2 columns of budget for
     // only 1 array slot), and clamping to the wider `cols` instead would
     // hand `highlight::compose` a span end past the real end of `chars`.
-    fn rebase(spans: &[StyledSpan], start_char: usize, len: usize) -> Vec<StyledSpan> {
+    let clamp = |spans: &[StyledSpan]| -> Vec<StyledSpan> {
         spans
             .iter()
-            .filter(|s| s.end > start_char && s.start < start_char + len)
-            .map(|s| StyledSpan { start: s.start.saturating_sub(start_char), end: (s.end - start_char).min(len), fg: s.fg, attrs: s.attrs })
+            .filter(|s| s.start < chars.len())
+            .map(|s| StyledSpan { start: s.start, end: s.end.min(chars.len()), fg: s.fg, attrs: s.attrs })
             .collect()
-    }
-    let line_styled = rebase(line_styled, start_char, chars.len());
-    let diag_styled = rebase(diag_styled, start_char, chars.len());
+    };
+    let line_styled = clamp(line_styled);
+    let diag_styled = clamp(diag_styled);
+    let highlights = clamp(highlights);
 
-    let cells = highlight::compose(&chars, &[&line_styled, &diag_styled, highlights]);
+    let cells = highlight::compose(&chars, &[&line_styled, &diag_styled, &highlights]);
     let mut rendered = highlight::render_styled(&cells);
     if !buf.wrap.wrap {
         if truncated_right && !buf.wrap.extends.is_empty() {
@@ -2605,6 +2715,9 @@ pub fn build_editor_frame(
     // buffer_highlight_spans's own doc comment for why a multi-line
     // construct needs that.
     let whole_styled = buffer_highlight_spans(buf, color_overrides);
+    // Measured once for the whole frame, not per row -- every row has to
+    // agree about where the columns are.
+    let layout = tabular_layout(buf);
     let starts = line_starts(buf);
     let mut out = String::new();
     let rows = visible_rows(buf, content_cols, content_rows);
@@ -2627,29 +2740,44 @@ pub fn build_editor_frame(
             // says where the row starts, and there is no horizontal
             // scroll to apply.
             let wrapping = buf.wrap.wrap;
-            let start_char =
-                if wrapping { row.seg.start } else { char_at_col(&buf.line_chars(line), hoffset) };
+            let display = display_row(buf, line, layout.as_ref());
             let prefix = continuation_prefix(buf, row.seg.indent);
             let avail = content_cols.saturating_sub(row.seg.indent);
+            // Where in the drawn cells this row starts and stops. With
+            // wrapping that is whatever the layout segmented; without
+            // it, the horizontal scroll -- which is a display column, so
+            // it indexes cells rather than characters.
+            let (start_cell, end_cell) = if wrapping {
+                (display.cell_of[row.seg.start.min(buf.line_len(line))], display.cell_of[row.seg.end.min(buf.line_len(line))])
+            } else {
+                (cell_at_col(&display.cells, hoffset), display.cells.len())
+            };
+            let line_len = buf.line_len(line);
             let mut highlights: Vec<StyledSpan> = Vec::new();
             for range in buf.selections.iter().chain(active.iter()) {
-                if let Some((start, end)) = selection_columns_in_line(range, line, start_char, avail) {
+                let Some((start, end)) = selection_columns_in_line(range, line, 0, line_len + 1) else { continue };
+                // A linewise selection covers the row to the pane's own
+                // edge, padding included -- it is selecting the line,
+                // not a range of its characters.
+                let span = if range.shape == motion::MotionShape::Linewise {
+                    Some((0, avail))
+                } else {
+                    to_window(&display, start_cell, avail, start, end)
+                };
+                if let Some((start, end)) = span {
                     highlights.push(StyledSpan { start, end, fg: vt100::Color::Default, attrs: vt100::CellAttrs { reverse: true, ..vt100::CellAttrs::default() } });
                 }
             }
             // A live `abbr` snippet's own placeholders, marked exactly as
             // the shell prompt marks them (editor.rs's `snippet_layer`):
             // reverse video on the one being typed into, underline on the
-            // rest. Rebased into the same viewport-local space
-            // selection_columns_in_line already produces, and dropped
-            // entirely when horizontal scrolling has carried the hole off
-            // this window.
-            for hole in buf.snippet_holes.iter().filter(|h| h.line == line && h.end > start_char) {
-                let start = hole.start.saturating_sub(start_char);
-                let end = (hole.end - start_char).min(avail);
-                if start >= end {
+            // rest. Mapped into the drawn window like every other layer,
+            // and dropped entirely when scrolling has carried the hole
+            // off it.
+            for hole in buf.snippet_holes.iter().filter(|h| h.line == line) {
+                let Some((start, end)) = to_window(&display, start_cell, avail, hole.start, hole.end) else {
                     continue;
-                }
+                };
                 let attrs = if hole.active {
                     vt100::CellAttrs { reverse: true, ..vt100::CellAttrs::default() }
                 } else {
@@ -2657,11 +2785,19 @@ pub fn build_editor_frame(
                 };
                 highlights.push(StyledSpan { start, end, fg: vt100::Color::Default, attrs });
             }
-            let line_styled = spans_for_line(&whole_styled, starts[line], buf.line_len(line));
-            let diag_styled = diagnostic_spans_for_line(&buf.diagnostics, starts[line], buf.line_len(line));
+            let map = |spans: Vec<StyledSpan>| -> Vec<StyledSpan> {
+                spans
+                    .into_iter()
+                    .filter_map(|s| {
+                        to_window(&display, start_cell, avail, s.start, s.end)
+                            .map(|(start, end)| StyledSpan { start, end, fg: s.fg, attrs: s.attrs })
+                    })
+                    .collect()
+            };
+            let line_styled = map(spans_for_line(&whole_styled, starts[line], line_len));
+            let diag_styled = map(diagnostic_spans_for_line(&buf.diagnostics, starts[line], line_len));
             out.push_str(&prefix);
-            let end_char = if wrapping { row.seg.end } else { buf.line_len(line) };
-            render_row(&mut out, buf, line, start_char, end_char, avail, &line_styled, &diag_styled, &highlights);
+            render_row(&mut out, buf, &display, start_cell, end_cell, avail, &line_styled, &diag_styled, &highlights);
         }
     }
 
@@ -2678,18 +2814,23 @@ pub fn build_editor_frame(
     // The cursor's own real display column, not its char index -- see
     // bishedit::unicode_width's own doc comment for why those two
     // differ once any wide/zero-width char precedes it on this line.
-    let chars = buf.line_chars(cl);
+    // Through the drawn cells, not the line's own characters: with a
+    // tabular display the two differ by however much padding precedes
+    // the cursor.
+    let cursor_display = display_row(buf, cl, layout.as_ref());
+    let cursor_cell = cursor_display.cell_of[cc.min(buf.line_len(cl))];
+    let cursor_abs = col_at_cell(&cursor_display.cells, cursor_cell);
     let (row_start, row_indent) = match rows.get(screen_row) {
         Some(row) if buf.wrap.wrap => (row.seg.start, row.seg.indent),
         _ => (0, 0),
     };
-    let cursor_col = col_of(&chars, cc).saturating_sub(col_of(&chars, row_start));
+    let row_start_col = col_at_cell(&cursor_display.cells, cursor_display.cell_of[row_start.min(buf.line_len(cl))]);
     let screen_col = gutter_width
         + row_indent
         + if buf.wrap.wrap {
-            cursor_col.min(content_cols.saturating_sub(row_indent + 1))
+            cursor_abs.saturating_sub(row_start_col).min(content_cols.saturating_sub(row_indent + 1))
         } else {
-            col_of(&chars, cc).saturating_sub(hoffset).min(content_cols.saturating_sub(1))
+            cursor_abs.saturating_sub(hoffset).min(content_cols.saturating_sub(1))
         };
     out.push_str(&format!("\x1b[{};{}H\x1b[?25h", row_origin + screen_row + 1, col_origin + screen_col + 1));
     out
@@ -3953,6 +4094,107 @@ mod pre_save_hook_tests {
             "expected the cursor on row 3 column {}, got:\n{frame:?}",
             gutter + 2
         );
+    }
+
+    fn csv_buf(text: &str) -> TextBuffer {
+        let mut buf = TextBuffer::open(std::path::Path::new("/tmp/bish-tabular-test.csv"), 10).unwrap();
+        buf.insert_text((0, 0), text);
+        buf.set_cursor(0, 0);
+        buf.tabular = Some(',');
+        buf
+    }
+
+    // What the pane actually draws, with the styling stripped, so a test
+    // reads as the screen does.
+    fn drawn(buf: &TextBuffer, cols: usize) -> Vec<String> {
+        let rect = Rect { row: 0, col: 0, rows: 12, cols };
+        let frame = build_editor_frame(buf, &VimKeys::new(), EditorMode::Normal, rect, 0, 0, None);
+        let gutter = total_gutter_width(buf);
+        // A cursor-position escape starts a row; every other escape is
+        // styling and contributes no characters.
+        let chars: Vec<char> = frame.chars().collect();
+        let mut rows: Vec<String> = Vec::new();
+        let mut current: Option<String> = None;
+        let mut i = 0;
+        while i < chars.len() {
+            if chars[i] == '\x1b' && chars.get(i + 1) == Some(&'[') {
+                let mut j = i + 2;
+                while j < chars.len() && !chars[j].is_ascii_alphabetic() {
+                    j += 1;
+                }
+                if chars.get(j) == Some(&'H') {
+                    if let Some(text) = current.take() {
+                        rows.push(text);
+                    }
+                    current = Some(String::new());
+                }
+                i = j + 1;
+                continue;
+            }
+            if let Some(row) = current.as_mut() {
+                row.push(chars[i]);
+            }
+            i += 1;
+        }
+        if let Some(text) = current.take() {
+            rows.push(text);
+        }
+        rows.into_iter()
+            .map(|row| row.chars().skip(gutter).collect::<String>().trim_end().to_string())
+            .filter(|row| !row.is_empty())
+            .collect()
+    }
+
+    #[test]
+    fn a_csv_buffer_draws_its_columns_lined_up() {
+        let buf = csv_buf("name,age,city\nalice,30,NYC\nbo,7,LA");
+        assert_eq!(drawn(&buf, 60), vec!["name,  age, city", "alice, 30,  NYC", "bo,    7,   LA"]);
+    }
+
+    // The alignment is drawn, never stored: the buffer still holds
+    // exactly what was typed, delimiters and all.
+    #[test]
+    fn the_alignment_never_touches_the_text() {
+        let mut buf = csv_buf("name,age\nalice,30");
+        assert_eq!(buffer_text(&buf), "name,age\nalice,30");
+        // ...and a delimiter is still an ordinary character: adding one
+        // splits the row into another column, which is the whole point
+        // of the alignment being cosmetic.
+        buf.insert_text((0, 4), ",");
+        assert_eq!(buffer_text(&buf), "name,,age\nalice,30");
+        assert_eq!(drawn(&buf, 60).len(), 2);
+    }
+
+    // A click on padding belongs to the character it was inserted after
+    // -- there is nothing else it could mean, since padding is not in
+    // the file.
+    #[test]
+    fn a_click_on_padding_lands_on_the_character_before_it() {
+        let buf = csv_buf("alice,30\nbo,7");
+        let gutter = total_gutter_width(&buf);
+        let rect = Rect { row: 0, col: 0, rows: 12, cols: gutter + 40 };
+        // Row 1 draws "bo,    7": columns 0-1 are `bo`, 2 is the comma,
+        // 3..6 are padding, 7 is `7`.
+        assert_eq!(position_at_screen(&buf, rect, 1, gutter), Some((1, 0)));
+        assert_eq!(position_at_screen(&buf, rect, 1, gutter + 2), Some((1, 2)), "the comma itself");
+        assert_eq!(position_at_screen(&buf, rect, 1, gutter + 4), Some((1, 2)), "padding belongs to the comma");
+        assert_eq!(position_at_screen(&buf, rect, 1, gutter + 7), Some((1, 3)), "the next field");
+    }
+
+    #[test]
+    fn a_buffer_with_no_tabular_form_is_drawn_exactly_as_before() {
+        let mut buf = csv_buf("name,age\nalice,30");
+        buf.tabular = None;
+        assert_eq!(drawn(&buf, 60), vec!["name,age", "alice,30"]);
+    }
+
+    // Wrapping and alignment are two answers to the same question, so
+    // only one of them applies.
+    #[test]
+    fn wrapping_turns_the_alignment_off() {
+        let mut buf = csv_buf("name,age\nalice,30");
+        buf.wrap = crate::bishedit::wrap::Options { wrap: true, ..Default::default() };
+        assert!(tabular_layout(&buf).is_none());
     }
 
     #[test]

@@ -85,6 +85,12 @@ pub struct TextBuffer {
     // one, which is why it lives beside `vtop`/`hleft` rather than
     // anywhere near the text.
     pub wrap: crate::bishedit::wrap::Options,
+    // The delimiter this buffer's columns line up on, for a language
+    // that has a tabular form and whose language the `tabular` bishopt's
+    // glob matches. `None` for everything else, which is almost every
+    // buffer. A *display* setting like `wrap`: the text is untouched,
+    // only where padding is drawn between it changes.
+    pub tabular: Option<char>,
     // Which visual row of `vtop`'s own line the viewport starts at. Only
     // ever non-zero with wrapping on, and only for a line tall enough to
     // exceed the pane by itself -- without it, a minified file would
@@ -162,6 +168,7 @@ impl TextBuffer {
             marks: HashMap::new(),
             selections: Vec::new(),
             wrap: crate::bishedit::wrap::Options::default(),
+            tabular: None,
             vtop_sub: 0,
             snippet_holes: Vec::new(),
             diagnostics: Vec::new(),
@@ -211,6 +218,7 @@ impl TextBuffer {
             marks: HashMap::new(),
             selections: Vec::new(),
             wrap: crate::bishedit::wrap::Options::default(),
+            tabular: None,
             vtop_sub: 0,
             snippet_holes: Vec::new(),
             diagnostics: Vec::new(),
@@ -709,6 +717,7 @@ mod tests {
             marks: HashMap::new(),
             selections: Vec::new(),
             wrap: crate::bishedit::wrap::Options::default(),
+            tabular: None,
             vtop_sub: 0,
             snippet_holes: Vec::new(),
             diagnostics: Vec::new(),

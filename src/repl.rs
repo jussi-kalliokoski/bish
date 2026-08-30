@@ -5860,6 +5860,21 @@ fn wrap_options(shell: &exec::Shell) -> crate::bishedit::wrap::Options {
 // one way these can change while the editor holds the terminal.
 fn apply_view_options(shell: &exec::Shell, buf: &mut TextBuffer) {
     buf.wrap = wrap_options(shell);
+    buf.tabular = tabular_delimiter(shell, &fileeditor::language_of(buf));
+}
+
+// Whether this buffer's columns line up, and on what. Two conditions,
+// in this order because they answer different questions: the `tabular`
+// bishopt's glob is the *user's* choice about which languages to do it
+// for, and `tabular::delimiter` is whether the language has a tabular
+// form at all. A language nobody has implemented one for falls out
+// through the second, which is why the glob can default to `*`.
+fn tabular_delimiter(shell: &exec::Shell, language: &str) -> Option<char> {
+    let languages = shell.bishopt_str("tabular");
+    if !crate::glob::matches(&languages, language) {
+        return None;
+    }
+    crate::bishedit::tabular::delimiter(language)
 }
 
 // Dispatches this loop's own per-keystroke redraw to whichever renderer
