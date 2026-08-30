@@ -165,6 +165,10 @@ pub(crate) struct Browser {
     // whole value of knowing about `.gitignore` here is not having to
     // scroll past `target/` and `node_modules/` to reach your own files.
     show_ignored: bool,
+    // The `gitignore` bishopt. Off means there is no such thing as an
+    // ignored file here -- `i` stops doing anything, and nothing is
+    // dimmed, because nothing was ever hidden.
+    honor_gitignore: bool,
     // Back/forward stacks for Alt-Left/Alt-Right, mirroring the
     // vocabulary the ordinary shell prompt's own directory navigation
     // already uses (editor::DirNav).
@@ -196,6 +200,7 @@ impl Browser {
             show_hidden: false,
             ignore: crate::gitignore::Stack::new(),
             show_ignored: false,
+            honor_gitignore: true,
             back: Vec::new(),
             forward: Vec::new(),
             error: None,
@@ -211,6 +216,16 @@ impl Browser {
         self.can_change_directory = allow;
     }
 
+    // The `gitignore` bishopt, from whichever shell opened this. Must be
+    // set before the first listing is used, so it reloads.
+    pub(crate) fn set_honor_gitignore(&mut self, honor: bool) -> Result<(), String> {
+        if self.honor_gitignore == honor {
+            return Ok(());
+        }
+        self.honor_gitignore = honor;
+        self.reload()
+    }
+
     // Re-reads `cwd` from disk and rebuilds the filtered view. Keeps the
     // cursor's *position* only in so far as it still exists -- callers
     // that want it on a specific name (going up to a parent, say) call
@@ -219,9 +234,10 @@ impl Browser {
         // Before `read_here`, which is what consults it. Skipped for a
         // virtual archive path: nothing inside a zip is on disk for a
         // `.gitignore` to be about.
-        self.ignore = match crate::archive::split(&self.cwd.to_string_lossy()) {
-            Some(_) => crate::gitignore::Stack::new(),
-            None => crate::gitignore::Stack::for_directory(&self.cwd),
+        let inside_archive = crate::archive::split(&self.cwd.to_string_lossy()).is_some();
+        self.ignore = match self.honor_gitignore && !inside_archive {
+            true => crate::gitignore::Stack::for_directory(&self.cwd),
+            false => crate::gitignore::Stack::new(),
         };
         let mut entries = self.read_here()?;
         // `Path::parent` already understands a virtual path: the parent
@@ -859,10 +875,13 @@ impl Browser {
             Some(e) => format!("{}  {}", e.name, human_size(e.size)),
             None => if self.query.is_empty() { "empty directory".to_string() } else { format!("no matches for '{}'", self.query) },
         };
-        let hints = if self.can_change_directory {
-            "enter open  ^y cd here  tab select  / filter  . hidden  i ignored  bksp up  esc back"
-        } else {
-            "enter open  tab select  / filter  . hidden  i ignored  bksp up  esc back"
+        // The `i` hint is left out when `gitignore` is off -- there is
+        // nothing for it to reveal, so offering it would be a lie.
+        let hints = match (self.can_change_directory, self.honor_gitignore) {
+            (true, true) => "enter open  ^y cd here  tab select  / filter  . hidden  i ignored  bksp up  esc back",
+            (true, false) => "enter open  ^y cd here  tab select  / filter  . hidden  bksp up  esc back",
+            (false, true) => "enter open  tab select  / filter  . hidden  i ignored  bksp up  esc back",
+            (false, false) => "enter open  tab select  / filter  . hidden  bksp up  esc back",
         };
         let used = str_width(&detail) + str_width(hints);
         if used + GUTTER > cols {
@@ -1262,6 +1281,24 @@ mod tests {
         // ...and shown *as* ignored, not just shown.
         let ignored: Vec<&str> = b.entries.iter().filter(|e| e.is_ignored).map(|e| e.name.as_str()).collect();
         assert_eq!(ignored, vec!["target", "debug.log"]);
+    }
+
+    // With the `gitignore` bishopt off there is no such thing as an
+    // ignored file: nothing hidden, and nothing marked either.
+    #[test]
+    fn the_gitignore_bishopt_turns_the_whole_thing_off() {
+        let t = Tmp::new("optout");
+        t.dir(".git");
+        t.file(".gitignore", "*.log\n");
+        t.file("debug.log", "");
+        let mut b = Browser::open(&t.0).unwrap();
+        assert!(!names(&b).contains(&"debug.log".to_string()));
+        b.set_honor_gitignore(false).unwrap();
+        assert!(names(&b).contains(&"debug.log".to_string()));
+        assert!(b.entries.iter().all(|e| !e.is_ignored), "nothing is marked ignored either");
+        // ...and `i` has nothing left to reveal.
+        b.handle_key(Key::Char('i'), rect(10, 80));
+        assert!(names(&b).contains(&"debug.log".to_string()));
     }
 
     // Outside a repository there is no root for a `.gitignore` to be

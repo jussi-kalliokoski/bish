@@ -10549,6 +10549,17 @@ const KNOWN_BISHOPTS: &[(&str, BishOptDefault)] = &[
     // (bishedit::tabular::style says which have one), so matching
     // everything means "wherever this is implemented, use it".
     ("tabular", BishOptDefault::Str("*")),
+    // Whether bish pays attention to `.gitignore` at all. On, the file
+    // browser leaves ignored files out of its listing until `i` asks
+    // for them; off, there is no such thing as an ignored file anywhere
+    // and every listing is what is actually on disk.
+    //
+    // Named for the file rather than for the browser (`browser_
+    // gitignore`, say) on purpose: the question it answers is "does
+    // bish honour .gitignore", which is the thing a person goes looking
+    // for, and the answer should stay one option as more of bish comes
+    // to ask it -- the fuzzy finder next.
+    ("gitignore", BishOptDefault::Bool(true)),
 ];
 
 // Best-effort terminal color-capability detection via the same

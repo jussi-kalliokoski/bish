@@ -1406,6 +1406,7 @@ fn expand_browse_targets(
         let browsed = run_browse_frame(
             &start,
             can_change_directory,
+            sessions.get(&session_id).is_none_or(|s| s.shell.bishopt_bool("gitignore")),
             sessions,
             windows,
             current_window,
@@ -2686,6 +2687,10 @@ enum BrowseOutcome {
 fn run_browse_frame(
     start: &std::path::Path,
     can_change_directory: bool,
+    // The `gitignore` bishopt, read fresh per browse rather than once
+    // at startup -- `bishopt --set gitignore off` should take effect on
+    // the next `e .`, not on the next shell.
+    honor_gitignore: bool,
     sessions: &mut HashMap<SessionId, SessionState>,
     windows: &mut [WindowEntry],
     current_window: usize,
@@ -2699,6 +2704,7 @@ fn run_browse_frame(
     // flicker into a browser that immediately backs out again.
     let mut browser = browser::Browser::open(start)?;
     browser.set_can_change_directory(can_change_directory);
+    browser.set_honor_gitignore(honor_gitignore)?;
     // Same reasoning run_diagnostics_frame's own guard has: whatever
     // loop ran last restored the terminal to cooked mode on its way
     // out, which is unusable for a key-at-a-time grid.
