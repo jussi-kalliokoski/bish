@@ -222,6 +222,48 @@ impl Stack {
         self.files.iter().all(|(_, i)| i.is_empty())
     }
 
+    /// Every ignore file that applies inside `dir`, read off disk in
+    /// the order git itself consults them.
+    ///
+    /// Outside a repository this is empty and everything is visible:
+    /// `.gitignore` files only mean anything relative to a repository
+    /// root, and honouring a stray one in some unrelated directory
+    /// would be inventing a rule git doesn't have.
+    ///
+    /// Sources, shallowest first (so the deepest still wins, per
+    /// `matched`): `core.excludesFile`, `.git/info/exclude`, then a
+    /// `.gitignore` in every directory from the root down to `dir`.
+    /// The first two are repository-wide, so both are based at the root.
+    pub fn for_directory(dir: &Path) -> Stack {
+        let mut stack = Stack::new();
+        let Some(root) = repo_root(dir) else { return stack };
+        if let Some(excludes) = excludes_file(&root) {
+            stack.push_file(&root, &excludes);
+        }
+        stack.push_file(&root, &root.join(".git/info/exclude"));
+        // Root first, then each directory on the way down -- `matched`
+        // orders by depth itself, but reading in this order keeps the
+        // stack legible to anyone printing it.
+        let mut here = PathBuf::new();
+        for component in dir.strip_prefix(&root).unwrap_or(Path::new("")).components() {
+            stack.push_file(&root.join(&here), &root.join(&here).join(".gitignore"));
+            here.push(component);
+        }
+        stack.push_file(dir, &dir.join(".gitignore"));
+        stack
+    }
+
+    // Reads one ignore file if it is there, and says nothing if it
+    // isn't -- a missing `.gitignore` is the normal case, not an error.
+    fn push_file(&mut self, base: &Path, file: &Path) {
+        if let Ok(text) = std::fs::read_to_string(file) {
+            let ignore = Ignore::parse(&text);
+            if !ignore.is_empty() {
+                self.push(base, ignore);
+            }
+        }
+    }
+
     /// Deepest base first, and the first file with anything to say
     /// decides -- including when what it says is `Whitelisted`, which is
     /// exactly how a nested `!` line overrides an exclusion from above.
@@ -237,6 +279,77 @@ impl Stack {
             }
         }
         Match::None
+    }
+}
+
+/// The nearest ancestor of `dir` holding a `.git` -- a directory
+/// normally, but a *file* in a worktree or submodule, which is why this
+/// only asks whether the name exists.
+pub fn repo_root(dir: &Path) -> Option<PathBuf> {
+    let mut here = dir;
+    loop {
+        if here.join(".git").exists() {
+            return Some(here.to_path_buf());
+        }
+        here = here.parent()?;
+    }
+}
+
+// git's `core.excludesFile`, from the repository config and then the
+// user's, falling back to the location git uses when nobody set one.
+fn excludes_file(root: &Path) -> Option<PathBuf> {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let xdg = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| home.as_ref().map(|h| h.join(".config")));
+    let configs = [
+        Some(root.join(".git/config")),
+        xdg.as_ref().map(|x| x.join("git/config")),
+        home.as_ref().map(|h| h.join(".gitconfig")),
+    ];
+    for config in configs.into_iter().flatten() {
+        if let Some(value) = git_config_value(&config, "core", "excludesfile") {
+            return Some(expand_tilde(&value, home.as_deref()));
+        }
+    }
+    // What git uses with no configuration at all.
+    xdg.map(|x| x.join("git/ignore"))
+}
+
+// One value out of a git config file, which is INI -- so this is
+// `ini::parse` and nothing more. Section and key names are compared
+// case-insensitively, as git compares them; `section` and `key` are
+// expected already lowercased.
+fn git_config_value(path: &Path, section: &str, key: &str) -> Option<String> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let mut in_section = false;
+    for item in &crate::ini::parse(&text).items {
+        match item {
+            crate::ini::Item::Section { name, .. } => {
+                in_section = slice(&text, name).to_lowercase() == section;
+            }
+            crate::ini::Item::Entry { key: k, value: Some(v), .. }
+                if in_section && slice(&text, k).to_lowercase() == key =>
+            {
+                // A quoted value is the same string without its quotes;
+                // nothing here needs git's escapes.
+                return Some(slice(&text, &v.span).trim_matches('"').to_string());
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+// ini's spans are char offsets, so this can't be a byte slice.
+fn slice(text: &str, span: &std::ops::Range<usize>) -> String {
+    text.chars().skip(span.start).take(span.end - span.start).collect()
+}
+
+fn expand_tilde(path: &str, home: Option<&Path>) -> PathBuf {
+    match (path.strip_prefix("~/"), home) {
+        (Some(rest), Some(home)) => home.join(rest),
+        _ => PathBuf::from(path),
     }
 }
 
@@ -499,6 +612,78 @@ mod tests {
         }
         let _ = std::fs::remove_dir_all(&root);
         assert!(disagreements.is_empty(), "disagreed with real git:\n  {}", disagreements.join("\n  "));
+    }
+
+    struct Tmp(PathBuf);
+    impl Tmp {
+        fn new(tag: &str) -> Tmp {
+            let dir = std::env::temp_dir().join(format!("bish-gitignore-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(dir.join(".git/info")).unwrap();
+            Tmp(dir)
+        }
+        fn write(&self, name: &str, contents: &str) {
+            let p = self.0.join(name);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, contents).unwrap();
+        }
+    }
+    impl Drop for Tmp {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn for_directory_finds_nothing_outside_a_repository() {
+        let dir = std::env::temp_dir().join(format!("bish-gitignore-norepo-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(".gitignore"), "*.log\n").unwrap();
+        // A `.gitignore` with no repository above it is not a rule -- it
+        // is a file that happens to be named that.
+        assert!(Stack::for_directory(&dir).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn for_directory_collects_every_gitignore_from_the_root_down() {
+        let t = Tmp::new("stack");
+        t.write(".gitignore", "*.log\n");
+        t.write("a/b/.gitignore", "!*.log\n");
+        let stack = Stack::for_directory(&t.0.join("a/b"));
+        assert_eq!(stack.matched(&t.0.join("x.log"), false), Match::Ignored);
+        assert_eq!(stack.matched(&t.0.join("a/x.log"), false), Match::Ignored);
+        assert_eq!(stack.matched(&t.0.join("a/b/x.log"), false), Match::Whitelisted, "the deepest file wins");
+    }
+
+    #[test]
+    fn for_directory_reads_git_info_exclude() {
+        let t = Tmp::new("exclude");
+        t.write(".git/info/exclude", "secret*\n");
+        assert_eq!(Stack::for_directory(&t.0).matched(&t.0.join("secrets.txt"), false), Match::Ignored);
+    }
+
+    // The payoff from the INI parser: `core.excludesFile` is a git
+    // config value, and a git config is an INI file.
+    #[test]
+    fn core_excludes_file_is_read_out_of_the_git_config() {
+        let t = Tmp::new("excludesfile");
+        t.write("myignores", "*.bak\n");
+        t.write(".git/config", format!("[core]\n\texcludesFile = {}\n", t.0.join("myignores").display()).as_str());
+        assert_eq!(Stack::for_directory(&t.0).matched(&t.0.join("a.bak"), false), Match::Ignored);
+    }
+
+    #[test]
+    fn git_config_values_are_found_case_insensitively_and_unquoted() {
+        let t = Tmp::new("config");
+        t.write(".git/config", "[CORE]\n\tExcludesFile = \"/tmp/x y\"\n");
+        assert_eq!(git_config_value(&t.0.join(".git/config"), "core", "excludesfile").as_deref(), Some("/tmp/x y"));
+        assert_eq!(git_config_value(&t.0.join(".git/config"), "core", "missing"), None);
+        // A key of the same name in a different section is a different
+        // key.
+        t.write(".git/config", "[other]\n\texcludesfile = /tmp/x\n");
+        assert_eq!(git_config_value(&t.0.join(".git/config"), "core", "excludesfile"), None);
     }
 
     #[test]

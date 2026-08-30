@@ -66,6 +66,10 @@ pub(crate) struct Entry {
     // of a multi-selection), and skipped entirely once a filter query is
     // typed, since it isn't a real match for anything.
     pub(crate) is_parent: bool,
+    // Excluded by a `.gitignore` that covers this directory. Hidden by
+    // default and shown dimmed once `i` asks for them, so "ignored" is
+    // visible as a property rather than only as an absence.
+    pub(crate) is_ignored: bool,
     pub(crate) size: u64,
 }
 
@@ -153,6 +157,14 @@ pub(crate) struct Browser {
     // (clearing the query) rather than leaving the browser entirely.
     searching: bool,
     show_hidden: bool,
+    // The gitignore rules covering `cwd`, reloaded whenever it changes.
+    // Empty outside a repository, which is also what makes this cost
+    // nothing anywhere else.
+    ignore: crate::gitignore::Stack,
+    // Whether ignored entries are listed at all. Off by default: the
+    // whole value of knowing about `.gitignore` here is not having to
+    // scroll past `target/` and `node_modules/` to reach your own files.
+    show_ignored: bool,
     // Back/forward stacks for Alt-Left/Alt-Right, mirroring the
     // vocabulary the ordinary shell prompt's own directory navigation
     // already uses (editor::DirNav).
@@ -182,6 +194,8 @@ impl Browser {
             query: String::new(),
             searching: false,
             show_hidden: false,
+            ignore: crate::gitignore::Stack::new(),
+            show_ignored: false,
             back: Vec::new(),
             forward: Vec::new(),
             error: None,
@@ -202,6 +216,13 @@ impl Browser {
     // that want it on a specific name (going up to a parent, say) call
     // `focus_name` right after.
     fn reload(&mut self) -> Result<(), String> {
+        // Before `read_here`, which is what consults it. Skipped for a
+        // virtual archive path: nothing inside a zip is on disk for a
+        // `.gitignore` to be about.
+        self.ignore = match crate::archive::split(&self.cwd.to_string_lossy()) {
+            Some(_) => crate::gitignore::Stack::new(),
+            None => crate::gitignore::Stack::for_directory(&self.cwd),
+        };
         let mut entries = self.read_here()?;
         // `Path::parent` already understands a virtual path: the parent
         // of `/a/b.zip!/dir` is `/a/b.zip!` and the parent of the
@@ -220,6 +241,7 @@ impl Browser {
                     is_symlink: false,
                     is_exec: false,
                     is_parent: true,
+                    is_ignored: false,
                     size: 0,
                 },
             );
@@ -263,18 +285,29 @@ impl Browser {
                     is_symlink: false,
                     is_exec: false,
                     is_parent: false,
+                    is_ignored: false,
                     size: m.size,
                 })
                 .collect());
         }
         let read = std::fs::read_dir(&self.cwd).map_err(|e| format!("{}: {e}", self.cwd.display()))?;
+        // If `cwd` is itself ignored, nothing in it is filtered. You
+        // walked in here on purpose, and a directory that answered an
+        // Enter with an empty listing would be a worse answer than a
+        // full one.
+        let filtering = !self.ignore.matched(&self.cwd, true).is_ignored();
         let mut entries = Vec::new();
         for dirent in read.flatten() {
             let name = dirent.file_name().to_string_lossy().into_owned();
             if !self.show_hidden && name.starts_with('.') {
                 continue;
             }
-            entries.push(describe(dirent.path(), name));
+            let mut entry = describe(dirent.path(), name);
+            entry.is_ignored = filtering && self.ignore.matched(&entry.path, entry.is_dir).is_ignored();
+            if entry.is_ignored && !self.show_ignored {
+                continue;
+            }
+            entries.push(entry);
         }
         Ok(entries)
     }
@@ -638,8 +671,11 @@ impl Browser {
                 }
                 Outcome::Continue
             }
-            Key::Char('.') => {
-                self.show_hidden = !self.show_hidden;
+            Key::Char('.') | Key::Char('i') => {
+                match key {
+                    Key::Char('i') => self.show_ignored = !self.show_ignored,
+                    _ => self.show_hidden = !self.show_hidden,
+                }
                 let name = self.current().map(|e| e.name.clone());
                 if let Err(e) = self.reload() {
                     self.error = Some(e);
@@ -755,6 +791,11 @@ impl Browser {
             out.push_str("\x1b[7m");
         }
         out.push_str(color_for(entry));
+        // On top of the type colour rather than instead of it: it is
+        // still a directory or an executable, it is just also ignored.
+        if entry.is_ignored {
+            out.push_str("\x1b[2m");
+        }
         out.push(if selected { '\u{2022}' } else { ' ' });
         out.push(icon_for(entry));
         out.push(' ');
@@ -819,9 +860,9 @@ impl Browser {
             None => if self.query.is_empty() { "empty directory".to_string() } else { format!("no matches for '{}'", self.query) },
         };
         let hints = if self.can_change_directory {
-            "enter open  ^y cd here  tab select  / filter  . hidden  bksp up  esc back"
+            "enter open  ^y cd here  tab select  / filter  . hidden  i ignored  bksp up  esc back"
         } else {
-            "enter open  tab select  / filter  . hidden  bksp up  esc back"
+            "enter open  tab select  / filter  . hidden  i ignored  bksp up  esc back"
         };
         let used = str_width(&detail) + str_width(hints);
         if used + GUTTER > cols {
@@ -897,7 +938,7 @@ fn describe(path: PathBuf, name: String) -> Entry {
     // fine for the directories a person browses and would be worth
     // revisiting only if listing something like /usr/bin ever felt slow.
     let is_archive = !is_dir && crate::archive::kind_of(&path) == Some(crate::archive::Kind::Zip);
-    Entry { name, path, is_dir, is_archive, is_symlink, is_exec, is_parent: false, size }
+    Entry { name, path, is_dir, is_archive, is_symlink, is_exec, is_parent: false, is_ignored: false, size }
 }
 
 // Joins a directory path inside an archive with one of its children --
@@ -1195,6 +1236,70 @@ mod tests {
         assert!(!b.view.iter().any(|&i| b.entries[i].name == ".secret"));
         b.handle_key(Key::Char('.'), rect(10, 80));
         assert!(b.view.iter().any(|&i| b.entries[i].name == ".secret"));
+    }
+
+    #[test]
+    fn gitignored_entries_are_hidden_until_i_asks_for_them() {
+        let t = Tmp::new("ignored");
+        t.dir(".git");
+        t.file(".gitignore", "target/\n*.log\n!keep.log\n");
+        t.dir("target");
+        t.file("main.rs", "");
+        t.file("debug.log", "");
+        t.file("keep.log", "");
+
+        let mut b = Browser::open(&t.0).unwrap();
+        let mut shown = names(&b);
+        shown.retain(|n| n != "..");
+        shown.sort();
+        assert_eq!(shown, vec!["keep.log", "main.rs"], "target/ and debug.log are ignored; the `!` rescues keep.log");
+
+        b.handle_key(Key::Char('i'), rect(10, 80));
+        let mut all = names(&b);
+        all.retain(|n| n != "..");
+        all.sort();
+        assert_eq!(all, vec!["debug.log", "keep.log", "main.rs", "target"]);
+        // ...and shown *as* ignored, not just shown.
+        let ignored: Vec<&str> = b.entries.iter().filter(|e| e.is_ignored).map(|e| e.name.as_str()).collect();
+        assert_eq!(ignored, vec!["target", "debug.log"]);
+    }
+
+    // Outside a repository there is no root for a `.gitignore` to be
+    // relative to, so nothing is ignored -- including by a stray file
+    // that happens to be sitting there.
+    #[test]
+    fn nothing_is_ignored_outside_a_repository() {
+        let t = Tmp::new("norepo");
+        t.file(".gitignore", "*.log\n");
+        t.file("debug.log", "");
+        let b = Browser::open(&t.0).unwrap();
+        assert!(names(&b).contains(&"debug.log".to_string()));
+    }
+
+    // Walking into an ignored directory on purpose should show what is
+    // in it, not an empty listing.
+    #[test]
+    fn an_ignored_directory_still_lists_its_contents_once_you_are_in_it() {
+        let t = Tmp::new("intarget");
+        t.dir(".git");
+        t.file(".gitignore", "target/\n");
+        t.dir("target");
+        fs::write(t.0.join("target/build.o"), "").unwrap();
+        let b = Browser::open(&t.0.join("target")).unwrap();
+        assert!(names(&b).contains(&"build.o".to_string()));
+    }
+
+    // A deeper `.gitignore` is loaded too, and wins.
+    #[test]
+    fn a_nested_gitignore_applies_and_overrides() {
+        let t = Tmp::new("nested");
+        t.dir(".git");
+        t.file(".gitignore", "*.log\n");
+        t.dir("sub");
+        fs::write(t.0.join("sub/.gitignore"), "!*.log\n").unwrap();
+        fs::write(t.0.join("sub/a.log"), "").unwrap();
+        let b = Browser::open(&t.0.join("sub")).unwrap();
+        assert!(names(&b).contains(&"a.log".to_string()), "the nested `!` line re-includes it");
     }
 
     // Column-major fill: with 4 grid rows, `l` from the first item lands
@@ -1673,6 +1778,7 @@ mod tests {
             is_symlink: false,
             is_exec: false,
             is_parent: false,
+            is_ignored: false,
             size: 0,
         };
         assert_eq!(icon_for(&mk("src", true)), '\u{1F4C1}');
