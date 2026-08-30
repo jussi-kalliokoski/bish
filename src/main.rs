@@ -8,6 +8,7 @@ mod csscolor;
 mod debugger;
 mod diff;
 mod docs;
+mod dotenv;
 mod editor;
 mod exec;
 mod fileeditor;

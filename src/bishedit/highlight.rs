@@ -340,6 +340,66 @@ fn markdown_inlines(inlines: &[crate::markdown::Inline], out: &mut Vec<Highlight
 // roff -- man page source -- over crate::roff's own lexical pass, not
 // its interpreter. That distinction is the point: a highlighter must
 // colour the source as written, so the `.de` and `.ie` scaffolding a
+// `.env` files. Reads `dotenv::parse`'s items directly, the same
+// one-layer arrangement Markdown and INI have.
+//
+// The interpolation spans are the point. A `.env` is mostly opaque
+// strings, and `$DATABASE_URL` inside one is the single piece of the
+// line whose text is not what it says -- so it gets `Variable`, the
+// kind that already means exactly that (`$foo`, a shell expansion)
+// everywhere else in bish.
+pub struct DotenvHighlighter;
+
+impl Highlighter for DotenvHighlighter {
+    fn highlight(&self, text: &str, _ctx: HighlightContext) -> Vec<HighlightSpan> {
+        let mut out = Vec::new();
+        for item in &crate::dotenv::parse(text).items {
+            match item {
+                crate::dotenv::Item::Comment { span: s } => out.push(span(s.clone(), HighlightKind::Comment)),
+                crate::dotenv::Item::Entry { export, key, separator, value, comment, .. } => {
+                    if let Some(export) = export {
+                        out.push(span(export.clone(), HighlightKind::Keyword));
+                    }
+                    out.push(span(key.clone(), HighlightKind::Key));
+                    if let Some(at) = separator {
+                        out.push(span(*at..*at + 1, HighlightKind::Operator));
+                    }
+                    if let Some(value) = value {
+                        dotenv_value(value, &mut out);
+                    }
+                    if let Some(comment) = comment {
+                        out.push(span(comment.clone(), HighlightKind::Comment));
+                    }
+                }
+                crate::dotenv::Item::Blank { .. } | crate::dotenv::Item::Junk { .. } => {}
+            }
+        }
+        out
+    }
+}
+
+fn dotenv_value(value: &crate::dotenv::Value, out: &mut Vec<HighlightSpan>) {
+    let base = match value.kind {
+        crate::dotenv::ValueKind::Quoted | crate::dotenv::ValueKind::Literal => Some(HighlightKind::String),
+        crate::dotenv::ValueKind::Number => Some(HighlightKind::Number),
+        crate::dotenv::ValueKind::Bool => Some(HighlightKind::Keyword),
+        // Same call INI makes: most values are a path, a URL or a
+        // token, and colouring those would only make the file louder.
+        crate::dotenv::ValueKind::Bare => None,
+    };
+    if let Some(base) = base {
+        out.push(span(value.span.clone(), base));
+    }
+    // Layered over whatever the value's own kind gave it, the way a
+    // JSON string's escapes sit over the string.
+    for esc in &value.escapes {
+        out.push(span(esc.clone(), HighlightKind::FormatSpecifier));
+    }
+    for expansion in &value.expansions {
+        out.push(span(expansion.clone(), HighlightKind::Variable));
+    }
+}
+
 // TOML. Reads `toml::tokens` straight through -- the tokenizer already
 // carries the one piece of grammar that matters here (whether a word is
 // in key or value position), because that is a property of TOML and not
@@ -490,6 +550,7 @@ pub fn highlighter_for_language(language: &str) -> Option<Box<dyn Highlighter>> 
         "roff" | "man" | "troff" | "groff" => Some(Box::new(RoffHighlighter)),
         "ini" => Some(Box::new(IniHighlighter)),
         "toml" => Some(Box::new(TomlHighlighter)),
+        "dotenv" => Some(Box::new(DotenvHighlighter)),
         _ => None,
     }
 }
@@ -2431,5 +2492,61 @@ mod tests {
     #[test]
     fn toml_highlights_nothing_in_empty_input() {
         assert_eq!(toml_kinds(""), vec![]);
+    }
+
+    fn dotenv_kinds(text: &str) -> Vec<(String, HighlightKind)> {
+        let chars: Vec<char> = text.chars().collect();
+        let mut spans = DotenvHighlighter.highlight(text, HighlightContext::default());
+        spans.sort_by_key(|s| (s.start, s.end));
+        spans.into_iter().map(|s| (chars[s.start..s.end].iter().collect(), s.kind)).collect()
+    }
+
+    #[test]
+    fn dotenv_highlights_a_key_its_value_and_a_trailing_comment() {
+        assert_eq!(
+            dotenv_kinds("PORT=3000 # the port"),
+            vec![
+                ("PORT".to_string(), HighlightKind::Key),
+                ("=".to_string(), HighlightKind::Operator),
+                ("3000".to_string(), HighlightKind::Number),
+                ("# the port".to_string(), HighlightKind::Comment),
+            ]
+        );
+    }
+
+    #[test]
+    fn dotenv_highlights_export_as_a_keyword() {
+        let kinds = dotenv_kinds("export A=1");
+        assert_eq!(kinds[0], ("export".to_string(), HighlightKind::Keyword));
+        assert_eq!(kinds[1], ("A".to_string(), HighlightKind::Key));
+    }
+
+    // The distinctive one: the piece of the value whose text is not
+    // what it says.
+    #[test]
+    fn dotenv_marks_interpolation_inside_the_value_that_holds_it() {
+        let kinds = dotenv_kinds("A=\"${HOME}/bin\"");
+        assert!(kinds.iter().any(|(t, k)| t == "\"${HOME}/bin\"" && *k == HighlightKind::String));
+        assert!(kinds.iter().any(|(t, k)| t == "${HOME}" && *k == HighlightKind::Variable));
+    }
+
+    #[test]
+    fn dotenv_leaves_a_single_quoted_value_alone() {
+        let kinds = dotenv_kinds("A='$HOME'");
+        assert!(!kinds.iter().any(|(_, k)| *k == HighlightKind::Variable), "single quotes interpolate nothing");
+    }
+
+    // An ordinary value -- a path, a URL, a token -- stays plain.
+    #[test]
+    fn dotenv_leaves_a_bare_value_uncoloured() {
+        assert_eq!(
+            dotenv_kinds("PATH_TO=/usr/bin"),
+            vec![("PATH_TO".to_string(), HighlightKind::Key), ("=".to_string(), HighlightKind::Operator)]
+        );
+    }
+
+    #[test]
+    fn dotenv_highlights_nothing_in_empty_input() {
+        assert_eq!(dotenv_kinds(""), vec![]);
     }
 }

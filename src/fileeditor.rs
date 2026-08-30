@@ -2110,6 +2110,8 @@ const LANGUAGE_BY_EXTENSION: &[(&str, &str)] = &[
     // files really are, and colouring a stray `//` as a comment in one
     // that isn't would be saying it is valid there.
     ("jsonc", "jsonc"),
+    // `local.env`, `production.env` -- the other way people name these.
+    ("env", "dotenv"),
 ];
 
 // The other half of recognizing a file: what it is *called*. Every entry
@@ -2140,6 +2142,14 @@ const LANGUAGE_BY_FILE_NAME: &[(&str, &str)] = &[
     ("jsconfig.json", "jsonc"),
     ("devcontainer.json", "jsonc"),
     (".eslintrc.json", "jsonc"),
+    // `.envrc` is direnv's, and direnv scripts are bash -- it sits in
+    // this table specifically so the `.env` prefix rule below can't
+    // claim it.
+    (".envrc", "bash"),
+    // python-dotenv reads this one by name. Here rather than in the
+    // extension table because `Path` sees `.flaskenv` as all stem and no
+    // suffix, the same as `.gitconfig`.
+    (".flaskenv", "dotenv"),
 ];
 
 pub(crate) fn language_of(buf: &TextBuffer) -> String {
@@ -2178,6 +2188,14 @@ pub(crate) fn language_of(buf: &TextBuffer) -> String {
     // listing the members.
     if (name.starts_with("tsconfig.") || name.starts_with("jsconfig.")) && name.ends_with(".json") {
         return "jsonc".to_string();
+    }
+    // The same argument, and a bigger family: `.env`, `.env.local`,
+    // `.env.production`, `.env.test.local`, `.env.example`. Listing
+    // them would be listing a convention rather than matching it.
+    // `.envrc` is already spoken for above, since direnv's is a shell
+    // script rather than one of these.
+    if name == ".env" || name.starts_with(".env.") {
+        return "dotenv".to_string();
     }
     let Some(ext) = path.extension() else {
         return "text".to_string();
@@ -4503,6 +4521,20 @@ mod pre_save_hook_tests {
         assert_eq!(language_of(&buf_named(".vscode/launch.json")), "jsonc", "everything VS Code keeps in .vscode");
         // ...and a plain `.json` stays strict.
         assert_eq!(language_of(&buf_named("package.json")), "json");
+    }
+
+    #[test]
+    fn the_dotenv_family_is_recognized() {
+        for name in [".env", ".env.local", ".env.production", ".env.test.local", ".env.example", "local.env", ".flaskenv"] {
+            assert_eq!(language_of(&buf_named(name)), "dotenv", "{name}");
+        }
+    }
+
+    // direnv's file is a shell script, not a list of assignments, and
+    // the `.env` prefix rule must not take it.
+    #[test]
+    fn envrc_is_bash_rather_than_dotenv() {
+        assert_eq!(language_of(&buf_named(".envrc")), "bash");
     }
 
     #[test]
