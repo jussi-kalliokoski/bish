@@ -169,6 +169,10 @@ pub(crate) struct Browser {
     // ignored file here -- `i` stops doing anything, and nothing is
     // dimmed, because nothing was ever hidden.
     honor_gitignore: bool,
+    // This session's resolved `ui_col_*` colours -- see theme.rs. `None`
+    // for a caller with no shell to read them from, which draws the
+    // defaults.
+    colors: Option<crate::theme::UiColors>,
     // Back/forward stacks for Alt-Left/Alt-Right, mirroring the
     // vocabulary the ordinary shell prompt's own directory navigation
     // already uses (editor::DirNav).
@@ -204,6 +208,7 @@ impl Browser {
             ignore: crate::gitignore::Stack::new(),
             show_ignored: false,
             honor_gitignore: true,
+            colors: None,
             back: Vec::new(),
             forward: Vec::new(),
             error: None,
@@ -227,6 +232,10 @@ impl Browser {
     // say it was.
     pub(crate) fn set_message(&mut self, message: String) {
         self.message = Some(message);
+    }
+
+    pub(crate) fn set_colors(&mut self, colors: crate::theme::UiColors) {
+        self.colors = Some(colors);
     }
 
     // The `gitignore` bishopt, from whichever shell opened this. Must be
@@ -826,7 +835,7 @@ impl Browser {
         if focused {
             out.push_str("\x1b[7m");
         }
-        out.push_str(color_for(entry));
+        out.push_str(&color_for(entry, self.colors.as_ref()));
         // On top of the type colour rather than instead of it: it is
         // still a directory or an executable, it is just also ignored.
         if entry.is_ignored {
@@ -990,21 +999,26 @@ fn join_inner(dir: &str, name: &str) -> String {
     if dir.is_empty() { name.to_string() } else { format!("{dir}/{name}") }
 }
 
-fn color_for(e: &Entry) -> &'static str {
-    if e.is_symlink {
-        "\x1b[36m"
+fn color_for(e: &Entry, colors: Option<&crate::theme::UiColors>) -> String {
+    use crate::theme::Ui;
+    let element = if e.is_symlink {
+        Ui::Symlink
     } else if e.is_archive {
         // Its own colour rather than a directory's blue: it navigates
         // like one, but it's still a single file on disk and everything
         // inside it is read-only.
-        "\x1b[35m"
+        Ui::Archive
     } else if e.is_dir {
-        "\x1b[1;34m"
+        Ui::Directory
     } else if e.is_exec {
-        "\x1b[32m"
+        Ui::Executable
     } else {
-        "\x1b[39m"
-    }
+        // An ordinary file is drawn in the terminal's own foreground --
+        // the thing most entries are shouldn't be the thing that stands
+        // out.
+        return "\x1b[39m".to_string();
+    };
+    crate::theme::sgr(element, colors)
 }
 
 // Every icon here is drawn from U+1F300..=U+1FAFF on purpose -- that's

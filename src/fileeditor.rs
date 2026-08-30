@@ -2257,7 +2257,8 @@ fn render_line_number_cell(buf: &TextBuffer, _starts: &[usize], line: usize, wid
     if line >= buf.line_count() {
         return None;
     }
-    Some(format!("\x1b[2m{:>pad$} \x1b[0m", line_number_text(buf, line), pad = width.saturating_sub(1)))
+    let sgr = crate::theme::sgr(crate::theme::Ui::LineNumber, buf.colors.as_ref());
+    Some(format!("{sgr}{:>pad$} \x1b[0m", line_number_text(buf, line), pad = width.saturating_sub(1)))
 }
 
 // What the gutter puts on this line: its own number, or -- with
@@ -2945,11 +2946,11 @@ pub(crate) fn toggle_buffer_diff(buf: &mut TextBuffer) -> Result<bool, String> {
 // against the real enum rather than a wildcard, so adding e.g. Error
 // later is a one-line addition here, not a search for every place
 // severity might matter.
-fn diagnostic_style(severity: lint::Severity) -> (vt100::Color, vt100::CellAttrs) {
-    let underline = vt100::CellAttrs { underline: true, ..vt100::CellAttrs::default() };
-    match severity {
-        lint::Severity::Warning => (vt100::Color::Indexed(3), underline),
-    }
+fn diagnostic_style(buf: &TextBuffer, severity: lint::Severity) -> (vt100::Color, vt100::CellAttrs) {
+    let element = match severity {
+        lint::Severity::Warning => crate::theme::Ui::Warning,
+    };
+    crate::theme::resolve(element, buf.colors.as_ref())
 }
 
 // diagnostic_spans_for_line's own sibling to spans_for_line (see that
@@ -2960,13 +2961,13 @@ fn diagnostic_style(severity: lint::Severity) -> (vt100::Color, vt100::CellAttrs
 // kind-to-style mapping (a highlight pass is one Highlighter's own
 // output, always styled uniformly by HighlightKind; diagnostics can vary
 // per finding once Severity grows past its current one variant).
-fn diagnostic_spans_for_line(diagnostics: &[lint::Diagnostic], line_start: usize, line_len: usize) -> Vec<StyledSpan> {
+fn diagnostic_spans_for_line(buf: &TextBuffer, diagnostics: &[lint::Diagnostic], line_start: usize, line_len: usize) -> Vec<StyledSpan> {
     let line_end = line_start + line_len;
     diagnostics
         .iter()
         .filter(|d| d.start < line_end && d.end > line_start)
         .map(|d| {
-            let (fg, attrs) = diagnostic_style(d.severity);
+            let (fg, attrs) = diagnostic_style(buf, d.severity);
             StyledSpan { start: d.start.saturating_sub(line_start), end: (d.end - line_start).min(line_len), fg, attrs }
         })
         .collect()
@@ -3318,7 +3319,7 @@ pub fn build_editor_frame(
                     .collect()
             };
             let line_styled = map(spans_for_line(&whole_styled, starts[line], line_len));
-            let diag_styled = map(diagnostic_spans_for_line(&buf.diagnostics, starts[line], line_len));
+            let diag_styled = map(diagnostic_spans_for_line(buf, &buf.diagnostics, starts[line], line_len));
             let links: Vec<highlight::LinkSpan> = links_for_line(&whole_links, starts[line], line_len)
                 .into_iter()
                 .filter_map(|l| {
@@ -4312,10 +4313,11 @@ mod diagnose_tests {
     #[test]
     fn diagnostic_spans_for_line_clamps_to_the_requested_lines_own_extent() {
         let diags = vec![lint::Diagnostic { start: 5, end: 9, severity: lint::Severity::Warning, code: "unquoted-expansion", message: String::new(), fix: None }];
-        let spans = diagnostic_spans_for_line(&diags, 0, 20);
+        let b = TextBuffer::new_unnamed(10);
+        let spans = diagnostic_spans_for_line(&b, &diags, 0, 20);
         assert_eq!(spans.len(), 1);
         assert_eq!((spans[0].start, spans[0].end), (5, 9));
-        assert!(diagnostic_spans_for_line(&diags, 10, 20).is_empty());
+        assert!(diagnostic_spans_for_line(&b, &diags, 10, 20).is_empty());
     }
 
     #[test]

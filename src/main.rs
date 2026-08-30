@@ -37,6 +37,7 @@ mod roff;
 mod serialize;
 mod session;
 mod term;
+mod theme;
 mod toml;
 mod tool;
 mod url;

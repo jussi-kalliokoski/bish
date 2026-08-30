@@ -30,10 +30,24 @@ const DIM: &str = "\x1b[2m";
 const ITALIC: &str = "\x1b[3m";
 const UNDERLINE: &str = "\x1b[4m";
 const STRIKE: &str = "\x1b[9m";
-const HEADING: &str = "\x1b[1;33m";
-const CODE: &str = "\x1b[32m";
-const LINK: &str = "\x1b[4;36m";
-const QUOTE_BAR: &str = "\x1b[2;34m";
+// The four this renderer picks by *meaning* rather than by weight, and
+// so the four a theme can set (see theme.rs). The rest of the constants
+// above are plain attributes -- bold is bold whatever colour you like.
+fn heading(opts: &Options) -> String {
+    crate::theme::sgr(crate::theme::Ui::Heading, opts.colors.as_ref())
+}
+
+fn code(opts: &Options) -> String {
+    crate::theme::sgr(crate::theme::Ui::Code, opts.colors.as_ref())
+}
+
+fn link(opts: &Options) -> String {
+    crate::theme::sgr(crate::theme::Ui::Link, opts.colors.as_ref())
+}
+
+fn quote_bar(opts: &Options) -> String {
+    crate::theme::sgr(crate::theme::Ui::Quote, opts.colors.as_ref())
+}
 
 #[derive(Debug, Clone)]
 pub struct Options {
@@ -50,11 +64,14 @@ pub struct Options {
     // file behind it (`:help`), where a relative target has nothing to
     // resolve against and simply gets no hyperlink.
     pub base_dir: Option<std::path::PathBuf>,
+    // This session's resolved `ui_col_*` colours. `None` renders the
+    // defaults, which is what a plain-text render wants anyway.
+    pub colors: Option<crate::theme::UiColors>,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Options { width: 80, highlight_code: true, hyperlinks: false, base_dir: None }
+        Options { width: 80, highlight_code: true, hyperlinks: false, base_dir: None, colors: None }
     }
 }
 
@@ -102,7 +119,7 @@ fn render_block(block: &Block, opts: &Options, indent: usize, out: &mut Vec<Stri
                 _ => "  ".repeat((*level as usize).saturating_sub(2)),
             };
             let text: String = inline_runs(content, opts).iter().map(|r| r.styled()).collect();
-            out.push(format!("{pad}{HEADING}{prefix}{text}{RESET}"));
+            out.push(format!("{pad}{}{prefix}{text}{RESET}", heading(opts)));
             // A top-level heading is underlined, which is what makes a
             // long help page scannable.
             if *level == 1 {
@@ -122,7 +139,7 @@ fn render_block(block: &Block, opts: &Options, indent: usize, out: &mut Vec<Stri
             let (doc, roots) = html::parse_fragment(raw, "div");
             let mut runs = Vec::new();
             for &root in &roots {
-                html_runs(&doc, root, Style::default(), &mut runs);
+                html_runs(&doc, root, Style::default(), &mut runs, opts);
             }
             for line in wrap(&runs, width) {
                 if !line.trim().is_empty() {
@@ -134,7 +151,7 @@ fn render_block(block: &Block, opts: &Options, indent: usize, out: &mut Vec<Stri
             let mut inner = Vec::new();
             render_blocks(blocks, &Options { width: width.saturating_sub(2), ..opts.clone() }, 0, &mut inner);
             for line in inner {
-                out.push(format!("{pad}{QUOTE_BAR}\u{2502}{RESET} {line}"));
+                out.push(format!("{pad}{}\u{2502}{RESET} {line}", quote_bar(opts)));
             }
         }
         Block::List(list) => render_list(list, opts, indent, out),
@@ -241,7 +258,10 @@ struct Style {
     dim: bool,
     underline: bool,
     strike: bool,
-    color: Option<&'static str>,
+    // A whole SGR sequence rather than a `&'static str`: with the four
+    // meaningful ones themeable (see theme.rs) the colour is resolved
+    // per render, not baked in at compile time.
+    color: Option<String>,
     // The OSC 8 target for this run, when it has one. Carried on the
     // style rather than beside it because wrapping splits a run into
     // words by cloning exactly this -- so a link that wraps stays a link
@@ -285,7 +305,7 @@ impl Run {
         if let Some(link) = link {
             out.push_str(&format!("\x1b]8;id={};{}\x1b\\", link.id, link.url));
         }
-        if let Some(color) = s.color {
+        if let Some(color) = &s.color {
             out.push_str(color);
         }
         if s.bold {
@@ -333,7 +353,7 @@ fn push_inlines(inlines: &[Inline], base: Style, out: &mut Vec<Run>, opts: &Opti
     for inline in inlines {
         let style = open.last().map(|(_, s)| s.clone()).unwrap_or_else(|| base.clone());
         if let Inline::Html { raw, .. } = inline {
-            apply_inline_tag(raw, &style, &mut open, &mut suppress, out);
+            apply_inline_tag(raw, &style, &mut open, &mut suppress, out, opts);
             continue;
         }
         if suppress > 0 {
@@ -343,7 +363,7 @@ fn push_inlines(inlines: &[Inline], base: Style, out: &mut Vec<Run>, opts: &Opti
             Inline::Text { text, .. } => out.push(Run { text: text.clone(), style: style.clone(), break_after: false }),
             Inline::Code { text, .. } => {
                 let mut s = style.clone();
-                s.color = Some(CODE);
+                s.color = Some(code(opts));
                 out.push(Run { text: text.clone(), style: s, break_after: false });
             }
             Inline::Emph { content, .. } => push_inlines(content, Style { italic: true, ..style.clone() }, out, opts),
@@ -353,7 +373,7 @@ fn push_inlines(inlines: &[Inline], base: Style, out: &mut Vec<Run>, opts: &Opti
             }
             Inline::Link { dest, content, span, .. } => {
                 let mut s = style.clone();
-                s.color = Some(LINK);
+                s.color = Some(link(opts));
                 s.link = opts
                     .hyperlinks
                     .then(|| crate::url::absolute(dest, opts.base_dir.as_deref()))
@@ -398,13 +418,13 @@ fn push_inlines(inlines: &[Inline], base: Style, out: &mut Vec<Run>, opts: &Opti
 // The elements below are the ones that mean something here; everything
 // else contributes only its text, and the three that mean "not text at
 // all" contribute nothing.
-fn html_runs(doc: &html::Document, node: html::NodeId, style: Style, out: &mut Vec<Run>) {
+fn html_runs(doc: &html::Document, node: html::NodeId, style: Style, out: &mut Vec<Run>, opts: &Options) {
     match &doc.node(node).data {
         NodeData::Text(text) => out.push(Run { text: text.clone(), style, break_after: false }),
         NodeData::Comment(_) | NodeData::Doctype { .. } => {}
         NodeData::Document => {
             for &child in doc.children(node) {
-                html_runs(doc, child, style.clone(), out);
+                html_runs(doc, child, style.clone(), out, opts);
             }
         }
         NodeData::Element { name, attrs, .. } => {
@@ -415,11 +435,11 @@ fn html_runs(doc: &html::Document, node: html::NodeId, style: Style, out: &mut V
                 "script" | "style" | "head" | "template" => return,
                 "b" | "strong" => Style { bold: true, ..style },
                 "i" | "em" | "cite" | "var" => Style { italic: true, ..style },
-                "code" | "kbd" | "samp" | "tt" => Style { color: Some(CODE), ..style },
+                "code" | "kbd" | "samp" | "tt" => Style { color: Some(code(opts)), ..style },
                 "u" | "ins" => Style { underline: true, ..style },
                 "s" | "del" | "strike" => Style { strike: true, ..style },
                 "small" => Style { dim: true, ..style },
-                "a" => Style { underline: true, color: Some(LINK), ..style },
+                "a" => Style { underline: true, color: Some(link(opts)), ..style },
                 "br" => {
                     out.push(Run { text: String::new(), style, break_after: true });
                     return;
@@ -444,7 +464,7 @@ fn html_runs(doc: &html::Document, node: html::NodeId, style: Style, out: &mut V
                 _ => style,
             };
             for &child in doc.children(node) {
-                html_runs(doc, child, child_style.clone(), out);
+                html_runs(doc, child, child_style.clone(), out, opts);
             }
             if name == "a"
                 && let Some(href) = attrs.iter().find(|a| a.name == "href")
@@ -535,7 +555,7 @@ fn highlight_line(line: &str, lang: &str) -> String {
 // One inline HTML tag's effect on the style stack. Read with the real
 // tokenizer rather than by looking for `<` and `>`, so an attribute
 // containing either (`<a title="a > b">`) can't confuse it.
-fn apply_inline_tag(raw: &str, style: &Style, open: &mut Vec<(String, Style)>, suppress: &mut usize, out: &mut Vec<Run>) {
+fn apply_inline_tag(raw: &str, style: &Style, open: &mut Vec<(String, Style)>, suppress: &mut usize, out: &mut Vec<Run>, opts: &Options) {
     use crate::html::tokenizer::{Token, Tokenizer};
     let token = Tokenizer::new(raw).next();
     match token {
@@ -552,7 +572,7 @@ fn apply_inline_tag(raw: &str, style: &Style, open: &mut Vec<(String, Style)>, s
                 }
                 _ => {}
             }
-            let inner = inline_tag_style(&tag.name, style);
+            let inner = inline_tag_style(&tag.name, style, opts);
             // A void element styles nothing, and a self-closing one has
             // already closed.
             if !tag.self_closing && !is_void(&tag.name) {
@@ -571,15 +591,15 @@ fn apply_inline_tag(raw: &str, style: &Style, open: &mut Vec<(String, Style)>, s
     }
 }
 
-fn inline_tag_style(name: &str, style: &Style) -> Style {
+fn inline_tag_style(name: &str, style: &Style, opts: &Options) -> Style {
     match name {
         "b" | "strong" => Style { bold: true, ..style.clone() },
         "i" | "em" | "cite" | "var" => Style { italic: true, ..style.clone() },
-        "code" | "kbd" | "samp" | "tt" => Style { color: Some(CODE), ..style.clone() },
+        "code" | "kbd" | "samp" | "tt" => Style { color: Some(code(opts)), ..style.clone() },
         "u" | "ins" => Style { underline: true, ..style.clone() },
         "s" | "del" | "strike" => Style { strike: true, ..style.clone() },
         "small" => Style { dim: true, ..style.clone() },
-        "a" => Style { underline: true, color: Some(LINK), ..style.clone() },
+        "a" => Style { underline: true, color: Some(link(opts)), ..style.clone() },
         _ => style.clone(),
     }
 }
@@ -787,6 +807,7 @@ to need wrapping at this width",
             highlight_code: false,
             hyperlinks: true,
             base_dir: Some(std::path::PathBuf::from("/tmp/somewhere")),
+            ..Options::default()
         };
         let text = to_lines(&doc, &opts).join("\n");
         let mut targets = osc8_targets(&text);
@@ -800,7 +821,7 @@ to need wrapping at this width",
     #[test]
     fn the_pieces_of_one_link_share_an_id() {
         let doc = crate::markdown::parse("[the site here](https://example.com/x)");
-        let opts = Options { width: 200, highlight_code: false, hyperlinks: true, base_dir: None };
+        let opts = Options { width: 200, highlight_code: false, hyperlinks: true, ..Options::default() };
         let text = to_lines(&doc, &opts).join("\n");
         assert_eq!(osc8_targets(&text).len(), 3, "one per word");
         let ids: Vec<&str> = text.match_indices("\x1b]8;id=").map(|(at, _)| &text[at + 8..at + 9]).collect();
@@ -810,7 +831,7 @@ to need wrapping at this width",
     #[test]
     fn no_hyperlinks_are_emitted_when_they_are_off() {
         let doc = crate::markdown::parse("[a](https://example.com/x)");
-        let opts = Options { width: 200, highlight_code: false, hyperlinks: false, base_dir: None };
+        let opts = Options { width: 200, highlight_code: false, hyperlinks: false, ..Options::default() };
         assert!(osc8_targets(&to_lines(&doc, &opts).join("\n")).is_empty());
     }
 
@@ -820,7 +841,7 @@ to need wrapping at this width",
     #[test]
     fn a_relative_destination_needs_a_base_directory() {
         let doc = crate::markdown::parse("[a](https://example.com/x) [b](plan.md)");
-        let opts = Options { width: 200, highlight_code: false, hyperlinks: true, base_dir: None };
+        let opts = Options { width: 200, highlight_code: false, hyperlinks: true, ..Options::default() };
         assert_eq!(osc8_targets(&to_lines(&doc, &opts).join("\n")), vec!["https://example.com/x"]);
     }
 }

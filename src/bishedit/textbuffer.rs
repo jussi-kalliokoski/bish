@@ -101,6 +101,12 @@ pub struct TextBuffer {
     pub relativenumber: bool,
     /// The `cursorshape` bishopt: whether the terminal's cursor changes
     /// shape to show the mode.
+    /// This session's resolved `ui_col_*` colours (see theme.rs) --
+    /// carried on the buffer for the same reason `wrap` and `tabular`
+    /// are: every frame showing this buffer has to agree, including a
+    /// detached pane's frozen one, and the gutter's own renderers are
+    /// plain functions of a `TextBuffer`.
+    pub colors: Option<crate::theme::UiColors>,
     pub cursorshape: bool,
     /// The `mouse` bishopt, carried here so the frame that draws this
     /// buffer and the loop that reads keys for it agree.
@@ -200,6 +206,7 @@ impl TextBuffer {
             tabular: None,
             hyperlinks: true,
             relativenumber: false,
+            colors: None,
             cursorshape: true,
             mouse: true,
             expandtab: true,
@@ -275,6 +282,7 @@ impl TextBuffer {
             tabular: None,
             hyperlinks: true,
             relativenumber: false,
+            colors: None,
             cursorshape: true,
             mouse: true,
             eol,
@@ -825,6 +833,7 @@ mod tests {
             tabular: None,
             hyperlinks: true,
             relativenumber: false,
+            colors: None,
             cursorshape: true,
             mouse: true,
             expandtab: true,

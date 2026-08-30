@@ -2786,6 +2786,9 @@ fn run_browse_frame(
     let mut browser = browser::Browser::open(start)?;
     browser.set_can_change_directory(can_change_directory);
     browser.set_honor_gitignore(honor_gitignore)?;
+    if let Some(session) = sessions.get(&session_id) {
+        browser.set_colors(ui_colors(&session.shell));
+    }
     // Same reasoning run_diagnostics_frame's own guard has: whatever
     // loop ran last restored the terminal to cooked mode on its way
     // out, which is unusable for a key-at-a-time grid.
@@ -4290,6 +4293,10 @@ struct PaneSnapshot {
 // resolved rectangles/screens plus the divider line segments between
 // them (see compute_regions).
 struct CompositorLayout {
+    // This window's session's `ui_col_divider` (see theme.rs), resolved
+    // once per frame -- `draw_divider` writes straight into the frame
+    // string and has no Shell to ask.
+    divider_sgr: String,
     panes: Vec<PaneSnapshot>,
     dividers: Vec<Divider>,
 }
@@ -4885,7 +4892,11 @@ fn snapshot_window(window: &WindowEntry, sessions: &HashMap<SessionId, SessionSt
         })
         .collect();
 
-    CompositorLayout { panes, dividers }
+    CompositorLayout {
+        divider_sgr: sessions.get(&window.owning_session()).map(|s| crate::theme::sgr(crate::theme::Ui::Divider, Some(&ui_colors(&s.shell)))).unwrap_or_default(),
+        panes,
+        dividers,
+    }
 }
 
 // The actual drawing: shared by compositor_redraw (reads the tab bar
@@ -4931,7 +4942,7 @@ fn build_compositor_frame_output(layout: &CompositorLayout, tab_bar: &str, term_
     }
 
     for divider in &layout.dividers {
-        draw_divider(&mut out, divider.rect, divider.horizontal, divider.folded);
+        draw_divider(&mut out, divider.rect, divider.horizontal, divider.folded, &layout.divider_sgr);
     }
 
     // Tab bar pinned to the terminal's real last row.
@@ -5137,7 +5148,8 @@ fn diff_frames(prev: &TerminalFrame, new: &TerminalFrame, term_rows: usize, term
 // accepted cosmetic gap for this first pane-support pass rather than
 // tracking junction geometry across independently-drawn divider
 // segments.
-fn draw_divider(out: &mut String, rect: Rect, horizontal: bool, folded: Option<usize>) {
+fn draw_divider(out: &mut String, rect: Rect, horizontal: bool, folded: Option<usize>, sgr: &str) {
+    out.push_str(sgr);
     if horizontal {
         out.push_str(&format!("\x1b[{};{}H", rect.row + 1, rect.col + 1));
         match folded {
@@ -5153,6 +5165,9 @@ fn draw_divider(out: &mut String, rect: Rect, horizontal: bool, folded: Option<u
             out.push_str(&format!("\x1b[{};{}H", rect.row + r + 1, rect.col + 1));
             out.push('│');
         }
+    }
+    if !sgr.is_empty() {
+        out.push_str("\x1b[0m");
     }
 }
 
@@ -6205,6 +6220,11 @@ fn nav_buffer_into_edit_state(buf: NavBuffer, vk: VimKeys) -> Option<(TextBuffer
 // because run_edit_frame had already taken its snapshot. The half of
 // that claim which *is* true is the diagnostics pane: it has no colon
 // line, and doesn't use these colors anyway.
+// The same, for bish's own chrome -- see theme.rs.
+fn ui_colors(shell: &exec::Shell) -> crate::theme::UiColors {
+    crate::theme::UI_COL_OPTIONS.iter().filter_map(|(element, name)| shell.bishopt_color(name).map(|c| (*element, c))).collect()
+}
+
 fn syntax_color_overrides(shell: &exec::Shell) -> highlight::ColorOverrides {
     highlight::SYN_COL_OPTIONS.iter().filter_map(|(kind, name)| shell.bishopt_color(name).map(|c| (*kind, c))).collect()
 }
@@ -6297,6 +6317,7 @@ fn apply_view_options(shell: &exec::Shell, buf: &mut TextBuffer) {
     buf.tabular = tabular_style(shell, &fileeditor::language_of(buf));
     buf.hyperlinks = shell.bishopt_bool("hyperlinks");
     buf.relativenumber = shell.bishopt_bool("relativenumber");
+    buf.colors = Some(ui_colors(shell));
     buf.cursorshape = shell.bishopt_bool("cursorshape");
     buf.mouse = shell.bishopt_bool("mouse");
     // In this order, and never the other way round: the shell's own
@@ -7850,6 +7871,7 @@ fn render_markdown_document(source: &str, term_cols: usize, links: &LinkOptions)
         highlight_code: true,
         hyperlinks: links.hyperlinks,
         base_dir: links.base_dir.clone(),
+        colors: links.colors.clone(),
     };
     crate::markdown::render::to_lines(&doc, &opts)
 }
@@ -7893,6 +7915,10 @@ fn preview_document(language: &str, source: &str, term_cols: usize, links: &Link
 struct LinkOptions {
     hyperlinks: bool,
     base_dir: Option<std::path::PathBuf>,
+    // ...and this session's `ui_col_*` colours, carried the same way and
+    // for the same reason: the pager and the markdown renderer have no
+    // Shell to ask.
+    colors: Option<crate::theme::UiColors>,
 }
 
 struct PagerSource {
@@ -9036,8 +9062,11 @@ fn run_command_mode(
                                     // resolve against -- which is fine,
                                     // since the help page's own links
                                     // are all absolute or none.
-                                    links: LinkOptions { hyperlinks: sessions.get(&session_id).is_none_or(|s| s.shell.bishopt_bool("hyperlinks")),
-                                        base_dir: None },
+                                    links: LinkOptions {
+                                        hyperlinks: sessions.get(&session_id).is_none_or(|s| s.shell.bishopt_bool("hyperlinks")),
+                                        base_dir: None,
+                                        colors: sessions.get(&session_id).map(|s| ui_colors(&s.shell)),
+                                    },
                                 },
                                 sessions,
                                 windows,
@@ -9066,6 +9095,7 @@ fn run_command_mode(
                             let links = LinkOptions {
                                 hyperlinks: tb.hyperlinks,
                                 base_dir: tb.path().and_then(|p| p.parent()).map(|p| p.to_path_buf()),
+                                colors: sessions.get(&session_id).map(|s| ui_colors(&s.shell)),
                             };
                             if preview_document(&language, &source, *term_cols, &links).is_none() {
                                 show_command_mode_error(
@@ -10435,6 +10465,7 @@ mod terminal_frame_capture_tests {
     fn capture_clamps_a_panes_stale_rect_to_its_screens_own_live_size() {
         let screen = Rc::new(RefCell::new(vt100::Screen::new(2, 3)));
         let layout = CompositorLayout {
+            divider_sgr: String::new(),
             panes: vec![PaneSnapshot { rect: Rect { row: 0, col: 0, rows: 5, cols: 10 }, screen, focused: true }],
             dividers: vec![],
         };
@@ -10448,6 +10479,7 @@ mod terminal_frame_capture_tests {
         let screen = Rc::new(RefCell::new(vt100::Screen::new(2, 3)));
         screen.borrow_mut().feed(b"ab");
         let layout = CompositorLayout {
+            divider_sgr: String::new(),
             panes: vec![PaneSnapshot { rect: Rect { row: 0, col: 0, rows: 2, cols: 3 }, screen, focused: true }],
             dividers: vec![],
         };
@@ -10629,7 +10661,7 @@ mod compositor_frame_output_tests {
     #[test]
     fn build_compositor_frame_output_never_erases_the_whole_display() {
         let screen = Rc::new(RefCell::new(vt100::Screen::new(2, 3)));
-        let layout = CompositorLayout { panes: vec![PaneSnapshot { rect: Rect { row: 0, col: 0, rows: 2, cols: 3 }, screen, focused: true }], dividers: vec![] };
+        let layout = CompositorLayout { divider_sgr: String::new(), panes: vec![PaneSnapshot { rect: Rect { row: 0, col: 0, rows: 2, cols: 3 }, screen, focused: true }], dividers: vec![] };
         let out = build_compositor_frame_output(&layout, "tab", 3);
         assert!(!out.contains("\x1b[2J"), "{out:?}");
     }
@@ -10638,7 +10670,7 @@ mod compositor_frame_output_tests {
     fn build_compositor_frame_output_still_paints_every_row_and_the_tab_bar() {
         let screen = Rc::new(RefCell::new(vt100::Screen::new(2, 3)));
         screen.borrow_mut().feed(b"ab");
-        let layout = CompositorLayout { panes: vec![PaneSnapshot { rect: Rect { row: 0, col: 0, rows: 2, cols: 3 }, screen, focused: true }], dividers: vec![] };
+        let layout = CompositorLayout { divider_sgr: String::new(), panes: vec![PaneSnapshot { rect: Rect { row: 0, col: 0, rows: 2, cols: 3 }, screen, focused: true }], dividers: vec![] };
         let out = build_compositor_frame_output(&layout, "[0] tab", 3);
         assert!(out.contains("\x1b[1;1H"), "{out:?}");
         assert!(out.contains("\x1b[2;1H"), "{out:?}");

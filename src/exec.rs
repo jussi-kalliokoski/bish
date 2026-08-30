@@ -10511,6 +10511,22 @@ const KNOWN_BISHOPTS: &[(&str, BishOptDefault)] = &[
     ("syn_col_format_specifier", BishOptDefault::Color("-bish-red")),
     ("syn_col_invalid_command", BishOptDefault::Color("-bish-red")),
     ("syn_col_key", BishOptDefault::Color("-bish-cyan")),
+    // ...and the same for bish's own chrome rather than for the text it
+    // shows: the browser's entry types, rendered markdown, diagnostics.
+    // Identical machinery (see theme.rs, which mirrors
+    // bishedit::highlight's) so `ui_col_directory` behaves exactly as
+    // `syn_col_keyword` does, and both land in a `::bish theme`
+    // declaration without either knowing about themes.
+    ("ui_col_directory", BishOptDefault::Color("-bish-blue")),
+    ("ui_col_symlink", BishOptDefault::Color("-bish-cyan")),
+    ("ui_col_archive", BishOptDefault::Color("-bish-magenta")),
+    ("ui_col_executable", BishOptDefault::Color("-bish-green")),
+    ("ui_col_heading", BishOptDefault::Color("-bish-yellow")),
+    ("ui_col_code", BishOptDefault::Color("-bish-green")),
+    ("ui_col_link", BishOptDefault::Color("-bish-cyan")),
+    ("ui_col_quote", BishOptDefault::Color("-bish-blue")),
+    ("ui_col_error", BishOptDefault::Color("-bish-red")),
+    ("ui_col_warning", BishOptDefault::Color("-bish-yellow")),
     // How the file editor handles a line wider than the pane. `wrap`
     // off is the current behaviour and vim's `nowrap`: the line scrolls
     // sideways. On, it is broken across as many rows as it needs.
