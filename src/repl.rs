@@ -1277,11 +1277,16 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
                                 &mut sessions,
                                 &mut windows,
                                 session_id,
-                                current_window,
+                                &mut current_window,
+                                &mut next_session_id,
+                                &mut next_window_id,
+                                &mut cmd_history,
                                 &mut job_frames,
+                                &mut debug_frames,
+                                &mut registers,
                                 &mut term_rows,
                                 &mut term_cols,
-                                sinks_are_grid,
+                                &mut sinks_are_grid,
                             );
                             // Read only now: browsing blocks on real
                             // input, so the terminal can have been
@@ -1378,13 +1383,23 @@ fn expand_browse_targets(
     // no session that outlives it -- see browser::Outcome.
     can_change_directory: bool,
     sessions: &mut HashMap<SessionId, SessionState>,
-    windows: &mut [WindowEntry],
+    // A `Vec`, not a slice: the browser's own colon line can run
+    // `:window new`, which appends one.
+    windows: &mut Vec<WindowEntry>,
     session_id: SessionId,
-    current_window: usize,
+    current_window: &mut usize,
+    // Everything from here down exists only so the browser can open the
+    // *same* command mode every other frame gets, rather than a second,
+    // smaller one of its own -- see run_browse_frame's own `:` handling.
+    next_session_id: &mut SessionId,
+    next_window_id: &mut u32,
+    cmd_history: &mut History,
     job_frames: &mut HashMap<JobFrameId, exec::FgJob>,
+    debug_frames: &mut HashMap<EditFrameId, debugger::DebugSession>,
+    registers: &mut Registers,
     term_rows: &mut usize,
     term_cols: &mut usize,
-    sinks_are_grid: bool,
+    sinks_are_grid: &mut bool,
 ) -> Vec<fileeditor::EditTarget> {
     // Only pay for the cwd lookup (and the stat below) when there's
     // actually something to resolve.
@@ -1427,17 +1442,23 @@ fn expand_browse_targets(
         // yet and the browser would sit on an otherwise blank alternate
         // screen. Every other ensure_promoted call site pairs the two for
         // the same reason.
-        if sinks_are_grid {
-            compositor_redraw(sessions, windows, current_window, *term_rows, *term_cols);
+        if *sinks_are_grid {
+            compositor_redraw(sessions, windows, *current_window, *term_rows, *term_cols);
         }
         let browsed = run_browse_frame(
             &start,
             can_change_directory,
             sessions.get(&session_id).is_none_or(|s| s.shell.bishopt_bool("gitignore")),
+            session_id,
             sessions,
             windows,
             current_window,
+            next_session_id,
+            next_window_id,
+            cmd_history,
             job_frames,
+            debug_frames,
+            registers,
             term_rows,
             term_cols,
             sinks_are_grid,
@@ -1652,11 +1673,16 @@ fn run_edit_impl(targets: &[fileeditor::EditTarget], attach_debug: bool) -> i32 
         &mut sessions,
         &mut windows,
         0,
-        current_window,
+        &mut current_window,
+        &mut next_session_id,
+        &mut next_window_id,
+        &mut cmd_history,
         &mut job_frames,
+        &mut debug_frames,
+        &mut registers,
         &mut term_rows,
         &mut term_cols,
-        sinks_are_grid,
+        &mut sinks_are_grid,
     );
     let rect = pane_rect(&windows[current_window], windows[current_window].focused_pane, term_rows, term_cols);
     // Unlike the `e` builtin (see open_edit_targets, which reports a bad
@@ -2719,13 +2745,19 @@ fn run_browse_frame(
     // at startup -- `bishopt --set gitignore off` should take effect on
     // the next `e .`, not on the next shell.
     honor_gitignore: bool,
+    session_id: SessionId,
     sessions: &mut HashMap<SessionId, SessionState>,
-    windows: &mut [WindowEntry],
-    current_window: usize,
+    windows: &mut Vec<WindowEntry>,
+    current_window: &mut usize,
+    next_session_id: &mut SessionId,
+    next_window_id: &mut u32,
+    cmd_history: &mut History,
     job_frames: &mut HashMap<JobFrameId, exec::FgJob>,
+    debug_frames: &mut HashMap<EditFrameId, debugger::DebugSession>,
+    registers: &mut Registers,
     term_rows: &mut usize,
     term_cols: &mut usize,
-    sinks_are_grid: bool,
+    sinks_are_grid: &mut bool,
 ) -> Result<BrowseOutcome, String> {
     // Opened before raw mode is touched, so an unreadable path is an
     // ordinary command-mode error at the colon line rather than a
@@ -2739,21 +2771,75 @@ fn run_browse_frame(
     let Ok(_guard) = term::RawGuard::enable_with_mouse(0) else {
         return Err("not a terminal".to_string());
     };
-    let pane_id = windows[current_window].focused_pane;
+    let pane_id = windows[*current_window].focused_pane;
 
     let outcome = loop {
-        let rect = pane_rect(&windows[current_window], pane_id, *term_rows, *term_cols);
+        let rect = pane_rect(&windows[*current_window], pane_id, *term_rows, *term_cols);
         print!("{}", browser.render(rect, *term_rows, *term_cols));
         let _ = io::stdout().flush();
 
         let key = match editor::read_key_idle(&mut || {
-            service_background_jobs(sessions, windows, job_frames, current_window, term_rows, term_cols, sinks_are_grid);
+            service_background_jobs(sessions, windows, job_frames, *current_window, term_rows, term_cols, *sinks_are_grid);
         }) {
             Ok(Some(k)) => k,
             // EOF/error: nothing chosen, same tolerance every other
             // loop's own EOF arm has.
             Ok(None) | Err(_) => break BrowseOutcome::Nothing,
         };
+
+        // `:` opens the very same command mode the editor's own Normal
+        // mode does -- not a smaller one that only knows how to quit.
+        // The browser is a modal takeover of a pane like any other, and
+        // the way out of one of those is `:q`, so that is the way out of
+        // this one. `editing: None`, since there is no buffer here: it
+        // is what makes `q`/`q!` mean "leave this frame" rather than
+        // "close a file" (see run_command_mode's own `editing` doc
+        // comment).
+        if key == editor::Key::Char(':') {
+            // Raw mode belongs to the colon line while it runs, and
+            // comes back to the browser after.
+            let outcome = handle_command_mode(
+                session_id,
+                sessions,
+                windows,
+                current_window,
+                next_session_id,
+                next_window_id,
+                cmd_history,
+                sinks_are_grid,
+                job_frames,
+                debug_frames,
+                registers,
+                term_rows,
+                term_cols,
+                None,
+                None,
+            );
+            // Whatever `:bishopt` just changed has to be picked up
+            // before the next redraw rather than on the next `e .` --
+            // the same reason the editor's own `:` arm re-reads its view
+            // options right here.
+            let honor = sessions.get(&session_id).is_none_or(|s| s.shell.bishopt_bool("gitignore"));
+            if let Err(e) = browser.set_honor_gitignore(honor) {
+                browser.set_message(e);
+            }
+            match outcome {
+                CommandModeOutcome::Quit => break BrowseOutcome::Nothing,
+                // A command that ran says so in the status row, where
+                // the browser already shows what it has to say.
+                CommandModeOutcome::Ran { output, .. } if !output.trim().is_empty() => {
+                    browser.set_message(output.trim().replace('\n', " "));
+                }
+                CommandModeOutcome::Ran { .. } | CommandModeOutcome::Cancelled | CommandModeOutcome::Action(_) => {}
+            }
+            // The colon line drew over the global status row and
+            // whatever else; the next iteration repaints the browser,
+            // but the pane behind it has to come back first.
+            if *sinks_are_grid {
+                compositor_redraw(sessions, windows, *current_window, *term_rows, *term_cols);
+            }
+            continue;
+        }
 
         match browser.handle_key(key, rect) {
             browser::Outcome::Continue => {}

@@ -177,6 +177,9 @@ pub(crate) struct Browser {
     // Whatever went wrong on the last attempted directory read, shown
     // in the status row until the next successful action.
     error: Option<String>,
+    // What the last command run from the colon line had to say. Same
+    // row, no warning sign -- see set_message.
+    message: Option<String>,
     // Whether Ctrl-Y is offered at all -- see Outcome::ChangeDirectory.
     can_change_directory: bool,
 }
@@ -204,6 +207,7 @@ impl Browser {
             back: Vec::new(),
             forward: Vec::new(),
             error: None,
+            message: None,
             can_change_directory: false,
         };
         b.reload()?;
@@ -214,6 +218,15 @@ impl Browser {
     // move can't accidentally offer a key that would do nothing.
     pub(crate) fn set_can_change_directory(&mut self, allow: bool) {
         self.can_change_directory = allow;
+    }
+
+    // Something to say in the status row until the next action clears
+    // it -- what a command run from the browser's own colon line
+    // printed. Its own slot rather than `error`'s: `bishopt wrap`
+    // answering "off" is not a warning, and drawing it with one would
+    // say it was.
+    pub(crate) fn set_message(&mut self, message: String) {
+        self.message = Some(message);
     }
 
     // The `gitignore` bishopt, from whichever shell opened this. Must be
@@ -435,6 +448,7 @@ impl Browser {
             self.forward.clear();
         }
         self.error = None;
+        self.message = None;
         self.query.clear();
         self.searching = false;
         self.cursor = 0;
@@ -500,6 +514,7 @@ impl Browser {
         let page = layout.rows * layout.cols;
         let last = self.view.len().saturating_sub(1);
         self.error = None;
+        self.message = None;
 
         // The filter input owns every printable key while it's active,
         // so only the keys that *aren't* text fall through to the
@@ -874,6 +889,9 @@ impl Browser {
         if let Some(err) = &self.error {
             return fit(&format!("\u{26A0} {err}"), cols);
         }
+        if let Some(message) = &self.message {
+            return fit(message, cols);
+        }
         let detail = match self.current() {
             Some(e) if e.is_parent => "parent directory".to_string(),
             Some(e) if e.is_dir => format!("{}/", e.name),
@@ -883,10 +901,10 @@ impl Browser {
         // The `i` hint is left out when `gitignore` is off -- there is
         // nothing for it to reveal, so offering it would be a lie.
         let hints = match (self.can_change_directory, self.honor_gitignore) {
-            (true, true) => "enter open  ^y cd here  tab select  / filter  . hidden  i ignored  bksp up  esc back",
-            (true, false) => "enter open  ^y cd here  tab select  / filter  . hidden  bksp up  esc back",
-            (false, true) => "enter open  tab select  / filter  . hidden  i ignored  bksp up  esc back",
-            (false, false) => "enter open  tab select  / filter  . hidden  bksp up  esc back",
+            (true, true) => "enter open  ^y cd here  tab select  / filter  . hidden  i ignored  : cmd  bksp up  esc back",
+            (true, false) => "enter open  ^y cd here  tab select  / filter  . hidden  : cmd  bksp up  esc back",
+            (false, true) => "enter open  tab select  / filter  . hidden  i ignored  : cmd  bksp up  esc back",
+            (false, false) => "enter open  tab select  / filter  . hidden  : cmd  bksp up  esc back",
         };
         let used = str_width(&detail) + str_width(hints);
         if used + GUTTER > cols {
