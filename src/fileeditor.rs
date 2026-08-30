@@ -210,10 +210,18 @@ pub(crate) fn scroll_to_show_cursor(buf: &mut TextBuffer, content_cols: usize) {
     }
     let (line, col) = buf.cursor();
     let height = buf.viewport_height();
-    if line < buf.viewport_top() {
-        buf.set_viewport_top(line);
-    } else if line >= buf.viewport_top() + height {
-        buf.set_viewport_top(line + 1 - height);
+    // `scrolloff`: keep this many lines visible above and below the
+    // cursor. Capped at half the pane for the same reason
+    // `sidescrolloff` is -- a margin wider than that has no middle left
+    // to keep the cursor in -- and clamped against the buffer's own ends,
+    // since there is nothing to scroll past the first and last lines.
+    let margin = buf.wrap.scrolloff.min(height.saturating_sub(1) / 2);
+    let top = buf.viewport_top();
+    let highest = buf.line_count().saturating_sub(height);
+    if line < top + margin {
+        buf.set_viewport_top(line.saturating_sub(margin));
+    } else if line + margin >= top + height {
+        buf.set_viewport_top((line + margin + 1 - height).min(highest));
     }
     // In drawn columns, so a tabular file scrolls by what is on screen
     // rather than by how many characters the line happens to hold.
@@ -292,28 +300,64 @@ fn scroll_wrapped(buf: &mut TextBuffer, content_cols: usize) {
     let height = buf.viewport_height().max(1);
     let seg = crate::bishedit::wrap::segment_of(&line_segments(buf, line, content_cols), col);
 
-    // Above the window: the cursor's own row becomes the top.
-    if line < buf.viewport_top() || (line == buf.viewport_top() && seg < buf.viewport_sub()) {
-        buf.set_viewport_top(line);
-        buf.set_viewport_sub(seg);
+    // `scrolloff`, counted in *visual* rows here rather than lines: with
+    // wrapping on, "two lines below the cursor" and "two rows below the
+    // cursor" are different amounts of screen, and rows are what the
+    // margin is actually protecting.
+    let margin = buf.wrap.scrolloff.min(height.saturating_sub(1) / 2);
+    let back_from = |buf: &TextBuffer, from: (usize, usize), steps: usize| {
+        let mut at = from;
+        for _ in 0..steps {
+            let previous = previous_row(buf, at, content_cols);
+            if previous == at {
+                break;
+            }
+            at = previous;
+        }
+        at
+    };
+
+    // Above the window: the cursor's own row moves to `margin` rows
+    // below the top -- with no margin, to the top itself.
+    let above = line < buf.viewport_top() || (line == buf.viewport_top() && seg < buf.viewport_sub());
+    if above || rows_between(buf, (buf.viewport_top(), buf.viewport_sub()), (line, seg), margin, content_cols) < margin {
+        let top = back_from(buf, (line, seg), margin);
+        buf.set_viewport_top(top.0);
+        buf.set_viewport_sub(top.1);
         return;
     }
     // Below it: walk forward from the top, and if the cursor isn't
-    // reached within the pane's height, put it on the last row by
-    // walking back from it instead.
+    // reached within the pane's height minus the margin, put it that
+    // many rows above the bottom by walking back from it instead.
+    let reach = height.saturating_sub(margin);
     let mut at = (buf.viewport_top(), buf.viewport_sub());
-    for _ in 0..height {
+    for _ in 0..reach {
         if at == (line, seg) {
             return;
         }
         at = next_row(buf, at, content_cols);
     }
-    let mut top = (line, seg);
-    for _ in 1..height {
-        top = previous_row(buf, top, content_cols);
-    }
+    let top = back_from(buf, (line, seg), reach.saturating_sub(1));
     buf.set_viewport_top(top.0);
     buf.set_viewport_sub(top.1);
+}
+
+// How many visual rows `to` sits below `from`, giving up once it passes
+// `limit` -- the caller only ever asks "is it at least this far", and a
+// buffer can be long enough that walking the true distance is wasted.
+fn rows_between(buf: &TextBuffer, from: (usize, usize), to: (usize, usize), limit: usize, content_cols: usize) -> usize {
+    let mut at = from;
+    for n in 0..limit {
+        if at == to {
+            return n;
+        }
+        let next = next_row(buf, at, content_cols);
+        if next == at {
+            break;
+        }
+        at = next;
+    }
+    limit
 }
 
 fn next_row(buf: &TextBuffer, (line, sub): (usize, usize), content_cols: usize) -> (usize, usize) {
@@ -2026,6 +2070,12 @@ fn render_diagnostic_cell(buf: &TextBuffer, starts: &[usize], line: usize, _widt
 // buffer's own content starts. Grows dynamically as the buffer gains
 // lines (matching vim), rather than reserving a fixed width up front.
 fn line_number_width(buf: &TextBuffer) -> usize {
+    // Sized for the widest number this column can ever draw, not for
+    // whatever it happens to be drawing now: with `relativenumber` the
+    // distances are small but the cursor's own line still shows its
+    // absolute number, so the column can't shrink to fit the offsets.
+    // A gutter that changed width as the cursor moved would shift every
+    // line of the pane sideways on every `j`.
     buf.line_count().to_string().len() + 1
 }
 
@@ -2033,7 +2083,22 @@ fn render_line_number_cell(buf: &TextBuffer, _starts: &[usize], line: usize, wid
     if line >= buf.line_count() {
         return None;
     }
-    Some(format!("\x1b[2m{:>pad$} \x1b[0m", line + 1, pad = width.saturating_sub(1)))
+    Some(format!("\x1b[2m{:>pad$} \x1b[0m", line_number_text(buf, line), pad = width.saturating_sub(1)))
+}
+
+// What the gutter puts on this line: its own number, or -- with
+// `relativenumber` on -- how far it is from the cursor's, which is what
+// makes `12j` or `d8k` something you read off the screen instead of
+// counting. The cursor's own line keeps its absolute number either way:
+// a `0` there would be the one number on screen that is not a motion
+// count, and vim only shows one because it lets you turn `number` off,
+// which bish does not.
+fn line_number_text(buf: &TextBuffer, line: usize) -> String {
+    let (cursor, _) = buf.cursor();
+    if !buf.relativenumber || line == cursor {
+        return (line + 1).to_string();
+    }
+    line.abs_diff(cursor).to_string()
 }
 
 // Language detection, v1: a bare extension check, not a content sniff --
@@ -4154,6 +4219,93 @@ mod horizontal_scroll_tests {
         scroll_horizontally(&mut b, 12, 40);
         assert_eq!(b.viewport_left(), 0);
         assert_eq!(b.cursor(), (0, 0));
+    }
+
+    fn tall(lines: usize, height: usize) -> TextBuffer {
+        let text: String = (1..=lines).map(|i| format!("line {i}\n")).collect();
+        let mut b = TextBuffer::new_unnamed(height);
+        b.insert_text((0, 0), &text);
+        b.set_cursor(0, 0);
+        b
+    }
+
+    #[test]
+    fn scrolloff_keeps_lines_visible_below_the_cursor() {
+        let mut b = tall(100, 10);
+        b.wrap.scrolloff = 3;
+        b.set_cursor(20, 0);
+        scroll_to_show_cursor(&mut b, 40);
+        // The cursor sits three rows above the bottom, not on it.
+        assert_eq!(b.viewport_top(), 20 + 3 + 1 - 10);
+    }
+
+    #[test]
+    fn scrolloff_keeps_lines_visible_above_the_cursor() {
+        let mut b = tall(100, 10);
+        b.wrap.scrolloff = 3;
+        b.set_viewport_top(40);
+        b.set_cursor(41, 0);
+        scroll_to_show_cursor(&mut b, 40);
+        assert_eq!(b.viewport_top(), 38, "three lines kept above it");
+    }
+
+    // Nothing to scroll past the ends, so the margin gives way there --
+    // otherwise the first line could never sit at the top.
+    #[test]
+    fn scrolloff_gives_way_at_the_ends_of_the_buffer() {
+        let mut b = tall(100, 10);
+        b.wrap.scrolloff = 3;
+        b.set_cursor(0, 0);
+        scroll_to_show_cursor(&mut b, 40);
+        assert_eq!(b.viewport_top(), 0);
+        let last = b.line_count() - 1;
+        b.set_cursor(last, 0);
+        scroll_to_show_cursor(&mut b, 40);
+        assert_eq!(b.viewport_top(), last + 1 - 10, "the last line is on the last row");
+    }
+
+    // A margin wider than half the pane has no middle left to keep the
+    // cursor in, so it is capped rather than fighting itself.
+    #[test]
+    fn a_scrolloff_wider_than_the_pane_is_capped() {
+        let mut b = tall(100, 10);
+        b.wrap.scrolloff = 200;
+        b.set_cursor(50, 0);
+        scroll_to_show_cursor(&mut b, 40);
+        let top = b.viewport_top();
+        assert!(top <= 50 && 50 < top + 10, "the cursor is still on screen: top={top}");
+    }
+
+    #[test]
+    fn scrolloff_off_is_exactly_what_it_always_was() {
+        let mut b = tall(100, 10);
+        b.set_cursor(20, 0);
+        scroll_to_show_cursor(&mut b, 40);
+        assert_eq!(b.viewport_top(), 11, "the cursor on the last row");
+    }
+
+    #[test]
+    fn relativenumber_numbers_by_distance_and_keeps_the_cursors_own() {
+        let mut b = tall(10, 10);
+        b.set_cursor(4, 0);
+        assert_eq!(line_number_text(&b, 0), "1", "absolute while it is off");
+        b.relativenumber = true;
+        assert_eq!(line_number_text(&b, 4), "5", "the cursor's own line keeps its number");
+        assert_eq!(line_number_text(&b, 3), "1");
+        assert_eq!(line_number_text(&b, 5), "1");
+        assert_eq!(line_number_text(&b, 0), "4");
+        assert_eq!(line_number_text(&b, 9), "5");
+    }
+
+    // The column can't shrink to fit the offsets: a gutter that changed
+    // width as the cursor moved would shift the whole pane sideways on
+    // every `j`.
+    #[test]
+    fn the_gutter_keeps_its_width_under_relativenumber() {
+        let mut b = tall(100, 10);
+        let absolute = line_number_width(&b);
+        b.relativenumber = true;
+        assert_eq!(line_number_width(&b), absolute);
     }
 
     #[test]

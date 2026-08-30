@@ -32,6 +32,12 @@ pub struct Options {
     pub column: usize,
     // With `wrap` off: how many columns to keep visible either side of
     // the cursor.
+    // Vertical counterpart to `sidescrolloff`, and the one option here
+    // that has nothing to do with wrapping -- it lives on this struct
+    // because this is where a buffer's view options are, and splitting
+    // "how the view scrolls" across two homes would be worse than the
+    // slightly wide name.
+    pub scrolloff: usize,
     pub sidescrolloff: usize,
     // With `wrap` off: what marks a line continuing past the right or
     // left edge. Empty for nothing, which is the default.
@@ -51,6 +57,7 @@ impl Default for Options {
             breakindent: true,
             showbreak: "\u{21B3} ".to_string(),
             column: 0,
+            scrolloff: 0,
             sidescrolloff: 0,
             extends: String::new(),
             precedes: String::new(),

@@ -96,6 +96,9 @@ pub struct TextBuffer {
     // either way, since the styling that marks them comes from the same
     // pass.
     pub hyperlinks: bool,
+    // The `relativenumber` bishopt: whether the gutter numbers each line
+    // by its distance from the cursor's instead of absolutely.
+    pub relativenumber: bool,
     // Which visual row of `vtop`'s own line the viewport starts at. Only
     // ever non-zero with wrapping on, and only for a line tall enough to
     // exceed the pane by itself -- without it, a minified file would
@@ -175,6 +178,7 @@ impl TextBuffer {
             wrap: crate::bishedit::wrap::Options::default(),
             tabular: None,
             hyperlinks: true,
+            relativenumber: false,
             vtop_sub: 0,
             snippet_holes: Vec::new(),
             diagnostics: Vec::new(),
@@ -226,6 +230,7 @@ impl TextBuffer {
             wrap: crate::bishedit::wrap::Options::default(),
             tabular: None,
             hyperlinks: true,
+            relativenumber: false,
             vtop_sub: 0,
             snippet_holes: Vec::new(),
             diagnostics: Vec::new(),
@@ -726,6 +731,7 @@ mod tests {
             wrap: crate::bishedit::wrap::Options::default(),
             tabular: None,
             hyperlinks: true,
+            relativenumber: false,
             vtop_sub: 0,
             snippet_holes: Vec::new(),
             diagnostics: Vec::new(),

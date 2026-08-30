@@ -5679,6 +5679,19 @@ pub(crate) fn scroll_to_show_cursor(buf: &mut impl BisheditBuffer, content_cols:
 // -- `ReadOnly`'s `ScreenBuffer` has no gutter at all (the whole pane
 // width is content), `Editable`'s `TextBuffer` does (see
 // fileeditor::editor_content_cols).
+// The nav loop drives both kinds of buffer, and a real file wants the
+// scrolling `fileeditor` does for it everywhere else: `scrolloff`, the
+// wrap-aware walk over visual rows, and drawn-column arithmetic for a
+// tabular file. The generic version below it is right for a
+// `ScreenBuffer`, whose content is already fixed-width pre-wrapped
+// terminal output with none of those questions to answer.
+fn nav_scroll_to_show_cursor(buf: &mut NavBuffer, content_cols: usize) {
+    match buf {
+        NavBuffer::Editable(tb) => fileeditor::scroll_to_show_cursor(tb, content_cols),
+        NavBuffer::ReadOnly(sb) => scroll_to_show_cursor(sb, content_cols),
+    }
+}
+
 // A `ScreenBuffer`'s content is already fixed-width, pre-wrapped
 // terminal output with nothing off to the side to scroll into (see
 // `Buffer::viewport_left`'s own doc comment), so the horizontal wheel
@@ -6201,6 +6214,7 @@ fn wrap_options(shell: &exec::Shell) -> crate::bishedit::wrap::Options {
         breakindent: shell.bishopt_bool("breakindent"),
         showbreak: shell.bishopt_str("showbreak"),
         column: shell.bishopt_int("wrap_column").max(0) as usize,
+        scrolloff: shell.bishopt_int("scrolloff").max(0) as usize,
         sidescrolloff: shell.bishopt_int("sidescrolloff").max(0) as usize,
         extends: shell.bishopt_str("extends"),
         precedes: shell.bishopt_str("precedes"),
@@ -6215,6 +6229,7 @@ fn apply_view_options(shell: &exec::Shell, buf: &mut TextBuffer) {
     buf.wrap = wrap_options(shell);
     buf.tabular = tabular_style(shell, &fileeditor::language_of(buf));
     buf.hyperlinks = shell.bishopt_bool("hyperlinks");
+    buf.relativenumber = shell.bishopt_bool("relativenumber");
 }
 
 // Whether this buffer's columns line up, and on what. Two conditions,
@@ -6647,7 +6662,7 @@ fn run_normal_mode_navigation(
                 if vk.is_visual() {
                     place_nav_cursor_at(&mut buf, rect, row0, col0);
                     let content_cols = nav_content_cols(&buf, rect);
-                    scroll_to_show_cursor(&mut buf, content_cols);
+                    nav_scroll_to_show_cursor(&mut buf, content_cols);
                 }
             } else if ev.is_release() {
                 // A press with no drag after it: the anchor is still
@@ -6665,7 +6680,7 @@ fn run_normal_mode_navigation(
                 let motion = if ev.is_scroll_down() { motion::Motion::ScrollLineDown } else { motion::Motion::ScrollLineUp };
                 editor::apply_motion_or_reselect(&mut vk, &mut buf, motion, Some(fileeditor::MOUSE_WHEEL_LINES));
                 let content_cols = nav_content_cols(&buf, rect);
-                scroll_to_show_cursor(&mut buf, content_cols);
+                nav_scroll_to_show_cursor(&mut buf, content_cols);
             } else if ev.is_scroll_left() || ev.is_scroll_right() {
                 let columns = fileeditor::MOUSE_WHEEL_COLUMNS as isize;
                 let content_cols = nav_content_cols(&buf, rect);
@@ -7066,7 +7081,7 @@ fn run_normal_mode_navigation(
             KeyOutcome::Motion(m, count) => {
                 editor::apply_motion_or_reselect(&mut vk, &mut buf, m, count);
                 let content_cols = nav_content_cols(&buf, rect);
-                scroll_to_show_cursor(&mut buf, content_cols);
+                nav_scroll_to_show_cursor(&mut buf, content_cols);
                 render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides.as_ref());
             }
             // `ReadOnly`: hands typing back to the live prompt's own
@@ -7139,7 +7154,7 @@ fn run_normal_mode_navigation(
                     let col = col.min(buf.line_len(row));
                     buf.set_cursor(row, col);
                     let content_cols = nav_content_cols(&buf, rect);
-                    scroll_to_show_cursor(&mut buf, content_cols);
+                    nav_scroll_to_show_cursor(&mut buf, content_cols);
                 }
                 render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides.as_ref());
             }

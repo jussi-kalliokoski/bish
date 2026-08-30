@@ -10530,6 +10530,12 @@ const KNOWN_BISHOPTS: &[(&str, BishOptDefault)] = &[
     // own `wordWrapColumn`. 0 means the pane's width; anything else is
     // capped by it, so a narrow pane still wraps at the pane.
     ("wrap_column", BishOptDefault::Int(0, 0..=1000)),
+    // vim's own: keep this many lines visible above and below the
+    // cursor rather than letting it sit against the top or bottom of
+    // the pane. Applies with or without wrapping, unlike its horizontal
+    // counterpart just below. Capped at half the pane, since a margin
+    // wider than that has no middle left to keep the cursor in.
+    ("scrolloff", BishOptDefault::Int(0, 0..=200)),
     // ...and the two that matter while `wrap` is *off*. `sidescrolloff`
     // is vim's own: keep this many columns visible either side of the
     // cursor rather than letting it sit against the edge.
@@ -10574,6 +10580,15 @@ const KNOWN_BISHOPTS: &[(&str, BishOptDefault)] = &[
     // lets the dividers have the whole split if that is what the pane
     // count comes to.
     ("divider_budget", BishOptDefault::Int(25, 0..=100)),
+    // vim's own `relativenumber`: number each line by its distance from
+    // the cursor's, which is what makes `12j` or `d8k` something you
+    // read off the screen instead of counting.
+    //
+    // The cursor's own line keeps its absolute number -- vim gets that
+    // by setting `number` *and* `relativenumber` together, and bish has
+    // no `number` to turn off (the gutter always numbers), so this is
+    // the only reading of it that leaves the option meaningful.
+    ("relativenumber", BishOptDefault::Bool(false)),
 ];
 
 // Every bishopt option name, in registry order -- the source of truth
