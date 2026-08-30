@@ -320,6 +320,70 @@ fn markdown_inlines(inlines: &[crate::markdown::Inline], out: &mut Vec<Highlight
 // roff -- man page source -- over crate::roff's own lexical pass, not
 // its interpreter. That distinction is the point: a highlighter must
 // colour the source as written, so the `.de` and `.ie` scaffolding a
+// INI, and the family of config formats that are INI in all but name.
+// Reads `ini::parse`'s items directly -- the same one-layer arrangement
+// MarkdownHighlighter has, and for the same reason: a second scanner
+// that "just looks for `=`" is how a highlighter starts disagreeing
+// with the parser it is supposed to describe. It can afford to, because
+// unlike JSON an INI parse never fails; see ini.rs's own header for
+// which dialect disagreements it takes a side on.
+//
+// Values are coloured by kind rather than uniformly: a number, a
+// boolean and a quoted string say something a reader can use, while the
+// great majority of values -- a path, a command line, a URL -- are
+// arbitrary text that colouring would only make louder.
+pub struct IniHighlighter;
+
+impl Highlighter for IniHighlighter {
+    fn highlight(&self, text: &str, _ctx: HighlightContext) -> Vec<HighlightSpan> {
+        let mut out = Vec::new();
+        for item in &crate::ini::parse(text).items {
+            match item {
+                crate::ini::Item::Comment { span: s } => out.push(span(s.clone(), HighlightKind::Comment)),
+                crate::ini::Item::Section { sub, span: s, .. } => {
+                    // The whole header, brackets included: a section is
+                    // one thing to a reader, the same call
+                    // markdown_block makes for a heading's own `#`.
+                    out.push(span(s.clone(), HighlightKind::Keyword));
+                    // Layered over it, since a subsection really is a
+                    // string sitting inside the header.
+                    if let Some(sub) = sub {
+                        out.push(span(sub.clone(), HighlightKind::String));
+                    }
+                }
+                crate::ini::Item::Entry { key, separator, value, .. } => {
+                    out.push(span(key.clone(), HighlightKind::Key));
+                    if let Some(at) = separator {
+                        out.push(span(*at..*at + 1, HighlightKind::Operator));
+                    }
+                    if let Some(value) = value {
+                        ini_value(value, &mut out);
+                    }
+                }
+                crate::ini::Item::Continuation { value, .. } => ini_value(value, &mut out),
+                crate::ini::Item::Blank { .. } => {}
+            }
+        }
+        out
+    }
+}
+
+fn ini_value(value: &crate::ini::Value, out: &mut Vec<HighlightSpan>) {
+    let kind = match value.kind {
+        crate::ini::ValueKind::Quoted => HighlightKind::String,
+        crate::ini::ValueKind::Number => HighlightKind::Number,
+        crate::ini::ValueKind::Bool => HighlightKind::Keyword,
+        // Left uncoloured on purpose -- see IniHighlighter's own comment.
+        crate::ini::ValueKind::Plain => return,
+    };
+    out.push(span(value.span.clone(), kind));
+    // Over the string's own span, exactly as a JSON string's escapes sit
+    // over theirs.
+    for esc in &value.escapes {
+        out.push(span(esc.clone(), HighlightKind::FormatSpecifier));
+    }
+}
+
 // generated page opens with stays visible as what it is rather than
 // being executed away.
 pub struct RoffHighlighter;
@@ -359,6 +423,7 @@ pub fn highlighter_for_language(language: &str) -> Option<Box<dyn Highlighter>> 
         "json" => Some(Box::new(JsonHighlighter)),
         "markdown" | "md" => Some(Box::new(MarkdownHighlighter)),
         "roff" | "man" | "troff" | "groff" => Some(Box::new(RoffHighlighter)),
+        "ini" => Some(Box::new(IniHighlighter)),
         _ => None,
     }
 }
@@ -1173,6 +1238,13 @@ mod tests {
     fn json_kinds(text: &str) -> Vec<(String, HighlightKind)> {
         let chars: Vec<char> = text.chars().collect();
         let mut spans = JsonHighlighter.highlight(text, HighlightContext::default());
+        spans.sort_by_key(|s| (s.start, s.end));
+        spans.into_iter().map(|s| (chars[s.start..s.end].iter().collect(), s.kind)).collect()
+    }
+
+    fn ini_kinds(text: &str) -> Vec<(String, HighlightKind)> {
+        let chars: Vec<char> = text.chars().collect();
+        let mut spans = IniHighlighter.highlight(text, HighlightContext::default());
         spans.sort_by_key(|s| (s.start, s.end));
         spans.into_iter().map(|s| (chars[s.start..s.end].iter().collect(), s.kind)).collect()
     }
@@ -2125,5 +2197,86 @@ mod tests {
         let kinds = roff_kinds(".de Flag\n.B \\\\$1\n..\n.Flag x\n");
         assert!(kinds.iter().any(|(t, k)| t == "de" && *k == HighlightKind::Keyword));
         assert!(kinds.iter().any(|(t, k)| t == "Flag" && *k == HighlightKind::Keyword));
+    }
+
+    #[test]
+    fn ini_highlights_a_section_its_key_and_its_value() {
+        assert_eq!(
+            ini_kinds("[core]\nbare = true\n"),
+            vec![
+                ("[core]".to_string(), HighlightKind::Keyword),
+                ("bare".to_string(), HighlightKind::Key),
+                ("=".to_string(), HighlightKind::Operator),
+                ("true".to_string(), HighlightKind::Keyword),
+            ]
+        );
+    }
+
+    // The subsection is a string sitting inside the header, so both
+    // spans are emitted and compose paints the later one over the first.
+    #[test]
+    fn ini_paints_a_subsection_over_its_header() {
+        assert_eq!(
+            ini_kinds("[remote \"origin\"]"),
+            vec![
+                ("[remote \"origin\"]".to_string(), HighlightKind::Keyword),
+                ("\"origin\"".to_string(), HighlightKind::String),
+            ]
+        );
+    }
+
+    // The great majority of values are arbitrary text, and colouring
+    // them would only make the file louder without saying anything.
+    #[test]
+    fn ini_leaves_an_ordinary_value_uncoloured() {
+        assert_eq!(
+            ini_kinds("ExecStart=/usr/bin/env sh"),
+            vec![("ExecStart".to_string(), HighlightKind::Key), ("=".to_string(), HighlightKind::Operator)]
+        );
+    }
+
+    #[test]
+    fn ini_colours_numbers_and_quoted_strings_but_not_paths() {
+        let kinds = |text: &str| ini_kinds(text).into_iter().map(|(_, k)| k).last().unwrap();
+        assert_eq!(kinds("port = 8080"), HighlightKind::Number);
+        assert_eq!(kinds("mask = 0xFF"), HighlightKind::Number);
+        assert_eq!(kinds("name = \"bish\""), HighlightKind::String);
+        assert_eq!(kinds("enabled = no"), HighlightKind::Keyword);
+        assert_eq!(kinds("path = /var/log"), HighlightKind::Operator, "the `=` is the last span; the value got none");
+    }
+
+    #[test]
+    fn ini_marks_escapes_inside_a_quoted_value() {
+        assert_eq!(
+            ini_kinds("a = \"x\\ny\""),
+            vec![
+                ("a".to_string(), HighlightKind::Key),
+                ("=".to_string(), HighlightKind::Operator),
+                ("\"x\\ny\"".to_string(), HighlightKind::String),
+                ("\\n".to_string(), HighlightKind::FormatSpecifier),
+            ]
+        );
+    }
+
+    // Only at the start of a line -- a `#` in a systemd command is part
+    // of the command. See ini.rs's header for why that side was taken.
+    #[test]
+    fn ini_highlights_whole_line_comments_only() {
+        assert_eq!(ini_kinds("; a note"), vec![("; a note".to_string(), HighlightKind::Comment)]);
+        let trailing = ini_kinds("a = 1 ; not a comment");
+        assert!(!trailing.iter().any(|(_, k)| *k == HighlightKind::Comment));
+    }
+
+    // A continuation's text is value, not a key -- the visible payoff of
+    // the parser knowing the difference.
+    #[test]
+    fn ini_does_not_read_a_continuation_line_as_a_key() {
+        let spans = ini_kinds("install_requires =\n    foo >= 1.0\n");
+        assert_eq!(spans.iter().filter(|(_, k)| *k == HighlightKind::Key).count(), 1, "only `install_requires`");
+    }
+
+    #[test]
+    fn ini_highlights_nothing_in_empty_input() {
+        assert_eq!(ini_kinds(""), vec![]);
     }
 }

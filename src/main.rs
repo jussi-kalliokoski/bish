@@ -17,6 +17,7 @@ mod hexedit;
 mod history;
 mod html;
 mod inflate;
+mod ini;
 mod json;
 mod lexer;
 mod markdown;

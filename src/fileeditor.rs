@@ -2020,6 +2020,51 @@ const LANGUAGE_BY_EXTENSION: &[(&str, &str)] = &[
     ("9", "roff"),
     ("man", "roff"),
     ("tmac", "roff"),
+    // The INI family. `.conf` is the loosest of these -- plenty of
+    // `.conf` files (nginx's, apache's) are nothing of the sort -- but
+    // it is by far the most common extension people actually put INI
+    // in, and the cost of being wrong is that a brace-and-semicolon
+    // config gets its words coloured as keys.
+    ("ini", "ini"),
+    ("cfg", "ini"),
+    ("conf", "ini"),
+    ("desktop", "ini"),
+    // systemd units, which are INI with a stricter dialect. Several of
+    // these are generic-looking words (`.path`, `.link`, `.target`) and
+    // a file with one of those names that *isn't* a unit will be read
+    // as INI; nothing but highlighting depends on this, and in practice
+    // nothing else claims them.
+    ("service", "ini"),
+    ("socket", "ini"),
+    ("timer", "ini"),
+    ("target", "ini"),
+    ("mount", "ini"),
+    ("automount", "ini"),
+    ("path", "ini"),
+    ("slice", "ini"),
+    ("network", "ini"),
+    ("netdev", "ini"),
+    ("link", "ini"),
+    ("nmconnection", "ini"),
+];
+
+// The other half of recognizing a file: what it is *called*. Every entry
+// above is an extension, and the most-used config files in the INI
+// family don't have one -- `.gitconfig`, `.editorconfig` and `.npmrc`
+// are all extension-less as far as `Path` is concerned (a leading dot
+// makes the whole name the stem). Matched case-insensitively against
+// the file name, ahead of the extension table.
+const LANGUAGE_BY_FILE_NAME: &[(&str, &str)] = &[
+    (".gitconfig", "ini"),
+    (".gitmodules", "ini"),
+    (".editorconfig", "ini"),
+    (".npmrc", "ini"),
+    (".hgrc", "ini"),
+    (".pypirc", "ini"),
+    (".pylintrc", "ini"),
+    ("pylintrc", "ini"),
+    (".flake8", "ini"),
+    (".coveragerc", "ini"),
 ];
 
 pub(crate) fn language_of(buf: &TextBuffer) -> String {
@@ -2032,6 +2077,17 @@ pub(crate) fn language_of(buf: &TextBuffer) -> String {
         Some(ext) if ext.eq_ignore_ascii_case("gz") => std::path::Path::new(path.file_stem().unwrap_or(path.as_os_str())),
         _ => path,
     };
+    let name = path.file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
+    if let Some((_, lang)) = LANGUAGE_BY_FILE_NAME.iter().find(|(n, _)| *n == name) {
+        return (*lang).to_string();
+    }
+    // `config` alone is far too common a name to claim, but inside a
+    // `.git` directory (or the `git` one under `~/.config`) it is the
+    // git config -- which is the file you are actually editing when you
+    // type `e .git/config`.
+    if name == "config" && path.parent().and_then(|p| p.file_name()).is_some_and(|d| d == ".git" || d == "git") {
+        return "ini".to_string();
+    }
     let Some(ext) = path.extension() else {
         return "text".to_string();
     };
@@ -4263,6 +4319,37 @@ mod pre_save_hook_tests {
         assert_eq!(language_of(&buf_with_ext("x", "TOML")), "toml", "case-folded, so `--lang=toml` matches either spelling");
         assert_eq!(language_of(&buf_with_ext("x", "txt")), "txt");
         assert_eq!(language_of(&TextBuffer::new_unnamed(10)), "text");
+    }
+
+    fn buf_named(name: &str) -> TextBuffer {
+        TextBuffer::open(std::path::Path::new(&format!("/tmp/bish-fileeditor-name-test/{name}")), 10).unwrap()
+    }
+
+    // The INI family is spread across extensions that share nothing.
+    #[test]
+    fn the_ini_family_is_recognized_by_extension() {
+        for name in ["settings.ini", "setup.cfg", "sshd.conf", "firefox.desktop", "nginx.service", "boot.timer", "wg0.netdev"] {
+            assert_eq!(language_of(&buf_named(name)), "ini", "{name}");
+        }
+        assert_eq!(language_of(&buf_named("Desktop.INI")), "ini", "case-folded like every other extension");
+    }
+
+    // ...and the most-used ones have no extension at all, which is why
+    // there is a name table too.
+    #[test]
+    fn the_extension_less_ini_files_are_recognized_by_name() {
+        for name in [".gitconfig", ".editorconfig", ".npmrc", ".pylintrc", "pylintrc", ".flake8"] {
+            assert_eq!(language_of(&buf_named(name)), "ini", "{name}");
+        }
+    }
+
+    // `config` on its own is claimed by everything; inside `.git` it
+    // isn't ambiguous at all.
+    #[test]
+    fn a_bare_config_is_ini_only_inside_a_git_directory() {
+        assert_eq!(language_of(&buf_named(".git/config")), "ini");
+        assert_eq!(language_of(&buf_named("git/config")), "ini", "the one under ~/.config");
+        assert_eq!(language_of(&buf_named("myapp/config")), "text", "anywhere else it could be anything");
     }
 
     #[test]
