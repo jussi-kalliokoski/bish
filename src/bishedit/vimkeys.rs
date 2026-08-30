@@ -95,6 +95,19 @@ pub enum KeyOutcome {
     /// reasoning as `EnterVisual`'s own doc comment); a no-op if there's
     /// nothing to reselect yet.
     ReselectVisual,
+    /// `gd`: ask whatever knows about this language where the thing
+    /// under the cursor is defined, and go there.
+    ///
+    /// Real vim's `gd` is a *local* declaration search -- a backwards
+    /// scan for the identifier in the current function -- and this is
+    /// the binding every editor with a language server has since given
+    /// to go-to-definition, for the same reason `K` became hover: the
+    /// key already means "tell me about this thing", and a server just
+    /// knows the answer better. Emitted here, resolved by whoever is
+    /// driving the buffer; a frontend with no server simply doesn't
+    /// wire it, the same "enforced by omission" the debugger's
+    /// read-only subset already relies on.
+    GotoDefinition,
     /// `Ctrl-O`/`Ctrl-I` -- step backward/forward through the jump list.
     /// The caller must call `vk.jump_back(buf.cursor())`/`vk.jump_forward
     /// (buf.cursor())` (this crate owns the jump-list state -- see
@@ -1090,6 +1103,13 @@ impl VimKeys {
         KeyOutcome::ReselectVisual
     }
 
+    fn emit_goto_definition(&mut self) -> KeyOutcome {
+        self.count = None;
+        self.pending = Pending::None;
+        self.last_completed = std::mem::take(&mut self.current_input);
+        KeyOutcome::GotoDefinition
+    }
+
     fn emit_jump(&mut self, forward: bool) -> KeyOutcome {
         self.count = None;
         self.pending = Pending::None;
@@ -1451,6 +1471,7 @@ impl VimKeys {
                 self.last_search = Some(LastSearch::Word { forward: false, bounded: false });
                 self.emit(Motion::SearchWordBackwardUnbounded)
             }
+            Key::Char('d') => self.emit_goto_definition(),
             Key::Char('J') => self.emit_join(false),
             Key::Char('v') => self.emit_reselect_visual(),
             Key::Char('i') => self.emit_insert(InsertCmd::LastInsertPos),
@@ -1990,6 +2011,20 @@ mod tests {
         assert_eq!(vk.jump_forward((0, 0)), Some((10, 0)));
         assert_eq!(vk.jump_forward((10, 0)), Some((20, 0)));
         assert_eq!(vk.jump_forward((20, 0)), None); // exhausted
+    }
+
+    #[test]
+    fn gd_emits_goto_definition_and_does_not_disturb_g_s_other_bindings() {
+        let mut vk = VimKeys::new();
+        assert_eq!(vk.feed(Key::Char('g')), KeyOutcome::Pending);
+        assert_eq!(vk.feed(Key::Char('d')), KeyOutcome::GotoDefinition);
+        // The `g` family is crowded, and `d` is also the delete
+        // operator's own key -- so check the neighbours still work.
+        assert_eq!(vk.feed(Key::Char('g')), KeyOutcome::Pending);
+        assert_eq!(vk.feed(Key::Char('g')), KeyOutcome::Motion(Motion::GotoFirstLine, None));
+        // A bare `d` is still the delete operator, not this.
+        assert_eq!(vk.feed(Key::Char('d')), KeyOutcome::Pending);
+        vk.feed(Key::Escape);
     }
 
     #[test]

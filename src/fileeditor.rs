@@ -2496,6 +2496,10 @@ pub(crate) fn buffer_text(buf: &TextBuffer) -> String {
 // prefix-sum vector, indexed by line number, rather than summed fresh
 // per row -- build_editor_frame's own loop calls this once and reuses
 // it, not once per visible row.
+pub(crate) fn line_starts_of(buf: &TextBuffer) -> Vec<usize> {
+    line_starts(buf)
+}
+
 fn line_starts(buf: &TextBuffer) -> Vec<usize> {
     let mut starts = Vec::with_capacity(buf.line_count());
     let mut pos = 0;

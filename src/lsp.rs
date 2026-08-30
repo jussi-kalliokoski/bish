@@ -527,6 +527,54 @@ fn hover_text_lines(text: &str) -> Vec<String> {
 }
 
 // ---------------------------------------------------------------------
+// Locations
+// ---------------------------------------------------------------------
+
+/// Somewhere in some file: what `textDocument/definition` (and later
+/// `references`, `documentSymbol`) answers with. Positions are still in
+/// the server's own `(line, character)`, for the same reason `Finding`'s
+/// are.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Location {
+    pub uri: String,
+    pub start: (usize, usize),
+    pub end: (usize, usize),
+}
+
+/// Reads a definition-shaped result. Empty when the server had nothing
+/// -- a `null` result is the ordinary way of saying "I don't know where
+/// that is", not a failure.
+///
+/// Three shapes again, and again all three are in use: a single
+/// `Location`, an array of them, and an array of `LocationLink` (the
+/// newer form, which names its target with `targetUri` and carries both
+/// a full `targetRange` and the narrower `targetSelectionRange` -- the
+/// selection range is the one to jump to, since it is the identifier
+/// itself rather than the whole declaration body).
+pub fn locations(result: &Value) -> Vec<Location> {
+    match result {
+        Value::Object(_) => location(result).into_iter().collect(),
+        Value::Array(items) => items.iter().filter_map(location).collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn location(value: &Value) -> Option<Location> {
+    // A LocationLink names its target differently, and prefers the
+    // narrower of its two ranges.
+    if let Ok(Value::Str(uri)) = json::query(value, ".targetUri") {
+        let range = match json::query(value, ".targetSelectionRange") {
+            Ok(range @ Value::Object(_)) => range,
+            _ => json::query(value, ".targetRange").ok()?,
+        };
+        return Some(Location { uri: uri.clone(), start: position(json::query(range, ".start").ok()?)?, end: position(json::query(range, ".end").ok()?)? });
+    }
+    let Ok(Value::Str(uri)) = json::query(value, ".uri") else { return None };
+    let range = json::query(value, ".range").ok()?;
+    Some(Location { uri: uri.clone(), start: position(json::query(range, ".start").ok()?)?, end: position(json::query(range, ".end").ok()?)? })
+}
+
+// ---------------------------------------------------------------------
 // Languages
 // ---------------------------------------------------------------------
 
@@ -828,6 +876,50 @@ mod tests {
         // Mid-character resolves to that character's own start.
         assert_eq!(from_server_column(&line, 2, PositionEncoding::Utf16), 1);
         assert_eq!(from_server_column(&line, 3, PositionEncoding::Utf8), 1);
+    }
+
+    #[test]
+    fn every_shape_a_definition_may_come_back_in_is_read() {
+        let one = json::parse(r#"{"uri":"file:///a.rs","range":{"start":{"line":3,"character":4},"end":{"line":3,"character":9}}}"#).unwrap();
+        assert_eq!(locations(&one), vec![Location { uri: "file:///a.rs".to_string(), start: (3, 4), end: (3, 9) }]);
+
+        let many = json::parse(
+            r#"[{"uri":"file:///a.rs","range":{"start":{"line":0,"character":0},"end":{"line":0,"character":1}}},
+                {"uri":"file:///b.rs","range":{"start":{"line":9,"character":2},"end":{"line":9,"character":5}}}]"#,
+        )
+        .unwrap();
+        assert_eq!(locations(&many).len(), 2);
+        assert_eq!(locations(&many)[1].uri, "file:///b.rs");
+
+        // A LocationLink names its target differently and carries two
+        // ranges; the selection range is the identifier itself, which is
+        // where a jump should land, rather than the whole declaration.
+        let link = json::parse(
+            r#"[{"targetUri":"file:///c.rs",
+                "targetRange":{"start":{"line":10,"character":0},"end":{"line":20,"character":1}},
+                "targetSelectionRange":{"start":{"line":10,"character":7},"end":{"line":10,"character":11}}}]"#,
+        )
+        .unwrap();
+        assert_eq!(locations(&link), vec![Location { uri: "file:///c.rs".to_string(), start: (10, 7), end: (10, 11) }]);
+
+        // ...falling back to the full range when that is all there is.
+        let link_only = json::parse(
+            r#"[{"targetUri":"file:///c.rs","targetRange":{"start":{"line":10,"character":0},"end":{"line":20,"character":1}}}]"#,
+        )
+        .unwrap();
+        assert_eq!(locations(&link_only)[0].start, (10, 0));
+    }
+
+    #[test]
+    fn a_server_that_does_not_know_where_something_is_says_so_with_null() {
+        assert!(locations(&Value::Null).is_empty());
+        assert!(locations(&json::parse("[]").unwrap()).is_empty());
+        // One malformed entry does not cost the rest.
+        let mixed = json::parse(r#"[{"nonsense":1},{"uri":"file:///a.rs","range":{"start":{"line":1,"character":0},"end":{"line":1,"character":2}}}]"#).unwrap();
+        assert_eq!(mixed_len(&mixed), 1);
+        fn mixed_len(v: &Value) -> usize {
+            locations(v).len()
+        }
     }
 
     fn hover(json_text: &str) -> Option<Vec<String>> {

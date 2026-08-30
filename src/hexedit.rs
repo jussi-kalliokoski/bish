@@ -1321,6 +1321,10 @@ impl HexSession {
                 self.vk.begin_visual(shape, anchor);
                 self.mode = Mode::Visual;
             }
+            // A hex view of a binary file has no identifiers and no
+            // language server; `gd` simply does nothing, the same way
+            // every other outcome this view has no meaning for does.
+            KeyOutcome::GotoDefinition => {}
             KeyOutcome::ReselectVisual => {
                 if let Some((shape, anchor, cursor)) = self.vk.last_visual() {
                     self.buf.set_cursor(cursor.0, cursor.1);

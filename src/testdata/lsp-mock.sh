@@ -57,7 +57,17 @@ while :; do
 	id=$(printf '%s' "$body" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
 	case "$body" in
 	*'"method":"initialize"'*)
-		send '{"jsonrpc":"2.0","id":'"$id"',"result":{"capabilities":{"positionEncoding":"utf-32","hoverProvider":true,"textDocumentSync":{"openClose":true,"change":1,"save":true}}}}'
+		send '{"jsonrpc":"2.0","id":'"$id"',"result":{"capabilities":{"positionEncoding":"utf-32","hoverProvider":true,"definitionProvider":true,"textDocumentSync":{"openClose":true,"change":1,"save":true}}}}'
+		;;
+	*'"method":"textDocument/didOpen"'*)
+		# Remembered so `textDocument/definition` can answer about
+		# the document the client actually opened.
+		uri=$(printf '%s' "$body" | sed -n 's/.*"uri":"\([^"]*\)".*/\1/p')
+		;;
+	*'"method":"textDocument/definition"'*)
+		# Line 1 of the same document, which the test opens: a
+		# same-file jump, the case that is actually wired up.
+		send '{"jsonrpc":"2.0","id":'"$id"',"result":{"uri":"'"$uri"'","range":{"start":{"line":1,"character":0},"end":{"line":1,"character":5}}}}'
 		;;
 	*'"method":"textDocument/hover"'*)
 		# Markdown with a fenced signature, which is the shape a real

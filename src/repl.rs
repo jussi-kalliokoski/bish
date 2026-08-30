@@ -7180,7 +7180,7 @@ fn run_normal_mode_navigation(
                 // bash and this buffer's own comments. Everything about
                 // the fallback is unchanged, so a bash file with no
                 // server behaves exactly as it always has.
-                let hover_lines = hover_from_server(
+                let hover_lines = ask_server_at_cursor(
                     sessions,
                     windows,
                     job_frames,
@@ -7192,7 +7192,10 @@ fn run_normal_mode_navigation(
                     tb,
                     row,
                     col,
+                    "textDocument/hover",
+                    "hoverProvider",
                 )
+                .and_then(|result| crate::lsp::hover_lines(&result))
                 .unwrap_or_else(|| {
                     let index = docs::DocIndex::build_from_source(&tb.text(), &base_path);
                     let debug_session = edit_frame_id.and_then(|id| debug_frames.get(&id));
@@ -7309,6 +7312,74 @@ fn run_normal_mode_navigation(
         }
 
         match vk.feed(key) {
+            // `gd`: ask the language server where this is defined, and
+            // go there.
+            //
+            // Scoped to `Editable`, like `K`, for the same reason -- a
+            // scrollback view has no file for a server to answer about.
+            // A definition in *another* file is reported rather than
+            // opened: opening one needs this loop to hand a new frame
+            // back to its caller, which means a new `NavExit` variant
+            // and a change to all three of its call sites. That is a
+            // real design decision rather than an oversight, and it is
+            // deliberately not being made here (see plan.md).
+            KeyOutcome::GotoDefinition => {
+                if let NavBuffer::Editable(tb) = &buf {
+                    let (row, col) = tb.cursor();
+                    let here = tb.path().map(crate::url::from_file_path);
+                    let found = ask_server_at_cursor(
+                        sessions,
+                        windows,
+                        job_frames,
+                        session_id,
+                        *current_window,
+                        term_rows,
+                        term_cols,
+                        *sinks_are_grid,
+                        tb,
+                        row,
+                        col,
+                        "textDocument/definition",
+                        "definitionProvider",
+                    )
+                    .map(|result| crate::lsp::locations(&result))
+                    .unwrap_or_default();
+                    // The first is the one to go to. A server that
+                    // returns several has found several definitions of
+                    // the same name (a trait method's implementations,
+                    // say), and choosing between them is what the
+                    // location list this defers will be for.
+                    let target = found.first().cloned();
+                    let elsewhere = found.iter().find(|l| Some(&l.uri) != here.as_ref()).cloned();
+                    match target {
+                        Some(location) if Some(&location.uri) == here.as_ref() => {
+                            let starts = fileeditor::line_starts_of(tb);
+                            let encoding = server_encoding_for(sessions, session_id, tb).unwrap_or(crate::lsp::PositionEncoding::Utf16);
+                            let offset = fileeditor::diagnostic_offset(tb, &starts, location.start.0, location.start.1, encoding);
+                            let (line, column) = fileeditor::diagnostic_position(tb, offset);
+                            // Recorded before moving, so `Ctrl-O` comes
+                            // back to where the question was asked --
+                            // which is the whole reason the jump list
+                            // exists.
+                            vk.push_jump(buf.cursor());
+                            buf.set_cursor(line, column);
+                            let content_cols = nav_content_cols(&buf, rect);
+                            nav_scroll_to_show_cursor(&mut buf, content_cols);
+                            render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides.as_ref());
+                        }
+                        Some(_) => {
+                            let location = elsewhere.expect("a target that isn't here is elsewhere");
+                            let path = crate::url::to_file_path(&location.uri).map(|p| p.display().to_string()).unwrap_or(location.uri.clone());
+                            render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides.as_ref());
+                            show_command_mode_error(&format!("definition is at {path}:{}", location.start.0 + 1), *term_rows, *term_cols);
+                        }
+                        None => {
+                            render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides.as_ref());
+                            show_command_mode_error("no definition found", *term_rows, *term_cols);
+                        }
+                    }
+                }
+            }
             KeyOutcome::Motion(m, count) => {
                 editor::apply_motion_or_reselect(&mut vk, &mut buf, m, count);
                 let content_cols = nav_content_cols(&buf, rect);
@@ -7772,11 +7843,13 @@ fn sync_language_server_document(sessions: &mut HashMap<SessionId, SessionState>
     server.change_document(&target.uri, buf.version(), &fileeditor::buffer_text(buf));
 }
 
-// `K` against a language server: `textDocument/hover` for whatever is
-// under the cursor, as lines for the same popup `docs.rs` already
-// fills. `None` -- fall back to bish's own answer -- for every ordinary
-// reason there might not be one: no server, not ready yet, doesn't do
-// hover, nothing to say, or it didn't answer in time.
+// Asks the language server one position-shaped question about whatever
+// is under the cursor -- `textDocument/hover` for `K`,
+// `textDocument/definition` for `gd` -- and returns its raw result.
+// `None`, meaning "fall back to whatever bish knows itself", for every
+// ordinary reason there might not be an answer: no server, not ready
+// yet, doesn't advertise `capability`, answered with an error, or
+// didn't answer in time.
 //
 // **This one blocks**, unlike everything else in this file's LSP path,
 // and that is the deliberate trade. Hover is a question the user just
@@ -7793,7 +7866,7 @@ fn sync_language_server_document(sessions: &mut HashMap<SessionId, SessionState>
 // rest of a timeout to show them a popup they've moved past is the
 // wrong side of the trade.
 #[allow(clippy::too_many_arguments)]
-fn hover_from_server(
+fn ask_server_at_cursor(
     sessions: &mut HashMap<SessionId, SessionState>,
     windows: &mut [WindowEntry],
     job_frames: &mut HashMap<JobFrameId, exec::FgJob>,
@@ -7805,7 +7878,9 @@ fn hover_from_server(
     buf: &TextBuffer,
     row: usize,
     col: usize,
-) -> Option<Vec<String>> {
+    method: &str,
+    capability: &str,
+) -> Option<crate::json::Value> {
     let session = sessions.get(&session_id)?;
     let target = server_target(&session.shell, buf)?;
     let timeout = std::time::Duration::from_millis(session.shell.bishopt_int("lsp_timeout_ms").max(0) as u64);
@@ -7816,13 +7891,13 @@ fn hover_from_server(
         let server = table.running(&target.display, &target.root)?;
         // Asking a server that hasn't said it answers this would spend
         // the whole timeout to be told so.
-        if !server.is_ready() || !server.provides("hoverProvider") {
+        if !server.is_ready() || !server.provides(capability) {
             return None;
         }
         let chars = buf.line_chars(row);
         let character = crate::lsp::to_server_column(&chars, col, server.encoding());
         server.request(
-            "textDocument/hover",
+            method,
             crate::json::Value::Object(vec![
                 (
                     "textDocument".to_string(),
@@ -7844,9 +7919,9 @@ fn hover_from_server(
         service_background_jobs(sessions, windows, job_frames, current_window, term_rows, term_cols, sinks_are_grid);
         if let Some(result) = lsp.borrow_mut().running(&target.display, &target.root)?.take_response(id) {
             // A server answering with an error has answered: there is
-            // no better hover to wait for, and bish's own is still a
-            // sensible thing to show instead.
-            return crate::lsp::hover_lines(&result.ok()?);
+            // nothing better to wait for, and the caller's own fallback
+            // is still a sensible thing to do instead.
+            return result.ok();
         }
         // Doubles as the tick: a byte arriving means the user has moved
         // on, so the wait is abandoned rather than held out.
@@ -7855,6 +7930,17 @@ fn hover_from_server(
         }
     }
     None
+}
+
+// The position encoding the server for this buffer negotiated, if there
+// is one running. `None` when there isn't, in which case any position
+// arithmetic is moot anyway.
+fn server_encoding_for(sessions: &HashMap<SessionId, SessionState>, session_id: SessionId, buf: &TextBuffer) -> Option<crate::lsp::PositionEncoding> {
+    let session = sessions.get(&session_id)?;
+    let target = server_target(&session.shell, buf)?;
+    let lsp = Rc::clone(&session.shell.lsp);
+    let mut table = lsp.borrow_mut();
+    Some(table.running(&target.display, &target.root)?.encoding())
 }
 
 // Applies whatever the language server has most recently said about

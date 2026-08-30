@@ -1338,9 +1338,12 @@ mod tests {
         let mut server = Server::start(1, &scripted_server(&dir, &log), "mock", &dir).unwrap();
         run_until_ready(&mut server);
         assert_eq!(*server.state(), State::Ready, "log: {:?}", server.log().collect::<Vec<_>>());
-        // A capability the server declared, and one it didn't.
+        // Capabilities the fixture declares, and one it doesn't --
+        // which is what stops a request being spent on a timeout only
+        // to be told the server never offered it.
         assert!(server.provides("hoverProvider"));
-        assert!(!server.provides("definitionProvider"));
+        assert!(server.provides("definitionProvider"));
+        assert!(!server.provides("referencesProvider"));
 
         server.open_document("file:///p/x.sh", "shellscript", 1, "echo hi");
         let id = server.request(
