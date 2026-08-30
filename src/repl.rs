@@ -7175,9 +7175,29 @@ fn run_normal_mode_navigation(
                 let chars = tb.line_chars(row);
                 let line_text: String = chars.iter().collect();
                 let base_path = tb.path().map(|p| p.to_path_buf()).unwrap_or_else(|| std::env::current_dir().unwrap_or_default().join("untitled"));
-                let index = docs::DocIndex::build_from_source(&tb.text(), &base_path);
-                let debug_session = edit_frame_id.and_then(|id| debug_frames.get(&id));
-                let hover_lines = docs::hover_lines_at(&chars, col, &line_text, &index, |name| debug_session.and_then(|s| s.peek_var(name)));
+                // A language server's answer wins when there is one:
+                // it knows the actual language, where `docs.rs` knows
+                // bash and this buffer's own comments. Everything about
+                // the fallback is unchanged, so a bash file with no
+                // server behaves exactly as it always has.
+                let hover_lines = hover_from_server(
+                    sessions,
+                    windows,
+                    job_frames,
+                    session_id,
+                    *current_window,
+                    term_rows,
+                    term_cols,
+                    *sinks_are_grid,
+                    tb,
+                    row,
+                    col,
+                )
+                .unwrap_or_else(|| {
+                    let index = docs::DocIndex::build_from_source(&tb.text(), &base_path);
+                    let debug_session = edit_frame_id.and_then(|id| debug_frames.get(&id));
+                    docs::hover_lines_at(&chars, col, &line_text, &index, |name| debug_session.and_then(|s| s.peek_var(name)))
+                });
                 let gutter_width = rect.cols.saturating_sub(fileeditor::editor_content_cols(tb, rect));
                 let cursor_row = rect.row + row.saturating_sub(tb.viewport_top());
                 let cursor_display_col = col_of(&chars, col);
@@ -7750,6 +7770,91 @@ fn sync_language_server_document(sessions: &mut HashMap<SessionId, SessionState>
         return;
     }
     server.change_document(&target.uri, buf.version(), &fileeditor::buffer_text(buf));
+}
+
+// `K` against a language server: `textDocument/hover` for whatever is
+// under the cursor, as lines for the same popup `docs.rs` already
+// fills. `None` -- fall back to bish's own answer -- for every ordinary
+// reason there might not be one: no server, not ready yet, doesn't do
+// hover, nothing to say, or it didn't answer in time.
+//
+// **This one blocks**, unlike everything else in this file's LSP path,
+// and that is the deliberate trade. Hover is a question the user just
+// asked and is waiting for; making the whole editor loop asynchronous
+// to serve it would be a rewrite of every mode. So it waits in place --
+// the same call `debugger.rs`'s pause loop already makes for the same
+// reason -- but it waits *servicing*: `service_background_jobs` runs on
+// every tick of the wait, so other panes' jobs keep draining, a resize
+// still lands, and the server's own stream keeps being read (which is
+// what delivers the reply at all).
+//
+// A keystroke abandons the wait. Someone who has started typing again
+// is no longer waiting for this answer, and holding their input for the
+// rest of a timeout to show them a popup they've moved past is the
+// wrong side of the trade.
+#[allow(clippy::too_many_arguments)]
+fn hover_from_server(
+    sessions: &mut HashMap<SessionId, SessionState>,
+    windows: &mut [WindowEntry],
+    job_frames: &mut HashMap<JobFrameId, exec::FgJob>,
+    session_id: SessionId,
+    current_window: usize,
+    term_rows: &mut usize,
+    term_cols: &mut usize,
+    sinks_are_grid: bool,
+    buf: &TextBuffer,
+    row: usize,
+    col: usize,
+) -> Option<Vec<String>> {
+    let session = sessions.get(&session_id)?;
+    let target = server_target(&session.shell, buf)?;
+    let timeout = std::time::Duration::from_millis(session.shell.bishopt_int("lsp_timeout_ms").max(0) as u64);
+    let lsp = Rc::clone(&session.shell.lsp);
+
+    let id = {
+        let mut table = lsp.borrow_mut();
+        let server = table.running(&target.display, &target.root)?;
+        // Asking a server that hasn't said it answers this would spend
+        // the whole timeout to be told so.
+        if !server.is_ready() || !server.provides("hoverProvider") {
+            return None;
+        }
+        let chars = buf.line_chars(row);
+        let character = crate::lsp::to_server_column(&chars, col, server.encoding());
+        server.request(
+            "textDocument/hover",
+            crate::json::Value::Object(vec![
+                (
+                    "textDocument".to_string(),
+                    crate::json::Value::Object(vec![("uri".to_string(), crate::json::Value::Str(target.uri.clone()))]),
+                ),
+                (
+                    "position".to_string(),
+                    crate::json::Value::Object(vec![
+                        ("line".to_string(), crate::json::Value::Number(row as f64)),
+                        ("character".to_string(), crate::json::Value::Number(character as f64)),
+                    ]),
+                ),
+            ]),
+        )
+    };
+
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        service_background_jobs(sessions, windows, job_frames, current_window, term_rows, term_cols, sinks_are_grid);
+        if let Some(result) = lsp.borrow_mut().running(&target.display, &target.root)?.take_response(id) {
+            // A server answering with an error has answered: there is
+            // no better hover to wait for, and bish's own is still a
+            // sensible thing to show instead.
+            return crate::lsp::hover_lines(&result.ok()?);
+        }
+        // Doubles as the tick: a byte arriving means the user has moved
+        // on, so the wait is abandoned rather than held out.
+        if term::stdin_ready(editor::IDLE_POLL_MS) {
+            return None;
+        }
+    }
+    None
 }
 
 // Applies whatever the language server has most recently said about

@@ -46,6 +46,12 @@ const MAX_READS_PER_TICK: u32 = 16;
 // exactly the moment a user needs it.
 const LOG_LINES: usize = 200;
 
+// How many uncollected responses to keep. A request that timed out may
+// still be answered long afterwards with nobody left to receive it, so
+// this is a ceiling on that debris rather than a real capacity: an
+// actual conversation has one or two replies in flight.
+const MAX_PENDING_RESPONSES: usize = 32;
+
 /// Where a server is in its lifecycle.
 ///
 /// `Initializing` is a real state rather than an implementation detail:
@@ -178,6 +184,14 @@ pub struct Server {
     stderr_partial: String,
 
     state: State,
+    // Responses to requests bish made, waiting to be collected.
+    //
+    // A `Vec` rather than a map because it is also the place staleness
+    // is bounded: a request that timed out may still be answered
+    // eventually, and nothing will ever collect it, so the oldest are
+    // dropped once there are more than a handful outstanding. A real
+    // conversation never has more than one or two in flight.
+    responses: Vec<(i64, Result<Value, ResponseError>)>,
     // Set when stdout hits EOF, which for a server that just exited
     // happens a moment *before* the exit is reapable. Counted rather
     // than acted on at once, so `check_alive` gets the chance to
@@ -240,6 +254,7 @@ impl Server {
             log: VecDeque::new(),
             stderr_partial: String::new(),
             state: State::Initializing,
+            responses: Vec::new(),
             stdout_eof: false,
             eof_ticks: 0,
             next_id: 1,
@@ -306,7 +321,22 @@ impl Server {
                                 ("willSaveWaitUntil".to_string(), Value::Bool(false)),
                                 ("didSave".to_string(), Value::Bool(true)),
                             ]),
-                        )]),
+                        ),
+                        (
+                            "hover".to_string(),
+                            Value::Object(vec![
+                                ("dynamicRegistration".to_string(), Value::Bool(false)),
+                                // Markdown first, because that is what
+                                // servers put their best answer in --
+                                // but plaintext is accepted, and either
+                                // is flattened to lines for the popup.
+                                (
+                                    "contentFormat".to_string(),
+                                    Value::Array(vec![Value::Str("markdown".to_string()), Value::Str("plaintext".to_string())]),
+                                ),
+                            ]),
+                        ),
+                    ]),
                     ),
                     ("workspace".to_string(), Value::Object(Vec::new())),
                 ]),
@@ -400,6 +430,18 @@ impl Server {
                         self.note(format!("ready, position encoding {}", self.encoding.wire_name()));
                     }
                 }
+                None
+            }
+            // A reply to something bish asked. Kept for whoever is
+            // waiting on that id rather than handed back, since the
+            // waiter is several frames up the stack from here.
+            Message::Response { id: Id::Number(id), result } => {
+                if self.responses.len() >= MAX_PENDING_RESPONSES {
+                    // Dropping the oldest uncollected reply, which by
+                    // definition nobody is still waiting for.
+                    let _ = self.responses.remove(0);
+                }
+                self.responses.push((*id, result.clone()));
                 None
             }
             Message::Notification { method, params } if method == "textDocument/publishDiagnostics" => {
@@ -615,6 +657,21 @@ impl Server {
         }
         let since = *document.pending_since.get_or_insert(now);
         now.duration_since(since) >= debounce
+    }
+
+    /// The answer to `id`, once it has arrived. `None` means "not yet"
+    /// -- the caller polls this while servicing everything else.
+    pub fn take_response(&mut self, id: i64) -> Option<Result<Value, ResponseError>> {
+        let at = self.responses.iter().position(|(pending, _)| *pending == id)?;
+        Some(self.responses.remove(at).1)
+    }
+
+    /// Whether the server said it answers `textDocument/hover`. A
+    /// provider capability may be a bare `true` or an options object,
+    /// and both mean yes; anything else (including absent) means no,
+    /// and asking anyway would spend a timeout to be told so.
+    pub fn provides(&self, capability: &str) -> bool {
+        matches!(json::query(&self.capabilities, &format!(".{capability}")), Ok(Value::Bool(true)) | Ok(Value::Object(_)))
     }
 
     /// The newest diagnostics for this document if they haven't been
@@ -1245,6 +1302,110 @@ mod tests {
             publish.len()
         );
         vec!["sh".to_string(), "-c".to_string(), script]
+    }
+
+    // The scripted fixture: a real server that reads the framing and
+    // replies according to what arrived. Written out from
+    // `include_str!` so it exists in the test binary and nowhere else.
+    fn scripted_server(dir: &Path, log: &Path) -> Vec<String> {
+        let script = dir.join("lsp-mock.sh");
+        std::fs::write(&script, include_str!("testdata/lsp-mock.sh")).unwrap();
+        vec!["sh".to_string(), script.to_string_lossy().into_owned(), log.to_string_lossy().into_owned()]
+    }
+
+    // Everything the fixture was told, decoded with the same decoder
+    // under test elsewhere -- one framed message per line.
+    fn received(log: &Path) -> Vec<Message> {
+        let text = std::fs::read_to_string(log).unwrap_or_default();
+        text.lines().filter_map(|line| json::parse(line).ok()).filter_map(|v| Message::from_value(&v).ok()).collect()
+    }
+
+    fn wait_for_response(server: &mut Server, id: i64) -> Option<Result<Value, ResponseError>> {
+        for _ in 0..600 {
+            server.service();
+            if let Some(result) = server.take_response(id) {
+                return Some(result);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        None
+    }
+
+    #[test]
+    fn a_request_is_answered_and_the_reply_is_matched_to_its_own_id() {
+        let dir = temp_dir("request");
+        let log = dir.join("received.jsonl");
+        let mut server = Server::start(1, &scripted_server(&dir, &log), "mock", &dir).unwrap();
+        run_until_ready(&mut server);
+        assert_eq!(*server.state(), State::Ready, "log: {:?}", server.log().collect::<Vec<_>>());
+        // A capability the server declared, and one it didn't.
+        assert!(server.provides("hoverProvider"));
+        assert!(!server.provides("definitionProvider"));
+
+        server.open_document("file:///p/x.sh", "shellscript", 1, "echo hi");
+        let id = server.request(
+            "textDocument/hover",
+            Value::Object(vec![
+                ("textDocument".to_string(), Value::Object(vec![("uri".to_string(), Value::Str("file:///p/x.sh".to_string()))])),
+                (
+                    "position".to_string(),
+                    Value::Object(vec![("line".to_string(), Value::Number(0.0)), ("character".to_string(), Value::Number(1.0))]),
+                ),
+            ]),
+        );
+        assert_ne!(id, 1, "the initialize request already used id 1");
+        let result = wait_for_response(&mut server, id).expect("an answer").expect("not an error");
+        let lines = lsp::hover_lines(&result).expect("hover lines");
+        assert_eq!(lines, vec!["echo [args...]".to_string(), String::new(), "Writes its arguments.".to_string()]);
+
+        // Collected once: a second ask has nothing, which is what stops
+        // a waiter from seeing a stale reply.
+        assert!(server.take_response(id).is_none());
+
+        // ...and the fixture recorded what bish actually sent, in order.
+        let sent = received(&log);
+        let methods: Vec<&str> = sent
+            .iter()
+            .filter_map(|m| match m {
+                Message::Request { method, .. } | Message::Notification { method, .. } => Some(method.as_str()),
+                Message::Response { .. } => None,
+            })
+            .collect();
+        assert_eq!(methods, vec!["initialize", "initialized", "textDocument/didOpen", "textDocument/hover"], "{methods:?}");
+        let Some(Message::Request { params, .. }) = sent.iter().find(|m| matches!(m, Message::Request { method, .. } if method == "textDocument/hover")) else {
+            panic!("no hover request recorded");
+        };
+        assert_eq!(json::query(params, ".position.character"), Ok(&Value::Number(1.0)));
+        assert_eq!(json::query(params, ".textDocument.uri"), Ok(&Value::Str("file:///p/x.sh".to_string())));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // A reply nobody is left waiting for must not accumulate forever.
+    #[test]
+    fn uncollected_replies_are_bounded() {
+        let dir = temp_dir("bounded");
+        let log = dir.join("received.jsonl");
+        let mut server = Server::start(1, &scripted_server(&dir, &log), "mock", &dir).unwrap();
+        run_until_ready(&mut server);
+        server.open_document("file:///p/x.sh", "shellscript", 1, "echo hi");
+        let position = Value::Object(vec![
+            ("textDocument".to_string(), Value::Object(vec![("uri".to_string(), Value::Str("file:///p/x.sh".to_string()))])),
+            (
+                "position".to_string(),
+                Value::Object(vec![("line".to_string(), Value::Number(0.0)), ("character".to_string(), Value::Number(0.0))]),
+            ),
+        ]);
+        let mut ids = Vec::new();
+        for _ in 0..MAX_PENDING_RESPONSES + 10 {
+            ids.push(server.request("textDocument/hover", position.clone()));
+        }
+        // Nobody collects any of them.
+        let last = *ids.last().unwrap();
+        wait_for_response(&mut server, last);
+        assert!(server.responses.len() <= MAX_PENDING_RESPONSES, "{} kept", server.responses.len());
+        // The oldest went first, so the newest is what survives.
+        assert!(!server.responses.iter().any(|(id, _)| *id == ids[0]));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

@@ -11285,6 +11285,7 @@ const KNOWN_BISHOPTS: &[(&str, BishOptDefault)] = &[
     // to ask it -- the fuzzy finder next.
     ("gitignore", BishOptDefault::Bool(true)),
     ("lsp", BishOptDefault::Bool(true)),
+    ("lsp_timeout_ms", BishOptDefault::Int(1000, 0..=10000)),
     // Whether a URL, a markdown link's destination or a path that
     // resolves is drawn as a real OSC 8 terminal hyperlink -- clickable
     // where the terminal supports it. On: a terminal that doesn't know
@@ -11420,6 +11421,7 @@ const BISHOPT_HELP: &[(&str, &str)] = &[
     ("tabular", "Which languages draw their columns lined up. A language glob, as `abbr --lang` uses."),
     ("gitignore", "Honour `.gitignore`: the browser and completion leave ignored files out."),
     ("lsp", "Use the language servers registered with `::bish lsp add`."),
+    ("lsp_timeout_ms", "How long to wait for a language server to answer a question like hover."),
     ("hyperlinks", "Emit OSC 8 terminal hyperlinks for URLs, links and resolved paths."),
     ("divider_budget", "How much of a split its pane dividers may take, as a percentage, before panes fold away."),
     ("relativenumber", "Number lines by their distance from the cursor's."),

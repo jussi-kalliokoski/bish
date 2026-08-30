@@ -431,6 +431,102 @@ fn sanitize(text: &str) -> String {
 }
 
 // ---------------------------------------------------------------------
+// Hover
+// ---------------------------------------------------------------------
+
+/// How many lines of hover to keep, and how wide. A server can return a
+/// type signature with every trait bound spelled out; a popup floating
+/// over someone's code cannot.
+const MAX_HOVER_LINES: usize = 30;
+const MAX_HOVER_WIDTH: usize = 120;
+
+/// A `textDocument/hover` result as lines to draw, or `None` when the
+/// server had nothing to say (a `null` result, or contents that are
+/// empty once cleaned up) -- which is a perfectly ordinary answer and
+/// the caller's cue to fall back to whatever it knows itself.
+///
+/// LSP allows three shapes here and all three are in the wild: the
+/// current `MarkupContent { kind, value }`, the deprecated bare or
+/// `{language, value}` `MarkedString`, and an array of those. Handling
+/// only the first would mean no hover at all from a number of real
+/// servers, so all three are read.
+pub fn hover_lines(result: &Value) -> Option<Vec<String>> {
+    let contents = json::query(result, ".contents").ok()?;
+    let raw = match contents {
+        // MarkupContent, and the `{language, value}` MarkedString, are
+        // told apart by which fields they have -- both carry `value`.
+        Value::Object(_) => match json::query(contents, ".value") {
+            Ok(Value::Str(value)) => value.clone(),
+            _ => return None,
+        },
+        Value::Str(text) => text.clone(),
+        Value::Array(items) => items
+            .iter()
+            .filter_map(|item| match item {
+                Value::Str(text) => Some(text.clone()),
+                Value::Object(_) => match json::query(item, ".value") {
+                    Ok(Value::Str(value)) => Some(value.clone()),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => return None,
+    };
+    let lines = hover_text_lines(&raw);
+    (!lines.is_empty()).then_some(lines)
+}
+
+/// Server markdown as plain lines.
+///
+/// Deliberately not a markdown *renderer*: the popup this feeds shows
+/// plain text, and the one thing worth doing is not showing the
+/// syntax. Code fences are dropped rather than kept, because a hover is
+/// most often exactly one fenced signature and leaving the ``` in makes
+/// the useful line look like debris. Everything else is left as written
+/// -- a half-rendered `**bold**` would be worse than an honest one.
+fn hover_text_lines(text: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for line in text.split('\n') {
+        if out.len() >= MAX_HOVER_LINES {
+            out.push("\u{2026}".to_string());
+            break;
+        }
+        let trimmed = line.trim_end();
+        if trimmed.trim_start().starts_with("```") {
+            continue;
+        }
+        // Same hazard as a diagnostic message: this is text from
+        // another process on its way into a terminal. Line structure is
+        // meaningful here, so only the *within*-line control characters
+        // are dropped, with a tab becoming a space rather than nothing.
+        let mut clean = String::new();
+        for c in trimmed.chars() {
+            if clean.chars().count() >= MAX_HOVER_WIDTH {
+                clean.push('\u{2026}');
+                break;
+            }
+            match c {
+                '\t' => clean.push(' '),
+                c if c.is_control() => {}
+                c => clean.push(c),
+            }
+        }
+        // A blank line between paragraphs is worth keeping; a run of
+        // them, or ones at either end, is not.
+        if clean.trim().is_empty() && (out.is_empty() || out.last().is_some_and(|l| l.trim().is_empty())) {
+            continue;
+        }
+        out.push(clean);
+    }
+    while out.last().is_some_and(|l| l.trim().is_empty()) {
+        out.pop();
+    }
+    out
+}
+
+// ---------------------------------------------------------------------
 // Languages
 // ---------------------------------------------------------------------
 
@@ -732,6 +828,68 @@ mod tests {
         // Mid-character resolves to that character's own start.
         assert_eq!(from_server_column(&line, 2, PositionEncoding::Utf16), 1);
         assert_eq!(from_server_column(&line, 3, PositionEncoding::Utf8), 1);
+    }
+
+    fn hover(json_text: &str) -> Option<Vec<String>> {
+        hover_lines(&json::parse(json_text).unwrap())
+    }
+
+    // All three shapes are in the wild, and handling only the current
+    // one would mean no hover at all from a number of real servers.
+    #[test]
+    fn every_shape_a_server_may_return_hover_contents_in_is_read() {
+        // MarkupContent -- the current form.
+        assert_eq!(hover(r#"{"contents":{"kind":"markdown","value":"a line"}}"#), Some(vec!["a line".to_string()]));
+        // A bare MarkedString.
+        assert_eq!(hover(r#"{"contents":"a line"}"#), Some(vec!["a line".to_string()]));
+        // A `{language, value}` MarkedString, told apart from
+        // MarkupContent only by which fields it has -- both carry
+        // `value`, which is what makes reading that field the right
+        // rule for either.
+        assert_eq!(hover(r#"{"contents":{"language":"rust","value":"fn f()"}}"#), Some(vec!["fn f()".to_string()]));
+        // An array of them, joined.
+        assert_eq!(
+            hover(r#"{"contents":["one",{"language":"rust","value":"two"}]}"#),
+            Some(vec!["one".to_string(), "two".to_string()])
+        );
+    }
+
+    #[test]
+    fn a_server_with_nothing_to_say_says_so_rather_than_showing_an_empty_popup() {
+        assert_eq!(hover(r#"{"contents":null}"#), None);
+        assert_eq!(hover("null"), None);
+        assert_eq!(hover(r#"{"contents":{"kind":"markdown","value":""}}"#), None);
+        // Whitespace and fences only: nothing left once cleaned up.
+        assert_eq!(hover("{\"contents\":\"```rust\\n```\\n\\n\"}"), None);
+    }
+
+    // A hover is most often exactly one fenced signature, and leaving
+    // the ``` in makes the useful line look like debris.
+    #[test]
+    fn markdown_is_flattened_to_lines_without_becoming_a_renderer() {
+        let lines = hover("{\"contents\":{\"kind\":\"markdown\",\"value\":\"```rust\\nfn f() -> i32\\n```\\n\\n---\\n\\nReturns **a number**.\\n\\n\\n\"}}").unwrap();
+        assert_eq!(
+            lines,
+            vec!["fn f() -> i32".to_string(), String::new(), "---".to_string(), String::new(), "Returns **a number**.".to_string()]
+        );
+        // Runs of blank lines collapse and trailing ones go, but a
+        // single separating blank line is worth keeping. `**bold**` is
+        // left exactly as written -- half-rendering it would be worse
+        // than being honest about what it is.
+    }
+
+    #[test]
+    fn hover_text_is_bounded_and_stripped_of_anything_a_terminal_would_act_on() {
+        let value = format!("line\\u001b[31mred\\ttabbed\\n{}", "y\\n".repeat(100));
+        let lines = hover(&format!(r#"{{"contents":"{value}"}}"#)).unwrap();
+        assert_eq!(lines[0], "line[31mred tabbed", "an escape must not reach the terminal, and a tab becomes a space");
+        assert!(lines.len() <= MAX_HOVER_LINES + 1, "{} lines", lines.len());
+        assert_eq!(lines.last().unwrap(), "\u{2026}");
+
+        let wide = "z".repeat(500);
+        let lines = hover(&format!(r#"{{"contents":"{wide}"}}"#)).unwrap();
+        assert!(lines[0].chars().count() <= MAX_HOVER_WIDTH + 1);
+        assert!(lines[0].ends_with('\u{2026}'));
     }
 
     fn published(json_text: &str) -> Publication {
