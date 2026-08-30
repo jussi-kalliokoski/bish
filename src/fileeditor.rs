@@ -232,6 +232,57 @@ pub(crate) fn scroll_to_show_cursor(buf: &mut TextBuffer, content_cols: usize) {
     }
 }
 
+// How far one horizontal wheel notch moves the view. More than
+// MOUSE_WHEEL_LINES because a column is a much smaller step than a line
+// -- three columns a notch would feel like nothing.
+pub(crate) const MOUSE_WHEEL_COLUMNS: usize = 6;
+
+// Moves the view sideways by `columns` (negative for left), the way the
+// mouse's horizontal wheel and vim's own `zh`/`zl` do -- and then brings
+// the *cursor* to the view rather than the view back to the cursor,
+// which is the whole difference between this and
+// `scroll_to_show_cursor` above.
+//
+// A no-op while `wrap` is on: a wrapped line has nothing off to the side
+// to scroll into, by construction.
+pub(crate) fn scroll_horizontally(buf: &mut TextBuffer, columns: isize, content_cols: usize) {
+    if buf.wrap.wrap || columns == 0 {
+        return;
+    }
+    let width = content_cols.max(1);
+    let layout = tabular_layout(buf);
+    // Only as far as there is something to see. The widest *visible*
+    // line, not the widest in the file: it is the only thing the reader
+    // could be scrolling towards, and it costs a pass over one screen
+    // rather than over the whole buffer.
+    let last = (buf.viewport_top() + buf.viewport_height()).min(buf.line_count());
+    let widest = (buf.viewport_top()..last)
+        .map(|line| {
+            let row = display_row(buf, line, layout.as_ref());
+            col_at_cell(&row.cells, row.cells.len())
+        })
+        .max()
+        .unwrap_or(0);
+    let furthest = widest.saturating_sub(width);
+    let left = (buf.viewport_left() as isize + columns).clamp(0, furthest as isize) as usize;
+    buf.set_viewport_left(left);
+
+    // ...and drag the cursor along, so the next keystroke doesn't snap
+    // the view straight back. Same `sidescrolloff` margin
+    // scroll_to_show_cursor keeps, for the same reason.
+    let (line, col) = buf.cursor();
+    let display = display_row(buf, line, layout.as_ref());
+    let cursor_col = col_at_cell(&display.cells, display.cell_of[col.min(buf.line_len(line))]);
+    let margin = buf.wrap.sidescrolloff.min(width.saturating_sub(1) / 2);
+    let lowest = left + margin;
+    let highest = (left + width).saturating_sub(margin + 1);
+    let target = cursor_col.clamp(lowest.min(highest), highest);
+    if target != cursor_col {
+        let cell = cell_at_col(&display.cells, target);
+        buf.set_cursor(line, source_at_or_before(&display, cell).min(buf.line_len(line)));
+    }
+}
+
 // The same job in visual rows: which row the cursor is on, and whether
 // the window has to move for it. Horizontal scroll is forced to zero --
 // a wrapped line has no off-screen right edge to scroll to.
@@ -1327,6 +1378,15 @@ pub(crate) fn run_insert_mode(
             }
             Key::Mouse(ev) if ev.is_scroll_up() => {
                 motion::apply_motion(buf, motion::Motion::ScrollLineUp, Some(MOUSE_WHEEL_LINES));
+                cursors[0] = buf.cursor();
+            }
+            // The horizontal wheel, where the terminal sends one (see
+            // MouseEvent::is_scroll_left). Unlike the vertical pair this
+            // does move the cursor -- it has to, since a caret parked
+            // off-screen is not somewhere you can type.
+            Key::Mouse(ev) if ev.is_scroll_left() || ev.is_scroll_right() => {
+                let columns = if ev.is_scroll_right() { MOUSE_WHEEL_COLUMNS as isize } else { -(MOUSE_WHEEL_COLUMNS as isize) };
+                scroll_horizontally(buf, columns, editor_content_cols(buf, rect));
                 cursors[0] = buf.cursor();
             }
             // Space is the other abbreviation trigger. Unlike a plain
@@ -3912,6 +3972,61 @@ mod horizontal_scroll_tests {
         buf.insert_text((0, 0), text);
         buf.set_cursor(0, 0);
         buf
+    }
+
+    #[test]
+    fn scroll_horizontally_moves_the_view_and_stops_at_the_widest_visible_line() {
+        let mut b = buf(&format!("{}\nshort", "x".repeat(40)));
+        scroll_horizontally(&mut b, 6, 10);
+        assert_eq!(b.viewport_left(), 6);
+        scroll_horizontally(&mut b, 6, 10);
+        assert_eq!(b.viewport_left(), 12);
+        // 40 columns of content in a 10-column pane: 30 is as far as
+        // there is anything left to see.
+        for _ in 0..20 {
+            scroll_horizontally(&mut b, 6, 10);
+        }
+        assert_eq!(b.viewport_left(), 30);
+    }
+
+    #[test]
+    fn scroll_horizontally_stops_at_zero_going_back() {
+        let mut b = buf(&format!("{}\n", "x".repeat(40)));
+        scroll_horizontally(&mut b, 12, 10);
+        scroll_horizontally(&mut b, -6, 10);
+        assert_eq!(b.viewport_left(), 6);
+        scroll_horizontally(&mut b, -30, 10);
+        assert_eq!(b.viewport_left(), 0);
+    }
+
+    // The whole difference from scroll_to_show_cursor: the cursor comes
+    // to the view, not the view back to the cursor.
+    #[test]
+    fn scroll_horizontally_brings_the_cursor_along() {
+        let mut b = buf(&format!("{}\n", "x".repeat(40)));
+        b.set_cursor(0, 0);
+        scroll_horizontally(&mut b, 12, 10);
+        assert_eq!(b.viewport_left(), 12);
+        assert_eq!(b.cursor(), (0, 12), "the cursor was dragged to the left edge of the new view");
+        scroll_horizontally(&mut b, -6, 10);
+        assert_eq!(b.cursor(), (0, 12), "still in view, so left where it was");
+    }
+
+    // Nothing to the side means nothing to do.
+    #[test]
+    fn scroll_horizontally_does_nothing_while_wrapping() {
+        let mut b = buf(&format!("{}\n", "x".repeat(40)));
+        b.wrap.wrap = true;
+        scroll_horizontally(&mut b, 12, 10);
+        assert_eq!(b.viewport_left(), 0);
+    }
+
+    #[test]
+    fn scroll_horizontally_does_nothing_when_every_line_fits() {
+        let mut b = buf("short\nalso short\n");
+        scroll_horizontally(&mut b, 12, 40);
+        assert_eq!(b.viewport_left(), 0);
+        assert_eq!(b.cursor(), (0, 0));
     }
 
     #[test]

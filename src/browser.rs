@@ -703,9 +703,14 @@ impl Browser {
                 Outcome::Continue
             }
             Key::Mouse(ev) => {
-                if ev.is_scroll_down() {
+                // Either wheel moves the same way here, because this
+                // grid *is* horizontal: it fills column-major, so the
+                // vertical wheel has always scrolled it sideways. A
+                // terminal that sends the horizontal wheel now says the
+                // same thing more literally.
+                if ev.is_scroll_down() || ev.is_scroll_right() {
                     self.scroll_col = (self.scroll_col + 1).min(self.total_cols(layout.rows).saturating_sub(1));
-                } else if ev.is_scroll_up() {
+                } else if ev.is_scroll_up() || ev.is_scroll_left() {
                     self.scroll_col = self.scroll_col.saturating_sub(1);
                 } else if ev.is_left_click()
                     && let Some(idx) = self.hit_test(ev.row as usize, ev.col as usize, rect, layout)
@@ -1337,6 +1342,31 @@ mod tests {
         fs::write(t.0.join("sub/a.log"), "").unwrap();
         let b = Browser::open(&t.0.join("sub")).unwrap();
         assert!(names(&b).contains(&"a.log".to_string()), "the nested `!` line re-includes it");
+    }
+
+    // This grid fills column-major, so the vertical wheel has always
+    // scrolled it sideways -- the horizontal one now says the same thing
+    // more literally, and both have to agree.
+    #[test]
+    fn either_wheel_scrolls_the_grid_sideways() {
+        let t = Tmp::new("hwheel");
+        for i in 0..40 {
+            t.file(&format!("f{i:02}.txt"), "");
+        }
+        let mut b = Browser::open(&t.0).unwrap();
+        let r = rect(6, 40);
+        let wheel = |button| Key::Mouse(crate::editor::MouseEvent { button, col: 1, row: 1, pressed: true });
+        assert_eq!(b.scroll_col, 0);
+        b.handle_key(wheel(67), r); // right
+        assert_eq!(b.scroll_col, 1);
+        b.handle_key(wheel(65), r); // down -- the same direction here
+        assert_eq!(b.scroll_col, 2);
+        b.handle_key(wheel(66), r); // left
+        assert_eq!(b.scroll_col, 1);
+        b.handle_key(wheel(64), r); // up
+        assert_eq!(b.scroll_col, 0);
+        b.handle_key(wheel(66), r);
+        assert_eq!(b.scroll_col, 0, "and it stops rather than going negative");
     }
 
     // Column-major fill: with 4 grid rows, `l` from the first item lands

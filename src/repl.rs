@@ -5365,6 +5365,16 @@ pub(crate) fn scroll_to_show_cursor(buf: &mut impl BisheditBuffer, content_cols:
 // -- `ReadOnly`'s `ScreenBuffer` has no gutter at all (the whole pane
 // width is content), `Editable`'s `TextBuffer` does (see
 // fileeditor::editor_content_cols).
+// A `ScreenBuffer`'s content is already fixed-width, pre-wrapped
+// terminal output with nothing off to the side to scroll into (see
+// `Buffer::viewport_left`'s own doc comment), so the horizontal wheel
+// only means anything over a real file.
+fn nav_scroll_horizontally(buf: &mut NavBuffer, columns: isize, content_cols: usize) {
+    if let NavBuffer::Editable(tb) = buf {
+        fileeditor::scroll_horizontally(tb, columns, content_cols);
+    }
+}
+
 fn nav_content_cols(buf: &NavBuffer, rect: Rect) -> usize {
     match buf {
         NavBuffer::ReadOnly(_) => rect.cols,
@@ -6341,6 +6351,14 @@ fn run_normal_mode_navigation(
                 editor::apply_motion_or_reselect(&mut vk, &mut buf, motion, Some(fileeditor::MOUSE_WHEEL_LINES));
                 let content_cols = nav_content_cols(&buf, rect);
                 scroll_to_show_cursor(&mut buf, content_cols);
+            } else if ev.is_scroll_left() || ev.is_scroll_right() {
+                let columns = fileeditor::MOUSE_WHEEL_COLUMNS as isize;
+                let content_cols = nav_content_cols(&buf, rect);
+                // Deliberately *not* followed by scroll_to_show_cursor,
+                // which pulls the view back to the cursor -- the exact
+                // opposite of what a scroll is asking for. The cursor
+                // comes along instead; see fileeditor::scroll_horizontally.
+                nav_scroll_horizontally(&mut buf, if ev.is_scroll_right() { columns } else { -columns }, content_cols);
             }
             render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides.as_ref());
             continue 'nav;

@@ -165,21 +165,38 @@ impl MouseEvent {
         !self.pressed
     }
 
-    // xterm's SGR mouse protocol encodes a wheel notch as button 4 (up) or
-    // 5 (down) -- bit 6 set (the same bit that also marks buttons 6/7,
-    // which this codebase has no use for and doesn't distinguish), plus
-    // bits 0-1 holding 0 or 1. Modifier bits (2-4) are masked out, same as
-    // is_left_click above -- a Shift/Ctrl/Alt-held wheel notch still
-    // scrolls. A wheel notch is always reported as a bare press (no
-    // matching release), but `pressed` is still checked here anyway --
-    // cheap insurance against a terminal that behaves differently, same
-    // spirit as is_left_click's own explicit check.
+    // xterm's SGR mouse protocol encodes a wheel notch as bit 6 set plus
+    // the X11 button number in bits 0-1: 4/5 are the vertical wheel and
+    // 6/7 the horizontal one, which is the whole of what a terminal
+    // sends for a tilt wheel or a sideways trackpad gesture. Modifier
+    // bits (2-4) are masked out, same as is_left_click above -- a
+    // Shift/Ctrl/Alt-held wheel notch still scrolls. A wheel notch is
+    // always reported as a bare press (no matching release), but
+    // `pressed` is still checked here anyway -- cheap insurance against
+    // a terminal that behaves differently, same spirit as
+    // is_left_click's own explicit check.
+    //
+    // Not every terminal sends 66/67; the ones that don't simply produce
+    // nothing here, which is the same as before these existed. Some
+    // terminals instead fold a sideways gesture into Shift+wheel, and
+    // that is deliberately *not* treated as horizontal: the masks above
+    // say a modifier never changes what a notch means, and quietly
+    // making Shift the exception would break the vertical scrolling that
+    // rule currently guarantees.
     pub fn is_scroll_up(&self) -> bool {
         self.pressed && self.button & 0x43 == 0x40
     }
 
     pub fn is_scroll_down(&self) -> bool {
         self.pressed && self.button & 0x43 == 0x41
+    }
+
+    pub fn is_scroll_left(&self) -> bool {
+        self.pressed && self.button & 0x43 == 0x42
+    }
+
+    pub fn is_scroll_right(&self) -> bool {
+        self.pressed && self.button & 0x43 == 0x43
     }
 }
 
@@ -3306,6 +3323,29 @@ mod tests {
         // ordinary click.
         let shift_wheel_up = MouseEvent { button: 64 | 0x04, col: 1, row: 1, pressed: true };
         assert!(shift_wheel_up.is_scroll_up());
+    }
+
+    #[test]
+    fn mouse_event_recognizes_the_horizontal_wheel() {
+        let left = MouseEvent { button: 66, col: 1, row: 1, pressed: true };
+        assert!(left.is_scroll_left());
+        assert!(!left.is_scroll_right() && !left.is_scroll_up() && !left.is_scroll_down());
+        let right = MouseEvent { button: 67, col: 1, row: 1, pressed: true };
+        assert!(right.is_scroll_right());
+        assert!(!right.is_scroll_left() && !right.is_scroll_up() && !right.is_scroll_down());
+        // Modifiers are masked out here too.
+        assert!(MouseEvent { button: 66 | 0x04, col: 1, row: 1, pressed: true }.is_scroll_left());
+    }
+
+    // The four are mutually exclusive, which is what lets a caller test
+    // them in any order.
+    #[test]
+    fn mouse_event_wheel_directions_never_overlap() {
+        for button in [64u16, 65, 66, 67] {
+            let ev = MouseEvent { button, col: 1, row: 1, pressed: true };
+            let set = [ev.is_scroll_up(), ev.is_scroll_down(), ev.is_scroll_left(), ev.is_scroll_right()];
+            assert_eq!(set.iter().filter(|b| **b).count(), 1, "button {button}");
+        }
     }
 
     #[test]
