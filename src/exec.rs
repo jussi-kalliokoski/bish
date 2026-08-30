@@ -494,6 +494,68 @@ pub struct Hook {
     pub command: String,
 }
 
+/// One declared language server: what to run, for which languages, and
+/// how to find the root of the project it should be given.
+///
+/// A *declaration*, not a running process -- nothing here starts
+/// anything. `repl::run` owns the servers that are actually running
+/// (keyed by command and project root, so one server serves every pane
+/// editing the same project), the same way it owns job and edit frames;
+/// this is the config a shell carries so a bishrc can say which servers
+/// exist at all. `lspclient::Server` is the other half.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LspServer {
+    /// From a per-shell counter, never reused -- `rm` always names the
+    /// thing `ls` showed. Same contract as `Hook::id`.
+    pub id: u64,
+    /// `--lang=`: a glob over the language of the file being edited
+    /// (`fileeditor::language_of`), the same shape and matcher
+    /// `hook --lang` and `abbr --lang` use. `*` when unscoped.
+    pub lang: String,
+    /// The command line to run, split into words at registration time.
+    pub command: Vec<String>,
+    /// `--root=`: file names that mark the top of a project, tried in
+    /// order, walking up from the file being edited. `.git` when
+    /// unspecified, which is what gitignore::Stack::for_directory
+    /// already treats as the boundary.
+    pub root_markers: Vec<String>,
+}
+
+/// One running language server, as `::bish lsp status` reports it.
+/// A snapshot owned by the shell and refreshed from repl.rs each idle
+/// tick -- see `Shell::lsp_running`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LspStatus {
+    /// The declaration this was started from (`LspServer::id`).
+    pub id: u64,
+    pub command: String,
+    /// The project root it was started for, which together with the
+    /// command is what identifies it: one server per (command, root).
+    pub root: String,
+    /// "starting", "initializing", "ready", or "dead: <why>".
+    pub state: String,
+    /// The `positionEncoding` negotiated during the handshake -- empty
+    /// until there has been one. Worth reporting because it is the
+    /// difference between exact and approximated columns on any line
+    /// with an emoji in it.
+    pub encoding: String,
+    /// How many documents this server has been told about.
+    pub open_documents: usize,
+}
+
+impl LspServer {
+    /// What `ls` prints and what `status` echoes back -- the command as
+    /// one line, quoting only the words that would otherwise stop being
+    /// one word. `ls` is tab-separated so a script can read it, which
+    /// means this field is the one a person actually reads, and
+    /// `'rust-analyzer'` in quotes for no reason reads as though
+    /// something odd is going on.
+    pub fn command_line(&self) -> String {
+        let plain = |w: &String| !w.is_empty() && w.chars().all(|c| c.is_alphanumeric() || "-_./=:+@,".contains(c));
+        self.command.iter().map(|w| if plain(w) { w.clone() } else { shell_quote(w) }).collect::<Vec<_>>().join(" ")
+    }
+}
+
 /// Every event a hook can be attached to.
 ///
 /// **Naming.** `pre`/`post` is a segment rather than a prefix
@@ -543,6 +605,31 @@ pub fn hook_help() -> Vec<String> {
         out.push(format!("    {description}"));
     }
     out
+}
+
+/// `::bish lsp help`.
+pub fn lsp_help() -> Vec<String> {
+    vec![
+        "::bish lsp ls [--lang=GLOB]            what is registered".to_string(),
+        "::bish lsp add [--lang=GLOB] [--root=NAME,...] COMMAND...".to_string(),
+        "::bish lsp rm ID                       remove one, by the id `add` printed".to_string(),
+        "::bish lsp status                      what is actually running".to_string(),
+        String::new(),
+        "A registered server is started the first time a file it covers is opened,".to_string(),
+        "once per project root, and shared by every pane editing that project.".to_string(),
+        String::new(),
+        "--lang is a glob over the file's language, as `hook --lang` uses.".to_string(),
+        "--root names the files that mark the top of a project, tried in order".to_string(),
+        "       walking up from the file being edited. Defaults to `.git`.".to_string(),
+        String::new(),
+        "  ::bish lsp add --lang=rust --root=Cargo.toml,.git rust-analyzer".to_string(),
+        String::new(),
+        "`ls` and `status` print tab-separated fields, for reading in a script:".to_string(),
+        "  ls:     id, language glob, root markers, command".to_string(),
+        "  status: id, state, position encoding, open documents, root, command".to_string(),
+        String::new(),
+        "Turn the whole thing off with `bishopt --unset lsp`.".to_string(),
+    ]
 }
 
 /// One line about each event: when it fires, and what its argument is.
@@ -726,6 +813,16 @@ pub struct Shell {
     /// split off should behave like the one you split it from.
     pub hooks: Vec<Hook>,
     next_hook_id: u64,
+    /// Declared language servers -- config, not processes. See
+    /// `LspServer`.
+    pub lsp_servers: Vec<LspServer>,
+    next_lsp_id: u64,
+    /// What `::bish lsp status` reports: a snapshot of the servers
+    /// actually running, refreshed once per idle tick by repl.rs from
+    /// the map it owns. Exactly the treatment `windows` already gets,
+    /// and for the same reason -- `status` has to be an ordinary builtin
+    /// readable in `$(...)`, not a signal the caller has to interpret.
+    pub lsp_running: Vec<LspStatus>,
     /// Set while a hook is running, so a hook that causes its own event
     /// -- a `shell:cwd:change` hook that `cd`s, most obviously -- fires
     /// once rather than forever. Not shared with a virtual child: a hook
@@ -1118,6 +1215,9 @@ impl Shell {
             abbrs: Vec::new(),
             hooks: Vec::new(),
             next_hook_id: 1,
+            lsp_servers: Vec::new(),
+            next_lsp_id: 1,
+            lsp_running: Vec::new(),
             firing_hooks: false,
             array_local_stack: Vec::new(),
             assoc_local_stack: Vec::new(),
@@ -1381,6 +1481,9 @@ impl Shell {
             abbrs: self.abbrs.clone(),
             hooks: self.hooks.clone(),
             next_hook_id: self.next_hook_id,
+            lsp_servers: self.lsp_servers.clone(),
+            next_lsp_id: self.next_lsp_id,
+            lsp_running: self.lsp_running.clone(),
             firing_hooks: false,
             array_local_stack: Vec::new(),
             assoc_local_stack: Vec::new(),
@@ -3111,12 +3214,13 @@ impl Shell {
             // bish-specific commands that shouldn't spend a common word.
             [sub, rest @ ..] if sub == "window" || sub == "win" => self.run_window(rest),
             [sub, rest @ ..] if sub == "hook" => ExecResult::Status(self.run_hook(rest)),
+            [sub, rest @ ..] if sub == "lsp" => ExecResult::Status(self.run_lsp(rest)),
             [] => {
-                sh_eprintln!(self, "bish: ::bish: missing subcommand (expected: theme, window, hook)");
+                sh_eprintln!(self, "bish: ::bish: missing subcommand (expected: theme, window, hook, lsp)");
                 ExecResult::Status(2)
             }
             [other, ..] => {
-                sh_eprintln!(self, "bish: ::bish: unknown subcommand '{other}' (expected: theme, window, hook)");
+                sh_eprintln!(self, "bish: ::bish: unknown subcommand '{other}' (expected: theme, window, hook, lsp)");
                 ExecResult::Status(2)
             }
         }
@@ -3223,6 +3327,138 @@ impl Shell {
                 2
             }
         }
+    }
+
+    // `::bish lsp ls|add|rm|status` -- which language servers exist and
+    // which are running. Deliberately the same shape as `::bish hook`
+    // right above: a per-shell counter for ids, `--lang` as a glob, `rm`
+    // by the id `add` printed. Two registries that worked differently
+    // would be two things to learn.
+    //
+    // Canonical under `::bish` rather than a bare `lsp` builtin, for the
+    // reason `window` was moved there: this namespace exists so
+    // bish-specific commands don't shadow real ones in scripts.
+    fn run_lsp(&mut self, args: &[String]) -> i32 {
+        match args.first().map(String::as_str) {
+            Some("ls") | Some("list") | None => {
+                let rest = &args[1.min(args.len())..];
+                let lang = match self.lsp_lang_flag("ls", rest) {
+                    Ok((lang, [])) => lang,
+                    Ok(_) => {
+                        sh_eprintln!(self, "bish: ::bish lsp: ls: usage: ::bish lsp ls [--lang=GLOB]");
+                        return 2;
+                    }
+                    Err(status) => return status,
+                };
+                for server in self.lsp_servers.clone() {
+                    // Same question `hook ls --lang` answers: "what
+                    // would be used for a file of this language" -- so
+                    // the glob is matched against the language given,
+                    // not the two globs against each other.
+                    if let Some(lang) = lang.as_deref()
+                        && !crate::glob::matches(&server.lang, lang)
+                    {
+                        continue;
+                    }
+                    sh_println!(self, "{}\t{}\t{}\t{}", server.id, server.lang, server.root_markers.join(","), server.command_line());
+                }
+                0
+            }
+            Some("add") => {
+                let (lang, rest) = match self.lsp_lang_flag("add", &args[1..]) {
+                    Ok(parsed) => parsed,
+                    Err(status) => return status,
+                };
+                let (root_markers, rest) = match self.lsp_root_flag(rest) {
+                    Ok(parsed) => parsed,
+                    Err(status) => return status,
+                };
+                if rest.is_empty() {
+                    sh_eprintln!(self, "bish: ::bish lsp: add: usage: ::bish lsp add [--lang=GLOB] [--root=NAME,...] COMMAND...");
+                    return 2;
+                }
+                let id = self.next_lsp_id;
+                self.next_lsp_id += 1;
+                self.lsp_servers.push(LspServer {
+                    id,
+                    lang: lang.unwrap_or_else(|| "*".to_string()),
+                    command: rest.to_vec(),
+                    root_markers,
+                });
+                // The id is the return value, same as `hook add`: a
+                // config that registers something usually wants to be
+                // able to take it back.
+                sh_println!(self, "{id}");
+                0
+            }
+            Some("rm") | Some("remove") => {
+                let Some(id) = args.get(1).and_then(|a| a.parse::<u64>().ok()) else {
+                    sh_eprintln!(self, "bish: ::bish lsp: rm: usage: ::bish lsp rm <id>");
+                    return 2;
+                };
+                let before = self.lsp_servers.len();
+                self.lsp_servers.retain(|s| s.id != id);
+                if self.lsp_servers.len() == before {
+                    sh_eprintln!(self, "bish: ::bish lsp: rm: no language server with id {id}");
+                    return 1;
+                }
+                0
+            }
+            Some("status") => {
+                for server in self.lsp_running.clone() {
+                    sh_println!(self, "{}\t{}\t{}\t{}\t{}\t{}", server.id, server.state, server.encoding, server.open_documents, server.root, server.command);
+                }
+                0
+            }
+            Some("help") | Some("--help") | Some("-h") => {
+                for line in lsp_help() {
+                    sh_println!(self, "{line}");
+                }
+                0
+            }
+            Some(other) => {
+                sh_eprintln!(self, "bish: ::bish lsp: unknown subcommand '{other}' (expected: ls, add, rm, status, help)");
+                2
+            }
+        }
+    }
+
+    // `--lang=GLOB`/`--lang GLOB`, exactly as `hook_lang_flag` does it.
+    fn lsp_lang_flag<'a>(&mut self, subcommand: &str, args: &'a [String]) -> Result<(Option<String>, &'a [String]), i32> {
+        match args.first().map(String::as_str) {
+            Some(flag) if flag.starts_with("--lang=") => Ok((Some(flag["--lang=".len()..].to_string()), &args[1..])),
+            Some("--lang") => match args.get(1) {
+                Some(lang) => Ok((Some(lang.clone()), &args[2..])),
+                None => {
+                    sh_eprintln!(self, "bish: ::bish lsp: {subcommand}: --lang needs a glob");
+                    Err(2)
+                }
+            },
+            _ => Ok((None, args)),
+        }
+    }
+
+    // `--root=NAME[,NAME...]`. Defaults to `.git`, which is already this
+    // codebase's notion of where a project stops (gitignore::Stack::
+    // for_directory walks up to exactly there).
+    fn lsp_root_flag<'a>(&mut self, args: &'a [String]) -> Result<(Vec<String>, &'a [String]), i32> {
+        let (raw, rest) = match args.first().map(String::as_str) {
+            Some(flag) if flag.starts_with("--root=") => (flag["--root=".len()..].to_string(), &args[1..]),
+            Some("--root") => match args.get(1) {
+                Some(v) => (v.clone(), &args[2..]),
+                None => {
+                    sh_eprintln!(self, "bish: ::bish lsp: add: --root needs a name");
+                    return Err(2);
+                }
+            },
+            _ => return Ok((vec![".git".to_string()], args)),
+        };
+        let markers: Vec<String> = raw.split(',').map(str::trim).filter(|m| !m.is_empty()).map(str::to_string).collect();
+        if markers.is_empty() {
+            sh_eprintln!(self, "bish: ::bish lsp: add: --root needs at least one name");
+            return Err(2);
+        }
+        Ok((markers, rest))
     }
 
     /// The commands to run for `event` on a file of `language`, in the
@@ -11044,6 +11280,7 @@ const KNOWN_BISHOPTS: &[(&str, BishOptDefault)] = &[
     // for, and the answer should stay one option as more of bish comes
     // to ask it -- the fuzzy finder next.
     ("gitignore", BishOptDefault::Bool(true)),
+    ("lsp", BishOptDefault::Bool(true)),
     // Whether a URL, a markdown link's destination or a path that
     // resolves is drawn as a real OSC 8 terminal hyperlink -- clickable
     // where the terminal supports it. On: a terminal that doesn't know
@@ -11178,6 +11415,7 @@ const BISHOPT_HELP: &[(&str, &str)] = &[
     ("precedes", "Shown in the first column when a line continues off the left edge."),
     ("tabular", "Which languages draw their columns lined up. A language glob, as `abbr --lang` uses."),
     ("gitignore", "Honour `.gitignore`: the browser and completion leave ignored files out."),
+    ("lsp", "Use the language servers registered with `::bish lsp add`."),
     ("hyperlinks", "Emit OSC 8 terminal hyperlinks for URLs, links and resolved paths."),
     ("divider_budget", "How much of a split its pane dividers may take, as a percentage, before panes fold away."),
     ("relativenumber", "Number lines by their distance from the cursor's."),
@@ -13224,6 +13462,70 @@ mod tests {
         // ...and an id is never reused, so `rm` can't hit the wrong one.
         assert_eq!(shell.run_hook(&strs(&["add", "editor:file:open", "__again"])), 0);
         assert_eq!(hook_ids(&mut shell), vec![2, 3]);
+    }
+
+    fn lsp_ids(shell: &Shell) -> Vec<u64> {
+        shell.lsp_servers.iter().map(|s| s.id).collect()
+    }
+
+    #[test]
+    fn adding_a_language_server_returns_an_id_that_removes_it() {
+        let mut shell = Shell::new();
+        assert_eq!(shell.run_lsp(&strs(&["add", "--lang=rust", "rust-analyzer"])), 0);
+        assert_eq!(shell.run_lsp(&strs(&["add", "--lang=python", "pylsp"])), 0);
+        assert_eq!(lsp_ids(&shell), vec![1, 2], "ids come from a counter, in order");
+        assert_eq!(shell.run_lsp(&strs(&["rm", "1"])), 0);
+        assert_eq!(lsp_ids(&shell), vec![2]);
+        // Never reused, so `rm` can't hit the wrong one -- same
+        // contract `hook` ids have.
+        assert_eq!(shell.run_lsp(&strs(&["add", "gopls"])), 0);
+        assert_eq!(lsp_ids(&shell), vec![2, 3]);
+        assert_eq!(shell.run_lsp(&strs(&["rm", "99"])), 1);
+        assert_eq!(shell.run_lsp(&strs(&["rm", "nonsense"])), 2);
+    }
+
+    #[test]
+    fn a_command_keeps_its_words_and_defaults_to_a_git_root() {
+        let mut shell = Shell::new();
+        assert_eq!(shell.run_lsp(&strs(&["add", "--lang=c", "clangd", "--background-index"])), 0);
+        let server = &shell.lsp_servers[0];
+        assert_eq!(server.command, vec!["clangd".to_string(), "--background-index".to_string()]);
+        assert_eq!(server.lang, "c");
+        assert_eq!(server.root_markers, vec![".git".to_string()]);
+        assert_eq!(server.command_line(), "clangd --background-index");
+        // ...and a word that would stop being one word does get quoted.
+        assert_eq!(shell.run_lsp(&strs(&["add", "some server", "--flag=a b"])), 0);
+        assert_eq!(shell.lsp_servers[1].command_line(), "'some server' '--flag=a b'");
+    }
+
+    #[test]
+    fn root_markers_are_a_comma_separated_list_in_the_order_given() {
+        let mut shell = Shell::new();
+        assert_eq!(shell.run_lsp(&strs(&["add", "--root=Cargo.toml,.git", "rust-analyzer"])), 0);
+        assert_eq!(shell.lsp_servers[0].root_markers, vec!["Cargo.toml".to_string(), ".git".to_string()]);
+        assert_eq!(shell.run_lsp(&strs(&["add", "--root", "go.mod", "gopls"])), 0);
+        assert_eq!(shell.lsp_servers[1].root_markers, vec!["go.mod".to_string()]);
+        // A flag with nothing usable after it is a config error, not a
+        // silently empty marker list that would never match anything.
+        assert_eq!(shell.run_lsp(&strs(&["add", "--root=", "x"])), 2);
+        assert_eq!(shell.run_lsp(&strs(&["add", "--root"])), 2);
+        assert_eq!(shell.run_lsp(&strs(&["add"])), 2, "a registration with no command at all");
+        assert_eq!(shell.lsp_servers.len(), 2);
+    }
+
+    #[test]
+    fn an_unknown_lsp_subcommand_is_refused() {
+        let mut shell = Shell::new();
+        assert_eq!(shell.run_lsp(&strs(&["restart"])), 2);
+    }
+
+    #[test]
+    fn a_child_shell_inherits_the_declared_language_servers() {
+        let mut shell = Shell::new();
+        shell.run_lsp(&strs(&["add", "--lang=rust", "rust-analyzer"]));
+        let child = shell.new_virtual_child();
+        assert_eq!(child.lsp_servers, shell.lsp_servers);
+        assert_eq!(child.next_lsp_id, shell.next_lsp_id, "or the child would hand out an id the parent already used");
     }
 
     #[test]
