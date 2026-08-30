@@ -186,6 +186,20 @@ pub struct TextBuffer {
     // which can legitimately land back exactly on it).
     saved_node: usize,
     dirty: bool,
+    // Bumped by `content_changed` on every real edit, and never reset --
+    // a monotonic "which revision of this buffer is this" stamp, as
+    // against `dirty`'s "does it differ from disk" (which undo can and
+    // does clear again).
+    //
+    // Exists for anything that computes something *from* the text and
+    // gets an answer back later, when the text may have moved on: a
+    // language server's diagnostics arrive asynchronously and carry the
+    // version they describe, so a reply about a revision this buffer has
+    // already left can be dropped instead of drawn at offsets that no
+    // longer mean anything. `dirty` cannot answer that question and
+    // `diagnostics.clear()` alone can't either -- clearing says the old
+    // answer is gone, not which new one is still worth waiting for.
+    version: u64,
     path: Option<PathBuf>,
 }
 
@@ -223,6 +237,7 @@ impl TextBuffer {
             breakpoints: std::collections::BTreeSet::new(),
             readonly: false,
             dirty: false,
+            version: 0,
             path: None,
         }
     }
@@ -299,6 +314,7 @@ impl TextBuffer {
             breakpoints: std::collections::BTreeSet::new(),
             readonly: false,
             dirty: false,
+            version: 0,
             path: Some(path.to_path_buf()),
         }
     }
@@ -319,6 +335,31 @@ impl TextBuffer {
 
     pub fn is_dirty(&self) -> bool {
         self.dirty
+    }
+
+    /// This buffer's current revision -- see the `version` field.
+    pub fn version(&self) -> u64 {
+        self.version
+    }
+
+    // The one thing every real edit does: bump the revision, and drop
+    // everything derived from the old text. Called by insert_text/
+    // delete_range/join_lines and by restore_snapshot (undo/redo/time
+    // travel), which are between them the only four places this
+    // buffer's content actually changes.
+    //
+    // Deliberately does not touch `dirty`: the three edit methods set it
+    // unconditionally, while restore_snapshot's is save-aware (landing
+    // back on the node that's on disk clears it). That difference is
+    // real, so it stays at the call sites rather than being averaged
+    // into something wrong for one of them here.
+    fn content_changed(&mut self) {
+        self.version += 1;
+        // Positions in any of these are char offsets into the text that
+        // just changed, so keeping them would be showing a lie.
+        self.diagnostics.clear();
+        self.blame = None;
+        self.diff = None;
     }
 
     pub fn is_readonly(&self) -> bool {
@@ -387,9 +428,7 @@ impl TextBuffer {
         self.cursor = cursor;
         // Positions may no longer be valid -- same reasoning insert_text/
         // delete_range/join_lines already apply for any real edit.
-        self.diagnostics.clear();
-        self.blame = None;
-        self.diff = None;
+        self.content_changed();
         // Save-aware: landing back exactly on the node that was on disk
         // as of the last `:w` clears `dirty`, matching real vim's own
         // undo-tree-aware `modified` flag -- see `saved_node`'s own doc
@@ -512,9 +551,7 @@ impl TextBuffer {
             (new_row, new_col)
         };
         self.dirty = true;
-        self.diagnostics.clear();
-        self.blame = None;
-        self.diff = None;
+        self.content_changed();
         self.cursor = new_pos;
         // `.` -- vim's own "position of the last change" mark (`` `. ``),
         // set automatically by every mutation here rather than at each of
@@ -561,9 +598,7 @@ impl TextBuffer {
             }
         }
         self.dirty = true;
-        self.diagnostics.clear();
-        self.blame = None;
-        self.diff = None;
+        self.content_changed();
         self.marks.insert('.', self.cursor);
         text
     }
@@ -604,9 +639,7 @@ impl TextBuffer {
         }
         self.cursor = (row, join_col.min(self.lines[row].len().saturating_sub(1)));
         self.dirty = true;
-        self.diagnostics.clear();
-        self.blame = None;
-        self.diff = None;
+        self.content_changed();
         self.marks.insert('.', self.cursor);
         true
     }
@@ -851,6 +884,7 @@ mod tests {
             breakpoints: std::collections::BTreeSet::new(),
             readonly: false,
             dirty: false,
+            version: 0,
             path: None,
         }
     }
@@ -1020,6 +1054,32 @@ mod tests {
         buf.set_cursor(0, 0);
         assert!(buf.join_lines(100, true));
         assert_eq!(text_of(&buf), "one two three");
+    }
+
+    // The whole point of `version` existing alongside `dirty`: `dirty`
+    // answers "does this differ from disk," which undo and save both
+    // move in *both* directions, while `version` only ever counts
+    // forward. Anything holding an answer computed from an older
+    // revision needs the second question, not the first.
+    #[test]
+    fn version_counts_forward_through_edits_undo_and_save_alike() {
+        let mut buf = TextBuffer::new_unnamed(10);
+        assert_eq!(buf.version(), 0);
+
+        buf.insert_text((0, 0), "alpha");
+        let after_insert = buf.version();
+        assert!(after_insert > 0);
+
+        buf.delete_range(&motion::MotionRange { shape: motion::MotionShape::Exclusive, from: (0, 0), to: (0, 1) });
+        let after_delete = buf.version();
+        assert!(after_delete > after_insert);
+
+        // Undo puts the *content* back, so `dirty` can go backwards --
+        // but the revision must not, or a reply about `after_delete`
+        // would be indistinguishable from one about whatever comes next.
+        buf.checkpoint_undo();
+        assert!(buf.undo(), "nothing to undo -- the checkpoint above didn't take");
+        assert!(buf.version() > after_delete);
     }
 
     #[test]
