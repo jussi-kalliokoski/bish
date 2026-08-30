@@ -10,6 +10,7 @@ mod diff;
 mod docs;
 mod dotenv;
 mod editor;
+mod editorconfig;
 mod exec;
 mod fileeditor;
 mod git;

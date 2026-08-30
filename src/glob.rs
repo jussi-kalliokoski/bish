@@ -122,7 +122,7 @@ fn match_extglob(prefix: u8, alts: &[&[u8]], group: &[u8], rest: &[u8], text: &[
 // pat[0] == b'['. Returns (did `c` match the class, remaining pattern after
 // the closing ']'), or None if the bracket expression is malformed (no
 // closing ']'), in which case '[' should be treated as a literal char.
-fn match_class(pat: &[u8], c: Option<u8>) -> Option<(bool, &[u8])> {
+pub(crate) fn match_class(pat: &[u8], c: Option<u8>) -> Option<(bool, &[u8])> {
     let mut i = 1;
     let negate = i < pat.len() && (pat[i] == b'!' || pat[i] == b'^');
     if negate {
