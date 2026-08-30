@@ -261,6 +261,38 @@ impl CompletionProvider for BuiltinCompletionProvider {
     }
 }
 
+// The commands whose arguments are hosts, and where.
+//
+// `ssh`, `sftp`, `mosh` and `ssh-copy-id` take exactly one host and then
+// (for ssh) a *remote command*, which nothing here can know anything
+// about -- so only the first argument is a host position. `scp` and
+// `rsync` take `[user@]host:path` in any argument position, and either
+// side of the copy can be local, so those positions offer hosts *and*
+// files together rather than replacing one with the other.
+fn host_position(command: Option<&str>, arg_index: usize) -> bool {
+    match command {
+        Some("ssh" | "sftp" | "mosh" | "ssh-copy-id") => arg_index == 0,
+        Some("scp" | "rsync") => true,
+        _ => false,
+    }
+}
+
+// A host argument's own shape: `[user@]host[:path]`. Completion applies
+// to the host part alone, with whatever came before it kept -- typing
+// `ssh deploy@we<Tab>` should finish the host, not offer to replace the
+// user with one.
+fn host_word(prefix: &str) -> Option<(&str, &str)> {
+    // A `:` means the host is already complete and a path has started;
+    // remote paths are not something this can enumerate.
+    if prefix.contains(':') {
+        return None;
+    }
+    Some(match prefix.rsplit_once('@') {
+        Some((user, host)) => (&prefix[..user.len() + 1], host),
+        None => ("", prefix),
+    })
+}
+
 pub struct ShellCompletionProvider<'a> {
     pub cwd: Option<&'a Path>,
     pub known_functions: Option<&'a HashSet<String>>,
@@ -306,6 +338,12 @@ impl<'a> CompletionProvider for ShellCompletionProvider<'a> {
         let candidates = match role {
             CmdRole::Command => self.command_name_candidates(&prefix),
             CmdRole::Argument { command, .. } if prefix.starts_with('-') => self.flag_candidates(command.as_deref(), &prefix),
+            // Before the subcommand/file fallbacks: `ssh web` is not a
+            // path and never will be, and a man page has nothing to say
+            // about which hosts *this machine* knows.
+            CmdRole::Argument { command, arg_index } if host_position(command.as_deref(), arg_index) => {
+                self.host_candidates(command.as_deref(), &prefix)
+            }
             CmdRole::Argument { command, arg_index: 0 } => self.subcommand_or_file_candidates(command.as_deref(), &prefix),
             CmdRole::Argument { .. } => self.file_candidates(&prefix),
         };
@@ -349,6 +387,27 @@ impl<'a> ShellCompletionProvider<'a> {
         }
         names.extend(highlight::enumerate_path_matches(prefix));
         rank(prefix, names.into_iter().collect())
+    }
+
+    // The hosts this machine knows about (`hosts::known` -- ssh config,
+    // known_hosts, /etc/hosts), plus, for the commands where an argument
+    // can be either end of a copy, the local files beside them.
+    fn host_candidates(&self, command: Option<&str>, prefix: &str) -> Vec<CompletionCandidate> {
+        let also_files = matches!(command, Some("scp" | "rsync"));
+        let Some((keep, _)) = host_word(prefix) else {
+            // Past the `:`, so this is a remote path -- nothing here can
+            // enumerate one, and offering local files for it would be
+            // offering the wrong machine's.
+            return Vec::new();
+        };
+        let mut names: Vec<String> = crate::hosts::known().into_iter().map(|h| format!("{keep}{h}")).collect();
+        // `scp host:` wants the colon, since the path follows it on the
+        // same word; `ssh host` is finished as it stands.
+        if also_files {
+            names = names.into_iter().map(|n| format!("{n}:")).collect();
+            names.extend(self.file_candidates(prefix).into_iter().map(|c| c.display));
+        }
+        rank(prefix, names)
     }
 
     // Flags only, never falling through to subcommands/files even on a
@@ -783,5 +842,83 @@ mod tests {
         let result = provider.complete(CompletionRequest { line, cursor: line.chars().count() });
         let names: Vec<String> = result.candidates.into_iter().map(|c| c.display).collect();
         assert!(names.contains(&"wrap".to_string()));
+    }
+
+    #[test]
+    fn host_positions_are_where_a_host_can_actually_go() {
+        // One host, then a remote command nothing here can know about.
+        assert!(host_position(Some("ssh"), 0));
+        assert!(!host_position(Some("ssh"), 1));
+        assert!(host_position(Some("sftp"), 0));
+        // Either end of a copy can be remote, in any position.
+        assert!(host_position(Some("scp"), 0));
+        assert!(host_position(Some("scp"), 2));
+        assert!(host_position(Some("rsync"), 1));
+        // Everything else is somebody else's business.
+        assert!(!host_position(Some("ls"), 0));
+        assert!(!host_position(None, 0));
+    }
+
+    // `[user@]host` -- completing the host keeps the user, rather than
+    // offering to replace it with one.
+    #[test]
+    fn a_user_prefix_is_kept_and_the_host_is_what_completes() {
+        assert_eq!(host_word("we"), Some(("", "we")));
+        assert_eq!(host_word("deploy@we"), Some(("deploy@", "we")));
+        assert_eq!(host_word(""), Some(("", "")));
+    }
+
+    // Past the `:` this is a *remote* path, and nothing here can
+    // enumerate one -- offering local files for it would be offering the
+    // wrong machine's.
+    #[test]
+    fn a_colon_ends_host_completion() {
+        assert_eq!(host_word("web:"), None);
+        assert_eq!(host_word("web:/var/l"), None);
+        assert_eq!(host_word("deploy@web:/etc"), None);
+    }
+
+    // The dispatch, not the host list: `ssh web` must not fall through
+    // to the file completion it used to get.
+    #[test]
+    fn ssh_does_not_complete_files() {
+        let dir = std::env::temp_dir().join(format!("bish-completion-ssh-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("zzz-not-a-host.txt"), "").unwrap();
+        let provider = ShellCompletionProvider {
+            cwd: Some(&dir),
+            known_functions: None,
+            completions: None,
+            default_completion: None,
+            action_ctx: None,
+            functions_preamble: None,
+        };
+        let line = "ssh zzz";
+        let result = provider.complete(CompletionRequest { line, cursor: line.chars().count() });
+        let names: Vec<String> = result.candidates.into_iter().map(|c| c.display).collect();
+        assert!(!names.iter().any(|n| n.contains("zzz-not-a-host")), "a local file is never an ssh target: {names:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ...whereas for scp it is: either end of a copy can be local.
+    #[test]
+    fn scp_completes_files_as_well_as_hosts() {
+        let dir = std::env::temp_dir().join(format!("bish-completion-scp-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("zzz-local.txt"), "").unwrap();
+        let provider = ShellCompletionProvider {
+            cwd: Some(&dir),
+            known_functions: None,
+            completions: None,
+            default_completion: None,
+            action_ctx: None,
+            functions_preamble: None,
+        };
+        let line = "scp zzz";
+        let result = provider.complete(CompletionRequest { line, cursor: line.chars().count() });
+        let names: Vec<String> = result.candidates.into_iter().map(|c| c.display).collect();
+        assert!(names.iter().any(|n| n.contains("zzz-local")), "got {names:?}");
     }
 }

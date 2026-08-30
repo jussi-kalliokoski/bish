@@ -17,6 +17,7 @@ mod gitignore;
 mod glob;
 mod hexedit;
 mod history;
+mod hosts;
 mod html;
 mod inflate;
 mod ini;
