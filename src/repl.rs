@@ -231,6 +231,12 @@ enum PaneLayout {
 // see close_orphaned_sessions.
 struct WindowEntry {
     id: u32,
+    // What this window is called, if anything -- `window create --name`
+    // or `window rename`. Shown in the tab bar instead of the cwd, and
+    // what `window select` finds it by. `None` is the ordinary case and
+    // shows the cwd, which is what every window showed before names
+    // existed.
+    name: Option<String>,
     layout: PaneLayout,
     panes: Vec<Pane>,
     focused_pane: PaneId,
@@ -254,6 +260,7 @@ impl WindowEntry {
     fn single(id: u32, initial_frame: Frame) -> WindowEntry {
         WindowEntry {
             id,
+            name: None,
             layout: PaneLayout::Leaf(0),
             panes: vec![Pane { id: 0, stack: vec![initial_frame] }],
             focused_pane: 0,
@@ -410,6 +417,9 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
     // default. See term::ignore_sigint's doc comment.
     term::ignore_sigint();
     exec::install_winch_handler();
+    // This loop *is* the window manager, so the `window` builtin means
+    // something at its prompts -- see Shell::windows_available.
+    shell.windows_available = true;
     // Real bash enables job control automatically for an interactive
     // shell -- see Shell::enable_monitor_mode's own doc comment.
     shell.enable_monitor_mode();
@@ -1836,8 +1846,8 @@ fn handle_command_mode(
         session_id, sessions, windows, *current_window, next_session_id, cmd_history, job_frames, debug_frames, registers, term_rows, term_cols, *sinks_are_grid, editing, seed,
     );
     match outcome {
-        CommandModeOutcome::Action(action) => {
-            apply_window_action(action, sessions, windows, current_window, next_session_id, next_window_id, sinks_are_grid, *term_rows, *term_cols);
+        CommandModeOutcome::Action(ref action) => {
+            apply_window_action(action.clone(), sessions, windows, current_window, next_session_id, next_window_id, sinks_are_grid, *term_rows, *term_cols);
         }
         CommandModeOutcome::Quit | CommandModeOutcome::Cancelled | CommandModeOutcome::Ran { .. } => {
             if *sinks_are_grid {
@@ -3106,7 +3116,7 @@ fn apply_window_action(
         WindowAction::Previous => {
             *current_window = (*current_window + windows.len() - 1) % windows.len();
         }
-        WindowAction::New => {
+        WindowAction::New { name } => {
             let parent_id = windows[*current_window].owning_session();
             let child_history = sessions[&parent_id].history.fork();
             let mut child_shell = sessions[&parent_id].shell.new_virtual_child();
@@ -3136,8 +3146,40 @@ fn apply_window_action(
             );
             let wid = *next_window_id;
             *next_window_id += 1;
-            windows.push(WindowEntry::single(wid, Frame::Session(sid)));
+            let mut window = WindowEntry::single(wid, Frame::Session(sid));
+            window.name = name;
+            windows.push(window);
             *current_window = windows.len() - 1;
+        }
+        // The three that make a workflow scriptable: something to call a
+        // window, a way to see what is there, and a way to ask for one
+        // back -- see WindowAction's own doc comments.
+        WindowAction::Rename(name) => windows[*current_window].name = name,
+        WindowAction::List => {
+            let listing = window_listing(sessions, windows, *current_window);
+            if let Some(session) = sessions.get(&windows[*current_window].owning_session()) {
+                session.shell.sink_out(&listing);
+            }
+        }
+        WindowAction::Select(target) => {
+            let found = windows.iter().position(|w| w.name.as_deref() == Some(target.as_str()))
+                // A name first, an id second: names are what a config
+                // function knows, ids are what it falls back to.
+                .or_else(|| windows.iter().position(|w| w.id.to_string() == target));
+            match found {
+                Some(index) => *current_window = index,
+                // The status is the whole point: `window select work ||
+                // window c --name work` is "attach if it's there, set it
+                // up if it isn't", in one line.
+                None => {
+                    if let Some(session) = sessions.get(&windows[*current_window].owning_session()) {
+                        session.shell.sink_err(&format!("bish: window: select: no window named '{target}'\n"));
+                    }
+                    if let Some(session) = sessions.get_mut(&windows[*current_window].owning_session()) {
+                        session.shell.last_status = 1;
+                    }
+                }
+            }
         }
         WindowAction::Close => {
             if windows[*current_window].stack().len() > 1 {
@@ -6006,7 +6048,7 @@ fn window_cmd_to_action(cmd: WindowCmd) -> WindowAction {
     match cmd {
         WindowCmd::Next => WindowAction::Next,
         WindowCmd::Previous => WindowAction::Previous,
-        WindowCmd::New => WindowAction::New,
+        WindowCmd::New => WindowAction::New { name: None },
         WindowCmd::Close => WindowAction::Close,
         WindowCmd::Split => WindowAction::Split { horizontal: false },
         WindowCmd::VSplit => WindowAction::Split { horizontal: true },
@@ -6063,6 +6105,7 @@ fn dispatch_window_cmd(
         _ => {
             let action = window_cmd_to_action(cmd);
             for _ in 0..count.unwrap_or(1).max(1) {
+                let action = action.clone();
                 apply_window_action(action, sessions, windows, current_window, next_session_id, next_window_id, sinks_are_grid, term_rows, term_cols);
             }
         }
@@ -7495,14 +7538,47 @@ fn tab_bar_snapshot(sessions: &HashMap<SessionId, SessionState>, windows: &[Wind
         .iter()
         .enumerate()
         .map(|(i, w)| {
-            let cwd = sessions[&w.owning_session()].shell.cwd.to_string_lossy();
-            (w.id, i == current_window, prompt::shorten_path(&cwd, &home))
+            // A window's name replaces its cwd here: if you have told
+            // bish what a window is *for*, that is more useful than
+            // where it happens to be.
+            let label = match &w.name {
+                Some(name) => name.clone(),
+                None => {
+                    let cwd = sessions[&w.owning_session()].shell.cwd.to_string_lossy();
+                    prompt::shorten_path(&cwd, &home)
+                }
+            };
+            (w.id, i == current_window, label)
         })
         .collect()
 }
 
 fn tab_bar_line(sessions: &HashMap<SessionId, SessionState>, windows: &[WindowEntry], current_window: usize) -> String {
     render_tab_bar(&tab_bar_snapshot(sessions, windows, current_window))
+}
+
+// `window ls`: one tab-separated line per window -- id, name (empty when
+// unnamed), cwd, pane count, and `*` for the current one.
+//
+// Tab-separated and stable rather than aligned and pretty, because the
+// caller this exists for is a shell function: `window ls | cut -f2`
+// should be a sensible thing to write. The `*` is its own column for the
+// same reason -- a marker glued to the id would have to be stripped
+// before the id could be used.
+fn window_listing(sessions: &HashMap<SessionId, SessionState>, windows: &[WindowEntry], current_window: usize) -> String {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let mut out = String::new();
+    for (i, window) in windows.iter().enumerate() {
+        let cwd = sessions
+            .get(&window.owning_session())
+            .map(|s| prompt::shorten_path(&s.shell.cwd.to_string_lossy(), &home))
+            .unwrap_or_default();
+        let name = window.name.clone().unwrap_or_default();
+        let panes = window.panes.len();
+        let current = if i == current_window { "*" } else { "" };
+        out.push_str(&format!("{}\t{name}\t{cwd}\t{panes}\t{current}\n", window.id));
+    }
+    out
 }
 
 // The visible text of one tab's own segment -- shared by render_tab_bar
@@ -9928,6 +10004,7 @@ mod divider_drag_tests {
     fn window(layout: PaneLayout, panes: &[PaneId]) -> WindowEntry {
         WindowEntry {
             id: 0,
+            name: None,
             layout,
             panes: panes.iter().map(|id| Pane { id: *id, stack: vec![Frame::Session(0)] }).collect(),
             focused_pane: panes[0],

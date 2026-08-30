@@ -312,7 +312,7 @@ macro_rules! sh_eprintln {
     }};
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub enum ExecResult {
     Status(i32),
     Break(u32),
@@ -378,17 +378,17 @@ pub enum ExecResult {
 }
 
 impl ExecResult {
-    fn status(self) -> i32 {
+    fn status(&self) -> i32 {
         match self {
-            ExecResult::Status(s) => s,
-            ExecResult::Return(s) => s,
-            ExecResult::Exit(s) => s,
+            ExecResult::Status(s) => *s,
+            ExecResult::Return(s) => *s,
+            ExecResult::Exit(s) => *s,
             ExecResult::Break(_) | ExecResult::Continue(_) => 0,
             ExecResult::Window(_) | ExecResult::Fg | ExecResult::Edit => 0,
         }
     }
 
-    fn is_signal(self) -> bool {
+    fn is_signal(&self) -> bool {
         matches!(
             self,
             ExecResult::Break(_)
@@ -459,9 +459,33 @@ pub trait DebugHook {
 // What repl.rs should do in response to a `window`-family command -- see
 // ExecResult::Window's doc comment for why this travels as a bubbled
 // signal instead of direct shared-state mutation.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub enum WindowAction {
-    New,
+    /// `window create [--name NAME]`. A name is what the tab bar shows
+    /// for this window instead of its cwd, and what `window select`
+    /// finds it by -- the two halves of making a workflow scriptable:
+    /// something to call a window, and a way to ask for it back.
+    New { name: Option<String> },
+    /// `window rename [NAME]` -- the current window. No name clears it
+    /// back to showing the cwd, which is what an unnamed window shows.
+    Rename(Option<String>),
+    /// `window ls`: one tab-separated line per window, for a caller that
+    /// is a shell function rather than a person.
+    ///
+    /// Known limit: **not capturable in `$(...)`**. Every window action
+    /// is applied by the repl loop *after* the command returns (see this
+    /// enum's own doc comment on why it can't mutate that state from
+    /// here), and a command substitution's own shell has no window
+    /// manager behind it -- so the listing goes to the session's output,
+    /// where a person reads it, and a substitution gets nothing. Naming
+    /// and `select` are what a script actually needs, and both work.
+    List,
+    /// `window select NAME|ID` -- **exit status 1 when there is no such
+    /// window**, which is the whole point of it. That is what lets a
+    /// config function say `window select work || window c --name work`
+    /// and get "attach if it's there, set it up if it isn't" out of one
+    /// line.
+    Select(String),
     Next,
     Previous,
     Close,
@@ -832,6 +856,14 @@ pub struct Shell {
     // promotion stub. Cell (not RefCell) since get/set on a bool never
     // needs borrow tracking.
     promoted: Rc<Cell<bool>>,
+    /// Whether something is actually managing windows for this shell --
+    /// set by `repl.rs` on the sessions it drives, false everywhere
+    /// else. It is what lets the `window` builtin be callable from an
+    /// ordinary shell function (which is the whole point of naming and
+    /// selecting windows) without letting `ExecResult::Window` escape
+    /// from `bish script.sh`, where nothing would ever act on it and
+    /// `run_program` would take it for a signal and stop early.
+    pub windows_available: bool,
     // Mirrors the OS process's real cwd, kept in sync by run_cd/run_pushd/
     // run_popd (which still delegate the actual directory change to
     // std::env::set_current_dir -- this field doesn't yet let a session
@@ -1012,6 +1044,7 @@ impl Shell {
             current_stderr_target: None,
             restrict_to_builtins: false,
             promoted: Rc::new(Cell::new(false)),
+            windows_available: false,
             cwd: std::env::current_dir().unwrap_or_default(),
             sink: OutputSink::Real,
             real_output_needs_newline: std::cell::Cell::new(false),
@@ -1240,6 +1273,7 @@ impl Shell {
             current_stderr_target: None,
             restrict_to_builtins: false,
             promoted: self.promoted.clone(),
+            windows_available: self.windows_available,
             cwd: self.cwd.clone(),
             sink: OutputSink::Real,
             real_output_needs_newline: std::cell::Cell::new(false),
@@ -3458,11 +3492,46 @@ impl Shell {
     // ExecResult::Window signal (see that variant's doc comment for why
     // this can't just mutate shared state directly from here).
     fn run_window(&mut self, args: &[String]) -> ExecResult {
+        fn parse_window_name(shell: &mut Shell, subcommand: &str, rest: &[String]) -> Result<Option<String>, i32> {
+            match rest.first().map(String::as_str) {
+                None => Ok(None),
+                Some("--name") | Some("-n") => match rest.len() {
+                    1 => {
+                        sh_eprintln!(shell, "bish: window: {subcommand}: --name needs a name");
+                        Err(2)
+                    }
+                    _ => Ok(Some(rest[1..].join(" "))),
+                },
+                Some(other) => {
+                    sh_eprintln!(shell, "bish: window: {subcommand}: unexpected argument '{other}' (expected --name NAME)");
+                    Err(2)
+                }
+            }
+        }
+
         self.promote_if_needed();
         match args.first().map(String::as_str) {
             Some("next") | Some("n") => ExecResult::Window(WindowAction::Next),
             Some("previous") | Some("prev") | Some("p") => ExecResult::Window(WindowAction::Previous),
-            Some("new") | Some("c") | Some("create") => ExecResult::Window(WindowAction::New),
+            Some("new") | Some("c") | Some("create") => match parse_window_name(self, "create", &args[1..]) {
+                Ok(name) => ExecResult::Window(WindowAction::New { name }),
+                Err(status) => ExecResult::Status(status),
+            },
+            Some("rename") | Some("ren") => match args.get(1) {
+                // A bare `window rename` clears the name; anything else
+                // is the new one, joined so `window rename my project`
+                // means what it looks like.
+                None => ExecResult::Window(WindowAction::Rename(None)),
+                Some(_) => ExecResult::Window(WindowAction::Rename(Some(args[1..].join(" ")))),
+            },
+            Some("ls") | Some("list") => ExecResult::Window(WindowAction::List),
+            Some("select") | Some("sel") => match args.get(1) {
+                Some(target) => ExecResult::Window(WindowAction::Select(target.clone())),
+                None => {
+                    sh_eprintln!(self, "bish: window: select: usage: window select <name>|<id>");
+                    ExecResult::Status(2)
+                }
+            },
             Some("close") | Some("q") | Some("quit") => ExecResult::Window(WindowAction::Close),
             // WindowAction::Split's own `horizontal` names the divider
             // LINE's orientation (true = a horizontal dividing line,
@@ -4078,6 +4147,8 @@ impl Shell {
             if let Some(exit) = self.take_pending_exit() {
                 return exit;
             }
+            // Cloned rather than moved at each use: `ExecResult` stopped
+            // being `Copy` when `WindowAction` grew a name to carry.
             if result.is_signal() {
                 return result;
             }
@@ -5680,16 +5751,21 @@ impl Shell {
             "compgen" => return ExecResult::Status(self.run_compgen(&argv[1..])),
             "complete" => return ExecResult::Status(self.run_complete(&argv[1..])),
             "compopt" => return ExecResult::Status(self.run_compopt(&argv[1..])),
-            // Command-mode-exclusive: this extends the builtin set
-            // available there specifically, rather than being a normal
-            // shell builtin -- with the guard false, this arm doesn't
-            // match and `window` falls through to the same external-
-            // command lookup any other unrecognized name would hit.
+            // Available in command mode, and at any prompt a real window
+            // manager is behind (`windows_available`). It used to be
+            // command-mode-exclusive; that was right while `window` was
+            // a gesture you made by hand, and wrong the moment it grew
+            // names and `select`, since the point of those is to be
+            // called from a shell function in your config. With both
+            // guards false the arm doesn't match and `window` falls
+            // through to the same external lookup any other unrecognized
+            // name would hit -- which is what keeps `bish script.sh`,
+            // where nothing could act on the result, out of it.
             // "w" deliberately isn't an alias here (unlike "win") -- it's
             // reserved for a future vim-style `:w` write command instead,
             // matching bishedit's normal-mode Ctrl-W leader now covering
             // window management directly (see vimkeys.rs's WindowCmd).
-            "window" | "win" if self.restrict_to_builtins => {
+            "window" | "win" if self.restrict_to_builtins || self.windows_available => {
                 return self.run_window(&argv[1..]);
             }
             "pushd" => return ExecResult::Status(self.run_pushd(&argv[1..])),
