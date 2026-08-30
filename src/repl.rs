@@ -2324,6 +2324,11 @@ fn run_edit_frame(
     // until the file was reopened.)
     let color_overrides = syntax_color_overrides(&sessions[&session_id].shell);
     apply_view_options(&sessions[&session_id].shell, &mut buffer);
+    // The buffer exists and its options are resolved, which is the
+    // moment `editor:file:open` is about -- a hook that configures a
+    // language server for this file wants a real buffer to ask about,
+    // not a path.
+    run_hooks(sessions, session_id, "editor:file:open", &buffer);
     // Where this editor frame actually lives -- captured once, before
     // any window command can move focus elsewhere. The Detached arm
     // below needs this pane's own rect to freeze into, not whatever
@@ -2364,7 +2369,13 @@ fn run_edit_frame(
             Some(&color_overrides),
         );
         match outcome {
-            Ok((NavExit::Quit, _)) => {
+            Ok((NavExit::Quit, ref state)) => {
+                // *Before* the frame goes away: afterwards there is
+                // nothing left for a hook to look at, which is why vim's
+                // own BufUnload/BufDelete are both "before" too.
+                if let Some((tb, _)) = state {
+                    run_hooks(sessions, session_id, "editor:file:close", tb);
+                }
                 windows[*current_window].stack_mut().pop();
                 // Back to the primary screen, which still holds this
                 // session's own scrollback -- prompt, the `e` command
@@ -7545,6 +7556,49 @@ fn tab_bar_line(sessions: &HashMap<SessionId, SessionState>, windows: &[WindowEn
     render_tab_bar(&tab_bar_snapshot(sessions, windows, current_window))
 }
 
+// Runs whatever `::bish hook` has attached to `event` for this buffer's
+// language, with the file's path appended as the command's first
+// argument.
+//
+// Output is captured and dropped rather than printed: a hook fires while
+// the editor owns the terminal, and anything it echoed would land in the
+// middle of a rendered frame. A hook is for doing something, not for
+// saying something -- and the buffer it is about is still there to be
+// changed, which is the channel that matters.
+//
+// The empty case costs a `Vec` and a string compare, which is what keeps
+// firing an event free on the overwhelmingly common path where nobody is
+// listening.
+fn run_hooks(sessions: &mut HashMap<SessionId, SessionState>, session_id: SessionId, event: &str, buf: &TextBuffer) {
+    let language = fileeditor::language_of(buf);
+    let Some(session) = sessions.get(&session_id) else { return };
+    let commands = session.shell.hooks_for(event, &language);
+    if commands.is_empty() {
+        return;
+    }
+    let path = buf.path().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
+    let Some(session) = sessions.get_mut(&session_id) else { return };
+    let captured = Rc::new(RefCell::new(String::new()));
+    session.shell.set_sink_capture(captured);
+    for command in commands {
+        // The path as one quoted word, so a name with a space in it
+        // arrives as one argument rather than several.
+        let line = format!("{command} {}", crate::exec::shell_quote(&path));
+        // A hook that doesn't parse is a config error, and the middle of
+        // a redraw is the worst possible place to report one -- it is
+        // simply not run, the same tolerance the abbreviation table
+        // already has for a bad expansion.
+        if let Ok(toks) = Lexer::new(&line).tokenize()
+            && let Ok(prog) = Parser::new(toks).parse_program()
+        {
+            session.shell.run_program(&prog);
+        }
+    }
+    // Back to the pane's own grid, which is where this session's output
+    // belongs the rest of the time.
+    session.shell.set_sink_grid(session.screen.clone());
+}
+
 // The window list as the `window` builtin sees it -- pushed into every
 // session's Shell before a command runs, so `window ls` and `window
 // select` are ordinary builtins reading a snapshot rather than actions
@@ -8623,10 +8677,17 @@ fn run_command_mode(
                     };
                     match cmd {
                         "w" | "write" => {
+                            run_hooks(sessions, session_id, "editor:file:write:pre", tb);
                             fileeditor::run_pre_save_hooks(tb);
                             match tb.save(arg.map(std::path::Path::new)) {
                                 Ok(()) => {
                                     fileeditor::set_last_filename(tb, registers);
+                                    // After the bytes are really on
+                                    // disk, so a hook that formats or
+                                    // reloads is looking at what was
+                                    // written rather than what was
+                                    // about to be.
+                                    run_hooks(sessions, session_id, "editor:file:write:post", tb);
                                     sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry {
                                         command: trimmed,
                                         output: String::new(),

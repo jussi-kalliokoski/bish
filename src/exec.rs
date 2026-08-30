@@ -472,6 +472,47 @@ pub struct WindowInfo {
 // What repl.rs should do in response to a `window`-family command -- see
 // ExecResult::Window's doc comment for why this travels as a bubbled
 // signal instead of direct shared-state mutation.
+/// One registered hook: what to run, when, and for which languages.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Hook {
+    /// Assigned from a per-shell counter and never reused, so `rm`
+    /// always names the thing `ls` showed.
+    pub id: u64,
+    pub event: String,
+    /// `--lang=`: a glob matched against the language of the file the
+    /// event is about (`fileeditor::language_of`), the same shape and
+    /// the same matcher `abbr --lang` uses -- so `--lang='*script'`
+    /// covers a family and `--lang='!(bash)'` covers everything else.
+    /// `*` when unscoped.
+    pub lang: String,
+    /// The command line to run, with the file's path appended as its
+    /// first argument.
+    pub command: String,
+}
+
+/// Every event a hook can be attached to.
+///
+/// **Naming.** `pre`/`post` is a segment rather than a prefix
+/// (`editor:file:write:pre`, not `editor:file:prewrite`) because every
+/// established system treats it as a modifier on one event -- git's
+/// `pre-commit`/`post-commit`, vim's `BufWritePre`/`BufWritePost`,
+/// emacs's `before-save-hook`/`after-save-hook`, LSP's
+/// `willSave`/`didSave`. The practical half of that argument is that it
+/// keeps the hierarchy prefix-matchable: `editor:file:write` and
+/// `editor:file` are meaningful prefixes to glob or group by, which
+/// they cannot be with the verb buried inside a segment.
+///
+/// `open` and `close` carry no qualifier because each has only one
+/// useful moment: `open` fires once the buffer exists, and `close`
+/// fires *before* it goes away -- afterwards there is nothing left for
+/// a hook to look at, which is why vim's own `BufUnload`/`BufDelete`
+/// are both "before" too.
+///
+/// The `editor:` namespace is deliberate rather than decorative: it
+/// leaves room for `shell:` events (a preexec, a chpwd) to exist later
+/// without renaming any of these.
+pub const HOOK_EVENTS: &[&str] = &["editor:file:open", "editor:file:write:pre", "editor:file:write:post", "editor:file:close"];
+
 #[derive(Debug, Clone)]
 pub enum WindowAction {
     /// `window create [--name NAME]`. A name is what the tab bar shows
@@ -635,6 +676,11 @@ pub struct Shell {
     // exactly that snapshotting (repl.rs is a different module) --
     // matching `cwd`'s own visibility.
     pub abbrs: Vec<Abbr>,
+    /// `::bish hook`-registered commands, in the order they were added.
+    /// Inherited by a virtual child exactly as `abbrs` is: a window you
+    /// split off should behave like the one you split it from.
+    pub hooks: Vec<Hook>,
+    next_hook_id: u64,
     // One frame per active function call (pushed/popped alongside
     // var_scopes in call_function). `local -a`/`-A name` snapshots the
     // array's pre-local value here (None if it didn't exist) before
@@ -1019,6 +1065,8 @@ impl Shell {
             assoc_names: std::collections::HashSet::new(),
             aliases: Vec::new(),
             abbrs: Vec::new(),
+            hooks: Vec::new(),
+            next_hook_id: 1,
             array_local_stack: Vec::new(),
             assoc_local_stack: Vec::new(),
             nameref_names: std::collections::HashSet::new(),
@@ -1245,6 +1293,8 @@ impl Shell {
             assoc_names: self.assoc_names.clone(),
             aliases: self.aliases.clone(),
             abbrs: self.abbrs.clone(),
+            hooks: self.hooks.clone(),
+            next_hook_id: self.next_hook_id,
             array_local_stack: Vec::new(),
             assoc_local_stack: Vec::new(),
             nameref_names: self.nameref_names.clone(),
@@ -2963,6 +3013,7 @@ impl Shell {
     // bash's own less-common toggles under one name instead of each
     // getting its own builtin.
     fn run_bish(&mut self, args: &[String]) -> ExecResult {
+
         match args {
             [sub, rest @ ..] if sub == "theme" => ExecResult::Status(self.run_bish_theme(rest)),
             // The canonical spelling of the window manager. `window`/
@@ -2972,15 +3023,124 @@ impl Shell {
             // runs under bish, and this namespace exists precisely for
             // bish-specific commands that shouldn't spend a common word.
             [sub, rest @ ..] if sub == "window" || sub == "win" => self.run_window(rest),
+            [sub, rest @ ..] if sub == "hook" => ExecResult::Status(self.run_hook(rest)),
             [] => {
-                sh_eprintln!(self, "bish: ::bish: missing subcommand (expected: theme, window)");
+                sh_eprintln!(self, "bish: ::bish: missing subcommand (expected: theme, window, hook)");
                 ExecResult::Status(2)
             }
             [other, ..] => {
-                sh_eprintln!(self, "bish: ::bish: unknown subcommand '{other}' (expected: theme, window)");
+                sh_eprintln!(self, "bish: ::bish: unknown subcommand '{other}' (expected: theme, window, hook)");
                 ExecResult::Status(2)
             }
         }
+    }
+
+    // `::bish hook ls|add|rm` -- what runs when the editor opens, writes
+    // or closes a file. The whole point is that a config file can attach
+    // behaviour to a language without the editor knowing anything about
+    // that behaviour: `::bish hook add --lang=rust editor:file:open
+    // __rust_setup` and the editor just runs it.
+// `--lang=GLOB` or `--lang GLOB`, returning it and whatever
+    // follows. Its own helper because `add` and `ls` have to agree
+    // about the spelling.
+    fn hook_lang_flag<'a>(&mut self, subcommand: &str, args: &'a [String]) -> Result<(Option<String>, &'a [String]), i32> {
+        match args.first().map(String::as_str) {
+            Some(flag) if flag.starts_with("--lang=") => Ok((Some(flag["--lang=".len()..].to_string()), &args[1..])),
+            Some("--lang") => match args.get(1) {
+                Some(lang) => Ok((Some(lang.clone()), &args[2..])),
+                None => {
+                    sh_eprintln!(self, "bish: ::bish hook: {subcommand}: --lang needs a glob");
+                    Err(2)
+                }
+            },
+            _ => Ok((None, args)),
+        }
+    }
+
+    fn run_hook(&mut self, args: &[String]) -> i32 {
+        match args.first().map(String::as_str) {
+            Some("ls") | Some("list") | None => {
+                let lang = match self.hook_lang_flag("ls", &args[1.min(args.len())..]) {
+                    Ok((lang, [])) => lang,
+                    Ok(_) => {
+                        sh_eprintln!(self, "bish: ::bish hook: ls: usage: ::bish hook ls [--lang=GLOB]");
+                        return 2;
+                    }
+                    Err(status) => return status,
+                };
+                for hook in self.hooks.clone() {
+                    // Listing by language asks "what would fire for a
+                    // file of this language", so it matches the *glob*
+                    // against the language given, exactly as firing
+                    // does -- not the two globs against each other.
+                    if let Some(lang) = lang.as_deref()
+                        && !crate::glob::matches(&hook.lang, lang)
+                    {
+                        continue;
+                    }
+                    sh_println!(self, "{}\t{}\t{}\t{}", hook.id, hook.event, hook.lang, hook.command);
+                }
+                0
+            }
+            Some("add") => {
+                let (lang, rest) = match self.hook_lang_flag("add", &args[1..]) {
+                    Ok(parsed) => parsed,
+                    Err(status) => return status,
+                };
+                let [event, command @ ..] = rest else {
+                    sh_eprintln!(self, "bish: ::bish hook: add: usage: ::bish hook add [--lang=GLOB] EVENT COMMAND...");
+                    return 2;
+                };
+                if !HOOK_EVENTS.contains(&event.as_str()) {
+                    sh_eprintln!(self, "bish: ::bish hook: add: unknown event '{event}' (expected: {})", HOOK_EVENTS.join(", "));
+                    return 2;
+                }
+                if command.is_empty() {
+                    sh_eprintln!(self, "bish: ::bish hook: add: no command given");
+                    return 2;
+                }
+                let id = self.next_hook_id;
+                self.next_hook_id += 1;
+                self.hooks.push(Hook {
+                    id,
+                    event: event.clone(),
+                    lang: lang.unwrap_or_else(|| "*".to_string()),
+                    command: command.join(" "),
+                });
+                // The id is the return value: a config that adds a hook
+                // is usually the thing that will want to remove it.
+                sh_println!(self, "{id}");
+                0
+            }
+            Some("rm") | Some("remove") => {
+                let Some(id) = args.get(1).and_then(|a| a.parse::<u64>().ok()) else {
+                    sh_eprintln!(self, "bish: ::bish hook: rm: usage: ::bish hook rm <id>");
+                    return 2;
+                };
+                let before = self.hooks.len();
+                self.hooks.retain(|h| h.id != id);
+                if self.hooks.len() == before {
+                    sh_eprintln!(self, "bish: ::bish hook: rm: no hook with id {id}");
+                    return 1;
+                }
+                0
+            }
+            Some(other) => {
+                sh_eprintln!(self, "bish: ::bish hook: unknown subcommand '{other}' (expected: ls, add, rm)");
+                2
+            }
+        }
+    }
+
+    /// The commands to run for `event` on a file of `language`, in the
+    /// order they were added. Empty is the overwhelmingly common answer,
+    /// which is what keeps firing an event free when nobody is listening.
+    pub fn hooks_for(&self, event: &str, language: &str) -> Vec<String> {
+        self.hooks
+            .iter()
+            .filter(|h| h.event == event && crate::glob::matches(&h.lang, language))
+            .map(|h| h.command.clone())
+            .collect()
     }
 
     fn run_bish_theme(&mut self, args: &[String]) -> i32 {
@@ -9053,7 +9213,7 @@ fn echo_expand_escapes(s: &str) -> (String, bool) {
 // Wraps `s` in single quotes, escaping any embedded single quote as
 // '\'' (close, escaped-quote, reopen) -- the standard POSIX-shell-safe
 // quoting form, and what printf's own %q conversion produces.
-fn shell_quote(s: &str) -> String {
+pub(crate) fn shell_quote(s: &str) -> String {
     let mut out = String::from("'");
     for c in s.chars() {
         if c == '\'' {
@@ -12942,5 +13102,79 @@ mod tests {
     fn describing_an_option_that_does_not_exist_fails() {
         let mut shell = Shell::new();
         assert_eq!(shell.run_bishopt(&strs(&["--describe", "nonsense"]), KNOWN_BISHOPTS), 1);
+    }
+
+    fn hook_ids(shell: &mut Shell) -> Vec<u64> {
+        shell.hooks.iter().map(|h| h.id).collect()
+    }
+
+    #[test]
+    fn adding_a_hook_returns_an_id_that_removes_it() {
+        let mut shell = Shell::new();
+        assert_eq!(shell.run_hook(&strs(&["add", "editor:file:open", "__setup"])), 0);
+        assert_eq!(shell.run_hook(&strs(&["add", "editor:file:close", "__teardown"])), 0);
+        assert_eq!(hook_ids(&mut shell), vec![1, 2], "ids come from a counter, in order");
+        assert_eq!(shell.run_hook(&strs(&["rm", "1"])), 0);
+        assert_eq!(hook_ids(&mut shell), vec![2]);
+        // ...and an id is never reused, so `rm` can't hit the wrong one.
+        assert_eq!(shell.run_hook(&strs(&["add", "editor:file:open", "__again"])), 0);
+        assert_eq!(hook_ids(&mut shell), vec![2, 3]);
+    }
+
+    #[test]
+    fn removing_a_hook_that_is_not_there_fails() {
+        let mut shell = Shell::new();
+        assert_eq!(shell.run_hook(&strs(&["rm", "99"])), 1);
+        assert_eq!(shell.run_hook(&strs(&["rm", "nonsense"])), 2);
+    }
+
+    // A typo'd event is the mistake this can actually catch, and a hook
+    // that never fires is the worst way to find out.
+    #[test]
+    fn an_unknown_event_is_refused() {
+        let mut shell = Shell::new();
+        assert_eq!(shell.run_hook(&strs(&["add", "editor:file:prewrite", "__x"])), 2);
+        assert!(shell.hooks.is_empty());
+        assert_eq!(shell.run_hook(&strs(&["add", "editor:file:write:pre", "__x"])), 0);
+    }
+
+    #[test]
+    fn a_hook_fires_only_for_its_event_and_language() {
+        let mut shell = Shell::new();
+        shell.run_hook(&strs(&["add", "--lang=rust", "editor:file:open", "__rust"]));
+        shell.run_hook(&strs(&["add", "--lang", "!(rust)", "editor:file:open", "__other"]));
+        shell.run_hook(&strs(&["add", "editor:file:open", "__any"]));
+        shell.run_hook(&strs(&["add", "--lang=rust", "editor:file:close", "__bye"]));
+        assert_eq!(shell.hooks_for("editor:file:open", "rust"), vec!["__rust", "__any"]);
+        assert_eq!(shell.hooks_for("editor:file:open", "bash"), vec!["__other", "__any"]);
+        assert_eq!(shell.hooks_for("editor:file:close", "rust"), vec!["__bye"]);
+        assert!(shell.hooks_for("editor:file:write:pre", "rust").is_empty());
+    }
+
+    // Order is registration order, because a config that adds two hooks
+    // for one event means them to run in the order it wrote them.
+    #[test]
+    fn hooks_fire_in_the_order_they_were_added() {
+        let mut shell = Shell::new();
+        for name in ["__first", "__second", "__third"] {
+            shell.run_hook(&strs(&["add", "editor:file:open", name]));
+        }
+        assert_eq!(shell.hooks_for("editor:file:open", "bash"), vec!["__first", "__second", "__third"]);
+    }
+
+    // A split window should behave like the one it was split from.
+    #[test]
+    fn a_child_shell_inherits_the_hooks() {
+        let mut shell = Shell::new();
+        shell.run_hook(&strs(&["add", "editor:file:open", "__setup"]));
+        let child = shell.new_virtual_child();
+        assert_eq!(child.hooks_for("editor:file:open", "bash"), vec!["__setup"]);
+    }
+
+    #[test]
+    fn a_command_with_arguments_is_kept_whole() {
+        let mut shell = Shell::new();
+        shell.run_hook(&strs(&["add", "editor:file:open", "lsp", "start", "--quiet"]));
+        assert_eq!(shell.hooks[0].command, "lsp start --quiet");
     }
 }
