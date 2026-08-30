@@ -2973,7 +2973,7 @@ fn render_diagnostics_list_frame(buf: &TextBuffer, rect: Rect, selected: usize, 
             if expanded == Some(i) {
                 if row < rect.rows {
                     out.push_str(&format!("\x1b[{};{}H", rect.row + row + 1, rect.col + 1));
-                    out.push_str(&pad(&format!("  [{}] {}", d.code, d.message), rect.cols));
+                    out.push_str(&pad(&format!("  [{}] {}", d.label(), d.message), rect.cols));
                     row += 1;
                 }
                 if row < rect.rows {

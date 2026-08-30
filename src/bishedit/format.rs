@@ -43,6 +43,7 @@
 // else unexpected (a `\` line continuation, say).
 
 use crate::bishedit::lint::{Diagnostic, Fix, Severity};
+use std::borrow::Cow;
 use crate::lexer::{self, SpannedItem, Tok};
 use crate::parser::Parser;
 
@@ -382,7 +383,7 @@ fn format_gaps(chars: &[char], real: &[&SpannedItem]) -> Vec<Diagnostic> {
                                 start: kw_span.start,
                                 end: word_start,
                                 severity: Severity::Warning,
-                                code: "format",
+                                code: Cow::Borrowed("format"), source: None,
                                 message: "expected no `function` keyword here -- use `NAME() { ... }`".to_string(),
                                 fix: Some(Fix { start: kw_span.start, end: word_start, replacement: String::new() }),
                             });
@@ -444,7 +445,7 @@ fn format_gaps(chars: &[char], real: &[&SpannedItem]) -> Vec<Diagnostic> {
                     start: prev_end,
                     end: this_start,
                     severity: Severity::Warning,
-                    code: "format",
+                    code: Cow::Borrowed("format"), source: None,
                     message: describe(&intended),
                     fix: Some(Fix { start: prev_end, end: this_start, replacement: intended }),
                 });

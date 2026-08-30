@@ -296,7 +296,7 @@ fn report_remaining<'a>(path: &str, text: &str, diagnostics: impl Iterator<Item 
     let chars: Vec<char> = text.chars().collect();
     for d in diagnostics {
         let (line, col) = line_col(&chars, d.start);
-        println!("{path}:{line}:{col}: [{}] {}", d.code, d.message);
+        println!("{path}:{line}:{col}: [{}] {}", d.label(), d.message);
     }
 }
 
@@ -323,9 +323,10 @@ fn line_col(chars: &[char], offset: usize) -> (usize, usize) {
 mod tests {
     use super::*;
     use crate::bishedit::lint::Severity;
+    use std::borrow::Cow;
 
     fn diag(start: usize, end: usize, fix: Option<Fix>) -> Diagnostic {
-        Diagnostic { start, end, severity: Severity::Warning, code: "test", message: "test".to_string(), fix }
+        Diagnostic { start, end, severity: Severity::Warning, code: Cow::Borrowed("test"), source: None, message: "test".to_string(), fix }
     }
 
     #[test]

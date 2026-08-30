@@ -4294,6 +4294,7 @@ mod insert_mode_alt_word_motion_tests {
 #[cfg(test)]
 mod diagnose_tests {
     use super::*;
+    use std::borrow::Cow;
 
     // `is_bash_file` keys off the path's own extension (see its own doc
     // comment) -- `TextBuffer::new_unnamed`/`insert_text` can't produce
@@ -4325,7 +4326,7 @@ mod diagnose_tests {
 
     #[test]
     fn diagnostic_spans_for_line_clamps_to_the_requested_lines_own_extent() {
-        let diags = vec![lint::Diagnostic { start: 5, end: 9, severity: lint::Severity::Warning, code: "unquoted-expansion", message: String::new(), fix: None }];
+        let diags = vec![lint::Diagnostic { start: 5, end: 9, severity: lint::Severity::Warning, code: Cow::Borrowed("unquoted-expansion"), source: None, message: String::new(), fix: None }];
         let b = TextBuffer::new_unnamed(10);
         let spans = diagnostic_spans_for_line(&b, &diags, 0, 20);
         assert_eq!(spans.len(), 1);
@@ -4340,7 +4341,7 @@ mod diagnose_tests {
     fn the_gutter_mark_takes_the_worst_severity_on_the_line() {
         let mut buf = TextBuffer::new_unnamed(10);
         buf.insert_text((0, 0), "one two\nthree");
-        let diag = |start, end, severity| lint::Diagnostic { start, end, severity, code: "x", message: String::new(), fix: None };
+        let diag = |start, end, severity| lint::Diagnostic { start, end, severity, code: Cow::Borrowed("x"), source: None, message: String::new(), fix: None };
         buf.diagnostics = vec![diag(0, 3, lint::Severity::Hint), diag(4, 7, lint::Severity::Error), diag(4, 7, lint::Severity::Warning)];
         let starts = line_starts(&buf);
         assert_eq!(line_severity(&buf, &starts, 0), Some(lint::Severity::Error));
@@ -4383,7 +4384,7 @@ mod diagnose_tests {
             start: 5,
             end: 9,
             severity: lint::Severity::Warning,
-            code: "unquoted-expansion",
+            code: Cow::Borrowed("unquoted-expansion"), source: None,
             message: String::new(),
             fix: Some(lint::Fix { start: 5, end: 9, replacement: "\"$foo\"".to_string() }),
         };
@@ -4395,7 +4396,7 @@ mod diagnose_tests {
     fn apply_fix_is_a_no_op_without_a_fix() {
         let mut buf = TextBuffer::new_unnamed(10);
         buf.insert_text((0, 0), "echo $foo");
-        let diagnostic = lint::Diagnostic { start: 5, end: 9, severity: lint::Severity::Warning, code: "unquoted-expansion", message: String::new(), fix: None };
+        let diagnostic = lint::Diagnostic { start: 5, end: 9, severity: lint::Severity::Warning, code: Cow::Borrowed("unquoted-expansion"), source: None, message: String::new(), fix: None };
         assert!(!apply_fix(&mut buf, &diagnostic));
         assert_eq!(buf.line_chars(0).into_iter().collect::<String>(), "echo $foo");
     }

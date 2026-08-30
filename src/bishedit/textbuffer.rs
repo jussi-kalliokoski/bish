@@ -816,6 +816,7 @@ fn detect_eol(text: &str) -> crate::editorconfig::Eol {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::borrow::Cow;
 
     fn make(text: &str) -> TextBuffer {
         let lines: Vec<Vec<char>> = text.split('\n').map(|l| l.chars().collect()).collect();
@@ -1160,7 +1161,7 @@ mod tests {
         // Diagnostics computed for the *current* (post-edit) content --
         // set directly, since insert_text/checkpoint_undo themselves don't
         // touch this field.
-        buf.diagnostics = vec![lint::Diagnostic { start: 0, end: 1, severity: lint::Severity::Warning, code: "x", message: String::new(), fix: None }];
+        buf.diagnostics = vec![lint::Diagnostic { start: 0, end: 1, severity: lint::Severity::Warning, code: Cow::Borrowed("x"), source: None, message: String::new(), fix: None }];
         assert!(buf.undo());
         assert!(buf.diagnostics.is_empty());
     }

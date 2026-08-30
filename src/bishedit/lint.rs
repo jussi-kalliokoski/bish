@@ -32,6 +32,7 @@
 use crate::bishedit::highlight::resets_command_position;
 use crate::lexer::{self, Chunk, SpannedItem, Tok};
 use crate::parser;
+use std::borrow::Cow;
 use std::ops::Range;
 
 // Declared least-severe-first, and `Ord` is derived for exactly that
@@ -77,15 +78,63 @@ pub struct Diagnostic {
     pub end: usize,
     pub severity: Severity,
     // A short, stable, kebab-case identifier for the rule that produced
-    // this -- what a future suppression comment or LSP diagnostic code
-    // would key off of, not meant to change once a rule ships.
-    pub code: &'static str,
+    // this -- what a future suppression comment would key off of, not
+    // meant to change once a rule ships.
+    //
+    // `Cow` rather than the `&'static str` this was, because a language
+    // server's diagnostic code is a runtime string off the wire and
+    // these share one `Vec` with bish's own findings. Every rule in this
+    // file still writes a literal and still allocates nothing for it;
+    // only the borrowed-or-owned choice moved into the type.
+    pub code: Cow<'static, str>,
+    // Who found it -- `None` for bish's own linters (the overwhelming
+    // majority, and what a reader assumes when nothing says otherwise),
+    // `Some("rustc")` for a finding relayed from a language server. Kept
+    // separate from `code` rather than folded into it because the two
+    // namespaces are genuinely different: two servers can both emit an
+    // `E0308` and mean different things.
+    pub source: Option<String>,
     pub message: String,
     // `None` when the finding is real but there's no fix this engine
     // trusts itself to make automatically (see masked_return_value's own
     // doc comment for a concrete case: a fix is only offered when
     // rewriting it can't change the script's behavior any other way).
     pub fix: Option<Fix>,
+}
+
+impl Diagnostic {
+    /// How this finding identifies itself in a list: its bare `code`
+    /// when bish found it, `source:code` when something else did. The
+    /// one place that formatting is decided, since both the CLI
+    /// (`bish tool check`) and the editor's diagnostics pane show it.
+    pub fn label(&self) -> String {
+        match &self.source {
+            Some(source) => format!("{source}:{}", self.code),
+            None => self.code.to_string(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod label_tests {
+    use super::*;
+
+    #[test]
+    fn a_label_names_its_source_only_when_something_other_than_bish_found_it() {
+        let mut d = Diagnostic {
+            start: 0,
+            end: 1,
+            severity: Severity::Warning,
+            code: Cow::Borrowed("unquoted-expansion"),
+            source: None,
+            message: String::new(),
+            fix: None,
+        };
+        assert_eq!(d.label(), "unquoted-expansion");
+        d.code = Cow::Owned("E0308".to_string());
+        d.source = Some("rustc".to_string());
+        assert_eq!(d.label(), "rustc:E0308");
+    }
 }
 
 pub trait Linter {
@@ -365,7 +414,7 @@ fn lint_into(text: &str, offset: usize, out: &mut Vec<Diagnostic>) {
                             start: word_start,
                             end: word_end,
                             severity: Severity::Warning,
-                            code: "masked-return-value",
+                            code: Cow::Borrowed("masked-return-value"), source: None,
                             message: format!(
                                 "`{keyword}` masks `{name}`'s command substitution's own exit status -- assign it in a separate statement to check it"
                             ),
@@ -461,7 +510,7 @@ fn push_unquoted_expansion(chars: &[char], offset: usize, content: Range<usize>,
         start,
         end,
         severity: Severity::Warning,
-        code: "unquoted-expansion",
+        code: Cow::Borrowed("unquoted-expansion"), source: None,
         message: "Unquoted expansion may be word-split or glob-expanded here -- wrap it in double quotes".to_string(),
         fix: Some(Fix { start, end, replacement: format!("\"{}\"", char_slice(chars, full)) }),
     });
@@ -472,7 +521,7 @@ mod tests {
     use super::*;
 
     fn codes(diags: &[Diagnostic]) -> Vec<&str> {
-        diags.iter().map(|d| d.code).collect()
+        diags.iter().map(|d| d.code.as_ref()).collect()
     }
 
     fn check(src: &str) -> Vec<Diagnostic> {
