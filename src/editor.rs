@@ -834,8 +834,24 @@ fn compose_redraw(prompt: &str, ed: &LineEditor, ghost: &str, col_origin: usize,
     // out-of-scope list (a single command line's worth of recomputation
     // per keystroke is cheap enough that it isn't worth it).
     let buf_text: String = ed.buf.iter().collect();
-    let styled: Vec<StyledSpan> = BashHighlighter
-        .highlight(&buf_text, ctx)
+    let raw = BashHighlighter.highlight(&buf_text, ctx);
+    // The other half of what the highlighter already produces: a path
+    // that resolved against the cwd carries the `file://` URL it
+    // resolved to, and a URL typed into the line is one of its own.
+    // Both become real terminal hyperlinks here (see
+    // highlight::render_linked), so ^click on a filename at the prompt
+    // opens it.
+    let mut links: Vec<highlight::LinkSpan> = if !ctx.hyperlinks { Vec::new() } else { raw
+        .iter()
+        .filter_map(|s| Some(highlight::LinkSpan { start: s.start, end: s.end, url: s.link.clone()? }))
+        .collect() };
+    if ctx.hyperlinks {
+        for found in crate::url::find(&buf_text) {
+            let url: String = buf_text.chars().skip(found.start).take(found.end - found.start).collect();
+            links.push(highlight::LinkSpan { start: found.start, end: found.end, url });
+        }
+    }
+    let styled: Vec<StyledSpan> = raw
         .into_iter()
         .map(|s| {
             let (fg, attrs) = highlight::resolve_style(s.kind, ctx.color_overrides);
@@ -878,7 +894,7 @@ fn compose_redraw(prompt: &str, ed: &LineEditor, ghost: &str, col_origin: usize,
     let cells = highlight::compose(&combined, &[&styled, &ghost_layer, overlay]);
 
     if combined.len() <= remaining {
-        out.push_str(&highlight::render_styled(&cells));
+        out.push_str(&highlight::render_linked(&cells, &links));
         // Walks the real cursor back past the ghost tail (present or
         // not) to land right after the real buffer, at ed.cursor's own
         // position -- cursor-wise, the ghost doesn't exist. With no
@@ -899,7 +915,19 @@ fn compose_redraw(prompt: &str, ed: &LineEditor, ghost: &str, col_origin: usize,
         // references ed.buf/ed.cursor, never `combined`.
         let window_start = ed.cursor.saturating_sub(remaining - 1).min(ed.buf.len() - remaining);
         let window_end = (window_start + remaining).min(ed.buf.len());
-        out.push_str(&highlight::render_styled(&cells[window_start..window_end]));
+        // Rebased onto the window, the same way the cells themselves
+        // are sliced -- a link that starts before the visible window
+        // still hyperlinks the part of it that shows.
+        let windowed: Vec<highlight::LinkSpan> = links
+            .iter()
+            .filter(|l| l.start < window_end && l.end > window_start)
+            .map(|l| highlight::LinkSpan {
+                start: l.start.saturating_sub(window_start),
+                end: (l.end - window_start).min(window_end - window_start),
+                url: l.url.clone(),
+            })
+            .collect();
+        out.push_str(&highlight::render_linked(&cells[window_start..window_end], &windowed));
         let back = (window_end - window_start) - (ed.cursor - window_start);
         if back > 0 {
             out.push_str(&format!("\x1b[{}D", back));

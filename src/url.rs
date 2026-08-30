@@ -238,6 +238,34 @@ fn trim_trailing(chars: &[char], start: usize, mut end: usize) -> usize {
     end
 }
 
+/// Whether a URL is safe to put inside an OSC 8 escape sequence.
+///
+/// The URL comes from a *file* -- a markdown link's destination, a
+/// string in someone's source -- and is about to be spliced into an
+/// escape sequence, so a control character in it would end the sequence
+/// early and hand the terminal whatever followed as commands. A URL
+/// that needs repairing to be safe is a URL nobody should be one click
+/// away from, so this says no rather than sanitizing.
+pub fn is_safe(url: &str) -> bool {
+    !url.is_empty() && !url.chars().any(|c| c.is_control())
+}
+
+/// A link target as something a terminal can actually open. Already a
+/// URL, it is returned as it is; otherwise it is a relative path -- a
+/// markdown link to a sibling document, most often -- resolved against
+/// `base_dir` into a `file://` URL, which is what makes clicking
+/// `[the plan](plan.md)` go somewhere. Without a base directory a
+/// relative target has nothing to be relative *to*, and gets no link
+/// rather than a guessed one.
+pub fn absolute(target: &str, base_dir: Option<&std::path::Path>) -> Option<String> {
+    if parse(target).is_some() {
+        return Some(target.to_string());
+    }
+    let joined = base_dir?.join(target);
+    let resolved = std::fs::canonicalize(&joined).unwrap_or(joined);
+    Some(format!("file://{}", resolved.display()))
+}
+
 fn is_scheme_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.')
 }
@@ -398,5 +426,21 @@ mod tests {
         assert_eq!(parse("https://example.com/a?b").unwrap().origin().as_deref(), Some("https://example.com"));
         assert_eq!(parse("https://example.com:8443/a").unwrap().origin().as_deref(), Some("https://example.com:8443"));
         assert_eq!(parse("mailto:a@b").unwrap().origin(), None);
+    }
+
+    #[test]
+    fn a_url_with_a_control_character_is_not_safe_to_emit() {
+        assert!(is_safe("https://example.com/a"));
+        assert!(!is_safe(""));
+        assert!(!is_safe("https://x\u{1b}]0;pwned\u{7}"));
+        assert!(!is_safe("https://x\n"));
+    }
+
+    #[test]
+    fn absolute_passes_a_url_through_and_resolves_a_path() {
+        assert_eq!(absolute("https://example.com", None).as_deref(), Some("https://example.com"));
+        let base = std::path::Path::new("/tmp/somewhere");
+        assert_eq!(absolute("plan.md", Some(base)).as_deref(), Some("file:///tmp/somewhere/plan.md"));
+        assert_eq!(absolute("plan.md", None), None, "nothing to be relative to");
     }
 }

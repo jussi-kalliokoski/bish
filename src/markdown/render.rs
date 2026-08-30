@@ -35,16 +35,26 @@ const CODE: &str = "\x1b[32m";
 const LINK: &str = "\x1b[4;36m";
 const QUOTE_BAR: &str = "\x1b[2;34m";
 
+#[derive(Debug, Clone)]
 pub struct Options {
     pub width: usize,
     // Whether a fenced code block's own language gets syntax
     // highlighted. Off for a plain-text render (a test, a pipe).
     pub highlight_code: bool,
+    // Whether a link's own text is emitted as a real OSC 8 terminal
+    // hyperlink. Off for a plain-text render, and off when the
+    // `hyperlinks` bishopt is.
+    pub hyperlinks: bool,
+    // What a *relative* link destination is relative to -- the directory
+    // of the document being rendered. `None` for a document that has no
+    // file behind it (`:help`), where a relative target has nothing to
+    // resolve against and simply gets no hyperlink.
+    pub base_dir: Option<std::path::PathBuf>,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Options { width: 80, highlight_code: true }
+        Options { width: 80, highlight_code: true, hyperlinks: false, base_dir: None }
     }
 }
 
@@ -80,7 +90,7 @@ fn render_block(block: &Block, opts: &Options, indent: usize, out: &mut Vec<Stri
     let width = opts.width.saturating_sub(indent).max(8);
     match block {
         Block::Paragraph { content, .. } => {
-            for line in wrap(&inline_runs(content), width) {
+            for line in wrap(&inline_runs(content, opts), width) {
                 out.push(format!("{pad}{line}"));
             }
         }
@@ -91,7 +101,7 @@ fn render_block(block: &Block, opts: &Options, indent: usize, out: &mut Vec<Stri
                 1 => String::new(),
                 _ => "  ".repeat((*level as usize).saturating_sub(2)),
             };
-            let text: String = inline_runs(content).iter().map(|r| r.styled()).collect();
+            let text: String = inline_runs(content, opts).iter().map(|r| r.styled()).collect();
             out.push(format!("{pad}{HEADING}{prefix}{text}{RESET}"));
             // A top-level heading is underlined, which is what makes a
             // long help page scannable.
@@ -122,7 +132,7 @@ fn render_block(block: &Block, opts: &Options, indent: usize, out: &mut Vec<Stri
         }
         Block::BlockQuote { blocks, .. } => {
             let mut inner = Vec::new();
-            render_blocks(blocks, &Options { width: width.saturating_sub(2), ..*opts }, 0, &mut inner);
+            render_blocks(blocks, &Options { width: width.saturating_sub(2), ..opts.clone() }, 0, &mut inner);
             for line in inner {
                 out.push(format!("{pad}{QUOTE_BAR}\u{2502}{RESET} {line}"));
             }
@@ -146,7 +156,7 @@ fn render_list(list: &List, opts: &Options, indent: usize, out: &mut Vec<String>
             (false, None) => "\u{2022} ".to_string(),
         };
         let mut inner = Vec::new();
-        let inner_opts = Options { width: opts.width.saturating_sub(indent + str_width(&marker)), ..*opts };
+        let inner_opts = Options { width: opts.width.saturating_sub(indent + str_width(&marker)), ..opts.clone() };
         render_blocks(&item.blocks, &inner_opts, 0, &mut inner);
         let pad = " ".repeat(indent);
         let hang = " ".repeat(indent + str_width(&marker));
@@ -165,7 +175,7 @@ fn render_table(table: &Table, opts: &Options, indent: usize, out: &mut Vec<Stri
     let cell = |cells: &[Vec<Inline>], i: usize| -> (String, usize) {
         match cells.get(i) {
             Some(inlines) => {
-                let runs = inline_runs(inlines);
+                let runs = inline_runs(inlines, opts);
                 let styled: String = runs.iter().map(|r| r.styled()).collect();
                 let width: usize = runs.iter().map(|r| str_width(&r.text)).sum();
                 (styled, width)
@@ -232,6 +242,26 @@ struct Style {
     underline: bool,
     strike: bool,
     color: Option<&'static str>,
+    // The OSC 8 target for this run, when it has one. Carried on the
+    // style rather than beside it because wrapping splits a run into
+    // words by cloning exactly this -- so a link that wraps stays a link
+    // on both rows without the wrapper knowing anything about links.
+    link: Option<Link>,
+}
+
+// A hyperlink target, and the id that ties its pieces together.
+//
+// The id matters because of that same word-splitting: `[the site](...)`
+// becomes two runs and so two OSC 8 sequences, and a terminal treats two
+// adjacent hyperlinks with no id as two separate targets -- hovering
+// would underline only the word under the pointer. Giving both pieces
+// the same id is what makes the whole phrase one link, and is exactly
+// what the id parameter is for. The link's own source offset serves as
+// the id, since no two links in a document start at the same place.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Link {
+    id: usize,
+    url: String,
 }
 
 #[derive(Debug, Clone)]
@@ -249,6 +279,12 @@ impl Run {
             return self.text.clone();
         }
         let mut out = String::new();
+        // Outside the SGR codes, so the reset that ends them doesn't
+        // land between the hyperlink's open and its text.
+        let link = s.link.as_ref().filter(|l| crate::url::is_safe(&l.url));
+        if let Some(link) = link {
+            out.push_str(&format!("\x1b]8;id={};{}\x1b\\", link.id, link.url));
+        }
         if let Some(color) = s.color {
             out.push_str(color);
         }
@@ -269,17 +305,20 @@ impl Run {
         }
         out.push_str(&self.text);
         out.push_str(RESET);
+        if link.is_some() {
+            out.push_str("\x1b]8;;\x1b\\");
+        }
         out
     }
 }
 
-fn inline_runs(inlines: &[Inline]) -> Vec<Run> {
+fn inline_runs(inlines: &[Inline], opts: &Options) -> Vec<Run> {
     let mut out = Vec::new();
-    push_inlines(inlines, Style::default(), &mut out);
+    push_inlines(inlines, Style::default(), &mut out, opts);
     out
 }
 
-fn push_inlines(inlines: &[Inline], base: Style, out: &mut Vec<Run>) {
+fn push_inlines(inlines: &[Inline], base: Style, out: &mut Vec<Run>, opts: &Options) {
     // Inline HTML arrives as *separate* nodes -- `<b>`, the text, then
     // `</b>` -- because in markdown the text between two tags is
     // markdown, not HTML. So making `<b>bold</b>` actually bold means
@@ -307,18 +346,25 @@ fn push_inlines(inlines: &[Inline], base: Style, out: &mut Vec<Run>) {
                 s.color = Some(CODE);
                 out.push(Run { text: text.clone(), style: s, break_after: false });
             }
-            Inline::Emph { content, .. } => push_inlines(content, Style { italic: true, ..style.clone() }, out),
-            Inline::Strong { content, .. } => push_inlines(content, Style { bold: true, ..style.clone() }, out),
+            Inline::Emph { content, .. } => push_inlines(content, Style { italic: true, ..style.clone() }, out, opts),
+            Inline::Strong { content, .. } => push_inlines(content, Style { bold: true, ..style.clone() }, out, opts),
             Inline::Strikethrough { content, .. } => {
-                push_inlines(content, Style { strike: true, ..style.clone() }, out)
+                push_inlines(content, Style { strike: true, ..style.clone() }, out, opts)
             }
-            Inline::Link { dest, content, .. } => {
+            Inline::Link { dest, content, span, .. } => {
                 let mut s = style.clone();
                 s.color = Some(LINK);
-                push_inlines(content, s, out);
-                // The destination is shown after the text, dimmed --
-                // a terminal has no way to click, so hiding it would
-                // lose the only useful half.
+                s.link = opts
+                    .hyperlinks
+                    .then(|| crate::url::absolute(dest, opts.base_dir.as_deref()))
+                    .flatten()
+                    .map(|url| Link { id: span.start, url });
+                push_inlines(content, s, out, opts);
+                // The destination is shown after the text, dimmed. Still
+                // shown even now that the text itself can be a real
+                // hyperlink: not every terminal can click one, and
+                // seeing where a link goes without hovering is worth a
+                // few dim columns.
                 let text: String = content.iter().map(|i| i.text_content()).collect();
                 if !dest.is_empty() && *dest != text && format!("mailto:{text}") != *dest {
                     out.push(Run {
@@ -556,7 +602,7 @@ mod tests {
     // checked separately, below.
     fn plain(input: &str, width: usize) -> String {
         let doc = parse(input);
-        let lines = to_lines(&doc, &Options { width, highlight_code: false });
+        let lines = to_lines(&doc, &Options { width, highlight_code: false, ..Options::default() });
         lines.iter().map(|l| format!("{}\n", strip_sgr(l))).collect()
     }
 
@@ -668,7 +714,7 @@ to need wrapping at this width",
     #[test]
     fn inline_html_is_rendered_as_what_it_means() {
         assert_render("a <b>bold</b> and <code>code</code> word\n", 60, "a bold and code word");
-        let styled = to_lines(&parse("a <b>bold</b> word\n"), &Options { width: 60, highlight_code: false });
+        let styled = to_lines(&parse("a <b>bold</b> word\n"), &Options { width: 60, highlight_code: false, ..Options::default() });
         assert!(styled[0].contains("\x1b[1mbold"), "the bold really is bold: {:?}", styled[0]);
     }
 
@@ -686,7 +732,7 @@ to need wrapping at this width",
 
     #[test]
     fn emphasis_and_code_get_real_escape_sequences() {
-        let lines = to_lines(&parse("*em* **strong** `code` ~~gone~~\n"), &Options { width: 60, highlight_code: false });
+        let lines = to_lines(&parse("*em* **strong** `code` ~~gone~~\n"), &Options { width: 60, highlight_code: false, ..Options::default() });
         let line = &lines[0];
         assert!(line.contains("\x1b[3mem"), "italic: {line:?}");
         assert!(line.contains("\x1b[1mstrong"), "bold: {line:?}");
@@ -716,5 +762,65 @@ to need wrapping at this width",
     #[test]
     fn an_empty_document_renders_to_nothing() {
         assert_eq!(to_lines(&parse(""), &Options::default()), Vec::<String>::new());
+    }
+
+    fn osc8_targets(text: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut rest = text;
+        while let Some(at) = rest.find("\x1b]8;") {
+            rest = &rest[at + 4..];
+            rest = rest.split_once(';').map(|(_, url)| url).unwrap_or(rest);
+            let end = rest.find("\x1b\\").unwrap_or(rest.len());
+            if !rest[..end].is_empty() {
+                out.push(rest[..end].to_string());
+            }
+            rest = &rest[end..];
+        }
+        out
+    }
+
+    #[test]
+    fn hyperlinks_are_emitted_for_absolute_and_resolved_relative_destinations() {
+        let doc = crate::markdown::parse("See [the site](https://example.com/x) and [the plan](plan.md).");
+        let opts = Options {
+            width: 200,
+            highlight_code: false,
+            hyperlinks: true,
+            base_dir: Some(std::path::PathBuf::from("/tmp/somewhere")),
+        };
+        let text = to_lines(&doc, &opts).join("\n");
+        let mut targets = osc8_targets(&text);
+        targets.dedup();
+        assert_eq!(targets, vec!["https://example.com/x", "file:///tmp/somewhere/plan.md"]);
+    }
+
+    // Each word of a link's text is its own run after wrapping, so each
+    // gets its own sequence -- all sharing one id, which is what makes a
+    // terminal treat the whole phrase as a single hyperlink.
+    #[test]
+    fn the_pieces_of_one_link_share_an_id() {
+        let doc = crate::markdown::parse("[the site here](https://example.com/x)");
+        let opts = Options { width: 200, highlight_code: false, hyperlinks: true, base_dir: None };
+        let text = to_lines(&doc, &opts).join("\n");
+        assert_eq!(osc8_targets(&text).len(), 3, "one per word");
+        let ids: Vec<&str> = text.match_indices("\x1b]8;id=").map(|(at, _)| &text[at + 8..at + 9]).collect();
+        assert!(ids.windows(2).all(|w| w[0] == w[1]), "all three share one id: {ids:?}");
+    }
+
+    #[test]
+    fn no_hyperlinks_are_emitted_when_they_are_off() {
+        let doc = crate::markdown::parse("[a](https://example.com/x)");
+        let opts = Options { width: 200, highlight_code: false, hyperlinks: false, base_dir: None };
+        assert!(osc8_targets(&to_lines(&doc, &opts).join("\n")).is_empty());
+    }
+
+    // Without a directory to resolve against, a relative destination
+    // gets no link rather than a guessed one -- the absolute one beside
+    // it still does.
+    #[test]
+    fn a_relative_destination_needs_a_base_directory() {
+        let doc = crate::markdown::parse("[a](https://example.com/x) [b](plan.md)");
+        let opts = Options { width: 200, highlight_code: false, hyperlinks: true, base_dir: None };
+        assert_eq!(osc8_targets(&to_lines(&doc, &opts).join("\n")), vec!["https://example.com/x"]);
     }
 }

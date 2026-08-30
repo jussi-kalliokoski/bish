@@ -678,8 +678,17 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
         // re-querying the shell per span. See syntax_color_overrides'
         // own doc comment.
         let color_overrides = syntax_color_overrides(&sessions[&session_id].shell);
+        // Read per redraw for the same reason the colours are: `bishopt
+        // --set hyperlinks off` should take effect on the next keystroke,
+        // not the next shell.
+        let hyperlinks = sessions[&session_id].shell.bishopt_bool("hyperlinks");
         let highlight_ctx =
-            HighlightContext { cwd: Some(cwd_snapshot.as_path()), known_functions: Some(&known_functions), color_overrides: Some(&color_overrides) };
+            HighlightContext {
+                cwd: Some(cwd_snapshot.as_path()),
+                known_functions: Some(&known_functions),
+                color_overrides: Some(&color_overrides),
+                hyperlinks,
+            };
         // Same owned-snapshot pattern as cwd_snapshot/known_functions above
         // -- registered `complete NAME` specs, the contextual shell data
         // (aliases, PATH commands, jobs, ...) evaluating one needs, and a
@@ -7431,19 +7440,24 @@ its decompressed text.
 // than a special case. Rendered on demand rather than once: the width is
 // the terminal's, and a table has to be laid out for the width it will
 // actually occupy.
-fn render_markdown_document(source: &str, term_cols: usize) -> Vec<String> {
+fn render_markdown_document(source: &str, term_cols: usize, links: &LinkOptions) -> Vec<String> {
     let doc = crate::markdown::parse(source);
-    let opts = crate::markdown::render::Options { width: term_cols.saturating_sub(1).max(20), highlight_code: true };
+    let opts = crate::markdown::render::Options {
+        width: term_cols.saturating_sub(1).max(20),
+        highlight_code: true,
+        hyperlinks: links.hyperlinks,
+        base_dir: links.base_dir.clone(),
+    };
     crate::markdown::render::to_lines(&doc, &opts)
 }
 
 // `:preview`'s own dispatch: which languages have something to render,
 // and how. `None` for a language that has no rendered form -- which is
 // what the command reports rather than guessing at one.
-fn preview_document(language: &str, source: &str, term_cols: usize) -> Option<Vec<String>> {
+fn preview_document(language: &str, source: &str, term_cols: usize, links: &LinkOptions) -> Option<Vec<String>> {
     let width = term_cols.saturating_sub(1).max(20);
     match language {
-        "markdown" => Some(render_markdown_document(source, term_cols)),
+        "markdown" => Some(render_markdown_document(source, term_cols, links)),
         "roff" => {
             let doc = crate::roff::parse(source);
             Some(crate::roff::render::to_lines(&doc, &crate::roff::render::Options { width }))
@@ -7468,14 +7482,25 @@ fn preview_document(language: &str, source: &str, term_cols: usize) -> Option<Ve
 // What the pager is showing, so a resize can re-render it at the new
 // width -- which is not optional, since a table's layout and every
 // wrapped line depend on it.
+// Whether a rendered document's links are emitted as real terminal
+// hyperlinks, and what a relative one is relative to. Carried rather
+// than read where it's needed, because neither the pager nor the
+// markdown renderer has a Shell to ask or a buffer to look at.
+#[derive(Debug, Clone, Default)]
+struct LinkOptions {
+    hyperlinks: bool,
+    base_dir: Option<std::path::PathBuf>,
+}
+
 struct PagerSource {
     language: String,
     source: String,
+    links: LinkOptions,
 }
 
 impl PagerSource {
     fn lines(&self, term_cols: usize) -> Vec<String> {
-        preview_document(&self.language, &self.source, term_cols).unwrap_or_default()
+        preview_document(&self.language, &self.source, term_cols, &self.links).unwrap_or_default()
     }
 }
 
@@ -8599,6 +8624,13 @@ fn run_command_mode(
                                 PagerSource {
                                     language: "markdown".to_string(),
                                     source: EDITOR_HELP_MARKDOWN.to_string(),
+                                    // No file behind this one, so a
+                                    // relative target has nothing to
+                                    // resolve against -- which is fine,
+                                    // since the help page's own links
+                                    // are all absolute or none.
+                                    links: LinkOptions { hyperlinks: sessions.get(&session_id).is_none_or(|s| s.shell.bishopt_bool("hyperlinks")),
+                                        base_dir: None },
                                 },
                                 sessions,
                                 windows,
@@ -8621,7 +8653,14 @@ fn run_command_mode(
                         "preview" | "prev" if arg.is_none() => {
                             let language = fileeditor::language_of(tb);
                             let source = fileeditor::buffer_source(tb);
-                            if preview_document(&language, &source, *term_cols).is_none() {
+                            // The buffer's own directory, so a link to a
+                            // sibling document in a README resolves the
+                            // same way it does in the editor itself.
+                            let links = LinkOptions {
+                                hyperlinks: tb.hyperlinks,
+                                base_dir: tb.path().and_then(|p| p.parent()).map(|p| p.to_path_buf()),
+                            };
+                            if preview_document(&language, &source, *term_cols, &links).is_none() {
                                 show_command_mode_error(
                                     &format!("bish: preview: nothing to render for a {language} file (markdown and roff have previews)"),
                                     *term_rows,
@@ -8637,7 +8676,7 @@ fn run_command_mode(
                                 .unwrap_or_else(|| "preview".to_string());
                             run_pager(
                                 &format!("{name}  (q to close)"),
-                                PagerSource { language, source },
+                                PagerSource { language, source, links },
                                 sessions,
                                 windows,
                                 job_frames,

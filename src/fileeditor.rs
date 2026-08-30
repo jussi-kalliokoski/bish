@@ -2346,21 +2346,11 @@ fn buffer_spans(
     (styled, links)
 }
 
-// A link target as something a terminal can actually open. Already a
-// URL, it is used as it is. Otherwise it is a relative path -- a
-// markdown link to a sibling document, most often -- and is resolved
-// against this buffer's own directory into a `file://` URL, which is
-// what makes clicking `[the plan](plan.md)` in a README go somewhere.
-// An unnamed buffer has no directory to resolve against, so a relative
-// target there stays underlined and unclickable rather than guessing.
+// This buffer's own directory is what a relative link target is
+// relative to; an unnamed buffer has none, and `url::absolute` gives no
+// link rather than a guessed one.
 fn absolute_link(buf: &TextBuffer, target: &str) -> Option<String> {
-    if crate::url::parse(target).is_some() {
-        return Some(target.to_string());
-    }
-    let dir = buf.path()?.parent()?.to_path_buf();
-    let joined = dir.join(target);
-    let resolved = std::fs::canonicalize(&joined).unwrap_or(joined);
-    Some(format!("file://{}", resolved.display()))
+    crate::url::absolute(target, buf.path().and_then(|p| p.parent()))
 }
 
 // `:diag`'s own worker (see repl.rs's run_command_mode, the one caller):

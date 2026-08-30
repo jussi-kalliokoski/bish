@@ -54,6 +54,13 @@ pub struct HighlightContext<'a> {
     // churn than it's worth for one more `Option<&T>`. See resolve_style/
     // ColorOverrides/SYN_COL_OPTIONS just above default_style.
     pub color_overrides: Option<&'a ColorOverrides>,
+    // The `hyperlinks` bishopt, carried here for the same reason
+    // `color_overrides` is: never read by the highlighting itself, but
+    // every call site that turns these spans into terminal output
+    // already has `ctx` in scope. `false` by default so a context built
+    // for analysis rather than for a terminal (a test, `bish tool
+    // check`) emits nothing.
+    pub hyperlinks: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -597,17 +604,6 @@ fn osc8_open(url: &str) -> String {
 
 const OSC8_CLOSE: &str = "\x1b]8;;\x1b\\";
 
-// Whether a URL is safe to put inside that sequence. The URL comes from
-// a *file* -- a markdown link's destination, a string in someone's
-// source -- and it is about to be spliced into an escape sequence, so a
-// control character in it would end the sequence early and hand the
-// terminal whatever followed as commands. Anything with one is dropped
-// rather than sanitized: a URL that needs repairing to be safe is a URL
-// nobody should be one click away from.
-fn is_safe_url(url: &str) -> bool {
-    !url.is_empty() && !url.chars().any(|c| c.is_control())
-}
-
 // Indexed(0-15), matching prompt.rs's own existing bold+low-8-ANSI
 // convention, not Rgb -- there's no light/dark-aware theme system yet to
 // make a fixed RGB choice safe.
@@ -733,7 +729,7 @@ pub fn render_linked(cells: &[vt100::Cell], links: &[LinkSpan]) -> String {
     for (i, cell) in cells.iter().enumerate() {
         let url = links
             .iter()
-            .find(|l| i >= l.start && i < l.end && is_safe_url(&l.url))
+            .find(|l| i >= l.start && i < l.end && crate::url::is_safe(&l.url))
             .map(|l| l.url.as_str());
         if url != open {
             if open.is_some() {
@@ -2022,7 +2018,7 @@ mod tests {
     fn is_valid_command_name_recognizes_a_known_function() {
         let mut functions = HashSet::new();
         functions.insert("my_func".to_string());
-        let ctx = HighlightContext { cwd: None, known_functions: Some(&functions), color_overrides: None };
+        let ctx = HighlightContext { cwd: None, known_functions: Some(&functions), color_overrides: None, hyperlinks: false };
         assert!(is_valid_command_name("my_func", &ctx));
         assert!(!is_valid_command_name("other_func", &ctx));
     }
@@ -2111,7 +2107,7 @@ mod tests {
     fn a_call_to_a_known_function_is_not_flagged_invalid() {
         let mut functions = HashSet::new();
         functions.insert("my_func".to_string());
-        let ctx = HighlightContext { cwd: None, known_functions: Some(&functions), color_overrides: None };
+        let ctx = HighlightContext { cwd: None, known_functions: Some(&functions), color_overrides: None, hyperlinks: false };
         let spans = BashHighlighter.highlight("my_func arg", ctx);
         assert!(!spans.iter().any(|s| s.kind == HighlightKind::InvalidCommand), "{spans:?}");
     }
