@@ -2763,22 +2763,69 @@ impl Shell {
     // "--unset turns it off" and "revert to default" are the same
     // operation; for a Str or Color it reverts to whatever default that
     // option was registered with.
+    // One block per option: its name, what it accepts, what it is set to
+    // now, and the line from BISHOPT_HELP. Shared by `bishopt
+    // --describe` and the `:help options` page, so the two can't drift.
+    /// The same, over the real registry -- for a caller outside this
+    /// module, which has no name for `BishOptDefault` and no reason to.
+    pub fn describe_options(&self, which: Option<&str>) -> Vec<String> {
+        self.describe_bishopts(KNOWN_BISHOPTS, which)
+    }
+
+    fn describe_bishopts(&self, registry: &[(&str, BishOptDefault)], which: Option<&str>) -> Vec<String> {
+        let mut out = Vec::new();
+        for (name, default) in registry.iter().filter(|(n, _)| which.is_none_or(|w| *n == w)) {
+            let (accepts, default_text) = match default {
+                BishOptDefault::Bool(d) => ("on | off".to_string(), if *d { "on".to_string() } else { "off".to_string() }),
+                BishOptDefault::Int(d, range) => (format!("{}-{}", range.start(), range.end()), d.to_string()),
+                BishOptDefault::Str(d) => ("text".to_string(), format!("{d:?}")),
+                BishOptDefault::Color(d) => ("a CSS colour".to_string(), (*d).to_string()),
+            };
+            let description = BISHOPT_HELP.iter().find(|(n, _)| n == name).map(|(_, d)| *d).unwrap_or("");
+            // The value as `bishopt NAME` itself would print it, so the
+            // two never disagree about what is set.
+            let current = self.bishopt_display(registry, name);
+            out.push(name.to_string());
+            out.push(format!("    {description}"));
+            out.push(format!("    accepts: {accepts}    default: {default_text}    now: {current}"));
+        }
+        out
+    }
+
+    // What `bishopt NAME` prints, as a string rather than to the sink.
+    fn bishopt_display(&self, registry: &[(&str, BishOptDefault)], name: &str) -> String {
+        match self.bishopt_value(registry, name) {
+            Some(BishOptValue::Bool(on)) => if on { "on" } else { "off" }.to_string(),
+            Some(BishOptValue::Int(n)) => n.to_string(),
+            Some(BishOptValue::Str(s)) => format!("{s:?}"),
+            Some(BishOptValue::Color(text, _)) => text,
+            None => String::new(),
+        }
+    }
+
     fn run_bishopt(&mut self, args: &[String], registry: &[(&str, BishOptDefault)]) -> i32 {
         enum Mode<'a> {
             List,
             Get(&'a str, bool), // bool: quiet
+            // `--describe [NAME]`: what an option is for, what it
+            // accepts, and what it is set to. Everything `bishopt` could
+            // already tell you was the *value*; this is the half that
+            // makes an option findable rather than merely settable.
+            Describe(Option<&'a str>),
             Set(&'a str, Option<&'a str>),
             Unset(&'a str),
         }
         let mode = match args {
             [] => Mode::List,
+            [flag] if flag == "--describe" || flag == "-d" => Mode::Describe(None),
+            [flag, name] if flag == "--describe" || flag == "-d" => Mode::Describe(Some(name.as_str())),
             [flag, name] if flag == "--set" || flag == "-s" => Mode::Set(name, None),
             [flag, name, value] if flag == "--set" || flag == "-s" => Mode::Set(name, Some(value)),
             [flag, name] if flag == "--unset" || flag == "-u" => Mode::Unset(name),
             [flag, name] if flag == "--quiet" || flag == "-q" => Mode::Get(name, true),
             [name] => Mode::Get(name, false),
             _ => {
-                sh_eprintln!(self, "bish: bishopt: usage: bishopt [--quiet|-q NAME | --set|-s NAME [VALUE] | --unset|-u NAME | NAME]");
+                sh_eprintln!(self, "bish: bishopt: usage: bishopt [--quiet|-q NAME | --set|-s NAME [VALUE] | --unset|-u NAME | --describe|-d [NAME] | NAME]");
                 return 2;
             }
         };
@@ -2786,6 +2833,18 @@ impl Shell {
             Mode::List => {
                 for (name, _) in registry {
                     sh_println!(self, "{name}");
+                }
+                0
+            }
+            Mode::Describe(which) => {
+                if let Some(name) = which
+                    && !registry.iter().any(|(n, _)| *n == name)
+                {
+                    sh_eprintln!(self, "bish: bishopt: unknown option '{name}'");
+                    return 1;
+                }
+                for line in self.describe_bishopts(registry, which) {
+                    sh_println!(self, "{line}");
                 }
                 0
             }
@@ -10806,6 +10865,68 @@ pub fn bishopt_values(name: &str) -> &'static [&'static str] {
     }
 }
 
+// One line about each bishopt, for `bishopt --describe` and the
+// `:help options` page.
+//
+// A parallel table rather than a third field on KNOWN_BISHOPTS: adding
+// one would touch every consumer of that tuple for a string only two
+// call sites read. The obvious risk of a parallel table is drift -- an
+// option nobody wrote a line for -- and that is what
+// `every_bishopt_is_described` removes, by failing the moment the two
+// lists disagree.
+//
+// One sentence each, saying what the option *does* rather than
+// restating its name. The type, default and legal range come from
+// KNOWN_BISHOPTS and are printed alongside, so none of that is repeated
+// here.
+const BISHOPT_HELP: &[(&str, &str)] = &[
+    ("theme", "The active `::bish theme` declaration, if any."),
+    ("syn_col_keyword", "Syntax colour: shell keywords, booleans, and a markup heading."),
+    ("syn_col_operator", "Syntax colour: operators, punctuation and separators."),
+    ("syn_col_redirect", "Syntax colour: redirection operators."),
+    ("syn_col_string", "Syntax colour: quoted strings."),
+    ("syn_col_variable", "Syntax colour: variable references, including a `.env` interpolation."),
+    ("syn_col_substitution", "Syntax colour: command and process substitutions."),
+    ("syn_col_comment", "Syntax colour: comments."),
+    ("syn_col_number", "Syntax colour: numbers, and a date-time in TOML."),
+    ("syn_col_format_specifier", "Syntax colour: escapes and printf specifiers inside a string."),
+    ("syn_col_invalid_command", "Syntax colour: a command name that resolves to nothing."),
+    ("syn_col_key", "Syntax colour: a field name -- a JSON, TOML, INI or `.env` key."),
+    ("ui_col_directory", "Interface colour: directories in the file browser."),
+    ("ui_col_symlink", "Interface colour: symlinks in the file browser."),
+    ("ui_col_archive", "Interface colour: archives in the file browser."),
+    ("ui_col_executable", "Interface colour: executables in the file browser."),
+    ("ui_col_heading", "Interface colour: headings in rendered markdown."),
+    ("ui_col_code", "Interface colour: code spans and blocks in rendered markdown."),
+    ("ui_col_link", "Interface colour: links in rendered markdown."),
+    ("ui_col_quote", "Interface colour: the bar beside a rendered block quote."),
+    ("ui_col_error", "Interface colour: errors, in the gutter and under the text."),
+    ("ui_col_warning", "Interface colour: warnings, in the gutter and under the text."),
+    ("wrap", "Break a line too long for the pane across rows instead of scrolling sideways."),
+    ("linebreak", "While wrapping, break at word boundaries rather than mid-word."),
+    ("breakindent", "While wrapping, indent continued rows under the line they belong to."),
+    ("showbreak", "What a continued row opens with. Empty for nothing."),
+    ("wrap_column", "Wrap at this column rather than at the pane's edge. 0 means the pane."),
+    ("scrolloff", "Keep this many lines visible above and below the cursor."),
+    ("sidescrolloff", "Keep this many columns visible either side of the cursor, while not wrapping."),
+    ("extends", "Shown in the last column when a line continues off the right edge."),
+    ("precedes", "Shown in the first column when a line continues off the left edge."),
+    ("tabular", "Which languages draw their columns lined up. A language glob, as `abbr --lang` uses."),
+    ("gitignore", "Honour `.gitignore`: the browser and completion leave ignored files out."),
+    ("hyperlinks", "Emit OSC 8 terminal hyperlinks for URLs, links and resolved paths."),
+    ("divider_budget", "How much of a split its pane dividers may take, as a percentage, before panes fold away."),
+    ("relativenumber", "Number lines by their distance from the cursor's."),
+    ("editorconfig", "Let a project's `.editorconfig` override the settings below it."),
+    ("mouse", "Ask the terminal to report mouse events. Off gives the terminal's own selection back."),
+    ("cursorshape", "Change the terminal's cursor shape to show the editor's mode."),
+    ("expandtab", "Indent with spaces rather than a literal tab."),
+    ("shiftwidth", "How many columns one indent is."),
+    ("tabstop", "How many columns a literal tab draws as."),
+    ("fixendofline", "Give a file a final newline on save if it hasn't got one."),
+    ("trim_trailing_whitespace", "Strip whitespace from the end of every line on save."),
+    ("fileformat", "Line endings to write: `unix`, `dos`, `mac`. Empty keeps whatever the file had."),
+];
+
 // Best-effort terminal color-capability detection via the same
 // environment variables most terminal-aware CLI tools already check --
 // no terminfo database dependency. COLORTERM=truecolor/24bit is the de
@@ -12782,5 +12903,44 @@ mod tests {
         let buf = capture_output(&mut shell);
         shell.run_source_here("echo hi", "<test>");
         assert_eq!(buf.borrow().as_str(), "hi\n");
+    }
+
+    // The one thing a parallel table can get wrong: an option nobody
+    // wrote a line for, or a line for an option that no longer exists.
+    #[test]
+    fn every_bishopt_is_described() {
+        let mut options: Vec<&str> = KNOWN_BISHOPTS.iter().map(|(n, _)| *n).collect();
+        let mut described: Vec<&str> = BISHOPT_HELP.iter().map(|(n, _)| *n).collect();
+        options.sort_unstable();
+        described.sort_unstable();
+        assert_eq!(options, described, "KNOWN_BISHOPTS and BISHOPT_HELP disagree");
+        assert!(BISHOPT_HELP.iter().all(|(_, d)| !d.is_empty()), "an empty description is not a description");
+    }
+
+    #[test]
+    fn describe_reports_what_an_option_accepts_and_what_it_is_set_to() {
+        let mut shell = Shell::new();
+        let lines = shell.describe_bishopts(KNOWN_BISHOPTS, Some("shiftwidth")).join("\n");
+        assert!(lines.contains("shiftwidth"), "{lines}");
+        assert!(lines.contains("How many columns one indent is"), "{lines}");
+        assert!(lines.contains("accepts: 1-64"), "{lines}");
+        assert!(lines.contains("default: 4"), "{lines}");
+        assert!(lines.contains("now: 4"), "{lines}");
+        // ...and it follows the live value.
+        assert_eq!(shell.run_bishopt(&strs(&["--set", "shiftwidth", "2"]), KNOWN_BISHOPTS), 0);
+        assert!(shell.describe_bishopts(KNOWN_BISHOPTS, Some("shiftwidth")).join("\n").contains("now: 2"));
+    }
+
+    #[test]
+    fn describing_everything_covers_every_option() {
+        let shell = Shell::new();
+        let all = shell.describe_bishopts(KNOWN_BISHOPTS, None);
+        assert_eq!(all.len(), KNOWN_BISHOPTS.len() * 3, "three lines each");
+    }
+
+    #[test]
+    fn describing_an_option_that_does_not_exist_fails() {
+        let mut shell = Shell::new();
+        assert_eq!(shell.run_bishopt(&strs(&["--describe", "nonsense"]), KNOWN_BISHOPTS), 1);
     }
 }

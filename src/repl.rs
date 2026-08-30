@@ -7919,8 +7919,28 @@ its decompressed text.
 | `:dbg` | attach a read-only debug session (`:dbg help`) |
 | `:preview` | render this markdown buffer |
 | `:!CMD` | run a shell command; a space before the `!` keeps it out of history |
-| `:help` | this screen |
+| `:help` | this screen (`:help options` lists every setting) |
 "#;
+
+// `:help options`, as markdown: every bishopt with what it accepts, its
+// default and its current value.
+//
+// Generated from the registry rather than written out, so an option
+// added tomorrow is documented today -- the same reason `bishopt`'s own
+// completion reads the registry instead of a copy. `Shell::describe_
+// bishopts` does the formatting, so this page and `bishopt --describe`
+// can never disagree about what an option is for.
+fn options_help(shell: &exec::Shell) -> String {
+    let mut out = String::from("# bish options\n\nSet with `bishopt --set NAME VALUE`, read with `bishopt NAME`, cleared with `bishopt --unset NAME`.\nEverything here also works from the editor's own `:` line.\n\n");
+    let described = shell.describe_options(None);
+    // describe_bishopts emits three lines per option: the name, the
+    // description, then what it accepts.
+    for block in described.chunks(3) {
+        let [name, description, accepts] = block else { continue };
+        out.push_str(&format!("## `{}`\n\n{}\n\n`{}`\n\n", name.trim(), description.trim(), accepts.trim()));
+    }
+    out
+}
 
 // Shared by `:help` and `:preview` -- the same pipeline either way,
 // which is what makes the help page a real markdown document rather
@@ -9114,12 +9134,22 @@ fn run_command_mode(
                         // free truncation-with-a-count-notice for a
                         // shorter terminal, and the real content behind
                         // it stays visible per the screen-wipe fix above.
-                        "help" | "h" | "?" if arg.is_none() => {
+                        // `:help` and `:help options` -- the second
+                        // generated from the option registry itself
+                        // rather than written out, so a new bishopt is
+                        // documented by existing.
+                        "help" | "h" | "?" if arg.is_none() || arg == Some("options") => {
+                            let options = arg == Some("options");
+                            let title = if options { "bish options  (q to close)" } else { "bish help  (q to close)" };
+                            let source = match options {
+                                true => sessions.get(&session_id).map(|s| options_help(&s.shell)).unwrap_or_default(),
+                                false => EDITOR_HELP_MARKDOWN.to_string(),
+                            };
                             run_pager(
-                                "bish help  (q to close)",
+                                title,
                                 PagerSource {
                                     language: "markdown".to_string(),
-                                    source: EDITOR_HELP_MARKDOWN.to_string(),
+                                    source,
                                     // No file behind this one, so a
                                     // relative target has nothing to
                                     // resolve against -- which is fine,
