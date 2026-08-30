@@ -1219,6 +1219,12 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
                                     push_dir_history(session, session.shell.cwd.clone());
                                 }
                                 let moved_to = (session.shell.cwd != cwd_before).then(|| session.shell.cwd.to_string_lossy().into_owned());
+                                // Before `cwd:change`: this one is about
+                                // the command that just ended, and a
+                                // directory change is a consequence of
+                                // it.
+                                run_shell_hooks(&mut sessions, session_id, "shell:exec:post", &submitted);
+                                let session = sessions.get_mut(&session_id).unwrap();
                                 session.buffer.clear();
                                 // After the command, and after the
                                 // session's own state is synced back:
@@ -7609,6 +7615,11 @@ fn run_hooks_for(sessions: &mut HashMap<SessionId, SessionState>, session_id: Se
     // Anything these do can't fire more hooks -- a `shell:cwd:change`
     // hook that `cd`s would otherwise keep triggering itself.
     session.shell.set_firing_hooks(true);
+    // A hook is not a command the user ran, so it must not become the
+    // answer to their next `$?`. Kept across the whole run rather than
+    // per hook, so `$?` means the same thing to each of several hooks
+    // on one event.
+    let status = session.shell.last_status();
     let captured = Rc::new(RefCell::new(String::new()));
     // Borrowed and given back, rather than set and assumed: an
     // unpromoted session writes to the real terminal, and "restoring" it
@@ -7631,6 +7642,7 @@ fn run_hooks_for(sessions: &mut HashMap<SessionId, SessionState>, session_id: Se
         }
     }
     session.shell.set_firing_hooks(false);
+    session.shell.set_last_status(status);
     session.shell.return_sink(saved);
 }
 

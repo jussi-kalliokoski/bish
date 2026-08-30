@@ -521,6 +521,7 @@ pub const HOOK_EVENTS: &[&str] = &[
     "editor:file:write:post",
     "editor:file:close",
     "shell:exec:pre",
+    "shell:exec:post",
     "shell:cwd:change",
 ];
 
@@ -553,6 +554,7 @@ pub const HOOK_EVENT_HELP: &[(&str, &str)] = &[
     ("editor:file:write:post", "A file has been written to disk. Argument: the path."),
     ("editor:file:close", "A file is about to be closed, while its buffer still exists. Argument: the path."),
     ("shell:exec:pre", "A command line is about to run at the prompt. Argument: the command line."),
+    ("shell:exec:post", "A command line has finished. Argument: the command line; `$?` is its exit status."),
     ("shell:cwd:change", "The working directory has changed, however it happened. Argument: the new directory."),
 ];
 
@@ -1264,6 +1266,24 @@ impl Shell {
 
     pub(crate) fn return_sink(&mut self, saved: SavedSink) {
         self.sink = saved.0;
+    }
+
+    /// The exit status of the last command, for a caller that is about
+    /// to run something the user didn't type and must put it back.
+    ///
+    /// Running a hook goes through `run_program`, which sets
+    /// `last_status` like anything else -- so without this a hook
+    /// becomes the answer to the user's next `$?`, and a
+    /// `shell:cwd:change` hook could turn a successful command into a
+    /// failed one from the prompt's point of view. Restoring it also
+    /// makes `$?` *inside* a `shell:exec:post` hook mean the command's
+    /// own status, which is the thing such a hook exists to look at.
+    pub fn last_status(&self) -> i32 {
+        self.last_status
+    }
+
+    pub fn set_last_status(&mut self, status: i32) {
+        self.last_status = status;
     }
 
     // debugger.rs's own "hand the real terminal to the script" moment
@@ -13279,10 +13299,24 @@ mod tests {
         assert_eq!(with_prefix("editor:file:write"), 2, "pre and post are one event's two moments");
         assert_eq!(with_prefix("editor:file"), 4);
         assert_eq!(with_prefix("editor:"), 4);
-        assert_eq!(with_prefix("shell:"), 2);
+        assert_eq!(with_prefix("shell:exec"), 2, "and now shell:exec really does name two");
+        assert_eq!(with_prefix("shell:"), 3);
         // ...which is exactly what a `prewrite`/`postwrite` spelling
         // would have cost: nothing would share a `write` prefix.
         assert!(HOOK_EVENTS.iter().all(|e| !e.contains("prewrite") && !e.contains("postwrite")));
+    }
+
+    // A hook is not a command the user ran, so it must not become the
+    // answer to their next `$?`.
+    #[test]
+    fn last_status_can_be_put_back_after_a_hook_runs() {
+        let mut shell = Shell::new();
+        shell.set_last_status(3);
+        let saved = shell.last_status();
+        // What running a hook does to it.
+        shell.set_last_status(0);
+        shell.set_last_status(saved);
+        assert_eq!(shell.last_status(), 3);
     }
 
     #[test]
