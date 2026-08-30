@@ -10567,6 +10567,13 @@ const KNOWN_BISHOPTS: &[(&str, BishOptDefault)] = &[
     // there is nothing to detect and nothing to degrade. Off is for
     // wanting the text and only the text.
     ("hyperlinks", BishOptDefault::Bool(true)),
+    // How much of a split's own space its pane dividers may take before
+    // the panes furthest from the focus fold away behind a single
+    // divider that stands for all of them (see repl.rs's
+    // collapsed_runs). A percentage; 100 turns folding off entirely and
+    // lets the dividers have the whole split if that is what the pane
+    // count comes to.
+    ("divider_budget", BishOptDefault::Int(25, 0..=100)),
 ];
 
 // Every bishopt option name, in registry order -- the source of truth

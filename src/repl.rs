@@ -235,7 +235,20 @@ struct WindowEntry {
     panes: Vec<Pane>,
     focused_pane: PaneId,
     next_pane_id: PaneId,
+    // The `divider_budget` bishopt, kept here rather than read where it
+    // is used: it is a *layout* parameter, and the geometry helpers that
+    // need it (`pane_rect` above all) are pure functions of a window,
+    // called from far more places than have a Shell to ask. Refreshed
+    // from the owning session on every compositor redraw, so a change
+    // lands on the next frame -- one frame's staleness for a setting
+    // nobody changes mid-keystroke.
+    divider_budget: usize,
 }
+
+// What `divider_budget` is when nothing has said otherwise -- the same
+// number KNOWN_BISHOPTS defaults it to, and what a window built outside
+// a session (a test) uses.
+const DEFAULT_DIVIDER_BUDGET: usize = 25;
 
 impl WindowEntry {
     fn single(id: u32, initial_frame: Frame) -> WindowEntry {
@@ -245,6 +258,7 @@ impl WindowEntry {
             panes: vec![Pane { id: 0, stack: vec![initial_frame] }],
             focused_pane: 0,
             next_pane_id: 1,
+            divider_budget: DEFAULT_DIVIDER_BUDGET,
         }
     }
 
@@ -3666,6 +3680,15 @@ fn close_orphaned_sessions(sessions: &mut HashMap<SessionId, SessionState>, wind
 // requirement, and this keeps both redraw paths sharing one
 // implementation (render_compositor_frame) rather than risking them
 // drifting apart.
+// Picks up a changed `divider_budget` for this window before its layout
+// is resolved. Cheap, and the one place every visible change already
+// passes through.
+fn refresh_divider_budget(sessions: &HashMap<SessionId, SessionState>, window: &mut WindowEntry) {
+    if let Some(session) = sessions.get(&window.owning_session()) {
+        window.divider_budget = session.shell.bishopt_int("divider_budget").max(0) as usize;
+    }
+}
+
 fn compositor_redraw(sessions: &HashMap<SessionId, SessionState>, windows: &[WindowEntry], current_window: usize, term_rows: usize, term_cols: usize) {
     let tab_bar = tab_bar_line(sessions, windows, current_window);
     let layout = snapshot_window(&windows[current_window], sessions, term_rows, term_cols);
@@ -4088,6 +4111,16 @@ fn service_background_jobs(
 ) -> bool {
     use std::io::Read;
 
+    // Every blocking loop in this file calls this as its idle callback,
+    // which makes it the one place a setting change reliably passes
+    // through however it was made -- the colon line, the shell prompt,
+    // a sourced file. `divider_budget` is a layout parameter kept on
+    // the window itself (see WindowEntry), so this is where it catches
+    // up.
+    for window in windows.iter_mut() {
+        refresh_divider_budget(sessions, window);
+    }
+
     // A plain no-op unless this process is running as a `bish session`
     // daemon (session::install_bridge was called) -- see session.rs's
     // own module doc comment for why this one call, here, is the whole
@@ -4270,6 +4303,58 @@ const MIN_PANE_WEIGHT: f64 = 0.05;
 // just be a redundant blank line. Shared by split_sizes (to know how
 // much of the axis dividers actually consume) and compute_regions (to
 // know where to actually draw one).
+// Which children of a split are folded away behind a single "flipper"
+// divider, as half-open index ranges.
+//
+// Every divider costs a row (or a column), and past a certain number of
+// panes the dividers are most of what a split contains. So once they
+// take more than `divider_budget` of the space (see that bishopt), the
+// panes that are furthest from what you are actually looking at fold
+// into one divider that stands for all of them, and unfold again as the
+// focus moves back towards them.
+//
+// What stays is: the first child, the last child, the focused one, and
+// the one either side of it. Keeping the ends is what makes the split
+// still readable as a whole; keeping the neighbours is what makes moving
+// the focus feel continuous rather than teleporting.
+//
+// **A run of exactly one child is never folded**, which is the rule that
+// makes this behave sensibly rather than mechanically: a folded run and
+// an ordinary divider both cost exactly one line, so folding a single
+// child away buys nothing and costs you a pane. With eight panes `a`..`h`
+// that produces, as the focus moves:
+//
+//     a [b] c ... h        focus b -- d,e,f,g fold
+//     a b [c] d ... h      focus c -- e,f,g fold
+//     a b c [d] e ... h    focus d -- b alone stays, f,g fold
+//     a ... d [e] f g h    focus e -- b,c fold, g alone stays
+fn collapsed_runs(n: usize, focused: usize) -> Vec<std::ops::Range<usize>> {
+    if n == 0 {
+        return Vec::new();
+    }
+    let focused = focused.min(n - 1);
+    let mut anchors = vec![0, n - 1, focused];
+    if focused > 0 {
+        anchors.push(focused - 1);
+    }
+    if focused + 1 < n {
+        anchors.push(focused + 1);
+    }
+    anchors.sort_unstable();
+    anchors.dedup();
+    anchors
+        .windows(2)
+        .map(|pair| pair[0] + 1..pair[1])
+        .filter(|run| run.len() >= 2)
+        .collect()
+}
+
+// Whether the dividers a split needs take more of it than they are
+// allowed to. `budget` is a percentage; 100 means never fold.
+fn dividers_overflow(divider_count: usize, axis: usize, budget: usize) -> bool {
+    budget < 100 && axis > 0 && divider_count * 100 > axis * budget
+}
+
 fn dividers_after(children: &[SplitChild]) -> Vec<bool> {
     (0..children.len().saturating_sub(1)).map(|i| !(children[i].minimized || children[i + 1].minimized)).collect()
 }
@@ -4337,8 +4422,27 @@ fn split_sizes(children: &[SplitChild], usable: usize) -> Vec<usize> {
 // Split trying to draw into space a child might otherwise want --
 // skipped entirely between a minimized child and its neighbor (see
 // dividers_after).
-fn compute_regions(layout: &PaneLayout, area: Rect, out: &mut Vec<(PaneId, Rect)>, dividers: &mut Vec<Divider>) {
-    compute_regions_at(layout, area, out, dividers, &mut Vec::new());
+fn compute_regions(layout: &PaneLayout, area: Rect, focused: PaneId, budget: usize, out: &mut Vec<(PaneId, Rect)>, dividers: &mut Vec<Divider>) {
+    compute_regions_at(layout, area, focused, budget, out, dividers, &mut Vec::new());
+}
+
+// Which child of this split holds `pane`, if any.
+fn child_holding(children: &[SplitChild], pane: PaneId) -> Option<usize> {
+    children.iter().position(|c| layout_holds(&c.layout, pane))
+}
+
+fn layout_holds(layout: &PaneLayout, pane: PaneId) -> bool {
+    match layout {
+        PaneLayout::Leaf(id) => *id == pane,
+        PaneLayout::Split { children, .. } => children.iter().any(|c| layout_holds(&c.layout, pane)),
+    }
+}
+
+fn leaves_of(layout: &PaneLayout, out: &mut Vec<PaneId>) {
+    match layout {
+        PaneLayout::Leaf(id) => out.push(*id),
+        PaneLayout::Split { children, .. } => children.iter().for_each(|c| leaves_of(&c.layout, out)),
+    }
 }
 
 // compute_regions' own recursion, carrying the path from the layout root
@@ -4350,7 +4454,15 @@ fn compute_regions(layout: &PaneLayout, area: Rect, out: &mut Vec<(PaneId, Rect)
 // arbitrarily deep. `split_axis` is the axis length that child's own size
 // is a share of, so a drag can turn a screen position straight into a
 // fraction without re-deriving the layout.
-fn compute_regions_at(layout: &PaneLayout, area: Rect, out: &mut Vec<(PaneId, Rect)>, dividers: &mut Vec<Divider>, path: &mut Vec<usize>) {
+fn compute_regions_at(
+    layout: &PaneLayout,
+    area: Rect,
+    focused: PaneId,
+    budget: usize,
+    out: &mut Vec<(PaneId, Rect)>,
+    dividers: &mut Vec<Divider>,
+    path: &mut Vec<usize>,
+) {
     match layout {
         PaneLayout::Leaf(id) => out.push((*id, area)),
         PaneLayout::Split { horizontal, children } => {
@@ -4359,20 +4471,55 @@ fn compute_regions_at(layout: &PaneLayout, area: Rect, out: &mut Vec<(PaneId, Re
                 return;
             }
             let draws_divider = dividers_after(children);
-            let divider_count = draws_divider.iter().filter(|d| **d).count();
+            let axis = if *horizontal { area.rows } else { area.cols };
+            // Folded when the dividers would otherwise take more of this
+            // split than they are allowed to. The runs are measured from
+            // whichever child holds the focus -- an unfocused split
+            // (the focus is in some other branch entirely) folds around
+            // its first child, which is as good an anchor as any when
+            // nothing here is being looked at.
+            let folded = if dividers_overflow(draws_divider.iter().filter(|d| **d).count(), axis, budget) {
+                collapsed_runs(n, child_holding(children, focused).unwrap_or(0))
+            } else {
+                Vec::new()
+            };
+            let hidden = |i: usize| folded.iter().any(|r| r.contains(&i));
+            // A folded run costs exactly one line, and the ordinary
+            // divider that would have followed the run's last child is
+            // the line it costs -- so it is drawn instead of, not as
+            // well as, that one.
+            let divider_count =
+                (0..n.saturating_sub(1)).filter(|i| draws_divider[*i] && !hidden(*i)).count() + folded.len();
+            // Only the children that are actually drawn are sized:
+            // handing `split_sizes` a zero-weight child would still
+            // spend whatever minimum it guarantees on something with no
+            // room on screen. `sizes` is indexed by *visible* position,
+            // which `visible_index` maps back from a child index.
+            let visible: Vec<SplitChild> = children
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| !hidden(*i))
+                .map(|(_, c)| SplitChild { layout: PaneLayout::Leaf(0), weight: c.weight, fixed: c.fixed, minimized: c.minimized })
+                .collect();
+            let visible_index = |upto: usize| (0..upto).filter(|i| !hidden(*i)).count();
             if *horizontal {
                 // Panes stacked top/bottom; the divider is the horizontal
                 // line between them.
                 let usable = area.rows.saturating_sub(divider_count);
-                let sizes = split_sizes(children, usable);
+                let sizes = split_sizes(&visible, usable);
                 let mut row = area.row;
                 for (i, child) in children.iter().enumerate() {
-                    let h = sizes[i];
+                    // A folded child gets no space, and its panes are
+                    // still reported -- at the fold's own row, with no
+                    // height -- so that focusing one still works and
+                    // brings it straight back (see focus_pane_direction).
+                    let h = if hidden(i) { 0 } else { sizes[visible_index(i)] };
                     path.push(i);
-                    compute_regions_at(&child.layout, Rect { row, col: area.col, rows: h, cols: area.cols }, out, dividers, path);
+                    compute_regions_at(&child.layout, Rect { row, col: area.col, rows: h, cols: area.cols }, focused, budget, out, dividers, path);
                     path.pop();
                     row += h;
-                    if i + 1 < n && draws_divider[i] {
+                    let ends_fold = folded.iter().find(|r| r.end == i + 1);
+                    if let Some(run) = ends_fold {
                         dividers.push(Divider {
                             rect: Rect { row, col: area.col, rows: 1, cols: area.cols },
                             horizontal: true,
@@ -4380,6 +4527,18 @@ fn compute_regions_at(layout: &PaneLayout, area: Rect, out: &mut Vec<(PaneId, Re
                             child: i,
                             split_start: area.row,
                             split_axis: usable,
+                            folded: Some(run.len()),
+                        });
+                        row += 1;
+                    } else if i + 1 < n && draws_divider[i] && !hidden(i) {
+                        dividers.push(Divider {
+                            rect: Rect { row, col: area.col, rows: 1, cols: area.cols },
+                            horizontal: true,
+                            path: path.clone(),
+                            child: i,
+                            split_start: area.row,
+                            split_axis: usable,
+                            folded: None,
                         });
                         row += 1;
                     }
@@ -4388,15 +4547,16 @@ fn compute_regions_at(layout: &PaneLayout, area: Rect, out: &mut Vec<(PaneId, Re
                 // Panes side by side; the divider is the vertical line
                 // between them.
                 let usable = area.cols.saturating_sub(divider_count);
-                let sizes = split_sizes(children, usable);
+                let sizes = split_sizes(&visible, usable);
                 let mut col = area.col;
                 for (i, child) in children.iter().enumerate() {
-                    let w = sizes[i];
+                    let w = if hidden(i) { 0 } else { sizes[visible_index(i)] };
                     path.push(i);
-                    compute_regions_at(&child.layout, Rect { row: area.row, col, rows: area.rows, cols: w }, out, dividers, path);
+                    compute_regions_at(&child.layout, Rect { row: area.row, col, rows: area.rows, cols: w }, focused, budget, out, dividers, path);
                     path.pop();
                     col += w;
-                    if i + 1 < n && draws_divider[i] {
+                    let ends_fold = folded.iter().find(|r| r.end == i + 1);
+                    if let Some(run) = ends_fold {
                         dividers.push(Divider {
                             rect: Rect { row: area.row, col, rows: area.rows, cols: 1 },
                             horizontal: false,
@@ -4404,6 +4564,18 @@ fn compute_regions_at(layout: &PaneLayout, area: Rect, out: &mut Vec<(PaneId, Re
                             child: i,
                             split_start: area.col,
                             split_axis: usable,
+                            folded: Some(run.len()),
+                        });
+                        col += 1;
+                    } else if i + 1 < n && draws_divider[i] && !hidden(i) {
+                        dividers.push(Divider {
+                            rect: Rect { row: area.row, col, rows: area.rows, cols: 1 },
+                            horizontal: false,
+                            path: path.clone(),
+                            child: i,
+                            split_start: area.col,
+                            split_axis: usable,
+                            folded: None,
                         });
                         col += 1;
                     }
@@ -4426,6 +4598,31 @@ struct Divider {
     // minus the strips the dividers themselves occupy).
     split_start: usize,
     split_axis: usize,
+    // How many panes this divider stands in for, when it is a folded
+    // run rather than an ordinary line between two neighbours (see
+    // collapsed_runs). `None` for every ordinary divider; a folded one
+    // draws a count into itself and is not draggable, since there is no
+    // single boundary for a drag to move.
+    folded: Option<usize>,
+}
+
+// The first pane hidden behind a folded divider -- what clicking one
+// focuses. `Divider::child` is the index of the run's last child, so the
+// run's own panes are the ones this walks back over.
+fn folded_divider_pane(window: &WindowEntry, divider: &Divider) -> Option<PaneId> {
+    let folded = divider.folded?;
+    let mut layout = &window.layout;
+    for step in &divider.path {
+        match layout {
+            PaneLayout::Split { children, .. } => layout = &children.get(*step)?.layout,
+            PaneLayout::Leaf(_) => return None,
+        }
+    }
+    let PaneLayout::Split { children, .. } = layout else { return None };
+    let first = (divider.child + 1).checked_sub(folded)?;
+    let mut leaves = Vec::new();
+    leaves_of(&children.get(first)?.layout, &mut leaves);
+    leaves.first().copied()
 }
 
 // (col_origin, width): the real terminal column the given window's
@@ -4484,7 +4681,7 @@ fn pane_rect(window: &WindowEntry, pane_id: PaneId, term_rows: usize, term_cols:
     let area = Rect { row: 0, col: 0, rows: content_rows(term_rows), cols: term_cols };
     let mut regions = Vec::new();
     let mut dividers = Vec::new();
-    compute_regions(&window.layout, area, &mut regions, &mut dividers);
+    compute_regions(&window.layout, area, window.focused_pane, window.divider_budget, &mut regions, &mut dividers);
     regions.into_iter().find(|(id, _)| *id == pane_id).map(|(_, r)| r).expect("pane id always present in its own window's layout")
 }
 
@@ -4662,7 +4859,7 @@ fn snapshot_window(window: &WindowEntry, sessions: &HashMap<SessionId, SessionSt
     let area = Rect { row: 0, col: 0, rows: content_rows(term_rows), cols: term_cols };
     let mut regions = Vec::new();
     let mut dividers = Vec::new();
-    compute_regions(&window.layout, area, &mut regions, &mut dividers);
+    compute_regions(&window.layout, area, window.focused_pane, window.divider_budget, &mut regions, &mut dividers);
 
     let panes = regions
         .into_iter()
@@ -4670,7 +4867,11 @@ fn snapshot_window(window: &WindowEntry, sessions: &HashMap<SessionId, SessionSt
             let sid = window.pane(pane_id).owning_session();
             let screen = sessions[&sid].screen.clone();
             let (srows, scols) = screen.borrow().size();
-            if (srows, scols) != (rect.rows, rect.cols) {
+            // A folded pane has no room on screen (see collapsed_runs)
+            // and must keep whatever it had: resizing it to nothing
+            // would throw its content away, and folding is presentation,
+            // not a decision about the session's contents.
+            if rect.rows > 0 && rect.cols > 0 && (srows, scols) != (rect.rows, rect.cols) {
                 screen.borrow_mut().resize(rect.rows, rect.cols);
             }
             PaneSnapshot { rect, screen, focused: pane_id == window.focused_pane }
@@ -4723,7 +4924,7 @@ fn build_compositor_frame_output(layout: &CompositorLayout, tab_bar: &str, term_
     }
 
     for divider in &layout.dividers {
-        draw_divider(&mut out, divider.rect, divider.horizontal);
+        draw_divider(&mut out, divider.rect, divider.horizontal, divider.folded);
     }
 
     // Tab bar pinned to the terminal's real last row.
@@ -4929,16 +5130,34 @@ fn diff_frames(prev: &TerminalFrame, new: &TerminalFrame, term_rows: usize, term
 // accepted cosmetic gap for this first pane-support pass rather than
 // tracking junction geometry across independently-drawn divider
 // segments.
-fn draw_divider(out: &mut String, rect: Rect, horizontal: bool) {
+fn draw_divider(out: &mut String, rect: Rect, horizontal: bool, folded: Option<usize>) {
     if horizontal {
         out.push_str(&format!("\x1b[{};{}H", rect.row + 1, rect.col + 1));
-        out.push_str(&"─".repeat(rect.cols));
+        match folded {
+            // The same "pill set into an otherwise ordinary divider
+            // line" shape render_diagnostics_title already uses, so a
+            // folded run reads as a divider that has something to say
+            // rather than as a new kind of chrome.
+            Some(n) => out.push_str(&folded_divider_line(rect.cols, n)),
+            None => out.push_str(&"─".repeat(rect.cols)),
+        }
     } else {
         for r in 0..rect.rows {
             out.push_str(&format!("\x1b[{};{}H", rect.row + r + 1, rect.col + 1));
             out.push('│');
         }
     }
+}
+
+// `───  4 panes  ─────` -- what a folded run draws instead of a plain
+// line. A vertical divider is one column wide and has nowhere to put
+// this, so it stays a plain line and the count simply isn't shown.
+fn folded_divider_line(cols: usize, panes: usize) -> String {
+    let pill: String = format!(" \u{22EF} {panes} pane{} ", if panes == 1 { "" } else { "s" }).chars().take(cols).collect();
+    let pill_len = pill.chars().count();
+    let left = 2.min(cols.saturating_sub(pill_len));
+    let right = cols.saturating_sub(pill_len + left);
+    format!("{}\x1b[7m{pill}\x1b[0m{}", "─".repeat(left), "─".repeat(right))
 }
 
 // vim/tmux Ctrl-w-hjkl-style spatial pane focus: moves to the nearest
@@ -4961,7 +5180,7 @@ fn focus_pane_direction(window: &mut WindowEntry, sessions: &mut HashMap<Session
     let area = Rect { row: 0, col: 0, rows: content_rows(term_rows), cols: term_cols };
     let mut regions = Vec::new();
     let mut dividers = Vec::new();
-    compute_regions(&window.layout, area, &mut regions, &mut dividers);
+    compute_regions(&window.layout, area, window.focused_pane, window.divider_budget, &mut regions, &mut dividers);
     if regions.len() <= 1 {
         return;
     }
@@ -7296,7 +7515,7 @@ fn hit_test_click(
     let area = Rect { row: 0, col: 0, rows: content_rows(term_rows), cols: term_cols };
     let mut regions = Vec::new();
     let mut dividers = Vec::new();
-    compute_regions(&windows[current_window].layout, area, &mut regions, &mut dividers);
+    compute_regions(&windows[current_window].layout, area, windows[current_window].focused_pane, windows[current_window].divider_budget, &mut regions, &mut dividers);
     // Dividers first: they sit *between* pane rectangles, so nothing here
     // overlaps, but checking them first keeps the intent obvious -- a
     // press on the strip is a resize, never a focus change.
@@ -7304,6 +7523,13 @@ fn hit_test_click(
         .into_iter()
         .find(|d| row0 >= d.rect.row && row0 < d.rect.row + d.rect.rows && col0 >= d.rect.col && col0 < d.rect.col + d.rect.cols)
     {
+        // A folded divider stands for several boundaries at once, so
+        // there is no single one for a drag to move. Clicking it focuses
+        // the first pane it is hiding instead, which unfolds the run
+        // around it -- the "flip" in flipper divider.
+        if divider.folded.is_some() {
+            return folded_divider_pane(&windows[current_window], &divider).map(ClickTarget::Pane);
+        }
         return Some(ClickTarget::Divider(divider));
     }
     let (pane_id, _) = regions.into_iter().find(|(_, r)| row0 >= r.row && row0 < r.row + r.rows && col0 >= r.col && col0 < r.col + r.cols)?;
@@ -7369,7 +7595,7 @@ fn drag_divider(
             let area = Rect { row: 0, col: 0, rows: content_rows(*term_rows), cols: *term_cols };
             let mut regions = Vec::new();
             let mut dividers = Vec::new();
-            compute_regions(&windows[current_window].layout, area, &mut regions, &mut dividers);
+            compute_regions(&windows[current_window].layout, area, windows[current_window].focused_pane, windows[current_window].divider_budget, &mut regions, &mut dividers);
             if let Some(fresh) = dividers.into_iter().find(|d| d.path == current.path && d.child == current.child) {
                 current = fresh;
             }
@@ -9580,6 +9806,7 @@ mod divider_drag_tests {
             layout,
             panes: panes.iter().map(|id| Pane { id: *id, stack: vec![Frame::Session(0)] }).collect(),
             focused_pane: panes[0],
+            divider_budget: DEFAULT_DIVIDER_BUDGET,
             next_pane_id: panes.len() as PaneId,
         }
     }
@@ -9587,7 +9814,7 @@ mod divider_drag_tests {
     fn dividers_of(w: &WindowEntry, area: Rect) -> Vec<Divider> {
         let mut out = Vec::new();
         let mut dividers = Vec::new();
-        compute_regions(&w.layout, area, &mut out, &mut dividers);
+        compute_regions(&w.layout, area, w.focused_pane, w.divider_budget, &mut out, &mut dividers);
         dividers
     }
 
@@ -9684,7 +9911,7 @@ mod divider_drag_tests {
         let d = dividers_of(&w, AREA)[0].clone();
         let mut out = Vec::new();
         let mut dividers = Vec::new();
-        compute_regions(&w.layout, AREA, &mut out, &mut dividers);
+        compute_regions(&w.layout, AREA, w.focused_pane, w.divider_budget, &mut out, &mut dividers);
         // Nothing overlaps: the divider column belongs to no pane rect.
         assert!(!out.iter().any(|(_, r)| d.rect.col >= r.col && d.rect.col < r.col + r.cols));
     }
@@ -9770,7 +9997,7 @@ mod pane_layout_tests {
     fn regions(layout: &PaneLayout, area: Rect) -> Vec<(PaneId, Rect)> {
         let mut out = Vec::new();
         let mut dividers = Vec::new();
-        compute_regions(layout, area, &mut out, &mut dividers);
+        compute_regions(layout, area, 0, DEFAULT_DIVIDER_BUDGET, &mut out, &mut dividers);
         out
     }
 
@@ -9851,7 +10078,7 @@ mod pane_layout_tests {
     fn regions_and_dividers(layout: &PaneLayout, area: Rect) -> (Vec<(PaneId, Rect)>, Vec<Divider>) {
         let mut out = Vec::new();
         let mut dividers = Vec::new();
-        compute_regions(layout, area, &mut out, &mut dividers);
+        compute_regions(layout, area, 0, DEFAULT_DIVIDER_BUDGET, &mut out, &mut dividers);
         (out, dividers)
     }
 
@@ -10601,5 +10828,175 @@ mod substitute_command_tests {
         assert!(!starts_off_the_record(""));
         // Trailing and interior whitespace say nothing about it.
         assert!(!starts_off_the_record("echo a  b "));
+    }
+
+    // The worked examples from the feature's own description, with eight
+    // panes `a`..`h` and the focus moving right one at a time.
+    #[test]
+    fn folding_keeps_the_ends_the_focus_and_its_neighbours() {
+        let show = |focused: usize| {
+            let runs = collapsed_runs(8, focused);
+            let mut out = String::new();
+            let mut i = 0;
+            while i < 8 {
+                if let Some(run) = runs.iter().find(|r| r.start == i) {
+                    out.push_str("... ");
+                    i = run.end;
+                    continue;
+                }
+                let name = (b'a' + i as u8) as char;
+                if i == focused {
+                    out.push_str(&format!("[{name}] "));
+                } else {
+                    out.push_str(&format!("{name} "));
+                }
+                i += 1;
+            }
+            out.trim_end().to_string()
+        };
+        assert_eq!(show(1), "a [b] c ... h");
+        assert_eq!(show(2), "a b [c] d ... h");
+        assert_eq!(show(3), "a b c [d] e ... h");
+        assert_eq!(show(4), "a ... d [e] f g h");
+    }
+
+    // The rule that keeps this from being merely mechanical: a folded
+    // run and an ordinary divider cost the same one line, so folding a
+    // lone child buys nothing and costs you a pane.
+    #[test]
+    fn a_run_of_one_is_never_folded() {
+        // focus d (index 3) leaves exactly `b` between the first child
+        // and the focus's own neighbour -- kept.
+        assert_eq!(collapsed_runs(8, 3), vec![5..7]);
+        // ...and focus e leaves exactly `g` at the other end -- kept.
+        assert_eq!(collapsed_runs(8, 4), vec![1..3]);
+    }
+
+    // Four panes can't fold from any focus: the ends, the focus and its
+    // two neighbours are already all of them, and whatever is left over
+    // is a run of one.
+    #[test]
+    fn four_panes_or_fewer_never_fold() {
+        for n in 0..=4 {
+            for focused in 0..n.max(1) {
+                assert!(collapsed_runs(n, focused).is_empty(), "n={n} focused={focused}");
+            }
+        }
+    }
+
+    // Five is the first count that can, and only from an end -- from the
+    // middle every child is still an anchor or a lone leftover.
+    #[test]
+    fn five_panes_fold_only_from_an_end() {
+        assert_eq!(collapsed_runs(5, 0), vec![2..4], "[a] b ... e");
+        assert_eq!(collapsed_runs(5, 4), vec![1..3], "a ... d [e]");
+        assert!(collapsed_runs(5, 2).is_empty(), "a b [c] d e");
+    }
+
+    #[test]
+    fn folding_never_hides_the_focus_its_neighbours_or_the_ends() {
+        for n in 1..40 {
+            for focused in 0..n {
+                let runs = collapsed_runs(n, focused);
+                let hidden = |i: usize| runs.iter().any(|r| r.contains(&i));
+                assert!(!hidden(0) && !hidden(n - 1), "n={n} focused={focused}: an end folded");
+                assert!(!hidden(focused), "n={n} focused={focused}: the focus folded");
+                assert!(focused == 0 || !hidden(focused - 1), "n={n} focused={focused}");
+                assert!(focused + 1 == n || !hidden(focused + 1), "n={n} focused={focused}");
+                // ...and the runs stay ordered and disjoint.
+                assert!(runs.windows(2).all(|w| w[0].end < w[1].start), "n={n} focused={focused}: runs touch");
+            }
+        }
+    }
+
+    #[test]
+    fn the_budget_decides_whether_anything_folds_at_all() {
+        // Seven dividers in forty rows is 17.5%.
+        assert!(!dividers_overflow(7, 40, 25));
+        assert!(dividers_overflow(7, 40, 10));
+        // 100 means never, whatever the numbers say.
+        assert!(!dividers_overflow(39, 40, 100));
+        // ...and nothing divides by zero on a split with no room.
+        assert!(!dividers_overflow(7, 0, 25));
+    }
+
+    // The layout half: folded children really do get no space, the
+    // dividers they would have needed are gone, and one divider stands
+    // in their place carrying the count.
+    #[test]
+    fn a_folded_run_gives_up_its_rows_to_the_panes_that_are_left() {
+        // Ten panes stacked in twenty rows: nine dividers is 45%, over
+        // the 25% budget.
+        let children: Vec<SplitChild> =
+            (0..10).map(|i| SplitChild { layout: PaneLayout::Leaf(i), weight: 1.0, fixed: None, minimized: false }).collect();
+        let layout = PaneLayout::Split { horizontal: true, children };
+        let area = Rect { row: 0, col: 0, rows: 20, cols: 40 };
+        let mut regions = Vec::new();
+        let mut dividers = Vec::new();
+        compute_regions(&layout, area, 1, 25, &mut regions, &mut dividers);
+
+        // Focused pane 1, so panes 0,1,2 and 9 keep their rows and
+        // 3..=8 fold.
+        let rows = |id: PaneId| regions.iter().find(|(p, _)| *p == id).unwrap().1.rows;
+        for id in [0, 1, 2, 9] {
+            assert!(rows(id) > 0, "pane {id} should still be drawn");
+        }
+        for id in 3..=8 {
+            assert_eq!(rows(id), 0, "pane {id} should be folded away");
+        }
+        // Every pane is still reported, folded or not -- that is what
+        // keeps focusing one possible.
+        assert_eq!(regions.len(), 10);
+        // Three ordinary dividers and one fold, not nine.
+        assert_eq!(dividers.len(), 4);
+        assert_eq!(dividers.iter().filter(|d| d.folded == Some(6)).count(), 1);
+        // ...and the rows add up to the area.
+        let used: usize = regions.iter().map(|(_, r)| r.rows).sum::<usize>() + dividers.len();
+        assert_eq!(used, area.rows);
+    }
+
+    // Under the budget nothing folds, however many panes there are.
+    #[test]
+    fn a_generous_budget_folds_nothing() {
+        let children: Vec<SplitChild> =
+            (0..10).map(|i| SplitChild { layout: PaneLayout::Leaf(i), weight: 1.0, fixed: None, minimized: false }).collect();
+        let layout = PaneLayout::Split { horizontal: true, children };
+        let mut regions = Vec::new();
+        let mut dividers = Vec::new();
+        compute_regions(&layout, Rect { row: 0, col: 0, rows: 20, cols: 40 }, 1, 100, &mut regions, &mut dividers);
+        assert_eq!(dividers.len(), 9);
+        assert!(dividers.iter().all(|d| d.folded.is_none()));
+        assert!(regions.iter().all(|(_, r)| r.rows > 0));
+    }
+
+    // Moving the focus is what unfolds: the same layout, a different
+    // pane in front, and a different set is hidden.
+    #[test]
+    fn the_fold_follows_the_focus() {
+        let hidden_for = |focused: PaneId| {
+            let children: Vec<SplitChild> =
+                (0..10).map(|i| SplitChild { layout: PaneLayout::Leaf(i), weight: 1.0, fixed: None, minimized: false }).collect();
+            let layout = PaneLayout::Split { horizontal: true, children };
+            let mut regions = Vec::new();
+            let mut dividers = Vec::new();
+            compute_regions(&layout, Rect { row: 0, col: 0, rows: 20, cols: 40 }, focused, 25, &mut regions, &mut dividers);
+            let mut hidden: Vec<PaneId> = regions.iter().filter(|(_, r)| r.rows == 0).map(|(p, _)| *p).collect();
+            hidden.sort_unstable();
+            hidden
+        };
+        assert_eq!(hidden_for(1), vec![3, 4, 5, 6, 7, 8]);
+        assert_eq!(hidden_for(5), vec![1, 2, 3, 7, 8]);
+        // Whatever is focused is never hidden, at any position.
+        for focused in 0..10 {
+            assert!(!hidden_for(focused).contains(&focused));
+        }
+    }
+
+    #[test]
+    fn a_folded_divider_draws_what_it_stands_for() {
+        let line = folded_divider_line(30, 6);
+        assert!(line.contains("6 panes"), "{line:?}");
+        assert_eq!(super::super::editor::visible_len(&line), 30, "still exactly the divider's width");
+        assert!(folded_divider_line(30, 1).contains("1 pane"), "singular");
     }
 }
