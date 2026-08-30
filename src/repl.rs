@@ -3,6 +3,8 @@ use std::collections::{HashMap, HashSet};
 use std::io::{self, Write};
 use std::rc::Rc;
 
+use crate::lspclient;
+
 use crate::bishedit::completion;
 use crate::bishedit::highlight::{self, HighlightContext};
 use crate::bishedit::lint;
@@ -1401,6 +1403,15 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
         }
         let _ = io::stdout().flush();
     }
+    // The protocol's own goodbye to every language server on the way
+    // out. `Server`'s `Drop` would kill them anyway -- an orphaned
+    // rust-analyzer indexing a workspace forever is a real problem, not
+    // a tidiness one -- but a server told to shut down gets to write
+    // out whatever cache it keeps, which is the difference between a
+    // fast and a slow start next time.
+    if let Some(lsp) = sessions.values().next().map(|s| Rc::clone(&s.shell.lsp)) {
+        lsp.borrow_mut().shutdown_all();
+    }
 }
 
 // `e DIR` -- a directory argument isn't a buffer to open, it's a place
@@ -2351,6 +2362,7 @@ fn run_edit_frame(
     // language server for this file wants a real buffer to ask about,
     // not a path.
     run_hooks(sessions, session_id, "editor:file:open", &buffer);
+    start_language_server(sessions, session_id, &buffer);
     // Where this editor frame actually lives -- captured once, before
     // any window command can move focus elsewhere. The Detached arm
     // below needs this pane's own rect to freeze into, not whatever
@@ -4192,6 +4204,17 @@ fn service_background_jobs(
     let snapshot = window_snapshot(sessions, windows, skip_window);
     for session in sessions.values_mut() {
         session.shell.windows = snapshot.clone();
+    }
+
+    // Every language server gets one non-blocking tick here, for the
+    // same reason job ptys do: this is the one callback every blocking
+    // loop in this file passes as `on_idle`, so it is the only place
+    // that reliably runs no matter which of them the user is sitting
+    // in. The table is shared by every session's shell (see
+    // `lspclient::Table`), so reaching it through any one of them
+    // reaches all of them.
+    if let Some(lsp) = sessions.values().next().map(|s| Rc::clone(&s.shell.lsp)) {
+        lsp.borrow_mut().service_all();
     }
 
     // A plain no-op unless this process is running as a `bish session`
@@ -7591,6 +7614,37 @@ fn tab_bar_line(sessions: &HashMap<SessionId, SessionState>, windows: &[WindowEn
 // The empty case costs a `Vec` and a string compare, which is what keeps
 // firing an event free on the overwhelmingly common path where nobody is
 // listening.
+// Starts the language server for this buffer's language, if one is
+// registered and isn't already running for its project.
+//
+// Called at exactly the moment `editor:file:open` fires, and for the
+// same reason: the buffer exists and its options are resolved, so its
+// language is knowable. Starting is all that happens here -- the server
+// is not told about the file yet, which is the next piece of work.
+//
+// Every failure is silent apart from what `::bish lsp status` will
+// show. The middle of opening a file is the worst place to interrupt
+// someone with a configuration problem, and a language server is an
+// optional convenience: the editor has to work exactly as well without
+// one. Same tolerance `run_hooks_for` already applies to a hook that
+// doesn't parse.
+fn start_language_server(sessions: &mut HashMap<SessionId, SessionState>, session_id: SessionId, buf: &TextBuffer) {
+    let Some(path) = buf.path() else { return };
+    let Some(session) = sessions.get(&session_id) else { return };
+    let language = fileeditor::language_of(buf);
+    let Some(declared) = session.shell.lsp_server_for(&language) else { return };
+    // An absolute path, so walking up for a root marker doesn't depend
+    // on where the shell happens to be.
+    let absolute = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let Some(root) = lspclient::root_for(&absolute, &declared.root_markers) else { return };
+    let (id, command, display) = (declared.id, declared.command.clone(), declared.command_line());
+    let lsp = Rc::clone(&session.shell.lsp);
+    // The error is deliberately dropped here: `get_or_start` records it
+    // on the table, which is where `::bish lsp status` will show it, and
+    // there is nowhere sensible to print mid-open.
+    let _ = lsp.borrow_mut().get_or_start(id, &command, &display, &root);
+}
+
 fn run_hooks(sessions: &mut HashMap<SessionId, SessionState>, session_id: SessionId, event: &str, buf: &TextBuffer) {
     let path = buf.path().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
     run_hooks_for(sessions, session_id, event, &fileeditor::language_of(buf), &path);

@@ -521,28 +521,6 @@ pub struct LspServer {
     pub root_markers: Vec<String>,
 }
 
-/// One running language server, as `::bish lsp status` reports it.
-/// A snapshot owned by the shell and refreshed from repl.rs each idle
-/// tick -- see `Shell::lsp_running`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LspStatus {
-    /// The declaration this was started from (`LspServer::id`).
-    pub id: u64,
-    pub command: String,
-    /// The project root it was started for, which together with the
-    /// command is what identifies it: one server per (command, root).
-    pub root: String,
-    /// "starting", "initializing", "ready", or "dead: <why>".
-    pub state: String,
-    /// The `positionEncoding` negotiated during the handshake -- empty
-    /// until there has been one. Worth reporting because it is the
-    /// difference between exact and approximated columns on any line
-    /// with an emoji in it.
-    pub encoding: String,
-    /// How many documents this server has been told about.
-    pub open_documents: usize,
-}
-
 impl LspServer {
     /// What `ls` prints and what `status` echoes back -- the command as
     /// one line, quoting only the words that would otherwise stop being
@@ -817,12 +795,13 @@ pub struct Shell {
     /// `LspServer`.
     pub lsp_servers: Vec<LspServer>,
     next_lsp_id: u64,
-    /// What `::bish lsp status` reports: a snapshot of the servers
-    /// actually running, refreshed once per idle tick by repl.rs from
-    /// the map it owns. Exactly the treatment `windows` already gets,
-    /// and for the same reason -- `status` has to be an ordinary builtin
-    /// readable in `$(...)`, not a signal the caller has to interpret.
-    pub lsp_running: Vec<LspStatus>,
+    /// The language servers actually running, shared by every shell in
+    /// the process the same way `jobs` is (`Rc::clone` in
+    /// `new_virtual_child`) -- see `lspclient::Table` for why it lives
+    /// here rather than in repl.rs. Because it is the live table and not
+    /// a snapshot, `::bish lsp status` is an ordinary builtin readable
+    /// in `$(...)`, which is the lesson `window ls` taught.
+    pub lsp: Rc<RefCell<crate::lspclient::Table>>,
     /// Set while a hook is running, so a hook that causes its own event
     /// -- a `shell:cwd:change` hook that `cd`s, most obviously -- fires
     /// once rather than forever. Not shared with a virtual child: a hook
@@ -1217,7 +1196,7 @@ impl Shell {
             next_hook_id: 1,
             lsp_servers: Vec::new(),
             next_lsp_id: 1,
-            lsp_running: Vec::new(),
+            lsp: Rc::new(RefCell::new(crate::lspclient::Table::default())),
             firing_hooks: false,
             array_local_stack: Vec::new(),
             assoc_local_stack: Vec::new(),
@@ -1483,7 +1462,7 @@ impl Shell {
             next_hook_id: self.next_hook_id,
             lsp_servers: self.lsp_servers.clone(),
             next_lsp_id: self.next_lsp_id,
-            lsp_running: self.lsp_running.clone(),
+            lsp: Rc::clone(&self.lsp),
             firing_hooks: false,
             array_local_stack: Vec::new(),
             assoc_local_stack: Vec::new(),
@@ -3405,8 +3384,22 @@ impl Shell {
                 0
             }
             Some("status") => {
-                for server in self.lsp_running.clone() {
-                    sh_println!(self, "{}\t{}\t{}\t{}\t{}\t{}", server.id, server.state, server.encoding, server.open_documents, server.root, server.command);
+                // Collected before printing: `sh_println!` needs the
+                // shell mutably, and the table is reached through it.
+                let table = self.lsp.borrow();
+                let running = table.servers().iter().map(|s| {
+                    let encoding = if s.is_ready() { s.encoding().wire_name() } else { "" };
+                    format!("{}\t{}\t{}\t{}\t{}\t{}", s.id, s.state().describe(), encoding, s.open_documents(), s.root.display(), s.command)
+                });
+                // A server that never started has no state of its own to
+                // report, but it is the thing someone running `status`
+                // is most likely looking for, so it appears in the same
+                // shape rather than being left out.
+                let failed = table.failures().iter().map(|f| format!("{}\tdead: {}\t\t0\t{}\t{}", f.id, f.why, f.root.display(), f.command));
+                let rows: Vec<String> = running.chain(failed).collect();
+                drop(table);
+                for row in rows {
+                    sh_println!(self, "{row}");
                 }
                 0
             }
@@ -3421,6 +3414,17 @@ impl Shell {
                 2
             }
         }
+    }
+
+    /// The declared server for a file of `language`, if any -- the first
+    /// whose `--lang` glob matches, so an earlier, more specific
+    /// registration wins over a later catch-all, the same
+    /// first-match-wins rule `hooks_for` uses for ordering.
+    pub fn lsp_server_for(&self, language: &str) -> Option<&LspServer> {
+        if !self.bishopt_bool("lsp") {
+            return None;
+        }
+        self.lsp_servers.iter().find(|s| crate::glob::matches(&s.lang, language))
     }
 
     // `--lang=GLOB`/`--lang GLOB`, exactly as `hook_lang_flag` does it.

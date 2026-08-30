@@ -266,6 +266,31 @@ pub fn absolute(target: &str, base_dir: Option<&std::path::Path>) -> Option<Stri
     Some(format!("file://{}", resolved.display()))
 }
 
+/// A real, percent-encoded `file://` URL for an absolute path.
+///
+/// `absolute` above also produces `file://`-prefixed strings, but for a
+/// different audience: a terminal emulator being handed an OSC 8 target,
+/// which is forgiving about what it gets. A language server is not --
+/// `rootUri` and every `textDocument.uri` are matched against each other
+/// and against the server's own idea of the same file, so a path
+/// containing a space or a `#` has to arrive encoded or it names a
+/// different document (or no document at all).
+///
+/// Everything outside RFC 3986's unreserved set is encoded, byte by byte
+/// of the path's UTF-8, with `/` kept as the separator it is. Encoding
+/// more than strictly necessary is safe -- a decoder gets the same path
+/// back either way -- while encoding less is not.
+pub fn from_file_path(path: &std::path::Path) -> String {
+    let mut out = String::from("file://");
+    for byte in path.to_string_lossy().as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' => out.push(*byte as char),
+            other => out.push_str(&format!("%{other:02X}")),
+        }
+    }
+    out
+}
+
 fn is_scheme_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.')
 }

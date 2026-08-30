@@ -25,6 +25,7 @@ mod ini;
 mod json;
 mod lexer;
 mod lsp;
+mod lspclient;
 mod markdown;
 mod pager;
 mod parser;
