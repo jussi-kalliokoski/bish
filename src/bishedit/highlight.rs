@@ -154,46 +154,66 @@ pub struct JsonHighlighter;
 
 impl Highlighter for JsonHighlighter {
     fn highlight(&self, text: &str, _ctx: HighlightContext) -> Vec<HighlightSpan> {
-        let toks = crate::json::tokens(text);
-        let mut out = Vec::new();
-        for (i, tok) in toks.iter().enumerate() {
-            let kind = match &tok.kind {
-                // The one piece of structure this needs, and one token of
-                // lookahead is all it takes: a string is a key exactly
-                // when a colon follows it. Reading it off the flat stream
-                // rather than a parse tree is what keeps it working in a
-                // buffer that doesn't parse yet.
-                crate::json::TokenKind::Str(_) => {
-                    match toks.get(i + 1).map(|t| &t.kind) {
-                        Some(crate::json::TokenKind::Colon) => HighlightKind::Key,
-                        _ => HighlightKind::String,
-                    }
-                }
-                crate::json::TokenKind::Number(_) => HighlightKind::Number,
-                crate::json::TokenKind::Bool(_) | crate::json::TokenKind::Null => HighlightKind::Keyword,
-                crate::json::TokenKind::OpenBrace
-                | crate::json::TokenKind::CloseBrace
-                | crate::json::TokenKind::OpenBracket
-                | crate::json::TokenKind::CloseBracket
-                | crate::json::TokenKind::Comma
-                | crate::json::TokenKind::Colon => HighlightKind::Operator,
-                crate::json::TokenKind::Invalid(_) => continue,
-            };
-            out.push(HighlightSpan { start: tok.start, end: tok.end, kind, link: None });
-            // Layered on top of the string's own span just above, the
-            // same way printf's format specifiers sit inside their
-            // argument -- compose paints later spans over earlier ones.
-            for esc in &tok.escapes {
-                out.push(HighlightSpan {
-                    start: esc.start,
-                    end: esc.end,
-                    kind: HighlightKind::FormatSpecifier,
-                    link: None,
-                });
-            }
-        }
-        out
+        json_spans(&crate::json::tokens(text))
     }
+}
+
+// JSON as `tsconfig.json`, `devcontainer.json` and every `.vscode` file
+// actually write it: with comments. The same spans off the same
+// tokenizer, from the stream that keeps them -- see
+// `json::tokens_with_comments`, and see the JSON entry in plan.md for
+// why there is one scanner here rather than two.
+pub struct JsoncHighlighter;
+
+impl Highlighter for JsoncHighlighter {
+    fn highlight(&self, text: &str, _ctx: HighlightContext) -> Vec<HighlightSpan> {
+        json_spans(&crate::json::tokens_with_comments(text))
+    }
+}
+
+fn json_spans(toks: &[crate::json::Token]) -> Vec<HighlightSpan> {
+    let mut out = Vec::new();
+    for (i, tok) in toks.iter().enumerate() {
+        let kind = match &tok.kind {
+            // The one piece of structure this needs, and one token of
+            // lookahead is all it takes: a string is a key exactly
+            // when a colon follows it. Reading it off the flat stream
+            // rather than a parse tree is what keeps it working in a
+            // buffer that doesn't parse yet.
+            crate::json::TokenKind::Str(_) => {
+                // Past any comment between the two, so
+                // `"key" /* why */: 1` still reads as a key.
+                let next = toks[i + 1..].iter().find(|t| t.kind != crate::json::TokenKind::Comment);
+                match next.map(|t| &t.kind) {
+                    Some(crate::json::TokenKind::Colon) => HighlightKind::Key,
+                    _ => HighlightKind::String,
+                }
+            }
+            crate::json::TokenKind::Number(_) => HighlightKind::Number,
+            crate::json::TokenKind::Bool(_) | crate::json::TokenKind::Null => HighlightKind::Keyword,
+            crate::json::TokenKind::OpenBrace
+            | crate::json::TokenKind::CloseBrace
+            | crate::json::TokenKind::OpenBracket
+            | crate::json::TokenKind::CloseBracket
+            | crate::json::TokenKind::Comma
+            | crate::json::TokenKind::Colon => HighlightKind::Operator,
+            crate::json::TokenKind::Comment => HighlightKind::Comment,
+            crate::json::TokenKind::Invalid(_) => continue,
+        };
+        out.push(HighlightSpan { start: tok.start, end: tok.end, kind, link: None });
+        // Layered on top of the string's own span just above, the
+        // same way printf's format specifiers sit inside their
+        // argument -- compose paints later spans over earlier ones.
+        for esc in &tok.escapes {
+            out.push(HighlightSpan {
+                start: esc.start,
+                end: esc.end,
+                kind: HighlightKind::FormatSpecifier,
+                link: None,
+            });
+        }
+    }
+    out
 }
 
 // Markdown, over crate::markdown's own parse -- the same rule the other
@@ -320,6 +340,50 @@ fn markdown_inlines(inlines: &[crate::markdown::Inline], out: &mut Vec<Highlight
 // roff -- man page source -- over crate::roff's own lexical pass, not
 // its interpreter. That distinction is the point: a highlighter must
 // colour the source as written, so the `.de` and `.ie` scaffolding a
+// TOML. Reads `toml::tokens` straight through -- the tokenizer already
+// carries the one piece of grammar that matters here (whether a word is
+// in key or value position), because that is a property of TOML and not
+// of colouring it. See toml.rs's own header.
+pub struct TomlHighlighter;
+
+impl Highlighter for TomlHighlighter {
+    fn highlight(&self, text: &str, _ctx: HighlightContext) -> Vec<HighlightSpan> {
+        let mut out = Vec::new();
+        for tok in crate::toml::tokens(text) {
+            let kind = match &tok.kind {
+                crate::toml::TokenKind::Comment => HighlightKind::Comment,
+                // The whole header, brackets included -- a table is one
+                // thing to a reader, the same call IniHighlighter makes
+                // for `[core]` and markdown_block for a heading's `#`.
+                crate::toml::TokenKind::TableHeader => HighlightKind::Keyword,
+                crate::toml::TokenKind::Key => HighlightKind::Key,
+                crate::toml::TokenKind::Str { escapes } => {
+                    out.push(span(tok.start..tok.end, HighlightKind::String));
+                    for esc in escapes {
+                        out.push(span(esc.clone(), HighlightKind::FormatSpecifier));
+                    }
+                    continue;
+                }
+                crate::toml::TokenKind::Number => HighlightKind::Number,
+                crate::toml::TokenKind::Bool => HighlightKind::Keyword,
+                // Not a number, but it belongs with them: an unquoted
+                // literal scalar, and `1979-05-27` sitting beside `1234`
+                // in the same column should read the same way. There is
+                // no narrower kind, and inventing one for a single
+                // language would be a kind nothing else could use.
+                crate::toml::TokenKind::DateTime => HighlightKind::Number,
+                crate::toml::TokenKind::Punctuation => HighlightKind::Operator,
+                // Left uncoloured, the same as JSON's own Invalid:
+                // going plain as you type past a mistake is a quieter
+                // signal than painting an error the moment a quote opens.
+                crate::toml::TokenKind::Invalid => continue,
+            };
+            out.push(span(tok.start..tok.end, kind));
+        }
+        out
+    }
+}
+
 // INI, and the family of config formats that are INI in all but name.
 // Reads `ini::parse`'s items directly -- the same one-layer arrangement
 // MarkdownHighlighter has, and for the same reason: a second scanner
@@ -421,9 +485,11 @@ pub fn highlighter_for_language(language: &str) -> Option<Box<dyn Highlighter>> 
     match language {
         "bash" | "sh" | "shell" => Some(Box::new(BashHighlighter)),
         "json" => Some(Box::new(JsonHighlighter)),
+        "jsonc" => Some(Box::new(JsoncHighlighter)),
         "markdown" | "md" => Some(Box::new(MarkdownHighlighter)),
         "roff" | "man" | "troff" | "groff" => Some(Box::new(RoffHighlighter)),
         "ini" => Some(Box::new(IniHighlighter)),
+        "toml" => Some(Box::new(TomlHighlighter)),
         _ => None,
     }
 }
@@ -2278,5 +2344,92 @@ mod tests {
     #[test]
     fn ini_highlights_nothing_in_empty_input() {
         assert_eq!(ini_kinds(""), vec![]);
+    }
+
+    fn jsonc_kinds(text: &str) -> Vec<(String, HighlightKind)> {
+        let chars: Vec<char> = text.chars().collect();
+        let mut spans = JsoncHighlighter.highlight(text, HighlightContext::default());
+        spans.sort_by_key(|s| (s.start, s.end));
+        spans.into_iter().map(|s| (chars[s.start..s.end].iter().collect(), s.kind)).collect()
+    }
+
+    #[test]
+    fn jsonc_highlights_both_comment_forms() {
+        assert_eq!(
+            jsonc_kinds("// why\n1"),
+            vec![("// why".to_string(), HighlightKind::Comment), ("1".to_string(), HighlightKind::Number)]
+        );
+        assert_eq!(
+            jsonc_kinds("/* why */ 1"),
+            vec![("/* why */".to_string(), HighlightKind::Comment), ("1".to_string(), HighlightKind::Number)]
+        );
+    }
+
+    // A comment between a key and its colon must not cost the key its
+    // colour -- the lookahead skips past comments to find the colon.
+    #[test]
+    fn jsonc_still_sees_a_key_through_a_comment() {
+        let kinds = jsonc_kinds("{\"a\" /* c */: 1}");
+        assert!(kinds.iter().any(|(t, k)| t == "\"a\"" && *k == HighlightKind::Key));
+    }
+
+    // An unterminated comment ends at the end of the input rather than
+    // swallowing nothing -- what one looks like while being typed.
+    #[test]
+    fn jsonc_tolerates_an_unterminated_block_comment() {
+        assert_eq!(jsonc_kinds("/* open"), vec![("/* open".to_string(), HighlightKind::Comment)]);
+    }
+
+    // Strict JSON is untouched: a `/` there is not a comment, it is a
+    // character that cannot start a value.
+    #[test]
+    fn plain_json_has_no_comments() {
+        assert!(!json_kinds("// not a comment").iter().any(|(_, k)| *k == HighlightKind::Comment));
+    }
+
+    fn toml_kinds(text: &str) -> Vec<(String, HighlightKind)> {
+        let chars: Vec<char> = text.chars().collect();
+        let mut spans = TomlHighlighter.highlight(text, HighlightContext::default());
+        spans.sort_by_key(|s| (s.start, s.end));
+        spans.into_iter().map(|s| (chars[s.start..s.end].iter().collect(), s.kind)).collect()
+    }
+
+    #[test]
+    fn toml_highlights_a_table_a_key_and_its_value() {
+        assert_eq!(
+            toml_kinds("[package]\nname = \"bish\"\n"),
+            vec![
+                ("[package]".to_string(), HighlightKind::Keyword),
+                ("name".to_string(), HighlightKind::Key),
+                ("=".to_string(), HighlightKind::Operator),
+                ("\"bish\"".to_string(), HighlightKind::String),
+            ]
+        );
+    }
+
+    // The payoff from the tokenizer knowing which side of `=` it is on.
+    #[test]
+    fn toml_colours_the_same_word_by_position() {
+        let kinds = |text: &str| toml_kinds(text).into_iter().map(|(_, k)| k).collect::<Vec<_>>();
+        assert_eq!(kinds("true = false"), vec![HighlightKind::Key, HighlightKind::Operator, HighlightKind::Keyword]);
+    }
+
+    #[test]
+    fn toml_colours_numbers_dates_and_booleans() {
+        let last = |text: &str| toml_kinds(text).pop().unwrap().1;
+        assert_eq!(last("k = 0xFF"), HighlightKind::Number);
+        assert_eq!(last("k = 1979-05-27T07:32:00Z"), HighlightKind::Number);
+        assert_eq!(last("k = true"), HighlightKind::Keyword);
+    }
+
+    #[test]
+    fn toml_marks_escapes_inside_a_basic_string() {
+        let spans = toml_kinds("k = \"a\\nb\"");
+        assert!(spans.iter().any(|(t, k)| t == "\\n" && *k == HighlightKind::FormatSpecifier));
+    }
+
+    #[test]
+    fn toml_highlights_nothing_in_empty_input() {
+        assert_eq!(toml_kinds(""), vec![]);
     }
 }

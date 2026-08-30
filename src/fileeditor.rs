@@ -2106,6 +2106,10 @@ const LANGUAGE_BY_EXTENSION: &[(&str, &str)] = &[
     ("netdev", "ini"),
     ("link", "ini"),
     ("nmconnection", "ini"),
+    // JSON with comments. `.json` itself stays strict -- most `.json`
+    // files really are, and colouring a stray `//` as a comment in one
+    // that isn't would be saying it is valid there.
+    ("jsonc", "jsonc"),
 ];
 
 // The other half of recognizing a file: what it is *called*. Every entry
@@ -2125,6 +2129,17 @@ const LANGUAGE_BY_FILE_NAME: &[(&str, &str)] = &[
     ("pylintrc", "ini"),
     (".flake8", "ini"),
     (".coveragerc", "ini"),
+    // TOML that doesn't say so. `Pipfile` and `poetry.lock` are both
+    // TOML documents with names that give no hint of it.
+    ("pipfile", "toml"),
+    ("poetry.lock", "toml"),
+    // The files everyone knows are JSON-with-comments even though their
+    // extension says otherwise. TypeScript's own parser accepts
+    // comments here, and every real `tsconfig.json` has them.
+    ("tsconfig.json", "jsonc"),
+    ("jsconfig.json", "jsonc"),
+    ("devcontainer.json", "jsonc"),
+    (".eslintrc.json", "jsonc"),
 ];
 
 pub(crate) fn language_of(buf: &TextBuffer) -> String {
@@ -2141,12 +2156,28 @@ pub(crate) fn language_of(buf: &TextBuffer) -> String {
     if let Some((_, lang)) = LANGUAGE_BY_FILE_NAME.iter().find(|(n, _)| *n == name) {
         return (*lang).to_string();
     }
-    // `config` alone is far too common a name to claim, but inside a
-    // `.git` directory (or the `git` one under `~/.config`) it is the
-    // git config -- which is the file you are actually editing when you
-    // type `e .git/config`.
-    if name == "config" && path.parent().and_then(|p| p.file_name()).is_some_and(|d| d == ".git" || d == "git") {
-        return "ini".to_string();
+    // Some names only mean something in the directory they are in.
+    let parent = path.parent().and_then(|p| p.file_name()).map(|d| d.to_string_lossy().to_lowercase());
+    match parent.as_deref() {
+        // `config` alone is far too common a name to claim, but inside a
+        // `.git` directory (or the `git` one under `~/.config`) it is
+        // the git config -- the file you are actually editing when you
+        // type `e .git/config`.
+        Some(".git") | Some("git") if name == "config" => return "ini".to_string(),
+        // ...and inside `.cargo` it is cargo's, which is TOML. (Cargo
+        // itself now prefers `config.toml`, which needs no help.)
+        Some(".cargo") if name == "config" => return "toml".to_string(),
+        // Every `.json` VS Code keeps in a project's `.vscode` accepts
+        // comments, and the ones people hand-edit are full of them.
+        Some(".vscode") if name.ends_with(".json") => return "jsonc".to_string(),
+        _ => {}
+    }
+    // `tsconfig.json` is never alone for long: a real project grows
+    // `tsconfig.app.json`, `tsconfig.node.json`, `tsconfig.build.json`.
+    // All of them are the same format, so match the family rather than
+    // listing the members.
+    if (name.starts_with("tsconfig.") || name.starts_with("jsconfig.")) && name.ends_with(".json") {
+        return "jsonc".to_string();
     }
     let Some(ext) = path.extension() else {
         return "text".to_string();
@@ -4126,10 +4157,16 @@ mod pre_save_hook_tests {
         assert!(!buffer_highlight_spans(&roff, None).is_empty(), "and a .1 buffer");
         assert_eq!(language_of(&roff), "roff");
 
+        let toml = buf_with_ext("[package]\nname = \"bish\"\n", "toml");
+        assert!(!buffer_highlight_spans(&toml, None).is_empty(), "and a .toml buffer");
+
         // Valid bash, and deliberately not highlighted as any: nothing
-        // claims to know what a .toml file is.
-        let toml = buf_with_ext("if true; then echo hi; fi", "toml");
-        assert!(buffer_highlight_spans(&toml, None).is_empty(), "a language with no highlighter renders plain");
+        // claims to know what a .zig file is. (This used to be the .toml
+        // case, until TOML got a highlighter of its own -- the point of
+        // the assertion is the fallback, so it moved to a language
+        // nothing here has an opinion about rather than being dropped.)
+        let unclaimed = buf_with_ext("if true; then echo hi; fi", "zig");
+        assert!(buffer_highlight_spans(&unclaimed, None).is_empty(), "a language with no highlighter renders plain");
     }
 
     // Opening compressed content: a member inside a zip and a gzip'd
@@ -4456,6 +4493,24 @@ mod pre_save_hook_tests {
         for name in [".gitconfig", ".editorconfig", ".npmrc", ".pylintrc", "pylintrc", ".flake8"] {
             assert_eq!(language_of(&buf_named(name)), "ini", "{name}");
         }
+    }
+
+    #[test]
+    fn the_json_with_comments_family_is_recognized() {
+        for name in ["settings.jsonc", "tsconfig.json", "tsconfig.app.json", "jsconfig.json", "devcontainer.json", ".eslintrc.json"] {
+            assert_eq!(language_of(&buf_named(name)), "jsonc", "{name}");
+        }
+        assert_eq!(language_of(&buf_named(".vscode/launch.json")), "jsonc", "everything VS Code keeps in .vscode");
+        // ...and a plain `.json` stays strict.
+        assert_eq!(language_of(&buf_named("package.json")), "json");
+    }
+
+    #[test]
+    fn toml_is_recognized_by_extension_and_by_the_names_that_hide_it() {
+        assert_eq!(language_of(&buf_named("Cargo.toml")), "toml");
+        assert_eq!(language_of(&buf_named("Pipfile")), "toml");
+        assert_eq!(language_of(&buf_named("poetry.lock")), "toml");
+        assert_eq!(language_of(&buf_named(".cargo/config")), "toml", "cargo's config, which is not git's");
     }
 
     // `config` on its own is claimed by everything; inside `.git` it

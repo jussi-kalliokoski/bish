@@ -79,6 +79,10 @@ pub enum TokenKind {
     Number(f64),
     Bool(bool),
     Null,
+    // `//` to end of line, or `/* ... */`. Only ever emitted by
+    // `tokens_with_comments` -- strict JSON has no comments, and
+    // `parse`, which reads the strict stream, therefore never sees one.
+    Comment,
     // Whatever couldn't be read as any of the above, carrying the reason
     // for `parse` to report. Tokenizing never fails: it emits one of
     // these and keeps going, so a half-typed buffer still tokenizes into
@@ -89,7 +93,25 @@ pub enum TokenKind {
 // Every token in `input`, whitespace dropped. Never fails -- see
 // TokenKind::Invalid.
 pub fn tokens(input: &str) -> Vec<Token> {
-    let mut lexer = Lexer { chars: input.chars().peekable(), pos: 0 };
+    lex(input, false)
+}
+
+// The same, for JSONC -- JSON as `tsconfig.json` and every `.vscode`
+// file actually write it, with `//` and `/* */` comments. Comments come
+// back as real `TokenKind::Comment` tokens rather than being skipped,
+// since the one consumer that wants this stream is a highlighter and a
+// comment it can't see is a comment it can't colour.
+//
+// The other thing JSONC permits, a trailing comma before `}`/`]`, needs
+// nothing here: a comma is the same token wherever it sits, and whether
+// one is allowed in that position is a question for a parser, which is
+// not what this stream is for.
+pub fn tokens_with_comments(input: &str) -> Vec<Token> {
+    lex(input, true)
+}
+
+fn lex(input: &str, comments: bool) -> Vec<Token> {
+    let mut lexer = Lexer { chars: input.chars().peekable(), pos: 0, comments };
     let mut out = Vec::new();
     while let Some(tok) = lexer.next_token() {
         out.push(tok);
@@ -100,6 +122,9 @@ pub fn tokens(input: &str) -> Vec<Token> {
 struct Lexer<'a> {
     chars: Peekable<Chars<'a>>,
     pos: usize,
+    // Whether `/`-introduced text is a comment or, as in strict JSON, a
+    // character that can't start a value.
+    comments: bool,
 }
 
 impl Lexer<'_> {
@@ -130,8 +155,39 @@ impl Lexer<'_> {
         }
     }
 
+    // `// ...` to the end of the line, or `/* ... */` -- unterminated,
+    // it runs to the end of the input, which is what a comment being
+    // typed looks like.
+    fn comment(&mut self) -> Token {
+        let start = self.pos;
+        self.advance();
+        let line = self.eat('/');
+        if !line {
+            self.advance();
+        }
+        loop {
+            match self.chars.peek() {
+                None => break,
+                Some('\n') if line => break,
+                Some('*') if !line => {
+                    self.advance();
+                    if self.eat('/') {
+                        break;
+                    }
+                }
+                _ => {
+                    self.advance();
+                }
+            }
+        }
+        Token { kind: TokenKind::Comment, start, end: self.pos, escapes: Vec::new() }
+    }
+
     fn next_token(&mut self) -> Option<Token> {
         self.skip_ws();
+        if self.comments && self.chars.peek() == Some(&'/') {
+            return Some(self.comment());
+        }
         let start = self.pos;
         let single = |kind| Some(kind);
         let kind = match *self.chars.peek()? {
@@ -401,6 +457,10 @@ fn describe(kind: &TokenKind) -> &'static str {
         TokenKind::Number(_) => "a number",
         TokenKind::Bool(_) => "a boolean",
         TokenKind::Null => "null",
+        // Unreachable through `parse`, which reads the strict stream --
+        // named rather than lumped in with Invalid so that if a JSONC
+        // stream is ever handed to a parser, it says what it saw.
+        TokenKind::Comment => "a comment",
         TokenKind::Invalid(_) => "invalid input",
     }
 }

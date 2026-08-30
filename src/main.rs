@@ -34,6 +34,7 @@ mod roff;
 mod serialize;
 mod session;
 mod term;
+mod toml;
 mod tool;
 mod vt100;
 
