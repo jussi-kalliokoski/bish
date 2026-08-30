@@ -20,6 +20,7 @@ use std::rc::Rc;
 use crate::bishedit::format::BashFormatter;
 use crate::bishedit::highlight::{self, HighlightContext, Highlighter, StyledSpan};
 use crate::bishedit::lint::{self, BashLinter, Linter};
+use crate::lsp;
 use crate::bishedit::motion;
 use crate::bishedit::registers::{RegisterShape, RegisterValue, Registers};
 use crate::bishedit::snippet::{self, Abbr, LiveSnippet, Snippet, SnippetHost};
@@ -1172,7 +1173,7 @@ pub(crate) fn run_insert_mode(
     // `sync_language_server_document`) can't borrow it a second time.
     // Handing it in at the one moment nothing else holds it is what
     // makes both possible.
-    on_idle: &mut dyn FnMut(&TextBuffer) -> Option<IdleRedraw>,
+    on_idle: &mut dyn FnMut(&mut TextBuffer) -> Option<IdleRedraw>,
     replace: bool,
     term_rows: usize,
     term_cols: usize,
@@ -2653,6 +2654,65 @@ pub(crate) fn diagnostic_position(buf: &TextBuffer, offset: usize) -> (usize, us
     let line = line.min(buf.line_count().saturating_sub(1));
     let col = offset.saturating_sub(starts[line]).min(buf.line_len(line));
     (line, col)
+}
+
+// `diagnostic_position`'s inverse: a `(line, character)` as a language
+// server counts it, back to the flat char offset every diagnostic and
+// highlight span in this codebase is addressed by.
+//
+// Two conversions in one, and both matter. The column is in whatever
+// encoding the handshake settled on (`utf-32` is bish's own counting
+// and needs no work; `utf-16` differs on any line holding an emoji),
+// and the line has to be turned into an offset via the same
+// `line_starts` prefix sum everything else here uses.
+//
+// Clamps rather than fails at every step. A server can and does name a
+// position past the end of what bish currently holds -- it is answering
+// about a revision the buffer may have moved past, and the alternative
+// to clamping is discarding a finding that is very probably still
+// pointing at the right place.
+pub(crate) fn diagnostic_offset(buf: &TextBuffer, starts: &[usize], line: usize, character: usize, encoding: lsp::PositionEncoding) -> usize {
+    let last = buf.line_count().saturating_sub(1);
+    if line > last {
+        return starts[last] + buf.line_len(last);
+    }
+    let chars = buf.line_chars(line);
+    starts[line] + lsp::from_server_column(&chars, character, encoding)
+}
+
+// A server's findings as diagnostics this editor can draw. The one
+// place LSP's model and `lint::Diagnostic` meet -- which is here, and
+// not in lsp.rs, because only something holding the actual text can
+// convert a `(line, character)` into an offset.
+//
+// `fix` is always `None`: an LSP fix is a code action, which is a
+// separate request and a multi-range `WorkspaceEdit` that `lint::Fix`'s
+// deliberately-single-range shape cannot express. Nothing is silently
+// lost by that -- a server's diagnostic carries no edit of its own.
+pub(crate) fn diagnostics_from_server(buf: &TextBuffer, findings: &[lsp::Finding], encoding: lsp::PositionEncoding) -> Vec<lint::Diagnostic> {
+    let starts = line_starts(buf);
+    findings
+        .iter()
+        .map(|f| lint::Diagnostic {
+            start: diagnostic_offset(buf, &starts, f.start.0, f.start.1, encoding),
+            end: diagnostic_offset(buf, &starts, f.end.0, f.end.1, encoding),
+            severity: match f.severity {
+                1 => lint::Severity::Error,
+                2 => lint::Severity::Warning,
+                3 => lint::Severity::Info,
+                _ => lint::Severity::Hint,
+            },
+            code: std::borrow::Cow::Owned(f.code.clone()),
+            // Always `Some`, even when the server named no source: this
+            // is what tells a relayed finding apart from one of bish's
+            // own, which is what lets a new publication replace exactly
+            // the right subset. The server's command stands in when it
+            // didn't say.
+            source: Some(f.source.clone().unwrap_or_else(|| "lsp".to_string())),
+            message: f.message.clone(),
+            fix: None,
+        })
+        .collect()
 }
 
 // Splices `diagnostic`'s own `Fix` (if it has one) into `buf` --
@@ -4368,6 +4428,69 @@ mod diagnose_tests {
         assert!(!buf.diagnostics.is_empty());
         buf.insert_text((0, 0), "x");
         assert!(buf.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn a_server_position_becomes_a_flat_offset_and_back_again() {
+        let mut buf = TextBuffer::new_unnamed(10);
+        buf.insert_text((0, 0), "abc\ndefgh\nij");
+        let starts = line_starts(&buf);
+        let utf32 = lsp::PositionEncoding::Utf32;
+        // The inverse of diagnostic_position, which is tested just
+        // below -- so the two are checked against each other.
+        for offset in [0usize, 3, 4, 8, 9, 11] {
+            let (line, col) = diagnostic_position(&buf, offset);
+            assert_eq!(diagnostic_offset(&buf, &starts, line, col, utf32), offset, "offset {offset}");
+        }
+        // Past the end clamps to the end of the buffer rather than
+        // discarding a finding that is probably still pointing at the
+        // right place.
+        assert_eq!(diagnostic_offset(&buf, &starts, 99, 0, utf32), 12);
+        assert_eq!(diagnostic_offset(&buf, &starts, 1, 99, utf32), starts[1] + 5);
+    }
+
+    // The whole reason positionEncoding gets negotiated: a server still
+    // counting UTF-16 code units names a column bish would otherwise
+    // read as a different character.
+    #[test]
+    fn a_utf16_column_lands_on_the_right_character() {
+        let mut buf = TextBuffer::new_unnamed(10);
+        buf.insert_text((0, 0), "a\u{1f30d}bc");
+        let starts = line_starts(&buf);
+        // The emoji is one char to bish and two UTF-16 code units, so
+        // `b` is at char 2 but at UTF-16 column 3.
+        assert_eq!(diagnostic_offset(&buf, &starts, 0, 3, lsp::PositionEncoding::Utf16), 2);
+        assert_eq!(diagnostic_offset(&buf, &starts, 0, 2, lsp::PositionEncoding::Utf32), 2);
+    }
+
+    #[test]
+    fn a_servers_findings_become_diagnostics_this_editor_can_draw() {
+        let mut buf = TextBuffer::new_unnamed(10);
+        buf.insert_text((0, 0), "let x = 1\nlet y = 2");
+        let findings = vec![
+            lsp::Finding {
+                start: (1, 4),
+                end: (1, 5),
+                severity: 1,
+                code: "E0308".to_string(),
+                source: Some("rustc".to_string()),
+                message: "mismatched types".to_string(),
+            },
+            lsp::Finding { start: (0, 0), end: (0, 3), severity: 4, code: String::new(), source: None, message: "unused".to_string() },
+        ];
+        let diagnostics = diagnostics_from_server(&buf, &findings, lsp::PositionEncoding::Utf32);
+        assert_eq!(diagnostics[0].start, 14, "line 1 starts at 10, plus 4 columns");
+        assert_eq!(diagnostics[0].end, 15);
+        assert_eq!(diagnostics[0].severity, lint::Severity::Error);
+        assert_eq!(diagnostics[0].label(), "rustc:E0308");
+        assert_eq!(diagnostics[1].severity, lint::Severity::Hint);
+        // Always sourced, even when the server named none: that is what
+        // distinguishes a relayed finding from one of bish's own, which
+        // is what lets a new publication replace exactly the right ones.
+        assert_eq!(diagnostics[1].source.as_deref(), Some("lsp"));
+        // A server's diagnostic carries no edit of its own -- a fix is a
+        // separate code-action request.
+        assert!(diagnostics.iter().all(|d| d.fix.is_none()));
     }
 
     #[test]

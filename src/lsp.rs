@@ -291,6 +291,146 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 }
 
 // ---------------------------------------------------------------------
+// Diagnostics
+// ---------------------------------------------------------------------
+
+/// One finding from a `textDocument/publishDiagnostics`, still in the
+/// protocol's own coordinates.
+///
+/// Named `Finding` rather than `Diagnostic` on purpose: `lint::
+/// Diagnostic` is what the editor draws, and the two are genuinely
+/// different things until a buffer has converted one into the other.
+/// This one's positions are `(line, character)` in whatever encoding the
+/// server negotiated; that one's are flat char offsets. Only something
+/// holding the actual text can bridge them, which is why this type stops
+/// here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Finding {
+    pub start: (usize, usize),
+    pub end: (usize, usize),
+    /// LSP's 1..=4. Kept as the number rather than mapped here, because
+    /// the enum it maps to lives in `lint` and this module has no
+    /// business knowing about it.
+    pub severity: u8,
+    pub code: String,
+    pub source: Option<String>,
+    pub message: String,
+}
+
+/// A whole `publishDiagnostics` payload: which document, which revision
+/// of it, and what was found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Publication {
+    pub uri: String,
+    /// The document version these describe, when the server said. LSP
+    /// makes it optional; absent means "no idea", and a client has
+    /// little choice but to trust them.
+    pub version: Option<u64>,
+    pub findings: Vec<Finding>,
+}
+
+/// Reads a `textDocument/publishDiagnostics` payload. `None` if it isn't
+/// one -- no uri, or a `diagnostics` that isn't an array.
+///
+/// Every string here comes from another process and ends up drawn into a
+/// terminal, so all of them go through `sanitize` on the way in: one
+/// place, at the boundary, rather than a rule every rendering path has
+/// to remember. Exactly what `url::is_safe` exists for, one layer down.
+pub fn publication(params: &Value) -> Option<Publication> {
+    let Ok(Value::Str(uri)) = json::query(params, ".uri") else { return None };
+    let Ok(Value::Array(items)) = json::query(params, ".diagnostics") else { return None };
+    let version = match json::query(params, ".version") {
+        Ok(Value::Number(v)) if *v >= 0.0 => Some(*v as u64),
+        _ => None,
+    };
+    let findings = items.iter().filter_map(finding).collect();
+    Some(Publication { uri: uri.clone(), version, findings })
+}
+
+fn finding(value: &Value) -> Option<Finding> {
+    let start = position(json::query(value, ".range.start").ok()?)?;
+    let end = position(json::query(value, ".range.end").ok()?)?;
+    // A range whose end precedes its start is a server bug; taking it at
+    // face value would produce an underline of negative width. Reading
+    // it as an empty range at `start` keeps the finding, which is the
+    // part the user actually needs.
+    let end = if end < start { start } else { end };
+    Some(Finding {
+        start,
+        end,
+        severity: match json::query(value, ".severity") {
+            Ok(Value::Number(s)) if (1.0..=4.0).contains(s) => *s as u8,
+            // "If omitted it is up to the client to interpret" -- and
+            // the safe interpretation is the loudest one: a finding
+            // shown as an error that was meant as a hint is a small
+            // annoyance, the reverse is a missed problem.
+            _ => 1,
+        },
+        // A code may be a string or a number, and both are common.
+        code: match json::query(value, ".code") {
+            Ok(Value::Str(code)) => sanitize(code),
+            Ok(Value::Number(code)) => format!("{}", *code as i64),
+            _ => String::new(),
+        },
+        source: match json::query(value, ".source") {
+            Ok(Value::Str(source)) => Some(sanitize(source)),
+            _ => None,
+        },
+        message: match json::query(value, ".message") {
+            Ok(Value::Str(message)) => sanitize(message),
+            _ => String::new(),
+        },
+    })
+}
+
+fn position(value: &Value) -> Option<(usize, usize)> {
+    let (Ok(Value::Number(line)), Ok(Value::Number(character))) = (json::query(value, ".line"), json::query(value, ".character")) else {
+        return None;
+    };
+    if *line < 0.0 || *character < 0.0 {
+        return None;
+    }
+    Some((*line as usize, *character as usize))
+}
+
+/// How long a message may be before it is cut. A compiler can produce a
+/// diagnostic with a whole worked example in it; a gutter row cannot.
+const MAX_MESSAGE: usize = 400;
+
+/// Text from a server, made safe to draw.
+///
+/// Two separate hazards. Control characters would be spliced straight
+/// into a terminal's escape-sequence stream -- the exact bug class
+/// `url::is_safe` exists for -- and newlines and tabs would break the
+/// one-line-per-finding shape every place that shows these assumes
+/// (`rustc` messages are routinely several lines). So every whitespace
+/// run collapses to one space and every other control character is
+/// dropped, and the result is capped.
+fn sanitize(text: &str) -> String {
+    let mut out = String::with_capacity(text.len().min(MAX_MESSAGE));
+    let mut pending_space = false;
+    for c in text.chars() {
+        if out.chars().count() >= MAX_MESSAGE {
+            out.push('\u{2026}');
+            break;
+        }
+        if c.is_whitespace() {
+            pending_space = !out.is_empty();
+            continue;
+        }
+        if c.is_control() {
+            continue;
+        }
+        if pending_space {
+            out.push(' ');
+            pending_space = false;
+        }
+        out.push(c);
+    }
+    out
+}
+
+// ---------------------------------------------------------------------
 // Languages
 // ---------------------------------------------------------------------
 
@@ -592,6 +732,110 @@ mod tests {
         // Mid-character resolves to that character's own start.
         assert_eq!(from_server_column(&line, 2, PositionEncoding::Utf16), 1);
         assert_eq!(from_server_column(&line, 3, PositionEncoding::Utf8), 1);
+    }
+
+    fn published(json_text: &str) -> Publication {
+        publication(&json::parse(json_text).unwrap()).expect("a publication")
+    }
+
+    #[test]
+    fn a_publication_reads_the_document_its_revision_and_every_finding() {
+        let p = published(
+            r#"{"uri":"file:///p/x.rs","version":7,"diagnostics":[
+                 {"range":{"start":{"line":2,"character":4},"end":{"line":2,"character":9}},
+                  "severity":1,"code":"E0308","source":"rustc","message":"mismatched types"},
+                 {"range":{"start":{"line":5,"character":0},"end":{"line":6,"character":1}},
+                  "severity":4,"message":"unused"}]}"#,
+        );
+        assert_eq!(p.uri, "file:///p/x.rs");
+        assert_eq!(p.version, Some(7));
+        assert_eq!(p.findings.len(), 2);
+        assert_eq!(
+            p.findings[0],
+            Finding {
+                start: (2, 4),
+                end: (2, 9),
+                severity: 1,
+                code: "E0308".to_string(),
+                source: Some("rustc".to_string()),
+                message: "mismatched types".to_string(),
+            }
+        );
+        assert_eq!(p.findings[1].source, None);
+        assert_eq!(p.findings[1].code, "");
+    }
+
+    // Everything here is text from another process on its way to a
+    // terminal. The control-character case is the same bug class
+    // `url::is_safe` exists for; the newline case is subtler and just as
+    // real, since every place these are drawn is one line per finding.
+    #[test]
+    fn text_from_a_server_is_made_safe_to_draw() {
+        let p = published(
+            "{\"uri\":\"file:///x\",\"diagnostics\":[{\"range\":{\"start\":{\"line\":0,\"character\":0},\"end\":{\"line\":0,\"character\":1}},\
+             \"message\":\"expected \\u001b[31mint\\u001b[0m,\\n  found str\\there\",\"source\":\"a\\nb\",\"code\":\"c\\u0007d\"}]}",
+        );
+        let f = &p.findings[0];
+        assert_eq!(f.message, "expected [31mint[0m, found str here");
+        assert!(!f.message.contains('\u{1b}'), "an escape would be spliced straight into the terminal");
+        assert!(!f.message.contains('\n') && !f.message.contains('\t'));
+        assert_eq!(f.source.as_deref(), Some("a b"));
+        assert_eq!(f.code, "cd");
+    }
+
+    #[test]
+    fn a_very_long_message_is_cut_rather_than_drawn_whole() {
+        let long = "x".repeat(5000);
+        let p = published(&format!(
+            r#"{{"uri":"file:///x","diagnostics":[{{"range":{{"start":{{"line":0,"character":0}},"end":{{"line":0,"character":1}}}},"message":"{long}"}}]}}"#
+        ));
+        let message = &p.findings[0].message;
+        assert!(message.chars().count() <= MAX_MESSAGE + 1, "{}", message.chars().count());
+        assert!(message.ends_with('\u{2026}'));
+    }
+
+    #[test]
+    fn the_awkward_shapes_a_real_server_actually_sends() {
+        // A numeric code (tsserver, and every compiler with numbered
+        // errors) is as common as a string one.
+        let p = published(
+            r#"{"uri":"file:///x","diagnostics":[{"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":1}},"code":2304,"message":"m"}]}"#,
+        );
+        assert_eq!(p.findings[0].code, "2304");
+        // No severity at all: read as the loudest, because a hint shown
+        // as an error is an annoyance and the reverse is a missed
+        // problem.
+        assert_eq!(p.findings[0].severity, 1);
+        // No version: the server isn't saying, so nothing can be gated
+        // on it.
+        assert_eq!(p.version, None);
+
+        // An end before its start would underline a negative width;
+        // read as an empty range at the start, keeping the finding.
+        let backwards = published(
+            r#"{"uri":"file:///x","diagnostics":[{"range":{"start":{"line":3,"character":8},"end":{"line":1,"character":0}},"message":"m"}]}"#,
+        );
+        assert_eq!(backwards.findings[0].start, (3, 8));
+        assert_eq!(backwards.findings[0].end, (3, 8));
+
+        // A finding with no range at all is dropped, but the ones
+        // around it survive -- one malformed entry must not cost the
+        // whole publication.
+        let mixed = published(
+            r#"{"uri":"file:///x","diagnostics":[{"message":"no range"},{"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":2}},"message":"good"}]}"#,
+        );
+        assert_eq!(mixed.findings.len(), 1);
+        assert_eq!(mixed.findings[0].message, "good");
+    }
+
+    #[test]
+    fn something_that_is_not_a_publication_is_not_read_as_one() {
+        assert_eq!(publication(&json::parse(r#"{"diagnostics":[]}"#).unwrap()), None, "no uri");
+        assert_eq!(publication(&json::parse(r#"{"uri":"file:///x"}"#).unwrap()), None, "no diagnostics");
+        assert_eq!(publication(&Value::Null), None);
+        // An empty list is a real publication: it is how a server
+        // withdraws everything it previously reported.
+        assert_eq!(published(r#"{"uri":"file:///x","diagnostics":[]}"#).findings, vec![]);
     }
 
     // The one that actually bites: a shell server matches on

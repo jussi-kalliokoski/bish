@@ -291,6 +291,42 @@ pub fn from_file_path(path: &std::path::Path) -> String {
     out
 }
 
+/// `from_file_path`'s inverse: the path a `file://` URL names, or `None`
+/// for anything that isn't one.
+///
+/// Needed because a language server's diagnostics arrive addressed by
+/// URI, and the only way to know which buffer they are about is to turn
+/// that back into the path the buffer was opened from.
+///
+/// Percent-decoding is byte-wise and the result is only accepted as
+/// UTF-8 -- a path bish could not have produced a URI for in the first
+/// place is better rejected than guessed at. An authority component
+/// (`file://host/path`) is rejected too: bish has no remote files, so a
+/// URI naming one is not about any buffer here.
+pub fn to_file_path(uri: &str) -> Option<std::path::PathBuf> {
+    let rest = uri.strip_prefix("file://")?;
+    // `file:///path` (empty authority) is the ordinary form; anything
+    // before the first `/` is a host we can't do anything with.
+    if !rest.starts_with('/') {
+        return None;
+    }
+    let bytes = rest.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            let hex = bytes.get(i + 1..i + 3)?;
+            let hex = std::str::from_utf8(hex).ok()?;
+            out.push(u8::from_str_radix(hex, 16).ok()?);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    Some(std::path::PathBuf::from(String::from_utf8(out).ok()?))
+}
+
 fn is_scheme_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.')
 }
@@ -301,6 +337,39 @@ mod tests {
 
     fn found(text: &str) -> Vec<String> {
         find(text).into_iter().map(|r| text.chars().skip(r.start).take(r.end - r.start).collect()).collect()
+    }
+
+    #[test]
+    fn a_file_path_round_trips_through_a_uri_including_the_awkward_characters() {
+        for path in [
+            "/plain/x.sh",
+            // The ones that actually break a naive encoder: a space and
+            // a `#` both mean something in a URI.
+            "/a dir/my file.rs",
+            "/proj/notes#1.md",
+            "/proj/100% done/x.py",
+            "/proj/a+b/c?d.ts",
+            // Non-ASCII goes byte-wise through UTF-8.
+            "/proj/\u{e4}\u{e4}kk\u{f6}nen/\u{1f30d}.md",
+        ] {
+            let uri = from_file_path(std::path::Path::new(path));
+            assert!(uri.starts_with("file:///"), "{uri}");
+            assert!(!uri.contains(' '), "a space must not survive unencoded: {uri}");
+            assert_eq!(to_file_path(&uri).as_deref(), Some(std::path::Path::new(path)), "via {uri}");
+        }
+    }
+
+    #[test]
+    fn only_a_local_file_url_is_a_path() {
+        assert_eq!(to_file_path("https://example.com/x"), None);
+        // An authority names a host, and bish has no remote buffers for
+        // one to be about.
+        assert_eq!(to_file_path("file://host/x"), None);
+        // Truncated or non-hex escapes are refused rather than guessed.
+        assert_eq!(to_file_path("file:///a%"), None);
+        assert_eq!(to_file_path("file:///a%zz"), None);
+        // Bytes that aren't UTF-8 are a path bish could not have named.
+        assert_eq!(to_file_path("file:///a%FF"), None);
     }
 
     #[test]

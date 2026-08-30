@@ -137,6 +137,18 @@ struct Document {
     // typing produces one `didChange` at a bounded delay instead of
     // never producing one at all while the typing continues.
     pending_since: Option<Instant>,
+    // The most recent `publishDiagnostics` for this document, and
+    // whether anyone has applied it yet.
+    //
+    // Kept rather than handed straight to a caller, because
+    // diagnostics arrive on the idle tick -- which has no buffer -- and
+    // are applied by the editor loop, which does. Holding the newest
+    // here means an update that arrives for a pane nobody is currently
+    // driving is waiting when they come back to it, rather than lost.
+    // Only the newest is worth keeping: a publication replaces the
+    // document's findings outright, it does not add to them.
+    published: Option<lsp::Publication>,
+    unapplied: bool,
 }
 
 pub struct Server {
@@ -390,6 +402,18 @@ impl Server {
                 }
                 None
             }
+            Message::Notification { method, params } if method == "textDocument/publishDiagnostics" => {
+                if let Some(publication) = lsp::publication(params)
+                    && let Some(document) = self.documents.iter_mut().find(|d| d.uri == publication.uri)
+                {
+                    document.published = Some(publication);
+                    document.unapplied = true;
+                }
+                // A publication for a document this server was never
+                // told about (or one already closed) is dropped: there
+                // is no buffer for it to be about.
+                None
+            }
             // A server's own log lines belong with the ones it wrote to
             // stderr, not in the caller's lap.
             Message::Notification { method, params } if method == "window/logMessage" || method == "window/showMessage" => {
@@ -555,7 +579,7 @@ impl Server {
         // Recorded before the send, not after: `send` holds the
         // notification until the handshake finishes, and a second open
         // arriving in the meantime must not queue a duplicate.
-        self.documents.push(Document { uri: uri.to_string(), version, pending_since: None });
+        self.documents.push(Document { uri: uri.to_string(), version, pending_since: None, published: None, unapplied: false });
         self.notify(
             "textDocument/didOpen",
             Value::Object(vec![(
@@ -591,6 +615,24 @@ impl Server {
         }
         let since = *document.pending_since.get_or_insert(now);
         now.duration_since(since) >= debounce
+    }
+
+    /// The newest diagnostics for this document if they haven't been
+    /// applied yet, marking them applied. `None` when nothing new has
+    /// arrived -- which is the answer on almost every idle tick, so this
+    /// is the cheap check the editor makes before doing any work.
+    ///
+    /// Deliberately does not drop them: a later call needs to be able to
+    /// re-apply the same findings after an edit cleared the buffer's
+    /// list, and re-publishing is the server's business, not something a
+    /// client can ask for.
+    pub fn take_diagnostics(&mut self, uri: &str) -> Option<&lsp::Publication> {
+        let document = self.documents.iter_mut().find(|d| d.uri == uri)?;
+        if !document.unapplied {
+            return None;
+        }
+        document.unapplied = false;
+        document.published.as_ref()
     }
 
     /// Sends the document's current text. A no-op when the server
@@ -1190,6 +1232,58 @@ mod tests {
     // A server describing itself with the options object means exactly
     // what it says, and sending it notifications it declined is noise on
     // a pipe with real work to carry.
+    // A server that publishes diagnostics the moment it is told about a
+    // document -- which is what every real one does.
+    fn publishing_server(uri: &str) -> Vec<String> {
+        let publish = format!(
+            r#"{{"jsonrpc":"2.0","method":"textDocument/publishDiagnostics","params":{{"uri":"{uri}","version":1,"diagnostics":[{{"range":{{"start":{{"line":0,"character":0}},"end":{{"line":0,"character":3}}}},"severity":2,"message":"careful"}}]}}}}"#
+        );
+        let init = format!(r#"{{"jsonrpc":"2.0","id":1,"result":{FULL_SYNC}}}"#);
+        let script = format!(
+            "printf 'Content-Length: %d\\r\\n\\r\\n%s' {} '{init}'; sleep 0.2; printf 'Content-Length: %d\\r\\n\\r\\n%s' {} '{publish}'; sleep 30",
+            init.len(),
+            publish.len()
+        );
+        vec!["sh".to_string(), "-c".to_string(), script]
+    }
+
+    #[test]
+    fn a_publication_waits_for_whoever_holds_the_buffer_and_is_delivered_once() {
+        let dir = temp_dir("publish");
+        let uri = "file:///p/x.sh";
+        let mut server = Server::start(1, &publishing_server(uri), "mock", &dir).unwrap();
+        run_until_ready(&mut server);
+        server.open_document(uri, "shellscript", 1, "one");
+
+        for _ in 0..400 {
+            server.service();
+            if server.take_diagnostics(uri).is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        // Consumed above; a second ask has nothing new to report, which
+        // is what keeps the editor from repainting on every idle tick.
+        assert!(server.take_diagnostics(uri).is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_publication_for_an_unknown_document_is_dropped() {
+        let dir = temp_dir("unknown");
+        let mut server = Server::start(1, &publishing_server("file:///p/never-opened.sh"), "mock", &dir).unwrap();
+        run_until_ready(&mut server);
+        server.open_document("file:///p/x.sh", "shellscript", 1, "one");
+        for _ in 0..200 {
+            server.service();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        // Nothing here is about any buffer, so nothing is kept.
+        assert!(server.take_diagnostics("file:///p/x.sh").is_none());
+        assert!(server.take_diagnostics("file:///p/never-opened.sh").is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn a_server_that_wants_no_documents_is_told_about_none() {
         let dir = temp_dir("nosync");

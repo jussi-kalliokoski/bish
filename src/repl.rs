@@ -5630,13 +5630,6 @@ impl NavBuffer {
     // toggle `set_readonly`/`breakpoints` in the first place. Vim-motion
     // content mutation is gated separately, at each individual
     // KeyOutcome/raw-key arm below, via `as_writable_mut`.
-    fn as_editable(&self) -> Option<&TextBuffer> {
-        match self {
-            NavBuffer::ReadOnly(_) => None,
-            NavBuffer::Editable(b) => Some(b),
-        }
-    }
-
     fn as_editable_mut(&mut self) -> Option<&mut TextBuffer> {
         match self {
             NavBuffer::ReadOnly(_) => None,
@@ -6470,7 +6463,7 @@ fn insert_idle(
     term_cols: &mut usize,
     sinks_are_grid: bool,
     session_id: SessionId,
-    buf: &TextBuffer,
+    buf: &mut TextBuffer,
 ) -> Option<fileeditor::IdleRedraw> {
     let repaint =
         service_background_jobs(sessions, windows, job_frames, *current_window, term_rows, term_cols, sinks_are_grid);
@@ -6480,7 +6473,10 @@ fn insert_idle(
     // calls this while stdin is quiet), which is exactly the settling
     // the debounce is measuring.
     sync_language_server_document(sessions, session_id, buf);
-    repaint.then(|| fileeditor::IdleRedraw {
+    // Diagnostics that arrived while the user was typing are drawn on
+    // the same tick they land, which is what makes them feel live.
+    let diagnosed = apply_language_server_diagnostics(sessions, session_id, buf);
+    (repaint || diagnosed).then(|| fileeditor::IdleRedraw {
         rect: pane_rect(&windows[*current_window], windows[*current_window].focused_pane, *term_rows, *term_cols),
         term_rows: *term_rows,
         term_cols: *term_cols,
@@ -6680,8 +6676,10 @@ fn run_normal_mode_navigation(
             // covers the case that matters most: the user has stopped
             // touching the keyboard, which is exactly when they are
             // waiting to see what the server has to say.
-            if let Some(tb) = buf.as_editable() {
+            let mut diagnosed = false;
+            if let Some(tb) = buf.as_editable_mut() {
                 sync_language_server_document(sessions, session_id, tb);
+                diagnosed = apply_language_server_diagnostics(sessions, session_id, tb);
             }
             // A job this pane stepped away from is still producing, and
             // the mode line's own "+N new lines below" has to keep up
@@ -6691,7 +6689,7 @@ fn run_normal_mode_navigation(
             // stays exactly where it was put (that's the whole point of
             // this mode), so only the status row actually changes.
             let grew = buf.new_lines_changed();
-            if attached || grew {
+            if attached || grew || diagnosed {
                 // compositor_redraw already ran (inside
                 // service_background_jobs), but that alone paints this
                 // pane blank if it's a `Frame::Edit` (see that
@@ -6998,7 +6996,7 @@ fn run_normal_mode_navigation(
                         &mut vk,
                         rect,
                         registers,
-                        &mut |tb: &TextBuffer| insert_idle(sessions, windows, job_frames, current_window, term_rows, term_cols, *sinks_are_grid, session_id, tb),
+                        &mut |tb: &mut TextBuffer| insert_idle(sessions, windows, job_frames, current_window, term_rows, term_cols, *sinks_are_grid, session_id, tb),
                         false,
                         insert_term_rows,
                         insert_term_cols,
@@ -7313,7 +7311,7 @@ fn run_normal_mode_navigation(
                         fileeditor::resolve_insert_start(tb, cmd);
                         let (insert_term_rows, insert_term_cols) = (*term_rows, *term_cols);
                         let insert_abbrs = sessions[&session_id].shell.abbrs.clone();
-                        fileeditor::run_insert_mode(tb, &mut vk, rect, registers, &mut |tb: &TextBuffer| insert_idle(sessions, windows, job_frames, current_window, term_rows, term_cols, *sinks_are_grid, session_id, tb), false, insert_term_rows, insert_term_cols, color_overrides.as_ref(), &[], &insert_abbrs)?;
+                        fileeditor::run_insert_mode(tb, &mut vk, rect, registers, &mut |tb: &mut TextBuffer| insert_idle(sessions, windows, job_frames, current_window, term_rows, term_cols, *sinks_are_grid, session_id, tb), false, insert_term_rows, insert_term_cols, color_overrides.as_ref(), &[], &insert_abbrs)?;
                     }
                     render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides.as_ref());
                 } else {
@@ -7333,7 +7331,7 @@ fn run_normal_mode_navigation(
                     if let Some(tb) = buf.as_writable_mut() {
                         let (insert_term_rows, insert_term_cols) = (*term_rows, *term_cols);
                         let insert_abbrs = sessions[&session_id].shell.abbrs.clone();
-                        fileeditor::run_insert_mode(tb, &mut vk, rect, registers, &mut |tb: &TextBuffer| insert_idle(sessions, windows, job_frames, current_window, term_rows, term_cols, *sinks_are_grid, session_id, tb), true, insert_term_rows, insert_term_cols, color_overrides.as_ref(), &[], &insert_abbrs)?;
+                        fileeditor::run_insert_mode(tb, &mut vk, rect, registers, &mut |tb: &mut TextBuffer| insert_idle(sessions, windows, job_frames, current_window, term_rows, term_cols, *sinks_are_grid, session_id, tb), true, insert_term_rows, insert_term_cols, color_overrides.as_ref(), &[], &insert_abbrs)?;
                     }
                     render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides.as_ref());
                 } else {
@@ -7430,7 +7428,7 @@ fn run_normal_mode_navigation(
                             if fileeditor::delete_motion(tb, registers, m, count, register) {
                                 let (insert_term_rows, insert_term_cols) = (*term_rows, *term_cols);
                                 let insert_abbrs = sessions[&session_id].shell.abbrs.clone();
-                                fileeditor::run_insert_mode(tb, &mut vk, rect, registers, &mut |tb: &TextBuffer| insert_idle(sessions, windows, job_frames, current_window, term_rows, term_cols, *sinks_are_grid, session_id, tb), false, insert_term_rows, insert_term_cols, color_overrides.as_ref(), &[], &insert_abbrs)?;
+                                fileeditor::run_insert_mode(tb, &mut vk, rect, registers, &mut |tb: &mut TextBuffer| insert_idle(sessions, windows, job_frames, current_window, term_rows, term_cols, *sinks_are_grid, session_id, tb), false, insert_term_rows, insert_term_cols, color_overrides.as_ref(), &[], &insert_abbrs)?;
                             }
                         }
                         Op::Lowercase | Op::Uppercase | Op::CaseToggle => {
@@ -7453,7 +7451,7 @@ fn run_normal_mode_navigation(
                             fileeditor::delete_lines(tb, registers, count, register);
                             let (insert_term_rows, insert_term_cols) = (*term_rows, *term_cols);
                             let insert_abbrs = sessions[&session_id].shell.abbrs.clone();
-                            fileeditor::run_insert_mode(tb, &mut vk, rect, registers, &mut |tb: &TextBuffer| insert_idle(sessions, windows, job_frames, current_window, term_rows, term_cols, *sinks_are_grid, session_id, tb), false, insert_term_rows, insert_term_cols, color_overrides.as_ref(), &[], &insert_abbrs)?;
+                            fileeditor::run_insert_mode(tb, &mut vk, rect, registers, &mut |tb: &mut TextBuffer| insert_idle(sessions, windows, job_frames, current_window, term_rows, term_cols, *sinks_are_grid, session_id, tb), false, insert_term_rows, insert_term_cols, color_overrides.as_ref(), &[], &insert_abbrs)?;
                         }
                         Op::Lowercase | Op::Uppercase | Op::CaseToggle => fileeditor::case_operator_lines(tb, count, fileeditor::case_kind_for_op(op)),
                         Op::Indent => fileeditor::indent_lines(tb, count),
@@ -7527,7 +7525,7 @@ fn run_normal_mode_navigation(
                     fileeditor::open_line(tb, above);
                     let (insert_term_rows, insert_term_cols) = (*term_rows, *term_cols);
                     let insert_abbrs = sessions[&session_id].shell.abbrs.clone();
-                    fileeditor::run_insert_mode(tb, &mut vk, rect, registers, &mut |tb: &TextBuffer| insert_idle(sessions, windows, job_frames, current_window, term_rows, term_cols, *sinks_are_grid, session_id, tb), false, insert_term_rows, insert_term_cols, color_overrides.as_ref(), &[], &insert_abbrs)?;
+                    fileeditor::run_insert_mode(tb, &mut vk, rect, registers, &mut |tb: &mut TextBuffer| insert_idle(sessions, windows, job_frames, current_window, term_rows, term_cols, *sinks_are_grid, session_id, tb), false, insert_term_rows, insert_term_cols, color_overrides.as_ref(), &[], &insert_abbrs)?;
                 }
                 render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides.as_ref());
             }
@@ -7752,6 +7750,51 @@ fn sync_language_server_document(sessions: &mut HashMap<SessionId, SessionState>
         return;
     }
     server.change_document(&target.uri, buf.version(), &fileeditor::buffer_text(buf));
+}
+
+// Applies whatever the language server has most recently said about
+// this buffer. `true` when the buffer's diagnostics actually changed,
+// which is the caller's cue to repaint.
+//
+// Runs from the same idle path as `sync_language_server_document`, and
+// for the same reason: a publication arrives whenever the server feels
+// like sending one, and the editor loop is the only thing holding the
+// buffer it describes.
+//
+// **Version-gated.** A publication naming a revision the buffer has
+// already left is dropped rather than drawn: its offsets address text
+// that no longer exists, and putting a squiggle under the wrong word is
+// worse than showing none. A server that says nothing about the version
+// is taken at its word, since there is nothing else to go on. This is
+// what `TextBuffer::version` was added for.
+fn apply_language_server_diagnostics(sessions: &mut HashMap<SessionId, SessionState>, session_id: SessionId, buf: &mut TextBuffer) -> bool {
+    let Some(session) = sessions.get(&session_id) else { return false };
+    let Some(target) = server_target(&session.shell, buf) else { return false };
+    let lsp = Rc::clone(&session.shell.lsp);
+    let mut table = lsp.borrow_mut();
+    let Some(server) = table.running(&target.display, &target.root) else { return false };
+    let encoding = server.encoding();
+    let Some(publication) = server.take_diagnostics(&target.uri) else { return false };
+    if publication.version.is_some_and(|v| v != buf.version()) {
+        return false;
+    }
+    let relayed = fileeditor::diagnostics_from_server(buf, &publication.findings, encoding);
+    drop(table);
+    // A publication replaces this server's findings outright, and
+    // leaves bish's own linter output (`:diag`, which sets no `source`)
+    // exactly where it was. The two coexist in one list precisely so
+    // that the gutter, the underlines and the diagnostics pane need to
+    // know nothing about where a finding came from.
+    let mut merged: Vec<lint::Diagnostic> = buf.diagnostics.iter().filter(|d| d.source.is_none()).cloned().collect();
+    merged.extend(relayed);
+    // Document order, so the diagnostics pane reads top to bottom
+    // however the two sources interleave.
+    merged.sort_by_key(|d| (d.start, d.end));
+    if merged == buf.diagnostics {
+        return false;
+    }
+    buf.diagnostics = merged;
+    true
 }
 
 // `:w` happened. Sent after the write rather than before it, so a
@@ -8998,7 +9041,19 @@ fn run_command_mode(
                         // something with a real buffer" gating as w/wq/x/q
                         // above -- there's nothing to diagnose without one.
                         "diag" | "diagnose" if arg.is_none() => {
-                            tb.diagnostics = fileeditor::diagnose_buffer(tb);
+                            // Replaces bish's own findings and leaves
+                            // a language server's alone -- the mirror
+                            // of what a publication does (see
+                            // apply_language_server_diagnostics). Both
+                            // write to this one list precisely so the
+                            // gutter, the underlines and the pane need
+                            // to know nothing about where a finding
+                            // came from, and that only works if each
+                            // source replaces exactly its own.
+                            let mut merged = fileeditor::diagnose_buffer(tb);
+                            merged.extend(tb.diagnostics.iter().filter(|d| d.source.is_some()).cloned());
+                            merged.sort_by_key(|d| (d.start, d.end));
+                            tb.diagnostics = merged;
                             let n = tb.diagnostics.len();
                             let output = if n == 0 { "No problems found.".to_string() } else { format!("{n} problem{} found.", if n == 1 { "" } else { "s" }) };
                             // Creates the collapsed diagnostics split
@@ -9043,6 +9098,11 @@ fn run_command_mode(
                         // exactly the pre-`:diag` state rather than
                         // leaving a stale "0 problems" bar behind.
                         "diag" | "diagnose" if arg == Some("clear") => {
+                            // `clear` really does mean all of them: a
+                            // server's findings would come back on its
+                            // next publication anyway, and a `clear`
+                            // that visibly left some behind would read
+                            // as broken.
                             tb.diagnostics.clear();
                             if let Some(Frame::Edit(edit_frame_id)) = windows[current_window].stack().last().copied()
                                 && let Some(pane_id) = diagnostics_sibling(&windows[current_window], edit_frame_id)
