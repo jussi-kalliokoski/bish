@@ -37,6 +37,7 @@ mod session;
 mod term;
 mod toml;
 mod tool;
+mod url;
 mod vt100;
 
 use std::io::{IsTerminal, Read};

@@ -2293,19 +2293,74 @@ fn highlighter_for(language: &str) -> Option<Box<dyn Highlighter>> {
 // still come out mis-highlighted. Narrower and pre-existing either way,
 // not something this change introduces or could fix without touching
 // lexer.rs's own heredoc-body capture.
+// The style layer on its own. Only the tests want it that way: the
+// render path needs both layers and takes them together, because they
+// come out of the same pass (see buffer_spans).
+#[cfg(test)]
 fn buffer_highlight_spans(buf: &TextBuffer, color_overrides: Option<&highlight::ColorOverrides>) -> Vec<StyledSpan> {
-    let Some(highlighter) = highlighter_for(&language_of(buf)) else {
-        return Vec::new();
-    };
+    buffer_spans(buf, color_overrides).0
+}
+
+// Both layers this buffer needs, from one run of the highlighter --
+// they come out of the same spans, and running the highlighter twice per
+// redraw to separate them would double the one real cost here.
+//
+// The link layer is where `HighlightSpan.link` finally goes somewhere:
+// it has always been populated (bash's resolved file paths, markdown's
+// link destinations) and has never been read. On top of those, every
+// buffer gets a pass for bare URLs in its text -- a URL in a comment, in
+// a `.env` value, in a commit message -- which is language-independent
+// because being a URL is.
+fn buffer_spans(
+    buf: &TextBuffer,
+    color_overrides: Option<&highlight::ColorOverrides>,
+) -> (Vec<StyledSpan>, Vec<highlight::LinkSpan>) {
     let text = buffer_text(buf);
-    highlighter
-        .highlight(&text, HighlightContext::default())
+    let mut spans = match highlighter_for(&language_of(buf)) {
+        Some(highlighter) => highlighter.highlight(&text, HighlightContext::default()),
+        None => Vec::new(),
+    };
+    // Appended after the language's own spans so it paints over them:
+    // a URL inside a string is a URL, and the underline that says so is
+    // the only cue that it can be clicked.
+    for found in crate::url::find(&text) {
+        let url: String = text.chars().skip(found.start).take(found.end - found.start).collect();
+        spans.push(highlight::HighlightSpan {
+            start: found.start,
+            end: found.end,
+            kind: highlight::HighlightKind::Link,
+            link: Some(url),
+        });
+    }
+    let links = spans
+        .iter()
+        .filter_map(|s| Some(highlight::LinkSpan { start: s.start, end: s.end, url: absolute_link(buf, s.link.as_deref()?)? }))
+        .collect();
+    let styled = spans
         .into_iter()
         .map(|s| {
             let (fg, attrs) = highlight::resolve_style(s.kind, color_overrides);
             StyledSpan { start: s.start, end: s.end, fg, attrs }
         })
-        .collect()
+        .collect();
+    (styled, links)
+}
+
+// A link target as something a terminal can actually open. Already a
+// URL, it is used as it is. Otherwise it is a relative path -- a
+// markdown link to a sibling document, most often -- and is resolved
+// against this buffer's own directory into a `file://` URL, which is
+// what makes clicking `[the plan](plan.md)` in a README go somewhere.
+// An unnamed buffer has no directory to resolve against, so a relative
+// target there stays underlined and unclickable rather than guessing.
+fn absolute_link(buf: &TextBuffer, target: &str) -> Option<String> {
+    if crate::url::parse(target).is_some() {
+        return Some(target.to_string());
+    }
+    let dir = buf.path()?.parent()?.to_path_buf();
+    let joined = dir.join(target);
+    let resolved = std::fs::canonicalize(&joined).unwrap_or(joined);
+    Some(format!("file://{}", resolved.display()))
 }
 
 // `:diag`'s own worker (see repl.rs's run_command_mode, the one caller):
@@ -2706,6 +2761,22 @@ fn spans_for_line(spans: &[StyledSpan], line_start: usize, line_len: usize) -> V
         .collect()
 }
 
+// spans_for_line's own sibling for the link layer -- same whole-buffer
+// char offsets, same per-line clamp, so a URL that a wrapped line
+// carries across two rows stays one link on both of them.
+fn links_for_line(links: &[highlight::LinkSpan], line_start: usize, line_len: usize) -> Vec<highlight::LinkSpan> {
+    let line_end = line_start + line_len;
+    links
+        .iter()
+        .filter(|l| l.start < line_end && l.end > line_start)
+        .map(|l| highlight::LinkSpan {
+            start: l.start.saturating_sub(line_start),
+            end: (l.end - line_start).min(line_len),
+            url: l.url.clone(),
+        })
+        .collect()
+}
+
 // Reuses editor.rs's own compose_redraw pipeline (BashHighlighter ->
 // StyledSpan -> highlight::compose -> highlight::render_styled), with
 // this editor's own selection highlighting (`highlights`, already
@@ -2767,6 +2838,7 @@ fn render_row(
     line_styled: &[StyledSpan],
     diag_styled: &[StyledSpan],
     highlights: &[StyledSpan],
+    links: &[highlight::LinkSpan],
 ) {
     let limit = end_cell.min(display.cells.len());
     let mut chars: Vec<char> = Vec::with_capacity(cols);
@@ -2808,8 +2880,13 @@ fn render_row(
     let diag_styled = clamp(diag_styled);
     let highlights = clamp(highlights);
 
+    let links: Vec<highlight::LinkSpan> = links
+        .iter()
+        .filter(|l| l.start < chars.len())
+        .map(|l| highlight::LinkSpan { start: l.start, end: l.end.min(chars.len()), url: l.url.clone() })
+        .collect();
     let cells = highlight::compose(&chars, &[&line_styled, &diag_styled, &highlights]);
-    let mut rendered = highlight::render_styled(&cells);
+    let mut rendered = highlight::render_linked(&cells, &links);
     if !buf.wrap.wrap {
         if truncated_right && !buf.wrap.extends.is_empty() {
             rendered = overlay_marker(&rendered, cols, &buf.wrap.extends, true);
@@ -2927,7 +3004,11 @@ pub fn build_editor_frame(
     // Computed once for the whole buffer, not per visible row -- see
     // buffer_highlight_spans's own doc comment for why a multi-line
     // construct needs that.
-    let whole_styled = buffer_highlight_spans(buf, color_overrides);
+    let (whole_styled, whole_links) = buffer_spans(buf, color_overrides);
+    // `hyperlinks` off means the text and only the text: the underline
+    // that marks a link stays (it is the language's own styling), but
+    // nothing is emitted for a terminal to make clickable.
+    let whole_links = if buf.hyperlinks { whole_links } else { Vec::new() };
     // Measured once for the whole frame, not per row -- every row has to
     // agree about where the columns are.
     let layout = tabular_layout(buf);
@@ -3009,8 +3090,15 @@ pub fn build_editor_frame(
             };
             let line_styled = map(spans_for_line(&whole_styled, starts[line], line_len));
             let diag_styled = map(diagnostic_spans_for_line(&buf.diagnostics, starts[line], line_len));
+            let links: Vec<highlight::LinkSpan> = links_for_line(&whole_links, starts[line], line_len)
+                .into_iter()
+                .filter_map(|l| {
+                    to_window(&display, start_cell, avail, l.start, l.end)
+                        .map(|(start, end)| highlight::LinkSpan { start, end, url: l.url })
+                })
+                .collect();
             out.push_str(&prefix);
-            render_row(&mut out, buf, &display, start_cell, end_cell, avail, &line_styled, &diag_styled, &highlights);
+            render_row(&mut out, buf, &display, start_cell, end_cell, avail, &line_styled, &diag_styled, &highlights, &links);
         }
     }
 
@@ -4521,6 +4609,46 @@ mod pre_save_hook_tests {
         assert_eq!(language_of(&buf_named(".vscode/launch.json")), "jsonc", "everything VS Code keeps in .vscode");
         // ...and a plain `.json` stays strict.
         assert_eq!(language_of(&buf_named("package.json")), "json");
+    }
+
+    // The URL pass runs whatever the language is, because being a URL
+    // isn't a property of the language around it.
+    #[test]
+    fn a_bare_url_becomes_a_link_in_any_buffer() {
+        let buf = buf_with_ext("ticket https://bugs.example.com/42 here", "txt");
+        let (_, links) = buffer_spans(&buf, None);
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].url, "https://bugs.example.com/42");
+    }
+
+    // ...and the sentence's punctuation is not the URL's.
+    #[test]
+    fn a_url_at_the_end_of_a_sentence_stops_before_the_full_stop() {
+        let buf = buf_with_ext("see https://example.com/x.", "txt");
+        let (_, links) = buffer_spans(&buf, None);
+        assert_eq!(links[0].url, "https://example.com/x");
+    }
+
+    // A markdown link to a sibling document is a relative path, which no
+    // terminal can open -- resolving it against the buffer's own
+    // directory is what makes clicking it go somewhere.
+    #[test]
+    fn a_relative_link_target_is_resolved_against_the_buffer_directory() {
+        let buf = buf_with_ext("[the plan](plan.md)", "md");
+        let (_, links) = buffer_spans(&buf, None);
+        let plan = links.iter().find(|l| l.url.ends_with("plan.md")).expect("the relative link");
+        assert!(plan.url.starts_with("file:///"), "got {}", plan.url);
+    }
+
+    // An unnamed buffer has no directory to resolve against, so a
+    // relative target stays underlined and unclickable rather than
+    // being guessed at.
+    #[test]
+    fn a_relative_link_in_an_unnamed_buffer_produces_no_link() {
+        let mut buf = TextBuffer::new_unnamed(10);
+        buf.insert_text((0, 0), "[the plan](plan.md)");
+        let (_, links) = buffer_spans(&buf, None);
+        assert!(links.is_empty());
     }
 
     #[test]

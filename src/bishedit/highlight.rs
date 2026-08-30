@@ -571,6 +571,43 @@ pub struct StyledSpan {
     pub attrs: vt100::CellAttrs,
 }
 
+// A run of characters that is a hyperlink, for OSC 8 emission.
+//
+// Its own type rather than a field on `StyledSpan` because a link is a
+// different axis from colour: it composes *with* whatever styling the
+// text already has instead of replacing it, and nineteen of the twenty
+// places that build a StyledSpan have nothing to say about links. This
+// is the same "build your own layer and hand it over" seam StyledSpan's
+// own doc comment describes, one axis along.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkSpan {
+    pub start: usize,
+    pub end: usize,
+    pub url: String,
+}
+
+// OSC 8, the terminal hyperlink: `ESC ] 8 ; params ; URI ST` opens one
+// and the same with an empty URI closes it. Terminals that don't know it
+// skip the whole sequence, which is why this needs no capability check
+// -- an OSC with an unknown number is defined to be ignored, and the
+// text between the two sequences is printed either way.
+fn osc8_open(url: &str) -> String {
+    format!("\x1b]8;;{url}\x1b\\")
+}
+
+const OSC8_CLOSE: &str = "\x1b]8;;\x1b\\";
+
+// Whether a URL is safe to put inside that sequence. The URL comes from
+// a *file* -- a markdown link's destination, a string in someone's
+// source -- and it is about to be spliced into an escape sequence, so a
+// control character in it would end the sequence early and hand the
+// terminal whatever followed as commands. Anything with one is dropped
+// rather than sanitized: a URL that needs repairing to be safe is a URL
+// nobody should be one click away from.
+fn is_safe_url(url: &str) -> bool {
+    !url.is_empty() && !url.chars().any(|c| c.is_control())
+}
+
 // Indexed(0-15), matching prompt.rs's own existing bold+low-8-ANSI
 // convention, not Rgb -- there's no light/dark-aware theme system yet to
 // make a fixed RGB choice safe.
@@ -682,15 +719,40 @@ pub fn compose(chars: &[char], layers: &[&[StyledSpan]]) -> Vec<vt100::Cell> {
 // already does for a live pane's grid, just fed synthesized cells instead
 // of ones read off a Screen.
 pub fn render_styled(cells: &[vt100::Cell]) -> String {
+    render_linked(cells, &[])
+}
+
+// The same, with OSC 8 hyperlinks opened and closed around the runs
+// `links` covers. Emitted exactly the way the SGR codes beside them are
+// -- on the transition, not per character -- so a link costs two escape
+// sequences however long it is.
+pub fn render_linked(cells: &[vt100::Cell], links: &[LinkSpan]) -> String {
     let mut out = String::new();
     let mut last: Option<(vt100::Color, vt100::Color, vt100::CellAttrs)> = None;
-    for cell in cells {
+    let mut open: Option<&str> = None;
+    for (i, cell) in cells.iter().enumerate() {
+        let url = links
+            .iter()
+            .find(|l| i >= l.start && i < l.end && is_safe_url(&l.url))
+            .map(|l| l.url.as_str());
+        if url != open {
+            if open.is_some() {
+                out.push_str(OSC8_CLOSE);
+            }
+            if let Some(url) = url {
+                out.push_str(&osc8_open(url));
+            }
+            open = url;
+        }
         let key = (cell.fg, cell.bg, cell.attrs);
         if last != Some(key) {
             out.push_str(&vt100::sgr_codes(cell.fg, cell.bg, cell.attrs));
             last = Some(key);
         }
         out.push(cell.ch);
+    }
+    if open.is_some() {
+        out.push_str(OSC8_CLOSE);
     }
     out.push_str("\x1b[0m");
     out
@@ -2548,5 +2610,65 @@ mod tests {
     #[test]
     fn dotenv_highlights_nothing_in_empty_input() {
         assert_eq!(dotenv_kinds(""), vec![]);
+    }
+
+    fn cells_of(text: &str) -> Vec<vt100::Cell> {
+        text.chars().map(|ch| vt100::Cell { ch, ..vt100::Cell::default() }).collect()
+    }
+
+    fn link(start: usize, end: usize, url: &str) -> LinkSpan {
+        LinkSpan { start, end, url: url.to_string() }
+    }
+
+    #[test]
+    fn render_linked_wraps_the_run_in_osc_8() {
+        let out = render_linked(&cells_of("see here now"), &[link(4, 8, "https://x")]);
+        assert!(out.contains("\x1b]8;;https://x\x1b\\here\x1b]8;;\x1b\\"), "got {out:?}");
+    }
+
+    // Emitted on the transition, like the SGR codes beside them: a link
+    // costs two sequences however long it is.
+    #[test]
+    fn render_linked_opens_and_closes_once_per_run() {
+        let out = render_linked(&cells_of("aaaa"), &[link(0, 4, "https://x")]);
+        assert_eq!(out.matches("\x1b]8;;https://x").count(), 1);
+        assert_eq!(out.matches("\x1b]8;;\x1b\\").count(), 1);
+    }
+
+    #[test]
+    fn render_linked_closes_a_link_that_runs_to_the_end() {
+        let out = render_linked(&cells_of("abc"), &[link(0, 3, "https://x")]);
+        assert!(out.contains("abc\x1b]8;;\x1b\\"), "got {out:?}");
+    }
+
+    #[test]
+    fn render_linked_handles_two_adjacent_links() {
+        let out = render_linked(&cells_of("abcd"), &[link(0, 2, "https://a"), link(2, 4, "https://b")]);
+        // The first run's close and the second's open sit back to back;
+        // the SGR reset for the default style lands between the open and
+        // the text, which is why this checks the pieces rather than one
+        // contiguous literal.
+        assert!(out.contains("\x1b]8;;https://a"), "got {out:?}");
+        assert!(out.contains("ab\x1b]8;;\x1b\\\x1b]8;;https://b\x1b\\cd"), "got {out:?}");
+    }
+
+    // The URL comes out of a file and is about to be spliced into an
+    // escape sequence, so one holding a control character is dropped
+    // rather than repaired.
+    #[test]
+    fn render_linked_refuses_a_url_that_could_break_out_of_the_sequence() {
+        for url in ["https://x\x1b]0;pwned\x07", "https://x\x07", "https://x\n", ""] {
+            let out = render_linked(&cells_of("abc"), &[link(0, 3, url)]);
+            assert!(!out.contains("\x1b]8;;"), "emitted a hyperlink for {url:?}");
+            assert!(out.contains("abc"));
+        }
+    }
+
+    // With no links this has to be byte-for-byte what it always was.
+    #[test]
+    fn render_styled_is_render_linked_with_nothing_to_link() {
+        let cells = cells_of("hello");
+        assert_eq!(render_styled(&cells), render_linked(&cells, &[]));
+        assert!(!render_styled(&cells).contains("\x1b]8"));
     }
 }

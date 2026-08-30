@@ -91,6 +91,11 @@ pub struct TextBuffer {
     // buffer. A *display* setting like `wrap`: the text is untouched,
     // only where padding is drawn between it changes.
     pub tabular: Option<crate::bishedit::tabular::Style>,
+    // The `hyperlinks` bishopt: whether links are drawn as real OSC 8
+    // hyperlinks. Only affects rendering -- the link spans are computed
+    // either way, since the styling that marks them comes from the same
+    // pass.
+    pub hyperlinks: bool,
     // Which visual row of `vtop`'s own line the viewport starts at. Only
     // ever non-zero with wrapping on, and only for a line tall enough to
     // exceed the pane by itself -- without it, a minified file would
@@ -169,6 +174,7 @@ impl TextBuffer {
             selections: Vec::new(),
             wrap: crate::bishedit::wrap::Options::default(),
             tabular: None,
+            hyperlinks: true,
             vtop_sub: 0,
             snippet_holes: Vec::new(),
             diagnostics: Vec::new(),
@@ -219,6 +225,7 @@ impl TextBuffer {
             selections: Vec::new(),
             wrap: crate::bishedit::wrap::Options::default(),
             tabular: None,
+            hyperlinks: true,
             vtop_sub: 0,
             snippet_holes: Vec::new(),
             diagnostics: Vec::new(),
@@ -718,6 +725,7 @@ mod tests {
             selections: Vec::new(),
             wrap: crate::bishedit::wrap::Options::default(),
             tabular: None,
+            hyperlinks: true,
             vtop_sub: 0,
             snippet_holes: Vec::new(),
             diagnostics: Vec::new(),

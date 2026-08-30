@@ -10560,6 +10560,13 @@ const KNOWN_BISHOPTS: &[(&str, BishOptDefault)] = &[
     // for, and the answer should stay one option as more of bish comes
     // to ask it -- the fuzzy finder next.
     ("gitignore", BishOptDefault::Bool(true)),
+    // Whether a URL, a markdown link's destination or a path that
+    // resolves is drawn as a real OSC 8 terminal hyperlink -- clickable
+    // where the terminal supports it. On: a terminal that doesn't know
+    // OSC 8 skips the sequence and shows the text exactly as before, so
+    // there is nothing to detect and nothing to degrade. Off is for
+    // wanting the text and only the text.
+    ("hyperlinks", BishOptDefault::Bool(true)),
 ];
 
 // Every bishopt option name, in registry order -- the source of truth

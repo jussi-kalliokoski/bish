@@ -5900,6 +5900,7 @@ fn wrap_options(shell: &exec::Shell) -> crate::bishedit::wrap::Options {
 fn apply_view_options(shell: &exec::Shell, buf: &mut TextBuffer) {
     buf.wrap = wrap_options(shell);
     buf.tabular = tabular_style(shell, &fileeditor::language_of(buf));
+    buf.hyperlinks = shell.bishopt_bool("hyperlinks");
 }
 
 // Whether this buffer's columns line up, and on what. Two conditions,
