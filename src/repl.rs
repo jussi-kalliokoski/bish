@@ -3,6 +3,8 @@ use std::collections::{HashMap, HashSet};
 use std::io::{self, Write};
 use std::rc::Rc;
 
+use std::path::PathBuf;
+
 use crate::lspclient;
 
 use crate::bishedit::completion;
@@ -2362,7 +2364,7 @@ fn run_edit_frame(
     // language server for this file wants a real buffer to ask about,
     // not a path.
     run_hooks(sessions, session_id, "editor:file:open", &buffer);
-    start_language_server(sessions, session_id, &buffer);
+    open_language_server_document(sessions, session_id, &buffer);
     // Where this editor frame actually lives -- captured once, before
     // any window command can move focus elsewhere. The Detached arm
     // below needs this pane's own rect to freeze into, not whatever
@@ -2409,6 +2411,9 @@ fn run_edit_frame(
                 // own BufUnload/BufDelete are both "before" too.
                 if let Some((tb, _)) = state {
                     run_hooks(sessions, session_id, "editor:file:close", tb);
+                    // Same moment, same reason: the buffer still exists,
+                    // so its URI is still resolvable.
+                    close_language_server_document(sessions, session_id, tb);
                 }
                 windows[*current_window].stack_mut().pop();
                 // Back to the primary screen, which still holds this
@@ -5625,6 +5630,13 @@ impl NavBuffer {
     // toggle `set_readonly`/`breakpoints` in the first place. Vim-motion
     // content mutation is gated separately, at each individual
     // KeyOutcome/raw-key arm below, via `as_writable_mut`.
+    fn as_editable(&self) -> Option<&TextBuffer> {
+        match self {
+            NavBuffer::ReadOnly(_) => None,
+            NavBuffer::Editable(b) => Some(b),
+        }
+    }
+
     fn as_editable_mut(&mut self) -> Option<&mut TextBuffer> {
         match self {
             NavBuffer::ReadOnly(_) => None,
@@ -6457,9 +6469,17 @@ fn insert_idle(
     term_rows: &mut usize,
     term_cols: &mut usize,
     sinks_are_grid: bool,
+    session_id: SessionId,
+    buf: &TextBuffer,
 ) -> Option<fileeditor::IdleRedraw> {
     let repaint =
         service_background_jobs(sessions, windows, job_frames, *current_window, term_rows, term_cols, sinks_are_grid);
+    // Typing is the case document synchronization exists for, and this
+    // is the only path that runs while it is happening -- keystrokes
+    // themselves never come back through here (the loop above only
+    // calls this while stdin is quiet), which is exactly the settling
+    // the debounce is measuring.
+    sync_language_server_document(sessions, session_id, buf);
     repaint.then(|| fileeditor::IdleRedraw {
         rect: pane_rect(&windows[*current_window], windows[*current_window].focused_pane, *term_rows, *term_cols),
         term_rows: *term_rows,
@@ -6654,6 +6674,15 @@ fn run_normal_mode_navigation(
         // loop uses, so behavior is identical once a byte does arrive.
         while !term::stdin_ready(editor::IDLE_POLL_MS) {
             let attached = service_background_jobs(sessions, windows, job_frames, *current_window, term_rows, term_cols, *sinks_are_grid);
+            // Normal-mode edits (`dd`, `p`, `x`, `>>`, and everything
+            // an Insert-mode session left behind on its way out) reach
+            // the server from here. This is the idle path, so it also
+            // covers the case that matters most: the user has stopped
+            // touching the keyboard, which is exactly when they are
+            // waiting to see what the server has to say.
+            if let Some(tb) = buf.as_editable() {
+                sync_language_server_document(sessions, session_id, tb);
+            }
             // A job this pane stepped away from is still producing, and
             // the mode line's own "+N new lines below" has to keep up
             // with it -- otherwise the count is only ever as fresh as the
@@ -6969,7 +6998,7 @@ fn run_normal_mode_navigation(
                         &mut vk,
                         rect,
                         registers,
-                        &mut || insert_idle(sessions, windows, job_frames, current_window, term_rows, term_cols, *sinks_are_grid),
+                        &mut |tb: &TextBuffer| insert_idle(sessions, windows, job_frames, current_window, term_rows, term_cols, *sinks_are_grid, session_id, tb),
                         false,
                         insert_term_rows,
                         insert_term_cols,
@@ -7284,7 +7313,7 @@ fn run_normal_mode_navigation(
                         fileeditor::resolve_insert_start(tb, cmd);
                         let (insert_term_rows, insert_term_cols) = (*term_rows, *term_cols);
                         let insert_abbrs = sessions[&session_id].shell.abbrs.clone();
-                        fileeditor::run_insert_mode(tb, &mut vk, rect, registers, &mut || insert_idle(sessions, windows, job_frames, current_window, term_rows, term_cols, *sinks_are_grid), false, insert_term_rows, insert_term_cols, color_overrides.as_ref(), &[], &insert_abbrs)?;
+                        fileeditor::run_insert_mode(tb, &mut vk, rect, registers, &mut |tb: &TextBuffer| insert_idle(sessions, windows, job_frames, current_window, term_rows, term_cols, *sinks_are_grid, session_id, tb), false, insert_term_rows, insert_term_cols, color_overrides.as_ref(), &[], &insert_abbrs)?;
                     }
                     render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides.as_ref());
                 } else {
@@ -7304,7 +7333,7 @@ fn run_normal_mode_navigation(
                     if let Some(tb) = buf.as_writable_mut() {
                         let (insert_term_rows, insert_term_cols) = (*term_rows, *term_cols);
                         let insert_abbrs = sessions[&session_id].shell.abbrs.clone();
-                        fileeditor::run_insert_mode(tb, &mut vk, rect, registers, &mut || insert_idle(sessions, windows, job_frames, current_window, term_rows, term_cols, *sinks_are_grid), true, insert_term_rows, insert_term_cols, color_overrides.as_ref(), &[], &insert_abbrs)?;
+                        fileeditor::run_insert_mode(tb, &mut vk, rect, registers, &mut |tb: &TextBuffer| insert_idle(sessions, windows, job_frames, current_window, term_rows, term_cols, *sinks_are_grid, session_id, tb), true, insert_term_rows, insert_term_cols, color_overrides.as_ref(), &[], &insert_abbrs)?;
                     }
                     render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides.as_ref());
                 } else {
@@ -7401,7 +7430,7 @@ fn run_normal_mode_navigation(
                             if fileeditor::delete_motion(tb, registers, m, count, register) {
                                 let (insert_term_rows, insert_term_cols) = (*term_rows, *term_cols);
                                 let insert_abbrs = sessions[&session_id].shell.abbrs.clone();
-                                fileeditor::run_insert_mode(tb, &mut vk, rect, registers, &mut || insert_idle(sessions, windows, job_frames, current_window, term_rows, term_cols, *sinks_are_grid), false, insert_term_rows, insert_term_cols, color_overrides.as_ref(), &[], &insert_abbrs)?;
+                                fileeditor::run_insert_mode(tb, &mut vk, rect, registers, &mut |tb: &TextBuffer| insert_idle(sessions, windows, job_frames, current_window, term_rows, term_cols, *sinks_are_grid, session_id, tb), false, insert_term_rows, insert_term_cols, color_overrides.as_ref(), &[], &insert_abbrs)?;
                             }
                         }
                         Op::Lowercase | Op::Uppercase | Op::CaseToggle => {
@@ -7424,7 +7453,7 @@ fn run_normal_mode_navigation(
                             fileeditor::delete_lines(tb, registers, count, register);
                             let (insert_term_rows, insert_term_cols) = (*term_rows, *term_cols);
                             let insert_abbrs = sessions[&session_id].shell.abbrs.clone();
-                            fileeditor::run_insert_mode(tb, &mut vk, rect, registers, &mut || insert_idle(sessions, windows, job_frames, current_window, term_rows, term_cols, *sinks_are_grid), false, insert_term_rows, insert_term_cols, color_overrides.as_ref(), &[], &insert_abbrs)?;
+                            fileeditor::run_insert_mode(tb, &mut vk, rect, registers, &mut |tb: &TextBuffer| insert_idle(sessions, windows, job_frames, current_window, term_rows, term_cols, *sinks_are_grid, session_id, tb), false, insert_term_rows, insert_term_cols, color_overrides.as_ref(), &[], &insert_abbrs)?;
                         }
                         Op::Lowercase | Op::Uppercase | Op::CaseToggle => fileeditor::case_operator_lines(tb, count, fileeditor::case_kind_for_op(op)),
                         Op::Indent => fileeditor::indent_lines(tb, count),
@@ -7498,7 +7527,7 @@ fn run_normal_mode_navigation(
                     fileeditor::open_line(tb, above);
                     let (insert_term_rows, insert_term_cols) = (*term_rows, *term_cols);
                     let insert_abbrs = sessions[&session_id].shell.abbrs.clone();
-                    fileeditor::run_insert_mode(tb, &mut vk, rect, registers, &mut || insert_idle(sessions, windows, job_frames, current_window, term_rows, term_cols, *sinks_are_grid), false, insert_term_rows, insert_term_cols, color_overrides.as_ref(), &[], &insert_abbrs)?;
+                    fileeditor::run_insert_mode(tb, &mut vk, rect, registers, &mut |tb: &TextBuffer| insert_idle(sessions, windows, job_frames, current_window, term_rows, term_cols, *sinks_are_grid, session_id, tb), false, insert_term_rows, insert_term_cols, color_overrides.as_ref(), &[], &insert_abbrs)?;
                 }
                 render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides.as_ref());
             }
@@ -7628,21 +7657,130 @@ fn tab_bar_line(sessions: &HashMap<SessionId, SessionState>, windows: &[WindowEn
 // optional convenience: the editor has to work exactly as well without
 // one. Same tolerance `run_hooks_for` already applies to a hook that
 // doesn't parse.
-fn start_language_server(sessions: &mut HashMap<SessionId, SessionState>, session_id: SessionId, buf: &TextBuffer) {
-    let Some(path) = buf.path() else { return };
-    let Some(session) = sessions.get(&session_id) else { return };
+// Everything needed to talk to the language server for one buffer,
+// resolved in a single place so the four document events can't disagree
+// about which server a file belongs to or what it is called.
+struct ServerTarget {
+    id: u64,
+    command: Vec<String>,
+    display: String,
+    root: PathBuf,
+    // The document's own identity as far as the protocol is concerned.
+    // Percent-encoded, because a server matches this string against its
+    // own idea of the same file (see url::from_file_path).
+    uri: String,
+    language_id: String,
+}
+
+// `None` -- meaning "this buffer has nothing to do with any language
+// server" -- for an unnamed buffer, a language nobody registered a
+// server for, `bishopt --unset lsp`, or a file with no project root
+// under it. Each of those is an ordinary state, not a failure.
+fn server_target(shell: &exec::Shell, buf: &TextBuffer) -> Option<ServerTarget> {
+    let path = buf.path()?;
     let language = fileeditor::language_of(buf);
-    let Some(declared) = session.shell.lsp_server_for(&language) else { return };
-    // An absolute path, so walking up for a root marker doesn't depend
-    // on where the shell happens to be.
+    let declared = shell.lsp_server_for(&language)?;
+    // Absolute, so walking up for a root marker doesn't depend on where
+    // the shell happens to be, and so the URI names one file however it
+    // was reached.
     let absolute = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    let Some(root) = lspclient::root_for(&absolute, &declared.root_markers) else { return };
-    let (id, command, display) = (declared.id, declared.command.clone(), declared.command_line());
+    let root = lspclient::root_for(&absolute, &declared.root_markers)?;
+    Some(ServerTarget {
+        id: declared.id,
+        command: declared.command.clone(),
+        display: declared.command_line(),
+        root,
+        uri: crate::url::from_file_path(&absolute),
+        language_id: crate::lsp::language_id(&language).to_string(),
+    })
+}
+
+// Starts the language server for this buffer's language if one is
+// registered and isn't already running for its project, and tells it
+// about the file.
+//
+// Called at exactly the moment `editor:file:open` fires, and for the
+// same reason: the buffer exists and its options are resolved, so its
+// language is knowable. The server usually isn't ready yet at this
+// point -- the handshake takes as long as it takes -- and that is
+// deliberately not waited for: `didOpen` is held in the server's own
+// queue and goes out the instant `initialized` does.
+//
+// Every failure is silent apart from what `::bish lsp status` will
+// show. The middle of opening a file is the worst place to interrupt
+// someone with a configuration problem, and a language server is an
+// optional convenience: the editor has to work exactly as well without
+// one. Same tolerance `run_hooks_for` already applies to a hook that
+// doesn't parse.
+fn open_language_server_document(sessions: &mut HashMap<SessionId, SessionState>, session_id: SessionId, buf: &TextBuffer) {
+    let Some(session) = sessions.get(&session_id) else { return };
+    let Some(target) = server_target(&session.shell, buf) else { return };
     let lsp = Rc::clone(&session.shell.lsp);
-    // The error is deliberately dropped here: `get_or_start` records it
-    // on the table, which is where `::bish lsp status` will show it, and
-    // there is nowhere sensible to print mid-open.
-    let _ = lsp.borrow_mut().get_or_start(id, &command, &display, &root);
+    let mut table = lsp.borrow_mut();
+    // The error is deliberately dropped: `get_or_start` records it on
+    // the table, which is where `::bish lsp status` shows it, and there
+    // is nowhere sensible to print mid-open.
+    let Ok(server) = table.get_or_start(target.id, &target.command, &target.display, &target.root) else { return };
+    server.open_document(&target.uri, &target.language_id, buf.version(), &fileeditor::buffer_text(buf));
+}
+
+// How long a buffer has to stop changing before the server hears about
+// it. Sending on every keystroke would be a whole-document message per
+// character; waiting for the user to stop typing entirely would mean
+// diagnostics that only ever appear after a pause long enough to
+// notice. This is the usual editor figure, and it is measured from the
+// *first* unsent change rather than the most recent one, so continuous
+// typing still produces updates at a bounded rate rather than none.
+const LSP_CHANGE_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(150);
+
+// One tick of document synchronization for the buffer being edited.
+//
+// Called from the idle path of the loops that actually drive a buffer,
+// which is the only place with both the live text and a moment to spare
+// -- the same reason those loops already do their own redraws rather
+// than leaving it to `compositor_redraw` (see run_normal_mode_
+// navigation's own idle block). A buffer's text is only ever built when
+// `needs_change` says something actually changed and settled, so the
+// common case -- nothing has been typed -- costs a version comparison.
+fn sync_language_server_document(sessions: &mut HashMap<SessionId, SessionState>, session_id: SessionId, buf: &TextBuffer) {
+    let Some(session) = sessions.get(&session_id) else { return };
+    let Some(target) = server_target(&session.shell, buf) else { return };
+    let lsp = Rc::clone(&session.shell.lsp);
+    let mut table = lsp.borrow_mut();
+    let Some(server) = table.running(&target.display, &target.root) else { return };
+    if !server.needs_change(&target.uri, buf.version(), std::time::Instant::now(), LSP_CHANGE_DEBOUNCE) {
+        return;
+    }
+    server.change_document(&target.uri, buf.version(), &fileeditor::buffer_text(buf));
+}
+
+// `:w` happened. Sent after the write rather than before it, so a
+// server that reruns a build on save is looking at what is actually on
+// disk.
+fn save_language_server_document(sessions: &mut HashMap<SessionId, SessionState>, session_id: SessionId, buf: &TextBuffer) {
+    let Some(session) = sessions.get(&session_id) else { return };
+    let Some(target) = server_target(&session.shell, buf) else { return };
+    let lsp = Rc::clone(&session.shell.lsp);
+    let mut table = lsp.borrow_mut();
+    let Some(server) = table.running(&target.display, &target.root) else { return };
+    // A save with unsent edits behind it would otherwise tell the server
+    // "this is saved" about a version it has never seen.
+    if server.has_document(&target.uri) {
+        server.change_document(&target.uri, buf.version(), &fileeditor::buffer_text(buf));
+        server.save_document(&target.uri, &fileeditor::buffer_text(buf));
+    }
+}
+
+// The buffer is going away. Fired while it still exists, which is what
+// makes the URI resolvable at all.
+fn close_language_server_document(sessions: &mut HashMap<SessionId, SessionState>, session_id: SessionId, buf: &TextBuffer) {
+    let Some(session) = sessions.get(&session_id) else { return };
+    let Some(target) = server_target(&session.shell, buf) else { return };
+    let lsp = Rc::clone(&session.shell.lsp);
+    let mut table = lsp.borrow_mut();
+    if let Some(server) = table.running(&target.display, &target.root) {
+        server.close_document(&target.uri);
+    }
 }
 
 fn run_hooks(sessions: &mut HashMap<SessionId, SessionState>, session_id: SessionId, event: &str, buf: &TextBuffer) {
@@ -8802,6 +8940,7 @@ fn run_command_mode(
                                     // written rather than what was
                                     // about to be.
                                     run_hooks(sessions, session_id, "editor:file:write:post", tb);
+                                    save_language_server_document(sessions, session_id, tb);
                                     sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry {
                                         command: trimmed,
                                         output: String::new(),

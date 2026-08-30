@@ -27,6 +27,7 @@ use std::collections::VecDeque;
 use std::io::{ErrorKind, Read, Write};
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
 
 use crate::json::{self, Value};
@@ -73,6 +74,71 @@ impl State {
     }
 }
 
+/// What a server said about how it wants documents synchronized, from
+/// its `textDocumentSync` capability.
+///
+/// Worth honouring rather than assuming: a server that says
+/// `openClose: false` is telling us it does not track documents at all,
+/// and sending it a `didOpen` for every file the user visits is pure
+/// noise on a pipe that has real work to carry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Sync {
+    pub open_close: bool,
+    pub change: bool,
+    pub save: bool,
+}
+
+impl Default for Sync {
+    // What to assume when the server said nothing at all. The spec's
+    // own default is `None` -- no sync whatsoever -- which would mean a
+    // server that simply forgot to describe itself gets told nothing and
+    // appears broken in a way that is very hard to see from the outside.
+    // Assuming full sync instead fails the other way: a server that
+    // really wanted nothing receives notifications it can ignore.
+    fn default() -> Sync {
+        Sync { open_close: true, change: true, save: false }
+    }
+}
+
+impl Sync {
+    /// `textDocumentSync` is either a bare kind number or an options
+    /// object, and both forms are common.
+    fn parse(capabilities: &Value) -> Sync {
+        match json::query(capabilities, ".textDocumentSync") {
+            // The number form names only the change kind; a server using
+            // it still expects open/close (there would be nothing for a
+            // change to be relative to otherwise).
+            Ok(Value::Number(kind)) => Sync { open_close: true, change: *kind > 0.0, save: false },
+            Ok(value @ Value::Object(_)) => Sync {
+                // The object form's fields really do all default to
+                // false, per the spec -- a server choosing this form is
+                // describing itself exactly.
+                open_close: matches!(json::query(value, ".openClose"), Ok(Value::Bool(true))),
+                change: matches!(json::query(value, ".change"), Ok(Value::Number(k)) if *k > 0.0),
+                // Either `true` or `{ includeText: bool }`; both mean
+                // "tell me about saves".
+                save: matches!(json::query(value, ".save"), Ok(Value::Bool(true)) | Ok(Value::Object(_))),
+            },
+            _ => Sync::default(),
+        }
+    }
+}
+
+// One document this server has been told about.
+struct Document {
+    uri: String,
+    // The buffer revision last actually sent. Not the buffer's current
+    // one -- the gap between them is precisely what `needs_change` is
+    // asking about.
+    version: u64,
+    // When this document first differed from what the server has been
+    // told, or `None` when it doesn't. The debounce is measured from
+    // here rather than from the most recent keystroke, so a burst of
+    // typing produces one `didChange` at a bounded delay instead of
+    // never producing one at all while the typing continues.
+    pending_since: Option<Instant>,
+}
+
 pub struct Server {
     /// The `exec::LspServer` declaration this was started from.
     pub id: u64,
@@ -112,7 +178,8 @@ pub struct Server {
     initialize_id: i64,
     encoding: PositionEncoding,
     capabilities: Value,
-    open_documents: usize,
+    sync: Sync,
+    documents: Vec<Document>,
 }
 
 impl Server {
@@ -171,7 +238,8 @@ impl Server {
             // it.
             encoding: PositionEncoding::Utf16,
             capabilities: Value::Null,
-            open_documents: 0,
+            sync: Sync::default(),
+            documents: Vec::new(),
         };
         let params = server.initialize_params();
         server.initialize_id = server.next_id;
@@ -205,9 +273,29 @@ impl Server {
                     // conversion and no chance of being off by one on
                     // any line containing an emoji.
                     ("general".to_string(), Value::Object(vec![("positionEncodings".to_string(), Value::Array(encodings))])),
-                    // Present but empty, which is legal and honest:
-                    // nothing about documents is supported yet.
-                    ("textDocument".to_string(), Value::Object(Vec::new())),
+                    (
+                        "textDocument".to_string(),
+                        Value::Object(vec![(
+                            "synchronization".to_string(),
+                            Value::Object(vec![
+                                // No dynamic registration anywhere: a
+                                // server that could ask to be told about
+                                // things at run time would be asking a
+                                // client that has no way to honour it.
+                                ("dynamicRegistration".to_string(), Value::Bool(false)),
+                                // `willSave` is declined deliberately.
+                                // It only earns its place alongside
+                                // `willSaveWaitUntil`, which lets a
+                                // server rewrite the buffer before it
+                                // hits disk -- and a save that blocks on
+                                // a language server is a save that can
+                                // hang, which `:w` must not.
+                                ("willSave".to_string(), Value::Bool(false)),
+                                ("willSaveWaitUntil".to_string(), Value::Bool(false)),
+                                ("didSave".to_string(), Value::Bool(true)),
+                            ]),
+                        )]),
+                    ),
                     ("workspace".to_string(), Value::Object(Vec::new())),
                 ]),
             ),
@@ -291,6 +379,7 @@ impl Server {
                             // is for.
                             _ => PositionEncoding::Utf16,
                         };
+                        self.sync = Sync::parse(&self.capabilities);
                         self.state = State::Ready;
                         self.send_now(Message::Notification { method: "initialized".to_string(), params: Value::Object(Vec::new()) });
                         for message in std::mem::take(&mut self.queued) {
@@ -444,6 +533,131 @@ impl Server {
     }
 
     // -----------------------------------------------------------------
+    // Documents
+    // -----------------------------------------------------------------
+    //
+    // Full-document sync throughout: every change carries the whole
+    // text. `buffer_text` already produces exactly that and is what
+    // `:diag` has always used, whereas incremental sync would need the
+    // buffer to *emit* its edits as ranges, which nothing in it does
+    // today -- a real refactor of every mutating path for a performance
+    // win nobody has measured. The declared capability says `Full`, and
+    // the whole-document form (`[{ "text": ... }]`) is a legal change
+    // event even for a server that asked for `Incremental`, so this
+    // stays correct against either.
+
+    /// Tells the server about a document it hasn't seen. A no-op if it
+    /// already knows, or if it said it doesn't track documents.
+    pub fn open_document(&mut self, uri: &str, language_id: &str, version: u64, text: &str) {
+        if !self.sync.open_close || self.has_document(uri) {
+            return;
+        }
+        // Recorded before the send, not after: `send` holds the
+        // notification until the handshake finishes, and a second open
+        // arriving in the meantime must not queue a duplicate.
+        self.documents.push(Document { uri: uri.to_string(), version, pending_since: None });
+        self.notify(
+            "textDocument/didOpen",
+            Value::Object(vec![(
+                "textDocument".to_string(),
+                Value::Object(vec![
+                    ("uri".to_string(), Value::Str(uri.to_string())),
+                    ("languageId".to_string(), Value::Str(language_id.to_string())),
+                    ("version".to_string(), Value::Number(version as f64)),
+                    ("text".to_string(), Value::Str(text.to_string())),
+                ]),
+            )]),
+        );
+    }
+
+    /// Whether this document has changed since the server was last told,
+    /// and has been settled long enough to be worth telling it.
+    ///
+    /// Asked on every idle tick, which is why it is separate from
+    /// `change_document`: producing the text means walking the whole
+    /// buffer, and doing that sixty times a second to discover nothing
+    /// has changed would be the one genuinely wasteful thing in this
+    /// path.
+    pub fn needs_change(&mut self, uri: &str, version: u64, now: Instant, debounce: Duration) -> bool {
+        if !self.sync.change {
+            return false;
+        }
+        let Some(document) = self.documents.iter_mut().find(|d| d.uri == uri) else {
+            return false;
+        };
+        if document.version == version {
+            document.pending_since = None;
+            return false;
+        }
+        let since = *document.pending_since.get_or_insert(now);
+        now.duration_since(since) >= debounce
+    }
+
+    /// Sends the document's current text. A no-op when the server
+    /// already has this version -- which is what makes it safe for
+    /// `save_document` to flush unconditionally rather than having to
+    /// ask first, and keeps a save that follows a settled edit from
+    /// sending the same document twice.
+    pub fn change_document(&mut self, uri: &str, version: u64, text: &str) {
+        let Some(document) = self.documents.iter_mut().find(|d| d.uri == uri) else {
+            return;
+        };
+        if document.version == version {
+            document.pending_since = None;
+            return;
+        }
+        document.version = version;
+        document.pending_since = None;
+        self.notify(
+            "textDocument/didChange",
+            Value::Object(vec![
+                (
+                    "textDocument".to_string(),
+                    Value::Object(vec![("uri".to_string(), Value::Str(uri.to_string())), ("version".to_string(), Value::Number(version as f64))]),
+                ),
+                ("contentChanges".to_string(), Value::Array(vec![Value::Object(vec![("text".to_string(), Value::Str(text.to_string()))])])),
+            ]),
+        );
+    }
+
+    pub fn save_document(&mut self, uri: &str, text: &str) {
+        if !self.sync.save || !self.has_document(uri) {
+            return;
+        }
+        // `text` is included unconditionally. A server that didn't ask
+        // for it (`save: true` rather than `{ includeText: true }`) is
+        // required to ignore the field, and sending it costs one copy of
+        // a file someone just pressed `:w` on -- cheap, against the
+        // alternative of a server that wanted it silently working from
+        // whatever it last saw.
+        self.notify(
+            "textDocument/didSave",
+            Value::Object(vec![
+                ("textDocument".to_string(), Value::Object(vec![("uri".to_string(), Value::Str(uri.to_string()))])),
+                ("text".to_string(), Value::Str(text.to_string())),
+            ]),
+        );
+    }
+
+    /// Tells the server the document is gone, and forgets it. After
+    /// this the server's diagnostics for it are its own to withdraw --
+    /// which is exactly why the editor sends this while the buffer still
+    /// exists rather than after it is dropped.
+    pub fn close_document(&mut self, uri: &str) {
+        if !self.has_document(uri) {
+            return;
+        }
+        self.documents.retain(|d| d.uri != uri);
+        if !self.sync.open_close {
+            return;
+        }
+        self.notify(
+            "textDocument/didClose",
+            Value::Object(vec![("textDocument".to_string(), Value::Object(vec![("uri".to_string(), Value::Str(uri.to_string()))]))]),
+        );
+    }
+
+    // -----------------------------------------------------------------
     // Winding down
     // -----------------------------------------------------------------
 
@@ -503,7 +717,16 @@ impl Server {
     }
 
     pub fn open_documents(&self) -> usize {
-        self.open_documents
+        self.documents.len()
+    }
+
+    /// How this server wants documents synchronized.
+    pub fn sync(&self) -> Sync {
+        self.sync
+    }
+
+    pub fn has_document(&self, uri: &str) -> bool {
+        self.documents.iter().any(|d| d.uri == uri)
     }
 
     /// The tail of what this server has written to stderr, plus this
@@ -616,6 +839,15 @@ impl Table {
 
     pub fn servers(&self) -> &[Server] {
         &self.servers
+    }
+
+    /// The already-running server for this command and root, if there is
+    /// one. Unlike `get_or_start`, this never spawns -- which is what
+    /// makes it the right thing for the document events, none of which
+    /// should bring a server into existence: only opening a file does
+    /// that.
+    pub fn running(&mut self, display: &str, root: &Path) -> Option<&mut Server> {
+        self.servers.iter_mut().find(|s| s.command == display && s.root == root)
     }
 
     /// The protocol's goodbye to every server, for a clean bish exit.
@@ -802,10 +1034,197 @@ mod tests {
     // lsp-mock` will be, once there is a conversation to script rather
     // than a single reply.
     fn mock_server(result: &str) -> Vec<String> {
+        mock_server_script(result, "sleep 30")
+    }
+
+    // The same mock, but echoing its stdin back instead of idling --
+    // which turns it into an observer of everything bish sends.
+    //
+    // Everything written to the server comes straight back and is
+    // decoded by `lsp::Decoder`, the same decoder unit-tested on its own
+    // above, so a test can assert on the exact messages, their order and
+    // their versions without a log file, a temp path, or any worry about
+    // when a pipe flushes. Document sync is all notifications, so
+    // nothing here can start a reply loop.
+    //
+    // This stops being enough at the point where replies have to vary by
+    // method (hover, definition), which is when a real scripted fixture
+    // in `src/testdata/` earns its place.
+    fn echo_server(result: &str) -> Vec<String> {
+        mock_server_script(result, "exec cat")
+    }
+
+    fn mock_server_script(result: &str, then: &str) -> Vec<String> {
         let body = format!(r#"{{"jsonrpc":"2.0","id":1,"result":{result}}}"#);
-        let script = format!("printf 'Content-Length: %d\\r\\n\\r\\n%s' {} '{body}'; sleep 30", body.len());
+        let script = format!("printf 'Content-Length: %d\\r\\n\\r\\n%s' {} '{body}'; {then}", body.len());
         vec!["sh".to_string(), "-c".to_string(), script]
     }
+
+    // Services until `want` `textDocument/*` notifications have come
+    // back, or time runs out. Anything else (the echoed `initialize`
+    // request, the echoed `initialized`) is not what these tests are
+    // about.
+    fn document_notifications(server: &mut Server, want: usize) -> Vec<(String, Value)> {
+        let mut seen = Vec::new();
+        for _ in 0..400 {
+            for message in server.service() {
+                if let Message::Notification { method, params } = message
+                    && method.starts_with("textDocument/")
+                {
+                    seen.push((method, params));
+                }
+            }
+            if seen.len() >= want {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        seen
+    }
+
+    const FULL_SYNC: &str = r#"{"capabilities":{"positionEncoding":"utf-32","textDocumentSync":{"openClose":true,"change":1,"save":true}}}"#;
+
+    fn ready_echo_server(dir: &Path) -> Server {
+        let mut server = Server::start(1, &echo_server(FULL_SYNC), "mock", dir).unwrap();
+        run_until_ready(&mut server);
+        assert_eq!(*server.state(), State::Ready, "log: {:?}", server.log().collect::<Vec<_>>());
+        server
+    }
+
+    #[test]
+    fn opening_a_document_tells_the_server_its_language_version_and_text() {
+        let dir = temp_dir("didopen");
+        let mut server = ready_echo_server(&dir);
+        assert_eq!(server.sync(), Sync { open_close: true, change: true, save: true });
+
+        server.open_document("file:///p/x.sh", "shellscript", 3, "echo hi\n");
+        let seen = document_notifications(&mut server, 1);
+        assert_eq!(seen.len(), 1, "{seen:?}");
+        let (method, params) = &seen[0];
+        assert_eq!(method, "textDocument/didOpen");
+        assert_eq!(json::query(params, ".textDocument.uri"), Ok(&Value::Str("file:///p/x.sh".to_string())));
+        assert_eq!(json::query(params, ".textDocument.languageId"), Ok(&Value::Str("shellscript".to_string())));
+        assert_eq!(json::query(params, ".textDocument.version"), Ok(&Value::Number(3.0)));
+        assert_eq!(json::query(params, ".textDocument.text"), Ok(&Value::Str("echo hi\n".to_string())));
+        assert_eq!(server.open_documents(), 1);
+
+        // Opening the same document again says nothing: the server
+        // already has it, and a second didOpen for one uri is a protocol
+        // error, not a refresh.
+        server.open_document("file:///p/x.sh", "shellscript", 4, "echo bye\n");
+        assert_eq!(server.open_documents(), 1);
+        assert!(document_notifications(&mut server, 2).len() < 2);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_change_waits_for_the_buffer_to_settle_and_then_sends_the_whole_document() {
+        let dir = temp_dir("didchange");
+        let mut server = ready_echo_server(&dir);
+        server.open_document("file:///p/x.sh", "shellscript", 1, "one");
+        document_notifications(&mut server, 1);
+
+        let debounce = Duration::from_millis(150);
+        let start = Instant::now();
+        // Unchanged: nothing to say, and no clock started.
+        assert!(!server.needs_change("file:///p/x.sh", 1, start, debounce));
+        // Changed, but only just -- this call is what starts the clock.
+        assert!(!server.needs_change("file:///p/x.sh", 2, start, debounce));
+        // Still typing: measured from the *first* unsent change, not the
+        // most recent one, so a burst still produces an update.
+        assert!(!server.needs_change("file:///p/x.sh", 3, start + Duration::from_millis(100), debounce));
+        assert!(server.needs_change("file:///p/x.sh", 3, start + debounce, debounce));
+
+        server.change_document("file:///p/x.sh", 3, "one two three");
+        let seen = document_notifications(&mut server, 1);
+        let (method, params) = seen.last().expect("a didChange");
+        assert_eq!(method, "textDocument/didChange");
+        assert_eq!(json::query(params, ".textDocument.version"), Ok(&Value::Number(3.0)));
+        // Full sync: one change event carrying the entire document, with
+        // no range -- which is a legal change event for an incremental
+        // server too.
+        assert_eq!(json::query(params, ".contentChanges[0].text"), Ok(&Value::Str("one two three".to_string())));
+        assert_eq!(json::query(params, ".contentChanges[0].range"), Ok(&Value::Null));
+
+        // Sent: the clock resets, so an idle editor stops asking.
+        assert!(!server.needs_change("file:///p/x.sh", 3, start + Duration::from_secs(10), debounce));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // A save that reported a version the server had never been told
+    // about would be describing a file it cannot reconstruct.
+    #[test]
+    fn saving_flushes_a_pending_change_before_announcing_the_save() {
+        let dir = temp_dir("didsave");
+        let mut server = ready_echo_server(&dir);
+        server.open_document("file:///p/x.sh", "shellscript", 1, "one");
+        server.change_document("file:///p/x.sh", 2, "one two");
+        // The flush a save does is unconditional, so this second call
+        // must not put the same document on the wire twice.
+        server.change_document("file:///p/x.sh", 2, "one two");
+        server.save_document("file:///p/x.sh", "one two");
+        let seen = document_notifications(&mut server, 3);
+        let methods: Vec<&str> = seen.iter().map(|(m, _)| m.as_str()).collect();
+        assert_eq!(methods, vec!["textDocument/didOpen", "textDocument/didChange", "textDocument/didSave"], "{methods:?}");
+        assert_eq!(json::query(&seen[2].1, ".text"), Ok(&Value::Str("one two".to_string())));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn closing_a_document_tells_the_server_and_forgets_it() {
+        let dir = temp_dir("didclose");
+        let mut server = ready_echo_server(&dir);
+        server.open_document("file:///p/x.sh", "shellscript", 1, "one");
+        server.close_document("file:///p/x.sh");
+        assert_eq!(server.open_documents(), 0);
+        assert!(!server.has_document("file:///p/x.sh"));
+        let methods: Vec<String> = document_notifications(&mut server, 2).into_iter().map(|(m, _)| m).collect();
+        assert_eq!(methods, vec!["textDocument/didOpen".to_string(), "textDocument/didClose".to_string()]);
+
+        // Closing what isn't open says nothing at all.
+        server.close_document("file:///p/other.sh");
+        assert!(document_notifications(&mut server, 3).len() < 3);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // A server describing itself with the options object means exactly
+    // what it says, and sending it notifications it declined is noise on
+    // a pipe with real work to carry.
+    #[test]
+    fn a_server_that_wants_no_documents_is_told_about_none() {
+        let dir = temp_dir("nosync");
+        let capabilities = r#"{"capabilities":{"textDocumentSync":{"openClose":false,"change":0,"save":false}}}"#;
+        let mut server = Server::start(1, &echo_server(capabilities), "mock", &dir).unwrap();
+        run_until_ready(&mut server);
+        assert_eq!(server.sync(), Sync { open_close: false, change: false, save: false });
+
+        server.open_document("file:///p/x.sh", "shellscript", 1, "one");
+        assert_eq!(server.open_documents(), 0);
+        assert!(!server.needs_change("file:///p/x.sh", 2, Instant::now(), Duration::ZERO));
+        server.save_document("file:///p/x.sh", "one");
+        assert!(document_notifications(&mut server, 1).is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_sync_capability_is_read_from_either_form_a_server_may_use() {
+        // The bare-number form names only the change kind; a server
+        // using it still expects open/close.
+        let number = json::parse(r#"{"textDocumentSync":2}"#).unwrap();
+        assert_eq!(Sync::parse(&number), Sync { open_close: true, change: true, save: false });
+        let none = json::parse(r#"{"textDocumentSync":0}"#).unwrap();
+        assert_eq!(Sync::parse(&none), Sync { open_close: true, change: false, save: false });
+        // `save` may be a bool or an options object; both mean yes.
+        let object = json::parse(r#"{"textDocumentSync":{"openClose":true,"change":1,"save":{"includeText":true}}}"#).unwrap();
+        assert_eq!(Sync::parse(&object), Sync { open_close: true, change: true, save: true });
+        // Said nothing at all: assume full sync rather than the spec's
+        // own `None` default, so a server that merely forgot to describe
+        // itself still works. See `Sync::default`.
+        assert_eq!(Sync::parse(&Value::Object(Vec::new())), Sync::default());
+        assert!(Sync::default().open_close && Sync::default().change);
+    }
+
+
 
     fn run_until_ready(server: &mut Server) {
         for _ in 0..400 {

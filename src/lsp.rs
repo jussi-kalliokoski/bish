@@ -291,6 +291,37 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 }
 
 // ---------------------------------------------------------------------
+// Languages
+// ---------------------------------------------------------------------
+
+/// bish's own language name (`fileeditor::language_of`) as the
+/// `languageId` a server expects on `textDocument/didOpen`.
+///
+/// LSP defines a vocabulary for this, and it is a real vocabulary
+/// rather than a free-for-all: a server decides whether a document is
+/// any of its business by comparing this string, so `bash` where the
+/// spec says `shellscript` means a shell language server silently
+/// ignores every file bish opens.
+///
+/// Almost all of bish's names already are the spec's, which is why this
+/// is a short table of exceptions over an identity fallback rather than
+/// a full map. A name with no LSP equivalent at all (`roff`, `dotenv`,
+/// `csv`) passes through unchanged: no server speaks them today, and
+/// inventing a translation for a conversation nobody is having would be
+/// guessing.
+pub fn language_id(language: &str) -> &str {
+    match language {
+        // The one that actually bites. Every shell server (bash-language-
+        // server, shellcheck-ls) matches on `shellscript`.
+        "bash" => "shellscript",
+        // The spec's name for "no particular language", which is what
+        // `language_of` returns `text` for.
+        "text" => "plaintext",
+        other => other,
+    }
+}
+
+// ---------------------------------------------------------------------
 // Positions
 // ---------------------------------------------------------------------
 
@@ -561,6 +592,23 @@ mod tests {
         // Mid-character resolves to that character's own start.
         assert_eq!(from_server_column(&line, 2, PositionEncoding::Utf16), 1);
         assert_eq!(from_server_column(&line, 3, PositionEncoding::Utf8), 1);
+    }
+
+    // The one that actually bites: a shell server matches on
+    // `shellscript`, so bish's own `bash` would make it ignore every
+    // file the editor opens.
+    #[test]
+    fn a_language_name_is_translated_only_where_lsp_uses_a_different_one() {
+        assert_eq!(language_id("bash"), "shellscript");
+        assert_eq!(language_id("text"), "plaintext");
+        // Almost everything already agrees, which is why this is a table
+        // of exceptions over an identity fallback.
+        for same in ["rust", "python", "typescript", "json", "yaml", "markdown", "ruby", "elixir"] {
+            assert_eq!(language_id(same), same);
+        }
+        // A name LSP has no equivalent for passes through rather than
+        // being guessed at.
+        assert_eq!(language_id("roff"), "roff");
     }
 
     #[test]
