@@ -59,6 +59,14 @@ struct SessionState {
     /// naming a language-server type. Both handles point at the same
     /// `RefCell`; this is the one with the real API on it.
     lsp: Rc<RefCell<lspclient::Table>>,
+    /// Project roots already worked out by a `--root-cmd`, keyed by the
+    /// directory the question was asked from.
+    ///
+    /// Memoised because `server_target` runs on every idle tick, and a
+    /// root command is a real process -- `cargo metadata` takes the
+    /// better part of a second on a cold cache. Resolved once when a
+    /// document is opened, and read back from here afterwards.
+    lsp_roots: HashMap<PathBuf, PathBuf>,
     buffer: String,
     // Whether `buffer` is off the record -- see leading_space_suppresses
     // _history. Decided on the first line of a fresh command and left
@@ -596,6 +604,7 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
         SessionState {
             shell,
             lsp: root_lsp,
+            lsp_roots: HashMap::new(),
             buffer: String::new(),
             buffer_unrecorded: false,
             history: History::load(".bish_history"),
@@ -1901,6 +1910,7 @@ fn run_edit_impl(targets: &[fileeditor::EditTarget], attach_debug: bool) -> i32 
         SessionState {
             shell,
             lsp: root_lsp,
+            lsp_roots: HashMap::new(),
             buffer: String::new(),
             buffer_unrecorded: false,
             history: History::load(".bish_history"),
@@ -3716,6 +3726,7 @@ fn apply_window_action(
                 SessionState {
                     shell: child_shell,
             lsp: child_lsp,
+            lsp_roots: HashMap::new(),
                     buffer: String::new(),
                     buffer_unrecorded: false,
                     // A fork of the parent's own History (see its doc
@@ -3870,6 +3881,7 @@ fn split_focused_pane(
         SessionState {
             shell: child_shell,
             lsp: child_lsp,
+            lsp_roots: HashMap::new(),
             buffer: String::new(),
             buffer_unrecorded: false,
             // See WindowAction::New's own comment on forking the
@@ -3946,6 +3958,7 @@ fn split_diagnostics_pane(
         SessionState {
             shell: child_shell,
             lsp: child_lsp,
+            lsp_roots: HashMap::new(),
             buffer: String::new(),
             buffer_unrecorded: false,
             history: child_history,
@@ -3998,6 +4011,7 @@ fn split_locations_pane(
         SessionState {
             shell: child_shell,
             lsp: child_lsp,
+            lsp_roots: HashMap::new(),
             buffer: String::new(),
             buffer_unrecorded: false,
             history: child_history,
@@ -4110,6 +4124,7 @@ fn split_debug_run_pane(
         SessionState {
             shell: child_shell,
             lsp: child_lsp,
+            lsp_roots: HashMap::new(),
             buffer: String::new(),
             buffer_unrecorded: false,
             history: child_history,
@@ -8237,7 +8252,7 @@ fn run_normal_mode_navigation(
                     .unwrap_or_default();
                     // Relative to the project root when there is one, so
                     // the interesting part of a long path is what shows.
-                    let base = server_target(&sessions[&session_id].shell, tb).map(|t| t.root);
+                    let base = server_target(&sessions[&session_id], tb).map(|t| t.root);
                     let title = match found.len() {
                         0 => "No references found".to_string(),
                         1 => "1 reference".to_string(),
@@ -8276,7 +8291,7 @@ fn run_normal_mode_navigation(
                 if let NavBuffer::Editable(tb) = &buf {
                     let (row, col) = tb.cursor();
                     let encoding = server_encoding_for(sessions, session_id, tb).unwrap_or(crate::lsp::PositionEncoding::Utf16);
-                    let uri = server_target(&sessions[&session_id].shell, tb).map(|t| t.uri).unwrap_or_default();
+                    let uri = server_target(&sessions[&session_id], tb).map(|t| t.uri).unwrap_or_default();
                     let found = ask_server_at_cursor(
                         sessions,
                         windows,
@@ -8775,15 +8790,21 @@ struct ServerTarget {
 // server" -- for an unnamed buffer, a language nobody registered a
 // server for, `bishopt --unset lsp`, or a file with no project root
 // under it. Each of those is an ordinary state, not a failure.
-fn server_target(shell: &exec::Shell, buf: &TextBuffer) -> Option<ServerTarget> {
+fn server_target(session: &SessionState, buf: &TextBuffer) -> Option<ServerTarget> {
     let path = buf.path()?;
     let language = fileeditor::language_of(buf);
-    let declared = shell.lsp_server_for(&language)?;
+    let declared = session.shell.lsp_server_for(&language)?;
     // Absolute, so walking up for a root marker doesn't depend on where
     // the shell happens to be, and so the URI names one file however it
     // was reached.
     let absolute = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    let root = lspclient::root_for(&absolute, &declared.root_markers)?;
+    // A `--root-cmd`'s answer, when one was worked out at open time,
+    // beats the markers -- it is the only thing that can know a Cargo
+    // workspace root, or any other root a build tool alone can compute.
+    let root = match absolute.parent().and_then(|dir| session.lsp_roots.get(dir)) {
+        Some(root) => root.clone(),
+        None => lspclient::root_for(&absolute, &declared.root_markers)?,
+    };
     Some(ServerTarget {
         id: declared.id,
         command: declared.command.clone(),
@@ -8792,6 +8813,79 @@ fn server_target(shell: &exec::Shell, buf: &TextBuffer) -> Option<ServerTarget> 
         uri: crate::url::from_file_path(&absolute),
         language_id: crate::lsp::language_id(&language).to_string(),
     })
+}
+
+// Runs a server's `--root-cmd` and takes its first line of output as
+// the project root.
+//
+// Run through **bish's own shell**, not `/bin/sh`. The command is
+// configured in a bishrc by someone writing bish, and the natural
+// spelling of the case this exists for --
+// `cargo metadata --format-version 1 | json -r .workspace_root` --
+// uses `json`, which is a bish *builtin* and so does not exist for
+// `sh`. Discovered exactly that way: the documented example silently
+// fell back to the markers because `sh` could not find `json`.
+//
+// Wrapped in a subshell with a `cd`, so the command sees the file's own
+// directory without the session's cwd moving under the user. Output is
+// captured with the same borrow-and-give-back the hook runner uses (see
+// `run_hooks_for`), and `$?` is put back for the same reason: this is
+// not a command the user ran.
+//
+// `None` on anything unconvincing -- a failure, no output, a relative
+// path, a directory that is not there -- and the caller falls back to
+// the `--root` markers. A root command that half-works must not produce
+// a server pointed at the wrong tree.
+fn root_from_command(command: &str, dir: &Path) -> Option<PathBuf> {
+    // Run as `bish -c` in a process of its own, with the file's own
+    // directory as its cwd.
+    //
+    // Not `/bin/sh`: the natural spelling of the case this exists for
+    // uses `json`, which is a bish *builtin* and so does not exist for
+    // sh -- the first version of this documented an example that
+    // silently fell back to the markers for exactly that reason.
+    //
+    // And not the session's own shell either, which was the second
+    // attempt: the command has to run somewhere a `cd` cannot move the
+    // session's cwd, which means a subshell, and neither borrowing the
+    // output sink nor a command substitution into a variable brought
+    // that subshell's output back. A separate process has no such
+    // question -- its stdout is a pipe this reads -- and the cost is one
+    // spawn per directory, memoised (see `SessionState::lsp_roots`).
+    let exe = std::env::current_exe().ok()?;
+    let output = std::process::Command::new(exe).arg("-c").arg(command).current_dir(dir).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let root = PathBuf::from(text.lines().next()?.trim());
+    // `None` on anything unconvincing -- no output, a relative path, a
+    // directory that is not there -- so the caller falls back to the
+    // `--root` markers. A root command that half-works must not leave a
+    // server pointed at the wrong tree.
+    (root.is_absolute() && root.is_dir()).then_some(root)
+}
+
+// Works out this file's project root with the declared `--root-cmd`, if
+// there is one and it has not been asked already, and remembers it.
+fn resolve_root_command(sessions: &mut HashMap<SessionId, SessionState>, session_id: SessionId, buf: &TextBuffer) {
+    let Some(session) = sessions.get(&session_id) else { return };
+    let Some(path) = buf.path() else { return };
+    let language = fileeditor::language_of(buf);
+    let Some(declared) = session.shell.lsp_server_for(&language) else { return };
+    if declared.root_cmd.is_empty() {
+        return;
+    }
+    let command = declared.root_cmd.clone();
+    let absolute = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let Some(dir) = absolute.parent().map(|d| d.to_path_buf()) else { return };
+    if session.lsp_roots.contains_key(&dir) {
+        return;
+    }
+    let Some(root) = root_from_command(&command, &dir) else { return };
+    if let Some(session) = sessions.get_mut(&session_id) {
+        session.lsp_roots.insert(dir, root);
+    }
 }
 
 // Starts the language server for this buffer's language if one is
@@ -8812,8 +8906,14 @@ fn server_target(shell: &exec::Shell, buf: &TextBuffer) -> Option<ServerTarget> 
 // one. Same tolerance `run_hooks_for` already applies to a hook that
 // doesn't parse.
 fn open_language_server_document(sessions: &mut HashMap<SessionId, SessionState>, session_id: SessionId, buf: &TextBuffer) {
+    // A `--root-cmd` is resolved here and only here: this is the one
+    // moment per file, where paying for a real process is fine, and
+    // every later `server_target` reads the answer back from the memo
+    // (see `SessionState::lsp_roots`) rather than running it again on
+    // each idle tick.
+    resolve_root_command(sessions, session_id, buf);
     let Some(session) = sessions.get(&session_id) else { return };
-    let Some(target) = server_target(&session.shell, buf) else { return };
+    let Some(target) = server_target(session, buf) else { return };
     let lsp = Rc::clone(&session.lsp);
     let mut table = lsp.borrow_mut();
     // The error is deliberately dropped: `get_or_start` records it on
@@ -8843,7 +8943,7 @@ const LSP_CHANGE_DEBOUNCE: std::time::Duration = std::time::Duration::from_milli
 // common case -- nothing has been typed -- costs a version comparison.
 fn sync_language_server_document(sessions: &mut HashMap<SessionId, SessionState>, session_id: SessionId, buf: &TextBuffer) {
     let Some(session) = sessions.get(&session_id) else { return };
-    let Some(target) = server_target(&session.shell, buf) else { return };
+    let Some(target) = server_target(session, buf) else { return };
     let lsp = Rc::clone(&session.lsp);
     let mut table = lsp.borrow_mut();
     let Some(server) = table.running(&target.display, &target.root) else { return };
@@ -9401,7 +9501,7 @@ fn ask_server(
     mut params: Vec<(String, crate::json::Value)>,
 ) -> Option<crate::json::Value> {
     let session = sessions.get(&session_id)?;
-    let target = server_target(&session.shell, buf)?;
+    let target = server_target(session, buf)?;
     let timeout = std::time::Duration::from_millis(session.shell.bishopt_int("lsp_timeout_ms").max(0) as u64);
     let lsp = Rc::clone(&session.lsp);
 
@@ -9446,7 +9546,7 @@ fn ask_server(
 // arithmetic is moot anyway.
 fn server_encoding_for(sessions: &HashMap<SessionId, SessionState>, session_id: SessionId, buf: &TextBuffer) -> Option<crate::lsp::PositionEncoding> {
     let session = sessions.get(&session_id)?;
-    let target = server_target(&session.shell, buf)?;
+    let target = server_target(session, buf)?;
     let lsp = Rc::clone(&session.lsp);
     let mut table = lsp.borrow_mut();
     Some(table.running(&target.display, &target.root)?.encoding())
@@ -9517,7 +9617,7 @@ fn goto_location(
 // the next idle tick. See `Server::redeliver_diagnostics`.
 fn redeliver_language_server_diagnostics(sessions: &mut HashMap<SessionId, SessionState>, session_id: SessionId, buf: &TextBuffer) {
     let Some(session) = sessions.get(&session_id) else { return };
-    let Some(target) = server_target(&session.shell, buf) else { return };
+    let Some(target) = server_target(session, buf) else { return };
     let lsp = Rc::clone(&session.lsp);
     let mut table = lsp.borrow_mut();
     if let Some(server) = table.running(&target.display, &target.root) {
@@ -9542,7 +9642,7 @@ fn redeliver_language_server_diagnostics(sessions: &mut HashMap<SessionId, Sessi
 // what `TextBuffer::version` was added for.
 fn apply_language_server_diagnostics(sessions: &mut HashMap<SessionId, SessionState>, session_id: SessionId, buf: &mut TextBuffer) -> bool {
     let Some(session) = sessions.get(&session_id) else { return false };
-    let Some(target) = server_target(&session.shell, buf) else { return false };
+    let Some(target) = server_target(session, buf) else { return false };
     let lsp = Rc::clone(&session.lsp);
     let mut table = lsp.borrow_mut();
     let Some(server) = table.running(&target.display, &target.root) else { return false };
@@ -9575,7 +9675,7 @@ fn apply_language_server_diagnostics(sessions: &mut HashMap<SessionId, SessionSt
 // disk.
 fn save_language_server_document(sessions: &mut HashMap<SessionId, SessionState>, session_id: SessionId, buf: &TextBuffer) {
     let Some(session) = sessions.get(&session_id) else { return };
-    let Some(target) = server_target(&session.shell, buf) else { return };
+    let Some(target) = server_target(session, buf) else { return };
     let lsp = Rc::clone(&session.lsp);
     let mut table = lsp.borrow_mut();
     let Some(server) = table.running(&target.display, &target.root) else { return };
@@ -9591,7 +9691,7 @@ fn save_language_server_document(sessions: &mut HashMap<SessionId, SessionState>
 // makes the URI resolvable at all.
 fn close_language_server_document(sessions: &mut HashMap<SessionId, SessionState>, session_id: SessionId, buf: &TextBuffer) {
     let Some(session) = sessions.get(&session_id) else { return };
-    let Some(target) = server_target(&session.shell, buf) else { return };
+    let Some(target) = server_target(session, buf) else { return };
     let lsp = Rc::clone(&session.lsp);
     let mut table = lsp.borrow_mut();
     if let Some(server) = table.running(&target.display, &target.root) {
@@ -13003,6 +13103,7 @@ mod compositor_frame_output_tests {
         let screen = Rc::new(RefCell::new(vt100::Screen::new(4, 40)));
         let mut session = SessionState {
             lsp: Rc::new(RefCell::new(lspclient::Table::default())),
+            lsp_roots: HashMap::new(),
             shell: exec::Shell::new(),
             buffer: String::new(),
             buffer_unrecorded: false,

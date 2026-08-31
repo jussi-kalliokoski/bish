@@ -566,6 +566,18 @@ pub struct LspServer {
     /// unspecified, which is what gitignore::Stack::for_directory
     /// already treats as the boundary.
     pub root_markers: Vec<String>,
+    /// `--root-cmd=`: a command that prints the project root on its
+    /// first line of stdout, run in the directory of the file being
+    /// opened. Empty when unset, which is the ordinary case.
+    ///
+    /// Exists because some roots are only knowable by asking the build
+    /// tool: a Cargo *workspace* member should usually be rooted at the
+    /// workspace, and only `cargo metadata` knows where that is. A
+    /// generic escape hatch rather than a Cargo special case, so any
+    /// language can answer the same question its own way -- and so this
+    /// client stays a language server client rather than accumulating
+    /// per-language knowledge.
+    pub root_cmd: String,
 }
 
 impl LspServer {
@@ -636,7 +648,7 @@ pub fn hook_help() -> Vec<String> {
 pub fn lsp_help() -> Vec<String> {
     vec![
         "::bish lsp ls [--lang=GLOB]            what is registered".to_string(),
-        "::bish lsp add [--lang=GLOB] [--root=NAME,...] COMMAND...".to_string(),
+        "::bish lsp add [--lang=GLOB] [--root=NAME,...] [--root-cmd=CMD] COMMAND...".to_string(),
         "::bish lsp rm ID                       remove one, by the id `add` printed".to_string(),
         "::bish lsp status                      what is actually running".to_string(),
         "::bish lsp log ID                      what a server wrote to stderr".to_string(),
@@ -648,6 +660,10 @@ pub fn lsp_help() -> Vec<String> {
         "--lang is a glob over the file's language, as `hook --lang` uses.".to_string(),
         "--root names the files that mark the top of a project, tried in order".to_string(),
         "       walking up from the file being edited. Defaults to `.git`.".to_string(),
+        "--root-cmd runs a command in the file's own directory and takes its first".to_string(),
+        "       line of output as the root, for a root only a build tool knows:".to_string(),
+        "       --root-cmd 'json -r .workspace_root <(cargo metadata --no-deps --format-version 1)'".to_string(),
+        "       Falls back to --root when it prints nothing or fails.".to_string(),
         String::new(),
         "  ::bish lsp add --lang=rust --root=Cargo.toml,.git rust-analyzer".to_string(),
         String::new(),
@@ -3391,7 +3407,8 @@ impl Shell {
                     {
                         continue;
                     }
-                    sh_println!(self, "{}\t{}\t{}\t{}", server.id, server.lang, server.root_markers.join(","), server.command_line());
+                    let root = if server.root_cmd.is_empty() { server.root_markers.join(",") } else { server.root_cmd.clone() };
+                    sh_println!(self, "{}\t{}\t{}\t{}", server.id, server.lang, root, server.command_line());
                 }
                 0
             }
@@ -3401,6 +3418,10 @@ impl Shell {
                     Err(status) => return status,
                 };
                 let (root_markers, rest) = match self.lsp_root_flag(rest) {
+                    Ok(parsed) => parsed,
+                    Err(status) => return status,
+                };
+                let (root_cmd, rest) = match self.lsp_root_cmd_flag(rest) {
                     Ok(parsed) => parsed,
                     Err(status) => return status,
                 };
@@ -3415,6 +3436,7 @@ impl Shell {
                     lang: lang.unwrap_or_else(|| "*".to_string()),
                     command: rest.to_vec(),
                     root_markers,
+                    root_cmd,
                 });
                 // The id is the return value, same as `hook add`: a
                 // config that registers something usually wants to be
@@ -3489,6 +3511,23 @@ impl Shell {
                 sh_eprintln!(self, "bish: ::bish lsp: unknown subcommand '{other}' (expected: ls, add, rm, status, log, restart, help)");
                 2
             }
+        }
+    }
+
+    // `--root-cmd=COMMAND`/`--root-cmd COMMAND`. Its own helper rather
+    // than folding into `lsp_root_flag`, so `--root` and `--root-cmd`
+    // can be given in either order and neither is positional.
+    fn lsp_root_cmd_flag<'a>(&mut self, args: &'a [String]) -> Result<(String, &'a [String]), i32> {
+        match args.first().map(String::as_str) {
+            Some(flag) if flag.starts_with("--root-cmd=") => Ok((flag["--root-cmd=".len()..].to_string(), &args[1..])),
+            Some("--root-cmd") => match args.get(1) {
+                Some(command) if !command.trim().is_empty() => Ok((command.clone(), &args[2..])),
+                _ => {
+                    sh_eprintln!(self, "bish: ::bish lsp: add: --root-cmd needs a command");
+                    Err(2)
+                }
+            },
+            _ => Ok((String::new(), args)),
         }
     }
 
@@ -13578,6 +13617,27 @@ mod tests {
         // ...and a word that would stop being one word does get quoted.
         assert_eq!(shell.run_lsp(&strs(&["add", "some server", "--flag=a b"])), 0);
         assert_eq!(shell.lsp_servers[1].command_line(), "'some server' '--flag=a b'");
+    }
+
+    #[test]
+    fn a_root_command_is_recorded_and_shown_instead_of_the_markers() {
+        let mut shell = Shell::new();
+        assert_eq!(shell.run_lsp(&strs(&["add", "--lang=rust", "--root-cmd", "cargo metadata | json .workspace_root", "rust-analyzer"])), 0);
+        assert_eq!(shell.lsp_servers[0].root_cmd, "cargo metadata | json .workspace_root");
+        // `--root` still has its default, since the command is what
+        // gets asked first and the markers are the fallback.
+        assert_eq!(shell.lsp_servers[0].root_markers, vec![".git".to_string()]);
+
+        // Either order, and the `=` spelling.
+        assert_eq!(shell.run_lsp(&strs(&["add", "--root=go.mod", "--root-cmd=go env GOMOD", "gopls"])), 0);
+        assert_eq!(shell.lsp_servers[1].root_cmd, "go env GOMOD");
+        assert_eq!(shell.lsp_servers[1].root_markers, vec!["go.mod".to_string()]);
+
+        // A flag with nothing usable after it is a config error, not a
+        // silently empty command that would never run.
+        assert_eq!(shell.run_lsp(&strs(&["add", "--root-cmd"])), 2);
+        assert_eq!(shell.run_lsp(&strs(&["add", "--root-cmd", "   ", "x"])), 2);
+        assert_eq!(shell.lsp_servers.len(), 2);
     }
 
     #[test]
