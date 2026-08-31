@@ -11095,6 +11095,14 @@ fn expand_backslash_escapes(s: &str) -> String {
 // than anything actually breaking.
 const KNOWN_BUILTINS: &[&str] = &[
     ":",
+    // Every name `dispatch_builtin_or_external_impl` handles has to be
+    // here, not just for completion: `run_multi` uses this list to
+    // decide whether a pipeline stage needs the self-exec that lets a
+    // builtin run as one. A builtin missing from it is spawned as an
+    // external program and fails with ENOENT -- which is exactly what
+    // `echo hi | json .` did until `json` was added. See
+    // `every_dispatched_builtin_is_known`.
+    "json",
     "cd",
     "e",
     "export",
@@ -13587,6 +13595,50 @@ mod tests {
 
     fn lsp_ids(shell: &Shell) -> Vec<u64> {
         shell.lsp_servers.iter().map(|s| s.id).collect()
+    }
+
+    // `KNOWN_BUILTINS` is not just the completion list: `run_multi`
+    // reads it to decide whether a pipeline stage needs the self-exec
+    // that lets a builtin run as one. A name the dispatcher handles but
+    // this list omits gets spawned as an external program instead and
+    // dies with ENOENT -- which is what `echo hi | json .` did, while
+    // `json .` on its own worked, so nothing else noticed.
+    //
+    // Read out of the source because there is no table to compare
+    // against: the dispatcher is a `match`, and the two halves can only
+    // be kept honest by looking at it. A new arm shaped differently
+    // enough to escape this regex is a false negative, not a false
+    // failure; a false *failure* means the arm is genuinely absent from
+    // the list, and adding it there is the fix.
+    #[test]
+    fn every_dispatched_builtin_is_known() {
+        let source = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/exec.rs")).expect("exec.rs is readable from its own tests");
+        let start = source.find("fn dispatch_builtin_or_external_impl(").expect("the dispatcher is still called that");
+        let body = &source[start..];
+        let end = body[10..].find("\n    fn ").expect("the dispatcher ends somewhere") + 10;
+        let mut missing: Vec<String> = Vec::new();
+        for line in body[..end].lines() {
+            // Arms of the form `            "a" | "b" => {`, at the
+            // dispatcher's own match indentation.
+            let Some(rest) = line.strip_prefix("            \"") else { continue };
+            let Some(names) = rest.split("=>").next() else { continue };
+            if !line.contains("=>") {
+                continue;
+            }
+            for name in names.split('|') {
+                let name = name.trim().trim_matches('"');
+                if name.is_empty() || name.contains(' ') {
+                    continue;
+                }
+                if !KNOWN_BUILTINS.contains(&name) {
+                    missing.push(name.to_string());
+                }
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "these are dispatched as builtins but missing from KNOWN_BUILTINS, so they break in a pipeline: {missing:?}"
+        );
     }
 
     #[test]
