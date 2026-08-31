@@ -2918,16 +2918,6 @@ pub(crate) fn language_of(buf: &TextBuffer) -> String {
         .unwrap_or(ext)
 }
 
-// The one gate on bash-specific tooling (`:diag`'s linters, `:format`),
-// derived from `language_of` rather than from a second, separate notion
-// of what a file is -- two disagreeing answers
-// to "what language is this" in one module is exactly the kind of thing
-// that rots. A visible consequence: a `.sh` file is bash here now, where
-// the previous extension check recognized only `.bash`.
-fn is_bash_file(buf: &TextBuffer) -> bool {
-    language_of(buf) == snippet::DEFAULT_LANG
-}
-
 // The buffer's own text, lines joined by '\n' -- what a highlighter
 // needs to see a construct that spans several physical lines (a bash
 // heredoc body or multi-line double-quoted string, a JSON object) as
@@ -3077,11 +3067,11 @@ fn absolute_link(buf: &TextBuffer, target: &str) -> Option<String> {
 // `:diag`'s own worker (see repl.rs's run_command_mode, the one caller):
 // runs every diagnose tool configured for this buffer's language against
 // the *whole* buffer text, for the same reason buffer_highlight_spans
-// does (a multi-line construct needs to be seen as one thing). Still
-// gated on is_bash_file, unlike highlighting: bash is the only language
-// with a linter, and a JSON one -- which json::parse's own error, now
-// that it carries a position, is most of the way to -- is a separate
-// piece of work, not a side effect of this file's highlighting. Unlike
+// does (a multi-line construct needs to be seen as one thing). Which
+// linters those are is a plain match on `language_of`: there is more
+// than one language with something to say now, and the `Linter` trait
+// was always shaped for that (concatenation is the default answer), it
+// just never had a second one to prove it. Unlike
 // buffer_highlight_spans this isn't
 // called on every redraw: `:diag` is an explicit, user-triggered check,
 // not a live-typing overlay, so there's no per-keystroke cost to worry
@@ -3098,11 +3088,21 @@ fn absolute_link(buf: &TextBuffer, target: &str) -> Option<String> {
 // tool's own findings here is what makes adding a second one later just
 // "add it to this list," not a structural change.
 pub(crate) fn diagnose_buffer(buf: &TextBuffer) -> Vec<lint::Diagnostic> {
-    if !is_bash_file(buf) {
+    // Which of bish's own linters have anything to say about this
+    // buffer. A `Vec<&dyn Linter>` rather than a fixed-size array
+    // because the answer now depends on the language -- which is the
+    // shape this was always written for (see the `Linter` trait's own
+    // "concatenation is the default answer" note), it just never had a
+    // second language to prove it.
+    let linters: Vec<&dyn Linter> = match language_of(buf).as_str() {
+        lang if lang == snippet::DEFAULT_LANG => vec![&BashLinter],
+        "json" => vec![&lint::JsonLinter],
+        _ => Vec::new(),
+    };
+    if linters.is_empty() {
         return Vec::new();
     }
     let text = buffer_text(buf);
-    let linters: [&dyn Linter; 1] = [&BashLinter];
     linters.iter().flat_map(|l| l.check(&text)).collect()
 }
 
@@ -5258,8 +5258,8 @@ mod diagnose_tests {
     use super::*;
     use std::borrow::Cow;
 
-    // `is_bash_file` keys off the path's own extension (see its own doc
-    // comment) -- `TextBuffer::new_unnamed`/`insert_text` can't produce
+    // `diagnose_buffer`'s language gate keys off the path's own
+    // extension (`language_of`) -- `new_unnamed`/`insert_text` cannot produce
     // one, so a real `.bash` temp file is what actually exercises
     // diagnose_buffer's language gate, the same way textbuffer.rs's own
     // `open_and_save_round_trip_a_real_file` test does for `open`/`save`.

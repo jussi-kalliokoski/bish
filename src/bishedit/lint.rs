@@ -141,6 +141,67 @@ pub trait Linter {
     fn check(&self, text: &str) -> Vec<Diagnostic>;
 }
 
+/// JSON and JSONC, from the tokenizer bish already has.
+///
+/// Deliberately *lexical* rather than structural: `json::tokens` marks
+/// each bad piece with the exact offset it starts at, which is what a
+/// gutter marker and an underline need. `json::parse`'s own structural
+/// errors carry their position inside a message string rather than as
+/// data, so a mismatched brace is reported once, against the whole
+/// buffer, with the parser's own words -- which name the position even
+/// when this cannot point at it.
+///
+/// That covers what actually goes wrong in a hand-edited JSON file: an
+/// unterminated string, a bad escape, a stray word, a mismatched brace.
+///
+/// Plain `json` only, deliberately. **JSONC** is a highlighting language
+/// here and nothing more -- there is no JSONC parser, and the JSON
+/// tokenizer does not know a `//` comment from a syntax error, so
+/// linting one would light up every comment in a `tsconfig.json` with a
+/// finding that is wrong. **TOML** gets nothing for the same shape of
+/// reason: bish has a TOML *tokenizer* and no parser, so there is no
+/// failure to report. Neither is an oversight; both want a parser first.
+pub struct JsonLinter;
+
+impl Linter for JsonLinter {
+    fn check(&self, text: &str) -> Vec<Diagnostic> {
+        let mut out = Vec::new();
+        for token in crate::json::tokens(text) {
+            if let crate::json::TokenKind::Invalid(reason) = &token.kind {
+                out.push(Diagnostic {
+                    start: token.start,
+                    end: token.end.max(token.start + 1),
+                    severity: Severity::Error,
+                    code: Cow::Borrowed("json-syntax"),
+                    source: None,
+                    message: reason.clone(),
+                    fix: None,
+                });
+            }
+        }
+        // Only when nothing lexical was found: a stray character already
+        // reported once above is what *caused* the parse to fail, and
+        // saying so twice helps nobody.
+        if out.is_empty()
+            && !text.trim().is_empty()
+            && let Err(message) = crate::json::parse(text)
+        {
+            {
+                out.push(Diagnostic {
+                    start: 0,
+                    end: text.chars().count().min(1),
+                    severity: Severity::Error,
+                    code: Cow::Borrowed("json-parse"),
+                    source: None,
+                    message,
+                    fix: None,
+                });
+            }
+        }
+        out
+    }
+}
+
 pub struct BashLinter;
 
 impl Linter for BashLinter {
@@ -514,6 +575,57 @@ fn push_unquoted_expansion(chars: &[char], offset: usize, content: Range<usize>,
         message: "Unquoted expansion may be word-split or glob-expanded here -- wrap it in double quotes".to_string(),
         fix: Some(Fix { start, end, replacement: format!("\"{}\"", char_slice(chars, full)) }),
     });
+}
+
+#[cfg(test)]
+mod json_linter_tests {
+    use super::*;
+
+    fn check(text: &str) -> Vec<Diagnostic> {
+        JsonLinter.check(text)
+    }
+
+    #[test]
+    fn a_lexical_error_is_reported_where_it_actually_is() {
+        let text = "{\"a\": 1, \"b\": tru}";
+        let found = check(text);
+        assert_eq!(found.len(), 1);
+        assert!(found[0].message.contains("tru"), "{}", found[0].message);
+        // Pointing at the bad word, not at the start of the file.
+        assert_eq!(&text[found[0].start..found[0].end], "tru");
+    }
+
+    #[test]
+    fn an_unterminated_string_is_found() {
+        let found = check("{\"a\": \"oops}");
+        assert_eq!(found.len(), 1);
+        assert!(found[0].message.contains("unterminated"), "{}", found[0].message);
+    }
+
+    // A structural error has its position inside the parser's own
+    // message rather than as data, so it is reported once against the
+    // buffer -- with the parser's words, which do name the position.
+    #[test]
+    fn a_structural_error_is_reported_once_with_the_parsers_own_words() {
+        let found = check("{\"a\": 1,}");
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].code, "json-parse");
+        assert!(found[0].message.contains("position"), "{}", found[0].message);
+    }
+
+    // A stray character is what *caused* the parse to fail; saying so
+    // twice helps nobody.
+    #[test]
+    fn a_lexical_error_suppresses_the_structural_one() {
+        assert!(check("{\"a\": @}").iter().all(|d| d.code == "json-syntax"));
+    }
+
+    #[test]
+    fn valid_json_and_an_empty_buffer_are_both_quiet() {
+        assert!(check("{\"a\": [1, 2, {\"b\": null}]}").is_empty());
+        assert!(check("").is_empty());
+        assert!(check("   \n  ").is_empty());
+    }
 }
 
 #[cfg(test)]
