@@ -57,7 +57,7 @@ while :; do
 	id=$(printf '%s' "$body" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
 	case "$body" in
 	*'"method":"initialize"'*)
-		send '{"jsonrpc":"2.0","id":'"$id"',"result":{"capabilities":{"positionEncoding":"utf-32","hoverProvider":true,"definitionProvider":true,"referencesProvider":true,"documentSymbolProvider":true,"textDocumentSync":{"openClose":true,"change":1,"save":true}}}}'
+		send '{"jsonrpc":"2.0","id":'"$id"',"result":{"capabilities":{"positionEncoding":"utf-32","hoverProvider":true,"definitionProvider":true,"referencesProvider":true,"documentSymbolProvider":true,"completionProvider":{"triggerCharacters":["."]},"textDocumentSync":{"openClose":true,"change":1,"save":true}}}}'
 		;;
 	*'"method":"textDocument/didOpen"'*)
 		# Remembered so `textDocument/definition` can answer about
@@ -75,6 +75,16 @@ while :; do
 		 {"uri":"'"$target"'","range":{"start":{"line":1,"character":0},"end":{"line":1,"character":5}}},
 		 {"uri":"'"$uri"'","range":{"start":{"line":2,"character":0},"end":{"line":2,"character":5}}},
 		 {"uri":"'"$uri"'","range":{"start":{"line":0,"character":0},"end":{"line":0,"character":5}}}]}'
+		;;
+	*'"method":"textDocument/completion"'*)
+		# A mix on purpose: a plain label, one whose insertText
+		# differs from its label, one that is a snippet, and one
+		# ordered ahead of the others by sortText.
+		send '{"jsonrpc":"2.0","id":'"$id"',"result":{"isIncomplete":false,"items":[
+		 {"label":"beta","kind":6,"detail":"a variable"},
+		 {"label":"alpha","kind":3,"insertText":"alpha()","sortText":"0"},
+		 {"label":"gamma","kind":3,"insertText":"gamma(${1:x})","insertTextFormat":2},
+		 {"label":"belta","kind":6}]}}'
 		;;
 	*'"method":"textDocument/documentSymbol"'*)
 		# The nested form, so the outline has something to indent.

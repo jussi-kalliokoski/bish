@@ -7625,7 +7625,7 @@ fn run_normal_mode_navigation(
                         &mut vk,
                         rect,
                         registers,
-                        &mut |tb: &mut TextBuffer| insert_idle(sessions, windows, job_frames, current_window, term_rows, term_cols, *sinks_are_grid, session_id, tb),
+                        &mut EditorServices { sessions, windows, job_frames, current_window, term_rows, term_cols, sinks_are_grid: *sinks_are_grid, session_id },
                         false,
                         insert_term_rows,
                         insert_term_cols,
@@ -8141,7 +8141,7 @@ fn run_normal_mode_navigation(
                         fileeditor::resolve_insert_start(tb, cmd);
                         let (insert_term_rows, insert_term_cols) = (*term_rows, *term_cols);
                         let insert_abbrs = sessions[&session_id].shell.abbrs.clone();
-                        fileeditor::run_insert_mode(tb, &mut vk, rect, registers, &mut |tb: &mut TextBuffer| insert_idle(sessions, windows, job_frames, current_window, term_rows, term_cols, *sinks_are_grid, session_id, tb), false, insert_term_rows, insert_term_cols, color_overrides.as_ref(), &[], &insert_abbrs)?;
+                        fileeditor::run_insert_mode(tb, &mut vk, rect, registers, &mut EditorServices { sessions, windows, job_frames, current_window, term_rows, term_cols, sinks_are_grid: *sinks_are_grid, session_id }, false, insert_term_rows, insert_term_cols, color_overrides.as_ref(), &[], &insert_abbrs)?;
                     }
                     render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides.as_ref());
                 } else {
@@ -8161,7 +8161,7 @@ fn run_normal_mode_navigation(
                     if let Some(tb) = buf.as_writable_mut() {
                         let (insert_term_rows, insert_term_cols) = (*term_rows, *term_cols);
                         let insert_abbrs = sessions[&session_id].shell.abbrs.clone();
-                        fileeditor::run_insert_mode(tb, &mut vk, rect, registers, &mut |tb: &mut TextBuffer| insert_idle(sessions, windows, job_frames, current_window, term_rows, term_cols, *sinks_are_grid, session_id, tb), true, insert_term_rows, insert_term_cols, color_overrides.as_ref(), &[], &insert_abbrs)?;
+                        fileeditor::run_insert_mode(tb, &mut vk, rect, registers, &mut EditorServices { sessions, windows, job_frames, current_window, term_rows, term_cols, sinks_are_grid: *sinks_are_grid, session_id }, true, insert_term_rows, insert_term_cols, color_overrides.as_ref(), &[], &insert_abbrs)?;
                     }
                     render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides.as_ref());
                 } else {
@@ -8258,7 +8258,7 @@ fn run_normal_mode_navigation(
                             if fileeditor::delete_motion(tb, registers, m, count, register) {
                                 let (insert_term_rows, insert_term_cols) = (*term_rows, *term_cols);
                                 let insert_abbrs = sessions[&session_id].shell.abbrs.clone();
-                                fileeditor::run_insert_mode(tb, &mut vk, rect, registers, &mut |tb: &mut TextBuffer| insert_idle(sessions, windows, job_frames, current_window, term_rows, term_cols, *sinks_are_grid, session_id, tb), false, insert_term_rows, insert_term_cols, color_overrides.as_ref(), &[], &insert_abbrs)?;
+                                fileeditor::run_insert_mode(tb, &mut vk, rect, registers, &mut EditorServices { sessions, windows, job_frames, current_window, term_rows, term_cols, sinks_are_grid: *sinks_are_grid, session_id }, false, insert_term_rows, insert_term_cols, color_overrides.as_ref(), &[], &insert_abbrs)?;
                             }
                         }
                         Op::Lowercase | Op::Uppercase | Op::CaseToggle => {
@@ -8281,7 +8281,7 @@ fn run_normal_mode_navigation(
                             fileeditor::delete_lines(tb, registers, count, register);
                             let (insert_term_rows, insert_term_cols) = (*term_rows, *term_cols);
                             let insert_abbrs = sessions[&session_id].shell.abbrs.clone();
-                            fileeditor::run_insert_mode(tb, &mut vk, rect, registers, &mut |tb: &mut TextBuffer| insert_idle(sessions, windows, job_frames, current_window, term_rows, term_cols, *sinks_are_grid, session_id, tb), false, insert_term_rows, insert_term_cols, color_overrides.as_ref(), &[], &insert_abbrs)?;
+                            fileeditor::run_insert_mode(tb, &mut vk, rect, registers, &mut EditorServices { sessions, windows, job_frames, current_window, term_rows, term_cols, sinks_are_grid: *sinks_are_grid, session_id }, false, insert_term_rows, insert_term_cols, color_overrides.as_ref(), &[], &insert_abbrs)?;
                         }
                         Op::Lowercase | Op::Uppercase | Op::CaseToggle => fileeditor::case_operator_lines(tb, count, fileeditor::case_kind_for_op(op)),
                         Op::Indent => fileeditor::indent_lines(tb, count),
@@ -8355,7 +8355,7 @@ fn run_normal_mode_navigation(
                     fileeditor::open_line(tb, above);
                     let (insert_term_rows, insert_term_cols) = (*term_rows, *term_cols);
                     let insert_abbrs = sessions[&session_id].shell.abbrs.clone();
-                    fileeditor::run_insert_mode(tb, &mut vk, rect, registers, &mut |tb: &mut TextBuffer| insert_idle(sessions, windows, job_frames, current_window, term_rows, term_cols, *sinks_are_grid, session_id, tb), false, insert_term_rows, insert_term_cols, color_overrides.as_ref(), &[], &insert_abbrs)?;
+                    fileeditor::run_insert_mode(tb, &mut vk, rect, registers, &mut EditorServices { sessions, windows, job_frames, current_window, term_rows, term_cols, sinks_are_grid: *sinks_are_grid, session_id }, false, insert_term_rows, insert_term_cols, color_overrides.as_ref(), &[], &insert_abbrs)?;
                 }
                 render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides.as_ref());
             }
@@ -8580,6 +8580,120 @@ fn sync_language_server_document(sessions: &mut HashMap<SessionId, SessionState>
         return;
     }
     server.change_document(&target.uri, buf.version(), &fileeditor::buffer_text(buf));
+}
+
+// Insert mode's own view of everything repl.rs owns -- see
+// `fileeditor::InsertServices` for why this is one object rather than
+// two closures.
+struct EditorServices<'a> {
+    sessions: &'a mut HashMap<SessionId, SessionState>,
+    windows: &'a mut Vec<WindowEntry>,
+    job_frames: &'a mut HashMap<JobFrameId, exec::FgJob>,
+    current_window: &'a mut usize,
+    term_rows: &'a mut usize,
+    term_cols: &'a mut usize,
+    sinks_are_grid: bool,
+    session_id: SessionId,
+}
+
+impl fileeditor::InsertServices for EditorServices<'_> {
+    fn idle(&mut self, buf: &mut TextBuffer) -> Option<fileeditor::IdleRedraw> {
+        insert_idle(
+            self.sessions,
+            self.windows,
+            self.job_frames,
+            self.current_window,
+            self.term_rows,
+            self.term_cols,
+            self.sinks_are_grid,
+            self.session_id,
+            buf,
+        )
+    }
+
+    fn complete(&mut self, buf: &TextBuffer, row: usize, col: usize) -> Vec<crate::bishedit::completion::EditorCompletion> {
+        completions_from_server(
+            self.sessions,
+            self.windows,
+            self.job_frames,
+            self.session_id,
+            *self.current_window,
+            self.term_rows,
+            self.term_cols,
+            self.sinks_are_grid,
+            buf,
+            row,
+            col,
+        )
+    }
+}
+
+// What could go where the cursor is, for the editor's completion
+// popup. Empty for every ordinary reason there is nothing to offer --
+// no server, not ready, no `completionProvider`, no answer in time --
+// which is what makes Ctrl-N a no-op rather than an error.
+//
+// The server's own replace ranges are resolved to buffer coordinates
+// here, where the position encoding is known, so the editor never sees
+// anything protocol-shaped (see `EditorCompletion`).
+#[allow(clippy::too_many_arguments)]
+fn completions_from_server(
+    sessions: &mut HashMap<SessionId, SessionState>,
+    windows: &mut [WindowEntry],
+    job_frames: &mut HashMap<JobFrameId, exec::FgJob>,
+    session_id: SessionId,
+    current_window: usize,
+    term_rows: &mut usize,
+    term_cols: &mut usize,
+    sinks_are_grid: bool,
+    buf: &TextBuffer,
+    row: usize,
+    col: usize,
+) -> Vec<crate::bishedit::completion::EditorCompletion> {
+    let encoding = server_encoding_for(sessions, session_id, buf).unwrap_or(crate::lsp::PositionEncoding::Utf16);
+    let Some(result) = ask_server_at_cursor(
+        sessions,
+        windows,
+        job_frames,
+        session_id,
+        current_window,
+        term_rows,
+        term_cols,
+        sinks_are_grid,
+        buf,
+        row,
+        col,
+        "textDocument/completion",
+        "completionProvider",
+        &[],
+    ) else {
+        return Vec::new();
+    };
+    let mut found = crate::lsp::completions(&result);
+    // `sortText` is how a server puts the likely answers first, and
+    // ignoring it is how a completion list ends up alphabetical and
+    // useless.
+    found.sort_by(|a, b| a.sort.cmp(&b.sort));
+    let starts = fileeditor::line_starts_of(buf);
+    found
+        .into_iter()
+        .map(|item| {
+            // Only a range on the cursor's own line can be expressed as
+            // a single-line replacement, which is all the editor does
+            // here; anything else falls back to the word being typed.
+            let replace = item.edit.and_then(|(start, end)| {
+                (start.0 == end.0 && start.0 == row).then(|| {
+                    let to_col = |position: (usize, usize)| {
+                        let offset = fileeditor::diagnostic_offset(buf, &starts, position.0, position.1, encoding);
+                        fileeditor::diagnostic_position(buf, offset).1
+                    };
+                    (row, to_col(start), to_col(end))
+                })
+            });
+            let detail = item.detail_or_kind();
+            crate::bishedit::completion::EditorCompletion { label: item.label, detail, insert: item.insert, replace }
+        })
+        .collect()
 }
 
 // Asks the language server one position-shaped question about whatever

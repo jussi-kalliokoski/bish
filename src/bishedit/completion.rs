@@ -35,6 +35,31 @@ pub struct CompletionResult {
     pub candidates: Vec<CompletionCandidate>,
 }
 
+/// One candidate the *editor*'s completion popup can show and insert.
+///
+/// Deliberately not `CompletionCandidate` above: that one is the shell
+/// prompt's, and carries fuzzy-match positions for highlighting. This
+/// one carries what a language server actually answers with -- a label
+/// to show, an elaboration beside it, the text to insert (which is
+/// often not the label), and the exact range to replace when the server
+/// named one.
+///
+/// The replace range is in **buffer coordinates** already: whoever
+/// builds these owns the position encoding, and resolving it there
+/// keeps the editor free of anything protocol-shaped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EditorCompletion {
+    pub label: String,
+    /// Shown dimmed beside the label -- a kind, a signature, a type.
+    pub detail: String,
+    pub insert: String,
+    /// `(row, start_col, end_col)`, or `None` to replace the word being
+    /// typed. A server that names a range is completing something the
+    /// editor would not have recognised as one word -- a dotted path,
+    /// an import -- so its answer wins where it gave one.
+    pub replace: Option<(usize, usize, usize)>,
+}
+
 pub trait CompletionProvider {
     fn complete(&self, req: CompletionRequest) -> CompletionResult;
 }

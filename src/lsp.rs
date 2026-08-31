@@ -575,6 +575,190 @@ fn location(value: &Value) -> Option<Location> {
 }
 
 // ---------------------------------------------------------------------
+// Completion
+// ---------------------------------------------------------------------
+
+/// One candidate from `textDocument/completion`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Completion {
+    /// What the list shows.
+    pub label: String,
+    /// `CompletionItemKind` as its own name -- "function", "variable".
+    /// Empty for a number outside the table.
+    pub kind: String,
+    /// The server's own one-line elaboration: a signature, a type.
+    /// Empty when it gave none.
+    pub detail: String,
+    /// What to actually insert.
+    pub insert: String,
+    /// The range the server says to replace, in its own coordinates.
+    /// `None` means it did not say, and the caller should replace the
+    /// word being typed -- which is what every client does, but is a
+    /// guess where this is the server's own answer.
+    pub edit: Option<((usize, usize), (usize, usize))>,
+    /// What to sort by. `sortText` when the server gave one, which is
+    /// how a server puts the likely answers first, and the label
+    /// otherwise.
+    pub sort: String,
+}
+
+impl Completion {
+    /// What to show beside the label: the server's own elaboration when
+    /// it gave one, and the kind otherwise -- so a row is never bare
+    /// when there is something true to say about it.
+    pub fn detail_or_kind(&self) -> String {
+        if self.detail.is_empty() { self.kind.clone() } else { self.detail.clone() }
+    }
+}
+
+fn completion_kind(kind: f64) -> String {
+    const KINDS: [&str; 25] = [
+        "text", "method", "function", "constructor", "field", "variable", "class", "interface", "module", "property", "unit", "value",
+        "enum", "keyword", "snippet", "color", "file", "reference", "folder", "enum-member", "constant", "struct", "event", "operator",
+        "type-parameter",
+    ];
+    let index = kind as usize;
+    if (1..=KINDS.len()).contains(&index) { KINDS[index - 1].to_string() } else { String::new() }
+}
+
+/// Reads a `textDocument/completion` answer.
+///
+/// Two shapes, both in use: a bare `CompletionItem[]`, and a
+/// `CompletionList { isIncomplete, items }`. `isIncomplete` is read and
+/// discarded -- it means "ask again as the user types more", which this
+/// client does not do (it fetches once and filters what it got), and
+/// silently ignoring a field is better than pretending to honour it.
+pub fn completions(result: &Value) -> Vec<Completion> {
+    let items = match result {
+        Value::Array(items) => items,
+        Value::Object(_) => match json::query(result, ".items") {
+            Ok(Value::Array(items)) => items,
+            _ => return Vec::new(),
+        },
+        _ => return Vec::new(),
+    };
+    items.iter().filter_map(completion).collect()
+}
+
+fn completion(value: &Value) -> Option<Completion> {
+    let Ok(Value::Str(label)) = json::query(value, ".label") else { return None };
+    let label = sanitize(label);
+    if label.is_empty() {
+        return None;
+    }
+    // `insertTextFormat` 2 means the text is a snippet, with `$1`/
+    // `${1:name}` placeholders and a `$0` final position. bish has a
+    // snippet engine (`bishedit::snippet`, behind `abbr`), but wiring
+    // an LSP snippet into it is a feature of its own; until then the
+    // placeholders are flattened to their default text, which gives
+    // `foo(a, b)` rather than the literal `foo(${1:a}, ${2:b})` that
+    // ignoring the field would insert.
+    let snippet = matches!(json::query(value, ".insertTextFormat"), Ok(Value::Number(f)) if *f == 2.0);
+    let mut edit = None;
+    // A `textEdit` is the server saying exactly what to replace, which
+    // beats guessing at the word under the cursor -- it is how a server
+    // completes something the client would not have recognised as one
+    // word, like a dotted path or an import.
+    let text_edit = json::query(value, ".textEdit").ok().filter(|v| matches!(v, Value::Object(_)));
+    let insert = if let Some(text_edit) = text_edit {
+        // `InsertReplaceEdit` has `insert`/`replace` instead of
+        // `range`; `insert` is the conservative one (it does not eat
+        // what follows the cursor), so that is what is taken.
+        let range = match json::query(text_edit, ".range") {
+            Ok(range @ Value::Object(_)) => Some(range),
+            _ => json::query(text_edit, ".insert").ok().filter(|v| matches!(v, Value::Object(_))),
+        };
+        if let Some(range) = range
+            && let (Some(start), Some(end)) =
+                (json::query(range, ".start").ok().and_then(position), json::query(range, ".end").ok().and_then(position))
+        {
+            edit = Some((start, end));
+        }
+        match json::query(text_edit, ".newText") {
+            Ok(Value::Str(text)) => text.clone(),
+            _ => label.clone(),
+        }
+    } else {
+        match json::query(value, ".insertText") {
+            Ok(Value::Str(text)) => text.clone(),
+            _ => label.clone(),
+        }
+    };
+    let insert = sanitize(&if snippet { flatten_snippet(&insert) } else { insert });
+    Some(Completion {
+        label: label.clone(),
+        kind: match json::query(value, ".kind") {
+            Ok(Value::Number(k)) => completion_kind(*k),
+            _ => String::new(),
+        },
+        detail: match json::query(value, ".detail") {
+            Ok(Value::Str(detail)) => sanitize(detail),
+            _ => String::new(),
+        },
+        insert: if insert.is_empty() { label.clone() } else { insert },
+        edit,
+        sort: match json::query(value, ".sortText") {
+            Ok(Value::Str(sort)) => sort.clone(),
+            _ => label,
+        },
+    })
+}
+
+/// An LSP snippet reduced to plain text: `${1:name}` and `$1` become
+/// the placeholder's default (or nothing), `$0` disappears, and `\$` is
+/// an escaped dollar rather than a placeholder.
+fn flatten_snippet(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::new();
+    let mut i = 0;
+    while i < chars.len() {
+        match chars[i] {
+            '\\' if i + 1 < chars.len() => {
+                out.push(chars[i + 1]);
+                i += 2;
+            }
+            '$' if i + 1 < chars.len() && chars[i + 1] == '{' => {
+                // `${1:default}` -- keep the default, which is the part
+                // after the first colon, up to the matching brace.
+                let mut depth = 0;
+                let mut j = i + 1;
+                let mut colon = None;
+                while j < chars.len() {
+                    match chars[j] {
+                        '{' => depth += 1,
+                        '}' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        ':' if depth == 1 && colon.is_none() => colon = Some(j),
+                        _ => {}
+                    }
+                    j += 1;
+                }
+                if let Some(colon) = colon {
+                    out.push_str(&flatten_snippet(&chars[colon + 1..j.min(chars.len())].iter().collect::<String>()));
+                }
+                i = (j + 1).min(chars.len().max(j + 1));
+            }
+            '$' if i + 1 < chars.len() && chars[i + 1].is_ascii_digit() => {
+                let mut j = i + 1;
+                while j < chars.len() && chars[j].is_ascii_digit() {
+                    j += 1;
+                }
+                i = j;
+            }
+            c => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------------
 // Symbols
 // ---------------------------------------------------------------------
 
@@ -1005,6 +1189,82 @@ mod tests {
         fn mixed_len(v: &Value) -> usize {
             locations(v).len()
         }
+    }
+
+    #[test]
+    fn both_shapes_of_a_completion_answer_are_read() {
+        let bare = json::parse(r#"[{"label":"push","kind":2,"detail":"fn(&mut self, T)"}]"#).unwrap();
+        let found = completions(&bare);
+        assert_eq!(found.len(), 1);
+        assert_eq!((found[0].label.as_str(), found[0].kind.as_str()), ("push", "method"));
+        assert_eq!(found[0].detail, "fn(&mut self, T)");
+        // Nothing said about what to insert: the label is it.
+        assert_eq!(found[0].insert, "push");
+        // Nothing said about what to replace either -- the caller
+        // falls back to the word being typed.
+        assert_eq!(found[0].edit, None);
+        // And nothing said about ordering: sort by what is shown.
+        assert_eq!(found[0].sort, "push");
+
+        // The list form, whose `isIncomplete` is deliberately ignored.
+        let list = json::parse(r#"{"isIncomplete":true,"items":[{"label":"a"},{"label":"b"}]}"#).unwrap();
+        assert_eq!(completions(&list).len(), 2);
+        assert!(completions(&Value::Null).is_empty());
+    }
+
+    // A textEdit is the server saying exactly what to replace, which
+    // beats guessing at a word -- it is how a dotted path or an import
+    // gets completed at all.
+    #[test]
+    fn a_text_edit_carries_both_the_text_and_the_range_to_replace() {
+        let with_edit = json::parse(
+            r#"[{"label":"std::fmt","textEdit":{"range":{"start":{"line":3,"character":4},"end":{"line":3,"character":9}},"newText":"std::fmt"}}]"#,
+        )
+        .unwrap();
+        let found = completions(&with_edit);
+        assert_eq!(found[0].edit, Some(((3, 4), (3, 9))));
+        assert_eq!(found[0].insert, "std::fmt");
+
+        // InsertReplaceEdit names two ranges; `insert` is the
+        // conservative one, since it does not eat what follows.
+        let insert_replace = json::parse(
+            r#"[{"label":"x","textEdit":{"insert":{"start":{"line":1,"character":0},"end":{"line":1,"character":2}},
+                "replace":{"start":{"line":1,"character":0},"end":{"line":1,"character":9}},"newText":"xy"}}]"#,
+        )
+        .unwrap();
+        assert_eq!(completions(&insert_replace)[0].edit, Some(((1, 0), (1, 2))));
+    }
+
+    // Ignoring insertTextFormat would insert the literal `${1:a}`.
+    #[test]
+    fn a_snippet_completion_is_flattened_to_its_default_text() {
+        let snippet = json::parse(r#"[{"label":"foo","insertText":"foo(${1:a}, ${2:b})$0","insertTextFormat":2}]"#).unwrap();
+        assert_eq!(completions(&snippet)[0].insert, "foo(a, b)");
+        // Without the format flag it is literal text and stays as it is.
+        let literal = json::parse(r#"[{"label":"foo","insertText":"foo(${1:a})"}]"#).unwrap();
+        assert_eq!(completions(&literal)[0].insert, "foo(${1:a})");
+    }
+
+    #[test]
+    fn snippet_flattening_handles_the_forms_that_actually_turn_up() {
+        assert_eq!(flatten_snippet("plain"), "plain");
+        // A bare tabstop contributes nothing.
+        assert_eq!(flatten_snippet("if $1 then $0"), "if  then ");
+        // Nested placeholders keep the inner default.
+        assert_eq!(flatten_snippet("${1:${2:inner}}"), "inner");
+        assert_eq!(flatten_snippet("gamma(${1:x})"), "gamma(x)");
+        // An escaped dollar is a dollar.
+        assert_eq!(flatten_snippet("cost \\$5"), "cost $5");
+        // An unterminated placeholder must not run off the end.
+        assert_eq!(flatten_snippet("${1:oops"), "oops");
+    }
+
+    #[test]
+    fn a_completion_with_no_label_is_not_one() {
+        let nameless = json::parse(r#"[{"kind":2},{"label":""},{"label":"real"}]"#).unwrap();
+        let found = completions(&nameless);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].label, "real");
     }
 
     #[test]

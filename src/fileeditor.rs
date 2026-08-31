@@ -484,6 +484,56 @@ pub(crate) fn render_hover_popup(lines: &[String], cursor_row: usize, cursor_col
     out
 }
 
+// The completion popup: a list anchored under the cursor, the selected
+// row marked.
+//
+// Drawn in reverse video like `render_hover_popup` just above, for the
+// same reason -- it floats over real text, and reverse video is the one
+// way to be legible over it without assuming anything about colours.
+// The selection is marked with `>` *and* bold rather than by colour
+// alone, so it is unambiguous on a terminal that has none.
+pub(crate) fn render_completion_popup(items: &[crate::bishedit::completion::EditorCompletion], selected: usize, cursor_row: usize, cursor_col: usize, rect: Rect) -> String {
+    const MAX_ROWS: usize = 10;
+    if items.is_empty() {
+        return String::new();
+    }
+    // Scrolled so the selection is always on screen: a server can
+    // answer with hundreds.
+    let first = selected.saturating_sub(MAX_ROWS - 1);
+    let shown: Vec<&crate::bishedit::completion::EditorCompletion> = items.iter().skip(first).take(MAX_ROWS).collect();
+    let max_width = rect.cols.saturating_sub(4).clamp(10, 60);
+    let label_width = shown.iter().map(|i| i.label.chars().count()).max().unwrap_or(1);
+    let detail_width = shown.iter().map(|i| i.detail.chars().count()).max().unwrap_or(0);
+    // `> ` marker, the label, and the detail with a gap before it.
+    let inner_width = (2 + label_width + if detail_width > 0 { detail_width + 2 } else { 0 }).min(max_width).max(1);
+    let box_width = (inner_width + 2).min(rect.cols.max(3));
+    let box_height = shown.len() + 2;
+
+    let bottom_limit = rect.row + rect.rows;
+    let top = if cursor_row + 1 + box_height <= bottom_limit { cursor_row + 1 } else { cursor_row.saturating_sub(box_height).max(rect.row) };
+    let left = cursor_col.min((rect.col + rect.cols).saturating_sub(box_width));
+
+    let mut out = String::new();
+    out.push_str(&format!("\x1b[{};{}H\x1b[7m\u{256d}{}\u{256e}\x1b[0m", top + 1, left + 1, "\u{2500}".repeat(box_width.saturating_sub(2))));
+    for (i, item) in shown.iter().enumerate() {
+        let is_selected = first + i == selected;
+        let marker = if is_selected { "> " } else { "  " };
+        let mut text = format!("{marker}{}", item.label);
+        if !item.detail.is_empty() {
+            let used = text.chars().count();
+            if inner_width > used + 2 {
+                text.push_str(&" ".repeat(inner_width - used - item.detail.chars().count().min(inner_width - used)));
+                text.push_str(&item.detail);
+            }
+        }
+        let padded: String = format!("{text:<inner_width$}").chars().take(inner_width).collect();
+        let weight = if is_selected { "\x1b[7;1m" } else { "\x1b[7m" };
+        out.push_str(&format!("\x1b[{};{}H{weight}\u{2502}{padded}\u{2502}\x1b[0m", top + 2 + i, left + 1));
+    }
+    out.push_str(&format!("\x1b[{};{}H\x1b[7m\u{2570}{}\u{256f}\x1b[0m", top + box_height, left + 1, "\u{2500}".repeat(box_width.saturating_sub(2))));
+    out
+}
+
 // Plain character-level wrap (not word-aware) for one hover line into
 // however many `width`-wide rows it takes -- simple, and entirely
 // adequate for the short doc comments/man snippets this actually
@@ -1161,6 +1211,90 @@ pub(crate) struct IdleRedraw {
     pub(crate) term_cols: usize,
 }
 
+/// What Insert mode needs from whoever is driving it.
+///
+/// One object rather than two closures because both of them need the
+/// same mutable state (the session table, the window list), and two
+/// closures capturing it are two simultaneous unique borrows -- which
+/// the compiler is right to refuse. Methods on one object take that
+/// borrow once.
+///
+/// `idle` is called while nothing is arriving on stdin; `complete` when
+/// Ctrl-N asks what could go at the cursor. A caller with no language
+/// server implements the second as "nothing", which is what makes
+/// Ctrl-N a no-op rather than an error in a plain editor.
+pub(crate) trait InsertServices {
+    fn idle(&mut self, buf: &mut TextBuffer) -> Option<IdleRedraw>;
+    fn complete(&mut self, _buf: &TextBuffer, _row: usize, _col: usize) -> Vec<crate::bishedit::completion::EditorCompletion> {
+        Vec::new()
+    }
+}
+
+/// For a caller with nothing to offer: no idle work, no completions.
+/// Only this module's own tests today, which is why it is test-only --
+/// every real caller has a shell behind it.
+#[cfg(test)]
+pub(crate) struct NoInsertServices;
+
+#[cfg(test)]
+impl InsertServices for NoInsertServices {
+    fn idle(&mut self, _buf: &mut TextBuffer) -> Option<IdleRedraw> {
+        None
+    }
+}
+
+// The completion popup while it is open.
+//
+// Fetched once, then filtered as you keep typing rather than re-asked
+// -- which is what makes it feel instant, and is honest about what it
+// is: a snapshot of what the server said at the moment you asked. A
+// server that wanted to be re-asked says so with `isIncomplete`, which
+// this client reads and ignores (see `lsp::completions`).
+struct LiveCompletion {
+    /// Everything the server offered, in its own order.
+    all: Vec<crate::bishedit::completion::EditorCompletion>,
+    /// Indices into `all` still matching what has been typed.
+    shown: Vec<usize>,
+    /// Index into `shown`.
+    selected: usize,
+    /// Where the word being completed starts, on `row`. Captured when
+    /// the popup opens so the filter can see what has been typed since.
+    row: usize,
+    word_start: usize,
+}
+
+impl LiveCompletion {
+    // Narrows to the candidates still matching the word under the
+    // cursor. `false` when nothing matches any more, which is the
+    // caller's cue to close: a popup with no rows is just a box.
+    fn refilter(&mut self, buf: &TextBuffer) -> bool {
+        let (row, col) = buf.cursor();
+        if row != self.row || col < self.word_start {
+            return false;
+        }
+        let line = buf.line_chars(row);
+        let typed: String = line[self.word_start..col.min(line.len())].iter().collect();
+        let typed = typed.to_lowercase();
+        self.shown = self
+            .all
+            .iter()
+            .enumerate()
+            .filter(|(_, item)| typed.is_empty() || item.label.to_lowercase().starts_with(&typed))
+            .map(|(i, _)| i)
+            .collect();
+        self.selected = self.selected.min(self.shown.len().saturating_sub(1));
+        !self.shown.is_empty()
+    }
+
+    fn items(&self) -> Vec<crate::bishedit::completion::EditorCompletion> {
+        self.shown.iter().filter_map(|i| self.all.get(*i).cloned()).collect()
+    }
+
+    fn chosen(&self) -> Option<&crate::bishedit::completion::EditorCompletion> {
+        self.all.get(*self.shown.get(self.selected)?)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_insert_mode(
     buf: &mut TextBuffer,
@@ -1173,7 +1307,7 @@ pub(crate) fn run_insert_mode(
     // `sync_language_server_document`) can't borrow it a second time.
     // Handing it in at the one moment nothing else holds it is what
     // makes both possible.
-    on_idle: &mut dyn FnMut(&mut TextBuffer) -> Option<IdleRedraw>,
+    services: &mut dyn InsertServices,
     replace: bool,
     term_rows: usize,
     term_cols: usize,
@@ -1200,6 +1334,7 @@ pub(crate) fn run_insert_mode(
     // caller snapshots it fresh on the way in -- see repl.rs).
     let abbrs = snippet::for_language(abbrs, &language_of(buf));
     let mut live: Option<LiveSnippet> = None;
+    let mut completing: Option<LiveCompletion> = None;
     render_editor_frame(buf, vk, mode, rect, term_rows, term_cols, color_overrides);
     // `"."`'s own accumulator for this session -- see `Registers::
     // set_last_insert`'s own doc comment. Best-effort: a Backspace just
@@ -1218,7 +1353,7 @@ pub(crate) fn run_insert_mode(
         // run_normal_mode_navigation's own identical restructuring
         // (repl.rs) for the full reasoning -- same fix, same root cause.
         while !term::stdin_ready(editor::IDLE_POLL_MS) {
-            if let Some(geometry) = on_idle(buf) {
+            if let Some(geometry) = services.idle(buf) {
                 rect = geometry.rect;
                 term_rows = geometry.term_rows;
                 term_cols = geometry.term_cols;
@@ -1261,7 +1396,67 @@ pub(crate) fn run_insert_mode(
             buf.snippet_holes.clear();
         }
 
+        // Any key the popup does not use closes it and then means
+        // whatever it always meant -- the same rule a live snippet just
+        // above follows, and what keeps every other arm free of
+        // completion-aware special cases. `Char`/`Backspace` are not in
+        // this list because they *narrow* the popup rather than
+        // dismissing it: typing more of a word is how you pick from one.
+        if completing.is_some()
+            && !matches!(key, Key::CtrlN | Key::CtrlP | Key::Enter | Key::Tab | Key::Escape | Key::Char(_) | Key::Backspace)
+        {
+            completing = None;
+        }
+
         match key {
+            // --- the completion popup owns these while it is open ----
+            Key::CtrlN if completing.is_some() && live.is_none() => {
+                let state = completing.as_mut().unwrap();
+                if !state.shown.is_empty() {
+                    state.selected = (state.selected + 1) % state.shown.len();
+                }
+            }
+            Key::CtrlP if completing.is_some() && live.is_none() => {
+                let state = completing.as_mut().unwrap();
+                if !state.shown.is_empty() {
+                    state.selected = (state.selected + state.shown.len() - 1) % state.shown.len();
+                }
+            }
+            // Escape closes the popup and stays in Insert mode -- the
+            // one place Escape does not leave, matching every editor
+            // with a completion menu.
+            Key::Escape if completing.is_some() => {
+                completing = None;
+            }
+            Key::Enter | Key::Tab if completing.is_some() => {
+                let state = completing.take().unwrap();
+                if let Some(item) = state.chosen().cloned() {
+                    let (row, col) = buf.cursor();
+                    // The server's own range when it named one; the word
+                    // being typed otherwise.
+                    let (row, start, end) = item.replace.unwrap_or((row, state.word_start, col));
+                    let line_len = buf.line_len(row);
+                    let (start, end) = (start.min(line_len), end.min(line_len).max(start.min(line_len)));
+                    buf.replace_in_line(row, start, end, &item.insert);
+                    buf.set_cursor(row, start + item.insert.chars().count());
+                    cursors[0] = buf.cursor();
+                    inserted.push_str(&item.insert);
+                }
+            }
+            // Opening it: only with no snippet live, since Ctrl-N is
+            // that feature's own "next placeholder" while one is.
+            Key::CtrlN if live.is_none() => {
+                let (row, col) = buf.cursor();
+                let line = buf.line_chars(row);
+                let word_start = crate::bishedit::completion::find_word_start(&line, col.min(line.len()));
+                let all = services.complete(buf, row, col);
+                if !all.is_empty() {
+                    let mut state = LiveCompletion { all, shown: Vec::new(), selected: 0, row, word_start };
+                    if state.refilter(buf) {
+                        completing = Some(state);
+                    }
+                }
+            }
             // --- a live `abbr` snippet owns these eight keys, exactly as
             // it does at the shell prompt (editor.rs) ------------------
             // Tab advances rather than indenting, Ctrl-E cancels back to
@@ -1594,8 +1789,25 @@ pub(crate) fn run_insert_mode(
         // TextBuffer::snippet_holes), and one place to write them is one
         // place for them to go stale.
         buf.snippet_holes = live.as_ref().map(snippet_holes).unwrap_or_default();
+        // Narrowed after the key has been applied, not before: what
+        // matters is the word as it stands now, and every arm above
+        // that changes it has already run.
+        if let Some(state) = completing.as_mut()
+            && !state.refilter(buf)
+        {
+            completing = None;
+        }
         scroll_to_show_cursor(buf, editor_content_cols(buf, rect));
         render_editor_frame(buf, vk, mode, rect, term_rows, term_cols, color_overrides);
+        if let Some(state) = completing.as_ref() {
+            let (row, col) = buf.cursor();
+            let chars = buf.line_chars(row);
+            let gutter = rect.cols.saturating_sub(editor_content_cols(buf, rect));
+            let screen_row = rect.row + row.saturating_sub(buf.viewport_top());
+            let screen_col = rect.col + gutter + crate::bishedit::unicode_width::col_of(&chars, col).saturating_sub(buf.viewport_left());
+            print!("{}", render_completion_popup(&state.items(), state.selected, screen_row, screen_col, rect));
+            let _ = io::stdout().flush();
+        }
     }
 }
 
@@ -3825,7 +4037,7 @@ mod macro_tests {
             KeyOutcome::Motion(m, count) => motion::apply_motion(buf, m, count),
             KeyOutcome::EnterInsert(cmd) => {
                 resolve_insert_start(buf, cmd);
-                run_insert_mode(buf, vk, rect(), registers, &mut |_| None, false, 24, 80, None, &[], &[]).unwrap();
+                run_insert_mode(buf, vk, rect(), registers, &mut NoInsertServices, false, 24, 80, None, &[], &[]).unwrap();
             }
             other => panic!("unexpected outcome in this test: {other:?}"),
         }
@@ -3864,7 +4076,7 @@ mod macro_tests {
         }
         vk.stop_recording();
         assert!(vk.queue_macro_replay('a', 1));
-        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut |_| None, false, 24, 80, None, &[], abbrs).unwrap();
+        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut NoInsertServices, false, 24, 80, None, &[], abbrs).unwrap();
         buf
     }
 
@@ -3959,7 +4171,7 @@ mod macro_tests {
         }
         vk.stop_recording();
         assert!(vk.queue_macro_replay('a', 1));
-        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut |_| None, true, 24, 80, None, &[], &abbrs).unwrap();
+        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut NoInsertServices, true, 24, 80, None, &[], &abbrs).unwrap();
         assert_eq!(text_of(&buf), "pl ");
     }
 
@@ -4068,7 +4280,7 @@ mod multi_cursor_insert_tests {
         let mut registers = Registers::new_for_test();
         scripted(&mut vk, &[Key::Char('D'), Key::Char('O'), Key::Char('N'), Key::Char('E'), Key::Escape]);
 
-        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut |_| None, false, 24, 80, None, &[(1, 0), (2, 0)], &[]).unwrap();
+        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut NoInsertServices, false, 24, 80, None, &[(1, 0), (2, 0)], &[]).unwrap();
 
         assert_eq!(line(&buf, 0), "DONE one");
         assert_eq!(line(&buf, 1), "DONE two");
@@ -4084,7 +4296,7 @@ mod multi_cursor_insert_tests {
         let mut registers = Registers::new_for_test();
         scripted(&mut vk, &[Key::Backspace, Key::Escape]);
 
-        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut |_| None, false, 24, 80, None, &[(1, 1)], &[]).unwrap();
+        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut NoInsertServices, false, 24, 80, None, &[(1, 1)], &[]).unwrap();
 
         assert_eq!(line(&buf, 0), " one");
         assert_eq!(line(&buf, 1), " two");
@@ -4099,7 +4311,7 @@ mod multi_cursor_insert_tests {
         let mut registers = Registers::new_for_test();
         scripted(&mut vk, &[Key::Enter, Key::Escape]);
 
-        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut |_| None, false, 24, 80, None, &[(1, 1)], &[]).unwrap();
+        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut NoInsertServices, false, 24, 80, None, &[(1, 1)], &[]).unwrap();
 
         assert_eq!(buf.line_count(), 4);
         assert_eq!(line(&buf, 0), "a");
@@ -4120,7 +4332,7 @@ mod multi_cursor_insert_tests {
         let mut registers = Registers::new_for_test();
         scripted(&mut vk, &[Key::Char('X'), Key::Escape]);
 
-        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut |_| None, false, 24, 80, None, &[(0, 6)], &[]).unwrap();
+        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut NoInsertServices, false, 24, 80, None, &[(0, 6)], &[]).unwrap();
 
         assert_eq!(line(&buf, 0), "X placeX ");
     }
@@ -4156,7 +4368,7 @@ mod insert_mode_exit_clamp_tests {
         let mut registers = Registers::new_for_test();
         scripted(&mut vk, &[Key::Escape]);
 
-        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut |_| None, false, 24, 80, None, &[], &[]).unwrap();
+        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut NoInsertServices, false, 24, 80, None, &[], &[]).unwrap();
 
         assert_eq!(buf.cursor(), (0, 1), "cursor must land on 'b', not past it");
     }
@@ -4169,7 +4381,7 @@ mod insert_mode_exit_clamp_tests {
         let mut registers = Registers::new_for_test();
         scripted(&mut vk, &[Key::Char('h'), Key::Char('i'), Key::Escape]);
 
-        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut |_| None, false, 24, 80, None, &[], &[]).unwrap();
+        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut NoInsertServices, false, 24, 80, None, &[], &[]).unwrap();
 
         assert_eq!(buf.cursor(), (0, 1), "cursor must land on the 'i', not past it");
     }
@@ -4185,7 +4397,7 @@ mod insert_mode_exit_clamp_tests {
         let mut registers = Registers::new_for_test();
         scripted(&mut vk, &[Key::Escape]);
 
-        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut |_| None, false, 24, 80, None, &[], &[]).unwrap();
+        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut NoInsertServices, false, 24, 80, None, &[], &[]).unwrap();
 
         assert_eq!(buf.get_mark('^'), Some((0, 2)));
     }
@@ -4198,7 +4410,7 @@ mod insert_mode_exit_clamp_tests {
         let mut registers = Registers::new_for_test();
         scripted(&mut vk, &[Key::Escape]);
 
-        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut |_| None, false, 24, 80, None, &[], &[]).unwrap();
+        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut NoInsertServices, false, 24, 80, None, &[], &[]).unwrap();
 
         assert_eq!(buf.cursor(), (0, 0));
     }
@@ -4245,7 +4457,7 @@ mod insert_mode_ctrl_w_tests {
         keys.push(Key::CtrlW);
         scripted(&mut vk, &keys);
 
-        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut |_| None, false, 24, 80, None, &[], &[]).unwrap();
+        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut NoInsertServices, false, 24, 80, None, &[], &[]).unwrap();
 
         assert_eq!(line(&buf, 0), "hello ");
         assert_eq!(buf.cursor(), (0, 6));
@@ -4262,7 +4474,7 @@ mod insert_mode_ctrl_w_tests {
         keys.push(Key::CtrlW);
         scripted(&mut vk, &keys);
 
-        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut |_| None, false, 24, 80, None, &[], &[]).unwrap();
+        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut NoInsertServices, false, 24, 80, None, &[], &[]).unwrap();
 
         assert_eq!(line(&buf, 0), "", "both words should be gone");
     }
@@ -4276,7 +4488,7 @@ mod insert_mode_ctrl_w_tests {
         let mut registers = Registers::new_for_test();
         scripted(&mut vk, &[Key::CtrlW]);
 
-        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut |_| None, false, 24, 80, None, &[], &[]).unwrap();
+        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut NoInsertServices, false, 24, 80, None, &[], &[]).unwrap();
 
         assert_eq!(line(&buf, 0), "existing ");
     }
@@ -4289,7 +4501,7 @@ mod insert_mode_ctrl_w_tests {
         let mut registers = Registers::new_for_test();
         scripted(&mut vk, &[Key::CtrlW, Key::Char('x')]);
 
-        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut |_| None, false, 24, 80, None, &[], &[]).unwrap();
+        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut NoInsertServices, false, 24, 80, None, &[], &[]).unwrap();
 
         assert_eq!(line(&buf, 0), "x");
     }
@@ -4325,7 +4537,7 @@ mod insert_mode_alt_word_motion_tests {
         let mut registers = Registers::new_for_test();
         scripted(&mut vk, &[Key::AltLeft, Key::Escape]);
 
-        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut |_| None, false, 24, 80, None, &[], &[]).unwrap();
+        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut NoInsertServices, false, 24, 80, None, &[], &[]).unwrap();
 
         assert_eq!(buf.line_chars(0).into_iter().collect::<String>(), "hello world", "nothing should be deleted");
         assert_eq!(buf.cursor(), (0, 6), "cursor should land at the start of 'world', matching vim's own `b`");
@@ -4340,7 +4552,7 @@ mod insert_mode_alt_word_motion_tests {
         let mut registers = Registers::new_for_test();
         scripted(&mut vk, &[Key::AltRight, Key::Escape]);
 
-        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut |_| None, false, 24, 80, None, &[], &[]).unwrap();
+        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut NoInsertServices, false, 24, 80, None, &[], &[]).unwrap();
 
         assert_eq!(buf.line_chars(0).into_iter().collect::<String>(), "hello world", "nothing should be deleted");
         assert_eq!(buf.cursor(), (0, 6), "cursor should land at the start of 'world', matching vim's own `w`");
@@ -4355,7 +4567,7 @@ mod insert_mode_alt_word_motion_tests {
         let mut registers = Registers::new_for_test();
         scripted(&mut vk, &[Key::AltLeft, Key::Char('X'), Key::Escape]);
 
-        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut |_| None, false, 24, 80, None, &[], &[]).unwrap();
+        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut NoInsertServices, false, 24, 80, None, &[], &[]).unwrap();
 
         assert_eq!(buf.line_chars(0).into_iter().collect::<String>(), "hello Xworld");
     }
