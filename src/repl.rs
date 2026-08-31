@@ -6103,6 +6103,13 @@ impl NavBuffer {
     // toggle `set_readonly`/`breakpoints` in the first place. Vim-motion
     // content mutation is gated separately, at each individual
     // KeyOutcome/raw-key arm below, via `as_writable_mut`.
+    fn as_editable(&self) -> Option<&TextBuffer> {
+        match self {
+            NavBuffer::ReadOnly(_) => None,
+            NavBuffer::Editable(b) => Some(b),
+        }
+    }
+
     fn as_editable_mut(&mut self) -> Option<&mut TextBuffer> {
         match self {
             NavBuffer::ReadOnly(_) => None,
@@ -8196,6 +8203,37 @@ fn run_normal_mode_navigation(
                     buf.set_cursor(row, col);
                     let content_cols = nav_content_cols(&buf, rect);
                     nav_scroll_to_show_cursor(&mut buf, content_cols);
+                    render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides.as_ref());
+                    continue;
+                }
+                // Nothing left in *this buffer's* list. In vim the jump
+                // list spans files, so `Ctrl-O` after a `gd` into
+                // another one goes back to where the question was asked
+                // -- and this list cannot, because it lives in the
+                // per-buffer `VimKeys` and the opened file got a fresh
+                // one.
+                //
+                // Going back here means leaving this frame, since a
+                // cross-file jump opened it *on top of* the frame it
+                // came from. That is exactly what `:q` already does, so
+                // this takes the same exit rather than inventing a
+                // second way out -- which also gets the close hooks,
+                // the language server's `didClose` and the sibling-pane
+                // cleanup right for free.
+                if !forward && edit_frame_id.is_some() {
+                    let pane = windows[*current_window].pane(windows[*current_window].focused_pane);
+                    let beneath_is_edit = pane.stack.len() >= 2 && matches!(pane.stack[pane.stack.len() - 2], Frame::Edit(_));
+                    if beneath_is_edit {
+                        // Unsaved work is not something to close out
+                        // from under someone, and `:q` refuses it for
+                        // the same reason.
+                        if buf.as_editable().is_some_and(|tb| tb.is_dirty()) {
+                            render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides.as_ref());
+                            show_command_mode_error("bish: unsaved changes -- :w or :q! before jumping back", *term_rows, *term_cols);
+                            continue;
+                        }
+                        break 'nav (NavExit::Quit, nav_buffer_into_edit_state(buf, vk));
+                    }
                 }
                 render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides.as_ref());
             }
@@ -9603,7 +9641,90 @@ const CMD_ECHO_FG: &str = "\x1b[1m";
 // overlay and the transcript view so both always paint a full-width,
 // unambiguously-edged line rather than leaving stray real-terminal
 // content peeking out past a short one.
+// Tabs, as the terminal will actually draw them: out to the next
+// multiple of eight, counting only what is visible (an SGR sequence
+// occupies no columns).
+//
+// A fixed-width bar cannot leave these alone. `visible_len` counts a
+// tab as one column because a per-character width is all it can
+// return, but a terminal draws it as up to eight -- so a line holding
+// one is padded as though it were short, overflows `cols`, and wraps
+// onto the row below. That row is the mode line, which is what made
+// `::bish lsp status` (tab-separated, like every `ls` this shell has)
+// look spliced into the file and spilling over the status bar.
+// Expanding here rather than at each call site keeps the "this draws
+// exactly `cols` columns" promise in the one place that makes it.
+const TAB_STOP: usize = 8;
+
+fn expand_tabs(text: &str) -> String {
+    if !text.contains('\t') {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut column = 0usize;
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' && chars.peek() == Some(&'[') {
+            out.push(c);
+            for c2 in chars.by_ref() {
+                out.push(c2);
+                if c2 == 'm' {
+                    break;
+                }
+            }
+            continue;
+        }
+        if c == '\t' {
+            let width = TAB_STOP - (column % TAB_STOP);
+            out.push_str(&" ".repeat(width));
+            column += width;
+            continue;
+        }
+        out.push(c);
+        column += crate::bishedit::unicode_width::char_width(c);
+    }
+    out
+}
+
+
+#[cfg(test)]
+mod overlay_tab_tests {
+    use super::*;
+
+    // The bug this exists for: a tab-separated line (every `ls` in this
+    // shell prints one) was padded as though each tab were one column,
+    // overflowed the row, and wrapped onto the mode line -- which is
+    // what made `::bish lsp status` look spliced into the file.
+    #[test]
+    fn a_tabbed_line_still_draws_exactly_one_row_wide() {
+        let row = "1\tready\tutf-32\t1\t/home/jussi/bish\trust-analyzer";
+        let drawn = styled_full_width_line(row, OUTPUT_BG, OUTPUT_FG, 80);
+        assert_eq!(editor::visible_len(&drawn), 80, "one row, no more and no less");
+        assert!(!drawn.contains('\t'), "a tab left in would be re-expanded by the terminal");
+    }
+
+    #[test]
+    fn tabs_advance_to_the_next_multiple_of_eight() {
+        assert_eq!(expand_tabs("a\tb"), "a       b");
+        assert_eq!(expand_tabs("abcdefg\tb"), "abcdefg b");
+        // Exactly on a stop still advances a whole one, as a terminal does.
+        assert_eq!(expand_tabs("abcdefgh\tb"), "abcdefgh        b");
+        // A line with none is handed back untouched.
+        assert_eq!(expand_tabs("plain"), "plain");
+        // SGR occupies no columns, so it must not shift the stops.
+        assert_eq!(expand_tabs("\x1b[1ma\x1b[0m\tb"), "\x1b[1ma\x1b[0m       b");
+    }
+
+    // Long output is truncated rather than wrapped, for the same reason.
+    #[test]
+    fn a_line_wider_than_the_row_is_cut_to_it() {
+        let wide = "x".repeat(50) + "\t" + &"y".repeat(50);
+        assert_eq!(editor::visible_len(&styled_full_width_line(&wide, OUTPUT_BG, OUTPUT_FG, 40)), 40);
+    }
+}
+
 fn styled_full_width_line(text: &str, bg: &str, fg: &str, cols: usize) -> String {
+    let text = &expand_tabs(text);
     let mut out = String::new();
     out.push_str(bg);
     out.push_str(fg);
