@@ -569,6 +569,11 @@ impl Server {
                             "references".to_string(),
                             Value::Object(vec![("dynamicRegistration".to_string(), Value::Bool(false))]),
                         ),
+                        // "Where else in this file is what I'm on."
+                        (
+                            "documentHighlight".to_string(),
+                            Value::Object(vec![("dynamicRegistration".to_string(), Value::Bool(false))]),
+                        ),
                         (
                             "definition".to_string(),
                             Value::Object(vec![("dynamicRegistration".to_string(), Value::Bool(false))]),

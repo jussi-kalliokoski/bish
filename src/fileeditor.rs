@@ -3693,6 +3693,11 @@ fn render_row(
     line_styled: &[StyledSpan],
     diag_styled: &[StyledSpan],
     highlights: &[StyledSpan],
+    // Attribute-only marks composed *over* whatever colour the layers
+    // above resolved to, rather than replacing it -- today, the
+    // language server's own "these are the same symbol" answer. See
+    // `highlight::compose_attrs`.
+    attr_overlay: &[StyledSpan],
     links: &[highlight::LinkSpan],
 ) {
     let limit = end_cell.min(display.cells.len());
@@ -3734,13 +3739,15 @@ fn render_row(
     let line_styled = clamp(line_styled);
     let diag_styled = clamp(diag_styled);
     let highlights = clamp(highlights);
+    let attr_overlay = clamp(attr_overlay);
 
     let links: Vec<highlight::LinkSpan> = links
         .iter()
         .filter(|l| l.start < chars.len())
         .map(|l| highlight::LinkSpan { start: l.start, end: l.end.min(chars.len()), url: l.url.clone() })
         .collect();
-    let cells = highlight::compose(&chars, &[&line_styled, &diag_styled, &highlights]);
+    let mut cells = highlight::compose(&chars, &[&line_styled, &diag_styled, &highlights]);
+    highlight::compose_attrs(&mut cells, &attr_overlay);
     let mut rendered = highlight::render_linked(&cells, &links);
     if !buf.wrap.wrap {
         if truncated_right && !buf.wrap.extends.is_empty() {
@@ -3994,6 +4001,10 @@ pub fn build_editor_frame(
                     .collect()
             };
             let line_styled = map(spans_for_line(&whole_styled, starts[line], line_len));
+            // The server's `documentHighlight` answer, kept on its own
+            // axis so an occurrence keeps its colour and gains an
+            // underline rather than losing one for the other.
+            let line_marks = map(spans_for_line(&buf.document_highlights, starts[line], line_len));
             let diag_styled = map(diagnostic_spans_for_line(buf, &buf.diagnostics, starts[line], line_len));
             let links: Vec<highlight::LinkSpan> = links_for_line(&whole_links, starts[line], line_len)
                 .into_iter()
@@ -4003,7 +4014,7 @@ pub fn build_editor_frame(
                 })
                 .collect();
             out.push_str(&prefix);
-            render_row(&mut out, buf, &display, start_cell, end_cell, avail, &line_styled, &diag_styled, &highlights, &links);
+            render_row(&mut out, buf, &display, start_cell, end_cell, avail, &line_styled, &diag_styled, &highlights, &line_marks, &links);
         }
     }
 
@@ -6063,6 +6074,46 @@ mod pre_save_hook_tests {
             "expected the cursor on row 3 column {}, got:\n{frame:?}",
             gutter + 2
         );
+    }
+
+    // The language server's "these are the same symbol" marks compose
+    // over the colour already there rather than replacing it -- the one
+    // thing that distinguishes this layer from the search and selection
+    // ones, and the thing a regression would silently undo.
+    #[test]
+    fn document_highlights_underline_without_taking_the_colour_off() {
+        let mut buf = TextBuffer::new_unnamed(10);
+        buf.insert_text((0, 0), "alpha beta alpha");
+        buf.set_cursor(0, 0);
+        let rect = Rect { row: 0, col: 0, rows: 4, cols: 40 };
+        let plain = build_editor_frame(&buf, &VimKeys::new(), EditorMode::Normal, rect, 0, 0, None);
+        assert!(!plain.contains("\x1b[4m") && !plain.contains(";4m"), "nothing underlined yet:\n{plain:?}");
+
+        buf.document_highlights = vec![
+            highlight::StyledSpan {
+                start: 0,
+                end: 5,
+                fg: vt100::Color::Default,
+                attrs: vt100::CellAttrs { underline: true, ..vt100::CellAttrs::default() },
+            },
+            highlight::StyledSpan {
+                start: 11,
+                end: 16,
+                fg: vt100::Color::Default,
+                attrs: vt100::CellAttrs { underline: true, bold: true, ..vt100::CellAttrs::default() },
+            },
+        ];
+        let marked = build_editor_frame(&buf, &VimKeys::new(), EditorMode::Normal, rect, 0, 0, None);
+        // The read is underlined; the write is underlined *and* bold,
+        // which is what distinguishes "assigned here" from "used here".
+        assert!(marked.contains("\x1b[0;4malpha"), "expected an underlined read:\n{marked:?}");
+        assert!(marked.contains("\x1b[0;1;4malpha"), "expected a bold underlined write:\n{marked:?}");
+        // The word between them keeps no marking at all.
+        assert!(marked.contains("\x1b[0m beta "), "{marked:?}");
+        // And the marks are gone the moment the buffer's are.
+        buf.document_highlights.clear();
+        let cleared = build_editor_frame(&buf, &VimKeys::new(), EditorMode::Normal, rect, 0, 0, None);
+        assert_eq!(cleared, plain, "clearing the marks restores exactly the unmarked frame");
     }
 
     fn csv_buf(text: &str) -> TextBuffer {

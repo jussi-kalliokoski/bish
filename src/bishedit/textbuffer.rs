@@ -102,6 +102,17 @@ pub struct TextBuffer {
     // next answer arrives is a colour in the wrong place, and clearing
     // them on every keystroke would strobe the whole file instead.
     pub semantic_spans: Vec<super::highlight::StyledSpan>,
+    /// Where else in this file the thing under the cursor appears, as
+    /// the language server sees it (`textDocument/documentHighlight`).
+    /// Whole-buffer char offsets, like `semantic_spans`.
+    ///
+    /// Only the attributes are used: these compose over the colour
+    /// already there rather than replacing it (see
+    /// `highlight::compose_attrs`), because the point of the mark is
+    /// "this is the same symbol", not "this is something else".
+    /// Refreshed on the idle tick as the cursor moves, and emptied as
+    /// soon as it moves somewhere the server has nothing to say about.
+    pub document_highlights: Vec<super::highlight::StyledSpan>,
     // A fingerprint of the file's bytes as of the last read or write, for
     // noticing that something else rewrote it since. `None` for a buffer
     // that is not a view of a file on disk at all.
@@ -286,6 +297,7 @@ impl TextBuffer {
             lsp_progress: None,
             lsp_message: None,
             semantic_spans: Vec::new(),
+            document_highlights: Vec::new(),
             diagnostics: Vec::new(),
             blame: None,
             diff: None,
@@ -413,6 +425,7 @@ impl TextBuffer {
             lsp_progress: None,
             lsp_message: None,
             semantic_spans: Vec::new(),
+            document_highlights: Vec::new(),
             diagnostics: Vec::new(),
             blame: None,
             diff: None,
@@ -1048,6 +1061,7 @@ mod tests {
             lsp_progress: None,
             lsp_message: None,
             semantic_spans: Vec::new(),
+            document_highlights: Vec::new(),
             diagnostics: Vec::new(),
             blame: None,
             diff: None,

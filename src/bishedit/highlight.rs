@@ -743,6 +743,34 @@ pub fn compose(chars: &[char], layers: &[&[StyledSpan]]) -> Vec<vt100::Cell> {
     cells
 }
 
+/// Adds `spans`' attributes to cells already composed, leaving every
+/// colour exactly as it was.
+///
+/// The other axis `compose` does not have. A `StyledSpan` *replaces*
+/// what is under it, which is right for a selection or a search match
+/// -- those are saying "this run is now something else" -- and wrong
+/// for a mark that means "and also, this one is the same symbol as the
+/// one under your cursor": stripping the colour off an identifier to
+/// point it out makes it stand out less, not more. Same reasoning
+/// `LinkSpan` is a separate type for, and the same shape: one axis
+/// composing over another rather than fighting it.
+///
+/// Attributes are OR-ed rather than assigned, so an underlined run
+/// inside a bold one ends up both.
+pub fn compose_attrs(cells: &mut [vt100::Cell], spans: &[StyledSpan]) {
+    for span in spans {
+        let end = span.end.min(cells.len());
+        for cell in cells.iter_mut().take(end).skip(span.start) {
+            cell.attrs.bold |= span.attrs.bold;
+            cell.attrs.dim |= span.attrs.dim;
+            cell.attrs.italic |= span.attrs.italic;
+            cell.attrs.underline |= span.attrs.underline;
+            cell.attrs.reverse |= span.attrs.reverse;
+            cell.attrs.strikethrough |= span.attrs.strikethrough;
+        }
+    }
+}
+
 // Turns a resolved cell sequence back into an SGR-coded string, reusing
 // vt100::sgr_codes -- the same run-coalescing step repl.rs's render_row
 // already does for a live pane's grid, just fed synthesized cells instead

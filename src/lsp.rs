@@ -541,6 +541,47 @@ pub struct Location {
     pub end: (usize, usize),
 }
 
+/// One occurrence of the thing under the cursor, in this same file:
+/// `textDocument/documentHighlight`'s answer.
+///
+/// No uri, unlike `Location` -- the request is about one document and
+/// every answer is inside it. `write` distinguishes the occurrences
+/// that *assign* to the symbol (kind 3) from the ones that only read it
+/// (kinds 1 and 2, and anything a server invents), which is the
+/// distinction worth drawing differently.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Highlight {
+    pub start: (usize, usize),
+    pub end: (usize, usize),
+    pub write: bool,
+}
+
+/// How many occurrences are worth marking. A `documentHighlight` for a
+/// name used everywhere in a generated file can run to thousands, and
+/// past a screenful the marks stop meaning anything anyway.
+const MAX_HIGHLIGHTS: usize = 512;
+
+/// Reads a `documentHighlight` result. A `null` -- "nothing here worth
+/// pointing at" -- is the ordinary answer when the cursor is on
+/// whitespace or a comment, so it is empty rather than an error.
+pub fn highlights(result: &Value) -> Vec<Highlight> {
+    let Value::Array(items) = result else { return Vec::new() };
+    items
+        .iter()
+        .take(MAX_HIGHLIGHTS)
+        .filter_map(|item| {
+            let (Ok(start), Ok(end)) = (json::query(item, ".range.start"), json::query(item, ".range.end")) else {
+                return None;
+            };
+            Some(Highlight {
+                start: position(start)?,
+                end: position(end)?,
+                write: matches!(json::query(item, ".kind"), Ok(Value::Number(k)) if *k == 3.0),
+            })
+        })
+        .collect()
+}
+
 /// Reads a definition-shaped result. Empty when the server had nothing
 /// -- a `null` result is the ordinary way of saying "I don't know where
 /// that is", not a failure.
@@ -1245,6 +1286,48 @@ pub fn from_server_column(line: &[char], server_col: usize, encoding: PositionEn
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn highlights_of(text: &str) -> Vec<Highlight> {
+        highlights(&json::parse(text).unwrap())
+    }
+
+    #[test]
+    fn document_highlights_carry_their_ranges_and_which_one_writes() {
+        let found = highlights_of(
+            r#"[{"range":{"start":{"line":2,"character":4},"end":{"line":2,"character":7}},"kind":1},
+                {"range":{"start":{"line":9,"character":0},"end":{"line":9,"character":3}},"kind":3},
+                {"range":{"start":{"line":11,"character":8},"end":{"line":11,"character":11}}}]"#,
+        );
+        assert_eq!(found.len(), 3);
+        assert_eq!((found[0].start, found[0].end), ((2, 4), (2, 7)));
+        assert!(!found[0].write, "kind 1 is a plain reference");
+        assert!(found[1].write, "kind 3 is a write");
+        // `kind` is optional, and the safe reading of an absent one is
+        // "a read": marking something as an assignment when it is not
+        // sends people to the wrong line.
+        assert!(!found[2].write);
+    }
+
+    #[test]
+    fn a_null_or_malformed_highlight_answer_is_simply_empty() {
+        // `null` is the ordinary answer for a cursor on whitespace.
+        assert!(highlights_of("null").is_empty());
+        assert!(highlights_of(r#"{"range":{"start":{"line":1,"character":0},"end":{"line":1,"character":2}}}"#).is_empty());
+        // An entry with no usable range is dropped; the ones beside it
+        // are not.
+        let mixed = highlights_of(
+            r#"[{"kind":1},
+                {"range":{"start":{"line":1,"character":0},"end":{"line":1,"character":2}}}]"#,
+        );
+        assert_eq!(mixed.len(), 1);
+    }
+
+    #[test]
+    fn an_absurd_number_of_highlights_is_capped() {
+        let one = r#"{"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":1}}}"#;
+        let many = format!("[{}]", vec![one; MAX_HIGHLIGHTS * 2].join(","));
+        assert_eq!(highlights_of(&many).len(), MAX_HIGHLIGHTS);
+    }
 
     fn decode_all(chunks: &[&[u8]]) -> Vec<Result<Message, String>> {
         let mut decoder = Decoder::new();
