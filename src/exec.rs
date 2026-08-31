@@ -588,6 +588,20 @@ pub struct LspServer {
     /// client stays a language server client rather than accumulating
     /// per-language knowledge.
     pub root_cmd: String,
+    /// `--apply-edits=`: how much authority this server has to change
+    /// files on its own.
+    ///
+    /// A server can ask the client to apply an edit at any moment
+    /// (`workspace/applyEdit`), not only in answer to something the
+    /// user asked for. That is how a command-style code action does its
+    /// work, and it is also how a server could rewrite a buffer nobody
+    /// invited it to touch -- so it is a policy rather than a fact.
+    ///
+    /// `scoped` (the default) accepts an edit only while a command the
+    /// *user chose* is still running; `never` refuses always, which is
+    /// what bish did before this existed; `always` accepts whenever
+    /// asked, which is what VS Code does.
+    pub apply_edits: String,
 }
 
 impl LspServer {
@@ -658,7 +672,8 @@ pub fn hook_help() -> Vec<String> {
 pub fn lsp_help() -> Vec<String> {
     vec![
         "::bish lsp ls [--lang=GLOB]            what is registered".to_string(),
-        "::bish lsp add [--lang=GLOB] [--root=NAME,...] [--root-cmd=CMD] COMMAND...".to_string(),
+        "::bish lsp add [--lang=GLOB] [--root=NAME,...] [--root-cmd=CMD]".to_string(),
+        "               [--apply-edits=scoped|never|always] COMMAND...".to_string(),
         "::bish lsp rm ID                       remove one, by the id `add` printed".to_string(),
         "::bish lsp status                      what is actually running".to_string(),
         "::bish lsp log ID                      what a server wrote to stderr".to_string(),
@@ -674,6 +689,11 @@ pub fn lsp_help() -> Vec<String> {
         "       line of output as the root, for a root only a build tool knows:".to_string(),
         "       --root-cmd 'json -r .workspace_root <(cargo metadata --no-deps --format-version 1)'".to_string(),
         "       Falls back to --root when it prints nothing or fails.".to_string(),
+        "--apply-edits says how far a server may change files on its own. A server".to_string(),
+        "       can ask at any moment, not only when you asked it for something:".to_string(),
+        "         scoped  (default) only while a command you chose is running".to_string(),
+        "         never             refuse always".to_string(),
+        "         always            accept whenever asked".to_string(),
         String::new(),
         "  ::bish lsp add --lang=rust --root=Cargo.toml,.git rust-analyzer".to_string(),
         String::new(),
@@ -3497,18 +3517,63 @@ impl Shell {
                 0
             }
             Some("add") => {
-                let (lang, rest) = match self.lsp_lang_flag("add", &args[1..]) {
-                    Ok(parsed) => parsed,
-                    Err(status) => return status,
-                };
-                let (root_markers, rest) = match self.lsp_root_flag(rest) {
-                    Ok(parsed) => parsed,
-                    Err(status) => return status,
-                };
-                let (root_cmd, rest) = match self.lsp_root_cmd_flag(rest) {
-                    Ok(parsed) => parsed,
-                    Err(status) => return status,
-                };
+                // Round-robin rather than a fixed order: with four
+                // flags, an order that only reads correctly one way
+                // means `--apply-edits=always --lang=rust rust-analyzer`
+                // silently tries to *run* `--apply-edits=always`. Each
+                // helper leaves the slice alone when its flag isn't at
+                // the front, so a pass that consumes nothing is the
+                // signal that what remains is the command.
+                let mut rest = &args[1..];
+                let mut lang = None;
+                let mut root_markers = None;
+                let mut root_cmd = String::new();
+                let mut apply_edits = "scoped".to_string();
+                loop {
+                    let before = rest.len();
+                    match self.lsp_lang_flag("add", rest) {
+                        Ok((found, after)) => {
+                            if found.is_some() {
+                                lang = found;
+                            }
+                            rest = after;
+                        }
+                        Err(status) => return status,
+                    }
+                    let mark = rest.len();
+                    match self.lsp_root_flag(rest) {
+                        Ok((found, after)) => {
+                            if after.len() != mark {
+                                root_markers = Some(found);
+                            }
+                            rest = after;
+                        }
+                        Err(status) => return status,
+                    }
+                    match self.lsp_root_cmd_flag(rest) {
+                        Ok((found, after)) => {
+                            if !found.is_empty() {
+                                root_cmd = found;
+                            }
+                            rest = after;
+                        }
+                        Err(status) => return status,
+                    }
+                    let mark = rest.len();
+                    match self.lsp_apply_edits_flag(rest) {
+                        Ok((found, after)) => {
+                            if after.len() != mark {
+                                apply_edits = found;
+                            }
+                            rest = after;
+                        }
+                        Err(status) => return status,
+                    }
+                    if rest.len() == before {
+                        break;
+                    }
+                }
+                let root_markers = root_markers.unwrap_or_else(|| vec![".git".to_string()]);
                 if rest.is_empty() {
                     sh_eprintln!(self, "bish: ::bish lsp: add: usage: ::bish lsp add [--lang=GLOB] [--root=NAME,...] COMMAND...");
                     return 2;
@@ -3521,6 +3586,7 @@ impl Shell {
                     command: rest.to_vec(),
                     root_markers,
                     root_cmd,
+                    apply_edits,
                 });
                 // The id is the return value, same as `hook add`: a
                 // config that registers something usually wants to be
@@ -3613,6 +3679,26 @@ impl Shell {
             },
             _ => Ok((String::new(), args)),
         }
+    }
+
+    // `--apply-edits=scoped|never|always`, defaulting to `scoped`.
+    fn lsp_apply_edits_flag<'a>(&mut self, args: &'a [String]) -> Result<(String, &'a [String]), i32> {
+        let (value, rest) = match args.first().map(String::as_str) {
+            Some(flag) if flag.starts_with("--apply-edits=") => (flag["--apply-edits=".len()..].to_string(), &args[1..]),
+            Some("--apply-edits") => match args.get(1) {
+                Some(v) => (v.clone(), &args[2..]),
+                None => {
+                    sh_eprintln!(self, "bish: ::bish lsp: add: --apply-edits needs scoped, never or always");
+                    return Err(2);
+                }
+            },
+            _ => return Ok(("scoped".to_string(), args)),
+        };
+        if !matches!(value.as_str(), "scoped" | "never" | "always") {
+            sh_eprintln!(self, "bish: ::bish lsp: add: --apply-edits: expected scoped, never or always, got '{value}'");
+            return Err(2);
+        }
+        Ok((value, rest))
     }
 
     /// The declared server for a file of `language`, if any -- the first
@@ -13884,6 +13970,40 @@ mod tests {
         assert_eq!(shell.run_lsp(&strs(&["add", "--root-cmd"])), 2);
         assert_eq!(shell.run_lsp(&strs(&["add", "--root-cmd", "   ", "x"])), 2);
         assert_eq!(shell.lsp_servers.len(), 2);
+    }
+
+    #[test]
+    fn apply_edits_is_a_named_policy_defaulting_to_scoped() {
+        let mut shell = Shell::new();
+        assert_eq!(shell.run_lsp(&strs(&["add", "--lang=rust", "rust-analyzer"])), 0);
+        assert_eq!(shell.lsp_servers[0].apply_edits, "scoped", "the default is the one that needs no thought");
+
+        assert_eq!(shell.run_lsp(&strs(&["add", "--apply-edits=always", "gopls"])), 0);
+        assert_eq!(shell.lsp_servers[1].apply_edits, "always");
+        assert_eq!(shell.run_lsp(&strs(&["add", "--apply-edits", "never", "clangd"])), 0);
+        assert_eq!(shell.lsp_servers[2].apply_edits, "never");
+
+        // A misspelling is a config error rather than a silent
+        // downgrade: "--apply-edits=alwyas" quietly meaning `scoped`
+        // is exactly the kind of thing nobody notices until a refactor
+        // does nothing.
+        assert_eq!(shell.run_lsp(&strs(&["add", "--apply-edits=sometimes", "x"])), 2);
+        assert_eq!(shell.run_lsp(&strs(&["add", "--apply-edits"])), 2);
+        assert_eq!(shell.lsp_servers.len(), 3);
+    }
+
+    // Four flags is enough that insisting on one order means the wrong
+    // one silently becomes part of the command to run.
+    #[test]
+    fn add_takes_its_flags_in_any_order() {
+        let mut shell = Shell::new();
+        assert_eq!(shell.run_lsp(&strs(&["add", "--apply-edits=always", "--root=Cargo.toml", "--lang=rust", "--root-cmd=cargo x", "ra", "--stdio"])), 0);
+        let server = &shell.lsp_servers[0];
+        assert_eq!(server.lang, "rust");
+        assert_eq!(server.root_markers, vec!["Cargo.toml".to_string()]);
+        assert_eq!(server.root_cmd, "cargo x");
+        assert_eq!(server.apply_edits, "always");
+        assert_eq!(server.command, vec!["ra".to_string(), "--stdio".to_string()]);
     }
 
     #[test]

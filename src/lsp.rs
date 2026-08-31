@@ -693,11 +693,17 @@ pub struct CodeAction {
     /// this -- so an action with no `edit` is not necessarily an action
     /// with nothing to do.
     pub unresolved: Value,
-    /// The server-side command this action runs instead of carrying an
-    /// edit. bish cannot execute one (that is `workspace/executeCommand`
-    /// and the `applyEdit` round trip it implies), so this exists to
-    /// say *why* an action was refused rather than to run it.
+    /// The name of the server-side command this action runs, for
+    /// saying which one when there is something to explain.
     pub command: Option<String>,
+    /// That same command verbatim -- `{command, arguments}` -- to hand
+    /// straight back in `workspace/executeCommand`.
+    ///
+    /// Deliberately not sanitized, and deliberately kept whole: the
+    /// `arguments` are the server's own opaque payload (rust-analyzer
+    /// puts entire computed edits in there), so anything but echoing
+    /// them back exactly is corruption.
+    pub invocation: Option<Value>,
     /// A server can offer an action and say it does not apply here,
     /// with a reason. Shown, and refused if chosen.
     pub disabled: Option<String>,
@@ -718,13 +724,14 @@ fn code_action(value: &Value) -> Option<CodeAction> {
     }
     // A bare `Command` has `command` as a string at the top level; a
     // `CodeAction`'s own `command` is an object with one inside.
-    let command = match json::query(value, ".command") {
-        Ok(Value::Str(name)) => Some(sanitize(name)),
+    let (command, invocation) = match json::query(value, ".command") {
+        // The bare-`Command` shape: this whole object is the command.
+        Ok(Value::Str(name)) => (Some(sanitize(name)), Some(value.clone())),
         Ok(object @ Value::Object(_)) => match json::query(object, ".command") {
-            Ok(Value::Str(name)) => Some(sanitize(name)),
-            _ => None,
+            Ok(Value::Str(name)) => (Some(sanitize(name)), Some(object.clone())),
+            _ => (None, None),
         },
-        _ => None,
+        _ => (None, None),
     };
     let edit = match json::query(value, ".edit") {
         Ok(edit @ Value::Object(_)) => Some(workspace_edit(edit)),
@@ -739,6 +746,7 @@ fn code_action(value: &Value) -> Option<CodeAction> {
         edit,
         unresolved: value.clone(),
         command,
+        invocation,
         disabled: match json::query(value, ".disabled.reason") {
             Ok(Value::Str(reason)) => Some(sanitize(reason)),
             _ => None,

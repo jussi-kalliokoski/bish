@@ -8784,6 +8784,7 @@ struct ServerTarget {
     // own idea of the same file (see url::from_file_path).
     uri: String,
     language_id: String,
+    apply_edits: lspclient::ApplyEdits,
 }
 
 // `None` -- meaning "this buffer has nothing to do with any language
@@ -8812,6 +8813,7 @@ fn server_target(session: &SessionState, buf: &TextBuffer) -> Option<ServerTarge
         root,
         uri: crate::url::from_file_path(&absolute),
         language_id: crate::lsp::language_id(&language).to_string(),
+        apply_edits: lspclient::ApplyEdits::from_name(&declared.apply_edits),
     })
 }
 
@@ -8919,7 +8921,7 @@ fn open_language_server_document(sessions: &mut HashMap<SessionId, SessionState>
     // The error is deliberately dropped: `get_or_start` records it on
     // the table, which is where `::bish lsp status` shows it, and there
     // is nowhere sensible to print mid-open.
-    let Ok(server) = table.get_or_start(target.id, &target.command, &target.display, &target.root) else { return };
+    let Ok(server) = table.get_or_start(target.id, &target.command, &target.display, &target.root, target.apply_edits) else { return };
     server.open_document(&target.uri, &target.language_id, buf.version(), &fileeditor::buffer_text(buf));
 }
 
@@ -9106,58 +9108,95 @@ fn code_actions_at_cursor(
     // A server may send an action without its edit and compute one only
     // for the action actually chosen. rust-analyzer does exactly this,
     // so an action with no edit is not an action with nothing to do.
-    let edit = match &action.edit {
-        Some(edit) => edit.clone(),
-        None => {
-            let resolved = ask_server(
-                sessions,
-                windows,
-                job_frames,
-                session_id,
-                current_window,
-                term_rows,
-                term_cols,
-                sinks_are_grid,
-                buf,
-                "codeAction/resolve",
-                "codeActionProvider",
-                match &action.unresolved {
-                    crate::json::Value::Object(fields) => fields.clone(),
-                    _ => Vec::new(),
-                },
-            );
-            match resolved.map(|r| crate::lsp::code_actions(&crate::json::Value::Array(vec![r]))) {
-                Some(mut one) if !one.is_empty() && one[0].edit.is_some() => one.remove(0).edit.unwrap(),
-                // Nothing to apply, and the honest reason: an action
-                // that only runs a server-side command needs
-                // `workspace/executeCommand` and the `applyEdit` round
-                // trip it implies, neither of which bish does.
-                _ => {
-                    return Some(match &action.command {
-                        Some(name) => format!("\"{}\" runs the server command {name}, which bish cannot do yet", action.title),
-                        None => format!("\"{}\" produced no edit", action.title),
-                    });
-                }
-            }
+    //
+    // Only asked for when there is nothing to go on yet: an action that
+    // already carries an edit, or names a command to run, is complete.
+    let action = if action.edit.is_none() && action.invocation.is_none() {
+        let resolved = ask_server(
+            sessions,
+            windows,
+            job_frames,
+            session_id,
+            current_window,
+            term_rows,
+            term_cols,
+            sinks_are_grid,
+            buf,
+            "codeAction/resolve",
+            "codeActionProvider",
+            match &action.unresolved {
+                crate::json::Value::Object(fields) => fields.clone(),
+                _ => Vec::new(),
+            },
+        );
+        match resolved.map(|r| crate::lsp::code_actions(&crate::json::Value::Array(vec![r]))) {
+            Some(mut one) if !one.is_empty() => one.remove(0),
+            _ => action.clone(),
         }
+    } else {
+        action.clone()
     };
-    if !edit.unsupported.is_empty() {
-        return Some(format!("that action also needs to {} files, which bish cannot do yet -- nothing changed", edit.unsupported.join("/")));
-    }
-    if edit.changes.is_empty() {
-        return Some(format!("\"{}\" changed nothing", action.title));
-    }
-    match apply_workspace_edit(edit_frames, buf, &edit, encoding) {
-        Ok((written, unsaved)) => {
-            let total = written + unsaved;
-            let mut message = format!("{} -- {total} file{}", action.title, if total == 1 { "" } else { "s" });
-            if unsaved > 0 {
-                message.push_str(&format!(" ({unsaved} open, unsaved -- :w to keep)"));
-            }
-            Some(message)
+
+    // Both halves, in the order the spec gives them: the edit first,
+    // then the command. An action is allowed to have either, or both --
+    // "apply this rewrite, then re-run the thing it was in the middle
+    // of" is one action, not two.
+    let mut written = 0;
+    let mut unsaved = 0;
+    let mut did_something = false;
+    if let Some(edit) = &action.edit {
+        if !edit.unsupported.is_empty() {
+            return Some(format!("that action also needs to {} files, which bish cannot do yet -- nothing changed", edit.unsupported.join("/")));
         }
-        Err(e) => Some(e),
+        if !edit.changes.is_empty() {
+            match apply_workspace_edit(edit_frames, buf, edit, encoding) {
+                Ok((w, u)) => {
+                    written += w;
+                    unsaved += u;
+                    did_something = true;
+                }
+                Err(e) => return Some(e),
+            }
+        }
     }
+    if let Some(invocation) = &action.invocation {
+        match run_server_command(
+            sessions,
+            windows,
+            job_frames,
+            edit_frames,
+            session_id,
+            current_window,
+            term_rows,
+            term_cols,
+            sinks_are_grid,
+            buf,
+            invocation,
+        ) {
+            Ok((w, u)) => {
+                written += w;
+                unsaved += u;
+                did_something = true;
+            }
+            // Reported with the action's own title, since "that command
+            // timed out" on its own does not say which one.
+            Err(why) => return Some(format!("\"{}\": {why}", action.title)),
+        }
+    }
+    if !did_something {
+        return Some(format!("\"{}\" produced no edit", action.title));
+    }
+    let total = written + unsaved;
+    if total == 0 {
+        // A command that ran and asked for nothing. Not an error --
+        // plenty of server commands only move the server's own state.
+        return Some(format!("{} -- nothing to change here", action.title));
+    }
+    let mut message = format!("{} -- {total} file{}", action.title, if total == 1 { "" } else { "s" });
+    if unsaved > 0 {
+        message.push_str(&format!(" ({unsaved} open, unsaved -- :w to keep)"));
+    }
+    Some(message)
 }
 
 // Draws a labelled list at the cursor and lets one be chosen. `None` if
@@ -9539,6 +9578,127 @@ fn ask_server(
         }
     }
     None
+}
+
+// Runs a server-side command and applies whatever it asks for on the
+// way.
+//
+// This is the other half of a command-style code action, and the reason
+// it cannot go through `ask_server`: the command's *result* is almost
+// always `null`. The work arrives as a separate `workspace/applyEdit`
+// request from the server, mid-command, and answering it is what makes
+// the command finish at all -- a server waiting on that reply will sit
+// there until the timeout otherwise.
+//
+// So the wait loop here is `ask_server`'s with one thing added: each
+// tick, whatever edits the server parked (see `Server::take_apply_edit`
+// -- only edits the `--apply-edits` policy already accepted get parked)
+// are applied and answered. That is also what defines the scope in
+// `--apply-edits=scoped`: the window is open from the request going out
+// to its response coming back, and `refuse_pending_applies` closes it
+// on every exit from this function, including the timeout.
+//
+// Returns how many files were changed and how many of those are open
+// and unsaved, or an error to show.
+#[allow(clippy::too_many_arguments)]
+fn run_server_command(
+    sessions: &mut HashMap<SessionId, SessionState>,
+    windows: &mut [WindowEntry],
+    job_frames: &mut HashMap<JobFrameId, exec::FgJob>,
+    edit_frames: &mut HashMap<EditFrameId, fileeditor::EditSession>,
+    session_id: SessionId,
+    current_window: usize,
+    term_rows: &mut usize,
+    term_cols: &mut usize,
+    sinks_are_grid: bool,
+    buf: &mut TextBuffer,
+    invocation: &crate::json::Value,
+) -> Result<(usize, usize), String> {
+    let Some(session) = sessions.get(&session_id) else { return Err("no session".to_string()) };
+    let Some(target) = server_target(session, buf) else { return Err("no language server for this file".to_string()) };
+    let timeout = std::time::Duration::from_millis(session.shell.bishopt_int("lsp_timeout_ms").max(0) as u64);
+    let encoding = server_encoding_for(sessions, session_id, buf).unwrap_or(crate::lsp::PositionEncoding::Utf16);
+    let lsp = Rc::clone(&sessions.get(&session_id).expect("checked").lsp);
+
+    let id = {
+        let mut table = lsp.borrow_mut();
+        let Some(server) = table.running(&target.display, &target.root) else { return Err("that server is not running".to_string()) };
+        if !server.is_ready() {
+            return Err("that server is still starting up".to_string());
+        }
+        if !server.provides("executeCommandProvider") {
+            return Err("that server did not say it runs commands".to_string());
+        }
+        if server.apply_edits() == lspclient::ApplyEdits::Never {
+            return Err("this server is configured --apply-edits=never, so its commands cannot change anything".to_string());
+        }
+        let mut params = match invocation {
+            crate::json::Value::Object(fields) => fields.clone(),
+            _ => Vec::new(),
+        };
+        // A `Command`'s own `title` is menu text, not a parameter.
+        params.retain(|(name, _)| name == "command" || name == "arguments");
+        server.execute_command(crate::json::Value::Object(params))
+    };
+
+    let mut written = 0;
+    let mut unsaved = 0;
+    let mut failure = None;
+    let deadline = std::time::Instant::now() + timeout;
+    let mut done = false;
+    while !done && std::time::Instant::now() < deadline {
+        service_background_jobs(sessions, windows, job_frames, current_window, term_rows, term_cols, sinks_are_grid);
+        loop {
+            let taken = {
+                let mut table = lsp.borrow_mut();
+                match table.running(&target.display, &target.root) {
+                    Some(server) => server.take_apply_edit(),
+                    None => None,
+                }
+            };
+            let Some((request_id, params)) = taken else { break };
+            // The edit is applied with the table *not* borrowed:
+            // writing a file can reach back into the same table (an
+            // open buffer's own `didChange`), and holding the borrow
+            // across that is how a RefCell panic gets written.
+            let edit = crate::lsp::workspace_edit(&crate::json::query(&params, ".edit").cloned().unwrap_or(crate::json::Value::Null));
+            let applied = if !edit.unsupported.is_empty() {
+                failure = Some(format!("that command wanted to {} files, which bish cannot do -- nothing changed", edit.unsupported.join("/")));
+                false
+            } else {
+                match apply_workspace_edit(edit_frames, buf, &edit, encoding) {
+                    Ok((w, u)) => {
+                        written += w;
+                        unsaved += u;
+                        true
+                    }
+                    Err(why) => {
+                        failure = Some(why);
+                        false
+                    }
+                }
+            };
+            if let Some(server) = lsp.borrow_mut().running(&target.display, &target.root) {
+                server.reply_to_apply(request_id, applied);
+            }
+        }
+        let mut table = lsp.borrow_mut();
+        let Some(server) = table.running(&target.display, &target.root) else { break };
+        if let Some(result) = server.take_response(id) {
+            if let Err(e) = result {
+                failure = Some(format!("the server refused to run it: {}", e.message));
+            }
+            done = true;
+        }
+    }
+    if let Some(server) = lsp.borrow_mut().running(&target.display, &target.root) {
+        server.refuse_pending_applies();
+    }
+    match failure {
+        Some(why) => Err(why),
+        None if !done => Err("that command timed out".to_string()),
+        None => Ok((written, unsaved)),
+    }
 }
 
 // The position encoding the server for this buffer negotiated, if there

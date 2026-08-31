@@ -218,14 +218,71 @@ pub struct Server {
     capabilities: Value,
     sync: Sync,
     documents: Vec<Document>,
+    apply_edits: ApplyEdits,
+    // Ids of `workspace/executeCommand` requests still waiting for a
+    // response. Non-empty is what "a command the user chose is running"
+    // means for `ApplyEdits::Scoped`.
+    commands: Vec<i64>,
+    // Server-requested edits accepted by policy and not yet applied.
+    // Deliberately unanswered: the reply has to say whether the edit
+    // landed, and only the editor knows that, so the response waits for
+    // `take_apply_edit`'s caller to do the work.
+    applies: Vec<(Id, Value)>,
 }
+
+/// How far a server may go in changing files without being asked.
+///
+/// `workspace/applyEdit` is a request the *server* makes, at whatever
+/// moment it likes. That is how a command-style code action does its
+/// work -- the client runs `workspace/executeCommand`, and the edit
+/// comes back as a separate request rather than as the command's
+/// result -- but nothing in the protocol confines it to that moment. A
+/// server may ask to rewrite a file nobody was editing, at any point
+/// after the handshake.
+///
+/// So this is a policy and not a fact, and it is per declared server:
+/// a language server you wrote yesterday and a large one you installed
+/// from a distribution do not deserve the same latitude.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ApplyEdits {
+    /// Accept only while a command the user chose is still running.
+    ///
+    /// The default, and what makes command-style code actions work
+    /// without handing over a standing permission: the window is open
+    /// from the moment `workspace/executeCommand` goes out until its
+    /// response comes back, which is exactly the span a server needs to
+    /// carry out the thing that was picked from a menu.
+    #[default]
+    Scoped,
+    /// Refuse always. What bish did before this existed.
+    Never,
+    /// Accept whenever asked, which is what VS Code does.
+    Always,
+}
+
+impl ApplyEdits {
+    pub fn from_name(name: &str) -> ApplyEdits {
+        match name {
+            "never" => ApplyEdits::Never,
+            "always" => ApplyEdits::Always,
+            _ => ApplyEdits::Scoped,
+        }
+    }
+}
+
+/// The most server-requested edits held unanswered at once.
+///
+/// A server that asks faster than the editor applies is either broken
+/// or hostile; either way the answer past this point is a refusal
+/// rather than unbounded memory.
+const MAX_PENDING_APPLIES: usize = 8;
 
 impl Server {
     /// Spawns `command` in `root` and sends `initialize`. Returns as
     /// soon as the process exists -- the handshake completes later, in
     /// `service`, which is why the returned server starts out
     /// `Initializing` rather than usable.
-    pub fn start(id: u64, command: &[String], display: &str, root: &Path) -> Result<Server, String> {
+    pub fn start(id: u64, command: &[String], display: &str, root: &Path, apply_edits: ApplyEdits) -> Result<Server, String> {
         let Some((program, args)) = command.split_first() else {
             return Err("no command to run".to_string());
         };
@@ -279,6 +336,9 @@ impl Server {
             capabilities: Value::Null,
             sync: Sync::default(),
             documents: Vec::new(),
+            apply_edits,
+            commands: Vec::new(),
+            applies: Vec::new(),
         };
         let params = server.initialize_params();
         server.initialize_id = server.next_id;
@@ -426,7 +486,22 @@ impl Server {
                                 ("documentChanges".to_string(), Value::Bool(true)),
                                 ("resourceOperations".to_string(), Value::Array(Vec::new())),
                             ]),
-                        )]),
+                        ),
+                        // Declared to match the policy rather than
+                        // always: a server told `applyEdit: true` and
+                        // then refused every time has been lied to, and
+                        // some react by disabling the feature that
+                        // needed it anyway. Under `never` the honest
+                        // claim is that bish cannot do this.
+                        ("applyEdit".to_string(), Value::Bool(self.apply_edits != ApplyEdits::Never)),
+                        // The other half of a command-style code
+                        // action: the action names a command, and this
+                        // is how it gets run.
+                        (
+                            "executeCommand".to_string(),
+                            Value::Object(vec![("dynamicRegistration".to_string(), Value::Bool(false))]),
+                        ),
+                    ]),
                     ),
                 ]),
             ),
@@ -530,6 +605,7 @@ impl Server {
                     // definition nobody is still waiting for.
                     let _ = self.responses.remove(0);
                 }
+                self.commands.retain(|pending| pending != id);
                 self.responses.push((*id, result.clone()));
                 None
             }
@@ -552,6 +628,19 @@ impl Server {
             // the few a real server actually sends, so each of those
             // gets the reply a client with nothing to offer should give
             // (see `answer`).
+            // An edit the policy allows is not answered here: the
+            // reply reports whether it was applied, and this layer
+            // cannot apply anything. It is parked for the editor and
+            // answered by whoever picks it up.
+            Message::Request { id, method, params } if method == "workspace/applyEdit" && self.may_apply() => {
+                if self.applies.len() >= MAX_PENDING_APPLIES {
+                    let (id, _) = self.applies.remove(0);
+                    self.note("refused workspace/applyEdit: too many still waiting to be applied".to_string());
+                    self.respond(id, Ok(Value::Object(vec![("applied".to_string(), Value::Bool(false))])));
+                }
+                self.applies.push((id.clone(), params.clone()));
+                None
+            }
             Message::Request { id, method, params } => {
                 let (answer, note) = self.answer(method, params);
                 if let Some(note) = note {
@@ -611,11 +700,18 @@ impl Server {
             "client/registerCapability" | "client/unregisterCapability" => {
                 (Ok(Value::Null), Some(format!("accepted and ignored {method}: bish declares no dynamic registration")))
             }
-            // "Apply these edits to the workspace." Not implemented --
-            // and `applied: false` says exactly that in the server's own
-            // vocabulary, so it can tell the user its refactor did not
-            // happen instead of failing obscurely.
-            "workspace/applyEdit" => (Ok(Value::Object(vec![("applied".to_string(), Value::Bool(false))])), None),
+            // "Apply these edits to the workspace." Only reached when
+            // the policy says no (the yes case never gets here -- see
+            // `handle`). `applied: false` is a refusal in the server's
+            // own vocabulary, so it can tell the user its refactor did
+            // not happen instead of failing obscurely.
+            "workspace/applyEdit" => (
+                Ok(Value::Object(vec![("applied".to_string(), Value::Bool(false))])),
+                Some(match self.apply_edits {
+                    ApplyEdits::Never => "refused workspace/applyEdit: --apply-edits=never".to_string(),
+                    _ => "refused workspace/applyEdit: no command of yours was running".to_string(),
+                }),
+            ),
             // A message with buttons. Nothing displays it, so nothing
             // was chosen: `null` is the spec's own "user dismissed it".
             "window/showMessageRequest" => (Ok(Value::Null), None),
@@ -724,6 +820,53 @@ impl Server {
     /// Fire-and-forget. Held until the handshake finishes if it hasn't.
     pub fn notify(&mut self, method: &str, params: Value) {
         self.send(Message::Notification { method: method.to_string(), params });
+    }
+
+    /// Whether a server-requested edit would be accepted right now.
+    fn may_apply(&self) -> bool {
+        match self.apply_edits {
+            ApplyEdits::Never => false,
+            ApplyEdits::Always => true,
+            ApplyEdits::Scoped => !self.commands.is_empty(),
+        }
+    }
+
+    /// This server's declared `--apply-edits` policy.
+    pub fn apply_edits(&self) -> ApplyEdits {
+        self.apply_edits
+    }
+
+    /// Runs a server command, holding the `applyEdit` window open until
+    /// the response arrives. Returns the id to wait for.
+    pub fn execute_command(&mut self, params: Value) -> i64 {
+        let id = self.request("workspace/executeCommand", params);
+        self.commands.push(id);
+        id
+    }
+
+    /// Takes the next server-requested edit waiting to be applied. The
+    /// caller owes it a `reply_to_apply`, or the server waits forever.
+    pub fn take_apply_edit(&mut self) -> Option<(Id, Value)> {
+        if self.applies.is_empty() {
+            None
+        } else {
+            Some(self.applies.remove(0))
+        }
+    }
+
+    /// Answers one edit taken with `take_apply_edit`.
+    pub fn reply_to_apply(&mut self, id: Id, applied: bool) {
+        self.respond(id, Ok(Value::Object(vec![("applied".to_string(), Value::Bool(applied))])));
+    }
+
+    /// Refuses everything still parked. Called when the window closes
+    /// -- a command finished, or gave up -- so no server is left
+    /// waiting on a reply that is never coming.
+    pub fn refuse_pending_applies(&mut self) {
+        for (id, _) in std::mem::take(&mut self.applies) {
+            self.respond(id, Ok(Value::Object(vec![("applied".to_string(), Value::Bool(false))])));
+        }
+        self.commands.clear();
     }
 
     /// Sends a request and returns the id its response will carry.
@@ -1076,14 +1219,14 @@ impl Table {
     /// either -- retrying would turn one typo into a spawn attempt per
     /// keystroke's worth of navigation. A server that started and then
     /// died is likewise left dead, for the same reason.
-    pub fn get_or_start(&mut self, id: u64, command: &[String], display: &str, root: &Path) -> Result<&mut Server, String> {
+    pub fn get_or_start(&mut self, id: u64, command: &[String], display: &str, root: &Path, apply_edits: ApplyEdits) -> Result<&mut Server, String> {
         if let Some(index) = self.servers.iter().position(|s| s.command == display && s.root == root) {
             return Ok(&mut self.servers[index]);
         }
         if let Some(failure) = self.failures.iter().find(|f| f.command == display && f.root == root) {
             return Err(failure.why.clone());
         }
-        match Server::start(id, command, display, root) {
+        match Server::start(id, command, display, root, apply_edits) {
             Ok(server) => {
                 self.servers.push(server);
                 Ok(self.servers.last_mut().expect("just pushed"))
@@ -1240,15 +1383,15 @@ mod tests {
         let command = vec!["cat".to_string()];
         let mut table = Table::default();
 
-        let first = table.get_or_start(1, &command, "cat", &dir).map(|s| s.root.clone()).unwrap();
+        let first = table.get_or_start(1, &command, "cat", &dir, ApplyEdits::default()).map(|s| s.root.clone()).unwrap();
         assert_eq!(table.servers().len(), 1);
         // Same command, same root: the existing one, which is the whole
         // point -- every pane editing a project shares its server.
-        table.get_or_start(1, &command, "cat", &dir).unwrap();
+        table.get_or_start(1, &command, "cat", &dir, ApplyEdits::default()).unwrap();
         assert_eq!(table.servers().len(), 1);
         // Same command, different root: a second server, because a
         // server is scoped to the project it was told about.
-        table.get_or_start(1, &command, "cat", &other).unwrap();
+        table.get_or_start(1, &command, "cat", &other, ApplyEdits::default()).unwrap();
         assert_eq!(table.servers().len(), 2);
         assert_eq!(first, dir);
         std::fs::remove_dir_all(&dir).ok();
@@ -1262,7 +1405,7 @@ mod tests {
         let command = vec!["bish-no-such-language-server".to_string()];
         let mut table = Table::default();
         for _ in 0..5 {
-            assert!(table.get_or_start(7, &command, "nope", &dir).is_err());
+            assert!(table.get_or_start(7, &command, "nope", &dir, ApplyEdits::default()).is_err());
         }
         assert!(table.servers().is_empty());
         assert_eq!(table.failures().len(), 1, "one record, however many times it was asked for");
@@ -1277,7 +1420,7 @@ mod tests {
     #[test]
     fn a_server_request_gets_the_answer_a_client_with_nothing_to_offer_should_give() {
         let dir = temp_dir("answer");
-        let server = Server::start(1, &mock_server(FULL_SYNC), "mock", &dir).unwrap();
+        let server = Server::start(1, &mock_server(FULL_SYNC), "mock", &dir, ApplyEdits::default()).unwrap();
 
         // Settings for three sections, none configured: one `null`
         // each, meaning "use your defaults". MethodNotFound here makes
@@ -1314,13 +1457,133 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    // `--apply-edits` is a policy, so the thing to pin down is what
+    // each setting actually does to a request that arrives.
+    #[test]
+    fn a_server_requested_edit_is_taken_or_refused_by_policy() {
+        let dir = temp_dir("apply-policy");
+        let params = json::parse(r#"{"edit":{"changes":{}}}"#).unwrap();
+        let request = |id: i64| Message::Request { id: Id::Number(id), method: "workspace/applyEdit".to_string(), params: params.clone() };
+        let refused = Ok(Value::Object(vec![("applied".to_string(), Value::Bool(false))]));
+
+        // scoped, with nothing of the user's running: refused, and the
+        // log says which of the two refusals it was.
+        let mut server = Server::start(1, &mock_server(FULL_SYNC), "mock", &dir, ApplyEdits::Scoped).unwrap();
+        run_until_ready(&mut server);
+        assert!(!server.may_apply());
+        let (answer, note) = server.answer("workspace/applyEdit", &Value::Null);
+        assert_eq!(answer, refused);
+        assert!(note.unwrap().contains("no command of yours"));
+        assert!(server.handle(request(1)).is_none());
+        assert!(server.take_apply_edit().is_none(), "refused, so nothing is waiting for the editor");
+
+        // The same server, with a command the user chose in flight:
+        // parked rather than answered, because the reply has to say
+        // whether the edit landed and only the editor knows that.
+        server.execute_command(json::parse(r#"{"command":"x"}"#).unwrap());
+        assert!(server.may_apply());
+        assert!(server.handle(request(2)).is_none());
+        let (id, taken) = server.take_apply_edit().expect("parked for the editor");
+        assert_eq!(id, Id::Number(2));
+        assert_eq!(json::query(&taken, ".edit.changes"), Ok(&Value::Object(Vec::new())));
+
+        // And the window closes when the command's own response comes
+        // back -- that is the whole of what "scoped" means.
+        let done = Message::Response { id: Id::Number(server.next_id - 1), result: Ok(Value::Null) };
+        assert!(server.handle(done).is_none());
+        assert!(!server.may_apply());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn never_and_always_do_not_wait_for_a_command() {
+        let dir = temp_dir("apply-ends");
+        let request = Message::Request { id: Id::Number(1), method: "workspace/applyEdit".to_string(), params: Value::Null };
+
+        let mut never = Server::start(1, &mock_server(FULL_SYNC), "mock", &dir, ApplyEdits::Never).unwrap();
+        run_until_ready(&mut never);
+        never.execute_command(Value::Null);
+        assert!(!never.may_apply(), "a command of the user's own does not unlock `never`");
+        assert!(never.answer("workspace/applyEdit", &Value::Null).1.unwrap().contains("never"));
+
+        let mut always = Server::start(2, &mock_server(FULL_SYNC), "mock", &dir, ApplyEdits::Always).unwrap();
+        run_until_ready(&mut always);
+        assert!(always.may_apply(), "no command needed");
+        assert!(always.handle(request).is_none());
+        assert!(always.take_apply_edit().is_some());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // The declaration has to match the policy: a server told
+    // `applyEdit: true` and then refused every time has been lied to,
+    // and some react by disabling the feature that needed it.
+    #[test]
+    fn the_declared_apply_edit_capability_follows_the_policy() {
+        let dir = temp_dir("apply-declared");
+        for (policy, declared) in [(ApplyEdits::Scoped, true), (ApplyEdits::Always, true), (ApplyEdits::Never, false)] {
+            let server = Server::start(1, &mock_server(FULL_SYNC), "mock", &dir, policy).unwrap();
+            let params = server.initialize_params();
+            assert_eq!(json::query(&params, ".capabilities.workspace.applyEdit"), Ok(&Value::Bool(declared)), "{policy:?}");
+            // Claimed unconditionally: running a command is what an
+            // action with no edit of its own needs, whether or not the
+            // command is then allowed to change anything.
+            assert!(json::query(&params, ".capabilities.workspace.executeCommand.dynamicRegistration").is_ok());
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // Nothing may be left parked when the window closes: a server still
+    // waiting on a reply to `applyEdit` can sit there indefinitely.
+    #[test]
+    fn edits_still_parked_when_a_command_ends_are_refused_not_dropped() {
+        let dir = temp_dir("apply-leftover");
+        let log = dir.join("leftover.log");
+        let mut server = Server::start(1, &scripted_server(&dir, &log), "mock", &dir, ApplyEdits::Always).unwrap();
+        run_until_ready(&mut server);
+        for id in 1..=3 {
+            server.handle(Message::Request { id: Id::Number(id), method: "workspace/applyEdit".to_string(), params: Value::Null });
+        }
+        server.refuse_pending_applies();
+        assert!(server.take_apply_edit().is_none());
+        // Refusals actually sent, not merely forgotten -- read back out
+        // of the fixture's own log of what arrived.
+        for _ in 0..200 {
+            server.service();
+            if std::fs::read_to_string(&log).unwrap_or_default().matches(r#""applied":false"#).count() >= 3 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let seen = std::fs::read_to_string(&log).unwrap_or_default();
+        assert_eq!(seen.matches(r#""applied":false"#).count(), 3, "one refusal per parked edit, in {seen}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // A server that asks faster than the editor applies is broken or
+    // hostile; either way the answer past the cap is a refusal rather
+    // than unbounded memory.
+    #[test]
+    fn parked_edits_are_capped() {
+        let dir = temp_dir("apply-cap");
+        let mut server = Server::start(1, &mock_server(FULL_SYNC), "mock", &dir, ApplyEdits::Always).unwrap();
+        run_until_ready(&mut server);
+        for id in 0..(MAX_PENDING_APPLIES as i64 + 5) {
+            server.handle(Message::Request { id: Id::Number(id), method: "workspace/applyEdit".to_string(), params: Value::Null });
+        }
+        assert_eq!(server.applies.len(), MAX_PENDING_APPLIES);
+        // The oldest went, not the newest: the ones dropped are the
+        // ones the editor has already had the longest to get to.
+        assert_eq!(server.applies[0].0, Id::Number(5));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     // The one sharp edge of queueing instead of blocking: a server that
     // has stopped reading its stdin will never start again, and every
     // keystroke adds another whole document to the pile.
     #[test]
     fn a_server_that_stops_reading_its_input_is_declared_broken_not_queued_forever() {
         let dir = temp_dir("wedged");
-        let mut server = Server::start(1, &mock_server(FULL_SYNC), "mock", &dir).unwrap();
+        let mut server = Server::start(1, &mock_server(FULL_SYNC), "mock", &dir, ApplyEdits::default()).unwrap();
         run_until_ready(&mut server);
         server.open_document("file:///p/x.sh", "shellscript", 1, "x");
         let big = "x".repeat(1024 * 1024);
@@ -1344,7 +1607,7 @@ mod tests {
     fn a_publication_can_be_asked_for_again_after_something_cleared_it() {
         let dir = temp_dir("redeliver");
         let uri = "file:///p/x.sh";
-        let mut server = Server::start(1, &publishing_server(uri), "mock", &dir).unwrap();
+        let mut server = Server::start(1, &publishing_server(uri), "mock", &dir, ApplyEdits::default()).unwrap();
         run_until_ready(&mut server);
         server.open_document(uri, "shellscript", 1, "one");
         for _ in 0..400 {
@@ -1368,8 +1631,8 @@ mod tests {
         use crate::exec::ServiceTable;
         let dir = temp_dir("forget");
         let mut table = Table::default();
-        table.get_or_start(1, &["cat".to_string()], "cat", &dir).unwrap();
-        assert!(table.get_or_start(2, &["bish-no-such-server".to_string()], "nope", &dir).is_err());
+        table.get_or_start(1, &["cat".to_string()], "cat", &dir, ApplyEdits::default()).unwrap();
+        assert!(table.get_or_start(2, &["bish-no-such-server".to_string()], "nope", &dir, ApplyEdits::default()).is_err());
         assert_eq!(table.rows().len(), 2, "one running, one that never started");
         // The failure's reason is what `::bish lsp log` shows for a
         // server that produced no process to have a log of its own.
@@ -1379,7 +1642,7 @@ mod tests {
         assert_eq!(table.rows().len(), 1);
         // ...and now it will be tried again rather than refused from
         // the remembered failure.
-        assert!(table.get_or_start(2, &["bish-no-such-server".to_string()], "nope", &dir).is_err());
+        assert!(table.get_or_start(2, &["bish-no-such-server".to_string()], "nope", &dir, ApplyEdits::default()).is_err());
         assert_eq!(table.forget(1), 1);
         assert_eq!(table.forget(99), 0);
         std::fs::remove_dir_all(&dir).ok();
@@ -1480,7 +1743,7 @@ mod tests {
     const FULL_SYNC: &str = r#"{"capabilities":{"positionEncoding":"utf-32","textDocumentSync":{"openClose":true,"change":1,"save":true}}}"#;
 
     fn ready_echo_server(dir: &Path) -> Server {
-        let mut server = Server::start(1, &echo_server(FULL_SYNC), "mock", dir).unwrap();
+        let mut server = Server::start(1, &echo_server(FULL_SYNC), "mock", dir, ApplyEdits::default()).unwrap();
         run_until_ready(&mut server);
         assert_eq!(*server.state(), State::Ready, "log: {:?}", server.log().collect::<Vec<_>>());
         server
@@ -1631,7 +1894,7 @@ mod tests {
     fn a_request_is_answered_and_the_reply_is_matched_to_its_own_id() {
         let dir = temp_dir("request");
         let log = dir.join("received.jsonl");
-        let mut server = Server::start(1, &scripted_server(&dir, &log), "mock", &dir).unwrap();
+        let mut server = Server::start(1, &scripted_server(&dir, &log), "mock", &dir, ApplyEdits::default()).unwrap();
         run_until_ready(&mut server);
         assert_eq!(*server.state(), State::Ready, "log: {:?}", server.log().collect::<Vec<_>>());
         // Capabilities the fixture declares, and one it doesn't --
@@ -1689,7 +1952,7 @@ mod tests {
     fn uncollected_replies_are_bounded() {
         let dir = temp_dir("bounded");
         let log = dir.join("received.jsonl");
-        let mut server = Server::start(1, &scripted_server(&dir, &log), "mock", &dir).unwrap();
+        let mut server = Server::start(1, &scripted_server(&dir, &log), "mock", &dir, ApplyEdits::default()).unwrap();
         run_until_ready(&mut server);
         server.open_document("file:///p/x.sh", "shellscript", 1, "echo hi");
         let position = Value::Object(vec![
@@ -1716,7 +1979,7 @@ mod tests {
     fn a_publication_waits_for_whoever_holds_the_buffer_and_is_delivered_once() {
         let dir = temp_dir("publish");
         let uri = "file:///p/x.sh";
-        let mut server = Server::start(1, &publishing_server(uri), "mock", &dir).unwrap();
+        let mut server = Server::start(1, &publishing_server(uri), "mock", &dir, ApplyEdits::default()).unwrap();
         run_until_ready(&mut server);
         server.open_document(uri, "shellscript", 1, "one");
 
@@ -1736,7 +1999,7 @@ mod tests {
     #[test]
     fn a_publication_for_an_unknown_document_is_dropped() {
         let dir = temp_dir("unknown");
-        let mut server = Server::start(1, &publishing_server("file:///p/never-opened.sh"), "mock", &dir).unwrap();
+        let mut server = Server::start(1, &publishing_server("file:///p/never-opened.sh"), "mock", &dir, ApplyEdits::default()).unwrap();
         run_until_ready(&mut server);
         server.open_document("file:///p/x.sh", "shellscript", 1, "one");
         for _ in 0..200 {
@@ -1753,7 +2016,7 @@ mod tests {
     fn a_server_that_wants_no_documents_is_told_about_none() {
         let dir = temp_dir("nosync");
         let capabilities = r#"{"capabilities":{"textDocumentSync":{"openClose":false,"change":0,"save":false}}}"#;
-        let mut server = Server::start(1, &echo_server(capabilities), "mock", &dir).unwrap();
+        let mut server = Server::start(1, &echo_server(capabilities), "mock", &dir, ApplyEdits::default()).unwrap();
         run_until_ready(&mut server);
         assert_eq!(server.sync(), Sync { open_close: false, change: false, save: false });
 
@@ -1799,7 +2062,7 @@ mod tests {
     fn the_handshake_completes_and_agrees_on_the_encoding_the_server_named() {
         let dir = temp_dir("ready");
         let command = mock_server(r#"{"capabilities":{"positionEncoding":"utf-32","hoverProvider":true}}"#);
-        let mut server = Server::start(1, &command, "mock", &dir).unwrap();
+        let mut server = Server::start(1, &command, "mock", &dir, ApplyEdits::default()).unwrap();
         run_until_ready(&mut server);
         assert_eq!(*server.state(), State::Ready, "log: {:?}", server.log().collect::<Vec<_>>());
         // utf-32 is bish's own column counting, so agreeing on it is the
@@ -1817,7 +2080,7 @@ mod tests {
     #[test]
     fn a_server_that_names_no_encoding_is_assumed_to_mean_utf16() {
         let dir = temp_dir("utf16");
-        let mut server = Server::start(1, &mock_server(r#"{"capabilities":{}}"#), "mock", &dir).unwrap();
+        let mut server = Server::start(1, &mock_server(r#"{"capabilities":{}}"#), "mock", &dir, ApplyEdits::default()).unwrap();
         run_until_ready(&mut server);
         assert_eq!(*server.state(), State::Ready, "log: {:?}", server.log().collect::<Vec<_>>());
         assert_eq!(server.encoding(), PositionEncoding::Utf16);
@@ -1827,7 +2090,7 @@ mod tests {
     #[test]
     fn work_queued_during_the_handshake_goes_out_once_it_finishes() {
         let dir = temp_dir("release");
-        let mut server = Server::start(1, &mock_server(r#"{"capabilities":{}}"#), "mock", &dir).unwrap();
+        let mut server = Server::start(1, &mock_server(r#"{"capabilities":{}}"#), "mock", &dir, ApplyEdits::default()).unwrap();
         server.request("textDocument/hover", Value::Null);
         assert_eq!(server.queued.len(), 1);
         run_until_ready(&mut server);
@@ -1846,7 +2109,7 @@ mod tests {
         let dir = temp_dir("refused");
         let body = r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"unsupported client"}}"#;
         let script = format!("printf 'Content-Length: %d\\r\\n\\r\\n%s' {} '{body}'; sleep 30", body.len());
-        let mut server = Server::start(1, &["sh".to_string(), "-c".to_string(), script], "mock", &dir).unwrap();
+        let mut server = Server::start(1, &["sh".to_string(), "-c".to_string(), script], "mock", &dir, ApplyEdits::default()).unwrap();
         run_until_ready(&mut server);
         let State::Dead(why) = server.state() else { panic!("still {:?}", server.state()) };
         assert!(why.contains("unsupported client"), "{why}");
@@ -1857,7 +2120,7 @@ mod tests {
     fn starting_a_server_sends_initialize_and_leaves_it_initializing() {
         let dir = temp_dir("start");
         let log = dir.join("received.jsonl");
-        let mut server = Server::start(1, &scripted_server(&dir, &log), "mock", &dir).unwrap();
+        let mut server = Server::start(1, &scripted_server(&dir, &log), "mock", &dir, ApplyEdits::default()).unwrap();
         // Before anything is serviced: the process exists, the
         // handshake has not happened.
         assert_eq!(*server.state(), State::Initializing);
@@ -1889,7 +2152,7 @@ mod tests {
     fn a_request_made_before_the_handshake_finishes_is_held_not_sent() {
         let dir = temp_dir("queue");
         let log = dir.join("received.jsonl");
-        let mut server = Server::start(1, &scripted_server(&dir, &log), "mock", &dir).unwrap();
+        let mut server = Server::start(1, &scripted_server(&dir, &log), "mock", &dir, ApplyEdits::default()).unwrap();
         server.request("textDocument/hover", Value::Null);
         server.notify("textDocument/didOpen", Value::Null);
         assert_eq!(server.queued.len(), 2, "both should be waiting for `initialized`");
@@ -1920,7 +2183,7 @@ mod tests {
     #[test]
     fn a_command_that_does_not_exist_fails_to_start_rather_than_hanging() {
         let dir = temp_dir("missing");
-        let Err(error) = Server::start(1, &["bish-no-such-language-server".to_string()], "x", &dir) else {
+        let Err(error) = Server::start(1, &["bish-no-such-language-server".to_string()], "x", &dir, ApplyEdits::default()) else {
             panic!("a command that isn't there should not have started");
         };
         assert!(error.contains("bish-no-such-language-server"), "{error}");
@@ -1934,7 +2197,7 @@ mod tests {
     fn a_server_that_exits_is_noticed_with_its_last_words() {
         let dir = temp_dir("dies");
         let script = "echo 'cannot find configuration' >&2; exit 3";
-        let mut server = Server::start(1, &["sh".to_string(), "-c".to_string(), script.to_string()], "sh", &dir).unwrap();
+        let mut server = Server::start(1, &["sh".to_string(), "-c".to_string(), script.to_string()], "sh", &dir, ApplyEdits::default()).unwrap();
         for _ in 0..400 {
             server.service();
             if matches!(server.state(), State::Dead(_)) {
@@ -1954,7 +2217,7 @@ mod tests {
     #[test]
     fn a_dead_server_stops_accepting_work() {
         let dir = temp_dir("dead");
-        let mut server = Server::start(1, &["sh".to_string(), "-c".to_string(), "exit 0".to_string()], "sh", &dir).unwrap();
+        let mut server = Server::start(1, &["sh".to_string(), "-c".to_string(), "exit 0".to_string()], "sh", &dir, ApplyEdits::default()).unwrap();
         for _ in 0..400 {
             server.service();
             if matches!(server.state(), State::Dead(_)) {

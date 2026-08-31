@@ -56,8 +56,24 @@ while :; do
 
 	id=$(printf '%s' "$body" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
 	case "$body" in
+	*'"applied"'*)
+		# The client's answer to the `workspace/applyEdit` sent below.
+		# Only now does the command that asked for it finish -- which
+		# is the whole shape this fixture exists to exercise: a server
+		# does its work *during* `workspace/executeCommand`, not in
+		# its result.
+		if [ -n "$cmd_id" ]; then
+			send '{"jsonrpc":"2.0","id":'"$cmd_id"',"result":null}'
+			cmd_id=""
+		fi
+		;;
+	*'"method":"workspace/executeCommand"'*)
+		cmd_id=$id
+		send '{"jsonrpc":"2.0","id":9001,"method":"workspace/applyEdit","params":{"label":"mock.run","edit":{"changes":{"'"$uri"'":[
+		 {"range":{"start":{"line":2,"character":0},"end":{"line":2,"character":7}},"newText":"COMMANDED"}]}}}}'
+		;;
 	*'"method":"initialize"'*)
-		send '{"jsonrpc":"2.0","id":'"$id"',"result":{"capabilities":{"positionEncoding":"utf-32","hoverProvider":true,"definitionProvider":true,"referencesProvider":true,"documentSymbolProvider":true,"completionProvider":{"triggerCharacters":["."]},"documentFormattingProvider":true,"renameProvider":true,"codeActionProvider":true,"textDocumentSync":{"openClose":true,"change":1,"save":true}}}}'
+		send '{"jsonrpc":"2.0","id":'"$id"',"result":{"capabilities":{"positionEncoding":"utf-32","hoverProvider":true,"definitionProvider":true,"referencesProvider":true,"documentSymbolProvider":true,"completionProvider":{"triggerCharacters":["."]},"documentFormattingProvider":true,"renameProvider":true,"codeActionProvider":true,"executeCommandProvider":{"commands":["mock.run"]},"textDocumentSync":{"openClose":true,"change":1,"save":true}}}}'
 		;;
 	*'"method":"textDocument/didOpen"'*)
 		# Remembered so `textDocument/definition` can answer about
