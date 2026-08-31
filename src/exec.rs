@@ -534,6 +534,48 @@ pub trait ServiceTable {
     fn forget(&mut self, id: u64) -> usize;
 }
 
+/// The interactive command history, as much of it as a builtin needs.
+///
+/// The history lives in `repl::SessionState`, not here -- it is a
+/// property of a session at a prompt, and a script has none. `plan.md`
+/// called that an architecture mismatch rather than a small addition,
+/// and it is: the fix is not to move the history down but to give the
+/// shell an opaque way to ask.
+///
+/// Which is the second time this exact shape has been needed, after
+/// `ServiceTable` did it for language servers, and it is the same
+/// answer: a trait exec.rs owns and repl.rs implements, so the
+/// dependency points the way it already does.
+pub trait HistoryAccess {
+    /// Every entry, oldest first. The index a caller prints is this
+    /// position plus one, matching bash's 1-based numbering.
+    fn entries(&self) -> Vec<String>;
+
+    /// Drops everything -- `history -c`.
+    fn clear(&mut self);
+
+    /// Drops the entry with 1-based number `n`. `false` when there is
+    /// no such entry, which the caller reports.
+    fn delete(&mut self, n: usize) -> bool;
+}
+
+/// What a shell has before anything installs a real one -- and what
+/// every non-interactive shell keeps, since a script has no interactive
+/// history to have.
+pub struct NoHistory;
+
+impl HistoryAccess for NoHistory {
+    fn entries(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    fn clear(&mut self) {}
+
+    fn delete(&mut self, _n: usize) -> bool {
+        false
+    }
+}
+
 /// What a shell has before anything installs a real table -- and what
 /// every non-interactive shell keeps, since nothing there ever starts a
 /// language server.
@@ -903,6 +945,10 @@ pub struct Shell {
     /// builtin readable in `$(...)`, which is the lesson `window ls`
     /// taught.
     pub lsp: Rc<RefCell<dyn ServiceTable>>,
+    /// The interactive history, when there is one -- see
+    /// `HistoryAccess`. Shared with whichever session owns it, the same
+    /// `Rc<RefCell<_>>` way `lsp` is.
+    pub history: Rc<RefCell<dyn HistoryAccess>>,
     /// Set while a hook is running, so a hook that causes its own event
     /// -- a `shell:cwd:change` hook that `cd`s, most obviously -- fires
     /// once rather than forever. Not shared with a virtual child: a hook
@@ -1344,6 +1390,7 @@ impl Shell {
             lsp_servers: Vec::new(),
             next_lsp_id: 1,
             lsp: Rc::new(RefCell::new(NoServices)),
+            history: Rc::new(RefCell::new(NoHistory)),
             firing_hooks: false,
             array_local_stack: Vec::new(),
             assoc_local_stack: Vec::new(),
@@ -1620,6 +1667,7 @@ impl Shell {
             lsp_servers: self.lsp_servers.clone(),
             next_lsp_id: self.next_lsp_id,
             lsp: Rc::clone(&self.lsp),
+            history: Rc::clone(&self.history),
             firing_hooks: false,
             array_local_stack: Vec::new(),
             assoc_local_stack: Vec::new(),
@@ -4479,6 +4527,88 @@ impl Shell {
     // fish's (which errors) -- consistency with the sibling builtin wins
     // here since nothing else in bish already commits to fish's own
     // no-args-is-an-error behavior.
+    // `history [N]`, `history -c`, `history -d N`.
+    //
+    // Deliberately not `-w`/`-r`/`-a`: those are about a *file*, and
+    // bish's history file is appended to by every concurrent bish
+    // process (see history.rs's own load()), so "write the in-memory
+    // list to the file" would mean deciding whose list wins. That is a
+    // real design question, not a missing flag.
+    fn run_history(&mut self, args: &[String]) -> i32 {
+        let history = Rc::clone(&self.history);
+        match args.first().map(String::as_str) {
+            Some("-c") => {
+                history.borrow_mut().clear();
+                0
+            }
+            Some("-d") => {
+                let Some(n) = args.get(1).and_then(|a| a.parse::<usize>().ok()) else {
+                    sh_eprintln!(self, "bish: history: -d: usage: history -d OFFSET");
+                    return 2;
+                };
+                if history.borrow_mut().delete(n) {
+                    0
+                } else {
+                    sh_eprintln!(self, "bish: history: {n}: history position out of range");
+                    1
+                }
+            }
+            Some(flag) if flag.starts_with('-') => {
+                sh_eprintln!(self, "bish: history: {flag}: invalid option (expected -c or -d)");
+                2
+            }
+            other => {
+                let entries = history.borrow().entries();
+                // A bare count shows the *last* N, which is what makes
+                // `history 20` the useful spelling it is.
+                let start = match other.and_then(|a| a.parse::<usize>().ok()) {
+                    Some(n) => entries.len().saturating_sub(n),
+                    None => 0,
+                };
+                for (i, entry) in entries.iter().enumerate().skip(start) {
+                    sh_println!(self, "{:5}  {}", i + 1, entry);
+                }
+                0
+            }
+        }
+    }
+
+    // `fc -l [first [last]]` -- the listing half, which is what `fc` is
+    // actually reached for.
+    //
+    // Bare `fc` opens the last command in an editor and runs the result
+    // on exit. bish has an editor and could, but "run whatever comes
+    // back" is a different and much sharper thing than "show me what I
+    // ran", and shipping it as a surprise inside a listing command would
+    // be wrong. So it is refused by name, which is this shell's own
+    // convention for something it does not do yet.
+    fn run_fc(&mut self, args: &[String]) -> i32 {
+        if args.first().map(String::as_str) != Some("-l") {
+            sh_eprintln!(self, "bish: fc: only `fc -l [first [last]]` is implemented (use `history` to list, and an editor to edit)");
+            return 2;
+        }
+        let entries = self.history.borrow().entries();
+        if entries.is_empty() {
+            return 0;
+        }
+        // bash's own defaults: the last 16, and a negative number counts
+        // back from the end.
+        let resolve = |arg: Option<&String>, fallback: usize| -> usize {
+            match arg.and_then(|a| a.parse::<i64>().ok()) {
+                Some(n) if n < 0 => entries.len().saturating_sub((-n) as usize).saturating_add(1).max(1),
+                Some(n) if n > 0 => (n as usize).min(entries.len()),
+                _ => fallback,
+            }
+        };
+        let first = resolve(args.get(1), entries.len().saturating_sub(15).max(1));
+        let last = resolve(args.get(2), entries.len());
+        let (lo, hi) = (first.min(last), first.max(last));
+        for n in lo..=hi.min(entries.len()) {
+            sh_println!(self, "{:5}\t{}", n, entries[n - 1]);
+        }
+        0
+    }
+
     fn run_arith_print(&mut self, args: &[String]) -> i32 {
         // Joined with spaces rather than evaluated per argument: the
         // shell has already split `= 3 * (2 + 7)` into words, and it is
@@ -6997,6 +7127,8 @@ impl Shell {
                 return ExecResult::Status(status);
             }
             "abbr" => return ExecResult::Status(self.run_abbr(&argv[1..])),
+            "history" => return ExecResult::Status(self.run_history(&argv[1..])),
+            "fc" => return ExecResult::Status(self.run_fc(&argv[1..])),
             // `= EXPR`: evaluate and print. The other half of the inline
             // calculator whose answer the prompt already shows as ghost
             // text while it is being typed (bishedit::suggestion::
@@ -11720,6 +11852,8 @@ const KNOWN_BUILTINS: &[&str] = &[
     "unalias",
     "abbr",
     "=",
+    "history",
+    "fc",
     "bishopt",
     "::bish",
     "compgen",

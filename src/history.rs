@@ -489,3 +489,91 @@ mod tests {
         assert_eq!(child_entries[1].cwd, Some(cwd_b.as_path()));
     }
 }
+
+// The shell's own view of this list -- see `exec::HistoryAccess` for why
+// the `history` builtin reaches it through a trait rather than through
+// a field.
+//
+// `clear` and `delete` rebuild the chain rather than mutating it,
+// because a `Node` may be shared with a forked child (`fork` is an
+// O(1) `Rc` clone -- see its own doc comment). Rebuilding is what keeps
+// `history -c` in one window from emptying another's.
+impl crate::exec::HistoryAccess for History {
+    fn entries(&self) -> Vec<String> {
+        History::entries(self).into_iter().map(|e| e.text.to_string()).collect()
+    }
+
+    fn clear(&mut self) {
+        self.tail = None;
+    }
+
+    fn delete(&mut self, n: usize) -> bool {
+        let kept: Vec<String> = History::entries(self).into_iter().map(|e| e.text.to_string()).collect();
+        if n == 0 || n > kept.len() {
+            return false;
+        }
+        let mut tail: Option<Rc<Node>> = None;
+        for (i, entry) in kept.into_iter().enumerate() {
+            if i + 1 == n {
+                continue;
+            }
+            // The rebuilt chain carries no cwd: the directory each entry
+            // ran in is not recoverable from `entries()`, and inventing
+            // one would feed the suggestion engine's own
+            // directory heuristic a lie. Losing it makes those entries
+            // rank as `Legacy`, which is exactly what a disk-loaded
+            // entry already is.
+            tail = Some(Rc::new(Node { entry, cwd: None, prev: tail.take() }));
+        }
+        self.tail = tail;
+        true
+    }
+}
+
+#[cfg(test)]
+mod history_access_tests {
+    use super::*;
+    use crate::exec::HistoryAccess;
+
+    fn built(entries: &[&str]) -> History {
+        let mut h = History { path: None, tail: None };
+        for e in entries {
+            h.record(e, Some(std::path::Path::new("/tmp")));
+        }
+        h
+    }
+
+    #[test]
+    fn the_shell_sees_every_entry_oldest_first() {
+        let h = built(&["one", "two", "three"]);
+        assert_eq!(HistoryAccess::entries(&h), vec!["one".to_string(), "two".to_string(), "three".to_string()]);
+    }
+
+    #[test]
+    fn clear_and_delete_rebuild_rather_than_mutate() {
+        let mut h = built(&["one", "two", "three"]);
+        // A fork shares nodes (it is an O(1) `Rc` clone), so a change
+        // here must not reach it -- `history -c` in one window emptying
+        // another's is exactly what rebuilding prevents.
+        let forked = h.fork();
+
+        assert!(h.delete(2));
+        assert_eq!(HistoryAccess::entries(&h), vec!["one".to_string(), "three".to_string()]);
+        assert_eq!(HistoryAccess::entries(&forked).len(), 3, "the fork is untouched");
+
+        assert!(!h.delete(0), "1-based, so 0 is out of range");
+        assert!(!h.delete(99));
+
+        h.clear();
+        assert!(HistoryAccess::entries(&h).is_empty());
+        assert_eq!(HistoryAccess::entries(&forked).len(), 3);
+    }
+
+    #[test]
+    fn a_shell_with_no_history_answers_emptily_rather_than_failing() {
+        let mut none = crate::exec::NoHistory;
+        assert!(none.entries().is_empty());
+        assert!(!none.delete(1));
+        none.clear();
+    }
+}

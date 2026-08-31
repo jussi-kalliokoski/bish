@@ -87,7 +87,12 @@ struct SessionState {
     // alone by every continuation line, so a multi-line command begun
     // with a leading space stays unrecorded in full.
     buffer_unrecorded: bool,
-    history: History,
+    // Behind an `Rc<RefCell<_>>` so the shell can reach it: the
+    // `history` builtin lives in exec.rs, which has no idea what a
+    // session is, and talks to this through `exec::HistoryAccess` --
+    // the same shape `ServiceTable` already established for language
+    // servers. Both handles point at the same list.
+    history: Rc<RefCell<History>>,
     screen: Rc<RefCell<vt100::Screen>>,
     // Set once EOF has already warned this session about stopped jobs
     // (see the ReadOutcome::Eof handler) without actually exiting --
@@ -618,6 +623,8 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
     let root_cwd = shell.cwd.clone();
     let root_lsp: Rc<RefCell<lspclient::Table>> = Rc::new(RefCell::new(lspclient::Table::default()));
     install_service_table(&mut shell, &root_lsp);
+    let root_history = Rc::new(RefCell::new(History::load(".bish_history")));
+    install_history(&mut shell, &root_history);
     sessions.insert(
         0,
         SessionState {
@@ -628,7 +635,7 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
             lsp_semantic_applied: HashMap::new(),
             buffer: String::new(),
             buffer_unrecorded: false,
-            history: History::load(".bish_history"),
+            history: root_history,
             screen: root_screen,
             warned_stopped_jobs: false,
             dir_history: vec![root_cwd],
@@ -900,7 +907,7 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
         // Nothing recorded elsewhere during this one read_line call
         // needs to be visible mid-browse anyway (see History's own doc
         // comment on what a clone/fork actually shares).
-        let session_history = sessions[&session_id].history.clone();
+        let session_history = sessions[&session_id].history.borrow().clone();
         // Same "standalone snapshot, not a live borrow" reasoning as
         // session_history just above -- on_idle's own &mut sessions borrow
         // below would conflict with borrowing sessions[&session_id].shell's
@@ -1346,7 +1353,8 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
                         session.buffer_unrecorded = starts_off_the_record(&line);
                     }
                     let line = if session.buffer.is_empty() {
-                        match history::expand(&line, &session.history) {
+                        let history_snapshot = session.history.borrow().clone();
+                        match history::expand(&line, &history_snapshot) {
                             Ok(history::Expansion::Substituted(s)) => s,
                             Ok(history::Expansion::UnrecognizedBang(rest)) => format!("({})", rest),
                             Err(msg) => {
@@ -1432,7 +1440,7 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
                                 // way to ask for the opposite (see
                                 // starts_off_the_record).
                                 if !session.buffer_unrecorded {
-                                    session.history.record(&session.buffer, Some(&cwd_before));
+                                    session.history.borrow_mut().record(&session.buffer, Some(&cwd_before));
                                 }
                                 // Before the command runs, and after
                                 // history has it -- a hook that times or
@@ -1955,7 +1963,7 @@ fn run_edit_impl(targets: &[fileeditor::EditTarget], attach_debug: bool) -> i32 
             lsp_semantic_applied: HashMap::new(),
             buffer: String::new(),
             buffer_unrecorded: false,
-            history: History::load(".bish_history"),
+            history: Rc::new(RefCell::new(History::load(".bish_history"))),
             screen: root_screen,
             warned_stopped_jobs: false,
             dir_history: vec![root_cwd],
@@ -3758,12 +3766,13 @@ fn apply_window_action(
         }
         WindowAction::New { name } => {
             let parent_id = windows[*current_window].owning_session();
-            let child_history = sessions[&parent_id].history.fork();
+            let child_history = Rc::new(RefCell::new(sessions[&parent_id].history.borrow().fork()));
             let mut child_shell = sessions[&parent_id].shell.new_virtual_child();
     // The same table every other session sees -- one per process, like
     // `jobs`, so a server started for one pane serves them all.
     let child_lsp = Rc::clone(&sessions[&parent_id].lsp);
     install_service_table(&mut child_shell, &child_lsp);
+    install_history(&mut child_shell, &child_history);
             let screen = Rc::new(RefCell::new(vt100::Screen::new(content_rows(term_rows), term_cols)));
             child_shell.set_sink_grid(screen.clone());
             let child_cwd = child_shell.cwd.clone();
@@ -3784,7 +3793,7 @@ fn apply_window_action(
                     // everything the parent could already see, but from
                     // here on diverges independently -- neither side's
                     // later commands leak into the other's.
-                    history: child_history,
+                    history: Rc::clone(&child_history),
                     screen,
                     warned_stopped_jobs: false,
                     dir_history: vec![child_cwd],
@@ -3915,12 +3924,13 @@ fn split_focused_pane(
     term_cols: usize,
 ) {
     let parent_id = windows[current_window].owning_session();
-    let child_history = sessions[&parent_id].history.fork();
+    let child_history = Rc::new(RefCell::new(sessions[&parent_id].history.borrow().fork()));
     let mut child_shell = sessions[&parent_id].shell.new_virtual_child();
     // The same table every other session sees -- one per process, like
     // `jobs`, so a server started for one pane serves them all.
     let child_lsp = Rc::clone(&sessions[&parent_id].lsp);
     install_service_table(&mut child_shell, &child_lsp);
+    install_history(&mut child_shell, &child_history);
     let screen = Rc::new(RefCell::new(vt100::Screen::new(content_rows(term_rows), term_cols)));
     child_shell.set_sink_grid(screen.clone());
     let child_cwd = child_shell.cwd.clone();
@@ -3938,7 +3948,7 @@ fn split_focused_pane(
             buffer_unrecorded: false,
             // See WindowAction::New's own comment on forking the
             // parent's History instead of starting from "now".
-            history: child_history,
+            history: Rc::clone(&child_history),
             screen,
             warned_stopped_jobs: false,
             dir_history: vec![child_cwd],
@@ -3994,12 +4004,13 @@ fn split_diagnostics_pane(
     term_cols: usize,
 ) -> PaneId {
     let parent_id = windows[current_window].owning_session();
-    let child_history = sessions[&parent_id].history.fork();
+    let child_history = Rc::new(RefCell::new(sessions[&parent_id].history.borrow().fork()));
     let mut child_shell = sessions[&parent_id].shell.new_virtual_child();
     // The same table every other session sees -- one per process, like
     // `jobs`, so a server started for one pane serves them all.
     let child_lsp = Rc::clone(&sessions[&parent_id].lsp);
     install_service_table(&mut child_shell, &child_lsp);
+    install_history(&mut child_shell, &child_history);
     let screen = Rc::new(RefCell::new(vt100::Screen::new(content_rows(term_rows), term_cols)));
     child_shell.set_sink_grid(screen.clone());
     let child_cwd = child_shell.cwd.clone();
@@ -4015,7 +4026,7 @@ fn split_diagnostics_pane(
             lsp_semantic_applied: HashMap::new(),
             buffer: String::new(),
             buffer_unrecorded: false,
-            history: child_history,
+            history: Rc::clone(&child_history),
             screen,
             warned_stopped_jobs: false,
             dir_history: vec![child_cwd],
@@ -4051,10 +4062,11 @@ fn split_locations_pane(
     term_cols: usize,
 ) -> PaneId {
     let parent_id = windows[current_window].owning_session();
-    let child_history = sessions[&parent_id].history.fork();
+    let child_history = Rc::new(RefCell::new(sessions[&parent_id].history.borrow().fork()));
     let mut child_shell = sessions[&parent_id].shell.new_virtual_child();
     let child_lsp = Rc::clone(&sessions[&parent_id].lsp);
     install_service_table(&mut child_shell, &child_lsp);
+    install_history(&mut child_shell, &child_history);
     let screen = Rc::new(RefCell::new(vt100::Screen::new(content_rows(term_rows), term_cols)));
     child_shell.set_sink_grid(screen.clone());
     let child_cwd = child_shell.cwd.clone();
@@ -4070,7 +4082,7 @@ fn split_locations_pane(
             lsp_semantic_applied: HashMap::new(),
             buffer: String::new(),
             buffer_unrecorded: false,
-            history: child_history,
+            history: Rc::clone(&child_history),
             screen,
             warned_stopped_jobs: false,
             dir_history: vec![child_cwd],
@@ -4164,12 +4176,13 @@ fn split_debug_run_pane(
     term_cols: usize,
 ) -> (PaneId, Rc<RefCell<vt100::Screen>>) {
     let parent_id = windows[current_window].owning_session();
-    let child_history = sessions[&parent_id].history.fork();
+    let child_history = Rc::new(RefCell::new(sessions[&parent_id].history.borrow().fork()));
     let mut child_shell = sessions[&parent_id].shell.new_virtual_child();
     // The same table every other session sees -- one per process, like
     // `jobs`, so a server started for one pane serves them all.
     let child_lsp = Rc::clone(&sessions[&parent_id].lsp);
     install_service_table(&mut child_shell, &child_lsp);
+    install_history(&mut child_shell, &child_history);
     let screen = Rc::new(RefCell::new(vt100::Screen::new(content_rows(term_rows), term_cols)));
     child_shell.set_sink_grid(screen.clone());
     let child_cwd = child_shell.cwd.clone();
@@ -4185,7 +4198,7 @@ fn split_debug_run_pane(
             lsp_semantic_applied: HashMap::new(),
             buffer: String::new(),
             buffer_unrecorded: false,
-            history: child_history,
+            history: Rc::clone(&child_history),
             screen: screen.clone(),
             warned_stopped_jobs: false,
             dir_history: vec![child_cwd],
@@ -7155,6 +7168,13 @@ fn nav_buffer_into_edit_state(buf: NavBuffer, vk: VimKeys) -> Option<(TextBuffer
 // tables.
 fn install_service_table(shell: &mut Shell, table: &Rc<RefCell<lspclient::Table>>) {
     shell.lsp = Rc::clone(table) as Rc<RefCell<dyn exec::ServiceTable>>;
+}
+
+// The same for the interactive history, which the `history` builtin
+// reaches through `exec::HistoryAccess` -- see that trait for why a
+// shell cannot simply own one.
+fn install_history(shell: &mut Shell, history: &Rc<RefCell<History>>) {
+    shell.history = Rc::clone(history) as Rc<RefCell<dyn exec::HistoryAccess>>;
 }
 
 /// One place a location list points at.
@@ -14109,7 +14129,7 @@ mod compositor_frame_output_tests {
             shell: exec::Shell::new(),
             buffer: String::new(),
             buffer_unrecorded: false,
-            history: History::load("/dev/null"),
+            history: Rc::new(RefCell::new(History::load("/dev/null"))),
             screen: screen.clone(),
             warned_stopped_jobs: false,
             dir_history: Vec::new(),
