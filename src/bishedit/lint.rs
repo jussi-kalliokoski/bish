@@ -202,6 +202,38 @@ impl Linter for JsonLinter {
     }
 }
 
+/// TOML, from the parser in `toml.rs`.
+///
+/// Unlike JSON's, this one points at the mistake: `toml::ParseError`
+/// carries a char offset as *data* rather than baking a position into
+/// its message, so the gutter marker and the underline land on the
+/// thing that is wrong rather than on the whole buffer.
+///
+/// One finding, not a list: the parser stops at the first thing it
+/// cannot read, and everything after that is a guess about a document
+/// whose shape is already unknown.
+pub struct TomlLinter;
+
+impl Linter for TomlLinter {
+    fn check(&self, text: &str) -> Vec<Diagnostic> {
+        let Err(e) = crate::toml::parse(text) else { return Vec::new() };
+        let len = text.chars().count();
+        let start = e.at.min(len.saturating_sub(1));
+        vec![Diagnostic {
+            start,
+            // Through to the end of the offending line, so there is
+            // something to underline even where the parser can only
+            // name a single position.
+            end: text.chars().skip(start).position(|c| c == '\n').map_or(len, |n| start + n).max(start + 1).min(len),
+            severity: Severity::Error,
+            code: Cow::Borrowed("toml-syntax"),
+            source: None,
+            message: e.message,
+            fix: None,
+        }]
+    }
+}
+
 pub struct BashLinter;
 
 impl Linter for BashLinter {
@@ -575,6 +607,46 @@ fn push_unquoted_expansion(chars: &[char], offset: usize, content: Range<usize>,
         message: "Unquoted expansion may be word-split or glob-expanded here -- wrap it in double quotes".to_string(),
         fix: Some(Fix { start, end, replacement: format!("\"{}\"", char_slice(chars, full)) }),
     });
+}
+
+#[cfg(test)]
+mod toml_linter_tests {
+    use super::*;
+
+    fn check(text: &str) -> Vec<Diagnostic> {
+        TomlLinter.check(text)
+    }
+
+    #[test]
+    fn a_broken_cargo_toml_is_pointed_at() {
+        let text = "[package]\nname = \"bish\"\nversion = \n";
+        let found = check(text);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].code, "toml-syntax");
+        // On the third line, not against the whole buffer -- which is
+        // the difference the parser carrying its position as data makes.
+        let line = text.chars().take(found[0].start).filter(|c| *c == '\n').count();
+        assert_eq!(line, 2);
+    }
+
+    #[test]
+    fn the_underline_covers_something() {
+        let found = check("a = 1\nb = @\n");
+        assert!(found[0].end > found[0].start, "an empty span would draw nothing");
+    }
+
+    #[test]
+    fn a_valid_document_is_quiet() {
+        assert!(check("[a]\nb = 1\nc = [1, 2]\n").is_empty());
+        assert!(check("").is_empty());
+    }
+
+    // One finding, not a list: everything after the first unreadable
+    // thing is a guess about a document whose shape is already unknown.
+    #[test]
+    fn only_the_first_problem_is_reported() {
+        assert_eq!(check("a = \nb = \nc = \n").len(), 1);
+    }
 }
 
 #[cfg(test)]

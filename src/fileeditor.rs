@@ -3097,6 +3097,7 @@ pub(crate) fn diagnose_buffer(buf: &TextBuffer) -> Vec<lint::Diagnostic> {
     let linters: Vec<&dyn Linter> = match language_of(buf).as_str() {
         lang if lang == snippet::DEFAULT_LANG => vec![&BashLinter],
         "json" => vec![&lint::JsonLinter],
+        "toml" => vec![&lint::TomlLinter],
         _ => Vec::new(),
     };
     if linters.is_empty() {
