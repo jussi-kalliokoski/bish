@@ -114,6 +114,12 @@ pub enum KeyOutcome {
     /// references are many by nature -- so this is what fills the
     /// location-list pane rather than moving the cursor.
     GotoReferences,
+    /// `gO`: an outline of this file -- what it declares, in order,
+    /// nested. Neovim's own binding for the same thing, and vim's `gO`
+    /// already means "show me an outline of what I'm looking at" in
+    /// help and man pages, so the key is not being repurposed so much
+    /// as extended to code.
+    DocumentSymbols,
     /// `Ctrl-O`/`Ctrl-I` -- step backward/forward through the jump list.
     /// The caller must call `vk.jump_back(buf.cursor())`/`vk.jump_forward
     /// (buf.cursor())` (this crate owns the jump-list state -- see
@@ -1123,6 +1129,13 @@ impl VimKeys {
         KeyOutcome::GotoReferences
     }
 
+    fn emit_document_symbols(&mut self) -> KeyOutcome {
+        self.count = None;
+        self.pending = Pending::None;
+        self.last_completed = std::mem::take(&mut self.current_input);
+        KeyOutcome::DocumentSymbols
+    }
+
     fn emit_jump(&mut self, forward: bool) -> KeyOutcome {
         self.count = None;
         self.pending = Pending::None;
@@ -1486,6 +1499,7 @@ impl VimKeys {
             }
             Key::Char('d') => self.emit_goto_definition(),
             Key::Char('r') => self.emit_goto_references(),
+            Key::Char('O') => self.emit_document_symbols(),
             Key::Char('J') => self.emit_join(false),
             Key::Char('v') => self.emit_reselect_visual(),
             Key::Char('i') => self.emit_insert(InsertCmd::LastInsertPos),
@@ -2034,6 +2048,8 @@ mod tests {
         assert_eq!(vk.feed(Key::Char('d')), KeyOutcome::GotoDefinition);
         assert_eq!(vk.feed(Key::Char('g')), KeyOutcome::Pending);
         assert_eq!(vk.feed(Key::Char('r')), KeyOutcome::GotoReferences);
+        assert_eq!(vk.feed(Key::Char('g')), KeyOutcome::Pending);
+        assert_eq!(vk.feed(Key::Char('O')), KeyOutcome::DocumentSymbols);
         // `r` on its own is still replace-a-character, not this.
         assert_eq!(vk.feed(Key::Char('r')), KeyOutcome::Pending);
         vk.feed(Key::Escape);

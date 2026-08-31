@@ -57,7 +57,7 @@ while :; do
 	id=$(printf '%s' "$body" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
 	case "$body" in
 	*'"method":"initialize"'*)
-		send '{"jsonrpc":"2.0","id":'"$id"',"result":{"capabilities":{"positionEncoding":"utf-32","hoverProvider":true,"definitionProvider":true,"referencesProvider":true,"textDocumentSync":{"openClose":true,"change":1,"save":true}}}}'
+		send '{"jsonrpc":"2.0","id":'"$id"',"result":{"capabilities":{"positionEncoding":"utf-32","hoverProvider":true,"definitionProvider":true,"referencesProvider":true,"documentSymbolProvider":true,"textDocumentSync":{"openClose":true,"change":1,"save":true}}}}'
 		;;
 	*'"method":"textDocument/didOpen"'*)
 		# Remembered so `textDocument/definition` can answer about
@@ -75,6 +75,16 @@ while :; do
 		 {"uri":"'"$target"'","range":{"start":{"line":1,"character":0},"end":{"line":1,"character":5}}},
 		 {"uri":"'"$uri"'","range":{"start":{"line":2,"character":0},"end":{"line":2,"character":5}}},
 		 {"uri":"'"$uri"'","range":{"start":{"line":0,"character":0},"end":{"line":0,"character":5}}}]}'
+		;;
+	*'"method":"textDocument/documentSymbol"'*)
+		# The nested form, so the outline has something to indent.
+		send '{"jsonrpc":"2.0","id":'"$id"',"result":[
+		 {"name":"Outer","kind":23,
+		  "range":{"start":{"line":0,"character":0},"end":{"line":2,"character":0}},
+		  "selectionRange":{"start":{"line":0,"character":0},"end":{"line":0,"character":5}},
+		  "children":[{"name":"inner","kind":6,
+		    "range":{"start":{"line":1,"character":0},"end":{"line":1,"character":9}},
+		    "selectionRange":{"start":{"line":1,"character":0},"end":{"line":1,"character":5}}}]}]}'
 		;;
 	*'"method":"textDocument/references"'*)
 		# Three uses in the document the client opened, so the list

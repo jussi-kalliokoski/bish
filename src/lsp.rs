@@ -575,6 +575,91 @@ fn location(value: &Value) -> Option<Location> {
 }
 
 // ---------------------------------------------------------------------
+// Symbols
+// ---------------------------------------------------------------------
+
+/// One entry from `textDocument/documentSymbol`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Symbol {
+    pub name: String,
+    /// LSP's `SymbolKind`, 1..=26, as its own name -- "function",
+    /// "struct". Empty for a number outside the table, which is a
+    /// server using an extension we have no name for.
+    pub kind: String,
+    /// How deeply nested, for indenting an outline. Always 0 for a
+    /// server answering with the flat `SymbolInformation` form.
+    pub depth: usize,
+    pub uri: String,
+    pub start: (usize, usize),
+}
+
+/// `SymbolKind` by its wire number. A plain table because that is what
+/// the spec is; the names are the spec's own, lowercased.
+fn symbol_kind(kind: f64) -> String {
+    const KINDS: [&str; 26] = [
+        "file", "module", "namespace", "package", "class", "method", "property", "field", "constructor", "enum", "interface", "function",
+        "variable", "constant", "string", "number", "boolean", "array", "object", "key", "null", "enum-member", "struct", "event",
+        "operator", "type-parameter",
+    ];
+    let index = kind as usize;
+    if (1..=KINDS.len()).contains(&index) { KINDS[index - 1].to_string() } else { String::new() }
+}
+
+/// Reads a `textDocument/documentSymbol` answer, flattened depth-first
+/// with each entry's nesting recorded so an outline can indent it.
+///
+/// Two shapes again, both in use: the hierarchical `DocumentSymbol`
+/// (which carries `children` and no uri, since it is always about the
+/// document that was asked) and the older flat `SymbolInformation`
+/// (which carries a full `location`). `fallback_uri` is what the first
+/// form's entries belong to.
+pub fn symbols(result: &Value, fallback_uri: &str) -> Vec<Symbol> {
+    let Value::Array(items) = result else { return Vec::new() };
+    let mut out = Vec::new();
+    for item in items {
+        collect_symbol(item, fallback_uri, 0, &mut out);
+    }
+    out
+}
+
+fn collect_symbol(value: &Value, fallback_uri: &str, depth: usize, out: &mut Vec<Symbol>) {
+    let Ok(Value::Str(name)) = json::query(value, ".name") else { return };
+    let kind = match json::query(value, ".kind") {
+        Ok(Value::Number(k)) => symbol_kind(*k),
+        _ => String::new(),
+    };
+    // `SymbolInformation` puts the place in `location`; `DocumentSymbol`
+    // has `selectionRange` (the name itself) and `range` (the whole
+    // declaration), and the name is what an outline should jump to.
+    let (uri, range) = match json::query(value, ".location") {
+        Ok(location @ Value::Object(_)) => {
+            let uri = match json::query(location, ".uri") {
+                Ok(Value::Str(uri)) => uri.clone(),
+                _ => fallback_uri.to_string(),
+            };
+            (uri, json::query(location, ".range").ok())
+        }
+        _ => {
+            let range = match json::query(value, ".selectionRange") {
+                Ok(range @ Value::Object(_)) => Some(range),
+                _ => json::query(value, ".range").ok(),
+            };
+            (fallback_uri.to_string(), range)
+        }
+    };
+    if let Some(range) = range
+        && let Some(start) = json::query(range, ".start").ok().and_then(position)
+    {
+        out.push(Symbol { name: sanitize(name), kind, depth, uri, start });
+    }
+    if let Ok(Value::Array(children)) = json::query(value, ".children") {
+        for child in children {
+            collect_symbol(child, fallback_uri, depth + 1, out);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
 // Languages
 // ---------------------------------------------------------------------
 
@@ -920,6 +1005,55 @@ mod tests {
         fn mixed_len(v: &Value) -> usize {
             locations(v).len()
         }
+    }
+
+    #[test]
+    fn both_shapes_of_document_symbol_are_read_and_flattened() {
+        // The hierarchical form: no uri of its own, and children nested.
+        let tree = json::parse(
+            r#"[{"name":"Outer","kind":23,
+                 "range":{"start":{"line":0,"character":0},"end":{"line":9,"character":1}},
+                 "selectionRange":{"start":{"line":0,"character":7},"end":{"line":0,"character":12}},
+                 "children":[{"name":"inner","kind":6,
+                   "range":{"start":{"line":2,"character":2},"end":{"line":4,"character":3}},
+                   "selectionRange":{"start":{"line":2,"character":6},"end":{"line":2,"character":11}}}]}]"#,
+        )
+        .unwrap();
+        let found = symbols(&tree, "file:///a.rs");
+        assert_eq!(found.len(), 2);
+        assert_eq!((found[0].name.as_str(), found[0].kind.as_str(), found[0].depth), ("Outer", "struct", 0));
+        // The *name*, not the whole declaration -- an outline should
+        // jump to the identifier.
+        assert_eq!(found[0].start, (0, 7));
+        assert_eq!((found[1].name.as_str(), found[1].kind.as_str(), found[1].depth), ("inner", "method", 1));
+        assert_eq!(found[1].uri, "file:///a.rs", "the hierarchical form names no uri of its own");
+
+        // The flat form carries a full location.
+        let flat = json::parse(
+            r#"[{"name":"main","kind":12,"location":{"uri":"file:///b.rs","range":{"start":{"line":5,"character":3},"end":{"line":5,"character":7}}}}]"#,
+        )
+        .unwrap();
+        let found = symbols(&flat, "file:///a.rs");
+        assert_eq!(found.len(), 1);
+        assert_eq!((found[0].name.as_str(), found[0].kind.as_str(), found[0].uri.as_str()), ("main", "function", "file:///b.rs"));
+        assert_eq!(found[0].depth, 0, "nothing nested in the flat form");
+    }
+
+    #[test]
+    fn a_symbol_answer_that_says_nothing_useful_yields_nothing() {
+        assert!(symbols(&Value::Null, "file:///a").is_empty());
+        assert!(symbols(&json::parse("[]").unwrap(), "file:///a").is_empty());
+        // No name, or no range at all: dropped, without costing the
+        // rest of the answer.
+        let mixed = json::parse(
+            r#"[{"kind":12},{"name":"ok","kind":12,"range":{"start":{"line":1,"character":0},"end":{"line":1,"character":2}}}]"#,
+        )
+        .unwrap();
+        assert_eq!(symbols(&mixed, "file:///a").len(), 1);
+        // A kind outside the table is a server extension we have no
+        // name for, not a reason to drop the symbol.
+        let odd = json::parse(r#"[{"name":"x","kind":99,"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":1}}}]"#).unwrap();
+        assert_eq!(symbols(&odd, "file:///a")[0].kind, "");
     }
 
     fn hover(json_text: &str) -> Option<Vec<String>> {

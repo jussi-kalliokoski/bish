@@ -6853,6 +6853,32 @@ fn location_list(title: &str, locations: &[crate::lsp::Location], encoding: crat
     LocationList { title: title.to_string(), items }
 }
 
+// `gO`'s outline, as a location list. Same pane, different producer --
+// which is the whole reason that pane holds `LocationItem`s rather than
+// anything reference-shaped.
+//
+// Indented by nesting depth, so a method reads as belonging to its
+// struct, and labelled with the symbol's own kind: the line number is
+// far less useful here than in a reference list, where the point *is*
+// which line.
+fn symbol_list(title: &str, symbols: &[crate::lsp::Symbol], encoding: crate::lsp::PositionEncoding) -> LocationList {
+    let items = symbols
+        .iter()
+        .take(MAX_LOCATIONS)
+        .filter_map(|symbol| {
+            let path = crate::url::to_file_path(&symbol.uri)?;
+            let indent = "  ".repeat(symbol.depth);
+            let label = if symbol.kind.is_empty() {
+                format!("{indent}{}", symbol.name)
+            } else {
+                format!("{indent}{}  [{}]", symbol.name, symbol.kind)
+            };
+            Some(LocationItem { path, line: symbol.start.0, character: symbol.start.1, encoding, label })
+        })
+        .collect();
+    LocationList { title: title.to_string(), items }
+}
+
 // A session's live syn_col_* colors (see bishedit::highlight::
 // SYN_COL_OPTIONS/ColorOverrides, exec::Shell::bishopt_color), resolved
 // fresh from `shell` -- every caller owns its own snapshot rather than
@@ -8041,6 +8067,51 @@ fn run_normal_mode_navigation(
                         }
                         // No edit frame to hang a pane on -- which is
                         // every navigation start except `Edit`.
+                        None => {
+                            render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides.as_ref());
+                            show_command_mode_error(&list.title, *term_rows, *term_cols);
+                        }
+                    }
+                }
+            }
+            // `gO`: an outline of this file, into the same pane `gr`
+            // fills. Nothing is jumped to and focus does not move --
+            // an outline is something to look at while you keep working.
+            KeyOutcome::DocumentSymbols => {
+                if let NavBuffer::Editable(tb) = &buf {
+                    let (row, col) = tb.cursor();
+                    let encoding = server_encoding_for(sessions, session_id, tb).unwrap_or(crate::lsp::PositionEncoding::Utf16);
+                    let uri = server_target(&sessions[&session_id].shell, tb).map(|t| t.uri).unwrap_or_default();
+                    let found = ask_server_at_cursor(
+                        sessions,
+                        windows,
+                        job_frames,
+                        session_id,
+                        *current_window,
+                        term_rows,
+                        term_cols,
+                        *sinks_are_grid,
+                        tb,
+                        row,
+                        col,
+                        "textDocument/documentSymbol",
+                        "documentSymbolProvider",
+                        &[],
+                    )
+                    .map(|result| crate::lsp::symbols(&result, &uri))
+                    .unwrap_or_default();
+                    let title = match found.len() {
+                        0 => "No symbols found".to_string(),
+                        1 => "1 symbol".to_string(),
+                        n if n > MAX_LOCATIONS => format!("{MAX_LOCATIONS} of {n} symbols"),
+                        n => format!("{n} symbols"),
+                    };
+                    let list = symbol_list(&title, &found, encoding);
+                    match edit_frame_id {
+                        Some(id) => {
+                            sync_locations_pane(sessions, windows, *current_window, next_session_id, location_lists, id, list, *term_rows, *term_cols);
+                            render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides.as_ref());
+                        }
                         None => {
                             render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides.as_ref());
                             show_command_mode_error(&list.title, *term_rows, *term_cols);

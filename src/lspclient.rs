@@ -335,6 +335,17 @@ impl Server {
                             ]),
                         ),
                         (
+                            "documentSymbol".to_string(),
+                            Value::Object(vec![
+                                ("dynamicRegistration".to_string(), Value::Bool(false)),
+                                // The nested form, which is what an
+                                // indented outline wants; a server that
+                                // only speaks the flat one still works
+                                // (see `lsp::symbols`).
+                                ("hierarchicalDocumentSymbolSupport".to_string(), Value::Bool(true)),
+                            ]),
+                        ),
+                        (
                             "references".to_string(),
                             Value::Object(vec![("dynamicRegistration".to_string(), Value::Bool(false))]),
                         ),
