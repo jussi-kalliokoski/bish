@@ -620,6 +620,57 @@ fn text_edit(value: &Value) -> Option<TextEdit> {
     Some(TextEdit { start, end, text: text.clone() })
 }
 
+/// A change to a whole project: which files, and what to do to each.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct WorkspaceEdit {
+    /// One entry per file, in the order the server gave them.
+    pub changes: Vec<(String, Vec<TextEdit>)>,
+    /// Resource operations bish cannot perform -- creating, renaming or
+    /// deleting files -- named so the caller can say what it is
+    /// refusing.
+    ///
+    /// These are not ignorable. rust-analyzer sends a `RenameFile` when
+    /// the thing being renamed owns a module file, and applying only
+    /// the text half of that leaves the project broken. A caller that
+    /// sees any of these must do nothing at all.
+    pub unsupported: Vec<String>,
+}
+
+/// Reads a `WorkspaceEdit`, in either of the two shapes it comes in:
+/// the older `changes` map from uri to edits, and `documentChanges`,
+/// which is an array that may interleave `TextDocumentEdit`s with
+/// resource operations.
+///
+/// `documentChanges` wins when both are present, as the spec says.
+pub fn workspace_edit(result: &Value) -> WorkspaceEdit {
+    let mut edit = WorkspaceEdit::default();
+    if let Ok(Value::Array(items)) = json::query(result, ".documentChanges") {
+        for item in items {
+            // A resource operation names its own kind; a
+            // `TextDocumentEdit` has none.
+            if let Ok(Value::Str(kind)) = json::query(item, ".kind") {
+                edit.unsupported.push(kind.clone());
+                continue;
+            }
+            let Ok(Value::Str(uri)) = json::query(item, ".textDocument.uri") else { continue };
+            let edits = json::query(item, ".edits").map(text_edits).unwrap_or_default();
+            if !edits.is_empty() {
+                edit.changes.push((uri.clone(), edits));
+            }
+        }
+        return edit;
+    }
+    if let Ok(Value::Object(files)) = json::query(result, ".changes") {
+        for (uri, edits) in files {
+            let edits = text_edits(edits);
+            if !edits.is_empty() {
+                edit.changes.push((uri.clone(), edits));
+            }
+        }
+    }
+    edit
+}
+
 // ---------------------------------------------------------------------
 // Completion
 // ---------------------------------------------------------------------
@@ -1384,6 +1435,52 @@ mod tests {
         // One malformed entry does not cost the rest.
         let mixed = json::parse(r#"[{"newText":"no range"},{"range":{"start":{"line":1,"character":0},"end":{"line":1,"character":1}},"newText":"x"}]"#).unwrap();
         assert_eq!(text_edits(&mixed).len(), 1);
+    }
+
+    #[test]
+    fn a_workspace_edit_is_read_from_either_shape() {
+        let one_edit = r#"{"range":{"start":{"line":1,"character":0},"end":{"line":1,"character":3}},"newText":"new"}"#;
+        // The older map form.
+        let changes = json::parse(&format!(r#"{{"changes":{{"file:///a.rs":[{one_edit}],"file:///b.rs":[{one_edit}]}}}}"#)).unwrap();
+        let edit = workspace_edit(&changes);
+        assert_eq!(edit.changes.len(), 2);
+        assert!(edit.unsupported.is_empty());
+        assert_eq!(edit.changes[0].1[0].text, "new");
+
+        // documentChanges, which wins when both are present.
+        let both = json::parse(&format!(
+            r#"{{"changes":{{"file:///ignored.rs":[{one_edit}]}},
+                 "documentChanges":[{{"textDocument":{{"uri":"file:///c.rs","version":3}},"edits":[{one_edit}]}}]}}"#
+        ))
+        .unwrap();
+        let edit = workspace_edit(&both);
+        assert_eq!(edit.changes.len(), 1);
+        assert_eq!(edit.changes[0].0, "file:///c.rs");
+    }
+
+    // The case that must not be silently half-applied: rust-analyzer
+    // sends a RenameFile when the renamed thing owns a module file, and
+    // doing only the text half leaves the project broken.
+    #[test]
+    fn resource_operations_are_reported_rather_than_ignored() {
+        let with_rename = json::parse(
+            r#"{"documentChanges":[
+                {"textDocument":{"uri":"file:///a.rs","version":1},
+                 "edits":[{"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":1}},"newText":"x"}]},
+                {"kind":"rename","oldUri":"file:///old.rs","newUri":"file:///new.rs"}]}"#,
+        )
+        .unwrap();
+        let edit = workspace_edit(&with_rename);
+        assert_eq!(edit.changes.len(), 1, "the text half is still read");
+        assert_eq!(edit.unsupported, vec!["rename".to_string()], "...and so is the half we cannot do");
+    }
+
+    #[test]
+    fn an_empty_or_absent_workspace_edit_is_empty_not_an_error() {
+        assert_eq!(workspace_edit(&Value::Null), WorkspaceEdit::default());
+        assert_eq!(workspace_edit(&json::parse(r#"{"changes":{}}"#).unwrap()), WorkspaceEdit::default());
+        // A file listed with no edits contributes nothing.
+        assert!(workspace_edit(&json::parse(r#"{"changes":{"file:///a":[]}}"#).unwrap()).changes.is_empty());
     }
 
     fn hover(json_text: &str) -> Option<Vec<String>> {

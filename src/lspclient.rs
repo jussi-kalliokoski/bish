@@ -335,6 +335,17 @@ impl Server {
                             ]),
                         ),
                         (
+                            "rename".to_string(),
+                            Value::Object(vec![
+                                ("dynamicRegistration".to_string(), Value::Bool(false)),
+                                // Not claimed: `prepareSupport` means
+                                // the client asks whether a rename is
+                                // legal here before offering one, which
+                                // bish does not do -- it just asks.
+                                ("prepareSupport".to_string(), Value::Bool(false)),
+                            ]),
+                        ),
+                        (
                             "formatting".to_string(),
                             Value::Object(vec![("dynamicRegistration".to_string(), Value::Bool(false))]),
                         ),
@@ -373,7 +384,22 @@ impl Server {
                         ),
                     ]),
                     ),
-                    ("workspace".to_string(), Value::Object(Vec::new())),
+                    (
+                        "workspace".to_string(),
+                        Value::Object(vec![(
+                            "workspaceEdit".to_string(),
+                            Value::Object(vec![
+                                // What bish can actually carry out. A
+                                // server that would need to create,
+                                // rename or delete a file is told so
+                                // here, and the rename that needs one is
+                                // refused rather than half-applied (see
+                                // `lsp::WorkspaceEdit::unsupported`).
+                                ("documentChanges".to_string(), Value::Bool(true)),
+                                ("resourceOperations".to_string(), Value::Array(Vec::new())),
+                            ]),
+                        )]),
+                    ),
                 ]),
             ),
         ])
@@ -1586,7 +1612,11 @@ mod tests {
         assert!(server.provides("hoverProvider"));
         assert!(server.provides("definitionProvider"));
         assert!(server.provides("referencesProvider"));
-        assert!(!server.provides("renameProvider"));
+        // Deliberately a name no server will ever declare, rather than
+        // one the fixture merely happens not to support yet: this
+        // assertion broke three times as the fixture grew capabilities,
+        // which taught it nothing except that the list had changed.
+        assert!(!server.provides("bishNoSuchProvider"));
 
         server.open_document("file:///p/x.sh", "shellscript", 1, "echo hi");
         let id = server.request(

@@ -57,7 +57,7 @@ while :; do
 	id=$(printf '%s' "$body" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
 	case "$body" in
 	*'"method":"initialize"'*)
-		send '{"jsonrpc":"2.0","id":'"$id"',"result":{"capabilities":{"positionEncoding":"utf-32","hoverProvider":true,"definitionProvider":true,"referencesProvider":true,"documentSymbolProvider":true,"completionProvider":{"triggerCharacters":["."]},"documentFormattingProvider":true,"textDocumentSync":{"openClose":true,"change":1,"save":true}}}}'
+		send '{"jsonrpc":"2.0","id":'"$id"',"result":{"capabilities":{"positionEncoding":"utf-32","hoverProvider":true,"definitionProvider":true,"referencesProvider":true,"documentSymbolProvider":true,"completionProvider":{"triggerCharacters":["."]},"documentFormattingProvider":true,"renameProvider":true,"textDocumentSync":{"openClose":true,"change":1,"save":true}}}}'
 		;;
 	*'"method":"textDocument/didOpen"'*)
 		# Remembered so `textDocument/definition` can answer about
@@ -75,6 +75,22 @@ while :; do
 		 {"uri":"'"$target"'","range":{"start":{"line":1,"character":0},"end":{"line":1,"character":5}}},
 		 {"uri":"'"$uri"'","range":{"start":{"line":2,"character":0},"end":{"line":2,"character":5}}},
 		 {"uri":"'"$uri"'","range":{"start":{"line":0,"character":0},"end":{"line":0,"character":5}}}]}'
+		;;
+	*'"method":"textDocument/rename"'*)
+		# Two files: the one the client opened, and $2 when the test
+		# gave one -- so the open-buffer and on-disk halves are both
+		# exercised. `$3` set to `resource` makes it also ask for a
+		# file rename, which bish must refuse outright.
+		new=$(printf '%s' "$body" | sed -n 's/.*"newName":"\([^"]*\)".*/\1/p')
+		extra=""
+		[ -n "$2" ] && extra=',
+		 {"textDocument":{"uri":"'"$2"'","version":1},
+		  "edits":[{"range":{"start":{"line":1,"character":0},"end":{"line":1,"character":5}},"newText":"'"$new"'"}]}'
+		[ "$3" = "resource" ] && extra="$extra"',
+		 {"kind":"rename","oldUri":"file:///old","newUri":"file:///new"}'
+		send '{"jsonrpc":"2.0","id":'"$id"',"result":{"documentChanges":[
+		 {"textDocument":{"uri":"'"$uri"'","version":1},
+		  "edits":[{"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":5}},"newText":"'"$new"'"}]}'"$extra"']}}'
 		;;
 	*'"method":"textDocument/formatting"'*)
 		# Two edits, given ascending as a server sends them, on

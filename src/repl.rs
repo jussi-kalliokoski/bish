@@ -681,6 +681,7 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
                 &mut job_frames,
                 &mut debug_frames,
                 &mut location_lists,
+                &mut edit_frames,
                 &mut cmd_history,
                 &mut sinks_are_grid,
                 &mut registers,
@@ -1201,6 +1202,7 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
                     None,
                     &mut debug_frames,
                     &mut location_lists,
+                    &mut edit_frames,
                     &mut cmd_history,
                     &mut registers,
                     NavStart::Prompt { text, cursor },
@@ -1494,6 +1496,7 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
                         &mut job_frames,
                         &mut debug_frames,
                         &mut location_lists,
+                        &mut edit_frames,
                         &mut cmd_history,
                         &mut sinks_are_grid,
                         &mut registers,
@@ -1529,6 +1532,7 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
                                 &mut cmd_history,
                                 &mut job_frames,
                                 &mut debug_frames,
+                                &mut edit_frames,
                                 &mut registers,
                                 &mut term_rows,
                                 &mut term_cols,
@@ -1651,6 +1655,7 @@ fn expand_browse_targets(
     cmd_history: &mut History,
     job_frames: &mut HashMap<JobFrameId, exec::FgJob>,
     debug_frames: &mut HashMap<EditFrameId, debugger::DebugSession>,
+    edit_frames: &mut HashMap<EditFrameId, fileeditor::EditSession>,
     registers: &mut Registers,
     term_rows: &mut usize,
     term_cols: &mut usize,
@@ -1713,6 +1718,7 @@ fn expand_browse_targets(
             cmd_history,
             job_frames,
             debug_frames,
+            edit_frames,
             registers,
             term_rows,
             term_cols,
@@ -1938,6 +1944,7 @@ fn run_edit_impl(targets: &[fileeditor::EditTarget], attach_debug: bool) -> i32 
         &mut cmd_history,
         &mut job_frames,
         &mut debug_frames,
+        &mut edit_frames,
         &mut registers,
         &mut term_rows,
         &mut term_cols,
@@ -2066,6 +2073,11 @@ fn handle_command_mode(
     sinks_are_grid: &mut bool,
     job_frames: &mut HashMap<JobFrameId, exec::FgJob>,
     debug_frames: &mut HashMap<EditFrameId, debugger::DebugSession>,
+    // Every *other* open buffer. `run_edit_frame` takes the one being
+    // driven out of this map before driving it, so what is left here is
+    // exactly the files a cross-file edit must not write behind the
+    // user's back -- see `rename_via_server`.
+    edit_frames: &mut HashMap<EditFrameId, fileeditor::EditSession>,
     registers: &mut Registers,
     term_rows: &mut usize,
     term_cols: &mut usize,
@@ -2073,7 +2085,7 @@ fn handle_command_mode(
     seed: Option<String>,
 ) -> CommandModeOutcome {
     let outcome = run_command_mode(
-        session_id, sessions, windows, *current_window, next_session_id, cmd_history, job_frames, debug_frames, registers, term_rows, term_cols, *sinks_are_grid, editing, seed,
+        session_id, sessions, windows, *current_window, next_session_id, cmd_history, job_frames, debug_frames, edit_frames, registers, term_rows, term_cols, *sinks_are_grid, editing, seed,
     );
     match outcome {
         CommandModeOutcome::Action(ref action) => {
@@ -2119,6 +2131,11 @@ fn run_fg_job_frame(
     job_frames: &mut HashMap<JobFrameId, exec::FgJob>,
     debug_frames: &mut HashMap<EditFrameId, debugger::DebugSession>,
     location_lists: &mut HashMap<EditFrameId, LocationList>,
+    // Every *other* open buffer. `run_edit_frame` takes the one being
+    // driven out of this map before driving it, so what is left here is
+    // exactly the files a cross-file edit must not write behind the
+    // user's back -- see `rename_via_server`.
+    edit_frames: &mut HashMap<EditFrameId, fileeditor::EditSession>,
     cmd_history: &mut History,
     sinks_are_grid: &mut bool,
     registers: &mut Registers,
@@ -2204,6 +2221,7 @@ fn run_fg_job_frame(
                 None,
                 debug_frames,
                 location_lists,
+                edit_frames,
                 cmd_history,
                 registers,
                 NavStart::JobDetach,
@@ -2597,6 +2615,7 @@ fn run_edit_frame(
             Some(edit_frame_id),
             debug_frames,
             location_lists,
+            edit_frames,
             cmd_history,
             registers,
             NavStart::Edit(Box::new(buffer), Box::new(vk)),
@@ -3343,6 +3362,10 @@ fn run_browse_frame(
     cmd_history: &mut History,
     job_frames: &mut HashMap<JobFrameId, exec::FgJob>,
     debug_frames: &mut HashMap<EditFrameId, debugger::DebugSession>,
+    // Every open buffer -- threaded only so this frame's own `:` line
+    // can reach a cross-file edit (see `rename_via_server`); the
+    // browser itself never touches it.
+    edit_frames: &mut HashMap<EditFrameId, fileeditor::EditSession>,
     registers: &mut Registers,
     term_rows: &mut usize,
     term_cols: &mut usize,
@@ -3401,6 +3424,7 @@ fn run_browse_frame(
                 sinks_are_grid,
                 job_frames,
                 debug_frames,
+                edit_frames,
                 registers,
                 term_rows,
                 term_cols,
@@ -7291,6 +7315,11 @@ fn run_normal_mode_navigation(
     debug_frames: &mut HashMap<EditFrameId, debugger::DebugSession>,
     // `gr`'s answers, keyed like `debug_frames` -- see Frame::Locations.
     location_lists: &mut HashMap<EditFrameId, LocationList>,
+    // Every *other* open buffer. `run_edit_frame` takes the one being
+    // driven out of this map before driving it, so what is left here is
+    // exactly the files a cross-file edit must not write behind the
+    // user's back -- see `rename_via_server`.
+    edit_frames: &mut HashMap<EditFrameId, fileeditor::EditSession>,
     cmd_history: &mut History,
     registers: &mut Registers,
     start: NavStart,
@@ -8019,6 +8048,7 @@ fn run_normal_mode_navigation(
                     sinks_are_grid,
                     job_frames,
                     debug_frames,
+                    edit_frames,
                     registers,
                     term_rows,
                     term_cols,
@@ -8840,6 +8870,106 @@ impl fileeditor::InsertServices for EditorServices<'_> {
             col,
         )
     }
+}
+
+// `:rename NEW` through the language server.
+//
+// **All or nothing.** A rename that lands in some files and not others
+// leaves the project broken, which is worse than not renaming at all --
+// so every refusal below happens before anything is written, and the
+// files that are not open are read and edited in memory first, then
+// written only once every one of them succeeded.
+//
+// Where the changes land follows what every mainstream editor does:
+// buffers that are **open** get the edits in memory and stay dirty, so
+// the user keeps control of their own unsaved work; files that are
+// **not** open are written to disk, because there is nowhere else for
+// them to go. The message says which is which.
+#[allow(clippy::too_many_arguments)]
+fn rename_via_server(
+    sessions: &mut HashMap<SessionId, SessionState>,
+    windows: &mut [WindowEntry],
+    job_frames: &mut HashMap<JobFrameId, exec::FgJob>,
+    edit_frames: &mut HashMap<EditFrameId, fileeditor::EditSession>,
+    session_id: SessionId,
+    current_window: usize,
+    term_rows: &mut usize,
+    term_cols: &mut usize,
+    sinks_are_grid: bool,
+    buf: &mut TextBuffer,
+    new_name: &str,
+) -> Result<String, String> {
+    let encoding = server_encoding_for(sessions, session_id, buf).ok_or("no language server for this file")?;
+    let (row, col) = buf.cursor();
+    let result = ask_server_at_cursor(
+        sessions,
+        windows,
+        job_frames,
+        session_id,
+        current_window,
+        term_rows,
+        term_cols,
+        sinks_are_grid,
+        buf,
+        row,
+        col,
+        "textDocument/rename",
+        "renameProvider",
+        &[("newName", crate::json::Value::Str(new_name.to_string()))],
+    )
+    .ok_or("the language server did not answer")?;
+    let edit = crate::lsp::workspace_edit(&result);
+    if !edit.unsupported.is_empty() {
+        // Not something to do partially: see this function's own doc
+        // comment, and `lsp::WorkspaceEdit::unsupported`.
+        return Err(format!("this rename also needs to {} files, which bish cannot do yet -- nothing changed", edit.unsupported.join("/")));
+    }
+    if edit.changes.is_empty() {
+        return Err("the language server had nothing to rename here".to_string());
+    }
+
+    let here = buf.path().map(|p| p.to_path_buf());
+    // Phase one: work everything out, touching no disk.
+    let mut in_this_buffer: Vec<crate::lsp::TextEdit> = Vec::new();
+    let mut in_open_buffers: Vec<(EditFrameId, Vec<crate::lsp::TextEdit>)> = Vec::new();
+    let mut on_disk: Vec<(std::path::PathBuf, TextBuffer)> = Vec::new();
+    for (uri, edits) in &edit.changes {
+        let Some(path) = crate::url::to_file_path(uri) else {
+            return Err(format!("the language server named {uri}, which is not a local file -- nothing changed"));
+        };
+        if here.as_deref() == Some(path.as_path()) {
+            in_this_buffer = edits.clone();
+            continue;
+        }
+        if let Some((id, _)) = edit_frames.iter().find(|(_, s)| s.buffer.path() == Some(path.as_path())) {
+            in_open_buffers.push((*id, edits.clone()));
+            continue;
+        }
+        // Read and edit in memory now, so a file that cannot be opened
+        // stops the whole rename before any of it has happened.
+        let mut loaded = TextBuffer::open(&path, 1).map_err(|e| format!("{}: {e} -- nothing changed", path.display()))?;
+        fileeditor::apply_text_edits(&mut loaded, edits, encoding);
+        on_disk.push((path, loaded));
+    }
+
+    // Phase two: commit.
+    let written = on_disk.len();
+    for (path, mut loaded) in on_disk {
+        loaded.save(None).map_err(|e| format!("{}: {e} -- some files were already written", path.display()))?;
+    }
+    for (id, edits) in &in_open_buffers {
+        if let Some(session) = edit_frames.get_mut(id) {
+            fileeditor::apply_text_edits(&mut session.buffer, edits, encoding);
+        }
+    }
+    fileeditor::apply_text_edits(buf, &in_this_buffer, encoding);
+
+    let unsaved = in_open_buffers.len() + usize::from(!in_this_buffer.is_empty());
+    let mut message = format!("renamed to {new_name} in {} file{}", written + unsaved, if written + unsaved == 1 { "" } else { "s" });
+    if unsaved > 0 {
+        message.push_str(&format!(" ({unsaved} open, unsaved -- :w to keep)"));
+    }
+    Ok(message)
 }
 
 // `:fmt` through the language server. `None` when there is nothing to
@@ -10227,6 +10357,11 @@ fn run_command_mode(
     history: &mut History,
     job_frames: &mut HashMap<JobFrameId, exec::FgJob>,
     debug_frames: &mut HashMap<EditFrameId, debugger::DebugSession>,
+    // Every *other* open buffer. `run_edit_frame` takes the one being
+    // driven out of this map before driving it, so what is left here is
+    // exactly the files a cross-file edit must not write behind the
+    // user's back -- see `rename_via_server`.
+    edit_frames: &mut HashMap<EditFrameId, fileeditor::EditSession>,
     registers: &mut Registers,
     term_rows: &mut usize,
     term_cols: &mut usize,
@@ -10659,6 +10794,45 @@ fn run_command_mode(
                         // way `diag` has one: there's no persistent
                         // state this leaves behind to clear, just an
                         // ordinary buffer edit `u` already undoes.
+                        // `:rename NEW` -- the new name is text, and the
+                        // colon line is where text arguments are typed,
+                        // so this is a command rather than a key. `:rn`
+                        // for the same reason `:fmt` exists beside
+                        // `:format`.
+                        "rename" | "rn" => {
+                            let Some(new_name) = arg.filter(|a| !a.trim().is_empty()) else {
+                                show_command_mode_error("bish: rename: usage: :rename NEW-NAME", *term_rows, *term_cols);
+                                buffer.clear();
+                                continue;
+                            };
+                            match rename_via_server(
+                                sessions,
+                                windows,
+                                job_frames,
+                                edit_frames,
+                                session_id,
+                                current_window,
+                                term_rows,
+                                term_cols,
+                                sinks_are_grid,
+                                tb,
+                                new_name.trim(),
+                            ) {
+                                Ok(output) => {
+                                    sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry {
+                                        command: trimmed,
+                                        output: output.clone(),
+                                        status: 0,
+                                    });
+                                    return CommandModeOutcome::Ran { output, status: 0 };
+                                }
+                                Err(e) => {
+                                    show_command_mode_error(&format!("bish: rename: {e}"), *term_rows, *term_cols);
+                                    buffer.clear();
+                                    continue;
+                                }
+                            }
+                        }
                         "format" | "fmt" if arg.is_none() => {
                             // The server first when there is one: it
                             // knows the actual language, where
