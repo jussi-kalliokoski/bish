@@ -2765,7 +2765,7 @@ fn run_edit_frame(
             // starts driving it -- which makes `:q` on the new file pop
             // straight back here, the natural "go look, then come back"
             // shape, and one this codebase's pane stack already has.
-            Ok((NavExit::OpenAt { path, line, character, encoding }, state)) => {
+            Ok((NavExit::OpenAt { path, line, character, encoding, root }, state)) => {
                 if let Some((b, v)) = state {
                     edit_frames.insert(edit_frame_id, fileeditor::EditSession { buffer: b, vk: v });
                 }
@@ -2804,6 +2804,7 @@ fn run_edit_frame(
                         let offset = fileeditor::diagnostic_offset(&opened.buffer, &starts, line, character, encoding);
                         let (row, col) = fileeditor::diagnostic_position(&opened.buffer, offset);
                         opened.buffer.set_cursor(row, col);
+                        opened.buffer.lsp_root = root;
                         let id = *next_edit_frame_id;
                         *next_edit_frame_id += 1;
                         edit_frames.insert(id, opened);
@@ -7145,7 +7146,11 @@ enum NavExit {
     /// `encoding`, because converting it needs the text of the file
     /// being opened, which does not exist yet at the point this is
     /// produced.
-    OpenAt { path: PathBuf, line: usize, character: usize, encoding: crate::lsp::PositionEncoding },
+    // `root`: the project root the buffer this jump *came from* was
+    // being served by, carried so the file being opened inherits it
+    // rather than working one out from its own ancestors -- see
+    // `TextBuffer::lsp_root`.
+    OpenAt { path: PathBuf, line: usize, character: usize, encoding: crate::lsp::PositionEncoding, root: Option<PathBuf> },
 }
 
 // Packages this loop's own `buf`/`vk` locals back up for the caller once
@@ -7944,7 +7949,21 @@ fn run_normal_mode_navigation(
                     // cycle, since the list belongs to the buffer the
                     // question was asked in.
                     Goto::Elsewhere { path, line, character, encoding } => {
-                        break 'nav (NavExit::OpenAt { path, line, character, encoding }, nav_buffer_into_edit_state(buf, vk));
+                        break 'nav (
+                            NavExit::OpenAt {
+                                path,
+                                line,
+                                character,
+                                encoding,
+                                // Inherited, not recomputed: the file being
+                                // opened is one this server already knows
+                                // about -- possibly a dependency's source,
+                                // whose own nearest project marker belongs
+                                // to something else entirely.
+                                root: buf.as_editable().and_then(|tb| server_target(&sessions[&session_id], tb)).map(|t| t.root),
+                            },
+                            nav_buffer_into_edit_state(buf, vk),
+                        );
                     }
                     Goto::Nowhere(message) => {
                         render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides.as_ref());
@@ -8524,7 +8543,22 @@ fn run_normal_mode_navigation(
                                 }
                             }
                             Goto::Elsewhere { path, line, character, encoding } => {
-                                break 'nav (NavExit::OpenAt { path, line, character, encoding }, nav_buffer_into_edit_state(buf, vk));
+                                break 'nav (
+                                    NavExit::OpenAt {
+                                        path,
+                                        line,
+                                        character,
+                                        encoding,
+                                        // Inherited, not recomputed: the file
+                                        // being opened is one this server
+                                        // already knows about -- possibly a
+                                        // dependency's source, whose own
+                                        // nearest project marker belongs to
+                                        // something else entirely.
+                                        root: buf.as_editable().and_then(|tb| server_target(&sessions[&session_id], tb)).map(|t| t.root),
+                                    },
+                                    nav_buffer_into_edit_state(buf, vk),
+                                );
                             }
                             Goto::Nowhere(message) => {
                                 render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides.as_ref());
@@ -8831,6 +8865,7 @@ fn run_normal_mode_navigation(
                                 line: target.row,
                                 character: target.col,
                                 encoding: crate::lsp::PositionEncoding::Utf32,
+                                root: buf.as_editable().and_then(|tb| server_target(&sessions[&session_id], tb)).map(|t| t.root),
                             },
                             nav_buffer_into_edit_state(buf, vk),
                         );
@@ -9174,9 +9209,14 @@ fn server_target(session: &SessionState, buf: &TextBuffer) -> Option<ServerTarge
     // A `--root-cmd`'s answer, when one was worked out at open time,
     // beats the markers -- it is the only thing that can know a Cargo
     // workspace root, or any other root a build tool alone can compute.
-    let root = match absolute.parent().and_then(|dir| session.lsp_roots.get(dir)) {
-        Some(root) => root.clone(),
-        None => lspclient::root_for(&absolute, &declared.root_markers)?,
+    let root = match (&buf.lsp_root, absolute.parent().and_then(|dir| session.lsp_roots.get(dir))) {
+        // Reached by a jump from a buffer that already had a server:
+        // that server knows this file, and asking a second one would
+        // mean starting it and waiting for it to index a project this
+        // file only incidentally sits inside. See `TextBuffer::lsp_root`.
+        (Some(inherited), _) => inherited.clone(),
+        (None, Some(root)) => root.clone(),
+        (None, None) => lspclient::root_for(&absolute, &declared.root_markers)?,
     };
     Some(ServerTarget {
         id: declared.id,

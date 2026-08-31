@@ -64,6 +64,16 @@ pub struct TextBuffer {
     /// buffer at all.
     pub ignorecase: bool,
     pub smartcase: bool,
+    /// The project root this buffer's language server was reached
+    /// through, when it was *inherited* rather than computed.
+    ///
+    /// A file opened fresh has none, and `repl::server_target` works one
+    /// out from its own ancestors. A file reached by a jump keeps the
+    /// one it was reached from -- which is the difference between
+    /// `gd` into the Rust standard library answering immediately and
+    /// starting a second rust-analyzer for the toolchain directory,
+    /// because that file's own nearest `Cargo.toml` lives there.
+    pub lsp_root: Option<std::path::PathBuf>,
     // A language server's semantic tokens for this buffer, already
     // resolved to colours and to this buffer's own char offsets (see
     // repl::sync_semantic_tokens) -- painted as one more layer over
@@ -260,6 +270,7 @@ impl TextBuffer {
             snippet_holes: Vec::new(),
             ignorecase: false,
             smartcase: false,
+            lsp_root: None,
             semantic_spans: Vec::new(),
             diagnostics: Vec::new(),
             blame: None,
@@ -384,6 +395,7 @@ impl TextBuffer {
             snippet_holes: Vec::new(),
             ignorecase: false,
             smartcase: false,
+            lsp_root: None,
             semantic_spans: Vec::new(),
             diagnostics: Vec::new(),
             blame: None,
@@ -1016,6 +1028,7 @@ mod tests {
             snippet_holes: Vec::new(),
             ignorecase: false,
             smartcase: false,
+            lsp_root: None,
             semantic_spans: Vec::new(),
             diagnostics: Vec::new(),
             blame: None,
