@@ -819,11 +819,11 @@ impl Buffer for TextBuffer {
 // `SnippetHost` doc comment for why one line is always enough. Mirrors
 // editor.rs's own impl for the single-line prompt buffer.
 impl snippet::SnippetHost for TextBuffer {
-    fn replace_in_line(&mut self, line: usize, start: usize, end: usize, text: &str) {
-        if end > start {
-            self.delete_range(&motion::MotionRange { shape: motion::MotionShape::Exclusive, from: (line, start), to: (line, end) });
+    fn replace_span(&mut self, from: (usize, usize), to: (usize, usize), text: &str) {
+        if to > from {
+            self.delete_range(&motion::MotionRange { shape: motion::MotionShape::Exclusive, from, to });
         }
-        self.insert_text((line, start), text);
+        self.insert_text(from, text);
     }
 
     fn place_cursor(&mut self, line: usize, col: usize) {

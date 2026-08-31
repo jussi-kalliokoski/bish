@@ -659,12 +659,18 @@ fn accept_suggestion(ed: &mut LineEditor, tail: &str) {
 // file editor, and all that's left here is the two-line buffer adapter
 // plus how it's drawn. `line` is always 0 -- this buffer is one line.
 impl snippet::SnippetHost for LineEditor {
-    fn replace_in_line(&mut self, _line: usize, start: usize, end: usize, text: &str) {
-        self.buf.splice(start..end, text.chars());
+    fn replace_span(&mut self, from: (usize, usize), to: (usize, usize), text: &str) {
+        self.buf.splice(from.1..to.1, text.chars());
     }
 
     fn place_cursor(&mut self, _line: usize, col: usize) {
         self.cursor = col;
+    }
+
+    // One line, always -- which is what makes a multi-line snippet fold
+    // to spaces here rather than corrupting the prompt buffer.
+    fn is_multiline(&self) -> bool {
+        false
     }
 }
 
@@ -678,8 +684,8 @@ fn snippet_layer(live: &LiveSnippet) -> Vec<StyledSpan> {
     live.holes()
         .into_iter()
         .map(|(start, end, active)| StyledSpan {
-            start,
-            end,
+            start: start.1,
+            end: end.1,
             fg: vt100::Color::Default,
             attrs: if active {
                 vt100::CellAttrs { reverse: true, ..vt100::CellAttrs::default() }
@@ -722,9 +728,11 @@ fn expand_abbr_at_cursor(ed: &mut LineEditor, abbrs: &[Abbr], snippet: &mut Opti
     let Some(abbr) = abbrs.iter().find(|a| a.name == word) else {
         return false;
     };
-    match Snippet::parse(&abbr.expansion, &abbr.order) {
+    match Snippet::parse(&abbr.expansion) {
         Some(snip) => *snippet = Some(LiveSnippet::start(snip, 0, word_start, word, ed)),
-        None => ed.splice_word(word_start, ed.cursor, &abbr.expansion),
+        // No tabstops: ordinary text, but still read through the same
+        // escape rules, so `\$` is a literal `$` here too.
+        None => ed.splice_word(word_start, ed.cursor, &snippet::flatten(&abbr.expansion)),
     }
     true
 }
@@ -4111,12 +4119,12 @@ mod tests {
     // (bishedit::snippet's own tests) and the seam between the model and
     // the line editor, which is this.
 
-    fn start_snippet(line: &str, cursor: usize, expansion: &str, order: &[usize]) -> (LineEditor, LiveSnippet) {
+    fn start_snippet(line: &str, cursor: usize, expansion: &str) -> (LineEditor, LiveSnippet) {
         let mut ed = make_editor(line, cursor);
-        let table = vec![Abbr { order: order.to_vec(), ..Abbr::new("foo", expansion) }];
+        let table = vec![Abbr::new("foo", expansion)];
         let mut snippet = None;
         assert!(expand_abbr_at_cursor(&mut ed, &table, &mut snippet));
-        (ed, snippet.expect("an expansion with placeholders is a snippet"))
+        (ed, snippet.expect("an expansion with tabstops is a snippet"))
     }
 
     fn type_text(ed: &mut LineEditor, state: &mut LiveSnippet, text: &str) {
@@ -4127,21 +4135,21 @@ mod tests {
     }
 
     #[test]
-    fn an_expansion_with_placeholders_splices_in_tentatively() {
-        let (ed, state) = start_snippet("foo", 3, "bar -x %s -y %s | qoo", &[]);
-        assert_eq!(ed.as_string(), "bar -x %s -y %s | qoo");
-        assert_eq!(state.holes()[0].0, 7, "the first placeholder starts after `bar -x `");
-        // The caret parks at the first placeholder, not at the end of the
+    fn an_expansion_with_tabstops_splices_in_tentatively() {
+        let (ed, state) = start_snippet("foo", 3, "bar -x $1 -y $2 | qoo");
+        assert_eq!(ed.as_string(), "bar -x $1 -y $2 | qoo");
+        assert_eq!(state.holes()[0].0, (0, 7), "the first tabstop starts after `bar -x `");
+        // The caret parks at the first tabstop, not at the end of the
         // expansion the way a plain abbreviation leaves it.
         assert_eq!(ed.cursor, 7);
     }
 
     #[test]
     fn a_snippet_only_ever_rewrites_its_own_span_of_the_line() {
-        let (mut ed, mut state) = start_snippet("foo", 3, "cd %s", &[]);
+        let (mut ed, mut state) = start_snippet("foo", 3, "cd $1");
         // Text typed after the abbreviation would normally be to the
         // right; simulate the same thing by expanding mid-line.
-        assert_eq!(ed.as_string(), "cd %s");
+        assert_eq!(ed.as_string(), "cd $1");
         type_text(&mut ed, &mut state, "src");
         assert_eq!(ed.as_string(), "cd src");
         assert_eq!(ed.cursor, 6);
@@ -4149,7 +4157,7 @@ mod tests {
 
     #[test]
     fn accepting_leaves_the_cursor_where_typing_it_out_would_have() {
-        let (mut ed, mut state) = start_snippet("foo", 3, "bar -x %s -y %s | qoo", &[]);
+        let (mut ed, mut state) = start_snippet("foo", 3, "bar -x $1 -y $2 | qoo");
         type_text(&mut ed, &mut state, "one");
         state.snip.advance(false);
         state.sync(&mut ed);
@@ -4161,8 +4169,8 @@ mod tests {
 
     #[test]
     fn cancelling_puts_the_abbreviation_name_back_verbatim() {
-        let (mut ed, mut state) = start_snippet("echo hi; foo", 12, "cd %s", &[]);
-        assert_eq!(ed.as_string(), "echo hi; cd %s");
+        let (mut ed, mut state) = start_snippet("echo hi; foo", 12, "cd $1");
+        assert_eq!(ed.as_string(), "echo hi; cd $1");
         type_text(&mut ed, &mut state, "src");
         state.cancel(&mut ed);
         assert_eq!(ed.as_string(), "echo hi; foo");
@@ -4170,31 +4178,47 @@ mod tests {
     }
 
     #[test]
-    fn the_placeholder_layer_marks_the_active_one_differently() {
-        let (_, state) = start_snippet("foo", 3, "a %s b %s", &[]);
+    fn the_tabstop_layer_marks_the_active_one_differently() {
+        let (_, state) = start_snippet("foo", 3, "a $1 b $2");
         let layer = snippet_layer(&state);
         assert_eq!(layer.len(), 2);
-        assert!(layer[0].attrs.reverse, "the placeholder being typed into is the reverse-video one");
+        assert!(layer[0].attrs.reverse, "the tabstop being typed into is the reverse-video one");
         assert!(!layer[1].attrs.reverse && layer[1].attrs.underline);
     }
 
     #[test]
     fn the_layer_is_offset_by_where_the_snippet_actually_sits() {
-        let (_, state) = start_snippet("echo hi; foo", 12, "cd %s", &[]);
+        let (_, state) = start_snippet("echo hi; foo", 12, "cd $1");
         let layer = snippet_layer(&state);
-        // "echo hi; cd " is 12 chars, then the `%s`.
+        // "echo hi; cd " is 12 chars, then the `$1`.
         assert_eq!((layer[0].start, layer[0].end), (12, 14));
     }
 
     #[test]
-    fn a_reversed_order_fills_the_second_placeholder_first() {
-        let (mut ed, mut state) = start_snippet("foo", 3, "bar -x %s -y %s", &[1, 0]);
+    fn numbering_decides_which_hole_is_filled_first() {
+        let (mut ed, mut state) = start_snippet("foo", 3, "bar -x $2 -y $1");
         type_text(&mut ed, &mut state, "why");
-        assert_eq!(ed.as_string(), "bar -x %s -y why", "the caret started on the *second* hole");
+        assert_eq!(ed.as_string(), "bar -x $2 -y why", "the caret started on the *second* hole, because it is `$1`");
         state.snip.advance(false);
         state.sync(&mut ed);
         type_text(&mut ed, &mut state, "ex");
         state.accept(&mut ed);
         assert_eq!(ed.as_string(), "bar -x ex -y why");
+    }
+
+    // The prompt is one line, so a snippet that spans several folds to
+    // spaces rather than corrupting the buffer -- and every offset the
+    // model computed still lines up, since a newline becomes exactly one
+    // space.
+    #[test]
+    fn a_multi_line_expansion_folds_to_one_line_at_the_prompt() {
+        let (mut ed, mut state) = start_snippet("foo", 3, "if $1; then\n\t$0\nfi");
+        assert_eq!(ed.as_string(), "if $1; then \t$0 fi");
+        assert_eq!(ed.cursor, 3, "still parked on `$1`");
+        type_text(&mut ed, &mut state, "x");
+        assert_eq!(ed.as_string(), "if x; then \t$0 fi");
+        state.accept(&mut ed);
+        assert_eq!(ed.as_string(), "if x; then \t fi");
+        assert_eq!(ed.cursor, "if x; then \t".chars().count(), "and `$0` still takes the caret");
     }
 }

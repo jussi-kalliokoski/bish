@@ -4326,18 +4326,14 @@ impl Shell {
                     sh_eprintln!(self, "bish: abbr: -a: requires an EXPANSION for '{name}'");
                     return 2;
                 }
-                let (expansion_words, order) = snippet::parse_order(expansion_words);
                 let expansion = expansion_words.join(" ");
                 let lang = lang.unwrap_or_else(|| snippet::DEFAULT_LANG.to_string());
                 // Redefinition is keyed on both name *and* language: the
                 // same name under a different `--lang=` is a different
                 // abbreviation, not a replacement for this one.
                 match self.abbrs.iter_mut().find(|a| a.name == *name && a.lang == lang) {
-                    Some(existing) => {
-                        existing.expansion = expansion;
-                        existing.order = order;
-                    }
-                    None => self.abbrs.push(Abbr { name: name.clone(), expansion, lang, order }),
+                    Some(existing) => existing.expansion = expansion,
+                    None => self.abbrs.push(Abbr { name: name.clone(), expansion, lang }),
                 }
                 0
             }
@@ -4369,16 +4365,9 @@ impl Shell {
             }
             Mode::Show => {
                 for abbr in &self.abbrs {
-                    // A non-text-order permutation is printed back as the
-                    // same trailing 1-based run that set it, and a
-                    // non-default language as the same `--lang=`, so
-                    // `abbr -s` stays something you can paste straight
-                    // back in.
-                    let order = if abbr.order.is_empty() {
-                        String::new()
-                    } else {
-                        abbr.order.iter().map(|i| format!(" {}", i + 1)).collect()
-                    };
+                    // A non-default language is printed back as the same
+                    // `--lang=`, so `abbr -s` stays something you can
+                    // paste straight back in.
                     let lang = if abbr.lang == snippet::DEFAULT_LANG {
                         String::new()
                     } else {
@@ -4386,11 +4375,10 @@ impl Shell {
                     };
                     sh_println!(
                         self,
-                        "abbr -a {}{} {}{}",
+                        "abbr -a {}{} {}",
                         lang,
                         crate::serialize::quote_literal(&abbr.name),
-                        crate::serialize::quote_literal(&abbr.expansion),
-                        order
+                        crate::serialize::quote_literal(&abbr.expansion)
                     );
                 }
                 0
@@ -12143,45 +12131,26 @@ mod tests {
         assert_eq!(shell.abbrs, vec![Abbr::new("gco", "git checkout")]);
     }
 
+    // The trailing-integer-run spelling for placeholder order is gone
+    // -- order lives in the expansion now, as `$1`/`$2` -- so trailing
+    // integers are plain expansion words again, with nothing to
+    // disambiguate.
     #[test]
-    fn abbr_add_reads_a_trailing_integer_run_as_the_placeholder_order() {
+    fn abbr_add_keeps_trailing_integers_as_expansion_words() {
         let mut shell = Shell::new();
-        assert_eq!(shell.run_abbr(&strs(&["--add", "foo", "bar -x %s -y %s", "2", "1"])), 0);
-        assert_eq!(shell.abbrs, vec![Abbr { order: vec![1, 0], ..Abbr::new("foo", "bar -x %s -y %s") }]);
-    }
-
-    #[test]
-    fn abbr_add_keeps_trailing_integers_as_expansion_words_unless_they_really_are_an_order() {
-        let mut shell = Shell::new();
-        // No placeholders at all: "1 2" is just more of the expansion,
-        // exactly as it was before snippets existed.
+        assert_eq!(shell.run_abbr(&strs(&["--add", "foo", "bar -x $1 -y $2", "2", "1"])), 0);
+        assert_eq!(shell.abbrs, vec![Abbr::new("foo", "bar -x $1 -y $2 2 1")]);
         assert_eq!(shell.run_abbr(&strs(&["-a", "e12", "echo", "1", "2"])), 0);
-        // The right count, but not a permutation.
-        assert_eq!(shell.run_abbr(&strs(&["-a", "dup", "echo %s %s", "1", "1"])), 0);
-        // A permutation, but of the wrong length for one placeholder.
-        assert_eq!(shell.run_abbr(&strs(&["-a", "one", "echo %s", "1", "2"])), 0);
-        assert_eq!(
-            shell.abbrs,
-            vec![Abbr::new("e12", "echo 1 2"), Abbr::new("dup", "echo %s %s 1 1"), Abbr::new("one", "echo %s 1 2")]
-        );
+        assert_eq!(shell.abbrs[1], Abbr::new("e12", "echo 1 2"));
     }
 
     #[test]
-    fn abbr_order_is_only_ever_found_in_separate_words() {
+    fn abbr_show_round_trips_an_expansion_verbatim() {
         let mut shell = Shell::new();
-        // Quoted as one word, `1` is expansion text -- the only way to
-        // write an expansion that really does end in a number.
-        assert_eq!(shell.run_abbr(&strs(&["-a", "foo", "echo %s 1"])), 0);
-        assert_eq!(shell.abbrs, vec![Abbr::new("foo", "echo %s 1")]);
-    }
-
-    #[test]
-    fn abbr_show_round_trips_a_placeholder_order() {
-        let mut shell = Shell::new();
-        shell.run_abbr(&strs(&["-a", "foo", "bar -x %s -y %s", "2", "1"]));
+        shell.run_abbr(&strs(&["-a", "foo", "bar -x ${1:x} -y $2"]));
         let out = capture_output(&mut shell);
         shell.run_abbr(&strs(&["-s"]));
-        assert_eq!(out.borrow().as_str(), "abbr -a 'foo' 'bar -x %s -y %s' 2 1\n");
+        assert_eq!(out.borrow().as_str(), "abbr -a 'foo' 'bar -x ${1:x} -y $2'\n");
     }
 
     #[test]

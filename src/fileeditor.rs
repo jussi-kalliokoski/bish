@@ -1458,7 +1458,7 @@ pub(crate) fn run_insert_mode(
                     let (row, start, end) = item.replace.unwrap_or((row, state.word_start, col));
                     let line_len = buf.line_len(row);
                     let (start, end) = (start.min(line_len), end.min(line_len).max(start.min(line_len)));
-                    buf.replace_in_line(row, start, end, &item.insert);
+                    buf.replace_span((row, start), (row, end), &item.insert);
                     buf.set_cursor(row, start + item.insert.chars().count());
                     cursors[0] = buf.cursor();
                     inserted.push_str(&item.insert);
@@ -1809,7 +1809,7 @@ pub(crate) fn run_insert_mode(
         // whoever draws it can mark the placeholders (see
         // TextBuffer::snippet_holes), and one place to write them is one
         // place for them to go stale.
-        buf.snippet_holes = live.as_ref().map(snippet_holes).unwrap_or_default();
+        buf.snippet_holes = live.as_ref().map(|live| snippet_holes(live, buf)).unwrap_or_default();
         // Narrowed after the key has been applied, not before: what
         // matters is the word as it stands now, and every arm above
         // that changes it has already run.
@@ -1834,9 +1834,20 @@ pub(crate) fn run_insert_mode(
 
 // A live snippet's placeholders in the buffer's own (line, column)
 // space, for the renderer.
-fn snippet_holes(live: &LiveSnippet) -> Vec<textbuffer::SnippetHole> {
-    let line = live.line();
-    live.holes().into_iter().map(|(start, end, active)| textbuffer::SnippetHole { line, start, end, active }).collect()
+fn snippet_holes(live: &LiveSnippet, buf: &TextBuffer) -> Vec<textbuffer::SnippetHole> {
+    live.holes()
+        .into_iter()
+        // A hole that spans a line break is drawn on the line it starts
+        // on, out to the end of what is there: the renderer marks spans
+        // within one line, and a tabstop whose *default* contains a
+        // newline is rare enough not to be worth a second shape.
+        .map(|(start, end, active)| textbuffer::SnippetHole {
+            line: start.0,
+            start: start.1,
+            end: if end.0 == start.0 { end.1 } else { buf.line_len(start.0) },
+            active,
+        })
+        .collect()
 }
 
 // The file editor's own half of `abbr` expansion -- editor.rs's
@@ -1866,11 +1877,16 @@ fn expand_abbr(buf: &mut TextBuffer, abbrs: &[Abbr], live: &mut Option<LiveSnipp
     let Some(abbr) = abbrs.iter().find(|a| a.name == word) else {
         return false;
     };
-    match Snippet::parse(&abbr.expansion, &abbr.order) {
+    match Snippet::parse(&abbr.expansion) {
         Some(snip) => *live = Some(LiveSnippet::start(snip, row, word_start, word, buf)),
         None => {
-            buf.replace_in_line(row, word_start, col, &abbr.expansion);
-            buf.set_cursor(row, word_start + abbr.expansion.chars().count());
+            // `flatten` rather than the raw text: an expansion with no
+            // *tabstops* can still carry `\$` or `${1}`-shaped noise,
+            // and what goes in is what a finished snippet would have
+            // left behind.
+            let text = snippet::flatten(&abbr.expansion);
+            buf.replace_span((row, word_start), (row, col), &text);
+            buf.set_cursor(row, word_start + text.chars().count());
         }
     }
     true
@@ -4191,7 +4207,7 @@ mod macro_tests {
 
     #[test]
     fn insert_mode_drives_a_whole_snippet_with_tab_and_ctrl_y() {
-        let abbrs = vec![Abbr { lang: "rust".into(), ..Abbr::new("f", "fn %s(%s) {}") }];
+        let abbrs = vec![Abbr { lang: "rust".into(), ..Abbr::new("f", "fn $1($2) {}") }];
         let mut keys = chars("f ");
         keys.extend(chars("main"));
         keys.push(Key::Tab);
@@ -4204,7 +4220,7 @@ mod macro_tests {
 
     #[test]
     fn insert_mode_snippet_enter_advances_then_accepts_without_a_newline() {
-        let abbrs = vec![Abbr { lang: "rust".into(), ..Abbr::new("f", "fn %s(%s) {}") }];
+        let abbrs = vec![Abbr { lang: "rust".into(), ..Abbr::new("f", "fn $1($2) {}") }];
         let mut keys = chars("f ");
         keys.extend(chars("main"));
         keys.push(Key::Enter);
@@ -4216,7 +4232,7 @@ mod macro_tests {
 
     #[test]
     fn insert_mode_snippet_ctrl_e_cancels_back_to_the_abbreviation_name() {
-        let abbrs = vec![Abbr { lang: "rust".into(), ..Abbr::new("f", "fn %s() {}") }];
+        let abbrs = vec![Abbr { lang: "rust".into(), ..Abbr::new("f", "fn $1() {}") }];
         let mut keys = chars("f ");
         keys.extend(chars("main"));
         keys.push(Key::CtrlE);
@@ -4231,7 +4247,7 @@ mod macro_tests {
         // inserts at has to be resynced from the buffer -- left stale, a
         // keystroke right after an accept lands back where the
         // abbreviation started.
-        let abbrs = vec![Abbr { lang: "rust".into(), ..Abbr::new("f", "fn %s()") }];
+        let abbrs = vec![Abbr { lang: "rust".into(), ..Abbr::new("f", "fn $1()") }];
         let mut keys = chars("f ");
         keys.extend(chars("main"));
         keys.push(Key::CtrlY);
@@ -4258,14 +4274,43 @@ mod macro_tests {
     }
 
     #[test]
-    fn a_live_snippet_marks_its_placeholders_for_the_renderer() {
-        let abbrs = vec![Abbr { lang: "rust".into(), ..Abbr::new("f", "fn %s(%s)") }];
+    fn a_live_snippet_marks_its_tabstops_for_the_renderer() {
+        let abbrs = vec![Abbr { lang: "rust".into(), ..Abbr::new("f", "fn $1($2)") }];
         // No accept/cancel: Insert mode ends at EOF with the snippet
         // still live, so the marks are whatever was last written.
         let buf = insert_with(Some("main.rs"), &chars("f "), &abbrs);
         assert_eq!(buf.snippet_holes.len(), 2);
         assert!(buf.snippet_holes[0].active && !buf.snippet_holes[1].active);
         assert_eq!((buf.snippet_holes[0].start, buf.snippet_holes[0].end), (3, 5));
+    }
+
+    // A file buffer has as many lines as it likes, so a multi-line
+    // snippet stays multi-line here -- the one thing the prompt cannot
+    // do.
+    #[test]
+    fn a_multi_line_snippet_spans_real_lines_in_a_file() {
+        let abbrs = vec![Abbr { lang: "rust".into(), ..Abbr::new("f", "fn ${1:name}() {\n    $0\n}") }];
+        let mut keys = chars("f ");
+        keys.extend(chars("main"));
+        keys.push(Key::CtrlY);
+        keys.extend(chars("todo!()"));
+        let buf = insert_with(Some("main.rs"), &keys, &abbrs);
+        // `$0` put the caret on the indented middle line, so what was
+        // typed next landed there rather than after the closing brace.
+        assert_eq!(text_of(&buf), "fn main() {\n    todo!()\n}");
+    }
+
+    // Before it is accepted, the holes are marked on the lines they are
+    // actually on -- the renderer draws per line.
+    #[test]
+    fn a_multi_line_snippets_holes_are_marked_line_by_line() {
+        let abbrs = vec![Abbr { lang: "rust".into(), ..Abbr::new("f", "fn ${1:name}() {\n    $0\n}") }];
+        let buf = insert_with(Some("main.rs"), &chars("f "), &abbrs);
+        assert_eq!(text_of(&buf), "fn name() {\n    $0\n}");
+        assert_eq!(buf.snippet_holes.len(), 2);
+        assert_eq!((buf.snippet_holes[0].line, buf.snippet_holes[0].start, buf.snippet_holes[0].end), (0, 3, 7));
+        assert!(buf.snippet_holes[0].active);
+        assert_eq!((buf.snippet_holes[1].line, buf.snippet_holes[1].start, buf.snippet_holes[1].end), (1, 4, 6));
     }
 
     #[test]
