@@ -1335,6 +1335,20 @@ pub(crate) fn run_insert_mode(
     let abbrs = snippet::for_language(abbrs, &language_of(buf));
     let mut live: Option<LiveSnippet> = None;
     let mut completing: Option<LiveCompletion> = None;
+    // Before the first frame, not just after every keystroke.
+    //
+    // Where insert starts is chosen by the *caller* -- `a` steps the
+    // cursor past the last character, `o` opens a line below, `A` goes
+    // to the end -- and any of those can land outside the viewport the
+    // pane was last scrolled to. Without this the first thing typed
+    // goes in at a position nobody can see: `a` at the end of a line
+    // too long for the pane types off the right edge, and `o` under a
+    // horizontally scrolled line types at column 0 while the viewport
+    // is still scrolled right. Both were reported; both are this one
+    // missing call, because the loop below has always scrolled *after*
+    // a key and never before the first.
+    buf.set_viewport_height(editor_content_rows(rect));
+    scroll_to_show_cursor(buf, editor_content_cols(buf, rect));
     render_editor_frame(buf, vk, mode, rect, term_rows, term_cols, color_overrides);
     // `"."`'s own accumulator for this session -- see `Registers::
     // set_last_insert`'s own doc comment. Best-effort: a Backspace just
