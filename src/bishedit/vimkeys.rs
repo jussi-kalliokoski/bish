@@ -108,6 +108,12 @@ pub enum KeyOutcome {
     /// wire it, the same "enforced by omission" the debugger's
     /// read-only subset already relies on.
     GotoDefinition,
+    /// `gr`: everywhere the thing under the cursor is used.
+    ///
+    /// Unlike `GotoDefinition` there is no "the" answer to go to --
+    /// references are many by nature -- so this is what fills the
+    /// location-list pane rather than moving the cursor.
+    GotoReferences,
     /// `Ctrl-O`/`Ctrl-I` -- step backward/forward through the jump list.
     /// The caller must call `vk.jump_back(buf.cursor())`/`vk.jump_forward
     /// (buf.cursor())` (this crate owns the jump-list state -- see
@@ -1110,6 +1116,13 @@ impl VimKeys {
         KeyOutcome::GotoDefinition
     }
 
+    fn emit_goto_references(&mut self) -> KeyOutcome {
+        self.count = None;
+        self.pending = Pending::None;
+        self.last_completed = std::mem::take(&mut self.current_input);
+        KeyOutcome::GotoReferences
+    }
+
     fn emit_jump(&mut self, forward: bool) -> KeyOutcome {
         self.count = None;
         self.pending = Pending::None;
@@ -1472,6 +1485,7 @@ impl VimKeys {
                 self.emit(Motion::SearchWordBackwardUnbounded)
             }
             Key::Char('d') => self.emit_goto_definition(),
+            Key::Char('r') => self.emit_goto_references(),
             Key::Char('J') => self.emit_join(false),
             Key::Char('v') => self.emit_reselect_visual(),
             Key::Char('i') => self.emit_insert(InsertCmd::LastInsertPos),
@@ -2014,10 +2028,15 @@ mod tests {
     }
 
     #[test]
-    fn gd_emits_goto_definition_and_does_not_disturb_g_s_other_bindings() {
+    fn gd_and_gr_emit_their_outcomes_without_disturbing_g_s_other_bindings() {
         let mut vk = VimKeys::new();
         assert_eq!(vk.feed(Key::Char('g')), KeyOutcome::Pending);
         assert_eq!(vk.feed(Key::Char('d')), KeyOutcome::GotoDefinition);
+        assert_eq!(vk.feed(Key::Char('g')), KeyOutcome::Pending);
+        assert_eq!(vk.feed(Key::Char('r')), KeyOutcome::GotoReferences);
+        // `r` on its own is still replace-a-character, not this.
+        assert_eq!(vk.feed(Key::Char('r')), KeyOutcome::Pending);
+        vk.feed(Key::Escape);
         // The `g` family is crowded, and `d` is also the delete
         // operator's own key -- so check the neighbours still work.
         assert_eq!(vk.feed(Key::Char('g')), KeyOutcome::Pending);

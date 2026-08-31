@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::{self, Write};
 use std::rc::Rc;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::lspclient;
 
@@ -146,6 +146,18 @@ enum Frame {
     Edit(EditFrameId),
     Hex(HexFrameId),
     Diagnostics(EditFrameId),
+    /// A list of places -- `gr`'s references today, and whatever else
+    /// answers with `lsp::Location`s later. A sibling pane of the
+    /// editor frame it was asked from, exactly like `Diagnostics`, and
+    /// for the same reason: the list is *about* that buffer, and
+    /// collapsing to a title row when unfocused is what keeps it from
+    /// costing anything while you go on editing.
+    ///
+    /// Its contents live in `repl::run`'s own `location_lists`, keyed
+    /// the same way `debug_frames` is -- unlike diagnostics, a list of
+    /// places in *other* files is not a property of any one buffer, so
+    /// it has nowhere on `TextBuffer` it could honestly live.
+    Locations(EditFrameId),
     DebugRun(EditFrameId),
 }
 
@@ -406,7 +418,7 @@ fn session_referenced_elsewhere(windows: &[WindowEntry], current_window: usize, 
             for (depth, frame) in pane.stack.iter().enumerate() {
                 let matches = match frame {
                     Frame::Session(s) => *s == sid,
-                    Frame::Job(_) | Frame::Edit(_) | Frame::Hex(_) | Frame::Diagnostics(_) | Frame::DebugRun(_) => false,
+                    Frame::Job(_) | Frame::Edit(_) | Frame::Hex(_) | Frame::Diagnostics(_) | Frame::Locations(_) | Frame::DebugRun(_) => false,
                 };
                 if !matches {
                     continue;
@@ -485,6 +497,7 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
     // Same idea again, for `:dbg`'s own attached sessions (Frame::
     // DebugRun) -- see Frame's own doc comment.
     let mut debug_frames: HashMap<EditFrameId, debugger::DebugSession> = HashMap::new();
+    let mut location_lists: HashMap<EditFrameId, LocationList> = HashMap::new();
     // Flips true (and stays true) the first time any window-family
     // command promotes the terminal -- see apply_window_action. Every
     // session's sink is Real until then, matching today's plain behavior
@@ -539,6 +552,7 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
                 &mut next_window_id,
                 &mut job_frames,
                 &mut debug_frames,
+                &mut location_lists,
                 &mut cmd_history,
                 &mut sinks_are_grid,
                 &mut registers,
@@ -566,6 +580,7 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
                 &mut edit_frames,
                 &mut next_edit_frame_id,
                 &mut debug_frames,
+                &mut location_lists,
                 &mut cmd_history,
                 &mut sinks_are_grid,
                 &mut registers,
@@ -615,6 +630,30 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
                 &mut next_window_id,
                 &mut job_frames,
                 &mut edit_frames,
+                &mut sinks_are_grid,
+                &mut term_rows,
+                &mut term_cols,
+            );
+            let _ = io::stdout().flush();
+            continue;
+        }
+
+        // Same idea again, for the `gr`-created location list (see
+        // split_locations_pane) -- reached whenever focus lands on it,
+        // by <C-w>j or by clicking its collapsed title bar.
+        if let Frame::Locations(edit_frame_id) = *windows[current_window].stack().last().unwrap() {
+            run_locations_frame(
+                windows[current_window].focused_pane,
+                edit_frame_id,
+                &mut sessions,
+                &mut windows,
+                &mut current_window,
+                &mut next_session_id,
+                &mut next_window_id,
+                &mut job_frames,
+                &mut edit_frames,
+                &mut next_edit_frame_id,
+                &mut location_lists,
                 &mut sinks_are_grid,
                 &mut term_rows,
                 &mut term_cols,
@@ -1033,6 +1072,7 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
                     &mut job_frames,
                     None,
                     &mut debug_frames,
+                    &mut location_lists,
                     &mut cmd_history,
                     &mut registers,
                     NavStart::Prompt { text, cursor },
@@ -1325,6 +1365,7 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
                         &mut next_window_id,
                         &mut job_frames,
                         &mut debug_frames,
+                        &mut location_lists,
                         &mut cmd_history,
                         &mut sinks_are_grid,
                         &mut registers,
@@ -1746,6 +1787,7 @@ fn run_edit_impl(targets: &[fileeditor::EditTarget], attach_debug: bool) -> i32 
     let mut hex_frames: HashMap<HexFrameId, hexedit::HexSession> = HashMap::new();
     let mut next_hex_frame_id: HexFrameId = 1;
     let mut debug_frames: HashMap<EditFrameId, debugger::DebugSession> = HashMap::new();
+    let mut location_lists: HashMap<EditFrameId, LocationList> = HashMap::new();
     let mut sinks_are_grid = false;
 
     ensure_promoted(&mut sessions, &mut sinks_are_grid);
@@ -1841,6 +1883,7 @@ fn run_edit_impl(targets: &[fileeditor::EditTarget], attach_debug: bool) -> i32 
                 &mut edit_frames,
                 &mut next_edit_frame_id,
                 &mut debug_frames,
+                &mut location_lists,
                 &mut cmd_history,
                 &mut sinks_are_grid,
                 &mut registers,
@@ -1947,6 +1990,7 @@ fn run_fg_job_frame(
     next_window_id: &mut u32,
     job_frames: &mut HashMap<JobFrameId, exec::FgJob>,
     debug_frames: &mut HashMap<EditFrameId, debugger::DebugSession>,
+    location_lists: &mut HashMap<EditFrameId, LocationList>,
     cmd_history: &mut History,
     sinks_are_grid: &mut bool,
     registers: &mut Registers,
@@ -2031,6 +2075,7 @@ fn run_fg_job_frame(
                 job_frames,
                 None,
                 debug_frames,
+                location_lists,
                 cmd_history,
                 registers,
                 NavStart::JobDetach,
@@ -2351,6 +2396,7 @@ fn run_edit_frame(
     // frame, and this is the counter those ids come from.
     next_edit_frame_id: &mut EditFrameId,
     debug_frames: &mut HashMap<EditFrameId, debugger::DebugSession>,
+    location_lists: &mut HashMap<EditFrameId, LocationList>,
     cmd_history: &mut History,
     sinks_are_grid: &mut bool,
     registers: &mut Registers,
@@ -2422,6 +2468,7 @@ fn run_edit_frame(
             job_frames,
             Some(edit_frame_id),
             debug_frames,
+            location_lists,
             cmd_history,
             registers,
             NavStart::Edit(Box::new(buffer), Box::new(vk)),
@@ -2454,6 +2501,15 @@ fn run_edit_frame(
                     close_pane(&mut windows[*current_window], diag_pane);
                     close_orphaned_sessions(sessions, windows);
                 }
+                // The same for a `gr` location list: it is about the
+                // buffer that is going away, and its entries are
+                // addressed against a frame id that is about to be
+                // reused.
+                if let Some(pane) = locations_sibling(&windows[*current_window], edit_frame_id) {
+                    close_pane(&mut windows[*current_window], pane);
+                    close_orphaned_sessions(sessions, windows);
+                }
+                location_lists.remove(&edit_frame_id);
                 // Same idea for an attached `:dbg` session's own
                 // DebugRun sibling -- the buffer this session was
                 // attached to is going away regardless of whether
@@ -2844,6 +2900,247 @@ fn run_diagnostics_frame(
                 }
                 _ => {}
             },
+        }
+    }
+}
+
+// One row per location: where it is, and the source line if it could be
+// read. Same shape as `render_diagnostics_list_frame` -- selected row in
+// reverse video, blank rows padded out -- so the two panes behave the
+// same under the hand.
+fn render_locations_list_frame(list: &LocationList, rect: Rect, selected: usize) {
+    fn pad(text: &str, cols: usize) -> String {
+        let mut s: String = text.chars().take(cols).collect();
+        let len = s.chars().count();
+        if len < cols {
+            s.push_str(&" ".repeat(cols - len));
+        }
+        s
+    }
+    let mut out = String::new();
+    let mut row = 0usize;
+    if list.items.is_empty() {
+        out.push_str(&format!("\x1b[{};{}H", rect.row + 1, rect.col + 1));
+        out.push_str(&pad(&list.title, rect.cols));
+        row = 1;
+    } else {
+        // Scrolled so the selection stays visible: a list capped at
+        // MAX_LOCATIONS is routinely taller than a pane capped at half
+        // the window.
+        let first = selected.saturating_sub(rect.rows.saturating_sub(1));
+        for (i, item) in list.items.iter().enumerate().skip(first) {
+            if row >= rect.rows {
+                break;
+            }
+            let text = pad(&item.label, rect.cols);
+            out.push_str(&format!("\x1b[{};{}H", rect.row + row + 1, rect.col + 1));
+            if i == selected {
+                out.push_str("\x1b[7m");
+                out.push_str(&text);
+                out.push_str("\x1b[0m");
+            } else {
+                out.push_str(&text);
+            }
+            row += 1;
+        }
+    }
+    while row < rect.rows {
+        out.push_str(&format!("\x1b[{};{}H", rect.row + row + 1, rect.col + 1));
+        out.push_str(&" ".repeat(rect.cols));
+        row += 1;
+    }
+    out.push_str("\x1b[?25l");
+    print!("{}", out);
+    let _ = io::stdout().flush();
+}
+
+// The location pane's own interactive list -- `run_diagnostics_frame`'s
+// sibling, dispatched from the main loop the same way, and deliberately
+// the same shape: a bare `VimKeys` purely for `<C-w>` chords and
+// `j`/`k` with counts, every other key intercepted before `vk.feed`,
+// selection state local to the call.
+//
+// The one real difference is what Enter does. A diagnostic is always in
+// the buffer the pane belongs to, so selecting one just moves that
+// buffer's cursor; a location may be in any file, so selecting one can
+// have to *open* something -- which is why this takes the frame-id
+// counter its sibling does not need.
+#[allow(clippy::too_many_arguments)]
+fn run_locations_frame(
+    pane_id: PaneId,
+    edit_frame_id: EditFrameId,
+    sessions: &mut HashMap<SessionId, SessionState>,
+    windows: &mut Vec<WindowEntry>,
+    current_window: &mut usize,
+    next_session_id: &mut SessionId,
+    next_window_id: &mut u32,
+    job_frames: &mut HashMap<JobFrameId, exec::FgJob>,
+    edit_frames: &mut HashMap<EditFrameId, fileeditor::EditSession>,
+    next_edit_frame_id: &mut EditFrameId,
+    location_lists: &mut HashMap<EditFrameId, LocationList>,
+    sinks_are_grid: &mut bool,
+    term_rows: &mut usize,
+    term_cols: &mut usize,
+) {
+    let Ok(_guard) = term::RawGuard::enable_with_mouse(0) else { return };
+    let mut vk = VimKeys::new();
+    let mut selected: usize = 0;
+
+    let budget = editor_pane_for(&windows[*current_window], edit_frame_id)
+        .map(|id| pane_rect(&windows[*current_window], id, *term_rows, *term_cols).rows + 1)
+        .unwrap_or(*term_rows);
+    let set_expanded = |windows: &mut Vec<WindowEntry>, current_window: usize, rows: usize| {
+        if let Some((_, children, idx)) = find_parent_split_mut(&mut windows[current_window].layout, pane_id) {
+            children[idx].minimized = false;
+            children[idx].fixed = Some(rows);
+        }
+    };
+    let set_minimized = |windows: &mut Vec<WindowEntry>, current_window: usize| {
+        if let Some((_, children, idx)) = find_parent_split_mut(&mut windows[current_window].layout, pane_id) {
+            children[idx].minimized = true;
+            children[idx].fixed = None;
+        }
+    };
+    let refresh_editor_frame = |sessions: &HashMap<SessionId, SessionState>, windows: &Vec<WindowEntry>, edit_frames: &HashMap<EditFrameId, fileeditor::EditSession>, current_window: usize, term_rows: usize, term_cols: usize| {
+        let Some(editor_pane) = editor_pane_for(&windows[current_window], edit_frame_id) else { return };
+        let Some(session) = edit_frames.get(&edit_frame_id) else { return };
+        let rect = pane_rect(&windows[current_window], editor_pane, term_rows, term_cols);
+        let sid = windows[current_window].pane(editor_pane).owning_session();
+        let color_overrides = syntax_color_overrides(&sessions[&sid].shell);
+        let screen = &sessions[&sid].screen;
+        screen.borrow_mut().resize(rect.rows, rect.cols);
+        fileeditor::freeze_editor_frame(screen, &session.buffer, &session.vk, rect, Some(&color_overrides));
+    };
+    let len = location_lists.get(&edit_frame_id).map(|l| l.items.len()).unwrap_or(0);
+    set_expanded(windows, *current_window, diagnostics_pane_rows(len, false, budget));
+    refresh_editor_frame(sessions, windows, edit_frames, *current_window, *term_rows, *term_cols);
+    compositor_redraw(sessions, windows, *current_window, *term_rows, *term_cols);
+
+    loop {
+        let rect = pane_rect(&windows[*current_window], pane_id, *term_rows, *term_cols);
+        if let Some(list) = location_lists.get(&edit_frame_id) {
+            render_locations_list_frame(list, rect, selected);
+        }
+        let key = match editor::read_key_idle(&mut || {
+            service_background_jobs(sessions, windows, job_frames, *current_window, term_rows, term_cols, *sinks_are_grid);
+        }) {
+            Ok(Some(k)) => k,
+            Ok(None) | Err(_) => return,
+        };
+        let len = location_lists.get(&edit_frame_id).map(|l| l.items.len()).unwrap_or(0);
+
+        if let Key::Mouse(ev) = key {
+            if ev.is_left_click() {
+                let row0 = (ev.row as usize).saturating_sub(1);
+                if row0 >= rect.row {
+                    let first = selected.saturating_sub(rect.rows.saturating_sub(1));
+                    let idx = first + (row0 - rect.row);
+                    if idx < len {
+                        selected = idx;
+                    }
+                }
+            }
+            continue;
+        }
+
+        // Collapse back to the title row and hand focus to the editor
+        // pane this list belongs to -- the same exit its diagnostics
+        // sibling has.
+        let collapse = |windows: &mut Vec<WindowEntry>, sessions: &HashMap<SessionId, SessionState>, lists: &HashMap<EditFrameId, LocationList>| {
+            if let Some(list) = lists.get(&edit_frame_id) {
+                let sid = windows[*current_window].pane(pane_id).owning_session();
+                render_locations_title(&sessions[&sid].screen, rect.cols, &list.title);
+            }
+            set_minimized(windows, *current_window);
+            if let Some(editor_pane) = editor_pane_for(&windows[*current_window], edit_frame_id) {
+                windows[*current_window].focused_pane = editor_pane;
+            }
+        };
+
+        match key {
+            Key::Enter => {
+                let chosen = location_lists.get(&edit_frame_id).and_then(|l| l.items.get(selected)).map(|item| {
+                    (item.path.clone(), item.line, item.character, item.encoding)
+                });
+                collapse(windows, sessions, location_lists);
+                if let Some((path, line, character, encoding)) = chosen {
+                    let here = edit_frames.get(&edit_frame_id).and_then(|s| s.buffer.path().map(|p| p.to_path_buf()));
+                    if here.as_deref() == Some(path.as_path()) {
+                        // Already open: just move its cursor, the way
+                        // the diagnostics pane always does.
+                        if let Some(session) = edit_frames.get_mut(&edit_frame_id) {
+                            let starts = fileeditor::line_starts_of(&session.buffer);
+                            let offset = fileeditor::diagnostic_offset(&session.buffer, &starts, line, character, encoding);
+                            let (row, col) = fileeditor::diagnostic_position(&session.buffer, offset);
+                            session.buffer.set_cursor(row, col);
+                        }
+                    } else {
+                        open_location_frame(sessions, windows, edit_frames, next_edit_frame_id, *current_window, &path, line, character, encoding, *term_rows, *term_cols);
+                    }
+                }
+                refresh_editor_frame(sessions, windows, edit_frames, *current_window, *term_rows, *term_cols);
+                compositor_redraw(sessions, windows, *current_window, *term_rows, *term_cols);
+                return;
+            }
+            Key::Escape | Key::Char('q') => {
+                collapse(windows, sessions, location_lists);
+                refresh_editor_frame(sessions, windows, edit_frames, *current_window, *term_rows, *term_cols);
+                compositor_redraw(sessions, windows, *current_window, *term_rows, *term_cols);
+                return;
+            }
+            _ => match vk.feed(key) {
+                KeyOutcome::Motion(motion::Motion::Down, count) => {
+                    selected = (selected + count.unwrap_or(1).max(1)).min(len.saturating_sub(1));
+                    compositor_redraw(sessions, windows, *current_window, *term_rows, *term_cols);
+                }
+                KeyOutcome::Motion(motion::Motion::Up, count) => {
+                    selected = selected.saturating_sub(count.unwrap_or(1).max(1));
+                    compositor_redraw(sessions, windows, *current_window, *term_rows, *term_cols);
+                }
+                KeyOutcome::Window(cmd, count) => {
+                    dispatch_window_cmd(cmd, count, sessions, windows, current_window, next_session_id, next_window_id, sinks_are_grid, *term_rows, *term_cols);
+                    return;
+                }
+                _ => {}
+            },
+        }
+    }
+}
+
+// Opens `path` as a new Edit frame on the focused pane's stack, with the
+// cursor at the server position given -- the same "go look, then `:q`
+// back" shape `NavExit::OpenAt` produces for `gd`, reached from the
+// location pane instead of from the navigation loop.
+#[allow(clippy::too_many_arguments)]
+fn open_location_frame(
+    sessions: &mut HashMap<SessionId, SessionState>,
+    windows: &mut [WindowEntry],
+    edit_frames: &mut HashMap<EditFrameId, fileeditor::EditSession>,
+    next_edit_frame_id: &mut EditFrameId,
+    current_window: usize,
+    path: &Path,
+    line: usize,
+    character: usize,
+    encoding: crate::lsp::PositionEncoding,
+    term_rows: usize,
+    term_cols: usize,
+) {
+    let pane_id = windows[current_window].focused_pane;
+    let rect = pane_rect(&windows[current_window], pane_id, term_rows, term_cols);
+    match fileeditor::EditSession::open(path.to_str(), normal_mode_content_rows(rect)) {
+        Ok(mut opened) => {
+            let starts = fileeditor::line_starts_of(&opened.buffer);
+            let offset = fileeditor::diagnostic_offset(&opened.buffer, &starts, line, character, encoding);
+            let (row, col) = fileeditor::diagnostic_position(&opened.buffer, offset);
+            opened.buffer.set_cursor(row, col);
+            let id = *next_edit_frame_id;
+            *next_edit_frame_id += 1;
+            edit_frames.insert(id, opened);
+            windows[current_window].pane_mut(pane_id).stack.push(Frame::Edit(id));
+        }
+        Err(e) => {
+            let sid = windows[current_window].pane(pane_id).owning_session();
+            sessions.get_mut(&sid).unwrap().shell.sink_err(&format!("bish: {}: {}\n", path.display(), e));
         }
     }
 }
@@ -3325,6 +3622,11 @@ fn apply_window_action(
                 Some(Frame::Diagnostics(_)) => {
                     sessions[&cur_sid].shell.sink_err("bish: window: fg: that window is showing diagnostics, not a session\n");
                 }
+                // Same reasoning again -- a location list belongs to the
+                // one Edit frame's pane it sits below.
+                Some(Frame::Locations(_)) => {
+                    sessions[&cur_sid].shell.sink_err("bish: window: fg: that window is showing a location list, not a session\n");
+                }
                 // Same reasoning again -- the debug-run pane is scoped to
                 // the one Edit frame's own pane it sits below too.
                 Some(Frame::DebugRun(_)) => {
@@ -3489,6 +3791,100 @@ fn split_diagnostics_pane(
     window.layout = insert_sibling(old_layout, focused_id, new_pane_id, true, None, true);
 
     new_pane_id
+}
+
+// The location-list sibling of `split_diagnostics_pane` just above.
+// Same shape and the same reasoning throughout: a session forked purely
+// to give the new pane a screen to composite from, always horizontal,
+// starts minimized, and does not move focus -- asking where something
+// is used should not take you out of the file.
+fn split_locations_pane(
+    sessions: &mut HashMap<SessionId, SessionState>,
+    windows: &mut [WindowEntry],
+    current_window: usize,
+    next_session_id: &mut SessionId,
+    edit_frame_id: EditFrameId,
+    term_rows: usize,
+    term_cols: usize,
+) -> PaneId {
+    let parent_id = windows[current_window].owning_session();
+    let child_history = sessions[&parent_id].history.fork();
+    let mut child_shell = sessions[&parent_id].shell.new_virtual_child();
+    let child_lsp = Rc::clone(&sessions[&parent_id].lsp);
+    install_service_table(&mut child_shell, &child_lsp);
+    let screen = Rc::new(RefCell::new(vt100::Screen::new(content_rows(term_rows), term_cols)));
+    child_shell.set_sink_grid(screen.clone());
+    let child_cwd = child_shell.cwd.clone();
+    let sid = *next_session_id;
+    *next_session_id += 1;
+    sessions.insert(
+        sid,
+        SessionState {
+            shell: child_shell,
+            lsp: child_lsp,
+            buffer: String::new(),
+            buffer_unrecorded: false,
+            history: child_history,
+            screen,
+            warned_stopped_jobs: false,
+            dir_history: vec![child_cwd],
+            dir_history_index: 0,
+            command_transcript: Vec::new(),
+        },
+    );
+    let window = &mut windows[current_window];
+    let new_pane_id = window.next_pane_id;
+    window.next_pane_id += 1;
+    window.panes.push(Pane { id: new_pane_id, stack: vec![Frame::Session(sid), Frame::Locations(edit_frame_id)] });
+    let focused_id = window.focused_pane;
+    let old_layout = std::mem::replace(&mut window.layout, PaneLayout::Leaf(0));
+    window.layout = insert_sibling(old_layout, focused_id, new_pane_id, true, None, true);
+    new_pane_id
+}
+
+fn locations_sibling(window: &WindowEntry, edit_frame_id: EditFrameId) -> Option<PaneId> {
+    window.panes.iter().find(|p| p.stack.last() == Some(&Frame::Locations(edit_frame_id))).map(|p| p.id)
+}
+
+// The collapsed title row, exactly `render_diagnostics_title`'s shape
+// -- a short reverse-video pill set into an otherwise ordinary dashed
+// divider -- so the two panes read as the same kind of thing.
+fn render_locations_title(screen: &Rc<RefCell<vt100::Screen>>, cols: usize, title: &str) {
+    let pill: String = format!(" {title} ").chars().take(cols).collect();
+    let pill_len = pill.chars().count();
+    let left = 2.min(cols.saturating_sub(pill_len));
+    let right = cols.saturating_sub(pill_len + left);
+    let mut framed = String::from("\r\x1b[K");
+    framed.push_str(&"\u{2500}".repeat(left));
+    framed.push_str("\x1b[7m");
+    framed.push_str(&pill);
+    framed.push_str("\x1b[0m");
+    framed.push_str(&"\u{2500}".repeat(right));
+    screen.borrow_mut().feed(framed.as_bytes());
+}
+
+// Creates the location sibling if there isn't one, records the list,
+// and repaints -- called from `gr`, while the buffer it is about is
+// still the caller's own local.
+#[allow(clippy::too_many_arguments)]
+fn sync_locations_pane(
+    sessions: &mut HashMap<SessionId, SessionState>,
+    windows: &mut [WindowEntry],
+    current_window: usize,
+    next_session_id: &mut SessionId,
+    location_lists: &mut HashMap<EditFrameId, LocationList>,
+    edit_frame_id: EditFrameId,
+    list: LocationList,
+    term_rows: usize,
+    term_cols: usize,
+) {
+    let pane_id = locations_sibling(&windows[current_window], edit_frame_id)
+        .unwrap_or_else(|| split_locations_pane(sessions, windows, current_window, next_session_id, edit_frame_id, term_rows, term_cols));
+    let rect = pane_rect(&windows[current_window], pane_id, term_rows, term_cols);
+    let sid = windows[current_window].pane(pane_id).owning_session();
+    render_locations_title(&sessions[&sid].screen, rect.cols, &list.title);
+    location_lists.insert(edit_frame_id, list);
+    compositor_redraw(sessions, windows, current_window, term_rows, term_cols);
 }
 
 // The diagnostics sibling pane already sitting below `edit_frame_id`'s
@@ -3817,7 +4213,7 @@ fn close_orphaned_sessions(sessions: &mut HashMap<SessionId, SessionState>, wind
         .flat_map(|p| {
             p.stack.iter().filter_map(|f| match f {
                 Frame::Session(id) => Some(*id),
-                Frame::Job(_) | Frame::Edit(_) | Frame::Hex(_) | Frame::Diagnostics(_) | Frame::DebugRun(_) => None,
+                Frame::Job(_) | Frame::Edit(_) | Frame::Hex(_) | Frame::Diagnostics(_) | Frame::Locations(_) | Frame::DebugRun(_) => None,
             })
         })
         .collect();
@@ -6398,6 +6794,65 @@ fn install_service_table(shell: &mut Shell, table: &Rc<RefCell<lspclient::Table>
     shell.lsp = Rc::clone(table) as Rc<RefCell<dyn exec::ServiceTable>>;
 }
 
+/// One place a location list points at.
+///
+/// Holds the server's own `(line, character)` and the encoding to read
+/// it in, rather than a resolved cursor position: resolving needs the
+/// text of the file, which for every entry outside the current buffer
+/// has not been read and may never be.
+struct LocationItem {
+    path: PathBuf,
+    line: usize,
+    character: usize,
+    encoding: crate::lsp::PositionEncoding,
+    /// What the row shows: where it is, and the source line if it could
+    /// be read cheaply.
+    label: String,
+}
+
+struct LocationList {
+    /// The pill in the pane's own divider -- "12 references".
+    title: String,
+    items: Vec<LocationItem>,
+}
+
+// How many entries a list keeps. A `gr` on something common in a large
+// project can answer with thousands; a pane capped at half the window
+// can show a few dozen. Truncating is honest and bounded, where
+// building the other nine hundred rows is work nobody asked for.
+const MAX_LOCATIONS: usize = 200;
+
+// Turns a server's answer into a list, reading each distinct file once
+// to put the actual source line on each row.
+//
+// Reading is what makes the list worth having -- `path:12` tells you
+// nothing about which use it is -- but it is bounded twice over: to
+// `MAX_LOCATIONS` entries, and to one read per file however many
+// entries land in it. A file that cannot be read still gets a row, just
+// without its line: a reference that exists is worth showing even if
+// the file moved out from under us.
+fn location_list(title: &str, locations: &[crate::lsp::Location], encoding: crate::lsp::PositionEncoding, base: Option<&Path>) -> LocationList {
+    let mut cache: HashMap<PathBuf, Vec<String>> = HashMap::new();
+    let mut items = Vec::new();
+    for location in locations.iter().take(MAX_LOCATIONS) {
+        let Some(path) = crate::url::to_file_path(&location.uri) else { continue };
+        let lines = cache
+            .entry(path.clone())
+            .or_insert_with(|| std::fs::read_to_string(&path).map(|text| text.lines().map(str::to_string).collect()).unwrap_or_default());
+        // Relative to the file the question was asked from, so the
+        // interesting part of a long path is what shows.
+        let shown = base
+            .and_then(|base| path.strip_prefix(base).ok())
+            .unwrap_or(&path)
+            .display()
+            .to_string();
+        let text = lines.get(location.start.0).map(|l| l.trim()).unwrap_or("");
+        let label = if text.is_empty() { format!("{shown}:{}", location.start.0 + 1) } else { format!("{shown}:{}  {text}", location.start.0 + 1) };
+        items.push(LocationItem { path, line: location.start.0, character: location.start.1, encoding, label });
+    }
+    LocationList { title: title.to_string(), items }
+}
+
 // A session's live syn_col_* colors (see bishedit::highlight::
 // SYN_COL_OPTIONS/ColorOverrides, exec::Shell::bishopt_color), resolved
 // fresh from `shell` -- every caller owns its own snapshot rather than
@@ -6649,6 +7104,8 @@ fn run_normal_mode_navigation(
     // never touched from those calls.
     edit_frame_id: Option<EditFrameId>,
     debug_frames: &mut HashMap<EditFrameId, debugger::DebugSession>,
+    // `gr`'s answers, keyed like `debug_frames` -- see Frame::Locations.
+    location_lists: &mut HashMap<EditFrameId, LocationList>,
     cmd_history: &mut History,
     registers: &mut Registers,
     start: NavStart,
@@ -7340,6 +7797,7 @@ fn run_normal_mode_navigation(
                     col,
                     "textDocument/hover",
                     "hoverProvider",
+                    &[],
                 )
                 .and_then(|result| crate::lsp::hover_lines(&result))
                 .unwrap_or_else(|| {
@@ -7493,6 +7951,7 @@ fn run_normal_mode_navigation(
                         col,
                         "textDocument/definition",
                         "definitionProvider",
+                        &[],
                     )
                     .map(|result| crate::lsp::locations(&result))
                     .unwrap_or_default();
@@ -7522,6 +7981,70 @@ fn run_normal_mode_navigation(
                                 show_command_mode_error(&message, *term_rows, *term_cols);
                             }
                         },
+                    }
+                }
+            }
+            // `gr`: everywhere this is used. Unlike `gd` there is no
+            // single answer to go to, so this fills the location-list
+            // pane below the editor rather than moving the cursor --
+            // and, like `:diag`, does not steal focus: you asked a
+            // question about the code, you did not ask to leave it.
+            KeyOutcome::GotoReferences => {
+                if let NavBuffer::Editable(tb) = &buf {
+                    let (row, col) = tb.cursor();
+                    let encoding = server_encoding_for(sessions, session_id, tb).unwrap_or(crate::lsp::PositionEncoding::Utf16);
+                    let found = ask_server_at_cursor(
+                        sessions,
+                        windows,
+                        job_frames,
+                        session_id,
+                        *current_window,
+                        term_rows,
+                        term_cols,
+                        *sinks_are_grid,
+                        tb,
+                        row,
+                        col,
+                        "textDocument/references",
+                        "referencesProvider",
+                        // Required by the spec, and the answer people
+                        // expect: "where is this used" includes where
+                        // it is declared.
+                        &[("context", crate::json::Value::Object(vec![("includeDeclaration".to_string(), crate::json::Value::Bool(true))]))],
+                    )
+                    .map(|result| crate::lsp::locations(&result))
+                    .unwrap_or_default();
+                    // Relative to the project root when there is one, so
+                    // the interesting part of a long path is what shows.
+                    let base = server_target(&sessions[&session_id].shell, tb).map(|t| t.root);
+                    let title = match found.len() {
+                        0 => "No references found".to_string(),
+                        1 => "1 reference".to_string(),
+                        n if n > MAX_LOCATIONS => format!("{MAX_LOCATIONS} of {n} references"),
+                        n => format!("{n} references"),
+                    };
+                    let list = location_list(&title, &found, encoding, base.as_deref());
+                    match edit_frame_id {
+                        Some(id) => {
+                            sync_locations_pane(
+                                sessions,
+                                windows,
+                                *current_window,
+                                next_session_id,
+                                location_lists,
+                                id,
+                                list,
+                                *term_rows,
+                                *term_cols,
+                            );
+                            render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides.as_ref());
+                        }
+                        // No edit frame to hang a pane on -- which is
+                        // every navigation start except `Edit`.
+                        None => {
+                            render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides.as_ref());
+                            show_command_mode_error(&list.title, *term_rows, *term_cols);
+                        }
                     }
                 }
             }
@@ -8025,6 +8548,11 @@ fn ask_server_at_cursor(
     col: usize,
     method: &str,
     capability: &str,
+    // Anything the method needs beyond `textDocument`/`position`.
+    // `textDocument/references` is the reason this exists: its
+    // `context` is *required*, not optional, so omitting it is a
+    // malformed request rather than a sparse one.
+    extra: &[(&str, crate::json::Value)],
 ) -> Option<crate::json::Value> {
     let session = sessions.get(&session_id)?;
     let target = server_target(&session.shell, buf)?;
@@ -8041,22 +8569,21 @@ fn ask_server_at_cursor(
         }
         let chars = buf.line_chars(row);
         let character = crate::lsp::to_server_column(&chars, col, server.encoding());
-        server.request(
-            method,
-            crate::json::Value::Object(vec![
-                (
-                    "textDocument".to_string(),
-                    crate::json::Value::Object(vec![("uri".to_string(), crate::json::Value::Str(target.uri.clone()))]),
-                ),
-                (
-                    "position".to_string(),
-                    crate::json::Value::Object(vec![
-                        ("line".to_string(), crate::json::Value::Number(row as f64)),
-                        ("character".to_string(), crate::json::Value::Number(character as f64)),
-                    ]),
-                ),
-            ]),
-        )
+        let mut params = vec![
+            (
+                "textDocument".to_string(),
+                crate::json::Value::Object(vec![("uri".to_string(), crate::json::Value::Str(target.uri.clone()))]),
+            ),
+            (
+                "position".to_string(),
+                crate::json::Value::Object(vec![
+                    ("line".to_string(), crate::json::Value::Number(row as f64)),
+                    ("character".to_string(), crate::json::Value::Number(character as f64)),
+                ]),
+            ),
+        ];
+        params.extend(extra.iter().map(|(k, v)| ((*k).to_string(), v.clone())));
+        server.request(method, crate::json::Value::Object(params))
     };
 
     let deadline = std::time::Instant::now() + timeout;

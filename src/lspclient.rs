@@ -335,6 +335,14 @@ impl Server {
                             ]),
                         ),
                         (
+                            "references".to_string(),
+                            Value::Object(vec![("dynamicRegistration".to_string(), Value::Bool(false))]),
+                        ),
+                        (
+                            "definition".to_string(),
+                            Value::Object(vec![("dynamicRegistration".to_string(), Value::Bool(false))]),
+                        ),
+                        (
                             "hover".to_string(),
                             Value::Object(vec![
                                 ("dynamicRegistration".to_string(), Value::Bool(false)),
@@ -1562,7 +1570,8 @@ mod tests {
         // to be told the server never offered it.
         assert!(server.provides("hoverProvider"));
         assert!(server.provides("definitionProvider"));
-        assert!(!server.provides("referencesProvider"));
+        assert!(server.provides("referencesProvider"));
+        assert!(!server.provides("renameProvider"));
 
         server.open_document("file:///p/x.sh", "shellscript", 1, "echo hi");
         let id = server.request(
