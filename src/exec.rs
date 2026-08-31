@@ -11638,6 +11638,8 @@ const KNOWN_BISHOPTS: &[(&str, BishOptDefault)] = &[
     // no `number` to turn off (the gutter always numbers), so this is
     // the only reading of it that leaves the option meaningful.
     ("relativenumber", BishOptDefault::Bool(false)),
+    ("ignorecase", BishOptDefault::Bool(false)),
+    ("smartcase", BishOptDefault::Bool(false)),
     // Whether a project's own `.editorconfig` wins over the settings
     // just below. On, it does -- a project's conventions are the point
     // of the file, and the settings here are your own preference for
@@ -11787,6 +11789,8 @@ const BISHOPT_HELP: &[(&str, &str)] = &[
     ("hyperlinks", "Emit OSC 8 terminal hyperlinks for URLs, links and resolved paths."),
     ("divider_budget", "How much of a split its pane dividers may take, as a percentage, before panes fold away."),
     ("relativenumber", "Number lines by their distance from the cursor's."),
+    ("ignorecase", "Ignore case when searching, unless smartcase says otherwise."),
+    ("smartcase", "With ignorecase on, an uppercase letter in the pattern makes that one search case-sensitive again."),
     ("editorconfig", "Let a project's `.editorconfig` override the settings below it."),
     ("mouse", "Ask the terminal to report mouse events. Off gives the terminal's own selection back."),
     ("cursorshape", "Change the terminal's cursor shape to show the editor's mode."),

@@ -1298,7 +1298,7 @@ pub fn find_matches_in_line(buf: &impl Buffer, line: usize, pattern: &str) -> Ve
     if pattern.is_empty() {
         return Vec::new();
     }
-    let re = Regex::compile(pattern);
+    let re = Regex::compile(pattern, buf.search_ignore_case(pattern));
     let chars = buf.line_chars(line);
     let mut matches = Vec::new();
     let mut from = 0;
@@ -1702,7 +1702,7 @@ pub fn apply_motion(buf: &mut impl Buffer, motion: Motion, count: Option<usize>)
         }
         Motion::SearchForward(pattern) => {
             if !pattern.is_empty() {
-                let re = Regex::compile(&pattern);
+                let re = Regex::compile(&pattern, buf.search_ignore_case(&pattern));
                 let mut pos = buf.cursor();
                 let mut found = None;
                 for _ in 0..n {
@@ -1721,7 +1721,7 @@ pub fn apply_motion(buf: &mut impl Buffer, motion: Motion, count: Option<usize>)
         }
         Motion::SearchBackward(pattern) => {
             if !pattern.is_empty() {
-                let re = Regex::compile(&pattern);
+                let re = Regex::compile(&pattern, buf.search_ignore_case(&pattern));
                 let mut pos = buf.cursor();
                 let mut found = None;
                 for _ in 0..n {
@@ -1742,7 +1742,7 @@ pub fn apply_motion(buf: &mut impl Buffer, motion: Motion, count: Option<usize>)
             let pos = buf.cursor();
             if let Some(word) = word_under_cursor(buf, pos) {
                 let word_len = word.chars().count();
-                let re = Regex::compile(&crate::regex::escape(&word));
+                let re = Regex::compile(&crate::regex::escape(&word), buf.search_ignore_case(&word));
                 let mut cur = pos;
                 let mut found = None;
                 for _ in 0..n {
@@ -1763,7 +1763,7 @@ pub fn apply_motion(buf: &mut impl Buffer, motion: Motion, count: Option<usize>)
             let pos = buf.cursor();
             if let Some(word) = word_under_cursor(buf, pos) {
                 let word_len = word.chars().count();
-                let re = Regex::compile(&crate::regex::escape(&word));
+                let re = Regex::compile(&crate::regex::escape(&word), buf.search_ignore_case(&word));
                 let mut cur = pos;
                 let mut found = None;
                 for _ in 0..n {
@@ -1787,7 +1787,7 @@ pub fn apply_motion(buf: &mut impl Buffer, motion: Motion, count: Option<usize>)
         Motion::SearchWordForwardUnbounded => {
             let pos = buf.cursor();
             if let Some(word) = word_under_cursor(buf, pos) {
-                let re = Regex::compile(&crate::regex::escape(&word));
+                let re = Regex::compile(&crate::regex::escape(&word), buf.search_ignore_case(&word));
                 let mut cur = pos;
                 let mut found = None;
                 for _ in 0..n {
@@ -1807,7 +1807,7 @@ pub fn apply_motion(buf: &mut impl Buffer, motion: Motion, count: Option<usize>)
         Motion::SearchWordBackwardUnbounded => {
             let pos = buf.cursor();
             if let Some(word) = word_under_cursor(buf, pos) {
-                let re = Regex::compile(&crate::regex::escape(&word));
+                let re = Regex::compile(&crate::regex::escape(&word), buf.search_ignore_case(&word));
                 let mut cur = pos;
                 let mut found = None;
                 for _ in 0..n {
@@ -2151,6 +2151,9 @@ mod tests {
         // by column-width autowrap rather than a real line break, for
         // tests exercising that (empty for every other test here).
         wraps: std::collections::HashSet<usize>,
+        // What `Buffer::search_ignore_case` answers, so a search test can
+        // exercise folding without a Shell or a bishopt anywhere in sight.
+        icase: bool,
     }
 
     impl TestBuffer {
@@ -2163,6 +2166,7 @@ mod tests {
                 vheight: 24,
                 marks: std::collections::HashMap::new(),
                 wraps: std::collections::HashSet::new(),
+                icase: false,
             }
         }
 
@@ -2196,11 +2200,16 @@ mod tests {
                 vheight: 24,
                 marks: std::collections::HashMap::new(),
                 wraps,
+                icase: false,
             }
         }
     }
 
     impl Buffer for TestBuffer {
+        fn search_ignore_case(&self, _pattern: &str) -> bool {
+            self.icase
+        }
+
         fn line_count(&self) -> usize {
             self.lines.len()
         }
@@ -2569,6 +2578,46 @@ mod tests {
         assert_eq!(go(&mut buf, Motion::ScreenMiddle, None), (2, 0));
         assert_eq!(go(&mut buf, Motion::ScreenBottom, None), (4, 0));
         assert_eq!(go(&mut buf, Motion::ScreenBottom, Some(2)), (3, 0));
+    }
+
+    // The engine folds; this is the wiring that decides whether it does.
+    #[test]
+    fn a_search_folds_case_only_when_the_buffer_says_so() {
+        let lines = "alpha\nbeta\nBETA\ngamma";
+        let mut buf = TestBuffer::new(lines);
+        buf.set_cursor(0, 0);
+        // Case-sensitive: `BETA` is on line 2 (0-based).
+        assert_eq!(go(&mut buf, Motion::SearchForward("BETA".to_string()), None), (2, 0));
+
+        let mut buf = TestBuffer::new(lines);
+        buf.icase = true;
+        buf.set_cursor(0, 0);
+        assert_eq!(go(&mut buf, Motion::SearchForward("BETA".to_string()), None), (1, 0), "folded, so `beta` on line 1 comes first");
+
+        // Backwards, and the highlight pass, go through the same answer.
+        let mut buf = TestBuffer::new(lines);
+        buf.icase = true;
+        buf.set_cursor(3, 0);
+        assert_eq!(go(&mut buf, Motion::SearchBackward("BETA".to_string()), None), (2, 0));
+        assert_eq!(find_matches_in_line(&buf, 1, "BETA"), vec![(0, 4)]);
+
+        let buf = TestBuffer::new(lines);
+        assert!(find_matches_in_line(&buf, 1, "BETA").is_empty(), "and case-sensitively it does not match at all");
+    }
+
+    // `*` searches for the word under the cursor, and vim folds it the
+    // same way it folds a typed pattern.
+    #[test]
+    fn the_word_under_the_cursor_folds_too() {
+        let lines = "beta\ngamma\nBETA";
+        let mut buf = TestBuffer::new(lines);
+        buf.icase = true;
+        buf.set_cursor(0, 0);
+        assert_eq!(go(&mut buf, Motion::SearchWordForward, None), (2, 0));
+
+        let mut buf = TestBuffer::new(lines);
+        buf.set_cursor(0, 0);
+        assert_eq!(go(&mut buf, Motion::SearchWordForward, None), (0, 0), "case-sensitively there is nowhere else to go");
     }
 
     #[test]

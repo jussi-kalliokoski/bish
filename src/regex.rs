@@ -325,17 +325,17 @@ pub struct Regex {
 }
 
 impl Regex {
-    pub fn compile(pattern: &str) -> Regex {
-        Regex::compile_with(pattern, false)
-    }
-
-    /// The same pattern, matched with or without regard to case.
-    ///
-    /// The flag rides on the compiled pattern rather than on each
+    /// `ignore_case` rides on the compiled pattern rather than on each
     /// search because that is where every caller has the answer: an
     /// editor knows its `ignorecase` setting once per search, not once
     /// per line.
-    pub fn compile_with(pattern: &str, ignore_case: bool) -> Regex {
+    ///
+    /// There is deliberately no one-argument shorthand. Every caller
+    /// answering the question explicitly is what stops a new search
+    /// site from quietly defaulting to case-sensitive -- which is
+    /// exactly how `/` stayed case-sensitive while `:s`, reaching the
+    /// same buffer by a different route, did not.
+    pub fn compile(pattern: &str, ignore_case: bool) -> Regex {
         let (re, group_count) = parse(pattern);
         Regex { re, group_count, ignore_case }
     }
@@ -414,7 +414,7 @@ mod tests {
     use super::*;
 
     fn m(pattern: &str, text: &str, ignore_case: bool) -> bool {
-        let re = Regex::compile_with(pattern, ignore_case);
+        let re = Regex::compile(pattern, ignore_case);
         re.find_at(&text.chars().collect::<Vec<char>>(), 0).is_some()
     }
 
@@ -460,7 +460,7 @@ mod tests {
 
     #[test]
     fn captures_survive_folding() {
-        let re = Regex::compile_with("(a+)(B+)", true);
+        let re = Regex::compile("(a+)(B+)", true);
         let chars: Vec<char> = "xxAAbbyy".chars().collect();
         let (start, end, caps) = re.find_at_with_captures(&chars, 0).expect("matches");
         assert_eq!((start, end), (2, 6));
@@ -484,7 +484,7 @@ mod tests {
 
     #[test]
     fn find_at_with_captures_finds_the_leftmost_match_and_its_groups() {
-        let re = Regex::compile("(a+)(b)");
+        let re = Regex::compile("(a+)(b)", false);
         let cs = chars("xx aaab yy");
         let (start, end, caps) = re.find_at_with_captures(&cs, 0).unwrap();
         assert_eq!((start, end), (3, 7));
@@ -493,7 +493,7 @@ mod tests {
 
     #[test]
     fn find_at_with_captures_respects_from() {
-        let re = Regex::compile("a");
+        let re = Regex::compile("a", false);
         let cs = chars("a.a.a");
         let (start, _, _) = re.find_at_with_captures(&cs, 2).unwrap();
         assert_eq!(start, 2);
@@ -502,13 +502,13 @@ mod tests {
 
     #[test]
     fn find_at_with_captures_none_when_nothing_matches() {
-        let re = Regex::compile("z+");
+        let re = Regex::compile("z+", false);
         assert!(re.find_at_with_captures(&chars("abc"), 0).is_none());
     }
 
     #[test]
     fn find_at_with_captures_empty_string_for_a_group_that_never_matched() {
-        let re = Regex::compile("(a)|(b)");
+        let re = Regex::compile("(a)|(b)", false);
         let (_, _, caps) = re.find_at_with_captures(&chars("b"), 0).unwrap();
         assert_eq!(caps, vec!["b".to_string(), String::new(), "b".to_string()]);
     }

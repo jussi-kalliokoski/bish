@@ -6114,6 +6114,13 @@ struct ScreenBuffer {
     vtop: usize,
     vheight: usize,
     marks: HashMap<char, (usize, usize)>,
+    // `ignorecase`/`smartcase`, set from the session's own shell at the
+    // moment normal mode is entered. A plain field rather than a live
+    // read for the reason every other snapshot here is one: this buffer
+    // has a screen and nothing else, and an excursion is short enough
+    // that a mid-flight change to either option is not worth chasing.
+    ignorecase: bool,
+    smartcase: bool,
     // Visual mode's own committed selections (see vimkeys.rs's own
     // `visual` field doc comment for the active, not-yet-committed one --
     // that lives in `VimKeys`, not here, since it's just an anchor plus
@@ -6207,7 +6214,24 @@ impl ScreenBuffer {
         let vheight = vheight.max(1);
         let vtop = cursor.0.saturating_sub(vheight - 1);
         let entry_line_count = addressable_len(&screen.borrow());
-        ScreenBuffer { screen, cursor, vtop, vheight, marks: HashMap::new(), selections: Vec::new(), entry_line_count, reported_new_lines: 0 }
+        ScreenBuffer {
+            screen,
+            cursor,
+            vtop,
+            vheight,
+            marks: HashMap::new(),
+            selections: Vec::new(),
+            entry_line_count,
+            reported_new_lines: 0,
+            ignorecase: false,
+            smartcase: false,
+        }
+    }
+
+    // The two search options, from whichever session owns this pane.
+    fn set_search_case(&mut self, shell: &exec::Shell) {
+        self.ignorecase = shell.bishopt_bool("ignorecase");
+        self.smartcase = shell.bishopt_bool("smartcase");
     }
 
     // How many lines the pane has gained since this excursion started --
@@ -6283,6 +6307,10 @@ impl BisheditBuffer for ScreenBuffer {
         } else {
             None
         }
+    }
+
+    fn search_ignore_case(&self, pattern: &str) -> bool {
+        crate::bishedit::ignore_case_for(pattern, self.ignorecase, self.smartcase)
     }
 
     fn cursor(&self) -> (usize, usize) {
@@ -6425,6 +6453,18 @@ impl NavBuffer {
 }
 
 impl BisheditBuffer for NavBuffer {
+    // Forwarded like everything else here, and easy to forget: a
+    // defaulted trait method that this wrapper does not pass down
+    // silently answers for both variants with the default -- which is
+    // how `/` kept searching case-sensitively while `:s`, reaching the
+    // same buffer directly, did not.
+    fn search_ignore_case(&self, pattern: &str) -> bool {
+        match self {
+            NavBuffer::Editable(b) => b.search_ignore_case(pattern),
+            NavBuffer::ReadOnly(b) => b.search_ignore_case(pattern),
+        }
+    }
+
     fn line_count(&self) -> usize {
         match self {
             NavBuffer::ReadOnly(b) => b.line_count(),
@@ -7304,6 +7344,8 @@ fn apply_view_options(shell: &exec::Shell, buf: &mut TextBuffer) {
     buf.colors = Some(ui_colors(shell));
     buf.cursorshape = shell.bishopt_bool("cursorshape");
     buf.mouse = shell.bishopt_bool("mouse");
+    buf.ignorecase = shell.bishopt_bool("ignorecase");
+    buf.smartcase = shell.bishopt_bool("smartcase");
     // In this order, and never the other way round: the shell's own
     // settings are the base, and the project's are the override.
     apply_shell_options(shell, buf);
@@ -7496,6 +7538,7 @@ fn run_normal_mode_navigation(
             // whatever had already been typed).
             let screen = sessions[&session_id].screen.clone();
             let mut sb = ScreenBuffer::new(screen, normal_mode_content_rows(rect));
+            sb.set_search_case(&sessions[&session_id].shell);
             let prompt_str = freeze_input_with_text(sessions.get_mut(&session_id).unwrap(), &text);
             // Explicitly positioned rather than trusting wherever
             // ScreenBuffer::new's own default (or the vt100 grid's
@@ -7516,7 +7559,9 @@ fn run_normal_mode_navigation(
         // synthetic prompt line to land after.
         NavStart::JobDetach => {
             let screen = sessions[&session_id].screen.clone();
-            (NavBuffer::ReadOnly(ScreenBuffer::new(screen, normal_mode_content_rows(rect))), VimKeys::new())
+            let mut sb = ScreenBuffer::new(screen, normal_mode_content_rows(rect));
+            sb.set_search_case(&sessions[&session_id].shell);
+            (NavBuffer::ReadOnly(sb), VimKeys::new())
         }
         NavStart::Edit(tb, vk0) => (NavBuffer::Editable(*tb), *vk0),
     };
@@ -12699,7 +12744,7 @@ fn run_substitute(tb: &mut TextBuffer, cmd: &SubstituteCmd) -> Result<(usize, us
     // that prompt would do anyway.
     let mut row = a.min(b);
     let mut end = a.max(b);
-    let re = crate::regex::Regex::compile(&cmd.pattern);
+    let re = crate::regex::Regex::compile(&cmd.pattern, tb.search_ignore_case(&cmd.pattern));
     let mut total = 0usize;
     let mut lines_changed = 0usize;
     while row <= end && row < tb.line_count() {
@@ -13884,7 +13929,7 @@ mod substitute_command_tests {
 
     #[test]
     fn substitute_line_first_match_only_without_g() {
-        let re = crate::regex::Regex::compile("o");
+        let re = crate::regex::Regex::compile("o", false);
         let (text, count) = substitute_line("foo bar", &re, "0", false);
         assert_eq!(text, "f0o bar");
         assert_eq!(count, 1);
@@ -13892,7 +13937,7 @@ mod substitute_command_tests {
 
     #[test]
     fn substitute_line_every_match_with_g() {
-        let re = crate::regex::Regex::compile("o");
+        let re = crate::regex::Regex::compile("o", false);
         let (text, count) = substitute_line("foo bar", &re, "0", true);
         assert_eq!(text, "f00 bar");
         assert_eq!(count, 2);
@@ -13905,7 +13950,7 @@ mod substitute_command_tests {
     // empty.
     #[test]
     fn substitute_line_zero_width_match_makes_forward_progress_but_never_matches_past_the_last_char() {
-        let re = crate::regex::Regex::compile("x*");
+        let re = crate::regex::Regex::compile("x*", false);
         let (text, count) = substitute_line("ab", &re, "-", true);
         assert_eq!(text, "-a-b");
         assert_eq!(count, 2);
@@ -13913,7 +13958,7 @@ mod substitute_command_tests {
 
     #[test]
     fn substitute_line_zero_width_on_a_single_char_line() {
-        let re = crate::regex::Regex::compile("x*");
+        let re = crate::regex::Regex::compile("x*", false);
         let (text, count) = substitute_line("a", &re, "-", true);
         assert_eq!(text, "-a");
         assert_eq!(count, 1);
@@ -13921,7 +13966,7 @@ mod substitute_command_tests {
 
     #[test]
     fn substitute_line_zero_width_on_an_empty_line_still_substitutes_once() {
-        let re = crate::regex::Regex::compile("x*");
+        let re = crate::regex::Regex::compile("x*", false);
         let (text, count) = substitute_line("", &re, "-", true);
         assert_eq!(text, "-");
         assert_eq!(count, 1);
@@ -13929,7 +13974,7 @@ mod substitute_command_tests {
 
     #[test]
     fn substitute_line_a_real_match_reaching_the_end_leaves_nothing_further_to_match() {
-        let re = crate::regex::Regex::compile("b*");
+        let re = crate::regex::Regex::compile("b*", false);
         let (text, count) = substitute_line("ab", &re, "-", true);
         assert_eq!(text, "-a-");
         assert_eq!(count, 2);

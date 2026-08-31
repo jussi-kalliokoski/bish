@@ -29,6 +29,18 @@ pub mod wrap;
 /// `LineBuffer` (which already reaches straight into its own `Vec<char>`)
 /// -- keeping it bespoke per concrete type stayed the simpler, established
 /// shape once it actually came time to add it, not a shortcut taken here.
+/// vim's `ignorecase` and `smartcase`, resolved to the one answer a
+/// pattern actually needs.
+///
+/// `smartcase` only ever *narrows*: with `ignorecase` off it means
+/// nothing at all, and with it on an uppercase letter anywhere in the
+/// pattern makes that one search case-sensitive again. Which is the
+/// whole point -- you type lowercase when you do not care and reach for
+/// the shift key exactly when you do.
+pub fn ignore_case_for(pattern: &str, ignorecase: bool, smartcase: bool) -> bool {
+    ignorecase && !(smartcase && pattern.chars().any(char::is_uppercase))
+}
+
 pub trait Buffer {
     fn line_count(&self) -> usize;
     fn line_len(&self, line: usize) -> usize;
@@ -42,6 +54,20 @@ pub trait Buffer {
 
     fn cursor(&self) -> (usize, usize);
     fn set_cursor(&mut self, line: usize, col: usize);
+
+    /// Whether a search for `pattern` in this buffer folds case.
+    ///
+    /// Asked of the buffer rather than passed down because of where the
+    /// question comes up: a motion is handed a pattern and nothing else,
+    /// and the renderer's own highlight pass is handed even less. The
+    /// buffer is the one thing both already have.
+    ///
+    /// Default false -- vim's own default, and the right answer for an
+    /// implementor with no settings behind it (a test double, the hex
+    /// view).
+    fn search_ignore_case(&self, _pattern: &str) -> bool {
+        false
+    }
 
     fn viewport_top(&self) -> usize;
     fn set_viewport_top(&mut self, line: usize);
@@ -98,5 +124,31 @@ pub trait Buffer {
     /// URL, say) and making it impossible to select in one motion.
     fn line_wraps(&self, _line: usize) -> bool {
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ignore_case_for;
+
+    // `smartcase` only ever narrows, and only when `ignorecase` is on --
+    // which is the half people get wrong when they set it alone and
+    // wonder why nothing changed.
+    #[test]
+    fn smartcase_narrows_ignorecase_and_means_nothing_without_it() {
+        assert!(!ignore_case_for("beta", false, false));
+        assert!(ignore_case_for("beta", true, false));
+        assert!(ignore_case_for("BETA", true, false), "without smartcase, case in the pattern is irrelevant");
+
+        assert!(ignore_case_for("beta", true, true), "all lowercase, so still folded");
+        assert!(!ignore_case_for("Beta", true, true), "one uppercase letter is enough to narrow it");
+        assert!(!ignore_case_for("BETA", true, true));
+
+        assert!(!ignore_case_for("beta", false, true), "smartcase alone does nothing at all");
+        assert!(!ignore_case_for("BETA", false, true));
+
+        // Not a letter at all: nothing to be uppercase about.
+        assert!(ignore_case_for("2 + 2", true, true));
+        assert!(ignore_case_for("", true, true));
     }
 }

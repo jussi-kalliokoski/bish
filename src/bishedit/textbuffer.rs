@@ -57,6 +57,13 @@ pub struct TextBuffer {
     // free. Written by fileeditor::run_insert_mode while a snippet is
     // live and cleared the moment it ends; empty every other time.
     pub snippet_holes: Vec<SnippetHole>,
+    /// The `ignorecase`/`smartcase` bishopts, copied here by
+    /// `apply_view_options` the way every other view option is -- see
+    /// `bishedit::ignore_case_for` for how the two combine, and
+    /// `Buffer::search_ignore_case` for why the answer lives on the
+    /// buffer at all.
+    pub ignorecase: bool,
+    pub smartcase: bool,
     // A language server's semantic tokens for this buffer, already
     // resolved to colours and to this buffer's own char offsets (see
     // repl::sync_semantic_tokens) -- painted as one more layer over
@@ -247,6 +254,8 @@ impl TextBuffer {
             eol: crate::editorconfig::Eol::Lf,
             vtop_sub: 0,
             snippet_holes: Vec::new(),
+            ignorecase: false,
+            smartcase: false,
             semantic_spans: Vec::new(),
             diagnostics: Vec::new(),
             blame: None,
@@ -325,6 +334,8 @@ impl TextBuffer {
             trim_trailing_whitespace: false,
             vtop_sub: 0,
             snippet_holes: Vec::new(),
+            ignorecase: false,
+            smartcase: false,
             semantic_spans: Vec::new(),
             diagnostics: Vec::new(),
             blame: None,
@@ -831,6 +842,10 @@ impl Buffer for TextBuffer {
     fn get_mark(&self, name: char) -> Option<(usize, usize)> {
         self.marks.get(&name).copied()
     }
+
+    fn search_ignore_case(&self, pattern: &str) -> bool {
+        super::ignore_case_for(pattern, self.ignorecase, self.smartcase)
+    }
 }
 
 // The buffer half of a live snippet -- see bishedit::snippet's own
@@ -896,6 +911,8 @@ mod tests {
             eol: crate::editorconfig::Eol::Lf,
             vtop_sub: 0,
             snippet_holes: Vec::new(),
+            ignorecase: false,
+            smartcase: false,
             semantic_spans: Vec::new(),
             diagnostics: Vec::new(),
             blame: None,
