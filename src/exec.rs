@@ -472,6 +472,16 @@ pub struct WindowInfo {
 // What repl.rs should do in response to a `window`-family command -- see
 // ExecResult::Window's doc comment for why this travels as a bubbled
 // signal instead of direct shared-state mutation.
+/// One declared theme: the bishopts it sets, and the highlight colours
+/// it sets. Two maps because they are two namespaces -- `::bish hl`
+/// names are open, bishopt names are a fixed registry -- but one type,
+/// because a theme is a single thing you switch to.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Theme {
+    opts: std::collections::HashMap<String, BishOptValue>,
+    hl: std::collections::HashMap<String, String>,
+}
+
 /// Whatever a shell's output sink was before something borrowed it --
 /// opaque, so `OutputSink` itself stays private.
 pub(crate) struct SavedSink(OutputSink);
@@ -932,7 +942,16 @@ pub struct Shell {
     // Str option, set the normal way -- outside any declaration) names
     // one of these. A shell-wide table, cloned into a forked child the
     // same way bishopts itself is.
-    themes: std::collections::HashMap<String, std::collections::HashMap<String, BishOptValue>>,
+    themes: std::collections::HashMap<String, Theme>,
+    /// Syntax-highlighting colours, by name -- see `::bish hl`.
+    ///
+    /// A plain map rather than a registry, because the names are open:
+    /// `HighlightKind`'s own are what bish produces today, and a
+    /// language server's semantic token types will be more of the same
+    /// without any of them needing to be declared first. That is the
+    /// whole reason these are not bishopts, which are a closed set with
+    /// a default each.
+    hl: std::collections::HashMap<String, String>,
     // `Some` for the entire span between `::bish theme begin` and its
     // matching `::bish theme end` -- every `bishopt --set NAME VALUE` in
     // between is diverted here (keyed by NAME) instead of applying live,
@@ -944,7 +963,7 @@ pub struct Shell {
     // to `None` (not cloned) in a forked child: a declaration in
     // progress is transient, top-level-only state, not something that
     // makes sense to carry into a subshell/command-substitution mid-way.
-    pending_theme: Option<std::collections::HashMap<String, BishOptValue>>,
+    pending_theme: Option<Theme>,
     // `complete NAME`: registered completion specs, by command name -- see
     // run_complete's own doc comment. Consulted both by `compgen`-adjacent
     // introspection (`complete -p`/`-r`/`compopt`) and, via a per-prompt
@@ -1274,6 +1293,7 @@ impl Shell {
             shopt_options: std::collections::HashMap::new(),
             bishopts: std::collections::HashMap::new(),
             themes: std::collections::HashMap::new(),
+            hl: std::collections::HashMap::new(),
             pending_theme: None,
             completions: std::collections::HashMap::new(),
             default_completion: None,
@@ -1540,6 +1560,7 @@ impl Shell {
             shopt_options: self.shopt_options.clone(),
             bishopts: self.bishopts.clone(),
             themes: self.themes.clone(),
+            hl: self.hl.clone(),
             pending_theme: None,
             completions: self.completions.clone(),
             default_completion: self.default_completion.clone(),
@@ -2969,7 +2990,7 @@ impl Shell {
         }
         if name != "theme"
             && let Some(BishOptValue::Str(active)) = self.bishopts.get("theme")
-            && let Some(v) = self.themes.get(active).and_then(|opts| opts.get(name))
+            && let Some(v) = self.themes.get(active).and_then(|theme| theme.opts.get(name))
         {
             return Some(v.clone());
         }
@@ -2992,10 +3013,72 @@ impl Shell {
     // isn't "declaring" a value the way `--set` is -- see run_bish_
     // theme_end's own doc comment for the full reasoning), so it always
     // acts on live state even mid-declaration.
+    // `::bish hl --set`'s own write, diverted into a theme declaration
+    // exactly as `store_bishopt` diverts a bishopt -- which is what
+    // makes `::bish theme begin` capture colours and options together,
+    // as one thing to switch to.
+    fn store_hl(&mut self, name: &str, value: String) {
+        match &mut self.pending_theme {
+            Some(pending) => {
+                pending.hl.insert(name.to_string(), value);
+            }
+            None => {
+                self.hl.insert(name.to_string(), value);
+            }
+        }
+    }
+
+    /// The colour set for `name`, following the active theme when
+    /// nothing is set directly -- the same precedence a bishopt has.
+    ///
+    /// `None` means nothing has been said about this name, and the
+    /// caller keeps its own default. There is no registry of defaults
+    /// here on purpose: the names are open (see `Shell::hl`), so
+    /// "unset" is the only thing that can be said about one nobody has
+    /// mentioned.
+    pub fn hl_color(&self, name: &str) -> Option<vt100::Color> {
+        self.hl_color_for(name, detect_color_support())
+    }
+
+    // `hl_color`'s own logic with the terminal's support passed in --
+    // split out for the reason `bishopt_color_for` is: so tests can
+    // exercise every tier without mutating process-global env vars.
+    fn hl_color_for(&self, name: &str, support: crate::csscolor::ColorSupport) -> Option<vt100::Color> {
+        let text = match self.hl.get(name) {
+            Some(text) => text.clone(),
+            None => {
+                let BishOptValue::Str(active) = self.bishopts.get("theme")? else { return None };
+                self.themes.get(active)?.hl.get(name)?.clone()
+            }
+        };
+        let candidates = crate::csscolor::parse_terminal_list(&text).ok()?;
+        Some(match crate::csscolor::pick(&candidates, support) {
+            crate::csscolor::TermColor::Rgba(rgba) => vt100::Color::Rgb(rgba.r, rgba.g, rgba.b),
+            crate::csscolor::TermColor::Ansi(n) => vt100::Color::Indexed(n),
+        })
+    }
+
+    /// Every highlight colour currently in force, theme included --
+    /// what a redraw builds its overrides from, and what `::bish hl`
+    /// with no arguments lists.
+    pub fn hl_colors(&self) -> Vec<(String, String)> {
+        let mut out: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        if let Some(BishOptValue::Str(active)) = self.bishopts.get("theme")
+            && let Some(theme) = self.themes.get(active)
+        {
+            out.extend(theme.hl.iter().map(|(k, v)| (k.clone(), v.clone())));
+        }
+        // Anything set directly wins over the theme, same as a bishopt.
+        out.extend(self.hl.iter().map(|(k, v)| (k.clone(), v.clone())));
+        let mut list: Vec<(String, String)> = out.into_iter().collect();
+        list.sort();
+        list
+    }
+
     fn store_bishopt(&mut self, name: &str, value: BishOptValue) {
         match &mut self.pending_theme {
             Some(pending) => {
-                pending.insert(name.to_string(), value);
+                pending.opts.insert(name.to_string(), value);
             }
             None => {
                 self.bishopts.insert(name.to_string(), value);
@@ -3261,13 +3344,14 @@ impl Shell {
             // bish-specific commands that shouldn't spend a common word.
             [sub, rest @ ..] if sub == "window" || sub == "win" => self.run_window(rest),
             [sub, rest @ ..] if sub == "hook" => ExecResult::Status(self.run_hook(rest)),
+            [sub, rest @ ..] if sub == "hl" => ExecResult::Status(self.run_hl(rest)),
             [sub, rest @ ..] if sub == "lsp" => ExecResult::Status(self.run_lsp(rest)),
             [] => {
-                sh_eprintln!(self, "bish: ::bish: missing subcommand (expected: theme, window, hook, lsp)");
+                sh_eprintln!(self, "bish: ::bish: missing subcommand (expected: theme, window, hook, hl, lsp)");
                 ExecResult::Status(2)
             }
             [other, ..] => {
-                sh_eprintln!(self, "bish: ::bish: unknown subcommand '{other}' (expected: theme, window, hook, lsp)");
+                sh_eprintln!(self, "bish: ::bish: unknown subcommand '{other}' (expected: theme, window, hook, hl, lsp)");
                 ExecResult::Status(2)
             }
         }
@@ -3599,6 +3683,62 @@ impl Shell {
         self.firing_hooks = firing;
     }
 
+    // `::bish hl` -- the syntax-highlighting palette.
+    //
+    // Shaped like `bishopt` (`--set`, `--unset`, a bare name to read,
+    // nothing to list) because it does the same job, and two commands
+    // that behave differently for no reason are two things to learn.
+    // It is a *separate* command because the names are open: bishopt is
+    // a closed registry with a default and a description for each
+    // entry, and a highlight colour cannot be, since a language
+    // server's semantic token types are not knowable in advance.
+    //
+    // Only colours. The chrome colours (`ui_col_*`) stay bishopts --
+    // those really are a fixed set of things bish draws.
+    fn run_hl(&mut self, args: &[String]) -> i32 {
+        match args {
+            [] => {
+                for (name, value) in self.hl_colors() {
+                    sh_println!(self, "{name}\t{value}");
+                }
+                0
+            }
+            [flag, name] if flag == "--unset" || flag == "-u" => {
+                // Live state even mid-declaration, exactly as
+                // `bishopt --unset` is: unsetting is not declaring.
+                if self.hl.remove(name.as_str()).is_none() {
+                    sh_eprintln!(self, "bish: ::bish hl: {name} is not set");
+                    return 1;
+                }
+                0
+            }
+            [flag, name, value] if flag == "--set" || flag == "-s" => {
+                if let Err(e) = crate::csscolor::parse_terminal_list(value) {
+                    sh_eprintln!(self, "bish: ::bish hl: {name}: {e}");
+                    return 2;
+                }
+                self.store_hl(name, value.clone());
+                0
+            }
+            [name] if !name.starts_with('-') => {
+                match self.hl_colors().into_iter().find(|(n, _)| n == name) {
+                    Some((_, value)) => {
+                        sh_println!(self, "{value}");
+                        0
+                    }
+                    // Nothing said about this name, which is not an
+                    // error: an open namespace has no unknown names,
+                    // only unset ones.
+                    None => 1,
+                }
+            }
+            _ => {
+                sh_eprintln!(self, "bish: ::bish hl: usage: ::bish hl [NAME | --set|-s NAME COLOUR | --unset|-u NAME]");
+                2
+            }
+        }
+    }
+
     fn run_bish_theme(&mut self, args: &[String]) -> i32 {
         match args {
             [sub] if sub == "begin" => self.run_bish_theme_begin(),
@@ -3627,7 +3767,7 @@ impl Shell {
             sh_eprintln!(self, "bish: ::bish theme: a theme declaration is already in progress -- `::bish theme end` it first");
             return 1;
         }
-        self.pending_theme = Some(std::collections::HashMap::new());
+        self.pending_theme = Some(Theme::default());
         0
     }
 
@@ -3651,7 +3791,7 @@ impl Shell {
             sh_eprintln!(self, "bish: ::bish theme: no theme declaration in progress");
             return 1;
         };
-        let Some(BishOptValue::Str(name)) = pending.remove("theme") else {
+        let Some(BishOptValue::Str(name)) = pending.opts.remove("theme") else {
             return 0;
         };
         self.themes.insert(name, pending);
@@ -3664,13 +3804,13 @@ impl Shell {
     // csscolor::TermColor). `None` if `name` isn't a registered Color
     // option at all (an unknown name, or a Bool/Str one). Used by repl.rs
     // to build a session's live bishedit::highlight::ColorOverrides each
-    // redraw, from bishedit::highlight::SYN_COL_OPTIONS' own list of
+    // redraw, from bishedit::highlight::HL_NAMES' own list of
     // names -- exposed this way (rather than BishOptValue/bishopt_value
     // themselves, both private) since repl.rs only ever needs the
     // resolved color, never the raw bishopt machinery. Detects the real
     // terminal's own color support fresh each call (see
     // detect_color_support) -- cheap (two env lookups), and this is only
-    // ever called once per syn_col_* name per redraw, not per character.
+    // ever called once per colour name per redraw, not per character.
     // A registered Bool/Int/Str option's current value. Panicking on an
     // unregistered name is deliberate: every caller names a constant
     // from KNOWN_BISHOPTS, so a miss is a typo in this codebase rather
@@ -11249,7 +11389,7 @@ const SET_O_OPTIONS: &[&str] = &["pipefail", "errexit", "nounset", "xtrace", "no
 // its own, see `run_bishopt`'s own doc comment on why "unset" and
 // "false" are the same state for a boolean option.
 // #[allow(dead_code)]: no Bool entry has landed in KNOWN_BISHOPTS yet
-// (Color, for syn_col_*, and now Str, for "theme" -- see KNOWN_BISHOPTS'
+// (Color, for the ui_col_* chrome colours, and Str, for "theme" -- see KNOWN_BISHOPTS'
 // own doc comments -- both have real entries), so only Bool isn't
 // actually constructed by production code, only by run_bishopt's tests
 // (which build their own small registry covering all three). Drop this
@@ -11295,9 +11435,9 @@ enum BishOptValue {
 // real bash silently colliding with (or being silently ignored by) a
 // bish-only setting sharing the same name.
 //
-// The `syn_col_*` entries are the first real, behavior-gating ones (no
+// The `ui_col_*` entries are the first real, behavior-gating ones (no
 // more dead-stub problem, unlike shopt_options' own history): each is
-// one of bishedit::highlight's own SYN_COL_OPTIONS names, read every
+// one of bishedit::highlight's own HL_NAMES names, read every
 // prompt redraw (see repl.rs's own construction of `highlight_ctx`) to
 // build that redraw's ColorOverrides. Their default text is a `-bish-*`
 // vendor color (csscolor::parse_terminal) naming the exact ANSI slot
@@ -11323,22 +11463,11 @@ const KNOWN_BISHOPTS: &[(&str, BishOptDefault)] = &[
     // way every other option does -- a theme naming itself would be
     // circular and meaningless.
     ("theme", BishOptDefault::Str("")),
-    ("syn_col_keyword", BishOptDefault::Color("-bish-yellow")),
-    ("syn_col_operator", BishOptDefault::Color("-bish-white")),
-    ("syn_col_redirect", BishOptDefault::Color("-bish-magenta")),
-    ("syn_col_string", BishOptDefault::Color("-bish-green")),
-    ("syn_col_variable", BishOptDefault::Color("-bish-cyan")),
-    ("syn_col_substitution", BishOptDefault::Color("-bish-blue")),
-    ("syn_col_comment", BishOptDefault::Color("-bish-bright-black")),
-    ("syn_col_number", BishOptDefault::Color("-bish-cyan")),
-    ("syn_col_format_specifier", BishOptDefault::Color("-bish-red")),
-    ("syn_col_invalid_command", BishOptDefault::Color("-bish-red")),
-    ("syn_col_key", BishOptDefault::Color("-bish-cyan")),
     // ...and the same for bish's own chrome rather than for the text it
     // shows: the browser's entry types, rendered markdown, diagnostics.
     // Identical machinery (see theme.rs, which mirrors
     // bishedit::highlight's) so `ui_col_directory` behaves exactly as
-    // `syn_col_keyword` does, and both land in a `::bish theme`
+    // `::bish hl`'s own names do, and both land in a `::bish theme`
     // declaration without either knowing about themes.
     ("ui_col_directory", BishOptDefault::Color("-bish-blue")),
     ("ui_col_symlink", BishOptDefault::Color("-bish-cyan")),
@@ -11509,17 +11638,6 @@ pub fn bishopt_values(name: &str) -> &'static [&'static str] {
 // here.
 const BISHOPT_HELP: &[(&str, &str)] = &[
     ("theme", "The active `::bish theme` declaration, if any."),
-    ("syn_col_keyword", "Syntax colour: shell keywords, booleans, and a markup heading."),
-    ("syn_col_operator", "Syntax colour: operators, punctuation and separators."),
-    ("syn_col_redirect", "Syntax colour: redirection operators."),
-    ("syn_col_string", "Syntax colour: quoted strings."),
-    ("syn_col_variable", "Syntax colour: variable references, including a `.env` interpolation."),
-    ("syn_col_substitution", "Syntax colour: command and process substitutions."),
-    ("syn_col_comment", "Syntax colour: comments."),
-    ("syn_col_number", "Syntax colour: numbers, and a date-time in TOML."),
-    ("syn_col_format_specifier", "Syntax colour: escapes and printf specifiers inside a string."),
-    ("syn_col_invalid_command", "Syntax colour: a command name that resolves to nothing."),
-    ("syn_col_key", "Syntax colour: a field name -- a JSON, TOML, INI or `.env` key."),
     ("ui_col_directory", "Interface colour: directories in the file browser."),
     ("ui_col_symlink", "Interface colour: symlinks in the file browser."),
     ("ui_col_archive", "Interface colour: archives in the file browser."),
@@ -12327,8 +12445,8 @@ mod tests {
         assert_eq!(shell.bishopt_value(&test_bishopts(), "accent"), Some(BishOptValue::Color("red".to_string(), vec![crate::csscolor::TermColor::Rgba(crate::csscolor::Rgba::new(255, 0, 0, 255))])));
         // But the theme itself was registered, "theme" entry excluded.
         let dark = shell.themes.get("dark").expect("theme must be registered");
-        assert_eq!(dark.get("accent"), Some(&BishOptValue::Color("blue".to_string(), vec![crate::csscolor::TermColor::Rgba(crate::csscolor::Rgba::new(0, 0, 255, 255))])));
-        assert!(!dark.contains_key("theme"), "a theme's own opts must not include a self-referential \"theme\" entry");
+        assert_eq!(dark.opts.get("accent"), Some(&BishOptValue::Color("blue".to_string(), vec![crate::csscolor::TermColor::Rgba(crate::csscolor::Rgba::new(0, 0, 255, 255))])));
+        assert!(!dark.opts.contains_key("theme"), "a theme's own opts must not include a self-referential \"theme\" entry");
     }
 
     #[test]
@@ -12406,24 +12524,95 @@ mod tests {
         assert!(shell.themes.contains_key("fromshell"), "::bish must parse and dispatch as an ordinary command word");
     }
 
+    // Every name bish's own highlighting produces has to be spellable
+    // at `::bish hl`. Not an exhaustive list of what that command
+    // accepts -- the namespace is open -- but these are the ones that
+    // do something today, so a typo'd or duplicated entry here is a
+    // colour nobody can set.
     #[test]
-    fn every_syn_col_option_is_registered_and_defaults_to_a_valid_css_color() {
-        let shell = Shell::new();
-        for (_, name) in crate::bishedit::highlight::SYN_COL_OPTIONS {
-            assert!(shell.bishopt_color(name).is_some(), "{name} must be a registered Color option with a parseable default");
+    fn every_highlight_kind_has_a_distinct_settable_name() {
+        let mut names: Vec<&str> = crate::bishedit::highlight::HL_NAMES.iter().map(|(_, n)| *n).collect();
+        let count = names.len();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), count, "two highlight kinds share a name");
+        let mut shell = Shell::new();
+        for name in names {
+            assert!(!name.is_empty() && !name.starts_with('-'), "{name} is not spellable as a `::bish hl` name");
+            assert_eq!(shell.run_hl(&strs(&["--set", name, "#123456"])), 0, "{name} must be settable");
+            assert_eq!(shell.hl_color(name), Some(vt100::Color::Rgb(0x12, 0x34, 0x56)));
         }
+    }
+
+    #[test]
+    fn an_unset_highlight_colour_is_none_so_the_renderer_keeps_its_own_default() {
+        let mut shell = Shell::new();
+        // No registry and no defaults: `::bish hl`'s namespace is open,
+        // so the only thing that can be said about a name nobody has
+        // mentioned is that it is unset -- and the caller then uses
+        // `highlight::default_style`, which is what a fresh install
+        // rendered with before any of this existed.
+        assert_eq!(shell.hl_color("string"), None);
+        assert_eq!(shell.hl_color("something_no_one_has_named"), None);
+        assert_eq!(shell.run_hl(&strs(&["--set", "string", "#123456"])), 0);
+        assert_eq!(shell.hl_color("string"), Some(vt100::Color::Rgb(0x12, 0x34, 0x56)));
+        // An open namespace takes a name nothing produces yet, which is
+        // what lets a server's semantic token types be coloured before
+        // bish knows about them.
+        assert_eq!(shell.run_hl(&strs(&["--set", "lsp_type_parameter", "#abcdef"])), 0);
+        assert_eq!(shell.hl_color("lsp_type_parameter"), Some(vt100::Color::Rgb(0xab, 0xcd, 0xef)));
+        // Unsetting takes it back to "nothing said".
+        assert_eq!(shell.run_hl(&strs(&["--unset", "string"])), 0);
+        assert_eq!(shell.hl_color("string"), None);
+        assert_eq!(shell.run_hl(&strs(&["--unset", "string"])), 1, "unsetting what is not set says so");
+    }
+
+    // The point of `::bish hl` being its own command but not its own
+    // *concept*: a theme is one thing you switch to, and it carries the
+    // palette along with the options.
+    #[test]
+    fn a_theme_captures_highlight_colours_alongside_bishopts() {
+        let mut shell = Shell::new();
+        assert_eq!(shell.run_bish_theme(&strs(&["begin"])), 0);
+        shell.run_bishopt(&strs(&["--set", "theme", "midnight"]), KNOWN_BISHOPTS);
+        shell.run_bishopt(&strs(&["--set", "ui_col_directory", "#111111"]), KNOWN_BISHOPTS);
+        assert_eq!(shell.run_hl(&strs(&["--set", "string", "#222222"])), 0);
+        assert_eq!(shell.run_bish_theme(&strs(&["end"])), 0);
+
+        // Declaring is not switching, so nothing has changed yet.
+        assert_eq!(shell.hl_color("string"), None);
+        // Switching brings both halves.
+        shell.run_bishopt(&strs(&["--set", "theme", "midnight"]), KNOWN_BISHOPTS);
+        assert_eq!(shell.bishopt_color("ui_col_directory"), Some(vt100::Color::Rgb(0x11, 0x11, 0x11)));
+        assert_eq!(shell.hl_color("string"), Some(vt100::Color::Rgb(0x22, 0x22, 0x22)));
+
+        // Something set directly still wins over the theme, the same
+        // precedence a bishopt has.
+        assert_eq!(shell.run_hl(&strs(&["--set", "string", "#333333"])), 0);
+        assert_eq!(shell.hl_color("string"), Some(vt100::Color::Rgb(0x33, 0x33, 0x33)));
+        // ...and the listing shows the theme's entries too, so `::bish
+        // hl` with no arguments answers "what is in force", not "what
+        // did I type".
+        let listed = shell.hl_colors();
+        assert!(listed.iter().any(|(n, v)| n == "string" && v == "#333333"), "{listed:?}");
+    }
+
+    #[test]
+    fn a_bad_highlight_colour_is_refused_and_nothing_is_stored() {
+        let mut shell = Shell::new();
+        assert_eq!(shell.run_hl(&strs(&["--set", "string", "not-a-colour"])), 2);
+        assert_eq!(shell.hl_color("string"), None);
     }
 
     #[test]
     fn bishopt_color_resolves_the_default_then_an_override_then_none_for_unknown() {
         let mut shell = Shell::new();
-        // Default is "-bish-green" (ANSI slot 2, terminal-resolved), not
-        // a fixed "green" RGB -- see KNOWN_BISHOPTS' own doc comment on
-        // why: a fresh install should render exactly as it did before
-        // syn_col_* existed.
-        assert_eq!(shell.bishopt_color("syn_col_string"), Some(vt100::Color::Indexed(2)));
-        shell.run_bishopt(&strs(&["--set", "syn_col_string", "#123456"]), KNOWN_BISHOPTS);
-        assert_eq!(shell.bishopt_color("syn_col_string"), Some(vt100::Color::Rgb(0x12, 0x34, 0x56)));
+        // The chrome colours stayed bishopts, and still have defaults:
+        // `-bish-blue` is ANSI slot 4, terminal-resolved, not a fixed
+        // RGB -- so a fresh install renders as it always did.
+        assert_eq!(shell.bishopt_color("ui_col_directory"), Some(vt100::Color::Indexed(4)));
+        shell.run_bishopt(&strs(&["--set", "ui_col_directory", "#123456"]), KNOWN_BISHOPTS);
+        assert_eq!(shell.bishopt_color("ui_col_directory"), Some(vt100::Color::Rgb(0x12, 0x34, 0x56)));
         assert_eq!(shell.bishopt_color("not_a_real_option"), None);
     }
 
@@ -12479,13 +12668,18 @@ mod tests {
     fn bishopt_color_for_picks_the_best_candidate_the_terminals_support_allows() {
         use crate::csscolor::ColorSupport;
         let mut shell = Shell::new();
-        shell.run_bishopt(&strs(&["--set", "syn_col_string", "#ff0000, -bish-ansi(200), -bish-red"]), KNOWN_BISHOPTS);
-        assert_eq!(shell.bishopt_color_for("syn_col_string", ColorSupport::Truecolor), Some(vt100::Color::Rgb(255, 0, 0)));
-        assert_eq!(shell.bishopt_color_for("syn_col_string", ColorSupport::Ansi256), Some(vt100::Color::Indexed(200)));
-        assert_eq!(shell.bishopt_color_for("syn_col_string", ColorSupport::Ansi16), Some(vt100::Color::Indexed(1)));
+        shell.run_bishopt(&strs(&["--set", "ui_col_directory", "#ff0000, -bish-ansi(200), -bish-red"]), KNOWN_BISHOPTS);
+        assert_eq!(shell.bishopt_color_for("ui_col_directory", ColorSupport::Truecolor), Some(vt100::Color::Rgb(255, 0, 0)));
+        assert_eq!(shell.bishopt_color_for("ui_col_directory", ColorSupport::Ansi256), Some(vt100::Color::Indexed(200)));
+        assert_eq!(shell.bishopt_color_for("ui_col_directory", ColorSupport::Ansi16), Some(vt100::Color::Indexed(1)));
         // Nothing in this particular list suits ColorSupport::None -- the
         // least-demanding candidate (last in the list) is still used.
-        assert_eq!(shell.bishopt_color_for("syn_col_string", ColorSupport::None), Some(vt100::Color::Indexed(1)));
+        assert_eq!(shell.bishopt_color_for("ui_col_directory", ColorSupport::None), Some(vt100::Color::Indexed(1)));
+        // And the same tiering through `::bish hl`, which shares the
+        // candidate-picking with bishopt rather than re-deriving it.
+        assert_eq!(shell.run_hl(&strs(&["--set", "string", "#ff0000, -bish-ansi(200), -bish-red"])), 0);
+        assert_eq!(shell.hl_color_for("string", ColorSupport::Truecolor), Some(vt100::Color::Rgb(255, 0, 0)));
+        assert_eq!(shell.hl_color_for("string", ColorSupport::Ansi16), Some(vt100::Color::Indexed(1)));
     }
 
     fn capture_output(shell: &mut Shell) -> Rc<RefCell<String>> {

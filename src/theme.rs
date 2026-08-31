@@ -1,13 +1,13 @@
 // The colours of bish's own chrome -- the file browser's entry types,
 // the editor's gutter, pane dividers, rendered markdown, diagnostics.
 //
-// Deliberately the same shape `bishedit::highlight`'s `syn_col_*`
+// Deliberately the same shape `bishedit::highlight`'s own colour
 // machinery already has, one axis over: a table naming each element's
 // bishopt, a `default_style` giving what it looks like with nothing
 // set, and a resolved map a caller with a live `Shell` builds once per
 // redraw. Two parallel systems that worked differently would be two
 // things to learn; this way `ui_col_directory` behaves exactly as
-// `syn_col_keyword` does, and both land in a `::bish theme` declaration
+// `::bish hl` names do, and both land in a `::bish theme` declaration
 // without either knowing about themes at all.
 //
 // **Only the foreground is themeable**, again matching `resolve_style`:

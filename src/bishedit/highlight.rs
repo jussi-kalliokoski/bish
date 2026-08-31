@@ -52,7 +52,7 @@ pub struct HighlightContext<'a> {
     // HighlightKinds into StyledSpans via resolve_style, and a second
     // parameter threaded in parallel the whole way down would be more
     // churn than it's worth for one more `Option<&T>`. See resolve_style/
-    // ColorOverrides/SYN_COL_OPTIONS just above default_style.
+    // ColorOverrides/HL_NAMES just above default_style.
     pub color_overrides: Option<&'a ColorOverrides>,
     // The `hyperlinks` bishopt, carried here for the same reason
     // `color_overrides` is: never read by the highlighting itself, but
@@ -641,8 +641,8 @@ pub fn default_style(kind: HighlightKind) -> (vt100::Color, vt100::CellAttrs) {
 }
 
 // A session's live foreground-color overrides, keyed by HighlightKind --
-// what `bishopt`'s `syn_col_*` Color options (see exec.rs's KNOWN_
-// BISHOPTS and SYN_COL_OPTIONS just below) resolve to, once a caller with
+// what `::bish hl`'s own colours (see exec.rs's `Shell::hl` and KNOWN_
+// BISHOPTS and HL_NAMES just below) resolve to, once a caller with
 // an actual live Shell to read them from (repl.rs's main prompt loop) has
 // built one. A plain HashMap, not bishopt-aware itself -- this crate
 // doesn't know what a "bishopt" is (see this module's own doc comment on
@@ -667,25 +667,32 @@ pub fn resolve_style(kind: HighlightKind, overrides: Option<&ColorOverrides>) ->
 // Which bishopt Color option name (see exec.rs's KNOWN_BISHOPTS) drives
 // each colorable HighlightKind's foreground -- lives here, not exec.rs,
 // since HighlightKind is this crate's own type and exec.rs otherwise has
-// no reason to depend on it. Deliberately doesn't cover every
-// HighlightKind: Flag/Subcommand/Link use vt100::Color::Default (whatever
-// the terminal's own default foreground is, not a real color) rather
-// than one of default_style's Indexed picks, and bishopt's Color type
-// can only ever produce a concrete Rgb -- there's no "inherit the
-// terminal's default" CSS color to register a default of, so those three
-// simply aren't made configurable this way.
-pub const SYN_COL_OPTIONS: &[(HighlightKind, &str)] = &[
-    (HighlightKind::Keyword, "syn_col_keyword"),
-    (HighlightKind::Operator, "syn_col_operator"),
-    (HighlightKind::Redirect, "syn_col_redirect"),
-    (HighlightKind::String, "syn_col_string"),
-    (HighlightKind::Variable, "syn_col_variable"),
-    (HighlightKind::Substitution, "syn_col_substitution"),
-    (HighlightKind::Comment, "syn_col_comment"),
-    (HighlightKind::Number, "syn_col_number"),
-    (HighlightKind::FormatSpecifier, "syn_col_format_specifier"),
-    (HighlightKind::InvalidCommand, "syn_col_invalid_command"),
-    (HighlightKind::Key, "syn_col_key"),
+// no reason to depend on it.
+//
+// The names `::bish hl` knows these by. Not an exhaustive list of what
+// that command accepts -- its namespace is open, so a name absent from
+// here is simply one nothing in bish produces *yet*, which is what
+// makes a language server's semantic token types settable before
+// anything here knows about them.
+//
+// Deliberately doesn't cover every HighlightKind: Flag/Subcommand/Link
+// use vt100::Color::Default (whatever the terminal's own default
+// foreground is, not a real color) rather than one of default_style's
+// Indexed picks, and a CSS colour can only ever produce a concrete one
+// -- there is no "inherit the terminal's default" to name, so those
+// three simply aren't made configurable this way.
+pub const HL_NAMES: &[(HighlightKind, &str)] = &[
+    (HighlightKind::Keyword, "keyword"),
+    (HighlightKind::Operator, "operator"),
+    (HighlightKind::Redirect, "redirect"),
+    (HighlightKind::String, "string"),
+    (HighlightKind::Variable, "variable"),
+    (HighlightKind::Substitution, "substitution"),
+    (HighlightKind::Comment, "comment"),
+    (HighlightKind::Number, "number"),
+    (HighlightKind::FormatSpecifier, "format_specifier"),
+    (HighlightKind::InvalidCommand, "invalid_command"),
+    (HighlightKind::Key, "key"),
 ];
 
 // Builds one Cell per char, then paints each layer's spans over it in
@@ -1706,11 +1713,11 @@ mod tests {
     }
 
     #[test]
-    fn syn_col_options_never_covers_a_kind_that_uses_the_terminals_own_default_color() {
+    fn hl_names_never_covers_a_kind_that_uses_the_terminals_own_default_color() {
         // Flag/Subcommand/Link all render via vt100::Color::Default in
         // default_style -- there's no CSS color that means "inherit the
         // terminal's own default foreground", so none of them should be
-        // bishopt-configurable this way (see SYN_COL_OPTIONS' own doc
+        // bishopt-configurable this way (see HL_NAMES' own doc
         // comment).
         for uncolorable in [
             HighlightKind::Flag,
@@ -1720,18 +1727,18 @@ mod tests {
             HighlightKind::Strong,
             HighlightKind::Struck,
         ] {
-            assert!(!SYN_COL_OPTIONS.iter().any(|(k, _)| *k == uncolorable));
+            assert!(!HL_NAMES.iter().any(|(k, _)| *k == uncolorable));
         }
         // The same rule stated from the other side, so a kind added to
         // the table later can't quietly register a color option for
         // something that has no color to override.
-        for (kind, option) in SYN_COL_OPTIONS {
+        for (kind, option) in HL_NAMES {
             assert_ne!(default_style(*kind).0, vt100::Color::Default, "{option}");
         }
         // Bump when a colorable kind is genuinely added (and give it its
         // own entry in exec.rs's KNOWN_BISHOPTS too, or the option name
         // here resolves to nothing).
-        assert_eq!(SYN_COL_OPTIONS.len(), 11);
+        assert_eq!(HL_NAMES.len(), 11);
     }
 
     fn tok(word: &str) -> Tok {

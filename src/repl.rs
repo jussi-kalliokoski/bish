@@ -891,7 +891,7 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
         // thought about languages is still live exactly here.
         let abbrs_snapshot = snippet::for_language(&sessions[&session_id].shell.abbrs, snippet::DEFAULT_LANG);
         // Same owned-snapshot pattern again -- this redraw's live
-        // syn_col_* colors, resolved once up front rather than
+        // `::bish hl` colours, resolved once up front rather than
         // re-querying the shell per span. See syntax_color_overrides'
         // own doc comment.
         let color_overrides = syntax_color_overrides(&sessions[&session_id].shell);
@@ -7077,8 +7077,8 @@ fn symbol_list(title: &str, symbols: &[crate::lsp::Symbol], encoding: crate::lsp
     LocationList { title: title.to_string(), items }
 }
 
-// A session's live syn_col_* colors (see bishedit::highlight::
-// SYN_COL_OPTIONS/ColorOverrides, exec::Shell::bishopt_color), resolved
+// A session's live `::bish hl` colours (see bishedit::highlight::
+// HL_NAMES/ColorOverrides, exec::Shell::bishopt_color), resolved
 // fresh from `shell` -- every caller owns its own snapshot rather than
 // sharing one.
 //
@@ -7087,7 +7087,7 @@ fn symbol_list(title: &str, symbols: &[crate::lsp::Symbol], encoding: crate::lsp
 // `--set`/`--unset` "can only ever run from an actual shell prompt
 // (bishopt is a builtin, not reachable from inside the modal file
 // editor)" -- which was wrong: command mode runs builtins, so
-// `:bishopt --set syn_col_string ...` from the colon line has always
+// `::bish hl --set string ...` from the colon line has always
 // worked. It just had no visible effect until the file was reopened,
 // because run_edit_frame had already taken its snapshot. The half of
 // that claim which *is* true is the diagnostics pane: it has no colon
@@ -7098,7 +7098,7 @@ fn ui_colors(shell: &exec::Shell) -> crate::theme::UiColors {
 }
 
 fn syntax_color_overrides(shell: &exec::Shell) -> highlight::ColorOverrides {
-    highlight::SYN_COL_OPTIONS.iter().filter_map(|(kind, name)| shell.bishopt_color(name).map(|c| (*kind, c))).collect()
+    highlight::HL_NAMES.iter().filter_map(|(kind, name)| shell.hl_color(name).map(|c| (*kind, c))).collect()
 }
 
 // How the file editor should lay out a line wider than the pane, read

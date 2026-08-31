@@ -2769,7 +2769,7 @@ fn highlighter_for(language: &str) -> Option<Box<dyn Highlighter>> {
 // here has a live Shell to pull those from -- bash's own Flag/
 // Subcommand/Link/InvalidCommand refinements that need them simply
 // don't fire, same as there; JsonHighlighter ignores the context
-// outright, having no use for any of it. `color_overrides` (bishopt's own syn_col_* -- see bishedit::
+// outright, having no use for any of it. `color_overrides` (`::bish hl`'s own palette -- see bishedit::
 // highlight::ColorOverrides/SYN_COL_OPTIONS) is a separate, later step
 // (picking a *color* for an already-classified span, not classifying
 // it), threaded in from wherever a live Shell to read it from actually
