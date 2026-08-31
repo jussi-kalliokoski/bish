@@ -457,6 +457,43 @@ impl Server {
                             Value::Object(vec![("dynamicRegistration".to_string(), Value::Bool(false))]),
                         ),
                         (
+                            "completion".to_string(),
+                            Value::Object(vec![
+                                ("dynamicRegistration".to_string(), Value::Bool(false)),
+                                (
+                                    "completionItem".to_string(),
+                                    Value::Object(vec![
+                                        // Claimed because it is now
+                                        // true: a snippet completion
+                                        // splices in tentatively with a
+                                        // caret in its first tabstop
+                                        // (see `bishedit::snippet`).
+                                        // Undeclared, a server sends
+                                        // plain text instead -- which is
+                                        // why rust-analyzer's function
+                                        // completions arrive without
+                                        // their parentheses until a
+                                        // client says this.
+                                        ("snippetSupport".to_string(), Value::Bool(true)),
+                                        // Not claimed: bish has no
+                                        // second round trip for a
+                                        // completion item, so a server
+                                        // must send whatever it wants
+                                        // used up front.
+                                        (
+                                            "resolveSupport".to_string(),
+                                            Value::Object(vec![("properties".to_string(), Value::Array(Vec::new()))]),
+                                        ),
+                                        ("insertReplaceSupport".to_string(), Value::Bool(true)),
+                                        (
+                                            "documentationFormat".to_string(),
+                                            Value::Array(vec![Value::Str("markdown".to_string()), Value::Str("plaintext".to_string())]),
+                                        ),
+                                    ]),
+                                ),
+                            ]),
+                        ),
+                        (
                             "hover".to_string(),
                             Value::Object(vec![
                                 ("dynamicRegistration".to_string(), Value::Bool(false)),
@@ -1529,6 +1566,18 @@ mod tests {
             // command is then allowed to change anything.
             assert!(json::query(&params, ".capabilities.workspace.executeCommand.dynamicRegistration").is_ok());
         }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // A server sends plain text unless the client says it can take a
+    // snippet -- which is why a function completion arrives without its
+    // parentheses from a client that never claimed this.
+    #[test]
+    fn snippet_support_is_declared_so_servers_actually_send_snippets() {
+        let dir = temp_dir("snippet-cap");
+        let server = Server::start(1, &mock_server(FULL_SYNC), "mock", &dir, ApplyEdits::default()).unwrap();
+        let params = server.initialize_params();
+        assert_eq!(json::query(&params, ".capabilities.textDocument.completion.completionItem.snippetSupport"), Ok(&Value::Bool(true)));
         std::fs::remove_dir_all(&dir).ok();
     }
 

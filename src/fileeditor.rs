@@ -1458,10 +1458,27 @@ pub(crate) fn run_insert_mode(
                     let (row, start, end) = item.replace.unwrap_or((row, state.word_start, col));
                     let line_len = buf.line_len(row);
                     let (start, end) = (start.min(line_len), end.min(line_len).max(start.min(line_len)));
-                    buf.replace_span((row, start), (row, end), &item.insert);
-                    buf.set_cursor(row, start + item.insert.chars().count());
+                    // A server's snippet completion becomes exactly the
+                    // same live snippet an `abbr` does -- same keys,
+                    // same marking, same accept -- so `fn ${1:name}()`
+                    // arrives with the caret already in `name` instead
+                    // of as literal punctuation to clean up.
+                    match item.snippet.then(|| Snippet::parse(&item.insert)).flatten() {
+                        Some(snip) => {
+                            let replaced: String = buf.line_chars(row)[start..end].iter().collect();
+                            live = Some(LiveSnippet::start(snip, row, start, replaced, buf));
+                        }
+                        None => {
+                            // `flatten` and not the raw text: a server
+                            // that flagged a snippet with no tabstops in
+                            // it still wrote `\$` for a literal dollar.
+                            let text = if item.snippet { snippet::flatten(&item.insert) } else { item.insert.clone() };
+                            buf.replace_span((row, start), (row, end), &text);
+                            buf.set_cursor(row, start + text.chars().count());
+                            inserted.push_str(&text);
+                        }
+                    }
                     cursors[0] = buf.cursor();
-                    inserted.push_str(&item.insert);
                 }
             }
             // Opening it: only with no snippet live, since Ctrl-N is
@@ -4157,6 +4174,89 @@ mod macro_tests {
     // through the same macro-replay queue the test just below uses --
     // there's no real terminal here to type at, and `run_insert_mode`
     // reads through `vk.next_key`, which serves a queued replay first.
+    // An `InsertServices` that offers exactly what it was handed --
+    // enough to drive Ctrl-N and the accept that follows without a
+    // language server anywhere in sight.
+    struct FixedCompletions(Vec<crate::bishedit::completion::EditorCompletion>);
+
+    impl InsertServices for FixedCompletions {
+        fn idle(&mut self, _buf: &mut TextBuffer) -> Option<IdleRedraw> {
+            None
+        }
+
+        fn complete(&mut self, _buf: &TextBuffer, _row: usize, _col: usize) -> Vec<crate::bishedit::completion::EditorCompletion> {
+            self.0.clone()
+        }
+    }
+
+    fn insert_completing(keys: &[Key], items: Vec<crate::bishedit::completion::EditorCompletion>) -> TextBuffer {
+        let mut buf = TextBuffer::open(std::path::Path::new("main.rs"), 10).unwrap();
+        let mut vk = VimKeys::new();
+        let mut registers = Registers::new_for_test();
+        let mut services = FixedCompletions(items);
+        vk.start_recording('a');
+        for key in keys {
+            vk.record_key(*key);
+        }
+        vk.stop_recording();
+        assert!(vk.queue_macro_replay('a', 1));
+        run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut services, false, 24, 80, None, &[], &[]).unwrap();
+        buf
+    }
+
+    fn completion(label: &str, insert: &str, snippet: bool) -> crate::bishedit::completion::EditorCompletion {
+        crate::bishedit::completion::EditorCompletion {
+            label: label.to_string(),
+            detail: String::new(),
+            insert: insert.to_string(),
+            replace: None,
+            snippet,
+        }
+    }
+
+    // A server's snippet completion becomes exactly the same live
+    // snippet an `abbr` does: same keys, same marking, same accept.
+    #[test]
+    fn a_snippet_completion_splices_in_tentatively() {
+        let items = vec![completion("gamma", "gamma(${1:x}, $2)$0", true)];
+        let mut keys = chars("ga");
+        keys.push(Key::CtrlN);
+        keys.push(Key::Enter);
+        let buf = insert_completing(&keys, items.clone());
+        assert_eq!(text_of(&buf), "gamma(x, $2)", "the tabstops are still holes, not text");
+        assert_eq!(buf.snippet_holes.len(), 3);
+        assert!(buf.snippet_holes[0].active, "the caret is in the first one");
+        assert_eq!(buf.cursor(), (0, 6));
+
+        // Driven to the end it reads as if typed by hand, `$0` included.
+        let mut keys = chars("ga");
+        keys.push(Key::CtrlN);
+        keys.push(Key::Enter);
+        keys.extend(chars("1"));
+        keys.push(Key::Tab);
+        keys.extend(chars("2"));
+        keys.push(Key::CtrlY);
+        keys.extend(chars(";"));
+        let buf = insert_completing(&keys, items);
+        assert_eq!(text_of(&buf), "gamma(1, 2);", "`$0` put the caret after the closing paren");
+    }
+
+    // A server may flag a snippet that has no tabstops in it. That is
+    // plain text -- but still written in snippet notation, so `\$` is
+    // a literal dollar rather than two characters.
+    #[test]
+    fn a_snippet_completion_with_no_tabstops_is_plain_text() {
+        let mut keys = chars("co");
+        keys.push(Key::CtrlN);
+        keys.push(Key::Enter);
+        let buf = insert_completing(&keys, vec![completion("cost", "cost \\$5", true)]);
+        assert_eq!(text_of(&buf), "cost $5");
+        assert!(buf.snippet_holes.is_empty());
+        // Unflagged, the same text is exactly what it says.
+        let buf = insert_completing(&keys, vec![completion("cost", "cost \\$5", false)]);
+        assert_eq!(text_of(&buf), "cost \\$5");
+    }
+
     fn insert_with(path: Option<&str>, keys: &[Key], abbrs: &[Abbr]) -> TextBuffer {
         // `TextBuffer::open` on a nonexistent path prepares to create it
         // (see its own doc comment) -- nothing is ever written here, and
@@ -4306,11 +4406,13 @@ mod macro_tests {
     fn a_multi_line_snippets_holes_are_marked_line_by_line() {
         let abbrs = vec![Abbr { lang: "rust".into(), ..Abbr::new("f", "fn ${1:name}() {\n    $0\n}") }];
         let buf = insert_with(Some("main.rs"), &chars("f "), &abbrs);
-        assert_eq!(text_of(&buf), "fn name() {\n    $0\n}");
+        assert_eq!(text_of(&buf), "fn name() {\n    \n}");
         assert_eq!(buf.snippet_holes.len(), 2);
         assert_eq!((buf.snippet_holes[0].line, buf.snippet_holes[0].start, buf.snippet_holes[0].end), (0, 3, 7));
         assert!(buf.snippet_holes[0].active);
-        assert_eq!((buf.snippet_holes[1].line, buf.snippet_holes[1].start, buf.snippet_holes[1].end), (1, 4, 6));
+        // `$0` is a position, not a span: an empty hole where the caret
+        // will land.
+        assert_eq!((buf.snippet_holes[1].line, buf.snippet_holes[1].start, buf.snippet_holes[1].end), (1, 4, 4));
     }
 
     #[test]

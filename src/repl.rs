@@ -9456,7 +9456,7 @@ fn completions_from_server(
                 })
             });
             let detail = item.detail_or_kind();
-            crate::bishedit::completion::EditorCompletion { label: item.label, detail, insert: item.insert, replace }
+            crate::bishedit::completion::EditorCompletion { label: item.label, detail, insert: item.insert, replace, snippet: item.snippet }
         })
         .collect()
 }

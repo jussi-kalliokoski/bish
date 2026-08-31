@@ -345,9 +345,15 @@ impl Snippet {
     // What an unfilled tabstop shows: its default, or the `$1` it was
     // written as. Seeing the token you typed is what makes an empty hole
     // legible as one.
+    //
+    // Except `$0`, which shows nothing: it is not a hole to type into,
+    // it is where the caret ends up, and every editor with snippets
+    // draws it as the empty position it is rather than as two
+    // characters to delete.
     fn shown(&self, tabstop: usize) -> String {
         match &self.defaults[tabstop] {
             Some(default) => default.clone(),
+            None if self.numbers[tabstop] == 0 => String::new(),
             None => format!("${}", self.numbers[tabstop]),
         }
     }
@@ -705,6 +711,7 @@ mod tests {
     #[test]
     fn the_final_tabstop_is_visited_last_and_takes_the_caret() {
         let mut s = snip("if $1; then\n\t$0\nfi");
+        assert_eq!(s.render(), "if $1; then\n\t\nfi", "`$0` draws as the empty position it is");
         assert_eq!(s.active(), 0);
         s.advance(false);
         assert!(s.at_last(), "`$0` is last however early it appears");

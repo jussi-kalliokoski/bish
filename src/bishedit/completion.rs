@@ -58,6 +58,12 @@ pub struct EditorCompletion {
     /// editor would not have recognised as one word -- a dotted path,
     /// an import -- so its answer wins where it gave one.
     pub replace: Option<(usize, usize, usize)>,
+    /// True when `insert` is a snippet (see `bishedit::snippet`) rather
+    /// than finished text: it goes in tentatively, with a caret in its
+    /// first tabstop and Tab moving between them, exactly as an `abbr`
+    /// expansion does. Only a language server ever sets this -- the
+    /// shell's own completions are plain words.
+    pub snippet: bool,
 }
 
 pub trait CompletionProvider {

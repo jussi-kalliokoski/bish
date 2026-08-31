@@ -4213,10 +4213,10 @@ mod tests {
     #[test]
     fn a_multi_line_expansion_folds_to_one_line_at_the_prompt() {
         let (mut ed, mut state) = start_snippet("foo", 3, "if $1; then\n\t$0\nfi");
-        assert_eq!(ed.as_string(), "if $1; then \t$0 fi");
+        assert_eq!(ed.as_string(), "if $1; then \t fi");
         assert_eq!(ed.cursor, 3, "still parked on `$1`");
         type_text(&mut ed, &mut state, "x");
-        assert_eq!(ed.as_string(), "if x; then \t$0 fi");
+        assert_eq!(ed.as_string(), "if x; then \t fi");
         state.accept(&mut ed);
         assert_eq!(ed.as_string(), "if x; then \t fi");
         assert_eq!(ed.cursor, "if x; then \t".chars().count(), "and `$0` still takes the caret");

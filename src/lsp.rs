@@ -780,6 +780,10 @@ pub struct Completion {
     /// how a server puts the likely answers first, and the label
     /// otherwise.
     pub sort: String,
+    /// `insertTextFormat: 2` -- `insert` is a snippet, in the notation
+    /// `bishedit::snippet` reads, and goes into the buffer tentatively
+    /// with a caret in its first tabstop rather than as finished text.
+    pub snippet: bool,
 }
 
 impl Completion {
@@ -864,7 +868,10 @@ fn completion(value: &Value) -> Option<Completion> {
             _ => label.clone(),
         }
     };
-    let insert = sanitize(&if snippet { flatten_snippet(&insert) } else { insert });
+    // `sanitize_insert`, not `sanitize`: this is text destined for the
+    // buffer, and a multi-line snippet collapsed to one line is not the
+    // completion the server offered.
+    let insert = sanitize_insert(&insert);
     Some(Completion {
         label: label.clone(),
         kind: match json::query(value, ".kind") {
@@ -881,59 +888,35 @@ fn completion(value: &Value) -> Option<Completion> {
             Ok(Value::Str(sort)) => sort.clone(),
             _ => label,
         },
+        snippet,
     })
 }
 
-/// An LSP snippet reduced to plain text: `${1:name}` and `$1` become
-/// the placeholder's default (or nothing), `$0` disappears, and `\$` is
-/// an escaped dollar rather than a placeholder.
-fn flatten_snippet(text: &str) -> String {
-    let chars: Vec<char> = text.chars().collect();
-    let mut out = String::new();
-    let mut i = 0;
-    while i < chars.len() {
-        match chars[i] {
-            '\\' if i + 1 < chars.len() => {
-                out.push(chars[i + 1]);
-                i += 2;
-            }
-            '$' if i + 1 < chars.len() && chars[i + 1] == '{' => {
-                // `${1:default}` -- keep the default, which is the part
-                // after the first colon, up to the matching brace.
-                let mut depth = 0;
-                let mut j = i + 1;
-                let mut colon = None;
-                while j < chars.len() {
-                    match chars[j] {
-                        '{' => depth += 1,
-                        '}' => {
-                            depth -= 1;
-                            if depth == 0 {
-                                break;
-                            }
-                        }
-                        ':' if depth == 1 && colon.is_none() => colon = Some(j),
-                        _ => {}
-                    }
-                    j += 1;
-                }
-                if let Some(colon) = colon {
-                    out.push_str(&flatten_snippet(&chars[colon + 1..j.min(chars.len())].iter().collect::<String>()));
-                }
-                i = (j + 1).min(chars.len().max(j + 1));
-            }
-            '$' if i + 1 < chars.len() && chars[i + 1].is_ascii_digit() => {
-                let mut j = i + 1;
-                while j < chars.len() && chars[j].is_ascii_digit() {
-                    j += 1;
-                }
-                i = j;
-            }
-            c => {
-                out.push(c);
-                i += 1;
-            }
+/// The most characters a single completion may insert.
+///
+/// A whole file arriving as one completion is a server malfunctioning
+/// or lying; a real snippet is a handful of lines.
+const MAX_INSERT: usize = 4096;
+
+/// Text on its way into the buffer, rather than into a one-line
+/// message: newlines and tabs survive, since a snippet is routinely
+/// several lines and indented, and everything else that cannot be
+/// displayed is dropped.
+///
+/// This is the middle setting between `sanitize` (which collapses all
+/// whitespace, for text that has to fit on one line) and no cleaning at
+/// all (`text_edits`, where the server is rewriting the file and every
+/// byte is deliberate).
+fn sanitize_insert(text: &str) -> String {
+    let mut out = String::with_capacity(text.len().min(MAX_INSERT));
+    for c in text.chars() {
+        if out.chars().count() >= MAX_INSERT {
+            break;
         }
+        if c.is_control() && c != '\n' && c != '\t' {
+            continue;
+        }
+        out.push(c);
     }
     out
 }
@@ -1415,28 +1398,32 @@ mod tests {
         assert_eq!(completions(&insert_replace)[0].edit, Some(((1, 0), (1, 2))));
     }
 
-    // Ignoring insertTextFormat would insert the literal `${1:a}`.
+    // A snippet is kept in its own notation and flagged, so the editor
+    // can splice it in tentatively (see `bishedit::snippet`) rather than
+    // guessing at what the user meant to fill in.
     #[test]
-    fn a_snippet_completion_is_flattened_to_its_default_text() {
+    fn a_snippet_completion_keeps_its_tabstops_and_says_so() {
         let snippet = json::parse(r#"[{"label":"foo","insertText":"foo(${1:a}, ${2:b})$0","insertTextFormat":2}]"#).unwrap();
-        assert_eq!(completions(&snippet)[0].insert, "foo(a, b)");
-        // Without the format flag it is literal text and stays as it is.
+        let found = completions(&snippet);
+        assert!(found[0].snippet);
+        assert_eq!(found[0].insert, "foo(${1:a}, ${2:b})$0");
+        // Without the format flag it is literal text -- and unflagged,
+        // so nothing downstream reads the braces as tabstops.
         let literal = json::parse(r#"[{"label":"foo","insertText":"foo(${1:a})"}]"#).unwrap();
+        assert!(!completions(&literal)[0].snippet);
         assert_eq!(completions(&literal)[0].insert, "foo(${1:a})");
     }
 
+    // What goes into a buffer is cleaned differently from what goes into
+    // a one-line message: a multi-line snippet collapsed to one line is
+    // not the completion the server offered.
     #[test]
-    fn snippet_flattening_handles_the_forms_that_actually_turn_up() {
-        assert_eq!(flatten_snippet("plain"), "plain");
-        // A bare tabstop contributes nothing.
-        assert_eq!(flatten_snippet("if $1 then $0"), "if  then ");
-        // Nested placeholders keep the inner default.
-        assert_eq!(flatten_snippet("${1:${2:inner}}"), "inner");
-        assert_eq!(flatten_snippet("gamma(${1:x})"), "gamma(x)");
-        // An escaped dollar is a dollar.
-        assert_eq!(flatten_snippet("cost \\$5"), "cost $5");
-        // An unterminated placeholder must not run off the end.
-        assert_eq!(flatten_snippet("${1:oops"), "oops");
+    fn insert_text_keeps_its_newlines_and_indentation() {
+        let multi = json::parse(r#"[{"label":"fn","insertText":"fn $1() {\n\t$0\n}","insertTextFormat":2}]"#).unwrap();
+        assert_eq!(completions(&multi)[0].insert, "fn $1() {\n\t$0\n}");
+        // Everything else that cannot be displayed still goes.
+        let control = json::parse(r#"[{"label":"x","insertText":"a\u0007b"}]"#).unwrap();
+        assert_eq!(completions(&control)[0].insert, "ab");
     }
 
     #[test]
