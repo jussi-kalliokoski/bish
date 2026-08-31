@@ -494,6 +494,53 @@ pub struct Hook {
     pub command: String,
 }
 
+/// A table of long-running helper processes the shell can report on and
+/// manage, without knowing what any of them are.
+///
+/// `::bish lsp` is a shell builtin -- it has to be readable in `$(...)`
+/// (the lesson `window ls` taught) -- but nothing about running a
+/// language server belongs in the shell. So the shell holds one of
+/// these and knows only that entries have an id, some fields to print,
+/// a recent log, and can be dropped. `lspclient::Table` implements it;
+/// repl.rs, which owns the real thing, keeps the concrete handle.
+///
+/// The row fields are deliberately opaque `String`s rather than a
+/// struct: what a language server's status consists of is not the
+/// shell's business, and a typed row here would be exactly the
+/// dependency this trait exists to remove.
+pub trait ServiceTable {
+    /// One row per entry, in the order to print, each already split
+    /// into the fields `status` will join with tabs.
+    fn rows(&self) -> Vec<Vec<String>>;
+
+    /// Recent output from the entries started from declaration `id`,
+    /// oldest first -- what a helper that failed to start said on its
+    /// way out. Empty when there is nothing, or no such entry.
+    fn logs(&self, id: u64) -> Vec<String>;
+
+    /// Forgets every entry started from declaration `id`, including a
+    /// remembered failure to start, so the next thing that needs one
+    /// gets a fresh attempt. Returns how many were dropped.
+    fn forget(&mut self, id: u64) -> usize;
+}
+
+/// What a shell has before anything installs a real table -- and what
+/// every non-interactive shell keeps, since nothing there ever starts a
+/// language server.
+pub struct NoServices;
+
+impl ServiceTable for NoServices {
+    fn rows(&self) -> Vec<Vec<String>> {
+        Vec::new()
+    }
+    fn logs(&self, _id: u64) -> Vec<String> {
+        Vec::new()
+    }
+    fn forget(&mut self, _id: u64) -> usize {
+        0
+    }
+}
+
 /// One declared language server: what to run, for which languages, and
 /// how to find the root of the project it should be given.
 ///
@@ -592,6 +639,8 @@ pub fn lsp_help() -> Vec<String> {
         "::bish lsp add [--lang=GLOB] [--root=NAME,...] COMMAND...".to_string(),
         "::bish lsp rm ID                       remove one, by the id `add` printed".to_string(),
         "::bish lsp status                      what is actually running".to_string(),
+        "::bish lsp log ID                      what a server wrote to stderr".to_string(),
+        "::bish lsp restart ID                  forget it so the next file starts it afresh".to_string(),
         String::new(),
         "A registered server is started the first time a file it covers is opened,".to_string(),
         "once per project root, and shared by every pane editing that project.".to_string(),
@@ -795,13 +844,16 @@ pub struct Shell {
     /// `LspServer`.
     pub lsp_servers: Vec<LspServer>,
     next_lsp_id: u64,
-    /// The language servers actually running, shared by every shell in
-    /// the process the same way `jobs` is (`Rc::clone` in
-    /// `new_virtual_child`) -- see `lspclient::Table` for why it lives
-    /// here rather than in repl.rs. Because it is the live table and not
-    /// a snapshot, `::bish lsp status` is an ordinary builtin readable
-    /// in `$(...)`, which is the lesson `window ls` taught.
-    pub lsp: Rc<RefCell<crate::lspclient::Table>>,
+    /// The helper processes `::bish lsp` reports on, behind a trait so
+    /// this module never names a language-server type. See
+    /// `ServiceTable`.
+    ///
+    /// Shared by every shell in the process the same way `jobs` is
+    /// (`Rc::clone` in `new_virtual_child`). Because it is the live
+    /// table and not a snapshot, `::bish lsp status` is an ordinary
+    /// builtin readable in `$(...)`, which is the lesson `window ls`
+    /// taught.
+    pub lsp: Rc<RefCell<dyn ServiceTable>>,
     /// Set while a hook is running, so a hook that causes its own event
     /// -- a `shell:cwd:change` hook that `cd`s, most obviously -- fires
     /// once rather than forever. Not shared with a virtual child: a hook
@@ -1196,7 +1248,7 @@ impl Shell {
             next_hook_id: 1,
             lsp_servers: Vec::new(),
             next_lsp_id: 1,
-            lsp: Rc::new(RefCell::new(crate::lspclient::Table::default())),
+            lsp: Rc::new(RefCell::new(NoServices)),
             firing_hooks: false,
             array_local_stack: Vec::new(),
             assoc_local_stack: Vec::new(),
@@ -3386,20 +3438,44 @@ impl Shell {
             Some("status") => {
                 // Collected before printing: `sh_println!` needs the
                 // shell mutably, and the table is reached through it.
-                let table = self.lsp.borrow();
-                let running = table.servers().iter().map(|s| {
-                    let encoding = if s.is_ready() { s.encoding().wire_name() } else { "" };
-                    format!("{}\t{}\t{}\t{}\t{}\t{}", s.id, s.state().describe(), encoding, s.open_documents(), s.root.display(), s.command)
-                });
-                // A server that never started has no state of its own to
-                // report, but it is the thing someone running `status`
-                // is most likely looking for, so it appears in the same
-                // shape rather than being left out.
-                let failed = table.failures().iter().map(|f| format!("{}\tdead: {}\t\t0\t{}\t{}", f.id, f.why, f.root.display(), f.command));
-                let rows: Vec<String> = running.chain(failed).collect();
-                drop(table);
+                let rows: Vec<String> = self.lsp.borrow().rows().iter().map(|fields| fields.join("\t")).collect();
                 for row in rows {
                     sh_println!(self, "{row}");
+                }
+                0
+            }
+            Some("log") => {
+                // The whole reason a server's stderr is captured rather
+                // than discarded: when one fails to start, what it said
+                // on the way out is the only explanation there is.
+                let Some(id) = args.get(1).and_then(|a| a.parse::<u64>().ok()) else {
+                    sh_eprintln!(self, "bish: ::bish lsp: log: usage: ::bish lsp log <id>");
+                    return 2;
+                };
+                let lines = self.lsp.borrow().logs(id);
+                if lines.is_empty() {
+                    sh_eprintln!(self, "bish: ::bish lsp: log: nothing recorded for id {id}");
+                    return 1;
+                }
+                for line in lines {
+                    sh_println!(self, "{line}");
+                }
+                0
+            }
+            Some("restart") => {
+                // A server that died, or never started, stays that way
+                // on purpose -- retrying on every file open would turn
+                // one bad line of config into a spawn per keystroke of
+                // navigation. This is how someone who has *fixed* that
+                // line says so.
+                let Some(id) = args.get(1).and_then(|a| a.parse::<u64>().ok()) else {
+                    sh_eprintln!(self, "bish: ::bish lsp: restart: usage: ::bish lsp restart <id>");
+                    return 2;
+                };
+                let dropped = self.lsp.borrow_mut().forget(id);
+                if dropped == 0 {
+                    sh_eprintln!(self, "bish: ::bish lsp: restart: nothing running or failed for id {id}");
+                    return 1;
                 }
                 0
             }
@@ -3410,7 +3486,7 @@ impl Shell {
                 0
             }
             Some(other) => {
-                sh_eprintln!(self, "bish: ::bish lsp: unknown subcommand '{other}' (expected: ls, add, rm, status, help)");
+                sh_eprintln!(self, "bish: ::bish lsp: unknown subcommand '{other}' (expected: ls, add, rm, status, log, restart, help)");
                 2
             }
         }

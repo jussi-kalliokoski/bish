@@ -66,10 +66,15 @@ while :; do
 		;;
 	*'"method":"textDocument/definition"'*)
 		# $2, when the test gave one, is a URI in another file, so
-		# the cross-file path can be exercised; otherwise line 1 of
-		# the document the client opened.
+		# the cross-file path can be exercised; otherwise the
+		# document the client opened.
 		target=${2:-$uri}
-		send '{"jsonrpc":"2.0","id":'"$id"',"result":{"uri":"'"$target"'","range":{"start":{"line":1,"character":0},"end":{"line":1,"character":5}}}}'
+		# Three of them, so `n`/`N` cycling has somewhere to go. The
+		# first is the one `gd` itself lands on.
+		send '{"jsonrpc":"2.0","id":'"$id"',"result":[
+		 {"uri":"'"$target"'","range":{"start":{"line":1,"character":0},"end":{"line":1,"character":5}}},
+		 {"uri":"'"$uri"'","range":{"start":{"line":2,"character":0},"end":{"line":2,"character":5}}},
+		 {"uri":"'"$uri"'","range":{"start":{"line":0,"character":0},"end":{"line":0,"character":5}}}]}'
 		;;
 	*'"method":"textDocument/hover"'*)
 		# Markdown with a fenced signature, which is the shape a real

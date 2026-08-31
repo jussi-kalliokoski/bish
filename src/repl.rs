@@ -52,6 +52,13 @@ type SessionId = u32;
 // showing stale/real-terminal content.
 struct SessionState {
     shell: Shell,
+    /// The real language-server table. Shared by every session in the
+    /// process (`Rc::clone` when one is created from another), and
+    /// installed into `shell` as an opaque `exec::ServiceTable` so
+    /// `::bish lsp status`/`log`/`restart` work without exec.rs ever
+    /// naming a language-server type. Both handles point at the same
+    /// `RefCell`; this is the one with the real API on it.
+    lsp: Rc<RefCell<lspclient::Table>>,
     buffer: String,
     // Whether `buffer` is off the record -- see leading_space_suppresses
     // _history. Decided on the first line of a fresh command and left
@@ -442,10 +449,13 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
     let mut sessions: HashMap<SessionId, SessionState> = HashMap::new();
     let root_screen = Rc::new(RefCell::new(vt100::Screen::new(content_rows(term_rows), term_cols)));
     let root_cwd = shell.cwd.clone();
+    let root_lsp: Rc<RefCell<lspclient::Table>> = Rc::new(RefCell::new(lspclient::Table::default()));
+    install_service_table(&mut shell, &root_lsp);
     sessions.insert(
         0,
         SessionState {
             shell,
+            lsp: root_lsp,
             buffer: String::new(),
             buffer_unrecorded: false,
             history: History::load(".bish_history"),
@@ -1419,7 +1429,7 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
     // a tidiness one -- but a server told to shut down gets to write
     // out whatever cache it keeps, which is the difference between a
     // fast and a slow start next time.
-    if let Some(lsp) = sessions.values().next().map(|s| Rc::clone(&s.shell.lsp)) {
+    if let Some(lsp) = sessions.values().next().map(|s| Rc::clone(&s.lsp)) {
         lsp.borrow_mut().shutdown_all();
     }
 }
@@ -1709,10 +1719,13 @@ fn run_edit_impl(targets: &[fileeditor::EditTarget], attach_debug: bool) -> i32 
 
     let mut sessions: HashMap<SessionId, SessionState> = HashMap::new();
     let root_screen = Rc::new(RefCell::new(vt100::Screen::new(content_rows(term_rows), term_cols)));
+    let root_lsp: Rc<RefCell<lspclient::Table>> = Rc::new(RefCell::new(lspclient::Table::default()));
+    install_service_table(&mut shell, &root_lsp);
     sessions.insert(
         0,
         SessionState {
             shell,
+            lsp: root_lsp,
             buffer: String::new(),
             buffer_unrecorded: false,
             history: History::load(".bish_history"),
@@ -3216,6 +3229,10 @@ fn apply_window_action(
             let parent_id = windows[*current_window].owning_session();
             let child_history = sessions[&parent_id].history.fork();
             let mut child_shell = sessions[&parent_id].shell.new_virtual_child();
+    // The same table every other session sees -- one per process, like
+    // `jobs`, so a server started for one pane serves them all.
+    let child_lsp = Rc::clone(&sessions[&parent_id].lsp);
+    install_service_table(&mut child_shell, &child_lsp);
             let screen = Rc::new(RefCell::new(vt100::Screen::new(content_rows(term_rows), term_cols)));
             child_shell.set_sink_grid(screen.clone());
             let child_cwd = child_shell.cwd.clone();
@@ -3225,6 +3242,7 @@ fn apply_window_action(
                 sid,
                 SessionState {
                     shell: child_shell,
+            lsp: child_lsp,
                     buffer: String::new(),
                     buffer_unrecorded: false,
                     // A fork of the parent's own History (see its doc
@@ -3360,6 +3378,10 @@ fn split_focused_pane(
     let parent_id = windows[current_window].owning_session();
     let child_history = sessions[&parent_id].history.fork();
     let mut child_shell = sessions[&parent_id].shell.new_virtual_child();
+    // The same table every other session sees -- one per process, like
+    // `jobs`, so a server started for one pane serves them all.
+    let child_lsp = Rc::clone(&sessions[&parent_id].lsp);
+    install_service_table(&mut child_shell, &child_lsp);
     let screen = Rc::new(RefCell::new(vt100::Screen::new(content_rows(term_rows), term_cols)));
     child_shell.set_sink_grid(screen.clone());
     let child_cwd = child_shell.cwd.clone();
@@ -3369,6 +3391,7 @@ fn split_focused_pane(
         sid,
         SessionState {
             shell: child_shell,
+            lsp: child_lsp,
             buffer: String::new(),
             buffer_unrecorded: false,
             // See WindowAction::New's own comment on forking the
@@ -3431,6 +3454,10 @@ fn split_diagnostics_pane(
     let parent_id = windows[current_window].owning_session();
     let child_history = sessions[&parent_id].history.fork();
     let mut child_shell = sessions[&parent_id].shell.new_virtual_child();
+    // The same table every other session sees -- one per process, like
+    // `jobs`, so a server started for one pane serves them all.
+    let child_lsp = Rc::clone(&sessions[&parent_id].lsp);
+    install_service_table(&mut child_shell, &child_lsp);
     let screen = Rc::new(RefCell::new(vt100::Screen::new(content_rows(term_rows), term_cols)));
     child_shell.set_sink_grid(screen.clone());
     let child_cwd = child_shell.cwd.clone();
@@ -3440,6 +3467,7 @@ fn split_diagnostics_pane(
         sid,
         SessionState {
             shell: child_shell,
+            lsp: child_lsp,
             buffer: String::new(),
             buffer_unrecorded: false,
             history: child_history,
@@ -3496,6 +3524,10 @@ fn split_debug_run_pane(
     let parent_id = windows[current_window].owning_session();
     let child_history = sessions[&parent_id].history.fork();
     let mut child_shell = sessions[&parent_id].shell.new_virtual_child();
+    // The same table every other session sees -- one per process, like
+    // `jobs`, so a server started for one pane serves them all.
+    let child_lsp = Rc::clone(&sessions[&parent_id].lsp);
+    install_service_table(&mut child_shell, &child_lsp);
     let screen = Rc::new(RefCell::new(vt100::Screen::new(content_rows(term_rows), term_cols)));
     child_shell.set_sink_grid(screen.clone());
     let child_cwd = child_shell.cwd.clone();
@@ -3505,6 +3537,7 @@ fn split_debug_run_pane(
         sid,
         SessionState {
             shell: child_shell,
+            lsp: child_lsp,
             buffer: String::new(),
             buffer_unrecorded: false,
             history: child_history,
@@ -4262,7 +4295,7 @@ fn service_background_jobs(
     // in. The table is shared by every session's shell (see
     // `lspclient::Table`), so reaching it through any one of them
     // reaches all of them.
-    if let Some(lsp) = sessions.values().next().map(|s| Rc::clone(&s.shell.lsp)) {
+    if let Some(lsp) = sessions.values().next().map(|s| Rc::clone(&s.lsp)) {
         lsp.borrow_mut().service_all();
     }
 
@@ -6357,6 +6390,14 @@ fn nav_buffer_into_edit_state(buf: NavBuffer, vk: VimKeys) -> Option<(TextBuffer
     }
 }
 
+// Gives a shell the opaque view of `table` that `::bish lsp` reports
+// through -- see `exec::ServiceTable`. The same `RefCell` the caller
+// keeps a concrete handle to, so the two can never describe different
+// tables.
+fn install_service_table(shell: &mut Shell, table: &Rc<RefCell<lspclient::Table>>) {
+    shell.lsp = Rc::clone(table) as Rc<RefCell<dyn exec::ServiceTable>>;
+}
+
 // A session's live syn_col_* colors (see bishedit::highlight::
 // SYN_COL_OPTIONS/ColorOverrides, exec::Shell::bishopt_color), resolved
 // fresh from `shell` -- every caller owns its own snapshot rather than
@@ -6702,6 +6743,13 @@ fn run_normal_mode_navigation(
     // too late.
     let mut click_streak: u32 = 0;
     let mut ranged_selection = false;
+    // The definitions `gd` last found, and which one the cursor is on,
+    // while `n`/`N` are still cycling them. `None` the rest of the time
+    // -- which is almost always, and is what keeps those two keys
+    // meaning `repeat-search` everywhere else. Same shape as
+    // `PendingView` above: a state that the next unrelated keystroke
+    // resolves away rather than a mode to leave.
+    let mut definitions: Option<(Vec<crate::lsp::Location>, usize)> = None;
 
     let result: (NavExit, Option<(TextBuffer, VimKeys)>) = 'nav: loop {
         // Recomputed every iteration, not just once up front: this pane's
@@ -6963,6 +7011,44 @@ fn run_normal_mode_navigation(
             }
             render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides.as_ref());
             continue 'nav;
+        }
+
+        // `n`/`N` step through the definitions `gd` just found, and
+        // any other key ends that. Scoped rather than bound outright
+        // because both keys already mean something (repeat-search
+        // forward and backward), and a `gd` that permanently took them
+        // over would be a worse trade than the cycling is worth.
+        if definitions.is_some() {
+            let cycling = vk.is_idle() && matches!(key, Key::Char('n') | Key::Char('N'));
+            if !cycling {
+                definitions = None;
+            } else {
+                let (locations, at) = definitions.take().expect("checked just above");
+                let step = if key == Key::Char('n') { 1 } else { locations.len() - 1 };
+                let next = (at + step) % locations.len();
+                match goto_location(sessions, session_id, &mut buf, &mut vk, &locations[next], false) {
+                    Goto::Moved => {
+                        let content_cols = nav_content_cols(&buf, rect);
+                        nav_scroll_to_show_cursor(&mut buf, content_cols);
+                        render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides.as_ref());
+                        show_command_mode_error(&format!("definition {}/{}", next + 1, locations.len()), *term_rows, *term_cols);
+                        definitions = Some((locations, next));
+                    }
+                    // Stepping onto a definition in another file opens
+                    // it, which ends this loop -- and with it the
+                    // cycle, since the list belongs to the buffer the
+                    // question was asked in.
+                    Goto::Elsewhere { path, line, character, encoding } => {
+                        break 'nav (NavExit::OpenAt { path, line, character, encoding }, nav_buffer_into_edit_state(buf, vk));
+                    }
+                    Goto::Nowhere(message) => {
+                        render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides.as_ref());
+                        show_command_mode_error(&message, *term_rows, *term_cols);
+                        definitions = Some((locations, at));
+                    }
+                }
+                continue;
+            }
         }
 
         match key {
@@ -7383,10 +7469,16 @@ fn run_normal_mode_navigation(
             // and a change to all three of its call sites. That is a
             // real design decision rather than an oversight, and it is
             // deliberately not being made here (see plan.md).
+            // `gd`: ask the language server where this is defined, and
+            // go there. Several answers arm `n`/`N` to step through the
+            // rest, the way vim's own next/previous works everywhere
+            // else -- see the block that handles those keys.
+            //
+            // Scoped to `Editable`, like `K`, for the same reason: a
+            // scrollback view has no file for a server to answer about.
             KeyOutcome::GotoDefinition => {
                 if let NavBuffer::Editable(tb) = &buf {
                     let (row, col) = tb.cursor();
-                    let here = tb.path().map(crate::url::from_file_path);
                     let found = ask_server_at_cursor(
                         sessions,
                         windows,
@@ -7404,60 +7496,32 @@ fn run_normal_mode_navigation(
                     )
                     .map(|result| crate::lsp::locations(&result))
                     .unwrap_or_default();
-                    // The first is the one to go to. A server that
-                    // returns several has found several definitions of
-                    // the same name (a trait method's implementations,
-                    // say), and choosing between them is what the
-                    // location list this defers will be for.
-                    let target = found.first().cloned();
-                    let elsewhere = found.iter().find(|l| Some(&l.uri) != here.as_ref()).cloned();
-                    match target {
-                        Some(location) if Some(&location.uri) == here.as_ref() => {
-                            let starts = fileeditor::line_starts_of(tb);
-                            let encoding = server_encoding_for(sessions, session_id, tb).unwrap_or(crate::lsp::PositionEncoding::Utf16);
-                            let offset = fileeditor::diagnostic_offset(tb, &starts, location.start.0, location.start.1, encoding);
-                            let (line, column) = fileeditor::diagnostic_position(tb, offset);
-                            // Recorded before moving, so `Ctrl-O` comes
-                            // back to where the question was asked --
-                            // which is the whole reason the jump list
-                            // exists.
-                            vk.push_jump(buf.cursor());
-                            buf.set_cursor(line, column);
-                            let content_cols = nav_content_cols(&buf, rect);
-                            nav_scroll_to_show_cursor(&mut buf, content_cols);
-                            render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides.as_ref());
-                        }
-                        Some(_) => {
-                            let location = elsewhere.expect("a target that isn't here is elsewhere");
-                            let encoding = server_encoding_for(sessions, session_id, tb).unwrap_or(crate::lsp::PositionEncoding::Utf16);
-                            match crate::url::to_file_path(&location.uri) {
-                                Some(path) => {
-                                    // The jump list is pushed here, not
-                                    // after the new file opens: it is
-                                    // this buffer's own list, and this
-                                    // is the position `Ctrl-O` should
-                                    // come back to once the reader
-                                    // returns to this file.
-                                    vk.push_jump(buf.cursor());
-                                    break 'nav (
-                                        NavExit::OpenAt { path, line: location.start.0, character: location.start.1, encoding },
-                                        nav_buffer_into_edit_state(buf, vk),
-                                    );
-                                }
-                                // A uri that isn't a local file at all
-                                // (a jar:, a zipfile:, some server's own
-                                // synthetic scheme) names nothing bish
-                                // can open, so say where it is instead.
-                                None => {
-                                    render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides.as_ref());
-                                    show_command_mode_error(&format!("definition is at {}:{}", location.uri, location.start.0 + 1), *term_rows, *term_cols);
-                                }
-                            }
-                        }
+                    match found.first().cloned() {
                         None => {
                             render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides.as_ref());
                             show_command_mode_error("no definition found", *term_rows, *term_cols);
                         }
+                        Some(first) => match goto_location(sessions, session_id, &mut buf, &mut vk, &first, true) {
+                            Goto::Moved => {
+                                let content_cols = nav_content_cols(&buf, rect);
+                                nav_scroll_to_show_cursor(&mut buf, content_cols);
+                                render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides.as_ref());
+                                // Only worth saying -- and only worth
+                                // arming -- when there is somewhere
+                                // else to go.
+                                if found.len() > 1 {
+                                    show_command_mode_error(&format!("definition 1/{} (n/N to cycle)", found.len()), *term_rows, *term_cols);
+                                    definitions = Some((found, 0));
+                                }
+                            }
+                            Goto::Elsewhere { path, line, character, encoding } => {
+                                break 'nav (NavExit::OpenAt { path, line, character, encoding }, nav_buffer_into_edit_state(buf, vk));
+                            }
+                            Goto::Nowhere(message) => {
+                                render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides.as_ref());
+                                show_command_mode_error(&message, *term_rows, *term_cols);
+                            }
+                        },
                     }
                 }
             }
@@ -7885,7 +7949,7 @@ fn server_target(shell: &exec::Shell, buf: &TextBuffer) -> Option<ServerTarget> 
 fn open_language_server_document(sessions: &mut HashMap<SessionId, SessionState>, session_id: SessionId, buf: &TextBuffer) {
     let Some(session) = sessions.get(&session_id) else { return };
     let Some(target) = server_target(&session.shell, buf) else { return };
-    let lsp = Rc::clone(&session.shell.lsp);
+    let lsp = Rc::clone(&session.lsp);
     let mut table = lsp.borrow_mut();
     // The error is deliberately dropped: `get_or_start` records it on
     // the table, which is where `::bish lsp status` shows it, and there
@@ -7915,7 +7979,7 @@ const LSP_CHANGE_DEBOUNCE: std::time::Duration = std::time::Duration::from_milli
 fn sync_language_server_document(sessions: &mut HashMap<SessionId, SessionState>, session_id: SessionId, buf: &TextBuffer) {
     let Some(session) = sessions.get(&session_id) else { return };
     let Some(target) = server_target(&session.shell, buf) else { return };
-    let lsp = Rc::clone(&session.shell.lsp);
+    let lsp = Rc::clone(&session.lsp);
     let mut table = lsp.borrow_mut();
     let Some(server) = table.running(&target.display, &target.root) else { return };
     if !server.needs_change(&target.uri, buf.version(), std::time::Instant::now(), LSP_CHANGE_DEBOUNCE) {
@@ -7965,7 +8029,7 @@ fn ask_server_at_cursor(
     let session = sessions.get(&session_id)?;
     let target = server_target(&session.shell, buf)?;
     let timeout = std::time::Duration::from_millis(session.shell.bishopt_int("lsp_timeout_ms").max(0) as u64);
-    let lsp = Rc::clone(&session.shell.lsp);
+    let lsp = Rc::clone(&session.lsp);
 
     let id = {
         let mut table = lsp.borrow_mut();
@@ -8019,9 +8083,70 @@ fn ask_server_at_cursor(
 fn server_encoding_for(sessions: &HashMap<SessionId, SessionState>, session_id: SessionId, buf: &TextBuffer) -> Option<crate::lsp::PositionEncoding> {
     let session = sessions.get(&session_id)?;
     let target = server_target(&session.shell, buf)?;
-    let lsp = Rc::clone(&session.shell.lsp);
+    let lsp = Rc::clone(&session.lsp);
     let mut table = lsp.borrow_mut();
     Some(table.running(&target.display, &target.root)?.encoding())
+}
+
+// What acting on one `lsp::Location` did.
+enum Goto {
+    /// The cursor moved within this buffer.
+    Moved,
+    /// The target is a different file, which this loop cannot open --
+    /// see `NavExit::OpenAt`.
+    Elsewhere { path: PathBuf, line: usize, character: usize, encoding: crate::lsp::PositionEncoding },
+    /// Nothing to go to, with what to say about it.
+    Nowhere(String),
+}
+
+// Moves the cursor to `location` if it is in this buffer, or reports
+// what else it is. Shared by `gd` and by the `n`/`N` cycling that
+// follows it, so the two cannot disagree about what "go there" means.
+//
+// `push_jump` only for the first jump of a `gd`: cycling within a
+// result set should leave one entry behind for `Ctrl-O`, at the place
+// the question was asked, not one per step.
+fn goto_location(
+    sessions: &HashMap<SessionId, SessionState>,
+    session_id: SessionId,
+    buf: &mut NavBuffer,
+    vk: &mut VimKeys,
+    location: &crate::lsp::Location,
+    push_jump: bool,
+) -> Goto {
+    let Some(tb) = buf.as_editable_mut() else {
+        return Goto::Nowhere("no definition found".to_string());
+    };
+    let here = tb.path().map(crate::url::from_file_path);
+    let encoding = server_encoding_for(sessions, session_id, tb).unwrap_or(crate::lsp::PositionEncoding::Utf16);
+    if Some(&location.uri) == here.as_ref() {
+        let starts = fileeditor::line_starts_of(tb);
+        let offset = fileeditor::diagnostic_offset(tb, &starts, location.start.0, location.start.1, encoding);
+        let (line, column) = fileeditor::diagnostic_position(tb, offset);
+        if push_jump {
+            vk.push_jump(tb.cursor());
+        }
+        tb.set_cursor(line, column);
+        return Goto::Moved;
+    }
+    match crate::url::to_file_path(&location.uri) {
+        Some(path) => Goto::Elsewhere { path, line: location.start.0, character: location.start.1, encoding },
+        // A uri naming no local file at all (`jar:`, `zipfile:`, a
+        // server's own synthetic scheme) is nothing bish can open.
+        None => Goto::Nowhere(format!("definition is at {}:{}", location.uri, location.start.0 + 1)),
+    }
+}
+
+// Asks this buffer's server to hand over its last publication again on
+// the next idle tick. See `Server::redeliver_diagnostics`.
+fn redeliver_language_server_diagnostics(sessions: &mut HashMap<SessionId, SessionState>, session_id: SessionId, buf: &TextBuffer) {
+    let Some(session) = sessions.get(&session_id) else { return };
+    let Some(target) = server_target(&session.shell, buf) else { return };
+    let lsp = Rc::clone(&session.lsp);
+    let mut table = lsp.borrow_mut();
+    if let Some(server) = table.running(&target.display, &target.root) {
+        server.redeliver_diagnostics(&target.uri);
+    }
 }
 
 // Applies whatever the language server has most recently said about
@@ -8042,7 +8167,7 @@ fn server_encoding_for(sessions: &HashMap<SessionId, SessionState>, session_id: 
 fn apply_language_server_diagnostics(sessions: &mut HashMap<SessionId, SessionState>, session_id: SessionId, buf: &mut TextBuffer) -> bool {
     let Some(session) = sessions.get(&session_id) else { return false };
     let Some(target) = server_target(&session.shell, buf) else { return false };
-    let lsp = Rc::clone(&session.shell.lsp);
+    let lsp = Rc::clone(&session.lsp);
     let mut table = lsp.borrow_mut();
     let Some(server) = table.running(&target.display, &target.root) else { return false };
     let encoding = server.encoding();
@@ -8075,7 +8200,7 @@ fn apply_language_server_diagnostics(sessions: &mut HashMap<SessionId, SessionSt
 fn save_language_server_document(sessions: &mut HashMap<SessionId, SessionState>, session_id: SessionId, buf: &TextBuffer) {
     let Some(session) = sessions.get(&session_id) else { return };
     let Some(target) = server_target(&session.shell, buf) else { return };
-    let lsp = Rc::clone(&session.shell.lsp);
+    let lsp = Rc::clone(&session.lsp);
     let mut table = lsp.borrow_mut();
     let Some(server) = table.running(&target.display, &target.root) else { return };
     // A save with unsent edits behind it would otherwise tell the server
@@ -8091,7 +8216,7 @@ fn save_language_server_document(sessions: &mut HashMap<SessionId, SessionState>
 fn close_language_server_document(sessions: &mut HashMap<SessionId, SessionState>, session_id: SessionId, buf: &TextBuffer) {
     let Some(session) = sessions.get(&session_id) else { return };
     let Some(target) = server_target(&session.shell, buf) else { return };
-    let lsp = Rc::clone(&session.shell.lsp);
+    let lsp = Rc::clone(&session.lsp);
     let mut table = lsp.borrow_mut();
     if let Some(server) = table.running(&target.display, &target.root) {
         server.close_document(&target.uri);
@@ -9322,6 +9447,14 @@ fn run_command_mode(
                             // to know nothing about where a finding
                             // came from, and that only works if each
                             // source replaces exactly its own.
+                            // Diagnostics are pushed, never requested,
+                            // so after `:diag clear` the only copy of a
+                            // server's findings is the one it holds.
+                            // Asking for them again is what makes
+                            // `clear` reversible rather than permanent
+                            // until the next edit -- which for a file
+                            // nobody goes on to touch is never.
+                            redeliver_language_server_diagnostics(sessions, session_id, tb);
                             let mut merged = fileeditor::diagnose_buffer(tb);
                             merged.extend(tb.diagnostics.iter().filter(|d| d.source.is_some()).cloned());
                             merged.sort_by_key(|d| (d.start, d.end));
@@ -11346,6 +11479,7 @@ mod compositor_frame_output_tests {
     fn an_interrupted_line_is_recorded_in_the_grid_the_way_the_terminal_shows_it() {
         let screen = Rc::new(RefCell::new(vt100::Screen::new(4, 40)));
         let mut session = SessionState {
+            lsp: Rc::new(RefCell::new(lspclient::Table::default())),
             shell: exec::Shell::new(),
             buffer: String::new(),
             buffer_unrecorded: false,

@@ -52,6 +52,18 @@ const LOG_LINES: usize = 200;
 // actual conversation has one or two replies in flight.
 const MAX_PENDING_RESPONSES: usize = 32;
 
+// How many bytes may be owed to a server's stdin before it is declared
+// broken.
+//
+// Queueing instead of blocking is what lets this be single-threaded
+// (see the header), but a queue with no ceiling is just a slower way to
+// run out of memory: a server that has stopped reading its input will
+// never start again, and every keystroke adds another whole document to
+// the pile. Generous enough that a large file's `didOpen` followed by a
+// burst of edits fits comfortably, small enough to notice a wedge long
+// before it matters.
+const MAX_OUTGOING_BYTES: usize = 8 * 1024 * 1024;
+
 /// Where a server is in its lifecycle.
 ///
 /// `Initializing` is a real state rather than an implementation detail:
@@ -456,6 +468,21 @@ impl Server {
                 // is no buffer for it to be about.
                 None
             }
+            // A request from the server. Answering *something* is not
+            // optional -- JSON-RPC says a request gets a response, and
+            // a server still waiting on one can stall indefinitely --
+            // but answering everything `MethodNotFound` is wrong for
+            // the few a real server actually sends, so each of those
+            // gets the reply a client with nothing to offer should give
+            // (see `answer`).
+            Message::Request { id, method, params } => {
+                let (answer, note) = self.answer(method, params);
+                if let Some(note) = note {
+                    self.note(note);
+                }
+                self.respond(id.clone(), answer);
+                None
+            }
             // A server's own log lines belong with the ones it wrote to
             // stderr, not in the caller's lap.
             Message::Notification { method, params } if method == "window/logMessage" || method == "window/showMessage" => {
@@ -465,6 +492,63 @@ impl Server {
                 None
             }
             _ => Some(message),
+        }
+    }
+
+    // What to reply to a request the server made, and optionally a line
+    // for the log.
+    //
+    // The default really is `MethodNotFound`: it is the correct answer
+    // for a method a client does not implement, and a server reading it
+    // learns something true. The exceptions are the requests where
+    // "not implemented" is *less* accurate than a real answer, and
+    // where refusing degrades the server for no reason.
+    fn answer(&self, method: &str, params: &Value) -> (Result<Value, ResponseError>, Option<String>) {
+        match method {
+            // "What are this client's settings for these sections?"
+            // The honest answer from a client with no per-server
+            // configuration is one `null` per item -- meaning "nothing
+            // set, use your defaults" -- not "I don't know this
+            // method", which makes servers log errors and sometimes
+            // disable features outright.
+            "workspace/configuration" => {
+                let count = match json::query(params, ".items") {
+                    Ok(Value::Array(items)) => items.len(),
+                    _ => 0,
+                };
+                (Ok(Value::Array(vec![Value::Null; count])), None)
+            }
+            // "May I report progress?" Yes -- the progress
+            // notifications that follow are ignored, which costs
+            // nothing, whereas refusing can stop a server reporting
+            // indexing state it would otherwise recover from cleanly.
+            "window/workDoneProgress/create" => (Ok(Value::Null), None),
+            // Dynamic registration. bish declares `dynamicRegistration:
+            // false` everywhere, so a conforming server never asks; one
+            // that asks anyway is already off-spec, and accepting is
+            // both what other clients do and harmless -- an unhonoured
+            // registration and a refused one leave the server equally
+            // uninformed, but the refusal can be treated as fatal.
+            // Logged, because it means a server is doing something this
+            // client did not expect.
+            "client/registerCapability" | "client/unregisterCapability" => {
+                (Ok(Value::Null), Some(format!("accepted and ignored {method}: bish declares no dynamic registration")))
+            }
+            // "Apply these edits to the workspace." Not implemented --
+            // and `applied: false` says exactly that in the server's own
+            // vocabulary, so it can tell the user its refactor did not
+            // happen instead of failing obscurely.
+            "workspace/applyEdit" => (Ok(Value::Object(vec![("applied".to_string(), Value::Bool(false))])), None),
+            // A message with buttons. Nothing displays it, so nothing
+            // was chosen: `null` is the spec's own "user dismissed it".
+            "window/showMessageRequest" => (Ok(Value::Null), None),
+            // bish sends a single `rootUri` and declares no
+            // workspace-folder support, so there is no list to give.
+            "workspace/workspaceFolders" => (Ok(Value::Null), None),
+            _ => (
+                Err(ResponseError { code: -32601, message: format!("bish does not implement {method}") }),
+                Some(format!("declined {method}: not implemented")),
+            ),
         }
     }
 
@@ -595,7 +679,15 @@ impl Server {
     }
 
     fn enqueue(&mut self, message: &Message) {
-        self.outgoing.extend(lsp::encode(message));
+        let encoded = lsp::encode(message);
+        if self.outgoing.len() + encoded.len() > MAX_OUTGOING_BYTES {
+            // Not a queue to grow: a server this far behind on reading
+            // its own stdin is wedged, and pretending otherwise trades a
+            // visible failure for an invisible leak.
+            self.die(format!("stopped reading its input ({} bytes queued)", self.outgoing.len()));
+            return;
+        }
+        self.outgoing.extend(encoded);
     }
 
     // -----------------------------------------------------------------
@@ -690,6 +782,22 @@ impl Server {
         }
         document.unapplied = false;
         document.published.as_ref()
+    }
+
+    /// Marks the diagnostics this server last published for `uri` as
+    /// needing to be applied again.
+    ///
+    /// Diagnostics are pushed, never requested -- there is no "send them
+    /// again" in the protocol -- so after something clears a buffer's
+    /// list (`:diag clear`) the only copy left is the one held here.
+    /// This is what lets `:diag` put them back rather than leaving the
+    /// user waiting for an edit that may never come.
+    pub fn redeliver_diagnostics(&mut self, uri: &str) -> bool {
+        let Some(document) = self.documents.iter_mut().find(|d| d.uri == uri) else {
+            return false;
+        };
+        document.unapplied = document.published.is_some();
+        document.unapplied
     }
 
     /// Sends the document's current text. A no-op when the server
@@ -919,20 +1027,11 @@ impl Table {
     /// blocking loop in repl.rs shares.
     pub fn service_all(&mut self) {
         for server in &mut self.servers {
-            for message in server.service() {
-                match message {
-                    // Nothing consumes server-initiated messages yet.
-                    // A *request* still has to be answered, though: a
-                    // server that asked something and never heard back
-                    // waits forever, and "not implemented" is both true
-                    // and the answer that unblocks it.
-                    Message::Request { id, method, .. } => {
-                        server.note(format!("declined {method}: not implemented"));
-                        server.respond(id, Err(ResponseError { code: -32601, message: format!("bish does not implement {method}") }));
-                    }
-                    Message::Notification { .. } | Message::Response { .. } => {}
-                }
-            }
+            // Every request is already answered inside `service` (see
+            // `Server::answer`); what comes back here is notifications
+            // and replies nobody collected, neither of which anything
+            // consumes yet.
+            let _ = server.service();
         }
     }
 
@@ -962,29 +1061,86 @@ impl Table {
     }
 }
 
+impl crate::exec::ServiceTable for Table {
+    // What `::bish lsp status` prints. The shell joins these with tabs
+    // and knows nothing about what any of them mean.
+    fn rows(&self) -> Vec<Vec<String>> {
+        let running = self.servers.iter().map(|s| {
+            let encoding = if s.is_ready() { s.encoding().wire_name() } else { "" };
+            vec![
+                s.id.to_string(),
+                s.state().describe(),
+                encoding.to_string(),
+                s.open_documents().to_string(),
+                s.root.display().to_string(),
+                s.command.clone(),
+            ]
+        });
+        // A server that never started has no state of its own to
+        // report, but it is the thing someone running `status` is most
+        // likely looking for, so it appears in the same shape rather
+        // than being left out.
+        let failed = self.failures.iter().map(|f| {
+            vec![f.id.to_string(), format!("dead: {}", f.why), String::new(), "0".to_string(), f.root.display().to_string(), f.command.clone()]
+        });
+        running.chain(failed).collect()
+    }
+
+    fn logs(&self, id: u64) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for server in self.servers.iter().filter(|s| s.id == id) {
+            out.extend(server.log().cloned());
+        }
+        // A failure to start produces no `Server` at all, and is
+        // precisely the case someone runs `log` for.
+        out.extend(self.failures.iter().filter(|f| f.id == id).map(|f| f.why.clone()));
+        out
+    }
+
+    fn forget(&mut self, id: u64) -> usize {
+        let before = self.servers.len() + self.failures.len();
+        // Told to stop on the way out, so a server holding a cache
+        // writes it: `Server::drop` would otherwise just kill it.
+        for server in self.servers.iter_mut().filter(|s| s.id == id) {
+            server.shutdown();
+        }
+        self.servers.retain(|s| s.id != id);
+        self.failures.retain(|f| f.id != id);
+        before - (self.servers.len() + self.failures.len())
+    }
+}
+
 /// The directory to treat as the project root for `path`: the nearest
-/// ancestor containing one of `markers`, tried marker by marker.
+/// ancestor containing **any** of `markers`.
 ///
-/// Marker order beats proximity, which is what `--root=Cargo.toml,.git`
-/// is asking for -- a crate inside a git repository should be rooted at
-/// its `Cargo.toml`, not at the repository, even though the repository
-/// root may be closer to nothing in particular. Within one marker,
-/// nearest wins.
+/// Proximity wins, not marker order -- which is what every mainstream
+/// client does (nvim-lspconfig's `root_pattern` walks up checking all
+/// its patterns at each level; VS Code roots at the opened folder).
+/// This was originally the other way round, trying each marker to the
+/// top before the next, on the reasoning that `--root=Cargo.toml,.git`
+/// meant "prefer a crate to a repository". That reasoning is wrong in
+/// the case it was aimed at: with a `Cargo.toml` above and a `.git`
+/// below it, marker-order picks the *further* directory, which is a
+/// bigger tree than the file belongs to.
 ///
-/// `None` when nothing matches, which is the caller's cue not to start a
-/// server at all rather than to guess: a server given the wrong root
+/// The genuinely hard case this does not solve: a member of a Cargo
+/// workspace should usually be rooted at the workspace, not at its own
+/// crate, and only `cargo metadata` knows which. Every client that gets
+/// that right shells out to Cargo for it. Out of scope here; the
+/// documented fix is to name the workspace directory explicitly.
+///
+/// `None` when nothing matches, which is the caller's cue not to start
+/// a server at all rather than to guess: a server given the wrong root
 /// indexes the wrong tree, and for a large one that is expensive enough
 /// to notice.
 pub fn root_for(path: &Path, markers: &[String]) -> Option<PathBuf> {
     let start = if path.is_dir() { path } else { path.parent()? };
-    for marker in markers {
-        let mut dir = Some(start);
-        while let Some(current) = dir {
-            if current.join(marker).exists() {
-                return Some(current.to_path_buf());
-            }
-            dir = current.parent();
+    let mut dir = Some(start);
+    while let Some(current) = dir {
+        if markers.iter().any(|marker| current.join(marker).exists()) {
+            return Some(current.to_path_buf());
         }
+        dir = current.parent();
     }
     None
 }
@@ -1038,6 +1194,120 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    // A request has to be answered -- a server still waiting on one can
+    // stall -- but "not implemented" is the wrong answer for the few a
+    // real server actually sends.
+    #[test]
+    fn a_server_request_gets_the_answer_a_client_with_nothing_to_offer_should_give() {
+        let dir = temp_dir("answer");
+        let server = Server::start(1, &mock_server(FULL_SYNC), "mock", &dir).unwrap();
+
+        // Settings for three sections, none configured: one `null`
+        // each, meaning "use your defaults". MethodNotFound here makes
+        // servers log errors and sometimes disable features.
+        let params = json::parse(r#"{"items":[{"section":"a"},{"section":"b"},{"section":"c"}]}"#).unwrap();
+        let (answer, _) = server.answer("workspace/configuration", &params);
+        assert_eq!(answer, Ok(Value::Array(vec![Value::Null; 3])));
+
+        // Progress: accepted, because the notifications that follow are
+        // ignored at no cost, while refusing can stop a server
+        // reporting indexing state.
+        assert_eq!(server.answer("window/workDoneProgress/create", &Value::Null).0, Ok(Value::Null));
+
+        // Dynamic registration: accepted and ignored, and logged --
+        // bish declares it does none, so a server asking is already
+        // doing something unexpected.
+        let (answer, note) = server.answer("client/registerCapability", &Value::Null);
+        assert_eq!(answer, Ok(Value::Null));
+        assert!(note.unwrap().contains("dynamic registration"));
+
+        // An edit bish cannot apply: said in the server's own
+        // vocabulary, so it can tell the user the refactor did not
+        // happen rather than failing obscurely.
+        assert_eq!(
+            server.answer("workspace/applyEdit", &Value::Null).0,
+            Ok(Value::Object(vec![("applied".to_string(), Value::Bool(false))]))
+        );
+
+        // And the default really is MethodNotFound: it is the correct
+        // answer for a method a client does not implement.
+        let (answer, note) = server.answer("workspace/somethingInvented", &Value::Null);
+        assert_eq!(answer.unwrap_err().code, -32601);
+        assert!(note.unwrap().contains("not implemented"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // The one sharp edge of queueing instead of blocking: a server that
+    // has stopped reading its stdin will never start again, and every
+    // keystroke adds another whole document to the pile.
+    #[test]
+    fn a_server_that_stops_reading_its_input_is_declared_broken_not_queued_forever() {
+        let dir = temp_dir("wedged");
+        let mut server = Server::start(1, &mock_server(FULL_SYNC), "mock", &dir).unwrap();
+        run_until_ready(&mut server);
+        server.open_document("file:///p/x.sh", "shellscript", 1, "x");
+        let big = "x".repeat(1024 * 1024);
+        for version in 2..40 {
+            server.change_document("file:///p/x.sh", version, &big);
+            if matches!(server.state(), State::Dead(_)) {
+                break;
+            }
+        }
+        let State::Dead(why) = server.state() else {
+            panic!("a wedged server should be declared dead, not queued into memory");
+        };
+        assert!(why.contains("stopped reading its input"), "{why}");
+        assert!(server.outgoing.len() <= MAX_OUTGOING_BYTES);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // Diagnostics are pushed, never requested, so after something
+    // clears a buffer's list the only copy left is the one held here.
+    #[test]
+    fn a_publication_can_be_asked_for_again_after_something_cleared_it() {
+        let dir = temp_dir("redeliver");
+        let uri = "file:///p/x.sh";
+        let mut server = Server::start(1, &publishing_server(uri), "mock", &dir).unwrap();
+        run_until_ready(&mut server);
+        server.open_document(uri, "shellscript", 1, "one");
+        for _ in 0..400 {
+            server.service();
+            if server.take_diagnostics(uri).is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(server.take_diagnostics(uri).is_none(), "collected once");
+        assert!(server.redeliver_diagnostics(uri), "and available again on request");
+        assert!(server.take_diagnostics(uri).is_some());
+        // Nothing to redeliver for a document that never had any.
+        server.open_document("file:///p/other.sh", "shellscript", 1, "x");
+        assert!(!server.redeliver_diagnostics("file:///p/other.sh"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn forgetting_a_declaration_drops_its_servers_and_its_remembered_failures() {
+        use crate::exec::ServiceTable;
+        let dir = temp_dir("forget");
+        let mut table = Table::default();
+        table.get_or_start(1, &["cat".to_string()], "cat", &dir).unwrap();
+        assert!(table.get_or_start(2, &["bish-no-such-server".to_string()], "nope", &dir).is_err());
+        assert_eq!(table.rows().len(), 2, "one running, one that never started");
+        // The failure's reason is what `::bish lsp log` shows for a
+        // server that produced no process to have a log of its own.
+        assert!(table.logs(2).iter().any(|l| l.contains("bish-no-such-server")));
+
+        assert_eq!(table.forget(2), 1);
+        assert_eq!(table.rows().len(), 1);
+        // ...and now it will be tried again rather than refused from
+        // the remembered failure.
+        assert!(table.get_or_start(2, &["bish-no-such-server".to_string()], "nope", &dir).is_err());
+        assert_eq!(table.forget(1), 1);
+        assert_eq!(table.forget(99), 0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn a_root_is_the_nearest_ancestor_holding_a_marker() {
         let dir = temp_dir("root");
@@ -1049,12 +1319,19 @@ mod tests {
         let file = crate_dir.join("src.rs");
         std::fs::write(&file, "").unwrap();
 
-        // Marker order beats proximity in the sense that matters: with
-        // Cargo.toml listed first, the crate wins over the repository
-        // even though both are ancestors.
+        // Nearest wins, whatever order the markers are given in --
+        // the rule every mainstream client uses.
         assert_eq!(root_for(&file, &["Cargo.toml".to_string(), ".git".to_string()]), Some(crate_dir.clone()));
-        // Listed the other way round, the repository wins.
-        assert_eq!(root_for(&file, &[".git".to_string(), "Cargo.toml".to_string()]), Some(repo.clone()));
+        assert_eq!(root_for(&file, &[".git".to_string(), "Cargo.toml".to_string()]), Some(crate_dir.clone()));
+        // ...and the case marker-order got backwards: a marker high up
+        // must not beat one directly above the file.
+        let deep = repo.join("crates").join("inner").join("src");
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::write(repo.join("Cargo.toml"), "").unwrap();
+        let nested = deep.join("lib.rs");
+        std::fs::write(&nested, "").unwrap();
+        assert_eq!(root_for(&nested, &["Cargo.toml".to_string(), ".git".to_string()]), Some(crate_dir.clone()), "the crate directly above, not the workspace far above");
+        let _ = &repo;
         // And with only the marker that isn't there, nothing does --
         // rather than falling back to a guess.
         assert_eq!(root_for(&file, &["go.mod".to_string()]), None);
@@ -1065,64 +1342,6 @@ mod tests {
     // simplest server-shaped thing on any system: it reads stdin and
     // writes stdout, so it exercises spawning, non-blocking pipes and
     // the queue without needing a language server installed.
-
-    #[test]
-    fn starting_a_server_sends_initialize_and_leaves_it_initializing() {
-        let dir = temp_dir("start");
-        let mut server = Server::start(1, &["cat".to_string()], "cat", &dir).unwrap();
-        assert_eq!(*server.state(), State::Initializing);
-        assert!(!server.is_ready());
-
-        // `cat` echoes, so what comes back is exactly what was sent --
-        // which means the framing that went out is decodable, end to
-        // end, through a real pipe.
-        let mut echoed = Vec::new();
-        for _ in 0..200 {
-            echoed.extend(server.service());
-            if !echoed.is_empty() {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        let Some(Message::Request { method, params, .. }) = echoed.first() else {
-            panic!("expected the echoed initialize, got {echoed:?}");
-        };
-        assert_eq!(method, "initialize");
-        assert_eq!(json::query(params, ".clientInfo.name"), Ok(&Value::Str("bish".to_string())));
-        // The negotiation the whole position-encoding story rests on:
-        // utf-32 offered first, because it is bish's own counting.
-        let Ok(Value::Array(encodings)) = json::query(params, ".capabilities.general.positionEncodings") else {
-            panic!("no positionEncodings in {params:?}");
-        };
-        assert_eq!(encodings[0], Value::Str("utf-32".to_string()));
-        // The root is a real percent-encoded file URI, not a bare path.
-        let Ok(Value::Str(uri)) = json::query(params, ".rootUri") else { panic!("no rootUri") };
-        assert!(uri.starts_with("file:///"), "{uri}");
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn a_request_made_before_the_handshake_finishes_is_held_not_sent() {
-        let dir = temp_dir("queue");
-        let mut server = Server::start(1, &["cat".to_string()], "cat", &dir).unwrap();
-        server.request("textDocument/hover", Value::Null);
-        server.notify("textDocument/didOpen", Value::Null);
-        assert_eq!(server.queued.len(), 2, "both should be waiting for `initialized`");
-
-        // Only `initialize` is ever on the wire before the handshake
-        // completes -- anything else would be answered with an error the
-        // caller could not learn about.
-        let mut seen = Vec::new();
-        for _ in 0..200 {
-            seen.extend(server.service());
-            if !seen.is_empty() {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        assert_eq!(seen.len(), 1, "{seen:?}");
-        std::fs::remove_dir_all(&dir).ok();
-    }
 
     // A mock server that answers `initialize` and then stays alive.
     //
@@ -1549,6 +1768,70 @@ mod tests {
         run_until_ready(&mut server);
         let State::Dead(why) = server.state() else { panic!("still {:?}", server.state()) };
         assert!(why.contains("unsupported client"), "{why}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn starting_a_server_sends_initialize_and_leaves_it_initializing() {
+        let dir = temp_dir("start");
+        let log = dir.join("received.jsonl");
+        let mut server = Server::start(1, &scripted_server(&dir, &log), "mock", &dir).unwrap();
+        // Before anything is serviced: the process exists, the
+        // handshake has not happened.
+        assert_eq!(*server.state(), State::Initializing);
+        assert!(!server.is_ready());
+        run_until_ready(&mut server);
+
+        // What actually went out, read back from the fixture's own
+        // record rather than from an echo -- requests are answered
+        // inside `service` now, so they never reach a caller.
+        let sent = received(&log);
+        let Some(Message::Request { method, params, .. }) = sent.first() else {
+            panic!("expected initialize first, got {sent:?}");
+        };
+        assert_eq!(method, "initialize");
+        assert_eq!(json::query(params, ".clientInfo.name"), Ok(&Value::Str("bish".to_string())));
+        // The negotiation the whole position-encoding story rests on:
+        // utf-32 offered first, because it is bish's own counting.
+        let Ok(Value::Array(encodings)) = json::query(params, ".capabilities.general.positionEncodings") else {
+            panic!("no positionEncodings in {params:?}");
+        };
+        assert_eq!(encodings[0], Value::Str("utf-32".to_string()));
+        // The root is a real percent-encoded file URI, not a bare path.
+        let Ok(Value::Str(uri)) = json::query(params, ".rootUri") else { panic!("no rootUri") };
+        assert!(uri.starts_with("file:///"), "{uri}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_request_made_before_the_handshake_finishes_is_held_not_sent() {
+        let dir = temp_dir("queue");
+        let log = dir.join("received.jsonl");
+        let mut server = Server::start(1, &scripted_server(&dir, &log), "mock", &dir).unwrap();
+        server.request("textDocument/hover", Value::Null);
+        server.notify("textDocument/didOpen", Value::Null);
+        assert_eq!(server.queued.len(), 2, "both should be waiting for `initialized`");
+        run_until_ready(&mut server);
+        for _ in 0..100 {
+            server.service();
+            if received(&log).len() >= 4 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        // The property that matters is the *order* on the wire: nothing
+        // may precede `initialized` except `initialize` itself, or the
+        // server is entitled to reject it.
+        let methods: Vec<String> = received(&log)
+            .into_iter()
+            .filter_map(|m| match m {
+                Message::Request { method, .. } | Message::Notification { method, .. } => Some(method),
+                Message::Response { .. } => None,
+            })
+            .collect();
+        assert_eq!(methods.first().map(String::as_str), Some("initialize"));
+        assert_eq!(methods.get(1).map(String::as_str), Some("initialized"));
+        assert!(methods[2..].contains(&"textDocument/hover".to_string()), "{methods:?}");
         std::fs::remove_dir_all(&dir).ok();
     }
 
