@@ -257,3 +257,148 @@ mod tests {
         assert_eq!(s.confidence, Confidence::DirectoryAndSequence);
     }
 }
+
+// ---------------------------------------------------------------------
+// `= EXPR` -- the inline calculator
+// ---------------------------------------------------------------------
+
+/// Answers a line that starts with `=` with its own arithmetic result,
+/// and hands everything else to `inner`.
+///
+/// The calculator every terminal person opens a second shell for. Typing
+/// `= 3*(2+7)` shows `21` in the same ghost text history suggestions use
+/// -- so the answer is there before you decide whether you even wanted
+/// to run anything -- and pressing Enter runs the `=` builtin, which
+/// prints it.
+///
+/// A wrapper rather than a second provider slot because `read_line`
+/// takes one: this is a *decision* about which source answers, and the
+/// line's first character makes it unambiguous.
+pub struct ArithSuggestionProvider<'a> {
+    pub inner: &'a dyn SuggestionProvider,
+    /// Where a name in the expression gets its value. Unset reads as 0,
+    /// which is what shell arithmetic does everywhere else.
+    pub vars: &'a dyn Fn(&str) -> i64,
+}
+
+/// The expression body of an `= ...` line, or `None` when this is not
+/// one.
+///
+/// The space is required, and that is not fussiness: `=` is a *command*,
+/// and a shell splits commands on words, so `=1+1` is a single word
+/// naming a program nobody has. Suggesting an answer for a line that
+/// Enter would then reject is worse than suggesting nothing, so the
+/// preview holds itself to exactly what the builtin can run.
+///
+/// A line that merely *contains* an `=` is left alone, and so is `==`,
+/// which is a comparison someone is in the middle of typing.
+pub fn arith_line(line: &str) -> Option<&str> {
+    let rest = line.strip_prefix('=')?;
+    if !rest.starts_with([' ', '\t']) {
+        return None;
+    }
+    let body = rest.trim();
+    (!body.is_empty()).then_some(body)
+}
+
+impl SuggestionProvider for ArithSuggestionProvider<'_> {
+    fn suggest(&self, req: SuggestionRequest) -> Option<Suggestion> {
+        let Some(body) = arith_line(req.line) else {
+            return self.inner.suggest(req);
+        };
+        let mut ctx = ClosureVars { get: self.vars };
+        // A half-typed expression (`= 3*(`) simply has no answer yet;
+        // showing an error where a suggestion goes would be worse than
+        // showing nothing, since the next keystroke usually fixes it.
+        let value = crate::arith::eval(body, &mut ctx).ok()?;
+        Some(Suggestion {
+            // A `Suggestion`'s text is the *whole line* it proposes --
+            // the renderer ghosts whatever of it extends past what has
+            // been typed (see `editor::compute_suggestion`). So this is
+            // the line plus the answer, which draws as `= 3*(2+7) 27`:
+            // an answer alongside the question rather than a
+            // replacement for it, and one that Tab turns into real text
+            // if you want to keep it.
+            text: format!("{} {value}", req.line),
+            confidence: Confidence::DirectoryAndSequence,
+        })
+    }
+}
+
+struct ClosureVars<'a> {
+    get: &'a dyn Fn(&str) -> i64,
+}
+
+impl crate::arith::VarContext for ClosureVars<'_> {
+    fn get(&mut self, name: &str) -> i64 {
+        (self.get)(name)
+    }
+
+    // An assignment inside a *preview* must not happen: `= (x = 1)` is
+    // still being typed, and the whole point of the ghost text is that
+    // it costs nothing to look at.
+    fn set(&mut self, _name: &str, _value: i64) {}
+}
+
+#[cfg(test)]
+mod arith_suggestion_tests {
+    use super::*;
+
+    struct Never;
+    impl SuggestionProvider for Never {
+        fn suggest(&self, _req: SuggestionRequest) -> Option<Suggestion> {
+            None
+        }
+    }
+
+    struct Fixed(&'static str);
+    impl SuggestionProvider for Fixed {
+        fn suggest(&self, _req: SuggestionRequest) -> Option<Suggestion> {
+            Some(Suggestion { text: self.0.to_string(), confidence: Confidence::Legacy })
+        }
+    }
+
+    fn ghost(line: &str, inner: &dyn SuggestionProvider) -> Option<String> {
+        let p = ArithSuggestionProvider { inner, vars: &|name| if name == "x" { 5 } else { 0 } };
+        p.suggest(SuggestionRequest { line, cursor: line.chars().count() }).map(|s| s.text)
+    }
+
+    #[test]
+    fn an_arithmetic_line_previews_its_own_answer() {
+        // The whole line plus the answer: the renderer ghosts whatever
+        // extends past what has been typed.
+        assert_eq!(ghost("= 3*(2+7)", &Never).as_deref(), Some("= 3*(2+7) 27"));
+        assert_eq!(ghost("= 1 + 2", &Never).as_deref(), Some("= 1 + 2 3"));
+        assert_eq!(ghost("= x*2", &Never).as_deref(), Some("= x*2 10"), "names resolve");
+        assert_eq!(ghost("= unset+1", &Never).as_deref(), Some("= unset+1 1"), "and an unset one is 0");
+    }
+
+    #[test]
+    fn a_half_typed_expression_says_nothing() {
+        // Not an error where a suggestion goes: the next keystroke
+        // usually fixes it.
+        assert_eq!(ghost("= 3*(", &Never), None);
+        assert_eq!(ghost("= ", &Never), None);
+        assert_eq!(ghost("=", &Never), None);
+    }
+
+    // The space is not fussiness: `=` is a command, and a shell splits
+    // commands on words, so `=1+1` names a program nobody has.
+    // Suggesting an answer Enter would then reject is worse than
+    // suggesting nothing.
+    #[test]
+    fn only_the_spelling_the_builtin_can_actually_run() {
+        assert_eq!(arith_line("= 1+1"), Some("1+1"));
+        assert_eq!(arith_line("=\t1+1"), Some("1+1"));
+        assert_eq!(arith_line("=1+1"), None);
+        assert_eq!(arith_line("== 1"), None, "someone mid-comparison");
+        assert_eq!(arith_line("x = 1"), None, "only at the start of the line");
+    }
+
+    #[test]
+    fn everything_else_still_reaches_the_history_provider() {
+        assert_eq!(ghost("echo hi", &Fixed("echo history")).as_deref(), Some("echo history"));
+        assert_eq!(ghost("=1+1", &Fixed("echo history")).as_deref(), Some("echo history"));
+        assert_eq!(ghost("echo hi", &Never), None);
+    }
+}

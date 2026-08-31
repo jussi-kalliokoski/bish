@@ -4479,6 +4479,27 @@ impl Shell {
     // fish's (which errors) -- consistency with the sibling builtin wins
     // here since nothing else in bish already commits to fish's own
     // no-args-is-an-error behavior.
+    fn run_arith_print(&mut self, args: &[String]) -> i32 {
+        // Joined with spaces rather than evaluated per argument: the
+        // shell has already split `= 3 * (2 + 7)` into words, and it is
+        // one expression.
+        let expr = args.join(" ");
+        if expr.trim().is_empty() {
+            sh_eprintln!(self, "bish: =: usage: = EXPRESSION");
+            return 2;
+        }
+        match crate::arith::eval(&expr, self) {
+            Ok(value) => {
+                sh_println!(self, "{value}");
+                0
+            }
+            Err(e) => {
+                sh_eprintln!(self, "bish: =: {e}");
+                1
+            }
+        }
+    }
+
     fn run_abbr(&mut self, args: &[String]) -> i32 {
         enum Mode {
             Add,
@@ -6976,6 +6997,13 @@ impl Shell {
                 return ExecResult::Status(status);
             }
             "abbr" => return ExecResult::Status(self.run_abbr(&argv[1..])),
+            // `= EXPR`: evaluate and print. The other half of the inline
+            // calculator whose answer the prompt already shows as ghost
+            // text while it is being typed (bishedit::suggestion::
+            // ArithSuggestionProvider) -- pressing Enter runs this and
+            // makes the answer real output, so it can be piped, captured
+            // or scrolled back to.
+            "=" => return ExecResult::Status(self.run_arith_print(&argv[1..])),
             "shopt" => return ExecResult::Status(self.run_shopt(&argv[1..])),
             "bishopt" => return ExecResult::Status(self.run_bishopt(&argv[1..], KNOWN_BISHOPTS)),
             // `::bish SUBCOMMAND...`: a dedicated namespace for bish-
@@ -11691,6 +11719,7 @@ const KNOWN_BUILTINS: &[&str] = &[
     "alias",
     "unalias",
     "abbr",
+    "=",
     "bishopt",
     "::bish",
     "compgen",

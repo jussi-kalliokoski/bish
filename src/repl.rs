@@ -969,6 +969,15 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
         // own doc comment on why a clone here is cheap: an O(1) Rc-clone
         // of its own tail, not a copy).
         let shell_suggestion = suggestion::HistorySuggestionProvider { history: &session_history, cwd: Some(cwd_snapshot.as_path()) };
+        // `= 3*(2+7)` previews its own answer instead of guessing at
+        // history. Variables resolve through the real process
+        // environment, which is where this shell keeps its plain ones
+        // (see `sync_real_state_in`); anything unset reads as 0, exactly
+        // as shell arithmetic does everywhere else.
+        let arith_suggestion = suggestion::ArithSuggestionProvider {
+            inner: &shell_suggestion,
+            vars: &|name| std::env::var(name).ok().and_then(|v| v.trim().parse::<i64>().ok()).unwrap_or(0),
+        };
         // Relative-cursor-row menu tricks are only safe on a single real
         // terminal -- a promoted/split-pane session risks spilling the
         // extra row into a neighboring pane or the tab bar. Grid/promoted
@@ -996,7 +1005,7 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
             width,
             highlight_ctx,
             Some(&shell_completion),
-            Some(&shell_suggestion),
+            Some(&arith_suggestion),
             menu_capable,
             row_origin,
             &mut registers,
