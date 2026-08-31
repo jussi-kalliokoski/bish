@@ -221,6 +221,15 @@ pub struct Server {
     // it, and a server that never sends one -- or crashes mid-work --
     // must not grow this forever.
     progress: Vec<(String, Progress)>,
+    // `window/showMessage` lines the user has not been shown yet.
+    //
+    // Separate from `log`, which is where `window/logMessage` and the
+    // server's own stderr go: the two look alike on the wire and mean
+    // opposite things. A log line is for someone who went looking; a
+    // show line is the server saying "tell them this" -- most often
+    // that it could not load a project, which is the difference between
+    // "nothing works and I don't know why" and knowing.
+    shown: VecDeque<String>,
 
     state: State,
     // Responses to requests bish made, waiting to be collected.
@@ -311,6 +320,9 @@ const MAX_PENDING_APPLIES: usize = 8;
 /// would otherwise accumulate tokens for as long as it runs.
 const MAX_PROGRESS: usize = 16;
 
+/// The most unread `window/showMessage` lines held at once.
+const MAX_SHOWN: usize = 8;
+
 /// One `$/progress` operation the server has begun and not yet ended.
 ///
 /// `title` is fixed at `begin` and does not change; `message` and
@@ -389,6 +401,7 @@ impl Server {
             log: VecDeque::new(),
             stderr_partial: String::new(),
             progress: Vec::new(),
+            shown: VecDeque::new(),
             state: State::Initializing,
             responses: Vec::new(),
             stdout_eof: false,
@@ -831,6 +844,32 @@ impl Server {
             Message::Notification { method, params } if method == "window/logMessage" || method == "window/showMessage" => {
                 if let Ok(Value::Str(text)) = json::query(params, ".message") {
                     self.note(format!("{method}: {text}"));
+                    // A `showMessage` is also queued for the user. The
+                    // log keeps its copy either way, so `::bish lsp log`
+                    // still shows the whole conversation in order.
+                    if method == "window/showMessage" {
+                        let severity = match json::query(params, ".type") {
+                            Ok(Value::Number(n)) if *n == 1.0 => "error",
+                            Ok(Value::Number(n)) if *n == 2.0 => "warning",
+                            // 3 (info), 4 (log), and anything a server
+                            // invents: shown without a label rather than
+                            // labelled with a guess.
+                            _ => "",
+                        };
+                        if self.shown.len() >= MAX_SHOWN {
+                            // Dropping the oldest: a server producing
+                            // these faster than they can be read is
+                            // saying the same thing repeatedly, and the
+                            // newest says it most currently.
+                            self.shown.pop_front();
+                        }
+                        let name = self.display_name().to_string();
+                        self.shown.push_back(if severity.is_empty() {
+                            format!("{name}: {text}")
+                        } else {
+                            format!("{name} {severity}: {text}")
+                        });
+                    }
                 }
                 None
             }
@@ -1412,6 +1451,16 @@ impl Server {
 
     pub fn is_ready(&self) -> bool {
         self.state == State::Ready
+    }
+
+    /// The oldest `window/showMessage` line nobody has been shown yet,
+    /// removed as it is taken.
+    ///
+    /// Drained one at a time rather than all at once because the place
+    /// it goes -- the status line -- has room for one, and a server
+    /// that said two things said the first one first.
+    pub fn take_shown_message(&mut self) -> Option<String> {
+        self.shown.pop_front()
     }
 
     /// What this server is busy with right now, or `None` when it is
@@ -2147,6 +2196,59 @@ mod tests {
         assert!(always.may_apply(), "no command needed");
         assert!(always.handle(request).is_none());
         assert!(always.take_apply_edit().is_some());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // The two `window/*Message` notifications look alike on the wire
+    // and mean opposite things: one is for someone who went looking,
+    // the other is the server asking to interrupt.
+    #[test]
+    fn a_show_message_reaches_the_user_and_a_log_message_only_the_log() {
+        let dir = temp_dir("show-message");
+        let mut server = Server::start(1, &mock_server(FULL_SYNC), "mock", &dir, ApplyEdits::default()).unwrap();
+        run_until_ready(&mut server);
+        let notify = |method: &str, kind: f64, text: &str| Message::Notification {
+            method: method.to_string(),
+            params: Value::Object(vec![
+                ("type".to_string(), Value::Number(kind)),
+                ("message".to_string(), Value::Str(text.to_string())),
+            ]),
+        };
+        assert!(server.handle(notify("window/logMessage", 1.0, "loading")).is_none());
+        assert_eq!(server.take_shown_message(), None, "a log line is not shown");
+
+        assert!(server.handle(notify("window/showMessage", 1.0, "no Cargo.toml")).is_none());
+        assert!(server.handle(notify("window/showMessage", 3.0, "reloaded")).is_none());
+        // Oldest first, and the severity is labelled only where it says
+        // something an unlabelled line would not.
+        assert_eq!(server.take_shown_message().as_deref(), Some("mock error: no Cargo.toml"));
+        assert_eq!(server.take_shown_message().as_deref(), Some("mock: reloaded"));
+        assert_eq!(server.take_shown_message(), None, "each is shown once");
+
+        // Both kinds are still in the log, in the order they arrived --
+        // `::bish lsp log` is the whole conversation.
+        let log: Vec<&String> = server.log().collect();
+        assert!(log.iter().any(|line| line.contains("window/logMessage: loading")), "{log:?}");
+        assert!(log.iter().any(|line| line.contains("window/showMessage: no Cargo.toml")), "{log:?}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn unread_shown_messages_are_bounded() {
+        let dir = temp_dir("show-bounded");
+        let mut server = Server::start(1, &mock_server(FULL_SYNC), "mock", &dir, ApplyEdits::default()).unwrap();
+        run_until_ready(&mut server);
+        for n in 0..MAX_SHOWN * 3 {
+            server.handle(Message::Notification {
+                method: "window/showMessage".to_string(),
+                params: Value::Object(vec![
+                    ("type".to_string(), Value::Number(3.0)),
+                    ("message".to_string(), Value::Str(format!("line {n}"))),
+                ]),
+            });
+        }
+        let drained = std::iter::from_fn(|| server.take_shown_message()).count();
+        assert_eq!(drained, MAX_SHOWN);
         std::fs::remove_dir_all(&dir).ok();
     }
 

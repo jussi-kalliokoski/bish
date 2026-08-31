@@ -7749,6 +7749,15 @@ fn run_normal_mode_navigation(
             }
         };
 
+        // A key is the acknowledgement an echoed server message needs
+        // (see `TextBuffer::lsp_message`) -- the same convention vim's
+        // own echoed messages use, and the reason they need no
+        // dismissing. The redraw comes for free: whatever this key does
+        // ends in one.
+        if let Some(tb) = buf.as_editable_mut() {
+            tb.lsp_message = None;
+        }
+
         // Resolve whatever PendingView is currently covering the screen
         // before this key does anything else -- see PendingView's own
         // doc comment. A loop, not a single check: Ctrl-L on Output
@@ -9382,6 +9391,22 @@ fn sync_language_server_document(sessions: &mut HashMap<SessionId, SessionState>
 // redraw -- a progress line that only updates on the next keystroke is
 // worse than none, since it is then reliably wrong.
 fn sync_language_server_progress(sessions: &mut HashMap<SessionId, SessionState>, session_id: SessionId, buf: &mut TextBuffer) -> bool {
+    // Anything the server asked to have *shown* is taken first and
+    // holds the slot until a key clears it (see `TextBuffer::
+    // lsp_message`). Taken on the same tick either way -- leaving it
+    // queued while one is already displayed would mean the second of
+    // two messages arrives long after whatever prompted it.
+    let mut changed = false;
+    if let Some(message) = (|| {
+        let session = sessions.get(&session_id)?;
+        let target = server_target(session, buf)?;
+        let lsp = Rc::clone(&session.lsp);
+        let mut table = lsp.borrow_mut();
+        table.running(&target.display, &target.root)?.take_shown_message()
+    })() {
+        buf.lsp_message = Some(message);
+        changed = true;
+    }
     let line = (|| {
         let session = sessions.get(&session_id)?;
         let target = server_target(session, buf)?;
@@ -9390,7 +9415,7 @@ fn sync_language_server_progress(sessions: &mut HashMap<SessionId, SessionState>
         table.running(&target.display, &target.root)?.progress_line()
     })();
     if buf.lsp_progress == line {
-        return false;
+        return changed;
     }
     buf.lsp_progress = line;
     true

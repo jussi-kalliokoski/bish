@@ -2246,7 +2246,10 @@ fn status_text(buf: &TextBuffer, vk: &VimKeys, mode: EditorMode, cols: usize) ->
     // rather than truncated when the pane is too narrow for both it and
     // the position -- knowing where the cursor is matters more, every
     // time, than knowing a server is indexing.
-    if let Some(progress) = &buf.lsp_progress {
+    // A message the server asked to have shown wins the slot: it is
+    // news, where progress is a state, and it is gone by the next
+    // keypress either way.
+    if let Some(progress) = buf.lsp_message.as_ref().or(buf.lsp_progress.as_ref()) {
         let candidate = format!("{progress}   {right}");
         if left.chars().count() + candidate.chars().count() < cols {
             right = candidate;
