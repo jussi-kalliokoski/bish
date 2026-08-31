@@ -2143,6 +2143,169 @@ fn split_top_level_commas(s: &str) -> Vec<String> {
     items
 }
 
+
+// ---------------------------------------------------------------------
+// Alias expansion
+// ---------------------------------------------------------------------
+
+/// The most alias expansions one pass will perform.
+///
+/// Two aliases that name each other (`alias a=b; alias b=a`) would
+/// otherwise expand forever. bash's own answer is a per-chain guard;
+/// this is that plus a hard ceiling, because a ceiling cannot be
+/// reasoned around and a real command line never comes near it.
+const MAX_ALIAS_EXPANSIONS: usize = 200;
+
+/// Substitutes aliases into an already-tokenized line.
+///
+/// bash expands aliases while *reading*, textually, before the line is
+/// parsed -- which is what let `alias l='ls | less'` work, and what made
+/// this look impossible in a shell that tokenizes and parses a whole
+/// script up front. The token stream is the seam that resolves it: a
+/// word in command position is replaced by the tokens of its alias's
+/// value, operators and all, before the parser ever sees either. So an
+/// alias whose value is a whole pipeline is a pipeline, not a command
+/// with `|` as an argument -- which is exactly the "half-correct
+/// expansion" this was held back to avoid.
+///
+/// The rules are bash's:
+///
+///  * Only the **first word** of a command, and only where a command can
+///    start. A variable assignment before it does not count as the
+///    command word, so `FOO=1 ll` still expands `ll`.
+///  * Only an **unquoted, unescaped** word. `\ll` and `'ll'` run the real
+///    thing -- `Tok::Word`'s own "no quoting or expansion at all" flag is
+///    already exactly this question.
+///  * An alias whose value **ends in a blank** makes the next word
+///    eligible too, which is the whole point of `alias sudo='sudo '`.
+///  * An alias's own value cannot re-trigger it, so `alias ls='ls -F'`
+///    terminates.
+///
+/// `lookup` rather than a table so the lexer stays ignorant of `Shell`.
+pub fn expand_aliases(toks: Vec<(Tok, usize)>, lookup: &dyn Fn(&str) -> Option<String>) -> Vec<(Tok, usize)> {
+    let mut queue: std::collections::VecDeque<(Tok, usize)> = toks.into();
+    let mut out: Vec<(Tok, usize)> = Vec::new();
+    // How many tokens are left from each alias currently being spliced
+    // in, and whether that alias's value ended in a blank. Popped as
+    // each runs out, which is when the trailing-blank rule fires.
+    let mut frames: Vec<(usize, bool)> = Vec::new();
+    let mut command_position = true;
+    let mut budget = MAX_ALIAS_EXPANSIONS;
+
+    while let Some((tok, line)) = queue.pop_front() {
+        // Account for this token against whichever alias produced it,
+        // before anything else can change what "next" means.
+        let mut trailing_blank = false;
+        while let Some(frame) = frames.last_mut() {
+            frame.0 -= 1;
+            if frame.0 > 0 {
+                break;
+            }
+            trailing_blank |= frame.1;
+            frames.pop();
+        }
+
+        let eligible = command_position
+            && budget > 0
+            && matches!(&tok, Tok::Word(_, globbable) if *globbable);
+        let name = if eligible { literal_word(&tok) } else { None };
+        let value = name.as_deref().and_then(lookup);
+
+        if let (Some(name), Some(value)) = (name, value)
+            && let Ok(mut sub) = Lexer::new(&value).tokenize()
+        {
+            // The lexer ends a line with a `Newline`; an alias's value is
+            // a fragment of one, not a line of its own.
+            while matches!(sub.last(), Some((Tok::Newline, _))) {
+                sub.pop();
+            }
+            if !sub.is_empty() {
+                budget -= 1;
+                // An alias's own value cannot re-trigger it: emit its
+                // first word directly when that word *is* the alias, so
+                // `alias ls='ls -F'` terminates instead of recursing.
+                let self_referential = literal_word(&sub[0].0).as_deref() == Some(name.as_str());
+                let ends_blank = value.ends_with([' ', '\t']);
+                if self_referential {
+                    let (first, _) = sub.remove(0);
+                    out.push((first, line));
+                    command_position = false;
+                }
+                if !sub.is_empty() {
+                    frames.push((sub.len(), ends_blank));
+                    for (t, _) in sub.into_iter().rev() {
+                        queue.push_front((t, line));
+                    }
+                    if !self_referential {
+                        // Still at the start of a command: the alias's
+                        // own first token is the command word now.
+                        command_position = true;
+                    }
+                } else if ends_blank {
+                    command_position = true;
+                }
+                continue;
+            }
+        }
+
+        command_position = starts_a_command(&tok) || (command_position && is_assignment_word(&tok)) || trailing_blank;
+        out.push((tok, line));
+    }
+    out
+}
+
+/// A word made of exactly one literal run, with nothing expanded or
+/// quoted in it -- the only shape that can name an alias.
+fn literal_word(tok: &Tok) -> Option<String> {
+    match tok {
+        Tok::Word(chunks, true) => match chunks.as_slice() {
+            [Chunk::Str(s)] => Some(s.clone()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// `NAME=` -- a variable assignment sitting in front of the command
+/// word. bash expands an alias after these, so they must not consume
+/// command position.
+fn is_assignment_word(tok: &Tok) -> bool {
+    let Some(word) = literal_word(tok) else { return false };
+    let Some(eq) = word.find('=') else { return false };
+    let name = &word[..eq];
+    !name.is_empty()
+        && !name.starts_with(|c: char| c.is_ascii_digit())
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Whether a command can start immediately after this token.
+///
+/// Deliberately only the separators and block openers, not every
+/// keyword: the word after `for` is a variable name and the words after
+/// `in` are a list, and expanding an alias into either would be wrong.
+fn starts_a_command(tok: &Tok) -> bool {
+    matches!(
+        tok,
+        Tok::Pipe
+            | Tok::And
+            | Tok::Or
+            | Tok::Semi
+            | Tok::DSemi
+            | Tok::SemiAmp
+            | Tok::DSemiAmp
+            | Tok::Amp
+            | Tok::Newline
+            | Tok::LBrace
+            | Tok::KwIf
+            | Tok::KwThen
+            | Tok::KwElif
+            | Tok::KwElse
+            | Tok::KwWhile
+            | Tok::KwUntil
+            | Tok::KwDo
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2375,5 +2538,127 @@ mod tests {
             })
             .collect();
         assert_eq!(literal_strs, expected.iter().collect::<Vec<_>>());
+    }
+}
+
+#[cfg(test)]
+mod alias_tests {
+    use super::*;
+
+    // Round-trips through the lexer so a test reads as the shell line it
+    // is, and so what is asserted is the *token stream* the parser will
+    // actually see.
+    fn expand(line: &str, aliases: &[(&str, &str)]) -> String {
+        let toks = Lexer::new(line).tokenize().expect("lexes");
+        let out = expand_aliases(toks, &|name| aliases.iter().find(|(n, _)| *n == name).map(|(_, v)| v.to_string()));
+        out.iter().map(|(t, _)| describe(t)).collect::<Vec<_>>().join(" ")
+    }
+
+    fn describe(t: &Tok) -> String {
+        match t {
+            // Both literal shapes, so a quoted word prints as its text
+            // -- the point of the quoting tests is that it survived
+            // unexpanded, not that it is unprintable.
+            Tok::Word(chunks, _) => chunks
+                .iter()
+                .map(|c| match c {
+                    Chunk::Str(s) | Chunk::LiteralStr(s) => s.clone(),
+                    _ => "<expansion>".to_string(),
+                })
+                .collect(),
+            Tok::Pipe => "|".to_string(),
+            Tok::Semi => ";".to_string(),
+            Tok::And => "&&".to_string(),
+            Tok::Newline => "\\n".to_string(),
+            Tok::KwIf => "if".to_string(),
+            Tok::KwThen => "then".to_string(),
+            Tok::KwFi => "fi".to_string(),
+            Tok::KwFor => "for".to_string(),
+            Tok::KwIn => "in".to_string(),
+            Tok::KwDo => "do".to_string(),
+            Tok::KwDone => "done".to_string(),
+            other => format!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_first_word_of_a_command_is_replaced() {
+        assert_eq!(expand("ll", &[("ll", "ls -la")]), "ls -la");
+        assert_eq!(expand("ll /tmp", &[("ll", "ls -la")]), "ls -la /tmp");
+        // Not a *later* word: `ll` as an argument is an argument.
+        assert_eq!(expand("echo ll", &[("ll", "ls -la")]), "echo ll");
+    }
+
+    // The reason this is done on tokens rather than on words: an alias
+    // whose value is a pipeline has to *become* a pipeline.
+    #[test]
+    fn an_alias_can_expand_to_a_whole_pipeline() {
+        assert_eq!(expand("g", &[("g", "echo x | tr a-z A-Z")]), "echo x | tr a-z A-Z");
+        assert_eq!(expand("two", &[("two", "echo one; echo two")]), "echo one ; echo two");
+    }
+
+    #[test]
+    fn a_command_can_start_after_a_separator_or_a_block_opener() {
+        let a = &[("ll", "ls -la")][..];
+        assert_eq!(expand("echo a | ll", a), "echo a | ls -la");
+        assert_eq!(expand("true && ll", a), "true && ls -la");
+        assert_eq!(expand("true; ll", a), "true ; ls -la");
+        assert_eq!(expand("if true; then ll; fi", a), "if true ; then ls -la ; fi");
+        assert_eq!(expand("echo x\nll", a), "echo x \\n ls -la");
+    }
+
+    // A variable assignment sits in front of the command word without
+    // being it.
+    #[test]
+    fn an_assignment_does_not_consume_command_position() {
+        assert_eq!(expand("FOO=1 ll", &[("ll", "ls")]), "FOO=1 ls");
+        assert_eq!(expand("FOO=1 BAR=2 ll", &[("ll", "ls")]), "FOO=1 BAR=2 ls");
+        // ...but something that only looks like one does.
+        assert_eq!(expand("1FOO=x ll", &[("ll", "ls")]), "1FOO=x ll");
+    }
+
+    #[test]
+    fn quoting_or_escaping_the_word_runs_the_real_thing() {
+        assert_eq!(expand("\\ll", &[("ll", "ls -la")]), "ll");
+        assert_eq!(expand("'ll'", &[("ll", "ls -la")]), "ll");
+        assert_eq!(expand("\"ll\"", &[("ll", "ls -la")]), "ll");
+    }
+
+    // `alias ls='ls -F'` is the single most common alias there is, and it
+    // has to terminate.
+    #[test]
+    fn an_alias_cannot_re_trigger_itself() {
+        assert_eq!(expand("ls", &[("ls", "ls -F")]), "ls -F");
+        assert_eq!(expand("ls /tmp", &[("ls", "ls -F")]), "ls -F /tmp");
+        // Two aliases naming each other cannot spin forever either.
+        let mutual = &[("a", "b"), ("b", "a")][..];
+        let out = expand("a", mutual);
+        assert!(out == "a" || out == "b", "terminated with {out:?}");
+    }
+
+    // `alias sudo='sudo '` -- the trailing blank is what makes the *next*
+    // word eligible, and the only reason anyone writes one.
+    #[test]
+    fn a_trailing_blank_makes_the_next_word_eligible() {
+        let a = &[("sudo", "sudo "), ("ll", "ls -la")][..];
+        assert_eq!(expand("sudo ll", a), "sudo ls -la");
+        // Without the blank, the next word is just an argument.
+        let b = &[("sudo", "sudo"), ("ll", "ls -la")][..];
+        assert_eq!(expand("sudo ll", b), "sudo ll");
+    }
+
+    // Only the separators and block openers put us back in command
+    // position: the word after `for` is a variable name, and the words
+    // after `in` are a list.
+    #[test]
+    fn a_loop_variable_and_its_list_are_not_commands() {
+        let a = &[("i", "echo NO"), ("x", "echo NO")][..];
+        assert_eq!(expand("for i in x; do echo hi; done", a), "for i in x ; do echo hi ; done");
+    }
+
+    #[test]
+    fn nothing_to_expand_leaves_the_stream_alone() {
+        assert_eq!(expand("echo hello", &[]), "echo hello");
+        assert_eq!(expand("echo hello", &[("ll", "ls")]), "echo hello");
     }
 }

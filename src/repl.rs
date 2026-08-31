@@ -597,6 +597,11 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
     // Real bash enables job control automatically for an interactive
     // shell -- see Shell::enable_monitor_mode's own doc comment.
     shell.enable_monitor_mode();
+    // ...and expands aliases, which it also does only when interactive.
+    // Set here rather than defaulted on in the registry so a script run
+    // by `bish script.sh` still sees bash's own answer: off unless it
+    // says `shopt -s expand_aliases` itself.
+    shell.enable_shopt("expand_aliases");
 
     let mut cmd_history = History::load(".bish_cmd_history");
     // The whole-shell register table (yank/put/<C-r>) -- one instance,
@@ -1387,7 +1392,7 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
                     }
 
                     match Lexer::new(&session.buffer).tokenize() {
-                        Ok(toks) => match Parser::new(toks).parse_program() {
+                        Ok(toks) => match Parser::new(session.shell.expand_aliases(toks)).parse_program() {
                             Ok(prog) => {
                                 // Snapshotted before recording (not just
                                 // before running) so record() can tag this
@@ -12548,7 +12553,7 @@ fn run_command_mode(
                 }
 
                 match Lexer::new(&buffer).tokenize() {
-                    Ok(toks) => match Parser::new(toks).parse_program() {
+                    Ok(toks) => match Parser::new(sessions.get(&session_id).map(|s| s.shell.expand_aliases(toks.clone())).unwrap_or(toks)).parse_program() {
                         Ok(prog) => {
                             if let Some(msg) = command_mode_violation(&prog) {
                                 show_command_mode_error(&format!("bish: {}", msg), *term_rows, *term_cols);

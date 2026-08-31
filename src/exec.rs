@@ -848,20 +848,23 @@ pub struct Shell {
     // array is read or written.
     assoc_arrays: HashMap<String, OrderedMap>,
     assoc_names: std::collections::HashSet<String>,
-    // `alias name=value`: stored and queryable (alias/unalias both work as
-    // a plain table), but NOT expanded when a command runs. Real alias
-    // expansion happens at parse time on an already-known table, textually
-    // substituting a command-position word before the rest of that line is
-    // even tokenized -- fundamentally at odds with this shell parsing an
-    // entire script upfront before executing anything (a script-mode
-    // architecture, unlike bash's line-at-a-time interactive parsing). It's
-    // also off by default in bash for non-interactive shells (needs
-    // `shopt -s expand_aliases`), so a script that never touches that
-    // option -- the overwhelming majority -- already sees this exact
-    // behavior from real bash too. Storing without expanding keeps a
-    // defensive `alias foo=... ` preamble from failing the script outright
-    // under `set -e`, without risking a half-correct expansion that only
-    // works for some control-flow shapes.
+    // `alias name=value`, expanded for real -- see
+    // `lexer::expand_aliases`.
+    //
+    // This used to be stored and never expanded, on the reasoning that
+    // bash substitutes aliases *textually* before a line is tokenized,
+    // which is at odds with a shell that tokenizes and parses a whole
+    // script up front. The token stream turned out to be the seam: a
+    // command-position word is replaced by the *tokens* of its value
+    // before the parser sees either, so an alias whose value is a whole
+    // pipeline is a pipeline rather than a command with `|` as an
+    // argument. That was the half-correct expansion worth avoiding, and
+    // it is avoided by not doing it at the word level.
+    //
+    // Gated on `shopt -s expand_aliases`, which is bash's own gate and
+    // is off for a non-interactive shell -- so a script that never
+    // touches it still sees exactly what real bash gives it. repl.rs
+    // turns it on for an interactive session, which is also bash.
     // Vec, not a map -- bash's own `alias` listing (and real bash's own
     // internal table) is in definition order, not sorted, and this list is
     // never large enough for linear lookup to matter.
@@ -2913,6 +2916,28 @@ impl Shell {
     // cased to always report "on" regardless of either, since bish's
     // extglob support is unconditional (see glob.rs) rather than actually
     // gated by this flag.
+    /// Substitutes this shell's aliases into a tokenized line, when
+    /// `shopt -s expand_aliases` says to.
+    ///
+    /// Public so every place that turns text into a `Program` can go
+    /// through it -- there are several (`eval`, `source`, a script,
+    /// the interactive prompt, command mode) and an alias that worked
+    /// in one and not the others would be worse than none at all.
+    /// Turns a shopt on from Rust, for a default a *mode* implies rather
+    /// than a user does -- `expand_aliases` for an interactive shell,
+    /// which is bash's own rule and not something anyone should have to
+    /// write in a config file.
+    pub fn enable_shopt(&mut self, name: &str) {
+        self.shopt_options.insert(name.to_string(), true);
+    }
+
+    pub fn expand_aliases(&self, toks: Vec<(crate::lexer::Tok, usize)>) -> Vec<(crate::lexer::Tok, usize)> {
+        if !self.shopt_is_on("expand_aliases") || self.aliases.is_empty() {
+            return toks;
+        }
+        crate::lexer::expand_aliases(toks, &|name| self.aliases.iter().find(|(n, _)| n == name).map(|(_, v)| v.clone()))
+    }
+
     fn shopt_is_on(&self, name: &str) -> bool {
         if name == "extglob" {
             return true;
@@ -5285,7 +5310,7 @@ impl Shell {
     // config.bash, not a subprocess.
     pub(crate) fn run_source_here(&mut self, src: &str, label: &str) -> ExecResult {
         match crate::lexer::Lexer::new(src).tokenize() {
-            Ok(toks) => match crate::parser::Parser::new(toks).parse_program() {
+            Ok(toks) => match crate::parser::Parser::new(self.expand_aliases(toks)).parse_program() {
                 Ok(prog) => self.run_program(&prog),
                 Err(e) => {
                     sh_eprintln!(self, "bish: {}: syntax error: {}", label, e);

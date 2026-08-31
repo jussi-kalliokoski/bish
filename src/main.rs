@@ -171,7 +171,7 @@ fn load_config(shell: &mut exec::Shell) {
 
 fn run_source(shell: &mut exec::Shell, src: &str) -> i32 {
     match lexer::Lexer::new(src).tokenize() {
-        Ok(toks) => match parser::Parser::new(toks).parse_program() {
+        Ok(toks) => match parser::Parser::new(shell.expand_aliases(toks)).parse_program() {
             Ok(prog) => {
                 if let exec::ExecResult::Exit(code) = shell.run_program(&prog) {
                     // The exit trap already ran at whichever site produced
