@@ -11524,6 +11524,25 @@ fn run_command_mode(
                     // `None` -- not even a recognized attempt -- for
                     // anything else (`w`, `diag`, ...), letting this
                     // fall through to the ordinary dispatch unchanged.
+                    if let Some(parsed) = parse_global_command(&trimmed) {
+                        match parsed.and_then(|cmd| run_global(tb, &cmd)) {
+                            Ok(lines) => {
+                                let output = format!("{lines} line{}", if lines == 1 { "" } else { "s" });
+                                sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry {
+                                    command: trimmed,
+                                    output: output.clone(),
+                                    status: 0,
+                                });
+                                return CommandModeOutcome::Ran { output, status: 0 };
+                            }
+                            Err(e) => {
+                                show_command_mode_error(&format!("bish: {e}"), *term_rows, *term_cols);
+                                buffer.clear();
+                                continue;
+                            }
+                        }
+                    }
+
                     if let Some(parsed) = parse_substitute_command(&trimmed) {
                         match parsed.and_then(|cmd| run_substitute(tb, &cmd)) {
                             Ok((subs, lines)) => {
@@ -12886,6 +12905,156 @@ fn substitute_line(text: &str, re: &crate::regex::Regex, replacement: &str, glob
 // (`+= 1 + however many extra lines this one's own substitution added`)
 // so a growing range is still walked correctly to its (also shifting)
 // end.
+// `:[range]g/pattern/cmd` and its inverse `:g!` (`:v`) -- run `cmd` on
+// every line that matches, or on every line that does not.
+//
+// The operation people reach for when a substitution is not enough:
+// `:g/TODO/d`, `:g!/^$/d`, `:g/^fn /s/pub //`. Over the same hand-rolled
+// ERE engine `:s` already uses, and honouring the same `ignorecase`.
+struct GlobalCmd {
+    from: LineRef,
+    to: LineRef,
+    pattern: String,
+    invert: bool,
+    command: String,
+}
+
+// `g`/`g!`/`v`, a delimiter, the pattern, the same delimiter, then the
+// command. `None` for anything that is not an attempt at one at all, so
+// an unrecognised `:gitfoo` still falls through to ordinary dispatch --
+// the same contract `parse_substitute_command` follows.
+fn parse_global_command(trimmed: &str) -> Option<Result<GlobalCmd, String>> {
+    let chars: Vec<char> = trimmed.chars().collect();
+    let mut i = 0;
+    // Default range is the *whole file*, not the current line -- `:g`'s
+    // own default in vim, and the opposite of `:s`'s.
+    let (from, to) = parse_range_prefix(&chars, &mut i).unwrap_or((LineRef::Number(1), LineRef::Last));
+
+    let invert = match chars.get(i) {
+        // `:g!` is parsed here and does not currently *reach* here from
+        // the colon line: bang-history expansion (history::expand, run
+        // on every command-mode line before dispatch) claims the `!`
+        // first and rewrites the line. `:v` is vim's own equally
+        // standard spelling of the same thing and is unaffected, so
+        // nothing is missing -- but this arm stays, because the moment
+        // bang-history goes the collision goes with it.
+        Some('g') if chars.get(i + 1) == Some(&'!') => {
+            i += 2;
+            true
+        }
+        Some('g') => {
+            i += 1;
+            false
+        }
+        Some('v') => {
+            i += 1;
+            true
+        }
+        _ => return None,
+    };
+    // A delimiter has to follow immediately, or this is some other
+    // command that merely starts with the same letter (`gi`, `version`).
+    let delimiter = match chars.get(i) {
+        Some(c) if !c.is_alphanumeric() && !c.is_whitespace() => *c,
+        _ => return None,
+    };
+    i += 1;
+    let mut pattern = String::new();
+    while let Some(&c) = chars.get(i) {
+        i += 1;
+        if c == '\\' && chars.get(i) == Some(&delimiter) {
+            pattern.push(delimiter);
+            i += 1;
+            continue;
+        }
+        if c == delimiter {
+            let command: String = chars[i..].iter().collect();
+            let command = command.trim().to_string();
+            if pattern.is_empty() {
+                return Some(Err("g: empty pattern".to_string()));
+            }
+            if command.is_empty() {
+                return Some(Err("g: no command to run on the matching lines".to_string()));
+            }
+            return Some(Ok(GlobalCmd { from, to, pattern, invert, command }));
+        }
+        pattern.push(c);
+    }
+    Some(Err("g: unterminated pattern".to_string()))
+}
+
+// Returns how many lines the command actually ran on.
+//
+// Two passes, exactly as vim does it and for the same reason: every
+// matching line is found *first*, then the command runs on each. A
+// single pass would have the command's own edits decide which lines the
+// pattern still gets tested against -- so `:g/x/d` on consecutive
+// matches would skip every other one.
+//
+// The marked lines are then run highest-first, so a deletion earlier in
+// the file cannot shift a line that has not been reached yet.
+fn run_global(tb: &mut TextBuffer, cmd: &GlobalCmd) -> Result<usize, String> {
+    let last = tb.line_count().saturating_sub(1);
+    let current = tb.cursor().0;
+    let a = cmd.from.resolve(current, last);
+    let b = cmd.to.resolve(current, last);
+    let (start, end) = (a.min(b), a.max(b).min(last));
+    let re = crate::regex::Regex::compile(&cmd.pattern, tb.search_ignore_case(&cmd.pattern));
+
+    let marked: Vec<usize> = (start..=end)
+        .filter(|&row| {
+            let chars = tb.line_chars(row);
+            re.find_at(&chars, 0).is_some() != cmd.invert
+        })
+        .collect();
+    if marked.is_empty() {
+        return Ok(0);
+    }
+
+    // Only the commands that mean something applied line by line. `d`
+    // and a substitution cover what `:g` is actually used for; anything
+    // else is refused by name rather than silently doing nothing.
+    let body = cmd.command.trim();
+    if body == "d" || body == "delete" {
+        for &row in marked.iter().rev() {
+            if tb.line_count() == 1 {
+                // Never leave zero lines -- `delete_range`'s own
+                // Linewise branch already restores that invariant, but
+                // deleting the only line should clear it, not remove it.
+                let len = tb.line_len(0);
+                tb.delete_range(&motion::MotionRange { shape: motion::MotionShape::Exclusive, from: (0, 0), to: (0, len) });
+                continue;
+            }
+            tb.delete_range(&motion::MotionRange { shape: motion::MotionShape::Linewise, from: (row, 0), to: (row, 0) });
+        }
+        let row = marked[0].min(tb.line_count().saturating_sub(1));
+        tb.set_cursor(row, 0);
+        return Ok(marked.len());
+    }
+    if body.starts_with('s') {
+        let mut ran = 0;
+        for &row in marked.iter().rev() {
+            if row >= tb.line_count() {
+                continue;
+            }
+            // Each marked line is substituted on its own, by handing the
+            // existing `:s` machinery a one-line range -- rather than a
+            // second substitution implementation living here.
+            let Some(parsed) = parse_substitute_command(body) else {
+                return Err("g: not a command this can run (expected `d` or `s/.../.../`)".to_string());
+            };
+            let mut one = parsed?;
+            one.from = LineRef::Number(row + 1);
+            one.to = LineRef::Number(row + 1);
+            if run_substitute(tb, &one)?.0 > 0 {
+                ran += 1;
+            }
+        }
+        return Ok(ran);
+    }
+    Err(format!("g: cannot run '{body}' on each line (expected `d` or `s/.../.../`)"))
+}
+
 fn run_substitute(tb: &mut TextBuffer, cmd: &SubstituteCmd) -> Result<(usize, usize), String> {
     let last = tb.line_count().saturating_sub(1);
     let current = tb.cursor().0;
@@ -14136,6 +14305,32 @@ mod substitute_command_tests {
         let (text, count) = substitute_line("abb", &re, "-", true);
         assert_eq!(text, "-a-");
         assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn parse_global_command_reads_all_three_spellings() {
+        let ok = |s: &str| parse_global_command(s).unwrap().unwrap();
+        let g = ok("g/TODO/d");
+        assert_eq!((g.pattern.as_str(), g.invert, g.command.as_str()), ("TODO", false, "d"));
+        let g = ok("g!/TODO/d");
+        assert!(g.invert, "`g!` is the inverse");
+        let g = ok("v/TODO/d");
+        assert!(g.invert, "and `v` is the same thing");
+        // Default range is the whole file, unlike `:s`'s current line.
+        assert_eq!((g.from, g.to), (LineRef::Number(1), LineRef::Last));
+        let g = ok("2,4g/x/d");
+        assert_eq!((g.from, g.to), (LineRef::Number(2), LineRef::Number(4)));
+        // Any non-alphanumeric delimiter, like `:s`.
+        assert_eq!(ok("g#a/b#d").pattern, "a/b");
+
+        // Not an attempt at all: falls through to ordinary dispatch.
+        assert!(parse_global_command("git diff").is_none());
+        assert!(parse_global_command("gi").is_none());
+        assert!(parse_global_command("w").is_none());
+        // Recognised but malformed.
+        assert!(parse_global_command("g/unterminated").unwrap().is_err());
+        assert!(parse_global_command("g//d").unwrap().is_err());
+        assert!(parse_global_command("g/x/").unwrap().is_err());
     }
 
     #[test]
