@@ -5185,9 +5185,27 @@ impl Shell {
 
     fn run_pipeline_inner(&mut self, pipeline: &Pipeline, background: bool) -> ExecResult {
         if pipeline.commands.len() == 1 {
-            return self.run_command(&pipeline.commands[0], background);
+            let result = self.run_command(&pipeline.commands[0], background);
+            // A one-command pipeline is still a pipeline as far as
+            // `PIPESTATUS` is concerned: bash gives it a one-element
+            // array, and a script that reads `${PIPESTATUS[0]}` after a
+            // plain command expects to find `$?` there.
+            if let ExecResult::Status(code) = result {
+                self.set_pipestatus(&[code]);
+            }
+            return result;
         }
         ExecResult::Status(self.run_multi(&pipeline.commands, background))
+    }
+
+    /// Publishes `PIPESTATUS`, every stage's own exit status in order.
+    ///
+    /// The array bash gives you for `cmd | tee log` so you can still
+    /// find out whether `cmd` failed -- which is the entire reason it
+    /// exists, and the reason `$?` alone is not enough.
+    fn set_pipestatus(&mut self, codes: &[i32]) {
+        let map: std::collections::BTreeMap<usize, String> = codes.iter().enumerate().map(|(i, c)| (i, c.to_string())).collect();
+        self.arrays.insert("PIPESTATUS".to_string(), map);
     }
 
     fn run_command(&mut self, cmd: &parser::Command, background: bool) -> ExecResult {
@@ -7896,6 +7914,10 @@ impl Shell {
 
         let mut status = 0;
         let mut pipefail_status = 0;
+        // Kept, not just folded down: this is exactly what `PIPESTATUS`
+        // is, and the loop was already computing every element of it on
+        // its way to one number.
+        let mut codes: Vec<i32> = Vec::with_capacity(n);
         for mut c in children {
             let code = match c.wait() {
                 Ok(s) => exit_code_from_status(s),
@@ -7904,11 +7926,13 @@ impl Shell {
                     1
                 }
             };
+            codes.push(code);
             status = code;
             if code != 0 {
                 pipefail_status = code;
             }
         }
+        self.set_pipestatus(&codes);
         if self.opt_pipefail {
             pipefail_status
         } else {
@@ -14055,6 +14079,35 @@ mod tests {
         assert_eq!(shell.run_lsp(&strs(&["add", "--root-cmd"])), 2);
         assert_eq!(shell.run_lsp(&strs(&["add", "--root-cmd", "   ", "x"])), 2);
         assert_eq!(shell.lsp_servers.len(), 2);
+    }
+
+    // Every expectation here was run against real bash before being
+    // asserted -- `PIPESTATUS` is the kind of thing where "what I think
+    // bash does" and "what bash does" are easy to confuse.
+    #[test]
+    fn pipestatus_reports_every_stage() {
+        let run = |script: &str| {
+            let mut shell = Shell::new();
+            let out = capture_output(&mut shell);
+            shell.run_source_here(script, "<test>");
+            out.borrow().clone()
+        };
+        assert_eq!(run(r#"true | false; echo "${PIPESTATUS[0]} ${PIPESTATUS[1]}""#), "0 1\n");
+        assert_eq!(run(r#"false | true; echo "${PIPESTATUS[0]} ${PIPESTATUS[1]}""#), "1 0\n");
+        // Real external stages, not `exit N`: a builtin in a pipeline
+        // stage self-execs, and under `cargo test` that resolves to the
+        // test harness rather than to bish (the `current_exe` trap this
+        // codebase documents elsewhere). Verified by hand against the
+        // real binary, where `exit 3 | exit 4 | exit 5` also gives
+        // `3 4 5`.
+        assert_eq!(run(r#"sh -c 'exit 3' | sh -c 'exit 4' | sh -c 'exit 5'; echo "${PIPESTATUS[@]}""#), "3 4 5\n");
+        // A plain command is a one-element pipeline, which is what a
+        // script reading `${PIPESTATUS[0]}` after one expects.
+        assert_eq!(run(r#"false; echo "${PIPESTATUS[0]}""#), "1\n");
+        assert_eq!(run(r#"true; echo "${#PIPESTATUS[@]}""#), "1\n");
+        // The whole reason it exists: `$?` is the *last* stage, so a
+        // failure anywhere earlier is invisible without this.
+        assert_eq!(run(r#"false | true; echo "$? ${PIPESTATUS[0]}""#), "0 1\n");
     }
 
     // `nocasematch` has been in the shopt registry since that registry
