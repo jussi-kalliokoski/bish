@@ -575,6 +575,52 @@ fn location(value: &Value) -> Option<Location> {
 }
 
 // ---------------------------------------------------------------------
+// Edits
+// ---------------------------------------------------------------------
+
+/// One replacement a server wants made: put `text` where `start..end`
+/// currently is. Positions are the server's own, as everywhere else
+/// here.
+///
+/// This is LSP's `TextEdit`, and it is what `textDocument/formatting`,
+/// `rename` and a code action's `WorkspaceEdit` are all made of --
+/// which is why it is its own type rather than something formatting
+/// owns. `lint::Fix` cannot stand in: it is deliberately a *single*
+/// range (see its own doc comment), and these arrive in batches that
+/// have to be applied together.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TextEdit {
+    pub start: (usize, usize),
+    pub end: (usize, usize),
+    pub text: String,
+}
+
+/// Reads a `TextEdit[]` -- what `textDocument/formatting` answers with,
+/// and what each file's entry in a `WorkspaceEdit` holds. `null` (the
+/// server had nothing to change) reads as an empty list, which is a
+/// real answer and not a failure.
+pub fn text_edits(result: &Value) -> Vec<TextEdit> {
+    let Value::Array(items) = result else { return Vec::new() };
+    items.iter().filter_map(text_edit).collect()
+}
+
+fn text_edit(value: &Value) -> Option<TextEdit> {
+    let range = json::query(value, ".range").ok()?;
+    let start = position(json::query(range, ".start").ok()?)?;
+    let end = position(json::query(range, ".end").ok()?)?;
+    // A backwards range would delete nothing and insert in the wrong
+    // place; read it as empty at the start, as a diagnostic's is.
+    let end = if end < start { start } else { end };
+    let Ok(Value::Str(text)) = json::query(value, ".newText") else { return None };
+    // Deliberately *not* sanitized. Unlike a message or a hover, this
+    // is text going into the buffer, where a tab or a newline is
+    // meaningful and stripping control characters would silently
+    // corrupt what the server asked for. A formatter's whole output is
+    // whitespace decisions.
+    Some(TextEdit { start, end, text: text.clone() })
+}
+
+// ---------------------------------------------------------------------
 // Completion
 // ---------------------------------------------------------------------
 
@@ -1314,6 +1360,30 @@ mod tests {
         // name for, not a reason to drop the symbol.
         let odd = json::parse(r#"[{"name":"x","kind":99,"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":1}}}]"#).unwrap();
         assert_eq!(symbols(&odd, "file:///a")[0].kind, "");
+    }
+
+    #[test]
+    fn a_text_edit_list_is_read_with_its_text_left_exactly_as_sent() {
+        let edits = json::parse(
+            r#"[{"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":4}},"newText":"\tif x {\n"},
+                {"range":{"start":{"line":9,"character":2},"end":{"line":9,"character":2}},"newText":""}]"#,
+        )
+        .unwrap();
+        let found = text_edits(&edits);
+        assert_eq!(found.len(), 2);
+        // A formatter's output *is* whitespace decisions, so tabs and
+        // newlines must survive -- this is the one place server text is
+        // not sanitized.
+        assert_eq!(found[0].text, "\tif x {\n");
+        assert_eq!((found[0].start, found[0].end), ((0, 0), (0, 4)));
+        // An empty replacement over an empty range is a legal no-op and
+        // still parses.
+        assert_eq!(found[1].text, "");
+
+        assert!(text_edits(&Value::Null).is_empty(), "a server with nothing to change");
+        // One malformed entry does not cost the rest.
+        let mixed = json::parse(r#"[{"newText":"no range"},{"range":{"start":{"line":1,"character":0},"end":{"line":1,"character":1}},"newText":"x"}]"#).unwrap();
+        assert_eq!(text_edits(&mixed).len(), 1);
     }
 
     fn hover(json_text: &str) -> Option<Vec<String>> {

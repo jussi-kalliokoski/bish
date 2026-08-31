@@ -57,7 +57,7 @@ while :; do
 	id=$(printf '%s' "$body" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
 	case "$body" in
 	*'"method":"initialize"'*)
-		send '{"jsonrpc":"2.0","id":'"$id"',"result":{"capabilities":{"positionEncoding":"utf-32","hoverProvider":true,"definitionProvider":true,"referencesProvider":true,"documentSymbolProvider":true,"completionProvider":{"triggerCharacters":["."]},"textDocumentSync":{"openClose":true,"change":1,"save":true}}}}'
+		send '{"jsonrpc":"2.0","id":'"$id"',"result":{"capabilities":{"positionEncoding":"utf-32","hoverProvider":true,"definitionProvider":true,"referencesProvider":true,"documentSymbolProvider":true,"completionProvider":{"triggerCharacters":["."]},"documentFormattingProvider":true,"textDocumentSync":{"openClose":true,"change":1,"save":true}}}}'
 		;;
 	*'"method":"textDocument/didOpen"'*)
 		# Remembered so `textDocument/definition` can answer about
@@ -75,6 +75,14 @@ while :; do
 		 {"uri":"'"$target"'","range":{"start":{"line":1,"character":0},"end":{"line":1,"character":5}}},
 		 {"uri":"'"$uri"'","range":{"start":{"line":2,"character":0},"end":{"line":2,"character":5}}},
 		 {"uri":"'"$uri"'","range":{"start":{"line":0,"character":0},"end":{"line":0,"character":5}}}]}'
+		;;
+	*'"method":"textDocument/formatting"'*)
+		# Two edits, given ascending as a server sends them, on
+		# different lines -- so applying them in the wrong order
+		# would visibly corrupt the result.
+		send '{"jsonrpc":"2.0","id":'"$id"',"result":[
+		 {"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":5}},"newText":"FIRST"},
+		 {"range":{"start":{"line":2,"character":0},"end":{"line":2,"character":7}},"newText":"THIRD"}]}'
 		;;
 	*'"method":"textDocument/completion"'*)
 		# A mix on purpose: a plain label, one whose insertText

@@ -2896,6 +2896,67 @@ pub(crate) fn diagnostic_offset(buf: &TextBuffer, starts: &[usize], line: usize,
     starts[line] + lsp::from_server_column(&chars, character, encoding)
 }
 
+// Applies a batch of `lsp::TextEdit`s to a buffer, returning how many
+// actually changed anything.
+//
+// **Applied last-first.** LSP says a batch's ranges never overlap and
+// must be applied as though simultaneously, which for a buffer that
+// edits in place means starting from the end: an earlier edit that
+// shifted everything after it would invalidate every later range.
+// Exactly the rule `tool.rs`'s own `apply_fixes` already follows for a
+// batch of `lint::Fix`es, one coordinate system over.
+//
+// Multi-line edits are the norm here, not the exception -- a formatter
+// rewriting a block sends one edit spanning it -- so this splices with
+// `delete_range` + `insert_text` rather than the single-line
+// `replace_in_line` that completion's accept can get away with.
+pub(crate) fn apply_text_edits(buf: &mut TextBuffer, edits: &[lsp::TextEdit], encoding: lsp::PositionEncoding) -> usize {
+    // One edit with its ends already in this buffer's coordinates.
+    struct Resolved<'a> {
+        from: (usize, usize),
+        to: (usize, usize),
+        text: &'a str,
+    }
+    let starts = line_starts(buf);
+    // Resolved against the *current* text before anything moves, which
+    // is the whole reason the order below matters.
+    let mut resolved: Vec<Resolved<'_>> = edits
+        .iter()
+        .map(|edit| {
+            let from = position_of(buf, &starts, edit.start, encoding);
+            let to = position_of(buf, &starts, edit.end, encoding);
+            Resolved { from, to: to.max(from), text: edit.text.as_str() }
+        })
+        .collect();
+    resolved.sort_by_key(|edit| std::cmp::Reverse(edit.from));
+    let mut applied = 0;
+    for Resolved { from, to, text } in resolved {
+        let unchanged = from == to && text.is_empty();
+        if unchanged {
+            continue;
+        }
+        if from != to {
+            buf.delete_range(&crate::bishedit::motion::MotionRange {
+                shape: crate::bishedit::motion::MotionShape::Exclusive,
+                from,
+                to,
+            });
+        }
+        if !text.is_empty() {
+            buf.insert_text(from, text);
+        }
+        applied += 1;
+    }
+    applied
+}
+
+// A server position as this buffer's own `(row, col)`, clamped -- see
+// `diagnostic_offset`, which this is the two-dimensional face of.
+fn position_of(buf: &TextBuffer, starts: &[usize], position: (usize, usize), encoding: lsp::PositionEncoding) -> (usize, usize) {
+    let offset = diagnostic_offset(buf, starts, position.0, position.1, encoding);
+    diagnostic_position(buf, offset)
+}
+
 // A server's findings as diagnostics this editor can draw. The one
 // place LSP's model and `lint::Diagnostic` meet -- which is here, and
 // not in lsp.rs, because only something holding the actual text can
@@ -4644,6 +4705,50 @@ mod diagnose_tests {
         assert!(!buf.diagnostics.is_empty());
         buf.insert_text((0, 0), "x");
         assert!(buf.diagnostics.is_empty());
+    }
+
+    // The rule the whole batch turns on: applied last-first, because an
+    // earlier edit that shifted the text would invalidate every later
+    // range.
+    #[test]
+    fn a_batch_of_edits_applies_without_invalidating_its_own_ranges() {
+        let mut buf = TextBuffer::new_unnamed(10);
+        buf.insert_text((0, 0), "one two three");
+        // Given in *ascending* order, as a server sends them.
+        let edits = vec![
+            lsp::TextEdit { start: (0, 0), end: (0, 3), text: "ONE".to_string() },
+            lsp::TextEdit { start: (0, 4), end: (0, 7), text: "TWO!!".to_string() },
+            lsp::TextEdit { start: (0, 8), end: (0, 13), text: "3".to_string() },
+        ];
+        assert_eq!(apply_text_edits(&mut buf, &edits, lsp::PositionEncoding::Utf32), 3);
+        assert_eq!(buffer_text(&buf), "ONE TWO!! 3");
+    }
+
+    #[test]
+    fn an_edit_may_span_lines_and_may_insert_them() {
+        let mut buf = TextBuffer::new_unnamed(10);
+        buf.insert_text((0, 0), "a\nb\nc");
+        // Replace from mid-line 0 through mid-line 2 with two lines --
+        // the shape a formatter rewriting a block sends.
+        let edits = vec![lsp::TextEdit { start: (0, 1), end: (2, 1), text: "X\nY".to_string() }];
+        assert_eq!(apply_text_edits(&mut buf, &edits, lsp::PositionEncoding::Utf32), 1);
+        assert_eq!(buffer_text(&buf), "aX\nY");
+    }
+
+    #[test]
+    fn a_pure_insertion_and_a_pure_deletion_both_work() {
+        let mut buf = TextBuffer::new_unnamed(10);
+        buf.insert_text((0, 0), "ac");
+        // Empty range, non-empty text: an insertion.
+        assert_eq!(apply_text_edits(&mut buf, &[lsp::TextEdit { start: (0, 1), end: (0, 1), text: "b".to_string() }], lsp::PositionEncoding::Utf32), 1);
+        assert_eq!(buffer_text(&buf), "abc");
+        // Non-empty range, empty text: a deletion.
+        assert_eq!(apply_text_edits(&mut buf, &[lsp::TextEdit { start: (0, 1), end: (0, 2), text: String::new() }], lsp::PositionEncoding::Utf32), 1);
+        assert_eq!(buffer_text(&buf), "ac");
+        // Empty range, empty text: nothing, and counted as nothing, so
+        // a formatter that changed nothing can say so.
+        assert_eq!(apply_text_edits(&mut buf, &[lsp::TextEdit { start: (0, 1), end: (0, 1), text: String::new() }], lsp::PositionEncoding::Utf32), 0);
+        assert_eq!(buffer_text(&buf), "ac");
     }
 
     #[test]

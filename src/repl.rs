@@ -8842,6 +8842,54 @@ impl fileeditor::InsertServices for EditorServices<'_> {
     }
 }
 
+// `:fmt` through the language server. `None` when there is nothing to
+// ask -- no server, no `documentFormattingProvider`, no answer -- which
+// is the caller's cue to fall back to bish's own formatter, so a bash
+// file with no server behaves exactly as it always has.
+//
+// `Some(n)` is how many edits actually changed something, so a server
+// that reports "already formatted" (an empty list, or edits that are
+// all no-ops) is distinguishable from one that reformatted.
+#[allow(clippy::too_many_arguments)]
+fn format_via_server(
+    sessions: &mut HashMap<SessionId, SessionState>,
+    windows: &mut [WindowEntry],
+    job_frames: &mut HashMap<JobFrameId, exec::FgJob>,
+    session_id: SessionId,
+    current_window: usize,
+    term_rows: &mut usize,
+    term_cols: &mut usize,
+    sinks_are_grid: bool,
+    buf: &mut TextBuffer,
+) -> Option<usize> {
+    let encoding = server_encoding_for(sessions, session_id, buf)?;
+    // The buffer's own indent settings, which is what the file already
+    // agrees with -- editorconfig and `bishopt` both feed these, so a
+    // server is told the same thing `>>` and Tab already obey rather
+    // than whatever its own default happens to be.
+    let options = crate::json::Value::Object(vec![
+        ("tabSize".to_string(), crate::json::Value::Number(buf.shiftwidth as f64)),
+        ("insertSpaces".to_string(), crate::json::Value::Bool(buf.expandtab)),
+        ("trimTrailingWhitespace".to_string(), crate::json::Value::Bool(buf.trim_trailing_whitespace)),
+        ("insertFinalNewline".to_string(), crate::json::Value::Bool(buf.final_newline)),
+    ]);
+    let result = ask_server(
+        sessions,
+        windows,
+        job_frames,
+        session_id,
+        current_window,
+        term_rows,
+        term_cols,
+        sinks_are_grid,
+        buf,
+        "textDocument/formatting",
+        "documentFormattingProvider",
+        vec![("options".to_string(), options)],
+    )?;
+    Some(fileeditor::apply_text_edits(buf, &crate::lsp::text_edits(&result), encoding))
+}
+
 // What could go where the cursor is, for the editor's completion
 // popup. Empty for every ordinary reason there is nothing to offer --
 // no server, not ready, no `completionProvider`, no answer in time --
@@ -8953,6 +9001,41 @@ fn ask_server_at_cursor(
     // malformed request rather than a sparse one.
     extra: &[(&str, crate::json::Value)],
 ) -> Option<crate::json::Value> {
+    let chars = buf.line_chars(row);
+    let encoding = server_encoding_for(sessions, session_id, buf).unwrap_or(crate::lsp::PositionEncoding::Utf16);
+    let character = crate::lsp::to_server_column(&chars, col, encoding);
+    let mut params = vec![(
+        "position".to_string(),
+        crate::json::Value::Object(vec![
+            ("line".to_string(), crate::json::Value::Number(row as f64)),
+            ("character".to_string(), crate::json::Value::Number(character as f64)),
+        ]),
+    )];
+    params.extend(extra.iter().map(|(k, v)| ((*k).to_string(), v.clone())));
+    ask_server(sessions, windows, job_frames, session_id, current_window, term_rows, term_cols, sinks_are_grid, buf, method, capability, params)
+}
+
+// The general form: one request about this buffer, with whatever params
+// the method takes, waited for the same bounded, servicing way.
+//
+// `textDocument` is added here rather than by every caller, since every
+// method that is about a document needs it and none of them want to
+// build the uri themselves.
+#[allow(clippy::too_many_arguments)]
+fn ask_server(
+    sessions: &mut HashMap<SessionId, SessionState>,
+    windows: &mut [WindowEntry],
+    job_frames: &mut HashMap<JobFrameId, exec::FgJob>,
+    session_id: SessionId,
+    current_window: usize,
+    term_rows: &mut usize,
+    term_cols: &mut usize,
+    sinks_are_grid: bool,
+    buf: &TextBuffer,
+    method: &str,
+    capability: &str,
+    mut params: Vec<(String, crate::json::Value)>,
+) -> Option<crate::json::Value> {
     let session = sessions.get(&session_id)?;
     let target = server_target(&session.shell, buf)?;
     let timeout = std::time::Duration::from_millis(session.shell.bishopt_int("lsp_timeout_ms").max(0) as u64);
@@ -8966,23 +9049,14 @@ fn ask_server_at_cursor(
         if !server.is_ready() || !server.provides(capability) {
             return None;
         }
-        let chars = buf.line_chars(row);
-        let character = crate::lsp::to_server_column(&chars, col, server.encoding());
-        let mut params = vec![
+        params.insert(
+            0,
             (
                 "textDocument".to_string(),
                 crate::json::Value::Object(vec![("uri".to_string(), crate::json::Value::Str(target.uri.clone()))]),
             ),
-            (
-                "position".to_string(),
-                crate::json::Value::Object(vec![
-                    ("line".to_string(), crate::json::Value::Number(row as f64)),
-                    ("character".to_string(), crate::json::Value::Number(character as f64)),
-                ]),
-            ),
-        ];
-        params.extend(extra.iter().map(|(k, v)| ((*k).to_string(), v.clone())));
-        server.request(method, crate::json::Value::Object(params))
+        );
+        server.request(method, crate::json::Value::Object(std::mem::take(&mut params)))
     };
 
     let deadline = std::time::Instant::now() + timeout;
@@ -10586,7 +10660,27 @@ fn run_command_mode(
                         // state this leaves behind to clear, just an
                         // ordinary buffer edit `u` already undoes.
                         "format" | "fmt" if arg.is_none() => {
-                            let (output, status) = match fileeditor::format_buffer(tb) {
+                            // The server first when there is one: it
+                            // knows the actual language, where
+                            // `format_buffer` knows bash. Everything
+                            // about the fallback is unchanged.
+                            let served = format_via_server(
+                                sessions,
+                                windows,
+                                job_frames,
+                                session_id,
+                                current_window,
+                                term_rows,
+                                term_cols,
+                                sinks_are_grid,
+                                tb,
+                            );
+                            let outcome = match served {
+                                Some(0) => fileeditor::FormatOutcome::AlreadyFormatted,
+                                Some(_) => fileeditor::FormatOutcome::Formatted,
+                                None => fileeditor::format_buffer(tb),
+                            };
+                            let (output, status) = match outcome {
                                 fileeditor::FormatOutcome::Formatted => ("Reformatted.".to_string(), 0),
                                 fileeditor::FormatOutcome::AlreadyFormatted => ("Already formatted.".to_string(), 0),
                                 fileeditor::FormatOutcome::NotSupported => {

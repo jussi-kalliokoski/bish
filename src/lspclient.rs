@@ -335,6 +335,10 @@ impl Server {
                             ]),
                         ),
                         (
+                            "formatting".to_string(),
+                            Value::Object(vec![("dynamicRegistration".to_string(), Value::Bool(false))]),
+                        ),
+                        (
                             "documentSymbol".to_string(),
                             Value::Object(vec![
                                 ("dynamicRegistration".to_string(), Value::Bool(false)),
