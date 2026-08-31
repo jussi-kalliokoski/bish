@@ -1073,6 +1073,36 @@ pub struct Shell {
     // it's run directly wherever the shell is about to terminate rather
     // than through the sigaction/PENDING_SIGNALS machinery.
     exit_trap: Option<String>,
+    // The other three pseudo-signals `trap` takes. Not signals at all --
+    // the interpreter fires them itself, at three places it already
+    // passes through: before each simple command, after a command fails
+    // under the rules `errexit` already uses, and on a function's
+    // return.
+    //
+    // Separate fields rather than entries in `traps` for the reason
+    // `exit_trap` is: `traps` is keyed by a real signal number, and
+    // these have none.
+    debug_trap: Option<String>,
+    err_trap: Option<String>,
+    return_trap: Option<String>,
+    // Whether a trap's own body is running. A DEBUG trap whose body is a
+    // command would otherwise fire DEBUG again, forever; bash guards the
+    // same way.
+    in_trap: bool,
+    // `set -T` / `set -o functrace` covers DEBUG and RETURN; `set -E` /
+    // `set -o errtrace` covers ERR. Two options and not one, because
+    // bash makes them two -- inheriting DEBUG into every function is a
+    // very different appetite from wanting an error handler to still
+    // fire inside one.
+    //
+    // Without them, none of the three is inherited by a shell function,
+    // which is why a trap set at the top level fires once for a failing
+    // function call rather than once inside and once outside.
+    opt_functrace: bool,
+    opt_errtrace: bool,
+    // How many shell functions deep we are, which is the question
+    // `functrace` is really about.
+    function_depth: usize,
     // `coproc`'s pipe halves that the *shell* keeps (the coprocess's own
     // ends are handed to the child and closed here after spawn). Kept
     // alive here, keyed by raw fd number, for as long as the coprocess
@@ -1333,6 +1363,13 @@ impl Shell {
             jobs: Rc::new(RefCell::new(JobTable::new())),
             traps: std::collections::HashMap::new(),
             exit_trap: None,
+            debug_trap: None,
+            err_trap: None,
+            return_trap: None,
+            in_trap: false,
+            opt_functrace: false,
+            opt_errtrace: false,
+            function_depth: 0,
             coproc_fds: std::collections::HashMap::new(),
             opt_errexit: false,
             opt_nounset: false,
@@ -1600,6 +1637,13 @@ impl Shell {
             jobs: self.jobs.clone(),
             traps: self.traps.clone(),
             exit_trap: self.exit_trap.clone(),
+            debug_trap: self.debug_trap.clone(),
+            err_trap: self.err_trap.clone(),
+            return_trap: self.return_trap.clone(),
+            in_trap: self.in_trap,
+            opt_functrace: self.opt_functrace,
+            opt_errtrace: self.opt_errtrace,
+            function_depth: 0,
             coproc_fds: std::collections::HashMap::new(),
             opt_errexit: self.opt_errexit,
             opt_nounset: self.opt_nounset,
@@ -1652,6 +1696,44 @@ impl Shell {
         if let Some(cmd) = self.exit_trap.take() {
             self.run_source_here(&cmd, "trap");
         }
+    }
+
+    /// Runs one of the pseudo-signal traps, if it is set.
+    ///
+    /// `$?` is borrowed and given back around it, exactly as
+    /// `run_hooks_for` does: the trap did not run because the user typed
+    /// it, and a DEBUG trap that quietly changed the status of the
+    /// command it fired before would be worse than no trap at all.
+    ///
+    /// Re-entry is refused rather than counted: a trap's body is
+    /// commands, and those would fire the same trap again.
+    fn run_pseudo_trap(&mut self, which: PseudoTrap) {
+        if self.in_trap {
+            return;
+        }
+        // Not inherited by a shell function unless the matching option
+        // says so -- bash's own rule, and the reason a trap set at the
+        // top level fires once for a failing function call rather than
+        // once inside and once outside.
+        let inherited = match which {
+            PseudoTrap::Err => self.opt_errtrace,
+            PseudoTrap::Debug | PseudoTrap::Return => self.opt_functrace,
+        };
+        if self.function_depth > 0 && !inherited {
+            return;
+        }
+        let Some(cmd) = (match which {
+            PseudoTrap::Debug => self.debug_trap.clone(),
+            PseudoTrap::Err => self.err_trap.clone(),
+            PseudoTrap::Return => self.return_trap.clone(),
+        }) else {
+            return;
+        };
+        let saved = self.last_status;
+        self.in_trap = true;
+        self.run_source_here(&cmd, "trap");
+        self.in_trap = false;
+        self.last_status = saved;
     }
 
     // Real bash enables job control (`-m`/monitor) by default for an
@@ -5035,6 +5117,8 @@ impl Shell {
     fn apply_shell_flag(&mut self, c: char, on: bool) {
         match c {
             'e' => self.opt_errexit = on,
+            'T' => self.opt_functrace = on,
+            'E' => self.opt_errtrace = on,
             'u' => self.opt_nounset = on,
             'x' => self.opt_xtrace = on,
             'f' => self.opt_noglob = on,
@@ -5056,6 +5140,8 @@ impl Shell {
         match name {
             "pipefail" => self.opt_pipefail = on,
             "errexit" => self.opt_errexit = on,
+            "functrace" => self.opt_functrace = on,
+            "errtrace" => self.opt_errtrace = on,
             "nounset" => self.opt_nounset = on,
             "xtrace" => self.opt_xtrace = on,
             "noglob" => self.opt_noglob = on,
@@ -5136,6 +5222,16 @@ impl Shell {
             // per ListItem here (the *overall* and-or result) rather than
             // per-pipeline also naturally exempts non-last commands in a
             // &&/|| chain, since only the chain's final status reaches here.
+            // ERR fires under exactly `errexit`'s own rules -- not in a
+            // condition, not behind `!`, not for a non-final command of
+            // a `&&`/`||` chain -- because that is what bash means by
+            // it, and this is already the one place those rules are
+            // decided. It fires whether or not `errexit` is *on*, which
+            // is the point: a script traps ERR precisely so it does not
+            // have to exit.
+            if self.suppress_errexit == 0 && result.status() != 0 {
+                self.run_pseudo_trap(PseudoTrap::Err);
+            }
             if self.opt_errexit && self.suppress_errexit == 0 && result.status() != 0 {
                 self.run_exit_trap();
                 return ExecResult::Exit(result.status());
@@ -5882,6 +5978,7 @@ impl Shell {
 
     fn call_function(&mut self, body: &parser::Command, call_args: Vec<String>) -> ExecResult {
         self.arg_frames.push(call_args);
+        self.function_depth += 1;
         self.var_scopes.push(HashMap::new());
         self.array_local_stack.push(Vec::new());
         self.assoc_local_stack.push(Vec::new());
@@ -5921,6 +6018,14 @@ impl Shell {
             }
         }
         self.arg_frames.pop();
+        self.function_depth -= 1;
+        // RETURN, after the frame is gone so the trap runs in the
+        // caller's scope. Only under `functrace`, per the rule above --
+        // a plain `trap ... RETURN` at the top level is about *sourced
+        // scripts*, which fire it below regardless.
+        if self.opt_functrace {
+            self.run_pseudo_trap(PseudoTrap::Return);
+        }
         match result {
             ExecResult::Return(code) => ExecResult::Status(code),
             other => other,
@@ -6377,6 +6482,9 @@ impl Shell {
     }
 
     fn run_single(&mut self, cmd: &SimpleCommand, background: bool) -> ExecResult {
+        // DEBUG, before the command rather than after: the whole use of
+        // it is to see what is about to run.
+        self.run_pseudo_trap(PseudoTrap::Debug);
         if cmd.words.is_empty() {
             for (name, mode, val) in &cmd.assigns {
                 let v = self.expand_word(val);
@@ -7251,7 +7359,15 @@ impl Shell {
                     return ExecResult::Status(1);
                 }
                 match std::fs::read_to_string(&path) {
-                    Ok(src) => return self.run_source_here(&src, &path),
+                    Ok(src) => {
+                        let result = self.run_source_here(&src, &path);
+                        // A sourced script fires RETURN when it
+                        // finishes, `functrace` or not -- unlike a
+                        // function, and unlike `eval`, which is why this
+                        // is here rather than inside `run_source_here`.
+                        self.run_pseudo_trap(PseudoTrap::Return);
+                        return result;
+                    }
                     Err(e) => {
                         sh_eprintln!(self, "bish: {}: {}", path, e);
                         return ExecResult::Status(1);
@@ -7283,6 +7399,18 @@ impl Shell {
                 for sig in &argv[2..] {
                     if sig == "EXIT" || sig == "0" {
                         self.exit_trap = if cmd_str == "-" { None } else { Some(cmd_str.clone()) };
+                        continue;
+                    }
+                    // The pseudo-signals: not signals, fired by the
+                    // interpreter itself. `-` clears one, same as for a
+                    // real signal.
+                    if let Some(slot) = match sig.as_str() {
+                        "DEBUG" => Some(&mut self.debug_trap),
+                        "ERR" => Some(&mut self.err_trap),
+                        "RETURN" => Some(&mut self.return_trap),
+                        _ => None,
+                    } {
+                        *slot = if cmd_str == "-" { None } else { Some(cmd_str.clone()) };
                         continue;
                     }
                     let num = match signal_number(sig) {
@@ -10191,6 +10319,15 @@ fn read_line_or_chars(reader: &mut dyn std::io::BufRead, nchars: Option<usize>, 
             Err(_) => (None, false),
         }
     }
+}
+
+/// The three `trap` targets that are not signals -- the interpreter
+/// fires each itself, at a point it already passes through.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PseudoTrap {
+    Debug,
+    Err,
+    Return,
 }
 
 #[derive(Clone)]
@@ -14079,6 +14216,46 @@ mod tests {
         assert_eq!(shell.run_lsp(&strs(&["add", "--root-cmd"])), 2);
         assert_eq!(shell.run_lsp(&strs(&["add", "--root-cmd", "   ", "x"])), 2);
         assert_eq!(shell.lsp_servers.len(), 2);
+    }
+
+    // Every expectation in this test was run against real bash first.
+    // The inheritance rules in particular are not guessable: DEBUG and
+    // RETURN ride on `functrace`, ERR on `errtrace`, and they are two
+    // different options for a reason.
+    #[test]
+    fn the_pseudo_signal_traps_fire_where_bash_fires_them() {
+        let run = |script: &str| {
+            let mut shell = Shell::new();
+            let out = capture_output(&mut shell);
+            shell.run_source_here(script, "<test>");
+            out.borrow().clone()
+        };
+        assert_eq!(run("trap 'echo DBG' DEBUG; true; true"), "DBG\nDBG\n", "before each command, not after");
+        assert_eq!(run("trap 'echo ERR' ERR; false; true"), "ERR\n");
+        assert_eq!(run("trap 'echo ERR' ERR; true"), "");
+
+        // ERR follows `errexit`'s own exemptions, because it is decided
+        // in the same place.
+        assert_eq!(run("trap 'echo E' ERR; if false; then :; fi; echo done"), "done\n");
+        assert_eq!(run("trap 'echo E' ERR; false || true; echo done"), "done\n");
+        assert_eq!(run("trap 'echo E' ERR; ! false; echo done"), "done\n");
+
+        // ...and it fires whether or not `errexit` is on, which is the
+        // point: a script traps ERR so it does not have to exit.
+        assert_eq!(run("trap 'echo E' ERR; false; echo after"), "E\nafter\n");
+
+        // Not inherited into a function without the option that says so.
+        assert_eq!(run("f(){ false; }; trap 'echo E' ERR; f; echo done"), "E\ndone\n");
+        assert_eq!(run("set -E; f(){ false; }; trap 'echo E' ERR; f; echo done"), "E\nE\ndone\n");
+        assert_eq!(run("f(){ echo in; }; trap 'echo RET' RETURN; f"), "in\n");
+        assert_eq!(run("set -T; f(){ echo in; }; trap 'echo RET' RETURN; f"), "in\nRET\n");
+
+        // `-` clears one, same as for a real signal.
+        assert_eq!(run("trap 'echo D' DEBUG; trap - DEBUG; true; true"), "D\n");
+
+        // A trap does not get to change `$?` of the command it fired
+        // around.
+        assert_eq!(run("trap 'false' DEBUG; echo hi; echo $?"), "hi\n0\n");
     }
 
     // Every expectation here was run against real bash before being
