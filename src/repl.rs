@@ -170,9 +170,137 @@ type PaneId = u32;
 // empties the pane itself closes (see apply_window_action's Close arm),
 // collapsing the split, or -- if it was the window's only pane -- falls
 // through to the existing "close the whole window" logic unchanged.
+/// One position in the jump list: which file, and where in it.
+///
+/// The path is what makes this cross-file, and is the whole reason the
+/// list cannot live where `VimKeys` keeps its own -- a `VimKeys`
+/// belongs to one `EditSession`, so a file opened by `gd` gets a fresh
+/// one and the history stops at the door.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct JumpEntry {
+    path: PathBuf,
+    row: usize,
+    col: usize,
+}
+
+/// `Ctrl-O`/`Ctrl-I`'s history, vim's semantics: a jump pushes where
+/// you were and discards the forward history, `Ctrl-O` steps back
+/// pushing where you are so `Ctrl-I` can return, and `Ctrl-I` mirrors
+/// it.
+///
+/// Lives on the `Pane` because vim's is per *window*, which is what a
+/// pane is here -- and because it has to outlive any one buffer, which
+/// is exactly what the first attempt at cross-file `gd` got wrong.
+#[derive(Debug, Default)]
+struct JumpList {
+    back: Vec<JumpEntry>,
+    forward: Vec<JumpEntry>,
+}
+
+// Vim keeps 100. Same number, same reason: a list you cannot walk out
+// of is no more useful than a short one, and each entry is a path.
+const MAX_JUMPS: usize = 100;
+
+impl JumpList {
+    /// Records where a jump is leaving from. Discards the forward
+    /// history, exactly as taking a new branch does in a browser -- and
+    /// as vim does.
+    fn push(&mut self, entry: JumpEntry) {
+        // Vim collapses a repeat of the same line rather than stacking
+        // it, which is what keeps `Ctrl-O` from needing several presses
+        // to leave one spot.
+        if self.back.last().is_some_and(|last| last.path == entry.path && last.row == entry.row) {
+            self.back.pop();
+        }
+        self.back.push(entry);
+        if self.back.len() > MAX_JUMPS {
+            self.back.remove(0);
+        }
+        self.forward.clear();
+    }
+
+    fn back(&mut self, current: JumpEntry) -> Option<JumpEntry> {
+        let target = self.back.pop()?;
+        self.forward.push(current);
+        Some(target)
+    }
+
+    fn forward(&mut self, current: JumpEntry) -> Option<JumpEntry> {
+        let target = self.forward.pop()?;
+        self.back.push(current);
+        Some(target)
+    }
+}
+
+#[cfg(test)]
+mod jump_list_tests {
+    use super::*;
+
+    fn at(path: &str, row: usize) -> JumpEntry {
+        JumpEntry { path: PathBuf::from(path), row, col: 0 }
+    }
+
+    // The property the whole feature exists for: one list spanning
+    // files, so `Ctrl-O` after a cross-file `gd` steps back over the
+    // file boundary and `Ctrl-I` steps forward over it again.
+    #[test]
+    fn back_and_forward_step_across_files_in_one_history() {
+        let mut jumps = JumpList::default();
+        jumps.push(at("a.rs", 1));
+        jumps.push(at("a.rs", 30));
+        assert_eq!(jumps.back(at("b.rs", 5)), Some(at("a.rs", 30)));
+        assert_eq!(jumps.back(at("a.rs", 30)), Some(at("a.rs", 1)));
+        assert_eq!(jumps.back(at("a.rs", 1)), None, "nothing further back");
+        // ...and forward returns along the same path.
+        assert_eq!(jumps.forward(at("a.rs", 1)), Some(at("a.rs", 30)));
+        assert_eq!(jumps.forward(at("a.rs", 30)), Some(at("b.rs", 5)));
+        assert_eq!(jumps.forward(at("b.rs", 5)), None);
+    }
+
+    #[test]
+    fn a_new_jump_discards_the_forward_history() {
+        let mut jumps = JumpList::default();
+        jumps.push(at("a.rs", 1));
+        assert_eq!(jumps.back(at("a.rs", 9)), Some(at("a.rs", 1)));
+        assert!(jumps.forward.len() == 1, "there is somewhere to go forward to");
+        // Taking a new branch discards it, as it does in a browser and
+        // as it does in vim.
+        jumps.push(at("a.rs", 20));
+        assert_eq!(jumps.forward(at("a.rs", 20)), None);
+    }
+
+    // Vim collapses a repeat on the same line rather than stacking it,
+    // which is what stops `Ctrl-O` needing several presses to leave one
+    // spot.
+    #[test]
+    fn repeated_jumps_from_one_line_leave_a_single_entry() {
+        let mut jumps = JumpList::default();
+        jumps.push(at("a.rs", 5));
+        jumps.push(JumpEntry { path: PathBuf::from("a.rs"), row: 5, col: 40 });
+        assert_eq!(jumps.back.len(), 1);
+        // The same line in a *different* file is a different place.
+        jumps.push(at("b.rs", 5));
+        assert_eq!(jumps.back.len(), 2);
+    }
+
+    #[test]
+    fn the_list_is_bounded() {
+        let mut jumps = JumpList::default();
+        for row in 0..MAX_JUMPS + 20 {
+            jumps.push(at("a.rs", row));
+        }
+        assert_eq!(jumps.back.len(), MAX_JUMPS);
+        // The oldest went, not the newest.
+        assert_eq!(jumps.back.last(), Some(&at("a.rs", MAX_JUMPS + 19)));
+        assert!(!jumps.back.contains(&at("a.rs", 0)));
+    }
+}
+
 struct Pane {
     id: PaneId,
     stack: Vec<Frame>,
+    /// See `JumpList` -- per pane, the way vim's is per window.
+    jumps: JumpList,
 }
 
 impl Pane {
@@ -285,7 +413,7 @@ impl WindowEntry {
             id,
             name: None,
             layout: PaneLayout::Leaf(0),
-            panes: vec![Pane { id: 0, stack: vec![initial_frame] }],
+            panes: vec![Pane { id: 0, stack: vec![initial_frame], jumps: JumpList::default() }],
             focused_pane: 0,
             next_pane_id: 1,
             divider_budget: DEFAULT_DIVIDER_BUDGET,
@@ -2556,6 +2684,30 @@ fn run_edit_frame(
                 if let Some((b, v)) = state {
                     edit_frames.insert(edit_frame_id, fileeditor::EditSession { buffer: b, vk: v });
                 }
+                // Already open in this pane? Bring that frame to the
+                // front rather than opening the file twice. Nothing is
+                // closed, which is what lets `Ctrl-I` step forward
+                // again -- and it means a buffer with unsaved work is
+                // never quietly dropped on the way back to it.
+                let existing = windows[own_window]
+                    .pane(own_pane_id)
+                    .stack
+                    .iter()
+                    .position(|frame| matches!(frame, Frame::Edit(id) if edit_frames.get(id).and_then(|s| s.buffer.path()) == Some(path.as_path())));
+                if let Some(at) = existing {
+                    let stack = &mut windows[own_window].pane_mut(own_pane_id).stack;
+                    let frame = stack.remove(at);
+                    stack.push(frame);
+                    if let Frame::Edit(id) = frame
+                        && let Some(session) = edit_frames.get_mut(&id)
+                    {
+                        let starts = fileeditor::line_starts_of(&session.buffer);
+                        let offset = fileeditor::diagnostic_offset(&session.buffer, &starts, line, character, encoding);
+                        let (row, col) = fileeditor::diagnostic_position(&session.buffer, offset);
+                        session.buffer.set_cursor(row, col);
+                    }
+                    return;
+                }
                 let rect = pane_rect(&windows[own_window], own_pane_id, *term_rows, *term_cols);
                 match fileeditor::EditSession::open(path.to_str(), normal_mode_content_rows(rect)) {
                     Ok(mut opened) => {
@@ -3710,7 +3862,7 @@ fn split_focused_pane(
     let window = &mut windows[current_window];
     let new_pane_id = window.next_pane_id;
     window.next_pane_id += 1;
-    window.panes.push(Pane { id: new_pane_id, stack: vec![Frame::Session(sid)] });
+    window.panes.push(Pane { id: new_pane_id, stack: vec![Frame::Session(sid)], jumps: JumpList::default() });
 
     let focused_id = window.focused_pane;
     let old_layout = std::mem::replace(&mut window.layout, PaneLayout::Leaf(0));
@@ -3784,7 +3936,7 @@ fn split_diagnostics_pane(
     let window = &mut windows[current_window];
     let new_pane_id = window.next_pane_id;
     window.next_pane_id += 1;
-    window.panes.push(Pane { id: new_pane_id, stack: vec![Frame::Session(sid), Frame::Diagnostics(edit_frame_id)] });
+    window.panes.push(Pane { id: new_pane_id, stack: vec![Frame::Session(sid), Frame::Diagnostics(edit_frame_id)], jumps: JumpList::default() });
 
     let focused_id = window.focused_pane;
     let old_layout = std::mem::replace(&mut window.layout, PaneLayout::Leaf(0));
@@ -3835,7 +3987,7 @@ fn split_locations_pane(
     let window = &mut windows[current_window];
     let new_pane_id = window.next_pane_id;
     window.next_pane_id += 1;
-    window.panes.push(Pane { id: new_pane_id, stack: vec![Frame::Session(sid), Frame::Locations(edit_frame_id)] });
+    window.panes.push(Pane { id: new_pane_id, stack: vec![Frame::Session(sid), Frame::Locations(edit_frame_id)], jumps: JumpList::default() });
     let focused_id = window.focused_pane;
     let old_layout = std::mem::replace(&mut window.layout, PaneLayout::Leaf(0));
     window.layout = insert_sibling(old_layout, focused_id, new_pane_id, true, None, true);
@@ -3948,7 +4100,7 @@ fn split_debug_run_pane(
     let window = &mut windows[current_window];
     let new_pane_id = window.next_pane_id;
     window.next_pane_id += 1;
-    window.panes.push(Pane { id: new_pane_id, stack: vec![Frame::Session(sid), Frame::DebugRun(edit_frame_id)] });
+    window.panes.push(Pane { id: new_pane_id, stack: vec![Frame::Session(sid), Frame::DebugRun(edit_frame_id)], jumps: JumpList::default() });
 
     let focused_id = window.focused_pane;
     let old_layout = std::mem::replace(&mut window.layout, PaneLayout::Leaf(0));
@@ -7516,7 +7668,7 @@ fn run_normal_mode_navigation(
                 let (locations, at) = definitions.take().expect("checked just above");
                 let step = if key == Key::Char('n') { 1 } else { locations.len() - 1 };
                 let next = (at + step) % locations.len();
-                match goto_location(sessions, session_id, &mut buf, &mut vk, &locations[next], false) {
+                match goto_location(sessions, session_id, &mut buf, &locations[next]) {
                     Goto::Moved => {
                         let content_cols = nav_content_cols(&buf, rect);
                         nav_scroll_to_show_cursor(&mut buf, content_cols);
@@ -7993,7 +8145,12 @@ fn run_normal_mode_navigation(
                             render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides.as_ref());
                             show_command_mode_error("no definition found", *term_rows, *term_cols);
                         }
-                        Some(first) => match goto_location(sessions, session_id, &mut buf, &mut vk, &first, true) {
+                        Some(first) => {
+                            // One entry, here, before going anywhere:
+                            // `Ctrl-O` should come back to where the
+                            // question was asked.
+                            record_jump(windows, *current_window, &buf);
+                            match goto_location(sessions, session_id, &mut buf, &first) {
                             Goto::Moved => {
                                 let content_cols = nav_content_cols(&buf, rect);
                                 nav_scroll_to_show_cursor(&mut buf, content_cols);
@@ -8013,7 +8170,8 @@ fn run_normal_mode_navigation(
                                 render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides.as_ref());
                                 show_command_mode_error(&message, *term_rows, *term_cols);
                             }
-                        },
+                            }
+                        }
                     }
                 }
             }
@@ -8127,6 +8285,13 @@ fn run_normal_mode_navigation(
                 }
             }
             KeyOutcome::Motion(m, count) => {
+                // `apply_motion_or_reselect` records this into `vk`'s
+                // own list too, which the editor no longer reads -- see
+                // `JumpList`. Recorded here as well because only this
+                // frontend knows which *file* the cursor is in.
+                if motion::is_jump(&m) {
+                    record_jump(windows, *current_window, &buf);
+                }
                 editor::apply_motion_or_reselect(&mut vk, &mut buf, m, count);
                 let content_cols = nav_content_cols(&buf, rect);
                 nav_scroll_to_show_cursor(&mut buf, content_cols);
@@ -8194,45 +8359,56 @@ fn run_normal_mode_navigation(
                 }
                 render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides.as_ref());
             }
+            // `Ctrl-O`/`Ctrl-I`. Cross-file, because vim's are: the
+            // list lives on the pane (see `JumpList`) rather than in
+            // this buffer's `VimKeys`, so a `gd` into another file is
+            // just another entry and stepping back over it goes back to
+            // the file as well as the line.
+            //
+            // A target in *this* buffer moves the cursor and stays; one
+            // in another file leaves this loop with `NavExit::OpenAt`,
+            // which either brings that file's existing frame to the
+            // front or opens it. Nothing is closed either way, which is
+            // what makes `Ctrl-I` able to come back.
             KeyOutcome::Jump { forward } => {
-                let current = buf.cursor();
-                let target = if forward { vk.jump_forward(current) } else { vk.jump_back(current) };
-                if let Some((row, col)) = target {
-                    let row = row.min(buf.line_count() - 1);
-                    let col = col.min(buf.line_len(row));
-                    buf.set_cursor(row, col);
-                    let content_cols = nav_content_cols(&buf, rect);
-                    nav_scroll_to_show_cursor(&mut buf, content_cols);
-                    render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides.as_ref());
-                    continue;
-                }
-                // Nothing left in *this buffer's* list. In vim the jump
-                // list spans files, so `Ctrl-O` after a `gd` into
-                // another one goes back to where the question was asked
-                // -- and this list cannot, because it lives in the
-                // per-buffer `VimKeys` and the opened file got a fresh
-                // one.
-                //
-                // Going back here means leaving this frame, since a
-                // cross-file jump opened it *on top of* the frame it
-                // came from. That is exactly what `:q` already does, so
-                // this takes the same exit rather than inventing a
-                // second way out -- which also gets the close hooks,
-                // the language server's `didClose` and the sibling-pane
-                // cleanup right for free.
-                if !forward && edit_frame_id.is_some() {
-                    let pane = windows[*current_window].pane(windows[*current_window].focused_pane);
-                    let beneath_is_edit = pane.stack.len() >= 2 && matches!(pane.stack[pane.stack.len() - 2], Frame::Edit(_));
-                    if beneath_is_edit {
-                        // Unsaved work is not something to close out
-                        // from under someone, and `:q` refuses it for
-                        // the same reason.
-                        if buf.as_editable().is_some_and(|tb| tb.is_dirty()) {
-                            render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides.as_ref());
-                            show_command_mode_error("bish: unsaved changes -- :w or :q! before jumping back", *term_rows, *term_cols);
-                            continue;
-                        }
-                        break 'nav (NavExit::Quit, nav_buffer_into_edit_state(buf, vk));
+                let here = jump_here(&buf);
+                let target = match (here.clone(), buf.as_editable().is_some()) {
+                    (Some(here), true) => {
+                        let pane_id = windows[*current_window].focused_pane;
+                        let jumps = &mut windows[*current_window].pane_mut(pane_id).jumps;
+                        if forward { jumps.forward(here) } else { jumps.back(here) }
+                    }
+                    // No file behind this view: fall back to the
+                    // position-only list `VimKeys` keeps, which is all
+                    // a prompt or a scrollback ever needed.
+                    _ => {
+                        let current = buf.cursor();
+                        let target = if forward { vk.jump_forward(current) } else { vk.jump_back(current) };
+                        target.map(|(row, col)| JumpEntry { path: PathBuf::new(), row, col })
+                    }
+                };
+                if let Some(target) = target {
+                    let same_file = here.as_ref().is_none_or(|h| h.path == target.path);
+                    if same_file {
+                        let row = target.row.min(buf.line_count().saturating_sub(1));
+                        let col = target.col.min(buf.line_len(row));
+                        buf.set_cursor(row, col);
+                        let content_cols = nav_content_cols(&buf, rect);
+                        nav_scroll_to_show_cursor(&mut buf, content_cols);
+                    } else {
+                        // `Utf32` is bish's own column counting, so the
+                        // buffer coordinates carried here pass through
+                        // `OpenAt`'s server-position conversion
+                        // unchanged. See `lsp::PositionEncoding`.
+                        break 'nav (
+                            NavExit::OpenAt {
+                                path: target.path,
+                                line: target.row,
+                                character: target.col,
+                                encoding: crate::lsp::PositionEncoding::Utf32,
+                            },
+                            nav_buffer_into_edit_state(buf, vk),
+                        );
                     }
                 }
                 render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides.as_ref());
@@ -8838,6 +9014,23 @@ fn server_encoding_for(sessions: &HashMap<SessionId, SessionState>, session_id: 
     Some(table.running(&target.display, &target.root)?.encoding())
 }
 
+// Where the cursor is, as a jump-list entry -- `None` for anything with
+// no file behind it (the prompt's own Normal mode, a job's scrollback),
+// which is also every case where a cross-file jump could not mean
+// anything.
+fn jump_here(buf: &NavBuffer) -> Option<JumpEntry> {
+    let tb = buf.as_editable()?;
+    let (row, col) = tb.cursor();
+    Some(JumpEntry { path: tb.path()?.to_path_buf(), row, col })
+}
+
+// Records a jump leaving `buf`, on the pane that owns it.
+fn record_jump(windows: &mut [WindowEntry], current_window: usize, buf: &NavBuffer) {
+    let Some(entry) = jump_here(buf) else { return };
+    let pane_id = windows[current_window].focused_pane;
+    windows[current_window].pane_mut(pane_id).jumps.push(entry);
+}
+
 // What acting on one `lsp::Location` did.
 enum Goto {
     /// The cursor moved within this buffer.
@@ -8853,16 +9046,14 @@ enum Goto {
 // what else it is. Shared by `gd` and by the `n`/`N` cycling that
 // follows it, so the two cannot disagree about what "go there" means.
 //
-// `push_jump` only for the first jump of a `gd`: cycling within a
-// result set should leave one entry behind for `Ctrl-O`, at the place
-// the question was asked, not one per step.
+// Recording the jump is the caller's job (`record_jump`), so that a
+// `gd` leaves exactly one entry behind -- at the place the question was
+// asked -- while cycling through its results with `n`/`N` leaves none.
 fn goto_location(
     sessions: &HashMap<SessionId, SessionState>,
     session_id: SessionId,
     buf: &mut NavBuffer,
-    vk: &mut VimKeys,
     location: &crate::lsp::Location,
-    push_jump: bool,
 ) -> Goto {
     let Some(tb) = buf.as_editable_mut() else {
         return Goto::Nowhere("no definition found".to_string());
@@ -8873,9 +9064,6 @@ fn goto_location(
         let starts = fileeditor::line_starts_of(tb);
         let offset = fileeditor::diagnostic_offset(tb, &starts, location.start.0, location.start.1, encoding);
         let (line, column) = fileeditor::diagnostic_position(tb, offset);
-        if push_jump {
-            vk.push_jump(tb.cursor());
-        }
         tb.set_cursor(line, column);
         return Goto::Moved;
     }
@@ -11639,7 +11827,7 @@ mod divider_drag_tests {
             id: 0,
             name: None,
             layout,
-            panes: panes.iter().map(|id| Pane { id: *id, stack: vec![Frame::Session(0)] }).collect(),
+            panes: panes.iter().map(|id| Pane { id: *id, stack: vec![Frame::Session(0)], jumps: JumpList::default() }).collect(),
             focused_pane: panes[0],
             divider_budget: DEFAULT_DIVIDER_BUDGET,
             next_pane_id: panes.len() as PaneId,
@@ -11760,7 +11948,7 @@ mod completion_menu_geometry_tests {
     fn split_window() -> WindowEntry {
         let mut w = WindowEntry::single(0, Frame::Session(0));
         w.layout = insert_sibling(w.layout, 0, 1, true, None, false);
-        w.panes.push(Pane { id: 1, stack: vec![Frame::Session(0)] });
+        w.panes.push(Pane { id: 1, stack: vec![Frame::Session(0)], jumps: JumpList::default() });
         w.next_pane_id = 2;
         w.focused_pane = 1;
         w
