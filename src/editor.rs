@@ -64,6 +64,21 @@ pub enum Key {
     // own Motion::PageUp/PageDown handling for where these actually go now.
     PageUp,
     PageDown,
+    // "CSI 200 ~" / "CSI 201 ~" -- the brackets a terminal puts around
+    // pasted text once DECSET 2004 is on.
+    //
+    // What they buy is the one thing a terminal otherwise cannot tell
+    // you: whether a burst of characters was typed or pasted. Everything
+    // that helpfully reacts to typing -- autoindent, `abbr` expansion --
+    // is wrong applied to a paste, and produces the staircase every
+    // editor that lacks this is known for.
+    //
+    // Decoded unconditionally, even for a caller that never enables the
+    // mode: a terminal that sends them anyway (tmux passing through a
+    // neighbour's request) would otherwise land "200~" in the buffer as
+    // literal text.
+    PasteStart,
+    PasteEnd,
     Escape,
     // xterm/tmux send these as "CSI 1 ; 3 <letter>" (modifier 3 = Alt)
     // rather than the plain "CSI <letter>" -- see decode_csi_final.
@@ -425,6 +440,8 @@ fn decode_csi_final(params: &str, final_byte: u8) -> Key {
             Some(4) | Some(8) => Key::End,
             Some(5) => Key::PageUp,
             Some(6) => Key::PageDown,
+            Some(200) => Key::PasteStart,
+            Some(201) => Key::PasteEnd,
             _ => Key::Unknown,
         },
         b'Z' => Key::BackTab,
@@ -1938,7 +1955,21 @@ pub fn read_line(
             // scrollback view to page through here -- that's Ctrl+Space's
             // own Normal-mode navigation's job), same as a real bash
             // readline prompt not binding them either.
-            Key::AltLeft | Key::AltRight | Key::AltUp | Key::CtrlY | Key::CtrlX | Key::Mouse(_) | Key::PageUp | Key::PageDown | Key::Unknown => {}
+            // The paste brackets are ignored here rather than acted on:
+            // this prompt never turns DECSET 2004 on, so they only ever
+            // arrive from a terminal that had it on for someone else --
+            // and dropping them is still better than typing "200~".
+            Key::AltLeft
+            | Key::AltRight
+            | Key::AltUp
+            | Key::CtrlY
+            | Key::CtrlX
+            | Key::Mouse(_)
+            | Key::PageUp
+            | Key::PageDown
+            | Key::PasteStart
+            | Key::PasteEnd
+            | Key::Unknown => {}
         }
         // Recomputed fresh every iteration -- see compute_suggestion's
         // own doc comment. Must happen after the match (so it reflects

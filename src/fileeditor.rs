@@ -1096,6 +1096,7 @@ pub(crate) fn redirect_cw_to_ce(buf: &TextBuffer, m: &motion::Motion) -> motion:
 // explicitly for that case.
 pub(crate) fn open_line(buf: &mut TextBuffer, above: bool) {
     let (row, _) = buf.cursor();
+    let indent = autoindent_for(buf, row);
     if above {
         buf.insert_text((row, 0), "\n");
         buf.set_cursor(row, 0);
@@ -1103,6 +1104,30 @@ pub(crate) fn open_line(buf: &mut TextBuffer, above: bool) {
         let len = buf.line_len(row);
         buf.insert_text((row, len), "\n");
     }
+    let (row, _) = buf.cursor();
+    if !indent.is_empty() {
+        buf.insert_text((row, 0), &indent);
+        buf.set_cursor(row, indent.chars().count());
+    }
+}
+
+/// The whitespace a new line opened from `row` should start with:
+/// exactly `row`'s own leading whitespace, copied.
+///
+/// **Plain** autoindent, vim's `autoindent` and not its `smartindent` --
+/// no opening a level after `{` or `then`, no closing one on `}`. The
+/// virtue of copying is that it is never wrong in a way that surprises:
+/// it puts the caret where the eye already is, and it cannot mis-guess a
+/// language's block structure because it never guesses.
+///
+/// Empty when the line is only whitespace, so pressing Enter on a blank
+/// line does not leave a trail of trailing spaces behind.
+pub(crate) fn autoindent_for(buf: &TextBuffer, row: usize) -> String {
+    let chars = buf.line_chars(row);
+    if chars.iter().all(|c| c.is_whitespace()) {
+        return String::new();
+    }
+    chars.iter().take_while(|c| **c == ' ' || **c == '\t').collect()
 }
 
 pub(crate) fn resolve_insert_start(buf: &mut TextBuffer, cmd: InsertCmd) {
@@ -1364,6 +1389,18 @@ pub(crate) fn run_insert_mode(
     // pre-existing text it backed into -- real vim tracks that
     // distinction precisely; this doesn't.
     let mut inserted = String::new();
+    // Whether the bytes arriving right now were pasted rather than
+    // typed, bracketed by the terminal (see `Key::PasteStart`). Nothing
+    // that helpfully reacts to typing runs while this is set:
+    // autoindent would staircase every line, and `abbr` would expand a
+    // word that happens to look like an abbreviation in someone else's
+    // code.
+    let mut pasting = false;
+    // Asking the real terminal to bracket pastes for the duration.
+    // `sync_bracketed_paste` (repl.rs) does the same thing for a
+    // *foreground job* that asked for it; the two never overlap, since
+    // no job is being driven while this loop owns the keyboard.
+    let _paste_guard = term::BracketedPasteGuard::enable();
     loop {
         // Waits for a byte to actually be ready *before* calling
         // vk.next_key below, rather than passing `on_idle` as that
@@ -1609,13 +1646,22 @@ pub(crate) fn run_insert_mode(
             // does the newline. Never in Replace mode, whose whole
             // contract is that the line's length doesn't change --
             // splicing an expansion in would break exactly that.
-            Key::Enter if !replace && expand_abbr(buf, &abbrs, &mut live) => {
+            // An `abbr` never expands out of pasted text: a word in
+            // someone else's code that happens to match one of yours is
+            // not an abbreviation you typed.
+            Key::Enter if !replace && !pasting && expand_abbr(buf, &abbrs, &mut live) => {
                 cursors[0] = buf.cursor();
             }
             Key::Enter => {
-                apply_insert_to_all(buf, &mut cursors, "\n");
+                // Autoindent, unless these characters were pasted --
+                // a paste already carries its own indentation, and
+                // adding to it is the staircase bracketed paste exists
+                // to prevent.
+                let indent = if pasting { String::new() } else { autoindent_for(buf, buf.cursor().0) };
+                let text = format!("\n{indent}");
+                apply_insert_to_all(buf, &mut cursors, &text);
                 buf.set_cursor(cursors[0].0, cursors[0].1);
-                inserted.push('\n');
+                inserted.push_str(&text);
             }
             // With `expandtab` on, spaces up to the next `shiftwidth`
             // boundary; with it off, one literal tab. Never overtypes
@@ -1739,6 +1785,10 @@ pub(crate) fn run_insert_mode(
             //
             // `Home` is column 0, not first-non-blank -- vim's own
             // `<Home>`, with `^` still the other thing.
+            // The paste brackets themselves insert nothing -- they only
+            // say what the characters between them are.
+            Key::PasteStart => pasting = true,
+            Key::PasteEnd => pasting = false,
             Key::Home => {
                 motion::apply_motion(buf, motion::Motion::LineStart, None);
                 cursors[0] = buf.cursor();
@@ -1846,7 +1896,7 @@ pub(crate) fn run_insert_mode(
             // swallows it: the caret is already parked inside the first
             // placeholder, where a space would be the first thing typed
             // into it rather than anything that ended the abbreviation.
-            Key::Char(' ') if !replace && !abbrs.is_empty() && expand_abbr(buf, &abbrs, &mut live) => {
+            Key::Char(' ') if !replace && !pasting && !abbrs.is_empty() && expand_abbr(buf, &abbrs, &mut live) => {
                 cursors[0] = buf.cursor();
                 if live.is_none() {
                     let mut b = [0u8; 4];
@@ -4333,6 +4383,71 @@ mod macro_tests {
     // through the same macro-replay queue the test just below uses --
     // there's no real terminal here to type at, and `run_insert_mode`
     // reads through `vk.next_key`, which serves a queued replay first.
+    // Plain autoindent: copy, never guess. `smartindent` is what opens a
+    // level after `{`, and it is deliberately not this.
+    #[test]
+    fn autoindent_copies_the_lines_own_leading_whitespace() {
+        let mut buf = TextBuffer::new_unnamed(10);
+        buf.insert_text((0, 0), "no indent\n    four spaces\n\tone tab\n   \n");
+        assert_eq!(autoindent_for(&buf, 0), "");
+        assert_eq!(autoindent_for(&buf, 1), "    ");
+        assert_eq!(autoindent_for(&buf, 2), "\t");
+        // Whitespace-only: nothing, so Enter on a blank line does not
+        // leave a trail of trailing spaces behind it.
+        assert_eq!(autoindent_for(&buf, 3), "");
+    }
+
+    #[test]
+    fn enter_and_open_line_both_carry_the_indent() {
+        let mut buf = TextBuffer::new_unnamed(10);
+        buf.insert_text((0, 0), "fn main() {\n    let x = 1;\n}");
+        buf.set_cursor(1, 14);
+        insert_into(&mut buf, &[Key::Enter, Key::Char('y')]);
+        assert_eq!(text_of(&buf), "fn main() {\n    let x = 1;\n    y\n}");
+
+        let mut buf = TextBuffer::new_unnamed(10);
+        buf.insert_text((0, 0), "fn main() {\n    let x = 1;\n}");
+        buf.set_cursor(1, 0);
+        open_line(&mut buf, false);
+        assert_eq!(buf.cursor(), (2, 4), "`o` lands past the copied indent, not at column zero");
+        insert_into(&mut buf, &[Key::Char('y')]);
+        assert_eq!(text_of(&buf), "fn main() {\n    let x = 1;\n    y\n}");
+
+        let mut buf = TextBuffer::new_unnamed(10);
+        buf.insert_text((0, 0), "fn main() {\n    let x = 1;\n}");
+        buf.set_cursor(1, 0);
+        open_line(&mut buf, true);
+        insert_into(&mut buf, &[Key::Char('y')]);
+        assert_eq!(text_of(&buf), "fn main() {\n    y\n    let x = 1;\n}");
+    }
+
+    // The reason bracketed paste ships with autoindent rather than after
+    // it: the same bytes have to land differently depending on whether
+    // they were typed or pasted, and without the brackets a terminal
+    // cannot say which.
+    #[test]
+    fn a_bracketed_paste_keeps_its_own_indentation() {
+        let pasted = |keys: Vec<Key>| {
+            let mut buf = TextBuffer::new_unnamed(10);
+            buf.insert_text((0, 0), "    start");
+            buf.set_cursor(0, 9);
+            insert_into(&mut buf, &keys);
+            text_of(&buf)
+        };
+        let body: Vec<Key> = "if a {\n    b();\n}".chars().map(|c| if c == '\n' { Key::Enter } else { Key::Char(c) }).collect();
+
+        let mut bracketed = vec![Key::PasteStart];
+        bracketed.extend(body.clone());
+        bracketed.push(Key::PasteEnd);
+        assert_eq!(pasted(bracketed), "    startif a {\n    b();\n}", "verbatim -- the paste brought its own indent");
+
+        // Typed, every Enter copies the line above it -- so the closing
+        // brace inherits `b();`'s own indent rather than the `if`'s.
+        // That is the staircase, and it is the correct behaviour for
+        // text someone is actually typing.
+        assert_eq!(pasted(body), "    startif a {\n        b();\n        }", "typed, the same characters get indented as you go");
+    }
+
     // The file editor never drew search matches at all, while both of
     // bish's other Normal modes always have.
     #[test]

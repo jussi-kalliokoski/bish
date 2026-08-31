@@ -148,6 +148,37 @@ pub fn suspend_self() {
 pub const MOUSE_REPORTING_ENABLE: &str = "\x1b[?1000h\x1b[?1002h\x1b[?1006h";
 pub const MOUSE_REPORTING_DISABLE: &str = "\x1b[?1006l\x1b[?1002l\x1b[?1000l";
 
+// DECSET 2004: ask the terminal to wrap pasted text in `CSI 200 ~` and
+// `CSI 201 ~`, so a burst of characters can be told apart from typing.
+//
+// Its own escape pair rather than a flag on `RawGuard` for the same
+// reason mouse reporting has `sync_bracketed_paste` alongside the guard:
+// this is asked for by one specific view for the duration of one
+// specific mode, not by everything that happens to want raw mode.
+pub const BRACKETED_PASTE_ENABLE: &str = "\x1b[?2004h";
+pub const BRACKETED_PASTE_DISABLE: &str = "\x1b[?2004l";
+
+/// RAII counterpart: on while it lives, off when it drops -- including
+/// down every early return of whatever loop is holding it.
+pub struct BracketedPasteGuard;
+
+impl BracketedPasteGuard {
+    pub fn enable() -> BracketedPasteGuard {
+        use std::io::Write;
+        print!("{BRACKETED_PASTE_ENABLE}");
+        let _ = std::io::stdout().flush();
+        BracketedPasteGuard
+    }
+}
+
+impl Drop for BracketedPasteGuard {
+    fn drop(&mut self) {
+        use std::io::Write;
+        print!("{BRACKETED_PASTE_DISABLE}");
+        let _ = std::io::stdout().flush();
+    }
+}
+
 // RAII guard: puts fd (almost always 0/stdin) into raw mode on construction,
 // restores the terminal's prior settings on drop. Raw mode here means no
 // line buffering (ICANON off), no local echo (we draw the line ourselves),
