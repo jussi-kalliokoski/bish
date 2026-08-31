@@ -103,6 +103,9 @@ impl State {
 pub struct Sync {
     pub open_close: bool,
     pub change: bool,
+    /// Kind 2: the server wants only the parts that changed, as ranges,
+    /// rather than the whole file every time.
+    pub incremental: bool,
     pub save: bool,
 }
 
@@ -114,7 +117,9 @@ impl Default for Sync {
     // Assuming full sync instead fails the other way: a server that
     // really wanted nothing receives notifications it can ignore.
     fn default() -> Sync {
-        Sync { open_close: true, change: true, save: false }
+        // Full, not incremental: a server that did not describe itself
+        // is unlikely to be one that wants ranges.
+        Sync { open_close: true, change: true, incremental: false, save: false }
     }
 }
 
@@ -126,13 +131,14 @@ impl Sync {
             // The number form names only the change kind; a server using
             // it still expects open/close (there would be nothing for a
             // change to be relative to otherwise).
-            Ok(Value::Number(kind)) => Sync { open_close: true, change: *kind > 0.0, save: false },
+            Ok(Value::Number(kind)) => Sync { open_close: true, change: *kind > 0.0, incremental: *kind == 2.0, save: false },
             Ok(value @ Value::Object(_)) => Sync {
                 // The object form's fields really do all default to
                 // false, per the spec -- a server choosing this form is
                 // describing itself exactly.
                 open_close: matches!(json::query(value, ".openClose"), Ok(Value::Bool(true))),
                 change: matches!(json::query(value, ".change"), Ok(Value::Number(k)) if *k > 0.0),
+                incremental: matches!(json::query(value, ".change"), Ok(Value::Number(k)) if *k == 2.0),
                 // Either `true` or `{ includeText: bool }`; both mean
                 // "tell me about saves".
                 save: matches!(json::query(value, ".save"), Ok(Value::Bool(true)) | Ok(Value::Object(_))),
@@ -155,6 +161,14 @@ struct Document {
     // typing produces one `didChange` at a bounded delay instead of
     // never producing one at all while the typing continues.
     pending_since: Option<Instant>,
+    // The text the server was last told about, kept only for a server
+    // that asked for incremental sync -- it is the thing the next
+    // change is a *difference from*, and there is nowhere else to get
+    // it: a `TextBuffer` knows what it says now, not what was sent.
+    //
+    // Empty (and never filled) under full sync, so the extra copy is
+    // paid only where it buys something.
+    sent_text: String,
     // The most recent `publishDiagnostics` for this document, and
     // whether anyone has applied it yet.
     //
@@ -1025,7 +1039,14 @@ impl Server {
         // Recorded before the send, not after: `send` holds the
         // notification until the handshake finishes, and a second open
         // arriving in the meantime must not queue a duplicate.
-        self.documents.push(Document { uri: uri.to_string(), version, pending_since: None, published: None, unapplied: false });
+        self.documents.push(Document {
+            uri: uri.to_string(),
+            version,
+            pending_since: None,
+            sent_text: if self.sync.incremental { text.to_string() } else { String::new() },
+            published: None,
+            unapplied: false,
+        });
         self.notify(
             "textDocument/didOpen",
             Value::Object(vec![(
@@ -1129,6 +1150,8 @@ impl Server {
     /// ask first, and keeps a save that follows a settled edit from
     /// sending the same document twice.
     pub fn change_document(&mut self, uri: &str, version: u64, text: &str) {
+        let incremental = self.sync.incremental;
+        let encoding = self.encoding;
         let Some(document) = self.documents.iter_mut().find(|d| d.uri == uri) else {
             return;
         };
@@ -1138,6 +1161,20 @@ impl Server {
         }
         document.version = version;
         document.pending_since = None;
+        let changes = if incremental {
+            let changes = line_changes(&document.sent_text, text, encoding);
+            document.sent_text = text.to_string();
+            // `None` means the diff was not worth sending as one -- see
+            // `line_changes` -- and the whole file goes instead, which
+            // is always a legal `didChange` whatever kind the server
+            // asked for.
+            changes.unwrap_or_else(|| vec![Value::Object(vec![("text".to_string(), Value::Str(text.to_string()))])])
+        } else {
+            vec![Value::Object(vec![("text".to_string(), Value::Str(text.to_string()))])]
+        };
+        if changes.is_empty() {
+            return;
+        }
         self.notify(
             "textDocument/didChange",
             Value::Object(vec![
@@ -1145,7 +1182,7 @@ impl Server {
                     "textDocument".to_string(),
                     Value::Object(vec![("uri".to_string(), Value::Str(uri.to_string())), ("version".to_string(), Value::Number(version as f64))]),
                 ),
-                ("contentChanges".to_string(), Value::Array(vec![Value::Object(vec![("text".to_string(), Value::Str(text.to_string()))])])),
+                ("contentChanges".to_string(), Value::Array(changes)),
             ]),
         );
     }
@@ -1470,6 +1507,145 @@ impl crate::exec::ServiceTable for Table {
 /// a server at all rather than to guess: a server given the wrong root
 /// indexes the wrong tree, and for a large one that is expensive enough
 /// to notice.
+/// The most separate edits one `didChange` will carry.
+///
+/// Past this the diff has stopped describing an edit and started
+/// describing a different file (a formatter ran, a branch was checked
+/// out), and one full-text change is both smaller on the wire and
+/// cheaper for the server to apply than fifty ranges.
+const MAX_CONTENT_CHANGES: usize = 32;
+
+/// `old` -> `new` as LSP `contentChanges`, or `None` when sending the
+/// whole file would be better.
+///
+/// Whole lines only. A character-level diff would send fewer bytes, but
+/// every column in a range has to be in the negotiated position
+/// encoding, and getting that wrong does not look wrong -- it silently
+/// describes a different edit. Line boundaries are the same number in
+/// every encoding, so the only column arithmetic left is the one at the
+/// very end of the file, where a range cannot start on a line that does
+/// not exist.
+///
+/// The changes come out in *reverse* document order, because the server
+/// applies them in the order given and each one shifts everything after
+/// it -- the same rule `fileeditor::apply_text_edits` follows for a
+/// batch of edits going the other way.
+fn line_changes(old: &str, new: &str, encoding: PositionEncoding) -> Option<Vec<Value>> {
+    if old.is_empty() && !new.is_empty() {
+        // Nothing to be a difference from: this is the first change
+        // after an open that predates incremental sync being known, or
+        // a document that really was empty and is now not.
+        return None;
+    }
+    // `split('\n')` and not `lines()`: a trailing newline means a final
+    // empty line, which is exactly LSP's own model of a document, and
+    // `lines()` would hide it.
+    let old_lines: Vec<&str> = old.split('\n').collect();
+    let new_lines: Vec<&str> = new.split('\n').collect();
+    let mut changes = Vec::new();
+    // One hunk per Delete/Insert run, with an adjacent pair of them
+    // treated as the single replacement it is.
+    let ops = crate::diff::diff(&old_lines, &new_lines);
+    let mut i = 0;
+    while i < ops.len() {
+        let (from, removed, at) = match ops[i] {
+            crate::diff::DiffOp::Equal { .. } => {
+                i += 1;
+                continue;
+            }
+            crate::diff::DiffOp::Delete { a, len } => (a, len, None),
+            crate::diff::DiffOp::Insert { b, len } => {
+                // An insertion's position in `old` is wherever the
+                // preceding equal run ended.
+                let a = ops[..i]
+                    .iter()
+                    .rev()
+                    .find_map(|op| match op {
+                        crate::diff::DiffOp::Equal { a, len, .. } | crate::diff::DiffOp::Delete { a, len } => Some(a + len),
+                        crate::diff::DiffOp::Insert { .. } => None,
+                    })
+                    .unwrap_or(0);
+                (a, 0, Some((b, len)))
+            }
+        };
+        // A delete immediately followed by an insert is one replacement.
+        let inserted = match at {
+            Some(range) => {
+                i += 1;
+                Some(range)
+            }
+            None => match ops.get(i + 1) {
+                Some(crate::diff::DiffOp::Insert { b, len }) => {
+                    i += 2;
+                    Some((*b, *len))
+                }
+                _ => {
+                    i += 1;
+                    None
+                }
+            },
+        };
+        if changes.len() >= MAX_CONTENT_CHANGES {
+            return None;
+        }
+        let to = from + removed;
+        let added: Vec<&str> = match inserted {
+            Some((b, len)) => new_lines[b..b + len].to_vec(),
+            None => Vec::new(),
+        };
+        // A hunk that runs off the end of the document cannot be
+        // expressed as `{line: <count>, character: 0}` -- that line does
+        // not exist -- so it ends at the end of the last line that does.
+        // Two shapes of that, and they differ in where the newline goes:
+        // a *replacement* reaching the end drops its trailing one, while
+        // a pure *append* past the end needs a leading one, since the
+        // line it is being appended after has none.
+        let (start, end, text) = if to < old_lines.len() {
+            // The ordinary case: whole lines swapped for whole lines,
+            // every replacement newline-terminated so the line after the
+            // hunk stays a line.
+            (position(from, 0), position(to, 0), added.iter().map(|line| format!("{line}\n")).collect::<String>())
+        } else if from == 0 {
+            // The whole document.
+            (position(0, 0), end_of(&old_lines, encoding), added.join("\n"))
+        } else {
+            // A hunk running to the end of the document, which cannot be
+            // written as lines `[from, count)` -- `{line: count}` does
+            // not exist, and worse, a range starting at `{from, 0}`
+            // leaves the newline that *ends the line before it* behind,
+            // so the result keeps a trailing blank line that the new
+            // text does not have.
+            //
+            // So it starts at the end of the previous line and takes
+            // that newline with it, and whatever replaces it brings its
+            // own leading one. Deleting to the end and appending past it
+            // are the same shape once written this way.
+            let previous: Vec<char> = old_lines[from - 1].chars().collect();
+            let text = if added.is_empty() { String::new() } else { format!("\n{}", added.join("\n")) };
+            (position(from - 1, lsp::to_server_column(&previous, previous.len(), encoding)), end_of(&old_lines, encoding), text)
+        };
+        changes.push(Value::Object(vec![
+            ("range".to_string(), Value::Object(vec![("start".to_string(), start), ("end".to_string(), end)])),
+            ("text".to_string(), Value::Str(text)),
+        ]));
+    }
+    changes.reverse();
+    Some(changes)
+}
+
+// The very last position in a document, as the server counts columns.
+fn end_of(lines: &[&str], encoding: PositionEncoding) -> Value {
+    let last: Vec<char> = lines[lines.len() - 1].chars().collect();
+    position(lines.len() - 1, lsp::to_server_column(&last, last.len(), encoding))
+}
+
+fn position(line: usize, character: usize) -> Value {
+    Value::Object(vec![
+        ("line".to_string(), Value::Number(line as f64)),
+        ("character".to_string(), Value::Number(character as f64)),
+    ])
+}
+
 pub fn root_for(path: &Path, markers: &[String]) -> Option<PathBuf> {
     let start = if path.is_dir() { path } else { path.parent()? };
     let mut dir = Some(start);
@@ -1572,6 +1748,185 @@ mod tests {
         assert_eq!(answer.unwrap_err().code, -32601);
         assert!(note.unwrap().contains("not implemented"));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // Applies `contentChanges` the way a server does: in the order
+    // given, each one against the document the previous left behind.
+    // The whole point of the reverse ordering `line_changes` produces is
+    // that this comes out right.
+    fn apply_changes(text: &str, changes: &[Value]) -> String {
+        let mut text = text.to_string();
+        for change in changes {
+            let Ok(Value::Str(new_text)) = json::query(change, ".text") else { panic!("no text") };
+            let Ok(range) = json::query(change, ".range") else {
+                text = new_text.clone();
+                continue;
+            };
+            let at = |path: &str| match json::query(range, path) {
+                Ok(Value::Number(n)) => *n as usize,
+                _ => panic!("no {path}"),
+            };
+            // Char offsets, which is what utf-32 columns already are.
+            let offset = |line: usize, character: usize| {
+                let mut chars = 0;
+                for (i, l) in text.split('\n').enumerate() {
+                    if i == line {
+                        return chars + character.min(l.chars().count());
+                    }
+                    chars += l.chars().count() + 1;
+                }
+                text.chars().count()
+            };
+            let start = offset(at(".start.line"), at(".start.character"));
+            let end = offset(at(".end.line"), at(".end.character"));
+            let before: String = text.chars().take(start).collect();
+            let after: String = text.chars().skip(end.max(start)).collect();
+            text = format!("{before}{new_text}{after}");
+        }
+        text
+    }
+
+    fn round_trip(old: &str, new: &str) -> usize {
+        let changes = line_changes(old, new, PositionEncoding::Utf32).unwrap_or_else(|| panic!("{old:?} -> {new:?} refused"));
+        assert_eq!(apply_changes(old, &changes), new, "for {old:?} -> {new:?} via {changes:?}");
+        changes.len()
+    }
+
+    // The one thing that actually has to be true: whatever the diff
+    // produces, a server applying it in order ends up with the text bish
+    // has. Every shape of edit, checked by reconstructing the result
+    // rather than by eyeballing the ranges.
+    #[test]
+    fn incremental_changes_reconstruct_the_new_text_exactly() {
+        // A line rewritten in the middle.
+        assert_eq!(round_trip("a\nb\nc\n", "a\nB\nc\n"), 1);
+        // Inserted, deleted, both at once.
+        round_trip("a\nc\n", "a\nb\nc\n");
+        round_trip("a\nb\nc\n", "a\nc\n");
+        round_trip("a\nb\nc\n", "a\nx\ny\nz\nc\n");
+        // The first line, and the last -- where a range cannot start on
+        // a line that does not exist.
+        round_trip("a\nb\nc\n", "A\nb\nc\n");
+        round_trip("a\nb\nc", "a\nb\nC");
+        round_trip("a\nb\nc", "a\nb\nc\nd");
+        round_trip("a\nb\nc\n", "a\nb\nc\nd\n");
+        round_trip("a\nb\nc\nd\n", "a\nb\n");
+        // No trailing newline either side, one whole-file rewrite.
+        round_trip("one", "two");
+        // Two separate hunks, which is where the reverse ordering earns
+        // its place: applied forwards, the second range would describe
+        // text the first had already moved.
+        assert_eq!(round_trip("a\nb\nc\nd\ne\n", "A\nb\nc\nd\nE\n"), 2);
+        assert_eq!(round_trip("1\n2\n3\n4\n5\n6\n7\n", "1\nX\n3\n4\nY\nZ\n7\n"), 2);
+        // Nothing changed at all.
+        assert!(line_changes("a\nb\n", "a\nb\n", PositionEncoding::Utf32).unwrap().is_empty());
+        // Emptied entirely, and filled from nothing.
+        round_trip("a\nb\n", "");
+        round_trip("", "");
+    }
+
+    // Non-ASCII is exactly where a hand-written range goes wrong, and
+    // does so invisibly. Whole lines are the same number in every
+    // encoding; the one column that is not is the end of the last line.
+    #[test]
+    fn a_hunk_at_the_end_of_a_file_uses_the_negotiated_encoding() {
+        let old = "a\n\u{1f600}\u{1f600}";
+        let changes = line_changes(old, "a\nx", PositionEncoding::Utf16).unwrap();
+        assert_eq!(json::query(&changes[0], ".range.end.character"), Ok(&Value::Number(4.0)), "two surrogate pairs");
+        let changes = line_changes(old, "a\nx", PositionEncoding::Utf32).unwrap();
+        assert_eq!(json::query(&changes[0], ".range.end.character"), Ok(&Value::Number(2.0)), "two chars");
+        let changes = line_changes(old, "a\nx", PositionEncoding::Utf8).unwrap();
+        assert_eq!(json::query(&changes[0], ".range.end.character"), Ok(&Value::Number(8.0)), "eight bytes");
+    }
+
+    // The cases above are the ones worth naming; these are the ones
+    // nobody thinks of. A tiny deterministic generator over line sets,
+    // every result reconstructed -- which is the only property that
+    // actually matters and the only one worth checking exhaustively.
+    #[test]
+    fn incremental_changes_round_trip_for_edits_nobody_would_think_to_write() {
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let alphabet = ["a", "bb", "ccc", "", "\u{1f600}", "x y z"];
+        for _ in 0..2000 {
+            let build = |n: usize, next: &mut dyn FnMut() -> u64| {
+                let mut lines: Vec<&str> = (0..n).map(|_| alphabet[(next() % alphabet.len() as u64) as usize]).collect();
+                // Half the time with a trailing newline, half without --
+                // the distinction the last-line arithmetic turns on.
+                if next().is_multiple_of(2) {
+                    lines.push("");
+                }
+                lines.join("\n")
+            };
+            let old = build((next() % 12) as usize, &mut next);
+            let new = build((next() % 12) as usize, &mut next);
+            if old.is_empty() && !new.is_empty() {
+                continue;
+            }
+            round_trip(&old, &new);
+        }
+    }
+
+    // The declaration is the server's, not the client's: kind 2 means
+    // it wants ranges, and sending it whole files instead is the client
+    // ignoring what it was told.
+    #[test]
+    fn a_server_that_asked_for_incremental_sync_gets_ranges() {
+        let dir = temp_dir("incremental");
+        let capabilities = r#"{"capabilities":{"positionEncoding":"utf-32","textDocumentSync":{"openClose":true,"change":2,"save":false}}}"#;
+        let mut server = Server::start(1, &echo_server(capabilities), "mock", &dir, ApplyEdits::default()).unwrap();
+        run_until_ready(&mut server);
+        assert!(server.sync().incremental);
+        server.open_document("file:///p/x.sh", "shellscript", 1, "one\ntwo\nthree\n");
+        server.change_document("file:///p/x.sh", 2, "one\nTWO\nthree\n");
+        let seen = document_notifications(&mut server, 2);
+        let (method, params) = &seen[1];
+        assert_eq!(method, "textDocument/didChange");
+        let Ok(Value::Array(changes)) = json::query(params, ".contentChanges") else { panic!("no changes in {params:?}") };
+        assert_eq!(changes.len(), 1);
+        // Just the one line, named by range -- not the whole file.
+        assert_eq!(json::query(&changes[0], ".text"), Ok(&Value::Str("TWO\n".to_string())));
+        assert_eq!(json::query(&changes[0], ".range.start.line"), Ok(&Value::Number(1.0)));
+        assert_eq!(json::query(&changes[0], ".range.end.line"), Ok(&Value::Number(2.0)));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // And a server that asked for full sync still gets full files --
+    // the first change after an open is also full, since there is
+    // nothing yet to be a difference from.
+    #[test]
+    fn a_full_sync_server_still_gets_whole_files() {
+        let dir = temp_dir("full-sync");
+        let mut server = Server::start(1, &echo_server(FULL_SYNC), "mock", &dir, ApplyEdits::default()).unwrap();
+        run_until_ready(&mut server);
+        assert!(!server.sync().incremental);
+        server.open_document("file:///p/x.sh", "shellscript", 1, "one\ntwo\n");
+        server.change_document("file:///p/x.sh", 2, "one\nTWO\n");
+        let seen = document_notifications(&mut server, 2);
+        let Ok(Value::Array(changes)) = json::query(&seen[1].1, ".contentChanges") else { panic!("no changes") };
+        assert_eq!(changes.len(), 1);
+        assert_eq!(json::query(&changes[0], ".text"), Ok(&Value::Str("one\nTWO\n".to_string())));
+        assert!(!matches!(json::query(&changes[0], ".range"), Ok(Value::Object(_))), "no range means the whole document");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // Past a point the diff has stopped describing an edit and started
+    // describing a different file, and one full-text change is smaller
+    // on the wire and cheaper to apply than fifty ranges.
+    #[test]
+    fn a_wholesale_rewrite_falls_back_to_sending_the_file() {
+        // Every third line rewritten, so the diff really is dozens of
+        // separate hunks rather than one big replacement.
+        let old: String = (0..200).map(|i| format!("line {i}\n")).collect();
+        let new: String = (0..200).map(|i| if i % 3 == 0 { format!("changed {i}\n") } else { format!("line {i}\n") }).collect();
+        assert!(line_changes(&old, &new, PositionEncoding::Utf32).is_none());
+        // And with nothing to be a difference from.
+        assert!(line_changes("", "hello\n", PositionEncoding::Utf32).is_none());
     }
 
     // `--apply-edits` is a policy, so the thing to pin down is what
@@ -1882,7 +2237,7 @@ mod tests {
     fn opening_a_document_tells_the_server_its_language_version_and_text() {
         let dir = temp_dir("didopen");
         let mut server = ready_echo_server(&dir);
-        assert_eq!(server.sync(), Sync { open_close: true, change: true, save: true });
+        assert_eq!(server.sync(), Sync { open_close: true, change: true, incremental: false, save: true });
 
         server.open_document("file:///p/x.sh", "shellscript", 3, "echo hi\n");
         let seen = document_notifications(&mut server, 1);
@@ -2147,7 +2502,7 @@ mod tests {
         let capabilities = r#"{"capabilities":{"textDocumentSync":{"openClose":false,"change":0,"save":false}}}"#;
         let mut server = Server::start(1, &echo_server(capabilities), "mock", &dir, ApplyEdits::default()).unwrap();
         run_until_ready(&mut server);
-        assert_eq!(server.sync(), Sync { open_close: false, change: false, save: false });
+        assert_eq!(server.sync(), Sync { open_close: false, change: false, incremental: false, save: false });
 
         server.open_document("file:///p/x.sh", "shellscript", 1, "one");
         assert_eq!(server.open_documents(), 0);
@@ -2162,12 +2517,14 @@ mod tests {
         // The bare-number form names only the change kind; a server
         // using it still expects open/close.
         let number = json::parse(r#"{"textDocumentSync":2}"#).unwrap();
-        assert_eq!(Sync::parse(&number), Sync { open_close: true, change: true, save: false });
+        assert_eq!(Sync::parse(&number), Sync { open_close: true, change: true, incremental: true, save: false }, "kind 2 is the incremental one");
+        let full = json::parse(r#"{"textDocumentSync":1}"#).unwrap();
+        assert_eq!(Sync::parse(&full), Sync { open_close: true, change: true, incremental: false, save: false });
         let none = json::parse(r#"{"textDocumentSync":0}"#).unwrap();
-        assert_eq!(Sync::parse(&none), Sync { open_close: true, change: false, save: false });
+        assert_eq!(Sync::parse(&none), Sync { open_close: true, change: false, incremental: false, save: false });
         // `save` may be a bool or an options object; both mean yes.
         let object = json::parse(r#"{"textDocumentSync":{"openClose":true,"change":1,"save":{"includeText":true}}}"#).unwrap();
-        assert_eq!(Sync::parse(&object), Sync { open_close: true, change: true, save: true });
+        assert_eq!(Sync::parse(&object), Sync { open_close: true, change: true, incremental: false, save: true });
         // Said nothing at all: assume full sync rather than the spec's
         // own `None` default, so a server that merely forgot to describe
         // itself still works. See `Sync::default`.
