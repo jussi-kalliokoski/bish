@@ -6161,6 +6161,37 @@ fn addressable_scrollback_len(s: &vt100::Screen) -> usize {
     }
 }
 
+// The last row of the live grid that holds anything, or `None` for a
+// grid that is entirely blank.
+//
+// A `vt100::Grid` is always allocated at its full height whether or not
+// anything has been written into it, so "how much of this grid is real
+// content" has to be asked rather than assumed. Scans upward, so the
+// ordinary case -- a shell pane whose lower rows really are untouched --
+// stops within a row or two.
+fn last_written_row(s: &vt100::Screen) -> Option<usize> {
+    let (rows, cols) = s.size();
+    (0..rows).rev().find(|&row| (0..cols).any(|col| s.cell(row, col).ch != ' '))
+}
+
+// How many lines of this screen normal mode can address: the scrollback
+// it is allowed to see, plus the part of the live grid that is real.
+//
+// The live cursor's row is always real (freeze_idle_prompt writes the
+// prompt there before this is ever asked), and for a *shell* pane
+// nothing below it is -- output grows downward and the cursor sits at
+// the end. That was the whole rule, and it is wrong for a program that
+// paints the grid wholesale: vim parks its cursor on line 1 and fills
+// every row beneath, so clipping at the cursor left normal mode showing
+// one line of a full screen. Taking whichever is lower covers both --
+// for a shell pane the rows below the cursor are blank, so the answer is
+// unchanged.
+fn addressable_len(s: &vt100::Screen) -> usize {
+    let (cursor_row, _) = s.cursor();
+    let last = last_written_row(s).unwrap_or(0).max(cursor_row);
+    (addressable_scrollback_len(s) + last + 1).max(1)
+}
+
 impl ScreenBuffer {
     fn new(screen: Rc<RefCell<vt100::Screen>>, vheight: usize) -> ScreenBuffer {
         let (sb_len, cur_row, cur_col) = {
@@ -6175,7 +6206,7 @@ impl ScreenBuffer {
         let cursor = (sb_len + cur_row, cur_col);
         let vheight = vheight.max(1);
         let vtop = cursor.0.saturating_sub(vheight - 1);
-        let entry_line_count = (sb_len + cur_row + 1).max(1);
+        let entry_line_count = addressable_len(&screen.borrow());
         ScreenBuffer { screen, cursor, vtop, vheight, marks: HashMap::new(), selections: Vec::new(), entry_line_count, reported_new_lines: 0 }
     }
 
@@ -6233,20 +6264,12 @@ impl ScreenBuffer {
 impl BisheditBuffer for ScreenBuffer {
     // Deliberately *not* scrollback.len() + the grid's full (fixed) row
     // count: a vt100::Grid is always allocated at its full height
-    // regardless of how much has actually been written into it, so any
-    // rows below wherever the terminal's own live cursor currently sits
-    // are genuinely blank padding that scrolling hasn't reached yet, not
-    // real content -- counting them let G/j/Ctrl-D/etc. navigate past the
-    // actual end of the pane's content into empty space. The live
-    // cursor's row is always real content by the time this is read: the
-    // one and only ScreenBuffer constructor call site (run_normal_mode_
-    // navigation) always calls freeze_idle_prompt immediately before
-    // building this, which guarantees something (the prompt text) is
-    // written at wherever the cursor is.
+    // regardless of how much has actually been written into it, so
+    // counting every row would let G/j/Ctrl-D navigate past the end of
+    // the pane's content into empty space. See `addressable_len` for
+    // where the end actually is, and why the cursor alone does not say.
     fn line_count(&self) -> usize {
-        let s = self.screen.borrow();
-        let (cursor_row, _) = s.cursor();
-        (addressable_scrollback_len(&s) + cursor_row + 1).max(1)
+        addressable_len(&self.screen.borrow())
     }
 
     fn line_len(&self, line: usize) -> usize {
@@ -12872,6 +12895,47 @@ mod alt_screen_addressing_tests {
         screen.feed(b"\x1b[?1049l"); // back to the primary screen (vim/less/... on exit)
         assert!(!screen.using_alternate);
         assert_eq!(addressable_scrollback_len(&screen), primary_len);
+    }
+
+    // The other half of the same report, and the half that was still
+    // broken: a program that paints the whole grid parks its cursor
+    // wherever it likes -- vim leaves it on line 1 -- and clipping the
+    // addressable range at the cursor row showed one line of a full
+    // screen. See `addressable_len`.
+    #[test]
+    fn a_full_screen_program_is_addressable_below_its_own_cursor() {
+        let screen = Rc::new(RefCell::new(vt100::Screen::new(6, 20)));
+        {
+            let mut s = screen.borrow_mut();
+            s.feed(b"\x1b[?1049h");
+            // Paint every row, then send the cursor back to the top --
+            // exactly what a full-screen editor does before waiting for
+            // a key.
+            for row in 0..6 {
+                s.feed(format!("\x1b[{};1Hrow {row}", row + 1).as_bytes());
+            }
+            s.feed(b"\x1b[1;1H");
+            assert_eq!(s.cursor().0, 0, "cursor parked at the top, content below it");
+        }
+        let buf = ScreenBuffer::new(screen, 6);
+        assert_eq!(buf.line_count(), 6, "the whole painted screen, not just the cursor's row");
+        assert_eq!(buf.line_chars(5).into_iter().collect::<String>(), "row 5");
+        // Entering does not read as "5 new lines arrived" either.
+        assert_eq!(buf.new_lines(), 0);
+    }
+
+    // ...and the rule that was there before still holds where it was
+    // right: a shell pane's rows below the cursor really are untouched
+    // padding, and counting them would let `G` walk into empty space.
+    #[test]
+    fn a_shell_panes_blank_rows_below_the_cursor_are_still_not_content() {
+        let screen = Rc::new(RefCell::new(vt100::Screen::new(10, 20)));
+        {
+            let mut s = screen.borrow_mut();
+            s.feed(b"one\r\ntwo\r\nthree$ ");
+        }
+        let buf = ScreenBuffer::new(screen, 10);
+        assert_eq!(buf.line_count(), 3, "three written rows, seven blank ones below");
     }
 
     // Same bug, exercised through `ScreenBuffer` itself (the actual
