@@ -11696,6 +11696,50 @@ pub fn bishopt_values(name: &str) -> &'static [&'static str] {
     }
 }
 
+// The `::bish` namespace's own vocabulary, for Tab completion
+// (bishedit::completion::bish_candidates).
+//
+// Here rather than in bishedit for the same reason `bishopt_names` is:
+// these subcommands are dispatched a few hundred lines above in
+// `run_bish`/`run_lsp`/`run_hl`, and a hand-copied list in another
+// module would advertise subcommands that do not exist and hide ones
+// that do. `every_bish_subcommand_is_dispatched` is what keeps the two
+// honest about each other.
+//
+// Only the canonical spellings. The aliases (`win`, `list`, `remove`,
+// `prev`) are all understood, but a completion list is a menu, and a
+// menu should show one name per thing -- the same call
+// `bishopt_candidates` already makes about `-s`/`--set`.
+pub fn bish_subcommands() -> &'static [&'static str] {
+    &["theme", "window", "hook", "hl", "lsp"]
+}
+
+// The second level: what follows `::bish <sub>`. Empty for a
+// subcommand that takes something other than a fixed word.
+pub fn bish_sub_subcommands(sub: &str) -> &'static [&'static str] {
+    match sub {
+        "theme" => &["begin", "end"],
+        "window" | "win" => &["next", "previous", "new", "rename", "ls", "select"],
+        "hook" => &["ls", "add", "rm", "help"],
+        "lsp" => &["ls", "add", "rm", "status", "log", "restart", "help"],
+        _ => &[],
+    }
+}
+
+// The flags `::bish lsp add` takes, in the spelling its own usage line
+// uses. `=`-terminated because each takes a value, and the completion
+// menu offering `--lang=` rather than `--lang` puts the cursor where
+// the next thing to type goes.
+pub fn lsp_add_flags() -> &'static [&'static str] {
+    &["--lang=", "--root=", "--root-cmd=", "--apply-edits="]
+}
+
+// The values `--apply-edits=` accepts -- the one flag there with a
+// fixed set, the same rule `bishopt_values` follows.
+pub fn lsp_apply_edits_values() -> &'static [&'static str] {
+    &["scoped", "never", "always"]
+}
+
 // One line about each bishopt, for `bishopt --describe` and the
 // `:help options` page.
 //
@@ -13859,6 +13903,46 @@ mod tests {
     // enough to escape this regex is a false negative, not a false
     // failure; a false *failure* means the arm is genuinely absent from
     // the list, and adding it there is the fix.
+    // The completion menu is only worth having if it lists what is real.
+    // Asked of the dispatcher itself rather than of a second copy of the
+    // list: `::bish` says "unknown subcommand" for anything it does not
+    // handle, so running each one and looking for that answers the
+    // question directly.
+    #[test]
+    fn every_offered_bish_subcommand_is_really_dispatched() {
+        let unknown = |args: &[&str]| {
+            let mut shell = Shell::new();
+            // `Capture` takes stderr too, which is where the
+            // "unknown subcommand" line goes.
+            let out = capture_output(&mut shell);
+            shell.run_bish(&strs(args));
+            let seen = out.borrow().clone();
+            seen.contains("unknown subcommand")
+        };
+        // The negative control: a name nothing dispatches really does
+        // say so, or this test proves nothing.
+        assert!(unknown(&["bishNoSuchSubcommand"]), "the probe itself works");
+
+        for sub in bish_subcommands() {
+            assert!(!unknown(&[sub]), "::bish {sub} is offered but not dispatched");
+            for second in bish_sub_subcommands(sub) {
+                assert!(!unknown(&[sub, second]), "::bish {sub} {second} is offered but not dispatched");
+            }
+        }
+    }
+
+    // Same question for the one flag with a fixed set of values behind
+    // it: an offered value that `add` then rejects would be worse than
+    // offering nothing.
+    #[test]
+    fn every_offered_apply_edits_value_is_accepted() {
+        for value in lsp_apply_edits_values() {
+            let mut shell = Shell::new();
+            assert_eq!(shell.run_lsp(&strs(&["add", &format!("--apply-edits={value}"), "x"])), 0, "{value}");
+            assert_eq!(shell.lsp_servers[0].apply_edits, *value);
+        }
+    }
+
     #[test]
     fn every_dispatched_builtin_is_known() {
         let source = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/exec.rs")).expect("exec.rs is readable from its own tests");

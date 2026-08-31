@@ -229,15 +229,150 @@ fn subcommand_candidates_core(man: Option<&manpages::ManPageData>, prefix: &str)
 // `complete` spec follows, so `bishopt --set wrap <Tab>` offers nothing
 // rather than falling through and offering files.
 //
-// `bishopt` is the whole list today. It earns its place because the
-// option registry is exactly the kind of thing nobody can be expected to
-// remember, and `bishopt` with no arguments already prints every name --
-// this just puts that same list under the key people actually press.
-pub(crate) fn builtin_argument_candidates(role: &CmdRole, prefix_text: &str, prefix: &str) -> Option<Vec<CompletionCandidate>> {
+// `bishopt` and `::bish`, for the same reason: both are registries
+// nobody can be expected to remember, and both already print their own
+// contents when asked -- this puts that same list under the key people
+// actually press.
+//
+// `hl` is the currently-set `::bish hl` colour names, for the one place
+// a fixed list cannot answer: that namespace is open, so what exists is
+// whatever has been set. Empty for a caller with no shell to read it
+// from (the editor's colon line), which falls back to the names bish
+// itself produces.
+pub(crate) fn builtin_argument_candidates(role: &CmdRole, prefix_text: &str, prefix: &str, hl: &[String]) -> Option<Vec<CompletionCandidate>> {
     let CmdRole::Argument { command, arg_index } = role else { return None };
     match command.as_deref()? {
         "bishopt" => Some(bishopt_candidates(&preceding_args(prefix_text, *arg_index), prefix)),
+        "::bish" => bish_candidates(&preceding_args(prefix_text, *arg_index), prefix, hl),
         _ => None,
+    }
+}
+
+// `::bish <sub> ...`. `None` means "this position is an ordinary
+// command or a free-text value" -- an event's handler, a language
+// server's own command line, a CSS colour -- and the generic fallbacks
+// should have it instead. `Some(vec![])` would claim the position and
+// offer nothing, which is right for `bishopt --set wrap` and wrong
+// here.
+pub(crate) fn bish_candidates(args: &[String], prefix: &str, hl: &[String]) -> Option<Vec<CompletionCandidate>> {
+    let strings = |vs: &[&str]| vs.iter().map(|v| v.to_string()).collect::<Vec<_>>();
+    let subs = |sub: &str| strings(crate::exec::bish_sub_subcommands(sub));
+    let (sub, rest) = match args.split_first() {
+        None => return Some(rank(prefix, strings(crate::exec::bish_subcommands()))),
+        Some((sub, rest)) => (sub.as_str(), rest),
+    };
+    match sub {
+        "hl" => Some(hl_candidates(rest, prefix, hl)),
+        "lsp" => lsp_candidates(rest, prefix),
+        "hook" => hook_candidates(rest, prefix),
+        "theme" | "window" | "win" => match rest {
+            [] => Some(rank(prefix, subs(sub))),
+            // `window rename NAME` and `window select NAME` take a name
+            // this cannot know; everything else is already complete.
+            _ => Some(Vec::new()),
+        },
+        _ => Some(Vec::new()),
+    }
+}
+
+// `::bish hl [NAME | --set NAME COLOUR | --unset NAME]`.
+//
+// The namespace is open -- a language server's own semantic token type
+// names are settable before any version of bish has heard of them (see
+// repl::semantic_spans) -- so a completion list here can only ever be a
+// starting point, never the set of legal answers. It offers what bish
+// itself draws, plus whatever is already set.
+fn hl_candidates(args: &[String], prefix: &str, hl: &[String]) -> Vec<CompletionCandidate> {
+    let known = || {
+        let mut names: Vec<String> = crate::bishedit::highlight::HL_NAMES.iter().map(|(_, name)| name.to_string()).collect();
+        for name in hl {
+            if !names.contains(name) {
+                names.push(name.clone());
+            }
+        }
+        names
+    };
+    match args {
+        [] if prefix.starts_with('-') => rank(prefix, vec!["--set".to_string(), "--unset".to_string()]),
+        // Reading one: anything is a legal question, but the ones that
+        // will actually answer are the ones that are set.
+        [] => rank(prefix, known()),
+        [flag] if flag == "--set" || flag == "-s" => rank(prefix, known()),
+        // Unsetting: only what is set can be unset, and saying so is
+        // more useful than listing names that would just error.
+        [flag] if flag == "--unset" || flag == "-u" => rank(prefix, hl.to_vec()),
+        // The colour itself. Free text -- a CSS colour, or a
+        // comma-separated list of fallbacks -- so there is nothing to
+        // offer, but nor should a file name be offered.
+        _ => Vec::new(),
+    }
+}
+
+// `::bish lsp <sub>`.
+fn lsp_candidates(args: &[String], prefix: &str) -> Option<Vec<CompletionCandidate>> {
+    let strings = |vs: &[&str]| vs.iter().map(|v| v.to_string()).collect::<Vec<_>>();
+    match args.split_first() {
+        None => Some(rank(prefix, strings(crate::exec::bish_sub_subcommands("lsp")))),
+        Some((sub, rest)) if sub == "add" => {
+            // `--apply-edits scoped` -- the separated spelling, where
+            // the value is its own word.
+            if rest.last().is_some_and(|w| w == "--apply-edits") {
+                return Some(rank(prefix, strings(crate::exec::lsp_apply_edits_values())));
+            }
+            if prefix.starts_with('-') {
+                let mut flags = strings(crate::exec::lsp_add_flags());
+                // `--apply-edits=` is the one with a fixed set of
+                // values, so the whole `--apply-edits=always` is worth
+                // offering rather than just the flag.
+                if prefix.starts_with("--apply-edits=") {
+                    flags.extend(crate::exec::lsp_apply_edits_values().iter().map(|v| format!("--apply-edits={v}")));
+                }
+                return Some(rank(prefix, flags));
+            }
+            // Past the flags this is the server's own command line,
+            // which is an ordinary command and then its ordinary
+            // arguments.
+            None
+        }
+        // `rm`/`log`/`restart` take an id, which is whatever
+        // `::bish lsp ls` last printed -- a number, not a name.
+        Some(_) => Some(Vec::new()),
+    }
+}
+
+// `::bish hook <sub>`, whose `add` takes one of a fixed set of events
+// and then a command.
+fn hook_candidates(args: &[String], prefix: &str) -> Option<Vec<CompletionCandidate>> {
+    let strings = |vs: &[&str]| vs.iter().map(|v| v.to_string()).collect::<Vec<_>>();
+    match args.split_first() {
+        None => Some(rank(prefix, strings(crate::exec::bish_sub_subcommands("hook")))),
+        Some((sub, rest)) if sub == "add" || sub == "ls" || sub == "list" => {
+            if prefix.starts_with('-') {
+                return Some(rank(prefix, vec!["--lang=".to_string()]));
+            }
+            // Everything before the event is `--lang=GLOB` or
+            // `--lang GLOB`; the first word that is neither is the
+            // event, and anything after it is the handler command.
+            let mut after_flags = rest.iter().peekable();
+            let mut positional = 0;
+            while let Some(word) = after_flags.next() {
+                if word == "--lang" {
+                    after_flags.next();
+                    continue;
+                }
+                if word.starts_with("--lang=") {
+                    continue;
+                }
+                positional += 1;
+            }
+            match (sub.as_str(), positional) {
+                ("add", 0) => Some(rank(prefix, strings(crate::exec::HOOK_EVENTS))),
+                // The handler: an ordinary command line.
+                ("add", _) => None,
+                _ => Some(Vec::new()),
+            }
+        }
+        Some(_) => Some(Vec::new()),
     }
 }
 
@@ -277,7 +412,14 @@ pub(crate) fn bishopt_candidates(args: &[String], prefix: &str) -> Vec<Completio
 // command lines -- see run_command_mode's own doc comment), but the
 // builtins whose arguments bish defines need no shell context at all, so
 // they can be offered anywhere a line is being typed.
-pub struct BuiltinCompletionProvider;
+pub struct BuiltinCompletionProvider {
+    /// The same `::bish hl` snapshot `ShellCompletionProvider` takes.
+    /// The colon line has no shell *completion* context -- no cwd, no
+    /// PATH, no registered specs -- but it does have a session behind
+    /// it, and changing a colour is something you do while looking at
+    /// the buffer it changes, so this one snapshot is worth carrying.
+    pub hl_names: Vec<String>,
+}
 
 impl CompletionProvider for BuiltinCompletionProvider {
     fn complete(&self, req: CompletionRequest) -> CompletionResult {
@@ -287,7 +429,7 @@ impl CompletionProvider for BuiltinCompletionProvider {
         let prefix: String = chars[word_start..cursor].iter().collect();
         let prefix_text: String = chars[..word_start].iter().collect();
         let role = classify_word_role(&prefix_text);
-        let candidates = builtin_argument_candidates(&role, &prefix_text, &prefix).unwrap_or_default();
+        let candidates = builtin_argument_candidates(&role, &prefix_text, &prefix, &self.hl_names).unwrap_or_default();
         CompletionResult { word_start, candidates }
     }
 }
@@ -346,6 +488,15 @@ pub struct ShellCompletionProvider<'a> {
     /// read it from, which offers everything -- the behaviour before
     /// this existed.
     pub honor_gitignore: bool,
+    /// The `::bish hl` colour names currently set (a per-prompt
+    /// snapshot of `Shell::hl_colors`'s keys), for completing
+    /// `::bish hl --unset <Tab>`.
+    ///
+    /// Needed as a snapshot rather than a fixed list because that
+    /// namespace is open: what exists is whatever has been set, which
+    /// for a language server's semantic token types is a set no version
+    /// of bish knows in advance. Empty for a caller with no shell.
+    pub hl_names: Vec<String>,
 }
 
 impl<'a> CompletionProvider for ShellCompletionProvider<'a> {
@@ -366,7 +517,7 @@ impl<'a> CompletionProvider for ShellCompletionProvider<'a> {
         // outright, per real bash) but before the generic flag/
         // subcommand/file fallbacks, since those know nothing about a
         // builtin whose arguments bish itself defines.
-        if let Some(candidates) = builtin_argument_candidates(&role, &prefix_text, &prefix) {
+        if let Some(candidates) = builtin_argument_candidates(&role, &prefix_text, &prefix, &self.hl_names) {
             return CompletionResult { word_start, candidates };
         }
 
@@ -591,13 +742,17 @@ mod tests {
         let _ = classify_word_role("echo $(git chec");
     }
 
+    fn strs(words: &[&str]) -> Vec<String> {
+        words.iter().map(|w| w.to_string()).collect()
+    }
+
     fn display_names(candidates: Vec<CompletionCandidate>) -> Vec<String> {
         candidates.into_iter().map(|c| c.display).collect()
     }
 
     #[test]
     fn command_name_candidates_includes_known_builtins_matching_prefix() {
-        let provider = ShellCompletionProvider { cwd: None, known_functions: None, completions: None, default_completion: None, action_ctx: None, functions_preamble: None, honor_gitignore: false };
+        let provider = ShellCompletionProvider { cwd: None, known_functions: None, completions: None, default_completion: None, action_ctx: None, functions_preamble: None, honor_gitignore: false, hl_names: Vec::new() };
         let names = display_names(provider.command_name_candidates("ech"));
         assert!(names.iter().any(|n| n == "echo"), "{names:?}");
     }
@@ -610,7 +765,7 @@ mod tests {
         // prefixes, which would make the assertion flaky.
         let mut functions = HashSet::new();
         functions.insert("zz_bish_test_func".to_string());
-        let provider = ShellCompletionProvider { cwd: None, known_functions: Some(&functions), completions: None, default_completion: None, action_ctx: None, functions_preamble: None, honor_gitignore: false };
+        let provider = ShellCompletionProvider { cwd: None, known_functions: Some(&functions), completions: None, default_completion: None, action_ctx: None, functions_preamble: None, honor_gitignore: false, hl_names: Vec::new() };
         let names = display_names(provider.command_name_candidates("zz_bish_test"));
         assert_eq!(names, vec!["zz_bish_test_func".to_string()]);
     }
@@ -620,7 +775,7 @@ mod tests {
         // coreutils -- same real-PATH assumption this whole feature
         // already leans on elsewhere (highlight.rs's own is_in_path
         // tests).
-        let provider = ShellCompletionProvider { cwd: None, known_functions: None, completions: None, default_completion: None, action_ctx: None, functions_preamble: None, honor_gitignore: false };
+        let provider = ShellCompletionProvider { cwd: None, known_functions: None, completions: None, default_completion: None, action_ctx: None, functions_preamble: None, honor_gitignore: false, hl_names: Vec::new() };
         let names = display_names(provider.command_name_candidates("tru"));
         assert!(names.iter().any(|n| n == "true"), "{names:?}");
     }
@@ -678,7 +833,7 @@ mod tests {
         std::fs::write(dir.join("widget-notes.txt"), b"hi").unwrap();
         std::fs::write(dir.join("unrelated.txt"), b"hi").unwrap();
 
-        let provider = ShellCompletionProvider { cwd: Some(&dir), known_functions: None, completions: None, default_completion: None, action_ctx: None, functions_preamble: None, honor_gitignore: false };
+        let provider = ShellCompletionProvider { cwd: Some(&dir), known_functions: None, completions: None, default_completion: None, action_ctx: None, functions_preamble: None, honor_gitignore: false, hl_names: Vec::new() };
         let names = display_names(provider.file_candidates("widg"));
 
         std::fs::remove_dir_all(&dir).ok();
@@ -709,7 +864,7 @@ mod tests {
             unsafe { std::env::set_var("HOME", &dir) };
             // cwd is deliberately a different, unrelated directory --
             // confirms the lookup actually goes to $HOME, not cwd.
-            let provider = ShellCompletionProvider { cwd: Some(Path::new("/")), known_functions: None, completions: None, default_completion: None, action_ctx: None, functions_preamble: None, honor_gitignore: false };
+            let provider = ShellCompletionProvider { cwd: Some(Path::new("/")), known_functions: None, completions: None, default_completion: None, action_ctx: None, functions_preamble: None, honor_gitignore: false, hl_names: Vec::new() };
             let names = display_names(provider.file_candidates("~/.co"));
             unsafe { std::env::set_var("HOME", &original_home) };
             names
@@ -725,13 +880,13 @@ mod tests {
 
     #[test]
     fn file_candidates_yields_nothing_without_a_cwd() {
-        let provider = ShellCompletionProvider { cwd: None, known_functions: None, completions: None, default_completion: None, action_ctx: None, functions_preamble: None, honor_gitignore: false };
+        let provider = ShellCompletionProvider { cwd: None, known_functions: None, completions: None, default_completion: None, action_ctx: None, functions_preamble: None, honor_gitignore: false, hl_names: Vec::new() };
         assert_eq!(provider.file_candidates("anything"), Vec::new());
     }
 
     #[test]
     fn complete_dispatches_bare_prefix_to_command_names() {
-        let provider = ShellCompletionProvider { cwd: None, known_functions: None, completions: None, default_completion: None, action_ctx: None, functions_preamble: None, honor_gitignore: false };
+        let provider = ShellCompletionProvider { cwd: None, known_functions: None, completions: None, default_completion: None, action_ctx: None, functions_preamble: None, honor_gitignore: false, hl_names: Vec::new() };
         let result = provider.complete(CompletionRequest { line: "ech", cursor: 3 });
         assert_eq!(result.word_start, 0);
         let names = display_names(result.candidates);
@@ -744,7 +899,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("readme.txt"), b"hi").unwrap();
 
-        let provider = ShellCompletionProvider { cwd: Some(&dir), known_functions: None, completions: None, default_completion: None, action_ctx: None, functions_preamble: None, honor_gitignore: false };
+        let provider = ShellCompletionProvider { cwd: Some(&dir), known_functions: None, completions: None, default_completion: None, action_ctx: None, functions_preamble: None, honor_gitignore: false, hl_names: Vec::new() };
         let line = "some-dynamic-cmd read";
         let result = provider.complete(CompletionRequest { line, cursor: line.chars().count() });
         let word_start = result.word_start;
@@ -761,7 +916,7 @@ mod tests {
         let mut completions = HashMap::new();
         completions.insert("fruit".to_string(), compgen::CompgenSpec { wordlist: Some("apple avocado banana".to_string()), ..Default::default() });
         let provider =
-            ShellCompletionProvider { cwd: None, known_functions: None, completions: Some(&completions), default_completion: None, action_ctx: None, functions_preamble: None, honor_gitignore: false };
+            ShellCompletionProvider { cwd: None, known_functions: None, completions: Some(&completions), default_completion: None, action_ctx: None, functions_preamble: None, honor_gitignore: false, hl_names: Vec::new() };
         let line = "fruit a";
         let result = provider.complete(CompletionRequest { line, cursor: line.chars().count() });
         assert_eq!(display_names(result.candidates), vec!["apple".to_string(), "avocado".to_string()]);
@@ -779,6 +934,7 @@ mod tests {
             action_ctx: None,
             functions_preamble: None,
             honor_gitignore: false,
+            hl_names: Vec::new(),
         };
         let line = "unknowncmd12345 def";
         let result = provider.complete(CompletionRequest { line, cursor: line.chars().count() });
@@ -791,7 +947,7 @@ mod tests {
         // completions concept at all" case, distinct from "nothing
         // registered yet" -- must fall straight through to the built-in
         // command-name-candidates path, same as today.
-        let provider = ShellCompletionProvider { cwd: None, known_functions: None, completions: None, default_completion: None, action_ctx: None, functions_preamble: None, honor_gitignore: false };
+        let provider = ShellCompletionProvider { cwd: None, known_functions: None, completions: None, default_completion: None, action_ctx: None, functions_preamble: None, honor_gitignore: false, hl_names: Vec::new() };
         let line = "ech";
         let result = provider.complete(CompletionRequest { line, cursor: line.chars().count() });
         assert!(display_names(result.candidates).iter().any(|n| n == "echo"));
@@ -812,12 +968,116 @@ mod tests {
 
     fn bishopt_at(line: &str) -> Vec<String> {
         let cursor = line.chars().count();
-        BuiltinCompletionProvider
+        BuiltinCompletionProvider { hl_names: Vec::new() }
             .complete(CompletionRequest { line, cursor })
             .candidates
             .into_iter()
             .map(|c| c.display)
             .collect()
+    }
+
+    // `::bish` is reachable from the editor's colon line as well as the
+    // shell prompt, and the colon line is where most of it gets typed.
+    fn bish_at(line: &str) -> Vec<String> {
+        bishopt_at(line)
+    }
+
+    #[test]
+    fn bish_completes_its_own_subcommands() {
+        let names = bish_at("::bish ");
+        let mut expected: Vec<String> = crate::exec::bish_subcommands().iter().map(|s| s.to_string()).collect();
+        expected.sort();
+        let mut got = names.clone();
+        got.sort();
+        assert_eq!(got, expected, "the list is the dispatcher's, nothing invented and nothing missing");
+        assert_eq!(bish_at("::bish ls"), vec!["lsp".to_string()], "fuzzy, like every other list here");
+    }
+
+    #[test]
+    fn bish_completes_the_second_level_of_each_subcommand() {
+        for sub in crate::exec::bish_subcommands() {
+            let offered = bish_at(&format!("::bish {sub} "));
+            let expected = crate::exec::bish_sub_subcommands(sub);
+            for name in expected {
+                assert!(offered.contains(&name.to_string()), "::bish {sub} <Tab> should offer {name}, got {offered:?}");
+            }
+        }
+        assert!(bish_at("::bish lsp ").contains(&"restart".to_string()));
+        assert!(bish_at("::bish theme ").contains(&"begin".to_string()));
+    }
+
+    #[test]
+    fn bish_lsp_add_completes_its_flags_and_the_one_flag_with_fixed_values() {
+        let flags = bish_at("::bish lsp add --");
+        assert!(flags.contains(&"--lang=".to_string()) && flags.contains(&"--apply-edits=".to_string()), "{flags:?}");
+        // Both spellings of the value: attached to the flag...
+        let attached = bish_at("::bish lsp add --apply-edits=");
+        assert!(attached.contains(&"--apply-edits=scoped".to_string()), "{attached:?}");
+        // ...and as its own word.
+        assert_eq!(bish_at("::bish lsp add --apply-edits ").len(), crate::exec::lsp_apply_edits_values().len());
+        assert!(bish_at("::bish lsp add --apply-edits ").contains(&"always".to_string()));
+    }
+
+    // The server's own command line is an ordinary command line, so this
+    // position must be *given up* rather than claimed and answered with
+    // nothing -- the distinction `builtin_argument_candidates`'
+    // `Option` exists for.
+    #[test]
+    fn bish_lsp_add_hands_the_server_command_back_to_the_ordinary_completions() {
+        assert!(bish_candidates(&strs(&["lsp", "add"]), "rust-ana", &[]).is_none());
+        assert!(bish_candidates(&strs(&["lsp", "add", "--lang=rust"]), "rust-ana", &[]).is_none());
+        // And a hook's handler, for the same reason -- but only after
+        // its event, which is a fixed list.
+        assert!(bish_candidates(&strs(&["hook", "add"]), "editor", &[]).is_some());
+        assert!(bish_candidates(&strs(&["hook", "add", "editor:file:open"]), "my_", &[]).is_none());
+    }
+
+    #[test]
+    fn bish_hook_add_completes_the_event_from_the_real_list() {
+        let events = bish_at("::bish hook add ");
+        let mut expected: Vec<String> = crate::exec::HOOK_EVENTS.iter().map(|e| e.to_string()).collect();
+        expected.sort();
+        let mut got = events;
+        got.sort();
+        assert_eq!(got, expected);
+        // `--lang=` first is the same position, since it is a flag and
+        // not the event.
+        assert!(bish_at("::bish hook add --lang=rust ").contains(&"editor:file:open".to_string()));
+    }
+
+    // The namespace is open, so this list can only ever be a starting
+    // point -- but `--unset` is the exception: only what is set can be
+    // unset, and offering names that would just error is worse than
+    // offering none.
+    #[test]
+    fn bish_hl_completes_known_names_to_set_and_only_live_ones_to_unset() {
+        let set = display_names(hl_candidates(&strs(&["--set"]), "", &[]));
+        assert!(set.contains(&"string".to_string()) && set.contains(&"keyword".to_string()), "{set:?}");
+
+        let live = strs(&["parameter", "string"]);
+        let with_live = display_names(hl_candidates(&strs(&["--set"]), "", &live));
+        assert!(with_live.contains(&"parameter".to_string()), "a name only a server ever produced is still offered once set");
+        assert_eq!(with_live.iter().filter(|n| *n == "string").count(), 1, "and one that is both is offered once");
+
+        let unset = display_names(hl_candidates(&strs(&["--unset"]), "", &live));
+        assert_eq!(unset.len(), 2, "only the two that are set: {unset:?}");
+        assert!(display_names(hl_candidates(&strs(&["--unset"]), "", &[])).is_empty(), "nothing set, nothing to unset");
+
+        // The colour itself is free text, but a file name would be
+        // wrong, so the position is claimed and answered with nothing.
+        assert!(hl_candidates(&strs(&["--set", "string"]), "#ff", &[]).is_empty());
+        assert!(bish_candidates(&strs(&["hl", "--set", "string"]), "#ff", &[]).is_some());
+
+        let flags = bish_at("::bish hl --");
+        assert!(flags.contains(&"--set".to_string()) && flags.contains(&"--unset".to_string()), "{flags:?}");
+
+        // And the snapshot really does reach the colon line's own
+        // provider, which is the one place it had to be threaded rather
+        // than read.
+        let line = "::bish hl --unset ";
+        let colon = BuiltinCompletionProvider { hl_names: strs(&["colonLineOnly"]) };
+        let found = colon.complete(CompletionRequest { line, cursor: line.chars().count() });
+        assert_eq!(display_names(found.candidates), strs(&["colonLineOnly"]));
     }
 
     // Ordered by `rank` like every other candidate list here, which for
@@ -865,7 +1125,7 @@ mod tests {
     #[test]
     fn bishopt_never_falls_through_to_files() {
         let role = CmdRole::Argument { command: Some("bishopt".to_string()), arg_index: 3 };
-        assert_eq!(builtin_argument_candidates(&role, "bishopt --set wrap on ", ""), Some(Vec::new()));
+        assert_eq!(builtin_argument_candidates(&role, "bishopt --set wrap on ", "", &[]), Some(Vec::new()));
         assert_eq!(bishopt_at("bishopt wrap "), Vec::<String>::new());
     }
 
@@ -887,6 +1147,7 @@ mod tests {
             action_ctx: None,
             functions_preamble: None,
             honor_gitignore: false,
+            hl_names: Vec::new(),
         };
         let line = "bishopt --set wr";
         let result = provider.complete(CompletionRequest { line, cursor: line.chars().count() });
@@ -944,6 +1205,7 @@ mod tests {
             action_ctx: None,
             functions_preamble: None,
             honor_gitignore: false,
+            hl_names: Vec::new(),
         };
         let line = "ssh zzz";
         let result = provider.complete(CompletionRequest { line, cursor: line.chars().count() });
@@ -967,6 +1229,7 @@ mod tests {
             action_ctx: None,
             functions_preamble: None,
             honor_gitignore: false,
+            hl_names: Vec::new(),
         };
         let line = "scp zzz";
         let result = provider.complete(CompletionRequest { line, cursor: line.chars().count() });
@@ -993,6 +1256,7 @@ mod tests {
                 action_ctx: None,
                 functions_preamble: None,
                 honor_gitignore: honor,
+                hl_names: Vec::new(),
             };
             let line = "cat ta";
             provider

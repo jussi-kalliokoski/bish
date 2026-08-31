@@ -948,6 +948,7 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
             default_completion: default_completion_snapshot.as_ref(),
             action_ctx: Some(&action_ctx_snapshot),
             functions_preamble: Some(&preamble_snapshot),
+            hl_names: sessions[&session_id].shell.hl_colors().into_iter().map(|(name, _)| name).collect(),
         };
         // Same pattern again -- session_history is already the exact
         // snapshot the suggestions engine itself needs (see History's
@@ -11193,6 +11194,9 @@ fn run_command_mode(
         let prompt_row = command_mode_row(*term_rows) + 1;
         let prompt_str = if buffer.is_empty() { prompt::command_mode_prompt() } else { prompt::continuation() };
         let mouse = sessions.get(&session_id).is_none_or(|s| s.shell.bishopt_bool("mouse"));
+        let builtin_completion = crate::bishedit::completion::BuiltinCompletionProvider {
+            hl_names: sessions.get(&session_id).map(|s| s.shell.hl_colors().into_iter().map(|(name, _)| name).collect()).unwrap_or_default(),
+        };
         print!("\x1b[{};1H", prompt_row);
         let _ = io::stdout().flush();
 
@@ -11219,7 +11223,10 @@ fn run_command_mode(
         // itself defines need no session, cwd or PATH to complete, and
         // `:bishopt --set <Tab>` is worth as much here as at the prompt
         // -- more, since changing a view option is something you do
-        // *while* looking at the buffer it changes. menu_capable: false
+        // *while* looking at the buffer it changes. Which is also why it
+        // gets the one snapshot it cannot do without: `::bish hl`'s
+        // namespace is open, so what is *set* is knowable only from the
+        // session. menu_capable: false
         // -- this colon line has no row of its own to draw a menu into,
         // so Tab cycles by splicing, which is what a one-line prompt
         // wants anyway.
@@ -11232,7 +11239,7 @@ fn run_command_mode(
             0,
             *term_cols,
             HighlightContext::default(),
-            Some(&crate::bishedit::completion::BuiltinCompletionProvider),
+            Some(&builtin_completion),
             None,
             false,
             None,
