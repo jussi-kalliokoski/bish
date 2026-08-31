@@ -964,6 +964,24 @@ fn detect_eol(text: &str) -> crate::editorconfig::Eol {
     crate::editorconfig::Eol::Lf
 }
 
+// FNV-1a over a file's bytes, for telling "the same file" from "a
+// different file" cheaply.
+//
+// A hash rather than the text itself because the alternative is keeping
+// a second copy of every open file in memory forever, to answer a
+// question asked once per `:w`. Not a cryptographic hash and it does not
+// need to be: what is on the other side of this comparison is a
+// formatter or a branch switch, not an adversary building a collision.
+fn disk_hash(path: &Path) -> Option<u64> {
+    let bytes = std::fs::read(path).ok()?;
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100_0000_01b3);
+    }
+    Some(h)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1527,22 +1545,4 @@ mod tests {
         assert_eq!(buf.eol, crate::editorconfig::Eol::Cr);
         assert_eq!(buf.on_disk_text(), "one\rtwo\r");
     }
-}
-
-// FNV-1a over a file's bytes, for telling "the same file" from "a
-// different file" cheaply.
-//
-// A hash rather than the text itself because the alternative is keeping
-// a second copy of every open file in memory forever, to answer a
-// question asked once per `:w`. Not a cryptographic hash and it does not
-// need to be: what is on the other side of this comparison is a
-// formatter or a branch switch, not an adversary building a collision.
-fn disk_hash(path: &Path) -> Option<u64> {
-    let bytes = std::fs::read(path).ok()?;
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in bytes {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x100_0000_01b3);
-    }
-    Some(h)
 }
