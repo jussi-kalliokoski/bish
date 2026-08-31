@@ -80,6 +80,10 @@ pub struct TextBuffer {
     // next answer arrives is a colour in the wrong place, and clearing
     // them on every keystroke would strobe the whole file instead.
     pub semantic_spans: Vec<super::highlight::StyledSpan>,
+    // A fingerprint of the file's bytes as of the last read or write, for
+    // noticing that something else rewrote it since. `None` for a buffer
+    // that is not a view of a file on disk at all.
+    disk_hash: Option<u64>,
     // `:diag`'s own last result (see fileeditor::diagnose_buffer) -- rides
     // along with the buffer exactly like `selections` does (survives a
     // Ctrl+Space detach/reattach, since both live on the one thing that
@@ -263,6 +267,7 @@ impl TextBuffer {
             breakpoints: std::collections::BTreeSet::new(),
             readonly: false,
             dirty: false,
+            disk_hash: None,
             version: 0,
             path: None,
         }
@@ -277,7 +282,50 @@ impl TextBuffer {
             Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
             Err(e) => return Err(e),
         };
-        Ok(TextBuffer::from_text(path, &text, vheight))
+        let mut buf = TextBuffer::from_text(path, &text, vheight);
+        buf.disk_hash = disk_hash(path);
+        Ok(buf)
+    }
+
+    /// Whether the file changed on disk since this buffer last read or
+    /// wrote it.
+    ///
+    /// Compares *content*, not mtime: a `touch`, a formatter that made no
+    /// change, or a checkout that restored the same bytes all move the
+    /// timestamp without changing anything, and refusing to save over
+    /// those would be the false positive that makes this annoying rather
+    /// than useful.
+    ///
+    /// `false` for a buffer with no path, one whose file has since been
+    /// removed (writing it back is exactly what you would want), and one
+    /// whose content never came from that path in the first place -- a
+    /// zip member, a decompressed stream -- since for those there is
+    /// nothing on disk this is a view of.
+    pub fn changed_on_disk(&self) -> bool {
+        let Some(path) = self.path.as_deref() else { return false };
+        let Some(known) = self.disk_hash else { return false };
+        disk_hash(path).is_some_and(|now| now != known)
+    }
+
+    /// Re-reads this buffer from its own file, discarding whatever is in
+    /// it -- `:e!`. The cursor is kept where it was, clamped.
+    pub fn reload(&mut self) -> io::Result<()> {
+        let path = self.path.clone().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "No file name"))?;
+        let text = std::fs::read_to_string(&path)?;
+        let (row, col) = self.cursor;
+        let fresh = TextBuffer::from_text(&path, &text, self.vheight);
+        self.lines = fresh.lines;
+        self.eol = fresh.eol;
+        self.disk_hash = disk_hash(&path);
+        self.dirty = false;
+        self.saved_node = self.undo.current_id();
+        self.diagnostics.clear();
+        self.selections.clear();
+        self.diff = None;
+        let row = row.min(self.lines.len() - 1);
+        self.cursor = (row, col.min(self.lines[row].len()));
+        self.content_changed();
+        Ok(())
     }
 
     // A buffer holding `text` but named `path` -- for content that has a
@@ -343,6 +391,7 @@ impl TextBuffer {
             breakpoints: std::collections::BTreeSet::new(),
             readonly: false,
             dirty: false,
+            disk_hash: None,
             version: 0,
             path: Some(path.to_path_buf()),
         }
@@ -535,6 +584,7 @@ impl TextBuffer {
         // handled -- repl.rs's own `render_nav_frame` checkpoints after
         // *every* one, before the next key is ever read.
         self.saved_node = self.undo.current_id();
+        self.disk_hash = self.path.as_deref().and_then(disk_hash);
         Ok(())
     }
 
@@ -955,6 +1005,7 @@ mod tests {
             breakpoints: std::collections::BTreeSet::new(),
             readonly: false,
             dirty: false,
+            disk_hash: None,
             version: 0,
             path: None,
         }
@@ -991,6 +1042,45 @@ mod tests {
         let new_cursor = buf.insert_text((0, 3), "\nbar");
         assert_eq!(text_of(&buf), "foo\nbar");
         assert_eq!(new_cursor, (1, 3));
+    }
+
+    #[test]
+    fn changed_on_disk_compares_content_not_timestamps() {
+        let dir = std::env::temp_dir().join(format!("bish-disk-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("f.txt");
+        std::fs::write(&path, "one\n").unwrap();
+
+        let mut buf = TextBuffer::open(&path, 10).unwrap();
+        assert!(!buf.changed_on_disk());
+
+        // Rewritten with the *same* bytes: a `touch`, or a formatter
+        // that changed nothing. Not a change.
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        std::fs::write(&path, "one\n").unwrap();
+        assert!(!buf.changed_on_disk(), "same content is not a change, whatever the timestamp says");
+
+        std::fs::write(&path, "someone else\n").unwrap();
+        assert!(buf.changed_on_disk());
+
+        // Saving takes ownership of what is there again.
+        buf.save(None).unwrap();
+        assert!(!buf.changed_on_disk());
+
+        // ...and so does reloading, which also brings the other side's
+        // content in.
+        std::fs::write(&path, "third\n").unwrap();
+        assert!(buf.changed_on_disk());
+        buf.reload().unwrap();
+        assert_eq!(buf.text(), "third\n");
+        assert!(!buf.changed_on_disk());
+        assert!(!buf.is_dirty(), "a reload is not an unsaved change");
+
+        // A buffer that is not a view of a file has nothing to compare.
+        let unnamed = TextBuffer::new_unnamed(10);
+        assert!(!unnamed.changed_on_disk());
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -1437,4 +1527,22 @@ mod tests {
         assert_eq!(buf.eol, crate::editorconfig::Eol::Cr);
         assert_eq!(buf.on_disk_text(), "one\rtwo\r");
     }
+}
+
+// FNV-1a over a file's bytes, for telling "the same file" from "a
+// different file" cheaply.
+//
+// A hash rather than the text itself because the alternative is keeping
+// a second copy of every open file in memory forever, to answer a
+// question asked once per `:w`. Not a cryptographic hash and it does not
+// need to be: what is on the other side of this comparison is a
+// formatter or a branch switch, not an adversary building a collision.
+fn disk_hash(path: &Path) -> Option<u64> {
+    let bytes = std::fs::read(path).ok()?;
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100_0000_01b3);
+    }
+    Some(h)
 }

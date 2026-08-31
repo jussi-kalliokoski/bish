@@ -11549,6 +11549,69 @@ fn run_command_mode(
                         None => (trimmed.as_str(), None),
                     };
                     match cmd {
+                        // The file was rewritten under us since it was
+                        // read -- by a formatter, a branch switch,
+                        // another pane. vim's own E13, and it matters
+                        // more here than in a short-lived editor: a
+                        // detachable session can hold a buffer open for
+                        // days.
+                        //
+                        // Content, not mtime (see `changed_on_disk`), so
+                        // a `touch` or a formatter that changed nothing
+                        // does not stand in the way. `!` overrides, and
+                        // `:e!` is how you take the other side instead.
+                        "w" | "write" | "wq" | "x" if arg.is_none() && tb.changed_on_disk() => {
+                            show_command_mode_error(
+                                "bish: E13: file changed on disk since it was read (`:w!` to overwrite, `:e!` to reload)",
+                                *term_rows,
+                                *term_cols,
+                            );
+                            buffer.clear();
+                            continue;
+                        }
+                        // `e!`: throw away what is in the buffer and read
+                        // the file again. Bang required, always -- unlike
+                        // `:q`, there is no unambiguous non-destructive
+                        // reading of "reload", so this never guesses.
+                        "e!" | "edit!" => {
+                            match tb.reload() {
+                                Ok(()) => {
+                                    sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry {
+                                        command: trimmed,
+                                        output: String::new(),
+                                        status: 0,
+                                    });
+                                    return CommandModeOutcome::Ran { output: String::new(), status: 0 };
+                                }
+                                Err(e) => {
+                                    show_command_mode_error(&format!("bish: e!: {e}"), *term_rows, *term_cols);
+                                    buffer.clear();
+                                    continue;
+                                }
+                            }
+                        }
+                        "w!" | "write!" => {
+                            run_hooks(sessions, session_id, "editor:file:write:pre", tb);
+                            fileeditor::run_pre_save_hooks(tb);
+                            match tb.save(arg.map(std::path::Path::new)) {
+                                Ok(()) => {
+                                    fileeditor::set_last_filename(tb, registers);
+                                    run_hooks(sessions, session_id, "editor:file:write:post", tb);
+                                    save_language_server_document(sessions, session_id, tb);
+                                    sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry {
+                                        command: trimmed,
+                                        output: String::new(),
+                                        status: 0,
+                                    });
+                                    return CommandModeOutcome::Ran { output: String::new(), status: 0 };
+                                }
+                                Err(e) => {
+                                    show_command_mode_error(&write_error(tb, &e), *term_rows, *term_cols);
+                                    buffer.clear();
+                                    continue;
+                                }
+                            }
+                        }
                         "w" | "write" => {
                             run_hooks(sessions, session_id, "editor:file:write:pre", tb);
                             fileeditor::run_pre_save_hooks(tb);
