@@ -879,6 +879,15 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
                 let _ = io::stdout().flush();
             }
         }
+        // Before the prompt is built, not after: the whole point of
+        // `PROMPT_COMMAND` is to change what the prompt then says. Only
+        // for a *primary* prompt -- bash does not run it before a
+        // continuation line either.
+        if sessions.get(&session_id).is_some_and(|s| s.buffer.is_empty())
+            && let Some(session) = sessions.get_mut(&session_id)
+        {
+            session.shell.run_prompt_command();
+        }
         let prompt_str = {
             let session = &sessions[&session_id];
             if session.buffer.is_empty() { prompt::render(&session.shell) } else { prompt::continuation() }

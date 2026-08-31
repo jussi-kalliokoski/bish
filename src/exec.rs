@@ -1089,6 +1089,10 @@ pub struct Shell {
     // command would otherwise fire DEBUG again, forever; bash guards the
     // same way.
     in_trap: bool,
+    // Whether `PROMPT_COMMAND` is running. It is invoked once per
+    // prompt from one place, so nothing can currently re-enter it --
+    // this exists so that stays true if a second call site ever appears.
+    in_prompt_command: bool,
     // `set -T` / `set -o functrace` covers DEBUG and RETURN; `set -E` /
     // `set -o errtrace` covers ERR. Two options and not one, because
     // bash makes them two -- inheriting DEBUG into every function is a
@@ -1367,6 +1371,7 @@ impl Shell {
             err_trap: None,
             return_trap: None,
             in_trap: false,
+            in_prompt_command: false,
             opt_functrace: false,
             opt_errtrace: false,
             function_depth: 0,
@@ -1641,6 +1646,7 @@ impl Shell {
             err_trap: self.err_trap.clone(),
             return_trap: self.return_trap.clone(),
             in_trap: self.in_trap,
+            in_prompt_command: false,
             opt_functrace: self.opt_functrace,
             opt_errtrace: self.opt_errtrace,
             function_depth: 0,
@@ -1696,6 +1702,43 @@ impl Shell {
         if let Some(cmd) = self.exit_trap.take() {
             self.run_source_here(&cmd, "trap");
         }
+    }
+
+    /// Runs `PROMPT_COMMAND` before drawing a primary prompt.
+    ///
+    /// The conventional way to make a prompt dynamic without inventing a
+    /// format language, and what every prompt tool in the ecosystem
+    /// hooks into. bash 5.1 lets it be an array, each element run in
+    /// turn, and that costs nothing to honour here.
+    ///
+    /// Its output is deliberately *not* captured, unlike a `::bish
+    /// hook`'s: printing is most of what a `PROMPT_COMMAND` is for --
+    /// a title escape, a blank line, a right-hand clock -- so it writes
+    /// wherever this session's output already goes.
+    ///
+    /// `$?` is borrowed and given back: the command did not run because
+    /// the user typed it, and a prompt hook that quietly rewrote the
+    /// status of what they *did* type would break the next prompt that
+    /// tried to colour itself by it.
+    pub fn run_prompt_command(&mut self) {
+        if self.in_prompt_command {
+            return;
+        }
+        let mut bodies: Vec<String> = match self.arrays.get("PROMPT_COMMAND") {
+            Some(map) if !map.is_empty() => map.values().cloned().collect(),
+            _ => vec![self.lookup_var("PROMPT_COMMAND")],
+        };
+        bodies.retain(|b| !b.trim().is_empty());
+        if bodies.is_empty() {
+            return;
+        }
+        let status = self.last_status;
+        self.in_prompt_command = true;
+        for body in bodies {
+            self.run_source_here(&body, "PROMPT_COMMAND");
+        }
+        self.in_prompt_command = false;
+        self.last_status = status;
     }
 
     /// Runs one of the pseudo-signal traps, if it is set.
@@ -14216,6 +14259,43 @@ mod tests {
         assert_eq!(shell.run_lsp(&strs(&["add", "--root-cmd"])), 2);
         assert_eq!(shell.run_lsp(&strs(&["add", "--root-cmd", "   ", "x"])), 2);
         assert_eq!(shell.lsp_servers.len(), 2);
+    }
+
+    // The one thing a `PROMPT_COMMAND` must not do is change the answer
+    // to `$?` for the command the user actually ran -- a prompt that
+    // colours itself by the last status would be wrong on every line
+    // after the first.
+    #[test]
+    fn prompt_command_runs_and_gives_the_status_back() {
+        let mut shell = Shell::new();
+        let out = capture_output(&mut shell);
+        shell.run_source_here("false", "<test>");
+        assert_eq!(shell.last_status(), 1);
+        shell.run_source_here("PROMPT_COMMAND='true; echo PC'", "<test>");
+        shell.set_last_status(1);
+        shell.run_prompt_command();
+        assert_eq!(out.borrow().as_str(), "PC\n");
+        assert_eq!(shell.last_status(), 1, "the prompt hook's own `true` must not become the user's `$?`");
+    }
+
+    #[test]
+    fn prompt_command_takes_the_array_form_too() {
+        let mut shell = Shell::new();
+        let out = capture_output(&mut shell);
+        // bash 5.1's spelling: each element run in turn.
+        shell.run_source_here("PROMPT_COMMAND=('echo A' 'echo B')", "<test>");
+        shell.run_prompt_command();
+        assert_eq!(out.borrow().as_str(), "A\nB\n");
+    }
+
+    #[test]
+    fn an_unset_or_empty_prompt_command_runs_nothing() {
+        let mut shell = Shell::new();
+        let out = capture_output(&mut shell);
+        shell.run_prompt_command();
+        shell.run_source_here("PROMPT_COMMAND='   '", "<test>");
+        shell.run_prompt_command();
+        assert_eq!(out.borrow().as_str(), "");
     }
 
     // Every expectation in this test was run against real bash first.
