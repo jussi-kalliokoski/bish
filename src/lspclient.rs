@@ -538,6 +538,24 @@ impl Server {
                             "executeCommand".to_string(),
                             Value::Object(vec![("dynamicRegistration".to_string(), Value::Bool(false))]),
                         ),
+                        // `:sym` -- the project-wide half of `gO`.
+                        (
+                            "symbol".to_string(),
+                            Value::Object(vec![
+                                ("dynamicRegistration".to_string(), Value::Bool(false)),
+                                // Not claimed: a `WorkspaceSymbol` whose
+                                // location is only a uri would need a
+                                // second round trip to find out *where*
+                                // in the file, and bish would have
+                                // nothing to show in the list until it
+                                // came back. Declining means every
+                                // answer arrives complete.
+                                (
+                                    "resolveSupport".to_string(),
+                                    Value::Object(vec![("properties".to_string(), Value::Array(Vec::new()))]),
+                                ),
+                            ]),
+                        ),
                     ]),
                     ),
                 ]),
@@ -1166,6 +1184,13 @@ impl Server {
 
     pub fn is_ready(&self) -> bool {
         self.state == State::Ready
+    }
+
+    /// Whether this server has stopped for good. A dead server is kept
+    /// in the table (`::bish lsp status` still has to explain what
+    /// happened), so anyone acting on what it once said has to ask.
+    pub fn is_dead(&self) -> bool {
+        matches!(self.state, State::Dead(_))
     }
 
     /// How this server counts columns. Only meaningful once ready.

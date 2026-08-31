@@ -73,12 +73,32 @@ while :; do
 		 {"range":{"start":{"line":2,"character":0},"end":{"line":2,"character":7}},"newText":"COMMANDED"}]}}}}'
 		;;
 	*'"method":"initialize"'*)
-		send '{"jsonrpc":"2.0","id":'"$id"',"result":{"capabilities":{"positionEncoding":"utf-32","hoverProvider":true,"definitionProvider":true,"referencesProvider":true,"documentSymbolProvider":true,"completionProvider":{"triggerCharacters":["."]},"documentFormattingProvider":true,"renameProvider":true,"codeActionProvider":true,"executeCommandProvider":{"commands":["mock.run"]},"textDocumentSync":{"openClose":true,"change":1,"save":true}}}}'
+		send '{"jsonrpc":"2.0","id":'"$id"',"result":{"capabilities":{"positionEncoding":"utf-32","hoverProvider":true,"definitionProvider":true,"referencesProvider":true,"documentSymbolProvider":true,"completionProvider":{"triggerCharacters":["."]},"documentFormattingProvider":true,"renameProvider":true,"codeActionProvider":true,"executeCommandProvider":{"commands":["mock.run"]},"workspaceSymbolProvider":true,"textDocumentSync":{"openClose":true,"change":1,"save":true}}}}'
 		;;
 	*'"method":"textDocument/didOpen"'*)
 		# Remembered so `textDocument/definition` can answer about
 		# the document the client actually opened.
 		uri=$(printf '%s' "$body" | sed -n 's/.*"uri":"\([^"]*\)".*/\1/p')
+		# Diagnostics are *pushed*, so this is the only chance to send
+		# any: nothing ever asks for them.
+		send '{"jsonrpc":"2.0","method":"textDocument/publishDiagnostics","params":{"uri":"'"$uri"'","diagnostics":[
+		 {"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":5}},
+		  "severity":1,"source":"mock","message":"first problem"},
+		 {"range":{"start":{"line":1,"character":0},"end":{"line":1,"character":4}},
+		  "severity":2,"source":"mock","message":"second problem"}]}}'
+		# `$4` set to `die` makes the server walk away right after
+		# publishing -- the case where its findings must not linger on
+		# screen as claims nobody stands behind any more.
+		[ "$4" = "die" ] && break
+		;;
+	*'"method":"textDocument/didChange"'*)
+		# A second, *different* publication -- one finding where the
+		# first had two. What the client does with a count that moves
+		# while its diagnostics pane is open is the thing this exists
+		# to exercise.
+		send '{"jsonrpc":"2.0","method":"textDocument/publishDiagnostics","params":{"uri":"'"$uri"'","diagnostics":[
+		 {"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":5}},
+		  "severity":1,"source":"mock","message":"the only problem left"}]}}'
 		;;
 	*'"method":"textDocument/definition"'*)
 		# $2, when the test gave one, is a URI in another file, so
@@ -151,6 +171,16 @@ while :; do
 		 {"label":"alpha","kind":3,"insertText":"alpha()","sortText":"0"},
 		 {"label":"gamma","kind":3,"insertText":"gamma(${1:x})","insertTextFormat":2},
 		 {"label":"belta","kind":6}]}}'
+		;;
+	*'"method":"workspace/symbol"'*)
+		# The flat `SymbolInformation` shape, which is the only one a
+		# workspace query comes back in: each result names its own
+		# file, since the point is that they are elsewhere.
+		send '{"jsonrpc":"2.0","id":'"$id"',"result":[
+		 {"name":"Outer","kind":23,"location":{"uri":"'"$uri"'",
+		  "range":{"start":{"line":0,"character":0},"end":{"line":0,"character":5}}}},
+		 {"name":"other","kind":12,"location":{"uri":"'"${2:-$uri}"'",
+		  "range":{"start":{"line":1,"character":0},"end":{"line":1,"character":5}}}}]}'
 		;;
 	*'"method":"textDocument/documentSymbol"'*)
 		# The nested form, so the outline has something to indent.

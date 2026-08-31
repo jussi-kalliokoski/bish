@@ -2101,7 +2101,7 @@ fn handle_command_mode(
         CommandModeOutcome::Action(ref action) => {
             apply_window_action(action.clone(), sessions, windows, current_window, next_session_id, next_window_id, sinks_are_grid, *term_rows, *term_cols);
         }
-        CommandModeOutcome::Quit | CommandModeOutcome::Cancelled | CommandModeOutcome::Ran { .. } => {
+        CommandModeOutcome::Quit | CommandModeOutcome::Cancelled | CommandModeOutcome::Ran { .. } | CommandModeOutcome::Symbols(_) => {
             if *sinks_are_grid {
                 // No window action, but command mode may still have
                 // written a rejected-attempt message straight to this
@@ -3456,7 +3456,7 @@ fn run_browse_frame(
                 CommandModeOutcome::Ran { output, .. } if !output.trim().is_empty() => {
                     browser.set_message(output.trim().replace('\n', " "));
                 }
-                CommandModeOutcome::Ran { .. } | CommandModeOutcome::Cancelled | CommandModeOutcome::Action(_) => {}
+                CommandModeOutcome::Ran { .. } | CommandModeOutcome::Cancelled | CommandModeOutcome::Action(_) | CommandModeOutcome::Symbols(_) => {}
             }
             // The colon line drew over the global status row and
             // whatever else; the next iteration repaints the browser,
@@ -4229,6 +4229,39 @@ fn sync_diagnostics_pane(
     let rect = pane_rect(&windows[current_window], pane_id, term_rows, term_cols);
     let sid = windows[current_window].pane(pane_id).owning_session();
     render_diagnostics_title(&sessions[&sid].screen, rect.cols, diagnostics);
+    compositor_redraw(sessions, windows, current_window, term_rows, term_cols);
+}
+
+// Repaints the diagnostics pane's own collapsed title for the focused
+// editor pane, if one is open.
+//
+// Unlike `sync_diagnostics_pane` this never *creates* the pane: it is
+// called from the idle path, where a server publication arriving is not
+// a reason to split the window open. It exists because the title says
+// how many problems there are, and until this existed that count was
+// only ever as fresh as the last `:diag` -- a server fixing every error
+// left "3 problems" on screen indefinitely.
+fn refresh_diagnostics_title(
+    sessions: &mut HashMap<SessionId, SessionState>,
+    windows: &mut [WindowEntry],
+    current_window: usize,
+    diagnostics: &[lint::Diagnostic],
+    term_rows: usize,
+    term_cols: usize,
+) {
+    let window = &windows[current_window];
+    let Some(Frame::Edit(edit_frame_id)) = window.panes.iter().find(|p| p.id == window.focused_pane).and_then(|p| p.stack.last()).copied() else {
+        return;
+    };
+    let Some(pane_id) = diagnostics_sibling(window, edit_frame_id) else { return };
+    let rect = pane_rect(window, pane_id, term_rows, term_cols);
+    let sid = window.pane(pane_id).owning_session();
+    render_diagnostics_title(&sessions[&sid].screen, rect.cols, diagnostics);
+    // The grid alone changes nothing on screen, and the redraw
+    // `service_background_jobs` already did happened before this wrote
+    // anything. Painting the editor pane blank on the way is fine and
+    // expected: every caller of this repaints it immediately after --
+    // that is what the `diagnosed` flag they are acting on is for.
     compositor_redraw(sessions, windows, current_window, term_rows, term_cols);
 }
 
@@ -7077,6 +7110,27 @@ fn symbol_list(title: &str, symbols: &[crate::lsp::Symbol], encoding: crate::lsp
     LocationList { title: title.to_string(), items }
 }
 
+// `:sym`'s answer, as a location list.
+//
+// Not `symbol_list`: a workspace symbol comes from a file the user is
+// not looking at, so the file is the most useful thing to show and the
+// nesting depth (which a flat `SymbolInformation` does not have anyway)
+// is not.
+fn workspace_symbol_list(title: &str, symbols: &[crate::lsp::Symbol], encoding: crate::lsp::PositionEncoding, base: Option<&Path>) -> LocationList {
+    let items = symbols
+        .iter()
+        .take(MAX_LOCATIONS)
+        .filter_map(|symbol| {
+            let path = crate::url::to_file_path(&symbol.uri)?;
+            let shown = base.and_then(|base| path.strip_prefix(base).ok()).unwrap_or(&path).display().to_string();
+            let kind = if symbol.kind.is_empty() { String::new() } else { format!("  [{}]", symbol.kind) };
+            let label = format!("{}{kind}  {shown}:{}", symbol.name, symbol.start.0 + 1);
+            Some(LocationItem { path, line: symbol.start.0, character: symbol.start.1, encoding, label })
+        })
+        .collect();
+    LocationList { title: title.to_string(), items }
+}
+
 // A session's live `::bish hl` colours (see bishedit::highlight::
 // HL_NAMES/ColorOverrides, exec::Shell::bishopt_color), resolved
 // fresh from `shell` -- every caller owns its own snapshot rather than
@@ -7256,6 +7310,9 @@ fn insert_idle(
     // Diagnostics that arrived while the user was typing are drawn on
     // the same tick they land, which is what makes them feel live.
     let diagnosed = apply_language_server_diagnostics(sessions, session_id, buf);
+    if diagnosed {
+        refresh_diagnostics_title(sessions, windows, *current_window, &buf.diagnostics, *term_rows, *term_cols);
+    }
     (repaint || diagnosed).then(|| fileeditor::IdleRedraw {
         rect: pane_rect(&windows[*current_window], windows[*current_window].focused_pane, *term_rows, *term_cols),
         term_rows: *term_rows,
@@ -7474,6 +7531,9 @@ fn run_normal_mode_navigation(
             if let Some(tb) = buf.as_editable_mut() {
                 sync_language_server_document(sessions, session_id, tb);
                 diagnosed = apply_language_server_diagnostics(sessions, session_id, tb);
+                if diagnosed {
+                    refresh_diagnostics_title(sessions, windows, *current_window, &tb.diagnostics, *term_rows, *term_cols);
+                }
             }
             // A job this pane stepped away from is still producing, and
             // the mode line's own "+N new lines below" has to keep up
@@ -8137,6 +8197,60 @@ fn run_normal_mode_navigation(
                         if !output.is_empty() || status != 0 {
                             render_command_output_overlay(&output, status, *term_rows, *term_cols);
                             pending_view = PendingView::Output;
+                        }
+                        continue;
+                    }
+                    // `:sym QUERY` -- the project-wide half of `gO`,
+                    // into the very same pane. See the arm that builds
+                    // that pane for `gO` itself; the only differences
+                    // are the method and that a workspace symbol
+                    // already names its own file.
+                    CommandModeOutcome::Symbols(query) => {
+                        if let NavBuffer::Editable(tb) = &buf {
+                            let encoding = server_encoding_for(sessions, session_id, tb).unwrap_or(crate::lsp::PositionEncoding::Utf16);
+                            let found = ask_server(
+                                sessions,
+                                windows,
+                                job_frames,
+                                session_id,
+                                *current_window,
+                                term_rows,
+                                term_cols,
+                                *sinks_are_grid,
+                                tb,
+                                "workspace/symbol",
+                                "workspaceSymbolProvider",
+                                vec![("query".to_string(), crate::json::Value::Str(query.clone()))],
+                            )
+                            .map(|result| crate::lsp::symbols(&result, ""))
+                            .unwrap_or_default();
+                            let named = if query.is_empty() { String::new() } else { format!(" matching '{query}'") };
+                            let title = match found.len() {
+                                0 => format!("No symbols{named}"),
+                                1 => format!("1 symbol{named}"),
+                                n if n > MAX_LOCATIONS => format!("{MAX_LOCATIONS} of {n} symbols{named}"),
+                                n => format!("{n} symbols{named}"),
+                            };
+                            // Paths shown relative to the file asked
+                            // from, the way a reference list does: a
+                            // project-wide answer is mostly other files,
+                            // and the whole absolute path of each is
+                            // noise.
+                            let base = tb.path().and_then(|p| p.parent()).map(std::path::Path::to_path_buf);
+                            let list = workspace_symbol_list(&title, &found, encoding, base.as_deref());
+                            match edit_frame_id {
+                                Some(id) => {
+                                    sync_locations_pane(sessions, windows, *current_window, next_session_id, location_lists, id, list, *term_rows, *term_cols);
+                                    render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides.as_ref());
+                                }
+                                None => {
+                                    render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides.as_ref());
+                                    show_command_mode_error(&list.title, *term_rows, *term_cols);
+                                }
+                            }
+                        } else {
+                            render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides.as_ref());
+                            show_command_mode_error("bish: sym: no file here to ask a language server about", *term_rows, *term_cols);
                         }
                         continue;
                     }
@@ -9552,13 +9666,20 @@ fn ask_server(
         if !server.is_ready() || !server.provides(capability) {
             return None;
         }
-        params.insert(
-            0,
-            (
-                "textDocument".to_string(),
-                crate::json::Value::Object(vec![("uri".to_string(), crate::json::Value::Str(target.uri.clone()))]),
-            ),
-        );
+        // Only for the methods that are actually *about* a document.
+        // `codeAction/resolve` takes the action back verbatim and
+        // `workspace/symbol` takes a query, and adding a field of our
+        // own to either is at best ignored and at worst confusing to
+        // read in a server's log.
+        if method.starts_with("textDocument/") {
+            params.insert(
+                0,
+                (
+                    "textDocument".to_string(),
+                    crate::json::Value::Object(vec![("uri".to_string(), crate::json::Value::Str(target.uri.clone()))]),
+                ),
+            );
+        }
         server.request(method, crate::json::Value::Object(std::mem::take(&mut params)))
     };
 
@@ -9805,7 +9926,25 @@ fn apply_language_server_diagnostics(sessions: &mut HashMap<SessionId, SessionSt
     let Some(target) = server_target(session, buf) else { return false };
     let lsp = Rc::clone(&session.lsp);
     let mut table = lsp.borrow_mut();
-    let Some(server) = table.running(&target.display, &target.root) else { return false };
+    // The server this buffer's findings came from may be gone -- it
+    // crashed, or `::bish lsp restart` took it away. Its underlines and
+    // gutter marks are then claims nobody stands behind, and nothing
+    // will ever come along to correct them, since diagnostics are
+    // pushed rather than asked for.
+    //
+    // `source` is what tells the two apart: a server's findings carry
+    // one, and bish's own linter (`:diag`) sets none. So this clears
+    // exactly the dead server's half and leaves `:diag`'s alone.
+    if table.running(&target.display, &target.root).is_none_or(|server| server.is_dead()) {
+        drop(table);
+        let kept: Vec<lint::Diagnostic> = buf.diagnostics.iter().filter(|d| d.source.is_none()).cloned().collect();
+        if kept.len() == buf.diagnostics.len() {
+            return false;
+        }
+        buf.diagnostics = kept;
+        return true;
+    }
+    let server = table.running(&target.display, &target.root).expect("checked just above");
     let encoding = server.encoding();
     let Some(publication) = server.take_diagnostics(&target.uri) else { return false };
     if publication.version.is_some_and(|v| v != buf.version()) {
@@ -10802,6 +10941,12 @@ enum CommandModeOutcome {
     // navigation) is the one that actually shows this -- see its own
     // doc comment on PendingView for how.
     Ran { output: String, status: i32 },
+    // `:sym QUERY` -- ask the language server for matching symbols
+    // across the whole project. Handed back rather than done here
+    // because the answer goes into the locations pane, and command mode
+    // has neither the pane's id nor the map it lives in; the Normal-mode
+    // loop that owns `gO`'s pane has both.
+    Symbols(String),
 }
 
 // Command mode: reached only via bishedit normal mode's own ':' now (see
@@ -11246,6 +11391,26 @@ fn run_command_mode(
                             show_command_mode_error(&format!("bish: diag: unknown subcommand '{}' (expected: clear)", arg.unwrap_or_default()), *term_rows, *term_cols);
                             buffer.clear();
                             continue;
+                        }
+                        // `sym QUERY`: what the language server knows by
+                        // that name anywhere in the project, listed in
+                        // the same pane `gO`'s outline uses.
+                        //
+                        // A command rather than a key because it takes a
+                        // query, which is also why it is `:sym` and not
+                        // an extension of `gO`: `gO` answers "what is in
+                        // this file", this answers "where is the thing
+                        // called X", and the two only look alike because
+                        // both end up as a list of places.
+                        //
+                        // Empty is allowed and means "everything you
+                        // have" -- some servers answer that with the
+                        // whole index, which the pane's own cap keeps
+                        // survivable.
+                        "sym" | "symbols" => {
+                            let query = arg.unwrap_or_default().to_string();
+                            sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry { command: trimmed.clone(), output: String::new(), status: 0 });
+                            return CommandModeOutcome::Symbols(query);
                         }
                         // `diff` (bare, no `git` prefix): the same +/~/-
                         // gutter marker toggle `:git diff` uses, but
