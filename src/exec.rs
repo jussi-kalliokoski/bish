@@ -4913,8 +4913,23 @@ impl Shell {
             }
         };
         let _ = old;
+        // `CDPATH`: a search path for `cd`, so `cd bish` from anywhere
+        // finds `~/src/bish`. Only for a plain relative name -- an
+        // absolute path, or one that already says `.`/`..`, means
+        // exactly where it says and is never searched for.
+        //
+        // A hit that did not come from the current directory prints
+        // where it landed, which is bash's own behaviour and not a
+        // courtesy: without it, `cd bish` silently putting you somewhere
+        // other than `./bish` would be the worst kind of surprise.
+        let (target, from_cdpath) = self.resolve_cdpath(target);
         match self.change_directory(std::path::Path::new(&target)) {
-            Ok(()) => 0,
+            Ok(()) => {
+                if from_cdpath {
+                    sh_println!(self, "{}", self.cwd.display());
+                }
+                0
+            }
             Err(e) if e == RESTRICTED => {
                 sh_eprintln!(self, "bish: cd: restricted");
                 1
@@ -4924,6 +4939,45 @@ impl Shell {
                 1
             }
         }
+    }
+
+    /// `target` resolved against `CDPATH`, and whether that is where it
+    /// came from.
+    ///
+    /// Left alone -- and `false` -- for anything `CDPATH` does not apply
+    /// to: an absolute path, one starting `.` or `..`, an unset or empty
+    /// `CDPATH`, or a name no component holds.
+    ///
+    /// An *empty* component means the current directory, per the same
+    /// convention `PATH` uses, and a hit there is the only one not
+    /// announced -- bash's rule is that a **non-empty** component
+    /// announces, so a literal `.` in `CDPATH` does print, even though
+    /// it lands exactly where a plain `cd` would have.
+    fn resolve_cdpath(&mut self, target: String) -> (String, bool) {
+        let path = std::path::Path::new(&target);
+        if path.is_absolute() || target.starts_with('.') || target.is_empty() {
+            return (target, false);
+        }
+        let cdpath = self.lookup_var("CDPATH");
+        if cdpath.is_empty() {
+            return (target, false);
+        }
+        for component in cdpath.split(':') {
+            // Against *this shell's* own cwd, not the process's. They
+            // are the same for whichever session last ran something, and
+            // genuinely different for any other window -- and `cd` is
+            // defined relative to the shell doing it.
+            let base = match std::path::Path::new(component) {
+                _ if component.is_empty() => self.cwd.clone(),
+                p if p.is_absolute() => p.to_path_buf(),
+                p => self.cwd.join(p),
+            };
+            let candidate = base.join(&target);
+            if candidate.is_dir() {
+                return (candidate.to_string_lossy().into_owned(), !component.is_empty());
+            }
+        }
+        (target, false)
     }
 
     // Moving this shell to another directory -- the single write path,
@@ -14301,6 +14355,68 @@ mod tests {
         assert_eq!(shell.run_lsp(&strs(&["add", "--root-cmd"])), 2);
         assert_eq!(shell.run_lsp(&strs(&["add", "--root-cmd", "   ", "x"])), 2);
         assert_eq!(shell.lsp_servers.len(), 2);
+    }
+
+    // Every expectation was run against real bash first -- the
+    // announce rule in particular is not guessable (a literal `.`
+    // component prints; an *empty* one does not).
+    #[test]
+    fn cdpath_searches_and_says_where_it_landed() {
+        // `cd` moves the *real* process directory (see
+        // `change_directory`), so this has to be put back -- otherwise
+        // every later test resolving a relative path runs from a
+        // directory this one deleted.
+        let restore = std::env::current_dir().expect("a current directory");
+        let root = std::env::temp_dir().join(format!("bish-cdpath-{}", std::process::id()));
+        let (here, away) = (root.join("here"), root.join("away"));
+        std::fs::create_dir_all(here.join("alpha")).unwrap();
+        std::fs::create_dir_all(away.join("beta")).unwrap();
+        std::fs::create_dir_all(away.join("alpha")).unwrap();
+
+        // `unset CDPATH` up front on every one: a plain assignment is
+        // real process-wide environment (see `sync_real_state_in`'s own
+        // doc comment), so a value one of these scripts sets is still
+        // there for the next `Shell::new()`.
+        let run = |script: &str| {
+            let mut shell = Shell::new();
+            let out = capture_output(&mut shell);
+            shell.run_source_here(&format!("unset CDPATH\n{script}"), "<test>");
+            out.borrow().clone()
+        };
+        let prelude = format!("cd {}; CDPATH={}", here.display(), away.display());
+
+        // The announcement *is* the observable here, and a better one
+        // than `pwd`: it says both that CDPATH was used and which
+        // component won. (`pwd` reports the real process directory,
+        // which a test shell's own `cd` deliberately does not move.)
+
+        // Found only via CDPATH: goes there, and says so.
+        assert_eq!(run(&format!("{prelude}; cd beta")), format!("{}\n", away.join("beta").display()));
+
+        // A name that exists in *both* -- CDPATH wins, because that is
+        // what a search path means.
+        assert_eq!(run(&format!("{prelude}; cd alpha")), format!("{}\n", away.join("alpha").display()));
+
+        // An empty component means "here", and is the one hit that is
+        // not announced. A literal `.` is announced, which is the part
+        // that is not guessable.
+        assert_eq!(run(&format!("cd {}; CDPATH=:{}; cd alpha", here.display(), away.display())), "");
+        assert_eq!(run(&format!("cd {}; CDPATH=.:{}; cd alpha", here.display(), away.display())), format!("{}\n", here.join("alpha").display()));
+
+        // Never searched: an explicit `./`, an absolute path, or no
+        // CDPATH at all.
+        assert_eq!(run(&format!("{prelude}; cd ./alpha")), "");
+        assert_eq!(run(&format!("{prelude}; cd {}", away.join("beta").display())), "");
+        assert_eq!(run(&format!("cd {}; cd alpha", here.display())), "");
+
+        // A name no component holds is the ordinary failure, reported
+        // against the name as typed rather than against some candidate
+        // the search happened to try last.
+        let seen = run(&format!("{prelude}; cd nope"));
+        assert!(seen.contains("cd: nope:"), "{seen}");
+
+        std::env::set_current_dir(&restore).expect("restoring the test process's own directory");
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
