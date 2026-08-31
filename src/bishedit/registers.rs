@@ -44,6 +44,12 @@ use std::process::{Command, Stdio};
 pub enum RegisterShape {
     Char,
     Line,
+    /// A rectangle: `Ctrl-V`'s own selection, and what a yank of one
+    /// stores. Put back, each of its lines lands at the *same column* on
+    /// consecutive lines rather than being spliced end to end -- which is
+    /// the whole difference between a block and the same characters
+    /// yanked charwise.
+    Block,
 }
 
 #[derive(Debug, Clone)]
@@ -211,6 +217,21 @@ impl RegisterBackend for ClipboardBackend {
         match output {
             Ok(out) if out.status.success() => {
                 let text = String::from_utf8_lossy(&out.stdout).into_owned();
+                // A clipboard holds text and no shape, so a shape has to
+                // be inferred from the text -- and a trailing newline is
+                // all there is to go on. That reads a blockwise yank
+                // back as charwise, which is how `Ctrl-V y` then `p`
+                // pastes a rectangle as one run of text.
+                //
+                // When what comes back is exactly what was last put
+                // there, the recorded shape is the better answer: nobody
+                // else has touched the clipboard since, so nothing about
+                // it has changed except that its shape was forgotten.
+                // This is the only way blockwise survives a register
+                // that *is* the system clipboard.
+                if text == self.fallback.text {
+                    return self.fallback.clone();
+                }
                 let shape = if text.ends_with('\n') { RegisterShape::Line } else { RegisterShape::Char };
                 RegisterValue { text, shape }
             }

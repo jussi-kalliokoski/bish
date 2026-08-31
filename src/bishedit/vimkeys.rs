@@ -1499,6 +1499,11 @@ impl VimKeys {
             // vim nuance yet.
             Key::Char('v') if self.visual.is_none() => self.emit_visual(RegisterShape::Char),
             Key::Char('V') if self.visual.is_none() => self.emit_visual(RegisterShape::Line),
+            // `Ctrl-V`: a rectangle rather than a run. The third visual
+            // shape, and the one that makes a column edit -- commenting
+            // a block, stripping a prefix off twenty lines -- one
+            // gesture instead of twenty.
+            Key::CtrlV if self.visual.is_none() => self.emit_visual(RegisterShape::Block),
             _ => self.abort(),
         }
     }

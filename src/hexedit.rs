@@ -246,7 +246,10 @@ impl HexBuffer {
         let len = self.bytes.len();
         match range.shape {
             MotionShape::Linewise => ((range.from.0 * bpr).min(len), ((range.to.0 + 1) * bpr).min(len)),
-            MotionShape::Inclusive => (off(range.from).min(len), (off(range.to) + 1).min(len)),
+            // The hex view has no blockwise selection of its own (nothing
+            // emits one here), and a rectangle over a fixed-width dump is
+            // the inclusive byte span anyway.
+            MotionShape::Inclusive | MotionShape::Blockwise => (off(range.from).min(len), (off(range.to) + 1).min(len)),
             MotionShape::Exclusive => (off(range.from).min(len), off(range.to).min(len)),
         }
     }
@@ -662,7 +665,10 @@ impl HexSession {
         let cursor_off = self.buf.offset();
         let (lo, hi) = if anchor_off <= cursor_off { (anchor_off, cursor_off) } else { (cursor_off, anchor_off) };
         Some(match shape {
-            RegisterShape::Char => (lo, (hi + 1).min(self.buf.len())),
+            // Blockwise never arises here (`Ctrl-V` is not bound in this
+            // view), and a rectangle over a fixed-width dump is the same
+            // flat span charwise selection already gives.
+            RegisterShape::Char | RegisterShape::Block => (lo, (hi + 1).min(self.buf.len())),
             // `V` selects whole rows -- still handed back as a flat byte
             // span (see this module's own doc comment, point 2).
             RegisterShape::Line => ((lo / bpr) * bpr, ((hi / bpr + 1) * bpr).min(self.buf.len())),

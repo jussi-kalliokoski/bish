@@ -567,7 +567,11 @@ pub(crate) fn delete_motion(buf: &mut TextBuffer, registers: &mut Registers, m: 
     let Some(range) = motion::motion_range(buf, m, count) else {
         return false;
     };
-    let shape = if range.shape == motion::MotionShape::Linewise { RegisterShape::Line } else { RegisterShape::Char };
+    let shape = match range.shape {
+        motion::MotionShape::Linewise => RegisterShape::Line,
+        motion::MotionShape::Blockwise => RegisterShape::Block,
+        _ => RegisterShape::Char,
+    };
     let text = buf.delete_range(&range);
     registers.record_delete(register, RegisterValue { text, shape });
     true
@@ -1056,6 +1060,32 @@ pub(crate) fn put(buf: &mut TextBuffer, registers: &mut Registers, before: bool,
             // vimkeys::apply_put's own doc comment establishes for the
             // single-line case.
             buf.set_cursor(new_cursor.0, new_cursor.1.saturating_sub(1));
+        }
+        // A block goes back as a rectangle: each of its lines at the
+        // *same column* on consecutive lines, rather than spliced end to
+        // end. Which is the whole difference between a block and the
+        // same characters yanked charwise, and the reason `Block` is a
+        // register shape rather than a detail of how it was selected.
+        //
+        // A line too short to reach that column is padded out to it, so
+        // the rectangle stays a rectangle -- vim does the same.
+        RegisterShape::Block => {
+            let insert_col = if before { col } else { (col + 1).min(buf.line_len(row)) };
+            let piece: Vec<&str> = value.text.split('\n').collect();
+            for (offset, chunk) in piece.iter().enumerate() {
+                let line = row + offset;
+                if line >= buf.line_count() {
+                    let last = buf.line_count() - 1;
+                    buf.insert_text((last, buf.line_len(last)), "\n");
+                }
+                let len = buf.line_len(line);
+                let text = chunk.repeat(count);
+                if len < insert_col {
+                    buf.insert_text((line, len), &" ".repeat(insert_col - len));
+                }
+                buf.insert_text((line, insert_col), &text);
+            }
+            buf.set_cursor(row, insert_col);
         }
     }
 }
@@ -2185,6 +2215,7 @@ fn mode_label(vk: &VimKeys, mode: EditorMode) -> &'static str {
     match vk.visual_anchor() {
         Some((RegisterShape::Char, _)) => "-- VISUAL --",
         Some((RegisterShape::Line, _)) => "-- VISUAL LINE --",
+        Some((RegisterShape::Block, _)) => "-- VISUAL BLOCK --",
         None => "-- NORMAL --",
     }
 }
@@ -2250,6 +2281,14 @@ fn selection_columns_in_line(range: &motion::MotionRange, line: usize, start_cha
     }
     if range.shape == motion::MotionShape::Linewise {
         return Some((0, cols));
+    }
+    // A block covers the same columns on every row it spans, which is
+    // what makes it a rectangle rather than a run -- so neither end
+    // depends on which row this is.
+    if let Some((left, right)) = motion::block_columns(range) {
+        let start = left.saturating_sub(start_char);
+        let end = (right + 1).saturating_sub(start_char).min(cols);
+        return (end > start).then_some((start, end));
     }
     let start = if line == range.from.0 { range.from.1.saturating_sub(start_char) } else { 0 };
     let end = if line == range.to.0 { (range.to.1 + 1).saturating_sub(start_char).min(cols) } else { cols };
@@ -4383,6 +4422,29 @@ mod macro_tests {
     // through the same macro-replay queue the test just below uses --
     // there's no real terminal here to type at, and `run_insert_mode`
     // reads through `vk.next_key`, which serves a queued replay first.
+    #[test]
+    fn a_block_yank_puts_back_as_a_rectangle() {
+        let mut buf = TextBuffer::new_unnamed(10);
+        buf.insert_text((0, 0), "aaa111\nbbb222\nccc333\nzz");
+        let mut registers = Registers::new_for_test();
+        buf.selections = vec![crate::bishedit::motion::MotionRange {
+            shape: crate::bishedit::motion::MotionShape::Blockwise,
+            from: (0, 0),
+            to: (2, 2),
+        }];
+        let text = crate::bishedit::motion::extract_text(&buf, &buf.selections[0]);
+        assert_eq!(text, "aaa\nbbb\nccc");
+        registers.record_yank(None, crate::bishedit::registers::RegisterValue { text, shape: RegisterShape::Block });
+        buf.selections.clear();
+
+        // Put after the cursor on the short last line: the rectangle is
+        // rebuilt downward, and a line too short to reach the column is
+        // padded out to it.
+        buf.set_cursor(3, 0);
+        put(&mut buf, &mut registers, false, None, None);
+        assert_eq!(text_of(&buf), "aaa111\nbbb222\nccc333\nzaaaz\n bbb\n ccc");
+    }
+
     // Plain autoindent: copy, never guess. `smartindent` is what opens a
     // level after `{`, and it is deliberately not this.
     #[test]

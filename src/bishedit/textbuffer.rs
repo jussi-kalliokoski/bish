@@ -614,6 +614,23 @@ impl TextBuffer {
                 let row = range.from.0.min(self.lines.len() - 1);
                 self.cursor = (row, 0);
             }
+            // A block cuts the same columns out of each of its rows and
+            // leaves the rows themselves, which is the whole point: the
+            // lines above and below stay put and only the rectangle
+            // goes. A row shorter than the block contributes whatever of
+            // it falls inside, which may be nothing.
+            motion::MotionShape::Blockwise => {
+                let (left, right) = motion::block_columns(&range).expect("blockwise");
+                for line in range.from.0..=range.to.0 {
+                    let row = &mut self.lines[line];
+                    let start = left.min(row.len());
+                    let end = (right + 1).min(row.len());
+                    if end > start {
+                        row.drain(start..end);
+                    }
+                }
+                self.cursor = (range.from.0, left.min(self.lines[range.from.0].len()));
+            }
             _ => {
                 let end_col = if range.shape == motion::MotionShape::Inclusive { range.to.1 + 1 } else { range.to.1 };
                 let last_line = &self.lines[range.to.0];
@@ -685,8 +702,13 @@ impl TextBuffer {
         let mut shape = RegisterShape::Char;
         for range in &self.selections {
             text.push_str(&motion::extract_text(self, range));
-            if range.shape == motion::MotionShape::Linewise {
-                shape = RegisterShape::Line;
+            // Same rule as `delete_selections` just below and repl.rs's
+            // own `yank_selections`: a block stays a block through the
+            // register, `Line` wins over both.
+            match range.shape {
+                motion::MotionShape::Linewise => shape = RegisterShape::Line,
+                motion::MotionShape::Blockwise if shape == RegisterShape::Char => shape = RegisterShape::Block,
+                _ => {}
             }
         }
         registers.record_yank(register, RegisterValue { text, shape });
@@ -724,13 +746,26 @@ impl TextBuffer {
         let mut shape = RegisterShape::Char;
         for range in &self.selections {
             text.push_str(&motion::extract_text(self, range));
-            if range.shape == motion::MotionShape::Linewise {
-                shape = RegisterShape::Line;
+            match range.shape {
+                motion::MotionShape::Linewise => shape = RegisterShape::Line,
+                motion::MotionShape::Blockwise if shape == RegisterShape::Char => shape = RegisterShape::Block,
+                _ => {}
             }
         }
         registers.record_delete(register, RegisterValue { text, shape });
 
-        let mut froms: Vec<(usize, usize)> = self.selections.iter().map(|r| r.from).collect();
+        // One resume position per range -- except a block, which leaves
+        // one *per row*. That is what makes `c` in block mode type into
+        // every row at once rather than only the first: the positions
+        // this returns become Insert mode's own cursor list.
+        let mut froms: Vec<(usize, usize)> = self
+            .selections
+            .iter()
+            .flat_map(|r| match motion::block_columns(r) {
+                Some((left, _)) => (r.from.0..=r.to.0).map(|line| (line, left)).collect::<Vec<_>>(),
+                None => vec![r.from],
+            })
+            .collect();
         froms.sort();
         let mut ranges = self.selections.clone();
         ranges.sort_by_key(|r| std::cmp::Reverse(r.from));
@@ -956,6 +991,23 @@ mod tests {
         let new_cursor = buf.insert_text((0, 3), "\nbar");
         assert_eq!(text_of(&buf), "foo\nbar");
         assert_eq!(new_cursor, (1, 3));
+    }
+
+    #[test]
+    fn delete_range_takes_a_block_out_of_every_row_and_keeps_the_rows() {
+        let mut buf = TextBuffer::new_unnamed(10);
+        buf.insert_text((0, 0), "aaa111\nbbb222\nccc333\nddd444");
+        let text = buf.delete_range(&motion::MotionRange { shape: motion::MotionShape::Blockwise, from: (0, 0), to: (2, 2) });
+        assert_eq!(text, "aaa\nbbb\nccc");
+        assert_eq!(buf.text(), "111\n222\n333\nddd444\n", "the rows stay; only the rectangle goes");
+        assert_eq!(buf.cursor(), (0, 0));
+
+        // A row too short to reach the block loses nothing and is not
+        // padded either -- deleting never adds characters.
+        let mut buf = TextBuffer::new_unnamed(10);
+        buf.insert_text((0, 0), "aaa111\nb\nccc333");
+        buf.delete_range(&motion::MotionRange { shape: motion::MotionShape::Blockwise, from: (0, 3), to: (2, 5) });
+        assert_eq!(buf.text(), "aaa\nb\nccc\n");
     }
 
     #[test]

@@ -6640,6 +6640,10 @@ fn selection_columns_in_line(range: &motion::MotionRange, line: usize, cols: usi
     if range.shape == motion::MotionShape::Linewise {
         return Some((0, cols));
     }
+    // Same columns on every row it spans -- see fileeditor.rs's twin.
+    if let Some((left, right)) = motion::block_columns(range) {
+        return (right + 1 > left).then(|| (left, (right + 1).min(cols)));
+    }
     let start = if line == range.from.0 { range.from.1 } else { 0 };
     let end = if line == range.to.0 { range.to.1 + 1 } else { cols };
     Some((start, end))
@@ -6699,6 +6703,7 @@ fn mode_label(vk: &VimKeys) -> &'static str {
     match vk.visual_anchor() {
         Some((RegisterShape::Char, _)) => "-- VISUAL --",
         Some((RegisterShape::Line, _)) => "-- VISUAL LINE --",
+        Some((RegisterShape::Block, _)) => "-- VISUAL BLOCK --",
         None => "-- NORMAL --",
     }
 }
@@ -7957,7 +7962,11 @@ fn run_normal_mode_navigation(
                 render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides.as_ref());
                 continue;
             }
-            Key::Char('d') if vk.is_idle() && buf.is_writable() && (vk.is_visual() || !buf.selections().is_empty()) => {
+            // `x` with a selection standing is `d` -- vim's own rule, and
+            // it was missing for every shape, not just blockwise: `x`
+            // always emitted `DeleteCharForward`, so it deleted one
+            // character and left the selection alone.
+            Key::Char('d') | Key::Char('x') if vk.is_idle() && buf.is_writable() && (vk.is_visual() || !buf.selections().is_empty()) => {
                 commit_active_selection(&vk, &mut buf);
                 let register = vk.take_pending_register();
                 let end_cursor = buf.cursor();
@@ -8609,6 +8618,44 @@ fn run_normal_mode_navigation(
             // (`fileeditor::run_insert_mode`) that returns straight back
             // here once it's done, same as any other mutating
             // `KeyOutcome`.
+            // `I`/`A` with a *block* standing are their own thing: they
+            // insert the same text at the same column on every row of the
+            // block, without deleting anything -- which is the gesture
+            // people actually reach for visual block to get (commenting
+            // a run of lines, adding a trailing comma to each).
+            //
+            // `I` goes to the block's left edge, `A` one past its right,
+            // and a row too short to reach that column is padded out to
+            // it so the edit stays a column.
+            KeyOutcome::EnterInsert(cmd @ (crate::bishedit::vimkeys::InsertCmd::LineStart | crate::bishedit::vimkeys::InsertCmd::LineEnd))
+                if vk.visual_anchor().map(|(shape, _)| shape) == Some(RegisterShape::Block) =>
+            {
+                let range = active_visual_range(&vk, &buf);
+                let end_cursor = buf.cursor();
+                vk.end_visual(end_cursor);
+                buf.selections_mut().clear();
+                if let (Some(range), Some(tb)) = (range, buf.as_writable_mut())
+                    && let Some((left, right)) = motion::block_columns(&range)
+                {
+                    let col = if cmd == crate::bishedit::vimkeys::InsertCmd::LineStart { left } else { right + 1 };
+                    let mut cursors: Vec<(usize, usize)> = Vec::new();
+                    for line in range.from.0..=range.to.0.min(tb.line_count().saturating_sub(1)) {
+                        let len = tb.line_len(line);
+                        if len < col {
+                            tb.insert_text((line, len), &" ".repeat(col - len));
+                        }
+                        cursors.push((line, col));
+                    }
+                    if let Some(&first) = cursors.first() {
+                        tb.set_cursor(first.0, first.1);
+                        let extra: Vec<(usize, usize)> = cursors[1..].to_vec();
+                        let (insert_term_rows, insert_term_cols) = (*term_rows, *term_cols);
+                        let insert_abbrs = sessions[&session_id].shell.abbrs.clone();
+                        fileeditor::run_insert_mode(tb, &mut vk, rect, registers, &mut EditorServices { sessions, windows, job_frames, current_window, term_rows, term_cols, sinks_are_grid: *sinks_are_grid, session_id }, false, insert_term_rows, insert_term_cols, color_overrides.as_ref(), &extra, &insert_abbrs)?;
+                    }
+                }
+                render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides.as_ref());
+            }
             KeyOutcome::EnterInsert(cmd) => {
                 if matches!(buf, NavBuffer::Editable(_)) {
                     if let Some(tb) = buf.as_writable_mut() {
@@ -8908,8 +8955,21 @@ fn run_normal_mode_navigation(
 pub(crate) fn active_visual_range(vk: &VimKeys, buf: &impl BisheditBuffer) -> Option<motion::MotionRange> {
     let (shape, anchor) = vk.visual_anchor()?;
     let cursor = buf.cursor();
-    let motion_shape = if shape == RegisterShape::Line { motion::MotionShape::Linewise } else { motion::MotionShape::Inclusive };
+    let motion_shape = match shape {
+        RegisterShape::Line => motion::MotionShape::Linewise,
+        RegisterShape::Block => motion::MotionShape::Blockwise,
+        RegisterShape::Char => motion::MotionShape::Inclusive,
+    };
+    // Rows always in order; columns kept as the two *corners* rather than
+    // sorted, because a block's corners can be the other way round from
+    // its rows -- dragging up-and-right is an ordinary thing to do. See
+    // `motion::block_columns`, which is where that gets untangled.
     let (from, to) = if anchor <= cursor { (anchor, cursor) } else { (cursor, anchor) };
+    let (from, to) = if motion_shape == motion::MotionShape::Blockwise {
+        ((from.0.min(to.0), anchor.1), (from.0.max(to.0), cursor.1))
+    } else {
+        (from, to)
+    };
     Some(motion::MotionRange { shape: motion_shape, from, to })
 }
 
@@ -8935,8 +8995,14 @@ fn yank_selections(buf: &impl BisheditBuffer, selections: &[motion::MotionRange]
     let mut shape = RegisterShape::Char;
     for range in selections {
         text.push_str(&motion::extract_text(buf, range));
-        if range.shape == motion::MotionShape::Linewise {
-            shape = RegisterShape::Line;
+        // A block stays a block through the register, so putting it back
+        // rebuilds the rectangle rather than splicing its rows end to
+        // end. `Line` still wins over both if anything linewise is mixed
+        // in, per this function's own rule.
+        match range.shape {
+            motion::MotionShape::Linewise => shape = RegisterShape::Line,
+            motion::MotionShape::Blockwise if shape == RegisterShape::Char => shape = RegisterShape::Block,
+            _ => {}
         }
     }
     registers.record_yank(register, RegisterValue { text, shape });

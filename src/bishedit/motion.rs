@@ -1209,7 +1209,10 @@ pub fn surround_insert_points(buf: &impl Buffer, range: &MotionRange) -> ((usize
             let close_at = (range.to.0, buf.line_len(range.to.0));
             (open_at, close_at)
         }
-        MotionShape::Inclusive => (range.from, (range.to.0, range.to.1 + 1)),
+        // A block has no surround of its own in vim either; treated as
+        // the inclusive span between its corners, which is what a
+        // one-row block already is.
+        MotionShape::Inclusive | MotionShape::Blockwise => (range.from, (range.to.0, range.to.1 + 1)),
         MotionShape::Exclusive => (range.from, range.to),
     }
 }
@@ -1903,6 +1906,19 @@ pub enum MotionShape {
     Exclusive,
     Inclusive,
     Linewise,
+    /// A rectangle between two corners: rows `from.0..=to.0`, and on each
+    /// of them the columns between `from.1` and `to.1` inclusive.
+    ///
+    /// Unlike the other three, `from`/`to` here are *corners* rather than
+    /// a start and an end in reading order -- either may hold the smaller
+    /// column. `block_columns` is the one place that is untangled.
+    Blockwise,
+}
+
+/// The inclusive column range a blockwise motion covers, lowest first.
+/// `None` for any other shape, which has no such thing.
+pub fn block_columns(range: &MotionRange) -> Option<(usize, usize)> {
+    (range.shape == MotionShape::Blockwise).then(|| (range.from.1.min(range.to.1), range.from.1.max(range.to.1)))
 }
 
 /// Whether `m` is one of vim's own `:help jump-motions` -- the ones that
@@ -2060,6 +2076,18 @@ pub fn motion_range(buf: &mut impl Buffer, motion: Motion, count: Option<usize>)
 /// (again, not a `line_wraps` one) -- `Exclusive` stops one character
 /// short of `to`, `Inclusive` includes it.
 pub fn extract_text(buf: &impl Buffer, range: &MotionRange) -> String {
+    // A block yanks as one line per row, each cut to the block's own
+    // columns -- a short line contributing whatever of it falls inside,
+    // which may be nothing at all.
+    if let Some((left, right)) = block_columns(range) {
+        let rows: Vec<String> = (range.from.0..=range.to.0)
+            .map(|line| {
+                let chars = buf.line_chars(line);
+                chars.iter().skip(left).take(right + 1 - left).collect()
+            })
+            .collect();
+        return rows.join("\n");
+    }
     if range.shape == MotionShape::Linewise {
         let mut s = String::new();
         for l in range.from.0..=range.to.0 {
@@ -2578,6 +2606,30 @@ mod tests {
         assert_eq!(go(&mut buf, Motion::ScreenMiddle, None), (2, 0));
         assert_eq!(go(&mut buf, Motion::ScreenBottom, None), (4, 0));
         assert_eq!(go(&mut buf, Motion::ScreenBottom, Some(2)), (3, 0));
+    }
+
+    // A block's corners are corners, not a start and an end in reading
+    // order: dragging up-and-right is an ordinary thing to do.
+    #[test]
+    fn block_columns_sorts_the_corners_and_only_for_a_block() {
+        let block = |a: (usize, usize), b: (usize, usize)| MotionRange { shape: MotionShape::Blockwise, from: a, to: b };
+        assert_eq!(block_columns(&block((0, 2), (3, 7))), Some((2, 7)));
+        assert_eq!(block_columns(&block((0, 7), (3, 2))), Some((2, 7)), "right-to-left drags the same rectangle");
+        assert_eq!(block_columns(&block((0, 4), (3, 4))), Some((4, 4)), "one column wide");
+        assert_eq!(block_columns(&MotionRange { shape: MotionShape::Inclusive, from: (0, 2), to: (3, 7) }), None);
+    }
+
+    #[test]
+    fn extracting_a_block_cuts_each_row_to_the_same_columns() {
+        let buf = TestBuffer::new("aaa111\nbbb222\nccc333");
+        let range = MotionRange { shape: MotionShape::Blockwise, from: (0, 1), to: (2, 3) };
+        assert_eq!(extract_text(&buf, &range), "aa1\nbb2\ncc3");
+
+        // A row shorter than the block contributes whatever of it falls
+        // inside -- which can be nothing at all.
+        let buf = TestBuffer::new("aaa111\nb\nccc333");
+        let range = MotionRange { shape: MotionShape::Blockwise, from: (0, 3), to: (2, 5) };
+        assert_eq!(extract_text(&buf, &range), "111\n\n333");
     }
 
     // The engine folds; this is the wiring that decides whether it does.

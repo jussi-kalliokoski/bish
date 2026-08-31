@@ -104,6 +104,10 @@ pub enum Key {
     // insert" -- see run_one_shot_normal_command's own doc comment.
     CtrlO,
     CtrlU,
+    // 0x16. Visual *block* mode in Normal mode; nothing at the shell
+    // prompt binds it, so it is decoded here and acted on only where a
+    // rectangle means something.
+    CtrlV,
     CtrlW,
     // Vim's insert-mode "paste this register here" -- see read_line's own
     // Key::CtrlR arm.
@@ -271,6 +275,7 @@ fn read_key() -> io::Result<Option<Key>> {
         0x10 => Key::CtrlP,
         0x12 => Key::CtrlR,
         0x15 => Key::CtrlU,
+        0x16 => Key::CtrlV,
         0x17 => Key::CtrlW,
         0x18 => Key::CtrlX,
         0x19 => Key::CtrlY,
@@ -1969,6 +1974,10 @@ pub fn read_line(
             | Key::PageDown
             | Key::PasteStart
             | Key::PasteEnd
+            // Visual block on a one-line buffer would be an ordinary
+            // charwise selection, which `v` already gives -- so the
+            // prompt leaves this key alone.
+            | Key::CtrlV
             | Key::Unknown => {}
         }
         // Recomputed fresh every iteration -- see compute_suggestion's
@@ -2615,7 +2624,10 @@ fn delete_motion(lb: &mut LineBuffer, registers: &mut Registers, motion: motion:
             lb.ed.buf.clear();
             lb.ed.cursor = 0;
         }
-        motion::MotionShape::Inclusive => {
+        // A block on a buffer that has exactly one line is that line's
+        // own inclusive span -- the shell prompt has no second row for a
+        // rectangle to reach into.
+        motion::MotionShape::Inclusive | motion::MotionShape::Blockwise => {
             let end = (to_col + 1).min(lb.ed.buf.len());
             lb.ed.buf.drain(from_col..end);
             lb.ed.cursor = from_col.min(lb.ed.buf.len().saturating_sub(1));
@@ -2934,7 +2946,10 @@ fn case_operator_motion(lb: &mut LineBuffer, motion: motion::Motion, count: Opti
         // buffer -- same flattening `delete_motion`/`yank_lines` already
         // establish for `yy`/`dd`.
         motion::MotionShape::Linewise => case_operator_lines(lb, kind),
-        motion::MotionShape::Inclusive => {
+        // A block on a buffer that has exactly one line is that line's
+        // own inclusive span -- the shell prompt has no second row for a
+        // rectangle to reach into.
+        motion::MotionShape::Inclusive | motion::MotionShape::Blockwise => {
             let end = (to_col + 1).min(lb.ed.buf.len());
             for c in lb.ed.buf[from_col..end].iter_mut() {
                 *c = motion::case_transform(*c, kind);
