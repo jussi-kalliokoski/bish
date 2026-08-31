@@ -2120,7 +2120,7 @@ fn handle_command_mode(
         CommandModeOutcome::Action(ref action) => {
             apply_window_action(action.clone(), sessions, windows, current_window, next_session_id, next_window_id, sinks_are_grid, *term_rows, *term_cols);
         }
-        CommandModeOutcome::Quit | CommandModeOutcome::Cancelled | CommandModeOutcome::Ran { .. } | CommandModeOutcome::Symbols(_) => {
+        CommandModeOutcome::Quit | CommandModeOutcome::Cancelled | CommandModeOutcome::Ran { .. } | CommandModeOutcome::Symbols(_) | CommandModeOutcome::NoHighlight => {
             if *sinks_are_grid {
                 // No window action, but command mode may still have
                 // written a rejected-attempt message straight to this
@@ -3481,7 +3481,7 @@ fn run_browse_frame(
                 CommandModeOutcome::Ran { output, .. } if !output.trim().is_empty() => {
                     browser.set_message(output.trim().replace('\n', " "));
                 }
-                CommandModeOutcome::Ran { .. } | CommandModeOutcome::Cancelled | CommandModeOutcome::Action(_) | CommandModeOutcome::Symbols(_) => {}
+                CommandModeOutcome::Ran { .. } | CommandModeOutcome::Cancelled | CommandModeOutcome::Action(_) | CommandModeOutcome::Symbols(_) | CommandModeOutcome::NoHighlight => {}
             }
             // The colon line drew over the global status row and
             // whatever else; the next iteration repaints the browser,
@@ -6820,6 +6820,12 @@ fn normal_mode_status_text(buf: &ScreenBuffer, vk: &VimKeys, command_line: Optio
 // only a few lines either way.
 fn active_search_pattern(vk: &VimKeys, buf: &ScreenBuffer) -> Option<String> {
     let pending = vk.pending_display();
+    // A pattern still being typed is always shown, `:noh` or not: that is
+    // live feedback about what you are typing, not the leftover
+    // highlight `:noh` is about.
+    if !vk.search_highlight_on() && !pending.starts_with('/') && !pending.starts_with('?') {
+        return None;
+    }
     if let Some(rest) = pending.strip_prefix('/').or_else(|| pending.strip_prefix('?')) {
         return if rest.is_empty() { None } else { Some(rest.to_string()) };
     }
@@ -8303,6 +8309,11 @@ fn run_normal_mode_navigation(
                             render_command_output_overlay(&output, status, *term_rows, *term_cols);
                             pending_view = PendingView::Output;
                         }
+                        continue;
+                    }
+                    CommandModeOutcome::NoHighlight => {
+                        vk.suppress_search_highlight();
+                        render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides.as_ref());
                         continue;
                     }
                     // `:sym QUERY` -- the project-wide half of `gO`,
@@ -11164,6 +11175,12 @@ enum CommandModeOutcome {
     // navigation) is the one that actually shows this -- see its own
     // doc comment on PendingView for how.
     Ran { output: String, status: i32 },
+    // `:noh`/`:nohlsearch` -- stop drawing the current search's matches.
+    //
+    // Handed back rather than done here for the reason `Symbols` is:
+    // the flag lives on `VimKeys`, which command mode does not have and
+    // the Normal-mode loop that owns the search does.
+    NoHighlight,
     // `:sym QUERY` -- ask the language server for matching symbols
     // across the whole project. Handed back rather than done here
     // because the answer goes into the locations pane, and command mode
@@ -11620,6 +11637,15 @@ fn run_command_mode(
                             show_command_mode_error(&format!("bish: diag: unknown subcommand '{}' (expected: clear)", arg.unwrap_or_default()), *term_rows, *term_cols);
                             buffer.clear();
                             continue;
+                        }
+                        // `noh`/`nohlsearch`: vim's own escape from a
+                        // search highlight that has outlived its
+                        // usefulness. Any later search brings it back,
+                        // `n` and `N` included, so this is never a mode
+                        // anyone has to leave.
+                        "noh" | "nohl" | "nohlsearch" => {
+                            sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry { command: trimmed.clone(), output: String::new(), status: 0 });
+                            return CommandModeOutcome::NoHighlight;
                         }
                         // `sym QUERY`: what the language server knows by
                         // that name anywhere in the project, listed in

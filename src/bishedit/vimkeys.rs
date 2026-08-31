@@ -564,6 +564,11 @@ pub struct VimKeys {
     pending: Pending,
     last_find: Option<(char, bool, bool)>, // (ch, till, forward)
     last_search_text: String,
+    // `:noh`. Vim's own rule exactly: the highlight goes away until the
+    // *next* search command, and `n`/`N`/`*` all count as one -- which
+    // is why this is cleared wherever `last_search` is set rather than
+    // being a setting anyone has to turn back on.
+    search_highlight_off: bool,
     last_search: Option<LastSearch>,
     // The operator waiting for a motion (or its own double-tap
     // shorthand), and the count that had already accumulated in `count`
@@ -645,6 +650,7 @@ impl VimKeys {
             pending: Pending::None,
             last_find: None,
             last_search_text: String::new(),
+            search_highlight_off: false,
             last_search: None,
             active_operator: None,
             operator_count: None,
@@ -686,6 +692,19 @@ impl VimKeys {
     /// a word-search's pattern without this needing to store it itself.
     pub fn last_search_text(&self) -> &str {
         &self.last_search_text
+    }
+
+    /// `:noh` -- stop drawing the current search's matches. Any later
+    /// search brings the highlight back on its own.
+    pub fn suppress_search_highlight(&mut self) {
+        self.search_highlight_off = true;
+    }
+
+    /// Whether search matches should be drawn at all right now. Every
+    /// view that highlights asks this before working out *what* to
+    /// highlight.
+    pub fn search_highlight_on(&self) -> bool {
+        !self.search_highlight_off
     }
 
     /// Whether the last resolved search was word-based (`*`/`#`) rather
@@ -1328,10 +1347,12 @@ impl VimKeys {
             Key::Char('n') => self.emit_last_search(true),
             Key::Char('N') => self.emit_last_search(false),
             Key::Char('*') => {
+                self.search_highlight_off = false;
                 self.last_search = Some(LastSearch::Word { forward: true, bounded: true });
                 self.emit(Motion::SearchWordForward)
             }
             Key::Char('#') => {
+                self.search_highlight_off = false;
                 self.last_search = Some(LastSearch::Word { forward: false, bounded: true });
                 self.emit(Motion::SearchWordBackward)
             }
@@ -1506,10 +1527,12 @@ impl VimKeys {
             Key::Char('e') => self.emit(Motion::WordEndBackward),
             Key::Char('E') => self.emit(Motion::WordEndBackwardBig),
             Key::Char('*') => {
+                self.search_highlight_off = false;
                 self.last_search = Some(LastSearch::Word { forward: true, bounded: false });
                 self.emit(Motion::SearchWordForwardUnbounded)
             }
             Key::Char('#') => {
+                self.search_highlight_off = false;
                 self.last_search = Some(LastSearch::Word { forward: false, bounded: false });
                 self.emit(Motion::SearchWordBackwardUnbounded)
             }
@@ -1740,6 +1763,7 @@ impl VimKeys {
         match key {
             Key::Enter => {
                 self.last_search_text = text.clone();
+                self.search_highlight_off = false;
                 self.last_search = Some(LastSearch::Pattern { forward });
                 self.emit(if forward {
                     Motion::SearchForward(text)
@@ -1785,6 +1809,11 @@ impl VimKeys {
     }
 
     fn emit_last_search(&mut self, same_direction: bool) -> KeyOutcome {
+        // `n`/`N` reuse the last search rather than setting a new one, so
+        // they need their own clear -- and they must have it: vim brings
+        // the highlight back on `n` after a `:noh`, which is most of what
+        // makes `:noh` safe to press.
+        self.search_highlight_off = false;
         match self.last_search {
             Some(LastSearch::Pattern { forward }) => {
                 let forward = if same_direction { forward } else { !forward };
@@ -2193,6 +2222,36 @@ mod tests {
             last(&mut vk, &[Key::Char('z'), Key::Char('b')]),
             KeyOutcome::Motion(Motion::ScrollBottom, None)
         );
+    }
+
+    // `:noh` is only safe to press because anything that searches again
+    // brings the highlight back -- `n` and `*` included, neither of
+    // which sets a *new* search.
+    #[test]
+    fn a_suppressed_search_highlight_comes_back_on_the_next_search() {
+        let mut vk = VimKeys::new();
+        assert!(vk.search_highlight_on(), "nothing suppressed to begin with");
+        vk.suppress_search_highlight();
+        assert!(!vk.search_highlight_on());
+
+        // A fresh `/` search.
+        for key in [Key::Char('/'), Key::Char('x'), Key::Enter] {
+            vk.feed(key);
+        }
+        assert!(vk.search_highlight_on());
+
+        // `n`, which reuses the last search rather than setting one.
+        vk.suppress_search_highlight();
+        vk.feed(Key::Char('n'));
+        assert!(vk.search_highlight_on(), "`n` brings it back");
+
+        // `N`, and `*` on a word.
+        vk.suppress_search_highlight();
+        vk.feed(Key::Char('N'));
+        assert!(vk.search_highlight_on());
+        vk.suppress_search_highlight();
+        vk.feed(Key::Char('*'));
+        assert!(vk.search_highlight_on());
     }
 
     #[test]

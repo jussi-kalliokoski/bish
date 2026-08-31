@@ -3722,6 +3722,31 @@ fn split_rendered(rendered: &str, at: usize) -> (String, String) {
 // entirely, in a split window. `rect` itself is still used for *size*
 // (`rect.rows`/`rect.cols`) either way -- only the position origin
 // changes.
+// The pattern whose matches this frame should mark, if any.
+//
+// Mirrors repl.rs's own `active_search_pattern` for `ScreenBuffer` --
+// duplicated rather than shared for the reason that one already gives
+// about its twin in editor.rs: the three contexts drive three different
+// `Buffer` impls, and this is a few lines either way.
+fn active_search_pattern(vk: &VimKeys, buf: &TextBuffer) -> Option<String> {
+    let pending = vk.pending_display();
+    if let Some(rest) = pending.strip_prefix('/').or_else(|| pending.strip_prefix('?')) {
+        // A pattern still being typed is shown regardless of `:noh`:
+        // that is live feedback about what you are typing, not the
+        // leftover highlight `:noh` is about.
+        return if rest.is_empty() { None } else { Some(rest.to_string()) };
+    }
+    if !vk.search_highlight_on() {
+        return None;
+    }
+    if vk.last_search_is_word() {
+        motion::word_under_cursor(buf, buf.cursor())
+    } else {
+        let text = vk.last_search_text();
+        if text.is_empty() { None } else { Some(text.to_string()) }
+    }
+}
+
 pub fn build_editor_frame(
     buf: &TextBuffer,
     vk: &VimKeys,
@@ -3733,6 +3758,9 @@ pub fn build_editor_frame(
 ) -> String {
     let content_rows = editor_content_rows(rect);
     let total = buf.line_count();
+    // What `hlsearch` should be drawing right now, worked out once for
+    // the whole frame rather than per row.
+    let search_pattern = active_search_pattern(vk, buf);
     // Reserves at least one column for content even if the gutter would
     // otherwise want more than the whole pane -- only reachable in a
     // pathologically narrow split, but `content_cols` below would
@@ -3796,6 +3824,10 @@ pub fn build_editor_frame(
                 (cell_at_col(&display.cells, hoffset), display.cells.len())
             };
             let line_len = buf.line_len(line);
+            let search_matches = match &search_pattern {
+                Some(pattern) => motion::find_matches_in_line(buf, line, pattern),
+                None => Vec::new(),
+            };
             let mut highlights: Vec<StyledSpan> = Vec::new();
             for range in buf.selections.iter().chain(active.iter()) {
                 let Some((start, end)) = selection_columns_in_line(range, line, 0, line_len + 1) else { continue };
@@ -3810,6 +3842,24 @@ pub fn build_editor_frame(
                 if let Some((start, end)) = span {
                     highlights.push(StyledSpan { start, end, fg: vt100::Color::Default, attrs: vt100::CellAttrs { reverse: true, ..vt100::CellAttrs::default() } });
                 }
+            }
+            // Search matches, underlined -- distinct from a selection's
+            // reverse video just above, so a match inside a selection
+            // still reads as both.
+            //
+            // The file editor had no `hlsearch` at all, while both of
+            // bish's other Normal modes (the prompt's own, and normal
+            // mode over a pane's scrollback) have always drawn it. This
+            // is the one place people actually search, and it was the
+            // one place that never showed what it found.
+            for (start, end) in search_matches.iter().copied() {
+                let Some((start, end)) = to_window(&display, start_cell, avail, start, end) else { continue };
+                highlights.push(StyledSpan {
+                    start,
+                    end,
+                    fg: vt100::Color::Default,
+                    attrs: vt100::CellAttrs { underline: true, ..vt100::CellAttrs::default() },
+                });
             }
             // A live `abbr` snippet's own placeholders, marked exactly as
             // the shell prompt marks them (editor.rs's `snippet_layer`):
@@ -4283,6 +4333,34 @@ mod macro_tests {
     // through the same macro-replay queue the test just below uses --
     // there's no real terminal here to type at, and `run_insert_mode`
     // reads through `vk.next_key`, which serves a queued replay first.
+    // The file editor never drew search matches at all, while both of
+    // bish's other Normal modes always have.
+    #[test]
+    fn the_editor_knows_what_a_search_highlight_should_cover() {
+        let mut buf = TextBuffer::new_unnamed(10);
+        buf.insert_text((0, 0), "alpha beta\ngamma beta");
+        let mut vk = VimKeys::new();
+        assert_eq!(active_search_pattern(&vk, &buf), None, "nothing searched for yet");
+
+        for key in [Key::Char('/'), Key::Char('b'), Key::Char('e')] {
+            vk.feed(key);
+        }
+        assert_eq!(active_search_pattern(&vk, &buf).as_deref(), Some("be"), "a pattern being typed is shown as it grows");
+        vk.feed(Key::Enter);
+        assert_eq!(active_search_pattern(&vk, &buf).as_deref(), Some("be"));
+
+        vk.suppress_search_highlight();
+        assert_eq!(active_search_pattern(&vk, &buf), None, "`:noh`");
+
+        // ...but typing a *new* pattern still shows as you type it,
+        // suppressed or not: that is feedback about the keystrokes, not
+        // the leftover highlight `:noh` is about.
+        for key in [Key::Char('/'), Key::Char('g')] {
+            vk.feed(key);
+        }
+        assert_eq!(active_search_pattern(&vk, &buf).as_deref(), Some("g"));
+    }
+
     // `insert_with`, but driving a buffer the caller prepared -- a
     // selection standing, a cursor somewhere particular.
     fn insert_into(buf: &mut TextBuffer, keys: &[Key]) {
