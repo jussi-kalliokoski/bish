@@ -1093,6 +1093,9 @@ pub struct Shell {
     // prompt from one place, so nothing can currently re-enter it --
     // this exists so that stays true if a second call site ever appears.
     in_prompt_command: bool,
+    // Whether `command_not_found_handle` is running -- a handler that
+    // itself mistypes a command would otherwise call itself forever.
+    in_command_not_found: bool,
     // `set -T` / `set -o functrace` covers DEBUG and RETURN; `set -E` /
     // `set -o errtrace` covers ERR. Two options and not one, because
     // bash makes them two -- inheriting DEBUG into every function is a
@@ -1372,6 +1375,7 @@ impl Shell {
             return_trap: None,
             in_trap: false,
             in_prompt_command: false,
+            in_command_not_found: false,
             opt_functrace: false,
             opt_errtrace: false,
             function_depth: 0,
@@ -1647,6 +1651,7 @@ impl Shell {
             return_trap: self.return_trap.clone(),
             in_trap: self.in_trap,
             in_prompt_command: false,
+            in_command_not_found: false,
             opt_functrace: self.opt_functrace,
             opt_errtrace: self.opt_errtrace,
             function_depth: 0,
@@ -1702,6 +1707,33 @@ impl Shell {
         if let Some(cmd) = self.exit_trap.take() {
             self.run_source_here(&cmd, "trap");
         }
+    }
+
+    /// Whether a `command_not_found_handle` function is defined and
+    /// could be called right now.
+    ///
+    /// The "right now" matters: the handler is itself a command, and a
+    /// handler that mistypes something would otherwise call itself
+    /// forever.
+    fn has_command_not_found_handler(&self) -> bool {
+        !self.in_command_not_found && self.functions.contains_key(COMMAND_NOT_FOUND_HANDLER)
+    }
+
+    /// bash's `command_not_found_handle`: the hook every distribution's
+    /// "command not found -- install package X" integration needs.
+    ///
+    /// Called with the whole failed command line as its positional
+    /// parameters, and its own exit status becomes the shell's -- so a
+    /// handler that installs and re-runs the thing can report success,
+    /// and one that only prints advice can still return 127.
+    fn run_command_not_found_handler(&mut self, argv: &[String]) -> ExecResult {
+        let Some(body) = self.functions.get(COMMAND_NOT_FOUND_HANDLER).cloned() else {
+            return ExecResult::Status(127);
+        };
+        self.in_command_not_found = true;
+        let result = self.call_function(&body, argv.to_vec());
+        self.in_command_not_found = false;
+        result
     }
 
     /// Runs `PROMPT_COMMAND` before drawing a primary prompt.
@@ -7860,6 +7892,10 @@ impl Shell {
                     result
                 }
             }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && self.has_command_not_found_handler() => {
+                self.drain_proc_subs();
+                self.run_command_not_found_handler(&argv)
+            }
             Err(e) => {
                 let msg = format!("bish: {}: {}", name, e);
                 self.write_command_error(cmd, &msg);
@@ -10363,6 +10399,12 @@ fn read_line_or_chars(reader: &mut dyn std::io::BufRead, nchars: Option<usize>, 
         }
     }
 }
+
+/// The three `trap` targets that are not signals -- the interpreter
+/// fires each itself, at a point it already passes through.
+/// bash's own name for it, spelled exactly as bash spells it -- a
+/// distribution's integration script defines this name and no other.
+const COMMAND_NOT_FOUND_HANDLER: &str = "command_not_found_handle";
 
 /// The three `trap` targets that are not signals -- the interpreter
 /// fires each itself, at a point it already passes through.
@@ -14261,6 +14303,43 @@ mod tests {
         assert_eq!(shell.lsp_servers.len(), 2);
     }
 
+    #[test]
+    fn command_not_found_handle_is_called_with_the_whole_command() {
+        let mut shell = Shell::new();
+        let out = capture_output(&mut shell);
+        shell.run_source_here(
+            r#"command_not_found_handle(){ echo "no $1 (args: $*)"; return 42; }
+bish_no_such_command a b
+echo "status=$?""#,
+            "<test>",
+        );
+        assert_eq!(out.borrow().as_str(), "no bish_no_such_command (args: bish_no_such_command a b)\nstatus=42\n");
+    }
+
+    #[test]
+    fn without_a_handler_a_missing_command_is_still_127() {
+        let mut shell = Shell::new();
+        let out = capture_output(&mut shell);
+        shell.run_source_here("bish_no_such_command\necho \"status=$?\"", "<test>");
+        assert!(out.borrow().contains("status=127"), "{}", out.borrow());
+    }
+
+    // Real bash loops forever here. The guard is a deliberate
+    // divergence, not an accident: a handler that itself mistypes
+    // something would otherwise call itself until the machine gives up.
+    #[test]
+    fn a_handler_that_mistypes_something_does_not_call_itself_forever() {
+        let mut shell = Shell::new();
+        let out = capture_output(&mut shell);
+        shell.run_source_here(
+            "command_not_found_handle(){ echo H; bish_also_missing; }\nbish_no_such_command\necho \"status=$?\"",
+            "<test>",
+        );
+        let seen = out.borrow().clone();
+        assert_eq!(seen.matches('H').count(), 1, "the handler ran exactly once: {seen}");
+        assert!(seen.contains("status=127"));
+    }
+
     // The one thing a `PROMPT_COMMAND` must not do is change the answer
     // to `$?` for the command the user actually ran -- a prompt that
     // colours itself by the last status would be wrong on every line
@@ -14376,8 +14455,7 @@ mod tests {
             let mut shell = Shell::new();
             let out = capture_output(&mut shell);
             shell.run_source_here(script, "<test>");
-            let seen = out.borrow().clone();
-            seen
+            out.borrow().clone()
         };
         assert_eq!(run(r#"[[ HELLO =~ ^hel ]] && echo yes || echo no"#), "no\n");
         assert_eq!(run(r#"shopt -s nocasematch; [[ HELLO =~ ^hel ]] && echo yes || echo no"#), "yes\n");
