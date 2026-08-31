@@ -8426,8 +8426,41 @@ fn run_normal_mode_navigation(
                     .unwrap_or_default();
                     match found.first().cloned() {
                         None => {
-                            render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides.as_ref());
-                            show_command_mode_error("no definition found", *term_rows, *term_cols);
+                            // No server answer -- but in a shell script a
+                            // command word has an obvious definition, and
+                            // bish has both a roff parser and a real
+                            // pager to show it in. `man rsync` without
+                            // leaving the buffer, in bish's own renderer
+                            // rather than a subprocess.
+                            let manpage = man_page_under_cursor(tb);
+                            match manpage {
+                                Some((name, source)) => {
+                                    run_pager(
+                                        &format!("man {name}"),
+                                        PagerSource {
+                                            language: "roff".to_string(),
+                                            source,
+                                            links: LinkOptions {
+                                                hyperlinks: sessions.get(&session_id).is_none_or(|s| s.shell.bishopt_bool("hyperlinks")),
+                                                base_dir: None,
+                                                colors: sessions.get(&session_id).map(|s| ui_colors(&s.shell)),
+                                            },
+                                        },
+                                        sessions,
+                                        windows,
+                                        job_frames,
+                                        *current_window,
+                                        term_rows,
+                                        term_cols,
+                                        *sinks_are_grid,
+                                    );
+                                    render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides.as_ref());
+                                }
+                                None => {
+                                    render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides.as_ref());
+                                    show_command_mode_error("no definition found", *term_rows, *term_cols);
+                                }
+                            }
                         }
                         Some(first) => {
                             // One entry, here, before going anywhere:
@@ -10835,6 +10868,31 @@ impl PagerSource {
     fn lines(&self, term_cols: usize) -> Vec<String> {
         preview_document(&self.language, &self.source, term_cols, &self.links).unwrap_or_default()
     }
+}
+
+// The man page for the command word under the cursor, if this is a
+// shell buffer and there is one.
+//
+// Scoped to bash on purpose: "the word under the cursor names a program
+// on this machine" is only a safe reading where a word in command
+// position *is* a program. In a Rust file it would be a coincidence.
+//
+// `manpages::source_for` reads the page synchronously rather than going
+// through `query`'s background fetch -- this is answering a key someone
+// just pressed, and there is nothing useful to show them a moment later.
+fn man_page_under_cursor(buf: &TextBuffer) -> Option<(String, String)> {
+    if fileeditor::language_of(buf) != crate::bishedit::snippet::DEFAULT_LANG {
+        return None;
+    }
+    let (row, col) = buf.cursor();
+    let line = buf.line_chars(row);
+    let start = crate::bishedit::completion::find_word_start(&line, col.min(line.len()));
+    let end = line[start..].iter().position(|c| !c.is_alphanumeric() && *c != '-' && *c != '_' && *c != '.').map_or(line.len(), |n| start + n);
+    let word: String = line[start..end].iter().collect();
+    if word.is_empty() {
+        return None;
+    }
+    crate::bishedit::manpages::source_for(&word).map(|source| (word, source))
 }
 
 fn run_pager(

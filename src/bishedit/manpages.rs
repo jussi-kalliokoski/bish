@@ -114,6 +114,18 @@ fn fetch_and_store(command: String) {
 // crate::archive if it needs it) and run through crate::roff, so a
 // flag and its description are paired because the page's own `.TP`
 // paired them, not because they happened to line up in a column.
+/// A command's man page as raw roff, for a caller that wants to *render*
+/// it rather than mine facts out of it.
+///
+/// Synchronous, unlike `query`: this is answering a key someone just
+/// pressed, and what it costs is one file read plus a decompress -- not
+/// the roff parse and flag extraction `query` spawns a thread for.
+/// `None` for a command with no page, which is every miss the caller
+/// needs to distinguish.
+pub fn source_for(command: &str) -> Option<String> {
+    read_page(&find_page(command)?)
+}
+
 fn fetch_and_parse(command: &str) -> Option<ManPageData> {
     let source = read_page(&find_page(command)?)?;
     Some(extract(&crate::roff::parse(&source), command))
