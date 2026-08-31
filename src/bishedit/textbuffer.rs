@@ -74,6 +74,12 @@ pub struct TextBuffer {
     /// starting a second rust-analyzer for the toolchain directory,
     /// because that file's own nearest `Cargo.toml` lives there.
     pub lsp_root: Option<std::path::PathBuf>,
+    /// What this buffer's language server says it is busy with, for the
+    /// status line. `None` when it is idle, has nothing to say, or does
+    /// not exist. Refreshed on the idle tick like `diagnostics` and
+    /// `semantic_spans`, and for the same reason: this is the one place
+    /// with both the buffer and a moment to spare.
+    pub lsp_progress: Option<String>,
     // A language server's semantic tokens for this buffer, already
     // resolved to colours and to this buffer's own char offsets (see
     // repl::sync_semantic_tokens) -- painted as one more layer over
@@ -271,6 +277,7 @@ impl TextBuffer {
             ignorecase: false,
             smartcase: false,
             lsp_root: None,
+            lsp_progress: None,
             semantic_spans: Vec::new(),
             diagnostics: Vec::new(),
             blame: None,
@@ -396,6 +403,7 @@ impl TextBuffer {
             ignorecase: false,
             smartcase: false,
             lsp_root: None,
+            lsp_progress: None,
             semantic_spans: Vec::new(),
             diagnostics: Vec::new(),
             blame: None,
@@ -1029,6 +1037,7 @@ mod tests {
             ignorecase: false,
             smartcase: false,
             lsp_root: None,
+            lsp_progress: None,
             semantic_spans: Vec::new(),
             diagnostics: Vec::new(),
             blame: None,

@@ -7473,7 +7473,8 @@ fn insert_idle(
         refresh_diagnostics_title(sessions, windows, *current_window, &buf.diagnostics, *term_rows, *term_cols);
     }
     let recoloured = sync_semantic_tokens(sessions, session_id, buf);
-    (repaint || diagnosed || recoloured).then(|| fileeditor::IdleRedraw {
+    let reprogressed = sync_language_server_progress(sessions, session_id, buf);
+    (repaint || diagnosed || recoloured || reprogressed).then(|| fileeditor::IdleRedraw {
         rect: pane_rect(&windows[*current_window], windows[*current_window].focused_pane, *term_rows, *term_cols),
         term_rows: *term_rows,
         term_cols: *term_cols,
@@ -7698,6 +7699,7 @@ fn run_normal_mode_navigation(
                     refresh_diagnostics_title(sessions, windows, *current_window, &tb.diagnostics, *term_rows, *term_cols);
                 }
                 diagnosed |= sync_semantic_tokens(sessions, session_id, tb);
+                diagnosed |= sync_language_server_progress(sessions, session_id, tb);
             }
             // A job this pane stepped away from is still producing, and
             // the mode line's own "+N new lines below" has to keep up
@@ -9365,6 +9367,33 @@ fn sync_language_server_document(sessions: &mut HashMap<SessionId, SessionState>
         return;
     }
     server.change_document(&target.uri, buf.version(), &fileeditor::buffer_text(buf));
+}
+
+// One tick of "what is the server doing" upkeep for the buffer being
+// edited, so the status line can say so.
+//
+// This is the named risk of the whole feature made visible: a cold
+// server answers nothing, and until now every `K` against one cost a
+// full `lsp_timeout_ms` with no hint that waiting would have helped.
+// Costs a string comparison on a quiet tick, which is why it can run on
+// every one of them.
+//
+// Returns true when the line changed, which is the caller's cue to
+// redraw -- a progress line that only updates on the next keystroke is
+// worse than none, since it is then reliably wrong.
+fn sync_language_server_progress(sessions: &mut HashMap<SessionId, SessionState>, session_id: SessionId, buf: &mut TextBuffer) -> bool {
+    let line = (|| {
+        let session = sessions.get(&session_id)?;
+        let target = server_target(session, buf)?;
+        let lsp = Rc::clone(&session.lsp);
+        let mut table = lsp.borrow_mut();
+        table.running(&target.display, &target.root)?.progress_line()
+    })();
+    if buf.lsp_progress == line {
+        return false;
+    }
+    buf.lsp_progress = line;
+    true
 }
 
 // One tick of semantic-token upkeep for the buffer being edited.

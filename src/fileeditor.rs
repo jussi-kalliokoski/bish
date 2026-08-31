@@ -2238,7 +2238,20 @@ fn status_text(buf: &TextBuffer, vk: &VimKeys, mode: EditorMode, cols: usize) ->
     }
     let (line, col) = buf.cursor();
     let total = buf.line_count();
-    let right = format!("{},{}  {}/{}", line + 1, col + 1, line + 1, total);
+    let mut right = format!("{},{}  {}/{}", line + 1, col + 1, line + 1, total);
+
+    // What the language server is busy with, between the mode indicator
+    // and the cursor position. On the right because that is where it is
+    // out of the way of a `:` line being typed, and dropped outright
+    // rather than truncated when the pane is too narrow for both it and
+    // the position -- knowing where the cursor is matters more, every
+    // time, than knowing a server is indexing.
+    if let Some(progress) = &buf.lsp_progress {
+        let candidate = format!("{progress}   {right}");
+        if left.chars().count() + candidate.chars().count() < cols {
+            right = candidate;
+        }
+    }
 
     let left_len = left.chars().count();
     let right_len = right.chars().count();

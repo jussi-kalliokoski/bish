@@ -208,6 +208,19 @@ pub struct Server {
 
     log: VecDeque<String>,
     stderr_partial: String,
+    // Work the server says it is currently doing, newest last, keyed by
+    // the `$/progress` token that will end it.
+    //
+    // This is the answer to the risk this feature was planned around: a
+    // server that has not finished indexing answers nothing, and every
+    // `K` or `gd` against it costs a full timeout with no explanation.
+    // A server that reports progress is *saying* so, and the only thing
+    // missing was somewhere to put it.
+    //
+    // Bounded because a token is only removed by the `end` that names
+    // it, and a server that never sends one -- or crashes mid-work --
+    // must not grow this forever.
+    progress: Vec<(String, Progress)>,
 
     state: State,
     // Responses to requests bish made, waiting to be collected.
@@ -291,6 +304,45 @@ impl ApplyEdits {
 /// rather than unbounded memory.
 const MAX_PENDING_APPLIES: usize = 8;
 
+/// The most concurrent `$/progress` operations tracked at once.
+///
+/// Only the newest is ever displayed, so this is a memory bound rather
+/// than a display one -- a server that begins work and never ends it
+/// would otherwise accumulate tokens for as long as it runs.
+const MAX_PROGRESS: usize = 16;
+
+/// One `$/progress` operation the server has begun and not yet ended.
+///
+/// `title` is fixed at `begin` and does not change; `message` and
+/// `percentage` are whatever the last `report` said, and either may be
+/// absent at any point -- a server is free to send a bare `begin` and
+/// then nothing until `end`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Progress {
+    title: String,
+    message: Option<String>,
+    percentage: Option<u8>,
+}
+
+impl Progress {
+    // "Indexing 40%: core", with each half omitted when the server did
+    // not supply it. Short on purpose: this competes for the status
+    // line with the mode indicator and the cursor position, and a
+    // server's own `message` can be a full crate path.
+    fn line(&self) -> String {
+        let mut text = self.title.clone();
+        if let Some(pct) = self.percentage {
+            text.push_str(&format!(" {pct}%"));
+        }
+        if let Some(message) = &self.message
+            && !message.is_empty()
+        {
+            text.push_str(&format!(": {message}"));
+        }
+        text
+    }
+}
+
 impl Server {
     /// Spawns `command` in `root` and sends `initialize`. Returns as
     /// soon as the process exists -- the handshake completes later, in
@@ -336,6 +388,7 @@ impl Server {
             queued: Vec::new(),
             log: VecDeque::new(),
             stderr_partial: String::new(),
+            progress: Vec::new(),
             state: State::Initializing,
             responses: Vec::new(),
             stdout_eof: false,
@@ -609,6 +662,17 @@ impl Server {
                         ),
                     ]),
                     ),
+                    (
+                        "window".to_string(),
+                        Value::Object(vec![
+                            // Not a courtesy: rust-analyzer (and others)
+                            // send `$/progress` only to a client that
+                            // asked for it, so without this the status
+                            // line has nothing to show and a cold server
+                            // looks identical to a broken one.
+                            ("workDoneProgress".to_string(), Value::Bool(true)),
+                        ]),
+                    ),
                 ]),
             ),
         ])
@@ -753,6 +817,13 @@ impl Server {
                     self.note(note);
                 }
                 self.respond(id.clone(), answer);
+                None
+            }
+            // "I have started / am partway through / have finished a
+            // piece of work." Tracked rather than logged, because the
+            // point of it is to be visible *while* it is true.
+            Message::Notification { method, params } if method == "$/progress" => {
+                self.progress_update(params);
                 None
             }
             // A server's own log lines belong with the ones it wrote to
@@ -1252,6 +1323,78 @@ impl Server {
         self.queued.clear();
     }
 
+    // Applies one `$/progress` notification.
+    //
+    // A token is either a string or a number on the wire and is opaque
+    // either way -- it only ever has to match the one an `end` names --
+    // so both are kept as their own text. A `report` for a token that
+    // was never begun is ignored rather than invented: without the
+    // `begin` there is no title, and a percentage on its own says
+    // nothing a status line could show.
+    fn progress_update(&mut self, params: &Value) {
+        apply_progress(&mut self.progress, params);
+    }
+}
+
+// The body of `Server::progress_update`, as a free function so it can
+// be tested against a plain `Vec` -- the alternative is spawning a real
+// process to assert that "end" removes a token.
+fn apply_progress(progress: &mut Vec<(String, Progress)>, params: &Value) {
+    let token = match json::query(params, ".token") {
+        Ok(Value::Str(text)) => text.clone(),
+        Ok(Value::Number(n)) => format!("{n}"),
+        _ => return,
+    };
+    let kind = match json::query(params, ".value.kind") {
+        Ok(Value::Str(kind)) => kind.clone(),
+        _ => return,
+    };
+    let message = match json::query(params, ".value.message") {
+        Ok(Value::Str(text)) => Some(text.clone()),
+        _ => None,
+    };
+    // Clamped rather than trusted: the spec says 0-100, and a
+    // status line reading "Indexing 4000%" is worse than one
+    // reading nothing.
+    let percentage = match json::query(params, ".value.percentage") {
+        Ok(Value::Number(n)) if *n >= 0.0 => Some((*n as u64).min(100) as u8),
+        _ => None,
+    };
+    match kind.as_str() {
+        "begin" => {
+            let title = match json::query(params, ".value.title") {
+                Ok(Value::Str(title)) => title.clone(),
+                _ => String::new(),
+            };
+            if progress.len() >= MAX_PROGRESS {
+                // The oldest is the one least likely to still be
+                // running, and something has to give.
+                let _ = progress.remove(0);
+            }
+            progress.retain(|(existing, _)| existing != &token);
+            progress.push((token, Progress { title, message, percentage }));
+        }
+        "report" => {
+            if let Some((_, running)) = progress.iter_mut().find(|(existing, _)| existing == &token) {
+                // Absent fields mean "unchanged", not "cleared" --
+                // rust-analyzer sends a bare percentage bump with no
+                // message far more often than it sends both.
+                if message.is_some() {
+                    running.message = message;
+                }
+                if percentage.is_some() {
+                    running.percentage = percentage;
+                }
+            }
+        }
+        "end" => {
+            progress.retain(|(existing, _)| existing != &token);
+        }
+        _ => {}
+    }
+}
+
+impl Server {
     fn note(&mut self, line: String) {
         if self.log.len() == LOG_LINES {
             self.log.pop_front();
@@ -1269,6 +1412,27 @@ impl Server {
 
     pub fn is_ready(&self) -> bool {
         self.state == State::Ready
+    }
+
+    /// What this server is busy with right now, or `None` when it is
+    /// not busy with anything it has told us about.
+    ///
+    /// The *newest* operation rather than all of them: a status line
+    /// has room for one, and the newest is the one whose progress is
+    /// still moving. A server still handshaking reports that instead,
+    /// since "not ready" is the same news for the same reason and a
+    /// server generally starts reporting progress only once it is.
+    pub fn progress_line(&self) -> Option<String> {
+        if !self.is_ready() && !self.is_dead() {
+            return Some(format!("{} starting", self.display_name()));
+        }
+        self.progress.last().map(|(_, progress)| progress.line())
+    }
+
+    // The server's own name for a status line: the command's first
+    // word, without whatever path or arguments it was registered with.
+    fn display_name(&self) -> &str {
+        self.command.split_whitespace().next().unwrap_or(&self.command).rsplit('/').next().unwrap_or(&self.command)
     }
 
     /// Whether this server has stopped for good. A dead server is kept
@@ -2361,6 +2525,94 @@ mod tests {
     fn received(log: &Path) -> Vec<Message> {
         let text = std::fs::read_to_string(log).unwrap_or_default();
         text.lines().filter_map(|line| json::parse(line).ok()).filter_map(|v| Message::from_value(&v).ok()).collect()
+    }
+
+    // One `$/progress` notification's params, as a server sends them.
+    fn progress_params(json: &str) -> Value {
+        json::parse(json).unwrap()
+    }
+
+    // What the status line would show for this sequence of them.
+    fn progress_after(notifications: &[&str]) -> Option<String> {
+        let mut progress = Vec::new();
+        for text in notifications {
+            apply_progress(&mut progress, &progress_params(text));
+        }
+        progress.last().map(|(_, p)| p.line())
+    }
+
+    #[test]
+    fn a_begin_is_shown_and_its_end_clears_it() {
+        let begin = r#"{"token":"rustAnalyzer/Indexing","value":{"kind":"begin","title":"Indexing"}}"#;
+        let end = r#"{"token":"rustAnalyzer/Indexing","value":{"kind":"end"}}"#;
+        assert_eq!(progress_after(&[begin]).as_deref(), Some("Indexing"));
+        assert_eq!(progress_after(&[begin, end]), None);
+    }
+
+    #[test]
+    fn a_report_updates_the_title_it_belongs_to() {
+        let begin = r#"{"token":1,"value":{"kind":"begin","title":"Indexing","percentage":0}}"#;
+        let report = r#"{"token":1,"value":{"kind":"report","percentage":40,"message":"core"}}"#;
+        assert_eq!(progress_after(&[begin]).as_deref(), Some("Indexing 0%"));
+        assert_eq!(progress_after(&[begin, report]).as_deref(), Some("Indexing 40%: core"));
+    }
+
+    #[test]
+    fn a_report_that_omits_a_field_leaves_it_alone() {
+        // rust-analyzer's own shape: one `begin` with a message, then
+        // bare percentage bumps. Treating an absent field as a clear
+        // would make the message flicker in and out on every tick.
+        let begin = r#"{"token":"t","value":{"kind":"begin","title":"Indexing","message":"core","percentage":10}}"#;
+        let bump = r#"{"token":"t","value":{"kind":"report","percentage":20}}"#;
+        assert_eq!(progress_after(&[begin, bump]).as_deref(), Some("Indexing 20%: core"));
+    }
+
+    #[test]
+    fn a_report_for_a_token_that_never_began_is_ignored() {
+        // There is no title to show it under, so there is nothing to
+        // say -- and inventing an empty one would put a bare "40%" on
+        // the status line.
+        let orphan = r#"{"token":"ghost","value":{"kind":"report","percentage":40}}"#;
+        assert_eq!(progress_after(&[orphan]), None);
+    }
+
+    #[test]
+    fn the_newest_operation_is_the_one_shown() {
+        // Two overlapping operations is the normal case (rust-analyzer
+        // indexes and builds its proc-macro server at once); the status
+        // line has room for one, and the newest is the live one.
+        let first = r#"{"token":"a","value":{"kind":"begin","title":"Indexing"}}"#;
+        let second = r#"{"token":"b","value":{"kind":"begin","title":"Building"}}"#;
+        let end_second = r#"{"token":"b","value":{"kind":"end"}}"#;
+        assert_eq!(progress_after(&[first, second]).as_deref(), Some("Building"));
+        // ...and ending it falls back to the one still running rather
+        // than to nothing.
+        assert_eq!(progress_after(&[first, second, end_second]).as_deref(), Some("Indexing"));
+    }
+
+    #[test]
+    fn a_percentage_outside_the_spec_s_own_range_is_clamped() {
+        let begin = r#"{"token":"t","value":{"kind":"begin","title":"Indexing","percentage":4000}}"#;
+        assert_eq!(progress_after(&[begin]).as_deref(), Some("Indexing 100%"));
+    }
+
+    #[test]
+    fn a_server_that_begins_without_ever_ending_does_not_grow_forever() {
+        let mut progress = Vec::new();
+        for token in 0..MAX_PROGRESS * 4 {
+            let text = format!(r#"{{"token":{token},"value":{{"kind":"begin","title":"Work"}}}}"#);
+            apply_progress(&mut progress, &progress_params(&text));
+        }
+        assert_eq!(progress.len(), MAX_PROGRESS);
+    }
+
+    #[test]
+    fn a_notification_missing_what_it_needs_changes_nothing() {
+        let mut progress = Vec::new();
+        for text in [r#"{"value":{"kind":"begin","title":"Indexing"}}"#, r#"{"token":"t"}"#, r#"{"token":"t","value":{}}"#] {
+            apply_progress(&mut progress, &progress_params(text));
+        }
+        assert!(progress.is_empty());
     }
 
     fn wait_for_response(server: &mut Server, id: i64) -> Option<Result<Value, ResponseError>> {
