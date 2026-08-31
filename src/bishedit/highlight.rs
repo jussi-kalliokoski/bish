@@ -695,6 +695,32 @@ pub const HL_NAMES: &[(HighlightKind, &str)] = &[
     (HighlightKind::Key, "key"),
 ];
 
+// The `HighlightKind` a language server's semantic token type falls
+// back to when nothing has been said about that name with `::bish hl`.
+//
+// Only the names that genuinely mean the same thing here. The point of
+// semantic tokens is that the server knows things a lexer cannot -- that
+// this identifier is a parameter and that one a constant -- so the
+// mapping is deliberately partial: a type with no bish equivalent
+// (`function`, `class`, `typeParameter`) yields nothing at all, leaving
+// whatever the local highlighter made of it and waiting for a
+// `::bish hl --set function ...` to give it a colour of its own. That
+// is also why `HL_NAMES` is not the list of what `::bish hl` accepts.
+pub fn kind_for_semantic_type(name: &str) -> Option<HighlightKind> {
+    Some(match name {
+        "keyword" | "modifier" => HighlightKind::Keyword,
+        "string" | "regexp" => HighlightKind::String,
+        "comment" => HighlightKind::Comment,
+        "number" => HighlightKind::Number,
+        "operator" => HighlightKind::Operator,
+        // A parameter, a property and an enum member are all "a name
+        // standing for a value" as far as anything bish draws is
+        // concerned.
+        "variable" | "parameter" | "property" | "enumMember" => HighlightKind::Variable,
+        _ => return None,
+    })
+}
+
 // Builds one Cell per char, then paints each layer's spans over it in
 // order -- a later layer (or a later span within the same layer, though
 // BashHighlighter's own output is always non-overlapping by construction)

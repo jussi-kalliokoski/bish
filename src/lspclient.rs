@@ -449,6 +449,43 @@ impl Server {
                             ]),
                         ),
                         (
+                            "semanticTokens".to_string(),
+                            Value::Object(vec![
+                                ("dynamicRegistration".to_string(), Value::Bool(false)),
+                                // Only the whole document. The delta and
+                                // range forms exist to make a large file
+                                // cheap, and bish asks for tokens off the
+                                // idle path with the answer collected
+                                // whenever it turns up -- nothing is
+                                // waiting on it, so there is nothing for
+                                // the cheaper forms to save yet.
+                                (
+                                    "requests".to_string(),
+                                    Value::Object(vec![("full".to_string(), Value::Bool(true)), ("range".to_string(), Value::Bool(false))]),
+                                ),
+                                // Empty, both of them: a server sends
+                                // whatever legend it likes and bish reads
+                                // the names back out of it (see
+                                // `lsp::SemanticLegend`). Declaring a
+                                // fixed list here would mean refusing
+                                // token types this client can in fact
+                                // colour, since `::bish hl`'s namespace
+                                // is open.
+                                ("tokenTypes".to_string(), Value::Array(Vec::new())),
+                                ("tokenModifiers".to_string(), Value::Array(Vec::new())),
+                                ("formats".to_string(), Value::Array(vec![Value::Str("relative".to_string())])),
+                                // Neither is claimed: bish paints one
+                                // colour per token, so a server splitting
+                                // an unrecognised multi-line token into
+                                // per-line pieces (the first) and
+                                // overlapping tokens (the second) would
+                                // both need renderer work with nothing to
+                                // show for it yet.
+                                ("multilineTokenSupport".to_string(), Value::Bool(false)),
+                                ("overlappingTokenSupport".to_string(), Value::Bool(false)),
+                            ]),
+                        ),
+                        (
                             "references".to_string(),
                             Value::Object(vec![("dynamicRegistration".to_string(), Value::Bool(false))]),
                         ),
@@ -1026,6 +1063,17 @@ impl Server {
         now.duration_since(since) >= debounce
     }
 
+    /// The version of `uri` the server has actually been told about.
+    /// `None` for a document it was never told about at all.
+    ///
+    /// Asking a server about text it has not seen yet gets an answer
+    /// about the text it *has* seen, whose offsets describe a different
+    /// file -- which is why anything that positions itself by a server's
+    /// answer checks this first.
+    pub fn known_version(&self, uri: &str) -> Option<u64> {
+        self.documents.iter().find(|d| d.uri == uri).map(|d| d.version)
+    }
+
     /// The answer to `id`, once it has arrived. `None` means "not yet"
     /// -- the caller polls this while servicing everything else.
     pub fn take_response(&mut self, id: i64) -> Option<Result<Value, ResponseError>> {
@@ -1191,6 +1239,13 @@ impl Server {
     /// happened), so anyone acting on what it once said has to ask.
     pub fn is_dead(&self) -> bool {
         matches!(self.state, State::Dead(_))
+    }
+
+    /// The names this server gave its own semantic token types and
+    /// modifiers, from the handshake. Empty for a server that does not
+    /// do semantic tokens at all.
+    pub fn semantic_legend(&self) -> lsp::SemanticLegend {
+        lsp::SemanticLegend::parse(&self.capabilities)
     }
 
     /// How this server counts columns. Only meaningful once ready.

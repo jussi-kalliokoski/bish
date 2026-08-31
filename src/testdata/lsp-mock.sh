@@ -73,7 +73,7 @@ while :; do
 		 {"range":{"start":{"line":2,"character":0},"end":{"line":2,"character":7}},"newText":"COMMANDED"}]}}}}'
 		;;
 	*'"method":"initialize"'*)
-		send '{"jsonrpc":"2.0","id":'"$id"',"result":{"capabilities":{"positionEncoding":"utf-32","hoverProvider":true,"definitionProvider":true,"referencesProvider":true,"documentSymbolProvider":true,"completionProvider":{"triggerCharacters":["."]},"documentFormattingProvider":true,"renameProvider":true,"codeActionProvider":true,"executeCommandProvider":{"commands":["mock.run"]},"workspaceSymbolProvider":true,"textDocumentSync":{"openClose":true,"change":1,"save":true}}}}'
+		send '{"jsonrpc":"2.0","id":'"$id"',"result":{"capabilities":{"positionEncoding":"utf-32","hoverProvider":true,"definitionProvider":true,"referencesProvider":true,"documentSymbolProvider":true,"completionProvider":{"triggerCharacters":["."]},"documentFormattingProvider":true,"renameProvider":true,"codeActionProvider":true,"executeCommandProvider":{"commands":["mock.run"]},"workspaceSymbolProvider":true,"semanticTokensProvider":{"legend":{"tokenTypes":["keyword","parameter","bishInvented"],"tokenModifiers":["declaration"]},"full":true},"textDocumentSync":{"openClose":true,"change":1,"save":true}}}}'
 		;;
 	*'"method":"textDocument/didOpen"'*)
 		# Remembered so `textDocument/definition` can answer about
@@ -171,6 +171,16 @@ while :; do
 		 {"label":"alpha","kind":3,"insertText":"alpha()","sortText":"0"},
 		 {"label":"gamma","kind":3,"insertText":"gamma(${1:x})","insertTextFormat":2},
 		 {"label":"belta","kind":6}]}}'
+		;;
+	*'"method":"textDocument/semanticTokens/full"'*)
+		# Deltas, as the protocol requires: line 0 col 0 for 5 chars
+		# (a keyword), then the same line 6 chars further along for 4
+		# (a parameter), then two lines down for 5 -- of a type this
+		# client has no colour for, which must simply not be painted.
+		send '{"jsonrpc":"2.0","id":'"$id"',"result":{"data":[
+		 0,0,5,0,0,
+		 0,6,4,1,1,
+		 2,0,5,2,0]}}'
 		;;
 	*'"method":"workspace/symbol"'*)
 		# The flat `SymbolInformation` shape, which is the only one a

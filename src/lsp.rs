@@ -922,6 +922,118 @@ fn sanitize_insert(text: &str) -> String {
 }
 
 // ---------------------------------------------------------------------
+// Semantic tokens
+// ---------------------------------------------------------------------
+
+/// The names a server chose for its own token types and modifiers.
+///
+/// The protocol sends tokens as bare numbers and puts the meanings in
+/// the `initialize` result, once, so this has to be kept from there --
+/// a token stream read against the wrong legend is not wrong-looking,
+/// it is confidently the wrong colour everywhere.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SemanticLegend {
+    pub types: Vec<String>,
+    pub modifiers: Vec<String>,
+}
+
+impl SemanticLegend {
+    /// Reads the legend out of a server's `semanticTokensProvider`.
+    pub fn parse(capabilities: &Value) -> SemanticLegend {
+        let names = |path: &str| match json::query(capabilities, path) {
+            Ok(Value::Array(items)) => items
+                .iter()
+                .map(|item| match item {
+                    Value::Str(name) => sanitize(name),
+                    _ => String::new(),
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
+        SemanticLegend {
+            types: names(".semanticTokensProvider.legend.tokenTypes"),
+            modifiers: names(".semanticTokensProvider.legend.tokenModifiers"),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.types.is_empty()
+    }
+}
+
+/// One token, in the server's own coordinates: a run on one line,
+/// named by whatever the legend called its type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SemanticToken {
+    pub line: usize,
+    /// In the negotiated position encoding, like every other column.
+    pub start: usize,
+    pub length: usize,
+    /// The legend's name for the type -- "function", "keyword",
+    /// "parameter". Empty when the server used a number the legend does
+    /// not cover, which the caller drops.
+    pub kind: String,
+    /// The modifier names that were set, in legend order:
+    /// "declaration", "readonly", "deprecated".
+    pub modifiers: Vec<String>,
+}
+
+/// The most tokens read from one answer.
+///
+/// A whole large file's worth is normal; several times that is a server
+/// that has lost track of what it is describing, and every one of them
+/// costs a span in the renderer.
+const MAX_SEMANTIC_TOKENS: usize = 20_000;
+
+/// Decodes `textDocument/semanticTokens/full`.
+///
+/// The data is a flat array of 5-tuples, each *relative to the one
+/// before it*: `[deltaLine, deltaStart, length, type, modifiers]`, where
+/// `deltaStart` is relative to the previous token's start when they are
+/// on the same line and absolute when the line moved. That encoding is
+/// the whole reason this is a decoder and not a `map`.
+pub fn semantic_tokens(result: &Value, legend: &SemanticLegend) -> Vec<SemanticToken> {
+    let Ok(Value::Array(data)) = json::query(result, ".data") else { return Vec::new() };
+    let mut out = Vec::new();
+    let mut line = 0usize;
+    let mut start = 0usize;
+    for group in data.chunks(5) {
+        if group.len() < 5 || out.len() >= MAX_SEMANTIC_TOKENS {
+            break;
+        }
+        let number = |value: &Value| match value {
+            // Negative or fractional is malformed; 0 is the harmless
+            // reading, and a malformed stream is not worth abandoning
+            // the tokens around it over.
+            Value::Number(n) if *n >= 0.0 => *n as usize,
+            _ => 0,
+        };
+        let delta_line = number(&group[0]);
+        let delta_start = number(&group[1]);
+        line += delta_line;
+        start = if delta_line == 0 { start + delta_start } else { delta_start };
+        let length = number(&group[2]);
+        if length == 0 {
+            continue;
+        }
+        let kind = legend.types.get(number(&group[3])).cloned().unwrap_or_default();
+        if kind.is_empty() {
+            continue;
+        }
+        let bits = number(&group[4]);
+        let modifiers = legend
+            .modifiers
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i < usize::BITS as usize && bits & (1 << i) != 0)
+            .map(|(_, name)| name.clone())
+            .collect();
+        out.push(SemanticToken { line, start, length, kind, modifiers });
+    }
+    out
+}
+
+// ---------------------------------------------------------------------
 // Symbols
 // ---------------------------------------------------------------------
 
@@ -1432,6 +1544,81 @@ mod tests {
         let found = completions(&nameless);
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].label, "real");
+    }
+
+    fn legend() -> SemanticLegend {
+        SemanticLegend {
+            types: vec!["keyword".to_string(), "function".to_string(), "parameter".to_string()],
+            modifiers: vec!["declaration".to_string(), "readonly".to_string()],
+        }
+    }
+
+    // The encoding is the whole difficulty: every tuple is relative to
+    // the one before it, and `deltaStart` changes meaning depending on
+    // whether the line moved.
+    #[test]
+    fn semantic_tokens_are_decoded_from_their_deltas() {
+        let data = json::parse(
+            r#"{"data":[
+                 0,0,3,0,0,
+                 0,4,4,1,1,
+                 2,2,5,2,0]}"#,
+        )
+        .unwrap();
+        let found = semantic_tokens(&data, &legend());
+        assert_eq!(found.len(), 3);
+        // First: line 0, column 0.
+        assert_eq!((found[0].line, found[0].start, found[0].length), (0, 0, 3));
+        assert_eq!(found[0].kind, "keyword");
+        assert!(found[0].modifiers.is_empty());
+        // Second: same line, so its start is *relative* to the first.
+        assert_eq!((found[1].line, found[1].start, found[1].length), (0, 4, 4));
+        assert_eq!(found[1].kind, "function");
+        assert_eq!(found[1].modifiers, vec!["declaration".to_string()], "bit 0 of the modifier mask");
+        // Third: two lines down, so its start is absolute again.
+        assert_eq!((found[2].line, found[2].start, found[2].length), (2, 2, 5));
+        assert_eq!(found[2].kind, "parameter");
+    }
+
+    #[test]
+    fn a_token_bish_cannot_name_is_dropped_rather_than_shifting_the_rest() {
+        // Type 9 is outside this legend, and a zero-length token is
+        // nothing to paint -- but both still advance the running
+        // position, or every token after them would be misplaced.
+        let data = json::parse(r#"{"data":[0,0,3,9,0, 0,4,0,0,0, 0,2,2,0,0]}"#).unwrap();
+        let found = semantic_tokens(&data, &legend());
+        assert_eq!(found.len(), 1);
+        assert_eq!((found[0].line, found[0].start, found[0].length), (0, 6, 2));
+    }
+
+    #[test]
+    fn a_truncated_or_malformed_stream_keeps_what_it_can() {
+        // A trailing partial tuple: everything before it is still good.
+        let data = json::parse(r#"{"data":[0,0,3,0,0, 0,4,4]}"#).unwrap();
+        assert_eq!(semantic_tokens(&data, &legend()).len(), 1);
+        // Nothing at all, and the wrong shape entirely.
+        assert!(semantic_tokens(&json::parse(r#"{"data":[]}"#).unwrap(), &legend()).is_empty());
+        assert!(semantic_tokens(&json::parse(r#"{"resultId":"1"}"#).unwrap(), &legend()).is_empty());
+        // A legend with no types at all can name nothing.
+        assert!(semantic_tokens(&json::parse(r#"{"data":[0,0,3,0,0]}"#).unwrap(), &SemanticLegend::default()).is_empty());
+    }
+
+    // Read against the wrong legend, tokens are not wrong-looking --
+    // they are confidently the wrong colour everywhere. So it comes from
+    // the handshake, once, and is kept.
+    #[test]
+    fn the_legend_comes_out_of_the_servers_own_capabilities() {
+        let capabilities = json::parse(
+            r#"{"semanticTokensProvider":{"legend":{
+                 "tokenTypes":["namespace","type"],"tokenModifiers":["static"]},"full":true}}"#,
+        )
+        .unwrap();
+        let legend = SemanticLegend::parse(&capabilities);
+        assert_eq!(legend.types, vec!["namespace".to_string(), "type".to_string()]);
+        assert_eq!(legend.modifiers, vec!["static".to_string()]);
+        assert!(!legend.is_empty());
+        // A server that does no semantic tokens has none of this.
+        assert!(SemanticLegend::parse(&json::parse(r#"{"hoverProvider":true}"#).unwrap()).is_empty());
     }
 
     #[test]

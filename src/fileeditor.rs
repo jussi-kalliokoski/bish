@@ -2859,13 +2859,20 @@ fn buffer_spans(
         .iter()
         .filter_map(|s| Some(highlight::LinkSpan { start: s.start, end: s.end, url: absolute_link(buf, s.link.as_deref()?)? }))
         .collect();
-    let styled = spans
+    let mut styled: Vec<StyledSpan> = spans
         .into_iter()
         .map(|s| {
             let (fg, attrs) = highlight::resolve_style(s.kind, color_overrides);
             StyledSpan { start: s.start, end: s.end, fg, attrs }
         })
         .collect();
+    // Last, so it paints over the lexer's guesses: a language server
+    // knows which identifier is a parameter and which a constant, which
+    // is the whole reason to ask. Only the tokens that resolved to a
+    // colour are here at all (see repl::sync_semantic_tokens), so
+    // everything the server named and bish has no colour for keeps
+    // whatever the local highlighter made of it.
+    styled.extend(buf.semantic_spans.iter().cloned());
     (styled, links)
 }
 

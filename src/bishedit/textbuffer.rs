@@ -57,6 +57,22 @@ pub struct TextBuffer {
     // free. Written by fileeditor::run_insert_mode while a snippet is
     // live and cleared the moment it ends; empty every other time.
     pub snippet_holes: Vec<SnippetHole>,
+    // A language server's semantic tokens for this buffer, already
+    // resolved to colours and to this buffer's own char offsets (see
+    // repl::sync_semantic_tokens) -- painted as one more layer over
+    // whatever the local highlighter made of the same text.
+    //
+    // Resolved at arrival rather than at draw time because that is where
+    // the `Shell` is: a token type's colour comes from `::bish hl`,
+    // whose namespace is open, so it cannot be looked up through the
+    // closed `ColorOverrides` map the renderer is given.
+    //
+    // Deliberately *not* cleared by an edit, unlike `diagnostics` just
+    // below. A diagnostic in the wrong place is a claim about code that
+    // is not there; a colour in the wrong place for the 150ms until the
+    // next answer arrives is a colour in the wrong place, and clearing
+    // them on every keystroke would strobe the whole file instead.
+    pub semantic_spans: Vec<super::highlight::StyledSpan>,
     // `:diag`'s own last result (see fileeditor::diagnose_buffer) -- rides
     // along with the buffer exactly like `selections` does (survives a
     // Ctrl+Space detach/reattach, since both live on the one thing that
@@ -231,6 +247,7 @@ impl TextBuffer {
             eol: crate::editorconfig::Eol::Lf,
             vtop_sub: 0,
             snippet_holes: Vec::new(),
+            semantic_spans: Vec::new(),
             diagnostics: Vec::new(),
             blame: None,
             diff: None,
@@ -308,6 +325,7 @@ impl TextBuffer {
             trim_trailing_whitespace: false,
             vtop_sub: 0,
             snippet_holes: Vec::new(),
+            semantic_spans: Vec::new(),
             diagnostics: Vec::new(),
             blame: None,
             diff: None,
@@ -878,6 +896,7 @@ mod tests {
             eol: crate::editorconfig::Eol::Lf,
             vtop_sub: 0,
             snippet_holes: Vec::new(),
+            semantic_spans: Vec::new(),
             diagnostics: Vec::new(),
             blame: None,
             diff: None,

@@ -67,6 +67,20 @@ struct SessionState {
     /// better part of a second on a cold cache. Resolved once when a
     /// document is opened, and read back from here afterwards.
     lsp_roots: HashMap<PathBuf, PathBuf>,
+    /// Semantic-token requests already sent and not yet collected,
+    /// keyed by document uri: `(request id, the buffer version it was
+    /// asked about)`.
+    ///
+    /// Unlike every other language-server question, this one is asked
+    /// without waiting for the answer -- nobody is standing in front of
+    /// it, and a bounded wait on the idle path would be a stall on every
+    /// keystroke's worth of quiet. So the request goes out, the id is
+    /// parked here, and whichever later idle tick finds the reply
+    /// applies it.
+    lsp_semantic: HashMap<String, (i64, u64)>,
+    /// The buffer version whose tokens are currently painted, per uri --
+    /// what makes "nothing has changed, do not ask again" cheap.
+    lsp_semantic_applied: HashMap<String, u64>,
     buffer: String,
     // Whether `buffer` is off the record -- see leading_space_suppresses
     // _history. Decided on the first line of a fresh command and left
@@ -605,6 +619,8 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
             shell,
             lsp: root_lsp,
             lsp_roots: HashMap::new(),
+            lsp_semantic: HashMap::new(),
+            lsp_semantic_applied: HashMap::new(),
             buffer: String::new(),
             buffer_unrecorded: false,
             history: History::load(".bish_history"),
@@ -1911,6 +1927,8 @@ fn run_edit_impl(targets: &[fileeditor::EditTarget], attach_debug: bool) -> i32 
             shell,
             lsp: root_lsp,
             lsp_roots: HashMap::new(),
+            lsp_semantic: HashMap::new(),
+            lsp_semantic_applied: HashMap::new(),
             buffer: String::new(),
             buffer_unrecorded: false,
             history: History::load(".bish_history"),
@@ -3727,6 +3745,8 @@ fn apply_window_action(
                     shell: child_shell,
             lsp: child_lsp,
             lsp_roots: HashMap::new(),
+            lsp_semantic: HashMap::new(),
+            lsp_semantic_applied: HashMap::new(),
                     buffer: String::new(),
                     buffer_unrecorded: false,
                     // A fork of the parent's own History (see its doc
@@ -3882,6 +3902,8 @@ fn split_focused_pane(
             shell: child_shell,
             lsp: child_lsp,
             lsp_roots: HashMap::new(),
+            lsp_semantic: HashMap::new(),
+            lsp_semantic_applied: HashMap::new(),
             buffer: String::new(),
             buffer_unrecorded: false,
             // See WindowAction::New's own comment on forking the
@@ -3959,6 +3981,8 @@ fn split_diagnostics_pane(
             shell: child_shell,
             lsp: child_lsp,
             lsp_roots: HashMap::new(),
+            lsp_semantic: HashMap::new(),
+            lsp_semantic_applied: HashMap::new(),
             buffer: String::new(),
             buffer_unrecorded: false,
             history: child_history,
@@ -4012,6 +4036,8 @@ fn split_locations_pane(
             shell: child_shell,
             lsp: child_lsp,
             lsp_roots: HashMap::new(),
+            lsp_semantic: HashMap::new(),
+            lsp_semantic_applied: HashMap::new(),
             buffer: String::new(),
             buffer_unrecorded: false,
             history: child_history,
@@ -4125,6 +4151,8 @@ fn split_debug_run_pane(
             shell: child_shell,
             lsp: child_lsp,
             lsp_roots: HashMap::new(),
+            lsp_semantic: HashMap::new(),
+            lsp_semantic_applied: HashMap::new(),
             buffer: String::new(),
             buffer_unrecorded: false,
             history: child_history,
@@ -7313,7 +7341,8 @@ fn insert_idle(
     if diagnosed {
         refresh_diagnostics_title(sessions, windows, *current_window, &buf.diagnostics, *term_rows, *term_cols);
     }
-    (repaint || diagnosed).then(|| fileeditor::IdleRedraw {
+    let recoloured = sync_semantic_tokens(sessions, session_id, buf);
+    (repaint || diagnosed || recoloured).then(|| fileeditor::IdleRedraw {
         rect: pane_rect(&windows[*current_window], windows[*current_window].focused_pane, *term_rows, *term_cols),
         term_rows: *term_rows,
         term_cols: *term_cols,
@@ -7534,6 +7563,7 @@ fn run_normal_mode_navigation(
                 if diagnosed {
                     refresh_diagnostics_title(sessions, windows, *current_window, &tb.diagnostics, *term_rows, *term_cols);
                 }
+                diagnosed |= sync_semantic_tokens(sessions, session_id, tb);
             }
             // A job this pane stepped away from is still producing, and
             // the mode line's own "+N new lines below" has to keep up
@@ -9067,6 +9097,124 @@ fn sync_language_server_document(sessions: &mut HashMap<SessionId, SessionState>
         return;
     }
     server.change_document(&target.uri, buf.version(), &fileeditor::buffer_text(buf));
+}
+
+// One tick of semantic-token upkeep for the buffer being edited.
+//
+// Asked and collected without ever waiting: `ask_server`'s bounded wait
+// is right when the user pressed a key and is now looking at the screen,
+// and wrong here, where nothing is blocked on the answer and the wait
+// would be paid on every quiet moment. So this sends the request, parks
+// its id on the session, and lets a later tick pick the reply up.
+//
+// Returns true when the painted tokens changed, which is the caller's
+// cue to redraw.
+fn sync_semantic_tokens(sessions: &mut HashMap<SessionId, SessionState>, session_id: SessionId, buf: &mut TextBuffer) -> bool {
+    let Some(session) = sessions.get(&session_id) else { return false };
+    let Some(target) = server_target(session, buf) else { return false };
+    let lsp = Rc::clone(&session.lsp);
+    let version = buf.version();
+
+    // Collect first: an answer already sitting there is worth more than
+    // a fresher question.
+    if let Some(&(id, asked_at)) = session.lsp_semantic.get(&target.uri) {
+        let mut table = lsp.borrow_mut();
+        let Some(server) = table.running(&target.display, &target.root) else {
+            drop(table);
+            sessions.get_mut(&session_id).expect("checked").lsp_semantic.remove(&target.uri);
+            return false;
+        };
+        if let Some(result) = server.take_response(id) {
+            let legend = server.semantic_legend();
+            let encoding = server.encoding();
+            drop(table);
+            let session = sessions.get_mut(&session_id).expect("checked");
+            session.lsp_semantic.remove(&target.uri);
+            // Answered about a version that has since been typed over:
+            // every offset in it describes text that has moved. Dropped
+            // rather than applied, and the next pass asks again.
+            if asked_at != version {
+                return false;
+            }
+            let tokens = result.map(|result| crate::lsp::semantic_tokens(&result, &legend)).unwrap_or_default();
+            let spans = semantic_spans(&session.shell, buf, &tokens, encoding);
+            session.lsp_semantic_applied.insert(target.uri.clone(), version);
+            if spans == buf.semantic_spans {
+                return false;
+            }
+            buf.semantic_spans = spans;
+            return true;
+        }
+        // Still waiting. Not asking twice about the same document is
+        // what keeps a slow server from accumulating a request per idle
+        // tick.
+        return false;
+    }
+
+    if session.lsp_semantic_applied.get(&target.uri) == Some(&version) {
+        return false;
+    }
+    let mut table = lsp.borrow_mut();
+    let Some(server) = table.running(&target.display, &target.root) else { return false };
+    if !server.is_ready() || !server.provides("semanticTokensProvider") || server.semantic_legend().is_empty() {
+        return false;
+    }
+    // The server answers about the text it has been *told* about, so
+    // asking before `didChange` has caught up gets tokens whose offsets
+    // describe a different file. The debounced sync above this in the
+    // same tick is what eventually makes these equal.
+    if server.known_version(&target.uri) != Some(version) {
+        return false;
+    }
+    let params = crate::json::Value::Object(vec![(
+        "textDocument".to_string(),
+        crate::json::Value::Object(vec![("uri".to_string(), crate::json::Value::Str(target.uri.clone()))]),
+    )]);
+    let id = server.request("textDocument/semanticTokens/full", params);
+    drop(table);
+    sessions.get_mut(&session_id).expect("checked").lsp_semantic.insert(target.uri, (id, version));
+    false
+}
+
+// A server's tokens as drawable spans, in this buffer's own char
+// offsets, keeping only the ones that resolve to a colour.
+//
+// The colour comes from `::bish hl` by the server's own name for the
+// token type -- `::bish hl --set parameter '#d19a66'` -- which is what
+// that command's open namespace was for. Failing that, from the
+// `HighlightKind` the name means the same thing as, if there is one
+// (`highlight::kind_for_semantic_type`). A type with neither is dropped
+// here rather than drawn in some default colour: the local highlighter
+// already had an opinion about that text, and overwriting it with
+// "no opinion" would be a downgrade.
+fn semantic_spans(
+    shell: &exec::Shell,
+    buf: &TextBuffer,
+    tokens: &[crate::lsp::SemanticToken],
+    encoding: crate::lsp::PositionEncoding,
+) -> Vec<highlight::StyledSpan> {
+    let starts = fileeditor::line_starts_of(buf);
+    let mut out = Vec::with_capacity(tokens.len());
+    // One lookup per distinct type name, not per token: a large file is
+    // tens of thousands of tokens over a couple of dozen names, and
+    // every miss walks the theme table.
+    let mut resolved: HashMap<&str, Option<(vt100::Color, vt100::CellAttrs)>> = HashMap::new();
+    for token in tokens {
+        let style = *resolved.entry(token.kind.as_str()).or_insert_with(|| {
+            let fallback = highlight::kind_for_semantic_type(&token.kind).map(highlight::default_style);
+            match shell.hl_color(&token.kind) {
+                Some(fg) => Some((fg, fallback.map(|(_, attrs)| attrs).unwrap_or_default())),
+                None => fallback,
+            }
+        });
+        let Some((fg, attrs)) = style else { continue };
+        let start = fileeditor::diagnostic_offset(buf, &starts, token.line, token.start, encoding);
+        let end = fileeditor::diagnostic_offset(buf, &starts, token.line, token.start + token.length, encoding);
+        if end > start {
+            out.push(highlight::StyledSpan { start, end, fg, attrs });
+        }
+    }
+    out
 }
 
 // Insert mode's own view of everything repl.rs owns -- see
@@ -13429,6 +13577,8 @@ mod compositor_frame_output_tests {
         let mut session = SessionState {
             lsp: Rc::new(RefCell::new(lspclient::Table::default())),
             lsp_roots: HashMap::new(),
+            lsp_semantic: HashMap::new(),
+            lsp_semantic_applied: HashMap::new(),
             shell: exec::Shell::new(),
             buffer: String::new(),
             buffer_unrecorded: false,
