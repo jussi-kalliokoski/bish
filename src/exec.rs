@@ -1331,6 +1331,13 @@ pub struct Shell {
     // inside a converted foreground subshell/command-substitution, which
     // is otherwise a genuinely separate Shell.
     debug_hook: Option<Rc<RefCell<dyn DebugHook>>>,
+    // The source line of the statement currently running -- `$LINENO`.
+    //
+    // Recorded in `run_program`, which already had it: the debugger has
+    // been handed `item.line` on every statement since line tracking
+    // landed on the executable AST, and nothing else needed it. Which is
+    // why `LINENO` was not possible before and is nearly free now.
+    current_line: usize,
     // How many nested foreground subshells/command-substitutions/proc-
     // subs (run_in_child_shell) deep this Shell is, relative to the real
     // top-level one -- incremented (never shared) by new_virtual_child.
@@ -1450,6 +1457,7 @@ impl Shell {
             pending_exit: None,
             stdio_override: None,
             debug_hook: None,
+            current_line: 0,
             subshell_depth: 0,
             env_snapshot: std::env::vars().collect(),
             umask_snapshot: current_umask(),
@@ -1731,6 +1739,7 @@ impl Shell {
             pending_exit: None,
             stdio_override: None,
             debug_hook: self.debug_hook.clone(),
+            current_line: self.current_line,
             subshell_depth: self.subshell_depth + 1,
             // Captured fresh from the real process rather than cloning
             // self.env_snapshot/umask_snapshot directly -- equal to it at
@@ -5461,6 +5470,7 @@ impl Shell {
     pub fn run_program(&mut self, prog: &Program) -> ExecResult {
         let mut result = ExecResult::Status(self.last_status);
         for item in prog {
+            self.current_line = item.line;
             self.check_pending_signals();
             // Clone the Rc (not borrow self.debug_hook directly) before
             // calling into it: on_statement takes `&Shell`, and the hook
@@ -9092,6 +9102,15 @@ impl Shell {
             "$" => std::process::id().to_string(),
             "!" => self.jobs.borrow().last_bg_pid.map(|p| p.to_string()).unwrap_or_default(),
             "RANDOM" => self.next_random().to_string(),
+            "LINENO" => self.current_line.to_string(),
+            // Seconds since the epoch, and the same with microseconds.
+            // bash 5's own two spellings; a script that wants a
+            // timestamp should not have to spawn `date` for it.
+            "EPOCHSECONDS" => unix_now().as_secs().to_string(),
+            "EPOCHREALTIME" => {
+                let now = unix_now();
+                format!("{}.{:06}", now.as_secs(), now.subsec_micros())
+            }
             "SECONDS" => (self.shell_start.elapsed().as_secs() as i64 + self.seconds_offset).to_string(),
             "-" => {
                 let mut s = String::new();
@@ -9363,6 +9382,9 @@ impl Shell {
                 | "!"
                 | "-"
                 | "RANDOM"
+                | "LINENO"
+                | "EPOCHSECONDS"
+                | "EPOCHREALTIME"
                 | "SECONDS"
                 | "BASH_VERSION"
                 | "PPID"
@@ -10619,6 +10641,15 @@ fn read_line_or_chars(reader: &mut dyn std::io::BufRead, nchars: Option<usize>, 
 /// bash's own name for it, spelled exactly as bash spells it -- a
 /// distribution's integration script defines this name and no other.
 const COMMAND_NOT_FOUND_HANDLER: &str = "command_not_found_handle";
+
+/// The three `trap` targets that are not signals -- the interpreter
+/// fires each itself, at a point it already passes through.
+// Wall-clock time since the epoch. `SystemTime` can technically be
+// before it if the clock is badly wrong; that reads as 0 rather than
+// panicking, since a shell variable is not the place to raise it.
+fn unix_now() -> std::time::Duration {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default()
+}
 
 /// The three `trap` targets that are not signals -- the interpreter
 /// fires each itself, at a point it already passes through.
@@ -14518,6 +14549,34 @@ mod tests {
         assert_eq!(shell.run_lsp(&strs(&["add", "--root-cmd"])), 2);
         assert_eq!(shell.run_lsp(&strs(&["add", "--root-cmd", "   ", "x"])), 2);
         assert_eq!(shell.lsp_servers.len(), 2);
+    }
+
+    #[test]
+    fn lineno_is_the_line_of_the_statement_running() {
+        let mut shell = Shell::new();
+        let out = capture_output(&mut shell);
+        shell.run_source_here("echo \"line $LINENO\"\necho \"line $LINENO\"\n\nf(){ echo \"in f: $LINENO\"; }\nf\n", "<test>");
+        // Checked against real bash, which gives exactly these three.
+        assert_eq!(out.borrow().as_str(), "line 1\nline 2\nin f: 4\n");
+    }
+
+    #[test]
+    fn the_epoch_variables_are_a_real_clock() {
+        let mut shell = Shell::new();
+        let out = capture_output(&mut shell);
+        shell.run_source_here("echo $EPOCHSECONDS\necho $EPOCHREALTIME", "<test>");
+        let seen = out.borrow().clone();
+        let mut lines = seen.lines();
+        let secs: u64 = lines.next().unwrap().parse().expect("a whole number of seconds");
+        // Somewhere after this was written and before the far future --
+        // enough to catch a zero or a garbled value without pinning a
+        // date.
+        assert!(secs > 1_700_000_000, "{secs}");
+
+        let real = lines.next().unwrap();
+        let (whole, frac) = real.split_once('.').expect("a decimal point, not a locale separator");
+        assert!(whole.parse::<u64>().unwrap().abs_diff(secs) <= 1);
+        assert_eq!(frac.len(), 6, "microseconds, zero-padded: {real}");
     }
 
     // Every expectation was run against real bash first -- the
