@@ -1429,6 +1429,25 @@ pub(crate) fn run_insert_mode(
             completing = None;
         }
 
+        // Typing with a selection standing replaces it -- select-and-type,
+        // the other half of the Backspace/Delete arms below and what a
+        // selection means everywhere one can exist. Done here rather than
+        // as another guarded arm because the arms that insert differ only
+        // in *what* they insert, and every one of them would need the
+        // same four lines.
+        //
+        // Only a plain character, and only with no popup or snippet live:
+        // those two own `Char` while they are up (it narrows a completion
+        // and fills a tabstop), and Replace mode's whole contract is that
+        // the line's length does not change.
+        if !buf.selections.is_empty() && !replace && live.is_none() && completing.is_none() && matches!(key, Key::Char(_)) {
+            let range = buf.selections[0];
+            buf.selections.clear();
+            buf.delete_range(&range);
+            buf.set_cursor(range.from.0, range.from.1);
+            cursors = vec![buf.cursor()];
+        }
+
         match key {
             // --- the completion popup owns these while it is open ----
             Key::CtrlN if completing.is_some() && live.is_none() => {
@@ -1650,6 +1669,28 @@ pub(crate) fn run_insert_mode(
                 buf.set_cursor(cursors[0].0, cursors[0].1);
                 inserted.pop();
             }
+            // Delete: Backspace's forward twin, and absent for the same
+            // reason Home/End were -- the shell prompt has had it
+            // (editor.rs's own `Key::Delete` arm) and this loop simply
+            // had no arm, so the key did nothing at all. Selection first,
+            // exactly as Backspace does, because a standing selection is
+            // what either key means when there is one.
+            //
+            // `inserted` (the `.`-repeat accumulator) is deliberately
+            // left alone: what Delete removes is *ahead* of the cursor
+            // and so was never part of what this session typed. Same
+            // best-effort acknowledgement `Key::CtrlW` already makes.
+            Key::Delete if !buf.selections.is_empty() => {
+                let range = buf.selections[0];
+                buf.selections.clear();
+                buf.delete_range(&range);
+                buf.set_cursor(range.from.0, range.from.1);
+                cursors = vec![buf.cursor()];
+            }
+            Key::Delete => {
+                apply_delete_to_all(buf, &mut cursors);
+                buf.set_cursor(cursors[0].0, cursors[0].1);
+            }
             // Ctrl-W: delete the word before the cursor -- real vim's own
             // Insert-mode convention (`:help i_CTRL-W`), same idea
             // editor::LineEditor::kill_word_backward already gives the
@@ -1686,6 +1727,30 @@ pub(crate) fn run_insert_mode(
                 // than going through the clamped motion.
                 let (row, col) = buf.cursor();
                 buf.set_cursor(row, (col + 1).min(buf.line_len(row)));
+                cursors[0] = buf.cursor();
+            }
+            // Home/End/Delete: keys the terminal sends that Insert mode
+            // simply had no arm for, so they did nothing at all -- while
+            // Normal mode has had all three (vimkeys.rs binds Home/End to
+            // LineStart/LineEnd) and so has the shell prompt
+            // (editor.rs's own Home/End/Delete arms). The asymmetry was
+            // the bug: the one mode where a person reaches for Home is
+            // the one that ignored it.
+            //
+            // `Home` is column 0, not first-non-blank -- vim's own
+            // `<Home>`, with `^` still the other thing.
+            Key::Home => {
+                motion::apply_motion(buf, motion::Motion::LineStart, None);
+                cursors[0] = buf.cursor();
+            }
+            // `Motion::LineEnd` clamps to the last real character, which
+            // is Normal mode's meaning; Insert mode's cursor is allowed
+            // one column past it (where the next typed char lands), so
+            // this goes there directly -- the same reasoning `Key::Right`
+            // just above already makes.
+            Key::End => {
+                let (row, _) = buf.cursor();
+                buf.set_cursor(row, buf.line_len(row));
                 cursors[0] = buf.cursor();
             }
             // Alt-Left/Alt-Right: real vim's own `b`/`w` word motions,
@@ -1947,6 +2012,43 @@ fn apply_insert_to_all(buf: &mut TextBuffer, cursors: &mut [(usize, usize)], tex
                 }
             } else if r == row && c >= col {
                 cursors[j] = (r, c + width);
+            }
+        }
+    }
+}
+
+// Delete, replicated across every tracked cursor -- apply_backspace_to_
+// all's forward twin, and processed furthest-first for the same reason.
+//
+// The cursor does not move: what goes is the character *after* it, and
+// at the end of a line that character is the newline, so the next line
+// joins onto this one. A cursor at the very end of the buffer is left
+// alone, matching the prompt's own `delete_forward` doing nothing there.
+fn apply_delete_to_all(buf: &mut TextBuffer, cursors: &mut [(usize, usize)]) {
+    let mut order: Vec<usize> = (0..cursors.len()).collect();
+    order.sort_by_key(|&i| std::cmp::Reverse(cursors[i]));
+    for step in 0..order.len() {
+        let i = order[step];
+        let (row, col) = cursors[i];
+        if col < buf.line_len(row) {
+            let range = motion::MotionRange { shape: motion::MotionShape::Exclusive, from: (row, col), to: (row, col + 1) };
+            buf.delete_range(&range);
+            for &j in &order[step + 1..] {
+                let (r, c) = cursors[j];
+                if r == row && c > col {
+                    cursors[j] = (r, c - 1);
+                }
+            }
+        } else if row + 1 < buf.line_count() {
+            let range = motion::MotionRange { shape: motion::MotionShape::Exclusive, from: (row, col), to: (row + 1, 0) };
+            buf.delete_range(&range);
+            for &j in &order[step + 1..] {
+                let (r, c) = cursors[j];
+                if r > row + 1 {
+                    cursors[j] = (r - 1, c);
+                } else if r == row + 1 {
+                    cursors[j] = (row, col + c);
+                }
             }
         }
     }
@@ -4181,6 +4283,93 @@ mod macro_tests {
     // through the same macro-replay queue the test just below uses --
     // there's no real terminal here to type at, and `run_insert_mode`
     // reads through `vk.next_key`, which serves a queued replay first.
+    // `insert_with`, but driving a buffer the caller prepared -- a
+    // selection standing, a cursor somewhere particular.
+    fn insert_into(buf: &mut TextBuffer, keys: &[Key]) {
+        let mut vk = VimKeys::new();
+        let mut registers = Registers::new_for_test();
+        vk.start_recording('a');
+        for key in keys {
+            vk.record_key(*key);
+        }
+        vk.stop_recording();
+        assert!(vk.queue_macro_replay('a', 1));
+        run_insert_mode(buf, &mut vk, rect(), &mut registers, &mut NoInsertServices, false, 24, 80, None, &[], &[]).unwrap();
+    }
+
+    // Home, End and Delete did nothing at all in Insert mode: Normal mode
+    // binds all three (vimkeys.rs) and so does the shell prompt
+    // (editor.rs), and this one loop had no arm for any of them.
+    #[test]
+    fn insert_mode_honours_home_and_end() {
+        let mut buf = TextBuffer::new_unnamed(10);
+        buf.insert_text((0, 0), "alpha beta");
+        buf.set_cursor(0, 4);
+        insert_into(&mut buf, &[Key::End, Key::Char('!'), Key::Home, Key::Char('>')]);
+        assert_eq!(text_of(&buf), ">alpha beta!", "End went one past the last char, Home to column zero");
+    }
+
+    #[test]
+    fn insert_mode_delete_removes_forward_and_joins_lines() {
+        let mut buf = TextBuffer::new_unnamed(10);
+        buf.insert_text((0, 0), "abc
+def");
+        buf.set_cursor(0, 1);
+        insert_into(&mut buf, &[Key::Delete]);
+        assert_eq!(text_of(&buf), "ac
+def", "the character *after* the cursor goes");
+
+        let mut buf = TextBuffer::new_unnamed(10);
+        buf.insert_text((0, 0), "abc
+def");
+        buf.set_cursor(0, 3);
+        insert_into(&mut buf, &[Key::Delete]);
+        assert_eq!(text_of(&buf), "abcdef", "at end of line the newline goes, joining the next");
+        assert_eq!(buf.cursor(), (0, 3), "and the cursor does not move");
+
+        // The very end of the buffer has nothing after it.
+        let mut buf = TextBuffer::new_unnamed(10);
+        buf.insert_text((0, 0), "abc");
+        buf.set_cursor(0, 3);
+        insert_into(&mut buf, &[Key::Delete]);
+        assert_eq!(text_of(&buf), "abc");
+    }
+
+    // Backspace and Delete already replaced a standing selection; typing
+    // did not, which is the half that makes a mouse selection worth
+    // making.
+    #[test]
+    fn insert_mode_typing_replaces_a_standing_selection() {
+        let select = |buf: &mut TextBuffer| {
+            buf.selections = vec![crate::bishedit::motion::MotionRange {
+                shape: crate::bishedit::motion::MotionShape::Exclusive,
+                from: (0, 6),
+                to: (0, 10),
+            }];
+            buf.set_cursor(0, 10);
+        };
+
+        let mut buf = TextBuffer::new_unnamed(10);
+        buf.insert_text((0, 0), "alpha beta gamma");
+        select(&mut buf);
+        insert_into(&mut buf, &[Key::Char('X')]);
+        assert_eq!(text_of(&buf), "alpha X gamma");
+        assert!(buf.selections.is_empty(), "and the selection is gone, not left standing over new text");
+
+        // The two that already worked, pinned so they stay working.
+        let mut buf = TextBuffer::new_unnamed(10);
+        buf.insert_text((0, 0), "alpha beta gamma");
+        select(&mut buf);
+        insert_into(&mut buf, &[Key::Backspace]);
+        assert_eq!(text_of(&buf), "alpha  gamma");
+
+        let mut buf = TextBuffer::new_unnamed(10);
+        buf.insert_text((0, 0), "alpha beta gamma");
+        select(&mut buf);
+        insert_into(&mut buf, &[Key::Delete]);
+        assert_eq!(text_of(&buf), "alpha  gamma");
+    }
+
     // An `InsertServices` that offers exactly what it was handed --
     // enough to drive Ctrl-N and the accept that follows without a
     // language server anywhere in sight.
