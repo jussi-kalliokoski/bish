@@ -335,6 +335,34 @@ impl Server {
                             ]),
                         ),
                         (
+                            "codeAction".to_string(),
+                            Value::Object(vec![
+                                ("dynamicRegistration".to_string(), Value::Bool(false)),
+                                // The literal form, meaning a server may
+                                // answer with `CodeAction` objects
+                                // rather than only the older bare
+                                // `Command`s -- which is what carries an
+                                // edit at all.
+                                (
+                                    "codeActionLiteralSupport".to_string(),
+                                    Value::Object(vec![(
+                                        "codeActionKind".to_string(),
+                                        Value::Object(vec![("valueSet".to_string(), Value::Array(Vec::new()))]),
+                                    )]),
+                                ),
+                                // Yes to being sent actions without
+                                // their edits: `codeAction/resolve`
+                                // fetches the one actually chosen, which
+                                // is how rust-analyzer avoids computing
+                                // every refactor nobody picked.
+                                (
+                                    "resolveSupport".to_string(),
+                                    Value::Object(vec![("properties".to_string(), Value::Array(vec![Value::Str("edit".to_string())]))]),
+                                ),
+                                ("disabledSupport".to_string(), Value::Bool(true)),
+                            ]),
+                        ),
+                        (
                             "rename".to_string(),
                             Value::Object(vec![
                                 ("dynamicRegistration".to_string(), Value::Bool(false)),

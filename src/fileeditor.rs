@@ -493,6 +493,13 @@ pub(crate) fn render_hover_popup(lines: &[String], cursor_row: usize, cursor_col
 // The selection is marked with `>` *and* bold rather than by colour
 // alone, so it is unambiguous on a terminal that has none.
 pub(crate) fn render_completion_popup(items: &[crate::bishedit::completion::EditorCompletion], selected: usize, cursor_row: usize, cursor_col: usize, rect: Rect) -> String {
+    let rows: Vec<(String, String)> = items.iter().map(|i| (i.label.clone(), i.detail.clone())).collect();
+    render_popup_list(&rows, selected, cursor_row, cursor_col, rect)
+}
+
+/// The same widget over plain `(label, detail)` rows -- what a code
+/// action picker needs, and what completion is underneath.
+pub(crate) fn render_popup_list(items: &[(String, String)], selected: usize, cursor_row: usize, cursor_col: usize, rect: Rect) -> String {
     const MAX_ROWS: usize = 10;
     if items.is_empty() {
         return String::new();
@@ -500,10 +507,10 @@ pub(crate) fn render_completion_popup(items: &[crate::bishedit::completion::Edit
     // Scrolled so the selection is always on screen: a server can
     // answer with hundreds.
     let first = selected.saturating_sub(MAX_ROWS - 1);
-    let shown: Vec<&crate::bishedit::completion::EditorCompletion> = items.iter().skip(first).take(MAX_ROWS).collect();
+    let shown: Vec<&(String, String)> = items.iter().skip(first).take(MAX_ROWS).collect();
     let max_width = rect.cols.saturating_sub(4).clamp(10, 60);
-    let label_width = shown.iter().map(|i| i.label.chars().count()).max().unwrap_or(1);
-    let detail_width = shown.iter().map(|i| i.detail.chars().count()).max().unwrap_or(0);
+    let label_width = shown.iter().map(|i| i.0.chars().count()).max().unwrap_or(1);
+    let detail_width = shown.iter().map(|i| i.1.chars().count()).max().unwrap_or(0);
     // `> ` marker, the label, and the detail with a gap before it.
     let inner_width = (2 + label_width + if detail_width > 0 { detail_width + 2 } else { 0 }).min(max_width).max(1);
     let box_width = (inner_width + 2).min(rect.cols.max(3));
@@ -518,12 +525,12 @@ pub(crate) fn render_completion_popup(items: &[crate::bishedit::completion::Edit
     for (i, item) in shown.iter().enumerate() {
         let is_selected = first + i == selected;
         let marker = if is_selected { "> " } else { "  " };
-        let mut text = format!("{marker}{}", item.label);
-        if !item.detail.is_empty() {
+        let mut text = format!("{marker}{}", item.0);
+        if !item.1.is_empty() {
             let used = text.chars().count();
             if inner_width > used + 2 {
-                text.push_str(&" ".repeat(inner_width - used - item.detail.chars().count().min(inner_width - used)));
-                text.push_str(&item.detail);
+                text.push_str(&" ".repeat(inner_width - used - item.1.chars().count().min(inner_width - used)));
+                text.push_str(&item.1);
             }
         }
         let padded: String = format!("{text:<inner_width$}").chars().take(inner_width).collect();

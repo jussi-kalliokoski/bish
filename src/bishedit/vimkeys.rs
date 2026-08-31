@@ -120,6 +120,15 @@ pub enum KeyOutcome {
     /// help and man pages, so the key is not being repurposed so much
     /// as extended to code.
     DocumentSymbols,
+    /// `ga`: what the language server offers to do to the code here --
+    /// a quick fix for a diagnostic, a refactor, an import to add.
+    ///
+    /// Real vim's `ga` prints the character under the cursor's numeric
+    /// value, which this codebase has never implemented, so nothing is
+    /// being taken away. Neovim's own default for this is `gra`, which
+    /// bish cannot use: `gr` already emits references and never waits
+    /// for a third key.
+    CodeActions,
     /// `Ctrl-O`/`Ctrl-I` -- step backward/forward through the jump list.
     /// The caller must call `vk.jump_back(buf.cursor())`/`vk.jump_forward
     /// (buf.cursor())` (this crate owns the jump-list state -- see
@@ -1136,6 +1145,13 @@ impl VimKeys {
         KeyOutcome::DocumentSymbols
     }
 
+    fn emit_code_actions(&mut self) -> KeyOutcome {
+        self.count = None;
+        self.pending = Pending::None;
+        self.last_completed = std::mem::take(&mut self.current_input);
+        KeyOutcome::CodeActions
+    }
+
     fn emit_jump(&mut self, forward: bool) -> KeyOutcome {
         self.count = None;
         self.pending = Pending::None;
@@ -1500,6 +1516,7 @@ impl VimKeys {
             Key::Char('d') => self.emit_goto_definition(),
             Key::Char('r') => self.emit_goto_references(),
             Key::Char('O') => self.emit_document_symbols(),
+            Key::Char('a') => self.emit_code_actions(),
             Key::Char('J') => self.emit_join(false),
             Key::Char('v') => self.emit_reselect_visual(),
             Key::Char('i') => self.emit_insert(InsertCmd::LastInsertPos),
@@ -2050,6 +2067,10 @@ mod tests {
         assert_eq!(vk.feed(Key::Char('r')), KeyOutcome::GotoReferences);
         assert_eq!(vk.feed(Key::Char('g')), KeyOutcome::Pending);
         assert_eq!(vk.feed(Key::Char('O')), KeyOutcome::DocumentSymbols);
+        assert_eq!(vk.feed(Key::Char('g')), KeyOutcome::Pending);
+        assert_eq!(vk.feed(Key::Char('a')), KeyOutcome::CodeActions);
+        // `a` alone is still append, not this.
+        assert_eq!(vk.feed(Key::Char('a')), KeyOutcome::EnterInsert(InsertCmd::After));
         // `r` on its own is still replace-a-character, not this.
         assert_eq!(vk.feed(Key::Char('r')), KeyOutcome::Pending);
         vk.feed(Key::Escape);

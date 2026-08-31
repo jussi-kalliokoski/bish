@@ -2369,7 +2369,7 @@ fn run_line_normal_mode(
                     }
                     // See the note on the other arm in this file:
                     // nothing to ask, and nowhere to go.
-                    KeyOutcome::GotoDefinition | KeyOutcome::GotoReferences | KeyOutcome::DocumentSymbols => {}
+                    KeyOutcome::GotoDefinition | KeyOutcome::GotoReferences | KeyOutcome::DocumentSymbols | KeyOutcome::CodeActions => {}
                     KeyOutcome::Jump { forward } => {
                         let current = lb.cursor();
                         let target = if forward { vk.jump_forward(current) } else { vk.jump_back(current) };
@@ -3140,6 +3140,7 @@ fn run_one_shot_normal_command(ed: &mut LineEditor, registers: &mut Registers, u
                     | KeyOutcome::GotoDefinition
                     | KeyOutcome::GotoReferences
                     | KeyOutcome::DocumentSymbols
+                    | KeyOutcome::CodeActions
                     | KeyOutcome::None => break None,
                     // `<C-o>u`/`<C-o>Ctrl-R`/`<C-o>g-`/`<C-o>g+`: real vim
                     // treats these as ordinary one-shot Normal commands

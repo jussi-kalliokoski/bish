@@ -8314,6 +8314,33 @@ fn run_normal_mode_navigation(
                     }
                 }
             }
+            // `ga`: pick something for the server to do here. The
+            // buffer is handed in mutably because applying an action is
+            // an edit to it, and to any other file the change reaches.
+            KeyOutcome::CodeActions => {
+                let message = match buf.as_editable_mut() {
+                    Some(tb) => code_actions_at_cursor(
+                        sessions,
+                        windows,
+                        job_frames,
+                        edit_frames,
+                        session_id,
+                        *current_window,
+                        term_rows,
+                        term_cols,
+                        *sinks_are_grid,
+                        tb,
+                        rect,
+                    ),
+                    None => None,
+                };
+                let content_cols = nav_content_cols(&buf, rect);
+                nav_scroll_to_show_cursor(&mut buf, content_cols);
+                render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides.as_ref());
+                if let Some(message) = message {
+                    show_command_mode_error(&message, *term_rows, *term_cols);
+                }
+            }
             KeyOutcome::Motion(m, count) => {
                 // `apply_motion_or_reselect` records this into `vk`'s
                 // own list too, which the editor no longer reads -- see
@@ -8872,19 +8899,203 @@ impl fileeditor::InsertServices for EditorServices<'_> {
     }
 }
 
+// `ga`: what the server offers to do here, picked from a popup and
+// applied.
+//
+// The popup is the completion widget over plain rows -- a labelled list
+// anchored at the cursor is the same thing whether the labels are
+// identifiers or refactors, and building a second one would have been
+// building the same thing twice.
+//
+// Returns a message to show, or `None` when the picker was cancelled
+// and there is nothing to say.
+#[allow(clippy::too_many_arguments)]
+fn code_actions_at_cursor(
+    sessions: &mut HashMap<SessionId, SessionState>,
+    windows: &mut [WindowEntry],
+    job_frames: &mut HashMap<JobFrameId, exec::FgJob>,
+    edit_frames: &mut HashMap<EditFrameId, fileeditor::EditSession>,
+    session_id: SessionId,
+    current_window: usize,
+    term_rows: &mut usize,
+    term_cols: &mut usize,
+    sinks_are_grid: bool,
+    buf: &mut TextBuffer,
+    rect: Rect,
+) -> Option<String> {
+    let encoding = server_encoding_for(sessions, session_id, buf)?;
+    let (row, col) = buf.cursor();
+    // The diagnostics on this line are the `context` that makes a
+    // server offer quick *fixes* rather than only refactors -- without
+    // them rust-analyzer has nothing to fix, since it is being asked
+    // "what can you do here" with no mention of what is wrong.
+    let starts = fileeditor::line_starts_of(buf);
+    let line_start = starts[row.min(starts.len().saturating_sub(1))];
+    let line_end = line_start + buf.line_len(row);
+    let here: Vec<crate::json::Value> = buf
+        .diagnostics
+        .iter()
+        .filter(|d| d.start < line_end && d.end > line_start && d.source.is_some())
+        .map(|d| {
+            let to_position = |offset: usize| {
+                let (line, column) = fileeditor::diagnostic_position(buf, offset);
+                let chars = buf.line_chars(line);
+                crate::json::Value::Object(vec![
+                    ("line".to_string(), crate::json::Value::Number(line as f64)),
+                    ("character".to_string(), crate::json::Value::Number(crate::lsp::to_server_column(&chars, column, encoding) as f64)),
+                ])
+            };
+            crate::json::Value::Object(vec![
+                (
+                    "range".to_string(),
+                    crate::json::Value::Object(vec![("start".to_string(), to_position(d.start)), ("end".to_string(), to_position(d.end))]),
+                ),
+                ("message".to_string(), crate::json::Value::Str(d.message.clone())),
+            ])
+        })
+        .collect();
+    let chars = buf.line_chars(row);
+    let character = crate::lsp::to_server_column(&chars, col, encoding);
+    let position = crate::json::Value::Object(vec![
+        ("line".to_string(), crate::json::Value::Number(row as f64)),
+        ("character".to_string(), crate::json::Value::Number(character as f64)),
+    ]);
+    let result = ask_server(
+        sessions,
+        windows,
+        job_frames,
+        session_id,
+        current_window,
+        term_rows,
+        term_cols,
+        sinks_are_grid,
+        buf,
+        "textDocument/codeAction",
+        "codeActionProvider",
+        vec![
+            // An empty range at the cursor: "what applies here".
+            (
+                "range".to_string(),
+                crate::json::Value::Object(vec![("start".to_string(), position.clone()), ("end".to_string(), position)]),
+            ),
+            ("context".to_string(), crate::json::Value::Object(vec![("diagnostics".to_string(), crate::json::Value::Array(here))])),
+        ],
+    )?;
+    let actions = crate::lsp::code_actions(&result);
+    if actions.is_empty() {
+        return Some("no code actions here".to_string());
+    }
+
+    let rows: Vec<(String, String)> = actions
+        .iter()
+        .map(|a| {
+            let detail = match (&a.disabled, &a.command) {
+                (Some(why), _) => format!("({why})"),
+                (None, Some(_)) if a.edit.is_none() => "(command)".to_string(),
+                _ => a.kind.clone(),
+            };
+            (a.title.clone(), detail)
+        })
+        .collect();
+    let chosen = pick_from_popup(&rows, buf, rect, *term_rows, *term_cols)?;
+    let action = &actions[chosen];
+    if let Some(why) = &action.disabled {
+        return Some(format!("that action does not apply here: {why}"));
+    }
+
+    // A server may send an action without its edit and compute one only
+    // for the action actually chosen. rust-analyzer does exactly this,
+    // so an action with no edit is not an action with nothing to do.
+    let edit = match &action.edit {
+        Some(edit) => edit.clone(),
+        None => {
+            let resolved = ask_server(
+                sessions,
+                windows,
+                job_frames,
+                session_id,
+                current_window,
+                term_rows,
+                term_cols,
+                sinks_are_grid,
+                buf,
+                "codeAction/resolve",
+                "codeActionProvider",
+                match &action.unresolved {
+                    crate::json::Value::Object(fields) => fields.clone(),
+                    _ => Vec::new(),
+                },
+            );
+            match resolved.map(|r| crate::lsp::code_actions(&crate::json::Value::Array(vec![r]))) {
+                Some(mut one) if !one.is_empty() && one[0].edit.is_some() => one.remove(0).edit.unwrap(),
+                // Nothing to apply, and the honest reason: an action
+                // that only runs a server-side command needs
+                // `workspace/executeCommand` and the `applyEdit` round
+                // trip it implies, neither of which bish does.
+                _ => {
+                    return Some(match &action.command {
+                        Some(name) => format!("\"{}\" runs the server command {name}, which bish cannot do yet", action.title),
+                        None => format!("\"{}\" produced no edit", action.title),
+                    });
+                }
+            }
+        }
+    };
+    if !edit.unsupported.is_empty() {
+        return Some(format!("that action also needs to {} files, which bish cannot do yet -- nothing changed", edit.unsupported.join("/")));
+    }
+    if edit.changes.is_empty() {
+        return Some(format!("\"{}\" changed nothing", action.title));
+    }
+    match apply_workspace_edit(edit_frames, buf, &edit, encoding) {
+        Ok((written, unsaved)) => {
+            let total = written + unsaved;
+            let mut message = format!("{} -- {total} file{}", action.title, if total == 1 { "" } else { "s" });
+            if unsaved > 0 {
+                message.push_str(&format!(" ({unsaved} open, unsaved -- :w to keep)"));
+            }
+            Some(message)
+        }
+        Err(e) => Some(e),
+    }
+}
+
+// Draws a labelled list at the cursor and lets one be chosen. `None` if
+// cancelled.
+//
+// Its own small key loop rather than a pane: this is a menu that
+// answers a question and goes away, not a view to navigate between --
+// which is exactly the distinction between this and the location list.
+fn pick_from_popup(rows: &[(String, String)], buf: &TextBuffer, rect: Rect, term_rows: usize, term_cols: usize) -> Option<usize> {
+    let (row, col) = buf.cursor();
+    let chars = buf.line_chars(row);
+    let gutter = rect.cols.saturating_sub(fileeditor::editor_content_cols(buf, rect));
+    let screen_row = rect.row + row.saturating_sub(buf.viewport_top());
+    let screen_col = rect.col + gutter + crate::bishedit::unicode_width::col_of(&chars, col).saturating_sub(buf.viewport_left());
+    let mut selected = 0usize;
+    loop {
+        print!("{}", fileeditor::render_popup_list(rows, selected, screen_row, screen_col, rect));
+        let _ = io::stdout().flush();
+        let key = match editor::read_key_idle(&mut || {}) {
+            Ok(Some(k)) => k,
+            _ => return None,
+        };
+        match key {
+            editor::Key::Char('j') | editor::Key::CtrlN | editor::Key::Down => selected = (selected + 1) % rows.len(),
+            editor::Key::Char('k') | editor::Key::CtrlP | editor::Key::Up => selected = (selected + rows.len() - 1) % rows.len(),
+            editor::Key::Enter => return Some(selected),
+            editor::Key::Escape | editor::Key::Char('q') => return None,
+            _ => {}
+        }
+        let _ = (term_rows, term_cols);
+    }
+}
+
 // `:rename NEW` through the language server.
 //
-// **All or nothing.** A rename that lands in some files and not others
-// leaves the project broken, which is worse than not renaming at all --
-// so every refusal below happens before anything is written, and the
-// files that are not open are read and edited in memory first, then
-// written only once every one of them succeeded.
-//
-// Where the changes land follows what every mainstream editor does:
-// buffers that are **open** get the edits in memory and stay dirty, so
-// the user keeps control of their own unsaved work; files that are
-// **not** open are written to disk, because there is nowhere else for
-// them to go. The message says which is which.
+// Every refusal happens before anything is written; `apply_workspace_
+// edit` below is what actually carries the change out, and its own doc
+// comment explains where the edits land.
 #[allow(clippy::too_many_arguments)]
 fn rename_via_server(
     sessions: &mut HashMap<SessionId, SessionState>,
@@ -8928,6 +9139,37 @@ fn rename_via_server(
         return Err("the language server had nothing to rename here".to_string());
     }
 
+    let (written, unsaved) = apply_workspace_edit(edit_frames, buf, &edit, encoding)?;
+    let mut message = format!("renamed to {new_name} in {} file{}", written + unsaved, if written + unsaved == 1 { "" } else { "s" });
+    if unsaved > 0 {
+        message.push_str(&format!(" ({unsaved} open, unsaved -- :w to keep)"));
+    }
+    Ok(message)
+}
+
+// Carries out a `WorkspaceEdit`, returning how many files were written
+// and how many open buffers were left modified-but-unsaved.
+//
+// **All or nothing.** A change that lands in some files and not others
+// leaves the project broken, which is worse than not changing anything
+// -- so files that are not open are read and edited *in memory* first,
+// and written only once every one of them has succeeded. A file that
+// cannot be opened stops the whole thing with nothing changed.
+//
+// Where the changes land follows what every mainstream editor does:
+// buffers that are **open** get the edits in memory and stay dirty, so
+// the user keeps control of their own unsaved work; files that are
+// **not** open are written, because there is nowhere else for them to
+// go.
+//
+// Shared by `:rename` and by code actions, which are the same operation
+// wearing different names.
+fn apply_workspace_edit(
+    edit_frames: &mut HashMap<EditFrameId, fileeditor::EditSession>,
+    buf: &mut TextBuffer,
+    edit: &crate::lsp::WorkspaceEdit,
+    encoding: crate::lsp::PositionEncoding,
+) -> Result<(usize, usize), String> {
     let here = buf.path().map(|p| p.to_path_buf());
     // Phase one: work everything out, touching no disk.
     let mut in_this_buffer: Vec<crate::lsp::TextEdit> = Vec::new();
@@ -8945,8 +9187,6 @@ fn rename_via_server(
             in_open_buffers.push((*id, edits.clone()));
             continue;
         }
-        // Read and edit in memory now, so a file that cannot be opened
-        // stops the whole rename before any of it has happened.
         let mut loaded = TextBuffer::open(&path, 1).map_err(|e| format!("{}: {e} -- nothing changed", path.display()))?;
         fileeditor::apply_text_edits(&mut loaded, edits, encoding);
         on_disk.push((path, loaded));
@@ -8963,13 +9203,7 @@ fn rename_via_server(
         }
     }
     fileeditor::apply_text_edits(buf, &in_this_buffer, encoding);
-
-    let unsaved = in_open_buffers.len() + usize::from(!in_this_buffer.is_empty());
-    let mut message = format!("renamed to {new_name} in {} file{}", written + unsaved, if written + unsaved == 1 { "" } else { "s" });
-    if unsaved > 0 {
-        message.push_str(&format!(" ({unsaved} open, unsaved -- :w to keep)"));
-    }
-    Ok(message)
+    Ok((written, in_open_buffers.len() + usize::from(!in_this_buffer.is_empty())))
 }
 
 // `:fmt` through the language server. `None` when there is nothing to

@@ -57,7 +57,7 @@ while :; do
 	id=$(printf '%s' "$body" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
 	case "$body" in
 	*'"method":"initialize"'*)
-		send '{"jsonrpc":"2.0","id":'"$id"',"result":{"capabilities":{"positionEncoding":"utf-32","hoverProvider":true,"definitionProvider":true,"referencesProvider":true,"documentSymbolProvider":true,"completionProvider":{"triggerCharacters":["."]},"documentFormattingProvider":true,"renameProvider":true,"textDocumentSync":{"openClose":true,"change":1,"save":true}}}}'
+		send '{"jsonrpc":"2.0","id":'"$id"',"result":{"capabilities":{"positionEncoding":"utf-32","hoverProvider":true,"definitionProvider":true,"referencesProvider":true,"documentSymbolProvider":true,"completionProvider":{"triggerCharacters":["."]},"documentFormattingProvider":true,"renameProvider":true,"codeActionProvider":true,"textDocumentSync":{"openClose":true,"change":1,"save":true}}}}'
 		;;
 	*'"method":"textDocument/didOpen"'*)
 		# Remembered so `textDocument/definition` can answer about
@@ -75,6 +75,32 @@ while :; do
 		 {"uri":"'"$target"'","range":{"start":{"line":1,"character":0},"end":{"line":1,"character":5}}},
 		 {"uri":"'"$uri"'","range":{"start":{"line":2,"character":0},"end":{"line":2,"character":5}}},
 		 {"uri":"'"$uri"'","range":{"start":{"line":0,"character":0},"end":{"line":0,"character":5}}}]}'
+		;;
+	*'"method":"codeAction/resolve"'*)
+		# Only the action that said it needed resolving gets an edit
+		# back. A real server does the same: resolving something that
+		# only runs a command returns it unchanged, with nothing to
+		# apply -- which is the case the client must refuse rather
+		# than silently do nothing.
+		case "$body" in
+		*'"title":"Resolve me"'*)
+			send '{"jsonrpc":"2.0","id":'"$id"',"result":{"title":"Resolve me","edit":{"changes":{"'"$uri"'":[
+			 {"range":{"start":{"line":1,"character":0},"end":{"line":1,"character":5}},"newText":"RESOLVED"}]}}}}'
+			;;
+		*)
+			send '{"jsonrpc":"2.0","id":'"$id"',"result":{"title":"unchanged"}}'
+			;;
+		esac
+		;;
+	*'"method":"textDocument/codeAction"'*)
+		# Three, on purpose: one carrying its edit, one that must be
+		# resolved, and one that only runs a server command and so
+		# must be refused with a reason.
+		send '{"jsonrpc":"2.0","id":'"$id"',"result":[
+		 {"title":"Fix it","kind":"quickfix","edit":{"changes":{"'"$uri"'":[
+		   {"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":5}},"newText":"FIXED"}]}}},
+		 {"title":"Resolve me","kind":"refactor"},
+		 {"title":"Run it","command":{"title":"r","command":"mock.run"}}]}'
 		;;
 	*'"method":"textDocument/rename"'*)
 		# Two files: the one the client opened, and $2 when the test

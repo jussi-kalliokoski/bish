@@ -672,6 +672,81 @@ pub fn workspace_edit(result: &Value) -> WorkspaceEdit {
 }
 
 // ---------------------------------------------------------------------
+// Code actions
+// ---------------------------------------------------------------------
+
+/// Something a server offers to do to the code here -- a quick fix for
+/// a diagnostic, a refactor, an import to add.
+// No `Eq`: `unresolved` is a `json::Value`, which holds `f64`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CodeAction {
+    /// What the picker shows.
+    pub title: String,
+    /// `quickfix`, `refactor.extract`, ... Empty when the server said
+    /// nothing, which is common for plain commands.
+    pub kind: String,
+    /// The change to make, when the server sent it up front.
+    pub edit: Option<WorkspaceEdit>,
+    /// The action verbatim, for `codeAction/resolve`. A server is
+    /// allowed to send actions without their edits and compute one only
+    /// for the action actually chosen -- rust-analyzer does exactly
+    /// this -- so an action with no `edit` is not necessarily an action
+    /// with nothing to do.
+    pub unresolved: Value,
+    /// The server-side command this action runs instead of carrying an
+    /// edit. bish cannot execute one (that is `workspace/executeCommand`
+    /// and the `applyEdit` round trip it implies), so this exists to
+    /// say *why* an action was refused rather than to run it.
+    pub command: Option<String>,
+    /// A server can offer an action and say it does not apply here,
+    /// with a reason. Shown, and refused if chosen.
+    pub disabled: Option<String>,
+}
+
+/// Reads a `textDocument/codeAction` answer: an array mixing
+/// `CodeAction`s and bare `Command`s, the older form.
+pub fn code_actions(result: &Value) -> Vec<CodeAction> {
+    let Value::Array(items) = result else { return Vec::new() };
+    items.iter().filter_map(code_action).collect()
+}
+
+fn code_action(value: &Value) -> Option<CodeAction> {
+    let Ok(Value::Str(title)) = json::query(value, ".title") else { return None };
+    let title = sanitize(title);
+    if title.is_empty() {
+        return None;
+    }
+    // A bare `Command` has `command` as a string at the top level; a
+    // `CodeAction`'s own `command` is an object with one inside.
+    let command = match json::query(value, ".command") {
+        Ok(Value::Str(name)) => Some(sanitize(name)),
+        Ok(object @ Value::Object(_)) => match json::query(object, ".command") {
+            Ok(Value::Str(name)) => Some(sanitize(name)),
+            _ => None,
+        },
+        _ => None,
+    };
+    let edit = match json::query(value, ".edit") {
+        Ok(edit @ Value::Object(_)) => Some(workspace_edit(edit)),
+        _ => None,
+    };
+    Some(CodeAction {
+        title,
+        kind: match json::query(value, ".kind") {
+            Ok(Value::Str(kind)) => sanitize(kind),
+            _ => String::new(),
+        },
+        edit,
+        unresolved: value.clone(),
+        command,
+        disabled: match json::query(value, ".disabled.reason") {
+            Ok(Value::Str(reason)) => Some(sanitize(reason)),
+            _ => None,
+        },
+    })
+}
+
+// ---------------------------------------------------------------------
 // Completion
 // ---------------------------------------------------------------------
 
@@ -1481,6 +1556,49 @@ mod tests {
         assert_eq!(workspace_edit(&json::parse(r#"{"changes":{}}"#).unwrap()), WorkspaceEdit::default());
         // A file listed with no edits contributes nothing.
         assert!(workspace_edit(&json::parse(r#"{"changes":{"file:///a":[]}}"#).unwrap()).changes.is_empty());
+    }
+
+    #[test]
+    fn code_actions_are_read_with_their_edit_or_the_reason_there_is_none() {
+        let one_edit = r#"{"range":{"start":{"line":1,"character":0},"end":{"line":1,"character":3}},"newText":"fixed"}"#;
+        let actions = json::parse(&format!(
+            r#"[{{"title":"Fix this","kind":"quickfix","edit":{{"changes":{{"file:///a.rs":[{one_edit}]}}}}}},
+                {{"title":"Run a thing","command":{{"title":"t","command":"rust-analyzer.runSingle"}}}},
+                {{"title":"Later","data":{{"id":7}}}},
+                {{"title":"Not here","disabled":{{"reason":"no trait in scope"}}}}]"#
+        ))
+        .unwrap();
+        let found = code_actions(&actions);
+        assert_eq!(found.len(), 4);
+
+        // Carries its edit up front.
+        assert_eq!(found[0].kind, "quickfix");
+        assert_eq!(found[0].edit.as_ref().unwrap().changes.len(), 1);
+
+        // A command, which bish cannot run -- kept so the refusal can
+        // say what it is rather than "nothing happened".
+        assert_eq!(found[1].command.as_deref(), Some("rust-analyzer.runSingle"));
+        assert!(found[1].edit.is_none());
+
+        // No edit and no command: the server means to compute one only
+        // if this action is chosen, which is what `unresolved` is for.
+        assert!(found[2].edit.is_none() && found[2].command.is_none());
+        assert_eq!(json::query(&found[2].unresolved, ".data.id"), Ok(&Value::Number(7.0)));
+
+        // Offered but not applicable, with the server's own reason.
+        assert_eq!(found[3].disabled.as_deref(), Some("no trait in scope"));
+    }
+
+    #[test]
+    fn the_older_bare_command_form_is_read_too() {
+        // Pre-3.8 servers answer with `Command`s, whose `command` is a
+        // string at the top level rather than an object.
+        let bare = json::parse(r#"[{"title":"Do it","command":"server.doIt"}]"#).unwrap();
+        let found = code_actions(&bare);
+        assert_eq!(found[0].command.as_deref(), Some("server.doIt"));
+        assert!(code_actions(&Value::Null).is_empty());
+        // A titleless entry is not an action anyone could pick.
+        assert!(code_actions(&json::parse(r#"[{"kind":"quickfix"}]"#).unwrap()).is_empty());
     }
 
     fn hover(json_text: &str) -> Option<Vec<String>> {
