@@ -6223,7 +6223,10 @@ impl Shell {
                 let a = self.expand_word(a);
                 if op == "=~" {
                     let pattern = self.expand_regex_operand(b);
-                    match crate::regex::match_captures(&a, &pattern) {
+                    // `shopt -s nocasematch` -- registered since the
+                    // shopt namespace was, and until regex.rs could fold
+                    // case at all there was nothing for it to do.
+                    match crate::regex::match_captures(&a, &pattern, self.shopt_is_on("nocasematch")) {
                         Some(groups) => {
                             let map: std::collections::BTreeMap<usize, String> =
                                 groups.into_iter().enumerate().collect();
@@ -14023,6 +14026,27 @@ mod tests {
         assert_eq!(shell.run_lsp(&strs(&["add", "--root-cmd"])), 2);
         assert_eq!(shell.run_lsp(&strs(&["add", "--root-cmd", "   ", "x"])), 2);
         assert_eq!(shell.lsp_servers.len(), 2);
+    }
+
+    // `nocasematch` has been in the shopt registry since that registry
+    // existed, with nothing at all to act on -- regex.rs could not fold
+    // case. Checked against real bash before being asserted here.
+    #[test]
+    fn nocasematch_makes_the_regex_operator_fold_case() {
+        let run = |script: &str| {
+            let mut shell = Shell::new();
+            let out = capture_output(&mut shell);
+            shell.run_source_here(script, "<test>");
+            let seen = out.borrow().clone();
+            seen
+        };
+        assert_eq!(run(r#"[[ HELLO =~ ^hel ]] && echo yes || echo no"#), "no\n");
+        assert_eq!(run(r#"shopt -s nocasematch; [[ HELLO =~ ^hel ]] && echo yes || echo no"#), "yes\n");
+        assert_eq!(run(r#"shopt -s nocasematch; [[ hello =~ ^[A-Z] ]] && echo yes || echo no"#), "yes\n");
+        // Turned back off again really is off again.
+        assert_eq!(run(r#"shopt -s nocasematch; shopt -u nocasematch; [[ HELLO =~ ^hel ]] && echo yes || echo no"#), "no\n");
+        // Captures still land in BASH_REMATCH.
+        assert_eq!(run(r#"shopt -s nocasematch; [[ FooBar =~ (foo)(bar) ]] && echo "${BASH_REMATCH[1]}-${BASH_REMATCH[2]}""#), "Foo-Bar\n");
     }
 
     #[test]
