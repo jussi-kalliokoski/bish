@@ -2481,6 +2481,12 @@ fn run_hex_frame(
         );
         match outcome {
             hexedit::HexOutcome::Continue => {}
+            // This pane itself is repainted by the loop's own
+            // `session.render` on the very next turn, so all that is
+            // needed here is everything *else*.
+            hexedit::HexOutcome::Redraw => {
+                compositor_redraw(sessions, windows, *current_window, *term_rows, *term_cols);
+            }
             hexedit::HexOutcome::Quit => break true,
             hexedit::HexOutcome::Window(cmd, count) => {
                 dispatch_window_cmd(cmd, count, sessions, windows, current_window, next_session_id, next_window_id, sinks_are_grid, *term_rows, *term_cols);

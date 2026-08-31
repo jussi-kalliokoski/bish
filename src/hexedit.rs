@@ -1529,6 +1529,18 @@ pub enum HexOutcome {
     Continue,
     Quit,
     Window(WindowCmd, Option<usize>),
+    /// Ctrl-L on the colon line: repaint everything, this pane's
+    /// neighbours and the tab bar included.
+    ///
+    /// Reported rather than done here because a full repaint needs the
+    /// compositor, which this view has no reach into -- the same reason
+    /// `Window` is reported. What it replaces is worse: `read_line`'s
+    /// own unreported Ctrl-L prints `\x1b[H\x1b[2J` straight at the real
+    /// terminal, which wipes the compositor's whole frame -- pane
+    /// borders, tab bar, every neighbour -- with nothing repainting any
+    /// of it. See repl.rs's own `ReadOutcome::CtrlL` arm, which is where
+    /// that was already fixed for the shell prompt.
+    Redraw,
 }
 
 impl HexSession {
@@ -1677,7 +1689,10 @@ impl HexSession {
             ":",
             cmd_history,
             true,
-            false,
+            // `ctrl_l_reports`: true, so Ctrl-L comes back here as an
+            // outcome instead of being answered inside `read_line` with
+            // a raw full-screen clear this pane could never put back.
+            true,
             None,
             0,
             term_cols,
@@ -1701,6 +1716,9 @@ impl HexSession {
             true,
         );
         self.registers = registers;
+        if matches!(outcome, Ok(editor::ReadOutcome::CtrlL)) {
+            return HexOutcome::Redraw;
+        }
         if let Ok(editor::ReadOutcome::Line(line)) = outcome {
             if matches!(line.trim(), "help" | "h" | "?") {
                 self.show_help(rect, term_rows, term_cols, on_idle);
