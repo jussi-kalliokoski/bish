@@ -163,6 +163,19 @@ fn load_config(shell: &mut exec::Shell) {
     match std::fs::read_to_string(&path) {
         Ok(src) => {
             shell.run_source_here(&src, &path.display().to_string());
+            // Everything config.bash just set has to be captured into
+            // this shell's own remembered environment, or the very first
+            // `sync_real_state_in` wipes it.
+            //
+            // That snapshot is taken in `Shell::new`, which runs *before*
+            // this -- and `sync_real_state_in` (which every command goes
+            // through, so sibling windows cannot clobber each other's
+            // variables) removes every real env var the snapshot does not
+            // have. So a plain `MYVAR=x` in config.bash survived exactly
+            // until the first command ran. Aliases and functions live on
+            // the `Shell` and were never affected, which is what made
+            // this look like config.bash working.
+            shell.sync_real_state_out();
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => eprintln!("bish: {}: {}", path.display(), e),
