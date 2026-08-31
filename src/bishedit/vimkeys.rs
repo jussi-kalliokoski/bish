@@ -14,6 +14,54 @@ use crate::editor::Key;
 use super::motion::{Motion, TextObjectKind};
 use super::registers::RegisterShape;
 
+/// Which "where is this" question `KeyOutcome::GotoDefinition` is
+/// asking.
+///
+/// Four separate language-server requests that differ only in which one
+/// is sent: each takes a position, each answers with locations, and
+/// each is followed by the same jump. Keeping them one outcome rather
+/// than four is what makes that literally true in the code as well --
+/// the loop driving the buffer has one arm, parameterized here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GotoKind {
+    /// `gd`.
+    Definition,
+    /// `gy`: the definition of this thing's *type*, not of the thing.
+    TypeDefinition,
+    /// The implementations of an interface/trait/abstract method.
+    /// Currently unreachable from any key -- see `feed_g`'s own note on
+    /// `gi`.
+    Implementation,
+    /// `gD`: where it was declared, which in a language that separates
+    /// the two is not where it was defined.
+    Declaration,
+}
+
+impl GotoKind {
+    /// The request to send, and the capability that says whether the
+    /// server answers it at all -- checked first, so a question a
+    /// server never offered costs nothing instead of a timeout.
+    pub fn request(self) -> (&'static str, &'static str) {
+        match self {
+            GotoKind::Definition => ("textDocument/definition", "definitionProvider"),
+            GotoKind::TypeDefinition => ("textDocument/typeDefinition", "typeDefinitionProvider"),
+            GotoKind::Implementation => ("textDocument/implementation", "implementationProvider"),
+            GotoKind::Declaration => ("textDocument/declaration", "declarationProvider"),
+        }
+    }
+
+    /// What to call the thing when there isn't one: "no type definition
+    /// found".
+    pub fn noun(self) -> &'static str {
+        match self {
+            GotoKind::Definition => "definition",
+            GotoKind::TypeDefinition => "type definition",
+            GotoKind::Implementation => "implementation",
+            GotoKind::Declaration => "declaration",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum KeyOutcome {
     /// A motion is ready to apply, with the raw count the user typed before
@@ -107,7 +155,8 @@ pub enum KeyOutcome {
     /// driving the buffer; a frontend with no server simply doesn't
     /// wire it, the same "enforced by omission" the debugger's
     /// read-only subset already relies on.
-    GotoDefinition,
+    GotoDefinition(GotoKind),
+    // (`GotoKind` itself is below, next to `KeyOutcome`.)
     /// `gr`: everywhere the thing under the cursor is used.
     ///
     /// Unlike `GotoDefinition` there is no "the" answer to go to --
@@ -1143,11 +1192,11 @@ impl VimKeys {
         KeyOutcome::ReselectVisual
     }
 
-    fn emit_goto_definition(&mut self) -> KeyOutcome {
+    fn emit_goto_definition(&mut self, kind: GotoKind) -> KeyOutcome {
         self.count = None;
         self.pending = Pending::None;
         self.last_completed = std::mem::take(&mut self.current_input);
-        KeyOutcome::GotoDefinition
+        KeyOutcome::GotoDefinition(kind)
     }
 
     fn emit_goto_references(&mut self) -> KeyOutcome {
@@ -1541,7 +1590,20 @@ impl VimKeys {
                 self.last_search = Some(LastSearch::Word { forward: false, bounded: false });
                 self.emit(Motion::SearchWordBackwardUnbounded)
             }
-            Key::Char('d') => self.emit_goto_definition(),
+            Key::Char('d') => self.emit_goto_definition(GotoKind::Definition),
+            // The two questions next to "where is this defined" whose
+            // keys were free to take. `gy` is unused in vim and is what
+            // helix, VS Code and neovim all reach for; `gD` in vim
+            // already means "find where this was declared", just by
+            // scanning the file backwards rather than by asking someone
+            // who knows -- the same relationship `gd` and `K` already
+            // have with their own vim meanings.
+            //
+            // `textDocument/implementation`'s own settled binding is
+            // `gi`, which is not free: it means "resume insert where I
+            // left off" here and in vim. Not taken without asking.
+            Key::Char('y') => self.emit_goto_definition(GotoKind::TypeDefinition),
+            Key::Char('D') => self.emit_goto_definition(GotoKind::Declaration),
             Key::Char('r') => self.emit_goto_references(),
             Key::Char('O') => self.emit_document_symbols(),
             Key::Char('a') => self.emit_code_actions(),
@@ -2096,7 +2158,7 @@ mod tests {
     fn gd_and_gr_emit_their_outcomes_without_disturbing_g_s_other_bindings() {
         let mut vk = VimKeys::new();
         assert_eq!(vk.feed(Key::Char('g')), KeyOutcome::Pending);
-        assert_eq!(vk.feed(Key::Char('d')), KeyOutcome::GotoDefinition);
+        assert_eq!(vk.feed(Key::Char('d')), KeyOutcome::GotoDefinition(GotoKind::Definition));
         assert_eq!(vk.feed(Key::Char('g')), KeyOutcome::Pending);
         assert_eq!(vk.feed(Key::Char('r')), KeyOutcome::GotoReferences);
         assert_eq!(vk.feed(Key::Char('g')), KeyOutcome::Pending);
@@ -2115,6 +2177,48 @@ mod tests {
         // A bare `d` is still the delete operator, not this.
         assert_eq!(vk.feed(Key::Char('d')), KeyOutcome::Pending);
         vk.feed(Key::Escape);
+    }
+
+    // The two neighbours of `gd` that had a free key. Each is its own
+    // request, so a `gy` that quietly emitted a plain definition lookup
+    // would look like it worked and answer the wrong question.
+    #[test]
+    fn gy_and_gd_capital_ask_their_own_questions() {
+        let mut vk = VimKeys::new();
+        assert_eq!(vk.feed(Key::Char('g')), KeyOutcome::Pending);
+        assert_eq!(vk.feed(Key::Char('y')), KeyOutcome::GotoDefinition(GotoKind::TypeDefinition));
+        assert_eq!(vk.feed(Key::Char('g')), KeyOutcome::Pending);
+        assert_eq!(vk.feed(Key::Char('D')), KeyOutcome::GotoDefinition(GotoKind::Declaration));
+        // Neither key lost what it already meant on its own: `y` is
+        // still the yank operator, `D` still deletes to end of line.
+        assert_eq!(vk.feed(Key::Char('y')), KeyOutcome::Pending);
+        vk.feed(Key::Escape);
+        assert!(matches!(vk.feed(Key::Char('D')), KeyOutcome::Operator { .. } | KeyOutcome::OperatorLines { .. }));
+        // And `gi` still resumes insert where it left off -- taking it
+        // for `textDocument/implementation` is a decision nobody has
+        // made yet.
+        assert_eq!(vk.feed(Key::Char('g')), KeyOutcome::Pending);
+        assert_eq!(vk.feed(Key::Char('i')), KeyOutcome::EnterInsert(InsertCmd::LastInsertPos));
+    }
+
+    // Each kind maps to its own request and says its own name -- the
+    // one place a copy-paste slip would silently send `gy` to the
+    // definition endpoint.
+    #[test]
+    fn every_goto_kind_has_its_own_request_and_noun() {
+        let kinds =
+            [GotoKind::Definition, GotoKind::TypeDefinition, GotoKind::Implementation, GotoKind::Declaration];
+        let mut seen: Vec<(&str, &str)> = Vec::new();
+        for kind in kinds {
+            let (method, capability) = kind.request();
+            assert!(method.starts_with("textDocument/"), "{method}");
+            assert!(capability.ends_with("Provider"), "{capability}");
+            assert!(!kind.noun().is_empty());
+            seen.push((method, capability));
+        }
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen.len(), kinds.len(), "two kinds share a request");
     }
 
     #[test]

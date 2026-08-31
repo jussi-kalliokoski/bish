@@ -15,7 +15,7 @@ use crate::bishedit::registers::{RegisterShape, RegisterValue, Registers};
 use crate::bishedit::suggestion;
 use crate::bishedit::textbuffer::TextBuffer;
 use crate::bishedit::unicode_width::col_of;
-use crate::bishedit::vimkeys::{KeyOutcome, Op, VimKeys, WindowCmd};
+use crate::bishedit::vimkeys::{GotoKind, KeyOutcome, Op, VimKeys, WindowCmd};
 use crate::bishedit::Buffer as BisheditBuffer;
 use crate::archive;
 use crate::browser;
@@ -7650,13 +7650,16 @@ fn run_normal_mode_navigation(
     // too late.
     let mut click_streak: u32 = 0;
     let mut ranged_selection = false;
-    // The definitions `gd` last found, and which one the cursor is on,
-    // while `n`/`N` are still cycling them. `None` the rest of the time
-    // -- which is almost always, and is what keeps those two keys
-    // meaning `repeat-search` everywhere else. Same shape as
-    // `PendingView` above: a state that the next unrelated keystroke
-    // resolves away rather than a mode to leave.
-    let mut definitions: Option<(Vec<crate::lsp::Location>, usize)> = None;
+    // What `gd` (or `gy`/`gD`) last found, which one the cursor is on,
+    // and which question was asked -- the last so that cycling through
+    // the answers says "type definition 2/3" rather than mislabelling
+    // them all as definitions.
+    //
+    // `None` the rest of the time -- which is almost always, and is
+    // what keeps `n`/`N` meaning `repeat-search` everywhere else. Same
+    // shape as `PendingView` above: a state that the next unrelated
+    // keystroke resolves away rather than a mode to leave.
+    let mut definitions: Option<(GotoKind, Vec<crate::lsp::Location>, usize)> = None;
 
     let result: (NavExit, Option<(TextBuffer, VimKeys)>) = 'nav: loop {
         // Recomputed every iteration, not just once up front: this pane's
@@ -7944,16 +7947,16 @@ fn run_normal_mode_navigation(
             if !cycling {
                 definitions = None;
             } else {
-                let (locations, at) = definitions.take().expect("checked just above");
+                let (kind, locations, at) = definitions.take().expect("checked just above");
                 let step = if key == Key::Char('n') { 1 } else { locations.len() - 1 };
                 let next = (at + step) % locations.len();
-                match goto_location(sessions, session_id, &mut buf, &locations[next]) {
+                match goto_location(sessions, session_id, &mut buf, &locations[next], kind.noun()) {
                     Goto::Moved => {
                         let content_cols = nav_content_cols(&buf, rect);
                         nav_scroll_to_show_cursor(&mut buf, content_cols);
                         render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides.as_ref());
-                        show_command_mode_error(&format!("definition {}/{}", next + 1, locations.len()), *term_rows, *term_cols);
-                        definitions = Some((locations, next));
+                        show_command_mode_error(&format!("{} {}/{}", kind.noun(), next + 1, locations.len()), *term_rows, *term_cols);
+                        definitions = Some((kind, locations, next));
                     }
                     // Stepping onto a definition in another file opens
                     // it, which ends this loop -- and with it the
@@ -7979,7 +7982,7 @@ fn run_normal_mode_navigation(
                     Goto::Nowhere(message) => {
                         render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides.as_ref());
                         show_command_mode_error(&message, *term_rows, *term_cols);
-                        definitions = Some((locations, at));
+                        definitions = Some((kind, locations, at));
                     }
                 }
                 continue;
@@ -8476,9 +8479,10 @@ fn run_normal_mode_navigation(
             //
             // Scoped to `Editable`, like `K`, for the same reason: a
             // scrollback view has no file for a server to answer about.
-            KeyOutcome::GotoDefinition => {
+            KeyOutcome::GotoDefinition(kind) => {
                 if let NavBuffer::Editable(tb) = &buf {
                     let (row, col) = tb.cursor();
+                    let (method, capability) = kind.request();
                     let found = ask_server_at_cursor(
                         sessions,
                         windows,
@@ -8491,8 +8495,8 @@ fn run_normal_mode_navigation(
                         tb,
                         row,
                         col,
-                        "textDocument/definition",
-                        "definitionProvider",
+                        method,
+                        capability,
                         &[],
                     )
                     .map(|result| crate::lsp::locations(&result))
@@ -8505,7 +8509,13 @@ fn run_normal_mode_navigation(
                             // pager to show it in. `man rsync` without
                             // leaving the buffer, in bish's own renderer
                             // rather than a subprocess.
-                            let manpage = man_page_under_cursor(tb);
+                            //
+                            // Only for `gd`: a manpage is a definition,
+                            // and is not this command's *type* or where
+                            // it was declared. Asking `gy` on a shell
+                            // word and getting a manpage would be the
+                            // wrong answer to the question asked.
+                            let manpage = (kind == GotoKind::Definition).then(|| man_page_under_cursor(tb)).flatten();
                             match manpage {
                                 Some((name, source)) => {
                                     run_pager(
@@ -8531,7 +8541,7 @@ fn run_normal_mode_navigation(
                                 }
                                 None => {
                                     render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides.as_ref());
-                                    show_command_mode_error("no definition found", *term_rows, *term_cols);
+                                    show_command_mode_error(&format!("no {} found", kind.noun()), *term_rows, *term_cols);
                                 }
                             }
                         }
@@ -8540,7 +8550,7 @@ fn run_normal_mode_navigation(
                             // `Ctrl-O` should come back to where the
                             // question was asked.
                             record_jump(windows, *current_window, &buf);
-                            match goto_location(sessions, session_id, &mut buf, &first) {
+                            match goto_location(sessions, session_id, &mut buf, &first, kind.noun()) {
                             Goto::Moved => {
                                 let content_cols = nav_content_cols(&buf, rect);
                                 nav_scroll_to_show_cursor(&mut buf, content_cols);
@@ -8549,8 +8559,8 @@ fn run_normal_mode_navigation(
                                 // arming -- when there is somewhere
                                 // else to go.
                                 if found.len() > 1 {
-                                    show_command_mode_error(&format!("definition 1/{} (n/N to cycle)", found.len()), *term_rows, *term_cols);
-                                    definitions = Some((found, 0));
+                                    show_command_mode_error(&format!("{} 1/{} (n/N to cycle)", kind.noun(), found.len()), *term_rows, *term_cols);
+                                    definitions = Some((kind, found, 0));
                                 }
                             }
                             Goto::Elsewhere { path, line, character, encoding } => {
@@ -10332,8 +10342,9 @@ enum Goto {
 }
 
 // Moves the cursor to `location` if it is in this buffer, or reports
-// what else it is. Shared by `gd` and by the `n`/`N` cycling that
-// follows it, so the two cannot disagree about what "go there" means.
+// what else it is. Shared by `gd`/`gy`/`gD` and by the `n`/`N` cycling
+// that follows one, so they cannot disagree about what "go there"
+// means.
 //
 // Recording the jump is the caller's job (`record_jump`), so that a
 // `gd` leaves exactly one entry behind -- at the place the question was
@@ -10343,9 +10354,12 @@ fn goto_location(
     session_id: SessionId,
     buf: &mut NavBuffer,
     location: &crate::lsp::Location,
+    // What the caller asked for, for the two messages this can produce
+    // -- "definition", "type definition", "declaration".
+    noun: &str,
 ) -> Goto {
     let Some(tb) = buf.as_editable_mut() else {
-        return Goto::Nowhere("no definition found".to_string());
+        return Goto::Nowhere(format!("no {noun} found"));
     };
     let here = tb.path().map(crate::url::from_file_path);
     let encoding = server_encoding_for(sessions, session_id, tb).unwrap_or(crate::lsp::PositionEncoding::Utf16);
@@ -10360,7 +10374,7 @@ fn goto_location(
         Some(path) => Goto::Elsewhere { path, line: location.start.0, character: location.start.1, encoding },
         // A uri naming no local file at all (`jar:`, `zipfile:`, a
         // server's own synthetic scheme) is nothing bish can open.
-        None => Goto::Nowhere(format!("definition is at {}:{}", location.uri, location.start.0 + 1)),
+        None => Goto::Nowhere(format!("{noun} is at {}:{}", location.uri, location.start.0 + 1)),
     }
 }
 

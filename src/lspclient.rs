@@ -573,6 +573,25 @@ impl Server {
                             "definition".to_string(),
                             Value::Object(vec![("dynamicRegistration".to_string(), Value::Bool(false))]),
                         ),
+                        // The three questions next to it: `gy`, `gD`,
+                        // and `textDocument/implementation` (which has
+                        // no key yet -- see vimkeys' own note on `gi`).
+                        // Declared even where no key reaches it, since
+                        // what a client can do and what it currently
+                        // binds are different questions and a server
+                        // reads only the first.
+                        (
+                            "typeDefinition".to_string(),
+                            Value::Object(vec![("dynamicRegistration".to_string(), Value::Bool(false))]),
+                        ),
+                        (
+                            "implementation".to_string(),
+                            Value::Object(vec![("dynamicRegistration".to_string(), Value::Bool(false))]),
+                        ),
+                        (
+                            "declaration".to_string(),
+                            Value::Object(vec![("dynamicRegistration".to_string(), Value::Bool(false))]),
+                        ),
                         (
                             "completion".to_string(),
                             Value::Object(vec![
