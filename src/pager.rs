@@ -187,10 +187,14 @@ impl Pager {
             }
             Key::Mouse(ev) if ev.is_left_click() => Outcome::Click(ev),
             Key::Mouse(ev) => {
+                // The same notch the editor and Normal mode use, from
+                // the one constant, so a wheel feels the same wherever
+                // it is turned.
+                let step = crate::fileeditor::MOUSE_WHEEL_LINES as isize;
                 if ev.is_scroll_down() {
-                    self.scroll_by(3);
+                    self.scroll_by(step);
                 } else if ev.is_scroll_up() {
-                    self.scroll_by(-3);
+                    self.scroll_by(-step);
                 }
                 Outcome::Continue
             }

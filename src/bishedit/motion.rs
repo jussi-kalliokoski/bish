@@ -2821,6 +2821,27 @@ mod tests {
         assert_eq!(buf.viewport_top(), 0);
     }
 
+    // One notch of the wheel moves the view by one line, which is what
+    // the terminal would have done with it before bish started
+    // handling the wheel itself. Three lines a notch turned a
+    // trackpad's stream of fine-grained notches into a lurch -- see
+    // `fileeditor::MOUSE_WHEEL_LINES`, which is the number this pins.
+    #[test]
+    fn one_wheel_notch_scrolls_exactly_one_line() {
+        let notch = Some(crate::fileeditor::MOUSE_WHEEL_LINES);
+        let mut buf = TestBuffer::new(&numbered_lines(40));
+        buf.vheight = 10;
+        buf.set_cursor(0, 0);
+        go(&mut buf, Motion::ScrollLineDown, notch);
+        assert_eq!(buf.viewport_top(), 1, "one notch down is one line");
+        for _ in 0..4 {
+            go(&mut buf, Motion::ScrollLineDown, notch);
+        }
+        assert_eq!(buf.viewport_top(), 5, "and five notches are five lines, not fifteen");
+        go(&mut buf, Motion::ScrollLineUp, notch);
+        assert_eq!(buf.viewport_top(), 4);
+    }
+
     #[test]
     fn scroll_center_top_bottom() {
         let mut buf = TestBuffer::new(&numbered_lines(20));

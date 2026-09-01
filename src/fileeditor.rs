@@ -243,8 +243,12 @@ pub(crate) fn scroll_to_show_cursor(buf: &mut TextBuffer, content_cols: usize) {
 }
 
 // How far one horizontal wheel notch moves the view. More than
-// MOUSE_WHEEL_LINES because a column is a much smaller step than a line
-// -- three columns a notch would feel like nothing.
+// MOUSE_WHEEL_LINES because a column is a much smaller step than a
+// line -- a column a notch would feel like nothing.
+//
+// Untested against a trackpad's sideways gesture, unlike the vertical
+// step beside it; if that turns out to lurch the same way, this is the
+// number to look at.
 pub(crate) const MOUSE_WHEEL_COLUMNS: usize = 6;
 
 // Moves the view sideways by `columns` (negative for left), the way the
@@ -1236,11 +1240,23 @@ pub(crate) fn resolve_insert_start(buf: &mut TextBuffer, cmd: InsertCmd) {
 // keeps using the size it started with until then -- the same "next
 // natural redraw" caveat this codebase already accepts elsewhere for a
 // loop that's actively blocked on a keystroke.
-// Lines scrolled per mouse wheel notch, here and in repl.rs's own
-// Normal-mode navigation wheel handling -- matches most terminals'/
-// editors' own default wheel granularity (a single line per notch reads
-// as sluggish for a fast scroll).
-pub(crate) const MOUSE_WHEEL_LINES: usize = 3;
+// Lines scrolled per mouse wheel notch -- here, in repl.rs's own
+// Normal-mode navigation, and in the pager.
+//
+// One, because the terminal has already decided how fast the wheel
+// turns. This was three on the theory that a line a notch "reads as
+// sluggish for a fast scroll"; that was a guess, and it was wrong. A
+// trackpad in kitty sends a stream of fine-grained notches, and
+// multiplying each of them by three turns a smooth scroll into a lurch
+// -- which is exactly the thing that got worse when bish started
+// handling the wheel itself instead of letting the terminal translate
+// it into arrow keys.
+//
+// A discrete wheel does move a line at a time this way. That is the
+// same amount its own terminal would have scrolled, so it is the
+// honest default; a multiplier belongs in the terminal's settings,
+// where a person's other applications already read it from.
+pub(crate) const MOUSE_WHEEL_LINES: usize = 1;
 
 // `extra_cursors`: every position besides `buf.cursor()` itself that
 // this same Insert-mode session must also type into -- multi-selection
