@@ -872,35 +872,85 @@ impl<'a> Lexer<'a> {
     // Reads a $'...' ANSI-C quoted string (opening $' already consumed).
     // Result is a plain literal -- no further $ expansion happens inside,
     // matching bash. Common C-style escapes only (no \xHH/\uHHHH/octal).
+    // `$'...'`, whose escapes are C's rather than the shell's.
+    //
+    // Assembled as *bytes* and decoded at the end, because `\303\244`
+    // has to mean the two bytes of `ä` and not the two characters
+    // U+00C3 U+00A4. That is the form `printf %q` writes a non-ASCII
+    // string in, so this is the reading end of that round trip.
     fn read_ansi_c_string(&mut self) -> Result<String, String> {
-        let mut s = String::new();
+        let mut bytes: Vec<u8> = Vec::new();
         loop {
             match self.advance() {
                 None => return Err("unterminated $'...'".to_string()),
                 Some('\'') => break,
                 Some('\\') => match self.advance() {
-                    Some('n') => s.push('\n'),
-                    Some('t') => s.push('\t'),
-                    Some('r') => s.push('\r'),
-                    Some('\\') => s.push('\\'),
-                    Some('\'') => s.push('\''),
-                    Some('"') => s.push('"'),
-                    Some('a') => s.push('\x07'),
-                    Some('b') => s.push('\x08'),
-                    Some('e') => s.push('\x1b'),
-                    Some('f') => s.push('\x0c'),
-                    Some('v') => s.push('\x0b'),
-                    Some('0') => s.push('\0'),
+                    Some('n') => bytes.push(b'\n'),
+                    Some('t') => bytes.push(b'\t'),
+                    Some('r') => bytes.push(b'\r'),
+                    Some('\\') => bytes.push(b'\\'),
+                    Some('\'') => bytes.push(b'\''),
+                    Some('"') => bytes.push(b'"'),
+                    Some('?') => bytes.push(b'?'),
+                    Some('a') => bytes.push(0x07),
+                    Some('b') => bytes.push(0x08),
+                    // `\E` as well as `\e`: `printf %q` writes the
+                    // capital one.
+                    Some('e' | 'E') => bytes.push(0x1b),
+                    Some('f') => bytes.push(0x0c),
+                    Some('v') => bytes.push(0x0b),
+                    // Up to three octal digits, counting the one just
+                    // read -- so `\0` is NUL, `\101` is `A`, and
+                    // `\0101` is NUL-then-`101`... no: it is `\010`
+                    // then `1`, which is what the three-digit limit
+                    // gives on its own.
+                    Some(d @ '0'..='7') => {
+                        let mut value = d.to_digit(8).unwrap();
+                        for _ in 0..2 {
+                            match self.chars.peek().and_then(|c| c.to_digit(8)) {
+                                Some(next) => {
+                                    value = value * 8 + next;
+                                    self.advance();
+                                }
+                                None => break,
+                            }
+                        }
+                        bytes.push(value as u8);
+                    }
+                    // `\xHH`, one or two hex digits.
+                    Some('x') => bytes.push(read_hex(&mut self.chars, 2) as u8),
+                    // `\uHHHH` / `\UHHHHHHHH` name a code point rather
+                    // than a byte, so they go in as UTF-8.
+                    Some(u @ ('u' | 'U')) => {
+                        let width = if u == 'u' { 4 } else { 8 };
+                        let value = read_hex(&mut self.chars, width);
+                        match char::from_u32(value) {
+                            Some(c) => {
+                                let mut buf = [0u8; 4];
+                                bytes.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+                            }
+                            None => bytes.push(b'?'),
+                        }
+                    }
+                    // `\cX` is the control character X stands for.
+                    Some('c') => match self.advance() {
+                        Some(c) => bytes.push((c as u8) & 0x1f),
+                        None => return Err("unterminated $'...'".to_string()),
+                    },
                     Some(other) => {
-                        s.push('\\');
-                        s.push(other);
+                        bytes.push(b'\\');
+                        let mut buf = [0u8; 4];
+                        bytes.extend_from_slice(other.encode_utf8(&mut buf).as_bytes());
                     }
                     None => return Err("unterminated $'...'".to_string()),
                 },
-                Some(c) => s.push(c),
+                Some(c) => {
+                    let mut buf = [0u8; 4];
+                    bytes.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+                }
             }
         }
-        Ok(s)
+        Ok(String::from_utf8_lossy(&bytes).into_owned())
     }
 
     // Reads the delimiter word after `<<`/`<<-`. Only the common forms are
@@ -1031,6 +1081,15 @@ impl<'a> Lexer<'a> {
                     buf.push(')');
                 }
                 Some('|') | Some('(') | Some(')') if relaxed => {
+                    buf.push(self.advance().unwrap());
+                }
+                // `#` only opens a comment where a word could begin.
+                // Inside one it is an ordinary character: bash reads
+                // `echo a#b` as `a#b`, and `printf %q` relies on that
+                // -- it leaves a mid-word `#` unescaped, so a shell
+                // that broke the word there could not read back what it
+                // had just written.
+                Some('#') if !buf.is_empty() || !chunks.is_empty() => {
                     buf.push(self.advance().unwrap());
                 }
                 Some('|') | Some('&') | Some(';') | Some('<') | Some('>') | Some('#') | Some('(') | Some(')') => break,
@@ -2308,6 +2367,59 @@ fn starts_a_command(tok: &Tok) -> bool {
 
 #[cfg(test)]
 mod tests {
+    // The text of every word a line lexes to, for the tests just below.
+    // Only the plain-literal chunks matter to them.
+    fn words_of(src: &str) -> Vec<String> {
+        super::Lexer::new(src)
+            .tokenize()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|(tok, _)| match tok {
+                super::Tok::Word(chunks, _) => Some(
+                    chunks
+                        .iter()
+                        .map(|c| match c {
+                            super::Chunk::Str(s) | super::Chunk::LiteralStr(s) => s.as_str(),
+                            _ => "",
+                        })
+                        .collect::<String>(),
+                ),
+                _ => None,
+            })
+            .collect()
+    }
+
+    // `$'...'` carries C's escapes, and the numeric ones name *bytes*:
+    // `\303\244` is the two bytes of `ä`, not the two characters
+    // U+00C3 U+00A4. That is the form `printf %q` writes a non-ASCII
+    // string in, and this is the reading end of that round trip.
+    #[test]
+    fn ansi_c_quoting_reads_the_escapes_printf_q_writes() {
+        let read = |body: &str| words_of(&format!("x $'{body}'")).pop().unwrap_or_default();
+        assert_eq!(read(r"a\tb"), "a\tb");
+        assert_eq!(read(r"a\Eb"), "a\u{1b}b", "capital E, which is what `printf %q` writes");
+        assert_eq!(read(r"a\eb"), "a\u{1b}b");
+        assert_eq!(read(r"\101\102"), "AB", "up to three octal digits");
+        assert_eq!(read(r"\0101"), "\u{8}1", "three at most, so this is \\010 and then a `1`");
+        assert_eq!(read(r"\303\244"), "\u{e4}", "octal bytes, decoded as UTF-8 at the end");
+        assert_eq!(read(r"\x41\x7"), "A\u{7}", "one or two hex digits");
+        assert_eq!(read(r"\U0001F600"), "\u{1f600}", "a code point rather than a byte");
+        assert_eq!(read(r"\cA"), "\u{1}");
+        assert_eq!(read(r"\q"), r"\q", "an escape it does not know keeps its backslash");
+    }
+
+    // `#` opens a comment only where a word could begin. `printf %q`
+    // leaves a mid-word `#` unescaped, so a shell that ended the word
+    // there could not read back what it had just written -- which is
+    // exactly what this one used to do.
+    #[test]
+    fn a_hash_inside_a_word_is_an_ordinary_character() {
+        assert_eq!(words_of("echo a#b"), vec!["echo".to_string(), "a#b".to_string()]);
+        assert_eq!(words_of("echo ab#"), vec!["echo".to_string(), "ab#".to_string()]);
+        assert_eq!(words_of("echo a #b"), vec!["echo".to_string(), "a".to_string()], "one that starts a word still does");
+        assert_eq!(words_of("# whole line"), Vec::<String>::new());
+    }
+
     use super::*;
 
     #[test]
@@ -2661,4 +2773,20 @@ mod alias_tests {
         assert_eq!(expand("echo hello", &[]), "echo hello");
         assert_eq!(expand("echo hello", &[("ll", "ls")]), "echo hello");
     }
+}
+
+// Up to `max` hexadecimal digits, as one value. Fewer is fine -- `\x7`
+// is a complete escape -- which is why this peeks rather than demands.
+fn read_hex(chars: &mut std::iter::Peekable<std::str::Chars<'_>>, max: usize) -> u32 {
+    let mut value = 0u32;
+    for _ in 0..max {
+        match chars.peek().and_then(|c| c.to_digit(16)) {
+            Some(digit) => {
+                value = value * 16 + digit;
+                chars.next();
+            }
+            None => break,
+        }
+    }
+    value
 }

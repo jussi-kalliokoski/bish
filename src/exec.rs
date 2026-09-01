@@ -8404,6 +8404,73 @@ pub(crate) fn echo_expand_escapes(s: &str) -> (String, bool) {
     (out, false)
 }
 
+// `printf %q`: the argument written as text a shell reads back as
+// exactly this string. Bash's rules, byte for byte, because the whole
+// point of the output is to survive being pasted somewhere else --
+// including through something that does not know the encoding.
+//
+// Two forms. While every byte is printable ASCII, the shell-special
+// ones each get a backslash. As soon as one is not -- a control
+// character, or anything with the high bit set -- the whole string goes
+// into `$'...'` and those bytes are written as octal escapes: `ä`
+// becomes `$'\303\244'`, its own UTF-8 bytes, which is the spelling
+// least likely to arrive somewhere as something else.
+//
+// `shell_quote` next door does the always-single-quote form instead,
+// which is what `${v@Q}` wants. Bash draws the same distinction between
+// the two.
+pub(crate) fn printf_quote(s: &str) -> String {
+    if s.is_empty() {
+        return "''".to_string();
+    }
+    let bytes = s.as_bytes();
+    if bytes.iter().any(|b| !(0x20..0x7f).contains(b)) {
+        return dollar_quote(bytes);
+    }
+    let mut out = String::with_capacity(bytes.len());
+    for (i, &b) in bytes.iter().enumerate() {
+        // `#` opens a comment and `~` names a home directory only at
+        // the front of a word, and bash escapes them only there.
+        let front_only = matches!(b, b'#' | b'~');
+        if BACKSLASH_QUOTED.contains(&b) && (!front_only || i == 0) {
+            out.push('\\');
+        }
+        out.push(b as char);
+    }
+    out
+}
+
+// Every ASCII character bash puts a backslash in front of. `%`, `+`,
+// `-`, `.`, `/`, `:`, `=`, `@`, `_` and the alphanumerics are the ones
+// it leaves alone.
+const BACKSLASH_QUOTED: &[u8] = b" !\"#$&'()*,;<>?[\\]^`{|}~";
+
+// The `$'...'` form. Only `'` and `\` are special inside it -- `$`,
+// `"` and a backtick are all literal there, which is most of why bash
+// reaches for it.
+fn dollar_quote(bytes: &[u8]) -> String {
+    let mut out = String::from("$'");
+    for &b in bytes {
+        match b {
+            0x07 => out.push_str("\\a"),
+            0x08 => out.push_str("\\b"),
+            b'\t' => out.push_str("\\t"),
+            b'\n' => out.push_str("\\n"),
+            0x0b => out.push_str("\\v"),
+            0x0c => out.push_str("\\f"),
+            b'\r' => out.push_str("\\r"),
+            // `\E`, not `\e`: bash writes the one every shell reads.
+            0x1b => out.push_str("\\E"),
+            b'\'' => out.push_str("\\'"),
+            b'\\' => out.push_str("\\\\"),
+            0x20..=0x7e => out.push(b as char),
+            other => out.push_str(&format!("\\{other:03o}")),
+        }
+    }
+    out.push('\'');
+    out
+}
+
 // Wraps `s` in single quotes, escaping any embedded single quote as
 // '\'' (close, escaped-quote, reopen) -- the standard POSIX-shell-safe
 // quoting form, and what printf's own %q conversion produces.
@@ -8418,6 +8485,69 @@ pub(crate) fn shell_quote(s: &str) -> String {
     }
     out.push('\'');
     out
+}
+
+#[cfg(test)]
+mod quoting_round_trip_tests {
+    // `%q` exists so a string can be carried somewhere else and read
+    // back as itself. Bash's spelling is what bish writes -- including
+    // `$'\303\244'` for a non-ASCII string, which is octal *bytes* and
+    // therefore cannot be re-encoded into something else on the way --
+    // so the two halves are checked separately: that bish writes what
+    // bash writes, and that bish reads its own writing back.
+    //
+    // The values go to bash as arguments rather than inside the script,
+    // which is the only way to hand it a control character without
+    // needing the very quoting under test.
+    fn nasty() -> Vec<String> {
+        let mut out: Vec<String> = ["", "abc", "a b", "a'b", "a\"b", "a$b", "a\\b", "a`b", "#abc", "~abc",
+            "a#b", "a~b", "a,b", "a^b", "a{b}c", "a[b]c", "a(b)c", "a?b", "a*b", "a;b", "a|b", "a&b",
+            "a<b>c", "a!b", "a=b", "a.b", "a/b", "a:b", "a@b", "a+b", "a%b", "a-b", "a_b", "123", "~", "#"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        // Every control character, and a few that need real bytes.
+        for code in 1u8..0x20 {
+            out.push(format!("x{}y", code as char));
+        }
+        out.push("x\u{7f}y".to_string());
+        out.push("\u{e4}\u{f6}\u{e5}".to_string());
+        out.push("a \u{e4} b".to_string());
+        out.push("\u{1f600}".to_string());
+        out
+    }
+
+    #[test]
+    fn printf_q_writes_what_bash_writes() {
+        let values = nasty();
+        let mut command = std::process::Command::new("bash");
+        command.env("LC_ALL", "C").arg("-c").arg("for v in \"$@\"; do printf '%q' \"$v\"; printf '\\001'; done").arg("bash");
+        for value in &values {
+            command.arg(value);
+        }
+        let Ok(out) = command.output() else { return };
+        if !out.status.success() {
+            return;
+        }
+        let printed = String::from_utf8_lossy(&out.stdout).into_owned();
+        let want: Vec<&str> = printed.split('\u{1}').collect();
+        assert_eq!(want.len(), values.len() + 1, "one result per value, plus the empty tail");
+        for (value, expected) in values.iter().zip(&want) {
+            assert_eq!(&super::printf_quote(value), expected, "printf %q of {value:?}");
+        }
+    }
+
+    #[test]
+    fn what_printf_q_writes_reads_back_as_itself() {
+        for value in nasty() {
+            let quoted = super::printf_quote(&value);
+            let mut shell = super::Shell::new();
+            let captured = std::rc::Rc::new(std::cell::RefCell::new(String::new()));
+            shell.set_sink_capture(captured.clone());
+            shell.run_source_here(&format!("printf '%s' {quoted}\n"), "<quote-round-trip>");
+            assert_eq!(captured.borrow().as_str(), value, "{quoted} did not read back");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -8449,7 +8579,7 @@ mod printf_conversion_tests {
             "%g", "%G", "%.1g", "%.3g", "%.10g", "%+08.0g", "%012g",
             "%d", "%i", "%5d", "%-5d", "%05d", "%+d", "% d", "%.5d", "%.0d", "%5.0d", "%08.5d", "%-8.5d",
             "%u", "%.5u", "%x", "%X", "%.3x", "%08x", "%o", "%.5o", "%12.4X",
-            "%s", "%.3s", "%8.3s", "%-8.3s", "%c", "%b", "%.3b",
+            "%s", "%.3s", "%8.3s", "%-8.3s", "%c", "%b", "%.3b", "%q", "%.3q", "%8q",
         ];
         let values = [
             "0", "1", "-1", "2.5", "3.5", "-0.5", "3.14159", "-3.14159", "1e3", "1e-3", "1e20",
@@ -8457,6 +8587,9 @@ mod printf_conversion_tests {
             "31415.9", "0.000123", "inf", "-inf", "nan", "abc", "",
             "42", "-42", "010", "0XfF", "'A", "+5", " 7 ", "3.9", "-3.9", "12 34", "3.9abc", ".5", "1.",
             "255", "-255", "abcdef",
+            "a b", "a'b", "a\"b", "a$b", "a\\b", "a`b", "a*b", "a;b", "a|b", "a&b", "a<b", "a>b",
+            "a#b", "#abc", "abc#", "a~b", "~abc", "a!b", "a,b", "a^b", "a{b", "a[b", "a(b", "a?b",
+            "a=b", "a.b", "a-b", "a_b", "a/b", "a:b", "a@b", "a+b", "a%b", "~", "#",
         ];
         specs.iter().flat_map(|s| values.iter().map(move |v| (s.to_string(), v.to_string()))).collect()
     }
@@ -8888,7 +9021,7 @@ pub(crate) fn printf_format_once(format: &str, values: &[String], idx: &mut usiz
             // than in digits.
             's' => truncate_chars(&next_arg(), precision.unwrap_or(usize::MAX)),
             'b' => truncate_chars(&echo_expand_escapes(&next_arg()).0, precision.unwrap_or(usize::MAX)),
-            'q' => truncate_chars(&shell_quote(&next_arg()), precision.unwrap_or(usize::MAX)),
+            'q' => truncate_chars(&printf_quote(&next_arg()), precision.unwrap_or(usize::MAX)),
             // An empty argument is still a character: bash writes the
             // NUL it read, and so does this.
             'c' => next_arg().chars().next().unwrap_or('\0').to_string(),
