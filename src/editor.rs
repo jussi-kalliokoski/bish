@@ -1306,7 +1306,15 @@ pub enum ReadOutcome {
     // `I`/`A`/`s`/`S`/`C` in normal mode all act relative to this
     // *original* cursor (not wherever normal mode's own navigation cursor
     // wanders off to -- see run_normal_mode_navigation's own doc comment).
-    NormalMode { text: String, cursor: usize },
+    // `wheel` is the notch that asked for this, when a wheel is what
+    // opened it rather than Ctrl+Space. A promoted prompt has mouse
+    // reporting on (see repl.rs's prompt_claims_mouse), so the terminal
+    // no longer scrolls its own scrollback -- and bish's scrollback view
+    // *is* normal mode, so a notch means "show me that". Carried rather
+    // than dropped so the notch that got you here also scrolls: entering
+    // a mode and not moving reads as the wheel being broken, which is
+    // the complaint this whole path exists to answer.
+    NormalMode { text: String, cursor: usize, wheel: Option<MouseEvent> },
     // A qualifying left click (see MouseEvent::is_left_click) anywhere
     // during ordinary typing. Bubbled up the same way NormalMode is --
     // read_line has no idea `windows`/panes exist at all, only its own
@@ -1876,7 +1884,18 @@ pub fn read_line(
             // gating is gone.
             Key::CtrlSpace => {
                 drop(guard.take());
-                return Ok(ReadOutcome::NormalMode { text: ed.as_string(), cursor: ed.cursor });
+                return Ok(ReadOutcome::NormalMode { text: ed.as_string(), cursor: ed.cursor, wheel: None });
+            }
+            // A wheel notch is the other way into the same view. Only
+            // reachable at a *promoted* prompt, and not by this arm's
+            // doing: an unpromoted one never turns mouse reporting on, so
+            // the terminal keeps scrolling its own scrollback and no
+            // event arrives here at all (see repl.rs's
+            // prompt_claims_mouse). Once promoted, that scrollback is
+            // bish's, and normal mode is where it can be read.
+            Key::Mouse(ev) if ev.is_scroll_up() || ev.is_scroll_down() => {
+                drop(guard.take());
+                return Ok(ReadOutcome::NormalMode { text: ed.as_string(), cursor: ed.cursor, wheel: Some(ev) });
             }
             // Ctrl-E: a line-local vim Normal mode, always available
             // (empty buffer or not) -- see run_line_normal_mode's own doc

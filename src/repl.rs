@@ -1262,7 +1262,7 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
                     compositor_redraw(&sessions, &windows, current_window, term_rows, term_cols);
                 }
             }
-            Ok(ReadOutcome::NormalMode { text, cursor }) => {
+            Ok(ReadOutcome::NormalMode { text, cursor, wheel }) => {
                 ensure_promoted(&mut sessions, &mut sinks_are_grid);
                 match run_normal_mode_navigation(
                     session_id,
@@ -1279,7 +1279,7 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
                     &mut edit_frames,
                     &mut cmd_history,
                     &mut registers,
-                    NavStart::Prompt { text, cursor },
+                    NavStart::Prompt { text, cursor, wheel },
                     &mut term_rows,
                     &mut term_cols,
                     None,
@@ -7168,7 +7168,13 @@ enum PendingView {
 enum NavStart {
     // Ctrl+Space from a live shell prompt, mid-typing `text` with the
     // cursor at `cursor` -- resumable (see `NavExit::Resume`).
-    Prompt { text: String, cursor: usize },
+    //
+    // `wheel` is set instead when a wheel notch is what opened this view
+    // (see editor::ReadOutcome::NormalMode), and that notch scrolls once
+    // the buffer exists -- otherwise the gesture that got you here would
+    // be swallowed, and a wheel that opens a view without moving it is
+    // exactly what "the wheel doesn't work" looks like.
+    Prompt { text: String, cursor: usize, wheel: Option<editor::MouseEvent> },
     // Ctrl+Space detaching a running foreground job -- read-only, same
     // as `Prompt`, but nothing to resume into (this pane's top frame
     // stays `Frame::Job`, not a live prompt, so a caller-side "resume
@@ -7651,13 +7657,20 @@ fn run_normal_mode_navigation(
     // caller regardless (this pane's top frame is `Frame::Job`, not a
     // live prompt), and `Edit` never reaches that code path at all.
     let (initial_text, initial_cursor) = match &start {
-        NavStart::Prompt { text, cursor } => (text.clone(), *cursor),
+        NavStart::Prompt { text, cursor, .. } => (text.clone(), *cursor),
         NavStart::JobDetach | NavStart::Edit(..) => (String::new(), 0),
     };
     let original_chars: Vec<char> = initial_text.chars().collect();
 
+    // The wheel notch that opened this view, if that is what did --
+    // applied once `buf` exists, just below.
+    let entered_by_wheel = match &start {
+        NavStart::Prompt { wheel, .. } => *wheel,
+        NavStart::JobDetach | NavStart::Edit(..) => None,
+    };
+
     let (mut buf, mut vk) = match start {
-        NavStart::Prompt { text, cursor } => {
+        NavStart::Prompt { text, cursor, .. } => {
             // Same reasoning as freeze_idle_prompt's other call sites
             // (splitting, switching pane focus): this session's live
             // prompt has only ever been drawn straight to the real
@@ -7708,6 +7721,17 @@ fn run_normal_mode_navigation(
     // starts out blank), harmless otherwise -- then this pane's own
     // rectangle on top of that with the current view.
     compositor_redraw(sessions, windows, *current_window, *term_rows, *term_cols);
+    // The notch that opened this view scrolls it, before the first frame
+    // is drawn -- so a wheel flick moves the content in one step rather
+    // than spending its first notch silently entering a mode. Same
+    // motion, distance and follow-up as the wheel branch inside the key
+    // loop below, which handles every notch after this one.
+    if let Some(ev) = entered_by_wheel {
+        let motion = if ev.is_scroll_down() { motion::Motion::ScrollLineDown } else { motion::Motion::ScrollLineUp };
+        editor::apply_motion_or_reselect(&mut vk, &mut buf, motion, Some(fileeditor::MOUSE_WHEEL_LINES));
+        let content_cols = nav_content_cols(&buf, rect);
+        nav_scroll_to_show_cursor(&mut buf, content_cols);
+    }
     render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides.as_ref());
     let mut pending_view = PendingView::None;
     // The last left press, for telling a double-click from two separate
@@ -12064,7 +12088,10 @@ fn run_command_mode(
             // the next read_line call's own `initial` keeps that text
             // right where it was -- the same "don't lose in-progress
             // typing" guarantee every other caller of this gets.
-            Ok(ReadOutcome::NormalMode { text, cursor }) => {
+            // `wheel` is ignored for the same reason: a colon line is
+            // already inside the scrollback view, so a notch has no
+            // second view to open.
+            Ok(ReadOutcome::NormalMode { text, cursor, wheel: _ }) => {
                 pending_initial = Some((text, cursor));
             }
             // Same reasoning as NormalMode just above: click-to-focus
