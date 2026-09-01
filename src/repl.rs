@@ -1190,6 +1190,8 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
                     }
                     Some(ClickTarget::Pane(pane_id)) if pane_id != windows[current_window].focused_pane => {
                         freeze_input_with_text(sessions.get_mut(&session_id).unwrap(), &text);
+                        // Going to a pane is how you get a minimized one back.
+                        restore_if_minimized(&mut windows[current_window], pane_id);
                         windows[current_window].focused_pane = pane_id;
                         compositor_redraw(&sessions, &windows, current_window, term_rows, term_cols);
                     }
@@ -3936,6 +3938,9 @@ fn apply_window_action(
         WindowAction::Balance => {
             balance_panes(&mut windows[*current_window].layout);
         }
+        WindowAction::Minimize => {
+            minimize_focused_pane(&mut windows[*current_window]);
+        }
         WindowAction::SizeUp => {
             resize_focused_pane(&mut windows[*current_window], RESIZE_STEP);
         }
@@ -6117,6 +6122,61 @@ fn folded_divider_line(cols: usize, panes: usize) -> String {
 // top pane above-and-to-the-left of it). A no-op if the window isn't
 // split (single leaf) or nothing qualifies (e.g. `left` from the
 // leftmost pane).
+// Shrinks the focused pane to its divider and moves focus off it.
+//
+// The `minimized` state has existed since the diagnostics pane, which
+// drives it through closures of its own; this is the same state made
+// reachable for any pane. `fixed` is cleared alongside it because the
+// two describe the same thing and `minimized` wins -- see SplitChild's
+// own doc comment.
+//
+// Focus has to move: a pane showing one row is not somewhere to type,
+// and leaving the cursor there would send the next keystroke somewhere
+// invisible. It moves to a sibling in the same split, chosen from the
+// layout rather than by geometry -- `focus_pane_direction` answers
+// "which pane lies that way on screen", which is the right question for
+// `<C-w>j` and the wrong one here, where any neighbour will do and the
+// answer must not depend on rows and columns.
+//
+// A pane with no sibling is left alone. There is nowhere for focus to
+// go, and a window showing nothing but a divider is not a state worth
+// being able to reach.
+fn minimize_focused_pane(window: &mut WindowEntry) {
+    let target = window.focused_pane;
+    let Some((_, children, idx)) = find_parent_split_mut(&mut window.layout, target) else {
+        return;
+    };
+    let sibling = if idx + 1 < children.len() { idx + 1 } else { idx.checked_sub(1).unwrap_or(idx) };
+    if sibling == idx {
+        return;
+    }
+    let Some(landing) = first_leaf_of(&children[sibling].layout) else { return };
+    children[idx].minimized = true;
+    children[idx].fixed = None;
+    window.focused_pane = landing;
+}
+
+// The first pane inside a subtree -- where focus lands when it has to
+// leave a pane and the sibling may itself be a split.
+fn first_leaf_of(layout: &PaneLayout) -> Option<PaneId> {
+    match layout {
+        PaneLayout::Leaf(id) => Some(*id),
+        PaneLayout::Split { children, .. } => children.iter().find_map(|c| first_leaf_of(&c.layout)),
+    }
+}
+
+// Brings `pane` back if it was minimized. Called wherever focus lands
+// on a pane deliberately -- a `<C-w>` direction move or a click -- which
+// is what "restoring on activation" means: you get it back by going to
+// it, with no second command to remember.
+fn restore_if_minimized(window: &mut WindowEntry, pane: PaneId) {
+    if let Some((_, children, idx)) = find_parent_split_mut(&mut window.layout, pane)
+        && children[idx].minimized
+    {
+        children[idx].minimized = false;
+    }
+}
+
 fn focus_pane_direction(window: &mut WindowEntry, sessions: &mut HashMap<SessionId, SessionState>, direction: PaneDirection, term_rows: usize, term_cols: usize) {
     let area = Rect { row: 0, col: 0, rows: content_rows(term_rows), cols: term_cols };
     let mut regions = Vec::new();
@@ -6169,6 +6229,8 @@ fn focus_pane_direction(window: &mut WindowEntry, sessions: &mut HashMap<Session
             let old_sid = window.owning_session();
             freeze_idle_prompt(sessions.get_mut(&old_sid).unwrap());
         }
+        // Going to a pane is how you get a minimized one back.
+        restore_if_minimized(window, id);
         window.focused_pane = id;
     }
 }
@@ -7046,6 +7108,7 @@ fn window_cmd_to_action(cmd: WindowCmd) -> WindowAction {
         WindowCmd::FocusUp => WindowAction::FocusPane(PaneDirection::Up),
         WindowCmd::FocusRight => WindowAction::FocusPane(PaneDirection::Right),
         WindowCmd::Balance => WindowAction::Balance,
+        WindowCmd::Minimize => WindowAction::Minimize,
         WindowCmd::GotoFirstWindow | WindowCmd::GotoLastWindow => {
             unreachable!("handled directly in dispatch_window_cmd, never reaches here")
         }
@@ -7957,6 +8020,8 @@ fn run_normal_mode_navigation(
                             let sid = windows[*current_window].owning_session();
                             freeze_idle_prompt(sessions.get_mut(&sid).unwrap());
                         }
+                        // Going to a pane is how you get a minimized one back.
+                        restore_if_minimized(&mut windows[*current_window], pane_id);
                         windows[*current_window].focused_pane = pane_id;
                         compositor_redraw(sessions, windows, *current_window, *term_rows, *term_cols);
                         return Ok((NavExit::Detached, nav_buffer_into_edit_state(buf, vk)));
@@ -12746,6 +12811,8 @@ fn run_command_mode(
                                         children[idx].minimized = false;
                                         children[idx].fixed = Some(rows);
                                     }
+                                    // Going to a pane is how you get a minimized one back.
+                                    restore_if_minimized(&mut windows[current_window], pane_id);
                                     windows[current_window].focused_pane = pane_id;
                                     compositor_redraw(sessions, windows, current_window, *term_rows, *term_cols);
                                     let run_rect = pane_rect(&windows[current_window], pane_id, *term_rows, *term_cols);
@@ -14787,6 +14854,53 @@ mod compositor_frame_output_tests {
     // --promoted`, Enter, then Ctrl-C at the fresh prompt): an explicit
     // clear immediately followed by repainting the *same* content one
     // real terminal can still render as a blank frame in between.
+    #[test]
+    fn minimizing_collapses_the_focused_pane_and_moves_off_it() {
+        // Built directly rather than through a pty: this is layout
+        // arithmetic, and a screen-scrape cannot tell "collapsed to a
+        // divider" from "scrolled out of view".
+        let mut w = WindowEntry::single(1, Frame::Session(0));
+        let top = w.focused_pane;
+        let bottom = top + 1;
+        w.panes.push(Pane { id: bottom, stack: vec![Frame::Session(0)], jumps: JumpList::default() });
+        w.layout = PaneLayout::Split {
+            horizontal: false,
+            children: vec![
+                SplitChild { layout: PaneLayout::Leaf(top), weight: 1.0, fixed: None, minimized: false },
+                SplitChild { layout: PaneLayout::Leaf(bottom), weight: 1.0, fixed: None, minimized: false },
+            ],
+        };
+        w.focused_pane = bottom;
+
+        minimize_focused_pane(&mut w);
+
+        let minimized_of = |w: &WindowEntry, id: PaneId| match &w.layout {
+            PaneLayout::Split { children, .. } => {
+                children.iter().find(|c| matches!(c.layout, PaneLayout::Leaf(l) if l == id)).unwrap().minimized
+            }
+            PaneLayout::Leaf(_) => unreachable!(),
+        };
+        assert!(minimized_of(&w, bottom), "the focused pane collapses");
+        assert!(!minimized_of(&w, top), "its neighbour does not");
+        assert_ne!(w.focused_pane, bottom, "focus leaves it -- one row is nowhere to type");
+
+        // Going back to it is what restores it; there is no second
+        // command to remember.
+        restore_if_minimized(&mut w, bottom);
+        assert!(!minimized_of(&w, bottom));
+    }
+
+    #[test]
+    fn a_lone_pane_will_not_minimize_itself_out_of_view() {
+        // Nowhere for focus to go, and a window showing nothing but a
+        // divider is not a state worth being able to reach.
+        let mut w = WindowEntry::single(1, Frame::Session(0));
+        let only = w.focused_pane;
+        minimize_focused_pane(&mut w);
+        assert_eq!(w.focused_pane, only);
+        assert!(matches!(w.layout, PaneLayout::Leaf(_)), "layout untouched");
+    }
+
     #[test]
     fn the_prompt_only_claims_the_mouse_once_it_has_something_to_do_with_it() {
         // Unpromoted: nothing to hit-test and nowhere to scroll, so

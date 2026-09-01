@@ -514,6 +514,10 @@ pub enum WindowCmd {
     FocusUp,
     FocusRight,
     Balance,
+    /// `<C-w> _` -- shrink this pane to its divider. Focus moves to a
+    /// neighbour, since a pane showing one row is not somewhere to be;
+    /// focusing it again brings it back.
+    Minimize,
     /// `<C-w>gg` / `<C-w>{N}gg`: go to the first tab, or tab N.
     GotoFirstWindow,
     /// `<C-w>G` / `<C-w>{N}G`: go to the last tab, or tab N.
@@ -1956,6 +1960,8 @@ impl VimKeys {
             Key::Char('k') => self.emit_window(WindowCmd::FocusUp),
             Key::Char('l') => self.emit_window(WindowCmd::FocusRight),
             Key::Char('=') => self.emit_window(WindowCmd::Balance),
+            // vim spells "make this pane as small as it goes" the same way.
+            Key::Char('_') => self.emit_window(WindowCmd::Minimize),
             Key::Char('g') => {
                 self.pending = Pending::WindowG;
                 KeyOutcome::Pending
@@ -2210,6 +2216,7 @@ fn describe_window_cmd(cmd: &WindowCmd) -> &'static str {
         WindowCmd::FocusUp => "focus-up",
         WindowCmd::FocusRight => "focus-right",
         WindowCmd::Balance => "balance",
+        WindowCmd::Minimize => "minimize",
         WindowCmd::GotoFirstWindow => "goto-first",
         WindowCmd::GotoLastWindow => "goto-last",
     }

@@ -798,6 +798,12 @@ pub enum WindowAction {
     Next,
     Previous,
     Close,
+    /// `::bish window minimize`/`_`, and `<C-w> _`. Shrinks the focused
+    /// pane to just its divider and moves focus to a neighbour --
+    /// focusing it again restores it. The underlying `minimized` state
+    /// already existed for the diagnostics pane; this is what lets any
+    /// pane use it.
+    Minimize,
     // `window fg <window-id>`: push the target window's current top
     // frame onto *this* window's stack too -- vim-like "the same
     // session shown in multiple windows" (see WindowEntry::stack's doc
@@ -5059,6 +5065,7 @@ impl Shell {
             Some("k") | Some("above") => ExecResult::Window(WindowAction::FocusPane(PaneDirection::Up)),
             Some("l") | Some("right") => ExecResult::Window(WindowAction::FocusPane(PaneDirection::Right)),
             Some("=") | Some("balance") => ExecResult::Window(WindowAction::Balance),
+            Some("_") | Some("minimize") => ExecResult::Window(WindowAction::Minimize),
             Some("+") | Some("sizeup") => ExecResult::Window(WindowAction::SizeUp),
             Some("-") | Some("sizedown") => ExecResult::Window(WindowAction::SizeDown),
             Some("size") => match args.get(1).and_then(|a| parse_size_spec(a)) {
@@ -5082,7 +5089,7 @@ impl Shell {
             None => {
                 sh_eprintln!(
                     self,
-                    "bish: window: missing subcommand (next(n)/previous/new(c,create)/close(q,quit)/split(s)/vsplit(v)/h(left)/j(below)/k(above)/l(right)/=(balance)/+(sizeup)/-(sizedown)/size <N|N%,N/M>/fg <id>)"
+                    "bish: window: missing subcommand (next(n)/previous/new(c,create)/close(q,quit)/split(s)/vsplit(v)/h(left)/j(below)/k(above)/l(right)/=(balance)/_(minimize)/+(sizeup)/-(sizedown)/size <N|N%,N/M>/fg <id>)"
                 );
                 ExecResult::Status(2)
             }
