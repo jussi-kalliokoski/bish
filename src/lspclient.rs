@@ -230,6 +230,12 @@ pub struct Server {
     // that it could not load a project, which is the difference between
     // "nothing works and I don't know why" and knowing.
     shown: VecDeque<String>,
+    // What this server should be told its configuration is, already
+    // nested (see `settings_tree`). `Value::Object(vec![])` for a
+    // server with no `--setting` of its own, which is the ordinary
+    // case and means "nothing set, use your defaults" everywhere it is
+    // read.
+    settings: Value,
 
     state: State,
     // Responses to requests bish made, waiting to be collected.
@@ -313,6 +319,82 @@ impl ApplyEdits {
 /// rather than unbounded memory.
 const MAX_PENDING_APPLIES: usize = 8;
 
+/// Builds the configuration object a server should be told about, from
+/// the flat `dotted.key=value` pairs `::bish lsp add --setting` took.
+///
+/// `rust-analyzer.check.command=clippy` becomes
+/// `{"rust-analyzer":{"check":{"command":"clippy"}}}` -- which is the
+/// shape both `workspace/configuration` and `didChangeConfiguration`
+/// are defined in terms of, and not a shape anyone should have to type
+/// through two levels of shell quoting.
+///
+/// A value is JSON when it parses as JSON and a string otherwise, so
+/// `enable=true` is a boolean, `procMacro.attributes=["a"]` is an
+/// array, and `path=/usr/bin/foo` is a string without ceremony. The
+/// fallback is deliberate: far more settings are strings than are
+/// anything else, and a bare word is not valid JSON.
+///
+/// Two keys where one is a prefix of the other describe incompatible
+/// shapes -- `a` cannot be both a number and an object -- so the later
+/// one wins, exactly as a repeated key does. Nothing is dropped
+/// silently and the rule is the same one either way: the last thing you
+/// said is what you meant.
+pub fn settings_tree(pairs: &[(String, String)]) -> Value {
+    let mut root = Value::Object(Vec::new());
+    for (key, raw) in pairs {
+        let value = json::parse(raw).unwrap_or_else(|_| Value::Str(raw.clone()));
+        let path: Vec<&str> = key.split('.').filter(|p| !p.is_empty()).collect();
+        if path.is_empty() {
+            continue;
+        }
+        insert_at(&mut root, &path, value);
+    }
+    root
+}
+
+// The subtree a `workspace/configuration` item's `section` names, or
+// `Null` for one nothing was set for -- which is the protocol's own way
+// of saying "nothing set, use your defaults".
+//
+// Walked here rather than handed to `json::query`, whose path syntax
+// accepts only alphanumerics and `_` in a dotted field name: the single
+// most common section name in the wild is `rust-analyzer`, and it would
+// stop at the hyphen and silently answer `null` for everything.
+fn section_of(settings: &Value, section: &str) -> Value {
+    let mut node = settings;
+    for part in section.split('.').filter(|p| !p.is_empty()) {
+        let Value::Object(fields) = node else { return Value::Null };
+        match fields.iter().find(|(name, _)| name == part) {
+            Some((_, value)) => node = value,
+            None => return Value::Null,
+        }
+    }
+    node.clone()
+}
+
+// Walks `path`, creating the objects it names, and puts `value` at the
+// end of it.
+fn insert_at(node: &mut Value, path: &[&str], value: Value) {
+    let Value::Object(fields) = node else {
+        // A leaf where an object is needed. The later key wins (see
+        // `settings_tree`), so this becomes an object and the scalar
+        // that was here goes.
+        *node = Value::Object(Vec::new());
+        return insert_at(node, path, value);
+    };
+    let [head, tail @ ..] = path else { return };
+    if tail.is_empty() {
+        fields.retain(|(name, _)| name != head);
+        fields.push(((*head).to_string(), value));
+        return;
+    }
+    if !fields.iter().any(|(name, _)| name == head) {
+        fields.push(((*head).to_string(), Value::Object(Vec::new())));
+    }
+    let slot = fields.iter_mut().find(|(name, _)| name == head).expect("just ensured");
+    insert_at(&mut slot.1, tail, value);
+}
+
 /// The most concurrent `$/progress` operations tracked at once.
 ///
 /// Only the newest is ever displayed, so this is a memory bound rather
@@ -360,7 +442,7 @@ impl Server {
     /// soon as the process exists -- the handshake completes later, in
     /// `service`, which is why the returned server starts out
     /// `Initializing` rather than usable.
-    pub fn start(id: u64, command: &[String], display: &str, root: &Path, apply_edits: ApplyEdits) -> Result<Server, String> {
+    pub fn start(id: u64, command: &[String], display: &str, root: &Path, apply_edits: ApplyEdits, settings: Value) -> Result<Server, String> {
         let Some((program, args)) = command.split_first() else {
             return Err("no command to run".to_string());
         };
@@ -402,6 +484,7 @@ impl Server {
             stderr_partial: String::new(),
             progress: Vec::new(),
             shown: VecDeque::new(),
+            settings,
             state: State::Initializing,
             responses: Vec::new(),
             stdout_eof: false,
@@ -701,6 +784,17 @@ impl Server {
                         // needed it anyway. Under `never` the honest
                         // claim is that bish cannot do this.
                         ("applyEdit".to_string(), Value::Bool(self.apply_edits != ApplyEdits::Never)),
+                        // Claimed so a server knows a push is coming
+                        // and does not have to poll for what it was
+                        // already told -- see the `didChangeConfiguration`
+                        // sent right after `initialized`.
+                        (
+                            "didChangeConfiguration".to_string(),
+                            Value::Object(vec![("dynamicRegistration".to_string(), Value::Bool(false))]),
+                        ),
+                        // "What are this client's settings for these
+                        // sections?" -- answered from the same place.
+                        ("configuration".to_string(), Value::Bool(true)),
                         // The other half of a command-style code
                         // action: the action names a command, and this
                         // is how it gets run.
@@ -824,10 +918,32 @@ impl Server {
                         self.sync = Sync::parse(&self.capabilities);
                         self.state = State::Ready;
                         self.send_now(Message::Notification { method: "initialized".to_string(), params: Value::Object(Vec::new()) });
+                        // Immediately after `initialized`, and only for
+                        // a server that was actually given settings.
+                        //
+                        // Both halves are needed and neither is
+                        // redundant: `workspace/configuration` is a
+                        // *pull*, answered whenever the server gets
+                        // round to asking, and some servers never do;
+                        // this is the push, and it is what makes a
+                        // setting take effect at startup rather than
+                        // whenever the server happens to be curious.
+                        if !matches!(&self.settings, Value::Object(fields) if fields.is_empty()) {
+                            let params = Value::Object(vec![("settings".to_string(), self.settings.clone())]);
+                            self.send_now(Message::Notification { method: "workspace/didChangeConfiguration".to_string(), params });
+                        }
                         for message in std::mem::take(&mut self.queued) {
                             self.send_now(message);
                         }
                         self.note(format!("ready, position encoding {}", self.encoding.wire_name()));
+                        // In the log rather than in `ls`, which is
+                        // tab-separated for scripts and whose columns
+                        // are not mine to move. This is the one place a
+                        // setting that did not take effect can be
+                        // checked against what was actually sent.
+                        if !matches!(&self.settings, Value::Object(fields) if fields.is_empty()) {
+                            self.note(format!("configuration: {}", json::compact_print(&self.settings)));
+                        }
                     }
                 }
                 None
@@ -947,11 +1063,24 @@ impl Server {
             // method", which makes servers log errors and sometimes
             // disable features outright.
             "workspace/configuration" => {
-                let count = match json::query(params, ".items") {
-                    Ok(Value::Array(items)) => items.len(),
-                    _ => 0,
+                let Ok(Value::Array(items)) = json::query(params, ".items") else {
+                    return (Ok(Value::Array(Vec::new())), None);
                 };
-                (Ok(Value::Array(vec![Value::Null; count])), None)
+                // One answer per item, in order -- the reply is matched
+                // to the request positionally, so a short array is a
+                // protocol error rather than a partial answer.
+                let answers = items
+                    .iter()
+                    .map(|item| match json::query(item, ".section") {
+                        // A section names a path into the settings, the
+                        // same dotted form `--setting` takes.
+                        Ok(Value::Str(section)) => section_of(&self.settings, section),
+                        // No section at all means "everything you have
+                        // for me".
+                        _ => self.settings.clone(),
+                    })
+                    .collect();
+                (Ok(Value::Array(answers)), None)
             }
             // "May I report progress?" Yes -- the progress
             // notifications that follow are ignored, which costs
@@ -1639,14 +1768,22 @@ impl Table {
     /// either -- retrying would turn one typo into a spawn attempt per
     /// keystroke's worth of navigation. A server that started and then
     /// died is likewise left dead, for the same reason.
-    pub fn get_or_start(&mut self, id: u64, command: &[String], display: &str, root: &Path, apply_edits: ApplyEdits) -> Result<&mut Server, String> {
+    pub fn get_or_start(
+        &mut self,
+        id: u64,
+        command: &[String],
+        display: &str,
+        root: &Path,
+        apply_edits: ApplyEdits,
+        settings: Value,
+    ) -> Result<&mut Server, String> {
         if let Some(index) = self.servers.iter().position(|s| s.command == display && s.root == root) {
             return Ok(&mut self.servers[index]);
         }
         if let Some(failure) = self.failures.iter().find(|f| f.command == display && f.root == root) {
             return Err(failure.why.clone());
         }
-        match Server::start(id, command, display, root, apply_edits) {
+        match Server::start(id, command, display, root, apply_edits, settings) {
             Ok(server) => {
                 self.servers.push(server);
                 Ok(self.servers.last_mut().expect("just pushed"))
@@ -1942,15 +2079,15 @@ mod tests {
         let command = vec!["cat".to_string()];
         let mut table = Table::default();
 
-        let first = table.get_or_start(1, &command, "cat", &dir, ApplyEdits::default()).map(|s| s.root.clone()).unwrap();
+        let first = table.get_or_start(1, &command, "cat", &dir, ApplyEdits::default(), Value::Object(Vec::new())).map(|s| s.root.clone()).unwrap();
         assert_eq!(table.servers().len(), 1);
         // Same command, same root: the existing one, which is the whole
         // point -- every pane editing a project shares its server.
-        table.get_or_start(1, &command, "cat", &dir, ApplyEdits::default()).unwrap();
+        table.get_or_start(1, &command, "cat", &dir, ApplyEdits::default(), Value::Object(Vec::new())).unwrap();
         assert_eq!(table.servers().len(), 1);
         // Same command, different root: a second server, because a
         // server is scoped to the project it was told about.
-        table.get_or_start(1, &command, "cat", &other, ApplyEdits::default()).unwrap();
+        table.get_or_start(1, &command, "cat", &other, ApplyEdits::default(), Value::Object(Vec::new())).unwrap();
         assert_eq!(table.servers().len(), 2);
         assert_eq!(first, dir);
         std::fs::remove_dir_all(&dir).ok();
@@ -1964,7 +2101,7 @@ mod tests {
         let command = vec!["bish-no-such-language-server".to_string()];
         let mut table = Table::default();
         for _ in 0..5 {
-            assert!(table.get_or_start(7, &command, "nope", &dir, ApplyEdits::default()).is_err());
+            assert!(table.get_or_start(7, &command, "nope", &dir, ApplyEdits::default(), Value::Object(Vec::new())).is_err());
         }
         assert!(table.servers().is_empty());
         assert_eq!(table.failures().len(), 1, "one record, however many times it was asked for");
@@ -1979,7 +2116,7 @@ mod tests {
     #[test]
     fn a_server_request_gets_the_answer_a_client_with_nothing_to_offer_should_give() {
         let dir = temp_dir("answer");
-        let server = Server::start(1, &mock_server(FULL_SYNC), "mock", &dir, ApplyEdits::default()).unwrap();
+        let server = Server::start(1, &mock_server(FULL_SYNC), "mock", &dir, ApplyEdits::default(), Value::Object(Vec::new())).unwrap();
 
         // Settings for three sections, none configured: one `null`
         // each, meaning "use your defaults". MethodNotFound here makes
@@ -2145,7 +2282,7 @@ mod tests {
     fn a_server_that_asked_for_incremental_sync_gets_ranges() {
         let dir = temp_dir("incremental");
         let capabilities = r#"{"capabilities":{"positionEncoding":"utf-32","textDocumentSync":{"openClose":true,"change":2,"save":false}}}"#;
-        let mut server = Server::start(1, &echo_server(capabilities), "mock", &dir, ApplyEdits::default()).unwrap();
+        let mut server = Server::start(1, &echo_server(capabilities), "mock", &dir, ApplyEdits::default(), Value::Object(Vec::new())).unwrap();
         run_until_ready(&mut server);
         assert!(server.sync().incremental);
         server.open_document("file:///p/x.sh", "shellscript", 1, "one\ntwo\nthree\n");
@@ -2168,7 +2305,7 @@ mod tests {
     #[test]
     fn a_full_sync_server_still_gets_whole_files() {
         let dir = temp_dir("full-sync");
-        let mut server = Server::start(1, &echo_server(FULL_SYNC), "mock", &dir, ApplyEdits::default()).unwrap();
+        let mut server = Server::start(1, &echo_server(FULL_SYNC), "mock", &dir, ApplyEdits::default(), Value::Object(Vec::new())).unwrap();
         run_until_ready(&mut server);
         assert!(!server.sync().incremental);
         server.open_document("file:///p/x.sh", "shellscript", 1, "one\ntwo\n");
@@ -2206,7 +2343,7 @@ mod tests {
 
         // scoped, with nothing of the user's running: refused, and the
         // log says which of the two refusals it was.
-        let mut server = Server::start(1, &mock_server(FULL_SYNC), "mock", &dir, ApplyEdits::Scoped).unwrap();
+        let mut server = Server::start(1, &mock_server(FULL_SYNC), "mock", &dir, ApplyEdits::Scoped, Value::Object(Vec::new())).unwrap();
         run_until_ready(&mut server);
         assert!(!server.may_apply());
         let (answer, note) = server.answer("workspace/applyEdit", &Value::Null);
@@ -2238,17 +2375,161 @@ mod tests {
         let dir = temp_dir("apply-ends");
         let request = Message::Request { id: Id::Number(1), method: "workspace/applyEdit".to_string(), params: Value::Null };
 
-        let mut never = Server::start(1, &mock_server(FULL_SYNC), "mock", &dir, ApplyEdits::Never).unwrap();
+        let mut never = Server::start(1, &mock_server(FULL_SYNC), "mock", &dir, ApplyEdits::Never, Value::Object(Vec::new())).unwrap();
         run_until_ready(&mut never);
         never.execute_command(Value::Null);
         assert!(!never.may_apply(), "a command of the user's own does not unlock `never`");
         assert!(never.answer("workspace/applyEdit", &Value::Null).1.unwrap().contains("never"));
 
-        let mut always = Server::start(2, &mock_server(FULL_SYNC), "mock", &dir, ApplyEdits::Always).unwrap();
+        let mut always = Server::start(2, &mock_server(FULL_SYNC), "mock", &dir, ApplyEdits::Always, Value::Object(Vec::new())).unwrap();
         run_until_ready(&mut always);
         assert!(always.may_apply(), "no command needed");
         assert!(always.handle(request).is_none());
         assert!(always.take_apply_edit().is_some());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // Keeps servicing for long enough that everything queued has been
+    // written and echoed back into the fixture's log.
+    fn drain(server: &mut Server) {
+        for _ in 0..100 {
+            server.service();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    fn pairs(items: &[(&str, &str)]) -> Vec<(String, String)> {
+        items.iter().map(|(k, v)| ((*k).to_string(), (*v).to_string())).collect()
+    }
+
+    fn tree(items: &[(&str, &str)]) -> String {
+        json::compact_print(&settings_tree(&pairs(items)))
+    }
+
+    #[test]
+    fn dotted_keys_become_the_nested_object_a_server_expects() {
+        assert_eq!(
+            tree(&[("rust-analyzer.check.command", "clippy")]),
+            r#"{"rust-analyzer":{"check":{"command":"clippy"}}}"#
+        );
+        // Two keys sharing a prefix share the objects along it rather
+        // than each rebuilding their own.
+        assert_eq!(
+            tree(&[("a.b", "1"), ("a.c", "2")]),
+            r#"{"a":{"b":1,"c":2}}"#
+        );
+    }
+
+    #[test]
+    fn a_value_is_json_when_it_is_json_and_a_string_when_it_is_not() {
+        // The distinction that matters: `true` the boolean is not
+        // `"true"` the string, and a server told the wrong one either
+        // ignores the setting or rejects it.
+        assert_eq!(tree(&[("x.enable", "true")]), r#"{"x":{"enable":true}}"#);
+        assert_eq!(tree(&[("x.count", "3")]), r#"{"x":{"count":3}}"#);
+        assert_eq!(tree(&[("x.tags", r#"["a","b"]"#)]), r#"{"x":{"tags":["a","b"]}}"#);
+        // A bare word is not valid JSON, and far more settings are
+        // strings than are anything else.
+        assert_eq!(tree(&[("x.path", "/usr/bin/foo")]), r#"{"x":{"path":"/usr/bin/foo"}}"#);
+        assert_eq!(tree(&[("x.name", "clippy")]), r#"{"x":{"name":"clippy"}}"#);
+    }
+
+    // `a` cannot be both a number and an object, so one of the two has
+    // to go. The rule is the same one a repeated key already follows.
+    #[test]
+    fn a_key_that_contradicts_an_earlier_one_replaces_it() {
+        assert_eq!(tree(&[("a", "1"), ("a.b", "2")]), r#"{"a":{"b":2}}"#, "the object replaces the scalar");
+        assert_eq!(tree(&[("a.b", "2"), ("a", "1")]), r#"{"a":1}"#, "and the scalar replaces the object");
+        // The plain repeated-key case, for the same reason.
+        assert_eq!(tree(&[("a.b", "1"), ("a.b", "2")]), r#"{"a":{"b":2}}"#);
+    }
+
+    #[test]
+    fn no_settings_is_an_empty_object_not_a_null() {
+        // Empty is what "nothing set, use your defaults" looks like
+        // everywhere this is read, and it is also what suppresses the
+        // `didChangeConfiguration` push.
+        assert_eq!(tree(&[]), "{}");
+    }
+
+    // The pull half. A server asks for the sections it cares about and
+    // gets one answer per item, in order -- a short array would be a
+    // protocol error, not a partial answer.
+    #[test]
+    fn workspace_configuration_is_answered_from_the_settings_it_was_given() {
+        let dir = temp_dir("configuration");
+        let settings = settings_tree(&pairs(&[("rust-analyzer.check.command", "clippy"), ("other.thing", "1")]));
+        let server = Server::start(1, &mock_server(FULL_SYNC), "mock", &dir, ApplyEdits::default(), settings).unwrap();
+        let request = |sections: &[&str]| {
+            let items = sections
+                .iter()
+                .map(|s| Value::Object(vec![("section".to_string(), Value::Str((*s).to_string()))]))
+                .collect();
+            Value::Object(vec![("items".to_string(), Value::Array(items))])
+        };
+
+        let (answer, _) = server.answer("workspace/configuration", &request(&["rust-analyzer.check"]));
+        assert_eq!(json::compact_print(&answer.unwrap()), r#"[{"command":"clippy"}]"#);
+
+        // One answer per item, in the order asked, with `null` for a
+        // section nothing was set for -- which is "use your defaults",
+        // and is what this used to answer for every item.
+        let (answer, _) = server.answer("workspace/configuration", &request(&["nothing.here", "other.thing"]));
+        assert_eq!(json::compact_print(&answer.unwrap()), r#"[null,1]"#);
+
+        // An item with no section at all means "everything".
+        let all = Value::Object(vec![("items".to_string(), Value::Array(vec![Value::Object(Vec::new())]))]);
+        let (answer, _) = server.answer("workspace/configuration", &all);
+        assert!(json::compact_print(&answer.unwrap()).contains("rust-analyzer"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // The push half. `workspace/configuration` is answered whenever the
+    // server gets round to asking, and some never do.
+    #[test]
+    fn settings_are_pushed_once_the_handshake_finishes_and_only_when_there_are_any() {
+        let dir = temp_dir("didchangeconfig");
+        let log = dir.join("received.jsonl");
+        let settings = settings_tree(&pairs(&[("mock.enable", "true")]));
+        let mut server = Server::start(1, &scripted_server(&dir, &log), "mock", &dir, ApplyEdits::default(), settings).unwrap();
+        run_until_ready(&mut server);
+        // `run_until_ready` stops the moment the state flips, which is
+        // before what that flip queued has been written to a
+        // non-blocking pipe, let alone read at the other end.
+        drain(&mut server);
+        let methods: Vec<String> = received(&log)
+            .iter()
+            .filter_map(|m| match m {
+                Message::Request { method, .. } | Message::Notification { method, .. } => Some(method.clone()),
+                _ => None,
+            })
+            .collect();
+        let at = methods.iter().position(|m| m == "workspace/didChangeConfiguration");
+        assert!(at.is_some(), "expected a push, got {methods:?}");
+        // After `initialized`, never before: nothing but `initialize`
+        // may precede it.
+        assert!(at > methods.iter().position(|m| m == "initialized"), "{methods:?}");
+
+        let sent = received(&log).into_iter().find_map(|m| match m {
+            Message::Notification { method, params } if method == "workspace/didChangeConfiguration" => Some(params),
+            _ => None,
+        });
+        assert_eq!(json::query(&sent.unwrap(), ".settings.mock.enable"), Ok(&Value::Bool(true)));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_server_with_no_settings_is_not_pushed_an_empty_configuration() {
+        let dir = temp_dir("noconfig");
+        let log = dir.join("received.jsonl");
+        let mut server =
+            Server::start(1, &scripted_server(&dir, &log), "mock", &dir, ApplyEdits::default(), Value::Object(Vec::new())).unwrap();
+        run_until_ready(&mut server);
+        drain(&mut server);
+        assert!(
+            !received(&log).iter().any(|m| matches!(m, Message::Notification { method, .. } if method == "workspace/didChangeConfiguration")),
+            "nothing to say is not the same as saying nothing"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -2258,7 +2539,7 @@ mod tests {
     #[test]
     fn a_show_message_reaches_the_user_and_a_log_message_only_the_log() {
         let dir = temp_dir("show-message");
-        let mut server = Server::start(1, &mock_server(FULL_SYNC), "mock", &dir, ApplyEdits::default()).unwrap();
+        let mut server = Server::start(1, &mock_server(FULL_SYNC), "mock", &dir, ApplyEdits::default(), Value::Object(Vec::new())).unwrap();
         run_until_ready(&mut server);
         let notify = |method: &str, kind: f64, text: &str| Message::Notification {
             method: method.to_string(),
@@ -2289,7 +2570,7 @@ mod tests {
     #[test]
     fn unread_shown_messages_are_bounded() {
         let dir = temp_dir("show-bounded");
-        let mut server = Server::start(1, &mock_server(FULL_SYNC), "mock", &dir, ApplyEdits::default()).unwrap();
+        let mut server = Server::start(1, &mock_server(FULL_SYNC), "mock", &dir, ApplyEdits::default(), Value::Object(Vec::new())).unwrap();
         run_until_ready(&mut server);
         for n in 0..MAX_SHOWN * 3 {
             server.handle(Message::Notification {
@@ -2312,7 +2593,7 @@ mod tests {
     fn the_declared_apply_edit_capability_follows_the_policy() {
         let dir = temp_dir("apply-declared");
         for (policy, declared) in [(ApplyEdits::Scoped, true), (ApplyEdits::Always, true), (ApplyEdits::Never, false)] {
-            let server = Server::start(1, &mock_server(FULL_SYNC), "mock", &dir, policy).unwrap();
+            let server = Server::start(1, &mock_server(FULL_SYNC), "mock", &dir, policy, Value::Object(Vec::new())).unwrap();
             let params = server.initialize_params();
             assert_eq!(json::query(&params, ".capabilities.workspace.applyEdit"), Ok(&Value::Bool(declared)), "{policy:?}");
             // Claimed unconditionally: running a command is what an
@@ -2329,7 +2610,7 @@ mod tests {
     #[test]
     fn snippet_support_is_declared_so_servers_actually_send_snippets() {
         let dir = temp_dir("snippet-cap");
-        let server = Server::start(1, &mock_server(FULL_SYNC), "mock", &dir, ApplyEdits::default()).unwrap();
+        let server = Server::start(1, &mock_server(FULL_SYNC), "mock", &dir, ApplyEdits::default(), Value::Object(Vec::new())).unwrap();
         let params = server.initialize_params();
         assert_eq!(json::query(&params, ".capabilities.textDocument.completion.completionItem.snippetSupport"), Ok(&Value::Bool(true)));
         std::fs::remove_dir_all(&dir).ok();
@@ -2341,7 +2622,7 @@ mod tests {
     fn edits_still_parked_when_a_command_ends_are_refused_not_dropped() {
         let dir = temp_dir("apply-leftover");
         let log = dir.join("leftover.log");
-        let mut server = Server::start(1, &scripted_server(&dir, &log), "mock", &dir, ApplyEdits::Always).unwrap();
+        let mut server = Server::start(1, &scripted_server(&dir, &log), "mock", &dir, ApplyEdits::Always, Value::Object(Vec::new())).unwrap();
         run_until_ready(&mut server);
         for id in 1..=3 {
             server.handle(Message::Request { id: Id::Number(id), method: "workspace/applyEdit".to_string(), params: Value::Null });
@@ -2368,7 +2649,7 @@ mod tests {
     #[test]
     fn parked_edits_are_capped() {
         let dir = temp_dir("apply-cap");
-        let mut server = Server::start(1, &mock_server(FULL_SYNC), "mock", &dir, ApplyEdits::Always).unwrap();
+        let mut server = Server::start(1, &mock_server(FULL_SYNC), "mock", &dir, ApplyEdits::Always, Value::Object(Vec::new())).unwrap();
         run_until_ready(&mut server);
         for id in 0..(MAX_PENDING_APPLIES as i64 + 5) {
             server.handle(Message::Request { id: Id::Number(id), method: "workspace/applyEdit".to_string(), params: Value::Null });
@@ -2386,7 +2667,7 @@ mod tests {
     #[test]
     fn a_server_that_stops_reading_its_input_is_declared_broken_not_queued_forever() {
         let dir = temp_dir("wedged");
-        let mut server = Server::start(1, &mock_server(FULL_SYNC), "mock", &dir, ApplyEdits::default()).unwrap();
+        let mut server = Server::start(1, &mock_server(FULL_SYNC), "mock", &dir, ApplyEdits::default(), Value::Object(Vec::new())).unwrap();
         run_until_ready(&mut server);
         server.open_document("file:///p/x.sh", "shellscript", 1, "x");
         let big = "x".repeat(1024 * 1024);
@@ -2410,7 +2691,7 @@ mod tests {
     fn a_publication_can_be_asked_for_again_after_something_cleared_it() {
         let dir = temp_dir("redeliver");
         let uri = "file:///p/x.sh";
-        let mut server = Server::start(1, &publishing_server(uri), "mock", &dir, ApplyEdits::default()).unwrap();
+        let mut server = Server::start(1, &publishing_server(uri), "mock", &dir, ApplyEdits::default(), Value::Object(Vec::new())).unwrap();
         run_until_ready(&mut server);
         server.open_document(uri, "shellscript", 1, "one");
         for _ in 0..400 {
@@ -2434,8 +2715,8 @@ mod tests {
         use crate::exec::ServiceTable;
         let dir = temp_dir("forget");
         let mut table = Table::default();
-        table.get_or_start(1, &["cat".to_string()], "cat", &dir, ApplyEdits::default()).unwrap();
-        assert!(table.get_or_start(2, &["bish-no-such-server".to_string()], "nope", &dir, ApplyEdits::default()).is_err());
+        table.get_or_start(1, &["cat".to_string()], "cat", &dir, ApplyEdits::default(), Value::Object(Vec::new())).unwrap();
+        assert!(table.get_or_start(2, &["bish-no-such-server".to_string()], "nope", &dir, ApplyEdits::default(), Value::Object(Vec::new())).is_err());
         assert_eq!(table.rows().len(), 2, "one running, one that never started");
         // The failure's reason is what `::bish lsp log` shows for a
         // server that produced no process to have a log of its own.
@@ -2445,7 +2726,7 @@ mod tests {
         assert_eq!(table.rows().len(), 1);
         // ...and now it will be tried again rather than refused from
         // the remembered failure.
-        assert!(table.get_or_start(2, &["bish-no-such-server".to_string()], "nope", &dir, ApplyEdits::default()).is_err());
+        assert!(table.get_or_start(2, &["bish-no-such-server".to_string()], "nope", &dir, ApplyEdits::default(), Value::Object(Vec::new())).is_err());
         assert_eq!(table.forget(1), 1);
         assert_eq!(table.forget(99), 0);
         std::fs::remove_dir_all(&dir).ok();
@@ -2546,7 +2827,7 @@ mod tests {
     const FULL_SYNC: &str = r#"{"capabilities":{"positionEncoding":"utf-32","textDocumentSync":{"openClose":true,"change":1,"save":true}}}"#;
 
     fn ready_echo_server(dir: &Path) -> Server {
-        let mut server = Server::start(1, &echo_server(FULL_SYNC), "mock", dir, ApplyEdits::default()).unwrap();
+        let mut server = Server::start(1, &echo_server(FULL_SYNC), "mock", dir, ApplyEdits::default(), Value::Object(Vec::new())).unwrap();
         run_until_ready(&mut server);
         assert_eq!(*server.state(), State::Ready, "log: {:?}", server.log().collect::<Vec<_>>());
         server
@@ -2785,7 +3066,7 @@ mod tests {
     fn a_request_is_answered_and_the_reply_is_matched_to_its_own_id() {
         let dir = temp_dir("request");
         let log = dir.join("received.jsonl");
-        let mut server = Server::start(1, &scripted_server(&dir, &log), "mock", &dir, ApplyEdits::default()).unwrap();
+        let mut server = Server::start(1, &scripted_server(&dir, &log), "mock", &dir, ApplyEdits::default(), Value::Object(Vec::new())).unwrap();
         run_until_ready(&mut server);
         assert_eq!(*server.state(), State::Ready, "log: {:?}", server.log().collect::<Vec<_>>());
         // Capabilities the fixture declares, and one it doesn't --
@@ -2843,7 +3124,7 @@ mod tests {
     fn uncollected_replies_are_bounded() {
         let dir = temp_dir("bounded");
         let log = dir.join("received.jsonl");
-        let mut server = Server::start(1, &scripted_server(&dir, &log), "mock", &dir, ApplyEdits::default()).unwrap();
+        let mut server = Server::start(1, &scripted_server(&dir, &log), "mock", &dir, ApplyEdits::default(), Value::Object(Vec::new())).unwrap();
         run_until_ready(&mut server);
         server.open_document("file:///p/x.sh", "shellscript", 1, "echo hi");
         let position = Value::Object(vec![
@@ -2870,7 +3151,7 @@ mod tests {
     fn a_publication_waits_for_whoever_holds_the_buffer_and_is_delivered_once() {
         let dir = temp_dir("publish");
         let uri = "file:///p/x.sh";
-        let mut server = Server::start(1, &publishing_server(uri), "mock", &dir, ApplyEdits::default()).unwrap();
+        let mut server = Server::start(1, &publishing_server(uri), "mock", &dir, ApplyEdits::default(), Value::Object(Vec::new())).unwrap();
         run_until_ready(&mut server);
         server.open_document(uri, "shellscript", 1, "one");
 
@@ -2890,7 +3171,7 @@ mod tests {
     #[test]
     fn a_publication_for_an_unknown_document_is_dropped() {
         let dir = temp_dir("unknown");
-        let mut server = Server::start(1, &publishing_server("file:///p/never-opened.sh"), "mock", &dir, ApplyEdits::default()).unwrap();
+        let mut server = Server::start(1, &publishing_server("file:///p/never-opened.sh"), "mock", &dir, ApplyEdits::default(), Value::Object(Vec::new())).unwrap();
         run_until_ready(&mut server);
         server.open_document("file:///p/x.sh", "shellscript", 1, "one");
         for _ in 0..200 {
@@ -2907,7 +3188,7 @@ mod tests {
     fn a_server_that_wants_no_documents_is_told_about_none() {
         let dir = temp_dir("nosync");
         let capabilities = r#"{"capabilities":{"textDocumentSync":{"openClose":false,"change":0,"save":false}}}"#;
-        let mut server = Server::start(1, &echo_server(capabilities), "mock", &dir, ApplyEdits::default()).unwrap();
+        let mut server = Server::start(1, &echo_server(capabilities), "mock", &dir, ApplyEdits::default(), Value::Object(Vec::new())).unwrap();
         run_until_ready(&mut server);
         assert_eq!(server.sync(), Sync { open_close: false, change: false, incremental: false, save: false });
 
@@ -2955,7 +3236,7 @@ mod tests {
     fn the_handshake_completes_and_agrees_on_the_encoding_the_server_named() {
         let dir = temp_dir("ready");
         let command = mock_server(r#"{"capabilities":{"positionEncoding":"utf-32","hoverProvider":true}}"#);
-        let mut server = Server::start(1, &command, "mock", &dir, ApplyEdits::default()).unwrap();
+        let mut server = Server::start(1, &command, "mock", &dir, ApplyEdits::default(), Value::Object(Vec::new())).unwrap();
         run_until_ready(&mut server);
         assert_eq!(*server.state(), State::Ready, "log: {:?}", server.log().collect::<Vec<_>>());
         // utf-32 is bish's own column counting, so agreeing on it is the
@@ -2973,7 +3254,7 @@ mod tests {
     #[test]
     fn a_server_that_names_no_encoding_is_assumed_to_mean_utf16() {
         let dir = temp_dir("utf16");
-        let mut server = Server::start(1, &mock_server(r#"{"capabilities":{}}"#), "mock", &dir, ApplyEdits::default()).unwrap();
+        let mut server = Server::start(1, &mock_server(r#"{"capabilities":{}}"#), "mock", &dir, ApplyEdits::default(), Value::Object(Vec::new())).unwrap();
         run_until_ready(&mut server);
         assert_eq!(*server.state(), State::Ready, "log: {:?}", server.log().collect::<Vec<_>>());
         assert_eq!(server.encoding(), PositionEncoding::Utf16);
@@ -2983,7 +3264,7 @@ mod tests {
     #[test]
     fn work_queued_during_the_handshake_goes_out_once_it_finishes() {
         let dir = temp_dir("release");
-        let mut server = Server::start(1, &mock_server(r#"{"capabilities":{}}"#), "mock", &dir, ApplyEdits::default()).unwrap();
+        let mut server = Server::start(1, &mock_server(r#"{"capabilities":{}}"#), "mock", &dir, ApplyEdits::default(), Value::Object(Vec::new())).unwrap();
         server.request("textDocument/hover", Value::Null);
         assert_eq!(server.queued.len(), 1);
         run_until_ready(&mut server);
@@ -3002,7 +3283,7 @@ mod tests {
         let dir = temp_dir("refused");
         let body = r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"unsupported client"}}"#;
         let script = format!("printf 'Content-Length: %d\\r\\n\\r\\n%s' {} '{body}'; sleep 30", body.len());
-        let mut server = Server::start(1, &["sh".to_string(), "-c".to_string(), script], "mock", &dir, ApplyEdits::default()).unwrap();
+        let mut server = Server::start(1, &["sh".to_string(), "-c".to_string(), script], "mock", &dir, ApplyEdits::default(), Value::Object(Vec::new())).unwrap();
         run_until_ready(&mut server);
         let State::Dead(why) = server.state() else { panic!("still {:?}", server.state()) };
         assert!(why.contains("unsupported client"), "{why}");
@@ -3013,7 +3294,7 @@ mod tests {
     fn starting_a_server_sends_initialize_and_leaves_it_initializing() {
         let dir = temp_dir("start");
         let log = dir.join("received.jsonl");
-        let mut server = Server::start(1, &scripted_server(&dir, &log), "mock", &dir, ApplyEdits::default()).unwrap();
+        let mut server = Server::start(1, &scripted_server(&dir, &log), "mock", &dir, ApplyEdits::default(), Value::Object(Vec::new())).unwrap();
         // Before anything is serviced: the process exists, the
         // handshake has not happened.
         assert_eq!(*server.state(), State::Initializing);
@@ -3045,7 +3326,7 @@ mod tests {
     fn a_request_made_before_the_handshake_finishes_is_held_not_sent() {
         let dir = temp_dir("queue");
         let log = dir.join("received.jsonl");
-        let mut server = Server::start(1, &scripted_server(&dir, &log), "mock", &dir, ApplyEdits::default()).unwrap();
+        let mut server = Server::start(1, &scripted_server(&dir, &log), "mock", &dir, ApplyEdits::default(), Value::Object(Vec::new())).unwrap();
         server.request("textDocument/hover", Value::Null);
         server.notify("textDocument/didOpen", Value::Null);
         assert_eq!(server.queued.len(), 2, "both should be waiting for `initialized`");
@@ -3076,7 +3357,7 @@ mod tests {
     #[test]
     fn a_command_that_does_not_exist_fails_to_start_rather_than_hanging() {
         let dir = temp_dir("missing");
-        let Err(error) = Server::start(1, &["bish-no-such-language-server".to_string()], "x", &dir, ApplyEdits::default()) else {
+        let Err(error) = Server::start(1, &["bish-no-such-language-server".to_string()], "x", &dir, ApplyEdits::default(), Value::Object(Vec::new())) else {
             panic!("a command that isn't there should not have started");
         };
         assert!(error.contains("bish-no-such-language-server"), "{error}");
@@ -3090,7 +3371,7 @@ mod tests {
     fn a_server_that_exits_is_noticed_with_its_last_words() {
         let dir = temp_dir("dies");
         let script = "echo 'cannot find configuration' >&2; exit 3";
-        let mut server = Server::start(1, &["sh".to_string(), "-c".to_string(), script.to_string()], "sh", &dir, ApplyEdits::default()).unwrap();
+        let mut server = Server::start(1, &["sh".to_string(), "-c".to_string(), script.to_string()], "sh", &dir, ApplyEdits::default(), Value::Object(Vec::new())).unwrap();
         for _ in 0..400 {
             server.service();
             if matches!(server.state(), State::Dead(_)) {
@@ -3110,7 +3391,7 @@ mod tests {
     #[test]
     fn a_dead_server_stops_accepting_work() {
         let dir = temp_dir("dead");
-        let mut server = Server::start(1, &["sh".to_string(), "-c".to_string(), "exit 0".to_string()], "sh", &dir, ApplyEdits::default()).unwrap();
+        let mut server = Server::start(1, &["sh".to_string(), "-c".to_string(), "exit 0".to_string()], "sh", &dir, ApplyEdits::default(), Value::Object(Vec::new())).unwrap();
         for _ in 0..400 {
             server.service();
             if matches!(server.state(), State::Dead(_)) {

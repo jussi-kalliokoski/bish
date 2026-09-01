@@ -9262,6 +9262,10 @@ struct ServerTarget {
     uri: String,
     language_id: String,
     apply_edits: lspclient::ApplyEdits,
+    // Already nested from the declaration's flat `--setting` pairs, so
+    // the only thing that has to know about dotted keys is the thing
+    // that parsed them.
+    settings: crate::json::Value,
 }
 
 // `None` -- meaning "this buffer has nothing to do with any language
@@ -9296,6 +9300,7 @@ fn server_target(session: &SessionState, buf: &TextBuffer) -> Option<ServerTarge
         uri: crate::url::from_file_path(&absolute),
         language_id: crate::lsp::language_id(&language).to_string(),
         apply_edits: lspclient::ApplyEdits::from_name(&declared.apply_edits),
+        settings: lspclient::settings_tree(&declared.settings),
     })
 }
 
@@ -9403,7 +9408,7 @@ fn open_language_server_document(sessions: &mut HashMap<SessionId, SessionState>
     // The error is deliberately dropped: `get_or_start` records it on
     // the table, which is where `::bish lsp status` shows it, and there
     // is nowhere sensible to print mid-open.
-    let Ok(server) = table.get_or_start(target.id, &target.command, &target.display, &target.root, target.apply_edits) else { return };
+    let Ok(server) = table.get_or_start(target.id, &target.command, &target.display, &target.root, target.apply_edits, target.settings.clone()) else { return };
     server.open_document(&target.uri, &target.language_id, buf.version(), &fileeditor::buffer_text(buf));
 }
 

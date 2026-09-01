@@ -644,7 +644,25 @@ pub struct LspServer {
     /// what bish did before this existed; `always` accepts whenever
     /// asked, which is what VS Code does.
     pub apply_edits: String,
+    /// `--setting KEY=VALUE`, repeatable: what this server should be
+    /// told its configuration is.
+    ///
+    /// Kept as the flat `dotted.key=value` pairs they were given as,
+    /// not as a parsed tree, because that is what `ls` has to print
+    /// back and what a person has to be able to read. The nesting a
+    /// server expects (`rust-analyzer.check.command` is an object three
+    /// deep) is built where it is sent, from these.
+    ///
+    /// Values are JSON when they parse as JSON and strings otherwise,
+    /// so `--setting x.enable=true` is a boolean and
+    /// `--setting x.path=/usr/bin/foo` is a string without needing
+    /// quotes fought through two levels of shell.
+    pub settings: Vec<(String, String)>,
 }
+
+/// One `--setting` pass's result: the pair it found, if the flag was
+/// at the front, and whatever is left of the arguments.
+type ParsedSetting<'a> = (Option<(String, String)>, &'a [String]);
 
 impl LspServer {
     /// What `ls` prints and what `status` echoes back -- the command as
@@ -715,6 +733,7 @@ pub fn lsp_help() -> Vec<String> {
     vec![
         "::bish lsp ls [--lang=GLOB]            what is registered".to_string(),
         "::bish lsp add [--lang=GLOB] [--root=NAME,...] [--root-cmd=CMD]".to_string(),
+        "                [--apply-edits=scoped|never|always] [--setting KEY=VALUE]...".to_string(),
         "               [--apply-edits=scoped|never|always] COMMAND...".to_string(),
         "::bish lsp rm ID                       remove one, by the id `add` printed".to_string(),
         "::bish lsp status                      what is actually running".to_string(),
@@ -3768,6 +3787,7 @@ impl Shell {
                 let mut root_markers = None;
                 let mut root_cmd = String::new();
                 let mut apply_edits = "scoped".to_string();
+                let mut settings: Vec<(String, String)> = Vec::new();
                 loop {
                     let before = rest.len();
                     match self.lsp_lang_flag("add", rest) {
@@ -3808,6 +3828,19 @@ impl Shell {
                         }
                         Err(status) => return status,
                     }
+                    match self.lsp_setting_flag(rest) {
+                        Ok((found, after)) => {
+                            if let Some(pair) = found {
+                                // Last one wins for a repeated key, so a
+                                // config that overrides an earlier line
+                                // reads the way it looks.
+                                settings.retain(|(k, _)| k != &pair.0);
+                                settings.push(pair);
+                            }
+                            rest = after;
+                        }
+                        Err(status) => return status,
+                    }
                     if rest.len() == before {
                         break;
                     }
@@ -3826,6 +3859,7 @@ impl Shell {
                     root_markers,
                     root_cmd,
                     apply_edits,
+                    settings,
                 });
                 // The id is the return value, same as `hook add`: a
                 // config that registers something usually wants to be
@@ -3918,6 +3952,38 @@ impl Shell {
             },
             _ => Ok((String::new(), args)),
         }
+    }
+
+    // `--setting KEY=VALUE`/`--setting=KEY=VALUE`, repeatable.
+    //
+    // Returns at most one pair per call; the caller's round-robin loop
+    // is what makes it repeatable, and what lets it appear anywhere
+    // among the other flags.
+    fn lsp_setting_flag<'a>(&mut self, args: &'a [String]) -> Result<ParsedSetting<'a>, i32> {
+        let (raw, rest) = match args.first().map(String::as_str) {
+            Some(flag) if flag.starts_with("--setting=") => (flag["--setting=".len()..].to_string(), &args[1..]),
+            Some("--setting") => match args.get(1) {
+                Some(v) => (v.clone(), &args[2..]),
+                None => {
+                    sh_eprintln!(self, "bish: ::bish lsp: add: --setting needs KEY=VALUE");
+                    return Err(2);
+                }
+            },
+            _ => return Ok((None, args)),
+        };
+        // Split on the *first* `=`: a value is free to contain more of
+        // them, and a key is not.
+        let Some(at) = raw.find('=') else {
+            sh_eprintln!(self, "bish: ::bish lsp: add: --setting: expected KEY=VALUE, got '{raw}'");
+            return Err(2);
+        };
+        let (key, value) = raw.split_at(at);
+        let key = key.trim();
+        if key.is_empty() {
+            sh_eprintln!(self, "bish: ::bish lsp: add: --setting: empty key in '{raw}'");
+            return Err(2);
+        }
+        Ok((Some((key.to_string(), value[1..].to_string())), rest))
     }
 
     // `--apply-edits=scoped|never|always`, defaulting to `scoped`.
@@ -12256,7 +12322,7 @@ pub fn bish_sub_subcommands(sub: &str) -> &'static [&'static str] {
 // menu offering `--lang=` rather than `--lang` puts the cursor where
 // the next thing to type goes.
 pub fn lsp_add_flags() -> &'static [&'static str] {
-    &["--lang=", "--root=", "--root-cmd=", "--apply-edits="]
+    &["--lang=", "--root=", "--root-cmd=", "--apply-edits=", "--setting="]
 }
 
 // The values `--apply-edits=` accepts -- the one flag there with a
@@ -14551,6 +14617,52 @@ mod tests {
         assert_eq!(shell.run_lsp(&strs(&["add", "--root-cmd"])), 2);
         assert_eq!(shell.run_lsp(&strs(&["add", "--root-cmd", "   ", "x"])), 2);
         assert_eq!(shell.lsp_servers.len(), 2);
+    }
+
+    #[test]
+    fn lsp_add_collects_repeated_settings_in_any_position() {
+        let mut shell = Shell::new();
+        let _out = capture_output(&mut shell);
+        assert_eq!(
+            shell.run_lsp(&strs(&[
+                "add",
+                "--setting",
+                "rust-analyzer.check.command=clippy",
+                "--lang=rust",
+                "--setting=rust-analyzer.cargo.features=[\"all\"]",
+                "rust-analyzer",
+            ])),
+            0
+        );
+        let server = &shell.lsp_servers[0];
+        // The flags are round-robin, so a `--setting` before `--lang`
+        // is not mistaken for the command to run.
+        assert_eq!(server.command, vec!["rust-analyzer".to_string()]);
+        assert_eq!(server.lang, "rust");
+        assert_eq!(
+            server.settings,
+            vec![
+                ("rust-analyzer.check.command".to_string(), "clippy".to_string()),
+                ("rust-analyzer.cargo.features".to_string(), "[\"all\"]".to_string()),
+            ]
+        );
+
+        // A repeated key is the later one, not both -- the same rule
+        // `settings_tree` follows for a key that contradicts an earlier
+        // one.
+        assert_eq!(shell.run_lsp(&strs(&["add", "--setting", "a.b=1", "--setting", "a.b=2", "srv"])), 0);
+        assert_eq!(shell.lsp_servers[1].settings, vec![("a.b".to_string(), "2".to_string())]);
+
+        // A value is free to contain `=`; a key is not.
+        assert_eq!(shell.run_lsp(&strs(&["add", "--setting", "a=b=c", "srv"])), 0);
+        assert_eq!(shell.lsp_servers[2].settings, vec![("a".to_string(), "b=c".to_string())]);
+
+        // Malformed is a config error rather than a setting nobody
+        // notices was dropped.
+        assert_eq!(shell.run_lsp(&strs(&["add", "--setting", "nokey", "srv"])), 2);
+        assert_eq!(shell.run_lsp(&strs(&["add", "--setting", "=value", "srv"])), 2);
+        assert_eq!(shell.run_lsp(&strs(&["add", "--setting"])), 2);
+        assert_eq!(shell.lsp_servers.len(), 3);
     }
 
     #[test]
