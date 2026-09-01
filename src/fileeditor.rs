@@ -1696,18 +1696,23 @@ pub(crate) fn run_insert_mode(
                 // must not affect it.
                 buf.set_mark('^', buf.cursor());
                 registers.set_last_insert(inserted);
-                // Normal mode's cursor can never sit *after* the last
-                // character of a line (unlike Insert mode, which allows
-                // that to append) -- clamp back by one column on the way
-                // out, same convention toggle_case's own post-edit clamp
-                // already uses. A wholly empty line (line_len 0) has
-                // nothing to clamp to but column 0, which set_cursor's
-                // own min() already leaves it at.
+                // Leaving Insert mode steps the cursor one column left,
+                // as vim's does, so the caret lands *on* the character
+                // just typed rather than after it. That is what makes
+                // `x` delete what you were looking at and `A`-then-Esc
+                // leave you on the last character.
+                //
+                // This used only to clamp a cursor sitting past the end
+                // of the line, which is the same thing in the common
+                // "typed to the end and pressed Escape" case and nothing
+                // at all anywhere else -- so `i`, type, Escape, `x` in
+                // the middle of a line deleted the character *after* the
+                // insertion instead of the last one typed.
+                //
+                // Column 0 stays at column 0: there is nowhere left, and
+                // an empty line has nothing to sit on either.
                 let (row, col) = buf.cursor();
-                let len = buf.line_len(row);
-                if col >= len && len > 0 {
-                    buf.set_cursor(row, len - 1);
-                }
+                buf.set_cursor(row, col.saturating_sub(1));
                 return Ok(());
             }
             // Enter is the first of the two abbreviation triggers, same
@@ -5406,6 +5411,40 @@ mod insert_mode_alt_word_motion_tests {
     }
 
     #[test]
+    fn leaving_insert_mode_steps_the_cursor_left_as_vim_does() {
+        // So the caret lands *on* what you just typed rather than after
+        // it, which is what makes `x` delete the right character and
+        // `A`-then-Escape leave you on the last one.
+        //
+        // This used only to clamp a cursor sitting past the end of the
+        // line -- the same thing when you typed to the end, and nothing
+        // at all in the middle of one.
+        let leave_at = |text: &str, start: usize, typed: &str| {
+            let mut buf = TextBuffer::new_unnamed(10);
+            buf.insert_text((0, 0), text);
+            buf.set_cursor(0, start);
+            let mut vk = VimKeys::new();
+            let mut registers = Registers::new_for_test();
+            let mut keys: Vec<Key> = typed.chars().map(Key::Char).collect();
+            keys.push(Key::Escape);
+            scripted(&mut vk, &keys);
+            run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut NoInsertServices, false, 24, 80, None, &[], &[])
+                .unwrap();
+            buf.cursor().1
+        };
+        // Typed in the middle: land on the last character typed, not the
+        // one after it. This is the case the old clamp missed entirely.
+        assert_eq!(leave_at("abcdef", 3, "zz"), 4);
+        // Typed at the end: the append position is past the last
+        // character, and stepping back is also what the clamp did.
+        assert_eq!(leave_at("abc", 3, "!"), 3);
+        // Column 0 has nowhere further left to go.
+        assert_eq!(leave_at("abcdef", 0, ""), 0);
+        // ...and an empty line has nothing to sit on at all.
+        assert_eq!(leave_at("", 0, ""), 0);
+    }
+
+    #[test]
     fn alt_left_moves_the_cursor_back_a_word_without_deleting() {
         let mut buf = TextBuffer::new_unnamed(10);
         buf.insert_text((0, 0), "hello world");
@@ -5417,7 +5456,11 @@ mod insert_mode_alt_word_motion_tests {
         run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut NoInsertServices, false, 24, 80, None, &[], &[]).unwrap();
 
         assert_eq!(buf.line_chars(0).into_iter().collect::<String>(), "hello world", "nothing should be deleted");
-        assert_eq!(buf.cursor(), (0, 6), "cursor should land at the start of 'world', matching vim's own `b`");
+        // 6 is where the motion landed; Escape then steps one column
+        // left, as vim's does, and every exit from Insert mode goes
+        // through that. The assertion has to name the position *after*
+        // leaving, since `run_insert_mode` only returns once it has.
+        assert_eq!(buf.cursor(), (0, 5), "cursor should land at the start of 'world' (`b`), less Escape's step back");
     }
 
     #[test]
@@ -5432,7 +5475,11 @@ mod insert_mode_alt_word_motion_tests {
         run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut NoInsertServices, false, 24, 80, None, &[], &[]).unwrap();
 
         assert_eq!(buf.line_chars(0).into_iter().collect::<String>(), "hello world", "nothing should be deleted");
-        assert_eq!(buf.cursor(), (0, 6), "cursor should land at the start of 'world', matching vim's own `w`");
+        // 6 is where the motion landed; Escape then steps one column
+        // left, as vim's does, and every exit from Insert mode goes
+        // through that. The assertion has to name the position *after*
+        // leaving, since `run_insert_mode` only returns once it has.
+        assert_eq!(buf.cursor(), (0, 5), "cursor should land at the start of 'world' (`w`), less Escape's step back");
     }
 
     #[test]
