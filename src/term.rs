@@ -388,6 +388,31 @@ impl Drop for NoEchoGuard {
     }
 }
 
+/// One character, made safe to write to a terminal.
+///
+/// A control character reaching a terminal is not text, it is an
+/// instruction -- and most of the text this shell draws was written by
+/// somebody else: a filename, a git ref, a line of a file, a completion
+/// candidate. `evil<ESC>[2J.txt` clears the screen merely by appearing
+/// in a listing. Same hazard `url::is_safe` exists for, one layer down.
+///
+/// One character in, one character out, so every index into the text --
+/// a fuzzy match position, a selection span, a caret column -- still
+/// means what it meant. U+FFFD rather than `?` because it says "this
+/// could not be shown" rather than looking like part of the name.
+pub fn safe_char(c: char) -> char {
+    match c.is_control() {
+        true => '\u{FFFD}',
+        false => c,
+    }
+}
+
+/// `safe_char` over a whole string, for the places that build terminal
+/// output as text rather than as cells.
+pub fn safe_text(s: &str) -> String {
+    s.chars().map(safe_char).collect()
+}
+
 // True if a byte is available on stdin within timeout_ms. Used to tell a
 // standalone Esc keypress (nothing follows) apart from the start of a
 // terminal escape sequence (whose bytes arrive back-to-back) without

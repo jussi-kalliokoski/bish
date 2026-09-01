@@ -806,7 +806,16 @@ pub fn render_linked(cells: &[vt100::Cell], links: &[LinkSpan]) -> String {
             out.push_str(&vt100::sgr_codes(cell.fg, cell.bg, cell.attrs));
             last = Some(key);
         }
-        out.push(cell.ch);
+        // The last gate before synthesized text becomes terminal bytes.
+        // Every cell run that reaches here was built out of text this
+        // shell did not write -- a filename in a completion menu, a line
+        // of a file, a search result -- and a control character in one
+        // is spliced straight into the terminal's own escape stream. A
+        // file called `evil<ESC>[2J.txt` cleared the screen just by
+        // being offered as a completion. Exactly the hazard the
+        // `url::is_safe` check a few lines up already covers for this
+        // function's other input.
+        out.push(crate::term::safe_char(cell.ch));
     }
     if open.is_some() {
         out.push_str(OSC8_CLOSE);
@@ -1477,6 +1486,36 @@ fn push_procsub(raw: &str, offset: usize, raw_spans: &[Range<usize>], cursor: &m
 
 #[cfg(test)]
 mod tests {
+    // A filename is text somebody else wrote, and `render_linked` is the
+    // last thing between it and the terminal's escape stream. Before
+    // this gate, offering `evil<ESC>[2J.txt` in a completion menu
+    // cleared the user's screen -- confirmed against the real binary
+    // over a pty, with a control run in a directory without such a file.
+    #[test]
+    fn a_control_character_never_reaches_the_terminal_as_one() {
+        let render = |text: &str| {
+            let chars: Vec<char> = text.chars().collect();
+            (chars.len(), super::render_styled(&super::compose(&chars, &[])))
+        };
+        let (len, out) = render("evil\x1b[2J.txt");
+        assert!(!out.contains("\x1b[2J"), "the screen-clearing sequence must not survive: {out:?}");
+        assert!(out.contains("evil\u{FFFD}[2J.txt"), "{out:?}");
+
+        // The only escapes left are this function's own SGR framing --
+        // the same ones a name with nothing hostile in it produces.
+        let (_, benign) = render("evilX[2J.txt");
+        assert_eq!(
+            out.matches('\x1b').count(),
+            benign.matches('\x1b').count(),
+            "the text contributed an escape of its own"
+        );
+
+        // One character in, one out, so every index into the run still
+        // means what it meant -- match positions, selection spans, the
+        // caret column.
+        assert_eq!(super::compose(&"evil\x1b[2J.txt".chars().collect::<Vec<_>>(), &[]).len(), len);
+    }
+
     use super::*;
 
     // The text each JSON span actually covers, so a test reads as what

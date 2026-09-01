@@ -820,12 +820,17 @@ impl Browser {
         // A directory's `/` and an archive's `!` are the same hint:
         // Enter goes *into* this. `!` because that's exactly what the
         // path gains when you do (archive::SEPARATOR).
-        let label = match entry {
+        // A name is drawn here as raw SGR text, not as cells, so it
+        // does not pass through `render_linked`'s own gate -- and a file
+        // called `evil<ESC>[2J.txt` is a listing that clears the screen.
+        // One character in, one out, so `self.matches`' own positions
+        // still line up with it.
+        let label = crate::term::safe_text(&match entry {
             e if e.is_parent => e.name.clone(),
             e if e.is_dir => format!("{}/", e.name),
             e if e.is_archive => format!("{}{}", e.name, crate::archive::SEPARATOR),
             e => e.name.clone(),
-        };
+        });
         let name_width = width.saturating_sub(PREFIX_WIDTH + GUTTER.min(width.saturating_sub(PREFIX_WIDTH)));
         let empty = Vec::new();
         let positions = self.matches.get(idx).unwrap_or(&empty);
@@ -903,8 +908,8 @@ impl Browser {
         }
         let detail = match self.current() {
             Some(e) if e.is_parent => "parent directory".to_string(),
-            Some(e) if e.is_dir => format!("{}/", e.name),
-            Some(e) => format!("{}  {}", e.name, human_size(e.size)),
+            Some(e) if e.is_dir => crate::term::safe_text(&format!("{}/", e.name)),
+            Some(e) => crate::term::safe_text(&format!("{}  {}", e.name, human_size(e.size))),
             None => if self.query.is_empty() { "empty directory".to_string() } else { format!("no matches for '{}'", self.query) },
         };
         // The `i` hint is left out when `gitignore` is off -- there is
@@ -1095,7 +1100,14 @@ fn icon_for(e: &Entry) -> char {
     '\u{1F4C4}'
 }
 
+// Display text only, so the control-character guard lives here: this is
+// what the browser's own header prints, and a directory can be named
+// anything at all.
 fn shorten_home(path: &Path) -> String {
+    crate::term::safe_text(&shorten_home_raw(path))
+}
+
+fn shorten_home_raw(path: &Path) -> String {
     let text = path.display().to_string();
     match std::env::var_os("HOME").map(PathBuf::from) {
         Some(home) if path == home => "~".to_string(),
@@ -1219,6 +1231,25 @@ fn fit_marked(s: &str, positions: &[usize], width: usize) -> (Vec<(String, bool)
 
 #[cfg(test)]
 mod tests {
+    // A listing is drawn as raw SGR text, so a name is spliced into the
+    // terminal's escape stream directly. `evil<ESC>[2J.txt` cleared the
+    // screen just by being in the directory you opened.
+    #[test]
+    fn a_hostile_filename_cannot_paint_with_the_terminals_own_escapes() {
+        let dir = std::env::temp_dir().join(format!("bish-browser-escapes-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("evil\x1b[2J.txt"), "").unwrap();
+        std::fs::write(dir.join("plain.txt"), "").unwrap();
+
+        let mut b = super::Browser::open(&dir).unwrap();
+        let drawn = b.render(super::Rect { row: 0, col: 0, rows: 20, cols: 60 }, 24, 80);
+        assert!(drawn.contains("plain.txt"), "the control renders normally");
+        assert!(!drawn.contains("\x1b[2J"), "but the hostile one does not clear the screen");
+        assert!(drawn.contains('\u{FFFD}'), "it is shown, just not obeyed");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     use super::*;
     use std::fs;
 

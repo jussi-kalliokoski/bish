@@ -80,7 +80,18 @@ pub fn continuation() -> String {
 // snapshot) so a window's path there always reads exactly like the
 // prompt's own -- same abbreviation, same "~" home substitution --
 // rather than showing the full, unshortened path.
+// The result is display text and only display text (it is abbreviated,
+// so it never round-trips back into a real path), which is why the
+// control-character guard belongs here rather than on the caller: a
+// directory called `sub<ESC>[2Jdir` would otherwise clear the terminal
+// on every prompt redraw -- that is, on every keystroke. The prompt is
+// built as a raw SGR string rather than as cells, so it does not pass
+// through `render_linked`'s own gate.
 pub fn shorten_path(cwd: &str, home: &str) -> String {
+    crate::term::safe_text(&shorten_path_raw(cwd, home))
+}
+
+fn shorten_path_raw(cwd: &str, home: &str) -> String {
     let (base, rest) = if !home.is_empty() && (cwd == home || cwd.starts_with(&format!("{home}/"))) {
         ("~".to_string(), cwd[home.len()..].trim_start_matches('/').to_string())
     } else {
@@ -106,4 +117,28 @@ pub fn shorten_path(cwd: &str, home: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shorten_path_abbreviates_all_but_the_last_component() {
+        assert_eq!(shorten_path("/home/jussi/bish/src", "/home/jussi"), "~/b/src");
+        assert_eq!(shorten_path("/home/jussi", "/home/jussi"), "~");
+        assert_eq!(shorten_path("/usr/local/share", ""), "/u/l/share");
+        assert_eq!(shorten_path("/home/jussi/.config/bish", "/home/jussi"), "~/.c/bish");
+    }
+
+    // The prompt is built as a raw SGR string, not as cells, so nothing
+    // downstream is going to catch this: a directory called
+    // `sub<ESC>[2Jdir` cleared the terminal on every prompt redraw --
+    // that is, on every keystroke -- until this guard.
+    #[test]
+    fn a_directory_cannot_name_itself_a_terminal_command() {
+        let out = shorten_path("/tmp/sub\x1b[2Jdir", "");
+        assert!(!out.contains("\x1b[2J"), "{out:?}");
+        assert_eq!(out, "/t/sub\u{FFFD}[2Jdir");
+    }
 }
