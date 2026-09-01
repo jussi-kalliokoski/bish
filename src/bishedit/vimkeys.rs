@@ -940,7 +940,22 @@ impl VimKeys {
     /// `record_key` for it, see `next_key`'s own doc comment). A no-op if
     /// nothing was recording.
     pub fn stop_recording(&mut self) {
-        if let Some((reg, keys)) = self.recording.take() {
+        if let Some((reg, mut keys)) = self.recording.take() {
+            // Drop the `q` that ended the recording. `record_key`'s own
+            // doc comment says the host consumes that key before it can
+            // ever be recorded, and that used to be true -- but reading
+            // now goes through `next_key`/`next_command_key`, which
+            // record every key they read, including this one, well
+            // before the host decides what it means.
+            //
+            // A recorded stop key is not a cosmetic surplus: replaying
+            // the macro re-runs it, which starts a *new* recording, and
+            // that recording then swallows the next keystroke as its
+            // register name. `@a@a` lost its second `@` that way, and
+            // `@a` followed by anything at all lost that too.
+            if keys.last() == Some(&Key::Char('q')) {
+                keys.pop();
+            }
             self.macros.insert(reg, keys);
         }
     }
@@ -1076,7 +1091,7 @@ impl VimKeys {
     pub fn next_mapped_key(&mut self, mode: &str, mut read: impl FnMut() -> io::Result<Option<Key>>) -> io::Result<Option<Key>> {
         loop {
             if let Some(key) = self.replay_queue.pop_front() {
-                return Ok(Some(key));
+                    return Ok(Some(key));
             }
             let Some(key) = read()? else { return Ok(None) };
             self.record_key(key);
@@ -2297,6 +2312,28 @@ mod tests {
         assert_eq!(describe_typed("<C-w>s"), "window split");
         assert_eq!(describe_typed("p"), "put-after");
         assert_eq!(describe_typed("u"), "undo");
+    }
+
+    #[test]
+    fn the_q_that_stops_a_recording_is_not_part_of_it() {
+        // Reading goes through `next_key`, which records every key it
+        // reads -- including the `q` the host is about to interpret as
+        // "stop". Left in, replaying the macro re-runs that `q`, starts
+        // a fresh recording, and the next keystroke disappears into it
+        // as a register name.
+        let mut vk = VimKeys::new();
+        vk.start_recording('a');
+        for k in [Key::Char('x'), Key::Char('x'), Key::Char('q')] {
+            vk.record_key(k);
+        }
+        vk.stop_recording();
+
+        assert!(vk.queue_macro_replay('a', 1));
+        let mut replayed = Vec::new();
+        while let Some(key) = vk.next_key(|| Ok(None)).unwrap() {
+            replayed.push(key);
+        }
+        assert_eq!(replayed, vec![Key::Char('x'), Key::Char('x')], "the stop key is not replayed");
     }
 
     #[test]
