@@ -1496,6 +1496,18 @@ pub(crate) fn run_insert_mode(
                 return Ok(());
             }
         };
+        // A mapping whose prefix was typed speculatively (see
+        // `Matcher::feed`) has completed, so those characters come back
+        // off before whatever it mapped to runs. Exactly Backspace's own
+        // effect, reused rather than reimplemented, so multi-cursor and
+        // the `inserted` record stay consistent. Invisible to undo: an
+        // Insert session is one undo step, so a character typed and
+        // removed inside it leaves nothing behind.
+        for _ in 0..vk.take_pending_revert() {
+            apply_backspace_to_all(buf, &mut cursors);
+            buf.set_cursor(cursors[0].0, cursors[0].1);
+            inserted.pop();
+        }
         // Any key outside a live snippet's own vocabulary accepts it as
         // it stands and then means whatever it always meant -- the exact
         // rule read_line already follows for the same thing at the shell

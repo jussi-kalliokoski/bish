@@ -692,6 +692,10 @@ pub struct VimKeys {
     // `::bish map`. Empty unless the session has mappings, and consulted
     // only by `next_command_key` -- see there for why not by `next_key`.
     matcher: crate::keymap::Matcher,
+    // Characters a speculative mapping put on screen that the caller
+    // has to take back before dispatching what it returned -- see
+    // `take_pending_revert`.
+    pending_revert: usize,
     last_macro_register: Option<char>,
 }
 
@@ -718,6 +722,7 @@ impl VimKeys {
             recording: None,
             replay_queue: VecDeque::new(),
             matcher: crate::keymap::Matcher::new(Vec::new()),
+            pending_revert: 0,
             last_macro_register: None,
         }
     }
@@ -1001,6 +1006,19 @@ impl VimKeys {
         self.matcher = crate::keymap::Matcher::new(mappings);
     }
 
+    /// How many characters the caller must remove before dispatching
+    /// the key just returned.
+    ///
+    /// Insert mode types a mapping's prefix as it arrives rather than
+    /// holding it, so `j` shows the instant it is pressed. When the
+    /// sequence turns out to be `jk`, those characters have to come
+    /// back off before the mapping fires. Nothing is left in the undo
+    /// tree by the round trip: an Insert session is one undo step, so a
+    /// character typed and removed inside it is invisible to `u`.
+    pub fn take_pending_revert(&mut self) -> usize {
+        std::mem::take(&mut self.pending_revert)
+    }
+
     /// Whether a key is already waiting to be delivered, from a macro
     /// replay or a mapping's expansion.
     ///
@@ -1067,12 +1085,16 @@ impl VimKeys {
             if self.matcher.is_empty() || self.wants_raw_key() {
                 return Ok(Some(key));
             }
-            let mut out = self.matcher.feed(key, mode);
-            if out.is_empty() {
+            // Insert mode can take a printable key back off the screen,
+            // so it lets the matcher type one speculatively rather than
+            // holding it; every other mode holds. See `Matcher::feed`.
+            let mut out = self.matcher.feed(key, mode, mode == "insert");
+            self.pending_revert += out.revert;
+            if out.keys.is_empty() {
                 continue;
             }
-            let first = out.remove(0);
-            self.replay_queue.extend(out);
+            let first = out.keys.remove(0);
+            self.replay_queue.extend(out.keys);
             return Ok(Some(first));
         }
     }

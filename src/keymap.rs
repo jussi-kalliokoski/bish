@@ -353,6 +353,35 @@ pub fn describe_rhs(keys: &[Key]) -> Result<String, String> {
     crate::bishedit::vimkeys::describe_key_sequence(keys)
 }
 
+/// What a matcher decided about one key.
+#[derive(Debug, PartialEq)]
+pub struct Dispatch {
+    /// Characters to take back off the screen before dispatching
+    /// `keys` -- always 0 unless the caller asked to speculate.
+    pub revert: usize,
+    /// Keys to dispatch, in order. Empty while a sequence is still
+    /// being decided.
+    pub keys: Vec<Key>,
+}
+
+impl Dispatch {
+    fn keys(keys: Vec<Key>) -> Dispatch {
+        Dispatch { revert: 0, keys }
+    }
+    fn none() -> Dispatch {
+        Dispatch { revert: 0, keys: Vec::new() }
+    }
+}
+
+/// Whether a key can be typed now and taken back later: its whole
+/// effect has to be one character on screen. A letter or digit
+/// qualifies; whitespace does not (Space and Enter trigger `abbr`
+/// expansion, which one backspace would not undo), and nor does
+/// anything that is not a character at all.
+fn can_speculate(key: Key) -> bool {
+    matches!(key, Key::Char(c) if !c.is_whitespace())
+}
+
 /// Translates typed keys into the keys they are mapped to, in front of
 /// `VimKeys` rather than inside it.
 ///
@@ -371,6 +400,11 @@ pub struct Matcher {
     mappings: Vec<Mapping>,
     /// Keys typed so far that are still a live prefix of some mapping.
     buffer: Vec<Key>,
+    /// How many of `buffer`'s keys have already been dispatched on the
+    /// chance that this is not a mapping after all -- see `feed`'s
+    /// `speculative`. Exactly the number of characters to take back if
+    /// it turns out to be one.
+    speculated: usize,
     /// The longest complete mapping the buffer has matched so far, and
     /// how many keys it consumed -- remembered because a longer mapping
     /// may still match, and if it does not, this is what fires. See
@@ -381,7 +415,7 @@ pub struct Matcher {
 
 impl Matcher {
     pub fn new(mappings: Vec<Mapping>) -> Matcher {
-        Matcher { mappings, buffer: Vec::new(), matched: None }
+        Matcher { mappings, buffer: Vec::new(), speculated: 0, matched: None }
     }
 
     /// Whether anything is mapped at all -- lets a caller skip the whole
@@ -397,21 +431,25 @@ impl Matcher {
         &self.buffer
     }
 
-    /// The keys `key` should turn into, in dispatch order. Empty while a
-    /// sequence is still being decided.
+    /// What to do with `key`.
     ///
-    /// Longest match wins, decided by waiting rather than by a timer:
-    /// while the buffer is a strict prefix of some mapping, nothing is
-    /// emitted, and the moment it stops being one the best complete
-    /// match found so far fires, followed by whatever keys came after
-    /// it. A mapping that is a prefix of another therefore costs one
-    /// extra keystroke of latency before it fires, and not a wall-clock
-    /// wait -- unlike vim's `timeoutlen`, nothing here fires because
-    /// time passed, which means the same keys always produce the same
-    /// result no matter how fast they were typed.
-    pub fn feed(&mut self, key: Key, mode: &str) -> Vec<Key> {
+    /// `speculative` says the caller can take a key back: in Insert mode
+    /// a printable character's whole effect is one character on screen,
+    /// so it can be typed now and removed if the sequence turns out to
+    /// be a mapping. That is what makes `jk` -> `<Esc>` feel right
+    /// without a timer -- `j` appears the instant it is pressed and
+    /// disappears when `k` completes the mapping. Normal mode passes
+    /// false: nothing echoes there so there is no lag to remove, and
+    /// `d` or `x` does real work that "delete one character" could not
+    /// undo.
+    ///
+    /// Longest match wins either way, decided by the next key rather
+    /// than by a clock. Nothing here ever fires because time passed, so
+    /// the same keys always produce the same result however fast they
+    /// were typed.
+    pub fn feed(&mut self, key: Key, mode: &str, speculative: bool) -> Dispatch {
         if self.mappings.is_empty() {
-            return vec![key];
+            return Dispatch::keys(vec![key]);
         }
         self.buffer.push(key);
         let live: Vec<&Mapping> = self.mappings.iter().filter(|m| m.applies_to(mode)).collect();
@@ -421,23 +459,37 @@ impl Matcher {
         }
         // A longer mapping could still match, so hold and see.
         if live.iter().any(|m| m.lhs.len() > self.buffer.len() && m.lhs.starts_with(&self.buffer)) {
-            return Vec::new();
+            if speculative && can_speculate(key) {
+                // Typed now, remembered as takeable. Only printable
+                // non-whitespace: Space and Enter trigger `abbr`
+                // expansion (and Enter autoindents), and removing one
+                // character does not undo an expansion. A control key
+                // does not echo, so holding it costs nothing visible.
+                self.speculated += 1;
+                return Dispatch::keys(vec![key]);
+            }
+            return Dispatch::none();
         }
         match self.matched.take() {
-            // The best match fires, and anything typed past it was never
-            // part of it -- those keys dispatch as themselves, which is
-            // what keeps `<Space>wx` from losing its `x` when `<Space>w`
-            // is mapped.
+            // The best match fires. Everything speculated is taken back
+            // first -- including any that fell *outside* the match,
+            // since those keys reappear in `leftover` and are
+            // dispatched again.
             Some((rhs, consumed)) => {
                 let leftover: Vec<Key> = self.buffer.split_off(consumed);
                 self.buffer.clear();
-                rhs.into_iter().chain(leftover).collect()
+                let revert = std::mem::take(&mut self.speculated);
+                Dispatch { revert, keys: rhs.into_iter().chain(leftover).collect() }
             }
             // A false start: nothing this buffer could still become is
-            // mapped, so every key of it dispatches as itself. Emitted
-            // rather than dropped -- `<Space>` still means what it means
-            // when the `<Space>w` it might have been does not arrive.
-            None => std::mem::take(&mut self.buffer),
+            // mapped, so every key of it stands as itself. Whatever was
+            // speculated is already on screen and must not be sent
+            // twice.
+            None => {
+                let all: Vec<Key> = self.buffer.drain(..).collect();
+                let already = std::mem::take(&mut self.speculated);
+                Dispatch { revert: 0, keys: all[already.min(all.len())..].to_vec() }
+            }
         }
     }
 
@@ -445,7 +497,9 @@ impl Matcher {
     /// leaving the mode does not silently swallow it.
     pub fn flush(&mut self) -> Vec<Key> {
         self.matched = None;
-        std::mem::take(&mut self.buffer)
+        let already = std::mem::take(&mut self.speculated);
+        let all: Vec<Key> = std::mem::take(&mut self.buffer);
+        all[already.min(all.len())..].to_vec()
     }
 }
 
@@ -463,9 +517,22 @@ mod tests {
     fn through(matcher: &mut Matcher, text: &str, mode: &str) -> String {
         let mut out = Vec::new();
         for key in parse_keys(text).unwrap() {
-            out.extend(matcher.feed(key, mode));
+            out.extend(matcher.feed(key, mode, false).keys);
         }
         format_keys(&out)
+    }
+
+    // The same, speculating -- returning what was dispatched and how
+    // many characters had to be taken back, which together are the
+    // whole of what Insert mode sees.
+    fn speculating(matcher: &mut Matcher, text: &str) -> (String, usize) {
+        let (mut out, mut reverted) = (Vec::new(), 0);
+        for key in parse_keys(text).unwrap() {
+            let d = matcher.feed(key, "insert", true);
+            reverted += d.revert;
+            out.extend(d.keys);
+        }
+        (format_keys(&out), reverted)
     }
 
     #[test]
@@ -497,8 +564,8 @@ mod tests {
     fn a_multi_key_sequence_waits_and_then_fires() {
         let mut m = Matcher::new(vec![mapping("*", "<Space>w", "<C-w>s")]);
         // Nothing is emitted while the sequence is still being decided.
-        assert!(m.feed(Key::Char(' '), "normal").is_empty());
-        assert_eq!(format_keys(&m.feed(Key::Char('w'), "normal")), "<C-w>s");
+        assert!(m.feed(Key::Char(' '), "normal", false).keys.is_empty());
+        assert_eq!(format_keys(&m.feed(Key::Char('w'), "normal", false).keys), "<C-w>s");
     }
 
     #[test]
@@ -531,10 +598,59 @@ mod tests {
     fn leaving_mid_sequence_gives_the_held_keys_back() {
         // Held keys must not vanish because the mode ended.
         let mut m = Matcher::new(vec![mapping("*", "<Space>w", "<C-w>s")]);
-        assert!(m.feed(Key::Char(' '), "normal").is_empty());
+        assert!(m.feed(Key::Char(' '), "normal", false).keys.is_empty());
         assert_eq!(format_keys(m.pending()), "<Space>");
         assert_eq!(format_keys(&m.flush()), "<Space>");
         assert!(m.pending().is_empty());
+    }
+
+    #[test]
+    fn a_speculated_prefix_is_typed_now_and_taken_back_if_it_completes() {
+        // The whole point: `j` reaches the screen the instant it is
+        // pressed, so there is no lag and no timer -- and comes back off
+        // when `k` turns it into a mapping.
+        let mut m = Matcher::new(vec![mapping("insert", "jk", "<Esc>")]);
+        let d = m.feed(Key::Char('j'), "insert", true);
+        assert_eq!((format_keys(&d.keys), d.revert), ("j".to_string(), 0), "j is typed immediately");
+        let d = m.feed(Key::Char('k'), "insert", true);
+        assert_eq!((format_keys(&d.keys), d.revert), ("<Esc>".to_string(), 1), "and taken back when the mapping fires");
+    }
+
+    #[test]
+    fn a_speculated_key_that_leads_nowhere_is_not_sent_twice() {
+        // `jl` must be `jl`, not `jjl`: the `j` is already on screen.
+        let mut m = Matcher::new(vec![mapping("insert", "jk", "<Esc>")]);
+        assert_eq!(speculating(&mut m, "jl"), ("jl".to_string(), 0));
+        assert_eq!(speculating(&mut m, "jam"), ("jam".to_string(), 0));
+    }
+
+    #[test]
+    fn whitespace_is_never_speculated() {
+        // Space and Enter trigger `abbr` expansion, and one backspace
+        // does not undo an expansion -- so they hold, like every
+        // non-character key, where holding costs nothing visible.
+        let mut m = Matcher::new(vec![mapping("insert", "<Space>w", "<C-w>s")]);
+        let d = m.feed(Key::Char(' '), "insert", true);
+        assert!(d.keys.is_empty(), "held rather than typed");
+        let d = m.feed(Key::Char('w'), "insert", true);
+        assert_eq!((format_keys(&d.keys), d.revert), ("<C-w>s".to_string(), 0), "nothing to take back");
+    }
+
+    #[test]
+    fn normal_mode_never_speculates() {
+        // Nothing echoes there, so there is no lag to remove -- and `d`
+        // or `x` does real work that one backspace could not undo.
+        let mut m = Matcher::new(vec![mapping("normal", "jk", "<Esc>")]);
+        assert!(m.feed(Key::Char('j'), "normal", false).keys.is_empty());
+        let d = m.feed(Key::Char('k'), "normal", false);
+        assert_eq!((format_keys(&d.keys), d.revert), ("<Esc>".to_string(), 0));
+    }
+
+    #[test]
+    fn leaving_mid_sequence_does_not_re_send_what_is_already_on_screen() {
+        let mut m = Matcher::new(vec![mapping("insert", "jk", "<Esc>")]);
+        assert_eq!(format_keys(&m.feed(Key::Char('j'), "insert", true).keys), "j");
+        assert!(m.flush().is_empty(), "the j was already dispatched");
     }
 
     #[test]

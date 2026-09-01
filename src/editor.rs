@@ -1616,14 +1616,20 @@ pub fn read_line(
                 if matcher.is_empty() {
                     raw
                 } else {
-                    let mut out = matcher.feed(raw, "command");
-                    if out.is_empty() {
+                    // Not speculative: the colon line is one line of
+                    // text with its own editing rules, and a key taken
+                    // back would have to be untangled from completion
+                    // and snippet state as well. Holding costs a
+                    // keystroke of latency on a multi-key mapping, which
+                    // nobody has asked for here.
+                    let mut out = matcher.feed(raw, "command", false);
+                    if out.keys.is_empty() {
                         // Mid-sequence: nothing to dispatch yet, so go
                         // back and wait for the key that decides it.
                         continue;
                     }
-                    let first = out.remove(0);
-                    mapped.extend(out);
+                    let first = out.keys.remove(0);
+                    mapped.extend(out.keys);
                     first
                 }
             }
