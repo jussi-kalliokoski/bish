@@ -8420,6 +8420,143 @@ pub(crate) fn shell_quote(s: &str) -> String {
     out
 }
 
+#[cfg(test)]
+mod printf_float_tests {
+    // Checked against real `bash`, on the same specs and the same
+    // values, because C's floating-point conversions have more corners
+    // than anyone's reading of them: `%.0f` of 2.5 is 2 and of 3.5 is
+    // 4 (round half to even), `%g` picks its form from the exponent
+    // *after* rounding, `%e` writes at least two exponent digits, and
+    // zero padding goes after the sign but not around an infinity.
+    //
+    // `LC_ALL=C`, or this measures the machine's decimal separator
+    // rather than the formatting -- a Finnish `bash` writes `3,14`.
+    // Skipped where there is no bash, the same way the git and inflate
+    // tests skip.
+    fn cases() -> Vec<(String, String)> {
+        let specs = [
+            "%f", "%.0f", "%.2f", "%8.3f", "%-8.3f", "%05.2f", "%08.3f", "%+f", "% f", "%012.4f",
+            "%e", "%E", "%.0e", "%.2e", "%012.1e", "%+.3e", "%08.0E",
+            "%g", "%G", "%.1g", "%.3g", "%.10g", "%+08.0g", "%012g",
+        ];
+        let values = [
+            "0", "1", "-1", "2.5", "3.5", "-0.5", "3.14159", "-3.14159", "1e3", "1e-3", "1e20",
+            "0.0001", "0.00001", "999999", "999999.5", "100000", "1000000", "0x10", "-0x10",
+            "31415.9", "0.000123", "inf", "-inf", "nan", "abc", "",
+        ];
+        specs.iter().flat_map(|s| values.iter().map(move |v| (s.to_string(), v.to_string()))).collect()
+    }
+
+    #[test]
+    fn floating_point_conversions_agree_with_bash() {
+        let cases = cases();
+        let script: String = cases.iter().map(|(spec, value)| format!("printf '{spec}' '{value}'; printf '\\n'\n")).collect();
+        let out = std::process::Command::new("bash").env("LC_ALL", "C").arg("-c").arg(&script).output();
+        let Ok(out) = out else { return };
+        if !out.status.success() {
+            return;
+        }
+        // bash writes "invalid number" to stderr for a value it cannot
+        // read and then uses 0, which is what bish does silently.
+        let want: Vec<String> = String::from_utf8_lossy(&out.stdout).lines().map(str::to_string).collect();
+        assert_eq!(want.len(), cases.len(), "one line per case");
+
+        for ((spec, value), expected) in cases.iter().zip(&want) {
+            let mut got = String::new();
+            let mut idx = 0;
+            super::printf_format_once(spec, std::slice::from_ref(value), &mut idx, &mut got);
+            assert_eq!(&got, expected, "printf '{spec}' '{value}'");
+        }
+    }
+}
+
+// `printf`'s own idea of a number, which is C's `strtod`: a decimal or
+// exponent form, a `0x` integer, surrounding space, `inf`/`nan`. `None`
+// for anything else, which every caller renders as zero.
+fn printf_float(arg: &str) -> f64 {
+    let text = arg.trim();
+    let (sign, rest) = match text.strip_prefix('-') {
+        Some(rest) => (-1.0, rest),
+        None => (1.0, text.strip_prefix('+').unwrap_or(text)),
+    };
+    if let Some(hex) = rest.strip_prefix("0x").or_else(|| rest.strip_prefix("0X")) {
+        return i64::from_str_radix(hex, 16).map(|v| sign * v as f64).unwrap_or(0.0);
+    }
+    text.parse::<f64>().unwrap_or(0.0)
+}
+
+// `inf`/`nan` print as themselves, in the case the conversion asked
+// for, with no digits and no precision applied.
+fn non_finite(v: f64, upper: bool) -> Option<String> {
+    if v.is_finite() {
+        return None;
+    }
+    let word = match (v.is_nan(), v.is_sign_negative()) {
+        (true, _) => "nan",
+        (false, true) => "-inf",
+        (false, false) => "inf",
+    };
+    Some(if upper { word.to_uppercase() } else { word.to_string() })
+}
+
+// `%f`.
+fn format_fixed(v: f64, precision: usize, upper: bool) -> String {
+    non_finite(v, upper).unwrap_or_else(|| format!("{v:.precision$}"))
+}
+
+// `%e`. Rust's own `{:e}` is close but not the same: it writes
+// `3.14159e4` where C writes `3.141590e+04` -- an explicit sign, and at
+// least two exponent digits.
+fn format_exponential(v: f64, precision: usize, upper: bool) -> String {
+    if let Some(word) = non_finite(v, upper) {
+        return word;
+    }
+    let formatted = format!("{v:.precision$e}");
+    let (mantissa, exponent) = formatted.split_once('e').unwrap_or((formatted.as_str(), "0"));
+    let exponent: i32 = exponent.parse().unwrap_or(0);
+    let sign = if exponent < 0 { '-' } else { '+' };
+    let out = format!("{mantissa}e{sign}{:02}", exponent.abs());
+    if upper { out.to_uppercase() } else { out }
+}
+
+// `%g`: whichever of `%e` and `%f` is shorter for this value, with
+// trailing zeros removed. Precision counts *significant* digits here
+// rather than digits after the point, and 0 means 1.
+//
+// The choice is made on the exponent the value has *after* rounding to
+// that many significant digits, not before -- which is why 999999.5 at
+// the default precision is `1e+06` and not `1000000`. Asking Rust for
+// the `%e` form first and reading the exponent back off it is the
+// cheapest way to get that right.
+fn format_general(v: f64, precision: usize, upper: bool) -> String {
+    if let Some(word) = non_finite(v, upper) {
+        return word;
+    }
+    let significant = precision.max(1);
+    let rounded = format!("{v:.*e}", significant - 1);
+    let exponent: i32 = rounded.split_once('e').and_then(|(_, e)| e.parse().ok()).unwrap_or(0);
+    let out = match exponent < -4 || exponent >= significant as i32 {
+        true => format_exponential(v, significant - 1, upper),
+        false => format_fixed(v, (significant as i32 - 1 - exponent).max(0) as usize, upper),
+    };
+    trim_trailing_zeros(&out)
+}
+
+// The `%g` cleanup, applied to the digits only: `1.230000e-05` becomes
+// `1.23e-05`, `100.000` becomes `100`, and a point left with nothing
+// after it goes too.
+fn trim_trailing_zeros(text: &str) -> String {
+    let (digits, suffix) = match text.find(['e', 'E']) {
+        Some(at) => text.split_at(at),
+        None => (text, ""),
+    };
+    if !digits.contains('.') {
+        return text.to_string();
+    }
+    let digits = digits.trim_end_matches('0').trim_end_matches('.');
+    format!("{digits}{suffix}")
+}
+
 // Runs FORMAT once against `values[*idx..]`, advancing `*idx` past
 // however many of them it actually consumed, and appending the result
 // to `out` -- see run_printf's own doc comment for the conversions and
@@ -8509,6 +8646,8 @@ pub(crate) fn printf_format_once(format: &str, values: &[String], idx: &mut usiz
 
         let mut left_align = false;
         let mut zero_pad = false;
+        let mut plus_sign = false;
+        let mut space_sign = false;
         while let Some(&p) = chars.peek() {
             match p {
                 '-' => {
@@ -8517,6 +8656,17 @@ pub(crate) fn printf_format_once(format: &str, values: &[String], idx: &mut usiz
                 }
                 '0' => {
                     zero_pad = true;
+                    chars.next();
+                }
+                // `+` always shows a sign, ` ` shows a space where a
+                // `+` would go -- both only mean anything for a signed
+                // numeric conversion, which is where they are applied.
+                '+' => {
+                    plus_sign = true;
+                    chars.next();
+                }
+                ' ' => {
+                    space_sign = true;
                     chars.next();
                 }
                 _ => break,
@@ -8553,7 +8703,17 @@ pub(crate) fn printf_format_once(format: &str, values: &[String], idx: &mut usiz
             *idx += 1;
             v
         };
-        let numeric = matches!(conv, 'd' | 'i' | 'u' | 'o' | 'x' | 'X');
+        // What zero-padding and the sign flags apply to. Floats are in
+        // both; `u`/`o`/`x`/`X` take the padding but not a sign, which
+        // is what C does with them.
+        let numeric = matches!(conv, 'd' | 'i' | 'u' | 'o' | 'x' | 'X' | 'f' | 'F' | 'e' | 'E' | 'g' | 'G');
+        let signed = matches!(conv, 'd' | 'i' | 'f' | 'F' | 'e' | 'E' | 'g' | 'G');
+        // Zero padding needs digits to sit beside; an infinity or a
+        // NaN has none, so C pads those with spaces however the flags
+        // read. Decided from the value rather than from the text --
+        // `1.0e+20` and `ff` both have letters in them and both pad
+        // with zeros perfectly happily.
+        let mut zero_pad_ok = true;
         let mut piece = match conv {
             's' => {
                 let mut s = next_arg();
@@ -8570,18 +8730,50 @@ pub(crate) fn printf_format_once(format: &str, values: &[String], idx: &mut usiz
             'o' => format!("{:o}", next_arg().trim().parse::<i64>().unwrap_or(0)),
             'x' => format!("{:x}", next_arg().trim().parse::<i64>().unwrap_or(0)),
             'X' => format!("{:X}", next_arg().trim().parse::<i64>().unwrap_or(0)),
+            // The floating-point family. Precision defaults to 6, as C
+            // does, and an argument that is not a number reads as 0 --
+            // the same silent fallback `%d` above already makes (bash
+            // warns and then uses 0; bish has never warned for `%d`
+            // either, and one behaviour for both is worth more here
+            // than half-matching).
+            'f' | 'F' | 'e' | 'E' | 'g' | 'G' => {
+                let value = printf_float(&next_arg());
+                zero_pad_ok = value.is_finite();
+                let precision = precision.unwrap_or(6);
+                match conv {
+                    'f' | 'F' => format_fixed(value, precision, conv == 'F'),
+                    'e' | 'E' => format_exponential(value, precision, conv == 'E'),
+                    _ => format_general(value, precision, conv == 'G'),
+                }
+            }
             // Unrecognized conversion: emitted literally, nothing
             // consumed -- matches bash treating it as plain text rather
             // than silently eating an argument.
             other => format!("%{}", other),
         };
+        if signed && !piece.starts_with('-') {
+            if plus_sign {
+                piece.insert(0, '+');
+            } else if space_sign {
+                piece.insert(0, ' ');
+            }
+        }
         let len = piece.chars().count();
         if len < width {
             let pad = width - len;
+            // Zero padding goes *after* the sign -- `%05d` of -42 is
+            // `-0042`, not `00-42` -- and C does not zero-pad an
+            // infinity or a NaN at all, since there are no digits for
+            // the zeros to be part of.
+            let padded_with_zeros = zero_pad && numeric && zero_pad_ok;
             if left_align {
                 piece.push_str(&" ".repeat(pad));
-            } else if zero_pad && numeric {
-                piece = format!("{}{}", "0".repeat(pad), piece);
+            } else if padded_with_zeros {
+                let (sign, digits) = match piece.starts_with(['-', '+', ' ']) {
+                    true => piece.split_at(1),
+                    false => ("", piece.as_str()),
+                };
+                piece = format!("{sign}{}{digits}", "0".repeat(pad));
             } else {
                 piece = format!("{}{}", " ".repeat(pad), piece);
             }
