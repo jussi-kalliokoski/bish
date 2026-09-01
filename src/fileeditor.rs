@@ -1302,6 +1302,21 @@ pub(crate) trait InsertServices {
     fn signature(&mut self, _buf: &TextBuffer, _row: usize, _col: usize, _typed: Option<char>) -> Option<Vec<String>> {
         None
     }
+
+    /// Whether Insert mode should wait on the terminal once every
+    /// queued key is spent. Real editing does, and must: a macro that
+    /// ends mid-insert leaves you in Insert mode, exactly as vim does.
+    ///
+    /// Tests drive a whole excursion from a macro replay with no
+    /// terminal behind fd 0, where "wait for a keystroke" means wait
+    /// forever -- and used to get away with it only because fd 0
+    /// happened to be at EOF, so the poll said ready and the read said
+    /// None. Run with fd 0 held open by anything that never speaks
+    /// (a socket, an idle pipe) the same tests hang. They answer false
+    /// instead, and Insert mode ends when the replay does.
+    fn awaits_live_input(&self) -> bool {
+        true
+    }
 }
 
 /// For a caller with nothing to offer: no idle work, no completions.
@@ -1314,6 +1329,10 @@ pub(crate) struct NoInsertServices;
 impl InsertServices for NoInsertServices {
     fn idle(&mut self, _buf: &mut TextBuffer) -> Option<IdleRedraw> {
         None
+    }
+
+    fn awaits_live_input(&self) -> bool {
+        false
     }
 }
 
@@ -1448,6 +1467,7 @@ pub(crate) fn run_insert_mode(
     // *foreground job* that asked for it; the two never overlap, since
     // no job is being driven while this loop owns the keyboard.
     let _paste_guard = term::BracketedPasteGuard::enable();
+    let live_input = services.awaits_live_input();
     loop {
         // Waits for a byte to actually be ready *before* calling
         // vk.next_key below, rather than passing `on_idle` as that
@@ -1460,7 +1480,7 @@ pub(crate) fn run_insert_mode(
         // A queued key -- a macro replay, or a mapping's expansion -- is
         // not a byte on stdin, so polling for one would block with keys
         // already in hand and hand them out one per real keystroke.
-        while !vk.has_pending_keys() && !term::stdin_ready(editor::IDLE_POLL_MS) {
+        while !vk.has_pending_keys() && live_input && !term::stdin_ready(editor::IDLE_POLL_MS) {
             if let Some(geometry) = services.idle(buf) {
                 rect = geometry.rect;
                 term_rows = geometry.term_rows;
@@ -1488,7 +1508,7 @@ pub(crate) fn run_insert_mode(
         // own purposes (`<C-r>{register}`, `<C-o>`'s one-shot command)
         // keep using `next_key` and stay unmapped, the same line Normal
         // mode draws with `wants_raw_key`.
-        let key = match vk.next_mapped_key("insert", || editor::read_key_idle(&mut || {}))? {
+        let key = match vk.next_mapped_key("insert", || if live_input { editor::read_key_idle(&mut || {}) } else { Ok(None) })? {
             Some(k) => k,
             None => {
                 buf.set_mark('^', buf.cursor());
@@ -4839,6 +4859,10 @@ def");
 
         fn complete(&mut self, _buf: &TextBuffer, _row: usize, _col: usize) -> Vec<crate::bishedit::completion::EditorCompletion> {
             self.0.clone()
+        }
+
+        fn awaits_live_input(&self) -> bool {
+            false
         }
     }
 
