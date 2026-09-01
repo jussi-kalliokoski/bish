@@ -5273,6 +5273,22 @@ impl Shell {
     // only syscall shape, so reading the current value means setting a
     // throwaway mask and immediately restoring what was there. Moved here
     // alongside run_ulimit for the same M6 sink reason.
+    /// Whether `name` is a builtin that would actually run.
+    ///
+    /// `enable -n NAME` takes one out of service, and everything that
+    /// asks "is this a builtin" has to agree with the dispatch that
+    /// decides -- otherwise `type echo` still calls it a builtin while
+    /// `/usr/bin/echo` is what runs, and a pipeline stage still self-
+    /// execs bish to run a builtin that is not going to run. Both were
+    /// true before this; bash reports the external in both cases.
+    ///
+    /// Deliberately a method where `is_known_builtin` is a free
+    /// function: the question now depends on this shell's own state,
+    /// which a free function cannot see.
+    fn is_active_builtin(&self, name: &str) -> bool {
+        is_known_builtin(name) && !self.disabled_builtins.contains(name)
+    }
+
     // `caller [N]` -- where the function you are in was called from.
     //
     // `caller 0` is the innermost call: the line it sits on, the
@@ -7474,11 +7490,15 @@ impl Shell {
         // of the same name runs instead. Done by handing the dispatch a
         // name no arm can match, rather than by jumping past it: the
         // external path is the code immediately after this match, and
-        // this is the one place that chooses between the two. `builtin
-        // NAME` ignores the setting, as it does in bash -- that is what
-        // `builtin` is for.
+        // this is the one place that chooses between the two.
+        //
+        // `builtin NAME` does not get an exemption. It looks as though
+        // it should -- `builtin` is how you reach past a *function* of
+        // the same name -- but bash refuses a disabled builtin there
+        // too, with "not a shell builtin", which is exactly what
+        // falling through this match produces.
         let dispatch_name: &str =
-            if !builtin_only && self.disabled_builtins.contains(&name) { "\u{0}disabled" } else { name.as_str() };
+            if self.disabled_builtins.contains(&name) { "\u{0}disabled" } else { name.as_str() };
         match dispatch_name {
             // POSIX special builtin: does nothing, exits 0. Its arguments
             // are still expanded (already done via argv above) for side
@@ -8746,7 +8766,7 @@ impl Shell {
                     // argv as single-quoted literals so the child doesn't
                     // re-run any command substitution/glob/etc a second
                     // time.
-                    let mut command = if is_known_builtin(&argv[0]) || self.functions.contains_key(&argv[0]) {
+                    let mut command = if self.is_active_builtin(&argv[0]) || self.functions.contains_key(&argv[0]) {
                         let exe = match std::env::current_exe() {
                             Ok(p) => p,
                             Err(e) => {
@@ -9858,7 +9878,7 @@ impl Shell {
             sh_println!(self, "{}", if verbose { format!("{} is a function", name) } else { name.to_string() });
             return 0;
         }
-        if is_known_builtin(name) {
+        if self.is_active_builtin(name) {
             sh_println!(self, "{}", if verbose { format!("{} is a shell builtin", name) } else { name.to_string() });
             return 0;
         }
@@ -9871,37 +9891,61 @@ impl Shell {
         }
     }
 
-    // type [-p] name... A scoped subset of real bash's `type`: reports
-    // function/builtin/PATH-resolved-executable, or "not found" (status
-    // 1). `-a`/`-t` are accepted but not distinguished from the default.
+    // type [-p] [-t] name... A scoped subset of real bash's `type`:
+    // reports function/builtin/PATH-resolved-executable, or "not found"
+    // (status 1). `-a` is accepted but not distinguished from the
+    // default.
+    //
+    // `-t` prints just the kind -- `function`, `builtin`, `file` -- and
+    // nothing at all for a name that is none of them. That last part is
+    // the point of it: `[ "$(type -t x)" = function ]` is how a script
+    // asks, and a sentence like "x is a shell builtin" fails that test
+    // however true it reads.
     fn run_type(&mut self, args: &[String]) -> i32 {
         let mut path_only = false;
+        let mut kind_only = false;
         let mut names: Vec<&String> = Vec::new();
         for a in args {
             match a.as_str() {
                 "-p" | "-P" => path_only = true,
-                "-a" | "-t" => {}
+                "-t" => kind_only = true,
+                "-a" => {}
                 _ => names.push(a),
             }
         }
         let mut status = 0;
         for name in names {
             if self.functions.contains_key(name.as_str()) {
-                if !path_only {
+                if kind_only {
+                    sh_println!(self, "function");
+                } else if !path_only {
                     sh_println!(self, "{} is a function", name);
                 }
                 continue;
             }
-            if is_known_builtin(name) {
-                if !path_only {
+            if self.is_active_builtin(name) {
+                if kind_only {
+                    sh_println!(self, "builtin");
+                } else if !path_only {
                     sh_println!(self, "{} is a shell builtin", name);
                 }
                 continue;
             }
             match resolve_in_path(name) {
-                Some(p) => sh_println!(self, "{}", if path_only { p } else { format!("{} is {}", name, p) }),
+                Some(p) => {
+                    if kind_only {
+                        sh_println!(self, "file");
+                    } else {
+                        sh_println!(self, "{}", if path_only { p } else { format!("{} is {}", name, p) });
+                    }
+                }
                 None => {
-                    sh_eprintln!(self, "bish: type: {}: not found", name);
+                    // `-t` says nothing about a name it does not know:
+                    // the empty answer is the answer, and bash keeps the
+                    // failing status without the message.
+                    if !kind_only {
+                        sh_eprintln!(self, "bish: type: {}: not found", name);
+                    }
                     status = 1;
                 }
             }
@@ -13236,6 +13280,37 @@ mod tests {
         }
         unsafe { tzset() };
         out
+    }
+
+    #[test]
+    fn a_disabled_builtin_is_not_a_builtin_to_anything_that_asks() {
+        // The dispatch already ran the external; everything that
+        // *classifies* a name had to agree, or `type` called it a
+        // builtin while `/usr/bin/echo` was what ran. Checked against
+        // real bash, which reports the external for all of these.
+        let mut sh = Shell::new();
+        assert!(sh.is_active_builtin("echo"));
+        sh.run_enable(&["-n".to_string(), "echo".to_string()]);
+        assert!(!sh.is_active_builtin("echo"), "type, command -v and the pipeline self-exec all ask this");
+        assert!(is_known_builtin("echo"), "still a builtin bish knows about -- `enable echo` has to find it");
+        sh.run_enable(&["echo".to_string()]);
+        assert!(sh.is_active_builtin("echo"));
+    }
+
+    #[test]
+    fn type_t_prints_the_kind_and_nothing_else() {
+        // `[ "$(type -t x)" = function ]` is how a script asks, and a
+        // sentence fails that test however true it reads.
+        let mut sh = Shell::new();
+        let out = std::rc::Rc::new(std::cell::RefCell::new(String::new()));
+        sh.set_sink_capture(out.clone());
+        sh.run_source_here("f() { :; }\ntype -t f\ntype -t echo\ntype -t nosuchthing_at_all\n", "<test>");
+        let text = out.borrow().clone();
+        assert!(text.contains("function"), "{text:?}");
+        assert!(text.contains("builtin"), "{text:?}");
+        // A name it does not know says nothing at all -- the empty
+        // answer is the answer.
+        assert!(!text.contains("not found"), "{text:?}");
     }
 
     #[test]
