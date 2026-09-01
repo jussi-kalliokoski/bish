@@ -422,6 +422,109 @@ enum PaneLayout {
 // fg`, or now within one window too), a session is only ever dropped
 // from `sessions` once no pane anywhere references it, at any depth --
 // see close_orphaned_sessions.
+/// Everything the window manager keeps for as long as the shell runs.
+///
+/// This is not a design so much as an observation: these eighteen
+/// values were already created together at the top of `run` and already
+/// passed together everywhere, and `run_normal_mode_navigation` took
+/// twenty parameters of which sixteen were these. That is what
+/// thirty-one `#[allow(clippy::too_many_arguments)]` in one file looks
+/// like from the inside, and it is why threading one more value through
+/// -- `current_window`, when panes learned to be clicked -- meant
+/// editing a dozen unrelated signatures.
+///
+/// What is *not* here is as deliberate: anything that belongs to one
+/// call rather than to the session (`session_id`, `edit_frame_id`,
+/// `rect`, `start: NavStart`) stays a parameter. A function's own
+/// arguments should say what that call is about; `App` is the part that
+/// is the same for every call.
+///
+/// The small, cohesive helpers keep their narrow signatures --
+/// `sync_semantic_tokens(&mut app.sessions, session_id, buf)` says more
+/// than the same call taking the whole world would, and a disjoint
+/// field borrow is exactly what makes that spelling work.
+struct App {
+    sessions: HashMap<SessionId, SessionState>,
+    windows: Vec<WindowEntry>,
+    current_window: usize,
+    next_session_id: SessionId,
+    next_window_id: u32,
+    // Owns every currently-fg'd job, keyed by the id a Frame::Job on
+    // some window's stack points to -- see Frame's doc comment for why
+    // a job isn't stored directly in the stack itself.
+    job_frames: HashMap<JobFrameId, exec::FgJob>,
+    next_job_frame_id: JobFrameId,
+    // Same idea as job_frames, for `e`'s own detachable editor sessions
+    // (Frame::Edit) -- see Frame's own doc comment.
+    //
+    // While one is being driven it is *not* in here: `run_edit_frame`
+    // takes it out first and puts it back on the way out, so what this
+    // map holds during an edit is exactly every *other* open buffer --
+    // which is to say, exactly the files a cross-file edit must not
+    // write behind the user's back. See `rename_via_server`, which
+    // depends on that.
+    edit_frames: HashMap<EditFrameId, fileeditor::EditSession>,
+    // `gd` into another file makes a frame of its own, and this is the
+    // counter those ids come from.
+    next_edit_frame_id: EditFrameId,
+    // `e --hex`'s own equivalent of edit_frames -- see Frame::Hex.
+    hex_frames: HashMap<HexFrameId, hexedit::HexSession>,
+    next_hex_frame_id: HexFrameId,
+    // Same idea again, for `:dbg`'s own attached sessions
+    // (Frame::DebugRun) -- see Frame's own doc comment.
+    debug_frames: HashMap<EditFrameId, debugger::DebugSession>,
+    // `gr`'s answers, keyed like `debug_frames` -- see Frame::Locations.
+    location_lists: HashMap<EditFrameId, LocationList>,
+    cmd_history: History,
+    // The whole-shell register table (yank/put/<C-r>) -- one instance,
+    // shared globally across every window/pane/session, matching both
+    // vim (registers are global to the editor instance, not per-buffer)
+    // and tmux (paste buffers are global to the server, not per-pane).
+    // See bishedit::registers::Registers' own doc comment.
+    registers: Registers,
+    // Flips true (and stays true) the first time any window-family
+    // command promotes the terminal -- see apply_window_action. Every
+    // session's sink is Real until then, matching today's plain
+    // behavior exactly when `:`/`window` are never invoked.
+    sinks_are_grid: bool,
+    term_rows: usize,
+    term_cols: usize,
+}
+
+impl App {
+    // The focused window's own entry, which nearly every caller wants
+    // before it wants anything else.
+    fn window(&self) -> &WindowEntry {
+        &self.windows[self.current_window]
+    }
+
+    fn window_mut(&mut self) -> &mut WindowEntry {
+        &mut self.windows[self.current_window]
+    }
+
+    // Registers are the one part of `App` a call regularly needs
+    // *beside* the rest of it: `editor::read_line` and
+    // `fileeditor::run_insert_mode` both take `&mut Registers` and an
+    // idle hook that reaches back into the shell, and those are two
+    // mutable borrows of the same `App`. Lending the field out and
+    // putting it back is what keeps it from having to live outside
+    // `App` and be threaded separately again.
+    fn with_registers<T>(&mut self, body: impl FnOnce(&mut App, &mut Registers) -> T) -> T {
+        let mut registers = std::mem::take(&mut self.registers);
+        let out = body(self, &mut registers);
+        self.registers = registers;
+        out
+    }
+
+    // The focused pane's own rectangle. Not the whole screen: a pager,
+    // the browser and the hex view all paint inside their own pane and
+    // leave the neighbours alone.
+    fn focused_pane_rect(&self) -> Rect {
+        let window = self.window();
+        pane_rect(window, window.focused_pane, self.term_rows, self.term_cols)
+    }
+}
+
 struct WindowEntry {
     id: u32,
     // What this window is called, if anything -- `window create --name`
@@ -536,41 +639,40 @@ pub(crate) fn content_rows(term_rows: usize) -> usize {
 // driving it, so drive_fg_job catches that one's pty up itself, reacting
 // to this same screen resize (see its own doc comment) rather than
 // polling WINCH a second time.
-fn poll_and_apply_resize(
-    sessions: &HashMap<SessionId, SessionState>,
-    windows: &[WindowEntry],
-    job_frames: &mut HashMap<JobFrameId, exec::FgJob>,
-    term_rows: &mut usize,
-    term_cols: &mut usize,
-    sinks_are_grid: bool,
-    current_window: usize,
-) -> bool {
+fn poll_and_apply_resize(app: &mut App) -> bool {
     use std::os::unix::io::AsRawFd;
     if !exec::take_winch() {
         return false;
     }
     let (rows, cols) = query_term_size();
-    if (rows, cols) == (*term_rows, *term_cols) {
+    if (rows, cols) == (app.term_rows, app.term_cols) {
         return false;
     }
-    *term_rows = rows;
-    *term_cols = cols;
-    for s in sessions.values() {
-        s.screen.borrow_mut().resize(content_rows(*term_rows), *term_cols);
+    app.term_rows = rows;
+    app.term_cols = cols;
+    for s in app.sessions.values() {
+        s.screen.borrow_mut().resize(content_rows(app.term_rows), app.term_cols);
     }
-    for window in windows {
-        for pane in &window.panes {
-            if let Some(Frame::Job(job_frame_id)) = pane.stack.last()
-                && let Some(job) = job_frames.get_mut(job_frame_id)
-            {
-                let sid = pane.owning_session();
-                let (rows, cols) = sessions[&sid].screen.borrow().size();
-                let _ = pty::set_size(job.pty_master().as_raw_fd(), rows as u16, cols as u16);
-            }
+    // Read out of the pane tree first, because resizing one reaches
+    // into `sessions` and `job_frames` both, and the walk itself is
+    // already holding `windows`.
+    let running: Vec<(JobFrameId, SessionId)> = app
+        .windows
+        .iter()
+        .flat_map(|window| window.panes.iter())
+        .filter_map(|pane| match pane.stack.last() {
+            Some(Frame::Job(job_frame_id)) => Some((*job_frame_id, pane.owning_session())),
+            _ => None,
+        })
+        .collect();
+    for (job_frame_id, sid) in running {
+        let (rows, cols) = app.sessions[&sid].screen.borrow().size();
+        if let Some(job) = app.job_frames.get_mut(&job_frame_id) {
+            let _ = pty::set_size(job.pty_master().as_raw_fd(), rows as u16, cols as u16);
         }
     }
-    if sinks_are_grid {
-        compositor_redraw(sessions, windows, current_window, *term_rows, *term_cols);
+    if app.sinks_are_grid {
+        compositor_redraw(app);
     }
     true
 }
@@ -624,15 +726,7 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
     shell.enable_shopt("expand_aliases");
 
     let history_size = shell.bishopt_int("history_size").max(0) as usize;
-    let mut cmd_history = History::load(".bish_cmd_history", history_size);
-    // The whole-shell register table (yank/put/<C-r>) -- one instance,
-    // shared globally across every window/pane/session, matching both vim
-    // (registers are global to the editor instance, not per-buffer) and
-    // tmux (paste buffers are global to the server, not per-pane). See
-    // bishedit::registers::Registers' own doc comment.
-    let mut registers = Registers::new();
-
-    let (mut term_rows, mut term_cols) = query_term_size();
+    let (term_rows, term_cols) = query_term_size();
 
     let mut sessions: HashMap<SessionId, SessionState> = HashMap::new();
     let root_screen = Rc::new(RefCell::new(vt100::Screen::new(content_rows(term_rows), term_cols)));
@@ -663,31 +757,29 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
             command_transcript: Vec::new(),
         },
     );
-    let mut windows: Vec<WindowEntry> = vec![WindowEntry::single(0, Frame::Session(0))];
-    let mut current_window: usize = 0;
-    let mut next_session_id: SessionId = 1;
-    let mut next_window_id: u32 = 1;
-    // Owns every currently-fg'd job, keyed by the id a Frame::Job on some
-    // window's stack points to -- see Frame's doc comment for why a job
-    // isn't stored directly in the stack itself.
-    let mut job_frames: HashMap<JobFrameId, exec::FgJob> = HashMap::new();
-    let mut next_job_frame_id: JobFrameId = 1;
-    // Same idea as job_frames, for `e`'s own detachable editor sessions
-    // (Frame::Edit) -- see Frame's own doc comment.
-    let mut edit_frames: HashMap<EditFrameId, fileeditor::EditSession> = HashMap::new();
-    let mut next_edit_frame_id: EditFrameId = 1;
-    // `e --hex`'s own equivalent of edit_frames -- see Frame::Hex.
-    let mut hex_frames: HashMap<HexFrameId, hexedit::HexSession> = HashMap::new();
-    let mut next_hex_frame_id: HexFrameId = 1;
-    // Same idea again, for `:dbg`'s own attached sessions (Frame::
-    // DebugRun) -- see Frame's own doc comment.
-    let mut debug_frames: HashMap<EditFrameId, debugger::DebugSession> = HashMap::new();
-    let mut location_lists: HashMap<EditFrameId, LocationList> = HashMap::new();
-    // Flips true (and stays true) the first time any window-family
-    // command promotes the terminal -- see apply_window_action. Every
-    // session's sink is Real until then, matching today's plain behavior
-    // exactly when `:`/`window` are never invoked.
-    let mut sinks_are_grid = false;
+    // Everything the window manager keeps for as long as this loop runs
+    // -- see `App`. Bound as a `&mut` right away so that every call
+    // below spells it the same way the callees do.
+    let app = &mut App {
+        sessions,
+        windows: vec![WindowEntry::single(0, Frame::Session(0))],
+        current_window: 0,
+        next_session_id: 1,
+        next_window_id: 1,
+        job_frames: HashMap::new(),
+        next_job_frame_id: 1,
+        edit_frames: HashMap::new(),
+        next_edit_frame_id: 1,
+        hex_frames: HashMap::new(),
+        next_hex_frame_id: 1,
+        debug_frames: HashMap::new(),
+        location_lists: HashMap::new(),
+        cmd_history: History::load(".bish_cmd_history", history_size),
+        registers: Registers::new(),
+        sinks_are_grid: false,
+        term_rows,
+        term_cols,
+    };
     // Set only when run_normal_mode_navigation returns text/cursor to
     // resume editing with (see its own doc comment) -- consumed by the
     // very next editor::read_line call below, then left None again for
@@ -704,8 +796,8 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
     // without it, the tab bar wouldn't actually be drawn until the user's
     // first keystroke or a resize.
     if start_promoted {
-        ensure_promoted(&mut sessions, &mut sinks_are_grid);
-        compositor_redraw(&sessions, &windows, current_window, term_rows, term_cols);
+        ensure_promoted(&mut app.sessions, &mut app.sinks_are_grid);
+        compositor_redraw(app);
     }
 
     loop {
@@ -716,9 +808,9 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
         // so it lands within a poll tick rather than waiting for the next
         // keystroke. This comment used to claim the opposite, from before
         // that idle hook existed.
-        poll_and_apply_resize(&sessions, &windows, &mut job_frames, &mut term_rows, &mut term_cols, sinks_are_grid, current_window);
+        poll_and_apply_resize(app);
 
-        let session_id = windows[current_window].owning_session();
+        let session_id = app.windows[app.current_window].owning_session();
 
         // The focused window's top frame is a running job (M10c): it was
         // either just pushed by the fg_pending branch below, or -- the
@@ -726,25 +818,8 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
         // window they'd earlier detached from (drive_fg_job's
         // FgOutcome::Detached) while it kept running in the background.
         // Either way, drive it the same way.
-        if let Frame::Job(job_frame_id) = *windows[current_window].stack().last().unwrap() {
-            run_fg_job_frame(
-                job_frame_id,
-                session_id,
-                &mut sessions,
-                &mut windows,
-                &mut current_window,
-                &mut next_session_id,
-                &mut next_window_id,
-                &mut job_frames,
-                &mut debug_frames,
-                &mut location_lists,
-                &mut edit_frames,
-                &mut cmd_history,
-                &mut sinks_are_grid,
-                &mut registers,
-                &mut term_rows,
-                &mut term_cols,
-            );
+        if let Frame::Job(job_frame_id) = *app.windows[app.current_window].stack().last().unwrap() {
+            run_fg_job_frame(app, job_frame_id, session_id);
             let _ = io::stdout().flush();
             continue;
         }
@@ -753,26 +828,8 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
         // `Frame::Edit` -- either just pushed by the pending_edit
         // handling below, or the user switched back to a window they'd
         // earlier detached an `e` session from.
-        if let Frame::Edit(edit_frame_id) = *windows[current_window].stack().last().unwrap() {
-            run_edit_frame(
-                edit_frame_id,
-                session_id,
-                &mut sessions,
-                &mut windows,
-                &mut current_window,
-                &mut next_session_id,
-                &mut next_window_id,
-                &mut job_frames,
-                &mut edit_frames,
-                &mut next_edit_frame_id,
-                &mut debug_frames,
-                &mut location_lists,
-                &mut cmd_history,
-                &mut sinks_are_grid,
-                &mut registers,
-                &mut term_rows,
-                &mut term_cols,
-            );
+        if let Frame::Edit(edit_frame_id) = *app.windows[app.current_window].stack().last().unwrap() {
+            run_edit_frame(app, edit_frame_id, session_id);
             let _ = io::stdout().flush();
             continue;
         }
@@ -780,23 +837,8 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
         // Same idea again, for `e --hex`'s own byte-buffer frame -- see
         // Frame::Hex, and run_hex_frame for why it can't simply reuse
         // run_edit_frame.
-        if let Frame::Hex(hex_frame_id) = *windows[current_window].stack().last().unwrap() {
-            run_hex_frame(
-                hex_frame_id,
-                session_id,
-                &mut sessions,
-                &mut windows,
-                &mut current_window,
-                &mut next_session_id,
-                &mut next_window_id,
-                &mut job_frames,
-                &mut hex_frames,
-                &mut cmd_history,
-                &mut sinks_are_grid,
-                &mut registers,
-                &mut term_rows,
-                &mut term_cols,
-            );
+        if let Frame::Hex(hex_frame_id) = *app.windows[app.current_window].stack().last().unwrap() {
+            run_hex_frame(app, hex_frame_id, session_id);
             let _ = io::stdout().flush();
             continue;
         }
@@ -805,21 +847,8 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
         // pane (see split_diagnostics_pane) -- reached whenever the user
         // navigates focus onto it (<C-w>j, or clicking its own
         // collapsed title bar).
-        if let Frame::Diagnostics(edit_frame_id) = *windows[current_window].stack().last().unwrap() {
-            run_diagnostics_frame(
-                windows[current_window].focused_pane,
-                edit_frame_id,
-                &mut sessions,
-                &mut windows,
-                &mut current_window,
-                &mut next_session_id,
-                &mut next_window_id,
-                &mut job_frames,
-                &mut edit_frames,
-                &mut sinks_are_grid,
-                &mut term_rows,
-                &mut term_cols,
-            );
+        if let Frame::Diagnostics(edit_frame_id) = *app.windows[app.current_window].stack().last().unwrap() {
+            run_diagnostics_frame(app, app.windows[app.current_window].focused_pane, edit_frame_id);
             let _ = io::stdout().flush();
             continue;
         }
@@ -827,23 +856,8 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
         // Same idea again, for the `gr`-created location list (see
         // split_locations_pane) -- reached whenever focus lands on it,
         // by <C-w>j or by clicking its collapsed title bar.
-        if let Frame::Locations(edit_frame_id) = *windows[current_window].stack().last().unwrap() {
-            run_locations_frame(
-                windows[current_window].focused_pane,
-                edit_frame_id,
-                &mut sessions,
-                &mut windows,
-                &mut current_window,
-                &mut next_session_id,
-                &mut next_window_id,
-                &mut job_frames,
-                &mut edit_frames,
-                &mut next_edit_frame_id,
-                &mut location_lists,
-                &mut sinks_are_grid,
-                &mut term_rows,
-                &mut term_cols,
-            );
+        if let Frame::Locations(edit_frame_id) = *app.windows[app.current_window].stack().last().unwrap() {
+            run_locations_frame(app, app.windows[app.current_window].focused_pane, edit_frame_id);
             let _ = io::stdout().flush();
             continue;
         }
@@ -853,20 +867,8 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
         // navigates focus onto it directly while nothing is actually
         // running (a real run takes over the terminal itself -- see
         // run_debug_run_frame's own doc comment).
-        if let Frame::DebugRun(edit_frame_id) = *windows[current_window].stack().last().unwrap() {
-            run_debug_run_frame(
-                windows[current_window].focused_pane,
-                edit_frame_id,
-                &mut sessions,
-                &mut windows,
-                &mut current_window,
-                &mut next_session_id,
-                &mut next_window_id,
-                &debug_frames,
-                &mut sinks_are_grid,
-                &mut term_rows,
-                &mut term_cols,
-            );
+        if let Frame::DebugRun(edit_frame_id) = *app.windows[app.current_window].stack().last().unwrap() {
+            run_debug_run_frame(app, app.windows[app.current_window].focused_pane, edit_frame_id);
             let _ = io::stdout().flush();
             continue;
         }
@@ -889,8 +891,8 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
         // fails/times out (`None`) is treated as "assume no newline
         // needed," the same as before this existed, rather than risking
         // a stall.
-        if !sinks_are_grid {
-            let shell = &sessions[&session_id].shell;
+        if !app.sinks_are_grid {
+            let shell = &app.sessions[&session_id].shell;
             let ran_external = shell.take_ran_external();
             // Always drained, even when about to be superseded by the
             // DSR query below -- otherwise a stale `true` left over from
@@ -910,56 +912,56 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
         // `PROMPT_COMMAND` is to change what the prompt then says. Only
         // for a *primary* prompt -- bash does not run it before a
         // continuation line either.
-        if sessions.get(&session_id).is_some_and(|s| s.buffer.is_empty())
-            && let Some(session) = sessions.get_mut(&session_id)
+        if app.sessions.get(&session_id).is_some_and(|s| s.buffer.is_empty())
+            && let Some(session) = app.sessions.get_mut(&session_id)
         {
             session.shell.run_prompt_command();
         }
         let prompt_str = {
-            let session = &sessions[&session_id];
+            let session = &app.sessions[&session_id];
             if session.buffer.is_empty() { prompt::render(&session.shell) } else { prompt::continuation() }
         };
-        let (col_origin, width) = focused_col_origin(&windows[current_window], sinks_are_grid, term_rows, term_cols);
+        let (col_origin, width) = focused_col_origin(&app.windows[app.current_window], app.sinks_are_grid, app.term_rows, app.term_cols);
         // A standalone snapshot, not a live borrow: on_idle below needs
-        // its own mutable borrow of `sessions` (to service other
-        // windows' jobs), which would conflict with holding this
+        // its own mutable borrow of `app.sessions` (to service other
+        // app.windows' jobs), which would conflict with holding this
         // session's own History borrowed for the whole call otherwise.
         // Nothing recorded elsewhere during this one read_line call
         // needs to be visible mid-browse anyway (see History's own doc
         // comment on what a clone/fork actually shares).
-        let session_history = sessions[&session_id].history.borrow().clone();
+        let session_history = app.sessions[&session_id].history.borrow().clone();
         // Same "standalone snapshot, not a live borrow" reasoning as
-        // session_history just above -- on_idle's own &mut sessions borrow
-        // below would conflict with borrowing sessions[&session_id].shell's
+        // session_history just above -- on_idle's own &mut app.sessions borrow
+        // below would conflict with borrowing app.sessions[&session_id].shell's
         // own cwd/functions directly as same-call arguments. Function
         // *names* only, not bodies -- cheap to clone, and all the
         // command-validity check needs (see HighlightContext's own doc
         // comment on why aliases are deliberately not included here too).
-        let cwd_snapshot = sessions[&session_id].shell.cwd.clone();
-        let known_functions: HashSet<String> = sessions[&session_id].shell.function_names().map(String::from).collect();
+        let cwd_snapshot = app.sessions[&session_id].shell.cwd.clone();
+        let known_functions: HashSet<String> = app.sessions[&session_id].shell.function_names().map(String::from).collect();
         // Same owned-snapshot pattern as cwd_snapshot/known_functions --
         // read_line's own abbrs param needs this session's current table
         // by the time expand_abbr_at_cursor runs, not a live borrow held
         // for the whole call (which would conflict with on_idle's own
-        // &mut sessions borrow below, same reasoning as session_history).
+        // &mut app.sessions borrow below, same reasoning as session_history).
         // Narrowed to the abbreviations that target this context's own
         // language while we're at it: a shell prompt *is* bash, which is
         // also `abbr`'s own default, so an abbreviation written without a
         // thought about languages is still live exactly here.
-        let abbrs_snapshot = snippet::for_language(&sessions[&session_id].shell.abbrs, snippet::DEFAULT_LANG);
+        let abbrs_snapshot = snippet::for_language(&app.sessions[&session_id].shell.abbrs, snippet::DEFAULT_LANG);
         // Same owned-snapshot pattern again -- this redraw's live
         // `::bish hl` colours, resolved once up front rather than
         // re-querying the shell per span. See syntax_color_overrides'
         // own doc comment.
-        let color_overrides = syntax_color_overrides(&sessions[&session_id].shell);
+        let color_overrides = syntax_color_overrides(&app.sessions[&session_id].shell);
         // Read per redraw for the same reason the colours are: `bishopt
         // --set hyperlinks off` should take effect on the next keystroke,
         // not the next shell.
-        let hyperlinks = sessions[&session_id].shell.bishopt_bool("hyperlinks");
+        let hyperlinks = app.sessions[&session_id].shell.bishopt_bool("hyperlinks");
         // Read per redraw for the same reason: `bishopt --set mouse off`
         // should hand the terminal's own selection back on the next
         // prompt, not the next shell.
-        let mouse = sessions[&session_id].shell.bishopt_bool("mouse");
+        let mouse = app.sessions[&session_id].shell.bishopt_bool("mouse");
         let highlight_ctx =
             HighlightContext {
                 cwd: Some(cwd_snapshot.as_path()),
@@ -975,28 +977,28 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
         // own doc comment). One PATH scan per prompt (inside
         // action_context), not per keystroke -- same cost class as
         // known_functions/abbrs_snapshot just above.
-        let completions_snapshot = sessions[&session_id].shell.completions_snapshot();
-        let default_completion_snapshot = sessions[&session_id].shell.default_completion_snapshot();
-        let action_ctx_snapshot = sessions[&session_id].shell.action_context();
-        let preamble_snapshot = sessions[&session_id].shell.functions_preamble();
+        let completions_snapshot = app.sessions[&session_id].shell.completions_snapshot();
+        let default_completion_snapshot = app.sessions[&session_id].shell.default_completion_snapshot();
+        let action_ctx_snapshot = app.sessions[&session_id].shell.action_context();
+        let preamble_snapshot = app.sessions[&session_id].shell.functions_preamble();
         // Same owned-snapshot pattern as highlight_ctx just above -- built
         // from the exact same locals, not re-snapshotted.
         let shell_completion = completion::ShellCompletionProvider {
-            honor_gitignore: sessions[&session_id].shell.bishopt_bool("gitignore"),
+            honor_gitignore: app.sessions[&session_id].shell.bishopt_bool("gitignore"),
             // Read per prompt, like every other snapshot here: `FIGNORE`
             // is an ordinary variable and `force_fignore` an ordinary
             // shopt, so both can change between one command and the next.
-            fignore: sessions[&session_id]
+            fignore: app.sessions[&session_id]
                 .shell
                 .fignore_suffixes(),
-            force_fignore: sessions[&session_id].shell.shopt_is_on("force_fignore"),
+            force_fignore: app.sessions[&session_id].shell.shopt_is_on("force_fignore"),
             cwd: Some(cwd_snapshot.as_path()),
             known_functions: Some(&known_functions),
             completions: Some(&completions_snapshot),
             default_completion: default_completion_snapshot.as_ref(),
             action_ctx: Some(&action_ctx_snapshot),
             functions_preamble: Some(&preamble_snapshot),
-            hl_names: sessions[&session_id].shell.hl_colors().into_iter().map(|(name, _)| name).collect(),
+            hl_names: app.sessions[&session_id].shell.hl_colors().into_iter().map(|(name, _)| name).collect(),
         };
         // Same pattern again -- session_history is already the exact
         // snapshot the suggestions engine itself needs (see History's
@@ -1018,22 +1020,27 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
         // mode gets its own, absolute-positioned path instead (see
         // redraw_with_completion_row's own doc comment and
         // completion_menu_rows).
-        let cursor_row = sessions[&session_id].screen.borrow().cursor().0;
-        let row_origin = completion_menu_rows(&windows[current_window], sinks_are_grid, cursor_row, term_rows, term_cols);
-        let menu_capable = !sinks_are_grid || row_origin.is_some();
+        let cursor_row = app.sessions[&session_id].screen.borrow().cursor().0;
+        let row_origin = completion_menu_rows(&app.windows[app.current_window], app.sinks_are_grid, cursor_row, app.term_rows, app.term_cols);
+        let menu_capable = !app.sinks_are_grid || row_origin.is_some();
 
         // Ctrl-E's own live search input draws at the shared global
         // status row using this exact snapshot -- a plain `(usize,
         // usize)` copy taken before `on_idle` below gets its own `&mut`
-        // borrow of the same `term_rows`/`term_cols` (see read_line's
+        // borrow of the same `app.term_rows`/`app.term_cols` (see read_line's
         // own doc comment on this param for why a snapshot, not a live
         // reference, is the right trade here).
-        let global_row_size = Some((term_rows, term_cols));
-        match editor::read_line(
+        let global_row_size = Some((app.term_rows, app.term_cols));
+        // Read before the call: the idle hook below borrows the whole
+        // `app`, so an argument that reads a field of it has to have
+        // been read already.
+        let promoted = app.sinks_are_grid;
+        let outcome = app.with_registers(|app, registers| {
+            editor::read_line(
             &prompt_str,
             &session_history,
             false,
-            sinks_are_grid,
+            app.sinks_are_grid,
             pending_initial.take(),
             col_origin,
             width,
@@ -1042,7 +1049,7 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
             Some(&arith_suggestion),
             menu_capable,
             row_origin,
-            &mut registers,
+            registers,
             &abbrs_snapshot,
             global_row_size,
             // Repaints the panes when something arrived underneath this
@@ -1052,20 +1059,22 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
             // why the signal is threaded through rather than either side
             // just redrawing everything.
             || {
-                let changed = service_background_jobs(&mut sessions, &mut windows, &mut job_frames, current_window, &mut term_rows, &mut term_cols, sinks_are_grid);
-                if changed && sinks_are_grid {
-                    compositor_redraw(&sessions, &windows, current_window, term_rows, term_cols);
+                let changed = service_background_jobs(app);
+                if changed && app.sinks_are_grid {
+                    compositor_redraw(app);
                 }
                 changed
             },
-            prompt_claims_mouse(mouse, sinks_are_grid),
+            prompt_claims_mouse(mouse, promoted),
             // The shell prompt is not one of the modes `::bish map`
             // knows -- an inert table keeps it behaving exactly as it
             // did before there were any mappings, and nothing can have
             // queued keys for it.
             Vec::new(),
             Vec::new(),
-        ) {
+        )
+        });
+        match outcome {
             Ok(ReadOutcome::Eof) => {
                 // Whether closing *this* (window, top-frame) reference
                 // would leave the session with no reference anywhere
@@ -1075,8 +1084,8 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
                 // EOF closing just one of those references shouldn't
                 // fire the exit trap for a session that's still alive
                 // and reachable elsewhere.
-                let will_orphan = !session_referenced_elsewhere(&windows, current_window, session_id);
-                let is_final_exit = will_orphan && windows.len() == 1 && windows[current_window].panes.len() == 1 && windows[current_window].stack().len() == 1;
+                let will_orphan = !session_referenced_elsewhere(&app.windows, app.current_window, session_id);
+                let is_final_exit = will_orphan && app.windows.len() == 1 && app.windows[app.current_window].panes.len() == 1 && app.windows[app.current_window].stack().len() == 1;
                 // Real bash refuses a plain Ctrl-D exit the first time
                 // there's a stopped job ("There are stopped jobs."),
                 // requiring a second immediate EOF to actually confirm
@@ -1088,18 +1097,18 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
                 // across every session -- see the `jobs` field comment
                 // in exec.rs), so there's nothing to warn about there.
                 if is_final_exit {
-                    let session = sessions.get_mut(&session_id).unwrap();
+                    let session = app.sessions.get_mut(&session_id).unwrap();
                     if session.buffer.is_empty() && session.shell.has_stopped_jobs() && !session.warned_stopped_jobs {
                         session.shell.sink_err("bish: There are stopped jobs.\n");
                         session.warned_stopped_jobs = true;
-                        if sinks_are_grid {
-                            compositor_redraw(&sessions, &windows, current_window, term_rows, term_cols);
+                        if app.sinks_are_grid {
+                            compositor_redraw(app);
                         }
                         let _ = io::stdout().flush();
                         continue;
                     }
                 }
-                let session = sessions.get_mut(&session_id).unwrap();
+                let session = app.sessions.get_mut(&session_id).unwrap();
                 if !session.buffer.is_empty() {
                     session.shell.sink_err("bish: syntax error: unexpected end of input\n");
                 }
@@ -1126,20 +1135,10 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
                 }
                 // Otherwise: EOF on a window's top frame pops/closes it,
                 // same as `window close` would.
-                apply_window_action(
-                    WindowAction::Close,
-                    &mut sessions,
-                    &mut windows,
-                    &mut current_window,
-                    &mut next_session_id,
-                    &mut next_window_id,
-                    &mut sinks_are_grid,
-                    term_rows,
-                    term_cols,
-                );
+                apply_window_action(app, WindowAction::Close);
             }
-            // ctrl_l_reports is now `sinks_are_grid` for this call: at
-            // the plain, unwindowed prompt (sinks_are_grid false) it's
+            // ctrl_l_reports is now `app.sinks_are_grid` for this call: at
+            // the plain, unwindowed prompt (app.sinks_are_grid false) it's
             // still false, so Ctrl-L keeps meaning "clear the real
             // screen" exactly as before, handled inside read_line itself
             // -- this arm is unreachable there, same as it always was.
@@ -1163,9 +1162,9 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
             // cursor) both already key off exactly this field, so nothing
             // else needs to change for either the unsplit or split case.
             Ok(ReadOutcome::CtrlL) => {
-                if sinks_are_grid {
-                    sessions.get_mut(&session_id).unwrap().screen.borrow_mut().feed(b"\x1b[H\x1b[2J");
-                    compositor_redraw(&sessions, &windows, current_window, term_rows, term_cols);
+                if app.sinks_are_grid {
+                    app.sessions.get_mut(&session_id).unwrap().screen.borrow_mut().feed(b"\x1b[H\x1b[2J");
+                    compositor_redraw(app);
                 }
             }
             // A qualifying left click while typing at the plain prompt --
@@ -1188,19 +1187,19 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
             // there (switching panes/tabs must never relocate what was
             // being typed into a different pane's own prompt).
             Ok(ReadOutcome::Mouse { event, text, cursor }) => {
-                let target = if sinks_are_grid { hit_test_click(event, &sessions, &windows, current_window, term_rows, term_cols) } else { None };
+                let target = if app.sinks_are_grid { hit_test_click(app, event) } else { None };
                 match target {
-                    Some(ClickTarget::Window(idx)) if idx != current_window => {
-                        freeze_input_with_text(sessions.get_mut(&session_id).unwrap(), &text);
-                        current_window = idx;
-                        compositor_redraw(&sessions, &windows, current_window, term_rows, term_cols);
+                    Some(ClickTarget::Window(idx)) if idx != app.current_window => {
+                        freeze_input_with_text(app.sessions.get_mut(&session_id).unwrap(), &text);
+                        app.current_window = idx;
+                        compositor_redraw(app);
                     }
-                    Some(ClickTarget::Pane(pane_id)) if pane_id != windows[current_window].focused_pane => {
-                        freeze_input_with_text(sessions.get_mut(&session_id).unwrap(), &text);
+                    Some(ClickTarget::Pane(pane_id)) if pane_id != app.windows[app.current_window].focused_pane => {
+                        freeze_input_with_text(app.sessions.get_mut(&session_id).unwrap(), &text);
                         // Going to a pane is how you get a minimized one back.
-                        restore_if_minimized(&mut windows[current_window], pane_id);
-                        windows[current_window].focused_pane = pane_id;
-                        compositor_redraw(&sessions, &windows, current_window, term_rows, term_cols);
+                        restore_if_minimized(&mut app.windows[app.current_window], pane_id);
+                        app.windows[app.current_window].focused_pane = pane_id;
+                        compositor_redraw(app);
                     }
                     Some(ClickTarget::Divider(divider)) => {
                         // Resume the prompt afterwards with exactly what
@@ -1208,22 +1207,13 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
                         // it, any more than clicking the pane it's
                         // already in would be.
                         pending_initial = Some((text, cursor));
-                        drag_divider(
-                            &divider,
-                            &mut sessions,
-                            &mut windows,
-                            &mut job_frames,
-                            current_window,
-                            &mut term_rows,
-                            &mut term_cols,
-                            sinks_are_grid,
-                        );
+                        drag_divider(app, &divider);
                     }
                     _ => pending_initial = Some((text, cursor)),
                 }
             }
             Ok(ReadOutcome::Interrupted { text }) => {
-                let session = sessions.get_mut(&session_id).unwrap();
+                let session = app.sessions.get_mut(&session_id).unwrap();
                 // editor::read_line's own Key::CtrlC arm prints a bare
                 // "^C\r\n" with no awareness of pane boundaries or the
                 // tab bar -- on a pane's own last row this can land on
@@ -1247,7 +1237,7 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
                 // continuation prompt over the primary one off that same
                 // buffer, and what was on screen was whichever one this
                 // line was actually read with.
-                if sinks_are_grid {
+                if app.sinks_are_grid {
                     freeze_interrupted_line(session, &text);
                 }
                 // Ctrl-C abandons whatever multi-line construct was
@@ -1256,12 +1246,12 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
                 // Same re-arming as a real Line -- Ctrl-C isn't an
                 // immediate repeated Ctrl-D either.
                 session.warned_stopped_jobs = false;
-                if sinks_are_grid {
-                    compositor_redraw(&sessions, &windows, current_window, term_rows, term_cols);
+                if app.sinks_are_grid {
+                    compositor_redraw(app);
                 }
             }
             Ok(ReadOutcome::DirNav(kind)) => {
-                let session = sessions.get_mut(&session_id).unwrap();
+                let session = app.sessions.get_mut(&session_id).unwrap();
                 session.warned_stopped_jobs = false;
                 navigate_dir(session, kind);
                 // Same reasoning as Ctrl-C's own freeze just above: the
@@ -1272,33 +1262,14 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
                 // this writes is already the post-`cd` one -- the same
                 // text read_line is about to draw -- so the repaint has
                 // nothing left to change.
-                if sinks_are_grid {
+                if app.sinks_are_grid {
                     freeze_idle_prompt(session);
-                    compositor_redraw(&sessions, &windows, current_window, term_rows, term_cols);
+                    compositor_redraw(app);
                 }
             }
             Ok(ReadOutcome::NormalMode { text, cursor, wheel }) => {
-                ensure_promoted(&mut sessions, &mut sinks_are_grid);
-                match run_normal_mode_navigation(
-                    session_id,
-                    &mut sessions,
-                    &mut windows,
-                    &mut current_window,
-                    &mut next_session_id,
-                    &mut next_window_id,
-                    &mut sinks_are_grid,
-                    &mut job_frames,
-                    None,
-                    &mut debug_frames,
-                    &mut location_lists,
-                    &mut edit_frames,
-                    &mut cmd_history,
-                    &mut registers,
-                    NavStart::Prompt { text, cursor, wheel },
-                    &mut term_rows,
-                    &mut term_cols,
-                    None,
-                ) {
+                ensure_promoted(&mut app.sessions, &mut app.sinks_are_grid);
+                match run_normal_mode_navigation(app, session_id, None, NavStart::Prompt { text, cursor, wheel }, None) {
                     Ok((NavExit::Resume(t, c), _)) => {
                         pending_initial = Some((t, c));
                         // Resuming straight back into ordinary prompt
@@ -1316,9 +1287,9 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
                         // closing cursor placement is what the prompt
                         // then draws against -- the same ordering, for
                         // the same reason, as run_edit_frame's own exit.
-                        print!("{}", erase_global_status_row(term_rows));
-                        if sinks_are_grid {
-                            compositor_redraw(&sessions, &windows, current_window, term_rows, term_cols);
+                        print!("{}", erase_global_status_row(app.term_rows));
+                        if app.sinks_are_grid {
+                            compositor_redraw(app);
                         }
                     }
                     // The mode line has to go here too, not just on the
@@ -1339,7 +1310,7 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
                     // the harmless reading if it ever somehow does.
                     Ok((NavExit::Detached | NavExit::Quit | NavExit::OpenAt { .. }, _)) => {
                         pending_initial = None;
-                        print!("{}", erase_global_status_row(term_rows));
+                        print!("{}", erase_global_status_row(app.term_rows));
                         // Then repaint, exactly as the Resume arm does
                         // and for the same reason: the erase leaves the
                         // real cursor parked on that row, and the prompt
@@ -1347,13 +1318,13 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
                         // the repaint's own closing cursor placement has
                         // to be the last word or the prompt lands on the
                         // status row instead of in its pane.
-                        if sinks_are_grid {
-                            compositor_redraw(&sessions, &windows, current_window, term_rows, term_cols);
+                        if app.sinks_are_grid {
+                            compositor_redraw(app);
                         }
                         let _ = io::stdout().flush();
                     }
                     Err(e) => {
-                        sessions.get(&session_id).unwrap().shell.sink_err(&format!("bish: error reading input: {}\n", e));
+                        app.sessions.get(&session_id).unwrap().shell.sink_err(&format!("bish: error reading input: {}\n", e));
                         break;
                     }
                 }
@@ -1363,7 +1334,7 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
                 let mut fg_pending = false;
                 let mut edit_pending = false;
                 {
-                    let session = sessions.get_mut(&session_id).unwrap();
+                    let session = app.sessions.get_mut(&session_id).unwrap();
                     // Any real input -- even a blank Enter -- re-arms the
                     // stopped-jobs exit warning: only an *immediate*
                     // second Ctrl-D, with nothing typed in between,
@@ -1392,8 +1363,8 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
                             Ok(history::Expansion::UnrecognizedBang(rest)) => format!("({})", rest),
                             Err(msg) => {
                                 session.shell.sink_err(&format!("{}\n", msg));
-                                if sinks_are_grid {
-                                    compositor_redraw(&sessions, &windows, current_window, term_rows, term_cols);
+                                if app.sinks_are_grid {
+                                    compositor_redraw(app);
                                 }
                                 continue;
                             }
@@ -1401,7 +1372,7 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
                     } else {
                         line
                     };
-                    let session = sessions.get_mut(&session_id).unwrap();
+                    let session = app.sessions.get_mut(&session_id).unwrap();
 
                     // Feed the prompt-and-what-was-typed into the grid
                     // itself, not just the real terminal -- editor::
@@ -1434,7 +1405,7 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
                     // is one pane's own private, independently-sized
                     // Screen, never shared with another pane's content
                     // the way one real terminal row can be.
-                    if sinks_are_grid {
+                    if app.sinks_are_grid {
                         let highlighted = highlight::render_line(&line, highlight_ctx);
                         let echoed = format!("\r\x1b[K{}{}\r\n", prompt_str, highlighted);
                         session.screen.borrow_mut().feed(echoed.as_bytes());
@@ -1480,8 +1451,8 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
                                 // logs a command wants the same line
                                 // history kept, not a rewritten one.
                                 let submitted = session.buffer.clone();
-                                run_shell_hooks(&mut sessions, session_id, "shell:exec:pre", &submitted);
-                                let session = sessions.get_mut(&session_id).unwrap();
+                                run_shell_hooks(&mut app.sessions, session_id, "shell:exec:pre", &submitted);
+                                let session = app.sessions.get_mut(&session_id).unwrap();
                                 // Every session sharing this one real
                                 // process (see new_virtual_child's own
                                 // doc comment on why "window new"/pane
@@ -1494,7 +1465,7 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
                                 // idempotent when this session was
                                 // already the one last synced in.
                                 session.shell.sync_real_state_in();
-                                let session = sessions.get_mut(&session_id).unwrap();
+                                let session = app.sessions.get_mut(&session_id).unwrap();
                                 let result = session.shell.run_program(&prog);
                                 session.shell.sync_real_state_out();
                                 if session.shell.cwd != cwd_before {
@@ -1505,15 +1476,15 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
                                 // the command that just ended, and a
                                 // directory change is a consequence of
                                 // it.
-                                run_shell_hooks(&mut sessions, session_id, "shell:exec:post", &submitted);
-                                let session = sessions.get_mut(&session_id).unwrap();
+                                run_shell_hooks(&mut app.sessions, session_id, "shell:exec:post", &submitted);
+                                let session = app.sessions.get_mut(&session_id).unwrap();
                                 session.buffer.clear();
                                 // After the command, and after the
                                 // session's own state is synced back:
                                 // a hook asking where it is should get
                                 // the answer the next prompt will show.
                                 if let Some(moved_to) = moved_to {
-                                    run_shell_hooks(&mut sessions, session_id, "shell:cwd:change", &moved_to);
+                                    run_shell_hooks(&mut app.sessions, session_id, "shell:cwd:change", &moved_to);
                                 }
                                 match result {
                                     ExecResult::Window(action) => window_action = Some(action),
@@ -1548,51 +1519,24 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
                     }
                 }
                 if let Some(action) = window_action {
-                    apply_window_action(
-                        action,
-                        &mut sessions,
-                        &mut windows,
-                        &mut current_window,
-                        &mut next_session_id,
-                        &mut next_window_id,
-                        &mut sinks_are_grid,
-                        term_rows,
-                        term_cols,
-                    );
+                    apply_window_action(app, action);
                 } else if fg_pending {
                     // A pty-attached background job was fg'd (see
                     // ExecResult::Fg's doc comment in exec.rs). Push it
                     // as a real Frame::Job on the focused window's own
                     // stack -- see Frame's doc comment for why a Job
-                    // frame holds an id into `job_frames` rather than
+                    // frame holds an id into `app.job_frames` rather than
                     // the FgJob itself -- then drive it via the same
                     // run_fg_job_frame the main loop's own top uses to
                     // re-enter a job left running in a window the user
                     // switched back to (M10c).
-                    let fg_job = sessions.get_mut(&session_id).unwrap().shell.take_pending_fg().expect("ExecResult::Fg implies a job was stashed");
-                    let job_frame_id = next_job_frame_id;
-                    next_job_frame_id += 1;
-                    job_frames.insert(job_frame_id, fg_job);
-                    windows[current_window].stack_mut().push(Frame::Job(job_frame_id));
+                    let fg_job = app.sessions.get_mut(&session_id).unwrap().shell.take_pending_fg().expect("ExecResult::Fg implies a job was stashed");
+                    let job_frame_id = app.next_job_frame_id;
+                    app.next_job_frame_id += 1;
+                    app.job_frames.insert(job_frame_id, fg_job);
+                    app.windows[app.current_window].stack_mut().push(Frame::Job(job_frame_id));
 
-                    run_fg_job_frame(
-                        job_frame_id,
-                        session_id,
-                        &mut sessions,
-                        &mut windows,
-                        &mut current_window,
-                        &mut next_session_id,
-                        &mut next_window_id,
-                        &mut job_frames,
-                        &mut debug_frames,
-                        &mut location_lists,
-                        &mut edit_frames,
-                        &mut cmd_history,
-                        &mut sinks_are_grid,
-                        &mut registers,
-                        &mut term_rows,
-                        &mut term_cols,
-                    );
+                    run_fg_job_frame(app, job_frame_id, session_id);
                 } else if edit_pending {
                     // `e [file]` -- see ExecResult::Edit's own doc
                     // comment. ensure_promoted first, unconditionally:
@@ -1604,47 +1548,21 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
                     // "plain unpromoted real terminal" branch to
                     // maintain -- same reasoning Ctrl+Space's own
                     // normal-mode navigation already established.
-                    ensure_promoted(&mut sessions, &mut sinks_are_grid);
-                    let args = sessions.get_mut(&session_id).unwrap().shell.take_pending_edit();
+                    ensure_promoted(&mut app.sessions, &mut app.sinks_are_grid);
+                    let args = app.sessions.get_mut(&session_id).unwrap().shell.take_pending_edit();
                     let opened = match fileeditor::parse_edit_args(&args) {
                         Ok(targets) => {
                             // A directory argument turns into whatever is
                             // picked out of it, before anything opens.
-                            let targets = expand_browse_targets(
-                                targets,
-                                true,
-                                &mut sessions,
-                                &mut windows,
-                                session_id,
-                                &mut current_window,
-                                &mut next_session_id,
-                                &mut next_window_id,
-                                &mut cmd_history,
-                                &mut job_frames,
-                                &mut debug_frames,
-                                &mut edit_frames,
-                                &mut registers,
-                                &mut term_rows,
-                                &mut term_cols,
-                                &mut sinks_are_grid,
-                            );
+                            let targets = expand_browse_targets(app, targets, true, session_id);
                             // Read only now: browsing blocks on real
                             // input, so the terminal can have been
                             // resized since this command was typed.
-                            let rect = pane_rect(&windows[current_window], windows[current_window].focused_pane, term_rows, term_cols);
-                            open_edit_targets(
-                                &targets,
-                                &mut sessions,
-                                session_id,
-                                &mut edit_frames,
-                                &mut next_edit_frame_id,
-                                &mut hex_frames,
-                                &mut next_hex_frame_id,
-                                rect,
-                            )
+                            let rect = pane_rect(&app.windows[app.current_window], app.windows[app.current_window].focused_pane, app.term_rows, app.term_cols);
+                            open_edit_targets(app, &targets, session_id, rect)
                         }
                         Err(e) => {
-                            sessions.get_mut(&session_id).unwrap().shell.sink_err(&format!("bish: e: {}\n", e));
+                            app.sessions.get_mut(&session_id).unwrap().shell.sink_err(&format!("bish: e: {}\n", e));
                             Vec::new()
                         }
                     };
@@ -1653,7 +1571,7 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
                         // named file failed) -- the pane keeps showing
                         // its shell, with whatever was sunk above now
                         // part of it.
-                        compositor_redraw(&sessions, &windows, current_window, term_rows, term_cols);
+                        compositor_redraw(app);
                     }
                     // Pushed back-to-front so the *first* file named is
                     // the one actually on top -- `e a b` opens both, with
@@ -1665,9 +1583,9 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
                     // hands control to the next file down once the one in
                     // front is closed.
                     for frame in opened.iter().rev() {
-                        windows[current_window].stack_mut().push(*frame);
+                        app.windows[app.current_window].stack_mut().push(*frame);
                     }
-                } else if sinks_are_grid {
+                } else if app.sinks_are_grid {
                     // The common case once promoted: a normal command ran
                     // in the focused session and its output (if any)
                     // landed in that session's grid via its sink -- make
@@ -1676,11 +1594,11 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
                     // every *other* command); the redraw happens once the
                     // command has fully finished, same as every other
                     // redraw trigger here.
-                    compositor_redraw(&sessions, &windows, current_window, term_rows, term_cols);
+                    compositor_redraw(app);
                 }
             }
             Err(e) => {
-                sessions.get(&session_id).unwrap().shell.sink_err(&format!("bish: error reading input: {}\n", e));
+                app.sessions.get(&session_id).unwrap().shell.sink_err(&format!("bish: error reading input: {}\n", e));
                 break;
             }
         }
@@ -1692,7 +1610,7 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
     // a tidiness one -- but a server told to shut down gets to write
     // out whatever cache it keeps, which is the difference between a
     // fast and a slow start next time.
-    if let Some(lsp) = sessions.values().next().map(|s| Rc::clone(&s.lsp)) {
+    if let Some(lsp) = app.sessions.values().next().map(|s| Rc::clone(&s.lsp)) {
         lsp.borrow_mut().shutdown_all();
     }
 }
@@ -1711,7 +1629,6 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
 // changing your mind, opens nothing rather than falling back to an
 // arbitrary file. A non-directory target passes through untouched, which
 // is every ordinary `e file.sh`.
-#[allow(clippy::too_many_arguments)]
 // What a failed `:w`/`:wq`/`:x` says. A read-only buffer gets vim's own
 // E45 rather than E212's "can't open file for writing", which would be
 // both wrong (nothing was opened) and unhelpful -- and it points at the
@@ -1724,39 +1641,21 @@ fn write_error(tb: &TextBuffer, e: &io::Error) -> String {
     format!("bish: E212: Can't open file for writing: {e}")
 }
 
-#[allow(clippy::too_many_arguments)]
 fn expand_browse_targets(
+    app: &mut App,
     targets: Vec<fileeditor::EditTarget>,
     // Whether the browser may hand the shell a new working directory.
     // False for `bish tool edit`, which is a one-shot command line with
     // no session that outlives it -- see browser::Outcome.
     can_change_directory: bool,
-    sessions: &mut HashMap<SessionId, SessionState>,
-    // A `Vec`, not a slice: the browser's own colon line can run
-    // `:window new`, which appends one.
-    windows: &mut Vec<WindowEntry>,
     session_id: SessionId,
-    current_window: &mut usize,
-    // Everything from here down exists only so the browser can open the
-    // *same* command mode every other frame gets, rather than a second,
-    // smaller one of its own -- see run_browse_frame's own `:` handling.
-    next_session_id: &mut SessionId,
-    next_window_id: &mut u32,
-    cmd_history: &mut History,
-    job_frames: &mut HashMap<JobFrameId, exec::FgJob>,
-    debug_frames: &mut HashMap<EditFrameId, debugger::DebugSession>,
-    edit_frames: &mut HashMap<EditFrameId, fileeditor::EditSession>,
-    registers: &mut Registers,
-    term_rows: &mut usize,
-    term_cols: &mut usize,
-    sinks_are_grid: &mut bool,
 ) -> Vec<fileeditor::EditTarget> {
     // Only pay for the cwd lookup (and the stat below) when there's
     // actually something to resolve.
     if targets.iter().all(|t| t.path.is_none()) {
         return targets;
     }
-    let cwd = sessions[&session_id].shell.cwd.clone();
+    let cwd = app.sessions[&session_id].shell.cwd.clone();
     let mut out = Vec::new();
     // A worklist rather than a plain pass, so a directory *picked in the
     // browser* means exactly what a directory *named on the command line*
@@ -1792,27 +1691,15 @@ fn expand_browse_targets(
         // yet and the browser would sit on an otherwise blank alternate
         // screen. Every other ensure_promoted call site pairs the two for
         // the same reason.
-        if *sinks_are_grid {
-            compositor_redraw(sessions, windows, *current_window, *term_rows, *term_cols);
+        if app.sinks_are_grid {
+            compositor_redraw(app);
         }
         let browsed = run_browse_frame(
+            app,
             &start,
             can_change_directory,
-            sessions.get(&session_id).is_none_or(|s| s.shell.bishopt_bool("gitignore")),
+            app.sessions.get(&session_id).is_none_or(|s| s.shell.bishopt_bool("gitignore")),
             session_id,
-            sessions,
-            windows,
-            current_window,
-            next_session_id,
-            next_window_id,
-            cmd_history,
-            job_frames,
-            debug_frames,
-            edit_frames,
-            registers,
-            term_rows,
-            term_cols,
-            sinks_are_grid,
         );
         match browsed {
             Ok(BrowseOutcome::Chosen(chosen)) => {
@@ -1824,14 +1711,14 @@ fn expand_browse_targets(
             // shell instead. Enforced by Shell::change_directory, which
             // is also what refuses under `set -r`.
             Ok(BrowseOutcome::ChangeDirectory(dir)) => {
-                let shell = &mut sessions.get_mut(&session_id).unwrap().shell;
+                let shell = &mut app.sessions.get_mut(&session_id).unwrap().shell;
                 if let Err(e) = shell.change_directory(&dir) {
                     shell.sink_err(&format!("bish: e: cd: {}: {}\n", dir.display(), e));
                 }
             }
             Ok(BrowseOutcome::Nothing) => {}
             Err(e) => {
-                sessions.get_mut(&session_id).unwrap().shell.sink_err(&format!("bish: e: {}: {}\n", path, e));
+                app.sessions.get_mut(&session_id).unwrap().shell.sink_err(&format!("bish: e: {}: {}\n", path, e));
             }
         }
     }
@@ -1850,25 +1737,15 @@ fn expand_browse_targets(
 // it can is both what vim does and the more useful half of the outcome.
 // The message goes to the owning session's own output, so it's still
 // there underneath once every editor frame this opened is closed again.
-#[allow(clippy::too_many_arguments)]
-fn open_edit_targets(
-    targets: &[fileeditor::EditTarget],
-    sessions: &mut HashMap<SessionId, SessionState>,
-    session_id: SessionId,
-    edit_frames: &mut HashMap<EditFrameId, fileeditor::EditSession>,
-    next_edit_frame_id: &mut EditFrameId,
-    hex_frames: &mut HashMap<HexFrameId, hexedit::HexSession>,
-    next_hex_frame_id: &mut HexFrameId,
-    rect: Rect,
-) -> Vec<Frame> {
+fn open_edit_targets(app: &mut App, targets: &[fileeditor::EditTarget], session_id: SessionId, rect: Rect) -> Vec<Frame> {
     let mut opened = Vec::new();
     for target in targets {
-        let result = open_one_edit_target(target, edit_frames, next_edit_frame_id, hex_frames, next_hex_frame_id, rect);
+        let result = open_one_edit_target(app, target, rect);
         match result {
             Ok(frame) => opened.push(frame),
             Err(e) => {
                 let what = target.path.as_deref().unwrap_or("<unnamed>");
-                sessions.get_mut(&session_id).unwrap().shell.sink_err(&format!("bish: e: {}: {}\n", what, e));
+                app.sessions.get_mut(&session_id).unwrap().shell.sink_err(&format!("bish: e: {}: {}\n", what, e));
             }
         }
     }
@@ -1880,14 +1757,7 @@ fn open_edit_targets(
 // open_edit_targets so `bish tool edit`'s own bootstrap -- which reports
 // a failure differently (see run_edit_impl) -- can reuse the fork
 // without reusing the reporting.
-fn open_one_edit_target(
-    target: &fileeditor::EditTarget,
-    edit_frames: &mut HashMap<EditFrameId, fileeditor::EditSession>,
-    next_edit_frame_id: &mut EditFrameId,
-    hex_frames: &mut HashMap<HexFrameId, hexedit::HexSession>,
-    next_hex_frame_id: &mut HexFrameId,
-    rect: Rect,
-) -> io::Result<Frame> {
+fn open_one_edit_target(app: &mut App, target: &fileeditor::EditTarget, rect: Rect) -> io::Result<Frame> {
     if target.hex {
         // A member inside an archive has no path the hex editor could
         // open, so its bytes are handed over directly -- and read-only
@@ -1898,15 +1768,15 @@ fn open_one_edit_target(
         {
             let bytes = bytes.map_err(io::Error::other)?;
             let session = hexedit::HexSession::from_bytes(bytes, std::path::Path::new(path), rect)?;
-            let id = *next_hex_frame_id;
-            *next_hex_frame_id += 1;
-            hex_frames.insert(id, session);
+            let id = app.next_hex_frame_id;
+            app.next_hex_frame_id += 1;
+            app.hex_frames.insert(id, session);
             return Ok(Frame::Hex(id));
         }
         let session = hexedit::HexSession::open(target.path.as_deref().map(std::path::Path::new), rect, target.readonly)?;
-        let id = *next_hex_frame_id;
-        *next_hex_frame_id += 1;
-        hex_frames.insert(id, session);
+        let id = app.next_hex_frame_id;
+        app.next_hex_frame_id += 1;
+        app.hex_frames.insert(id, session);
         return Ok(Frame::Hex(id));
     }
     let mut session = fileeditor::EditSession::open(target.path.as_deref(), normal_mode_content_rows(rect))?;
@@ -1915,9 +1785,9 @@ fn open_one_edit_target(
     if target.readonly {
         session.buffer.set_readonly(true);
     }
-    let id = *next_edit_frame_id;
-    *next_edit_frame_id += 1;
-    edit_frames.insert(id, session);
+    let id = app.next_edit_frame_id;
+    app.next_edit_frame_id += 1;
+    app.edit_frames.insert(id, session);
     Ok(Frame::Edit(id))
 }
 
@@ -1979,13 +1849,11 @@ fn run_edit_impl(targets: &[fileeditor::EditTarget], attach_debug: bool) -> i32 
     let root_cwd = shell.cwd.clone();
 
     let history_size = shell.bishopt_int("history_size").max(0) as usize;
-    let mut cmd_history = History::load(".bish_cmd_history", history_size);
     // Hoisted above the SessionState literal below: `shell` is moved
     // into its first field, so the bound cannot be read from it by the
     // time `history:` is evaluated.
     let edit_history = Rc::new(RefCell::new(History::load(".bish_history", history_size)));
-    let mut registers = Registers::new();
-    let (mut term_rows, mut term_cols) = query_term_size();
+    let (term_rows, term_cols) = query_term_size();
 
     let mut sessions: HashMap<SessionId, SessionState> = HashMap::new();
     let root_screen = Rc::new(RefCell::new(vt100::Screen::new(content_rows(term_rows), term_cols)));
@@ -2013,46 +1881,45 @@ fn run_edit_impl(targets: &[fileeditor::EditTarget], attach_debug: bool) -> i32 
             command_transcript: Vec::new(),
         },
     );
-    let mut windows: Vec<WindowEntry> = vec![WindowEntry::single(0, Frame::Session(0))];
-    let mut current_window: usize = 0;
-    let mut next_session_id: SessionId = 1;
-    let mut next_window_id: u32 = 1;
-    let mut job_frames: HashMap<JobFrameId, exec::FgJob> = HashMap::new();
-    let mut edit_frames: HashMap<EditFrameId, fileeditor::EditSession> = HashMap::new();
-    let mut next_edit_frame_id: EditFrameId = 1;
-    let mut hex_frames: HashMap<HexFrameId, hexedit::HexSession> = HashMap::new();
-    let mut next_hex_frame_id: HexFrameId = 1;
-    let mut debug_frames: HashMap<EditFrameId, debugger::DebugSession> = HashMap::new();
-    let mut location_lists: HashMap<EditFrameId, LocationList> = HashMap::new();
-    let mut sinks_are_grid = false;
+    // The same state the interactive shell keeps -- see `App`. `bish
+    // tool edit` is a one-session, one-window shell that happens to
+    // start inside the editor, not a separate kind of program.
+    let app = &mut App {
+        sessions,
+        windows: vec![WindowEntry::single(0, Frame::Session(0))],
+        current_window: 0,
+        next_session_id: 1,
+        next_window_id: 1,
+        job_frames: HashMap::new(),
+        next_job_frame_id: 1,
+        edit_frames: HashMap::new(),
+        next_edit_frame_id: 1,
+        hex_frames: HashMap::new(),
+        next_hex_frame_id: 1,
+        debug_frames: HashMap::new(),
+        location_lists: HashMap::new(),
+        cmd_history: History::load(".bish_cmd_history", history_size),
+        registers: Registers::new(),
+        sinks_are_grid: false,
+        term_rows,
+        term_cols,
+    };
 
-    ensure_promoted(&mut sessions, &mut sinks_are_grid);
+    ensure_promoted(&mut app.sessions, &mut app.sinks_are_grid);
 
     // `bish tool edit some-dir/` browses it, exactly as the builtin does
     // -- see expand_browse_targets. `rect` is read after that, since
     // browsing blocks on real input and the terminal can be resized
     // while it does.
     let targets = expand_browse_targets(
+        app,
         targets.to_vec(),
         // `bish tool edit` exits when the editor closes, so there is no
         // shell left for a directory change to mean anything to.
         false,
-        &mut sessions,
-        &mut windows,
         0,
-        &mut current_window,
-        &mut next_session_id,
-        &mut next_window_id,
-        &mut cmd_history,
-        &mut job_frames,
-        &mut debug_frames,
-        &mut edit_frames,
-        &mut registers,
-        &mut term_rows,
-        &mut term_cols,
-        &mut sinks_are_grid,
     );
-    let rect = pane_rect(&windows[current_window], windows[current_window].focused_pane, term_rows, term_cols);
+    let rect = pane_rect(&app.windows[app.current_window], app.windows[app.current_window].focused_pane, app.term_rows, app.term_cols);
     // Unlike the `e` builtin (see open_edit_targets, which reports a bad
     // target and opens the rest), a failure here aborts the whole
     // invocation: this is a one-shot command line, so a path that can't
@@ -2060,7 +1927,7 @@ fn run_edit_impl(targets: &[fileeditor::EditTarget], attach_debug: bool) -> i32 
     // scrolls past in a session that keeps running.
     let mut opened: Vec<Frame> = Vec::new();
     for target in &targets {
-        match open_one_edit_target(target, &mut edit_frames, &mut next_edit_frame_id, &mut hex_frames, &mut next_hex_frame_id, rect) {
+        match open_one_edit_target(app, target, rect) {
             Ok(frame) => opened.push(frame),
             Err(e) => {
                 // Leaving promotion behind here too: promote_if_needed already
@@ -2079,11 +1946,11 @@ fn run_edit_impl(targets: &[fileeditor::EditTarget], attach_debug: bool) -> i32 
         let path = targets[0].path.as_deref().unwrap_or_default();
         match debugger::DebugSession::attach(std::path::Path::new(path)) {
             Ok(debug_session) => {
-                edit_frames.get_mut(&edit_frame_id).unwrap().buffer.set_readonly(true);
-                debug_frames.insert(edit_frame_id, debug_session);
-                let (pane_id, _screen) = split_debug_run_pane(&mut sessions, &mut windows, current_window, &mut next_session_id, edit_frame_id, term_rows, term_cols);
-                let sid = windows[current_window].pane(pane_id).owning_session();
-                render_debug_run_title(&sessions[&sid].screen, term_cols, "attached -- :dbg run to start");
+                app.edit_frames.get_mut(&edit_frame_id).unwrap().buffer.set_readonly(true);
+                app.debug_frames.insert(edit_frame_id, debug_session);
+                let (pane_id, _screen) = split_debug_run_pane(app, edit_frame_id);
+                let sid = app.windows[app.current_window].pane(pane_id).owning_session();
+                render_debug_run_title(&app.sessions[&sid].screen, app.term_cols, "attached -- :dbg run to start");
             }
             Err(e) => {
                 print!("\x1b[?1049l");
@@ -2096,7 +1963,7 @@ fn run_edit_impl(targets: &[fileeditor::EditTarget], attach_debug: bool) -> i32 
     // Back-to-front, so the first file named is the one on top -- see
     // the `e` builtin's own identical push in run().
     for frame in opened.iter().rev() {
-        windows[current_window].stack_mut().push(*frame);
+        app.windows[app.current_window].stack_mut().push(*frame);
     }
 
     // Loops rather than driving `edit_frame_id` once: with several files
@@ -2107,42 +1974,9 @@ fn run_edit_impl(targets: &[fileeditor::EditTarget], attach_debug: bool) -> i32 
     // and keeps driving through a no-op detach itself -- see its own
     // `Detached` arm).
     loop {
-        match *windows[current_window].stack().last().unwrap() {
-            Frame::Edit(id) => run_edit_frame(
-                id,
-                0,
-                &mut sessions,
-                &mut windows,
-                &mut current_window,
-                &mut next_session_id,
-                &mut next_window_id,
-                &mut job_frames,
-                &mut edit_frames,
-                &mut next_edit_frame_id,
-                &mut debug_frames,
-                &mut location_lists,
-                &mut cmd_history,
-                &mut sinks_are_grid,
-                &mut registers,
-                &mut term_rows,
-                &mut term_cols,
-            ),
-            Frame::Hex(id) => run_hex_frame(
-                id,
-                0,
-                &mut sessions,
-                &mut windows,
-                &mut current_window,
-                &mut next_session_id,
-                &mut next_window_id,
-                &mut job_frames,
-                &mut hex_frames,
-                &mut cmd_history,
-                &mut sinks_are_grid,
-                &mut registers,
-                &mut term_rows,
-                &mut term_cols,
-            ),
+        match *app.windows[app.current_window].stack().last().unwrap() {
+            Frame::Edit(id) => run_edit_frame(app, id, 0),
+            Frame::Hex(id) => run_hex_frame(app, id, 0),
             _ => break,
         }
     }
@@ -2163,41 +1997,22 @@ fn run_edit_impl(targets: &[fileeditor::EditTarget], attach_debug: bool) -> i32 
 // mode's ':' handler does) can tell Quit apart from a command that just
 // ran normally -- the job-detach path ignores it, same as it always
 // ignored what command mode did before this returned anything.
-#[allow(clippy::too_many_arguments)]
 fn handle_command_mode(
+    app: &mut App,
     session_id: SessionId,
-    sessions: &mut HashMap<SessionId, SessionState>,
-    windows: &mut Vec<WindowEntry>,
-    current_window: &mut usize,
-    next_session_id: &mut SessionId,
-    next_window_id: &mut u32,
-    cmd_history: &mut History,
-    sinks_are_grid: &mut bool,
-    job_frames: &mut HashMap<JobFrameId, exec::FgJob>,
-    debug_frames: &mut HashMap<EditFrameId, debugger::DebugSession>,
-    // Every *other* open buffer. `run_edit_frame` takes the one being
-    // driven out of this map before driving it, so what is left here is
-    // exactly the files a cross-file edit must not write behind the
-    // user's back -- see `rename_via_server`.
-    edit_frames: &mut HashMap<EditFrameId, fileeditor::EditSession>,
-    registers: &mut Registers,
-    term_rows: &mut usize,
-    term_cols: &mut usize,
     editing: Option<&mut TextBuffer>,
     seed: Option<String>,
     // Keys a mapping produced that this colon line has to finish
     // delivering -- see editor::read_line's own `queued` parameter.
     queued: Vec<Key>,
 ) -> CommandModeOutcome {
-    let outcome = run_command_mode(
-        session_id, sessions, windows, current_window, next_session_id, cmd_history, job_frames, debug_frames, edit_frames, registers, term_rows, term_cols, *sinks_are_grid, editing, seed, queued,
-    );
+    let outcome = run_command_mode(app, session_id, editing, seed, queued);
     match outcome {
         CommandModeOutcome::Action(ref action) => {
-            apply_window_action(action.clone(), sessions, windows, current_window, next_session_id, next_window_id, sinks_are_grid, *term_rows, *term_cols);
+            apply_window_action(app, action.clone());
         }
         CommandModeOutcome::Quit | CommandModeOutcome::Cancelled | CommandModeOutcome::Ran { .. } | CommandModeOutcome::Symbols(_) | CommandModeOutcome::NoHighlight => {
-            if *sinks_are_grid {
+            if app.sinks_are_grid {
                 // No window action, but command mode may still have
                 // written a rejected-attempt message straight to this
                 // session's grid (a command_mode_violation/syntax error
@@ -2209,7 +2024,7 @@ fn handle_command_mode(
                 // a Ran result before the caller (only normal mode's ':'
                 // handler cares) paints its own overlay on top of it --
                 // see PendingView's own doc comment.
-                compositor_redraw(sessions, windows, *current_window, *term_rows, *term_cols);
+                compositor_redraw(app);
             }
         }
     }
@@ -2224,37 +2039,14 @@ fn handle_command_mode(
 // running) job back into job_frames and drops straight into command mode
 // for this same window, so `window next`/`previous` can move away from
 // it without ever having to touch the job itself.
-#[allow(clippy::too_many_arguments)]
-fn run_fg_job_frame(
-    job_frame_id: JobFrameId,
-    session_id: SessionId,
-    sessions: &mut HashMap<SessionId, SessionState>,
-    windows: &mut Vec<WindowEntry>,
-    current_window: &mut usize,
-    next_session_id: &mut SessionId,
-    next_window_id: &mut u32,
-    job_frames: &mut HashMap<JobFrameId, exec::FgJob>,
-    debug_frames: &mut HashMap<EditFrameId, debugger::DebugSession>,
-    location_lists: &mut HashMap<EditFrameId, LocationList>,
-    // Every *other* open buffer. `run_edit_frame` takes the one being
-    // driven out of this map before driving it, so what is left here is
-    // exactly the files a cross-file edit must not write behind the
-    // user's back -- see `rename_via_server`.
-    edit_frames: &mut HashMap<EditFrameId, fileeditor::EditSession>,
-    cmd_history: &mut History,
-    sinks_are_grid: &mut bool,
-    registers: &mut Registers,
-    term_rows: &mut usize,
-    term_cols: &mut usize,
-) {
-    // Taken out of job_frames (rather than borrowed via get_mut) so the
-    // on_idle closure below can freely borrow job_frames itself to
+fn run_fg_job_frame(app: &mut App, job_frame_id: JobFrameId, session_id: SessionId) {
+    // Taken out of app.job_frames (rather than borrowed via get_mut) so the
+    // on_idle closure below can freely borrow app.job_frames itself to
     // service every *other* window's job -- see service_background_jobs.
-    let mut job = job_frames.remove(&job_frame_id).expect("Frame::Job always has a live job_frames entry");
-    let focused_screen = sessions[&session_id].screen.clone();
-    let mut tab_bar = tab_bar_line(sessions, windows, *current_window);
-    let mut layout = snapshot_window(&windows[*current_window], sessions, *term_rows, *term_cols);
-    let cw = *current_window;
+    let mut job = app.job_frames.remove(&job_frame_id).expect("Frame::Job always has a live app.job_frames entry");
+    let focused_screen = app.sessions[&session_id].screen.clone();
+    let mut tab_bar = tab_bar_line(app);
+    let mut layout = snapshot_window(&app.windows[app.current_window], &app.sessions, app.term_rows, app.term_cols);
     // Persists across every drive_fg_job call in this loop (reset to None
     // -- forcing the next redraw back to a full repaint -- only on
     // FgOutcome::Resized below, alongside layout/tab_bar's own
@@ -2270,9 +2062,9 @@ fn run_fg_job_frame(
     // returns straight out of this function, same as before this loop
     // existed.
     loop {
-        // A plain owned copy, not `term_rows` itself: the `redraw`
+        // A plain owned copy, not `&mut app.term_rows` itself: the `redraw`
         // closure below and the `on_idle` closure both close over state
-        // for this same drive_fg_job call, and on_idle needs `term_rows`
+        // for this same drive_fg_job call, and on_idle needs `&mut app.term_rows`
         // as a genuine `&mut usize` (to drive service_background_jobs's
         // own resize handling) -- capturing it a second time here, even
         // just to read it, would conflict with that. A resize that lands
@@ -2280,25 +2072,25 @@ fn run_fg_job_frame(
         // own doc comment) and only takes effect for *this* closure once
         // the FgOutcome::Resized arm below re-snapshots and loops back
         // around, at most one drive_fg_job iteration later.
-        let redraw_rows = *term_rows;
-        let redraw_cols = *term_cols;
+        let redraw_rows = app.term_rows;
+        let redraw_cols = app.term_cols;
         let outcome = drive_fg_job(
             &mut job,
             &focused_screen,
             || render_compositor_frame_diff(&layout, &tab_bar, redraw_rows, redraw_cols, &mut frame_cache),
-            || { service_background_jobs(sessions, windows, job_frames, cw, term_rows, term_cols, *sinks_are_grid); },
+            || { service_background_jobs(app); },
         );
         match outcome {
         FgOutcome::Exited(status) => {
-            windows[*current_window].stack_mut().pop();
-            sessions.get_mut(&session_id).unwrap().shell.last_status = status;
-            if *sinks_are_grid {
-                compositor_redraw(sessions, windows, *current_window, *term_rows, *term_cols);
+            app.windows[app.current_window].stack_mut().pop();
+            app.sessions.get_mut(&session_id).unwrap().shell.last_status = status;
+            if app.sinks_are_grid {
+                compositor_redraw(app);
             }
             return;
         }
         FgOutcome::Detached => {
-            job_frames.insert(job_frame_id, job);
+            app.job_frames.insert(job_frame_id, job);
             // Normal mode, not command mode directly -- matches what the
             // detach key already does from a genuinely idle prompt (see
             // editor::ReadOutcome::NormalMode), rather than a second,
@@ -2314,26 +2106,7 @@ fn run_fg_job_frame(
             // anyway once the main loop sees the same Frame::Job still
             // on top and re-drives this job instead of ever calling
             // read_line with it.
-            let _ = run_normal_mode_navigation(
-                session_id,
-                sessions,
-                windows,
-                current_window,
-                next_session_id,
-                next_window_id,
-                sinks_are_grid,
-                job_frames,
-                None,
-                debug_frames,
-                location_lists,
-                edit_frames,
-                cmd_history,
-                registers,
-                NavStart::JobDetach,
-                term_rows,
-                term_cols,
-                None,
-            );
+            let _ = run_normal_mode_navigation(app, session_id, None, NavStart::JobDetach, None);
             // Whatever that excursion did (window action, or plain EOF)
             // hands control straight back to re-driving this same job
             // live -- which only redraws once fresh output actually
@@ -2341,56 +2114,56 @@ fn run_fg_job_frame(
             // could sit for a while with the global mode-line row
             // (render_normal_mode_frame's own render_global_status_row)
             // still showing this excursion's now-stale text otherwise.
-            if *sinks_are_grid {
-                compositor_redraw(sessions, windows, *current_window, *term_rows, *term_cols);
+            if app.sinks_are_grid {
+                compositor_redraw(app);
             }
             return;
         }
         FgOutcome::Stopped => {
-            // Unlike Detached, this job doesn't go back into job_frames
+            // Unlike Detached, this job doesn't go back into app.job_frames
             // -- it's no longer "a window's live top frame," it's a
             // genuine Stopped job now, addressable via jobs/fg/bg like
             // any other (see Shell::park_stopped_fg_job).
-            windows[*current_window].stack_mut().pop();
-            let session = sessions.get_mut(&session_id).unwrap();
+            app.windows[app.current_window].stack_mut().pop();
+            let session = app.sessions.get_mut(&session_id).unwrap();
             let (id, cmd_text) = session.shell.park_stopped_fg_job(job);
             session.shell.sink_err(&format!("\n[{}]+  Stopped                 {}\n", id, cmd_text));
             session.shell.last_status = 148;
-            if *sinks_are_grid {
-                compositor_redraw(sessions, windows, *current_window, *term_rows, *term_cols);
+            if app.sinks_are_grid {
+                compositor_redraw(app);
             }
             return;
         }
         FgOutcome::MouseClick(ev) => {
-            // sinks_are_grid gate matches every other hit_test_click
+            // &mut app.sinks_are_grid gate matches every other hit_test_click
             // call site: there's no tab bar/pane layout to click on
             // before the first promotion, so there's nothing to
             // hit-test against -- falls straight to the "forward it"
             // arm below, same as a genuine miss.
-            let target = if *sinks_are_grid {
-                hit_test_click(ev, sessions, windows, *current_window, *term_rows, *term_cols)
+            let target = if app.sinks_are_grid {
+                hit_test_click(app, ev)
             } else {
                 None
             };
             match target {
-                Some(ClickTarget::Window(idx)) if idx != *current_window => {
-                    job_frames.insert(job_frame_id, job);
-                    freeze_focused_idle_prompt(sessions, windows, *current_window);
-                    *current_window = idx;
-                    if *sinks_are_grid {
-                        compositor_redraw(sessions, windows, *current_window, *term_rows, *term_cols);
+                Some(ClickTarget::Window(idx)) if idx != app.current_window => {
+                    app.job_frames.insert(job_frame_id, job);
+                    freeze_focused_idle_prompt(app);
+                    app.current_window = idx;
+                    if app.sinks_are_grid {
+                        compositor_redraw(app);
                     }
                     return;
                 }
-                Some(ClickTarget::Pane(pane_id)) if pane_id != windows[*current_window].focused_pane => {
-                    job_frames.insert(job_frame_id, job);
-                    windows[*current_window].focused_pane = pane_id;
-                    if *sinks_are_grid {
-                        compositor_redraw(sessions, windows, *current_window, *term_rows, *term_cols);
+                Some(ClickTarget::Pane(pane_id)) if pane_id != app.windows[app.current_window].focused_pane => {
+                    app.job_frames.insert(job_frame_id, job);
+                    app.windows[app.current_window].focused_pane = pane_id;
+                    if app.sinks_are_grid {
+                        compositor_redraw(app);
                     }
                     return;
                 }
-                // A miss, the already-focused tab/pane, or sinks_are_grid
+                // A miss, the already-focused tab/pane, or &mut app.sinks_are_grid
                 // was false -- this click was for the job itself (or
                 // nothing meaningful bish owns either way). Reconstruct
                 // the exact SGR press byte drive_fg_job held back and
@@ -2416,8 +2189,8 @@ fn run_fg_job_frame(
             // soon as the job's next output arrives, which for a
             // well-behaved full-screen program is basically immediate
             // (TIOCSWINSZ delivers SIGWINCH to its own process group).
-            layout = snapshot_window(&windows[*current_window], sessions, *term_rows, *term_cols);
-            tab_bar = tab_bar_line(sessions, windows, *current_window);
+            layout = snapshot_window(&app.windows[app.current_window], &app.sessions, app.term_rows, app.term_cols);
+            tab_bar = tab_bar_line(app);
             // The geometry frame_cache's own cells describe is no longer
             // even the right shape -- render_compositor_frame_diff's own
             // stale check would catch a rows/cols mismatch anyway, but
@@ -2476,52 +2249,36 @@ fn leave_alt_screen(screen: &Rc<RefCell<vt100::Screen>>) {
 // `enable_with_mouse`): there's nothing in a hex dump a click means
 // anything to, and off is what makes a click send no bytes at all rather
 // than escape sequences this loop would have to swallow.
-#[allow(clippy::too_many_arguments)]
-fn run_hex_frame(
-    hex_frame_id: HexFrameId,
-    session_id: SessionId,
-    sessions: &mut HashMap<SessionId, SessionState>,
-    windows: &mut Vec<WindowEntry>,
-    current_window: &mut usize,
-    next_session_id: &mut SessionId,
-    next_window_id: &mut u32,
-    job_frames: &mut HashMap<JobFrameId, exec::FgJob>,
-    hex_frames: &mut HashMap<HexFrameId, hexedit::HexSession>,
-    cmd_history: &mut History,
-    sinks_are_grid: &mut bool,
-    registers: &mut Registers,
-    term_rows: &mut usize,
-    term_cols: &mut usize,
-) {
-    // Taken out of hex_frames rather than borrowed, for the same reason
+fn run_hex_frame(app: &mut App, hex_frame_id: HexFrameId, session_id: SessionId) {
+    // Taken out of app.hex_frames rather than borrowed, for the same reason
     // run_edit_frame/run_fg_job_frame take theirs out: it leaves the map
     // free for the on_idle closure below to borrow.
-    let mut session = hex_frames.remove(&hex_frame_id).expect("Frame::Hex always has a live hex_frames entry");
+    let mut session = app.hex_frames.remove(&hex_frame_id).expect("Frame::Hex always has a live app.hex_frames entry");
     // Same reasoning as run_edit_frame's own call -- see
     // `enter_alt_screen`.
-    enter_alt_screen(&sessions[&session_id].screen);
+    enter_alt_screen(&app.sessions[&session_id].screen);
     // The shell's one shared register table, moved in for as long as this
-    // frame is the one being driven -- see HexSession's own `registers`
+    // frame is the one being driven -- see HexSession's own `app.registers`
     // field doc comment.
-    session.attach_registers(registers);
+    session.attach_registers(&mut app.registers);
     // Captured before any window command can move focus elsewhere --
     // exactly run_edit_frame's own reasoning for the same two locals.
-    let own_window = *current_window;
-    let own_pane_id = windows[*current_window].focused_pane;
+    let own_window = app.current_window;
+    let own_pane_id = app.windows[app.current_window].focused_pane;
 
     let Ok(_guard) = term::RawGuard::enable(0) else {
-        session.detach_registers(registers);
-        hex_frames.insert(hex_frame_id, session);
+        session.detach_registers(&mut app.registers);
+        app.hex_frames.insert(hex_frame_id, session);
         return;
     };
     // The very first entry into this frame can be the moment promotion
     // happened, leaving the alternate screen blank -- same repaint
     // run_normal_mode_navigation opens with, and harmless afterward.
-    compositor_redraw(sessions, windows, *current_window, *term_rows, *term_cols);
+    compositor_redraw(app);
 
     let quit = loop {
-        let rect = pane_rect(&windows[*current_window], own_pane_id, *term_rows, *term_cols);
-        print!("{}", session.render(rect, *term_rows, *term_cols));
+        let rect = pane_rect(&app.windows[app.current_window], own_pane_id, app.term_rows, app.term_cols);
+        print!("{}", session.render(rect, app.term_rows, app.term_cols));
         let _ = io::stdout().flush();
 
         // Waiting for the next byte out here, rather than inside
@@ -2532,9 +2289,9 @@ fn run_hex_frame(
         // real content never feeds the session's vt100 grid while it's
         // being driven).
         while !term::stdin_ready(editor::IDLE_POLL_MS) {
-            if service_background_jobs(sessions, windows, job_frames, *current_window, term_rows, term_cols, *sinks_are_grid) {
-                let rect = pane_rect(&windows[*current_window], own_pane_id, *term_rows, *term_cols);
-                print!("{}", session.render(rect, *term_rows, *term_cols));
+            if service_background_jobs(app) {
+                let rect = pane_rect(&app.windows[app.current_window], own_pane_id, app.term_rows, app.term_cols);
+                print!("{}", session.render(rect, app.term_rows, app.term_cols));
                 let _ = io::stdout().flush();
             }
         }
@@ -2545,14 +2302,19 @@ fn run_hex_frame(
             Ok(None) | Err(_) => break true,
         };
 
+        // Cloned rather than borrowed: the idle hook beside it needs
+        // the whole `app` mutably, and `History` is an Rc-backed
+        // persistent list whose clone is O(1) -- see its own doc
+        // comment, which names this exact situation.
+        let history = app.cmd_history.clone();
         let outcome = session.handle_key(
             key,
             rect,
-            *term_rows,
-            *term_cols,
-            cmd_history,
+            app.term_rows,
+            app.term_cols,
+            &history,
             &mut || {
-                service_background_jobs(sessions, windows, job_frames, *current_window, term_rows, term_cols, *sinks_are_grid);
+                service_background_jobs(app);
             },
         );
         match outcome {
@@ -2561,36 +2323,36 @@ fn run_hex_frame(
             // `session.render` on the very next turn, so all that is
             // needed here is everything *else*.
             hexedit::HexOutcome::Redraw => {
-                compositor_redraw(sessions, windows, *current_window, *term_rows, *term_cols);
+                compositor_redraw(app);
             }
             hexedit::HexOutcome::Quit => break true,
             hexedit::HexOutcome::Window(cmd, count) => {
-                dispatch_window_cmd(cmd, count, sessions, windows, current_window, next_session_id, next_window_id, sinks_are_grid, *term_rows, *term_cols);
+                dispatch_window_cmd(app, cmd, count);
                 // A `<C-w>` that turned out to be a no-op from this
                 // pane's perspective (`<C-w>h` with nowhere to go, ...)
                 // leaves this frame on top -- keep driving it rather
                 // than freezing and returning, exactly as
                 // run_edit_frame's own Detached arm does.
-                if windows[*current_window].stack().last() != Some(&Frame::Hex(hex_frame_id)) {
+                if app.windows[app.current_window].stack().last() != Some(&Frame::Hex(hex_frame_id)) {
                     break false;
                 }
             }
         }
     };
 
-    session.detach_registers(registers);
+    session.detach_registers(&mut app.registers);
     if quit {
-        windows[*current_window].stack_mut().pop();
+        app.windows[app.current_window].stack_mut().pop();
         // Same cleanup run_edit_frame does on the way out, in the same
         // order and for the same reasons: back to the primary screen
         // (which still holds this session's scrollback), then erase the
         // colon line's own last text off the global status row -- before
         // the redraw, so the redraw's closing cursor placement is what
         // the shell prompt draws against.
-        leave_alt_screen(&sessions[&session_id].screen);
-        print!("{}{}", fileeditor::CURSOR_SHAPE_RESET, erase_global_status_row(*term_rows));
-        if *sinks_are_grid {
-            compositor_redraw(sessions, windows, *current_window, *term_rows, *term_cols);
+        leave_alt_screen(&app.sessions[&session_id].screen);
+        print!("{}{}", fileeditor::CURSOR_SHAPE_RESET, erase_global_status_row(app.term_rows));
+        if app.sinks_are_grid {
+            compositor_redraw(app);
         }
         let _ = io::stdout().flush();
         return;
@@ -2601,32 +2363,32 @@ fn run_hex_frame(
     // dump rather than stale rows, and put the session back for whenever
     // it's focused again. Recomputed fresh (not reused from the loop):
     // the window command that moved focus can have resized panes too.
-    let rect = if own_window < windows.len() && windows[own_window].panes.iter().any(|p| p.id == own_pane_id) {
-        pane_rect(&windows[own_window], own_pane_id, *term_rows, *term_cols)
+    let rect = if own_window < app.windows.len() && app.windows[own_window].panes.iter().any(|p| p.id == own_pane_id) {
+        pane_rect(&app.windows[own_window], own_pane_id, app.term_rows, app.term_cols)
     } else {
-        pane_rect(&windows[*current_window], windows[*current_window].focused_pane, *term_rows, *term_cols)
+        pane_rect(&app.windows[app.current_window], app.windows[app.current_window].focused_pane, app.term_rows, app.term_cols)
     };
     // Resized first: the split that moved focus made this pane narrower,
     // and freezing a full-width frame into a grid still sized for the old
     // rect would clip it -- run_diagnostics_frame's own refresh_editor_
     // frame does exactly this, for exactly this reason.
-    sessions[&session_id].screen.borrow_mut().resize(rect.rows, rect.cols);
-    session.freeze(&sessions[&session_id].screen, rect);
-    hex_frames.insert(hex_frame_id, session);
+    app.sessions[&session_id].screen.borrow_mut().resize(rect.rows, rect.cols);
+    session.freeze(&app.sessions[&session_id].screen, rect);
+    app.hex_frames.insert(hex_frame_id, session);
     // dispatch_window_cmd already redrew, but that was *before* the
     // freeze above -- without a second one this pane stays blank until
     // some unrelated activity happens to repaint it. Found via pty
     // against the real binary: `<C-w>s` from a hex frame left its own
     // half of the split empty until the next command ran.
-    if *sinks_are_grid {
-        compositor_redraw(sessions, windows, *current_window, *term_rows, *term_cols);
+    if app.sinks_are_grid {
+        compositor_redraw(app);
     }
     // The status row still holds this frame's own last status line (and
     // any half-typed `^W` chord shown in it). Whatever takes focus next
     // draws its own over this if it has one; a plain shell prompt
     // doesn't, and would otherwise leave a hex status line sitting above
     // it forever.
-    print!("{}{}", fileeditor::CURSOR_SHAPE_RESET, erase_global_status_row(*term_rows));
+    print!("{}{}", fileeditor::CURSOR_SHAPE_RESET, erase_global_status_row(app.term_rows));
     let _ = io::stdout().flush();
 }
 
@@ -2638,43 +2400,22 @@ fn run_hex_frame(
 // Normal mode, not a separate loop) -- this function's only job is
 // providing `rect`, moving the session's state in and back out, and
 // reacting to how driving it ended.
-#[allow(clippy::too_many_arguments)]
-fn run_edit_frame(
-    edit_frame_id: EditFrameId,
-    session_id: SessionId,
-    sessions: &mut HashMap<SessionId, SessionState>,
-    windows: &mut Vec<WindowEntry>,
-    current_window: &mut usize,
-    next_session_id: &mut SessionId,
-    next_window_id: &mut u32,
-    job_frames: &mut HashMap<JobFrameId, exec::FgJob>,
-    edit_frames: &mut HashMap<EditFrameId, fileeditor::EditSession>,
-    // Needed only by the `OpenAt` arm: `gd` into another file creates a
-    // frame, and this is the counter those ids come from.
-    next_edit_frame_id: &mut EditFrameId,
-    debug_frames: &mut HashMap<EditFrameId, debugger::DebugSession>,
-    location_lists: &mut HashMap<EditFrameId, LocationList>,
-    cmd_history: &mut History,
-    sinks_are_grid: &mut bool,
-    registers: &mut Registers,
-    term_rows: &mut usize,
-    term_cols: &mut usize,
-) {
-    // Taken out of edit_frames (rather than borrowed via get_mut) so
-    // on_idle below can freely borrow edit_frames -- moot today (nothing
+fn run_edit_frame(app: &mut App, edit_frame_id: EditFrameId, session_id: SessionId) {
+    // Taken out of app.edit_frames (rather than borrowed via get_mut) so
+    // on_idle below can freely borrow app.edit_frames -- moot today (nothing
     // in service_background_jobs touches it), but matches
-    // run_fg_job_frame's own reasoning for job_frames exactly, and keeps
+    // run_fg_job_frame's own reasoning for app.job_frames exactly, and keeps
     // the two symmetric.
-    let session = edit_frames.remove(&edit_frame_id).expect("Frame::Edit always has a live edit_frames entry");
+    let session = app.edit_frames.remove(&edit_frame_id).expect("Frame::Edit always has a live app.edit_frames entry");
     // Everything this frame draws (and everything it freezes into the
     // session's grid on the way out) belongs on the alternate screen, not
     // on top of the shell's scrollback -- see `enter_alt_screen`.
-    enter_alt_screen(&sessions[&session_id].screen);
+    enter_alt_screen(&app.sessions[&session_id].screen);
     // "%": refreshed here, once, whenever this function starts driving a
     // session -- see fileeditor::set_last_filename's own doc comment for
     // the other place (a successful :w/:wq/:x) it needs the same
     // refresh.
-    fileeditor::set_last_filename(&session.buffer, registers);
+    fileeditor::set_last_filename(&session.buffer, &mut app.registers);
     let mut buffer = session.buffer;
     let mut vk = session.vk;
     // The starting values only. `bishopt` is a builtin, and command
@@ -2685,24 +2426,24 @@ fn run_edit_frame(
     // bishopt was "unreachable from inside the modal file editor",
     // which was never true and made a `:bishopt` appear to do nothing
     // until the file was reopened.)
-    let color_overrides = syntax_color_overrides(&sessions[&session_id].shell);
-    apply_view_options(&sessions[&session_id].shell, &mut buffer);
+    let color_overrides = syntax_color_overrides(&app.sessions[&session_id].shell);
+    apply_view_options(&app.sessions[&session_id].shell, &mut buffer);
     // The buffer exists and its options are resolved, which is the
     // moment `editor:file:open` is about -- a hook that configures a
     // language server for this file wants a real buffer to ask about,
     // not a path.
-    run_hooks(sessions, session_id, "editor:file:open", &buffer);
-    open_language_server_document(sessions, session_id, &buffer);
+    run_hooks(&mut app.sessions, session_id, "editor:file:open", &buffer);
+    open_language_server_document(&mut app.sessions, session_id, &buffer);
     // Where this editor frame actually lives -- captured once, before
     // any window command can move focus elsewhere. The Detached arm
     // below needs this pane's own rect to freeze into, not whatever
     // pane/window happens to be focused *after* the command that
     // detached this one ran (that could be a sibling pane a split just
     // switched to, or even a different window entirely after `<C-w>w`/
-    // `window next` -- `windows[*current_window].focused_pane` at that
+    // `window next` -- `app.windows[app.current_window].focused_pane` at that
     // point names neither).
-    let own_window = *current_window;
-    let own_pane_id = windows[*current_window].focused_pane;
+    let own_window = app.current_window;
+    let own_pane_id = app.windows[app.current_window].focused_pane;
     // Loops rather than returning straight after one call: a `Window`
     // keypress (KeyOutcome::Window, handled inside run_normal_mode_
     // navigation) always resolves to NavExit::Detached, even when
@@ -2715,23 +2456,10 @@ fn run_edit_frame(
     // and just continuing to drive it.
     loop {
         let outcome = run_normal_mode_navigation(
+            app,
             session_id,
-            sessions,
-            windows,
-            current_window,
-            next_session_id,
-            next_window_id,
-            sinks_are_grid,
-            job_frames,
             Some(edit_frame_id),
-            debug_frames,
-            location_lists,
-            edit_frames,
-            cmd_history,
-            registers,
             NavStart::Edit(Box::new(buffer), Box::new(vk)),
-            term_rows,
-            term_cols,
             Some(&color_overrides),
         );
         match outcome {
@@ -2740,44 +2468,44 @@ fn run_edit_frame(
                 // nothing left for a hook to look at, which is why vim's
                 // own BufUnload/BufDelete are both "before" too.
                 if let Some((tb, _)) = state {
-                    run_hooks(sessions, session_id, "editor:file:close", tb);
+                    run_hooks(&mut app.sessions, session_id, "editor:file:close", tb);
                     // Same moment, same reason: the buffer still exists,
                     // so its URI is still resolvable.
-                    close_language_server_document(sessions, session_id, tb);
+                    close_language_server_document(&mut app.sessions, session_id, tb);
                 }
-                windows[*current_window].stack_mut().pop();
+                app.windows[app.current_window].stack_mut().pop();
                 // Back to the primary screen, which still holds this
                 // session's own scrollback -- prompt, the `e` command
                 // that opened this editor, everything before it -- with
                 // the cursor restored to the row the shell was about to
                 // print its next prompt on. See `enter_alt_screen`.
-                leave_alt_screen(&sessions[&session_id].screen);
+                leave_alt_screen(&app.sessions[&session_id].screen);
                 // A file with an open diagnostics pane (`:diag`) below
                 // it -- close that too rather than leaving an orphaned
                 // pane no `Frame::Edit` will ever point at again.
-                if let Some(diag_pane) = diagnostics_sibling(&windows[*current_window], edit_frame_id) {
-                    close_pane(&mut windows[*current_window], diag_pane);
-                    close_orphaned_sessions(sessions, windows);
+                if let Some(diag_pane) = diagnostics_sibling(&app.windows[app.current_window], edit_frame_id) {
+                    close_pane(&mut app.windows[app.current_window], diag_pane);
+                    close_orphaned_sessions(&mut app.sessions, &app.windows);
                 }
                 // The same for a `gr` location list: it is about the
                 // buffer that is going away, and its entries are
                 // addressed against a frame id that is about to be
                 // reused.
-                if let Some(pane) = locations_sibling(&windows[*current_window], edit_frame_id) {
-                    close_pane(&mut windows[*current_window], pane);
-                    close_orphaned_sessions(sessions, windows);
+                if let Some(pane) = locations_sibling(&app.windows[app.current_window], edit_frame_id) {
+                    close_pane(&mut app.windows[app.current_window], pane);
+                    close_orphaned_sessions(&mut app.sessions, &app.windows);
                 }
-                location_lists.remove(&edit_frame_id);
+                app.location_lists.remove(&edit_frame_id);
                 // Same idea for an attached `:dbg` session's own
                 // DebugRun sibling -- the buffer this session was
                 // attached to is going away regardless of whether
                 // `:dbg quit` was ever run explicitly, so there's
                 // nothing left for it to debug.
-                if debug_frames.remove(&edit_frame_id).is_some()
-                    && let Some(debug_pane) = debug_run_sibling(&windows[*current_window], edit_frame_id)
+                if app.debug_frames.remove(&edit_frame_id).is_some()
+                    && let Some(debug_pane) = debug_run_sibling(&app.windows[app.current_window], edit_frame_id)
                 {
-                    close_pane(&mut windows[*current_window], debug_pane);
-                    close_orphaned_sessions(sessions, windows);
+                    close_pane(&mut app.windows[app.current_window], debug_pane);
+                    close_orphaned_sessions(&mut app.sessions, &app.windows);
                 }
                 // Command mode's own colon-line (`:q`/`:q!`/`:wq`/`:x`)
                 // paints straight to the real terminal's global status row
@@ -2797,9 +2525,9 @@ fn run_edit_frame(
                 // redraw's own closing cursor placement (see
                 // build_compositor_frame_output) is what has to be the
                 // last word.
-                print!("{}{}", fileeditor::CURSOR_SHAPE_RESET, erase_global_status_row(*term_rows));
-                if *sinks_are_grid {
-                    compositor_redraw(sessions, windows, *current_window, *term_rows, *term_cols);
+                print!("{}{}", fileeditor::CURSOR_SHAPE_RESET, erase_global_status_row(app.term_rows));
+                if app.sinks_are_grid {
+                    compositor_redraw(app);
                 }
                 let _ = io::stdout().flush();
                 return;
@@ -2812,24 +2540,24 @@ fn run_edit_frame(
             // shape, and one this codebase's pane stack already has.
             Ok((NavExit::OpenAt { path, line, character, encoding, root }, state)) => {
                 if let Some((b, v)) = state {
-                    edit_frames.insert(edit_frame_id, fileeditor::EditSession { buffer: b, vk: v });
+                    app.edit_frames.insert(edit_frame_id, fileeditor::EditSession { buffer: b, vk: v });
                 }
                 // Already open in this pane? Bring that frame to the
                 // front rather than opening the file twice. Nothing is
                 // closed, which is what lets `Ctrl-I` step forward
                 // again -- and it means a buffer with unsaved work is
                 // never quietly dropped on the way back to it.
-                let existing = windows[own_window]
+                let existing = app.windows[own_window]
                     .pane(own_pane_id)
                     .stack
                     .iter()
-                    .position(|frame| matches!(frame, Frame::Edit(id) if edit_frames.get(id).and_then(|s| s.buffer.path()) == Some(path.as_path())));
+                    .position(|frame| matches!(frame, Frame::Edit(id) if app.edit_frames.get(id).and_then(|s| s.buffer.path()) == Some(path.as_path())));
                 if let Some(at) = existing {
-                    let stack = &mut windows[own_window].pane_mut(own_pane_id).stack;
+                    let stack = &mut app.windows[own_window].pane_mut(own_pane_id).stack;
                     let frame = stack.remove(at);
                     stack.push(frame);
                     if let Frame::Edit(id) = frame
-                        && let Some(session) = edit_frames.get_mut(&id)
+                        && let Some(session) = app.edit_frames.get_mut(&id)
                     {
                         let starts = fileeditor::line_starts_of(&session.buffer);
                         let offset = fileeditor::diagnostic_offset(&session.buffer, &starts, line, character, encoding);
@@ -2838,7 +2566,7 @@ fn run_edit_frame(
                     }
                     return;
                 }
-                let rect = pane_rect(&windows[own_window], own_pane_id, *term_rows, *term_cols);
+                let rect = pane_rect(&app.windows[own_window], own_pane_id, app.term_rows, app.term_cols);
                 match fileeditor::EditSession::open(path.to_str(), normal_mode_content_rows(rect)) {
                     Ok(mut opened) => {
                         // Converted here rather than before the exit,
@@ -2850,13 +2578,13 @@ fn run_edit_frame(
                         let (row, col) = fileeditor::diagnostic_position(&opened.buffer, offset);
                         opened.buffer.set_cursor(row, col);
                         opened.buffer.lsp_root = root;
-                        let id = *next_edit_frame_id;
-                        *next_edit_frame_id += 1;
-                        edit_frames.insert(id, opened);
-                        windows[own_window].pane_mut(own_pane_id).stack.push(Frame::Edit(id));
+                        let id = app.next_edit_frame_id;
+                        app.next_edit_frame_id += 1;
+                        app.edit_frames.insert(id, opened);
+                        app.windows[own_window].pane_mut(own_pane_id).stack.push(Frame::Edit(id));
                     }
                     Err(e) => {
-                        sessions.get_mut(&session_id).unwrap().shell.sink_err(&format!("bish: gd: {}: {}\n", path.display(), e));
+                        app.sessions.get_mut(&session_id).unwrap().shell.sink_err(&format!("bish: gd: {}: {}\n", path.display(), e));
                     }
                 }
                 return;
@@ -2876,7 +2604,7 @@ fn run_edit_frame(
                 // afterward -- exactly the "shell prompt drawn over the
                 // file's own last content" bug this loop exists to
                 // avoid. Keep driving it instead.
-                if windows[*current_window].stack().last() == Some(&Frame::Edit(edit_frame_id)) {
+                if app.windows[app.current_window].stack().last() == Some(&Frame::Edit(edit_frame_id)) {
                     buffer = b;
                     vk = v;
                     continue;
@@ -2889,14 +2617,14 @@ fn run_edit_frame(
                 // *does* leave this frame on top (the branch above) can
                 // still have resized panes (`window balance`, `+`/`-`),
                 // and one that moves focus away can too.
-                let rect = if own_window < windows.len() && windows[own_window].panes.iter().any(|p| p.id == own_pane_id) {
-                    pane_rect(&windows[own_window], own_pane_id, *term_rows, *term_cols)
+                let rect = if own_window < app.windows.len() && app.windows[own_window].panes.iter().any(|p| p.id == own_pane_id) {
+                    pane_rect(&app.windows[own_window], own_pane_id, app.term_rows, app.term_cols)
                 } else {
                     // This pane (or its whole window) is gone by now --
                     // nothing sensible to freeze into; fall back to
                     // wherever focus actually landed rather than
                     // indexing a pane that no longer exists.
-                    pane_rect(&windows[*current_window], windows[*current_window].focused_pane, *term_rows, *term_cols)
+                    pane_rect(&app.windows[app.current_window], app.windows[app.current_window].focused_pane, app.term_rows, app.term_cols)
                 };
                 // Resized first: the window action that moved focus is
                 // usually a split, which made this pane narrower, and
@@ -2904,17 +2632,17 @@ fn run_edit_frame(
                 // the old rect would clip it -- exactly what
                 // run_diagnostics_frame's own refresh_editor_frame does,
                 // for the same reason.
-                sessions[&session_id].screen.borrow_mut().resize(rect.rows, rect.cols);
-                fileeditor::freeze_editor_frame(&sessions[&session_id].screen, &b, &v, rect, Some(&color_overrides));
-                edit_frames.insert(edit_frame_id, fileeditor::EditSession { buffer: b, vk: v });
+                app.sessions[&session_id].screen.borrow_mut().resize(rect.rows, rect.cols);
+                fileeditor::freeze_editor_frame(&app.sessions[&session_id].screen, &b, &v, rect, Some(&color_overrides));
+                app.edit_frames.insert(edit_frame_id, fileeditor::EditSession { buffer: b, vk: v });
                 // dispatch_window_cmd already redrew, but that ran
                 // *before* the freeze above -- so without a second one
                 // this pane keeps showing whatever its grid held a moment
                 // ago (a freshly-switched alternate screen: blank) until
                 // some unrelated activity happens to repaint it. Same
                 // ordering gap, same fix, as run_hex_frame's own.
-                if *sinks_are_grid {
-                    compositor_redraw(sessions, windows, *current_window, *term_rows, *term_cols);
+                if app.sinks_are_grid {
+                    compositor_redraw(app);
                 }
                 return;
             }
@@ -2926,11 +2654,11 @@ fn run_edit_frame(
                 // loop itself gives one (see its own read_line Err arm):
                 // sink it and drop the session; there's no good way to
                 // resume from here.
-                windows[*current_window].stack_mut().pop();
-                leave_alt_screen(&sessions[&session_id].screen);
-                sessions.get_mut(&session_id).unwrap().shell.sink_err(&format!("bish: e: error reading input: {}\n", e));
-                if *sinks_are_grid {
-                    compositor_redraw(sessions, windows, *current_window, *term_rows, *term_cols);
+                app.windows[app.current_window].stack_mut().pop();
+                leave_alt_screen(&app.sessions[&session_id].screen);
+                app.sessions.get_mut(&session_id).unwrap().shell.sink_err(&format!("bish: e: error reading input: {}\n", e));
+                if app.sinks_are_grid {
+                    compositor_redraw(app);
                 }
                 return;
             }
@@ -2966,6 +2694,49 @@ fn diagnostics_pane_rows(diagnostics_len: usize, show_detail: bool, budget: usiz
     wanted.max(1).min(max_rows)
 }
 
+// The three things a diagnostics/locations pane does to its own
+// geometry and to its editor sibling. All three used to be closures
+// taking the pieces of state they touched as explicit parameters --
+// `refresh_editor_frame`'s own comment said why: capturing them would
+// have held a borrow alive across the whole enclosing function, which
+// conflicted with the idle hook's need to reborrow them. One `&mut App`
+// is not several borrows, so they are ordinary functions again, and the
+// two copies of each (diagnostics and locations had one apiece) are one
+// copy.
+fn set_pane_expanded(app: &mut App, pane_id: PaneId, rows: usize) {
+    if let Some((_, children, idx)) = find_parent_split_mut(&mut app.windows[app.current_window].layout, pane_id) {
+        children[idx].minimized = false;
+        children[idx].fixed = Some(rows);
+    }
+}
+
+fn set_pane_minimized(app: &mut App, pane_id: PaneId) {
+    if let Some((_, children, idx)) = find_parent_split_mut(&mut app.windows[app.current_window].layout, pane_id) {
+        children[idx].minimized = true;
+        children[idx].fixed = None;
+    }
+}
+
+// Hands focus back to the editor pane a sibling pane belongs to.
+fn focus_editor_pane(app: &mut App, edit_frame_id: EditFrameId) {
+    if let Some(editor_pane) = editor_pane_for(app.window(), edit_frame_id) {
+        app.window_mut().focused_pane = editor_pane;
+    }
+}
+
+// Repaints the editor pane beside a diagnostics/locations pane, at
+// whatever size that pane's own expansion has left it.
+fn refresh_editor_frame(app: &App, edit_frame_id: EditFrameId) {
+    let Some(editor_pane) = editor_pane_for(app.window(), edit_frame_id) else { return };
+    let Some(session) = app.edit_frames.get(&edit_frame_id) else { return };
+    let rect = pane_rect(app.window(), editor_pane, app.term_rows, app.term_cols);
+    let sid = app.window().pane(editor_pane).owning_session();
+    let color_overrides = syntax_color_overrides(&app.sessions[&sid].shell);
+    let screen = &app.sessions[&sid].screen;
+    screen.borrow_mut().resize(rect.rows, rect.cols);
+    fileeditor::freeze_editor_frame(screen, &session.buffer, &session.vk, rect, Some(&color_overrides));
+}
+
 // The diagnostics pane's own interactive list -- dispatched from repl::
 // run's main loop whenever a pane's top frame is `Frame::Diagnostics
 // (edit_frame_id)`, the same tier as run_fg_job_frame/run_edit_frame
@@ -2983,21 +2754,7 @@ fn diagnostics_pane_rows(diagnostics_len: usize, show_detail: bool, budget: usiz
 // call (see Frame::Diagnostics's own doc comment on why it's never
 // worth persisting) -- every (re-)entry starts fresh at row 0,
 // collapsed detail.
-#[allow(clippy::too_many_arguments)]
-fn run_diagnostics_frame(
-    pane_id: PaneId,
-    edit_frame_id: EditFrameId,
-    sessions: &mut HashMap<SessionId, SessionState>,
-    windows: &mut Vec<WindowEntry>,
-    current_window: &mut usize,
-    next_session_id: &mut SessionId,
-    next_window_id: &mut u32,
-    job_frames: &mut HashMap<JobFrameId, exec::FgJob>,
-    edit_frames: &mut HashMap<EditFrameId, fileeditor::EditSession>,
-    sinks_are_grid: &mut bool,
-    term_rows: &mut usize,
-    term_cols: &mut usize,
-) {
+fn run_diagnostics_frame(app: &mut App, pane_id: PaneId, edit_frame_id: EditFrameId) {
     // Every other loop that reads keys directly off the terminal
     // (run_normal_mode_navigation, run_insert_mode, ...) holds one of
     // these for its own duration -- without it the terminal is left in
@@ -3017,64 +2774,23 @@ fn run_diagnostics_frame(
     // diagnostics_pane_rows's own doc comment for why this can't just
     // be recomputed from the editor's own (by-then-shrunk) rect on
     // every later resize instead.
-    let budget = editor_pane_for(&windows[*current_window], edit_frame_id)
-        .map(|id| pane_rect(&windows[*current_window], id, *term_rows, *term_cols).rows + 1)
-        .unwrap_or(*term_rows);
+    let budget = editor_pane_for(&app.windows[app.current_window], edit_frame_id)
+        .map(|id| pane_rect(&app.windows[app.current_window], id, app.term_rows, app.term_cols).rows + 1)
+        .unwrap_or(app.term_rows);
 
-    let set_expanded = |windows: &mut Vec<WindowEntry>, current_window: usize, rows: usize| {
-        if let Some((_, children, idx)) = find_parent_split_mut(&mut windows[current_window].layout, pane_id) {
-            children[idx].minimized = false;
-            children[idx].fixed = Some(rows);
-        }
-    };
-    let set_minimized = |windows: &mut Vec<WindowEntry>, current_window: usize| {
-        if let Some((_, children, idx)) = find_parent_split_mut(&mut windows[current_window].layout, pane_id) {
-            children[idx].minimized = true;
-            children[idx].fixed = None;
-        }
-    };
-    // Whenever set_expanded/set_minimized change this pane's own size,
-    // the editor sibling's size changes right along with it (the split
-    // only has the two of them) -- but that sibling's own last frozen
-    // render (freeze_editor_frame, from run_edit_frame's own Detached
-    // arm, or an earlier call to this very closure) was addressed
-    // against whatever rect was current *then*. compositor_redraw's own
-    // resize of a pane's session screen keeps existing rows in place and
-    // either truncates or leaves the rest blank -- it does not reflow
-    // content -- so a stale frozen frame's status line (always its own
-    // rect's *last* row) ends up either clipped off (shrinking) or
-    // stranded above new blank rows (growing) once the split resizes
-    // out from under it. Re-freezing against the sibling's current rect
-    // keeps it honest across every resize this loop causes.
-    // Takes term_rows/term_cols as plain parameters (fresh at each call
-    // site below), not captured -- capturing them here (even just to
-    // read) would hold a borrow alive across this closure's whole
-    // lifetime (it's called repeatedly, throughout this function), which
-    // would conflict with the on_idle closure's own need to reborrow
-    // them mutably for service_background_jobs's resize handling.
-    let refresh_editor_frame = |sessions: &HashMap<SessionId, SessionState>, windows: &Vec<WindowEntry>, edit_frames: &HashMap<EditFrameId, fileeditor::EditSession>, current_window: usize, term_rows: usize, term_cols: usize| {
-        let Some(editor_pane) = editor_pane_for(&windows[current_window], edit_frame_id) else { return };
-        let Some(session) = edit_frames.get(&edit_frame_id) else { return };
-        let rect = pane_rect(&windows[current_window], editor_pane, term_rows, term_cols);
-        let sid = windows[current_window].pane(editor_pane).owning_session();
-        let color_overrides = syntax_color_overrides(&sessions[&sid].shell);
-        let screen = &sessions[&sid].screen;
-        screen.borrow_mut().resize(rect.rows, rect.cols);
-        fileeditor::freeze_editor_frame(screen, &session.buffer, &session.vk, rect, Some(&color_overrides));
-    };
-    let diagnostics_len = edit_frames.get(&edit_frame_id).map(|s| s.buffer.diagnostics.len()).unwrap_or(0);
-    set_expanded(windows, *current_window, diagnostics_pane_rows(diagnostics_len, false, budget));
-    refresh_editor_frame(sessions, windows, edit_frames, *current_window, *term_rows, *term_cols);
-    compositor_redraw(sessions, windows, *current_window, *term_rows, *term_cols);
+    let diagnostics_len = app.edit_frames.get(&edit_frame_id).map(|s| s.buffer.diagnostics.len()).unwrap_or(0);
+    set_pane_expanded(app, pane_id, diagnostics_pane_rows(diagnostics_len, false, budget));
+    refresh_editor_frame(app, edit_frame_id);
+    compositor_redraw(app);
 
     loop {
-        let rect = pane_rect(&windows[*current_window], pane_id, *term_rows, *term_cols);
-        if let Some(session) = edit_frames.get(&edit_frame_id) {
+        let rect = pane_rect(&app.windows[app.current_window], pane_id, app.term_rows, app.term_cols);
+        if let Some(session) = app.edit_frames.get(&edit_frame_id) {
             render_diagnostics_list_frame(&session.buffer, rect, selected, expanded);
         }
 
         let key = match editor::read_key_idle(&mut || {
-            service_background_jobs(sessions, windows, job_frames, *current_window, term_rows, term_cols, *sinks_are_grid);
+            service_background_jobs(app);
         }) {
             Ok(Some(k)) => k,
             // EOF/error: nothing to resume -- leave the pane exactly as
@@ -3085,7 +2801,7 @@ fn run_diagnostics_frame(
         if let Key::Mouse(ev) = key {
             if ev.is_left_click() {
                 let row0 = (ev.row as usize).saturating_sub(1);
-                let diagnostics_len = edit_frames.get(&edit_frame_id).map(|s| s.buffer.diagnostics.len()).unwrap_or(0);
+                let diagnostics_len = app.edit_frames.get(&edit_frame_id).map(|s| s.buffer.diagnostics.len()).unwrap_or(0);
                 if row0 >= rect.row {
                     let idx = row0 - rect.row;
                     if idx < diagnostics_len {
@@ -3103,40 +2819,39 @@ fn run_diagnostics_frame(
         // collapsed title first so it reflects whatever's still true
         // (only matters after `f` actually changed the count below, but
         // cheap enough to always do).
-        let leave = |windows: &mut Vec<WindowEntry>, sessions: &HashMap<SessionId, SessionState>, edit_frames: &mut HashMap<EditFrameId, fileeditor::EditSession>, jump: bool| {
-            if let Some(session) = edit_frames.get_mut(&edit_frame_id) {
+        let leave = |app: &mut App, jump: bool| {
+            let sid = app.windows[app.current_window].pane(pane_id).owning_session();
+            let screen = app.sessions[&sid].screen.clone();
+            if let Some(session) = app.edit_frames.get_mut(&edit_frame_id) {
                 if jump && let Some(d) = session.buffer.diagnostics.get(selected).cloned() {
                     let (line, col) = fileeditor::diagnostic_position(&session.buffer, d.start);
                     session.buffer.set_cursor(line, col);
                 }
-                let sid = windows[*current_window].pane(pane_id).owning_session();
-                render_diagnostics_title(&sessions[&sid].screen, rect.cols, &session.buffer.diagnostics);
+                render_diagnostics_title(&screen, rect.cols, &session.buffer.diagnostics);
             }
-            set_minimized(windows, *current_window);
-            if let Some(editor_pane) = editor_pane_for(&windows[*current_window], edit_frame_id) {
-                windows[*current_window].focused_pane = editor_pane;
-            }
+            set_pane_minimized(app, pane_id);
+            focus_editor_pane(app, edit_frame_id);
         };
 
         match key {
             Key::Enter => {
-                leave(windows, sessions, edit_frames, true);
-                refresh_editor_frame(sessions, windows, edit_frames, *current_window, *term_rows, *term_cols);
-                compositor_redraw(sessions, windows, *current_window, *term_rows, *term_cols);
+                leave(app, true);
+                refresh_editor_frame(app, edit_frame_id);
+                compositor_redraw(app);
                 return;
             }
             Key::Escape | Key::Char('q') => {
-                leave(windows, sessions, edit_frames, false);
-                refresh_editor_frame(sessions, windows, edit_frames, *current_window, *term_rows, *term_cols);
-                compositor_redraw(sessions, windows, *current_window, *term_rows, *term_cols);
+                leave(app, false);
+                refresh_editor_frame(app, edit_frame_id);
+                compositor_redraw(app);
                 return;
             }
             Key::Char(' ') => {
                 expanded = if expanded == Some(selected) { None } else { Some(selected) };
-                let diagnostics_len = edit_frames.get(&edit_frame_id).map(|s| s.buffer.diagnostics.len()).unwrap_or(0);
-                set_expanded(windows, *current_window, diagnostics_pane_rows(diagnostics_len, expanded.is_some(), budget));
-                refresh_editor_frame(sessions, windows, edit_frames, *current_window, *term_rows, *term_cols);
-                compositor_redraw(sessions, windows, *current_window, *term_rows, *term_cols);
+                let diagnostics_len = app.edit_frames.get(&edit_frame_id).map(|s| s.buffer.diagnostics.len()).unwrap_or(0);
+                set_pane_expanded(app, pane_id, diagnostics_pane_rows(diagnostics_len, expanded.is_some(), budget));
+                refresh_editor_frame(app, edit_frame_id);
+                compositor_redraw(app);
             }
             // `f`: applies the selected item's own fix, only while its
             // detail (and so the `[f] autofix` hint) is actually showing
@@ -3148,7 +2863,7 @@ fn run_diagnostics_frame(
             // why) and keeps the pane expanded, so applying several
             // fixes in a row doesn't require re-entering each time.
             Key::Char('f') if expanded == Some(selected) => {
-                let applied = edit_frames.get_mut(&edit_frame_id).map(|session| {
+                let applied = app.edit_frames.get_mut(&edit_frame_id).map(|session| {
                     let Some(d) = session.buffer.diagnostics.get(selected).cloned() else { return false };
                     if !fileeditor::apply_fix(&mut session.buffer, &d) {
                         return false;
@@ -3157,28 +2872,28 @@ fn run_diagnostics_frame(
                     true
                 });
                 if applied == Some(true) {
-                    let diagnostics_len = edit_frames.get(&edit_frame_id).map(|s| s.buffer.diagnostics.len()).unwrap_or(0);
+                    let diagnostics_len = app.edit_frames.get(&edit_frame_id).map(|s| s.buffer.diagnostics.len()).unwrap_or(0);
                     selected = selected.min(diagnostics_len.saturating_sub(1));
                     expanded = None;
-                    set_expanded(windows, *current_window, diagnostics_pane_rows(diagnostics_len, false, budget));
-                    refresh_editor_frame(sessions, windows, edit_frames, *current_window, *term_rows, *term_cols);
-                    compositor_redraw(sessions, windows, *current_window, *term_rows, *term_cols);
+                    set_pane_expanded(app, pane_id, diagnostics_pane_rows(diagnostics_len, false, budget));
+                    refresh_editor_frame(app, edit_frame_id);
+                    compositor_redraw(app);
                 }
             }
             _ => match vk.feed(key) {
                 KeyOutcome::Motion(motion::Motion::Down, count) => {
-                    let diagnostics_len = edit_frames.get(&edit_frame_id).map(|s| s.buffer.diagnostics.len()).unwrap_or(0);
+                    let diagnostics_len = app.edit_frames.get(&edit_frame_id).map(|s| s.buffer.diagnostics.len()).unwrap_or(0);
                     selected = (selected + count.unwrap_or(1).max(1)).min(diagnostics_len.saturating_sub(1));
                     expanded = None;
-                    compositor_redraw(sessions, windows, *current_window, *term_rows, *term_cols);
+                    compositor_redraw(app);
                 }
                 KeyOutcome::Motion(motion::Motion::Up, count) => {
                     selected = selected.saturating_sub(count.unwrap_or(1).max(1));
                     expanded = None;
-                    compositor_redraw(sessions, windows, *current_window, *term_rows, *term_cols);
+                    compositor_redraw(app);
                 }
                 KeyOutcome::Window(cmd, count) => {
-                    dispatch_window_cmd(cmd, count, sessions, windows, current_window, next_session_id, next_window_id, sinks_are_grid, *term_rows, *term_cols);
+                    dispatch_window_cmd(app, cmd, count);
                     return;
                 }
                 _ => {}
@@ -3248,69 +2963,31 @@ fn render_locations_list_frame(list: &LocationList, rect: Rect, selected: usize)
 // buffer's cursor; a location may be in any file, so selecting one can
 // have to *open* something -- which is why this takes the frame-id
 // counter its sibling does not need.
-#[allow(clippy::too_many_arguments)]
-fn run_locations_frame(
-    pane_id: PaneId,
-    edit_frame_id: EditFrameId,
-    sessions: &mut HashMap<SessionId, SessionState>,
-    windows: &mut Vec<WindowEntry>,
-    current_window: &mut usize,
-    next_session_id: &mut SessionId,
-    next_window_id: &mut u32,
-    job_frames: &mut HashMap<JobFrameId, exec::FgJob>,
-    edit_frames: &mut HashMap<EditFrameId, fileeditor::EditSession>,
-    next_edit_frame_id: &mut EditFrameId,
-    location_lists: &mut HashMap<EditFrameId, LocationList>,
-    sinks_are_grid: &mut bool,
-    term_rows: &mut usize,
-    term_cols: &mut usize,
-) {
+fn run_locations_frame(app: &mut App, pane_id: PaneId, edit_frame_id: EditFrameId) {
     let Ok(_guard) = term::RawGuard::enable_with_mouse(0) else { return };
     let mut vk = VimKeys::new();
     let mut selected: usize = 0;
 
-    let budget = editor_pane_for(&windows[*current_window], edit_frame_id)
-        .map(|id| pane_rect(&windows[*current_window], id, *term_rows, *term_cols).rows + 1)
-        .unwrap_or(*term_rows);
-    let set_expanded = |windows: &mut Vec<WindowEntry>, current_window: usize, rows: usize| {
-        if let Some((_, children, idx)) = find_parent_split_mut(&mut windows[current_window].layout, pane_id) {
-            children[idx].minimized = false;
-            children[idx].fixed = Some(rows);
-        }
-    };
-    let set_minimized = |windows: &mut Vec<WindowEntry>, current_window: usize| {
-        if let Some((_, children, idx)) = find_parent_split_mut(&mut windows[current_window].layout, pane_id) {
-            children[idx].minimized = true;
-            children[idx].fixed = None;
-        }
-    };
-    let refresh_editor_frame = |sessions: &HashMap<SessionId, SessionState>, windows: &Vec<WindowEntry>, edit_frames: &HashMap<EditFrameId, fileeditor::EditSession>, current_window: usize, term_rows: usize, term_cols: usize| {
-        let Some(editor_pane) = editor_pane_for(&windows[current_window], edit_frame_id) else { return };
-        let Some(session) = edit_frames.get(&edit_frame_id) else { return };
-        let rect = pane_rect(&windows[current_window], editor_pane, term_rows, term_cols);
-        let sid = windows[current_window].pane(editor_pane).owning_session();
-        let color_overrides = syntax_color_overrides(&sessions[&sid].shell);
-        let screen = &sessions[&sid].screen;
-        screen.borrow_mut().resize(rect.rows, rect.cols);
-        fileeditor::freeze_editor_frame(screen, &session.buffer, &session.vk, rect, Some(&color_overrides));
-    };
-    let len = location_lists.get(&edit_frame_id).map(|l| l.items.len()).unwrap_or(0);
-    set_expanded(windows, *current_window, diagnostics_pane_rows(len, false, budget));
-    refresh_editor_frame(sessions, windows, edit_frames, *current_window, *term_rows, *term_cols);
-    compositor_redraw(sessions, windows, *current_window, *term_rows, *term_cols);
+    let budget = editor_pane_for(&app.windows[app.current_window], edit_frame_id)
+        .map(|id| pane_rect(&app.windows[app.current_window], id, app.term_rows, app.term_cols).rows + 1)
+        .unwrap_or(app.term_rows);
+    let len = app.location_lists.get(&edit_frame_id).map(|l| l.items.len()).unwrap_or(0);
+    set_pane_expanded(app, pane_id, diagnostics_pane_rows(len, false, budget));
+    refresh_editor_frame(app, edit_frame_id);
+    compositor_redraw(app);
 
     loop {
-        let rect = pane_rect(&windows[*current_window], pane_id, *term_rows, *term_cols);
-        if let Some(list) = location_lists.get(&edit_frame_id) {
+        let rect = pane_rect(&app.windows[app.current_window], pane_id, app.term_rows, app.term_cols);
+        if let Some(list) = app.location_lists.get(&edit_frame_id) {
             render_locations_list_frame(list, rect, selected);
         }
         let key = match editor::read_key_idle(&mut || {
-            service_background_jobs(sessions, windows, job_frames, *current_window, term_rows, term_cols, *sinks_are_grid);
+            service_background_jobs(app);
         }) {
             Ok(Some(k)) => k,
             Ok(None) | Err(_) => return,
         };
-        let len = location_lists.get(&edit_frame_id).map(|l| l.items.len()).unwrap_or(0);
+        let len = app.location_lists.get(&edit_frame_id).map(|l| l.items.len()).unwrap_or(0);
 
         if let Key::Mouse(ev) = key {
             if ev.is_left_click() {
@@ -3329,59 +3006,57 @@ fn run_locations_frame(
         // Collapse back to the title row and hand focus to the editor
         // pane this list belongs to -- the same exit its diagnostics
         // sibling has.
-        let collapse = |windows: &mut Vec<WindowEntry>, sessions: &HashMap<SessionId, SessionState>, lists: &HashMap<EditFrameId, LocationList>| {
-            if let Some(list) = lists.get(&edit_frame_id) {
-                let sid = windows[*current_window].pane(pane_id).owning_session();
-                render_locations_title(&sessions[&sid].screen, rect.cols, &list.title);
+        let collapse = |app: &mut App| {
+            if let Some(list) = app.location_lists.get(&edit_frame_id) {
+                let sid = app.windows[app.current_window].pane(pane_id).owning_session();
+                render_locations_title(&app.sessions[&sid].screen, rect.cols, &list.title);
             }
-            set_minimized(windows, *current_window);
-            if let Some(editor_pane) = editor_pane_for(&windows[*current_window], edit_frame_id) {
-                windows[*current_window].focused_pane = editor_pane;
-            }
+            set_pane_minimized(app, pane_id);
+            focus_editor_pane(app, edit_frame_id);
         };
 
         match key {
             Key::Enter => {
-                let chosen = location_lists.get(&edit_frame_id).and_then(|l| l.items.get(selected)).map(|item| {
+                let chosen = app.location_lists.get(&edit_frame_id).and_then(|l| l.items.get(selected)).map(|item| {
                     (item.path.clone(), item.line, item.character, item.encoding)
                 });
-                collapse(windows, sessions, location_lists);
+                collapse(app);
                 if let Some((path, line, character, encoding)) = chosen {
-                    let here = edit_frames.get(&edit_frame_id).and_then(|s| s.buffer.path().map(|p| p.to_path_buf()));
+                    let here = app.edit_frames.get(&edit_frame_id).and_then(|s| s.buffer.path().map(|p| p.to_path_buf()));
                     if here.as_deref() == Some(path.as_path()) {
                         // Already open: just move its cursor, the way
                         // the diagnostics pane always does.
-                        if let Some(session) = edit_frames.get_mut(&edit_frame_id) {
+                        if let Some(session) = app.edit_frames.get_mut(&edit_frame_id) {
                             let starts = fileeditor::line_starts_of(&session.buffer);
                             let offset = fileeditor::diagnostic_offset(&session.buffer, &starts, line, character, encoding);
                             let (row, col) = fileeditor::diagnostic_position(&session.buffer, offset);
                             session.buffer.set_cursor(row, col);
                         }
                     } else {
-                        open_location_frame(sessions, windows, edit_frames, next_edit_frame_id, *current_window, &path, line, character, encoding, *term_rows, *term_cols);
+                        open_location_frame(app, &path, line, character, encoding);
                     }
                 }
-                refresh_editor_frame(sessions, windows, edit_frames, *current_window, *term_rows, *term_cols);
-                compositor_redraw(sessions, windows, *current_window, *term_rows, *term_cols);
+                refresh_editor_frame(app, edit_frame_id);
+                compositor_redraw(app);
                 return;
             }
             Key::Escape | Key::Char('q') => {
-                collapse(windows, sessions, location_lists);
-                refresh_editor_frame(sessions, windows, edit_frames, *current_window, *term_rows, *term_cols);
-                compositor_redraw(sessions, windows, *current_window, *term_rows, *term_cols);
+                collapse(app);
+                refresh_editor_frame(app, edit_frame_id);
+                compositor_redraw(app);
                 return;
             }
             _ => match vk.feed(key) {
                 KeyOutcome::Motion(motion::Motion::Down, count) => {
                     selected = (selected + count.unwrap_or(1).max(1)).min(len.saturating_sub(1));
-                    compositor_redraw(sessions, windows, *current_window, *term_rows, *term_cols);
+                    compositor_redraw(app);
                 }
                 KeyOutcome::Motion(motion::Motion::Up, count) => {
                     selected = selected.saturating_sub(count.unwrap_or(1).max(1));
-                    compositor_redraw(sessions, windows, *current_window, *term_rows, *term_cols);
+                    compositor_redraw(app);
                 }
                 KeyOutcome::Window(cmd, count) => {
-                    dispatch_window_cmd(cmd, count, sessions, windows, current_window, next_session_id, next_window_id, sinks_are_grid, *term_rows, *term_cols);
+                    dispatch_window_cmd(app, cmd, count);
                     return;
                 }
                 _ => {}
@@ -3394,36 +3069,23 @@ fn run_locations_frame(
 // cursor at the server position given -- the same "go look, then `:q`
 // back" shape `NavExit::OpenAt` produces for `gd`, reached from the
 // location pane instead of from the navigation loop.
-#[allow(clippy::too_many_arguments)]
-fn open_location_frame(
-    sessions: &mut HashMap<SessionId, SessionState>,
-    windows: &mut [WindowEntry],
-    edit_frames: &mut HashMap<EditFrameId, fileeditor::EditSession>,
-    next_edit_frame_id: &mut EditFrameId,
-    current_window: usize,
-    path: &Path,
-    line: usize,
-    character: usize,
-    encoding: crate::lsp::PositionEncoding,
-    term_rows: usize,
-    term_cols: usize,
-) {
-    let pane_id = windows[current_window].focused_pane;
-    let rect = pane_rect(&windows[current_window], pane_id, term_rows, term_cols);
+fn open_location_frame(app: &mut App, path: &Path, line: usize, character: usize, encoding: crate::lsp::PositionEncoding) {
+    let pane_id = app.windows[app.current_window].focused_pane;
+    let rect = pane_rect(&app.windows[app.current_window], pane_id, app.term_rows, app.term_cols);
     match fileeditor::EditSession::open(path.to_str(), normal_mode_content_rows(rect)) {
         Ok(mut opened) => {
             let starts = fileeditor::line_starts_of(&opened.buffer);
             let offset = fileeditor::diagnostic_offset(&opened.buffer, &starts, line, character, encoding);
             let (row, col) = fileeditor::diagnostic_position(&opened.buffer, offset);
             opened.buffer.set_cursor(row, col);
-            let id = *next_edit_frame_id;
-            *next_edit_frame_id += 1;
-            edit_frames.insert(id, opened);
-            windows[current_window].pane_mut(pane_id).stack.push(Frame::Edit(id));
+            let id = app.next_edit_frame_id;
+            app.next_edit_frame_id += 1;
+            app.edit_frames.insert(id, opened);
+            app.windows[app.current_window].pane_mut(pane_id).stack.push(Frame::Edit(id));
         }
         Err(e) => {
-            let sid = windows[current_window].pane(pane_id).owning_session();
-            sessions.get_mut(&sid).unwrap().shell.sink_err(&format!("bish: {}: {}\n", path.display(), e));
+            let sid = app.windows[app.current_window].pane(pane_id).owning_session();
+            app.sessions.get_mut(&sid).unwrap().shell.sink_err(&format!("bish: {}: {}\n", path.display(), e));
         }
     }
 }
@@ -3448,7 +3110,6 @@ fn open_location_frame(
 // over the pane immediately (the ordinary outcome) or redraws it because
 // nothing was chosen, so adding a redraw here would just paint the same
 // rows twice.
-#[allow(clippy::too_many_arguments)]
 // What a browse ended with. `Nothing` covers both cancelling and an EOF
 // -- neither has anything for the caller to do.
 enum BrowseOutcome {
@@ -3457,8 +3118,8 @@ enum BrowseOutcome {
     ChangeDirectory(std::path::PathBuf),
 }
 
-#[allow(clippy::too_many_arguments)]
 fn run_browse_frame(
+    app: &mut App,
     start: &std::path::Path,
     can_change_directory: bool,
     // The `gitignore` bishopt, read fresh per browse rather than once
@@ -3466,22 +3127,6 @@ fn run_browse_frame(
     // the next `e .`, not on the next shell.
     honor_gitignore: bool,
     session_id: SessionId,
-    sessions: &mut HashMap<SessionId, SessionState>,
-    windows: &mut Vec<WindowEntry>,
-    current_window: &mut usize,
-    next_session_id: &mut SessionId,
-    next_window_id: &mut u32,
-    cmd_history: &mut History,
-    job_frames: &mut HashMap<JobFrameId, exec::FgJob>,
-    debug_frames: &mut HashMap<EditFrameId, debugger::DebugSession>,
-    // Every open buffer -- threaded only so this frame's own `:` line
-    // can reach a cross-file edit (see `rename_via_server`); the
-    // browser itself never touches it.
-    edit_frames: &mut HashMap<EditFrameId, fileeditor::EditSession>,
-    registers: &mut Registers,
-    term_rows: &mut usize,
-    term_cols: &mut usize,
-    sinks_are_grid: &mut bool,
 ) -> Result<BrowseOutcome, String> {
     // Opened before raw mode is touched, so an unreadable path is an
     // ordinary command-mode error at the colon line rather than a
@@ -3489,7 +3134,7 @@ fn run_browse_frame(
     let mut browser = browser::Browser::open(start)?;
     browser.set_can_change_directory(can_change_directory);
     browser.set_honor_gitignore(honor_gitignore)?;
-    if let Some(session) = sessions.get(&session_id) {
+    if let Some(session) = app.sessions.get(&session_id) {
         browser.set_colors(ui_colors(&session.shell));
     }
     // Same reasoning run_diagnostics_frame's own guard has: whatever
@@ -3498,15 +3143,15 @@ fn run_browse_frame(
     let Ok(_guard) = term::RawGuard::enable_with_mouse(0) else {
         return Err("not a terminal".to_string());
     };
-    let pane_id = windows[*current_window].focused_pane;
+    let pane_id = app.windows[app.current_window].focused_pane;
 
     let outcome = loop {
-        let rect = pane_rect(&windows[*current_window], pane_id, *term_rows, *term_cols);
-        print!("{}", browser.render(rect, *term_rows, *term_cols));
+        let rect = pane_rect(&app.windows[app.current_window], pane_id, app.term_rows, app.term_cols);
+        print!("{}", browser.render(rect, app.term_rows, app.term_cols));
         let _ = io::stdout().flush();
 
         let key = match editor::read_key_idle(&mut || {
-            service_background_jobs(sessions, windows, job_frames, *current_window, term_rows, term_cols, *sinks_are_grid);
+            service_background_jobs(app);
         }) {
             Ok(Some(k)) => k,
             // EOF/error: nothing chosen, same tolerance every other
@@ -3526,20 +3171,8 @@ fn run_browse_frame(
             // Raw mode belongs to the colon line while it runs, and
             // comes back to the browser after.
             let outcome = handle_command_mode(
+                app,
                 session_id,
-                sessions,
-                windows,
-                current_window,
-                next_session_id,
-                next_window_id,
-                cmd_history,
-                sinks_are_grid,
-                job_frames,
-                debug_frames,
-                edit_frames,
-                registers,
-                term_rows,
-                term_cols,
                 None,
                 None,
                 // Nothing maps into the browser's colon line, so there is
@@ -3550,7 +3183,7 @@ fn run_browse_frame(
             // before the next redraw rather than on the next `e .` --
             // the same reason the editor's own `:` arm re-reads its view
             // options right here.
-            let honor = sessions.get(&session_id).is_none_or(|s| s.shell.bishopt_bool("gitignore"));
+            let honor = app.sessions.get(&session_id).is_none_or(|s| s.shell.bishopt_bool("gitignore"));
             if let Err(e) = browser.set_honor_gitignore(honor) {
                 browser.set_message(e);
             }
@@ -3566,8 +3199,8 @@ fn run_browse_frame(
             // The colon line drew over the global status row and
             // whatever else; the next iteration repaints the browser,
             // but the pane behind it has to come back first.
-            if *sinks_are_grid {
-                compositor_redraw(sessions, windows, *current_window, *term_rows, *term_cols);
+            if app.sinks_are_grid {
+                compositor_redraw(app);
             }
             continue;
         }
@@ -3588,7 +3221,7 @@ fn run_browse_frame(
     // caller's `compositor_redraw` cannot clean up on its own -- found
     // via pty, where cancelling a browse left "esc back" sitting above a
     // perfectly ordinary shell prompt.
-    print!("\x1b[?25h{}{}", fileeditor::CURSOR_SHAPE_RESET, erase_global_status_row(*term_rows));
+    print!("\x1b[?25h{}{}", fileeditor::CURSOR_SHAPE_RESET, erase_global_status_row(app.term_rows));
     let _ = io::stdout().flush();
     Ok(outcome)
 }
@@ -3667,28 +3300,10 @@ fn render_diagnostics_list_frame(buf: &TextBuffer, rect: Rect, selected: usize, 
 // the way `run_diagnostics_frame` has -- just a status line and
 // `<C-w>`/Escape/`q` to leave, so this is much smaller than that
 // function despite the shared shape.
-#[allow(clippy::too_many_arguments)]
-fn run_debug_run_frame(
-    pane_id: PaneId,
-    edit_frame_id: EditFrameId,
-    sessions: &mut HashMap<SessionId, SessionState>,
-    windows: &mut Vec<WindowEntry>,
-    current_window: &mut usize,
-    next_session_id: &mut SessionId,
-    next_window_id: &mut u32,
-    debug_frames: &HashMap<EditFrameId, debugger::DebugSession>,
-    sinks_are_grid: &mut bool,
-    term_rows: &mut usize,
-    term_cols: &mut usize,
-) {
+fn run_debug_run_frame(app: &mut App, pane_id: PaneId, edit_frame_id: EditFrameId) {
     let Ok(_guard) = term::RawGuard::enable_with_mouse(0) else { return };
     let mut vk = VimKeys::new();
 
-    let leave = |windows: &mut Vec<WindowEntry>| {
-        if let Some(editor_pane) = editor_pane_for(&windows[*current_window], edit_frame_id) {
-            windows[*current_window].focused_pane = editor_pane;
-        }
-    };
 
     // Same reasoning run_diagnostics_frame's own identical call has:
     // whichever pane this one's *sibling* is (the editor pane) has never
@@ -3697,11 +3312,11 @@ fn run_debug_run_frame(
     // update, leaving the editor pane's last content sitting there at
     // its *previous* (unshrunk) size until something else happens to
     // trigger a full repaint.
-    compositor_redraw(sessions, windows, *current_window, *term_rows, *term_cols);
+    compositor_redraw(app);
 
     loop {
-        let rect = pane_rect(&windows[*current_window], pane_id, *term_rows, *term_cols);
-        let status = if debug_frames.contains_key(&edit_frame_id) {
+        let rect = pane_rect(&app.windows[app.current_window], pane_id, app.term_rows, app.term_cols);
+        let status = if app.debug_frames.contains_key(&edit_frame_id) {
             "dbg: attached -- :dbg run to start  <C-w> to leave"
         } else {
             "dbg: not attached -- :dbg to attach"
@@ -3721,13 +3336,13 @@ fn run_debug_run_frame(
         };
         match key {
             Key::Escape | Key::Char('q') => {
-                leave(windows);
-                compositor_redraw(sessions, windows, *current_window, *term_rows, *term_cols);
+                focus_editor_pane(app, edit_frame_id);
+                compositor_redraw(app);
                 return;
             }
             _ => {
                 if let KeyOutcome::Window(cmd, count) = vk.feed(key) {
-                    dispatch_window_cmd(cmd, count, sessions, windows, current_window, next_session_id, next_window_id, sinks_are_grid, *term_rows, *term_cols);
+                    dispatch_window_cmd(app, cmd, count);
                     return;
                 }
             }
@@ -3741,7 +3356,6 @@ fn run_debug_run_frame(
 // compositor afterward for every action, including the rejected-close
 // case (its error message needs to actually become visible once
 // promoted, same as any other captured output).
-#[allow(clippy::too_many_arguments)]
 // One-time transition, shared by two independent triggers: every
 // window-family command (via apply_window_action -- see its own former
 // comment, preserved in spirit here) and, as of bishedit, Ctrl+Space
@@ -3785,49 +3399,39 @@ fn ensure_promoted(sessions: &mut HashMap<SessionId, SessionState>, sinks_are_gr
 // prompt+line grid-feed self-heals the display regardless, which is why
 // this went unnoticed until normal mode's own `<C-w>gg`/`<C-w>G` made it
 // possible to land on a window and *not* immediately type something).
-fn freeze_focused_idle_prompt(sessions: &mut HashMap<SessionId, SessionState>, windows: &[WindowEntry], current_window: usize) {
-    if matches!(windows[current_window].stack().last(), Some(Frame::Session(_))) {
-        let sid = windows[current_window].owning_session();
-        freeze_idle_prompt(sessions.get_mut(&sid).unwrap());
+fn freeze_focused_idle_prompt(app: &mut App) {
+    if matches!(app.windows[app.current_window].stack().last(), Some(Frame::Session(_))) {
+        let sid = app.windows[app.current_window].owning_session();
+        freeze_idle_prompt(app.sessions.get_mut(&sid).unwrap());
     }
 }
 
-fn apply_window_action(
-    action: WindowAction,
-    sessions: &mut HashMap<SessionId, SessionState>,
-    windows: &mut Vec<WindowEntry>,
-    current_window: &mut usize,
-    next_session_id: &mut SessionId,
-    next_window_id: &mut u32,
-    sinks_are_grid: &mut bool,
-    term_rows: usize,
-    term_cols: usize,
-) {
-    ensure_promoted(sessions, sinks_are_grid);
-    freeze_focused_idle_prompt(sessions, windows, *current_window);
+fn apply_window_action(app: &mut App, action: WindowAction) {
+    ensure_promoted(&mut app.sessions, &mut app.sinks_are_grid);
+    freeze_focused_idle_prompt(app);
 
     match action {
         WindowAction::Next => {
-            *current_window = (*current_window + 1) % windows.len();
+            app.current_window = (app.current_window + 1) % app.windows.len();
         }
         WindowAction::Previous => {
-            *current_window = (*current_window + windows.len() - 1) % windows.len();
+            app.current_window = (app.current_window + app.windows.len() - 1) % app.windows.len();
         }
         WindowAction::New { name } => {
-            let parent_id = windows[*current_window].owning_session();
-            let child_history = Rc::new(RefCell::new(sessions[&parent_id].history.borrow().fork()));
-            let mut child_shell = sessions[&parent_id].shell.new_virtual_child();
+            let parent_id = app.windows[app.current_window].owning_session();
+            let child_history = Rc::new(RefCell::new(app.sessions[&parent_id].history.borrow().fork()));
+            let mut child_shell = app.sessions[&parent_id].shell.new_virtual_child();
     // The same table every other session sees -- one per process, like
     // `jobs`, so a server started for one pane serves them all.
-    let child_lsp = Rc::clone(&sessions[&parent_id].lsp);
+    let child_lsp = Rc::clone(&app.sessions[&parent_id].lsp);
     install_service_table(&mut child_shell, &child_lsp);
     install_history(&mut child_shell, &child_history);
-            let screen = Rc::new(RefCell::new(vt100::Screen::new(content_rows(term_rows), term_cols)));
+            let screen = Rc::new(RefCell::new(vt100::Screen::new(content_rows(app.term_rows), app.term_cols)));
             child_shell.set_sink_grid(screen.clone());
             let child_cwd = child_shell.cwd.clone();
-            let sid = *next_session_id;
-            *next_session_id += 1;
-            sessions.insert(
+            let sid = app.next_session_id;
+            app.next_session_id += 1;
+            app.sessions.insert(
                 sid,
                 SessionState {
                     shell: child_shell,
@@ -3854,111 +3458,111 @@ fn apply_window_action(
                     command_transcript: Vec::new(),
                 },
             );
-            let wid = *next_window_id;
-            *next_window_id += 1;
+            let wid = app.next_window_id;
+            app.next_window_id += 1;
             let mut window = WindowEntry::single(wid, Frame::Session(sid));
             window.name = name;
-            windows.push(window);
-            *current_window = windows.len() - 1;
+            app.windows.push(window);
+            app.current_window = app.windows.len() - 1;
         }
         // The three that make a workflow scriptable: something to call a
         // window, a way to see what is there, and a way to ask for one
         // back -- see WindowAction's own doc comments.
-        WindowAction::Rename(name) => windows[*current_window].name = name,
-        // `select` is resolved in the builtin against Shell::windows, so
+        WindowAction::Rename(name) => app.windows[app.current_window].name = name,
+        // `select` is resolved in the builtin against Shell::app.windows, so
         // by the time one reaches here the index is known good -- a miss
         // never gets this far, it is an ordinary failing command.
-        WindowAction::Select(index) => *current_window = index.min(windows.len().saturating_sub(1)),
+        WindowAction::Select(index) => app.current_window = index.min(app.windows.len().saturating_sub(1)),
         WindowAction::Close => {
-            if windows[*current_window].stack().len() > 1 {
+            if app.windows[app.current_window].stack().len() > 1 {
                 // Popping a frame off the focused pane's own stack, not
                 // closing anything -- always fine regardless of how
-                // many windows/panes exist, and never orphans a session
+                // many app.windows/panes exist, and never orphans a session
                 // since what's revealed underneath was already a live
                 // frame.
-                windows[*current_window].stack_mut().pop();
-            } else if windows[*current_window].panes.len() > 1 {
+                app.windows[app.current_window].stack_mut().pop();
+            } else if app.windows[app.current_window].panes.len() > 1 {
                 // The focused pane's stack is down to just its own
                 // session with nothing else to reveal -- but it's one
                 // of several panes in a split window, so close just
                 // this pane (collapsing the split) rather than falling
                 // through to "close the whole window".
-                close_focused_pane(&mut windows[*current_window]);
-                close_orphaned_sessions(sessions, windows);
-            } else if windows.len() == 1 {
-                let sid = windows[*current_window].owning_session();
-                sessions[&sid].shell.sink_err("bish: window close: cannot close the last window -- exit the shell instead\n");
-                compositor_redraw(sessions, windows, *current_window, term_rows, term_cols);
+                close_focused_pane(&mut app.windows[app.current_window]);
+                close_orphaned_sessions(&mut app.sessions, &app.windows);
+            } else if app.windows.len() == 1 {
+                let sid = app.windows[app.current_window].owning_session();
+                app.sessions[&sid].shell.sink_err("bish: window close: cannot close the last window -- exit the shell instead\n");
+                compositor_redraw(app);
                 return;
             } else {
-                windows.remove(*current_window);
-                if *current_window >= windows.len() {
-                    *current_window = windows.len() - 1;
+                app.windows.remove(app.current_window);
+                if app.current_window >= app.windows.len() {
+                    app.current_window = app.windows.len() - 1;
                 }
-                close_orphaned_sessions(sessions, windows);
+                close_orphaned_sessions(&mut app.sessions, &app.windows);
             }
         }
         WindowAction::FgSession(target_id) => {
-            let target_frame = windows.iter().find(|w| w.id == target_id).map(|w| *w.stack().last().unwrap());
-            let cur_sid = windows[*current_window].owning_session();
+            let target_frame = app.windows.iter().find(|w| w.id == target_id).map(|w| *w.stack().last().unwrap());
+            let cur_sid = app.windows[app.current_window].owning_session();
             match target_frame {
-                Some(frame @ Frame::Session(_)) => windows[*current_window].stack_mut().push(frame),
+                Some(frame @ Frame::Session(_)) => app.windows[app.current_window].stack_mut().push(frame),
                 // A running job is a one-place-at-a-time resource (see
                 // Frame's doc comment) -- unlike a session, it can't
-                // legitimately be shown in two windows at once.
+                // legitimately be shown in two app.windows at once.
                 Some(Frame::Job(_)) => {
-                    sessions[&cur_sid].shell.sink_err("bish: window: fg: that window is running a job, not a session\n");
+                    app.sessions[&cur_sid].shell.sink_err("bish: window: fg: that window is running a job, not a session\n");
                 }
                 // Same one-place-at-a-time reasoning as Job just above --
-                // an open editor session can't be shown in two windows
+                // an open editor session can't be shown in two app.windows
                 // simultaneously either.
                 Some(Frame::Edit(_) | Frame::Hex(_)) => {
-                    sessions[&cur_sid].shell.sink_err("bish: window: fg: that window is running an editor, not a session\n");
+                    app.sessions[&cur_sid].shell.sink_err("bish: window: fg: that window is running an editor, not a session\n");
                 }
                 // Same reasoning again -- a diagnostics pane is scoped
                 // to the one Edit frame's own pane it sits below, not a
                 // session that could sensibly show up somewhere else.
                 Some(Frame::Diagnostics(_)) => {
-                    sessions[&cur_sid].shell.sink_err("bish: window: fg: that window is showing diagnostics, not a session\n");
+                    app.sessions[&cur_sid].shell.sink_err("bish: window: fg: that window is showing diagnostics, not a session\n");
                 }
                 // Same reasoning again -- a location list belongs to the
                 // one Edit frame's pane it sits below.
                 Some(Frame::Locations(_)) => {
-                    sessions[&cur_sid].shell.sink_err("bish: window: fg: that window is showing a location list, not a session\n");
+                    app.sessions[&cur_sid].shell.sink_err("bish: window: fg: that window is showing a location list, not a session\n");
                 }
                 // Same reasoning again -- the debug-run pane is scoped to
                 // the one Edit frame's own pane it sits below too.
                 Some(Frame::DebugRun(_)) => {
-                    sessions[&cur_sid].shell.sink_err("bish: window: fg: that window is running a debugged script, not a session\n");
+                    app.sessions[&cur_sid].shell.sink_err("bish: window: fg: that window is running a debugged script, not a session\n");
                 }
                 None => {
-                    sessions[&cur_sid].shell.sink_err(&format!("bish: window: fg: no such window: {}\n", target_id));
+                    app.sessions[&cur_sid].shell.sink_err(&format!("bish: window: fg: no such window: {}\n", target_id));
                 }
             }
         }
         WindowAction::Split { horizontal } => {
-            split_focused_pane(sessions, windows, *current_window, next_session_id, horizontal, term_rows, term_cols);
+            split_focused_pane(app, horizontal);
         }
         WindowAction::FocusPane(direction) => {
-            focus_pane_direction(&mut windows[*current_window], sessions, direction, term_rows, term_cols);
+            focus_pane_direction(&mut app.windows[app.current_window], &mut app.sessions, direction, app.term_rows, app.term_cols);
         }
         WindowAction::Balance => {
-            balance_panes(&mut windows[*current_window].layout);
+            balance_panes(&mut app.windows[app.current_window].layout);
         }
         WindowAction::Minimize => {
-            minimize_focused_pane(&mut windows[*current_window]);
+            minimize_focused_pane(&mut app.windows[app.current_window]);
         }
         WindowAction::SizeUp => {
-            resize_focused_pane(&mut windows[*current_window], RESIZE_STEP);
+            resize_focused_pane(&mut app.windows[app.current_window], RESIZE_STEP);
         }
         WindowAction::SizeDown => {
-            resize_focused_pane(&mut windows[*current_window], -RESIZE_STEP);
+            resize_focused_pane(&mut app.windows[app.current_window], -RESIZE_STEP);
         }
         WindowAction::SetSize(spec) => {
-            set_focused_pane_size(&mut windows[*current_window], spec, term_rows, term_cols);
+            set_focused_pane_size(&mut app.windows[app.current_window], spec, app.term_rows, app.term_cols);
         }
     }
-    compositor_redraw(sessions, windows, *current_window, term_rows, term_cols);
+    compositor_redraw(app);
 }
 
 // Creates a new pane in the current window by splitting the focused one
@@ -3969,30 +3573,21 @@ fn apply_window_action(
 // how `horizontal` maps to the divider's orientation, and
 // insert_sibling for why repeated same-direction splits stay flat (N
 // evenly sized panes) rather than progressively halving.
-#[allow(clippy::too_many_arguments)]
-fn split_focused_pane(
-    sessions: &mut HashMap<SessionId, SessionState>,
-    windows: &mut [WindowEntry],
-    current_window: usize,
-    next_session_id: &mut SessionId,
-    horizontal: bool,
-    term_rows: usize,
-    term_cols: usize,
-) {
-    let parent_id = windows[current_window].owning_session();
-    let child_history = Rc::new(RefCell::new(sessions[&parent_id].history.borrow().fork()));
-    let mut child_shell = sessions[&parent_id].shell.new_virtual_child();
+fn split_focused_pane(app: &mut App, horizontal: bool) {
+    let parent_id = app.windows[app.current_window].owning_session();
+    let child_history = Rc::new(RefCell::new(app.sessions[&parent_id].history.borrow().fork()));
+    let mut child_shell = app.sessions[&parent_id].shell.new_virtual_child();
     // The same table every other session sees -- one per process, like
     // `jobs`, so a server started for one pane serves them all.
-    let child_lsp = Rc::clone(&sessions[&parent_id].lsp);
+    let child_lsp = Rc::clone(&app.sessions[&parent_id].lsp);
     install_service_table(&mut child_shell, &child_lsp);
     install_history(&mut child_shell, &child_history);
-    let screen = Rc::new(RefCell::new(vt100::Screen::new(content_rows(term_rows), term_cols)));
+    let screen = Rc::new(RefCell::new(vt100::Screen::new(content_rows(app.term_rows), app.term_cols)));
     child_shell.set_sink_grid(screen.clone());
     let child_cwd = child_shell.cwd.clone();
-    let sid = *next_session_id;
-    *next_session_id += 1;
-    sessions.insert(
+    let sid = app.next_session_id;
+    app.next_session_id += 1;
+    app.sessions.insert(
         sid,
         SessionState {
             shell: child_shell,
@@ -4017,7 +3612,7 @@ fn split_focused_pane(
         },
     );
 
-    let window = &mut windows[current_window];
+    let window = &mut app.windows[app.current_window];
     let new_pane_id = window.next_pane_id;
     window.next_pane_id += 1;
     window.panes.push(Pane { id: new_pane_id, stack: vec![Frame::Session(sid)], jumps: JumpList::default() });
@@ -4036,10 +3631,10 @@ fn split_focused_pane(
     // pane's grid is already being live-written by the still-running
     // job (service_background_jobs) -- freezing a prompt there would
     // splice a bogus prompt line into the middle of its real output.
-    if matches!(windows[current_window].stack().last(), Some(Frame::Session(_))) {
-        freeze_idle_prompt(sessions.get_mut(&parent_id).unwrap());
+    if matches!(app.windows[app.current_window].stack().last(), Some(Frame::Session(_))) {
+        freeze_idle_prompt(app.sessions.get_mut(&parent_id).unwrap());
     }
-    windows[current_window].focused_pane = new_pane_id;
+    app.windows[app.current_window].focused_pane = new_pane_id;
 }
 
 // `:diag`'s own sibling to split_focused_pane, just above -- same
@@ -4054,29 +3649,21 @@ fn split_focused_pane(
 // feature's own name); `focused_id` is the *editor's* own pane, i.e.
 // whichever pane is currently focused when `:diag` runs (it's the one
 // driving this command in the first place).
-fn split_diagnostics_pane(
-    sessions: &mut HashMap<SessionId, SessionState>,
-    windows: &mut [WindowEntry],
-    current_window: usize,
-    next_session_id: &mut SessionId,
-    edit_frame_id: EditFrameId,
-    term_rows: usize,
-    term_cols: usize,
-) -> PaneId {
-    let parent_id = windows[current_window].owning_session();
-    let child_history = Rc::new(RefCell::new(sessions[&parent_id].history.borrow().fork()));
-    let mut child_shell = sessions[&parent_id].shell.new_virtual_child();
+fn split_diagnostics_pane(app: &mut App, edit_frame_id: EditFrameId) -> PaneId {
+    let parent_id = app.windows[app.current_window].owning_session();
+    let child_history = Rc::new(RefCell::new(app.sessions[&parent_id].history.borrow().fork()));
+    let mut child_shell = app.sessions[&parent_id].shell.new_virtual_child();
     // The same table every other session sees -- one per process, like
     // `jobs`, so a server started for one pane serves them all.
-    let child_lsp = Rc::clone(&sessions[&parent_id].lsp);
+    let child_lsp = Rc::clone(&app.sessions[&parent_id].lsp);
     install_service_table(&mut child_shell, &child_lsp);
     install_history(&mut child_shell, &child_history);
-    let screen = Rc::new(RefCell::new(vt100::Screen::new(content_rows(term_rows), term_cols)));
+    let screen = Rc::new(RefCell::new(vt100::Screen::new(content_rows(app.term_rows), app.term_cols)));
     child_shell.set_sink_grid(screen.clone());
     let child_cwd = child_shell.cwd.clone();
-    let sid = *next_session_id;
-    *next_session_id += 1;
-    sessions.insert(
+    let sid = app.next_session_id;
+    app.next_session_id += 1;
+    app.sessions.insert(
         sid,
         SessionState {
             shell: child_shell,
@@ -4099,7 +3686,7 @@ fn split_diagnostics_pane(
         },
     );
 
-    let window = &mut windows[current_window];
+    let window = &mut app.windows[app.current_window];
     let new_pane_id = window.next_pane_id;
     window.next_pane_id += 1;
     window.panes.push(Pane { id: new_pane_id, stack: vec![Frame::Session(sid), Frame::Diagnostics(edit_frame_id)], jumps: JumpList::default() });
@@ -4116,27 +3703,19 @@ fn split_diagnostics_pane(
 // to give the new pane a screen to composite from, always horizontal,
 // starts minimized, and does not move focus -- asking where something
 // is used should not take you out of the file.
-fn split_locations_pane(
-    sessions: &mut HashMap<SessionId, SessionState>,
-    windows: &mut [WindowEntry],
-    current_window: usize,
-    next_session_id: &mut SessionId,
-    edit_frame_id: EditFrameId,
-    term_rows: usize,
-    term_cols: usize,
-) -> PaneId {
-    let parent_id = windows[current_window].owning_session();
-    let child_history = Rc::new(RefCell::new(sessions[&parent_id].history.borrow().fork()));
-    let mut child_shell = sessions[&parent_id].shell.new_virtual_child();
-    let child_lsp = Rc::clone(&sessions[&parent_id].lsp);
+fn split_locations_pane(app: &mut App, edit_frame_id: EditFrameId) -> PaneId {
+    let parent_id = app.windows[app.current_window].owning_session();
+    let child_history = Rc::new(RefCell::new(app.sessions[&parent_id].history.borrow().fork()));
+    let mut child_shell = app.sessions[&parent_id].shell.new_virtual_child();
+    let child_lsp = Rc::clone(&app.sessions[&parent_id].lsp);
     install_service_table(&mut child_shell, &child_lsp);
     install_history(&mut child_shell, &child_history);
-    let screen = Rc::new(RefCell::new(vt100::Screen::new(content_rows(term_rows), term_cols)));
+    let screen = Rc::new(RefCell::new(vt100::Screen::new(content_rows(app.term_rows), app.term_cols)));
     child_shell.set_sink_grid(screen.clone());
     let child_cwd = child_shell.cwd.clone();
-    let sid = *next_session_id;
-    *next_session_id += 1;
-    sessions.insert(
+    let sid = app.next_session_id;
+    app.next_session_id += 1;
+    app.sessions.insert(
         sid,
         SessionState {
             shell: child_shell,
@@ -4158,7 +3737,7 @@ fn split_locations_pane(
             command_transcript: Vec::new(),
         },
     );
-    let window = &mut windows[current_window];
+    let window = &mut app.windows[app.current_window];
     let new_pane_id = window.next_pane_id;
     window.next_pane_id += 1;
     window.panes.push(Pane { id: new_pane_id, stack: vec![Frame::Session(sid), Frame::Locations(edit_frame_id)], jumps: JumpList::default() });
@@ -4192,25 +3771,14 @@ fn render_locations_title(screen: &Rc<RefCell<vt100::Screen>>, cols: usize, titl
 // Creates the location sibling if there isn't one, records the list,
 // and repaints -- called from `gr`, while the buffer it is about is
 // still the caller's own local.
-#[allow(clippy::too_many_arguments)]
-fn sync_locations_pane(
-    sessions: &mut HashMap<SessionId, SessionState>,
-    windows: &mut [WindowEntry],
-    current_window: usize,
-    next_session_id: &mut SessionId,
-    location_lists: &mut HashMap<EditFrameId, LocationList>,
-    edit_frame_id: EditFrameId,
-    list: LocationList,
-    term_rows: usize,
-    term_cols: usize,
-) {
-    let pane_id = locations_sibling(&windows[current_window], edit_frame_id)
-        .unwrap_or_else(|| split_locations_pane(sessions, windows, current_window, next_session_id, edit_frame_id, term_rows, term_cols));
-    let rect = pane_rect(&windows[current_window], pane_id, term_rows, term_cols);
-    let sid = windows[current_window].pane(pane_id).owning_session();
-    render_locations_title(&sessions[&sid].screen, rect.cols, &list.title);
-    location_lists.insert(edit_frame_id, list);
-    compositor_redraw(sessions, windows, current_window, term_rows, term_cols);
+fn sync_locations_pane(app: &mut App, edit_frame_id: EditFrameId, list: LocationList) {
+    let pane_id = locations_sibling(&app.windows[app.current_window], edit_frame_id)
+        .unwrap_or_else(|| split_locations_pane(app, edit_frame_id));
+    let rect = pane_rect(&app.windows[app.current_window], pane_id, app.term_rows, app.term_cols);
+    let sid = app.windows[app.current_window].pane(pane_id).owning_session();
+    render_locations_title(&app.sessions[&sid].screen, rect.cols, &list.title);
+    app.location_lists.insert(edit_frame_id, list);
+    compositor_redraw(app);
 }
 
 // The diagnostics sibling pane already sitting below `edit_frame_id`'s
@@ -4234,29 +3802,21 @@ fn diagnostics_sibling(window: &WindowEntry, edit_frame_id: EditFrameId) -> Opti
 // render into this exact same screen (`Shell::set_sink_grid`) so the
 // script's real output actually shows up in this pane the same way any
 // ordinary session's own live output does -- no bespoke ANSI-building.
-fn split_debug_run_pane(
-    sessions: &mut HashMap<SessionId, SessionState>,
-    windows: &mut [WindowEntry],
-    current_window: usize,
-    next_session_id: &mut SessionId,
-    edit_frame_id: EditFrameId,
-    term_rows: usize,
-    term_cols: usize,
-) -> (PaneId, Rc<RefCell<vt100::Screen>>) {
-    let parent_id = windows[current_window].owning_session();
-    let child_history = Rc::new(RefCell::new(sessions[&parent_id].history.borrow().fork()));
-    let mut child_shell = sessions[&parent_id].shell.new_virtual_child();
+fn split_debug_run_pane(app: &mut App, edit_frame_id: EditFrameId) -> (PaneId, Rc<RefCell<vt100::Screen>>) {
+    let parent_id = app.windows[app.current_window].owning_session();
+    let child_history = Rc::new(RefCell::new(app.sessions[&parent_id].history.borrow().fork()));
+    let mut child_shell = app.sessions[&parent_id].shell.new_virtual_child();
     // The same table every other session sees -- one per process, like
     // `jobs`, so a server started for one pane serves them all.
-    let child_lsp = Rc::clone(&sessions[&parent_id].lsp);
+    let child_lsp = Rc::clone(&app.sessions[&parent_id].lsp);
     install_service_table(&mut child_shell, &child_lsp);
     install_history(&mut child_shell, &child_history);
-    let screen = Rc::new(RefCell::new(vt100::Screen::new(content_rows(term_rows), term_cols)));
+    let screen = Rc::new(RefCell::new(vt100::Screen::new(content_rows(app.term_rows), app.term_cols)));
     child_shell.set_sink_grid(screen.clone());
     let child_cwd = child_shell.cwd.clone();
-    let sid = *next_session_id;
-    *next_session_id += 1;
-    sessions.insert(
+    let sid = app.next_session_id;
+    app.next_session_id += 1;
+    app.sessions.insert(
         sid,
         SessionState {
             shell: child_shell,
@@ -4279,7 +3839,7 @@ fn split_debug_run_pane(
         },
     );
 
-    let window = &mut windows[current_window];
+    let window = &mut app.windows[app.current_window];
     let new_pane_id = window.next_pane_id;
     window.next_pane_id += 1;
     window.panes.push(Pane { id: new_pane_id, stack: vec![Frame::Session(sid), Frame::DebugRun(edit_frame_id)], jumps: JumpList::default() });
@@ -4356,23 +3916,13 @@ fn render_diagnostics_title(screen: &Rc<RefCell<vt100::Screen>>, cols: usize, di
 // `tb.diagnostics`, while that buffer is still this function's own
 // caller's local (see this module's own doc comment on why that's the
 // only time this pane's content can be synced at all).
-#[allow(clippy::too_many_arguments)]
-fn sync_diagnostics_pane(
-    sessions: &mut HashMap<SessionId, SessionState>,
-    windows: &mut [WindowEntry],
-    current_window: usize,
-    next_session_id: &mut SessionId,
-    edit_frame_id: EditFrameId,
-    diagnostics: &[lint::Diagnostic],
-    term_rows: usize,
-    term_cols: usize,
-) {
-    let pane_id = diagnostics_sibling(&windows[current_window], edit_frame_id)
-        .unwrap_or_else(|| split_diagnostics_pane(sessions, windows, current_window, next_session_id, edit_frame_id, term_rows, term_cols));
-    let rect = pane_rect(&windows[current_window], pane_id, term_rows, term_cols);
-    let sid = windows[current_window].pane(pane_id).owning_session();
-    render_diagnostics_title(&sessions[&sid].screen, rect.cols, diagnostics);
-    compositor_redraw(sessions, windows, current_window, term_rows, term_cols);
+fn sync_diagnostics_pane(app: &mut App, edit_frame_id: EditFrameId, diagnostics: &[lint::Diagnostic]) {
+    let pane_id = diagnostics_sibling(&app.windows[app.current_window], edit_frame_id)
+        .unwrap_or_else(|| split_diagnostics_pane(app, edit_frame_id));
+    let rect = pane_rect(&app.windows[app.current_window], pane_id, app.term_rows, app.term_cols);
+    let sid = app.windows[app.current_window].pane(pane_id).owning_session();
+    render_diagnostics_title(&app.sessions[&sid].screen, rect.cols, diagnostics);
+    compositor_redraw(app);
 }
 
 // Repaints the diagnostics pane's own collapsed title for the focused
@@ -4384,28 +3934,21 @@ fn sync_diagnostics_pane(
 // how many problems there are, and until this existed that count was
 // only ever as fresh as the last `:diag` -- a server fixing every error
 // left "3 problems" on screen indefinitely.
-fn refresh_diagnostics_title(
-    sessions: &mut HashMap<SessionId, SessionState>,
-    windows: &mut [WindowEntry],
-    current_window: usize,
-    diagnostics: &[lint::Diagnostic],
-    term_rows: usize,
-    term_cols: usize,
-) {
-    let window = &windows[current_window];
+fn refresh_diagnostics_title(app: &mut App, diagnostics: &[lint::Diagnostic]) {
+    let window = &app.windows[app.current_window];
     let Some(Frame::Edit(edit_frame_id)) = window.panes.iter().find(|p| p.id == window.focused_pane).and_then(|p| p.stack.last()).copied() else {
         return;
     };
     let Some(pane_id) = diagnostics_sibling(window, edit_frame_id) else { return };
-    let rect = pane_rect(window, pane_id, term_rows, term_cols);
+    let rect = pane_rect(window, pane_id, app.term_rows, app.term_cols);
     let sid = window.pane(pane_id).owning_session();
-    render_diagnostics_title(&sessions[&sid].screen, rect.cols, diagnostics);
+    render_diagnostics_title(&app.sessions[&sid].screen, rect.cols, diagnostics);
     // The grid alone changes nothing on screen, and the redraw
     // `service_background_jobs` already did happened before this wrote
     // anything. Painting the editor pane blank on the way is fine and
     // expected: every caller of this repaints it immediately after --
     // that is what the `diagnosed` flag they are acting on is for.
-    compositor_redraw(sessions, windows, current_window, term_rows, term_cols);
+    compositor_redraw(app);
 }
 
 // Captures a pane's *idle* prompt (nothing submitted, just sitting
@@ -4611,10 +4154,10 @@ fn refresh_divider_budget(sessions: &HashMap<SessionId, SessionState>, window: &
     }
 }
 
-fn compositor_redraw(sessions: &HashMap<SessionId, SessionState>, windows: &[WindowEntry], current_window: usize, term_rows: usize, term_cols: usize) {
-    let tab_bar = tab_bar_line(sessions, windows, current_window);
-    let layout = snapshot_window(&windows[current_window], sessions, term_rows, term_cols);
-    render_compositor_frame(&layout, &tab_bar, term_rows);
+fn compositor_redraw(app: &App) {
+    let tab_bar = tab_bar_line(app);
+    let layout = snapshot_window(&app.windows[app.current_window], &app.sessions, app.term_rows, app.term_cols);
+    render_compositor_frame(&layout, &tab_bar, app.term_rows);
 }
 
 // How drive_fg_job's blocking loop ended.
@@ -5002,11 +4545,14 @@ fn drive_fg_job(job: &mut exec::FgJob, screen: &Rc<RefCell<vt100::Screen>>, mut 
 
 // Keeps every fg'd job alive while some other loop owns the terminal --
 // called as the on_idle hook of `drive_fg_job` (watching one job),
-// `editor::read_line` (typing at a prompt), and normal mode. `skip_window`
-// names the window whose focus those loops belong to; it no longer
-// exempts that window's focused *pane* from being drained (see the loop
-// below for why that exemption was both unnecessary and harmful), only
-// steering the resize/redraw handling above. A Frame::Job can end up
+// `editor::read_line` (typing at a prompt), and normal mode. It used to
+// take the window those loops' focus belongs to as a parameter; every
+// caller passed the focused window, and a few had to snapshot it first
+// because they could not read it while it was borrowed. `App` makes it
+// readable in place, so the parameter is gone. It never exempted that
+// window's focused *pane* from being drained (see the loop below for
+// why that exemption was both unnecessary and harmful), only steered
+// the resize/redraw handling above. A Frame::Job can end up
 // in any pane, not just the focused one of its window (the user can
 // navigate focus away via `window` h/j/k/l while it's still running),
 // so every pane of every window is checked here, not just each
@@ -5022,15 +4568,7 @@ fn drive_fg_job(job: &mut exec::FgJob, screen: &Rc<RefCell<vt100::Screen>>, mut 
 // view (a `Frame::Edit`'s own real content, see run_normal_mode_
 // navigation's own on_idle closure for the caller that needs to react
 // to this return value; every other caller correctly ignores it).
-fn service_background_jobs(
-    sessions: &mut HashMap<SessionId, SessionState>,
-    windows: &mut [WindowEntry],
-    job_frames: &mut HashMap<JobFrameId, exec::FgJob>,
-    skip_window: usize,
-    term_rows: &mut usize,
-    term_cols: &mut usize,
-    sinks_are_grid: bool,
-) -> bool {
+fn service_background_jobs(app: &mut App) -> bool {
     use std::io::Read;
 
     // Every blocking loop in this file calls this as its idle callback,
@@ -5039,15 +4577,15 @@ fn service_background_jobs(
     // a sourced file. `divider_budget` is a layout parameter kept on
     // the window itself (see WindowEntry), so this is where it catches
     // up.
-    for window in windows.iter_mut() {
-        refresh_divider_budget(sessions, window);
+    for window in app.windows.iter_mut() {
+        refresh_divider_budget(&app.sessions, window);
     }
     // ...and the window list every session's `window` builtin reads.
     // Built once from an immutable borrow, then handed to each session,
-    // so `window ls`/`select` answer about the windows that exist right
+    // so `window ls`/`select` answer about the app.windows that exist right
     // now rather than about whatever they last heard.
-    let snapshot = window_snapshot(sessions, windows, skip_window);
-    for session in sessions.values_mut() {
+    let snapshot = window_snapshot(app);
+    for session in app.sessions.values_mut() {
         session.shell.windows = snapshot.clone();
     }
 
@@ -5058,7 +4596,7 @@ fn service_background_jobs(
     // in. The table is shared by every session's shell (see
     // `lspclient::Table`), so reaching it through any one of them
     // reaches all of them.
-    if let Some(lsp) = sessions.values().next().map(|s| Rc::clone(&s.lsp)) {
+    if let Some(lsp) = app.sessions.values().next().map(|s| Rc::clone(&s.lsp)) {
         lsp.borrow_mut().service_all();
     }
 
@@ -5088,7 +4626,7 @@ fn service_background_jobs(
     // Shell::drain_background_output. One call covers every session: the
     // job table is shared, and each job carries its own destination. Any
     // live shell will do as the receiver; there is always at least one.
-    let bg_output = sessions.values().next().is_some_and(|s| s.shell.drain_background_output());
+    let bg_output = app.sessions.values().next().is_some_and(|s| s.shell.drain_background_output());
     // Only `just_attached` repaints from in here. Background output
     // deliberately does *not*: this function has no idea what is
     // currently drawn over the pane, and a blind compositor_redraw
@@ -5096,8 +4634,8 @@ fn service_background_jobs(
     // file browser, the diagnostics list. It's reported through the
     // return value instead, so each caller repaints whatever it alone
     // knows how to.
-    if just_attached && sinks_are_grid {
-        compositor_redraw(sessions, windows, skip_window, *term_rows, *term_cols);
+    if just_attached && app.sinks_are_grid {
+        compositor_redraw(app);
     }
     // The new client's own TERM/COLORTERM -- applied to *every*
     // session's own remembered environment (Shell::
@@ -5109,7 +4647,7 @@ fn service_background_jobs(
     // doc comment for why it has to go through each session's env_
     // snapshot instead.
     if let Some((term, colorterm)) = session::take_pending_capability() {
-        for session in sessions.values_mut() {
+        for session in app.sessions.values_mut() {
             session.shell.set_terminal_capability_env(&term, &colorterm);
         }
     }
@@ -5121,15 +4659,15 @@ fn service_background_jobs(
     // is what made shrinking the terminal leave an editor pane empty
     // until the next keystroke that happened to redraw something.
     let resized =
-        poll_and_apply_resize(&*sessions, &*windows, job_frames, term_rows, term_cols, sinks_are_grid, skip_window);
+        poll_and_apply_resize(app);
 
     const MAX_READS_PER_TICK: u32 = 16;
     let mut buf = [0u8; 4096];
-    for i in 0..windows.len() {
-        let pane_ids: Vec<PaneId> = windows[i].panes.iter().map(|p| p.id).collect();
+    for i in 0..app.windows.len() {
+        let pane_ids: Vec<PaneId> = app.windows[i].panes.iter().map(|p| p.id).collect();
         for pane_id in pane_ids {
             // No focused-pane exemption: `run_fg_job_frame` *removes* the
-            // job it's driving from `job_frames` for the whole time it
+            // job it's driving from `app.job_frames` for the whole time it
             // holds it (re-inserting on the way out), so the lookup below
             // already misses for a job someone else is reading -- the
             // skip that used to be here was belt-and-braces, and it cost
@@ -5141,13 +4679,13 @@ fn service_background_jobs(
             // its own session's grid, with the reader's viewport left
             // where they put it and the mode line reporting what arrived
             // (see ScreenBuffer::new_lines).
-            let job_frame_id = match windows[i].pane(pane_id).stack.last() {
+            let job_frame_id = match app.windows[i].pane(pane_id).stack.last() {
                 Some(Frame::Job(id)) => *id,
                 _ => continue,
             };
-            let sid = windows[i].pane(pane_id).owning_session();
-            let screen = sessions[&sid].screen.clone();
-            let job = match job_frames.get_mut(&job_frame_id) {
+            let sid = app.windows[i].pane(pane_id).owning_session();
+            let screen = app.sessions[&sid].screen.clone();
+            let job = match app.job_frames.get_mut(&job_frame_id) {
                 Some(j) => j,
                 None => continue,
             };
@@ -5161,16 +4699,16 @@ fn service_background_jobs(
             }
             match job.poll_untraced() {
                 exec::FgWait::Exited(status) => {
-                    windows[i].pane_mut(pane_id).stack.pop();
-                    job_frames.remove(&job_frame_id);
-                    sessions.get_mut(&sid).unwrap().shell.last_status = status;
+                    app.windows[i].pane_mut(pane_id).stack.pop();
+                    app.job_frames.remove(&job_frame_id);
+                    app.sessions.get_mut(&sid).unwrap().shell.last_status = status;
                 }
                 exec::FgWait::Stopped => {
-                    windows[i].pane_mut(pane_id).stack.pop();
-                    let job = job_frames.remove(&job_frame_id).unwrap();
-                    let (id, cmd_text) = sessions.get_mut(&sid).unwrap().shell.park_stopped_fg_job(job);
-                    sessions[&sid].shell.sink_err(&format!("\n[{}]+  Stopped                 {}\n", id, cmd_text));
-                    sessions.get_mut(&sid).unwrap().shell.last_status = 148;
+                    app.windows[i].pane_mut(pane_id).stack.pop();
+                    let job = app.job_frames.remove(&job_frame_id).unwrap();
+                    let (id, cmd_text) = app.sessions.get_mut(&sid).unwrap().shell.park_stopped_fg_job(job);
+                    app.sessions[&sid].shell.sink_err(&format!("\n[{}]+  Stopped                 {}\n", id, cmd_text));
+                    app.sessions.get_mut(&sid).unwrap().shell.last_status = 148;
                 }
                 exec::FgWait::Running => {}
             }
@@ -7131,22 +6669,10 @@ fn window_cmd_to_action(cmd: WindowCmd) -> WindowAction {
 // apply_window_action (or the GotoFirst/GotoLast branch) already does on
 // its own -- the caller exits its whole loop afterward either way
 // (nothing left to resume, a window-focus change).
-#[allow(clippy::too_many_arguments)]
-fn dispatch_window_cmd(
-    cmd: WindowCmd,
-    count: Option<usize>,
-    sessions: &mut HashMap<SessionId, SessionState>,
-    windows: &mut Vec<WindowEntry>,
-    current_window: &mut usize,
-    next_session_id: &mut SessionId,
-    next_window_id: &mut u32,
-    sinks_are_grid: &mut bool,
-    term_rows: usize,
-    term_cols: usize,
-) {
+fn dispatch_window_cmd(app: &mut App, cmd: WindowCmd, count: Option<usize>) {
     match cmd {
         // No WindowAction equivalent -- an absolute tab-position jump,
-        // not a repeatable action -- so this sets current_window
+        // not a repeatable action -- so this sets &mut app.current_window
         // directly instead of going through apply_window_action,
         // matching Motion::GotoFirstLine/GotoLastLine's own default-vs-
         // explicit-target split (see KeyOutcome::Window's own doc
@@ -7155,17 +6681,17 @@ fn dispatch_window_cmd(
         // doc comment) -- this is the one window-focus-changing path
         // that doesn't go through apply_window_action at all.
         WindowCmd::GotoFirstWindow | WindowCmd::GotoLastWindow => {
-            freeze_focused_idle_prompt(sessions, windows, *current_window);
-            let default = if cmd == WindowCmd::GotoFirstWindow { 1 } else { windows.len() };
+            freeze_focused_idle_prompt(app);
+            let default = if cmd == WindowCmd::GotoFirstWindow { 1 } else { app.windows.len() };
             let target = count.unwrap_or(default);
-            *current_window = target.saturating_sub(1).min(windows.len().saturating_sub(1));
-            compositor_redraw(sessions, windows, *current_window, term_rows, term_cols);
+            app.current_window = target.saturating_sub(1).min(app.windows.len().saturating_sub(1));
+            compositor_redraw(app);
         }
         _ => {
             let action = window_cmd_to_action(cmd);
             for _ in 0..count.unwrap_or(1).max(1) {
                 let action = action.clone();
-                apply_window_action(action, sessions, windows, current_window, next_session_id, next_window_id, sinks_are_grid, term_rows, term_cols);
+                apply_window_action(app, action);
             }
         }
     }
@@ -7614,41 +7140,30 @@ fn tabular_style(shell: &exec::Shell, language: &str) -> Option<crate::bishedit:
 // to repaint, hand back the geometry to repaint *into* rather than
 // letting the caller reuse what it measured before Insert mode began.
 // See fileeditor::IdleRedraw for why the two can't be separated.
-#[allow(clippy::too_many_arguments)]
-fn insert_idle(
-    sessions: &mut HashMap<SessionId, SessionState>,
-    windows: &mut [WindowEntry],
-    job_frames: &mut HashMap<JobFrameId, exec::FgJob>,
-    current_window: &mut usize,
-    term_rows: &mut usize,
-    term_cols: &mut usize,
-    sinks_are_grid: bool,
-    session_id: SessionId,
-    buf: &mut TextBuffer,
-) -> Option<fileeditor::IdleRedraw> {
+fn insert_idle(app: &mut App, session_id: SessionId, buf: &mut TextBuffer) -> Option<fileeditor::IdleRedraw> {
     let repaint =
-        service_background_jobs(sessions, windows, job_frames, *current_window, term_rows, term_cols, sinks_are_grid);
+        service_background_jobs(app);
     // Typing is the case document synchronization exists for, and this
     // is the only path that runs while it is happening -- keystrokes
     // themselves never come back through here (the loop above only
     // calls this while stdin is quiet), which is exactly the settling
     // the debounce is measuring.
-    sync_language_server_document(sessions, session_id, buf);
+    sync_language_server_document(&mut app.sessions, session_id, buf);
     // Diagnostics that arrived while the user was typing are drawn on
     // the same tick they land, which is what makes them feel live.
-    let diagnosed = apply_language_server_diagnostics(sessions, session_id, buf);
+    let diagnosed = apply_language_server_diagnostics(&mut app.sessions, session_id, buf);
     if diagnosed {
-        refresh_diagnostics_title(sessions, windows, *current_window, &buf.diagnostics, *term_rows, *term_cols);
+        refresh_diagnostics_title(app, &buf.diagnostics);
     }
-    let recoloured = sync_semantic_tokens(sessions, session_id, buf);
-    let reprogressed = sync_language_server_progress(sessions, session_id, buf);
+    let recoloured = sync_semantic_tokens(&mut app.sessions, session_id, buf);
+    let reprogressed = sync_language_server_progress(&mut app.sessions, session_id, buf);
     // Insert mode too: the marks follow the cursor, and typing moves it.
-    let remarked = sync_document_highlights(sessions, session_id, buf);
-    let rehinted = sync_inlay_hints(sessions, session_id, buf);
+    let remarked = sync_document_highlights(&mut app.sessions, session_id, buf);
+    let rehinted = sync_inlay_hints(&mut app.sessions, session_id, buf);
     (repaint || diagnosed || recoloured || reprogressed || remarked || rehinted).then(|| fileeditor::IdleRedraw {
-        rect: pane_rect(&windows[*current_window], windows[*current_window].focused_pane, *term_rows, *term_cols),
-        term_rows: *term_rows,
-        term_cols: *term_cols,
+        rect: pane_rect(&app.windows[app.current_window], app.windows[app.current_window].focused_pane, app.term_rows, app.term_cols),
+        term_rows: app.term_rows,
+        term_cols: app.term_cols,
     })
 }
 
@@ -7697,16 +7212,9 @@ fn commit_active_selection(vk: &VimKeys, buf: &mut NavBuffer) {
 // (`Put`, `Operator`/`OperatorLines` for `Delete`/`Change`/case-ops,
 // `EnterInsert`/`EnterReplace`, ...) match on `NavBuffer` directly, since
 // mutation was never part of the shared `Buffer` trait.
-#[allow(clippy::too_many_arguments)]
 fn run_normal_mode_navigation(
+    app: &mut App,
     session_id: SessionId,
-    sessions: &mut HashMap<SessionId, SessionState>,
-    windows: &mut Vec<WindowEntry>,
-    current_window: &mut usize,
-    next_session_id: &mut SessionId,
-    next_window_id: &mut u32,
-    sinks_are_grid: &mut bool,
-    job_frames: &mut HashMap<JobFrameId, exec::FgJob>,
     // `Some` iff `start` is `NavStart::Edit` -- the id `debug_frames`
     // itself is keyed on (see Frame::DebugRun's own doc comment), needed
     // both for `K`'s own live-value lookup below and threaded on into
@@ -7716,19 +7224,7 @@ fn run_normal_mode_navigation(
     // `:dbg` could mean anything against, so `debug_frames` is simply
     // never touched from those calls.
     edit_frame_id: Option<EditFrameId>,
-    debug_frames: &mut HashMap<EditFrameId, debugger::DebugSession>,
-    // `gr`'s answers, keyed like `debug_frames` -- see Frame::Locations.
-    location_lists: &mut HashMap<EditFrameId, LocationList>,
-    // Every *other* open buffer. `run_edit_frame` takes the one being
-    // driven out of this map before driving it, so what is left here is
-    // exactly the files a cross-file edit must not write behind the
-    // user's back -- see `rename_via_server`.
-    edit_frames: &mut HashMap<EditFrameId, fileeditor::EditSession>,
-    cmd_history: &mut History,
-    registers: &mut Registers,
     start: NavStart,
-    term_rows: &mut usize,
-    term_cols: &mut usize,
     color_overrides: Option<&highlight::ColorOverrides>,
 ) -> io::Result<(NavExit, Option<(TextBuffer, VimKeys)>)> {
     // Owned rather than borrowed, and refreshed after every command-mode
@@ -7739,7 +7235,7 @@ fn run_normal_mode_navigation(
     // `insert_abbrs` below, which re-snapshots for `:abbr` for exactly
     // this reason.
     let mut color_overrides: Option<highlight::ColorOverrides> = color_overrides.cloned();
-    let mut rect = pane_rect(&windows[*current_window], windows[*current_window].focused_pane, *term_rows, *term_cols);
+    let mut rect = pane_rect(&app.windows[app.current_window], app.windows[app.current_window].focused_pane, app.term_rows, app.term_cols);
 
     // Only `Prompt` ever has real text/cursor to resume into (see
     // `NavExit::Resume`'s own doc comment) -- kept as empty/0 for the
@@ -7774,10 +7270,10 @@ fn run_normal_mode_navigation(
             // session that's never lost focus before would render as a
             // blank pane, not even showing the current prompt (or
             // whatever had already been typed).
-            let screen = sessions[&session_id].screen.clone();
+            let screen = app.sessions[&session_id].screen.clone();
             let mut sb = ScreenBuffer::new(screen, normal_mode_content_rows(rect));
-            sb.set_search_case(&sessions[&session_id].shell);
-            let prompt_str = freeze_input_with_text(sessions.get_mut(&session_id).unwrap(), &text);
+            sb.set_search_case(&app.sessions[&session_id].shell);
+            let prompt_str = freeze_input_with_text(app.sessions.get_mut(&session_id).unwrap(), &text);
             // Explicitly positioned rather than trusting wherever
             // ScreenBuffer::new's own default (or the vt100 grid's
             // cursor, wherever feed() happened to leave it -- at the
@@ -7796,9 +7292,9 @@ fn run_normal_mode_navigation(
         // sensible place for navigation to start when there's no
         // synthetic prompt line to land after.
         NavStart::JobDetach => {
-            let screen = sessions[&session_id].screen.clone();
+            let screen = app.sessions[&session_id].screen.clone();
             let mut sb = ScreenBuffer::new(screen, normal_mode_content_rows(rect));
-            sb.set_search_case(&sessions[&session_id].shell);
+            sb.set_search_case(&app.sessions[&session_id].shell);
             (NavBuffer::ReadOnly(sb), VimKeys::new())
         }
         NavStart::Edit(tb, vk0) => (NavBuffer::Editable(*tb), *vk0),
@@ -7808,17 +7304,17 @@ fn run_normal_mode_navigation(
     // `color_overrides` above -- the colon line can redefine a mapping
     // mid-session, so this is refreshed after every command-mode command
     // rather than captured once.
-    vk.set_mappings(sessions.get(&session_id).map(|s| s.shell.mappings.clone()).unwrap_or_default());
+    vk.set_mappings(app.sessions.get(&session_id).map(|s| s.shell.mappings.clone()).unwrap_or_default());
 
     // The `mouse` bishopt: off means reporting is never enabled, so the
     // terminal keeps its own click-and-drag selection.
-    let mouse = sessions.get(&session_id).is_none_or(|s| s.shell.bishopt_bool("mouse"));
+    let mouse = app.sessions.get(&session_id).is_none_or(|s| s.shell.bishopt_bool("mouse"));
     let _guard = term::RawGuard::enable_maybe_mouse(0, mouse)?;
     // Repaints the whole screen first -- necessary the very first time
     // normal mode ever triggers promotion (the alternate screen buffer
     // starts out blank), harmless otherwise -- then this pane's own
     // rectangle on top of that with the current view.
-    compositor_redraw(sessions, windows, *current_window, *term_rows, *term_cols);
+    compositor_redraw(app);
     // The notch that opened this view scrolls it, before the first frame
     // is drawn -- so a wheel flick moves the content in one step rather
     // than spending its first notch silently entering a mode. Same
@@ -7830,7 +7326,7 @@ fn run_normal_mode_navigation(
         let content_cols = nav_content_cols(&buf, rect);
         nav_scroll_to_show_cursor(&mut buf, content_cols);
     }
-    render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides.as_ref());
+    render_nav_frame(&mut buf, &vk, rect, app.term_rows, app.term_cols, color_overrides.as_ref());
     let mut pending_view = PendingView::None;
     // The last left press, for telling a double-click from two separate
     // ones -- terminals report neither, so the timing and the "same cell"
@@ -7865,7 +7361,7 @@ fn run_normal_mode_navigation(
         // anything (`<C-w>` chords, a click) already exits via
         // `KeyOutcome::Window`/click handling, so this was never
         // observable before `:diag` -- cheap enough to just always do.
-        rect = pane_rect(&windows[*current_window], windows[*current_window].focused_pane, *term_rows, *term_cols);
+        rect = pane_rect(&app.windows[app.current_window], app.windows[app.current_window].focused_pane, app.term_rows, app.term_cols);
         // Waits for a byte to actually be ready *before* calling
         // vk.next_key below, rather than passing this same on_idle work
         // as that call's own closure (editor::read_key_idle's usual
@@ -7885,7 +7381,7 @@ fn run_normal_mode_navigation(
         // not a byte on stdin, so polling for one would block with keys
         // already in hand and hand them out one per real keystroke.
         while !vk.has_pending_keys() && !term::stdin_ready(editor::IDLE_POLL_MS) {
-            let attached = service_background_jobs(sessions, windows, job_frames, *current_window, term_rows, term_cols, *sinks_are_grid);
+            let attached = service_background_jobs(app);
             // Normal-mode edits (`dd`, `p`, `x`, `>>`, and everything
             // an Insert-mode session left behind on its way out) reach
             // the server from here. This is the idle path, so it also
@@ -7894,15 +7390,15 @@ fn run_normal_mode_navigation(
             // waiting to see what the server has to say.
             let mut diagnosed = false;
             if let Some(tb) = buf.as_editable_mut() {
-                sync_language_server_document(sessions, session_id, tb);
-                diagnosed = apply_language_server_diagnostics(sessions, session_id, tb);
+                sync_language_server_document(&mut app.sessions, session_id, tb);
+                diagnosed = apply_language_server_diagnostics(&mut app.sessions, session_id, tb);
                 if diagnosed {
-                    refresh_diagnostics_title(sessions, windows, *current_window, &tb.diagnostics, *term_rows, *term_cols);
+                    refresh_diagnostics_title(app, &tb.diagnostics);
                 }
-                diagnosed |= sync_semantic_tokens(sessions, session_id, tb);
-                diagnosed |= sync_language_server_progress(sessions, session_id, tb);
-                diagnosed |= sync_document_highlights(sessions, session_id, tb);
-                diagnosed |= sync_inlay_hints(sessions, session_id, tb);
+                diagnosed |= sync_semantic_tokens(&mut app.sessions, session_id, tb);
+                diagnosed |= sync_language_server_progress(&mut app.sessions, session_id, tb);
+                diagnosed |= sync_document_highlights(&mut app.sessions, session_id, tb);
+                diagnosed |= sync_inlay_hints(&mut app.sessions, session_id, tb);
             }
             // A job this pane stepped away from is still producing, and
             // the mode line's own "+N new lines below" has to keep up
@@ -7924,7 +7420,7 @@ fn run_normal_mode_navigation(
                 // back true is a terminal resize, after which this
                 // pane's own rect -- captured once, before the loop --
                 // describes geometry that no longer exists.
-                rect = pane_rect(&windows[*current_window], windows[*current_window].focused_pane, *term_rows, *term_cols);
+                rect = pane_rect(&app.windows[app.current_window], app.windows[app.current_window].focused_pane, app.term_rows, app.term_cols);
                 if let Some(tb) = buf.as_editable_mut() {
                     // The height a shrink took away may have left the
                     // cursor below the viewport; the scroll needs the
@@ -7933,7 +7429,7 @@ fn run_normal_mode_navigation(
                     tb.set_viewport_height(normal_mode_content_rows(rect));
                     fileeditor::scroll_to_show_cursor(tb, fileeditor::editor_content_cols(tb, rect));
                 }
-                render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides.as_ref());
+                render_nav_frame(&mut buf, &vk, rect, app.term_rows, app.term_cols, color_overrides.as_ref());
             }
         }
         // A byte is already known ready -- read_key_idle's own internal
@@ -7971,9 +7467,9 @@ fn run_normal_mode_navigation(
                 PendingView::None => break,
                 PendingView::Output if key == Key::CtrlL => {
                     pending_view = PendingView::Transcript;
-                    render_command_transcript(&sessions[&session_id].command_transcript, *term_rows, *term_cols);
+                    render_command_transcript(&app.sessions[&session_id].command_transcript, app.term_rows, app.term_cols);
                     key = match vk.next_key(|| editor::read_key_idle(&mut || {
-                        service_background_jobs(sessions, windows, job_frames, *current_window, term_rows, term_cols, *sinks_are_grid);
+                        service_background_jobs(app);
                     }))? {
                         Some(k) => k,
                         None => {
@@ -7984,8 +7480,8 @@ fn run_normal_mode_navigation(
                 }
                 PendingView::Output | PendingView::Transcript => {
                     pending_view = PendingView::None;
-                    compositor_redraw(sessions, windows, *current_window, *term_rows, *term_cols);
-                    render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides.as_ref());
+                    compositor_redraw(app);
+                    render_nav_frame(&mut buf, &vk, rect, app.term_rows, app.term_cols, color_overrides.as_ref());
                     break;
                 }
             }
@@ -8015,22 +7511,22 @@ fn run_normal_mode_navigation(
         // cleared above) and keep navigating.
         if let Key::Mouse(ev) = key {
             if ev.is_left_click() {
-                match hit_test_click(ev, sessions, windows, *current_window, *term_rows, *term_cols) {
-                    Some(ClickTarget::Window(idx)) if idx != *current_window => {
-                        freeze_focused_idle_prompt(sessions, windows, *current_window);
-                        *current_window = idx;
-                        compositor_redraw(sessions, windows, *current_window, *term_rows, *term_cols);
+                match hit_test_click(app, ev) {
+                    Some(ClickTarget::Window(idx)) if idx != app.current_window => {
+                        freeze_focused_idle_prompt(app);
+                        app.current_window = idx;
+                        compositor_redraw(app);
                         return Ok((NavExit::Detached, nav_buffer_into_edit_state(buf, vk)));
                     }
-                    Some(ClickTarget::Pane(pane_id)) if pane_id != windows[*current_window].focused_pane => {
-                        if matches!(windows[*current_window].stack().last(), Some(Frame::Session(_))) {
-                            let sid = windows[*current_window].owning_session();
-                            freeze_idle_prompt(sessions.get_mut(&sid).unwrap());
+                    Some(ClickTarget::Pane(pane_id)) if pane_id != app.windows[app.current_window].focused_pane => {
+                        if matches!(app.windows[app.current_window].stack().last(), Some(Frame::Session(_))) {
+                            let sid = app.windows[app.current_window].owning_session();
+                            freeze_idle_prompt(app.sessions.get_mut(&sid).unwrap());
                         }
                         // Going to a pane is how you get a minimized one back.
-                        restore_if_minimized(&mut windows[*current_window], pane_id);
-                        windows[*current_window].focused_pane = pane_id;
-                        compositor_redraw(sessions, windows, *current_window, *term_rows, *term_cols);
+                        restore_if_minimized(&mut app.windows[app.current_window], pane_id);
+                        app.windows[app.current_window].focused_pane = pane_id;
+                        compositor_redraw(app);
                         return Ok((NavExit::Detached, nav_buffer_into_edit_state(buf, vk)));
                     }
                     // A click inside the pane that already has focus:
@@ -8041,12 +7537,12 @@ fn run_normal_mode_navigation(
                     // clicking somewhere doesn't leave an empty
                     // selection behind for Escape to clear.
                     Some(ClickTarget::Divider(divider)) => {
-                        drag_divider(&divider, sessions, windows, job_frames, *current_window, term_rows, term_cols, *sinks_are_grid);
+                        drag_divider(app, &divider);
                         // The pane this loop is drawing into may have
                         // changed size under it; every later frame is
                         // addressed against `rect`, recomputed at the top
                         // of the next iteration.
-                        render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides.as_ref());
+                        render_nav_frame(&mut buf, &vk, rect, app.term_rows, app.term_cols, color_overrides.as_ref());
                         continue 'nav;
                     }
                     Some(ClickTarget::Pane(_)) => {
@@ -8135,7 +7631,7 @@ fn run_normal_mode_navigation(
                 // comes along instead; see fileeditor::scroll_horizontally.
                 nav_scroll_horizontally(&mut buf, if ev.is_scroll_right() { columns } else { -columns }, content_cols);
             }
-            render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides.as_ref());
+            render_nav_frame(&mut buf, &vk, rect, app.term_rows, app.term_cols, color_overrides.as_ref());
             continue 'nav;
         }
 
@@ -8152,12 +7648,12 @@ fn run_normal_mode_navigation(
                 let (kind, locations, at) = definitions.take().expect("checked just above");
                 let step = if key == Key::Char('n') { 1 } else { locations.len() - 1 };
                 let next = (at + step) % locations.len();
-                match goto_location(sessions, session_id, &mut buf, &locations[next], kind.noun()) {
+                match goto_location(&app.sessions, session_id, &mut buf, &locations[next], kind.noun()) {
                     Goto::Moved => {
                         let content_cols = nav_content_cols(&buf, rect);
                         nav_scroll_to_show_cursor(&mut buf, content_cols);
-                        render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides.as_ref());
-                        show_command_mode_error(&format!("{} {}/{}", kind.noun(), next + 1, locations.len()), *term_rows, *term_cols);
+                        render_nav_frame(&mut buf, &vk, rect, app.term_rows, app.term_cols, color_overrides.as_ref());
+                        show_command_mode_error(&format!("{} {}/{}", kind.noun(), next + 1, locations.len()), app.term_rows, app.term_cols);
                         definitions = Some((kind, locations, next));
                     }
                     // Stepping onto a definition in another file opens
@@ -8176,14 +7672,14 @@ fn run_normal_mode_navigation(
                                 // about -- possibly a dependency's source,
                                 // whose own nearest project marker belongs
                                 // to something else entirely.
-                                root: buf.as_editable().and_then(|tb| server_target(&sessions[&session_id], tb)).map(|t| t.root),
+                                root: buf.as_editable().and_then(|tb| server_target(&app.sessions[&session_id], tb)).map(|t| t.root),
                             },
                             nav_buffer_into_edit_state(buf, vk),
                         );
                     }
                     Goto::Nowhere(message) => {
-                        render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides.as_ref());
-                        show_command_mode_error(&message, *term_rows, *term_cols);
+                        render_nav_frame(&mut buf, &vk, rect, app.term_rows, app.term_cols, color_overrides.as_ref());
+                        show_command_mode_error(&message, app.term_rows, app.term_cols);
                         definitions = Some((kind, locations, at));
                     }
                 }
@@ -8223,7 +7719,7 @@ fn run_normal_mode_navigation(
                 commit_active_selection(&vk, &mut buf);
                 let end_cursor = buf.cursor();
                 vk.end_visual(end_cursor);
-                render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides.as_ref());
+                render_nav_frame(&mut buf, &vk, rect, app.term_rows, app.term_cols, color_overrides.as_ref());
                 continue;
             }
             Key::Char('y') if vk.is_idle() && (vk.is_visual() || !buf.selections().is_empty()) => {
@@ -8232,12 +7728,12 @@ fn run_normal_mode_navigation(
                 let end_cursor = buf.cursor();
                 let selections = buf.selections().clone();
                 match &mut buf {
-                    NavBuffer::ReadOnly(sb) => yank_selections(sb, &selections, registers, register),
-                    NavBuffer::Editable(tb) => tb.yank_selections(registers, register),
+                    NavBuffer::ReadOnly(sb) => yank_selections(sb, &selections, &mut app.registers, register),
+                    NavBuffer::Editable(tb) => tb.yank_selections(&mut app.registers, register),
                 }
                 buf.selections_mut().clear();
                 vk.end_visual(end_cursor);
-                render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides.as_ref());
+                render_nav_frame(&mut buf, &vk, rect, app.term_rows, app.term_cols, color_overrides.as_ref());
                 continue;
             }
             // `x` with a selection standing is `d` -- vim's own rule, and
@@ -8249,11 +7745,11 @@ fn run_normal_mode_navigation(
                 let register = vk.take_pending_register();
                 let end_cursor = buf.cursor();
                 if let Some(tb) = buf.as_writable_mut() {
-                    tb.delete_selections(registers, register);
+                    tb.delete_selections(&mut app.registers, register);
                 }
                 buf.selections_mut().clear();
                 vk.end_visual(end_cursor);
-                render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides.as_ref());
+                render_nav_frame(&mut buf, &vk, rect, app.term_rows, app.term_cols, color_overrides.as_ref());
                 continue;
             }
             // `c`: every deleted selection's own gap (delete_selections'
@@ -8269,33 +7765,35 @@ fn run_normal_mode_navigation(
                 let end_cursor = buf.cursor();
                 let mut gaps: Vec<(usize, usize)> = Vec::new();
                 if let Some(tb) = buf.as_writable_mut() {
-                    gaps = tb.delete_selections(registers, register);
+                    gaps = tb.delete_selections(&mut app.registers, register);
                 }
                 buf.selections_mut().clear();
                 vk.end_visual(end_cursor);
                 if !gaps.is_empty() && let Some(tb) = buf.as_writable_mut() {
-                    let (insert_term_rows, insert_term_cols) = (*term_rows, *term_cols);
+                    let (insert_term_rows, insert_term_cols) = (app.term_rows, app.term_cols);
                     // Snapshotted fresh on each entry into Insert mode, not
                     // once for this whole navigation session: `:abbr` is
                     // reachable from command mode right here, so a table
                     // captured at the top would go stale the moment
                     // someone defined one and immediately went to use it.
-                    let insert_abbrs = sessions[&session_id].shell.abbrs.clone();
-                    fileeditor::run_insert_mode(
-                        tb,
-                        &mut vk,
-                        rect,
-                        registers,
-                        &mut EditorServices { sessions, windows, job_frames, current_window, term_rows, term_cols, sinks_are_grid: *sinks_are_grid, session_id },
-                        false,
-                        insert_term_rows,
-                        insert_term_cols,
-                        color_overrides.as_ref(),
-                        &gaps[1..],
-                        &insert_abbrs,
-                    )?;
+                    let insert_abbrs = app.sessions[&session_id].shell.abbrs.clone();
+                    app.with_registers(|app, registers| {
+                        fileeditor::run_insert_mode(
+                            tb,
+                            &mut vk,
+                            rect,
+                            registers,
+                            &mut EditorServices { app, session_id },
+                            false,
+                            insert_term_rows,
+                            insert_term_cols,
+                            color_overrides.as_ref(),
+                            &gaps[1..],
+                            &insert_abbrs,
+                        )
+                    })?;
                 }
-                render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides.as_ref());
+                render_nav_frame(&mut buf, &vk, rect, app.term_rows, app.term_cols, color_overrides.as_ref());
                 continue;
             }
             Key::Char('p') | Key::Char('P') if vk.is_idle() && buf.is_writable() && (vk.is_visual() || !buf.selections().is_empty()) => {
@@ -8303,11 +7801,11 @@ fn run_normal_mode_navigation(
                 let register = vk.take_pending_register();
                 let end_cursor = buf.cursor();
                 if let Some(tb) = buf.as_writable_mut() {
-                    tb.put_over_selections(registers, register);
+                    tb.put_over_selections(&mut app.registers, register);
                 }
                 buf.selections_mut().clear();
                 vk.end_visual(end_cursor);
-                render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides.as_ref());
+                render_nav_frame(&mut buf, &vk, rect, app.term_rows, app.term_cols, color_overrides.as_ref());
                 continue;
             }
             // Visual `>`/`<`: same shape as `p`/`P` just above -- shifts
@@ -8323,7 +7821,7 @@ fn run_normal_mode_navigation(
                 }
                 buf.selections_mut().clear();
                 vk.end_visual(end_cursor);
-                render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides.as_ref());
+                render_nav_frame(&mut buf, &vk, rect, app.term_rows, app.term_cols, color_overrides.as_ref());
                 continue;
             }
             Key::Char('<') if vk.is_idle() && buf.is_writable() && (vk.is_visual() || !buf.selections().is_empty()) => {
@@ -8334,7 +7832,7 @@ fn run_normal_mode_navigation(
                 }
                 buf.selections_mut().clear();
                 vk.end_visual(end_cursor);
-                render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides.as_ref());
+                render_nav_frame(&mut buf, &vk, rect, app.term_rows, app.term_cols, color_overrides.as_ref());
                 continue;
             }
             Key::Char('S') if vk.is_idle() && buf.is_writable() && (vk.is_visual() || !buf.selections().is_empty()) => {
@@ -8342,21 +7840,21 @@ fn run_normal_mode_navigation(
                 let end_cursor = buf.cursor();
                 if let Some(tb) = buf.as_writable_mut()
                     && let Some(Key::Char(ch)) = vk.next_key(|| editor::read_key_idle(&mut || {
-                        service_background_jobs(sessions, windows, job_frames, *current_window, term_rows, term_cols, *sinks_are_grid);
+                        service_background_jobs(app);
                     }))?
                 {
                     fileeditor::surround_selections(tb, ch);
                 }
                 buf.selections_mut().clear();
                 vk.end_visual(end_cursor);
-                render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides.as_ref());
+                render_nav_frame(&mut buf, &vk, rect, app.term_rows, app.term_cols, color_overrides.as_ref());
                 continue;
             }
             Key::Escape | Key::CtrlC if vk.is_idle() && (key == Key::Escape || matches!(buf, NavBuffer::Editable(_))) && (vk.is_visual() || !buf.selections().is_empty()) => {
                 let end_cursor = buf.cursor();
                 vk.end_visual(end_cursor);
                 buf.selections_mut().clear();
-                render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides.as_ref());
+                render_nav_frame(&mut buf, &vk, rect, app.term_rows, app.term_cols, color_overrides.as_ref());
                 continue;
             }
             // `q`/`@` -- macro record/replay. Host-level, same tier as
@@ -8380,7 +7878,7 @@ fn run_normal_mode_navigation(
             // a new recording" arm below.
             Key::Char('q') if vk.is_idle() && vk.is_recording().is_some() => {
                 vk.stop_recording();
-                render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides.as_ref());
+                render_nav_frame(&mut buf, &vk, rect, app.term_rows, app.term_cols, color_overrides.as_ref());
                 continue;
             }
             // `q{reg}`: starts recording. The register-name lookahead
@@ -8390,12 +7888,12 @@ fn run_normal_mode_navigation(
             // correctly.
             Key::Char('q') if vk.is_idle() => {
                 if let Some(Key::Char(ch)) = vk.next_key(|| editor::read_key_idle(&mut || {
-                    service_background_jobs(sessions, windows, job_frames, *current_window, term_rows, term_cols, *sinks_are_grid);
+                    service_background_jobs(app);
                 }))? && ch.is_ascii_alphabetic()
                 {
                     vk.start_recording(ch);
                 }
-                render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides.as_ref());
+                render_nav_frame(&mut buf, &vk, rect, app.term_rows, app.term_cols, color_overrides.as_ref());
                 continue;
             }
             // `@{reg}`/`@@`: replays. `is_idle_except_count` (not
@@ -8405,17 +7903,17 @@ fn run_normal_mode_navigation(
             Key::Char('@') if vk.is_idle_except_count() => {
                 let count = vk.take_count().unwrap_or(1).max(1);
                 if let Some(Key::Char(ch)) = vk.next_key(|| editor::read_key_idle(&mut || {
-                    service_background_jobs(sessions, windows, job_frames, *current_window, term_rows, term_cols, *sinks_are_grid);
+                    service_background_jobs(app);
                 }))? && (ch == '@' || ch.is_ascii_lowercase())
                 {
                     vk.queue_macro_replay(ch, count);
                 }
-                render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides.as_ref());
+                render_nav_frame(&mut buf, &vk, rect, app.term_rows, app.term_cols, color_overrides.as_ref());
                 continue;
             }
             Key::Char('Z') => {
                 let k2 = vk.next_key(|| editor::read_key_idle(&mut || {
-                    service_background_jobs(sessions, windows, job_frames, *current_window, term_rows, term_cols, *sinks_are_grid);
+                    service_background_jobs(app);
                 }))?;
                 if k2 != Some(Key::Char('Z')) {
                     continue;
@@ -8425,9 +7923,9 @@ fn run_normal_mode_navigation(
                     let mut saved = true;
                     if let Some(tb) = buf.as_writable_mut() {
                         match tb.save(None) {
-                            Ok(()) => fileeditor::set_last_filename(tb, registers),
+                            Ok(()) => fileeditor::set_last_filename(tb, &mut app.registers),
                             Err(e) => {
-                                sessions[&session_id].shell.sink_err(&format!("bish: E212: Can't open file for writing: {e}\n"));
+                                app.sessions[&session_id].shell.sink_err(&format!("bish: E212: Can't open file for writing: {e}\n"));
                                 saved = false;
                             }
                         }
@@ -8435,7 +7933,7 @@ fn run_normal_mode_navigation(
                     if saved {
                         break 'nav (NavExit::Quit, nav_buffer_into_edit_state(buf, vk));
                     }
-                    render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides.as_ref());
+                    render_nav_frame(&mut buf, &vk, rect, app.term_rows, app.term_cols, color_overrides.as_ref());
                     continue;
                 }
                 break 'nav (NavExit::Resume(initial_text.clone(), initial_cursor), nav_buffer_into_edit_state(buf, vk));
@@ -8443,7 +7941,7 @@ fn run_normal_mode_navigation(
             // `K`: hover whatever's under the cursor -- same shared
             // lookup (docs::hover_lines_at) debugger.rs's own pause loop
             // used to build itself. Its live-value tier now comes from
-            // `debug_frames`: `Some` iff a `:dbg` session is actually
+            // `app.debug_frames`: `Some` iff a `:dbg` session is actually
             // attached to *this* edit frame, in which case the hovered
             // identifier's current value (Shell::debug_peek_var) is
             // shown same as it always was -- `|_| None` otherwise (no
@@ -8470,33 +7968,18 @@ fn run_normal_mode_navigation(
                 // bash and this buffer's own comments. Everything about
                 // the fallback is unchanged, so a bash file with no
                 // server behaves exactly as it always has.
-                let hover_lines = ask_server_at_cursor(
-                    sessions,
-                    windows,
-                    job_frames,
-                    session_id,
-                    *current_window,
-                    term_rows,
-                    term_cols,
-                    *sinks_are_grid,
-                    tb,
-                    row,
-                    col,
-                    "textDocument/hover",
-                    "hoverProvider",
-                    &[],
-                )
+                let hover_lines = ask_server_at_cursor(app, session_id, tb, row, col, "textDocument/hover", "hoverProvider", &[])
                 .and_then(|result| crate::lsp::hover_lines(&result))
                 .unwrap_or_else(|| {
                     let index = docs::DocIndex::build_from_source(&tb.text(), &base_path);
-                    let debug_session = edit_frame_id.and_then(|id| debug_frames.get(&id));
+                    let debug_session = edit_frame_id.and_then(|id| app.debug_frames.get(&id));
                     docs::hover_lines_at(&chars, col, &line_text, &index, |name| debug_session.and_then(|s| s.peek_var(name)))
                 });
                 let gutter_width = rect.cols.saturating_sub(fileeditor::editor_content_cols(tb, rect));
                 let cursor_row = rect.row + row.saturating_sub(tb.viewport_top());
                 let cursor_display_col = col_of(&chars, col);
                 let cursor_col = rect.col + gutter_width + cursor_display_col.saturating_sub(tb.viewport_left());
-                render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides.as_ref());
+                render_nav_frame(&mut buf, &vk, rect, app.term_rows, app.term_cols, color_overrides.as_ref());
                 print!("{}", fileeditor::render_hover_popup(&hover_lines, cursor_row, cursor_col, rect));
                 let _ = io::stdout().flush();
                 continue;
@@ -8511,20 +7994,8 @@ fn run_normal_mode_navigation(
             // pre-empting it.
             Key::Char(':') => {
                 let outcome = handle_command_mode(
+                    app,
                     session_id,
-                    sessions,
-                    windows,
-                    current_window,
-                    next_session_id,
-                    next_window_id,
-                    cmd_history,
-                    sinks_are_grid,
-                    job_frames,
-                    debug_frames,
-                    edit_frames,
-                    registers,
-                    term_rows,
-                    term_cols,
                     buf.as_editable_mut(),
                     None,
                     // The rest of a mapping's right-hand side, when a mapped
@@ -8539,22 +8010,22 @@ fn run_normal_mode_navigation(
                 // not just at the top of the next loop iteration, since
                 // `Ran`'s own `render_nav_frame` call just below still
                 // needs the *current* rect, not next keystroke's.
-                rect = pane_rect(&windows[*current_window], windows[*current_window].focused_pane, *term_rows, *term_cols);
+                rect = pane_rect(&app.windows[app.current_window], app.windows[app.current_window].focused_pane, app.term_rows, app.term_cols);
                 // ...and for the same reason, whatever `:bishopt` just
                 // changed has to be picked up before that redraw rather
                 // than on the next `e`. Command mode runs builtins, so
                 // the colon line is a live way to change any of these.
-                color_overrides = Some(syntax_color_overrides(&sessions[&session_id].shell));
-                vk.set_mappings(sessions[&session_id].shell.mappings.clone());
+                color_overrides = Some(syntax_color_overrides(&app.sessions[&session_id].shell));
+                vk.set_mappings(app.sessions[&session_id].shell.mappings.clone());
                 if let Some(tb) = buf.as_editable_mut() {
-                    apply_view_options(&sessions[&session_id].shell, tb);
+                    apply_view_options(&app.sessions[&session_id].shell, tb);
                     fileeditor::scroll_to_show_cursor(tb, fileeditor::editor_content_cols(tb, rect));
                 }
                 match outcome {
                     // Matches vim: an aborted/cancelled ':' command drops
                     // back into Normal mode, not out of it entirely.
                     CommandModeOutcome::Cancelled => {
-                        render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides.as_ref());
+                        render_nav_frame(&mut buf, &vk, rect, app.term_rows, app.term_cols, color_overrides.as_ref());
                         continue;
                     }
                     // Same `CommandModeOutcome::Quit` `"q"`/`"q!"` always
@@ -8598,16 +8069,16 @@ fn run_normal_mode_navigation(
                     // overlay's own doc comment on why it no longer
                     // blanks anything above them).
                     CommandModeOutcome::Ran { output, status } => {
-                        render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides.as_ref());
+                        render_nav_frame(&mut buf, &vk, rect, app.term_rows, app.term_cols, color_overrides.as_ref());
                         if !output.is_empty() || status != 0 {
-                            render_command_output_overlay(&output, status, *term_rows, *term_cols);
+                            render_command_output_overlay(&output, status, app.term_rows, app.term_cols);
                             pending_view = PendingView::Output;
                         }
                         continue;
                     }
                     CommandModeOutcome::NoHighlight => {
                         vk.suppress_search_highlight();
-                        render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides.as_ref());
+                        render_nav_frame(&mut buf, &vk, rect, app.term_rows, app.term_cols, color_overrides.as_ref());
                         continue;
                     }
                     // `:sym QUERY` -- the project-wide half of `gO`,
@@ -8617,16 +8088,10 @@ fn run_normal_mode_navigation(
                     // already names its own file.
                     CommandModeOutcome::Symbols(query) => {
                         if let NavBuffer::Editable(tb) = &buf {
-                            let encoding = server_encoding_for(sessions, session_id, tb).unwrap_or(crate::lsp::PositionEncoding::Utf16);
+                            let encoding = server_encoding_for(&app.sessions, session_id, tb).unwrap_or(crate::lsp::PositionEncoding::Utf16);
                             let found = ask_server(
-                                sessions,
-                                windows,
-                                job_frames,
+                                app,
                                 session_id,
-                                *current_window,
-                                term_rows,
-                                term_cols,
-                                *sinks_are_grid,
                                 tb,
                                 "workspace/symbol",
                                 "workspaceSymbolProvider",
@@ -8650,17 +8115,17 @@ fn run_normal_mode_navigation(
                             let list = workspace_symbol_list(&title, &found, encoding, base.as_deref());
                             match edit_frame_id {
                                 Some(id) => {
-                                    sync_locations_pane(sessions, windows, *current_window, next_session_id, location_lists, id, list, *term_rows, *term_cols);
-                                    render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides.as_ref());
+                                    sync_locations_pane(app, id, list);
+                                    render_nav_frame(&mut buf, &vk, rect, app.term_rows, app.term_cols, color_overrides.as_ref());
                                 }
                                 None => {
-                                    render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides.as_ref());
-                                    show_command_mode_error(&list.title, *term_rows, *term_cols);
+                                    render_nav_frame(&mut buf, &vk, rect, app.term_rows, app.term_cols, color_overrides.as_ref());
+                                    show_command_mode_error(&list.title, app.term_rows, app.term_cols);
                                 }
                             }
                         } else {
-                            render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides.as_ref());
-                            show_command_mode_error("bish: sym: no file here to ask a language server about", *term_rows, *term_cols);
+                            render_nav_frame(&mut buf, &vk, rect, app.term_rows, app.term_cols, color_overrides.as_ref());
+                            show_command_mode_error("bish: sym: no file here to ask a language server about", app.term_rows, app.term_cols);
                         }
                         continue;
                     }
@@ -8692,22 +8157,7 @@ fn run_normal_mode_navigation(
                 if let NavBuffer::Editable(tb) = &buf {
                     let (row, col) = tb.cursor();
                     let (method, capability) = kind.request();
-                    let found = ask_server_at_cursor(
-                        sessions,
-                        windows,
-                        job_frames,
-                        session_id,
-                        *current_window,
-                        term_rows,
-                        term_cols,
-                        *sinks_are_grid,
-                        tb,
-                        row,
-                        col,
-                        method,
-                        capability,
-                        &[],
-                    )
+                    let found = ask_server_at_cursor(app, session_id, tb, row, col, method, capability, &[])
                     .map(|result| crate::lsp::locations(&result))
                     .unwrap_or_default();
                     match found.first().cloned() {
@@ -8728,29 +8178,23 @@ fn run_normal_mode_navigation(
                             match manpage {
                                 Some((name, source)) => {
                                     run_pager(
+                                        app,
                                         &format!("man {name}"),
                                         PagerSource {
                                             language: "roff".to_string(),
                                             source,
                                             links: LinkOptions {
-                                                hyperlinks: sessions.get(&session_id).is_none_or(|s| s.shell.bishopt_bool("hyperlinks")),
+                                                hyperlinks: app.sessions.get(&session_id).is_none_or(|s| s.shell.bishopt_bool("hyperlinks")),
                                                 base_dir: None,
-                                                colors: sessions.get(&session_id).map(|s| ui_colors(&s.shell)),
+                                                colors: app.sessions.get(&session_id).map(|s| ui_colors(&s.shell)),
                                             },
                                         },
-                                        sessions,
-                                        windows,
-                                        job_frames,
-                                        current_window,
-                                        term_rows,
-                                        term_cols,
-                                        *sinks_are_grid,
                                     );
-                                    render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides.as_ref());
+                                    render_nav_frame(&mut buf, &vk, rect, app.term_rows, app.term_cols, color_overrides.as_ref());
                                 }
                                 None => {
-                                    render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides.as_ref());
-                                    show_command_mode_error(&format!("no {} found", kind.noun()), *term_rows, *term_cols);
+                                    render_nav_frame(&mut buf, &vk, rect, app.term_rows, app.term_cols, color_overrides.as_ref());
+                                    show_command_mode_error(&format!("no {} found", kind.noun()), app.term_rows, app.term_cols);
                                 }
                             }
                         }
@@ -8758,17 +8202,17 @@ fn run_normal_mode_navigation(
                             // One entry, here, before going anywhere:
                             // `Ctrl-O` should come back to where the
                             // question was asked.
-                            record_jump(windows, *current_window, &buf);
-                            match goto_location(sessions, session_id, &mut buf, &first, kind.noun()) {
+                            record_jump(&mut app.windows, app.current_window, &buf);
+                            match goto_location(&app.sessions, session_id, &mut buf, &first, kind.noun()) {
                             Goto::Moved => {
                                 let content_cols = nav_content_cols(&buf, rect);
                                 nav_scroll_to_show_cursor(&mut buf, content_cols);
-                                render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides.as_ref());
+                                render_nav_frame(&mut buf, &vk, rect, app.term_rows, app.term_cols, color_overrides.as_ref());
                                 // Only worth saying -- and only worth
                                 // arming -- when there is somewhere
                                 // else to go.
                                 if found.len() > 1 {
-                                    show_command_mode_error(&format!("{} 1/{} (n/N to cycle)", kind.noun(), found.len()), *term_rows, *term_cols);
+                                    show_command_mode_error(&format!("{} 1/{} (n/N to cycle)", kind.noun(), found.len()), app.term_rows, app.term_cols);
                                     definitions = Some((kind, found, 0));
                                 }
                             }
@@ -8785,14 +8229,14 @@ fn run_normal_mode_navigation(
                                         // dependency's source, whose own
                                         // nearest project marker belongs to
                                         // something else entirely.
-                                        root: buf.as_editable().and_then(|tb| server_target(&sessions[&session_id], tb)).map(|t| t.root),
+                                        root: buf.as_editable().and_then(|tb| server_target(&app.sessions[&session_id], tb)).map(|t| t.root),
                                     },
                                     nav_buffer_into_edit_state(buf, vk),
                                 );
                             }
                             Goto::Nowhere(message) => {
-                                render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides.as_ref());
-                                show_command_mode_error(&message, *term_rows, *term_cols);
+                                render_nav_frame(&mut buf, &vk, rect, app.term_rows, app.term_cols, color_overrides.as_ref());
+                                show_command_mode_error(&message, app.term_rows, app.term_cols);
                             }
                             }
                         }
@@ -8807,16 +8251,10 @@ fn run_normal_mode_navigation(
             KeyOutcome::GotoReferences => {
                 if let NavBuffer::Editable(tb) = &buf {
                     let (row, col) = tb.cursor();
-                    let encoding = server_encoding_for(sessions, session_id, tb).unwrap_or(crate::lsp::PositionEncoding::Utf16);
+                    let encoding = server_encoding_for(&app.sessions, session_id, tb).unwrap_or(crate::lsp::PositionEncoding::Utf16);
                     let found = ask_server_at_cursor(
-                        sessions,
-                        windows,
-                        job_frames,
+                        app,
                         session_id,
-                        *current_window,
-                        term_rows,
-                        term_cols,
-                        *sinks_are_grid,
                         tb,
                         row,
                         col,
@@ -8831,7 +8269,7 @@ fn run_normal_mode_navigation(
                     .unwrap_or_default();
                     // Relative to the project root when there is one, so
                     // the interesting part of a long path is what shows.
-                    let base = server_target(&sessions[&session_id], tb).map(|t| t.root);
+                    let base = server_target(&app.sessions[&session_id], tb).map(|t| t.root);
                     let title = match found.len() {
                         0 => "No references found".to_string(),
                         1 => "1 reference".to_string(),
@@ -8841,24 +8279,14 @@ fn run_normal_mode_navigation(
                     let list = location_list(&title, &found, encoding, base.as_deref());
                     match edit_frame_id {
                         Some(id) => {
-                            sync_locations_pane(
-                                sessions,
-                                windows,
-                                *current_window,
-                                next_session_id,
-                                location_lists,
-                                id,
-                                list,
-                                *term_rows,
-                                *term_cols,
-                            );
-                            render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides.as_ref());
+                            sync_locations_pane(app, id, list);
+                            render_nav_frame(&mut buf, &vk, rect, app.term_rows, app.term_cols, color_overrides.as_ref());
                         }
                         // No edit frame to hang a pane on -- which is
                         // every navigation start except `Edit`.
                         None => {
-                            render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides.as_ref());
-                            show_command_mode_error(&list.title, *term_rows, *term_cols);
+                            render_nav_frame(&mut buf, &vk, rect, app.term_rows, app.term_cols, color_overrides.as_ref());
+                            show_command_mode_error(&list.title, app.term_rows, app.term_cols);
                         }
                     }
                 }
@@ -8869,17 +8297,11 @@ fn run_normal_mode_navigation(
             KeyOutcome::DocumentSymbols => {
                 if let NavBuffer::Editable(tb) = &buf {
                     let (row, col) = tb.cursor();
-                    let encoding = server_encoding_for(sessions, session_id, tb).unwrap_or(crate::lsp::PositionEncoding::Utf16);
-                    let uri = server_target(&sessions[&session_id], tb).map(|t| t.uri).unwrap_or_default();
+                    let encoding = server_encoding_for(&app.sessions, session_id, tb).unwrap_or(crate::lsp::PositionEncoding::Utf16);
+                    let uri = server_target(&app.sessions[&session_id], tb).map(|t| t.uri).unwrap_or_default();
                     let found = ask_server_at_cursor(
-                        sessions,
-                        windows,
-                        job_frames,
+                        app,
                         session_id,
-                        *current_window,
-                        term_rows,
-                        term_cols,
-                        *sinks_are_grid,
                         tb,
                         row,
                         col,
@@ -8898,12 +8320,12 @@ fn run_normal_mode_navigation(
                     let list = symbol_list(&title, &found, encoding);
                     match edit_frame_id {
                         Some(id) => {
-                            sync_locations_pane(sessions, windows, *current_window, next_session_id, location_lists, id, list, *term_rows, *term_cols);
-                            render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides.as_ref());
+                            sync_locations_pane(app, id, list);
+                            render_nav_frame(&mut buf, &vk, rect, app.term_rows, app.term_cols, color_overrides.as_ref());
                         }
                         None => {
-                            render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides.as_ref());
-                            show_command_mode_error(&list.title, *term_rows, *term_cols);
+                            render_nav_frame(&mut buf, &vk, rect, app.term_rows, app.term_cols, color_overrides.as_ref());
+                            show_command_mode_error(&list.title, app.term_rows, app.term_cols);
                         }
                     }
                 }
@@ -8913,26 +8335,14 @@ fn run_normal_mode_navigation(
             // an edit to it, and to any other file the change reaches.
             KeyOutcome::CodeActions => {
                 let message = match buf.as_editable_mut() {
-                    Some(tb) => code_actions_at_cursor(
-                        sessions,
-                        windows,
-                        job_frames,
-                        edit_frames,
-                        session_id,
-                        *current_window,
-                        term_rows,
-                        term_cols,
-                        *sinks_are_grid,
-                        tb,
-                        rect,
-                    ),
+                    Some(tb) => code_actions_at_cursor(app, session_id, tb, rect),
                     None => None,
                 };
                 let content_cols = nav_content_cols(&buf, rect);
                 nav_scroll_to_show_cursor(&mut buf, content_cols);
-                render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides.as_ref());
+                render_nav_frame(&mut buf, &vk, rect, app.term_rows, app.term_cols, color_overrides.as_ref());
                 if let Some(message) = message {
-                    show_command_mode_error(&message, *term_rows, *term_cols);
+                    show_command_mode_error(&message, app.term_rows, app.term_cols);
                 }
             }
             KeyOutcome::Motion(m, count) => {
@@ -8941,12 +8351,12 @@ fn run_normal_mode_navigation(
                 // `JumpList`. Recorded here as well because only this
                 // frontend knows which *file* the cursor is in.
                 if motion::is_jump(&m) {
-                    record_jump(windows, *current_window, &buf);
+                    record_jump(&mut app.windows, app.current_window, &buf);
                 }
                 editor::apply_motion_or_reselect(&mut vk, &mut buf, m, count);
                 let content_cols = nav_content_cols(&buf, rect);
                 nav_scroll_to_show_cursor(&mut buf, content_cols);
-                render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides.as_ref());
+                render_nav_frame(&mut buf, &vk, rect, app.term_rows, app.term_cols, color_overrides.as_ref());
             }
             // `ReadOnly`: hands typing back to the live prompt's own
             // editor (`apply_insert_cmd` against `original_chars`,
@@ -8989,22 +8399,26 @@ fn run_normal_mode_navigation(
                     if let Some(&first) = cursors.first() {
                         tb.set_cursor(first.0, first.1);
                         let extra: Vec<(usize, usize)> = cursors[1..].to_vec();
-                        let (insert_term_rows, insert_term_cols) = (*term_rows, *term_cols);
-                        let insert_abbrs = sessions[&session_id].shell.abbrs.clone();
-                        fileeditor::run_insert_mode(tb, &mut vk, rect, registers, &mut EditorServices { sessions, windows, job_frames, current_window, term_rows, term_cols, sinks_are_grid: *sinks_are_grid, session_id }, false, insert_term_rows, insert_term_cols, color_overrides.as_ref(), &extra, &insert_abbrs)?;
+                        let (insert_term_rows, insert_term_cols) = (app.term_rows, app.term_cols);
+                        let insert_abbrs = app.sessions[&session_id].shell.abbrs.clone();
+                        app.with_registers(|app, registers| {
+                            fileeditor::run_insert_mode(tb, &mut vk, rect, registers, &mut EditorServices { app, session_id }, false, insert_term_rows, insert_term_cols, color_overrides.as_ref(), &extra, &insert_abbrs)
+                        })?;
                     }
                 }
-                render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides.as_ref());
+                render_nav_frame(&mut buf, &vk, rect, app.term_rows, app.term_cols, color_overrides.as_ref());
             }
             KeyOutcome::EnterInsert(cmd) => {
                 if matches!(buf, NavBuffer::Editable(_)) {
                     if let Some(tb) = buf.as_writable_mut() {
                         fileeditor::resolve_insert_start(tb, cmd);
-                        let (insert_term_rows, insert_term_cols) = (*term_rows, *term_cols);
-                        let insert_abbrs = sessions[&session_id].shell.abbrs.clone();
-                        fileeditor::run_insert_mode(tb, &mut vk, rect, registers, &mut EditorServices { sessions, windows, job_frames, current_window, term_rows, term_cols, sinks_are_grid: *sinks_are_grid, session_id }, false, insert_term_rows, insert_term_cols, color_overrides.as_ref(), &[], &insert_abbrs)?;
+                        let (insert_term_rows, insert_term_cols) = (app.term_rows, app.term_cols);
+                        let insert_abbrs = app.sessions[&session_id].shell.abbrs.clone();
+                        app.with_registers(|app, registers| {
+                            fileeditor::run_insert_mode(tb, &mut vk, rect, registers, &mut EditorServices { app, session_id }, false, insert_term_rows, insert_term_cols, color_overrides.as_ref(), &[], &insert_abbrs)
+                        })?;
                     }
-                    render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides.as_ref());
+                    render_nav_frame(&mut buf, &vk, rect, app.term_rows, app.term_cols, color_overrides.as_ref());
                 } else {
                     let (new_chars, new_cursor) = crate::bishedit::vimkeys::apply_insert_cmd(&original_chars, initial_cursor, cmd);
                     break 'nav (NavExit::Resume(new_chars.into_iter().collect(), new_cursor), nav_buffer_into_edit_state(buf, vk));
@@ -9020,11 +8434,13 @@ fn run_normal_mode_navigation(
             KeyOutcome::EnterReplace => {
                 if matches!(buf, NavBuffer::Editable(_)) {
                     if let Some(tb) = buf.as_writable_mut() {
-                        let (insert_term_rows, insert_term_cols) = (*term_rows, *term_cols);
-                        let insert_abbrs = sessions[&session_id].shell.abbrs.clone();
-                        fileeditor::run_insert_mode(tb, &mut vk, rect, registers, &mut EditorServices { sessions, windows, job_frames, current_window, term_rows, term_cols, sinks_are_grid: *sinks_are_grid, session_id }, true, insert_term_rows, insert_term_cols, color_overrides.as_ref(), &[], &insert_abbrs)?;
+                        let (insert_term_rows, insert_term_cols) = (app.term_rows, app.term_cols);
+                        let insert_abbrs = app.sessions[&session_id].shell.abbrs.clone();
+                        app.with_registers(|app, registers| {
+                            fileeditor::run_insert_mode(tb, &mut vk, rect, registers, &mut EditorServices { app, session_id }, true, insert_term_rows, insert_term_cols, color_overrides.as_ref(), &[], &insert_abbrs)
+                        })?;
                     }
-                    render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides.as_ref());
+                    render_nav_frame(&mut buf, &vk, rect, app.term_rows, app.term_cols, color_overrides.as_ref());
                 } else {
                     let (new_chars, new_cursor) =
                         crate::bishedit::vimkeys::apply_insert_cmd(&original_chars, initial_cursor, crate::bishedit::vimkeys::InsertCmd::Before);
@@ -9039,14 +8455,14 @@ fn run_normal_mode_navigation(
             // above, at the top of this same loop.
             KeyOutcome::EnterVisual(shape) => {
                 vk.begin_visual(shape, buf.cursor());
-                render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides.as_ref());
+                render_nav_frame(&mut buf, &vk, rect, app.term_rows, app.term_cols, color_overrides.as_ref());
             }
             KeyOutcome::ReselectVisual => {
                 if let Some((shape, anchor, cursor)) = vk.last_visual() {
                     buf.set_cursor(cursor.0, cursor.1);
                     vk.begin_visual(shape, anchor);
                 }
-                render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides.as_ref());
+                render_nav_frame(&mut buf, &vk, rect, app.term_rows, app.term_cols, color_overrides.as_ref());
             }
             // `Ctrl-O`/`Ctrl-I`. Cross-file, because vim's are: the
             // list lives on the pane (see `JumpList`) rather than in
@@ -9063,8 +8479,8 @@ fn run_normal_mode_navigation(
                 let here = jump_here(&buf);
                 let target = match (here.clone(), buf.as_editable().is_some()) {
                     (Some(here), true) => {
-                        let pane_id = windows[*current_window].focused_pane;
-                        let jumps = &mut windows[*current_window].pane_mut(pane_id).jumps;
+                        let pane_id = app.windows[app.current_window].focused_pane;
+                        let jumps = &mut app.windows[app.current_window].pane_mut(pane_id).jumps;
                         if forward { jumps.forward(here) } else { jumps.back(here) }
                     }
                     // No file behind this view: fall back to the
@@ -9095,13 +8511,13 @@ fn run_normal_mode_navigation(
                                 line: target.row,
                                 character: target.col,
                                 encoding: crate::lsp::PositionEncoding::Utf32,
-                                root: buf.as_editable().and_then(|tb| server_target(&sessions[&session_id], tb)).map(|t| t.root),
+                                root: buf.as_editable().and_then(|tb| server_target(&app.sessions[&session_id], tb)).map(|t| t.root),
                             },
                             nav_buffer_into_edit_state(buf, vk),
                         );
                     }
                 }
-                render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides.as_ref());
+                render_nav_frame(&mut buf, &vk, rect, app.term_rows, app.term_cols, color_overrides.as_ref());
             }
             // `u`/`Ctrl-R`: no-op for `ReadOnly`, same as every other
             // mutating outcome. Guarded on `!vk.is_visual() &&
@@ -9118,7 +8534,7 @@ fn run_normal_mode_navigation(
                         }
                     }
                 }
-                render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides.as_ref());
+                render_nav_frame(&mut buf, &vk, rect, app.term_rows, app.term_cols, color_overrides.as_ref());
             }
             KeyOutcome::Redo(count) => {
                 if !vk.is_visual() && buf.selections().is_empty() && let Some(tb) = buf.as_writable_mut() {
@@ -9128,7 +8544,7 @@ fn run_normal_mode_navigation(
                         }
                     }
                 }
-                render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides.as_ref());
+                render_nav_frame(&mut buf, &vk, rect, app.term_rows, app.term_cols, color_overrides.as_ref());
             }
             // `g-`/`g+`: same guard as `u`/`Ctrl-R` just above, for the
             // same reason.
@@ -9140,7 +8556,7 @@ fn run_normal_mode_navigation(
                         }
                     }
                 }
-                render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides.as_ref());
+                render_nav_frame(&mut buf, &vk, rect, app.term_rows, app.term_cols, color_overrides.as_ref());
             }
             // Yank works for either buffer kind (`op == Op::Yank` is
             // checked first, unconditionally) -- copying text out of a
@@ -9151,18 +8567,20 @@ fn run_normal_mode_navigation(
             // no-op as before this unification.
             KeyOutcome::Operator(op, motion, count, register) => {
                 if op == Op::Yank {
-                    editor::yank_motion(&mut buf, registers, motion, count, register);
+                    editor::yank_motion(&mut buf, &mut app.registers, motion, count, register);
                 } else if let Some(tb) = buf.as_writable_mut() {
                     match op {
                         Op::Delete => {
-                            fileeditor::delete_motion(tb, registers, motion, count, register);
+                            fileeditor::delete_motion(tb, &mut app.registers, motion, count, register);
                         }
                         Op::Change => {
                             let m = fileeditor::redirect_cw_to_ce(tb, &motion);
-                            if fileeditor::delete_motion(tb, registers, m, count, register) {
-                                let (insert_term_rows, insert_term_cols) = (*term_rows, *term_cols);
-                                let insert_abbrs = sessions[&session_id].shell.abbrs.clone();
-                                fileeditor::run_insert_mode(tb, &mut vk, rect, registers, &mut EditorServices { sessions, windows, job_frames, current_window, term_rows, term_cols, sinks_are_grid: *sinks_are_grid, session_id }, false, insert_term_rows, insert_term_cols, color_overrides.as_ref(), &[], &insert_abbrs)?;
+                            if fileeditor::delete_motion(tb, &mut app.registers, m, count, register) {
+                                let (insert_term_rows, insert_term_cols) = (app.term_rows, app.term_cols);
+                                let insert_abbrs = app.sessions[&session_id].shell.abbrs.clone();
+                                app.with_registers(|app, registers| {
+                            fileeditor::run_insert_mode(tb, &mut vk, rect, registers, &mut EditorServices { app, session_id }, false, insert_term_rows, insert_term_cols, color_overrides.as_ref(), &[], &insert_abbrs)
+                        })?;
                             }
                         }
                         Op::Lowercase | Op::Uppercase | Op::CaseToggle => {
@@ -9173,19 +8591,21 @@ fn run_normal_mode_navigation(
                         Op::Yank => unreachable!("handled above"),
                     }
                 }
-                render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides.as_ref());
+                render_nav_frame(&mut buf, &vk, rect, app.term_rows, app.term_cols, color_overrides.as_ref());
             }
             KeyOutcome::OperatorLines(op, count, register) => {
                 if op == Op::Yank {
-                    editor::yank_lines(&buf, registers, count, register);
+                    editor::yank_lines(&buf, &mut app.registers, count, register);
                 } else if let Some(tb) = buf.as_writable_mut() {
                     match op {
-                        Op::Delete => fileeditor::delete_lines(tb, registers, count, register),
+                        Op::Delete => fileeditor::delete_lines(tb, &mut app.registers, count, register),
                         Op::Change => {
-                            fileeditor::delete_lines(tb, registers, count, register);
-                            let (insert_term_rows, insert_term_cols) = (*term_rows, *term_cols);
-                            let insert_abbrs = sessions[&session_id].shell.abbrs.clone();
-                            fileeditor::run_insert_mode(tb, &mut vk, rect, registers, &mut EditorServices { sessions, windows, job_frames, current_window, term_rows, term_cols, sinks_are_grid: *sinks_are_grid, session_id }, false, insert_term_rows, insert_term_cols, color_overrides.as_ref(), &[], &insert_abbrs)?;
+                            fileeditor::delete_lines(tb, &mut app.registers, count, register);
+                            let (insert_term_rows, insert_term_cols) = (app.term_rows, app.term_cols);
+                            let insert_abbrs = app.sessions[&session_id].shell.abbrs.clone();
+                            app.with_registers(|app, registers| {
+                            fileeditor::run_insert_mode(tb, &mut vk, rect, registers, &mut EditorServices { app, session_id }, false, insert_term_rows, insert_term_cols, color_overrides.as_ref(), &[], &insert_abbrs)
+                        })?;
                         }
                         Op::Lowercase | Op::Uppercase | Op::CaseToggle => fileeditor::case_operator_lines(tb, count, fileeditor::case_kind_for_op(op)),
                         Op::Indent => fileeditor::indent_lines(tb, count),
@@ -9193,7 +8613,7 @@ fn run_normal_mode_navigation(
                         Op::Yank => unreachable!("handled above"),
                     }
                 }
-                render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides.as_ref());
+                render_nav_frame(&mut buf, &vk, rect, app.term_rows, app.term_cols, color_overrides.as_ref());
             }
             // `p`/`P`/`x`/`J`/`gJ`/`ys`/`ds`/`cs`/`r`/`~`/`o`/`O`: all
             // mutate, so all a no-op for `ReadOnly` (same as before this
@@ -9202,66 +8622,68 @@ fn run_normal_mode_navigation(
             // `fileeditor::` helper for `Editable`.
             KeyOutcome::Put { before, count, register } => {
                 if let Some(tb) = buf.as_writable_mut() {
-                    fileeditor::put(tb, registers, before, count, register);
+                    fileeditor::put(tb, &mut app.registers, before, count, register);
                 }
-                render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides.as_ref());
+                render_nav_frame(&mut buf, &vk, rect, app.term_rows, app.term_cols, color_overrides.as_ref());
             }
             KeyOutcome::DeleteCharForward { count, register } => {
                 if let Some(tb) = buf.as_writable_mut() {
-                    fileeditor::delete_char_forward(tb, registers, count, register);
+                    fileeditor::delete_char_forward(tb, &mut app.registers, count, register);
                 }
-                render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides.as_ref());
+                render_nav_frame(&mut buf, &vk, rect, app.term_rows, app.term_cols, color_overrides.as_ref());
             }
             KeyOutcome::Join { count, with_space } => {
                 if let Some(tb) = buf.as_writable_mut() {
                     tb.join_lines(count.unwrap_or(1).max(1), with_space);
                 }
-                render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides.as_ref());
+                render_nav_frame(&mut buf, &vk, rect, app.term_rows, app.term_cols, color_overrides.as_ref());
             }
             KeyOutcome::AddSurround { target, ch } => {
                 if let Some(tb) = buf.as_writable_mut() {
                     fileeditor::add_surround(tb, target, ch);
                 }
-                render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides.as_ref());
+                render_nav_frame(&mut buf, &vk, rect, app.term_rows, app.term_cols, color_overrides.as_ref());
             }
             KeyOutcome::DeleteSurround { ch } => {
                 if let Some(tb) = buf.as_writable_mut() {
                     fileeditor::delete_surround(tb, ch);
                 }
-                render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides.as_ref());
+                render_nav_frame(&mut buf, &vk, rect, app.term_rows, app.term_cols, color_overrides.as_ref());
             }
             KeyOutcome::ChangeSurround { ch, replacement } => {
                 if let Some(tb) = buf.as_writable_mut() {
                     fileeditor::change_surround(tb, ch, replacement);
                 }
-                render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides.as_ref());
+                render_nav_frame(&mut buf, &vk, rect, app.term_rows, app.term_cols, color_overrides.as_ref());
             }
             KeyOutcome::ReplaceChar { ch, count } => {
                 if let Some(tb) = buf.as_writable_mut() {
                     fileeditor::replace_char(tb, ch, count.unwrap_or(1).max(1));
                 }
-                render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides.as_ref());
+                render_nav_frame(&mut buf, &vk, rect, app.term_rows, app.term_cols, color_overrides.as_ref());
             }
             KeyOutcome::ToggleCase { count } => {
                 if let Some(tb) = buf.as_writable_mut() {
                     fileeditor::toggle_case(tb, count.unwrap_or(1).max(1));
                 }
-                render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides.as_ref());
+                render_nav_frame(&mut buf, &vk, rect, app.term_rows, app.term_cols, color_overrides.as_ref());
             }
             KeyOutcome::AdjustNumber { delta } => {
                 if let Some(tb) = buf.as_writable_mut() {
                     fileeditor::adjust_number(tb, delta);
                 }
-                render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides.as_ref());
+                render_nav_frame(&mut buf, &vk, rect, app.term_rows, app.term_cols, color_overrides.as_ref());
             }
             KeyOutcome::OpenLine { above } => {
                 if let Some(tb) = buf.as_writable_mut() {
                     fileeditor::open_line(tb, above);
-                    let (insert_term_rows, insert_term_cols) = (*term_rows, *term_cols);
-                    let insert_abbrs = sessions[&session_id].shell.abbrs.clone();
-                    fileeditor::run_insert_mode(tb, &mut vk, rect, registers, &mut EditorServices { sessions, windows, job_frames, current_window, term_rows, term_cols, sinks_are_grid: *sinks_are_grid, session_id }, false, insert_term_rows, insert_term_cols, color_overrides.as_ref(), &[], &insert_abbrs)?;
+                    let (insert_term_rows, insert_term_cols) = (app.term_rows, app.term_cols);
+                    let insert_abbrs = app.sessions[&session_id].shell.abbrs.clone();
+                    app.with_registers(|app, registers| {
+                            fileeditor::run_insert_mode(tb, &mut vk, rect, registers, &mut EditorServices { app, session_id }, false, insert_term_rows, insert_term_cols, color_overrides.as_ref(), &[], &insert_abbrs)
+                        })?;
                 }
-                render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides.as_ref());
+                render_nav_frame(&mut buf, &vk, rect, app.term_rows, app.term_cols, color_overrides.as_ref());
             }
             // dispatch_window_cmd does the actual work (shared with
             // run_edit_frame's own identical need -- see its own doc
@@ -9270,7 +8692,7 @@ fn run_normal_mode_navigation(
             // handing the buffer/vk back so an `Editable` caller can
             // re-stash them.
             KeyOutcome::Window(cmd, count) => {
-                dispatch_window_cmd(cmd, count, sessions, windows, current_window, next_session_id, next_window_id, sinks_are_grid, *term_rows, *term_cols);
+                dispatch_window_cmd(app, cmd, count);
                 return Ok((NavExit::Detached, nav_buffer_into_edit_state(buf, vk)));
             }
             // Rendered on every keystroke, not just a resolved Motion --
@@ -9278,12 +8700,12 @@ fn run_normal_mode_navigation(
             // "20g" mid-`20gg`) and a search's in-progress text live, not
             // just the end result once a motion actually applies.
             KeyOutcome::Pending | KeyOutcome::None => {
-                render_nav_frame(&mut buf, &vk, rect, *term_rows, *term_cols, color_overrides.as_ref());
+                render_nav_frame(&mut buf, &vk, rect, app.term_rows, app.term_cols, color_overrides.as_ref());
             }
         }
     };
 
-    compositor_redraw(sessions, windows, *current_window, *term_rows, *term_cols);
+    compositor_redraw(app);
     Ok(result)
 }
 
@@ -9353,12 +8775,12 @@ fn yank_selections(buf: &impl BisheditBuffer, selections: &[motion::MotionRange]
 // owned snapshot so drive_pending_fg's redraw callback can build a tab
 // bar without holding a live borrow of `sessions` for its whole poll
 // loop (see that call site's comment for why it can't).
-fn tab_bar_snapshot(sessions: &HashMap<SessionId, SessionState>, windows: &[WindowEntry], current_window: usize) -> Vec<(u32, bool, String)> {
+fn tab_bar_snapshot(app: &App) -> Vec<(u32, bool, String)> {
     // Same abbreviation the prompt itself uses (~-substitution, parent
     // components shortened to their first character) -- computed once
     // per redraw rather than per window, since it only depends on $HOME.
     let home = std::env::var("HOME").unwrap_or_default();
-    windows
+    app.windows
         .iter()
         .enumerate()
         .map(|(i, w)| {
@@ -9368,17 +8790,17 @@ fn tab_bar_snapshot(sessions: &HashMap<SessionId, SessionState>, windows: &[Wind
             let label = match &w.name {
                 Some(name) => name.clone(),
                 None => {
-                    let cwd = sessions[&w.owning_session()].shell.cwd.to_string_lossy();
+                    let cwd = app.sessions[&w.owning_session()].shell.cwd.to_string_lossy();
                     prompt::shorten_path(&cwd, &home)
                 }
             };
-            (w.id, i == current_window, label)
+            (w.id, i == app.current_window, label)
         })
         .collect()
 }
 
-fn tab_bar_line(sessions: &HashMap<SessionId, SessionState>, windows: &[WindowEntry], current_window: usize) -> String {
-    render_tab_bar(&tab_bar_snapshot(sessions, windows, current_window))
+fn tab_bar_line(app: &App) -> String {
+    render_tab_bar(&tab_bar_snapshot(app))
 }
 
 // Runs whatever `::bish hook` has attached to `event` for this buffer's
@@ -9991,63 +9413,27 @@ fn semantic_spans(
 // Insert mode's own view of everything repl.rs owns -- see
 // `fileeditor::InsertServices` for why this is one object rather than
 // two closures.
+// What the file editor's Insert mode is allowed to reach back into the
+// shell for: an idle tick, a completion list, a signature popup. Six of
+// its eight fields used to be the same six values every other function
+// here threaded, bundled by hand for exactly this one trait; `App`
+// bundles them for everyone.
 struct EditorServices<'a> {
-    sessions: &'a mut HashMap<SessionId, SessionState>,
-    windows: &'a mut Vec<WindowEntry>,
-    job_frames: &'a mut HashMap<JobFrameId, exec::FgJob>,
-    current_window: &'a mut usize,
-    term_rows: &'a mut usize,
-    term_cols: &'a mut usize,
-    sinks_are_grid: bool,
+    app: &'a mut App,
     session_id: SessionId,
 }
 
 impl fileeditor::InsertServices for EditorServices<'_> {
     fn idle(&mut self, buf: &mut TextBuffer) -> Option<fileeditor::IdleRedraw> {
-        insert_idle(
-            self.sessions,
-            self.windows,
-            self.job_frames,
-            self.current_window,
-            self.term_rows,
-            self.term_cols,
-            self.sinks_are_grid,
-            self.session_id,
-            buf,
-        )
+        insert_idle(self.app, self.session_id, buf)
     }
 
     fn complete(&mut self, buf: &TextBuffer, row: usize, col: usize) -> Vec<crate::bishedit::completion::EditorCompletion> {
-        completions_from_server(
-            self.sessions,
-            self.windows,
-            self.job_frames,
-            self.session_id,
-            *self.current_window,
-            self.term_rows,
-            self.term_cols,
-            self.sinks_are_grid,
-            buf,
-            row,
-            col,
-        )
+        completions_from_server(self.app, self.session_id, buf, row, col)
     }
 
     fn signature(&mut self, buf: &TextBuffer, row: usize, col: usize, typed: Option<char>) -> Option<Vec<String>> {
-        signature_from_server(
-            self.sessions,
-            self.windows,
-            self.job_frames,
-            self.session_id,
-            *self.current_window,
-            self.term_rows,
-            self.term_cols,
-            self.sinks_are_grid,
-            buf,
-            row,
-            col,
-            typed,
-        )
+        signature_from_server(self.app, self.session_id, buf, row, col, typed)
     }
 }
 
@@ -10064,22 +9450,15 @@ impl fileeditor::InsertServices for EditorServices<'_> {
 // Same bounded, servicing wait `K` uses: something *is* blocked on this
 // answer, because the popup is drawn in the same frame as the character
 // that opened it.
-#[allow(clippy::too_many_arguments)]
 fn signature_from_server(
-    sessions: &mut HashMap<SessionId, SessionState>,
-    windows: &mut [WindowEntry],
-    job_frames: &mut HashMap<JobFrameId, exec::FgJob>,
+    app: &mut App,
     session_id: SessionId,
-    current_window: usize,
-    term_rows: &mut usize,
-    term_cols: &mut usize,
-    sinks_are_grid: bool,
     buf: &TextBuffer,
     row: usize,
     col: usize,
     typed: Option<char>,
 ) -> Option<Vec<String>> {
-    let triggers = signature_triggers(sessions, session_id, buf)?;
+    let triggers = signature_triggers(&app.sessions, session_id, buf)?;
     // `None` means something other than typing moved the cursor, and a
     // refresh is only wanted for a popup already up.
     if let Some(ch) = typed
@@ -10093,23 +9472,8 @@ fn signature_from_server(
     // typed -- asking about a document the server was last told about
     // 150ms ago means asking about a file with no call in it, and
     // getting the correct answer: nothing.
-    flush_language_server_document(sessions, session_id, buf);
-    let result = ask_server_at_cursor(
-        sessions,
-        windows,
-        job_frames,
-        session_id,
-        current_window,
-        term_rows,
-        term_cols,
-        sinks_are_grid,
-        buf,
-        row,
-        col,
-        "textDocument/signatureHelp",
-        "signatureHelpProvider",
-        &[],
-    )?;
+    flush_language_server_document(&mut app.sessions, session_id, buf);
+    let result = ask_server_at_cursor(app, session_id, buf, row, col, "textDocument/signatureHelp", "signatureHelpProvider", &[])?;
     let lines = crate::lsp::signature_help(&result);
     (!lines.is_empty()).then_some(lines)
 }
@@ -10154,21 +9518,8 @@ fn signature_triggers(sessions: &HashMap<SessionId, SessionState>, session_id: S
 //
 // Returns a message to show, or `None` when the picker was cancelled
 // and there is nothing to say.
-#[allow(clippy::too_many_arguments)]
-fn code_actions_at_cursor(
-    sessions: &mut HashMap<SessionId, SessionState>,
-    windows: &mut [WindowEntry],
-    job_frames: &mut HashMap<JobFrameId, exec::FgJob>,
-    edit_frames: &mut HashMap<EditFrameId, fileeditor::EditSession>,
-    session_id: SessionId,
-    current_window: usize,
-    term_rows: &mut usize,
-    term_cols: &mut usize,
-    sinks_are_grid: bool,
-    buf: &mut TextBuffer,
-    rect: Rect,
-) -> Option<String> {
-    let encoding = server_encoding_for(sessions, session_id, buf)?;
+fn code_actions_at_cursor(app: &mut App, session_id: SessionId, buf: &mut TextBuffer, rect: Rect) -> Option<String> {
+    let encoding = server_encoding_for(&app.sessions, session_id, buf)?;
     let (row, col) = buf.cursor();
     // The diagnostics on this line are the `context` that makes a
     // server offer quick *fixes* rather than only refactors -- without
@@ -10206,14 +9557,8 @@ fn code_actions_at_cursor(
         ("character".to_string(), crate::json::Value::Number(character as f64)),
     ]);
     let result = ask_server(
-        sessions,
-        windows,
-        job_frames,
+        app,
         session_id,
-        current_window,
-        term_rows,
-        term_cols,
-        sinks_are_grid,
         buf,
         "textDocument/codeAction",
         "codeActionProvider",
@@ -10242,7 +9587,7 @@ fn code_actions_at_cursor(
             (a.title.clone(), detail)
         })
         .collect();
-    let chosen = pick_from_popup(&rows, buf, rect, *term_rows, *term_cols)?;
+    let chosen = pick_from_popup(&rows, buf, rect, app.term_rows, app.term_cols)?;
     let action = &actions[chosen];
     if let Some(why) = &action.disabled {
         return Some(format!("that action does not apply here: {why}"));
@@ -10256,14 +9601,8 @@ fn code_actions_at_cursor(
     // already carries an edit, or names a command to run, is complete.
     let action = if action.edit.is_none() && action.invocation.is_none() {
         let resolved = ask_server(
-            sessions,
-            windows,
-            job_frames,
+            app,
             session_id,
-            current_window,
-            term_rows,
-            term_cols,
-            sinks_are_grid,
             buf,
             "codeAction/resolve",
             "codeActionProvider",
@@ -10292,7 +9631,7 @@ fn code_actions_at_cursor(
             return Some(format!("that action also needs to {} files, which bish cannot do yet -- nothing changed", edit.unsupported.join("/")));
         }
         if !edit.changes.is_empty() {
-            match apply_workspace_edit(edit_frames, buf, edit, encoding) {
+            match apply_workspace_edit(&mut app.edit_frames, buf, edit, encoding) {
                 Ok((w, u)) => {
                     written += w;
                     unsaved += u;
@@ -10303,19 +9642,7 @@ fn code_actions_at_cursor(
         }
     }
     if let Some(invocation) = &action.invocation {
-        match run_server_command(
-            sessions,
-            windows,
-            job_frames,
-            edit_frames,
-            session_id,
-            current_window,
-            term_rows,
-            term_cols,
-            sinks_are_grid,
-            buf,
-            invocation,
-        ) {
+        match run_server_command(app, session_id, buf, invocation) {
             Ok((w, u)) => {
                 written += w;
                 unsaved += u;
@@ -10378,31 +9705,12 @@ fn pick_from_popup(rows: &[(String, String)], buf: &TextBuffer, rect: Rect, term
 // Every refusal happens before anything is written; `apply_workspace_
 // edit` below is what actually carries the change out, and its own doc
 // comment explains where the edits land.
-#[allow(clippy::too_many_arguments)]
-fn rename_via_server(
-    sessions: &mut HashMap<SessionId, SessionState>,
-    windows: &mut [WindowEntry],
-    job_frames: &mut HashMap<JobFrameId, exec::FgJob>,
-    edit_frames: &mut HashMap<EditFrameId, fileeditor::EditSession>,
-    session_id: SessionId,
-    current_window: usize,
-    term_rows: &mut usize,
-    term_cols: &mut usize,
-    sinks_are_grid: bool,
-    buf: &mut TextBuffer,
-    new_name: &str,
-) -> Result<String, String> {
-    let encoding = server_encoding_for(sessions, session_id, buf).ok_or("no language server for this file")?;
+fn rename_via_server(app: &mut App, session_id: SessionId, buf: &mut TextBuffer, new_name: &str) -> Result<String, String> {
+    let encoding = server_encoding_for(&app.sessions, session_id, buf).ok_or("no language server for this file")?;
     let (row, col) = buf.cursor();
     let result = ask_server_at_cursor(
-        sessions,
-        windows,
-        job_frames,
+        app,
         session_id,
-        current_window,
-        term_rows,
-        term_cols,
-        sinks_are_grid,
         buf,
         row,
         col,
@@ -10421,7 +9729,7 @@ fn rename_via_server(
         return Err("the language server had nothing to rename here".to_string());
     }
 
-    let (written, unsaved) = apply_workspace_edit(edit_frames, buf, &edit, encoding)?;
+    let (written, unsaved) = apply_workspace_edit(&mut app.edit_frames, buf, &edit, encoding)?;
     let mut message = format!("renamed to {new_name} in {} file{}", written + unsaved, if written + unsaved == 1 { "" } else { "s" });
     if unsaved > 0 {
         message.push_str(&format!(" ({unsaved} open, unsaved -- :w to keep)"));
@@ -10496,19 +9804,8 @@ fn apply_workspace_edit(
 // `Some(n)` is how many edits actually changed something, so a server
 // that reports "already formatted" (an empty list, or edits that are
 // all no-ops) is distinguishable from one that reformatted.
-#[allow(clippy::too_many_arguments)]
-fn format_via_server(
-    sessions: &mut HashMap<SessionId, SessionState>,
-    windows: &mut [WindowEntry],
-    job_frames: &mut HashMap<JobFrameId, exec::FgJob>,
-    session_id: SessionId,
-    current_window: usize,
-    term_rows: &mut usize,
-    term_cols: &mut usize,
-    sinks_are_grid: bool,
-    buf: &mut TextBuffer,
-) -> Option<usize> {
-    let encoding = server_encoding_for(sessions, session_id, buf)?;
+fn format_via_server(app: &mut App, session_id: SessionId, buf: &mut TextBuffer) -> Option<usize> {
+    let encoding = server_encoding_for(&app.sessions, session_id, buf)?;
     // The buffer's own indent settings, which is what the file already
     // agrees with -- editorconfig and `bishopt` both feed these, so a
     // server is told the same thing `>>` and Tab already obey rather
@@ -10520,14 +9817,8 @@ fn format_via_server(
         ("insertFinalNewline".to_string(), crate::json::Value::Bool(buf.final_newline)),
     ]);
     let result = ask_server(
-        sessions,
-        windows,
-        job_frames,
+        app,
         session_id,
-        current_window,
-        term_rows,
-        term_cols,
-        sinks_are_grid,
         buf,
         "textDocument/formatting",
         "documentFormattingProvider",
@@ -10544,37 +9835,15 @@ fn format_via_server(
 // The server's own replace ranges are resolved to buffer coordinates
 // here, where the position encoding is known, so the editor never sees
 // anything protocol-shaped (see `EditorCompletion`).
-#[allow(clippy::too_many_arguments)]
 fn completions_from_server(
-    sessions: &mut HashMap<SessionId, SessionState>,
-    windows: &mut [WindowEntry],
-    job_frames: &mut HashMap<JobFrameId, exec::FgJob>,
+    app: &mut App,
     session_id: SessionId,
-    current_window: usize,
-    term_rows: &mut usize,
-    term_cols: &mut usize,
-    sinks_are_grid: bool,
     buf: &TextBuffer,
     row: usize,
     col: usize,
 ) -> Vec<crate::bishedit::completion::EditorCompletion> {
-    let encoding = server_encoding_for(sessions, session_id, buf).unwrap_or(crate::lsp::PositionEncoding::Utf16);
-    let Some(result) = ask_server_at_cursor(
-        sessions,
-        windows,
-        job_frames,
-        session_id,
-        current_window,
-        term_rows,
-        term_cols,
-        sinks_are_grid,
-        buf,
-        row,
-        col,
-        "textDocument/completion",
-        "completionProvider",
-        &[],
-    ) else {
+    let encoding = server_encoding_for(&app.sessions, session_id, buf).unwrap_or(crate::lsp::PositionEncoding::Utf16);
+    let Some(result) = ask_server_at_cursor(app, session_id, buf, row, col, "textDocument/completion", "completionProvider", &[]) else {
         return Vec::new();
     };
     let mut found = crate::lsp::completions(&result);
@@ -10626,16 +9895,9 @@ fn completions_from_server(
 // is no longer waiting for this answer, and holding their input for the
 // rest of a timeout to show them a popup they've moved past is the
 // wrong side of the trade.
-#[allow(clippy::too_many_arguments)]
 fn ask_server_at_cursor(
-    sessions: &mut HashMap<SessionId, SessionState>,
-    windows: &mut [WindowEntry],
-    job_frames: &mut HashMap<JobFrameId, exec::FgJob>,
+    app: &mut App,
     session_id: SessionId,
-    current_window: usize,
-    term_rows: &mut usize,
-    term_cols: &mut usize,
-    sinks_are_grid: bool,
     buf: &TextBuffer,
     row: usize,
     col: usize,
@@ -10648,7 +9910,7 @@ fn ask_server_at_cursor(
     extra: &[(&str, crate::json::Value)],
 ) -> Option<crate::json::Value> {
     let chars = buf.line_chars(row);
-    let encoding = server_encoding_for(sessions, session_id, buf).unwrap_or(crate::lsp::PositionEncoding::Utf16);
+    let encoding = server_encoding_for(&app.sessions, session_id, buf).unwrap_or(crate::lsp::PositionEncoding::Utf16);
     let character = crate::lsp::to_server_column(&chars, col, encoding);
     let mut params = vec![(
         "position".to_string(),
@@ -10658,7 +9920,7 @@ fn ask_server_at_cursor(
         ]),
     )];
     params.extend(extra.iter().map(|(k, v)| ((*k).to_string(), v.clone())));
-    ask_server(sessions, windows, job_frames, session_id, current_window, term_rows, term_cols, sinks_are_grid, buf, method, capability, params)
+    ask_server(app, session_id, buf, method, capability, params)
 }
 
 // The general form: one request about this buffer, with whatever params
@@ -10667,22 +9929,15 @@ fn ask_server_at_cursor(
 // `textDocument` is added here rather than by every caller, since every
 // method that is about a document needs it and none of them want to
 // build the uri themselves.
-#[allow(clippy::too_many_arguments)]
 fn ask_server(
-    sessions: &mut HashMap<SessionId, SessionState>,
-    windows: &mut [WindowEntry],
-    job_frames: &mut HashMap<JobFrameId, exec::FgJob>,
+    app: &mut App,
     session_id: SessionId,
-    current_window: usize,
-    term_rows: &mut usize,
-    term_cols: &mut usize,
-    sinks_are_grid: bool,
     buf: &TextBuffer,
     method: &str,
     capability: &str,
     mut params: Vec<(String, crate::json::Value)>,
 ) -> Option<crate::json::Value> {
-    let session = sessions.get(&session_id)?;
+    let session = app.sessions.get(&session_id)?;
     let target = server_target(session, buf)?;
     let timeout = std::time::Duration::from_millis(session.shell.bishopt_int("lsp_timeout_ms").max(0) as u64);
     let lsp = Rc::clone(&session.lsp);
@@ -10714,7 +9969,7 @@ fn ask_server(
 
     let deadline = std::time::Instant::now() + timeout;
     while std::time::Instant::now() < deadline {
-        service_background_jobs(sessions, windows, job_frames, current_window, term_rows, term_cols, sinks_are_grid);
+        service_background_jobs(app);
         if let Some(result) = lsp.borrow_mut().running(&target.display, &target.root)?.take_response(id) {
             // A server answering with an error has answered: there is
             // nothing better to wait for, and the caller's own fallback
@@ -10750,25 +10005,17 @@ fn ask_server(
 //
 // Returns how many files were changed and how many of those are open
 // and unsaved, or an error to show.
-#[allow(clippy::too_many_arguments)]
 fn run_server_command(
-    sessions: &mut HashMap<SessionId, SessionState>,
-    windows: &mut [WindowEntry],
-    job_frames: &mut HashMap<JobFrameId, exec::FgJob>,
-    edit_frames: &mut HashMap<EditFrameId, fileeditor::EditSession>,
+    app: &mut App,
     session_id: SessionId,
-    current_window: usize,
-    term_rows: &mut usize,
-    term_cols: &mut usize,
-    sinks_are_grid: bool,
     buf: &mut TextBuffer,
     invocation: &crate::json::Value,
 ) -> Result<(usize, usize), String> {
-    let Some(session) = sessions.get(&session_id) else { return Err("no session".to_string()) };
+    let Some(session) = app.sessions.get(&session_id) else { return Err("no session".to_string()) };
     let Some(target) = server_target(session, buf) else { return Err("no language server for this file".to_string()) };
     let timeout = std::time::Duration::from_millis(session.shell.bishopt_int("lsp_timeout_ms").max(0) as u64);
-    let encoding = server_encoding_for(sessions, session_id, buf).unwrap_or(crate::lsp::PositionEncoding::Utf16);
-    let lsp = Rc::clone(&sessions.get(&session_id).expect("checked").lsp);
+    let encoding = server_encoding_for(&app.sessions, session_id, buf).unwrap_or(crate::lsp::PositionEncoding::Utf16);
+    let lsp = Rc::clone(&app.sessions.get(&session_id).expect("checked").lsp);
 
     let id = {
         let mut table = lsp.borrow_mut();
@@ -10797,7 +10044,7 @@ fn run_server_command(
     let deadline = std::time::Instant::now() + timeout;
     let mut done = false;
     while !done && std::time::Instant::now() < deadline {
-        service_background_jobs(sessions, windows, job_frames, current_window, term_rows, term_cols, sinks_are_grid);
+        service_background_jobs(app);
         loop {
             let taken = {
                 let mut table = lsp.borrow_mut();
@@ -10816,7 +10063,7 @@ fn run_server_command(
                 failure = Some(format!("that command wanted to {} files, which bish cannot do -- nothing changed", edit.unsupported.join("/")));
                 false
             } else {
-                match apply_workspace_edit(edit_frames, buf, &edit, encoding) {
+                match apply_workspace_edit(&mut app.edit_frames, buf, &edit, encoding) {
                     Ok((w, u)) => {
                         written += w;
                         unsaved += u;
@@ -11091,20 +10338,20 @@ fn run_hooks_for(sessions: &mut HashMap<SessionId, SessionState>, session_id: Se
 // select` are ordinary builtins reading a snapshot rather than actions
 // the repl applies afterwards. That is the difference between
 // `$(window ls)` capturing the listing and capturing nothing.
-fn window_snapshot(sessions: &HashMap<SessionId, SessionState>, windows: &[WindowEntry], current_window: usize) -> Vec<exec::WindowInfo> {
+fn window_snapshot(app: &App) -> Vec<exec::WindowInfo> {
     let home = std::env::var("HOME").unwrap_or_default();
-    windows
+    app.windows
         .iter()
         .enumerate()
         .map(|(i, window)| exec::WindowInfo {
             id: window.id,
             name: window.name.clone(),
-            cwd: sessions
+            cwd: app.sessions
                 .get(&window.owning_session())
                 .map(|s| prompt::shorten_path(&s.shell.cwd.to_string_lossy(), &home))
                 .unwrap_or_default(),
             panes: window.panes.len(),
-            current: i == current_window,
+            current: i == app.current_window,
         })
         .collect()
 }
@@ -11213,25 +10460,18 @@ fn place_nav_cursor_at(buf: &mut NavBuffer, rect: Rect, row0: usize, col0: usize
 // what a given click means. `ev.row`/`ev.col` are 1-indexed (the
 // terminal's own convention -- see MouseEvent's own doc comment); `Rect`/
 // the tab bar's own row are 0-indexed, hence the -1 conversions below.
-fn hit_test_click(
-    ev: editor::MouseEvent,
-    sessions: &HashMap<SessionId, SessionState>,
-    windows: &[WindowEntry],
-    current_window: usize,
-    term_rows: usize,
-    term_cols: usize,
-) -> Option<ClickTarget> {
+fn hit_test_click(app: &App, ev: editor::MouseEvent) -> Option<ClickTarget> {
     let row0 = (ev.row as usize).saturating_sub(1);
     let col0 = (ev.col as usize).saturating_sub(1);
-    if row0 == term_rows.saturating_sub(1) {
-        let regions = tab_bar_regions(&tab_bar_snapshot(sessions, windows, current_window));
+    if row0 == app.term_rows.saturating_sub(1) {
+        let regions = tab_bar_regions(&tab_bar_snapshot(app));
         let (id, _, _) = regions.into_iter().find(|(_, start, end)| col0 >= *start && col0 < *end)?;
-        return Some(ClickTarget::Window(windows.iter().position(|w| w.id == id)?));
+        return Some(ClickTarget::Window(app.windows.iter().position(|w| w.id == id)?));
     }
-    let area = Rect { row: 0, col: 0, rows: content_rows(term_rows), cols: term_cols };
+    let area = Rect { row: 0, col: 0, rows: content_rows(app.term_rows), cols: app.term_cols };
     let mut regions = Vec::new();
     let mut dividers = Vec::new();
-    compute_regions(&windows[current_window].layout, area, windows[current_window].focused_pane, windows[current_window].divider_budget, &mut regions, &mut dividers);
+    compute_regions(&app.windows[app.current_window].layout, area, app.windows[app.current_window].focused_pane, app.windows[app.current_window].divider_budget, &mut regions, &mut dividers);
     // Dividers first: they sit *between* pane rectangles, so nothing here
     // overlaps, but checking them first keeps the intent obvious -- a
     // press on the strip is a resize, never a focus change.
@@ -11244,7 +10484,7 @@ fn hit_test_click(
         // the first pane it is hiding instead, which unfolds the run
         // around it -- the "flip" in flipper divider.
         if divider.folded.is_some() {
-            return folded_divider_pane(&windows[current_window], &divider).map(ClickTarget::Pane);
+            return folded_divider_pane(&app.windows[app.current_window], &divider).map(ClickTarget::Pane);
         }
         return Some(ClickTarget::Divider(divider));
     }
@@ -11265,17 +10505,7 @@ fn hit_test_click(
 // arriving mid-drag is ignored, including keystrokes: the terminal is
 // mid-gesture, and a stray key is far more likely to be the user
 // fumbling than a command.
-#[allow(clippy::too_many_arguments)]
-fn drag_divider(
-    divider: &Divider,
-    sessions: &mut HashMap<SessionId, SessionState>,
-    windows: &mut [WindowEntry],
-    job_frames: &mut HashMap<JobFrameId, exec::FgJob>,
-    current_window: usize,
-    term_rows: &mut usize,
-    term_cols: &mut usize,
-    sinks_are_grid: bool,
-) {
+fn drag_divider(app: &mut App, divider: &Divider) {
     // Re-derived from the live layout on every motion: the first resize
     // moves the divider itself, so a `Divider` captured at press time is
     // stale from then on -- but its *identity* (path, child, axis) is
@@ -11293,7 +10523,7 @@ fn drag_divider(
         // state.
         let Ok(_guard) = term::RawGuard::enable_with_mouse(0) else { return };
         while let Ok(Some(key)) = editor::read_key_idle(&mut || {
-            service_background_jobs(sessions, windows, job_frames, current_window, term_rows, term_cols, sinks_are_grid);
+            service_background_jobs(app);
         }) {
             let Key::Mouse(ev) = key else { continue };
             if ev.is_release() {
@@ -11303,20 +10533,20 @@ fn drag_divider(
                 continue;
             }
             let to = if current.horizontal { (ev.row as usize).saturating_sub(1) } else { (ev.col as usize).saturating_sub(1) };
-            if !resize_split_child_to(&mut windows[current_window], &current, to) {
+            if !resize_split_child_to(&mut app.windows[app.current_window], &current, to) {
                 continue;
             }
             // Refresh this divider's own geometry from the layout it just
             // changed, matched by identity rather than position.
-            let area = Rect { row: 0, col: 0, rows: content_rows(*term_rows), cols: *term_cols };
+            let area = Rect { row: 0, col: 0, rows: content_rows(app.term_rows), cols: app.term_cols };
             let mut regions = Vec::new();
             let mut dividers = Vec::new();
-            compute_regions(&windows[current_window].layout, area, windows[current_window].focused_pane, windows[current_window].divider_budget, &mut regions, &mut dividers);
+            compute_regions(&app.windows[app.current_window].layout, area, app.windows[app.current_window].focused_pane, app.windows[app.current_window].divider_budget, &mut regions, &mut dividers);
             if let Some(fresh) = dividers.into_iter().find(|d| d.path == current.path && d.child == current.child) {
                 current = fresh;
             }
-            if sinks_are_grid {
-                compositor_redraw(sessions, windows, current_window, *term_rows, *term_cols);
+            if app.sinks_are_grid {
+                compositor_redraw(app);
             }
         }
     }
@@ -11587,7 +10817,6 @@ fn preview_document(language: &str, source: &str, term_cols: usize, links: &Link
 // callback exactly as it does in every other blocking loop here, so a
 // background job's output still lands in its own pane's grid while a
 // help page is open.
-#[allow(clippy::too_many_arguments)]
 // What the pager is showing, so a resize can re-render it at the new
 // width -- which is not optional, since a table's layout and every
 // wrapped line depend on it.
@@ -11642,36 +10871,21 @@ fn man_page_under_cursor(buf: &TextBuffer) -> Option<(String, String)> {
     crate::bishedit::manpages::source_for(&word).map(|source| (word, source))
 }
 
-fn run_pager(
-    title: &str,
-    doc: PagerSource,
-    sessions: &mut HashMap<SessionId, SessionState>,
-    windows: &mut Vec<WindowEntry>,
-    job_frames: &mut HashMap<JobFrameId, exec::FgJob>,
-    // `&mut` so a click on another tab can go there -- see the
-    // `Outcome::Click` arm below.
-    current_window: &mut usize,
-    term_rows: &mut usize,
-    term_cols: &mut usize,
-    sinks_are_grid: bool,
-) {
+fn run_pager(app: &mut App, title: &str, doc: PagerSource) {
     let Ok(_guard) = term::RawGuard::enable_with_mouse(0) else { return };
     // One pane's rectangle, not the whole screen. The neighbours are
     // painted once here and then left alone -- the pager only ever
     // writes inside its own rect, the same arrangement browser.rs and
     // the hex view already use.
-    let pane_rect_now = |windows: &[WindowEntry], current: usize, rows: usize, cols: usize| {
-        pane_rect(&windows[current], windows[current].focused_pane, rows, cols)
-    };
-    let mut rect = pane_rect_now(windows, *current_window, *term_rows, *term_cols);
-    compositor_redraw(sessions, windows, *current_window, *term_rows, *term_cols);
+    let mut rect = app.focused_pane_rect();
+    compositor_redraw(app);
     let mut view = crate::pager::Pager::new(title, doc.lines(rect.cols), rect.rows, rect.cols);
-    let mut last_size = (*term_rows, *term_cols);
+    let mut last_size = (app.term_rows, app.term_cols);
     loop {
         print!("{}", view.render(rect));
         let _ = io::stdout().flush();
         let key = match editor::read_key_idle(&mut || {
-            service_background_jobs(sessions, windows, job_frames, *current_window, term_rows, term_cols, sinks_are_grid);
+            service_background_jobs(app);
         }) {
             Ok(Some(k)) => k,
             // EOF/error: nothing to resume, same as every other loop's
@@ -11680,10 +10894,10 @@ fn run_pager(
         };
         // A resize while reading re-renders the *document*, not just the
         // view: the wrap width changed, and so did every table's layout.
-        if (*term_rows, *term_cols) != last_size {
-            last_size = (*term_rows, *term_cols);
-            rect = pane_rect_now(windows, *current_window, *term_rows, *term_cols);
-            compositor_redraw(sessions, windows, *current_window, *term_rows, *term_cols);
+        if (app.term_rows, app.term_cols) != last_size {
+            last_size = (app.term_rows, app.term_cols);
+            rect = app.focused_pane_rect();
+            compositor_redraw(app);
             let top_line = view.top_line();
             view = crate::pager::Pager::new(title, doc.lines(rect.cols), rect.rows, rect.cols);
             view.scroll_to(top_line);
@@ -11695,14 +10909,14 @@ fn run_pager(
             // focus change already follows. Anything else (this pane, a
             // divider, a miss) keeps reading.
             crate::pager::Outcome::Click(ev) => {
-                match hit_test_click(ev, sessions, windows, *current_window, *term_rows, *term_cols) {
-                    Some(ClickTarget::Window(idx)) if idx != *current_window => {
-                        *current_window = idx;
+                match hit_test_click(app, ev) {
+                    Some(ClickTarget::Window(idx)) if idx != app.current_window => {
+                        app.current_window = idx;
                         break;
                     }
-                    Some(ClickTarget::Pane(pane)) if pane != windows[*current_window].focused_pane => {
-                        restore_if_minimized(&mut windows[*current_window], pane);
-                        windows[*current_window].focused_pane = pane;
+                    Some(ClickTarget::Pane(pane)) if pane != app.windows[app.current_window].focused_pane => {
+                        restore_if_minimized(&mut app.windows[app.current_window], pane);
+                        app.windows[app.current_window].focused_pane = pane;
                         break;
                     }
                     _ => {}
@@ -12129,27 +11343,9 @@ enum CommandModeOutcome {
 // off the same way, or left as-is when this function returns (the
 // caller's own compositor_redraw, wherever it ends up happening, clears
 // it).
-#[allow(clippy::too_many_arguments)]
 fn run_command_mode(
+    app: &mut App,
     session_id: SessionId,
-    sessions: &mut HashMap<SessionId, SessionState>,
-    windows: &mut Vec<WindowEntry>,
-    // `&mut` so a click on another tab from inside a pager opened
-    // here (`:help`, `:preview`) can actually go there.
-    current_window: &mut usize,
-    next_session_id: &mut SessionId,
-    history: &mut History,
-    job_frames: &mut HashMap<JobFrameId, exec::FgJob>,
-    debug_frames: &mut HashMap<EditFrameId, debugger::DebugSession>,
-    // Every *other* open buffer. `run_edit_frame` takes the one being
-    // driven out of this map before driving it, so what is left here is
-    // exactly the files a cross-file edit must not write behind the
-    // user's back -- see `rename_via_server`.
-    edit_frames: &mut HashMap<EditFrameId, fileeditor::EditSession>,
-    registers: &mut Registers,
-    term_rows: &mut usize,
-    term_cols: &mut usize,
-    sinks_are_grid: bool,
     // `Some` iff the pane driving this call is a `Frame::Edit` (the
     // unified Normal-mode loop's own `NavBuffer::Editable` -- see that
     // enum's doc comment) -- what makes `w`/`w <path>`/`wq`/`x`/`q`/`q!`/
@@ -12189,12 +11385,12 @@ fn run_command_mode(
         // (see service_background_jobs's own on_idle-driven WINCH
         // handling below) repositions this row correctly on the very
         // next redraw, instead of staying pinned to wherever the old
-        // term_rows put it.
-        let prompt_row = command_mode_row(*term_rows) + 1;
+        // &mut app.term_rows put it.
+        let prompt_row = command_mode_row(app.term_rows) + 1;
         let prompt_str = if buffer.is_empty() { prompt::command_mode_prompt() } else { prompt::continuation() };
-        let mouse = sessions.get(&session_id).is_none_or(|s| s.shell.bishopt_bool("mouse"));
+        let mouse = app.sessions.get(&session_id).is_none_or(|s| s.shell.bishopt_bool("mouse"));
         let builtin_completion = crate::bishedit::completion::BuiltinCompletionProvider {
-            hl_names: sessions.get(&session_id).map(|s| s.shell.hl_colors().into_iter().map(|(name, _)| name).collect()).unwrap_or_default(),
+            hl_names: app.sessions.get(&session_id).map(|s| s.shell.hl_colors().into_iter().map(|(name, _)| name).collect()).unwrap_or_default(),
         };
         print!("\x1b[{};1H", prompt_row);
         let _ = io::stdout().flush();
@@ -12230,17 +11426,21 @@ fn run_command_mode(
         // so Tab cycles by splicing, which is what a one-line prompt
         // wants anyway.
         // Snapshotted before the call: the `on_idle` closure below takes
-        // `sessions` mutably for the whole of it, so this cannot be read
+        // `app.sessions` mutably for the whole of it, so this cannot be read
         // inline as another argument.
-        let command_mappings = sessions.get(&session_id).map(|s| s.shell.mappings.clone()).unwrap_or_default();
-        match editor::read_line(
+        let command_mappings = app.sessions.get(&session_id).map(|s| s.shell.mappings.clone()).unwrap_or_default();
+        // O(1) Rc-clone, for the same reason -- see `History`'s own doc
+        // comment, which names this exact situation.
+        let history_snapshot = app.cmd_history.clone();
+        let outcome = app.with_registers(|app, registers| {
+            editor::read_line(
             &prompt_str,
-            history,
+            &history_snapshot,
             true,
             true,
             pending_initial.take(),
             0,
-            *term_cols,
+            app.term_cols,
             HighlightContext::default(),
             Some(&builtin_completion),
             None,
@@ -12260,7 +11460,7 @@ fn run_command_mode(
             // for one -- whatever arrived shows up once this excursion
             // ends and the caller repaints.
             &mut || {
-                service_background_jobs(sessions, windows, job_frames, *current_window, term_rows, term_cols, sinks_are_grid);
+                service_background_jobs(app);
                 false
             },
             // The `mouse` bishopt -- off keeps the terminal's own
@@ -12272,7 +11472,9 @@ fn run_command_mode(
             // ...and if a mapping's `:` is what opened it, the rest of
             // that right-hand side arrives here.
             std::mem::take(&mut queued),
-        ) {
+        )
+        });
+        match outcome {
             // Command mode discards whatever was typed either way, so
             // `text` is nothing to it -- see that field's own doc comment
             // for the caller that does need it.
@@ -12310,16 +11512,16 @@ fn run_command_mode(
             Ok(ReadOutcome::CtrlL) => {
                 transcript_visible = !transcript_visible;
                 if transcript_visible {
-                    render_command_transcript(&sessions[&session_id].command_transcript, *term_rows, *term_cols);
+                    render_command_transcript(&app.sessions[&session_id].command_transcript, app.term_rows, app.term_cols);
                 } else {
-                    compositor_redraw(sessions, windows, *current_window, *term_rows, *term_cols);
+                    compositor_redraw(app);
                 }
             }
             Ok(ReadOutcome::Line(line)) => {
-                // Same history expansion as the normal shell prompt (see
+                // Same app.cmd_history expansion as the normal shell prompt (see
                 // history::expand's own doc comment), scoped the same
                 // way: only the first line of a fresh command, against
-                // command mode's own separate history. Command mode
+                // command mode's own separate app.cmd_history. Command mode
                 // disallows subshells outright (command_mode_violation
                 // below), so an unrecognized leading `!` becomes
                 // `command <rest>` here instead of `(<rest>)` -- the
@@ -12329,11 +11531,11 @@ fn run_command_mode(
                     buffer_unrecorded = starts_off_the_record(&line);
                 }
                 let line = if buffer.is_empty() {
-                    match history::expand(&line, history) {
+                    match history::expand(&line, &app.cmd_history) {
                         Ok(history::Expansion::Substituted(s)) => s,
                         Ok(history::Expansion::UnrecognizedBang(rest)) => format!("command {}", rest),
                         Err(msg) => {
-                            show_command_mode_error(&msg, *term_rows, *term_cols);
+                            show_command_mode_error(&msg, app.term_rows, app.term_cols);
                             continue;
                         }
                     }
@@ -12355,7 +11557,7 @@ fn run_command_mode(
                 // new `":`) -- now that `:` is genuinely one command
                 // mode, it records here rather than only when a
                 // `Frame::Edit` pane's own w/wq/x/q/q! handling ran.
-                registers.set_last_ex_command(trimmed.clone());
+                app.registers.set_last_ex_command(trimmed.clone());
 
                 // `w`/`w <path>`/`wq`/`x`/`q`/`q!`: the file's own
                 // save/quit commands -- only mean anything when this
@@ -12383,7 +11585,7 @@ fn run_command_mode(
                         match parsed.and_then(|cmd| run_global(tb, &cmd)) {
                             Ok(lines) => {
                                 let output = format!("{lines} line{}", if lines == 1 { "" } else { "s" });
-                                sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry {
+                                app.sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry {
                                     command: trimmed,
                                     output: output.clone(),
                                     status: 0,
@@ -12391,7 +11593,7 @@ fn run_command_mode(
                                 return CommandModeOutcome::Ran { output, status: 0 };
                             }
                             Err(e) => {
-                                show_command_mode_error(&format!("bish: {e}"), *term_rows, *term_cols);
+                                show_command_mode_error(&format!("bish: {e}"), app.term_rows, app.term_cols);
                                 buffer.clear();
                                 continue;
                             }
@@ -12403,7 +11605,7 @@ fn run_command_mode(
                             Ok((subs, lines)) => {
                                 let output =
                                     format!("{subs} substitution{} on {lines} line{}", if subs == 1 { "" } else { "s" }, if lines == 1 { "" } else { "s" });
-                                sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry {
+                                app.sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry {
                                     command: trimmed,
                                     output: output.clone(),
                                     status: 0,
@@ -12411,7 +11613,7 @@ fn run_command_mode(
                                 return CommandModeOutcome::Ran { output, status: 0 };
                             }
                             Err(e) => {
-                                show_command_mode_error(&format!("bish: {e}"), *term_rows, *term_cols);
+                                show_command_mode_error(&format!("bish: {e}"), app.term_rows, app.term_cols);
                                 buffer.clear();
                                 continue;
                             }
@@ -12437,8 +11639,8 @@ fn run_command_mode(
                         "w" | "write" | "wq" | "x" if arg.is_none() && tb.changed_on_disk() => {
                             show_command_mode_error(
                                 "bish: E13: file changed on disk since it was read (`:w!` to overwrite, `:e!` to reload)",
-                                *term_rows,
-                                *term_cols,
+                                app.term_rows,
+                                app.term_cols,
                             );
                             buffer.clear();
                             continue;
@@ -12450,7 +11652,7 @@ fn run_command_mode(
                         "e!" | "edit!" => {
                             match tb.reload() {
                                 Ok(()) => {
-                                    sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry {
+                                    app.sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry {
                                         command: trimmed,
                                         output: String::new(),
                                         status: 0,
@@ -12458,21 +11660,21 @@ fn run_command_mode(
                                     return CommandModeOutcome::Ran { output: String::new(), status: 0 };
                                 }
                                 Err(e) => {
-                                    show_command_mode_error(&format!("bish: e!: {e}"), *term_rows, *term_cols);
+                                    show_command_mode_error(&format!("bish: e!: {e}"), app.term_rows, app.term_cols);
                                     buffer.clear();
                                     continue;
                                 }
                             }
                         }
                         "w!" | "write!" => {
-                            run_hooks(sessions, session_id, "editor:file:write:pre", tb);
+                            run_hooks(&mut app.sessions, session_id, "editor:file:write:pre", tb);
                             fileeditor::run_pre_save_hooks(tb);
                             match tb.save(arg.map(std::path::Path::new)) {
                                 Ok(()) => {
-                                    fileeditor::set_last_filename(tb, registers);
-                                    run_hooks(sessions, session_id, "editor:file:write:post", tb);
-                                    save_language_server_document(sessions, session_id, tb);
-                                    sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry {
+                                    fileeditor::set_last_filename(tb, &mut app.registers);
+                                    run_hooks(&mut app.sessions, session_id, "editor:file:write:post", tb);
+                                    save_language_server_document(&mut app.sessions, session_id, tb);
+                                    app.sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry {
                                         command: trimmed,
                                         output: String::new(),
                                         status: 0,
@@ -12480,26 +11682,26 @@ fn run_command_mode(
                                     return CommandModeOutcome::Ran { output: String::new(), status: 0 };
                                 }
                                 Err(e) => {
-                                    show_command_mode_error(&write_error(tb, &e), *term_rows, *term_cols);
+                                    show_command_mode_error(&write_error(tb, &e), app.term_rows, app.term_cols);
                                     buffer.clear();
                                     continue;
                                 }
                             }
                         }
                         "w" | "write" => {
-                            run_hooks(sessions, session_id, "editor:file:write:pre", tb);
+                            run_hooks(&mut app.sessions, session_id, "editor:file:write:pre", tb);
                             fileeditor::run_pre_save_hooks(tb);
                             match tb.save(arg.map(std::path::Path::new)) {
                                 Ok(()) => {
-                                    fileeditor::set_last_filename(tb, registers);
+                                    fileeditor::set_last_filename(tb, &mut app.registers);
                                     // After the bytes are really on
                                     // disk, so a hook that formats or
                                     // reloads is looking at what was
                                     // written rather than what was
                                     // about to be.
-                                    run_hooks(sessions, session_id, "editor:file:write:post", tb);
-                                    save_language_server_document(sessions, session_id, tb);
-                                    sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry {
+                                    run_hooks(&mut app.sessions, session_id, "editor:file:write:post", tb);
+                                    save_language_server_document(&mut app.sessions, session_id, tb);
+                                    app.sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry {
                                         command: trimmed,
                                         output: String::new(),
                                         status: 0,
@@ -12507,7 +11709,7 @@ fn run_command_mode(
                                     return CommandModeOutcome::Ran { output: String::new(), status: 0 };
                                 }
                                 Err(e) => {
-                                    show_command_mode_error(&write_error(tb, &e), *term_rows, *term_cols);
+                                    show_command_mode_error(&write_error(tb, &e), app.term_rows, app.term_cols);
                                     buffer.clear();
                                     continue;
                                 }
@@ -12517,8 +11719,8 @@ fn run_command_mode(
                             fileeditor::run_pre_save_hooks(tb);
                             match tb.save(arg.map(std::path::Path::new)) {
                                 Ok(()) => {
-                                    fileeditor::set_last_filename(tb, registers);
-                                    sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry {
+                                    fileeditor::set_last_filename(tb, &mut app.registers);
+                                    app.sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry {
                                         command: trimmed,
                                         output: String::new(),
                                         status: 0,
@@ -12526,19 +11728,19 @@ fn run_command_mode(
                                     return CommandModeOutcome::Quit;
                                 }
                                 Err(e) => {
-                                    show_command_mode_error(&write_error(tb, &e), *term_rows, *term_cols);
+                                    show_command_mode_error(&write_error(tb, &e), app.term_rows, app.term_cols);
                                     buffer.clear();
                                     continue;
                                 }
                             }
                         }
                         "q" if tb.is_dirty() => {
-                            show_command_mode_error("bish: E37: No write since last change (add ! to override)", *term_rows, *term_cols);
+                            show_command_mode_error("bish: E37: No write since last change (add ! to override)", app.term_rows, app.term_cols);
                             buffer.clear();
                             continue;
                         }
                         "q" | "q!" => {
-                            sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry {
+                            app.sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry {
                                 command: trimmed,
                                 output: String::new(),
                                 status: 0,
@@ -12572,7 +11774,7 @@ fn run_command_mode(
                             // `clear` reversible rather than permanent
                             // until the next edit -- which for a file
                             // nobody goes on to touch is never.
-                            redeliver_language_server_diagnostics(sessions, session_id, tb);
+                            redeliver_language_server_diagnostics(&mut app.sessions, session_id, tb);
                             let mut merged = fileeditor::diagnose_buffer(tb);
                             merged.extend(tb.diagnostics.iter().filter(|d| d.source.is_some()).cloned());
                             merged.sort_by_key(|d| (d.start, d.end));
@@ -12591,10 +11793,10 @@ fn run_command_mode(
                             // still on top of this window's focused
                             // pane's own stack for the whole time this
                             // command-mode loop is driving it.
-                            if let Some(Frame::Edit(edit_frame_id)) = windows[*current_window].stack().last().copied() {
-                                sync_diagnostics_pane(sessions, windows, *current_window, next_session_id, edit_frame_id, &tb.diagnostics, *term_rows, *term_cols);
+                            if let Some(Frame::Edit(edit_frame_id)) = app.windows[app.current_window].stack().last().copied() {
+                                sync_diagnostics_pane(app, edit_frame_id, &tb.diagnostics);
                             }
-                            sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry { command: trimmed, output, status: 0 });
+                            app.sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry { command: trimmed, output, status: 0 });
                             // Empty `Ran` output (not the count message
                             // itself, still recorded above for `Ctrl-L`'s
                             // own transcript) -- unlike every other
@@ -12627,17 +11829,17 @@ fn run_command_mode(
                             // that visibly left some behind would read
                             // as broken.
                             tb.diagnostics.clear();
-                            if let Some(Frame::Edit(edit_frame_id)) = windows[*current_window].stack().last().copied()
-                                && let Some(pane_id) = diagnostics_sibling(&windows[*current_window], edit_frame_id)
+                            if let Some(Frame::Edit(edit_frame_id)) = app.windows[app.current_window].stack().last().copied()
+                                && let Some(pane_id) = diagnostics_sibling(&app.windows[app.current_window], edit_frame_id)
                             {
-                                close_pane(&mut windows[*current_window], pane_id);
-                                close_orphaned_sessions(sessions, windows);
+                                close_pane(&mut app.windows[app.current_window], pane_id);
+                                close_orphaned_sessions(&mut app.sessions, &app.windows);
                             }
-                            sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry { command: trimmed, output: String::new(), status: 0 });
+                            app.sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry { command: trimmed, output: String::new(), status: 0 });
                             return CommandModeOutcome::Ran { output: String::new(), status: 0 };
                         }
                         "diag" | "diagnose" => {
-                            show_command_mode_error(&format!("bish: diag: unknown subcommand '{}' (expected: clear)", arg.unwrap_or_default()), *term_rows, *term_cols);
+                            show_command_mode_error(&format!("bish: diag: unknown subcommand '{}' (expected: clear)", arg.unwrap_or_default()), app.term_rows, app.term_cols);
                             buffer.clear();
                             continue;
                         }
@@ -12647,7 +11849,7 @@ fn run_command_mode(
                         // `n` and `N` included, so this is never a mode
                         // anyone has to leave.
                         "noh" | "nohl" | "nohlsearch" => {
-                            sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry { command: trimmed.clone(), output: String::new(), status: 0 });
+                            app.sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry { command: trimmed.clone(), output: String::new(), status: 0 });
                             return CommandModeOutcome::NoHighlight;
                         }
                         // `sym QUERY`: what the language server knows by
@@ -12667,7 +11869,7 @@ fn run_command_mode(
                         // survivable.
                         "sym" | "symbols" => {
                             let query = arg.unwrap_or_default().to_string();
-                            sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry { command: trimmed.clone(), output: String::new(), status: 0 });
+                            app.sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry { command: trimmed.clone(), output: String::new(), status: 0 });
                             return CommandModeOutcome::Symbols(query);
                         }
                         // `diff` (bare, no `git` prefix): the same +/~/-
@@ -12684,7 +11886,7 @@ fn run_command_mode(
                         "diff" if arg.is_none() => match fileeditor::toggle_buffer_diff(tb) {
                             Ok(on) => {
                                 let output = if on { "Diff markers on.".to_string() } else { "Diff markers off.".to_string() };
-                                sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry {
+                                app.sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry {
                                     command: trimmed,
                                     output: output.clone(),
                                     status: 0,
@@ -12692,13 +11894,13 @@ fn run_command_mode(
                                 return CommandModeOutcome::Ran { output, status: 0 };
                             }
                             Err(e) => {
-                                show_command_mode_error(&format!("bish: diff: {e}"), *term_rows, *term_cols);
+                                show_command_mode_error(&format!("bish: diff: {e}"), app.term_rows, app.term_cols);
                                 buffer.clear();
                                 continue;
                             }
                         },
                         "diff" => {
-                            show_command_mode_error(&format!("bish: diff: unexpected argument '{}'", arg.unwrap_or_default()), *term_rows, *term_cols);
+                            show_command_mode_error(&format!("bish: diff: unexpected argument '{}'", arg.unwrap_or_default()), app.term_rows, app.term_cols);
                             buffer.clear();
                             continue;
                         }
@@ -12718,25 +11920,13 @@ fn run_command_mode(
                         // `:format`.
                         "rename" | "rn" => {
                             let Some(new_name) = arg.filter(|a| !a.trim().is_empty()) else {
-                                show_command_mode_error("bish: rename: usage: :rename NEW-NAME", *term_rows, *term_cols);
+                                show_command_mode_error("bish: rename: usage: :rename NEW-NAME", app.term_rows, app.term_cols);
                                 buffer.clear();
                                 continue;
                             };
-                            match rename_via_server(
-                                sessions,
-                                windows,
-                                job_frames,
-                                edit_frames,
-                                session_id,
-                                *current_window,
-                                term_rows,
-                                term_cols,
-                                sinks_are_grid,
-                                tb,
-                                new_name.trim(),
-                            ) {
+                            match rename_via_server(app, session_id, tb, new_name.trim()) {
                                 Ok(output) => {
-                                    sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry {
+                                    app.sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry {
                                         command: trimmed,
                                         output: output.clone(),
                                         status: 0,
@@ -12744,7 +11934,7 @@ fn run_command_mode(
                                     return CommandModeOutcome::Ran { output, status: 0 };
                                 }
                                 Err(e) => {
-                                    show_command_mode_error(&format!("bish: rename: {e}"), *term_rows, *term_cols);
+                                    show_command_mode_error(&format!("bish: rename: {e}"), app.term_rows, app.term_cols);
                                     buffer.clear();
                                     continue;
                                 }
@@ -12755,17 +11945,7 @@ fn run_command_mode(
                             // knows the actual language, where
                             // `format_buffer` knows bash. Everything
                             // about the fallback is unchanged.
-                            let served = format_via_server(
-                                sessions,
-                                windows,
-                                job_frames,
-                                session_id,
-                                *current_window,
-                                term_rows,
-                                term_cols,
-                                sinks_are_grid,
-                                tb,
-                            );
+                            let served = format_via_server(app, session_id, tb);
                             let outcome = match served {
                                 Some(0) => fileeditor::FormatOutcome::AlreadyFormatted,
                                 Some(_) => fileeditor::FormatOutcome::Formatted,
@@ -12775,21 +11955,21 @@ fn run_command_mode(
                                 fileeditor::FormatOutcome::Formatted => ("Reformatted.".to_string(), 0),
                                 fileeditor::FormatOutcome::AlreadyFormatted => ("Already formatted.".to_string(), 0),
                                 fileeditor::FormatOutcome::NotSupported => {
-                                    show_command_mode_error("bish: format: no formatter for this filetype", *term_rows, *term_cols);
+                                    show_command_mode_error("bish: format: no formatter for this filetype", app.term_rows, app.term_cols);
                                     buffer.clear();
                                     continue;
                                 }
                                 fileeditor::FormatOutcome::Error(e) => {
-                                    show_command_mode_error(&format!("bish: format: {e}"), *term_rows, *term_cols);
+                                    show_command_mode_error(&format!("bish: format: {e}"), app.term_rows, app.term_cols);
                                     buffer.clear();
                                     continue;
                                 }
                             };
-                            sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry { command: trimmed, output: output.clone(), status });
+                            app.sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry { command: trimmed, output: output.clone(), status });
                             return CommandModeOutcome::Ran { output, status };
                         }
                         "format" | "fmt" => {
-                            show_command_mode_error(&format!("bish: format: unexpected argument '{}'", arg.unwrap_or_default()), *term_rows, *term_cols);
+                            show_command_mode_error(&format!("bish: format: unexpected argument '{}'", arg.unwrap_or_default()), app.term_rows, app.term_cols);
                             buffer.clear();
                             continue;
                         }
@@ -12808,7 +11988,7 @@ fn run_command_mode(
                         // runs while that's true, same as `diag`'s own
                         // identical lookup just above).
                         "dbg" | "debug" => {
-                            let Some(Frame::Edit(edit_frame_id)) = windows[*current_window].stack().last().copied() else {
+                            let Some(Frame::Edit(edit_frame_id)) = app.windows[app.current_window].stack().last().copied() else {
                                 unreachable!("this whole match arm only runs while editing a real Frame::Edit pane")
                             };
                             let (subcmd, subarg) = match arg {
@@ -12828,38 +12008,38 @@ fn run_command_mode(
                                 // would silently debug something other
                                 // than what's on screen.
                                 "" if subarg.is_none() => {
-                                    if debug_frames.contains_key(&edit_frame_id) {
+                                    if app.debug_frames.contains_key(&edit_frame_id) {
                                         let output = "already attached -- :dbg run to start, :dbg quit to detach".to_string();
-                                        sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry { command: trimmed, output: output.clone(), status: 0 });
+                                        app.sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry { command: trimmed, output: output.clone(), status: 0 });
                                         return CommandModeOutcome::Ran { output, status: 0 };
                                     }
                                     if tb.is_dirty() {
-                                        show_command_mode_error("bish: dbg: E37: no write since last change -- save first with :w", *term_rows, *term_cols);
+                                        show_command_mode_error("bish: dbg: E37: no write since last change -- save first with :w", app.term_rows, app.term_cols);
                                         buffer.clear();
                                         continue;
                                     }
                                     let Some(path) = tb.path().map(|p| p.to_path_buf()) else {
-                                        show_command_mode_error("bish: dbg: no file name", *term_rows, *term_cols);
+                                        show_command_mode_error("bish: dbg: no file name", app.term_rows, app.term_cols);
                                         buffer.clear();
                                         continue;
                                     };
                                     let session = match debugger::DebugSession::attach(&path) {
                                         Ok(s) => s,
                                         Err(e) => {
-                                            show_command_mode_error(&format!("bish: dbg: {}: {e}", path.display()), *term_rows, *term_cols);
+                                            show_command_mode_error(&format!("bish: dbg: {}: {e}", path.display()), app.term_rows, app.term_cols);
                                             buffer.clear();
                                             continue;
                                         }
                                     };
-                                    debug_frames.insert(edit_frame_id, session);
+                                    app.debug_frames.insert(edit_frame_id, session);
                                     tb.set_readonly(true);
-                                    let pane_id = debug_run_sibling(&windows[*current_window], edit_frame_id)
-                                        .unwrap_or_else(|| split_debug_run_pane(sessions, windows, *current_window, next_session_id, edit_frame_id, *term_rows, *term_cols).0);
-                                    let sid = windows[*current_window].pane(pane_id).owning_session();
-                                    render_debug_run_title(&sessions[&sid].screen, *term_cols, "attached -- :dbg run to start");
-                                    compositor_redraw(sessions, windows, *current_window, *term_rows, *term_cols);
+                                    let pane_id = debug_run_sibling(&app.windows[app.current_window], edit_frame_id)
+                                        .unwrap_or_else(|| split_debug_run_pane(app, edit_frame_id).0);
+                                    let sid = app.windows[app.current_window].pane(pane_id).owning_session();
+                                    render_debug_run_title(&app.sessions[&sid].screen, app.term_cols, "attached -- :dbg run to start");
+                                    compositor_redraw(app);
                                     let output = "attached -- read-only until :dbg quit; :dbg run to start, :dbg break [line] to set a breakpoint".to_string();
-                                    sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry { command: trimmed, output: output.clone(), status: 0 });
+                                    app.sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry { command: trimmed, output: output.clone(), status: 0 });
                                     return CommandModeOutcome::Ran { output, status: 0 };
                                 }
                                 // `:dbg run`: the only thing that ever
@@ -12879,52 +12059,59 @@ fn run_command_mode(
                                 // explicitly below for the same reason
                                 // the original code did.
                                 "run" if subarg.is_none() => {
-                                    let Some(session) = debug_frames.get_mut(&edit_frame_id) else {
-                                        show_command_mode_error("bish: dbg: not attached -- use :dbg to attach", *term_rows, *term_cols);
+                                    // Only checked here; the session
+                                    // itself is taken out further down,
+                                    // right where it is used. Holding it
+                                    // across the pane arithmetic in
+                                    // between would hold a borrow of
+                                    // `app` across all of it.
+                                    if !app.debug_frames.contains_key(&edit_frame_id) {
+                                        show_command_mode_error("bish: dbg: not attached -- use :dbg to attach", app.term_rows, app.term_cols);
                                         buffer.clear();
                                         continue;
-                                    };
+                                    }
                                     let Some(path) = tb.path().map(|p| p.to_path_buf()) else {
-                                        show_command_mode_error("bish: dbg: no file name", *term_rows, *term_cols);
+                                        show_command_mode_error("bish: dbg: no file name", app.term_rows, app.term_cols);
                                         buffer.clear();
                                         continue;
                                     };
-                                    let pane_id = debug_run_sibling(&windows[*current_window], edit_frame_id)
-                                        .unwrap_or_else(|| split_debug_run_pane(sessions, windows, *current_window, next_session_id, edit_frame_id, *term_rows, *term_cols).0);
-                                    let budget = editor_pane_for(&windows[*current_window], edit_frame_id)
-                                        .map(|id| pane_rect(&windows[*current_window], id, *term_rows, *term_cols).rows + 1)
-                                        .unwrap_or(*term_rows);
+                                    let pane_id = debug_run_sibling(&app.windows[app.current_window], edit_frame_id)
+                                        .unwrap_or_else(|| split_debug_run_pane(app, edit_frame_id).0);
+                                    let budget = editor_pane_for(&app.windows[app.current_window], edit_frame_id)
+                                        .map(|id| pane_rect(&app.windows[app.current_window], id, app.term_rows, app.term_cols).rows + 1)
+                                        .unwrap_or(app.term_rows);
                                     let rows = (budget / 2).max(6).min(budget.saturating_sub(3).max(1));
-                                    if let Some((_, children, idx)) = find_parent_split_mut(&mut windows[*current_window].layout, pane_id) {
+                                    if let Some((_, children, idx)) = find_parent_split_mut(&mut app.windows[app.current_window].layout, pane_id) {
                                         children[idx].minimized = false;
                                         children[idx].fixed = Some(rows);
                                     }
                                     // Going to a pane is how you get a minimized one back.
-                                    restore_if_minimized(&mut windows[*current_window], pane_id);
-                                    windows[*current_window].focused_pane = pane_id;
-                                    compositor_redraw(sessions, windows, *current_window, *term_rows, *term_cols);
-                                    let run_rect = pane_rect(&windows[*current_window], pane_id, *term_rows, *term_cols);
+                                    restore_if_minimized(&mut app.windows[app.current_window], pane_id);
+                                    app.windows[app.current_window].focused_pane = pane_id;
+                                    compositor_redraw(app);
+                                    let run_rect = pane_rect(&app.windows[app.current_window], pane_id, app.term_rows, app.term_cols);
                                     // The real editor pane's own rect --
                                     // a pause paints straight into this
                                     // (see debugger.rs's own top-of-file
                                     // doc comment), not `run_rect`, which
                                     // stays reserved for the script's own
                                     // live/handed-off output.
-                                    let Some(editor_pane) = editor_pane_for(&windows[*current_window], edit_frame_id) else {
+                                    let Some(editor_pane) = editor_pane_for(&app.windows[app.current_window], edit_frame_id) else {
                                         unreachable!("this whole match arm only runs while editing a real Frame::Edit pane")
                                     };
-                                    let editor_rect = pane_rect(&windows[*current_window], editor_pane, *term_rows, *term_cols);
+                                    let editor_rect = pane_rect(&app.windows[app.current_window], editor_pane, app.term_rows, app.term_cols);
 
                                     let (quit_requested, nav_cursor) = match term::RawGuard::enable_with_mouse(0) {
                                         Ok(guard) => {
-                                            let hook = match debugger::PauseState::new(&path, tb.breakpoints.clone(), run_rect, editor_rect, *term_rows, *term_cols, Rc::new(guard)) {
+                                            let hook = match debugger::PauseState::new(&path, tb.breakpoints.clone(), run_rect, editor_rect, app.term_rows, app.term_cols, Rc::new(guard)) {
                                                 Ok(h) => Rc::new(RefCell::new(h)),
                                                 Err(e) => {
-                                                    show_command_mode_error(&format!("bish: dbg: {}: {e}", path.display()), *term_rows, *term_cols);
+                                                    show_command_mode_error(&format!("bish: dbg: {}: {e}", path.display()), app.term_rows, app.term_cols);
                                                     buffer.clear();
                                                     continue;
                                                 }
                                             };
+                                            let session = app.debug_frames.get_mut(&edit_frame_id).expect("checked before the pane was split");
                                             let src = session.source().to_string();
                                             session.shell.set_debug_hook(Some(hook.clone() as Rc<RefCell<dyn DebugHook>>));
                                             session.shell.run_source_here(&src, &trimmed);
@@ -12934,16 +12121,16 @@ fn run_command_mode(
                                             (hook.borrow().quit_requested(), hook.borrow().nav_cursor())
                                         }
                                         Err(_) => {
-                                            show_command_mode_error("bish: dbg: not a terminal", *term_rows, *term_cols);
+                                            show_command_mode_error("bish: dbg: not a terminal", app.term_rows, app.term_cols);
                                             (false, None)
                                         }
                                     };
 
-                                    if let Some((_, children, idx)) = find_parent_split_mut(&mut windows[*current_window].layout, pane_id) {
+                                    if let Some((_, children, idx)) = find_parent_split_mut(&mut app.windows[app.current_window].layout, pane_id) {
                                         children[idx].minimized = true;
                                         children[idx].fixed = None;
                                     }
-                                    windows[*current_window].focused_pane = editor_pane;
+                                    app.windows[app.current_window].focused_pane = editor_pane;
                                     // A pause navigated `tb`'s own stand-
                                     // in copy around (debugger.rs's own
                                     // `nav_buf`) -- carry that cursor
@@ -12955,18 +12142,18 @@ fn run_command_mode(
                                     }
                                     let status = if quit_requested {
                                         tb.set_readonly(false);
-                                        debug_frames.remove(&edit_frame_id);
-                                        close_pane(&mut windows[*current_window], pane_id);
-                                        close_orphaned_sessions(sessions, windows);
+                                        app.debug_frames.remove(&edit_frame_id);
+                                        close_pane(&mut app.windows[app.current_window], pane_id);
+                                        close_orphaned_sessions(&mut app.sessions, &app.windows);
                                         "quit"
                                     } else {
-                                        let sid = windows[*current_window].pane(pane_id).owning_session();
-                                        render_debug_run_title(&sessions[&sid].screen, *term_cols, "run finished -- :dbg run to run again");
+                                        let sid = app.windows[app.current_window].pane(pane_id).owning_session();
+                                        render_debug_run_title(&app.sessions[&sid].screen, app.term_cols, "run finished -- :dbg run to run again");
                                         "run finished"
                                     };
-                                    compositor_redraw(sessions, windows, *current_window, *term_rows, *term_cols);
+                                    compositor_redraw(app);
                                     let output = status.to_string();
-                                    sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry { command: trimmed, output: output.clone(), status: 0 });
+                                    app.sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry { command: trimmed, output: output.clone(), status: 0 });
                                     return CommandModeOutcome::Ran { output, status: 0 };
                                 }
                                 // `:dbg continue`/`next`/`step`: only ever
@@ -12982,14 +12169,14 @@ fn run_command_mode(
                                 // sharing the name, purely for an honest
                                 // error instead of "unknown subcommand".
                                 "continue" | "next" | "step" if subarg.is_none() => {
-                                    show_command_mode_error("bish: dbg: not paused -- these only work while stopped at a breakpoint", *term_rows, *term_cols);
+                                    show_command_mode_error("bish: dbg: not paused -- these only work while stopped at a breakpoint", app.term_rows, app.term_cols);
                                     buffer.clear();
                                     continue;
                                 }
                                 // `:dbg break [line]` / `:dbg break add|remove N`.
                                 "break" => {
-                                    if !debug_frames.contains_key(&edit_frame_id) {
-                                        show_command_mode_error("bish: dbg: not attached -- use :dbg to attach", *term_rows, *term_cols);
+                                    if !app.debug_frames.contains_key(&edit_frame_id) {
+                                        show_command_mode_error("bish: dbg: not attached -- use :dbg to attach", app.term_rows, app.term_cols);
                                         buffer.clear();
                                         continue;
                                     }
@@ -13013,7 +12200,7 @@ fn run_command_mode(
                                                         format!("breakpoint added at line {n}")
                                                     }
                                                     Err(_) => {
-                                                        show_command_mode_error(&format!("bish: dbg: {n}: invalid line number"), *term_rows, *term_cols);
+                                                        show_command_mode_error(&format!("bish: dbg: {n}: invalid line number"), app.term_rows, app.term_cols);
                                                         buffer.clear();
                                                         continue;
                                                     }
@@ -13024,7 +12211,7 @@ fn run_command_mode(
                                                         format!("breakpoint removed at line {n}")
                                                     }
                                                     Err(_) => {
-                                                        show_command_mode_error(&format!("bish: dbg: {n}: invalid line number"), *term_rows, *term_cols);
+                                                        show_command_mode_error(&format!("bish: dbg: {n}: invalid line number"), app.term_rows, app.term_cols);
                                                         buffer.clear();
                                                         continue;
                                                     }
@@ -13037,7 +12224,7 @@ fn run_command_mode(
                                                         format!("breakpoint toggled at line {n}")
                                                     }
                                                     Err(_) => {
-                                                        show_command_mode_error(&format!("bish: dbg: {rest}: invalid line number (expected: [line], add N, remove N)"), *term_rows, *term_cols);
+                                                        show_command_mode_error(&format!("bish: dbg: {rest}: invalid line number (expected: [line], add N, remove N)"), app.term_rows, app.term_cols);
                                                         buffer.clear();
                                                         continue;
                                                     }
@@ -13045,18 +12232,18 @@ fn run_command_mode(
                                             }
                                         }
                                     };
-                                    sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry { command: trimmed, output: output.clone(), status: 0 });
+                                    app.sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry { command: trimmed, output: output.clone(), status: 0 });
                                     return CommandModeOutcome::Ran { output, status: 0 };
                                 }
                                 // `:dbg print NAME`.
                                 "print" | "p" => {
-                                    let Some(session) = debug_frames.get(&edit_frame_id) else {
-                                        show_command_mode_error("bish: dbg: not attached -- use :dbg to attach", *term_rows, *term_cols);
+                                    let Some(session) = app.debug_frames.get(&edit_frame_id) else {
+                                        show_command_mode_error("bish: dbg: not attached -- use :dbg to attach", app.term_rows, app.term_cols);
                                         buffer.clear();
                                         continue;
                                     };
                                     let Some(name) = subarg else {
-                                        show_command_mode_error("bish: dbg: usage: dbg print NAME", *term_rows, *term_cols);
+                                        show_command_mode_error("bish: dbg: usage: dbg print NAME", app.term_rows, app.term_cols);
                                         buffer.clear();
                                         continue;
                                     };
@@ -13064,33 +12251,33 @@ fn run_command_mode(
                                         Some(v) => format!("{name} = {v}"),
                                         None => format!("{name}: unset or not inspectable"),
                                     };
-                                    sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry { command: trimmed, output: output.clone(), status: 0 });
+                                    app.sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry { command: trimmed, output: output.clone(), status: 0 });
                                     return CommandModeOutcome::Ran { output, status: 0 };
                                 }
                                 // `:dbg quit`: detach -- writable again,
-                                // drops the debug_frames entry, closes
+                                // drops the app.debug_frames entry, closes
                                 // the DebugRun sibling if one exists.
                                 "quit" | "q" if subarg.is_none() => {
-                                    if debug_frames.remove(&edit_frame_id).is_some() {
+                                    if app.debug_frames.remove(&edit_frame_id).is_some() {
                                         tb.set_readonly(false);
-                                        if let Some(pane_id) = debug_run_sibling(&windows[*current_window], edit_frame_id) {
-                                            close_pane(&mut windows[*current_window], pane_id);
-                                            close_orphaned_sessions(sessions, windows);
+                                        if let Some(pane_id) = debug_run_sibling(&app.windows[app.current_window], edit_frame_id) {
+                                            close_pane(&mut app.windows[app.current_window], pane_id);
+                                            close_orphaned_sessions(&mut app.sessions, &app.windows);
                                         }
-                                        compositor_redraw(sessions, windows, *current_window, *term_rows, *term_cols);
+                                        compositor_redraw(app);
                                     }
-                                    sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry { command: trimmed, output: String::new(), status: 0 });
+                                    app.sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry { command: trimmed, output: String::new(), status: 0 });
                                     return CommandModeOutcome::Ran { output: String::new(), status: 0 };
                                 }
                                 "help" | "h" | "?" if subarg.is_none() => {
-                                    sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry { command: trimmed, output: DBG_HELP_TEXT.to_string(), status: 0 });
+                                    app.sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry { command: trimmed, output: DBG_HELP_TEXT.to_string(), status: 0 });
                                     return CommandModeOutcome::Ran { output: DBG_HELP_TEXT.to_string(), status: 0 };
                                 }
                                 _ => {
                                     show_command_mode_error(
                                         &format!("bish: dbg: unknown subcommand '{subcmd}' (expected: run, break, continue, next, step, print, quit, help)"),
-                                        *term_rows,
-                                        *term_cols,
+                                        app.term_rows,
+                                        app.term_cols,
                                     );
                                     buffer.clear();
                                     continue;
@@ -13135,12 +12322,13 @@ fn run_command_mode(
                                 _ => "bish help  (q to close)",
                             };
                             let source = match arg {
-                                Some("options") => sessions.get(&session_id).map(|s| options_help(&s.shell)).unwrap_or_default(),
+                                Some("options") => app.sessions.get(&session_id).map(|s| options_help(&s.shell)).unwrap_or_default(),
                                 Some("hooks") => hooks_help(),
                                 Some("keys") => keys_help(),
                                 _ => EDITOR_HELP_MARKDOWN.to_string(),
                             };
                             run_pager(
+                                app,
                                 title,
                                 PagerSource {
                                     language: "markdown".to_string(),
@@ -13151,18 +12339,11 @@ fn run_command_mode(
                                     // since the help page's own links
                                     // are all absolute or none.
                                     links: LinkOptions {
-                                        hyperlinks: sessions.get(&session_id).is_none_or(|s| s.shell.bishopt_bool("hyperlinks")),
+                                        hyperlinks: app.sessions.get(&session_id).is_none_or(|s| s.shell.bishopt_bool("hyperlinks")),
                                         base_dir: None,
-                                        colors: sessions.get(&session_id).map(|s| ui_colors(&s.shell)),
+                                        colors: app.sessions.get(&session_id).map(|s| ui_colors(&s.shell)),
                                     },
                                 },
-                                sessions,
-                                windows,
-                                job_frames,
-                                current_window,
-                                term_rows,
-                                term_cols,
-                                sinks_are_grid,
                             );
                             // Cancelled, not Ran: the pager has already
                             // shown everything there was to show, and an
@@ -13183,13 +12364,13 @@ fn run_command_mode(
                             let links = LinkOptions {
                                 hyperlinks: tb.hyperlinks,
                                 base_dir: tb.path().and_then(|p| p.parent()).map(|p| p.to_path_buf()),
-                                colors: sessions.get(&session_id).map(|s| ui_colors(&s.shell)),
+                                colors: app.sessions.get(&session_id).map(|s| ui_colors(&s.shell)),
                             };
-                            if preview_document(&language, &source, *term_cols, &links).is_none() {
+                            if preview_document(&language, &source, app.term_cols, &links).is_none() {
                                 show_command_mode_error(
                                     &format!("bish: preview: nothing to render for a {language} file (markdown and roff have previews)"),
-                                    *term_rows,
-                                    *term_cols,
+                                    app.term_rows,
+                                    app.term_cols,
                                 );
                                 buffer.clear();
                                 continue;
@@ -13199,21 +12380,11 @@ fn run_command_mode(
                                 .and_then(|p| p.file_name())
                                 .map(|n| n.to_string_lossy().into_owned())
                                 .unwrap_or_else(|| "preview".to_string());
-                            run_pager(
-                                &format!("{name}  (q to close)"),
-                                PagerSource { language, source, links },
-                                sessions,
-                                windows,
-                                job_frames,
-                                current_window,
-                                term_rows,
-                                term_cols,
-                                sinks_are_grid,
-                            );
+                            run_pager(app, &format!("{name}  (q to close)"), PagerSource { language, source, links });
                             return CommandModeOutcome::Cancelled;
                         }
                         "help" | "h" | "?" => {
-                            show_command_mode_error(&format!("bish: help: unexpected argument '{}' (no help topics yet -- just `:help`)", arg.unwrap_or_default()), *term_rows, *term_cols);
+                            show_command_mode_error(&format!("bish: help: unexpected argument '{}' (no help topics yet -- just `:help`)", arg.unwrap_or_default()), app.term_rows, app.term_cols);
                             buffer.clear();
                             continue;
                         }
@@ -13236,7 +12407,7 @@ fn run_command_mode(
                         // counts as a valid revision).
                         "git" => {
                             if !crate::git::available() {
-                                show_command_mode_error("bish: git: git executable not found", *term_rows, *term_cols);
+                                show_command_mode_error("bish: git: git executable not found", app.term_rows, app.term_cols);
                                 buffer.clear();
                                 continue;
                             }
@@ -13246,7 +12417,7 @@ fn run_command_mode(
                                     None => (a, None),
                                 },
                                 None => {
-                                    show_command_mode_error("bish: git: missing subcommand (expected: blame, diff)", *term_rows, *term_cols);
+                                    show_command_mode_error("bish: git: missing subcommand (expected: blame, diff)", app.term_rows, app.term_cols);
                                     buffer.clear();
                                     continue;
                                 }
@@ -13259,8 +12430,8 @@ fn run_command_mode(
                             if subarg.is_some_and(|a| a.split_whitespace().count() > 1) {
                                 show_command_mode_error(
                                     &format!("bish: git: {subcmd}: expected at most one revision, got '{}'", subarg.unwrap_or_default()),
-                                    *term_rows,
-                                    *term_cols,
+                                    app.term_rows,
+                                    app.term_cols,
                                 );
                                 buffer.clear();
                                 continue;
@@ -13280,7 +12451,7 @@ fn run_command_mode(
                                     Ok(on) => {
                                         let output =
                                             if on { format!("Blame on{against}.") } else { "Blame off.".to_string() };
-                                        sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry {
+                                        app.sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry {
                                             command: trimmed,
                                             output: output.clone(),
                                             status: 0,
@@ -13288,7 +12459,7 @@ fn run_command_mode(
                                         return CommandModeOutcome::Ran { output, status: 0 };
                                     }
                                     Err(e) => {
-                                        show_command_mode_error(&format!("bish: git: blame: {e}"), *term_rows, *term_cols);
+                                        show_command_mode_error(&format!("bish: git: blame: {e}"), app.term_rows, app.term_cols);
                                         buffer.clear();
                                         continue;
                                     }
@@ -13306,7 +12477,7 @@ fn run_command_mode(
                                         } else {
                                             "Diff markers off.".to_string()
                                         };
-                                        sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry {
+                                        app.sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry {
                                             command: trimmed,
                                             output: output.clone(),
                                             status: 0,
@@ -13314,13 +12485,13 @@ fn run_command_mode(
                                         return CommandModeOutcome::Ran { output, status: 0 };
                                     }
                                     Err(e) => {
-                                        show_command_mode_error(&format!("bish: git: diff: {e}"), *term_rows, *term_cols);
+                                        show_command_mode_error(&format!("bish: git: diff: {e}"), app.term_rows, app.term_cols);
                                         buffer.clear();
                                         continue;
                                     }
                                 },
                                 other => {
-                                    show_command_mode_error(&format!("bish: git: unknown subcommand '{}' (expected: blame, diff)", other), *term_rows, *term_cols);
+                                    show_command_mode_error(&format!("bish: git: unknown subcommand '{}' (expected: blame, diff)", other), app.term_rows, app.term_cols);
                                     buffer.clear();
                                     continue;
                                 }
@@ -13342,7 +12513,7 @@ fn run_command_mode(
                     // the user typed and command mode acted on, so
                     // leaving it out of the transcript would read as if
                     // it never happened.
-                    sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry {
+                    app.sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry {
                         command: trimmed,
                         output: String::new(),
                         status: 0,
@@ -13351,25 +12522,25 @@ fn run_command_mode(
                 }
 
                 match Lexer::new(&buffer).tokenize() {
-                    Ok(toks) => match Parser::new(sessions.get(&session_id).map(|s| s.shell.expand_aliases(toks.clone())).unwrap_or(toks)).parse_program() {
+                    Ok(toks) => match Parser::new(app.sessions.get(&session_id).map(|s| s.shell.expand_aliases(toks.clone())).unwrap_or(toks)).parse_program() {
                         Ok(prog) => {
                             if let Some(msg) = command_mode_violation(&prog) {
-                                show_command_mode_error(&format!("bish: {}", msg), *term_rows, *term_cols);
+                                show_command_mode_error(&format!("bish: {}", msg), app.term_rows, app.term_cols);
                                 buffer.clear();
                             } else {
                                 // No meaningful shell context here -- this
                                 // is command mode's own, entirely
-                                // separate history of window-management
+                                // separate app.cmd_history of window-management
                                 // commands, not shell command lines, so
                                 // there's no cwd worth tagging it with
                                 // (same reasoning its own read_line call
                                 // already uses for HighlightContext::default()
                                 // and a None completion provider).
                                 if !buffer_unrecorded {
-                                    history.record(&buffer, None);
+                                    app.cmd_history.record(&buffer, None);
                                 }
                                 let (result, captured_text) = {
-                                    let session = sessions.get_mut(&session_id).unwrap();
+                                    let session = app.sessions.get_mut(&session_id).unwrap();
                                     let captured = Rc::new(RefCell::new(String::new()));
                                     session.shell.set_sink_capture(captured.clone());
                                     session.shell.restrict_to_builtins = true;
@@ -13399,7 +12570,7 @@ fn run_command_mode(
                                         // Ran's own overlay treatment since
                                         // it leaves normal mode entirely
                                         // rather than returning to it.
-                                        sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry {
+                                        app.sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry {
                                             command: trimmed,
                                             output: captured_text,
                                             status: 0,
@@ -13426,9 +12597,9 @@ fn run_command_mode(
                                     // compositor_redraw before the caller
                                     // even sees this outcome.
                                     ExecResult::Fg => {
-                                        sessions.get_mut(&session_id).unwrap().shell.discard_pending_fg();
+                                        app.sessions.get_mut(&session_id).unwrap().shell.discard_pending_fg();
                                         let output = "bish: fg: not supported in command mode -- use it from the normal shell prompt".to_string();
-                                        sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry { command: trimmed, output: output.clone(), status: 1 });
+                                        app.sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry { command: trimmed, output: output.clone(), status: 1 });
                                         return CommandModeOutcome::Ran { output, status: 1 };
                                     }
                                     // Same reasoning as Fg just above --
@@ -13436,9 +12607,9 @@ fn run_command_mode(
                                     // no way to drive an interactive
                                     // editor session either.
                                     ExecResult::Edit => {
-                                        sessions.get_mut(&session_id).unwrap().shell.take_pending_edit();
+                                        app.sessions.get_mut(&session_id).unwrap().shell.take_pending_edit();
                                         let output = "bish: e: not supported in command mode -- use it from the normal shell prompt".to_string();
-                                        sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry { command: trimmed, output: output.clone(), status: 1 });
+                                        app.sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry { command: trimmed, output: output.clone(), status: 1 });
                                         return CommandModeOutcome::Ran { output, status: 1 };
                                     }
                                     // Matches this codebase's prior behavior
@@ -13449,8 +12620,8 @@ fn run_command_mode(
                                     // was produced.
                                     ExecResult::Exit(code) => std::process::exit(code),
                                     _ => {
-                                        let status = sessions[&session_id].shell.last_status;
-                                        sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry {
+                                        let status = app.sessions[&session_id].shell.last_status;
+                                        app.sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry {
                                             command: trimmed,
                                             output: captured_text.clone(),
                                             status,
@@ -13462,14 +12633,14 @@ fn run_command_mode(
                         }
                         Err(e) => {
                             if !is_incomplete(&e) {
-                                show_command_mode_error(&format!("bish: syntax error: {}", e), *term_rows, *term_cols);
+                                show_command_mode_error(&format!("bish: syntax error: {}", e), app.term_rows, app.term_cols);
                                 buffer.clear();
                             }
                         }
                     },
                     Err(e) => {
                         if !is_incomplete(&e) {
-                            show_command_mode_error(&format!("bish: syntax error: {}", e), *term_rows, *term_cols);
+                            show_command_mode_error(&format!("bish: syntax error: {}", e), app.term_rows, app.term_cols);
                             buffer.clear();
                         }
                     }
