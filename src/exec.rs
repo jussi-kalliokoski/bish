@@ -962,6 +962,9 @@ pub struct Shell {
     /// thing: a small user-defined table the editor consults, defined
     /// from config.bash and changeable at runtime.
     pub mappings: Vec<crate::keymap::Mapping>,
+    /// `enable -n NAME`: builtins taken out of service, so the external
+    /// of the same name runs instead.
+    disabled_builtins: std::collections::HashSet<String>,
     /// `::bish hook`-registered commands, in the order they were added.
     /// Inherited by a virtual child exactly as `abbrs` is: a window you
     /// split off should behave like the one you split it from.
@@ -1429,6 +1432,7 @@ impl Shell {
             aliases: Vec::new(),
             abbrs: Vec::new(),
             mappings: Vec::new(),
+            disabled_builtins: std::collections::HashSet::new(),
             hooks: Vec::new(),
             next_hook_id: 1,
             lsp_servers: Vec::new(),
@@ -1717,6 +1721,7 @@ impl Shell {
             aliases: self.aliases.clone(),
             abbrs: self.abbrs.clone(),
             mappings: self.mappings.clone(),
+            disabled_builtins: self.disabled_builtins.clone(),
             hooks: self.hooks.clone(),
             next_hook_id: self.next_hook_id,
             lsp_servers: self.lsp_servers.clone(),
@@ -5247,6 +5252,137 @@ impl Shell {
     // only syscall shape, so reading the current value means setting a
     // throwaway mask and immediately restoring what was there. Moved here
     // alongside run_ulimit for the same M6 sink reason.
+    // `help [NAME...]` -- an index of the builtins.
+    //
+    // A name may be a glob, as bash's is, so `help comp*` works. A name
+    // that matches nothing is an error naming it, since silence would
+    // look like a builtin with nothing to say about it.
+    fn run_help(&mut self, args: &[String]) -> i32 {
+        let names: Vec<&String> = args.iter().filter(|a| !a.starts_with('-')).collect();
+        if names.is_empty() {
+            sh_println!(self, "bish's builtins. `help NAME` for one of them; NAME may be a glob.");
+            sh_println!(self, "Anything not listed here is an ordinary command -- try its own --help.");
+            sh_println!(self, "");
+            for (name, summary) in BUILTIN_HELP {
+                sh_println!(self, "  {name:<10} {summary}");
+            }
+            return 0;
+        }
+        let mut status = 0;
+        for name in names {
+            let matched: Vec<&(&str, &str)> =
+                BUILTIN_HELP.iter().filter(|(b, _)| *b == name.as_str() || crate::glob::matches(name, b)).collect();
+            if matched.is_empty() {
+                sh_eprintln!(self, "bish: help: no help topics match `{name}'");
+                status = 1;
+                continue;
+            }
+            for (b, summary) in matched {
+                sh_println!(self, "  {b:<10} {summary}");
+            }
+        }
+        status
+    }
+
+    // `enable [-n] [-a] [NAME...]` -- which builtins are in service.
+    //
+    // `-n NAME` takes one out, so `enable -n echo; echo hi` runs
+    // /bin/echo. Bare `NAME` puts it back. With no names it lists: the
+    // enabled ones by default, all of them with `-a`.
+    //
+    // bash also has `-f`/`-d` for loading builtins from a shared object.
+    // bish has no dynamic loading and no plans for any, so those are
+    // refused by name rather than silently ignored -- this shell's own
+    // convention for something it does not do.
+    fn run_enable(&mut self, args: &[String]) -> i32 {
+        let (mut disable, mut list_all, mut names) = (false, false, Vec::new());
+        for arg in args {
+            match arg.as_str() {
+                "-n" => disable = true,
+                "-a" => list_all = true,
+                "-p" => {}
+                "-f" | "-d" => {
+                    sh_eprintln!(self, "bish: enable: {arg}: dynamic loading is not supported");
+                    return 2;
+                }
+                other if other.starts_with('-') && other.len() > 1 => {
+                    sh_eprintln!(self, "bish: enable: {other}: invalid option");
+                    return 2;
+                }
+                other => names.push(other.to_string()),
+            }
+        }
+        if names.is_empty() {
+            let mut listed: Vec<&str> = KNOWN_BUILTINS
+                .iter()
+                .copied()
+                .filter(|b| list_all || !self.disabled_builtins.contains(*b))
+                .collect();
+            listed.sort_unstable();
+            for b in listed {
+                let state = if self.disabled_builtins.contains(b) { "enable -n" } else { "enable" };
+                sh_println!(self, "{state} {b}");
+            }
+            return 0;
+        }
+        let mut status = 0;
+        for name in names {
+            if !KNOWN_BUILTINS.contains(&name.as_str()) {
+                sh_eprintln!(self, "bish: enable: {name}: not a shell builtin");
+                status = 1;
+                continue;
+            }
+            if disable {
+                self.disabled_builtins.insert(name);
+            } else {
+                self.disabled_builtins.remove(&name);
+            }
+        }
+        status
+    }
+
+    // `times` -- CPU consumed by this shell and by the commands it has
+    // waited for, as POSIX specifies: two lines, user then system on
+    // each, the shell's own first and its children's second.
+    //
+    // Straight from `times(2)`, which reports all four in one call, in
+    // clock ticks. `sysconf(_SC_CLK_TCK)` is the divisor -- 100 on every
+    // Linux worth naming, but asking costs nothing and hard-coding it is
+    // the sort of thing that is wrong exactly once and mysteriously.
+    fn run_times(&mut self, args: &[String]) -> i32 {
+        if !args.is_empty() {
+            sh_eprintln!(self, "bish: times: too many arguments");
+            return 2;
+        }
+        #[repr(C)]
+        struct Tms {
+            utime: i64,
+            stime: i64,
+            cutime: i64,
+            cstime: i64,
+        }
+        unsafe extern "C" {
+            fn times(buf: *mut Tms) -> i64;
+            fn sysconf(name: i32) -> i64;
+        }
+        // _SC_CLK_TCK
+        const SC_CLK_TCK: i32 = 2;
+        let mut tms = Tms { utime: 0, stime: 0, cutime: 0, cstime: 0 };
+        if unsafe { times(&mut tms as *mut Tms) } == -1 {
+            sh_eprintln!(self, "bish: times: cannot read process times");
+            return 1;
+        }
+        let ticks = unsafe { sysconf(SC_CLK_TCK) }.max(1);
+        // bash's own shape: whole minutes, then seconds to milliseconds.
+        let show = |t: i64| {
+            let secs = t as f64 / ticks as f64;
+            format!("{}m{:.3}s", (secs as i64) / 60, secs % 60.0)
+        };
+        sh_println!(self, "{} {}", show(tms.utime), show(tms.stime));
+        sh_println!(self, "{} {}", show(tms.cutime), show(tms.cstime));
+        0
+    }
+
     fn run_umask(&mut self, args: &[String]) -> i32 {
         let symbolic = args.iter().any(|a| a == "-S");
         match args.iter().find(|a| !a.starts_with('-')) {
@@ -7256,7 +7392,16 @@ impl Shell {
         builtin_only: bool,
         array_literal_args: &[(usize, String, AssignMode, Vec<ArrayLiteralItem>)],
     ) -> ExecResult {
-        match name.as_str() {
+        // `enable -n NAME` takes a builtin out of service so the external
+        // of the same name runs instead. Done by handing the dispatch a
+        // name no arm can match, rather than by jumping past it: the
+        // external path is the code immediately after this match, and
+        // this is the one place that chooses between the two. `builtin
+        // NAME` ignores the setting, as it does in bash -- that is what
+        // `builtin` is for.
+        let dispatch_name: &str =
+            if !builtin_only && self.disabled_builtins.contains(&name) { "\u{0}disabled" } else { name.as_str() };
+        match dispatch_name {
             // POSIX special builtin: does nothing, exits 0. Its arguments
             // are still expanded (already done via argv above) for side
             // effects like `: ${x:=default}`. Its own redirects (e.g.
@@ -7392,6 +7537,9 @@ impl Shell {
             "echo" => return ExecResult::Status(self.run_echo(&argv[1..])),
             "printf" => return ExecResult::Status(self.run_printf(&argv[1..])),
             "umask" => return ExecResult::Status(self.run_umask(&argv[1..])),
+            "times" => return ExecResult::Status(self.run_times(&argv[1..])),
+            "enable" => return ExecResult::Status(self.run_enable(&argv[1..])),
+            "help" => return ExecResult::Status(self.run_help(&argv[1..])),
             "ulimit" => return ExecResult::Status(self.run_ulimit(&argv[1..])),
             // alias/unalias: store and query only, no expansion when a
             // command runs -- see the comment on the `aliases` field for
@@ -12289,6 +12437,82 @@ fn expand_backslash_escapes(s: &str) -> String {
     out
 }
 
+// One line per builtin, for `help`. Kept beside KNOWN_BUILTINS because
+// the two have to agree: a test asserts every name in that list has a
+// line here and vice versa, so adding a builtin without describing it
+// fails the build rather than silently listing a blank.
+//
+// Deliberately one line each, not bash's paragraphs. bash's `help` is a
+// manual; this is an index -- enough to tell you which builtin you
+// want, after which `::bish <thing> help` or the real manual has the
+// detail. A line that has to wrap is a line nobody reads in a list of
+// sixty.
+const BUILTIN_HELP: &[(&str, &str)] = &[
+    (":", "Do nothing, successfully. Arguments are still expanded."),
+    (".", "Read and run a file in this shell. Same as `source`."),
+    ("::bish", "bish's own namespace: theme, window, hook, hl, lsp, map."),
+    ("=", "Evaluate an arithmetic expression and print it."),
+    ("[", "Test a condition. Same as `test`, but wants a closing `]`."),
+    ("[[", "Test a condition, with pattern and regex matching."),
+    ("abbr", "Abbreviations that expand as you type."),
+    ("alias", "Define or list command aliases."),
+    ("bg", "Resume a stopped job in the background."),
+    ("bishopt", "Get or set bish's own options."),
+    ("break", "Leave a for, while or until loop."),
+    ("builtin", "Run a builtin, ignoring any function or `enable -n`."),
+    ("cd", "Change the working directory."),
+    ("command", "Run a command, ignoring any function of the same name."),
+    ("compgen", "Generate the completions a `complete` spec would offer."),
+    ("complete", "Say how a command's arguments should be completed."),
+    ("compopt", "Change the options of a completion in progress."),
+    ("continue", "Start the next turn of a loop."),
+    ("declare", "Declare variables and give them attributes."),
+    ("dirs", "Show the directory stack."),
+    ("disown", "Stop tracking a job, so it outlives this shell."),
+    ("e", "Open a file in bish's own editor."),
+    ("echo", "Print arguments, separated by spaces."),
+    ("enable", "Enable or disable builtins."),
+    ("eval", "Join the arguments into one command and run it."),
+    ("exec", "Replace this shell with a command, or apply redirects to it."),
+    ("exit", "Leave the shell."),
+    ("export", "Mark variables so commands started here inherit them."),
+    ("fc", "List history entries (`fc -l`)."),
+    ("fg", "Bring a job to the foreground."),
+    ("getopts", "Parse option arguments in a script."),
+    ("hash", "Show or clear the remembered paths of commands."),
+    ("help", "Show this index of builtins."),
+    ("history", "Show the command history."),
+    ("jobs", "List this shell's jobs."),
+    ("json", "Parse, pretty-print or query JSON."),
+    ("kill", "Send a signal to a job or process."),
+    ("let", "Evaluate arithmetic expressions."),
+    ("local", "Declare variables local to the current function."),
+    ("mapfile", "Read lines of input into an array."),
+    ("popd", "Pop a directory off the stack and go there."),
+    ("printf", "Print according to a format."),
+    ("pushd", "Push a directory onto the stack and go there."),
+    ("read", "Read one line into variables."),
+    ("readarray", "Read lines of input into an array. Same as `mapfile`."),
+    ("readonly", "Mark variables so they cannot be changed."),
+    ("return", "Leave a function or a sourced file."),
+    ("set", "Set shell options and the positional parameters."),
+    ("shift", "Drop positional parameters from the front."),
+    ("shopt", "Get or set optional shell behaviour."),
+    ("source", "Read and run a file in this shell. Same as `.`."),
+    ("test", "Test a condition."),
+    ("times", "Show CPU time used by this shell and its children."),
+    ("trap", "Run a command when a signal or shell event arrives."),
+    ("type", "Say what kind of thing a name is."),
+    ("typeset", "Declare variables and give them attributes. Same as `declare`."),
+    ("ulimit", "Get or set resource limits."),
+    ("umask", "Get or set the file-creation mask."),
+    ("unalias", "Remove aliases."),
+    ("unset", "Remove variables or functions."),
+    ("wait", "Wait for jobs to finish."),
+    ("win", "Manage windows and panes. Same as `window`."),
+    ("window", "Manage windows and panes."),
+];
+
 // Kept in sync with run_single's builtin dispatch match by hand -- used
 // only by `command -v`/`type` to classify a name, not to actually run
 // anything, so a name missing from this list just means those two
@@ -12296,6 +12520,9 @@ fn expand_backslash_escapes(s: &str) -> String {
 // than anything actually breaking.
 const KNOWN_BUILTINS: &[&str] = &[
     ":",
+    "times",
+    "enable",
+    "help",
     // Every name `dispatch_builtin_or_external_impl` handles has to be
     // here, not just for completion: `run_multi` uses this list to
     // decide whether a pipeline stage needs the self-exec that lets a
@@ -12928,6 +13155,45 @@ mod tests {
         }
         unsafe { tzset() };
         out
+    }
+
+    #[test]
+    fn enable_takes_a_builtin_out_of_service_and_puts_it_back() {
+        let mut sh = Shell::new();
+        assert!(!sh.disabled_builtins.contains("echo"));
+        assert_eq!(sh.run_enable(&["-n".to_string(), "echo".to_string()]), 0);
+        assert!(sh.disabled_builtins.contains("echo"));
+        assert_eq!(sh.run_enable(&["echo".to_string()]), 0);
+        assert!(!sh.disabled_builtins.contains("echo"));
+
+        // A name that is not a builtin is an error, and does not become
+        // one by being named.
+        assert_eq!(sh.run_enable(&["-n".to_string(), "nosuch".to_string()]), 1);
+        assert!(!sh.disabled_builtins.contains("nosuch"));
+        // Dynamic loading is refused by name rather than ignored.
+        assert_eq!(sh.run_enable(&["-f".to_string(), "mod".to_string()]), 2);
+    }
+
+    #[test]
+    fn every_builtin_is_described_and_every_description_is_a_builtin() {
+        // The two tables have to agree, and neither is derived from the
+        // other -- so adding a builtin without a line here fails the
+        // build rather than quietly listing a blank one.
+        use std::collections::HashSet;
+        let known: HashSet<&str> = KNOWN_BUILTINS.iter().copied().collect();
+        let described: HashSet<&str> = BUILTIN_HELP.iter().map(|(n, _)| *n).collect();
+        let mut missing: Vec<&&str> = known.difference(&described).collect();
+        let mut extra: Vec<&&str> = described.difference(&known).collect();
+        missing.sort_unstable();
+        extra.sort_unstable();
+        assert!(missing.is_empty(), "builtins with no help line: {missing:?}");
+        assert!(extra.is_empty(), "help lines for things that are not builtins: {extra:?}");
+        // One line each, and short enough to read in a list of sixty.
+        for (name, summary) in BUILTIN_HELP {
+            assert!(!summary.contains('\n'), "{name}: one line");
+            assert!(summary.len() <= 72, "{name}: {} chars is too long for an index", summary.len());
+            assert!(summary.ends_with('.'), "{name}: a sentence");
+        }
     }
 
     #[test]
