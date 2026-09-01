@@ -8421,13 +8421,22 @@ pub(crate) fn shell_quote(s: &str) -> String {
 }
 
 #[cfg(test)]
-mod printf_float_tests {
+mod printf_conversion_tests {
     // Checked against real `bash`, on the same specs and the same
-    // values, because C's floating-point conversions have more corners
-    // than anyone's reading of them: `%.0f` of 2.5 is 2 and of 3.5 is
-    // 4 (round half to even), `%g` picks its form from the exponent
-    // *after* rounding, `%e` writes at least two exponent digits, and
-    // zero padding goes after the sign but not around an infinity.
+    // values, because C's conversions have more corners than anyone's
+    // reading of them: `%.0f` of 2.5 is 2 and of 3.5 is 4 (round half
+    // to even), `%g` picks its form from the exponent *after*
+    // rounding, `%e` writes at least two exponent digits, zero padding
+    // goes after the sign but not around an infinity, precision on an
+    // integer means minimum digits rather than digits after the point
+    // (and silences the `0` flag), `010` is octal, and an argument is
+    // read as far as it parses rather than all-or-nothing, so `3.9abc`
+    // is 3.9 and `12 34` is 12.
+    //
+    // Precision stays at or below 17 significant digits on purpose:
+    // bash converts through `long double` and bish through `f64`, so
+    // the two genuinely diverge past what a double can represent, and
+    // there is no fixing that without an 80-bit float.
     //
     // `LC_ALL=C`, or this measures the machine's decimal separator
     // rather than the formatting -- a Finnish `bash` writes `3,14`.
@@ -8438,19 +8447,35 @@ mod printf_float_tests {
             "%f", "%.0f", "%.2f", "%8.3f", "%-8.3f", "%05.2f", "%08.3f", "%+f", "% f", "%012.4f",
             "%e", "%E", "%.0e", "%.2e", "%012.1e", "%+.3e", "%08.0E",
             "%g", "%G", "%.1g", "%.3g", "%.10g", "%+08.0g", "%012g",
+            "%d", "%i", "%5d", "%-5d", "%05d", "%+d", "% d", "%.5d", "%.0d", "%5.0d", "%08.5d", "%-8.5d",
+            "%u", "%.5u", "%x", "%X", "%.3x", "%08x", "%o", "%.5o", "%12.4X",
+            "%s", "%.3s", "%8.3s", "%-8.3s", "%c", "%b", "%.3b",
         ];
         let values = [
             "0", "1", "-1", "2.5", "3.5", "-0.5", "3.14159", "-3.14159", "1e3", "1e-3", "1e20",
             "0.0001", "0.00001", "999999", "999999.5", "100000", "1000000", "0x10", "-0x10",
             "31415.9", "0.000123", "inf", "-inf", "nan", "abc", "",
+            "42", "-42", "010", "0XfF", "'A", "+5", " 7 ", "3.9", "-3.9", "12 34", "3.9abc", ".5", "1.",
+            "255", "-255", "abcdef",
         ];
         specs.iter().flat_map(|s| values.iter().map(move |v| (s.to_string(), v.to_string()))).collect()
     }
 
     #[test]
-    fn floating_point_conversions_agree_with_bash() {
+    fn conversions_agree_with_bash() {
         let cases = cases();
-        let script: String = cases.iter().map(|(spec, value)| format!("printf '{spec}' '{value}'; printf '\\n'\n")).collect();
+        // Separated by SOH rather than by newline: `%b` can expand an
+        // escape into a newline and `%c` of nothing at all is a NUL, so
+        // one-result-per-line is not a protocol either side can keep.
+        let script: String = cases
+            .iter()
+            .map(|(spec, value)| {
+                // `'A` is one of the values, so the values cannot go
+                // into the script unescaped.
+                let (spec, value) = (spec.replace('\'', "'\\''"), value.replace('\'', "'\\''"));
+                format!("printf '{spec}' '{value}'; printf '\\001'\n")
+            })
+            .collect();
         let out = std::process::Command::new("bash").env("LC_ALL", "C").arg("-c").arg(&script).output();
         let Ok(out) = out else { return };
         if !out.status.success() {
@@ -8458,8 +8483,9 @@ mod printf_float_tests {
         }
         // bash writes "invalid number" to stderr for a value it cannot
         // read and then uses 0, which is what bish does silently.
-        let want: Vec<String> = String::from_utf8_lossy(&out.stdout).lines().map(str::to_string).collect();
-        assert_eq!(want.len(), cases.len(), "one line per case");
+        let printed = String::from_utf8_lossy(&out.stdout).into_owned();
+        let want: Vec<&str> = printed.split('\u{1}').collect();
+        assert_eq!(want.len(), cases.len() + 1, "one result per case, plus the empty tail");
 
         for ((spec, value), expected) in cases.iter().zip(&want) {
             let mut got = String::new();
@@ -8470,11 +8496,99 @@ mod printf_float_tests {
     }
 }
 
+// `printf`'s own idea of an integer, which is C's `strtoll` with base 0:
+// the longest valid prefix of the argument, in whatever base it
+// announces. `3.9` is 3 and `1e3` is 1 -- both stop at the first
+// character that cannot continue the number rather than failing -- while
+// `010` is octal 8 and `0x10` is hexadecimal 16. Anything with no valid
+// prefix at all is 0, and an overflow saturates, both of which bash
+// warns about and then does anyway.
+//
+// `'A` (or `"A`) is bash's own extension on top of that: a quote
+// followed by a character means that character's code point.
+fn printf_int(arg: &str) -> i64 {
+    let text = arg.trim();
+    if let Some(rest) = text.strip_prefix(['\'', '"']) {
+        return rest.chars().next().map(|c| c as i64).unwrap_or(0);
+    }
+    let (negative, rest) = match text.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, text.strip_prefix('+').unwrap_or(text)),
+    };
+    let (radix, digits) = int_radix(rest);
+    let valid = digits.len() - digits.trim_start_matches(|c: char| c.is_digit(radix)).len();
+    match i64::from_str_radix(&digits[..valid], radix) {
+        Ok(v) if negative => -v,
+        Ok(v) => v,
+        // No digits at all reads as zero; too many of them saturate at
+        // whichever end, which is what `strtoll` does with ERANGE.
+        Err(_) if valid == 0 => 0,
+        Err(_) if negative => i64::MIN,
+        Err(_) => i64::MAX,
+    }
+}
+
+// The same, for the conversions that read their argument as unsigned:
+// `%u`, `%o`, `%x`, `%X`. A negative argument wraps (`-42` is
+// `ffffffffffffffd6`), and anything too large for 64 bits saturates
+// whichever sign it had.
+fn printf_uint(arg: &str) -> u64 {
+    let text = arg.trim();
+    if let Some(rest) = text.strip_prefix(['\'', '"']) {
+        return rest.chars().next().map(|c| c as u64).unwrap_or(0);
+    }
+    let (negative, rest) = match text.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, text.strip_prefix('+').unwrap_or(text)),
+    };
+    let (radix, digits) = int_radix(rest);
+    let valid = digits.len() - digits.trim_start_matches(|c: char| c.is_digit(radix)).len();
+    match u64::from_str_radix(&digits[..valid], radix) {
+        Ok(v) if negative => 0u64.wrapping_sub(v),
+        Ok(v) => v,
+        Err(_) if valid == 0 => 0,
+        Err(_) => u64::MAX,
+    }
+}
+
+// The base an argument announces: `0x` for hexadecimal, a leading `0`
+// for octal, decimal otherwise -- `strtol`'s base 0.
+fn int_radix(rest: &str) -> (u32, &str) {
+    match rest.strip_prefix("0x").or_else(|| rest.strip_prefix("0X")) {
+        Some(hex) => (16, hex),
+        None => match rest.len() > 1 && rest.starts_with('0') {
+            true => (8, &rest[1..]),
+            false => (10, rest),
+        },
+    }
+}
+
+// The `%d`/`%x`/`%o` family's own reading of precision: a *minimum*
+// number of digits, zero-filled, rather than the "digits after the
+// point" it means for a float. Zero printed at precision zero is
+// nothing at all -- `%.0d` of 0 is the empty string, which is how a C
+// programmer writes "this column is blank when there is nothing in it".
+fn pad_integer_digits(piece: String, precision: usize) -> String {
+    let (sign, digits) = match piece.starts_with('-') {
+        true => piece.split_at(1),
+        false => ("", piece.as_str()),
+    };
+    if digits == "0" && precision == 0 {
+        return sign.to_string();
+    }
+    let fill = precision.saturating_sub(digits.chars().count());
+    format!("{sign}{}{digits}", "0".repeat(fill))
+}
+
 // `printf`'s own idea of a number, which is C's `strtod`: a decimal or
 // exponent form, a `0x` integer, surrounding space, `inf`/`nan`. `None`
 // for anything else, which every caller renders as zero.
 fn printf_float(arg: &str) -> f64 {
     let text = arg.trim();
+    // bash's `'X` extension is not just for the integer conversions.
+    if let Some(rest) = text.strip_prefix(['\'', '"']) {
+        return rest.chars().next().map(|c| c as u32 as f64).unwrap_or(0.0);
+    }
     let (sign, rest) = match text.strip_prefix('-') {
         Some(rest) => (-1.0, rest),
         None => (1.0, text.strip_prefix('+').unwrap_or(text)),
@@ -8482,7 +8596,62 @@ fn printf_float(arg: &str) -> f64 {
     if let Some(hex) = rest.strip_prefix("0x").or_else(|| rest.strip_prefix("0X")) {
         return i64::from_str_radix(hex, 16).map(|v| sign * v as f64).unwrap_or(0.0);
     }
-    text.parse::<f64>().unwrap_or(0.0)
+    if rest.eq_ignore_ascii_case("inf") || rest.eq_ignore_ascii_case("infinity") {
+        return sign * f64::INFINITY;
+    }
+    if rest.eq_ignore_ascii_case("nan") {
+        return f64::NAN;
+    }
+    text[..float_prefix_len(text)].parse::<f64>().unwrap_or(0.0)
+}
+
+// How much of `text` is a number, the way `strtod` measures it: an
+// optional sign, digits with an optional point among them, and an
+// optional exponent that only counts if it has digits of its own. `12
+// 34` is 12 and `3.9abc` is 3.9; `.` and `abc` are nothing.
+fn float_prefix_len(text: &str) -> usize {
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    if i < bytes.len() && (bytes[i] == b'+' || bytes[i] == b'-') {
+        i += 1;
+    }
+    let mut saw_digit = false;
+    while i < bytes.len() && bytes[i].is_ascii_digit() {
+        i += 1;
+        saw_digit = true;
+    }
+    if i < bytes.len() && bytes[i] == b'.' {
+        i += 1;
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
+            saw_digit = true;
+        }
+    }
+    if !saw_digit {
+        return 0;
+    }
+    let mantissa_end = i;
+    if i < bytes.len() && (bytes[i] == b'e' || bytes[i] == b'E') {
+        let mut j = i + 1;
+        if j < bytes.len() && (bytes[j] == b'+' || bytes[j] == b'-') {
+            j += 1;
+        }
+        let digits_start = j;
+        while j < bytes.len() && bytes[j].is_ascii_digit() {
+            j += 1;
+        }
+        // An `e` with nothing after it is not part of the number.
+        i = if j > digits_start { j } else { mantissa_end };
+    }
+    i
+}
+
+// Precision on a string conversion is a maximum length. Cut on a
+// character rather than a byte: `String::truncate` panics on a boundary
+// it does not own, and `printf '%.1s'` on a string of two-byte
+// characters used to take the whole shell down with it.
+fn truncate_chars(text: &str, max: usize) -> String {
+    text.chars().take(max).collect()
 }
 
 // `inf`/`nan` print as themselves, in the case the conversion asked
@@ -8715,21 +8884,19 @@ pub(crate) fn printf_format_once(format: &str, values: &[String], idx: &mut usiz
         // with zeros perfectly happily.
         let mut zero_pad_ok = true;
         let mut piece = match conv {
-            's' => {
-                let mut s = next_arg();
-                if let Some(p) = precision {
-                    s.truncate(p);
-                }
-                s
-            }
-            'b' => echo_expand_escapes(&next_arg()).0,
-            'c' => next_arg().chars().next().map(|c| c.to_string()).unwrap_or_default(),
-            'q' => shell_quote(&next_arg()),
-            'd' | 'i' => next_arg().trim().parse::<i64>().unwrap_or(0).to_string(),
-            'u' => (next_arg().trim().parse::<i64>().unwrap_or(0) as u64).to_string(),
-            'o' => format!("{:o}", next_arg().trim().parse::<i64>().unwrap_or(0)),
-            'x' => format!("{:x}", next_arg().trim().parse::<i64>().unwrap_or(0)),
-            'X' => format!("{:X}", next_arg().trim().parse::<i64>().unwrap_or(0)),
+            // The three that precision measures in characters rather
+            // than in digits.
+            's' => truncate_chars(&next_arg(), precision.unwrap_or(usize::MAX)),
+            'b' => truncate_chars(&echo_expand_escapes(&next_arg()).0, precision.unwrap_or(usize::MAX)),
+            'q' => truncate_chars(&shell_quote(&next_arg()), precision.unwrap_or(usize::MAX)),
+            // An empty argument is still a character: bash writes the
+            // NUL it read, and so does this.
+            'c' => next_arg().chars().next().unwrap_or('\0').to_string(),
+            'd' | 'i' => printf_int(&next_arg()).to_string(),
+            'u' => printf_uint(&next_arg()).to_string(),
+            'o' => format!("{:o}", printf_uint(&next_arg())),
+            'x' => format!("{:x}", printf_uint(&next_arg())),
+            'X' => format!("{:X}", printf_uint(&next_arg())),
             // The floating-point family. Precision defaults to 6, as C
             // does, and an argument that is not a number reads as 0 --
             // the same silent fallback `%d` above already makes (bash
@@ -8751,6 +8918,14 @@ pub(crate) fn printf_format_once(format: &str, values: &[String], idx: &mut usiz
             // than silently eating an argument.
             other => format!("%{}", other),
         };
+        // Precision on an integer means minimum digits, and having asked
+        // for those the `0` flag has nothing left to say -- C ignores it
+        // there, so `%08.5d` of 42 is `   00042` rather than `00000042`.
+        let integer = matches!(conv, 'd' | 'i' | 'u' | 'o' | 'x' | 'X');
+        if integer && let Some(p) = precision {
+            piece = pad_integer_digits(piece, p);
+            zero_pad = false;
+        }
         if signed && !piece.starts_with('-') {
             if plus_sign {
                 piece.insert(0, '+');
