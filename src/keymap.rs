@@ -173,22 +173,22 @@ pub fn parse_keys(text: &str) -> Result<Vec<Key>, String> {
 /// these, the same shape and the same engine `abbr --lang` uses, so one
 /// mapping can cover a family (`-m '*al'` is normal and visual) or
 /// everything but one (`-m '!(insert)'`).
-pub const MODES: &[&str] = &["normal", "insert", "visual", "command", "terminal"];
+///
+/// There is deliberately no `terminal`. While a foreground job owns the
+/// keyboard, `drive_fg_job` forwards raw bytes to it and never decodes
+/// keys at all -- which is exactly what keeps a real vim running under
+/// bish receiving its own escape sequences intact. Mapping there would
+/// need a second, parallel key-to-bytes encoder kept in step with the
+/// decoder, on the most fidelity-sensitive path in the codebase; and
+/// because the default scope is `*`, an ordinary global mapping would
+/// then silently apply *inside* every full-screen program, so mapping
+/// `jk` for Insert mode would break `j` in vim. The keyboard belongs to
+/// the program that has it.
+pub const MODES: &[&str] = &["normal", "insert", "visual", "command"];
 
 /// Unscoped: every mode. A mapping with no `--mode` is global, which is
 /// what vim's own `:noremap` (as against `:nnoremap`) means.
 pub const DEFAULT_MODE: &str = "*";
-
-/// The modes that actually consult the keymap today.
-///
-/// `normal` and `visual` share one `VimKeys`, which resolves a key
-/// sequence to a named action -- so a mapping there has something to be
-/// described *as*. The other three dispatch on raw `Key` arms with no
-/// enumerated action space, so they are accepted by the glob and
-/// reported as not yet remappable rather than being silently stored and
-/// never fired, which is the worse of the two failures: a mapping that
-/// lists but does nothing gives no hint that anything is missing.
-pub const REMAPPABLE: &[&str] = &["normal", "visual", "insert", "command"];
 
 /// One `::bish map` entry.
 ///
@@ -234,25 +234,11 @@ pub fn modes_matching(glob: &str) -> Vec<&'static str> {
 
 /// Whether a glob covers a mode driven by `VimKeys`, and so one where a
 /// right-hand side resolves to a *named action* rather than just to
-/// keys. Normal and visual share that machine; insert, command and
-/// terminal dispatch on raw keys and have no such vocabulary, which is
-/// why both validation and the listing have to ask.
+/// keys. Normal and visual share that machine; insert and command
+/// dispatch on raw keys and have no such vocabulary, which is why both
+/// validation and the listing have to ask.
 pub fn has_vim_mode(glob: &str) -> bool {
     modes_matching(glob).iter().any(|m| *m == "normal" || *m == "visual")
-}
-
-/// Whether a `--mode` glob selects nothing that can act on a mapping --
-/// i.e. this mapping can never fire as things stand.
-///
-/// Deliberately not "does it select *any* mode that cannot act on one":
-/// the default glob is `*`, which selects all five, so that reading
-/// would print a warning for every unscoped mapping in every config
-/// file. A global mapping working in normal and visual is exactly what
-/// was asked for. The warning is worth making only when the answer is
-/// "this will never fire at all", which is a typo or a misunderstanding
-/// rather than a partial success.
-pub fn never_fires(glob: &str) -> bool {
-    !modes_matching(glob).iter().any(|m| REMAPPABLE.contains(m))
 }
 
 // Pulls `--mode=GLOB`/`--mode GLOB`/`-m GLOB` out of `::bish map`'s
@@ -298,7 +284,6 @@ pub fn usage() -> Vec<String> {
         "Always non-recursive, as vim's `noremap` is: ACTION-KEYS mean what".to_string(),
         "they mean by default and never chain through another mapping.".to_string(),
         format!("-m is a glob over modes ({}), default '*'.", MODES.join(", ")),
-        format!("Modes that act on mappings so far: {}.", REMAPPABLE.join(", ")),
         "Write a space as <Space>, a literal < as <lt>.".to_string(),
         "Quote KEYS in the shell: a bare < is a redirection.".to_string(),
     ]
@@ -505,7 +490,7 @@ mod tests {
         assert!(has_vim_mode(DEFAULT_MODE));
         assert!(!has_vim_mode("insert"));
         assert!(!has_vim_mode("command"));
-        assert!(!has_vim_mode("@(insert|command|terminal)"));
+        assert!(!has_vim_mode("@(insert|command)"));
     }
 
     #[test]
@@ -514,8 +499,8 @@ mod tests {
         assert_eq!(modes_matching(DEFAULT_MODE), MODES.to_vec());
         // The same extglob the shell's own `case` understands, because
         // it is the same engine -- no second pattern dialect.
-        assert_eq!(modes_matching("!(insert)"), vec!["normal", "visual", "command", "terminal"]);
-        assert_eq!(modes_matching("*al"), vec!["normal", "visual", "terminal"]);
+        assert_eq!(modes_matching("!(insert)"), vec!["normal", "visual", "command"]);
+        assert_eq!(modes_matching("*al"), vec!["normal", "visual"]);
     }
 
     #[test]
@@ -526,24 +511,6 @@ mod tests {
         assert!(mode_glob_is_known("*"));
         assert!(!mode_glob_is_known("nrmal"));
         assert!(!mode_glob_is_known(""));
-    }
-
-    #[test]
-    fn only_a_mapping_that_can_never_fire_is_worth_warning_about() {
-        // The default glob selects all five, three of which cannot act
-        // on a mapping yet -- warning on that would fire for every
-        // unscoped mapping in every config file, which is noise, not a
-        // warning. Working in normal and visual is what was asked for.
-        assert!(!never_fires(DEFAULT_MODE));
-        assert!(!never_fires("normal"));
-        assert!(!never_fires("*al"));
-        assert!(!never_fires("insert"));
-        assert!(!never_fires("command"));
-        // Terminal is the one mode left that cannot act on a mapping:
-        // it forwards raw bytes to the program that owns the keyboard
-        // and never decodes keys at all. Saying so is worth it.
-        assert!(never_fires("terminal"));
-        assert!(!never_fires("@(command|terminal)"), "command can, so this one is not a dead mapping");
     }
 
     #[test]

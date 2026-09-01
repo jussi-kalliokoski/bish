@@ -4840,17 +4840,6 @@ impl Shell {
                     sh_eprintln!(self, "bish: ::bish map: if it was meant for another mode, scope it with -m");
                     return 2;
                 }
-                if crate::keymap::never_fires(&mode) {
-                    // Stored anyway, so a config file written today keeps
-                    // working when the other modes arrive -- but said out
-                    // loud, because a mapping that lists and does nothing
-                    // is the worst of the available failures.
-                    sh_eprintln!(
-                        self,
-                        "bish: ::bish map: nothing in mode '{mode}' acts on mappings yet, so this will not fire (these do: {})",
-                        crate::keymap::REMAPPABLE.join(", ")
-                    );
-                }
                 match self.mappings.iter_mut().find(|m| m.lhs == lhs && m.modes == mode) {
                     Some(existing) => existing.rhs = rhs,
                     None => self.mappings.push(crate::keymap::Mapping { modes: mode, lhs, rhs }),
