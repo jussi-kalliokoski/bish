@@ -945,6 +945,11 @@ pub struct Shell {
     // exactly that snapshotting (repl.rs is a different module) --
     // matching `cwd`'s own visibility.
     pub abbrs: Vec<Abbr>,
+    /// `::bish map` -- key remappings, scoped to modes by a glob. Held
+    /// here beside the abbreviations because it is the same kind of
+    /// thing: a small user-defined table the editor consults, defined
+    /// from config.bash and changeable at runtime.
+    pub mappings: Vec<crate::keymap::Mapping>,
     /// `::bish hook`-registered commands, in the order they were added.
     /// Inherited by a virtual child exactly as `abbrs` is: a window you
     /// split off should behave like the one you split it from.
@@ -1411,6 +1416,7 @@ impl Shell {
             assoc_names: std::collections::HashSet::new(),
             aliases: Vec::new(),
             abbrs: Vec::new(),
+            mappings: Vec::new(),
             hooks: Vec::new(),
             next_hook_id: 1,
             lsp_servers: Vec::new(),
@@ -1689,6 +1695,7 @@ impl Shell {
             assoc_names: self.assoc_names.clone(),
             aliases: self.aliases.clone(),
             abbrs: self.abbrs.clone(),
+            mappings: self.mappings.clone(),
             hooks: self.hooks.clone(),
             next_hook_id: self.next_hook_id,
             lsp_servers: self.lsp_servers.clone(),
@@ -3624,12 +3631,13 @@ impl Shell {
             [sub, rest @ ..] if sub == "hook" => ExecResult::Status(self.run_hook(rest)),
             [sub, rest @ ..] if sub == "hl" => ExecResult::Status(self.run_hl(rest)),
             [sub, rest @ ..] if sub == "lsp" => ExecResult::Status(self.run_lsp(rest)),
+            [sub, rest @ ..] if sub == "map" => ExecResult::Status(self.run_map(rest)),
             [] => {
-                sh_eprintln!(self, "bish: ::bish: missing subcommand (expected: theme, window, hook, hl, lsp)");
+                sh_eprintln!(self, "bish: ::bish: missing subcommand (expected: theme, window, hook, hl, lsp, map)");
                 ExecResult::Status(2)
             }
             [other, ..] => {
-                sh_eprintln!(self, "bish: ::bish: unknown subcommand '{other}' (expected: theme, window, hook, hl, lsp)");
+                sh_eprintln!(self, "bish: ::bish: unknown subcommand '{other}' (expected: theme, window, hook, hl, lsp, map)");
                 ExecResult::Status(2)
             }
         }
@@ -4701,6 +4709,133 @@ impl Shell {
             Err(e) => {
                 sh_eprintln!(self, "bish: =: {e}");
                 1
+            }
+        }
+    }
+
+    // `::bish map [-m GLOB] LHS RHS` -- remap a key sequence.
+    //
+    // Always non-recursive, the way vim's `noremap` is, and there is no
+    // recursive form: a mapping's right-hand side is resolved against
+    // the *default* bindings and can never chain through another
+    // mapping. That removes the whole class of surprise vim's `map` is
+    // famous for (a mapping that changes meaning because an unrelated
+    // one was defined later), and it is why a listing can name the
+    // action a mapping performs rather than just echoing keys.
+    //
+    // The flags follow `abbr`'s, not `::bish lsp`'s: this is a small
+    // user table with add/erase/list, the same shape abbreviations
+    // already have, rather than a subcommand family.
+    fn run_map(&mut self, args: &[String]) -> i32 {
+        let (args, mode) = crate::keymap::take_mode_flag(args);
+        let mode = mode.unwrap_or_else(|| crate::keymap::DEFAULT_MODE.to_string());
+        if !crate::keymap::mode_glob_is_known(&mode) {
+            // A glob matching no mode would be stored, listed, and never
+            // fire, with nothing anywhere saying why -- so it is refused
+            // where the typo was made.
+            sh_eprintln!(self, "bish: ::bish map: --mode '{mode}' matches no mode (have: {})", crate::keymap::MODES.join(", "));
+            return 2;
+        }
+        let rest: &[String] = &args;
+        match rest.first().map(String::as_str) {
+            Some("help") => {
+                for line in crate::keymap::usage() {
+                    sh_println!(self, "{line}");
+                }
+                0
+            }
+            None | Some("-l") | Some("--list") => {
+                let listing: Vec<String> = self
+                    .mappings
+                    .iter()
+                    .filter(|m| crate::keymap::modes_matching(&mode).iter().any(|one| m.applies_to(one)))
+                    .map(|m| {
+                        let action = crate::bishedit::vimkeys::describe_key_sequence(&m.rhs)
+                            .unwrap_or_else(|why| format!("({why})"));
+                        format!(
+                            "{}\t{}\t{}\t{}",
+                            m.modes,
+                            crate::keymap::format_keys(&m.lhs),
+                            crate::keymap::format_keys(&m.rhs),
+                            action
+                        )
+                    })
+                    .collect();
+                for line in listing {
+                    sh_println!(self, "{line}");
+                }
+                0
+            }
+            Some("-e") | Some("--erase") => {
+                let Some(lhs_text) = rest.get(1) else {
+                    sh_eprintln!(self, "bish: ::bish map: --erase: requires a KEY");
+                    return 2;
+                };
+                let lhs = match crate::keymap::parse_keys(lhs_text) {
+                    Ok(keys) => keys,
+                    Err(why) => {
+                        sh_eprintln!(self, "bish: ::bish map: {why}");
+                        return 2;
+                    }
+                };
+                let before = self.mappings.len();
+                self.mappings.retain(|m| !(m.lhs == lhs && m.modes == mode));
+                if self.mappings.len() == before {
+                    sh_eprintln!(self, "bish: ::bish map: no mapping for {lhs_text} in mode '{mode}'");
+                    return 1;
+                }
+                0
+            }
+            Some(_) => {
+                let (Some(lhs_text), Some(rhs_text)) = (rest.first(), rest.get(1)) else {
+                    sh_eprintln!(self, "bish: ::bish map: requires a KEY and what it should do");
+                    for line in crate::keymap::usage() {
+                        sh_eprintln!(self, "{line}");
+                    }
+                    return 2;
+                };
+                if rest.len() > 2 {
+                    // Two halves, always. A right-hand side split over
+                    // several words would be ambiguous about whether the
+                    // space is a key or a separator, which is the exact
+                    // ambiguity `<Space>` exists to remove.
+                    sh_eprintln!(self, "bish: ::bish map: too many arguments (a space in a mapping is <Space>)");
+                    return 2;
+                }
+                let (lhs, rhs) = match (crate::keymap::parse_keys(lhs_text), crate::keymap::parse_keys(rhs_text)) {
+                    (Ok(lhs), Ok(rhs)) => (lhs, rhs),
+                    (Err(why), _) | (_, Err(why)) => {
+                        sh_eprintln!(self, "bish: ::bish map: {why}");
+                        return 2;
+                    }
+                };
+                if let Some(bad) = lhs.iter().chain(rhs.iter()).find(|k| !crate::keymap::is_mappable(**k)) {
+                    sh_eprintln!(self, "bish: ::bish map: {} cannot carry a mapping", crate::keymap::format_keys(&[*bad]));
+                    return 2;
+                }
+                // Resolved here rather than at the keystroke: a
+                // right-hand side that means nothing should fail where
+                // it was written, not silently swallow keys later.
+                if let Err(why) = crate::bishedit::vimkeys::describe_key_sequence(&rhs) {
+                    sh_eprintln!(self, "bish: ::bish map: '{rhs_text}' is {why}");
+                    return 2;
+                }
+                if crate::keymap::never_fires(&mode) {
+                    // Stored anyway, so a config file written today keeps
+                    // working when the other modes arrive -- but said out
+                    // loud, because a mapping that lists and does nothing
+                    // is the worst of the available failures.
+                    sh_eprintln!(
+                        self,
+                        "bish: ::bish map: nothing in mode '{mode}' acts on mappings yet, so this will not fire (only {} do)",
+                        crate::keymap::REMAPPABLE.join(" and ")
+                    );
+                }
+                match self.mappings.iter_mut().find(|m| m.lhs == lhs && m.modes == mode) {
+                    Some(existing) => existing.rhs = rhs,
+                    None => self.mappings.push(crate::keymap::Mapping { modes: mode, lhs, rhs }),
+                }
+                0
             }
         }
     }
@@ -12317,6 +12452,7 @@ pub fn bish_sub_subcommands(sub: &str) -> &'static [&'static str] {
         "window" | "win" => &["next", "previous", "new", "rename", "ls", "select"],
         "hook" => &["ls", "add", "rm", "help"],
         "lsp" => &["ls", "add", "rm", "status", "log", "restart", "help"],
+        "map" => &["--mode=", "--erase", "--list", "help"],
         _ => &[],
     }
 }

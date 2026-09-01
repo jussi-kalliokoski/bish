@@ -1919,6 +1919,40 @@ enum MarkKind {
 }
 
 
+/// Resolves a mapping's right-hand side against the *default* bindings
+/// and names what it does, or says why it is not a usable right-hand
+/// side.
+///
+/// A fresh `VimKeys` is the whole of what makes this noremap: it has no
+/// keymap of its own to consult, so the resolution cannot chain through
+/// another mapping however the table is arranged. Called when a mapping
+/// is defined, both to reject a bad right-hand side up front and to
+/// produce the description `::bish map` lists.
+///
+/// A sequence may resolve to more than one action -- `jj` is two -- and
+/// is named as such, joined with " then ". Ending mid-action is an
+/// error rather than a mapping that swallows keys and does nothing.
+pub fn describe_key_sequence(keys: &[Key]) -> Result<String, String> {
+    let mut vk = VimKeys::new();
+    let mut actions = Vec::new();
+    let mut last = KeyOutcome::Pending;
+    for key in keys {
+        last = vk.feed(*key);
+        match &last {
+            KeyOutcome::Pending => {}
+            KeyOutcome::None => return Err("unrecognized".to_string()),
+            outcome => actions.push(describe_outcome(outcome)),
+        }
+    }
+    if matches!(last, KeyOutcome::Pending) {
+        return Err("incomplete".to_string());
+    }
+    if actions.is_empty() {
+        return Err("unrecognized".to_string());
+    }
+    Ok(actions.join(" then "))
+}
+
 /// The canonical name of a resolved key outcome, as `::bish map` prints
 /// it.
 ///
