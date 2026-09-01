@@ -1156,7 +1156,7 @@ pub struct Shell {
     // at the *same* table, not a copy of it. With only one Shell alive
     // today, this is behaviorally invisible -- it just draws the seam that
     // work needs.
-    jobs: Rc<RefCell<JobTable>>,
+    pub(crate) jobs: Rc<RefCell<JobTable>>,
     // `trap CMD SIGNAL`. EXIT is handled separately (exit_trap below) since
     // it isn't a real OS signal. Everything else here is a genuine
     // sigaction-installed handler (see install_trap_handler) -- the numeric
@@ -1227,7 +1227,7 @@ pub struct Shell {
     // which defaults it off for a non-interactive script (only real
     // interactive shells, or a script that explicitly opts in, get it).
     // `jobs`/`wait`/`kill` aren't gated by this; only fg/bg are.
-    opt_monitor: bool,
+    pub(crate) opt_monitor: bool,
     // `set -r` (bash's own restricted-shell mode -- NOT the same thing
     // as restrict_to_builtins below, which is bish's own unrelated
     // command-mode-colon-line feature). Only a short flag in real bash
@@ -1344,7 +1344,7 @@ pub struct Shell {
     // to that signal) -- see ExecResult::Fg's doc comment. Not shared via
     // Rc: only ever set and cleared within the single session that ran
     // `fg`, never meant to be visible to any other session.
-    pending_fg: Option<Job>,
+    pub(crate) pending_fg: Option<Job>,
     // Same pattern as `pending_fg` just above, for `e` -- see
     // ExecResult::Edit's own doc comment. Holds `e`'s own argument
     // vector verbatim (everything after the command word, unparsed):
@@ -2105,7 +2105,7 @@ impl Shell {
         table.jobs.push(Job { id, pids, children, cmd_text, pty_master, sink_screen, nonblocking: false, pgid, stopped: false });
     }
 
-    fn resolve_job_spec(&self, spec: &str) -> Option<usize> {
+    pub(crate) fn resolve_job_spec(&self, spec: &str) -> Option<usize> {
         let table = self.jobs.borrow();
         let rest = spec.strip_prefix('%').unwrap_or(spec);
         if rest.is_empty() || rest == "%" || rest == "+" {
@@ -2118,205 +2118,6 @@ impl Shell {
             return table.jobs.iter().position(|j| j.id == n);
         }
         table.jobs.iter().position(|j| j.cmd_text.starts_with(rest))
-    }
-
-    fn run_jobs(&mut self, _args: &[String]) -> i32 {
-        let mut table = self.jobs.borrow_mut();
-        let last_idx = table.jobs.len().checked_sub(1);
-        let prev_idx = table.jobs.len().checked_sub(2);
-        let mut to_remove = Vec::new();
-        for (i, job) in table.jobs.iter_mut().enumerate() {
-            let mark = if Some(i) == last_idx {
-                "+"
-            } else if Some(i) == prev_idx {
-                "-"
-            } else {
-                " "
-            };
-            // Checked before Job::poll -- that only ever wraps Child::
-            // try_wait, which never observes a stop (no WUNTRACED), so a
-            // job this shell has already recorded as Stopped would
-            // otherwise just look Running to it forever (see Job::
-            // stopped's own doc comment).
-            if job.stopped {
-                // No trailing " &": bash only shows that for a job
-                // actually launched with `&`, and a job stopped via
-                // Ctrl-Z from the foreground wasn't.
-                sh_println!(self, "[{}]{}  Stopped                 {}", job.id, mark, job.cmd_text);
-                continue;
-            }
-            match job.poll() {
-                Some(_) => {
-                    sh_println!(self, "[{}]{}  Done                    {} &", job.id, mark, job.cmd_text);
-                    to_remove.push(i);
-                }
-                None => {
-                    sh_println!(self, "[{}]{}  Running                 {} &", job.id, mark, job.cmd_text);
-                }
-            }
-        }
-        for i in to_remove.into_iter().rev() {
-            table.jobs.remove(i);
-        }
-        0
-    }
-
-    // disown [-a|-r] [%job|pid...]: removes matching jobs from the job
-    // table without touching their children at all -- Rust's own
-    // `Child::drop` never kills a still-running process, only closes the
-    // handle, so simply removing the entry already gives disown's
-    // "stop tracking, let it keep running independently" effect. bish
-    // has no SIGHUP-on-exit for background jobs to begin with (a
-    // separate, pre-existing gap), so the other half of real disown's
-    // job -- surviving that signal -- doesn't apply here; this only
-    // affects `jobs`/`wait`/`fg`/`bg` no longer seeing the job. Bare
-    // `disown` (no flags, no specs) disowns just the current job,
-    // matching bash.
-    fn run_disown(&mut self, args: &[String]) -> i32 {
-        let mut all = false;
-        let mut running_only = false;
-        let mut specs: Vec<&String> = Vec::new();
-        for a in args {
-            match a.as_str() {
-                "-a" => all = true,
-                "-r" => running_only = true,
-                _ => specs.push(a),
-            }
-        }
-        if all {
-            self.jobs.borrow_mut().jobs.clear();
-            return 0;
-        }
-        if running_only && specs.is_empty() {
-            self.jobs.borrow_mut().jobs.retain(|j| j.stopped);
-            return 0;
-        }
-        if specs.is_empty() {
-            let mut table = self.jobs.borrow_mut();
-            if table.jobs.is_empty() {
-                sh_eprintln!(self, "bish: disown: current: no such job");
-                return 1;
-            }
-            table.jobs.pop();
-            return 0;
-        }
-        // resolve_job_spec takes its own immutable borrow of self.jobs,
-        // so every spec is resolved to an index before the single
-        // borrow_mut below that actually removes them (highest index
-        // first, so earlier removals don't shift later indices out from
-        // under this same pass).
-        let mut status = 0;
-        let mut idxs: Vec<usize> = Vec::new();
-        for s in specs {
-            match self.resolve_job_spec(s) {
-                Some(i) => idxs.push(i),
-                None => {
-                    sh_eprintln!(self, "bish: disown: {}: no such job", s);
-                    status = 1;
-                }
-            }
-        }
-        idxs.sort_unstable();
-        idxs.dedup();
-        let mut table = self.jobs.borrow_mut();
-        for idx in idxs.into_iter().rev() {
-            table.jobs.remove(idx);
-        }
-        status
-    }
-
-    // A job that *was* spawned pty-attached (Job::pty_master.is_some() --
-    // only true for a promoted, unredirected background job) bubbles
-    // ExecResult::Fg without blocking at all: see that variant's doc
-    // comment for why the actual poll loop has to happen through
-    // repl.rs's Shell::take_pending_fg + drive_fg_job instead of directly
-    // here.
-    //
-    // A job real job control isolated into its own process group (Job::
-    // pgid -- see its own doc comment) gets the real terminal-foregrounding
-    // dance: SIGCONT it if it was Stopped, tcsetpgrp the real terminal at
-    // it, wait watching for it to stop *again* (not just exit -- see
-    // waitpid_untraced) rather than Job::wait's plain blocking wait
-    // (which can never observe a stop), then reclaim the terminal for
-    // bish either way.
-    //
-    // Anything else (no pty, no pgid -- a multi-stage pipeline, or a job
-    // spawned before this shell ever ran under `set -m`) falls back to
-    // the original plain blocking wait: scripts don't distinguish that
-    // from real terminal foregrounding since they never interactively
-    // signal the job via the keyboard anyway.
-    fn run_fg(&mut self, args: &[String]) -> ExecResult {
-        if !self.opt_monitor {
-            sh_eprintln!(self, "bish: fg: no job control");
-            return ExecResult::Status(1);
-        }
-        let idx = match args.first() {
-            Some(spec) => self.resolve_job_spec(spec),
-            None => self.jobs.borrow().jobs.len().checked_sub(1),
-        };
-        match idx {
-            Some(i) => {
-                let mut job = {
-                    let mut table = self.jobs.borrow_mut();
-                    sh_println!(self, "{}", table.jobs[i].cmd_text);
-                    table.jobs.remove(i)
-                };
-                if job.pty_master.is_some() {
-                    // Real bug, found interactively: if this job was
-                    // Stopped (Ctrl-Z while it was pty-driven -- see
-                    // FgJob::send_stop), it's sitting there SIGSTOP'd
-                    // right now. Bubbling it to repl.rs's drive_fg_job
-                    // without resuming it first means that loop just
-                    // forwards keystrokes (including further Ctrl-C/
-                    // Ctrl-Z) into a pty whose sole reader is frozen and
-                    // can't act on any of them -- not even run a signal
-                    // handler, since a stopped process runs *no* code at
-                    // all until continued -- which looked like the whole
-                    // shell hanging, unrecoverable short of the
-                    // undiscoverable Ctrl+Space detach. This job's own
-                    // pgid always equals its own (single) pid -- see
-                    // Job::pgid's doc comment on why pty-attached jobs
-                    // don't separately store one -- so send_signal_to_pgrp
-                    // on that pid reaches the same process SIGCONT would
-                    // via a real pgid.
-                    if job.stopped {
-                        if let Some(&pid) = job.pids.first() {
-                            send_signal_to_pgrp(pid, SIGCONT);
-                        }
-                        job.stopped = false;
-                    }
-                    self.pending_fg = Some(job);
-                    return ExecResult::Fg;
-                }
-                if let Some(pgid) = job.pgid {
-                    if job.stopped {
-                        send_signal_to_pgrp(pgid, SIGCONT);
-                        job.stopped = false;
-                    }
-                    pty::tcsetpgrp(0, pgid as i32).ok();
-                    let outcome = waitpid_untraced(job.pids[0]);
-                    unsafe {
-                        pty::tcsetpgrp(0, getpgrp()).ok();
-                    }
-                    return match outcome {
-                        JobWaitOutcome::Exited(status) => ExecResult::Status(status),
-                        JobWaitOutcome::Stopped(_sig) => {
-                            job.stopped = true;
-                            let id = job.id;
-                            let cmd_text = job.cmd_text.clone();
-                            self.jobs.borrow_mut().jobs.push(job);
-                            sh_println!(self, "\n[{}]+  Stopped                 {}", id, cmd_text);
-                            ExecResult::Status(148)
-                        }
-                    };
-                }
-                ExecResult::Status(job.wait())
-            }
-            None => {
-                sh_eprintln!(self, "bish: fg: no current job");
-                ExecResult::Status(1)
-            }
-        }
     }
 
     // Safety net for the one place ExecResult::Fg can arise that repl.rs
@@ -2431,147 +2232,6 @@ impl Shell {
         let cmd_text = job.cmd_text.clone();
         table.jobs.push(job);
         (id, cmd_text)
-    }
-
-    // Resumes a Stopped job (Job::stopped) in place, without reclaiming
-    // the real terminal for it -- SIGCONT to its process group is enough;
-    // it keeps running with whatever stdio it already had (inherited from
-    // the real terminal, same as any backgrounded command), it just isn't
-    // the terminal's foreground process group, so it won't receive
-    // further Ctrl-C/Ctrl-Z (and will itself stop again on SIGTTIN/
-    // SIGTTOU if it ever tries to read from the terminal -- ordinary
-    // kernel behavior, nothing this shell needs to implement).
-    // A job that's *already* running (no pgid at all, or pgid but not
-    // stopped) has nothing to resume -- matches real bash, confirmed:
-    // `bg` on an already-running job just reports "already in background"
-    // and returns 0.
-    fn run_bg(&mut self, args: &[String]) -> i32 {
-        if !self.opt_monitor {
-            sh_eprintln!(self, "bish: bg: no job control");
-            return 1;
-        }
-        let idx = match args.first() {
-            Some(spec) => self.resolve_job_spec(spec),
-            None => self.jobs.borrow().jobs.len().checked_sub(1),
-        };
-        match idx {
-            Some(i) => {
-                let mut table = self.jobs.borrow_mut();
-                let job = &mut table.jobs[i];
-                if job.stopped {
-                    // Same fix as run_fg's own pty_master.is_some()
-                    // branch: a pty-attached job doesn't store a
-                    // separate pgid (see Job::pgid's doc comment), but
-                    // its own pid always equals its own pgid (setsid),
-                    // so send_signal_to_pgrp on that pid resumes it the
-                    // same way.
-                    if let Some(pid) = job.pgid.or_else(|| job.pids.first().copied()) {
-                        send_signal_to_pgrp(pid, SIGCONT);
-                    }
-                    job.stopped = false;
-                    sh_println!(self, "[{}]+  {} &", job.id, job.cmd_text);
-                    return 0;
-                }
-                sh_eprintln!(self, "bish: bg: job {} already in background", job.id);
-                0
-            }
-            None => {
-                sh_eprintln!(self, "bish: bg: no current job");
-                1
-            }
-        }
-    }
-
-    // `wait` with no operands waits for every active job and always
-    // returns 0 (POSIX-specified, confirmed against real bash); with
-    // operands, waits for just those and returns the *last* one's status.
-    // Stopped jobs (Job::stopped) are skipped rather than waited on --
-    // Job::wait is a plain Child::wait, which (no WUNTRACED) would just
-    // block forever on a job that's merely stopped, not exited.
-    fn run_wait(&mut self, args: &[String]) -> i32 {
-        if args.is_empty() {
-            loop {
-                let idx = self.jobs.borrow().jobs.iter().position(|j| !j.stopped);
-                let Some(idx) = idx else { break };
-                let mut job = self.jobs.borrow_mut().jobs.remove(idx);
-                job.wait();
-            }
-            return 0;
-        }
-        let mut status = 0;
-        for a in args {
-            if let Some(idx) = self.resolve_job_spec(a) {
-                if self.jobs.borrow().jobs[idx].stopped {
-                    sh_eprintln!(self, "bish: wait: job {} is stopped", self.jobs.borrow().jobs[idx].id);
-                    status = 127;
-                    continue;
-                }
-                let mut job = self.jobs.borrow_mut().jobs.remove(idx);
-                status = job.wait();
-                continue;
-            }
-            match a.parse::<u32>() {
-                Ok(pid) => {
-                    let idx = self.jobs.borrow().jobs.iter().position(|j| j.pids.contains(&pid));
-                    match idx {
-                        Some(idx) => {
-                            let mut job = self.jobs.borrow_mut().jobs.remove(idx);
-                            status = job.wait();
-                        }
-                        None => {
-                            sh_eprintln!(self, "bish: wait: pid {} is not a child of this shell", pid);
-                            status = 127;
-                        }
-                    }
-                }
-                Err(_) => {
-                    sh_eprintln!(self, "bish: wait: {}: no such job", a);
-                    status = 127;
-                }
-            }
-        }
-        status
-    }
-
-    // kill [-SIGNAME|-N] pid|%job ... Negative PIDs (process-group kill)
-    // aren't specially handled -- see the `jobs` field comment on why real
-    // process-group management is out of scope here.
-    fn run_kill(&mut self, args: &[String]) -> i32 {
-        let mut sig = 15; // SIGTERM
-        let mut targets: Vec<&String> = Vec::new();
-        for a in args {
-            if let Some(rest) = a.strip_prefix('-') {
-                if rest == "l" {
-                    for (name, num) in SIGNAL_NAMES {
-                        sh_println!(self, "{}) SIG{}", num, name);
-                    }
-                    return 0;
-                }
-                if let Some(n) = signal_number(rest) {
-                    sig = n;
-                    continue;
-                }
-            }
-            targets.push(a);
-        }
-        let mut status = 0;
-        for t in targets {
-            if let Some(idx) = t.strip_prefix('%').and_then(|_| self.resolve_job_spec(t)) {
-                let pids = self.jobs.borrow().jobs[idx].pids.clone();
-                for pid in pids {
-                    send_signal(pid, sig);
-                }
-            } else if let Ok(pid) = t.parse::<i32>() {
-                if !send_signal(pid as u32, sig) {
-                    sh_eprintln!(self, "bish: kill: ({}) - No such process", pid);
-                    status = 1;
-                }
-            } else {
-                sh_eprintln!(self, "bish: kill: {}: arguments must be process or job IDs", t);
-                status = 1;
-            }
-        }
-        status
     }
 
     // getopts optstring name [args...]. Options requiring an argument are
@@ -8214,12 +7874,12 @@ impl Shell {
                 }
                 return ExecResult::Status(0);
             }
-            "jobs" => return ExecResult::Status(self.run_jobs(&argv[1..])),
-            "disown" => return ExecResult::Status(self.run_disown(&argv[1..])),
-            "fg" => return self.run_fg(&argv[1..]),
-            "bg" => return ExecResult::Status(self.run_bg(&argv[1..])),
-            "wait" => return ExecResult::Status(self.run_wait(&argv[1..])),
-            "kill" => return ExecResult::Status(self.run_kill(&argv[1..])),
+            "jobs" => return ExecResult::Status(crate::builtins::jobs::run_jobs(self, &argv[1..])),
+            "disown" => return ExecResult::Status(crate::builtins::jobs::run_disown(self, &argv[1..])),
+            "fg" => return crate::builtins::jobs::run_fg(self, &argv[1..]),
+            "bg" => return ExecResult::Status(crate::builtins::jobs::run_bg(self, &argv[1..])),
+            "wait" => return ExecResult::Status(crate::builtins::jobs::run_wait(self, &argv[1..])),
+            "kill" => return ExecResult::Status(crate::builtins::jobs::run_kill(self, &argv[1..])),
             "getopts" => return self.run_getopts(&argv[1..]),
             "unset" => {
                 let target = self.peek_stderr_target(&cmd.redirects);
@@ -10635,11 +10295,11 @@ impl std::os::fd::AsRawFd for KeptFd {
 // poll/block on them directly -- earlier this shell just spawned a thread
 // that blindly `.wait()`d and dropped the result, which meant nothing else
 // could ever observe a background job's completion or exit status.
-struct Job {
-    id: u32,
-    pids: Vec<u32>,
+pub(crate) struct Job {
+    pub(crate) id: u32,
+    pub(crate) pids: Vec<u32>,
     children: Vec<std::process::Child>,
-    cmd_text: String,
+    pub(crate) cmd_text: String,
     // The pty (M7) this background job's stdio is attached to instead of
     // inheriting the real terminal's fds -- set for every background job
     // spawned while promoted, whatever shape it is: a single external
@@ -10654,7 +10314,7 @@ struct Job {
     // into the fg-ing session's grid instead of blocking on Job::wait(),
     // and drain_background_output keeps the job's output flowing into
     // `sink_screen` while it stays in the background.
-    pty_master: Option<std::fs::File>,
+    pub(crate) pty_master: Option<std::fs::File>,
     // The grid this job's own output belongs in: the sink of whichever
     // session spawned it, captured at that moment (see push_job_full).
     // Recorded on the *job* rather than looked up later because the job
@@ -10681,7 +10341,7 @@ struct Job {
     // %N`/`bg` reach the whole job), which is why its own pty is wired as
     // plain fds rather than through spawn_attached: that setsid would
     // undo exactly this.
-    pgid: Option<u32>,
+    pub(crate) pgid: Option<u32>,
     // True once this job has been observed stopped (via a WUNTRACED-
     // aware wait -- see waitpid_untraced) rather than exited. Checked by
     // `jobs`/`wait` before touching Job::poll/wait, neither of which can
@@ -10690,13 +10350,13 @@ struct Job {
     // correct for every *other* caller, since only run_fg's real-job-
     // control path and run_single's own foreground wait ever use
     // waitpid_untraced directly). Cleared by `fg`/`bg` resuming it.
-    stopped: bool,
+    pub(crate) stopped: bool,
 }
 
 // Backs Shell.jobs (see that field's doc comment for why this lives behind
 // Rc<RefCell<_>> instead of being owned directly).
-struct JobTable {
-    jobs: Vec<Job>,
+pub(crate) struct JobTable {
+    pub(crate) jobs: Vec<Job>,
     next_job_id: u32,
     // $!: PID of the most recently backgrounded command (the last stage,
     // for a backgrounded pipeline -- matches bash). Mirrors `jobs.last()`'s
@@ -10718,7 +10378,7 @@ impl Job {
     // "done" when its last stage exits; this shell reports done once the
     // whole pipeline has, and uses the last child's code, matching the
     // pipeline exit-status convention used elsewhere in this file).
-    fn poll(&mut self) -> Option<i32> {
+    pub(crate) fn poll(&mut self) -> Option<i32> {
         let mut all_done = true;
         let mut last_code = 0;
         for c in &mut self.children {
@@ -10732,7 +10392,7 @@ impl Job {
     }
 
     // Blocking wait for every child in the job.
-    fn wait(&mut self) -> i32 {
+    pub(crate) fn wait(&mut self) -> i32 {
         let mut last_code = 0;
         for c in &mut self.children {
             match c.wait() {
@@ -11359,7 +11019,7 @@ pub(crate) const SIGNAL_NAMES: &[(&str, i32)] = &[
 
 // Accepts "INT", "SIGINT", or a bare number ("2"); "0"/"EXIT" is handled by
 // the caller separately since it isn't a real signal.
-fn signal_number(name: &str) -> Option<i32> {
+pub(crate) fn signal_number(name: &str) -> Option<i32> {
     let bare = name.strip_prefix("SIG").unwrap_or(name);
     if let Some(&(_, n)) = SIGNAL_NAMES.iter().find(|(n, _)| *n == bare) {
         return Some(n);
@@ -11371,7 +11031,7 @@ fn signal_name(num: i32) -> String {
     SIGNAL_NAMES.iter().find(|(_, n)| *n == num).map(|(name, _)| name.to_string()).unwrap_or_else(|| num.to_string())
 }
 
-fn send_signal(pid: u32, sig: i32) -> bool {
+pub(crate) fn send_signal(pid: u32, sig: i32) -> bool {
     unsafe extern "C" {
         fn kill(pid: i32, sig: i32) -> i32;
     }
@@ -11381,7 +11041,7 @@ fn send_signal(pid: u32, sig: i32) -> bool {
 // kill(2) with a negative pid targets the whole process group (POSIX) --
 // used to SIGCONT/SIGTERM/etc. a real-job-control job (Job::pgid) as a
 // unit, matching how the terminal driver itself would signal it.
-fn send_signal_to_pgrp(pgid: u32, sig: i32) -> bool {
+pub(crate) fn send_signal_to_pgrp(pgid: u32, sig: i32) -> bool {
     unsafe extern "C" {
         fn kill(pid: i32, sig: i32) -> i32;
     }
@@ -11391,14 +11051,14 @@ fn send_signal_to_pgrp(pgid: u32, sig: i32) -> bool {
 // Real job control (M11): SIGCONT, used to resume a Stopped job (Job::
 // stopped) from `fg`/`bg`. Linux/glibc's standard number, same "safe to
 // hardcode" reasoning as this file's other signal constants.
-const SIGCONT: i32 = 18;
+pub(crate) const SIGCONT: i32 = 18;
 // SIGSTOP: used by FgJob::send_stop instead of SIGTSTP -- see its own
 // doc comment for why the catchable version doesn't reliably work here.
 const SIGSTOP: i32 = 19;
 
 unsafe extern "C" {
     fn setpgid(pid: i32, pgid: i32) -> i32;
-    fn getpgrp() -> i32;
+    pub(crate) fn getpgrp() -> i32;
     fn waitpid(pid: i32, status: *mut i32, options: i32) -> i32;
 }
 
@@ -11415,7 +11075,7 @@ const WUNTRACED: i32 = 2;
 const WNOHANG: i32 = 1;
 
 // How a real-job-control wait (waitpid_untraced) ended.
-enum JobWaitOutcome {
+pub(crate) enum JobWaitOutcome {
     // Exited normally or was killed by a signal -- either way, this is
     // the process's final status, bash-convention-encoded (128+signum
     // for the killed case, matching exit_code_from_status elsewhere in
@@ -11462,7 +11122,7 @@ fn wait_status_stop_sig(status: i32) -> i32 {
 // pids real job control (Job::pgid) has isolated into their own process
 // group; every other job in this shell is still waited on the ordinary
 // way, via Child::wait/try_wait.
-fn waitpid_untraced(pid: u32) -> JobWaitOutcome {
+pub(crate) fn waitpid_untraced(pid: u32) -> JobWaitOutcome {
     loop {
         let mut status: i32 = 0;
         let r = unsafe { waitpid(pid as i32, &mut status, WUNTRACED) };
