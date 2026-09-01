@@ -965,6 +965,10 @@ pub struct Shell {
     /// `enable -n NAME`: builtins taken out of service, so the external
     /// of the same name runs instead.
     disabled_builtins: std::collections::HashSet<String>,
+    /// One entry per function call in progress, oldest first -- what
+    /// `caller` reports on. Pushed by `call_function`, which is the
+    /// only place a function body is entered.
+    call_stack: Vec<CallFrame>,
     /// `::bish hook`-registered commands, in the order they were added.
     /// Inherited by a virtual child exactly as `abbrs` is: a window you
     /// split off should behave like the one you split it from.
@@ -1418,6 +1422,21 @@ fn fresh_rng_seed() -> u64 {
     if seed == 0 { 0x2545F4914F6CDD1D } else { seed }
 }
 
+/// One in-progress function call, for `caller`.
+///
+/// `called` is the function whose body is running; `call_line` is the
+/// line its call sits on, and `source` the file that line is in.
+///
+/// Who *made* the call is not stored: it is the `called` of the frame
+/// below, or the script itself at the bottom. Deriving it keeps one
+/// source of truth, so a frame cannot disagree with the stack it is in.
+#[derive(Clone)]
+struct CallFrame {
+    called: String,
+    call_line: usize,
+    source: String,
+}
+
 impl Shell {
     pub fn new() -> Self {
         let mut shell = Shell {
@@ -1433,6 +1452,7 @@ impl Shell {
             abbrs: Vec::new(),
             mappings: Vec::new(),
             disabled_builtins: std::collections::HashSet::new(),
+            call_stack: Vec::new(),
             hooks: Vec::new(),
             next_hook_id: 1,
             lsp_servers: Vec::new(),
@@ -1722,6 +1742,7 @@ impl Shell {
             abbrs: self.abbrs.clone(),
             mappings: self.mappings.clone(),
             disabled_builtins: self.disabled_builtins.clone(),
+            call_stack: self.call_stack.clone(),
             hooks: self.hooks.clone(),
             next_hook_id: self.next_hook_id,
             lsp_servers: self.lsp_servers.clone(),
@@ -1840,7 +1861,7 @@ impl Shell {
             return ExecResult::Status(127);
         };
         self.in_command_not_found = true;
-        let result = self.call_function(&body, argv.to_vec());
+        let result = self.call_function(&argv[0], &body, argv.to_vec());
         self.in_command_not_found = false;
         result
     }
@@ -5252,6 +5273,54 @@ impl Shell {
     // only syscall shape, so reading the current value means setting a
     // throwaway mask and immediately restoring what was there. Moved here
     // alongside run_ulimit for the same M6 sink reason.
+    // `caller [N]` -- where the function you are in was called from.
+    //
+    // `caller 0` is the innermost call: the line it sits on, the
+    // function containing that line, and the file. `caller 1` is the
+    // call to *that* function, and so on outwards. A depth past the top
+    // of the stack prints nothing and fails, which is what makes
+    // `while caller $i; do ...` terminate.
+    //
+    // Bare `caller` is the short form: line and file only, no function
+    // name -- bash's own shape, and the reason this is not just `caller
+    // 0` with a default.
+    //
+    // Who made a call is the `called` of the frame below rather than
+    // anything stored: at the bottom of the stack nothing called it, and
+    // bash names that `main`.
+    fn run_caller(&mut self, args: &[String]) -> i32 {
+        if self.call_stack.is_empty() {
+            return 1;
+        }
+        let depth = match args.first() {
+            None => {
+                let frame = self.call_stack.last().expect("checked non-empty");
+                sh_println!(self, "{} {}", frame.call_line, frame.source);
+                return 0;
+            }
+            Some(a) => match a.parse::<usize>() {
+                Ok(n) => n,
+                Err(_) => {
+                    // bash's own shape here: the complaint, then the
+                    // usage, then 2 -- a malformed argument is a usage
+                    // error, not "no such frame", which is what 1 means
+                    // and is what `while caller $i` stops on.
+                    sh_eprintln!(self, "bish: caller: {a}: invalid number");
+                    sh_eprintln!(self, "caller: usage: caller [expr]");
+                    return 2;
+                }
+            },
+        };
+        let Some(idx) = self.call_stack.len().checked_sub(depth + 1) else {
+            return 1;
+        };
+        let frame = &self.call_stack[idx];
+        let enclosing =
+            if idx > 0 { self.call_stack[idx - 1].called.clone() } else { "main".to_string() };
+        sh_println!(self, "{} {} {}", frame.call_line, enclosing, frame.source);
+        0
+    }
+
     // `help [NAME...]` -- an index of the builtins.
     //
     // A name may be a glob, as bash's is, so `help comp*` works. A name
@@ -6653,7 +6722,15 @@ impl Shell {
         }
     }
 
-    fn call_function(&mut self, body: &parser::Command, call_args: Vec<String>) -> ExecResult {
+    fn call_function(&mut self, name: &str, body: &parser::Command, call_args: Vec<String>) -> ExecResult {
+        // Recorded before the body runs, so `current_line` is still the
+        // line of the call rather than of whatever the body reaches
+        // first.
+        self.call_stack.push(CallFrame {
+            called: name.to_string(),
+            call_line: self.current_line,
+            source: self.script_name.clone(),
+        });
         self.arg_frames.push(call_args);
         self.function_depth += 1;
         self.var_scopes.push(HashMap::new());
@@ -6661,6 +6738,7 @@ impl Shell {
         self.assoc_local_stack.push(Vec::new());
         self.nameref_local_stack.push(Vec::new());
         let result = self.run_command(body, false);
+        self.call_stack.pop();
         self.var_scopes.pop();
         if let Some(frame) = self.nameref_local_stack.pop() {
             for (name, was_nameref) in frame.into_iter().rev() {
@@ -7264,7 +7342,7 @@ impl Shell {
         if !self.restrict_to_builtins
             && let Some(body) = self.functions.get(&name).cloned()
         {
-            return self.call_function(&body, argv[1..].to_vec());
+            return self.call_function(&name, &body, argv[1..].to_vec());
         }
         // A prefix assignment (`IFS=: read a b`) is in scope for the
         // command it prefixes and gone afterwards. The external path
@@ -7540,6 +7618,7 @@ impl Shell {
             "times" => return ExecResult::Status(self.run_times(&argv[1..])),
             "enable" => return ExecResult::Status(self.run_enable(&argv[1..])),
             "help" => return ExecResult::Status(self.run_help(&argv[1..])),
+            "caller" => return ExecResult::Status(self.run_caller(&argv[1..])),
             "ulimit" => return ExecResult::Status(self.run_ulimit(&argv[1..])),
             // alias/unalias: store and query only, no expansion when a
             // command runs -- see the comment on the `aliases` field for
@@ -12460,6 +12539,7 @@ const BUILTIN_HELP: &[(&str, &str)] = &[
     ("bishopt", "Get or set bish's own options."),
     ("break", "Leave a for, while or until loop."),
     ("builtin", "Run a builtin, ignoring any function or `enable -n`."),
+    ("caller", "Show where the current function was called from."),
     ("cd", "Change the working directory."),
     ("command", "Run a command, ignoring any function of the same name."),
     ("compgen", "Generate the completions a `complete` spec would offer."),
@@ -12521,6 +12601,7 @@ const BUILTIN_HELP: &[(&str, &str)] = &[
 const KNOWN_BUILTINS: &[&str] = &[
     ":",
     "times",
+    "caller",
     "enable",
     "help",
     // Every name `dispatch_builtin_or_external_impl` handles has to be
@@ -13155,6 +13236,43 @@ mod tests {
         }
         unsafe { tzset() };
         out
+    }
+
+    #[test]
+    fn caller_walks_out_through_the_calls_that_got_here() {
+        // Checked line-for-line against real bash on the same script.
+        let dir = std::env::temp_dir().join(format!("bish-caller-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("c.sh");
+        std::fs::write(
+            &script,
+            "a() {\n  r0=$(caller 0)\n  r1=$(caller 1)\n  r2=$(caller 2)\n  rb=$(caller)\n}\nb() {\n  a\n}\nb\n",
+        )
+        .unwrap();
+        let mut sh = Shell::new();
+        let src = script.display().to_string();
+        // Run as a script rather than via `source`: `caller` reports the
+        // file a frame's line is in, and `source` does not update
+        // `script_name`, so a sourced file still reports the outer one.
+        // Noted rather than fixed here -- it is bash's `BASH_SOURCE`
+        // that bish has none of, and that is its own work.
+        sh.set_script_args(src.clone(), Vec::new());
+        sh.run_source_here(&std::fs::read_to_string(&script).unwrap(), &src);
+        // The innermost call: the line it is on, the function that line
+        // is in, and the file.
+        assert_eq!(sh.debug_peek_var("r0").as_deref(), Some(format!("8 b {src}").as_str()));
+        // ...then the call to *that* function. Nothing called `b`, and
+        // bash names that `main`.
+        assert_eq!(sh.debug_peek_var("r1").as_deref(), Some(format!("10 main {src}").as_str()));
+        // Past the top is empty, which is what stops `while caller $i`.
+        assert_eq!(sh.debug_peek_var("r2").as_deref(), Some(""));
+        // Bare `caller` is the short form: no function name.
+        assert_eq!(sh.debug_peek_var("rb").as_deref(), Some(format!("8 {src}").as_str()));
+
+        // Outside any function there is nothing to report.
+        let mut sh = Shell::new();
+        assert_eq!(sh.run_caller(&[]), 1);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
