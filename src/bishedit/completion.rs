@@ -676,19 +676,32 @@ impl<'a> ShellCompletionProvider<'a> {
             let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
             // `target/` and `node_modules/` are the whole reason to
             // bother: a completion list they are in is a completion list
-            // you have to read past.
-            if let Some(ignore) = &ignore
-                && ignore.matched(&entry.path(), is_dir).is_ignored()
-            {
-                continue;
-            }
-            names.push(format!("{dir_part}{name}{}", if is_dir { "/" } else { "" }));
+            // you have to read past. Recorded rather than dropped,
+            // though -- see the fallback below.
+            let ignored = ignore.as_ref().is_some_and(|i| i.matched(&entry.path(), is_dir).is_ignored());
+            names.push((format!("{dir_part}{name}{}", if is_dir { "/" } else { "" }), ignored));
         }
-        // `FIGNORE`, last: a suffix is about the name, so this filters
-        // what the listing produced rather than what it read.
-        // Directories keep their trailing `/` here, which is why the
-        // suffix test looks past it -- `FIGNORE=.o` should not be
-        // defeated by a directory called `x.o`.
+        let visible: Vec<String> = names.iter().filter(|(_, ig)| !ig).map(|(n, _)| n.clone()).collect();
+        let ranked = self.rank_files(prefix, visible);
+        // An ignored file is still a file, and asking for one by name is
+        // not a mistake -- `.gitignore` says "don't clutter the listing
+        // with this", not "this cannot be typed". So when hiding them
+        // leaves the word with nothing to complete to, offer them: the
+        // noise they would have added is exactly zero, and the
+        // alternative is a Tab that does nothing while the only possible
+        // answer sits in the directory.
+        if !ranked.is_empty() || !names.iter().any(|(_, ig)| *ig) {
+            return ranked;
+        }
+        self.rank_files(prefix, names.into_iter().map(|(n, _)| n).collect())
+    }
+
+    // `FIGNORE`, last: a suffix is about the name, so this filters what
+    // the listing produced rather than what it read. Directories keep
+    // their trailing `/` here, which is why the suffix test looks past
+    // it -- `FIGNORE=.o` should not be defeated by a directory called
+    // `x.o`.
+    fn rank_files(&self, prefix: &str, mut names: Vec<String>) -> Vec<CompletionCandidate> {
         if !self.fignore.is_empty() {
             let ignored = |n: &String| {
                 let bare = n.strip_suffix('/').unwrap_or(n);
@@ -743,6 +756,51 @@ mod tests {
         // something, which is the whole point of being able to turn it
         // off.
         assert_eq!(offer(vec![".o".to_string(), ".c".to_string()], false), all);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn an_ignored_file_still_completes_when_it_is_the_only_answer() {
+        let dir = std::env::temp_dir().join(format!("bish-completion-gitignore-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        std::fs::write(dir.join(".gitignore"), "plan.md\ntarget\n").unwrap();
+        for n in ["plan.md", "notes.md"] {
+            std::fs::write(dir.join(n), "").unwrap();
+        }
+        std::fs::create_dir_all(dir.join("target")).unwrap();
+        let offer = |word: &str| {
+            let provider = ShellCompletionProvider {
+                cwd: Some(&dir),
+                known_functions: None,
+                completions: None,
+                default_completion: None,
+                action_ctx: None,
+                functions_preamble: None,
+                honor_gitignore: true,
+                fignore: Vec::new(),
+                force_fignore: false,
+                hl_names: Vec::new(),
+            };
+            let line = format!("cat {word}");
+            let mut got: Vec<String> = provider
+                .complete(CompletionRequest { line: &line, cursor: line.len() })
+                .candidates
+                .into_iter()
+                .map(|c| c.display)
+                .collect();
+            got.sort();
+            got
+        };
+        assert_eq!(
+            offer(""),
+            vec![".git/".to_string(), ".gitignore".to_string(), "notes.md".to_string()],
+            "an empty word gets the uncluttered listing -- `target/` and `plan.md` are the ones .gitignore names"
+        );
+        assert_eq!(offer("plan"), vec!["plan.md".to_string()], "but naming one is not a mistake");
+        assert_eq!(offer("targ"), vec!["target/".to_string()]);
+        assert_eq!(offer("notes"), vec!["notes.md".to_string()], "a word the filter can answer never reaches the fallback");
+        assert!(offer("zzz").is_empty(), "and the fallback invents nothing");
         std::fs::remove_dir_all(&dir).ok();
     }
 
