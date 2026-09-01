@@ -4,11 +4,16 @@
 // (unspanned) AST. See lint.rs's own doc comment for why the AST
 // doesn't carry the source positions this needs.
 //
-// The whole formatter reduces to one idea: a token's own span is never
-// rewritten -- its literal source text (quoting, expansion syntax, a
-// subshell's raw interior, everything) is always copied through
-// verbatim. All this ever changes is the *gap* between one real item's
-// end and the next real item's start. Indentation is just the gap
+// The whole formatter reduces to one idea: a token's own span is very
+// nearly never rewritten -- its literal source text (expansion syntax,
+// a subshell's raw interior, everything) is copied through verbatim,
+// and all this normally changes is the *gap* between one real item's
+// end and the next real item's start.
+//
+// Two rules do touch a token, and both are named where they are: the
+// `function` keyword is deleted (see Tok::KwFunction below), and a word
+// that is one wholly-literal run is requoted to its plainest form (see
+// `canonical_quoting`). Everything else still only moves whitespace. Indentation is just the gap
 // immediately before a line's first token; joining `then`/`do`/`in`/
 // `{` onto their own header line (deliberately, per the user's own
 // design -- not "detect and preserve the existing style") is choosing
@@ -199,6 +204,90 @@ fn span_of(item: &SpannedItem) -> std::ops::Range<usize> {
 // leading requirement (e.g. KwFi dedenting) always takes priority over
 // whatever the previous item optimistically forced (see the empty
 // `if ...; then fi` case).
+// Quoting a word that does not need it is noise, and this is the one
+// rule here that rewrites a token rather than the gap beside it (the
+// `function` keyword's own deletion below is the other).
+//
+// Three answers, in order:
+//
+// - Nothing in the text needs a shell to be told to leave it alone:
+//   drop the quotes entirely.
+// - Something does, but nothing in it needs *double* quotes -- no
+//   expansion, no substitution: single-quote it, which is the form that
+//   says "this is exactly these characters" with the fewest rules
+//   attached.
+// - Otherwise leave the source alone.
+//
+// Only ever applied to a word that is one wholly-literal run. A word
+// built out of several pieces -- `"$(foo)"'\n'a"$(bar)"` -- is left
+// exactly as written: each piece is quoted the way it is for its own
+// reason, and rewriting the parts to a single canonical whole is a
+// different and much larger decision than this rule is making.
+fn canonical_quoting(text: &str) -> Option<String> {
+    if bare_is_safe(text) {
+        return Some(text.to_string());
+    }
+    match text.contains('\'') {
+        // A `'` inside would end the quote, and `'\''` is not obviously
+        // an improvement on whatever is already there.
+        true => None,
+        false => Some(format!("'{text}'")),
+    }
+}
+
+// Whether `text` means itself with no quoting at all.
+//
+// An allow-list, not a deny-list, and a short one: every character here
+// is one that neither the lexer nor any later expansion pass gives a
+// meaning to. That is what makes this safe for the places a word is not
+// simply an argument -- a `case` pattern or the right-hand side of
+// `[[ x == y ]]` are matched as globs, and no glob metacharacter is on
+// this list, so a pattern that was literal stays literal.
+fn bare_is_safe(text: &str) -> bool {
+    if text.is_empty() {
+        return false;
+    }
+    // `#` opens a comment and `~` names a home directory, but only
+    // where a word begins -- which is exactly where bash's own
+    // `printf %q` escapes them and nowhere else.
+    let safe_anywhere = |c: char| c.is_alphanumeric() || "%+-./:@_=".contains(c);
+    if !text.chars().enumerate().all(|(i, c)| safe_anywhere(c) || (i > 0 && (c == '#' || c == '~'))) {
+        return false;
+    }
+    // `2>file` redirects fd 2 where `"2">file` writes the word. The
+    // formatter's own spacing makes that hard to reach, but "hard to
+    // reach" is not a reason to hand back a different program.
+    if text.chars().all(|c| c.is_ascii_digit()) {
+        return false;
+    }
+    // `"a=b" cmd` runs a command called `a=b`; `a=b cmd` sets a
+    // variable. Anything shaped like an assignment keeps its quotes --
+    // which still leaves `--flag=value` alone to lose them, since a
+    // name cannot start with `-`.
+    let name = text.split('=').next().unwrap_or_default();
+    let assignment_shaped = text.contains('=')
+        && !name.is_empty()
+        && name.starts_with(|c: char| c.is_alphabetic() || c == '_')
+        && name.chars().all(|c| c.is_alphanumeric() || c == '_');
+    !assignment_shaped
+}
+
+// The literal text of a word that is one wholly-literal run, or `None`
+// for anything else: a word with an expansion in it, one built from
+// several pieces, or one that was never quoted to begin with.
+fn sole_literal(chunks: &[lexer::Chunk], plain: bool) -> Option<&str> {
+    if plain {
+        return None;
+    }
+    match chunks {
+        // `''` and `""` both arrive as one empty `Str`, since there is
+        // no literal run for the lexer to record.
+        [lexer::Chunk::Str(text)] if text.is_empty() => Some(text),
+        [lexer::Chunk::LiteralStr(text)] => Some(text),
+        _ => None,
+    }
+}
+
 fn format_gaps(chars: &[char], real: &[&SpannedItem]) -> Vec<Diagnostic> {
     let mut stack: Vec<Block> = Vec::new();
     let mut diagnostics = Vec::new();
@@ -367,6 +456,29 @@ fn format_gaps(chars: &[char], real: &[&SpannedItem]) -> Vec<Diagnostic> {
                 // the same span (see apply_fixes' own overlap handling in
                 // tool.rs) whenever the source had unusual spacing right
                 // after `function`.
+                // Quoting a word that does not need it -- see
+                // `canonical_quoting`. The only rule here that rewrites
+                // a word rather than the space beside it, and it never
+                // touches one that has an expansion in it.
+                Tok::Word(chunks, plain) => {
+                    let span = span_of(item.unwrap());
+                    if let Some(text) = sole_literal(chunks, *plain)
+                        && let Some(canonical) = canonical_quoting(text)
+                    {
+                        let source: String = chars[span.start..span.end].iter().collect();
+                        if canonical != source {
+                            diagnostics.push(Diagnostic {
+                                start: span.start,
+                                end: span.end,
+                                severity: Severity::Warning,
+                                code: Cow::Borrowed("format"),
+                                source: None,
+                                message: format!("expected `{canonical}` here"),
+                                fix: Some(Fix { start: span.start, end: span.end, replacement: canonical }),
+                            });
+                        }
+                    }
+                }
                 Tok::KwFunction => {
                     let at = |off: usize| -> Option<&Tok> {
                         match real.get(i + off)? {
@@ -471,6 +583,69 @@ mod tests {
             chars.splice(f.start..f.end, f.replacement.chars());
         }
         chars.into_iter().collect()
+    }
+
+    // Quoting a word that does not need quoting is noise; quoting one
+    // with double quotes when it holds nothing to expand says something
+    // that is not true about it.
+    #[test]
+    fn a_word_that_needs_no_quoting_loses_it() {
+        assert_eq!(format_text("echo \"hello\"\n"), "echo hello\n");
+        assert_eq!(format_text("echo 'hello'\n"), "echo hello\n");
+        assert_eq!(format_text("echo \"--flag=value\"\n"), "echo --flag=value\n");
+        assert_eq!(format_text("echo 'a.b/c:d@e'\n"), "echo a.b/c:d@e\n");
+        // `#` and `~` mean something only where a word begins, which is
+        // exactly where bash's own `printf %q` escapes them.
+        assert_eq!(format_text("echo 'x#y'\n"), "echo x#y\n");
+        assert_eq!(format_text("echo 'a:~/b'\n"), "echo a:~/b\n");
+        assert_eq!(format_text("echo '#x'\n"), "echo '#x'\n");
+        assert_eq!(format_text("echo '~/x'\n"), "echo '~/x'\n");
+    }
+
+    #[test]
+    fn a_word_with_nothing_to_expand_gets_single_quotes() {
+        assert_eq!(format_text("echo \"hello world\"\n"), "echo 'hello world'\n");
+        assert_eq!(format_text("echo \"a\\$b\"\n"), "echo 'a$b'\n");
+        assert_eq!(format_text("echo \"\"\n"), "echo ''\n");
+        // Glob and brace metacharacters keep their quotes, and single
+        // quotes hold them just as literally -- which is what makes
+        // this safe in a `case` pattern and beside `[[ x == y ]]`.
+        assert_eq!(format_text("echo \"*\"\n"), "echo '*'\n");
+        assert_eq!(format_text("echo \"{a,b}\"\n"), "echo '{a,b}'\n");
+        assert_eq!(format_text("case $x in \"a b\") echo \"y\";; esac\n"), "case $x in\n\t'a b')\n\t\techo y\n\t;;\nesac\n");
+    }
+
+    // The cases where the quotes are load-bearing, or where rewriting
+    // them would be answering a bigger question than this rule asks.
+    #[test]
+    fn quoting_that_is_doing_something_is_left_alone() {
+        // An expansion needs its double quotes.
+        assert_eq!(format_text("echo \"$x\"\n"), "echo \"$x\"\n");
+        assert_eq!(format_text("echo \"$(foo)\"\n"), "echo \"$(foo)\"\n");
+        // A word built from several differently-quoted pieces is left
+        // exactly as written: each piece is quoted the way it is for
+        // its own reason.
+        let mixed = "echo \"$(foo)\"'\\n'a\"$(bar)\"\n";
+        assert_eq!(format_text(mixed), mixed);
+        assert_eq!(format_text("echo a\"b\"c\n"), "echo a\"b\"c\n");
+        assert_eq!(format_text("a=\"b\"\n"), "a=\"b\"\n");
+        // A `'` inside would end the quote, and `'\''` is no
+        // improvement on what is already there.
+        assert_eq!(format_text("echo \"it's\"\n"), "echo \"it's\"\n");
+        // `"a=b" cmd` runs a command called `a=b`; `a=b cmd` sets a
+        // variable. Anything assignment-shaped keeps its quotes.
+        assert_eq!(format_text("echo \"a=b\"\n"), "echo 'a=b'\n");
+        assert_eq!(format_text("\"a=b\" cmd\n"), "'a=b' cmd\n");
+        // `2>file` redirects fd 2 where `"2">file` writes the word.
+        assert_eq!(format_text("echo \"2\"\n"), "echo '2'\n");
+    }
+
+    #[test]
+    fn requoting_settles_in_one_pass() {
+        let src = "echo \"a\" 'b' \"c d\" \"$x\" \"e=f\" \"2\" '#g' 'h#i'\n";
+        let once = format_text(&src);
+        assert_eq!(once, "echo a b 'c d' \"$x\" 'e=f' '2' '#g' h#i\n");
+        assert_eq!(format_text(&once), once, "formatting a formatted file changes nothing");
     }
 
     #[test]
