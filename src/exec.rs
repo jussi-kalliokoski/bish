@@ -901,7 +901,7 @@ pub struct Shell {
     pub(crate) functions: HashMap<String, parser::Command>,
     // Stack of positional-parameter frames; last() is the current scope
     // ($0 is tracked separately since it's never shifted/reassigned by calls).
-    arg_frames: Vec<Vec<String>>,
+    pub(crate) arg_frames: Vec<Vec<String>>,
     // Stack of `local` overlays; empty unless we're inside a function call.
     // A name only lives here if `local` explicitly declared it -- plain
     // assignment still targets the global (process-env) variable unless it
@@ -966,15 +966,15 @@ pub struct Shell {
     pub mappings: Vec<crate::keymap::Mapping>,
     /// `enable -n NAME`: builtins taken out of service, so the external
     /// of the same name runs instead.
-    disabled_builtins: std::collections::HashSet<String>,
+    pub(crate) disabled_builtins: std::collections::HashSet<String>,
     /// One entry per function call in progress, oldest first -- what
     /// `caller` reports on. Pushed by `call_function`, which is the
     /// only place a function body is entered.
-    call_stack: Vec<CallFrame>,
+    pub(crate) call_stack: Vec<CallFrame>,
     /// The file each function was defined in. `BASH_SOURCE` reports
     /// where a function *is*, not where it was called from, and those
     /// differ the moment anything is `source`d.
-    function_sources: HashMap<String, String>,
+    pub(crate) function_sources: HashMap<String, String>,
     /// `::bish hook`-registered commands, in the order they were added.
     /// Inherited by a virtual child exactly as `abbrs` is: a window you
     /// split off should behave like the one you split it from.
@@ -1041,7 +1041,7 @@ pub struct Shell {
     // at all means `shopt -s extglob`/`shopt -s nullglob` in a script no
     // longer fails as an unknown command, which would otherwise abort the
     // whole script under `set -e`.
-    shopt_options: std::collections::HashMap<String, bool>,
+    pub(crate) shopt_options: std::collections::HashMap<String, bool>,
     // `bishopt --set/--unset NAME [VALUE]`: bish's own config surface, a
     // deliberately separate namespace from shopt_options above (shopt
     // exists only for bash-script compatibility -- see KNOWN_BISHOPTS'
@@ -1437,10 +1437,10 @@ fn fresh_rng_seed() -> u64 {
 /// below, or the script itself at the bottom. Deriving it keeps one
 /// source of truth, so a frame cannot disagree with the stack it is in.
 #[derive(Clone)]
-struct CallFrame {
-    called: String,
-    call_line: usize,
-    source: String,
+pub(crate) struct CallFrame {
+    pub(crate) called: String,
+    pub(crate) call_line: usize,
+    pub(crate) source: String,
 }
 
 impl Shell {
@@ -2234,80 +2234,6 @@ impl Shell {
         (id, cmd_text)
     }
 
-    // getopts optstring name [args...]. Options requiring an argument are
-    // marked with a trailing ':' in optstring (e.g. "ab:c"); a leading ':'
-    // switches to "silent" error mode (custom handling via OPTARG/'?'/':'
-    // instead of a printed message), matching bash.
-    fn run_getopts(&mut self, args: &[String]) -> ExecResult {
-        let optstring = args.first().cloned().unwrap_or_default();
-        let varname = match args.get(1) {
-            Some(v) => v.clone(),
-            None => {
-                sh_eprintln!(self, "bish: getopts: usage: getopts optstring name [args]");
-                return ExecResult::Status(2);
-            }
-        };
-        let positional: Vec<String> =
-            if args.len() > 2 { args[2..].to_vec() } else { self.arg_frames.last().cloned().unwrap_or_default() };
-
-        let optind: usize = self.lookup_var("OPTIND").trim().parse().unwrap_or(1);
-        let idx = optind.saturating_sub(1);
-
-        if idx >= positional.len() {
-            return ExecResult::Status(1);
-        }
-        let cur = positional[idx].clone();
-        if !cur.starts_with('-') || cur == "-" {
-            return ExecResult::Status(1);
-        }
-        if cur == "--" {
-            self.assign_var("OPTIND", (optind + 1).to_string());
-            return ExecResult::Status(1);
-        }
-
-        let opt_char = cur.chars().nth(1).unwrap_or('?');
-        let silent = optstring.starts_with(':');
-        let spec = optstring.trim_start_matches(':');
-
-        let Some(pos) = spec.find(opt_char) else {
-            if silent {
-                self.assign_var(&varname, "?".to_string());
-                self.assign_var("OPTARG", opt_char.to_string());
-            } else {
-                sh_eprintln!(self, "bish: getopts: illegal option -- '{}'", opt_char);
-                self.assign_var(&varname, "?".to_string());
-            }
-            self.assign_var("OPTIND", (optind + 1).to_string());
-            return ExecResult::Status(0);
-        };
-
-        let needs_arg = spec.as_bytes().get(pos + 1) == Some(&b':');
-        if needs_arg {
-            let rest: String = cur.chars().skip(2).collect();
-            if !rest.is_empty() {
-                self.assign_var("OPTARG", rest);
-                self.assign_var("OPTIND", (optind + 1).to_string());
-            } else if idx + 1 < positional.len() {
-                self.assign_var("OPTARG", positional[idx + 1].clone());
-                self.assign_var("OPTIND", (optind + 2).to_string());
-            } else {
-                if silent {
-                    self.assign_var(&varname, ":".to_string());
-                    self.assign_var("OPTARG", opt_char.to_string());
-                } else {
-                    sh_eprintln!(self, "bish: getopts: option requires an argument -- '{}'", opt_char);
-                    self.assign_var(&varname, "?".to_string());
-                }
-                self.assign_var("OPTIND", (optind + 1).to_string());
-                return ExecResult::Status(0);
-            }
-        } else {
-            self.assign_var("OPTIND", (optind + 1).to_string());
-        }
-        self.assign_var(&varname, opt_char.to_string());
-        ExecResult::Status(0)
-    }
-
     // declare -f [name...] / declare -F [name...]: print each named
     // function's definition (or, under -F, just "declare -f NAME"); no
     // names means every currently-defined function, sorted for
@@ -2638,73 +2564,12 @@ impl Shell {
         self.shopt_options.get(name).copied().unwrap_or_else(|| shopt_default_on(name).unwrap_or(false))
     }
 
-    fn print_shopt_line(&mut self, name: &str, reusable: bool) {
+    pub(crate) fn print_shopt_line(&mut self, name: &str, reusable: bool) {
         let on = self.shopt_is_on(name);
         if reusable {
             sh_println!(self, "shopt -{} {}", if on { "s" } else { "u" }, name);
         } else {
             sh_println!(self, "{:<15}\t{}", name, if on { "on" } else { "off" });
-        }
-    }
-
-    // shopt [-su] [-q] [-p] [NAME ...]. Bare `shopt` lists every known
-    // option's on/off state; `shopt -s`/`shopt -u` alone list only the
-    // ones currently on/off (respectively); either with NAMEs given
-    // toggles just those. `-p` prints in the same `shopt -s/-u NAME` form
-    // that can be fed back in, instead of the plain "NAME\ton/off" table.
-    // A NAME not in KNOWN_SHOPT_OPTIONS is rejected up front, matching
-    // real bash's own "invalid shell option name" error -- see that
-    // list's own doc comment for what most of these names actually do (or
-    // don't do) in bish.
-    fn run_shopt(&mut self, args: &[String]) -> i32 {
-        let mut mode: Option<bool> = None; // Some(true)=-s, Some(false)=-u
-        let mut quiet = false;
-        let mut reusable = false;
-        let mut names: Vec<&str> = Vec::new();
-        for a in args {
-            match a.as_str() {
-                "-s" => mode = Some(true),
-                "-u" => mode = Some(false),
-                "-q" => quiet = true,
-                "-p" => reusable = true,
-                _ if a.starts_with('-') => {}
-                other => names.push(other),
-            }
-        }
-        for n in &names {
-            if shopt_default_on(n).is_none() {
-                sh_eprintln!(self, "bish: shopt: {n}: invalid shell option name");
-                return 1;
-            }
-        }
-        match mode {
-            Some(on) if names.is_empty() => {
-                let matching: Vec<&str> = KNOWN_SHOPT_OPTIONS.iter().map(|(n, _)| *n).filter(|n| self.shopt_is_on(n) == on).collect();
-                for n in matching {
-                    self.print_shopt_line(n, reusable);
-                }
-                0
-            }
-            Some(on) => {
-                for n in &names {
-                    self.shopt_options.insert(n.to_string(), on);
-                }
-                0
-            }
-            None if quiet => {
-                if names.iter().all(|n| self.shopt_is_on(n)) {
-                    0
-                } else {
-                    1
-                }
-            }
-            None => {
-                let targets: Vec<&str> = if names.is_empty() { KNOWN_SHOPT_OPTIONS.iter().map(|(n, _)| *n).collect() } else { names };
-                for n in targets {
-                    self.print_shopt_line(n, reusable);
-                }
-                0
-            }
         }
     }
 
@@ -4333,168 +4198,8 @@ impl Shell {
     /// Deliberately a method where `is_known_builtin` is a free
     /// function: the question now depends on this shell's own state,
     /// which a free function cannot see.
-    fn is_active_builtin(&self, name: &str) -> bool {
+    pub(crate) fn is_active_builtin(&self, name: &str) -> bool {
         is_known_builtin(name) && !self.disabled_builtins.contains(name)
-    }
-
-    // `caller [N]` -- where the function you are in was called from.
-    //
-    // `caller 0` is the innermost call: the line it sits on, the
-    // function containing that line, and the file. `caller 1` is the
-    // call to *that* function, and so on outwards. A depth past the top
-    // of the stack prints nothing and fails, which is what makes
-    // `while caller $i; do ...` terminate.
-    //
-    // Bare `caller` is the short form: line and file only, no function
-    // name -- bash's own shape, and the reason this is not just `caller
-    // 0` with a default.
-    //
-    // Who made a call is the `called` of the frame below rather than
-    // anything stored: at the bottom of the stack nothing called it, and
-    // bash names that `main`.
-    fn run_caller(&mut self, args: &[String]) -> i32 {
-        if self.call_stack.is_empty() {
-            return 1;
-        }
-        let depth = match args.first() {
-            None => {
-                let idx = self.call_stack.len() - 1;
-                let source = match idx.checked_sub(1) {
-                    Some(below) => {
-                        let name = &self.call_stack[below].called;
-                        self.function_sources.get(name).cloned().unwrap_or_else(|| self.call_stack[idx].source.clone())
-                    }
-                    None => self.call_stack[idx].source.clone(),
-                };
-                sh_println!(self, "{} {}", self.call_stack[idx].call_line, source);
-                return 0;
-            }
-            Some(a) => match a.parse::<usize>() {
-                Ok(n) => n,
-                Err(_) => {
-                    // bash's own shape here: the complaint, then the
-                    // usage, then 2 -- a malformed argument is a usage
-                    // error, not "no such frame", which is what 1 means
-                    // and is what `while caller $i` stops on.
-                    sh_eprintln!(self, "bish: caller: {a}: invalid number");
-                    sh_eprintln!(self, "caller: usage: caller [expr]");
-                    return 2;
-                }
-            },
-        };
-        let Some(idx) = self.call_stack.len().checked_sub(depth + 1) else {
-            return 1;
-        };
-        let frame = &self.call_stack[idx];
-        // The enclosing function, and the file its body lives in -- both
-        // come from the frame *below*, because that is whose code made
-        // this call. They are only the same file as `frame.source` until
-        // something is sourced: a function defined in a library and
-        // called from there reports the library, not the script that
-        // sourced it. Same index for both, since they are two halves of
-        // one answer.
-        let (enclosing, source) = match idx.checked_sub(1) {
-            Some(below) => {
-                let name = self.call_stack[below].called.clone();
-                let file = self.function_sources.get(&name).cloned().unwrap_or_else(|| frame.source.clone());
-                (name, file)
-            }
-            // Nothing below: the call was made by the script itself,
-            // which bash names `main`, and the frame already recorded
-            // which file that was.
-            None => ("main".to_string(), frame.source.clone()),
-        };
-        sh_println!(self, "{} {} {}", frame.call_line, enclosing, source);
-        0
-    }
-
-    // `help [NAME...]` -- an index of the builtins.
-    //
-    // A name may be a glob, as bash's is, so `help comp*` works. A name
-    // that matches nothing is an error naming it, since silence would
-    // look like a builtin with nothing to say about it.
-    fn run_help(&mut self, args: &[String]) -> i32 {
-        let names: Vec<&String> = args.iter().filter(|a| !a.starts_with('-')).collect();
-        if names.is_empty() {
-            sh_println!(self, "bish's builtins. `help NAME` for one of them; NAME may be a glob.");
-            sh_println!(self, "Anything not listed here is an ordinary command -- try its own --help.");
-            sh_println!(self, "");
-            for (name, summary) in BUILTIN_HELP {
-                sh_println!(self, "  {name:<10} {summary}");
-            }
-            return 0;
-        }
-        let mut status = 0;
-        for name in names {
-            let matched: Vec<&(&str, &str)> =
-                BUILTIN_HELP.iter().filter(|(b, _)| *b == name.as_str() || crate::glob::matches(name, b)).collect();
-            if matched.is_empty() {
-                sh_eprintln!(self, "bish: help: no help topics match `{name}'");
-                status = 1;
-                continue;
-            }
-            for (b, summary) in matched {
-                sh_println!(self, "  {b:<10} {summary}");
-            }
-        }
-        status
-    }
-
-    // `enable [-n] [-a] [NAME...]` -- which builtins are in service.
-    //
-    // `-n NAME` takes one out, so `enable -n echo; echo hi` runs
-    // /bin/echo. Bare `NAME` puts it back. With no names it lists: the
-    // enabled ones by default, all of them with `-a`.
-    //
-    // bash also has `-f`/`-d` for loading builtins from a shared object.
-    // bish has no dynamic loading and no plans for any, so those are
-    // refused by name rather than silently ignored -- this shell's own
-    // convention for something it does not do.
-    fn run_enable(&mut self, args: &[String]) -> i32 {
-        let (mut disable, mut list_all, mut names) = (false, false, Vec::new());
-        for arg in args {
-            match arg.as_str() {
-                "-n" => disable = true,
-                "-a" => list_all = true,
-                "-p" => {}
-                "-f" | "-d" => {
-                    sh_eprintln!(self, "bish: enable: {arg}: dynamic loading is not supported");
-                    return 2;
-                }
-                other if other.starts_with('-') && other.len() > 1 => {
-                    sh_eprintln!(self, "bish: enable: {other}: invalid option");
-                    return 2;
-                }
-                other => names.push(other.to_string()),
-            }
-        }
-        if names.is_empty() {
-            let mut listed: Vec<&str> = KNOWN_BUILTINS
-                .iter()
-                .copied()
-                .filter(|b| list_all || !self.disabled_builtins.contains(*b))
-                .collect();
-            listed.sort_unstable();
-            for b in listed {
-                let state = if self.disabled_builtins.contains(b) { "enable -n" } else { "enable" };
-                sh_println!(self, "{state} {b}");
-            }
-            return 0;
-        }
-        let mut status = 0;
-        for name in names {
-            if !KNOWN_BUILTINS.contains(&name.as_str()) {
-                sh_eprintln!(self, "bish: enable: {name}: not a shell builtin");
-                status = 1;
-                continue;
-            }
-            if disable {
-                self.disabled_builtins.insert(name);
-            } else {
-                self.disabled_builtins.remove(&name);
-            }
-        }
-        status
     }
 
     // Moved here from a builtins.rs free function once cd needed to update
@@ -4712,62 +4417,7 @@ impl Shell {
         }
     }
 
-    // set [-euxo pipefail] [--] [args...]. Combined single-char flags
-    // (-eu, -ex, -eux) work; `-o name` must be its own token (not combined
-    // into a cluster with other short flags) -- matches real bash, which
-    // also rejects e.g. `-euo pipefail` (it consumes `-o` with no argument
-    // of its own, then tries to parse "pipefail"'s remaining letters as
-    // further short flags and errors on the first invalid one).
-    fn run_set(&mut self, args: &[String]) -> i32 {
-        let mut idx = 0;
-        let mut saw_dashdash = false;
-        while idx < args.len() {
-            let a = &args[idx];
-            if a == "--" {
-                saw_dashdash = true;
-                idx += 1;
-                break;
-            }
-            if let Some(rest) = a.strip_prefix('-').filter(|r| !r.is_empty()) {
-                if rest == "o" {
-                    if let Some(optname) = args.get(idx + 1) {
-                        self.apply_shell_option(optname, true);
-                        idx += 2;
-                        continue;
-                    }
-                }
-                for c in rest.chars() {
-                    self.apply_shell_flag(c, true);
-                }
-                idx += 1;
-                continue;
-            }
-            if let Some(rest) = a.strip_prefix('+').filter(|r| !r.is_empty()) {
-                if rest == "o" {
-                    if let Some(optname) = args.get(idx + 1) {
-                        self.apply_shell_option(optname, false);
-                        idx += 2;
-                        continue;
-                    }
-                }
-                for c in rest.chars() {
-                    self.apply_shell_flag(c, false);
-                }
-                idx += 1;
-                continue;
-            }
-            break;
-        }
-        if saw_dashdash || idx < args.len() {
-            let new_args = args[idx..].to_vec();
-            if let Some(frame) = self.arg_frames.last_mut() {
-                *frame = new_args;
-            }
-        }
-        0
-    }
-
-    fn apply_shell_flag(&mut self, c: char, on: bool) {
+    pub(crate) fn apply_shell_flag(&mut self, c: char, on: bool) {
         match c {
             'e' => self.opt_errexit = on,
             'T' => self.opt_functrace = on,
@@ -4789,7 +4439,7 @@ impl Shell {
         }
     }
 
-    fn apply_shell_option(&mut self, name: &str, on: bool) {
+    pub(crate) fn apply_shell_option(&mut self, name: &str, on: bool) {
         match name {
             "pipefail" => self.opt_pipefail = on,
             "errexit" => self.opt_errexit = on,
@@ -4935,7 +4585,7 @@ impl Shell {
 
     fn run_pipeline_inner(&mut self, pipeline: &Pipeline, background: bool) -> ExecResult {
         if pipeline.commands.len() == 1 {
-            let result = self.run_command(&pipeline.commands[0], background);
+            let result = crate::builtins::shell::run_command(self, &pipeline.commands[0], background);
             // A one-command pipeline is still a pipeline as far as
             // `PIPESTATUS` is concerned: bash gives it a one-element
             // array, and a script that reads `${PIPESTATUS[0]}` after a
@@ -4958,14 +4608,6 @@ impl Shell {
         self.arrays.insert("PIPESTATUS".to_string(), map);
     }
 
-    fn run_command(&mut self, cmd: &parser::Command, background: bool) -> ExecResult {
-        let redirects: &[Redirect] = command_own_redirects(cmd);
-        if !redirects.is_empty() {
-            return self.run_compound_redirected(cmd, redirects, background);
-        }
-        self.run_command_body(cmd, background)
-    }
-
     // The part of run_command that actually dispatches on `cmd`'s own
     // variant, *after* its own redirects (if any) have already been
     // handled -- split out so run_in_child_shell's ChildSource::Parsed
@@ -4973,7 +4615,7 @@ impl Shell {
     // `cmd`'s content directly without re-checking command_own_redirects,
     // which would just see the same still-attached redirects and call
     // run_compound_redirected right back into itself, forever.
-    fn run_command_body(&mut self, cmd: &parser::Command, background: bool) -> ExecResult {
+    pub(crate) fn run_command_body(&mut self, cmd: &parser::Command, background: bool) -> ExecResult {
         match cmd {
             parser::Command::Simple(sc) => self.run_single(sc, background),
             parser::Command::If { branches, else_branch, .. } => self.run_if(branches, else_branch),
@@ -5456,7 +5098,7 @@ impl Shell {
     // compound), or a *backgrounded* run, which needs to keep going after
     // this call returns (nothing in this single-threaded interpreter can
     // do that in-process).
-    fn run_compound_redirected(&mut self, cmd: &parser::Command, redirects: &[Redirect], background: bool) -> ExecResult {
+    pub(crate) fn run_compound_redirected(&mut self, cmd: &parser::Command, redirects: &[Redirect], background: bool) -> ExecResult {
         if !background && Self::compound_redirects_are_simple(redirects) {
             return match self.resolve_simple_redirects_for_compound(redirects) {
                 Ok(stdio) => self.run_with_redirected_stdio(cmd, stdio),
@@ -5647,7 +5289,7 @@ impl Shell {
         self.array_local_stack.push(Vec::new());
         self.assoc_local_stack.push(Vec::new());
         self.nameref_local_stack.push(Vec::new());
-        let result = self.run_command(body, false);
+        let result = crate::builtins::shell::run_command(self, body, false);
         self.call_stack.pop();
         self.refresh_call_arrays();
         self.var_scopes.pop();
@@ -6498,7 +6140,7 @@ impl Shell {
                 let inner_name = argv[1].clone();
                 return self.dispatch_builtin_or_external(&argv[1..], inner_name, cmd, background, true, &[]);
             }
-            "type" => return ExecResult::Status(self.run_type(&argv[1..])),
+            "type" => return ExecResult::Status(crate::builtins::shell::run_type(self, &argv[1..])),
             // No command-path cache exists to manage -- every exec
             // re-resolves PATH via Command::status() itself -- so this is
             // a documented no-op rather than a real cache: `hash -r`
@@ -6531,9 +6173,9 @@ impl Shell {
             "printf" => return ExecResult::Status(self.run_printf(&argv[1..])),
             "umask" => return ExecResult::Status(crate::builtins::limits::run_umask(self, &argv[1..])),
             "times" => return ExecResult::Status(crate::builtins::limits::run_times(self, &argv[1..])),
-            "enable" => return ExecResult::Status(self.run_enable(&argv[1..])),
-            "help" => return ExecResult::Status(self.run_help(&argv[1..])),
-            "caller" => return ExecResult::Status(self.run_caller(&argv[1..])),
+            "enable" => return ExecResult::Status(crate::builtins::shell::run_enable(self, &argv[1..])),
+            "help" => return ExecResult::Status(crate::builtins::shell::run_help(self, &argv[1..])),
+            "caller" => return ExecResult::Status(crate::builtins::shell::run_caller(self, &argv[1..])),
             "ulimit" => return ExecResult::Status(crate::builtins::limits::run_ulimit(self, &argv[1..])),
             // alias/unalias: store and query only, no expansion when a
             // command runs -- see the comment on the `aliases` field for
@@ -6598,7 +6240,7 @@ impl Shell {
             // makes the answer real output, so it can be piped, captured
             // or scrolled back to.
             "=" => return ExecResult::Status(self.run_arith_print(&argv[1..])),
-            "shopt" => return ExecResult::Status(self.run_shopt(&argv[1..])),
+            "shopt" => return ExecResult::Status(crate::builtins::shell::run_shopt(self, &argv[1..])),
             "bishopt" => return ExecResult::Status(self.run_bishopt(&argv[1..], KNOWN_BISHOPTS)),
             // `::bish SUBCOMMAND...`: a dedicated namespace for bish-
             // specific commands that don't belong as an ordinary top-
@@ -7201,12 +6843,12 @@ impl Shell {
             "bg" => return ExecResult::Status(crate::builtins::jobs::run_bg(self, &argv[1..])),
             "wait" => return ExecResult::Status(crate::builtins::jobs::run_wait(self, &argv[1..])),
             "kill" => return ExecResult::Status(crate::builtins::jobs::run_kill(self, &argv[1..])),
-            "getopts" => return self.run_getopts(&argv[1..]),
+            "getopts" => return crate::builtins::shell::run_getopts(self, &argv[1..]),
             "unset" => {
                 let target = self.peek_stderr_target(&cmd.redirects);
                 return ExecResult::Status(crate::builtins::vars::run_unset(self, &argv[1..], &target));
             }
-            "set" => return ExecResult::Status(self.run_set(&argv[1..])),
+            "set" => return ExecResult::Status(crate::builtins::shell::run_set(self, &argv[1..])),
             "declare" | "typeset" => {
                 // array_literal_args is indexed into the *original* argv
                 // (which still has argv[0] == "declare"/"typeset"), so
@@ -8791,68 +8433,6 @@ impl Shell {
             }
             None => 1,
         }
-    }
-
-    // type [-p] [-t] name... A scoped subset of real bash's `type`:
-    // reports function/builtin/PATH-resolved-executable, or "not found"
-    // (status 1). `-a` is accepted but not distinguished from the
-    // default.
-    //
-    // `-t` prints just the kind -- `function`, `builtin`, `file` -- and
-    // nothing at all for a name that is none of them. That last part is
-    // the point of it: `[ "$(type -t x)" = function ]` is how a script
-    // asks, and a sentence like "x is a shell builtin" fails that test
-    // however true it reads.
-    fn run_type(&mut self, args: &[String]) -> i32 {
-        let mut path_only = false;
-        let mut kind_only = false;
-        let mut names: Vec<&String> = Vec::new();
-        for a in args {
-            match a.as_str() {
-                "-p" | "-P" => path_only = true,
-                "-t" => kind_only = true,
-                "-a" => {}
-                _ => names.push(a),
-            }
-        }
-        let mut status = 0;
-        for name in names {
-            if self.functions.contains_key(name.as_str()) {
-                if kind_only {
-                    sh_println!(self, "function");
-                } else if !path_only {
-                    sh_println!(self, "{} is a function", name);
-                }
-                continue;
-            }
-            if self.is_active_builtin(name) {
-                if kind_only {
-                    sh_println!(self, "builtin");
-                } else if !path_only {
-                    sh_println!(self, "{} is a shell builtin", name);
-                }
-                continue;
-            }
-            match resolve_in_path(name) {
-                Some(p) => {
-                    if kind_only {
-                        sh_println!(self, "file");
-                    } else {
-                        sh_println!(self, "{}", if path_only { p } else { format!("{} is {}", name, p) });
-                    }
-                }
-                None => {
-                    // `-t` says nothing about a name it does not know:
-                    // the empty answer is the answer, and bash keeps the
-                    // failing status without the message.
-                    if !kind_only {
-                        sh_eprintln!(self, "bish: type: {}: not found", name);
-                    }
-                    status = 1;
-                }
-            }
-        }
-        status
     }
 
     fn next_random(&mut self) -> u32 {
@@ -11211,7 +10791,7 @@ fn expand_backslash_escapes(s: &str) -> String {
 // want, after which `::bish <thing> help` or the real manual has the
 // detail. A line that has to wrap is a line nobody reads in a list of
 // sixty.
-const BUILTIN_HELP: &[(&str, &str)] = &[
+pub(crate) const BUILTIN_HELP: &[(&str, &str)] = &[
     (":", "Do nothing, successfully. Arguments are still expanded."),
     (".", "Read and run a file in this shell. Same as `source`."),
     ("::bish", "bish's own namespace: theme, window, hook, hl, lsp, map."),
@@ -11283,7 +10863,7 @@ const BUILTIN_HELP: &[(&str, &str)] = &[
 // anything, so a name missing from this list just means those two
 // diagnostic builtins under-report it as an external/not-found rather
 // than anything actually breaking.
-const KNOWN_BUILTINS: &[&str] = &[
+pub(crate) const KNOWN_BUILTINS: &[&str] = &[
     ":",
     "times",
     "caller",
@@ -11367,7 +10947,7 @@ const KNOWN_BUILTINS: &[&str] = &[
 // itself, most of these have no actual effect on bish's behavior beyond
 // being trackable -- extglob is the one name overridden elsewhere (see
 // Shell::shopt_is_on) since bish's extglob support is unconditional.
-const KNOWN_SHOPT_OPTIONS: &[(&str, bool)] = &[
+pub(crate) const KNOWN_SHOPT_OPTIONS: &[(&str, bool)] = &[
     ("array_expand_once", false),
     ("assoc_expand_once", false),
     ("autocd", false),
@@ -11429,7 +11009,7 @@ const KNOWN_SHOPT_OPTIONS: &[(&str, bool)] = &[
     ("xpg_echo", false),
 ];
 
-fn shopt_default_on(name: &str) -> Option<bool> {
+pub(crate) fn shopt_default_on(name: &str) -> Option<bool> {
     KNOWN_SHOPT_OPTIONS.iter().find(|(n, _)| *n == name).map(|(_, on)| *on)
 }
 
@@ -11822,7 +11402,7 @@ fn is_known_builtin(name: &str) -> bool {
     KNOWN_BUILTINS.contains(&name)
 }
 
-fn resolve_in_path(name: &str) -> Option<String> {
+pub(crate) fn resolve_in_path(name: &str) -> Option<String> {
     if name.contains('/') {
         return if std::path::Path::new(name).is_file() { Some(name.to_string()) } else { None };
     }
@@ -11851,7 +11431,7 @@ fn resolve_in_path(name: &str) -> Option<String> {
 }
 
 
-fn command_own_redirects(cmd: &parser::Command) -> &[Redirect] {
+pub(crate) fn command_own_redirects(cmd: &parser::Command) -> &[Redirect] {
     match cmd {
         parser::Command::If { redirects, .. } => redirects,
         parser::Command::While { redirects, .. } => redirects,
@@ -11931,10 +11511,10 @@ mod tests {
         // real bash, which reports the external for all of these.
         let mut sh = Shell::new();
         assert!(sh.is_active_builtin("echo"));
-        sh.run_enable(&["-n".to_string(), "echo".to_string()]);
+        crate::builtins::shell::run_enable(&mut sh, &["-n".to_string(), "echo".to_string()]);
         assert!(!sh.is_active_builtin("echo"), "type, command -v and the pipeline self-exec all ask this");
         assert!(is_known_builtin("echo"), "still a builtin bish knows about -- `enable echo` has to find it");
-        sh.run_enable(&["echo".to_string()]);
+        crate::builtins::shell::run_enable(&mut sh, &["echo".to_string()]);
         assert!(sh.is_active_builtin("echo"));
     }
 
@@ -12024,7 +11604,7 @@ mod tests {
 
         // Outside any function there is nothing to report.
         let mut sh = Shell::new();
-        assert_eq!(sh.run_caller(&[]), 1);
+        assert_eq!(crate::builtins::shell::run_caller(&mut sh, &[]), 1);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -12032,17 +11612,17 @@ mod tests {
     fn enable_takes_a_builtin_out_of_service_and_puts_it_back() {
         let mut sh = Shell::new();
         assert!(!sh.disabled_builtins.contains("echo"));
-        assert_eq!(sh.run_enable(&["-n".to_string(), "echo".to_string()]), 0);
+        assert_eq!(crate::builtins::shell::run_enable(&mut sh, &["-n".to_string(), "echo".to_string()]), 0);
         assert!(sh.disabled_builtins.contains("echo"));
-        assert_eq!(sh.run_enable(&["echo".to_string()]), 0);
+        assert_eq!(crate::builtins::shell::run_enable(&mut sh, &["echo".to_string()]), 0);
         assert!(!sh.disabled_builtins.contains("echo"));
 
         // A name that is not a builtin is an error, and does not become
         // one by being named.
-        assert_eq!(sh.run_enable(&["-n".to_string(), "nosuch".to_string()]), 1);
+        assert_eq!(crate::builtins::shell::run_enable(&mut sh, &["-n".to_string(), "nosuch".to_string()]), 1);
         assert!(!sh.disabled_builtins.contains("nosuch"));
         // Dynamic loading is refused by name rather than ignored.
-        assert_eq!(sh.run_enable(&["-f".to_string(), "mod".to_string()]), 2);
+        assert_eq!(crate::builtins::shell::run_enable(&mut sh, &["-f".to_string(), "mod".to_string()]), 2);
     }
 
     #[test]
@@ -12611,26 +12191,26 @@ mod tests {
     fn shopt_s_and_u_override_a_names_default_either_direction() {
         let mut shell = Shell::new();
         assert!(!shell.shopt_is_on("nullglob"));
-        assert_eq!(shell.run_shopt(&strs(&["-s", "nullglob"])), 0);
+        assert_eq!(crate::builtins::shell::run_shopt(&mut shell, &strs(&["-s", "nullglob"])), 0);
         assert!(shell.shopt_is_on("nullglob"));
 
         assert!(shell.shopt_is_on("cmdhist"));
-        assert_eq!(shell.run_shopt(&strs(&["-u", "cmdhist"])), 0);
+        assert_eq!(crate::builtins::shell::run_shopt(&mut shell, &strs(&["-u", "cmdhist"])), 0);
         assert!(!shell.shopt_is_on("cmdhist"));
     }
 
     #[test]
     fn shopt_q_reports_status_from_every_names_effective_state() {
         let mut shell = Shell::new();
-        assert_eq!(shell.run_shopt(&strs(&["-q", "cmdhist", "extglob"])), 0);
-        assert_eq!(shell.run_shopt(&strs(&["-q", "cmdhist", "nullglob"])), 1);
+        assert_eq!(crate::builtins::shell::run_shopt(&mut shell, &strs(&["-q", "cmdhist", "extglob"])), 0);
+        assert_eq!(crate::builtins::shell::run_shopt(&mut shell, &strs(&["-q", "cmdhist", "nullglob"])), 1);
     }
 
     #[test]
     fn shopt_rejects_an_unknown_option_name() {
         let mut shell = Shell::new();
-        assert_eq!(shell.run_shopt(&strs(&["bogus_option"])), 1);
-        assert_eq!(shell.run_shopt(&strs(&["-s", "bogus_option"])), 1);
+        assert_eq!(crate::builtins::shell::run_shopt(&mut shell, &strs(&["bogus_option"])), 1);
+        assert_eq!(crate::builtins::shell::run_shopt(&mut shell, &strs(&["-s", "bogus_option"])), 1);
         assert!(shell.shopt_options.is_empty(), "a rejected name must not be recorded");
     }
 
@@ -12641,13 +12221,13 @@ mod tests {
         // valid target, so this must not error and must not mutate
         // anything -- this is the bug this whole patch exists to fix
         // ("shopt without arguments does nothing").
-        assert_eq!(shell.run_shopt(&[]), 0);
+        assert_eq!(crate::builtins::shell::run_shopt(&mut shell, &[]), 0);
         assert!(shell.shopt_options.is_empty());
 
         // `shopt -s`/`shopt -u` alone list, not toggle -- no names means
         // nothing to turn on/off, unlike `shopt -s NAME`.
-        assert_eq!(shell.run_shopt(&strs(&["-s"])), 0);
-        assert_eq!(shell.run_shopt(&strs(&["-u"])), 0);
+        assert_eq!(crate::builtins::shell::run_shopt(&mut shell, &strs(&["-s"])), 0);
+        assert_eq!(crate::builtins::shell::run_shopt(&mut shell, &strs(&["-u"])), 0);
         assert!(shell.shopt_options.is_empty(), "-s/-u alone must only list, never mutate");
     }
 

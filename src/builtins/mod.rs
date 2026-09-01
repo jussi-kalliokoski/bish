@@ -16,6 +16,7 @@ pub(crate) mod dirs;
 pub(crate) mod history;
 pub(crate) mod jobs;
 pub(crate) mod limits;
+pub(crate) mod shell;
 pub(crate) mod vars;
 
 #[cfg(unix)]
