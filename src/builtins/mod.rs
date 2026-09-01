@@ -9,12 +9,24 @@
 // machinery, which are what that file is actually about.
 //
 // `exec.rs` keeps the dispatch (`dispatch_builtin_or_external_impl`)
-// and everything a builtin is dispatched *from*.
+// and everything a builtin is dispatched *from*: the executor proper
+// (`run_program`/`run_single`/`run_multi`/`run_pipeline`), expansion,
+// redirection, variable scoping, and the signal/FFI block. That is the
+// actual shell, and it belongs together.
+//
+// The cost, stated plainly: a good deal of `Shell` that was private to
+// one file is now `pub(crate)`. Its fields, several of its helpers, and
+// types like `JobTable`, `OutputSink` and `CallFrame` are visible to
+// the crate because a builtin in another file has to reach them. That
+// is a real loss of encapsulation, traded for `exec.rs` being 2,700
+// lines shorter and for `ls src/builtins` answering "what builtins does
+// bish have?" -- the question that `ls src/ | grep tar` could not.
 
 pub(crate) mod bish;
 pub(crate) mod completion;
 pub(crate) mod dirs;
 pub(crate) mod history;
+pub(crate) mod io;
 pub(crate) mod jobs;
 pub(crate) mod limits;
 pub(crate) mod shell;

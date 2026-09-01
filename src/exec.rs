@@ -283,6 +283,7 @@ macro_rules! sh_print {
         $self.sink_out(&format!($($arg)*))
     };
 }
+pub(crate) use sh_print;
 
 macro_rules! sh_println {
     ($self:expr) => {
@@ -480,7 +481,7 @@ pub struct WindowInfo {
 /// because a theme is a single thing you switch to.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Theme {
-    opts: std::collections::HashMap<String, BishOptValue>,
+    pub(crate) opts: std::collections::HashMap<String, BishOptValue>,
     pub(crate) hl: std::collections::HashMap<String, String>,
 }
 
@@ -1060,7 +1061,7 @@ pub struct Shell {
     // Str option, set the normal way -- outside any declaration) names
     // one of these. A shell-wide table, cloned into a forked child the
     // same way bishopts itself is.
-    themes: std::collections::HashMap<String, Theme>,
+    pub(crate) themes: std::collections::HashMap<String, Theme>,
     /// Syntax-highlighting colours, by name -- see `::bish hl`.
     ///
     /// A plain map rather than a registry, because the names are open:
@@ -1081,7 +1082,7 @@ pub struct Shell {
     // to `None` (not cloned) in a forked child: a declaration in
     // progress is transient, top-level-only state, not something that
     // makes sense to carry into a subshell/command-substitution mid-way.
-    pending_theme: Option<Theme>,
+    pub(crate) pending_theme: Option<Theme>,
     // `complete NAME`: registered completion specs, by command name -- see
     // run_complete's own doc comment. Consulted both by `compgen`-adjacent
     // introspection (`complete -p`/`-r`/`compopt`) and, via a per-prompt
@@ -2935,50 +2936,6 @@ impl Shell {
         self.firing_hooks = firing;
     }
 
-    // Starts a new theme declaration -- every `bishopt --set` from here
-    // until the matching `::bish theme end` is captured into
-    // `pending_theme` instead of applying live (see store_bishopt's own
-    // doc comment). Refuses to nest: a `begin` while one is already in
-    // progress would otherwise silently discard whatever the outer one
-    // had captured so far the moment `end` ran, with no way back --
-    // there's no real use for nesting this anyway (a theme is a flat set
-    // of opts, not something that composes from an inner declaration).
-    pub(crate) fn run_bish_theme_begin(&mut self) -> i32 {
-        if self.pending_theme.is_some() {
-            sh_eprintln!(self, "bish: ::bish theme: a theme declaration is already in progress -- `::bish theme end` it first");
-            return 1;
-        }
-        self.pending_theme = Some(Theme::default());
-        0
-    }
-
-    // Ends the current theme declaration. The captured "theme" entry (if
-    // any -- set via an ordinary `bishopt --set theme NAME` *inside* the
-    // declaration, which store_bishopt diverted here instead of applying
-    // live) names which entry of `self.themes` the rest of the captured
-    // opts get registered under; it's removed from that captured map
-    // first so a theme's own opts never include a "theme" entry pointing
-    // at itself. If "theme" was never set during the declaration, there's
-    // no name to register anything under -- the whole batch is just
-    // discarded, matching "theme behaves unset until explicitly declared
-    // inside a theme declaration" (declaring opts with no name doesn't
-    // retroactively give them one). Registering a theme here never
-    // switches to it -- that still needs its own ordinary `bishopt --set
-    // theme NAME` afterward, outside any declaration, the same way
-    // defining a theme and activating one are two separate, deliberate
-    // steps.
-    pub(crate) fn run_bish_theme_end(&mut self) -> i32 {
-        let Some(mut pending) = self.pending_theme.take() else {
-            sh_eprintln!(self, "bish: ::bish theme: no theme declaration in progress");
-            return 1;
-        };
-        let Some(BishOptValue::Str(name)) = pending.opts.remove("theme") else {
-            return 0;
-        };
-        self.themes.insert(name, pending);
-        0
-    }
-
     // Resolves a bishopt Color option's current effective value as a
     // vt100::Color -- Rgb for an ordinary CSS color, Indexed for a
     // `-bish-*` vendor reference into the terminal's own palette (see
@@ -3378,106 +3335,6 @@ impl Shell {
         Ok(())
     }
 
-    // `echo [-neE] [arg...]`: writes each arg separated by a single
-    // space, then a trailing newline unless -n was given. Flags must
-    // come first and be one of exactly n/e/E (bundled, e.g. "-ne") --
-    // the first argument that doesn't fit that shape ends flag parsing,
-    // matching bash's own echo (no long options, no "--" special case).
-    // -e enables the same backslash escapes real bash's echo recognizes
-    // (see echo_expand_escapes); -E (the default) leaves them untouched.
-    fn run_echo(&self, args: &[String]) -> i32 {
-        let mut interpret_escapes = false;
-        let mut trailing_newline = true;
-        let mut i = 0;
-        while let Some(a) = args.get(i) {
-            if a.len() < 2 || !a.starts_with('-') || !a[1..].chars().all(|c| matches!(c, 'n' | 'e' | 'E')) {
-                break;
-            }
-            for c in a[1..].chars() {
-                match c {
-                    'n' => trailing_newline = false,
-                    'e' => interpret_escapes = true,
-                    'E' => interpret_escapes = false,
-                    _ => unreachable!(),
-                }
-            }
-            i += 1;
-        }
-
-        let mut out = String::new();
-        let mut stopped_early = false;
-        for (pos, a) in args[i..].iter().enumerate() {
-            if pos > 0 {
-                out.push(' ');
-            }
-            if interpret_escapes {
-                let (expanded, hit_c) = echo_expand_escapes(a);
-                out.push_str(&expanded);
-                if hit_c {
-                    stopped_early = true;
-                    break;
-                }
-            } else {
-                out.push_str(a);
-            }
-        }
-        if trailing_newline && !stopped_early {
-            out.push('\n');
-        }
-        sh_print!(self, "{}", out);
-        0
-    }
-
-    // `printf FORMAT [ARGS...]` / `printf -v NAME FORMAT [ARGS...]`:
-    // bash-compatible subset -- %s %d %i %o %u %x %X %c %b %q %%
-    // conversions, with "-" (left-align) and "0" (zero-pad) flags, a
-    // numeric width, and a ".precision" (applied to %s only -- a
-    // truncation length; other conversions ignore it, a minor
-    // simplification against real printf's %d minimum-digit-count
-    // behavior). FORMAT's own backslash escapes (\n, \t, ...) are
-    // always interpreted -- unlike echo, there's no -e/-E switch, POSIX
-    // printf's format string is escape-interpreted unconditionally.
-    // FORMAT is cycled -- reused from the start -- for as long as
-    // there's still at least one unconsumed argument left, matching
-    // real printf (`printf "%s\n" a b c` prints three lines); a numeric
-    // conversion given a missing or non-numeric argument is treated as
-    // 0, a string conversion given a missing one as "". -v NAME assigns
-    // the formatted result to a shell variable instead of printing it.
-    fn run_printf(&mut self, args: &[String]) -> i32 {
-        let (var_name, rest) = if args.first().map(String::as_str) == Some("-v") {
-            match args.get(1) {
-                Some(name) => (Some(name.clone()), &args[2..]),
-                None => {
-                    sh_eprintln!(self, "bish: printf: -v: option requires an argument");
-                    return 1;
-                }
-            }
-        } else {
-            (None, &args[..])
-        };
-        let Some(format) = rest.first() else {
-            sh_eprintln!(self, "bish: printf: usage: printf format [arguments]");
-            return 1;
-        };
-        let values = &rest[1..];
-
-        let mut out = String::new();
-        let mut idx = 0;
-        loop {
-            let before = idx;
-            printf_format_once(format, values, &mut idx, &mut out);
-            if idx >= values.len() || idx == before {
-                break;
-            }
-        }
-
-        match var_name {
-            Some(name) => self.assign_var(&name, out),
-            None => sh_print!(self, "{}", out),
-        }
-        0
-    }
-
     fn collapse_home(path: &str) -> String {
         if let Ok(home) = std::env::var("HOME") {
             if !home.is_empty() {
@@ -3738,7 +3595,7 @@ impl Shell {
                     ExecResult::Status(1)
                 }
             },
-            parser::Command::Test(atoms, _redirects) => self.run_test(atoms),
+            parser::Command::Test(atoms, _redirects) => crate::builtins::io::run_test(self, atoms),
             parser::Command::Coproc { name, body } => {
                 let name = name.clone();
                 ExecResult::Status(self.run_coproc(name, body))
@@ -4691,21 +4548,7 @@ impl Shell {
         ExecResult::Status(last_body_status)
     }
 
-    // `[[ expr ]]`. Real recursive-descent precedence over the flat
-    // TestAtom stream the parser built: NOT binds tightest, then simple
-    // tests (unary/binary), then AND, then OR (loosest) -- matching bash.
-    fn run_test(&mut self, atoms: &[parser::TestAtom]) -> ExecResult {
-        let mut pos = 0;
-        match self.eval_test_or(atoms, &mut pos) {
-            Ok(b) => ExecResult::Status(if b { 0 } else { 1 }),
-            Err(e) => {
-                sh_eprintln!(self, "bish: [[: {}", e);
-                ExecResult::Status(2)
-            }
-        }
-    }
-
-    fn eval_test_or(&mut self, atoms: &[parser::TestAtom], pos: &mut usize) -> Result<bool, String> {
+    pub(crate) fn eval_test_or(&mut self, atoms: &[parser::TestAtom], pos: &mut usize) -> Result<bool, String> {
         let mut result = self.eval_test_and(atoms, pos)?;
         while matches!(atoms.get(*pos), Some(parser::TestAtom::Or)) {
             *pos += 1;
@@ -5256,8 +5099,8 @@ impl Shell {
             // command mode (restrict_to_builtins, below) disallows
             // externals outright, and echo/printf are two of the most
             // reached-for commands for producing quick output there.
-            "echo" => return ExecResult::Status(self.run_echo(&argv[1..])),
-            "printf" => return ExecResult::Status(self.run_printf(&argv[1..])),
+            "echo" => return ExecResult::Status(crate::builtins::io::run_echo(self, &argv[1..])),
+            "printf" => return ExecResult::Status(crate::builtins::io::run_printf(self, &argv[1..])),
             "umask" => return ExecResult::Status(crate::builtins::limits::run_umask(self, &argv[1..])),
             "times" => return ExecResult::Status(crate::builtins::limits::run_times(self, &argv[1..])),
             "enable" => return ExecResult::Status(crate::builtins::shell::run_enable(self, &argv[1..])),
@@ -8497,7 +8340,7 @@ impl FgJob {
 // doesn't support \c). An unrecognized escape (or a bare trailing
 // backslash) is left exactly as written, matching bash rather than
 // silently dropping the backslash.
-fn echo_expand_escapes(s: &str) -> (String, bool) {
+pub(crate) fn echo_expand_escapes(s: &str) -> (String, bool) {
     let mut out = String::new();
     let mut chars = s.chars().peekable();
     while let Some(c) = chars.next() {
@@ -8583,7 +8426,7 @@ pub(crate) fn shell_quote(s: &str) -> String {
 // flags supported. Split out from run_printf so the caller can call
 // this repeatedly to cycle FORMAT over more arguments than it has
 // conversions for.
-fn printf_format_once(format: &str, values: &[String], idx: &mut usize, out: &mut String) {
+pub(crate) fn printf_format_once(format: &str, values: &[String], idx: &mut usize, out: &mut String) {
     let mut chars = format.chars().peekable();
     while let Some(c) = chars.next() {
         if c == '\\' {

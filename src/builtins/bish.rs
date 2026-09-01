@@ -5,7 +5,7 @@
 
 use crate::bishedit::snippet::{self, Abbr};
 use crate::exec::{hook_help, lsp_help, parse_size_spec, sh_eprintln, sh_println, BishOptDefault, BishOptValue,
-    ExecResult, HOOK_EVENTS, Hook, LspServer, PaneDirection, Shell, WindowAction};
+    ExecResult, HOOK_EVENTS, Hook, LspServer, PaneDirection, Shell, Theme, WindowAction};
 
 pub(crate) fn run_bishopt(sh: &mut Shell, args: &[String], registry: &[(&str, BishOptDefault)]) -> i32 {
     enum Mode<'a> {
@@ -530,8 +530,8 @@ pub(crate) fn run_hl(sh: &mut Shell, args: &[String]) -> i32 {
 
 pub(crate) fn run_bish_theme(sh: &mut Shell, args: &[String]) -> i32 {
     match args {
-        [sub] if sub == "begin" => sh.run_bish_theme_begin(),
-        [sub] if sub == "end" => sh.run_bish_theme_end(),
+        [sub] if sub == "begin" => run_bish_theme_begin(sh),
+        [sub] if sub == "end" => run_bish_theme_end(sh),
         [] => {
             sh_eprintln!(sh, "bish: ::bish theme: missing subcommand (expected: begin, end)");
             2
@@ -918,4 +918,48 @@ pub(crate) fn run_window_inner(sh: &mut Shell, args: &[String]) -> ExecResult {
             ExecResult::Status(2)
         }
     }
+}
+
+// Starts a new theme declaration -- every `bishopt --set` from here
+// until the matching `::bish theme end` is captured into
+// `pending_theme` instead of applying live (see store_bishopt's own
+// doc comment). Refuses to nest: a `begin` while one is already in
+// progress would otherwise silently discard whatever the outer one
+// had captured so far the moment `end` ran, with no way back --
+// there's no real use for nesting this anyway (a theme is a flat set
+// of opts, not something that composes from an inner declaration).
+pub(crate) fn run_bish_theme_begin(sh: &mut Shell) -> i32 {
+    if sh.pending_theme.is_some() {
+        sh_eprintln!(sh, "bish: ::bish theme: a theme declaration is already in progress -- `::bish theme end` it first");
+        return 1;
+    }
+    sh.pending_theme = Some(Theme::default());
+    0
+}
+
+// Ends the current theme declaration. The captured "theme" entry (if
+// any -- set via an ordinary `bishopt --set theme NAME` *inside* the
+// declaration, which store_bishopt diverted here instead of applying
+// live) names which entry of `sh.themes` the rest of the captured
+// opts get registered under; it's removed from that captured map
+// first so a theme's own opts never include a "theme" entry pointing
+// at itself. If "theme" was never set during the declaration, there's
+// no name to register anything under -- the whole batch is just
+// discarded, matching "theme behaves unset until explicitly declared
+// inside a theme declaration" (declaring opts with no name doesn't
+// retroactively give them one). Registering a theme here never
+// switches to it -- that still needs its own ordinary `bishopt --set
+// theme NAME` afterward, outside any declaration, the same way
+// defining a theme and activating one are two separate, deliberate
+// steps.
+pub(crate) fn run_bish_theme_end(sh: &mut Shell) -> i32 {
+    let Some(mut pending) = sh.pending_theme.take() else {
+        sh_eprintln!(sh, "bish: ::bish theme: no theme declaration in progress");
+        return 1;
+    };
+    let Some(BishOptValue::Str(name)) = pending.opts.remove("theme") else {
+        return 0;
+    };
+    sh.themes.insert(name, pending);
+    0
 }
