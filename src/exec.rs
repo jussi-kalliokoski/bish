@@ -1417,7 +1417,7 @@ fn fresh_rng_seed() -> u64 {
 
 impl Shell {
     pub fn new() -> Self {
-        Shell {
+        let mut shell = Shell {
             last_status: 0,
             functions: HashMap::new(),
             arg_frames: vec![Vec::new()],
@@ -1498,7 +1498,16 @@ impl Shell {
             subshell_depth: 0,
             env_snapshot: std::env::vars().collect(),
             umask_snapshot: current_umask(),
-        }
+        };
+        // bash starts with IFS set to space/tab/newline, and scripts
+        // rely on that: `old=$IFS; IFS=,; ...; IFS=$old` is the standard
+        // way to change it temporarily, and with IFS merely *unset* that
+        // captures the empty string and restores it as "split on
+        // nothing". Splitting itself was already right (`get_ifs` falls
+        // back to the default when unset, and still tells unset apart
+        // from empty) -- what was missing was `$IFS` reading as anything.
+        shell.assign_var("IFS", " \t\n".to_string());
+        shell
     }
 
     // pub: repl.rs's own top-level orchestration code (syntax-error
@@ -12883,6 +12892,28 @@ mod tests {
         }
         unsafe { tzset() };
         out
+    }
+
+    #[test]
+    fn ifs_starts_out_set_to_the_default_the_way_bash_does() {
+        // Not cosmetic. The standard way to change IFS for a moment is
+        // `old=$IFS; IFS=,; ...; IFS=$old`, and with IFS merely unset
+        // that captured the empty string and restored it as "split on
+        // nothing" -- so everything after it stopped splitting at all.
+        let mut sh = Shell::new();
+        sh.run_source_here("old=$IFS; IFS=,; IFS=$old; s=\"a b c\"; set -- $s; n=$#", "<test>");
+        assert_eq!(sh.debug_peek_var("n").as_deref(), Some("3"), "splitting survives a save/restore");
+        assert_eq!(sh.debug_peek_var("IFS").as_deref(), Some(" \t\n"));
+
+        // The two states that must stay distinguishable: empty means
+        // "do not split", and unset still means the default.
+        let mut sh = Shell::new();
+        sh.run_source_here("IFS=; s=\"a b c\"; set -- $s; n=$#", "<test>");
+        assert_eq!(sh.debug_peek_var("n").as_deref(), Some("1"), "IFS= disables splitting");
+
+        let mut sh = Shell::new();
+        sh.run_source_here("unset IFS; s=\"a b c\"; set -- $s; n=$#", "<test>");
+        assert_eq!(sh.debug_peek_var("n").as_deref(), Some("3"), "unset still falls back to the default");
     }
 
     #[test]
