@@ -2183,7 +2183,7 @@ fn handle_command_mode(
     queued: Vec<Key>,
 ) -> CommandModeOutcome {
     let outcome = run_command_mode(
-        session_id, sessions, windows, *current_window, next_session_id, cmd_history, job_frames, debug_frames, edit_frames, registers, term_rows, term_cols, *sinks_are_grid, editing, seed, queued,
+        session_id, sessions, windows, current_window, next_session_id, cmd_history, job_frames, debug_frames, edit_frames, registers, term_rows, term_cols, *sinks_are_grid, editing, seed, queued,
     );
     match outcome {
         CommandModeOutcome::Action(ref action) => {
@@ -8734,7 +8734,7 @@ fn run_normal_mode_navigation(
                                         sessions,
                                         windows,
                                         job_frames,
-                                        *current_window,
+                                        current_window,
                                         term_rows,
                                         term_cols,
                                         *sinks_are_grid,
@@ -11594,19 +11594,30 @@ fn run_pager(
     sessions: &mut HashMap<SessionId, SessionState>,
     windows: &mut Vec<WindowEntry>,
     job_frames: &mut HashMap<JobFrameId, exec::FgJob>,
-    current_window: usize,
+    // `&mut` so a click on another tab can go there -- see the
+    // `Outcome::Click` arm below.
+    current_window: &mut usize,
     term_rows: &mut usize,
     term_cols: &mut usize,
     sinks_are_grid: bool,
 ) {
     let Ok(_guard) = term::RawGuard::enable_with_mouse(0) else { return };
-    let mut view = crate::pager::Pager::new(title, doc.lines(*term_cols), *term_rows, *term_cols);
+    // One pane's rectangle, not the whole screen. The neighbours are
+    // painted once here and then left alone -- the pager only ever
+    // writes inside its own rect, the same arrangement browser.rs and
+    // the hex view already use.
+    let pane_rect_now = |windows: &[WindowEntry], current: usize, rows: usize, cols: usize| {
+        pane_rect(&windows[current], windows[current].focused_pane, rows, cols)
+    };
+    let mut rect = pane_rect_now(windows, *current_window, *term_rows, *term_cols);
+    compositor_redraw(sessions, windows, *current_window, *term_rows, *term_cols);
+    let mut view = crate::pager::Pager::new(title, doc.lines(rect.cols), rect.rows, rect.cols);
     let mut last_size = (*term_rows, *term_cols);
     loop {
-        print!("{}", view.render(*term_rows));
+        print!("{}", view.render(rect));
         let _ = io::stdout().flush();
         let key = match editor::read_key_idle(&mut || {
-            service_background_jobs(sessions, windows, job_frames, current_window, term_rows, term_cols, sinks_are_grid);
+            service_background_jobs(sessions, windows, job_frames, *current_window, term_rows, term_cols, sinks_are_grid);
         }) {
             Ok(Some(k)) => k,
             // EOF/error: nothing to resume, same as every other loop's
@@ -11617,12 +11628,33 @@ fn run_pager(
         // view: the wrap width changed, and so did every table's layout.
         if (*term_rows, *term_cols) != last_size {
             last_size = (*term_rows, *term_cols);
+            rect = pane_rect_now(windows, *current_window, *term_rows, *term_cols);
+            compositor_redraw(sessions, windows, *current_window, *term_rows, *term_cols);
             let top_line = view.top_line();
-            view = crate::pager::Pager::new(title, doc.lines(*term_cols), *term_rows, *term_cols);
+            view = crate::pager::Pager::new(title, doc.lines(rect.cols), rect.rows, rect.cols);
             view.scroll_to(top_line);
         }
-        if view.handle_key(key) == crate::pager::Outcome::Quit {
-            break;
+        match view.handle_key(key) {
+            crate::pager::Outcome::Quit => break,
+            // A click the pager has no use for. Landing on another tab
+            // or pane, going there closes it -- the same rule a `<C-w>`
+            // focus change already follows. Anything else (this pane, a
+            // divider, a miss) keeps reading.
+            crate::pager::Outcome::Click(ev) => {
+                match hit_test_click(ev, sessions, windows, *current_window, *term_rows, *term_cols) {
+                    Some(ClickTarget::Window(idx)) if idx != *current_window => {
+                        *current_window = idx;
+                        break;
+                    }
+                    Some(ClickTarget::Pane(pane)) if pane != windows[*current_window].focused_pane => {
+                        restore_if_minimized(&mut windows[*current_window], pane);
+                        windows[*current_window].focused_pane = pane;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            crate::pager::Outcome::Continue => {}
         }
     }
     // The guard's own Drop turns mouse reporting off; whoever called
@@ -12048,7 +12080,9 @@ fn run_command_mode(
     session_id: SessionId,
     sessions: &mut HashMap<SessionId, SessionState>,
     windows: &mut Vec<WindowEntry>,
-    current_window: usize,
+    // `&mut` so a click on another tab from inside a pager opened
+    // here (`:help`, `:preview`) can actually go there.
+    current_window: &mut usize,
     next_session_id: &mut SessionId,
     history: &mut History,
     job_frames: &mut HashMap<JobFrameId, exec::FgJob>,
@@ -12172,7 +12206,7 @@ fn run_command_mode(
             // for one -- whatever arrived shows up once this excursion
             // ends and the caller repaints.
             &mut || {
-                service_background_jobs(sessions, windows, job_frames, current_window, term_rows, term_cols, sinks_are_grid);
+                service_background_jobs(sessions, windows, job_frames, *current_window, term_rows, term_cols, sinks_are_grid);
                 false
             },
             // The `mouse` bishopt -- off keeps the terminal's own
@@ -12224,7 +12258,7 @@ fn run_command_mode(
                 if transcript_visible {
                     render_command_transcript(&sessions[&session_id].command_transcript, *term_rows, *term_cols);
                 } else {
-                    compositor_redraw(sessions, windows, current_window, *term_rows, *term_cols);
+                    compositor_redraw(sessions, windows, *current_window, *term_rows, *term_cols);
                 }
             }
             Ok(ReadOutcome::Line(line)) => {
@@ -12503,8 +12537,8 @@ fn run_command_mode(
                             // still on top of this window's focused
                             // pane's own stack for the whole time this
                             // command-mode loop is driving it.
-                            if let Some(Frame::Edit(edit_frame_id)) = windows[current_window].stack().last().copied() {
-                                sync_diagnostics_pane(sessions, windows, current_window, next_session_id, edit_frame_id, &tb.diagnostics, *term_rows, *term_cols);
+                            if let Some(Frame::Edit(edit_frame_id)) = windows[*current_window].stack().last().copied() {
+                                sync_diagnostics_pane(sessions, windows, *current_window, next_session_id, edit_frame_id, &tb.diagnostics, *term_rows, *term_cols);
                             }
                             sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry { command: trimmed, output, status: 0 });
                             // Empty `Ran` output (not the count message
@@ -12539,10 +12573,10 @@ fn run_command_mode(
                             // that visibly left some behind would read
                             // as broken.
                             tb.diagnostics.clear();
-                            if let Some(Frame::Edit(edit_frame_id)) = windows[current_window].stack().last().copied()
-                                && let Some(pane_id) = diagnostics_sibling(&windows[current_window], edit_frame_id)
+                            if let Some(Frame::Edit(edit_frame_id)) = windows[*current_window].stack().last().copied()
+                                && let Some(pane_id) = diagnostics_sibling(&windows[*current_window], edit_frame_id)
                             {
-                                close_pane(&mut windows[current_window], pane_id);
+                                close_pane(&mut windows[*current_window], pane_id);
                                 close_orphaned_sessions(sessions, windows);
                             }
                             sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry { command: trimmed, output: String::new(), status: 0 });
@@ -12640,7 +12674,7 @@ fn run_command_mode(
                                 job_frames,
                                 edit_frames,
                                 session_id,
-                                current_window,
+                                *current_window,
                                 term_rows,
                                 term_cols,
                                 sinks_are_grid,
@@ -12672,7 +12706,7 @@ fn run_command_mode(
                                 windows,
                                 job_frames,
                                 session_id,
-                                current_window,
+                                *current_window,
                                 term_rows,
                                 term_cols,
                                 sinks_are_grid,
@@ -12720,7 +12754,7 @@ fn run_command_mode(
                         // runs while that's true, same as `diag`'s own
                         // identical lookup just above).
                         "dbg" | "debug" => {
-                            let Some(Frame::Edit(edit_frame_id)) = windows[current_window].stack().last().copied() else {
+                            let Some(Frame::Edit(edit_frame_id)) = windows[*current_window].stack().last().copied() else {
                                 unreachable!("this whole match arm only runs while editing a real Frame::Edit pane")
                             };
                             let (subcmd, subarg) = match arg {
@@ -12765,11 +12799,11 @@ fn run_command_mode(
                                     };
                                     debug_frames.insert(edit_frame_id, session);
                                     tb.set_readonly(true);
-                                    let pane_id = debug_run_sibling(&windows[current_window], edit_frame_id)
-                                        .unwrap_or_else(|| split_debug_run_pane(sessions, windows, current_window, next_session_id, edit_frame_id, *term_rows, *term_cols).0);
-                                    let sid = windows[current_window].pane(pane_id).owning_session();
+                                    let pane_id = debug_run_sibling(&windows[*current_window], edit_frame_id)
+                                        .unwrap_or_else(|| split_debug_run_pane(sessions, windows, *current_window, next_session_id, edit_frame_id, *term_rows, *term_cols).0);
+                                    let sid = windows[*current_window].pane(pane_id).owning_session();
                                     render_debug_run_title(&sessions[&sid].screen, *term_cols, "attached -- :dbg run to start");
-                                    compositor_redraw(sessions, windows, current_window, *term_rows, *term_cols);
+                                    compositor_redraw(sessions, windows, *current_window, *term_rows, *term_cols);
                                     let output = "attached -- read-only until :dbg quit; :dbg run to start, :dbg break [line] to set a breakpoint".to_string();
                                     sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry { command: trimmed, output: output.clone(), status: 0 });
                                     return CommandModeOutcome::Ran { output, status: 0 };
@@ -12801,31 +12835,31 @@ fn run_command_mode(
                                         buffer.clear();
                                         continue;
                                     };
-                                    let pane_id = debug_run_sibling(&windows[current_window], edit_frame_id)
-                                        .unwrap_or_else(|| split_debug_run_pane(sessions, windows, current_window, next_session_id, edit_frame_id, *term_rows, *term_cols).0);
-                                    let budget = editor_pane_for(&windows[current_window], edit_frame_id)
-                                        .map(|id| pane_rect(&windows[current_window], id, *term_rows, *term_cols).rows + 1)
+                                    let pane_id = debug_run_sibling(&windows[*current_window], edit_frame_id)
+                                        .unwrap_or_else(|| split_debug_run_pane(sessions, windows, *current_window, next_session_id, edit_frame_id, *term_rows, *term_cols).0);
+                                    let budget = editor_pane_for(&windows[*current_window], edit_frame_id)
+                                        .map(|id| pane_rect(&windows[*current_window], id, *term_rows, *term_cols).rows + 1)
                                         .unwrap_or(*term_rows);
                                     let rows = (budget / 2).max(6).min(budget.saturating_sub(3).max(1));
-                                    if let Some((_, children, idx)) = find_parent_split_mut(&mut windows[current_window].layout, pane_id) {
+                                    if let Some((_, children, idx)) = find_parent_split_mut(&mut windows[*current_window].layout, pane_id) {
                                         children[idx].minimized = false;
                                         children[idx].fixed = Some(rows);
                                     }
                                     // Going to a pane is how you get a minimized one back.
-                                    restore_if_minimized(&mut windows[current_window], pane_id);
-                                    windows[current_window].focused_pane = pane_id;
-                                    compositor_redraw(sessions, windows, current_window, *term_rows, *term_cols);
-                                    let run_rect = pane_rect(&windows[current_window], pane_id, *term_rows, *term_cols);
+                                    restore_if_minimized(&mut windows[*current_window], pane_id);
+                                    windows[*current_window].focused_pane = pane_id;
+                                    compositor_redraw(sessions, windows, *current_window, *term_rows, *term_cols);
+                                    let run_rect = pane_rect(&windows[*current_window], pane_id, *term_rows, *term_cols);
                                     // The real editor pane's own rect --
                                     // a pause paints straight into this
                                     // (see debugger.rs's own top-of-file
                                     // doc comment), not `run_rect`, which
                                     // stays reserved for the script's own
                                     // live/handed-off output.
-                                    let Some(editor_pane) = editor_pane_for(&windows[current_window], edit_frame_id) else {
+                                    let Some(editor_pane) = editor_pane_for(&windows[*current_window], edit_frame_id) else {
                                         unreachable!("this whole match arm only runs while editing a real Frame::Edit pane")
                                     };
-                                    let editor_rect = pane_rect(&windows[current_window], editor_pane, *term_rows, *term_cols);
+                                    let editor_rect = pane_rect(&windows[*current_window], editor_pane, *term_rows, *term_cols);
 
                                     let (quit_requested, nav_cursor) = match term::RawGuard::enable_with_mouse(0) {
                                         Ok(guard) => {
@@ -12851,11 +12885,11 @@ fn run_command_mode(
                                         }
                                     };
 
-                                    if let Some((_, children, idx)) = find_parent_split_mut(&mut windows[current_window].layout, pane_id) {
+                                    if let Some((_, children, idx)) = find_parent_split_mut(&mut windows[*current_window].layout, pane_id) {
                                         children[idx].minimized = true;
                                         children[idx].fixed = None;
                                     }
-                                    windows[current_window].focused_pane = editor_pane;
+                                    windows[*current_window].focused_pane = editor_pane;
                                     // A pause navigated `tb`'s own stand-
                                     // in copy around (debugger.rs's own
                                     // `nav_buf`) -- carry that cursor
@@ -12868,15 +12902,15 @@ fn run_command_mode(
                                     let status = if quit_requested {
                                         tb.set_readonly(false);
                                         debug_frames.remove(&edit_frame_id);
-                                        close_pane(&mut windows[current_window], pane_id);
+                                        close_pane(&mut windows[*current_window], pane_id);
                                         close_orphaned_sessions(sessions, windows);
                                         "quit"
                                     } else {
-                                        let sid = windows[current_window].pane(pane_id).owning_session();
+                                        let sid = windows[*current_window].pane(pane_id).owning_session();
                                         render_debug_run_title(&sessions[&sid].screen, *term_cols, "run finished -- :dbg run to run again");
                                         "run finished"
                                     };
-                                    compositor_redraw(sessions, windows, current_window, *term_rows, *term_cols);
+                                    compositor_redraw(sessions, windows, *current_window, *term_rows, *term_cols);
                                     let output = status.to_string();
                                     sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry { command: trimmed, output: output.clone(), status: 0 });
                                     return CommandModeOutcome::Ran { output, status: 0 };
@@ -12985,11 +13019,11 @@ fn run_command_mode(
                                 "quit" | "q" if subarg.is_none() => {
                                     if debug_frames.remove(&edit_frame_id).is_some() {
                                         tb.set_readonly(false);
-                                        if let Some(pane_id) = debug_run_sibling(&windows[current_window], edit_frame_id) {
-                                            close_pane(&mut windows[current_window], pane_id);
+                                        if let Some(pane_id) = debug_run_sibling(&windows[*current_window], edit_frame_id) {
+                                            close_pane(&mut windows[*current_window], pane_id);
                                             close_orphaned_sessions(sessions, windows);
                                         }
-                                        compositor_redraw(sessions, windows, current_window, *term_rows, *term_cols);
+                                        compositor_redraw(sessions, windows, *current_window, *term_rows, *term_cols);
                                     }
                                     sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry { command: trimmed, output: String::new(), status: 0 });
                                     return CommandModeOutcome::Ran { output: String::new(), status: 0 };

@@ -21,6 +21,7 @@
 // completely when they're done.
 
 use crate::bishedit::unicode_width::char_width;
+use crate::repl::Rect;
 
 pub struct Pager {
     // What the title bar says this is: `:help`, or a previewed file's
@@ -42,10 +43,15 @@ pub struct Pager {
 }
 
 // What one keystroke did, from the driving loop's point of view.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq)]
 pub enum Outcome {
     Continue,
     Quit,
+    /// A left click this view has no use for. Reported rather than
+    /// swallowed so the host can hit-test it against the tab bar and
+    /// the other panes -- which only became a sensible thing to do once
+    /// the pager stopped painting over them.
+    Click(crate::editor::MouseEvent),
 }
 
 impl Pager {
@@ -179,6 +185,7 @@ impl Pager {
                 self.step_match(-1);
                 Outcome::Continue
             }
+            Key::Mouse(ev) if ev.is_left_click() => Outcome::Click(ev),
             Key::Mouse(ev) => {
                 if ev.is_scroll_down() {
                     self.scroll_by(3);
@@ -238,16 +245,31 @@ impl Pager {
     }
 
     // The whole screen: title, the visible slice, and a status bar.
-    pub fn render(&self, term_rows: usize) -> String {
+    /// Renders into `rect` -- one pane's rectangle, not the whole
+    /// screen.
+    ///
+    /// It used to paint from `\x1b[H` across the full terminal, which
+    /// made it an overlay: every other pane and the tab bar disappeared
+    /// while a `:help` or a manpage was up, and there was nothing on
+    /// screen for a click to mean. Positioning against a rect is the
+    /// same thing browser.rs and the hex view already do, and it is what
+    /// lets a click be hit-tested against panes that are actually
+    /// visible.
+    pub fn render(&self, rect: Rect) -> String {
         let mut out = String::new();
-        out.push_str("\x1b[?25l\x1b[H");
+        out.push_str("\x1b[?25l");
+        let at = |row: usize| format!("\x1b[{};{}H", rect.row + row + 1, rect.col + 1);
+        out.push_str(&at(0));
         out.push_str(&format!("\x1b[1;7m{}\x1b[0m", pad_to_width(&self.title, self.cols)));
         for row in 0..self.rows {
-            out.push_str(&format!("\x1b[{};1H", row + 2));
+            out.push_str(&at(row + 1));
             let line = self.lines.get(self.top + row).map(String::as_str).unwrap_or("");
             out.push_str(&pad_to_width(line, self.cols));
         }
-        out.push_str(&format!("\x1b[{};1H", term_rows.max(2)));
+        // The status row is this pane's own last row, never the
+        // terminal's -- with a split above or below, those are different
+        // rows and the old code would have written over a neighbour.
+        out.push_str(&at(rect.rows.saturating_sub(1)));
         out.push_str(&format!("\x1b[7m{}\x1b[0m", pad_to_width(&self.status(), self.cols)));
         out
     }
@@ -440,7 +462,7 @@ mod tests {
             "x".repeat(200),
         ];
         let p = Pager::new("title", lines, 10, 40);
-        for row in p.render(10).split("\x1b[").filter(|s| s.ends_with('H') || s.contains('H')) {
+        for row in p.render(Rect { row: 0, col: 0, rows: 10, cols: 80 }).split("\x1b[").filter(|s| s.ends_with('H') || s.contains('H')) {
             let _ = row;
         }
         // Measured directly rather than by parsing the frame back out:
@@ -476,6 +498,6 @@ mod tests {
     #[test]
     fn an_empty_document_renders_without_panicking() {
         let p = Pager::new("empty", Vec::new(), 10, 40);
-        assert!(!p.render(10).is_empty());
+        assert!(!p.render(Rect { row: 0, col: 0, rows: 10, cols: 80 }).is_empty());
     }
 }
