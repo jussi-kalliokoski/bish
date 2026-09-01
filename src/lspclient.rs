@@ -356,10 +356,17 @@ pub fn settings_tree(pairs: &[(String, String)]) -> Value {
 // `Null` for one nothing was set for -- which is the protocol's own way
 // of saying "nothing set, use your defaults".
 //
-// Walked here rather than handed to `json::query`, whose path syntax
-// accepts only alphanumerics and `_` in a dotted field name: the single
-// most common section name in the wild is `rust-analyzer`, and it would
-// stop at the hyphen and silently answer `null` for everything.
+// Walked here rather than handed to `json::query`. That used to be
+// forced: `query`'s dotted field names accepted only alphanumerics and
+// `_`, so `rust-analyzer` -- the most common section name there is --
+// stopped at the hyphen and answered `null` for everything. `query` now
+// takes a bare name up to the next `.` or `[`, so it could do this.
+//
+// Kept as a walk anyway, because the two answer subtly different
+// questions: a section is a list of literal keys split on `.`, while a
+// path is an expression where `[` and a leading `.` mean something. A
+// server asking for a section whose name contains a bracket would be
+// mis-parsed by the path form and is handled correctly here.
 fn section_of(settings: &Value, section: &str) -> Value {
     let mut node = settings;
     for part in section.split('.').filter(|p| !p.is_empty()) {

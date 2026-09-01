@@ -594,13 +594,19 @@ fn write_json_string(out: &mut String, s: &str) {
     out.push('"');
 }
 
-// `.foo.bar[2]`/`.["key with spaces"]`/`.` -- a missing field or an
+// `.foo.bar[2]`/`["key with spaces"]`/`.` -- a missing field or an
 // out-of-range index resolves to `Null` rather than an error (matching
 // real `jq`'s own "absent means null" convention), so a script can
 // write `json .maybe_missing file.json` and get a clean "null" instead
 // of a parse-time-shaped failure for something that's a perfectly
 // ordinary runtime outcome. A malformed *path expression* itself (bad
 // syntax, not a bad lookup) is still a real Err.
+//
+// A bare `.name` runs to the next `.` or `[`, so it covers hyphens and
+// anything else a JSON key may contain -- `.rust-analyzer.check` works.
+// The bracket form is for the two characters a bare name cannot hold:
+// `["a.b"]` for a key with a dot, and `["x"]` at the very start, since
+// a leading `.` there would be looking for a field called nothing.
 pub fn query<'a>(root: &'a Value, path: &str) -> Result<&'a Value, String> {
     let path = path.trim();
     if path.is_empty() || path == "." {
@@ -614,7 +620,14 @@ pub fn query<'a>(root: &'a Value, path: &str) -> Result<&'a Value, String> {
             '.' => {
                 i += 1;
                 let start = i;
-                while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') {
+                // Everything up to the next `.` or `[` is the name. It
+                // used to be alphanumerics and `_` only, which quietly
+                // stopped at the hyphen in `.rust-analyzer` -- the most
+                // common LSP settings key there is -- and answered for
+                // `rust` instead. A JSON key can contain anything at
+                // all, so the only characters that can end one here are
+                // the two that begin the next step.
+                while i < chars.len() && chars[i] != '.' && chars[i] != '[' {
                     i += 1;
                 }
                 if start == i {
@@ -827,6 +840,24 @@ mod tests {
         assert_eq!(query(&v, ".a.b[0]").unwrap(), &Value::Number(10.0));
         assert_eq!(query(&v, ".a.b[2].c").unwrap(), &Value::Str("deep".to_string()));
         assert_eq!(query(&v, r#".a["b"][1]"#).unwrap(), &Value::Number(20.0));
+    }
+
+    #[test]
+    fn a_bare_field_name_may_hold_anything_but_a_dot_or_a_bracket() {
+        // The bug: a bare name used to stop at the first non-alphanumeric,
+        // so `.rust-analyzer` silently looked up `rust` -- and that is the
+        // most common LSP settings key there is. lspclient.rs had to walk
+        // its sections by hand because of it.
+        let v = parse(r#"{"rust-analyzer":{"check":{"command":"clippy"}},"a.b":1,"with space":2}"#).unwrap();
+        assert_eq!(query(&v, ".rust-analyzer.check.command").unwrap(), &Value::Str("clippy".to_string()));
+        assert_eq!(query(&v, r#".["with space"]"#).unwrap_or(&Value::Null), &Value::Null, "a leading dot still wants a name");
+        // The bracket form covers the two a bare name cannot: a key
+        // containing a dot, and a key at the very start.
+        assert_eq!(query(&v, r#"["a.b"]"#).unwrap(), &Value::Number(1.0));
+        assert_eq!(query(&v, r#"["with space"]"#).unwrap(), &Value::Number(2.0));
+        // ...and a name that is genuinely absent still resolves to null
+        // rather than to a shorter prefix of itself.
+        assert_eq!(query(&v, ".rust-analyser").unwrap(), &Value::Null);
     }
 
     #[test]
