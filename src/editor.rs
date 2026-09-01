@@ -91,6 +91,12 @@ pub enum Key {
     CtrlD,
     CtrlE,
     CtrlF,
+    // No binding of their own anywhere in bish -- decoded purely so a
+    // mapping can reach them, which is what `<C-s>` for "save" wants.
+    CtrlG,
+    CtrlQ,
+    CtrlS,
+    CtrlT,
     CtrlK,
     CtrlL,
     // Completion cycling -- see read_line's own completion handling.
@@ -248,6 +254,48 @@ fn read_byte() -> io::Result<Option<u8>> {
     }
 }
 
+// The keys that are exactly one byte and need nothing read after them.
+//
+// Split out of `read_key`'s own match so it can be tested without a
+// terminal: everything else there either reads further bytes (an escape
+// sequence, a UTF-8 continuation) or depends on what came before.
+//
+// 0x07/0x11/0x13/0x14 have no meaning of their own anywhere in bish and
+// are decoded purely so `::bish map` can bind them -- `<C-s>` for "save"
+// being the obvious one. They land in the same catch-all every other
+// unbound key does. 0x11/0x13 are XON/XOFF and reach a program at all
+// only because `term::derive_raw` clears IXON: flow control is the
+// terminal's idea, not this one's.
+fn decode_solo_byte(b: u8) -> Option<Key> {
+    Some(match b {
+        0x00 => Key::CtrlSpace,
+        0x01 => Key::CtrlA,
+        0x02 => Key::CtrlB,
+        0x03 => Key::CtrlC,
+        0x04 => Key::CtrlD,
+        0x05 => Key::CtrlE,
+        0x06 => Key::CtrlF,
+        0x07 => Key::CtrlG,
+        0x09 => Key::Tab,
+        0x0b => Key::CtrlK,
+        0x0c => Key::CtrlL,
+        0x0e => Key::CtrlN,
+        0x0f => Key::CtrlO,
+        0x10 => Key::CtrlP,
+        0x11 => Key::CtrlQ,
+        0x12 => Key::CtrlR,
+        0x13 => Key::CtrlS,
+        0x14 => Key::CtrlT,
+        0x15 => Key::CtrlU,
+        0x16 => Key::CtrlV,
+        0x17 => Key::CtrlW,
+        0x18 => Key::CtrlX,
+        0x19 => Key::CtrlY,
+        0x1a => Key::CtrlZ,
+        _ => return None,
+    })
+}
+
 // Reads one key event from stdin, which raw mode has already put into
 // unbuffered/no-echo/no-ISIG mode (see term::RawGuard) -- so every key,
 // including Ctrl-C and Ctrl-Z, arrives here as plain bytes rather than as
@@ -259,27 +307,10 @@ fn read_key() -> io::Result<Option<Key>> {
         Some(b) => b,
         None => return Ok(None),
     };
+    if let Some(key) = decode_solo_byte(b) {
+        return Ok(Some(key));
+    }
     let key = match b {
-        0x00 => Key::CtrlSpace,
-        0x01 => Key::CtrlA,
-        0x02 => Key::CtrlB,
-        0x03 => Key::CtrlC,
-        0x04 => Key::CtrlD,
-        0x05 => Key::CtrlE,
-        0x06 => Key::CtrlF,
-        0x09 => Key::Tab,
-        0x0b => Key::CtrlK,
-        0x0c => Key::CtrlL,
-        0x0e => Key::CtrlN,
-        0x0f => Key::CtrlO,
-        0x10 => Key::CtrlP,
-        0x12 => Key::CtrlR,
-        0x15 => Key::CtrlU,
-        0x16 => Key::CtrlV,
-        0x17 => Key::CtrlW,
-        0x18 => Key::CtrlX,
-        0x19 => Key::CtrlY,
-        0x1a => Key::CtrlZ,
         b'\r' | b'\n' => Key::Enter,
         0x7f | 0x08 => Key::Backspace,
         0x1b => return Ok(Some(read_escape()?)),
@@ -2130,6 +2161,13 @@ pub fn read_line(
             // charwise selection, which `v` already gives -- so the
             // prompt leaves this key alone.
             | Key::CtrlV
+            // Decoded so `::bish map` can bind them, and bound to
+            // nothing here -- the same place every other unbound key
+            // lands.
+            | Key::CtrlG
+            | Key::CtrlQ
+            | Key::CtrlS
+            | Key::CtrlT
             | Key::Unknown => {}
         }
         // Recomputed fresh every iteration -- see compute_suggestion's
@@ -3565,6 +3603,25 @@ mod tests {
         assert!(selection_layer(&ed, (2, 2)).is_empty());
         // ...and one running past the end is clamped, not a panic.
         assert_eq!(selection_layer(&ed, (4, 99)).first().map(|s| (s.start, s.end)), Some((4, 6)));
+    }
+
+    #[test]
+    fn every_control_byte_decodes_to_a_key_of_its_own() {
+        // 0x07/0x11/0x13/0x14 used to fall through to `Unknown`, so a
+        // mapping could not name them. 0x11 and 0x13 are XON/XOFF, and
+        // they reach us at all only because `derive_raw` clears IXON --
+        // flow control is the terminal's idea, not this program's.
+        assert_eq!(decode_solo_byte(0x07), Some(Key::CtrlG));
+        assert_eq!(decode_solo_byte(0x11), Some(Key::CtrlQ));
+        assert_eq!(decode_solo_byte(0x13), Some(Key::CtrlS));
+        assert_eq!(decode_solo_byte(0x14), Some(Key::CtrlT));
+        // The neighbours they sit between are unmoved.
+        assert_eq!(decode_solo_byte(0x06), Some(Key::CtrlF));
+        assert_eq!(decode_solo_byte(0x12), Some(Key::CtrlR));
+        assert_eq!(decode_solo_byte(0x15), Some(Key::CtrlU));
+        // ...and the ones that are something else entirely stay so.
+        assert_eq!(decode_solo_byte(0x09), Some(Key::Tab));
+        assert_eq!(decode_solo_byte(0x0d), Option::None, "CR is Enter, but that arm reads no further byte either -- it stays in read_key");
     }
 
     #[test]

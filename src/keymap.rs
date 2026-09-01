@@ -59,12 +59,16 @@ const NAMED: &[(&str, Key)] = &[
     ("<C-d>", Key::CtrlD),
     ("<C-e>", Key::CtrlE),
     ("<C-f>", Key::CtrlF),
+    ("<C-g>", Key::CtrlG),
     ("<C-k>", Key::CtrlK),
     ("<C-l>", Key::CtrlL),
     ("<C-n>", Key::CtrlN),
     ("<C-o>", Key::CtrlO),
     ("<C-p>", Key::CtrlP),
+    ("<C-q>", Key::CtrlQ),
     ("<C-r>", Key::CtrlR),
+    ("<C-s>", Key::CtrlS),
+    ("<C-t>", Key::CtrlT),
     ("<C-u>", Key::CtrlU),
     ("<C-v>", Key::CtrlV),
     ("<C-w>", Key::CtrlW),
@@ -764,6 +768,23 @@ mod tests {
         for (name, key) in NAMED {
             assert_eq!(parse_keys(name), Ok(vec![*key]), "{name} did not parse");
             assert_eq!(format_keys(&[*key]), *name, "{name} did not format back");
+        }
+    }
+
+    #[test]
+    fn the_control_keys_bish_binds_to_nothing_are_still_mappable() {
+        // These four have no meaning of their own anywhere in bish,
+        // which is exactly why someone would map them -- `<C-s>` for
+        // "save" most of all. They used not to decode at all, so the
+        // mapping was refused as an unknown name and the diagnosis
+        // ("flow control eats <C-s>") was wrong twice over: bish's raw
+        // mode already clears IXON.
+        for (spelling, key) in
+            [("<C-g>", Key::CtrlG), ("<C-q>", Key::CtrlQ), ("<C-s>", Key::CtrlS), ("<C-t>", Key::CtrlT)]
+        {
+            assert_eq!(parse_keys(spelling), Ok(vec![key]), "{spelling}");
+            assert_eq!(format_keys(&[key]), spelling);
+            assert!(is_mappable(key));
         }
     }
 
