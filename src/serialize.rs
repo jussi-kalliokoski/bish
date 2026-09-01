@@ -316,3 +316,128 @@ fn serialize_array_var_op(name: &str, index: &str, op: &VarOp) -> String {
     let full = format!("{}[{}]", name, index);
     serialize_var_op(&full, op)
 }
+
+#[cfg(test)]
+mod quoting_tests {
+    use super::quote_literal;
+
+    // Everything that re-enters the shell as text goes through this
+    // function: `functions_preamble` rebuilding a function body for a
+    // subshell, `$(...)` capture, `complete -W`'s word list, `abbr`
+    // listing itself back in a form that can be sourced. If it is ever
+    // wrong for some byte, the failure is not a wrong answer -- it is a
+    // string that stops being data and starts being syntax.
+    //
+    // So this checks the property directly, on the bytes most likely to
+    // break it, against two independent readers: bish's own lexer and
+    // expansion, and real bash.
+    fn corpus() -> Vec<String> {
+        let mut out: Vec<String> = [
+            "",
+            "plain",
+            "'",
+            "''",
+            "'''",
+            "a'b",
+            "\\",
+            "\\'",
+            "'\\''",
+            "\"",
+            "$x",
+            "${x}",
+            "$(id)",
+            "`id`",
+            "$((1+1))",
+            "!!",
+            "!$",
+            "~",
+            "~root",
+            "*",
+            "?",
+            "[a-z]",
+            "{a,b}",
+            "#comment",
+            ";",
+            "|",
+            "&&",
+            "<",
+            ">",
+            ">>",
+            "\n",
+            "a\nb",
+            "\t",
+            "  spaced  ",
+            "-n",
+            "--",
+            "%s",
+            "%",
+            "\u{e4}\u{f6}\u{e5}",
+            "\u{1b}[2J",
+            "\u{7f}",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+
+        // Plus random strings over the same alphabet, so the corpus is
+        // not just the cases I happened to think of. Seeded, because a
+        // test that fails only sometimes is a test nobody trusts.
+        let alphabet: Vec<char> = "ab'\\\"$`(){}[]!~*?;|&<>#\n\t %-\u{e4}".chars().collect();
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        };
+        for _ in 0..300 {
+            let len = (next() % 13) as usize;
+            out.push((0..len).map(|_| alphabet[(next() % alphabet.len() as u64) as usize]).collect());
+        }
+        out
+    }
+
+    #[test]
+    fn quote_literal_survives_bishs_own_lexer_and_expansion() {
+        for original in corpus() {
+            let script = format!("printf '%s' {}\n", quote_literal(&original));
+            let mut sh = crate::exec::Shell::new();
+            let out = std::rc::Rc::new(std::cell::RefCell::new(String::new()));
+            sh.set_sink_capture(out.clone());
+            sh.run_source_here(&script, "<quote-literal>");
+            let got = out.borrow().clone();
+            assert_eq!(got, original, "quoted as {}", quote_literal(&original));
+        }
+    }
+
+    // The same corpus through real bash. bish agreeing with itself
+    // would prove only that its lexer undoes its own quoter; the
+    // question is whether the quoting is *right*, and bash is what
+    // decides that.
+    #[test]
+    fn quote_literal_survives_real_bash() {
+        let available = std::process::Command::new("bash").arg("-c").arg(":").status().is_ok_and(|s| s.success());
+        if !available {
+            return;
+        }
+        for original in corpus() {
+            let script = format!("printf '%s' {}", quote_literal(&original));
+            let out = std::process::Command::new("bash").arg("-c").arg(&script).output().expect("bash");
+            assert!(out.status.success(), "bash rejected {script:?}");
+            let got = String::from_utf8_lossy(&out.stdout).into_owned();
+            assert_eq!(got, original, "bash read {script:?} differently");
+        }
+    }
+
+    // The shape of the output, pinned separately: a single-quoted run
+    // with `'\''` for each quote is the POSIX idiom, and the empty
+    // string still has to be a word rather than nothing at all.
+    #[test]
+    fn quote_literal_produces_the_posix_idiom() {
+        assert_eq!(quote_literal(""), "''", "an empty word has to survive as a word");
+        assert_eq!(quote_literal("a"), "'a'");
+        assert_eq!(quote_literal("a'b"), "'a'\\''b'");
+        assert_eq!(quote_literal("\\"), "'\\'");
+    }
+}
