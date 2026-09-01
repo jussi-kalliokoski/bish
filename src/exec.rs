@@ -1740,8 +1740,21 @@ impl Shell {
         Shell {
             last_status: 0,
             functions: self.functions.clone(),
-            arg_frames: vec![Vec::new()],
-            var_scopes: Vec::new(),
+            // A subshell sees what the shell that made it sees: its
+            // positional parameters, and whatever `local` is in scope.
+            // Both used to start empty here, so `$(... "$1" ...)` was
+            // blank and a `local` was invisible to any substitution
+            // inside the function that declared it -- while everything
+            // *around* them (functions, arrays, aliases) was inherited
+            // correctly, which is what made this look like a lookup bug
+            // rather than a missing copy.
+            //
+            // One frame, not the whole stack: a subshell is a single
+            // scope, and `shift` or `set` inside it must not reach a
+            // caller's frame. It is a copy either way -- a virtual
+            // child owns its own `Shell`.
+            arg_frames: vec![self.arg_frames.last().cloned().unwrap_or_default()],
+            var_scopes: self.var_scopes.clone(),
             script_name: self.script_name.clone(),
             arrays: self.arrays.clone(),
             assoc_arrays: self.assoc_arrays.clone(),
@@ -8485,6 +8498,55 @@ pub(crate) fn shell_quote(s: &str) -> String {
     }
     out.push('\'');
     out
+}
+
+#[cfg(test)]
+mod subshell_inheritance_tests {
+    // A subshell sees what the shell that made it sees. Everything
+    // *around* the positional parameters was already inherited --
+    // functions, arrays, aliases, the directory stack -- which is what
+    // made `$(... "$1" ...)` coming back empty look like a lookup
+    // problem rather than two fields left blank in one constructor.
+    //
+    // Every expectation here was checked against real bash first.
+    fn output(script: &str, args: &[&str]) -> String {
+        let mut shell = super::Shell::new();
+        shell.arg_frames = vec![args.iter().map(|s| s.to_string()).collect()];
+        let captured = std::rc::Rc::new(std::cell::RefCell::new(String::new()));
+        shell.set_sink_capture(captured.clone());
+        shell.run_source_here(script, "<subshell>");
+        let out = captured.borrow().clone();
+        out
+    }
+
+    #[test]
+    fn a_command_substitution_sees_the_positional_parameters() {
+        assert_eq!(output("printf '%s' \"$(printf '%s' \"$1\")\"\n", &["hello", "there"]), "hello");
+        assert_eq!(output("printf '%s' \"$(printf '%s' \"$#\")\"\n", &["hello", "there"]), "2");
+        assert_eq!(output("printf '%s' \"$(printf '%s' \"$*\")\"\n", &["hello", "there"]), "hello there");
+    }
+
+    #[test]
+    fn a_command_substitution_inside_a_function_sees_that_functions_arguments() {
+        let script = "f() { printf '%s' \"$(printf '%s' \"$1-$2-$#\")\"; }\nf a b\n";
+        assert_eq!(output(script, &["outer"]), "a-b-2");
+        // ...and what `shift` left behind, not what the call started
+        // with.
+        let shifted = "f() { shift; printf '%s' \"$(printf '%s' \"$1\")\"; }\nf one two\n";
+        assert_eq!(output(shifted, &[]), "two");
+    }
+
+    #[test]
+    fn a_command_substitution_sees_a_local_from_the_function_around_it() {
+        let script = "f() { local x=inner; printf '%s' \"$(printf '%s' \"$x\")\"; }\nf\n";
+        assert_eq!(output(script, &[]), "inner");
+    }
+
+    #[test]
+    fn what_a_subshell_does_to_its_own_arguments_stays_there() {
+        let script = "f() { printf '%s' \"$(shift; printf '%s' \"$1\")-$1\"; }\nf one two\n";
+        assert_eq!(output(script, &[]), "two-one", "the shift is the subshell's own");
+    }
 }
 
 #[cfg(test)]
