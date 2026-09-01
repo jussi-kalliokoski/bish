@@ -330,49 +330,14 @@ fn first_stderr_line(stderr: &[u8], fallback: &str) -> String {
     text.lines().next().unwrap_or(fallback).trim().to_string()
 }
 
-// The glibc/BSD `struct tm` layout, same as exec.rs's own CTm (kept as a
-// separate, local copy rather than shared -- this file's own small raw
-// libc FFI need doesn't justify a cross-module dependency for it, matching
-// how e.g. exec.rs's tty_basename/stdin_is_tty already each keep their own
-// tiny FFI declarations rather than sharing one). Unlike exec.rs's
-// local_time_now (always "right now"), this converts an arbitrary
-// caller-given Unix timestamp -- git blame's own author-time -- so it
-// calls localtime_r directly with that value instead of calling time()
-// first.
-#[repr(C)]
-struct CTm {
-    tm_sec: i32,
-    tm_min: i32,
-    tm_hour: i32,
-    tm_mday: i32,
-    tm_mon: i32,
-    tm_year: i32,
-    tm_wday: i32,
-    tm_yday: i32,
-    tm_isdst: i32,
-    tm_gmtoff: i64,
-    tm_zone: *const i8,
-}
-
+// git blame's author-time, as a plain date. This used to carry its own
+// copy of `struct tm` and its own `localtime_r` declaration, with a
+// comment explaining that one small FFI need did not justify a
+// cross-module dependency. That was true while the only other copy was
+// a private function sixteen thousand lines into exec.rs; `time.rs`
+// exists now, so it isn't.
 fn format_unix_date(epoch_secs: i64) -> String {
-    unsafe extern "C" {
-        fn localtime_r(t: *const i64, result: *mut CTm) -> *mut CTm;
-    }
-    let mut tm = CTm {
-        tm_sec: 0,
-        tm_min: 0,
-        tm_hour: 0,
-        tm_mday: 0,
-        tm_mon: 0,
-        tm_year: 0,
-        tm_wday: 0,
-        tm_yday: 0,
-        tm_isdst: 0,
-        tm_gmtoff: 0,
-        tm_zone: std::ptr::null(),
-    };
-    unsafe { localtime_r(&epoch_secs as *const i64, &mut tm as *mut CTm) };
-    format!("{:04}-{:02}-{:02}", tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday)
+    crate::time::strftime("%F", &crate::time::local_time_at(epoch_secs))
 }
 
 #[cfg(test)]

@@ -3101,11 +3101,11 @@ impl Shell {
                 'j' => out.push_str(&self.jobs.borrow().jobs.len().to_string()),
                 '!' | '#' => out.push('0'),
                 'l' => out.push_str(&tty_basename()),
-                'd' => out.push_str(&prompt_date()),
-                't' => out.push_str(&strftime("%H:%M:%S", &local_time_now())),
-                'T' => out.push_str(&strftime("%I:%M:%S", &local_time_now())),
-                '@' => out.push_str(&strftime("%I:%M %p", &local_time_now())),
-                'A' => out.push_str(&strftime("%H:%M", &local_time_now())),
+                'd' => out.push_str(&crate::time::prompt_date()),
+                't' => out.push_str(&crate::time::strftime("%H:%M:%S", &crate::time::local_time_now())),
+                'T' => out.push_str(&crate::time::strftime("%I:%M:%S", &crate::time::local_time_now())),
+                '@' => out.push_str(&crate::time::strftime("%I:%M %p", &crate::time::local_time_now())),
+                'A' => out.push_str(&crate::time::strftime("%H:%M", &crate::time::local_time_now())),
                 'D' if chars.peek() == Some(&'{') => {
                     chars.next();
                     let mut fmt = String::new();
@@ -3116,7 +3116,7 @@ impl Shell {
                         fmt.push(d);
                     }
                     let fmt = if fmt.is_empty() { "%a %b %e %H:%M:%S %Y" } else { &fmt };
-                    out.push_str(&strftime(fmt, &local_time_now()));
+                    out.push_str(&crate::time::strftime(fmt, &crate::time::local_time_now()));
                 }
                 other => {
                     out.push('\\');
@@ -4711,7 +4711,7 @@ impl Shell {
                     match &time_format {
                         Some(fmt) if !fmt.is_empty() => {
                             let stamp = match when {
-                                Some(secs) => strftime_at(fmt, &local_time_at(*secs), Some(*secs)),
+                                Some(secs) => crate::time::strftime_at(fmt, &crate::time::local_time_at(*secs), Some(*secs)),
                                 None => String::new(),
                             };
                             sh_println!(self, "{:5}  {}{}", i + 1, stamp, entry);
@@ -11178,7 +11178,7 @@ fn printf_format_once(format: &str, values: &[String], idx: &mut usize, out: &mu
                 Ok(n) if n >= 0 => n,
                 _ => unix_now().as_secs() as i64,
             };
-            out.push_str(&strftime_at(&time_fmt, &local_time_at(secs), Some(secs)));
+            out.push_str(&crate::time::strftime_at(&time_fmt, &crate::time::local_time_at(secs), Some(secs)));
             continue;
         }
 
@@ -11764,199 +11764,6 @@ fn tty_basename() -> String {
     }
     let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
     std::str::from_utf8(&buf[..end]).unwrap_or("").rsplit('/').next().unwrap_or("").to_string()
-}
-
-// The glibc/BSD `struct tm` layout (POSIX's 9 base fields plus the
-// common tm_gmtoff/tm_zone extension both platforms agree on) --
-// localtime_r writes a full struct tm's worth of bytes into its output
-// pointer regardless of what this declares, so this has to match the
-// real platform layout size-for-size, not just the fields this code
-// actually reads.
-#[repr(C)]
-struct CTm {
-    tm_sec: i32,
-    tm_min: i32,
-    tm_hour: i32,
-    tm_mday: i32,
-    tm_mon: i32,
-    tm_year: i32,
-    tm_wday: i32,
-    tm_yday: i32,
-    tm_isdst: i32,
-    tm_gmtoff: i64,
-    tm_zone: *const i8,
-}
-
-// `${v@P}`'s `\d`/`\t`/`\T`/`\@`/`\A`/`\D{...}` all need the current
-// local wall-clock time -- computed via the same raw libc FFI pattern
-// already used elsewhere in this file (e.g. stdin_is_tty/stdin_ready),
-// rather than pulling in a date/time crate for it.
-// The broken-down local time for an arbitrary timestamp, where
-// `local_time_now` only ever answers for "right now" -- what
-// `printf %(...)T` and `HISTTIMEFORMAT` both need.
-fn local_time_at(epoch_secs: i64) -> CTm {
-    unsafe extern "C" {
-        fn localtime_r(t: *const i64, result: *mut CTm) -> *mut CTm;
-    }
-    let mut tm = CTm {
-        tm_sec: 0,
-        tm_min: 0,
-        tm_hour: 0,
-        tm_mday: 0,
-        tm_mon: 0,
-        tm_year: 0,
-        tm_wday: 0,
-        tm_yday: 0,
-        tm_isdst: 0,
-        tm_gmtoff: 0,
-        tm_zone: std::ptr::null(),
-    };
-    unsafe { localtime_r(&epoch_secs as *const i64, &mut tm as *mut CTm) };
-    tm
-}
-
-fn local_time_now() -> CTm {
-    unsafe extern "C" {
-        fn time(t: *mut i64) -> i64;
-        fn localtime_r(t: *const i64, result: *mut CTm) -> *mut CTm;
-    }
-    let mut t: i64 = 0;
-    unsafe { time(&mut t as *mut i64) };
-    let mut tm = CTm {
-        tm_sec: 0,
-        tm_min: 0,
-        tm_hour: 0,
-        tm_mday: 0,
-        tm_mon: 0,
-        tm_year: 0,
-        tm_wday: 0,
-        tm_yday: 0,
-        tm_isdst: 0,
-        tm_gmtoff: 0,
-        tm_zone: std::ptr::null(),
-    };
-    unsafe { localtime_r(&t as *const i64, &mut tm as *mut CTm) };
-    tm
-}
-
-const WEEKDAY_ABBR: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
-const WEEKDAY_FULL: [&str; 7] =
-    ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
-const MONTH_ABBR: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
-const MONTH_FULL: [&str; 12] = [
-    "January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November",
-    "December",
-];
-
-// `\d`: bash's own default (no-arg) date format, "Weekday Month Day"
-// with the day space-padded to two columns (matching `%e`, e.g. "Tue
-// May  6" for the 6th) -- no year, no locale support (bish has none at
-// all), always English abbreviations.
-fn prompt_date() -> String {
-    let tm = local_time_now();
-    format!("{} {} {:2}", WEEKDAY_ABBR[tm.tm_wday as usize % 7], MONTH_ABBR[tm.tm_mon as usize % 12], tm.tm_mday)
-}
-
-// A small strftime subset covering the specifiers a prompt format
-// string would plausibly use -- not a general-purpose implementation
-// (no locale support, no width/padding modifiers beyond what's baked
-// into each specifier below). An unrecognized `%X` passes through
-// literally, matching this codebase's own established convention for
-// an unrecognized escape sequence elsewhere (e.g. expand_backslash_escapes).
-fn strftime(fmt: &str, tm: &CTm) -> String {
-    strftime_at(fmt, tm, None)
-}
-
-// The zone abbreviation the C library put in `tm_zone` ("UTC", "EEST",
-// ...). A borrowed C string that libc owns and keeps alive, so this
-// copies it out rather than holding the pointer.
-fn tm_zone_name(tm: &CTm) -> String {
-    if tm.tm_zone.is_null() {
-        return String::new();
-    }
-    let mut out = String::new();
-    let mut p = tm.tm_zone;
-    // Bounded: a zone abbreviation is a handful of bytes, and a
-    // runaway pointer must not become a runaway loop.
-    for _ in 0..32 {
-        let byte = unsafe { *p };
-        if byte == 0 {
-            break;
-        }
-        out.push(byte as u8 as char);
-        p = unsafe { p.add(1) };
-    }
-    out
-}
-
-// The same, with the timestamp `tm` was derived from -- `%s` is the one
-// directive that cannot be recovered from a broken-down time without
-// re-deriving the calendar, and the callers that want it always have it.
-// `None` prints `%s` literally rather than guessing.
-fn strftime_at(fmt: &str, tm: &CTm, epoch: Option<i64>) -> String {
-    let year = tm.tm_year + 1900;
-    let hour24 = tm.tm_hour;
-    let hour12 = match hour24 % 12 {
-        0 => 12,
-        h => h,
-    };
-    let mut out = String::new();
-    let mut chars = fmt.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c != '%' {
-            out.push(c);
-            continue;
-        }
-        let Some(spec) = chars.next() else {
-            out.push('%');
-            break;
-        };
-        match spec {
-            'Y' => out.push_str(&year.to_string()),
-            'y' => out.push_str(&format!("{:02}", year.rem_euclid(100))),
-            'm' => out.push_str(&format!("{:02}", tm.tm_mon + 1)),
-            'd' => out.push_str(&format!("{:02}", tm.tm_mday)),
-            'e' => out.push_str(&format!("{:2}", tm.tm_mday)),
-            'H' => out.push_str(&format!("{:02}", hour24)),
-            'I' => out.push_str(&format!("{:02}", hour12)),
-            'M' => out.push_str(&format!("{:02}", tm.tm_min)),
-            'S' => out.push_str(&format!("{:02}", tm.tm_sec)),
-            'p' => out.push_str(if hour24 < 12 { "AM" } else { "PM" }),
-            'a' => out.push_str(WEEKDAY_ABBR[tm.tm_wday as usize % 7]),
-            'A' => out.push_str(WEEKDAY_FULL[tm.tm_wday as usize % 7]),
-            'b' => out.push_str(MONTH_ABBR[tm.tm_mon as usize % 12]),
-            'B' => out.push_str(MONTH_FULL[tm.tm_mon as usize % 12]),
-            'j' => out.push_str(&format!("{:03}", tm.tm_yday + 1)),
-            'T' => out.push_str(&format!("{:02}:{:02}:{:02}", hour24, tm.tm_min, tm.tm_sec)),
-            'F' => out.push_str(&format!("{:04}-{:02}-{:02}", year, tm.tm_mon + 1, tm.tm_mday)),
-            'R' => out.push_str(&format!("{:02}:{:02}", hour24, tm.tm_min)),
-            'D' => out.push_str(&format!("{:02}/{:02}/{:02}", tm.tm_mon + 1, tm.tm_mday, year.rem_euclid(100))),
-            'C' => out.push_str(&format!("{:02}", year.div_euclid(100))),
-            'u' => out.push_str(&(if tm.tm_wday == 0 { 7 } else { tm.tm_wday }).to_string()),
-            'w' => out.push_str(&tm.tm_wday.to_string()),
-            'n' => out.push('\n'),
-            't' => out.push('\t'),
-            // The offset the C library resolved for *this* timestamp, so
-            // a summer date formats with summer's offset rather than
-            // today's -- which is the whole reason `tm_gmtoff` is filled
-            // in per-conversion.
-            'z' => {
-                let (sign, off) = if tm.tm_gmtoff < 0 { ('-', -tm.tm_gmtoff) } else { ('+', tm.tm_gmtoff) };
-                out.push_str(&format!("{sign}{:02}{:02}", off / 3600, (off % 3600) / 60));
-            }
-            'Z' => out.push_str(&tm_zone_name(tm)),
-            's' => match epoch {
-                Some(secs) => out.push_str(&secs.to_string()),
-                None => out.push_str("%s"),
-            },
-            '%' => out.push('%'),
-            other => {
-                out.push('%');
-                out.push(other);
-            }
-        }
-    }
-    out
 }
 
 // `read -p`'s prompt only displays when input is coming from a terminal

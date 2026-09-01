@@ -41,6 +41,7 @@ mod serialize;
 mod session;
 mod term;
 mod theme;
+mod time;
 mod toml;
 mod tool;
 mod url;
