@@ -2814,8 +2814,27 @@ mod tests {
     // request, the echoed `initialized`) is not what these tests are
     // about.
     fn document_notifications(server: &mut Server, want: usize) -> Vec<(String, Value)> {
+        collect_notifications(server, want, None)
+    }
+
+    // The negative form, for an assertion that `want` is *not* reached.
+    // There is no arrival to wait for there, so the helper above can
+    // only ever wait out its whole two seconds -- three call sites doing
+    // that were six seconds of every single test run.
+    //
+    // Waiting for the stream to go quiet answers the same question:
+    // once 100ms have passed with nothing new, a server talking to us
+    // over a pipe on this machine has said everything it is going to
+    // say. The 400-round ceiling stays as the backstop.
+    fn document_notifications_until_quiet(server: &mut Server, want: usize) -> Vec<(String, Value)> {
+        collect_notifications(server, want, Some(20))
+    }
+
+    fn collect_notifications(server: &mut Server, want: usize, quiet_rounds: Option<usize>) -> Vec<(String, Value)> {
         let mut seen = Vec::new();
+        let mut quiet = 0;
         for _ in 0..400 {
+            let before = seen.len();
             for message in server.service() {
                 if let Message::Notification { method, params } = message
                     && method.starts_with("textDocument/")
@@ -2824,6 +2843,10 @@ mod tests {
                 }
             }
             if seen.len() >= want {
+                break;
+            }
+            quiet = if seen.len() == before { quiet + 1 } else { 0 };
+            if quiet_rounds.is_some_and(|limit| quiet >= limit) {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(5));
@@ -2862,7 +2885,7 @@ mod tests {
         // error, not a refresh.
         server.open_document("file:///p/x.sh", "shellscript", 4, "echo bye\n");
         assert_eq!(server.open_documents(), 1);
-        assert!(document_notifications(&mut server, 2).len() < 2);
+        assert!(document_notifications_until_quiet(&mut server, 2).len() < 2);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -2932,7 +2955,7 @@ mod tests {
 
         // Closing what isn't open says nothing at all.
         server.close_document("file:///p/other.sh");
-        assert!(document_notifications(&mut server, 3).len() < 3);
+        assert!(document_notifications_until_quiet(&mut server, 3).len() < 3);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -3203,7 +3226,7 @@ mod tests {
         assert_eq!(server.open_documents(), 0);
         assert!(!server.needs_change("file:///p/x.sh", 2, Instant::now(), Duration::ZERO));
         server.save_document("file:///p/x.sh", "one");
-        assert!(document_notifications(&mut server, 1).is_empty());
+        assert!(document_notifications_until_quiet(&mut server, 1).is_empty());
         std::fs::remove_dir_all(&dir).ok();
     }
 
