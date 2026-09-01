@@ -104,6 +104,29 @@ pub fn socket_dir() -> PathBuf {
     PathBuf::from(format!("/tmp/bish-{}", current_uid()))
 }
 
+// A session name becomes a filename inside the 0700 socket directory,
+// so it has to be one component and nothing else. `bish session new
+// ../../tmp/x` would otherwise write outside that directory, and `bish
+// session attach ../../...` would connect to an arbitrary socket path.
+//
+// The user supplies their own argv today, so this is not a privilege
+// boundary yet -- it becomes one the moment a name can come from
+// anywhere else (a config file, a hook, `$BISH_SESSION`), and the
+// cheapest time to draw the line is before that happens.
+pub fn check_name(name: &str) -> io::Result<()> {
+    let ok = !name.is_empty()
+        && name != "."
+        && name != ".."
+        && name.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.');
+    match ok {
+        true => Ok(()),
+        false => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid session name '{name}': use letters, digits, '-', '_' and '.'"),
+        )),
+    }
+}
+
 pub fn socket_path(name: &str) -> PathBuf {
     socket_dir().join(format!("{}.sock", name))
 }
@@ -184,6 +207,30 @@ pub fn ensure_socket_dir() -> io::Result<PathBuf> {
         let err = io::Error::last_os_error();
         if err.kind() != io::ErrorKind::AlreadyExists {
             return Err(err);
+        }
+        // EEXIST is not the same as "the directory I meant is already
+        // there". On the `/tmp` fallback path anyone can pre-create
+        // `/tmp/bish-<uid>` -- including as a symlink into a directory
+        // they own -- and mkdir would report exactly this. The
+        // set_permissions below follows symlinks, so accepting EEXIST
+        // blindly means chmod'ing a stranger's directory 0700 and then
+        // putting this session's socket and pidfile inside it.
+        //
+        // symlink_metadata does not follow, so this sees the entry
+        // itself: it must be a real directory, and it must be ours.
+        use std::os::unix::fs::MetadataExt;
+        let meta = std::fs::symlink_metadata(&dir)?;
+        if !meta.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("{} exists and is not a directory", dir.display()),
+            ));
+        }
+        if meta.uid() != current_uid() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("{} is owned by uid {}, not by you", dir.display(), meta.uid()),
+            ));
         }
     }
     // Belt-and-suspenders: force the mode even if the directory already
@@ -286,6 +333,19 @@ fn decode_short_string(buf: &[u8], pos: &mut usize) -> Option<String> {
 // control sequence split across two `feed()` calls the same way) --
 // `feed` never blocks or does I/O itself, just appends; `next_message`
 // is what actually tries to parse.
+// The largest frame this protocol will accept. `try_accept` already
+// drops any connection whose peer uid is not ours, so the peer is the
+// same user -- but a session socket outlives the process that made it,
+// and same-uid is not same-trust. A length prefix is a promise about
+// bytes that have not arrived yet: without a ceiling a peer can declare
+// 4 GiB, dribble, and `feed` grows the buffer forever.
+//
+// 16 MiB is far past any real frame (a full repaint of a large terminal
+// is tens of kilobytes) and far below anything that matters. Same
+// reasoning as lsp.rs's MAX_CONTENT_LENGTH, which this protocol should
+// have had from the start.
+pub const MAX_FRAME: usize = 16 * 1024 * 1024;
+
 #[derive(Default)]
 pub struct Decoder {
     buf: Vec<u8>,
@@ -313,6 +373,12 @@ impl Decoder {
         }
         let kind = self.buf[0];
         let len = u32::from_be_bytes([self.buf[1], self.buf[2], self.buf[3], self.buf[4]]) as usize;
+        // Checked before the "not enough bytes yet" return, so an
+        // oversized declaration is refused on the first five bytes
+        // rather than after the peer has had a chance to send them.
+        if len > MAX_FRAME {
+            return Err(format!("frame of {len} bytes exceeds the {MAX_FRAME}-byte limit"));
+        }
         if self.buf.len() < 5 + len {
             return Ok(None);
         }
@@ -680,6 +746,7 @@ use crate::term;
 // unmodified repl::run. Only returns on a genuine startup failure --
 // repl::run itself runs until the interactive shell actually exits.
 pub fn run_daemon(name: &str) -> io::Result<i32> {
+    check_name(name)?;
     ensure_socket_dir()?;
     // Acquired first, before touching the socket at all: fails fast
     // (AddrInUse-shaped, but really "a live daemon already owns this
@@ -756,6 +823,7 @@ pub fn run_ls() -> io::Result<i32> {
 // than attempting a graceful in-shell shutdown -- matches what
 // tmux/screen's own kill-session already does, not a new tradeoff.
 pub fn run_kill(name: &str) -> io::Result<i32> {
+    check_name(name)?;
     if !is_daemon_alive(name) {
         eprintln!("bish: session '{}' is not running", name);
         return Ok(1);
@@ -781,6 +849,7 @@ pub fn run_kill(name: &str) -> io::Result<i32> {
 // rather than polling on an interval -- there is nothing else for a
 // client to usefully do while idle.
 pub fn run_client(name: &str) -> io::Result<i32> {
+    check_name(name)?;
     let sock_path = socket_path(name);
     let mut stream = UnixStream::connect(&sock_path).map_err(|e| io::Error::new(e.kind(), format!("bish: session '{}' not found ({})", name, e)))?;
 
@@ -889,6 +958,7 @@ pub fn run_client(name: &str) -> io::Result<i32> {
 // matching plain `tmux`'s own UX (see the implementation plan's
 // decision 1) rather than tmux's `-d`.
 pub fn run_new(name: &str) -> io::Result<i32> {
+    check_name(name)?;
     let exe = std::env::current_exe()?;
     std::process::Command::new(exe).args(["session", "--daemon", name]).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn()?;
 
@@ -908,6 +978,40 @@ pub fn run_new(name: &str) -> io::Result<i32> {
 
 #[cfg(test)]
 mod tests {
+    // A declared length is a promise about bytes that have not arrived.
+    // Believing a 4 GiB one means `feed` grows the buffer forever while
+    // the peer dribbles.
+    #[test]
+    fn an_oversized_frame_is_refused_on_its_header() {
+        let mut d = super::Decoder::new();
+        let mut header = vec![super::KIND_BYTES];
+        header.extend_from_slice(&(u32::MAX).to_be_bytes());
+        d.feed(&header);
+        let err = d.next_message().unwrap_err();
+        assert!(err.contains("exceeds"), "{err}");
+
+        // Refused on the five header bytes alone -- the payload never
+        // has to arrive, which is the whole point.
+        assert_eq!(header.len(), 5);
+
+        // And the largest legal frame still decodes.
+        let big = super::Message::Bytes(vec![b'x'; 4096]).encode();
+        let mut d = super::Decoder::new();
+        d.feed(&big);
+        assert!(matches!(d.next_message().unwrap(), Some(super::Message::Bytes(b)) if b.len() == 4096));
+    }
+
+    // A session name becomes a filename in the 0700 socket directory.
+    #[test]
+    fn a_session_name_has_to_be_one_path_component() {
+        for good in ["work", "a-b_c.2", "1"] {
+            assert!(super::check_name(good).is_ok(), "{good}");
+        }
+        for bad in ["", ".", "..", "../../tmp/x", "a/b", "a\0b", "-r --flag"] {
+            assert!(super::check_name(bad).is_err(), "{bad:?} must not become a path");
+        }
+    }
+
     use super::*;
     use std::os::unix::net::UnixStream;
 
