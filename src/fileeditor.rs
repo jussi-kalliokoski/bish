@@ -1457,7 +1457,10 @@ pub(crate) fn run_insert_mode(
         // for `on_idle` to also redraw them from inside that call. See
         // run_normal_mode_navigation's own identical restructuring
         // (repl.rs) for the full reasoning -- same fix, same root cause.
-        while !term::stdin_ready(editor::IDLE_POLL_MS) {
+        // A queued key -- a macro replay, or a mapping's expansion -- is
+        // not a byte on stdin, so polling for one would block with keys
+        // already in hand and hand them out one per real keystroke.
+        while !vk.has_pending_keys() && !term::stdin_ready(editor::IDLE_POLL_MS) {
             if let Some(geometry) = services.idle(buf) {
                 rect = geometry.rect;
                 term_rows = geometry.term_rows;

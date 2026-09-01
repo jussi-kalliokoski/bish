@@ -1001,6 +1001,32 @@ impl VimKeys {
         self.matcher = crate::keymap::Matcher::new(mappings);
     }
 
+    /// Whether a key is already waiting to be delivered, from a macro
+    /// replay or a mapping's expansion.
+    ///
+    /// Every loop that waits for input polls *stdin* before reading, so
+    /// each one has to ask this first: a queued key is not a byte on
+    /// stdin and the poll will never see it. Without the check the loop
+    /// blocks with keys in hand, and they come out one per real
+    /// keystroke -- which is what made a multi-key macro appear to
+    /// replay only its first key.
+    pub fn has_pending_keys(&self) -> bool {
+        !self.replay_queue.is_empty()
+    }
+
+    /// Takes whatever a mapping has queued but not yet delivered.
+    ///
+    /// Needed where a mapped key hands control to a loop that does not
+    /// read through this machine at all: `:` opens command mode, which
+    /// is `read_line` on raw stdin and has no idea a replay queue
+    /// exists. Without handing the rest over, a right-hand side like
+    /// `<Esc>:w<CR>` would fire its `<Esc>` and `:` and then silently
+    /// drop the `w<CR>` -- the mapping doing half its job, which is
+    /// worse than doing none.
+    pub fn take_replay_queue(&mut self) -> Vec<Key> {
+        self.replay_queue.drain(..).collect()
+    }
+
     /// Reads the next key *as a command*, applying `::bish map` to it.
     ///
     /// Deliberately separate from `next_key` rather than folded into it.

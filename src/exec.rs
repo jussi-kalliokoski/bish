@@ -4757,7 +4757,7 @@ impl Shell {
                         // dash says so rather than inventing a
                         // normal-mode reading of them.
                         let action = if crate::keymap::has_vim_mode(&m.modes) {
-                            crate::bishedit::vimkeys::describe_key_sequence(&m.rhs).unwrap_or_else(|why| format!("({why})"))
+                            crate::keymap::describe_rhs(&m.rhs).unwrap_or_else(|why| format!("({why})"))
                         } else {
                             "-".to_string()
                         };
@@ -4765,7 +4765,7 @@ impl Shell {
                             "{}\t{}\t{}\t{}",
                             m.modes,
                             crate::keymap::format_keys(&m.lhs),
-                            crate::keymap::format_keys(&m.rhs),
+                            crate::keymap::format_rhs(&m.rhs),
                             action
                         )
                     })
@@ -4811,6 +4811,10 @@ impl Shell {
                     sh_eprintln!(self, "bish: ::bish map: too many arguments (a space in a mapping is <Space>)");
                     return 2;
                 }
+                if lhs_text == "<Nop>" {
+                    sh_eprintln!(self, "bish: ::bish map: <Nop> is a right-hand side, not a key to press");
+                    return 2;
+                }
                 let (lhs, rhs) = match (crate::keymap::parse_keys(lhs_text), crate::keymap::parse_keys(rhs_text)) {
                     (Ok(lhs), Ok(rhs)) => (lhs, rhs),
                     (Err(why), _) | (_, Err(why)) => {
@@ -4834,7 +4838,7 @@ impl Shell {
                 // perfectly good insert-mode right-hand side while being
                 // no normal-mode action at all.
                 if crate::keymap::has_vim_mode(&mode)
-                    && let Err(why) = crate::bishedit::vimkeys::describe_key_sequence(&rhs)
+                    && let Err(why) = crate::keymap::describe_rhs(&rhs)
                 {
                     sh_eprintln!(self, "bish: ::bish map: '{rhs_text}' is {why} as a normal-mode action");
                     sh_eprintln!(self, "bish: ::bish map: if it was meant for another mode, scope it with -m");

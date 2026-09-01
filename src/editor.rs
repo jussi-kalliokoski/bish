@@ -1469,13 +1469,19 @@ pub fn read_line(
     // one of the remappable modes -- an empty table makes the whole
     // mechanism inert, so that caller behaves exactly as before.
     mappings: Vec<crate::keymap::Mapping>,
+    // Keys a mapping already produced elsewhere and could not deliver:
+    // a right-hand side like `<Esc>:w<CR>` fires `:` here and the rest
+    // has to arrive with it. Dispatched before anything is read, and
+    // never fed to the matcher -- they are a mapping's output, not
+    // input, which is what keeps noremap intact across the handoff.
+    queued: Vec<Key>,
 ) -> io::Result<ReadOutcome> {
     let mut guard = Some(term::RawGuard::enable_maybe_mouse(0, mouse)?);
     let mut matcher = crate::keymap::Matcher::new(mappings);
     // Keys a mapping expanded to, beyond the first -- delivered before
     // anything new is read, and never run back through the matcher,
     // which is what keeps a mapping from chaining into another.
-    let mut mapped: std::collections::VecDeque<Key> = std::collections::VecDeque::new();
+    let mut mapped: std::collections::VecDeque<Key> = queued.into_iter().collect();
     let mut ed = match initial {
         Some((text, cursor)) => {
             let mut e = LineEditor::new();
@@ -1577,7 +1583,9 @@ pub fn read_line(
                 // is drawn from actually free to redraw with. Same
                 // IDLE_POLL_MS interval read_key_idle's own loop uses, so
                 // behavior is identical once a byte does arrive.
-                while !term::stdin_ready(IDLE_POLL_MS) {
+                // Same reason as the other input loops: a key a mapping
+                // already produced is not a byte on stdin.
+                while mapped.is_empty() && !term::stdin_ready(IDLE_POLL_MS) {
                     if on_idle() {
                         let overlay = snippet.as_ref().map(snippet_layer).unwrap_or_default();
                         redraw_with_completion_row(

@@ -1052,9 +1052,11 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
                 changed
             },
             prompt_claims_mouse(mouse, sinks_are_grid),
-            // The shell prompt is not one of the five modes `::bish map`
+            // The shell prompt is not one of the modes `::bish map`
             // knows -- an inert table keeps it behaving exactly as it
-            // did before there were any mappings.
+            // did before there were any mappings, and nothing can have
+            // queued keys for it.
+            Vec::new(),
             Vec::new(),
         ) {
             Ok(ReadOutcome::Eof) => {
@@ -2174,9 +2176,12 @@ fn handle_command_mode(
     term_cols: &mut usize,
     editing: Option<&mut TextBuffer>,
     seed: Option<String>,
+    // Keys a mapping produced that this colon line has to finish
+    // delivering -- see editor::read_line's own `queued` parameter.
+    queued: Vec<Key>,
 ) -> CommandModeOutcome {
     let outcome = run_command_mode(
-        session_id, sessions, windows, *current_window, next_session_id, cmd_history, job_frames, debug_frames, edit_frames, registers, term_rows, term_cols, *sinks_are_grid, editing, seed,
+        session_id, sessions, windows, *current_window, next_session_id, cmd_history, job_frames, debug_frames, edit_frames, registers, term_rows, term_cols, *sinks_are_grid, editing, seed, queued,
     );
     match outcome {
         CommandModeOutcome::Action(ref action) => {
@@ -3528,6 +3533,9 @@ fn run_browse_frame(
                 term_cols,
                 None,
                 None,
+                // Nothing maps into the browser's colon line, so there is
+                // never a partly-delivered right-hand side to finish.
+                Vec::new(),
             );
             // Whatever `:bishopt` just changed has to be picked up
             // before the next redraw rather than on the next `e .` --
@@ -7793,7 +7801,10 @@ fn run_normal_mode_navigation(
         // that reattaches and doesn't immediately type anything, could
         // be never). Same IDLE_POLL_MS interval read_key_idle's own
         // loop uses, so behavior is identical once a byte does arrive.
-        while !term::stdin_ready(editor::IDLE_POLL_MS) {
+        // A queued key -- a macro replay, or a mapping's expansion -- is
+        // not a byte on stdin, so polling for one would block with keys
+        // already in hand and hand them out one per real keystroke.
+        while !vk.has_pending_keys() && !term::stdin_ready(editor::IDLE_POLL_MS) {
             let attached = service_background_jobs(sessions, windows, job_frames, *current_window, term_rows, term_cols, *sinks_are_grid);
             // Normal-mode edits (`dd`, `p`, `x`, `>>`, and everything
             // an Insert-mode session left behind on its way out) reach
@@ -8434,6 +8445,12 @@ fn run_normal_mode_navigation(
                     term_cols,
                     buf.as_editable_mut(),
                     None,
+                    // The rest of a mapping's right-hand side, when a mapped
+                    // `:` is what opened this colon line. Taken here rather
+                    // than left in the queue: `read_line` reads raw stdin and
+                    // never looks at it, so `<Esc>:w<CR>` would otherwise fire
+                    // its `:` and drop the `w<CR>`.
+                    vk.take_replay_queue(),
                 );
                 // `:diag` (only command that can, today) may have grafted
                 // a sibling pane in below this one -- recomputed here,
@@ -11984,6 +12001,9 @@ fn run_command_mode(
     // losing it. `None` (every other call site) starts with the ordinary
     // empty buffer.
     seed: Option<String>,
+    // See editor::read_line's own `queued` parameter: a mapping whose
+    // right-hand side opened this colon line has more keys to deliver.
+    mut queued: Vec<Key>,
 ) -> CommandModeOutcome {
     let mut editing = editing;
     let mut buffer = String::new();
@@ -12086,6 +12106,9 @@ fn run_command_mode(
             // This colon line *is* command mode, so `::bish map -m
             // command` applies to it.
             command_mappings,
+            // ...and if a mapping's `:` is what opened it, the rest of
+            // that right-hand side arrives here.
+            std::mem::take(&mut queued),
         ) {
             // Command mode discards whatever was typed either way, so
             // `text` is nothing to it -- see that field's own doc comment

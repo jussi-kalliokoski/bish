@@ -80,6 +80,10 @@ const NAMED: &[(&str, Key)] = &[
 const SPACE: &str = "<Space>";
 // `<` itself, so a mapping can contain one without opening a name.
 const LT: &str = "<lt>";
+// Vim's own spelling for "do nothing". Only meaningful as a whole
+// right-hand side -- it is the *absence* of keys, so there is nothing
+// for it to sit beside in a sequence.
+const NOP: &str = "<Nop>";
 
 // Whether a key can carry a mapping at all.
 //
@@ -121,6 +125,12 @@ pub fn format_keys(keys: &[Key]) -> String {
     keys.iter().map(|k| format_key(*k)).collect()
 }
 
+/// The same, for a right-hand side, where "no keys" is a real answer
+/// and prints as what would produce it.
+pub fn format_rhs(keys: &[Key]) -> String {
+    if keys.is_empty() { NOP.to_string() } else { format_keys(keys) }
+}
+
 /// Parses `<C-d>`, `<Space>w`, `10j` and so on into the keys they name.
 ///
 /// Angle-bracket names are matched case-insensitively (`<esc>`, `<ESC>`
@@ -132,6 +142,13 @@ pub fn format_keys(keys: &[Key]) -> String {
 /// The error is the message the user sees, so it names the offending
 /// text rather than an offset.
 pub fn parse_keys(text: &str) -> Result<Vec<Key>, String> {
+    if text.eq_ignore_ascii_case(NOP) {
+        // No keys at all: `::bish map -m insert '<Left>' '<Nop>'` is how
+        // a key is taken out of service. Only the whole right-hand side,
+        // never part of a sequence -- `a<Nop>b` would be `ab` written
+        // confusingly, so it is rejected below as an unknown name.
+        return Ok(Vec::new());
+    }
     if text.is_empty() {
         return Err("empty key sequence".to_string());
     }
@@ -287,6 +304,53 @@ pub fn usage() -> Vec<String> {
         "Write a space as <Space>, a literal < as <lt>.".to_string(),
         "Quote KEYS in the shell: a bare < is a redirection.".to_string(),
     ]
+}
+
+/// Keys the Normal-mode *host loop* answers itself, before `VimKeys`
+/// ever sees them -- see `run_normal_mode_navigation`'s own pre-match on
+/// `key`, above its `match vk.feed(key)`.
+///
+/// `VimKeys::feed` returns `None` for every one of these, so validating
+/// a right-hand side against that alone rejected `:`, `K`, `ZZ`, `q` and
+/// `@` -- which is to say every way of reaching command mode, hover,
+/// write-and-quit or a macro from a mapping. Normal mode's key handling
+/// is split across two layers and only one of them was being asked.
+///
+/// A table rather than a query, because that loop is a several-hundred
+/// line match with no seam to ask. The test below checks every entry is
+/// still unknown to `VimKeys`, which catches an entry that has since
+/// moved into the key machine; a *new* host arm has to be added here by
+/// hand.
+const HOST_KEYS: &[(Key, &str)] = &[
+    (Key::Char(':'), "command-mode"),
+    (Key::Char('K'), "hover"),
+    (Key::Char('Z'), "write-quit"),
+    (Key::Char('q'), "record-macro"),
+    (Key::Char('@'), "replay-macro"),
+];
+
+/// What the host loop calls this key, if it is one it handles.
+pub fn describe_host_key(key: Key) -> Option<&'static str> {
+    HOST_KEYS.iter().find(|(k, _)| *k == key).map(|(_, name)| *name)
+}
+
+/// Names what a right-hand side does, across both layers of Normal
+/// mode.
+///
+/// A sequence *starting* with a host key is named by it, with whatever
+/// follows shown as keys: `:w<CR>` is `command-mode w<CR>`. The tail
+/// cannot be resolved further and should not pretend to be -- once `:`
+/// has opened the colon line, the rest is text for a different reader
+/// entirely.
+pub fn describe_rhs(keys: &[Key]) -> Result<String, String> {
+    if keys.is_empty() {
+        return Ok("nothing".to_string());
+    }
+    if let Some(name) = keys.first().copied().and_then(describe_host_key) {
+        let rest = format_keys(&keys[1..]);
+        return Ok(if rest.is_empty() { name.to_string() } else { format!("{name} {rest}") });
+    }
+    crate::bishedit::vimkeys::describe_key_sequence(keys)
 }
 
 /// Translates typed keys into the keys they are mapped to, in front of
@@ -478,6 +542,46 @@ mod tests {
         let mut m = Matcher::new(Vec::new());
         assert!(m.is_empty());
         assert_eq!(through(&mut m, "dw", "normal"), "dw");
+    }
+
+    #[test]
+    fn a_host_key_is_a_valid_right_hand_side_even_though_vimkeys_never_sees_it() {
+        // Normal mode is handled across two layers and only one of them
+        // resolves keys to actions, so validating against `VimKeys`
+        // alone rejected every way of reaching command mode, hover,
+        // write-and-quit or a macro from a mapping.
+        assert_eq!(describe_rhs(&parse_keys(":w<CR>").unwrap()), Ok("command-mode w<CR>".to_string()));
+        assert_eq!(describe_rhs(&parse_keys("K").unwrap()), Ok("hover".to_string()));
+        assert_eq!(describe_rhs(&parse_keys("@a").unwrap()), Ok("replay-macro a".to_string()));
+        // ...and an ordinary action still resolves the ordinary way.
+        assert_eq!(describe_rhs(&parse_keys("10j").unwrap()), Ok("down 10".to_string()));
+        assert_eq!(describe_rhs(&parse_keys("qqq").unwrap()), Ok("record-macro qq".to_string()));
+    }
+
+    #[test]
+    fn every_host_key_is_one_vimkeys_really_does_not_know() {
+        // Half of the drift guard: if one of these moves into the key
+        // machine, the table here is wrong and this catches it. A *new*
+        // host arm still has to be added by hand.
+        for (key, name) in HOST_KEYS {
+            assert!(
+                crate::bishedit::vimkeys::describe_key_sequence(&[*key]).is_err(),
+                "{name}: VimKeys resolves this now, so it does not belong in HOST_KEYS"
+            );
+        }
+    }
+
+    #[test]
+    fn nop_is_no_keys_at_all_and_prints_as_itself() {
+        assert_eq!(parse_keys("<Nop>"), Ok(Vec::new()));
+        assert_eq!(parse_keys("<nop>"), Ok(Vec::new()));
+        assert_eq!(format_rhs(&[]), "<Nop>");
+        assert_eq!(describe_rhs(&[]), Ok("nothing".to_string()));
+        // Only ever the whole right-hand side: inside a sequence it
+        // would be `ab` written confusingly.
+        assert!(parse_keys("a<Nop>b").is_err());
+        // An empty left-hand side is still nothing to press.
+        assert!(parse_keys("").is_err());
     }
 
     #[test]
