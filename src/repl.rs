@@ -7712,6 +7712,12 @@ fn run_normal_mode_navigation(
         NavStart::Edit(tb, vk0) => (NavBuffer::Editable(*tb), *vk0),
     };
 
+    // `::bish map`, snapshotted the same way and for the same reason as
+    // `color_overrides` above -- the colon line can redefine a mapping
+    // mid-session, so this is refreshed after every command-mode command
+    // rather than captured once.
+    vk.set_mappings(sessions.get(&session_id).map(|s| s.shell.mappings.clone()).unwrap_or_default());
+
     // The `mouse` bishopt: off means reporting is never enabled, so the
     // terminal keeps its own click-and-drag selection.
     let mouse = sessions.get(&session_id).is_none_or(|s| s.shell.bishopt_bool("mouse"));
@@ -7839,7 +7845,7 @@ fn run_normal_mode_navigation(
         // poll will see that immediately, so this on_idle closure is
         // never actually called; kept only to match its existing
         // signature rather than adding a second, idle-free entry point.
-        let mut key = match vk.next_key(|| editor::read_key_idle(&mut || {}))? {
+        let mut key = match vk.next_command_key(|| editor::read_key_idle(&mut || {}))? {
             Some(k) => k,
             // EOF: nothing sensible to resume into for any start -- for
             // `Edit` specifically, that means dropping the session
@@ -8436,6 +8442,7 @@ fn run_normal_mode_navigation(
                 // than on the next `e`. Command mode runs builtins, so
                 // the colon line is a live way to change any of these.
                 color_overrides = Some(syntax_color_overrides(&sessions[&session_id].shell));
+                vk.set_mappings(sessions[&session_id].shell.mappings.clone());
                 if let Some(tb) = buf.as_editable_mut() {
                     apply_view_options(&sessions[&session_id].shell, tb);
                     fileeditor::scroll_to_show_cursor(tb, fileeditor::editor_content_cols(tb, rect));

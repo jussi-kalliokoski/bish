@@ -689,6 +689,9 @@ pub struct VimKeys {
     macros: HashMap<char, Vec<Key>>,
     recording: Option<(char, Vec<Key>)>,
     replay_queue: VecDeque<Key>,
+    // `::bish map`. Empty unless the session has mappings, and consulted
+    // only by `next_command_key` -- see there for why not by `next_key`.
+    matcher: crate::keymap::Matcher,
     last_macro_register: Option<char>,
 }
 
@@ -714,6 +717,7 @@ impl VimKeys {
             macros: HashMap::new(),
             recording: None,
             replay_queue: VecDeque::new(),
+            matcher: crate::keymap::Matcher::new(Vec::new()),
             last_macro_register: None,
         }
     }
@@ -783,6 +787,25 @@ impl VimKeys {
     /// mode. A caller combines this with the buffer's own current cursor
     /// to know what's actually selected right now (this crate never reads
     /// a `Buffer` itself -- see the module's own doc comment).
+    /// Whether the next key must reach this machine unmapped.
+    ///
+    /// `f{char}`, `m{mark}`, `r{char}` and the surround delimiters all
+    /// take the next keystroke as a literal character rather than as a
+    /// command. Running one of those through the keymap would make
+    /// `fx` find whatever `x` is mapped to instead of an `x`, which is
+    /// never what anyone means -- vim draws the same line, and calls the
+    /// states this covers "pending an argument".
+    pub fn wants_raw_key(&self) -> bool {
+        !matches!(self.pending, Pending::None)
+    }
+
+    /// Which mode's mappings apply right now. Normal and visual share
+    /// this machine, so the answer is a property of its state rather
+    /// than of the caller.
+    pub fn keymap_mode(&self) -> &'static str {
+        if self.visual_anchor().is_some() { "visual" } else { "normal" }
+    }
+
     pub fn visual_anchor(&self) -> Option<(RegisterShape, (usize, usize))> {
         self.visual
     }
@@ -968,6 +991,57 @@ impl VimKeys {
     /// *literal* keystrokes `@`/`b` that triggered it get recorded into
     /// `a`, not `b`'s own expansion). Otherwise calls `read` (a real
     /// terminal read) and records whatever it returns.
+    /// Installs this session's `::bish map` table. Snapshotted when
+    /// normal mode is entered and refreshed after a command-mode
+    /// command, the same rule `color_overrides` follows here: `::bish
+    /// map` is reachable from the colon line, and a table captured once
+    /// for a whole navigation session would go stale the moment someone
+    /// changed it and expected to see the difference.
+    pub fn set_mappings(&mut self, mappings: Vec<crate::keymap::Mapping>) {
+        self.matcher = crate::keymap::Matcher::new(mappings);
+    }
+
+    /// Reads the next key *as a command*, applying `::bish map` to it.
+    ///
+    /// Deliberately separate from `next_key` rather than folded into it.
+    /// `next_key` also serves Insert mode and the several places that
+    /// read one raw character for their own purposes; running those
+    /// through the keymap would remap text being typed and arguments
+    /// being collected. Only a key that is about to be interpreted as a
+    /// command belongs here.
+    ///
+    /// Mapped keys go out through `replay_queue`, which is popped at the
+    /// top *before* the matcher runs -- so a mapping's own output can
+    /// never be mapped again, and the non-recursion holds without a flag
+    /// to get wrong. It is also why a macro replaying through this is
+    /// unaffected: those keys were already resolved when recorded.
+    ///
+    /// The loop is the buffering: while a multi-key mapping is still
+    /// being decided nothing is returned yet, so the caller simply waits
+    /// on the next keystroke the way it waits on any other.
+    pub fn next_command_key(&mut self, mut read: impl FnMut() -> io::Result<Option<Key>>) -> io::Result<Option<Key>> {
+        loop {
+            if let Some(key) = self.replay_queue.pop_front() {
+                return Ok(Some(key));
+            }
+            let Some(key) = read()? else { return Ok(None) };
+            self.record_key(key);
+            // An argument-pending state takes the next keystroke as a
+            // literal (`fx` finds an `x`), so it must not be remapped.
+            if self.matcher.is_empty() || self.wants_raw_key() {
+                return Ok(Some(key));
+            }
+            let mode = self.keymap_mode();
+            let mut out = self.matcher.feed(key, mode);
+            if out.is_empty() {
+                continue;
+            }
+            let first = out.remove(0);
+            self.replay_queue.extend(out);
+            return Ok(Some(first));
+        }
+    }
+
     pub fn next_key(&mut self, mut read: impl FnMut() -> io::Result<Option<Key>>) -> io::Result<Option<Key>> {
         if let Some(key) = self.replay_queue.pop_front() {
             return Ok(Some(key));
