@@ -969,6 +969,10 @@ pub struct Shell {
     /// `caller` reports on. Pushed by `call_function`, which is the
     /// only place a function body is entered.
     call_stack: Vec<CallFrame>,
+    /// The file each function was defined in. `BASH_SOURCE` reports
+    /// where a function *is*, not where it was called from, and those
+    /// differ the moment anything is `source`d.
+    function_sources: HashMap<String, String>,
     /// `::bish hook`-registered commands, in the order they were added.
     /// Inherited by a virtual child exactly as `abbrs` is: a window you
     /// split off should behave like the one you split it from.
@@ -1453,6 +1457,7 @@ impl Shell {
             mappings: Vec::new(),
             disabled_builtins: std::collections::HashSet::new(),
             call_stack: Vec::new(),
+            function_sources: HashMap::new(),
             hooks: Vec::new(),
             next_hook_id: 1,
             lsp_servers: Vec::new(),
@@ -1743,6 +1748,7 @@ impl Shell {
             mappings: self.mappings.clone(),
             disabled_builtins: self.disabled_builtins.clone(),
             call_stack: self.call_stack.clone(),
+            function_sources: self.function_sources.clone(),
             hooks: self.hooks.clone(),
             next_hook_id: self.next_hook_id,
             lsp_servers: self.lsp_servers.clone(),
@@ -5273,6 +5279,54 @@ impl Shell {
     // only syscall shape, so reading the current value means setting a
     // throwaway mask and immediately restoring what was there. Moved here
     // alongside run_ulimit for the same M6 sink reason.
+    /// Rebuilds `FUNCNAME`, `BASH_SOURCE` and `BASH_LINENO` from the
+    /// call stack.
+    ///
+    /// Kept as real arrays, refreshed on every push and pop, rather than
+    /// computed on lookup: `${FUNCNAME[@]}`, `${FUNCNAME[0]}` and
+    /// `${#FUNCNAME[@]}` then all work with no changes to the variable
+    /// system at all, and a call costs three small vectors.
+    ///
+    /// Index 0 is innermost, and each array is one longer than the stack
+    /// -- the extra entry is the script itself, which bash names `main`,
+    /// sources to the top-level file and gives line 0. Verified against
+    /// bash: inside `inner`, called by `outer` from a sourced library,
+    ///
+    ///   FUNCNAME=(inner outer main)
+    ///   BASH_SOURCE=(./lib.sh ./lib.sh main.sh)
+    ///   BASH_LINENO=(7 2 0)
+    ///
+    /// so `BASH_SOURCE[i]` is where `FUNCNAME[i]` was *defined* and
+    /// `BASH_LINENO[i]` is the line in `BASH_SOURCE[i+1]` where it was
+    /// called. Those are two different files as soon as anything is
+    /// sourced, which is why the defining file is recorded separately.
+    fn refresh_call_arrays(&mut self) {
+        let (mut names, mut sources, mut lines) = (Vec::new(), Vec::new(), Vec::new());
+        for frame in self.call_stack.iter().rev() {
+            names.push(frame.called.clone());
+            sources.push(self.function_sources.get(&frame.called).cloned().unwrap_or_else(|| frame.source.clone()));
+            lines.push(frame.call_line.to_string());
+        }
+        names.push("main".to_string());
+        sources.push(self.script_name.clone());
+        lines.push("0".to_string());
+        // At the top level bash has no FUNCNAME at all, and a script
+        // testing `${FUNCNAME[0]}` should see nothing rather than
+        // "main".
+        if self.call_stack.is_empty() {
+            self.arrays.remove("FUNCNAME");
+            self.arrays.remove("BASH_LINENO");
+        } else {
+            self.set_array("FUNCNAME", names);
+            self.set_array("BASH_LINENO", lines);
+        }
+        self.set_array("BASH_SOURCE", sources);
+    }
+
+    fn set_array(&mut self, name: &str, values: Vec<String>) {
+        self.arrays.insert(name.to_string(), values.into_iter().enumerate().collect());
+    }
+
     /// Whether `name` is a builtin that would actually run.
     ///
     /// `enable -n NAME` takes one out of service, and everything that
@@ -5310,8 +5364,15 @@ impl Shell {
         }
         let depth = match args.first() {
             None => {
-                let frame = self.call_stack.last().expect("checked non-empty");
-                sh_println!(self, "{} {}", frame.call_line, frame.source);
+                let idx = self.call_stack.len() - 1;
+                let source = match idx.checked_sub(1) {
+                    Some(below) => {
+                        let name = &self.call_stack[below].called;
+                        self.function_sources.get(name).cloned().unwrap_or_else(|| self.call_stack[idx].source.clone())
+                    }
+                    None => self.call_stack[idx].source.clone(),
+                };
+                sh_println!(self, "{} {}", self.call_stack[idx].call_line, source);
                 return 0;
             }
             Some(a) => match a.parse::<usize>() {
@@ -5331,9 +5392,25 @@ impl Shell {
             return 1;
         };
         let frame = &self.call_stack[idx];
-        let enclosing =
-            if idx > 0 { self.call_stack[idx - 1].called.clone() } else { "main".to_string() };
-        sh_println!(self, "{} {} {}", frame.call_line, enclosing, frame.source);
+        // The enclosing function, and the file its body lives in -- both
+        // come from the frame *below*, because that is whose code made
+        // this call. They are only the same file as `frame.source` until
+        // something is sourced: a function defined in a library and
+        // called from there reports the library, not the script that
+        // sourced it. Same index for both, since they are two halves of
+        // one answer.
+        let (enclosing, source) = match idx.checked_sub(1) {
+            Some(below) => {
+                let name = self.call_stack[below].called.clone();
+                let file = self.function_sources.get(&name).cloned().unwrap_or_else(|| frame.source.clone());
+                (name, file)
+            }
+            // Nothing below: the call was made by the script itself,
+            // which bash names `main`, and the frame already recorded
+            // which file that was.
+            None => ("main".to_string(), frame.source.clone()),
+        };
+        sh_println!(self, "{} {} {}", frame.call_line, enclosing, source);
         0
     }
 
@@ -6105,6 +6182,7 @@ impl Shell {
             parser::Command::Case { word, arms, .. } => self.run_case(word, arms),
             parser::Command::Group(prog, _redirects) => self.run_program(prog),
             parser::Command::FuncDef { name, body } => {
+                self.function_sources.insert(name.clone(), self.script_name.clone());
                 self.functions.insert(name.clone(), (**body).clone());
                 ExecResult::Status(0)
             }
@@ -6747,6 +6825,7 @@ impl Shell {
             call_line: self.current_line,
             source: self.script_name.clone(),
         });
+        self.refresh_call_arrays();
         self.arg_frames.push(call_args);
         self.function_depth += 1;
         self.var_scopes.push(HashMap::new());
@@ -6755,6 +6834,7 @@ impl Shell {
         self.nameref_local_stack.push(Vec::new());
         let result = self.run_command(body, false);
         self.call_stack.pop();
+        self.refresh_call_arrays();
         self.var_scopes.pop();
         if let Some(frame) = self.nameref_local_stack.pop() {
             for (name, was_nameref) in frame.into_iter().rev() {
@@ -8216,7 +8296,14 @@ impl Shell {
                 }
                 match std::fs::read_to_string(&path) {
                     Ok(src) => {
+                        // For the duration, this file *is* the script:
+                        // a function defined here records it, and a
+                        // frame made here names it. Restored afterwards,
+                        // since `$0` and every later frame belong to the
+                        // outer script again.
+                        let outer_script = std::mem::replace(&mut self.script_name, path.clone());
                         let result = self.run_source_here(&src, &path);
+                        self.script_name = outer_script;
                         // A sourced script fires RETURN when it
                         // finishes, `functrace` or not -- unlike a
                         // function, and unlike `eval`, which is why this
@@ -13311,6 +13398,43 @@ mod tests {
         // A name it does not know says nothing at all -- the empty
         // answer is the answer.
         assert!(!text.contains("not found"), "{text:?}");
+    }
+
+    #[test]
+    fn funcname_bash_source_and_bash_lineno_describe_the_stack() {
+        // Checked against real bash on this exact pair of files. The
+        // sourced library is the point: BASH_SOURCE names where each
+        // function is *defined*, BASH_LINENO the line in the file one
+        // level out where it was called, and those stop being the same
+        // file the moment anything is sourced.
+        let dir = std::env::temp_dir().join(format!("bish-funcname-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let lib = dir.join("lib.sh");
+        let main = dir.join("main.sh");
+        std::fs::write(
+            &lib,
+            "inner() {\n  n=\"${FUNCNAME[*]}\"\n  s=\"${BASH_SOURCE[*]}\"\n  l=\"${BASH_LINENO[*]}\"\n}\nouter() {\n  inner\n}\n",
+        )
+        .unwrap();
+        std::fs::write(&main, format!("source {}\nouter\ntop=\"${{FUNCNAME[*]}}\"\n", lib.display())).unwrap();
+
+        let mut sh = Shell::new();
+        sh.set_script_args(main.display().to_string(), Vec::new());
+        sh.run_source_here(&std::fs::read_to_string(&main).unwrap(), &main.display().to_string());
+
+        assert_eq!(sh.debug_peek_var("n").as_deref(), Some("inner outer main"));
+        assert_eq!(
+            sh.debug_peek_var("s").as_deref(),
+            Some(format!("{} {} {}", lib.display(), lib.display(), main.display()).as_str()),
+            "where each function is defined, not where it was called"
+        );
+        // `inner` is called on line 7 of the library, `outer` on line 2
+        // of the script, and 0 stands for the script itself.
+        assert_eq!(sh.debug_peek_var("l").as_deref(), Some("7 2 0"));
+        // Outside every function bash has no FUNCNAME at all, so a
+        // script testing ${FUNCNAME[0]} sees nothing rather than "main".
+        assert_eq!(sh.debug_peek_var("top").as_deref(), Some(""));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
