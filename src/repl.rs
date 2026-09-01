@@ -89,6 +89,13 @@ struct SessionState {
     /// so a cursor sitting still costs a tuple comparison per tick
     /// rather than a request.
     lsp_highlight_applied: Option<(u64, usize, usize)>,
+    /// The in-flight `inlayHint`, and the (version, first line, last
+    /// line) it asked about. Like the highlight above: one at a time,
+    /// because only the buffer being driven has a viewport.
+    lsp_inlay: Option<(i64, u64, usize, usize)>,
+    /// The (version, first line, last line) whose hints are currently
+    /// drawn -- so scrolling asks again and sitting still does not.
+    lsp_inlay_applied: Option<(u64, usize, usize)>,
     buffer: String,
     // Whether `buffer` is off the record -- see leading_space_suppresses
     // _history. Decided on the first line of a fresh command and left
@@ -643,6 +650,8 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
             lsp_semantic_applied: HashMap::new(),
             lsp_highlight: None,
             lsp_highlight_applied: None,
+            lsp_inlay: None,
+            lsp_inlay_applied: None,
             buffer: String::new(),
             buffer_unrecorded: false,
             history: root_history,
@@ -1973,6 +1982,8 @@ fn run_edit_impl(targets: &[fileeditor::EditTarget], attach_debug: bool) -> i32 
             lsp_semantic_applied: HashMap::new(),
             lsp_highlight: None,
             lsp_highlight_applied: None,
+            lsp_inlay: None,
+            lsp_inlay_applied: None,
             buffer: String::new(),
             buffer_unrecorded: false,
             history: Rc::new(RefCell::new(History::load(".bish_history"))),
@@ -3801,6 +3812,8 @@ fn apply_window_action(
             lsp_semantic_applied: HashMap::new(),
             lsp_highlight: None,
             lsp_highlight_applied: None,
+            lsp_inlay: None,
+            lsp_inlay_applied: None,
                     buffer: String::new(),
                     buffer_unrecorded: false,
                     // A fork of the parent's own History (see its doc
@@ -3961,6 +3974,8 @@ fn split_focused_pane(
             lsp_semantic_applied: HashMap::new(),
             lsp_highlight: None,
             lsp_highlight_applied: None,
+            lsp_inlay: None,
+            lsp_inlay_applied: None,
             buffer: String::new(),
             buffer_unrecorded: false,
             // See WindowAction::New's own comment on forking the
@@ -4043,6 +4058,8 @@ fn split_diagnostics_pane(
             lsp_semantic_applied: HashMap::new(),
             lsp_highlight: None,
             lsp_highlight_applied: None,
+            lsp_inlay: None,
+            lsp_inlay_applied: None,
             buffer: String::new(),
             buffer_unrecorded: false,
             history: Rc::clone(&child_history),
@@ -4101,6 +4118,8 @@ fn split_locations_pane(
             lsp_semantic_applied: HashMap::new(),
             lsp_highlight: None,
             lsp_highlight_applied: None,
+            lsp_inlay: None,
+            lsp_inlay_applied: None,
             buffer: String::new(),
             buffer_unrecorded: false,
             history: Rc::clone(&child_history),
@@ -4219,6 +4238,8 @@ fn split_debug_run_pane(
             lsp_semantic_applied: HashMap::new(),
             lsp_highlight: None,
             lsp_highlight_applied: None,
+            lsp_inlay: None,
+            lsp_inlay_applied: None,
             buffer: String::new(),
             buffer_unrecorded: false,
             history: Rc::clone(&child_history),
@@ -7425,6 +7446,7 @@ fn apply_view_options(shell: &exec::Shell, buf: &mut TextBuffer) {
     buf.colors = Some(ui_colors(shell));
     buf.cursorshape = shell.bishopt_bool("cursorshape");
     buf.mouse = shell.bishopt_bool("mouse");
+    buf.inlayhints = shell.bishopt_bool("inlayhints");
     buf.ignorecase = shell.bishopt_bool("ignorecase");
     buf.smartcase = shell.bishopt_bool("smartcase");
     // In this order, and never the other way round: the shell's own
@@ -7498,7 +7520,8 @@ fn insert_idle(
     let reprogressed = sync_language_server_progress(sessions, session_id, buf);
     // Insert mode too: the marks follow the cursor, and typing moves it.
     let remarked = sync_document_highlights(sessions, session_id, buf);
-    (repaint || diagnosed || recoloured || reprogressed || remarked).then(|| fileeditor::IdleRedraw {
+    let rehinted = sync_inlay_hints(sessions, session_id, buf);
+    (repaint || diagnosed || recoloured || reprogressed || remarked || rehinted).then(|| fileeditor::IdleRedraw {
         rect: pane_rect(&windows[*current_window], windows[*current_window].focused_pane, *term_rows, *term_cols),
         term_rows: *term_rows,
         term_cols: *term_cols,
@@ -7728,6 +7751,7 @@ fn run_normal_mode_navigation(
                 diagnosed |= sync_semantic_tokens(sessions, session_id, tb);
                 diagnosed |= sync_language_server_progress(sessions, session_id, tb);
                 diagnosed |= sync_document_highlights(sessions, session_id, tb);
+                diagnosed |= sync_inlay_hints(sessions, session_id, tb);
             }
             // A job this pane stepped away from is still producing, and
             // the mode line's own "+N new lines below" has to keep up
@@ -9655,6 +9679,106 @@ fn sync_document_highlights(sessions: &mut HashMap<SessionId, SessionState>, ses
     let id = server.request("textDocument/documentHighlight", params);
     drop(table);
     sessions.get_mut(&session_id).expect("checked").lsp_highlight = Some((id, version, row, col));
+    false
+}
+
+// One tick of `textDocument/inlayHint` for the visible part of the
+// buffer being edited.
+//
+// Keyed on (version, visible range): typing invalidates them, and so
+// does scrolling, because the request takes a range and a hint nobody
+// can see costs the same to compute as one they can. Everything else
+// about this is `sync_semantic_tokens` -- asked and collected without
+// ever waiting, dropped if the answer describes a state left behind.
+//
+// Returns true when the hints changed, which is the caller's cue to
+// redraw.
+fn sync_inlay_hints(sessions: &mut HashMap<SessionId, SessionState>, session_id: SessionId, buf: &mut TextBuffer) -> bool {
+    // Off is off: no request, and nothing left drawn from when it was
+    // on.
+    if !buf.inlayhints {
+        if buf.inlay_hints.is_empty() {
+            return false;
+        }
+        buf.inlay_hints.clear();
+        return true;
+    }
+    let Some(session) = sessions.get(&session_id) else { return false };
+    let Some(target) = server_target(session, buf) else { return false };
+    let lsp = Rc::clone(&session.lsp);
+    let version = buf.version();
+    let first = buf.viewport_top();
+    let last = (first + buf.viewport_height()).min(buf.line_count()).saturating_sub(1);
+
+    if let Some((id, asked_version, asked_first, asked_last)) = session.lsp_inlay {
+        let mut table = lsp.borrow_mut();
+        let Some(server) = table.running(&target.display, &target.root) else {
+            drop(table);
+            sessions.get_mut(&session_id).expect("checked").lsp_inlay = None;
+            return false;
+        };
+        let Some(result) = server.take_response(id) else { return false };
+        let encoding = server.encoding();
+        drop(table);
+        let session = sessions.get_mut(&session_id).expect("checked");
+        session.lsp_inlay = None;
+        if (asked_version, asked_first, asked_last) != (version, first, last) {
+            return false;
+        }
+        session.lsp_inlay_applied = Some((version, first, last));
+        let found = result.map(|result| crate::lsp::inlay_hints(&result)).unwrap_or_default();
+        let mut hints: Vec<(usize, usize, String)> = found
+            .into_iter()
+            .filter(|hint| hint.line < buf.line_count())
+            .map(|hint| {
+                // The server's own column, in whatever encoding was
+                // negotiated, converted to one of this buffer's chars.
+                let chars = buf.line_chars(hint.line);
+                (hint.line, crate::lsp::from_server_column(&chars, hint.character, encoding), hint.label)
+            })
+            .collect();
+        hints.sort_by_key(|(line, col, _)| (*line, *col));
+        if hints == buf.inlay_hints {
+            return false;
+        }
+        buf.inlay_hints = hints;
+        return true;
+    }
+
+    if session.lsp_inlay_applied == Some((version, first, last)) {
+        return false;
+    }
+    let mut table = lsp.borrow_mut();
+    let Some(server) = table.running(&target.display, &target.root) else { return false };
+    if !server.is_ready() || !server.provides("inlayHintProvider") {
+        return false;
+    }
+    if server.known_version(&target.uri) != Some(version) {
+        return false;
+    }
+    let encoding = server.encoding();
+    let at = |line: usize, col: usize| {
+        crate::json::Value::Object(vec![
+            ("line".to_string(), crate::json::Value::Number(line as f64)),
+            (
+                "character".to_string(),
+                crate::json::Value::Number(crate::lsp::to_server_column(&buf.line_chars(line), col, encoding) as f64),
+            ),
+        ])
+    };
+    let params = crate::json::Value::Object(vec![
+        (
+            "textDocument".to_string(),
+            crate::json::Value::Object(vec![("uri".to_string(), crate::json::Value::Str(target.uri.clone()))]),
+        ),
+        (
+            "range".to_string(),
+            crate::json::Value::Object(vec![("start".to_string(), at(first, 0)), ("end".to_string(), at(last, buf.line_len(last)))]),
+        ),
+    ]);
+    let id = server.request("textDocument/inlayHint", params);
+    drop(table);
+    sessions.get_mut(&session_id).expect("checked").lsp_inlay = Some((id, version, first, last));
     false
 }
 
@@ -14496,6 +14620,8 @@ mod compositor_frame_output_tests {
             lsp_semantic_applied: HashMap::new(),
             lsp_highlight: None,
             lsp_highlight_applied: None,
+            lsp_inlay: None,
+            lsp_inlay_applied: None,
             shell: exec::Shell::new(),
             buffer: String::new(),
             buffer_unrecorded: false,

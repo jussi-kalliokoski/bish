@@ -541,6 +541,77 @@ pub struct Location {
     pub end: (usize, usize),
 }
 
+/// One piece of text the server wants drawn inside the line, at a
+/// position that is *between* two characters rather than over them:
+/// `textDocument/inlayHint`'s answer. A parameter name before an
+/// argument, an inferred type after a binding.
+///
+/// Positions are still in the server's own `(line, character)`, like
+/// every other position in this module.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InlayHint {
+    pub line: usize,
+    pub character: usize,
+    /// Already padded per the server's own `paddingLeft`/`paddingRight`
+    /// -- a hint is spliced into the line verbatim, so where its spaces
+    /// go is part of the text, not a separate instruction.
+    pub label: String,
+}
+
+/// How many hints one request's worth is allowed to produce. The
+/// request is for the visible range, so this is generous; it exists so
+/// that a server answering about a whole generated file cannot make
+/// splicing them in the expensive part of a redraw.
+const MAX_INLAY_HINTS: usize = 500;
+
+/// How long one hint may be. A hint is spliced into the line, so a
+/// server that answers with a fully-qualified generic type would push
+/// the code it annotates off the screen.
+const MAX_HINT_LABEL: usize = 60;
+
+/// Reads an `inlayHint` result.
+///
+/// The label has two shapes, and again both are in use: a plain string,
+/// or an array of parts each with its own `value` (the form that
+/// carries per-part links and tooltips, none of which bish draws). The
+/// parts are concatenated, which is exactly what they mean.
+pub fn inlay_hints(result: &Value) -> Vec<InlayHint> {
+    let Value::Array(items) = result else { return Vec::new() };
+    items
+        .iter()
+        .take(MAX_INLAY_HINTS)
+        .filter_map(|item| {
+            let (line, character) = position(json::query(item, ".position").ok()?)?;
+            let label = match json::query(item, ".label") {
+                Ok(Value::Str(text)) => sanitize(text),
+                Ok(Value::Array(parts)) => parts
+                    .iter()
+                    .filter_map(|part| match json::query(part, ".value") {
+                        Ok(Value::Str(text)) => Some(sanitize(text)),
+                        _ => None,
+                    })
+                    .collect(),
+                _ => return None,
+            };
+            // A hint with nothing in it would still take a cell.
+            if label.trim().is_empty() {
+                return None;
+            }
+            let pad = |key: &str| matches!(json::query(item, key), Ok(Value::Bool(true)));
+            let mut label = format!(
+                "{}{}{}",
+                if pad(".paddingLeft") { " " } else { "" },
+                label,
+                if pad(".paddingRight") { " " } else { "" }
+            );
+            if label.chars().count() > MAX_HINT_LABEL {
+                label = label.chars().take(MAX_HINT_LABEL - 1).chain(std::iter::once('…')).collect();
+            }
+            Some(InlayHint { line, character, label })
+        })
+        .collect()
+}
+
 /// How many lines a signature popup may take. A single overload is one
 /// line plus whatever documentation the server attached; several
 /// overloads are one line each. Past this the popup stops being a hint
@@ -1326,6 +1397,57 @@ pub fn from_server_column(line: &[char], server_col: usize, encoding: PositionEn
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn hints_of(text: &str) -> Vec<InlayHint> {
+        inlay_hints(&json::parse(text).unwrap())
+    }
+
+    #[test]
+    fn both_shapes_of_an_inlay_hint_label_are_read() {
+        let found = hints_of(
+            r#"[{"position":{"line":3,"character":9},"label":": u32"},
+                {"position":{"line":4,"character":2},"label":[{"value":"Vec<"},{"value":"u8"},{"value":">"}]}]"#,
+        );
+        assert_eq!(found.len(), 2);
+        assert_eq!((found[0].line, found[0].character, found[0].label.as_str()), (3, 9, ": u32"));
+        // The parts of a composite label mean exactly their
+        // concatenation; the extra per-part fields are not drawn.
+        assert_eq!(found[1].label, "Vec<u8>");
+    }
+
+    #[test]
+    fn padding_is_baked_into_the_label_because_that_is_what_gets_spliced() {
+        let found = hints_of(
+            r#"[{"position":{"line":0,"character":0},"label":"name:","paddingRight":true},
+                {"position":{"line":0,"character":5},"label":"=>","paddingLeft":true,"paddingRight":true}]"#,
+        );
+        assert_eq!(found[0].label, "name: ");
+        assert_eq!(found[1].label, " => ");
+    }
+
+    #[test]
+    fn a_hint_with_nothing_in_it_is_not_a_hint() {
+        assert!(hints_of("null").is_empty());
+        assert!(hints_of(r#"[{"position":{"line":0,"character":0},"label":"  "}]"#).is_empty());
+        assert!(hints_of(r#"[{"label":": u32"}]"#).is_empty(), "no position, nowhere to put it");
+        assert!(hints_of(r#"[{"position":{"line":0,"character":0}}]"#).is_empty(), "no label");
+    }
+
+    #[test]
+    fn an_enormous_hint_is_cut_rather_than_pushing_the_code_off_the_screen() {
+        let long = "x".repeat(MAX_HINT_LABEL * 2);
+        let text = format!(r#"[{{"position":{{"line":0,"character":0}},"label":"{long}"}}]"#);
+        let found = hints_of(&text);
+        assert_eq!(found[0].label.chars().count(), MAX_HINT_LABEL);
+        assert!(found[0].label.ends_with('\u{2026}'));
+    }
+
+    #[test]
+    fn a_server_answering_about_a_whole_generated_file_is_capped() {
+        let one = r#"{"position":{"line":0,"character":0},"label":"h"}"#;
+        let many = format!("[{}]", vec![one; MAX_INLAY_HINTS * 2].join(","));
+        assert_eq!(hints_of(&many).len(), MAX_INLAY_HINTS);
+    }
 
     fn signature_of(text: &str) -> Vec<String> {
         signature_help(&json::parse(text).unwrap())

@@ -2492,7 +2492,85 @@ pub(crate) fn display_row(
         Some(layout) => crate::bishedit::tabular::row(&chars, line, layout),
         None => crate::bishedit::tabular::Row::plain(&chars),
     };
-    expand_tabs(row, buf.tabstop)
+    splice_inlay_hints(expand_tabs(row, buf.tabstop), buf, line)
+}
+
+// The third producer of a `Row` whose cells and characters are not the
+// same thing -- after the tabular layout and tab expansion, and for the
+// same reason as both: everything downstream (the cursor, clicks,
+// horizontal scroll, selections, highlighting, diagnostics) addresses a
+// line through `Row`'s own two maps, so splicing here makes all of them
+// hint-aware at once and none of them have to know hints exist.
+//
+// After `expand_tabs`, not before: a hint is drawn text, and its width
+// has nothing to do with where the tab stops fall in the source.
+//
+// A hint's cells point at no source character (`source_at` is `None`),
+// which is what makes the cursor step over one in a single press and
+// what marks it for dimming in `render_row` -- the same treatment
+// tabular padding already gets, and true for the same reason: there is
+// nothing there.
+fn splice_inlay_hints(row: crate::bishedit::tabular::Row, buf: &TextBuffer, line: usize) -> crate::bishedit::tabular::Row {
+    if !buf.inlayhints {
+        return row;
+    }
+    let mut hints = buf.inlay_hints.iter().filter(|(l, _, _)| *l == line).peekable();
+    if hints.peek().is_none() {
+        return row;
+    }
+    let mut cells: Vec<char> = Vec::with_capacity(row.cells.len());
+    let mut source_at: Vec<Option<usize>> = Vec::with_capacity(row.cells.len());
+    // Walked in lockstep with the cells: a hint at character `c` is
+    // spliced immediately before the cell `c` starts at, which for a
+    // hint past the end of the line means at the end.
+    let mut pending: Vec<(usize, &str)> = hints.map(|(_, col, text)| (*col, text.as_str())).collect();
+    pending.sort_by_key(|(col, _)| *col);
+    let mut next = 0usize;
+    let emit = |cells: &mut Vec<char>, source_at: &mut Vec<Option<usize>>, upto: usize, next: &mut usize| {
+        while *next < pending.len() && pending[*next].0 <= upto {
+            for ch in pending[*next].1.chars() {
+                cells.push(ch);
+                source_at.push(None);
+            }
+            *next += 1;
+        }
+    };
+    for (i, ch) in row.cells.iter().enumerate() {
+        // Only at a cell that *starts* a character: splicing into the
+        // middle of a tab's spaces or a wide character's cells would
+        // put the hint inside something.
+        if let Some(source) = row.source_at.get(i).copied().flatten()
+            && row.cell_of.get(source) == Some(&i)
+        {
+            emit(&mut cells, &mut source_at, source, &mut next);
+        }
+        cells.push(*ch);
+        source_at.push(row.source_at.get(i).copied().flatten());
+    }
+    // Anything at or past the end of the line goes on the end, which is
+    // where a type hint after the last character belongs.
+    emit(&mut cells, &mut source_at, usize::MAX, &mut next);
+
+    // Rebuilt exactly as `expand_tabs` rebuilds it, and for the same
+    // reason: the first cell naming a source character is the one it
+    // maps to, and everything with no cell of its own points one past
+    // the end so the maps stay monotonic.
+    let mut cell_of = vec![cells.len(); row.cell_of.len()];
+    for (cell, source) in source_at.iter().enumerate().rev() {
+        if let Some(source) = source
+            && *source < cell_of.len()
+        {
+            cell_of[*source] = cell;
+        }
+    }
+    let mut last = cells.len();
+    for slot in cell_of.iter_mut().rev() {
+        if *slot > last {
+            *slot = last;
+        }
+        last = *slot;
+    }
+    crate::bishedit::tabular::Row { cells, source_at, cell_of }
 }
 
 // A literal tab draws as spaces to the next `tabstop` boundary, and
@@ -3800,6 +3878,22 @@ fn render_row(
         .collect();
     let mut cells = highlight::compose(&chars, &[&line_styled, &diag_styled, &highlights]);
     highlight::compose_attrs(&mut cells, &attr_overlay);
+    // Text that is in the drawn line but not in the file -- an inlay
+    // hint -- is dimmed, so it reads as annotation rather than as code
+    // you could put the cursor in.
+    //
+    // "Belongs to no source character and is not blank" is what says so.
+    // Tabular padding and a tab's spaces have no source character
+    // either, but they are spaces: dim has no effect on a cell with no
+    // foreground to dim, so the looseness costs exactly nothing on
+    // screen. Doing it here rather than as another span layer is what
+    // keeps it right: spans address the *line's* characters, and a hint
+    // is precisely the thing that has none.
+    for (i, cell) in cells.iter_mut().enumerate() {
+        if cell.ch != ' ' && display.source_at.get(start_cell + i).copied().flatten().is_none() {
+            cell.attrs.dim = true;
+        }
+    }
     let mut rendered = highlight::render_linked(&cells, &links);
     if !buf.wrap.wrap {
         if truncated_right && !buf.wrap.extends.is_empty() {
@@ -6166,6 +6260,96 @@ mod pre_save_hook_tests {
         buf.document_highlights.clear();
         let cleared = build_editor_frame(&buf, &VimKeys::new(), EditorMode::Normal, rect, 0, 0, None);
         assert_eq!(cleared, plain, "clearing the marks restores exactly the unmarked frame");
+    }
+
+    // A spliced hint has to leave every one of `Row`'s promises intact,
+    // because the cursor, clicks, scrolling, selections and every span
+    // layer all read the line through them and none of them know hints
+    // exist.
+    #[test]
+    fn an_inlay_hint_is_drawn_between_characters_without_moving_any_of_them() {
+        let mut buf = TextBuffer::new_unnamed(10);
+        buf.insert_text((0, 0), "let x = 1");
+        buf.set_cursor(0, 0);
+        let plain = display_row(&buf, 0, None);
+        assert_eq!(plain.cells.iter().collect::<String>(), "let x = 1");
+
+        // `: u32` after `x`, which is character 5.
+        buf.inlay_hints = vec![(0, 5, ": u32".to_string())];
+        let row = display_row(&buf, 0, None);
+        assert_eq!(row.cells.iter().collect::<String>(), "let x: u32 = 1");
+        // The hint's own cells belong to no character of the line --
+        // which is what dims them and what makes the cursor step over
+        // the whole hint in one press.
+        assert_eq!(row.source_at[5..10], [None, None, None, None, None]);
+        // Every real character still maps to itself, and the two maps
+        // still agree in both directions.
+        for c in 0..buf.line_len(0) {
+            assert_eq!(row.source_at[row.cell_of[c]], Some(c), "char {c}");
+        }
+        // The position after the last character still has an answer.
+        assert_eq!(row.cell_of.len(), buf.line_len(0) + 1);
+        assert_eq!(row.cell_of[buf.line_len(0)], row.cells.len());
+    }
+
+    #[test]
+    fn a_hint_past_the_end_of_the_line_lands_at_the_end() {
+        let mut buf = TextBuffer::new_unnamed(10);
+        buf.insert_text((0, 0), "let x = 1");
+        buf.inlay_hints = vec![(0, 99, "  // hint".to_string())];
+        let row = display_row(&buf, 0, None);
+        assert_eq!(row.cells.iter().collect::<String>(), "let x = 1  // hint");
+    }
+
+    #[test]
+    fn several_hints_on_one_line_keep_their_order_however_they_arrive() {
+        let mut buf = TextBuffer::new_unnamed(10);
+        buf.insert_text((0, 0), "f(a, b)");
+        // Deliberately out of order: the splice sorts, because a server
+        // is not required to.
+        buf.inlay_hints = vec![(0, 5, "two: ".to_string()), (0, 2, "one: ".to_string())];
+        let row = display_row(&buf, 0, None);
+        assert_eq!(row.cells.iter().collect::<String>(), "f(one: a, two: b)");
+    }
+
+    #[test]
+    fn turning_hints_off_draws_the_line_exactly_as_it_is() {
+        let mut buf = TextBuffer::new_unnamed(10);
+        buf.insert_text((0, 0), "let x = 1");
+        buf.inlay_hints = vec![(0, 5, ": u32".to_string())];
+        buf.inlayhints = false;
+        let row = display_row(&buf, 0, None);
+        assert_eq!(row.cells.iter().collect::<String>(), "let x = 1");
+        assert_eq!(row.cell_of, (0..=9).collect::<Vec<_>>());
+    }
+
+    // Hints splice after tab expansion, so a tab's own width is decided
+    // by the source line and not by what got drawn into it.
+    #[test]
+    fn a_hint_does_not_shift_the_tab_stops_of_the_line_it_is_on() {
+        let mut buf = TextBuffer::new_unnamed(10);
+        buf.tabstop = 4;
+        buf.insert_text((0, 0), "ab\tc");
+        let without = display_row(&buf, 0, None);
+        buf.inlay_hints = vec![(0, 4, "!!".to_string())];
+        let with = display_row(&buf, 0, None);
+        // "ab" + two spaces to the tab stop + "c", either way.
+        assert_eq!(without.cells.iter().collect::<String>(), "ab  c");
+        assert_eq!(with.cells.iter().collect::<String>(), "ab  c!!");
+    }
+
+    // The hint is drawn dim so it reads as annotation; the code around
+    // it is untouched.
+    #[test]
+    fn hint_cells_are_dimmed_and_the_real_characters_are_not() {
+        let mut buf = TextBuffer::new_unnamed(10);
+        buf.insert_text((0, 0), "let x = 1");
+        buf.inlay_hints = vec![(0, 5, ": u32".to_string())];
+        buf.set_cursor(0, 0);
+        let rect = Rect { row: 0, col: 0, rows: 4, cols: 40 };
+        let frame = build_editor_frame(&buf, &VimKeys::new(), EditorMode::Normal, rect, 0, 0, None);
+        assert!(frame.contains("\x1b[0;2m:"), "expected the hint dimmed:\n{frame:?}");
+        assert!(frame.contains("let x"), "the code before it keeps its own styling:\n{frame:?}");
     }
 
     fn csv_buf(text: &str) -> TextBuffer {

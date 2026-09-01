@@ -113,6 +113,19 @@ pub struct TextBuffer {
     /// Refreshed on the idle tick as the cursor moves, and emptied as
     /// soon as it moves somewhere the server has nothing to say about.
     pub document_highlights: Vec<super::highlight::StyledSpan>,
+    /// The language server's inlay hints for this buffer, as
+    /// `(line, column, text)` in this buffer's own char positions.
+    /// Spliced into the drawn line -- see `fileeditor::display_row` --
+    /// so they are between characters, never over them.
+    ///
+    /// Sorted by position, which is what the splice walks in one pass.
+    /// Refreshed on the idle tick for the visible range only: the
+    /// request takes a range, and a hint nobody can see costs the same
+    /// to compute as one they can.
+    pub inlay_hints: Vec<(usize, usize, String)>,
+    /// Whether to draw them at all. On by default; `bishopt
+    /// inlayhints=false` turns them off.
+    pub inlayhints: bool,
     // A fingerprint of the file's bytes as of the last read or write, for
     // noticing that something else rewrote it since. `None` for a buffer
     // that is not a view of a file on disk at all.
@@ -298,6 +311,8 @@ impl TextBuffer {
             lsp_message: None,
             semantic_spans: Vec::new(),
             document_highlights: Vec::new(),
+            inlay_hints: Vec::new(),
+            inlayhints: true,
             diagnostics: Vec::new(),
             blame: None,
             diff: None,
@@ -426,6 +441,8 @@ impl TextBuffer {
             lsp_message: None,
             semantic_spans: Vec::new(),
             document_highlights: Vec::new(),
+            inlay_hints: Vec::new(),
+            inlayhints: true,
             diagnostics: Vec::new(),
             blame: None,
             diff: None,
@@ -1062,6 +1079,8 @@ mod tests {
             lsp_message: None,
             semantic_spans: Vec::new(),
             document_highlights: Vec::new(),
+            inlay_hints: Vec::new(),
+            inlayhints: true,
             diagnostics: Vec::new(),
             blame: None,
             diff: None,

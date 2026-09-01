@@ -574,6 +574,17 @@ impl Server {
                             "documentHighlight".to_string(),
                             Value::Object(vec![("dynamicRegistration".to_string(), Value::Bool(false))]),
                         ),
+                        // Inline parameter names and inferred types.
+                        // `resolveSupport` is not claimed: a hint whose
+                        // label only arrives after a second round trip
+                        // would appear a beat after the code it
+                        // annotates, and every server can answer
+                        // completely if the client does not ask it to
+                        // defer.
+                        (
+                            "inlayHint".to_string(),
+                            Value::Object(vec![("dynamicRegistration".to_string(), Value::Bool(false))]),
+                        ),
                         // The signature of the call being typed.
                         // `contextSupport` is not claimed: bish sends
                         // the position and nothing about *why* it

@@ -12158,6 +12158,7 @@ const KNOWN_BISHOPTS: &[(&str, BishOptDefault)] = &[
     // the only reading of it that leaves the option meaningful.
     ("relativenumber", BishOptDefault::Bool(false)),
     ("ignorecase", BishOptDefault::Bool(false)),
+    ("inlayhints", BishOptDefault::Bool(true)),
     ("smartcase", BishOptDefault::Bool(false)),
     // Whether a project's own `.editorconfig` wins over the settings
     // just below. On, it does -- a project's conventions are the point
@@ -12309,6 +12310,7 @@ const BISHOPT_HELP: &[(&str, &str)] = &[
     ("divider_budget", "How much of a split its pane dividers may take, as a percentage, before panes fold away."),
     ("relativenumber", "Number lines by their distance from the cursor's."),
     ("ignorecase", "Ignore case when searching, unless smartcase says otherwise."),
+    ("inlayhints", "Draw the language server's inline parameter-name and inferred-type hints."),
     ("smartcase", "With ignorecase on, an uppercase letter in the pattern makes that one search case-sensitive again."),
     ("editorconfig", "Let a project's `.editorconfig` override the settings below it."),
     ("mouse", "Ask the terminal to report mouse events. Off gives the terminal's own selection back."),
