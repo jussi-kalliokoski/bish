@@ -1,3 +1,18 @@
+// The builtins: one file per family, and `ls src/builtins` is the index
+// of what bish has.
+//
+// They live here as free functions taking `&mut Shell` rather than as
+// methods on it. Nothing about a builtin wants to be a method -- it is
+// a command that happens to run in-process -- and seventy of them
+// inside one `impl Shell` was four thousand lines that `exec.rs` had to
+// carry on top of the executor, the expander and the redirection
+// machinery, which are what that file is actually about.
+//
+// `exec.rs` keeps the dispatch (`dispatch_builtin_or_external_impl`)
+// and everything a builtin is dispatched *from*.
+
+pub(crate) mod limits;
+
 #[cfg(unix)]
 use std::os::unix::fs::FileTypeExt;
 
