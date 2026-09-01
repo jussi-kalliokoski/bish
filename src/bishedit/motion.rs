@@ -2055,10 +2055,29 @@ pub fn motion_range(buf: &mut impl Buffer, motion: Motion, count: Option<usize>)
         return Some(range);
     }
     let shape = motion_shape(&motion)?;
+    // Checked before the move, since `apply_motion` consumes it.
+    let cannot_fail = matches!(motion, Motion::LineEnd | Motion::LineLastNonBlank);
     let start = buf.cursor();
     apply_motion(buf, motion, count);
     let end = buf.cursor();
     if start == end {
+        // A motion that did not move usually covers nothing, and an
+        // operator on it must do nothing -- `dfx` with no `x` ahead is
+        // not "delete one character", it is a find that failed.
+        //
+        // The line-end motions are the exception, because they cannot
+        // fail: `$` with the cursor already on the last character has
+        // *succeeded*, and being inclusive it still covers that
+        // character. Without this, `D`, `d$` and `y$` all silently did
+        // nothing at the one position where they are most often used
+        // -- reached by `$` itself, which is how you get there.
+        //
+        // Guarded on the line having any characters at all, so `d$` on
+        // an empty line still deletes nothing rather than inventing a
+        // character to remove.
+        if cannot_fail && shape == MotionShape::Inclusive && buf.line_len(start.0) > 0 {
+            return Some(MotionRange { shape, from: start, to: start });
+        }
         return None;
     }
     let (from, to) = if pos_lt(start, end) { (start, end) } else { (end, start) };
@@ -3089,6 +3108,40 @@ mod tests {
         for (motion, expected) in cases {
             assert_eq!(motion_shape(motion), *expected, "{:?}", motion);
         }
+    }
+
+    #[test]
+    fn a_line_end_motion_that_is_already_there_still_covers_that_character() {
+        // `D`, `d$` and `y$` are most often used from exactly where `$`
+        // leaves you, and did nothing there: the cursor had not moved,
+        // so the range came back empty.
+        let mut buf = TestBuffer::new("abxcd");
+        buf.set_cursor(0, 4);
+        let r = motion_range(&mut buf, Motion::LineEnd, None).unwrap();
+        assert_eq!(r.shape, MotionShape::Inclusive);
+        assert_eq!((r.from, r.to), ((0, 4), (0, 4)));
+        assert_eq!(extract_text(&buf, &r), "d");
+    }
+
+    #[test]
+    fn an_empty_line_has_no_character_for_a_line_end_operator_to_take() {
+        let mut buf = TestBuffer::new("");
+        buf.set_cursor(0, 0);
+        assert!(motion_range(&mut buf, Motion::LineEnd, None).is_none());
+    }
+
+    #[test]
+    fn a_motion_that_failed_still_covers_nothing() {
+        // The distinction the fix turns on: `$` not moving means it is
+        // already there, while `f` not moving means no match was found.
+        // An operator must do nothing for the second.
+        let mut buf = TestBuffer::new("abxcd");
+        buf.set_cursor(0, 4);
+        assert!(motion_range(&mut buf, Motion::FindChar { ch: 'z', till: false, forward: true }, None).is_none());
+        assert!(motion_range(&mut buf, Motion::MatchPair, None).is_none());
+        // ...and an exclusive motion with nowhere to go, likewise.
+        buf.set_cursor(0, 0);
+        assert!(motion_range(&mut buf, Motion::LineStart, None).is_none());
     }
 
     #[test]
