@@ -205,6 +205,12 @@ struct Parser {
 const TAB_STOP: usize = 4;
 const CODE_INDENT: usize = 4;
 
+// How deeply containers (block quotes, lists, list items) may nest. A
+// list item is its own container inside its list, so a real nested list
+// costs two levels per visible level -- 128 is still far past anything
+// written on purpose.
+const MAX_NESTING: usize = 128;
+
 impl Parser {
     fn process(&mut self, line: Line) {
         self.line = line;
@@ -489,7 +495,7 @@ impl Parser {
             self.all_matched && matches!(self.stack[self.stack.len() - 1].kind, Kind::Paragraph);
         let last_matched = container;
 
-        if !indented && self.peek() == Some('>') {
+        if !indented && self.peek() == Some('>') && self.can_nest() {
             self.close_unmatched(last_matched, started_any);
             let start = self.line.start + self.next_nonspace;
             self.advance_next_nonspace();
@@ -597,7 +603,9 @@ impl Parser {
             self.consumed = true;
             return Some(true);
         }
-        if let Some(item) = self.list_item_start(in_paragraph) {
+        if self.can_nest()
+            && let Some(item) = self.list_item_start(in_paragraph)
+        {
             self.close_unmatched(last_matched, started_any);
             self.start_list_item(item);
             return Some(true);
@@ -963,6 +971,22 @@ impl Parser {
     }
 
     // Opening any block that is not a list or a list item.
+    // Whether another container may open here. The block parser itself
+    // is iterative -- containers live on `self.stack` -- but the tree it
+    // produces is walked recursively three times over: `resolve` turns
+    // `Raw` into `Block`, the renderer descends it, and dropping it
+    // descends it again. 50k nested `>` in a file overflowed the stack
+    // during `resolve`, which is a crash on *opening a document*, not on
+    // running anything.
+    //
+    // Bounding the depth at the one place depth is created makes all
+    // three walks safe at once. Past the limit the markers are simply
+    // text, which is what any reader would see in them anyway -- a
+    // document nested 128 deep is not one anybody is reading.
+    fn can_nest(&self) -> bool {
+        self.stack.len() < MAX_NESTING
+    }
+
     fn open_leaf(&mut self, kind: Kind, start: usize) {
         self.close_lists_for_block();
         self.stack.push(Open::new(kind, start));

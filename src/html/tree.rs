@@ -808,6 +808,26 @@ impl TreeBuilder {
     // ---- token dispatch --------------------------------------------
 
     fn process(&mut self, token: Token) {
+        // Past this many open elements a start tag is dropped on the
+        // floor, the same thing browsers do (Blink's own limit is 512)
+        // and for the same two reasons. The spec's algorithms are
+        // written against the stack of open elements -- "have an element
+        // in scope", "reconstruct the active formatting elements" --
+        // so per-token work grows with depth and a file of nothing but
+        // `<div>` is quadratic: 8000 of them take 6.7s here, 50000 take
+        // eight minutes. And every consumer of the finished tree walks
+        // it recursively (see markdown::render::html_runs), which a
+        // depth nothing bounds turns into a stack overflow.
+        //
+        // Dropping the token rather than the element keeps the parser's
+        // own invariants intact: nothing further down ever sees it, so
+        // no rule has to cope with an element that was inserted but not
+        // opened. Content inside still parses; it just attaches to the
+        // deepest element that fit.
+        const MAX_OPEN_ELEMENTS: usize = 512;
+        if self.open.len() >= MAX_OPEN_ELEMENTS && matches!(token, Token::StartTag(_)) {
+            return;
+        }
         loop {
             let reprocess = if self.use_foreign_rules(&token) {
                 self.foreign_content(&token)
@@ -2777,6 +2797,30 @@ fn quirks_for(force: bool, name: &str, public_id: &str, system_id: &str) -> Quir
 
 #[cfg(test)]
 mod tests {
+    // The spec's algorithms are written against the stack of open
+    // elements -- "have an element in scope" walks it, "reconstruct the
+    // active formatting elements" walks it -- so per-token work grows
+    // with depth and a document of nothing but `<div>` is quadratic:
+    // 8000 of them measured 6.7s before this cap, 38ms after. The tree
+    // it produced was also deeper than any recursive consumer could
+    // walk (markdown::render::html_runs overflowed the stack on it).
+    #[test]
+    fn nesting_stops_deepening_past_the_open_element_limit() {
+        let src = format!("{}x{}", "<div>".repeat(20000), "</div>".repeat(20000));
+        let started = std::time::Instant::now();
+        let (doc, roots) = crate::html::parse_fragment(&src, "div");
+        assert!(started.elapsed().as_secs() < 10, "20k nested divs must not be quadratic");
+
+        // Depth measured without recursing, which is the whole point.
+        let mut deepest = 0;
+        let mut stack: Vec<(crate::html::NodeId, usize)> = roots.iter().map(|&r| (r, 1)).collect();
+        while let Some((node, depth)) = stack.pop() {
+            deepest = deepest.max(depth);
+            stack.extend(doc.children(node).iter().map(|&c| (c, depth + 1)));
+        }
+        assert!(deepest < 600, "the tree bottoms out near the limit, not at 20000 (got {deepest})");
+    }
+
     use super::super::{parse, parse_fragment};
 
     // Trees are compared in html5lib-tests' own indented format (see

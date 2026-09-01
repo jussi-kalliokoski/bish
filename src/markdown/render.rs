@@ -139,7 +139,7 @@ fn render_block(block: &Block, opts: &Options, indent: usize, out: &mut Vec<Stri
             let (doc, roots) = html::parse_fragment(raw, "div");
             let mut runs = Vec::new();
             for &root in &roots {
-                html_runs(&doc, root, Style::default(), &mut runs, opts);
+                html_runs(&doc, root, Style::default(), &mut runs, opts, 0);
             }
             for line in wrap(&runs, width) {
                 if !line.trim().is_empty() {
@@ -418,13 +418,23 @@ fn push_inlines(inlines: &[Inline], base: Style, out: &mut Vec<Run>, opts: &Opti
 // The elements below are the ones that mean something here; everything
 // else contributes only its text, and the three that mean "not text at
 // all" contribute nothing.
-fn html_runs(doc: &html::Document, node: html::NodeId, style: Style, out: &mut Vec<Run>, opts: &Options) {
+fn html_runs(doc: &html::Document, node: html::NodeId, style: Style, out: &mut Vec<Run>, opts: &Options, depth: usize) {
+    // The HTML tree is an arena, so building it is iterative and its
+    // depth is whatever the document says -- `<div>` fifty thousand
+    // times over is a legal fragment. This walk is the recursive part,
+    // so it is where the floor has to be: past the limit the subtree
+    // contributes nothing, which is the same thing a terminal renderer
+    // does with any structure it cannot show.
+    const MAX_DEPTH: usize = 128;
+    if depth == MAX_DEPTH {
+        return;
+    }
     match &doc.node(node).data {
         NodeData::Text(text) => out.push(Run { text: text.clone(), style, break_after: false }),
         NodeData::Comment(_) | NodeData::Doctype { .. } => {}
         NodeData::Document => {
             for &child in doc.children(node) {
-                html_runs(doc, child, style.clone(), out, opts);
+                html_runs(doc, child, style.clone(), out, opts, depth + 1);
             }
         }
         NodeData::Element { name, attrs, .. } => {
@@ -464,7 +474,7 @@ fn html_runs(doc: &html::Document, node: html::NodeId, style: Style, out: &mut V
                 _ => style,
             };
             for &child in doc.children(node) {
-                html_runs(doc, child, child_style.clone(), out, opts);
+                html_runs(doc, child, child_style.clone(), out, opts, depth + 1);
             }
             if name == "a"
                 && let Some(href) = attrs.iter().find(|a| a.name == "href")

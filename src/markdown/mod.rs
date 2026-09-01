@@ -674,3 +674,36 @@ mod real_world_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod nesting_tests {
+    use super::render::{self, Options};
+
+    // Absurd nesting used to be fatal rather than merely absurd. The
+    // block parser's own container stack is iterative, but the tree it
+    // hands back gets walked recursively three separate times -- once
+    // to resolve link references, once to render, and once more when it
+    // is dropped -- so 50k nested `>` in a file overflowed the stack,
+    // and a shell that dies on *opening a document* is the worst
+    // version of this bug.
+    //
+    // A test that regresses this one does not fail politely: a stack
+    // overflow aborts the whole process, which is exactly the noise it
+    // should make.
+    #[test]
+    fn deeply_nested_block_quotes_are_bounded_not_fatal() {
+        let doc = super::parse(&format!("{} hi\n", ">".repeat(20000)));
+        let out = render::to_string(&doc, &Options { highlight_code: false, ..Options::default() });
+        assert!(out.contains("hi"), "the text past the markers still renders");
+    }
+
+    // Same story from the HTML side, where the depth is bounded one
+    // layer further down (html::tree caps the stack of open elements)
+    // and the renderer's own walk has a floor of its own.
+    #[test]
+    fn deeply_nested_html_is_bounded_not_fatal() {
+        let src = format!("{}hi{}\n", "<div>".repeat(20000), "</div>".repeat(20000));
+        let doc = super::parse(&src);
+        let _ = render::to_string(&doc, &Options { highlight_code: false, ..Options::default() });
+    }
+}

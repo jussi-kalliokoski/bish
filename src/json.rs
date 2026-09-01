@@ -348,8 +348,17 @@ impl Lexer<'_> {
     }
 }
 
+// Deep enough for anything a real document does -- an LSP payload, a
+// package manifest, a config -- and shallow enough that the recursion
+// here (and the equally recursive `Drop` of the `Value` it builds)
+// cannot run the stack out. Without it, 64 MiB of `[` is 33 million
+// levels and a SIGSEGV; the size cap on an LSP body bounds the bytes
+// but says nothing about their shape. Same idea as roff/interp.rs's
+// own MAX_DEPTH.
+const MAX_DEPTH: usize = 128;
+
 pub fn parse(input: &str) -> Result<Value, String> {
-    let mut p = Parser { toks: tokens(input).into_iter().peekable() };
+    let mut p = Parser { toks: tokens(input).into_iter().peekable(), depth: 0 };
     let v = p.parse_value()?;
     match p.toks.next() {
         None => Ok(v),
@@ -359,6 +368,7 @@ pub fn parse(input: &str) -> Result<Value, String> {
 
 struct Parser {
     toks: Peekable<std::vec::IntoIter<Token>>,
+    depth: usize,
 }
 
 impl Parser {
@@ -370,8 +380,8 @@ impl Parser {
         let tok = self.next_token()?;
         let at = tok.start;
         match tok.kind {
-            TokenKind::OpenBrace => self.parse_object(),
-            TokenKind::OpenBracket => self.parse_array(),
+            TokenKind::OpenBrace => self.nested(at, Self::parse_object),
+            TokenKind::OpenBracket => self.nested(at, Self::parse_array),
             TokenKind::Str(s) => Ok(Value::Str(s)),
             TokenKind::Number(n) => Ok(Value::Number(n)),
             TokenKind::Bool(b) => Ok(Value::Bool(b)),
@@ -379,6 +389,19 @@ impl Parser {
             TokenKind::Invalid(reason) => Err(format!("{reason} (position {at})")),
             other => Err(format!("unexpected {} (position {at})", describe(&other))),
         }
+    }
+
+    // One level down, for the two token kinds that open a container.
+    // The counter lives here rather than in the two parsers so there is
+    // exactly one place that can forget to decrement it.
+    fn nested(&mut self, at: usize, parse: fn(&mut Self) -> Result<Value, String>) -> Result<Value, String> {
+        if self.depth == MAX_DEPTH {
+            return Err(format!("JSON nested deeper than {MAX_DEPTH} levels (position {at})"));
+        }
+        self.depth += 1;
+        let value = parse(self);
+        self.depth -= 1;
+        value
     }
 
     // The open brace is already consumed.
@@ -685,6 +708,30 @@ fn field<'a>(v: &'a Value, key: &str) -> &'a Value {
 
 #[cfg(test)]
 mod tests {
+    // A server can send a legal 64 MiB body that is 33 million `[` deep;
+    // parsing it recursively -- and then *dropping* the result, which
+    // recurses too -- is a SIGSEGV, not an error. The size cap on an LSP
+    // body bounds the bytes and says nothing about their shape.
+    #[test]
+    fn nesting_past_the_limit_is_an_error_rather_than_a_crash() {
+        let ok = format!("{}1{}", "[".repeat(super::MAX_DEPTH), "]".repeat(super::MAX_DEPTH));
+        assert!(super::parse(&ok).is_ok(), "exactly at the limit still parses");
+
+        let one_deeper = format!("{}1{}", "[".repeat(super::MAX_DEPTH + 1), "]".repeat(super::MAX_DEPTH + 1));
+        let err = super::parse(&one_deeper).unwrap_err();
+        assert!(err.contains("nested deeper"), "{err}");
+
+        // Unterminated is the shape a bomb actually arrives in -- there
+        // is no reason for it to bother closing its brackets.
+        assert!(super::parse(&"[".repeat(100_000)).unwrap_err().contains("nested deeper"));
+        assert!(super::parse(&"{\"a\":".repeat(100_000)).unwrap_err().contains("nested deeper"));
+
+        // The counter comes back down, so a wide document of shallow
+        // values is not slowly starved of depth.
+        let wide = format!("[{}]", vec!["[[1]]"; 500].join(","));
+        assert!(super::parse(&wide).is_ok());
+    }
+
     use super::*;
 
     #[test]
