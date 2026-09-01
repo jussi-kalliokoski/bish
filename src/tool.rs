@@ -18,15 +18,97 @@ pub fn run(args: &[String]) -> i32 {
         Some("format") => run_format(&args[1..]),
         Some("debug") => run_debug(&args[1..]),
         Some("edit") => run_edit(&args[1..]),
+        Some("keys") => run_keys(&args[1..]),
         Some(other) => {
-            eprintln!("bish tool: unknown subcommand '{other}' (expected: check, format, debug, edit)");
+            eprintln!("bish tool: unknown subcommand '{other}' (expected: check, format, debug, edit, keys)");
             2
         }
         None => {
             eprintln!(
-                "bish tool: expected a subcommand (usage: bish tool check [--fix] [FILE...], bish tool format [--check] [FILE...], bish tool debug FILE, bish tool edit [--hex] FILE...)"
+                "bish tool: expected a subcommand (usage: bish tool check [--fix] [FILE...], bish tool format [--check] [FILE...], bish tool debug FILE, bish tool edit [--hex] FILE..., bish tool keys [SEQUENCE | --action TEXT])"
             );
             2
+        }
+    }
+}
+
+
+// `bish tool keys` -- the editor's key bindings, answered by the editor
+// rather than described alongside it.
+//
+// There are two questions and they are both hard to ask today. Forward:
+// "what does `D` do?" -- answerable only by defining a throwaway
+// mapping to it and listing the mappings. Backward: "which key deletes
+// to end of line?" -- not answerable at all, and the written help does
+// not mention `D`.
+//
+// Both come out of `keymap::key_index`, which asks
+// `vimkeys::describe_key_sequence` about every candidate sequence, so
+// nothing here can go stale: a binding that exists is listed, and one
+// that does not, is not.
+fn run_keys(args: &[String]) -> i32 {
+    match args.first().map(String::as_str) {
+        Some("-h") | Some("--help") => {
+            println!("usage: bish tool keys [SEQUENCE | --action TEXT]");
+            println!();
+            println!("  (no argument)    every key sequence and what it does");
+            println!("  SEQUENCE         what that sequence does, e.g. `bish tool keys D`");
+            println!("  --action TEXT    every key whose action mentions TEXT");
+            0
+        }
+        Some("--action") | Some("-a") => match args.get(1) {
+            Some(needle) => {
+                let needle = needle.to_lowercase();
+                let matched: Vec<(String, String)> =
+                    crate::keymap::key_index().into_iter().filter(|(_, action)| action.to_lowercase().contains(&needle)).collect();
+                if matched.is_empty() {
+                    eprintln!("bish tool keys: no action mentions '{needle}'");
+                    return 1;
+                }
+                print_index(&matched);
+                0
+            }
+            None => {
+                eprintln!("usage: bish tool keys --action TEXT");
+                2
+            }
+        },
+        Some(sequence) => match crate::keymap::parse_keys(sequence) {
+            Err(e) => {
+                eprintln!("bish tool keys: {e}");
+                2
+            }
+            Ok(keys) => match crate::bishedit::vimkeys::describe_key_sequence(&keys) {
+                Ok(action) => {
+                    println!("{}\t{action}", crate::keymap::format_keys(&keys));
+                    0
+                }
+                Err(reason) => {
+                    eprintln!("bish tool keys: {sequence}: {reason}");
+                    1
+                }
+            },
+        },
+        None => {
+            print_index(&crate::keymap::key_index());
+            0
+        }
+    }
+}
+
+// Tab-separated, so the output is as usable from a script as it is to
+// read -- the same shape `::bish map`'s own listing has.
+//
+// Written through a locked handle rather than `println!` because this
+// is output somebody will pipe into `grep` or `head`, and `println!`
+// panics on the EPIPE that follows when the reader stops early.
+fn print_index(rows: &[(String, String)]) {
+    use std::io::Write;
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    for (keys, action) in rows {
+        if writeln!(out, "{keys}\t{action}").is_err() {
+            return;
         }
     }
 }

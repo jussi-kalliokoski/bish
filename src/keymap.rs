@@ -135,6 +135,300 @@ pub fn format_rhs(keys: &[Key]) -> String {
     if keys.is_empty() { NOP.to_string() } else { format_keys(keys) }
 }
 
+/// Every key sequence Normal mode resolves, with the canonical name of
+/// what it does -- the same name `::bish map` prints.
+///
+/// Derived by asking rather than by listing: every candidate goes
+/// through `vimkeys::describe_key_sequence`, so this index cannot
+/// disagree with the implementation the way a hand-written one can.
+/// That is the entire point of it. The editor's own written help does
+/// not mention `D` at all, and until this existed the only way to learn
+/// that `D` deletes to end of line was to map a throwaway key to it and
+/// list the mappings.
+///
+/// Two kinds of row, and the difference between them is what keeps this
+/// an index rather than a wall of six thousand lines:
+///
+/// - A sequence that resolves on its own: `D`, `dd`, `gg`, `<C-w>s`.
+/// - A *pattern*, where a key qualifies whatever follows it rather than
+///   doing anything itself: `d{motion}`, `f{char}`, `"{char}`,
+///   `/{pattern}<CR>`. Every one of those is recognized mechanically --
+///   an operator by its description being the motion's own with
+///   constant text wrapped around it, a character argument by the
+///   description echoing back the very key that was typed, a search by
+///   the description quoting the text typed before `<CR>`.
+///
+/// Counts are left out: `1`-`9` may prefix nearly everything, and
+/// enumerating that is noise rather than an index. `0` stays, because
+/// on its own it is a motion.
+pub fn key_index() -> Vec<(String, String)> {
+    let root = root_descriptions();
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut frontier: Vec<Vec<Key>> = vec![Vec::new()];
+    // Two levels of ordinary walking. A pattern reaches deeper on its
+    // own, through the handful of extra probes `pattern_rows` makes.
+    for _ in 0..2 {
+        let mut next = Vec::new();
+        for prefix in &frontier {
+            let (rows, expand) = walk(prefix, &root);
+            out.extend(rows);
+            next.extend(expand);
+        }
+        frontier = next;
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+// What a modifier wraps its operand's own description in: ("delete ",
+// "") for `d`, ("", " register 'a'") for `"a`.
+#[derive(Clone, PartialEq)]
+struct Affixes {
+    before: String,
+    after: String,
+}
+
+impl Affixes {
+    fn render(&self) -> String {
+        format!("{}{{motion}}{}", self.before, self.after)
+    }
+}
+
+enum Shape {
+    // Qualifies what follows, and says so in the name.
+    Modifier(Affixes),
+    // Qualifies what follows and changes nothing about the name -- the
+    // unnamed register `""` being the case that matters. Nothing to
+    // list, and nothing below it that is not already listed.
+    Transparent,
+    // Reads text up to `<CR>` and quotes it back, i.e. `/` and `?`.
+    LineArgument(String),
+    // An ordinary prefix: `g`, `z`, `<C-w>`. Worth walking into.
+    Prefix,
+}
+
+// One level: every row `prefix` produces with one more key, plus the
+// prefixes worth walking into.
+fn walk(prefix: &[Key], root: &[(Key, String)]) -> (Vec<(String, String)>, Vec<Vec<Key>>) {
+    let mut rows: Vec<(String, String)> = Vec::new();
+    let mut resolved: Vec<(Key, String)> = Vec::new();
+    // Modifier rows, kept apart only so they can go through the same
+    // character-argument collapse: a register is both at once (`"a` is
+    // a modifier, and the `a` is a typed character), and `"{char}
+    // {motion}` is one row where `"a{motion}` through `"z{motion}` are
+    // twenty-six that say the same thing.
+    let mut patterned: Vec<(Key, String)> = Vec::new();
+    let mut expand = Vec::new();
+    for key in candidate_keys() {
+        let seq = [prefix, &[key]].concat();
+        match crate::bishedit::vimkeys::describe_key_sequence(&seq) {
+            Ok(desc) => resolved.push((key, desc)),
+            Err(reason) if reason == "incomplete" => match shape_of(&seq, root) {
+                Shape::Modifier(affixes) => {
+                    patterned.push((key, affixes.render()));
+                    // A modifier reached by typing a character -- a
+                    // register -- earns no extra probes: everything
+                    // under `"a` is `"a` applied to something already
+                    // listed on its own. A real operator does, whether
+                    // it is spelled `d` or `gu`.
+                    if !echoes_last_key(&affixes.after, &seq) {
+                        rows.extend(pattern_rows(&seq, root));
+                    }
+                }
+                Shape::LineArgument(desc) => rows.push((format!("{}{{pattern}}<CR>", format_keys(&seq)), desc)),
+                Shape::Transparent => {}
+                Shape::Prefix => expand.push(seq),
+            },
+            Err(_) => {}
+        }
+    }
+    rows.extend(collapse_char_arguments(prefix, resolved, ""));
+    rows.extend(collapse_char_arguments(prefix, patterned, "{motion}"));
+    rows.sort();
+    rows.dedup();
+    (rows, expand)
+}
+
+// An operator is not walked into -- `d{motion}` already says what the
+// ninety rows under it would -- but three things below one are their
+// own facts rather than instances of the pattern: the doubled form
+// (`dd` operates on the line) and the two text-object introducers.
+fn pattern_rows(seq: &[Key], root: &[(Key, String)]) -> Vec<(String, String)> {
+    let Some(&last) = seq.last() else { return Vec::new() };
+    let mut rows = Vec::new();
+    for key in [last, Key::Char('i'), Key::Char('a')] {
+        let longer = [seq, &[key]].concat();
+        match crate::bishedit::vimkeys::describe_key_sequence(&longer) {
+            Ok(desc) => rows.push((format_keys(&longer), desc)),
+            Err(_) => match shape_of(&longer, root) {
+                Shape::Modifier(affixes) => rows.push((format!("{}{{motion}}", format_keys(&longer)), affixes.render())),
+                // A text object is not a motion and is not named like
+                // one -- `diw` is "delete text-object inner word" while
+                // `w` on its own is "word-forward" -- so the operand
+                // test above cannot see it. What it does have is a
+                // family of siblings that all begin the same way, which
+                // is exactly as mechanical and just as hard to fake.
+                _ => rows.extend(family_row(&longer)),
+            },
+        }
+    }
+    rows
+}
+
+// One row for a group of at least three sequences whose descriptions
+// share everything up to a final word: `di{object}`.
+fn family_row(seq: &[Key]) -> Option<(String, String)> {
+    let described: Vec<String> = candidate_keys()
+        .into_iter()
+        .filter_map(|key| crate::bishedit::vimkeys::describe_key_sequence(&[seq, &[key]].concat()).ok())
+        .collect();
+    if described.len() < 3 {
+        return None;
+    }
+    let first = described.first()?;
+    let mut shared = first.len();
+    for desc in &described[1..] {
+        shared = shared.min(first.chars().zip(desc.chars()).take_while(|(a, b)| a == b).count());
+    }
+    let common = first[..first.char_indices().nth(shared).map_or(first.len(), |(i, _)| i)].to_string();
+    let common = common.trim_end();
+    // A shared prefix that is the whole of some sibling's description
+    // means these are not one family with an argument, they are just
+    // names that happen to start alike.
+    match common.is_empty() || described.iter().any(|d| d.trim() == common) {
+        true => None,
+        false => Some((format!("{}{{object}}", format_keys(seq)), format!("{common} {{object}}"))),
+    }
+}
+
+// What kind of prefix `seq` is. Every test here is a question put to
+// `describe_key_sequence` about real sequences -- nothing is listed by
+// hand, which is why this cannot drift.
+fn shape_of(seq: &[Key], root: &[(Key, String)]) -> Shape {
+    // Does what follows keep its own name, with constant text wrapped
+    // around it? `dw` is "delete word" and `w` is "word"; `"ap` is
+    // "put-after register 'a'" and `p` is "put-after".
+    //
+    // Tallied rather than decided on the first agreement, because a
+    // modifier does not have to apply to everything: a register
+    // qualifies `p` and `Y` and leaves `J` and `u` alone, so the
+    // empty-affix answers are the majority and the *real* shape is the
+    // most common thing that actually wraps something.
+    let mut tried = 0;
+    let mut tally: Vec<(Affixes, usize)> = Vec::new();
+    for (key, base) in root {
+        let Ok(desc) = crate::bishedit::vimkeys::describe_key_sequence(&[seq, &[*key]].concat()) else { continue };
+        tried += 1;
+        let Some(at) = desc.find(base.as_str()) else { continue };
+        let affixes = Affixes { before: desc[..at].to_string(), after: desc[at + base.len()..].to_string() };
+        match tally.iter_mut().find(|(a, _)| *a == affixes) {
+            Some((_, n)) => *n += 1,
+            None => tally.push((affixes, 1)),
+        }
+    }
+    let wrapping = tally.iter().filter(|(a, _)| !(a.before.is_empty() && a.after.is_empty())).max_by_key(|(_, n)| *n);
+    if let Some((affixes, count)) = wrapping
+        && *count >= 3
+        // An operator applies to *everything* that follows it, so an
+        // overwhelming majority is the test: `d` matches 42 of the 42
+        // keys that resolve after it. `<C-w>` matches 4 of 8 -- it
+        // looks like one because `<C-w>h` is "window focus-left" beside
+        // `h`'s "left" -- and is not one, which is why `<C-w>s` and
+        // `<C-w>v` are still listed individually.
+        //
+        // A register is the exception, and names itself: `"a` only
+        // qualifies the commands that use a register, so it never wins
+        // a majority, but the text it adds echoes the very key that was
+        // typed -- the same signature `f{char}` is recognized by.
+        && (count * 4 >= tried * 3 || echoes_last_key(&affixes.after, seq))
+    {
+        return Shape::Modifier(affixes.clone());
+    }
+    // What follows keeps its own name exactly: the unnamed register
+    // `""` is this, and there is nothing under it that is not already
+    // listed on its own.
+    if tally.iter().any(|(a, n)| a.before.is_empty() && a.after.is_empty() && *n >= 3) && wrapping.is_none() {
+        return Shape::Transparent;
+    }
+    // Does it read text up to `<CR>` and quote it back? Asked of the
+    // empty text, which is the one case that needs no guessing about
+    // what was typed.
+    if let Ok(desc) = crate::bishedit::vimkeys::describe_key_sequence(&[seq, &[Key::Enter]].concat())
+        && let Some(stem) = desc.strip_suffix(" \"\"")
+    {
+        return Shape::LineArgument(format!("{stem} {{pattern}}"));
+    }
+    Shape::Prefix
+}
+
+// Whether the text a modifier adds quotes back the key that was typed
+// to reach it -- `"a` adding " register 'a'".
+fn echoes_last_key(after: &str, seq: &[Key]) -> bool {
+    matches!(seq.last(), Some(&last) if echoed_argument(after, last).is_some())
+}
+
+// Every single key that resolves on its own, which is what a modifier's
+// operand is drawn from.
+fn root_descriptions() -> Vec<(Key, String)> {
+    candidate_keys()
+        .into_iter()
+        .filter_map(|key| crate::bishedit::vimkeys::describe_key_sequence(&[key]).ok().map(|desc| (key, desc)))
+        .collect()
+}
+
+// `f` reads a character and says so: `fa` describes as "find-char 'a'".
+// Ninety-four rows of that is not an index, so any run whose
+// description echoes the key that produced it becomes one row.
+fn collapse_char_arguments(prefix: &[Key], resolved: Vec<(Key, String)>, suffix: &str) -> Vec<(String, String)> {
+    let mut groups: Vec<(String, usize)> = Vec::new();
+    for (key, desc) in &resolved {
+        if let Some(stem) = echoed_argument(desc, *key) {
+            match groups.iter_mut().find(|(s, _)| s == stem) {
+                Some((_, n)) => *n += 1,
+                None => groups.push((stem.to_string(), 1)),
+            }
+        }
+    }
+    let mut out: Vec<(String, String)> = Vec::new();
+    for (key, desc) in &resolved {
+        let collapsed = echoed_argument(desc, *key).and_then(|stem| groups.iter().find(|(s, n)| s == stem && *n > 1));
+        let row = match collapsed {
+            Some((stem, _)) => (format!("{}{{char}}{suffix}", format_keys(prefix)), format!("{stem} {{char}}")),
+            None => (format!("{}{suffix}", format_keys(&[prefix, &[*key]].concat())), desc.clone()),
+        };
+        if !out.contains(&row) {
+            out.push(row);
+        }
+    }
+    out
+}
+
+// The description with the echoed key stripped off, when it ends in
+// exactly the character that was typed. `'` and `\` arrive escaped
+// (`find-char '\''`), which is the describer's own quoting rather than
+// a different answer -- so both spellings count.
+fn echoed_argument(desc: &str, key: Key) -> Option<&str> {
+    let Key::Char(c) = key else { return None };
+    let escaped = match c {
+        '\'' => Some("\\'"),
+        '\\' => Some("\\\\"),
+        _ => None,
+    };
+    desc.strip_suffix(&format!(" '{c}'")).or_else(|| escaped.and_then(|e| desc.strip_suffix(&format!(" '{e}'"))))
+}
+
+// What the walk tries at each position: every printable ASCII character
+// and every named key. `1`-`9` are left out -- see `key_index`.
+fn candidate_keys() -> Vec<Key> {
+    let mut keys: Vec<Key> = (0x20u8..0x7f)
+        .map(|b| Key::Char(b as char))
+        .filter(|k| !matches!(k, Key::Char(c) if c.is_ascii_digit() && *c != '0'))
+        .collect();
+    keys.extend(NAMED.iter().map(|(_, k)| *k));
+    keys
+}
+
 /// Parses `<C-d>`, `<Space>w`, `10j` and so on into the keys they name.
 ///
 /// Angle-bracket names are matched case-insensitively (`<esc>`, `<ESC>`
@@ -509,6 +803,56 @@ impl Matcher {
 
 #[cfg(test)]
 mod tests {
+    // The index exists because the written help did not mention `D`,
+    // and nothing could have noticed. This one is asked, not written.
+    #[test]
+    fn the_key_index_answers_both_directions() {
+        let index = super::key_index();
+        let action = |keys: &str| index.iter().find(|(k, _)| k == keys).map(|(_, a)| a.as_str());
+
+        assert_eq!(action("D"), Some("delete line-end"), "the miss that started this");
+        assert_eq!(action("dd"), Some("delete line"));
+        assert_eq!(action("gg"), Some("goto-first-line"));
+        assert_eq!(action("<C-w>s"), Some("window split"));
+
+        // The patterns, each recognized by a different mechanical
+        // property -- see `key_index`.
+        assert_eq!(action("d{motion}"), Some("delete {motion}"));
+        assert_eq!(action("di{object}"), Some("delete text-object inner {object}"));
+        assert_eq!(action("f{char}"), Some("find-char {char}"));
+        assert_eq!(action("\"{char}{motion}"), Some("{motion} register {char}"));
+        assert_eq!(action("/{pattern}<CR>"), Some("search-forward {pattern}"));
+
+        // ...and what the patterns replace. Ninety rows of `dw`, `db`,
+        // `d$` say nothing `d{motion}` does not, so they are not there.
+        assert_eq!(action("dw"), None);
+        assert_eq!(action("fa"), None);
+        assert_eq!(action("\"ayy"), None);
+
+        // The reverse question, which nothing could answer before.
+        let deletes: Vec<&str> = index.iter().filter(|(_, a)| a.contains("delete")).map(|(k, _)| k.as_str()).collect();
+        assert!(deletes.contains(&"D"), "{deletes:?}");
+
+        // Small enough to read, which is the difference between an
+        // index and a dump: the unfiltered walk finds about six
+        // thousand sequences.
+        assert!((100..250).contains(&index.len()), "{} rows", index.len());
+    }
+
+    // A row's key column is real notation, not prose: anything without
+    // a `{placeholder}` in it parses back and describes as its own row.
+    #[test]
+    fn every_literal_row_round_trips_through_parse_keys() {
+        for (keys, action) in super::key_index() {
+            if keys.contains('{') {
+                continue;
+            }
+            let parsed = super::parse_keys(&keys).unwrap_or_else(|e| panic!("{keys}: {e}"));
+            assert_eq!(super::format_keys(&parsed), keys, "spelling is not canonical");
+            assert_eq!(crate::bishedit::vimkeys::describe_key_sequence(&parsed), Ok(action.clone()), "{keys}");
+        }
+    }
+
     use super::*;
 
     fn mapping(modes: &str, lhs: &str, rhs: &str) -> Mapping {

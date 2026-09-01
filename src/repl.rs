@@ -11460,7 +11460,7 @@ its decompressed text.
 | `:dbg` | attach a read-only debug session (`:dbg help`) |
 | `:preview` | render this markdown buffer |
 | `:!CMD` | run a shell command; a space before the `!` keeps it out of history |
-| `:help` | this screen (`:help options`, `:help hooks`) |
+| `:help` | this screen (`:help keys`, `:help options`, `:help hooks`) |
 "#;
 
 // `:help options`, as markdown: every bishopt with what it accepts, its
@@ -11481,6 +11481,53 @@ fn options_help(shell: &exec::Shell) -> String {
         out.push_str(&format!("## `{}`\n\n{}\n\n`{}`\n\n", name.trim(), description.trim(), accepts.trim()));
     }
     out
+}
+
+// `:help keys`, as markdown -- generated from `keymap::key_index`,
+// which asks the editor itself what every key does. The same treatment
+// `:help options` already gets from the option registry, and for the
+// same reason: a page written out by hand goes stale silently. This one
+// did -- the prose above has never mentioned `D`, and finding out that
+// `D` deletes to end of line meant mapping a throwaway key to it and
+// listing the mappings.
+//
+// `{motion}`, `{object}`, `{char}` and `{pattern}` in the key column
+// are patterns rather than literal keys; see `key_index`.
+fn keys_help() -> String {
+    let mut out = String::from(
+        "# bish editor keys\n\nNormal mode, as the editor itself reports it -- this page is generated from the\nkey table, not written beside it, so it cannot describe a key that isn't there or\nmiss one that is.\n\nA leading count repeats most of these (`3j`, `2dd`). `{motion}` stands for any\nmotion, `{object}` for any text object, `{char}` for one typed character, and\n`{pattern}` for text ending in Enter.\n\n| Keys | What |\n|:--|:--|\n",
+    );
+    for (keys, action) in crate::keymap::key_index() {
+        // A `|` inside a table cell would end it, and `` ` `` inside
+        // code spans needs a wider fence.
+        let keys = keys.replace('|', "\\|");
+        out.push_str(&format!("| ``{keys}`` | {action} |\n"));
+    }
+    out
+}
+
+#[cfg(test)]
+mod keys_help_tests {
+    // The written help has never mentioned `D`, and nothing could have
+    // noticed -- which is the whole argument for generating this page
+    // instead. So the test is that the generated page really does carry
+    // every row, rather than quietly truncating or mangling some.
+    #[test]
+    fn the_generated_page_carries_every_row_of_the_index() {
+        let page = super::keys_help();
+        for (keys, action) in crate::keymap::key_index() {
+            assert!(page.contains(&action), "{keys}: `{action}` is missing from :help keys");
+            assert!(page.contains(&keys.replace('|', "\\|")), "{keys} is missing from :help keys");
+        }
+        assert!(page.contains("delete line-end"), "the miss that started this");
+    }
+
+    // The prose page is what points at the generated one, so it has to
+    // say the name.
+    #[test]
+    fn the_written_help_points_at_the_generated_one() {
+        assert!(super::EDITOR_HELP_MARKDOWN.contains(":help keys"));
+    }
 }
 
 // `:help hooks`, as markdown -- the same event descriptions
@@ -13078,15 +13125,19 @@ fn run_command_mode(
                         // generated from the option registry itself
                         // rather than written out, so a new bishopt is
                         // documented by existing.
-                        "help" | "h" | "?" if arg.is_none() || arg == Some("options") || arg == Some("hooks") => {
+                        "help" | "h" | "?"
+                            if arg.is_none() || arg == Some("options") || arg == Some("hooks") || arg == Some("keys") =>
+                        {
                             let title = match arg {
                                 Some("options") => "bish options  (q to close)",
                                 Some("hooks") => "bish hooks  (q to close)",
+                                Some("keys") => "bish keys  (q to close)",
                                 _ => "bish help  (q to close)",
                             };
                             let source = match arg {
                                 Some("options") => sessions.get(&session_id).map(|s| options_help(&s.shell)).unwrap_or_default(),
                                 Some("hooks") => hooks_help(),
+                                Some("keys") => keys_help(),
                                 _ => EDITOR_HELP_MARKDOWN.to_string(),
                             };
                             run_pager(
