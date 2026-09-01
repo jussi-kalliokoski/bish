@@ -11,6 +11,19 @@ pub fn matches(pattern: &str, text: &str) -> bool {
     match_here(pattern.as_bytes(), text.as_bytes())
 }
 
+/// The same, but `*` and `?` never cross a `/` -- pathname semantics,
+/// what C's fnmatch spells `FNM_PATHNAME`.
+///
+/// This is the rule pathname expansion itself follows, and the one
+/// `GLOBIGNORE` is matched under: `*.o` drops `a.o` and leaves
+/// `sub/x.o` alone, because the pattern names one path component and
+/// the candidate has two. Confirmed against real bash, which was the
+/// opposite of what I first assumed.
+pub fn matches_path(pattern: &str, text: &str) -> bool {
+    let (pat, txt): (Vec<&str>, Vec<&str>) = (pattern.split('/').collect(), text.split('/').collect());
+    pat.len() == txt.len() && pat.iter().zip(txt.iter()).all(|(p, t)| matches(p, t))
+}
+
 fn match_here(pat: &[u8], text: &[u8]) -> bool {
     if pat.is_empty() {
         return text.is_empty();

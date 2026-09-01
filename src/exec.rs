@@ -3199,7 +3199,7 @@ impl Shell {
         crate::lexer::expand_aliases(toks, &|name| self.aliases.iter().find(|(n, _)| n == name).map(|(_, v)| v.clone()))
     }
 
-    fn shopt_is_on(&self, name: &str) -> bool {
+    pub(crate) fn shopt_is_on(&self, name: &str) -> bool {
         if name == "extglob" {
             return true;
         }
@@ -9120,6 +9120,13 @@ impl Shell {
     // The default IFS (" \t\n") when the variable is truly unset; its
     // actual value (which may be empty, meaning "don't split at all")
     // whenever it's been assigned, even to "".
+    /// `FIGNORE` split into the suffixes completion should leave out.
+    /// Empty entries are dropped, so a stray `:` cannot turn into a
+    /// suffix that matches everything.
+    pub fn fignore_suffixes(&self) -> Vec<String> {
+        self.raw_var_lookup("FIGNORE").split(':').filter(|s| !s.is_empty()).map(str::to_string).collect()
+    }
+
     fn get_ifs(&mut self) -> String {
         if self.var_is_set("IFS") {
             self.lookup_var("IFS")
@@ -9315,6 +9322,27 @@ impl Shell {
     // actually contains metacharacters. A pattern with no filesystem
     // matches is kept as its literal text, matching bash's default
     // (nullglob-off) behavior.
+    // `GLOBIGNORE`: a colon-separated list of patterns, and any
+    // pathname expansion result matching one is dropped.
+    //
+    // Matched against the whole produced name, under the same pathname
+    // rules the expansion itself used: `*` does not cross a `/`. So
+    // `GLOBIGNORE='*.o'` drops `a.o` and leaves `sub/x.o` alone,
+    // because the pattern names one component and that name has two.
+    // Checked against real bash, which is the opposite of what the
+    // obvious reading of "matched against the filename" suggests.
+    //
+    // An empty or unset GLOBIGNORE filters nothing, which is the far
+    // more common case and is checked first.
+    fn apply_globignore(&mut self, matches: Vec<String>) -> Vec<String> {
+        let ignore = self.lookup_var("GLOBIGNORE");
+        if ignore.is_empty() {
+            return matches;
+        }
+        let patterns: Vec<&str> = ignore.split(':').filter(|p| !p.is_empty()).collect();
+        matches.into_iter().filter(|m| !patterns.iter().any(|p| crate::glob::matches_path(p, m))).collect()
+    }
+
     fn expand_words(&mut self, words: &[Word]) -> Vec<String> {
         let mut out = Vec::new();
         for w in words {
@@ -9325,8 +9353,16 @@ impl Shell {
                 let s = self.expand_word(w);
                 if !self.opt_noglob {
                     if let Some(matches) = glob::expand(&s) {
-                        out.extend(matches);
-                        continue;
+                        let kept = self.apply_globignore(matches);
+                        // Everything the pattern found was ignored, so
+                        // it found nothing -- which under the default
+                        // nullglob-off rule means the word stands as its
+                        // own literal text, exactly as an unmatched
+                        // pattern does.
+                        if !kept.is_empty() {
+                            out.extend(kept);
+                            continue;
+                        }
                     }
                 }
                 out.push(s);
@@ -9336,7 +9372,7 @@ impl Shell {
                     out.extend(fields);
                 } else {
                     for (f, p) in fields.into_iter().zip(patterns.into_iter()) {
-                        match glob::expand(&p) {
+                        match glob::expand(&p).map(|m| self.apply_globignore(m)).filter(|m| !m.is_empty()) {
                             Some(matches) => out.extend(matches),
                             None => out.push(f),
                         }
@@ -12892,6 +12928,37 @@ mod tests {
         }
         unsafe { tzset() };
         out
+    }
+
+    #[test]
+    fn globignore_drops_matches_under_pathname_rules() {
+        // Checked against real bash. The second case is the one that
+        // matters: `*.o` leaves `sub/x.o` alone, because `*` does not
+        // cross a `/` here -- the opposite of what "matched against the
+        // filename" first suggests.
+        // `cd` moves the real process, so this holds the same lock every
+        // other cwd-touching test here holds, and puts it back.
+        let _guard = CWD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let original = std::env::current_dir().expect("a working directory");
+        let dir = std::env::temp_dir().join(format!("bish-globignore-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        for n in ["a.c", "a.o", "sub/x.o", "sub/y.c"] {
+            std::fs::write(dir.join(n), "").unwrap();
+        }
+        let run = |script: &str| {
+            let mut sh = Shell::new();
+            sh.run_source_here(&format!("cd {}; {script}", dir.display()), "<test>");
+            sh.debug_peek_var("r").unwrap_or_default()
+        };
+        assert_eq!(run("r=$(echo *)"), "a.c a.o sub");
+        assert_eq!(run("GLOBIGNORE='*.o'; r=$(echo *)"), "a.c sub");
+        assert_eq!(run("GLOBIGNORE='*.o'; r=$(echo sub/*)"), "sub/x.o sub/y.c", "* does not cross a /");
+        assert_eq!(run("GLOBIGNORE='sub/*.o'; r=$(echo sub/*)"), "sub/y.c");
+        // Everything ignored means the pattern matched nothing, and
+        // nullglob-off leaves an unmatched pattern as its own text.
+        assert_eq!(run("GLOBIGNORE='*'; r=$(echo *)"), "*");
+        std::env::set_current_dir(&original).expect("the working directory comes back");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

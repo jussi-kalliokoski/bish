@@ -488,6 +488,15 @@ pub struct ShellCompletionProvider<'a> {
     /// read it from, which offers everything -- the behaviour before
     /// this existed.
     pub honor_gitignore: bool,
+    /// `FIGNORE`, split on `:` -- filename *suffixes* completion leaves
+    /// out (`.o`, `~`). Empty when the variable is unset, which is the
+    /// usual case.
+    pub fignore: Vec<String>,
+    /// The `force_fignore` shopt, on by default as in bash. Off means
+    /// the suffixes are only honoured while doing so still leaves
+    /// something to offer -- so a directory of nothing but `.o` files
+    /// still completes rather than appearing empty.
+    pub force_fignore: bool,
     /// The `::bish hl` colour names currently set (a per-prompt
     /// snapshot of `Shell::hl_colors`'s keys), for completing
     /// `::bish hl --unset <Tab>`.
@@ -675,6 +684,25 @@ impl<'a> ShellCompletionProvider<'a> {
             }
             names.push(format!("{dir_part}{name}{}", if is_dir { "/" } else { "" }));
         }
+        // `FIGNORE`, last: a suffix is about the name, so this filters
+        // what the listing produced rather than what it read.
+        // Directories keep their trailing `/` here, which is why the
+        // suffix test looks past it -- `FIGNORE=.o` should not be
+        // defeated by a directory called `x.o`.
+        if !self.fignore.is_empty() {
+            let ignored = |n: &String| {
+                let bare = n.strip_suffix('/').unwrap_or(n);
+                self.fignore.iter().any(|suffix| bare.len() > suffix.len() && bare.ends_with(suffix.as_str()))
+            };
+            let kept: Vec<String> = names.iter().filter(|n| !ignored(n)).cloned().collect();
+            // With `force_fignore` off, an empty result means the filter
+            // took everything -- offer the unfiltered list rather than
+            // nothing, which is the whole point of being able to turn it
+            // off.
+            if !kept.is_empty() || self.force_fignore {
+                names = kept;
+            }
+        }
         rank(prefix, names)
     }
 }
@@ -682,6 +710,41 @@ impl<'a> ShellCompletionProvider<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fignore_leaves_out_the_suffixes_it_names() {
+        let dir = std::env::temp_dir().join(format!("bish-fignore-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for n in ["main.c", "main.o", "util.c", "util.o"] {
+            std::fs::write(dir.join(n), "").unwrap();
+        }
+        let offer = |fignore: Vec<String>, force: bool| {
+            let provider = ShellCompletionProvider {
+                cwd: Some(&dir),
+                known_functions: None,
+                completions: None,
+                default_completion: None,
+                action_ctx: None,
+                functions_preamble: None,
+                honor_gitignore: false,
+                fignore,
+                force_fignore: force,
+                hl_names: Vec::new(),
+            };
+            let mut got: Vec<String> = provider.complete(CompletionRequest { line: "cat ", cursor: 4 }).candidates.into_iter().map(|c| c.display).collect();
+            got.sort();
+            got
+        };
+        let all = vec!["main.c".to_string(), "main.o".to_string(), "util.c".to_string(), "util.o".to_string()];
+        assert_eq!(offer(Vec::new(), true), all, "no FIGNORE offers everything");
+        assert_eq!(offer(vec![".o".to_string()], true), vec!["main.c".to_string(), "util.c".to_string()]);
+        assert!(offer(vec![".o".to_string(), ".c".to_string()], true).is_empty(), "force_fignore on means gone is gone");
+        // ...and off means the filter only applies while it leaves
+        // something, which is the whole point of being able to turn it
+        // off.
+        assert_eq!(offer(vec![".o".to_string(), ".c".to_string()], false), all);
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn find_word_start_scans_back_to_whitespace() {
@@ -752,7 +815,7 @@ mod tests {
 
     #[test]
     fn command_name_candidates_includes_known_builtins_matching_prefix() {
-        let provider = ShellCompletionProvider { cwd: None, known_functions: None, completions: None, default_completion: None, action_ctx: None, functions_preamble: None, honor_gitignore: false, hl_names: Vec::new() };
+        let provider = ShellCompletionProvider { cwd: None, known_functions: None, completions: None, default_completion: None, action_ctx: None, functions_preamble: None, honor_gitignore: false, fignore: Vec::new(), force_fignore: true, hl_names: Vec::new() };
         let names = display_names(provider.command_name_candidates("ech"));
         assert!(names.iter().any(|n| n == "echo"), "{names:?}");
     }
@@ -765,7 +828,7 @@ mod tests {
         // prefixes, which would make the assertion flaky.
         let mut functions = HashSet::new();
         functions.insert("zz_bish_test_func".to_string());
-        let provider = ShellCompletionProvider { cwd: None, known_functions: Some(&functions), completions: None, default_completion: None, action_ctx: None, functions_preamble: None, honor_gitignore: false, hl_names: Vec::new() };
+        let provider = ShellCompletionProvider { cwd: None, known_functions: Some(&functions), completions: None, default_completion: None, action_ctx: None, functions_preamble: None, honor_gitignore: false, fignore: Vec::new(), force_fignore: true, hl_names: Vec::new() };
         let names = display_names(provider.command_name_candidates("zz_bish_test"));
         assert_eq!(names, vec!["zz_bish_test_func".to_string()]);
     }
@@ -775,7 +838,7 @@ mod tests {
         // coreutils -- same real-PATH assumption this whole feature
         // already leans on elsewhere (highlight.rs's own is_in_path
         // tests).
-        let provider = ShellCompletionProvider { cwd: None, known_functions: None, completions: None, default_completion: None, action_ctx: None, functions_preamble: None, honor_gitignore: false, hl_names: Vec::new() };
+        let provider = ShellCompletionProvider { cwd: None, known_functions: None, completions: None, default_completion: None, action_ctx: None, functions_preamble: None, honor_gitignore: false, fignore: Vec::new(), force_fignore: true, hl_names: Vec::new() };
         let names = display_names(provider.command_name_candidates("tru"));
         assert!(names.iter().any(|n| n == "true"), "{names:?}");
     }
@@ -833,7 +896,7 @@ mod tests {
         std::fs::write(dir.join("widget-notes.txt"), b"hi").unwrap();
         std::fs::write(dir.join("unrelated.txt"), b"hi").unwrap();
 
-        let provider = ShellCompletionProvider { cwd: Some(&dir), known_functions: None, completions: None, default_completion: None, action_ctx: None, functions_preamble: None, honor_gitignore: false, hl_names: Vec::new() };
+        let provider = ShellCompletionProvider { cwd: Some(&dir), known_functions: None, completions: None, default_completion: None, action_ctx: None, functions_preamble: None, honor_gitignore: false, fignore: Vec::new(), force_fignore: true, hl_names: Vec::new() };
         let names = display_names(provider.file_candidates("widg"));
 
         std::fs::remove_dir_all(&dir).ok();
@@ -864,7 +927,7 @@ mod tests {
             unsafe { std::env::set_var("HOME", &dir) };
             // cwd is deliberately a different, unrelated directory --
             // confirms the lookup actually goes to $HOME, not cwd.
-            let provider = ShellCompletionProvider { cwd: Some(Path::new("/")), known_functions: None, completions: None, default_completion: None, action_ctx: None, functions_preamble: None, honor_gitignore: false, hl_names: Vec::new() };
+            let provider = ShellCompletionProvider { cwd: Some(Path::new("/")), known_functions: None, completions: None, default_completion: None, action_ctx: None, functions_preamble: None, honor_gitignore: false, fignore: Vec::new(), force_fignore: true, hl_names: Vec::new() };
             let names = display_names(provider.file_candidates("~/.co"));
             unsafe { std::env::set_var("HOME", &original_home) };
             names
@@ -880,13 +943,13 @@ mod tests {
 
     #[test]
     fn file_candidates_yields_nothing_without_a_cwd() {
-        let provider = ShellCompletionProvider { cwd: None, known_functions: None, completions: None, default_completion: None, action_ctx: None, functions_preamble: None, honor_gitignore: false, hl_names: Vec::new() };
+        let provider = ShellCompletionProvider { cwd: None, known_functions: None, completions: None, default_completion: None, action_ctx: None, functions_preamble: None, honor_gitignore: false, fignore: Vec::new(), force_fignore: true, hl_names: Vec::new() };
         assert_eq!(provider.file_candidates("anything"), Vec::new());
     }
 
     #[test]
     fn complete_dispatches_bare_prefix_to_command_names() {
-        let provider = ShellCompletionProvider { cwd: None, known_functions: None, completions: None, default_completion: None, action_ctx: None, functions_preamble: None, honor_gitignore: false, hl_names: Vec::new() };
+        let provider = ShellCompletionProvider { cwd: None, known_functions: None, completions: None, default_completion: None, action_ctx: None, functions_preamble: None, honor_gitignore: false, fignore: Vec::new(), force_fignore: true, hl_names: Vec::new() };
         let result = provider.complete(CompletionRequest { line: "ech", cursor: 3 });
         assert_eq!(result.word_start, 0);
         let names = display_names(result.candidates);
@@ -899,7 +962,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("readme.txt"), b"hi").unwrap();
 
-        let provider = ShellCompletionProvider { cwd: Some(&dir), known_functions: None, completions: None, default_completion: None, action_ctx: None, functions_preamble: None, honor_gitignore: false, hl_names: Vec::new() };
+        let provider = ShellCompletionProvider { cwd: Some(&dir), known_functions: None, completions: None, default_completion: None, action_ctx: None, functions_preamble: None, honor_gitignore: false, fignore: Vec::new(), force_fignore: true, hl_names: Vec::new() };
         let line = "some-dynamic-cmd read";
         let result = provider.complete(CompletionRequest { line, cursor: line.chars().count() });
         let word_start = result.word_start;
@@ -916,7 +979,7 @@ mod tests {
         let mut completions = HashMap::new();
         completions.insert("fruit".to_string(), compgen::CompgenSpec { wordlist: Some("apple avocado banana".to_string()), ..Default::default() });
         let provider =
-            ShellCompletionProvider { cwd: None, known_functions: None, completions: Some(&completions), default_completion: None, action_ctx: None, functions_preamble: None, honor_gitignore: false, hl_names: Vec::new() };
+            ShellCompletionProvider { cwd: None, known_functions: None, completions: Some(&completions), default_completion: None, action_ctx: None, functions_preamble: None, honor_gitignore: false, fignore: Vec::new(), force_fignore: true, hl_names: Vec::new() };
         let line = "fruit a";
         let result = provider.complete(CompletionRequest { line, cursor: line.chars().count() });
         assert_eq!(display_names(result.candidates), vec!["apple".to_string(), "avocado".to_string()]);
@@ -933,7 +996,7 @@ mod tests {
             default_completion: Some(&default_completion),
             action_ctx: None,
             functions_preamble: None,
-            honor_gitignore: false,
+            honor_gitignore: false, fignore: Vec::new(), force_fignore: true,
             hl_names: Vec::new(),
         };
         let line = "unknowncmd12345 def";
@@ -947,7 +1010,7 @@ mod tests {
         // completions concept at all" case, distinct from "nothing
         // registered yet" -- must fall straight through to the built-in
         // command-name-candidates path, same as today.
-        let provider = ShellCompletionProvider { cwd: None, known_functions: None, completions: None, default_completion: None, action_ctx: None, functions_preamble: None, honor_gitignore: false, hl_names: Vec::new() };
+        let provider = ShellCompletionProvider { cwd: None, known_functions: None, completions: None, default_completion: None, action_ctx: None, functions_preamble: None, honor_gitignore: false, fignore: Vec::new(), force_fignore: true, hl_names: Vec::new() };
         let line = "ech";
         let result = provider.complete(CompletionRequest { line, cursor: line.chars().count() });
         assert!(display_names(result.candidates).iter().any(|n| n == "echo"));
@@ -1146,7 +1209,7 @@ mod tests {
             default_completion: None,
             action_ctx: None,
             functions_preamble: None,
-            honor_gitignore: false,
+            honor_gitignore: false, fignore: Vec::new(), force_fignore: true,
             hl_names: Vec::new(),
         };
         let line = "bishopt --set wr";
@@ -1204,7 +1267,7 @@ mod tests {
             default_completion: None,
             action_ctx: None,
             functions_preamble: None,
-            honor_gitignore: false,
+            honor_gitignore: false, fignore: Vec::new(), force_fignore: true,
             hl_names: Vec::new(),
         };
         let line = "ssh zzz";
@@ -1228,7 +1291,7 @@ mod tests {
             default_completion: None,
             action_ctx: None,
             functions_preamble: None,
-            honor_gitignore: false,
+            honor_gitignore: false, fignore: Vec::new(), force_fignore: true,
             hl_names: Vec::new(),
         };
         let line = "scp zzz";
@@ -1249,6 +1312,8 @@ mod tests {
 
         let names = |honor| {
             let provider = ShellCompletionProvider {
+                fignore: Vec::new(),
+                force_fignore: true,
                 cwd: Some(&dir),
                 known_functions: None,
                 completions: None,
