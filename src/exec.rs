@@ -898,7 +898,7 @@ fn parse_size_spec(arg: &str) -> Option<SizeSpec> {
 
 pub struct Shell {
     pub last_status: i32,
-    functions: HashMap<String, parser::Command>,
+    pub(crate) functions: HashMap<String, parser::Command>,
     // Stack of positional-parameter frames; last() is the current scope
     // ($0 is tracked separately since it's never shifted/reassigned by calls).
     arg_frames: Vec<Vec<String>>,
@@ -916,13 +916,13 @@ pub struct Shell {
     // since only `local -a`/`-A` need scoping at all -- see
     // array_local_stack/assoc_local_stack below for how that's retrofitted
     // via save/restore instead of a parallel lookup chain.
-    arrays: HashMap<String, std::collections::BTreeMap<usize, String>>,
+    pub(crate) arrays: HashMap<String, std::collections::BTreeMap<usize, String>>,
     // Associative arrays (`declare -A name`). Kept in a separate map from
     // `arrays` since their keys are arbitrary strings, not indices -- a name
     // in `assoc_names` is looked up here instead of `arrays` everywhere an
     // array is read or written.
     assoc_arrays: HashMap<String, OrderedMap>,
-    assoc_names: std::collections::HashSet<String>,
+    pub(crate) assoc_names: std::collections::HashSet<String>,
     // `alias name=value`, expanded for real -- see
     // `lexer::expand_aliases`.
     //
@@ -1031,7 +1031,7 @@ pub struct Shell {
     // pushd/popd/dirs: does NOT include the current directory itself (bash
     // convention -- `dirs` prints cwd first, then this stack). `+N`/`-N`
     // rotation forms aren't implemented, a scoped gap.
-    dir_stack: Vec<String>,
+    pub(crate) dir_stack: Vec<String>,
     // shopt -s/-u NAME: explicit overrides only, keyed by name -- absent
     // means "use that name's own default from KNOWN_SHOPT_OPTIONS", not
     // "off" (several real bash options, e.g. cmdhist/promptvars, default
@@ -1087,9 +1087,9 @@ pub struct Shell {
     // introspection (`complete -p`/`-r`/`compopt`) and, via a per-prompt
     // snapshot repl.rs builds the same way as cwd/known_functions, by
     // bish's own interactive Tab completion (ShellCompletionProvider).
-    completions: std::collections::HashMap<String, compgen::CompgenSpec>,
+    pub(crate) completions: std::collections::HashMap<String, compgen::CompgenSpec>,
     // `complete -D`: the fallback spec used when no exact name matches.
-    default_completion: Option<compgen::CompgenSpec>,
+    pub(crate) default_completion: Option<compgen::CompgenSpec>,
     // `readonly NAME`. Checked by assign_var, the single write path plain
     // assignment/local/export/declare/arithmetic-assignment/read/getopts
     // all funnel through, so marking a name here blocks writes everywhere
@@ -4038,7 +4038,7 @@ impl Shell {
     // name in the "bish: NAME: ..." prefix), and picks the matching exit
     // code (2 for every parse error, matching real bash's own usage-error
     // convention).
-    fn report_compgen_parse_error(&mut self, who: &str, err: &compgen::ParseError) -> i32 {
+    pub(crate) fn report_compgen_parse_error(&mut self, who: &str, err: &compgen::ParseError) -> i32 {
         match err {
             compgen::ParseError::UnknownAction(name) => sh_eprintln!(self, "bish: {who}: {name}: invalid action name"),
             compgen::ParseError::UnknownOption(c) => sh_eprintln!(self, "bish: {who}: -{c}: invalid option"),
@@ -4048,135 +4048,7 @@ impl Shell {
         2
     }
 
-    // compgen [-V varname] [-abcdefgjksuv] [-o option] [-A action]
-    // [-G globpat] [-W wordlist] [-F function] [-C command] [-X filterpat]
-    // [-P prefix] [-S suffix] [--] [word] -- bash's own completion-
-    // generator builtin, built on compgen.rs's shared spec parser/resolver
-    // (see that module's own doc comment for the design and every
-    // reverse-engineered semantic detail: which sources get filtered by
-    // `word` and which don't, the exact -F/-C calling convention, `-o`'s
-    // names being validated but otherwise inert).
-    //
-    // `-V varname` is compgen's own option (not part of the shared spec
-    // grammar, since `complete` has no equivalent) -- stripped out before
-    // handing the rest to compgen::parse_spec_args.
-    //
-    // Exit status is success unless a source was actually requested and
-    // it produced nothing
-    // (confirmed against real bash: bare `compgen`/a lone trailing word
-    // with no -A/-G/-W/-F/-C at all always exits 0 even though it prints
-    // nothing, but e.g. `compgen -W "" -- x` -- a real source, zero
-    // matches -- exits 1). Applies the same way whether or not -V
-    // redirected the output into an array.
-    fn run_compgen(&mut self, args: &[String]) -> i32 {
-        let mut varname: Option<String> = None;
-        let mut rest: Vec<String> = Vec::new();
-        let mut idx = 0;
-        while idx < args.len() {
-            if args[idx] == "-V" {
-                let Some(v) = args.get(idx + 1) else {
-                    sh_eprintln!(self, "bish: compgen: -V: option requires an argument");
-                    return 2;
-                };
-                varname = Some(v.clone());
-                idx += 2;
-            } else {
-                rest.push(args[idx].clone());
-                idx += 1;
-            }
-        }
-        let (spec, positionals) = match compgen::parse_spec_args(&rest) {
-            Ok(v) => v,
-            Err(e) => return self.report_compgen_parse_error("compgen", &e),
-        };
-        let word = positionals.last().cloned().unwrap_or_default();
-        let had_source = spec.has_any_source();
-        // A nicer, specific diagnostic for the overwhelmingly common
-        // mistake (a typo'd function name) than the silent "just no
-        // candidates" compgen::run_external falls back to for any
-        // subprocess failure -- that tolerance exists for the interactive
-        // Tab-completion path, where a hard error would be disruptive, but
-        // this standalone builtin can and should still say what went
-        // wrong (confirmed against real bash: `compgen -F nosuchfunc`
-        // prints "function not found" and exits 1).
-        if let Some(name) = &spec.function
-            && !self.functions.contains_key(name)
-        {
-            sh_eprintln!(self, "bish: compgen: {name}: function not found");
-            return 1;
-        }
-        let ctx = self.action_context();
-        let preamble = self.functions_preamble();
-        let candidates = compgen::resolve_spec(&spec, &word, &ctx, &self.cwd, &preamble);
-
-        let empty = candidates.is_empty();
-        if let Some(var) = varname {
-            self.assoc_names.remove(&var);
-            self.arrays.insert(var, candidates.into_iter().enumerate().collect());
-        } else {
-            for c in &candidates {
-                sh_println!(self, "{c}");
-            }
-        }
-        if empty && had_source {
-            1
-        } else {
-            0
-        }
-    }
-
-    // complete [-p|-r] [options] name... | complete -D [options] --
-    // registers/lists/removes the completion specs bish's own interactive
-    // Tab completion consults (see ShellCompletionProvider's own doc
-    // comment on how) for a given command name, or the `-D` default spec
-    // used when no exact name matches. Shares its entire option grammar
-    // with `compgen` (compgen.rs's parse_spec_args) -- only `-p`/`-r`/`-D`
-    // themselves, and taking one-or-more trailing NAMEs instead of a
-    // single trailing word, are complete's own.
-    //
-    // `-p`/`-r` are detected as the very first argument (confirmed against
-    // real bash: always used alone, never mixed with the rest of the
-    // option grammar in practice) and take every remaining argument as a
-    // literal NAME to print/remove -- no names at all means "every
-    // registered spec" for both. The literal name "-D" in either list
-    // targets the default spec instead of a real command name (confirmed:
-    // `complete -p -D` prints the default spec's own line).
-    //
-    // Registration always fully replaces whatever spec a name already had
-    // (confirmed: re-registering `cmd1` with just `-W x` drops its
-    // previous -X/-P/-S/-o entirely) -- a plain HashMap::insert overwrite,
-    // never a merge.
-    fn run_complete(&mut self, args: &[String]) -> i32 {
-        match args.first().map(String::as_str) {
-            None => {
-                self.print_all_completions();
-                return 0;
-            }
-            Some("-p") => return self.print_completions(&args[1..]),
-            Some("-r") => return self.remove_completions(&args[1..]),
-            _ => {}
-        }
-        let is_default = args.iter().any(|a| a == "-D");
-        let filtered: Vec<String> = args.iter().filter(|a| *a != "-D").cloned().collect();
-        let (spec, names) = match compgen::parse_spec_args(&filtered) {
-            Ok(v) => v,
-            Err(e) => return self.report_compgen_parse_error("complete", &e),
-        };
-        if is_default {
-            self.default_completion = Some(spec);
-            return 0;
-        }
-        if names.is_empty() {
-            sh_eprintln!(self, "bish: complete: usage: complete [-p|-r] [name ...] | complete -D [options] | complete [options] name [name ...]");
-            return 2;
-        }
-        for name in names {
-            self.completions.insert(name, spec.clone());
-        }
-        0
-    }
-
-    fn print_all_completions(&mut self) {
+    pub(crate) fn print_all_completions(&mut self) {
         let mut names: Vec<&String> = self.completions.keys().collect();
         names.sort();
         for name in names {
@@ -4187,7 +4059,7 @@ impl Shell {
         }
     }
 
-    fn print_completions(&mut self, names: &[String]) -> i32 {
+    pub(crate) fn print_completions(&mut self, names: &[String]) -> i32 {
         if names.is_empty() {
             self.print_all_completions();
             return 0;
@@ -4215,7 +4087,7 @@ impl Shell {
         status
     }
 
-    fn remove_completions(&mut self, names: &[String]) -> i32 {
+    pub(crate) fn remove_completions(&mut self, names: &[String]) -> i32 {
         if names.is_empty() {
             self.completions.clear();
             self.default_completion = None;
@@ -4236,66 +4108,6 @@ impl Shell {
             }
         }
         status
-    }
-
-    // compopt [-o option] [+o option] [name] -- adjusts a registered
-    // spec's own stored `-o` list in place (add for `-o`, remove for
-    // `+o`), leaving every other field untouched. Real bash's own compopt
-    // with no `name` at all only makes sense called from inside an
-    // in-progress completion function (adjusting *that* completion's
-    // options); bish's completion generation never calls back into a
-    // running compopt invocation that way, so -- matching real bash's own
-    // behavior outside that context -- this always errors when no name is
-    // given (confirmed: `compopt -o nospace` outside a completion function
-    // prints "not currently executing completion function" and exits 1).
-    fn run_compopt(&mut self, args: &[String]) -> i32 {
-        let mut adds: Vec<String> = Vec::new();
-        let mut removes: Vec<String> = Vec::new();
-        let mut name: Option<&str> = None;
-        let mut idx = 0;
-        while idx < args.len() {
-            match args[idx].as_str() {
-                "-o" => {
-                    let Some(v) = args.get(idx + 1) else {
-                        sh_eprintln!(self, "bish: compopt: -o: option requires an argument");
-                        return 2;
-                    };
-                    if !compgen::O_OPTIONS.contains(&v.as_str()) {
-                        sh_eprintln!(self, "bish: compopt: {v}: invalid option name");
-                        return 2;
-                    }
-                    adds.push(v.clone());
-                    idx += 2;
-                }
-                "+o" => {
-                    let Some(v) = args.get(idx + 1) else {
-                        sh_eprintln!(self, "bish: compopt: +o: option requires an argument");
-                        return 2;
-                    };
-                    removes.push(v.clone());
-                    idx += 2;
-                }
-                other => {
-                    name = Some(other);
-                    idx += 1;
-                }
-            }
-        }
-        let Some(name) = name else {
-            sh_eprintln!(self, "bish: compopt: not currently executing completion function");
-            return 1;
-        };
-        let Some(spec) = self.completions.get_mut(name) else {
-            sh_eprintln!(self, "bish: compopt: {name}: no completion specification");
-            return 1;
-        };
-        for o in adds {
-            if !spec.opts.contains(&o) {
-                spec.opts.push(o);
-            }
-        }
-        spec.opts.retain(|o| !removes.contains(o));
-        0
     }
 
     // Fish-style abbreviations: `self.abbrs`'s own doc comment covers the
@@ -5086,62 +4898,7 @@ impl Shell {
     // reuse run_cd's actual directory-change logic -- path resolution,
     // OLDPWD/PWD updates, error reporting -- rather than duplicating it.
     pub fn cd_to(&mut self, path: &std::path::Path) -> i32 {
-        self.run_cd(&[path.to_string_lossy().into_owned()])
-    }
-
-    fn run_cd(&mut self, args: &[String]) -> i32 {
-        let old = self.cwd.to_string_lossy().into_owned();
-        let target = if let Some(dir) = args.first() {
-            if dir == "-" {
-                match std::env::var("OLDPWD") {
-                    Ok(p) => {
-                        sh_println!(self, "{}", p);
-                        p
-                    }
-                    Err(_) => {
-                        sh_eprintln!(self, "cd: OLDPWD not set");
-                        return 1;
-                    }
-                }
-            } else {
-                dir.clone()
-            }
-        } else {
-            match std::env::var("HOME") {
-                Ok(h) => h,
-                Err(_) => {
-                    sh_eprintln!(self, "cd: HOME not set");
-                    return 1;
-                }
-            }
-        };
-        let _ = old;
-        // `CDPATH`: a search path for `cd`, so `cd bish` from anywhere
-        // finds `~/src/bish`. Only for a plain relative name -- an
-        // absolute path, or one that already says `.`/`..`, means
-        // exactly where it says and is never searched for.
-        //
-        // A hit that did not come from the current directory prints
-        // where it landed, which is bash's own behaviour and not a
-        // courtesy: without it, `cd bish` silently putting you somewhere
-        // other than `./bish` would be the worst kind of surprise.
-        let (target, from_cdpath) = self.resolve_cdpath(target);
-        match self.change_directory(std::path::Path::new(&target)) {
-            Ok(()) => {
-                if from_cdpath {
-                    sh_println!(self, "{}", self.cwd.display());
-                }
-                0
-            }
-            Err(e) if e == RESTRICTED => {
-                sh_eprintln!(self, "bish: cd: restricted");
-                1
-            }
-            Err(e) => {
-                sh_eprintln!(self, "cd: {}: {}", target, e);
-                1
-            }
-        }
+        crate::builtins::dirs::run_cd(self, &[path.to_string_lossy().into_owned()])
     }
 
     /// `target` resolved against `CDPATH`, and whether that is where it
@@ -5156,7 +4913,7 @@ impl Shell {
     /// announced -- bash's rule is that a **non-empty** component
     /// announces, so a literal `.` in `CDPATH` does print, even though
     /// it lands exactly where a plain `cd` would have.
-    fn resolve_cdpath(&mut self, target: String) -> (String, bool) {
+    pub(crate) fn resolve_cdpath(&mut self, target: String) -> (String, bool) {
         let path = std::path::Path::new(&target);
         if path.is_absolute() || target.starts_with('.') || target.is_empty() {
             return (target, false);
@@ -5315,56 +5072,6 @@ impl Shell {
         0
     }
 
-    fn run_pushd(&mut self, args: &[String]) -> i32 {
-        let target = match args.iter().find(|a| !a.starts_with('-')) {
-            Some(d) => d.clone(),
-            None => match self.dir_stack.first() {
-                Some(d) => d.clone(),
-                None => {
-                    sh_eprintln!(self, "bish: pushd: no other directory");
-                    return 1;
-                }
-            },
-        };
-        if !args.iter().any(|a| !a.starts_with('-')) {
-            // Bare `pushd`: rotate -- cd into the current top-of-stack,
-            // then push the old cwd back onto the front, net-swapping them.
-            self.dir_stack.remove(0);
-        }
-        let old_cwd = self.cwd.to_string_lossy().into_owned();
-        if self.run_cd(&[target]) != 0 {
-            return 1;
-        }
-        self.dir_stack.insert(0, old_cwd);
-        self.print_dirs(false);
-        0
-    }
-
-    fn run_popd(&mut self, _args: &[String]) -> i32 {
-        let target = match self.dir_stack.first() {
-            Some(d) => d.clone(),
-            None => {
-                sh_eprintln!(self, "bish: popd: directory stack empty");
-                return 1;
-            }
-        };
-        if self.run_cd(&[target]) != 0 {
-            return 1;
-        }
-        self.dir_stack.remove(0);
-        self.print_dirs(false);
-        0
-    }
-
-    fn run_dirs(&mut self, args: &[String]) -> i32 {
-        if args.iter().any(|a| a == "-c") {
-            self.dir_stack.clear();
-            return 0;
-        }
-        self.print_dirs(args.iter().any(|a| a == "-v"));
-        0
-    }
-
     fn collapse_home(path: &str) -> String {
         if let Ok(home) = std::env::var("HOME") {
             if !home.is_empty() {
@@ -5379,7 +5086,7 @@ impl Shell {
         path.to_string()
     }
 
-    fn print_dirs(&self, vertical: bool) {
+    pub(crate) fn print_dirs(&self, vertical: bool) {
         let mut all = vec![self.cwd.to_string_lossy().into_owned()];
         all.extend(self.dir_stack.iter().cloned());
         if vertical {
@@ -7190,7 +6897,7 @@ impl Shell {
                 }
                 return ExecResult::Status(0);
             }
-            "cd" => return ExecResult::Status(self.run_cd(&argv[1..])),
+            "cd" => return ExecResult::Status(crate::builtins::dirs::run_cd(self, &argv[1..])),
             // `e [ARG...]`: bubbles up via ExecResult::Edit -- see its
             // own doc comment, and Fg's, for why this can't just be
             // driven from here directly. The arguments are passed on
@@ -7285,9 +6992,9 @@ impl Shell {
             // why) -- `theme` (begin/end a theme declaration) is the
             // first subcommand.
             "::bish" => return self.run_bish(&argv[1..]),
-            "compgen" => return ExecResult::Status(self.run_compgen(&argv[1..])),
-            "complete" => return ExecResult::Status(self.run_complete(&argv[1..])),
-            "compopt" => return ExecResult::Status(self.run_compopt(&argv[1..])),
+            "compgen" => return ExecResult::Status(crate::builtins::completion::run_compgen(self, &argv[1..])),
+            "complete" => return ExecResult::Status(crate::builtins::completion::run_complete(self, &argv[1..])),
+            "compopt" => return ExecResult::Status(crate::builtins::completion::run_compopt(self, &argv[1..])),
             // Available in command mode, and at any prompt a real window
             // manager is behind. It used to be
             // command-mode-exclusive and is again, but for a better
@@ -7305,9 +7012,9 @@ impl Shell {
             "window" | "win" if self.restrict_to_builtins => {
                 return self.run_window(&argv[1..]);
             }
-            "pushd" => return ExecResult::Status(self.run_pushd(&argv[1..])),
-            "popd" => return ExecResult::Status(self.run_popd(&argv[1..])),
-            "dirs" => return ExecResult::Status(self.run_dirs(&argv[1..])),
+            "pushd" => return ExecResult::Status(crate::builtins::dirs::run_pushd(self, &argv[1..])),
+            "popd" => return ExecResult::Status(crate::builtins::dirs::run_popd(self, &argv[1..])),
+            "dirs" => return ExecResult::Status(crate::builtins::dirs::run_dirs(self, &argv[1..])),
             // `export` is equivalent to `declare -x` (real bash documents
             // it that way) -- routing through run_declare means it shares
             // -x's local-variable-mirroring behavior instead of the
@@ -12185,7 +11892,7 @@ enum BishOptValue {
 // ...) is what actually pins it to a real, terminal-independent color.
 // Shell::change_directory's own "refused by `set -r`" answer -- matched
 // by the `cd` builtin so it can keep printing the message it always has.
-const RESTRICTED: &str = "restricted";
+pub(crate) const RESTRICTED: &str = "restricted";
 
 const KNOWN_BISHOPTS: &[(&str, BishOptDefault)] = &[
     // Which `::bish theme`-declared theme (if any) is currently active --
@@ -13742,11 +13449,11 @@ mod tests {
     fn compgen_wordlist_preserves_input_order_and_filters_by_prefix() {
         let mut shell = Shell::new();
         let buf = capture_output(&mut shell);
-        assert_eq!(shell.run_compgen(&strs(&["-W", "banana apple cherry apple"])), 0);
+        assert_eq!(crate::builtins::completion::run_compgen(&mut shell, &strs(&["-W", "banana apple cherry apple"])), 0);
         assert_eq!(buf.borrow().as_str(), "banana\napple\ncherry\napple\n", "no sort, no dedup -- matches real bash");
 
         buf.borrow_mut().clear();
-        assert_eq!(shell.run_compgen(&strs(&["-W", "banana apple cherry", "--", "a"])), 0);
+        assert_eq!(crate::builtins::completion::run_compgen(&mut shell, &strs(&["-W", "banana apple cherry", "--", "a"])), 0);
         assert_eq!(buf.borrow().as_str(), "apple\n");
     }
 
@@ -13756,24 +13463,24 @@ mod tests {
         let _buf = capture_output(&mut shell);
         // No source at all -- always exits 0, even with a trailing word and
         // even though nothing gets printed.
-        assert_eq!(shell.run_compgen(&[]), 0);
-        assert_eq!(shell.run_compgen(&strs(&["zzz"])), 0);
+        assert_eq!(crate::builtins::completion::run_compgen(&mut shell, &[]), 0);
+        assert_eq!(crate::builtins::completion::run_compgen(&mut shell, &strs(&["zzz"])), 0);
         // A real source that produced zero matches -- exits 1.
-        assert_eq!(shell.run_compgen(&strs(&["-W", "", "--", "x"])), 1);
-        assert_eq!(shell.run_compgen(&strs(&["-W", "abc def", "--", "zzz"])), 1);
+        assert_eq!(crate::builtins::completion::run_compgen(&mut shell, &strs(&["-W", "", "--", "x"])), 1);
+        assert_eq!(crate::builtins::completion::run_compgen(&mut shell, &strs(&["-W", "abc def", "--", "zzz"])), 1);
         // A real source with a match -- exits 0.
-        assert_eq!(shell.run_compgen(&strs(&["-W", "abc def", "--", "a"])), 0);
+        assert_eq!(crate::builtins::completion::run_compgen(&mut shell, &strs(&["-W", "abc def", "--", "a"])), 0);
     }
 
     #[test]
     fn compgen_x_filter_excludes_by_default_and_keeps_only_matches_when_negated() {
         let mut shell = Shell::new();
         let buf = capture_output(&mut shell);
-        shell.run_compgen(&strs(&["-W", "apple banana avocado", "-X", "a*"]));
+        crate::builtins::completion::run_compgen(&mut shell, &strs(&["-W", "apple banana avocado", "-X", "a*"]));
         assert_eq!(buf.borrow().as_str(), "banana\n");
 
         buf.borrow_mut().clear();
-        shell.run_compgen(&strs(&["-W", "apple banana avocado", "-X", "!a*"]));
+        crate::builtins::completion::run_compgen(&mut shell, &strs(&["-W", "apple banana avocado", "-X", "!a*"]));
         assert_eq!(buf.borrow().as_str(), "apple\navocado\n");
     }
 
@@ -13781,7 +13488,7 @@ mod tests {
     fn compgen_prefix_and_suffix_wrap_every_candidate() {
         let mut shell = Shell::new();
         let buf = capture_output(&mut shell);
-        shell.run_compgen(&strs(&["-P", "<", "-S", ">", "-W", "a b"]));
+        crate::builtins::completion::run_compgen(&mut shell, &strs(&["-P", "<", "-S", ">", "-W", "a b"]));
         assert_eq!(buf.borrow().as_str(), "<a>\n<b>\n");
     }
 
@@ -13789,7 +13496,7 @@ mod tests {
     fn compgen_keyword_action_lists_bish_reserved_words_only() {
         let mut shell = Shell::new();
         let buf = capture_output(&mut shell);
-        shell.run_compgen(&strs(&["-A", "keyword"]));
+        crate::builtins::completion::run_compgen(&mut shell, &strs(&["-A", "keyword"]));
         let owned: Vec<String> = buf.borrow().lines().map(str::to_string).collect();
         assert!(owned.iter().any(|n| n == "if"), "{owned:?}");
         assert!(owned.iter().any(|n| n == "done"), "{owned:?}");
@@ -13804,7 +13511,7 @@ mod tests {
     fn compgen_signal_action_includes_exit_pseudo_signal_and_sig_prefixed_names() {
         let mut shell = Shell::new();
         let buf = capture_output(&mut shell);
-        shell.run_compgen(&strs(&["-A", "signal"]));
+        crate::builtins::completion::run_compgen(&mut shell, &strs(&["-A", "signal"]));
         let names: Vec<String> = buf.borrow().lines().map(str::to_string).collect();
         assert_eq!(names.first().map(String::as_str), Some("EXIT"));
         assert!(names.iter().any(|n| n == "SIGTERM"), "{names:?}");
@@ -13818,11 +13525,11 @@ mod tests {
     fn compgen_builtin_and_b_flag_agree_and_match_known_builtins() {
         let mut shell = Shell::new();
         let buf = capture_output(&mut shell);
-        shell.run_compgen(&strs(&["-A", "builtin"]));
+        crate::builtins::completion::run_compgen(&mut shell, &strs(&["-A", "builtin"]));
         let via_a: Vec<String> = buf.borrow().lines().map(str::to_string).collect();
 
         buf.borrow_mut().clear();
-        shell.run_compgen(&strs(&["-b"]));
+        crate::builtins::completion::run_compgen(&mut shell, &strs(&["-b"]));
         let via_flag: Vec<String> = buf.borrow().lines().map(str::to_string).collect();
 
         assert_eq!(via_a, via_flag);
@@ -13834,7 +13541,7 @@ mod tests {
     fn compgen_shorthand_flags_combine_into_one_token() {
         let mut shell = Shell::new();
         let buf = capture_output(&mut shell);
-        shell.run_compgen(&strs(&["-ab"]));
+        crate::builtins::completion::run_compgen(&mut shell, &strs(&["-ab"]));
         let names: Vec<String> = buf.borrow().lines().map(str::to_string).collect();
         assert!(names.iter().any(|n| n == "cd"), "builtin action missing: {names:?}");
     }
@@ -13843,11 +13550,11 @@ mod tests {
     fn compgen_setopt_and_shopt_actions_mirror_their_own_registries() {
         let mut shell = Shell::new();
         let buf = capture_output(&mut shell);
-        shell.run_compgen(&strs(&["-A", "setopt"]));
+        crate::builtins::completion::run_compgen(&mut shell, &strs(&["-A", "setopt"]));
         assert_eq!(buf.borrow().lines().collect::<Vec<_>>(), SET_O_OPTIONS.to_vec());
 
         buf.borrow_mut().clear();
-        shell.run_compgen(&strs(&["-A", "shopt"]));
+        crate::builtins::completion::run_compgen(&mut shell, &strs(&["-A", "shopt"]));
         let names: Vec<String> = buf.borrow().lines().map(str::to_string).collect();
         let expected: Vec<String> = KNOWN_SHOPT_OPTIONS.iter().map(|(n, _)| n.to_string()).collect();
         assert_eq!(names, expected);
@@ -13857,17 +13564,17 @@ mod tests {
     fn compgen_rejects_an_unknown_action_name_and_an_unknown_option() {
         let mut shell = Shell::new();
         let _buf = capture_output(&mut shell);
-        assert_eq!(shell.run_compgen(&strs(&["-A", "bogus"])), 2);
-        assert_eq!(shell.run_compgen(&strs(&["-Z"])), 2);
-        assert_eq!(shell.run_compgen(&strs(&["-o", "bogus"])), 2);
-        assert_eq!(shell.run_compgen(&strs(&["-o", "nosort", "-W", "a"])), 0, "a recognized -o name must not error");
+        assert_eq!(crate::builtins::completion::run_compgen(&mut shell, &strs(&["-A", "bogus"])), 2);
+        assert_eq!(crate::builtins::completion::run_compgen(&mut shell, &strs(&["-Z"])), 2);
+        assert_eq!(crate::builtins::completion::run_compgen(&mut shell, &strs(&["-o", "bogus"])), 2);
+        assert_eq!(crate::builtins::completion::run_compgen(&mut shell, &strs(&["-o", "nosort", "-W", "a"])), 0, "a recognized -o name must not error");
     }
 
     #[test]
     fn compgen_f_option_with_a_nonexistent_function_errors_and_exits_1() {
         let mut shell = Shell::new();
         let buf = capture_output(&mut shell);
-        assert_eq!(shell.run_compgen(&strs(&["-F", "not_a_real_function", "--", "a"])), 1);
+        assert_eq!(crate::builtins::completion::run_compgen(&mut shell, &strs(&["-F", "not_a_real_function", "--", "a"])), 1);
         // Capture is a combined stdout+stderr sink (see OutputSink::Capture's
         // own doc comment), so the error message lands right here too.
         assert_eq!(buf.borrow().as_str(), "bish: compgen: not_a_real_function: function not found\n");
@@ -13877,11 +13584,11 @@ mod tests {
     fn compgen_v_option_stores_into_an_indexed_array_instead_of_printing() {
         let mut shell = Shell::new();
         let buf = capture_output(&mut shell);
-        assert_eq!(shell.run_compgen(&strs(&["-V", "myarr", "-W", "a b c", "--", "a"])), 0);
+        assert_eq!(crate::builtins::completion::run_compgen(&mut shell, &strs(&["-V", "myarr", "-W", "a b c", "--", "a"])), 0);
         assert_eq!(buf.borrow().as_str(), "", "must not print when -V is given");
         assert_eq!(shell.arrays.get("myarr").map(|m| m.values().cloned().collect::<Vec<_>>()), Some(vec!["a".to_string()]));
 
-        assert_eq!(shell.run_compgen(&strs(&["-V", "myarr", "-W", "a b c", "--", "zzz"])), 1, "same had-a-source-and-got-nothing rule applies under -V");
+        assert_eq!(crate::builtins::completion::run_compgen(&mut shell, &strs(&["-V", "myarr", "-W", "a b c", "--", "zzz"])), 1, "same had-a-source-and-got-nothing rule applies under -V");
         assert_eq!(shell.arrays.get("myarr").map(|m| m.len()), Some(0));
     }
 
@@ -13891,9 +13598,9 @@ mod tests {
         // Same "a source was given and yielded nothing" rule as any other
         // empty action -- `disabled` is a real, meaningfully-empty source,
         // not "no source at all", so this still exits 1.
-        assert_eq!(shell.run_compgen(&strs(&["-A", "disabled"])), 1);
+        assert_eq!(crate::builtins::completion::run_compgen(&mut shell, &strs(&["-A", "disabled"])), 1);
         let buf = capture_output(&mut shell);
-        shell.run_compgen(&strs(&["-A", "enabled"]));
+        crate::builtins::completion::run_compgen(&mut shell, &strs(&["-A", "enabled"]));
         let names: Vec<String> = buf.borrow().lines().map(str::to_string).collect();
         assert_eq!(names.len(), KNOWN_BUILTINS.len());
     }
@@ -13904,7 +13611,7 @@ mod tests {
         shell.arrays.insert("idxarr".to_string(), std::collections::BTreeMap::new());
         shell.assoc_arrays.insert("assocarr".to_string(), OrderedMap::default());
         let buf = capture_output(&mut shell);
-        shell.run_compgen(&strs(&["-A", "arrayvar"]));
+        crate::builtins::completion::run_compgen(&mut shell, &strs(&["-A", "arrayvar"]));
         let names: Vec<String> = buf.borrow().lines().map(str::to_string).collect();
         assert!(names.iter().any(|n| n == "idxarr"), "{names:?}");
         assert!(names.iter().any(|n| n == "assocarr"), "{names:?}");
@@ -13919,7 +13626,7 @@ mod tests {
         unsafe { std::env::set_var("BISH_COMPGEN_TEST_VAR", "1") };
         shell.var_scopes.push(HashMap::from([("local_only_var".to_string(), "x".to_string())]));
         let buf = capture_output(&mut shell);
-        shell.run_compgen(&strs(&["-A", "variable"]));
+        crate::builtins::completion::run_compgen(&mut shell, &strs(&["-A", "variable"]));
         let names: Vec<String> = buf.borrow().lines().map(str::to_string).collect();
         unsafe { std::env::remove_var("BISH_COMPGEN_TEST_VAR") };
         assert!(names.iter().any(|n| n == "BISH_COMPGEN_TEST_VAR"), "{names:?}");
@@ -13932,11 +13639,11 @@ mod tests {
         shell.aliases.push(("myalias".to_string(), "ls -la".to_string()));
         shell.run_source_here("myfunc() { :; }", "<test>");
         let buf = capture_output(&mut shell);
-        shell.run_compgen(&strs(&["-A", "alias"]));
+        crate::builtins::completion::run_compgen(&mut shell, &strs(&["-A", "alias"]));
         assert_eq!(buf.borrow().as_str(), "myalias\n");
 
         buf.borrow_mut().clear();
-        shell.run_compgen(&strs(&["-A", "function"]));
+        crate::builtins::completion::run_compgen(&mut shell, &strs(&["-A", "function"]));
         assert_eq!(buf.borrow().as_str(), "myfunc\n");
     }
 
@@ -13956,7 +13663,7 @@ mod tests {
         let pattern = format!("{}/*.rs", dir.display());
         let mut shell = Shell::new();
         let buf = capture_output(&mut shell);
-        let status = shell.run_compgen(&strs(&["-G", &pattern]));
+        let status = crate::builtins::completion::run_compgen(&mut shell, &strs(&["-G", &pattern]));
 
         std::fs::remove_dir_all(&dir).ok();
 
@@ -13974,11 +13681,11 @@ mod tests {
         let mut shell = Shell::new();
         shell.cwd = dir.clone();
         let buf = capture_output(&mut shell);
-        shell.run_compgen(&strs(&["-f", "--", "sub/in"]));
+        crate::builtins::completion::run_compgen(&mut shell, &strs(&["-f", "--", "sub/in"]));
         let split_result = buf.borrow().clone();
 
         buf.borrow_mut().clear();
-        shell.run_compgen(&strs(&["-f"]));
+        crate::builtins::completion::run_compgen(&mut shell, &strs(&["-f"]));
         let bare_result = buf.borrow().clone();
 
         std::fs::remove_dir_all(&dir).ok();

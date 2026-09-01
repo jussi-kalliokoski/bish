@@ -11,6 +11,8 @@
 // `exec.rs` keeps the dispatch (`dispatch_builtin_or_external_impl`)
 // and everything a builtin is dispatched *from*.
 
+pub(crate) mod completion;
+pub(crate) mod dirs;
 pub(crate) mod jobs;
 pub(crate) mod limits;
 
