@@ -702,6 +702,38 @@ impl snippet::SnippetHost for LineEditor {
 // underlined. Both are drawn over whatever the syntax highlighter made
 // of the text underneath, since a half-finished command line is
 // routinely not valid syntax yet.
+// The char index in `ed.buf` under real-terminal column `col`, or None
+// if that column is the prompt itself or past the end of the line.
+//
+// Goes through `char_at_col` rather than subtracting indices, because a
+// column is a *display* position: one CJK character is two columns wide
+// and a combining mark is none, so the two only coincide for plain
+// ASCII.
+fn buf_index_at_column(prompt: &str, ed: &LineEditor, col_origin: usize, col: usize) -> Option<usize> {
+    let prompt_len = visible_len(prompt);
+    let text_start = col_origin + prompt_len;
+    if col < text_start {
+        return None;
+    }
+    let idx = crate::bishedit::unicode_width::char_at_col(&ed.buf, col - text_start);
+    (idx <= ed.buf.len()).then_some(idx)
+}
+
+// A mouse selection, drawn the way a Visual selection is everywhere
+// else: reversed, over the columns the selected characters occupy.
+fn selection_layer(ed: &LineEditor, range: (usize, usize)) -> Vec<StyledSpan> {
+    let (from, to) = (range.0.min(range.1), range.0.max(range.1).min(ed.buf.len()));
+    if from >= to {
+        return Vec::new();
+    }
+    vec![StyledSpan {
+        start: from,
+        end: to,
+        fg: vt100::Color::Default,
+        attrs: vt100::CellAttrs { reverse: true, ..vt100::CellAttrs::default() },
+    }]
+}
+
 fn snippet_layer(live: &LiveSnippet) -> Vec<StyledSpan> {
     live.holes()
         .into_iter()
@@ -1570,6 +1602,14 @@ pub fn read_line(
     // run_one_shot_normal_command's own doc comments) -- reprocessed here
     // through the exact same match arms that would have handled it had it
     // been read directly, rather than duplicating that handling.
+    // Mouse selection over the prompt line: the char index the drag
+    // started at, and the range it currently covers. Held here rather
+    // than on `LineEditor` (which is a buffer and a cursor, nothing
+    // else) for the same reason `marks` and `selections` are -- it is
+    // scoped to this one line and meaningless past it.
+    let mut drag_anchor: Option<usize> = None;
+    let mut mouse_selection: Option<(usize, usize)> = None;
+
     let mut pending_key: Option<Key> = None;
 
     loop {
@@ -1587,7 +1627,8 @@ pub fn read_line(
                 // already produced is not a byte on stdin.
                 while mapped.is_empty() && !term::stdin_ready(IDLE_POLL_MS) {
                     if on_idle() {
-                        let overlay = snippet.as_ref().map(snippet_layer).unwrap_or_default();
+                        let mut overlay = snippet.as_ref().map(snippet_layer).unwrap_or_default();
+        overlay.extend(mouse_selection.into_iter().flat_map(|r| selection_layer(&ed, r)));
                         redraw_with_completion_row(
                             prompt,
                             &ed,
@@ -1662,6 +1703,34 @@ pub fn read_line(
             )
         {
             snippet.take().unwrap().accept(&mut ed);
+        }
+
+        // Select-and-type: a mouse selection standing when a printable
+        // key or Backspace arrives is replaced by what is typed, the
+        // same rule the file editor's Insert mode already follows. Any
+        // other key simply drops it -- moving the cursor or reaching for
+        // history is not something to do *to* a selection.
+        //
+        // Mouse events themselves are exempt, or a drag would clear the
+        // selection it is in the middle of making.
+        if let Some((a, b)) = mouse_selection
+            && !matches!(key, Key::Mouse(_))
+        {
+            let (from, to) = (a.min(b), a.max(b).min(ed.buf.len()));
+            if from < to && matches!(key, Key::Char(_) | Key::Backspace | Key::Delete) {
+                ed.buf.drain(from..to);
+                ed.cursor = from;
+            }
+            mouse_selection = None;
+            // Backspace's whole job was deleting the selection; letting
+            // it fall through would eat a further character.
+            if matches!(key, Key::Backspace | Key::Delete) && from < to {
+                let overlay = snippet.as_ref().map(snippet_layer).unwrap_or_default();
+                redraw_with_completion_row(
+                    prompt, &ed, "", None, menu_was_shown, menu_capable, row_origin, col_origin, width, ctx, &overlay,
+                )?;
+                continue;
+            }
         }
 
         match key {
@@ -2007,6 +2076,34 @@ pub fn read_line(
             // mouse events (drags, releases, wheel, other buttons) fall
             // through to the catch-all just below, exactly as before --
             // safely decoded, silently ignored.
+            // A click on this prompt's *own* line places the cursor and
+            // arms a drag, rather than bubbling up: the caller's
+            // hit-test is about tabs, panes and dividers, and none of
+            // those are here. Anything landing elsewhere still bubbles,
+            // exactly as before.
+            Key::Mouse(ev)
+                if ev.is_left_click()
+                    && row_origin.is_some_and(|(prompt_row, _)| (ev.row as usize).saturating_sub(1) == prompt_row)
+                    && let Some(idx) = buf_index_at_column(prompt, &ed, col_origin, (ev.col as usize).saturating_sub(1)) =>
+            {
+                ed.cursor = idx;
+                drag_anchor = Some(idx);
+                mouse_selection = None;
+            }
+            // ...and dragging from it selects. The selection is what a
+            // later keystroke replaces and what Ctrl-E's own Visual
+            // machinery can act on -- one selection concept on this
+            // line, not two.
+            Key::Mouse(ev)
+                if ev.is_left_drag()
+                    && let Some(anchor) = drag_anchor
+                    && let Some(idx) = buf_index_at_column(prompt, &ed, col_origin, (ev.col as usize).saturating_sub(1)) =>
+            {
+                ed.cursor = idx;
+                mouse_selection = Some((anchor, idx));
+            }
+            // The selection outlives the release; only the drag ends.
+            Key::Mouse(ev) if ev.is_release() && drag_anchor.is_some() => drag_anchor = None,
             Key::Mouse(ev) if ev.is_left_click() => {
                 drop(guard.take());
                 return Ok(ReadOutcome::Mouse { event: ev, text: ed.as_string(), cursor: ed.cursor });
@@ -2040,7 +2137,8 @@ pub fn read_line(
         // whatever the just-dispatched key actually did to the buffer/
         // completion/browse state) and before the redraw that shows it.
         suggestion = compute_suggestion(&ed, suggestion_provider, completion.is_some() || snippet.is_some(), browse.is_some());
-        let overlay = snippet.as_ref().map(snippet_layer).unwrap_or_default();
+        let mut overlay = snippet.as_ref().map(snippet_layer).unwrap_or_default();
+        overlay.extend(mouse_selection.into_iter().flat_map(|r| selection_layer(&ed, r)));
         redraw_with_completion_row(
             prompt,
             &ed,
@@ -3425,6 +3523,48 @@ mod tests {
     fn decode_csi_final_tilde_form_page_up_and_down() {
         assert_eq!(decode_csi_final("5", b'~'), Key::PageUp);
         assert_eq!(decode_csi_final("6", b'~'), Key::PageDown);
+    }
+
+    #[test]
+    fn a_column_maps_to_the_character_under_it_by_display_width() {
+        let mut ed = LineEditor::new();
+        for c in "echo hi".chars() {
+            ed.insert(c);
+        }
+        // Prompt is 3 columns, line starts at real column 5.
+        let at = |col| buf_index_at_column("$ >", &ed, 2, col);
+        assert_eq!(at(4), None, "still inside the prompt");
+        assert_eq!(at(5), Some(0), "first character of the line");
+        assert_eq!(at(10), Some(5));
+
+        // A wide character is two columns, so index and column stop
+        // agreeing -- which is the whole reason this goes through
+        // char_at_col rather than subtracting.
+        let mut wide = LineEditor::new();
+        for c in "\u{4f60}\u{597d}x".chars() {
+            wide.insert(c);
+        }
+        assert_eq!(buf_index_at_column("", &wide, 0, 0), Some(0));
+        assert_eq!(buf_index_at_column("", &wide, 0, 2), Some(1), "past one double-width char");
+        assert_eq!(buf_index_at_column("", &wide, 0, 4), Some(2), "past both");
+    }
+
+    #[test]
+    fn a_selection_renders_reversed_over_exactly_what_it_covers() {
+        let mut ed = LineEditor::new();
+        for c in "abcdef".chars() {
+            ed.insert(c);
+        }
+        let spans = selection_layer(&ed, (1, 4));
+        assert_eq!(spans.len(), 1);
+        assert_eq!((spans[0].start, spans[0].end), (1, 4));
+        assert!(spans[0].attrs.reverse);
+        // Dragged backwards is the same selection.
+        assert_eq!(selection_layer(&ed, (4, 1)).first().map(|s| (s.start, s.end)), Some((1, 4)));
+        // An empty one draws nothing rather than a zero-width span.
+        assert!(selection_layer(&ed, (2, 2)).is_empty());
+        // ...and one running past the end is clamped, not a panic.
+        assert_eq!(selection_layer(&ed, (4, 99)).first().map(|s| (s.start, s.end)), Some((4, 6)));
     }
 
     #[test]
