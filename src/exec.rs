@@ -547,9 +547,15 @@ pub trait ServiceTable {
 /// answer: a trait exec.rs owns and repl.rs implements, so the
 /// dependency points the way it already does.
 pub trait HistoryAccess {
-    /// Every entry, oldest first. The index a caller prints is this
-    /// position plus one, matching bash's 1-based numbering.
-    fn entries(&self) -> Vec<String>;
+    /// Every entry, oldest first, each with when it was recorded if
+    /// that is known. The index a caller prints is this position plus
+    /// one, matching bash's 1-based numbering.
+    ///
+    /// The time is `None` for anything written before the history file
+    /// carried one, and for an entry rebuilt by `delete` -- see
+    /// history.rs. `HISTTIMEFORMAT` shows nothing for those rather than
+    /// inventing a plausible wrong time.
+    fn entries(&self) -> Vec<(String, Option<i64>)>;
 
     /// Drops everything -- `history -c`.
     fn clear(&mut self);
@@ -565,7 +571,7 @@ pub trait HistoryAccess {
 pub struct NoHistory;
 
 impl HistoryAccess for NoHistory {
-    fn entries(&self) -> Vec<String> {
+    fn entries(&self) -> Vec<(String, Option<i64>)> {
         Vec::new()
     }
 
@@ -4654,8 +4660,23 @@ impl Shell {
                     Some(n) => entries.len().saturating_sub(n),
                     None => 0,
                 };
-                for (i, entry) in entries.iter().enumerate().skip(start) {
-                    sh_println!(self, "{:5}  {}", i + 1, entry);
+                // bash's `HISTTIMEFORMAT`: set, and each line is
+                // prefixed with when the command ran. Unset (the
+                // default) and nothing changes -- which is also what an
+                // entry with no recorded time shows, padded to keep the
+                // commands lined up.
+                let time_format = self.var_is_set("HISTTIMEFORMAT").then(|| self.raw_var_lookup("HISTTIMEFORMAT"));
+                for (i, (entry, when)) in entries.iter().enumerate().skip(start) {
+                    match &time_format {
+                        Some(fmt) if !fmt.is_empty() => {
+                            let stamp = match when {
+                                Some(secs) => strftime_at(fmt, &local_time_at(*secs), Some(*secs)),
+                                None => String::new(),
+                            };
+                            sh_println!(self, "{:5}  {}{}", i + 1, stamp, entry);
+                        }
+                        _ => sh_println!(self, "{:5}  {}", i + 1, entry),
+                    }
                 }
                 0
             }
@@ -4693,7 +4714,7 @@ impl Shell {
         let last = resolve(args.get(2), entries.len());
         let (lo, hi) = (first.min(last), first.max(last));
         for n in lo..=hi.min(entries.len()) {
-            sh_println!(self, "{:5}\t{}", n, entries[n - 1]);
+            sh_println!(self, "{:5}\t{}", n, entries[n - 1].0);
         }
         0
     }

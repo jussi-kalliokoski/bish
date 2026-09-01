@@ -50,6 +50,10 @@ struct Node {
     // The directory this entry was recorded from. Persisted as `-d`,
     // so unlike before this survives a reload.
     cwd: Option<PathBuf>,
+    // When this entry was recorded, for `history` under
+    // `HISTTIMEFORMAT`. `None` for a legacy line, which has no `-t` to
+    // read -- and shows no time rather than an invented one.
+    time: Option<i64>,
     // This entry's own on-disk id, so a *later* entry can name it as
     // its parent. Meaningless in memory beyond that -- the chain has
     // real pointers and never looks an id up.
@@ -72,6 +76,8 @@ struct Node {
 pub struct HistoryEntry<'a> {
     pub text: &'a str,
     pub cwd: Option<&'a Path>,
+    /// When it was recorded, if known.
+    pub time: Option<i64>,
     // The entry run immediately before this one. Now recovered from
     // disk too, via the parent id each record carries -- which is what
     // demotes `Confidence::Legacy` from "anything that was loaded" to
@@ -134,6 +140,7 @@ impl History {
                     let node = Rc::new(Node {
                         entry: record.entry.clone(),
                         cwd: record.cwd.clone(),
+                        time: record.time,
                         id: record.id.unwrap_or(0),
                         parent,
                         live: false,
@@ -190,9 +197,11 @@ impl History {
         // every session appends to, not the command this one just ran.
         let parent = self.tail.as_ref().filter(|n| n.live).map(Rc::clone);
         let id = fresh_id();
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
         self.tail = Some(Rc::new(Node {
             entry: entry.to_string(),
             cwd: cwd.map(Path::to_path_buf),
+            time: Some(now.max(0)),
             id,
             parent: parent.clone(),
             live: true,
@@ -273,6 +282,7 @@ impl History {
             v.push(HistoryEntry {
                 text: node.entry.as_str(),
                 cwd: node.cwd.as_deref(),
+                time: node.time,
                 prev: node.parent.as_ref().map(|p| p.entry.as_str()),
             });
             cur = &node.prev;
@@ -658,6 +668,37 @@ fn iso_from_epoch(secs: i64) -> String {
     format!("{year:04}-{month:02}-{day:02}T{hh:02}:{mm:02}:{ss:02}Z")
 }
 
+// The epoch second an `iso_from_epoch` string names, or None for
+// anything that is not one.
+//
+// The inverse of the civil-from-days conversion above, and deliberately
+// strict: a timestamp that does not parse is a timestamp we do not
+// know, and `history` shows nothing for it rather than a plausible
+// wrong time. Assumes the `Z` these are always written with -- there is
+// no other producer.
+fn epoch_from_iso(text: &str) -> Option<i64> {
+    let b: Vec<char> = text.chars().collect();
+    if b.len() != 20 || b[4] != '-' || b[7] != '-' || b[10] != 'T' || b[13] != ':' || b[16] != ':' || b[19] != 'Z' {
+        return None;
+    }
+    let num = |from: usize, to: usize| text[from..to].parse::<i64>().ok();
+    let (y, mo, d) = (num(0, 4)?, num(5, 7)?, num(8, 10)?);
+    let (h, mi, sec) = (num(11, 13)?, num(14, 16)?, num(17, 19)?);
+    if !(1..=12).contains(&mo) || !(1..=31).contains(&d) {
+        return None;
+    }
+    // days_from_civil, Howard Hinnant's, the exact mirror of the
+    // civil_from_days in `iso_from_epoch`.
+    let y = if mo <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = if mo > 2 { mo - 3 } else { mo + 9 };
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    Some(days * 86_400 + h * 3600 + mi * 60 + sec)
+}
+
 fn iso_now() -> String {
     let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
     iso_from_epoch(secs as i64)
@@ -670,6 +711,9 @@ struct Record {
     id: Option<u64>,
     parent: Option<u64>,
     cwd: Option<PathBuf>,
+    /// When it was recorded, from `-t`. `None` for a legacy bare line,
+    /// and for a `-t` that does not parse.
+    time: Option<i64>,
     entry: String,
 }
 
@@ -756,7 +800,7 @@ fn split_record(line: &str) -> Option<(Vec<String>, String)> {
 // this one has already started writing.
 fn parse_record(line: &str) -> Record {
     let Some((words, entry)) = split_record(line) else {
-        return Record { id: None, parent: None, cwd: None, entry: unescape(line) };
+        return Record { id: None, parent: None, cwd: None, time: None, entry: unescape(line) };
     };
     let value = |flag: &str| {
         words.iter().position(|w| w == flag).and_then(|i| words.get(i + 1)).map(|s| s.as_str())
@@ -766,6 +810,7 @@ fn parse_record(line: &str) -> Record {
         id: hex("--id"),
         parent: hex("-p"),
         cwd: value("-d").map(|d| PathBuf::from(unescape(d))),
+        time: value("-t").and_then(|t| epoch_from_iso(&unescape(t))),
         entry: unescape(&entry),
     }
 }
@@ -897,6 +942,26 @@ mod tests {
     fn ids_do_not_repeat() {
         let ids: std::collections::HashSet<u64> = (0..1000).map(|_| fresh_id()).collect();
         assert_eq!(ids.len(), 1000);
+    }
+
+    #[test]
+    fn a_timestamp_round_trips_through_the_record() {
+        // `history` under HISTTIMEFORMAT formats the epoch this
+        // recovers, so the two conversions have to be exact inverses.
+        for secs in [0_i64, 1_000_000_000, 1_756_697_100, 1_709_208_000] {
+            assert_eq!(epoch_from_iso(&iso_from_epoch(secs)), Some(secs), "{secs}");
+        }
+    }
+
+    #[test]
+    fn an_unreadable_timestamp_is_no_timestamp_rather_than_a_wrong_one() {
+        // A legacy line has none at all, and a mangled one must not be
+        // guessed at -- `history` shows nothing for either.
+        for bad in ["", "not a time", "2001-09-09", "2001-09-09T01:46:40", "2001-13-09T01:46:40Z", "2001-09-32T01:46:40Z"] {
+            assert_eq!(epoch_from_iso(bad), Option::None, "{bad}");
+        }
+        assert_eq!(parse_record("legacy bare line").time, Option::None);
+        assert_eq!(parse_record(" : --id 0a -t 'nonsense'; echo hi").time, Option::None);
     }
 
     #[test]
@@ -1080,8 +1145,8 @@ mod tests {
 // O(1) `Rc` clone -- see its own doc comment). Rebuilding is what keeps
 // `history -c` in one window from emptying another's.
 impl crate::exec::HistoryAccess for History {
-    fn entries(&self) -> Vec<String> {
-        History::entries(self).into_iter().map(|e| e.text.to_string()).collect()
+    fn entries(&self) -> Vec<(String, Option<i64>)> {
+        History::entries(self).into_iter().map(|e| (e.text.to_string(), e.time)).collect()
     }
 
     fn clear(&mut self) {
@@ -1105,7 +1170,7 @@ impl crate::exec::HistoryAccess for History {
             // entries rank as `Legacy` -- a real cost now that a
             // reloaded entry would otherwise keep both, and still the
             // honest answer for a chain rebuilt from text alone.
-            tail = Some(Rc::new(Node { entry, cwd: None, id: fresh_id(), parent: None, live: false, prev: tail.take() }));
+            tail = Some(Rc::new(Node { entry, cwd: None, time: None, id: fresh_id(), parent: None, live: false, prev: tail.take() }));
         }
         self.tail = tail;
         true
@@ -1128,7 +1193,11 @@ mod history_access_tests {
     #[test]
     fn the_shell_sees_every_entry_oldest_first() {
         let h = built(&["one", "two", "three"]);
-        assert_eq!(HistoryAccess::entries(&h), vec!["one".to_string(), "two".to_string(), "three".to_string()]);
+        let texts: Vec<String> = HistoryAccess::entries(&h).into_iter().map(|(t, _)| t).collect();
+        assert_eq!(texts, vec!["one".to_string(), "two".to_string(), "three".to_string()]);
+        // ...and every live entry knows when it happened, which is what
+        // `HISTTIMEFORMAT` shows.
+        assert!(HistoryAccess::entries(&h).iter().all(|(_, when)| when.is_some()));
     }
 
     #[test]
@@ -1140,7 +1209,8 @@ mod history_access_tests {
         let forked = h.fork();
 
         assert!(h.delete(2));
-        assert_eq!(HistoryAccess::entries(&h), vec!["one".to_string(), "three".to_string()]);
+        let texts: Vec<String> = HistoryAccess::entries(&h).into_iter().map(|(t, _)| t).collect();
+        assert_eq!(texts, vec!["one".to_string(), "three".to_string()]);
         assert_eq!(HistoryAccess::entries(&forked).len(), 3, "the fork is untouched");
 
         assert!(!h.delete(0), "1-based, so 0 is out of range");

@@ -157,7 +157,7 @@ mod tests {
     use std::path::PathBuf;
 
     fn entry<'a>(text: &'a str, cwd: Option<&'a Path>, prev: Option<&'a str>) -> HistoryEntry<'a> {
-        HistoryEntry { text, cwd, prev }
+        HistoryEntry { text, cwd, time: None, prev }
     }
 
     #[test]
