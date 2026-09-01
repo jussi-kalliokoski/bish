@@ -13,8 +13,10 @@
 
 pub(crate) mod completion;
 pub(crate) mod dirs;
+pub(crate) mod history;
 pub(crate) mod jobs;
 pub(crate) mod limits;
+pub(crate) mod vars;
 
 #[cfg(unix)]
 use std::os::unix::fs::FileTypeExt;

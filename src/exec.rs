@@ -29,7 +29,7 @@ use crate::vt100;
 // Grid (see repl.rs's apply_window_action) and later reads the Grid back
 // out to render whichever window is currently focused.
 #[derive(Clone)]
-enum OutputSink {
+pub(crate) enum OutputSink {
     Real,
     Grid(Rc<RefCell<vt100::Screen>>),
     // repl.rs's command mode temporarily swaps a session's sink to this
@@ -906,7 +906,7 @@ pub struct Shell {
     // A name only lives here if `local` explicitly declared it -- plain
     // assignment still targets the global (process-env) variable unless it
     // matches an existing local of the same name, matching bash semantics.
-    var_scopes: Vec<HashMap<String, String>>,
+    pub(crate) var_scopes: Vec<HashMap<String, String>>,
     script_name: String,
     // Indexed arrays (`arr=(...)`). A BTreeMap (not Vec) so arrays are
     // genuinely sparse like bash's: `arr[10]=x` doesn't materialize empty
@@ -921,7 +921,7 @@ pub struct Shell {
     // `arrays` since their keys are arbitrary strings, not indices -- a name
     // in `assoc_names` is looked up here instead of `arrays` everywhere an
     // array is read or written.
-    assoc_arrays: HashMap<String, OrderedMap>,
+    pub(crate) assoc_arrays: HashMap<String, OrderedMap>,
     pub(crate) assoc_names: std::collections::HashSet<String>,
     // `alias name=value`, expanded for real -- see
     // `lexer::expand_aliases`.
@@ -1019,7 +1019,7 @@ pub struct Shell {
     // set before doing anything else, so reading/writing `ref` transparently
     // reads/writes `target` instead. Scalars only; array-element namerefs
     // (`declare -n ref=arr[0]`) aren't supported, a scoped gap.
-    nameref_names: std::collections::HashSet<String>,
+    pub(crate) nameref_names: std::collections::HashSet<String>,
     // Scoping for `local -n` (mirrors array_local_stack): each frame
     // records, for every name it nameref'd, whether that name was already
     // a nameref beforehand -- so call_function can undo just the
@@ -1094,22 +1094,22 @@ pub struct Shell {
     // assignment/local/export/declare/arithmetic-assignment/read/getopts
     // all funnel through, so marking a name here blocks writes everywhere
     // at once.
-    readonly_names: std::collections::HashSet<String>,
+    pub(crate) readonly_names: std::collections::HashSet<String>,
     // `declare -i`/`local -i`: assignments to these names are evaluated as
     // arithmetic expressions instead of stored as literal text (checked in
     // assign_var, the single write path).
-    integer_names: std::collections::HashSet<String>,
+    pub(crate) integer_names: std::collections::HashSet<String>,
     // `declare -u`/`-l`: assignments to these names are case-folded
     // (checked in assign_var alongside integer_names).
-    upper_names: std::collections::HashSet<String>,
-    lower_names: std::collections::HashSet<String>,
+    pub(crate) upper_names: std::collections::HashSet<String>,
+    pub(crate) lower_names: std::collections::HashSet<String>,
     // `declare -x`/`export -x NAME` on a name that's currently a `local`:
     // globals are already unconditionally visible to children (assign_var
     // writes them straight to the process env), so this only matters for a
     // local -- assign_var additionally mirrors the value into the process
     // env for any name in this set, so child processes can see it despite
     // it living in var_scopes rather than env.
-    exported_names: std::collections::HashSet<String>,
+    pub(crate) exported_names: std::collections::HashSet<String>,
     // `>(cmd)` substitutions queued by the command currently being built,
     // to run (reading the temp file back) once it finishes; see
     // run_proc_sub_out/drain_proc_subs.
@@ -1302,7 +1302,7 @@ pub struct Shell {
     pub cwd: std::path::PathBuf,
     // See OutputSink's doc comment: Real until repl.rs flips it to Grid
     // at promotion time.
-    sink: OutputSink,
+    pub(crate) sink: OutputSink,
     // Whether the last byte sink_out/sink_err actually wrote (through
     // *any* sink, though only OutputSink::Real's caller -- repl.rs's main
     // loop, before drawing the next prompt -- ever reads this) was
@@ -2308,248 +2308,6 @@ impl Shell {
         ExecResult::Status(0)
     }
 
-    // unset [-f|-v] NAME... Also accepts `arr[i]` to remove one element
-    // without touching the rest of the array. `stderr_target` mirrors real
-    // bash routing this error through the command's own `2>` (confirmed via
-    // a clean bash probe) -- unlike nounset/plain-assignment errors, which
-    // always go to real stderr since they happen before any redirect setup.
-    fn run_unset(&mut self, args: &[String], stderr_target: &Option<String>) -> i32 {
-        let mut only_funcs = false;
-        let mut only_vars = false;
-        let mut names: Vec<&String> = Vec::new();
-        for a in args {
-            match a.as_str() {
-                "-f" => only_funcs = true,
-                "-v" => only_vars = true,
-                _ => names.push(a),
-            }
-        }
-        for n in names {
-            if only_funcs {
-                self.functions.remove(n.as_str());
-                continue;
-            }
-            if let Some(bracket) = n.find('[') {
-                if let Some(idx_expr) = n.strip_suffix(']').map(|s| &s[bracket + 1..]) {
-                    let arr_name = n[..bracket].to_string();
-                    if self.assoc_names.contains(&arr_name) {
-                        let key = self.expand_index_as_string(idx_expr);
-                        if let Some(map) = self.assoc_arrays.get_mut(&arr_name) {
-                            map.remove(&key);
-                        }
-                    } else if let Ok(i) = arith::eval(idx_expr, self) {
-                        if let Some(idx) = self.resolve_array_index(&arr_name, i) {
-                            if let Some(map) = self.arrays.get_mut(&arr_name) {
-                                map.remove(&idx);
-                            }
-                        }
-                    }
-                    continue;
-                }
-            }
-            if self.readonly_names.contains(n.as_str()) || self.is_restricted_readonly_name(n) {
-                write_diagnostic(stderr_target, &format!("bish: unset: {}: cannot unset: readonly variable", n), self.sink.clone());
-                continue;
-            }
-            self.arrays.remove(n.as_str());
-            self.assoc_arrays.remove(n.as_str());
-            self.assoc_names.remove(n.as_str());
-            let mut removed_local = false;
-            for scope in self.var_scopes.iter_mut().rev() {
-                if scope.remove(n.as_str()).is_some() {
-                    removed_local = true;
-                    break;
-                }
-            }
-            if !removed_local {
-                unsafe {
-                    std::env::remove_var(n);
-                }
-            }
-            if !only_vars {
-                self.functions.remove(n.as_str());
-            }
-        }
-        0
-    }
-
-    // declare/typeset [-A|-a|-i|-r|-g] [NAME|NAME=value]... `-x` isn't
-    // tracked separately since every variable already lives in the
-    // process env here; other real bash flags (-u/-l/-n/...) are
-    // accepted but not enforced. `-p`/`-f`/`-F` are a different mode
-    // entirely (print instead of declare, see print_declared/
-    // print_functions) -- checked first, same as bash effectively
-    // treating them as a separate subcommand.
-    fn run_declare(&mut self, args: &[String], array_literals: &[(usize, String, AssignMode, Vec<ArrayLiteralItem>)]) -> i32 {
-        if args.iter().any(|a| a == "-f" || a == "-F") {
-            let names_only = args.iter().any(|a| a == "-F");
-            let names: Vec<String> = args.iter().filter(|a| !a.starts_with('-')).cloned().collect();
-            return self.print_functions(&names, names_only);
-        }
-        if args.iter().any(|a| a == "-p") {
-            let names: Vec<String> = args.iter().filter(|a| !a.starts_with('-')).cloned().collect();
-            return self.print_declared(&names);
-        }
-        // `-g`: force the write to the true global scope even when
-        // called from inside a function -- without it, a plain
-        // declare/typeset inside a function auto-localizes exactly like
-        // `local` does (see the scalar assignment branch below), matching
-        // real bash (confirmed: `f() { declare z=5; }; f; echo "$z"`
-        // prints nothing in bash, but bish used to leak z to the global
-        // scope here before this fix).
-        let mut global_flag = false;
-        let mut array_mode: Option<bool> = None; // Some(true)=-A, Some(false)=-a
-        let mut readonly_flag = false;
-        let mut integer_flag = false;
-        let mut nameref_flag = false;
-        let mut upper_flag = false;
-        let mut lower_flag = false;
-        let mut export_flag = false;
-        for (i, a) in args.iter().enumerate() {
-            match a.as_str() {
-                "-A" => {
-                    array_mode = Some(true);
-                    continue;
-                }
-                "-a" => {
-                    array_mode = Some(false);
-                    continue;
-                }
-                "-r" => {
-                    readonly_flag = true;
-                    continue;
-                }
-                "-i" => {
-                    integer_flag = true;
-                    continue;
-                }
-                "-n" => {
-                    nameref_flag = true;
-                    continue;
-                }
-                "-u" => {
-                    upper_flag = true;
-                    continue;
-                }
-                "-l" => {
-                    lower_flag = true;
-                    continue;
-                }
-                "-x" => {
-                    export_flag = true;
-                    continue;
-                }
-                "-g" => {
-                    global_flag = true;
-                    continue;
-                }
-                _ => {}
-            }
-            // `declare -A m=([a]=1 [b]=2)` -- this position is actually
-            // an array literal, not a plain `NAME`/`NAME=value` string
-            // (`a` here is just its xtrace-only display text, see
-            // array_literal_display's own doc comment). `-A`/`-a` seen
-            // so far decides which table it's declared into, matching
-            // the plain-name case just below; no flag at all falls back
-            // to whatever `name` already is (bash's own behavior:
-            // without `-A`, a bracketed key is just an arithmetic index
-            // into a plain indexed array).
-            if let Some((_, name, mode, items)) = array_literals.iter().find(|(pos, ..)| *pos == i) {
-                match array_mode {
-                    Some(true) => {
-                        self.assoc_names.insert(name.clone());
-                        self.assoc_arrays.entry(name.clone()).or_default();
-                    }
-                    Some(false) => {
-                        self.arrays.entry(name.clone()).or_default();
-                    }
-                    None => {}
-                }
-                self.apply_array_literal(name, *mode, items);
-                if readonly_flag {
-                    self.readonly_names.insert(name.clone());
-                }
-                continue;
-            }
-            if a.starts_with('-') {
-                continue;
-            }
-            let (name, val) = match a.find('=') {
-                Some(eq) => (a[..eq].to_string(), Some(a[eq + 1..].to_string())),
-                None => (a.clone(), None),
-            };
-            if integer_flag {
-                self.integer_names.insert(name.clone());
-            }
-            if upper_flag {
-                self.upper_names.insert(name.clone());
-            }
-            if lower_flag {
-                self.lower_names.insert(name.clone());
-            }
-            if export_flag {
-                self.exported_names.insert(name.clone());
-            }
-            if nameref_flag {
-                self.nameref_names.insert(name.clone());
-                if let Some(v) = val {
-                    self.raw_var_write(&name, v);
-                }
-                if readonly_flag {
-                    self.readonly_names.insert(name);
-                }
-                continue;
-            }
-            match array_mode {
-                Some(true) => {
-                    self.assoc_names.insert(name.clone());
-                    self.assoc_arrays.entry(name.clone()).or_default();
-                }
-                Some(false) => {
-                    self.arrays.entry(name.clone()).or_default();
-                }
-                None => {
-                    // Auto-localize, matching `local`: a plain (non-`-g`)
-                    // declare/typeset inside a function creates a new
-                    // local shadow rather than falling through to the
-                    // global env. Pre-inserting an (empty, for now) entry
-                    // into the current scope makes assign_var's own
-                    // existing "write into whichever scope already
-                    // shadows this name" logic (raw_var_write) do the
-                    // right thing without needing a separate write path.
-                    if !global_flag && !self.var_scopes.is_empty() {
-                        self.var_scopes.last_mut().unwrap().entry(name.clone()).or_default();
-                    }
-                    if let Some(v) = val {
-                        if global_flag { self.assign_var_global(&name, v) } else { self.assign_var(&name, v) }
-                    } else if export_flag {
-                        // Bare `declare -x NAME`/`export NAME` on an
-                        // already-set variable (commonly a local: `local
-                        // Z=inner; export Z`) -- re-assign its current
-                        // value through assign_var so exported_names'
-                        // mirror-to-env logic fires immediately, instead
-                        // of only on the variable's *next* write. The
-                        // empty-fallback branch below wouldn't reach this
-                        // case since it only fires for a name with no
-                        // value at all yet.
-                        let cur = self.lookup_var(&name);
-                        if global_flag { self.assign_var_global(&name, cur) } else { self.assign_var(&name, cur) }
-                    } else if self.lookup_var(&name).is_empty() && std::env::var(&name).is_err() {
-                        if global_flag {
-                            self.assign_var_global(&name, String::new())
-                        } else {
-                            self.assign_var(&name, String::new())
-                        }
-                    }
-                }
-            }
-            if readonly_flag {
-                self.readonly_names.insert(name);
-            }
-        }
-        0
-    }
-
     // declare -f [name...] / declare -F [name...]: print each named
     // function's definition (or, under -F, just "declare -f NAME"); no
     // names means every currently-defined function, sorted for
@@ -2559,7 +2317,7 @@ impl Shell {
     // against real bash). Reuses the exact same Command::FuncDef ->
     // serialize_program round-trip functions_preamble already does for
     // re-declaring functions across a subprocess boundary.
-    fn print_functions(&mut self, names: &[String], names_only: bool) -> i32 {
+    pub(crate) fn print_functions(&mut self, names: &[String], names_only: bool) -> i32 {
         let targets: Vec<String> = if names.is_empty() {
             let mut all: Vec<String> = self.functions.keys().cloned().collect();
             all.sort();
@@ -2602,7 +2360,7 @@ impl Shell {
     // was `declare -i`'d but never actually assigned a value can't be
     // distinguished from "doesn't exist" here (bish has no separate
     // "declared but unset" state) -- such a variable just doesn't appear.
-    fn print_declared(&mut self, names: &[String]) -> i32 {
+    pub(crate) fn print_declared(&mut self, names: &[String]) -> i32 {
         let targets: Vec<String> = if names.is_empty() { self.var_names_with_prefix("") } else { names.to_vec() };
         let mut status = 0;
         for name in targets {
@@ -2843,26 +2601,6 @@ impl Shell {
         }
         let value = self.lookup_var(name);
         Some(format!("declare {} {}={}", flag_str, name, declare_p_quote(&value)))
-    }
-
-    // readonly NAME[=value]... Marks each name so assign_var refuses future
-    // writes. The initializing assignment (if any) happens before the name
-    // is added to readonly_names, so it isn't rejected by its own call.
-    fn run_readonly(&mut self, args: &[String]) -> i32 {
-        for a in args {
-            if a.starts_with('-') {
-                continue;
-            }
-            let (name, val) = match a.find('=') {
-                Some(eq) => (a[..eq].to_string(), Some(a[eq + 1..].to_string())),
-                None => (a.clone(), None),
-            };
-            if let Some(v) = val {
-                self.assign_var(&name, v);
-            }
-            self.readonly_names.insert(name);
-        }
-        0
     }
 
     // Effective on/off state for a known shopt option name: an explicit
@@ -4108,130 +3846,6 @@ impl Shell {
             }
         }
         status
-    }
-
-    // Fish-style abbreviations: `self.abbrs`'s own doc comment covers the
-    // storage/trigger split (this builtin only ever stores/queries/lists;
-    // the actual expansion happens in editor.rs's read_line). Deliberately
-    // scoped down from real fish's own `abbr`: no `--rename`, no
-    // `--position anywhere` (always command position, fish's own default),
-    // no regex/function-backed abbreviations, no scope flags (`-U`/`-g`,
-    // meaningless here -- bish has no fish-variable-style scoping at all)
-    // -- just add/erase/list/show/query, the part of `abbr` people
-    // actually reach for day to day. An expansion *can* carry `%s`
-    // placeholders, which makes it a snippet rather than plain text (see
-    // bishedit::snippet, and `snippet::parse_order` for how a trailing
-    // `2 1` is told apart from two more words of expansion).
-    // `--lang=GLOB` scopes an abbreviation to the languages it's for
-    // (default `bash`, which is what the shell prompt itself counts as),
-    // so an abbreviation's identity here is `(name, lang)` and the same
-    // short name can mean one thing at a prompt and another in a Rust
-    // file. See `take_lang_flag` for why it's only recognized among the
-    // leading options.
-    // `-a`/`--add` is optional (`abbr NAME EXPANSION` alone means add, `abbr`
-    // with a recognized name misparsed as NAME would just mean "add an
-    // abbreviation literally named `-x`" -- an accepted, unvalidated edge
-    // case, same spirit as `alias`'s own lack of name validation above).
-    // Bare `abbr` (no args at all) shows everything, matching this
-    // codebase's own `alias`'s bare-listing convention rather than real
-    // fish's (which errors) -- consistency with the sibling builtin wins
-    // here since nothing else in bish already commits to fish's own
-    // no-args-is-an-error behavior.
-    // `history [N]`, `history -c`, `history -d N`.
-    //
-    // Deliberately not `-w`/`-r`/`-a`: those are about a *file*, and
-    // bish's history file is appended to by every concurrent bish
-    // process (see history.rs's own load()), so "write the in-memory
-    // list to the file" would mean deciding whose list wins. That is a
-    // real design question, not a missing flag.
-    fn run_history(&mut self, args: &[String]) -> i32 {
-        let history = Rc::clone(&self.history);
-        match args.first().map(String::as_str) {
-            Some("-c") => {
-                history.borrow_mut().clear();
-                0
-            }
-            Some("-d") => {
-                let Some(n) = args.get(1).and_then(|a| a.parse::<usize>().ok()) else {
-                    sh_eprintln!(self, "bish: history: -d: usage: history -d OFFSET");
-                    return 2;
-                };
-                if history.borrow_mut().delete(n) {
-                    0
-                } else {
-                    sh_eprintln!(self, "bish: history: {n}: history position out of range");
-                    1
-                }
-            }
-            Some(flag) if flag.starts_with('-') => {
-                sh_eprintln!(self, "bish: history: {flag}: invalid option (expected -c or -d)");
-                2
-            }
-            other => {
-                let entries = history.borrow().entries();
-                // A bare count shows the *last* N, which is what makes
-                // `history 20` the useful spelling it is.
-                let start = match other.and_then(|a| a.parse::<usize>().ok()) {
-                    Some(n) => entries.len().saturating_sub(n),
-                    None => 0,
-                };
-                // bash's `HISTTIMEFORMAT`: set, and each line is
-                // prefixed with when the command ran. Unset (the
-                // default) and nothing changes -- which is also what an
-                // entry with no recorded time shows, padded to keep the
-                // commands lined up.
-                let time_format = self.var_is_set("HISTTIMEFORMAT").then(|| self.raw_var_lookup("HISTTIMEFORMAT"));
-                for (i, (entry, when)) in entries.iter().enumerate().skip(start) {
-                    match &time_format {
-                        Some(fmt) if !fmt.is_empty() => {
-                            let stamp = match when {
-                                Some(secs) => crate::time::strftime_at(fmt, &crate::time::local_time_at(*secs), Some(*secs)),
-                                None => String::new(),
-                            };
-                            sh_println!(self, "{:5}  {}{}", i + 1, stamp, entry);
-                        }
-                        _ => sh_println!(self, "{:5}  {}", i + 1, entry),
-                    }
-                }
-                0
-            }
-        }
-    }
-
-    // `fc -l [first [last]]` -- the listing half, which is what `fc` is
-    // actually reached for.
-    //
-    // Bare `fc` opens the last command in an editor and runs the result
-    // on exit. bish has an editor and could, but "run whatever comes
-    // back" is a different and much sharper thing than "show me what I
-    // ran", and shipping it as a surprise inside a listing command would
-    // be wrong. So it is refused by name, which is this shell's own
-    // convention for something it does not do yet.
-    fn run_fc(&mut self, args: &[String]) -> i32 {
-        if args.first().map(String::as_str) != Some("-l") {
-            sh_eprintln!(self, "bish: fc: only `fc -l [first [last]]` is implemented (use `history` to list, and an editor to edit)");
-            return 2;
-        }
-        let entries = self.history.borrow().entries();
-        if entries.is_empty() {
-            return 0;
-        }
-        // bash's own defaults: the last 16, and a negative number counts
-        // back from the end.
-        let resolve = |arg: Option<&String>, fallback: usize| -> usize {
-            match arg.and_then(|a| a.parse::<i64>().ok()) {
-                Some(n) if n < 0 => entries.len().saturating_sub((-n) as usize).saturating_add(1).max(1),
-                Some(n) if n > 0 => (n as usize).min(entries.len()),
-                _ => fallback,
-            }
-        };
-        let first = resolve(args.get(1), entries.len().saturating_sub(15).max(1));
-        let last = resolve(args.get(2), entries.len());
-        let (lo, hi) = (first.min(last), first.max(last));
-        for n in lo..=hi.min(entries.len()) {
-            sh_println!(self, "{:5}\t{}", n, entries[n - 1].0);
-        }
-        0
     }
 
     fn run_arith_print(&mut self, args: &[String]) -> i32 {
@@ -6975,8 +6589,8 @@ impl Shell {
                 return ExecResult::Status(status);
             }
             "abbr" => return ExecResult::Status(self.run_abbr(&argv[1..])),
-            "history" => return ExecResult::Status(self.run_history(&argv[1..])),
-            "fc" => return ExecResult::Status(self.run_fc(&argv[1..])),
+            "history" => return ExecResult::Status(crate::builtins::history::run_history(self, &argv[1..])),
+            "fc" => return ExecResult::Status(crate::builtins::history::run_fc(self, &argv[1..])),
             // `= EXPR`: evaluate and print. The other half of the inline
             // calculator whose answer the prompt already shows as ghost
             // text while it is being typed (bishedit::suggestion::
@@ -7027,7 +6641,7 @@ impl Shell {
                 // forward by one again -- net zero, so array_literal_args
                 // (itself indexed into the *original* argv) already lines
                 // up with declare_args unchanged.
-                return ExecResult::Status(self.run_declare(&declare_args, array_literal_args));
+                return ExecResult::Status(crate::builtins::vars::run_declare(self, &declare_args, array_literal_args));
             }
             "let" => {
                 let mut last = 0i64;
@@ -7590,7 +7204,7 @@ impl Shell {
             "getopts" => return self.run_getopts(&argv[1..]),
             "unset" => {
                 let target = self.peek_stderr_target(&cmd.redirects);
-                return ExecResult::Status(self.run_unset(&argv[1..], &target));
+                return ExecResult::Status(crate::builtins::vars::run_unset(self, &argv[1..], &target));
             }
             "set" => return ExecResult::Status(self.run_set(&argv[1..])),
             "declare" | "typeset" => {
@@ -7602,9 +7216,9 @@ impl Shell {
                     .iter()
                     .filter_map(|(p, n, m, i)| p.checked_sub(1).map(|p2| (p2, n.clone(), *m, i.clone())))
                     .collect();
-                return ExecResult::Status(self.run_declare(&argv[1..], &shifted));
+                return ExecResult::Status(crate::builtins::vars::run_declare(self, &argv[1..], &shifted));
             }
-            "readonly" => return ExecResult::Status(self.run_readonly(&argv[1..])),
+            "readonly" => return ExecResult::Status(crate::builtins::vars::run_readonly(self, &argv[1..])),
             // exec CMD [args...] replaces this process image entirely (no
             // fork, no return on success) -- exactly what real bash does,
             // and available here as safe std (CommandExt::exec wraps
@@ -8286,7 +7900,7 @@ impl Shell {
     // arithmetic expressions -- re-lex the raw index text and expand it,
     // same as expand_raw (an index like `with space` re-lexes as more than
     // one Word token; taking only the first would silently truncate it).
-    fn expand_index_as_string(&mut self, index: &str) -> String {
+    pub(crate) fn expand_index_as_string(&mut self, index: &str) -> String {
         self.expand_raw(index)
     }
 
@@ -8295,7 +7909,7 @@ impl Shell {
     // the last (highest-index) element. Only meaningful for indexed arrays
     // -- associative-array indices are plain string keys, never resolved
     // here.
-    fn resolve_array_index(&self, name: &str, i: i64) -> Option<usize> {
+    pub(crate) fn resolve_array_index(&self, name: &str, i: i64) -> Option<usize> {
         if i >= 0 {
             return Some(i as usize);
         }
@@ -8435,7 +8049,7 @@ impl Shell {
     // running counter's string form as a last resort (real bash errors
     // on this instead; rare enough in practice that erroring isn't
     // worth the extra plumbing here).
-    fn apply_array_literal(&mut self, name: &str, mode: AssignMode, items: &[ArrayLiteralItem]) {
+    pub(crate) fn apply_array_literal(&mut self, name: &str, mode: AssignMode, items: &[ArrayLiteralItem]) {
         let is_assoc = self.assoc_names.contains(name);
         if mode == AssignMode::Set {
             if is_assoc {
@@ -8921,7 +8535,7 @@ impl Shell {
     // Reads a name's own raw stored value, bypassing nameref redirection --
     // used to read a nameref's target-name string, and internally by
     // resolve_nameref while following a chain.
-    fn raw_var_lookup(&self, name: &str) -> String {
+    pub(crate) fn raw_var_lookup(&self, name: &str) -> String {
         for scope in self.var_scopes.iter().rev() {
             if let Some(v) = scope.get(name) {
                 return v.clone();
@@ -8933,7 +8547,7 @@ impl Shell {
     // Writes a name's own raw value, bypassing nameref redirection -- used
     // to set a nameref's target-name string itself (assign_var, by
     // contrast, is what a nameref's *reads/writes* get redirected through).
-    fn raw_var_write(&mut self, name: &str, value: String) {
+    pub(crate) fn raw_var_write(&mut self, name: &str, value: String) {
         for scope in self.var_scopes.iter_mut().rev() {
             if scope.contains_key(name) {
                 scope.insert(name.to_string(), value);
@@ -8963,7 +8577,7 @@ impl Shell {
         current
     }
 
-    fn lookup_var(&mut self, name: &str) -> String {
+    pub(crate) fn lookup_var(&mut self, name: &str) -> String {
         if self.nameref_names.contains(name) {
             let target = self.resolve_nameref(name);
             if target != name {
@@ -9265,7 +8879,7 @@ impl Shell {
     // opposed to merely evaluating to an empty string -- the distinction
     // `${V-x}`/`${V+x}` (unset only) need vs. `${V:-x}`/`${V:+x}` (unset OR
     // empty). Special/positional parameters always count as set.
-    fn var_is_set(&self, name: &str) -> bool {
+    pub(crate) fn var_is_set(&self, name: &str) -> bool {
         let resolved;
         let name = if self.nameref_names.contains(name) {
             resolved = self.resolve_nameref(name);
@@ -9311,7 +8925,7 @@ impl Shell {
     // Plain assignment targets the global (process-env) variable, unless it
     // shadows an existing `local` of the same name in the current function
     // scope -- matching bash, where functions don't auto-localize vars.
-    fn assign_var(&mut self, name: &str, value: String) {
+    pub(crate) fn assign_var(&mut self, name: &str, value: String) {
         self.assign_var_impl(name, value, false);
     }
 
@@ -9321,7 +8935,7 @@ impl Shell {
     // (process-env) scope, bypassing any same-named local shadow in the
     // current function -- unlike assign_var/raw_var_write, which target
     // whichever scope already shadows the name.
-    fn assign_var_global(&mut self, name: &str, value: String) {
+    pub(crate) fn assign_var_global(&mut self, name: &str, value: String) {
         self.assign_var_impl(name, value, true);
     }
 
@@ -9604,7 +9218,7 @@ impl Shell {
     // readonly_names itself (that would make them readonly forever,
     // including outside restricted mode, and would wrongly show up as
     // `-r` in declare -p/${v@a}).
-    fn is_restricted_readonly_name(&self, name: &str) -> bool {
+    pub(crate) fn is_restricted_readonly_name(&self, name: &str) -> bool {
         self.opt_restricted && matches!(name, "SHELL" | "PATH" | "ENV" | "BASH_ENV")
     }
 
@@ -9932,7 +9546,7 @@ enum ExtraFd {
 // bash's own order isn't something a script author could reliably predict
 // either.
 #[derive(Default, Clone)]
-struct OrderedMap {
+pub(crate) struct OrderedMap {
     order: Vec<String>,
     values: std::collections::HashMap<String, String>,
 }
@@ -9953,7 +9567,7 @@ impl OrderedMap {
         self.values.insert(key, value);
     }
 
-    fn remove(&mut self, key: &str) -> Option<String> {
+    pub(crate) fn remove(&mut self, key: &str) -> Option<String> {
         let v = self.values.remove(key);
         if v.is_some() {
             self.order.retain(|k| k != key);
@@ -12267,7 +11881,7 @@ fn kill_all(children: Vec<std::process::Child>) {
 // explicitly rather than through self.sink_err/sh_eprintln! -- both of
 // its callers already have a `&Shell`/`&mut Shell` in scope to pass
 // `.sink` from.
-fn write_diagnostic(target: &Option<String>, msg: &str, sink: OutputSink) {
+pub(crate) fn write_diagnostic(target: &Option<String>, msg: &str, sink: OutputSink) {
     match target {
         Some(path) => {
             if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
@@ -14032,7 +13646,7 @@ mod tests {
     #[test]
     fn declare_p_on_an_unset_name_errors_and_exits_1() {
         let mut shell = Shell::new();
-        let status = shell.run_declare(&strs(&["-p", "DEFINITELY_NOT_SET_XYZ"]), &[]);
+        let status = crate::builtins::vars::run_declare(&mut shell, &strs(&["-p", "DEFINITELY_NOT_SET_XYZ"]), &[]);
         assert_eq!(status, 1);
     }
 
@@ -14041,7 +13655,7 @@ mod tests {
         let mut shell = Shell::new();
         shell.run_source_here("foo() { echo hi; }", "<test>");
         let buf = capture_output(&mut shell);
-        assert_eq!(shell.run_declare(&strs(&["-f", "foo"]), &[]), 0);
+        assert_eq!(crate::builtins::vars::run_declare(&mut shell, &strs(&["-f", "foo"]), &[]), 0);
         let printed = buf.borrow().clone();
         assert!(printed.contains("foo"), "{printed:?}");
 
@@ -14058,14 +13672,14 @@ mod tests {
         let mut shell = Shell::new();
         shell.run_source_here("foo() { echo hi; }", "<test>");
         let buf = capture_output(&mut shell);
-        shell.run_declare(&strs(&["-F", "foo"]), &[]);
+        crate::builtins::vars::run_declare(&mut shell, &strs(&["-F", "foo"]), &[]);
         assert_eq!(buf.borrow().as_str(), "declare -f foo\n");
     }
 
     #[test]
     fn declare_f_on_an_unknown_function_errors_and_exits_1() {
         let mut shell = Shell::new();
-        assert_eq!(shell.run_declare(&strs(&["-f", "not_a_real_function"]), &[]), 1);
+        assert_eq!(crate::builtins::vars::run_declare(&mut shell, &strs(&["-f", "not_a_real_function"]), &[]), 1);
     }
 
     #[test]
