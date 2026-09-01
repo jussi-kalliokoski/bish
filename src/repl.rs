@@ -1051,9 +1051,7 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
                 }
                 changed
             },
-            // The `mouse` bishopt -- off keeps the terminal's own
-            // selection working here (see enable_maybe_mouse).
-            mouse,
+            prompt_claims_mouse(mouse, sinks_are_grid),
         ) {
             Ok(ReadOutcome::Eof) => {
                 // Whether closing *this* (window, top-frame) reference
@@ -6169,6 +6167,28 @@ fn ranges_overlap(a_start: usize, a_len: usize, b_start: usize, b_len: usize) ->
 
 fn rect_center(rect: &Rect) -> (usize, usize) {
     (rect.col + rect.cols / 2, rect.row + rect.rows / 2)
+}
+
+// Whether the shell prompt should ask the terminal to report mouse
+// events, which is not the same question as the `mouse` bishopt alone.
+//
+// Turning reporting on takes the terminal's *own* wheel-to-scrollback
+// and click-drag selection away, so it is only worth doing where bish
+// has something to put in their place. Before promotion it has nothing:
+// the prompt's click handler hit-tests `if sinks_are_grid` and so finds
+// no target at all (there are no tabs, panes or dividers yet), and a
+// wheel notch falls into read_line's own catch-all, which decodes and
+// drops it. The whole gesture set was being claimed and none of it
+// used -- the terminal simply stopped scrolling, with nothing taking
+// over, which is the regression this fixes. It arrived with
+// e6d52ff, where read_line went from `RawGuard::enable` to
+// `enable_with_mouse` so that tabs and panes could be clicked; that
+// need is real, but only once there are tabs and panes.
+//
+// Once promoted, bish owns the scrollback and the layout, and reporting
+// earns its cost.
+fn prompt_claims_mouse(mouse_bishopt: bool, sinks_are_grid: bool) -> bool {
+    mouse_bishopt && sinks_are_grid
 }
 
 fn render_row(out: &mut String, screen: &vt100::Screen, row: usize, cols: usize) {
@@ -14689,6 +14709,21 @@ mod compositor_frame_output_tests {
     // --promoted`, Enter, then Ctrl-C at the fresh prompt): an explicit
     // clear immediately followed by repainting the *same* content one
     // real terminal can still render as a blank frame in between.
+    #[test]
+    fn the_prompt_only_claims_the_mouse_once_it_has_something_to_do_with_it() {
+        // Unpromoted: nothing to hit-test and nowhere to scroll, so
+        // claiming reporting would take the terminal's wheel and
+        // selection and give nothing back.
+        assert!(!prompt_claims_mouse(true, false));
+        // Promoted: tabs, panes and dividers exist and are clickable.
+        assert!(prompt_claims_mouse(true, true));
+        // The bishopt still wins in both directions -- `mouse off` is
+        // how you ask for the terminal's own selection back even in a
+        // split.
+        assert!(!prompt_claims_mouse(false, true));
+        assert!(!prompt_claims_mouse(false, false));
+    }
+
     #[test]
     fn build_compositor_frame_output_never_erases_the_whole_display() {
         let screen = Rc::new(RefCell::new(vt100::Screen::new(2, 3)));
