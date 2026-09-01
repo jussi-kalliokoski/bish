@@ -4750,8 +4750,17 @@ impl Shell {
                     .iter()
                     .filter(|m| crate::keymap::modes_matching(&mode).iter().any(|one| m.applies_to(one)))
                     .map(|m| {
-                        let action = crate::bishedit::vimkeys::describe_key_sequence(&m.rhs)
-                            .unwrap_or_else(|why| format!("({why})"));
+                        // The fourth column is what the mapping *does*,
+                        // which only exists where keys resolve to named
+                        // actions. For an insert/command/terminal-only
+                        // mapping the keys are the whole story, and a
+                        // dash says so rather than inventing a
+                        // normal-mode reading of them.
+                        let action = if crate::keymap::has_vim_mode(&m.modes) {
+                            crate::bishedit::vimkeys::describe_key_sequence(&m.rhs).unwrap_or_else(|why| format!("({why})"))
+                        } else {
+                            "-".to_string()
+                        };
                         format!(
                             "{}\t{}\t{}\t{}",
                             m.modes,
@@ -4816,8 +4825,19 @@ impl Shell {
                 // Resolved here rather than at the keystroke: a
                 // right-hand side that means nothing should fail where
                 // it was written, not silently swallow keys later.
-                if let Err(why) = crate::bishedit::vimkeys::describe_key_sequence(&rhs) {
-                    sh_eprintln!(self, "bish: ::bish map: '{rhs_text}' is {why}");
+                //
+                // Only where it *has* a meaning to check, though. Normal
+                // and visual resolve keys to named actions, so a
+                // right-hand side that resolves to nothing there is a
+                // mistake. Insert, command and terminal have no such
+                // vocabulary -- keys are keys -- and `<Esc>` is a
+                // perfectly good insert-mode right-hand side while being
+                // no normal-mode action at all.
+                if crate::keymap::has_vim_mode(&mode)
+                    && let Err(why) = crate::bishedit::vimkeys::describe_key_sequence(&rhs)
+                {
+                    sh_eprintln!(self, "bish: ::bish map: '{rhs_text}' is {why} as a normal-mode action");
+                    sh_eprintln!(self, "bish: ::bish map: if it was meant for another mode, scope it with -m");
                     return 2;
                 }
                 if crate::keymap::never_fires(&mode) {
@@ -4827,8 +4847,8 @@ impl Shell {
                     // is the worst of the available failures.
                     sh_eprintln!(
                         self,
-                        "bish: ::bish map: nothing in mode '{mode}' acts on mappings yet, so this will not fire (only {} do)",
-                        crate::keymap::REMAPPABLE.join(" and ")
+                        "bish: ::bish map: nothing in mode '{mode}' acts on mappings yet, so this will not fire (these do: {})",
+                        crate::keymap::REMAPPABLE.join(", ")
                     );
                 }
                 match self.mappings.iter_mut().find(|m| m.lhs == lhs && m.modes == mode) {

@@ -1720,6 +1720,10 @@ impl HexSession {
             // No shell here to ask, and a hex dump has nothing you would
             // sweep with the terminal's own selection anyway.
             true,
+            // No shell in scope here either, so no mapping table to
+            // consult -- `bish tool hex`'s own colon line is not the
+            // command mode `::bish map -m command` means.
+            Vec::new(),
         );
         self.registers = registers;
         if matches!(outcome, Ok(editor::ReadOutcome::CtrlL)) {

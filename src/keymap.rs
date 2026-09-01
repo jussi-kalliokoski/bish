@@ -188,7 +188,7 @@ pub const DEFAULT_MODE: &str = "*";
 /// reported as not yet remappable rather than being silently stored and
 /// never fired, which is the worse of the two failures: a mapping that
 /// lists but does nothing gives no hint that anything is missing.
-pub const REMAPPABLE: &[&str] = &["normal", "visual"];
+pub const REMAPPABLE: &[&str] = &["normal", "visual", "insert", "command"];
 
 /// One `::bish map` entry.
 ///
@@ -230,6 +230,15 @@ pub fn mode_glob_is_known(glob: &str) -> bool {
 /// The modes a `--mode` glob selects, in the order `MODES` lists them.
 pub fn modes_matching(glob: &str) -> Vec<&'static str> {
     MODES.iter().copied().filter(|m| crate::glob::matches(glob, m)).collect()
+}
+
+/// Whether a glob covers a mode driven by `VimKeys`, and so one where a
+/// right-hand side resolves to a *named action* rather than just to
+/// keys. Normal and visual share that machine; insert, command and
+/// terminal dispatch on raw keys and have no such vocabulary, which is
+/// why both validation and the listing have to ask.
+pub fn has_vim_mode(glob: &str) -> bool {
+    modes_matching(glob).iter().any(|m| *m == "normal" || *m == "visual")
 }
 
 /// Whether a `--mode` glob selects nothing that can act on a mapping --
@@ -289,7 +298,7 @@ pub fn usage() -> Vec<String> {
         "Always non-recursive, as vim's `noremap` is: ACTION-KEYS mean what".to_string(),
         "they mean by default and never chain through another mapping.".to_string(),
         format!("-m is a glob over modes ({}), default '*'.", MODES.join(", ")),
-        format!("Only {} act on mappings so far.", REMAPPABLE.join(" and ")),
+        format!("Modes that act on mappings so far: {}.", REMAPPABLE.join(", ")),
         "Write a space as <Space>, a literal < as <lt>.".to_string(),
         "Quote KEYS in the shell: a bare < is a redirection.".to_string(),
     ]
@@ -487,6 +496,19 @@ mod tests {
     }
 
     #[test]
+    fn only_the_vim_driven_modes_resolve_keys_to_named_actions() {
+        // What the fourth column of a listing means, and whether a
+        // right-hand side has to resolve at all. `<Esc>` is a fine
+        // insert-mode mapping and no normal-mode action whatsoever.
+        assert!(has_vim_mode("normal"));
+        assert!(has_vim_mode("visual"));
+        assert!(has_vim_mode(DEFAULT_MODE));
+        assert!(!has_vim_mode("insert"));
+        assert!(!has_vim_mode("command"));
+        assert!(!has_vim_mode("@(insert|command|terminal)"));
+    }
+
+    #[test]
     fn a_mode_glob_selects_modes_the_way_abbr_selects_languages() {
         assert_eq!(modes_matching("normal"), vec!["normal"]);
         assert_eq!(modes_matching(DEFAULT_MODE), MODES.to_vec());
@@ -515,9 +537,13 @@ mod tests {
         assert!(!never_fires(DEFAULT_MODE));
         assert!(!never_fires("normal"));
         assert!(!never_fires("*al"));
-        // These genuinely cannot fire, which is worth saying.
-        assert!(never_fires("insert"));
-        assert!(never_fires("@(command|terminal)"));
+        assert!(!never_fires("insert"));
+        assert!(!never_fires("command"));
+        // Terminal is the one mode left that cannot act on a mapping:
+        // it forwards raw bytes to the program that owns the keyboard
+        // and never decodes keys at all. Saying so is worth it.
+        assert!(never_fires("terminal"));
+        assert!(!never_fires("@(command|terminal)"), "command can, so this one is not a dead mapping");
     }
 
     #[test]

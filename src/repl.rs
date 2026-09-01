@@ -1052,6 +1052,10 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
                 changed
             },
             prompt_claims_mouse(mouse, sinks_are_grid),
+            // The shell prompt is not one of the five modes `::bish map`
+            // knows -- an inert table keeps it behaving exactly as it
+            // did before there were any mappings.
+            Vec::new(),
         ) {
             Ok(ReadOutcome::Eof) => {
                 // Whether closing *this* (window, top-frame) reference
@@ -12042,6 +12046,10 @@ fn run_command_mode(
         // -- this colon line has no row of its own to draw a menu into,
         // so Tab cycles by splicing, which is what a one-line prompt
         // wants anyway.
+        // Snapshotted before the call: the `on_idle` closure below takes
+        // `sessions` mutably for the whole of it, so this cannot be read
+        // inline as another argument.
+        let command_mappings = sessions.get(&session_id).map(|s| s.shell.mappings.clone()).unwrap_or_default();
         match editor::read_line(
             &prompt_str,
             history,
@@ -12075,6 +12083,9 @@ fn run_command_mode(
             // The `mouse` bishopt -- off keeps the terminal's own
             // selection working here (see enable_maybe_mouse).
             mouse,
+            // This colon line *is* command mode, so `::bish map -m
+            // command` applies to it.
+            command_mappings,
         ) {
             // Command mode discards whatever was typed either way, so
             // `text` is nothing to it -- see that field's own doc comment

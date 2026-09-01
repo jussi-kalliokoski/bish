@@ -1019,7 +1019,17 @@ impl VimKeys {
     /// The loop is the buffering: while a multi-key mapping is still
     /// being decided nothing is returned yet, so the caller simply waits
     /// on the next keystroke the way it waits on any other.
-    pub fn next_command_key(&mut self, mut read: impl FnMut() -> io::Result<Option<Key>>) -> io::Result<Option<Key>> {
+    pub fn next_command_key(&mut self, read: impl FnMut() -> io::Result<Option<Key>>) -> io::Result<Option<Key>> {
+        let mode = self.keymap_mode();
+        self.next_mapped_key(mode, read)
+    }
+
+    /// The same, for a mode that is not this machine's own -- Insert
+    /// mode passes "insert", command mode "command". Kept explicit
+    /// rather than inferred, because those modes are driven by other
+    /// loops entirely and `keymap_mode` only knows about normal and
+    /// visual.
+    pub fn next_mapped_key(&mut self, mode: &str, mut read: impl FnMut() -> io::Result<Option<Key>>) -> io::Result<Option<Key>> {
         loop {
             if let Some(key) = self.replay_queue.pop_front() {
                 return Ok(Some(key));
@@ -1031,7 +1041,6 @@ impl VimKeys {
             if self.matcher.is_empty() || self.wants_raw_key() {
                 return Ok(Some(key));
             }
-            let mode = self.keymap_mode();
             let mut out = self.matcher.feed(key, mode);
             if out.is_empty() {
                 continue;

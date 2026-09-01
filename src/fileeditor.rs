@@ -1477,7 +1477,15 @@ pub(crate) fn run_insert_mode(
         // the same `vk`, so nothing here needs its own bookkeeping. A
         // byte is already known ready (just confirmed above), so this
         // on_idle closure is never actually called.
-        let key = match vk.next_key(|| editor::read_key_idle(&mut || {}))? {
+        //
+        // `next_mapped_key` rather than `next_key`, so `::bish map -m
+        // insert` applies here -- the mode is passed explicitly because
+        // this loop, not `VimKeys`, is what makes it Insert mode. The
+        // several places below that read one further raw key for their
+        // own purposes (`<C-r>{register}`, `<C-o>`'s one-shot command)
+        // keep using `next_key` and stay unmapped, the same line Normal
+        // mode draws with `wants_raw_key`.
+        let key = match vk.next_mapped_key("insert", || editor::read_key_idle(&mut || {}))? {
             Some(k) => k,
             None => {
                 buf.set_mark('^', buf.cursor());

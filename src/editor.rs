@@ -1465,8 +1465,17 @@ pub fn read_line(
     // all, which is what hands the terminal's own selection back -- see
     // term::RawGuard::enable_maybe_mouse.
     mouse: bool,
+    // `::bish map -m command`. Empty for the shell prompt, which is not
+    // one of the remappable modes -- an empty table makes the whole
+    // mechanism inert, so that caller behaves exactly as before.
+    mappings: Vec<crate::keymap::Mapping>,
 ) -> io::Result<ReadOutcome> {
     let mut guard = Some(term::RawGuard::enable_maybe_mouse(0, mouse)?);
+    let mut matcher = crate::keymap::Matcher::new(mappings);
+    // Keys a mapping expanded to, beyond the first -- delivered before
+    // anything new is read, and never run back through the matcher,
+    // which is what keeps a mapping from chaining into another.
+    let mut mapped: std::collections::VecDeque<Key> = std::collections::VecDeque::new();
     let mut ed = match initial {
         Some((text, cursor)) => {
             let mut e = LineEditor::new();
@@ -1558,7 +1567,7 @@ pub fn read_line(
     let mut pending_key: Option<Key> = None;
 
     loop {
-        let key = match pending_key.take() {
+        let key = match pending_key.take().or_else(|| mapped.pop_front()) {
             Some(k) => k,
             None => {
                 // Waiting for the next byte out here rather than inside
@@ -1589,12 +1598,25 @@ pub fn read_line(
                 // A byte is already known ready, so this on_idle closure
                 // is never actually called -- kept only to match the
                 // existing signature.
-                match read_key_idle(&mut || {})? {
+                let raw = match read_key_idle(&mut || {})? {
                     Some(k) => k,
                     None => {
                         drop(guard.take());
                         return Ok(ReadOutcome::Eof);
                     }
+                };
+                if matcher.is_empty() {
+                    raw
+                } else {
+                    let mut out = matcher.feed(raw, "command");
+                    if out.is_empty() {
+                        // Mid-sequence: nothing to dispatch yet, so go
+                        // back and wait for the key that decides it.
+                        continue;
+                    }
+                    let first = out.remove(0);
+                    mapped.extend(out);
+                    first
                 }
             }
         };
