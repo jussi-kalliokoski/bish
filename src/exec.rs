@@ -10651,6 +10651,54 @@ fn printf_format_once(format: &str, values: &[String], idx: &mut usize, out: &mu
             continue;
         }
 
+        // bash's `%(FORMAT)T`: the parenthesised part is a strftime
+        // format and the argument is a Unix timestamp, with `-1` (or no
+        // argument) meaning now. Read here, before the flag/width
+        // parsing below, because `(` is where the conversion's own
+        // syntax starts and none of those flags apply to it.
+        if chars.peek() == Some(&'(') {
+            chars.next();
+            let mut time_fmt = String::new();
+            let mut closed = false;
+            for c in chars.by_ref() {
+                if c == ')' {
+                    closed = true;
+                    break;
+                }
+                time_fmt.push(c);
+            }
+            // `%(unterminated` is not a time conversion at all; print it
+            // back the way an unknown conversion is printed back.
+            if !closed || chars.next() != Some('T') {
+                // Not a time conversion after all. Print it back the way
+                // an unknown conversion is printed back -- but through
+                // the escape expander, since the characters swallowed
+                // looking for the `)` never reached the `\n`/`\t`
+                // handling at the top of this loop and would otherwise
+                // come out as a literal backslash. bash calls this an
+                // invalid time format and warns; bish just prints it.
+                out.push_str("%(");
+                out.push_str(&echo_expand_escapes(&time_fmt).0);
+                if closed {
+                    out.push(')');
+                }
+                continue;
+            }
+            let arg = values.get(*idx).cloned().unwrap_or_default();
+            if !arg.is_empty() {
+                *idx += 1;
+            }
+            let secs = match arg.trim().parse::<i64>() {
+                // bash: -1 is now, -2 is when the shell started. bish
+                // has no start-time to report, so both read as now --
+                // stated rather than silently wrong.
+                Ok(n) if n >= 0 => n,
+                _ => unix_now().as_secs() as i64,
+            };
+            out.push_str(&strftime_at(&time_fmt, &local_time_at(secs), Some(secs)));
+            continue;
+        }
+
         let mut left_align = false;
         let mut zero_pad = false;
         while let Some(&p) = chars.peek() {
@@ -11260,6 +11308,30 @@ struct CTm {
 // local wall-clock time -- computed via the same raw libc FFI pattern
 // already used elsewhere in this file (e.g. stdin_is_tty/stdin_ready),
 // rather than pulling in a date/time crate for it.
+// The broken-down local time for an arbitrary timestamp, where
+// `local_time_now` only ever answers for "right now" -- what
+// `printf %(...)T` and `HISTTIMEFORMAT` both need.
+fn local_time_at(epoch_secs: i64) -> CTm {
+    unsafe extern "C" {
+        fn localtime_r(t: *const i64, result: *mut CTm) -> *mut CTm;
+    }
+    let mut tm = CTm {
+        tm_sec: 0,
+        tm_min: 0,
+        tm_hour: 0,
+        tm_mday: 0,
+        tm_mon: 0,
+        tm_year: 0,
+        tm_wday: 0,
+        tm_yday: 0,
+        tm_isdst: 0,
+        tm_gmtoff: 0,
+        tm_zone: std::ptr::null(),
+    };
+    unsafe { localtime_r(&epoch_secs as *const i64, &mut tm as *mut CTm) };
+    tm
+}
+
 fn local_time_now() -> CTm {
     unsafe extern "C" {
         fn time(t: *mut i64) -> i64;
@@ -11309,6 +11381,36 @@ fn prompt_date() -> String {
 // literally, matching this codebase's own established convention for
 // an unrecognized escape sequence elsewhere (e.g. expand_backslash_escapes).
 fn strftime(fmt: &str, tm: &CTm) -> String {
+    strftime_at(fmt, tm, None)
+}
+
+// The zone abbreviation the C library put in `tm_zone` ("UTC", "EEST",
+// ...). A borrowed C string that libc owns and keeps alive, so this
+// copies it out rather than holding the pointer.
+fn tm_zone_name(tm: &CTm) -> String {
+    if tm.tm_zone.is_null() {
+        return String::new();
+    }
+    let mut out = String::new();
+    let mut p = tm.tm_zone;
+    // Bounded: a zone abbreviation is a handful of bytes, and a
+    // runaway pointer must not become a runaway loop.
+    for _ in 0..32 {
+        let byte = unsafe { *p };
+        if byte == 0 {
+            break;
+        }
+        out.push(byte as u8 as char);
+        p = unsafe { p.add(1) };
+    }
+    out
+}
+
+// The same, with the timestamp `tm` was derived from -- `%s` is the one
+// directive that cannot be recovered from a broken-down time without
+// re-deriving the calendar, and the callers that want it always have it.
+// `None` prints `%s` literally rather than guessing.
+fn strftime_at(fmt: &str, tm: &CTm, epoch: Option<i64>) -> String {
     let year = tm.tm_year + 1900;
     let hour24 = tm.tm_hour;
     let hour12 = match hour24 % 12 {
@@ -11344,6 +11446,26 @@ fn strftime(fmt: &str, tm: &CTm) -> String {
             'j' => out.push_str(&format!("{:03}", tm.tm_yday + 1)),
             'T' => out.push_str(&format!("{:02}:{:02}:{:02}", hour24, tm.tm_min, tm.tm_sec)),
             'F' => out.push_str(&format!("{:04}-{:02}-{:02}", year, tm.tm_mon + 1, tm.tm_mday)),
+            'R' => out.push_str(&format!("{:02}:{:02}", hour24, tm.tm_min)),
+            'D' => out.push_str(&format!("{:02}/{:02}/{:02}", tm.tm_mon + 1, tm.tm_mday, year.rem_euclid(100))),
+            'C' => out.push_str(&format!("{:02}", year.div_euclid(100))),
+            'u' => out.push_str(&(if tm.tm_wday == 0 { 7 } else { tm.tm_wday }).to_string()),
+            'w' => out.push_str(&tm.tm_wday.to_string()),
+            'n' => out.push('\n'),
+            't' => out.push('\t'),
+            // The offset the C library resolved for *this* timestamp, so
+            // a summer date formats with summer's offset rather than
+            // today's -- which is the whole reason `tm_gmtoff` is filled
+            // in per-conversion.
+            'z' => {
+                let (sign, off) = if tm.tm_gmtoff < 0 { ('-', -tm.tm_gmtoff) } else { ('+', tm.tm_gmtoff) };
+                out.push_str(&format!("{sign}{:02}{:02}", off / 3600, (off % 3600) / 60));
+            }
+            'Z' => out.push_str(&tm_zone_name(tm)),
+            's' => match epoch {
+                Some(secs) => out.push_str(&secs.to_string()),
+                None => out.push_str("%s"),
+            },
             '%' => out.push('%'),
             other => {
                 out.push('%');
@@ -12662,6 +12784,49 @@ fn write_diagnostic(target: &Option<String>, msg: &str, sink: OutputSink) {
 // needs no external crate, matching the zero-dependency stance elsewhere.
 #[cfg(test)]
 mod tests {
+    // Pinned to UTC so the expected strings do not depend on where this
+    // runs -- the same `TZ`+`tzset` trick git.rs's own date test uses.
+    fn utc_printf(format: &str, args: &[&str]) -> String {
+        unsafe extern "C" {
+            fn tzset();
+        }
+        let _guard = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let previous = std::env::var("TZ").ok();
+        unsafe { std::env::set_var("TZ", "UTC0") };
+        unsafe { tzset() };
+        let values: Vec<String> = args.iter().map(|a| (*a).to_string()).collect();
+        let (mut idx, mut out) = (0, String::new());
+        super::printf_format_once(format, &values, &mut idx, &mut out);
+        match previous {
+            Some(tz) => unsafe { std::env::set_var("TZ", tz) },
+            None => unsafe { std::env::remove_var("TZ") },
+        }
+        unsafe { tzset() };
+        out
+    }
+
+    #[test]
+    fn printf_formats_a_timestamp_the_way_bash_does() {
+        // Checked against real bash with the same inputs.
+        assert_eq!(utc_printf("%(%Y-%m-%d)T", &["0"]), "1970-01-01");
+        assert_eq!(utc_printf("%(%F %T)T", &["1000000000"]), "2001-09-09 01:46:40");
+        // `%s` is the one directive a broken-down time cannot answer on
+        // its own, so the timestamp is threaded through for it.
+        assert_eq!(utc_printf("%(%s)T", &["1234567890"]), "1234567890");
+        // Directives the PS1 escapes never needed.
+        assert_eq!(utc_printf("%(%R|%D|%u|%w|%C)T", &["1000000000"]), "01:46|09/09/01|7|0|20");
+        assert_eq!(utc_printf("%(%z)T", &["0"]), "+0000");
+    }
+
+    #[test]
+    fn a_malformed_time_conversion_is_printed_back_rather_than_swallowed() {
+        // bash calls this an invalid time format and warns; either way
+        // the text has to come out, and the escapes in it still count --
+        // they never reached the escape handling at the top of the loop.
+        assert_eq!(utc_printf("no-time %(unterminated\n", &[]), "no-time %(unterminated\n");
+        assert_eq!(utc_printf("%(%F)X", &["0"]), "%(%F)");
+    }
+
     // `change_directory` moves the real process, so these must not run
     // beside anything else that reads or sets the cwd -- same shared-
     // mutex fix, and the same poisoned-lock recovery, as session.rs's
