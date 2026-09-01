@@ -23,6 +23,7 @@ mod html;
 mod inflate;
 mod ini;
 mod json;
+mod keymap;
 mod lexer;
 mod lsp;
 mod lspclient;
