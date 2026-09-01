@@ -623,7 +623,8 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
     // says `shopt -s expand_aliases` itself.
     shell.enable_shopt("expand_aliases");
 
-    let mut cmd_history = History::load(".bish_cmd_history");
+    let history_size = shell.bishopt_int("history_size").max(0) as usize;
+    let mut cmd_history = History::load(".bish_cmd_history", history_size);
     // The whole-shell register table (yank/put/<C-r>) -- one instance,
     // shared globally across every window/pane/session, matching both vim
     // (registers are global to the editor instance, not per-buffer) and
@@ -638,7 +639,7 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
     let root_cwd = shell.cwd.clone();
     let root_lsp: Rc<RefCell<lspclient::Table>> = Rc::new(RefCell::new(lspclient::Table::default()));
     install_service_table(&mut shell, &root_lsp);
-    let root_history = Rc::new(RefCell::new(History::load(".bish_history")));
+    let root_history = Rc::new(RefCell::new(History::load(".bish_history", history_size)));
     install_history(&mut shell, &root_history);
     sessions.insert(
         0,
@@ -1964,7 +1965,12 @@ fn run_edit_impl(targets: &[fileeditor::EditTarget], attach_debug: bool) -> i32 
     shell.enable_monitor_mode();
     let root_cwd = shell.cwd.clone();
 
-    let mut cmd_history = History::load(".bish_cmd_history");
+    let history_size = shell.bishopt_int("history_size").max(0) as usize;
+    let mut cmd_history = History::load(".bish_cmd_history", history_size);
+    // Hoisted above the SessionState literal below: `shell` is moved
+    // into its first field, so the bound cannot be read from it by the
+    // time `history:` is evaluated.
+    let edit_history = Rc::new(RefCell::new(History::load(".bish_history", history_size)));
     let mut registers = Registers::new();
     let (mut term_rows, mut term_cols) = query_term_size();
 
@@ -1986,7 +1992,7 @@ fn run_edit_impl(targets: &[fileeditor::EditTarget], attach_debug: bool) -> i32 
             lsp_inlay_applied: None,
             buffer: String::new(),
             buffer_unrecorded: false,
-            history: Rc::new(RefCell::new(History::load(".bish_history"))),
+            history: edit_history,
             screen: root_screen,
             warned_stopped_jobs: false,
             dir_history: vec![root_cwd],
@@ -14630,7 +14636,7 @@ mod compositor_frame_output_tests {
             shell: exec::Shell::new(),
             buffer: String::new(),
             buffer_unrecorded: false,
-            history: Rc::new(RefCell::new(History::load("/dev/null"))),
+            history: Rc::new(RefCell::new(History::load("/dev/null", 0))),
             screen: screen.clone(),
             warned_stopped_jobs: false,
             dir_history: Vec::new(),

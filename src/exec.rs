@@ -12168,6 +12168,10 @@ const KNOWN_BISHOPTS: &[(&str, BishOptDefault)] = &[
     // counterpart just below. Capped at half the pane, since a margin
     // wider than that has no middle left to keep the cursor in.
     ("scrolloff", BishOptDefault::Int(0, 0..=200)),
+    // No zero, deliberately: bash's HISTFILESIZE=0 truncates the file to
+    // nothing, which is a footgun for anyone who reads 0 as "unlimited".
+    // The top of the range is the unlimited-in-practice answer instead.
+    ("history_size", BishOptDefault::Int(10_000, 100..=1_000_000)),
     // ...and the two that matter while `wrap` is *off*. `sidescrolloff`
     // is vim's own: keep this many columns visible either side of the
     // cursor rather than letting it sit against the edge.
@@ -12365,6 +12369,7 @@ const BISHOPT_HELP: &[(&str, &str)] = &[
     ("showbreak", "What a continued row opens with. Empty for nothing."),
     ("wrap_column", "Wrap at this column rather than at the pane's edge. 0 means the pane."),
     ("scrolloff", "Keep this many lines visible above and below the cursor."),
+    ("history_size", "How many commands the history file keeps. Older ones are dropped oldest-first."),
     ("sidescrolloff", "Keep this many columns visible either side of the cursor, while not wrapping."),
     ("extends", "Shown in the last column when a line continues off the right edge."),
     ("precedes", "Shown in the first column when a line continues off the left edge."),

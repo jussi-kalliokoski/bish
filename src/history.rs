@@ -1,9 +1,21 @@
-// Command history: persisted to ~/.bish_history (plain text, one entry per
-// file line -- a stored entry's own newlines/backslashes are escaped so a
+// Command history: persisted to ~/.bish_history, one entry per file line
+// -- a stored entry's own newlines/backslashes are escaped so a
 // multi-line history entry, e.g. a whole recalled for-loop, round-trips
-// through the file as a single line rather than fragmenting on reload).
+// through the file as a single line rather than fragmenting on reload.
+// Each line an entry now carries its own metadata inline, ahead of the
+// command, in a shape that is still a runnable shell command; see
+// "The on-disk record format" below for what it looks like and why.
 // editor.rs is the only consumer of the search methods, driving fish-style
 // up/down: prefix-filtered rather than plain chronological recall.
+//
+// The file is bounded (the `history_size` bishopt, default 10,000
+// entries, dropped oldest-first). That bound is also the in-memory one,
+// since load() stops at it -- to_vec() re-walks the whole chain on every
+// keypress, so an unbounded file was an unbounded per-keystroke cost
+// too, and a session that now stays detached for weeks would have found
+// the other end of that. Trimming happens at load and, for a session
+// that never restarts, from record() once the file reaches twice the
+// bound; both go through compact(), under an flock.
 //
 // The filename is parameterized (see History::load) so command mode can
 // keep a second, independent instance (its own file, own entries) without
@@ -33,32 +45,37 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
-// `cwd` lands ahead of its consumer -- the suggestions engine
-// (bishedit::suggestion) wires it in as its own, later stage -- same
-// "build the seam, wire it in later" pattern already used elsewhere in
-// this codebase (manpages.rs, lexer.rs's SpannedItem).
-#[allow(dead_code)]
 struct Node {
     entry: String,
-    // The directory this entry was recorded from -- None for anything
-    // loaded from the history file (load() never has a cwd to attach;
-    // persistence for this field is deliberately deferred, see
-    // HistoryEntry's own doc comment on prev for why the same "we
-    // genuinely don't know" gate matters for sequence tracking too).
+    // The directory this entry was recorded from. Persisted as `-d`,
+    // so unlike before this survives a reload.
     cwd: Option<PathBuf>,
+    // This entry's own on-disk id, so a *later* entry can name it as
+    // its parent. Meaningless in memory beyond that -- the chain has
+    // real pointers and never looks an id up.
+    id: u64,
+    // The command this one actually ran after, which is NOT the same as
+    // `prev`: `prev` is the previous line in a file every bish process
+    // appends to concurrently, while this is the real predecessor,
+    // resolved through `-p`. Keeping them apart is the whole point of
+    // writing a parent id rather than relying on file order.
+    parent: Option<Rc<Node>>,
+    // Recorded live in this process, as opposed to loaded from disk. A
+    // fresh session's first command has no true predecessor -- whatever
+    // sits before it in the file is just another window's -- so
+    // `record` only takes a parent from a node that is `live`.
+    live: bool,
     prev: Option<Rc<Node>>,
 }
 
 // A directory-aware, borrowed view of one entry -- see History::entries.
-// Unused until the suggestions engine's own stage wires it in.
-#[allow(dead_code)]
 pub struct HistoryEntry<'a> {
     pub text: &'a str,
     pub cwd: Option<&'a Path>,
-    // The entry run immediately before this one, and ONLY when both it
-    // and this one were recorded live in this session's own chain -- see
-    // entries()'s own doc comment for why disk-loaded entries never get
-    // one, even though the underlying Node chain technically links them.
+    // The entry run immediately before this one. Now recovered from
+    // disk too, via the parent id each record carries -- which is what
+    // demotes `Confidence::Legacy` from "anything that was loaded" to
+    // "anything written before this format existed".
     pub prev: Option<&'a str>,
 }
 
@@ -71,22 +88,71 @@ pub struct HistoryEntry<'a> {
 pub struct History {
     path: Option<PathBuf>,
     tail: Option<Rc<Node>>,
+    // How many entries the file is allowed to keep -- the `history_size`
+    // bishopt, passed in rather than read here so history.rs keeps no
+    // opinion about where configuration lives. Also the in-memory bound,
+    // since load() stops at it: the chain is re-walked by to_vec() on
+    // every keypress, so an unbounded file was an unbounded per-keystroke
+    // cost as well as an unbounded file.
+    limit: usize,
+    // Entries appended by this process since the last compaction. The
+    // high-water check in record() is against `limit + this`, so a
+    // session that stays attached (or detached) for weeks still
+    // compacts rather than growing until its next start-up.
+    appended: usize,
 }
 
 impl History {
     // `filename` is a bare filename under $HOME, e.g. ".bish_history" for
     // the normal shell history or ".bish_cmd_history" for command mode's.
-    pub fn load(filename: &str) -> History {
-        let path = history_path(filename);
+    pub fn load(filename: &str, limit: usize) -> History {
+        History::load_at(history_path(filename), limit)
+    }
+
+    // The half of load() that has a path already. Split out so tests can
+    // point at a real temp file rather than mutating $HOME, which two
+    // tests running at once cannot both do.
+    fn load_at(path: Option<PathBuf>, limit: usize) -> History {
         let mut tail: Option<Rc<Node>> = None;
         if let Some(p) = &path {
             if let Ok(content) = std::fs::read_to_string(p) {
-                for line in content.lines() {
-                    tail = Some(Rc::new(Node { entry: unescape(line), cwd: None, prev: tail.take() }));
+                let lines: Vec<&str> = content.lines().collect();
+                let records: Vec<Record> = lines.iter().map(|l| parse_record(l)).collect();
+                // Trim *before* resolving parents, so an entry whose
+                // parent was trimmed away resolves to None rather than
+                // reaching for a node that is no longer here. Truncating
+                // a file that records a forest orphans branches, not
+                // just a prefix, and that has to be ordinary rather than
+                // exceptional.
+                let start = records.len().saturating_sub(limit);
+                let mut by_id: std::collections::HashMap<u64, Rc<Node>> = std::collections::HashMap::new();
+                for record in &records[start..] {
+                    // Last one wins on a duplicate id, the same rule a
+                    // repeated key follows elsewhere. A collision costs
+                    // one entry the wrong predecessor and nothing more.
+                    let parent = record.parent.and_then(|p| by_id.get(&p).cloned());
+                    let node = Rc::new(Node {
+                        entry: record.entry.clone(),
+                        cwd: record.cwd.clone(),
+                        id: record.id.unwrap_or(0),
+                        parent,
+                        live: false,
+                        prev: tail.take(),
+                    });
+                    if let Some(id) = record.id {
+                        by_id.insert(id, Rc::clone(&node));
+                    }
+                    tail = Some(node);
+                }
+                // The file was over the bound when this process opened
+                // it -- rewrite it now, while we already hold the whole
+                // content in memory and know exactly what survives.
+                if records.len() > limit {
+                    compact(p, limit);
                 }
             }
         }
-        History { path, tail }
+        History { path, tail, limit, appended: 0 }
     }
 
     // Cheap, no-copy fork for a newly created session (`window new`/
@@ -119,12 +185,54 @@ impl History {
         if self.tail.as_ref().map(|n| n.entry.as_str()) == Some(entry) {
             return;
         }
-        self.tail = Some(Rc::new(Node { entry: entry.to_string(), cwd: cwd.map(Path::to_path_buf), prev: self.tail.take() }));
+        // Only a live node is a true predecessor: whatever sits at the
+        // tail of a freshly loaded chain is the previous line in a file
+        // every session appends to, not the command this one just ran.
+        let parent = self.tail.as_ref().filter(|n| n.live).map(Rc::clone);
+        let id = fresh_id();
+        self.tail = Some(Rc::new(Node {
+            entry: entry.to_string(),
+            cwd: cwd.map(Path::to_path_buf),
+            id,
+            parent: parent.clone(),
+            live: true,
+            prev: self.tail.take(),
+        }));
         if let Some(p) = &self.path {
             if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(p) {
-                let _ = writeln!(f, "{}", escape(entry));
+                // One `write_all` of one line, deliberately -- not a
+                // `writeln!` per field and not a two-line record. A
+                // single write to a file opened O_APPEND is serialized
+                // on the inode, so concurrent sessions interleave
+                // whole entries and never halves of one. Every
+                // `window new`/split forks a History that keeps
+                // appending here, and a detached daemon makes
+                // concurrent writers ordinary rather than an edge case.
+                let mut line = format_record(id, parent.map(|n| n.id), cwd, entry);
+                line.push('\n');
+                let _ = f.write_all(line.as_bytes());
             }
         }
+        self.appended += 1;
+        self.maybe_compact();
+    }
+
+    // Compaction for a session that never restarts. Deliberately
+    // hysteretic: the file is allowed to reach twice the bound before
+    // being rewritten, so a long session pays for this once every
+    // `limit` commands rather than on every one. Skipped entirely when
+    // this process has not appended enough to be the one responsible.
+    fn maybe_compact(&mut self) {
+        if self.limit == 0 || self.appended < self.limit {
+            return;
+        }
+        self.appended = 0;
+        let Some(path) = self.path.clone() else { return };
+        let Ok(content) = std::fs::read_to_string(&path) else { return };
+        if content.lines().count() <= self.limit * 2 {
+            return;
+        }
+        compact(&path, self.limit);
     }
 
     // Walks this History's own chain into a plain, oldest-first Vec --
@@ -149,25 +257,24 @@ impl History {
     // (bishedit::suggestion), which needs more than to_vec()'s bare
     // strings: which directory an entry ran in, and what immediately
     // preceded it. Re-walked fresh every call, same "no caching, cheap
-    // enough" reasoning as to_vec() above. Unused until that engine's
-    // own stage wires it in.
-    #[allow(dead_code)]
+    // enough" reasoning as to_vec() above -- which is now bounded from
+    // the other end too, since load() stops at `limit`.
+    //
+    // `prev` reads straight off the node's own resolved parent. It used
+    // to be computed here, gated on both sides having a cwd, because a
+    // disk-loaded node's `.prev` is only the previous line in a shared
+    // file and had to be kept out of the sequence heuristic. With a
+    // parent id on disk that distinction lives in the data instead: a
+    // reloaded entry now knows what it actually followed.
     pub fn entries(&self) -> Vec<HistoryEntry<'_>> {
         let mut v = Vec::new();
         let mut cur = &self.tail;
         while let Some(node) = cur {
-            // `prev` is Some only when *both* this entry and the one
-            // before it were recorded live in this session's own chain
-            // (cwd.is_some() on both sides) -- a disk-loaded node's own
-            // `.prev` is just the previous *line in a file every bish
-            // process appends to concurrently*, not "the command that
-            // actually ran before this one," so it must not leak into
-            // the sequence heuristic as if it were.
-            let prev = match (&node.cwd, &node.prev) {
-                (Some(_), Some(p)) if p.cwd.is_some() => Some(p.entry.as_str()),
-                _ => None,
-            };
-            v.push(HistoryEntry { text: node.entry.as_str(), cwd: node.cwd.as_deref(), prev });
+            v.push(HistoryEntry {
+                text: node.entry.as_str(),
+                cwd: node.cwd.as_deref(),
+                prev: node.parent.as_ref().map(|p| p.entry.as_str()),
+            });
             cur = &node.prev;
         }
         v.reverse();
@@ -374,6 +481,295 @@ fn history_path(filename: &str) -> Option<PathBuf> {
     std::env::var("HOME").ok().map(|h| PathBuf::from(h).join(filename))
 }
 
+unsafe extern "C" {
+    fn flock(fd: i32, operation: i32) -> i32;
+}
+
+const LOCK_EX: i32 = 2;
+const LOCK_UN: i32 = 8;
+const LOCK_NB: i32 = 4;
+
+// Rewrites the history file down to its newest `limit` entries,
+// verbatim -- the surviving
+// lines are copied across exactly as they were read, never re-rendered,
+// so ids and timestamps stay what they were rather than every entry
+// claiming to have happened at compaction time.
+//
+// Held under an exclusive, non-blocking `flock` for the whole rewrite,
+// the same primitive (and the same reasoning) session.rs uses for its
+// pidfiles. Non-blocking on purpose: if another bish is already
+// compacting, the right move is to skip -- it is doing this exact work,
+// and a shell prompt is not somewhere to wait on a lock. The lock also
+// makes "read the survivors, write them back" a unit, so two sessions
+// crossing here cannot each write a different suffix over the other.
+//
+// Writes in place rather than through a temp file and a rename: every
+// other session holds an *append* fd on this inode, and renaming a new
+// file over it would send their next entries to an inode nothing will
+// ever read again. Truncating in place keeps every one of those fds
+// pointed at the file that survives. The cost of that choice is that a
+// crash mid-rewrite can leave the file short, which is why nothing here
+// treats a missing entry as an error.
+fn compact(path: &Path, limit: usize) {
+    use std::io::{Read, Seek, SeekFrom};
+    use std::os::unix::io::AsRawFd;
+    let Ok(mut file) = std::fs::OpenOptions::new().read(true).write(true).open(path) else { return };
+    let fd = file.as_raw_fd();
+    if unsafe { flock(fd, LOCK_EX | LOCK_NB) } != 0 {
+        return;
+    }
+    // Re-read here, under the lock, rather than reusing what the caller
+    // already has: between a caller's read and this rewrite another
+    // session can append, and that entry would be written straight back
+    // out of existence. Reading inside the lock makes the whole
+    // read-keep-write a unit.
+    let mut content = String::new();
+    if file.read_to_string(&mut content).is_err() {
+        unsafe { flock(fd, LOCK_UN) };
+        return;
+    }
+    let lines: Vec<&str> = content.lines().collect();
+    let mut out = String::new();
+    for line in &lines[lines.len().saturating_sub(limit)..] {
+        out.push_str(line);
+        out.push('\n');
+    }
+    let done = file
+        .set_len(0)
+        .and_then(|()| file.seek(SeekFrom::Start(0)))
+        .and_then(|_| file.write_all(out.as_bytes()))
+        .and_then(|()| file.flush());
+    let _ = done;
+    unsafe { flock(fd, LOCK_UN) };
+}
+
+// ---------------------------------------------------------------------
+// The on-disk record format
+// ---------------------------------------------------------------------
+//
+// Still one line per entry, still appended with a single write -- see
+// record() for why that matters. An entry recorded by this version
+// carries its metadata inline, ahead of the command it describes:
+//
+//   : --id 4f2a9c.. -p 91bce0.. -t '2026-09-01T03:45:00Z' -d '/home/j'; cargo test
+//
+// ...beginning with a space. Two properties fall out of that shape, and
+// both were the point of choosing it:
+//
+//   * The line is a valid shell command that does exactly what the bare
+//     command does. `:` is the null builtin -- exec.rs returns
+//     Status(0) without so much as looking at its arguments -- and `;`
+//     sequences the real command after it, so the exit status is the
+//     command's own. A line pasted back into a shell runs what it
+//     records. (Single-line entries only: a multi-line entry has its
+//     newlines escaped, exactly as it always did, and reads back as a
+//     literal `\n`.)
+//   * The leading space keeps it *out* of history if it is pasted back
+//     (repl.rs's starts_off_the_record), and going the other way
+//     guarantees a metadata line can never be mistaken for a legacy
+//     bare-command line -- a command beginning with a space was never
+//     recorded in the first place, so no pre-existing line can start
+//     with one.
+//
+// **Values are single-quoted, not double-quoted, and that is a security
+// property rather than a style choice.** The line is meant to be
+// executable, which is exactly what makes it exploitable if its values
+// expand. A directory name is attacker-influenceable -- unpack an
+// archive, `cd` into it, run anything -- and under double quotes a cwd
+// of `/tmp/$(...)` would put a live command substitution into the
+// history file that fires the moment the line is pasted back. Verified
+// against the real binary: double-quoted, the substitution runs; single
+// quoted, it does not. Single quotes expand nothing, and a `'` inside a
+// value uses the shell's own `'\''` idiom so the line still parses.
+//
+// Unknown flags are ignored on read, which is what makes the flag shape
+// worth its bytes: exit status, duration or anything else can be added
+// later without a second format migration.
+
+// A random 64-bit id, hex-formatted. Random rather than a counter
+// because ids have to be unique across *processes* that append to one
+// file with no coordination between them, and position-independent so
+// that trimming renumbers nothing.
+//
+// A collision has no error path anywhere downstream and deliberately so
+// (see resolve_parents): two entries sharing an id means one of them
+// resolves to the wrong predecessor, which costs a worse suggestion and
+// nothing else. splitmix64 over a pid/nanosecond seed, the same shape
+// exec.rs's own fresh_rng_seed already uses for `$RANDOM`.
+fn fresh_id() -> u64 {
+    use std::cell::Cell;
+    thread_local! { static STATE: Cell<u64> = const { Cell::new(0) }; }
+    STATE.with(|cell| {
+        let mut x = cell.get();
+        if x == 0 {
+            x = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0x2545F4914F6CDD1D)
+                ^ (std::process::id() as u64).wrapping_mul(0x9E3779B97F4A7C15);
+            if x == 0 {
+                x = 0x2545F4914F6CDD1D;
+            }
+        }
+        x = x.wrapping_add(0x9E3779B97F4A7C15);
+        cell.set(x);
+        let mut z = x;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+        z ^ (z >> 31)
+    })
+}
+
+// Wraps a value for the shell so the record stays a runnable line.
+// `escape` has already made it single-line; this only has to balance
+// the quotes, which for single quotes means the one classic idiom:
+// close, backslash-quote, reopen.
+fn single_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for c in s.chars() {
+        if c == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(c);
+        }
+    }
+    out.push('\'');
+    out
+}
+
+// UTC, `YYYY-MM-DDTHH:MM:SSZ`. Nothing reads this yet -- it is written
+// so the format does not need revisiting when something does. Days are
+// converted with the standard civil-from-days algorithm rather than
+// shelling out to `date`, for the same reason roff.rs parses roff
+// itself.
+fn iso_from_epoch(secs: i64) -> String {
+    let (days, rem) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
+    let (hh, mm, ss) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!("{year:04}-{month:02}-{day:02}T{hh:02}:{mm:02}:{ss:02}Z")
+}
+
+fn iso_now() -> String {
+    let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+    iso_from_epoch(secs as i64)
+}
+
+// One parsed line. A legacy bare line yields a Record with no metadata
+// at all, which is the honest reading of it -- there is none to recover.
+#[derive(Debug, PartialEq)]
+struct Record {
+    id: Option<u64>,
+    parent: Option<u64>,
+    cwd: Option<PathBuf>,
+    entry: String,
+}
+
+// Renders one record. `cwd` goes through `escape` before quoting so a
+// directory containing a newline still leaves the record on one line;
+// a path that is not valid UTF-8 is stored lossily, which loses the
+// directory heuristic for that one entry rather than the entry itself.
+fn format_record(id: u64, parent: Option<u64>, cwd: Option<&Path>, entry: &str) -> String {
+    let mut out = format!(" : --id {id:016x}");
+    if let Some(p) = parent {
+        out.push_str(&format!(" -p {p:016x}"));
+    }
+    out.push_str(&format!(" -t {}", single_quote(&iso_now())));
+    if let Some(dir) = cwd {
+        out.push_str(&format!(" -d {}", single_quote(&escape(&dir.to_string_lossy()))));
+    }
+    out.push_str("; ");
+    out.push_str(&escape(entry));
+    out
+}
+
+// Splits ` : <flags>; <command>` into its flag words and the command
+// text. Tokenized rather than split on the first `;`, because a
+// single-quoted value may legitimately contain one -- a directory can
+// be named anything at all, and a format that breaks on `mkdir 'a;b'`
+// would be a format that breaks.
+//
+// None for anything that is not a well-formed metadata line: no
+// prefix, an unterminated quote, or no `;` at all. Every one of those
+// reads as a legacy bare command instead, which is both the safe answer
+// and the right one for a file another version appended to.
+fn split_record(line: &str) -> Option<(Vec<String>, String)> {
+    let rest = line.strip_prefix(" : ")?;
+    let ch: Vec<char> = rest.chars().collect();
+    let (mut words, mut cur, mut have, mut i) = (Vec::new(), String::new(), false, 0);
+    while i < ch.len() {
+        match ch[i] {
+            ';' => {
+                if have {
+                    words.push(cur);
+                }
+                let tail: String = ch[i + 1..].iter().collect();
+                return Some((words, tail.strip_prefix(' ').map(str::to_string).unwrap_or(tail)));
+            }
+            ' ' => {
+                if have {
+                    words.push(std::mem::take(&mut cur));
+                    have = false;
+                }
+                i += 1;
+            }
+            '\'' => {
+                have = true;
+                i += 1;
+                while i < ch.len() && ch[i] != '\'' {
+                    cur.push(ch[i]);
+                    i += 1;
+                }
+                if i >= ch.len() {
+                    return None;
+                }
+                i += 1;
+                // The `'\''` idiom: the section just closed, a literal
+                // quote follows, and the value continues in the next
+                // section -- which the outer loop picks up on its own.
+                if i + 1 < ch.len() && ch[i] == '\\' && ch[i + 1] == '\'' {
+                    cur.push('\'');
+                    i += 2;
+                }
+            }
+            c => {
+                have = true;
+                cur.push(c);
+                i += 1;
+            }
+        }
+    }
+    None
+}
+
+// Reads one file line. Anything that does not parse as a metadata
+// record is a bare command -- that covers every line written before
+// this format existed, and every line an older bish appends to a file
+// this one has already started writing.
+fn parse_record(line: &str) -> Record {
+    let Some((words, entry)) = split_record(line) else {
+        return Record { id: None, parent: None, cwd: None, entry: unescape(line) };
+    };
+    let value = |flag: &str| {
+        words.iter().position(|w| w == flag).and_then(|i| words.get(i + 1)).map(|s| s.as_str())
+    };
+    let hex = |flag: &str| value(flag).and_then(|v| u64::from_str_radix(v, 16).ok());
+    Record {
+        id: hex("--id"),
+        parent: hex("-p"),
+        cwd: value("-d").map(|d| PathBuf::from(unescape(d))),
+        entry: unescape(&entry),
+    }
+}
+
 fn escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
@@ -411,12 +807,105 @@ fn unescape(s: &str) -> String {
 mod tests {
     use super::*;
 
-    // `History { path: None, tail: None }` is a fully valid, filesystem-
-    // free empty history -- record()'s own disk write is already a no-op
-    // whenever `path` is None (see record()'s own body), so every test
-    // here is deterministic with no temp files involved.
+    // A fully valid, filesystem-free empty history: record()'s own disk
+    // write is already a no-op whenever `path` is None, so tests built
+    // on this are deterministic with no temp files involved. Tests that
+    // need real file behaviour (loading, trimming, legacy lines) use
+    // load_at with a temp path instead.
     fn empty() -> History {
-        History { path: None, tail: None }
+        History { path: None, tail: None, limit: 1000, appended: 0 }
+    }
+
+    #[test]
+    fn a_record_round_trips_through_the_line_it_renders() {
+        let line = format_record(0x4f2a, Some(0x91bc), Some(Path::new("/home/j/bish")), "cargo test");
+        let got = parse_record(&line);
+        assert_eq!(got.id, Some(0x4f2a));
+        assert_eq!(got.parent, Some(0x91bc));
+        assert_eq!(got.cwd, Some(PathBuf::from("/home/j/bish")));
+        assert_eq!(got.entry, "cargo test");
+    }
+
+    #[test]
+    fn the_line_is_shaped_to_run_as_the_command_it_records() {
+        let line = format_record(1, None, Some(Path::new("/w")), "echo hi");
+        // ` : ` so the null builtin swallows the metadata, a leading
+        // space so pasting it back does not re-record it, and the real
+        // command after a `;` so the exit status is the command's own.
+        assert!(line.starts_with(" : "), "{line}");
+        assert!(line.ends_with("; echo hi"), "{line}");
+        assert!(!line.contains('\n'), "one entry stays one line");
+    }
+
+    #[test]
+    fn a_value_is_single_quoted_so_the_line_cannot_execute_it() {
+        // Not a style preference. The line is meant to be runnable,
+        // which is what would make a double-quoted value runnable too --
+        // and a directory name is attacker-influenceable. Verified
+        // against the real binary: under double quotes the substitution
+        // fires, under single quotes it does not.
+        let line = format_record(1, None, Some(Path::new("/tmp/$(echo pwned)")), "ls");
+        assert!(line.contains("-d '/tmp/$(echo pwned)'"), "{line}");
+        assert!(!line.contains('"'), "{line}");
+        assert_eq!(parse_record(&line).cwd, Some(PathBuf::from("/tmp/$(echo pwned)")));
+    }
+
+    #[test]
+    fn a_value_may_contain_the_delimiter_and_the_quote() {
+        // A directory can be named anything, so neither a `;` nor a `'`
+        // in one may break the split -- which is why the metadata is
+        // tokenized rather than cut at the first `;`.
+        for dir in ["/tmp/a;b", "/tmp/it's", "/tmp/;';", "/tmp/a b"] {
+            let line = format_record(7, None, Some(Path::new(dir)), "echo x; echo y");
+            let got = parse_record(&line);
+            assert_eq!(got.cwd, Some(PathBuf::from(dir)), "{line}");
+            // ...and the command keeps its own `;`, which must not be
+            // escaped: escaping it would change what the line runs.
+            assert_eq!(got.entry, "echo x; echo y", "{line}");
+        }
+    }
+
+    #[test]
+    fn a_multi_line_entry_still_occupies_one_line() {
+        let line = format_record(1, None, None, "for i in 1 2 3\ndo echo $i\ndone");
+        assert!(!line.contains('\n'));
+        assert_eq!(parse_record(&line).entry, "for i in 1 2 3\ndo echo $i\ndone");
+    }
+
+    #[test]
+    fn an_unparseable_metadata_line_reads_as_a_plain_command() {
+        // Never an error: a truncated or foreign line is more useful
+        // read as the text it is than dropped.
+        for line in [" : --id 00 -d 'unterminated; ls", " : --id 00 no semicolon here", "plain old command"] {
+            let got = parse_record(line);
+            assert!(!got.entry.is_empty(), "{line}");
+        }
+        assert_eq!(parse_record("plain old command").entry, "plain old command");
+    }
+
+    #[test]
+    fn unknown_flags_are_ignored_rather_than_refused() {
+        // What the flag shape is for: a later version can add a field
+        // without a second format migration.
+        let got = parse_record(" : --id 000000000000002a --exit 3 --duration '1.5' -d '/w'; make");
+        assert_eq!(got.id, Some(42));
+        assert_eq!(got.cwd, Some(PathBuf::from("/w")));
+        assert_eq!(got.entry, "make");
+    }
+
+    #[test]
+    fn ids_do_not_repeat() {
+        let ids: std::collections::HashSet<u64> = (0..1000).map(|_| fresh_id()).collect();
+        assert_eq!(ids.len(), 1000);
+    }
+
+    #[test]
+    fn a_timestamp_is_utc_iso_8601() {
+        assert_eq!(iso_from_epoch(0), "1970-01-01T00:00:00Z");
+        assert_eq!(iso_from_epoch(1_756_697_100), "2025-09-01T03:25:00Z");
+        // A leap day, which is where a hand-rolled civil calendar goes
+        // wrong if it is going to.
+        assert_eq!(iso_from_epoch(1_709_208_000), "2024-02-29T12:00:00Z");
     }
 
     #[test]
@@ -430,11 +919,14 @@ mod tests {
         assert_eq!(entries[0].cwd, Some(cwd.as_path()));
     }
 
-    // Simulates what load() produces (cwd: None throughout) without
-    // touching the filesystem -- record(entry, None) yields the exact
-    // same Node shape a disk-loaded line would.
+    // Command mode's own history, which records window-management
+    // commands and has no shell cwd worth tagging them with. This used
+    // to double as a stand-in for a disk-loaded chain, back when a
+    // loaded entry never had a cwd either -- see
+    // prev_is_none_for_first_live_entry_after_a_disk_loaded_tail, which
+    // now loads a real file instead.
     #[test]
-    fn disk_loaded_shaped_chain_carries_no_cwd() {
+    fn an_entry_recorded_without_a_directory_reports_none() {
         let mut h = empty();
         h.record("ls -la", None);
         h.record("git status", None);
@@ -454,19 +946,108 @@ mod tests {
         assert_eq!(entries[1].prev, Some("git status"));
     }
 
+    // A real file, not a $HOME override -- see load_at.
+    fn temp_history(tag: &str, contents: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("bish-hist-{}-{}", tag, std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("history");
+        std::fs::write(&path, contents).unwrap();
+        path
+    }
+
     #[test]
     fn prev_is_none_for_first_live_entry_after_a_disk_loaded_tail() {
-        let mut h = empty();
-        // A disk-loaded-shaped entry (no cwd), then the first entry
-        // actually recorded live this session.
-        h.record("some old command", None);
+        // Genuinely loaded from a file, rather than approximated with a
+        // cwd-less record(): a disk entry now carries a cwd of its own,
+        // so "no cwd" stopped being a stand-in for "came from disk" and
+        // `live` is the real distinction.
+        let path = temp_history("first-live", " : --id 00000000000000a1 -d '/tmp/proj'; some old command\n");
+        let mut h = History::load_at(Some(path), 100);
+        assert_eq!(h.entries()[0].cwd, Some(Path::new("/tmp/proj")), "a loaded entry keeps its directory");
+
         let cwd = PathBuf::from("/tmp/proj");
         h.record("cargo build", Some(&cwd));
         let entries = h.entries();
-        assert_eq!(entries[0].prev, None);
-        // The live entry's own predecessor is the disk-loaded one, which
-        // has no cwd -- must not be reported as a real sequence link.
+        // The loaded entry is only the previous *line in a file every
+        // session appends to*. It is not what this session just ran, so
+        // it must not become a sequence link.
         assert_eq!(entries[1].prev, None);
+    }
+
+    #[test]
+    fn a_reloaded_entry_keeps_the_command_it_actually_followed() {
+        // The point of writing a parent id at all: this used to be
+        // unrecoverable, and every reloaded entry ranked `Legacy`.
+        let path = temp_history(
+            "parents",
+            " : --id 000000000000000a -d '/w'; git add -A\n : --id 000000000000000b -p 000000000000000a -d '/w'; git commit\n",
+        );
+        let h = History::load_at(Some(path), 100);
+        let entries = h.entries();
+        assert_eq!(entries[0].prev, None);
+        assert_eq!(entries[1].prev, Some("git add -A"));
+    }
+
+    #[test]
+    fn a_parent_that_was_trimmed_away_resolves_to_nothing() {
+        // Truncation orphans branches rather than a clean prefix, so an
+        // unresolvable parent has to be ordinary. `-p ...0a` survives
+        // into the kept window with nothing to point at.
+        let path = temp_history(
+            "orphan",
+            " : --id 000000000000000a -d '/w'; oldest\n : --id 000000000000000b -p 000000000000000a -d '/w'; newest\n",
+        );
+        let h = History::load_at(Some(path), 1);
+        let entries = h.entries();
+        assert_eq!(entries.len(), 1, "the bound is in entries");
+        assert_eq!(entries[0].text, "newest");
+        assert_eq!(entries[0].prev, None, "an orphan degrades, it does not dangle");
+    }
+
+    #[test]
+    fn loading_past_the_bound_rewrites_the_file_to_it() {
+        let lines: String = (0..10).map(|i| format!(" : --id {i:016x} -d '/w'; echo {i}\n")).collect();
+        let path = temp_history("trim", &lines);
+        let h = History::load_at(Some(path.clone()), 4);
+        assert_eq!(h.entries().len(), 4);
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(on_disk.lines().count(), 4, "the file is rewritten, not just the view");
+        // Verbatim, so ids and timestamps stay what they were rather
+        // than every survivor claiming to have happened just now.
+        assert!(on_disk.starts_with(" : --id 0000000000000006 -d '/w'; echo 6\n"), "{on_disk}");
+    }
+
+    #[test]
+    fn a_session_that_never_restarts_still_compacts() {
+        // The other half of the bound. Trimming at load covers every
+        // ordinary shell; a session detached for weeks never reaches
+        // one, and used to grow without limit.
+        let path = temp_history("highwater", "");
+        let mut h = History::load_at(Some(path.clone()), 4);
+        for i in 0..12 {
+            h.record(&format!("echo {i}"), Some(Path::new("/w")));
+        }
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        // Hysteretic on purpose: the file is allowed to reach twice the
+        // bound before a rewrite, so this costs one pass per `limit`
+        // commands rather than one per command.
+        assert!(on_disk.lines().count() <= 8, "{} lines", on_disk.lines().count());
+        assert!(on_disk.lines().count() >= 4);
+        // Whatever survived is still the newest, and still parses.
+        let last = parse_record(on_disk.lines().last().unwrap());
+        assert_eq!(last.entry, "echo 11");
+    }
+
+    #[test]
+    fn a_legacy_bare_line_still_loads_as_a_command() {
+        // The 1,000-odd lines already in everyone's file, and anything
+        // an older bish appends to one this version has started writing.
+        let path = temp_history("legacy", "ls -la\ncargo test\n : --id 000000000000000c -d '/w'; git status\n");
+        let h = History::load_at(Some(path), 100);
+        let entries = h.entries();
+        assert_eq!(entries.iter().map(|e| e.text).collect::<Vec<_>>(), vec!["ls -la", "cargo test", "git status"]);
+        assert_eq!(entries[0].cwd, None, "there is no directory to recover, and none is invented");
+        assert_eq!(entries[2].cwd, Some(Path::new("/w")));
     }
 
     #[test]
@@ -517,13 +1098,14 @@ impl crate::exec::HistoryAccess for History {
             if i + 1 == n {
                 continue;
             }
-            // The rebuilt chain carries no cwd: the directory each entry
-            // ran in is not recoverable from `entries()`, and inventing
-            // one would feed the suggestion engine's own
-            // directory heuristic a lie. Losing it makes those entries
-            // rank as `Legacy`, which is exactly what a disk-loaded
-            // entry already is.
-            tail = Some(Rc::new(Node { entry, cwd: None, prev: tail.take() }));
+            // The rebuilt chain carries no cwd and no parent: neither is
+            // recoverable from `entries()`'s bare strings, and inventing
+            // either would feed the suggestion engine's own directory
+            // and sequence heuristics a lie. Losing them makes those
+            // entries rank as `Legacy` -- a real cost now that a
+            // reloaded entry would otherwise keep both, and still the
+            // honest answer for a chain rebuilt from text alone.
+            tail = Some(Rc::new(Node { entry, cwd: None, id: fresh_id(), parent: None, live: false, prev: tail.take() }));
         }
         self.tail = tail;
         true
@@ -536,7 +1118,7 @@ mod history_access_tests {
     use crate::exec::HistoryAccess;
 
     fn built(entries: &[&str]) -> History {
-        let mut h = History { path: None, tail: None };
+        let mut h = History { path: None, tail: None, limit: 1000, appended: 0 };
         for e in entries {
             h.record(e, Some(std::path::Path::new("/tmp")));
         }

@@ -1814,7 +1814,7 @@ mod tests {
                 other => Key::Char(other),
             };
             session.checkpoint();
-            session.handle_key(key, RECT, 24, RECT.cols, &History::load("/dev/null"), &mut || {});
+            session.handle_key(key, RECT, 24, RECT.cols, &History::load("/dev/null", 0), &mut || {});
         }
     }
 
@@ -2071,7 +2071,7 @@ mod tests {
         feed(&mut s, "u");
         assert_eq!(s.buf.bytes(), b"ABCD");
         s.checkpoint();
-        s.handle_key(Key::CtrlR, RECT, 24, RECT.cols, &History::load("/dev/null"), &mut || {});
+        s.handle_key(Key::CtrlR, RECT, 24, RECT.cols, &History::load("/dev/null", 0), &mut || {});
         assert_eq!(s.buf.bytes(), b"BCD");
     }
 
@@ -2129,7 +2129,7 @@ mod tests {
     #[test]
     fn ctrl_a_and_ctrl_x_increment_the_byte_under_the_cursor() {
         let mut s = session_with(&[0xFE]);
-        let history = History::load("/dev/null");
+        let history = History::load("/dev/null", 0);
         s.handle_key(Key::CtrlA, RECT, 24, RECT.cols, &history, &mut || {});
         assert_eq!(s.buf.bytes(), &[0xFF]);
         s.handle_key(Key::CtrlA, RECT, 24, RECT.cols, &history, &mut || {});
