@@ -7121,7 +7121,66 @@ impl Shell {
         {
             return self.call_function(&body, argv[1..].to_vec());
         }
-        self.dispatch_builtin_or_external(&argv, name, cmd, background, false, &array_literal_args)
+        // A prefix assignment (`IFS=: read a b`) is in scope for the
+        // command it prefixes and gone afterwards. The external path
+        // already handled this by passing them as environment -- see
+        // run_external's own `command.env` loop -- but a builtin reads
+        // the *shell's* variables, so nothing reached it: `IFS=: read`
+        // split on the old IFS and `HISTTIMEFORMAT=x history` printed no
+        // times.
+        //
+        // Applied here, around the dispatch, rather than inside it: this
+        // is the one place that knows the command is about to run and
+        // that it is not a function call (bash lets an assignment
+        // outlive a function, which is its own rule and not this one).
+        let restore = self.apply_prefix_assigns(cmd);
+        let result = self.dispatch_builtin_or_external(&argv, name, cmd, background, false, &array_literal_args);
+        self.restore_prefix_assigns(restore);
+        result
+    }
+
+    // Applies `cmd`'s prefix assignments to the shell's own variables,
+    // handing back what was there before so it can be put back.
+    //
+    // `None` for a name that was unset, which has to be restored as
+    // *unset* rather than as empty -- `FOO=x cmd` must not leave `FOO`
+    // behind set to nothing, which `${FOO-default}` and `-u` both
+    // notice.
+    fn apply_prefix_assigns(&mut self, cmd: &SimpleCommand) -> Vec<(String, Option<String>)> {
+        let mut saved = Vec::new();
+        for (name, mode, val) in &cmd.assigns {
+            let v = self.expand_word(val);
+            let v = match mode {
+                AssignMode::Set => v,
+                AssignMode::Append => self.lookup_var(name) + &v,
+            };
+            saved.push((name.clone(), self.var_is_set(name).then(|| self.lookup_var(name))));
+            self.assign_var(name, v);
+        }
+        saved
+    }
+
+    fn restore_prefix_assigns(&mut self, saved: Vec<(String, Option<String>)>) {
+        for (name, previous) in saved.into_iter().rev() {
+            match previous {
+                Some(v) => self.assign_var(&name, v),
+                // Restored as *unset*, the same way `unset` does it:
+                // walk the local scopes first, then the real
+                // environment.
+                None => {
+                    let mut removed_local = false;
+                    for scope in self.var_scopes.iter_mut().rev() {
+                        if scope.remove(name.as_str()).is_some() {
+                            removed_local = true;
+                            break;
+                        }
+                    }
+                    if !removed_local {
+                        unsafe { std::env::remove_var(&name) };
+                    }
+                }
+            }
+        }
     }
 
     // Thin wrapper around dispatch_builtin_or_external_impl (the actual
@@ -12824,6 +12883,32 @@ mod tests {
         }
         unsafe { tzset() };
         out
+    }
+
+    #[test]
+    fn a_prefix_assignment_reaches_a_builtin_and_then_goes_away() {
+        // `IFS=: read a b` used to split on the old IFS: the assignment
+        // was passed as *environment*, which only an external command
+        // ever sees, and a builtin reads the shell's own variables.
+        // Checked against real bash, which gives x/y and leaves IFS
+        // alone.
+        let mut sh = Shell::new();
+        sh.run_source_here("IFS=: read a b <<< \"x:y\"", "<test>");
+        assert_eq!(sh.debug_peek_var("a").as_deref(), Some("x"));
+        assert_eq!(sh.debug_peek_var("b").as_deref(), Some("y"));
+
+        // Gone afterwards, and restored to what it was rather than to
+        // empty -- an assignment that outlived its command would be a
+        // worse bug than the one being fixed.
+        let mut sh = Shell::new();
+        sh.run_source_here("FOO=original; FOO=temp true; echo done", "<test>");
+        assert_eq!(sh.debug_peek_var("FOO").as_deref(), Some("original"));
+
+        // A name that was unset comes back unset, not set-to-empty:
+        // `${X-default}` and `set -u` both tell the difference.
+        let mut sh = Shell::new();
+        sh.run_source_here("NEVER_SET=temp true; echo hi", "<test>");
+        assert_eq!(sh.debug_peek_var("NEVER_SET"), Option::None);
     }
 
     #[test]
