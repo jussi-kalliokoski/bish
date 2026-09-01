@@ -1290,6 +1290,18 @@ pub(crate) trait InsertServices {
     fn complete(&mut self, _buf: &TextBuffer, _row: usize, _col: usize) -> Vec<crate::bishedit::completion::EditorCompletion> {
         Vec::new()
     }
+    /// The signature of the call being typed at this position, as
+    /// popup lines, or `None` for "nothing to show here".
+    ///
+    /// `typed` is the character just inserted, or `None` when something
+    /// else moved the cursor. The implementor decides whether that
+    /// character is a trigger, because the answer is the server's own
+    /// (`signatureHelpProvider.triggerCharacters`) and this module has
+    /// no server. A `None` return closes whatever is showing, so an
+    /// argument list that has been closed stops advertising itself.
+    fn signature(&mut self, _buf: &TextBuffer, _row: usize, _col: usize, _typed: Option<char>) -> Option<Vec<String>> {
+        None
+    }
 }
 
 /// For a caller with nothing to offer: no idle work, no completions.
@@ -1397,6 +1409,11 @@ pub(crate) fn run_insert_mode(
     let abbrs = snippet::for_language(abbrs, &language_of(buf));
     let mut live: Option<LiveSnippet> = None;
     let mut completing: Option<LiveCompletion> = None;
+    // The signature of the call being typed, while there is one. Opened
+    // by a trigger character the server named, refreshed by every key
+    // after that, and closed the moment the server has nothing more to
+    // say -- see `InsertServices::signature`.
+    let mut signature: Option<Vec<String>> = None;
     // Before the first frame, not just after every keystroke.
     //
     // Where insert starts is chosen by the *caller* -- `a` steps the
@@ -1980,18 +1997,53 @@ pub(crate) fn run_insert_mode(
         {
             completing = None;
         }
+        // Asked after the key has been applied, for the same reason the
+        // completion filter is: the question is about where the cursor
+        // is *now*. Only while something is being typed -- an arrow key
+        // or a Backspace that walks back out of the call closes it by
+        // getting `None` back, which is the whole of the close logic.
+        {
+            let typed = match key {
+                Key::Char(c) => Some(c),
+                _ => None,
+            };
+            if typed.is_some() || signature.is_some() {
+                let (row, col) = buf.cursor();
+                signature = services.signature(buf, row, col, typed);
+            }
+        }
         scroll_to_show_cursor(buf, editor_content_cols(buf, rect));
         render_editor_frame(buf, vk, mode, rect, term_rows, term_cols, color_overrides);
+        // The completion popup wins the space when both want it: you
+        // opened that one deliberately, and it is the one keys are
+        // going to.
         if let Some(state) = completing.as_ref() {
             let (row, col) = buf.cursor();
-            let chars = buf.line_chars(row);
-            let gutter = rect.cols.saturating_sub(editor_content_cols(buf, rect));
-            let screen_row = rect.row + row.saturating_sub(buf.viewport_top());
-            let screen_col = rect.col + gutter + crate::bishedit::unicode_width::col_of(&chars, col).saturating_sub(buf.viewport_left());
+            let (screen_row, screen_col) = popup_anchor(buf, rect, row, col);
             print!("{}", render_completion_popup(&state.items(), state.selected, screen_row, screen_col, rect));
+            let _ = io::stdout().flush();
+        } else if let Some(lines) = signature.as_ref() {
+            let (row, col) = buf.cursor();
+            let (screen_row, screen_col) = popup_anchor(buf, rect, row, col);
+            print!("{}", render_hover_popup(lines, screen_row, screen_col, rect));
             let _ = io::stdout().flush();
         }
     }
+}
+
+// Where on the real screen a popup anchored at this buffer position
+// belongs: the cursor's own cell, in terminal coordinates.
+//
+// Factored out when the signature popup became the second caller --
+// the completion popup had computed this inline, and two copies of a
+// gutter-plus-scroll-offset calculation is exactly the kind of thing
+// that drifts apart.
+fn popup_anchor(buf: &TextBuffer, rect: Rect, row: usize, col: usize) -> (usize, usize) {
+    let chars = buf.line_chars(row);
+    let gutter = rect.cols.saturating_sub(editor_content_cols(buf, rect));
+    let screen_row = rect.row + row.saturating_sub(buf.viewport_top());
+    let screen_col = rect.col + gutter + crate::bishedit::unicode_width::col_of(&chars, col).saturating_sub(buf.viewport_left());
+    (screen_row, screen_col)
 }
 
 // A live snippet's placeholders in the buffer's own (line, column)

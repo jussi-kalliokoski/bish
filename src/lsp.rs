@@ -541,6 +541,46 @@ pub struct Location {
     pub end: (usize, usize),
 }
 
+/// How many lines a signature popup may take. A single overload is one
+/// line plus whatever documentation the server attached; several
+/// overloads are one line each. Past this the popup stops being a hint
+/// about the call being typed and starts covering the code it is about.
+const MAX_SIGNATURE_LINES: usize = 8;
+
+/// Reads a `textDocument/signatureHelp` result into popup lines.
+///
+/// The active overload first and marked, the rest after it -- rather
+/// than only the active one, because which overload a server picks
+/// while the arguments are still half-typed is a guess, and seeing the
+/// alternatives is how you find out it guessed wrong.
+///
+/// The active *parameter* is deliberately not marked: doing it properly
+/// means resolving a `[start, end]` offset pair or a label substring
+/// against text this function does not own, and a popup that highlights
+/// the wrong argument is worse than one that highlights none.
+pub fn signature_help(result: &Value) -> Vec<String> {
+    let Ok(Value::Array(signatures)) = json::query(result, ".signatures") else { return Vec::new() };
+    if signatures.is_empty() {
+        return Vec::new();
+    }
+    let active = match json::query(result, ".activeSignature") {
+        Ok(Value::Number(n)) if *n >= 0.0 => (*n as usize).min(signatures.len() - 1),
+        _ => 0,
+    };
+    // The active one first, then the others in their own order.
+    let order = std::iter::once(active).chain((0..signatures.len()).filter(|&i| i != active));
+    let mut out = Vec::new();
+    for i in order {
+        let Ok(Value::Str(label)) = json::query(&signatures[i], ".label") else { continue };
+        let marker = if i == active && signatures.len() > 1 { "> " } else { "" };
+        out.push(format!("{marker}{}", sanitize(label)));
+        if out.len() >= MAX_SIGNATURE_LINES {
+            break;
+        }
+    }
+    out
+}
+
 /// One occurrence of the thing under the cursor, in this same file:
 /// `textDocument/documentHighlight`'s answer.
 ///
@@ -1286,6 +1326,60 @@ pub fn from_server_column(line: &[char], server_col: usize, encoding: PositionEn
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn signature_of(text: &str) -> Vec<String> {
+        signature_help(&json::parse(text).unwrap())
+    }
+
+    #[test]
+    fn the_active_overload_comes_first_and_is_marked() {
+        let lines = signature_of(
+            r#"{"signatures":[{"label":"fn one(a: u32)"},{"label":"fn two(a: u32, b: u32)"}],"activeSignature":1}"#,
+        );
+        assert_eq!(lines, vec!["> fn two(a: u32, b: u32)".to_string(), "fn one(a: u32)".to_string()]);
+    }
+
+    #[test]
+    fn a_lone_signature_is_not_marked_since_there_is_nothing_to_choose_between() {
+        assert_eq!(signature_of(r#"{"signatures":[{"label":"fn one(a: u32)"}]}"#), vec!["fn one(a: u32)".to_string()]);
+        // No `activeSignature` means the first one, which is what every
+        // server that omits it intends.
+        let two = signature_of(r#"{"signatures":[{"label":"a()"},{"label":"b()"}]}"#);
+        assert_eq!(two[0], "> a()");
+    }
+
+    #[test]
+    fn nothing_to_show_is_empty_rather_than_a_box_with_nothing_in_it() {
+        assert!(signature_of("null").is_empty());
+        assert!(signature_of(r#"{"signatures":[]}"#).is_empty());
+        // A signature with no label is not a signature.
+        assert!(signature_of(r#"{"signatures":[{"documentation":"hi"}]}"#).is_empty());
+    }
+
+    #[test]
+    fn an_out_of_range_active_signature_does_not_pick_one_that_is_not_there() {
+        let lines = signature_of(r#"{"signatures":[{"label":"a()"},{"label":"b()"}],"activeSignature":99}"#);
+        assert_eq!(lines[0], "> b()", "clamped to the last, not panicking or dropping everything");
+        let negative = signature_of(r#"{"signatures":[{"label":"a()"}],"activeSignature":-1}"#);
+        assert_eq!(negative, vec!["a()".to_string()]);
+    }
+
+    #[test]
+    fn a_server_with_an_absurd_number_of_overloads_does_not_cover_the_screen() {
+        let many = format!(r#"{{"signatures":[{}]}}"#, vec![r#"{"label":"f()"}"#; MAX_SIGNATURE_LINES * 3].join(","));
+        assert_eq!(signature_of(&many).len(), MAX_SIGNATURE_LINES);
+    }
+
+    // Same treatment every other string from a server gets: a label is
+    // drawn into a popup, so anything a terminal would act on has to be
+    // gone before it gets there.
+    #[test]
+    fn a_signature_label_is_made_safe_to_draw() {
+        let label = "fn f(\u{1b}[31mred\u{1b}[0m: u32)";
+        let json_text = format!("{{\"signatures\":[{{\"label\":{}}}]}}", json::compact_print(&json::Value::Str(label.to_string())));
+        let lines = signature_help(&json::parse(&json_text).unwrap());
+        assert!(!lines[0].contains('\u{1b}'), "{lines:?}");
+    }
 
     fn highlights_of(text: &str) -> Vec<Highlight> {
         highlights(&json::parse(text).unwrap())

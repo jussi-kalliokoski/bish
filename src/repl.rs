@@ -9413,6 +9413,26 @@ fn sync_language_server_document(sessions: &mut HashMap<SessionId, SessionState>
     server.change_document(&target.uri, buf.version(), &fileeditor::buffer_text(buf));
 }
 
+// Sends this buffer's text now, debounce or no debounce.
+//
+// For the callers that are about to ask a question whose answer depends
+// on the character just typed. `sync_language_server_document`'s
+// waiting is right for diagnostics -- nobody is looking at them yet --
+// and wrong here, where the whole point is the text as it stands this
+// instant. A no-op when the server is already current, so calling it
+// before a question costs a version comparison.
+fn flush_language_server_document(sessions: &mut HashMap<SessionId, SessionState>, session_id: SessionId, buf: &TextBuffer) {
+    let Some(session) = sessions.get(&session_id) else { return };
+    let Some(target) = server_target(session, buf) else { return };
+    let lsp = Rc::clone(&session.lsp);
+    let mut table = lsp.borrow_mut();
+    let Some(server) = table.running(&target.display, &target.root) else { return };
+    if !server.is_ready() || server.known_version(&target.uri) == Some(buf.version()) {
+        return;
+    }
+    server.change_document(&target.uri, buf.version(), &fileeditor::buffer_text(buf));
+}
+
 // One tick of "what is the server doing" upkeep for the buffer being
 // edited, so the status line can say so.
 //
@@ -9723,6 +9743,116 @@ impl fileeditor::InsertServices for EditorServices<'_> {
             col,
         )
     }
+
+    fn signature(&mut self, buf: &TextBuffer, row: usize, col: usize, typed: Option<char>) -> Option<Vec<String>> {
+        signature_from_server(
+            self.sessions,
+            self.windows,
+            self.job_frames,
+            self.session_id,
+            *self.current_window,
+            self.term_rows,
+            self.term_cols,
+            self.sinks_are_grid,
+            buf,
+            row,
+            col,
+            typed,
+        )
+    }
+}
+
+// The signature of the call being typed, if the server has one and this
+// is a moment worth asking about.
+//
+// Two things decide "worth asking": the character just typed is one the
+// server named as a trigger (`(` and `,` for most languages), or a
+// signature is already showing -- in which case every keystroke
+// refreshes it, so the active overload keeps up with what has been
+// typed and the popup closes on its own once the call is finished.
+// Anything else costs one string search and no request.
+//
+// Same bounded, servicing wait `K` uses: something *is* blocked on this
+// answer, because the popup is drawn in the same frame as the character
+// that opened it.
+#[allow(clippy::too_many_arguments)]
+fn signature_from_server(
+    sessions: &mut HashMap<SessionId, SessionState>,
+    windows: &mut [WindowEntry],
+    job_frames: &mut HashMap<JobFrameId, exec::FgJob>,
+    session_id: SessionId,
+    current_window: usize,
+    term_rows: &mut usize,
+    term_cols: &mut usize,
+    sinks_are_grid: bool,
+    buf: &TextBuffer,
+    row: usize,
+    col: usize,
+    typed: Option<char>,
+) -> Option<Vec<String>> {
+    let triggers = signature_triggers(sessions, session_id, buf)?;
+    // `None` means something other than typing moved the cursor, and a
+    // refresh is only wanted for a popup already up.
+    if let Some(ch) = typed
+        && !triggers.contains(ch)
+    {
+        return None;
+    }
+    // The one place the debounce is wrong. `sync_language_server_
+    // document` deliberately waits for typing to settle, but the
+    // character that opens this popup is by definition the one just
+    // typed -- asking about a document the server was last told about
+    // 150ms ago means asking about a file with no call in it, and
+    // getting the correct answer: nothing.
+    flush_language_server_document(sessions, session_id, buf);
+    let result = ask_server_at_cursor(
+        sessions,
+        windows,
+        job_frames,
+        session_id,
+        current_window,
+        term_rows,
+        term_cols,
+        sinks_are_grid,
+        buf,
+        row,
+        col,
+        "textDocument/signatureHelp",
+        "signatureHelpProvider",
+        &[],
+    )?;
+    let lines = crate::lsp::signature_help(&result);
+    (!lines.is_empty()).then_some(lines)
+}
+
+// The characters this buffer's server said should open a signature
+// popup, plus the ones that should keep it up to date, as one string to
+// search. `None` when there is no server or it does not do signatures
+// at all -- which is also the "don't ask" answer.
+//
+// A server that declares the capability without naming any trigger
+// characters gets the conventional pair, rather than never being asked:
+// the capability is the claim that matters, and `(`/`,` is what every
+// server that bothers to name them names.
+fn signature_triggers(sessions: &HashMap<SessionId, SessionState>, session_id: SessionId, buf: &TextBuffer) -> Option<String> {
+    let session = sessions.get(&session_id)?;
+    let target = server_target(session, buf)?;
+    let mut table = session.lsp.borrow_mut();
+    let server = table.running(&target.display, &target.root)?;
+    if !server.is_ready() || !server.provides("signatureHelpProvider") {
+        return None;
+    }
+    let mut chars = String::new();
+    for key in [".signatureHelpProvider.triggerCharacters", ".signatureHelpProvider.retriggerCharacters"] {
+        if let Ok(crate::json::Value::Array(items)) = crate::json::query(server.capabilities(), key) {
+            for item in items {
+                if let crate::json::Value::Str(text) = item {
+                    chars.push_str(text);
+                }
+            }
+        }
+    }
+    Some(if chars.is_empty() { "(,".to_string() } else { chars })
 }
 
 // `ga`: what the server offers to do here, picked from a popup and

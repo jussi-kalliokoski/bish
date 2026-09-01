@@ -574,6 +574,24 @@ impl Server {
                             "documentHighlight".to_string(),
                             Value::Object(vec![("dynamicRegistration".to_string(), Value::Bool(false))]),
                         ),
+                        // The signature of the call being typed.
+                        // `contextSupport` is not claimed: bish sends
+                        // the position and nothing about *why* it
+                        // asked, and a server told otherwise would look
+                        // for a context that is not there.
+                        (
+                            "signatureHelp".to_string(),
+                            Value::Object(vec![
+                                ("dynamicRegistration".to_string(), Value::Bool(false)),
+                                (
+                                    "signatureInformation".to_string(),
+                                    Value::Object(vec![(
+                                        "documentationFormat".to_string(),
+                                        Value::Array(vec![Value::Str("plaintext".to_string())]),
+                                    )]),
+                                ),
+                            ]),
+                        ),
                         (
                             "definition".to_string(),
                             Value::Object(vec![("dynamicRegistration".to_string(), Value::Bool(false))]),
