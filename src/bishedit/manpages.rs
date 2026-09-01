@@ -210,9 +210,18 @@ fn read_page(path: &std::path::Path) -> Option<String> {
     Some(text)
 }
 
+// The largest man page on a normal system is a few hundred kilobytes,
+// so this is two orders of magnitude of headroom -- and it is a much
+// tighter budget than `gunzip`'s own on purpose. Nothing on this path
+// was asked for: `query` reads whatever `man -w` points at, on a
+// background thread, while you type. A crafted `.gz` anywhere on
+// MANPATH would otherwise get to name its own memory and CPU cost the
+// moment the matching command name appears in the line.
+const MAX_PAGE_BYTES: usize = 8 * 1024 * 1024;
+
 fn read_text(path: &std::path::Path) -> Option<String> {
     if path.extension().is_some_and(|e| e == "gz") {
-        let (_, bytes) = crate::archive::gunzip(path).ok()?;
+        let (_, bytes) = crate::archive::gunzip_within(path, MAX_PAGE_BYTES).ok()?;
         return Some(String::from_utf8_lossy(&bytes).into_owned());
     }
     std::fs::read_to_string(path).ok()

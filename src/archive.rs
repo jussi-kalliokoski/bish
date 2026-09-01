@@ -278,6 +278,15 @@ pub fn list_dir(members: &[Member], inner: &str) -> Vec<Member> {
 // records if it has one (gzip stores the name it compressed, which is
 // how `e archive.gz` can still tell that the thing inside was a `.json`).
 pub fn gunzip(path: &Path) -> Result<(Option<String>, Vec<u8>), String> {
+    gunzip_within(path, inflate::MAX_OUTPUT)
+}
+
+// `gunzip` with a caller-chosen ceiling on the decompressed size, for a
+// caller that knows what it is reading and does not want the general
+// one. The budget is the whole file's, not each member's: members
+// concatenate, so a per-member ceiling would be no ceiling at all --
+// `cat bomb.gz bomb.gz ...` would walk straight past it.
+pub fn gunzip_within(path: &Path, max_out: usize) -> Result<(Option<String>, Vec<u8>), String> {
     let data = read_file(path)?;
     let mut pos = 0;
     let mut out = Vec::new();
@@ -286,7 +295,7 @@ pub fn gunzip(path: &Path) -> Result<(Option<String>, Vec<u8>), String> {
     // one) and decompress to the concatenation of their contents, which
     // is what gzip itself does with them.
     while pos < data.len() {
-        let (name, body, next) = gzip_member(&data, pos)?;
+        let (name, body, next) = gzip_member(&data, pos, max_out.saturating_sub(out.len()))?;
         if first_name.is_none() {
             first_name = name;
         }
@@ -301,7 +310,7 @@ pub fn gunzip(path: &Path) -> Result<(Option<String>, Vec<u8>), String> {
 
 // One gzip member starting at `pos`: its stored filename, its
 // decompressed bytes, and where the next member would begin.
-fn gzip_member(data: &[u8], pos: usize) -> Result<(Option<String>, Vec<u8>, usize), String> {
+fn gzip_member(data: &[u8], pos: usize, max_out: usize) -> Result<(Option<String>, Vec<u8>, usize), String> {
     let header = data.get(pos..pos + 10).ok_or("truncated gzip header")?;
     if header[0] != 0x1f || header[1] != 0x8b {
         return Err("not a gzip file".to_string());
@@ -327,7 +336,7 @@ fn gzip_member(data: &[u8], pos: usize) -> Result<(Option<String>, Vec<u8>, usiz
         at += 2;
     }
     let stream = data.get(at..).ok_or("truncated gzip data")?;
-    let (body, used) = inflate::inflate_prefix(stream)?;
+    let (body, used) = inflate::inflate_prefix(stream, max_out)?;
     let trailer = data.get(at + used..at + used + 8).ok_or("truncated gzip trailer")?;
     let want_crc = u32::from_le_bytes([trailer[0], trailer[1], trailer[2], trailer[3]]);
     let want_len = u32::from_le_bytes([trailer[4], trailer[5], trailer[6], trailer[7]]);

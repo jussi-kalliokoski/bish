@@ -18,6 +18,22 @@
 //
 // Callers: archive.rs (gzip and zip both frame a raw DEFLATE stream).
 
+// How many bytes one call may decompress to. DEFLATE's own maximum
+// ratio is about 1032:1 and gzip members concatenate (archive::gunzip
+// loops over them), so without a ceiling a megabyte of input can ask
+// for hundreds of gigabytes of memory -- and the paths that get here
+// are not all interactive: manpages.rs gunzips whatever `man -w` points
+// at, on a background thread, while you type at the prompt. Same
+// precedent as lsp.rs's MAX_CONTENT_LENGTH: refuse rather than trust
+// the size a stranger's file asks for.
+//
+// 64 MiB, the same number lsp.rs already picked for the same kind of
+// question, is far past anything this decoder exists for (a script, a
+// config, a man page) and far below anything that hurts. A caller with
+// a tighter idea of what it is reading passes its own budget instead --
+// see manpages.rs, whose reads are not user-initiated at all.
+pub const MAX_OUTPUT: usize = 64 * 1024 * 1024;
+
 // A code is at most 15 bits, and the two alphabets are at most 288/30
 // symbols -- all three fixed by the RFC, not tuning knobs.
 const MAX_BITS: usize = 15;
@@ -204,7 +220,7 @@ fn fixed_tables() -> (Huffman, Huffman) {
 // no zlib header, no gzip header -- peeling those is the container's job
 // (archive.rs).
 pub fn inflate(data: &[u8]) -> Result<Vec<u8>, String> {
-    inflate_prefix(data).map(|(out, _)| out)
+    inflate_prefix(data, MAX_OUTPUT).map(|(out, _)| out)
 }
 
 // `inflate`, plus how many bytes of `data` the stream actually occupied
@@ -212,20 +228,24 @@ pub fn inflate(data: &[u8]) -> Result<Vec<u8>, String> {
 // CRC/length trailer, and then possibly another member: see
 // archive::gunzip). A DEFLATE stream doesn't announce its own length,
 // so this is the only way to know.
-pub fn inflate_prefix(data: &[u8]) -> Result<(Vec<u8>, usize), String> {
+//
+// `max_out` is how many bytes this stream may produce -- MAX_OUTPUT for
+// a caller decompressing one thing, and whatever is left of that budget
+// for a caller walking a sequence of them.
+pub fn inflate_prefix(data: &[u8], max_out: usize) -> Result<(Vec<u8>, usize), String> {
     let mut bits = Bits::new(data);
     let mut out = Vec::new();
     loop {
         let last = bits.take(1)? == 1;
         match bits.take(2)? {
-            0 => stored_block(&mut bits, &mut out)?,
+            0 => stored_block(&mut bits, &mut out, max_out)?,
             1 => {
                 let (lit, dist) = fixed_tables();
-                compressed_block(&mut bits, &mut out, &lit, &dist)?;
+                compressed_block(&mut bits, &mut out, &lit, &dist, max_out)?;
             }
             2 => {
                 let (lit, dist) = dynamic_tables(&mut bits)?;
-                compressed_block(&mut bits, &mut out, &lit, &dist)?;
+                compressed_block(&mut bits, &mut out, &lit, &dist, max_out)?;
             }
             _ => return Err("invalid DEFLATE block type".to_string()),
         }
@@ -237,7 +257,7 @@ pub fn inflate_prefix(data: &[u8]) -> Result<(Vec<u8>, usize), String> {
     }
 }
 
-fn stored_block(bits: &mut Bits, out: &mut Vec<u8>) -> Result<(), String> {
+fn stored_block(bits: &mut Bits, out: &mut Vec<u8>, max_out: usize) -> Result<(), String> {
     bits.align();
     let header = bits.data.get(bits.pos..bits.pos + 4).ok_or("truncated stored block header")?;
     let len = u16::from_le_bytes([header[0], header[1]]) as usize;
@@ -249,6 +269,9 @@ fn stored_block(bits: &mut Bits, out: &mut Vec<u8>) -> Result<(), String> {
     }
     bits.pos += 4;
     let body = bits.data.get(bits.pos..bits.pos + len).ok_or("truncated stored block")?;
+    if out.len() + len > max_out {
+        return Err(too_big(max_out));
+    }
     out.extend_from_slice(body);
     bits.pos += len;
     Ok(())
@@ -331,11 +354,16 @@ fn fill(lengths: &mut [u8], i: &mut usize, value: u8, run: usize) -> Result<(), 
 // two alphabets are in hand: symbols under 256 are literal bytes, 256
 // ends the block, and anything above is a (length, distance) back
 // reference into what's already been decompressed.
-fn compressed_block(bits: &mut Bits, out: &mut Vec<u8>, lit: &Huffman, dist: &Huffman) -> Result<(), String> {
+fn compressed_block(bits: &mut Bits, out: &mut Vec<u8>, lit: &Huffman, dist: &Huffman, max_out: usize) -> Result<(), String> {
     loop {
         let sym = lit.decode(bits)?;
         match sym {
-            0..=255 => out.push(sym as u8),
+            0..=255 => {
+                if out.len() == max_out {
+                    return Err(too_big(max_out));
+                }
+                out.push(sym as u8);
+            }
             256 => return Ok(()),
             257..=285 => {
                 let idx = sym as usize - 257;
@@ -347,6 +375,12 @@ fn compressed_block(bits: &mut Bits, out: &mut Vec<u8>, lit: &Huffman, dist: &Hu
                 let distance = DIST_BASE[dsym] as usize + bits.take(DIST_EXTRA[dsym] as u32)? as usize;
                 if distance > out.len() {
                     return Err("back reference before the start of the output".to_string());
+                }
+                // Checked before the copy rather than inside it: this is
+                // the one place a few bytes of input turn into up to 258
+                // of output, so it is where a bomb actually grows.
+                if out.len() + len > max_out {
+                    return Err(too_big(max_out));
                 }
                 // Copied one byte at a time on purpose: an overlapping
                 // copy (distance < len, which is how a run of the same
@@ -362,6 +396,10 @@ fn compressed_block(bits: &mut Bits, out: &mut Vec<u8>, lit: &Huffman, dist: &Hu
             _ => return Err("invalid literal/length code".to_string()),
         }
     }
+}
+
+fn too_big(max_out: usize) -> String {
+    format!("decompressed size exceeds the {max_out}-byte limit")
 }
 
 // The CRC-32 gzip and zip both carry, computed bit by bit rather than
@@ -456,6 +494,46 @@ mod tests {
             }
         }
         round_trip(&data);
+    }
+
+    // The whole point of the ceiling: a compressor turns 4 MiB of one
+    // repeated byte into a few kilobytes, and a decompressor with no
+    // limit will happily be told to produce hundreds of gigabytes by a
+    // file that costs nothing to send.
+    #[test]
+    fn refuses_to_decompress_past_the_ceiling() {
+        if !compressor_available() {
+            return;
+        }
+        let compressed = deflate_raw(&vec![0u8; 4 << 20]);
+        assert!(compressed.len() < 64 << 10, "{} bytes in, 4 MiB out -- that ratio is the threat", compressed.len());
+
+        let (out, _) = inflate_prefix(&compressed, 8 << 20).unwrap();
+        assert_eq!(out.len(), 4 << 20, "a budget it fits inside decompresses in full");
+
+        let err = inflate_prefix(&compressed, 1 << 20).unwrap_err();
+        assert!(err.contains("exceeds"), "and one it does not is refused, not attempted: {err}");
+        // The refusal has to come from the back-reference path -- that
+        // is where a bomb grows -- so a budget under even the first
+        // literal byte is not what is being tested here.
+        assert!(inflate_prefix(&compressed, 0).is_err());
+    }
+
+    // Stored blocks carry their bytes literally, so they can never be a
+    // bomb -- but they are a second way into `out`, and the ceiling has
+    // to hold on that path too.
+    #[test]
+    fn the_ceiling_holds_on_the_stored_block_path() {
+        if !compressor_available() {
+            return;
+        }
+        let mut data = Vec::new();
+        for i in 0..40000u32 {
+            data.push((i.wrapping_mul(2654435761) >> 24) as u8);
+        }
+        let compressed = deflate_raw(&data);
+        assert_eq!(inflate_prefix(&compressed, data.len()).unwrap().0, data);
+        assert!(inflate_prefix(&compressed, data.len() - 1).is_err());
     }
 
     // Incompressible input is what makes a compressor fall back to
