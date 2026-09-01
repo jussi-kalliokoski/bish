@@ -1918,6 +1918,150 @@ enum MarkKind {
     GotoLine,
 }
 
+
+/// The canonical name of a resolved key outcome, as `::bish map` prints
+/// it.
+///
+/// Kebab-case of the variant, with whatever it carries appended -- the
+/// same mechanical rule `motion::describe_motion` follows, and for the
+/// same reason: a predictable vocabulary beats a memorable one, and a
+/// derived name cannot drift from the variant it names.
+///
+/// A count is printed where it came from the mapping's own right-hand
+/// side (`10j` lists as `down 10`). It is not the whole story at
+/// dispatch -- a count typed before the mapped key composes with it,
+/// because a mapping replays its keys into the live state rather than
+/// producing a frozen outcome -- but it is what the mapping itself says.
+pub fn describe_outcome(outcome: &KeyOutcome) -> String {
+    use KeyOutcome::*;
+    // `Some(3)` prints as " 3", `None` as nothing -- so every arm below
+    // can append a count without repeating the match.
+    fn n(count: &Option<usize>) -> String {
+        count.map(|c| format!(" {c}")).unwrap_or_default()
+    }
+    fn reg(register: &Option<char>) -> String {
+        register.map(|r| format!(" register {r:?}")).unwrap_or_default()
+    }
+    match outcome {
+        Motion(m, count) => format!("{}{}", crate::bishedit::motion::describe_motion(m), n(count)),
+        Window(cmd, count) => format!("window {}{}", describe_window_cmd(cmd), n(count)),
+        EnterInsert(cmd) => format!("insert {}", describe_insert_cmd(cmd)),
+        Operator(op, m, count, register) => format!(
+            "{} {}{}{}",
+            describe_op(op),
+            crate::bishedit::motion::describe_motion(m),
+            n(count),
+            reg(register)
+        ),
+        OperatorLines(op, count, register) => format!("{} line{}{}", describe_op(op), n(count), reg(register)),
+        Put { before, count, register } => {
+            format!("put-{}{}{}", if *before { "before" } else { "after" }, n(count), reg(register))
+        }
+        DeleteCharForward { count, register } => format!("delete-char-forward{}{}", n(count), reg(register)),
+        Join { count, with_space } => {
+            format!("join{}{}", if *with_space { "" } else { "-without-space" }, n(count))
+        }
+        EnterVisual(shape) => format!("visual {}", describe_register_shape(shape)),
+        ReselectVisual => "visual-reselect".to_string(),
+        GotoDefinition(kind) => describe_goto_kind(kind).to_string(),
+        GotoReferences => "goto-references".to_string(),
+        DocumentSymbols => "document-symbols".to_string(),
+        CodeActions => "code-actions".to_string(),
+        Jump { forward } => format!("jump-{}", if *forward { "forward" } else { "backward" }),
+        Undo(count) => format!("undo{}", n(count)),
+        Redo(count) => format!("redo{}", n(count)),
+        UndoSeq { forward, count } => {
+            format!("undo-seq-{}{}", if *forward { "forward" } else { "backward" }, n(count))
+        }
+        AddSurround { target, ch } => format!("add-surround {} {ch:?}", describe_surround_target(target)),
+        DeleteSurround { ch } => format!("delete-surround {ch:?}"),
+        ChangeSurround { ch, replacement } => format!("change-surround {ch:?} {replacement:?}"),
+        ReplaceChar { ch, count } => format!("replace-char {ch:?}{}", n(count)),
+        EnterReplace => "replace-mode".to_string(),
+        ToggleCase { count } => format!("toggle-case{}", n(count)),
+        AdjustNumber { delta } => format!("adjust-number {delta}"),
+        OpenLine { above } => format!("open-line-{}", if *above { "above" } else { "below" }),
+        // Neither is a resolved action: `Pending` means the sequence
+        // wants more keys, `None` that nothing recognized it. `::bish
+        // map` refuses a right-hand side that ends on either rather than
+        // storing a mapping that does nothing, so these are here for
+        // exhaustiveness and to make the refusal message say which.
+        Pending => "(incomplete)".to_string(),
+        None => "(unrecognized)".to_string(),
+    }
+}
+
+fn describe_op(op: &Op) -> &'static str {
+    match op {
+        Op::Yank => "yank",
+        Op::Delete => "delete",
+        Op::Change => "change",
+        Op::Lowercase => "lowercase",
+        Op::Uppercase => "uppercase",
+        Op::CaseToggle => "case-toggle",
+        Op::Indent => "indent",
+        Op::Outdent => "outdent",
+    }
+}
+
+fn describe_insert_cmd(cmd: &InsertCmd) -> &'static str {
+    match cmd {
+        InsertCmd::Before => "before",
+        InsertCmd::After => "after",
+        InsertCmd::LineStart => "line-start",
+        InsertCmd::LineEnd => "line-end",
+        InsertCmd::SubstituteChar => "substitute-char",
+        InsertCmd::SubstituteLine => "substitute-line",
+        InsertCmd::ChangeToEnd => "change-to-end",
+        InsertCmd::LastInsertPos => "last-insert-pos",
+    }
+}
+
+fn describe_window_cmd(cmd: &WindowCmd) -> &'static str {
+    match cmd {
+        WindowCmd::Next => "next",
+        WindowCmd::Previous => "previous",
+        WindowCmd::New => "new",
+        WindowCmd::Close => "close",
+        WindowCmd::Split => "split",
+        WindowCmd::VSplit => "vsplit",
+        WindowCmd::FocusLeft => "focus-left",
+        WindowCmd::FocusDown => "focus-down",
+        WindowCmd::FocusUp => "focus-up",
+        WindowCmd::FocusRight => "focus-right",
+        WindowCmd::Balance => "balance",
+        WindowCmd::GotoFirstWindow => "goto-first",
+        WindowCmd::GotoLastWindow => "goto-last",
+    }
+}
+
+fn describe_goto_kind(kind: &GotoKind) -> &'static str {
+    match kind {
+        GotoKind::Definition => "goto-definition",
+        GotoKind::TypeDefinition => "goto-type-definition",
+        GotoKind::Implementation => "goto-implementation",
+        GotoKind::Declaration => "goto-declaration",
+    }
+}
+
+fn describe_register_shape(shape: &RegisterShape) -> &'static str {
+    match shape {
+        RegisterShape::Char => "charwise",
+        RegisterShape::Line => "linewise",
+        RegisterShape::Block => "blockwise",
+    }
+}
+
+fn describe_surround_target(target: &SurroundTarget) -> String {
+    match target {
+        SurroundTarget::Motion(m, count) => {
+            let c = count.map(|c| format!(" {c}")).unwrap_or_default();
+            format!("{}{c}", crate::bishedit::motion::describe_motion(m))
+        }
+        SurroundTarget::Line(count) => format!("line{}", count.map(|c| format!(" {c}")).unwrap_or_default()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1928,6 +2072,66 @@ mod tests {
 
     fn last(vk: &mut VimKeys, keys: &[Key]) -> KeyOutcome {
         feed_all(vk, keys).pop().unwrap()
+    }
+
+    // Resolving a key sequence and naming what it resolved to is
+    // exactly what `::bish map` does with a right-hand side, so these
+    // go through the real path rather than constructing outcomes by
+    // hand.
+    fn describe_typed(text: &str) -> String {
+        let keys = crate::keymap::parse_keys(text).expect("test key sequence should parse");
+        let mut vk = VimKeys::new();
+        describe_outcome(&last(&mut vk, &keys))
+    }
+
+    #[test]
+    fn a_right_hand_side_is_named_by_what_it_resolves_to() {
+        assert_eq!(describe_typed("j"), "down");
+        assert_eq!(describe_typed("<C-d>"), "half-page-down");
+        assert_eq!(describe_typed("gg"), "goto-first-line");
+        // The count rides along, because it is part of what the mapping
+        // says -- `10j` and `j` are not the same mapping.
+        assert_eq!(describe_typed("10j"), "down 10");
+        assert_eq!(describe_typed("$"), "line-end");
+    }
+
+    #[test]
+    fn an_operator_names_both_halves() {
+        assert_eq!(describe_typed("dw"), "delete word-forward");
+        assert_eq!(describe_typed("yy"), "yank line");
+        assert_eq!(describe_typed("2yy"), "yank line 2");
+        assert_eq!(describe_typed("ciw"), "change text-object inner word");
+        assert_eq!(describe_typed("da\""), "delete text-object around double-quote");
+    }
+
+    #[test]
+    fn a_parameterized_action_says_what_it_carries() {
+        // `find-char` without the character would not tell two mappings
+        // apart in a listing.
+        assert_eq!(describe_typed("fx"), "find-char 'x'");
+        assert_eq!(describe_typed("Tx"), "till-char-backward 'x'");
+        assert_eq!(describe_typed("ma"), "set-mark 'a'");
+        assert_eq!(describe_typed("ra"), "replace-char 'a'");
+    }
+
+    #[test]
+    fn the_non_actions_are_named_so_a_refusal_can_say_which() {
+        // `::bish map` refuses a right-hand side ending on either rather
+        // than storing a mapping that does nothing.
+        assert_eq!(describe_typed("d"), "(incomplete)");
+        assert_eq!(describe_typed("g"), "(incomplete)");
+        assert_eq!(describe_outcome(&KeyOutcome::None), "(unrecognized)");
+    }
+
+    #[test]
+    fn insert_visual_and_window_actions_are_named_too() {
+        assert_eq!(describe_typed("i"), "insert before");
+        assert_eq!(describe_typed("A"), "insert line-end");
+        assert_eq!(describe_typed("v"), "visual charwise");
+        assert_eq!(describe_typed("V"), "visual linewise");
+        assert_eq!(describe_typed("<C-w>s"), "window split");
+        assert_eq!(describe_typed("p"), "put-after");
+        assert_eq!(describe_typed("u"), "undo");
     }
 
     #[test]

@@ -2165,6 +2165,106 @@ pub fn whole_lines(buf: &impl Buffer, count: usize) -> String {
     s
 }
 
+
+/// The canonical name of a motion, as `::bish map` prints it.
+///
+/// Kebab-case of the variant, deliberately mechanical rather than
+/// invented: a vocabulary someone has to memorize is worse than one
+/// they can predict, and a derived name cannot fall out of step with
+/// the variant it describes the way a hand-chosen synonym can. The
+/// parameterized ones append what they carry, since `find-char` without
+/// the character would not say which mapping you were looking at.
+pub fn describe_motion(motion: &Motion) -> String {
+    use Motion::*;
+    let plain = match motion {
+        Left => "left",
+        Right => "right",
+        Down => "down",
+        Up => "up",
+        LineStart => "line-start",
+        LineFirstNonBlank => "line-first-non-blank",
+        LineEnd => "line-end",
+        LineLastNonBlank => "line-last-non-blank",
+        GotoColumn => "goto-column",
+        GotoFirstLine => "goto-first-line",
+        GotoLastLine => "goto-last-line",
+        GotoPercent => "goto-percent",
+        WordForward => "word-forward",
+        WordForwardBig => "word-forward-big",
+        WordBackward => "word-backward",
+        WordBackwardBig => "word-backward-big",
+        WordEnd => "word-end",
+        WordEndBig => "word-end-big",
+        WordEndBackward => "word-end-backward",
+        WordEndBackwardBig => "word-end-backward-big",
+        ScreenTop => "screen-top",
+        ScreenMiddle => "screen-middle",
+        ScreenBottom => "screen-bottom",
+        HalfPageDown => "half-page-down",
+        HalfPageUp => "half-page-up",
+        PageDown => "page-down",
+        PageUp => "page-up",
+        ScrollLineDown => "scroll-line-down",
+        ScrollLineUp => "scroll-line-up",
+        ScrollCenter => "scroll-center",
+        ScrollTop => "scroll-top",
+        ScrollBottom => "scroll-bottom",
+        ParagraphForward => "paragraph-forward",
+        ParagraphBackward => "paragraph-backward",
+        SentenceForward => "sentence-forward",
+        SentenceBackward => "sentence-backward",
+        NextLineNonBlank => "next-line-non-blank",
+        PrevLineNonBlank => "prev-line-non-blank",
+        MatchPair => "match-pair",
+        SearchWordForward => "search-word-forward",
+        SearchWordBackward => "search-word-backward",
+        SearchWordForwardUnbounded => "search-word-forward-unbounded",
+        SearchWordBackwardUnbounded => "search-word-backward-unbounded",
+        UnmatchedOpenParen => "unmatched-open-paren",
+        UnmatchedCloseParen => "unmatched-close-paren",
+        UnmatchedOpenBrace => "unmatched-open-brace",
+        UnmatchedCloseBrace => "unmatched-close-brace",
+        SectionForward => "section-forward",
+        SectionForwardEnd => "section-forward-end",
+        SectionBackward => "section-backward",
+        SectionBackwardEnd => "section-backward-end",
+        // The rest carry something, and say so.
+        FindChar { ch, till, forward } => {
+            let verb = if *till { "till-char" } else { "find-char" };
+            let dir = if *forward { "" } else { "-backward" };
+            return format!("{verb}{dir} {ch:?}");
+        }
+        SetMark(c) => return format!("set-mark {c:?}"),
+        GotoMark(c) => return format!("goto-mark {c:?}"),
+        GotoMarkLine(c) => return format!("goto-mark-line {c:?}"),
+        SearchForward(p) => return format!("search-forward {p:?}"),
+        SearchBackward(p) => return format!("search-backward {p:?}"),
+        TextObject(kind, around) => {
+            let scope = if *around { "around" } else { "inner" };
+            return format!("text-object {scope} {}", describe_text_object(kind));
+        }
+    };
+    plain.to_string()
+}
+
+/// The object half of a text-object motion's name -- see describe_motion.
+pub fn describe_text_object(kind: &TextObjectKind) -> &'static str {
+    use TextObjectKind::*;
+    match kind {
+        Word => "word",
+        WordBig => "word-big",
+        Sentence => "sentence",
+        Paragraph => "paragraph",
+        Paren => "paren",
+        Brace => "brace",
+        Bracket => "bracket",
+        Angle => "angle",
+        DoubleQuote => "double-quote",
+        SingleQuote => "single-quote",
+        Backtick => "backtick",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
