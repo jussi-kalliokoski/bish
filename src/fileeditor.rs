@@ -30,7 +30,7 @@ use crate::bishedit::unicode_width::char_width;
 use crate::bishedit::vimkeys::{InsertCmd, Op, SurroundTarget, VimKeys};
 use crate::bishedit::Buffer;
 use crate::editor::{self, Key};
-use crate::repl::Rect;
+use crate::window::Rect;
 use crate::term;
 use crate::vt100;
 

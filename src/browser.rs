@@ -41,7 +41,7 @@ use crate::bishedit::fuzzy::fuzzy_match;
 use crate::bishedit::grapheme;
 use crate::bishedit::unicode_width::{char_width, str_width};
 use crate::editor::Key;
-use crate::repl::Rect;
+use crate::window::Rect;
 
 // One listing entry. `path` is always absolute (joined against the
 // browser's own cwd, which itself is canonicalized on open) so the

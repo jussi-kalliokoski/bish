@@ -55,7 +55,7 @@ use crate::docs::{self, DocIndex};
 use crate::editor::{self, Key};
 use crate::exec::{DebugAction, DebugDepth, DebugHook, Shell};
 use crate::fileeditor::{self, EditorMode};
-use crate::repl::Rect;
+use crate::window::Rect;
 use crate::term;
 
 // What a paused PauseState is waiting to do next.

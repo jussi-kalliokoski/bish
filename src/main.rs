@@ -46,6 +46,7 @@ mod toml;
 mod tool;
 mod url;
 mod vt100;
+mod window;
 
 use std::io::{IsTerminal, Read};
 

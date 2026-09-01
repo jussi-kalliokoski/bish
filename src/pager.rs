@@ -21,7 +21,7 @@
 // completely when they're done.
 
 use crate::bishedit::unicode_width::char_width;
-use crate::repl::Rect;
+use crate::window::Rect;
 
 pub struct Pager {
     // What the title bar says this is: `:help`, or a previewed file's

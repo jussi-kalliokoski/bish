@@ -73,7 +73,8 @@ use crate::bishedit::vimkeys::{InsertCmd, KeyOutcome, Op, VimKeys, WindowCmd};
 use crate::bishedit::Buffer;
 use crate::editor::{self, Key};
 use crate::history::History;
-use crate::repl::{render_global_status_row, Rect};
+use crate::repl::render_global_status_row;
+use crate::window::Rect;
 use crate::vt100;
 
 // Bytes per group, separated by an extra space in the hex column --
@@ -2299,7 +2300,7 @@ mod tests {
         // is still the common default, used to lose the last four lines
         // (found via pty against the real binary). This is the guard
         // against it happening again the next time a line is added.
-        let pane_rows = crate::repl::content_rows(24);
+        let pane_rows = crate::window::content_rows(24);
         let lines: Vec<&str> = HELP_TEXT.lines().collect();
         assert!(lines.len() <= pane_rows, "the help page is {} lines but a 24-row terminal's pane is {pane_rows}", lines.len());
         // 80 columns, minus nothing: `fit` truncates rather than wraps,
