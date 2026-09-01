@@ -6,7 +6,7 @@ use std::rc::Rc;
 
 use crate::arith;
 use crate::bishedit::highlight;
-use crate::bishedit::snippet::{self, Abbr};
+use crate::bishedit::snippet::Abbr;
 use crate::builtins;
 use crate::compgen;
 use crate::glob;
@@ -481,7 +481,7 @@ pub struct WindowInfo {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Theme {
     opts: std::collections::HashMap<String, BishOptValue>,
-    hl: std::collections::HashMap<String, String>,
+    pub(crate) hl: std::collections::HashMap<String, String>,
 }
 
 /// Whatever a shell's output sink was before something borrowed it --
@@ -881,7 +881,7 @@ pub enum PaneDirection {
 // invalid input (unparseable numbers, `/0`) is reported as `None` so
 // run_window can print one consistent usage error rather than a parse
 // panic.
-fn parse_size_spec(arg: &str) -> Option<SizeSpec> {
+pub(crate) fn parse_size_spec(arg: &str) -> Option<SizeSpec> {
     if let Some(pct) = arg.strip_suffix('%') {
         return Some(SizeSpec::Percent(pct.parse().ok()?));
     }
@@ -979,11 +979,11 @@ pub struct Shell {
     /// Inherited by a virtual child exactly as `abbrs` is: a window you
     /// split off should behave like the one you split it from.
     pub hooks: Vec<Hook>,
-    next_hook_id: u64,
+    pub(crate) next_hook_id: u64,
     /// Declared language servers -- config, not processes. See
     /// `LspServer`.
     pub lsp_servers: Vec<LspServer>,
-    next_lsp_id: u64,
+    pub(crate) next_lsp_id: u64,
     /// The helper processes `::bish lsp` reports on, behind a trait so
     /// this module never names a language-server type. See
     /// `ServiceTable`.
@@ -1050,7 +1050,7 @@ pub struct Shell {
     // registered default", `--unset` removes the entry outright rather
     // than writing the default back, so "explicitly unset" and "never
     // touched" collapse to the same state.
-    bishopts: std::collections::HashMap<String, BishOptValue>,
+    pub(crate) bishopts: std::collections::HashMap<String, BishOptValue>,
     // `::bish theme begin`/`::bish theme end`'s own registry -- theme
     // name -> the bishopt overrides captured while declaring it (see
     // pending_theme's own doc comment for how a declaration fills this
@@ -1069,7 +1069,7 @@ pub struct Shell {
     /// without any of them needing to be declared first. That is the
     /// whole reason these are not bishopts, which are a closed set with
     /// a default each.
-    hl: std::collections::HashMap<String, String>,
+    pub(crate) hl: std::collections::HashMap<String, String>,
     // `Some` for the entire span between `::bish theme begin` and its
     // matching `::bish theme end` -- every `bishopt --set NAME VALUE` in
     // between is diverted here (keyed by NAME) instead of applying live,
@@ -2586,7 +2586,7 @@ impl Shell {
     // source text, parsed the same way a `--set` value is -- `.expect()`
     // on failure is deliberate: an unparseable *registered* default is a
     // bug in KNOWN_BISHOPTS itself, not something a user can trigger.
-    fn bishopt_value(&self, registry: &[(&str, BishOptDefault)], name: &str) -> Option<BishOptValue> {
+    pub(crate) fn bishopt_value(&self, registry: &[(&str, BishOptDefault)], name: &str) -> Option<BishOptValue> {
         let default = registry.iter().find(|(n, _)| *n == name)?.1.clone();
         if let Some(v) = self.bishopts.get(name) {
             return Some(v.clone());
@@ -2620,7 +2620,7 @@ impl Shell {
     // exactly as `store_bishopt` diverts a bishopt -- which is what
     // makes `::bish theme begin` capture colours and options together,
     // as one thing to switch to.
-    fn store_hl(&mut self, name: &str, value: String) {
+    pub(crate) fn store_hl(&mut self, name: &str, value: String) {
         match &mut self.pending_theme {
             Some(pending) => {
                 pending.hl.insert(name.to_string(), value);
@@ -2678,7 +2678,7 @@ impl Shell {
         list
     }
 
-    fn store_bishopt(&mut self, name: &str, value: BishOptValue) {
+    pub(crate) fn store_bishopt(&mut self, name: &str, value: BishOptValue) {
         match &mut self.pending_theme {
             Some(pending) => {
                 pending.opts.insert(name.to_string(), value);
@@ -2745,7 +2745,7 @@ impl Shell {
         self.describe_bishopts(KNOWN_BISHOPTS, which)
     }
 
-    fn describe_bishopts(&self, registry: &[(&str, BishOptDefault)], which: Option<&str>) -> Vec<String> {
+    pub(crate) fn describe_bishopts(&self, registry: &[(&str, BishOptDefault)], which: Option<&str>) -> Vec<String> {
         let mut out = Vec::new();
         for (name, default) in registry.iter().filter(|(n, _)| which.is_none_or(|w| *n == w)) {
             let (accepts, default_text) = match default {
@@ -2776,191 +2776,6 @@ impl Shell {
         }
     }
 
-    fn run_bishopt(&mut self, args: &[String], registry: &[(&str, BishOptDefault)]) -> i32 {
-        enum Mode<'a> {
-            List,
-            Get(&'a str, bool), // bool: quiet
-            // `--describe [NAME]`: what an option is for, what it
-            // accepts, and what it is set to. Everything `bishopt` could
-            // already tell you was the *value*; this is the half that
-            // makes an option findable rather than merely settable.
-            Describe(Option<&'a str>),
-            Set(&'a str, Option<&'a str>),
-            Unset(&'a str),
-        }
-        let mode = match args {
-            [] => Mode::List,
-            [flag] if flag == "--describe" || flag == "-d" => Mode::Describe(None),
-            [flag, name] if flag == "--describe" || flag == "-d" => Mode::Describe(Some(name.as_str())),
-            [flag, name] if flag == "--set" || flag == "-s" => Mode::Set(name, None),
-            [flag, name, value] if flag == "--set" || flag == "-s" => Mode::Set(name, Some(value)),
-            [flag, name] if flag == "--unset" || flag == "-u" => Mode::Unset(name),
-            [flag, name] if flag == "--quiet" || flag == "-q" => Mode::Get(name, true),
-            [name] => Mode::Get(name, false),
-            _ => {
-                sh_eprintln!(self, "bish: bishopt: usage: bishopt [--quiet|-q NAME | --set|-s NAME [VALUE] | --unset|-u NAME | --describe|-d [NAME] | NAME]");
-                return 2;
-            }
-        };
-        match mode {
-            Mode::List => {
-                for (name, _) in registry {
-                    sh_println!(self, "{name}");
-                }
-                0
-            }
-            Mode::Describe(which) => {
-                if let Some(name) = which
-                    && !registry.iter().any(|(n, _)| *n == name)
-                {
-                    sh_eprintln!(self, "bish: bishopt: unknown option '{name}'");
-                    return 1;
-                }
-                for line in self.describe_bishopts(registry, which) {
-                    sh_println!(self, "{line}");
-                }
-                0
-            }
-            Mode::Get(name, quiet) => match self.bishopt_value(registry, name) {
-                Some(BishOptValue::Bool(on)) => {
-                    if !quiet {
-                        sh_println!(self, "{}", if on { "on" } else { "off" });
-                    }
-                    if on {
-                        0
-                    } else {
-                        1
-                    }
-                }
-                Some(BishOptValue::Int(n)) => {
-                    if !quiet {
-                        sh_println!(self, "{n}");
-                    }
-                    0
-                }
-                Some(BishOptValue::Str(s)) => {
-                    if !quiet {
-                        sh_println!(self, "{s}");
-                    }
-                    0
-                }
-                Some(BishOptValue::Color(text, _)) => {
-                    if !quiet {
-                        sh_println!(self, "{text}");
-                    }
-                    0
-                }
-                None => {
-                    sh_eprintln!(self, "bish: bishopt: {name}: no such option");
-                    1
-                }
-            },
-            Mode::Set(name, value) => match (registry.iter().find(|(n, _)| *n == name).map(|(_, d)| d.clone()), value) {
-                (None, _) => {
-                    sh_eprintln!(self, "bish: bishopt: {name}: no such option");
-                    1
-                }
-                (Some(BishOptDefault::Bool(_)), None | Some("on")) => {
-                    self.store_bishopt(name, BishOptValue::Bool(true));
-                    0
-                }
-                (Some(BishOptDefault::Bool(_)), Some("off")) => {
-                    self.store_bishopt(name, BishOptValue::Bool(false));
-                    0
-                }
-                (Some(BishOptDefault::Bool(_)), Some(_)) => {
-                    sh_eprintln!(self, "bish: bishopt: --set: {name}: a boolean option only accepts 'on' or 'off'");
-                    2
-                }
-                (Some(BishOptDefault::Int(_, _)), None) => {
-                    sh_eprintln!(self, "bish: bishopt: --set: {name}: requires a VALUE");
-                    2
-                }
-                (Some(BishOptDefault::Int(_, range)), Some(v)) => match v.parse::<i64>() {
-                    Ok(n) if range.contains(&n) => {
-                        self.store_bishopt(name, BishOptValue::Int(n));
-                        0
-                    }
-                    Ok(n) => {
-                        sh_eprintln!(self, "bish: bishopt: --set: {name}: {n} is outside {}..{}", range.start(), range.end());
-                        2
-                    }
-                    Err(_) => {
-                        sh_eprintln!(self, "bish: bishopt: --set: {name}: {v:?} is not a whole number");
-                        2
-                    }
-                },
-                (Some(BishOptDefault::Str(_)), None) => {
-                    sh_eprintln!(self, "bish: bishopt: --set: {name}: requires a VALUE");
-                    2
-                }
-                (Some(BishOptDefault::Str(_)), Some(v)) => {
-                    self.store_bishopt(name, BishOptValue::Str(v.to_string()));
-                    0
-                }
-                (Some(BishOptDefault::Color(_)), None) => {
-                    sh_eprintln!(self, "bish: bishopt: --set: {name}: requires a VALUE");
-                    2
-                }
-                (Some(BishOptDefault::Color(_)), Some(v)) => match crate::csscolor::parse_terminal_list(v) {
-                    Ok(c) => {
-                        self.store_bishopt(name, BishOptValue::Color(v.to_string(), c));
-                        0
-                    }
-                    Err(e) => {
-                        sh_eprintln!(self, "bish: bishopt: --set: {name}: invalid color '{v}': {e}");
-                        2
-                    }
-                },
-            },
-            Mode::Unset(name) => {
-                if !registry.iter().any(|(n, _)| *n == name) {
-                    sh_eprintln!(self, "bish: bishopt: {name}: no such option");
-                    return 1;
-                }
-                self.bishopts.remove(name);
-                0
-            }
-        }
-    }
-
-    // `::bish SUBCOMMAND...`: a small namespace of its own for bish-
-    // specific commands (`theme begin`/`theme end` today) that don't
-    // read naturally as an ordinary top-level builtin name -- `theme` on
-    // its own would either collide with a real bash script's own
-    // variable/function of that name, or need its own awkward "begin"/
-    // "end" builtins polluting the global command namespace for
-    // something this narrow. `::` is never a valid start of an ordinary
-    // bash command word in practice, so `::bish` reads unambiguously as
-    // "this is bish's own thing," the same spirit as `set -o` bundling
-    // bash's own less-common toggles under one name instead of each
-    // getting its own builtin.
-    fn run_bish(&mut self, args: &[String]) -> ExecResult {
-
-        match args {
-            [sub, rest @ ..] if sub == "theme" => ExecResult::Status(self.run_bish_theme(rest)),
-            // The canonical spelling of the window manager. `window`/
-            // `win` survive only as *command-mode* aliases (see
-            // run_single's own arm): a top-level builtin called `window`
-            // shadows any real `window` on `$PATH` for every script that
-            // runs under bish, and this namespace exists precisely for
-            // bish-specific commands that shouldn't spend a common word.
-            [sub, rest @ ..] if sub == "window" || sub == "win" => self.run_window(rest),
-            [sub, rest @ ..] if sub == "hook" => ExecResult::Status(self.run_hook(rest)),
-            [sub, rest @ ..] if sub == "hl" => ExecResult::Status(self.run_hl(rest)),
-            [sub, rest @ ..] if sub == "lsp" => ExecResult::Status(self.run_lsp(rest)),
-            [sub, rest @ ..] if sub == "map" => ExecResult::Status(self.run_map(rest)),
-            [] => {
-                sh_eprintln!(self, "bish: ::bish: missing subcommand (expected: theme, window, hook, hl, lsp, map)");
-                ExecResult::Status(2)
-            }
-            [other, ..] => {
-                sh_eprintln!(self, "bish: ::bish: unknown subcommand '{other}' (expected: theme, window, hook, hl, lsp, map)");
-                ExecResult::Status(2)
-            }
-        }
-    }
-
     // `::bish hook ls|add|rm` -- what runs when the editor opens, writes
     // or closes a file. The whole point is that a config file can attach
     // behaviour to a language without the editor knowing anything about
@@ -2969,7 +2784,7 @@ impl Shell {
 // `--lang=GLOB` or `--lang GLOB`, returning it and whatever
     // follows. Its own helper because `add` and `ls` have to agree
     // about the spelling.
-    fn hook_lang_flag<'a>(&mut self, subcommand: &str, args: &'a [String]) -> Result<(Option<String>, &'a [String]), i32> {
+    pub(crate) fn hook_lang_flag<'a>(&mut self, subcommand: &str, args: &'a [String]) -> Result<(Option<String>, &'a [String]), i32> {
         match args.first().map(String::as_str) {
             Some(flag) if flag.starts_with("--lang=") => Ok((Some(flag["--lang=".len()..].to_string()), &args[1..])),
             Some("--lang") => match args.get(1) {
@@ -2983,290 +2798,10 @@ impl Shell {
         }
     }
 
-    fn run_hook(&mut self, args: &[String]) -> i32 {
-        match args.first().map(String::as_str) {
-            Some("ls") | Some("list") | None => {
-                let lang = match self.hook_lang_flag("ls", &args[1.min(args.len())..]) {
-                    Ok((lang, [])) => lang,
-                    Ok(_) => {
-                        sh_eprintln!(self, "bish: ::bish hook: ls: usage: ::bish hook ls [--lang=GLOB]");
-                        return 2;
-                    }
-                    Err(status) => return status,
-                };
-                for hook in self.hooks.clone() {
-                    // Listing by language asks "what would fire for a
-                    // file of this language", so it matches the *glob*
-                    // against the language given, exactly as firing
-                    // does -- not the two globs against each other.
-                    if let Some(lang) = lang.as_deref()
-                        && !crate::glob::matches(&hook.lang, lang)
-                    {
-                        continue;
-                    }
-                    sh_println!(self, "{}\t{}\t{}\t{}", hook.id, hook.event, hook.lang, hook.command);
-                }
-                0
-            }
-            Some("add") => {
-                let (lang, rest) = match self.hook_lang_flag("add", &args[1..]) {
-                    Ok(parsed) => parsed,
-                    Err(status) => return status,
-                };
-                let [event, command @ ..] = rest else {
-                    sh_eprintln!(self, "bish: ::bish hook: add: usage: ::bish hook add [--lang=GLOB] EVENT COMMAND...");
-                    return 2;
-                };
-                if !HOOK_EVENTS.contains(&event.as_str()) {
-                    sh_eprintln!(self, "bish: ::bish hook: add: unknown event '{event}' (try `::bish hook help`)");
-                    return 2;
-                }
-                if command.is_empty() {
-                    sh_eprintln!(self, "bish: ::bish hook: add: no command given");
-                    return 2;
-                }
-                let id = self.next_hook_id;
-                self.next_hook_id += 1;
-                self.hooks.push(Hook {
-                    id,
-                    event: event.clone(),
-                    lang: lang.unwrap_or_else(|| "*".to_string()),
-                    command: command.join(" "),
-                });
-                // The id is the return value: a config that adds a hook
-                // is usually the thing that will want to remove it.
-                sh_println!(self, "{id}");
-                0
-            }
-            Some("rm") | Some("remove") => {
-                let Some(id) = args.get(1).and_then(|a| a.parse::<u64>().ok()) else {
-                    sh_eprintln!(self, "bish: ::bish hook: rm: usage: ::bish hook rm <id>");
-                    return 2;
-                };
-                let before = self.hooks.len();
-                self.hooks.retain(|h| h.id != id);
-                if self.hooks.len() == before {
-                    sh_eprintln!(self, "bish: ::bish hook: rm: no hook with id {id}");
-                    return 1;
-                }
-                0
-            }
-            Some("help") | Some("--help") | Some("-h") | Some("events") => {
-                for line in hook_help() {
-                    sh_println!(self, "{line}");
-                }
-                0
-            }
-            Some(other) => {
-                sh_eprintln!(self, "bish: ::bish hook: unknown subcommand '{other}' (expected: ls, add, rm, help)");
-                2
-            }
-        }
-    }
-
-    // `::bish lsp ls|add|rm|status` -- which language servers exist and
-    // which are running. Deliberately the same shape as `::bish hook`
-    // right above: a per-shell counter for ids, `--lang` as a glob, `rm`
-    // by the id `add` printed. Two registries that worked differently
-    // would be two things to learn.
-    //
-    // Canonical under `::bish` rather than a bare `lsp` builtin, for the
-    // reason `window` was moved there: this namespace exists so
-    // bish-specific commands don't shadow real ones in scripts.
-    fn run_lsp(&mut self, args: &[String]) -> i32 {
-        match args.first().map(String::as_str) {
-            Some("ls") | Some("list") | None => {
-                let rest = &args[1.min(args.len())..];
-                let lang = match self.lsp_lang_flag("ls", rest) {
-                    Ok((lang, [])) => lang,
-                    Ok(_) => {
-                        sh_eprintln!(self, "bish: ::bish lsp: ls: usage: ::bish lsp ls [--lang=GLOB]");
-                        return 2;
-                    }
-                    Err(status) => return status,
-                };
-                for server in self.lsp_servers.clone() {
-                    // Same question `hook ls --lang` answers: "what
-                    // would be used for a file of this language" -- so
-                    // the glob is matched against the language given,
-                    // not the two globs against each other.
-                    if let Some(lang) = lang.as_deref()
-                        && !crate::glob::matches(&server.lang, lang)
-                    {
-                        continue;
-                    }
-                    let root = if server.root_cmd.is_empty() { server.root_markers.join(",") } else { server.root_cmd.clone() };
-                    sh_println!(self, "{}\t{}\t{}\t{}", server.id, server.lang, root, server.command_line());
-                }
-                0
-            }
-            Some("add") => {
-                // Round-robin rather than a fixed order: with four
-                // flags, an order that only reads correctly one way
-                // means `--apply-edits=always --lang=rust rust-analyzer`
-                // silently tries to *run* `--apply-edits=always`. Each
-                // helper leaves the slice alone when its flag isn't at
-                // the front, so a pass that consumes nothing is the
-                // signal that what remains is the command.
-                let mut rest = &args[1..];
-                let mut lang = None;
-                let mut root_markers = None;
-                let mut root_cmd = String::new();
-                let mut apply_edits = "scoped".to_string();
-                let mut settings: Vec<(String, String)> = Vec::new();
-                loop {
-                    let before = rest.len();
-                    match self.lsp_lang_flag("add", rest) {
-                        Ok((found, after)) => {
-                            if found.is_some() {
-                                lang = found;
-                            }
-                            rest = after;
-                        }
-                        Err(status) => return status,
-                    }
-                    let mark = rest.len();
-                    match self.lsp_root_flag(rest) {
-                        Ok((found, after)) => {
-                            if after.len() != mark {
-                                root_markers = Some(found);
-                            }
-                            rest = after;
-                        }
-                        Err(status) => return status,
-                    }
-                    match self.lsp_root_cmd_flag(rest) {
-                        Ok((found, after)) => {
-                            if !found.is_empty() {
-                                root_cmd = found;
-                            }
-                            rest = after;
-                        }
-                        Err(status) => return status,
-                    }
-                    let mark = rest.len();
-                    match self.lsp_apply_edits_flag(rest) {
-                        Ok((found, after)) => {
-                            if after.len() != mark {
-                                apply_edits = found;
-                            }
-                            rest = after;
-                        }
-                        Err(status) => return status,
-                    }
-                    match self.lsp_setting_flag(rest) {
-                        Ok((found, after)) => {
-                            if let Some(pair) = found {
-                                // Last one wins for a repeated key, so a
-                                // config that overrides an earlier line
-                                // reads the way it looks.
-                                settings.retain(|(k, _)| k != &pair.0);
-                                settings.push(pair);
-                            }
-                            rest = after;
-                        }
-                        Err(status) => return status,
-                    }
-                    if rest.len() == before {
-                        break;
-                    }
-                }
-                let root_markers = root_markers.unwrap_or_else(|| vec![".git".to_string()]);
-                if rest.is_empty() {
-                    sh_eprintln!(self, "bish: ::bish lsp: add: usage: ::bish lsp add [--lang=GLOB] [--root=NAME,...] COMMAND...");
-                    return 2;
-                }
-                let id = self.next_lsp_id;
-                self.next_lsp_id += 1;
-                self.lsp_servers.push(LspServer {
-                    id,
-                    lang: lang.unwrap_or_else(|| "*".to_string()),
-                    command: rest.to_vec(),
-                    root_markers,
-                    root_cmd,
-                    apply_edits,
-                    settings,
-                });
-                // The id is the return value, same as `hook add`: a
-                // config that registers something usually wants to be
-                // able to take it back.
-                sh_println!(self, "{id}");
-                0
-            }
-            Some("rm") | Some("remove") => {
-                let Some(id) = args.get(1).and_then(|a| a.parse::<u64>().ok()) else {
-                    sh_eprintln!(self, "bish: ::bish lsp: rm: usage: ::bish lsp rm <id>");
-                    return 2;
-                };
-                let before = self.lsp_servers.len();
-                self.lsp_servers.retain(|s| s.id != id);
-                if self.lsp_servers.len() == before {
-                    sh_eprintln!(self, "bish: ::bish lsp: rm: no language server with id {id}");
-                    return 1;
-                }
-                0
-            }
-            Some("status") => {
-                // Collected before printing: `sh_println!` needs the
-                // shell mutably, and the table is reached through it.
-                let rows: Vec<String> = self.lsp.borrow().rows().iter().map(|fields| fields.join("\t")).collect();
-                for row in rows {
-                    sh_println!(self, "{row}");
-                }
-                0
-            }
-            Some("log") => {
-                // The whole reason a server's stderr is captured rather
-                // than discarded: when one fails to start, what it said
-                // on the way out is the only explanation there is.
-                let Some(id) = args.get(1).and_then(|a| a.parse::<u64>().ok()) else {
-                    sh_eprintln!(self, "bish: ::bish lsp: log: usage: ::bish lsp log <id>");
-                    return 2;
-                };
-                let lines = self.lsp.borrow().logs(id);
-                if lines.is_empty() {
-                    sh_eprintln!(self, "bish: ::bish lsp: log: nothing recorded for id {id}");
-                    return 1;
-                }
-                for line in lines {
-                    sh_println!(self, "{line}");
-                }
-                0
-            }
-            Some("restart") => {
-                // A server that died, or never started, stays that way
-                // on purpose -- retrying on every file open would turn
-                // one bad line of config into a spawn per keystroke of
-                // navigation. This is how someone who has *fixed* that
-                // line says so.
-                let Some(id) = args.get(1).and_then(|a| a.parse::<u64>().ok()) else {
-                    sh_eprintln!(self, "bish: ::bish lsp: restart: usage: ::bish lsp restart <id>");
-                    return 2;
-                };
-                let dropped = self.lsp.borrow_mut().forget(id);
-                if dropped == 0 {
-                    sh_eprintln!(self, "bish: ::bish lsp: restart: nothing running or failed for id {id}");
-                    return 1;
-                }
-                0
-            }
-            Some("help") | Some("--help") | Some("-h") => {
-                for line in lsp_help() {
-                    sh_println!(self, "{line}");
-                }
-                0
-            }
-            Some(other) => {
-                sh_eprintln!(self, "bish: ::bish lsp: unknown subcommand '{other}' (expected: ls, add, rm, status, log, restart, help)");
-                2
-            }
-        }
-    }
-
     // `--root-cmd=COMMAND`/`--root-cmd COMMAND`. Its own helper rather
     // than folding into `lsp_root_flag`, so `--root` and `--root-cmd`
     // can be given in either order and neither is positional.
-    fn lsp_root_cmd_flag<'a>(&mut self, args: &'a [String]) -> Result<(String, &'a [String]), i32> {
+    pub(crate) fn lsp_root_cmd_flag<'a>(&mut self, args: &'a [String]) -> Result<(String, &'a [String]), i32> {
         match args.first().map(String::as_str) {
             Some(flag) if flag.starts_with("--root-cmd=") => Ok((flag["--root-cmd=".len()..].to_string(), &args[1..])),
             Some("--root-cmd") => match args.get(1) {
@@ -3285,7 +2820,7 @@ impl Shell {
     // Returns at most one pair per call; the caller's round-robin loop
     // is what makes it repeatable, and what lets it appear anywhere
     // among the other flags.
-    fn lsp_setting_flag<'a>(&mut self, args: &'a [String]) -> Result<ParsedSetting<'a>, i32> {
+    pub(crate) fn lsp_setting_flag<'a>(&mut self, args: &'a [String]) -> Result<ParsedSetting<'a>, i32> {
         let (raw, rest) = match args.first().map(String::as_str) {
             Some(flag) if flag.starts_with("--setting=") => (flag["--setting=".len()..].to_string(), &args[1..]),
             Some("--setting") => match args.get(1) {
@@ -3313,7 +2848,7 @@ impl Shell {
     }
 
     // `--apply-edits=scoped|never|always`, defaulting to `scoped`.
-    fn lsp_apply_edits_flag<'a>(&mut self, args: &'a [String]) -> Result<(String, &'a [String]), i32> {
+    pub(crate) fn lsp_apply_edits_flag<'a>(&mut self, args: &'a [String]) -> Result<(String, &'a [String]), i32> {
         let (value, rest) = match args.first().map(String::as_str) {
             Some(flag) if flag.starts_with("--apply-edits=") => (flag["--apply-edits=".len()..].to_string(), &args[1..]),
             Some("--apply-edits") => match args.get(1) {
@@ -3344,7 +2879,7 @@ impl Shell {
     }
 
     // `--lang=GLOB`/`--lang GLOB`, exactly as `hook_lang_flag` does it.
-    fn lsp_lang_flag<'a>(&mut self, subcommand: &str, args: &'a [String]) -> Result<(Option<String>, &'a [String]), i32> {
+    pub(crate) fn lsp_lang_flag<'a>(&mut self, subcommand: &str, args: &'a [String]) -> Result<(Option<String>, &'a [String]), i32> {
         match args.first().map(String::as_str) {
             Some(flag) if flag.starts_with("--lang=") => Ok((Some(flag["--lang=".len()..].to_string()), &args[1..])),
             Some("--lang") => match args.get(1) {
@@ -3361,7 +2896,7 @@ impl Shell {
     // `--root=NAME[,NAME...]`. Defaults to `.git`, which is already this
     // codebase's notion of where a project stops (gitignore::Stack::
     // for_directory walks up to exactly there).
-    fn lsp_root_flag<'a>(&mut self, args: &'a [String]) -> Result<(Vec<String>, &'a [String]), i32> {
+    pub(crate) fn lsp_root_flag<'a>(&mut self, args: &'a [String]) -> Result<(Vec<String>, &'a [String]), i32> {
         let (raw, rest) = match args.first().map(String::as_str) {
             Some(flag) if flag.starts_with("--root=") => (flag["--root=".len()..].to_string(), &args[1..]),
             Some("--root") => match args.get(1) {
@@ -3400,77 +2935,6 @@ impl Shell {
         self.firing_hooks = firing;
     }
 
-    // `::bish hl` -- the syntax-highlighting palette.
-    //
-    // Shaped like `bishopt` (`--set`, `--unset`, a bare name to read,
-    // nothing to list) because it does the same job, and two commands
-    // that behave differently for no reason are two things to learn.
-    // It is a *separate* command because the names are open: bishopt is
-    // a closed registry with a default and a description for each
-    // entry, and a highlight colour cannot be, since a language
-    // server's semantic token types are not knowable in advance.
-    //
-    // Only colours. The chrome colours (`ui_col_*`) stay bishopts --
-    // those really are a fixed set of things bish draws.
-    fn run_hl(&mut self, args: &[String]) -> i32 {
-        match args {
-            [] => {
-                for (name, value) in self.hl_colors() {
-                    sh_println!(self, "{name}\t{value}");
-                }
-                0
-            }
-            [flag, name] if flag == "--unset" || flag == "-u" => {
-                // Live state even mid-declaration, exactly as
-                // `bishopt --unset` is: unsetting is not declaring.
-                if self.hl.remove(name.as_str()).is_none() {
-                    sh_eprintln!(self, "bish: ::bish hl: {name} is not set");
-                    return 1;
-                }
-                0
-            }
-            [flag, name, value] if flag == "--set" || flag == "-s" => {
-                if let Err(e) = crate::csscolor::parse_terminal_list(value) {
-                    sh_eprintln!(self, "bish: ::bish hl: {name}: {e}");
-                    return 2;
-                }
-                self.store_hl(name, value.clone());
-                0
-            }
-            [name] if !name.starts_with('-') => {
-                match self.hl_colors().into_iter().find(|(n, _)| n == name) {
-                    Some((_, value)) => {
-                        sh_println!(self, "{value}");
-                        0
-                    }
-                    // Nothing said about this name, which is not an
-                    // error: an open namespace has no unknown names,
-                    // only unset ones.
-                    None => 1,
-                }
-            }
-            _ => {
-                sh_eprintln!(self, "bish: ::bish hl: usage: ::bish hl [NAME | --set|-s NAME COLOUR | --unset|-u NAME]");
-                2
-            }
-        }
-    }
-
-    fn run_bish_theme(&mut self, args: &[String]) -> i32 {
-        match args {
-            [sub] if sub == "begin" => self.run_bish_theme_begin(),
-            [sub] if sub == "end" => self.run_bish_theme_end(),
-            [] => {
-                sh_eprintln!(self, "bish: ::bish theme: missing subcommand (expected: begin, end)");
-                2
-            }
-            [other, ..] => {
-                sh_eprintln!(self, "bish: ::bish theme: unknown subcommand '{other}' (expected: begin, end)");
-                2
-            }
-        }
-    }
-
     // Starts a new theme declaration -- every `bishopt --set` from here
     // until the matching `::bish theme end` is captured into
     // `pending_theme` instead of applying live (see store_bishopt's own
@@ -3479,7 +2943,7 @@ impl Shell {
     // had captured so far the moment `end` ran, with no way back --
     // there's no real use for nesting this anyway (a theme is a flat set
     // of opts, not something that composes from an inner declaration).
-    fn run_bish_theme_begin(&mut self) -> i32 {
+    pub(crate) fn run_bish_theme_begin(&mut self) -> i32 {
         if self.pending_theme.is_some() {
             sh_eprintln!(self, "bish: ::bish theme: a theme declaration is already in progress -- `::bish theme end` it first");
             return 1;
@@ -3503,7 +2967,7 @@ impl Shell {
     // theme NAME` afterward, outside any declaration, the same way
     // defining a theme and activating one are two separate, deliberate
     // steps.
-    fn run_bish_theme_end(&mut self) -> i32 {
+    pub(crate) fn run_bish_theme_end(&mut self) -> i32 {
         let Some(mut pending) = self.pending_theme.take() else {
             sh_eprintln!(self, "bish: ::bish theme: no theme declaration in progress");
             return 1;
@@ -3730,383 +3194,6 @@ impl Shell {
             Err(e) => {
                 sh_eprintln!(self, "bish: =: {e}");
                 1
-            }
-        }
-    }
-
-    // `::bish map [-m GLOB] LHS RHS` -- remap a key sequence.
-    //
-    // Always non-recursive, the way vim's `noremap` is, and there is no
-    // recursive form: a mapping's right-hand side is resolved against
-    // the *default* bindings and can never chain through another
-    // mapping. That removes the whole class of surprise vim's `map` is
-    // famous for (a mapping that changes meaning because an unrelated
-    // one was defined later), and it is why a listing can name the
-    // action a mapping performs rather than just echoing keys.
-    //
-    // The flags follow `abbr`'s, not `::bish lsp`'s: this is a small
-    // user table with add/erase/list, the same shape abbreviations
-    // already have, rather than a subcommand family.
-    fn run_map(&mut self, args: &[String]) -> i32 {
-        let (args, mode) = crate::keymap::take_mode_flag(args);
-        let mode = mode.unwrap_or_else(|| crate::keymap::DEFAULT_MODE.to_string());
-        if !crate::keymap::mode_glob_is_known(&mode) {
-            // A glob matching no mode would be stored, listed, and never
-            // fire, with nothing anywhere saying why -- so it is refused
-            // where the typo was made.
-            sh_eprintln!(self, "bish: ::bish map: --mode '{mode}' matches no mode (have: {})", crate::keymap::MODES.join(", "));
-            return 2;
-        }
-        let rest: &[String] = &args;
-        match rest.first().map(String::as_str) {
-            Some("help") => {
-                for line in crate::keymap::usage() {
-                    sh_println!(self, "{line}");
-                }
-                0
-            }
-            None | Some("-l") | Some("--list") => {
-                let listing: Vec<String> = self
-                    .mappings
-                    .iter()
-                    .filter(|m| crate::keymap::modes_matching(&mode).iter().any(|one| m.applies_to(one)))
-                    .map(|m| {
-                        // The fourth column is what the mapping *does*,
-                        // which only exists where keys resolve to named
-                        // actions. For an insert/command/terminal-only
-                        // mapping the keys are the whole story, and a
-                        // dash says so rather than inventing a
-                        // normal-mode reading of them.
-                        let action = if crate::keymap::has_vim_mode(&m.modes) {
-                            crate::keymap::describe_rhs(&m.rhs).unwrap_or_else(|why| format!("({why})"))
-                        } else {
-                            "-".to_string()
-                        };
-                        format!(
-                            "{}\t{}\t{}\t{}",
-                            m.modes,
-                            crate::keymap::format_keys(&m.lhs),
-                            crate::keymap::format_rhs(&m.rhs),
-                            action
-                        )
-                    })
-                    .collect();
-                for line in listing {
-                    sh_println!(self, "{line}");
-                }
-                0
-            }
-            Some("-e") | Some("--erase") => {
-                let Some(lhs_text) = rest.get(1) else {
-                    sh_eprintln!(self, "bish: ::bish map: --erase: requires a KEY");
-                    return 2;
-                };
-                let lhs = match crate::keymap::parse_keys(lhs_text) {
-                    Ok(keys) => keys,
-                    Err(why) => {
-                        sh_eprintln!(self, "bish: ::bish map: {why}");
-                        return 2;
-                    }
-                };
-                let before = self.mappings.len();
-                self.mappings.retain(|m| !(m.lhs == lhs && m.modes == mode));
-                if self.mappings.len() == before {
-                    sh_eprintln!(self, "bish: ::bish map: no mapping for {lhs_text} in mode '{mode}'");
-                    return 1;
-                }
-                0
-            }
-            Some(_) => {
-                let (Some(lhs_text), Some(rhs_text)) = (rest.first(), rest.get(1)) else {
-                    sh_eprintln!(self, "bish: ::bish map: requires a KEY and what it should do");
-                    for line in crate::keymap::usage() {
-                        sh_eprintln!(self, "{line}");
-                    }
-                    return 2;
-                };
-                if rest.len() > 2 {
-                    // Two halves, always. A right-hand side split over
-                    // several words would be ambiguous about whether the
-                    // space is a key or a separator, which is the exact
-                    // ambiguity `<Space>` exists to remove.
-                    sh_eprintln!(self, "bish: ::bish map: too many arguments (a space in a mapping is <Space>)");
-                    return 2;
-                }
-                if lhs_text == "<Nop>" {
-                    sh_eprintln!(self, "bish: ::bish map: <Nop> is a right-hand side, not a key to press");
-                    return 2;
-                }
-                let (lhs, rhs) = match (crate::keymap::parse_keys(lhs_text), crate::keymap::parse_keys(rhs_text)) {
-                    (Ok(lhs), Ok(rhs)) => (lhs, rhs),
-                    (Err(why), _) | (_, Err(why)) => {
-                        sh_eprintln!(self, "bish: ::bish map: {why}");
-                        return 2;
-                    }
-                };
-                if let Some(bad) = lhs.iter().chain(rhs.iter()).find(|k| !crate::keymap::is_mappable(**k)) {
-                    sh_eprintln!(self, "bish: ::bish map: {} cannot carry a mapping", crate::keymap::format_keys(&[*bad]));
-                    return 2;
-                }
-                // Resolved here rather than at the keystroke: a
-                // right-hand side that means nothing should fail where
-                // it was written, not silently swallow keys later.
-                //
-                // Only where it *has* a meaning to check, though. Normal
-                // and visual resolve keys to named actions, so a
-                // right-hand side that resolves to nothing there is a
-                // mistake. Insert, command and terminal have no such
-                // vocabulary -- keys are keys -- and `<Esc>` is a
-                // perfectly good insert-mode right-hand side while being
-                // no normal-mode action at all.
-                if crate::keymap::has_vim_mode(&mode)
-                    && let Err(why) = crate::keymap::describe_rhs(&rhs)
-                {
-                    sh_eprintln!(self, "bish: ::bish map: '{rhs_text}' is {why} as a normal-mode action");
-                    sh_eprintln!(self, "bish: ::bish map: if it was meant for another mode, scope it with -m");
-                    return 2;
-                }
-                match self.mappings.iter_mut().find(|m| m.lhs == lhs && m.modes == mode) {
-                    Some(existing) => existing.rhs = rhs,
-                    None => self.mappings.push(crate::keymap::Mapping { modes: mode, lhs, rhs }),
-                }
-                0
-            }
-        }
-    }
-
-    fn run_abbr(&mut self, args: &[String]) -> i32 {
-        enum Mode {
-            Add,
-            Erase,
-            List,
-            Show,
-            Query,
-        }
-        let (args, lang) = snippet::take_lang_flag(args);
-        let args: &[String] = &args;
-        let (mode, rest) = match args.first().map(String::as_str) {
-            Some("-a") | Some("--add") => (Mode::Add, &args[1..]),
-            Some("-e") | Some("--erase") => (Mode::Erase, &args[1..]),
-            Some("-l") | Some("--list") => (Mode::List, &args[1..]),
-            Some("-s") | Some("--show") => (Mode::Show, &args[1..]),
-            Some("-q") | Some("--query") => (Mode::Query, &args[1..]),
-            None => (Mode::Show, args),
-            Some(_) => (Mode::Add, args),
-        };
-        match mode {
-            Mode::Add => {
-                let Some((name, expansion_words)) = rest.split_first() else {
-                    sh_eprintln!(self, "bish: abbr: -a: requires a NAME and an EXPANSION");
-                    return 2;
-                };
-                if expansion_words.is_empty() {
-                    sh_eprintln!(self, "bish: abbr: -a: requires an EXPANSION for '{name}'");
-                    return 2;
-                }
-                let expansion = expansion_words.join(" ");
-                let lang = lang.unwrap_or_else(|| snippet::DEFAULT_LANG.to_string());
-                // Redefinition is keyed on both name *and* language: the
-                // same name under a different `--lang=` is a different
-                // abbreviation, not a replacement for this one.
-                match self.abbrs.iter_mut().find(|a| a.name == *name && a.lang == lang) {
-                    Some(existing) => existing.expansion = expansion,
-                    None => self.abbrs.push(Abbr { name: name.clone(), expansion, lang }),
-                }
-                0
-            }
-            Mode::Erase => {
-                if rest.is_empty() {
-                    sh_eprintln!(self, "bish: abbr: -e: requires a NAME");
-                    return 2;
-                }
-                let mut status = 0;
-                for name in rest {
-                    // With no `--lang=`, erasing a name erases it in
-                    // every language it was defined for -- "get rid of
-                    // `foo`" is what someone typing that means. With one,
-                    // only the exact `(name, lang)` entry goes.
-                    let before = self.abbrs.len();
-                    self.abbrs.retain(|a| a.name != *name || lang.as_ref().is_some_and(|l| a.lang != *l));
-                    if self.abbrs.len() == before {
-                        sh_eprintln!(self, "bish: abbr: -e: {}: no such abbreviation", name);
-                        status = 1;
-                    }
-                }
-                status
-            }
-            Mode::List => {
-                for abbr in &self.abbrs {
-                    sh_println!(self, "{}", abbr.name);
-                }
-                0
-            }
-            Mode::Show => {
-                for abbr in &self.abbrs {
-                    // A non-default language is printed back as the same
-                    // `--lang=`, so `abbr -s` stays something you can
-                    // paste straight back in.
-                    let lang = if abbr.lang == snippet::DEFAULT_LANG {
-                        String::new()
-                    } else {
-                        format!("--lang={} ", crate::serialize::quote_literal(&abbr.lang))
-                    };
-                    sh_println!(
-                        self,
-                        "abbr -a {}{} {}",
-                        lang,
-                        crate::serialize::quote_literal(&abbr.name),
-                        crate::serialize::quote_literal(&abbr.expansion)
-                    );
-                }
-                0
-            }
-            Mode::Query => {
-                if rest.is_empty() {
-                    sh_eprintln!(self, "bish: abbr: -q: requires at least one NAME");
-                    return 2;
-                }
-                // `--lang=` narrows the question to that one language;
-                // without it, any language counts.
-                let hit = |a: &Abbr, name: &String| a.name == *name && lang.as_ref().is_none_or(|l| a.lang == *l);
-                if rest.iter().all(|name| self.abbrs.iter().any(|a| hit(a, name))) { 0 } else { 1 }
-            }
-        }
-    }
-
-    // `window`/`w`/`win` -- the window-manager builtin. Only validates the
-    // subcommand and triggers promotion; the actual session/window
-    // mutation happens in repl.rs, reached via the bubbled-up
-    // ExecResult::Window signal (see that variant's doc comment for why
-    // this can't just mutate shared state directly from here).
-    // `::bish window ...` (and command mode's `window` alias). The
-    // read-only subcommands answer from `Shell::windows` right here; the
-    // rest bubble an action up to repl.rs -- and only where something is
-    // actually there to act on it, since `ExecResult::Window` is a
-    // signal `run_program` stops on and letting one escape from `bish
-    // script.sh` would end the script for no reason.
-    fn run_window(&mut self, args: &[String]) -> ExecResult {
-        let result = self.run_window_inner(args);
-        if matches!(result, ExecResult::Window(_)) && !self.windows_available && !self.restrict_to_builtins {
-            sh_eprintln!(self, "bish: ::bish window: no window manager here (this needs an interactive bish)");
-            return ExecResult::Status(1);
-        }
-        result
-    }
-
-    fn run_window_inner(&mut self, args: &[String]) -> ExecResult {
-        fn parse_window_name(shell: &mut Shell, subcommand: &str, rest: &[String]) -> Result<Option<String>, i32> {
-            match rest.first().map(String::as_str) {
-                None => Ok(None),
-                Some("--name") | Some("-n") => match rest.len() {
-                    1 => {
-                        sh_eprintln!(shell, "bish: window: {subcommand}: --name needs a name");
-                        Err(2)
-                    }
-                    _ => Ok(Some(rest[1..].join(" "))),
-                },
-                Some(other) => {
-                    sh_eprintln!(shell, "bish: window: {subcommand}: unexpected argument '{other}' (expected --name NAME)");
-                    Err(2)
-                }
-            }
-        }
-
-        self.promote_if_needed();
-        match args.first().map(String::as_str) {
-            Some("next") | Some("n") => ExecResult::Window(WindowAction::Next),
-            Some("previous") | Some("prev") | Some("p") => ExecResult::Window(WindowAction::Previous),
-            Some("new") | Some("c") | Some("create") => match parse_window_name(self, "create", &args[1..]) {
-                Ok(name) => ExecResult::Window(WindowAction::New { name }),
-                Err(status) => ExecResult::Status(status),
-            },
-            Some("rename") | Some("ren") => match args.get(1) {
-                // A bare `window rename` clears the name; anything else
-                // is the new one, joined so `window rename my project`
-                // means what it looks like.
-                None => ExecResult::Window(WindowAction::Rename(None)),
-                Some(_) => ExecResult::Window(WindowAction::Rename(Some(args[1..].join(" ")))),
-            },
-            // The two that only *read*. Both answer from
-            // `Shell::windows`, which means both behave like any other
-            // builtin: `ls` writes to whatever sink it has (so
-            // `$(window ls)` captures it) and `select` fails
-            // synchronously (so `select || create` works in a function,
-            // a subshell or an `if`).
-            Some("ls") | Some("list") => {
-                for w in &self.windows.clone() {
-                    let name = w.name.clone().unwrap_or_default();
-                    let current = if w.current { "*" } else { "" };
-                    sh_println!(self, "{}\t{name}\t{}\t{}\t{current}", w.id, w.cwd, w.panes);
-                }
-                ExecResult::Status(0)
-            }
-            Some("select") | Some("sel") => match args.get(1) {
-                Some(target) => {
-                    // A name first, an id second: a name is what a config
-                    // function knows, an id is what it falls back to.
-                    let found = self
-                        .windows
-                        .iter()
-                        .position(|w| w.name.as_deref() == Some(target.as_str()))
-                        .or_else(|| self.windows.iter().position(|w| w.id.to_string() == *target));
-                    match found {
-                        Some(index) => ExecResult::Window(WindowAction::Select(index)),
-                        None => {
-                            sh_eprintln!(self, "bish: window: select: no window named '{target}'");
-                            ExecResult::Status(1)
-                        }
-                    }
-                }
-                None => {
-                    sh_eprintln!(self, "bish: window: select: usage: window select <name>|<id>");
-                    ExecResult::Status(2)
-                }
-            },
-            Some("close") | Some("q") | Some("quit") => ExecResult::Window(WindowAction::Close),
-            // WindowAction::Split's own `horizontal` names the divider
-            // LINE's orientation (true = a horizontal dividing line,
-            // panes stacked top/bottom), matching vim's :split/:vsplit
-            // convention. Users read "vertical"/"horizontal" by the
-            // panes' own arrangement axis instead (stacked = panes
-            // arranged *vertically*, side by side = arranged
-            // *horizontally*) -- the opposite pairing -- so `split`/`s`
-            // maps to horizontal:false (side by side) and `vsplit`/`v`
-            // to horizontal:true (stacked), even though that looks
-            // inverted next to the field's own name.
-            Some("split") | Some("s") => ExecResult::Window(WindowAction::Split { horizontal: false }),
-            Some("vsplit") | Some("v") => ExecResult::Window(WindowAction::Split { horizontal: true }),
-            Some("h") | Some("left") => ExecResult::Window(WindowAction::FocusPane(PaneDirection::Left)),
-            Some("j") | Some("below") => ExecResult::Window(WindowAction::FocusPane(PaneDirection::Down)),
-            Some("k") | Some("above") => ExecResult::Window(WindowAction::FocusPane(PaneDirection::Up)),
-            Some("l") | Some("right") => ExecResult::Window(WindowAction::FocusPane(PaneDirection::Right)),
-            Some("=") | Some("balance") => ExecResult::Window(WindowAction::Balance),
-            Some("_") | Some("minimize") => ExecResult::Window(WindowAction::Minimize),
-            Some("+") | Some("sizeup") => ExecResult::Window(WindowAction::SizeUp),
-            Some("-") | Some("sizedown") => ExecResult::Window(WindowAction::SizeDown),
-            Some("size") => match args.get(1).and_then(|a| parse_size_spec(a)) {
-                Some(spec) => ExecResult::Window(WindowAction::SetSize(spec)),
-                None => {
-                    sh_eprintln!(self, "bish: window: size: usage: window size <N>|<N>%|<N>/<M>");
-                    ExecResult::Status(2)
-                }
-            },
-            Some("fg") => match args.get(1).and_then(|a| a.parse::<u32>().ok()) {
-                Some(id) => ExecResult::Window(WindowAction::FgSession(id)),
-                None => {
-                    sh_eprintln!(self, "bish: window: fg: usage: window fg <window-id>");
-                    ExecResult::Status(2)
-                }
-            },
-            Some(other) => {
-                sh_eprintln!(self, "bish: window: unknown subcommand: {}", other);
-                ExecResult::Status(2)
-            }
-            None => {
-                sh_eprintln!(
-                    self,
-                    "bish: window: missing subcommand (next(n)/previous/new(c,create)/close(q,quit)/split(s)/vsplit(v)/h(left)/j(below)/k(above)/l(right)/=(balance)/_(minimize)/+(sizeup)/-(sizedown)/size <N|N%,N/M>/fg <id>)"
-                );
-                ExecResult::Status(2)
             }
         }
     }
@@ -6230,7 +5317,7 @@ impl Shell {
                 }
                 return ExecResult::Status(status);
             }
-            "abbr" => return ExecResult::Status(self.run_abbr(&argv[1..])),
+            "abbr" => return ExecResult::Status(crate::builtins::bish::run_abbr(self, &argv[1..])),
             "history" => return ExecResult::Status(crate::builtins::history::run_history(self, &argv[1..])),
             "fc" => return ExecResult::Status(crate::builtins::history::run_fc(self, &argv[1..])),
             // `= EXPR`: evaluate and print. The other half of the inline
@@ -6241,13 +5328,13 @@ impl Shell {
             // or scrolled back to.
             "=" => return ExecResult::Status(self.run_arith_print(&argv[1..])),
             "shopt" => return ExecResult::Status(crate::builtins::shell::run_shopt(self, &argv[1..])),
-            "bishopt" => return ExecResult::Status(self.run_bishopt(&argv[1..], KNOWN_BISHOPTS)),
+            "bishopt" => return ExecResult::Status(crate::builtins::bish::run_bishopt(self, &argv[1..], KNOWN_BISHOPTS)),
             // `::bish SUBCOMMAND...`: a dedicated namespace for bish-
             // specific commands that don't belong as an ordinary top-
             // level builtin name (see run_bish's own doc comment for
             // why) -- `theme` (begin/end a theme declaration) is the
             // first subcommand.
-            "::bish" => return self.run_bish(&argv[1..]),
+            "::bish" => return crate::builtins::bish::run_bish(self, &argv[1..]),
             "compgen" => return ExecResult::Status(crate::builtins::completion::run_compgen(self, &argv[1..])),
             "complete" => return ExecResult::Status(crate::builtins::completion::run_complete(self, &argv[1..])),
             "compopt" => return ExecResult::Status(crate::builtins::completion::run_compopt(self, &argv[1..])),
@@ -6266,7 +5353,7 @@ impl Shell {
             // matching bishedit's normal-mode Ctrl-W leader now covering
             // window management directly (see vimkeys.rs's WindowCmd).
             "window" | "win" if self.restrict_to_builtins => {
-                return self.run_window(&argv[1..]);
+                return crate::builtins::bish::run_window(self, &argv[1..]);
             }
             "pushd" => return ExecResult::Status(crate::builtins::dirs::run_pushd(self, &argv[1..])),
             "popd" => return ExecResult::Status(crate::builtins::dirs::run_popd(self, &argv[1..])),
@@ -11034,7 +10121,7 @@ const SET_O_OPTIONS: &[&str] = &["pipefail", "errexit", "nounset", "xtrace", "no
 // Not `Copy`: an Int option carries the range it accepts, and a range
 // isn't. Cloned at the two places that need an owned default instead.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum BishOptDefault {
+pub(crate) enum BishOptDefault {
     Bool(bool),
     // Whole numbers, with the range they accept -- a column count or a
     // scroll margin is meaningless outside one, and catching that at
@@ -11057,7 +10144,7 @@ enum BishOptDefault {
 // Shell::bishopt_color) -- not baked in here, since that support could
 // in principle differ from whatever it was when `--set` ran.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum BishOptValue {
+pub(crate) enum BishOptValue {
     Bool(bool),
     Int(i64),
     Str(String),
@@ -11976,50 +11063,50 @@ mod tests {
     #[test]
     fn abbr_add_registers_a_multi_word_expansion_joined_by_single_spaces() {
         let mut shell = Shell::new();
-        assert_eq!(shell.run_abbr(&strs(&["-a", "gco", "git", "checkout"])), 0);
+        assert_eq!(crate::builtins::bish::run_abbr(&mut shell, &strs(&["-a", "gco", "git", "checkout"])), 0);
         assert_eq!(shell.abbrs, vec![Abbr::new("gco", "git checkout")]);
     }
 
     #[test]
     fn abbr_add_without_the_dash_a_flag_still_adds() {
         let mut shell = Shell::new();
-        assert_eq!(shell.run_abbr(&strs(&["ll", "ls", "-la"])), 0);
+        assert_eq!(crate::builtins::bish::run_abbr(&mut shell, &strs(&["ll", "ls", "-la"])), 0);
         assert_eq!(shell.abbrs, vec![Abbr::new("ll", "ls -la")]);
     }
 
     #[test]
     fn abbr_add_redefines_an_existing_name_in_place_rather_than_duplicating() {
         let mut shell = Shell::new();
-        shell.run_abbr(&strs(&["-a", "gco", "git", "checkout"]));
-        shell.run_abbr(&strs(&["-a", "gco", "git", "switch"]));
+        crate::builtins::bish::run_abbr(&mut shell, &strs(&["-a", "gco", "git", "checkout"]));
+        crate::builtins::bish::run_abbr(&mut shell, &strs(&["-a", "gco", "git", "switch"]));
         assert_eq!(shell.abbrs, vec![Abbr::new("gco", "git switch")]);
     }
 
     #[test]
     fn abbr_erase_removes_a_known_name_and_reports_status_1_for_an_unknown_one() {
         let mut shell = Shell::new();
-        shell.run_abbr(&strs(&["-a", "gco", "git", "checkout"]));
-        assert_eq!(shell.run_abbr(&strs(&["-e", "gco"])), 0);
+        crate::builtins::bish::run_abbr(&mut shell, &strs(&["-a", "gco", "git", "checkout"]));
+        assert_eq!(crate::builtins::bish::run_abbr(&mut shell, &strs(&["-e", "gco"])), 0);
         assert!(shell.abbrs.is_empty());
-        assert_eq!(shell.run_abbr(&strs(&["-e", "gco"])), 1);
+        assert_eq!(crate::builtins::bish::run_abbr(&mut shell, &strs(&["-e", "gco"])), 1);
     }
 
     #[test]
     fn abbr_query_is_zero_only_when_every_named_abbreviation_exists() {
         let mut shell = Shell::new();
-        shell.run_abbr(&strs(&["-a", "gco", "git", "checkout"]));
-        shell.run_abbr(&strs(&["-a", "gs", "git", "status"]));
-        assert_eq!(shell.run_abbr(&strs(&["-q", "gco", "gs"])), 0);
-        assert_eq!(shell.run_abbr(&strs(&["-q", "gco", "nope"])), 1);
+        crate::builtins::bish::run_abbr(&mut shell, &strs(&["-a", "gco", "git", "checkout"]));
+        crate::builtins::bish::run_abbr(&mut shell, &strs(&["-a", "gs", "git", "status"]));
+        assert_eq!(crate::builtins::bish::run_abbr(&mut shell, &strs(&["-q", "gco", "gs"])), 0);
+        assert_eq!(crate::builtins::bish::run_abbr(&mut shell, &strs(&["-q", "gco", "nope"])), 1);
     }
 
     #[test]
     fn abbr_list_and_show_report_status_0_without_mutating_the_table() {
         let mut shell = Shell::new();
-        shell.run_abbr(&strs(&["-a", "gco", "git", "checkout"]));
-        assert_eq!(shell.run_abbr(&strs(&["-l"])), 0);
-        assert_eq!(shell.run_abbr(&strs(&["-s"])), 0);
-        assert_eq!(shell.run_abbr(&[]), 0);
+        crate::builtins::bish::run_abbr(&mut shell, &strs(&["-a", "gco", "git", "checkout"]));
+        assert_eq!(crate::builtins::bish::run_abbr(&mut shell, &strs(&["-l"])), 0);
+        assert_eq!(crate::builtins::bish::run_abbr(&mut shell, &strs(&["-s"])), 0);
+        assert_eq!(crate::builtins::bish::run_abbr(&mut shell, &[]), 0);
         assert_eq!(shell.abbrs, vec![Abbr::new("gco", "git checkout")]);
     }
 
@@ -12030,18 +11117,18 @@ mod tests {
     #[test]
     fn abbr_add_keeps_trailing_integers_as_expansion_words() {
         let mut shell = Shell::new();
-        assert_eq!(shell.run_abbr(&strs(&["--add", "foo", "bar -x $1 -y $2", "2", "1"])), 0);
+        assert_eq!(crate::builtins::bish::run_abbr(&mut shell, &strs(&["--add", "foo", "bar -x $1 -y $2", "2", "1"])), 0);
         assert_eq!(shell.abbrs, vec![Abbr::new("foo", "bar -x $1 -y $2 2 1")]);
-        assert_eq!(shell.run_abbr(&strs(&["-a", "e12", "echo", "1", "2"])), 0);
+        assert_eq!(crate::builtins::bish::run_abbr(&mut shell, &strs(&["-a", "e12", "echo", "1", "2"])), 0);
         assert_eq!(shell.abbrs[1], Abbr::new("e12", "echo 1 2"));
     }
 
     #[test]
     fn abbr_show_round_trips_an_expansion_verbatim() {
         let mut shell = Shell::new();
-        shell.run_abbr(&strs(&["-a", "foo", "bar -x ${1:x} -y $2"]));
+        crate::builtins::bish::run_abbr(&mut shell, &strs(&["-a", "foo", "bar -x ${1:x} -y $2"]));
         let out = capture_output(&mut shell);
-        shell.run_abbr(&strs(&["-s"]));
+        crate::builtins::bish::run_abbr(&mut shell, &strs(&["-s"]));
         assert_eq!(out.borrow().as_str(), "abbr -a 'foo' 'bar -x ${1:x} -y $2'\n");
     }
 
@@ -12106,11 +11193,11 @@ mod tests {
     #[test]
     fn abbr_lang_scopes_an_abbreviation_and_the_same_name_can_mean_two_things() {
         let mut shell = Shell::new();
-        assert_eq!(shell.run_abbr(&strs(&["-a", "p", "echo bash"])), 0);
-        assert_eq!(shell.run_abbr(&strs(&["--lang=rust", "-a", "p", "println!(\"%s\")"])), 0);
+        assert_eq!(crate::builtins::bish::run_abbr(&mut shell, &strs(&["-a", "p", "echo bash"])), 0);
+        assert_eq!(crate::builtins::bish::run_abbr(&mut shell, &strs(&["--lang=rust", "-a", "p", "println!(\"%s\")"])), 0);
         assert_eq!(shell.abbrs.len(), 2, "same name, different language -- two entries, not a redefinition");
         // Redefining still replaces in place, keyed on both.
-        assert_eq!(shell.run_abbr(&strs(&["--lang=rust", "-a", "p", "dbg!(%s)"])), 0);
+        assert_eq!(crate::builtins::bish::run_abbr(&mut shell, &strs(&["--lang=rust", "-a", "p", "dbg!(%s)"])), 0);
         assert_eq!(shell.abbrs.len(), 2);
         assert_eq!(shell.abbrs[1].expansion, "dbg!(%s)");
         assert_eq!(shell.abbrs[0].lang, "bash");
@@ -12119,41 +11206,41 @@ mod tests {
     #[test]
     fn abbr_erase_without_a_lang_erases_the_name_everywhere() {
         let mut shell = Shell::new();
-        shell.run_abbr(&strs(&["-a", "p", "one"]));
-        shell.run_abbr(&strs(&["--lang=rust", "-a", "p", "two"]));
-        shell.run_abbr(&strs(&["-a", "q", "three"]));
-        assert_eq!(shell.run_abbr(&strs(&["-e", "p"])), 0);
+        crate::builtins::bish::run_abbr(&mut shell, &strs(&["-a", "p", "one"]));
+        crate::builtins::bish::run_abbr(&mut shell, &strs(&["--lang=rust", "-a", "p", "two"]));
+        crate::builtins::bish::run_abbr(&mut shell, &strs(&["-a", "q", "three"]));
+        assert_eq!(crate::builtins::bish::run_abbr(&mut shell, &strs(&["-e", "p"])), 0);
         assert_eq!(shell.abbrs.iter().map(|a| a.name.as_str()).collect::<Vec<_>>(), vec!["q"]);
     }
 
     #[test]
     fn abbr_erase_with_a_lang_erases_only_that_one() {
         let mut shell = Shell::new();
-        shell.run_abbr(&strs(&["-a", "p", "one"]));
-        shell.run_abbr(&strs(&["--lang=rust", "-a", "p", "two"]));
-        assert_eq!(shell.run_abbr(&strs(&["--lang=rust", "-e", "p"])), 0);
+        crate::builtins::bish::run_abbr(&mut shell, &strs(&["-a", "p", "one"]));
+        crate::builtins::bish::run_abbr(&mut shell, &strs(&["--lang=rust", "-a", "p", "two"]));
+        assert_eq!(crate::builtins::bish::run_abbr(&mut shell, &strs(&["--lang=rust", "-e", "p"])), 0);
         assert_eq!(shell.abbrs.len(), 1);
         assert_eq!(shell.abbrs[0].lang, "bash");
         // ...and erasing a language it isn't defined for is a miss.
-        assert_eq!(shell.run_abbr(&strs(&["--lang=go", "-e", "p"])), 1);
+        assert_eq!(crate::builtins::bish::run_abbr(&mut shell, &strs(&["--lang=go", "-e", "p"])), 1);
     }
 
     #[test]
     fn abbr_query_can_ask_about_one_language() {
         let mut shell = Shell::new();
-        shell.run_abbr(&strs(&["--lang=rust", "-a", "p", "two"]));
-        assert_eq!(shell.run_abbr(&strs(&["-q", "p"])), 0, "any language counts without --lang");
-        assert_eq!(shell.run_abbr(&strs(&["--lang=rust", "-q", "p"])), 0);
-        assert_eq!(shell.run_abbr(&strs(&["--lang=bash", "-q", "p"])), 1);
+        crate::builtins::bish::run_abbr(&mut shell, &strs(&["--lang=rust", "-a", "p", "two"]));
+        assert_eq!(crate::builtins::bish::run_abbr(&mut shell, &strs(&["-q", "p"])), 0, "any language counts without --lang");
+        assert_eq!(crate::builtins::bish::run_abbr(&mut shell, &strs(&["--lang=rust", "-q", "p"])), 0);
+        assert_eq!(crate::builtins::bish::run_abbr(&mut shell, &strs(&["--lang=bash", "-q", "p"])), 1);
     }
 
     #[test]
     fn abbr_show_round_trips_a_language() {
         let mut shell = Shell::new();
-        shell.run_abbr(&strs(&["--lang=!(bash)", "-a", "p", "note %s"]));
-        shell.run_abbr(&strs(&["-a", "plain", "echo hi"]));
+        crate::builtins::bish::run_abbr(&mut shell, &strs(&["--lang=!(bash)", "-a", "p", "note %s"]));
+        crate::builtins::bish::run_abbr(&mut shell, &strs(&["-a", "plain", "echo hi"]));
         let out = capture_output(&mut shell);
-        shell.run_abbr(&strs(&["-s"]));
+        crate::builtins::bish::run_abbr(&mut shell, &strs(&["-s"]));
         assert_eq!(
             out.borrow().as_str(),
             // The default language is left off, so an abbreviation that
@@ -12165,17 +11252,17 @@ mod tests {
     #[test]
     fn abbr_add_with_no_expansion_is_a_usage_error() {
         let mut shell = Shell::new();
-        assert_eq!(shell.run_abbr(&strs(&["-a", "gco"])), 2);
+        assert_eq!(crate::builtins::bish::run_abbr(&mut shell, &strs(&["-a", "gco"])), 2);
         assert!(shell.abbrs.is_empty());
     }
 
     #[test]
     fn new_virtual_child_inherits_a_snapshot_of_the_parents_abbrs() {
         let mut parent = Shell::new();
-        parent.run_abbr(&strs(&["-a", "gco", "git", "checkout"]));
+        crate::builtins::bish::run_abbr(&mut parent, &strs(&["-a", "gco", "git", "checkout"]));
         let mut child = parent.new_virtual_child();
         assert_eq!(child.abbrs, parent.abbrs);
-        child.run_abbr(&strs(&["-a", "gs", "git", "status"]));
+        crate::builtins::bish::run_abbr(&mut child, &strs(&["-a", "gs", "git", "status"]));
         assert!(!parent.abbrs.iter().any(|a| a.name == "gs"), "parent must not see the child's later abbr additions");
     }
 
@@ -12246,15 +11333,15 @@ mod tests {
     #[test]
     fn bishopt_lists_only_names_with_no_args() {
         let mut shell = Shell::new();
-        assert_eq!(shell.run_bishopt(&[], &test_bishopts()), 0);
+        assert_eq!(crate::builtins::bish::run_bishopt(&mut shell, &[], &test_bishopts()), 0);
     }
 
     #[test]
     fn bishopt_get_on_a_bool_reports_its_value_via_exit_status_either_way() {
         let mut shell = Shell::new();
-        assert_eq!(shell.run_bishopt(&strs(&["verbose"]), &test_bishopts()), 1, "unset bool defaults to off");
-        shell.run_bishopt(&strs(&["--set", "verbose"]), &test_bishopts());
-        assert_eq!(shell.run_bishopt(&strs(&["verbose"]), &test_bishopts()), 0);
+        assert_eq!(crate::builtins::bish::run_bishopt(&mut shell, &strs(&["verbose"]), &test_bishopts()), 1, "unset bool defaults to off");
+        crate::builtins::bish::run_bishopt(&mut shell, &strs(&["--set", "verbose"]), &test_bishopts());
+        assert_eq!(crate::builtins::bish::run_bishopt(&mut shell, &strs(&["verbose"]), &test_bishopts()), 0);
     }
 
     #[test]
@@ -12262,18 +11349,18 @@ mod tests {
         let mut shell = Shell::new();
         // -q/--quiet only changes whether get *prints* -- the exit status
         // (what shopt -q itself is for) is identical to the bare get's.
-        assert_eq!(shell.run_bishopt(&strs(&["-q", "verbose"]), &test_bishopts()), 1);
-        assert_eq!(shell.run_bishopt(&strs(&["--quiet", "greeting"]), &test_bishopts()), 0, "a Str's mere existence is enough under -q");
-        shell.run_bishopt(&strs(&["--set", "verbose"]), &test_bishopts());
-        assert_eq!(shell.run_bishopt(&strs(&["-q", "verbose"]), &test_bishopts()), 0);
+        assert_eq!(crate::builtins::bish::run_bishopt(&mut shell, &strs(&["-q", "verbose"]), &test_bishopts()), 1);
+        assert_eq!(crate::builtins::bish::run_bishopt(&mut shell, &strs(&["--quiet", "greeting"]), &test_bishopts()), 0, "a Str's mere existence is enough under -q");
+        crate::builtins::bish::run_bishopt(&mut shell, &strs(&["--set", "verbose"]), &test_bishopts());
+        assert_eq!(crate::builtins::bish::run_bishopt(&mut shell, &strs(&["-q", "verbose"]), &test_bishopts()), 0);
     }
 
     #[test]
     fn bishopt_set_accepts_on_and_off_as_an_alternative_to_unset_for_a_bool() {
         let mut shell = Shell::new();
-        assert_eq!(shell.run_bishopt(&strs(&["--set", "verbose", "on"]), &test_bishopts()), 0);
+        assert_eq!(crate::builtins::bish::run_bishopt(&mut shell, &strs(&["--set", "verbose", "on"]), &test_bishopts()), 0);
         assert_eq!(shell.bishopt_value(&test_bishopts(), "verbose"), Some(BishOptValue::Bool(true)));
-        assert_eq!(shell.run_bishopt(&strs(&["--set", "verbose", "off"]), &test_bishopts()), 0);
+        assert_eq!(crate::builtins::bish::run_bishopt(&mut shell, &strs(&["--set", "verbose", "off"]), &test_bishopts()), 0);
         assert_eq!(shell.bishopt_value(&test_bishopts(), "verbose"), Some(BishOptValue::Bool(false)));
     }
 
@@ -12281,28 +11368,28 @@ mod tests {
     fn bishopt_get_on_a_str_prints_its_value_and_exits_0() {
         let mut shell = Shell::new();
         assert_eq!(shell.bishopt_value(&test_bishopts(), "greeting"), Some(BishOptValue::Str("hi".to_string())));
-        assert_eq!(shell.run_bishopt(&strs(&["greeting"]), &test_bishopts()), 0);
-        shell.run_bishopt(&strs(&["--set", "greeting", "hey"]), &test_bishopts());
+        assert_eq!(crate::builtins::bish::run_bishopt(&mut shell, &strs(&["greeting"]), &test_bishopts()), 0);
+        crate::builtins::bish::run_bishopt(&mut shell, &strs(&["--set", "greeting", "hey"]), &test_bishopts());
         assert_eq!(shell.bishopt_value(&test_bishopts(), "greeting"), Some(BishOptValue::Str("hey".to_string())));
     }
 
     #[test]
     fn bishopt_set_rejects_a_value_on_a_bool_and_a_missing_value_on_a_str() {
         let mut shell = Shell::new();
-        assert_eq!(shell.run_bishopt(&strs(&["--set", "verbose", "true"]), &test_bishopts()), 2);
-        assert_eq!(shell.run_bishopt(&strs(&["--set", "greeting"]), &test_bishopts()), 2);
+        assert_eq!(crate::builtins::bish::run_bishopt(&mut shell, &strs(&["--set", "verbose", "true"]), &test_bishopts()), 2);
+        assert_eq!(crate::builtins::bish::run_bishopt(&mut shell, &strs(&["--set", "greeting"]), &test_bishopts()), 2);
         assert_eq!(shell.bishopts, std::collections::HashMap::new(), "a rejected set must not be recorded");
     }
 
     #[test]
     fn bishopt_unset_reverts_to_each_types_own_default() {
         let mut shell = Shell::new();
-        shell.run_bishopt(&strs(&["--set", "verbose"]), &test_bishopts());
-        shell.run_bishopt(&strs(&["--set", "greeting", "hey"]), &test_bishopts());
-        shell.run_bishopt(&strs(&["--set", "accent", "blue"]), &test_bishopts());
-        assert_eq!(shell.run_bishopt(&strs(&["--unset", "verbose"]), &test_bishopts()), 0);
-        assert_eq!(shell.run_bishopt(&strs(&["--unset", "greeting"]), &test_bishopts()), 0);
-        assert_eq!(shell.run_bishopt(&strs(&["--unset", "accent"]), &test_bishopts()), 0);
+        crate::builtins::bish::run_bishopt(&mut shell, &strs(&["--set", "verbose"]), &test_bishopts());
+        crate::builtins::bish::run_bishopt(&mut shell, &strs(&["--set", "greeting", "hey"]), &test_bishopts());
+        crate::builtins::bish::run_bishopt(&mut shell, &strs(&["--set", "accent", "blue"]), &test_bishopts());
+        assert_eq!(crate::builtins::bish::run_bishopt(&mut shell, &strs(&["--unset", "verbose"]), &test_bishopts()), 0);
+        assert_eq!(crate::builtins::bish::run_bishopt(&mut shell, &strs(&["--unset", "greeting"]), &test_bishopts()), 0);
+        assert_eq!(crate::builtins::bish::run_bishopt(&mut shell, &strs(&["--unset", "accent"]), &test_bishopts()), 0);
         assert_eq!(shell.bishopt_value(&test_bishopts(), "verbose"), Some(BishOptValue::Bool(false)));
         assert_eq!(shell.bishopt_value(&test_bishopts(), "greeting"), Some(BishOptValue::Str("hi".to_string())));
         assert_eq!(shell.bishopt_value(&test_bishopts(), "accent"), Some(BishOptValue::Color("red".to_string(), vec![crate::csscolor::TermColor::Rgba(crate::csscolor::Rgba::new(255, 0, 0, 255))])));
@@ -12315,27 +11402,27 @@ mod tests {
 
         let buf = Rc::new(RefCell::new(String::new()));
         shell.set_sink_capture(buf.clone());
-        assert_eq!(shell.run_bishopt(&strs(&["accent"]), &test_bishopts()), 0);
+        assert_eq!(crate::builtins::bish::run_bishopt(&mut shell, &strs(&["accent"]), &test_bishopts()), 0);
         assert_eq!(buf.borrow().as_str(), "red\n", "must echo back the registered default's own text, not \"#ff0000\"");
 
         buf.borrow_mut().clear();
-        shell.run_bishopt(&strs(&["--set", "accent", "cornflowerblue"]), &test_bishopts());
-        assert_eq!(shell.run_bishopt(&strs(&["accent"]), &test_bishopts()), 0);
+        crate::builtins::bish::run_bishopt(&mut shell, &strs(&["--set", "accent", "cornflowerblue"]), &test_bishopts());
+        assert_eq!(crate::builtins::bish::run_bishopt(&mut shell, &strs(&["accent"]), &test_bishopts()), 0);
         assert_eq!(buf.borrow().as_str(), "cornflowerblue\n", "must echo back what --set was actually given, not \"#6495ed\"");
 
-        assert_eq!(shell.run_bishopt(&strs(&["-q", "accent"]), &test_bishopts()), 0, "no boolean meaning, but must not error");
+        assert_eq!(crate::builtins::bish::run_bishopt(&mut shell, &strs(&["-q", "accent"]), &test_bishopts()), 0, "no boolean meaning, but must not error");
     }
 
     #[test]
     fn bishopt_set_accepts_any_valid_css_color_syntax_including_color_mix() {
         let mut shell = Shell::new();
-        assert_eq!(shell.run_bishopt(&strs(&["--set", "accent", "#00ff00"]), &test_bishopts()), 0);
+        assert_eq!(crate::builtins::bish::run_bishopt(&mut shell, &strs(&["--set", "accent", "#00ff00"]), &test_bishopts()), 0);
         assert_eq!(shell.bishopt_value(&test_bishopts(), "accent"), Some(BishOptValue::Color("#00ff00".to_string(), vec![crate::csscolor::TermColor::Rgba(crate::csscolor::Rgba::new(0, 255, 0, 255))])));
 
-        assert_eq!(shell.run_bishopt(&strs(&["--set", "accent", "rgb(0 0 255)"]), &test_bishopts()), 0);
+        assert_eq!(crate::builtins::bish::run_bishopt(&mut shell, &strs(&["--set", "accent", "rgb(0 0 255)"]), &test_bishopts()), 0);
         assert_eq!(shell.bishopt_value(&test_bishopts(), "accent"), Some(BishOptValue::Color("rgb(0 0 255)".to_string(), vec![crate::csscolor::TermColor::Rgba(crate::csscolor::Rgba::new(0, 0, 255, 255))])));
 
-        assert_eq!(shell.run_bishopt(&strs(&["--set", "accent", "color-mix(in srgb, red, blue)"]), &test_bishopts()), 0);
+        assert_eq!(crate::builtins::bish::run_bishopt(&mut shell, &strs(&["--set", "accent", "color-mix(in srgb, red, blue)"]), &test_bishopts()), 0);
         assert_eq!(
             shell.bishopt_value(&test_bishopts(), "accent"),
             Some(BishOptValue::Color("color-mix(in srgb, red, blue)".to_string(), vec![crate::csscolor::TermColor::Rgba(crate::csscolor::Rgba::new(128, 0, 128, 255))]))
@@ -12345,7 +11432,7 @@ mod tests {
     #[test]
     fn bishopt_set_rejects_an_invalid_color_and_does_not_mutate() {
         let mut shell = Shell::new();
-        assert_eq!(shell.run_bishopt(&strs(&["--set", "accent", "not-a-color"]), &test_bishopts()), 2);
+        assert_eq!(crate::builtins::bish::run_bishopt(&mut shell, &strs(&["--set", "accent", "not-a-color"]), &test_bishopts()), 2);
         assert_eq!(
             shell.bishopt_value(&test_bishopts(), "accent"),
             Some(BishOptValue::Color("red".to_string(), vec![crate::csscolor::TermColor::Rgba(crate::csscolor::Rgba::new(255, 0, 0, 255))])),
@@ -12356,18 +11443,18 @@ mod tests {
     #[test]
     fn bishopt_rejects_an_unregistered_name_everywhere() {
         let mut shell = Shell::new();
-        assert_eq!(shell.run_bishopt(&strs(&["nope"]), &test_bishopts()), 1);
-        assert_eq!(shell.run_bishopt(&strs(&["--set", "nope"]), &test_bishopts()), 1);
-        assert_eq!(shell.run_bishopt(&strs(&["--unset", "nope"]), &test_bishopts()), 1);
+        assert_eq!(crate::builtins::bish::run_bishopt(&mut shell, &strs(&["nope"]), &test_bishopts()), 1);
+        assert_eq!(crate::builtins::bish::run_bishopt(&mut shell, &strs(&["--set", "nope"]), &test_bishopts()), 1);
+        assert_eq!(crate::builtins::bish::run_bishopt(&mut shell, &strs(&["--unset", "nope"]), &test_bishopts()), 1);
     }
 
     #[test]
     fn new_virtual_child_inherits_a_snapshot_of_the_parents_bishopts() {
         let mut parent = Shell::new();
-        parent.run_bishopt(&strs(&["--set", "verbose"]), &test_bishopts());
+        crate::builtins::bish::run_bishopt(&mut parent, &strs(&["--set", "verbose"]), &test_bishopts());
         let mut child = parent.new_virtual_child();
         assert_eq!(child.bishopts, parent.bishopts);
-        child.run_bishopt(&strs(&["--set", "greeting", "yo"]), &test_bishopts());
+        crate::builtins::bish::run_bishopt(&mut child, &strs(&["--set", "greeting", "yo"]), &test_bishopts());
         assert!(!parent.bishopts.contains_key("greeting"), "parent must not see the child's later bishopt changes");
     }
 
@@ -12381,10 +11468,10 @@ mod tests {
     #[test]
     fn bish_theme_declares_a_named_theme_without_applying_its_opts_live() {
         let mut shell = Shell::new();
-        assert_eq!(shell.run_bish(&strs(&["theme", "begin"])).status(), 0);
-        assert_eq!(shell.run_bishopt(&strs(&["--set", "theme", "dark"]), KNOWN_BISHOPTS), 0);
-        assert_eq!(shell.run_bishopt(&strs(&["--set", "accent", "blue"]), &test_bishopts()), 0);
-        assert_eq!(shell.run_bish(&strs(&["theme", "end"])).status(), 0);
+        assert_eq!(crate::builtins::bish::run_bish(&mut shell, &strs(&["theme", "begin"])).status(), 0);
+        assert_eq!(crate::builtins::bish::run_bishopt(&mut shell, &strs(&["--set", "theme", "dark"]), KNOWN_BISHOPTS), 0);
+        assert_eq!(crate::builtins::bish::run_bishopt(&mut shell, &strs(&["--set", "accent", "blue"]), &test_bishopts()), 0);
+        assert_eq!(crate::builtins::bish::run_bish(&mut shell, &strs(&["theme", "end"])).status(), 0);
 
         // Neither "theme" nor "accent" was actually applied live -- both
         // still read as whatever they were before the declaration.
@@ -12399,9 +11486,9 @@ mod tests {
     #[test]
     fn bish_theme_end_without_ever_naming_it_discards_the_whole_declaration() {
         let mut shell = Shell::new();
-        shell.run_bish(&strs(&["theme", "begin"])).status();
-        shell.run_bishopt(&strs(&["--set", "accent", "blue"]), &test_bishopts());
-        assert_eq!(shell.run_bish(&strs(&["theme", "end"])).status(), 0);
+        crate::builtins::bish::run_bish(&mut shell, &strs(&["theme", "begin"])).status();
+        crate::builtins::bish::run_bishopt(&mut shell, &strs(&["--set", "accent", "blue"]), &test_bishopts());
+        assert_eq!(crate::builtins::bish::run_bish(&mut shell, &strs(&["theme", "end"])).status(), 0);
         assert!(shell.themes.is_empty(), "no name was ever declared, so nothing should be registered");
         assert_eq!(shell.bishopt_value(&test_bishopts(), "accent"), Some(BishOptValue::Color("red".to_string(), vec![crate::csscolor::TermColor::Rgba(crate::csscolor::Rgba::new(255, 0, 0, 255))])), "still not applied live either");
     }
@@ -12409,59 +11496,59 @@ mod tests {
     #[test]
     fn activating_a_declared_theme_makes_its_opts_the_new_fallback_default() {
         let mut shell = Shell::new();
-        shell.run_bish(&strs(&["theme", "begin"])).status();
-        shell.run_bishopt(&strs(&["--set", "theme", "dark"]), KNOWN_BISHOPTS);
-        shell.run_bishopt(&strs(&["--set", "accent", "blue"]), &test_bishopts());
-        shell.run_bish(&strs(&["theme", "end"])).status();
+        crate::builtins::bish::run_bish(&mut shell, &strs(&["theme", "begin"])).status();
+        crate::builtins::bish::run_bishopt(&mut shell, &strs(&["--set", "theme", "dark"]), KNOWN_BISHOPTS);
+        crate::builtins::bish::run_bishopt(&mut shell, &strs(&["--set", "accent", "blue"]), &test_bishopts());
+        crate::builtins::bish::run_bish(&mut shell, &strs(&["theme", "end"])).status();
 
         // Registering "dark" doesn't activate it by itself.
         assert_eq!(shell.bishopt_value(&test_bishopts(), "accent"), Some(BishOptValue::Color("red".to_string(), vec![crate::csscolor::TermColor::Rgba(crate::csscolor::Rgba::new(255, 0, 0, 255))])));
 
         // Activating it (an ordinary set, outside any declaration) makes
         // its opts the new fallback wherever nothing else was set.
-        assert_eq!(shell.run_bishopt(&strs(&["--set", "theme", "dark"]), KNOWN_BISHOPTS), 0);
+        assert_eq!(crate::builtins::bish::run_bishopt(&mut shell, &strs(&["--set", "theme", "dark"]), KNOWN_BISHOPTS), 0);
         assert_eq!(shell.bishopt_value(&test_bishopts(), "accent"), Some(BishOptValue::Color("blue".to_string(), vec![crate::csscolor::TermColor::Rgba(crate::csscolor::Rgba::new(0, 0, 255, 255))])));
 
         // An explicit override still wins over the active theme.
-        shell.run_bishopt(&strs(&["--set", "accent", "green"]), &test_bishopts());
+        crate::builtins::bish::run_bishopt(&mut shell, &strs(&["--set", "accent", "green"]), &test_bishopts());
         assert_eq!(shell.bishopt_value(&test_bishopts(), "accent"), Some(BishOptValue::Color("green".to_string(), vec![crate::csscolor::TermColor::Rgba(crate::csscolor::Rgba::new(0, 128, 0, 255))])));
     }
 
     #[test]
     fn bish_theme_begin_refuses_to_nest() {
         let mut shell = Shell::new();
-        assert_eq!(shell.run_bish(&strs(&["theme", "begin"])).status(), 0);
-        assert_eq!(shell.run_bish(&strs(&["theme", "begin"])).status(), 1, "a second begin while one is already in progress must be refused");
+        assert_eq!(crate::builtins::bish::run_bish(&mut shell, &strs(&["theme", "begin"])).status(), 0);
+        assert_eq!(crate::builtins::bish::run_bish(&mut shell, &strs(&["theme", "begin"])).status(), 1, "a second begin while one is already in progress must be refused");
         // The original declaration must still be intact -- a set right
         // after the refused nested begin still lands in it.
-        shell.run_bishopt(&strs(&["--set", "theme", "t"]), KNOWN_BISHOPTS);
-        shell.run_bish(&strs(&["theme", "end"])).status();
+        crate::builtins::bish::run_bishopt(&mut shell, &strs(&["--set", "theme", "t"]), KNOWN_BISHOPTS);
+        crate::builtins::bish::run_bish(&mut shell, &strs(&["theme", "end"])).status();
         assert!(shell.themes.contains_key("t"));
     }
 
     #[test]
     fn bish_theme_end_without_a_begin_is_an_error() {
         let mut shell = Shell::new();
-        assert_eq!(shell.run_bish(&strs(&["theme", "end"])).status(), 1);
+        assert_eq!(crate::builtins::bish::run_bish(&mut shell, &strs(&["theme", "end"])).status(), 1);
     }
 
     #[test]
     fn bish_unset_still_applies_live_even_mid_declaration() {
         let mut shell = Shell::new();
-        shell.run_bishopt(&strs(&["--set", "accent", "blue"]), &test_bishopts());
-        shell.run_bish(&strs(&["theme", "begin"])).status();
-        assert_eq!(shell.run_bishopt(&strs(&["--unset", "accent"]), &test_bishopts()), 0);
-        shell.run_bish(&strs(&["theme", "end"])).status();
+        crate::builtins::bish::run_bishopt(&mut shell, &strs(&["--set", "accent", "blue"]), &test_bishopts());
+        crate::builtins::bish::run_bish(&mut shell, &strs(&["theme", "begin"])).status();
+        assert_eq!(crate::builtins::bish::run_bishopt(&mut shell, &strs(&["--unset", "accent"]), &test_bishopts()), 0);
+        crate::builtins::bish::run_bish(&mut shell, &strs(&["theme", "end"])).status();
         assert_eq!(shell.bishopt_value(&test_bishopts(), "accent"), Some(BishOptValue::Color("red".to_string(), vec![crate::csscolor::TermColor::Rgba(crate::csscolor::Rgba::new(255, 0, 0, 255))])), "--unset must not have been diverted into the pending theme");
     }
 
     #[test]
     fn bish_and_bish_theme_reject_unknown_subcommands() {
         let mut shell = Shell::new();
-        assert_eq!(shell.run_bish(&strs(&["nonsense"])).status(), 2);
-        assert_eq!(shell.run_bish(&strs(&[])).status(), 2);
-        assert_eq!(shell.run_bish(&strs(&["theme", "nonsense"])).status(), 2);
-        assert_eq!(shell.run_bish(&strs(&["theme"])).status(), 2);
+        assert_eq!(crate::builtins::bish::run_bish(&mut shell, &strs(&["nonsense"])).status(), 2);
+        assert_eq!(crate::builtins::bish::run_bish(&mut shell, &strs(&[])).status(), 2);
+        assert_eq!(crate::builtins::bish::run_bish(&mut shell, &strs(&["theme", "nonsense"])).status(), 2);
+        assert_eq!(crate::builtins::bish::run_bish(&mut shell, &strs(&["theme"])).status(), 2);
     }
 
     #[test]
@@ -12486,7 +11573,7 @@ mod tests {
         let mut shell = Shell::new();
         for name in names {
             assert!(!name.is_empty() && !name.starts_with('-'), "{name} is not spellable as a `::bish hl` name");
-            assert_eq!(shell.run_hl(&strs(&["--set", name, "#123456"])), 0, "{name} must be settable");
+            assert_eq!(crate::builtins::bish::run_hl(&mut shell, &strs(&["--set", name, "#123456"])), 0, "{name} must be settable");
             assert_eq!(shell.hl_color(name), Some(vt100::Color::Rgb(0x12, 0x34, 0x56)));
         }
     }
@@ -12501,17 +11588,17 @@ mod tests {
         // rendered with before any of this existed.
         assert_eq!(shell.hl_color("string"), None);
         assert_eq!(shell.hl_color("something_no_one_has_named"), None);
-        assert_eq!(shell.run_hl(&strs(&["--set", "string", "#123456"])), 0);
+        assert_eq!(crate::builtins::bish::run_hl(&mut shell, &strs(&["--set", "string", "#123456"])), 0);
         assert_eq!(shell.hl_color("string"), Some(vt100::Color::Rgb(0x12, 0x34, 0x56)));
         // An open namespace takes a name nothing produces yet, which is
         // what lets a server's semantic token types be coloured before
         // bish knows about them.
-        assert_eq!(shell.run_hl(&strs(&["--set", "lsp_type_parameter", "#abcdef"])), 0);
+        assert_eq!(crate::builtins::bish::run_hl(&mut shell, &strs(&["--set", "lsp_type_parameter", "#abcdef"])), 0);
         assert_eq!(shell.hl_color("lsp_type_parameter"), Some(vt100::Color::Rgb(0xab, 0xcd, 0xef)));
         // Unsetting takes it back to "nothing said".
-        assert_eq!(shell.run_hl(&strs(&["--unset", "string"])), 0);
+        assert_eq!(crate::builtins::bish::run_hl(&mut shell, &strs(&["--unset", "string"])), 0);
         assert_eq!(shell.hl_color("string"), None);
-        assert_eq!(shell.run_hl(&strs(&["--unset", "string"])), 1, "unsetting what is not set says so");
+        assert_eq!(crate::builtins::bish::run_hl(&mut shell, &strs(&["--unset", "string"])), 1, "unsetting what is not set says so");
     }
 
     // The point of `::bish hl` being its own command but not its own
@@ -12520,22 +11607,22 @@ mod tests {
     #[test]
     fn a_theme_captures_highlight_colours_alongside_bishopts() {
         let mut shell = Shell::new();
-        assert_eq!(shell.run_bish_theme(&strs(&["begin"])), 0);
-        shell.run_bishopt(&strs(&["--set", "theme", "midnight"]), KNOWN_BISHOPTS);
-        shell.run_bishopt(&strs(&["--set", "ui_col_directory", "#111111"]), KNOWN_BISHOPTS);
-        assert_eq!(shell.run_hl(&strs(&["--set", "string", "#222222"])), 0);
-        assert_eq!(shell.run_bish_theme(&strs(&["end"])), 0);
+        assert_eq!(crate::builtins::bish::run_bish_theme(&mut shell, &strs(&["begin"])), 0);
+        crate::builtins::bish::run_bishopt(&mut shell, &strs(&["--set", "theme", "midnight"]), KNOWN_BISHOPTS);
+        crate::builtins::bish::run_bishopt(&mut shell, &strs(&["--set", "ui_col_directory", "#111111"]), KNOWN_BISHOPTS);
+        assert_eq!(crate::builtins::bish::run_hl(&mut shell, &strs(&["--set", "string", "#222222"])), 0);
+        assert_eq!(crate::builtins::bish::run_bish_theme(&mut shell, &strs(&["end"])), 0);
 
         // Declaring is not switching, so nothing has changed yet.
         assert_eq!(shell.hl_color("string"), None);
         // Switching brings both halves.
-        shell.run_bishopt(&strs(&["--set", "theme", "midnight"]), KNOWN_BISHOPTS);
+        crate::builtins::bish::run_bishopt(&mut shell, &strs(&["--set", "theme", "midnight"]), KNOWN_BISHOPTS);
         assert_eq!(shell.bishopt_color("ui_col_directory"), Some(vt100::Color::Rgb(0x11, 0x11, 0x11)));
         assert_eq!(shell.hl_color("string"), Some(vt100::Color::Rgb(0x22, 0x22, 0x22)));
 
         // Something set directly still wins over the theme, the same
         // precedence a bishopt has.
-        assert_eq!(shell.run_hl(&strs(&["--set", "string", "#333333"])), 0);
+        assert_eq!(crate::builtins::bish::run_hl(&mut shell, &strs(&["--set", "string", "#333333"])), 0);
         assert_eq!(shell.hl_color("string"), Some(vt100::Color::Rgb(0x33, 0x33, 0x33)));
         // ...and the listing shows the theme's entries too, so `::bish
         // hl` with no arguments answers "what is in force", not "what
@@ -12547,7 +11634,7 @@ mod tests {
     #[test]
     fn a_bad_highlight_colour_is_refused_and_nothing_is_stored() {
         let mut shell = Shell::new();
-        assert_eq!(shell.run_hl(&strs(&["--set", "string", "not-a-colour"])), 2);
+        assert_eq!(crate::builtins::bish::run_hl(&mut shell, &strs(&["--set", "string", "not-a-colour"])), 2);
         assert_eq!(shell.hl_color("string"), None);
     }
 
@@ -12558,7 +11645,7 @@ mod tests {
         // `-bish-blue` is ANSI slot 4, terminal-resolved, not a fixed
         // RGB -- so a fresh install renders as it always did.
         assert_eq!(shell.bishopt_color("ui_col_directory"), Some(vt100::Color::Indexed(4)));
-        shell.run_bishopt(&strs(&["--set", "ui_col_directory", "#123456"]), KNOWN_BISHOPTS);
+        crate::builtins::bish::run_bishopt(&mut shell, &strs(&["--set", "ui_col_directory", "#123456"]), KNOWN_BISHOPTS);
         assert_eq!(shell.bishopt_color("ui_col_directory"), Some(vt100::Color::Rgb(0x12, 0x34, 0x56)));
         assert_eq!(shell.bishopt_color("not_a_real_option"), None);
     }
@@ -12566,25 +11653,25 @@ mod tests {
     #[test]
     fn bishopt_color_accepts_a_vendor_ansi_reference_and_reads_it_back_verbatim() {
         let mut shell = Shell::new();
-        assert_eq!(shell.run_bishopt(&strs(&["--set", "accent", "-bish-bright-red"]), &test_bishopts()), 0);
+        assert_eq!(crate::builtins::bish::run_bishopt(&mut shell, &strs(&["--set", "accent", "-bish-bright-red"]), &test_bishopts()), 0);
         assert_eq!(shell.bishopt_value(&test_bishopts(), "accent"), Some(BishOptValue::Color("-bish-bright-red".to_string(), vec![crate::csscolor::TermColor::Ansi(9)])));
 
         let buf = Rc::new(RefCell::new(String::new()));
         shell.set_sink_capture(buf.clone());
-        shell.run_bishopt(&strs(&["accent"]), &test_bishopts());
+        crate::builtins::bish::run_bishopt(&mut shell, &strs(&["accent"]), &test_bishopts());
         assert_eq!(buf.borrow().as_str(), "-bish-bright-red\n");
     }
 
     #[test]
     fn bishopt_set_rejects_a_vendor_color_used_inside_color_mix() {
         let mut shell = Shell::new();
-        assert_eq!(shell.run_bishopt(&strs(&["--set", "accent", "color-mix(in srgb, -bish-red, blue)"]), &test_bishopts()), 2);
+        assert_eq!(crate::builtins::bish::run_bishopt(&mut shell, &strs(&["--set", "accent", "color-mix(in srgb, -bish-red, blue)"]), &test_bishopts()), 2);
     }
 
     #[test]
     fn bishopt_set_accepts_a_font_family_style_fallback_list() {
         let mut shell = Shell::new();
-        assert_eq!(shell.run_bishopt(&strs(&["--set", "accent", "#ff0000, -bish-ansi(1), -bish-red"]), &test_bishopts()), 0);
+        assert_eq!(crate::builtins::bish::run_bishopt(&mut shell, &strs(&["--set", "accent", "#ff0000, -bish-ansi(1), -bish-red"]), &test_bishopts()), 0);
         assert_eq!(
             shell.bishopt_value(&test_bishopts(), "accent"),
             Some(BishOptValue::Color(
@@ -12601,21 +11688,21 @@ mod tests {
         // whole list as typed, not whichever candidate happened to win.
         let buf = Rc::new(RefCell::new(String::new()));
         shell.set_sink_capture(buf.clone());
-        shell.run_bishopt(&strs(&["accent"]), &test_bishopts());
+        crate::builtins::bish::run_bishopt(&mut shell, &strs(&["accent"]), &test_bishopts());
         assert_eq!(buf.borrow().as_str(), "#ff0000, -bish-ansi(1), -bish-red\n");
     }
 
     #[test]
     fn bishopt_set_rejects_a_fallback_list_with_any_invalid_candidate() {
         let mut shell = Shell::new();
-        assert_eq!(shell.run_bishopt(&strs(&["--set", "accent", "red, not-a-color, blue"]), &test_bishopts()), 2);
+        assert_eq!(crate::builtins::bish::run_bishopt(&mut shell, &strs(&["--set", "accent", "red, not-a-color, blue"]), &test_bishopts()), 2);
     }
 
     #[test]
     fn bishopt_color_for_picks_the_best_candidate_the_terminals_support_allows() {
         use crate::csscolor::ColorSupport;
         let mut shell = Shell::new();
-        shell.run_bishopt(&strs(&["--set", "ui_col_directory", "#ff0000, -bish-ansi(200), -bish-red"]), KNOWN_BISHOPTS);
+        crate::builtins::bish::run_bishopt(&mut shell, &strs(&["--set", "ui_col_directory", "#ff0000, -bish-ansi(200), -bish-red"]), KNOWN_BISHOPTS);
         assert_eq!(shell.bishopt_color_for("ui_col_directory", ColorSupport::Truecolor), Some(vt100::Color::Rgb(255, 0, 0)));
         assert_eq!(shell.bishopt_color_for("ui_col_directory", ColorSupport::Ansi256), Some(vt100::Color::Indexed(200)));
         assert_eq!(shell.bishopt_color_for("ui_col_directory", ColorSupport::Ansi16), Some(vt100::Color::Indexed(1)));
@@ -12624,7 +11711,7 @@ mod tests {
         assert_eq!(shell.bishopt_color_for("ui_col_directory", ColorSupport::None), Some(vt100::Color::Indexed(1)));
         // And the same tiering through `::bish hl`, which shares the
         // candidate-picking with bishopt rather than re-deriving it.
-        assert_eq!(shell.run_hl(&strs(&["--set", "string", "#ff0000, -bish-ansi(200), -bish-red"])), 0);
+        assert_eq!(crate::builtins::bish::run_hl(&mut shell, &strs(&["--set", "string", "#ff0000, -bish-ansi(200), -bish-red"])), 0);
         assert_eq!(shell.hl_color_for("string", ColorSupport::Truecolor), Some(vt100::Color::Rgb(255, 0, 0)));
         assert_eq!(shell.hl_color_for("string", ColorSupport::Ansi16), Some(vt100::Color::Indexed(1)));
     }
@@ -13700,7 +12787,7 @@ mod tests {
         assert!(lines.contains("default: 4"), "{lines}");
         assert!(lines.contains("now: 4"), "{lines}");
         // ...and it follows the live value.
-        assert_eq!(shell.run_bishopt(&strs(&["--set", "shiftwidth", "2"]), KNOWN_BISHOPTS), 0);
+        assert_eq!(crate::builtins::bish::run_bishopt(&mut shell, &strs(&["--set", "shiftwidth", "2"]), KNOWN_BISHOPTS), 0);
         assert!(shell.describe_bishopts(KNOWN_BISHOPTS, Some("shiftwidth")).join("\n").contains("now: 2"));
     }
 
@@ -13714,7 +12801,7 @@ mod tests {
     #[test]
     fn describing_an_option_that_does_not_exist_fails() {
         let mut shell = Shell::new();
-        assert_eq!(shell.run_bishopt(&strs(&["--describe", "nonsense"]), KNOWN_BISHOPTS), 1);
+        assert_eq!(crate::builtins::bish::run_bishopt(&mut shell, &strs(&["--describe", "nonsense"]), KNOWN_BISHOPTS), 1);
     }
 
     fn hook_ids(shell: &mut Shell) -> Vec<u64> {
@@ -13724,13 +12811,13 @@ mod tests {
     #[test]
     fn adding_a_hook_returns_an_id_that_removes_it() {
         let mut shell = Shell::new();
-        assert_eq!(shell.run_hook(&strs(&["add", "editor:file:open", "__setup"])), 0);
-        assert_eq!(shell.run_hook(&strs(&["add", "editor:file:close", "__teardown"])), 0);
+        assert_eq!(crate::builtins::bish::run_hook(&mut shell, &strs(&["add", "editor:file:open", "__setup"])), 0);
+        assert_eq!(crate::builtins::bish::run_hook(&mut shell, &strs(&["add", "editor:file:close", "__teardown"])), 0);
         assert_eq!(hook_ids(&mut shell), vec![1, 2], "ids come from a counter, in order");
-        assert_eq!(shell.run_hook(&strs(&["rm", "1"])), 0);
+        assert_eq!(crate::builtins::bish::run_hook(&mut shell, &strs(&["rm", "1"])), 0);
         assert_eq!(hook_ids(&mut shell), vec![2]);
         // ...and an id is never reused, so `rm` can't hit the wrong one.
-        assert_eq!(shell.run_hook(&strs(&["add", "editor:file:open", "__again"])), 0);
+        assert_eq!(crate::builtins::bish::run_hook(&mut shell, &strs(&["add", "editor:file:open", "__again"])), 0);
         assert_eq!(hook_ids(&mut shell), vec![2, 3]);
     }
 
@@ -13763,7 +12850,7 @@ mod tests {
             // `Capture` takes stderr too, which is where the
             // "unknown subcommand" line goes.
             let out = capture_output(&mut shell);
-            shell.run_bish(&strs(args));
+            crate::builtins::bish::run_bish(&mut shell, &strs(args));
             let seen = out.borrow().clone();
             seen.contains("unknown subcommand")
         };
@@ -13786,7 +12873,7 @@ mod tests {
     fn every_offered_apply_edits_value_is_accepted() {
         for value in lsp_apply_edits_values() {
             let mut shell = Shell::new();
-            assert_eq!(shell.run_lsp(&strs(&["add", &format!("--apply-edits={value}"), "x"])), 0, "{value}");
+            assert_eq!(crate::builtins::bish::run_lsp(&mut shell, &strs(&["add", &format!("--apply-edits={value}"), "x"])), 0, "{value}");
             assert_eq!(shell.lsp_servers[0].apply_edits, *value);
         }
     }
@@ -13825,51 +12912,51 @@ mod tests {
     #[test]
     fn adding_a_language_server_returns_an_id_that_removes_it() {
         let mut shell = Shell::new();
-        assert_eq!(shell.run_lsp(&strs(&["add", "--lang=rust", "rust-analyzer"])), 0);
-        assert_eq!(shell.run_lsp(&strs(&["add", "--lang=python", "pylsp"])), 0);
+        assert_eq!(crate::builtins::bish::run_lsp(&mut shell, &strs(&["add", "--lang=rust", "rust-analyzer"])), 0);
+        assert_eq!(crate::builtins::bish::run_lsp(&mut shell, &strs(&["add", "--lang=python", "pylsp"])), 0);
         assert_eq!(lsp_ids(&shell), vec![1, 2], "ids come from a counter, in order");
-        assert_eq!(shell.run_lsp(&strs(&["rm", "1"])), 0);
+        assert_eq!(crate::builtins::bish::run_lsp(&mut shell, &strs(&["rm", "1"])), 0);
         assert_eq!(lsp_ids(&shell), vec![2]);
         // Never reused, so `rm` can't hit the wrong one -- same
         // contract `hook` ids have.
-        assert_eq!(shell.run_lsp(&strs(&["add", "gopls"])), 0);
+        assert_eq!(crate::builtins::bish::run_lsp(&mut shell, &strs(&["add", "gopls"])), 0);
         assert_eq!(lsp_ids(&shell), vec![2, 3]);
-        assert_eq!(shell.run_lsp(&strs(&["rm", "99"])), 1);
-        assert_eq!(shell.run_lsp(&strs(&["rm", "nonsense"])), 2);
+        assert_eq!(crate::builtins::bish::run_lsp(&mut shell, &strs(&["rm", "99"])), 1);
+        assert_eq!(crate::builtins::bish::run_lsp(&mut shell, &strs(&["rm", "nonsense"])), 2);
     }
 
     #[test]
     fn a_command_keeps_its_words_and_defaults_to_a_git_root() {
         let mut shell = Shell::new();
-        assert_eq!(shell.run_lsp(&strs(&["add", "--lang=c", "clangd", "--background-index"])), 0);
+        assert_eq!(crate::builtins::bish::run_lsp(&mut shell, &strs(&["add", "--lang=c", "clangd", "--background-index"])), 0);
         let server = &shell.lsp_servers[0];
         assert_eq!(server.command, vec!["clangd".to_string(), "--background-index".to_string()]);
         assert_eq!(server.lang, "c");
         assert_eq!(server.root_markers, vec![".git".to_string()]);
         assert_eq!(server.command_line(), "clangd --background-index");
         // ...and a word that would stop being one word does get quoted.
-        assert_eq!(shell.run_lsp(&strs(&["add", "some server", "--flag=a b"])), 0);
+        assert_eq!(crate::builtins::bish::run_lsp(&mut shell, &strs(&["add", "some server", "--flag=a b"])), 0);
         assert_eq!(shell.lsp_servers[1].command_line(), "'some server' '--flag=a b'");
     }
 
     #[test]
     fn a_root_command_is_recorded_and_shown_instead_of_the_markers() {
         let mut shell = Shell::new();
-        assert_eq!(shell.run_lsp(&strs(&["add", "--lang=rust", "--root-cmd", "cargo metadata | json .workspace_root", "rust-analyzer"])), 0);
+        assert_eq!(crate::builtins::bish::run_lsp(&mut shell, &strs(&["add", "--lang=rust", "--root-cmd", "cargo metadata | json .workspace_root", "rust-analyzer"])), 0);
         assert_eq!(shell.lsp_servers[0].root_cmd, "cargo metadata | json .workspace_root");
         // `--root` still has its default, since the command is what
         // gets asked first and the markers are the fallback.
         assert_eq!(shell.lsp_servers[0].root_markers, vec![".git".to_string()]);
 
         // Either order, and the `=` spelling.
-        assert_eq!(shell.run_lsp(&strs(&["add", "--root=go.mod", "--root-cmd=go env GOMOD", "gopls"])), 0);
+        assert_eq!(crate::builtins::bish::run_lsp(&mut shell, &strs(&["add", "--root=go.mod", "--root-cmd=go env GOMOD", "gopls"])), 0);
         assert_eq!(shell.lsp_servers[1].root_cmd, "go env GOMOD");
         assert_eq!(shell.lsp_servers[1].root_markers, vec!["go.mod".to_string()]);
 
         // A flag with nothing usable after it is a config error, not a
         // silently empty command that would never run.
-        assert_eq!(shell.run_lsp(&strs(&["add", "--root-cmd"])), 2);
-        assert_eq!(shell.run_lsp(&strs(&["add", "--root-cmd", "   ", "x"])), 2);
+        assert_eq!(crate::builtins::bish::run_lsp(&mut shell, &strs(&["add", "--root-cmd"])), 2);
+        assert_eq!(crate::builtins::bish::run_lsp(&mut shell, &strs(&["add", "--root-cmd", "   ", "x"])), 2);
         assert_eq!(shell.lsp_servers.len(), 2);
     }
 
@@ -13878,7 +12965,7 @@ mod tests {
         let mut shell = Shell::new();
         let _out = capture_output(&mut shell);
         assert_eq!(
-            shell.run_lsp(&strs(&[
+            crate::builtins::bish::run_lsp(&mut shell, &strs(&[
                 "add",
                 "--setting",
                 "rust-analyzer.check.command=clippy",
@@ -13904,18 +12991,18 @@ mod tests {
         // A repeated key is the later one, not both -- the same rule
         // `settings_tree` follows for a key that contradicts an earlier
         // one.
-        assert_eq!(shell.run_lsp(&strs(&["add", "--setting", "a.b=1", "--setting", "a.b=2", "srv"])), 0);
+        assert_eq!(crate::builtins::bish::run_lsp(&mut shell, &strs(&["add", "--setting", "a.b=1", "--setting", "a.b=2", "srv"])), 0);
         assert_eq!(shell.lsp_servers[1].settings, vec![("a.b".to_string(), "2".to_string())]);
 
         // A value is free to contain `=`; a key is not.
-        assert_eq!(shell.run_lsp(&strs(&["add", "--setting", "a=b=c", "srv"])), 0);
+        assert_eq!(crate::builtins::bish::run_lsp(&mut shell, &strs(&["add", "--setting", "a=b=c", "srv"])), 0);
         assert_eq!(shell.lsp_servers[2].settings, vec![("a".to_string(), "b=c".to_string())]);
 
         // Malformed is a config error rather than a setting nobody
         // notices was dropped.
-        assert_eq!(shell.run_lsp(&strs(&["add", "--setting", "nokey", "srv"])), 2);
-        assert_eq!(shell.run_lsp(&strs(&["add", "--setting", "=value", "srv"])), 2);
-        assert_eq!(shell.run_lsp(&strs(&["add", "--setting"])), 2);
+        assert_eq!(crate::builtins::bish::run_lsp(&mut shell, &strs(&["add", "--setting", "nokey", "srv"])), 2);
+        assert_eq!(crate::builtins::bish::run_lsp(&mut shell, &strs(&["add", "--setting", "=value", "srv"])), 2);
+        assert_eq!(crate::builtins::bish::run_lsp(&mut shell, &strs(&["add", "--setting"])), 2);
         assert_eq!(shell.lsp_servers.len(), 3);
     }
 
@@ -14175,20 +13262,20 @@ echo "status=$?""#,
     #[test]
     fn apply_edits_is_a_named_policy_defaulting_to_scoped() {
         let mut shell = Shell::new();
-        assert_eq!(shell.run_lsp(&strs(&["add", "--lang=rust", "rust-analyzer"])), 0);
+        assert_eq!(crate::builtins::bish::run_lsp(&mut shell, &strs(&["add", "--lang=rust", "rust-analyzer"])), 0);
         assert_eq!(shell.lsp_servers[0].apply_edits, "scoped", "the default is the one that needs no thought");
 
-        assert_eq!(shell.run_lsp(&strs(&["add", "--apply-edits=always", "gopls"])), 0);
+        assert_eq!(crate::builtins::bish::run_lsp(&mut shell, &strs(&["add", "--apply-edits=always", "gopls"])), 0);
         assert_eq!(shell.lsp_servers[1].apply_edits, "always");
-        assert_eq!(shell.run_lsp(&strs(&["add", "--apply-edits", "never", "clangd"])), 0);
+        assert_eq!(crate::builtins::bish::run_lsp(&mut shell, &strs(&["add", "--apply-edits", "never", "clangd"])), 0);
         assert_eq!(shell.lsp_servers[2].apply_edits, "never");
 
         // A misspelling is a config error rather than a silent
         // downgrade: "--apply-edits=alwyas" quietly meaning `scoped`
         // is exactly the kind of thing nobody notices until a refactor
         // does nothing.
-        assert_eq!(shell.run_lsp(&strs(&["add", "--apply-edits=sometimes", "x"])), 2);
-        assert_eq!(shell.run_lsp(&strs(&["add", "--apply-edits"])), 2);
+        assert_eq!(crate::builtins::bish::run_lsp(&mut shell, &strs(&["add", "--apply-edits=sometimes", "x"])), 2);
+        assert_eq!(crate::builtins::bish::run_lsp(&mut shell, &strs(&["add", "--apply-edits"])), 2);
         assert_eq!(shell.lsp_servers.len(), 3);
     }
 
@@ -14197,7 +13284,7 @@ echo "status=$?""#,
     #[test]
     fn add_takes_its_flags_in_any_order() {
         let mut shell = Shell::new();
-        assert_eq!(shell.run_lsp(&strs(&["add", "--apply-edits=always", "--root=Cargo.toml", "--lang=rust", "--root-cmd=cargo x", "ra", "--stdio"])), 0);
+        assert_eq!(crate::builtins::bish::run_lsp(&mut shell, &strs(&["add", "--apply-edits=always", "--root=Cargo.toml", "--lang=rust", "--root-cmd=cargo x", "ra", "--stdio"])), 0);
         let server = &shell.lsp_servers[0];
         assert_eq!(server.lang, "rust");
         assert_eq!(server.root_markers, vec!["Cargo.toml".to_string()]);
@@ -14209,28 +13296,28 @@ echo "status=$?""#,
     #[test]
     fn root_markers_are_a_comma_separated_list_in_the_order_given() {
         let mut shell = Shell::new();
-        assert_eq!(shell.run_lsp(&strs(&["add", "--root=Cargo.toml,.git", "rust-analyzer"])), 0);
+        assert_eq!(crate::builtins::bish::run_lsp(&mut shell, &strs(&["add", "--root=Cargo.toml,.git", "rust-analyzer"])), 0);
         assert_eq!(shell.lsp_servers[0].root_markers, vec!["Cargo.toml".to_string(), ".git".to_string()]);
-        assert_eq!(shell.run_lsp(&strs(&["add", "--root", "go.mod", "gopls"])), 0);
+        assert_eq!(crate::builtins::bish::run_lsp(&mut shell, &strs(&["add", "--root", "go.mod", "gopls"])), 0);
         assert_eq!(shell.lsp_servers[1].root_markers, vec!["go.mod".to_string()]);
         // A flag with nothing usable after it is a config error, not a
         // silently empty marker list that would never match anything.
-        assert_eq!(shell.run_lsp(&strs(&["add", "--root=", "x"])), 2);
-        assert_eq!(shell.run_lsp(&strs(&["add", "--root"])), 2);
-        assert_eq!(shell.run_lsp(&strs(&["add"])), 2, "a registration with no command at all");
+        assert_eq!(crate::builtins::bish::run_lsp(&mut shell, &strs(&["add", "--root=", "x"])), 2);
+        assert_eq!(crate::builtins::bish::run_lsp(&mut shell, &strs(&["add", "--root"])), 2);
+        assert_eq!(crate::builtins::bish::run_lsp(&mut shell, &strs(&["add"])), 2, "a registration with no command at all");
         assert_eq!(shell.lsp_servers.len(), 2);
     }
 
     #[test]
     fn an_unknown_lsp_subcommand_is_refused() {
         let mut shell = Shell::new();
-        assert_eq!(shell.run_lsp(&strs(&["restart"])), 2);
+        assert_eq!(crate::builtins::bish::run_lsp(&mut shell, &strs(&["restart"])), 2);
     }
 
     #[test]
     fn a_child_shell_inherits_the_declared_language_servers() {
         let mut shell = Shell::new();
-        shell.run_lsp(&strs(&["add", "--lang=rust", "rust-analyzer"]));
+        crate::builtins::bish::run_lsp(&mut shell, &strs(&["add", "--lang=rust", "rust-analyzer"]));
         let child = shell.new_virtual_child();
         assert_eq!(child.lsp_servers, shell.lsp_servers);
         assert_eq!(child.next_lsp_id, shell.next_lsp_id, "or the child would hand out an id the parent already used");
@@ -14239,8 +13326,8 @@ echo "status=$?""#,
     #[test]
     fn removing_a_hook_that_is_not_there_fails() {
         let mut shell = Shell::new();
-        assert_eq!(shell.run_hook(&strs(&["rm", "99"])), 1);
-        assert_eq!(shell.run_hook(&strs(&["rm", "nonsense"])), 2);
+        assert_eq!(crate::builtins::bish::run_hook(&mut shell, &strs(&["rm", "99"])), 1);
+        assert_eq!(crate::builtins::bish::run_hook(&mut shell, &strs(&["rm", "nonsense"])), 2);
     }
 
     // A typo'd event is the mistake this can actually catch, and a hook
@@ -14248,18 +13335,18 @@ echo "status=$?""#,
     #[test]
     fn an_unknown_event_is_refused() {
         let mut shell = Shell::new();
-        assert_eq!(shell.run_hook(&strs(&["add", "editor:file:prewrite", "__x"])), 2);
+        assert_eq!(crate::builtins::bish::run_hook(&mut shell, &strs(&["add", "editor:file:prewrite", "__x"])), 2);
         assert!(shell.hooks.is_empty());
-        assert_eq!(shell.run_hook(&strs(&["add", "editor:file:write:pre", "__x"])), 0);
+        assert_eq!(crate::builtins::bish::run_hook(&mut shell, &strs(&["add", "editor:file:write:pre", "__x"])), 0);
     }
 
     #[test]
     fn a_hook_fires_only_for_its_event_and_language() {
         let mut shell = Shell::new();
-        shell.run_hook(&strs(&["add", "--lang=rust", "editor:file:open", "__rust"]));
-        shell.run_hook(&strs(&["add", "--lang", "!(rust)", "editor:file:open", "__other"]));
-        shell.run_hook(&strs(&["add", "editor:file:open", "__any"]));
-        shell.run_hook(&strs(&["add", "--lang=rust", "editor:file:close", "__bye"]));
+        crate::builtins::bish::run_hook(&mut shell, &strs(&["add", "--lang=rust", "editor:file:open", "__rust"]));
+        crate::builtins::bish::run_hook(&mut shell, &strs(&["add", "--lang", "!(rust)", "editor:file:open", "__other"]));
+        crate::builtins::bish::run_hook(&mut shell, &strs(&["add", "editor:file:open", "__any"]));
+        crate::builtins::bish::run_hook(&mut shell, &strs(&["add", "--lang=rust", "editor:file:close", "__bye"]));
         assert_eq!(shell.hooks_for("editor:file:open", "rust"), vec!["__rust", "__any"]);
         assert_eq!(shell.hooks_for("editor:file:open", "bash"), vec!["__other", "__any"]);
         assert_eq!(shell.hooks_for("editor:file:close", "rust"), vec!["__bye"]);
@@ -14272,7 +13359,7 @@ echo "status=$?""#,
     fn hooks_fire_in_the_order_they_were_added() {
         let mut shell = Shell::new();
         for name in ["__first", "__second", "__third"] {
-            shell.run_hook(&strs(&["add", "editor:file:open", name]));
+            crate::builtins::bish::run_hook(&mut shell, &strs(&["add", "editor:file:open", name]));
         }
         assert_eq!(shell.hooks_for("editor:file:open", "bash"), vec!["__first", "__second", "__third"]);
     }
@@ -14281,7 +13368,7 @@ echo "status=$?""#,
     #[test]
     fn a_child_shell_inherits_the_hooks() {
         let mut shell = Shell::new();
-        shell.run_hook(&strs(&["add", "editor:file:open", "__setup"]));
+        crate::builtins::bish::run_hook(&mut shell, &strs(&["add", "editor:file:open", "__setup"]));
         let child = shell.new_virtual_child();
         assert_eq!(child.hooks_for("editor:file:open", "bash"), vec!["__setup"]);
     }
@@ -14289,7 +13376,7 @@ echo "status=$?""#,
     #[test]
     fn a_command_with_arguments_is_kept_whole() {
         let mut shell = Shell::new();
-        shell.run_hook(&strs(&["add", "editor:file:open", "lsp", "start", "--quiet"]));
+        crate::builtins::bish::run_hook(&mut shell, &strs(&["add", "editor:file:open", "lsp", "start", "--quiet"]));
         assert_eq!(shell.hooks[0].command, "lsp start --quiet");
     }
 
@@ -14345,8 +13432,8 @@ echo "status=$?""#,
     #[test]
     fn shell_events_are_registrable_and_scoped_like_the_rest() {
         let mut shell = Shell::new();
-        assert_eq!(shell.run_hook(&strs(&["add", "shell:exec:pre", "__timer"])), 0);
-        assert_eq!(shell.run_hook(&strs(&["add", "shell:cwd:change", "__ls"])), 0);
+        assert_eq!(crate::builtins::bish::run_hook(&mut shell, &strs(&["add", "shell:exec:pre", "__timer"])), 0);
+        assert_eq!(crate::builtins::bish::run_hook(&mut shell, &strs(&["add", "shell:cwd:change", "__ls"])), 0);
         assert_eq!(shell.hooks_for("shell:exec:pre", "bash"), vec!["__timer"]);
         assert_eq!(shell.hooks_for("shell:cwd:change", "bash"), vec!["__ls"]);
     }
@@ -14355,7 +13442,7 @@ echo "status=$?""#,
     #[test]
     fn a_hook_cannot_trigger_more_hooks_while_it_runs() {
         let mut shell = Shell::new();
-        shell.run_hook(&strs(&["add", "shell:cwd:change", "__cd_somewhere"]));
+        crate::builtins::bish::run_hook(&mut shell, &strs(&["add", "shell:cwd:change", "__cd_somewhere"]));
         assert_eq!(shell.hooks_for("shell:cwd:change", "bash").len(), 1);
         shell.set_firing_hooks(true);
         assert!(shell.hooks_for("shell:cwd:change", "bash").is_empty(), "nothing fires while a hook runs");
