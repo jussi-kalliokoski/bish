@@ -64,6 +64,10 @@ pub struct TextBuffer {
     /// buffer at all.
     pub ignorecase: bool,
     pub smartcase: bool,
+    /// The `iskeyword` bishopt, copied here the same way -- see
+    /// `Buffer::word_chars` for what it means and why the buffer is
+    /// where a motion can ask.
+    pub iskeyword: String,
     /// The project root this buffer's language server was reached
     /// through, when it was *inherited* rather than computed.
     ///
@@ -306,6 +310,7 @@ impl TextBuffer {
             snippet_holes: Vec::new(),
             ignorecase: false,
             smartcase: false,
+            iskeyword: "_".to_string(),
             lsp_root: None,
             lsp_progress: None,
             lsp_message: None,
@@ -436,6 +441,7 @@ impl TextBuffer {
             snippet_holes: Vec::new(),
             ignorecase: false,
             smartcase: false,
+            iskeyword: "_".to_string(),
             lsp_root: None,
             lsp_progress: None,
             lsp_message: None,
@@ -989,6 +995,10 @@ impl Buffer for TextBuffer {
     fn search_ignore_case(&self, pattern: &str) -> bool {
         super::ignore_case_for(pattern, self.ignorecase, self.smartcase)
     }
+
+    fn word_chars(&self) -> &str {
+        &self.iskeyword
+    }
 }
 
 // The buffer half of a live snippet -- see bishedit::snippet's own
@@ -1074,6 +1084,7 @@ mod tests {
             snippet_holes: Vec::new(),
             ignorecase: false,
             smartcase: false,
+            iskeyword: "_".to_string(),
             lsp_root: None,
             lsp_progress: None,
             lsp_message: None,

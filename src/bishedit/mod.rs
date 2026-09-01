@@ -69,6 +69,26 @@ pub trait Buffer {
         false
     }
 
+    /// Which characters, besides letters and digits, are part of a word
+    /// for `w`/`b`/`e`/`ge`, `iw`/`aw`, `*`/`#` and `Ctrl-W` -- vim's
+    /// `iskeyword`, and the same question `classify` asks of every
+    /// character it walks over.
+    ///
+    /// A plain set of extra characters rather than vim's own
+    /// comma-separated ranges-and-classes spec (`@,48-57,_,192-255`).
+    /// That spec exists because vim predates Unicode having an opinion;
+    /// `char::is_alphanumeric` already covers every letter in every
+    /// script, so all that is left to say is which punctuation joins
+    /// them. `-` for kebab-case, `$` for shell variables.
+    ///
+    /// Asked of the buffer for the same reason `search_ignore_case` is:
+    /// a motion is handed a buffer and a count, and nothing else.
+    ///
+    /// Default `_`, which is what every motion here has always assumed.
+    fn word_chars(&self) -> &str {
+        "_"
+    }
+
     fn viewport_top(&self) -> usize;
     fn set_viewport_top(&mut self, line: usize);
     fn viewport_height(&self) -> usize;

@@ -114,8 +114,11 @@ enum Class {
     Punct,
 }
 
-fn is_word_char(c: char) -> bool {
-    c.is_alphanumeric() || c == '_'
+// Whether `c` is part of a word, given the buffer's own `iskeyword`
+// answer -- see `Buffer::word_chars`. Letters and digits always are, in
+// any script; `extra` says which punctuation joins them.
+fn is_word_char(c: char, extra: &str) -> bool {
+    c.is_alphanumeric() || extra.contains(c)
 }
 
 /// `~`/`gu`/`gU`/`g~`'s own shared notion of "which way to change case" --
@@ -158,7 +161,7 @@ fn classify(buf: &impl Buffer, line: usize, col: usize, big: bool) -> Class {
     };
     if ch.is_whitespace() {
         Class::Blank
-    } else if big || is_word_char(ch) {
+    } else if big || is_word_char(ch, buf.word_chars()) {
         Class::Word
     } else {
         Class::Punct
@@ -652,7 +655,7 @@ fn match_pair_once(buf: &impl Buffer, pos: (usize, usize)) -> Option<(usize, usi
 /// need for `vimkeys.rs` to separately track and expose that text itself.
 pub fn word_under_cursor(buf: &impl Buffer, pos: (usize, usize)) -> Option<String> {
     let mut p = pos;
-    if buf.line_len(p.0) == 0 || !matches!(buf.char_at(p.0, p.1), Some(c) if is_word_char(c)) {
+    if buf.line_len(p.0) == 0 || !matches!(buf.char_at(p.0, p.1), Some(c) if is_word_char(c, buf.word_chars())) {
         let next = word_forward_once(buf, p, false);
         if next == p {
             return None;
@@ -662,17 +665,17 @@ pub fn word_under_cursor(buf: &impl Buffer, pos: (usize, usize)) -> Option<Strin
     if buf.line_len(p.0) == 0 {
         return None;
     }
-    if !matches!(buf.char_at(p.0, p.1), Some(c) if is_word_char(c)) {
+    if !matches!(buf.char_at(p.0, p.1), Some(c) if is_word_char(c, buf.word_chars())) {
         return None;
     }
     let line = p.0;
     let mut start_col = p.1;
-    while start_col > 0 && matches!(buf.char_at(line, start_col - 1), Some(c) if is_word_char(c)) {
+    while start_col > 0 && matches!(buf.char_at(line, start_col - 1), Some(c) if is_word_char(c, buf.word_chars())) {
         start_col -= 1;
     }
     let mut end_col = p.1;
     while end_col + 1 < buf.line_len(line)
-        && matches!(buf.char_at(line, end_col + 1), Some(c) if is_word_char(c))
+        && matches!(buf.char_at(line, end_col + 1), Some(c) if is_word_char(c, buf.word_chars()))
     {
         end_col += 1;
     }
@@ -1350,7 +1353,7 @@ fn search_backward_once(buf: &impl Buffer, pos: (usize, usize), re: &Regex) -> O
 }
 
 fn is_word_boundary_at(buf: &impl Buffer, line: usize, col: usize) -> bool {
-    !matches!(buf.char_at(line, col), Some(c) if is_word_char(c))
+    !matches!(buf.char_at(line, col), Some(c) if is_word_char(c, buf.word_chars()))
 }
 
 /// `*`/`#`'s own word-boundary-respecting wrapper around `search_forward_
@@ -3108,6 +3111,36 @@ mod tests {
         for (motion, expected) in cases {
             assert_eq!(motion_shape(motion), *expected, "{:?}", motion);
         }
+    }
+
+    #[test]
+    fn word_chars_decide_where_a_word_ends() {
+        // `iskeyword`: letters and digits are always word characters,
+        // and the buffer says which punctuation joins them.
+        struct Kw(TestBuffer, &'static str);
+        impl Buffer for Kw {
+            fn line_count(&self) -> usize { self.0.line_count() }
+            fn line_len(&self, l: usize) -> usize { self.0.line_len(l) }
+            fn char_at(&self, l: usize, c: usize) -> Option<char> { self.0.char_at(l, c) }
+            fn cursor(&self) -> (usize, usize) { self.0.cursor() }
+            fn set_cursor(&mut self, l: usize, c: usize) { self.0.set_cursor(l, c) }
+            fn viewport_top(&self) -> usize { self.0.viewport_top() }
+            fn set_viewport_top(&mut self, l: usize) { self.0.set_viewport_top(l) }
+            fn viewport_height(&self) -> usize { self.0.viewport_height() }
+            fn set_mark(&mut self, name: char, pos: (usize, usize)) { self.0.set_mark(name, pos) }
+            fn get_mark(&self, name: char) -> Option<(usize, usize)> { self.0.get_mark(name) }
+            fn word_chars(&self) -> &str { self.1 }
+        }
+        let end_of_first_word = |extra: &'static str| {
+            let mut buf = Kw(TestBuffer::new("foo-bar baz"), extra);
+            buf.set_cursor(0, 0);
+            apply_motion(&mut buf, Motion::WordForward, None);
+            buf.cursor()
+        };
+        // Default: `-` is punctuation, so `w` stops at it.
+        assert_eq!(end_of_first_word("_"), (0, 3));
+        // With `-` a word character, `foo-bar` is one word.
+        assert_eq!(end_of_first_word("_-"), (0, 8));
     }
 
     #[test]

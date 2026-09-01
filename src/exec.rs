@@ -12320,6 +12320,12 @@ const KNOWN_BISHOPTS: &[(&str, BishOptDefault)] = &[
     // nothing, which is a footgun for anyone who reads 0 as "unlimited".
     // The top of the range is the unlimited-in-practice answer instead.
     ("history_size", BishOptDefault::Int(10_000, 100..=1_000_000)),
+    // The extra characters -- beyond letters and digits, which are
+    // always word characters in any script -- that `w`/`b`/`e`, `iw`,
+    // `*` and `Ctrl-W` treat as part of a word. `_` is what every
+    // motion has always assumed; `-` suits kebab-case, `$` shell
+    // variables.
+    ("iskeyword", BishOptDefault::Str("_")),
     // ...and the two that matter while `wrap` is *off*. `sidescrolloff`
     // is vim's own: keep this many columns visible either side of the
     // cursor rather than letting it sit against the edge.
@@ -12519,6 +12525,7 @@ const BISHOPT_HELP: &[(&str, &str)] = &[
     ("wrap_column", "Wrap at this column rather than at the pane's edge. 0 means the pane."),
     ("scrolloff", "Keep this many lines visible above and below the cursor."),
     ("history_size", "How many commands the history file keeps. Older ones are dropped oldest-first."),
+    ("iskeyword", "Characters besides letters and digits that count as part of a word."),
     ("sidescrolloff", "Keep this many columns visible either side of the cursor, while not wrapping."),
     ("extends", "Shown in the last column when a line continues off the right edge."),
     ("precedes", "Shown in the first column when a line continues off the left edge."),

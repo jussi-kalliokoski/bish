@@ -6239,6 +6239,9 @@ struct ScreenBuffer {
     // that a mid-flight change to either option is not worth chasing.
     ignorecase: bool,
     smartcase: bool,
+    // The `iskeyword` bishopt, snapshotted alongside them -- see
+    // `bishedit::Buffer::word_chars`.
+    iskeyword: String,
     // Visual mode's own committed selections (see vimkeys.rs's own
     // `visual` field doc comment for the active, not-yet-committed one --
     // that lives in `VimKeys`, not here, since it's just an anchor plus
@@ -6343,11 +6346,13 @@ impl ScreenBuffer {
             reported_new_lines: 0,
             ignorecase: false,
             smartcase: false,
+            iskeyword: "_".to_string(),
         }
     }
 
     // The two search options, from whichever session owns this pane.
     fn set_search_case(&mut self, shell: &exec::Shell) {
+        self.iskeyword = shell.bishopt_str("iskeyword");
         self.ignorecase = shell.bishopt_bool("ignorecase");
         self.smartcase = shell.bishopt_bool("smartcase");
     }
@@ -6425,6 +6430,10 @@ impl BisheditBuffer for ScreenBuffer {
         } else {
             None
         }
+    }
+
+    fn word_chars(&self) -> &str {
+        &self.iskeyword
     }
 
     fn search_ignore_case(&self, pattern: &str) -> bool {
@@ -7491,6 +7500,7 @@ fn apply_view_options(shell: &exec::Shell, buf: &mut TextBuffer) {
     buf.cursorshape = shell.bishopt_bool("cursorshape");
     buf.mouse = shell.bishopt_bool("mouse");
     buf.inlayhints = shell.bishopt_bool("inlayhints");
+    buf.iskeyword = shell.bishopt_str("iskeyword");
     buf.ignorecase = shell.bishopt_bool("ignorecase");
     buf.smartcase = shell.bishopt_bool("smartcase");
     // In this order, and never the other way round: the shell's own
