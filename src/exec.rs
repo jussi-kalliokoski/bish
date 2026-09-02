@@ -8607,78 +8607,89 @@ impl FgJob {
     }
 }
 
-// Backslash-escape expansion shared by `echo -e` and `printf`'s FORMAT
-// (see run_echo/run_printf's own doc comments) -- bash's own set:
-// \\ \a \b \e \f \n \r \t \v, \0NNN (up to 3 octal digits), \xHH (up to
-// 2 hex digits), and \c (stop all further output, including anything
-// already queued after this point in the same echo/printf call --
-// signaled via the returned bool, which run_echo checks directly and
-// run_printf's format string never actually reaches since FORMAT itself
-// doesn't support \c). An unrecognized escape (or a bare trailing
-// backslash) is left exactly as written, matching bash rather than
-// silently dropping the backslash.
+// `echo -e`'s escapes, and `printf %b`'s, which are nearly the same
+// set. The bool is `\c`: it means "stop here, and stop the caller too".
+//
+// Assembled as bytes and decoded once at the end, because `\0303\0244`
+// names the two bytes of `ä` rather than two Latin-1 characters --
+// the same reason `$'...'` and the printf format are built this way.
 pub(crate) fn echo_expand_escapes(s: &str) -> (String, bool) {
-    let mut out = String::new();
+    backslash_escapes(s, false)
+}
+
+// The same, for `%b`, which takes a bare `\nnn` as octal where
+// `echo -e` reads it as text. That difference is bash's, checked
+// against it: `echo -e 'a\101b'` prints `a\101b` and
+// `printf '%b' 'a\101b'` prints `aAb`.
+pub(crate) fn printf_b_escapes(s: &str) -> (String, bool) {
+    backslash_escapes(s, true)
+}
+
+fn backslash_escapes(s: &str, bare_octal: bool) -> (String, bool) {
+    let mut buf: Vec<u8> = Vec::new();
     let mut chars = s.chars().peekable();
+    let octal = |chars: &mut std::iter::Peekable<std::str::Chars<'_>>, first: u32| -> u8 {
+        let mut value = first;
+        for _ in 0..2 {
+            match chars.peek().and_then(|c| c.to_digit(8)) {
+                Some(next) => {
+                    value = value * 8 + next;
+                    chars.next();
+                }
+                None => break,
+            }
+        }
+        value as u8
+    };
     while let Some(c) = chars.next() {
         if c != '\\' {
-            out.push(c);
+            push_char(&mut buf, c);
             continue;
         }
         match chars.next() {
-            Some('\\') => out.push('\\'),
-            Some('a') => out.push('\u{7}'),
-            Some('b') => out.push('\u{8}'),
-            Some('c') => return (out, true),
-            Some('e') => out.push('\u{1b}'),
-            Some('f') => out.push('\u{c}'),
-            Some('n') => out.push('\n'),
-            Some('r') => out.push('\r'),
-            Some('t') => out.push('\t'),
-            Some('v') => out.push('\u{b}'),
+            Some('\\') => push_char(&mut buf, '\\'),
+            Some('a') => push_char(&mut buf, '\u{7}'),
+            Some('b') => push_char(&mut buf, '\u{8}'),
+            Some('c') => return (String::from_utf8_lossy(&buf).into_owned(), true),
+            Some('e' | 'E') => push_char(&mut buf, '\u{1b}'),
+            Some('f') => push_char(&mut buf, '\u{c}'),
+            Some('n') => push_char(&mut buf, '\n'),
+            Some('r') => push_char(&mut buf, '\r'),
+            Some('t') => push_char(&mut buf, '\t'),
+            Some('v') => push_char(&mut buf, '\u{b}'),
+            // `\0nnn` in both, and a bare `\nnn` only where the caller
+            // says so.
             Some('0') => {
-                let mut val: u32 = 0;
-                let mut n = 0;
-                while n < 3 {
-                    match chars.peek().and_then(|c| c.to_digit(8)) {
-                        Some(d) => {
-                            val = val * 8 + d;
-                            chars.next();
-                            n += 1;
-                        }
-                        None => break,
-                    }
-                }
-                out.push(char::from_u32(val).unwrap_or('\0'));
+                let first = chars.peek().and_then(|c| c.to_digit(8)).map(|d| {
+                    chars.next();
+                    d
+                });
+                buf.push(match first {
+                    Some(d) => octal(&mut chars, d),
+                    None => 0,
+                });
             }
-            Some('x') => {
-                let mut val: u32 = 0;
-                let mut n = 0;
-                while n < 2 {
-                    match chars.peek().and_then(|c| c.to_digit(16)) {
-                        Some(d) => {
-                            val = val * 16 + d;
-                            chars.next();
-                            n += 1;
-                        }
-                        None => break,
-                    }
-                }
-                if n > 0 {
-                    out.push(char::from_u32(val).unwrap_or('\0'));
-                } else {
-                    out.push('\\');
-                    out.push('x');
-                }
+            Some(d @ '1'..='7') if bare_octal => {
+                let first = d.to_digit(8).unwrap();
+                buf.push(octal(&mut chars, first));
             }
+            Some('x') => buf.push(read_hex_escape(&mut chars, 2) as u8),
+            Some('u') => match char::from_u32(read_hex_escape(&mut chars, 4)) {
+                Some(c) => push_char(&mut buf, c),
+                None => push_char(&mut buf, '?'),
+            },
+            Some('U') => match char::from_u32(read_hex_escape(&mut chars, 8)) {
+                Some(c) => push_char(&mut buf, c),
+                None => push_char(&mut buf, '?'),
+            },
             Some(other) => {
-                out.push('\\');
-                out.push(other);
+                push_char(&mut buf, '\\');
+                push_char(&mut buf, other);
             }
-            None => out.push('\\'),
+            None => push_char(&mut buf, '\\'),
         }
     }
-    (out, false)
+    (String::from_utf8_lossy(&buf).into_owned(), false)
 }
 
 // `printf %q`: the argument written as text a shell reads back as
@@ -9044,7 +9055,7 @@ mod printf_conversion_tests {
         for ((spec, value), expected) in cases.iter().zip(&want) {
             let mut got = String::new();
             let mut idx = 0;
-            super::printf_format_once(spec, std::slice::from_ref(value), &mut idx, &mut got);
+                let _ = super::printf_format_once(spec, std::slice::from_ref(value), &mut idx, &mut got);
             assert_eq!(&got, expected, "printf '{spec}' '{value}'");
         }
     }
@@ -9286,36 +9297,89 @@ fn trim_trailing_zeros(text: &str) -> String {
 // flags supported. Split out from run_printf so the caller can call
 // this repeatedly to cycle FORMAT over more arguments than it has
 // conversions for.
-pub(crate) fn printf_format_once(format: &str, values: &[String], idx: &mut usize, out: &mut String) {
+// One character as its UTF-8 bytes, for a buffer that is assembled as
+// bytes so a `\nnn` escape can name one.
+fn push_char(buf: &mut Vec<u8>, c: char) {
+    let mut bytes = [0u8; 4];
+    buf.extend_from_slice(c.encode_utf8(&mut bytes).as_bytes());
+}
+
+// Up to `max` hexadecimal digits. Fewer is fine -- `\x7` is a complete
+// escape -- which is why this peeks rather than demands.
+fn read_hex_escape(chars: &mut std::iter::Peekable<std::str::Chars<'_>>, max: usize) -> u32 {
+    let mut value = 0u32;
+    for _ in 0..max {
+        match chars.peek().and_then(|c| c.to_digit(16)) {
+            Some(digit) => {
+                value = value * 16 + digit;
+                chars.next();
+            }
+            None => break,
+        }
+    }
+    value
+}
+
+pub(crate) fn printf_format_once(format: &str, values: &[String], idx: &mut usize, out: &mut String) -> bool {
+    // Assembled as bytes and decoded once at the end, because `\303\244`
+    // has to mean the two bytes of `ä` rather than two Latin-1
+    // characters -- the same reason `$'...'` is built this way.
+    let mut buf: Vec<u8> = Vec::new();
     let mut chars = format.chars().peekable();
     while let Some(c) = chars.next() {
         if c == '\\' {
             match chars.next() {
-                Some('\\') => out.push('\\'),
-                Some('a') => out.push('\u{7}'),
-                Some('b') => out.push('\u{8}'),
-                Some('e') => out.push('\u{1b}'),
-                Some('f') => out.push('\u{c}'),
-                Some('n') => out.push('\n'),
-                Some('r') => out.push('\r'),
-                Some('t') => out.push('\t'),
-                Some('v') => out.push('\u{b}'),
-                Some('"') => out.push('"'),
-                Some(other) => {
-                    out.push('\\');
-                    out.push(other);
+                Some('\\') => push_char(&mut buf, '\\'),
+                Some('a') => push_char(&mut buf, '\u{7}'),
+                Some('b') => push_char(&mut buf, '\u{8}'),
+                Some('e') => push_char(&mut buf, '\u{1b}'),
+                Some('f') => push_char(&mut buf, '\u{c}'),
+                Some('n') => push_char(&mut buf, '\n'),
+                Some('r') => push_char(&mut buf, '\r'),
+                Some('t') => push_char(&mut buf, '\t'),
+                Some('v') => push_char(&mut buf, '\u{b}'),
+                Some('"') => push_char(&mut buf, '"'),
+                // `\nnn` names a *byte*, in octal, up to three digits
+                // counting the one just read. `\0nnn` is the same thing
+                // -- `0` is an octal digit.
+                Some(d @ '0'..='7') => {
+                    let mut value = d.to_digit(8).unwrap();
+                    for _ in 0..2 {
+                        match chars.peek().and_then(|c| c.to_digit(8)) {
+                            Some(next) => {
+                                value = value * 8 + next;
+                                chars.next();
+                            }
+                            None => break,
+                        }
+                    }
+                    buf.push(value as u8);
                 }
-                None => out.push('\\'),
+                Some('x') => buf.push(read_hex_escape(&mut chars, 2) as u8),
+                // `\u`/`\U` name a code point rather than a byte, so
+                // they go in as UTF-8.
+                Some(u @ ('u' | 'U')) => {
+                    let width = if u == 'u' { 4 } else { 8 };
+                    match char::from_u32(read_hex_escape(&mut chars, width)) {
+                        Some(c) => push_char(&mut buf, c),
+                        None => push_char(&mut buf, '?'),
+                    }
+                }
+                Some(other) => {
+                    push_char(&mut buf, '\\');
+                    push_char(&mut buf, other);
+                }
+                None => push_char(&mut buf, '\\'),
             }
             continue;
         }
         if c != '%' {
-            out.push(c);
+            push_char(&mut buf, c);
             continue;
         }
         if chars.peek() == Some(&'%') {
             chars.next();
-            out.push('%');
+            push_char(&mut buf, '%');
             continue;
         }
 
@@ -9345,10 +9409,10 @@ pub(crate) fn printf_format_once(format: &str, values: &[String], idx: &mut usiz
                 // handling at the top of this loop and would otherwise
                 // come out as a literal backslash. bash calls this an
                 // invalid time format and warns; bish just prints it.
-                out.push_str("%(");
-                out.push_str(&echo_expand_escapes(&time_fmt).0);
+                buf.extend_from_slice("%(".as_bytes());
+                buf.extend_from_slice(&echo_expand_escapes(&time_fmt).0.as_bytes());
                 if closed {
-                    out.push(')');
+                    push_char(&mut buf, ')');
                 }
                 continue;
             }
@@ -9363,7 +9427,7 @@ pub(crate) fn printf_format_once(format: &str, values: &[String], idx: &mut usiz
                 Ok(n) if n >= 0 => n,
                 _ => unix_now().as_secs() as i64,
             };
-            out.push_str(&crate::time::strftime_at(&time_fmt, &crate::time::local_time_at(secs), Some(secs)));
+            buf.extend_from_slice(&crate::time::strftime_at(&time_fmt, &crate::time::local_time_at(secs), Some(secs)).as_bytes());
             continue;
         }
 
@@ -9441,7 +9505,18 @@ pub(crate) fn printf_format_once(format: &str, values: &[String], idx: &mut usiz
             // The three that precision measures in characters rather
             // than in digits.
             's' => truncate_chars(&next_arg(), precision.unwrap_or(usize::MAX)),
-            'b' => truncate_chars(&echo_expand_escapes(&next_arg()).0, precision.unwrap_or(usize::MAX)),
+            'b' => {
+                let (expanded, stop) = printf_b_escapes(&next_arg());
+                let piece = truncate_chars(&expanded, precision.unwrap_or(usize::MAX));
+                if stop {
+                    // `\c` in a `%b` argument ends the output -- all of
+                    // it, not just this conversion.
+                    buf.extend_from_slice(piece.as_bytes());
+                    out.push_str(&String::from_utf8_lossy(&buf));
+                    return true;
+                }
+                piece
+            }
             'q' => truncate_chars(&printf_quote(&next_arg()), precision.unwrap_or(usize::MAX)),
             // An empty argument is still a character: bash writes the
             // NUL it read, and so does this.
@@ -9507,8 +9582,10 @@ pub(crate) fn printf_format_once(format: &str, values: &[String], idx: &mut usiz
                 piece = format!("{}{}", " ".repeat(pad), piece);
             }
         }
-        out.push_str(&piece);
+        buf.extend_from_slice(&piece.as_bytes());
     }
+    out.push_str(&String::from_utf8_lossy(&buf));
+    false
 }
 
 // bash's exit-status convention for a process killed by a signal is
@@ -11388,7 +11465,7 @@ mod tests {
         unsafe { tzset() };
         let values: Vec<String> = args.iter().map(|a| (*a).to_string()).collect();
         let (mut idx, mut out) = (0, String::new());
-        super::printf_format_once(format, &values, &mut idx, &mut out);
+        let _ = super::printf_format_once(format, &values, &mut idx, &mut out);
         match previous {
             Some(tz) => unsafe { std::env::set_var("TZ", tz) },
             None => unsafe { std::env::remove_var("TZ") },

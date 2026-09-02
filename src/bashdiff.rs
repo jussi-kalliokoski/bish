@@ -176,6 +176,15 @@ mod tests {
         case("echo-flags", r#"echo -n a; echo; echo -e 'a\tb'"#),
         case("printf-recycle", r#"printf '%s-%s\n' a b c d"#),
         case("printf-width", r#"printf '[%5s][%-5s][%05d]\n' a b 42"#),
+        // A numeric escape in a format names a byte, so a pair of them
+        // is one character.
+        case("printf-escapes", r#"printf 'a\101b|\x41|\x7|\u0041|\U00000041|\0|\q|' | cat -v; echo"#),
+        case("printf-escape-bytes", r#"printf '\303\244' | od -An -c"#),
+        // `%b` takes a bare `\nnn` where `echo -e` reads it as text.
+        case("printf-b-escapes", r#"printf '[%b][%b][%b]' 'a\101b' 'a\0101b' 'a\x41b' | cat -v; echo"#),
+        case("echo-e-escapes", r#"echo -ne 'a\101b|a\0101b|a\x41b|' | cat -v; echo"#),
+        case("printf-b-stop", r#"printf 'x%bz' 'a\cb'; echo done"#),
+        case("echo-e-stop", r#"echo -ne 'a\cb'; echo done"#),
         case("read-basic", r#"printf 'x y\n' | { read -r a b; echo "$a|$b"; }"#),
         case("read-ifs", r#"IFS=: read -r a b <<< 'x:y'; echo "$a|$b""#),
         case("read-array", r#"read -r -a arr <<< 'p q r'; echo "${arr[1]}" "${#arr[@]}""#),
@@ -203,7 +212,6 @@ mod tests {
         ("function-call-redirect", "a redirect on a function *call* does not reach a builtin inside the body"),
         ("expansion-error-continues", "bish reports an expansion error and carries on with an empty result; bash abandons the command"),
         ("dbracket-pattern", "quoting the right of `[[ == ]]` should make it a literal, not a glob"),
-        ("printf-octal-escape", "roadmap 8: \\nnn in a printf format is not decoded"),
         ("shopt-failglob", "failglob reports but does not abandon the command -- see expansion-error-continues"),
         ("builtin-gaps", "roadmap 9: [[ -v ]], wait -n, kill -l SIG, exec -a, set -C"),
     ];
@@ -214,7 +222,6 @@ mod tests {
         case("function-call-redirect", r#"f() { echo inner >&2; }; f 2>/dev/null; echo after"#),
         case("expansion-error-continues", r#"a=(1 2 3); printf '[%s]' "${a[@]:1:-1}"; echo"#),
         case("dbracket-pattern", r#"[[ abc == a* ]] && echo glob; [[ abc == "a*" ]] || echo literal"#),
-        case("printf-octal-escape", r#"printf 'a\101b\n'"#),
         case("shopt-failglob", r#"shopt -s failglob; printf '%s,' zz_no_match*; echo"#),
         case("builtin-gaps", r#"x=1; [[ -v x ]] && echo v; kill -l 9"#),
     ];

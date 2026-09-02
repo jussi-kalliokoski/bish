@@ -94,7 +94,11 @@ pub(crate) fn run_printf(sh: &mut Shell, args: &[String]) -> i32 {
     let mut idx = 0;
     loop {
         let before = idx;
-        printf_format_once(format, values, &mut idx, &mut out);
+        // `\c` in a `%b` argument ends the output there -- including
+        // the reruns the remaining arguments would have caused.
+        if printf_format_once(format, values, &mut idx, &mut out) {
+            break;
+        }
         if idx >= values.len() || idx == before {
             break;
         }
