@@ -48,6 +48,8 @@ mod time;
 mod toml;
 mod tool;
 mod url;
+#[cfg(test)]
+mod vimdiff;
 mod vt100;
 mod window;
 
