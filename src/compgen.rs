@@ -512,7 +512,7 @@ pub fn resolve_spec(spec: &CompgenSpec, word: &str, ctx: &ActionContext, cwd: &P
         sourced.extend(resolve_action(*action, ctx, cwd, word));
     }
     if let Some(pat) = &spec.globpat {
-        sourced.extend(crate::glob::expand(pat).unwrap_or_default());
+        sourced.extend(crate::glob::expand(pat, crate::glob::Options::default()).unwrap_or_default());
     }
     if let Some(list) = &spec.wordlist {
         sourced.extend(list.split_whitespace().map(str::to_string));

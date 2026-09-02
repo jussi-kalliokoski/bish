@@ -7219,6 +7219,34 @@ impl Shell {
         matches.into_iter().filter(|m| !patterns.iter().any(|p| crate::glob::matches_path(p, m))).collect()
     }
 
+    // What `dotglob`/`nocaseglob` currently say. Read per expansion
+    // rather than cached: `shopt -s` inside a script has to take effect
+    // on the very next word, and reading two booleans is nothing next
+    // to the `read_dir` that follows.
+    fn glob_options(&self) -> glob::Options {
+        glob::Options { dotglob: self.shopt_is_on("dotglob"), nocaseglob: self.shopt_is_on("nocaseglob") }
+    }
+
+    // A pattern that matched nothing. bash's default is to leave the
+    // word as its own text -- which is why `echo *.nothing` prints
+    // `*.nothing` -- and the two shopts that change that are the whole
+    // reason anyone sets them.
+    //
+    // `failglob` reports and yields nothing. Real bash also abandons
+    // the command; bish carries on, which is what it already does with
+    // every other expansion error (see `${x?msg}`), so the difference
+    // is one line of output rather than one of behaviour.
+    fn unmatched_pattern(&mut self, word: &str) -> Vec<String> {
+        if self.shopt_is_on("failglob") {
+            sh_eprintln!(self, "bish: no match: {word}");
+            return Vec::new();
+        }
+        match self.shopt_is_on("nullglob") {
+            true => Vec::new(),
+            false => vec![word.to_string()],
+        }
+    }
+
     fn expand_words(&mut self, words: &[Word]) -> Vec<String> {
         let mut out = Vec::new();
         for w in words {
@@ -7227,19 +7255,20 @@ impl Shell {
                 // (see Word::globbable), so splitting can't apply here --
                 // glob-check the single literal value as before.
                 let s = self.expand_word(w);
-                if !self.opt_noglob {
-                    if let Some(matches) = glob::expand(&s) {
-                        let kept = self.apply_globignore(matches);
-                        // Everything the pattern found was ignored, so
-                        // it found nothing -- which under the default
-                        // nullglob-off rule means the word stands as its
-                        // own literal text, exactly as an unmatched
-                        // pattern does.
-                        if !kept.is_empty() {
-                            out.extend(kept);
-                            continue;
-                        }
+                if !self.opt_noglob
+                    && let Some(matches) = glob::expand(&s, self.glob_options())
+                {
+                    let kept = self.apply_globignore(matches);
+                    // Everything the pattern found was ignored, so it
+                    // found nothing -- which is the same case as a
+                    // pattern that matched nothing, and answered the
+                    // same way.
+                    if kept.is_empty() {
+                        out.extend(self.unmatched_pattern(&s));
+                    } else {
+                        out.extend(kept);
                     }
+                    continue;
                 }
                 out.push(s);
             } else {
@@ -7247,10 +7276,14 @@ impl Shell {
                 if self.opt_noglob {
                     out.extend(fields);
                 } else {
-                    for (f, p) in fields.into_iter().zip(patterns.into_iter()) {
-                        match glob::expand(&p).map(|m| self.apply_globignore(m)).filter(|m| !m.is_empty()) {
-                            Some(matches) => out.extend(matches),
-                            None => out.push(f),
+                    for (field, pattern) in fields.into_iter().zip(patterns.into_iter()) {
+                        match glob::expand(&pattern, self.glob_options()).map(|m| self.apply_globignore(m)) {
+                            Some(matches) if !matches.is_empty() => out.extend(matches),
+                            // A pattern that matched nothing. Not the
+                            // same as a word that was never a pattern,
+                            // which is the `None` arm.
+                            Some(_) => out.extend(self.unmatched_pattern(&field)),
+                            None => out.push(field),
                         }
                     }
                 }

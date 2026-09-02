@@ -175,9 +175,30 @@ pub(crate) fn match_class(pat: &[u8], c: Option<u8>) -> Option<(bool, &[u8])> {
     Some((matched, &pat[j + 1..]))
 }
 
+/// Whether `s` is a pattern at all -- i.e. whether it has a
+/// metacharacter that is not escaped.
+///
+/// The escaping matters and used to be ignored. A word's quoted parts
+/// reach here through `escape`, so `printf '[%s]'` arrives as
+/// `\[%s\]`: it has a `[` in it, but not one that means anything, and
+/// reading it as a pattern makes the word vanish under `nullglob`.
 pub fn has_meta(s: &str) -> bool {
-    s.chars().any(|c| c == '*' || c == '?' || c == '[')
-        || ["@(", "!(", "+("].iter().any(|p| s.contains(p))
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' {
+            i += 2;
+            continue;
+        }
+        if matches!(bytes[i], b'*' | b'?' | b'[') {
+            return true;
+        }
+        if matches!(bytes[i], b'@' | b'!' | b'+') && bytes.get(i + 1) == Some(&b'(') {
+            return true;
+        }
+        i += 1;
+    }
+    false
 }
 
 // Escapes every character match_here treats specially, so the result --
@@ -202,7 +223,31 @@ pub fn escape(s: &str) -> String {
 // in an intermediate directory segment don't. Returns None if there were no
 // matches (caller should fall back to the literal pattern text, bash's
 // default nullglob-off behavior).
-pub fn expand(pattern: &str) -> Option<Vec<String>> {
+/// The `shopt` settings that change what a pattern matches.
+///
+/// Passed in rather than read here because `glob` has no shell to ask,
+/// and because `case` patterns and `[[ == ]]` deliberately do not take
+/// them -- `nocaseglob` and `dotglob` are about *pathnames*.
+#[derive(Clone, Copy, Default)]
+pub struct Options {
+    /// `shopt -s dotglob`: a leading `.` stops being special, so `*`
+    /// matches `.hidden` too.
+    pub dotglob: bool,
+    /// `shopt -s nocaseglob`: match without regard to case.
+    pub nocaseglob: bool,
+}
+
+/// Expands a glob pattern against the filesystem.
+///
+/// `None` means "this is not a pattern at all" -- no metacharacters --
+/// and is a different answer from `Some(vec![])`, which means it is a
+/// pattern that matched nothing. Only the caller can decide what the
+/// second one means: left alone it is bash's default, `nullglob` drops
+/// the word, and `failglob` makes it an error.
+///
+/// Only the final path component may contain metacharacters: `dir/*.c`
+/// works, `*/x` does not.
+pub fn expand(pattern: &str, options: Options) -> Option<Vec<String>> {
     if !has_meta(pattern) {
         return None;
     }
@@ -210,21 +255,28 @@ pub fn expand(pattern: &str) -> Option<Vec<String>> {
         Some(idx) => (pattern[..idx].to_string(), &pattern[idx + 1..], format!("{}/", &pattern[..idx])),
         None => (".".to_string(), pattern, String::new()),
     };
-    let entries = std::fs::read_dir(&dir).ok()?;
+    let Ok(entries) = std::fs::read_dir(&dir) else { return Some(Vec::new()) };
     let mut found: Vec<String> = entries
         .filter_map(|e| e.ok())
         .filter_map(|e| e.file_name().into_string().ok())
         .filter(|name| {
-            if name.starts_with('.') && !base_pattern.starts_with('.') {
+            // A leading `.` has to be asked for by name -- unless
+            // `dotglob` says otherwise. `.` and `..` are never
+            // produced either way, which is what `globskipdots`
+            // defaults to and bash 5.2 made unconditional.
+            if name.starts_with('.') && !options.dotglob && !base_pattern.starts_with('.') {
                 return false;
             }
-            matches(base_pattern, name)
+            if name == "." || name == ".." {
+                return false;
+            }
+            match options.nocaseglob {
+                true => matches(&base_pattern.to_lowercase(), &name.to_lowercase()),
+                false => matches(base_pattern, name),
+            }
         })
         .map(|name| format!("{}{}", prefix, name))
         .collect();
-    if found.is_empty() {
-        return None;
-    }
     found.sort();
     Some(found)
 }
