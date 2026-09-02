@@ -12,6 +12,10 @@ use crate::bishedit::format::BashFormatter;
 use crate::bishedit::lint::{BashLinter, Diagnostic, Fix, Linter};
 use std::io::{self, Read, Write};
 
+// Used both for the "expected:" line and for the "did you mean" beside
+// it, so the two cannot disagree about what exists.
+const SUBCOMMANDS: &[&str] = &["check", "format", "debug", "edit", "keys"];
+
 pub fn run(args: &[String]) -> i32 {
     match args.first().map(String::as_str) {
         Some("check") => run_check(&args[1..]),
@@ -20,7 +24,8 @@ pub fn run(args: &[String]) -> i32 {
         Some("edit") => run_edit(&args[1..]),
         Some("keys") => run_keys(&args[1..]),
         Some(other) => {
-            eprintln!("bish tool: unknown subcommand '{other}' (expected: check, format, debug, edit, keys)");
+            let hint = crate::suggest::did_you_mean(other, SUBCOMMANDS.iter().copied());
+            eprintln!("bish tool: unknown subcommand '{other}'{hint} (expected: {})", SUBCOMMANDS.join(", "));
             2
         }
         None => {

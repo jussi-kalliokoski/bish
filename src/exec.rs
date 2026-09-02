@@ -6165,7 +6165,15 @@ impl Shell {
                 self.run_command_not_found_handler(&argv)
             }
             Err(e) => {
-                let msg = format!("bish: {}: {}", name, e);
+                // A name that is nearly a builtin is worth saying so
+                // about. Only for NotFound: an EACCES on a real file is
+                // a different problem and a suggestion there would be
+                // noise on top of it.
+                let hint = match e.kind() == std::io::ErrorKind::NotFound {
+                    true => crate::suggest::did_you_mean(&name, KNOWN_BUILTINS.iter().copied()),
+                    false => String::new(),
+                };
+                let msg = format!("bish: {}: {}{}", name, e, hint);
                 self.write_command_error(cmd, &msg);
                 self.drain_proc_subs();
                 ExecResult::Status(127)
@@ -8498,6 +8506,54 @@ pub(crate) fn shell_quote(s: &str) -> String {
     }
     out.push('\'');
     out
+}
+
+#[cfg(test)]
+mod did_you_mean_tests {
+    fn stderr_of(script: &str) -> String {
+        let mut shell = super::Shell::new();
+        let captured = std::rc::Rc::new(std::cell::RefCell::new(String::new()));
+        shell.set_sink_capture(captured.clone());
+        shell.run_source_here(script, "<did-you-mean>");
+        let out = captured.borrow().clone();
+        out
+    }
+
+    // The wiring, not the algorithm -- `suggest`'s own tests cover
+    // which name is closest. What matters here is that the shell
+    // actually says it, on the paths where a name is nearly right.
+    #[test]
+    fn a_mistyped_builtin_is_named() {
+        assert!(stderr_of("ecoh hi\n").contains("did you mean 'echo'?"), "{}", stderr_of("ecoh hi\n"));
+        assert!(stderr_of("expor X=1\n").contains("did you mean 'export'?"));
+        // A name that is not nearly anything gets no guess.
+        let miss = stderr_of("nosuchcommand_at_all\n");
+        assert!(miss.contains("nosuchcommand_at_all"), "{miss}");
+        assert!(!miss.contains("did you mean"), "{miss}");
+    }
+
+    #[test]
+    fn a_mistyped_bish_subcommand_is_named() {
+        assert!(stderr_of("::bish lps ls\n").contains("did you mean 'lsp'?"));
+        assert!(stderr_of("::bish hook lls\n").contains("did you mean 'ls'?"));
+        assert!(stderr_of("::bish theme bgein\n").contains("did you mean 'begin'?"));
+        assert!(!stderr_of("::bish qqqq\n").contains("did you mean"));
+    }
+
+    #[test]
+    fn a_mistyped_bishopt_name_is_named() {
+        assert!(stderr_of("bishopt gitignor\n").contains("did you mean 'gitignore'?"));
+    }
+
+    // The "expected:" list and the suggestion read from the same array,
+    // so a subcommand cannot exist in one and not the other.
+    #[test]
+    fn the_expected_list_is_the_list_that_is_searched() {
+        let listed = stderr_of("::bish qqqq\n");
+        for name in ["theme", "window", "hook", "hl", "lsp", "map"] {
+            assert!(listed.contains(name), "{name} missing from {listed}");
+        }
+    }
 }
 
 #[cfg(test)]

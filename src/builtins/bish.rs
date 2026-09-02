@@ -7,6 +7,30 @@ use crate::bishedit::snippet::{self, Abbr};
 use crate::exec::{hook_help, lsp_help, parse_size_spec, sh_eprintln, sh_println, BishOptDefault, BishOptValue,
     ExecResult, HOOK_EVENTS, Hook, LspServer, PaneDirection, Shell, Theme, WindowAction};
 
+// The subcommand names each `::bish` family answers to. One list per
+// family, used both for the "expected:" line and for the "did you
+// mean" beside it -- so a name added to a `match` below and forgotten
+// here shows up as a wrong error message rather than as a silently
+// unsuggestable command.
+const BISH_SUBCOMMANDS: &[&str] = &["theme", "window", "hook", "hl", "lsp", "map"];
+const HOOK_SUBCOMMANDS: &[&str] = &["ls", "add", "rm", "help"];
+const LSP_SUBCOMMANDS: &[&str] = &["ls", "add", "rm", "status", "log", "restart", "help"];
+const THEME_SUBCOMMANDS: &[&str] = &["begin", "end"];
+// Long forms only. The one-letter aliases (`s`, `v`, `h`, `=`) are real
+// spellings but useless as suggestions: at a one-edit threshold every
+// mistyped single character is a near miss for most of them, so the
+// answer would be arbitrary.
+const WINDOW_SUBCOMMANDS: &[&str] = &[
+    "next", "previous", "new", "create", "close", "quit", "split", "vsplit", "left", "below", "above", "right",
+    "balance", "minimize", "sizeup", "sizedown", "size", "fg",
+];
+
+// "theme, window, hook, hl, lsp, map" -- the list as an error message
+// says it.
+fn listed(names: &[&str]) -> String {
+    names.join(", ")
+}
+
 pub(crate) fn run_bishopt(sh: &mut Shell, args: &[String], registry: &[(&str, BishOptDefault)]) -> i32 {
     enum Mode<'a> {
         List,
@@ -82,13 +106,19 @@ pub(crate) fn run_bishopt(sh: &mut Shell, args: &[String], registry: &[(&str, Bi
                 0
             }
             None => {
-                sh_eprintln!(sh, "bish: bishopt: {name}: no such option");
+                {
+                    let hint = crate::suggest::did_you_mean(name, registry.iter().map(|(n, _)| *n));
+                    sh_eprintln!(sh, "bish: bishopt: {name}: no such option{hint}");
+                }
                 1
             }
         },
         Mode::Set(name, value) => match (registry.iter().find(|(n, _)| *n == name).map(|(_, d)| d.clone()), value) {
             (None, _) => {
-                sh_eprintln!(sh, "bish: bishopt: {name}: no such option");
+                {
+                    let hint = crate::suggest::did_you_mean(name, registry.iter().map(|(n, _)| *n));
+                    sh_eprintln!(sh, "bish: bishopt: {name}: no such option{hint}");
+                }
                 1
             }
             (Some(BishOptDefault::Bool(_)), None | Some("on")) => {
@@ -146,7 +176,10 @@ pub(crate) fn run_bishopt(sh: &mut Shell, args: &[String], registry: &[(&str, Bi
         },
         Mode::Unset(name) => {
             if !registry.iter().any(|(n, _)| *n == name) {
-                sh_eprintln!(sh, "bish: bishopt: {name}: no such option");
+                {
+                    let hint = crate::suggest::did_you_mean(name, registry.iter().map(|(n, _)| *n));
+                    sh_eprintln!(sh, "bish: bishopt: {name}: no such option{hint}");
+                }
                 return 1;
             }
             sh.bishopts.remove(name);
@@ -182,11 +215,12 @@ pub(crate) fn run_bish(sh: &mut Shell, args: &[String]) -> ExecResult {
         [sub, rest @ ..] if sub == "lsp" => ExecResult::Status(run_lsp(sh, rest)),
         [sub, rest @ ..] if sub == "map" => ExecResult::Status(run_map(sh, rest)),
         [] => {
-            sh_eprintln!(sh, "bish: ::bish: missing subcommand (expected: theme, window, hook, hl, lsp, map)");
+            sh_eprintln!(sh, "bish: ::bish: missing subcommand (expected: {})", listed(BISH_SUBCOMMANDS));
             ExecResult::Status(2)
         }
         [other, ..] => {
-            sh_eprintln!(sh, "bish: ::bish: unknown subcommand '{other}' (expected: theme, window, hook, hl, lsp, map)");
+            let hint = crate::suggest::did_you_mean(other, BISH_SUBCOMMANDS.iter().copied());
+            sh_eprintln!(sh, "bish: ::bish: unknown subcommand '{other}'{hint} (expected: {})", listed(BISH_SUBCOMMANDS));
             ExecResult::Status(2)
         }
     }
@@ -267,7 +301,8 @@ pub(crate) fn run_hook(sh: &mut Shell, args: &[String]) -> i32 {
             0
         }
         Some(other) => {
-            sh_eprintln!(sh, "bish: ::bish hook: unknown subcommand '{other}' (expected: ls, add, rm, help)");
+            let hint = crate::suggest::did_you_mean(other, HOOK_SUBCOMMANDS.iter().copied());
+            sh_eprintln!(sh, "bish: ::bish hook: unknown subcommand '{other}'{hint} (expected: {})", listed(HOOK_SUBCOMMANDS));
             2
         }
     }
@@ -466,7 +501,8 @@ pub(crate) fn run_lsp(sh: &mut Shell, args: &[String]) -> i32 {
             0
         }
         Some(other) => {
-            sh_eprintln!(sh, "bish: ::bish lsp: unknown subcommand '{other}' (expected: ls, add, rm, status, log, restart, help)");
+            let hint = crate::suggest::did_you_mean(other, LSP_SUBCOMMANDS.iter().copied());
+            sh_eprintln!(sh, "bish: ::bish lsp: unknown subcommand '{other}'{hint} (expected: {})", listed(LSP_SUBCOMMANDS));
             2
         }
     }
@@ -533,11 +569,12 @@ pub(crate) fn run_bish_theme(sh: &mut Shell, args: &[String]) -> i32 {
         [sub] if sub == "begin" => run_bish_theme_begin(sh),
         [sub] if sub == "end" => run_bish_theme_end(sh),
         [] => {
-            sh_eprintln!(sh, "bish: ::bish theme: missing subcommand (expected: begin, end)");
+            sh_eprintln!(sh, "bish: ::bish theme: missing subcommand (expected: {})", listed(THEME_SUBCOMMANDS));
             2
         }
         [other, ..] => {
-            sh_eprintln!(sh, "bish: ::bish theme: unknown subcommand '{other}' (expected: begin, end)");
+            let hint = crate::suggest::did_you_mean(other, THEME_SUBCOMMANDS.iter().copied());
+            sh_eprintln!(sh, "bish: ::bish theme: unknown subcommand '{other}'{hint} (expected: {})", listed(THEME_SUBCOMMANDS));
             2
         }
     }
@@ -907,7 +944,8 @@ pub(crate) fn run_window_inner(sh: &mut Shell, args: &[String]) -> ExecResult {
             }
         },
         Some(other) => {
-            sh_eprintln!(sh, "bish: window: unknown subcommand: {}", other);
+            let hint = crate::suggest::did_you_mean(other, WINDOW_SUBCOMMANDS.iter().copied());
+            sh_eprintln!(sh, "bish: window: unknown subcommand: {other}{hint}");
             ExecResult::Status(2)
         }
         None => {

@@ -39,6 +39,7 @@ mod repl;
 mod roff;
 mod serialize;
 mod session;
+mod suggest;
 mod term;
 mod theme;
 mod time;
