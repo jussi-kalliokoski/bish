@@ -250,12 +250,17 @@ pub struct Parser {
     // on. See ListItem::line's own doc comment.
     lines: Vec<usize>,
     pos: usize,
+    // Whether the list just parsed ended with a real `;`/newline/`&`
+    // rather than simply running into its stop token. A brace group
+    // needs to know: `{ : }` is a syntax error in bash, and `{ :; }`
+    // is not.
+    list_ended_with_separator: bool,
 }
 
 impl Parser {
     pub fn new(toks: Vec<(Tok, usize)>) -> Self {
         let (toks, lines) = toks.into_iter().unzip();
-        Parser { toks, lines, pos: 0 }
+        Parser { toks, lines, pos: 0, list_ended_with_separator: false }
     }
 
     // The source line the token at the parser's current position started
@@ -327,6 +332,7 @@ impl Parser {
             }
             let line = self.current_line();
             let and_or = self.parse_and_or()?;
+            self.list_ended_with_separator = true;
             let sep = match self.peek() {
                 Some(Tok::Amp) => {
                     self.advance();
@@ -336,7 +342,18 @@ impl Parser {
                     self.advance();
                     Sep::Seq
                 }
-                _ => Sep::Seq,
+                // Nothing separated this command from whatever comes
+                // next. A *simple* command consumes its own arguments,
+                // so this only happens after a compound one --
+                // `f() { :; } f() { :; }`, two definitions with no `;`
+                // between them, which used to parse as two commands.
+                _ if !self.at_any(stops) && self.peek().is_some() => {
+                    return Err(format!("near unexpected token `{}'", self.offending_token_text()));
+                }
+                _ => {
+                    self.list_ended_with_separator = false;
+                    Sep::Seq
+                }
             };
             items.push(ListItem { and_or, sep, line });
             self.skip_terminators();
@@ -806,7 +823,14 @@ impl Parser {
 
     fn parse_group(&mut self) -> Result<Command, String> {
         self.advance(); // LBrace
-        let body = self.parse_list_until(&[Tok::RBrace])?;
+        let body = self.parse_required_list_until(&[Tok::RBrace])?;
+        // `{ : }` is a syntax error in bash and `{ :; }` is not -- the
+        // last command in a brace group has to be terminated. Reading
+        // the `}` as just another word is also why `{ echo }` printed
+        // a brace instead of complaining.
+        if !self.list_ended_with_separator {
+            return Err("near unexpected token `}'".to_string());
+        }
         self.expect(Tok::RBrace)?;
         let redirects = self.parse_trailing_redirects()?;
         Ok(Command::Group(body, redirects))

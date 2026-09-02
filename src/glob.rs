@@ -11,6 +11,16 @@ pub fn matches(pattern: &str, text: &str) -> bool {
     match_here(pattern.as_bytes(), text.as_bytes())
 }
 
+/// `matches`, optionally folding case -- what `shopt -s nocasematch`
+/// asks of `case` and of `[[ == ]]`. Folding both sides is the same
+/// thing `nocaseglob` does for pathnames (see `read_names`).
+pub fn matches_with_case(pattern: &str, text: &str, fold_case: bool) -> bool {
+    match fold_case {
+        true => matches(&pattern.to_lowercase(), &text.to_lowercase()),
+        false => matches(pattern, text),
+    }
+}
+
 /// The same, but `*` and `?` never cross a `/` -- pathname semantics,
 /// what C's fnmatch spells `FNM_PATHNAME`.
 ///

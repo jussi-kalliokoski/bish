@@ -155,9 +155,16 @@ fn is_executable(a: &str) -> bool {
 }
 
 pub(crate) fn binary(a: &str, op: &str, b: &str, use_glob: bool) -> bool {
+    binary_with_case(a, op, b, use_glob, false)
+}
+
+// `binary`, with `shopt -s nocasematch`'s case folding for the two
+// operators it applies to. `[ ]`/`test` never fold -- the option is
+// about pattern matching, and those two compare literally.
+pub(crate) fn binary_with_case(a: &str, op: &str, b: &str, use_glob: bool, fold_case: bool) -> bool {
     match op {
-        "=" | "==" if use_glob => crate::glob::matches(b, a),
-        "!=" if use_glob => !crate::glob::matches(b, a),
+        "=" | "==" if use_glob => crate::glob::matches_with_case(b, a, fold_case),
+        "!=" if use_glob => !crate::glob::matches_with_case(b, a, fold_case),
         "=" | "==" => a == b,
         "!=" => a != b,
         "<" => a < b,

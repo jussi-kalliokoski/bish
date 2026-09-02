@@ -960,9 +960,13 @@ impl<'a> Lexer<'a> {
         // same raw text's span (this function doesn't append anything to
         // `raw` afterward, just consumes the second closing paren).
         let raw = self.capture_balanced_parens()?;
-        if self.chars.peek().copied() == Some(')') {
-            self.advance();
+        // The *second* `)` is not optional. `for ((i=0; i<2; i++) do`
+        // has only one, and swallowing that silently turned an
+        // unbalanced loop header into a working loop over nonsense.
+        if self.chars.peek().copied() != Some(')') {
+            return Err(format!("near `{}'", raw.trim()));
         }
+        self.advance();
         Ok(raw)
     }
 
@@ -1515,7 +1519,12 @@ impl<'a> Lexer<'a> {
             // out of input first" (span includes every char actually
             // consumed, matching what `inner` itself already contains).
             let (inner, closed) = self.capture_var_expansion_body();
-            let span = start..(if closed { self.pos - 1 } else { self.pos });
+            if !closed {
+                // `echo ${x` -- expanding it as though the brace were
+                // there is how a truncated line went on to run.
+                return Err("unexpected EOF while looking for matching `}'".to_string());
+            }
+            let span = start..(self.pos - 1);
             match parse_brace_content(&inner) {
                 BraceContent::Plain(name) => {
                     if name.is_empty() {

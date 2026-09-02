@@ -311,6 +311,25 @@ y
         case("bare-array-is-element-zero", r#"a=(1 2); echo "[$a]"; declare -A m=([k]=v); echo "[$m]""#),
         case("funcname-scalar", r#"f() { echo "[$FUNCNAME]"; }; f"#),
         case("funcname-has-no-main-frame-under-c", r#"f() { g; }; g() { echo "${FUNCNAME[*]} n=${#FUNCNAME[@]}"; }; f"#),
+        // -- roadmap 18: the last of the parser's leniency -------------
+        // Sourced with stderr discarded, so what is compared is that
+        // the construct is rejected -- the two shells word a syntax
+        // error differently (bash echoes the offending line back).
+        case("two-defs-no-separator", "printf 'f() { :; } f() { :; }\\n' > s.sh; . ./s.sh 2>/dev/null; echo \"rc=$?\""),
+        case(
+            "brace-group-needs-a-terminator",
+            "printf '{ : }\\n' > s.sh; . ./s.sh 2>/dev/null; echo \"rc=$?\"; printf '{ echo }\\n' > s.sh; . ./s.sh 2>/dev/null; echo \"rc=$?\"",
+        ),
+        case("unterminated-brace-expansion", "printf 'echo ${x\\n' > s.sh; . ./s.sh 2>/dev/null; echo \"rc=$?\""),
+        case("c-for-needs-both-parens", "printf 'for ((i=0; i<2; i++) do :; done\\n' > s.sh; . ./s.sh 2>/dev/null; echo \"rc=$?\""),
+        // bash rejects this at parse time and abandons the whole
+        // input; bish rejects it when the condition runs. Sourced, so
+        // both are an ordinary non-zero status the script can see.
+        case("dbracket-rejects-a-fourth-operand", "printf '[[ a == b == c ]]\\n' > s.sh; . ./s.sh 2>/dev/null; echo \"rc=$?\""),
+        case(
+            "nocasematch-covers-case",
+            r#"shopt -s nocasematch; case AB in ab) echo ci;; esac; [[ ABC == abc ]] && echo dbracket; [ ABC = abc ] || echo literal"#,
+        ),
     ];
 
     // Cases bish does not match today, each with why. Asserted to
@@ -319,17 +338,12 @@ y
     const DIVERGENCES: &[(&str, &str)] = &[
         ("function-call-redirect", "a redirect on a function *call* does not reach a builtin inside the body"),
         ("dbracket-pattern", "quoting the right of `[[ == ]]` should make it a literal, not a glob"),
-        // All seven are the same shape: bash calls it a syntax error,
-        // bish parses it into something and runs it. None is a
-        // deliberate extension -- they are places the grammar is looser
-        // than it meant to be, listed so the next pass has a worklist.
-        ("two-func-defs-no-separator", "two definitions with no `;` between them"),
-        ("brace-group-unterminated", "a brace group whose last command has no terminator"),
-        ("brace-command-unterminated", "the same, with a command in it -- `}` ends a word here, so it is read as an argument"),
-        ("unterminated-brace-expansion", "`${x` with no closing brace expands as if it had one"),
-        ("c-for-unbalanced", "the C-style `for`'s own parens are not balance-checked"),
+        // The last of the grammar's leniency: bash calls it a syntax
+        // error, bish skips the empty statement and runs the rest. The
+        // other six of this group are fixed; this one lives inside
+        // skip_terminators, which every construct's list parsing goes
+        // through, and is not worth the blast radius on its own.
         ("empty-command-between-separators", "`;` twice in a row is skipped rather than reported"),
-        ("dbracket-three-operands", "`[[ ]]` takes a fourth operand instead of rejecting it"),
     ];
 
     // The cases the divergence list is about. Kept apart from `CASES`
@@ -338,13 +352,7 @@ y
         case("function-call-redirect", r#"f() { echo inner >&2; }; f 2>/dev/null; echo after"#),
         case("dbracket-pattern", r#"[[ abc == a* ]] && echo glob; [[ abc == "a*" ]] || echo literal"#),
         // -- roadmap 10: parser leniency, the part still standing -----
-        case("two-func-defs-no-separator", r#"f() { :; } f() { :; }"#),
-        case("brace-group-unterminated", "{ : }"),
-        case("brace-command-unterminated", "{ echo }"),
-        case("unterminated-brace-expansion", "echo ${x"),
-        case("c-for-unbalanced", "for ((i=0; i<2; i++) do :; done"),
         case("empty-command-between-separators", "echo a; ; echo b"),
-        case("dbracket-three-operands", "[[ a == b == c ]]"),
     ];
 
     // `target/<profile>/bish`, worked out from the test binary's own

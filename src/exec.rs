@@ -4842,10 +4842,13 @@ impl Shell {
         let mut last_body_status = 0;
         while i < arms.len() {
             let (patterns, body, term) = &arms[i];
+            // `shopt -s nocasematch` covers `case` as well as
+            // `[[ =~ ]]` -- it was only wired into the latter.
+            let fold_case = self.shopt_is_on("nocasematch");
             let should_run = force_run
                 || patterns.iter().any(|p| {
                     let pat = self.expand_word(p);
-                    glob::matches(&pat, &val)
+                    glob::matches_with_case(&pat, &val, fold_case)
                 });
             if should_run {
                 match self.run_program(body) {
@@ -4909,6 +4912,13 @@ impl Shell {
                     word_atoms.push(w);
                     *pos += 1;
                 }
+                // `[[ a == b == c ]]` -- no form of `[[ ]]` takes four
+                // operands, and reading it as "non-empty, so true" is
+                // how a stray word passed silently.
+                if word_atoms.len() > 3 {
+                    let text = word_atoms.iter().map(|w| self.expand_word(w)).collect::<Vec<_>>();
+                    return Err(format!("syntax error in conditional expression: unexpected token `{}'", text[3]));
+                }
                 Ok(self.eval_simple_test(&word_atoms))
             }
             other => Err(format!("syntax error near {:?}", other)),
@@ -4962,9 +4972,12 @@ impl Shell {
                     }
                 } else {
                     let b = self.expand_word(b);
-                    builtins::binary(&a, &op, &b, true)
+                    let fold_case = self.shopt_is_on("nocasematch");
+                    builtins::binary_with_case(&a, &op, &b, true, fold_case)
                 }
             }
+            // Four or more is rejected by the caller before reaching
+            // here; this arm is unreachable in practice.
             _ => !words.is_empty(),
         }
     }
