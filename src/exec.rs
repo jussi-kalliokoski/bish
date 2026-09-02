@@ -102,7 +102,24 @@ impl OutputSink {
             // "stop writing, not fatal" instead of crashing the process.
             OutputSink::Real => {
                 use std::io::Write;
-                let _ = std::io::stdout().write_all(s.as_bytes());
+                let mut out = std::io::stdout();
+                let _ = out.write_all(s.as_bytes());
+                // Flushed here rather than left to the line buffer,
+                // because fd 1 is not this shell's alone: the next
+                // thing to write to it is very often a child process,
+                // and a half-line still sitting in `Stdout`'s buffer
+                // comes out *after* what the child wrote.
+                // `printf A; printf B | cat; printf C` printed `BAC`.
+                //
+                // A line-oriented write already costs one syscall, so
+                // this only adds one where output stops mid-line.
+                // Measured on 20,000 partial writes into /dev/null --
+                // the case buffering would help most -- 2.156s against
+                // 2.146s, which is noise: the loop is the interpreter's
+                // time, not the kernel's. Flushing before every spawn
+                // instead would keep the buffering, at the cost of
+                // having to find every place a child can start.
+                let _ = out.flush();
             }
             OutputSink::Grid(screen) => screen.borrow_mut().feed(onlcr(s).as_bytes()),
             OutputSink::Capture(buf) => buf.borrow_mut().push_str(s),

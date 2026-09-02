@@ -99,6 +99,10 @@ mod tests {
         case("redir-fd", r#"exec 3> three; echo x >&3; exec 3>&-; cat three"#),
         // -- pipelines and subshells ----------------------------------
         case("pipeline", r#"printf 'b\na\n' | sort | head -1"#),
+        // A half-line from a builtin has to reach fd 1 before the child
+        // that writes to the same fd next.
+        case("flush-order", r#"printf A; printf B | cat; printf C; echo"#),
+        case("flush-order-stderr", r#"printf E >&2; printf F | cat; echo"#),
         case("pipeline-status", r#"false | true; echo $?; set -o pipefail; false | true; echo $?"#),
         case("subshell-scope", r#"x=1; (x=2); echo $x"#),
         case("subshell-exit", r#"(exit 4); echo $?"#),
@@ -155,7 +159,6 @@ mod tests {
         ("globstar", "roadmap 5: ** is not implemented"),
         ("time-keyword", "roadmap 7: `time` is not a reserved word here"),
         ("builtin-gaps", "roadmap 9: [[ -v ]], wait -n, kill -l SIG, exec -a, set -C"),
-        ("flush-order", "roadmap 2: a builtin's output is not flushed before a child writes"),
     ];
 
     // The cases the divergence list is about. Kept apart from `CASES`
@@ -173,7 +176,6 @@ mod tests {
         case("globstar", r#"mkdir -p a/b; : > a/b/deep; shopt -s globstar; printf '%s,' **/deep; echo"#),
         case("time-keyword", r#"time true"#),
         case("builtin-gaps", r#"x=1; [[ -v x ]] && echo v; kill -l 9"#),
-        case("flush-order", r#"printf A; printf B | cat; printf C; echo"#),
     ];
 
     // `target/<profile>/bish`, worked out from the test binary's own
