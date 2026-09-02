@@ -5340,7 +5340,7 @@ impl Shell {
         // that unrelated, still-needed layer the moment a command with no
         // redirect of its own (push returning `Ok(false)`, doing nothing)
         // ran inside it.
-        let pushed = match self.push_builtin_output_sink(&cmd.redirects) {
+        let pushed = match self.push_builtin_output_sink(&cmd.redirects, &name) {
             Ok(pushed) => pushed,
             Err(e) => {
                 sh_eprintln!(self, "bish: {}", e);
@@ -8598,98 +8598,153 @@ impl Shell {
     // caller must call pop_builtin_output_sink when done; Err surfaces a
     // failed `open_out` (e.g. `> /no/such/dir/f`) the same way every other
     // redirect failure already does.
-    fn push_builtin_output_sink(&mut self, redirects: &[Redirect]) -> Result<bool, String> {
-        // A word-based target (`>file`) or a dup onto some other already-
-        // open fd (`>&3`, most commonly a fd `exec 3<>/dev/tcp/...` left
-        // open) -- last one wins either way, matching real bash's own
-        // "later redirects override earlier ones for the same fd" rule,
-        // which two separate Option fields (one per shape) couldn't
-        // express correctly across a mix of both shapes.
-        enum Target {
+    fn push_builtin_output_sink(&mut self, redirects: &[Redirect], who: &str) -> Result<bool, String> {
+        // A left-to-right simulation of the command's whole redirect
+        // list. Order is the point, and so is *when* a destination is
+        // captured:
+        //
+        //     echo x 3>&1 >&2 2>&3 3>&-     the stdout/stderr swap
+        //
+        // `2>&3` copies whatever fd 3 names at that moment; the `3>&-`
+        // after it closes fd 3 and must not touch fd 2. And in
+        // `>file 2>&1` the two streams have to end up on *one* open
+        // file, or their write positions diverge and they overwrite
+        // each other.
+        //
+        // Both fall out of giving each destination an identity: a
+        // redirect that creates one appends to `dests`, a dup copies
+        // the *id*, and a later rebinding of the source fd creates a
+        // new id and leaves the old one alone. Two descriptors share
+        // exactly when they hold the same id.
+        //
+        // Only fds 1 and 2 reach the builtin -- it writes nowhere else
+        // -- but every fd has to be tracked, because 1 and 2 can be
+        // defined in terms of them.
+        enum Dest {
+            // The *process's* fd N, as this command found it. `echo e
+            // >&2 2>/dev/null` prints on the terminal in bash, because
+            // `>&2` names fd 2 as it stood then.
+            ProcessFd(i32),
             // path, append, clobber -- the last is `>|`'s override of
-            // `set -C`, carried alongside so `resolve` can hand all
-            // three to open_out.
+            // `set -C`.
             Path(String, bool, bool),
-            Fd(i32),
+            Closed,
         }
-        let mut stdout_target: Option<Target> = None;
-        let mut stderr_target: Option<Target> = None;
-        let mut dup_err_to_out = false;
-        let mut dup_out_to_err = false;
-        let mut touched = false;
+        let mut dests: Vec<Dest> = Vec::new();
+        let mut table: std::collections::HashMap<i32, usize> = std::collections::HashMap::new();
+        macro_rules! define {
+            ($fd:expr, $dest:expr) => {{
+                dests.push($dest);
+                table.insert($fd, dests.len() - 1);
+            }};
+        }
+        // The id fd `n` holds right now -- creating one for the
+        // process's own descriptor if this command has not touched it.
+        macro_rules! id_of {
+            ($fd:expr) => {{
+                let fd = $fd;
+                match table.get(&fd) {
+                    Some(id) => *id,
+                    None => {
+                        dests.push(Dest::ProcessFd(fd));
+                        dests.len() - 1
+                    }
+                }
+            }};
+        }
         for r in redirects {
             match r {
-                Redirect::Out { word, append, clobber } => {
-                    stdout_target = Some(Target::Path(self.expand_word(word), *append, *clobber));
-                    dup_out_to_err = false;
-                    touched = true;
+                Redirect::Out { word, append, clobber } => define!(1, Dest::Path(self.expand_word(word), *append, *clobber)),
+                Redirect::Err { word, append, clobber } => define!(2, Dest::Path(self.expand_word(word), *append, *clobber)),
+                Redirect::FdOut { fd, word, append, clobber } => {
+                    define!(*fd as i32, Dest::Path(self.expand_word(word), *append, *clobber))
                 }
-                Redirect::FdOut { fd, word, append, clobber } if *fd == 1 => {
-                    stdout_target = Some(Target::Path(self.expand_word(word), *append, *clobber));
-                    dup_out_to_err = false;
-                    touched = true;
-                }
-                Redirect::Err { word, append, clobber } => {
-                    stderr_target = Some(Target::Path(self.expand_word(word), *append, *clobber));
-                    dup_err_to_out = false;
-                    touched = true;
-                }
-                Redirect::FdOut { fd, word, append, clobber } if *fd == 2 => {
-                    stderr_target = Some(Target::Path(self.expand_word(word), *append, *clobber));
-                    dup_err_to_out = false;
-                    touched = true;
-                }
+                // `&>file`: both descriptors, one open file.
                 Redirect::Both { word, append } => {
-                    stdout_target = Some(Target::Path(self.expand_word(word), *append, false));
-                    dup_err_to_out = true;
-                    dup_out_to_err = false;
-                    touched = true;
+                    define!(1, Dest::Path(self.expand_word(word), *append, false));
+                    let id = table[&1];
+                    table.insert(2, id);
                 }
                 Redirect::DupErrToOut => {
-                    dup_err_to_out = true;
-                    touched = true;
+                    let id = id_of!(1);
+                    table.insert(2, id);
                 }
-                Redirect::FdDup { fd, target } if *fd == 2 && *target == 1 => {
-                    dup_err_to_out = true;
-                    touched = true;
+                Redirect::FdDup { fd, target } => {
+                    let id = id_of!(*target as i32);
+                    table.insert(*fd as i32, id);
                 }
-                Redirect::FdDup { fd, target } if *fd == 1 && *target == 2 => {
-                    dup_out_to_err = true;
-                    touched = true;
+                // `>&$var` -- how a script writes to a coproc's own
+                // descriptor. Only the literal-number spelling was
+                // matched before, so the redirect was dropped and the
+                // builtin wrote to stdout; an external command in the
+                // same position worked, which is what made it look like
+                // the co-process's descriptors were wrong.
+                Redirect::FdDupWord { fd, word } => {
+                    let text = self.expand_word(word);
+                    let Ok(target) = text.trim().parse::<i32>() else {
+                        return Err(format!("{}: ambiguous redirect", text));
+                    };
+                    let id = id_of!(target);
+                    table.insert(*fd as i32, id);
                 }
-                // Any other numbered-fd dup onto stdout/stderr (`>&3`,
-                // `2>&4`, ...) -- see dup_existing_fd's own doc comment.
-                // Only fd 1/2 as the *source* mean anything to a
-                // builtin's own output at all (a builtin never writes
-                // anywhere else), matching FdOut{1}/FdOut{2} above.
-                Redirect::FdDup { fd, target } if *fd == 1 => {
-                    stdout_target = Some(Target::Fd(*target as i32));
-                    dup_out_to_err = false;
-                    touched = true;
-                }
-                Redirect::FdDup { fd, target } if *fd == 2 => {
-                    stderr_target = Some(Target::Fd(*target as i32));
-                    dup_err_to_out = false;
-                    touched = true;
-                }
+                Redirect::FdClose { fd } => define!(*fd as i32, Dest::Closed),
                 _ => {}
             }
         }
-        if !touched {
+        // For a *builtin*, fd 1 and fd 2 are not the process's own:
+        // they are the enclosing sink, which may already be a capture,
+        // a grid, or an outer command's redirect. So `ProcessFd(1)` and
+        // `ProcessFd(2)` resolve to "whatever this sink's parent does
+        // with them" rather than to a dup of the real descriptor --
+        // which is what `dup_out_to_err`/`dup_err_to_out` and a `None`
+        // field mean to OutputSink::Builtin's own write path. Any other
+        // descriptor is a real one and really is duped.
+        let out_dest = table.get(&1).map(|&i| &dests[i]);
+        let err_dest = table.get(&2).map(|&i| &dests[i]);
+        if out_dest.is_none() && err_dest.is_none() {
             return Ok(false);
         }
-        let resolve = |t: &Option<Target>| -> Result<Option<Rc<RefCell<std::fs::File>>>, String> {
-            match t {
-                Some(Target::Path(p, append, clobber)) => Ok(Some(Rc::new(RefCell::new(self.open_out(p, *append, *clobber)?)))),
-                Some(Target::Fd(fd)) => Ok(dup_existing_fd(*fd).map(|f| Rc::new(RefCell::new(f)))),
-                None => Ok(None),
+        let shared = matches!((table.get(&1), table.get(&2)), (Some(a), Some(b)) if a == b);
+        let mut dup_out_to_err = false;
+        let mut dup_err_to_out = false;
+        let stdout = match out_dest {
+            None | Some(Dest::ProcessFd(1)) => None,
+            Some(Dest::ProcessFd(2)) => {
+                dup_out_to_err = true;
+                None
             }
+            Some(d) => open_dest(self, d, who)?,
         };
-        let stdout = resolve(&stdout_target)?;
-        let stderr = resolve(&stderr_target)?;
+        let stderr = match err_dest {
+            None | Some(Dest::ProcessFd(2)) => None,
+            Some(Dest::ProcessFd(1)) => {
+                dup_err_to_out = true;
+                None
+            }
+            // One destination for both, opened once.
+            Some(_) if shared && stdout.is_some() => {
+                dup_err_to_out = true;
+                None
+            }
+            Some(d) => open_dest(self, d, who)?,
+        };
         let previous = std::mem::replace(&mut self.sink, OutputSink::Real);
         self.sink = OutputSink::Builtin { previous: Box::new(previous), stdout, stderr, dup_err_to_out, dup_out_to_err };
-        Ok(true)
+        return Ok(true);
+
+        fn open_dest(sh: &mut Shell, dest: &Dest, who: &str) -> Result<Option<Rc<RefCell<std::fs::File>>>, String> {
+            match dest {
+                Dest::Path(p, append, clobber) => Ok(Some(Rc::new(RefCell::new(sh.open_out(p, *append, *clobber)?)))),
+                // A dup of a descriptor nothing has open is an error,
+                // not a silent fallback to stdout: `echo x >&9` reports
+                // and fails, the way it does for an external command.
+                Dest::ProcessFd(fd) => match dup_existing_fd(*fd) {
+                    Some(f) => Ok(Some(Rc::new(RefCell::new(f)))),
+                    None => Err(format!("{}: Bad file descriptor", fd)),
+                },
+                Dest::Closed => Err(format!("{}: write error: Bad file descriptor", who)),
+            }
+        }
     }
 
     // Restores whatever sink push_builtin_output_sink saved -- a no-op if
@@ -11344,11 +11399,13 @@ fn apply_fds_to_self(dup_stderr_to_stdout: bool, extra_fds: Vec<ExtraFd>) -> Res
                 }
                 clear_cloexec(fd);
             }
-            ExtraFd::Close(fd) => {
-                if unsafe { close(fd) } == -1 {
-                    return Err(std::io::Error::last_os_error().to_string());
-                }
-            }
+            // Closing a descriptor nothing opened is a no-op, not an
+            // error: `{ echo a; } 3>&-` is legal in bash whether or not
+            // anything ever opened fd 3, and a script that closes
+            // defensively should not have to check first.
+            ExtraFd::Close(fd) => unsafe {
+                close(fd);
+            },
         }
     }
     Ok(())
@@ -11420,10 +11477,10 @@ fn apply_fd_redirects(command: &mut Command, dup_stderr_to_stdout: bool, extra_f
                         }
                         clear_cloexec(*fd);
                     }
+                    // See the same arm in apply_fds_to_self: closing a
+                    // descriptor nothing opened is a no-op.
                     ExtraFd::Close(fd) => {
-                        if close(*fd) == -1 {
-                            return Err(std::io::Error::last_os_error());
-                        }
+                        close(*fd);
                     }
                 }
             }

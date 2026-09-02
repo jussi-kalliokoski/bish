@@ -342,6 +342,14 @@ y
         case("source-takes-arguments", "printf 'echo \"[$1][$#]\"\\n' > s.sh; set -- outer; . ./s.sh a b; echo \"after=[$1]\""),
         case("xtrace-traces-assignments", r#"PS4='XX '; set -x; x=1; y="a b"; a=(1 2)"#),
         case("true-and-false-are-builtins", r#"type -t true; type -t false; true; echo "rc=$?"; false; echo "rc=$?""#),
+        // -- roadmap 21: the redirects that were syntax errors ---------
+        case("stderr-to-a-saved-fd", r#"exec 3>&1; echo a 2>&3; exec 3>&-; echo b 3>&1 >&2 2>&3 3>&-"#),
+        case("close-an-unopened-fd", r#"{ echo a; } 3>&-; echo b 4>&-"#),
+        case("dup-to-a-word-fd", r#"exec 3>&1; f=3; echo hi >&$f; echo two >&$((1+2)); exec 3>&-"#),
+        case("dup-to-a-closed-fd", r#"echo x >&9; echo "rc=$?""#),
+        case("coproc-round-trip", r#"coproc CP { cat; }; echo hi >&"${CP[1]}"; sleep 0.2; read -r l <&"${CP[0]}"; echo "back=[$l]""#),
+        // -- roadmap 20: a lone bracket is not a pattern ---------------
+        case("lone-bracket-is-literal", r#"printf '%s,' [ ] '[abc'; echo; [ 1 -lt 2 ] && echo test-works"#),
     ];
 
     // Cases bish does not match today, each with why. Asserted to
@@ -356,12 +364,25 @@ y
         // skip_terminators, which every construct's list parsing goes
         // through, and is not worth the blast radius on its own.
         ("empty-command-between-separators", "`;` twice in a row is skipped rather than reported"),
-        // Both are the pipeline architecture's residue: a stage that is
-        // a builtin, function or compound command re-execs (see roadmap
-        // 13), and a re-exec carries neither an fd table nor a job
-        // table across.
-        ("coproc-fds", "a coproc's `${NAME[0]}`/`[1]` descriptors are not wired to the co-process, so writing one and reading the other deadlocks"),
+        // The pipeline architecture's residue: a stage that is a
+        // builtin, function or compound command re-execs (see roadmap
+        // 13), and a re-exec carries no job table across. (The coproc
+        // entry that used to sit here was not this at all -- the
+        // descriptors were fine, `>&$word` was being dropped. See
+        // roadmap 21.)
         ("jobs-in-a-pipeline", "`jobs` as a pipeline stage runs in a child with an empty job table"),
+        // Pre-existing, and named now that the redirect simulation made
+        // the rest of the list exact: `>&2` means "the enclosing
+        // stderr", and OutputSink::Builtin's two booleans can only say
+        // "this sink's other stream, else the enclosing one" -- a
+        // different thing once the same command also redirects fd 2.
+        // Expressing it wants the sink's stdout/stderr fields to hold a
+        // small enum (a file, or the enclosing out/err) rather than a
+        // file plus two flags.
+        (
+            "dup-to-stderr-that-is-itself-redirected",
+            "`echo e >&2 2>/dev/null` writes to /dev/null; bash writes to the stderr `>&2` named, which is the one from before this command",
+        ),
     ];
 
     // The cases the divergence list is about. Kept apart from `CASES`
@@ -372,10 +393,8 @@ y
         // -- roadmap 10: parser leniency, the part still standing -----
         case("empty-command-between-separators", "echo a; ; echo b"),
         // -- the pipeline architecture's residue ----------------------
-        // This one *deadlocks* in bish, which is why the harness above
-        // has a timeout.
-        case("coproc-fds", r#"coproc CP { read line; echo "got $line"; }; echo hi >&"${CP[1]}"; read -r out <&"${CP[0]}"; echo "$out""#),
         case("jobs-in-a-pipeline", r#"sleep 0.2 & jobs -p | grep -cE '^[0-9]+$'"#),
+        case("dup-to-stderr-that-is-itself-redirected", r#"echo e >&2 2>/dev/null; echo done"#),
     ];
 
     // `target/<profile>/bish`, worked out from the test binary's own

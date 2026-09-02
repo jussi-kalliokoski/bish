@@ -632,6 +632,15 @@ impl<'a> Lexer<'a> {
                         self.advance(); // '&'
                         self.advance(); // '1'
                         push_tok!(Tok::DupErrToOut);
+                    } else if self.chars.peek().copied() == Some('&') {
+                        // `2>&3`, `2>&$fd`, `2>&-`. This arm matches
+                        // before the general numbered-fd path below, so
+                        // anything it does not handle itself never
+                        // reaches that path -- and everything but `&1`
+                        // used to fall through to `RedirErr`, leaving
+                        // the `&` for the parser to trip over.
+                        self.advance(); // '&'
+                        push_tok!(self.lex_dup_target(2));
                     } else {
                         let append = self.chars.peek().copied() == Some('>');
                         if append {
@@ -645,8 +654,8 @@ impl<'a> Lexer<'a> {
                     }
                 }
                 // Any other explicit fd number (0,1,3-9,...; also covers
-                // `2<`/`2>&M` for M != 1, which the fd=2 fast path above
-                // doesn't handle) immediately followed by `>`/`<` with no
+                // `2<`, which the fd=2 fast path above doesn't handle)
+                // immediately followed by `>`/`<` with no
                 // intervening whitespace -- e.g. `3>file`, `4<&0`. A digit
                 // with no immediately-following `>`/`<` (an ordinary
                 // numeric word, or a redirect target's own value) isn't
@@ -1894,6 +1903,10 @@ pub fn tokenize_spanned(src: &str) -> SpannedResult {
                     lexer.advance(); // '&'
                     lexer.advance(); // '1'
                     items.push(SpannedItem::Tok(Tok::DupErrToOut, start..lexer.pos));
+                } else if lexer.chars.peek().copied() == Some('&') {
+                    lexer.advance(); // '&'
+                    let tok = lexer.lex_dup_target(2);
+                    items.push(SpannedItem::Tok(tok, start..lexer.pos));
                 } else {
                     let append = lexer.chars.peek().copied() == Some('>');
                     if append {
