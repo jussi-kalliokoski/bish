@@ -602,6 +602,41 @@ pub(crate) fn delete_lines(buf: &mut TextBuffer, registers: &mut Registers, coun
     buf.delete_range(&range);
 }
 
+// `cc`/`S`: the lines' *text* goes, the first line itself stays.
+//
+// Not `delete_lines` followed by an insert, which is what this used to
+// be: removing the line outright leaves the cursor at the start of the
+// line that follows, so `ccZ` on `  abc\ndef` typed `Z` onto `def` and
+// produced `Zdef` -- one line where vim has two. vim's `cc` empties the
+// line and leaves it in place, and the register still gets the lines
+// linewise, exactly as `dd` would have recorded them.
+//
+// The cursor lands past the reconstructed indent rather than at column
+// zero, the same rule `o`/`O` follow here (`autoindent_for`), which is
+// where this differs from `vim -u NONE` -- see the editor corpus's own
+// `cc-keeps-the-indent` divergence.
+pub(crate) fn change_lines(buf: &mut TextBuffer, registers: &mut Registers, count: Option<usize>, register: Option<char>) {
+    let count = count.unwrap_or(1).max(1);
+    let text = motion::whole_lines(buf, count);
+    registers.record_delete(register, RegisterValue { text, shape: RegisterShape::Line });
+    let (row, _) = buf.cursor();
+    let last = (row + count - 1).min(buf.line_count().saturating_sub(1));
+    let indent = autoindent_for(buf, row);
+    // Everything from the start of the first line to the end of the
+    // last, as an inclusive character range: that empties the lines and
+    // joins what is left of them into one, rather than removing any.
+    let end_col = buf.line_len(last);
+    if end_col > 0 || last > row {
+        let to = if end_col > 0 { (last, end_col - 1) } else { (last, 0) };
+        buf.delete_range(&motion::MotionRange { shape: motion::MotionShape::Inclusive, from: (row, 0), to });
+    }
+    buf.set_cursor(row, 0);
+    if !indent.is_empty() {
+        buf.insert_text((row, 0), &indent);
+        buf.set_cursor(row, indent.chars().count());
+    }
+}
+
 // `>{motion}`/`>>`/Visual `>`'s own shared row-range primitive: prepends
 // The selection between two caret positions, as the `Inclusive` range
 // the rest of this editor already understands -- so an Insert-mode
@@ -4656,6 +4691,41 @@ mod macro_tests {
 
     // Plain autoindent: copy, never guess. `smartindent` is what opens a
     // level after `{`, and it is deliberately not this.
+    // `cc` empties the line; it does not remove it. Deleting the line
+    // outright put the insert at the start of the *next* line, so
+    // `ccZ` on `abc\ndef` produced `Zdef` -- one line where vim has two.
+    #[test]
+    fn change_lines_empties_the_lines_and_leaves_one_behind() {
+        let mut registers = Registers::new_for_test();
+        let mut buf = TextBuffer::new_unnamed(10);
+        buf.insert_text((0, 0), "abc\ndef");
+        buf.set_cursor(0, 0);
+        change_lines(&mut buf, &mut registers, None, None);
+        assert_eq!(text_of(&buf), "\ndef");
+        assert_eq!(buf.cursor(), (0, 0));
+
+        // A count covers that many lines and still leaves one.
+        let mut buf = TextBuffer::new_unnamed(10);
+        buf.insert_text((0, 0), "a\nb\nc");
+        buf.set_cursor(0, 0);
+        change_lines(&mut buf, &mut registers, Some(2), None);
+        assert_eq!(text_of(&buf), "\nc");
+
+        // The register gets the lines linewise, exactly as `dd` records
+        // them -- so `cc` then `p` puts a line back.
+        let recorded = registers.read(None);
+        assert_eq!((recorded.text.as_str(), recorded.shape), ("a\nb\n", RegisterShape::Line));
+
+        // The cursor lands past the indent that was reconstructed, the
+        // same rule `o`/`O` follow here.
+        let mut buf = TextBuffer::new_unnamed(10);
+        buf.insert_text((0, 0), "    abc\ndef");
+        buf.set_cursor(0, 0);
+        change_lines(&mut buf, &mut registers, None, None);
+        assert_eq!(text_of(&buf), "    \ndef");
+        assert_eq!(buf.cursor(), (0, 4));
+    }
+
     #[test]
     fn autoindent_copies_the_lines_own_leading_whitespace() {
         let mut buf = TextBuffer::new_unnamed(10);

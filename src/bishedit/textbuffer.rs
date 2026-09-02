@@ -200,6 +200,19 @@ pub struct TextBuffer {
     /// was loaded, so a file without one keeps not having one -- and
     /// overridden by `fixendofline`/`insert_final_newline`.
     pub final_newline: bool,
+    /// Whether this buffer holds *no lines* -- as opposed to holding one
+    /// line that happens to be empty, which is a different thing and
+    /// writes differently.
+    ///
+    /// A buffer always keeps at least one line so there is somewhere to
+    /// put the cursor, which makes those two states look identical in
+    /// `lines`. They are not: a file of one empty line is one byte, and
+    /// a file of no lines is zero, and vim keeps the same distinction
+    /// (its `ML_EMPTY`) for the same reason. Set by loading an empty
+    /// file or by deleting the last line, cleared by inserting anything
+    /// -- so `dd` on a one-line file writes an empty file, while typing
+    /// a character and deleting it again writes the newline back.
+    pub empty: bool,
     /// The line ending this file is written back with. Detected on load,
     /// so opening and saving a CRLF file leaves it a CRLF file.
     pub eol: crate::editorconfig::Eol,
@@ -305,6 +318,7 @@ impl TextBuffer {
             tabstop: crate::bishedit::vimkeys::INDENT_WIDTH,
             trim_trailing_whitespace: false,
             final_newline: true,
+            empty: false,
             eol: crate::editorconfig::Eol::Lf,
             vtop_sub: 0,
             snippet_holes: Vec::new(),
@@ -410,6 +424,11 @@ impl TextBuffer {
         // doesn't show up as a phantom trailing empty line; *whether* it
         // was there is remembered instead, so a file without one keeps
         // not having one.
+        //
+        // An empty file counts as having one, which matters only once
+        // it stops being empty: what an untouched empty file writes
+        // back as is decided by `empty`, not here, and typing into one
+        // should leave a newline at the end the way a new file does.
         let final_newline = normalized.is_empty() || normalized.ends_with('\n');
         let text = normalized.strip_suffix('\n').unwrap_or(&normalized);
         let lines: Vec<Vec<char>> = text.split('\n').map(|l| l.chars().collect()).collect();
@@ -433,6 +452,7 @@ impl TextBuffer {
             mouse: true,
             eol,
             final_newline,
+            empty: normalized.is_empty(),
             expandtab: true,
             shiftwidth: crate::bishedit::vimkeys::INDENT_WIDTH,
             tabstop: crate::bishedit::vimkeys::INDENT_WIDTH,
@@ -609,6 +629,11 @@ impl TextBuffer {
                 }
             }
         }
+        // No lines means no bytes -- not one empty line's worth of
+        // newline. See `empty`'s own doc comment.
+        if self.empty {
+            return String::new();
+        }
         let mut out = lines.join(self.eol.text());
         if self.final_newline {
             out.push_str(self.eol.text());
@@ -663,6 +688,8 @@ impl TextBuffer {
         if text.is_empty() {
             return at;
         }
+        // There is content now, so the placeholder line is a real line.
+        self.empty = false;
         let row = at.0.min(self.lines.len().saturating_sub(1));
         let parts: Vec<&str> = text.split('\n').collect();
         let line = std::mem::take(&mut self.lines[row]);
@@ -724,6 +751,13 @@ impl TextBuffer {
             motion::MotionShape::Linewise => {
                 self.lines.drain(range.from.0..=range.to.0);
                 if self.lines.is_empty() {
+                    // No lines left at all. The placeholder below is
+                    // somewhere to keep the cursor, not content -- see
+                    // `empty`'s own doc comment. Only a *linewise*
+                    // delete can do this: `x`-ing the last character of
+                    // a line leaves a line that is empty, which still
+                    // writes its newline.
+                    self.empty = true;
                     self.lines.push(Vec::new());
                 }
                 let row = range.from.0.min(self.lines.len() - 1);
@@ -1080,6 +1114,7 @@ mod tests {
             tabstop: crate::bishedit::vimkeys::INDENT_WIDTH,
             trim_trailing_whitespace: false,
             final_newline: true,
+            empty: false,
             eol: crate::editorconfig::Eol::Lf,
             vtop_sub: 0,
             snippet_holes: Vec::new(),
@@ -1603,6 +1638,40 @@ mod tests {
         assert_eq!(buf.line_count(), 2, "the \\r is not a character in the buffer");
         assert_eq!(buf.text(), "one\ntwo\n", "everything above this reads LF");
         assert_eq!(buf.on_disk_text(), "one\r\ntwo\r\n");
+    }
+
+    // A file of no lines and a file of one empty line are different
+    // files -- zero bytes and one -- and a buffer that always keeps a
+    // line to put the cursor on cannot tell them apart from `lines`
+    // alone. See `empty`'s own doc comment.
+    #[test]
+    fn an_empty_file_stays_empty_and_only_a_linewise_delete_empties_one() {
+        let path = Path::new("/tmp/x");
+        // Opened and saved untouched: still zero bytes, not a newline
+        // that nobody typed.
+        let buf = TextBuffer::from_text(path, "", 10);
+        assert!(buf.empty);
+        assert_eq!(buf.on_disk_text(), "");
+
+        // Typing into it makes it a real line again.
+        let mut buf = TextBuffer::from_text(path, "", 10);
+        buf.insert_text((0, 0), "hi");
+        assert!(!buf.empty);
+        assert_eq!(buf.on_disk_text(), "hi\n");
+
+        // Deleting every line leaves no lines, which writes nothing.
+        let mut buf = TextBuffer::from_text(path, "a\nb\n", 10);
+        assert!(!buf.empty);
+        buf.delete_range(&motion::MotionRange { shape: motion::MotionShape::Linewise, from: (0, 0), to: (1, 0) });
+        assert!(buf.empty);
+        assert_eq!(buf.on_disk_text(), "");
+
+        // Emptying the only line is not the same thing: the line is
+        // still there, and still ends in a newline.
+        let mut buf = TextBuffer::from_text(path, "a\n", 10);
+        buf.delete_range(&motion::MotionRange { shape: motion::MotionShape::Inclusive, from: (0, 0), to: (0, 0) });
+        assert!(!buf.empty);
+        assert_eq!(buf.on_disk_text(), "\n");
     }
 
     #[test]

@@ -1668,6 +1668,7 @@ fn handle_command_mode(
         | CommandModeOutcome::Cancelled
         | CommandModeOutcome::Ran { .. }
         | CommandModeOutcome::Symbols(_)
+        | CommandModeOutcome::RunNormal(_)
         | CommandModeOutcome::NoHighlight => {
             if app.sinks_are_grid {
                 // No window action, but command mode may still have
@@ -2837,10 +2838,13 @@ fn run_browse_frame(
                 CommandModeOutcome::Ran { output, .. } if !output.trim().is_empty() => {
                     browser.set_message(output.trim().replace('\n', " "));
                 }
+                // `:normal` has no Normal mode to run in from the
+                // browser -- there is no buffer here to run it against.
                 CommandModeOutcome::Ran { .. }
                 | CommandModeOutcome::Cancelled
                 | CommandModeOutcome::Action(_)
                 | CommandModeOutcome::Symbols(_)
+                | CommandModeOutcome::RunNormal(_)
                 | CommandModeOutcome::NoHighlight => {}
             }
             // The colon line drew over the global status row and
@@ -6942,7 +6946,17 @@ fn run_normal_mode_navigation(
                 render_nav_frame(&mut buf, &vk, rect, app.term_rows, app.term_cols, color_overrides.as_ref());
                 continue;
             }
-            Key::Char('Z') => {
+            // `is_idle()`, like every other command intercepted ahead of
+            // `feed()` here -- and this one needs it twice over. Without
+            // the guard a `Z` typed while something is pending is stolen
+            // from whatever was waiting for it, and then this arm reads
+            // *another* key and drops that too when it isn't a second
+            // `Z`: `rZ` lost both the `Z` and the key after it, and the
+            // replace never happened. Counts are discarded in front of
+            // `ZZ` the same way they are in front of `S` and `q`, which
+            // is what `is_idle` (rather than `is_idle_except_count`)
+            // says.
+            Key::Char('Z') if vk.is_idle() => {
                 let k2 = vk.next_key(|| {
                     editor::read_key_idle(&mut || {
                         service_background_jobs(app);
@@ -7032,7 +7046,13 @@ fn run_normal_mode_navigation(
             // command_mode's own `editing` parameter doc comment) -- the
             // *same* call either way, not a separate file-command parser
             // pre-empting it.
-            Key::Char(':') => {
+            // Ahead of `feed()` like the rest, so it needs the same
+            // gate -- `r:` and `f:` are ordinary things to type and both
+            // lost their `:` to this arm. `is_idle_except_count` rather
+            // than `is_idle` because a count in front of `:` is already
+            // dropped here rather than refused, and gating on `is_idle`
+            // would newly swallow the `:` as well.
+            Key::Char(':') if vk.is_idle_except_count() => {
                 let outcome = handle_command_mode(
                     app,
                     session_id,
@@ -7087,6 +7107,17 @@ fn run_normal_mode_navigation(
                     // doesn't carry the original text over).
                     CommandModeOutcome::Action(_) => {
                         return Ok((NavExit::Detached, nav_buffer_into_edit_state(buf, vk)));
+                    }
+                    // `:normal {keys}` -- queued rather than interpreted
+                    // here, so they arrive at this loop's own reads as
+                    // ordinary keystrokes and go through exactly the
+                    // path a person typing them would. Each character is
+                    // itself: `:normal` takes literal keys, so there is
+                    // no `<Esc>`-style notation to parse.
+                    CommandModeOutcome::RunNormal(keys) => {
+                        vk.queue_keys(keys.chars().map(Key::Char));
+                        render_nav_frame(&mut buf, &vk, rect, app.term_rows, app.term_cols, color_overrides.as_ref());
+                        continue;
                     }
                     // Back to normal mode too, per this session's own
                     // "go back to the original mode with the last output
@@ -7547,6 +7578,14 @@ fn run_normal_mode_navigation(
                 }
                 render_nav_frame(&mut buf, &vk, rect, app.term_rows, app.term_cols, color_overrides.as_ref());
             }
+            KeyOutcome::SwapVisualEnds => {
+                if let Some((_, anchor)) = vk.visual_anchor() {
+                    let cursor = buf.cursor();
+                    buf.set_cursor(anchor.0, anchor.1);
+                    vk.set_visual_anchor(cursor);
+                }
+                render_nav_frame(&mut buf, &vk, rect, app.term_rows, app.term_cols, color_overrides.as_ref());
+            }
             // `Ctrl-O`/`Ctrl-I`. Cross-file, because vim's are: the
             // list lives on the pane (see `JumpList`) rather than in
             // this buffer's `VimKeys`, so a `gd` into another file is
@@ -7704,7 +7743,7 @@ fn run_normal_mode_navigation(
                     match op {
                         Op::Delete => fileeditor::delete_lines(tb, &mut app.registers, count, register),
                         Op::Change => {
-                            fileeditor::delete_lines(tb, &mut app.registers, count, register);
+                            fileeditor::change_lines(tb, &mut app.registers, count, register);
                             let (insert_term_rows, insert_term_cols) = (app.term_rows, app.term_cols);
                             let insert_abbrs = app.sessions[&session_id].shell.abbrs.clone();
                             app.with_registers(|app, registers| {
@@ -10430,6 +10469,12 @@ enum CommandModeOutcome {
     // the flag lives on `VimKeys`, which command mode does not have and
     // the Normal-mode loop that owns the search does.
     NoHighlight,
+    // `:normal {keys}` -- run `keys` as if they had been typed in
+    // Normal mode.
+    //
+    // Handed back for the same reason `NoHighlight` is: the keys go
+    // through `VimKeys`, which command mode does not have.
+    RunNormal(String),
     // `:sym QUERY` -- ask the language server for matching symbols
     // across the whole project. Handed back rather than done here
     // because the answer goes into the locations pane, and command mode
@@ -10723,6 +10768,27 @@ fn run_command_mode(
                                     status: 0,
                                 });
                                 return CommandModeOutcome::Ran { output, status: 0 };
+                            }
+                            Err(e) => {
+                                show_command_mode_error(&format!("bish: {e}"), app.term_rows, app.term_cols);
+                                buffer.clear();
+                                continue;
+                            }
+                        }
+                    }
+
+                    if let Some(cmd) = parse_line_command(&trimmed) {
+                        if let LineCommand::Normal(keys) = cmd {
+                            return CommandModeOutcome::RunNormal(keys);
+                        }
+                        match run_line_command(tb, &cmd) {
+                            Ok(()) => {
+                                app.sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry {
+                                    command: trimmed,
+                                    output: String::new(),
+                                    status: 0,
+                                });
+                                return CommandModeOutcome::Ran { output: String::new(), status: 0 };
                             }
                             Err(e) => {
                                 show_command_mode_error(&format!("bish: {e}"), app.term_rows, app.term_cols);
@@ -11962,6 +12028,134 @@ fn parse_one_line_ref(chars: &[char], i: &mut usize) -> Option<LineRef> {
 // doesn't support `'<,'>` (visual-mode marks), `;` (range separator that
 // also moves the cursor), or relative `+N`/`-N` offsets -- see plan.md's
 // own note on this feature's scope.
+/// The ex commands that are a line range and a letter: `:{n}` on its
+/// own, `:{range}d`, `:{range}m{dest}`, plus `:normal`, which is not one
+/// of those but is parsed here because it is the other command whose
+/// name runs straight into its argument.
+#[derive(Debug, Clone, PartialEq)]
+enum LineCommand {
+    /// `:5` -- a bare address is "go there", vim's oldest command.
+    Goto(LineRef),
+    Delete {
+        from: LineRef,
+        to: LineRef,
+    },
+    /// `dest` is a 1-indexed line number to move *after*, so 0 means
+    /// "to the very top" -- vim's `:m0`. Deliberately not a row: `:m0`
+    /// and `:m1` are different destinations, and every 0-indexed row
+    /// would have to represent both.
+    Move {
+        from: LineRef,
+        to: LineRef,
+        dest: LineRef,
+    },
+    Normal(String),
+}
+
+/// `None` when `trimmed` is not one of these at all, so the ordinary
+/// dispatch still sees `w`, `set`, `diag` and the rest unchanged. The
+/// same shape `parse_substitute_command` uses, and for the same reason:
+/// these commands run their name into their argument with no space, so
+/// the `split_once(' ')` dispatch cannot see them.
+fn parse_line_command(trimmed: &str) -> Option<LineCommand> {
+    if let Some(rest) = trimmed.strip_prefix("normal ").or_else(|| trimmed.strip_prefix("norm ")) {
+        return Some(LineCommand::Normal(rest.to_string()));
+    }
+    let chars: Vec<char> = trimmed.chars().collect();
+    let mut i = 0;
+    let range = parse_range_prefix(&chars, &mut i);
+    match (chars.get(i), range) {
+        // A range and nothing after it: go to its last line. `:` alone
+        // is not this -- `parse_range_prefix` found no address at all.
+        (None, Some((_, to))) => Some(LineCommand::Goto(to)),
+        (Some('d'), Some((from, to))) if i + 1 == chars.len() => Some(LineCommand::Delete { from, to }),
+        (Some('m'), Some((from, to))) => {
+            let mut j = i + 1;
+            let dest = parse_one_line_ref(&chars, &mut j)?;
+            (j == chars.len()).then_some(LineCommand::Move { from, to, dest })
+        }
+        _ => None,
+    }
+}
+
+/// Runs everything `parse_line_command` produces except `Normal`, which
+/// needs the Normal-mode loop's own `VimKeys` and is handed back to it.
+fn run_line_command(tb: &mut TextBuffer, cmd: &LineCommand) -> Result<(), String> {
+    let last = tb.line_count().saturating_sub(1);
+    let current = tb.cursor().0;
+    match *cmd {
+        LineCommand::Goto(to) => {
+            let row = to.resolve(current, last);
+            tb.set_cursor(row, 0);
+            let col = crate::bishedit::motion::first_non_blank(tb, row);
+            tb.set_cursor(row, col);
+            Ok(())
+        }
+        LineCommand::Delete { from, to } => {
+            let (a, b) = ordered(from, to, current, last);
+            tb.set_cursor(a, 0);
+            tb.delete_range(&crate::bishedit::motion::MotionRange {
+                shape: crate::bishedit::motion::MotionShape::Linewise,
+                from: (a, 0),
+                to: (b, 0),
+            });
+            Ok(())
+        }
+        LineCommand::Move { from, to, dest } => {
+            let (a, b) = ordered(from, to, current, last);
+            // 1-indexed, and 0 is a real answer meaning "the top".
+            let dest = match dest {
+                LineRef::Current => current + 1,
+                LineRef::Last => last + 1,
+                LineRef::Number(n) => n.min(last + 1),
+            };
+            if dest > a && dest <= b + 1 {
+                return Err("E134: Cannot move a range of lines into itself".to_string());
+            }
+            let text = crate::bishedit::motion::extract_text(
+                &*tb,
+                &crate::bishedit::motion::MotionRange { shape: crate::bishedit::motion::MotionShape::Linewise, from: (a, 0), to: (b, 0) },
+            );
+            tb.delete_range(&crate::bishedit::motion::MotionRange {
+                shape: crate::bishedit::motion::MotionShape::Linewise,
+                from: (a, 0),
+                to: (b, 0),
+            });
+            // The destination counts lines that are no longer there once
+            // the block has been lifted out, so a destination below the
+            // block shifts up by its height.
+            let height = b - a + 1;
+            let row = if dest > b + 1 { dest - height } else { dest };
+            let text = text.strip_suffix('\n').unwrap_or(&text).to_string();
+            tb.set_cursor(row.min(tb.line_count()), 0);
+            insert_lines_at(tb, row, &text);
+            Ok(())
+        }
+        LineCommand::Normal(_) => Ok(()),
+    }
+}
+
+/// Both ends of a range as 0-indexed rows, smaller first.
+fn ordered(from: LineRef, to: LineRef, current: usize, last: usize) -> (usize, usize) {
+    let a = from.resolve(current, last);
+    let b = to.resolve(current, last);
+    if a <= b { (a, b) } else { (b, a) }
+}
+
+/// Splices `text` in as whole lines starting at row `at`, which may be
+/// one past the last line (appending at the end).
+fn insert_lines_at(tb: &mut TextBuffer, at: usize, text: &str) {
+    let count = tb.line_count();
+    if at >= count {
+        let end = count.saturating_sub(1);
+        tb.set_cursor(end, tb.line_len(end));
+        tb.insert_text((end, tb.line_len(end)), &format!("\n{text}"));
+    } else {
+        tb.insert_text((at, 0), &format!("{text}\n"));
+    }
+    tb.set_cursor(at.min(tb.line_count().saturating_sub(1)), 0);
+}
+
 fn parse_range_prefix(chars: &[char], i: &mut usize) -> Option<(LineRef, LineRef)> {
     if chars.get(*i) == Some(&'%') {
         *i += 1;
@@ -13241,6 +13435,73 @@ mod substitute_command_tests {
         assert!(parse_substitute_command("set foo").is_none());
         assert!(parse_substitute_command("sort").is_none());
         assert!(parse_substitute_command("w").is_none());
+    }
+
+    #[test]
+    fn parse_line_command_recognizes_an_address_a_delete_a_move_and_normal() {
+        use LineCommand::*;
+        assert_eq!(parse_line_command("2"), Some(Goto(LineRef::Number(2))));
+        assert_eq!(parse_line_command("$"), Some(Goto(LineRef::Last)));
+        assert_eq!(parse_line_command("2d"), Some(Delete { from: LineRef::Number(2), to: LineRef::Number(2) }));
+        assert_eq!(parse_line_command("2,4d"), Some(Delete { from: LineRef::Number(2), to: LineRef::Number(4) }));
+        assert_eq!(parse_line_command("%d"), Some(Delete { from: LineRef::Number(1), to: LineRef::Last }));
+        assert_eq!(parse_line_command("1m$"), Some(Move { from: LineRef::Number(1), to: LineRef::Number(1), dest: LineRef::Last }));
+        assert_eq!(parse_line_command("1,2m0"), Some(Move { from: LineRef::Number(1), to: LineRef::Number(2), dest: LineRef::Number(0) }));
+        assert_eq!(parse_line_command("normal dd"), Some(Normal("dd".to_string())));
+        assert_eq!(parse_line_command("norm x"), Some(Normal("x".to_string())));
+
+        // Everything else still belongs to the ordinary dispatch, which
+        // only ever sees it if this says no.
+        for other in ["w", "wq", "q!", "set number", "diag", "d", "2dd", "2x", "1m", "normal"] {
+            assert_eq!(parse_line_command(other), None, "{other:?}");
+        }
+    }
+
+    fn buffer_of(text: &str) -> TextBuffer {
+        let mut buf = TextBuffer::new_unnamed(10);
+        buf.insert_text((0, 0), text);
+        buf.set_cursor(0, 0);
+        buf
+    }
+
+    fn lines_of(buf: &TextBuffer) -> String {
+        (0..buf.line_count()).map(|l| buf.line_chars(l).into_iter().collect::<String>()).collect::<Vec<_>>().join("\n")
+    }
+
+    #[test]
+    fn run_line_command_goes_to_a_line_deletes_a_range_and_moves_one() {
+        let mut buf = buffer_of("a\nb\nc");
+        run_line_command(&mut buf, &LineCommand::Goto(LineRef::Number(2))).unwrap();
+        assert_eq!(buf.cursor(), (1, 0));
+        // A bare address lands on the first non-blank, not column zero.
+        let mut buf = buffer_of("a\n    b");
+        run_line_command(&mut buf, &LineCommand::Goto(LineRef::Last)).unwrap();
+        assert_eq!(buf.cursor(), (1, 4));
+
+        let mut buf = buffer_of("a\nb\nc\nd");
+        run_line_command(&mut buf, &LineCommand::Delete { from: LineRef::Number(2), to: LineRef::Number(3) }).unwrap();
+        assert_eq!(lines_of(&buf), "a\nd");
+
+        // `:1m$` -- to the very end.
+        let mut buf = buffer_of("one\ntwo");
+        run_line_command(&mut buf, &LineCommand::Move { from: LineRef::Number(1), to: LineRef::Number(1), dest: LineRef::Last }).unwrap();
+        assert_eq!(lines_of(&buf), "two\none");
+
+        // `:3m0` -- "after line zero" is the top, which is why the
+        // destination is a line number and not a row.
+        let mut buf = buffer_of("one\ntwo\nthree");
+        run_line_command(&mut buf, &LineCommand::Move { from: LineRef::Number(3), to: LineRef::Number(3), dest: LineRef::Number(0) }).unwrap();
+        assert_eq!(lines_of(&buf), "three\none\ntwo");
+
+        // A range moved past itself, and the same range moved into
+        // itself, which vim refuses.
+        let mut buf = buffer_of("a\nb\nc\nd");
+        run_line_command(&mut buf, &LineCommand::Move { from: LineRef::Number(1), to: LineRef::Number(2), dest: LineRef::Last }).unwrap();
+        assert_eq!(lines_of(&buf), "c\nd\na\nb");
+        let mut buf = buffer_of("a\nb\nc");
+        let into_itself = LineCommand::Move { from: LineRef::Number(1), to: LineRef::Number(2), dest: LineRef::Number(1) };
+        assert!(run_line_command(&mut buf, &into_itself).is_err());
+        assert_eq!(lines_of(&buf), "a\nb\nc", "and the buffer is left alone");
     }
 
     #[test]

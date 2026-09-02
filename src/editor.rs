@@ -2620,6 +2620,13 @@ fn run_line_normal_mode(
                             vk.begin_visual(shape, anchor);
                         }
                     }
+                    KeyOutcome::SwapVisualEnds => {
+                        if let Some((_, anchor)) = vk.visual_anchor() {
+                            let cursor = lb.cursor();
+                            lb.set_cursor(anchor.0, anchor.1);
+                            vk.set_visual_anchor(cursor);
+                        }
+                    }
                     // See the note on the other arm in this file:
                     // nothing to ask, and nowhere to go.
                     KeyOutcome::GotoDefinition(_) | KeyOutcome::GotoReferences | KeyOutcome::DocumentSymbols | KeyOutcome::CodeActions => {}
@@ -3402,6 +3409,7 @@ fn run_one_shot_normal_command(
                     KeyOutcome::Window(..)
                     | KeyOutcome::EnterVisual(_)
                     | KeyOutcome::ReselectVisual
+                    | KeyOutcome::SwapVisualEnds
                     | KeyOutcome::Join { .. }
                     | KeyOutcome::OpenLine { .. }
                     | KeyOutcome::Jump { .. }

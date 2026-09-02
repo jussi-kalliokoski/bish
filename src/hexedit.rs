@@ -1338,6 +1338,13 @@ impl HexSession {
                     self.mode = Mode::Visual;
                 }
             }
+            KeyOutcome::SwapVisualEnds => {
+                if let Some((_, anchor)) = self.vk.visual_anchor() {
+                    let cursor = self.buf.cursor();
+                    self.buf.set_cursor(anchor.0, anchor.1);
+                    self.vk.set_visual_anchor(cursor);
+                }
+            }
             KeyOutcome::Jump { forward } => {
                 let here = self.buf.cursor();
                 let target = if forward { self.vk.jump_forward(here) } else { self.vk.jump_back(here) };

@@ -491,6 +491,13 @@ impl PauseState {
                     self.vk.begin_visual(shape, anchor);
                 }
             }
+            KeyOutcome::SwapVisualEnds => {
+                if let Some((_, anchor)) = self.vk.visual_anchor() {
+                    let cursor = self.nav_buf.cursor();
+                    self.nav_buf.set_cursor(anchor.0, anchor.1);
+                    self.vk.set_visual_anchor(cursor);
+                }
+            }
             KeyOutcome::Jump { forward } => {
                 let current = self.nav_buf.cursor();
                 let target = if forward { self.vk.jump_forward(current) } else { self.vk.jump_back(current) };

@@ -188,7 +188,7 @@ fn last_col(buf: &impl Buffer, line: usize) -> usize {
     grapheme::prev_boundary(&chars, len)
 }
 
-fn first_non_blank(buf: &impl Buffer, line: usize) -> usize {
+pub fn first_non_blank(buf: &impl Buffer, line: usize) -> usize {
     for col in 0..buf.line_len(line) {
         if let Some(c) = buf.char_at(line, col) {
             if !c.is_whitespace() {
@@ -403,6 +403,21 @@ fn find_char_forward_once(buf: &impl Buffer, line: usize, from_col: usize, ch: c
 
 fn find_char_backward_once(buf: &impl Buffer, line: usize, from_col: usize, ch: char) -> Option<usize> {
     (0..from_col).rev().find(|&c| buf.char_at(line, c) == Some(ch))
+}
+
+/// Where `f`/`F`/`t`/`T` would put the cursor, or `None` if there is no
+/// `n`th `ch` to find in that direction.
+///
+/// Separate from `apply_motion` because `motion_range` has to know
+/// whether the find *succeeded*, which is not the same question as
+/// whether the cursor ended up somewhere new -- see its own note on
+/// `dt,`.
+fn find_char_landing(buf: &impl Buffer, line: usize, col: usize, ch: char, till: bool, forward: bool, n: usize) -> Option<usize> {
+    let mut c = col;
+    for _ in 0..n {
+        c = if forward { find_char_forward_once(buf, line, c, ch)? } else { find_char_backward_once(buf, line, c, ch)? };
+    }
+    Some(if till { if forward { c.saturating_sub(1) } else { c + 1 } } else { c })
 }
 
 fn is_sentence_end_punct(c: char) -> bool {
@@ -1505,23 +1520,7 @@ pub fn apply_motion(buf: &mut impl Buffer, motion: Motion, count: Option<usize>)
         }
         Motion::FindChar { ch, till, forward } => {
             let (line, col) = buf.cursor();
-            let mut cur = col;
-            let mut found = None;
-            for _ in 0..n {
-                let next = if forward { find_char_forward_once(buf, line, cur, ch) } else { find_char_backward_once(buf, line, cur, ch) };
-                match next {
-                    Some(c) => {
-                        cur = c;
-                        found = Some(c);
-                    }
-                    None => {
-                        found = None;
-                        break;
-                    }
-                }
-            }
-            if let Some(c) = found {
-                let target = if till { if forward { c.saturating_sub(1) } else { c + 1 } } else { c };
+            if let Some(target) = find_char_landing(buf, line, col, ch, till, forward, n) {
                 buf.set_cursor(line, target);
             }
         }
@@ -2014,7 +2013,22 @@ pub fn motion_range(buf: &mut impl Buffer, motion: Motion, count: Option<usize>)
     }
     let shape = motion_shape(&motion)?;
     // Checked before the move, since `apply_motion` consumes it.
-    let cannot_fail = matches!(motion, Motion::LineEnd | Motion::LineLastNonBlank);
+    let cannot_fail = match motion {
+        Motion::LineEnd | Motion::LineLastNonBlank => true,
+        // `dt,` with the comma sitting immediately ahead of the cursor.
+        // `t` lands *before* its target, which here is the character
+        // the cursor is already on, so nothing moves -- but the find
+        // succeeded, and being inclusive it still covers that one
+        // character, which is what vim deletes. Telling that apart from
+        // a find with no target left on the line is exactly why this
+        // asks where the motion would land rather than reading it off
+        // the cursor afterwards.
+        Motion::FindChar { ch, till, forward } => {
+            let (line, col) = buf.cursor();
+            find_char_landing(buf, line, col, ch, till, forward, count.unwrap_or(1).max(1)) == Some(col)
+        }
+        _ => false,
+    };
     let start = buf.cursor();
     apply_motion(buf, motion, count);
     let end = buf.cursor();
@@ -2571,6 +2585,28 @@ mod tests {
         assert_eq!(go(&mut buf, f.clone(), None), (0, 7));
         // no third X: motion fails, cursor stays put
         assert_eq!(go(&mut buf, f, None), (0, 7));
+    }
+
+    // `dt,` with the comma sitting immediately ahead: the find
+    // succeeds and lands on the column the cursor is already on, which
+    // is not the same thing as a find that had nowhere to go.
+    #[test]
+    fn a_till_motion_onto_the_cursors_own_column_still_covers_that_character() {
+        let mut buf = TestBuffer::new("a,b,c");
+        let t = Motion::FindChar { ch: ',', till: true, forward: true };
+        let range = motion_range(&mut buf, t, None).expect("the find succeeded, so there is a range");
+        assert_eq!((range.shape, range.from, range.to), (MotionShape::Inclusive, (0, 0), (0, 0)));
+
+        // ... and a find with no target left still covers nothing.
+        let mut buf = TestBuffer::new("abc");
+        assert_eq!(motion_range(&mut buf, Motion::FindChar { ch: ',', till: true, forward: true }, None), None);
+        assert_eq!(motion_range(&mut buf, Motion::FindChar { ch: ',', till: false, forward: true }, None), None);
+        // Backward `T` is exclusive, so landing on the cursor's own
+        // column really does cover nothing -- vim deletes nothing there
+        // either.
+        let mut buf = TestBuffer::new("a,b");
+        buf.set_cursor(0, 2);
+        assert_eq!(motion_range(&mut buf, Motion::FindChar { ch: ',', till: true, forward: false }, None), None);
     }
 
     #[test]

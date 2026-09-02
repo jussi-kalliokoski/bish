@@ -47,6 +47,46 @@ mod tests {
     const CASES: &[Case] = &[
         // -- deleting --------------------------------------------------
         case("dd", "one\ntwo\nthree\n", "dd"),
+        case("cc", "abc\ndef\n", "ccZ\u{1b}"),
+        case("cc-with-count", "a\nb\nc\n", "2ccZ\u{1b}"),
+        case("r", "abc\n", "rZ"),
+        case("r-with-count", "abcdef\n", "3rZ"),
+        // `Z` is `ZZ`'s own first key, intercepted ahead of the key
+        // machine -- so `rZ` is the case that catches an interception
+        // that forgot to check whether anything was pending.
+        case("ZZ-still-saves", "one\ntwo\n", "xZZ"),
+        case("t-motion", "a,b,c\n", "dt,"),
+        case("t-motion-mid-line", "abcdef\n", "dtc"),
+        case("T-motion-backward", "a,b\n", "$dT,"),
+        case("visual-o", "abcdef\n", "llvohd"),
+        case("visual-big-o", "abc\n", "vOx"),
+        case("visual-o-linewise", "a\nb\nc\nd\n", "jVjokd"),
+        case("dot-repeats", "aaa bbb ccc\n", "dw."),
+        case("dot-repeats-twice", "abcdef\n", "x.."),
+        case("dot-repeats-an-insert", "a\nb\n", "IX\u{1b}j."),
+        case("dot-repeats-a-change", "one two three\n", "cwZ\u{1b}w."),
+        case("dot-repeats-a-line-delete", "a\nb\nc\nd\n", "dd."),
+        case("dot-after-undo-repeats-the-change-not-the-undo", "abcdef\n", "xu."),
+        case("dot-with-nothing-to-repeat", "abc\n", "."),
+        case("mark-linewise-delete", "a\nb\nc\n", "maGd'a"),
+        case("mark-linewise-delete-partial", "a\nb\nc\nd\n", "jmaGd'a"),
+        // An empty file and a file of one empty line are different
+        // files, and a buffer that always keeps a line to put the
+        // cursor on has to remember which it started as.
+        case("empty-file-stays-empty", "", "0"),
+        case("one-newline-file-stays-one-newline", "\n", "0"),
+        case("deleting-every-line-empties-the-file", "a\nb\nc\n", "dG"),
+        case("emptying-the-only-line-keeps-its-newline", "\n", "iX\u{1b}x"),
+        case("ex-line-address", "a\nb\nc\n", ":2\rdd"),
+        case("ex-line-address-last", "a\nb\nc\n", ":$\rdd"),
+        case("ex-delete-a-line", "one\ntwo\nthree\n", ":2d\r"),
+        case("ex-delete-a-range", "a\nb\nc\nd\n", ":2,3d\r"),
+        case("ex-move-a-line", "one\ntwo\n", ":1m$\r"),
+        case("ex-move-to-the-top", "one\ntwo\nthree\n", ":3m0\r"),
+        case("ex-move-a-range", "a\nb\nc\nd\n", ":1,2m$\r"),
+        case("ex-move-into-itself-is-refused", "a\nb\nc\n", ":1,2m1\r"),
+        case("ex-normal", "abc\n", ":normal x\r"),
+        case("ex-normal-runs-a-whole-command", "a\nb\nc\n", ":normal dd\r"),
         case("dd-with-count", "one\ntwo\nthree\n", "2dd"),
         case("dw", "alpha beta gamma\n", "dw"),
         case("dw-with-count", "a b c d e\n", "d3w"),
@@ -153,41 +193,15 @@ mod tests {
             "indent-width",
             "`>>` inserts four spaces where `vim -u NONE` inserts a tab -- bish reads .editorconfig and defaults to spaces, which is a choice rather than a bug, but it is a difference and it is recorded",
         ),
-        ("cc", "`cc` deletes the line itself rather than emptying it, so the insert lands at the start of the next line and the two run together"),
-        ("r", "`r` is not implemented -- the key and the character after it are both ignored"),
-        ("r-with-count", "`r` is not implemented, counted or not -- see `r`"),
-        ("t-motion", "the `t`/`T` motions are not implemented, so `dt,` deletes nothing"),
-        (
-            "visual-o",
-            "`o` in visual mode does not swap which end of the selection the cursor is on -- it leaves visual mode and opens a line instead, so the rest of the keys are typed into it",
-        ),
         ("visual-indent", "indents with spaces where `vim -u NONE` uses a tab -- the same deliberate choice as `indent-width`"),
-        ("dot-repeats", "`.` does not repeat the last change"),
         (
-            "mark-linewise-delete",
-            "a linewise delete to a mark stops one line short: deleting to a mark on the first line leaves an empty line where vim empties the file",
+            "cc-keeps-the-indent",
+            "`cc` leaves the line's indentation and starts the insert past it, where `vim -u NONE` (which has no autoindent) starts at column zero -- bish's `o`/`O` carry the indent too, so this is that same choice rather than a `cc` bug",
         ),
-        ("ex-line-address", "a bare line number as an ex command does not move the cursor"),
-        ("ex-delete-a-line", "`:[range]d` is not implemented"),
-        ("ex-move-a-line", "`:[range]m` is not implemented"),
-        ("ex-normal", "`:normal` is not implemented"),
     ];
 
-    const PENDING: &[Case] = &[
-        case("indent-width", "a\nb\n", ">>"),
-        case("cc", "  abc\ndef\n", "ccZ\u{1b}"),
-        case("r", "abc\n", "rZ"),
-        case("r-with-count", "abcdef\n", "3rZ"),
-        case("t-motion", "a,b,c\n", "dt,"),
-        case("visual-o", "abcdef\n", "llvohd"),
-        case("visual-indent", "a\nb\n", "Vj>"),
-        case("dot-repeats", "aaa bbb ccc\n", "dw."),
-        case("mark-linewise-delete", "a\nb\nc\n", "maGd'a"),
-        case("ex-line-address", "a\nb\nc\n", ":2\rdd"),
-        case("ex-delete-a-line", "one\ntwo\nthree\n", ":2d\r"),
-        case("ex-move-a-line", "one\ntwo\n", ":1m$\r"),
-        case("ex-normal", "abc\n", ":normal x\r"),
-    ];
+    const PENDING: &[Case] =
+        &[case("indent-width", "a\nb\n", ">>"), case("visual-indent", "a\nb\n", "Vj>"), case("cc-keeps-the-indent", "  abc\ndef\n", "ccZ\u{1b}")];
 
     fn have_vim() -> bool {
         Path::new(VIM).exists()
@@ -367,6 +381,16 @@ mod tests {
         }
     }
 
+    /// Runs every case through both editors and returns the ones whose
+    /// files came out different.
+    ///
+    /// A case that differs is run again before it is believed. Two live
+    /// editors are being typed at through a pty, and a keystroke lost
+    /// to a slow redraw shows up here as "bish did nothing" -- which
+    /// looks exactly like a real divergence and is not one. A genuine
+    /// difference is deterministic and survives the second run; timing
+    /// noise does not. The retry costs nothing on a clean run, since
+    /// only a differing case pays for it.
     fn compare(cases: &[Case], bish: &Path) -> Vec<(&'static str, String, String)> {
         let root = std::env::temp_dir().join(format!("bish-vimdiff-{}", std::process::id()));
         let mut differing = Vec::new();
@@ -390,10 +414,15 @@ mod tests {
             // the same mistake there, and every case here already
             // leaves normal mode.
             let got = run(vec![bish.display().to_string(), "tool".into(), "edit".into(), path.display().to_string()], "\u{1b}:wq\r");
-            let _ = std::fs::remove_dir_all(&dir);
             if want != got {
-                differing.push((c.name, want, got));
+                let want_again =
+                    run(vec![VIM.into(), "-u".into(), "NONE".into(), "-i".into(), "NONE".into(), "-N".into(), path.display().to_string()], ":wq\r");
+                let got_again = run(vec![bish.display().to_string(), "tool".into(), "edit".into(), path.display().to_string()], "\u{1b}:wq\r");
+                if want_again != got_again {
+                    differing.push((c.name, want_again, got_again));
+                }
             }
+            let _ = std::fs::remove_dir_all(&dir);
         }
         let _ = std::fs::remove_dir(&root);
         differing

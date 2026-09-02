@@ -143,6 +143,16 @@ pub enum KeyOutcome {
     /// reasoning as `EnterVisual`'s own doc comment); a no-op if there's
     /// nothing to reselect yet.
     ReselectVisual,
+    /// Visual `o` -- puts the cursor on the other end of the selection
+    /// and the anchor where the cursor was, so the end that moves is the
+    /// one that was standing still.
+    ///
+    /// Split the same way `EnterVisual`/`ReselectVisual` are, and for
+    /// the same reason: the anchor lives here, the cursor lives in the
+    /// buffer, and this crate never touches a `Buffer`. The caller reads
+    /// `visual_anchor()`, sets the cursor to that anchor, and calls
+    /// `set_visual_anchor` with where the cursor just was.
+    SwapVisualEnds,
     /// `gd`: ask whatever knows about this language where the thing
     /// under the cursor is defined, and go there.
     ///
@@ -662,6 +672,26 @@ pub struct VimKeys {
     // next key starts a new sequence, so a frontend can flash "here's what
     // that just did" for a beat after the motion applies.
     last_completed: String,
+    // `.`'s own memory, in three parts: the keys of the command being
+    // typed right now, the keys of the last one that *changed* the
+    // buffer, and whether an Insert-mode excursion is still adding to
+    // the first of those.
+    //
+    // Keys, not an edit description: a change is replayed by feeding
+    // its keystrokes back through the same replay queue macros use, so
+    // `.` needs no separate notion of what any command does and gains
+    // every command at once. What it costs is that a repeat re-resolves
+    // against the buffer's current state -- `dw` repeated deletes
+    // whatever word is under the cursor now, which is what vim does
+    // too.
+    current_change: Vec<Key>,
+    last_change: Vec<Key>,
+    // Set when a command opens Insert mode, cleared when the escape that
+    // closes it comes back through `next_key`. While it is set, the
+    // host's own Insert-mode reads are part of the change being
+    // recorded -- which is what makes `cwfoo<Esc>` repeat as a whole
+    // rather than as a bare `cw`.
+    capturing_insert: bool,
     // Visual mode's own state: the shape (`v`/`V`) and the anchor position
     // (the cursor at the moment Visual was entered) a caller supplied via
     // `begin_visual`. `None` means Normal mode. Deliberately not touched
@@ -722,6 +752,9 @@ impl VimKeys {
             jump_forward: Vec::new(),
             current_input: String::new(),
             last_completed: String::new(),
+            current_change: Vec::new(),
+            last_change: Vec::new(),
+            capturing_insert: false,
             macros: HashMap::new(),
             recording: None,
             replay_queue: VecDeque::new(),
@@ -796,6 +829,22 @@ impl VimKeys {
     /// mode. A caller combines this with the buffer's own current cursor
     /// to know what's actually selected right now (this crate never reads
     /// a `Buffer` itself -- see the module's own doc comment).
+    /// Visual mode's own shape and anchor, if active -- `None` in Normal
+    /// mode. A caller combines this with the buffer's own current cursor
+    /// to know what's actually selected right now (this crate never reads
+    /// a `Buffer` itself -- see the module's own doc comment).
+    pub fn visual_anchor(&self) -> Option<(RegisterShape, (usize, usize))> {
+        self.visual
+    }
+
+    /// Moves the anchor without leaving Visual mode -- `SwapVisualEnds`'s
+    /// own counterpart, the way `begin_visual` is `EnterVisual`'s.
+    pub fn set_visual_anchor(&mut self, anchor: (usize, usize)) {
+        if let Some((_, a)) = self.visual.as_mut() {
+            *a = anchor;
+        }
+    }
+
     /// Whether the next key must reach this machine unmapped.
     ///
     /// `f{char}`, `m{mark}`, `r{char}` and the surround delimiters all
@@ -813,10 +862,6 @@ impl VimKeys {
     /// than of the caller.
     pub fn keymap_mode(&self) -> &'static str {
         if self.visual_anchor().is_some() { "visual" } else { "normal" }
-    }
-
-    pub fn visual_anchor(&self) -> Option<(RegisterShape, (usize, usize))> {
-        self.visual
     }
 
     /// Enters Visual mode: called by a caller that just received
@@ -1003,6 +1048,15 @@ impl VimKeys {
         true
     }
 
+    /// Puts `keys` at the front of the replay queue, so the host's own
+    /// next reads see them as if they had been typed. `:normal`'s own
+    /// entry point, and the same mechanism `@{reg}` and `.` use.
+    pub fn queue_keys(&mut self, keys: impl DoubleEndedIterator<Item = Key>) {
+        for key in keys.rev() {
+            self.replay_queue.push_front(key);
+        }
+    }
+
     /// The one seam every host-level key read goes through (the main
     /// per-iteration read, every lookahead read like `S`'s delimiter or
     /// `Z`'s second `Z`, and `fileeditor::run_insert_mode`'s own read) --
@@ -1095,14 +1149,14 @@ impl VimKeys {
     pub fn next_mapped_key(&mut self, mode: &str, mut read: impl FnMut() -> io::Result<Option<Key>>) -> io::Result<Option<Key>> {
         loop {
             if let Some(key) = self.replay_queue.pop_front() {
-                return Ok(Some(key));
+                return Ok(Some(self.capture_insert_key(key)));
             }
             let Some(key) = read()? else { return Ok(None) };
             self.record_key(key);
             // An argument-pending state takes the next keystroke as a
             // literal (`fx` finds an `x`), so it must not be remapped.
             if self.matcher.is_empty() || self.wants_raw_key() {
-                return Ok(Some(key));
+                return Ok(Some(self.capture_insert_key(key)));
             }
             // Insert mode can take a printable key back off the screen,
             // so it lets the matcher type one speculatively rather than
@@ -1114,22 +1168,110 @@ impl VimKeys {
             }
             let first = out.keys.remove(0);
             self.replay_queue.extend(out.keys);
-            return Ok(Some(first));
+            return Ok(Some(self.capture_insert_key(first)));
         }
+    }
+
+    /// Adds `key` to the change `.` will repeat, if an Insert-mode
+    /// excursion is open, and closes that excursion out when the key is
+    /// the one that ends it.
+    ///
+    /// Called from both read seams because Insert mode uses
+    /// `next_mapped_key` (so that `::bish map -m insert` applies to what
+    /// gets typed) while Normal-mode lookaheads use `next_key`, and the
+    /// text typed during a change arrives through whichever one the host
+    /// happens to be in. Normal-mode keys are recorded in `feed`, not
+    /// here -- `capturing_insert` is false then, which is what keeps
+    /// them from being counted twice.
+    fn capture_insert_key(&mut self, key: Key) -> Key {
+        if self.capturing_insert {
+            self.current_change.push(key);
+            if matches!(key, Key::Escape | Key::CtrlC) {
+                self.capturing_insert = false;
+                self.last_change = std::mem::take(&mut self.current_change);
+            }
+        }
+        key
     }
 
     pub fn next_key(&mut self, mut read: impl FnMut() -> io::Result<Option<Key>>) -> io::Result<Option<Key>> {
-        if let Some(key) = self.replay_queue.pop_front() {
-            return Ok(Some(key));
+        let key = match self.replay_queue.pop_front() {
+            Some(key) => Some(key),
+            None => {
+                let key = read()?;
+                if let Some(key) = key {
+                    self.record_key(key);
+                }
+                key
+            }
+        };
+        Ok(key.map(|key| self.capture_insert_key(key)))
+    }
+
+    /// Whether `outcome` changed the buffer, and so is what `.` should
+    /// repeat. Motions, scrolls, visual-mode bookkeeping and undo are
+    /// not changes; vim draws the same line, and `u` in particular must
+    /// not become the thing `.` repeats.
+    fn outcome_is_a_change(outcome: &KeyOutcome) -> bool {
+        match outcome {
+            KeyOutcome::Operator(op, ..) | KeyOutcome::OperatorLines(op, ..) => *op != Op::Yank,
+            KeyOutcome::Put { .. }
+            | KeyOutcome::DeleteCharForward { .. }
+            | KeyOutcome::Join { .. }
+            | KeyOutcome::AddSurround { .. }
+            | KeyOutcome::DeleteSurround { .. }
+            | KeyOutcome::ChangeSurround { .. }
+            | KeyOutcome::ReplaceChar { .. }
+            | KeyOutcome::ToggleCase { .. }
+            | KeyOutcome::AdjustNumber { .. }
+            | KeyOutcome::OpenLine { .. }
+            | KeyOutcome::EnterInsert(_)
+            | KeyOutcome::EnterReplace => true,
+            _ => false,
         }
-        let key = read()?;
-        if let Some(key) = key {
-            self.record_key(key);
+    }
+
+    /// Whether `outcome` leaves the host in Insert mode, so that the
+    /// keys it is about to read are still part of this change.
+    fn outcome_opens_insert(outcome: &KeyOutcome) -> bool {
+        match outcome {
+            KeyOutcome::Operator(op, ..) | KeyOutcome::OperatorLines(op, ..) => *op == Op::Change,
+            KeyOutcome::EnterInsert(_) | KeyOutcome::EnterReplace | KeyOutcome::OpenLine { .. } => true,
+            _ => false,
         }
-        Ok(key)
     }
 
     pub fn feed(&mut self, key: Key) -> KeyOutcome {
+        // A key arriving with nothing typed toward a command yet starts
+        // a new one, which is where the previous command's keys stop
+        // being interesting -- unless Insert mode is still open, in
+        // which case they are not a new command at all.
+        if self.current_input.is_empty() && !self.capturing_insert {
+            self.current_change.clear();
+        }
+        self.current_change.push(key);
+        // Wrapped rather than inlined below, because what a key resolves
+        // to is not settled until every one of `feed_resolving`'s own
+        // returns has been taken: `dd` leaves through an early
+        // double-tap return near the top, and `dw` is still a bare
+        // `Motion` until the armed-operator block at the very bottom
+        // turns it into one. Asking anywhere but out here would record
+        // some changes and miss others.
+        let outcome = self.feed_resolving(key);
+        if Self::outcome_is_a_change(&outcome) {
+            if Self::outcome_opens_insert(&outcome) {
+                // Not finished yet: the text still has to be typed, and
+                // it arrives through `next_key`, which closes this out
+                // on the escape.
+                self.capturing_insert = true;
+            } else {
+                self.last_change = self.current_change.clone();
+            }
+        }
+        outcome
+    }
+
+    fn feed_resolving(&mut self, key: Key) -> KeyOutcome {
         if let Some(label) = key_label(key) {
             self.current_input.push_str(&label);
         }
@@ -1328,10 +1470,26 @@ impl VimKeys {
     }
 
     // Same shape as emit_insert -- a leading count has no effect yet.
+    //
+    // In Visual mode neither `o` nor `O` is "open a line" at all: both
+    // swap which end of the selection is being held. Deciding that here
+    // rather than in the caller is what keeps it right for all four of
+    // them -- `o` in Visual used to fall through as an ordinary
+    // open-line, which left Visual mode, opened a line, and typed the
+    // rest of the keys into it.
+    //
+    // `O` differs from `o` only in Blockwise Visual, where vim swaps the
+    // corner horizontally rather than diagonally. Treating it as the
+    // plain swap is exactly right for Charwise and Linewise, and for a
+    // block it moves to a corner rather than opening a line, which is
+    // the nearer of the two wrong answers by a distance.
     fn emit_open_line(&mut self, above: bool) -> KeyOutcome {
         self.count = None;
         self.pending = Pending::None;
         self.last_completed = std::mem::take(&mut self.current_input);
+        if self.visual.is_some() {
+            return KeyOutcome::SwapVisualEnds;
+        }
         KeyOutcome::OpenLine { above }
     }
 
@@ -1440,6 +1598,29 @@ impl VimKeys {
         self.pending = Pending::None;
         self.last_completed = std::mem::take(&mut self.current_input);
         KeyOutcome::Put { before, count, register }
+    }
+
+    /// `.`: replays the keys of the last change through the same queue
+    /// `@{reg}` uses, so the repeat is the original command happening
+    /// again rather than a second implementation of it.
+    ///
+    /// Returns `None` rather than an outcome of its own: nothing has
+    /// happened yet at this point, and nothing needs to -- the host's
+    /// next read comes out of the replay queue and drives the command
+    /// through the ordinary path, which is also what leaves `.` itself
+    /// repeatable afterwards.
+    ///
+    /// `[count].` replays once, not `count` times, and does not
+    /// substitute the count into the repeated command the way vim does.
+    fn emit_repeat_change(&mut self) -> KeyOutcome {
+        self.count = None;
+        self.pending = Pending::None;
+        self.pending_register = None;
+        self.last_completed = std::mem::take(&mut self.current_input);
+        for key in self.last_change.clone().iter().rev() {
+            self.replay_queue.push_front(*key);
+        }
+        KeyOutcome::None
     }
 
     fn abort(&mut self) -> KeyOutcome {
@@ -1643,6 +1824,7 @@ impl VimKeys {
             // `<C-r>{register}` paste-while-typing, a different context
             // entirely from Normal-mode redo) -- no conflict.
             Key::Char('u') => self.emit_undo(),
+            Key::Char('.') => self.emit_repeat_change(),
             Key::CtrlR => self.emit_redo(),
             // `D`: delete from the cursor through end of line, staying in
             // Normal mode -- vim's own `d$` shorthand. Unlike `C` (the
@@ -2154,6 +2336,7 @@ pub fn describe_outcome(outcome: &KeyOutcome) -> String {
         ToggleCase { count } => format!("toggle-case{}", n(count)),
         AdjustNumber { delta } => format!("adjust-number {delta}"),
         OpenLine { above } => format!("open-line-{}", if *above { "above" } else { "below" }),
+        SwapVisualEnds => "visual-swap-ends".to_string(),
         // Neither is a resolved action: `Pending` means the sequence
         // wants more keys, `None` that nothing recognized it. `::bish
         // map` refuses a right-hand side that ends on either rather than
@@ -3631,6 +3814,101 @@ mod tests {
         assert_eq!(vk.take_pending_register(), Some('a'));
         // Consumed -- a second take sees nothing left.
         assert_eq!(vk.take_pending_register(), None);
+    }
+
+    // `o`/`O` in Visual mode are the one place these two keys do not
+    // open a line -- see `emit_open_line`'s own note.
+    #[test]
+    fn o_and_big_o_swap_the_visual_ends_rather_than_opening_a_line() {
+        for key in [Key::Char('o'), Key::Char('O')] {
+            let mut vk = VimKeys::new();
+            assert!(matches!(vk.feed(key), KeyOutcome::OpenLine { .. }), "{key:?} opens a line in Normal mode");
+            let mut vk = VimKeys::new();
+            vk.begin_visual(RegisterShape::Char, (0, 0));
+            assert_eq!(vk.feed(key), KeyOutcome::SwapVisualEnds, "{key:?} in Visual mode");
+        }
+    }
+
+    #[test]
+    fn set_visual_anchor_moves_the_anchor_and_stays_in_visual_mode() {
+        let mut vk = VimKeys::new();
+        vk.begin_visual(RegisterShape::Char, (1, 2));
+        vk.set_visual_anchor((4, 5));
+        assert_eq!(vk.visual_anchor(), Some((RegisterShape::Char, (4, 5))));
+        assert!(vk.is_visual());
+        // Nothing to move when there is no selection, and it must not
+        // invent one.
+        let mut vk = VimKeys::new();
+        vk.set_visual_anchor((4, 5));
+        assert_eq!(vk.visual_anchor(), None);
+    }
+
+    /// Drives `.` the way a host does: feed the keys, then serve
+    /// whatever `.` queued back out through `next_key` and feed those
+    /// too, collecting what each resolved to.
+    fn feed_then_repeat(keys: &[Key]) -> Vec<KeyOutcome> {
+        let mut vk = VimKeys::new();
+        for k in keys {
+            vk.feed(*k);
+        }
+        vk.feed(Key::Char('.'));
+        let mut out = Vec::new();
+        while let Some(key) = vk.next_key(|| Ok(None)).unwrap() {
+            out.push(vk.feed(key));
+        }
+        out
+    }
+
+    #[test]
+    fn dot_replays_the_last_change_and_ignores_everything_that_is_not_one() {
+        assert_eq!(feed_then_repeat(&[Key::Char('x')]), vec![KeyOutcome::DeleteCharForward { count: None, register: None }]);
+        // `dd` leaves through the double-tap shortcut and `dw` only
+        // becomes an operator in the armed-operator block at the very
+        // bottom of `feed` -- both have to be recorded anyway.
+        assert_eq!(feed_then_repeat(&[Key::Char('d'), Key::Char('d')]), vec![KeyOutcome::Pending, KeyOutcome::OperatorLines(Op::Delete, None, None)]);
+        assert_eq!(
+            feed_then_repeat(&[Key::Char('d'), Key::Char('w')]),
+            vec![KeyOutcome::Pending, KeyOutcome::Operator(Op::Delete, Motion::WordForward, None, None)]
+        );
+        // A motion is not a change, and neither is a yank or an undo --
+        // `.` after any of them repeats the change before it.
+        for after in [&[Key::Char('w')][..], &[Key::Char('y'), Key::Char('y')][..], &[Key::Char('u')][..]] {
+            let mut keys = vec![Key::Char('x')];
+            keys.extend_from_slice(after);
+            assert_eq!(feed_then_repeat(&keys), vec![KeyOutcome::DeleteCharForward { count: None, register: None }], "after {after:?}");
+        }
+        // Nothing changed yet, so there is nothing to repeat.
+        assert!(feed_then_repeat(&[Key::Char('w')]).is_empty());
+    }
+
+    #[test]
+    fn dot_replays_the_text_typed_during_an_insert_excursion_too() {
+        let mut vk = VimKeys::new();
+        assert!(matches!(vk.feed(Key::Char('i')), KeyOutcome::EnterInsert(_)));
+        // What the host's own Insert-mode loop does: read through the
+        // same seam until the escape comes back.
+        let typed = [Key::Char('h'), Key::Char('i'), Key::Escape];
+        let mut feed_from = typed.iter().copied();
+        while let Some(key) = vk.next_mapped_key("insert", || Ok(feed_from.next())).unwrap() {
+            if key == Key::Escape {
+                break;
+            }
+        }
+        vk.feed(Key::Char('.'));
+        let mut replayed = Vec::new();
+        while let Some(key) = vk.next_key(|| Ok(None)).unwrap() {
+            replayed.push(key);
+        }
+        assert_eq!(replayed, vec![Key::Char('i'), Key::Char('h'), Key::Char('i'), Key::Escape]);
+    }
+
+    #[test]
+    fn queue_keys_serves_them_in_order_ahead_of_a_real_read() {
+        let mut vk = VimKeys::new();
+        vk.queue_keys("dd".chars().map(Key::Char));
+        assert_eq!(vk.next_key(|| Ok(Some(Key::Char('Q')))).unwrap(), Some(Key::Char('d')));
+        assert_eq!(vk.next_key(|| Ok(Some(Key::Char('Q')))).unwrap(), Some(Key::Char('d')));
+        assert_eq!(vk.next_key(|| Ok(Some(Key::Char('Q')))).unwrap(), Some(Key::Char('Q')));
     }
 
     #[test]
