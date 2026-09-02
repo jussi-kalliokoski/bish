@@ -96,6 +96,9 @@ pub(crate) fn run_shopt(sh: &mut Shell, args: &[String]) -> i32 {
     let mut quiet = false;
     let mut reusable = false;
     let mut names: Vec<&str> = Vec::new();
+    if let Some(bad) = crate::exec::first_unknown_option(args, "supqo") {
+        return crate::exec::bad_option_status(sh, "shopt", &bad, "shopt [-pqsu] [-o] [optname ...]");
+    }
     for a in args {
         match a.as_str() {
             "-s" => mode = Some(true),
@@ -309,6 +312,13 @@ pub(crate) fn run_enable(sh: &mut Shell, args: &[String]) -> i32 {
 // also rejects e.g. `-euo pipefail` (it consumes `-o` with no argument
 // of its own, then tries to parse "pipefail"'s remaining letters as
 // further short flags and errors on the first invalid one).
+// Every short flag real bash's `set` accepts. Most of them do nothing
+// here (see apply_shell_flag for the ones that do) -- but accepting
+// exactly bash's set, no more, is what makes `set -Z` a reported typo
+// instead of a silent no-op.
+const SET_FLAGS: &str = "abefhkmnptuvxBCEHPTro";
+const SET_USAGE: &str = "set [-abefhkmnptuvxBCEHPT] [-o option-name] [--] [-] [arg ...]";
+
 // `set -o` (a padded name/on-off table) and `set +o` (the same as
 // `set -o NAME`/`set +o NAME` commands). Only the options this shell
 // actually gates behaviour on are listed -- see SET_O_OPTIONS.
@@ -334,8 +344,15 @@ pub(crate) fn run_set(sh: &mut Shell, args: &[String]) -> i32 {
             break;
         }
         if let Some(rest) = a.strip_prefix('-').filter(|r| !r.is_empty()) {
+            if let Some(bad) = rest.chars().find(|c| !SET_FLAGS.contains(*c)) {
+                return crate::exec::bad_option_status(sh, "set", &format!("-{bad}"), SET_USAGE);
+            }
             if rest == "o" {
                 if let Some(optname) = args.get(idx + 1) {
+                    if sh.shell_option_enabled(optname).is_none() {
+                        sh_eprintln!(sh, "bish: set: {optname}: invalid option name");
+                        return 2;
+                    }
                     sh.apply_shell_option(optname, true);
                     idx += 2;
                     continue;
@@ -351,8 +368,15 @@ pub(crate) fn run_set(sh: &mut Shell, args: &[String]) -> i32 {
             continue;
         }
         if let Some(rest) = a.strip_prefix('+').filter(|r| !r.is_empty()) {
+            if let Some(bad) = rest.chars().find(|c| !SET_FLAGS.contains(*c)) {
+                return crate::exec::bad_option_status(sh, "set", &format!("+{bad}"), SET_USAGE);
+            }
             if rest == "o" {
                 if let Some(optname) = args.get(idx + 1) {
+                    if sh.shell_option_enabled(optname).is_none() {
+                        sh_eprintln!(sh, "bish: set: {optname}: invalid option name");
+                        return 2;
+                    }
                     sh.apply_shell_option(optname, false);
                     idx += 2;
                     continue;

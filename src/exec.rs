@@ -1390,6 +1390,13 @@ pub struct Shell {
     // doesn't cover -- e.g. a `for`/`case`/arithmetic list). Not shared
     // via Rc: each Shell (including a new_virtual_child) gets its own.
     pending_exit: Option<i32>,
+    // Whether a human is typing at this shell. Set once by repl.rs at
+    // interactive startup (see enable_monitor_mode) and inherited by
+    // every virtual child. The one thing it gates is which errors are
+    // *fatal*: bash exits a non-interactive shell on an assignment to
+    // a readonly variable, and would be intolerable if it did that to
+    // someone's session over a typo.
+    interactive: bool,
     // See StdioOverride's own doc comment. `None` for every ordinary
     // Shell (spawned external commands really inherit the real process's
     // fds); set by run_in_child_shell on the Shell it builds for a
@@ -1549,6 +1556,7 @@ impl Shell {
             pending_fg: None,
             pending_edit: None,
             pending_exit: None,
+            interactive: false,
             stdio_override: None,
             debug_hook: None,
             current_line: 0,
@@ -1858,6 +1866,7 @@ impl Shell {
             pending_fg: None,
             pending_edit: None,
             pending_exit: None,
+            interactive: self.interactive,
             stdio_override: None,
             debug_hook: self.debug_hook.clone(),
             current_line: self.current_line,
@@ -1997,6 +2006,7 @@ impl Shell {
     // way it inherits every other opt_* flag (see new_virtual_child).
     pub fn enable_monitor_mode(&mut self) {
         self.opt_monitor = true;
+        self.interactive = true;
         crate::term::ignore_tty_signals();
     }
 
@@ -3353,7 +3363,7 @@ impl Shell {
             return Err(RESTRICTED.to_string());
         }
         let old = self.cwd.to_string_lossy().into_owned();
-        std::env::set_current_dir(target).map_err(|e| e.to_string())?;
+        std::env::set_current_dir(target).map_err(|e| os_message(&e))?;
         self.cwd = std::env::current_dir().unwrap_or_else(|_| target.to_path_buf());
         let new = self.cwd.to_string_lossy().into_owned();
         unsafe {
@@ -4887,21 +4897,28 @@ impl Shell {
         // it is to see what is about to run.
         self.run_pseudo_trap(PseudoTrap::Debug);
         if cmd.words.is_empty() {
+            // A refused write (readonly name) is the whole command's
+            // failure, not a silent no-op -- `set -e` and an explicit
+            // `|| exit` both depend on seeing it.
+            let mut ok = true;
             for (name, mode, val) in &cmd.assigns {
                 let v = self.expand_word(val);
-                match mode {
+                ok &= match mode {
                     AssignMode::Set => self.assign_var(name, v),
                     AssignMode::Append => {
                         let mut cur = self.lookup_var(name);
                         cur.push_str(&v);
-                        self.assign_var(name, cur);
+                        self.assign_var(name, cur)
                     }
-                }
+                };
             }
             for (name, mode, items) in &cmd.array_assigns {
-                self.apply_array_literal(name, *mode, items);
+                ok &= self.apply_array_literal(name, *mode, items);
             }
             for (name, index, val) in &cmd.index_assigns {
+                // array_set_index prints the refusal itself; this only
+                // needs to know that one is coming.
+                ok &= !self.name_is_readonly(name);
                 let v = self.expand_word(val);
                 self.array_set_index(name, index, v);
             }
@@ -4909,10 +4926,18 @@ impl Shell {
                 // side effect only: create/truncate/append the target files
                 let _ = self.resolve_redirects(cmd);
             }
+            // bash treats a refused assignment as *fatal* in a
+            // non-interactive shell -- the script stops, which is the
+            // only thing that makes `readonly` worth writing. It does
+            // not do that to a session someone is typing at, and
+            // neither does this.
+            if !ok && !self.interactive {
+                self.pending_exit = Some(1);
+            }
             if let Some(exit) = self.take_pending_exit() {
                 return exit;
             }
-            return ExecResult::Status(0);
+            return ExecResult::Status(i32::from(!ok));
         }
 
         let saved_stderr_target = self.current_stderr_target.take();
@@ -5023,8 +5048,13 @@ impl Shell {
                 AssignMode::Set => v,
                 AssignMode::Append => self.lookup_var(name) + &v,
             };
-            saved.push((name.clone(), self.var_is_set(name).then(|| self.lookup_var(name))));
-            self.assign_var(name, v);
+            // Only what was actually written needs putting back -- a
+            // refused write (readonly name) left nothing to restore,
+            // and restoring it would print the same refusal twice.
+            let previous = self.var_is_set(name).then(|| self.lookup_var(name));
+            if self.assign_var(name, v) {
+                saved.push((name.clone(), previous));
+            }
         }
         saved
     }
@@ -5032,7 +5062,9 @@ impl Shell {
     fn restore_prefix_assigns(&mut self, saved: Vec<(String, Option<String>)>) {
         for (name, previous) in saved.into_iter().rev() {
             match previous {
-                Some(v) => self.assign_var(&name, v),
+                Some(v) => {
+                    self.assign_var(&name, v);
+                }
                 // Restored as *unset*, the same way `unset` does it:
                 // walk the local scopes first, then the real
                 // environment.
@@ -5241,6 +5273,10 @@ impl Shell {
             // Bare `hash` with no args normally lists the cache; ours is
             // always empty, so that's the one output bash-compat requires.
             "hash" => {
+                if let Some(bad) = first_unknown_option(&argv[1..], "lrpdt") {
+                    let usage = "hash [-lr] [-p pathname] [-dt] [name ...]";
+                    return ExecResult::Status(bad_option_status(self, "hash", &bad, usage));
+                }
                 if argv.len() == 1 {
                     sh_println!(self, "hash: hash table empty");
                 }
@@ -5434,10 +5470,29 @@ impl Shell {
                 return ExecResult::Return(code);
             }
             "shift" => {
-                let n = argv.get(1).and_then(|s| s.parse::<usize>().ok()).unwrap_or(1);
+                if argv.len() > 2 {
+                    sh_eprintln!(self, "bish: shift: too many arguments");
+                    return ExecResult::Status(1);
+                }
+                let n = match argv.get(1) {
+                    Some(a) => match a.parse::<usize>() {
+                        Ok(n) => n,
+                        Err(_) => {
+                            sh_eprintln!(self, "bish: shift: {}: numeric argument required", a);
+                            return ExecResult::Status(2);
+                        }
+                    },
+                    None => 1,
+                };
+                // Shifting past the end is a no-op that *reports* --
+                // `while shift; do ...; done` is how a script walks its
+                // arguments, and it never stops if this always says 0.
+                let available = self.arg_frames.last().map(Vec::len).unwrap_or(0);
+                if n > available {
+                    return ExecResult::Status(1);
+                }
                 if let Some(frame) = self.arg_frames.last_mut() {
-                    let drain = n.min(frame.len());
-                    frame.drain(0..drain);
+                    frame.drain(0..n);
                 }
                 return ExecResult::Status(0);
             }
@@ -5602,10 +5657,20 @@ impl Shell {
                 return ExecResult::Status(0);
             }
             "exit" => {
-                let code = argv
-                    .get(1)
-                    .and_then(|s| s.parse::<i32>().ok())
-                    .unwrap_or(self.last_status);
+                let code = match argv.get(1) {
+                    Some(a) => match a.parse::<i32>() {
+                        Ok(n) => n,
+                        // Still exits -- bash does too, with 2, rather
+                        // than carrying on as if `exit` had not been
+                        // written.
+                        Err(_) => {
+                            sh_eprintln!(self, "bish: exit: {}: numeric argument required", a);
+                            self.run_exit_trap();
+                            return ExecResult::Exit(2);
+                        }
+                    },
+                    None => self.last_status,
+                };
                 self.run_exit_trap();
                 return ExecResult::Exit(code);
             }
@@ -5764,6 +5829,13 @@ impl Shell {
             // ignored rather than erroring, a scoped subset covering the
             // overwhelmingly common `mapfile -t arr < file` usage.
             "mapfile" | "readarray" => {
+                if let Some(bad) = first_unknown_option(&argv[1..], "dnOstuCc") {
+                    let usage = format!(
+                        "{} [-d delim] [-n count] [-O origin] [-s count] [-t] [-u fd] [-C callback] [-c quantum] [array]",
+                        name
+                    );
+                    return ExecResult::Status(bad_option_status(self, &name, &bad, &usage));
+                }
                 let mut strip_newline = false;
                 let mut array_name = "MAPFILE".to_string();
                 for a in &argv[1..] {
@@ -5896,6 +5968,10 @@ impl Shell {
                 }
             }
             "trap" => {
+                if let Some(bad) = first_unknown_option(&argv[1..], "Plp") {
+                    let usage = "trap [-Plp] [[action] signal_spec ...]";
+                    return ExecResult::Status(bad_option_status(self, "trap", &bad, usage));
+                }
                 if argv.len() == 1 || argv.get(1).map(|s| s == "-p").unwrap_or(false) {
                     if let Some(code) = &self.exit_trap {
                         sh_println!(self, "trap -- {} EXIT", crate::serialize::quote_literal(code));
@@ -5917,6 +5993,9 @@ impl Shell {
                     return ExecResult::Status(0);
                 }
                 let cmd_str = argv[1].clone();
+                // A signal this shell cannot name is the command
+                // failing, not a line of output to scroll past.
+                let mut status = 0;
                 for sig in &argv[2..] {
                     if sig == "EXIT" || sig == "0" {
                         self.exit_trap = if cmd_str == "-" { None } else { Some(cmd_str.clone()) };
@@ -5934,17 +6013,29 @@ impl Shell {
                         *slot = if cmd_str == "-" { None } else { Some(cmd_str.clone()) };
                         continue;
                     }
+                    // KILL and STOP first: they are real signals with
+                    // real numbers, deliberately absent from
+                    // SIGNAL_NAMES so that list can be trap's own
+                    // answer to "may I catch this?" (see its doc
+                    // comment). bash accepts and records a trap for
+                    // them silently, and it simply never fires; saying
+                    // so is more use than a status a script would have
+                    // to have expected.
+                    if crate::exec::UNCATCHABLE_SIGNALS
+                        .iter()
+                        .any(|(n, num)| sig.strip_prefix("SIG").unwrap_or(sig) == *n || sig == &num.to_string())
+                    {
+                        sh_eprintln!(self, "bish: trap: {}: cannot trap", sig);
+                        continue;
+                    }
                     let num = match signal_number(sig) {
                         Some(n) => n,
                         None => {
                             sh_eprintln!(self, "bish: trap: {}: invalid signal specification", sig);
+                            status = 1;
                             continue;
                         }
                     };
-                    if num == 9 || num == 19 {
-                        sh_eprintln!(self, "bish: trap: {}: cannot trap", sig);
-                        continue;
-                    }
                     if cmd_str == "-" {
                         self.traps.remove(&num);
                         sigaction_raw(num, SIG_DFL);
@@ -5956,7 +6047,7 @@ impl Shell {
                         sigaction_raw(num, record_pending_signal as *const () as usize);
                     }
                 }
-                return ExecResult::Status(0);
+                return ExecResult::Status(status);
             }
             "jobs" => return ExecResult::Status(crate::builtins::jobs::run_jobs(self, &argv[1..])),
             "disown" => return ExecResult::Status(crate::builtins::jobs::run_disown(self, &argv[1..])),
@@ -5981,7 +6072,16 @@ impl Shell {
                     .collect();
                 return ExecResult::Status(crate::builtins::vars::run_declare(self, &argv[1..], &shifted));
             }
-            "readonly" => return ExecResult::Status(crate::builtins::vars::run_readonly(self, &argv[1..])),
+            // `readonly` is `declare -r`, the same way `export` is
+            // `declare -x` -- and for the same reason: run_declare is
+            // what knows about array literals, so the standalone
+            // version silently dropped the value of `readonly a=(1)`.
+            // The position bookkeeping is identical; see `export`.
+            "readonly" => {
+                let mut declare_args = vec!["-r".to_string()];
+                declare_args.extend(argv[1..].iter().cloned());
+                return ExecResult::Status(crate::builtins::vars::run_declare(self, &declare_args, array_literal_args));
+            }
             // exec CMD [args...] replaces this process image entirely (no
             // fork, no return on success) -- exactly what real bash does,
             // and available here as safe std (CommandExt::exec wraps
@@ -6827,6 +6927,10 @@ impl Shell {
     // "next index" counter should resume after an explicit `[i]=value`
     // element.
     fn array_set_index(&mut self, name: &str, index: &str, value: String) -> Option<usize> {
+        if self.name_is_readonly(name) {
+            sh_eprintln!(self, "bish: {}: readonly variable", name);
+            return None;
+        }
         if self.assoc_names.contains(name) {
             let key = self.expand_index_as_string(index);
             self.assoc_arrays.entry(name.to_string()).or_default().insert(key, value);
@@ -6863,7 +6967,14 @@ impl Shell {
     // running counter's string form as a last resort (real bash errors
     // on this instead; rare enough in practice that erroring isn't
     // worth the extra plumbing here).
-    pub(crate) fn apply_array_literal(&mut self, name: &str, mode: AssignMode, items: &[ArrayLiteralItem]) {
+    pub(crate) fn apply_array_literal(&mut self, name: &str, mode: AssignMode, items: &[ArrayLiteralItem]) -> bool {
+        // Same guard, and the same message, as a scalar write -- see
+        // assign_var_impl. Without it `readonly a=(1); a+=(2)` went
+        // through, which is the one thing `readonly` promises not to.
+        if self.name_is_readonly(name) {
+            sh_eprintln!(self, "bish: {}: readonly variable", name);
+            return false;
+        }
         let is_assoc = self.assoc_names.contains(name);
         if mode == AssignMode::Set {
             if is_assoc {
@@ -6897,6 +7008,7 @@ impl Shell {
                 }
             }
         }
+        true
     }
 
     // Reconstructs a display string for one `name=(...)`/`name+=(...)`
@@ -7816,8 +7928,12 @@ impl Shell {
     // Plain assignment targets the global (process-env) variable, unless it
     // shadows an existing `local` of the same name in the current function
     // scope -- matching bash, where functions don't auto-localize vars.
-    pub(crate) fn assign_var(&mut self, name: &str, value: String) {
-        self.assign_var_impl(name, value, false);
+    // Returns false when the name is readonly and the write was
+    // refused -- the message is already printed by then. Most callers
+    // have nothing to do with that; the ones that owe the shell an
+    // exit status (a bare `x=2` command, `declare`, `local`) check it.
+    pub(crate) fn assign_var(&mut self, name: &str, value: String) -> bool {
+        self.assign_var_impl(name, value, false)
     }
 
     // `declare -g`/`local -g`: same readonly guard, SECONDS/RANDOM
@@ -7826,11 +7942,11 @@ impl Shell {
     // (process-env) scope, bypassing any same-named local shadow in the
     // current function -- unlike assign_var/raw_var_write, which target
     // whichever scope already shadows the name.
-    pub(crate) fn assign_var_global(&mut self, name: &str, value: String) {
-        self.assign_var_impl(name, value, true);
+    pub(crate) fn assign_var_global(&mut self, name: &str, value: String) -> bool {
+        self.assign_var_impl(name, value, true)
     }
 
-    fn assign_var_impl(&mut self, name: &str, value: String, force_global: bool) {
+    fn assign_var_impl(&mut self, name: &str, value: String, force_global: bool) -> bool {
         let resolved;
         let name = if self.nameref_names.contains(name) {
             resolved = self.resolve_nameref(name);
@@ -7838,9 +7954,9 @@ impl Shell {
         } else {
             name
         };
-        if self.readonly_names.contains(name) || self.is_restricted_readonly_name(name) {
+        if self.name_is_readonly(name) {
             sh_eprintln!(self, "bish: {}: readonly variable", name);
-            return;
+            return false;
         }
         // `SECONDS=n` resets the elapsed-time counter to start counting
         // from n, matching bash -- lookup_var computes it live rather
@@ -7850,7 +7966,7 @@ impl Shell {
             if let Ok(n) = value.trim().parse::<i64>() {
                 self.seconds_offset = n - self.shell_start.elapsed().as_secs() as i64;
             }
-            return;
+            return true;
         }
         // `RANDOM=n` reseeds the generator, matching bash (rather than
         // making $RANDOM a static value forever).
@@ -7858,7 +7974,7 @@ impl Shell {
             if let Ok(n) = value.trim().parse::<u64>() {
                 self.rng_state = if n == 0 { 0x2545F4914F6CDD1D } else { n };
             }
-            return;
+            return true;
         }
         // `declare -i`/`local -i`: the assigned text is evaluated as an
         // arithmetic expression rather than stored literally (bash: `n="2+3"`
@@ -7879,7 +7995,7 @@ impl Shell {
             unsafe {
                 std::env::set_var(name, &value);
             }
-            return;
+            return true;
         }
         if self.exported_names.contains(name) {
             unsafe {
@@ -7887,6 +8003,7 @@ impl Shell {
             }
         }
         self.raw_var_write(name, value);
+        true
     }
 
     fn resolve_redirects(&mut self, cmd: &SimpleCommand) -> Result<ResolvedRedirs, String> {
@@ -8077,7 +8194,7 @@ impl Shell {
             .append(append)
             .truncate(!append)
             .open(path)
-            .map_err(|e| format!("{}: {}", path, e))
+            .map_err(|e| format!("{}: {}", path, os_message(&e)))
     }
 
     // The one place every redirect that opens a file for *reading*
@@ -8096,7 +8213,7 @@ impl Shell {
         if let Some(result) = dev_socket_file(path) {
             return result;
         }
-        std::fs::File::open(path).map_err(|e| format!("{}: {}", path, e))
+        std::fs::File::open(path).map_err(|e| format!("{}: {}", path, os_message(&e)))
     }
 
     // The read+write counterpart to open_in/open_out -- bare `<>`/`N<>`'s
@@ -8111,7 +8228,7 @@ impl Shell {
         if let Some(result) = dev_socket_file(path) {
             return result;
         }
-        std::fs::OpenOptions::new().create(true).read(true).write(true).open(path).map_err(|e| format!("{}: {}", path, e))
+        std::fs::OpenOptions::new().create(true).read(true).write(true).open(path).map_err(|e| format!("{}: {}", path, os_message(&e)))
     }
 
     // Restricted mode: SHELL/PATH/ENV/BASH_ENV can't be set or unset --
@@ -8123,6 +8240,15 @@ impl Shell {
     // readonly_names itself (that would make them readonly forever,
     // including outside restricted mode, and would wrongly show up as
     // `-r` in declare -p/${v@a}).
+    // Whether a write to this name will be refused -- `readonly`'s own
+    // list plus restricted mode's. The refusal and its message live in
+    // assign_var_impl/apply_array_literal/array_set_index; this is for
+    // a caller that needs to know one happened without printing a
+    // second message about it.
+    pub(crate) fn name_is_readonly(&self, name: &str) -> bool {
+        self.readonly_names.contains(name) || self.is_restricted_readonly_name(name)
+    }
+
     pub(crate) fn is_restricted_readonly_name(&self, name: &str) -> bool {
         self.opt_restricted && matches!(name, "SHELL" | "PATH" | "ENV" | "BASH_ENV")
     }
@@ -8906,7 +9032,9 @@ mod time_format_tests {
         // outlives the `Shell` that set it and would leak into the next
         // case here.
         match format {
-            Some(f) => shell.assign_var("TIMEFORMAT", f.to_string()),
+            Some(f) => {
+                shell.assign_var("TIMEFORMAT", f.to_string());
+            }
             None => unsafe { std::env::remove_var("TIMEFORMAT") },
         }
         shell.format_times(style, real, user, sys)
@@ -9192,6 +9320,35 @@ mod printf_conversion_tests {
 //
 // `'A` (or `"A`) is bash's own extension on top of that: a quote
 // followed by a character means that character's code point.
+// Whether printf's own number reading consumed the whole argument --
+// which is what bash means by "invalid number". Leading whitespace is
+// skipped, the way strtol does; anything left over after the digits is
+// not, so `12 ` and `1e3` are both rejected for an integer conversion
+// while ` 12` is fine. bash's `'X` (the character's code point) is a
+// number by this measure too.
+fn printf_number_complete(arg: &str, float: bool) -> bool {
+    let text = arg.trim_start();
+    if text.starts_with(['\'', '"']) {
+        return true;
+    }
+    if text.is_empty() {
+        return false;
+    }
+    let rest = text.strip_prefix(['-', '+']).unwrap_or(text);
+    if float {
+        if rest.eq_ignore_ascii_case("inf") || rest.eq_ignore_ascii_case("infinity") || rest.eq_ignore_ascii_case("nan")
+        {
+            return true;
+        }
+        if let Some(hex) = rest.strip_prefix("0x").or_else(|| rest.strip_prefix("0X")) {
+            return !hex.is_empty() && hex.chars().all(|c| c.is_ascii_hexdigit());
+        }
+        return float_prefix_len(text) == text.len() && float_prefix_len(text) > 0;
+    }
+    let (radix, digits) = int_radix(rest);
+    !digits.is_empty() && digits.chars().all(|c| c.is_digit(radix))
+}
+
 fn printf_int(arg: &str) -> i64 {
     let text = arg.trim();
     if let Some(rest) = text.strip_prefix(['\'', '"']) {
@@ -9441,11 +9598,37 @@ fn read_hex_escape(chars: &mut std::iter::Peekable<std::str::Chars<'_>>, max: us
     value
 }
 
-pub(crate) fn printf_format_once(format: &str, values: &[String], idx: &mut usize, out: &mut String) -> bool {
+// What one pass over a printf format produced besides its output.
+// Collected rather than printed here because this is a free function
+// with no shell to print through -- run_printf reports them in order.
+#[derive(Default)]
+pub(crate) struct PrintfOutcome {
+    // Stop rerunning the format over the remaining arguments: either a
+    // `\c` in a `%b` argument, or an error that ended the pass.
+    pub(crate) stop: bool,
+    pub(crate) errors: Vec<String>,
+    pub(crate) status: i32,
+}
+
+// The C length modifiers. bash skips them -- every integer here is
+// already 64-bit -- but a format that carries one (`%zu`, `%lld`) has
+// to reach the conversion character behind it rather than reading the
+// modifier *as* the conversion. `q` (C's quad) is deliberately absent:
+// `%q` is bash's own shell-quoting conversion, and that is what a
+// script writing it means.
+const PRINTF_LENGTH_MODIFIERS: &str = "hlLjzt";
+
+pub(crate) fn printf_format_once(
+    format: &str,
+    values: &[String],
+    idx: &mut usize,
+    out: &mut String,
+) -> PrintfOutcome {
     // Assembled as bytes and decoded once at the end, because `\303\244`
     // has to mean the two bytes of `ä` rather than two Latin-1
     // characters -- the same reason `$'...'` is built this way.
     let mut buf: Vec<u8> = Vec::new();
+    let mut outcome = PrintfOutcome::default();
     let mut chars = format.chars().peekable();
     while let Some(c) = chars.next() {
         if c == '\\' {
@@ -9604,13 +9787,70 @@ pub(crate) fn printf_format_once(format: &str, values: &[String], idx: &mut usiz
             }
             precision = Some(p.parse().unwrap_or(0));
         }
-        let Some(conv) = chars.next() else { break };
+        // C's length modifiers (`%zu`, `%lld`): skipped, since every
+        // integer here is already 64-bit -- but skipped rather than
+        // mistaken for the conversion character itself.
+        let mut modifiers = String::new();
+        while let Some(&m) = chars.peek() {
+            if PRINTF_LENGTH_MODIFIERS.contains(m) {
+                modifiers.push(m);
+                chars.next();
+            } else {
+                break;
+            }
+        }
+        let spec_so_far = |extra: &str| -> String {
+            let mut spec = String::from("%");
+            if left_align {
+                spec.push('-');
+            }
+            if zero_pad {
+                spec.push('0');
+            }
+            if plus_sign {
+                spec.push('+');
+            }
+            if space_sign {
+                spec.push(' ');
+            }
+            spec.push_str(&width_digits);
+            if let Some(p) = precision {
+                spec.push('.');
+                spec.push_str(&p.to_string());
+            }
+            spec.push_str(&modifiers);
+            spec.push_str(extra);
+            spec
+        };
+        let Some(conv) = chars.next() else {
+            // `printf '%'` / `printf '%5'`: a conversion that never
+            // named what to convert. bash reports it and stops.
+            outcome.errors.push(format!("`{}': missing format character", spec_so_far("")));
+            outcome.status = 1;
+            outcome.stop = true;
+            out.push_str(&String::from_utf8_lossy(&buf));
+            return outcome;
+        };
+        if !"sbqcdiuoxXfFeEgG".contains(conv) {
+            // An unrecognized conversion is the whole format being
+            // wrong, not a character to print back -- bash abandons
+            // the printf there, and so does this now.
+            outcome.errors.push(format!("`{}': missing format character", spec_so_far(&conv.to_string())));
+            outcome.status = 1;
+            outcome.stop = true;
+            out.push_str(&String::from_utf8_lossy(&buf));
+            return outcome;
+        }
 
         let mut next_arg = || -> String {
             let v = values.get(*idx).cloned().unwrap_or_default();
             *idx += 1;
             v
         };
+        // Collected beside `outcome` rather than into it: `next_arg`
+        // already holds a mutable borrow across this match.
+        let mut errors: Vec<String> = Vec::new();
+        let mut status = 0;
         // What zero-padding and the sign flags apply to. Floats are in
         // both; `u`/`o`/`x`/`X` take the padding but not a sign, which
         // is what C does with them.
@@ -9634,7 +9874,8 @@ pub(crate) fn printf_format_once(format: &str, values: &[String], idx: &mut usiz
                     // it, not just this conversion.
                     buf.extend_from_slice(piece.as_bytes());
                     out.push_str(&String::from_utf8_lossy(&buf));
-                    return true;
+                    outcome.stop = true;
+                    return outcome;
                 }
                 piece
             }
@@ -9642,11 +9883,22 @@ pub(crate) fn printf_format_once(format: &str, values: &[String], idx: &mut usiz
             // An empty argument is still a character: bash writes the
             // NUL it read, and so does this.
             'c' => next_arg().chars().next().unwrap_or('\0').to_string(),
-            'd' | 'i' => printf_int(&next_arg()).to_string(),
-            'u' => printf_uint(&next_arg()).to_string(),
-            'o' => format!("{:o}", printf_uint(&next_arg())),
-            'x' => format!("{:x}", printf_uint(&next_arg())),
-            'X' => format!("{:X}", printf_uint(&next_arg())),
+            'd' | 'i' | 'u' | 'o' | 'x' | 'X' => {
+                let arg = next_arg();
+                // bash still prints whatever prefix of the argument
+                // *was* a number (`%d` of `1x` is 1) -- but it says so.
+                if !printf_number_complete(&arg, false) {
+                    errors.push(format!("{}: invalid number", arg));
+                    status = 1;
+                }
+                match conv {
+                    'd' | 'i' => printf_int(&arg).to_string(),
+                    'u' => printf_uint(&arg).to_string(),
+                    'o' => format!("{:o}", printf_uint(&arg)),
+                    'x' => format!("{:x}", printf_uint(&arg)),
+                    _ => format!("{:X}", printf_uint(&arg)),
+                }
+            }
             // The floating-point family. Precision defaults to 6, as C
             // does, and an argument that is not a number reads as 0 --
             // the same silent fallback `%d` above already makes (bash
@@ -9654,7 +9906,12 @@ pub(crate) fn printf_format_once(format: &str, values: &[String], idx: &mut usiz
             // either, and one behaviour for both is worth more here
             // than half-matching).
             'f' | 'F' | 'e' | 'E' | 'g' | 'G' => {
-                let value = printf_float(&next_arg());
+                let arg = next_arg();
+                if !printf_number_complete(&arg, true) {
+                    errors.push(format!("{}: invalid number", arg));
+                    status = 1;
+                }
+                let value = printf_float(&arg);
                 zero_pad_ok = value.is_finite();
                 let precision = precision.unwrap_or(6);
                 match conv {
@@ -9663,10 +9920,8 @@ pub(crate) fn printf_format_once(format: &str, values: &[String], idx: &mut usiz
                     _ => format_general(value, precision, conv == 'G'),
                 }
             }
-            // Unrecognized conversion: emitted literally, nothing
-            // consumed -- matches bash treating it as plain text rather
-            // than silently eating an argument.
-            other => format!("%{}", other),
+            // Excluded by the check above.
+            other => unreachable!("unhandled printf conversion {other:?}"),
         };
         // Precision on an integer means minimum digits, and having asked
         // for those the `0` flag has nothing left to say -- C ignores it
@@ -9703,10 +9958,14 @@ pub(crate) fn printf_format_once(format: &str, values: &[String], idx: &mut usiz
                 piece = format!("{}{}", " ".repeat(pad), piece);
             }
         }
+        outcome.errors.append(&mut errors);
+        if status != 0 {
+            outcome.status = status;
+        }
         buf.extend_from_slice(&piece.as_bytes());
     }
     out.push_str(&String::from_utf8_lossy(&buf));
-    false
+    outcome
 }
 
 // bash's exit-status convention for a process killed by a signal is
@@ -10030,7 +10289,11 @@ pub(crate) fn signal_number(name: &str) -> Option<i32> {
     if let Some(&(_, n)) = SIGNAL_NAMES.iter().find(|(n, _)| *n == bare) {
         return Some(n);
     }
-    bare.parse::<i32>().ok()
+    // A number has to be one the kernel could actually deliver: bash
+    // rejects `trap x 99999` rather than recording a trap for a signal
+    // that can never arrive. 64 is Linux's highest (the real-time
+    // range tops out there).
+    bare.parse::<i32>().ok().filter(|n| (1..=64).contains(n))
 }
 
 fn signal_name(num: i32) -> String {
@@ -10494,6 +10757,48 @@ fn parse_exec_opts(argv: &[String]) -> ExecOpts {
     ExecOpts::Run(flags)
 }
 
+// A builtin handed an option it does not have. bash's shape exactly:
+// the complaint, then that builtin's own usage line -- which is the
+// half that answers the question -- and status 2. Silently ignoring an
+// unknown option, which is what this shell used to do everywhere, turns
+// a typo into a behaviour change nobody sees.
+// The first `-X` in `args` whose letters aren't all in `accepted`,
+// spelled the way bash reports it (`-z`, one letter, even when it came
+// from a cluster). `--` ends the options, and a lone `-` is an operand
+// rather than an option, both as everywhere else.
+pub(crate) fn first_unknown_option(args: &[String], accepted: &str) -> Option<String> {
+    for a in args {
+        if a == "--" {
+            return None;
+        }
+        let Some(letters) = a.strip_prefix('-').filter(|r| !r.is_empty()) else {
+            return None;
+        };
+        if let Some(c) = letters.chars().find(|c| !accepted.contains(*c)) {
+            return Some(format!("-{}", c));
+        }
+    }
+    None
+}
+
+pub(crate) fn bad_option_status(sh: &mut Shell, who: &str, opt: &str, usage: &str) -> i32 {
+    sh_eprintln!(sh, "bish: {}: {}: invalid option", who, opt);
+    sh_eprintln!(sh, "{}: usage: {}", who, usage);
+    2
+}
+
+// Rust's `io::Error` Display appends " (os error N)". No shell prints
+// that, and a script that greps a message for "No such file or
+// directory" should not have to know about it -- this is the same text
+// without the tail, which is what strerror(3), and so bash, gives.
+pub(crate) fn os_message(e: &std::io::Error) -> String {
+    let text = e.to_string();
+    match text.rfind(" (os error ") {
+        Some(i) if text.ends_with(')') => text[..i].to_string(),
+        _ => text,
+    }
+}
+
 fn dev_socket_file(path: &str) -> Option<Result<std::fs::File, String>> {
     let (proto, rest) = path
         .strip_prefix("/dev/tcp/")
@@ -10503,7 +10808,7 @@ fn dev_socket_file(path: &str) -> Option<Result<std::fs::File, String>> {
     if host.is_empty() || port.is_empty() {
         return None;
     }
-    Some(connect_dev_socket(proto, host, port).map_err(|e| format!("{}: {}", path, e)))
+    Some(connect_dev_socket(proto, host, port).map_err(|e| format!("{}: {}", path, os_message(&e))))
 }
 
 // A builtin's own output redirected onto an arbitrary already-open fd
@@ -13642,8 +13947,12 @@ mod tests {
         let mut shell = Shell::new();
         shell.run_source_here("set -r", "<test>");
         for name in ["SHELL", "PATH", "ENV", "BASH_ENV"] {
+            // Fatal, not merely refused: a write to a readonly name
+            // stops a non-interactive shell, which is what real bash
+            // does here too (`bash -r -c 'SHELL=/x; echo after'`
+            // prints the error and nothing else, exiting 1).
             let result = shell.run_source_here(&format!("{name}=/tmp"), "<test>");
-            assert!(matches!(result, ExecResult::Status(0)), "{name}: {result:?}");
+            assert!(matches!(result, ExecResult::Exit(1)), "{name}: {result:?}");
         }
         // Still readable/unchanged, just refused as a write target.
         assert_ne!(shell.lookup_var("PATH"), "/tmp");

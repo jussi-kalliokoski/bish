@@ -92,23 +92,39 @@ pub(crate) fn run_printf(sh: &mut Shell, args: &[String]) -> i32 {
 
     let mut out = String::new();
     let mut idx = 0;
+    let mut status = 0;
+    let mut errors: Vec<String> = Vec::new();
     loop {
         let before = idx;
         // `\c` in a `%b` argument ends the output there -- including
-        // the reruns the remaining arguments would have caused.
-        if printf_format_once(format, values, &mut idx, &mut out) {
+        // the reruns the remaining arguments would have caused. So does
+        // a malformed conversion, which bash abandons the format over.
+        let outcome = printf_format_once(format, values, &mut idx, &mut out);
+        errors.extend(outcome.errors);
+        if outcome.status != 0 {
+            status = outcome.status;
+        }
+        if outcome.stop {
             break;
         }
         if idx >= values.len() || idx == before {
             break;
         }
     }
+    // Before the output, the way bash orders them -- the diagnostic is
+    // on stderr and the result on stdout, and a reader watching both
+    // sees the complaint first.
+    for e in errors {
+        sh_eprintln!(sh, "bish: printf: {}", e);
+    }
 
     match var_name {
-        Some(name) => sh.assign_var(&name, out),
+        Some(name) => {
+            sh.assign_var(&name, out);
+        }
         None => sh_print!(sh, "{}", out),
     }
-    0
+    status
 }
 
 // `[[ expr ]]`. Real recursive-descent precedence over the flat

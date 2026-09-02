@@ -6,7 +6,14 @@ use crate::pty;
 use crate::exec::{getpgrp, send_signal, send_signal_to_pgrp, sh_eprintln, sh_println, signal_number,
     waitpid_untraced, ExecResult, JobWaitOutcome, SIGCONT, Shell};
 
-pub(crate) fn run_jobs(sh: &mut Shell, _args: &[String]) -> i32 {
+pub(crate) fn run_jobs(sh: &mut Shell, args: &[String]) -> i32 {
+    // The flags themselves are accepted and ignored -- this listing has
+    // one shape -- but a letter bash does not have is a typo, and
+    // reporting it is the point of the check.
+    if let Some(bad) = crate::exec::first_unknown_option(args, "lnprsx") {
+        let usage = "jobs [-lnprs] [jobspec ...] or jobs -x command [args]";
+        return crate::exec::bad_option_status(sh, "jobs", &bad, usage);
+    }
     let mut table = sh.jobs.borrow_mut();
     let last_idx = table.jobs.len().checked_sub(1);
     let prev_idx = table.jobs.len().checked_sub(2);
@@ -413,6 +420,14 @@ pub(crate) fn run_kill(sh: &mut Shell, args: &[String]) -> i32 {
             if let Some(n) = signal_number(rest) {
                 sig = n;
                 continue;
+            }
+            // A `-something` that is not a signal is not a target
+            // either -- treating `kill -99999 1` as "signal pid -99999
+            // and pid 1 with SIGTERM" is how a typo becomes a signal
+            // sent to the wrong process.
+            if !rest.is_empty() {
+                sh_eprintln!(sh, "bish: kill: {rest}: invalid signal specification");
+                return 1;
             }
         }
         targets.push(a);

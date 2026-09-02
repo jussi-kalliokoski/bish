@@ -17,6 +17,10 @@ pub(crate) fn run_unset(sh: &mut Shell, args: &[String], stderr_target: &Option<
     let mut only_funcs = false;
     let mut only_vars = false;
     let mut names: Vec<&String> = Vec::new();
+    let mut status = 0;
+    if let Some(bad) = crate::exec::first_unknown_option(args, "fvn") {
+        return crate::exec::bad_option_status(sh, "unset", &bad, "unset [-f] [-v] [-n] [name ...]");
+    }
     for a in args {
         match a.as_str() {
             "-f" => only_funcs = true,
@@ -47,8 +51,9 @@ pub(crate) fn run_unset(sh: &mut Shell, args: &[String], stderr_target: &Option<
                 continue;
             }
         }
-        if sh.readonly_names.contains(n.as_str()) || sh.is_restricted_readonly_name(n) {
+        if sh.name_is_readonly(n) {
             write_diagnostic(stderr_target, &format!("bish: unset: {}: cannot unset: readonly variable", n), sh.sink.clone());
+            status = 1;
             continue;
         }
         sh.arrays.remove(n.as_str());
@@ -70,7 +75,7 @@ pub(crate) fn run_unset(sh: &mut Shell, args: &[String], stderr_target: &Option<
             sh.functions.remove(n.as_str());
         }
     }
-    0
+    status
 }
 
 // declare/typeset [-A|-a|-i|-r|-g] [NAME|NAME=value]... `-x` isn't
@@ -105,6 +110,7 @@ pub(crate) fn run_declare(sh: &mut Shell, args: &[String], array_literals: &[(us
     let mut upper_flag = false;
     let mut lower_flag = false;
     let mut export_flag = false;
+    let mut status = 0;
     for (i, a) in args.iter().enumerate() {
         match a.as_str() {
             "-A" => {
@@ -221,7 +227,12 @@ pub(crate) fn run_declare(sh: &mut Shell, args: &[String], array_literals: &[(us
                     sh.var_scopes.last_mut().unwrap().entry(name.clone()).or_default();
                 }
                 if let Some(v) = val {
-                    if global_flag { sh.assign_var_global(&name, v) } else { sh.assign_var(&name, v) }
+                    // A readonly name refuses the write, and `declare`
+                    // owes the shell that failure -- same as a bare
+                    // `x=2` command does.
+                    if !if global_flag { sh.assign_var_global(&name, v) } else { sh.assign_var(&name, v) } {
+                        status = 1;
+                    }
                 } else if export_flag {
                     // Bare `declare -x NAME`/`export NAME` on an
                     // already-set variable (commonly a local: `local
@@ -233,12 +244,12 @@ pub(crate) fn run_declare(sh: &mut Shell, args: &[String], array_literals: &[(us
                     // case since it only fires for a name with no
                     // value at all yet.
                     let cur = sh.lookup_var(&name);
-                    if global_flag { sh.assign_var_global(&name, cur) } else { sh.assign_var(&name, cur) }
+                    if global_flag { sh.assign_var_global(&name, cur) } else { sh.assign_var(&name, cur) };
                 } else if sh.lookup_var(&name).is_empty() && std::env::var(&name).is_err() {
                     if global_flag {
-                        sh.assign_var_global(&name, String::new())
+                        sh.assign_var_global(&name, String::new());
                     } else {
-                        sh.assign_var(&name, String::new())
+                        sh.assign_var(&name, String::new());
                     }
                 }
             }
@@ -247,25 +258,6 @@ pub(crate) fn run_declare(sh: &mut Shell, args: &[String], array_literals: &[(us
             sh.readonly_names.insert(name);
         }
     }
-    0
+    status
 }
 
-// readonly NAME[=value]... Marks each name so assign_var refuses future
-// writes. The initializing assignment (if any) happens before the name
-// is added to readonly_names, so it isn't rejected by its own call.
-pub(crate) fn run_readonly(sh: &mut Shell, args: &[String]) -> i32 {
-    for a in args {
-        if a.starts_with('-') {
-            continue;
-        }
-        let (name, val) = match a.find('=') {
-            Some(eq) => (a[..eq].to_string(), Some(a[eq + 1..].to_string())),
-            None => (a.clone(), None),
-        };
-        if let Some(v) = val {
-            sh.assign_var(&name, v);
-        }
-        sh.readonly_names.insert(name);
-    }
-    0
-}

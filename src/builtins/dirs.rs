@@ -6,27 +6,40 @@
 use crate::exec::{sh_eprintln, sh_println, RESTRICTED, Shell};
 
 pub(crate) fn run_cd(sh: &mut Shell, args: &[String]) -> i32 {
+    // `-L`/`-P` (follow symlinks or resolve them) are accepted and
+    // ignored: this shell has only ever had the logical behaviour, and
+    // a script that writes `cd -P` is asking for something stricter
+    // than it gets rather than for something wrong. What is *not*
+    // ignored is a second operand -- bash rejects that, and accepting
+    // it silently hid a typo'd path.
+    let operands: Vec<&String> = args.iter().filter(|a| !matches!(a.as_str(), "-L" | "-P" | "-@" | "-e")).collect();
+    if operands.len() > 1 {
+        // 2, not 1: bash reserves 2 for a builtin's own usage error
+        // and 1 for the operation failing.
+        sh_eprintln!(sh, "bish: cd: too many arguments");
+        return 2;
+    }
     let old = sh.cwd.to_string_lossy().into_owned();
-    let target = if let Some(dir) = args.first() {
-        if dir == "-" {
+    let target = if let Some(dir) = operands.first() {
+        if dir.as_str() == "-" {
             match std::env::var("OLDPWD") {
                 Ok(p) => {
                     sh_println!(sh, "{}", p);
                     p
                 }
                 Err(_) => {
-                    sh_eprintln!(sh, "cd: OLDPWD not set");
+                    sh_eprintln!(sh, "bish: cd: OLDPWD not set");
                     return 1;
                 }
             }
         } else {
-            dir.clone()
+            (*dir).clone()
         }
     } else {
         match std::env::var("HOME") {
             Ok(h) => h,
             Err(_) => {
-                sh_eprintln!(sh, "cd: HOME not set");
+                sh_eprintln!(sh, "bish: cd: HOME not set");
                 return 1;
             }
         }
@@ -54,7 +67,7 @@ pub(crate) fn run_cd(sh: &mut Shell, args: &[String]) -> i32 {
             1
         }
         Err(e) => {
-            sh_eprintln!(sh, "cd: {}: {}", target, e);
+            sh_eprintln!(sh, "bish: cd: {}: {}", target, e);
             1
         }
     }
