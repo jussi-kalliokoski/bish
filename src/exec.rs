@@ -7745,6 +7745,10 @@ impl Shell {
     fn eval_var_op(&mut self, name: &str, op: &VarOp) -> String {
         let cur = self.lookup_var(name);
         match op {
+            // `${#@}` and `${#*}` are `$#` -- how many positional
+            // parameters there are, not how long they are once joined.
+            // Every other name measures its value.
+            VarOp::Length if name == "@" || name == "*" => self.arg_frames.last().map(Vec::len).unwrap_or(0).to_string(),
             VarOp::Length => cur.chars().count().to_string(),
             VarOp::Default { word, colon } => {
                 let trigger = if *colon { cur.is_empty() } else { !self.var_is_set(name) };
@@ -7794,8 +7798,13 @@ impl Shell {
                 apply_case_convert(&cur, &pattern, *upper, *all)
             }
             VarOp::Substring { offset, length } => {
-                let off = arith::eval(offset, self).unwrap_or(0);
-                let len = length.as_ref().and_then(|l| arith::eval(l, self).ok());
+                // An omitted offset is zero -- `${x::3}` -- and the
+                // evaluator does not read an empty string as one.
+                let off = match offset.trim().is_empty() {
+                    true => 0,
+                    false => self.eval_arith(offset).unwrap_or(0),
+                };
+                let len = length.as_ref().and_then(|l| self.eval_arith(l).ok());
                 substring_expand(&cur, off, len)
             }
             VarOp::Replace { pattern, repl, global, anchor } => {
@@ -7854,9 +7863,15 @@ impl Shell {
             }
             None => return None,
         };
-        let offset = match arith::eval(offset, self) {
-            Ok(n) => n,
-            Err(e) => return Some(Err(e.to_string())),
+        // `${a[@]::2}` -- an omitted offset is zero, and handing the
+        // arithmetic evaluator an empty string is an error rather than
+        // a default.
+        let offset = match offset.trim().is_empty() {
+            true => 0,
+            false => match self.eval_arith(offset) {
+                Ok(n) => n,
+                Err(e) => return Some(Err(e.to_string())),
+            },
         };
         let length = match length {
             None => None,
@@ -7949,8 +7964,13 @@ impl Shell {
                 apply_case_convert(&cur, &pattern, *upper, *all)
             }
             VarOp::Substring { offset, length } => {
-                let off = arith::eval(offset, self).unwrap_or(0);
-                let len = length.as_ref().and_then(|l| arith::eval(l, self).ok());
+                // An omitted offset is zero -- `${x::3}` -- and the
+                // evaluator does not read an empty string as one.
+                let off = match offset.trim().is_empty() {
+                    true => 0,
+                    false => self.eval_arith(offset).unwrap_or(0),
+                };
+                let len = length.as_ref().and_then(|l| self.eval_arith(l).ok());
                 substring_expand(&cur, off, len)
             }
             VarOp::Replace { pattern, repl, global, anchor } => {

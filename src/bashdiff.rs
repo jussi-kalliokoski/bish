@@ -350,6 +350,9 @@ y
         case("coproc-round-trip", r#"coproc CP { cat; }; echo hi >&"${CP[1]}"; sleep 0.2; read -r l <&"${CP[0]}"; echo "back=[$l]""#),
         // -- roadmap 20: a lone bracket is not a pattern ---------------
         case("lone-bracket-is-literal", r#"printf '%s,' [ ] '[abc'; echo; [ 1 -lt 2 ] && echo test-works"#),
+        // -- roadmap 22: parameter expansion's last corners ------------
+        case("count-of-the-positionals", r#"set -- a b c; echo "${#@} ${#*} $#""#),
+        case("omitted-slice-offset", r#"a=(1 2 3); echo "${a[@]::2}"; x=abcdef; echo "${x::3}"; set -- a b c; echo "${@:1:1}""#),
     ];
 
     // Cases bish does not match today, each with why. Asserted to
