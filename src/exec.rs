@@ -4196,6 +4196,18 @@ impl Shell {
     // pop_builtin_output_sink already use for a single builtin's own
     // redirects, generalized here to a whole compound command.
     fn run_with_redirected_stdio(&mut self, cmd: &parser::Command, stdio: ChildStdio) -> ExecResult {
+        let saved = self.install_redirected_stdio(stdio);
+        let result = self.run_command_body(cmd, false);
+        self.restore_redirected_stdio(saved);
+        result
+    }
+
+    // The install/restore halves of run_with_redirected_stdio, split out
+    // so a *function call* can borrow them: `f > out` redirects the
+    // whole body, exactly as `{ ...; } > out` does, and routing it
+    // through the compound path is the only way a builtin inside the
+    // body and an external inside it end up in the same place.
+    fn install_redirected_stdio(&mut self, stdio: ChildStdio) -> (OutputSink, Option<Rc<RefCell<StdioOverride>>>) {
         let saved_sink = self.sink.clone();
         let saved_stdio_override = self.stdio_override.clone();
 
@@ -4222,11 +4234,11 @@ impl Shell {
             };
         }
 
-        let result = self.run_command_body(cmd, false);
+        (saved_sink, saved_stdio_override)
+    }
 
-        self.sink = saved_sink;
-        self.stdio_override = saved_stdio_override;
-        result
+    fn restore_redirected_stdio(&mut self, saved: (OutputSink, Option<Rc<RefCell<StdioOverride>>>)) {
+        (self.sink, self.stdio_override) = saved;
     }
 
     // (...) subshells run in-process now (see run_in_child_shell's own
@@ -4974,7 +4986,13 @@ impl Shell {
                         }
                     }
                 } else {
-                    let b = self.expand_word(b);
+                    // `==`/`!=`/`=` take a *pattern* on the right, so
+                    // the quoted parts of it have to be escaped; every
+                    // other operator compares plain text.
+                    let b = match op.as_str() {
+                        "=" | "==" | "!=" => self.expand_glob_pattern_operand(b),
+                        _ => self.expand_word(b),
+                    };
                     let fold_case = self.shopt_is_on("nocasematch");
                     builtins::binary_with_case(&a, &op, &b, true, fold_case)
                 }
@@ -5082,6 +5100,105 @@ impl Shell {
                     let raw = raw.clone();
                     let v = self.run_proc_sub_out(&raw);
                     out.push_str(&crate::regex::escape(&v));
+                }
+            }
+        }
+        out
+    }
+
+    // The same, for `[[ x == PATTERN ]]`. Quoting any part of the
+    // right-hand side makes that part a literal instead of pattern
+    // syntax -- `[[ abc == "a*" ]]` is false, and `[[ abc == a* ]]` is
+    // true. Expanding it as one plain word lost the distinction, so a
+    // quoted `*` still globbed.
+    fn expand_glob_pattern_operand(&mut self, w: &Word) -> String {
+        let mut out = String::new();
+        for c in &w.chunks {
+            match c {
+                Chunk::Tilde { name } => {
+                    let name = name.clone();
+                    out.push_str(&crate::glob::escape(&self.expand_tilde(&name)));
+                }
+                Chunk::Str(t) => out.push_str(t),
+                Chunk::LiteralStr(t) => out.push_str(&crate::glob::escape(t)),
+                Chunk::Var { name, quoted } => {
+                    let name = name.clone();
+                    self.check_nounset(&name);
+                    let v = self.lookup_var(&name);
+                    out.push_str(&if *quoted { crate::glob::escape(&v) } else { v });
+                }
+                Chunk::Sub { raw, quoted } => {
+                    let v = self.run_command_substitution(raw);
+                    out.push_str(&if *quoted { crate::glob::escape(&v) } else { v });
+                }
+                Chunk::Arith { raw, quoted } => match self.eval_arith(raw) {
+                    Ok(v) => {
+                        let v = v.to_string();
+                        out.push_str(&if *quoted { crate::glob::escape(&v) } else { v });
+                    }
+                    Err(e) => {
+                        sh_eprintln!(self, "bish: (({})): {}", raw, e);
+                        // Fatal, unlike the `(( ))` *command* -- see
+                        // expansion_failed.
+                        self.expansion_failed = true;
+                    }
+                },
+                Chunk::VarExpand { name, op, quoted } => {
+                    let name = name.clone();
+                    let op = op.clone();
+                    let v = match self.list_slice(&name, None, &op) {
+                        Some(sliced) => self.joined_slice(sliced),
+                        None => self.eval_var_op(&name, &op),
+                    };
+                    out.push_str(&if *quoted { crate::glob::escape(&v) } else { v });
+                }
+                Chunk::ArrayVar { name, index, quoted } => {
+                    let name = name.clone();
+                    let index = index.clone();
+                    let v = self.array_element(&name, &index);
+                    out.push_str(&if *quoted { crate::glob::escape(&v) } else { v });
+                }
+                Chunk::ArrayLength { name, index } => {
+                    let name = name.clone();
+                    let index = index.clone();
+                    out.push_str(&self.array_length(&name, &index).to_string());
+                }
+                Chunk::ArrayVarExpand { name, index, op, quoted } => {
+                    let name = name.clone();
+                    let index = index.clone();
+                    let op = op.clone();
+                    let v = match self.list_slice(&name, Some(&index), &op) {
+                        Some(sliced) => self.joined_slice(sliced),
+                        None => self.eval_array_var_op(&name, &index, &op),
+                    };
+                    out.push_str(&if *quoted { crate::glob::escape(&v) } else { v });
+                }
+                Chunk::Indirect { name, quoted } => {
+                    let target = self.lookup_var(name);
+                    let v = self.lookup_var(&target);
+                    out.push_str(&if *quoted { crate::glob::escape(&v) } else { v });
+                }
+                Chunk::ArrayKeys { name, quoted } => {
+                    let name = name.clone();
+                    let sep = self.ifs_join_char();
+                    let v = self.array_keys(&name).join(&sep);
+                    out.push_str(&if *quoted { crate::glob::escape(&v) } else { v });
+                }
+                Chunk::VarNamesMatchingPrefix { prefix, quoted, .. } => {
+                    let prefix = prefix.clone();
+                    let sep = self.ifs_join_char();
+                    let v = self.var_names_with_prefix(&prefix).join(&sep);
+                    out.push_str(&if *quoted { crate::glob::escape(&v) } else { v });
+                }
+                Chunk::ProcSubIn { raw } => {
+                    let raw = raw.clone();
+                    let v = self.run_proc_sub_in(&raw);
+                    out.push_str(&crate::glob::escape(&v));
+                }
+                Chunk::ProcSubOut { raw } => {
+                    let raw = raw.clone();
+                    let v = self.run_proc_sub_out(&raw);
+                    out.push_str(&crate::glob::escape(&v));
                 }
             }
         }
@@ -5253,7 +5370,42 @@ impl Shell {
         if !self.restrict_to_builtins
             && let Some(body) = self.functions.get(&name).cloned()
         {
-            return self.call_function(&name, &body, argv[1..].to_vec());
+            // A redirect on the *call* applies to the whole body:
+            // `f > out` sends everything the function prints to the
+            // file, builtins and external commands alike. It used to be
+            // dropped entirely -- the file was never even created.
+            if cmd.redirects.is_empty() {
+                return self.call_function(&name, &body, argv[1..].to_vec());
+            }
+            if !Self::compound_redirects_are_simple(&cmd.redirects) {
+                // A numbered-fd redirect on a function call has no
+                // in-process model (see run_compound_redirected); run
+                // the body the way a redirected compound command is
+                // run, which does.
+                let group = parser::Command::Group(
+                    vec![ListItem {
+                        and_or: AndOr { first: Pipeline { commands: vec![body.clone()], negate: false, timed: None }, rest: Vec::new() },
+                        sep: Sep::Seq,
+                        line: self.current_line,
+                    }],
+                    Vec::new(),
+                );
+                self.arg_frames.push(argv[1..].to_vec());
+                let result = self.run_compound_redirected(&group, &cmd.redirects, background);
+                self.arg_frames.pop();
+                return result;
+            }
+            let stdio = match self.resolve_simple_redirects_for_compound(&cmd.redirects) {
+                Ok(stdio) => stdio,
+                Err(e) => {
+                    sh_eprintln!(self, "bish: {}", e);
+                    return ExecResult::Status(1);
+                }
+            };
+            let saved = self.install_redirected_stdio(stdio);
+            let result = self.call_function(&name, &body, argv[1..].to_vec());
+            self.restore_redirected_stdio(saved);
+            return result;
         }
         // A prefix assignment (`IFS=: read a b`) is in scope for the
         // command it prefixes and gone afterwards. The external path

@@ -353,6 +353,13 @@ y
         // -- roadmap 22: parameter expansion's last corners ------------
         case("count-of-the-positionals", r#"set -- a b c; echo "${#@} ${#*} $#""#),
         case("omitted-slice-offset", r#"a=(1 2 3); echo "${a[@]::2}"; x=abcdef; echo "${x::3}"; set -- a b c; echo "${@:1:1}""#),
+        // -- roadmap 24: a redirect on a function call -----------------
+        case("function-call-redirect", r#"f() { echo a; /bin/echo b; echo e >&2; }; f > o 2> e; cat o e; rm -f o e"#),
+        case("function-call-redirect-fd", r#"f() { echo x; }; f 3>&1 >o; cat o; rm -f o"#),
+        case(
+            "dbracket-quoted-pattern",
+            r#"[[ abc == a* ]] && echo glob; [[ abc == "a*" ]] || echo literal; p='a*'; [[ abc == $p ]] && echo var-globs; [[ abc == "$p" ]] || echo var-literal"#,
+        ),
         // -- roadmap 23: the command line the shell is invoked with ----
         case("bash-versinfo", r#"echo "${#BASH_VERSINFO[@]} ${BASH_VERSINFO[3]} ${BASH_VERSINFO[4]}""#),
         // The harness clears the environment, so both shells start
@@ -365,8 +372,6 @@ y
     // *still* diverge -- fixing one fails this test until its line is
     // removed, which is the only way a list like this stays true.
     const DIVERGENCES: &[(&str, &str)] = &[
-        ("function-call-redirect", "a redirect on a function *call* does not reach a builtin inside the body"),
-        ("dbracket-pattern", "quoting the right of `[[ == ]]` should make it a literal, not a glob"),
         // The last of the grammar's leniency: bash calls it a syntax
         // error, bish skips the empty statement and runs the rest. The
         // other six of this group are fixed; this one lives inside
@@ -397,8 +402,6 @@ y
     // The cases the divergence list is about. Kept apart from `CASES`
     // so that list stays a description of what works.
     const PENDING: &[Case] = &[
-        case("function-call-redirect", r#"f() { echo inner >&2; }; f 2>/dev/null; echo after"#),
-        case("dbracket-pattern", r#"[[ abc == a* ]] && echo glob; [[ abc == "a*" ]] || echo literal"#),
         // -- roadmap 10: parser leniency, the part still standing -----
         case("empty-command-between-separators", "echo a; ; echo b"),
         // -- the pipeline architecture's residue ----------------------
