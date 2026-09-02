@@ -54,7 +54,7 @@ mod window;
 use std::io::{IsTerminal, Read};
 
 fn main() {
-    let mut args: Vec<String> = std::env::args().collect();
+    let args: Vec<String> = std::env::args().collect();
 
     // `bish tool <subcommand>` -- checked first, ahead of every other
     // argv-based branch below (in particular the generic `args.len() >=
@@ -103,51 +103,284 @@ fn main() {
         }
     }
 
-    // `bish --promoted`: starts the interactive REPL already promoted into
-    // the windowed compositor (see repl::run's own doc comment on this
-    // param) instead of waiting for the first window-family command/
-    // Ctrl+Space. Only meaningful for the interactive branch below, so
-    // this is checked and stripped before any of `-c`/a script path/piped
-    // stdin get their turn at args[1] -- same "leading flag reserved
-    // ahead of everything else" treatment as `tool` just above. Harmless
-    // (silently ignored, `start_promoted` just never gets used) if
-    // combined with one of those non-interactive forms.
-    let start_promoted = args.get(1).map(String::as_str) == Some("--promoted");
-    if start_promoted {
-        args.remove(1);
+    let invocation = match Invocation::parse(&args[1..]) {
+        Ok(inv) => inv,
+        Err(e) => {
+            eprintln!("bish: {e}");
+            eprintln!("{USAGE}");
+            std::process::exit(2);
+        }
+    };
+    if invocation.print_version {
+        println!("bish {} (bash {} compatible)", env!("CARGO_PKG_VERSION"), exec::BASH_VERSION);
+        std::process::exit(0);
+    }
+    if invocation.print_help {
+        println!("{USAGE}");
+        std::process::exit(0);
     }
 
     let mut shell = exec::Shell::new();
-
-    if args.len() >= 3 && args[1] == "-c" {
-        let script_name = args.get(3).cloned().unwrap_or_else(|| "bish".to_string());
-        let positional = args.get(4..).map(|s| s.to_vec()).unwrap_or_default();
-        shell.set_script_args(script_name, positional);
-        std::process::exit(run_source(&mut shell, &args[2]));
+    // $SHLVL counts how deep this shell is inside other shells. bash
+    // reads whatever it inherited and adds one; a shell that does not
+    // is invisible to anything counting nesting, `exit`-on-last-level
+    // prompts included.
+    let depth = shell.lookup_var("SHLVL").trim().parse::<i64>().unwrap_or(0);
+    shell.run_source_here(&format!("export SHLVL={}", depth + 1), "<startup>");
+    for (flag, on) in &invocation.set_flags {
+        shell.apply_shell_flag(*flag, *on);
+    }
+    for (name, on) in &invocation.set_options {
+        shell.apply_shell_option(name, *on);
     }
 
-    if args.len() >= 2 {
-        let path = &args[1];
-        shell.set_script_args(path.clone(), args[2..].to_vec());
+    if let Some(command) = &invocation.command {
+        let script_name = invocation.operands.first().cloned().unwrap_or_else(|| "bish".to_string());
+        let positional = invocation.operands.get(1..).map(<[String]>::to_vec).unwrap_or_default();
+        shell.set_script_args(script_name, positional);
+        source_bash_env(&mut shell, &invocation);
+        std::process::exit(run_source(&mut shell, command));
+    }
+
+    // A named script, unless `-s` said to read stdin regardless.
+    if !invocation.read_stdin
+        && let Some(path) = invocation.operands.first()
+    {
+        shell.set_script_args(path.clone(), invocation.operands[1..].to_vec());
         // A named script has an outermost `main` call frame; `-c` text
         // does not. See Shell::running_a_script.
         shell.running_a_script = true;
+        source_bash_env(&mut shell, &invocation);
         match std::fs::read_to_string(path) {
             Ok(src) => std::process::exit(run_source(&mut shell, &src)),
             Err(e) => {
-                eprintln!("bish: {}: {}", path, e);
-                std::process::exit(1);
+                eprintln!("bish: {}: {}", path, exec::os_message(&e));
+                std::process::exit(127);
             }
         }
     }
+    if !invocation.operands.is_empty() {
+        // `-s` with arguments: they are the positional parameters, and
+        // the script itself comes from stdin.
+        shell.set_script_args("bish".to_string(), invocation.operands.clone());
+    }
 
-    if std::io::stdin().is_terminal() {
-        load_config(&mut shell);
-        repl::run(shell, start_promoted);
+    if invocation.interactive.unwrap_or_else(|| std::io::stdin().is_terminal()) {
+        if !invocation.norc {
+            load_config(&mut shell);
+        }
+        repl::run(shell, invocation.promoted);
     } else {
+        source_bash_env(&mut shell, &invocation);
         let mut src = String::new();
         if std::io::stdin().read_to_string(&mut src).is_ok() {
             std::process::exit(run_source(&mut shell, &src));
+        }
+    }
+}
+
+const USAGE: &str = "\
+usage: bish [options] [script [args...]]
+       bish [options] -c command [name [args...]]
+       bish tool|session <subcommand>
+
+  -c COMMAND     run COMMAND
+  -s             read commands from stdin, remaining arguments are $1..
+  -i             force interactive, even without a terminal
+  -l, --login    a login shell: read $BASH_ENV/profile before anything else
+  --norc         do not read ~/.config/bish/config.bash
+  -o NAME        set the `set -o` option NAME (`+o NAME` unsets it)
+  -e -u -x -f    the `set` flags, and any other single-letter one
+  --version      print the version and exit
+  --help         print this and exit";
+
+// What the command line asked for. Everything here is bash's own
+// spelling; `--promoted` is bish's own (see repl::run).
+#[derive(Default)]
+struct Invocation {
+    command: Option<String>,
+    operands: Vec<String>,
+    read_stdin: bool,
+    // `None` means "decide from whether stdin is a terminal", which is
+    // what a shell with no `-i`/`-c`/script does.
+    interactive: Option<bool>,
+    login: bool,
+    norc: bool,
+    promoted: bool,
+    print_version: bool,
+    print_help: bool,
+    set_flags: Vec<(char, bool)>,
+    set_options: Vec<(String, bool)>,
+}
+
+impl Invocation {
+    // Everything that is not `-c`, a script path, `tool` or
+    // `--promoted` used to be read as a *filename*, so `bish -lc 'echo'`
+    // -- how a terminal emulator starts a login shell -- failed with
+    // "-lc: No such file or directory", and `bish --version` did too.
+    fn parse(args: &[String]) -> Result<Invocation, String> {
+        let mut inv = Invocation::default();
+        let mut i = 0;
+        while i < args.len() {
+            let arg = &args[i];
+            match arg.as_str() {
+                "--" => {
+                    i += 1;
+                    break;
+                }
+                "--version" => inv.print_version = true,
+                "--help" => inv.print_help = true,
+                "--login" => inv.login = true,
+                "--norc" | "--noprofile" => inv.norc = true,
+                "--promoted" => inv.promoted = true,
+                _ if arg.starts_with("--") => return Err(format!("{arg}: unrecognized option")),
+                // A cluster of single-letter flags, either sense:
+                // `-euo pipefail`, `+x`. A bare `-` or `+` is an
+                // operand, not a flag.
+                _ if (arg.starts_with('-') || arg.starts_with('+')) && arg.len() > 1 => {
+                    let on = arg.starts_with('-');
+                    let mut letters = arg[1..].chars();
+                    while let Some(c) = letters.next() {
+                        match c {
+                            // `c` ends the cluster: what follows is the
+                            // command, which is why `-lc 'echo hi'`
+                            // works.
+                            'c' => {
+                                i += 1;
+                                inv.command = Some(args.get(i).cloned().ok_or("-c: option requires an argument")?);
+                                inv.interactive.get_or_insert(false);
+                            }
+                            'o' => {
+                                let rest: String = letters.by_ref().collect();
+                                let name = match rest.is_empty() {
+                                    false => rest,
+                                    true => {
+                                        i += 1;
+                                        args.get(i).cloned().ok_or("-o: option requires an argument")?
+                                    }
+                                };
+                                inv.set_options.push((name, on));
+                            }
+                            's' => inv.read_stdin = true,
+                            'i' => inv.interactive = Some(on),
+                            'l' => inv.login = true,
+                            other => inv.set_flags.push((other, on)),
+                        }
+                    }
+                }
+                // The first non-option word is the script, and
+                // everything after it belongs to the script rather than
+                // to this shell.
+                _ => break,
+            }
+            i += 1;
+        }
+        inv.operands.extend_from_slice(&args[i.min(args.len())..]);
+        Ok(inv)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Invocation;
+
+    fn parse(args: &[&str]) -> Invocation {
+        Invocation::parse(&args.iter().map(|s| s.to_string()).collect::<Vec<_>>()).expect("parses")
+    }
+
+    // Everything except `-c`, a script path and two bish-only words
+    // used to be read as a *filename*, so `bish -lc 'echo hi'` -- how a
+    // terminal emulator starts a login shell -- failed with "-lc: No
+    // such file or directory".
+    #[test]
+    fn a_cluster_ending_in_c_takes_the_next_argument_as_the_command() {
+        let inv = parse(&["-lc", "echo hi"]);
+        assert_eq!(inv.command.as_deref(), Some("echo hi"));
+        assert!(inv.login);
+        assert_eq!(inv.interactive, Some(false), "-c is not interactive");
+    }
+
+    #[test]
+    fn set_flags_and_options_come_through() {
+        let inv = parse(&["-euo", "pipefail", "-c", "true"]);
+        assert_eq!(inv.set_flags, vec![('e', true), ('u', true)]);
+        assert_eq!(inv.set_options, vec![("pipefail".to_string(), true)]);
+        assert_eq!(inv.command.as_deref(), Some("true"));
+    }
+
+    #[test]
+    fn plus_unsets_what_minus_sets() {
+        let inv = parse(&["+x", "script.sh"]);
+        assert_eq!(inv.set_flags, vec![('x', false)]);
+        assert_eq!(inv.operands, vec!["script.sh".to_string()]);
+    }
+
+    // The first word that is not an option belongs to the script, and
+    // so does everything after it -- `bish s.sh -x` passes `-x` to the
+    // script, it does not turn on xtrace.
+    #[test]
+    fn options_stop_at_the_first_operand() {
+        let inv = parse(&["-e", "s.sh", "-x", "arg"]);
+        assert_eq!(inv.set_flags, vec![('e', true)]);
+        assert_eq!(inv.operands, vec!["s.sh".to_string(), "-x".to_string(), "arg".to_string()]);
+    }
+
+    #[test]
+    fn dash_dash_ends_the_options() {
+        let inv = parse(&["--", "-notaflag"]);
+        assert!(inv.set_flags.is_empty());
+        assert_eq!(inv.operands, vec!["-notaflag".to_string()]);
+    }
+
+    #[test]
+    fn a_missing_option_argument_is_an_error() {
+        let args = ["-c".to_string()];
+        assert!(Invocation::parse(&args).is_err());
+        let args = ["-o".to_string()];
+        assert!(Invocation::parse(&args).is_err());
+    }
+
+    #[test]
+    fn an_unknown_long_option_is_an_error() {
+        let args = ["--nosuch".to_string()];
+        assert!(Invocation::parse(&args).is_err());
+    }
+
+    #[test]
+    fn version_and_help_are_recognized() {
+        assert!(parse(&["--version"]).print_version);
+        assert!(parse(&["--help"]).print_help);
+    }
+
+    // A lone `-` is an operand, the way it is to every other tool.
+    #[test]
+    fn a_bare_dash_is_not_a_flag() {
+        let inv = parse(&["-"]);
+        assert!(inv.set_flags.is_empty());
+        assert_eq!(inv.operands, vec!["-".to_string()]);
+    }
+}
+
+// `$BASH_ENV` for a non-interactive shell, and the login profile for a
+// login one -- bash reads the first before running a script or `-c`
+// text, which is how a system-wide setup file reaches a script at all.
+fn source_bash_env(shell: &mut exec::Shell, invocation: &Invocation) {
+    if invocation.norc {
+        return;
+    }
+    let mut candidates: Vec<String> = Vec::new();
+    if invocation.login
+        && let Some(home) = std::env::var_os("HOME")
+    {
+        candidates.push(std::path::PathBuf::from(home).join(".profile").display().to_string());
+    }
+    let env_var = shell.lookup_var("BASH_ENV");
+    if !env_var.trim().is_empty() {
+        candidates.push(env_var);
+    }
+    for path in candidates {
+        if let Ok(src) = std::fs::read_to_string(&path) {
+            shell.run_source_here(&src, &path);
         }
     }
 }

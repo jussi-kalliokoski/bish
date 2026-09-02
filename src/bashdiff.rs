@@ -353,6 +353,12 @@ y
         // -- roadmap 22: parameter expansion's last corners ------------
         case("count-of-the-positionals", r#"set -- a b c; echo "${#@} ${#*} $#""#),
         case("omitted-slice-offset", r#"a=(1 2 3); echo "${a[@]::2}"; x=abcdef; echo "${x::3}"; set -- a b c; echo "${@:1:1}""#),
+        // -- roadmap 23: the command line the shell is invoked with ----
+        case("bash-versinfo", r#"echo "${#BASH_VERSINFO[@]} ${BASH_VERSINFO[3]} ${BASH_VERSINFO[4]}""#),
+        // The harness clears the environment, so both shells start
+        // from no SHLVL at all and must reach 1 -- the increment is
+        // what is being checked, not the inherited value.
+        case("shlvl-starts-at-one", r#"echo "$SHLVL""#),
     ];
 
     // Cases bish does not match today, each with why. Asserted to

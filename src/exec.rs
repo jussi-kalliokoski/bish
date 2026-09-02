@@ -1532,7 +1532,10 @@ impl Shell {
             var_scopes: Vec::new(),
             script_name: "bish".to_string(),
             running_a_script: false,
-            arrays: HashMap::new(),
+            // Scripts branch on `${BASH_VERSINFO[0]}` far more often
+            // than they parse `$BASH_VERSION`, so the taken-apart form
+            // has to exist too.
+            arrays: HashMap::from([("BASH_VERSINFO".to_string(), BASH_VERSINFO.iter().enumerate().map(|(i, v)| (i, (*v).to_string())).collect())]),
             assoc_arrays: HashMap::new(),
             assoc_names: std::collections::HashSet::new(),
             aliases: Vec::new(),
@@ -8281,7 +8284,7 @@ impl Shell {
                 // assignment (checked above) since that's the common bash
                 // behavior for all of these once actually set.
                 match name {
-                    "BASH_VERSION" => "5.2.21(1)-release".to_string(),
+                    "BASH_VERSION" => BASH_VERSION.to_string(),
                     "PPID" => unsafe { getppid() }.to_string(),
                     "UID" => unsafe { getuid() }.to_string(),
                     "EUID" => unsafe { geteuid() }.to_string(),
@@ -12423,6 +12426,13 @@ pub(crate) enum BishOptValue {
 // Shell::change_directory's own "refused by `set -r`" answer -- matched
 // by the `cd` builtin so it can keep printing the message it always has.
 pub(crate) const RESTRICTED: &str = "restricted";
+
+/// The bash release bish answers `$BASH_VERSION` with, and reports
+/// itself compatible with in `--version`. `BASH_VERSINFO` is this same
+/// version taken apart, since scripts branch on `${BASH_VERSINFO[0]}`
+/// far more often than they parse the string.
+pub const BASH_VERSION: &str = "5.2.21(1)-release";
+pub(crate) const BASH_VERSINFO: &[&str] = &["5", "2", "21", "1", "release", "x86_64-pc-linux-gnu"];
 
 const KNOWN_BISHOPTS: &[(&str, BishOptDefault)] = &[
     // Which `::bish theme`-declared theme (if any) is currently active --
