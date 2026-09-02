@@ -548,7 +548,7 @@ fn lint_word_chunks(
     }
     for chunk in chunks {
         match chunk {
-            Chunk::Str(_) => {}
+            Chunk::Str(_) | Chunk::Tilde { .. } => {}
             Chunk::LiteralStr(_) => {
                 next_span(raw_spans, cursor);
             }

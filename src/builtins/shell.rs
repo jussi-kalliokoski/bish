@@ -433,24 +433,32 @@ pub(crate) fn run_command(sh: &mut Shell, cmd: &parser::Command, background: boo
 pub(crate) fn run_type(sh: &mut Shell, args: &[String]) -> i32 {
     let mut path_only = false;
     let mut kind_only = false;
+    // `-a` reports *every* way the name resolves, not just the first:
+    // `type -a echo` is how you find out there is a /usr/bin/echo
+    // behind the builtin.
+    let mut all = false;
     let mut names: Vec<&String> = Vec::new();
     for a in args {
         match a.as_str() {
             "-p" | "-P" => path_only = true,
             "-t" => kind_only = true,
-            "-a" => {}
+            "-a" => all = true,
             _ => names.push(a),
         }
     }
     let mut status = 0;
     for name in names {
+        let mut found = false;
         if sh.functions.contains_key(name.as_str()) {
             if kind_only {
                 sh_println!(sh, "function");
             } else if !path_only {
                 sh_println!(sh, "{} is a function", name);
             }
-            continue;
+            found = true;
+            if !all {
+                continue;
+            }
         }
         if sh.is_active_builtin(name) {
             if kind_only {
@@ -458,7 +466,10 @@ pub(crate) fn run_type(sh: &mut Shell, args: &[String]) -> i32 {
             } else if !path_only {
                 sh_println!(sh, "{} is a shell builtin", name);
             }
-            continue;
+            found = true;
+            if !all {
+                continue;
+            }
         }
         match resolve_in_path(name) {
             Some(p) => {
@@ -468,6 +479,7 @@ pub(crate) fn run_type(sh: &mut Shell, args: &[String]) -> i32 {
                     sh_println!(sh, "{}", if path_only { p } else { format!("{} is {}", name, p) });
                 }
             }
+            None if found => {}
             None => {
                 // `-t` says nothing about a name it does not know:
                 // the empty answer is the answer, and bash keeps the

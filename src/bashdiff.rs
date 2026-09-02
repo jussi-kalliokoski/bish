@@ -330,6 +330,18 @@ y
             "nocasematch-covers-case",
             r#"shopt -s nocasematch; case AB in ab) echo ci;; esac; [[ ABC == abc ]] && echo dbracket; [ ABC = abc ] || echo literal"#,
         ),
+        // -- roadmap 19: the builtins and flags nobody had needed -------
+        case("printf-star-width", r#"printf '%*d|%-*d|%.*f|%*.*f|\n' 5 42 5 42 2 3.14159 8 2 3.14159"#),
+        case("tilde-user-and-dirs", r#"cd /tmp; cd /; echo "$(echo ~+) $(echo ~-)"; echo ~nosuchuser_zz"#),
+        // Not through a pipe: `jobs` as a pipeline stage is its own
+        // divergence (see jobs-in-a-pipeline).
+        case("jobs-p-and-l", r#"sleep 0.2 & jobs -p > p; jobs > j; grep -cE '^[0-9]+$' p; grep -c Running j"#),
+        case("type-a-lists-every-match", r#"type -a echo"#),
+        case("alias-p", r#"alias x=y; alias -p"#),
+        case("dollar-quoted-string", r#"x=1; echo $"lit $x""#),
+        case("source-takes-arguments", "printf 'echo \"[$1][$#]\"\\n' > s.sh; set -- outer; . ./s.sh a b; echo \"after=[$1]\""),
+        case("xtrace-traces-assignments", r#"PS4='XX '; set -x; x=1; y="a b"; a=(1 2)"#),
+        case("true-and-false-are-builtins", r#"type -t true; type -t false; true; echo "rc=$?"; false; echo "rc=$?""#),
     ];
 
     // Cases bish does not match today, each with why. Asserted to
@@ -344,6 +356,12 @@ y
         // skip_terminators, which every construct's list parsing goes
         // through, and is not worth the blast radius on its own.
         ("empty-command-between-separators", "`;` twice in a row is skipped rather than reported"),
+        // Both are the pipeline architecture's residue: a stage that is
+        // a builtin, function or compound command re-execs (see roadmap
+        // 13), and a re-exec carries neither an fd table nor a job
+        // table across.
+        ("coproc-fds", "a coproc's `${NAME[0]}`/`[1]` descriptors are not wired to the co-process, so writing one and reading the other deadlocks"),
+        ("jobs-in-a-pipeline", "`jobs` as a pipeline stage runs in a child with an empty job table"),
     ];
 
     // The cases the divergence list is about. Kept apart from `CASES`
@@ -353,6 +371,11 @@ y
         case("dbracket-pattern", r#"[[ abc == a* ]] && echo glob; [[ abc == "a*" ]] || echo literal"#),
         // -- roadmap 10: parser leniency, the part still standing -----
         case("empty-command-between-separators", "echo a; ; echo b"),
+        // -- the pipeline architecture's residue ----------------------
+        // This one *deadlocks* in bish, which is why the harness above
+        // has a timeout.
+        case("coproc-fds", r#"coproc CP { read line; echo "got $line"; }; echo hi >&"${CP[1]}"; read -r out <&"${CP[0]}"; echo "$out""#),
+        case("jobs-in-a-pipeline", r#"sleep 0.2 & jobs -p | grep -cE '^[0-9]+$'"#),
     ];
 
     // `target/<profile>/bish`, worked out from the test binary's own
@@ -381,6 +404,12 @@ y
     // result depends on which other tests happened to run first --
     // which showed up as every glob case failing, from a leaked
     // GLOBIGNORE, in whole-suite runs only.
+    // Five seconds, then killed. A case that deadlocks -- and the
+    // divergence list has one, a coproc whose descriptors go nowhere --
+    // would otherwise wedge the whole test run rather than reporting a
+    // difference.
+    const CASE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
     fn run(shell: &std::ffi::OsStr, script: &str, dir: &std::path::Path) -> String {
         let out = Command::new(shell)
             .arg("-c")
@@ -391,7 +420,11 @@ y
             .env("LC_ALL", "C")
             .env("HOME", dir)
             .env("PS1", "$ ")
-            .output();
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .and_then(|child| wait_with_timeout(child, CASE_TIMEOUT));
         match out {
             Ok(out) => {
                 let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
@@ -417,6 +450,25 @@ y
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    // `Child::wait_with_output` with a deadline: polled rather than
+    // blocked on, and killed if it runs out. Its output is still
+    // collected afterwards, so a case that produced something before
+    // hanging still reports it.
+    fn wait_with_timeout(mut child: std::process::Child, limit: std::time::Duration) -> std::io::Result<std::process::Output> {
+        let deadline = std::time::Instant::now() + limit;
+        loop {
+            if child.try_wait()?.is_some() {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        child.wait_with_output()
     }
 
     fn compare(cases: &[Case], bish: &std::path::Path) -> Vec<(&'static str, String, String)> {

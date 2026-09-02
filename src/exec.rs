@@ -4995,6 +4995,10 @@ impl Shell {
         let mut out = String::new();
         for c in &w.chunks {
             match c {
+                Chunk::Tilde { name } => {
+                    let name = name.clone();
+                    out.push_str(&crate::regex::escape(&self.expand_tilde(&name)));
+                }
                 Chunk::Str(t) => out.push_str(t),
                 Chunk::LiteralStr(t) => out.push_str(&crate::regex::escape(t)),
                 Chunk::Var { name, quoted } => {
@@ -5093,8 +5097,16 @@ impl Shell {
             // Cleared before the expansions, so what is left afterwards
             // is this command's own -- see last_subst_status.
             self.last_subst_status = None;
+            // A bare assignment is a command, and bash traces it:
+            // `set -x; x=1` prints `+ x=1`, with the *expanded* value
+            // and quotes only where they are needed.
+            let mut traced: Vec<String> = Vec::new();
             for (name, mode, val) in &cmd.assigns {
                 let v = self.expand_word(val);
+                if self.opt_xtrace {
+                    let op = if *mode == AssignMode::Append { "+=" } else { "=" };
+                    traced.push(format!("{}{}{}", name, op, xtrace_quote(&v)));
+                }
                 ok &= match mode {
                     AssignMode::Set => self.assign_var(name, v),
                     AssignMode::Append => {
@@ -5105,6 +5117,9 @@ impl Shell {
                 };
             }
             for (name, mode, items) in &cmd.array_assigns {
+                if self.opt_xtrace {
+                    traced.push(self.array_literal_display(name, *mode, items));
+                }
                 ok &= self.apply_array_literal(name, *mode, items);
             }
             for (name, index, mode, val) in &cmd.index_assigns {
@@ -5120,6 +5135,10 @@ impl Shell {
                 // needs to know that one is coming.
                 ok &= !self.name_is_readonly(name);
                 let v = self.expand_word(val);
+                if self.opt_xtrace {
+                    let op = if *mode == AssignMode::Append { "+=" } else { "=" };
+                    traced.push(format!("{}[{}]{}{}", name, index, op, xtrace_quote(&v)));
+                }
                 let v = match mode {
                     AssignMode::Set => v,
                     // `m[k]+=v` appends to whatever the element holds,
@@ -5127,6 +5146,10 @@ impl Shell {
                     AssignMode::Append => self.array_element(name, index) + &v,
                 };
                 self.array_set_index(name, index, v);
+            }
+            if !traced.is_empty() {
+                let ps4 = self.xtrace_prefix();
+                sh_eprintln!(self, "{}{}", ps4, traced.join(" "));
             }
             if !cmd.redirects.is_empty() {
                 // side effect only: create/truncate/append the target files
@@ -5212,7 +5235,8 @@ impl Shell {
             return ExecResult::Status(0);
         }
         if self.opt_xtrace {
-            sh_eprintln!(self, "+ {}", argv.join(" "));
+            let ps4 = self.xtrace_prefix();
+            sh_eprintln!(self, "{}{}", ps4, argv.join(" "));
         }
         let name = argv[0].clone();
 
@@ -5494,6 +5518,23 @@ impl Shell {
                 }
                 return ExecResult::Status(0);
             }
+            // Real builtins, as they are in bash: a `while true` loop
+            // should not spawn a process per iteration.
+            "true" => return ExecResult::Status(0),
+            "false" => return ExecResult::Status(1),
+            // Job control belongs to the terminal, and a shell without
+            // it cannot hand itself back -- bash says exactly this.
+            "suspend" => {
+                if !self.opt_monitor {
+                    sh_eprintln!(self, "bish: suspend: cannot suspend: no job control");
+                    return ExecResult::Status(1);
+                }
+                unsafe extern "C" {
+                    fn getpid() -> i32;
+                }
+                send_signal(unsafe { getpid() } as u32, 19);
+                return ExecResult::Status(0);
+            }
             "cd" => return ExecResult::Status(crate::builtins::dirs::run_cd(self, &argv[1..])),
             // `e [ARG...]`: bubbles up via ExecResult::Edit -- see its
             // own doc comment, and Fg's, for why this can't just be
@@ -5522,7 +5563,11 @@ impl Shell {
             // command runs -- see the comment on the `aliases` field for
             // why.
             "alias" => {
-                if argv.len() == 1 {
+                // `-p` prints them all, the same as no arguments --
+                // bash's flag for "give me something re-runnable", and
+                // it used to be read as an alias *name* and reported
+                // as not found.
+                if argv.len() == 1 || argv[1..].iter().all(|a| a == "-p") {
                     let mut sorted: Vec<&(String, String)> = self.aliases.iter().collect();
                     sorted.sort_by(|a, b| a.0.cmp(&b.0));
                     for (n, v) in sorted {
@@ -6259,7 +6304,21 @@ impl Shell {
                         // since `$0` and every later frame belong to the
                         // outer script again.
                         let outer_script = std::mem::replace(&mut self.script_name, path.clone());
+                        // `. file arg...` gives the sourced file its own
+                        // positional parameters, and puts the caller's
+                        // back afterwards. With none given it keeps the
+                        // caller's, which is what makes `. lib.sh`
+                        // inside a function still see `$1`.
+                        let outer_args = match argv.len() > 2 {
+                            true => Some(std::mem::replace(self.arg_frames.last_mut().expect("a positional frame"), argv[2..].to_vec())),
+                            false => None,
+                        };
                         let result = self.run_source_here(&src, &path);
+                        if let Some(args) = outer_args
+                            && let Some(frame) = self.arg_frames.last_mut()
+                        {
+                            *frame = args;
+                        }
                         self.script_name = outer_script;
                         // A sourced script fires RETURN when it
                         // finishes, `functrace` or not -- unlike a
@@ -7099,6 +7158,10 @@ impl Shell {
         let mut s = String::new();
         for c in &w.chunks {
             match c {
+                Chunk::Tilde { name } => {
+                    let name = name.clone();
+                    s.push_str(&self.expand_tilde(&name));
+                }
                 Chunk::Str(t) | Chunk::LiteralStr(t) => s.push_str(t),
                 Chunk::Var { name, .. } => {
                     let name = name.clone();
@@ -7411,8 +7474,8 @@ impl Shell {
         let mut parts = Vec::new();
         for item in items {
             parts.push(match item {
-                ArrayLiteralItem::Positional(w) => crate::serialize::quote_literal(&self.expand_word(w)),
-                ArrayLiteralItem::Keyed(index, w) => format!("[{}]={}", index, crate::serialize::quote_literal(&self.expand_word(w))),
+                ArrayLiteralItem::Positional(w) => xtrace_quote(&self.expand_word(w)),
+                ArrayLiteralItem::Keyed(index, w) => format!("[{}]={}", index, xtrace_quote(&self.expand_word(w))),
             });
         }
         format!("{name}{op}({})", parts.join(" "))
@@ -7445,6 +7508,14 @@ impl Shell {
         let mut pattern_current: Option<String> = None;
         for c in &w.chunks {
             match c {
+                // The expanded home directory is text, not a pattern:
+                // a `~user` whose home holds a `*` must not glob.
+                Chunk::Tilde { name } => {
+                    let name = name.clone();
+                    let home = self.expand_tilde(&name);
+                    current.get_or_insert_with(String::new).push_str(&home);
+                    pattern_current.get_or_insert_with(String::new).push_str(&crate::glob::escape(&home));
+                }
                 Chunk::Str(t) => {
                     current.get_or_insert_with(String::new).push_str(t);
                     pattern_current.get_or_insert_with(String::new).push_str(t);
@@ -7639,6 +7710,31 @@ impl Shell {
             return arith::eval(&expanded, self);
         }
         arith::eval(raw, self)
+    }
+
+    // What a `~` prefix stands for. Empty is `$HOME`; `+` and `-` are
+    // bash's spellings of `$PWD` and `$OLDPWD`; anything else is a user
+    // name, looked up in /etc/passwd. A name with no home found is left
+    // as it was written, which is what bash does -- `~nosuchuser/x`
+    // really is the literal path `~nosuchuser/x`.
+    fn expand_tilde(&mut self, name: &str) -> String {
+        match name {
+            "" => self.lookup_var("HOME"),
+            "+" => self.lookup_var("PWD"),
+            "-" => self.lookup_var("OLDPWD"),
+            user => home_of_user(user).unwrap_or_else(|| format!("~{user}")),
+        }
+    }
+
+    // `PS4`, the string `set -x` puts in front of each traced line.
+    // bash's default is `+ `, and the first character is repeated once
+    // per level of nesting -- only the flat default is reproduced here,
+    // since nothing in this shell tracks a trace depth.
+    fn xtrace_prefix(&mut self) -> String {
+        match self.var_is_set("PS4") {
+            true => self.lookup_var("PS4"),
+            false => "+ ".to_string(),
+        }
     }
 
     fn expand_raw(&mut self, raw: &str) -> String {
@@ -10301,21 +10397,44 @@ pub(crate) fn printf_format_once(format: &str, values: &[String], idx: &mut usiz
                 _ => break,
             }
         }
+        // `%*d` takes the width from an argument, `%.*f` the
+        // precision. Both are how a script prints a column whose width
+        // it computed; neither was recognised, so `%*d` reported a
+        // missing format character.
         let mut width_digits = String::new();
-        while let Some(&p) = chars.peek() {
-            if p.is_ascii_digit() {
-                width_digits.push(p);
-                chars.next();
-            } else {
-                break;
+        let mut star_width: Option<usize> = None;
+        if chars.peek() == Some(&'*') {
+            chars.next();
+            let v = values.get(*idx).cloned().unwrap_or_default();
+            *idx += 1;
+            star_width = Some(printf_int(&v).unsigned_abs() as usize);
+            // A negative `*` width means left-aligned, as `-` does.
+            if printf_int(&v) < 0 {
+                left_align = true;
             }
         }
-        let width: usize = width_digits.parse().unwrap_or(0);
+        while star_width.is_none() {
+            match chars.peek() {
+                Some(&p) if p.is_ascii_digit() => {
+                    width_digits.push(p);
+                    chars.next();
+                }
+                _ => break,
+            }
+        }
+        let width: usize = star_width.unwrap_or_else(|| width_digits.parse().unwrap_or(0));
         let mut precision: Option<usize> = None;
         if chars.peek() == Some(&'.') {
             chars.next();
+            if chars.peek() == Some(&'*') {
+                chars.next();
+                let v = values.get(*idx).cloned().unwrap_or_default();
+                *idx += 1;
+                precision = Some(printf_int(&v).max(0) as usize);
+            }
             let mut p = String::new();
-            while let Some(&d) = chars.peek() {
+            while precision.is_none() {
+                let Some(&d) = chars.peek() else { break };
                 if d.is_ascii_digit() {
                     p.push(d);
                     chars.next();
@@ -10323,7 +10442,9 @@ pub(crate) fn printf_format_once(format: &str, values: &[String], idx: &mut usiz
                     break;
                 }
             }
-            precision = Some(p.parse().unwrap_or(0));
+            if precision.is_none() {
+                precision = Some(p.parse().unwrap_or(0));
+            }
         }
         // C's length modifiers (`%zu`, `%lld`): skipped, since every
         // integer here is already 64-bit -- but skipped rather than
@@ -11060,6 +11181,29 @@ pub(crate) fn waitpid_untraced(pid: u32) -> JobWaitOutcome {
 // it already) and then to empty. pub: prompt.rs reuses this for the
 // "user@host" segment of the default prompt rather than duplicating the
 // lookup.
+// A user's home directory, straight out of /etc/passwd -- field 6 of a
+// colon-separated line whose field 1 is the name. No NSS, so a network
+// directory is not consulted; that is the same limit every other
+// /etc-parsing corner of this shell already has.
+fn home_of_user(user: &str) -> Option<String> {
+    let passwd = std::fs::read_to_string("/etc/passwd").ok()?;
+    passwd.lines().find_map(|line| {
+        let mut fields = line.split(':');
+        (fields.next()? == user).then(|| fields.nth(4).unwrap_or_default().to_string())
+    })
+}
+
+// How `set -x` shows a value: bare when it can be, single-quoted when
+// it cannot. bash's trace is meant to be re-runnable, and quoting
+// everything makes it noise -- `+ x=1`, not `+ x='1'`.
+fn xtrace_quote(value: &str) -> String {
+    let safe = value.chars().all(|c| c.is_ascii_alphanumeric() || "_-./:=@+,%^".contains(c));
+    match safe {
+        true => value.to_string(),
+        false => crate::serialize::quote_literal(value),
+    }
+}
+
 pub fn get_hostname() -> String {
     if let Ok(s) = std::fs::read_to_string("/proc/sys/kernel/hostname") {
         return s.trim_end().to_string();
@@ -11901,6 +12045,9 @@ fn expand_backslash_escapes(s: &str) -> String {
 // sixty.
 pub(crate) const BUILTIN_HELP: &[(&str, &str)] = &[
     (":", "Do nothing, successfully. Arguments are still expanded."),
+    ("true", "Do nothing, successfully."),
+    ("false", "Do nothing, unsuccessfully."),
+    ("suspend", "Suspend this shell. Needs job control."),
     (".", "Read and run a file in this shell. Same as `source`."),
     ("::bish", "bish's own namespace: theme, window, hook, hl, lsp, map."),
     ("=", "Evaluate an arithmetic expression and print it."),
@@ -11973,6 +12120,9 @@ pub(crate) const BUILTIN_HELP: &[(&str, &str)] = &[
 // than anything actually breaking.
 pub(crate) const KNOWN_BUILTINS: &[&str] = &[
     ":",
+    "true",
+    "false",
+    "suspend",
     "times",
     "caller",
     "enable",
@@ -15360,8 +15510,13 @@ echo "status=$?""#,
             shell.run_source_here(script, "<test>");
             out.borrow().clone()
         };
-        assert_eq!(run(r#"true | false; echo "${PIPESTATUS[0]} ${PIPESTATUS[1]}""#), "0 1\n");
-        assert_eq!(run(r#"false | true; echo "${PIPESTATUS[0]} ${PIPESTATUS[1]}""#), "1 0\n");
+        // `sh -c` rather than bare `true`/`false`: those are builtins
+        // now, and a builtin in a pipeline stage self-execs -- under
+        // `cargo test` that resolves to the test harness rather than to
+        // bish (the `current_exe` trap this codebase documents
+        // elsewhere), so it is untestable from here whatever it is.
+        assert_eq!(run(r#"sh -c 'exit 0' | sh -c 'exit 1'; echo "${PIPESTATUS[0]} ${PIPESTATUS[1]}""#), "0 1\n");
+        assert_eq!(run(r#"sh -c 'exit 1' | sh -c 'exit 0'; echo "${PIPESTATUS[0]} ${PIPESTATUS[1]}""#), "1 0\n");
         // Real external stages, not `exit N`: a builtin in a pipeline
         // stage self-execs, and under `cargo test` that resolves to the
         // test harness rather than to bish (the `current_exe` trap this
@@ -15375,7 +15530,7 @@ echo "status=$?""#,
         assert_eq!(run(r#"true; echo "${#PIPESTATUS[@]}""#), "1\n");
         // The whole reason it exists: `$?` is the *last* stage, so a
         // failure anywhere earlier is invisible without this.
-        assert_eq!(run(r#"false | true; echo "$? ${PIPESTATUS[0]}""#), "0 1\n");
+        assert_eq!(run(r#"sh -c 'exit 1' | sh -c 'exit 0'; echo "$? ${PIPESTATUS[0]}""#), "0 1\n");
     }
 
     // `nocasematch` has been in the shopt registry since that registry

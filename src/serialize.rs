@@ -243,6 +243,9 @@ fn serialize_word(w: &Word) -> String {
 
 fn serialize_chunk(c: &Chunk) -> String {
     match c {
+        // Written back as the source wrote it -- `~` is only a tilde
+        // prefix at the start of a word, so it needs no quoting here.
+        Chunk::Tilde { name } => format!("~{}", name),
         Chunk::Str(s) | Chunk::LiteralStr(s) => quote_literal(s),
         Chunk::Var { name, quoted } => wrap_quoted(format!("${{{}}}", name), *quoted),
         Chunk::Sub { raw, quoted } => wrap_quoted(format!("$({})", raw), *quoted),

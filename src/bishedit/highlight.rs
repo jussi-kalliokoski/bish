@@ -1432,7 +1432,7 @@ fn highlight_word(
     }
     for chunk in chunks {
         match chunk {
-            Chunk::Str(_) => {}
+            Chunk::Str(_) | Chunk::Tilde { .. } => {}
 
             Chunk::LiteralStr(_) => {
                 if let Some(r) = next_span(raw_spans, cursor) {

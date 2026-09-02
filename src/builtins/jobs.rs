@@ -7,6 +7,18 @@ use crate::exec::{
 };
 use crate::pty;
 
+// One line of `jobs` output, in bash's own columns: the job id and its
+// `+`/`-` mark, the pid when `-l` asked for it, the status padded to 24,
+// then the command. `suffix` is the ` &` a backgrounded job carries and
+// a stopped one does not.
+fn job_line(job: &crate::exec::Job, mark: &str, long: bool, status: &str, suffix: &str) -> String {
+    let pid = match long {
+        true => job.pids.first().map(|p| format!("{p} ")).unwrap_or_default(),
+        false => " ".to_string(),
+    };
+    format!("[{}]{} {}{:<27}{}{}", job.id, mark, pid, status, job.cmd_text, suffix)
+}
+
 pub(crate) fn run_jobs(sh: &mut Shell, args: &[String]) -> i32 {
     // The flags themselves are accepted and ignored -- this listing has
     // one shape -- but a letter bash does not have is a typo, and
@@ -14,6 +26,28 @@ pub(crate) fn run_jobs(sh: &mut Shell, args: &[String]) -> i32 {
     if let Some(bad) = crate::exec::first_unknown_option(args, "lnprsx") {
         let usage = "jobs [-lnprs] [jobspec ...] or jobs -x command [args]";
         return crate::exec::bad_option_status(sh, "jobs", &bad, usage);
+    }
+    // `-p` is the pids alone -- what `kill $(jobs -p)` is written for;
+    // `-l` is the normal listing with each job's pid in it.
+    let pids_only = args.iter().any(|a| a == "-p");
+    let long = args.iter().any(|a| a == "-l");
+    if pids_only {
+        let mut table = sh.jobs.borrow_mut();
+        let mut done = Vec::new();
+        for (i, job) in table.jobs.iter_mut().enumerate() {
+            match (job.stopped, job.poll()) {
+                (false, Some(_)) => done.push(i),
+                _ => {
+                    if let Some(pid) = job.pids.first() {
+                        sh_println!(sh, "{pid}");
+                    }
+                }
+            }
+        }
+        for i in done.into_iter().rev() {
+            table.jobs.remove(i);
+        }
+        return 0;
     }
     let mut table = sh.jobs.borrow_mut();
     let last_idx = table.jobs.len().checked_sub(1);
@@ -36,16 +70,16 @@ pub(crate) fn run_jobs(sh: &mut Shell, args: &[String]) -> i32 {
             // No trailing " &": bash only shows that for a job
             // actually launched with `&`, and a job stopped via
             // Ctrl-Z from the foreground wasn't.
-            sh_println!(sh, "[{}]{}  Stopped                 {}", job.id, mark, job.cmd_text);
+            sh_println!(sh, "{}", job_line(job, mark, long, "Stopped", ""));
             continue;
         }
         match job.poll() {
             Some(_) => {
-                sh_println!(sh, "[{}]{}  Done                    {} &", job.id, mark, job.cmd_text);
+                sh_println!(sh, "{}", job_line(job, mark, long, "Done", " &"));
                 to_remove.push(i);
             }
             None => {
-                sh_println!(sh, "[{}]{}  Running                 {} &", job.id, mark, job.cmd_text);
+                sh_println!(sh, "{}", job_line(job, mark, long, "Running", " &"));
             }
         }
     }

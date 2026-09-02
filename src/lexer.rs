@@ -9,6 +9,11 @@
 #[derive(Debug, Clone, PartialEq)]
 pub enum Chunk {
     Str(String),
+    // A `~` prefix at the start of a word. `name` is what followed it:
+    // empty for `~` and `~/...`, `+`/`-` for `$PWD`/`$OLDPWD`, or a
+    // user name to look up. Resolved at expansion time, since it needs
+    // the shell (and /etc/passwd).
+    Tilde { name: String },
     Var { name: String, quoted: bool },
     // Raw, not-yet-parsed source text of a $(...) or `...` command
     // substitution -- re-tokenized/parsed/run recursively at expansion time.
@@ -1185,14 +1190,38 @@ impl<'a> Lexer<'a> {
         let mut buf = String::new();
         let mut plain = true;
 
-        // Tilde expansion: only the bare `~` / `~/...` form at the very
-        // start of a word (no `~user` lookup).
+        // Tilde expansion at the very start of a word: `~`, `~/...`,
+        // `~user`, and bash's `~+`/`~-` for `$PWD`/`$OLDPWD`. The name
+        // is resolved at expansion time, not here -- see Chunk::Tilde.
         if self.chars.peek().copied() == Some('~') {
             let mut probe = self.chars.clone();
             probe.next();
-            if matches!(probe.peek().copied(), None | Some('/') | Some(' ') | Some('\t') | Some('\n')) {
-                self.advance();
-                chunks.push(Chunk::Var { name: "HOME".to_string(), quoted: false });
+            let mut name = String::new();
+            let mut consumed = 1;
+            match probe.peek().copied() {
+                Some(c @ ('+' | '-')) => {
+                    name.push(c);
+                    consumed += 1;
+                    probe.next();
+                }
+                _ => {
+                    while let Some(c) = probe.peek().copied() {
+                        if c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '-' {
+                            name.push(c);
+                            consumed += 1;
+                            probe.next();
+                        } else {
+                            break;
+                        }
+                    }
+                }
+            }
+            // A tilde prefix ends at `/` or at the end of the word.
+            if matches!(probe.peek().copied(), None | Some('/') | Some(' ') | Some('\t') | Some('\n') | Some(':')) {
+                for _ in 0..consumed {
+                    self.advance();
+                }
+                chunks.push(Chunk::Tilde { name });
             }
         }
 
@@ -1374,6 +1403,15 @@ impl<'a> Lexer<'a> {
                         self.raw_capture_spans.push(start..self.pos);
                         chunks.push(Chunk::LiteralStr(n.to_string()));
                     }
+                }
+                // `$"..."` is a *translated* string. With no message
+                // catalogues to consult there is nothing to translate,
+                // so it is exactly a double-quoted string -- which is
+                // also what bash does when no translation is found.
+                // Reading it as a literal `$` followed by a quote,
+                // which is what happened before, printed the dollar.
+                Some('$') if self.peek2() == Some('"') => {
+                    self.advance(); // '$'
                 }
                 Some('$') if self.peek2() == Some('\'') => {
                     plain = false;
