@@ -200,7 +200,10 @@ pub fn has_meta(s: &str) -> bool {
             i += 2;
             continue;
         }
-        if matches!(bytes[i], b'*' | b'?' | b'[') {
+        if matches!(bytes[i], b'*' | b'?') {
+            return true;
+        }
+        if bytes[i] == b'[' && closing_bracket(&bytes[i..]).is_some() {
             return true;
         }
         if matches!(bytes[i], b'@' | b'!' | b'+') && bytes.get(i + 1) == Some(&b'(') {
@@ -209,6 +212,38 @@ pub fn has_meta(s: &str) -> bool {
         i += 1;
     }
     false
+}
+
+/// Where the bracket expression opened at `pat[0]` closes, if it closes
+/// at all -- the same scan `match_class` does, and it has to agree with
+/// it: a `[` with no `]` after it is not a pattern, it is the character
+/// `[`.
+///
+/// That agreement is worth a measurement. `has_meta` used to answer
+/// "yes, a pattern" for any `[`, and a word that *might* be a pattern
+/// gets a filesystem scan. So `[ $n -lt 300 ]` -- two words, `[` and
+/// `]` -- read the whole current directory twice per iteration:
+///
+///     cd /tmp                                  # ~8,000 entries
+///     while [ $n -lt 300 ]; do n=$((n+1)); done
+///     bash 3-13ms, bish 5.7-8.3s
+///
+/// The result was never wrong, since the scan matched nothing and the
+/// word fell back to its own text. It just cost 19-27ms each time.
+fn closing_bracket(pat: &[u8]) -> Option<usize> {
+    let mut i = 1;
+    if i < pat.len() && (pat[i] == b'!' || pat[i] == b'^') {
+        i += 1;
+    }
+    // A `]` in the first position is the literal character, not the
+    // terminator -- `[]]` matches a single `]`.
+    if i < pat.len() && pat[i] == b']' {
+        i += 1;
+    }
+    while i < pat.len() && pat[i] != b']' {
+        i += 1;
+    }
+    (i < pat.len()).then_some(i)
 }
 
 // Escapes every character match_here treats specially, so the result --
@@ -413,4 +448,53 @@ fn unescape(s: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The check that keeps `[ ... ]` off the filesystem. Every `true`
+    // here costs a directory scan at the call site, so the interesting
+    // assertions are the `false` ones.
+    #[test]
+    fn a_bracket_is_a_pattern_only_when_it_closes() {
+        assert!(has_meta("[ab]"), "a real class");
+        assert!(has_meta("[!a]"), "a negated class");
+        assert!(has_meta("[^a]"), "the other negation");
+        assert!(has_meta("[]]"), "a class whose only member is `]`");
+        assert!(has_meta("x[]]y"), "the same, mid-word");
+        assert!(has_meta("a[b]c"), "mid-word");
+
+        // `[` and `]` are the two words of `[ $x -lt 1 ]`, and reading
+        // either as a pattern made every test in a loop read the whole
+        // directory. Neither is one.
+        assert!(!has_meta("["), "a lone open bracket");
+        assert!(!has_meta("]"), "a lone close bracket");
+        assert!(!has_meta("[abc"), "never closed");
+        assert!(!has_meta("[!"), "a negation with nothing after it");
+        assert!(!has_meta("[]"), "`]` right after `[` is the literal, so this never closes");
+        assert!(!has_meta("plain"), "no metacharacters at all");
+        assert!(!has_meta("\\[a]"), "escaped, so not a pattern");
+    }
+
+    // has_meta and match_class have to agree about where a class ends,
+    // or a word gets scanned for as a pattern and then matched as a
+    // literal (or the reverse).
+    #[test]
+    fn has_meta_agrees_with_the_matcher_about_what_is_a_class() {
+        for pat in ["[ab]", "[]]", "[!a]", "[", "]", "[abc", "[]"] {
+            let scanned = has_meta(pat);
+            let matched = match_class(pat.as_bytes(), Some(b'a')).is_some();
+            assert_eq!(scanned, matched, "{pat:?}: has_meta says {scanned}, match_class says {matched}");
+        }
+    }
+
+    #[test]
+    fn an_unterminated_bracket_matches_itself() {
+        assert!(matches("[", "["));
+        assert!(matches("]", "]"));
+        assert!(matches("a[b", "a[b"));
+        assert!(!matches("[", "a"));
+    }
 }
