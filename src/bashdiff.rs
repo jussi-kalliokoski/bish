@@ -265,6 +265,13 @@ mod tests {
         case("nested-subscript-assign", r#"a=(1 2); b=(0); a[b[0]]=9; echo "${a[0]}""#),
         case("index-append", r#"declare -A m; m[k]+=v; m[k]+=w; a=(x); a[0]+=y; echo "${m[k]} ${a[0]}""#),
         case("nameref-to-an-array", r#"a=(1 2); declare -n r=a; echo "${r[1]} ${#r[@]} ${r[*]}"; r[0]=9; echo "${a[0]}""#),
+        // -- roadmap 13: a pipeline stage is this shell's child --------
+        case("stage-sees-globals", r#"x=1; f() { echo "[$x]"; }; { echo "[$x]"; } | cat; f | cat; (echo "[$x]") | cat"#),
+        case("stage-sees-shell-options", r#"set -u; { echo "${nosuch-ok}"; } | cat; shopt -s nullglob; { shopt nullglob; } | cat"#),
+        case("read-leaves-the-rest-of-the-pipe", r#"{ echo a; echo b; } | { read -r x; echo "x=$x"; cat; }"#),
+        case("lastpipe", r#"shopt -s lastpipe; set +m; n=0; seq 1 3 | while read -r l; do n=$((n+1)); done; echo "$n""#),
+        case("lastpipe-status", r#"shopt -s lastpipe; set +m; false | true; echo "${PIPESTATUS[*]}"; true | false; echo "rc=$?""#),
+        case("shopt-status", r#"shopt nullglob; echo "rc=$?"; shopt -s nullglob; shopt nullglob; echo "rc=$?""#),
     ];
 
     // Cases bish does not match today, each with why. Asserted to
@@ -284,10 +291,6 @@ mod tests {
         ("c-for-unbalanced", "the C-style `for`'s own parens are not balance-checked"),
         ("empty-command-between-separators", "`;` twice in a row is skipped rather than reported"),
         ("dbracket-three-operands", "`[[ ]]` takes a fourth operand instead of rejecting it"),
-        (
-            "pipeline-stage-options",
-            "a pipeline stage that is a builtin/function/compound re-execs bish rather than forking a virtual child, so it starts with none of the shell's own `set` options",
-        ),
     ];
 
     // The cases the divergence list is about. Kept apart from `CASES`
@@ -295,7 +298,6 @@ mod tests {
     const PENDING: &[Case] = &[
         case("function-call-redirect", r#"f() { echo inner >&2; }; f 2>/dev/null; echo after"#),
         case("dbracket-pattern", r#"[[ abc == a* ]] && echo glob; [[ abc == "a*" ]] || echo literal"#),
-        case("pipeline-stage-options", r#"set -Ceu; { echo "[$-]"; } | cat"#),
         // -- roadmap 10: parser leniency, the part still standing -----
         case("two-func-defs-no-separator", r#"f() { :; } f() { :; }"#),
         case("brace-group-unterminated", "{ : }"),

@@ -138,11 +138,18 @@ pub(crate) fn run_shopt(sh: &mut Shell, args: &[String]) -> i32 {
             }
         }
         None => {
-            let targets: Vec<&str> = if names.is_empty() { KNOWN_SHOPT_OPTIONS.iter().map(|(n, _)| *n).collect() } else { names };
+            let listing_everything = names.is_empty();
+            let targets: Vec<&str> = if listing_everything { KNOWN_SHOPT_OPTIONS.iter().map(|(n, _)| *n).collect() } else { names };
+            // With names, the status answers the question as well as
+            // the output does -- 0 only when every one of them is on,
+            // which is what makes `shopt -q NAME` and plain
+            // `shopt NAME` interchangeable in a condition. The bare
+            // listing is not a question, so it is always 0.
+            let all_on = targets.iter().all(|n| sh.shopt_is_on(n));
             for n in targets {
                 sh.print_shopt_line(n, reusable);
             }
-            0
+            i32::from(!listing_everything && !all_on)
         }
     }
 }

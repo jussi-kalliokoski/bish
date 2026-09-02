@@ -2655,7 +2655,9 @@ impl Shell {
         if reusable {
             sh_println!(self, "shopt -{} {}", if on { "s" } else { "u" }, name);
         } else {
-            sh_println!(self, "{:<15}\t{}", name, if on { "on" } else { "off" });
+            // 20, then a tab -- bash's own column, and the reason
+            // `shopt | grep` scripts line up the same way there.
+            sh_println!(self, "{:<20}\t{}", name, if on { "on" } else { "off" });
         }
     }
 
@@ -3832,16 +3834,8 @@ impl Shell {
                 return Box::new(SharedStdinReader { state: state.clone(), local: Vec::new() });
             }
         }
-        // NOT `BufReader::new(stdin())` -- that wraps stdin in a fresh,
-        // throwaway read-ahead buffer on every `read` call. A single
-        // read_line() can pull far more than one line into that buffer in
-        // one syscall; whatever it read past the first line is then lost
-        // when the wrapper is dropped at the end of this call, so a `while
-        // read` loop would silently only ever see its first line. Stdin's
-        // own lock reuses the shared, persistent buffer behind
-        // std::io::stdin() instead, so nothing already-read is discarded
-        // between calls.
-        Box::new(std::io::stdin().lock())
+        // One byte per syscall, deliberately -- see UnbufferedStdin.
+        Box::new(UnbufferedStdin::default())
     }
 
     // Shared by `eval`, `source`/`.`, and main.rs's own config-file loading
@@ -3879,6 +3873,17 @@ impl Shell {
     pub(crate) fn functions_preamble(&self) -> String {
         let mut s = String::new();
         let mut flattened: HashMap<&str, &str> = HashMap::new();
+        // Unexported globals. An exported one is in the child's real
+        // environment already and needs no replay; an unexported one
+        // used to travel that way too, before variables stopped living
+        // in the environment (see the `globals` field) -- without this
+        // a pipeline stage started with none of them.
+        for (k, v) in &self.globals {
+            if !self.exported_names.contains(k) {
+                flattened.insert(k.as_str(), v.as_str());
+            }
+        }
+        // Locals over globals: the stage is a child of *this* frame.
         for scope in &self.var_scopes {
             for (k, v) in scope {
                 flattened.insert(k.as_str(), v.as_str());
@@ -3932,6 +3937,26 @@ impl Shell {
                 sep: Sep::Seq,
                 line: 0,
             }]));
+        }
+        // Whatever `shopt -s`/`-u` has been changed from its default.
+        for (name, on) in &self.shopt_options {
+            if shopt_default_on(name) == Some(*on) {
+                continue;
+            }
+            s.push_str(if *on { "shopt -s " } else { "shopt -u " });
+            s.push_str(name);
+            s.push('\n');
+        }
+        // The `set` options go *last*: `set -e` applied any earlier
+        // would make the preamble's own assignments the thing that
+        // aborts the stage, and `set -u` would trip over a name the
+        // preamble has not reached yet.
+        for name in SET_O_OPTIONS {
+            if self.shell_option_enabled(name) == Some(true) {
+                s.push_str("set -o ");
+                s.push_str(name);
+                s.push('\n');
+            }
         }
         s
     }
@@ -6572,7 +6597,10 @@ impl Shell {
     fn run_multi(&mut self, commands: &[parser::Command], background: bool) -> i32 {
         let n = commands.len();
         let mut children: Vec<std::process::Child> = Vec::with_capacity(n);
-        let mut prev_stdout: Option<Stdio> = None;
+        // The previous stage's read end, kept as a `ChildStdout` rather
+        // than a `Stdio`: `lastpipe` needs its fd, and only ChildStdout
+        // still has one.
+        let mut prev_stdout: Option<std::process::ChildStdout> = None;
         // Real job control isolation (see run_single's own identical
         // pre_exec/setpgid pattern) for a *backgrounded* pipeline only --
         // every stage joins the same process group, seeded from the
@@ -6591,6 +6619,16 @@ impl Shell {
         // group" behavior doesn't have.
         let mut pgid: Option<i32> = None;
 
+        // `shopt -s lastpipe`: the *last* stage runs in this shell
+        // rather than in a child, so `seq 3 | while read l; do n=$l;
+        // done` leaves `n` set. bash gates it on job control being off
+        // (an interactive shell has to be able to name the stage as a
+        // job) and on the pipeline being in the foreground; this adds
+        // one more gate, that stdin is not already redirected by an
+        // enclosing converted construct, since the stage's stdin here
+        // is installed by dup2 onto the real fd 0.
+        let lastpipe = n > 1 && !background && !self.opt_monitor && self.stdio_override.is_none() && self.shopt_is_on("lastpipe");
+
         // A backgrounded pipeline's own pty (see background_pty): the
         // first stage reads from it, the last writes to it, and every
         // stage's stderr goes there too -- inherited, any of that would
@@ -6606,10 +6644,13 @@ impl Shell {
 
         for (i, cmd) in commands.iter().enumerate() {
             let is_last = i == n - 1;
+            if is_last && lastpipe {
+                break;
+            }
             // Only the first stage takes the pty as stdin -- every other
             // one reads the previous stage's pipe, exactly as before.
             let default_stdin = match prev_stdout.take() {
-                Some(prev) => prev,
+                Some(prev) => Stdio::from(prev),
                 None => bg_slave(&bg_pty).unwrap_or_else(|| self.spawn_stdin_stdio()),
             };
             let default_stdout = if is_last { bg_slave(&bg_pty).unwrap_or_else(|| self.spawn_stdout_stdio()) } else { Stdio::piped() };
@@ -6743,7 +6784,7 @@ impl Shell {
                         }
                     }
                     if !is_last {
-                        prev_stdout = child.stdout.take().map(Stdio::from);
+                        prev_stdout = child.stdout.take();
                     }
                     children.push(child);
                 }
@@ -6764,6 +6805,32 @@ impl Shell {
             return 0;
         }
 
+        // The last stage, in this shell, reading the pipe the others
+        // are writing to. Run *before* waiting on them: they are
+        // blocked on a full pipe until something drains it.
+        let mut lastpipe_code = None;
+        if lastpipe {
+            unsafe extern "C" {
+                fn dup2(oldfd: i32, newfd: i32) -> i32;
+            }
+            let saved = save_fd012();
+            if let Some(read_end) = prev_stdout.take() {
+                let fd = std::os::fd::OwnedFd::from(read_end);
+                unsafe {
+                    dup2(std::os::fd::AsRawFd::as_raw_fd(&fd), 0);
+                }
+                let result = crate::builtins::shell::run_command(self, &commands[n - 1], false);
+                lastpipe_code = Some(match result {
+                    ExecResult::Exit(code) => {
+                        self.pending_exit = Some(code);
+                        code
+                    }
+                    other => other.status(),
+                });
+            }
+            restore_fd012(saved);
+        }
+
         let mut status = 0;
         let mut pipefail_status = 0;
         // Kept, not just folded down: this is exactly what `PIPESTATUS`
@@ -6778,6 +6845,13 @@ impl Shell {
                     1
                 }
             };
+            codes.push(code);
+            status = code;
+            if code != 0 {
+                pipefail_status = code;
+            }
+        }
+        if let Some(code) = lastpipe_code {
             codes.push(code);
             status = code;
             if code != 0 {
@@ -10129,6 +10203,66 @@ pub(crate) fn printf_format_once(format: &str, values: &[String], idx: &mut usiz
     }
     out.push_str(&String::from_utf8_lossy(&buf));
     outcome
+}
+
+// `read`'s view of the real stdin: never reads a byte it was not asked
+// for.
+//
+// Any buffering here is visible behaviour, not an implementation
+// detail. `{ read -r x; cat; }` must give the first line to `read` and
+// the rest to `cat`, and `cat` is a different process inheriting the
+// same fd -- so anything `read` pulled into a userspace buffer is gone.
+// `BufReader::new(stdin())` lost it at the end of the call;
+// `stdin().lock()` kept it inside this process, which is right for a
+// `while read` loop in one shell and still wrong the moment the fd is
+// handed on. bash reads a byte at a time from a pipe for exactly this
+// reason, and so does this.
+#[derive(Default)]
+struct UnbufferedStdin {
+    byte: [u8; 1],
+    filled: bool,
+}
+
+impl std::io::Read for UnbufferedStdin {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        use std::io::BufRead;
+        if out.is_empty() {
+            return Ok(0);
+        }
+        if self.fill_buf()?.is_empty() {
+            return Ok(0);
+        }
+        out[0] = self.byte[0];
+        self.consume(1);
+        Ok(1)
+    }
+}
+
+impl std::io::BufRead for UnbufferedStdin {
+    fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+        if !self.filled {
+            // Straight to fd 0, not through `std::io::stdin()`, whose
+            // own shared buffer is the thing being avoided.
+            let n = unsafe { libc_read(0, self.byte.as_mut_ptr(), 1) };
+            match n {
+                1 => self.filled = true,
+                0 => return Ok(&[]),
+                _ => return Err(std::io::Error::last_os_error()),
+            }
+        }
+        Ok(&self.byte[..1])
+    }
+
+    fn consume(&mut self, amount: usize) {
+        if amount > 0 {
+            self.filled = false;
+        }
+    }
+}
+
+unsafe extern "C" {
+    #[link_name = "read"]
+    fn libc_read(fd: i32, buf: *mut u8, count: usize) -> isize;
 }
 
 // bash's exit-status convention for a process killed by a signal is
