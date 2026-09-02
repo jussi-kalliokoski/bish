@@ -279,10 +279,8 @@ fn pattern_rows(seq: &[Key], root: &[(Key, String)]) -> Vec<(String, String)> {
 // One row for a group of at least three sequences whose descriptions
 // share everything up to a final word: `di{object}`.
 fn family_row(seq: &[Key]) -> Option<(String, String)> {
-    let described: Vec<String> = candidate_keys()
-        .into_iter()
-        .filter_map(|key| crate::bishedit::vimkeys::describe_key_sequence(&[seq, &[key]].concat()).ok())
-        .collect();
+    let described: Vec<String> =
+        candidate_keys().into_iter().filter_map(|key| crate::bishedit::vimkeys::describe_key_sequence(&[seq, &[key]].concat()).ok()).collect();
     if described.len() < 3 {
         return None;
     }
@@ -371,10 +369,7 @@ fn echoes_last_key(after: &str, seq: &[Key]) -> bool {
 // Every single key that resolves on its own, which is what a modifier's
 // operand is drawn from.
 fn root_descriptions() -> Vec<(Key, String)> {
-    candidate_keys()
-        .into_iter()
-        .filter_map(|key| crate::bishedit::vimkeys::describe_key_sequence(&[key]).ok().map(|desc| (key, desc)))
-        .collect()
+    candidate_keys().into_iter().filter_map(|key| crate::bishedit::vimkeys::describe_key_sequence(&[key]).ok().map(|desc| (key, desc))).collect()
 }
 
 // `f` reads a character and says so: `fa` describes as "find-char 'a'".
@@ -421,10 +416,8 @@ fn echoed_argument(desc: &str, key: Key) -> Option<&str> {
 // What the walk tries at each position: every printable ASCII character
 // and every named key. `1`-`9` are left out -- see `key_index`.
 fn candidate_keys() -> Vec<Key> {
-    let mut keys: Vec<Key> = (0x20u8..0x7f)
-        .map(|b| Key::Char(b as char))
-        .filter(|k| !matches!(k, Key::Char(c) if c.is_ascii_digit() && *c != '0'))
-        .collect();
+    let mut keys: Vec<Key> =
+        (0x20u8..0x7f).map(|b| Key::Char(b as char)).filter(|k| !matches!(k, Key::Char(c) if c.is_ascii_digit() && *c != '0')).collect();
     keys.extend(NAMED.iter().map(|(_, k)| *k));
     keys
 }
@@ -1123,9 +1116,7 @@ mod tests {
         // mapping was refused as an unknown name and the diagnosis
         // ("flow control eats <C-s>") was wrong twice over: bish's raw
         // mode already clears IXON.
-        for (spelling, key) in
-            [("<C-g>", Key::CtrlG), ("<C-q>", Key::CtrlQ), ("<C-s>", Key::CtrlS), ("<C-t>", Key::CtrlT)]
-        {
+        for (spelling, key) in [("<C-g>", Key::CtrlG), ("<C-q>", Key::CtrlQ), ("<C-s>", Key::CtrlS), ("<C-t>", Key::CtrlT)] {
             assert_eq!(parse_keys(spelling), Ok(vec![key]), "{spelling}");
             assert_eq!(format_keys(&[key]), spelling);
             assert!(is_mappable(key));

@@ -29,7 +29,17 @@
 // up, not attempted speculatively.
 
 fn in_ranges(c: u32, ranges: &[(u32, u32)]) -> bool {
-    ranges.binary_search_by(|&(lo, hi)| if c < lo { std::cmp::Ordering::Greater } else if c > hi { std::cmp::Ordering::Less } else { std::cmp::Ordering::Equal }).is_ok()
+    ranges
+        .binary_search_by(|&(lo, hi)| {
+            if c < lo {
+                std::cmp::Ordering::Greater
+            } else if c > hi {
+                std::cmp::Ordering::Less
+            } else {
+                std::cmp::Ordering::Equal
+            }
+        })
+        .is_ok()
 }
 
 // Combining marks, zero-width joiners/spaces, variation selectors --

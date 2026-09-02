@@ -361,11 +361,7 @@ fn find_designator(rest: &str) -> Option<(usize, Designator<'_>)> {
         '$' => Some((1, Designator::LastArg)),
         '-' => {
             let digits: String = rest[1..].chars().take_while(|c| c.is_ascii_digit()).collect();
-            if digits.is_empty() {
-                None
-            } else {
-                Some((1 + digits.len(), Designator::Back(digits.parse().ok()?)))
-            }
+            if digits.is_empty() { None } else { Some((1 + digits.len(), Designator::Back(digits.parse().ok()?))) }
         }
         c if c.is_ascii_digit() => {
             let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
@@ -378,21 +374,13 @@ fn find_designator(rest: &str) -> Option<(usize, Designator<'_>)> {
                 Some((1 + end + 1, Designator::Contains(&body[..end])))
             } else {
                 let end = body.find(char::is_whitespace).unwrap_or(body.len());
-                if end == 0 {
-                    None
-                } else {
-                    Some((1 + end, Designator::Contains(&body[..end])))
-                }
+                if end == 0 { None } else { Some((1 + end, Designator::Contains(&body[..end]))) }
             }
         }
         '/' => {
             let body = &rest[1..];
             let end = body.find(char::is_whitespace).unwrap_or(body.len());
-            if end == 0 {
-                None
-            } else {
-                Some((1 + end, Designator::StartsWith(&body[..end])))
-            }
+            if end == 0 { None } else { Some((1 + end, Designator::StartsWith(&body[..end]))) }
         }
         _ => None,
     }
@@ -544,11 +532,7 @@ fn compact(path: &Path, limit: usize) {
         out.push_str(line);
         out.push('\n');
     }
-    let done = file
-        .set_len(0)
-        .and_then(|()| file.seek(SeekFrom::Start(0)))
-        .and_then(|_| file.write_all(out.as_bytes()))
-        .and_then(|()| file.flush());
+    let done = file.set_len(0).and_then(|()| file.seek(SeekFrom::Start(0))).and_then(|_| file.write_all(out.as_bytes())).and_then(|()| file.flush());
     let _ = done;
     unsafe { flock(fd, LOCK_UN) };
 }
@@ -612,10 +596,7 @@ fn fresh_id() -> u64 {
     STATE.with(|cell| {
         let mut x = cell.get();
         if x == 0 {
-            x = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos() as u64)
-                .unwrap_or(0x2545F4914F6CDD1D)
+            x = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0x2545F4914F6CDD1D)
                 ^ (std::process::id() as u64).wrapping_mul(0x9E3779B97F4A7C15);
             if x == 0 {
                 x = 0x2545F4914F6CDD1D;
@@ -802,9 +783,7 @@ fn parse_record(line: &str) -> Record {
     let Some((words, entry)) = split_record(line) else {
         return Record { id: None, parent: None, cwd: None, time: None, entry: unescape(line) };
     };
-    let value = |flag: &str| {
-        words.iter().position(|w| w == flag).and_then(|i| words.get(i + 1)).map(|s| s.as_str())
-    };
+    let value = |flag: &str| words.iter().position(|w| w == flag).and_then(|i| words.get(i + 1)).map(|s| s.as_str());
     let hex = |flag: &str| value(flag).and_then(|v| u64::from_str_radix(v, 16).ok());
     Record {
         id: hex("--id"),
@@ -1058,10 +1037,7 @@ mod tests {
         // Truncation orphans branches rather than a clean prefix, so an
         // unresolvable parent has to be ordinary. `-p ...0a` survives
         // into the kept window with nothing to point at.
-        let path = temp_history(
-            "orphan",
-            " : --id 000000000000000a -d '/w'; oldest\n : --id 000000000000000b -p 000000000000000a -d '/w'; newest\n",
-        );
+        let path = temp_history("orphan", " : --id 000000000000000a -d '/w'; oldest\n : --id 000000000000000b -p 000000000000000a -d '/w'; newest\n");
         let h = History::load_at(Some(path), 1);
         let entries = h.entries();
         assert_eq!(entries.len(), 1, "the bound is in entries");

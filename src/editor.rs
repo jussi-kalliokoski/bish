@@ -19,15 +19,15 @@
 use std::collections::HashMap;
 use std::io::{self, Write};
 
+use crate::bishedit::Buffer;
 use crate::bishedit::completion::{self, CompletionCandidate, CompletionProvider, CompletionRequest};
-use crate::bishedit::highlight::{self, BashHighlighter, Highlighter, HighlightContext, StyledSpan};
+use crate::bishedit::highlight::{self, BashHighlighter, HighlightContext, Highlighter, StyledSpan};
 use crate::bishedit::motion;
 use crate::bishedit::registers::{RegisterShape, RegisterValue, Registers};
 use crate::bishedit::snippet::{self, Abbr, LiveSnippet, Snippet};
 use crate::bishedit::suggestion::{SuggestionProvider, SuggestionRequest};
 use crate::bishedit::undo::UndoTree;
 use crate::bishedit::unicode_width::char_width;
-use crate::bishedit::Buffer;
 use crate::bishedit::vimkeys::{self, KeyOutcome, Op, VimKeys};
 use crate::history::History;
 // Same cross-module use fileeditor.rs already makes of these two -- see
@@ -757,12 +757,7 @@ fn selection_layer(ed: &LineEditor, range: (usize, usize)) -> Vec<StyledSpan> {
     if from >= to {
         return Vec::new();
     }
-    vec![StyledSpan {
-        start: from,
-        end: to,
-        fg: vt100::Color::Default,
-        attrs: vt100::CellAttrs { reverse: true, ..vt100::CellAttrs::default() },
-    }]
+    vec![StyledSpan { start: from, end: to, fg: vt100::Color::Default, attrs: vt100::CellAttrs { reverse: true, ..vt100::CellAttrs::default() } }]
 }
 
 fn snippet_layer(live: &LiveSnippet) -> Vec<StyledSpan> {
@@ -861,10 +856,22 @@ fn expand_abbr_at_cursor(ed: &mut LineEditor, abbrs: &[Abbr], snippet: &mut Opti
 // something worth highlighting, can be in progress) -- turned into
 // compose_redraw's own generic `overlay` layer here rather than being a
 // second, parallel mechanism beside it.
-fn redraw(prompt: &str, ed: &LineEditor, col_origin: usize, width: usize, ctx: HighlightContext, search_matches: &[(usize, usize)]) -> io::Result<()> {
+fn redraw(
+    prompt: &str,
+    ed: &LineEditor,
+    col_origin: usize,
+    width: usize,
+    ctx: HighlightContext,
+    search_matches: &[(usize, usize)],
+) -> io::Result<()> {
     let overlay: Vec<StyledSpan> = search_matches
         .iter()
-        .map(|&(start, end)| StyledSpan { start, end, fg: vt100::Color::Default, attrs: vt100::CellAttrs { reverse: true, ..vt100::CellAttrs::default() } })
+        .map(|&(start, end)| StyledSpan {
+            start,
+            end,
+            fg: vt100::Color::Default,
+            attrs: vt100::CellAttrs { reverse: true, ..vt100::CellAttrs::default() },
+        })
         .collect();
     print!("{}", compose_redraw(prompt, ed, "", col_origin, width, ctx, &overlay));
     io::stdout().flush()
@@ -895,7 +902,15 @@ fn redraw(prompt: &str, ed: &LineEditor, col_origin: usize, width: usize, ctx: H
 // visually wins over both syntax highlighting and a suggestion's ghost
 // tail wherever they overlap -- matching vim, where `hlsearch` sits on
 // top of everything else. Empty for every caller with nothing to mark.
-fn compose_redraw(prompt: &str, ed: &LineEditor, ghost: &str, col_origin: usize, width: usize, ctx: HighlightContext, overlay: &[StyledSpan]) -> String {
+fn compose_redraw(
+    prompt: &str,
+    ed: &LineEditor,
+    ghost: &str,
+    col_origin: usize,
+    width: usize,
+    ctx: HighlightContext,
+    overlay: &[StyledSpan],
+) -> String {
     let mut out = String::new();
     out.push_str(&format!("\x1b[{}G", col_origin + 1));
     out.push_str(&" ".repeat(width));
@@ -934,10 +949,11 @@ fn compose_redraw(prompt: &str, ed: &LineEditor, ghost: &str, col_origin: usize,
     // Both become real terminal hyperlinks here (see
     // highlight::render_linked), so ^click on a filename at the prompt
     // opens it.
-    let mut links: Vec<highlight::LinkSpan> = if !ctx.hyperlinks { Vec::new() } else { raw
-        .iter()
-        .filter_map(|s| Some(highlight::LinkSpan { start: s.start, end: s.end, url: s.link.clone()? }))
-        .collect() };
+    let mut links: Vec<highlight::LinkSpan> = if !ctx.hyperlinks {
+        Vec::new()
+    } else {
+        raw.iter().filter_map(|s| Some(highlight::LinkSpan { start: s.start, end: s.end, url: s.link.clone()? })).collect()
+    };
     if ctx.hyperlinks {
         for found in crate::url::find(&buf_text) {
             let url: String = buf_text.chars().skip(found.start).take(found.end - found.start).collect();
@@ -1659,7 +1675,7 @@ pub fn read_line(
                 while mapped.is_empty() && !term::stdin_ready(IDLE_POLL_MS) {
                     if on_idle() {
                         let mut overlay = snippet.as_ref().map(snippet_layer).unwrap_or_default();
-        overlay.extend(mouse_selection.into_iter().flat_map(|r| selection_layer(&ed, r)));
+                        overlay.extend(mouse_selection.into_iter().flat_map(|r| selection_layer(&ed, r)));
                         redraw_with_completion_row(
                             prompt,
                             &ed,
@@ -1757,9 +1773,7 @@ pub fn read_line(
             // it fall through would eat a further character.
             if matches!(key, Key::Backspace | Key::Delete) && from < to {
                 let overlay = snippet.as_ref().map(snippet_layer).unwrap_or_default();
-                redraw_with_completion_row(
-                    prompt, &ed, "", None, menu_was_shown, menu_capable, row_origin, col_origin, width, ctx, &overlay,
-                )?;
+                redraw_with_completion_row(prompt, &ed, "", None, menu_was_shown, menu_capable, row_origin, col_origin, width, ctx, &overlay)?;
                 continue;
             }
         }
@@ -2762,7 +2776,13 @@ pub fn apply_motion_or_reselect(vk: &mut VimKeys, buf: &mut impl crate::bishedit
 // directly (not through `Buffer`), and only the LineBuffer-driven contexts
 // ever have something real to put into -- see repl.rs's own doc comment on
 // why `KeyOutcome::Put` is a deliberate no-op there.
-pub fn yank_motion(buf: &mut impl crate::bishedit::Buffer, registers: &mut Registers, motion: motion::Motion, count: Option<usize>, register: Option<char>) {
+pub fn yank_motion(
+    buf: &mut impl crate::bishedit::Buffer,
+    registers: &mut Registers,
+    motion: motion::Motion,
+    count: Option<usize>,
+    register: Option<char>,
+) {
     let Some(range) = motion::motion_range(buf, motion, count) else {
         return;
     };
@@ -3247,7 +3267,12 @@ fn redirect_cw_to_ce(lb: &LineBuffer, motion: &motion::Motion) -> motion::Motion
 // handled by the caller the same way run_line_normal_mode's own
 // `Propagate` is. No terminal cursor-shape change here either -- same
 // reasoning as run_line_normal_mode's own doc comment.
-fn run_one_shot_normal_command(ed: &mut LineEditor, registers: &mut Registers, undo: &mut UndoTree<Vec<char>>, on_idle: &mut dyn FnMut()) -> io::Result<Option<Key>> {
+fn run_one_shot_normal_command(
+    ed: &mut LineEditor,
+    registers: &mut Registers,
+    undo: &mut UndoTree<Vec<char>>,
+    on_idle: &mut dyn FnMut(),
+) -> io::Result<Option<Key>> {
     let mut vk = VimKeys::new();
     let mut marks: HashMap<char, (usize, usize)> = HashMap::new();
     // Never actually driven in this loop (see EnterVisual's own arm

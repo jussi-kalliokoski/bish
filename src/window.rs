@@ -319,7 +319,14 @@ impl WindowEntry {
 // (compute_regions splits one Split's area evenly among however many
 // children it has) rather than each new split only ever halving
 // whatever was there before.
-pub(crate) fn insert_sibling(layout: PaneLayout, target: PaneId, new_id: PaneId, horizontal: bool, new_fixed: Option<usize>, new_minimized: bool) -> PaneLayout {
+pub(crate) fn insert_sibling(
+    layout: PaneLayout,
+    target: PaneId,
+    new_id: PaneId,
+    horizontal: bool,
+    new_fixed: Option<usize>,
+    new_minimized: bool,
+) -> PaneLayout {
     match layout {
         PaneLayout::Leaf(id) if id == target => PaneLayout::Split {
             horizontal,
@@ -334,13 +341,19 @@ pub(crate) fn insert_sibling(layout: PaneLayout, target: PaneId, new_id: PaneId,
             if let Some(idx) = direct_child_idx {
                 if h == horizontal {
                     let mut children = children;
-                    children.insert(idx + 1, SplitChild { layout: PaneLayout::Leaf(new_id), weight: 1.0, fixed: new_fixed, minimized: new_minimized });
+                    children
+                        .insert(idx + 1, SplitChild { layout: PaneLayout::Leaf(new_id), weight: 1.0, fixed: new_fixed, minimized: new_minimized });
                     return PaneLayout::Split { horizontal: h, children };
                 }
             }
             let children = children
                 .into_iter()
-                .map(|c| SplitChild { layout: insert_sibling(c.layout, target, new_id, horizontal, new_fixed, new_minimized), weight: c.weight, fixed: c.fixed, minimized: c.minimized })
+                .map(|c| SplitChild {
+                    layout: insert_sibling(c.layout, target, new_id, horizontal, new_fixed, new_minimized),
+                    weight: c.weight,
+                    fixed: c.fixed,
+                    minimized: c.minimized,
+                })
                 .collect();
             PaneLayout::Split { horizontal: h, children }
         }
@@ -365,7 +378,9 @@ fn remove_from_layout(layout: PaneLayout, target: PaneId) -> Option<PaneLayout> 
         PaneLayout::Split { horizontal, children } => {
             let new_children: Vec<SplitChild> = children
                 .into_iter()
-                .filter_map(|c| remove_from_layout(c.layout, target).map(|layout| SplitChild { layout, weight: c.weight, fixed: c.fixed, minimized: c.minimized }))
+                .filter_map(|c| {
+                    remove_from_layout(c.layout, target).map(|layout| SplitChild { layout, weight: c.weight, fixed: c.fixed, minimized: c.minimized })
+                })
                 .collect();
             match new_children.len() {
                 0 => None,
@@ -477,11 +492,7 @@ fn collapsed_runs(n: usize, focused: usize) -> Vec<std::ops::Range<usize>> {
     }
     anchors.sort_unstable();
     anchors.dedup();
-    anchors
-        .windows(2)
-        .map(|pair| pair[0] + 1..pair[1])
-        .filter(|run| run.len() >= 2)
-        .collect()
+    anchors.windows(2).map(|pair| pair[0] + 1..pair[1]).filter(|run| run.len() >= 2).collect()
 }
 
 // Whether the dividers a split needs take more of it than they are
@@ -557,7 +568,14 @@ fn split_sizes(children: &[SplitChild], usable: usize) -> Vec<usize> {
 // Split trying to draw into space a child might otherwise want --
 // skipped entirely between a minimized child and its neighbor (see
 // dividers_after).
-pub(crate) fn compute_regions(layout: &PaneLayout, area: Rect, focused: PaneId, budget: usize, out: &mut Vec<(PaneId, Rect)>, dividers: &mut Vec<Divider>) {
+pub(crate) fn compute_regions(
+    layout: &PaneLayout,
+    area: Rect,
+    focused: PaneId,
+    budget: usize,
+    out: &mut Vec<(PaneId, Rect)>,
+    dividers: &mut Vec<Divider>,
+) {
     compute_regions_at(layout, area, focused, budget, out, dividers, &mut Vec::new());
 }
 
@@ -623,8 +641,7 @@ fn compute_regions_at(
             // divider that would have followed the run's last child is
             // the line it costs -- so it is drawn instead of, not as
             // well as, that one.
-            let divider_count =
-                (0..n.saturating_sub(1)).filter(|i| draws_divider[*i] && !hidden(*i)).count() + folded.len();
+            let divider_count = (0..n.saturating_sub(1)).filter(|i| draws_divider[*i] && !hidden(*i)).count() + folded.len();
             // Only the children that are actually drawn are sized:
             // handing `split_sizes` a zero-weight child would still
             // spend whatever minimum it guarantees on something with no
@@ -791,7 +808,13 @@ pub(crate) fn folded_divider_pane(window: &WindowEntry, divider: &Divider) -> Op
 // trailing "\r\n" every time a line is submitted) with none of real-
 // terminal relative movement's scrolling ambiguity -- so no live query
 // is needed to learn it.
-pub(crate) fn completion_menu_rows(window: &WindowEntry, sinks_are_grid: bool, cursor_row: usize, term_rows: usize, term_cols: usize) -> Option<(usize, usize)> {
+pub(crate) fn completion_menu_rows(
+    window: &WindowEntry,
+    sinks_are_grid: bool,
+    cursor_row: usize,
+    term_rows: usize,
+    term_cols: usize,
+) -> Option<(usize, usize)> {
     if !sinks_are_grid {
         return None;
     }

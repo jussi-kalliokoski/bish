@@ -3,10 +3,12 @@
 //
 // Free functions taking `&mut Shell` -- see `builtins/mod.rs`.
 
+use crate::exec::{
+    BUILTIN_HELP, ExecResult, KNOWN_BUILTINS, KNOWN_SHOPT_OPTIONS, Shell, command_own_redirects, resolve_in_path, sh_eprintln, sh_println,
+    shopt_default_on,
+};
 use crate::parser;
 use crate::parser::Redirect;
-use crate::exec::{command_own_redirects, resolve_in_path, sh_eprintln, sh_println, shopt_default_on, BUILTIN_HELP,
-    ExecResult, KNOWN_BUILTINS, KNOWN_SHOPT_OPTIONS, Shell};
 
 // getopts optstring name [args...]. Options requiring an argument are
 // marked with a trailing ':' in optstring (e.g. "ab:c"); a leading ':'
@@ -21,8 +23,7 @@ pub(crate) fn run_getopts(sh: &mut Shell, args: &[String]) -> ExecResult {
             return ExecResult::Status(2);
         }
     };
-    let positional: Vec<String> =
-        if args.len() > 2 { args[2..].to_vec() } else { sh.arg_frames.last().cloned().unwrap_or_default() };
+    let positional: Vec<String> = if args.len() > 2 { args[2..].to_vec() } else { sh.arg_frames.last().cloned().unwrap_or_default() };
 
     let optind: usize = sh.lookup_var("OPTIND").trim().parse().unwrap_or(1);
     let idx = optind.saturating_sub(1);
@@ -235,8 +236,7 @@ pub(crate) fn run_help(sh: &mut Shell, args: &[String]) -> i32 {
     }
     let mut status = 0;
     for name in names {
-        let matched: Vec<&(&str, &str)> =
-            BUILTIN_HELP.iter().filter(|(b, _)| *b == name.as_str() || crate::glob::matches(name, b)).collect();
+        let matched: Vec<&(&str, &str)> = BUILTIN_HELP.iter().filter(|(b, _)| *b == name.as_str() || crate::glob::matches(name, b)).collect();
         if matched.is_empty() {
             sh_eprintln!(sh, "bish: help: no help topics match `{name}'");
             status = 1;
@@ -278,11 +278,7 @@ pub(crate) fn run_enable(sh: &mut Shell, args: &[String]) -> i32 {
         }
     }
     if names.is_empty() {
-        let mut listed: Vec<&str> = KNOWN_BUILTINS
-            .iter()
-            .copied()
-            .filter(|b| list_all || !sh.disabled_builtins.contains(*b))
-            .collect();
+        let mut listed: Vec<&str> = KNOWN_BUILTINS.iter().copied().filter(|b| list_all || !sh.disabled_builtins.contains(*b)).collect();
         listed.sort_unstable();
         for b in listed {
             let state = if sh.disabled_builtins.contains(b) { "enable -n" } else { "enable" };

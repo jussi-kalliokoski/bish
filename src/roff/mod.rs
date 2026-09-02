@@ -157,7 +157,6 @@ pub fn parse(source: &str) -> Document {
     man::parse(source)
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -503,10 +502,7 @@ mod real_world_tests {
         // The overwhelming majority of real pages have a NAME section;
         // this is a floor, not a target, and exists to catch a parse
         // that silently stops finding structure.
-        assert!(
-            with_name * 10 >= checked * 8,
-            "only {with_name} of {checked} pages had a NAME section -- structure is being lost"
-        );
+        assert!(with_name * 10 >= checked * 8, "only {with_name} of {checked} pages had a NAME section -- structure is being lost");
     }
 
     // Man pages are gzipped, which bish can now undo itself.

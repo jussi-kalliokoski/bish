@@ -336,10 +336,7 @@ impl Tokenizer {
     // Whether the character reference being parsed sits in an attribute
     // value, which changes the rules for an unterminated named one.
     fn in_attribute(&self) -> bool {
-        matches!(
-            self.return_state,
-            State::AttributeValueDoubleQuoted | State::AttributeValueSingleQuoted | State::AttributeValueUnquoted
-        )
+        matches!(self.return_state, State::AttributeValueDoubleQuoted | State::AttributeValueSingleQuoted | State::AttributeValueUnquoted)
     }
 
     // §13.2.5.72's "flush code points consumed as a character
@@ -1216,9 +1213,7 @@ impl Tokenizer {
             State::DoctypePublicIdentifierDoubleQuoted => self.doctype_id(true, '"'),
             State::DoctypePublicIdentifierSingleQuoted => self.doctype_id(true, '\''),
             State::AfterDoctypePublicIdentifier => match self.consume() {
-                Some('\t') | Some('\n') | Some('\x0C') | Some(' ') => {
-                    self.state = State::BetweenDoctypePublicAndSystemIdentifiers
-                }
+                Some('\t') | Some('\n') | Some('\x0C') | Some(' ') => self.state = State::BetweenDoctypePublicAndSystemIdentifiers,
                 Some('>') => {
                     self.emit_doctype();
                     self.state = State::Data;
@@ -1398,10 +1393,7 @@ impl Tokenizer {
                         // -- what keeps `?a&not=b` a literal query
                         // string rather than turning it into `?a\u{AC}=b`.
                         let next = self.peek();
-                        if !terminated
-                            && self.in_attribute()
-                            && next.is_some_and(|c| c == '=' || c.is_ascii_alphanumeric())
-                        {
+                        if !terminated && self.in_attribute() && next.is_some_and(|c| c == '=' || c.is_ascii_alphanumeric()) {
                             self.flush_char_ref();
                             self.state = self.return_state;
                         } else {
@@ -1554,10 +1546,7 @@ impl Tokenizer {
     }
 
     fn emit_doctype(&mut self) {
-        let d = std::mem::replace(
-            &mut self.doctype,
-            Doctype { name: None, public_id: None, system_id: None, force_quirks: false },
-        );
+        let d = std::mem::replace(&mut self.doctype, Doctype { name: None, public_id: None, system_id: None, force_quirks: false });
         self.emit(Token::Doctype(d));
     }
 
@@ -1625,10 +1614,9 @@ fn longest_named_match(rest: &str) -> Option<(&'static str, &'static str)> {
 // mistake).
 fn numeric_reference_char(code: u32, error: &mut dyn FnMut(&str)) -> char {
     const C1: [char; 32] = [
-        '\u{20AC}', '\u{81}', '\u{201A}', '\u{192}', '\u{201E}', '\u{2026}', '\u{2020}', '\u{2021}', '\u{2C6}',
-        '\u{2030}', '\u{160}', '\u{2039}', '\u{152}', '\u{8D}', '\u{17D}', '\u{8F}', '\u{90}', '\u{2018}', '\u{2019}',
-        '\u{201C}', '\u{201D}', '\u{2022}', '\u{2013}', '\u{2014}', '\u{2DC}', '\u{2122}', '\u{161}', '\u{203A}',
-        '\u{153}', '\u{9D}', '\u{17E}', '\u{178}',
+        '\u{20AC}', '\u{81}', '\u{201A}', '\u{192}', '\u{201E}', '\u{2026}', '\u{2020}', '\u{2021}', '\u{2C6}', '\u{2030}', '\u{160}', '\u{2039}',
+        '\u{152}', '\u{8D}', '\u{17D}', '\u{8F}', '\u{90}', '\u{2018}', '\u{2019}', '\u{201C}', '\u{201D}', '\u{2022}', '\u{2013}', '\u{2014}',
+        '\u{2DC}', '\u{2122}', '\u{161}', '\u{203A}', '\u{153}', '\u{9D}', '\u{17E}', '\u{178}',
     ];
     match code {
         0 => {
@@ -1763,11 +1751,10 @@ mod tests {
     #[test]
     fn a_duplicate_attribute_keeps_the_first() {
         let mut tk = Tokenizer::new(r#"<a x="1" x="2">"#);
-        assert_eq!(tk.next(), Token::StartTag(Tag {
-            name: "a".to_string(),
-            attrs: vec![Attr { name: "x".to_string(), value: "1".to_string() }],
-            self_closing: false,
-        }));
+        assert_eq!(
+            tk.next(),
+            Token::StartTag(Tag { name: "a".to_string(), attrs: vec![Attr { name: "x".to_string(), value: "1".to_string() }], self_closing: false })
+        );
         assert!(tk.errors.iter().any(|e| e.contains("duplicate")));
     }
 
@@ -1859,10 +1846,7 @@ mod tests {
     // closes the element.
     #[test]
     fn rcdata_keeps_tags_as_text_but_still_expands_references() {
-        assert_eq!(
-            tokenize("<title>a <b> &amp; c</title>d"),
-            vec![start("title", &[]), text("a <b> & c"), T::End("title".to_string()), text("d")]
-        );
+        assert_eq!(tokenize("<title>a <b> &amp; c</title>d"), vec![start("title", &[]), text("a <b> & c"), T::End("title".to_string()), text("d")]);
     }
 
     #[test]
@@ -1879,12 +1863,7 @@ mod tests {
     fn script_data_ends_only_at_its_own_end_tag() {
         assert_eq!(
             tokenize("<script>if (a</b) { x('</div>') }</script>after"),
-            vec![
-                start("script", &[]),
-                text("if (a</b) { x('</div>') }"),
-                T::End("script".to_string()),
-                text("after")
-            ]
+            vec![start("script", &[]), text("if (a</b) { x('</div>') }"), T::End("script".to_string()), text("after")]
         );
     }
 
@@ -1894,21 +1873,13 @@ mod tests {
     fn script_data_handles_the_escaped_and_double_escaped_forms() {
         assert_eq!(
             tokenize("<script><!-- <script> </script> --></script>x"),
-            vec![
-                start("script", &[]),
-                text("<!-- <script> </script> -->"),
-                T::End("script".to_string()),
-                text("x")
-            ]
+            vec![start("script", &[]), text("<!-- <script> </script> -->"), T::End("script".to_string()), text("x")]
         );
     }
 
     #[test]
     fn a_mismatched_end_tag_in_rawtext_comes_back_out_as_text() {
-        assert_eq!(
-            tokenize("<style>a</styl</style>"),
-            vec![start("style", &[]), text("a</styl"), T::End("style".to_string())]
-        );
+        assert_eq!(tokenize("<style>a</styl</style>"), vec![start("style", &[]), text("a</styl"), T::End("style".to_string())]);
     }
 
     #[test]

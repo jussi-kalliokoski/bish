@@ -212,12 +212,7 @@ fn json_spans(toks: &[crate::json::Token]) -> Vec<HighlightSpan> {
         // same way printf's format specifiers sit inside their
         // argument -- compose paints later spans over earlier ones.
         for esc in &tok.escapes {
-            out.push(HighlightSpan {
-                start: esc.start,
-                end: esc.end,
-                kind: HighlightKind::FormatSpecifier,
-                link: None,
-            });
+            out.push(HighlightSpan { start: esc.start, end: esc.end, kind: HighlightKind::FormatSpecifier, link: None });
         }
     }
     out
@@ -521,7 +516,7 @@ pub struct RoffHighlighter;
 
 impl Highlighter for RoffHighlighter {
     fn highlight(&self, text: &str, _ctx: HighlightContext) -> Vec<HighlightSpan> {
-        use crate::roff::lexer::{lex, TokenKind};
+        use crate::roff::lexer::{TokenKind, lex};
         lex(text)
             .into_iter()
             .filter_map(|token| {
@@ -634,9 +629,7 @@ pub fn default_style(kind: HighlightKind) -> (vt100::Color, vt100::CellAttrs) {
         HighlightKind::Key => (vt100::Color::Indexed(6), bold),
         HighlightKind::Emphasis => (vt100::Color::Default, vt100::CellAttrs { italic: true, ..vt100::CellAttrs::default() }),
         HighlightKind::Strong => (vt100::Color::Default, bold),
-        HighlightKind::Struck => {
-            (vt100::Color::Default, vt100::CellAttrs { strikethrough: true, ..vt100::CellAttrs::default() })
-        }
+        HighlightKind::Struck => (vt100::Color::Default, vt100::CellAttrs { strikethrough: true, ..vt100::CellAttrs::default() }),
     }
 }
 
@@ -788,10 +781,7 @@ pub fn render_linked(cells: &[vt100::Cell], links: &[LinkSpan]) -> String {
     let mut last: Option<(vt100::Color, vt100::Color, vt100::CellAttrs)> = None;
     let mut open: Option<&str> = None;
     for (i, cell) in cells.iter().enumerate() {
-        let url = links
-            .iter()
-            .find(|l| i >= l.start && i < l.end && crate::url::is_safe(&l.url))
-            .map(|l| l.url.as_str());
+        let url = links.iter().find(|l| i >= l.start && i < l.end && crate::url::is_safe(&l.url)).map(|l| l.url.as_str());
         if url != open {
             if open.is_some() {
                 out.push_str(OSC8_CLOSE);
@@ -993,10 +983,60 @@ pub(crate) fn is_assignment_prefix_word(chunks: &[Chunk]) -> bool {
 // decoupled from the shell's execution engine, matching every other
 // editor-analysis-vs-execution split in this file.
 pub(crate) const KNOWN_BUILTINS: &[&str] = &[
-    ":", "cd", "e", "export", "let", "break", "continue", "test", "[", "[[", "return", "shift", "local", "exit", "read", "mapfile",
-    "readarray", "eval", "source", ".", "trap", "jobs", "disown", "fg", "bg", "wait", "kill", "getopts", "unset", "set", "declare",
-    "typeset", "readonly", "exec", "command", "builtin", "type", "hash", "shopt", "umask", "pushd", "popd", "dirs", "ulimit", "alias",
-    "unalias", "abbr", "bishopt", "compgen", "complete", "compopt", "::bish", "echo", "printf",
+    ":",
+    "cd",
+    "e",
+    "export",
+    "let",
+    "break",
+    "continue",
+    "test",
+    "[",
+    "[[",
+    "return",
+    "shift",
+    "local",
+    "exit",
+    "read",
+    "mapfile",
+    "readarray",
+    "eval",
+    "source",
+    ".",
+    "trap",
+    "jobs",
+    "disown",
+    "fg",
+    "bg",
+    "wait",
+    "kill",
+    "getopts",
+    "unset",
+    "set",
+    "declare",
+    "typeset",
+    "readonly",
+    "exec",
+    "command",
+    "builtin",
+    "type",
+    "hash",
+    "shopt",
+    "umask",
+    "pushd",
+    "popd",
+    "dirs",
+    "ulimit",
+    "alias",
+    "unalias",
+    "abbr",
+    "bishopt",
+    "compgen",
+    "complete",
+    "compopt",
+    "::bish",
+    "echo",
+    "printf",
 ];
 
 // A command name is valid if it's a known builtin, one of the session's
@@ -1112,12 +1152,8 @@ fn classify_plain_argument_core(
     cwd: Option<&Path>,
     offset: usize,
 ) -> Option<HighlightSpan> {
-    let out_span = |kind: HighlightKind, link: Option<String>| HighlightSpan {
-        start: offset + word_span.start,
-        end: offset + word_span.end,
-        kind,
-        link,
-    };
+    let out_span =
+        |kind: HighlightKind, link: Option<String>| HighlightSpan { start: offset + word_span.start, end: offset + word_span.end, kind, link };
 
     if text.starts_with('-') {
         let flag_text = strip_flag_suffix(text);
@@ -1154,11 +1190,7 @@ fn classify_plain_argument_core(
 fn resolve_file_link(text: &str, cwd: Option<&Path>) -> Option<String> {
     let cwd = cwd?;
     let candidate = if Path::new(text).is_absolute() { std::path::PathBuf::from(text) } else { cwd.join(text) };
-    if candidate.exists() {
-        Some(format!("file://{}", candidate.display()))
-    } else {
-        None
-    }
+    if candidate.exists() { Some(format!("file://{}", candidate.display())) } else { None }
 }
 
 // Strips a trailing "=value" or " <placeholder>" suffix from a `-`-
@@ -1504,11 +1536,7 @@ mod tests {
         // The only escapes left are this function's own SGR framing --
         // the same ones a name with nothing hostile in it produces.
         let (_, benign) = render("evilX[2J.txt");
-        assert_eq!(
-            out.matches('\x1b').count(),
-            benign.matches('\x1b').count(),
-            "the text contributed an escape of its own"
-        );
+        assert_eq!(out.matches('\x1b').count(), benign.matches('\x1b').count(), "the text contributed an escape of its own");
 
         // One character in, one out, so every index into the run still
         // means what it meant -- match positions, selection spans, the
@@ -1724,7 +1752,14 @@ mod tests {
         let cells = compose(&chars, &[&layer]);
         let rendered = render_styled(&cells);
         assert_eq!(rendered.matches('\x1b').count(), 3); // 2 style changes + 1 trailing reset
-        assert_eq!(rendered, format!("{}ab{}cd\x1b[0m", vt100::sgr_codes(vt100::Color::Default, vt100::Color::Default, vt100::CellAttrs::default()), vt100::sgr_codes(vt100::Color::Indexed(3), vt100::Color::Default, vt100::CellAttrs::default())));
+        assert_eq!(
+            rendered,
+            format!(
+                "{}ab{}cd\x1b[0m",
+                vt100::sgr_codes(vt100::Color::Default, vt100::Color::Default, vt100::CellAttrs::default()),
+                vt100::sgr_codes(vt100::Color::Indexed(3), vt100::Color::Default, vt100::CellAttrs::default())
+            )
+        );
     }
 
     #[test]
@@ -2308,23 +2343,14 @@ mod tests {
         let kinds: Vec<HighlightKind> = json_kinds(r#"["a", "b"]"#).into_iter().map(|(_, k)| k).collect();
         assert_eq!(
             kinds,
-            vec![
-                HighlightKind::Operator,
-                HighlightKind::String,
-                HighlightKind::Operator,
-                HighlightKind::String,
-                HighlightKind::Operator
-            ]
+            vec![HighlightKind::Operator, HighlightKind::String, HighlightKind::Operator, HighlightKind::String, HighlightKind::Operator]
         );
     }
 
     #[test]
     fn json_highlights_numbers_and_the_three_literals() {
         assert_eq!(
-            json_kinds("[1, -2.5e3, true, false, null]")
-                .into_iter()
-                .filter(|(_, k)| *k != HighlightKind::Operator)
-                .collect::<Vec<_>>(),
+            json_kinds("[1, -2.5e3, true, false, null]").into_iter().filter(|(_, k)| *k != HighlightKind::Operator).collect::<Vec<_>>(),
             vec![
                 ("1".to_string(), HighlightKind::Number),
                 ("-2.5e3".to_string(), HighlightKind::Number),
@@ -2443,11 +2469,7 @@ mod tests {
     fn roff_highlights_a_control_line_by_its_parts() {
         assert_eq!(
             roff_kinds(".SH NAME\n"),
-            vec![
-                (".".to_string(), HighlightKind::Operator),
-                ("SH".to_string(), HighlightKind::Keyword),
-                ("NAME".to_string(), HighlightKind::String),
-            ]
+            vec![(".".to_string(), HighlightKind::Operator), ("SH".to_string(), HighlightKind::Keyword), ("NAME".to_string(), HighlightKind::String),]
         );
     }
 
@@ -2455,10 +2477,7 @@ mod tests {
     fn roff_highlights_escapes_inside_text() {
         assert_eq!(
             roff_kinds("plain \\fBbold\\fP text\n"),
-            vec![
-                ("\\fB".to_string(), HighlightKind::Substitution),
-                ("\\fP".to_string(), HighlightKind::Substitution),
-            ]
+            vec![("\\fB".to_string(), HighlightKind::Substitution), ("\\fP".to_string(), HighlightKind::Substitution),]
         );
     }
 
@@ -2503,10 +2522,7 @@ mod tests {
     fn ini_paints_a_subsection_over_its_header() {
         assert_eq!(
             ini_kinds("[remote \"origin\"]"),
-            vec![
-                ("[remote \"origin\"]".to_string(), HighlightKind::Keyword),
-                ("\"origin\"".to_string(), HighlightKind::String),
-            ]
+            vec![("[remote \"origin\"]".to_string(), HighlightKind::Keyword), ("\"origin\"".to_string(), HighlightKind::String),]
         );
     }
 
@@ -2574,14 +2590,8 @@ mod tests {
 
     #[test]
     fn jsonc_highlights_both_comment_forms() {
-        assert_eq!(
-            jsonc_kinds("// why\n1"),
-            vec![("// why".to_string(), HighlightKind::Comment), ("1".to_string(), HighlightKind::Number)]
-        );
-        assert_eq!(
-            jsonc_kinds("/* why */ 1"),
-            vec![("/* why */".to_string(), HighlightKind::Comment), ("1".to_string(), HighlightKind::Number)]
-        );
+        assert_eq!(jsonc_kinds("// why\n1"), vec![("// why".to_string(), HighlightKind::Comment), ("1".to_string(), HighlightKind::Number)]);
+        assert_eq!(jsonc_kinds("/* why */ 1"), vec![("/* why */".to_string(), HighlightKind::Comment), ("1".to_string(), HighlightKind::Number)]);
     }
 
     // A comment between a key and its colon must not cost the key its
@@ -2697,10 +2707,7 @@ mod tests {
     // An ordinary value -- a path, a URL, a token -- stays plain.
     #[test]
     fn dotenv_leaves_a_bare_value_uncoloured() {
-        assert_eq!(
-            dotenv_kinds("PATH_TO=/usr/bin"),
-            vec![("PATH_TO".to_string(), HighlightKind::Key), ("=".to_string(), HighlightKind::Operator)]
-        );
+        assert_eq!(dotenv_kinds("PATH_TO=/usr/bin"), vec![("PATH_TO".to_string(), HighlightKind::Key), ("=".to_string(), HighlightKind::Operator)]);
     }
 
     #[test]

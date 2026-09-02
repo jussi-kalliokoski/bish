@@ -204,7 +204,10 @@ mod tests {
         case("set-u", r#"set -u; echo "${undefined_zz-ok}""#),
         case("and-or", r#"true && echo t; false || echo f; false && echo no; echo $?"#),
         // -- the roadmap-9 builtin gaps -------------------------------
-        case("test-v", r#"x=1; a=(q); declare -A m; m[k]=1; [[ -v x ]] && echo x; [[ -v a[0] ]] && echo a; [[ -v m[k] ]] && echo m; [[ -v nope_zz ]] || echo no"#),
+        case(
+            "test-v",
+            r#"x=1; a=(q); declare -A m; m[k]=1; [[ -v x ]] && echo x; [[ -v a[0] ]] && echo a; [[ -v m[k] ]] && echo m; [[ -v nope_zz ]] || echo no"#,
+        ),
         case("kill-l", r#"kill -l 9; kill -l TERM; kill -l SIGTERM; kill -l 137"#),
         case("exec-a", r#"exec -a zzname /bin/sh -c 'echo $0'"#),
         case("noclobber", "set -C; echo a > nc; echo b > nc; echo $?; echo c >| nc; cat nc; set +C"),
@@ -393,11 +396,7 @@ mod tests {
             "{} of {} cases differ from bash:\n{}",
             differing.len(),
             CASES.len(),
-            differing
-                .iter()
-                .map(|(name, want, got)| format!("  {name}\n    bash: {want:?}\n    bish: {got:?}"))
-                .collect::<Vec<_>>()
-                .join("\n")
+            differing.iter().map(|(name, want, got)| format!("  {name}\n    bash: {want:?}\n    bish: {got:?}")).collect::<Vec<_>>().join("\n")
         );
     }
 
@@ -409,10 +408,7 @@ mod tests {
         }
         let differing: Vec<&str> = compare(PENDING, &bish).into_iter().map(|(name, _, _)| name).collect();
         for (name, why) in DIVERGENCES {
-            assert!(
-                differing.contains(name),
-                "`{name}` matches bash now -- remove its line from DIVERGENCES ({why})"
-            );
+            assert!(differing.contains(name), "`{name}` matches bash now -- remove its line from DIVERGENCES ({why})");
         }
         let unlisted: Vec<&str> = differing.iter().filter(|n| !DIVERGENCES.iter().any(|(d, _)| d == *n)).copied().collect();
         assert!(unlisted.is_empty(), "differing but not listed: {unlisted:?}");

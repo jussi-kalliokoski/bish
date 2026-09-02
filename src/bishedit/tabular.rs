@@ -83,9 +83,7 @@ pub fn style(language: &str) -> Option<Style> {
 // ordinary row is content, and only a row that is entirely rule is the
 // table's own separator.
 fn is_rule_row(line: &[char]) -> bool {
-    !line.is_empty()
-        && line.iter().any(|c| *c == '-')
-        && line.iter().all(|c| matches!(c, '-' | ':' | '|' | ' ' | '\t'))
+    !line.is_empty() && line.iter().any(|c| *c == '-') && line.iter().all(|c| matches!(c, '-' | ':' | '|' | ' ' | '\t'))
 }
 
 // A pathological file must not produce a pathological layout: a column
@@ -226,11 +224,7 @@ impl Row {
     // What a language with no tabular form gets, and what makes the
     // editor able to run one code path for both cases.
     pub fn plain(line: &[char]) -> Row {
-        Row {
-            cells: line.to_vec(),
-            source_at: (0..line.len()).map(Some).collect(),
-            cell_of: (0..=line.len()).collect(),
-        }
+        Row { cells: line.to_vec(), source_at: (0..line.len()).map(Some).collect(), cell_of: (0..=line.len()).collect() }
     }
 }
 
@@ -372,10 +366,7 @@ mod tests {
 
     #[test]
     fn columns_line_up_across_rows() {
-        assert_eq!(
-            rendered(&["name,age,city", "alice,30,NYC", "bo,7,LA"], csv()),
-            vec!["name,  age, city", "alice, 30,  NYC", "bo,    7,   LA"]
-        );
+        assert_eq!(rendered(&["name,age,city", "alice,30,NYC", "bo,7,LA"], csv()), vec!["name,  age, city", "alice, 30,  NYC", "bo,    7,   LA"]);
     }
 
     // Nothing is removed and nothing is reordered: the file's own
@@ -447,17 +438,8 @@ mod tests {
     #[test]
     fn a_markdown_table_lines_its_pipes_up() {
         assert_eq!(
-            rendered_regions(
-                &["| Key | Does |", "|---|:--|", "| gg | goes to the top |", "| G | end |"],
-                md(),
-                &[0..4],
-            ),
-            vec![
-                "| Key | Does            |",
-                "|---  |:--              |",
-                "| gg  | goes to the top |",
-                "| G   | end             |",
-            ]
+            rendered_regions(&["| Key | Does |", "|---|:--|", "| gg | goes to the top |", "| G | end |"], md(), &[0..4],),
+            vec!["| Key | Does            |", "|---  |:--              |", "| gg  | goes to the top |", "| G   | end             |",]
         );
     }
 
@@ -466,10 +448,7 @@ mod tests {
     // spaces, never stretch the dashes to fill what it asked for.
     #[test]
     fn a_rule_row_is_padded_but_does_not_set_the_width() {
-        assert_eq!(
-            rendered_regions(&["| a | b |", "|--------|--------|"], md(), &[0..2]),
-            vec!["| a | b |", "|--------|--------|"]
-        );
+        assert_eq!(rendered_regions(&["| a | b |", "|--------|--------|"], md(), &[0..2]), vec!["| a | b |", "|--------|--------|"]);
     }
 
     // A row of dashes in a CSV is data, not a rule.
@@ -482,11 +461,7 @@ mod tests {
     // untouched even though it contains the delimiter.
     #[test]
     fn a_line_outside_every_region_is_left_alone() {
-        let out = rendered_regions(
-            &["a | b in prose", "| x | yy |", "| zzz | w |"],
-            md(),
-            &[1..3],
-        );
+        let out = rendered_regions(&["a | b in prose", "| x | yy |", "| zzz | w |"], md(), &[1..3]);
         assert_eq!(out[0], "a | b in prose");
         assert_eq!(out[1], "| x   | yy |");
         assert_eq!(out[2], "| zzz | w  |");
@@ -496,11 +471,7 @@ mod tests {
     // must not widen the other.
     #[test]
     fn each_region_has_its_own_widths() {
-        let out = rendered_regions(
-            &["| a | b |", "", "| aaaaaaaa | b |"],
-            md(),
-            &[0..1, 2..3],
-        );
+        let out = rendered_regions(&["| a | b |", "", "| aaaaaaaa | b |"], md(), &[0..1, 2..3]);
         assert_eq!(out[0], "| a | b |");
         assert_eq!(out[2], "| aaaaaaaa | b |");
     }

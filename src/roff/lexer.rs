@@ -198,15 +198,13 @@ pub fn escape_len(chars: &[char], i: usize) -> usize {
         's' => 2 + size_argument_len(chars, i + 2),
         // Quote-delimited: the character right after the escape is the
         // delimiter, whatever it is.
-        'h' | 'v' | 'l' | 'L' | 'o' | 'w' | 'A' | 'b' | 'C' | 'D' | 'H' | 'N' | 'R' | 'S' | 'x' | 'X' | 'Z' => {
-            match chars.get(i + 2) {
-                Some(&delim) => match close_bracket(chars, i + 3, delim) {
-                    Some(end) => end + 1 - i,
-                    None => 3,
-                },
-                None => 2,
-            }
-        }
+        'h' | 'v' | 'l' | 'L' | 'o' | 'w' | 'A' | 'b' | 'C' | 'D' | 'H' | 'N' | 'R' | 'S' | 'x' | 'X' | 'Z' => match chars.get(i + 2) {
+            Some(&delim) => match close_bracket(chars, i + 3, delim) {
+                Some(end) => end + 1 - i,
+                None => 3,
+            },
+            None => 2,
+        },
         _ => 2,
     }
 }
@@ -236,7 +234,7 @@ fn size_argument_len(chars: &[char], at: usize) -> usize {
             return match close_bracket(chars, i + 1, ']') {
                 Some(end) => end + 1 - at,
                 None => i + 1 - at,
-            }
+            };
         }
         _ => {}
     }

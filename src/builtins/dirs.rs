@@ -3,7 +3,7 @@
 //
 // Free functions taking `&mut Shell` -- see `builtins/mod.rs`.
 
-use crate::exec::{sh_eprintln, sh_println, RESTRICTED, Shell};
+use crate::exec::{RESTRICTED, Shell, sh_eprintln, sh_println};
 
 pub(crate) fn run_cd(sh: &mut Shell, args: &[String]) -> i32 {
     // `-L`/`-P` (follow symlinks or resolve them) are accepted and

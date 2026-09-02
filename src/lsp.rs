@@ -598,12 +598,7 @@ pub fn inlay_hints(result: &Value) -> Vec<InlayHint> {
                 return None;
             }
             let pad = |key: &str| matches!(json::query(item, key), Ok(Value::Bool(true)));
-            let mut label = format!(
-                "{}{}{}",
-                if pad(".paddingLeft") { " " } else { "" },
-                label,
-                if pad(".paddingRight") { " " } else { "" }
-            );
+            let mut label = format!("{}{}{}", if pad(".paddingLeft") { " " } else { "" }, label, if pad(".paddingRight") { " " } else { "" });
             if label.chars().count() > MAX_HINT_LABEL {
                 label = label.chars().take(MAX_HINT_LABEL - 1).chain(std::iter::once('…')).collect();
             }
@@ -719,7 +714,11 @@ fn location(value: &Value) -> Option<Location> {
             Ok(range @ Value::Object(_)) => range,
             _ => json::query(value, ".targetRange").ok()?,
         };
-        return Some(Location { uri: uri.clone(), start: position(json::query(range, ".start").ok()?)?, end: position(json::query(range, ".end").ok()?)? });
+        return Some(Location {
+            uri: uri.clone(),
+            start: position(json::query(range, ".start").ok()?)?,
+            end: position(json::query(range, ".end").ok()?)?,
+        });
     }
     let Ok(Value::Str(uri)) = json::query(value, ".uri") else { return None };
     let range = json::query(value, ".range").ok()?;
@@ -949,8 +948,30 @@ impl Completion {
 
 fn completion_kind(kind: f64) -> String {
     const KINDS: [&str; 25] = [
-        "text", "method", "function", "constructor", "field", "variable", "class", "interface", "module", "property", "unit", "value",
-        "enum", "keyword", "snippet", "color", "file", "reference", "folder", "enum-member", "constant", "struct", "event", "operator",
+        "text",
+        "method",
+        "function",
+        "constructor",
+        "field",
+        "variable",
+        "class",
+        "interface",
+        "module",
+        "property",
+        "unit",
+        "value",
+        "enum",
+        "keyword",
+        "snippet",
+        "color",
+        "file",
+        "reference",
+        "folder",
+        "enum-member",
+        "constant",
+        "struct",
+        "event",
+        "operator",
         "type-parameter",
     ];
     let index = kind as usize;
@@ -1208,9 +1229,32 @@ pub struct Symbol {
 /// the spec is; the names are the spec's own, lowercased.
 fn symbol_kind(kind: f64) -> String {
     const KINDS: [&str; 26] = [
-        "file", "module", "namespace", "package", "class", "method", "property", "field", "constructor", "enum", "interface", "function",
-        "variable", "constant", "string", "number", "boolean", "array", "object", "key", "null", "enum-member", "struct", "event",
-        "operator", "type-parameter",
+        "file",
+        "module",
+        "namespace",
+        "package",
+        "class",
+        "method",
+        "property",
+        "field",
+        "constructor",
+        "enum",
+        "interface",
+        "function",
+        "variable",
+        "constant",
+        "string",
+        "number",
+        "boolean",
+        "array",
+        "object",
+        "key",
+        "null",
+        "enum-member",
+        "struct",
+        "event",
+        "operator",
+        "type-parameter",
     ];
     let index = kind as usize;
     if (1..=KINDS.len()).contains(&index) { KINDS[index - 1].to_string() } else { String::new() }
@@ -1455,9 +1499,7 @@ mod tests {
 
     #[test]
     fn the_active_overload_comes_first_and_is_marked() {
-        let lines = signature_of(
-            r#"{"signatures":[{"label":"fn one(a: u32)"},{"label":"fn two(a: u32, b: u32)"}],"activeSignature":1}"#,
-        );
+        let lines = signature_of(r#"{"signatures":[{"label":"fn one(a: u32)"},{"label":"fn two(a: u32, b: u32)"}],"activeSignature":1}"#);
         assert_eq!(lines, vec!["> fn two(a: u32, b: u32)".to_string(), "fn one(a: u32)".to_string()]);
     }
 
@@ -1577,10 +1619,7 @@ mod tests {
     // multi-byte characters in it is the case that catches the mistake.
     #[test]
     fn content_length_counts_bytes_not_characters() {
-        let message = Message::Notification {
-            method: "window/logMessage".to_string(),
-            params: Value::Str("héllo 🌍".to_string()),
-        };
+        let message = Message::Notification { method: "window/logMessage".to_string(), params: Value::Str("héllo 🌍".to_string()) };
         let bytes = encode(&message);
         let header_end = find(&bytes, b"\r\n\r\n").unwrap();
         let header = std::str::from_utf8(&bytes[..header_end]).unwrap();
@@ -1596,10 +1635,11 @@ mod tests {
     // at a time is the worst case, so it is the one tested.
     #[test]
     fn a_stream_split_one_byte_at_a_time_decodes_the_same_messages() {
-        let stream: Vec<u8> = [request(1, "initialize"), Message::Notification { method: "initialized".to_string(), params: Value::Null }, request(2, "shutdown")]
-            .iter()
-            .flat_map(encode)
-            .collect();
+        let stream: Vec<u8> =
+            [request(1, "initialize"), Message::Notification { method: "initialized".to_string(), params: Value::Null }, request(2, "shutdown")]
+                .iter()
+                .flat_map(encode)
+                .collect();
         let whole = decode_all(&[&stream]);
         assert_eq!(whole.len(), 3);
         let chunks: Vec<&[u8]> = stream.chunks(1).collect();
@@ -1625,7 +1665,10 @@ mod tests {
     #[test]
     fn the_three_message_shapes_are_told_apart_by_id_and_method() {
         let response = Message::Response { id: Id::Number(7), result: Ok(Value::Bool(true)) };
-        let error = Message::Response { id: Id::Str("abc".to_string()), result: Err(ResponseError { code: -32601, message: "Method not found".to_string() }) };
+        let error = Message::Response {
+            id: Id::Str("abc".to_string()),
+            result: Err(ResponseError { code: -32601, message: "Method not found".to_string() }),
+        };
         let notification = Message::Notification { method: "textDocument/publishDiagnostics".to_string(), params: Value::Null };
         for message in [response, error, notification, request(1, "initialize")] {
             let bytes = encode(&message);
@@ -1746,10 +1789,9 @@ mod tests {
         assert_eq!(locations(&link), vec![Location { uri: "file:///c.rs".to_string(), start: (10, 7), end: (10, 11) }]);
 
         // ...falling back to the full range when that is all there is.
-        let link_only = json::parse(
-            r#"[{"targetUri":"file:///c.rs","targetRange":{"start":{"line":10,"character":0},"end":{"line":20,"character":1}}}]"#,
-        )
-        .unwrap();
+        let link_only =
+            json::parse(r#"[{"targetUri":"file:///c.rs","targetRange":{"start":{"line":10,"character":0},"end":{"line":20,"character":1}}}]"#)
+                .unwrap();
         assert_eq!(locations(&link_only)[0].start, (10, 0));
     }
 
@@ -1758,7 +1800,9 @@ mod tests {
         assert!(locations(&Value::Null).is_empty());
         assert!(locations(&json::parse("[]").unwrap()).is_empty());
         // One malformed entry does not cost the rest.
-        let mixed = json::parse(r#"[{"nonsense":1},{"uri":"file:///a.rs","range":{"start":{"line":1,"character":0},"end":{"line":1,"character":2}}}]"#).unwrap();
+        let mixed =
+            json::parse(r#"[{"nonsense":1},{"uri":"file:///a.rs","range":{"start":{"line":1,"character":0},"end":{"line":1,"character":2}}}]"#)
+                .unwrap();
         assert_eq!(mixed_len(&mixed), 1);
         fn mixed_len(v: &Value) -> usize {
             locations(v).len()
@@ -1958,10 +2002,8 @@ mod tests {
         assert!(symbols(&json::parse("[]").unwrap(), "file:///a").is_empty());
         // No name, or no range at all: dropped, without costing the
         // rest of the answer.
-        let mixed = json::parse(
-            r#"[{"kind":12},{"name":"ok","kind":12,"range":{"start":{"line":1,"character":0},"end":{"line":1,"character":2}}}]"#,
-        )
-        .unwrap();
+        let mixed = json::parse(r#"[{"kind":12},{"name":"ok","kind":12,"range":{"start":{"line":1,"character":0},"end":{"line":1,"character":2}}}]"#)
+            .unwrap();
         assert_eq!(symbols(&mixed, "file:///a").len(), 1);
         // A kind outside the table is a server extension we have no
         // name for, not a reason to drop the symbol.
@@ -1989,7 +2031,9 @@ mod tests {
 
         assert!(text_edits(&Value::Null).is_empty(), "a server with nothing to change");
         // One malformed entry does not cost the rest.
-        let mixed = json::parse(r#"[{"newText":"no range"},{"range":{"start":{"line":1,"character":0},"end":{"line":1,"character":1}},"newText":"x"}]"#).unwrap();
+        let mixed =
+            json::parse(r#"[{"newText":"no range"},{"range":{"start":{"line":1,"character":0},"end":{"line":1,"character":1}},"newText":"x"}]"#)
+                .unwrap();
         assert_eq!(text_edits(&mixed).len(), 1);
     }
 
@@ -2100,10 +2144,7 @@ mod tests {
         // rule for either.
         assert_eq!(hover(r#"{"contents":{"language":"rust","value":"fn f()"}}"#), Some(vec!["fn f()".to_string()]));
         // An array of them, joined.
-        assert_eq!(
-            hover(r#"{"contents":["one",{"language":"rust","value":"two"}]}"#),
-            Some(vec!["one".to_string(), "two".to_string()])
-        );
+        assert_eq!(hover(r#"{"contents":["one",{"language":"rust","value":"two"}]}"#), Some(vec!["one".to_string(), "two".to_string()]));
     }
 
     #[test]
@@ -2119,11 +2160,10 @@ mod tests {
     // the ``` in makes the useful line look like debris.
     #[test]
     fn markdown_is_flattened_to_lines_without_becoming_a_renderer() {
-        let lines = hover("{\"contents\":{\"kind\":\"markdown\",\"value\":\"```rust\\nfn f() -> i32\\n```\\n\\n---\\n\\nReturns **a number**.\\n\\n\\n\"}}").unwrap();
-        assert_eq!(
-            lines,
-            vec!["fn f() -> i32".to_string(), String::new(), "---".to_string(), String::new(), "Returns **a number**.".to_string()]
-        );
+        let lines =
+            hover("{\"contents\":{\"kind\":\"markdown\",\"value\":\"```rust\\nfn f() -> i32\\n```\\n\\n---\\n\\nReturns **a number**.\\n\\n\\n\"}}")
+                .unwrap();
+        assert_eq!(lines, vec!["fn f() -> i32".to_string(), String::new(), "---".to_string(), String::new(), "Returns **a number**.".to_string()]);
         // Runs of blank lines collapse and trailing ones go, but a
         // single separating blank line is worth keeping. `**bold**` is
         // left exactly as written -- half-rendering it would be worse

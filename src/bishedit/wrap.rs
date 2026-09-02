@@ -109,11 +109,7 @@ pub fn segments(chars: &[char], width: usize, opts: &Options) -> Vec<Segment> {
         let first = out.is_empty();
         let avail = if first { first_width } else { rest_width };
         let hard_end = fill(chars, start, avail);
-        let end = if opts.linebreak && hard_end < chars.len() {
-            break_before(chars, start, hard_end)
-        } else {
-            hard_end
-        };
+        let end = if opts.linebreak && hard_end < chars.len() { break_before(chars, start, hard_end) } else { hard_end };
         out.push(Segment { start, end, indent: if first { 0 } else { indent } });
         // Whitespace at a break is consumed by it rather than opening
         // the next row -- otherwise every wrapped line would start with

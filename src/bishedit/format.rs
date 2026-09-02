@@ -48,9 +48,9 @@
 // else unexpected (a `\` line continuation, say).
 
 use crate::bishedit::lint::{Diagnostic, Fix, Severity};
-use std::borrow::Cow;
 use crate::lexer::{self, SpannedItem, Tok};
 use crate::parser::Parser;
+use std::borrow::Cow;
 
 pub struct BashFormatter;
 
@@ -70,7 +70,8 @@ impl BashFormatter {
             return Err(e);
         }
         let chars: Vec<char> = source.chars().collect();
-        let real: Vec<&SpannedItem> = res.items.iter().filter(|it| !matches!(it, SpannedItem::Tok(Tok::Newline, _) | SpannedItem::Tok(Tok::Semi, _))).collect();
+        let real: Vec<&SpannedItem> =
+            res.items.iter().filter(|it| !matches!(it, SpannedItem::Tok(Tok::Newline, _) | SpannedItem::Tok(Tok::Semi, _))).collect();
         Ok(format_gaps(&chars, &real))
     }
 }
@@ -518,7 +519,8 @@ fn format_gaps(chars: &[char], real: &[&SpannedItem]) -> Vec<Diagnostic> {
                                 start: kw_span.start,
                                 end: word_start,
                                 severity: Severity::Warning,
-                                code: Cow::Borrowed("format"), source: None,
+                                code: Cow::Borrowed("format"),
+                                source: None,
                                 message: "expected no `function` keyword here -- use `NAME() { ... }`".to_string(),
                                 fix: Some(Fix { start: kw_span.start, end: word_start, replacement: String::new() }),
                             });
@@ -565,11 +567,7 @@ fn format_gaps(chars: &[char], real: &[&SpannedItem]) -> Vec<Diagnostic> {
                     // guessed at.
                     actual.clone()
                 } else if newlines == 0 {
-                    if matches!(item, Some(SpannedItem::Comment(_))) {
-                        "  ".to_string()
-                    } else {
-                        " ".to_string()
-                    }
+                    if matches!(item, Some(SpannedItem::Comment(_))) { "  ".to_string() } else { " ".to_string() }
                 } else {
                     let blank = newlines >= 2;
                     format!("{}{}", if blank { "\n\n" } else { "\n" }, indent(depth_before))
@@ -580,7 +578,8 @@ fn format_gaps(chars: &[char], real: &[&SpannedItem]) -> Vec<Diagnostic> {
                     start: prev_end,
                     end: this_start,
                     severity: Severity::Warning,
-                    code: Cow::Borrowed("format"), source: None,
+                    code: Cow::Borrowed("format"),
+                    source: None,
                     message: describe(&intended),
                     fix: Some(Fix { start: prev_end, end: this_start, replacement: intended }),
                 });

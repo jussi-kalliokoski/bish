@@ -46,17 +46,17 @@ use std::io::Write;
 use std::path::Path;
 use std::rc::Rc;
 
+use crate::bishedit::Buffer as _;
 use crate::bishedit::registers::Registers;
 use crate::bishedit::textbuffer::TextBuffer;
 use crate::bishedit::unicode_width::col_of;
 use crate::bishedit::vimkeys::{KeyOutcome, Op, VimKeys};
-use crate::bishedit::Buffer as _;
 use crate::docs::{self, DocIndex};
 use crate::editor::{self, Key};
 use crate::exec::{DebugAction, DebugDepth, DebugHook, Shell};
 use crate::fileeditor::{self, EditorMode};
-use crate::window::Rect;
 use crate::term;
+use crate::window::Rect;
 
 // What a paused PauseState is waiting to do next.
 #[derive(Clone, Copy)]
@@ -238,7 +238,11 @@ impl PauseState {
         self.raw_guard.suspend_raw();
         shell.set_sink_real();
         shell.clear_stdio_override();
-        print!("\x1b[{};{}H\x1b[?25h(script running -- back to the debugger once it pauses or finishes)\r\n", self.run_rect.row + 1, self.run_rect.col + 1);
+        print!(
+            "\x1b[{};{}H\x1b[?25h(script running -- back to the debugger once it pauses or finishes)\r\n",
+            self.run_rect.row + 1,
+            self.run_rect.col + 1
+        );
         let _ = std::io::stdout().flush();
     }
 
@@ -266,7 +270,10 @@ impl PauseState {
     // reminder, right-aligned with the cursor's own position/line count,
     // matching `fileeditor::status_text`'s own layout convention.
     fn status_text(&self) -> String {
-        let mut left = self.message.clone().unwrap_or_else(|| format!("-- PAUSED at line {} -- :dbg continue/next/step/print/quit/help --", self.paused_at.unwrap_or(0)));
+        let mut left = self
+            .message
+            .clone()
+            .unwrap_or_else(|| format!("-- PAUSED at line {} -- :dbg continue/next/step/print/quit/help --", self.paused_at.unwrap_or(0)));
         let (row, col) = self.nav_buf.cursor();
         let total = self.nav_buf.line_count();
         let right = format!("{},{}  {}/{}", row + 1, col + 1, row + 1, total);
@@ -333,7 +340,15 @@ impl PauseState {
             None => self.status_text(),
         };
         let mut out = crate::repl::render_global_status_row(&status, self.term_rows);
-        out.push_str(&fileeditor::build_editor_frame(&self.nav_buf, &self.vk, EditorMode::Normal, self.editor_rect, self.editor_rect.row, self.editor_rect.col, None));
+        out.push_str(&fileeditor::build_editor_frame(
+            &self.nav_buf,
+            &self.vk,
+            EditorMode::Normal,
+            self.editor_rect,
+            self.editor_rect.row,
+            self.editor_rect.col,
+            None,
+        ));
         out.push_str(&self.render_hover_popup());
         let (row, col) = match colon_input {
             Some(buf) => (self.term_rows.saturating_sub(2), 1 + buf.chars().count()),
@@ -402,7 +417,10 @@ impl PauseState {
                 Some(DebugAction::Quit)
             }
             "h" | "help" | "?" => {
-                self.message = Some("dbg (paused): :dbg continue|next|step|print NAME|quit|help (short c/n/s/p/q/h) -- real vim navigation otherwise, K hovers".to_string());
+                self.message = Some(
+                    "dbg (paused): :dbg continue|next|step|print NAME|quit|help (short c/n/s/p/q/h) -- real vim navigation otherwise, K hovers"
+                        .to_string(),
+                );
                 None
             }
             _ => {

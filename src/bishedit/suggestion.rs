@@ -83,11 +83,7 @@ fn occurrence_confidence(entry: &HistoryEntry, cwd: Option<&Path>, prev: Option<
     if Some(entry_cwd) != cwd {
         return Confidence::Elsewhere;
     }
-    if prev.is_some() && entry.prev == prev {
-        Confidence::DirectoryAndSequence
-    } else {
-        Confidence::CurrentDirectory
-    }
+    if prev.is_some() && entry.prev == prev { Confidence::DirectoryAndSequence } else { Confidence::CurrentDirectory }
 }
 
 // The pure core: takes history data directly rather than going through
@@ -193,10 +189,7 @@ mod tests {
     #[test]
     fn disk_loaded_entry_loses_to_same_directory_live_entry() {
         let cwd = PathBuf::from("/proj");
-        let entries = vec![
-            entry("git commit -m legacy", None, None),
-            entry("git commit -m live", Some(&cwd), None),
-        ];
+        let entries = vec![entry("git commit -m legacy", None, None), entry("git commit -m live", Some(&cwd), None)];
         let s = best_suggestion(&entries, "git commit", Some(&cwd), None).unwrap();
         assert_eq!(s.text, "git commit -m live");
         assert_eq!(s.confidence, Confidence::CurrentDirectory);
@@ -208,10 +201,7 @@ mod tests {
     #[test]
     fn perfect_directory_and_sequence_match() {
         let cwd = PathBuf::from("/proj");
-        let entries = vec![
-            entry("git add -A", Some(&cwd), None),
-            entry("git commit -m fix", Some(&cwd), Some("git add -A")),
-        ];
+        let entries = vec![entry("git add -A", Some(&cwd), None), entry("git commit -m fix", Some(&cwd), Some("git add -A"))];
         let s = best_suggestion(&entries, "git commit", Some(&cwd), Some("git add -A")).unwrap();
         assert_eq!(s.text, "git commit -m fix");
         assert_eq!(s.confidence, Confidence::DirectoryAndSequence);

@@ -2,9 +2,10 @@
 //
 // Free functions taking `&mut Shell` -- see `builtins/mod.rs`.
 
+use crate::exec::{
+    ExecResult, JobWaitOutcome, SIGCONT, Shell, getpgrp, send_signal, send_signal_to_pgrp, sh_eprintln, sh_println, signal_number, waitpid_untraced,
+};
 use crate::pty;
-use crate::exec::{getpgrp, send_signal, send_signal_to_pgrp, sh_eprintln, sh_println, signal_number,
-    waitpid_untraced, ExecResult, JobWaitOutcome, SIGCONT, Shell};
 
 pub(crate) fn run_jobs(sh: &mut Shell, args: &[String]) -> i32 {
     // The flags themselves are accepted and ignored -- this listing has
@@ -292,8 +293,7 @@ fn wait_for_next(sh: &mut Shell, ids: &[String]) -> i32 {
             // `wait -n` has its own wording for an unusable id, distinct
             // from plain `wait`'s "not a child of this shell" -- it
             // rejects the *spec* before it ever looks for a process.
-            let found =
-                a.parse::<u32>().ok().and_then(|pid| sh.jobs.borrow().jobs.iter().find(|j| j.pids.contains(&pid)).map(|j| j.id));
+            let found = a.parse::<u32>().ok().and_then(|pid| sh.jobs.borrow().jobs.iter().find(|j| j.pids.contains(&pid)).map(|j| j.id));
             match found {
                 Some(id) => out.push(id),
                 None => {
@@ -310,10 +310,7 @@ fn wait_for_next(sh: &mut Shell, ids: &[String]) -> i32 {
             return 127;
         }
         let mut table = sh.jobs.borrow_mut();
-        let finished = table
-            .jobs
-            .iter_mut()
-            .position(|j| !j.stopped && watched.as_ref().is_none_or(|w| w.contains(&j.id)) && j.poll().is_some());
+        let finished = table.jobs.iter_mut().position(|j| !j.stopped && watched.as_ref().is_none_or(|w| w.contains(&j.id)) && j.poll().is_some());
         if let Some(idx) = finished {
             let mut job = table.jobs.remove(idx);
             drop(table);

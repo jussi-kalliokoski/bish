@@ -11,12 +11,12 @@ use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use super::Buffer;
 use super::lint;
 use super::motion;
 use super::registers::{RegisterShape, RegisterValue, Registers};
 use super::snippet;
 use super::undo::UndoTree;
-use super::Buffer;
 
 // One placeholder of a live `abbr` snippet, in this buffer's own
 // (line, column) space. `active` is the one being typed into, which the
@@ -717,7 +717,8 @@ impl TextBuffer {
     // degrades gracefully instead of panicking.
     pub fn delete_range(&mut self, range: &motion::MotionRange) -> String {
         let last_row = self.lines.len().saturating_sub(1);
-        let range = motion::MotionRange { shape: range.shape, from: (range.from.0.min(last_row), range.from.1), to: (range.to.0.min(last_row), range.to.1) };
+        let range =
+            motion::MotionRange { shape: range.shape, from: (range.from.0.min(last_row), range.from.1), to: (range.to.0.min(last_row), range.to.1) };
         let text = motion::extract_text(&*self, &range);
         match range.shape {
             motion::MotionShape::Linewise => {
@@ -1492,7 +1493,15 @@ mod tests {
         // Diagnostics computed for the *current* (post-edit) content --
         // set directly, since insert_text/checkpoint_undo themselves don't
         // touch this field.
-        buf.diagnostics = vec![lint::Diagnostic { start: 0, end: 1, severity: lint::Severity::Warning, code: Cow::Borrowed("x"), source: None, message: String::new(), fix: None }];
+        buf.diagnostics = vec![lint::Diagnostic {
+            start: 0,
+            end: 1,
+            severity: lint::Severity::Warning,
+            code: Cow::Borrowed("x"),
+            source: None,
+            message: String::new(),
+            fix: None,
+        }];
         assert!(buf.undo());
         assert!(buf.diagnostics.is_empty());
     }

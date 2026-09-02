@@ -104,11 +104,8 @@ impl RegisterBackend for InMemoryBackend {
     }
     fn write(&mut self, value: RegisterValue, append: bool) {
         if append && !self.0.text.is_empty() {
-            let shape = if self.0.shape == RegisterShape::Line || value.shape == RegisterShape::Line {
-                RegisterShape::Line
-            } else {
-                RegisterShape::Char
-            };
+            let shape =
+                if self.0.shape == RegisterShape::Line || value.shape == RegisterShape::Line { RegisterShape::Line } else { RegisterShape::Char };
             self.0.text.push_str(&value.text);
             self.0.shape = shape;
         } else {
@@ -250,11 +247,8 @@ impl RegisterBackend for ClipboardBackend {
             // possibly-stale fallback) and merge the same way InMemoryBackend
             // does.
             let mut current = self.read();
-            let shape = if current.shape == RegisterShape::Line || value.shape == RegisterShape::Line {
-                RegisterShape::Line
-            } else {
-                RegisterShape::Char
-            };
+            let shape =
+                if current.shape == RegisterShape::Line || value.shape == RegisterShape::Line { RegisterShape::Line } else { RegisterShape::Char };
             current.text.push_str(&value.text);
             current.shape = shape;
             current
@@ -366,9 +360,7 @@ impl Registers {
         match name {
             None | Some('"') | Some('+') => (&mut self.unnamed, false),
             Some('_') => (&mut self.black_hole, false),
-            Some(c) if c.is_ascii_uppercase() => {
-                (self.named.entry(c.to_ascii_lowercase()).or_default(), true)
-            }
+            Some(c) if c.is_ascii_uppercase() => (self.named.entry(c.to_ascii_lowercase()).or_default(), true),
             Some(c) if c.is_ascii_lowercase() => (self.named.entry(c).or_default(), false),
             Some(c) if c.is_ascii_digit() => (self.numbered.entry(c).or_default(), false),
             Some('.') => (&mut self.last_insert, false),

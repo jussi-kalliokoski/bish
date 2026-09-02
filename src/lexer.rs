@@ -458,11 +458,7 @@ impl<'a> Lexer<'a> {
                         let pending = std::mem::take(&mut self.pending_heredocs);
                         for (tok_idx, delim, strip_tabs, expand) in pending {
                             let body = self.capture_heredoc_body(&delim, strip_tabs);
-                            let chunks = if expand {
-                                expand_heredoc_chunks(&body)?
-                            } else {
-                                vec![Chunk::Str(body)]
-                            };
+                            let chunks = if expand { expand_heredoc_chunks(&body)? } else { vec![Chunk::Str(body)] };
                             toks[tok_idx].0 = Tok::HereDoc(chunks);
                         }
                     }
@@ -1637,10 +1633,7 @@ pub fn tokenize_spanned(src: &str) -> SpannedResult {
                 if lexer.chars.peek().copied() == Some('(') {
                     lexer.advance();
                     match lexer.capture_balanced_parens() {
-                        Ok(raw) => items.push(SpannedItem::Tok(
-                            Tok::Word(vec![Chunk::ProcSubOut { raw }], false),
-                            start..lexer.pos,
-                        )),
+                        Ok(raw) => items.push(SpannedItem::Tok(Tok::Word(vec![Chunk::ProcSubOut { raw }], false), start..lexer.pos)),
                         Err(e) => {
                             error = Some(e);
                             break;
@@ -1669,10 +1662,7 @@ pub fn tokenize_spanned(src: &str) -> SpannedResult {
                 if lexer.chars.peek().copied() == Some('(') {
                     lexer.advance();
                     match lexer.capture_balanced_parens() {
-                        Ok(raw) => items.push(SpannedItem::Tok(
-                            Tok::Word(vec![Chunk::ProcSubIn { raw }], false),
-                            start..lexer.pos,
-                        )),
+                        Ok(raw) => items.push(SpannedItem::Tok(Tok::Word(vec![Chunk::ProcSubIn { raw }], false), start..lexer.pos)),
                         Err(e) => {
                             error = Some(e);
                             break;
@@ -1940,9 +1930,7 @@ fn parse_operator_suffix(rest: &str) -> Option<VarOp> {
     // it (`${V: -1}`) for exactly this reason.
     if let Some(spec) = rest.strip_prefix(':') {
         return Some(match spec.find(':') {
-            Some(idx) => {
-                VarOp::Substring { offset: spec[..idx].to_string(), length: Some(spec[idx + 1..].to_string()) }
-            }
+            Some(idx) => VarOp::Substring { offset: spec[..idx].to_string(), length: Some(spec[idx + 1..].to_string()) },
             None => VarOp::Substring { offset: spec.to_string(), length: None },
         });
     }
@@ -2179,16 +2167,14 @@ fn try_brace_range(inner: &str) -> Option<Vec<String>> {
         None => 1,
     };
     if let (Ok(a), Ok(b)) = (parts[0].parse::<i64>(), parts[1].parse::<i64>()) {
-        let items: Vec<i64> =
-            if a <= b { (a..=b).step_by(step).collect() } else { (b..=a).rev().step_by(step).collect() };
+        let items: Vec<i64> = if a <= b { (a..=b).step_by(step).collect() } else { (b..=a).rev().step_by(step).collect() };
         let pad_width = brace_range_zero_pad_width(parts[0], parts[1]);
         return Some(items.into_iter().map(|n| format_brace_range_int(n, pad_width)).collect());
     }
     let (ca, cb): (Vec<char>, Vec<char>) = (parts[0].chars().collect(), parts[1].chars().collect());
     if ca.len() == 1 && cb.len() == 1 {
         let (a, b) = (ca[0] as u32, cb[0] as u32);
-        let range: Vec<u32> =
-            if a <= b { (a..=b).step_by(step).collect() } else { (b..=a).rev().step_by(step).collect() };
+        let range: Vec<u32> = if a <= b { (a..=b).step_by(step).collect() } else { (b..=a).rev().step_by(step).collect() };
         return Some(range.into_iter().filter_map(char::from_u32).map(String::from).collect());
     }
     None
@@ -2242,7 +2228,6 @@ fn split_top_level_commas(s: &str) -> Vec<String> {
     items.push(cur);
     items
 }
-
 
 // ---------------------------------------------------------------------
 // Alias expansion
@@ -2305,9 +2290,7 @@ pub fn expand_aliases(toks: Vec<(Tok, usize)>, lookup: &dyn Fn(&str) -> Option<S
             frames.pop();
         }
 
-        let eligible = command_position
-            && budget > 0
-            && matches!(&tok, Tok::Word(_, globbable) if *globbable);
+        let eligible = command_position && budget > 0 && matches!(&tok, Tok::Word(_, globbable) if *globbable);
         let name = if eligible { literal_word(&tok) } else { None };
         let value = name.as_deref().and_then(lookup);
 
@@ -2373,9 +2356,7 @@ fn is_assignment_word(tok: &Tok) -> bool {
     let Some(word) = literal_word(tok) else { return false };
     let Some(eq) = word.find('=') else { return false };
     let name = &word[..eq];
-    !name.is_empty()
-        && !name.starts_with(|c: char| c.is_ascii_digit())
-        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    !name.is_empty() && !name.starts_with(|c: char| c.is_ascii_digit()) && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 /// Whether a command can start immediately after this token.
@@ -2522,16 +2503,12 @@ mod tests {
 
     #[test]
     fn parse_expansion_word_still_expands_vars_around_literal_spaces() {
-        assert_eq!(
-            parse_expansion_word("hello $v"),
-            vec![Chunk::Str("hello ".to_string()), Chunk::Var { name: "v".to_string(), quoted: false }]
-        );
+        assert_eq!(parse_expansion_word("hello $v"), vec![Chunk::Str("hello ".to_string()), Chunk::Var { name: "v".to_string(), quoted: false }]);
     }
 
     fn spanned_text<'a>(src: &'a str, r: &std::ops::Range<usize>) -> &'a str {
         let chars: Vec<char> = src.chars().collect();
-        &src[chars[..r.start].iter().map(|c| c.len_utf8()).sum()
-            ..chars[..r.end].iter().map(|c| c.len_utf8()).sum()]
+        &src[chars[..r.start].iter().map(|c| c.len_utf8()).sum()..chars[..r.end].iter().map(|c| c.len_utf8()).sum()]
     }
 
     #[test]
@@ -2831,6 +2808,3 @@ fn read_hex(chars: &mut std::iter::Peekable<std::str::Chars<'_>>, max: usize) ->
     }
     value
 }
-
-
-

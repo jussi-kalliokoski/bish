@@ -114,16 +114,10 @@ pub fn socket_dir() -> PathBuf {
 // anywhere else (a config file, a hook, `$BISH_SESSION`), and the
 // cheapest time to draw the line is before that happens.
 pub fn check_name(name: &str) -> io::Result<()> {
-    let ok = !name.is_empty()
-        && name != "."
-        && name != ".."
-        && name.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.');
+    let ok = !name.is_empty() && name != "." && name != ".." && name.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.');
     match ok {
         true => Ok(()),
-        false => Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("invalid session name '{name}': use letters, digits, '-', '_' and '.'"),
-        )),
+        false => Err(io::Error::new(io::ErrorKind::InvalidInput, format!("invalid session name '{name}': use letters, digits, '-', '_' and '.'"))),
     }
 }
 
@@ -221,16 +215,10 @@ pub fn ensure_socket_dir() -> io::Result<PathBuf> {
         use std::os::unix::fs::MetadataExt;
         let meta = std::fs::symlink_metadata(&dir)?;
         if !meta.is_dir() {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                format!("{} exists and is not a directory", dir.display()),
-            ));
+            return Err(io::Error::new(io::ErrorKind::AlreadyExists, format!("{} exists and is not a directory", dir.display())));
         }
         if meta.uid() != current_uid() {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                format!("{} is owned by uid {}, not by you", dir.display(), meta.uid()),
-            ));
+            return Err(io::Error::new(io::ErrorKind::PermissionDenied, format!("{} is owned by uid {}, not by you", dir.display(), meta.uid())));
         }
     }
     // Belt-and-suspenders: force the mode even if the directory already
@@ -549,7 +537,15 @@ impl SessionBridge {
         let client_write = Arc::new(Mutex::new(None));
         let client_write_for_thread = client_write.clone();
         std::thread::spawn(move || drain_pty_master_thread(pty_master_read, client_write_for_thread));
-        Ok(SessionBridge { listener, client_read: None, client_write, pty_master, decoder: Decoder::new(), just_attached: false, pending_capability: None })
+        Ok(SessionBridge {
+            listener,
+            client_read: None,
+            client_write,
+            pty_master,
+            decoder: Decoder::new(),
+            just_attached: false,
+            pending_capability: None,
+        })
     }
 
     pub fn is_attached(&self) -> bool {
@@ -790,10 +786,8 @@ pub fn run_ls() -> io::Result<i32> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(0),
         Err(e) => return Err(e),
     };
-    let mut names: Vec<String> = entries
-        .flatten()
-        .filter_map(|entry| entry.file_name().to_str().and_then(|s| s.strip_suffix(".sock")).map(str::to_string))
-        .collect();
+    let mut names: Vec<String> =
+        entries.flatten().filter_map(|entry| entry.file_name().to_str().and_then(|s| s.strip_suffix(".sock")).map(str::to_string)).collect();
     names.sort();
     let mut any = false;
     for name in names {
@@ -854,7 +848,8 @@ pub fn run_client(name: &str) -> io::Result<i32> {
     let mut stream = UnixStream::connect(&sock_path).map_err(|e| io::Error::new(e.kind(), format!("bish: session '{}' not found ({})", name, e)))?;
 
     let (rows, cols) = crate::pty::get_size(0).map(|ws| (ws.rows, ws.cols)).unwrap_or((24, 80));
-    let handshake = Message::Handshake { rows, cols, term: std::env::var("TERM").unwrap_or_default(), colorterm: std::env::var("COLORTERM").unwrap_or_default() };
+    let handshake =
+        Message::Handshake { rows, cols, term: std::env::var("TERM").unwrap_or_default(), colorterm: std::env::var("COLORTERM").unwrap_or_default() };
     stream.write_all(&handshake.encode())?;
     stream.set_nonblocking(true)?;
 
@@ -960,7 +955,12 @@ pub fn run_client(name: &str) -> io::Result<i32> {
 pub fn run_new(name: &str) -> io::Result<i32> {
     check_name(name)?;
     let exe = std::env::current_exe()?;
-    std::process::Command::new(exe).args(["session", "--daemon", name]).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn()?;
+    std::process::Command::new(exe)
+        .args(["session", "--daemon", name])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()?;
 
     let sock_path = socket_path(name);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);

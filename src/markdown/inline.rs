@@ -214,11 +214,7 @@ impl InlineParser<'_> {
                     let mut text: String = self.c.text(inner_start, i);
                     // Line endings inside a code span are spaces.
                     text = text.replace('\n', " ");
-                    if text.len() >= 2
-                        && text.starts_with(' ')
-                        && text.ends_with(' ')
-                        && !text.chars().all(|c| c == ' ')
-                    {
+                    if text.len() >= 2 && text.starts_with(' ') && text.ends_with(' ') && !text.chars().all(|c| c == ' ') {
                         text = text[1..text.len() - 1].to_string();
                     }
                     let span = self.c.span(self.pos, i + len);
@@ -251,17 +247,12 @@ impl InlineParser<'_> {
         }
         let before = if self.pos == 0 { ' ' } else { self.c.chars[self.pos - 1] };
         let after = self.at(self.pos + count).unwrap_or(' ');
-        let left_flanking = !after.is_whitespace()
-            && (!is_punctuation(after) || before.is_whitespace() || is_punctuation(before));
-        let right_flanking = !before.is_whitespace()
-            && (!is_punctuation(before) || after.is_whitespace() || is_punctuation(after));
+        let left_flanking = !after.is_whitespace() && (!is_punctuation(after) || before.is_whitespace() || is_punctuation(before));
+        let right_flanking = !before.is_whitespace() && (!is_punctuation(before) || after.is_whitespace() || is_punctuation(after));
         // `_` is stricter than `*`: it can't open or close inside a
         // word, so `snake_case_names` stays one word.
         let (can_open, can_close) = match c {
-            '_' => (
-                left_flanking && (!right_flanking || is_punctuation(before)),
-                right_flanking && (!left_flanking || is_punctuation(after)),
-            ),
+            '_' => (left_flanking && (!right_flanking || is_punctuation(before)), right_flanking && (!left_flanking || is_punctuation(after))),
             _ => (left_flanking, right_flanking),
         };
 
@@ -296,9 +287,7 @@ impl InlineParser<'_> {
         let label_end = self.pos;
         let after = self.pos + 1;
 
-        let resolved = self
-            .inline_destination(after)
-            .or_else(|| self.reference_destination(bracket.pos, label_end, after));
+        let resolved = self.inline_destination(after).or_else(|| self.reference_destination(bracket.pos, label_end, after));
         let Some((dest, title, end)) = resolved else {
             // Not a link after all: both brackets stay literal text.
             let span = self.c.span(self.pos, self.pos + 1);
@@ -609,10 +598,7 @@ fn is_email(s: &str) -> bool {
     }
     let user_ok = user.chars().all(|c| c.is_ascii_alphanumeric() || "!#$%&'*+/=?^_`{|}~-.".contains(c));
     let domain_ok = domain.split('.').all(|part| {
-        !part.is_empty()
-            && part.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
-            && !part.starts_with('-')
-            && !part.ends_with('-')
+        !part.is_empty() && part.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') && !part.starts_with('-') && !part.ends_with('-')
     });
     user_ok && domain_ok && domain.contains('.')
 }
@@ -708,10 +694,7 @@ pub fn html_span(s: &str) -> Option<usize> {
                 i = close + 1;
             }
             Some(c) if !c.is_whitespace() && !matches!(c, '"' | '\'' | '=' | '<' | '>' | '`') => {
-                while chars
-                    .get(i)
-                    .is_some_and(|c| !c.is_whitespace() && !matches!(c, '"' | '\'' | '=' | '<' | '>' | '`'))
-                {
+                while chars.get(i).is_some_and(|c| !c.is_whitespace() && !matches!(c, '"' | '\'' | '=' | '<' | '>' | '`')) {
                     i += 1;
                 }
             }
@@ -885,9 +868,7 @@ fn coalesce(inlines: Vec<Inline>) -> Vec<Inline> {
             Inline::Emph { content, span } => Inline::Emph { content: coalesce(content), span },
             Inline::Strong { content, span } => Inline::Strong { content: coalesce(content), span },
             Inline::Strikethrough { content, span } => Inline::Strikethrough { content: coalesce(content), span },
-            Inline::Link { dest, title, content, span } => {
-                Inline::Link { dest, title, content: coalesce(content), span }
-            }
+            Inline::Link { dest, title, content, span } => Inline::Link { dest, title, content: coalesce(content), span },
             Inline::Image { dest, title, alt, span } => Inline::Image { dest, title, alt: coalesce(alt), span },
             other => other,
         };

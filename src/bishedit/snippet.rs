@@ -848,5 +848,4 @@ mod tests {
         assert_eq!(take_lang_flag(&strs(&["-a", "foo", "echo", "--lang=x"])), (strs(&["-a", "foo", "echo", "--lang=x"]), None));
         assert_eq!(take_lang_flag(&strs(&["-a", "foo", "bar"])), (strs(&["-a", "foo", "bar"]), None));
     }
-
 }

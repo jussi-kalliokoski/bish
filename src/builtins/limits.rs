@@ -4,7 +4,7 @@
 // Free functions taking `&mut Shell` rather than methods on it -- see
 // `builtins/mod.rs` for why the whole family moved out of `impl Shell`.
 
-use crate::exec::{current_umask, sh_eprintln, sh_println, Shell};
+use crate::exec::{Shell, current_umask, sh_eprintln, sh_println};
 
 // Raw libc, the same way the rest of this codebase reaches for it: it
 // is already linked, and std has no wrapper. `getrlimit`/`setrlimit`
@@ -86,11 +86,7 @@ fn read_limit(spec: &LimitSpec, hard: bool) -> String {
 }
 
 fn fmt_limit(v: u64, div: u64) -> String {
-    if v == RLIM_INFINITY {
-        "unlimited".to_string()
-    } else {
-        (v / div.max(1)).to_string()
-    }
+    if v == RLIM_INFINITY { "unlimited".to_string() } else { (v / div.max(1)).to_string() }
 }
 
 fn umask_symbolic(mask: u32) -> String {
@@ -110,7 +106,6 @@ fn umask_symbolic(mask: u32) -> String {
     };
     format!("u={},g={},o={}", perm_for(6), perm_for(3), perm_for(0))
 }
-
 
 // ulimit [-HS] [-a] [-cdefilmnqrstuvx [limit]]. `-a` doesn't attempt to
 // byte-match bash's exact column alignment (its internal padding rules

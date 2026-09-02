@@ -4,8 +4,8 @@
 //
 // Free functions taking `&mut Shell` -- see `builtins/mod.rs`.
 
+use crate::exec::{ExecResult, Shell, echo_expand_escapes, printf_format_once, sh_eprintln, sh_print};
 use crate::parser;
-use crate::exec::{echo_expand_escapes, printf_format_once, sh_eprintln, sh_print, ExecResult, Shell};
 
 // `echo [-neE] [arg...]`: writes each arg separated by a single
 // space, then a trailing newline unless -n was given. Flags must

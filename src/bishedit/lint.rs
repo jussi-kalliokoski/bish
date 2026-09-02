@@ -507,7 +507,8 @@ fn lint_into(text: &str, offset: usize, out: &mut Vec<Diagnostic>) {
                             start: word_start,
                             end: word_end,
                             severity: Severity::Warning,
-                            code: Cow::Borrowed("masked-return-value"), source: None,
+                            code: Cow::Borrowed("masked-return-value"),
+                            source: None,
                             message: format!(
                                 "`{keyword}` masks `{name}`'s command substitution's own exit status -- assign it in a separate statement to check it"
                             ),
@@ -528,7 +529,15 @@ fn lint_into(text: &str, offset: usize, out: &mut Vec<Diagnostic>) {
 // always gets linted -- exempt only ever means "don't flag *this* word's
 // own splitting/globbing risk", never "skip its interior"), and flags an
 // unquoted, splitting-sensitive one when `!exempt`.
-fn lint_word_chunks(chunks: &[Chunk], offset: usize, chars: &[char], raw_spans: &[Range<usize>], cursor: &mut usize, exempt: bool, out: &mut Vec<Diagnostic>) {
+fn lint_word_chunks(
+    chunks: &[Chunk],
+    offset: usize,
+    chars: &[char],
+    raw_spans: &[Range<usize>],
+    cursor: &mut usize,
+    exempt: bool,
+    out: &mut Vec<Diagnostic>,
+) {
     // An all-plain word ([Chunk::Str(_)]) never got a raw_capture_spans
     // entry at all (see that field's own doc comment) and has nothing an
     // expansion-focused rule could ever flag -- skip it outright rather
@@ -603,7 +612,8 @@ fn push_unquoted_expansion(chars: &[char], offset: usize, content: Range<usize>,
         start,
         end,
         severity: Severity::Warning,
-        code: Cow::Borrowed("unquoted-expansion"), source: None,
+        code: Cow::Borrowed("unquoted-expansion"),
+        source: None,
         message: "Unquoted expansion may be word-split or glob-expanded here -- wrap it in double quotes".to_string(),
         fix: Some(Fix { start, end, replacement: format!("\"{}\"", char_slice(chars, full)) }),
     });

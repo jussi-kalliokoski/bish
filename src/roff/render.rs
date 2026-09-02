@@ -130,11 +130,7 @@ fn styled_of(inline: &Inline) -> String {
         Inline::Link { url, content, .. } => {
             let text: String = content.iter().map(styled_of).collect();
             let plain: String = content.iter().map(|i| i.text_content()).collect();
-            if plain.trim().is_empty() {
-                format!("{LINK}{url}{RESET}")
-            } else {
-                format!("{LINK}{text}{RESET}{DIM} ({url}){RESET}")
-            }
+            if plain.trim().is_empty() { format!("{LINK}{url}{RESET}") } else { format!("{LINK}{text}{RESET}{DIM} ({url}){RESET}") }
         }
     }
 }

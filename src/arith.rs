@@ -57,8 +57,7 @@ fn tokenize(src: &str) -> Result<Vec<Tok>, String> {
                     i += 1;
                 }
                 let digits: String = chars[dstart..i].iter().collect();
-                let n = i64::from_str_radix(&digits, base)
-                    .map_err(|_| format!("bad base-{} number in arithmetic expression", base))?;
+                let n = i64::from_str_radix(&digits, base).map_err(|_| format!("bad base-{} number in arithmetic expression", base))?;
                 toks.push(Tok::Num(n));
                 continue;
             }
@@ -151,10 +150,8 @@ fn tokenize(src: &str) -> Result<Vec<Tok>, String> {
             continue;
         }
         let two: String = chars[i..(i + 2).min(chars.len())].iter().collect();
-        const TWO_CHAR_OPS: [&str; 19] = [
-            "==", "!=", "<=", ">=", "&&", "||", "<<", ">>", "++", "--", "**", "+=", "-=", "*=", "/=", "%=", "&=",
-            "|=", "^=",
-        ];
+        const TWO_CHAR_OPS: [&str; 19] =
+            ["==", "!=", "<=", ">=", "&&", "||", "<<", ">>", "++", "--", "**", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^="];
         if TWO_CHAR_OPS.contains(&two.as_str()) {
             toks.push(Tok::Op(two));
             i += 2;

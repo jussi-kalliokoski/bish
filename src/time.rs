@@ -87,13 +87,10 @@ pub(crate) fn local_time_now() -> CTm {
 }
 
 const WEEKDAY_ABBR: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
-const WEEKDAY_FULL: [&str; 7] =
-    ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+const WEEKDAY_FULL: [&str; 7] = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
 const MONTH_ABBR: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
-const MONTH_FULL: [&str; 12] = [
-    "January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November",
-    "December",
-];
+const MONTH_FULL: [&str; 12] =
+    ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
 
 // `\d`: bash's own default (no-arg) date format, "Weekday Month Day"
 // with the day space-padded to two columns (matching `%e`, e.g. "Tue
@@ -224,11 +221,7 @@ mod tests {
             // Without it the comparison measures the machine's locale
             // rather than the formatting (a Finnish `date` answers
             // "torstai" for %A and nothing at all for %p).
-            let out = std::process::Command::new("date")
-                .env("LC_ALL", "C")
-                .arg(format!("-d@{epoch}"))
-                .arg(format!("+{SPECS}"))
-                .output();
+            let out = std::process::Command::new("date").env("LC_ALL", "C").arg(format!("-d@{epoch}")).arg(format!("+{SPECS}")).output();
             let Ok(out) = out else { return };
             if !out.status.success() {
                 return;

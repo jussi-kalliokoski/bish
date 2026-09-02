@@ -34,7 +34,17 @@
 // reproduction of the real (large, evolving) emoji-data.txt property.
 
 fn in_ranges(c: u32, ranges: &[(u32, u32)]) -> bool {
-    ranges.binary_search_by(|&(lo, hi)| if c < lo { std::cmp::Ordering::Greater } else if c > hi { std::cmp::Ordering::Less } else { std::cmp::Ordering::Equal }).is_ok()
+    ranges
+        .binary_search_by(|&(lo, hi)| {
+            if c < lo {
+                std::cmp::Ordering::Greater
+            } else if c > hi {
+                std::cmp::Ordering::Less
+            } else {
+                std::cmp::Ordering::Equal
+            }
+        })
+        .is_ok()
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -110,8 +120,8 @@ const HANGUL_TCOUNT: u32 = 28;
 // sequence (heart U+2764 in "couple with heart", watch/hourglass, ...)
 // actually needs.
 const EXTENDED_PICTOGRAPHIC: &[(u32, u32)] = &[
-    (0x2300, 0x23FF), // Miscellaneous Technical (watch, hourglass, ...)
-    (0x2600, 0x27BF), // Miscellaneous Symbols + Dingbats (heart, sun, scissors, ...)
+    (0x2300, 0x23FF),   // Miscellaneous Technical (watch, hourglass, ...)
+    (0x2600, 0x27BF),   // Miscellaneous Symbols + Dingbats (heart, sun, scissors, ...)
     (0x1F300, 0x1FAFF), // main emoji blocks
 ];
 

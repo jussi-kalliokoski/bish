@@ -27,8 +27,8 @@ use std::collections::VecDeque;
 use std::io::{ErrorKind, Read, Write};
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
 use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
+use std::time::{Duration, Instant};
 
 use crate::json::{self, Value};
 use crate::lsp::{self, Id, Message, PositionEncoding, ResponseError};
@@ -525,7 +525,10 @@ impl Server {
             ("processId".to_string(), Value::Number(std::process::id() as f64)),
             (
                 "clientInfo".to_string(),
-                Value::Object(vec![("name".to_string(), Value::Str("bish".to_string())), ("version".to_string(), Value::Str(env!("CARGO_PKG_VERSION").to_string()))]),
+                Value::Object(vec![
+                    ("name".to_string(), Value::Str("bish".to_string())),
+                    ("version".to_string(), Value::Str(env!("CARGO_PKG_VERSION").to_string())),
+                ]),
             ),
             // `rootUri` is deprecated in favour of `workspaceFolders`,
             // but it is the one every server still honours, and bish has
@@ -544,290 +547,256 @@ impl Server {
                     ("general".to_string(), Value::Object(vec![("positionEncodings".to_string(), Value::Array(encodings))])),
                     (
                         "textDocument".to_string(),
-                        Value::Object(vec![(
-                            "synchronization".to_string(),
-                            Value::Object(vec![
-                                // No dynamic registration anywhere: a
-                                // server that could ask to be told about
-                                // things at run time would be asking a
-                                // client that has no way to honour it.
-                                ("dynamicRegistration".to_string(), Value::Bool(false)),
-                                // `willSave` is declined deliberately.
-                                // It only earns its place alongside
-                                // `willSaveWaitUntil`, which lets a
-                                // server rewrite the buffer before it
-                                // hits disk -- and a save that blocks on
-                                // a language server is a save that can
-                                // hang, which `:w` must not.
-                                ("willSave".to_string(), Value::Bool(false)),
-                                ("willSaveWaitUntil".to_string(), Value::Bool(false)),
-                                ("didSave".to_string(), Value::Bool(true)),
-                            ]),
-                        ),
-                        (
-                            "codeAction".to_string(),
-                            Value::Object(vec![
-                                ("dynamicRegistration".to_string(), Value::Bool(false)),
-                                // The literal form, meaning a server may
-                                // answer with `CodeAction` objects
-                                // rather than only the older bare
-                                // `Command`s -- which is what carries an
-                                // edit at all.
-                                (
-                                    "codeActionLiteralSupport".to_string(),
-                                    Value::Object(vec![(
-                                        "codeActionKind".to_string(),
-                                        Value::Object(vec![("valueSet".to_string(), Value::Array(Vec::new()))]),
-                                    )]),
-                                ),
-                                // Yes to being sent actions without
-                                // their edits: `codeAction/resolve`
-                                // fetches the one actually chosen, which
-                                // is how rust-analyzer avoids computing
-                                // every refactor nobody picked.
-                                (
-                                    "resolveSupport".to_string(),
-                                    Value::Object(vec![("properties".to_string(), Value::Array(vec![Value::Str("edit".to_string())]))]),
-                                ),
-                                ("disabledSupport".to_string(), Value::Bool(true)),
-                            ]),
-                        ),
-                        (
-                            "rename".to_string(),
-                            Value::Object(vec![
-                                ("dynamicRegistration".to_string(), Value::Bool(false)),
-                                // Not claimed: `prepareSupport` means
-                                // the client asks whether a rename is
-                                // legal here before offering one, which
-                                // bish does not do -- it just asks.
-                                ("prepareSupport".to_string(), Value::Bool(false)),
-                            ]),
-                        ),
-                        (
-                            "formatting".to_string(),
-                            Value::Object(vec![("dynamicRegistration".to_string(), Value::Bool(false))]),
-                        ),
-                        (
-                            "documentSymbol".to_string(),
-                            Value::Object(vec![
-                                ("dynamicRegistration".to_string(), Value::Bool(false)),
-                                // The nested form, which is what an
-                                // indented outline wants; a server that
-                                // only speaks the flat one still works
-                                // (see `lsp::symbols`).
-                                ("hierarchicalDocumentSymbolSupport".to_string(), Value::Bool(true)),
-                            ]),
-                        ),
-                        (
-                            "semanticTokens".to_string(),
-                            Value::Object(vec![
-                                ("dynamicRegistration".to_string(), Value::Bool(false)),
-                                // Only the whole document. The delta and
-                                // range forms exist to make a large file
-                                // cheap, and bish asks for tokens off the
-                                // idle path with the answer collected
-                                // whenever it turns up -- nothing is
-                                // waiting on it, so there is nothing for
-                                // the cheaper forms to save yet.
-                                (
-                                    "requests".to_string(),
-                                    Value::Object(vec![("full".to_string(), Value::Bool(true)), ("range".to_string(), Value::Bool(false))]),
-                                ),
-                                // Empty, both of them: a server sends
-                                // whatever legend it likes and bish reads
-                                // the names back out of it (see
-                                // `lsp::SemanticLegend`). Declaring a
-                                // fixed list here would mean refusing
-                                // token types this client can in fact
-                                // colour, since `::bish hl`'s namespace
-                                // is open.
-                                ("tokenTypes".to_string(), Value::Array(Vec::new())),
-                                ("tokenModifiers".to_string(), Value::Array(Vec::new())),
-                                ("formats".to_string(), Value::Array(vec![Value::Str("relative".to_string())])),
-                                // Neither is claimed: bish paints one
-                                // colour per token, so a server splitting
-                                // an unrecognised multi-line token into
-                                // per-line pieces (the first) and
-                                // overlapping tokens (the second) would
-                                // both need renderer work with nothing to
-                                // show for it yet.
-                                ("multilineTokenSupport".to_string(), Value::Bool(false)),
-                                ("overlappingTokenSupport".to_string(), Value::Bool(false)),
-                            ]),
-                        ),
-                        (
-                            "references".to_string(),
-                            Value::Object(vec![("dynamicRegistration".to_string(), Value::Bool(false))]),
-                        ),
-                        // "Where else in this file is what I'm on."
-                        (
-                            "documentHighlight".to_string(),
-                            Value::Object(vec![("dynamicRegistration".to_string(), Value::Bool(false))]),
-                        ),
-                        // Inline parameter names and inferred types.
-                        // `resolveSupport` is not claimed: a hint whose
-                        // label only arrives after a second round trip
-                        // would appear a beat after the code it
-                        // annotates, and every server can answer
-                        // completely if the client does not ask it to
-                        // defer.
-                        (
-                            "inlayHint".to_string(),
-                            Value::Object(vec![("dynamicRegistration".to_string(), Value::Bool(false))]),
-                        ),
-                        // The signature of the call being typed.
-                        // `contextSupport` is not claimed: bish sends
-                        // the position and nothing about *why* it
-                        // asked, and a server told otherwise would look
-                        // for a context that is not there.
-                        (
-                            "signatureHelp".to_string(),
-                            Value::Object(vec![
-                                ("dynamicRegistration".to_string(), Value::Bool(false)),
-                                (
-                                    "signatureInformation".to_string(),
-                                    Value::Object(vec![(
-                                        "documentationFormat".to_string(),
-                                        Value::Array(vec![Value::Str("plaintext".to_string())]),
-                                    )]),
-                                ),
-                            ]),
-                        ),
-                        (
-                            "definition".to_string(),
-                            Value::Object(vec![("dynamicRegistration".to_string(), Value::Bool(false))]),
-                        ),
-                        // The three questions next to it: `gy`, `gD`,
-                        // and `textDocument/implementation` (which has
-                        // no key yet -- see vimkeys' own note on `gi`).
-                        // Declared even where no key reaches it, since
-                        // what a client can do and what it currently
-                        // binds are different questions and a server
-                        // reads only the first.
-                        (
-                            "typeDefinition".to_string(),
-                            Value::Object(vec![("dynamicRegistration".to_string(), Value::Bool(false))]),
-                        ),
-                        (
-                            "implementation".to_string(),
-                            Value::Object(vec![("dynamicRegistration".to_string(), Value::Bool(false))]),
-                        ),
-                        (
-                            "declaration".to_string(),
-                            Value::Object(vec![("dynamicRegistration".to_string(), Value::Bool(false))]),
-                        ),
-                        (
-                            "completion".to_string(),
-                            Value::Object(vec![
-                                ("dynamicRegistration".to_string(), Value::Bool(false)),
-                                (
-                                    "completionItem".to_string(),
-                                    Value::Object(vec![
-                                        // Claimed because it is now
-                                        // true: a snippet completion
-                                        // splices in tentatively with a
-                                        // caret in its first tabstop
-                                        // (see `bishedit::snippet`).
-                                        // Undeclared, a server sends
-                                        // plain text instead -- which is
-                                        // why rust-analyzer's function
-                                        // completions arrive without
-                                        // their parentheses until a
-                                        // client says this.
-                                        ("snippetSupport".to_string(), Value::Bool(true)),
-                                        // Not claimed: bish has no
-                                        // second round trip for a
-                                        // completion item, so a server
-                                        // must send whatever it wants
-                                        // used up front.
-                                        (
-                                            "resolveSupport".to_string(),
-                                            Value::Object(vec![("properties".to_string(), Value::Array(Vec::new()))]),
-                                        ),
-                                        ("insertReplaceSupport".to_string(), Value::Bool(true)),
-                                        (
+                        Value::Object(vec![
+                            (
+                                "synchronization".to_string(),
+                                Value::Object(vec![
+                                    // No dynamic registration anywhere: a
+                                    // server that could ask to be told about
+                                    // things at run time would be asking a
+                                    // client that has no way to honour it.
+                                    ("dynamicRegistration".to_string(), Value::Bool(false)),
+                                    // `willSave` is declined deliberately.
+                                    // It only earns its place alongside
+                                    // `willSaveWaitUntil`, which lets a
+                                    // server rewrite the buffer before it
+                                    // hits disk -- and a save that blocks on
+                                    // a language server is a save that can
+                                    // hang, which `:w` must not.
+                                    ("willSave".to_string(), Value::Bool(false)),
+                                    ("willSaveWaitUntil".to_string(), Value::Bool(false)),
+                                    ("didSave".to_string(), Value::Bool(true)),
+                                ]),
+                            ),
+                            (
+                                "codeAction".to_string(),
+                                Value::Object(vec![
+                                    ("dynamicRegistration".to_string(), Value::Bool(false)),
+                                    // The literal form, meaning a server may
+                                    // answer with `CodeAction` objects
+                                    // rather than only the older bare
+                                    // `Command`s -- which is what carries an
+                                    // edit at all.
+                                    (
+                                        "codeActionLiteralSupport".to_string(),
+                                        Value::Object(vec![(
+                                            "codeActionKind".to_string(),
+                                            Value::Object(vec![("valueSet".to_string(), Value::Array(Vec::new()))]),
+                                        )]),
+                                    ),
+                                    // Yes to being sent actions without
+                                    // their edits: `codeAction/resolve`
+                                    // fetches the one actually chosen, which
+                                    // is how rust-analyzer avoids computing
+                                    // every refactor nobody picked.
+                                    (
+                                        "resolveSupport".to_string(),
+                                        Value::Object(vec![("properties".to_string(), Value::Array(vec![Value::Str("edit".to_string())]))]),
+                                    ),
+                                    ("disabledSupport".to_string(), Value::Bool(true)),
+                                ]),
+                            ),
+                            (
+                                "rename".to_string(),
+                                Value::Object(vec![
+                                    ("dynamicRegistration".to_string(), Value::Bool(false)),
+                                    // Not claimed: `prepareSupport` means
+                                    // the client asks whether a rename is
+                                    // legal here before offering one, which
+                                    // bish does not do -- it just asks.
+                                    ("prepareSupport".to_string(), Value::Bool(false)),
+                                ]),
+                            ),
+                            ("formatting".to_string(), Value::Object(vec![("dynamicRegistration".to_string(), Value::Bool(false))])),
+                            (
+                                "documentSymbol".to_string(),
+                                Value::Object(vec![
+                                    ("dynamicRegistration".to_string(), Value::Bool(false)),
+                                    // The nested form, which is what an
+                                    // indented outline wants; a server that
+                                    // only speaks the flat one still works
+                                    // (see `lsp::symbols`).
+                                    ("hierarchicalDocumentSymbolSupport".to_string(), Value::Bool(true)),
+                                ]),
+                            ),
+                            (
+                                "semanticTokens".to_string(),
+                                Value::Object(vec![
+                                    ("dynamicRegistration".to_string(), Value::Bool(false)),
+                                    // Only the whole document. The delta and
+                                    // range forms exist to make a large file
+                                    // cheap, and bish asks for tokens off the
+                                    // idle path with the answer collected
+                                    // whenever it turns up -- nothing is
+                                    // waiting on it, so there is nothing for
+                                    // the cheaper forms to save yet.
+                                    (
+                                        "requests".to_string(),
+                                        Value::Object(vec![("full".to_string(), Value::Bool(true)), ("range".to_string(), Value::Bool(false))]),
+                                    ),
+                                    // Empty, both of them: a server sends
+                                    // whatever legend it likes and bish reads
+                                    // the names back out of it (see
+                                    // `lsp::SemanticLegend`). Declaring a
+                                    // fixed list here would mean refusing
+                                    // token types this client can in fact
+                                    // colour, since `::bish hl`'s namespace
+                                    // is open.
+                                    ("tokenTypes".to_string(), Value::Array(Vec::new())),
+                                    ("tokenModifiers".to_string(), Value::Array(Vec::new())),
+                                    ("formats".to_string(), Value::Array(vec![Value::Str("relative".to_string())])),
+                                    // Neither is claimed: bish paints one
+                                    // colour per token, so a server splitting
+                                    // an unrecognised multi-line token into
+                                    // per-line pieces (the first) and
+                                    // overlapping tokens (the second) would
+                                    // both need renderer work with nothing to
+                                    // show for it yet.
+                                    ("multilineTokenSupport".to_string(), Value::Bool(false)),
+                                    ("overlappingTokenSupport".to_string(), Value::Bool(false)),
+                                ]),
+                            ),
+                            ("references".to_string(), Value::Object(vec![("dynamicRegistration".to_string(), Value::Bool(false))])),
+                            // "Where else in this file is what I'm on."
+                            ("documentHighlight".to_string(), Value::Object(vec![("dynamicRegistration".to_string(), Value::Bool(false))])),
+                            // Inline parameter names and inferred types.
+                            // `resolveSupport` is not claimed: a hint whose
+                            // label only arrives after a second round trip
+                            // would appear a beat after the code it
+                            // annotates, and every server can answer
+                            // completely if the client does not ask it to
+                            // defer.
+                            ("inlayHint".to_string(), Value::Object(vec![("dynamicRegistration".to_string(), Value::Bool(false))])),
+                            // The signature of the call being typed.
+                            // `contextSupport` is not claimed: bish sends
+                            // the position and nothing about *why* it
+                            // asked, and a server told otherwise would look
+                            // for a context that is not there.
+                            (
+                                "signatureHelp".to_string(),
+                                Value::Object(vec![
+                                    ("dynamicRegistration".to_string(), Value::Bool(false)),
+                                    (
+                                        "signatureInformation".to_string(),
+                                        Value::Object(vec![(
                                             "documentationFormat".to_string(),
-                                            Value::Array(vec![Value::Str("markdown".to_string()), Value::Str("plaintext".to_string())]),
-                                        ),
-                                    ]),
-                                ),
-                            ]),
-                        ),
-                        (
-                            "hover".to_string(),
-                            Value::Object(vec![
-                                ("dynamicRegistration".to_string(), Value::Bool(false)),
-                                // Markdown first, because that is what
-                                // servers put their best answer in --
-                                // but plaintext is accepted, and either
-                                // is flattened to lines for the popup.
-                                (
-                                    "contentFormat".to_string(),
-                                    Value::Array(vec![Value::Str("markdown".to_string()), Value::Str("plaintext".to_string())]),
-                                ),
-                            ]),
-                        ),
-                    ]),
+                                            Value::Array(vec![Value::Str("plaintext".to_string())]),
+                                        )]),
+                                    ),
+                                ]),
+                            ),
+                            ("definition".to_string(), Value::Object(vec![("dynamicRegistration".to_string(), Value::Bool(false))])),
+                            // The three questions next to it: `gy`, `gD`,
+                            // and `textDocument/implementation` (which has
+                            // no key yet -- see vimkeys' own note on `gi`).
+                            // Declared even where no key reaches it, since
+                            // what a client can do and what it currently
+                            // binds are different questions and a server
+                            // reads only the first.
+                            ("typeDefinition".to_string(), Value::Object(vec![("dynamicRegistration".to_string(), Value::Bool(false))])),
+                            ("implementation".to_string(), Value::Object(vec![("dynamicRegistration".to_string(), Value::Bool(false))])),
+                            ("declaration".to_string(), Value::Object(vec![("dynamicRegistration".to_string(), Value::Bool(false))])),
+                            (
+                                "completion".to_string(),
+                                Value::Object(vec![
+                                    ("dynamicRegistration".to_string(), Value::Bool(false)),
+                                    (
+                                        "completionItem".to_string(),
+                                        Value::Object(vec![
+                                            // Claimed because it is now
+                                            // true: a snippet completion
+                                            // splices in tentatively with a
+                                            // caret in its first tabstop
+                                            // (see `bishedit::snippet`).
+                                            // Undeclared, a server sends
+                                            // plain text instead -- which is
+                                            // why rust-analyzer's function
+                                            // completions arrive without
+                                            // their parentheses until a
+                                            // client says this.
+                                            ("snippetSupport".to_string(), Value::Bool(true)),
+                                            // Not claimed: bish has no
+                                            // second round trip for a
+                                            // completion item, so a server
+                                            // must send whatever it wants
+                                            // used up front.
+                                            ("resolveSupport".to_string(), Value::Object(vec![("properties".to_string(), Value::Array(Vec::new()))])),
+                                            ("insertReplaceSupport".to_string(), Value::Bool(true)),
+                                            (
+                                                "documentationFormat".to_string(),
+                                                Value::Array(vec![Value::Str("markdown".to_string()), Value::Str("plaintext".to_string())]),
+                                            ),
+                                        ]),
+                                    ),
+                                ]),
+                            ),
+                            (
+                                "hover".to_string(),
+                                Value::Object(vec![
+                                    ("dynamicRegistration".to_string(), Value::Bool(false)),
+                                    // Markdown first, because that is what
+                                    // servers put their best answer in --
+                                    // but plaintext is accepted, and either
+                                    // is flattened to lines for the popup.
+                                    (
+                                        "contentFormat".to_string(),
+                                        Value::Array(vec![Value::Str("markdown".to_string()), Value::Str("plaintext".to_string())]),
+                                    ),
+                                ]),
+                            ),
+                        ]),
                     ),
                     (
                         "workspace".to_string(),
-                        Value::Object(vec![(
-                            "workspaceEdit".to_string(),
-                            Value::Object(vec![
-                                // What bish can actually carry out. A
-                                // server that would need to create,
-                                // rename or delete a file is told so
-                                // here, and the rename that needs one is
-                                // refused rather than half-applied (see
-                                // `lsp::WorkspaceEdit::unsupported`).
-                                ("documentChanges".to_string(), Value::Bool(true)),
-                                ("resourceOperations".to_string(), Value::Array(Vec::new())),
-                            ]),
-                        ),
-                        // Declared to match the policy rather than
-                        // always: a server told `applyEdit: true` and
-                        // then refused every time has been lied to, and
-                        // some react by disabling the feature that
-                        // needed it anyway. Under `never` the honest
-                        // claim is that bish cannot do this.
-                        ("applyEdit".to_string(), Value::Bool(self.apply_edits != ApplyEdits::Never)),
-                        // Claimed so a server knows a push is coming
-                        // and does not have to poll for what it was
-                        // already told -- see the `didChangeConfiguration`
-                        // sent right after `initialized`.
-                        (
-                            "didChangeConfiguration".to_string(),
-                            Value::Object(vec![("dynamicRegistration".to_string(), Value::Bool(false))]),
-                        ),
-                        // "What are this client's settings for these
-                        // sections?" -- answered from the same place.
-                        ("configuration".to_string(), Value::Bool(true)),
-                        // The other half of a command-style code
-                        // action: the action names a command, and this
-                        // is how it gets run.
-                        (
-                            "executeCommand".to_string(),
-                            Value::Object(vec![("dynamicRegistration".to_string(), Value::Bool(false))]),
-                        ),
-                        // `:sym` -- the project-wide half of `gO`.
-                        (
-                            "symbol".to_string(),
-                            Value::Object(vec![
-                                ("dynamicRegistration".to_string(), Value::Bool(false)),
-                                // Not claimed: a `WorkspaceSymbol` whose
-                                // location is only a uri would need a
-                                // second round trip to find out *where*
-                                // in the file, and bish would have
-                                // nothing to show in the list until it
-                                // came back. Declining means every
-                                // answer arrives complete.
-                                (
-                                    "resolveSupport".to_string(),
-                                    Value::Object(vec![("properties".to_string(), Value::Array(Vec::new()))]),
-                                ),
-                            ]),
-                        ),
-                    ]),
+                        Value::Object(vec![
+                            (
+                                "workspaceEdit".to_string(),
+                                Value::Object(vec![
+                                    // What bish can actually carry out. A
+                                    // server that would need to create,
+                                    // rename or delete a file is told so
+                                    // here, and the rename that needs one is
+                                    // refused rather than half-applied (see
+                                    // `lsp::WorkspaceEdit::unsupported`).
+                                    ("documentChanges".to_string(), Value::Bool(true)),
+                                    ("resourceOperations".to_string(), Value::Array(Vec::new())),
+                                ]),
+                            ),
+                            // Declared to match the policy rather than
+                            // always: a server told `applyEdit: true` and
+                            // then refused every time has been lied to, and
+                            // some react by disabling the feature that
+                            // needed it anyway. Under `never` the honest
+                            // claim is that bish cannot do this.
+                            ("applyEdit".to_string(), Value::Bool(self.apply_edits != ApplyEdits::Never)),
+                            // Claimed so a server knows a push is coming
+                            // and does not have to poll for what it was
+                            // already told -- see the `didChangeConfiguration`
+                            // sent right after `initialized`.
+                            ("didChangeConfiguration".to_string(), Value::Object(vec![("dynamicRegistration".to_string(), Value::Bool(false))])),
+                            // "What are this client's settings for these
+                            // sections?" -- answered from the same place.
+                            ("configuration".to_string(), Value::Bool(true)),
+                            // The other half of a command-style code
+                            // action: the action names a command, and this
+                            // is how it gets run.
+                            ("executeCommand".to_string(), Value::Object(vec![("dynamicRegistration".to_string(), Value::Bool(false))])),
+                            // `:sym` -- the project-wide half of `gO`.
+                            (
+                                "symbol".to_string(),
+                                Value::Object(vec![
+                                    ("dynamicRegistration".to_string(), Value::Bool(false)),
+                                    // Not claimed: a `WorkspaceSymbol` whose
+                                    // location is only a uri would need a
+                                    // second round trip to find out *where*
+                                    // in the file, and bish would have
+                                    // nothing to show in the list until it
+                                    // came back. Declining means every
+                                    // answer arrives complete.
+                                    ("resolveSupport".to_string(), Value::Object(vec![("properties".to_string(), Value::Array(Vec::new()))])),
+                                ]),
+                            ),
+                        ]),
                     ),
                     (
                         "window".to_string(),
@@ -1040,11 +1009,7 @@ impl Server {
                             self.shown.pop_front();
                         }
                         let name = self.display_name().to_string();
-                        self.shown.push_back(if severity.is_empty() {
-                            format!("{name}: {text}")
-                        } else {
-                            format!("{name} {severity}: {text}")
-                        });
+                        self.shown.push_back(if severity.is_empty() { format!("{name}: {text}") } else { format!("{name} {severity}: {text}") });
                     }
                 }
                 None
@@ -1252,11 +1217,7 @@ impl Server {
     /// Takes the next server-requested edit waiting to be applied. The
     /// caller owes it a `reply_to_apply`, or the server waits forever.
     pub fn take_apply_edit(&mut self) -> Option<(Id, Value)> {
-        if self.applies.is_empty() {
-            None
-        } else {
-            Some(self.applies.remove(0))
-        }
+        if self.applies.is_empty() { None } else { Some(self.applies.remove(0)) }
     }
 
     /// Answers one edit taken with `take_apply_edit`.
@@ -2050,10 +2011,7 @@ fn end_of(lines: &[&str], encoding: PositionEncoding) -> Value {
 }
 
 fn position(line: usize, character: usize) -> Value {
-    Value::Object(vec![
-        ("line".to_string(), Value::Number(line as f64)),
-        ("character".to_string(), Value::Number(character as f64)),
-    ])
+    Value::Object(vec![("line".to_string(), Value::Number(line as f64)), ("character".to_string(), Value::Number(character as f64))])
 }
 
 pub fn root_for(path: &Path, markers: &[String]) -> Option<PathBuf> {
@@ -2147,10 +2105,7 @@ mod tests {
         // An edit bish cannot apply: said in the server's own
         // vocabulary, so it can tell the user the refactor did not
         // happen rather than failing obscurely.
-        assert_eq!(
-            server.answer("workspace/applyEdit", &Value::Null).0,
-            Ok(Value::Object(vec![("applied".to_string(), Value::Bool(false))]))
-        );
+        assert_eq!(server.answer("workspace/applyEdit", &Value::Null).0, Ok(Value::Object(vec![("applied".to_string(), Value::Bool(false))])));
 
         // And the default really is MethodNotFound: it is the correct
         // answer for a method a client does not implement.
@@ -2415,16 +2370,10 @@ mod tests {
 
     #[test]
     fn dotted_keys_become_the_nested_object_a_server_expects() {
-        assert_eq!(
-            tree(&[("rust-analyzer.check.command", "clippy")]),
-            r#"{"rust-analyzer":{"check":{"command":"clippy"}}}"#
-        );
+        assert_eq!(tree(&[("rust-analyzer.check.command", "clippy")]), r#"{"rust-analyzer":{"check":{"command":"clippy"}}}"#);
         // Two keys sharing a prefix share the objects along it rather
         // than each rebuilding their own.
-        assert_eq!(
-            tree(&[("a.b", "1"), ("a.c", "2")]),
-            r#"{"a":{"b":1,"c":2}}"#
-        );
+        assert_eq!(tree(&[("a.b", "1"), ("a.c", "2")]), r#"{"a":{"b":1,"c":2}}"#);
     }
 
     #[test]
@@ -2468,10 +2417,7 @@ mod tests {
         let settings = settings_tree(&pairs(&[("rust-analyzer.check.command", "clippy"), ("other.thing", "1")]));
         let server = Server::start(1, &mock_server(FULL_SYNC), "mock", &dir, ApplyEdits::default(), settings).unwrap();
         let request = |sections: &[&str]| {
-            let items = sections
-                .iter()
-                .map(|s| Value::Object(vec![("section".to_string(), Value::Str((*s).to_string()))]))
-                .collect();
+            let items = sections.iter().map(|s| Value::Object(vec![("section".to_string(), Value::Str((*s).to_string()))])).collect();
             Value::Object(vec![("items".to_string(), Value::Array(items))])
         };
 
@@ -2529,8 +2475,7 @@ mod tests {
     fn a_server_with_no_settings_is_not_pushed_an_empty_configuration() {
         let dir = temp_dir("noconfig");
         let log = dir.join("received.jsonl");
-        let mut server =
-            Server::start(1, &scripted_server(&dir, &log), "mock", &dir, ApplyEdits::default(), Value::Object(Vec::new())).unwrap();
+        let mut server = Server::start(1, &scripted_server(&dir, &log), "mock", &dir, ApplyEdits::default(), Value::Object(Vec::new())).unwrap();
         run_until_ready(&mut server);
         drain(&mut server);
         assert!(
@@ -2550,10 +2495,7 @@ mod tests {
         run_until_ready(&mut server);
         let notify = |method: &str, kind: f64, text: &str| Message::Notification {
             method: method.to_string(),
-            params: Value::Object(vec![
-                ("type".to_string(), Value::Number(kind)),
-                ("message".to_string(), Value::Str(text.to_string())),
-            ]),
+            params: Value::Object(vec![("type".to_string(), Value::Number(kind)), ("message".to_string(), Value::Str(text.to_string()))]),
         };
         assert!(server.handle(notify("window/logMessage", 1.0, "loading")).is_none());
         assert_eq!(server.take_shown_message(), None, "a log line is not shown");
@@ -2582,10 +2524,7 @@ mod tests {
         for n in 0..MAX_SHOWN * 3 {
             server.handle(Message::Notification {
                 method: "window/showMessage".to_string(),
-                params: Value::Object(vec![
-                    ("type".to_string(), Value::Number(3.0)),
-                    ("message".to_string(), Value::Str(format!("line {n}"))),
-                ]),
+                params: Value::Object(vec![("type".to_string(), Value::Number(3.0)), ("message".to_string(), Value::Str(format!("line {n}")))]),
             });
         }
         let drained = std::iter::from_fn(|| server.take_shown_message()).count();
@@ -2761,7 +2700,11 @@ mod tests {
         std::fs::write(repo.join("Cargo.toml"), "").unwrap();
         let nested = deep.join("lib.rs");
         std::fs::write(&nested, "").unwrap();
-        assert_eq!(root_for(&nested, &["Cargo.toml".to_string(), ".git".to_string()]), Some(crate_dir.clone()), "the crate directly above, not the workspace far above");
+        assert_eq!(
+            root_for(&nested, &["Cargo.toml".to_string(), ".git".to_string()]),
+            Some(crate_dir.clone()),
+            "the crate directly above, not the workspace far above"
+        );
         let _ = &repo;
         // And with only the marker that isn't there, nothing does --
         // rather than falling back to a guess.
@@ -3141,7 +3084,9 @@ mod tests {
             })
             .collect();
         assert_eq!(methods, vec!["initialize", "initialized", "textDocument/didOpen", "textDocument/hover"], "{methods:?}");
-        let Some(Message::Request { params, .. }) = sent.iter().find(|m| matches!(m, Message::Request { method, .. } if method == "textDocument/hover")) else {
+        let Some(Message::Request { params, .. }) =
+            sent.iter().find(|m| matches!(m, Message::Request { method, .. } if method == "textDocument/hover"))
+        else {
             panic!("no hover request recorded");
         };
         assert_eq!(json::query(params, ".position.character"), Ok(&Value::Number(1.0)));
@@ -3159,10 +3104,7 @@ mod tests {
         server.open_document("file:///p/x.sh", "shellscript", 1, "echo hi");
         let position = Value::Object(vec![
             ("textDocument".to_string(), Value::Object(vec![("uri".to_string(), Value::Str("file:///p/x.sh".to_string()))])),
-            (
-                "position".to_string(),
-                Value::Object(vec![("line".to_string(), Value::Number(0.0)), ("character".to_string(), Value::Number(0.0))]),
-            ),
+            ("position".to_string(), Value::Object(vec![("line".to_string(), Value::Number(0.0)), ("character".to_string(), Value::Number(0.0))])),
         ]);
         let mut ids = Vec::new();
         for _ in 0..MAX_PENDING_RESPONSES + 10 {
@@ -3201,7 +3143,9 @@ mod tests {
     #[test]
     fn a_publication_for_an_unknown_document_is_dropped() {
         let dir = temp_dir("unknown");
-        let mut server = Server::start(1, &publishing_server("file:///p/never-opened.sh"), "mock", &dir, ApplyEdits::default(), Value::Object(Vec::new())).unwrap();
+        let mut server =
+            Server::start(1, &publishing_server("file:///p/never-opened.sh"), "mock", &dir, ApplyEdits::default(), Value::Object(Vec::new()))
+                .unwrap();
         run_until_ready(&mut server);
         server.open_document("file:///p/x.sh", "shellscript", 1, "one");
         for _ in 0..200 {
@@ -3250,8 +3194,6 @@ mod tests {
         assert!(Sync::default().open_close && Sync::default().change);
     }
 
-
-
     fn run_until_ready(server: &mut Server) {
         for _ in 0..400 {
             server.service();
@@ -3284,7 +3226,8 @@ mod tests {
     #[test]
     fn a_server_that_names_no_encoding_is_assumed_to_mean_utf16() {
         let dir = temp_dir("utf16");
-        let mut server = Server::start(1, &mock_server(r#"{"capabilities":{}}"#), "mock", &dir, ApplyEdits::default(), Value::Object(Vec::new())).unwrap();
+        let mut server =
+            Server::start(1, &mock_server(r#"{"capabilities":{}}"#), "mock", &dir, ApplyEdits::default(), Value::Object(Vec::new())).unwrap();
         run_until_ready(&mut server);
         assert_eq!(*server.state(), State::Ready, "log: {:?}", server.log().collect::<Vec<_>>());
         assert_eq!(server.encoding(), PositionEncoding::Utf16);
@@ -3294,7 +3237,8 @@ mod tests {
     #[test]
     fn work_queued_during_the_handshake_goes_out_once_it_finishes() {
         let dir = temp_dir("release");
-        let mut server = Server::start(1, &mock_server(r#"{"capabilities":{}}"#), "mock", &dir, ApplyEdits::default(), Value::Object(Vec::new())).unwrap();
+        let mut server =
+            Server::start(1, &mock_server(r#"{"capabilities":{}}"#), "mock", &dir, ApplyEdits::default(), Value::Object(Vec::new())).unwrap();
         server.request("textDocument/hover", Value::Null);
         assert_eq!(server.queued.len(), 1);
         run_until_ready(&mut server);
@@ -3313,7 +3257,8 @@ mod tests {
         let dir = temp_dir("refused");
         let body = r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"unsupported client"}}"#;
         let script = format!("printf 'Content-Length: %d\\r\\n\\r\\n%s' {} '{body}'; sleep 30", body.len());
-        let mut server = Server::start(1, &["sh".to_string(), "-c".to_string(), script], "mock", &dir, ApplyEdits::default(), Value::Object(Vec::new())).unwrap();
+        let mut server =
+            Server::start(1, &["sh".to_string(), "-c".to_string(), script], "mock", &dir, ApplyEdits::default(), Value::Object(Vec::new())).unwrap();
         run_until_ready(&mut server);
         let State::Dead(why) = server.state() else { panic!("still {:?}", server.state()) };
         assert!(why.contains("unsupported client"), "{why}");
@@ -3387,7 +3332,8 @@ mod tests {
     #[test]
     fn a_command_that_does_not_exist_fails_to_start_rather_than_hanging() {
         let dir = temp_dir("missing");
-        let Err(error) = Server::start(1, &["bish-no-such-language-server".to_string()], "x", &dir, ApplyEdits::default(), Value::Object(Vec::new())) else {
+        let Err(error) = Server::start(1, &["bish-no-such-language-server".to_string()], "x", &dir, ApplyEdits::default(), Value::Object(Vec::new()))
+        else {
             panic!("a command that isn't there should not have started");
         };
         assert!(error.contains("bish-no-such-language-server"), "{error}");
@@ -3401,7 +3347,9 @@ mod tests {
     fn a_server_that_exits_is_noticed_with_its_last_words() {
         let dir = temp_dir("dies");
         let script = "echo 'cannot find configuration' >&2; exit 3";
-        let mut server = Server::start(1, &["sh".to_string(), "-c".to_string(), script.to_string()], "sh", &dir, ApplyEdits::default(), Value::Object(Vec::new())).unwrap();
+        let mut server =
+            Server::start(1, &["sh".to_string(), "-c".to_string(), script.to_string()], "sh", &dir, ApplyEdits::default(), Value::Object(Vec::new()))
+                .unwrap();
         for _ in 0..400 {
             server.service();
             if matches!(server.state(), State::Dead(_)) {
@@ -3421,7 +3369,15 @@ mod tests {
     #[test]
     fn a_dead_server_stops_accepting_work() {
         let dir = temp_dir("dead");
-        let mut server = Server::start(1, &["sh".to_string(), "-c".to_string(), "exit 0".to_string()], "sh", &dir, ApplyEdits::default(), Value::Object(Vec::new())).unwrap();
+        let mut server = Server::start(
+            1,
+            &["sh".to_string(), "-c".to_string(), "exit 0".to_string()],
+            "sh",
+            &dir,
+            ApplyEdits::default(),
+            Value::Object(Vec::new()),
+        )
+        .unwrap();
         for _ in 0..400 {
             server.service();
             if matches!(server.state(), State::Dead(_)) {

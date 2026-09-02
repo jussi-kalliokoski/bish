@@ -233,10 +233,9 @@ impl Interp {
             "while" => self.run_while(args_text, span),
             // Things a terminal renderer has nothing to do with, and
             // which would otherwise reach the macro package as noise.
-            "tm" | "tm1" | "ab" | "pm" | "pi" | "lf" | "fp" | "hw" | "hy" | "nh" | "hla" | "hlm" | "hcode"
-            | "ss" | "cs" | "kern" | "lg" | "fam" | "char" | "rchar" | "tr" | "ec" | "eo" | "mc" | "psbb"
-            | "pso" | "blm" | "wh" | "ch" | "dt" | "it" | "itc" | "em" | "di" | "da" | "box" | "boxa" | "asciify"
-            | "unformat" | "output" | "device" | "devicem" | "warn" | "spreadwarn" | "msg" | "color" | "defcolor"
+            "tm" | "tm1" | "ab" | "pm" | "pi" | "lf" | "fp" | "hw" | "hy" | "nh" | "hla" | "hlm" | "hcode" | "ss" | "cs" | "kern" | "lg" | "fam"
+            | "char" | "rchar" | "tr" | "ec" | "eo" | "mc" | "psbb" | "pso" | "blm" | "wh" | "ch" | "dt" | "it" | "itc" | "em" | "di" | "da"
+            | "box" | "boxa" | "asciify" | "unformat" | "output" | "device" | "devicem" | "warn" | "spreadwarn" | "msg" | "color" | "defcolor"
             | "gcolor" | "fcolor" | "break" | "continue" | "do" | "cp" | "cflags" | "class" => {}
             "so" | "mso" | "soquiet" | "msoquiet" => {
                 self.note(format!("`.{name}` includes another file, which this parser does not follow"));

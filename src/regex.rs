@@ -47,11 +47,7 @@ impl<'a> ReParser<'a> {
             self.pos += 1;
             branches.push(self.parse_concat());
         }
-        if branches.len() == 1 {
-            branches.pop().unwrap()
-        } else {
-            Re::Alt(branches)
-        }
+        if branches.len() == 1 { branches.pop().unwrap() } else { Re::Alt(branches) }
     }
 
     fn parse_concat(&mut self) -> Re {
@@ -271,9 +267,7 @@ fn match_concat(parts: &[Re], s: &[char], pos: usize, ctx: &MatchCtx, k: &dyn Fn
 // to zero. `depth` is just a runaway-recursion guard for pathological
 // patterns on long inputs.
 fn match_star(inner: &Re, s: &[char], pos: usize, depth: usize, ctx: &MatchCtx, k: &dyn Fn(usize) -> bool) -> bool {
-    if depth < s.len() + 1
-        && match_re(inner, s, pos, ctx, &|p| p > pos && match_star(inner, s, p, depth + 1, ctx, k))
-    {
+    if depth < s.len() + 1 && match_re(inner, s, pos, ctx, &|p| p > pos && match_star(inner, s, p, depth + 1, ctx, k)) {
         return true;
     }
     k(pos)
@@ -298,13 +292,7 @@ pub fn escape(s: &str) -> String {
 // Shared by `Regex::match_at` and `match_captures` below: does `re` match
 // starting at exactly `pos` (not scanning forward for the next viable
 // start)? Returns the match's own end position plus its capture slots.
-fn match_at_with_caps(
-    re: &Re,
-    group_count: usize,
-    chars: &[char],
-    pos: usize,
-    ignore_case: bool,
-) -> Option<(usize, CapSlots)> {
+fn match_at_with_caps(re: &Re, group_count: usize, chars: &[char], pos: usize, ignore_case: bool) -> Option<(usize, CapSlots)> {
     let ctx = MatchCtx { caps: RefCell::new(vec![None; group_count + 1]), ignore_case };
     let end: std::cell::Cell<Option<usize>> = std::cell::Cell::new(None);
     let matched = match_re(re, chars, pos, &ctx, &|p| {
@@ -476,7 +464,6 @@ mod tests {
         // it -- see `case_variants`' own doc comment.
         assert_eq!(case_variants('\u{df}').collect::<Vec<char>>(), Vec::<char>::new());
     }
-
 
     fn chars(s: &str) -> Vec<char> {
         s.chars().collect()

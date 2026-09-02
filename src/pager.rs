@@ -231,11 +231,8 @@ impl Pager {
 
     fn step_match(&mut self, delta: isize) {
         if self.matches.is_empty() {
-            self.message = Some(if self.query.is_empty() {
-                "no search yet -- press / to search".to_string()
-            } else {
-                format!("no match for {:?}", self.query)
-            });
+            self.message =
+                Some(if self.query.is_empty() { "no search yet -- press / to search".to_string() } else { format!("no match for {:?}", self.query) });
             return;
         }
         let len = self.matches.len() as isize;
@@ -459,12 +456,7 @@ mod tests {
     // screen before showing through.
     #[test]
     fn every_rendered_row_is_exactly_the_width() {
-        let lines = vec![
-            "short".to_string(),
-            "\x1b[1mstyled\x1b[0m".to_string(),
-            "\u{65e5}\u{672c}\u{8a9e} wide".to_string(),
-            "x".repeat(200),
-        ];
+        let lines = vec!["short".to_string(), "\x1b[1mstyled\x1b[0m".to_string(), "\u{65e5}\u{672c}\u{8a9e} wide".to_string(), "x".repeat(200)];
         let p = Pager::new("title", lines, 10, 40);
         for row in p.render(Rect { row: 0, col: 0, rows: 10, cols: 80 }).split("\x1b[").filter(|s| s.ends_with('H') || s.contains('H')) {
             let _ = row;

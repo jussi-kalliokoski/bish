@@ -81,15 +81,7 @@ pub fn parse(text: &str) -> Option<Url> {
         Some(hostport) => split_host_port(hostport),
         None => (None, None),
     };
-    Some(Url {
-        scheme,
-        userinfo,
-        host,
-        port,
-        path: path.to_string(),
-        query: query.map(str::to_string),
-        fragment: fragment.map(str::to_string),
-    })
+    Some(Url { scheme, userinfo, host, port, path: path.to_string(), query: query.map(str::to_string), fragment: fragment.map(str::to_string) })
 }
 
 // `scheme:` -- a letter followed by letters, digits, `+`, `-` or `.`.

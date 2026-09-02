@@ -368,17 +368,12 @@ fn push_inlines(inlines: &[Inline], base: Style, out: &mut Vec<Run>, opts: &Opti
             }
             Inline::Emph { content, .. } => push_inlines(content, Style { italic: true, ..style.clone() }, out, opts),
             Inline::Strong { content, .. } => push_inlines(content, Style { bold: true, ..style.clone() }, out, opts),
-            Inline::Strikethrough { content, .. } => {
-                push_inlines(content, Style { strike: true, ..style.clone() }, out, opts)
-            }
+            Inline::Strikethrough { content, .. } => push_inlines(content, Style { strike: true, ..style.clone() }, out, opts),
             Inline::Link { dest, content, span, .. } => {
                 let mut s = style.clone();
                 s.color = Some(link(opts));
-                s.link = opts
-                    .hyperlinks
-                    .then(|| crate::url::absolute(dest, opts.base_dir.as_deref()))
-                    .flatten()
-                    .map(|url| Link { id: span.start, url });
+                s.link =
+                    opts.hyperlinks.then(|| crate::url::absolute(dest, opts.base_dir.as_deref())).flatten().map(|url| Link { id: span.start, url });
                 push_inlines(content, s, out, opts);
                 // The destination is shown after the text, dimmed. Still
                 // shown even now that the text itself can be a real
@@ -387,11 +382,7 @@ fn push_inlines(inlines: &[Inline], base: Style, out: &mut Vec<Run>, opts: &Opti
                 // few dim columns.
                 let text: String = content.iter().map(|i| i.text_content()).collect();
                 if !dest.is_empty() && *dest != text && format!("mailto:{text}") != *dest {
-                    out.push(Run {
-                        text: format!(" ({dest})"),
-                        style: Style { dim: true, ..Style::default() },
-                        break_after: false,
-                    });
+                    out.push(Run { text: format!(" ({dest})"), style: Style { dim: true, ..Style::default() }, break_after: false });
                 }
             }
             Inline::Image { dest, alt, .. } => {
@@ -404,12 +395,8 @@ fn push_inlines(inlines: &[Inline], base: Style, out: &mut Vec<Run>, opts: &Opti
             }
             // Handled above, before the suppression check.
             Inline::Html { .. } => {}
-            Inline::SoftBreak { .. } => {
-                out.push(Run { text: " ".to_string(), style: Style::default(), break_after: false })
-            }
-            Inline::HardBreak { .. } => {
-                out.push(Run { text: String::new(), style: Style::default(), break_after: true })
-            }
+            Inline::SoftBreak { .. } => out.push(Run { text: " ".to_string(), style: Style::default(), break_after: false }),
+            Inline::HardBreak { .. } => out.push(Run { text: String::new(), style: Style::default(), break_after: true }),
         }
     }
 }
@@ -480,11 +467,7 @@ fn html_runs(doc: &html::Document, node: html::NodeId, style: Style, out: &mut V
                 && let Some(href) = attrs.iter().find(|a| a.name == "href")
                 && !href.value.is_empty()
             {
-                out.push(Run {
-                    text: format!(" ({})", href.value),
-                    style: Style { dim: true, ..Style::default() },
-                    break_after: false,
-                });
+                out.push(Run { text: format!(" ({})", href.value), style: Style { dim: true, ..Style::default() }, break_after: false });
             }
             if matches!(name.as_str(), "p" | "div" | "tr" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "li") {
                 out.push(Run { text: String::new(), style: Style::default(), break_after: true });
@@ -615,11 +598,7 @@ fn inline_tag_style(name: &str, style: &Style, opts: &Options) -> Style {
 }
 
 fn is_void(name: &str) -> bool {
-    matches!(
-        name,
-        "area" | "base" | "br" | "col" | "embed" | "hr" | "img" | "input" | "link" | "meta" | "param" | "source"
-            | "track" | "wbr"
-    )
+    matches!(name, "area" | "base" | "br" | "col" | "embed" | "hr" | "img" | "input" | "link" | "meta" | "param" | "source" | "track" | "wbr")
 }
 
 #[cfg(test)]
@@ -782,11 +761,7 @@ to need wrapping at this width",
 
     #[test]
     fn a_code_block_is_indented_and_kept_verbatim() {
-        assert_render(
-            "```bash\nif true; then\n  echo hi\nfi\n```\n",
-            40,
-            &["  if true; then", "    echo hi", "  fi"].join("\n"),
-        );
+        assert_render("```bash\nif true; then\n  echo hi\nfi\n```\n", 40, &["  if true; then", "    echo hi", "  fi"].join("\n"));
     }
 
     #[test]

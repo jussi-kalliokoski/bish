@@ -65,28 +65,19 @@ struct RawItem {
 fn resolve(raw: Raw, refs: &[LinkRef]) -> Block {
     match raw {
         Raw::Paragraph { content, span } => Block::Paragraph { content: inline::parse(&content, refs), span },
-        Raw::Heading { level, content, marker, span } => {
-            Block::Heading { level, content: inline::parse(&content, refs), marker, span }
-        }
+        Raw::Heading { level, content, marker, span } => Block::Heading { level, content: inline::parse(&content, refs), marker, span },
         Raw::Code { info, literal, fenced, info_span, literal_span, span } => {
             Block::CodeBlock { info, literal, fenced, info_span, literal_span, span }
         }
         Raw::Html { raw, span } => Block::HtmlBlock { raw, span },
-        Raw::Quote { blocks, span } => {
-            Block::BlockQuote { blocks: blocks.into_iter().map(|b| resolve(b, refs)).collect(), span }
-        }
+        Raw::Quote { blocks, span } => Block::BlockQuote { blocks: blocks.into_iter().map(|b| resolve(b, refs)).collect(), span },
         Raw::List { ordered, start, tight, items, span } => Block::List(List {
             ordered,
             start,
             tight,
             items: items
                 .into_iter()
-                .map(|i| ListItem {
-                    blocks: i.blocks.into_iter().map(|b| resolve(b, refs)).collect(),
-                    task: i.task,
-                    marker: i.marker,
-                    span: i.span,
-                })
+                .map(|i| ListItem { blocks: i.blocks.into_iter().map(|b| resolve(b, refs)).collect(), task: i.task, marker: i.marker, span: i.span })
                 .collect(),
             span,
         }),
@@ -94,10 +85,7 @@ fn resolve(raw: Raw, refs: &[LinkRef]) -> Block {
         Raw::Table { align, header, rows, span } => {
             let columns = align.len();
             let head = split_row(&header, Some(columns)).iter().map(|c| inline::parse(c, refs)).collect();
-            let rows = rows
-                .iter()
-                .map(|r| split_row(r, Some(columns)).iter().map(|c| inline::parse(c, refs)).collect())
-                .collect();
+            let rows = rows.iter().map(|r| split_row(r, Some(columns)).iter().map(|c| inline::parse(c, refs)).collect()).collect();
             Block::Table(Table { align, head, rows, span })
         }
     }
@@ -491,8 +479,7 @@ impl Parser {
         // "Interrupting a paragraph" means one that is actually still
         // open: a paragraph whose own container the line already left is
         // going to close regardless, so nothing interrupts it.
-        let in_paragraph =
-            self.all_matched && matches!(self.stack[self.stack.len() - 1].kind, Kind::Paragraph);
+        let in_paragraph = self.all_matched && matches!(self.stack[self.stack.len() - 1].kind, Kind::Paragraph);
         let last_matched = container;
 
         if !indented && self.peek() == Some('>') && self.can_nest() {
@@ -539,17 +526,15 @@ impl Parser {
         // delimiter row with the same number of columns. Checked before
         // the setext underline, since `---` is both -- the pipes are
         // what tell them apart.
-        if !indented && in_paragraph && let Some(align) = delimiter_row(&self.line.chars[self.next_nonspace..]) {
+        if !indented
+            && in_paragraph
+            && let Some(align) = delimiter_row(&self.line.chars[self.next_nonspace..])
+        {
             let tip = self.stack.len() - 1;
-            let header_has_pipe = self.stack[tip]
-                .lines
-                .last()
-                .is_some_and(|(l, _)| l.chars().enumerate().any(|(i, c)| c == '|' && !escaped_at(l, i)));
-            let columns_match = self.stack[tip]
-                .lines
-                .last()
-                .map(|(l, o)| split_row(&Content::from_line(l, *o), None).len() == align.len())
-                .unwrap_or(false);
+            let header_has_pipe =
+                self.stack[tip].lines.last().is_some_and(|(l, _)| l.chars().enumerate().any(|(i, c)| c == '|' && !escaped_at(l, i)));
+            let columns_match =
+                self.stack[tip].lines.last().map(|(l, o)| split_row(&Content::from_line(l, *o), None).len() == align.len()).unwrap_or(false);
             if header_has_pipe && columns_match {
                 // The paragraph is taken *before* closing anything:
                 // close_unmatched would close the very block this needs.
@@ -577,7 +562,10 @@ impl Parser {
                 return Some(true);
             }
         }
-        if !indented && in_paragraph && let Some(level) = self.setext_underline() {
+        if !indented
+            && in_paragraph
+            && let Some(level) = self.setext_underline()
+        {
             // The paragraph's own accumulated lines become the heading
             // -- taken before closing anything, since close_unmatched
             // would close the very block this needs.
@@ -615,14 +603,7 @@ impl Parser {
             self.advance_columns(CODE_INDENT);
             let start = self.line.start + self.offset;
             self.open_leaf(
-                Kind::Code {
-                    fenced: false,
-                    fence_char: ' ',
-                    fence_len: 0,
-                    indent: 0,
-                    info: String::new(),
-                    info_span: start..start,
-                },
+                Kind::Code { fenced: false, fence_char: ' ', fence_len: 0, indent: 0, info: String::new(), info_span: start..start },
                 start,
             );
             return Some(true);
@@ -749,8 +730,7 @@ impl Parser {
         let (ordered, number, marker_char, delim, marker_len) = if matches!(c, '-' | '+' | '*') {
             (false, 1u64, c, ' ', 1)
         } else if c.is_ascii_digit() {
-            let digits: String =
-                self.line.chars[marker_start..].iter().take_while(|c| c.is_ascii_digit()).collect();
+            let digits: String = self.line.chars[marker_start..].iter().take_while(|c| c.is_ascii_digit()).collect();
             // At most nine digits, per the spec -- past that it's text.
             if digits.len() > 9 {
                 return None;
@@ -811,15 +791,7 @@ impl Parser {
             _ => None,
         };
 
-        Some(ItemStart {
-            ordered,
-            number,
-            marker_char,
-            delim,
-            marker: (self.line.start + marker_start)..(self.line.start + after),
-            indent,
-            task,
-        })
+        Some(ItemStart { ordered, number, marker_char, delim, marker: (self.line.start + marker_start)..(self.line.start + after), indent, task })
     }
 
     fn start_list_item(&mut self, item: ItemStart) {
@@ -831,9 +803,7 @@ impl Parser {
         // kind of marker means the same list.
         let mut tip = self.stack.len() - 1;
         let same_list = match &self.stack[tip].kind {
-            Kind::List { ordered, marker, delim, .. } => {
-                *ordered == item.ordered && *marker == item.marker_char && *delim == item.delim
-            }
+            Kind::List { ordered, marker, delim, .. } => *ordered == item.ordered && *marker == item.marker_char && *delim == item.delim,
             _ => false,
         };
         // A different marker means a different list, so the open one has
@@ -852,21 +822,11 @@ impl Parser {
             }
         } else {
             self.stack.push(Open::new(
-                Kind::List {
-                    ordered: item.ordered,
-                    start: item.number,
-                    marker: item.marker_char,
-                    delim: item.delim,
-                    tight: true,
-                    saw_blank: false,
-                },
+                Kind::List { ordered: item.ordered, start: item.number, marker: item.marker_char, delim: item.delim, tight: true, saw_blank: false },
                 start,
             ));
         }
-        self.stack.push(Open::new(
-            Kind::Item { indent: item.indent, marker: item.marker.clone(), task: item.task, saw_blank_child: false },
-            start,
-        ));
+        self.stack.push(Open::new(Kind::Item { indent: item.indent, marker: item.marker.clone(), task: item.task, saw_blank_child: false }, start));
         // The task marker itself is consumed, so it isn't also text.
         if item.task.is_some() {
             self.find_next_nonspace();
@@ -882,11 +842,68 @@ impl Parser {
 // The seven HTML block conditions, §4.6. The tag lists are the spec's
 // own, not a guess at what looks block-like.
 const HTML_BLOCK_TAGS: &[&str] = &[
-    "address", "article", "aside", "base", "basefont", "blockquote", "body", "caption", "center", "col", "colgroup",
-    "dd", "details", "dialog", "dir", "div", "dl", "dt", "fieldset", "figcaption", "figure", "footer", "form",
-    "frame", "frameset", "h1", "h2", "h3", "h4", "h5", "h6", "head", "header", "hr", "html", "iframe", "legend",
-    "li", "link", "main", "menu", "menuitem", "nav", "noframes", "ol", "optgroup", "option", "p", "param", "search",
-    "section", "summary", "table", "tbody", "td", "tfoot", "th", "thead", "title", "tr", "track", "ul",
+    "address",
+    "article",
+    "aside",
+    "base",
+    "basefont",
+    "blockquote",
+    "body",
+    "caption",
+    "center",
+    "col",
+    "colgroup",
+    "dd",
+    "details",
+    "dialog",
+    "dir",
+    "div",
+    "dl",
+    "dt",
+    "fieldset",
+    "figcaption",
+    "figure",
+    "footer",
+    "form",
+    "frame",
+    "frameset",
+    "h1",
+    "h2",
+    "h3",
+    "h4",
+    "h5",
+    "h6",
+    "head",
+    "header",
+    "hr",
+    "html",
+    "iframe",
+    "legend",
+    "li",
+    "link",
+    "main",
+    "menu",
+    "menuitem",
+    "nav",
+    "noframes",
+    "ol",
+    "optgroup",
+    "option",
+    "p",
+    "param",
+    "search",
+    "section",
+    "summary",
+    "table",
+    "tbody",
+    "td",
+    "tfoot",
+    "th",
+    "thead",
+    "title",
+    "tr",
+    "track",
+    "ul",
 ];
 
 impl Parser {
@@ -897,9 +914,7 @@ impl Parser {
         let rest: String = self.line.chars[self.next_nonspace..].iter().collect();
         let lower = rest.to_lowercase();
         for tag in ["script", "pre", "style", "textarea"] {
-            if lower.starts_with(&format!("<{tag}"))
-                && matches!(lower.chars().nth(tag.len() + 1), None | Some(' ') | Some('\t') | Some('>'))
-            {
+            if lower.starts_with(&format!("<{tag}")) && matches!(lower.chars().nth(tag.len() + 1), None | Some(' ') | Some('\t') | Some('>')) {
                 return Some(1);
             }
         }
@@ -918,11 +933,7 @@ impl Parser {
         let after_slash = lower.strip_prefix("</").unwrap_or_else(|| lower.strip_prefix('<').unwrap_or(&lower));
         for tag in HTML_BLOCK_TAGS {
             if let Some(tail) = after_slash.strip_prefix(tag)
-                && (tail.is_empty()
-                    || tail.starts_with(' ')
-                    || tail.starts_with('\t')
-                    || tail.starts_with('>')
-                    || tail.starts_with("/>"))
+                && (tail.is_empty() || tail.starts_with(' ') || tail.starts_with('\t') || tail.starts_with('>') || tail.starts_with("/>"))
             {
                 return Some(6);
             }
@@ -1048,9 +1059,7 @@ impl Parser {
         match open.kind {
             Kind::Document => None,
             Kind::BlockQuote => Some(Raw::Quote { blocks: open.children, span }),
-            Kind::List { ordered, start, tight, .. } => {
-                Some(Raw::List { ordered, start, tight, items: open.items, span })
-            }
+            Kind::List { ordered, start, tight, .. } => Some(Raw::List { ordered, start, tight, items: open.items, span }),
             // Closed by `close_to`, which knows where a ListItem goes.
             Kind::Item { .. } => None,
             Kind::Paragraph => {
@@ -1088,12 +1097,7 @@ impl Parser {
                 Some(Raw::Html { raw, span })
             }
             Kind::Table { align, header } => {
-                let rows = open
-                    .lines
-                    .iter()
-                    .filter(|(l, _)| !l.trim().is_empty())
-                    .map(|(l, o)| Content::from_line(l, *o))
-                    .collect();
+                let rows = open.lines.iter().filter(|(l, _)| !l.trim().is_empty()).map(|(l, o)| Content::from_line(l, *o)).collect();
                 Some(Raw::Table { align, header: Content::from_lines(&header), rows, span })
             }
         }
@@ -1112,8 +1116,7 @@ impl Parser {
             // The first definition of a label wins; a later one is
             // simply ignored.
             if !normalized.is_empty() && !self.link_refs.iter().any(|r| r.label == normalized) {
-                let span = content.source_offset(at).unwrap_or(0)
-                    ..content.source_offset(next.saturating_sub(1)).map(|o| o + 1).unwrap_or(0);
+                let span = content.source_offset(at).unwrap_or(0)..content.source_offset(next.saturating_sub(1)).map(|o| o + 1).unwrap_or(0);
                 self.link_refs.push(LinkRef { label: normalized, dest, title, span });
             }
             at = next;

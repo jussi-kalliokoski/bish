@@ -11,11 +11,7 @@ pub struct FuzzyMatch {
 }
 
 fn lower_char(c: char) -> char {
-    if c.is_ascii() {
-        c.to_ascii_lowercase()
-    } else {
-        c
-    }
+    if c.is_ascii() { c.to_ascii_lowercase() } else { c }
 }
 
 fn is_boundary_start(cand_chars: &[char], pos: usize) -> bool {
@@ -33,10 +29,7 @@ fn is_boundary_start(cand_chars: &[char], pos: usize) -> bool {
 /// a bare `git ` show every subcommand unranked-but-present.
 pub fn fuzzy_match(query: &str, candidate: &str) -> Option<FuzzyMatch> {
     if query.is_empty() {
-        return Some(FuzzyMatch {
-            score: 0,
-            positions: Vec::new(),
-        });
+        return Some(FuzzyMatch { score: 0, positions: Vec::new() });
     }
 
     let query_lower: Vec<char> = query.chars().map(lower_char).collect();
@@ -169,10 +162,7 @@ mod tests {
         // The plan's own worked example: commit/config/count-objects should
         // all rank above checkout for the query "co".
         let candidates = ["commit", "config", "count-objects", "checkout"];
-        let mut scored: Vec<(&str, i32)> = candidates
-            .iter()
-            .filter_map(|c| fuzzy_match("co", c).map(|m| (*c, m.score)))
-            .collect();
+        let mut scored: Vec<(&str, i32)> = candidates.iter().filter_map(|c| fuzzy_match("co", c).map(|m| (*c, m.score))).collect();
         scored.sort_by(|a, b| b.1.cmp(&a.1));
         let checkout_rank = scored.iter().position(|(name, _)| *name == "checkout").unwrap();
         assert_eq!(checkout_rank, scored.len() - 1, "{:?}", scored);

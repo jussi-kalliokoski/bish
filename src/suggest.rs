@@ -177,8 +177,10 @@ mod tests {
     #[test]
     fn a_real_program_name_is_rarely_mistaken_for_a_builtin() {
         let builtins = crate::exec::KNOWN_BUILTINS;
-        for name in ["ls", "grep", "awk", "curl", "python3", "make", "git", "ssh", "tar", "find",
-                     "sort", "chmod", "mount", "ping", "less", "vim", "rustc", "cargo", "docker"] {
+        for name in [
+            "ls", "grep", "awk", "curl", "python3", "make", "git", "ssh", "tar", "find", "sort", "chmod", "mount", "ping", "less", "vim", "rustc",
+            "cargo", "docker",
+        ] {
             assert_eq!(nearest(name, builtins.iter().copied()), None, "{name} should not look like a builtin");
         }
         assert_eq!(nearest("sed", builtins.iter().copied()), Some("set"), "the unavoidable kind");

@@ -240,14 +240,10 @@ fn serialize_chunk(c: &Chunk) -> String {
         Chunk::VarExpand { name, op, quoted } => wrap_quoted(serialize_var_op(name, op), *quoted),
         Chunk::ArrayVar { name, index, quoted } => wrap_quoted(format!("${{{}[{}]}}", name, index), *quoted),
         Chunk::ArrayLength { name, index } => format!("${{#{}[{}]}}", name, index),
-        Chunk::ArrayVarExpand { name, index, op, quoted } => {
-            wrap_quoted(serialize_array_var_op(name, index, op), *quoted)
-        }
+        Chunk::ArrayVarExpand { name, index, op, quoted } => wrap_quoted(serialize_array_var_op(name, index, op), *quoted),
         Chunk::Indirect { name, quoted } => wrap_quoted(format!("${{!{}}}", name), *quoted),
         Chunk::ArrayKeys { name, quoted } => wrap_quoted(format!("${{!{}[@]}}", name), *quoted),
-        Chunk::VarNamesMatchingPrefix { prefix, at, quoted } => {
-            wrap_quoted(format!("${{!{}{}}}", prefix, if *at { "@" } else { "*" }), *quoted)
-        }
+        Chunk::VarNamesMatchingPrefix { prefix, at, quoted } => wrap_quoted(format!("${{!{}{}}}", prefix, if *at { "@" } else { "*" }), *quoted),
         Chunk::ProcSubIn { raw } => format!("<({})", raw),
         Chunk::ProcSubOut { raw } => format!(">({})", raw),
     }
@@ -257,11 +253,7 @@ fn serialize_chunk(c: &Chunk) -> String {
 // exec.rs::functions_preamble) so a re-parsed expansion keeps the same
 // word-splitting eligibility it had in the original source.
 fn wrap_quoted(s: String, quoted: bool) -> String {
-    if quoted {
-        format!("\"{}\"", s)
-    } else {
-        s
-    }
+    if quoted { format!("\"{}\"", s) } else { s }
 }
 
 pub fn quote_literal(s: &str) -> String {

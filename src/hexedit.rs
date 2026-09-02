@@ -66,16 +66,16 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
+use crate::bishedit::Buffer;
 use crate::bishedit::motion::{self, CaseKind, Motion, MotionRange, MotionShape};
 use crate::bishedit::registers::{RegisterShape, RegisterValue, Registers};
 use crate::bishedit::undo::UndoTree;
 use crate::bishedit::vimkeys::{InsertCmd, KeyOutcome, Op, VimKeys, WindowCmd};
-use crate::bishedit::Buffer;
 use crate::editor::{self, Key};
 use crate::history::History;
 use crate::repl::render_global_status_row;
-use crate::window::Rect;
 use crate::vt100;
+use crate::window::Rect;
 
 // Bytes per group, separated by an extra space in the hex column --
 // `hexdump -C`/`xxd`'s own convention, and the reason a 16-byte row is
@@ -123,7 +123,18 @@ impl HexBuffer {
     }
 
     pub fn from_bytes(bytes: Vec<u8>, bytes_per_row: usize, vheight: usize) -> HexBuffer {
-        HexBuffer { bytes, path: None, offset: 0, bytes_per_row, vtop: 0, vheight, marks: HashMap::new(), dirty: false, readonly: false, is_new: false }
+        HexBuffer {
+            bytes,
+            path: None,
+            offset: 0,
+            bytes_per_row,
+            vtop: 0,
+            vheight,
+            marks: HashMap::new(),
+            dirty: false,
+            readonly: false,
+            is_new: false,
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -263,11 +274,7 @@ impl Buffer for HexBuffer {
 
     fn line_len(&self, line: usize) -> usize {
         let start = line * self.bytes_per_row;
-        if start >= self.bytes.len() {
-            0
-        } else {
-            (self.bytes.len() - start).min(self.bytes_per_row)
-        }
+        if start >= self.bytes.len() { 0 } else { (self.bytes.len() - start).min(self.bytes_per_row) }
     }
 
     // Latin-1, deliberately: it's the one mapping where every byte has a
@@ -376,11 +383,7 @@ pub fn parse_pattern(input: &str) -> Option<Pattern> {
     }
     let compact: String = trimmed.chars().filter(|c| !c.is_whitespace()).collect();
     if !compact.is_empty() && compact.len().is_multiple_of(2) && compact.chars().all(|c| c.is_ascii_hexdigit()) {
-        let bytes = compact
-            .as_bytes()
-            .chunks(2)
-            .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
-            .collect();
+        let bytes = compact.as_bytes().chunks(2).map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap()).collect();
         return Some(Pattern::Bytes(bytes));
     }
     Some(Pattern::Text(trimmed.as_bytes().to_vec()))
@@ -397,10 +400,15 @@ pub fn find_bytes(haystack: &[u8], needle: &[u8], from: usize, forward: bool) ->
     let last_start = haystack.len() - needle.len();
     if forward {
         let begin = from.saturating_add(1).min(last_start + 1);
-        (begin..=last_start).find(|&i| &haystack[i..i + needle.len()] == needle).or_else(|| (0..begin.min(last_start + 1)).find(|&i| &haystack[i..i + needle.len()] == needle))
+        (begin..=last_start)
+            .find(|&i| &haystack[i..i + needle.len()] == needle)
+            .or_else(|| (0..begin.min(last_start + 1)).find(|&i| &haystack[i..i + needle.len()] == needle))
     } else {
         let begin = from.min(last_start + 1);
-        (0..begin).rev().find(|&i| &haystack[i..i + needle.len()] == needle).or_else(|| (begin..=last_start).rev().find(|&i| &haystack[i..i + needle.len()] == needle))
+        (0..begin)
+            .rev()
+            .find(|&i| &haystack[i..i + needle.len()] == needle)
+            .or_else(|| (begin..=last_start).rev().find(|&i| &haystack[i..i + needle.len()] == needle))
     }
 }
 
@@ -485,9 +493,7 @@ pub fn compute_layout(rows: usize, cols: usize, len: usize, bytes_per_row: Optio
         // over after reserving room for it, and only falls back to
         // filling the whole pane if even one group wouldn't fit
         // alongside it.
-        None if want_inspector && dump_width_for(GROUP, offset_width) + INSPECTOR_WIDTH <= cols => {
-            widest_fitting(cols - INSPECTOR_WIDTH)
-        }
+        None if want_inspector && dump_width_for(GROUP, offset_width) + INSPECTOR_WIDTH <= cols => widest_fitting(cols - INSPECTOR_WIDTH),
         None => widest_fitting(cols),
     };
     let dump_width = dump_width_for(bpr, offset_width);
@@ -896,7 +902,11 @@ fn styled(text: &str, color: &str, off: usize, cursor: usize, selection: Option<
     }
     // A half-typed byte in the hex pane shows its high nibble in place,
     // so the cell being built is never invisible.
-    if is_cursor && active && session.pane == Pane::Hex && let Some(n) = session.pending_nibble {
+    if is_cursor
+        && active
+        && session.pane == Pane::Hex
+        && let Some(n) = session.pending_nibble
+    {
         out.push_str(&format!("{n:x}_"));
     } else {
         out.push_str(text);
@@ -983,11 +993,7 @@ fn format_float(v: f64) -> String {
         return if v.is_nan() { "NaN".to_string() } else { format!("{v}") };
     }
     let magnitude = v.abs();
-    if (1e-4..1e12).contains(&magnitude) {
-        format!("{v:.6}")
-    } else {
-        format!("{v:.6e}")
-    }
+    if (1e-4..1e12).contains(&magnitude) { format!("{v:.6}") } else { format!("{v:.6e}") }
 }
 
 // The text for the terminal's shared global status row (see
@@ -1001,10 +1007,7 @@ fn status_text(session: &HexSession, layout: Layout, term_cols: usize) -> String
     // status line, and found necessary in practice: a deep absolute path
     // is easily 80+ columns on its own, which pushed every actually
     // useful field (offset, byte value, mode) straight off the row.
-    let name = buf
-        .path()
-        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
-        .unwrap_or_else(|| "[no name]".to_string());
+    let name = buf.path().and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned())).unwrap_or_else(|| "[no name]".to_string());
     let dirty = if buf.is_dirty() { " [+]" } else { "" };
     let ro = if buf.readonly { " [RO]" } else { "" };
     let new = if buf.is_new { " [new]" } else { "" };
@@ -1038,11 +1041,7 @@ fn status_text(session: &HexSession, layout: Layout, term_cols: usize) -> String
         Some(msg) => fit(msg, term_cols),
         None => {
             let used = display_len(&left) + display_len(&right);
-            if used + 2 > term_cols {
-                fit(&left, term_cols)
-            } else {
-                format!("{left}{}{right}", " ".repeat(term_cols - used))
-            }
+            if used + 2 > term_cols { fit(&left, term_cols) } else { format!("{left}{}{right}", " ".repeat(term_cols - used)) }
         }
     };
     format!("{text}{}", " ".repeat(term_cols.saturating_sub(display_len(&text))))
@@ -1681,14 +1680,7 @@ impl HexSession {
     // shared global command row `run_command_mode`'s own `:` prompt uses,
     // with no completion/suggestion providers -- this view's commands are
     // its own, not the shell's.
-    fn run_colon_line(
-        &mut self,
-        rect: Rect,
-        term_rows: usize,
-        term_cols: usize,
-        cmd_history: &History,
-        on_idle: &mut dyn FnMut(),
-    ) -> HexOutcome {
+    fn run_colon_line(&mut self, rect: Rect, term_rows: usize, term_cols: usize, cmd_history: &History, on_idle: &mut dyn FnMut()) -> HexOutcome {
         print!("\x1b[{};1H\x1b[K\x1b[?25h", crate::repl::command_mode_row(term_rows) + 1);
         let _ = io::stdout().flush();
         let mut registers = std::mem::take(&mut self.registers);

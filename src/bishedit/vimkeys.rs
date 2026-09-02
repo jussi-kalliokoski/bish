@@ -10,9 +10,9 @@
 use std::collections::{HashMap, VecDeque};
 use std::io;
 
-use crate::editor::Key;
 use super::motion::{Motion, TextObjectKind};
 use super::registers::RegisterShape;
+use crate::editor::Key;
 
 /// Which "where is this" question `KeyOutcome::GotoDefinition` is
 /// asking.
@@ -1095,7 +1095,7 @@ impl VimKeys {
     pub fn next_mapped_key(&mut self, mode: &str, mut read: impl FnMut() -> io::Result<Option<Key>>) -> io::Result<Option<Key>> {
         loop {
             if let Some(key) = self.replay_queue.pop_front() {
-                    return Ok(Some(key));
+                return Ok(Some(key));
             }
             let Some(key) = read()? else { return Ok(None) };
             self.record_key(key);
@@ -1984,11 +1984,7 @@ impl VimKeys {
                 self.last_search_text = text.clone();
                 self.search_highlight_off = false;
                 self.last_search = Some(LastSearch::Pattern { forward });
-                self.emit(if forward {
-                    Motion::SearchForward(text)
-                } else {
-                    Motion::SearchBackward(text)
-                })
+                self.emit(if forward { Motion::SearchForward(text) } else { Motion::SearchBackward(text) })
             }
             Key::Escape => self.abort(),
             // Cancels only the search, same as Escape -- callers gate
@@ -2037,11 +2033,7 @@ impl VimKeys {
             Some(LastSearch::Pattern { forward }) => {
                 let forward = if same_direction { forward } else { !forward };
                 let text = self.last_search_text.clone();
-                self.emit(if forward {
-                    Motion::SearchForward(text)
-                } else {
-                    Motion::SearchBackward(text)
-                })
+                self.emit(if forward { Motion::SearchForward(text) } else { Motion::SearchBackward(text) })
             }
             Some(LastSearch::Word { forward, bounded }) => {
                 let forward = if same_direction { forward } else { !forward };
@@ -2069,7 +2061,6 @@ enum MarkKind {
     GotoExact,
     GotoLine,
 }
-
 
 /// Resolves a mapping's right-hand side against the *default* bindings
 /// and names what it does, or says why it is not a usable right-hand
@@ -2132,13 +2123,9 @@ pub fn describe_outcome(outcome: &KeyOutcome) -> String {
         Motion(m, count) => format!("{}{}", crate::bishedit::motion::describe_motion(m), n(count)),
         Window(cmd, count) => format!("window {}{}", describe_window_cmd(cmd), n(count)),
         EnterInsert(cmd) => format!("insert {}", describe_insert_cmd(cmd)),
-        Operator(op, m, count, register) => format!(
-            "{} {}{}{}",
-            describe_op(op),
-            crate::bishedit::motion::describe_motion(m),
-            n(count),
-            reg(register)
-        ),
+        Operator(op, m, count, register) => {
+            format!("{} {}{}{}", describe_op(op), crate::bishedit::motion::describe_motion(m), n(count), reg(register))
+        }
         OperatorLines(op, count, register) => format!("{} line{}{}", describe_op(op), n(count), reg(register)),
         Put { before, count, register } => {
             format!("put-{}{}{}", if *before { "before" } else { "after" }, n(count), reg(register))
@@ -2416,26 +2403,14 @@ mod tests {
         assert_eq!(vk.feed(Key::Char('g')), KeyOutcome::Motion(Motion::GotoFirstLine, None));
 
         let mut vk = VimKeys::new();
-        assert_eq!(
-            last(&mut vk, &[Key::Char('3'), Key::Char('g'), Key::Char('g')]),
-            KeyOutcome::Motion(Motion::GotoFirstLine, Some(3))
-        );
+        assert_eq!(last(&mut vk, &[Key::Char('3'), Key::Char('g'), Key::Char('g')]), KeyOutcome::Motion(Motion::GotoFirstLine, Some(3)));
 
         let mut vk = VimKeys::new();
-        assert_eq!(
-            last(&mut vk, &[Key::Char('g'), Key::Char('_')]),
-            KeyOutcome::Motion(Motion::LineLastNonBlank, None)
-        );
+        assert_eq!(last(&mut vk, &[Key::Char('g'), Key::Char('_')]), KeyOutcome::Motion(Motion::LineLastNonBlank, None));
         let mut vk = VimKeys::new();
-        assert_eq!(
-            last(&mut vk, &[Key::Char('g'), Key::Char('e')]),
-            KeyOutcome::Motion(Motion::WordEndBackward, None)
-        );
+        assert_eq!(last(&mut vk, &[Key::Char('g'), Key::Char('e')]), KeyOutcome::Motion(Motion::WordEndBackward, None));
         let mut vk = VimKeys::new();
-        assert_eq!(
-            last(&mut vk, &[Key::Char('g'), Key::Char('E')]),
-            KeyOutcome::Motion(Motion::WordEndBackwardBig, None)
-        );
+        assert_eq!(last(&mut vk, &[Key::Char('g'), Key::Char('E')]), KeyOutcome::Motion(Motion::WordEndBackwardBig, None));
     }
 
     #[test]
@@ -2452,20 +2427,11 @@ mod tests {
     fn find_char_and_repeat() {
         let mut vk = VimKeys::new();
         assert_eq!(vk.feed(Key::Char('f')), KeyOutcome::Pending);
-        assert_eq!(
-            vk.feed(Key::Char('x')),
-            KeyOutcome::Motion(Motion::FindChar { ch: 'x', till: false, forward: true }, None)
-        );
+        assert_eq!(vk.feed(Key::Char('x')), KeyOutcome::Motion(Motion::FindChar { ch: 'x', till: false, forward: true }, None));
         // ';' repeats the same direction
-        assert_eq!(
-            vk.feed(Key::Char(';')),
-            KeyOutcome::Motion(Motion::FindChar { ch: 'x', till: false, forward: true }, None)
-        );
+        assert_eq!(vk.feed(Key::Char(';')), KeyOutcome::Motion(Motion::FindChar { ch: 'x', till: false, forward: true }, None));
         // ',' repeats with direction flipped
-        assert_eq!(
-            vk.feed(Key::Char(',')),
-            KeyOutcome::Motion(Motion::FindChar { ch: 'x', till: false, forward: false }, None)
-        );
+        assert_eq!(vk.feed(Key::Char(',')), KeyOutcome::Motion(Motion::FindChar { ch: 'x', till: false, forward: false }, None));
     }
 
     #[test]
@@ -2496,20 +2462,11 @@ mod tests {
     #[test]
     fn marks() {
         let mut vk = VimKeys::new();
-        assert_eq!(
-            last(&mut vk, &[Key::Char('m'), Key::Char('a')]),
-            KeyOutcome::Motion(Motion::SetMark('a'), None)
-        );
+        assert_eq!(last(&mut vk, &[Key::Char('m'), Key::Char('a')]), KeyOutcome::Motion(Motion::SetMark('a'), None));
         let mut vk = VimKeys::new();
-        assert_eq!(
-            last(&mut vk, &[Key::Char('`'), Key::Char('a')]),
-            KeyOutcome::Motion(Motion::GotoMark('a'), None)
-        );
+        assert_eq!(last(&mut vk, &[Key::Char('`'), Key::Char('a')]), KeyOutcome::Motion(Motion::GotoMark('a'), None));
         let mut vk = VimKeys::new();
-        assert_eq!(
-            last(&mut vk, &[Key::Char('\''), Key::Char('a')]),
-            KeyOutcome::Motion(Motion::GotoMarkLine('a'), None)
-        );
+        assert_eq!(last(&mut vk, &[Key::Char('\''), Key::Char('a')]), KeyOutcome::Motion(Motion::GotoMarkLine('a'), None));
     }
 
     #[test]
@@ -2619,8 +2576,7 @@ mod tests {
     // definition endpoint.
     #[test]
     fn every_goto_kind_has_its_own_request_and_noun() {
-        let kinds =
-            [GotoKind::Definition, GotoKind::TypeDefinition, GotoKind::Implementation, GotoKind::Declaration];
+        let kinds = [GotoKind::Definition, GotoKind::TypeDefinition, GotoKind::Implementation, GotoKind::Declaration];
         let mut seen: Vec<(&str, &str)> = Vec::new();
         for kind in kinds {
             let (method, capability) = kind.request();
@@ -2730,20 +2686,11 @@ mod tests {
     #[test]
     fn z_prefix_scroll_motions() {
         let mut vk = VimKeys::new();
-        assert_eq!(
-            last(&mut vk, &[Key::Char('z'), Key::Char('z')]),
-            KeyOutcome::Motion(Motion::ScrollCenter, None)
-        );
+        assert_eq!(last(&mut vk, &[Key::Char('z'), Key::Char('z')]), KeyOutcome::Motion(Motion::ScrollCenter, None));
         let mut vk = VimKeys::new();
-        assert_eq!(
-            last(&mut vk, &[Key::Char('z'), Key::Char('t')]),
-            KeyOutcome::Motion(Motion::ScrollTop, None)
-        );
+        assert_eq!(last(&mut vk, &[Key::Char('z'), Key::Char('t')]), KeyOutcome::Motion(Motion::ScrollTop, None));
         let mut vk = VimKeys::new();
-        assert_eq!(
-            last(&mut vk, &[Key::Char('z'), Key::Char('b')]),
-            KeyOutcome::Motion(Motion::ScrollBottom, None)
-        );
+        assert_eq!(last(&mut vk, &[Key::Char('z'), Key::Char('b')]), KeyOutcome::Motion(Motion::ScrollBottom, None));
     }
 
     // `:noh` is only safe to press because anything that searches again
@@ -2779,25 +2726,10 @@ mod tests {
     #[test]
     fn search_forward_and_repeat() {
         let mut vk = VimKeys::new();
-        let keys = [
-            Key::Char('/'),
-            Key::Char('f'),
-            Key::Char('o'),
-            Key::Char('o'),
-            Key::Enter,
-        ];
-        assert_eq!(
-            last(&mut vk, &keys),
-            KeyOutcome::Motion(Motion::SearchForward("foo".to_string()), None)
-        );
-        assert_eq!(
-            vk.feed(Key::Char('n')),
-            KeyOutcome::Motion(Motion::SearchForward("foo".to_string()), None)
-        );
-        assert_eq!(
-            vk.feed(Key::Char('N')),
-            KeyOutcome::Motion(Motion::SearchBackward("foo".to_string()), None)
-        );
+        let keys = [Key::Char('/'), Key::Char('f'), Key::Char('o'), Key::Char('o'), Key::Enter];
+        assert_eq!(last(&mut vk, &keys), KeyOutcome::Motion(Motion::SearchForward("foo".to_string()), None));
+        assert_eq!(vk.feed(Key::Char('n')), KeyOutcome::Motion(Motion::SearchForward("foo".to_string()), None));
+        assert_eq!(vk.feed(Key::Char('N')), KeyOutcome::Motion(Motion::SearchBackward("foo".to_string()), None));
     }
 
     #[test]
@@ -2809,10 +2741,7 @@ mod tests {
         assert_eq!(vk.feed(Key::Char('z')), KeyOutcome::Pending);
         assert_eq!(vk.feed(Key::Backspace), KeyOutcome::Pending); // "ba"
         assert_eq!(vk.feed(Key::Char('r')), KeyOutcome::Pending); // "bar"
-        assert_eq!(
-            vk.feed(Key::Enter),
-            KeyOutcome::Motion(Motion::SearchBackward("bar".to_string()), None)
-        );
+        assert_eq!(vk.feed(Key::Enter), KeyOutcome::Motion(Motion::SearchBackward("bar".to_string()), None));
     }
 
     #[test]
@@ -2934,10 +2863,7 @@ mod tests {
     fn count_survives_into_find_char_and_search() {
         let mut vk = VimKeys::new();
         let keys = [Key::Char('2'), Key::Char('f'), Key::Char('x')];
-        assert_eq!(
-            last(&mut vk, &keys),
-            KeyOutcome::Motion(Motion::FindChar { ch: 'x', till: false, forward: true }, Some(2))
-        );
+        assert_eq!(last(&mut vk, &keys), KeyOutcome::Motion(Motion::FindChar { ch: 'x', till: false, forward: true }, Some(2)));
     }
 
     #[test]
@@ -3175,37 +3101,25 @@ mod tests {
     fn operator_plus_motion_resolves_with_no_count() {
         let mut vk = VimKeys::new();
         assert_eq!(vk.feed(Key::Char('y')), KeyOutcome::Pending);
-        assert_eq!(
-            vk.feed(Key::Char('w')),
-            KeyOutcome::Operator(Op::Yank, Motion::WordForward, None, None)
-        );
+        assert_eq!(vk.feed(Key::Char('w')), KeyOutcome::Operator(Op::Yank, Motion::WordForward, None, None));
     }
 
     #[test]
     fn operator_and_motion_counts_multiply() {
         let mut vk = VimKeys::new();
         let keys = [Key::Char('2'), Key::Char('y'), Key::Char('3'), Key::Char('w')];
-        assert_eq!(
-            last(&mut vk, &keys),
-            KeyOutcome::Operator(Op::Yank, Motion::WordForward, Some(6), None)
-        );
+        assert_eq!(last(&mut vk, &keys), KeyOutcome::Operator(Op::Yank, Motion::WordForward, Some(6), None));
     }
 
     #[test]
     fn operator_with_only_a_pre_count_or_only_a_post_count() {
         let mut vk = VimKeys::new();
         let keys = [Key::Char('3'), Key::Char('y'), Key::Char('w')];
-        assert_eq!(
-            last(&mut vk, &keys),
-            KeyOutcome::Operator(Op::Yank, Motion::WordForward, Some(3), None)
-        );
+        assert_eq!(last(&mut vk, &keys), KeyOutcome::Operator(Op::Yank, Motion::WordForward, Some(3), None));
 
         let mut vk = VimKeys::new();
         let keys = [Key::Char('y'), Key::Char('3'), Key::Char('w')];
-        assert_eq!(
-            last(&mut vk, &keys),
-            KeyOutcome::Operator(Op::Yank, Motion::WordForward, Some(3), None)
-        );
+        assert_eq!(last(&mut vk, &keys), KeyOutcome::Operator(Op::Yank, Motion::WordForward, Some(3), None));
     }
 
     #[test]
@@ -3215,10 +3129,7 @@ mod tests {
         let mut vk = VimKeys::new();
         assert_eq!(vk.feed(Key::Char('y')), KeyOutcome::Pending);
         assert_eq!(vk.feed(Key::Char('f')), KeyOutcome::Pending);
-        assert_eq!(
-            vk.feed(Key::Char('x')),
-            KeyOutcome::Operator(Op::Yank, Motion::FindChar { ch: 'x', till: false, forward: true }, None, None)
-        );
+        assert_eq!(vk.feed(Key::Char('x')), KeyOutcome::Operator(Op::Yank, Motion::FindChar { ch: 'x', till: false, forward: true }, None, None));
     }
 
     #[test]
@@ -3291,10 +3202,7 @@ mod tests {
     fn register_prefix_threads_into_operator_and_operator_lines() {
         let mut vk = VimKeys::new();
         let keys = [Key::Char('"'), Key::Char('a'), Key::Char('y'), Key::Char('w')];
-        assert_eq!(
-            last(&mut vk, &keys),
-            KeyOutcome::Operator(Op::Yank, Motion::WordForward, None, Some('a'))
-        );
+        assert_eq!(last(&mut vk, &keys), KeyOutcome::Operator(Op::Yank, Motion::WordForward, None, Some('a')));
 
         let mut vk = VimKeys::new();
         let keys = [Key::Char('"'), Key::Char('A'), Key::Char('y'), Key::Char('y')];
@@ -3308,10 +3216,7 @@ mod tests {
         assert_eq!(vk.feed(Key::Char('a')), KeyOutcome::Pending);
         assert_eq!(vk.feed(Key::Char('w')), KeyOutcome::Motion(Motion::WordForward, None));
         // and it doesn't leak into a later put that never asked for one
-        assert_eq!(
-            vk.feed(Key::Char('p')),
-            KeyOutcome::Put { before: false, count: None, register: None }
-        );
+        assert_eq!(vk.feed(Key::Char('p')), KeyOutcome::Put { before: false, count: None, register: None });
     }
 
     #[test]
@@ -3336,10 +3241,7 @@ mod tests {
         for c in ['0', '5', '9', '.', '%', ':'] {
             let mut vk = VimKeys::new();
             let keys = [Key::Char('"'), Key::Char(c), Key::Char('p')];
-            assert_eq!(
-                last(&mut vk, &keys),
-                KeyOutcome::Put { before: false, count: None, register: Some(c) }
-            );
+            assert_eq!(last(&mut vk, &keys), KeyOutcome::Put { before: false, count: None, register: Some(c) });
         }
     }
 
@@ -3446,20 +3348,14 @@ mod tests {
     fn delete_operator_plus_motion() {
         let mut vk = VimKeys::new();
         assert_eq!(vk.feed(Key::Char('d')), KeyOutcome::Pending);
-        assert_eq!(
-            vk.feed(Key::Char('w')),
-            KeyOutcome::Operator(Op::Delete, Motion::WordForward, None, None)
-        );
+        assert_eq!(vk.feed(Key::Char('w')), KeyOutcome::Operator(Op::Delete, Motion::WordForward, None, None));
     }
 
     #[test]
     fn change_operator_plus_motion() {
         let mut vk = VimKeys::new();
         assert_eq!(vk.feed(Key::Char('c')), KeyOutcome::Pending);
-        assert_eq!(
-            vk.feed(Key::Char('e')),
-            KeyOutcome::Operator(Op::Change, Motion::WordEnd, None, None)
-        );
+        assert_eq!(vk.feed(Key::Char('e')), KeyOutcome::Operator(Op::Change, Motion::WordEnd, None, None));
     }
 
     #[test]
@@ -3506,10 +3402,7 @@ mod tests {
     fn register_prefix_threads_into_delete_change_and_delete_char_forward() {
         let mut vk = VimKeys::new();
         let keys = [Key::Char('"'), Key::Char('a'), Key::Char('d'), Key::Char('w')];
-        assert_eq!(
-            last(&mut vk, &keys),
-            KeyOutcome::Operator(Op::Delete, Motion::WordForward, None, Some('a'))
-        );
+        assert_eq!(last(&mut vk, &keys), KeyOutcome::Operator(Op::Delete, Motion::WordForward, None, Some('a')));
 
         let mut vk = VimKeys::new();
         let keys = [Key::Char('"'), Key::Char('b'), Key::Char('D')];
@@ -3560,16 +3453,10 @@ mod tests {
     fn diw_and_daw_resolve_to_word_text_objects() {
         let mut vk = VimKeys::new();
         let keys = [Key::Char('d'), Key::Char('i'), Key::Char('w')];
-        assert_eq!(
-            last(&mut vk, &keys),
-            KeyOutcome::Operator(Op::Delete, Motion::TextObject(TextObjectKind::Word, false), None, None)
-        );
+        assert_eq!(last(&mut vk, &keys), KeyOutcome::Operator(Op::Delete, Motion::TextObject(TextObjectKind::Word, false), None, None));
         let mut vk = VimKeys::new();
         let keys = [Key::Char('d'), Key::Char('a'), Key::Char('w')];
-        assert_eq!(
-            last(&mut vk, &keys),
-            KeyOutcome::Operator(Op::Delete, Motion::TextObject(TextObjectKind::Word, true), None, None)
-        );
+        assert_eq!(last(&mut vk, &keys), KeyOutcome::Operator(Op::Delete, Motion::TextObject(TextObjectKind::Word, true), None, None));
     }
 
     #[test]
@@ -3577,27 +3464,18 @@ mod tests {
         // count before the operator...
         let mut vk = VimKeys::new();
         let keys = [Key::Char('2'), Key::Char('c'), Key::Char('i'), Key::Char('w')];
-        assert_eq!(
-            last(&mut vk, &keys),
-            KeyOutcome::Operator(Op::Change, Motion::TextObject(TextObjectKind::Word, false), Some(2), None)
-        );
+        assert_eq!(last(&mut vk, &keys), KeyOutcome::Operator(Op::Change, Motion::TextObject(TextObjectKind::Word, false), Some(2), None));
         // ...and between the operator and the object prefix -- same result.
         let mut vk = VimKeys::new();
         let keys = [Key::Char('c'), Key::Char('2'), Key::Char('i'), Key::Char('w')];
-        assert_eq!(
-            last(&mut vk, &keys),
-            KeyOutcome::Operator(Op::Change, Motion::TextObject(TextObjectKind::Word, false), Some(2), None)
-        );
+        assert_eq!(last(&mut vk, &keys), KeyOutcome::Operator(Op::Change, Motion::TextObject(TextObjectKind::Word, false), Some(2), None));
     }
 
     #[test]
     fn text_object_register_prefix_carries_through() {
         let mut vk = VimKeys::new();
         let keys = [Key::Char('"'), Key::Char('a'), Key::Char('y'), Key::Char('i'), Key::Char('w')];
-        assert_eq!(
-            last(&mut vk, &keys),
-            KeyOutcome::Operator(Op::Yank, Motion::TextObject(TextObjectKind::Word, false), None, Some('a'))
-        );
+        assert_eq!(last(&mut vk, &keys), KeyOutcome::Operator(Op::Yank, Motion::TextObject(TextObjectKind::Word, false), None, Some('a')));
     }
 
     #[test]
@@ -3902,10 +3780,7 @@ mod tests {
     fn gu_text_object_and_counts_combine_like_any_other_operator() {
         let mut vk = VimKeys::new();
         let keys = [Key::Char('2'), Key::Char('g'), Key::Char('U'), Key::Char('i'), Key::Char('w')];
-        assert_eq!(
-            last(&mut vk, &keys),
-            KeyOutcome::Operator(Op::Uppercase, Motion::TextObject(TextObjectKind::Word, false), Some(2), None)
-        );
+        assert_eq!(last(&mut vk, &keys), KeyOutcome::Operator(Op::Uppercase, Motion::TextObject(TextObjectKind::Word, false), Some(2), None));
     }
 
     #[test]
@@ -3944,10 +3819,7 @@ mod tests {
     fn ys_with_a_simple_motion_and_count() {
         let mut vk = VimKeys::new();
         let keys = [Key::Char('y'), Key::Char('s'), Key::Char('3'), Key::Char('w'), Key::Char('"')];
-        assert_eq!(
-            last(&mut vk, &keys),
-            KeyOutcome::AddSurround { target: SurroundTarget::Motion(Motion::WordForward, Some(3)), ch: '"' }
-        );
+        assert_eq!(last(&mut vk, &keys), KeyOutcome::AddSurround { target: SurroundTarget::Motion(Motion::WordForward, Some(3)), ch: '"' });
     }
 
     #[test]

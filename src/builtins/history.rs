@@ -2,8 +2,8 @@
 //
 // Free functions taking `&mut Shell` -- see `builtins/mod.rs`.
 
+use crate::exec::{Shell, sh_eprintln, sh_println};
 use std::rc::Rc;
-use crate::exec::{sh_eprintln, sh_println, Shell};
 
 // Fish-style abbreviations: `sh.abbrs`'s own doc comment covers the
 // storage/trigger split (this builtin only ever stores/queries/lists;

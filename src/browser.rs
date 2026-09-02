@@ -405,7 +405,12 @@ impl Browser {
     // usable columns.
     pub(crate) fn layout(&self, rect: Rect) -> Layout {
         let rows = rect.rows.saturating_sub(1).max(1);
-        let widest = self.view.iter().map(|&i| PREFIX_WIDTH + str_width(&self.entries[i].name) + if self.entries[i].is_dir { 1 } else { 0 }).max().unwrap_or(0);
+        let widest = self
+            .view
+            .iter()
+            .map(|&i| PREFIX_WIDTH + str_width(&self.entries[i].name) + if self.entries[i].is_dir { 1 } else { 0 })
+            .max()
+            .unwrap_or(0);
         let cols_avail = rect.cols.max(1);
         let col_width = (widest + GUTTER).clamp(MIN_COL_WIDTH.min(cols_avail), MAX_COL_WIDTH.min(cols_avail));
         let cols = (cols_avail / col_width).max(1);
@@ -889,11 +894,7 @@ impl Browser {
         let path = fit_left(&path, room);
         let left = format!("\u{1F4C1} {path}");
         let used = str_width(&left) + str_width(&right);
-        if used + GUTTER > cols {
-            fit(&left, cols)
-        } else {
-            format!("{left}{}{right}", " ".repeat(cols - used))
-        }
+        if used + GUTTER > cols { fit(&left, cols) } else { format!("{left}{}{right}", " ".repeat(cols - used)) }
     }
 
     fn status_text(&self, cols: usize) -> String {
@@ -910,7 +911,13 @@ impl Browser {
             Some(e) if e.is_parent => "parent directory".to_string(),
             Some(e) if e.is_dir => crate::term::safe_text(&format!("{}/", e.name)),
             Some(e) => crate::term::safe_text(&format!("{}  {}", e.name, human_size(e.size))),
-            None => if self.query.is_empty() { "empty directory".to_string() } else { format!("no matches for '{}'", self.query) },
+            None => {
+                if self.query.is_empty() {
+                    "empty directory".to_string()
+                } else {
+                    format!("no matches for '{}'", self.query)
+                }
+            }
         };
         // The `i` hint is left out when `gitignore` is off -- there is
         // nothing for it to reveal, so offering it would be a lie.
@@ -921,11 +928,7 @@ impl Browser {
             (false, false) => "enter open  tab select  / filter  . hidden  : cmd  bksp up  esc back",
         };
         let used = str_width(&detail) + str_width(hints);
-        if used + GUTTER > cols {
-            fit(&detail, cols)
-        } else {
-            format!("{detail}{}{hints}", " ".repeat(cols - used))
-        }
+        if used + GUTTER > cols { fit(&detail, cols) } else { format!("{detail}{}{hints}", " ".repeat(cols - used)) }
     }
 }
 
@@ -947,11 +950,7 @@ pub(crate) fn resolve_start(cwd: &Path, arg: Option<&str>) -> PathBuf {
     } else {
         PathBuf::from(arg)
     };
-    if expanded.is_absolute() {
-        expanded
-    } else {
-        cwd.join(expanded)
-    }
+    if expanded.is_absolute() { expanded } else { cwd.join(expanded) }
 }
 
 // The absolute, symlink-free spelling of wherever the browser is about
@@ -1061,12 +1060,7 @@ const BY_EXTENSION: &[(&[&str], char)] = &[
 ];
 
 // Extension-less files that are still instantly recognizable by name.
-const BY_NAME: &[(&str, char)] = &[
-    ("makefile", '\u{1F528}'),
-    ("dockerfile", '\u{1F433}'),
-    ("license", '\u{1F4DC}'),
-    ("readme", '\u{1F4DD}'),
-];
+const BY_NAME: &[(&str, char)] = &[("makefile", '\u{1F528}'), ("dockerfile", '\u{1F433}'), ("license", '\u{1F4DC}'), ("readme", '\u{1F4DD}')];
 
 fn icon_for(e: &Entry) -> char {
     if e.is_parent {
@@ -1127,11 +1121,7 @@ fn human_size(bytes: u64) -> String {
         value /= 1024.0;
         unit += 1;
     }
-    if unit == 0 {
-        format!("{bytes} B")
-    } else {
-        format!("{value:.1}{}", UNITS[unit])
-    }
+    if unit == 0 { format!("{bytes} B") } else { format!("{value:.1}{}", UNITS[unit]) }
 }
 
 // Pad with spaces to exactly `width` display columns (truncating first
@@ -1501,7 +1491,12 @@ mod tests {
         b.handle_key(Key::Char('G'), r);
         assert!(b.scroll_col > 0, "cursor at the end should have scrolled");
         let cursor_col = b.cursor / layout.rows;
-        assert!(cursor_col >= b.scroll_col && cursor_col < b.scroll_col + layout.cols, "cursor column {cursor_col} outside visible {}..{}", b.scroll_col, b.scroll_col + layout.cols);
+        assert!(
+            cursor_col >= b.scroll_col && cursor_col < b.scroll_col + layout.cols,
+            "cursor column {cursor_col} outside visible {}..{}",
+            b.scroll_col,
+            b.scroll_col + layout.cols
+        );
         b.handle_key(Key::Char('g'), r);
         assert_eq!(b.scroll_col, 0);
     }

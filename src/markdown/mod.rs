@@ -213,9 +213,7 @@ mod tests {
         let pad = "  ".repeat(depth);
         match block {
             Block::Paragraph { content, .. } => out.push_str(&format!("{pad}p: {}\n", show(content))),
-            Block::Heading { level, content, .. } => {
-                out.push_str(&format!("{pad}h{level}: {}\n", show(content)))
-            }
+            Block::Heading { level, content, .. } => out.push_str(&format!("{pad}h{level}: {}\n", show(content))),
             Block::CodeBlock { info, literal, fenced, .. } => {
                 let kind = if *fenced { "fence" } else { "indent" };
                 out.push_str(&format!("{pad}code[{kind}:{info}]: {:?}\n", literal));

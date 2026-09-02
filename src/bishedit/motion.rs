@@ -1,5 +1,5 @@
-use super::grapheme;
 use super::Buffer;
+use super::grapheme;
 use crate::regex::Regex;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -12,18 +12,18 @@ pub enum Motion {
     LineFirstNonBlank,  // ^
     LineEnd,            // $ (count moves down count-1 lines first)
     LineLastNonBlank,   // g_ (count moves down count-1 lines first)
-    GotoColumn,          // | (count is the 1-indexed target column, default 1)
-    GotoFirstLine,        // gg (count is the 1-indexed target line, default first)
-    GotoLastLine,          // G  (count is the 1-indexed target line, default last)
-    GotoPercent,           // {count}% (only emitted when a count precedes '%' -- see vimkeys.rs)
-    WordForward,            // w
-    WordForwardBig,           // W
-    WordBackward,              // b
-    WordBackwardBig,            // B
-    WordEnd,                     // e
-    WordEndBig,                    // E
-    WordEndBackward,                // ge
-    WordEndBackwardBig,               // gE
+    GotoColumn,         // | (count is the 1-indexed target column, default 1)
+    GotoFirstLine,      // gg (count is the 1-indexed target line, default first)
+    GotoLastLine,       // G  (count is the 1-indexed target line, default last)
+    GotoPercent,        // {count}% (only emitted when a count precedes '%' -- see vimkeys.rs)
+    WordForward,        // w
+    WordForwardBig,     // W
+    WordBackward,       // b
+    WordBackwardBig,    // B
+    WordEnd,            // e
+    WordEndBig,         // E
+    WordEndBackward,    // ge
+    WordEndBackwardBig, // gE
     FindChar {
         // f F t T. Repeat via ';'/',' is vimkeys' job (stage 4): it remembers
         // the last FindChar and re-issues it (flipping `forward` for ',').
@@ -31,27 +31,27 @@ pub enum Motion {
         till: bool,
         forward: bool,
     },
-    ScreenTop,       // H (count = line offset from the top, default 1)
-    ScreenMiddle,    // M (count ignored)
-    ScreenBottom,    // L (count = line offset from the bottom, default 1)
-    HalfPageDown,    // Ctrl-D
-    HalfPageUp,      // Ctrl-U
-    PageDown,        // Ctrl-F
-    PageUp,          // Ctrl-B
-    ScrollLineDown,  // Ctrl-E (count = lines to scroll, default 1)
-    ScrollLineUp,    // Ctrl-Y (count = lines to scroll, default 1)
-    ScrollCenter,    // zz (count ignored; centers the current line)
-    ScrollTop,       // zt (count ignored; current line becomes the top)
-    ScrollBottom,    // zb (count ignored; current line becomes the bottom)
-    ParagraphForward,  // }
-    ParagraphBackward, // {
-    SentenceForward,   // )
-    SentenceBackward,  // (
-    NextLineNonBlank,  // + or Enter
-    PrevLineNonBlank,  // -
-    MatchPair,         // %
-    SetMark(char),     // m{a-z}
-    GotoMark(char),    // `{mark}
+    ScreenTop,          // H (count = line offset from the top, default 1)
+    ScreenMiddle,       // M (count ignored)
+    ScreenBottom,       // L (count = line offset from the bottom, default 1)
+    HalfPageDown,       // Ctrl-D
+    HalfPageUp,         // Ctrl-U
+    PageDown,           // Ctrl-F
+    PageUp,             // Ctrl-B
+    ScrollLineDown,     // Ctrl-E (count = lines to scroll, default 1)
+    ScrollLineUp,       // Ctrl-Y (count = lines to scroll, default 1)
+    ScrollCenter,       // zz (count ignored; centers the current line)
+    ScrollTop,          // zt (count ignored; current line becomes the top)
+    ScrollBottom,       // zb (count ignored; current line becomes the bottom)
+    ParagraphForward,   // }
+    ParagraphBackward,  // {
+    SentenceForward,    // )
+    SentenceBackward,   // (
+    NextLineNonBlank,   // + or Enter
+    PrevLineNonBlank,   // -
+    MatchPair,          // %
+    SetMark(char),      // m{a-z}
+    GotoMark(char),     // `{mark}
     GotoMarkLine(char), // '{mark}
     // Repeat via 'n'/'N' is vimkeys' job (stage 4), same as ';'/',' for
     // FindChar: it remembers the last search (the literal string it parsed
@@ -69,14 +69,14 @@ pub enum Motion {
     // cursor is "foo".
     SearchWordForwardUnbounded,
     SearchWordBackwardUnbounded,
-    UnmatchedOpenParen,   // [(
-    UnmatchedCloseParen,  // ])
-    UnmatchedOpenBrace,   // [{
-    UnmatchedCloseBrace,  // ]}
-    SectionForward,       // ]] (next line starting with '{')
-    SectionForwardEnd,    // ][ (next line starting with '}')
-    SectionBackward,      // [[ (previous line starting with '{')
-    SectionBackwardEnd,   // [] (previous line starting with '}')
+    UnmatchedOpenParen,  // [(
+    UnmatchedCloseParen, // ])
+    UnmatchedOpenBrace,  // [{
+    UnmatchedCloseBrace, // ]}
+    SectionForward,      // ]] (next line starting with '{')
+    SectionForwardEnd,   // ][ (next line starting with '}')
+    SectionBackward,     // [[ (previous line starting with '{')
+    SectionBackwardEnd,  // [] (previous line starting with '}')
     // `iw`/`aw`/`i(`/`a(`/`i"`/`a"`/... -- vim's text objects, valid only as
     // an operator's target (`vimkeys.rs` only ever produces this while an
     // operator is armed -- see its own doc comment on `i`/`a`'s gating).
@@ -370,11 +370,7 @@ fn word_end_forward_once(buf: &impl Buffer, pos: (usize, usize), big: bool) -> (
 fn word_end_backward_once(buf: &impl Buffer, pos: (usize, usize), big: bool) -> (usize, usize) {
     let (oline, ocol) = pos;
     let orig_is_word = buf.line_len(oline) > 0 && classify(buf, oline, ocol, big) != Class::Blank;
-    let orig_class = if orig_is_word {
-        Some(classify(buf, oline, ocol, big))
-    } else {
-        None
-    };
+    let orig_class = if orig_is_word { Some(classify(buf, oline, ocol, big)) } else { None };
     let mut cur = pos;
     let mut left_run = !orig_is_word;
     loop {
@@ -505,11 +501,7 @@ fn sentence_forward_once(buf: &impl Buffer, pos: (usize, usize)) -> (usize, usiz
 /// hand-rolling a mirrored version of the forward algorithm's boundary
 /// detection.
 fn sentence_starts(buf: &impl Buffer) -> Vec<(usize, usize)> {
-    let first = if buf.line_len(0) == 0 {
-        (0, 0)
-    } else {
-        (0, first_non_blank(buf, 0))
-    };
+    let first = if buf.line_len(0) == 0 { (0, 0) } else { (0, first_non_blank(buf, 0)) };
     let mut starts = vec![first];
     let mut cur = first;
     loop {
@@ -555,11 +547,7 @@ fn paragraph_forward_once(buf: &impl Buffer, line: usize) -> usize {
             l += 1;
         }
     }
-    if l < last {
-        l + 1
-    } else {
-        last
-    }
+    if l < last { l + 1 } else { last }
 }
 
 fn paragraph_backward_once(buf: &impl Buffer, line: usize) -> usize {
@@ -579,11 +567,7 @@ fn paragraph_backward_once(buf: &impl Buffer, line: usize) -> usize {
             l -= 1;
         }
     }
-    if l > 0 {
-        l - 1
-    } else {
-        0
-    }
+    if l > 0 { l - 1 } else { 0 }
 }
 
 fn viewport_bottom(buf: &impl Buffer) -> usize {
@@ -625,11 +609,7 @@ fn match_pair_once(buf: &impl Buffer, pos: (usize, usize)) -> Option<(usize, usi
     let mut depth = 1;
     let mut cur = start;
     loop {
-        cur = if is_opening {
-            step_forward(buf, cur)?
-        } else {
-            step_backward(buf, cur)?
-        };
+        cur = if is_opening { step_forward(buf, cur)? } else { step_backward(buf, cur)? };
         if let Some(c) = buf.char_at(cur.0, cur.1) {
             if c == ch0 {
                 depth += 1;
@@ -674,9 +654,7 @@ pub fn word_under_cursor(buf: &impl Buffer, pos: (usize, usize)) -> Option<Strin
         start_col -= 1;
     }
     let mut end_col = p.1;
-    while end_col + 1 < buf.line_len(line)
-        && matches!(buf.char_at(line, end_col + 1), Some(c) if is_word_char(c, buf.word_chars()))
-    {
+    while end_col + 1 < buf.line_len(line) && matches!(buf.char_at(line, end_col + 1), Some(c) if is_word_char(c, buf.word_chars())) {
         end_col += 1;
     }
     Some((start_col..=end_col).filter_map(|c| buf.char_at(line, c)).collect())
@@ -1170,7 +1148,12 @@ pub fn surround_pair_positions(buf: &impl Buffer, kind: TextObjectKind) -> Optio
 /// case (`( )`) is guarded so both sides don't independently claim the
 /// same position: the close side wins it, the open side falls back to
 /// just its own bracket.
-pub fn surround_delete_spans(buf: &impl Buffer, kind: TextObjectKind, open_pos: (usize, usize), close_pos: (usize, usize)) -> (MotionRange, MotionRange) {
+pub fn surround_delete_spans(
+    buf: &impl Buffer,
+    kind: TextObjectKind,
+    open_pos: (usize, usize),
+    close_pos: (usize, usize),
+) -> (MotionRange, MotionRange) {
     let pads = matches!(kind, TextObjectKind::Paren | TextObjectKind::Brace | TextObjectKind::Bracket | TextObjectKind::Angle);
     let mut open_to = open_pos;
     let mut close_from = close_pos;
@@ -1277,11 +1260,7 @@ pub fn apply_number_delta(m: &NumberMatch, delta: i64) -> String {
     let new_value = m.value.saturating_add(delta);
     let digits = new_value.unsigned_abs().to_string();
     let padded = if m.leading_zero && digits.len() < m.width { format!("{}{digits}", "0".repeat(m.width - digits.len())) } else { digits };
-    if new_value < 0 {
-        format!("-{padded}")
-    } else {
-        padded
-    }
+    if new_value < 0 { format!("-{padded}") } else { padded }
 }
 
 /// ERE search (via `crate::regex`) for `/`/`?` -- and, via an
@@ -1471,18 +1450,13 @@ pub fn apply_motion(buf: &mut impl Buffer, motion: Motion, count: Option<usize>)
             buf.set_cursor(line, col);
         }
         Motion::GotoFirstLine => {
-            let target = count
-                .map(|c| c.saturating_sub(1))
-                .unwrap_or(0)
-                .min(buf.line_count().saturating_sub(1));
+            let target = count.map(|c| c.saturating_sub(1)).unwrap_or(0).min(buf.line_count().saturating_sub(1));
             let col = first_non_blank(buf, target);
             buf.set_cursor(target, col);
         }
         Motion::GotoLastLine => {
-            let target = count
-                .map(|c| c.saturating_sub(1))
-                .unwrap_or_else(|| buf.line_count().saturating_sub(1))
-                .min(buf.line_count().saturating_sub(1));
+            let target =
+                count.map(|c| c.saturating_sub(1)).unwrap_or_else(|| buf.line_count().saturating_sub(1)).min(buf.line_count().saturating_sub(1));
             let col = first_non_blank(buf, target);
             buf.set_cursor(target, col);
         }
@@ -1492,11 +1466,7 @@ pub fn apply_motion(buf: &mut impl Buffer, motion: Motion, count: Option<usize>)
         // `([count] * lines + 99) / 100`, 1-indexed.
         Motion::GotoPercent => {
             let total = buf.line_count();
-            let target = count
-                .unwrap_or(0)
-                .saturating_mul(total)
-                .saturating_add(99)
-                / 100;
+            let target = count.unwrap_or(0).saturating_mul(total).saturating_add(99) / 100;
             let target = target.saturating_sub(1).min(total.saturating_sub(1));
             let col = first_non_blank(buf, target);
             buf.set_cursor(target, col);
@@ -1538,11 +1508,7 @@ pub fn apply_motion(buf: &mut impl Buffer, motion: Motion, count: Option<usize>)
             let mut cur = col;
             let mut found = None;
             for _ in 0..n {
-                let next = if forward {
-                    find_char_forward_once(buf, line, cur, ch)
-                } else {
-                    find_char_backward_once(buf, line, cur, ch)
-                };
+                let next = if forward { find_char_forward_once(buf, line, cur, ch) } else { find_char_backward_once(buf, line, cur, ch) };
                 match next {
                     Some(c) => {
                         cur = c;
@@ -1555,15 +1521,7 @@ pub fn apply_motion(buf: &mut impl Buffer, motion: Motion, count: Option<usize>)
                 }
             }
             if let Some(c) = found {
-                let target = if till {
-                    if forward {
-                        c.saturating_sub(1)
-                    } else {
-                        c + 1
-                    }
-                } else {
-                    c
-                };
+                let target = if till { if forward { c.saturating_sub(1) } else { c + 1 } } else { c };
                 buf.set_cursor(line, target);
             }
         }
@@ -2005,10 +1963,7 @@ fn motion_shape(m: &Motion) -> Option<MotionShape> {
         Motion::SearchForward(_) | Motion::SearchBackward(_) => Exclusive,
         Motion::SearchWordForward | Motion::SearchWordBackward => Exclusive,
         Motion::SearchWordForwardUnbounded | Motion::SearchWordBackwardUnbounded => Exclusive,
-        Motion::UnmatchedOpenParen
-        | Motion::UnmatchedCloseParen
-        | Motion::UnmatchedOpenBrace
-        | Motion::UnmatchedCloseBrace => Exclusive,
+        Motion::UnmatchedOpenParen | Motion::UnmatchedCloseParen | Motion::UnmatchedOpenBrace | Motion::UnmatchedCloseBrace => Exclusive,
         // Same classification `ParagraphForward`/`ParagraphBackward` already
         // use above -- vim's own section motions are their sibling, moving
         // to a boundary line's own start rather than tracking columns.
@@ -2187,7 +2142,6 @@ pub fn whole_lines(buf: &impl Buffer, count: usize) -> String {
     s
 }
 
-
 /// The canonical name of a motion, as `::bish map` prints it.
 ///
 /// Kebab-case of the variant, deliberately mechanical rather than
@@ -2343,15 +2297,7 @@ mod tests {
                     start = end;
                 }
             }
-            TestBuffer {
-                lines,
-                cursor: (0, 0),
-                vtop: 0,
-                vheight: 24,
-                marks: std::collections::HashMap::new(),
-                wraps,
-                icase: false,
-            }
+            TestBuffer { lines, cursor: (0, 0), vtop: 0, vheight: 24, marks: std::collections::HashMap::new(), wraps, icase: false }
         }
     }
 
@@ -2712,10 +2658,7 @@ mod tests {
     }
 
     fn numbered_lines(n: usize) -> String {
-        (0..n)
-            .map(|i| format!("l{}", i))
-            .collect::<Vec<_>>()
-            .join("\n")
+        (0..n).map(|i| format!("l{}", i)).collect::<Vec<_>>().join("\n")
     }
 
     #[test]
@@ -2966,10 +2909,7 @@ mod tests {
     fn search_forward_with_count() {
         let mut buf = TestBuffer::new("foo bar foo baz foo");
         buf.set_cursor(0, 0);
-        assert_eq!(
-            go(&mut buf, Motion::SearchForward("foo".to_string()), Some(2)),
-            (0, 16)
-        );
+        assert_eq!(go(&mut buf, Motion::SearchForward("foo".to_string()), Some(2)), (0, 16));
     }
 
     #[test]
@@ -3140,17 +3080,39 @@ mod tests {
         // and the buffer says which punctuation joins them.
         struct Kw(TestBuffer, &'static str);
         impl Buffer for Kw {
-            fn line_count(&self) -> usize { self.0.line_count() }
-            fn line_len(&self, l: usize) -> usize { self.0.line_len(l) }
-            fn char_at(&self, l: usize, c: usize) -> Option<char> { self.0.char_at(l, c) }
-            fn cursor(&self) -> (usize, usize) { self.0.cursor() }
-            fn set_cursor(&mut self, l: usize, c: usize) { self.0.set_cursor(l, c) }
-            fn viewport_top(&self) -> usize { self.0.viewport_top() }
-            fn set_viewport_top(&mut self, l: usize) { self.0.set_viewport_top(l) }
-            fn viewport_height(&self) -> usize { self.0.viewport_height() }
-            fn set_mark(&mut self, name: char, pos: (usize, usize)) { self.0.set_mark(name, pos) }
-            fn get_mark(&self, name: char) -> Option<(usize, usize)> { self.0.get_mark(name) }
-            fn word_chars(&self) -> &str { self.1 }
+            fn line_count(&self) -> usize {
+                self.0.line_count()
+            }
+            fn line_len(&self, l: usize) -> usize {
+                self.0.line_len(l)
+            }
+            fn char_at(&self, l: usize, c: usize) -> Option<char> {
+                self.0.char_at(l, c)
+            }
+            fn cursor(&self) -> (usize, usize) {
+                self.0.cursor()
+            }
+            fn set_cursor(&mut self, l: usize, c: usize) {
+                self.0.set_cursor(l, c)
+            }
+            fn viewport_top(&self) -> usize {
+                self.0.viewport_top()
+            }
+            fn set_viewport_top(&mut self, l: usize) {
+                self.0.set_viewport_top(l)
+            }
+            fn viewport_height(&self) -> usize {
+                self.0.viewport_height()
+            }
+            fn set_mark(&mut self, name: char, pos: (usize, usize)) {
+                self.0.set_mark(name, pos)
+            }
+            fn get_mark(&self, name: char) -> Option<(usize, usize)> {
+                self.0.get_mark(name)
+            }
+            fn word_chars(&self) -> &str {
+                self.1
+            }
         }
         let end_of_first_word = |extra: &'static str| {
             let mut buf = Kw(TestBuffer::new("foo-bar baz"), extra);

@@ -1,4 +1,4 @@
-use crate::lexer::{keyword_text, Chunk, Lexer, Tok};
+use crate::lexer::{Chunk, Lexer, Tok, keyword_text};
 
 #[derive(Debug, Clone)]
 pub struct Word {
@@ -139,14 +139,20 @@ pub enum Command {
     // `coproc NAME simple_command` (no braces) isn't supported; write it
     // with braces instead. `name: None` means the unnamed form, which
     // populates the default `COPROC` array/PID vars.
-    Coproc { name: Option<String>, body: Box<Command> },
+    Coproc {
+        name: Option<String>,
+        body: Box<Command>,
+    },
     Case {
         word: Word,
         arms: Vec<(Vec<Word>, Program, CaseTerm)>,
         redirects: Vec<Redirect>,
     },
     Group(Program, Vec<Redirect>),
-    FuncDef { name: String, body: Box<Command> },
+    FuncDef {
+        name: String,
+        body: Box<Command>,
+    },
     // Raw, not-yet-parsed source text of a (...) subshell -- tokenized and
     // parsed lazily, recursively, when it actually runs (see exec.rs).
     Subshell(String, Vec<Redirect>),
@@ -488,8 +494,7 @@ impl Parser {
                     let group = inner.parse_test_atoms()?;
                     atoms.push(TestAtom::Group(group));
                 }
-                Some(Tok::Word(chunks, plain)) if *plain && matches!(chunks.as_slice(), [Chunk::Str(s)] if s == "!") =>
-                {
+                Some(Tok::Word(chunks, plain)) if *plain && matches!(chunks.as_slice(), [Chunk::Str(s)] if s == "!") => {
                     self.advance();
                     atoms.push(TestAtom::Not);
                 }
@@ -579,9 +584,7 @@ impl Parser {
     fn parse_function_kw(&mut self) -> Result<Command, String> {
         self.advance(); // KwFunction
         let name = match self.advance() {
-            Some(Tok::Word(chunks, _)) => {
-                word_to_plain_name(&chunks).ok_or_else(|| "expected a plain function name".to_string())?
-            }
+            Some(Tok::Word(chunks, _)) => word_to_plain_name(&chunks).ok_or_else(|| "expected a plain function name".to_string())?,
             other => return Err(format!("expected function name, got {:?}", other)),
         };
         if matches!(self.peek(), Some(Tok::Subshell { raw, .. }) if raw.is_empty()) {
@@ -656,8 +659,7 @@ impl Parser {
             return Ok(Command::CFor { init, cond, step, body, redirects });
         }
         let var = match self.advance() {
-            Some(Tok::Word(chunks, _)) => word_to_plain_name(&chunks)
-                .ok_or_else(|| "expected a plain variable name after 'for'".to_string())?,
+            Some(Tok::Word(chunks, _)) => word_to_plain_name(&chunks).ok_or_else(|| "expected a plain variable name after 'for'".to_string())?,
             other => return Err(format!("expected variable name after 'for', got {:?}", other)),
         };
         self.skip_terminators();
@@ -687,8 +689,7 @@ impl Parser {
     fn parse_select(&mut self) -> Result<Command, String> {
         self.advance(); // KwSelect
         let var = match self.advance() {
-            Some(Tok::Word(chunks, _)) => word_to_plain_name(&chunks)
-                .ok_or_else(|| "expected a plain variable name after 'select'".to_string())?,
+            Some(Tok::Word(chunks, _)) => word_to_plain_name(&chunks).ok_or_else(|| "expected a plain variable name after 'select'".to_string())?,
             other => return Err(format!("expected variable name after 'select', got {:?}", other)),
         };
         self.skip_terminators();
@@ -746,11 +747,8 @@ impl Parser {
     // form.
     fn parse_coproc(&mut self) -> Result<Command, String> {
         self.advance(); // KwCoproc
-        let name = if let (Some(Tok::Word(chunks, true)), Some(Tok::LBrace)) =
-            (self.toks.get(self.pos), self.toks.get(self.pos + 1))
-        {
-            let name = word_to_plain_name(chunks)
-                .ok_or_else(|| "expected a plain name after 'coproc'".to_string())?;
+        let name = if let (Some(Tok::Word(chunks, true)), Some(Tok::LBrace)) = (self.toks.get(self.pos), self.toks.get(self.pos + 1)) {
+            let name = word_to_plain_name(chunks).ok_or_else(|| "expected a plain name after 'coproc'".to_string())?;
             self.advance();
             Some(name)
         } else {
@@ -976,12 +974,7 @@ impl Parser {
                 // array assignment `arr=(a b)`, which is the leniency
                 // that let the formatter emit the broken spelling
                 // unnoticed (see try_array_literal_assignment).
-                Some(Tok::Subshell { .. })
-                    if !assigns.is_empty()
-                        || !array_assigns.is_empty()
-                        || !index_assigns.is_empty()
-                        || !words.is_empty() =>
-                {
+                Some(Tok::Subshell { .. }) if !assigns.is_empty() || !array_assigns.is_empty() || !index_assigns.is_empty() || !words.is_empty() => {
                     return Err("near unexpected token `('".to_string());
                 }
                 Some(tok)
@@ -1075,12 +1068,7 @@ impl Parser {
             }
         }
 
-        if assigns.is_empty()
-            && array_assigns.is_empty()
-            && index_assigns.is_empty()
-            && words.is_empty()
-            && redirects.is_empty()
-        {
+        if assigns.is_empty() && array_assigns.is_empty() && index_assigns.is_empty() && words.is_empty() && redirects.is_empty() {
             return Err("expected command".to_string());
         }
         Ok(SimpleCommand { assigns, array_assigns, array_word_assigns, index_assigns, words, redirects })
@@ -1135,11 +1123,7 @@ pub(crate) fn word_as_assignment(w: &Word) -> Option<(String, AssignMode, Word)>
     let first = w.chunks.first()?;
     if let Chunk::Str(s) = first {
         let eq = s.find('=')?;
-        let (name, mode) = if let Some(n) = s[..eq].strip_suffix('+') {
-            (n, AssignMode::Append)
-        } else {
-            (&s[..eq], AssignMode::Set)
-        };
+        let (name, mode) = if let Some(n) = s[..eq].strip_suffix('+') { (n, AssignMode::Append) } else { (&s[..eq], AssignMode::Set) };
         if is_valid_ident(name) {
             let mut rest_chunks = vec![Chunk::Str(s[eq + 1..].to_string())];
             rest_chunks.extend(w.chunks[1..].iter().cloned());

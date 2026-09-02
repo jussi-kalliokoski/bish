@@ -48,16 +48,12 @@ const MAX_DIST_CODES: usize = 32;
 // extra bits follow it. Code 284's own 5 extra bits can encode 227..=257,
 // but 285 is defined as exactly 258 with no extra bits, so the two
 // overlap at the top -- that's the RFC's own table, not a mistake here.
-const LENGTH_BASE: [u16; 29] =
-    [3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258];
+const LENGTH_BASE: [u16; 29] = [3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258];
 const LENGTH_EXTRA: [u8; 29] = [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0];
 
-const DIST_BASE: [u16; 30] = [
-    1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145,
-    8193, 12289, 16385, 24577,
-];
-const DIST_EXTRA: [u8; 30] =
-    [0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13];
+const DIST_BASE: [u16; 30] =
+    [1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577];
+const DIST_EXTRA: [u8; 30] = [0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13];
 
 // The order the dynamic-block header sends its code-length code lengths
 // in -- front-loaded so the ones most likely to be zero end up last and
@@ -446,7 +442,10 @@ mod tests {
         use std::io::Write;
         use std::process::Command;
         let mut child = Command::new("python3")
-            .args(["-c", "import sys,zlib;c=zlib.compressobj(9,zlib.DEFLATED,-15);sys.stdout.buffer.write(c.compress(sys.stdin.buffer.read())+c.flush())"])
+            .args([
+                "-c",
+                "import sys,zlib;c=zlib.compressobj(9,zlib.DEFLATED,-15);sys.stdout.buffer.write(c.compress(sys.stdin.buffer.read())+c.flush())",
+            ])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()

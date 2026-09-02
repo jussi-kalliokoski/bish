@@ -56,18 +56,93 @@ enum Formatting {
 // the adoption agency's search, and end scope. Anything not on this list
 // (and not a formatting element) is "ordinary".
 const SPECIAL: &[&str] = &[
-    "address", "applet", "area", "article", "aside", "base", "basefont", "bgsound", "blockquote", "body", "br",
-    "button", "caption", "center", "col", "colgroup", "dd", "details", "dir", "div", "dl", "dt", "embed", "fieldset",
-    "figcaption", "figure", "footer", "form", "frame", "frameset", "h1", "h2", "h3", "h4", "h5", "h6", "head",
-    "header", "hgroup", "hr", "html", "iframe", "img", "input", "keygen", "li", "link", "listing", "main", "marquee",
-    "menu", "meta", "nav", "noembed", "noframes", "noscript", "object", "ol", "p", "param", "plaintext", "pre",
-    "script", "search", "section", "select", "source", "style", "summary", "table", "tbody", "td", "template",
-    "textarea", "tfoot", "th", "thead", "title", "tr", "track", "ul", "wbr", "xmp",
+    "address",
+    "applet",
+    "area",
+    "article",
+    "aside",
+    "base",
+    "basefont",
+    "bgsound",
+    "blockquote",
+    "body",
+    "br",
+    "button",
+    "caption",
+    "center",
+    "col",
+    "colgroup",
+    "dd",
+    "details",
+    "dir",
+    "div",
+    "dl",
+    "dt",
+    "embed",
+    "fieldset",
+    "figcaption",
+    "figure",
+    "footer",
+    "form",
+    "frame",
+    "frameset",
+    "h1",
+    "h2",
+    "h3",
+    "h4",
+    "h5",
+    "h6",
+    "head",
+    "header",
+    "hgroup",
+    "hr",
+    "html",
+    "iframe",
+    "img",
+    "input",
+    "keygen",
+    "li",
+    "link",
+    "listing",
+    "main",
+    "marquee",
+    "menu",
+    "meta",
+    "nav",
+    "noembed",
+    "noframes",
+    "noscript",
+    "object",
+    "ol",
+    "p",
+    "param",
+    "plaintext",
+    "pre",
+    "script",
+    "search",
+    "section",
+    "select",
+    "source",
+    "style",
+    "summary",
+    "table",
+    "tbody",
+    "td",
+    "template",
+    "textarea",
+    "tfoot",
+    "th",
+    "thead",
+    "title",
+    "tr",
+    "track",
+    "ul",
+    "wbr",
+    "xmp",
 ];
 
 // §13.2.4.3: the elements the adoption agency algorithm exists for.
-const FORMATTING: &[&str] =
-    &["a", "b", "big", "code", "em", "font", "i", "nobr", "s", "small", "strike", "strong", "tt", "u"];
+const FORMATTING: &[&str] = &["a", "b", "big", "code", "em", "font", "i", "nobr", "s", "small", "strike", "strong", "tt", "u"];
 
 // The elements that stop a scope search. `has_element_in_scope`'s
 // variants add to this list rather than replacing it.
@@ -282,11 +357,7 @@ impl TreeBuilder {
     // ---- tree primitives -------------------------------------------
 
     fn new_element(&mut self, name: &str, ns: Namespace, attrs: Vec<Attr>) -> NodeId {
-        self.doc.nodes.push(Node {
-            data: NodeData::Element { name: name.to_string(), ns, attrs },
-            parent: None,
-            children: Vec::new(),
-        });
+        self.doc.nodes.push(Node { data: NodeData::Element { name: name.to_string(), ns, attrs }, parent: None, children: Vec::new() });
         self.doc.nodes.len() - 1
     }
 
@@ -476,8 +547,7 @@ impl TreeBuilder {
     fn generate_implied_end_tags(&mut self, except: &str) {
         while let Some(&id) = self.open.last() {
             let name = self.name_of(id);
-            if name != except && matches!(name, "dd" | "dt" | "li" | "optgroup" | "option" | "p" | "rb" | "rp" | "rt" | "rtc")
-            {
+            if name != except && matches!(name, "dd" | "dt" | "li" | "optgroup" | "option" | "p" | "rb" | "rp" | "rt" | "rtc") {
                 self.open.pop();
             } else {
                 break;
@@ -489,8 +559,24 @@ impl TreeBuilder {
         while let Some(&id) = self.open.last() {
             if matches!(
                 self.name_of(id),
-                "caption" | "colgroup" | "dd" | "dt" | "li" | "optgroup" | "option" | "p" | "rb" | "rp" | "rt" | "rtc"
-                    | "tbody" | "td" | "tfoot" | "th" | "thead" | "tr"
+                "caption"
+                    | "colgroup"
+                    | "dd"
+                    | "dt"
+                    | "li"
+                    | "optgroup"
+                    | "option"
+                    | "p"
+                    | "rb"
+                    | "rp"
+                    | "rt"
+                    | "rtc"
+                    | "tbody"
+                    | "td"
+                    | "tfoot"
+                    | "th"
+                    | "thead"
+                    | "tr"
             ) {
                 self.open.pop();
             } else {
@@ -734,7 +820,9 @@ impl TreeBuilder {
                     break;
                 }
                 let in_afe = self.afe_position(node);
-                if inner > 3 && let Some(pos) = in_afe {
+                if inner > 3
+                    && let Some(pos) = in_afe
+                {
                     self.afe.remove(pos);
                     if bookmark > pos {
                         bookmark -= 1;
@@ -829,11 +917,7 @@ impl TreeBuilder {
             return;
         }
         loop {
-            let reprocess = if self.use_foreign_rules(&token) {
-                self.foreign_content(&token)
-            } else {
-                self.dispatch(&token)
-            };
+            let reprocess = if self.use_foreign_rules(&token) { self.foreign_content(&token) } else { self.dispatch(&token) };
             if !reprocess {
                 return;
             }
@@ -955,11 +1039,7 @@ impl TreeBuilder {
                     self.error("unexpected doctype");
                 }
                 self.doc.quirks = quirks_for(d.force_quirks, &name, &public_id, &system_id);
-                self.doc.nodes.push(Node {
-                    data: NodeData::Doctype { name, public_id, system_id },
-                    parent: None,
-                    children: Vec::new(),
-                });
+                self.doc.nodes.push(Node { data: NodeData::Doctype { name, public_id, system_id }, parent: None, children: Vec::new() });
                 let node = self.doc.nodes.len() - 1;
                 let root = self.doc.root;
                 self.append(root, node);
@@ -1059,9 +1139,7 @@ impl TreeBuilder {
                 false
             }
             Token::StartTag(tag) if tag.name == "html" => self.in_body(token),
-            Token::StartTag(tag)
-                if matches!(tag.name.as_str(), "base" | "basefont" | "bgsound" | "link" | "meta") =>
-            {
+            Token::StartTag(tag) if matches!(tag.name.as_str(), "base" | "basefont" | "bgsound" | "link" | "meta") => {
                 self.insert_element(tag, Namespace::Html);
                 self.open.pop();
                 false
@@ -1148,9 +1226,7 @@ impl TreeBuilder {
             }
             Token::Char(c) if is_whitespace(*c) => self.in_head(token),
             Token::Comment(_) => self.in_head(token),
-            Token::StartTag(tag)
-                if matches!(tag.name.as_str(), "basefont" | "bgsound" | "link" | "meta" | "noframes" | "style") =>
-            {
+            Token::StartTag(tag) if matches!(tag.name.as_str(), "basefont" | "bgsound" | "link" | "meta" | "noframes" | "style") => {
                 self.in_head(token)
             }
             Token::StartTag(tag) if matches!(tag.name.as_str(), "head" | "noscript") => {
@@ -1202,8 +1278,7 @@ impl TreeBuilder {
             Token::StartTag(tag)
                 if matches!(
                     tag.name.as_str(),
-                    "base" | "basefont" | "bgsound" | "link" | "meta" | "noframes" | "script" | "style" | "template"
-                        | "title"
+                    "base" | "basefont" | "bgsound" | "link" | "meta" | "noframes" | "script" | "style" | "template" | "title"
                 ) =>
             {
                 self.error("head content after </head>");
@@ -1318,8 +1393,7 @@ impl TreeBuilder {
             Token::StartTag(tag)
                 if matches!(
                     tag.name.as_str(),
-                    "base" | "basefont" | "bgsound" | "link" | "meta" | "noframes" | "script" | "style" | "template"
-                        | "title"
+                    "base" | "basefont" | "bgsound" | "link" | "meta" | "noframes" | "script" | "style" | "template" | "title"
                 ) =>
             {
                 self.in_head(token)
@@ -1377,9 +1451,31 @@ impl TreeBuilder {
             Token::StartTag(tag)
                 if matches!(
                     tag.name.as_str(),
-                    "address" | "article" | "aside" | "blockquote" | "center" | "details" | "dialog" | "dir" | "div"
-                        | "dl" | "fieldset" | "figcaption" | "figure" | "footer" | "header" | "hgroup" | "main"
-                        | "menu" | "nav" | "ol" | "p" | "search" | "section" | "summary" | "ul"
+                    "address"
+                        | "article"
+                        | "aside"
+                        | "blockquote"
+                        | "center"
+                        | "details"
+                        | "dialog"
+                        | "dir"
+                        | "div"
+                        | "dl"
+                        | "fieldset"
+                        | "figcaption"
+                        | "figure"
+                        | "footer"
+                        | "header"
+                        | "hgroup"
+                        | "main"
+                        | "menu"
+                        | "nav"
+                        | "ol"
+                        | "p"
+                        | "search"
+                        | "section"
+                        | "summary"
+                        | "ul"
                 ) =>
             {
                 if self.has_in_button_scope("p") {
@@ -1619,9 +1715,7 @@ impl TreeBuilder {
                 self.insert_element(tag, Namespace::Html);
                 self.frameset_ok = false;
                 self.mode = match self.mode {
-                    Mode::InTable | Mode::InCaption | Mode::InTableBody | Mode::InRow | Mode::InCell => {
-                        Mode::InSelectInTable
-                    }
+                    Mode::InTable | Mode::InCaption | Mode::InTableBody | Mode::InRow | Mode::InCell => Mode::InSelectInTable,
                     _ => Mode::InSelect,
                 };
                 false
@@ -1671,8 +1765,7 @@ impl TreeBuilder {
             Token::StartTag(tag)
                 if matches!(
                     tag.name.as_str(),
-                    "caption" | "col" | "colgroup" | "frame" | "head" | "tbody" | "td" | "tfoot" | "th" | "thead"
-                        | "tr"
+                    "caption" | "col" | "colgroup" | "frame" | "head" | "tbody" | "td" | "tfoot" | "th" | "thead" | "tr"
                 ) =>
             {
                 self.error("start tag that has no place in the body");
@@ -1686,10 +1779,33 @@ impl TreeBuilder {
             Token::EndTag(tag)
                 if matches!(
                     tag.name.as_str(),
-                    "address" | "article" | "aside" | "blockquote" | "button" | "center" | "details" | "dialog"
-                        | "dir" | "div" | "dl" | "fieldset" | "figcaption" | "figure" | "footer" | "header"
-                        | "hgroup" | "listing" | "main" | "menu" | "nav" | "ol" | "pre" | "search" | "section"
-                        | "summary" | "ul"
+                    "address"
+                        | "article"
+                        | "aside"
+                        | "blockquote"
+                        | "button"
+                        | "center"
+                        | "details"
+                        | "dialog"
+                        | "dir"
+                        | "div"
+                        | "dl"
+                        | "fieldset"
+                        | "figcaption"
+                        | "figure"
+                        | "footer"
+                        | "header"
+                        | "hgroup"
+                        | "listing"
+                        | "main"
+                        | "menu"
+                        | "nav"
+                        | "ol"
+                        | "pre"
+                        | "search"
+                        | "section"
+                        | "summary"
+                        | "ul"
                 ) =>
             {
                 if !self.has_in_scope(&tag.name) {
@@ -1850,8 +1966,23 @@ impl TreeBuilder {
         let bad = self.open.iter().any(|&id| {
             !matches!(
                 self.name_of(id),
-                "dd" | "dt" | "li" | "optgroup" | "option" | "p" | "rb" | "rp" | "rt" | "rtc" | "tbody" | "td"
-                    | "tfoot" | "th" | "thead" | "tr" | "body" | "html"
+                "dd" | "dt"
+                    | "li"
+                    | "optgroup"
+                    | "option"
+                    | "p"
+                    | "rb"
+                    | "rp"
+                    | "rt"
+                    | "rtc"
+                    | "tbody"
+                    | "td"
+                    | "tfoot"
+                    | "th"
+                    | "thead"
+                    | "tr"
+                    | "body"
+                    | "html"
             )
         });
         if bad {
@@ -1945,8 +2076,7 @@ impl TreeBuilder {
             Token::EndTag(tag)
                 if matches!(
                     tag.name.as_str(),
-                    "body" | "caption" | "col" | "colgroup" | "html" | "tbody" | "td" | "tfoot" | "th" | "thead"
-                        | "tr"
+                    "body" | "caption" | "col" | "colgroup" | "html" | "tbody" | "td" | "tfoot" | "th" | "thead" | "tr"
                 ) =>
             {
                 self.error("end tag with no matching open element in a table");
@@ -1954,9 +2084,7 @@ impl TreeBuilder {
             }
             Token::StartTag(tag) if matches!(tag.name.as_str(), "style" | "script" | "template") => self.in_head(token),
             Token::EndTag(tag) if tag.name == "template" => self.in_head(token),
-            Token::StartTag(tag)
-                if tag.name == "input" && tag.attr("type").is_some_and(|t| t.eq_ignore_ascii_case("hidden")) =>
-            {
+            Token::StartTag(tag) if tag.name == "input" && tag.attr("type").is_some_and(|t| t.eq_ignore_ascii_case("hidden")) => {
                 self.error("<input> in a table");
                 self.insert_element(tag, Namespace::Html);
                 self.open.pop();
@@ -2048,10 +2176,7 @@ impl TreeBuilder {
                 false
             }
             Token::StartTag(tag)
-                if matches!(
-                    tag.name.as_str(),
-                    "caption" | "col" | "colgroup" | "tbody" | "td" | "tfoot" | "th" | "thead" | "tr"
-                ) =>
+                if matches!(tag.name.as_str(), "caption" | "col" | "colgroup" | "tbody" | "td" | "tfoot" | "th" | "thead" | "tr") =>
             {
                 self.error("table content inside a caption");
                 self.close_caption()
@@ -2061,10 +2186,7 @@ impl TreeBuilder {
                 self.close_caption()
             }
             Token::EndTag(tag)
-                if matches!(
-                    tag.name.as_str(),
-                    "body" | "col" | "colgroup" | "html" | "tbody" | "td" | "tfoot" | "th" | "thead" | "tr"
-                ) =>
+                if matches!(tag.name.as_str(), "body" | "col" | "colgroup" | "html" | "tbody" | "td" | "tfoot" | "th" | "thead" | "tr") =>
             {
                 self.error("end tag with no matching open element in a caption");
                 false
@@ -2147,9 +2269,7 @@ impl TreeBuilder {
                 self.mode = Mode::InTable;
                 false
             }
-            Token::StartTag(tag)
-                if matches!(tag.name.as_str(), "caption" | "col" | "colgroup" | "tbody" | "tfoot" | "thead") =>
-            {
+            Token::StartTag(tag) if matches!(tag.name.as_str(), "caption" | "col" | "colgroup" | "tbody" | "tfoot" | "thead") => {
                 if !["tbody", "thead", "tfoot"].iter().any(|n| self.has_in_table_scope(n)) {
                     self.error("table section with no open section");
                     return false;
@@ -2169,9 +2289,7 @@ impl TreeBuilder {
                 self.mode = Mode::InTable;
                 true
             }
-            Token::EndTag(tag)
-                if matches!(tag.name.as_str(), "body" | "caption" | "col" | "colgroup" | "html" | "td" | "th" | "tr") =>
-            {
+            Token::EndTag(tag) if matches!(tag.name.as_str(), "body" | "caption" | "col" | "colgroup" | "html" | "td" | "th" | "tr") => {
                 self.error("end tag with no matching open element in a table body");
                 false
             }
@@ -2198,12 +2316,7 @@ impl TreeBuilder {
                 self.mode = Mode::InTableBody;
                 false
             }
-            Token::StartTag(tag)
-                if matches!(
-                    tag.name.as_str(),
-                    "caption" | "col" | "colgroup" | "tbody" | "tfoot" | "thead" | "tr"
-                ) =>
-            {
+            Token::StartTag(tag) if matches!(tag.name.as_str(), "caption" | "col" | "colgroup" | "tbody" | "tfoot" | "thead" | "tr") => {
                 if !self.has_in_table_scope("tr") {
                     self.error("row content with no open row");
                     return false;
@@ -2236,9 +2349,7 @@ impl TreeBuilder {
                 self.mode = Mode::InTableBody;
                 true
             }
-            Token::EndTag(tag)
-                if matches!(tag.name.as_str(), "body" | "caption" | "col" | "colgroup" | "html" | "td" | "th") =>
-            {
+            Token::EndTag(tag) if matches!(tag.name.as_str(), "body" | "caption" | "col" | "colgroup" | "html" | "td" | "th") => {
                 self.error("end tag with no matching open element in a row");
                 false
             }
@@ -2274,10 +2385,7 @@ impl TreeBuilder {
                 false
             }
             Token::StartTag(tag)
-                if matches!(
-                    tag.name.as_str(),
-                    "caption" | "col" | "colgroup" | "tbody" | "td" | "tfoot" | "th" | "thead" | "tr"
-                ) =>
+                if matches!(tag.name.as_str(), "caption" | "col" | "colgroup" | "tbody" | "td" | "tfoot" | "th" | "thead" | "tr") =>
             {
                 if !self.has_in_table_scope("td") && !self.has_in_table_scope("th") {
                     self.error("table content with no open cell");
@@ -2342,10 +2450,7 @@ impl TreeBuilder {
                 false
             }
             Token::EndTag(tag) if tag.name == "optgroup" => {
-                if self.is_html(self.current(), "option")
-                    && self.open.len() > 1
-                    && self.is_html(self.open[self.open.len() - 2], "optgroup")
-                {
+                if self.is_html(self.current(), "option") && self.open.len() > 1 && self.is_html(self.open[self.open.len() - 2], "optgroup") {
                     self.open.pop();
                 }
                 if self.is_html(self.current(), "optgroup") {
@@ -2404,10 +2509,9 @@ impl TreeBuilder {
 
     fn in_select_in_table(&mut self, token: &Token) -> bool {
         let escapes = match token {
-            Token::StartTag(tag) | Token::EndTag(tag) => matches!(
-                tag.name.as_str(),
-                "caption" | "table" | "tbody" | "tfoot" | "thead" | "tr" | "td" | "th"
-            ),
+            Token::StartTag(tag) | Token::EndTag(tag) => {
+                matches!(tag.name.as_str(), "caption" | "table" | "tbody" | "tfoot" | "thead" | "tr" | "td" | "th")
+            }
             _ => false,
         };
         if escapes {
@@ -2435,16 +2539,13 @@ impl TreeBuilder {
             Token::StartTag(tag)
                 if matches!(
                     tag.name.as_str(),
-                    "base" | "basefont" | "bgsound" | "link" | "meta" | "noframes" | "script" | "style" | "template"
-                        | "title"
+                    "base" | "basefont" | "bgsound" | "link" | "meta" | "noframes" | "script" | "style" | "template" | "title"
                 ) =>
             {
                 self.in_head(token)
             }
             Token::EndTag(tag) if tag.name == "template" => self.in_head(token),
-            Token::StartTag(tag)
-                if matches!(tag.name.as_str(), "caption" | "colgroup" | "tbody" | "tfoot" | "thead") =>
-            {
+            Token::StartTag(tag) if matches!(tag.name.as_str(), "caption" | "colgroup" | "tbody" | "tfoot" | "thead") => {
                 self.switch_template_mode(Mode::InTable)
             }
             Token::StartTag(tag) if tag.name == "col" => self.switch_template_mode(Mode::InColumnGroup),
@@ -2667,12 +2768,50 @@ impl TreeBuilder {
             Token::StartTag(tag)
                 if matches!(
                     tag.name.as_str(),
-                    "b" | "big" | "blockquote" | "body" | "br" | "center" | "code" | "dd" | "div" | "dl" | "dt" | "em"
-                        | "embed" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "head" | "hr" | "i" | "img" | "li"
-                        | "listing" | "menu" | "meta" | "nobr" | "ol" | "p" | "pre" | "ruby" | "s" | "small" | "span"
-                        | "strong" | "strike" | "sub" | "sup" | "table" | "tt" | "u" | "ul" | "var"
-                ) || (tag.name == "font"
-                    && tag.attrs.iter().any(|a| matches!(a.name.as_str(), "color" | "face" | "size"))) =>
+                    "b" | "big"
+                        | "blockquote"
+                        | "body"
+                        | "br"
+                        | "center"
+                        | "code"
+                        | "dd"
+                        | "div"
+                        | "dl"
+                        | "dt"
+                        | "em"
+                        | "embed"
+                        | "h1"
+                        | "h2"
+                        | "h3"
+                        | "h4"
+                        | "h5"
+                        | "h6"
+                        | "head"
+                        | "hr"
+                        | "i"
+                        | "img"
+                        | "li"
+                        | "listing"
+                        | "menu"
+                        | "meta"
+                        | "nobr"
+                        | "ol"
+                        | "p"
+                        | "pre"
+                        | "ruby"
+                        | "s"
+                        | "small"
+                        | "span"
+                        | "strong"
+                        | "strike"
+                        | "sub"
+                        | "sup"
+                        | "table"
+                        | "tt"
+                        | "u"
+                        | "ul"
+                        | "var"
+                ) || (tag.name == "font" && tag.attrs.iter().any(|a| matches!(a.name.as_str(), "color" | "face" | "size"))) =>
             {
                 self.error("html start tag inside foreign content");
                 if self.fragment_context.is_some() {
@@ -2778,17 +2917,14 @@ fn quirks_for(force: bool, name: &str, public_id: &str, system_id: &str) -> Quir
     {
         return QuirksMode::Quirks;
     }
-    if system_id.is_empty()
-        && (public.starts_with("-//w3c//dtd html 4.01 frameset//")
-            || public.starts_with("-//w3c//dtd html 4.01 transitional//"))
+    if system_id.is_empty() && (public.starts_with("-//w3c//dtd html 4.01 frameset//") || public.starts_with("-//w3c//dtd html 4.01 transitional//"))
     {
         return QuirksMode::Quirks;
     }
     if public.starts_with("-//w3c//dtd xhtml 1.0 frameset//")
         || public.starts_with("-//w3c//dtd xhtml 1.0 transitional//")
         || (!system_id.is_empty()
-            && (public.starts_with("-//w3c//dtd html 4.01 frameset//")
-                || public.starts_with("-//w3c//dtd html 4.01 transitional//")))
+            && (public.starts_with("-//w3c//dtd html 4.01 frameset//") || public.starts_with("-//w3c//dtd html 4.01 transitional//")))
     {
         return QuirksMode::LimitedQuirks;
     }
@@ -3243,10 +3379,7 @@ mod tests {
         use super::super::QuirksMode;
         assert_eq!(parse("<!DOCTYPE html><p>x").quirks, QuirksMode::NoQuirks);
         assert_eq!(parse("<p>x").quirks, QuirksMode::Quirks, "no doctype at all is quirks mode");
-        assert_eq!(
-            parse(r#"<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">"#).quirks,
-            QuirksMode::Quirks
-        );
+        assert_eq!(parse(r#"<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">"#).quirks, QuirksMode::Quirks);
     }
 
     // Malformed input has to terminate and produce *something*: every

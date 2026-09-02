@@ -4,7 +4,7 @@
 // Free functions taking `&mut Shell` -- see `builtins/mod.rs`.
 
 use crate::compgen;
-use crate::exec::{sh_eprintln, sh_println, Shell};
+use crate::exec::{Shell, sh_eprintln, sh_println};
 
 // compgen [-V varname] [-abcdefgjksuv] [-o option] [-A action]
 // [-G globpat] [-W wordlist] [-F function] [-C command] [-X filterpat]
@@ -76,11 +76,7 @@ pub(crate) fn run_compgen(sh: &mut Shell, args: &[String]) -> i32 {
             sh_println!(sh, "{c}");
         }
     }
-    if empty && had_source {
-        1
-    } else {
-        0
-    }
+    if empty && had_source { 1 } else { 0 }
 }
 
 // complete [-p|-r] [options] name... | complete -D [options] --

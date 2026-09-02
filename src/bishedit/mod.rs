@@ -47,9 +47,7 @@ pub trait Buffer {
     fn char_at(&self, line: usize, col: usize) -> Option<char>;
 
     fn line_chars(&self, line: usize) -> Vec<char> {
-        (0..self.line_len(line))
-            .filter_map(|c| self.char_at(line, c))
-            .collect()
+        (0..self.line_len(line)).filter_map(|c| self.char_at(line, c)).collect()
     }
 
     fn cursor(&self) -> (usize, usize);

@@ -37,7 +37,6 @@ pub fn run(args: &[String]) -> i32 {
     }
 }
 
-
 // `bish tool keys` -- the editor's key bindings, answered by the editor
 // rather than described alongside it.
 //
@@ -334,7 +333,9 @@ fn format_file(path: &str, check_only: bool) -> i32 {
         let (fixed, applied, remaining) = apply_fixes(&text, &diagnostics);
         // Same "don't touch mtime for nothing" reasoning as check_file's
         // own --fix path.
-        if applied > 0 && let Err(e) = std::fs::write(path, &fixed) {
+        if applied > 0
+            && let Err(e) = std::fs::write(path, &fixed)
+        {
             eprintln!("bish tool format: {path}: error writing: {e}");
             return 2;
         }

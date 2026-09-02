@@ -4,8 +4,10 @@
 // Free functions taking `&mut Shell` -- see `builtins/mod.rs`.
 
 use crate::bishedit::snippet::{self, Abbr};
-use crate::exec::{hook_help, lsp_help, parse_size_spec, sh_eprintln, sh_println, BishOptDefault, BishOptValue,
-    ExecResult, HOOK_EVENTS, Hook, LspServer, PaneDirection, Shell, Theme, WindowAction};
+use crate::exec::{
+    BishOptDefault, BishOptValue, ExecResult, HOOK_EVENTS, Hook, LspServer, PaneDirection, Shell, Theme, WindowAction, hook_help, lsp_help,
+    parse_size_spec, sh_eprintln, sh_println,
+};
 
 // The subcommand names each `::bish` family answers to. One list per
 // family, used both for the "expected:" line and for the "did you
@@ -21,8 +23,8 @@ const THEME_SUBCOMMANDS: &[&str] = &["begin", "end"];
 // mistyped single character is a near miss for most of them, so the
 // answer would be arbitrary.
 const WINDOW_SUBCOMMANDS: &[&str] = &[
-    "next", "previous", "new", "create", "close", "quit", "split", "vsplit", "left", "below", "above", "right",
-    "balance", "minimize", "sizeup", "sizedown", "size", "fg",
+    "next", "previous", "new", "create", "close", "quit", "split", "vsplit", "left", "below", "above", "right", "balance", "minimize", "sizeup",
+    "sizedown", "size", "fg",
 ];
 
 // "theme, window, hook, hl, lsp, map" -- the list as an error message
@@ -53,7 +55,10 @@ pub(crate) fn run_bishopt(sh: &mut Shell, args: &[String], registry: &[(&str, Bi
         [flag, name] if flag == "--quiet" || flag == "-q" => Mode::Get(name, true),
         [name] => Mode::Get(name, false),
         _ => {
-            sh_eprintln!(sh, "bish: bishopt: usage: bishopt [--quiet|-q NAME | --set|-s NAME [VALUE] | --unset|-u NAME | --describe|-d [NAME] | NAME]");
+            sh_eprintln!(
+                sh,
+                "bish: bishopt: usage: bishopt [--quiet|-q NAME | --set|-s NAME [VALUE] | --unset|-u NAME | --describe|-d [NAME] | NAME]"
+            );
             return 2;
         }
     };
@@ -81,11 +86,7 @@ pub(crate) fn run_bishopt(sh: &mut Shell, args: &[String], registry: &[(&str, Bi
                 if !quiet {
                     sh_println!(sh, "{}", if on { "on" } else { "off" });
                 }
-                if on {
-                    0
-                } else {
-                    1
-                }
+                if on { 0 } else { 1 }
             }
             Some(BishOptValue::Int(n)) => {
                 if !quiet {
@@ -200,7 +201,6 @@ pub(crate) fn run_bishopt(sh: &mut Shell, args: &[String], registry: &[(&str, Bi
 // bash's own less-common toggles under one name instead of each
 // getting its own builtin.
 pub(crate) fn run_bish(sh: &mut Shell, args: &[String]) -> ExecResult {
-
     match args {
         [sub, rest @ ..] if sub == "theme" => ExecResult::Status(run_bish_theme(sh, rest)),
         // The canonical spelling of the window manager. `window`/
@@ -270,12 +270,7 @@ pub(crate) fn run_hook(sh: &mut Shell, args: &[String]) -> i32 {
             }
             let id = sh.next_hook_id;
             sh.next_hook_id += 1;
-            sh.hooks.push(Hook {
-                id,
-                event: event.clone(),
-                lang: lang.unwrap_or_else(|| "*".to_string()),
-                command: command.join(" "),
-            });
+            sh.hooks.push(Hook { id, event: event.clone(), lang: lang.unwrap_or_else(|| "*".to_string()), command: command.join(" ") });
             // The id is the return value: a config that adds a hook
             // is usually the thing that will want to remove it.
             sh_println!(sh, "{id}");
@@ -628,13 +623,7 @@ pub(crate) fn run_map(sh: &mut Shell, args: &[String]) -> i32 {
                     } else {
                         "-".to_string()
                     };
-                    format!(
-                        "{}\t{}\t{}\t{}",
-                        m.modes,
-                        crate::keymap::format_keys(&m.lhs),
-                        crate::keymap::format_rhs(&m.rhs),
-                        action
-                    )
+                    format!("{}\t{}\t{}\t{}", m.modes, crate::keymap::format_keys(&m.lhs), crate::keymap::format_rhs(&m.rhs), action)
                 })
                 .collect();
             for line in listing {

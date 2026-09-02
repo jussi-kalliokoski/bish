@@ -46,7 +46,9 @@ pub enum TokenKind {
     /// A string of any of TOML's four kinds, quotes included. `escapes`
     /// are spans within it, and are always empty for a literal
     /// (`'`-quoted) string, where a backslash is a backslash.
-    Str { escapes: Vec<Range<usize>> },
+    Str {
+        escapes: Vec<Range<usize>>,
+    },
     /// An integer or float in any of TOML's spellings, `inf`/`nan`
     /// included.
     Number,
@@ -311,9 +313,8 @@ impl Lexer<'_> {
         if text.contains(':') || self.peek() != Some(' ') {
             return;
         }
-        let looks_like_time = self.at(1).is_some_and(|c| c.is_ascii_digit())
-            && self.at(2).is_some_and(|c| c.is_ascii_digit())
-            && self.at(3) == Some(':');
+        let looks_like_time =
+            self.at(1).is_some_and(|c| c.is_ascii_digit()) && self.at(2).is_some_and(|c| c.is_ascii_digit()) && self.at(3) == Some(':');
         if !looks_like_time {
             return;
         }
@@ -705,9 +706,7 @@ impl<'a> Parser<'a> {
     fn number_or_datetime(&mut self) -> Result<crate::json::Value, ParseError> {
         if self.looks_like_datetime() {
             let start = self.pos;
-            while self
-                .peek()
-                .is_some_and(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | ':' | '.' | '+'))
+            while self.peek().is_some_and(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | ':' | '.' | '+'))
                 || (self.peek() == Some(' ') && self.peek_at(1).is_some_and(|c| c.is_ascii_digit()) && self.chars[start..self.pos].contains(&'-'))
             {
                 self.pos += 1;
@@ -929,7 +928,9 @@ impl<'a> Parser<'a> {
                 // An inline table is a single-line construct in TOML
                 // 1.0, and saying so is more useful than the "expected
                 // ',' or '}'" a newline would otherwise produce.
-                Some('\n') | None => return Err(ParseError { at: opened, message: "unterminated inline table -- it must fit on one line".to_string() }),
+                Some('\n') | None => {
+                    return Err(ParseError { at: opened, message: "unterminated inline table -- it must fit on one line".to_string() });
+                }
                 Some(c) => return self.err(format!("expected ',' or '}}' in an inline table, found '{c}'")),
             }
         }
@@ -1034,11 +1035,7 @@ mod tests {
     fn a_pair_is_a_key_an_equals_and_a_value() {
         assert_eq!(
             lex("title = \"bish\""),
-            vec![
-                ("title".to_string(), TokenKind::Key),
-                ("=".to_string(), TokenKind::Punctuation),
-                ("\"bish\"".to_string(), str_kind()),
-            ]
+            vec![("title".to_string(), TokenKind::Key), ("=".to_string(), TokenKind::Punctuation), ("\"bish\"".to_string(), str_kind()),]
         );
     }
 
@@ -1076,10 +1073,7 @@ mod tests {
     // string still shows one.
     #[test]
     fn a_quoted_segment_of_a_header_is_also_a_string() {
-        assert_eq!(
-            lex("[a.\"b.c\"]"),
-            vec![("[a.\"b.c\"]".to_string(), TokenKind::TableHeader), ("\"b.c\"".to_string(), str_kind())]
-        );
+        assert_eq!(lex("[a.\"b.c\"]"), vec![("[a.\"b.c\"]".to_string(), TokenKind::TableHeader), ("\"b.c\"".to_string(), str_kind())]);
     }
 
     // A `[` after a value opens an array; only one at the start of a

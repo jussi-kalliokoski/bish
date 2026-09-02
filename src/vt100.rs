@@ -578,19 +578,11 @@ impl Screen {
     }
 
     fn grid(&self) -> &Grid {
-        if self.using_alternate {
-            &self.alternate
-        } else {
-            &self.primary
-        }
+        if self.using_alternate { &self.alternate } else { &self.primary }
     }
 
     fn grid_mut(&mut self) -> &mut Grid {
-        if self.using_alternate {
-            &mut self.alternate
-        } else {
-            &mut self.primary
-        }
+        if self.using_alternate { &mut self.alternate } else { &mut self.primary }
     }
 
     pub fn cell(&self, row: usize, col: usize) -> Cell {
@@ -657,7 +649,7 @@ impl Screen {
 
     fn control(&mut self, b: u8) {
         match b {
-            0x0E => self.shifted_out = true, // SO
+            0x0E => self.shifted_out = true,  // SO
             0x0F => self.shifted_out = false, // SI
             _ => {}
         }
@@ -951,11 +943,7 @@ impl Screen {
             b'r' => {
                 let rows = self.grid().rows;
                 let top = (param_at(0, 1) - 1).max(0) as usize;
-                let bottom = if params.len() > 1 && params[1] != 0 {
-                    (params[1] - 1).max(0) as usize
-                } else {
-                    rows - 1
-                };
+                let bottom = if params.len() > 1 && params[1] != 0 { (params[1] - 1).max(0) as usize } else { rows - 1 };
                 let g = self.grid_mut();
                 if top < bottom && bottom < rows {
                     g.scroll_top = top;

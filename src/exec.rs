@@ -12,8 +12,7 @@ use crate::compgen;
 use crate::glob;
 use crate::lexer::{Chunk, ReplaceAnchor, TransformKind, VarOp};
 use crate::parser::{
-    self, AndOr, ArrayLiteralItem, AssignMode, Combinator, ListItem, Pipeline, Program, Redirect, Sep, SimpleCommand,
-    TimeStyle, Word,
+    self, AndOr, ArrayLiteralItem, AssignMode, Combinator, ListItem, Pipeline, Program, Redirect, Sep, SimpleCommand, TimeStyle, Word,
 };
 use crate::pty;
 use crate::vt100;
@@ -812,7 +811,9 @@ pub enum WindowAction {
     /// for this window instead of its cwd, and what `window select`
     /// finds it by -- the two halves of making a workflow scriptable:
     /// something to call a window, and a way to ask for it back.
-    New { name: Option<String> },
+    New {
+        name: Option<String>,
+    },
     /// `window rename [NAME]` -- the current window. No name clears it
     /// back to showing the cwd, which is what an unnamed window shows.
     Rename(Option<String>),
@@ -844,7 +845,9 @@ pub enum WindowAction {
     // half holding a freshly cloned session (same session-cloning
     // primitive `New` already uses) and taking focus. See repl.rs's
     // PaneLayout for how the split tree itself is represented.
-    Split { horizontal: bool },
+    Split {
+        horizontal: bool,
+    },
     // `window h/left`, `j/below`, `k/above`, `l/right`: move focus to
     // the nearest pane in that direction from the currently focused
     // one, vim Ctrl-w-hjkl style. A no-op if the current window isn't
@@ -1461,10 +1464,7 @@ pub struct Shell {
 // the parent's current rng_state, so sibling sessions don't produce
 // correlated $RANDOM sequences).
 fn fresh_rng_seed() -> u64 {
-    let seed = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0x2545F4914F6CDD1D)
+    let seed = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0x2545F4914F6CDD1D)
         ^ (std::process::id() as u64).wrapping_mul(0x9E3779B97F4A7C15);
     if seed == 0 { 0x2545F4914F6CDD1D } else { seed }
 }
@@ -2427,11 +2427,7 @@ impl Shell {
             None => self.lookup_var(name),
         };
         let quoted = crate::serialize::quote_literal(&value);
-        if flags.is_empty() {
-            format!("{name}={quoted}")
-        } else {
-            format!("declare -{flags} {name}={quoted}")
-        }
+        if flags.is_empty() { format!("{name}={quoted}") } else { format!("declare -{flags} {name}={quoted}") }
     }
 
     // ${arr[@]@K}/${assoc[@]@K}: "key value key value ..." pairs,
@@ -2670,7 +2666,8 @@ impl Shell {
             BishOptDefault::Int(n, _) => BishOptValue::Int(n),
             BishOptDefault::Str(s) => BishOptValue::Str(s.to_string()),
             BishOptDefault::Color(s) => {
-                let c = crate::csscolor::parse_terminal_list(s).unwrap_or_else(|e| panic!("KNOWN_BISHOPTS: {name}: default color {s:?} doesn't parse: {e}"));
+                let c = crate::csscolor::parse_terminal_list(s)
+                    .unwrap_or_else(|e| panic!("KNOWN_BISHOPTS: {name}: default color {s:?} doesn't parse: {e}"));
                 BishOptValue::Color(s.to_string(), c)
             }
         })
@@ -2849,7 +2846,7 @@ impl Shell {
     // behaviour to a language without the editor knowing anything about
     // that behaviour: `::bish hook add --lang=rust editor:file:open
     // __rust_setup` and the editor just runs it.
-// `--lang=GLOB` or `--lang GLOB`, returning it and whatever
+    // `--lang=GLOB` or `--lang GLOB`, returning it and whatever
     // follows. Its own helper because `add` and `ls` have to agree
     // about the spelling.
     pub(crate) fn hook_lang_flag<'a>(&mut self, subcommand: &str, args: &'a [String]) -> Result<(Option<String>, &'a [String]), i32> {
@@ -2991,11 +2988,7 @@ impl Shell {
         if self.firing_hooks {
             return Vec::new();
         }
-        self.hooks
-            .iter()
-            .filter(|h| h.event == event && crate::glob::matches(&h.lang, language))
-            .map(|h| h.command.clone())
-            .collect()
+        self.hooks.iter().filter(|h| h.event == event && crate::glob::matches(&h.lang, language)).map(|h| h.command.clone()).collect()
     }
 
     /// Brackets a run of hooks, so anything they do can't fire more.
@@ -3905,10 +3898,7 @@ impl Shell {
         for (name, body) in &self.functions {
             let def = parser::Command::FuncDef { name: name.clone(), body: Box::new(body.clone()) };
             s.push_str(&crate::serialize::serialize_program(&[ListItem {
-                and_or: AndOr {
-                    first: Pipeline { commands: vec![def], negate: false, timed: None },
-                    rest: Vec::new(),
-                },
+                and_or: AndOr { first: Pipeline { commands: vec![def], negate: false, timed: None }, rest: Vec::new() },
                 sep: Sep::Seq,
                 line: 0,
             }]));
@@ -4387,11 +4377,7 @@ impl Shell {
         // Recorded before the body runs, so `current_line` is still the
         // line of the call rather than of whatever the body reaches
         // first.
-        self.call_stack.push(CallFrame {
-            called: name.to_string(),
-            call_line: self.current_line,
-            source: self.script_name.clone(),
-        });
+        self.call_stack.push(CallFrame { called: name.to_string(), call_line: self.current_line, source: self.script_name.clone() });
         self.refresh_call_arrays();
         self.arg_frames.push(call_args);
         self.function_depth += 1;
@@ -4544,11 +4530,7 @@ impl Shell {
                 ret @ (ExecResult::Return(_) | ExecResult::Window(_) | ExecResult::Fg | ExecResult::Edit | ExecResult::Exit(_)) => return ret,
             }
         }
-        if ran_body {
-            ExecResult::Status(self.last_status)
-        } else {
-            ExecResult::Status(0)
-        }
+        if ran_body { ExecResult::Status(self.last_status) } else { ExecResult::Status(0) }
     }
 
     // `select var [in words]; do body; done`. Displays a numbered menu to
@@ -4671,11 +4653,7 @@ impl Shell {
                 }
             }
         }
-        if ran_body {
-            ExecResult::Status(self.last_status)
-        } else {
-            ExecResult::Status(0)
-        }
+        if ran_body { ExecResult::Status(self.last_status) } else { ExecResult::Status(0) }
     }
 
     fn run_case(&mut self, word: &Word, arms: &[(Vec<Word>, Program, parser::CaseTerm)]) -> ExecResult {
@@ -4797,8 +4775,7 @@ impl Shell {
                     // case at all there was nothing for it to do.
                     match crate::regex::match_captures(&a, &pattern, self.shopt_is_on("nocasematch")) {
                         Some(groups) => {
-                            let map: std::collections::BTreeMap<usize, String> =
-                                groups.into_iter().enumerate().collect();
+                            let map: std::collections::BTreeMap<usize, String> = groups.into_iter().enumerate().collect();
                             self.arrays.insert("BASH_REMATCH".to_string(), map);
                             true
                         }
@@ -4990,10 +4967,8 @@ impl Shell {
         // argv[p]" -- run_declare/run_local's own arg loops splice it back
         // in at that index instead of re-parsing a plain string there.
         let mut array_literal_args: Vec<(usize, String, AssignMode, Vec<ArrayLiteralItem>)> = Vec::new();
-        let argv: Vec<String> = if matches!(
-            first_word_literal,
-            Some("local") | Some("export") | Some("declare") | Some("typeset") | Some("readonly")
-        ) {
+        let argv: Vec<String> = if matches!(first_word_literal, Some("local") | Some("export") | Some("declare") | Some("typeset") | Some("readonly"))
+        {
             // Assignment-builtins: `NAME=value` arguments must not be
             // word-split on the expanded value (bash treats them like any
             // other assignment), unlike a normal builtin's arguments.
@@ -5196,8 +5171,7 @@ impl Shell {
         // the same name -- but bash refuses a disabled builtin there
         // too, with "not a shell builtin", which is exactly what
         // falling through this match produces.
-        let dispatch_name: &str =
-            if self.disabled_builtins.contains(&name) { "\u{0}disabled" } else { name.as_str() };
+        let dispatch_name: &str = if self.disabled_builtins.contains(&name) { "\u{0}disabled" } else { name.as_str() };
         match dispatch_name {
             // POSIX special builtin: does nothing, exits 0. Its arguments
             // are still expanded (already done via argv above) for side
@@ -5582,10 +5556,8 @@ impl Shell {
                 // (which still has argv[0] == "local"), so every position
                 // shifts back by one to line up with argv[1..]'s own
                 // enumeration below.
-                let shifted_array_literals: Vec<_> = array_literal_args
-                    .iter()
-                    .filter_map(|(p, n, m, i)| p.checked_sub(1).map(|p2| (p2, n.clone(), *m, i.clone())))
-                    .collect();
+                let shifted_array_literals: Vec<_> =
+                    array_literal_args.iter().filter_map(|(p, n, m, i)| p.checked_sub(1).map(|p2| (p2, n.clone(), *m, i.clone()))).collect();
                 for (i, a) in argv[1..].iter().enumerate() {
                     match a.as_str() {
                         "-a" => {
@@ -5782,10 +5754,7 @@ impl Shell {
                     }
                 }
                 let timeout_secs = argv.iter().position(|a| a == "-t").and_then(|p| argv.get(p + 1)).and_then(|s| s.parse::<f64>().ok());
-                let is_real_stdin = !cmd
-                    .redirects
-                    .iter()
-                    .any(|r| matches!(r, Redirect::In(_) | Redirect::HereString(_) | Redirect::HereDoc(_)));
+                let is_real_stdin = !cmd.redirects.iter().any(|r| matches!(r, Redirect::In(_) | Redirect::HereString(_) | Redirect::HereDoc(_)));
                 if let Some(p) = prompt {
                     if is_real_stdin && stdin_is_tty() {
                         sh_eprint!(self, "{}", p);
@@ -5842,8 +5811,7 @@ impl Shell {
                         let ifs = self.get_ifs();
                         if let Some(arr) = array_name {
                             let (parts, ..) = ifs_tokenize(line, &ifs);
-                            let map: std::collections::BTreeMap<usize, String> =
-                                parts.into_iter().enumerate().collect();
+                            let map: std::collections::BTreeMap<usize, String> = parts.into_iter().enumerate().collect();
                             self.arrays.insert(arr.to_string(), map);
                         } else if names.is_empty() {
                             self.assign_var("REPLY", line.to_string());
@@ -5881,10 +5849,7 @@ impl Shell {
             // overwhelmingly common `mapfile -t arr < file` usage.
             "mapfile" | "readarray" => {
                 if let Some(bad) = first_unknown_option(&argv[1..], "dnOstuCc") {
-                    let usage = format!(
-                        "{} [-d delim] [-n count] [-O origin] [-s count] [-t] [-u fd] [-C callback] [-c quantum] [array]",
-                        name
-                    );
+                    let usage = format!("{} [-d delim] [-n count] [-O origin] [-s count] [-t] [-u fd] [-C callback] [-c quantum] [array]", name);
                     return ExecResult::Status(bad_option_status(self, &name, &bad, &usage));
                 }
                 let mut strip_newline = false;
@@ -6054,8 +6019,7 @@ impl Shell {
                     if let Some(code) = &self.exit_trap {
                         sh_println!(self, "trap -- {} EXIT", crate::serialize::quote_literal(code));
                     }
-                    let mut entries: Vec<(i32, TrapAction)> =
-                        self.traps.iter().map(|(k, v)| (*k, v.clone())).collect();
+                    let mut entries: Vec<(i32, TrapAction)> = self.traps.iter().map(|(k, v)| (*k, v.clone())).collect();
                     entries.sort_by_key(|(n, _)| *n);
                     for (n, action) in entries {
                         match action {
@@ -6099,9 +6063,7 @@ impl Shell {
                     // them silently, and it simply never fires; saying
                     // so is more use than a status a script would have
                     // to have expected.
-                    if crate::exec::UNCATCHABLE_SIGNALS
-                        .iter()
-                        .any(|(n, num)| sig.strip_prefix("SIG").unwrap_or(sig) == *n || sig == &num.to_string())
+                    if crate::exec::UNCATCHABLE_SIGNALS.iter().any(|(n, num)| sig.strip_prefix("SIG").unwrap_or(sig) == *n || sig == &num.to_string())
                     {
                         sh_eprintln!(self, "bish: trap: {}: cannot trap", sig);
                         continue;
@@ -6144,10 +6106,8 @@ impl Shell {
                 // (which still has argv[0] == "declare"/"typeset"), so
                 // every position shifts back by one to line up with
                 // argv[1..].
-                let shifted: Vec<_> = array_literal_args
-                    .iter()
-                    .filter_map(|(p, n, m, i)| p.checked_sub(1).map(|p2| (p2, n.clone(), *m, i.clone())))
-                    .collect();
+                let shifted: Vec<_> =
+                    array_literal_args.iter().filter_map(|(p, n, m, i)| p.checked_sub(1).map(|p2| (p2, n.clone(), *m, i.clone()))).collect();
                 return ExecResult::Status(crate::builtins::vars::run_declare(self, &name, &argv[1..], &shifted));
             }
             // `readonly` is `declare -r`, the same way `export` is
@@ -6354,11 +6314,8 @@ impl Shell {
         // tcsetpgrp/waitpid_untraced treatment further below instead;
         // there's no compositor to interfere with there, so a pty would
         // just be unnecessary overhead.
-        let use_pty = self.is_promoted()
-            && redirs.stdin.is_none()
-            && redirs.stdout.is_none()
-            && redirs.stderr.is_none()
-            && redirs.extra_fds.is_empty();
+        let use_pty =
+            self.is_promoted() && redirs.stdin.is_none() && redirs.stdout.is_none() && redirs.stderr.is_none() && redirs.extra_fds.is_empty();
 
         if use_pty {
             if let Ok(p) = pty::open() {
@@ -6610,11 +6567,7 @@ impl Shell {
                 Some(prev) => prev,
                 None => bg_slave(&bg_pty).unwrap_or_else(|| self.spawn_stdin_stdio()),
             };
-            let default_stdout = if is_last {
-                bg_slave(&bg_pty).unwrap_or_else(|| self.spawn_stdout_stdio())
-            } else {
-                Stdio::piped()
-            };
+            let default_stdout = if is_last { bg_slave(&bg_pty).unwrap_or_else(|| self.spawn_stdout_stdio()) } else { Stdio::piped() };
             let mut default_stderr = bg_slave(&bg_pty);
 
             let mut command = match cmd {
@@ -6652,11 +6605,7 @@ impl Shell {
                                 return 1;
                             }
                         };
-                        let script_line: String = argv
-                            .iter()
-                            .map(|a| crate::serialize::quote_literal(a))
-                            .collect::<Vec<_>>()
-                            .join(" ");
+                        let script_line: String = argv.iter().map(|a| crate::serialize::quote_literal(a)).collect::<Vec<_>>().join(" ");
                         let script = self.functions_preamble() + &script_line;
                         let mut command = Command::new(exe);
                         command.arg("-c").arg(script);
@@ -6691,13 +6640,7 @@ impl Shell {
                     };
                     let own_redirects = command_own_redirects(other);
                     let redirs = if own_redirects.is_empty() {
-                        ResolvedRedirs {
-                            stdin: None,
-                            stdout: None,
-                            stderr: None,
-                            dup_stderr_to_stdout: false,
-                            extra_fds: Vec::new(),
-                        }
+                        ResolvedRedirs { stdin: None, stdout: None, stderr: None, dup_stderr_to_stdout: false, extra_fds: Vec::new() }
                     } else {
                         match self.resolve_redirect_list(own_redirects) {
                             Ok(r) => r,
@@ -6768,8 +6711,7 @@ impl Shell {
         }
 
         if background {
-            let cmd_text =
-                commands.iter().map(crate::serialize::serialize_command).collect::<Vec<_>>().join(" | ");
+            let cmd_text = commands.iter().map(crate::serialize::serialize_command).collect::<Vec<_>>().join(" | ");
             // Both the pgid (so `kill %N`/`bg` reach every stage at once)
             // and the output pty, which push_job_full needs to record for
             // the drain to find later.
@@ -6798,11 +6740,7 @@ impl Shell {
             }
         }
         self.set_pipestatus(&codes);
-        if self.opt_pipefail {
-            pipefail_status
-        } else {
-            status
-        }
+        if self.opt_pipefail { pipefail_status } else { status }
     }
 
     fn expand_word(&mut self, w: &Word) -> String {
@@ -6911,11 +6849,7 @@ impl Shell {
         }
         let max = *self.arrays.get(name)?.keys().next_back()?;
         let resolved = max as i64 + 1 + i;
-        if resolved >= 0 {
-            Some(resolved as usize)
-        } else {
-            None
-        }
+        if resolved >= 0 { Some(resolved as usize) } else { None }
     }
 
     fn array_element(&mut self, name: &str, index: &str) -> String {
@@ -6981,21 +6915,11 @@ impl Shell {
         }
         if self.assoc_names.contains(name) {
             let key = self.expand_index_as_string(index);
-            return self
-                .assoc_arrays
-                .get(name)
-                .and_then(|m| m.get(&key))
-                .map(|s| s.chars().count())
-                .unwrap_or(0);
+            return self.assoc_arrays.get(name).and_then(|m| m.get(&key)).map(|s| s.chars().count()).unwrap_or(0);
         }
         match arith::eval(index, self) {
             Ok(i) => match self.resolve_array_index(name, i) {
-                Some(idx) => self
-                    .arrays
-                    .get(name)
-                    .and_then(|m| m.get(&idx))
-                    .map(|s| s.chars().count())
-                    .unwrap_or(0),
+                Some(idx) => self.arrays.get(name).and_then(|m| m.get(&idx)).map(|s| s.chars().count()).unwrap_or(0),
                 None => 0,
             },
             Err(_) => 0,
@@ -7073,9 +6997,7 @@ impl Shell {
             }
         }
         let mut next_index: usize = match mode {
-            AssignMode::Append if !is_assoc => {
-                self.arrays.get(name).and_then(|m| m.keys().next_back()).map(|k| k + 1).unwrap_or(0)
-            }
+            AssignMode::Append if !is_assoc => self.arrays.get(name).and_then(|m| m.keys().next_back()).map(|k| k + 1).unwrap_or(0),
             _ => 0,
         };
         for item in items {
@@ -7321,11 +7243,7 @@ impl Shell {
     }
 
     fn get_ifs(&mut self) -> String {
-        if self.var_is_set("IFS") {
-            self.lookup_var("IFS")
-        } else {
-            " \t\n".to_string()
-        }
+        if self.var_is_set("IFS") { self.lookup_var("IFS") } else { " \t\n".to_string() }
     }
 
     // Re-lexes and expands a captured raw operand (the "word"/"pattern"
@@ -7344,11 +7262,7 @@ impl Shell {
             VarOp::Length => cur.chars().count().to_string(),
             VarOp::Default { word, colon } => {
                 let trigger = if *colon { cur.is_empty() } else { !self.var_is_set(name) };
-                if trigger {
-                    self.expand_raw(word)
-                } else {
-                    cur
-                }
+                if trigger { self.expand_raw(word) } else { cur }
             }
             VarOp::AssignDefault { word, colon } => {
                 let trigger = if *colon { cur.is_empty() } else { !self.var_is_set(name) };
@@ -7379,11 +7293,7 @@ impl Shell {
             }
             VarOp::AltIfSet { word, colon } => {
                 let set_enough = if *colon { !cur.is_empty() } else { self.var_is_set(name) };
-                if set_enough {
-                    self.expand_raw(word)
-                } else {
-                    String::new()
-                }
+                if set_enough { self.expand_raw(word) } else { String::new() }
             }
             VarOp::RemovePrefix { pattern, longest } => {
                 let pattern = self.expand_raw(pattern);
@@ -7412,9 +7322,7 @@ impl Shell {
                 TransformKind::AttributeFlags => self.attribute_flags_string(name),
                 TransformKind::KeyValue => apply_transform(&cur, TransformKind::Quote),
                 TransformKind::Prompt => self.expand_prompt_string(&cur),
-                TransformKind::Quote | TransformKind::Upper | TransformKind::Lower | TransformKind::Escape => {
-                    apply_transform(&cur, *kind)
-                }
+                TransformKind::Quote | TransformKind::Upper | TransformKind::Lower | TransformKind::Escape => apply_transform(&cur, *kind),
             },
         }
     }
@@ -7444,9 +7352,9 @@ impl Shell {
             // `${@:...}` / `${*:...}` -- `$0` first, which is why
             // `${@:0}` names the script and `${@:1}` is the first
             // argument.
-            None if name == "@" || name == "*" => std::iter::once(self.script_name.clone())
-                .chain(self.arg_frames.last().cloned().unwrap_or_default())
-                .collect(),
+            None if name == "@" || name == "*" => {
+                std::iter::once(self.script_name.clone()).chain(self.arg_frames.last().cloned().unwrap_or_default()).collect()
+            }
             None => return None,
         };
         let offset = match arith::eval(offset, self) {
@@ -7499,11 +7407,7 @@ impl Shell {
             VarOp::Length => cur.chars().count().to_string(),
             VarOp::Default { word, colon } => {
                 let trigger = if *colon { cur.is_empty() } else { !self.array_element_is_set(name, index) };
-                if trigger {
-                    self.expand_raw(word)
-                } else {
-                    cur
-                }
+                if trigger { self.expand_raw(word) } else { cur }
             }
             VarOp::AssignDefault { word, colon } => {
                 let trigger = if *colon { cur.is_empty() } else { !self.array_element_is_set(name, index) };
@@ -7533,11 +7437,7 @@ impl Shell {
             }
             VarOp::AltIfSet { word, colon } => {
                 let set_enough = if *colon { !cur.is_empty() } else { self.array_element_is_set(name, index) };
-                if set_enough {
-                    self.expand_raw(word)
-                } else {
-                    String::new()
-                }
+                if set_enough { self.expand_raw(word) } else { String::new() }
             }
             VarOp::RemovePrefix { pattern, longest } => {
                 let pattern = self.expand_raw(pattern);
@@ -7568,11 +7468,7 @@ impl Shell {
                     // own -a/-A attribute flag but only that one
                     // element's value -- both confirmed against real
                     // bash (see transform_attributes's own doc comment).
-                    if index == "@" || index == "*" {
-                        self.transform_attributes(name, None)
-                    } else {
-                        self.transform_attributes(name, Some(&cur))
-                    }
+                    if index == "@" || index == "*" { self.transform_attributes(name, None) } else { self.transform_attributes(name, Some(&cur)) }
                 }
                 TransformKind::AttributeFlags => self.attribute_flags_string(name),
                 TransformKind::KeyValue => {
@@ -7583,9 +7479,7 @@ impl Shell {
                     }
                 }
                 TransformKind::Prompt => self.expand_prompt_string(&cur),
-                TransformKind::Quote | TransformKind::Upper | TransformKind::Lower | TransformKind::Escape => {
-                    apply_transform(&cur, *kind)
-                }
+                TransformKind::Quote | TransformKind::Upper | TransformKind::Lower | TransformKind::Escape => apply_transform(&cur, *kind),
             },
         }
     }
@@ -7622,11 +7516,7 @@ impl Shell {
     // on the very next word, and reading two booleans is nothing next
     // to the `read_dir` that follows.
     fn glob_options(&self) -> glob::Options {
-        glob::Options {
-            dotglob: self.shopt_is_on("dotglob"),
-            nocaseglob: self.shopt_is_on("nocaseglob"),
-            globstar: self.shopt_is_on("globstar"),
-        }
+        glob::Options { dotglob: self.shopt_is_on("dotglob"), nocaseglob: self.shopt_is_on("nocaseglob"), globstar: self.shopt_is_on("globstar") }
     }
 
     // A pattern that matched nothing. bash's default is to leave the
@@ -7800,10 +7690,7 @@ impl Shell {
             }
             _ if !name.is_empty() && name.chars().all(|c| c.is_ascii_digit()) => {
                 let idx: usize = name.parse().unwrap_or(0);
-                idx.checked_sub(1)
-                    .and_then(|i| self.arg_frames.last().and_then(|a| a.get(i)))
-                    .cloned()
-                    .unwrap_or_default()
+                idx.checked_sub(1).and_then(|i| self.arg_frames.last().and_then(|a| a.get(i))).cloned().unwrap_or_default()
             }
             _ => {
                 for scope in self.var_scopes.iter().rev() {
@@ -8115,8 +8002,7 @@ impl Shell {
         // `declare -i`/`local -i`: the assigned text is evaluated as an
         // arithmetic expression rather than stored literally (bash: `n="2+3"`
         // on an integer-attribute variable stores 5, not the string "2+3").
-        let value =
-            if self.integer_names.contains(name) { arith::eval(&value, self).unwrap_or(0).to_string() } else { value };
+        let value = if self.integer_names.contains(name) { arith::eval(&value, self).unwrap_or(0).to_string() } else { value };
         // `declare -u`/`-l`: case-fold on every assignment.
         let value = if self.upper_names.contains(name) {
             value.to_uppercase()
@@ -8240,9 +8126,7 @@ impl Shell {
         }
         let resolve = |t: &Option<Target>| -> Result<Option<Rc<RefCell<std::fs::File>>>, String> {
             match t {
-                Some(Target::Path(p, append, clobber)) => {
-                    Ok(Some(Rc::new(RefCell::new(self.open_out(p, *append, *clobber)?))))
-                }
+                Some(Target::Path(p, append, clobber)) => Ok(Some(Rc::new(RefCell::new(self.open_out(p, *append, *clobber)?)))),
                 Some(Target::Fd(fd)) => Ok(dup_existing_fd(*fd).map(|f| Rc::new(RefCell::new(f)))),
                 None => Ok(None),
             }
@@ -9192,7 +9076,11 @@ mod time_format_tests {
     #[test]
     fn dash_p_is_posixs() {
         assert_eq!(formatted(TimeStyle::Posix, None, 1.5, 0.25, 0.0), "real 1.50\nuser 0.25\nsys 0.00\n");
-        assert_eq!(formatted(TimeStyle::Posix, Some("ignored"), 1.0, 0.0, 0.0), "real 1.00\nuser 0.00\nsys 0.00\n", "TIMEFORMAT is not consulted for -p");
+        assert_eq!(
+            formatted(TimeStyle::Posix, Some("ignored"), 1.0, 0.0, 0.0),
+            "real 1.00\nuser 0.00\nsys 0.00\n",
+            "TIMEFORMAT is not consulted for -p"
+        );
     }
 
     #[test]
@@ -9317,12 +9205,13 @@ mod quoting_round_trip_tests {
     // which is the only way to hand it a control character without
     // needing the very quoting under test.
     fn nasty() -> Vec<String> {
-        let mut out: Vec<String> = ["", "abc", "a b", "a'b", "a\"b", "a$b", "a\\b", "a`b", "#abc", "~abc",
-            "a#b", "a~b", "a,b", "a^b", "a{b}c", "a[b]c", "a(b)c", "a?b", "a*b", "a;b", "a|b", "a&b",
-            "a<b>c", "a!b", "a=b", "a.b", "a/b", "a:b", "a@b", "a+b", "a%b", "a-b", "a_b", "123", "~", "#"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
+        let mut out: Vec<String> = [
+            "", "abc", "a b", "a'b", "a\"b", "a$b", "a\\b", "a`b", "#abc", "~abc", "a#b", "a~b", "a,b", "a^b", "a{b}c", "a[b]c", "a(b)c", "a?b",
+            "a*b", "a;b", "a|b", "a&b", "a<b>c", "a!b", "a=b", "a.b", "a/b", "a:b", "a@b", "a+b", "a%b", "a-b", "a_b", "123", "~", "#",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
         // Every control character, and a few that need real bytes.
         for code in 1u8..0x20 {
             out.push(format!("x{}y", code as char));
@@ -9391,22 +9280,17 @@ mod printf_conversion_tests {
     // tests skip.
     fn cases() -> Vec<(String, String)> {
         let specs = [
-            "%f", "%.0f", "%.2f", "%8.3f", "%-8.3f", "%05.2f", "%08.3f", "%+f", "% f", "%012.4f",
-            "%e", "%E", "%.0e", "%.2e", "%012.1e", "%+.3e", "%08.0E",
-            "%g", "%G", "%.1g", "%.3g", "%.10g", "%+08.0g", "%012g",
-            "%d", "%i", "%5d", "%-5d", "%05d", "%+d", "% d", "%.5d", "%.0d", "%5.0d", "%08.5d", "%-8.5d",
-            "%u", "%.5u", "%x", "%X", "%.3x", "%08x", "%o", "%.5o", "%12.4X",
-            "%s", "%.3s", "%8.3s", "%-8.3s", "%c", "%b", "%.3b", "%q", "%.3q", "%8q",
+            "%f", "%.0f", "%.2f", "%8.3f", "%-8.3f", "%05.2f", "%08.3f", "%+f", "% f", "%012.4f", "%e", "%E", "%.0e", "%.2e", "%012.1e", "%+.3e",
+            "%08.0E", "%g", "%G", "%.1g", "%.3g", "%.10g", "%+08.0g", "%012g", "%d", "%i", "%5d", "%-5d", "%05d", "%+d", "% d", "%.5d", "%.0d",
+            "%5.0d", "%08.5d", "%-8.5d", "%u", "%.5u", "%x", "%X", "%.3x", "%08x", "%o", "%.5o", "%12.4X", "%s", "%.3s", "%8.3s", "%-8.3s", "%c",
+            "%b", "%.3b", "%q", "%.3q", "%8q",
         ];
         let values = [
-            "0", "1", "-1", "2.5", "3.5", "-0.5", "3.14159", "-3.14159", "1e3", "1e-3", "1e20",
-            "0.0001", "0.00001", "999999", "999999.5", "100000", "1000000", "0x10", "-0x10",
-            "31415.9", "0.000123", "inf", "-inf", "nan", "abc", "",
-            "42", "-42", "010", "0XfF", "'A", "+5", " 7 ", "3.9", "-3.9", "12 34", "3.9abc", ".5", "1.",
-            "255", "-255", "abcdef",
-            "a b", "a'b", "a\"b", "a$b", "a\\b", "a`b", "a*b", "a;b", "a|b", "a&b", "a<b", "a>b",
-            "a#b", "#abc", "abc#", "a~b", "~abc", "a!b", "a,b", "a^b", "a{b", "a[b", "a(b", "a?b",
-            "a=b", "a.b", "a-b", "a_b", "a/b", "a:b", "a@b", "a+b", "a%b", "~", "#",
+            "0", "1", "-1", "2.5", "3.5", "-0.5", "3.14159", "-3.14159", "1e3", "1e-3", "1e20", "0.0001", "0.00001", "999999", "999999.5", "100000",
+            "1000000", "0x10", "-0x10", "31415.9", "0.000123", "inf", "-inf", "nan", "abc", "", "42", "-42", "010", "0XfF", "'A", "+5", " 7 ", "3.9",
+            "-3.9", "12 34", "3.9abc", ".5", "1.", "255", "-255", "abcdef", "a b", "a'b", "a\"b", "a$b", "a\\b", "a`b", "a*b", "a;b", "a|b", "a&b",
+            "a<b", "a>b", "a#b", "#abc", "abc#", "a~b", "~abc", "a!b", "a,b", "a^b", "a{b", "a[b", "a(b", "a?b", "a=b", "a.b", "a-b", "a_b", "a/b",
+            "a:b", "a@b", "a+b", "a%b", "~", "#",
         ];
         specs.iter().flat_map(|s| values.iter().map(move |v| (s.to_string(), v.to_string()))).collect()
     }
@@ -9440,7 +9324,7 @@ mod printf_conversion_tests {
         for ((spec, value), expected) in cases.iter().zip(&want) {
             let mut got = String::new();
             let mut idx = 0;
-                let _ = super::printf_format_once(spec, std::slice::from_ref(value), &mut idx, &mut got);
+            let _ = super::printf_format_once(spec, std::slice::from_ref(value), &mut idx, &mut got);
             assert_eq!(&got, expected, "printf '{spec}' '{value}'");
         }
     }
@@ -9472,8 +9356,7 @@ fn printf_number_complete(arg: &str, float: bool) -> bool {
     }
     let rest = text.strip_prefix(['-', '+']).unwrap_or(text);
     if float {
-        if rest.eq_ignore_ascii_case("inf") || rest.eq_ignore_ascii_case("infinity") || rest.eq_ignore_ascii_case("nan")
-        {
+        if rest.eq_ignore_ascii_case("inf") || rest.eq_ignore_ascii_case("infinity") || rest.eq_ignore_ascii_case("nan") {
             return true;
         }
         if let Some(hex) = rest.strip_prefix("0x").or_else(|| rest.strip_prefix("0X")) {
@@ -9754,12 +9637,7 @@ pub(crate) struct PrintfOutcome {
 // script writing it means.
 const PRINTF_LENGTH_MODIFIERS: &str = "hlLjzt";
 
-pub(crate) fn printf_format_once(
-    format: &str,
-    values: &[String],
-    idx: &mut usize,
-    out: &mut String,
-) -> PrintfOutcome {
+pub(crate) fn printf_format_once(format: &str, values: &[String], idx: &mut usize, out: &mut String) -> PrintfOutcome {
     // Assembled as bytes and decoded once at the end, because `\303\244`
     // has to mean the two bytes of `ä` rather than two Latin-1
     // characters -- the same reason `$'...'` is built this way.
@@ -10430,8 +10308,7 @@ fn is_parameter_name(name: &str) -> bool {
         return !name.is_empty();
     }
     let mut chars = name.chars();
-    matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
-        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+    matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_') && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 pub(crate) fn signal_number(name: &str) -> Option<i32> {
@@ -10727,11 +10604,7 @@ fn apply_fds_to_self(dup_stderr_to_stdout: bool, extra_fds: Vec<ExtraFd>) -> Res
 // forget-on-self-dup pattern as apply_fds_to_self, and for the same
 // reasons (no execve immediately follows to bypass Rust's normal Drop
 // glue the way the pre_exec-based spawn path is protected).
-fn apply_fd012_to_self(
-    stdin: Option<std::fs::File>,
-    stdout: Option<std::fs::File>,
-    stderr: Option<std::fs::File>,
-) -> Result<(), String> {
+fn apply_fd012_to_self(stdin: Option<std::fs::File>, stdout: Option<std::fs::File>, stderr: Option<std::fs::File>) -> Result<(), String> {
     unsafe extern "C" {
         fn dup2(oldfd: i32, newfd: i32) -> i32;
     }
@@ -10950,10 +10823,7 @@ pub(crate) fn os_message(e: &std::io::Error) -> String {
 }
 
 fn dev_socket_file(path: &str) -> Option<Result<std::fs::File, String>> {
-    let (proto, rest) = path
-        .strip_prefix("/dev/tcp/")
-        .map(|r| ("tcp", r))
-        .or_else(|| path.strip_prefix("/dev/udp/").map(|r| ("udp", r)))?;
+    let (proto, rest) = path.strip_prefix("/dev/tcp/").map(|r| ("tcp", r)).or_else(|| path.strip_prefix("/dev/udp/").map(|r| ("udp", r)))?;
     let (host, port) = rest.split_once('/')?;
     if host.is_empty() || port.is_empty() {
         return None;
@@ -12058,7 +11928,6 @@ pub(crate) fn resolve_in_path(name: &str) -> Option<String> {
     None
 }
 
-
 pub(crate) fn command_own_redirects(cmd: &parser::Command) -> &[Redirect] {
     match cmd {
         parser::Command::If { redirects, .. } => redirects,
@@ -12173,11 +12042,8 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let lib = dir.join("lib.sh");
         let main = dir.join("main.sh");
-        std::fs::write(
-            &lib,
-            "inner() {\n  n=\"${FUNCNAME[*]}\"\n  s=\"${BASH_SOURCE[*]}\"\n  l=\"${BASH_LINENO[*]}\"\n}\nouter() {\n  inner\n}\n",
-        )
-        .unwrap();
+        std::fs::write(&lib, "inner() {\n  n=\"${FUNCNAME[*]}\"\n  s=\"${BASH_SOURCE[*]}\"\n  l=\"${BASH_LINENO[*]}\"\n}\nouter() {\n  inner\n}\n")
+            .unwrap();
         std::fs::write(&main, format!("source {}\nouter\ntop=\"${{FUNCNAME[*]}}\"\n", lib.display())).unwrap();
 
         let mut sh = Shell::new();
@@ -12205,11 +12071,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("bish-caller-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let script = dir.join("c.sh");
-        std::fs::write(
-            &script,
-            "a() {\n  r0=$(caller 0)\n  r1=$(caller 1)\n  r2=$(caller 2)\n  rb=$(caller)\n}\nb() {\n  a\n}\nb\n",
-        )
-        .unwrap();
+        std::fs::write(&script, "a() {\n  r0=$(caller 0)\n  r1=$(caller 1)\n  r2=$(caller 2)\n  rb=$(caller)\n}\nb() {\n  a\n}\nb\n").unwrap();
         let mut sh = Shell::new();
         let src = script.display().to_string();
         // Run as a script rather than via `source`: `caller` reports the
@@ -12411,11 +12273,7 @@ mod tests {
         // The part that was broken: after the session restores its own
         // remembered environment, `cd -` still has somewhere to go.
         shell.sync_real_state_in();
-        assert_eq!(
-            std::env::var("OLDPWD").as_deref(),
-            Ok(root_real.to_string_lossy().as_ref()),
-            "OLDPWD must survive the snapshot being reapplied"
-        );
+        assert_eq!(std::env::var("OLDPWD").as_deref(), Ok(root_real.to_string_lossy().as_ref()), "OLDPWD must survive the snapshot being reapplied");
         assert_eq!(std::env::var("PWD").as_deref(), Ok(inner_real.to_string_lossy().as_ref()));
 
         std::env::set_current_dir(&original).unwrap();
@@ -12891,7 +12749,11 @@ mod tests {
         // -q/--quiet only changes whether get *prints* -- the exit status
         // (what shopt -q itself is for) is identical to the bare get's.
         assert_eq!(crate::builtins::bish::run_bishopt(&mut shell, &strs(&["-q", "verbose"]), &test_bishopts()), 1);
-        assert_eq!(crate::builtins::bish::run_bishopt(&mut shell, &strs(&["--quiet", "greeting"]), &test_bishopts()), 0, "a Str's mere existence is enough under -q");
+        assert_eq!(
+            crate::builtins::bish::run_bishopt(&mut shell, &strs(&["--quiet", "greeting"]), &test_bishopts()),
+            0,
+            "a Str's mere existence is enough under -q"
+        );
         crate::builtins::bish::run_bishopt(&mut shell, &strs(&["--set", "verbose"]), &test_bishopts());
         assert_eq!(crate::builtins::bish::run_bishopt(&mut shell, &strs(&["-q", "verbose"]), &test_bishopts()), 0);
     }
@@ -12933,13 +12795,19 @@ mod tests {
         assert_eq!(crate::builtins::bish::run_bishopt(&mut shell, &strs(&["--unset", "accent"]), &test_bishopts()), 0);
         assert_eq!(shell.bishopt_value(&test_bishopts(), "verbose"), Some(BishOptValue::Bool(false)));
         assert_eq!(shell.bishopt_value(&test_bishopts(), "greeting"), Some(BishOptValue::Str("hi".to_string())));
-        assert_eq!(shell.bishopt_value(&test_bishopts(), "accent"), Some(BishOptValue::Color("red".to_string(), vec![crate::csscolor::TermColor::Rgba(crate::csscolor::Rgba::new(255, 0, 0, 255))])));
+        assert_eq!(
+            shell.bishopt_value(&test_bishopts(), "accent"),
+            Some(BishOptValue::Color("red".to_string(), vec![crate::csscolor::TermColor::Rgba(crate::csscolor::Rgba::new(255, 0, 0, 255))]))
+        );
     }
 
     #[test]
     fn bishopt_get_on_a_color_prints_the_original_text_not_a_re_serialization() {
         let mut shell = Shell::new();
-        assert_eq!(shell.bishopt_value(&test_bishopts(), "accent"), Some(BishOptValue::Color("red".to_string(), vec![crate::csscolor::TermColor::Rgba(crate::csscolor::Rgba::new(255, 0, 0, 255))])));
+        assert_eq!(
+            shell.bishopt_value(&test_bishopts(), "accent"),
+            Some(BishOptValue::Color("red".to_string(), vec![crate::csscolor::TermColor::Rgba(crate::csscolor::Rgba::new(255, 0, 0, 255))]))
+        );
 
         let buf = Rc::new(RefCell::new(String::new()));
         shell.set_sink_capture(buf.clone());
@@ -12951,22 +12819,35 @@ mod tests {
         assert_eq!(crate::builtins::bish::run_bishopt(&mut shell, &strs(&["accent"]), &test_bishopts()), 0);
         assert_eq!(buf.borrow().as_str(), "cornflowerblue\n", "must echo back what --set was actually given, not \"#6495ed\"");
 
-        assert_eq!(crate::builtins::bish::run_bishopt(&mut shell, &strs(&["-q", "accent"]), &test_bishopts()), 0, "no boolean meaning, but must not error");
+        assert_eq!(
+            crate::builtins::bish::run_bishopt(&mut shell, &strs(&["-q", "accent"]), &test_bishopts()),
+            0,
+            "no boolean meaning, but must not error"
+        );
     }
 
     #[test]
     fn bishopt_set_accepts_any_valid_css_color_syntax_including_color_mix() {
         let mut shell = Shell::new();
         assert_eq!(crate::builtins::bish::run_bishopt(&mut shell, &strs(&["--set", "accent", "#00ff00"]), &test_bishopts()), 0);
-        assert_eq!(shell.bishopt_value(&test_bishopts(), "accent"), Some(BishOptValue::Color("#00ff00".to_string(), vec![crate::csscolor::TermColor::Rgba(crate::csscolor::Rgba::new(0, 255, 0, 255))])));
+        assert_eq!(
+            shell.bishopt_value(&test_bishopts(), "accent"),
+            Some(BishOptValue::Color("#00ff00".to_string(), vec![crate::csscolor::TermColor::Rgba(crate::csscolor::Rgba::new(0, 255, 0, 255))]))
+        );
 
         assert_eq!(crate::builtins::bish::run_bishopt(&mut shell, &strs(&["--set", "accent", "rgb(0 0 255)"]), &test_bishopts()), 0);
-        assert_eq!(shell.bishopt_value(&test_bishopts(), "accent"), Some(BishOptValue::Color("rgb(0 0 255)".to_string(), vec![crate::csscolor::TermColor::Rgba(crate::csscolor::Rgba::new(0, 0, 255, 255))])));
+        assert_eq!(
+            shell.bishopt_value(&test_bishopts(), "accent"),
+            Some(BishOptValue::Color("rgb(0 0 255)".to_string(), vec![crate::csscolor::TermColor::Rgba(crate::csscolor::Rgba::new(0, 0, 255, 255))]))
+        );
 
         assert_eq!(crate::builtins::bish::run_bishopt(&mut shell, &strs(&["--set", "accent", "color-mix(in srgb, red, blue)"]), &test_bishopts()), 0);
         assert_eq!(
             shell.bishopt_value(&test_bishopts(), "accent"),
-            Some(BishOptValue::Color("color-mix(in srgb, red, blue)".to_string(), vec![crate::csscolor::TermColor::Rgba(crate::csscolor::Rgba::new(128, 0, 128, 255))]))
+            Some(BishOptValue::Color(
+                "color-mix(in srgb, red, blue)".to_string(),
+                vec![crate::csscolor::TermColor::Rgba(crate::csscolor::Rgba::new(128, 0, 128, 255))]
+            ))
         );
     }
 
@@ -13017,10 +12898,16 @@ mod tests {
         // Neither "theme" nor "accent" was actually applied live -- both
         // still read as whatever they were before the declaration.
         assert_eq!(shell.bishopt_value(KNOWN_BISHOPTS, "theme"), Some(BishOptValue::Str(String::new())));
-        assert_eq!(shell.bishopt_value(&test_bishopts(), "accent"), Some(BishOptValue::Color("red".to_string(), vec![crate::csscolor::TermColor::Rgba(crate::csscolor::Rgba::new(255, 0, 0, 255))])));
+        assert_eq!(
+            shell.bishopt_value(&test_bishopts(), "accent"),
+            Some(BishOptValue::Color("red".to_string(), vec![crate::csscolor::TermColor::Rgba(crate::csscolor::Rgba::new(255, 0, 0, 255))]))
+        );
         // But the theme itself was registered, "theme" entry excluded.
         let dark = shell.themes.get("dark").expect("theme must be registered");
-        assert_eq!(dark.opts.get("accent"), Some(&BishOptValue::Color("blue".to_string(), vec![crate::csscolor::TermColor::Rgba(crate::csscolor::Rgba::new(0, 0, 255, 255))])));
+        assert_eq!(
+            dark.opts.get("accent"),
+            Some(&BishOptValue::Color("blue".to_string(), vec![crate::csscolor::TermColor::Rgba(crate::csscolor::Rgba::new(0, 0, 255, 255))]))
+        );
         assert!(!dark.opts.contains_key("theme"), "a theme's own opts must not include a self-referential \"theme\" entry");
     }
 
@@ -13031,7 +12918,11 @@ mod tests {
         crate::builtins::bish::run_bishopt(&mut shell, &strs(&["--set", "accent", "blue"]), &test_bishopts());
         assert_eq!(crate::builtins::bish::run_bish(&mut shell, &strs(&["theme", "end"])).status(), 0);
         assert!(shell.themes.is_empty(), "no name was ever declared, so nothing should be registered");
-        assert_eq!(shell.bishopt_value(&test_bishopts(), "accent"), Some(BishOptValue::Color("red".to_string(), vec![crate::csscolor::TermColor::Rgba(crate::csscolor::Rgba::new(255, 0, 0, 255))])), "still not applied live either");
+        assert_eq!(
+            shell.bishopt_value(&test_bishopts(), "accent"),
+            Some(BishOptValue::Color("red".to_string(), vec![crate::csscolor::TermColor::Rgba(crate::csscolor::Rgba::new(255, 0, 0, 255))])),
+            "still not applied live either"
+        );
     }
 
     #[test]
@@ -13043,23 +12934,36 @@ mod tests {
         crate::builtins::bish::run_bish(&mut shell, &strs(&["theme", "end"])).status();
 
         // Registering "dark" doesn't activate it by itself.
-        assert_eq!(shell.bishopt_value(&test_bishopts(), "accent"), Some(BishOptValue::Color("red".to_string(), vec![crate::csscolor::TermColor::Rgba(crate::csscolor::Rgba::new(255, 0, 0, 255))])));
+        assert_eq!(
+            shell.bishopt_value(&test_bishopts(), "accent"),
+            Some(BishOptValue::Color("red".to_string(), vec![crate::csscolor::TermColor::Rgba(crate::csscolor::Rgba::new(255, 0, 0, 255))]))
+        );
 
         // Activating it (an ordinary set, outside any declaration) makes
         // its opts the new fallback wherever nothing else was set.
         assert_eq!(crate::builtins::bish::run_bishopt(&mut shell, &strs(&["--set", "theme", "dark"]), KNOWN_BISHOPTS), 0);
-        assert_eq!(shell.bishopt_value(&test_bishopts(), "accent"), Some(BishOptValue::Color("blue".to_string(), vec![crate::csscolor::TermColor::Rgba(crate::csscolor::Rgba::new(0, 0, 255, 255))])));
+        assert_eq!(
+            shell.bishopt_value(&test_bishopts(), "accent"),
+            Some(BishOptValue::Color("blue".to_string(), vec![crate::csscolor::TermColor::Rgba(crate::csscolor::Rgba::new(0, 0, 255, 255))]))
+        );
 
         // An explicit override still wins over the active theme.
         crate::builtins::bish::run_bishopt(&mut shell, &strs(&["--set", "accent", "green"]), &test_bishopts());
-        assert_eq!(shell.bishopt_value(&test_bishopts(), "accent"), Some(BishOptValue::Color("green".to_string(), vec![crate::csscolor::TermColor::Rgba(crate::csscolor::Rgba::new(0, 128, 0, 255))])));
+        assert_eq!(
+            shell.bishopt_value(&test_bishopts(), "accent"),
+            Some(BishOptValue::Color("green".to_string(), vec![crate::csscolor::TermColor::Rgba(crate::csscolor::Rgba::new(0, 128, 0, 255))]))
+        );
     }
 
     #[test]
     fn bish_theme_begin_refuses_to_nest() {
         let mut shell = Shell::new();
         assert_eq!(crate::builtins::bish::run_bish(&mut shell, &strs(&["theme", "begin"])).status(), 0);
-        assert_eq!(crate::builtins::bish::run_bish(&mut shell, &strs(&["theme", "begin"])).status(), 1, "a second begin while one is already in progress must be refused");
+        assert_eq!(
+            crate::builtins::bish::run_bish(&mut shell, &strs(&["theme", "begin"])).status(),
+            1,
+            "a second begin while one is already in progress must be refused"
+        );
         // The original declaration must still be intact -- a set right
         // after the refused nested begin still lands in it.
         crate::builtins::bish::run_bishopt(&mut shell, &strs(&["--set", "theme", "t"]), KNOWN_BISHOPTS);
@@ -13080,7 +12984,11 @@ mod tests {
         crate::builtins::bish::run_bish(&mut shell, &strs(&["theme", "begin"])).status();
         assert_eq!(crate::builtins::bish::run_bishopt(&mut shell, &strs(&["--unset", "accent"]), &test_bishopts()), 0);
         crate::builtins::bish::run_bish(&mut shell, &strs(&["theme", "end"])).status();
-        assert_eq!(shell.bishopt_value(&test_bishopts(), "accent"), Some(BishOptValue::Color("red".to_string(), vec![crate::csscolor::TermColor::Rgba(crate::csscolor::Rgba::new(255, 0, 0, 255))])), "--unset must not have been diverted into the pending theme");
+        assert_eq!(
+            shell.bishopt_value(&test_bishopts(), "accent"),
+            Some(BishOptValue::Color("red".to_string(), vec![crate::csscolor::TermColor::Rgba(crate::csscolor::Rgba::new(255, 0, 0, 255))])),
+            "--unset must not have been diverted into the pending theme"
+        );
     }
 
     #[test]
@@ -13195,7 +13103,10 @@ mod tests {
     fn bishopt_color_accepts_a_vendor_ansi_reference_and_reads_it_back_verbatim() {
         let mut shell = Shell::new();
         assert_eq!(crate::builtins::bish::run_bishopt(&mut shell, &strs(&["--set", "accent", "-bish-bright-red"]), &test_bishopts()), 0);
-        assert_eq!(shell.bishopt_value(&test_bishopts(), "accent"), Some(BishOptValue::Color("-bish-bright-red".to_string(), vec![crate::csscolor::TermColor::Ansi(9)])));
+        assert_eq!(
+            shell.bishopt_value(&test_bishopts(), "accent"),
+            Some(BishOptValue::Color("-bish-bright-red".to_string(), vec![crate::csscolor::TermColor::Ansi(9)]))
+        );
 
         let buf = Rc::new(RefCell::new(String::new()));
         shell.set_sink_capture(buf.clone());
@@ -13206,13 +13117,19 @@ mod tests {
     #[test]
     fn bishopt_set_rejects_a_vendor_color_used_inside_color_mix() {
         let mut shell = Shell::new();
-        assert_eq!(crate::builtins::bish::run_bishopt(&mut shell, &strs(&["--set", "accent", "color-mix(in srgb, -bish-red, blue)"]), &test_bishopts()), 2);
+        assert_eq!(
+            crate::builtins::bish::run_bishopt(&mut shell, &strs(&["--set", "accent", "color-mix(in srgb, -bish-red, blue)"]), &test_bishopts()),
+            2
+        );
     }
 
     #[test]
     fn bishopt_set_accepts_a_font_family_style_fallback_list() {
         let mut shell = Shell::new();
-        assert_eq!(crate::builtins::bish::run_bishopt(&mut shell, &strs(&["--set", "accent", "#ff0000, -bish-ansi(1), -bish-red"]), &test_bishopts()), 0);
+        assert_eq!(
+            crate::builtins::bish::run_bishopt(&mut shell, &strs(&["--set", "accent", "#ff0000, -bish-ansi(1), -bish-red"]), &test_bishopts()),
+            0
+        );
         assert_eq!(
             shell.bishopt_value(&test_bishopts(), "accent"),
             Some(BishOptValue::Color(
@@ -13389,7 +13306,11 @@ mod tests {
         assert_eq!(crate::builtins::completion::run_compgen(&mut shell, &strs(&["-A", "bogus"])), 2);
         assert_eq!(crate::builtins::completion::run_compgen(&mut shell, &strs(&["-Z"])), 2);
         assert_eq!(crate::builtins::completion::run_compgen(&mut shell, &strs(&["-o", "bogus"])), 2);
-        assert_eq!(crate::builtins::completion::run_compgen(&mut shell, &strs(&["-o", "nosort", "-W", "a"])), 0, "a recognized -o name must not error");
+        assert_eq!(
+            crate::builtins::completion::run_compgen(&mut shell, &strs(&["-o", "nosort", "-W", "a"])),
+            0,
+            "a recognized -o name must not error"
+        );
     }
 
     #[test]
@@ -13410,7 +13331,11 @@ mod tests {
         assert_eq!(buf.borrow().as_str(), "", "must not print when -V is given");
         assert_eq!(shell.arrays.get("myarr").map(|m| m.values().cloned().collect::<Vec<_>>()), Some(vec!["a".to_string()]));
 
-        assert_eq!(crate::builtins::completion::run_compgen(&mut shell, &strs(&["-V", "myarr", "-W", "a b c", "--", "zzz"])), 1, "same had-a-source-and-got-nothing rule applies under -V");
+        assert_eq!(
+            crate::builtins::completion::run_compgen(&mut shell, &strs(&["-V", "myarr", "-W", "a b c", "--", "zzz"])),
+            1,
+            "same had-a-source-and-got-nothing rule applies under -V"
+        );
         assert_eq!(shell.arrays.get("myarr").map(|m| m.len()), Some(0));
     }
 
@@ -14452,10 +14377,7 @@ mod tests {
                 }
             }
         }
-        assert!(
-            missing.is_empty(),
-            "these are dispatched as builtins but missing from KNOWN_BUILTINS, so they break in a pipeline: {missing:?}"
-        );
+        assert!(missing.is_empty(), "these are dispatched as builtins but missing from KNOWN_BUILTINS, so they break in a pipeline: {missing:?}");
     }
 
     #[test]
@@ -14491,7 +14413,13 @@ mod tests {
     #[test]
     fn a_root_command_is_recorded_and_shown_instead_of_the_markers() {
         let mut shell = Shell::new();
-        assert_eq!(crate::builtins::bish::run_lsp(&mut shell, &strs(&["add", "--lang=rust", "--root-cmd", "cargo metadata | json .workspace_root", "rust-analyzer"])), 0);
+        assert_eq!(
+            crate::builtins::bish::run_lsp(
+                &mut shell,
+                &strs(&["add", "--lang=rust", "--root-cmd", "cargo metadata | json .workspace_root", "rust-analyzer"])
+            ),
+            0
+        );
         assert_eq!(shell.lsp_servers[0].root_cmd, "cargo metadata | json .workspace_root");
         // `--root` still has its default, since the command is what
         // gets asked first and the markers are the fallback.
@@ -14514,14 +14442,17 @@ mod tests {
         let mut shell = Shell::new();
         let _out = capture_output(&mut shell);
         assert_eq!(
-            crate::builtins::bish::run_lsp(&mut shell, &strs(&[
-                "add",
-                "--setting",
-                "rust-analyzer.check.command=clippy",
-                "--lang=rust",
-                "--setting=rust-analyzer.cargo.features=[\"all\"]",
-                "rust-analyzer",
-            ])),
+            crate::builtins::bish::run_lsp(
+                &mut shell,
+                &strs(&[
+                    "add",
+                    "--setting",
+                    "rust-analyzer.check.command=clippy",
+                    "--lang=rust",
+                    "--setting=rust-analyzer.cargo.features=[\"all\"]",
+                    "rust-analyzer",
+                ])
+            ),
             0
         );
         let server = &shell.lsp_servers[0];
@@ -14673,10 +14604,7 @@ echo "status=$?""#,
     fn a_handler_that_mistypes_something_does_not_call_itself_forever() {
         let mut shell = Shell::new();
         let out = capture_output(&mut shell);
-        shell.run_source_here(
-            "command_not_found_handle(){ echo H; bish_also_missing; }\nbish_no_such_command\necho \"status=$?\"",
-            "<test>",
-        );
+        shell.run_source_here("command_not_found_handle(){ echo H; bish_also_missing; }\nbish_no_such_command\necho \"status=$?\"", "<test>");
         let seen = out.borrow().clone();
         assert_eq!(seen.matches('H').count(), 1, "the handler ran exactly once: {seen}");
         assert!(seen.contains("status=127"));
@@ -14833,7 +14761,13 @@ echo "status=$?""#,
     #[test]
     fn add_takes_its_flags_in_any_order() {
         let mut shell = Shell::new();
-        assert_eq!(crate::builtins::bish::run_lsp(&mut shell, &strs(&["add", "--apply-edits=always", "--root=Cargo.toml", "--lang=rust", "--root-cmd=cargo x", "ra", "--stdio"])), 0);
+        assert_eq!(
+            crate::builtins::bish::run_lsp(
+                &mut shell,
+                &strs(&["add", "--apply-edits=always", "--root=Cargo.toml", "--lang=rust", "--root-cmd=cargo x", "ra", "--stdio"])
+            ),
+            0
+        );
         let server = &shell.lsp_servers[0];
         assert_eq!(server.lang, "rust");
         assert_eq!(server.root_markers, vec!["Cargo.toml".to_string()]);

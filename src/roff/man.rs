@@ -211,13 +211,7 @@ impl Builder {
                     self.note("this page uses mdoc macros, which this parser renders only roughly");
                 }
                 let get = |i: usize| args.get(i).cloned().unwrap_or_default();
-                self.header = Some(Header {
-                    title: get(0),
-                    section: get(1),
-                    date: get(2),
-                    source: get(3),
-                    manual: get(4),
-                });
+                self.header = Some(Header { title: get(0), section: get(1), date: get(2), source: get(3), manual: get(4) });
             }
             "Dd" | "Os" => self.note("this page uses mdoc macros, which this parser renders only roughly"),
             "SH" | "SS" | "Sh" | "Ss" => {
@@ -377,8 +371,8 @@ impl Builder {
             }
             // Layout requests a terminal at one width has nothing to do
             // with.
-            "ll" | "in" | "ad" | "na" | "ps" | "vs" | "nh" | "hy" | "ce" | "rj" | "fl" | "ns" | "rs" | "bp"
-            | "pl" | "po" | "tl" | "pc" | "nx" | "ex" | "am" | "PU" | "UC" | "DT" | "IX" | "ci" => {}
+            "ll" | "in" | "ad" | "na" | "ps" | "vs" | "nh" | "hy" | "ce" | "rj" | "fl" | "ns" | "rs" | "bp" | "pl" | "po" | "tl" | "pc" | "nx"
+            | "ex" | "am" | "PU" | "UC" | "DT" | "IX" | "ci" => {}
             other => {
                 // An unknown macro's arguments are still text the reader
                 // should see -- dropping them would silently lose
@@ -523,8 +517,8 @@ pub fn to_inlines(text: &str, span: Range<usize>, style: &mut Style, prev: &mut 
             // control string straight to the output device. Real pages
             // use `\X'tty: link ...'` around every option name; those
             // are hyperlinks for a device that can show them, not text.
-            Some('s') | Some('h') | Some('v') | Some('l') | Some('L') | Some('D') | Some('o') | Some('w')
-            | Some('z') | Some('k') | Some('x') | Some('X') | Some('Y') | Some('n') | Some('*') => {}
+            Some('s') | Some('h') | Some('v') | Some('l') | Some('L') | Some('D') | Some('o') | Some('w') | Some('z') | Some('k') | Some('x')
+            | Some('X') | Some('Y') | Some('n') | Some('*') => {}
             Some(&c) => buf.push(c),
             None => {}
         }

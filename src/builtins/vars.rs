@@ -4,9 +4,9 @@
 // Free functions taking `&mut Shell` -- see `builtins/mod.rs`.
 
 use crate::arith;
+use crate::exec::{Shell, sh_eprintln, write_diagnostic};
 use crate::parser::ArrayLiteralItem;
 use crate::parser::AssignMode;
-use crate::exec::{sh_eprintln, write_diagnostic, Shell};
 
 // unset [-f|-v] NAME... Also accepts `arr[i]` to remove one element
 // without touching the rest of the array. `stderr_target` mirrors real
@@ -102,16 +102,10 @@ fn is_valid_declare_target(word: &str) -> bool {
         None => name,
     };
     let mut chars = name.chars();
-    matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
-        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+    matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_') && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
-pub(crate) fn run_declare(
-    sh: &mut Shell,
-    who: &str,
-    args: &[String],
-    array_literals: &[(usize, String, AssignMode, Vec<ArrayLiteralItem>)],
-) -> i32 {
+pub(crate) fn run_declare(sh: &mut Shell, who: &str, args: &[String], array_literals: &[(usize, String, AssignMode, Vec<ArrayLiteralItem>)]) -> i32 {
     if args.iter().any(|a| a == "-f" || a == "-F") {
         let names_only = args.iter().any(|a| a == "-F");
         let names: Vec<String> = args.iter().filter(|a| !a.starts_with('-')).cloned().collect();
@@ -297,7 +291,11 @@ pub(crate) fn run_declare(
                     // case since it only fires for a name with no
                     // value at all yet.
                     let cur = sh.lookup_var(&name);
-                    if global_flag { sh.assign_var_global(&name, cur) } else { sh.assign_var(&name, cur) };
+                    if global_flag {
+                        sh.assign_var_global(&name, cur)
+                    } else {
+                        sh.assign_var(&name, cur)
+                    };
                 } else if sh.lookup_var(&name).is_empty() && std::env::var(&name).is_err() {
                     if global_flag {
                         sh.assign_var_global(&name, String::new());
@@ -313,4 +311,3 @@ pub(crate) fn run_declare(
     }
     status
 }
-

@@ -223,10 +223,7 @@ fn archive_bytes(path: &Path) -> Result<Vec<u8>, String> {
 pub fn read_member(path: &Path, name: &str) -> Result<Vec<u8>, String> {
     let data = archive_bytes(path)?;
     let members = members_of(&data)?;
-    let member = members
-        .iter()
-        .find(|m| m.name.trim_end_matches('/') == name.trim_matches('/'))
-        .ok_or_else(|| format!("no such member: {name}"))?;
+    let member = members.iter().find(|m| m.name.trim_end_matches('/') == name.trim_matches('/')).ok_or_else(|| format!("no such member: {name}"))?;
     extract(&data, member)
 }
 

@@ -261,8 +261,7 @@ pub fn matches(pattern: &str, path: &str) -> bool {
         // Unanchored: try the whole path and every suffix that starts
         // after a `/`, which is what "at any depth" comes to.
         let bytes = path.as_bytes();
-        match_here(pat, bytes)
-            || bytes.iter().enumerate().any(|(i, b)| *b == b'/' && match_here(pat, &bytes[i + 1..]))
+        match_here(pat, bytes) || bytes.iter().enumerate().any(|(i, b)| *b == b'/' && match_here(pat, &bytes[i + 1..]))
     })
 }
 

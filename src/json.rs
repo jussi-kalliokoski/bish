@@ -419,24 +419,14 @@ impl Parser {
             };
             let colon = self.next_token()?;
             if colon.kind != TokenKind::Colon {
-                return Err(format!(
-                    "expected ':' after an object key (got {}, position {})",
-                    describe(&colon.kind),
-                    colon.start
-                ));
+                return Err(format!("expected ':' after an object key (got {}, position {})", describe(&colon.kind), colon.start));
             }
             fields.push((key, self.parse_value()?));
             let tok = self.next_token()?;
             match tok.kind {
                 TokenKind::Comma => continue,
                 TokenKind::CloseBrace => break,
-                other => {
-                    return Err(format!(
-                        "expected ',' or closing brace in object (got {}, position {})",
-                        describe(&other),
-                        tok.start
-                    ))
-                }
+                other => return Err(format!("expected ',' or closing brace in object (got {}, position {})", describe(&other), tok.start)),
             }
         }
         Ok(Value::Object(fields))
@@ -455,9 +445,7 @@ impl Parser {
             match tok.kind {
                 TokenKind::Comma => continue,
                 TokenKind::CloseBracket => break,
-                other => {
-                    return Err(format!("expected ',' or ']' in array (got {}, position {})", describe(&other), tok.start))
-                }
+                other => return Err(format!("expected ',' or ']' in array (got {}, position {})", describe(&other), tok.start)),
             }
         }
         Ok(Value::Array(items))
@@ -751,10 +739,7 @@ mod tests {
         // The one property that actually matters for a wire format:
         // whatever is in a string survives, and the two writers cannot
         // disagree about it because they share the same escaper.
-        let nasty = Value::Object(vec![(
-            "k\u{1}\"\\\n".to_string(),
-            Value::Str("tab\there\u{7f}\u{1f600}".to_string()),
-        )]);
+        let nasty = Value::Object(vec![("k\u{1}\"\\\n".to_string(), Value::Str("tab\there\u{7f}\u{1f600}".to_string()))]);
         let compact = compact_print(&nasty);
         assert_eq!(parse(&compact).unwrap(), nasty);
         assert_eq!(parse(&pretty_print(&nasty)).unwrap(), nasty);
@@ -874,10 +859,7 @@ mod tests {
         let src = r#"{"name":"bish","tags":["shell","editor"],"stable":false,"count":3}"#;
         let v = parse(src).unwrap();
         let out = pretty_print(&v);
-        assert_eq!(
-            out,
-            "{\n  \"name\": \"bish\",\n  \"tags\": [\n    \"shell\",\n    \"editor\"\n  ],\n  \"stable\": false,\n  \"count\": 3\n}"
-        );
+        assert_eq!(out, "{\n  \"name\": \"bish\",\n  \"tags\": [\n    \"shell\",\n    \"editor\"\n  ],\n  \"stable\": false,\n  \"count\": 3\n}");
     }
 
     #[test]

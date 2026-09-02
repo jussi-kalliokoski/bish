@@ -30,8 +30,12 @@ pub struct Document {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Item {
-    Comment { span: Range<usize> },
-    Blank { span: Range<usize> },
+    Comment {
+        span: Range<usize>,
+    },
+    Blank {
+        span: Range<usize>,
+    },
     /// `KEY=value`, with or without a leading `export`. `separator` is
     /// the `=`; a key with none is a line still being typed rather than
     /// an error worth shouting about.
@@ -44,7 +48,9 @@ pub enum Item {
         span: Range<usize>,
     },
     /// A line that is no part of any of the above.
-    Junk { span: Range<usize> },
+    Junk {
+        span: Range<usize>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -360,9 +366,7 @@ mod tests {
 
     fn entry(text: &str, index: usize) -> (String, String) {
         match &items(text)[index] {
-            Item::Entry { key, value, .. } => {
-                (text_of(text, key), value.as_ref().map(|v| text_of(text, &v.span)).unwrap_or_default())
-            }
+            Item::Entry { key, value, .. } => (text_of(text, key), value.as_ref().map(|v| text_of(text, &v.span)).unwrap_or_default()),
             other => panic!("expected an entry, got {other:?}"),
         }
     }

@@ -175,8 +175,10 @@ pub const O_OPTIONS: &[&str] = &["bashdefault", "default", "dirnames", "filename
 // also includes "!" and "time" (pipeline negation/timing) -- bish's
 // grammar doesn't reserve either as a keyword, so they're deliberately
 // left out here rather than advertised as something typeable that isn't.
-pub const KEYWORDS: &[&str] =
-    &["if", "then", "elif", "else", "fi", "for", "while", "until", "do", "done", "case", "esac", "select", "function", "coproc", "in", "{", "}", "[[", "]]"];
+pub const KEYWORDS: &[&str] = &[
+    "if", "then", "elif", "else", "fi", "for", "while", "until", "do", "done", "case", "esac", "select", "function", "coproc", "in", "{", "}", "[[",
+    "]]",
+];
 
 // Every bit of live Shell state a *contextual* action (one that isn't just
 // a static table or a plain filesystem read) needs -- built once per use

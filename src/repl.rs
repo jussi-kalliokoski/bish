@@ -7,38 +7,38 @@ use std::path::{Path, PathBuf};
 
 use crate::lspclient;
 
+use crate::archive;
+use crate::bishedit::Buffer as BisheditBuffer;
 use crate::bishedit::completion;
 use crate::bishedit::highlight::{self, HighlightContext};
 use crate::bishedit::lint;
 use crate::bishedit::motion;
 use crate::bishedit::registers::{RegisterShape, RegisterValue, Registers};
+use crate::bishedit::snippet;
 use crate::bishedit::suggestion;
 use crate::bishedit::textbuffer::TextBuffer;
 use crate::bishedit::unicode_width::col_of;
 use crate::bishedit::vimkeys::{GotoKind, KeyOutcome, Op, VimKeys, WindowCmd};
-use crate::bishedit::Buffer as BisheditBuffer;
-use crate::archive;
 use crate::browser;
 use crate::debugger;
 use crate::docs;
 use crate::editor::{self, Key, ReadOutcome};
 use crate::exec::{self, DebugHook, ExecResult, PaneDirection, Shell, WindowAction};
-use crate::bishedit::snippet;
-use crate::hexedit;
 use crate::fileeditor;
+use crate::hexedit;
 use crate::history::{self, History};
 use crate::lexer::Lexer;
 use crate::parser::{AndOr, Command, Parser, Pipeline, Program};
 use crate::prompt;
 use crate::pty;
-use crate::window::{Divider, EditFrameId, Frame, HexFrameId, JobFrameId, JumpEntry, JumpList, MIN_PANE_WEIGHT, Pane,
-    PaneId, PaneLayout, RESIZE_STEP, Rect, SessionId, WindowEntry, close_focused_pane, close_pane,
-    completion_menu_rows, compute_regions, content_rows, find_parent_split_mut, focused_col_origin,
-    folded_divider_pane, insert_sibling, pane_rect, resize_focused_pane, resize_split_child_to,
-    set_child_weight_to_fraction};
 use crate::session;
 use crate::term;
 use crate::vt100;
+use crate::window::{
+    Divider, EditFrameId, Frame, HexFrameId, JobFrameId, JumpEntry, JumpList, MIN_PANE_WEIGHT, Pane, PaneId, PaneLayout, RESIZE_STEP, Rect,
+    SessionId, WindowEntry, close_focused_pane, close_pane, completion_menu_rows, compute_regions, content_rows, find_parent_split_mut,
+    focused_col_origin, folded_divider_pane, insert_sibling, pane_rect, resize_focused_pane, resize_split_child_to, set_child_weight_to_fraction,
+};
 
 // One virtual shell session -- either the original process's own session
 // (the root, id 0) or one created by `window new` (via Shell::
@@ -549,8 +549,7 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
             // ran_external stops being true, wrongly inserting a
             // newline that real terminal state no longer calls for.
             let builtin_needs_newline = shell.take_needs_newline();
-            let needs_newline =
-                if ran_external { term::query_cursor_column().is_some_and(|col| col != 1) } else { builtin_needs_newline };
+            let needs_newline = if ran_external { term::query_cursor_column().is_some_and(|col| col != 1) } else { builtin_needs_newline };
             if needs_newline {
                 print!("\r\n");
                 let _ = io::stdout().flush();
@@ -610,13 +609,12 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
         // should hand the terminal's own selection back on the next
         // prompt, not the next shell.
         let mouse = app.sessions[&session_id].shell.bishopt_bool("mouse");
-        let highlight_ctx =
-            HighlightContext {
-                cwd: Some(cwd_snapshot.as_path()),
-                known_functions: Some(&known_functions),
-                color_overrides: Some(&color_overrides),
-                hyperlinks,
-            };
+        let highlight_ctx = HighlightContext {
+            cwd: Some(cwd_snapshot.as_path()),
+            known_functions: Some(&known_functions),
+            color_overrides: Some(&color_overrides),
+            hyperlinks,
+        };
         // Same owned-snapshot pattern as cwd_snapshot/known_functions above
         // -- registered `complete NAME` specs, the contextual shell data
         // (aliases, PATH commands, jobs, ...) evaluating one needs, and a
@@ -636,9 +634,7 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
             // Read per prompt, like every other snapshot here: `FIGNORE`
             // is an ordinary variable and `force_fignore` an ordinary
             // shopt, so both can change between one command and the next.
-            fignore: app.sessions[&session_id]
-                .shell
-                .fignore_suffixes(),
+            fignore: app.sessions[&session_id].shell.fignore_suffixes(),
             force_fignore: app.sessions[&session_id].shell.shopt_is_on("force_fignore"),
             cwd: Some(cwd_snapshot.as_path()),
             known_functions: Some(&known_functions),
@@ -685,42 +681,42 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
         let promoted = app.sinks_are_grid;
         let outcome = app.with_registers(|app, registers| {
             editor::read_line(
-            &prompt_str,
-            &session_history,
-            false,
-            app.sinks_are_grid,
-            pending_initial.take(),
-            col_origin,
-            width,
-            highlight_ctx,
-            Some(&shell_completion),
-            Some(&arith_suggestion),
-            menu_capable,
-            row_origin,
-            registers,
-            &abbrs_snapshot,
-            global_row_size,
-            // Repaints the panes when something arrived underneath this
-            // prompt (a background job's output, a session client
-            // reattaching) and tells read_line to put its own prompt line
-            // back on top -- neither half can do the other's, which is
-            // why the signal is threaded through rather than either side
-            // just redrawing everything.
-            || {
-                let changed = service_background_jobs(app);
-                if changed && app.sinks_are_grid {
-                    compositor_redraw(app);
-                }
-                changed
-            },
-            prompt_claims_mouse(mouse, promoted),
-            // The shell prompt is not one of the modes `::bish map`
-            // knows -- an inert table keeps it behaving exactly as it
-            // did before there were any mappings, and nothing can have
-            // queued keys for it.
-            Vec::new(),
-            Vec::new(),
-        )
+                &prompt_str,
+                &session_history,
+                false,
+                app.sinks_are_grid,
+                pending_initial.take(),
+                col_origin,
+                width,
+                highlight_ctx,
+                Some(&shell_completion),
+                Some(&arith_suggestion),
+                menu_capable,
+                row_origin,
+                registers,
+                &abbrs_snapshot,
+                global_row_size,
+                // Repaints the panes when something arrived underneath this
+                // prompt (a background job's output, a session client
+                // reattaching) and tells read_line to put its own prompt line
+                // back on top -- neither half can do the other's, which is
+                // why the signal is threaded through rather than either side
+                // just redrawing everything.
+                || {
+                    let changed = service_background_jobs(app);
+                    if changed && app.sinks_are_grid {
+                        compositor_redraw(app);
+                    }
+                    changed
+                },
+                prompt_claims_mouse(mouse, promoted),
+                // The shell prompt is not one of the modes `::bish map`
+                // knows -- an inert table keeps it behaving exactly as it
+                // did before there were any mappings, and nothing can have
+                // queued keys for it.
+                Vec::new(),
+                Vec::new(),
+            )
         });
         match outcome {
             Ok(ReadOutcome::Eof) => {
@@ -733,7 +729,10 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
                 // fire the exit trap for a session that's still alive
                 // and reachable elsewhere.
                 let will_orphan = !session_referenced_elsewhere(&app.windows, app.current_window, session_id);
-                let is_final_exit = will_orphan && app.windows.len() == 1 && app.windows[app.current_window].panes.len() == 1 && app.windows[app.current_window].stack().len() == 1;
+                let is_final_exit = will_orphan
+                    && app.windows.len() == 1
+                    && app.windows[app.current_window].panes.len() == 1
+                    && app.windows[app.current_window].stack().len() == 1;
                 // Real bash refuses a plain Ctrl-D exit the first time
                 // there's a stopped job ("There are stopped jobs."),
                 // requiring a second immediate EOF to actually confirm
@@ -1178,7 +1177,8 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
                     // run_fg_job_frame the main loop's own top uses to
                     // re-enter a job left running in a window the user
                     // switched back to (M10c).
-                    let fg_job = app.sessions.get_mut(&session_id).unwrap().shell.take_pending_fg().expect("ExecResult::Fg implies a job was stashed");
+                    let fg_job =
+                        app.sessions.get_mut(&session_id).unwrap().shell.take_pending_fg().expect("ExecResult::Fg implies a job was stashed");
                     let job_frame_id = app.next_job_frame_id;
                     app.next_job_frame_id += 1;
                     app.job_frames.insert(job_frame_id, fg_job);
@@ -1206,7 +1206,12 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
                             // Read only now: browsing blocks on real
                             // input, so the terminal can have been
                             // resized since this command was typed.
-                            let rect = pane_rect(&app.windows[app.current_window], app.windows[app.current_window].focused_pane, app.term_rows, app.term_cols);
+                            let rect = pane_rect(
+                                &app.windows[app.current_window],
+                                app.windows[app.current_window].focused_pane,
+                                app.term_rows,
+                                app.term_cols,
+                            );
                             open_edit_targets(app, &targets, session_id, rect)
                         }
                         Err(e) => {
@@ -1659,7 +1664,11 @@ fn handle_command_mode(
         CommandModeOutcome::Action(ref action) => {
             apply_window_action(app, action.clone());
         }
-        CommandModeOutcome::Quit | CommandModeOutcome::Cancelled | CommandModeOutcome::Ran { .. } | CommandModeOutcome::Symbols(_) | CommandModeOutcome::NoHighlight => {
+        CommandModeOutcome::Quit
+        | CommandModeOutcome::Cancelled
+        | CommandModeOutcome::Ran { .. }
+        | CommandModeOutcome::Symbols(_)
+        | CommandModeOutcome::NoHighlight => {
             if app.sinks_are_grid {
                 // No window action, but command mode may still have
                 // written a rejected-attempt message straight to this
@@ -1726,131 +1735,129 @@ fn run_fg_job_frame(app: &mut App, job_frame_id: JobFrameId, session_id: Session
             &mut job,
             &focused_screen,
             || render_compositor_frame_diff(&layout, &tab_bar, redraw_rows, redraw_cols, &mut frame_cache),
-            || { service_background_jobs(app); },
+            || {
+                service_background_jobs(app);
+            },
         );
         match outcome {
-        FgOutcome::Exited(status) => {
-            app.windows[app.current_window].stack_mut().pop();
-            app.sessions.get_mut(&session_id).unwrap().shell.last_status = status;
-            if app.sinks_are_grid {
-                compositor_redraw(app);
+            FgOutcome::Exited(status) => {
+                app.windows[app.current_window].stack_mut().pop();
+                app.sessions.get_mut(&session_id).unwrap().shell.last_status = status;
+                if app.sinks_are_grid {
+                    compositor_redraw(app);
+                }
+                return;
             }
-            return;
-        }
-        FgOutcome::Detached => {
-            app.job_frames.insert(job_frame_id, job);
-            // Normal mode, not command mode directly -- matches what the
-            // detach key already does from a genuinely idle prompt (see
-            // editor::ReadOutcome::NormalMode), rather than a second,
-            // inconsistent "Ctrl+Space sometimes means normal mode,
-            // sometimes means command mode" behavior depending on what
-            // happened to be running. `:` still reaches command mode from
-            // here (run_normal_mode_navigation's own doc comment), so
-            // `window next`/`previous` away from this job stays exactly
-            // as reachable as before, just one keystroke further in.
-            // NavStart::JobDetach: this pane's top frame is Frame::Job,
-            // not a live prompt, so whatever this returns for "resume
-            // editing here" is meaningless and gets silently discarded
-            // anyway once the main loop sees the same Frame::Job still
-            // on top and re-drives this job instead of ever calling
-            // read_line with it.
-            let _ = run_normal_mode_navigation(app, session_id, None, NavStart::JobDetach, None);
-            // Whatever that excursion did (window action, or plain EOF)
-            // hands control straight back to re-driving this same job
-            // live -- which only redraws once fresh output actually
-            // arrives (drive_fg_job's own redraw callback). A quiet job
-            // could sit for a while with the global mode-line row
-            // (render_normal_mode_frame's own render_global_status_row)
-            // still showing this excursion's now-stale text otherwise.
-            if app.sinks_are_grid {
-                compositor_redraw(app);
+            FgOutcome::Detached => {
+                app.job_frames.insert(job_frame_id, job);
+                // Normal mode, not command mode directly -- matches what the
+                // detach key already does from a genuinely idle prompt (see
+                // editor::ReadOutcome::NormalMode), rather than a second,
+                // inconsistent "Ctrl+Space sometimes means normal mode,
+                // sometimes means command mode" behavior depending on what
+                // happened to be running. `:` still reaches command mode from
+                // here (run_normal_mode_navigation's own doc comment), so
+                // `window next`/`previous` away from this job stays exactly
+                // as reachable as before, just one keystroke further in.
+                // NavStart::JobDetach: this pane's top frame is Frame::Job,
+                // not a live prompt, so whatever this returns for "resume
+                // editing here" is meaningless and gets silently discarded
+                // anyway once the main loop sees the same Frame::Job still
+                // on top and re-drives this job instead of ever calling
+                // read_line with it.
+                let _ = run_normal_mode_navigation(app, session_id, None, NavStart::JobDetach, None);
+                // Whatever that excursion did (window action, or plain EOF)
+                // hands control straight back to re-driving this same job
+                // live -- which only redraws once fresh output actually
+                // arrives (drive_fg_job's own redraw callback). A quiet job
+                // could sit for a while with the global mode-line row
+                // (render_normal_mode_frame's own render_global_status_row)
+                // still showing this excursion's now-stale text otherwise.
+                if app.sinks_are_grid {
+                    compositor_redraw(app);
+                }
+                return;
             }
-            return;
-        }
-        FgOutcome::Stopped => {
-            // Unlike Detached, this job doesn't go back into app.job_frames
-            // -- it's no longer "a window's live top frame," it's a
-            // genuine Stopped job now, addressable via jobs/fg/bg like
-            // any other (see Shell::park_stopped_fg_job).
-            app.windows[app.current_window].stack_mut().pop();
-            let session = app.sessions.get_mut(&session_id).unwrap();
-            let (id, cmd_text) = session.shell.park_stopped_fg_job(job);
-            session.shell.sink_err(&format!("\n[{}]+  Stopped                 {}\n", id, cmd_text));
-            session.shell.last_status = 148;
-            if app.sinks_are_grid {
-                compositor_redraw(app);
+            FgOutcome::Stopped => {
+                // Unlike Detached, this job doesn't go back into app.job_frames
+                // -- it's no longer "a window's live top frame," it's a
+                // genuine Stopped job now, addressable via jobs/fg/bg like
+                // any other (see Shell::park_stopped_fg_job).
+                app.windows[app.current_window].stack_mut().pop();
+                let session = app.sessions.get_mut(&session_id).unwrap();
+                let (id, cmd_text) = session.shell.park_stopped_fg_job(job);
+                session.shell.sink_err(&format!("\n[{}]+  Stopped                 {}\n", id, cmd_text));
+                session.shell.last_status = 148;
+                if app.sinks_are_grid {
+                    compositor_redraw(app);
+                }
+                return;
             }
-            return;
-        }
-        FgOutcome::MouseClick(ev) => {
-            // &mut app.sinks_are_grid gate matches every other hit_test_click
-            // call site: there's no tab bar/pane layout to click on
-            // before the first promotion, so there's nothing to
-            // hit-test against -- falls straight to the "forward it"
-            // arm below, same as a genuine miss.
-            let target = if app.sinks_are_grid {
-                hit_test_click(app, ev)
-            } else {
-                None
-            };
-            match target {
-                Some(ClickTarget::Window(idx)) if idx != app.current_window => {
-                    app.job_frames.insert(job_frame_id, job);
-                    freeze_focused_idle_prompt(app);
-                    app.current_window = idx;
-                    if app.sinks_are_grid {
-                        compositor_redraw(app);
+            FgOutcome::MouseClick(ev) => {
+                // &mut app.sinks_are_grid gate matches every other hit_test_click
+                // call site: there's no tab bar/pane layout to click on
+                // before the first promotion, so there's nothing to
+                // hit-test against -- falls straight to the "forward it"
+                // arm below, same as a genuine miss.
+                let target = if app.sinks_are_grid { hit_test_click(app, ev) } else { None };
+                match target {
+                    Some(ClickTarget::Window(idx)) if idx != app.current_window => {
+                        app.job_frames.insert(job_frame_id, job);
+                        freeze_focused_idle_prompt(app);
+                        app.current_window = idx;
+                        if app.sinks_are_grid {
+                            compositor_redraw(app);
+                        }
+                        return;
                     }
-                    return;
-                }
-                Some(ClickTarget::Pane(pane_id)) if pane_id != app.windows[app.current_window].focused_pane => {
-                    app.job_frames.insert(job_frame_id, job);
-                    app.windows[app.current_window].focused_pane = pane_id;
-                    if app.sinks_are_grid {
-                        compositor_redraw(app);
+                    Some(ClickTarget::Pane(pane_id)) if pane_id != app.windows[app.current_window].focused_pane => {
+                        app.job_frames.insert(job_frame_id, job);
+                        app.windows[app.current_window].focused_pane = pane_id;
+                        if app.sinks_are_grid {
+                            compositor_redraw(app);
+                        }
+                        return;
                     }
-                    return;
-                }
-                // A miss, the already-focused tab/pane, or &mut app.sinks_are_grid
-                // was false -- this click was for the job itself (or
-                // nothing meaningful bish owns either way). Reconstruct
-                // the exact SGR press byte drive_fg_job held back and
-                // forward it, then keep driving the same job (the
-                // enclosing loop, not a recursive call).
-                _ => {
-                    let seq = format!("\x1b[<{};{};{}M", ev.button, ev.col, ev.row);
-                    let _ = job.pty_master().write_all(seq.as_bytes());
+                    // A miss, the already-focused tab/pane, or &mut app.sinks_are_grid
+                    // was false -- this click was for the job itself (or
+                    // nothing meaningful bish owns either way). Reconstruct
+                    // the exact SGR press byte drive_fg_job held back and
+                    // forward it, then keep driving the same job (the
+                    // enclosing loop, not a recursive call).
+                    _ => {
+                        let seq = format!("\x1b[<{};{};{}M", ev.button, ev.col, ev.row);
+                        let _ = job.pty_master().write_all(seq.as_bytes());
+                    }
                 }
             }
-        }
-        FgOutcome::Resized => {
-            // service_background_jobs's own on_idle-driven WINCH handling
-            // (poll_and_apply_resize) already resized every session's
-            // screen and every *background* job's pty; drive_fg_job
-            // already caught this job's own pty up too. All that's left
-            // is this function's own pane-rects/tab-bar snapshot, taken
-            // before this loop started and now stale -- without
-            // recomputing it, the compositor would keep drawing this
-            // job's now-correctly-sized output into the old geometry
-            // until this whole function eventually returned. No redraw
-            // forced here: drive_fg_job's own redraw() fires again as
-            // soon as the job's next output arrives, which for a
-            // well-behaved full-screen program is basically immediate
-            // (TIOCSWINSZ delivers SIGWINCH to its own process group).
-            layout = snapshot_window(&app.windows[app.current_window], &app.sessions, app.term_rows, app.term_cols);
-            tab_bar = tab_bar_line(app);
-            // The geometry frame_cache's own cells describe is no longer
-            // even the right shape -- render_compositor_frame_diff's own
-            // stale check would catch a rows/cols mismatch anyway, but
-            // resetting explicitly here is what forces the *next* redraw
-            // back to a full, self-healing repaint (matching
-            // poll_and_apply_resize's own direct compositor_redraw call,
-            // which already painted a full frame with the new geometry
-            // via a completely different path this cache knows nothing
-            // about) rather than potentially diffing against content from
-            // before the resize.
-            frame_cache = None;
-        }
+            FgOutcome::Resized => {
+                // service_background_jobs's own on_idle-driven WINCH handling
+                // (poll_and_apply_resize) already resized every session's
+                // screen and every *background* job's pty; drive_fg_job
+                // already caught this job's own pty up too. All that's left
+                // is this function's own pane-rects/tab-bar snapshot, taken
+                // before this loop started and now stale -- without
+                // recomputing it, the compositor would keep drawing this
+                // job's now-correctly-sized output into the old geometry
+                // until this whole function eventually returned. No redraw
+                // forced here: drive_fg_job's own redraw() fires again as
+                // soon as the job's next output arrives, which for a
+                // well-behaved full-screen program is basically immediate
+                // (TIOCSWINSZ delivers SIGWINCH to its own process group).
+                layout = snapshot_window(&app.windows[app.current_window], &app.sessions, app.term_rows, app.term_cols);
+                tab_bar = tab_bar_line(app);
+                // The geometry frame_cache's own cells describe is no longer
+                // even the right shape -- render_compositor_frame_diff's own
+                // stale check would catch a rows/cols mismatch anyway, but
+                // resetting explicitly here is what forces the *next* redraw
+                // back to a full, self-healing repaint (matching
+                // poll_and_apply_resize's own direct compositor_redraw call,
+                // which already painted a full frame with the new geometry
+                // via a completely different path this cache knows nothing
+                // about) rather than potentially diffing against content from
+                // before the resize.
+                frame_cache = None;
+            }
         }
     }
 }
@@ -1955,16 +1962,9 @@ fn run_hex_frame(app: &mut App, hex_frame_id: HexFrameId, session_id: SessionId)
         // persistent list whose clone is O(1) -- see its own doc
         // comment, which names this exact situation.
         let history = app.cmd_history.clone();
-        let outcome = session.handle_key(
-            key,
-            rect,
-            app.term_rows,
-            app.term_cols,
-            &history,
-            &mut || {
-                service_background_jobs(app);
-            },
-        );
+        let outcome = session.handle_key(key, rect, app.term_rows, app.term_cols, &history, &mut || {
+            service_background_jobs(app);
+        });
         match outcome {
             hexedit::HexOutcome::Continue => {}
             // This pane itself is repainted by the loop's own
@@ -2103,13 +2103,8 @@ fn run_edit_frame(app: &mut App, edit_frame_id: EditFrameId, session_id: Session
     // one of those and this function returns anyway instead of noticing
     // and just continuing to drive it.
     loop {
-        let outcome = run_normal_mode_navigation(
-            app,
-            session_id,
-            Some(edit_frame_id),
-            NavStart::Edit(Box::new(buffer), Box::new(vk)),
-            Some(&color_overrides),
-        );
+        let outcome =
+            run_normal_mode_navigation(app, session_id, Some(edit_frame_id), NavStart::Edit(Box::new(buffer), Box::new(vk)), Some(&color_overrides));
         match outcome {
             Ok((NavExit::Quit, ref state)) => {
                 // *Before* the frame goes away: afterwards there is
@@ -2195,11 +2190,9 @@ fn run_edit_frame(app: &mut App, edit_frame_id: EditFrameId, session_id: Session
                 // closed, which is what lets `Ctrl-I` step forward
                 // again -- and it means a buffer with unsaved work is
                 // never quietly dropped on the way back to it.
-                let existing = app.windows[own_window]
-                    .pane(own_pane_id)
-                    .stack
-                    .iter()
-                    .position(|frame| matches!(frame, Frame::Edit(id) if app.edit_frames.get(id).and_then(|s| s.buffer.path()) == Some(path.as_path())));
+                let existing = app.windows[own_window].pane(own_pane_id).stack.iter().position(
+                    |frame| matches!(frame, Frame::Edit(id) if app.edit_frames.get(id).and_then(|s| s.buffer.path()) == Some(path.as_path())),
+                );
                 if let Some(at) = existing {
                     let stack = &mut app.windows[own_window].pane_mut(own_pane_id).stack;
                     let frame = stack.remove(at);
@@ -2665,9 +2658,11 @@ fn run_locations_frame(app: &mut App, pane_id: PaneId, edit_frame_id: EditFrameI
 
         match key {
             Key::Enter => {
-                let chosen = app.location_lists.get(&edit_frame_id).and_then(|l| l.items.get(selected)).map(|item| {
-                    (item.path.clone(), item.line, item.character, item.encoding)
-                });
+                let chosen = app
+                    .location_lists
+                    .get(&edit_frame_id)
+                    .and_then(|l| l.items.get(selected))
+                    .map(|item| (item.path.clone(), item.line, item.character, item.encoding));
                 collapse(app);
                 if let Some((path, line, character, encoding)) = chosen {
                     let here = app.edit_frames.get(&edit_frame_id).and_then(|s| s.buffer.path().map(|p| p.to_path_buf()));
@@ -2842,7 +2837,11 @@ fn run_browse_frame(
                 CommandModeOutcome::Ran { output, .. } if !output.trim().is_empty() => {
                     browser.set_message(output.trim().replace('\n', " "));
                 }
-                CommandModeOutcome::Ran { .. } | CommandModeOutcome::Cancelled | CommandModeOutcome::Action(_) | CommandModeOutcome::Symbols(_) | CommandModeOutcome::NoHighlight => {}
+                CommandModeOutcome::Ran { .. }
+                | CommandModeOutcome::Cancelled
+                | CommandModeOutcome::Action(_)
+                | CommandModeOutcome::Symbols(_)
+                | CommandModeOutcome::NoHighlight => {}
             }
             // The colon line drew over the global status row and
             // whatever else; the next iteration repaints the browser,
@@ -2951,7 +2950,6 @@ fn render_diagnostics_list_frame(buf: &TextBuffer, rect: Rect, selected: usize, 
 fn run_debug_run_frame(app: &mut App, pane_id: PaneId, edit_frame_id: EditFrameId) {
     let Ok(_guard) = term::RawGuard::enable_with_mouse(0) else { return };
     let mut vk = VimKeys::new();
-
 
     // Same reasoning run_diagnostics_frame's own identical call has:
     // whichever pane this one's *sibling* is (the editor pane) has never
@@ -3069,11 +3067,11 @@ fn apply_window_action(app: &mut App, action: WindowAction) {
             let parent_id = app.windows[app.current_window].owning_session();
             let child_history = Rc::new(RefCell::new(app.sessions[&parent_id].history.borrow().fork()));
             let mut child_shell = app.sessions[&parent_id].shell.new_virtual_child();
-    // The same table every other session sees -- one per process, like
-    // `jobs`, so a server started for one pane serves them all.
-    let child_lsp = Rc::clone(&app.sessions[&parent_id].lsp);
-    install_service_table(&mut child_shell, &child_lsp);
-    install_history(&mut child_shell, &child_history);
+            // The same table every other session sees -- one per process, like
+            // `jobs`, so a server started for one pane serves them all.
+            let child_lsp = Rc::clone(&app.sessions[&parent_id].lsp);
+            install_service_table(&mut child_shell, &child_lsp);
+            install_history(&mut child_shell, &child_history);
             let screen = Rc::new(RefCell::new(vt100::Screen::new(content_rows(app.term_rows), app.term_cols)));
             child_shell.set_sink_grid(screen.clone());
             let child_cwd = child_shell.cwd.clone();
@@ -3083,14 +3081,14 @@ fn apply_window_action(app: &mut App, action: WindowAction) {
                 sid,
                 SessionState {
                     shell: child_shell,
-            lsp: child_lsp,
-            lsp_roots: HashMap::new(),
-            lsp_semantic: HashMap::new(),
-            lsp_semantic_applied: HashMap::new(),
-            lsp_highlight: None,
-            lsp_highlight_applied: None,
-            lsp_inlay: None,
-            lsp_inlay_applied: None,
+                    lsp: child_lsp,
+                    lsp_roots: HashMap::new(),
+                    lsp_semantic: HashMap::new(),
+                    lsp_semantic_applied: HashMap::new(),
+                    lsp_highlight: None,
+                    lsp_highlight_applied: None,
+                    lsp_inlay: None,
+                    lsp_inlay_applied: None,
                     buffer: String::new(),
                     buffer_unrecorded: false,
                     // A fork of the parent's own History (see its doc
@@ -3420,8 +3418,7 @@ fn render_locations_title(screen: &Rc<RefCell<vt100::Screen>>, cols: usize, titl
 // and repaints -- called from `gr`, while the buffer it is about is
 // still the caller's own local.
 fn sync_locations_pane(app: &mut App, edit_frame_id: EditFrameId, list: LocationList) {
-    let pane_id = locations_sibling(&app.windows[app.current_window], edit_frame_id)
-        .unwrap_or_else(|| split_locations_pane(app, edit_frame_id));
+    let pane_id = locations_sibling(&app.windows[app.current_window], edit_frame_id).unwrap_or_else(|| split_locations_pane(app, edit_frame_id));
     let rect = pane_rect(&app.windows[app.current_window], pane_id, app.term_rows, app.term_cols);
     let sid = app.windows[app.current_window].pane(pane_id).owning_session();
     render_locations_title(&app.sessions[&sid].screen, rect.cols, &list.title);
@@ -3565,8 +3562,7 @@ fn render_diagnostics_title(screen: &Rc<RefCell<vt100::Screen>>, cols: usize, di
 // caller's local (see this module's own doc comment on why that's the
 // only time this pane's content can be synced at all).
 fn sync_diagnostics_pane(app: &mut App, edit_frame_id: EditFrameId, diagnostics: &[lint::Diagnostic]) {
-    let pane_id = diagnostics_sibling(&app.windows[app.current_window], edit_frame_id)
-        .unwrap_or_else(|| split_diagnostics_pane(app, edit_frame_id));
+    let pane_id = diagnostics_sibling(&app.windows[app.current_window], edit_frame_id).unwrap_or_else(|| split_diagnostics_pane(app, edit_frame_id));
     let rect = pane_rect(&app.windows[app.current_window], pane_id, app.term_rows, app.term_cols);
     let sid = app.windows[app.current_window].pane(pane_id).owning_session();
     render_diagnostics_title(&app.sessions[&sid].screen, rect.cols, diagnostics);
@@ -3909,7 +3905,10 @@ fn drive_fg_job(job: &mut exec::FgJob, screen: &Rc<RefCell<vt100::Screen>>, mut 
     sync_mouse_reporting(&mut mouse_enabled, screen);
     let mut bracketed_paste_enabled = false;
     sync_bracketed_paste(&mut bracketed_paste_enabled, screen);
-    let mut pty_size = { let (r, c) = screen.borrow().size(); (r as u16, c as u16) };
+    let mut pty_size = {
+        let (r, c) = screen.borrow().size();
+        (r as u16, c as u16)
+    };
 
     let mut buf = [0u8; 4096];
     // Caps how many chunks get drained per outer-loop tick before
@@ -4207,8 +4206,7 @@ fn service_background_jobs(app: &mut App) -> bool {
     // discarded here, so the caller never learned to follow up -- which
     // is what made shrinking the terminal leave an editor pane empty
     // until the next keystroke that happened to redraw something.
-    let resized =
-        poll_and_apply_resize(app);
+    let resized = poll_and_apply_resize(app);
 
     const MAX_READS_PER_TICK: u32 = 16;
     let mut buf = [0u8; 4096];
@@ -4392,7 +4390,10 @@ fn snapshot_window(window: &WindowEntry, sessions: &HashMap<SessionId, SessionSt
         .collect();
 
     CompositorLayout {
-        divider_sgr: sessions.get(&window.owning_session()).map(|s| crate::theme::sgr(crate::theme::Ui::Divider, Some(&ui_colors(&s.shell)))).unwrap_or_default(),
+        divider_sgr: sessions
+            .get(&window.owning_session())
+            .map(|s| crate::theme::sgr(crate::theme::Ui::Divider, Some(&ui_colors(&s.shell))))
+            .unwrap_or_default(),
         panes,
         dividers,
     }
@@ -4752,7 +4753,13 @@ fn restore_if_minimized(window: &mut WindowEntry, pane: PaneId) {
     }
 }
 
-fn focus_pane_direction(window: &mut WindowEntry, sessions: &mut HashMap<SessionId, SessionState>, direction: PaneDirection, term_rows: usize, term_cols: usize) {
+fn focus_pane_direction(
+    window: &mut WindowEntry,
+    sessions: &mut HashMap<SessionId, SessionState>,
+    direction: PaneDirection,
+    term_rows: usize,
+    term_cols: usize,
+) {
     let area = Rect { row: 0, col: 0, rows: content_rows(term_rows), cols: term_cols };
     let mut regions = Vec::new();
     let mut dividers = Vec::new();
@@ -4919,11 +4926,7 @@ struct ScreenBuffer {
 // could land the viewport almost entirely inside the stale scrollback
 // instead of the program's own screen.
 fn addressable_scrollback_len(s: &vt100::Screen) -> usize {
-    if s.using_alternate {
-        0
-    } else {
-        s.scrollback.len()
-    }
+    if s.using_alternate { 0 } else { s.scrollback.len() }
 }
 
 // The last row of the live grid that holds anything, or `None` for a
@@ -5021,11 +5024,7 @@ impl ScreenBuffer {
     fn raw_len(&self, line: usize) -> usize {
         let s = self.screen.borrow();
         let sb_len = addressable_scrollback_len(&s);
-        if line < sb_len {
-            s.scrollback[line].len()
-        } else {
-            s.size().1
-        }
+        if line < sb_len { s.scrollback[line].len() } else { s.size().1 }
     }
 
     fn raw_char_at(&self, line: usize, col: usize) -> Option<char> {
@@ -5036,11 +5035,7 @@ impl ScreenBuffer {
         } else {
             let row = line - sb_len;
             let (rows, cols) = s.size();
-            if row < rows && col < cols {
-                Some(s.cell(row, col).ch)
-            } else {
-                None
-            }
+            if row < rows && col < cols { Some(s.cell(row, col).ch) } else { None }
         }
     }
 }
@@ -5062,11 +5057,7 @@ impl BisheditBuffer for ScreenBuffer {
     }
 
     fn char_at(&self, line: usize, col: usize) -> Option<char> {
-        if col < self.line_len(line) {
-            self.raw_char_at(line, col)
-        } else {
-            None
-        }
+        if col < self.line_len(line) { self.raw_char_at(line, col) } else { None }
     }
 
     fn word_chars(&self) -> &str {
@@ -5118,11 +5109,7 @@ impl BisheditBuffer for ScreenBuffer {
     fn line_wraps(&self, line: usize) -> bool {
         let s = self.screen.borrow();
         let sb_len = addressable_scrollback_len(&s);
-        if line < sb_len {
-            s.scrollback_wrapped.get(line).copied().unwrap_or(false)
-        } else {
-            s.row_wraps(line - sb_len)
-        }
+        if line < sb_len { s.scrollback_wrapped.get(line).copied().unwrap_or(false) } else { s.row_wraps(line - sb_len) }
     }
 }
 
@@ -5432,11 +5419,7 @@ fn render_normal_mode_row(out: &mut String, buf: &ScreenBuffer, line: usize, col
         } else {
             let row = line - sb_len;
             let (rows, scols) = s.size();
-            if row < rows && c < scols {
-                s.cell(row, c)
-            } else {
-                vt100::Cell::default()
-            }
+            if row < rows && c < scols { s.cell(row, c) } else { vt100::Cell::default() }
         };
         if search_matches.iter().any(|&(start, end)| c >= start && c < end) {
             cell.attrs.reverse = true;
@@ -5872,7 +5855,13 @@ enum NavExit {
     // being served by, carried so the file being opened inherits it
     // rather than working one out from its own ancestors -- see
     // `TextBuffer::lsp_root`.
-    OpenAt { path: PathBuf, line: usize, character: usize, encoding: crate::lsp::PositionEncoding, root: Option<PathBuf> },
+    OpenAt {
+        path: PathBuf,
+        line: usize,
+        character: usize,
+        encoding: crate::lsp::PositionEncoding,
+        root: Option<PathBuf>,
+    },
 }
 
 // Packages this loop's own `buf`/`vk` locals back up for the caller once
@@ -5951,11 +5940,7 @@ fn location_list(title: &str, locations: &[crate::lsp::Location], encoding: crat
             .or_insert_with(|| std::fs::read_to_string(&path).map(|text| text.lines().map(str::to_string).collect()).unwrap_or_default());
         // Relative to the file the question was asked from, so the
         // interesting part of a long path is what shows.
-        let shown = base
-            .and_then(|base| path.strip_prefix(base).ok())
-            .unwrap_or(&path)
-            .display()
-            .to_string();
+        let shown = base.and_then(|base| path.strip_prefix(base).ok()).unwrap_or(&path).display().to_string();
         let text = lines.get(location.start.0).map(|l| l.trim()).unwrap_or("");
         let label = if text.is_empty() { format!("{shown}:{}", location.start.0 + 1) } else { format!("{shown}:{}  {text}", location.start.0 + 1) };
         items.push(LocationItem { path, line: location.start.0, character: location.start.1, encoding, label });
@@ -5978,11 +5963,8 @@ fn symbol_list(title: &str, symbols: &[crate::lsp::Symbol], encoding: crate::lsp
         .filter_map(|symbol| {
             let path = crate::url::to_file_path(&symbol.uri)?;
             let indent = "  ".repeat(symbol.depth);
-            let label = if symbol.kind.is_empty() {
-                format!("{indent}{}", symbol.name)
-            } else {
-                format!("{indent}{}  [{}]", symbol.name, symbol.kind)
-            };
+            let label =
+                if symbol.kind.is_empty() { format!("{indent}{}", symbol.name) } else { format!("{indent}{}  [{}]", symbol.name, symbol.kind) };
             Some(LocationItem { path, line: symbol.start.0, character: symbol.start.1, encoding, label })
         })
         .collect();
@@ -6171,8 +6153,7 @@ fn tabular_style(shell: &exec::Shell, language: &str) -> Option<crate::bishedit:
 // letting the caller reuse what it measured before Insert mode began.
 // See fileeditor::IdleRedraw for why the two can't be separated.
 fn insert_idle(app: &mut App, session_id: SessionId, buf: &mut TextBuffer) -> Option<fileeditor::IdleRedraw> {
-    let repaint =
-        service_background_jobs(app);
+    let repaint = service_background_jobs(app);
     // Typing is the case document synchronization exists for, and this
     // is the only path that runs while it is happening -- keystrokes
     // themselves never come back through here (the loop above only
@@ -6197,7 +6178,14 @@ fn insert_idle(app: &mut App, session_id: SessionId, buf: &mut TextBuffer) -> Op
     })
 }
 
-fn render_nav_frame(buf: &mut NavBuffer, vk: &VimKeys, rect: Rect, term_rows: usize, term_cols: usize, color_overrides: Option<&highlight::ColorOverrides>) {
+fn render_nav_frame(
+    buf: &mut NavBuffer,
+    vk: &VimKeys,
+    rect: Rect,
+    term_rows: usize,
+    term_cols: usize,
+    color_overrides: Option<&highlight::ColorOverrides>,
+) {
     // The buffer's own viewport height is a stored field with no resize
     // hook of its own, so every redraw resyncs it from the rect actually
     // being drawn into. Without this a shrink leaves the scroll
@@ -6498,9 +6486,11 @@ fn run_normal_mode_navigation(
                 PendingView::Output if key == Key::CtrlL => {
                     pending_view = PendingView::Transcript;
                     render_command_transcript(&app.sessions[&session_id].command_transcript, app.term_rows, app.term_cols);
-                    key = match vk.next_key(|| editor::read_key_idle(&mut || {
-                        service_background_jobs(app);
-                    }))? {
+                    key = match vk.next_key(|| {
+                        editor::read_key_idle(&mut || {
+                            service_background_jobs(app);
+                        })
+                    })? {
                         Some(k) => k,
                         None => {
                             let exit = if matches!(buf, NavBuffer::Editable(_)) { NavExit::Quit } else { NavExit::Detached };
@@ -6579,8 +6569,7 @@ fn run_normal_mode_navigation(
                         let row0 = (ev.row as usize).saturating_sub(1);
                         let col0 = (ev.col as usize).saturating_sub(1);
                         let now = std::time::Instant::now();
-                        let repeat = last_press
-                            .is_some_and(|(at, r, c)| (r, c) == (ev.row, ev.col) && now.duration_since(at) < DOUBLE_CLICK_WINDOW);
+                        let repeat = last_press.is_some_and(|(at, r, c)| (r, c) == (ev.row, ev.col) && now.duration_since(at) < DOUBLE_CLICK_WINDOW);
                         // Caps at 3: a fourth press starts over rather
                         // than doing nothing, so click-spamming cycles
                         // cursor / word / line instead of dead-ending.
@@ -6799,7 +6788,9 @@ fn run_normal_mode_navigation(
                 }
                 buf.selections_mut().clear();
                 vk.end_visual(end_cursor);
-                if !gaps.is_empty() && let Some(tb) = buf.as_writable_mut() {
+                if !gaps.is_empty()
+                    && let Some(tb) = buf.as_writable_mut()
+                {
                     let (insert_term_rows, insert_term_cols) = (app.term_rows, app.term_cols);
                     // Snapshotted fresh on each entry into Insert mode, not
                     // once for this whole navigation session: `:abbr` is
@@ -6869,9 +6860,11 @@ fn run_normal_mode_navigation(
                 commit_active_selection(&vk, &mut buf);
                 let end_cursor = buf.cursor();
                 if let Some(tb) = buf.as_writable_mut()
-                    && let Some(Key::Char(ch)) = vk.next_key(|| editor::read_key_idle(&mut || {
-                        service_background_jobs(app);
-                    }))?
+                    && let Some(Key::Char(ch)) = vk.next_key(|| {
+                        editor::read_key_idle(&mut || {
+                            service_background_jobs(app);
+                        })
+                    })?
                 {
                     fileeditor::surround_selections(tb, ch);
                 }
@@ -6880,7 +6873,11 @@ fn run_normal_mode_navigation(
                 render_nav_frame(&mut buf, &vk, rect, app.term_rows, app.term_cols, color_overrides.as_ref());
                 continue;
             }
-            Key::Escape | Key::CtrlC if vk.is_idle() && (key == Key::Escape || matches!(buf, NavBuffer::Editable(_))) && (vk.is_visual() || !buf.selections().is_empty()) => {
+            Key::Escape | Key::CtrlC
+                if vk.is_idle()
+                    && (key == Key::Escape || matches!(buf, NavBuffer::Editable(_)))
+                    && (vk.is_visual() || !buf.selections().is_empty()) =>
+            {
                 let end_cursor = buf.cursor();
                 vk.end_visual(end_cursor);
                 buf.selections_mut().clear();
@@ -6917,9 +6914,11 @@ fn run_normal_mode_navigation(
             // contains `q{reg}` (recording-within-a-macro) still replays
             // correctly.
             Key::Char('q') if vk.is_idle() => {
-                if let Some(Key::Char(ch)) = vk.next_key(|| editor::read_key_idle(&mut || {
-                    service_background_jobs(app);
-                }))? && ch.is_ascii_alphabetic()
+                if let Some(Key::Char(ch)) = vk.next_key(|| {
+                    editor::read_key_idle(&mut || {
+                        service_background_jobs(app);
+                    })
+                })? && ch.is_ascii_alphabetic()
                 {
                     vk.start_recording(ch);
                 }
@@ -6932,9 +6931,11 @@ fn run_normal_mode_navigation(
             // (`3@a`), not one silently discarded.
             Key::Char('@') if vk.is_idle_except_count() => {
                 let count = vk.take_count().unwrap_or(1).max(1);
-                if let Some(Key::Char(ch)) = vk.next_key(|| editor::read_key_idle(&mut || {
-                    service_background_jobs(app);
-                }))? && (ch == '@' || ch.is_ascii_lowercase())
+                if let Some(Key::Char(ch)) = vk.next_key(|| {
+                    editor::read_key_idle(&mut || {
+                        service_background_jobs(app);
+                    })
+                })? && (ch == '@' || ch.is_ascii_lowercase())
                 {
                     vk.queue_macro_replay(ch, count);
                 }
@@ -6942,9 +6943,11 @@ fn run_normal_mode_navigation(
                 continue;
             }
             Key::Char('Z') => {
-                let k2 = vk.next_key(|| editor::read_key_idle(&mut || {
-                    service_background_jobs(app);
-                }))?;
+                let k2 = vk.next_key(|| {
+                    editor::read_key_idle(&mut || {
+                        service_background_jobs(app);
+                    })
+                })?;
                 if k2 != Some(Key::Char('Z')) {
                     continue;
                 }
@@ -6998,7 +7001,14 @@ fn run_normal_mode_navigation(
                 // bash and this buffer's own comments. Everything about
                 // the fallback is unchanged, so a bash file with no
                 // server behaves exactly as it always has.
-                let hover_lines = ask_server_at_cursor(app, session_id, tb, row, col, CursorRequest { method: "textDocument/hover", capability: "hoverProvider", extra: &[] })
+                let hover_lines = ask_server_at_cursor(
+                    app,
+                    session_id,
+                    tb,
+                    row,
+                    col,
+                    CursorRequest { method: "textDocument/hover", capability: "hoverProvider", extra: &[] },
+                )
                 .and_then(|result| crate::lsp::hover_lines(&result))
                 .unwrap_or_else(|| {
                     let index = docs::DocIndex::build_from_source(&tb.text(), &base_path);
@@ -7188,8 +7198,8 @@ fn run_normal_mode_navigation(
                     let (row, col) = tb.cursor();
                     let (method, capability) = kind.request();
                     let found = ask_server_at_cursor(app, session_id, tb, row, col, CursorRequest { method, capability, extra: &[] })
-                    .map(|result| crate::lsp::locations(&result))
-                    .unwrap_or_default();
+                        .map(|result| crate::lsp::locations(&result))
+                        .unwrap_or_default();
                     match found.first().cloned() {
                         None => {
                             // No server answer -- but in a shell script a
@@ -7234,40 +7244,44 @@ fn run_normal_mode_navigation(
                             // question was asked.
                             record_jump(&mut app.windows, app.current_window, &buf);
                             match goto_location(&app.sessions, session_id, &mut buf, &first, kind.noun()) {
-                            Goto::Moved => {
-                                let content_cols = nav_content_cols(&buf, rect);
-                                nav_scroll_to_show_cursor(&mut buf, content_cols);
-                                render_nav_frame(&mut buf, &vk, rect, app.term_rows, app.term_cols, color_overrides.as_ref());
-                                // Only worth saying -- and only worth
-                                // arming -- when there is somewhere
-                                // else to go.
-                                if found.len() > 1 {
-                                    show_command_mode_error(&format!("{} 1/{} (n/N to cycle)", kind.noun(), found.len()), app.term_rows, app.term_cols);
-                                    definitions = Some((kind, found, 0));
+                                Goto::Moved => {
+                                    let content_cols = nav_content_cols(&buf, rect);
+                                    nav_scroll_to_show_cursor(&mut buf, content_cols);
+                                    render_nav_frame(&mut buf, &vk, rect, app.term_rows, app.term_cols, color_overrides.as_ref());
+                                    // Only worth saying -- and only worth
+                                    // arming -- when there is somewhere
+                                    // else to go.
+                                    if found.len() > 1 {
+                                        show_command_mode_error(
+                                            &format!("{} 1/{} (n/N to cycle)", kind.noun(), found.len()),
+                                            app.term_rows,
+                                            app.term_cols,
+                                        );
+                                        definitions = Some((kind, found, 0));
+                                    }
                                 }
-                            }
-                            Goto::Elsewhere { path, line, character, encoding } => {
-                                break 'nav (
-                                    NavExit::OpenAt {
-                                        path,
-                                        line,
-                                        character,
-                                        encoding,
-                                        // Inherited, not recomputed: the file
-                                        // being opened is one this server
-                                        // already knows about -- possibly a
-                                        // dependency's source, whose own
-                                        // nearest project marker belongs to
-                                        // something else entirely.
-                                        root: buf.as_editable().and_then(|tb| server_target(&app.sessions[&session_id], tb)).map(|t| t.root),
-                                    },
-                                    nav_buffer_into_edit_state(buf, vk),
-                                );
-                            }
-                            Goto::Nowhere(message) => {
-                                render_nav_frame(&mut buf, &vk, rect, app.term_rows, app.term_cols, color_overrides.as_ref());
-                                show_command_mode_error(&message, app.term_rows, app.term_cols);
-                            }
+                                Goto::Elsewhere { path, line, character, encoding } => {
+                                    break 'nav (
+                                        NavExit::OpenAt {
+                                            path,
+                                            line,
+                                            character,
+                                            encoding,
+                                            // Inherited, not recomputed: the file
+                                            // being opened is one this server
+                                            // already knows about -- possibly a
+                                            // dependency's source, whose own
+                                            // nearest project marker belongs to
+                                            // something else entirely.
+                                            root: buf.as_editable().and_then(|tb| server_target(&app.sessions[&session_id], tb)).map(|t| t.root),
+                                        },
+                                        nav_buffer_into_edit_state(buf, vk),
+                                    );
+                                }
+                                Goto::Nowhere(message) => {
+                                    render_nav_frame(&mut buf, &vk, rect, app.term_rows, app.term_cols, color_overrides.as_ref());
+                                    show_command_mode_error(&message, app.term_rows, app.term_cols);
+                                }
                             }
                         }
                     }
@@ -7294,7 +7308,10 @@ fn run_normal_mode_navigation(
                             // Required by the spec, and the answer
                             // people expect: "where is this used"
                             // includes where it is declared.
-                            extra: &[("context", crate::json::Value::Object(vec![("includeDeclaration".to_string(), crate::json::Value::Bool(true))]))],
+                            extra: &[(
+                                "context",
+                                crate::json::Value::Object(vec![("includeDeclaration".to_string(), crate::json::Value::Bool(true))]),
+                            )],
                         },
                     )
                     .map(|result| crate::lsp::locations(&result))
@@ -7432,7 +7449,19 @@ fn run_normal_mode_navigation(
                         let (insert_term_rows, insert_term_cols) = (app.term_rows, app.term_cols);
                         let insert_abbrs = app.sessions[&session_id].shell.abbrs.clone();
                         app.with_registers(|app, registers| {
-                            fileeditor::run_insert_mode(tb, &mut vk, rect, registers, &mut EditorServices { app, session_id }, false, insert_term_rows, insert_term_cols, color_overrides.as_ref(), &extra, &insert_abbrs)
+                            fileeditor::run_insert_mode(
+                                tb,
+                                &mut vk,
+                                rect,
+                                registers,
+                                &mut EditorServices { app, session_id },
+                                false,
+                                insert_term_rows,
+                                insert_term_cols,
+                                color_overrides.as_ref(),
+                                &extra,
+                                &insert_abbrs,
+                            )
                         })?;
                     }
                 }
@@ -7445,7 +7474,19 @@ fn run_normal_mode_navigation(
                         let (insert_term_rows, insert_term_cols) = (app.term_rows, app.term_cols);
                         let insert_abbrs = app.sessions[&session_id].shell.abbrs.clone();
                         app.with_registers(|app, registers| {
-                            fileeditor::run_insert_mode(tb, &mut vk, rect, registers, &mut EditorServices { app, session_id }, false, insert_term_rows, insert_term_cols, color_overrides.as_ref(), &[], &insert_abbrs)
+                            fileeditor::run_insert_mode(
+                                tb,
+                                &mut vk,
+                                rect,
+                                registers,
+                                &mut EditorServices { app, session_id },
+                                false,
+                                insert_term_rows,
+                                insert_term_cols,
+                                color_overrides.as_ref(),
+                                &[],
+                                &insert_abbrs,
+                            )
                         })?;
                     }
                     render_nav_frame(&mut buf, &vk, rect, app.term_rows, app.term_cols, color_overrides.as_ref());
@@ -7467,7 +7508,19 @@ fn run_normal_mode_navigation(
                         let (insert_term_rows, insert_term_cols) = (app.term_rows, app.term_cols);
                         let insert_abbrs = app.sessions[&session_id].shell.abbrs.clone();
                         app.with_registers(|app, registers| {
-                            fileeditor::run_insert_mode(tb, &mut vk, rect, registers, &mut EditorServices { app, session_id }, true, insert_term_rows, insert_term_cols, color_overrides.as_ref(), &[], &insert_abbrs)
+                            fileeditor::run_insert_mode(
+                                tb,
+                                &mut vk,
+                                rect,
+                                registers,
+                                &mut EditorServices { app, session_id },
+                                true,
+                                insert_term_rows,
+                                insert_term_cols,
+                                color_overrides.as_ref(),
+                                &[],
+                                &insert_abbrs,
+                            )
                         })?;
                     }
                     render_nav_frame(&mut buf, &vk, rect, app.term_rows, app.term_cols, color_overrides.as_ref());
@@ -7557,7 +7610,10 @@ fn run_normal_mode_navigation(
             // own doc comment in vimkeys.rs), so `u` simply does nothing
             // while a selection is active rather than misfiring as undo.
             KeyOutcome::Undo(count) => {
-                if !vk.is_visual() && buf.selections().is_empty() && let Some(tb) = buf.as_writable_mut() {
+                if !vk.is_visual()
+                    && buf.selections().is_empty()
+                    && let Some(tb) = buf.as_writable_mut()
+                {
                     for _ in 0..count.unwrap_or(1).max(1) {
                         if !tb.undo() {
                             break;
@@ -7567,7 +7623,10 @@ fn run_normal_mode_navigation(
                 render_nav_frame(&mut buf, &vk, rect, app.term_rows, app.term_cols, color_overrides.as_ref());
             }
             KeyOutcome::Redo(count) => {
-                if !vk.is_visual() && buf.selections().is_empty() && let Some(tb) = buf.as_writable_mut() {
+                if !vk.is_visual()
+                    && buf.selections().is_empty()
+                    && let Some(tb) = buf.as_writable_mut()
+                {
                     for _ in 0..count.unwrap_or(1).max(1) {
                         if !tb.redo() {
                             break;
@@ -7579,7 +7638,10 @@ fn run_normal_mode_navigation(
             // `g-`/`g+`: same guard as `u`/`Ctrl-R` just above, for the
             // same reason.
             KeyOutcome::UndoSeq { forward, count } => {
-                if !vk.is_visual() && buf.selections().is_empty() && let Some(tb) = buf.as_writable_mut() {
+                if !vk.is_visual()
+                    && buf.selections().is_empty()
+                    && let Some(tb) = buf.as_writable_mut()
+                {
                     for _ in 0..count.unwrap_or(1).max(1) {
                         if !tb.time_travel(forward) {
                             break;
@@ -7609,8 +7671,20 @@ fn run_normal_mode_navigation(
                                 let (insert_term_rows, insert_term_cols) = (app.term_rows, app.term_cols);
                                 let insert_abbrs = app.sessions[&session_id].shell.abbrs.clone();
                                 app.with_registers(|app, registers| {
-                            fileeditor::run_insert_mode(tb, &mut vk, rect, registers, &mut EditorServices { app, session_id }, false, insert_term_rows, insert_term_cols, color_overrides.as_ref(), &[], &insert_abbrs)
-                        })?;
+                                    fileeditor::run_insert_mode(
+                                        tb,
+                                        &mut vk,
+                                        rect,
+                                        registers,
+                                        &mut EditorServices { app, session_id },
+                                        false,
+                                        insert_term_rows,
+                                        insert_term_cols,
+                                        color_overrides.as_ref(),
+                                        &[],
+                                        &insert_abbrs,
+                                    )
+                                })?;
                             }
                         }
                         Op::Lowercase | Op::Uppercase | Op::CaseToggle => {
@@ -7634,10 +7708,24 @@ fn run_normal_mode_navigation(
                             let (insert_term_rows, insert_term_cols) = (app.term_rows, app.term_cols);
                             let insert_abbrs = app.sessions[&session_id].shell.abbrs.clone();
                             app.with_registers(|app, registers| {
-                            fileeditor::run_insert_mode(tb, &mut vk, rect, registers, &mut EditorServices { app, session_id }, false, insert_term_rows, insert_term_cols, color_overrides.as_ref(), &[], &insert_abbrs)
-                        })?;
+                                fileeditor::run_insert_mode(
+                                    tb,
+                                    &mut vk,
+                                    rect,
+                                    registers,
+                                    &mut EditorServices { app, session_id },
+                                    false,
+                                    insert_term_rows,
+                                    insert_term_cols,
+                                    color_overrides.as_ref(),
+                                    &[],
+                                    &insert_abbrs,
+                                )
+                            })?;
                         }
-                        Op::Lowercase | Op::Uppercase | Op::CaseToggle => fileeditor::case_operator_lines(tb, count, fileeditor::case_kind_for_op(op)),
+                        Op::Lowercase | Op::Uppercase | Op::CaseToggle => {
+                            fileeditor::case_operator_lines(tb, count, fileeditor::case_kind_for_op(op))
+                        }
                         Op::Indent => fileeditor::indent_lines(tb, count),
                         Op::Outdent => fileeditor::outdent_lines(tb, count),
                         Op::Yank => unreachable!("handled above"),
@@ -7710,8 +7798,20 @@ fn run_normal_mode_navigation(
                     let (insert_term_rows, insert_term_cols) = (app.term_rows, app.term_cols);
                     let insert_abbrs = app.sessions[&session_id].shell.abbrs.clone();
                     app.with_registers(|app, registers| {
-                            fileeditor::run_insert_mode(tb, &mut vk, rect, registers, &mut EditorServices { app, session_id }, false, insert_term_rows, insert_term_cols, color_overrides.as_ref(), &[], &insert_abbrs)
-                        })?;
+                        fileeditor::run_insert_mode(
+                            tb,
+                            &mut vk,
+                            rect,
+                            registers,
+                            &mut EditorServices { app, session_id },
+                            false,
+                            insert_term_rows,
+                            insert_term_cols,
+                            color_overrides.as_ref(),
+                            &[],
+                            &insert_abbrs,
+                        )
+                    })?;
                 }
                 render_nav_frame(&mut buf, &vk, rect, app.term_rows, app.term_cols, color_overrides.as_ref());
             }
@@ -7758,11 +7858,8 @@ pub(crate) fn active_visual_range(vk: &VimKeys, buf: &impl BisheditBuffer) -> Op
     // its rows -- dragging up-and-right is an ordinary thing to do. See
     // `motion::block_columns`, which is where that gets untangled.
     let (from, to) = if anchor <= cursor { (anchor, cursor) } else { (cursor, anchor) };
-    let (from, to) = if motion_shape == motion::MotionShape::Blockwise {
-        ((from.0.min(to.0), anchor.1), (from.0.max(to.0), cursor.1))
-    } else {
-        (from, to)
-    };
+    let (from, to) =
+        if motion_shape == motion::MotionShape::Blockwise { ((from.0.min(to.0), anchor.1), (from.0.max(to.0), cursor.1)) } else { (from, to) };
     Some(motion::MotionRange { shape: motion_shape, from, to })
 }
 
@@ -8020,7 +8117,10 @@ fn open_language_server_document(sessions: &mut HashMap<SessionId, SessionState>
     // The error is deliberately dropped: `get_or_start` records it on
     // the table, which is where `::bish lsp status` shows it, and there
     // is nowhere sensible to print mid-open.
-    let Ok(server) = table.get_or_start(target.id, &target.command, &target.display, &target.root, target.apply_edits, target.settings.clone()) else { return };
+    let Ok(server) = table.get_or_start(target.id, &target.command, &target.display, &target.root, target.apply_edits, target.settings.clone())
+    else {
+        return;
+    };
     server.open_document(&target.uri, &target.language_id, buf.version(), &fileeditor::buffer_text(buf));
 }
 
@@ -8252,7 +8352,12 @@ fn sync_document_highlights(sessions: &mut HashMap<SessionId, SessionState>, ses
                 // `fg` is never read for this layer (see
                 // `highlight::compose_attrs`); `Default` is the
                 // no-opinion value to put there.
-                (end > start).then_some(highlight::StyledSpan { start, end, fg: vt100::Color::Default, attrs: if h.write { write } else { underline } })
+                (end > start).then_some(highlight::StyledSpan {
+                    start,
+                    end,
+                    fg: vt100::Color::Default,
+                    attrs: if h.write { write } else { underline },
+                })
             })
             .collect();
         if marks == buf.document_highlights {
@@ -8278,18 +8383,12 @@ fn sync_document_highlights(sessions: &mut HashMap<SessionId, SessionState>, ses
     }
     let encoding = server.encoding();
     let params = crate::json::Value::Object(vec![
-        (
-            "textDocument".to_string(),
-            crate::json::Value::Object(vec![("uri".to_string(), crate::json::Value::Str(target.uri.clone()))]),
-        ),
+        ("textDocument".to_string(), crate::json::Value::Object(vec![("uri".to_string(), crate::json::Value::Str(target.uri.clone()))])),
         (
             "position".to_string(),
             crate::json::Value::Object(vec![
                 ("line".to_string(), crate::json::Value::Number(row as f64)),
-                (
-                    "character".to_string(),
-                    crate::json::Value::Number(crate::lsp::to_server_column(&buf.line_chars(row), col, encoding) as f64),
-                ),
+                ("character".to_string(), crate::json::Value::Number(crate::lsp::to_server_column(&buf.line_chars(row), col, encoding) as f64)),
             ]),
         ),
     ]);
@@ -8377,17 +8476,11 @@ fn sync_inlay_hints(sessions: &mut HashMap<SessionId, SessionState>, session_id:
     let at = |line: usize, col: usize| {
         crate::json::Value::Object(vec![
             ("line".to_string(), crate::json::Value::Number(line as f64)),
-            (
-                "character".to_string(),
-                crate::json::Value::Number(crate::lsp::to_server_column(&buf.line_chars(line), col, encoding) as f64),
-            ),
+            ("character".to_string(), crate::json::Value::Number(crate::lsp::to_server_column(&buf.line_chars(line), col, encoding) as f64)),
         ])
     };
     let params = crate::json::Value::Object(vec![
-        (
-            "textDocument".to_string(),
-            crate::json::Value::Object(vec![("uri".to_string(), crate::json::Value::Str(target.uri.clone()))]),
-        ),
+        ("textDocument".to_string(), crate::json::Value::Object(vec![("uri".to_string(), crate::json::Value::Str(target.uri.clone()))])),
         (
             "range".to_string(),
             crate::json::Value::Object(vec![("start".to_string(), at(first, 0)), ("end".to_string(), at(last, buf.line_len(last)))]),
@@ -8480,14 +8573,7 @@ impl fileeditor::InsertServices for EditorServices<'_> {
 // Same bounded, servicing wait `K` uses: something *is* blocked on this
 // answer, because the popup is drawn in the same frame as the character
 // that opened it.
-fn signature_from_server(
-    app: &mut App,
-    session_id: SessionId,
-    buf: &TextBuffer,
-    row: usize,
-    col: usize,
-    typed: Option<char>,
-) -> Option<Vec<String>> {
+fn signature_from_server(app: &mut App, session_id: SessionId, buf: &TextBuffer, row: usize, col: usize, typed: Option<char>) -> Option<Vec<String>> {
     let triggers = signature_triggers(&app.sessions, session_id, buf)?;
     // `None` means something other than typing moved the cursor, and a
     // refresh is only wanted for a popup already up.
@@ -8503,7 +8589,14 @@ fn signature_from_server(
     // 150ms ago means asking about a file with no call in it, and
     // getting the correct answer: nothing.
     flush_language_server_document(&mut app.sessions, session_id, buf);
-    let result = ask_server_at_cursor(app, session_id, buf, row, col, CursorRequest { method: "textDocument/signatureHelp", capability: "signatureHelpProvider", extra: &[] })?;
+    let result = ask_server_at_cursor(
+        app,
+        session_id,
+        buf,
+        row,
+        col,
+        CursorRequest { method: "textDocument/signatureHelp", capability: "signatureHelpProvider", extra: &[] },
+    )?;
     let lines = crate::lsp::signature_help(&result);
     (!lines.is_empty()).then_some(lines)
 }
@@ -8594,10 +8687,7 @@ fn code_actions_at_cursor(app: &mut App, session_id: SessionId, buf: &mut TextBu
         "codeActionProvider",
         vec![
             // An empty range at the cursor: "what applies here".
-            (
-                "range".to_string(),
-                crate::json::Value::Object(vec![("start".to_string(), position.clone()), ("end".to_string(), position)]),
-            ),
+            ("range".to_string(), crate::json::Value::Object(vec![("start".to_string(), position.clone()), ("end".to_string(), position)])),
             ("context".to_string(), crate::json::Value::Object(vec![("diagnostics".to_string(), crate::json::Value::Array(here))])),
         ],
     )?;
@@ -8848,14 +8938,7 @@ fn format_via_server(app: &mut App, session_id: SessionId, buf: &mut TextBuffer)
         ("trimTrailingWhitespace".to_string(), crate::json::Value::Bool(buf.trim_trailing_whitespace)),
         ("insertFinalNewline".to_string(), crate::json::Value::Bool(buf.final_newline)),
     ]);
-    let result = ask_server(
-        app,
-        session_id,
-        buf,
-        "textDocument/formatting",
-        "documentFormattingProvider",
-        vec![("options".to_string(), options)],
-    )?;
+    let result = ask_server(app, session_id, buf, "textDocument/formatting", "documentFormattingProvider", vec![("options".to_string(), options)])?;
     Some(fileeditor::apply_text_edits(buf, &crate::lsp::text_edits(&result), encoding))
 }
 
@@ -8875,7 +8958,14 @@ fn completions_from_server(
     col: usize,
 ) -> Vec<crate::bishedit::completion::EditorCompletion> {
     let encoding = server_encoding_for(&app.sessions, session_id, buf).unwrap_or(crate::lsp::PositionEncoding::Utf16);
-    let Some(result) = ask_server_at_cursor(app, session_id, buf, row, col, CursorRequest { method: "textDocument/completion", capability: "completionProvider", extra: &[] }) else {
+    let Some(result) = ask_server_at_cursor(
+        app,
+        session_id,
+        buf,
+        row,
+        col,
+        CursorRequest { method: "textDocument/completion", capability: "completionProvider", extra: &[] },
+    ) else {
         return Vec::new();
     };
     let mut found = crate::lsp::completions(&result);
@@ -8999,10 +9089,7 @@ fn ask_server(
         if method.starts_with("textDocument/") {
             params.insert(
                 0,
-                (
-                    "textDocument".to_string(),
-                    crate::json::Value::Object(vec![("uri".to_string(), crate::json::Value::Str(target.uri.clone()))]),
-                ),
+                ("textDocument".to_string(), crate::json::Value::Object(vec![("uri".to_string(), crate::json::Value::Str(target.uri.clone()))])),
             );
         }
         server.request(method, crate::json::Value::Object(std::mem::take(&mut params)))
@@ -9046,12 +9133,7 @@ fn ask_server(
 //
 // Returns how many files were changed and how many of those are open
 // and unsaved, or an error to show.
-fn run_server_command(
-    app: &mut App,
-    session_id: SessionId,
-    buf: &mut TextBuffer,
-    invocation: &crate::json::Value,
-) -> Result<(usize, usize), String> {
+fn run_server_command(app: &mut App, session_id: SessionId, buf: &mut TextBuffer, invocation: &crate::json::Value) -> Result<(usize, usize), String> {
     let Some(session) = app.sessions.get(&session_id) else { return Err("no session".to_string()) };
     let Some(target) = server_target(session, buf) else { return Err("no language server for this file".to_string()) };
     let timeout = std::time::Duration::from_millis(session.shell.bishopt_int("lsp_timeout_ms").max(0) as u64);
@@ -9387,10 +9469,7 @@ fn window_snapshot(app: &App) -> Vec<exec::WindowInfo> {
         .map(|(i, window)| exec::WindowInfo {
             id: window.id,
             name: window.name.clone(),
-            cwd: app.sessions
-                .get(&window.owning_session())
-                .map(|s| prompt::shorten_path(&s.shell.cwd.to_string_lossy(), &home))
-                .unwrap_or_default(),
+            cwd: app.sessions.get(&window.owning_session()).map(|s| prompt::shorten_path(&s.shell.cwd.to_string_lossy(), &home)).unwrap_or_default(),
             panes: window.panes.len(),
             current: i == app.current_window,
         })
@@ -9512,13 +9591,19 @@ fn hit_test_click(app: &App, ev: editor::MouseEvent) -> Option<ClickTarget> {
     let area = Rect { row: 0, col: 0, rows: content_rows(app.term_rows), cols: app.term_cols };
     let mut regions = Vec::new();
     let mut dividers = Vec::new();
-    compute_regions(&app.windows[app.current_window].layout, area, app.windows[app.current_window].focused_pane, app.windows[app.current_window].divider_budget, &mut regions, &mut dividers);
+    compute_regions(
+        &app.windows[app.current_window].layout,
+        area,
+        app.windows[app.current_window].focused_pane,
+        app.windows[app.current_window].divider_budget,
+        &mut regions,
+        &mut dividers,
+    );
     // Dividers first: they sit *between* pane rectangles, so nothing here
     // overlaps, but checking them first keeps the intent obvious -- a
     // press on the strip is a resize, never a focus change.
-    if let Some(divider) = dividers
-        .into_iter()
-        .find(|d| row0 >= d.rect.row && row0 < d.rect.row + d.rect.rows && col0 >= d.rect.col && col0 < d.rect.col + d.rect.cols)
+    if let Some(divider) =
+        dividers.into_iter().find(|d| row0 >= d.rect.row && row0 < d.rect.row + d.rect.rows && col0 >= d.rect.col && col0 < d.rect.col + d.rect.cols)
     {
         // A folded divider stands for several boundaries at once, so
         // there is no single one for a drag to move. Clicking it focuses
@@ -9582,7 +9667,14 @@ fn drag_divider(app: &mut App, divider: &Divider) {
             let area = Rect { row: 0, col: 0, rows: content_rows(app.term_rows), cols: app.term_cols };
             let mut regions = Vec::new();
             let mut dividers = Vec::new();
-            compute_regions(&app.windows[app.current_window].layout, area, app.windows[app.current_window].focused_pane, app.windows[app.current_window].divider_budget, &mut regions, &mut dividers);
+            compute_regions(
+                &app.windows[app.current_window].layout,
+                area,
+                app.windows[app.current_window].focused_pane,
+                app.windows[app.current_window].divider_budget,
+                &mut regions,
+                &mut dividers,
+            );
             if let Some(fresh) = dividers.into_iter().find(|d| d.path == current.path && d.child == current.child) {
                 current = fresh;
             }
@@ -9743,7 +9835,9 @@ its decompressed text.
 // bishopts` does the formatting, so this page and `bishopt --describe`
 // can never disagree about what an option is for.
 fn options_help(shell: &exec::Shell) -> String {
-    let mut out = String::from("# bish options\n\nSet with `bishopt --set NAME VALUE`, read with `bishopt NAME`, cleared with `bishopt --unset NAME`.\nEverything here also works from the editor's own `:` line.\n\n");
+    let mut out = String::from(
+        "# bish options\n\nSet with `bishopt --set NAME VALUE`, read with `bishopt NAME`, cleared with `bishopt --unset NAME`.\nEverything here also works from the editor's own `:` line.\n\n",
+    );
     let described = shell.describe_options(None);
     // describe_bishopts emits three lines per option: the name, the
     // description, then what it accepts.
@@ -9949,20 +10043,18 @@ fn run_pager(app: &mut App, title: &str, doc: PagerSource) {
             // or pane, going there closes it -- the same rule a `<C-w>`
             // focus change already follows. Anything else (this pane, a
             // divider, a miss) keeps reading.
-            crate::pager::Outcome::Click(ev) => {
-                match hit_test_click(app, ev) {
-                    Some(ClickTarget::Window(idx)) if idx != app.current_window => {
-                        app.current_window = idx;
-                        break;
-                    }
-                    Some(ClickTarget::Pane(pane)) if pane != app.windows[app.current_window].focused_pane => {
-                        restore_if_minimized(&mut app.windows[app.current_window], pane);
-                        app.windows[app.current_window].focused_pane = pane;
-                        break;
-                    }
-                    _ => {}
+            crate::pager::Outcome::Click(ev) => match hit_test_click(app, ev) {
+                Some(ClickTarget::Window(idx)) if idx != app.current_window => {
+                    app.current_window = idx;
+                    break;
                 }
-            }
+                Some(ClickTarget::Pane(pane)) if pane != app.windows[app.current_window].focused_pane => {
+                    restore_if_minimized(&mut app.windows[app.current_window], pane);
+                    app.windows[app.current_window].focused_pane = pane;
+                    break;
+                }
+                _ => {}
+            },
             crate::pager::Outcome::Continue => {}
         }
     }
@@ -10102,7 +10194,6 @@ fn expand_tabs(text: &str) -> String {
     }
     out
 }
-
 
 #[cfg(test)]
 mod overlay_tab_tests {
@@ -10475,45 +10566,45 @@ fn run_command_mode(
         let history_snapshot = app.cmd_history.clone();
         let outcome = app.with_registers(|app, registers| {
             editor::read_line(
-            &prompt_str,
-            &history_snapshot,
-            true,
-            true,
-            pending_initial.take(),
-            0,
-            app.term_cols,
-            HighlightContext::default(),
-            Some(&builtin_completion),
-            None,
-            false,
-            None,
-            registers,
-            &[],
-            // No global row of its own to draw into here -- this colon-
-            // line already occupies that exact row with its own prompt
-            // (see read_line's own doc comment on this param) -- so a
-            // Ctrl-E search started while composing a `:` command falls
-            // back to the original in-place prompt substitution.
-            None,
-            // Command mode's own colon line sits on the global status
-            // row with an output overlay of its own that no
-            // compositor_redraw knows how to put back, so it never asks
-            // for one -- whatever arrived shows up once this excursion
-            // ends and the caller repaints.
-            &mut || {
-                service_background_jobs(app);
-                false
-            },
-            // The `mouse` bishopt -- off keeps the terminal's own
-            // selection working here (see enable_maybe_mouse).
-            mouse,
-            // This colon line *is* command mode, so `::bish map -m
-            // command` applies to it.
-            command_mappings,
-            // ...and if a mapping's `:` is what opened it, the rest of
-            // that right-hand side arrives here.
-            std::mem::take(&mut queued),
-        )
+                &prompt_str,
+                &history_snapshot,
+                true,
+                true,
+                pending_initial.take(),
+                0,
+                app.term_cols,
+                HighlightContext::default(),
+                Some(&builtin_completion),
+                None,
+                false,
+                None,
+                registers,
+                &[],
+                // No global row of its own to draw into here -- this colon-
+                // line already occupies that exact row with its own prompt
+                // (see read_line's own doc comment on this param) -- so a
+                // Ctrl-E search started while composing a `:` command falls
+                // back to the original in-place prompt substitution.
+                None,
+                // Command mode's own colon line sits on the global status
+                // row with an output overlay of its own that no
+                // compositor_redraw knows how to put back, so it never asks
+                // for one -- whatever arrived shows up once this excursion
+                // ends and the caller repaints.
+                &mut || {
+                    service_background_jobs(app);
+                    false
+                },
+                // The `mouse` bishopt -- off keeps the terminal's own
+                // selection working here (see enable_maybe_mouse).
+                mouse,
+                // This colon line *is* command mode, so `::bish map -m
+                // command` applies to it.
+                command_mappings,
+                // ...and if a mapping's `:` is what opened it, the rest of
+                // that right-hand side arrives here.
+                std::mem::take(&mut queued),
+            )
         });
         match outcome {
             // Command mode discards whatever was typed either way, so
@@ -10644,8 +10735,11 @@ fn run_command_mode(
                     if let Some(parsed) = parse_substitute_command(&trimmed) {
                         match parsed.and_then(|cmd| run_substitute(tb, &cmd)) {
                             Ok((subs, lines)) => {
-                                let output =
-                                    format!("{subs} substitution{} on {lines} line{}", if subs == 1 { "" } else { "s" }, if lines == 1 { "" } else { "s" });
+                                let output = format!(
+                                    "{subs} substitution{} on {lines} line{}",
+                                    if subs == 1 { "" } else { "s" },
+                                    if lines == 1 { "" } else { "s" }
+                                );
                                 app.sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry {
                                     command: trimmed,
                                     output: output.clone(),
@@ -10690,23 +10784,21 @@ fn run_command_mode(
                         // the file again. Bang required, always -- unlike
                         // `:q`, there is no unambiguous non-destructive
                         // reading of "reload", so this never guesses.
-                        "e!" | "edit!" => {
-                            match tb.reload() {
-                                Ok(()) => {
-                                    app.sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry {
-                                        command: trimmed,
-                                        output: String::new(),
-                                        status: 0,
-                                    });
-                                    return CommandModeOutcome::Ran { output: String::new(), status: 0 };
-                                }
-                                Err(e) => {
-                                    show_command_mode_error(&format!("bish: e!: {e}"), app.term_rows, app.term_cols);
-                                    buffer.clear();
-                                    continue;
-                                }
+                        "e!" | "edit!" => match tb.reload() {
+                            Ok(()) => {
+                                app.sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry {
+                                    command: trimmed,
+                                    output: String::new(),
+                                    status: 0,
+                                });
+                                return CommandModeOutcome::Ran { output: String::new(), status: 0 };
                             }
-                        }
+                            Err(e) => {
+                                show_command_mode_error(&format!("bish: e!: {e}"), app.term_rows, app.term_cols);
+                                buffer.clear();
+                                continue;
+                            }
+                        },
                         "w!" | "write!" => {
                             run_hooks(&mut app.sessions, session_id, "editor:file:write:pre", tb);
                             fileeditor::run_pre_save_hooks(tb);
@@ -10821,7 +10913,11 @@ fn run_command_mode(
                             merged.sort_by_key(|d| (d.start, d.end));
                             tb.diagnostics = merged;
                             let n = tb.diagnostics.len();
-                            let output = if n == 0 { "No problems found.".to_string() } else { format!("{n} problem{} found.", if n == 1 { "" } else { "s" }) };
+                            let output = if n == 0 {
+                                "No problems found.".to_string()
+                            } else {
+                                format!("{n} problem{} found.", if n == 1 { "" } else { "s" })
+                            };
                             // Creates the collapsed diagnostics split
                             // (see split_diagnostics_pane's own doc
                             // comment) the first time this runs for this
@@ -10837,7 +10933,11 @@ fn run_command_mode(
                             if let Some(Frame::Edit(edit_frame_id)) = app.windows[app.current_window].stack().last().copied() {
                                 sync_diagnostics_pane(app, edit_frame_id, &tb.diagnostics);
                             }
-                            app.sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry { command: trimmed, output, status: 0 });
+                            app.sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry {
+                                command: trimmed,
+                                output,
+                                status: 0,
+                            });
                             // Empty `Ran` output (not the count message
                             // itself, still recorded above for `Ctrl-L`'s
                             // own transcript) -- unlike every other
@@ -10876,11 +10976,19 @@ fn run_command_mode(
                                 close_pane(&mut app.windows[app.current_window], pane_id);
                                 close_orphaned_sessions(&mut app.sessions, &app.windows);
                             }
-                            app.sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry { command: trimmed, output: String::new(), status: 0 });
+                            app.sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry {
+                                command: trimmed,
+                                output: String::new(),
+                                status: 0,
+                            });
                             return CommandModeOutcome::Ran { output: String::new(), status: 0 };
                         }
                         "diag" | "diagnose" => {
-                            show_command_mode_error(&format!("bish: diag: unknown subcommand '{}' (expected: clear)", arg.unwrap_or_default()), app.term_rows, app.term_cols);
+                            show_command_mode_error(
+                                &format!("bish: diag: unknown subcommand '{}' (expected: clear)", arg.unwrap_or_default()),
+                                app.term_rows,
+                                app.term_cols,
+                            );
                             buffer.clear();
                             continue;
                         }
@@ -10890,7 +10998,11 @@ fn run_command_mode(
                         // `n` and `N` included, so this is never a mode
                         // anyone has to leave.
                         "noh" | "nohl" | "nohlsearch" => {
-                            app.sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry { command: trimmed.clone(), output: String::new(), status: 0 });
+                            app.sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry {
+                                command: trimmed.clone(),
+                                output: String::new(),
+                                status: 0,
+                            });
                             return CommandModeOutcome::NoHighlight;
                         }
                         // `sym QUERY`: what the language server knows by
@@ -10910,7 +11022,11 @@ fn run_command_mode(
                         // survivable.
                         "sym" | "symbols" => {
                             let query = arg.unwrap_or_default().to_string();
-                            app.sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry { command: trimmed.clone(), output: String::new(), status: 0 });
+                            app.sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry {
+                                command: trimmed.clone(),
+                                output: String::new(),
+                                status: 0,
+                            });
                             return CommandModeOutcome::Symbols(query);
                         }
                         // `diff` (bare, no `git` prefix): the same +/~/-
@@ -10941,7 +11057,11 @@ fn run_command_mode(
                             }
                         },
                         "diff" => {
-                            show_command_mode_error(&format!("bish: diff: unexpected argument '{}'", arg.unwrap_or_default()), app.term_rows, app.term_cols);
+                            show_command_mode_error(
+                                &format!("bish: diff: unexpected argument '{}'", arg.unwrap_or_default()),
+                                app.term_rows,
+                                app.term_cols,
+                            );
                             buffer.clear();
                             continue;
                         }
@@ -11006,11 +11126,19 @@ fn run_command_mode(
                                     continue;
                                 }
                             };
-                            app.sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry { command: trimmed, output: output.clone(), status });
+                            app.sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry {
+                                command: trimmed,
+                                output: output.clone(),
+                                status,
+                            });
                             return CommandModeOutcome::Ran { output, status };
                         }
                         "format" | "fmt" => {
-                            show_command_mode_error(&format!("bish: format: unexpected argument '{}'", arg.unwrap_or_default()), app.term_rows, app.term_cols);
+                            show_command_mode_error(
+                                &format!("bish: format: unexpected argument '{}'", arg.unwrap_or_default()),
+                                app.term_rows,
+                                app.term_cols,
+                            );
                             buffer.clear();
                             continue;
                         }
@@ -11051,11 +11179,19 @@ fn run_command_mode(
                                 "" if subarg.is_none() => {
                                     if app.debug_frames.contains_key(&edit_frame_id) {
                                         let output = "already attached -- :dbg run to start, :dbg quit to detach".to_string();
-                                        app.sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry { command: trimmed, output: output.clone(), status: 0 });
+                                        app.sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry {
+                                            command: trimmed,
+                                            output: output.clone(),
+                                            status: 0,
+                                        });
                                         return CommandModeOutcome::Ran { output, status: 0 };
                                     }
                                     if tb.is_dirty() {
-                                        show_command_mode_error("bish: dbg: E37: no write since last change -- save first with :w", app.term_rows, app.term_cols);
+                                        show_command_mode_error(
+                                            "bish: dbg: E37: no write since last change -- save first with :w",
+                                            app.term_rows,
+                                            app.term_cols,
+                                        );
                                         buffer.clear();
                                         continue;
                                     }
@@ -11079,8 +11215,13 @@ fn run_command_mode(
                                     let sid = app.windows[app.current_window].pane(pane_id).owning_session();
                                     render_debug_run_title(&app.sessions[&sid].screen, app.term_cols, "attached -- :dbg run to start");
                                     compositor_redraw(app);
-                                    let output = "attached -- read-only until :dbg quit; :dbg run to start, :dbg break [line] to set a breakpoint".to_string();
-                                    app.sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry { command: trimmed, output: output.clone(), status: 0 });
+                                    let output =
+                                        "attached -- read-only until :dbg quit; :dbg run to start, :dbg break [line] to set a breakpoint".to_string();
+                                    app.sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry {
+                                        command: trimmed,
+                                        output: output.clone(),
+                                        status: 0,
+                                    });
                                     return CommandModeOutcome::Ran { output, status: 0 };
                                 }
                                 // `:dbg run`: the only thing that ever
@@ -11144,10 +11285,22 @@ fn run_command_mode(
 
                                     let (quit_requested, nav_cursor) = match term::RawGuard::enable_with_mouse(0) {
                                         Ok(guard) => {
-                                            let hook = match debugger::PauseState::new(&path, tb.breakpoints.clone(), run_rect, editor_rect, app.term_rows, app.term_cols, Rc::new(guard)) {
+                                            let hook = match debugger::PauseState::new(
+                                                &path,
+                                                tb.breakpoints.clone(),
+                                                run_rect,
+                                                editor_rect,
+                                                app.term_rows,
+                                                app.term_cols,
+                                                Rc::new(guard),
+                                            ) {
                                                 Ok(h) => Rc::new(RefCell::new(h)),
                                                 Err(e) => {
-                                                    show_command_mode_error(&format!("bish: dbg: {}: {e}", path.display()), app.term_rows, app.term_cols);
+                                                    show_command_mode_error(
+                                                        &format!("bish: dbg: {}: {e}", path.display()),
+                                                        app.term_rows,
+                                                        app.term_cols,
+                                                    );
                                                     buffer.clear();
                                                     continue;
                                                 }
@@ -11194,7 +11347,11 @@ fn run_command_mode(
                                     };
                                     compositor_redraw(app);
                                     let output = status.to_string();
-                                    app.sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry { command: trimmed, output: output.clone(), status: 0 });
+                                    app.sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry {
+                                        command: trimmed,
+                                        output: output.clone(),
+                                        status: 0,
+                                    });
                                     return CommandModeOutcome::Ran { output, status: 0 };
                                 }
                                 // `:dbg continue`/`next`/`step`: only ever
@@ -11210,7 +11367,11 @@ fn run_command_mode(
                                 // sharing the name, purely for an honest
                                 // error instead of "unknown subcommand".
                                 "continue" | "next" | "step" if subarg.is_none() => {
-                                    show_command_mode_error("bish: dbg: not paused -- these only work while stopped at a breakpoint", app.term_rows, app.term_cols);
+                                    show_command_mode_error(
+                                        "bish: dbg: not paused -- these only work while stopped at a breakpoint",
+                                        app.term_rows,
+                                        app.term_cols,
+                                    );
                                     buffer.clear();
                                     continue;
                                 }
@@ -11241,7 +11402,11 @@ fn run_command_mode(
                                                         format!("breakpoint added at line {n}")
                                                     }
                                                     Err(_) => {
-                                                        show_command_mode_error(&format!("bish: dbg: {n}: invalid line number"), app.term_rows, app.term_cols);
+                                                        show_command_mode_error(
+                                                            &format!("bish: dbg: {n}: invalid line number"),
+                                                            app.term_rows,
+                                                            app.term_cols,
+                                                        );
                                                         buffer.clear();
                                                         continue;
                                                     }
@@ -11252,7 +11417,11 @@ fn run_command_mode(
                                                         format!("breakpoint removed at line {n}")
                                                     }
                                                     Err(_) => {
-                                                        show_command_mode_error(&format!("bish: dbg: {n}: invalid line number"), app.term_rows, app.term_cols);
+                                                        show_command_mode_error(
+                                                            &format!("bish: dbg: {n}: invalid line number"),
+                                                            app.term_rows,
+                                                            app.term_cols,
+                                                        );
                                                         buffer.clear();
                                                         continue;
                                                     }
@@ -11265,7 +11434,11 @@ fn run_command_mode(
                                                         format!("breakpoint toggled at line {n}")
                                                     }
                                                     Err(_) => {
-                                                        show_command_mode_error(&format!("bish: dbg: {rest}: invalid line number (expected: [line], add N, remove N)"), app.term_rows, app.term_cols);
+                                                        show_command_mode_error(
+                                                            &format!("bish: dbg: {rest}: invalid line number (expected: [line], add N, remove N)"),
+                                                            app.term_rows,
+                                                            app.term_cols,
+                                                        );
                                                         buffer.clear();
                                                         continue;
                                                     }
@@ -11273,7 +11446,11 @@ fn run_command_mode(
                                             }
                                         }
                                     };
-                                    app.sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry { command: trimmed, output: output.clone(), status: 0 });
+                                    app.sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry {
+                                        command: trimmed,
+                                        output: output.clone(),
+                                        status: 0,
+                                    });
                                     return CommandModeOutcome::Ran { output, status: 0 };
                                 }
                                 // `:dbg print NAME`.
@@ -11292,7 +11469,11 @@ fn run_command_mode(
                                         Some(v) => format!("{name} = {v}"),
                                         None => format!("{name}: unset or not inspectable"),
                                     };
-                                    app.sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry { command: trimmed, output: output.clone(), status: 0 });
+                                    app.sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry {
+                                        command: trimmed,
+                                        output: output.clone(),
+                                        status: 0,
+                                    });
                                     return CommandModeOutcome::Ran { output, status: 0 };
                                 }
                                 // `:dbg quit`: detach -- writable again,
@@ -11307,16 +11488,26 @@ fn run_command_mode(
                                         }
                                         compositor_redraw(app);
                                     }
-                                    app.sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry { command: trimmed, output: String::new(), status: 0 });
+                                    app.sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry {
+                                        command: trimmed,
+                                        output: String::new(),
+                                        status: 0,
+                                    });
                                     return CommandModeOutcome::Ran { output: String::new(), status: 0 };
                                 }
                                 "help" | "h" | "?" if subarg.is_none() => {
-                                    app.sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry { command: trimmed, output: DBG_HELP_TEXT.to_string(), status: 0 });
+                                    app.sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry {
+                                        command: trimmed,
+                                        output: DBG_HELP_TEXT.to_string(),
+                                        status: 0,
+                                    });
                                     return CommandModeOutcome::Ran { output: DBG_HELP_TEXT.to_string(), status: 0 };
                                 }
                                 _ => {
                                     show_command_mode_error(
-                                        &format!("bish: dbg: unknown subcommand '{subcmd}' (expected: run, break, continue, next, step, print, quit, help)"),
+                                        &format!(
+                                            "bish: dbg: unknown subcommand '{subcmd}' (expected: run, break, continue, next, step, print, quit, help)"
+                                        ),
                                         app.term_rows,
                                         app.term_cols,
                                     );
@@ -11353,9 +11544,7 @@ fn run_command_mode(
                         // generated from the option registry itself
                         // rather than written out, so a new bishopt is
                         // documented by existing.
-                        "help" | "h" | "?"
-                            if arg.is_none() || arg == Some("options") || arg == Some("hooks") || arg == Some("keys") =>
-                        {
+                        "help" | "h" | "?" if arg.is_none() || arg == Some("options") || arg == Some("hooks") || arg == Some("keys") => {
                             let title = match arg {
                                 Some("options") => "bish options  (q to close)",
                                 Some("hooks") => "bish hooks  (q to close)",
@@ -11425,7 +11614,11 @@ fn run_command_mode(
                             return CommandModeOutcome::Cancelled;
                         }
                         "help" | "h" | "?" => {
-                            show_command_mode_error(&format!("bish: help: unexpected argument '{}' (no help topics yet -- just `:help`)", arg.unwrap_or_default()), app.term_rows, app.term_cols);
+                            show_command_mode_error(
+                                &format!("bish: help: unexpected argument '{}' (no help topics yet -- just `:help`)", arg.unwrap_or_default()),
+                                app.term_rows,
+                                app.term_cols,
+                            );
                             buffer.clear();
                             continue;
                         }
@@ -11490,8 +11683,7 @@ fn run_command_mode(
                             match subcmd {
                                 "blame" => match fileeditor::toggle_git_blame(tb, subarg) {
                                     Ok(on) => {
-                                        let output =
-                                            if on { format!("Blame on{against}.") } else { "Blame off.".to_string() };
+                                        let output = if on { format!("Blame on{against}.") } else { "Blame off.".to_string() };
                                         app.sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry {
                                             command: trimmed,
                                             output: output.clone(),
@@ -11513,11 +11705,7 @@ fn run_command_mode(
                                 // state instead of per-line authorship.
                                 "diff" => match fileeditor::toggle_git_diff(tb, subarg) {
                                     Ok(on) => {
-                                        let output = if on {
-                                            format!("Diff markers on{against}.")
-                                        } else {
-                                            "Diff markers off.".to_string()
-                                        };
+                                        let output = if on { format!("Diff markers on{against}.") } else { "Diff markers off.".to_string() };
                                         app.sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry {
                                             command: trimmed,
                                             output: output.clone(),
@@ -11532,7 +11720,11 @@ fn run_command_mode(
                                     }
                                 },
                                 other => {
-                                    show_command_mode_error(&format!("bish: git: unknown subcommand '{}' (expected: blame, diff)", other), app.term_rows, app.term_cols);
+                                    show_command_mode_error(
+                                        &format!("bish: git: unknown subcommand '{}' (expected: blame, diff)", other),
+                                        app.term_rows,
+                                        app.term_cols,
+                                    );
                                     buffer.clear();
                                     continue;
                                 }
@@ -11563,7 +11755,9 @@ fn run_command_mode(
                 }
 
                 match Lexer::new(&buffer).tokenize() {
-                    Ok(toks) => match Parser::new(app.sessions.get(&session_id).map(|s| s.shell.expand_aliases(toks.clone())).unwrap_or(toks)).parse_program() {
+                    Ok(toks) => match Parser::new(app.sessions.get(&session_id).map(|s| s.shell.expand_aliases(toks.clone())).unwrap_or(toks))
+                        .parse_program()
+                    {
                         Ok(prog) => {
                             if let Some(msg) = command_mode_violation(&prog) {
                                 show_command_mode_error(&format!("bish: {}", msg), app.term_rows, app.term_cols);
@@ -11640,7 +11834,11 @@ fn run_command_mode(
                                     ExecResult::Fg => {
                                         app.sessions.get_mut(&session_id).unwrap().shell.discard_pending_fg();
                                         let output = "bish: fg: not supported in command mode -- use it from the normal shell prompt".to_string();
-                                        app.sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry { command: trimmed, output: output.clone(), status: 1 });
+                                        app.sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry {
+                                            command: trimmed,
+                                            output: output.clone(),
+                                            status: 1,
+                                        });
                                         return CommandModeOutcome::Ran { output, status: 1 };
                                     }
                                     // Same reasoning as Fg just above --
@@ -11650,7 +11848,11 @@ fn run_command_mode(
                                     ExecResult::Edit => {
                                         app.sessions.get_mut(&session_id).unwrap().shell.take_pending_edit();
                                         let output = "bish: e: not supported in command mode -- use it from the normal shell prompt".to_string();
-                                        app.sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry { command: trimmed, output: output.clone(), status: 1 });
+                                        app.sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry {
+                                            command: trimmed,
+                                            output: output.clone(),
+                                            status: 1,
+                                        });
                                         return CommandModeOutcome::Ran { output, status: 1 };
                                     }
                                     // Matches this codebase's prior behavior
@@ -12224,7 +12426,6 @@ fn command_violation(c: &Command) -> Option<&'static str> {
         Command::Group(body, _) => command_mode_violation(body),
     }
 }
-
 
 #[cfg(test)]
 mod visual_mode_tests {
@@ -12906,9 +13107,7 @@ mod compositor_frame_output_tests {
         minimize_focused_pane(&mut w);
 
         let minimized_of = |w: &WindowEntry, id: PaneId| match &w.layout {
-            PaneLayout::Split { children, .. } => {
-                children.iter().find(|c| matches!(c.layout, PaneLayout::Leaf(l) if l == id)).unwrap().minimized
-            }
+            PaneLayout::Split { children, .. } => children.iter().find(|c| matches!(c.layout, PaneLayout::Leaf(l) if l == id)).unwrap().minimized,
             PaneLayout::Leaf(_) => unreachable!(),
         };
         assert!(minimized_of(&w, bottom), "the focused pane collapses");
@@ -12950,7 +13149,11 @@ mod compositor_frame_output_tests {
     #[test]
     fn build_compositor_frame_output_never_erases_the_whole_display() {
         let screen = Rc::new(RefCell::new(vt100::Screen::new(2, 3)));
-        let layout = CompositorLayout { divider_sgr: String::new(), panes: vec![PaneSnapshot { rect: Rect { row: 0, col: 0, rows: 2, cols: 3 }, screen, focused: true }], dividers: vec![] };
+        let layout = CompositorLayout {
+            divider_sgr: String::new(),
+            panes: vec![PaneSnapshot { rect: Rect { row: 0, col: 0, rows: 2, cols: 3 }, screen, focused: true }],
+            dividers: vec![],
+        };
         let out = build_compositor_frame_output(&layout, "tab", 3);
         assert!(!out.contains("\x1b[2J"), "{out:?}");
     }
@@ -12959,7 +13162,11 @@ mod compositor_frame_output_tests {
     fn build_compositor_frame_output_still_paints_every_row_and_the_tab_bar() {
         let screen = Rc::new(RefCell::new(vt100::Screen::new(2, 3)));
         screen.borrow_mut().feed(b"ab");
-        let layout = CompositorLayout { divider_sgr: String::new(), panes: vec![PaneSnapshot { rect: Rect { row: 0, col: 0, rows: 2, cols: 3 }, screen, focused: true }], dividers: vec![] };
+        let layout = CompositorLayout {
+            divider_sgr: String::new(),
+            panes: vec![PaneSnapshot { rect: Rect { row: 0, col: 0, rows: 2, cols: 3 }, screen, focused: true }],
+            dividers: vec![],
+        };
         let out = build_compositor_frame_output(&layout, "[0] tab", 3);
         assert!(out.contains("\x1b[1;1H"), "{out:?}");
         assert!(out.contains("\x1b[2;1H"), "{out:?}");
@@ -13203,7 +13410,8 @@ mod substitute_command_tests {
     fn run_substitute_current_line_only_by_default() {
         let mut buf = buf_from("foo\nfoo\nfoo");
         buf.set_cursor(1, 0);
-        let cmd = SubstituteCmd { from: LineRef::Current, to: LineRef::Current, pattern: "foo".to_string(), replacement: "bar".to_string(), global: false };
+        let cmd =
+            SubstituteCmd { from: LineRef::Current, to: LineRef::Current, pattern: "foo".to_string(), replacement: "bar".to_string(), global: false };
         let (subs, lines) = run_substitute(&mut buf, &cmd).unwrap();
         assert_eq!((subs, lines), (1, 1));
         assert_eq!(text_of(&buf), "foo\nbar\nfoo");
@@ -13212,7 +13420,8 @@ mod substitute_command_tests {
     #[test]
     fn run_substitute_whole_buffer_with_global_flag() {
         let mut buf = buf_from("foo foo\nfoo\nbaz");
-        let cmd = SubstituteCmd { from: LineRef::Number(1), to: LineRef::Last, pattern: "foo".to_string(), replacement: "X".to_string(), global: true };
+        let cmd =
+            SubstituteCmd { from: LineRef::Number(1), to: LineRef::Last, pattern: "foo".to_string(), replacement: "X".to_string(), global: true };
         let (subs, lines) = run_substitute(&mut buf, &cmd).unwrap();
         assert_eq!((subs, lines), (3, 2));
         assert_eq!(text_of(&buf), "X X\nX\nbaz");
@@ -13221,7 +13430,13 @@ mod substitute_command_tests {
     #[test]
     fn run_substitute_backreference_and_capture() {
         let mut buf = buf_from("hello world");
-        let cmd = SubstituteCmd { from: LineRef::Current, to: LineRef::Current, pattern: "(hello) (world)".to_string(), replacement: r"\2 \1".to_string(), global: false };
+        let cmd = SubstituteCmd {
+            from: LineRef::Current,
+            to: LineRef::Current,
+            pattern: "(hello) (world)".to_string(),
+            replacement: r"\2 \1".to_string(),
+            global: false,
+        };
         run_substitute(&mut buf, &cmd).unwrap();
         assert_eq!(text_of(&buf), "world hello");
     }
@@ -13232,7 +13447,8 @@ mod substitute_command_tests {
         // splits it into two lines via \r -- line 1 (originally "b")
         // must still be reached afterward, now at row 2.
         let mut buf = buf_from("a,a\nb");
-        let cmd = SubstituteCmd { from: LineRef::Number(1), to: LineRef::Last, pattern: ",".to_string(), replacement: r"\r".to_string(), global: false };
+        let cmd =
+            SubstituteCmd { from: LineRef::Number(1), to: LineRef::Last, pattern: ",".to_string(), replacement: r"\r".to_string(), global: false };
         let (subs, lines) = run_substitute(&mut buf, &cmd).unwrap();
         assert_eq!(subs, 1);
         assert_eq!(lines, 1);
@@ -13242,7 +13458,8 @@ mod substitute_command_tests {
     #[test]
     fn run_substitute_reports_pattern_not_found() {
         let mut buf = buf_from("foo");
-        let cmd = SubstituteCmd { from: LineRef::Current, to: LineRef::Current, pattern: "zzz".to_string(), replacement: "x".to_string(), global: false };
+        let cmd =
+            SubstituteCmd { from: LineRef::Current, to: LineRef::Current, pattern: "zzz".to_string(), replacement: "x".to_string(), global: false };
         assert_eq!(run_substitute(&mut buf, &cmd).unwrap_err(), "E486: Pattern not found: zzz");
     }
 
@@ -13271,6 +13488,4 @@ mod substitute_command_tests {
         // Trailing and interior whitespace say nothing about it.
         assert!(!starts_off_the_record("echo a  b "));
     }
-
-
 }

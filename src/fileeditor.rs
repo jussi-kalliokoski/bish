@@ -17,10 +17,10 @@ use std::cell::RefCell;
 use std::io::{self, Write};
 use std::rc::Rc;
 
+use crate::bishedit::Buffer;
 use crate::bishedit::format::BashFormatter;
 use crate::bishedit::highlight::{self, HighlightContext, Highlighter, StyledSpan};
 use crate::bishedit::lint::{self, BashLinter, Linter};
-use crate::lsp;
 use crate::bishedit::motion;
 use crate::bishedit::registers::{RegisterShape, RegisterValue, Registers};
 use crate::bishedit::snippet::{self, Abbr, LiveSnippet, Snippet, SnippetHost};
@@ -28,11 +28,11 @@ use crate::bishedit::textbuffer;
 use crate::bishedit::textbuffer::TextBuffer;
 use crate::bishedit::unicode_width::char_width;
 use crate::bishedit::vimkeys::{InsertCmd, Op, SurroundTarget, VimKeys};
-use crate::bishedit::Buffer;
 use crate::editor::{self, Key};
-use crate::window::Rect;
+use crate::lsp;
 use crate::term;
 use crate::vt100;
+use crate::window::Rect;
 
 // What `repl.rs`'s `edit_frames` side table actually holds -- not just a
 // bare `TextBuffer`, so a mid-typed count/prefix or an in-progress
@@ -367,11 +367,7 @@ fn rows_between(buf: &TextBuffer, from: (usize, usize), to: (usize, usize), limi
 }
 
 fn next_row(buf: &TextBuffer, (line, sub): (usize, usize), content_cols: usize) -> (usize, usize) {
-    if sub + 1 < line_segments(buf, line, content_cols).len() {
-        (line, sub + 1)
-    } else {
-        (line + 1, 0)
-    }
+    if sub + 1 < line_segments(buf, line, content_cols).len() { (line, sub + 1) } else { (line + 1, 0) }
 }
 
 fn previous_row(buf: &TextBuffer, (line, sub): (usize, usize), content_cols: usize) -> (usize, usize) {
@@ -471,11 +467,7 @@ pub(crate) fn render_hover_popup(lines: &[String], cursor_row: usize, cursor_col
     let box_height = wrapped.len() + 2;
 
     let bottom_limit = rect.row + rect.rows;
-    let top = if cursor_row + 1 + box_height <= bottom_limit {
-        cursor_row + 1
-    } else {
-        cursor_row.saturating_sub(box_height).max(rect.row)
-    };
+    let top = if cursor_row + 1 + box_height <= bottom_limit { cursor_row + 1 } else { cursor_row.saturating_sub(box_height).max(rect.row) };
     let left = cursor_col.min((rect.col + rect.cols).saturating_sub(box_width));
 
     let mut out = String::new();
@@ -496,7 +488,13 @@ pub(crate) fn render_hover_popup(lines: &[String], cursor_row: usize, cursor_col
 // way to be legible over it without assuming anything about colours.
 // The selection is marked with `>` *and* bold rather than by colour
 // alone, so it is unambiguous on a terminal that has none.
-pub(crate) fn render_completion_popup(items: &[crate::bishedit::completion::EditorCompletion], selected: usize, cursor_row: usize, cursor_col: usize, rect: Rect) -> String {
+pub(crate) fn render_completion_popup(
+    items: &[crate::bishedit::completion::EditorCompletion],
+    selected: usize,
+    cursor_row: usize,
+    cursor_col: usize,
+    rect: Rect,
+) -> String {
     let rows: Vec<(String, String)> = items.iter().map(|i| (i.label.clone(), i.detail.clone())).collect();
     render_popup_list(&rows, selected, cursor_row, cursor_col, rect)
 }
@@ -567,7 +565,13 @@ fn wrap_hover_line(line: &str, width: usize) -> Vec<String> {
 // separately), writes it to a register. Returns whether anything was
 // actually deleted, same as `editor.rs`'s own `delete_motion` -- `Change`
 // uses this to decide whether to enter insert mode at all.
-pub(crate) fn delete_motion(buf: &mut TextBuffer, registers: &mut Registers, m: motion::Motion, count: Option<usize>, register: Option<char>) -> bool {
+pub(crate) fn delete_motion(
+    buf: &mut TextBuffer,
+    registers: &mut Registers,
+    m: motion::Motion,
+    count: Option<usize>,
+    register: Option<char>,
+) -> bool {
     let Some(range) = motion::motion_range(buf, m, count) else {
         return false;
     };
@@ -1566,9 +1570,7 @@ pub(crate) fn run_insert_mode(
         // completion-aware special cases. `Char`/`Backspace` are not in
         // this list because they *narrow* the popup rather than
         // dismissing it: typing more of a word is how you pick from one.
-        if completing.is_some()
-            && !matches!(key, Key::CtrlN | Key::CtrlP | Key::Enter | Key::Tab | Key::Escape | Key::Char(_) | Key::Backspace)
-        {
+        if completing.is_some() && !matches!(key, Key::CtrlN | Key::CtrlP | Key::Enter | Key::Tab | Key::Escape | Key::Char(_) | Key::Backspace) {
             completing = None;
         }
 
@@ -2546,11 +2548,7 @@ fn collect_table_spans(blocks: &[crate::markdown::Block], out: &mut Vec<std::ops
 // One line as it will be drawn: its own characters plus whatever padding
 // lines its columns up. Without a layout this is the line itself, which
 // is what lets everything below run one code path.
-pub(crate) fn display_row(
-    buf: &TextBuffer,
-    line: usize,
-    layout: Option<&crate::bishedit::tabular::Layout>,
-) -> crate::bishedit::tabular::Row {
+pub(crate) fn display_row(buf: &TextBuffer, line: usize, layout: Option<&crate::bishedit::tabular::Layout>) -> crate::bishedit::tabular::Row {
     let chars = buf.line_chars(line);
     let row = match layout {
         Some(layout) => crate::bishedit::tabular::row(&chars, line, layout),
@@ -2737,13 +2735,7 @@ fn col_at_cell(cells: &[char], cell: usize) -> usize {
 // being drawn. Everything composed onto a row goes through this, so
 // padding shifts a highlight exactly as far as it shifts the text under
 // it. `None` when the span falls entirely outside the window.
-fn to_window(
-    display: &crate::bishedit::tabular::Row,
-    start_cell: usize,
-    avail: usize,
-    start: usize,
-    end: usize,
-) -> Option<(usize, usize)> {
+fn to_window(display: &crate::bishedit::tabular::Row, start_cell: usize, avail: usize, start: usize, end: usize) -> Option<(usize, usize)> {
     let last = display.cell_of.len().saturating_sub(1);
     let from = display.cell_of[start.min(last)];
     let to = display.cell_of[end.min(last)];
@@ -2823,8 +2815,7 @@ const BLAME_AUTHOR_MAX_WIDTH: usize = 16;
 
 fn blame_column_width(buf: &TextBuffer) -> usize {
     let Some(blame) = &buf.blame else { return 0 };
-    let author_width =
-        blame.iter().flatten().map(|b| b.author.chars().count()).max().unwrap_or(0).clamp(1, BLAME_AUTHOR_MAX_WIDTH);
+    let author_width = blame.iter().flatten().map(|b| b.author.chars().count()).max().unwrap_or(0).clamp(1, BLAME_AUTHOR_MAX_WIDTH);
     8 + 1 + 10 + 1 + author_width + 1
 }
 
@@ -3121,11 +3112,7 @@ pub(crate) fn language_of(buf: &TextBuffer) -> String {
         return "text".to_string();
     };
     let ext = ext.to_string_lossy().to_lowercase();
-    LANGUAGE_BY_EXTENSION
-        .iter()
-        .find(|(e, _)| *e == ext)
-        .map(|(_, lang)| (*lang).to_string())
-        .unwrap_or(ext)
+    LANGUAGE_BY_EXTENSION.iter().find(|(e, _)| *e == ext).map(|(_, lang)| (*lang).to_string()).unwrap_or(ext)
 }
 
 // The buffer's own text, lines joined by '\n' -- what a highlighter
@@ -3141,10 +3128,7 @@ pub(crate) fn buffer_source(buf: &TextBuffer) -> String {
 }
 
 pub(crate) fn buffer_text(buf: &TextBuffer) -> String {
-    (0..buf.line_count())
-        .map(|l| (0..buf.line_len(l)).map(|c| buf.char_at(l, c).unwrap_or(' ')).collect::<String>())
-        .collect::<Vec<_>>()
-        .join("\n")
+    (0..buf.line_count()).map(|l| (0..buf.line_len(l)).map(|c| buf.char_at(l, c).unwrap_or(' ')).collect::<String>()).collect::<Vec<_>>().join("\n")
 }
 
 // The char offset `buffer_text`'s own joined string lands each line's
@@ -3225,10 +3209,7 @@ fn buffer_highlight_spans(buf: &TextBuffer, color_overrides: Option<&highlight::
 // buffer gets a pass for bare URLs in its text -- a URL in a comment, in
 // a `.env` value, in a commit message -- which is language-independent
 // because being a URL is.
-fn buffer_spans(
-    buf: &TextBuffer,
-    color_overrides: Option<&highlight::ColorOverrides>,
-) -> (Vec<StyledSpan>, Vec<highlight::LinkSpan>) {
+fn buffer_spans(buf: &TextBuffer, color_overrides: Option<&highlight::ColorOverrides>) -> (Vec<StyledSpan>, Vec<highlight::LinkSpan>) {
     let text = buffer_text(buf);
     let mut spans = match highlighter_for(&language_of(buf)) {
         Some(highlighter) => highlighter.highlight(&text, HighlightContext::default()),
@@ -3239,17 +3220,10 @@ fn buffer_spans(
     // the only cue that it can be clicked.
     for found in crate::url::find(&text) {
         let url: String = text.chars().skip(found.start).take(found.end - found.start).collect();
-        spans.push(highlight::HighlightSpan {
-            start: found.start,
-            end: found.end,
-            kind: highlight::HighlightKind::Link,
-            link: Some(url),
-        });
+        spans.push(highlight::HighlightSpan { start: found.start, end: found.end, kind: highlight::HighlightKind::Link, link: Some(url) });
     }
-    let links = spans
-        .iter()
-        .filter_map(|s| Some(highlight::LinkSpan { start: s.start, end: s.end, url: absolute_link(buf, s.link.as_deref()?)? }))
-        .collect();
+    let links =
+        spans.iter().filter_map(|s| Some(highlight::LinkSpan { start: s.start, end: s.end, url: absolute_link(buf, s.link.as_deref()?)? })).collect();
     let mut styled: Vec<StyledSpan> = spans
         .into_iter()
         .map(|s| {
@@ -3399,11 +3373,7 @@ pub(crate) fn apply_text_edits(buf: &mut TextBuffer, edits: &[lsp::TextEdit], en
             continue;
         }
         if from != to {
-            buf.delete_range(&crate::bishedit::motion::MotionRange {
-                shape: crate::bishedit::motion::MotionShape::Exclusive,
-                from,
-                to,
-            });
+            buf.delete_range(&crate::bishedit::motion::MotionRange { shape: crate::bishedit::motion::MotionShape::Exclusive, from, to });
         }
         if !text.is_empty() {
             buf.insert_text(from, text);
@@ -3694,10 +3664,8 @@ pub(crate) fn toggle_git_blame(buf: &mut TextBuffer, rev: Option<&str>) -> Resul
     let old_lines: Vec<&str> = old.lines().collect();
     let current = buf.text();
     let current_lines: Vec<&str> = current.lines().collect();
-    let aligned = crate::git::align_to(&old_lines, &current_lines)
-        .into_iter()
-        .map(|from| from.and_then(|i| blamed.get(i).cloned()))
-        .collect::<Vec<_>>();
+    let aligned =
+        crate::git::align_to(&old_lines, &current_lines).into_iter().map(|from| from.and_then(|i| blamed.get(i).cloned())).collect::<Vec<_>>();
     buf.blame = Some(aligned);
     Ok(true)
 }
@@ -3818,11 +3786,7 @@ fn links_for_line(links: &[highlight::LinkSpan], line_start: usize, line_len: us
     links
         .iter()
         .filter(|l| l.start < line_end && l.end > line_start)
-        .map(|l| highlight::LinkSpan {
-            start: l.start.saturating_sub(line_start),
-            end: (l.end - line_start).min(line_len),
-            url: l.url.clone(),
-        })
+        .map(|l| highlight::LinkSpan { start: l.start.saturating_sub(line_start), end: (l.end - line_start).min(line_len), url: l.url.clone() })
         .collect()
 }
 
@@ -3980,11 +3944,7 @@ fn overlay_marker(rendered: &str, cols: usize, marker: &str, at_end: bool) -> St
     }
     let keep = if at_end { cols - width } else { width };
     let (head, tail) = split_rendered(rendered, keep);
-    if at_end {
-        format!("{head}\x1b[2m{marker}\x1b[0m")
-    } else {
-        format!("\x1b[2m{marker}\x1b[0m{tail}")
-    }
+    if at_end { format!("{head}\x1b[2m{marker}\x1b[0m") } else { format!("\x1b[2m{marker}\x1b[0m{tail}") }
 }
 
 // Splits already-styled text at a display column, keeping every SGR
@@ -4157,13 +4117,15 @@ pub fn build_editor_frame(
                 // A linewise selection covers the row to the pane's own
                 // edge, padding included -- it is selecting the line,
                 // not a range of its characters.
-                let span = if range.shape == motion::MotionShape::Linewise {
-                    Some((0, avail))
-                } else {
-                    to_window(&display, start_cell, avail, start, end)
-                };
+                let span =
+                    if range.shape == motion::MotionShape::Linewise { Some((0, avail)) } else { to_window(&display, start_cell, avail, start, end) };
                 if let Some((start, end)) = span {
-                    highlights.push(StyledSpan { start, end, fg: vt100::Color::Default, attrs: vt100::CellAttrs { reverse: true, ..vt100::CellAttrs::default() } });
+                    highlights.push(StyledSpan {
+                        start,
+                        end,
+                        fg: vt100::Color::Default,
+                        attrs: vt100::CellAttrs { reverse: true, ..vt100::CellAttrs::default() },
+                    });
                 }
             }
             // Search matches, underlined -- distinct from a selection's
@@ -4205,8 +4167,7 @@ pub fn build_editor_frame(
                 spans
                     .into_iter()
                     .filter_map(|s| {
-                        to_window(&display, start_cell, avail, s.start, s.end)
-                            .map(|(start, end)| StyledSpan { start, end, fg: s.fg, attrs: s.attrs })
+                        to_window(&display, start_cell, avail, s.start, s.end).map(|(start, end)| StyledSpan { start, end, fg: s.fg, attrs: s.attrs })
                     })
                     .collect()
             };
@@ -4219,8 +4180,7 @@ pub fn build_editor_frame(
             let links: Vec<highlight::LinkSpan> = links_for_line(&whole_links, starts[line], line_len)
                 .into_iter()
                 .filter_map(|l| {
-                    to_window(&display, start_cell, avail, l.start, l.end)
-                        .map(|(start, end)| highlight::LinkSpan { start, end, url: l.url })
+                    to_window(&display, start_cell, avail, l.start, l.end).map(|(start, end)| highlight::LinkSpan { start, end, url: l.url })
                 })
                 .collect();
             out.push_str(&prefix);
@@ -4299,7 +4259,15 @@ pub(crate) fn cursor_shape(buf: &TextBuffer, mode: EditorMode, vk: &VimKeys) -> 
 /// giving the terminal back.
 pub(crate) const CURSOR_SHAPE_RESET: &str = "\x1b[0 q";
 
-pub fn render_editor_frame(buf: &TextBuffer, vk: &VimKeys, mode: EditorMode, rect: Rect, term_rows: usize, term_cols: usize, color_overrides: Option<&highlight::ColorOverrides>) {
+pub fn render_editor_frame(
+    buf: &TextBuffer,
+    vk: &VimKeys,
+    mode: EditorMode,
+    rect: Rect,
+    term_rows: usize,
+    term_cols: usize,
+    color_overrides: Option<&highlight::ColorOverrides>,
+) {
     let mut out = crate::repl::render_global_status_row(&status_text(buf, vk, mode, term_cols), term_rows);
     out.push_str(&build_editor_frame(buf, vk, mode, rect, rect.row, rect.col, color_overrides));
     print!("{}", out);
@@ -4318,7 +4286,13 @@ pub fn render_editor_frame(buf: &TextBuffer, vk: &VimKeys, mode: EditorMode, rec
 // already-absolute-within-the-grid positioning rather than those two
 // functions' simpler `\r\x1b[K`-prefixed single-row convention (this
 // content spans the pane's whole height, not just one row).
-pub fn freeze_editor_frame(screen: &Rc<RefCell<vt100::Screen>>, buf: &TextBuffer, vk: &VimKeys, rect: Rect, color_overrides: Option<&highlight::ColorOverrides>) {
+pub fn freeze_editor_frame(
+    screen: &Rc<RefCell<vt100::Screen>>,
+    buf: &TextBuffer,
+    vk: &VimKeys,
+    rect: Rect,
+    color_overrides: Option<&highlight::ColorOverrides>,
+) {
     let framed = build_editor_frame(buf, vk, EditorMode::Normal, rect, 0, 0, color_overrides);
     screen.borrow_mut().feed(framed.as_bytes());
 }
@@ -4665,11 +4639,8 @@ mod macro_tests {
         let mut buf = TextBuffer::new_unnamed(10);
         buf.insert_text((0, 0), "aaa111\nbbb222\nccc333\nzz");
         let mut registers = Registers::new_for_test();
-        buf.selections = vec![crate::bishedit::motion::MotionRange {
-            shape: crate::bishedit::motion::MotionShape::Blockwise,
-            from: (0, 0),
-            to: (2, 2),
-        }];
+        buf.selections =
+            vec![crate::bishedit::motion::MotionRange { shape: crate::bishedit::motion::MotionShape::Blockwise, from: (0, 0), to: (2, 2) }];
         let text = crate::bishedit::motion::extract_text(&buf, &buf.selections[0]);
         assert_eq!(text, "aaa\nbbb\nccc");
         registers.record_yank(None, crate::bishedit::registers::RegisterValue { text, shape: RegisterShape::Block });
@@ -4805,16 +4776,26 @@ mod macro_tests {
     #[test]
     fn insert_mode_delete_removes_forward_and_joins_lines() {
         let mut buf = TextBuffer::new_unnamed(10);
-        buf.insert_text((0, 0), "abc
-def");
+        buf.insert_text(
+            (0, 0),
+            "abc
+def",
+        );
         buf.set_cursor(0, 1);
         insert_into(&mut buf, &[Key::Delete]);
-        assert_eq!(text_of(&buf), "ac
-def", "the character *after* the cursor goes");
+        assert_eq!(
+            text_of(&buf),
+            "ac
+def",
+            "the character *after* the cursor goes"
+        );
 
         let mut buf = TextBuffer::new_unnamed(10);
-        buf.insert_text((0, 0), "abc
-def");
+        buf.insert_text(
+            (0, 0),
+            "abc
+def",
+        );
         buf.set_cursor(0, 3);
         insert_into(&mut buf, &[Key::Delete]);
         assert_eq!(text_of(&buf), "abcdef", "at end of line the newline goes, joining the next");
@@ -4834,11 +4815,8 @@ def");
     #[test]
     fn insert_mode_typing_replaces_a_standing_selection() {
         let select = |buf: &mut TextBuffer| {
-            buf.selections = vec![crate::bishedit::motion::MotionRange {
-                shape: crate::bishedit::motion::MotionShape::Exclusive,
-                from: (0, 6),
-                to: (0, 10),
-            }];
+            buf.selections =
+                vec![crate::bishedit::motion::MotionRange { shape: crate::bishedit::motion::MotionShape::Exclusive, from: (0, 6), to: (0, 10) }];
             buf.set_cursor(0, 10);
         };
 
@@ -5468,8 +5446,7 @@ mod insert_mode_alt_word_motion_tests {
             let mut keys: Vec<Key> = typed.chars().map(Key::Char).collect();
             keys.push(Key::Escape);
             scripted(&mut vk, &keys);
-            run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut NoInsertServices, false, 24, 80, None, &[], &[])
-                .unwrap();
+            run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut NoInsertServices, false, 24, 80, None, &[], &[]).unwrap();
             buf.cursor().1
         };
         // Typed in the middle: land on the last character typed, not the
@@ -5572,7 +5549,15 @@ mod diagnose_tests {
 
     #[test]
     fn diagnostic_spans_for_line_clamps_to_the_requested_lines_own_extent() {
-        let diags = vec![lint::Diagnostic { start: 5, end: 9, severity: lint::Severity::Warning, code: Cow::Borrowed("unquoted-expansion"), source: None, message: String::new(), fix: None }];
+        let diags = vec![lint::Diagnostic {
+            start: 5,
+            end: 9,
+            severity: lint::Severity::Warning,
+            code: Cow::Borrowed("unquoted-expansion"),
+            source: None,
+            message: String::new(),
+            fix: None,
+        }];
         let b = TextBuffer::new_unnamed(10);
         let spans = diagnostic_spans_for_line(&b, &diags, 0, 20);
         assert_eq!(spans.len(), 1);
@@ -5587,7 +5572,15 @@ mod diagnose_tests {
     fn the_gutter_mark_takes_the_worst_severity_on_the_line() {
         let mut buf = TextBuffer::new_unnamed(10);
         buf.insert_text((0, 0), "one two\nthree");
-        let diag = |start, end, severity| lint::Diagnostic { start, end, severity, code: Cow::Borrowed("x"), source: None, message: String::new(), fix: None };
+        let diag = |start, end, severity| lint::Diagnostic {
+            start,
+            end,
+            severity,
+            code: Cow::Borrowed("x"),
+            source: None,
+            message: String::new(),
+            fix: None,
+        };
         buf.diagnostics = vec![diag(0, 3, lint::Severity::Hint), diag(4, 7, lint::Severity::Error), diag(4, 7, lint::Severity::Warning)];
         let starts = line_starts(&buf);
         assert_eq!(line_severity(&buf, &starts, 0), Some(lint::Severity::Error));
@@ -5643,7 +5636,10 @@ mod diagnose_tests {
         let mut buf = TextBuffer::new_unnamed(10);
         buf.insert_text((0, 0), "ac");
         // Empty range, non-empty text: an insertion.
-        assert_eq!(apply_text_edits(&mut buf, &[lsp::TextEdit { start: (0, 1), end: (0, 1), text: "b".to_string() }], lsp::PositionEncoding::Utf32), 1);
+        assert_eq!(
+            apply_text_edits(&mut buf, &[lsp::TextEdit { start: (0, 1), end: (0, 1), text: "b".to_string() }], lsp::PositionEncoding::Utf32),
+            1
+        );
         assert_eq!(buffer_text(&buf), "abc");
         // Non-empty range, empty text: a deletion.
         assert_eq!(apply_text_edits(&mut buf, &[lsp::TextEdit { start: (0, 1), end: (0, 2), text: String::new() }], lsp::PositionEncoding::Utf32), 1);
@@ -5737,7 +5733,8 @@ mod diagnose_tests {
             start: 5,
             end: 9,
             severity: lint::Severity::Warning,
-            code: Cow::Borrowed("unquoted-expansion"), source: None,
+            code: Cow::Borrowed("unquoted-expansion"),
+            source: None,
             message: String::new(),
             fix: Some(lint::Fix { start: 5, end: 9, replacement: "\"$foo\"".to_string() }),
         };
@@ -5749,7 +5746,15 @@ mod diagnose_tests {
     fn apply_fix_is_a_no_op_without_a_fix() {
         let mut buf = TextBuffer::new_unnamed(10);
         buf.insert_text((0, 0), "echo $foo");
-        let diagnostic = lint::Diagnostic { start: 5, end: 9, severity: lint::Severity::Warning, code: Cow::Borrowed("unquoted-expansion"), source: None, message: String::new(), fix: None };
+        let diagnostic = lint::Diagnostic {
+            start: 5,
+            end: 9,
+            severity: lint::Severity::Warning,
+            code: Cow::Borrowed("unquoted-expansion"),
+            source: None,
+            message: String::new(),
+            fix: None,
+        };
         assert!(!apply_fix(&mut buf, &diagnostic));
         assert_eq!(buf.line_chars(0).into_iter().collect::<String>(), "echo $foo");
     }
@@ -6223,21 +6228,14 @@ mod pre_save_hook_tests {
     }
 
     fn wrap_on() -> crate::bishedit::wrap::Options {
-        crate::bishedit::wrap::Options {
-            wrap: true,
-            showbreak: String::new(),
-            breakindent: false,
-            linebreak: false,
-            ..Default::default()
-        }
+        crate::bishedit::wrap::Options { wrap: true, showbreak: String::new(), breakindent: false, linebreak: false, ..Default::default() }
     }
 
     #[test]
     fn visible_rows_break_a_long_line_across_screen_rows() {
         let buf = wrapped_buf("abcdefghij\nok", wrap_on());
         let rows = visible_rows(&buf, 4, 10);
-        let shape: Vec<(usize, bool, usize, usize)> =
-            rows.iter().map(|r| (r.line, r.first, r.seg.start, r.seg.end)).collect();
+        let shape: Vec<(usize, bool, usize, usize)> = rows.iter().map(|r| (r.line, r.first, r.seg.start, r.seg.end)).collect();
         assert_eq!(
             shape,
             vec![(0, true, 0, 4), (0, false, 4, 8), (0, false, 8, 10), (1, true, 0, 2)],
@@ -6302,10 +6300,7 @@ mod pre_save_hook_tests {
     // other way of handling a long line.
     #[test]
     fn sidescrolloff_keeps_columns_visible_either_side_of_the_cursor() {
-        let mut buf = wrapped_buf(&"x".repeat(80), crate::bishedit::wrap::Options {
-            sidescrolloff: 5,
-            ..Default::default()
-        });
+        let mut buf = wrapped_buf(&"x".repeat(80), crate::bishedit::wrap::Options { sidescrolloff: 5, ..Default::default() });
         buf.set_cursor(0, 40);
         scroll_to_show_cursor(&mut buf, 20);
         // The cursor sits 5 columns short of the right edge, not against
@@ -6325,11 +6320,7 @@ mod pre_save_hook_tests {
         let rect = Rect { row: 0, col: 0, rows: 8, cols: gutter + 4 };
         let frame = build_editor_frame(&buf, &VimKeys::new(), EditorMode::Normal, rect, 0, 0, None);
         // Char 9 is on the third segment (8..10), second column of it.
-        assert!(
-            frame.contains(&format!("\x1b[3;{}H", gutter + 2)),
-            "expected the cursor on row 3 column {}, got:\n{frame:?}",
-            gutter + 2
-        );
+        assert!(frame.contains(&format!("\x1b[3;{}H", gutter + 2)), "expected the cursor on row 3 column {}, got:\n{frame:?}", gutter + 2);
     }
 
     // The language server's "these are the same symbol" marks compose
@@ -6505,10 +6496,7 @@ mod pre_save_hook_tests {
         if let Some(text) = current.take() {
             rows.push(text);
         }
-        rows.into_iter()
-            .map(|row| row.chars().skip(gutter).collect::<String>().trim_end().to_string())
-            .filter(|row| !row.is_empty())
-            .collect()
+        rows.into_iter().map(|row| row.chars().skip(gutter).collect::<String>().trim_end().to_string()).filter(|row| !row.is_empty()).collect()
     }
 
     #[test]

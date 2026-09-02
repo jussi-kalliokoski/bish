@@ -112,7 +112,11 @@ fn parse_vendor(rest: &str) -> Result<TermColor, String> {
         let n: u16 = inner.parse().map_err(|_| format!("-bish-ansi({inner}): expected an integer 0-255"))?;
         return u8::try_from(n).map(TermColor::Ansi).map_err(|_| format!("-bish-ansi({n}): out of range, must be 0-255"));
     }
-    ANSI_NAMES.iter().find(|(n, _)| *n == rest).map(|(_, idx)| TermColor::Ansi(*idx)).ok_or_else(|| format!("-bish-{rest}: not a known terminal palette color"))
+    ANSI_NAMES
+        .iter()
+        .find(|(n, _)| *n == rest)
+        .map(|(_, idx)| TermColor::Ansi(*idx))
+        .ok_or_else(|| format!("-bish-{rest}: not a known terminal palette color"))
 }
 
 // The 16 standard ANSI slots' conventional names -- the same 8 base +
@@ -505,12 +509,7 @@ fn mix_hue(h1: f64, h2: f64, w2: f64) -> f64 {
 }
 
 fn mix_srgb(c1: Rgba, c2: Rgba, w1: f64, w2: f64) -> Rgba {
-    Rgba::new(
-        mix_channel(c1.r, c2.r, w1, w2),
-        mix_channel(c1.g, c2.g, w1, w2),
-        mix_channel(c1.b, c2.b, w1, w2),
-        mix_channel(c1.a, c2.a, w1, w2),
-    )
+    Rgba::new(mix_channel(c1.r, c2.r, w1, w2), mix_channel(c1.g, c2.g, w1, w2), mix_channel(c1.b, c2.b, w1, w2), mix_channel(c1.a, c2.a, w1, w2))
 }
 
 fn mix_hsl(c1: Rgba, c2: Rgba, w1: f64, w2: f64) -> Rgba {
@@ -863,7 +862,11 @@ mod tests {
         let ansi200 = TermColor::Ansi(200);
         let ansi1 = TermColor::Ansi(1);
         assert!(!rgb.is_supported(ColorSupport::None) && !rgb.is_supported(ColorSupport::Ansi256) && rgb.is_supported(ColorSupport::Truecolor));
-        assert!(!ansi200.is_supported(ColorSupport::Ansi16) && ansi200.is_supported(ColorSupport::Ansi256) && ansi200.is_supported(ColorSupport::Truecolor));
+        assert!(
+            !ansi200.is_supported(ColorSupport::Ansi16)
+                && ansi200.is_supported(ColorSupport::Ansi256)
+                && ansi200.is_supported(ColorSupport::Truecolor)
+        );
         assert!(!ansi1.is_supported(ColorSupport::None) && ansi1.is_supported(ColorSupport::Ansi16) && ansi1.is_supported(ColorSupport::Truecolor));
     }
 
@@ -895,6 +898,10 @@ mod tests {
     #[test]
     fn pick_falls_back_to_the_last_candidate_when_nothing_qualifies() {
         let list = parse_terminal_list("#ff0000, -bish-ansi(200)").unwrap();
-        assert_eq!(pick(&list, ColorSupport::None), TermColor::Ansi(200), "no candidate here suits None, so the least-demanding (last) one wins anyway");
+        assert_eq!(
+            pick(&list, ColorSupport::None),
+            TermColor::Ansi(200),
+            "no candidate here suits None, so the least-demanding (last) one wins anyway"
+        );
     }
 }

@@ -140,10 +140,7 @@ fn man_roots() -> Vec<std::path::PathBuf> {
     {
         return path.split(':').filter(|p| !p.is_empty()).map(std::path::PathBuf::from).collect();
     }
-    ["/usr/share/man", "/usr/local/share/man", "/usr/local/man", "/usr/man"]
-        .iter()
-        .map(std::path::PathBuf::from)
-        .collect()
+    ["/usr/share/man", "/usr/local/share/man", "/usr/local/man", "/usr/man"].iter().map(std::path::PathBuf::from).collect()
 }
 
 // Sections in the order a user means them: a bare name is a command
@@ -409,17 +406,11 @@ with \fB\-lt\fR: sort by, and show, ctime
     #[test]
     fn a_flags_description_is_the_body_its_tag_paired_it_with() {
         let data = extract(&crate::roff::parse(LS_STYLE), "ls");
-        assert_eq!(
-            data.flag_descriptions.get("-a").map(String::as_str),
-            Some("do not ignore entries starting with .")
-        );
+        assert_eq!(data.flag_descriptions.get("-a").map(String::as_str), Some("do not ignore entries starting with ."));
         // Both spellings on one tag get the same description, because
         // the page gave them one description.
         assert_eq!(data.flag_descriptions.get("--all"), data.flag_descriptions.get("-a"));
-        assert_eq!(
-            data.flag_descriptions.get("-c").map(String::as_str),
-            Some("with \u{2d}lt: sort by, and show, ctime")
-        );
+        assert_eq!(data.flag_descriptions.get("-c").map(String::as_str), Some("with \u{2d}lt: sort by, and show, ctime"));
     }
 
     #[test]
@@ -477,16 +468,9 @@ with \fB\-lt\fR: sort by, and show, ctime
         assert!(path.exists(), "{}", path.display());
         let source = read_page(&path).expect("a readable page");
         let data = extract(&crate::roff::parse(&source), "ls");
-        assert!(
-            data.name_section.as_deref().is_some_and(|n| n.contains("ls")),
-            "NAME was {:?}",
-            data.name_section
-        );
+        assert!(data.name_section.as_deref().is_some_and(|n| n.contains("ls")), "NAME was {:?}", data.name_section);
         assert!(data.flags.iter().any(|f| f == "-l"), "expected -l among {:?}", data.flags);
-        assert!(
-            data.flag_descriptions.contains_key("-l"),
-            "expected a description for -l"
-        );
+        assert!(data.flag_descriptions.contains_key("-l"), "expected a description for -l");
     }
 
     #[test]

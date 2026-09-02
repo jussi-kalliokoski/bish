@@ -19,13 +19,7 @@ use std::process::{Command, Stdio};
 // actually types a `:git` command, not on every keystroke -- so installing
 // or removing `git` mid-session is picked up immediately.
 pub fn available() -> bool {
-    Command::new("git")
-        .arg("--version")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success())
+    Command::new("git").arg("--version").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok_and(|s| s.success())
 }
 
 // One command prompt's worth of "where does this repo's HEAD point, and
@@ -185,13 +179,7 @@ pub fn file_at_rev(path: &Path, rev: Option<&str>) -> Result<Option<String>, Str
     let mut spec = std::ffi::OsString::from(rev.unwrap_or(""));
     spec.push(":./");
     spec.push(filename);
-    let output = Command::new("git")
-        .arg("show")
-        .arg(&spec)
-        .current_dir(dir)
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|e| format!("git: {e}"))?;
+    let output = Command::new("git").arg("show").arg(&spec).current_dir(dir).stdin(Stdio::null()).output().map_err(|e| format!("git: {e}"))?;
     if !output.status.success() {
         // Both real failures are already ruled out above, so what's left
         // is "that path isn't in there".

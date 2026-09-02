@@ -43,8 +43,7 @@ pub struct Pathspec {
 
 impl Pathspec {
     pub fn parse(spec: &str) -> Result<Pathspec, String> {
-        let mut out =
-            Pathspec { exclude: false, top: false, literal: false, icase: false, glob: false, pattern: String::new() };
+        let mut out = Pathspec { exclude: false, top: false, literal: false, icase: false, glob: false, pattern: String::new() };
         let Some(rest) = spec.strip_prefix(':') else {
             // No leading colon: the whole thing is the pattern, magic and
             // all -- which is why a file really named `:foo` needs
@@ -296,17 +295,8 @@ mod tests {
         if !crate::git::available() {
             return;
         }
-        let files = [
-            "a.c",
-            "README.md",
-            "src/main.rs",
-            "src/a.c",
-            "src/deep/a.c",
-            "src/vendor/x.rs",
-            "docs/a.md",
-            "docs/deep/b.md",
-            "Documentation/git.txt",
-        ];
+        let files =
+            ["a.c", "README.md", "src/main.rs", "src/a.c", "src/deep/a.c", "src/vendor/x.rs", "docs/a.md", "docs/deep/b.md", "Documentation/git.txt"];
         let root = std::env::temp_dir().join(format!("bish-pathspec-vs-git-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
@@ -337,8 +327,7 @@ mod tests {
             let mut args = vec!["ls-files", "--"];
             args.extend(case.iter().copied());
             let out = run(&args);
-            let mut git_says: Vec<String> =
-                String::from_utf8_lossy(&out.stdout).lines().map(|l| l.to_string()).collect();
+            let mut git_says: Vec<String> = String::from_utf8_lossy(&out.stdout).lines().map(|l| l.to_string()).collect();
             git_says.sort();
             let specs = Pathspecs::parse(case.iter().copied()).unwrap();
             let mut we_say: Vec<String> = files.iter().filter(|f| specs.matches(f)).map(|f| f.to_string()).collect();

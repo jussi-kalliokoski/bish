@@ -98,11 +98,8 @@ impl Pattern {
         // the pattern.
         let anchored = line.contains('/');
         let line = line.strip_prefix('/').unwrap_or(line);
-        let segments: Vec<Segment> = line
-            .split('/')
-            .filter(|s| !s.is_empty())
-            .map(|s| if s == "**" { Segment::AnyDirs } else { Segment::Glob(s.to_string()) })
-            .collect();
+        let segments: Vec<Segment> =
+            line.split('/').filter(|s| !s.is_empty()).map(|s| if s == "**" { Segment::AnyDirs } else { Segment::Glob(s.to_string()) }).collect();
         if segments.is_empty() {
             return None;
         }
@@ -299,14 +296,8 @@ pub fn repo_root(dir: &Path) -> Option<PathBuf> {
 // user's, falling back to the location git uses when nobody set one.
 fn excludes_file(root: &Path) -> Option<PathBuf> {
     let home = std::env::var_os("HOME").map(PathBuf::from);
-    let xdg = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| home.as_ref().map(|h| h.join(".config")));
-    let configs = [
-        Some(root.join(".git/config")),
-        xdg.as_ref().map(|x| x.join("git/config")),
-        home.as_ref().map(|h| h.join(".gitconfig")),
-    ];
+    let xdg = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from).or_else(|| home.as_ref().map(|h| h.join(".config")));
+    let configs = [Some(root.join(".git/config")), xdg.as_ref().map(|x| x.join("git/config")), home.as_ref().map(|h| h.join(".gitconfig"))];
     for config in configs.into_iter().flatten() {
         if let Some(value) = git_config_value(&config, "core", "excludesfile") {
             return Some(expand_tilde(&value, home.as_deref()));
@@ -328,9 +319,7 @@ fn git_config_value(path: &Path, section: &str, key: &str) -> Option<String> {
             crate::ini::Item::Section { name, .. } => {
                 in_section = slice(&text, name).to_lowercase() == section;
             }
-            crate::ini::Item::Entry { key: k, value: Some(v), .. }
-                if in_section && slice(&text, k).to_lowercase() == key =>
-            {
+            crate::ini::Item::Entry { key: k, value: Some(v), .. } if in_section && slice(&text, k).to_lowercase() == key => {
                 // A quoted value is the same string without its quotes;
                 // nothing here needs git's escapes.
                 return Some(slice(&text, &v.span).trim_matches('"').to_string());
@@ -575,9 +564,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!("bish-gitignore-vs-git-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
-        let run = |args: &[&str], dir: &std::path::Path| {
-            std::process::Command::new("git").args(args).current_dir(dir).output().expect("git")
-        };
+        let run = |args: &[&str], dir: &std::path::Path| std::process::Command::new("git").args(args).current_dir(dir).output().expect("git");
         run(&["init", "-q"], &root);
 
         let mut disagreements = Vec::new();
