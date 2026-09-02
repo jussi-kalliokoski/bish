@@ -133,7 +133,12 @@ fn main() {
     // is invisible to anything counting nesting, `exit`-on-last-level
     // prompts included.
     let depth = shell.lookup_var("SHLVL").trim().parse::<i64>().unwrap_or(0);
-    shell.run_source_here(&format!("export SHLVL={}", depth + 1), "<startup>");
+    // Set directly rather than by running `export SHLVL=N` as a script.
+    // Lexing, parsing and executing a statement to increment a counter
+    // cost 68us of a 355us startup, and every re-exec'd construct paid
+    // it before running a single character of what it was actually
+    // asked to do.
+    shell.export_var("SHLVL", (depth + 1).to_string());
     for (flag, on) in &invocation.set_flags {
         shell.apply_shell_flag(*flag, *on);
     }
