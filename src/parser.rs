@@ -1,4 +1,4 @@
-use crate::lexer::{Chunk, Lexer, Tok, keyword_text};
+use crate::lexer::{Chunk, Lexer, Tok, VarFdKind, keyword_text};
 
 #[derive(Debug, Clone)]
 pub struct Word {
@@ -24,6 +24,10 @@ pub enum Redirect {
     // which would need fds kept open for the rest of the shell's life --
     // a documented, separate gap).
     FdOut { fd: u32, word: Word, append: bool, clobber: bool },
+    // `{name}>file`: the shell picks a free descriptor, opens `word` on
+    // it, and assigns the number to `name` -- bash's way of writing a
+    // redirect that cannot collide with a hardcoded fd.
+    VarFd { var: String, kind: VarFdKind, word: Word },
     FdIn { fd: u32, word: Word },
     // `N<>file`: same as InOut above, just on an explicit fd instead of
     // the implicit 0 -- the far more common real shape in practice
@@ -850,6 +854,12 @@ impl Parser {
                     let word = self.expect_word()?;
                     redirects.push(Redirect::FdOut { fd, word, append, clobber });
                 }
+                Some(Tok::RedirVarFd { var, kind }) => {
+                    let (var, kind) = (var.clone(), kind.clone());
+                    self.advance();
+                    let word = self.expect_word()?;
+                    redirects.push(Redirect::VarFd { var, kind, word });
+                }
                 Some(Tok::RedirFdIn { fd }) => {
                     let fd = *fd;
                     self.advance();
@@ -1023,6 +1033,12 @@ impl Parser {
                     self.advance();
                     let word = self.expect_word()?;
                     redirects.push(Redirect::FdOut { fd, word, append, clobber });
+                }
+                Some(Tok::RedirVarFd { var, kind }) => {
+                    let (var, kind) = (var.clone(), kind.clone());
+                    self.advance();
+                    let word = self.expect_word()?;
+                    redirects.push(Redirect::VarFd { var, kind, word });
                 }
                 Some(Tok::RedirFdIn { fd }) => {
                     let fd = *fd;

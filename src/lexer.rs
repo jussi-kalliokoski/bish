@@ -67,6 +67,20 @@ pub enum Chunk {
 // deferred-parsing approach as Sub/Arith. `colon` distinguishes `${V:-x}`
 // (triggers on unset-or-empty) from `${V-x}` (triggers on unset only) --
 // eval_var_op (exec.rs) branches on it via var_is_set vs is_empty.
+// Which redirect a `{name}...` form is. Kept apart from the numbered
+// tokens because the number does not exist until the shell allocates
+// one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VarFdKind {
+    In,
+    Out { append: bool, clobber: bool },
+    InOut,
+    // `{v}<&N` / `{v}>&N` duplicates N onto a fresh descriptor and
+    // names it `v`; `{v}<&-` / `{v}>&-` closes the one `v` already
+    // names. The word after the operator says which.
+    Dup,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum VarOp {
     Length,
@@ -186,6 +200,10 @@ pub enum Tok {
     // is for every other explicit fd number, plus `2<`/`2<>`/`2>&M` (M !=
     // 1), which the fd=2 fast path above doesn't cover.
     RedirFdOut { fd: u32, append: bool, clobber: bool },
+    // `{name}<`, `{name}>`, `{name}>>`, `{name}<>`: bash's own way of
+    // not colliding with a hardcoded descriptor number. The shell picks
+    // a free fd and assigns it to `name`; see Redirect::VarFd.
+    RedirVarFd { var: String, kind: VarFdKind },
     RedirFdIn { fd: u32 },
     RedirFdInOut { fd: u32 },
     RedirFdDup { fd: u32, target: u32 },
@@ -520,6 +538,17 @@ impl<'a> Lexer<'a> {
                     self.advance();
                     push_tok!(Tok::RParen);
                 }
+                // `{name}>file` and friends, before the brace-group
+                // arm below: a `{` that opens a group is followed by a
+                // word boundary, and this one is followed by a name and
+                // a redirect operator, so the two never overlap.
+                Some('{') if self.var_fd_redirect().is_some() => {
+                    let (var, kind, consumed) = self.var_fd_redirect().unwrap();
+                    for _ in 0..consumed {
+                        self.advance();
+                    }
+                    push_tok!(Tok::RedirVarFd { var, kind });
+                }
                 Some('{') if self.next_char_is_word_boundary() => {
                     self.advance();
                     push_tok!(Tok::LBrace);
@@ -797,6 +826,44 @@ impl<'a> Lexer<'a> {
         let mut it = self.chars.clone();
         it.next();
         it.next()
+    }
+
+    // `{name}<`, `{name}>`, `{name}>>`, `{name}<>` -- the variable-fd
+    // redirect. Returns the name, which form it is, and how many
+    // characters to consume; `None` when this `{` is something else
+    // entirely, which is every other `{` in the language.
+    fn var_fd_redirect(&self) -> Option<(String, VarFdKind, usize)> {
+        let mut it = self.chars.clone();
+        if it.next() != Some('{') {
+            return None;
+        }
+        let mut name = String::new();
+        loop {
+            match it.next() {
+                Some('}') => break,
+                Some(c) if c.is_ascii_alphanumeric() || c == '_' => name.push(c),
+                _ => return None,
+            }
+        }
+        if name.is_empty() || name.starts_with(|c: char| c.is_ascii_digit()) {
+            return None;
+        }
+        // `{` + name + `}` so far.
+        let base = name.len() + 2;
+        match it.next() {
+            Some('<') => match it.next() {
+                Some('&') => Some((name, VarFdKind::Dup, base + 2)),
+                Some('>') => Some((name, VarFdKind::InOut, base + 2)),
+                _ => Some((name, VarFdKind::In, base + 1)),
+            },
+            Some('>') => match it.next() {
+                Some('&') => Some((name, VarFdKind::Dup, base + 2)),
+                Some('>') => Some((name, VarFdKind::Out { append: true, clobber: false }, base + 2)),
+                Some('|') => Some((name, VarFdKind::Out { append: false, clobber: true }, base + 2)),
+                _ => Some((name, VarFdKind::Out { append: false, clobber: false }, base + 1)),
+            },
+            _ => None,
+        }
     }
 
     fn next_char_is_word_boundary(&self) -> bool {

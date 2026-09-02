@@ -3820,6 +3820,23 @@ impl Shell {
                         }
                     };
                 }
+                // `read <&3` -- fd 3 is one this shell opened with
+                // `exec 3<file`, and it is a real process fd, so the
+                // builtin can read it directly. Without this the
+                // redirect was ignored and `read` took the terminal.
+                Redirect::FdDup { fd: 0, target } => {
+                    return Box::new(UnbufferedFd::new(*target as i32));
+                }
+                Redirect::FdDupWord { fd: 0, word } => {
+                    let target = self.expand_word(word);
+                    return match target.trim().parse::<i32>() {
+                        Ok(n) => Box::new(UnbufferedFd::new(n)),
+                        Err(_) => {
+                            sh_eprintln!(self, "bish: {}: ambiguous redirect", target);
+                            Box::new(std::io::Cursor::new(Vec::new()))
+                        }
+                    };
+                }
                 _ => continue,
             }
         }
@@ -3834,8 +3851,8 @@ impl Shell {
                 return Box::new(SharedStdinReader { state: state.clone(), local: Vec::new() });
             }
         }
-        // One byte per syscall, deliberately -- see UnbufferedStdin.
-        Box::new(UnbufferedStdin::default())
+        // One byte per syscall, deliberately -- see UnbufferedFd.
+        Box::new(UnbufferedFd::new(0))
     }
 
     // Shared by `eval`, `source`/`.`, and main.rs's own config-file loading
@@ -5864,9 +5881,21 @@ impl Shell {
                 let (got, clean): (Option<String>, bool) = if let Some(fd) = ufd {
                     match self.coproc_fds.get_mut(&fd) {
                         Some(KeptFd::Read(r)) => read_line_or_chars(r, nchars, delim),
-                        _ => {
+                        Some(KeptFd::Write(_)) => {
                             sh_eprintln!(self, "bish: read: {}: invalid file descriptor", fd);
                             return ExecResult::Status(1);
+                        }
+                        // Not a coproc's end: an ordinary descriptor
+                        // this shell holds open, `exec 3<file`'s being
+                        // the usual one. Unbuffered for the same reason
+                        // stdin is -- see UnbufferedFd.
+                        None if !UnbufferedFd::is_open(fd) => {
+                            sh_eprintln!(self, "bish: read: {}: invalid file descriptor: Bad file descriptor", fd);
+                            return ExecResult::Status(1);
+                        }
+                        None => {
+                            let mut reader = UnbufferedFd::new(fd);
+                            read_line_or_chars(&mut reader, nchars, delim)
                         }
                     }
                 } else {
@@ -5924,25 +5953,35 @@ impl Shell {
                 }
                 let mut strip_newline = false;
                 let mut array_name = "MAPFILE".to_string();
-                // `-n`/`-O`/`-s`/`-u`/`-c` each take a count, and a
-                // count that is not a number is the command being
-                // wrong. The values themselves are still not acted on
-                // (this reads the whole source into the array); what
-                // changed is that a typo'd one is reported rather than
-                // silently becoming the array's name.
+                // The counted options, each acted on now rather than
+                // only validated: `-n` how many lines to keep, `-s` how
+                // many to skip first, `-O` the index to start writing
+                // at, `-u` the descriptor to read instead of stdin.
+                // (`-c`/`-C` are the progress callback, still accepted
+                // and ignored -- there is nothing to call back into.)
+                let mut max_lines = 0u64;
+                let mut skip = 0u64;
+                let mut origin = 0u64;
+                let mut from_fd: Option<i32> = None;
                 let mut expect_count: Option<&str> = None;
                 let mut bad_count: Option<(String, String)> = None;
                 for a in &argv[1..] {
                     if let Some(flag) = expect_count.take() {
-                        if a.parse::<u64>().is_err() {
-                            let what = match flag {
-                                "-n" => "invalid line count",
-                                "-O" => "invalid array origin",
-                                "-s" => "invalid line count",
-                                "-u" => "invalid file descriptor specification",
-                                _ => "invalid callback quantum",
-                            };
-                            bad_count = Some((a.clone(), what.to_string()));
+                        match (flag, a.parse::<u64>()) {
+                            ("-n", Ok(v)) => max_lines = v,
+                            ("-s", Ok(v)) => skip = v,
+                            ("-O", Ok(v)) => origin = v,
+                            ("-u", Ok(v)) => from_fd = Some(v as i32),
+                            (_, Ok(_)) | ("-d", Err(_)) => {}
+                            (flag, Err(_)) => {
+                                let what = match flag {
+                                    "-O" => "invalid array origin",
+                                    "-u" => "invalid file descriptor specification",
+                                    "-n" | "-s" => "invalid line count",
+                                    _ => "invalid callback quantum",
+                                };
+                                bad_count = Some((a.clone(), what.to_string()));
+                            }
                         }
                         continue;
                     }
@@ -5958,19 +5997,32 @@ impl Shell {
                     sh_eprintln!(self, "bish: {}: {}: {}", name, value, what);
                     return ExecResult::Status(1);
                 }
-                let mut reader = self.read_input_source(cmd);
+                let mut reader: Box<dyn std::io::BufRead> = match from_fd {
+                    Some(fd) => Box::new(UnbufferedFd::new(fd)),
+                    None => self.read_input_source(cmd),
+                };
                 let mut map = std::collections::BTreeMap::new();
-                let mut idx = 0usize;
+                let mut idx = origin as usize;
+                let mut kept = 0u64;
+                let mut seen = 0u64;
                 loop {
+                    if max_lines > 0 && kept >= max_lines {
+                        break;
+                    }
                     let mut line = String::new();
                     match std::io::BufRead::read_line(&mut *reader, &mut line) {
                         Ok(0) => break,
                         Ok(_) => {
+                            seen += 1;
+                            if seen <= skip {
+                                continue;
+                            }
                             if strip_newline {
                                 line = line.trim_end_matches(['\n', '\r']).to_string();
                             }
                             map.insert(idx, line);
                             idx += 1;
+                            kept += 1;
                         }
                         Err(_) => break,
                     }
@@ -8683,6 +8735,42 @@ impl Shell {
                     let file = self.open_out(&p, *append, *clobber)?;
                     extra_fds.push(ExtraFd::Open { fd: *fd as i32, file });
                 }
+                // `{name}>file`: the descriptor is chosen here, in the
+                // shell, because the *variable* has to be set here --
+                // the child only ever sees the number.
+                Redirect::VarFd { var, kind, word } => {
+                    let p = self.expand_word(word);
+                    if *kind == crate::lexer::VarFdKind::Dup {
+                        // `{v}>&-` closes the descriptor `v` already
+                        // names; `{v}>&N` opens a fresh one duplicating
+                        // N and names *that*.
+                        if p.trim() == "-" {
+                            match self.lookup_var(var).trim().parse::<i32>() {
+                                Ok(fd) => extra_fds.push(ExtraFd::Close(fd)),
+                                Err(_) => return Err(format!("{}: ambiguous redirect", var)),
+                            }
+                        } else {
+                            match p.trim().parse::<i32>() {
+                                Ok(source) => {
+                                    let fd = next_free_fd();
+                                    self.assign_var(var, fd.to_string());
+                                    extra_fds.push(ExtraFd::Dup { fd, source });
+                                }
+                                Err(_) => return Err(format!("{}: ambiguous redirect", p)),
+                            }
+                        }
+                        continue;
+                    }
+                    let file = match kind {
+                        crate::lexer::VarFdKind::In => self.open_in(&p)?,
+                        crate::lexer::VarFdKind::InOut => self.open_in_out(&p)?,
+                        crate::lexer::VarFdKind::Out { append, clobber } => self.open_out(&p, *append, *clobber)?,
+                        crate::lexer::VarFdKind::Dup => unreachable!("handled above"),
+                    };
+                    let fd = next_free_fd();
+                    self.assign_var(var, fd.to_string());
+                    extra_fds.push(ExtraFd::Open { fd, file });
+                }
                 Redirect::FdIn { fd, word } => {
                     let p = self.expand_word(word);
                     let file = self.open_in(&p)?;
@@ -10205,8 +10293,8 @@ pub(crate) fn printf_format_once(format: &str, values: &[String], idx: &mut usiz
     outcome
 }
 
-// `read`'s view of the real stdin: never reads a byte it was not asked
-// for.
+// `read`'s view of a file descriptor: never reads a byte it was not
+// asked for.
 //
 // Any buffering here is visible behaviour, not an implementation
 // detail. `{ read -r x; cat; }` must give the first line to `read` and
@@ -10217,13 +10305,33 @@ pub(crate) fn printf_format_once(format: &str, values: &[String], idx: &mut usiz
 // `while read` loop in one shell and still wrong the moment the fd is
 // handed on. bash reads a byte at a time from a pipe for exactly this
 // reason, and so does this.
-#[derive(Default)]
-struct UnbufferedStdin {
+struct UnbufferedFd {
+    fd: i32,
     byte: [u8; 1],
     filled: bool,
 }
 
-impl std::io::Read for UnbufferedStdin {
+impl UnbufferedFd {
+    fn new(fd: i32) -> Self {
+        UnbufferedFd { fd, byte: [0], filled: false }
+    }
+
+    // Whether the descriptor is open at all. `read -u 9` on a fd
+    // nothing opened has to say so; reading it just returns EBADF, and
+    // an unread line and a closed fd are otherwise the same "no input"
+    // from the caller's side.
+    fn is_open(fd: i32) -> bool {
+        unsafe extern "C" {
+            // Same three-argument shape the rest of this codebase
+            // declares it with (see pty.rs); F_GETFD ignores the third.
+            fn fcntl(fd: i32, cmd: i32, arg: i32) -> i32;
+        }
+        // F_GETFD
+        unsafe { fcntl(fd, 1, 0) != -1 }
+    }
+}
+
+impl std::io::Read for UnbufferedFd {
     fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
         use std::io::BufRead;
         if out.is_empty() {
@@ -10238,12 +10346,12 @@ impl std::io::Read for UnbufferedStdin {
     }
 }
 
-impl std::io::BufRead for UnbufferedStdin {
+impl std::io::BufRead for UnbufferedFd {
     fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
         if !self.filled {
-            // Straight to fd 0, not through `std::io::stdin()`, whose
+            // Straight to the fd, not through `std::io::stdin()`, whose
             // own shared buffer is the thing being avoided.
-            let n = unsafe { libc_read(0, self.byte.as_mut_ptr(), 1) };
+            let n = unsafe { libc_read(self.fd, self.byte.as_mut_ptr(), 1) };
             match n {
                 1 => self.filled = true,
                 0 => return Ok(&[]),
@@ -10431,6 +10539,13 @@ pub(crate) fn current_umask() -> u32 {
 // as "nothing to restore" rather than erroring, matching how a swallowed
 // `save`/`restore` failure elsewhere in this codebase degrades rather
 // than aborting the whole call.
+// The lowest descriptor at or above 10 that nothing has open. bash
+// allocates `{name}` redirects from 10 up, deliberately clear of the
+// 0-9 a script may name directly.
+fn next_free_fd() -> i32 {
+    (10..256).find(|fd| !UnbufferedFd::is_open(*fd)).unwrap_or(10)
+}
+
 fn save_fd012() -> [i32; 3] {
     unsafe extern "C" {
         fn dup(oldfd: i32) -> i32;

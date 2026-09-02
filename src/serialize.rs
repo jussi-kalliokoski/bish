@@ -214,6 +214,15 @@ pub fn serialize_redirect(r: &Redirect) -> String {
         // body is already fully captured, so a real <<DELIM...DELIM block
         // isn't needed to reproduce the same runtime content.
         Redirect::HereDoc(w) => format!("<<<{}", serialize_word(w)),
+        Redirect::VarFd { var, kind, word } => {
+            let op = match kind {
+                crate::lexer::VarFdKind::In => "<".to_string(),
+                crate::lexer::VarFdKind::InOut => "<>".to_string(),
+                crate::lexer::VarFdKind::Out { append, clobber } => redirect_op(*append, *clobber).to_string(),
+                crate::lexer::VarFdKind::Dup => ">&".to_string(),
+            };
+            format!("{{{}}}{}{}", var, op, serialize_word(word))
+        }
         Redirect::FdOut { fd, word, append, clobber } => {
             format!("{}{}{}", fd, redirect_op(*append, *clobber), serialize_word(word))
         }

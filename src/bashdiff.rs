@@ -272,6 +272,28 @@ mod tests {
         case("lastpipe", r#"shopt -s lastpipe; set +m; n=0; seq 1 3 | while read -r l; do n=$((n+1)); done; echo "$n""#),
         case("lastpipe-status", r#"shopt -s lastpipe; set +m; false | true; echo "${PIPESTATUS[*]}"; true | false; echo "rc=$?""#),
         case("shopt-status", r#"shopt nullglob; echo "rc=$?"; shopt -s nullglob; shopt nullglob; echo "rc=$?""#),
+        // -- roadmap 14: the descriptors the shell owns ----------------
+        case(
+            "builtin-reads-a-shell-fd",
+            r#"exec 3</etc/hostname; read -r a <&3; exec 3<&-; exec 4</etc/hostname; read -r -u 4 b; exec 4<&-; [ "$a" = "$b" ] && echo same"#,
+        ),
+        case("read-u-bad-fd", r#"read -r -u 9 l 2>/dev/null; echo "rc=$?""#),
+        case("varfd-open-and-close", r#"exec {fd}</etc/hostname; echo "$((fd>=10))"; read -r -u "$fd" l; exec {fd}<&-; [ -n "$l" ] && echo read"#),
+        case("varfd-dup", r#"echo x | { exec {fd}<&0; read -r -u "$fd" l; echo "[$l]"; }"#),
+        case(
+            "mapfile-counted-options",
+            r#"printf '1
+2
+3
+4
+' | { mapfile -t -s 1 -n 2 a; echo "${#a[@]} ${a[*]}"; }"#,
+        ),
+        case(
+            "mapfile-origin",
+            r#"printf '1
+2
+' | { mapfile -t -O 5 a; echo "${!a[*]}"; }"#,
+        ),
     ];
 
     // Cases bish does not match today, each with why. Asserted to

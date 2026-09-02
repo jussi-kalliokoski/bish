@@ -1329,6 +1329,7 @@ fn highlight_tok(
         | Tok::RedirBoth { .. }
         | Tok::DupErrToOut
         | Tok::RedirFdOut { .. }
+        | Tok::RedirVarFd { .. }
         | Tok::RedirFdIn { .. }
         | Tok::RedirFdInOut { .. }
         | Tok::RedirFdDup { .. }
