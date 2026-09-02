@@ -40,6 +40,7 @@ mod pty;
 mod regex;
 mod repl;
 mod roff;
+mod scheduler;
 mod serialize;
 mod session;
 mod stackguard;

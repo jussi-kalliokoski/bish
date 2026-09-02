@@ -13561,6 +13561,13 @@ fn make_pipe() -> std::io::Result<(std::os::fd::OwnedFd, std::os::fd::OwnedFd)> 
     Ok(unsafe { (std::os::fd::OwnedFd::from_raw_fd(fds[0]), std::os::fd::OwnedFd::from_raw_fd(fds[1])) })
 }
 
+/// `make_pipe`, for the scheduler's own tests: they need a real pipe
+/// with the same close-on-exec treatment, and this is where that lives.
+#[cfg(test)]
+pub(crate) fn make_pipe_for_test() -> std::io::Result<(std::os::fd::OwnedFd, std::os::fd::OwnedFd)> {
+    make_pipe()
+}
+
 fn kill_all(children: Vec<(usize, std::process::Child)>) {
     for (_, mut c) in children {
         let _ = c.kill();
