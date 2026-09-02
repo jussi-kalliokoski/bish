@@ -128,6 +128,19 @@ mod tests {
         case("command-subst-backtick", "echo \"`printf a`\""),
         case("process-subst", r#"cat <(printf 'p\n')"#),
         case("group-command", r#"{ echo a; echo b; } | wc -l"#),
+        // `time` is a reserved word, so it takes a whole pipeline and
+        // a group, and `echo time` is still a word. The numbers vary,
+        // so these look at the shape.
+        // The numbers vary, so the cases that can be compared are the
+        // ones a format makes stable. `format_times`' own unit test
+        // covers the arithmetic.
+        case("time-format-literal", r#"TIMEFORMAT='timed'; time true"#),
+        case("time-format-percent", r#"TIMEFORMAT='%%'; time true"#),
+        case("time-status", r#"TIMEFORMAT='t'; time false; echo "status=$?""#),
+        case("time-pipeline", r#"TIMEFORMAT='t'; time printf 'b\na\n' | sort | head -1"#),
+        case("time-group", r#"TIMEFORMAT='t'; time { echo g; }"#),
+        case("time-negated", r#"TIMEFORMAT='t'; ! time false; echo "status=$?""#),
+        case("time-not-a-word", r#"echo time; x=time; echo "$x"; echo "$(echo time)""#),
         // -- globbing -------------------------------------------------
         case("glob-star", r#": > ga; : > gb; printf '%s,' g*; echo"#),
         case("glob-class", r#": > g1; : > g2; printf '%s,' g[12]; echo"#),
@@ -187,22 +200,22 @@ mod tests {
     // *still* diverge -- fixing one fails this test until its line is
     // removed, which is the only way a list like this stays true.
     const DIVERGENCES: &[(&str, &str)] = &[
+        ("function-call-redirect", "a redirect on a function *call* does not reach a builtin inside the body"),
         ("expansion-error-continues", "bish reports an expansion error and carries on with an empty result; bash abandons the command"),
         ("dbracket-pattern", "quoting the right of `[[ == ]]` should make it a literal, not a glob"),
         ("printf-octal-escape", "roadmap 8: \\nnn in a printf format is not decoded"),
         ("shopt-failglob", "failglob reports but does not abandon the command -- see expansion-error-continues"),
-        ("time-keyword", "roadmap 7: `time` is not a reserved word here"),
         ("builtin-gaps", "roadmap 9: [[ -v ]], wait -n, kill -l SIG, exec -a, set -C"),
     ];
 
     // The cases the divergence list is about. Kept apart from `CASES`
     // so that list stays a description of what works.
     const PENDING: &[Case] = &[
+        case("function-call-redirect", r#"f() { echo inner >&2; }; f 2>/dev/null; echo after"#),
         case("expansion-error-continues", r#"a=(1 2 3); printf '[%s]' "${a[@]:1:-1}"; echo"#),
         case("dbracket-pattern", r#"[[ abc == a* ]] && echo glob; [[ abc == "a*" ]] || echo literal"#),
         case("printf-octal-escape", r#"printf 'a\101b\n'"#),
         case("shopt-failglob", r#"shopt -s failglob; printf '%s,' zz_no_match*; echo"#),
-        case("time-keyword", r#"time true"#),
         case("builtin-gaps", r#"x=1; [[ -v x ]] && echo v; kill -l 9"#),
     ];
 

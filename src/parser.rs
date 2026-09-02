@@ -184,6 +184,19 @@ pub enum TestAtom {
 pub struct Pipeline {
     pub commands: Vec<Command>,
     pub negate: bool,
+    /// `time` in front of the pipeline. A reserved word rather than a
+    /// builtin -- which is the whole reason it lives on the pipeline
+    /// and not in an argv: it times *all* of it, and a builtin could
+    /// only ever see one command's worth.
+    pub timed: Option<TimeStyle>,
+}
+
+/// Which shape `time` reports in. `-p` is POSIX's, plain seconds on
+/// three unadorned lines; the default is bash's own `0m0.000s`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum TimeStyle {
+    Shell,
+    Posix,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -342,23 +355,42 @@ impl Parser {
     }
 
     fn parse_pipeline(&mut self) -> Result<Pipeline, String> {
-        let negate = if let Some(Tok::Word(chunks, _)) = self.peek() {
-            if matches!(chunks.as_slice(), [Chunk::Str(s)] if s == "!") {
+        // `time [-p]` and `!`, in either order: the grammar puts `time`
+        // first but bash takes `! time true` too. Recognized by their
+        // text, like `!` always has been here, because both are only
+        // keywords where a command could start -- `echo time` is a
+        // word.
+        let mut timed = None;
+        let mut negate = false;
+        loop {
+            if timed.is_none() && self.word_is("time") {
                 self.advance();
-                true
-            } else {
-                false
+                timed = Some(TimeStyle::Shell);
+                if self.word_is("-p") {
+                    self.advance();
+                    timed = Some(TimeStyle::Posix);
+                }
+                continue;
             }
-        } else {
-            false
-        };
+            if !negate && self.word_is("!") {
+                self.advance();
+                negate = true;
+                continue;
+            }
+            break;
+        }
         let mut commands = vec![self.parse_command()?];
         while matches!(self.peek(), Some(Tok::Pipe)) {
             self.advance();
             self.skip_newlines();
             commands.push(self.parse_command()?);
         }
-        Ok(Pipeline { commands, negate })
+        Ok(Pipeline { commands, negate, timed })
+    }
+
+    // Whether the next token is exactly this unquoted word.
+    fn word_is(&self, text: &str) -> bool {
+        matches!(self.peek(), Some(Tok::Word(chunks, _)) if matches!(chunks.as_slice(), [Chunk::Str(s)] if s == text))
     }
 
     fn parse_command(&mut self) -> Result<Command, String> {

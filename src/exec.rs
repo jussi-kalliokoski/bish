@@ -12,7 +12,8 @@ use crate::compgen;
 use crate::glob;
 use crate::lexer::{Chunk, ReplaceAnchor, TransformKind, VarOp};
 use crate::parser::{
-    self, AndOr, ArrayLiteralItem, AssignMode, Combinator, ListItem, Pipeline, Program, Redirect, Sep, SimpleCommand, Word,
+    self, AndOr, ArrayLiteralItem, AssignMode, Combinator, ListItem, Pipeline, Program, Redirect, Sep, SimpleCommand,
+    TimeStyle, Word,
 };
 use crate::pty;
 use crate::vt100;
@@ -2291,7 +2292,7 @@ impl Shell {
                     } else {
                         let def = parser::Command::FuncDef { name: name.clone(), body: Box::new(body) };
                         let src = crate::serialize::serialize_program(&[ListItem {
-                            and_or: AndOr { first: Pipeline { commands: vec![def], negate: false }, rest: Vec::new() },
+                            and_or: AndOr { first: Pipeline { commands: vec![def], negate: false, timed: None }, rest: Vec::new() },
                             sep: Sep::Seq,
                             line: 0,
                         }]);
@@ -3543,6 +3544,83 @@ impl Shell {
     }
 
     fn run_pipeline(&mut self, pipeline: &Pipeline, background: bool) -> ExecResult {
+        if let Some(style) = pipeline.timed {
+            let started = std::time::Instant::now();
+            let before = child_cpu_times();
+            let result = self.run_pipeline_untimed(pipeline, background);
+            let after = child_cpu_times();
+            let report = self.format_times(style, started.elapsed().as_secs_f64(), after.0 - before.0, after.1 - before.1);
+            sh_eprint!(self, "{report}");
+            return result;
+        }
+        self.run_pipeline_untimed(pipeline, background)
+    }
+
+    // `time`'s own report. bash's default is a blank line and then
+    // three `0m0.000s` rows; `-p` is POSIX's three bare seconds.
+    // `TIMEFORMAT` replaces the first of those -- the subset of its
+    // language anyone writes: `%R`/`%U`/`%S` for the three numbers,
+    // `%P` for the percentage, an `l` for the `0m0.000s` spelling, a
+    // digit for the precision, and `%%` for a literal one.
+    fn format_times(&mut self, style: TimeStyle, real: f64, user: f64, sys: f64) -> String {
+        let format = match style {
+            TimeStyle::Posix => "real %2R\nuser %2U\nsys %2S".to_string(),
+            TimeStyle::Shell => match self.var_is_set("TIMEFORMAT") {
+                true => self.lookup_var("TIMEFORMAT"),
+                false => "\nreal\t%3lR\nuser\t%3lU\nsys\t%3lS".to_string(),
+            },
+        };
+        let mut out = String::new();
+        let mut chars = format.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c != '%' {
+                out.push(c);
+                continue;
+            }
+            let mut precision = 3;
+            if let Some(d) = chars.peek().and_then(|c| c.to_digit(10)) {
+                precision = d.min(3) as usize;
+                chars.next();
+            }
+            let long = chars.peek() == Some(&'l');
+            if long {
+                chars.next();
+            }
+            let value = match chars.next() {
+                Some('R') => real,
+                Some('U') => user,
+                Some('S') => sys,
+                Some('P') => {
+                    let percent = match real > 0.0 {
+                        true => (user + sys) / real * 100.0,
+                        false => 0.0,
+                    };
+                    out.push_str(&format!("{percent:.precision$}"));
+                    continue;
+                }
+                Some('%') => {
+                    out.push('%');
+                    continue;
+                }
+                other => {
+                    out.push('%');
+                    out.extend(other);
+                    continue;
+                }
+            };
+            match long {
+                // `0m0.000s`: whole minutes, then the rest of the
+                // seconds. No padding on the integer part -- 65 seconds
+                // is `1m5.000s`.
+                true => out.push_str(&format!("{}m{:.precision$}s", (value as i64) / 60, value % 60.0)),
+                false => out.push_str(&format!("{value:.precision$}")),
+            }
+        }
+        out.push('\n');
+        out
+    }
+
+    fn run_pipeline_untimed(&mut self, pipeline: &Pipeline, background: bool) -> ExecResult {
         if pipeline.negate {
             // POSIX exempts a `!`-negated pipeline's own failure from -e
             // (that's usually the whole point of negating it).
@@ -3770,7 +3848,7 @@ impl Shell {
             let def = parser::Command::FuncDef { name: name.clone(), body: Box::new(body.clone()) };
             s.push_str(&crate::serialize::serialize_program(&[ListItem {
                 and_or: AndOr {
-                    first: Pipeline { commands: vec![def], negate: false },
+                    first: Pipeline { commands: vec![def], negate: false, timed: None },
                     rest: Vec::new(),
                 },
                 sep: Sep::Seq,
@@ -8687,6 +8765,53 @@ pub(crate) fn shell_quote(s: &str) -> String {
 }
 
 #[cfg(test)]
+mod time_format_tests {
+    use super::TimeStyle;
+
+    fn formatted(style: TimeStyle, format: Option<&str>, real: f64, user: f64, sys: f64) -> String {
+        let mut shell = super::Shell::new();
+        // A global lives in the real process environment, so it
+        // outlives the `Shell` that set it and would leak into the next
+        // case here.
+        match format {
+            Some(f) => shell.assign_var("TIMEFORMAT", f.to_string()),
+            None => unsafe { std::env::remove_var("TIMEFORMAT") },
+        }
+        shell.format_times(style, real, user, sys)
+    }
+
+    // The numbers are what a corpus case cannot pin, so they are
+    // pinned here instead. Every expectation was read off real bash
+    // with the same inputs.
+    #[test]
+    fn the_default_shape_is_bashs_own() {
+        assert_eq!(formatted(TimeStyle::Shell, None, 0.0, 0.0, 0.0), "\nreal\t0m0.000s\nuser\t0m0.000s\nsys\t0m0.000s\n");
+        assert_eq!(
+            formatted(TimeStyle::Shell, None, 65.5, 1.25, 0.5),
+            "\nreal\t1m5.500s\nuser\t0m1.250s\nsys\t0m0.500s\n",
+            "whole minutes, and no padding on the seconds"
+        );
+    }
+
+    #[test]
+    fn dash_p_is_posixs() {
+        assert_eq!(formatted(TimeStyle::Posix, None, 1.5, 0.25, 0.0), "real 1.50\nuser 0.25\nsys 0.00\n");
+        assert_eq!(formatted(TimeStyle::Posix, Some("ignored"), 1.0, 0.0, 0.0), "real 1.00\nuser 0.00\nsys 0.00\n", "TIMEFORMAT is not consulted for -p");
+    }
+
+    #[test]
+    fn timeformat_reads_the_specifiers_anyone_writes() {
+        assert_eq!(formatted(TimeStyle::Shell, Some("R=%R U=%U S=%S"), 2.0, 1.0, 0.5), "R=2.000 U=1.000 S=0.500\n");
+        assert_eq!(formatted(TimeStyle::Shell, Some("%1R"), 2.25, 0.0, 0.0), "2.2\n", "a digit sets the precision");
+        assert_eq!(formatted(TimeStyle::Shell, Some("%lR"), 61.0, 0.0, 0.0), "1m1.000s\n", "`l` is the minutes-and-seconds spelling");
+        assert_eq!(formatted(TimeStyle::Shell, Some("%P"), 2.0, 1.0, 0.5), "75.000\n", "cpu as a percentage of wall clock");
+        assert_eq!(formatted(TimeStyle::Shell, Some("%P"), 0.0, 1.0, 0.5), "0.000\n", "and no division by a zero elapsed");
+        assert_eq!(formatted(TimeStyle::Shell, Some("%%lit%%"), 0.0, 0.0, 0.0), "%lit%\n");
+        assert_eq!(formatted(TimeStyle::Shell, Some("%Q"), 0.0, 0.0, 0.0), "%Q\n", "an unknown one is printed back");
+    }
+}
+
+#[cfg(test)]
 mod did_you_mean_tests {
     fn stderr_of(script: &str) -> String {
         let mut shell = super::Shell::new();
@@ -9406,6 +9531,31 @@ fn slice_elements(items: Vec<String>, offset: i64, length: Option<i64>) -> Resul
         Some(n) => (start + n).min(count),
     };
     Ok(items.into_iter().skip(start as usize).take((end - start).max(0) as usize).collect())
+}
+
+// The CPU a shell's children have used so far, in seconds. `times(2)`
+// rather than `getrusage`, because it is the same call the `times`
+// builtin already makes and it reports exactly the two numbers `time`
+// wants.
+fn child_cpu_times() -> (f64, f64) {
+    #[repr(C)]
+    struct Tms {
+        utime: i64,
+        stime: i64,
+        cutime: i64,
+        cstime: i64,
+    }
+    unsafe extern "C" {
+        fn times(buf: *mut Tms) -> i64;
+        fn sysconf(name: i32) -> i64;
+    }
+    const SC_CLK_TCK: i32 = 2;
+    let mut tms = Tms { utime: 0, stime: 0, cutime: 0, cstime: 0 };
+    if unsafe { times(&mut tms as *mut Tms) } == -1 {
+        return (0.0, 0.0);
+    }
+    let ticks = unsafe { sysconf(SC_CLK_TCK) }.max(1) as f64;
+    (tms.cutime as f64 / ticks, tms.cstime as f64 / ticks)
 }
 
 fn exit_code_from_status(status: std::process::ExitStatus) -> i32 {
