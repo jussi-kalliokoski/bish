@@ -4732,12 +4732,14 @@ impl Shell {
                 }
                 Chunk::ArrayKeys { name, quoted } => {
                     let name = name.clone();
-                    let v = self.array_keys(&name).join(" ");
+                    let sep = self.ifs_join_char();
+                    let v = self.array_keys(&name).join(&sep);
                     out.push_str(&if *quoted { crate::regex::escape(&v) } else { v });
                 }
                 Chunk::VarNamesMatchingPrefix { prefix, quoted, .. } => {
                     let prefix = prefix.clone();
-                    let v = self.var_names_with_prefix(&prefix).join(" ");
+                    let sep = self.ifs_join_char();
+                    let v = self.var_names_with_prefix(&prefix).join(&sep);
                     out.push_str(&if *quoted { crate::regex::escape(&v) } else { v });
                 }
                 Chunk::ProcSubIn { raw } => {
@@ -6500,11 +6502,15 @@ impl Shell {
                 }
                 Chunk::ArrayKeys { name, .. } => {
                     let name = name.clone();
-                    s.push_str(&self.array_keys(&name).join(" "));
+                    let sep = self.ifs_join_char();
+                    let keys = self.array_keys(&name).join(&sep);
+                    s.push_str(&keys);
                 }
                 Chunk::VarNamesMatchingPrefix { prefix, .. } => {
                     let prefix = prefix.clone();
-                    s.push_str(&self.var_names_with_prefix(&prefix).join(" "));
+                    let sep = self.ifs_join_char();
+                    let names = self.var_names_with_prefix(&prefix).join(&sep);
+                    s.push_str(&names);
                 }
                 Chunk::ProcSubIn { raw } => {
                     let raw = raw.clone();
@@ -6552,7 +6558,8 @@ impl Shell {
 
     fn array_element(&mut self, name: &str, index: &str) -> String {
         if index == "@" || index == "*" {
-            return self.array_all(name).join(" ");
+            let sep = self.ifs_join_char();
+            return self.array_all(name).join(&sep);
         }
         if self.assoc_names.contains(name) {
             let key = self.expand_index_as_string(index);
@@ -6834,7 +6841,8 @@ impl Shell {
                         let items = self.array_all(name);
                         append_parts_glob(&mut fields, &mut current, &mut patterns, &mut pattern_current, &items);
                     } else if index == "@" || index == "*" {
-                        let joined = self.array_all(name).join(" ");
+                        let sep = self.ifs_join_char();
+                        let joined = self.array_all(name).join(&sep);
                         append_splittable_glob(&mut fields, &mut current, &mut patterns, &mut pattern_current, &joined, *quoted, &ifs);
                     } else {
                         let name = name.clone();
@@ -6878,7 +6886,8 @@ impl Shell {
                         let items = self.array_keys(name);
                         append_parts_glob(&mut fields, &mut current, &mut patterns, &mut pattern_current, &items);
                     } else {
-                        let joined = self.array_keys(name).join(" ");
+                        let sep = self.ifs_join_char();
+                        let joined = self.array_keys(name).join(&sep);
                         append_splittable_glob(&mut fields, &mut current, &mut patterns, &mut pattern_current, &joined, *quoted, &ifs);
                     }
                 }
@@ -7306,7 +7315,14 @@ impl Shell {
             "?" => self.last_status.to_string(),
             "0" => self.script_name.clone(),
             "#" => self.arg_frames.last().map(|a| a.len()).unwrap_or(0).to_string(),
-            "@" | "*" => self.arg_frames.last().map(|a| a.join(" ")).unwrap_or_default(),
+            // Joined on IFS's first character, not a space: `IFS=-;
+            // echo "$*"` is `a-b-c`. Unquoted `$*` reads the same way
+            // and is then split on IFS again, which is how bash gets
+            // separate fields out of it.
+            "@" | "*" => {
+                let sep = self.ifs_join_char();
+                self.arg_frames.last().map(|a| a.join(&sep)).unwrap_or_default()
+            }
             // $$/$!/$RANDOM/$SECONDS/$- are always computed live, never
             // read back from var_scopes/env, matching how bash treats them
             // as effectively magic rather than ordinary settable

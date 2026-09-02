@@ -47,6 +47,14 @@ mod tests {
         case("param-subst", r#"x=aXbXc; echo "${x/X/-}" "${x//X/-}" "${x/#a/A}" "${x/%c/C}""#),
         case("param-indirect", r#"v=hello; n=v; echo "${!n}""#),
         case("param-at-split", r#"set -- "a b" c; for w in "$@"; do echo "[$w]"; done"#),
+        // A list joins on IFS's first character, not on a space, and
+        // an unquoted one is that same join split again.
+        case("ifs-join-star", r#"set -- a b c; IFS=-; printf '[%s]' "$*"; echo"#),
+        case("ifs-join-array", r#"a=(x y z); IFS=-; printf '[%s]' "${a[*]}"; echo"#),
+        case("ifs-join-unquoted", r#"set -- a b c; IFS=-; printf '[%s]' $*; printf '[%s]' $@; echo"#),
+        case("ifs-join-empty", r#"set -- a b c; IFS=; printf '[%s]' "$*"; echo"#),
+        case("ifs-join-multichar", r#"set -- a b c; IFS=xy; printf '[%s]' "$*"; echo"#),
+        case("ifs-join-keys", r#"aa_1=; aa_2=; set -- ${!aa_*}; printf '%s' "$#""#),
         case("param-nested", r#"x=abc; echo "${x/$(printf b)/Z}""#),
         // -- arrays ---------------------------------------------------
         case("array-basic", r#"a=(1 2 3); echo "${a[0]}" "${a[@]}" "${#a[@]}" "${!a[@]}""#),
@@ -158,8 +166,6 @@ mod tests {
     // removed, which is the only way a list like this stays true.
     const DIVERGENCES: &[(&str, &str)] = &[
         ("expansion-error-continues", "bish reports an expansion error and carries on with an empty result; bash abandons the command"),
-        ("param-quoted-star", "roadmap 6: \"$*\" does not join on IFS"),
-        ("array-star-join", "roadmap 6: \"${a[*]}\" does not join on IFS"),
         ("dbracket-pattern", "quoting the right of `[[ == ]]` should make it a literal, not a glob"),
         ("printf-octal-escape", "roadmap 8: \\nnn in a printf format is not decoded"),
         ("shopt-nullglob", "roadmap 4: the globbing shopts are tracked and ignored"),
@@ -174,8 +180,6 @@ mod tests {
     // so that list stays a description of what works.
     const PENDING: &[Case] = &[
         case("expansion-error-continues", r#"a=(1 2 3); printf '[%s]' "${a[@]:1:-1}"; echo"#),
-        case("param-quoted-star", r#"set -- a b c; IFS=,; echo "$*"; echo "$@""#),
-        case("array-star-join", r#"a=(x y); IFS=-; echo "${a[*]}""#),
         case("dbracket-pattern", r#"[[ abc == a* ]] && echo glob; [[ abc == "a*" ]] || echo literal"#),
         case("printf-octal-escape", r#"printf 'a\101b\n'"#),
         case("shopt-nullglob", r#"shopt -s nullglob; printf '%s,' zz_no_match*; echo"#),
