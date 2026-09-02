@@ -3555,8 +3555,9 @@ impl Shell {
         std::env::set_current_dir(target).map_err(|e| os_message(&e))?;
         self.cwd = std::env::current_dir().unwrap_or_else(|_| target.to_path_buf());
         let new = self.cwd.to_string_lossy().into_owned();
-        env_set("OLDPWD", &old);
-        env_set("PWD", &new);
+        // Not written to the real environment: `PWD` and `OLDPWD` are
+        // exported shell variables, and a child gets them the way it
+        // gets every other one.
         // ...and into the variable table, which is what `$PWD` actually
         // reads now. Both are exported in bash, so they stay in the
         // real environment too, above.
@@ -4261,21 +4262,16 @@ impl Shell {
         // `cd` inside this construct (`$(cd /tmp && pwd)`) must not leak
         // back out to the real shell once this call returns.
         let real_cwd_before = std::env::current_dir().ok();
-        // A plain (non-`local`) variable assignment isn't Shell-owned
-        // state at all -- raw_var_write's own fallback writes straight to
-        // the real process environment (see its own doc comment), which
-        // is how bish gives builtins/scripts free interop with spawned
-        // external commands. That means it's process-wide, exactly like
-        // cwd: `new_virtual_child`'s "the two sessions evolve
-        // independently" doc comment is only true for arrays/assoc-
-        // arrays/functions/etc, which really are their own Rust-owned
-        // fields -- a bare `x=2` inside this construct would otherwise
-        // permanently clobber the real parent's own `x` the moment this
-        // runs in-process instead of as a separate OS process. Snapshot
-        // and restore exactly, same technique as cwd just above: any var
-        // the child added gets removed, anything it changed gets put
-        // back, matching real bash's fork isolation for env/variables.
-        env_journal_push();
+        // Variables need nothing here any more, and the absence is
+        // deliberate. A plain `x=2` inside this construct used to write
+        // straight to the real process environment, which is shared
+        // with the parent -- so isolating it meant snapshotting the
+        // whole environment on the way in and replaying it on the way
+        // out, O(env) to take and O(env^2) to restore. `child` owns its
+        // own `globals`, and a spawned process is handed those rather
+        // than reading `environ` (see `Shell::command`), so the
+        // isolation is now a property of the data rather than something
+        // reconstructed around every construct.
         // Same reasoning, for `umask` (a real process-wide syscall, not
         // Shell-owned state either -- see current_umask's own doc
         // comment).
@@ -4314,7 +4310,6 @@ impl Shell {
         }
         unsafe { umask(umask_before) };
         restore_fd012(saved_fd012);
-        env_journal_pop_and_restore();
 
         match result {
             // A subshell's own `exit`/`set -e`/`set -u` must not kill the
@@ -6161,7 +6156,6 @@ impl Shell {
                 if argv.get(1).map(String::as_str) == Some("-n") {
                     for name in &argv[2..] {
                         self.exported_names.remove(name);
-                        env_unset(name);
                     }
                     return ExecResult::Status(0);
                 }
@@ -8747,15 +8741,19 @@ impl Shell {
     // `printf 'a\0b' | read -r -d "" v` used to kill the shell; a
     // shell variable may hold one, a C environment string may not, and
     // the variable is worth more than the export.
-    fn export_to_environment(&self, name: &str, value: &str) {
-        if !self.exported_names.contains(name) {
-            return;
-        }
-        if name.contains('\0') || value.contains('\0') {
-            return;
-        }
-        env_set(name, value);
-    }
+    /// Kept as the one place that documents why nothing happens here.
+    ///
+    /// An exported variable used to be written straight into the real
+    /// process environment so a spawned child would inherit it. Children
+    /// are now built from the shell's own exported names (see
+    /// `Shell::command`), which is where the value already is -- and the
+    /// write was the only thing making one shell's variables visible to
+    /// another sharing this process, which is exactly what an in-process
+    /// pipeline stage must not do.
+    ///
+    /// The NUL check that used to live here moved to `exported_pairs`,
+    /// which is now what a value has to survive to reach a child.
+    fn export_to_environment(&self, _name: &str, _value: &str) {}
 
     // Removes a name from wherever it lives: the innermost local scope
     // holding it, the globals, and the real environment. Shared by
@@ -8767,7 +8765,6 @@ impl Shell {
             }
         }
         self.globals.remove(name);
-        env_unset(name);
     }
 
     // Follows a `declare -n`/`local -n` chain to the final target name,
@@ -9016,6 +9013,23 @@ impl Shell {
         } else {
             snap.insert("COLORTERM".to_string(), colorterm.to_string());
         }
+        // And into the variables, which is what a spawned command now
+        // reads (see `Shell::command`). Reattaching a session to a
+        // different terminal used to reach a child through the real
+        // process environment, which this wrote by way of
+        // `sync_real_state_in`; children no longer read that, so a
+        // `TERM` updated only there would have been invisible to every
+        // program the session went on to run.
+        if !term.is_empty() {
+            self.assign_var("TERM", term.to_string());
+            self.exported_names.insert("TERM".to_string());
+        }
+        if colorterm.is_empty() {
+            self.globals.remove("COLORTERM");
+        } else {
+            self.assign_var("COLORTERM", colorterm.to_string());
+            self.exported_names.insert("COLORTERM".to_string());
+        }
     }
 
     // `set -u`: only a *bare* $VAR/${VAR} reference to a truly-unset name
@@ -9039,7 +9053,7 @@ impl Shell {
             sh_println!(self, "{}", if verbose { format!("{} is a shell builtin", name) } else { name.to_string() });
             return 0;
         }
-        match resolve_in_path(name) {
+        match resolve_in_path(name, &self.lookup_var("PATH")) {
             Some(p) => {
                 sh_println!(self, "{}", if verbose { format!("{} is {}", name, p) } else { p });
                 0
@@ -11651,50 +11665,6 @@ fn broken_pipe_seen() -> bool {
     BROKEN_PIPE.with(|b| *b.borrow() == Some(true))
 }
 
-// One name and what it held before the innermost child touched it --
-// `None` for a name that did not exist, which the restore removes again
-// rather than setting to empty.
-type EnvUndo = (String, Option<String>);
-
-thread_local! {
-    static ENV_JOURNAL: RefCell<Vec<Vec<EnvUndo>>> = const { RefCell::new(Vec::new()) };
-}
-
-fn env_journal_record(name: &str) {
-    ENV_JOURNAL.with(|j| {
-        let mut j = j.borrow_mut();
-        if let Some(frame) = j.last_mut() {
-            frame.push((name.to_string(), std::env::var(name).ok()));
-        }
-    });
-}
-
-fn env_journal_push() {
-    ENV_JOURNAL.with(|j| j.borrow_mut().push(Vec::new()));
-}
-
-fn env_journal_pop_and_restore() {
-    let frame = ENV_JOURNAL.with(|j| j.borrow_mut().pop()).unwrap_or_default();
-    for (name, before) in frame.into_iter().rev() {
-        match before {
-            Some(v) => unsafe { std::env::set_var(&name, v) },
-            None => unsafe { std::env::remove_var(&name) },
-        }
-    }
-}
-
-// Every write to the real process environment from the shell goes through
-// these two, so the journal above sees it.
-pub(crate) fn env_set(name: &str, value: &str) {
-    env_journal_record(name);
-    unsafe { std::env::set_var(name, value) };
-}
-
-pub(crate) fn env_unset(name: &str) {
-    env_journal_record(name);
-    unsafe { std::env::remove_var(name) };
-}
-
 // A cheap order-sensitive fingerprint of a call's positional parameters.
 // FNV-1a: no allocation, and the frames only ever compare it against
 // another fingerprint taken the same way.
@@ -13544,11 +13514,15 @@ fn is_known_builtin(name: &str) -> bool {
     KNOWN_BUILTINS.contains(&name)
 }
 
-pub(crate) fn resolve_in_path(name: &str) -> Option<String> {
+/// Where `name` is found, searching `path_var` -- which is the *shell's*
+/// `PATH`, handed in rather than read from the process environment.
+///
+/// The two are the same until a script assigns `PATH`, and a shell
+/// variable's home is the shell.
+pub(crate) fn resolve_in_path(name: &str, path_var: &str) -> Option<String> {
     if name.contains('/') {
         return if std::path::Path::new(name).is_file() { Some(name.to_string()) } else { None };
     }
-    let path_var = std::env::var("PATH").unwrap_or_default();
     for dir in path_var.split(':') {
         let candidate = std::path::Path::new(dir).join(name);
         if !candidate.is_file() {

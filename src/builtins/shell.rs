@@ -471,7 +471,7 @@ pub(crate) fn run_type(sh: &mut Shell, args: &[String]) -> i32 {
                 continue;
             }
         }
-        match resolve_in_path(name) {
+        match resolve_in_path(name, &sh.lookup_var("PATH")) {
             Some(p) => {
                 if kind_only {
                     sh_println!(sh, "file");
