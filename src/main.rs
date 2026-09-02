@@ -6,6 +6,7 @@ mod bishedit;
 mod browser;
 mod builtins;
 mod compgen;
+mod coroutine;
 mod csscolor;
 mod debugger;
 mod diff;
