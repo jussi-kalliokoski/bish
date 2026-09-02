@@ -141,6 +141,20 @@ mod tests {
         // A quoted word is not a pattern however many metacharacters
         // it has in it, so none of the above may touch it.
         case("shopt-nullglob-quoted", r#"shopt -s nullglob; printf '[%s]' 'a*b'; echo"#),
+        // Every component may be a pattern, not only the last.
+        case("glob-multi-component", r#"mkdir -p m/one m/two; : > m/one/f.c; : > m/two/f.c; printf '[%s]' m/*/f.c */*.c; echo"#),
+        case("glob-question-component", r#"mkdir -p m/one; : > m/one/f; printf '[%s]' m/?ne/f; echo"#),
+        case("glob-missing-dir", r#"printf '[%s]' nodir_zz/*; echo"#),
+        // `**` is any number of directories, none included, and it
+        // does not descend through a symlink where a single `*` still
+        // steps through one.
+        case("globstar-all", r#"mkdir -p a/b/c; : > x; : > a/x; : > a/b/x; shopt -s globstar; printf '[%s]' **; echo"#),
+        case("globstar-suffix", r#"mkdir -p a/b/c; : > x; : > a/x; : > a/b/c/x; shopt -s globstar; printf '[%s]' **/x; echo"#),
+        case("globstar-middle", r#"mkdir -p a/b/c; : > a/x; : > a/b/c/x; shopt -s globstar; printf '[%s]' a/**/x; echo"#),
+        case("globstar-prefix", r#"mkdir -p a/b; : > a/b/x; shopt -s globstar; printf '[%s]' a/**; echo"#),
+        case("globstar-dirs-only", r#"mkdir -p a/b; : > a/x; shopt -s globstar; printf '[%s]' **/; echo"#),
+        case("globstar-symlink", r#"mkdir -p a/b; : > a/x; ln -s a link; shopt -s globstar; printf '[%s]' **/x; printf '[%s]' */x; echo"#),
+        case("globstar-off", r#"mkdir -p a/b; : > x; : > a/x; shopt -u globstar; printf '[%s]' ** **/x; echo"#),
         case("brace-list", r#"echo {a,b}{1,2}"#),
         case("brace-range", r#"echo {1..5} {a..e} {1..9..3}"#),
         case("brace-nested", r#"echo {a,b{1,2}}"#),
@@ -177,7 +191,6 @@ mod tests {
         ("dbracket-pattern", "quoting the right of `[[ == ]]` should make it a literal, not a glob"),
         ("printf-octal-escape", "roadmap 8: \\nnn in a printf format is not decoded"),
         ("shopt-failglob", "failglob reports but does not abandon the command -- see expansion-error-continues"),
-        ("globstar", "roadmap 5: ** is not implemented"),
         ("time-keyword", "roadmap 7: `time` is not a reserved word here"),
         ("builtin-gaps", "roadmap 9: [[ -v ]], wait -n, kill -l SIG, exec -a, set -C"),
     ];
@@ -189,7 +202,6 @@ mod tests {
         case("dbracket-pattern", r#"[[ abc == a* ]] && echo glob; [[ abc == "a*" ]] || echo literal"#),
         case("printf-octal-escape", r#"printf 'a\101b\n'"#),
         case("shopt-failglob", r#"shopt -s failglob; printf '%s,' zz_no_match*; echo"#),
-        case("globstar", r#"mkdir -p a/b; : > a/b/deep; shopt -s globstar; printf '%s,' **/deep; echo"#),
         case("time-keyword", r#"time true"#),
         case("builtin-gaps", r#"x=1; [[ -v x ]] && echo v; kill -l 9"#),
     ];

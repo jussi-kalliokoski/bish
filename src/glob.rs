@@ -235,48 +235,172 @@ pub struct Options {
     pub dotglob: bool,
     /// `shopt -s nocaseglob`: match without regard to case.
     pub nocaseglob: bool,
+    /// `shopt -s globstar`: `**` as a whole component stands for any
+    /// number of directories.
+    pub globstar: bool,
 }
 
 /// Expands a glob pattern against the filesystem.
 ///
-/// `None` means "this is not a pattern at all" -- no metacharacters --
-/// and is a different answer from `Some(vec![])`, which means it is a
-/// pattern that matched nothing. Only the caller can decide what the
-/// second one means: left alone it is bash's default, `nullglob` drops
-/// the word, and `failglob` makes it an error.
+/// `None` means "this is not a pattern at all" -- no unescaped
+/// metacharacters -- and is a different answer from `Some(vec![])`,
+/// which means it is a pattern that matched nothing. Only the caller
+/// can decide what the second one means: left alone it is bash's
+/// default, `nullglob` drops the word, and `failglob` makes it an
+/// error.
 ///
-/// Only the final path component may contain metacharacters: `dir/*.c`
-/// works, `*/x` does not.
+/// Every path component may be a pattern, and `**` (with `globstar`)
+/// stands for any number of directories, none included.
 pub fn expand(pattern: &str, options: Options) -> Option<Vec<String>> {
     if !has_meta(pattern) {
         return None;
     }
-    let (dir, base_pattern, prefix) = match pattern.rfind('/') {
-        Some(idx) => (pattern[..idx].to_string(), &pattern[idx + 1..], format!("{}/", &pattern[..idx])),
-        None => (".".to_string(), pattern, String::new()),
-    };
-    let Ok(entries) = std::fs::read_dir(&dir) else { return Some(Vec::new()) };
-    let mut found: Vec<String> = entries
+    let absolute = pattern.starts_with('/');
+    let trailing_slash = pattern.len() > 1 && pattern.ends_with('/');
+    let components: Vec<&str> = pattern.trim_matches('/').split('/').filter(|c| !c.is_empty()).collect();
+    let mut candidates = vec![if absolute { "/".to_string() } else { String::new() }];
+
+    for (i, component) in components.iter().enumerate() {
+        let last = i + 1 == components.len();
+        let mut next = Vec::new();
+        for base in &candidates {
+            match *component {
+                // `**` is any number of directories, including none --
+                // so `a/**/x` finds `a/x` as well as `a/b/c/x`. As the
+                // last component it also names the files it passed, so
+                // `**` on its own lists everything.
+                "**" if options.globstar => {
+                    for path in descend(base, !last) {
+                        next.push(match (path.is_empty(), last) {
+                            // No directories at all. On the end that is
+                            // the base itself, which bash writes with
+                            // the separator the pattern had -- `a/**`
+                            // lists `a/`. In the middle the separator
+                            // belongs to whatever comes next, or
+                            // `a/**/x` would be `a//x`.
+                            (true, true) => join(base, ""),
+                            (true, false) => base.clone(),
+                            _ => join(base, &path),
+                        });
+                    }
+                }
+                _ => {
+                    for name in read_names(base, component, options) {
+                        next.push(join(base, &name));
+                    }
+                }
+            }
+        }
+        candidates = next;
+        candidates.sort();
+        candidates.dedup();
+    }
+
+    let mut found: Vec<String> = candidates
+        .into_iter()
+        .filter(|p| !p.is_empty())
+        .filter(|p| !trailing_slash || std::fs::metadata(p).is_ok_and(|m| m.is_dir()))
+        .map(|p| match trailing_slash {
+            true => format!("{p}/"),
+            false => p,
+        })
+        .collect();
+    found.sort();
+    found.dedup();
+    Some(found)
+}
+
+// One component's worth of matching: the names in `base` that
+// `component` matches, or the component itself when it is not a
+// pattern (in which case only its existence matters).
+fn read_names(base: &str, component: &str, options: Options) -> Vec<String> {
+    let dir = if base.is_empty() { "." } else { base };
+    if !has_meta(component) {
+        let literal = unescape(component);
+        let path = join(base, &literal);
+        let path = if path.is_empty() { ".".to_string() } else { path };
+        return match std::fs::symlink_metadata(&path).is_ok() {
+            true => vec![literal],
+            false => Vec::new(),
+        };
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else { return Vec::new() };
+    entries
         .filter_map(|e| e.ok())
         .filter_map(|e| e.file_name().into_string().ok())
         .filter(|name| {
             // A leading `.` has to be asked for by name -- unless
-            // `dotglob` says otherwise. `.` and `..` are never
-            // produced either way, which is what `globskipdots`
-            // defaults to and bash 5.2 made unconditional.
-            if name.starts_with('.') && !options.dotglob && !base_pattern.starts_with('.') {
+            // `dotglob` says otherwise. `.` and `..` are never produced
+            // either way, which is what `globskipdots` defaults to and
+            // bash 5.2 made unconditional.
+            if name.starts_with('.') && !options.dotglob && !component.starts_with('.') {
                 return false;
             }
             if name == "." || name == ".." {
                 return false;
             }
             match options.nocaseglob {
-                true => matches(&base_pattern.to_lowercase(), &name.to_lowercase()),
-                false => matches(base_pattern, name),
+                true => matches(&component.to_lowercase(), &name.to_lowercase()),
+                false => matches(component, name),
             }
         })
-        .map(|name| format!("{}{}", prefix, name))
-        .collect();
-    found.sort();
-    Some(found)
+        .collect()
+}
+
+// What `**` stands for at `base`: the empty path (no directories at
+// all), and every path under it. Symlinks are named but never
+// descended into, which is bash's rule and the only thing between this
+// and a cycle -- `*/x` still goes through one, because that is the
+// component's own single step rather than this walk.
+//
+// `dirs_only` for a `**` that has something after it: whatever comes
+// next has to be looked up *inside*, and a file is not somewhere to
+// look.
+fn descend(base: &str, dirs_only: bool) -> Vec<String> {
+    let root = if base.is_empty() { "." } else { base };
+    let mut out = vec![String::new()];
+    let mut queue = vec![String::new()];
+    while let Some(prefix) = queue.pop() {
+        let dir = join(root, &prefix);
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        let mut names: Vec<String> = entries.filter_map(|e| e.ok()).filter_map(|e| e.file_name().into_string().ok()).collect();
+        names.sort();
+        for name in names {
+            if name.starts_with('.') {
+                continue;
+            }
+            let path = join(&prefix, &name);
+            let real_dir = std::fs::symlink_metadata(join(root, &path)).is_ok_and(|m| m.is_dir());
+            if real_dir {
+                queue.push(path.clone());
+            }
+            if !dirs_only || real_dir {
+                out.push(path);
+            }
+        }
+    }
+    out
+}
+
+fn join(base: &str, rest: &str) -> String {
+    match (base, rest) {
+        ("", _) => rest.to_string(),
+        (_, "") => format!("{base}/"),
+        ("/", _) => format!("/{rest}"),
+        _ => format!("{base}/{rest}"),
+    }
+}
+
+// A component with no metacharacters may still carry backslashes from
+// `escape`; the name on disk is what they were escaping.
+fn unescape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => out.extend(chars.next()),
+            _ => out.push(c),
+        }
+    }
+    out
 }

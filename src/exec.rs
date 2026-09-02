@@ -7224,7 +7224,11 @@ impl Shell {
     // on the very next word, and reading two booleans is nothing next
     // to the `read_dir` that follows.
     fn glob_options(&self) -> glob::Options {
-        glob::Options { dotglob: self.shopt_is_on("dotglob"), nocaseglob: self.shopt_is_on("nocaseglob") }
+        glob::Options {
+            dotglob: self.shopt_is_on("dotglob"),
+            nocaseglob: self.shopt_is_on("nocaseglob"),
+            globstar: self.shopt_is_on("globstar"),
+        }
     }
 
     // A pattern that matched nothing. bash's default is to leave the
