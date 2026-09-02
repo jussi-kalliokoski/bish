@@ -310,11 +310,11 @@ pub(crate) fn run_enable(sh: &mut Shell, args: &[String]) -> i32 {
 }
 
 // set [-euxo pipefail] [--] [args...]. Combined single-char flags
-// (-eu, -ex, -eux) work; `-o name` must be its own token (not combined
-// into a cluster with other short flags) -- matches real bash, which
-// also rejects e.g. `-euo pipefail` (it consumes `-o` with no argument
-// of its own, then tries to parse "pipefail"'s remaining letters as
-// further short flags and errors on the first invalid one).
+// (-eu, -ex, -eux) work, and so does a cluster *ending* in `o`:
+// `set -euo pipefail` is what nearly every strict-mode script actually
+// writes, and it applies e, u, and then `-o pipefail`. (An earlier
+// comment here claimed bash rejects that form. It does not -- checked
+// again: `set -euo pipefail; set -o` shows all three on.)
 // Every short flag real bash's `set` accepts. Most of them do nothing
 // here (see apply_shell_flag for the ones that do) -- but accepting
 // exactly bash's set, no more, is what makes `set -Z` a reported typo
@@ -350,7 +350,10 @@ pub(crate) fn run_set(sh: &mut Shell, args: &[String]) -> i32 {
             if let Some(bad) = rest.chars().find(|c| !SET_FLAGS.contains(*c)) {
                 return crate::exec::bad_option_status(sh, "set", &format!("-{bad}"), SET_USAGE);
             }
-            if rest == "o" {
+            if let Some(flags) = rest.strip_suffix('o') {
+                for c in flags.chars() {
+                    sh.apply_shell_flag(c, true);
+                }
                 if let Some(optname) = args.get(idx + 1) {
                     if sh.shell_option_enabled(optname).is_none() {
                         sh_eprintln!(sh, "bish: set: {optname}: invalid option name");
@@ -374,7 +377,10 @@ pub(crate) fn run_set(sh: &mut Shell, args: &[String]) -> i32 {
             if let Some(bad) = rest.chars().find(|c| !SET_FLAGS.contains(*c)) {
                 return crate::exec::bad_option_status(sh, "set", &format!("+{bad}"), SET_USAGE);
             }
-            if rest == "o" {
+            if let Some(flags) = rest.strip_suffix('o') {
+                for c in flags.chars() {
+                    sh.apply_shell_flag(c, false);
+                }
                 if let Some(optname) = args.get(idx + 1) {
                     if sh.shell_option_enabled(optname).is_none() {
                         sh_eprintln!(sh, "bish: set: {optname}: invalid option name");

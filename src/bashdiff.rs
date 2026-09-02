@@ -280,20 +280,16 @@ mod tests {
         case("read-u-bad-fd", r#"read -r -u 9 l 2>/dev/null; echo "rc=$?""#),
         case("varfd-open-and-close", r#"exec {fd}</etc/hostname; echo "$((fd>=10))"; read -r -u "$fd" l; exec {fd}<&-; [ -n "$l" ] && echo read"#),
         case("varfd-dup", r#"echo x | { exec {fd}<&0; read -r -u "$fd" l; echo "[$l]"; }"#),
-        case(
-            "mapfile-counted-options",
-            r#"printf '1
-2
-3
-4
-' | { mapfile -t -s 1 -n 2 a; echo "${#a[@]} ${a[*]}"; }"#,
-        ),
-        case(
-            "mapfile-origin",
-            r#"printf '1
-2
-' | { mapfile -t -O 5 a; echo "${!a[*]}"; }"#,
-        ),
+        case("mapfile-counted-options", "printf '1\\n2\\n3\\n4\\n' | { mapfile -t -s 1 -n 2 a; echo \"${#a[@]} ${a[*]}\"; }"),
+        case("mapfile-origin", "printf '1\\n2\\n' | { mapfile -t -O 5 a; echo \"${!a[*]}\"; }"),
+        // -- roadmap 15: errexit's actual rules ------------------------
+        case("errexit-exempts-a-chain-member", r#"set -e; f() { false; }; f && echo ok; false && echo no; echo after"#),
+        case("errexit-still-fires-on-the-last", r#"set -e; true && false; echo unreached"#),
+        case("errexit-and-pipefail", r#"set -euo pipefail; false | true; echo unreached"#),
+        case("assignment-takes-its-substitution-status", r#"x=$(exit 7); echo "rc=$?"; y=$(true); echo "rc=$?""#),
+        case("errexit-on-a-failed-capture", r#"set -e; x=$(false); echo unreached"#),
+        case("inherit-errexit", r#"set -e; x=$(false; echo reached); echo "[$x]""#),
+        case("set-cluster-ending-in-o", r#"set -euo pipefail; set -o | grep -cE '^(errexit|nounset|pipefail) +on'"#),
     ];
 
     // Cases bish does not match today, each with why. Asserted to

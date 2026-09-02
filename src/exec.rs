@@ -1281,6 +1281,19 @@ pub struct Shell {
     // triggering -e (a failing condition is meant to be checked, not
     // treated as a fatal error).
     suppress_errexit: u32,
+    // Set by run_and_or when the status it returns came from a command
+    // `set -e` does not apply to. bash exits on a failing pipeline
+    // "except the command following the final && or ||" -- so in
+    // `false && echo no` the `false` is exempt and the `echo` never
+    // runs, and the whole list's failing status must not abort the
+    // shell either. Only the ListItem check below reads it.
+    errexit_exempt: bool,
+    // The exit status of the most recent `$(...)`, for the one command
+    // that takes it as its own: a bare assignment. `x=$(false)` is a
+    // failing command in bash -- which is what makes `set -e` catch a
+    // failed capture, the single most common way a strict script means
+    // to stop.
+    last_subst_status: Option<i32>,
     // Set by run_single around a command's own word-expansion so mid-
     // expansion diagnostics (nounset's "unbound variable", etc) go to that
     // command's own `2>` target instead of unconditionally to the shell's
@@ -1574,6 +1587,8 @@ impl Shell {
             opt_noclobber: false,
             opt_posix: false,
             suppress_errexit: 0,
+            errexit_exempt: false,
+            last_subst_status: None,
             current_stderr_target: None,
             restrict_to_builtins: false,
             promoted: Rc::new(Cell::new(false)),
@@ -1886,6 +1901,8 @@ impl Shell {
             opt_noclobber: self.opt_noclobber,
             opt_posix: self.opt_posix,
             suppress_errexit: 0,
+            errexit_exempt: false,
+            last_subst_status: None,
             current_stderr_target: None,
             restrict_to_builtins: false,
             promoted: self.promoted.clone(),
@@ -3591,10 +3608,11 @@ impl Shell {
             // decided. It fires whether or not `errexit` is *on*, which
             // is the point: a script traps ERR precisely so it does not
             // have to exit.
-            if self.suppress_errexit == 0 && result.status() != 0 {
+            let exempt = std::mem::take(&mut self.errexit_exempt);
+            if self.suppress_errexit == 0 && !exempt && result.status() != 0 {
                 self.run_pseudo_trap(PseudoTrap::Err);
             }
-            if self.opt_errexit && self.suppress_errexit == 0 && result.status() != 0 {
+            if self.opt_errexit && self.suppress_errexit == 0 && !exempt && result.status() != 0 {
                 self.run_exit_trap();
                 return ExecResult::Exit(result.status());
             }
@@ -3603,19 +3621,48 @@ impl Shell {
     }
 
     fn run_and_or(&mut self, and_or: &AndOr, background: bool) -> ExecResult {
+        // Every member but the last is exempt from `set -e`, and the
+        // exemption reaches *inside* it: `set -e; f() { false; }; f &&
+        // echo ok` carries on in bash, because `f`'s own failing body
+        // is part of a chain whose result is being tested. Checking
+        // only the chain's overall status at the ListItem level was not
+        // enough -- the function body has ListItems of its own, and one
+        // of those was aborting the shell.
+        let last = and_or.rest.len();
+        if last > 0 {
+            self.suppress_errexit += 1;
+        }
         let mut result = self.run_pipeline(&and_or.first, background);
+        if last > 0 {
+            self.suppress_errexit -= 1;
+        }
+        // Set *after* the member runs, not before: a function body
+        // contains and_or lists of its own, and each one writes this
+        // field on its way out.
+        //
+        // A single pipeline is its own final command; in a chain, only
+        // the member after the last `&&`/`||` is.
+        self.errexit_exempt = last > 0;
         self.last_status = result.status();
         if result.is_signal() {
             return result;
         }
         let mut status = result.status();
-        for (comb, pipeline) in &and_or.rest {
+        for (i, (comb, pipeline)) in and_or.rest.iter().enumerate() {
             let should_run = match comb {
                 Combinator::And => status == 0,
                 Combinator::Or => status != 0,
             };
             if should_run {
+                let is_last = i + 1 == last;
+                if !is_last {
+                    self.suppress_errexit += 1;
+                }
                 result = self.run_pipeline(pipeline, background);
+                if !is_last {
+                    self.suppress_errexit -= 1;
+                }
+                self.errexit_exempt = !is_last;
                 self.last_status = result.status();
                 if result.is_signal() {
                     return result;
@@ -4383,7 +4430,18 @@ impl Shell {
             Ok(f) => f,
             Err(_) => return String::new(),
         };
-        self.run_in_child_shell(raw, ChildStdio { stdout: Some(file), ..Default::default() });
+        // `set -e` does not reach inside `$( )` unless
+        // `shopt -s inherit_errexit` says so -- that option exists
+        // precisely because it does not. A `( )` subshell is different
+        // and does inherit it, so this is scoped to command
+        // substitution rather than to run_in_child_shell.
+        let errexit = self.opt_errexit;
+        if !self.shopt_is_on("inherit_errexit") {
+            self.opt_errexit = false;
+        }
+        let result = self.run_in_child_shell(raw, ChildStdio { stdout: Some(file), ..Default::default() });
+        self.opt_errexit = errexit;
+        self.last_subst_status = Some(result.status());
         let mut s = std::fs::read_to_string(&path).unwrap_or_default();
         let _ = std::fs::remove_file(&path);
         while s.ends_with('\n') {
@@ -4973,6 +5031,9 @@ impl Shell {
             // failure, not a silent no-op -- `set -e` and an explicit
             // `|| exit` both depend on seeing it.
             let mut ok = true;
+            // Cleared before the expansions, so what is left afterwards
+            // is this command's own -- see last_subst_status.
+            self.last_subst_status = None;
             for (name, mode, val) in &cmd.assigns {
                 let v = self.expand_word(val);
                 ok &= match mode {
@@ -5026,7 +5087,10 @@ impl Shell {
             if let Some(exit) = self.take_pending_exit() {
                 return exit;
             }
-            return ExecResult::Status(i32::from(!ok));
+            if !ok {
+                return ExecResult::Status(1);
+            }
+            return ExecResult::Status(self.last_subst_status.take().unwrap_or(0));
         }
 
         let saved_stderr_target = self.current_stderr_target.take();
