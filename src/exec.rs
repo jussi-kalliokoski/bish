@@ -928,8 +928,17 @@ pub struct Shell {
     // A name only lives here if `local` explicitly declared it -- plain
     // assignment still targets the global (process-env) variable unless it
     // matches an existing local of the same name, matching bash semantics.
-    pub(crate) var_scopes: Vec<HashMap<String, String>>,
+    // `None` is a name declared local and *unset*: `local x` shadows
+    // whatever the caller had, and `${x-default}` and `set -u` both
+    // have to be able to tell that from an empty string -- which is
+    // how every "did my caller set this?" check in a function is
+    // written.
+    pub(crate) var_scopes: Vec<HashMap<String, Option<String>>>,
     script_name: String,
+    // Whether this shell is running a named script file rather than
+    // `-c` text. The one thing it decides is whether the call stack has
+    // an outermost `main` frame -- see refresh_call_arrays.
+    pub running_a_script: bool,
     // Indexed arrays (`arr=(...)`). A BTreeMap (not Vec) so arrays are
     // genuinely sparse like bash's: `arr[10]=x` doesn't materialize empty
     // strings for indices 0..9, and `${#arr[@]}` counts only what's
@@ -1522,6 +1531,7 @@ impl Shell {
             arg_frames: vec![Vec::new()],
             var_scopes: Vec::new(),
             script_name: "bish".to_string(),
+            running_a_script: false,
             arrays: HashMap::new(),
             assoc_arrays: HashMap::new(),
             assoc_names: std::collections::HashSet::new(),
@@ -1835,6 +1845,7 @@ impl Shell {
             arg_frames: vec![self.arg_frames.last().cloned().unwrap_or_default()],
             var_scopes: self.var_scopes.clone(),
             script_name: self.script_name.clone(),
+            running_a_script: self.running_a_script,
             arrays: self.arrays.clone(),
             assoc_arrays: self.assoc_arrays.clone(),
             assoc_names: self.assoc_names.clone(),
@@ -3311,9 +3322,16 @@ impl Shell {
             sources.push(self.function_sources.get(&frame.called).cloned().unwrap_or_else(|| frame.source.clone()));
             lines.push(frame.call_line.to_string());
         }
-        names.push("main".to_string());
+        // The outermost frame is the script itself, which bash names
+        // `main`. It only exists when there *is* a script: `bash -c
+        // 'f(){ g; }; g(){ echo "${FUNCNAME[*]}"; }; f'` prints `g f`,
+        // where the same functions in a file print `g f main`. Checked
+        // against bash 5.3 both ways.
+        if self.running_a_script {
+            names.push("main".to_string());
+            lines.push("0".to_string());
+        }
         sources.push(self.script_name.clone());
-        lines.push("0".to_string());
         // At the top level bash has no FUNCNAME at all, and a script
         // testing `${FUNCNAME[0]}` should see nothing rather than
         // "main".
@@ -3950,7 +3968,13 @@ impl Shell {
         // Locals over globals: the stage is a child of *this* frame.
         for scope in &self.var_scopes {
             for (k, v) in scope {
-                flattened.insert(k.as_str(), v.as_str());
+                // A declared-but-unset local has no assignment to
+                // replay; emitting `k=` would make it *set* to empty in
+                // the child, which is the distinction being kept.
+                match v {
+                    Some(v) => flattened.insert(k.as_str(), v.as_str()),
+                    None => flattened.remove(k.as_str()),
+                };
             }
         }
         for (k, v) in &flattened {
@@ -5804,7 +5828,7 @@ impl Shell {
                         let was_nameref = self.nameref_names.contains(&n);
                         self.nameref_local_stack.last_mut().unwrap().push((n.clone(), was_nameref));
                         self.nameref_names.insert(n.clone());
-                        self.var_scopes.last_mut().unwrap().insert(n.clone(), v.unwrap_or_default());
+                        self.var_scopes.last_mut().unwrap().insert(n.clone(), Some(v.unwrap_or_default()));
                         continue;
                     }
                     if integer_flag {
@@ -5836,7 +5860,15 @@ impl Shell {
                                 self.assign_var_global(&n, v.unwrap_or_default());
                                 continue;
                             }
-                            let v = v.unwrap_or_default();
+                            // `local x` with no `=` declares the name
+                            // and leaves it *unset* -- see var_scopes.
+                            // Storing an empty string here is what made
+                            // `${x-default}` inside a function unable
+                            // to tell "my caller did not set this".
+                            let Some(v) = v else {
+                                self.var_scopes.last_mut().unwrap().insert(n, None);
+                                continue;
+                            };
                             let v = if integer_flag { arith::eval(&v, self).unwrap_or(0).to_string() } else { v };
                             let v = if upper_flag {
                                 v.to_uppercase()
@@ -5849,7 +5881,7 @@ impl Shell {
                                 self.exported_names.insert(n.clone());
                                 self.export_to_environment(&n, &v);
                             }
-                            self.var_scopes.last_mut().unwrap().insert(n, v);
+                            self.var_scopes.last_mut().unwrap().insert(n, Some(v));
                         }
                     }
                 }
@@ -7946,7 +7978,7 @@ impl Shell {
     pub(crate) fn raw_var_lookup(&self, name: &str) -> String {
         for scope in self.var_scopes.iter().rev() {
             if let Some(v) = scope.get(name) {
-                return v.clone();
+                return v.clone().unwrap_or_default();
             }
         }
         if let Some(v) = self.globals.get(name) {
@@ -7964,7 +7996,7 @@ impl Shell {
     pub(crate) fn raw_var_write(&mut self, name: &str, value: String) {
         for scope in self.var_scopes.iter_mut().rev() {
             if scope.contains_key(name) {
-                scope.insert(name.to_string(), value.clone());
+                scope.insert(name.to_string(), Some(value.clone()));
                 self.export_to_environment(name, &value);
                 return;
             }
@@ -8092,12 +8124,22 @@ impl Shell {
             _ => {
                 for scope in self.var_scopes.iter().rev() {
                     if let Some(v) = scope.get(name) {
-                        return v.clone();
+                        return v.clone().unwrap_or_default();
                     }
                 }
                 if let Some(v) = self.globals.get(name) {
                     return v.clone();
                 }
+                // A bare `$a` on an array is `${a[0]}`, for every array
+                // -- which is also what makes `$FUNCNAME` the name of
+                // the running function rather than nothing. Checked
+                // after the scopes and globals so a scalar of the same
+                // name still wins.
+                if let Some(first) = self.arrays.get(name).and_then(|m| m.values().next()) {
+                    return first.clone();
+                }
+                // Indexed only: an associative array has no element 0
+                // to be, so bash's bare `$m` on one is empty.
                 // The real environment last, for a name something
                 // outside the variable table set behind its back --
                 // see raw_var_lookup, which reads the same three
@@ -8134,7 +8176,7 @@ impl Shell {
     pub(crate) fn debug_peek_var(&self, name: &str) -> Option<String> {
         for scope in self.var_scopes.iter().rev() {
             if let Some(v) = scope.get(name) {
-                return Some(v.clone());
+                return v.clone();
             }
         }
         if let Some(items) = self.arrays.get(name) {
@@ -8302,7 +8344,9 @@ impl Shell {
             return;
         }
         sh_eprintln!(self, "bish: {}: unbound variable", name);
-        self.pending_exit = Some(1);
+        // 127, the status bash uses for an unbound variable under
+        // `set -u` -- not 1. Checked against bash 5.3.
+        self.pending_exit = Some(127);
     }
 
     // Whether `name` is a variable that's actually been assigned, as
@@ -8344,9 +8388,12 @@ impl Shell {
         if is_special {
             return true;
         }
-        for scope in &self.var_scopes {
-            if scope.contains_key(name) {
-                return true;
+        // The innermost scope holding the name decides: a `local x`
+        // with no value shadows as *unset*, so the search stops there
+        // rather than falling through to whatever the caller had.
+        for scope in self.var_scopes.iter().rev() {
+            if let Some(v) = scope.get(name) {
+                return v.is_some();
             }
         }
         self.globals.contains_key(name) || std::env::var(name).is_ok()
@@ -12599,6 +12646,11 @@ mod tests {
 
         let mut sh = Shell::new();
         sh.set_script_args(main.display().to_string(), Vec::new());
+        // This test *is* the "running a script file" case, which is
+        // what puts the outermost `main` frame on the stack -- `bish -c`
+        // has no such frame, and neither does `bash -c`. See
+        // Shell::running_a_script.
+        sh.running_a_script = true;
         sh.run_source_here(&std::fs::read_to_string(&main).unwrap(), &main.display().to_string());
 
         assert_eq!(sh.debug_peek_var("n").as_deref(), Some("inner outer main"));
@@ -13944,7 +13996,7 @@ mod tests {
         // environment behind the shell's back is deliberately not one
         // of its variables -- that cross-talk is what the move removed.
         shell.run_source_here("export BISH_COMPGEN_TEST_VAR=1", "<test>");
-        shell.var_scopes.push(HashMap::from([("local_only_var".to_string(), "x".to_string())]));
+        shell.var_scopes.push(HashMap::from([("local_only_var".to_string(), Some("x".to_string()))]));
         let buf = capture_output(&mut shell);
         crate::builtins::completion::run_compgen(&mut shell, &strs(&["-A", "variable"]));
         let names: Vec<String> = buf.borrow().lines().map(str::to_string).collect();

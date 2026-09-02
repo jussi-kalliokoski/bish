@@ -285,13 +285,12 @@ pub(crate) fn run_declare(sh: &mut Shell, who: &str, args: &[String], array_lite
                     } else {
                         sh.assign_var(&name, cur)
                     };
-                } else if sh.lookup_var(&name).is_empty() && std::env::var(&name).is_err() {
-                    if global_flag {
-                        sh.assign_var_global(&name, String::new());
-                    } else {
-                        sh.assign_var(&name, String::new());
-                    }
                 }
+                // No `else`: `declare x` with no value records the
+                // name's attributes and leaves it *unset*, at either
+                // scope. Assigning an empty string here is exactly the
+                // distinction being kept (see Shell::var_scopes) --
+                // `declare z; echo "${z-unset}"` says `unset` in bash.
             }
         }
         if readonly_flag {

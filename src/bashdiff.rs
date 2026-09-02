@@ -304,6 +304,13 @@ y
         case("not-executable-is-126", r#"/etc/hosts; echo "rc=$?"; /etc; echo "rc=$?""#),
         case("missing-path-is-127", r#"./nosuchpath_zz; echo "rc=$?""#),
         case("source-a-directory", r#". /etc; echo "rc=$?"; source /nosuch_zz; echo "rc=$?""#),
+        // -- roadmap 17: local, FUNCNAME and the call stack ------------
+        case("local-shadows-as-unset", r#"x=out; f() { local x; echo "[${x-unset}]"; }; f; echo "[$x]""#),
+        case("declare-with-no-value-is-unset", r#"declare z; echo "[${z-unset}]"; g() { declare y; echo "[${y-unset}]"; }; y=out; g"#),
+        case("nounset-status", r#"set -u; echo "$nosuch_zz""#),
+        case("bare-array-is-element-zero", r#"a=(1 2); echo "[$a]"; declare -A m=([k]=v); echo "[$m]""#),
+        case("funcname-scalar", r#"f() { echo "[$FUNCNAME]"; }; f"#),
+        case("funcname-has-no-main-frame-under-c", r#"f() { g; }; g() { echo "${FUNCNAME[*]} n=${#FUNCNAME[@]}"; }; f"#),
     ];
 
     // Cases bish does not match today, each with why. Asserted to

@@ -129,6 +129,9 @@ fn main() {
     if args.len() >= 2 {
         let path = &args[1];
         shell.set_script_args(path.clone(), args[2..].to_vec());
+        // A named script has an outermost `main` call frame; `-c` text
+        // does not. See Shell::running_a_script.
+        shell.running_a_script = true;
         match std::fs::read_to_string(path) {
             Ok(src) => std::process::exit(run_source(&mut shell, &src)),
             Err(e) => {
