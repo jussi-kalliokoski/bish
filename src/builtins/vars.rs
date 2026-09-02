@@ -6,7 +6,7 @@
 use crate::arith;
 use crate::parser::ArrayLiteralItem;
 use crate::parser::AssignMode;
-use crate::exec::{write_diagnostic, Shell};
+use crate::exec::{sh_eprintln, write_diagnostic, Shell};
 
 // unset [-f|-v] NAME... Also accepts `arr[i]` to remove one element
 // without touching the rest of the array. `stderr_target` mirrors real
@@ -85,7 +85,33 @@ pub(crate) fn run_unset(sh: &mut Shell, args: &[String], stderr_target: &Option<
 // entirely (print instead of declare, see print_declared/
 // print_functions) -- checked first, same as bash effectively
 // treating them as a separate subcommand.
-pub(crate) fn run_declare(sh: &mut Shell, args: &[String], array_literals: &[(usize, String, AssignMode, Vec<ArrayLiteralItem>)]) -> i32 {
+// What `declare`/`export`/`readonly` will accept as a name: an
+// identifier, optionally with a `[subscript]` after it. Everything
+// else is what bash calls "not a valid identifier" -- and what this
+// used to accept and then quietly write into the environment under a
+// name nothing could ever expand.
+fn is_valid_declare_target(word: &str) -> bool {
+    let name = word.split_once('=').map(|(n, _)| n).unwrap_or(word);
+    let name = match name.split_once('[') {
+        Some((base, rest)) => {
+            if !rest.ends_with(']') || rest.len() < 2 {
+                return false;
+            }
+            base
+        }
+        None => name,
+    };
+    let mut chars = name.chars();
+    matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+pub(crate) fn run_declare(
+    sh: &mut Shell,
+    who: &str,
+    args: &[String],
+    array_literals: &[(usize, String, AssignMode, Vec<ArrayLiteralItem>)],
+) -> i32 {
     if args.iter().any(|a| a == "-f" || a == "-F") {
         let names_only = args.iter().any(|a| a == "-F");
         let names: Vec<String> = args.iter().filter(|a| !a.starts_with('-')).cloned().collect();
@@ -111,7 +137,15 @@ pub(crate) fn run_declare(sh: &mut Shell, args: &[String], array_literals: &[(us
     let mut lower_flag = false;
     let mut export_flag = false;
     let mut status = 0;
+    // After `--` a word is an operand however it starts, which is the
+    // only way to reach the "not a valid identifier" path with a
+    // leading dash (`declare -x -- -bad=1`).
+    let mut after_dashdash = false;
     for (i, a) in args.iter().enumerate() {
+        if a == "--" {
+            after_dashdash = true;
+            continue;
+        }
         match a.as_str() {
             "-A" => {
                 array_mode = Some(true);
@@ -177,13 +211,32 @@ pub(crate) fn run_declare(sh: &mut Shell, args: &[String], array_literals: &[(us
             }
             continue;
         }
-        if a.starts_with('-') {
+        if a.starts_with('-') && !after_dashdash {
+            continue;
+        }
+        if !is_valid_declare_target(a) {
+            sh_eprintln!(sh, "bish: {}: `{}': not a valid identifier", who, a);
+            status = 1;
             continue;
         }
         let (name, val) = match a.find('=') {
             Some(eq) => (a[..eq].to_string(), Some(a[eq + 1..].to_string())),
             None => (a.clone(), None),
         };
+        // `declare 'a[0]=5'` names an *element*, not a variable called
+        // "a[0]" -- which is what this used to create, under a name
+        // nothing could then expand.
+        if let Some((base, rest)) = name.split_once('[') {
+            let index = rest.trim_end_matches(']').to_string();
+            let base = base.to_string();
+            if let Some(v) = val {
+                sh.array_set_index_public(&base, &index, v);
+            }
+            if readonly_flag {
+                sh.readonly_names.insert(base);
+            }
+            continue;
+        }
         if integer_flag {
             sh.integer_names.insert(name.clone());
         }

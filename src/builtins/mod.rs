@@ -47,15 +47,17 @@ pub fn continue_loop(args: &[String]) -> crate::exec::ExecResult {
 
 // `use_glob` is true for `[[` (bash pattern-matches `==`/`!=`) and false for
 // `[`/`test` (POSIX literal-equality).
-pub fn test(args: &[String], use_glob: bool) -> i32 {
-    if eval_test_expr(args, use_glob) {
-        0
-    } else {
-        1
-    }
+// `Err` is a usage error -- an operand where an integer was wanted, or
+// more words than any form of `test` has. bash reports those and
+// returns 2, distinct from the 1 that means "the expression is false",
+// and a script that checks `$?` for 1 has to be able to tell them
+// apart. The caller prints it: only it knows whether the user wrote
+// `test` or `[`.
+pub fn test(args: &[String], use_glob: bool) -> Result<i32, String> {
+    Ok(i32::from(!eval_test_expr(args, use_glob)?))
 }
 
-fn eval_test_expr(args: &[String], use_glob: bool) -> bool {
+fn eval_test_expr(args: &[String], use_glob: bool) -> Result<bool, String> {
     // Split on top-level -a/-o (no parens support). Not strictly
     // POSIX-precedence-correct, but covers real-world usage.
     let mut clauses: Vec<Vec<String>> = vec![Vec::new()];
@@ -68,29 +70,48 @@ fn eval_test_expr(args: &[String], use_glob: bool) -> bool {
             clauses.last_mut().unwrap().push(a.clone());
         }
     }
-    let mut result = eval_simple(&clauses[0], use_glob);
+    let mut result = eval_simple(&clauses[0], use_glob)?;
     for (i, comb) in combinators.iter().enumerate() {
-        let next = eval_simple(&clauses[i + 1], use_glob);
+        let next = eval_simple(&clauses[i + 1], use_glob)?;
         result = match *comb {
             "-a" => result && next,
             "-o" => result || next,
             _ => unreachable!(),
         };
     }
-    result
+    Ok(result)
 }
 
-fn eval_simple(args: &[String], use_glob: bool) -> bool {
+fn eval_simple(args: &[String], use_glob: bool) -> Result<bool, String> {
     if args.first().map(|s| s.as_str()) == Some("!") {
-        return !eval_simple(&args[1..], use_glob);
+        return Ok(!eval_simple(&args[1..], use_glob)?);
     }
     match args {
-        [] => false,
-        [s] => !s.is_empty(),
-        [op, a] => unary(op, a),
-        [a, op, b] => binary(a, op, b, use_glob),
-        _ => !args.is_empty(),
+        [] => Ok(false),
+        [s] => Ok(!s.is_empty()),
+        [op, a] => Ok(unary(op, a)),
+        [a, op, b] => binary_checked(a, op, b, use_glob),
+        // Four or more words is no form of `test` there is. Reading it
+        // as "non-empty, so true" is how `[ "$a" = "$b" = "$c" ]`, and
+        // an unquoted variable that turned into two words, both passed
+        // silently.
+        _ => Err("too many arguments".to_string()),
     }
+}
+
+// `binary`, but reporting the one error it can have: a numeric
+// comparison whose operand is not a number. `[[ ]]` never reaches this
+// -- there the operands are arithmetic expressions, where a bare name
+// is a variable and an unset one is 0.
+fn binary_checked(a: &str, op: &str, b: &str, use_glob: bool) -> Result<bool, String> {
+    if matches!(op, "-eq" | "-ne" | "-lt" | "-le" | "-gt" | "-ge") {
+        for operand in [a, b] {
+            if operand.trim().parse::<i64>().is_err() {
+                return Err(format!("{}: integer expected", operand));
+            }
+        }
+    }
+    Ok(binary(a, op, b, use_glob))
 }
 
 pub(crate) fn unary(op: &str, a: &str) -> bool {

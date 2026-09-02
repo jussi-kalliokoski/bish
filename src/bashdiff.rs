@@ -213,6 +213,39 @@ mod tests {
         case("read-t0", r#"read -t 0 < /dev/null; echo $?"#),
         case("set-o", r#"set -C -o pipefail; set -o > oo; grep -E '^(noclobber|pipefail|xtrace) ' oo"#),
         case("ulimit-p", r#"ulimit -p"#),
+        // -- roadmap 10: what bish used to accept and bash never did --
+        case("readonly-array", r#"readonly a=(1); echo "[${a[*]}]"; a+=(2); echo "rc=$?""#),
+        case("readonly-scalar-is-fatal", r#"readonly x=1; x=2; echo unreached"#),
+        case("readonly-unset", r#"readonly x=1; unset x; echo "rc=$?""#),
+        case("bad-option", r#"unset -z x"#),
+        case("set-bad-option-name", r#"set -o nosuchopt"#),
+        case("cd-too-many-arguments", r#"cd / /tmp"#),
+        case("shift-past-end", r#"set -- a; shift 99; echo "rc=$?"; shift abc"#),
+        case("printf-missing-conversion", r#"printf '%5'"#),
+        case("printf-invalid-number", r#"printf '%d' 1x 2>/dev/null; echo " rc=$?""#),
+        case("test-integer-expected", r#"[ a -eq b ]"#),
+        case("test-too-many-arguments", r#"[ a = b = c ]"#),
+        case("declare-bad-identifier", r#"export 1bad=1"#),
+        case("bad-array-subscript", r#"declare -A m; m[]=1; echo unreached"#),
+        case("bad-substitution", r#"echo ${x!y}; echo unreached"#),
+        // stderr goes to /dev/null throughout: the *wording* of an
+        // arithmetic error differs between the two shells (bish's
+        // arith.rs names its own tokens), and what this case is about
+        // is that a `$(( ))` failure stops the script while the `(( ))`
+        // command below does not.
+        case("arith-expansion-is-fatal", r#"{ echo $((1+)); } 2>/dev/null; echo unreached"#),
+        case("arith-command-is-not", r#"((1+)) 2>/dev/null; echo after"#),
+        case("error-if-unset", r#": ${x:?}; echo unreached"#),
+        // Sourced from a file, with stderr discarded: a syntax error
+        // is reported differently by the two shells (bash echoes the
+        // offending line back, bish does not), and what these are about
+        // is that the construct is rejected at all -- which `.` turns
+        // into an ordinary non-zero status the script can see.
+        case("array-assignment-needs-attached-parens", "printf 'arr= (a b)\\n' > s.sh; . ./s.sh 2>/dev/null; echo \"rc=$?\""),
+        case("function-body-must-be-compound", "printf 'f() echo hi\\n' > s.sh; . ./s.sh 2>/dev/null; echo \"rc=$?\""),
+        case("empty-if-body", "printf 'if true; then fi\\n' > s.sh; . ./s.sh 2>/dev/null; echo \"rc=$?\""),
+        case("empty-loop-condition", "printf 'while; do :; done\\n' > s.sh; . ./s.sh 2>/dev/null; echo \"rc=$?\""),
+        case("declare-subscript", r#"declare 'a[0]=5'; echo "${a[0]}""#),
     ];
 
     // Cases bish does not match today, each with why. Asserted to
@@ -220,9 +253,18 @@ mod tests {
     // removed, which is the only way a list like this stays true.
     const DIVERGENCES: &[(&str, &str)] = &[
         ("function-call-redirect", "a redirect on a function *call* does not reach a builtin inside the body"),
-        ("expansion-error-continues", "bish reports an expansion error and carries on with an empty result; bash abandons the command"),
         ("dbracket-pattern", "quoting the right of `[[ == ]]` should make it a literal, not a glob"),
-        ("shopt-failglob", "failglob reports but does not abandon the command -- see expansion-error-continues"),
+        // All seven are the same shape: bash calls it a syntax error,
+        // bish parses it into something and runs it. None is a
+        // deliberate extension -- they are places the grammar is looser
+        // than it meant to be, listed so the next pass has a worklist.
+        ("two-func-defs-no-separator", "two definitions with no `;` between them"),
+        ("brace-group-unterminated", "a brace group whose last command has no terminator"),
+        ("brace-command-unterminated", "the same, with a command in it -- `}` ends a word here, so it is read as an argument"),
+        ("unterminated-brace-expansion", "`${x` with no closing brace expands as if it had one"),
+        ("c-for-unbalanced", "the C-style `for`'s own parens are not balance-checked"),
+        ("empty-command-between-separators", "`;` twice in a row is skipped rather than reported"),
+        ("dbracket-three-operands", "`[[ ]]` takes a fourth operand instead of rejecting it"),
         (
             "pipeline-stage-options",
             "a pipeline stage that is a builtin/function/compound re-execs bish rather than forking a virtual child, so it starts with none of the shell's own `set` options",
@@ -233,10 +275,16 @@ mod tests {
     // so that list stays a description of what works.
     const PENDING: &[Case] = &[
         case("function-call-redirect", r#"f() { echo inner >&2; }; f 2>/dev/null; echo after"#),
-        case("expansion-error-continues", r#"a=(1 2 3); printf '[%s]' "${a[@]:1:-1}"; echo"#),
         case("dbracket-pattern", r#"[[ abc == a* ]] && echo glob; [[ abc == "a*" ]] || echo literal"#),
-        case("shopt-failglob", r#"shopt -s failglob; printf '%s,' zz_no_match*; echo"#),
         case("pipeline-stage-options", r#"set -Ceu; { echo "[$-]"; } | cat"#),
+        // -- roadmap 10: parser leniency, the part still standing -----
+        case("two-func-defs-no-separator", r#"f() { :; } f() { :; }"#),
+        case("brace-group-unterminated", "{ : }"),
+        case("brace-command-unterminated", "{ echo }"),
+        case("unterminated-brace-expansion", "echo ${x"),
+        case("c-for-unbalanced", "for ((i=0; i<2; i++) do :; done"),
+        case("empty-command-between-separators", "echo a; ; echo b"),
+        case("dbracket-three-operands", "[[ a == b == c ]]"),
     ];
 
     // `target/<profile>/bish`, worked out from the test binary's own

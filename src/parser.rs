@@ -292,6 +292,19 @@ impl Parser {
     // Parses a list of ListItems until the next token (after skipping
     // separators) matches one of `stops`, or (if `stops` is empty) until
     // end of input. Does not consume the stop token.
+    // `parse_list_until` for the places a shell grammar requires at
+    // least one command: every condition, and every loop or `if` body.
+    // bash rejects `if true; then fi` and `while true; do done`, and
+    // `while; do :; done` -- an *empty condition*, which bish read as
+    // "true" and then looped on forever.
+    fn parse_required_list_until(&mut self, stops: &[Tok]) -> Result<Program, String> {
+        let list = self.parse_list_until(stops)?;
+        if list.is_empty() {
+            return Err(format!("near unexpected token `{}'", self.offending_token_text()));
+        }
+        Ok(list)
+    }
+
     fn parse_list_until(&mut self, stops: &[Tok]) -> Result<Program, String> {
         let mut items = Vec::new();
         self.skip_terminators();
@@ -393,6 +406,16 @@ impl Parser {
         matches!(self.peek(), Some(Tok::Word(chunks, _)) if matches!(chunks.as_slice(), [Chunk::Str(s)] if s == text))
     }
 
+    // How to name the token a syntax error is about, the way bash does
+    // -- the keyword or the word itself, not its Debug spelling.
+    fn offending_token_text(&self) -> String {
+        match self.peek() {
+            Some(Tok::Word(chunks, _)) => word_to_plain_name(chunks).unwrap_or_else(|| "word".to_string()),
+            Some(tok) => keyword_text(tok).unwrap_or("token").to_string(),
+            None => "end of input".to_string(),
+        }
+    }
+
     fn parse_command(&mut self) -> Result<Command, String> {
         match self.peek() {
             Some(Tok::KwIf) => self.parse_if(),
@@ -405,9 +428,9 @@ impl Parser {
             Some(Tok::LBrace) => self.parse_group(),
             Some(Tok::KwFunction) => self.parse_function_kw(),
             Some(Tok::Word(_, _)) if self.looks_like_func_def() => self.parse_function_paren(),
-            Some(Tok::Subshell(_)) => {
+            Some(Tok::Subshell { .. }) => {
                 let raw = match self.advance() {
-                    Some(Tok::Subshell(raw)) => raw,
+                    Some(Tok::Subshell { raw, .. }) => raw,
                     _ => unreachable!(),
                 };
                 let redirects = self.parse_trailing_redirects()?;
@@ -455,9 +478,9 @@ impl Parser {
                     self.advance();
                     atoms.push(TestAtom::Or);
                 }
-                Some(Tok::Subshell(_)) => {
+                Some(Tok::Subshell { .. }) => {
                     let raw = match self.advance() {
-                        Some(Tok::Subshell(raw)) => raw,
+                        Some(Tok::Subshell { raw, .. }) => raw,
                         _ => unreachable!(),
                     };
                     let inner_toks = Lexer::new(&raw).tokenize()?;
@@ -509,10 +532,37 @@ impl Parser {
     fn looks_like_func_def(&self) -> bool {
         if let Some(Tok::Word(chunks, _)) = self.toks.get(self.pos) {
             if word_to_plain_name(chunks).is_some() {
-                return matches!(self.toks.get(self.pos + 1), Some(Tok::Subshell(raw)) if raw.is_empty());
+                return matches!(self.toks.get(self.pos + 1), Some(Tok::Subshell { raw, .. }) if raw.is_empty());
             }
         }
         false
+    }
+
+    // A function body is a *compound* command -- a brace group, a
+    // subshell, a loop, an `if`, a `case`, `(( ))` or `[[ ]]`. bash
+    // rejects `f() echo hi`, and so must this: read as a simple command
+    // it defined a function whose body was `echo`, silently, with `hi`
+    // vanishing.
+    fn parse_function_body(&mut self) -> Result<Command, String> {
+        let compound = matches!(
+            self.peek(),
+            Some(
+                Tok::LBrace
+                    | Tok::Subshell { .. }
+                    | Tok::KwIf
+                    | Tok::KwWhile
+                    | Tok::KwUntil
+                    | Tok::KwFor
+                    | Tok::KwSelect
+                    | Tok::KwCase
+                    | Tok::Arith(_)
+                    | Tok::KwLBracket2
+            )
+        );
+        if !compound {
+            return Err(format!("near unexpected token `{}'", self.offending_token_text()));
+        }
+        self.parse_command()
     }
 
     fn parse_function_paren(&mut self) -> Result<Command, String> {
@@ -522,7 +572,7 @@ impl Parser {
         };
         self.advance(); // empty Subshell("") standing in for `()`
         self.skip_terminators();
-        let body = self.parse_command()?;
+        let body = self.parse_function_body()?;
         Ok(Command::FuncDef { name, body: Box::new(body) })
     }
 
@@ -534,11 +584,11 @@ impl Parser {
             }
             other => return Err(format!("expected function name, got {:?}", other)),
         };
-        if matches!(self.peek(), Some(Tok::Subshell(raw)) if raw.is_empty()) {
+        if matches!(self.peek(), Some(Tok::Subshell { raw, .. }) if raw.is_empty()) {
             self.advance();
         }
         self.skip_terminators();
-        let body = self.parse_command()?;
+        let body = self.parse_function_body()?;
         Ok(Command::FuncDef { name, body: Box::new(body) })
     }
 
@@ -546,23 +596,23 @@ impl Parser {
         self.advance(); // KwIf
         let mut branches = Vec::new();
 
-        let cond = self.parse_list_until(&[Tok::KwThen])?;
+        let cond = self.parse_required_list_until(&[Tok::KwThen])?;
         self.expect(Tok::KwThen)?;
-        let body = self.parse_list_until(&[Tok::KwElif, Tok::KwElse, Tok::KwFi])?;
+        let body = self.parse_required_list_until(&[Tok::KwElif, Tok::KwElse, Tok::KwFi])?;
         branches.push((cond, body));
 
         loop {
             match self.peek() {
                 Some(Tok::KwElif) => {
                     self.advance();
-                    let c = self.parse_list_until(&[Tok::KwThen])?;
+                    let c = self.parse_required_list_until(&[Tok::KwThen])?;
                     self.expect(Tok::KwThen)?;
-                    let b = self.parse_list_until(&[Tok::KwElif, Tok::KwElse, Tok::KwFi])?;
+                    let b = self.parse_required_list_until(&[Tok::KwElif, Tok::KwElse, Tok::KwFi])?;
                     branches.push((c, b));
                 }
                 Some(Tok::KwElse) => {
                     self.advance();
-                    let else_body = self.parse_list_until(&[Tok::KwFi])?;
+                    let else_body = self.parse_required_list_until(&[Tok::KwFi])?;
                     self.expect(Tok::KwFi)?;
                     let redirects = self.parse_trailing_redirects()?;
                     return Ok(Command::If { branches, else_branch: Some(else_body), redirects });
@@ -579,9 +629,9 @@ impl Parser {
 
     fn parse_while(&mut self, until: bool) -> Result<Command, String> {
         self.advance(); // KwWhile / KwUntil
-        let cond = self.parse_list_until(&[Tok::KwDo])?;
+        let cond = self.parse_required_list_until(&[Tok::KwDo])?;
         self.expect(Tok::KwDo)?;
-        let body = self.parse_list_until(&[Tok::KwDone])?;
+        let body = self.parse_required_list_until(&[Tok::KwDone])?;
         self.expect(Tok::KwDone)?;
         let redirects = self.parse_trailing_redirects()?;
         Ok(Command::While { cond, body, until, redirects })
@@ -600,7 +650,7 @@ impl Parser {
             let step = parts.next().unwrap_or("").trim().to_string();
             self.skip_terminators();
             self.expect(Tok::KwDo)?;
-            let body = self.parse_list_until(&[Tok::KwDone])?;
+            let body = self.parse_required_list_until(&[Tok::KwDone])?;
             self.expect(Tok::KwDone)?;
             let redirects = self.parse_trailing_redirects()?;
             return Ok(Command::CFor { init, cond, step, body, redirects });
@@ -624,7 +674,7 @@ impl Parser {
         // No "in ...": bash iterates "$@" here (words stays None).
         self.skip_terminators();
         self.expect(Tok::KwDo)?;
-        let body = self.parse_list_until(&[Tok::KwDone])?;
+        let body = self.parse_required_list_until(&[Tok::KwDone])?;
         self.expect(Tok::KwDone)?;
         let redirects = self.parse_trailing_redirects()?;
         Ok(Command::For { var, words, body, redirects })
@@ -654,7 +704,7 @@ impl Parser {
         }
         self.skip_terminators();
         self.expect(Tok::KwDo)?;
-        let body = self.parse_list_until(&[Tok::KwDone])?;
+        let body = self.parse_required_list_until(&[Tok::KwDone])?;
         self.expect(Tok::KwDone)?;
         let redirects = self.parse_trailing_redirects()?;
         Ok(Command::Select { var, words, body, redirects })
@@ -919,6 +969,21 @@ impl Parser {
                 // becomes an ordinary argument word. See expect_word's own
                 // doc comment on why the lexer produces a keyword token
                 // here in the first place.
+                // `x=1 (echo y)`, `arr= (a b)`: a subshell cannot be a
+                // command's argument, and after an assignment prefix
+                // there is no command for it to *be*. bash calls this a
+                // syntax error; bish used to read `arr= (a b)` as the
+                // array assignment `arr=(a b)`, which is the leniency
+                // that let the formatter emit the broken spelling
+                // unnoticed (see try_array_literal_assignment).
+                Some(Tok::Subshell { .. })
+                    if !assigns.is_empty()
+                        || !array_assigns.is_empty()
+                        || !index_assigns.is_empty()
+                        || !words.is_empty() =>
+                {
+                    return Err("near unexpected token `('".to_string());
+                }
                 Some(tok)
                     if keyword_text(tok).is_some()
                         && (!assigns.is_empty() || !array_assigns.is_empty() || !index_assigns.is_empty() || !words.is_empty()) =>
@@ -1031,11 +1096,17 @@ impl Parser {
     // (which the caller already owns either way).
     fn try_array_literal_assignment(&mut self, w: &Word) -> Result<Option<(String, AssignMode, Vec<ArrayLiteralItem>)>, String> {
         let Some((name, mode, val)) = word_as_assignment(w) else { return Ok(None) };
-        if !is_empty_word(&val) || !matches!(self.peek(), Some(Tok::Subshell(_))) {
+        // `attached`: `arr=(a b)` is an array assignment, `arr= (a b)`
+        // is a syntax error in bash -- the space is the whole
+        // difference, and without checking it this shell did the
+        // assignment either way. (That is what let the formatter emit
+        // the broken spelling for months: bish's own round-trip could
+        // not see the damage.)
+        if !is_empty_word(&val) || !matches!(self.peek(), Some(Tok::Subshell { attached: true, .. })) {
             return Ok(None);
         }
         let raw = match self.advance() {
-            Some(Tok::Subshell(r)) => r,
+            Some(Tok::Subshell { raw: r, .. }) => r,
             _ => unreachable!(),
         };
         Ok(Some((name, mode, split_array_literal_words(&raw)?)))

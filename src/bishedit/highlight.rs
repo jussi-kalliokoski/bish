@@ -899,7 +899,7 @@ fn highlight_into(text: &str, offset: usize, ctx: HighlightContext, out: &mut Ve
                 // a false "valid").
                 let is_function_def_name = matches!(cmd_pos, CmdPos::ExpectCommand)
                     && matches!(tok, Tok::Word(chunks, _) if matches!(chunks.as_slice(), [Chunk::Str(_)]))
-                    && matches!(res.items.get(i + 1), Some(SpannedItem::Tok(Tok::Subshell(raw), _)) if raw.is_empty());
+                    && matches!(res.items.get(i + 1), Some(SpannedItem::Tok(Tok::Subshell { raw, .. }, _)) if raw.is_empty());
                 highlight_tok(tok, span, offset, &chars, &res.raw_capture_spans, &mut cursor, ctx, &mut cmd_pos, is_function_def_name, out);
             }
         }
@@ -1310,7 +1310,7 @@ fn highlight_tok(
         // A (...) subshell command grouping -- the parens themselves stay
         // uncolored (unlike Chunk::Sub below, which does mark its
         // delimiters); only the interior recursively highlights.
-        Tok::Subshell(raw) => {
+        Tok::Subshell { raw, .. } => {
             if let Some(inner) = next_span(raw_spans, cursor) {
                 highlight_into(raw, offset + inner.start, ctx, out);
             }

@@ -211,7 +211,10 @@ pub enum Tok {
     RBrace,
     RParen,
     // Raw, not-yet-parsed source text of a (...) subshell pipeline stage.
-    Subshell(String),
+    // `attached` means the `(` sat directly against the previous
+    // token, with no space -- the difference between `arr=(a b)` (an
+    // array assignment) and `arr= (a b)` (a syntax error in bash).
+    Subshell { raw: String, attached: bool },
     // Raw source text of a standalone ((...)) arithmetic command.
     Arith(String),
     KwIf,
@@ -409,7 +412,10 @@ impl<'a> Lexer<'a> {
             };
         }
         loop {
-            self.skip_spaces();
+            // Whether this token touches the one before it, with no
+            // space between them. Only `(` after an `name=` word cares
+            // -- see Tok::Subshell.
+            let attached = !self.skip_spaces() && !toks.is_empty();
             if self.regex_operand_next {
                 self.regex_operand_next = false;
                 if self.chars.peek().is_some() {
@@ -511,7 +517,7 @@ impl<'a> Lexer<'a> {
                         push_tok!(Tok::Arith(raw));
                     } else {
                         let raw = self.capture_balanced_parens()?;
-                        push_tok!(Tok::Subshell(raw));
+                        push_tok!(Tok::Subshell { raw, attached });
                     }
                 }
                 Some(')') => {
@@ -1033,14 +1039,21 @@ impl<'a> Lexer<'a> {
         body
     }
 
-    fn skip_spaces(&mut self) {
+    // Returns whether anything was actually skipped. `arr=(a b)` and
+    // `arr= (a b)` produce the same two tokens otherwise, and only the
+    // first is an array assignment -- the second is bash's own syntax
+    // error, and was bish quietly doing the assignment anyway.
+    fn skip_spaces(&mut self) -> bool {
+        let mut skipped = false;
         while let Some(c) = self.chars.peek().copied() {
             if c == ' ' || c == '\t' {
                 self.advance();
+                skipped = true;
             } else {
                 break;
             }
         }
+        skipped
     }
 
     // Returns the word's chunks plus whether it was written with no
@@ -1488,7 +1501,7 @@ pub fn tokenize_spanned(src: &str) -> SpannedResult {
     let mut items: Vec<SpannedItem> = Vec::new();
     let mut error: Option<String> = None;
     'outer: loop {
-        lexer.skip_spaces();
+        let attached = !lexer.skip_spaces() && !items.is_empty();
         let start = lexer.pos;
         if lexer.regex_operand_next {
             lexer.regex_operand_next = false;
@@ -1599,7 +1612,7 @@ pub fn tokenize_spanned(src: &str) -> SpannedResult {
                     }
                 } else {
                     match lexer.capture_balanced_parens() {
-                        Ok(raw) => items.push(SpannedItem::Tok(Tok::Subshell(raw), start..lexer.pos)),
+                        Ok(raw) => items.push(SpannedItem::Tok(Tok::Subshell { raw, attached }, start..lexer.pos)),
                         Err(e) => {
                             error = Some(e);
                             break;

@@ -135,8 +135,10 @@ fn content_depth(stack: &[Block]) -> usize {
 // The gap before either one has to be nothing. `f () { ...; }` is at
 // least legal and merely unidiomatic, but `arr= (a b)` is a syntax
 // error in bash -- which is what made this worth fixing: the formatter
-// was writing it, and bish's own lexer is lenient enough to keep
-// running the result, so nothing here noticed.
+// was writing it, and bish's own parser used to be lenient enough to
+// keep running the result, so nothing here noticed. (That leniency is
+// gone too now; this rule is what keeps the formatter from writing the
+// broken spelling in the first place.)
 fn parens_belong_to_previous_word(chars: &[char], real: &[&SpannedItem], i: usize, inner: &str) -> bool {
     let Some(SpannedItem::Tok(Tok::Word(..), span)) = i.checked_sub(1).and_then(|j| real.get(j)).copied() else {
         return false;
@@ -161,7 +163,7 @@ fn is_function_brace(real: &[&SpannedItem], lbrace_idx: usize) -> bool {
         }
     };
     match (at(1), at(2)) {
-        (Some(Tok::Subshell(s)), Some(Tok::Word(..))) if s.is_empty() => true,
+        (Some(Tok::Subshell { raw: s, .. }), Some(Tok::Word(..))) if s.is_empty() => true,
         (Some(Tok::Word(..)), Some(Tok::KwFunction)) => true,
         _ => false,
     }
@@ -429,7 +431,7 @@ fn format_gaps(chars: &[char], real: &[&SpannedItem]) -> Vec<Diagnostic> {
                 // `parens_belong_to_previous_word`. Neither shape takes
                 // a space, and for an array assignment that is not
                 // style: `arr= (a b)` is a syntax error in bash.
-                Tok::Subshell(inner) if parens_belong_to_previous_word(chars, real, i, inner) => {
+                Tok::Subshell { raw: inner, .. } if parens_belong_to_previous_word(chars, real, i, inner) => {
                     leading_override = Some(String::new());
                 }
                 Tok::LBrace => {
@@ -508,7 +510,7 @@ fn format_gaps(chars: &[char], real: &[&SpannedItem]) -> Vec<Diagnostic> {
                         }
                     };
                     if matches!(at(1), Some(Tok::Word(..))) {
-                        let brace_off = if matches!(at(2), Some(Tok::Subshell(s)) if s.is_empty()) { 3 } else { 2 };
+                        let brace_off = if matches!(at(2), Some(Tok::Subshell { raw: s, .. }) if s.is_empty()) { 3 } else { 2 };
                         if matches!(at(brace_off), Some(Tok::LBrace)) {
                             let word_start = span_of(real[i + 1]).start;
                             let kw_span = span_of(item.unwrap());
@@ -679,10 +681,15 @@ mod tests {
         assert_eq!(format_text("arr=(a b)\n"), "arr=(a b)\n");
         assert_eq!(format_text("arr+=(\"$y\")\n"), "arr+=(\"$y\")\n");
         assert_eq!(format_text("declare -a x=(1 2)\n"), "declare -a x=(1 2)\n");
-        // A space that was there gets taken away, the same way the
-        // function-definition rule beside it does.
-        assert_eq!(format_text("arr= (a b)\n"), "arr=(a b)\n");
-        // ...and a real subshell still gets its space.
+        // `arr= (a b)` is no longer reachable here: the parser rejects
+        // it now, the way bash always has (see
+        // try_array_literal_assignment), and the formatter does not
+        // rewrite what it cannot parse. The rule above is what stops
+        // this formatter from ever *writing* that spelling; a file an
+        // older version already damaged is now a syntax error the
+        // editor reports rather than one it silently repairs.
+        assert!(BashFormatter.check("arr= (a b)\n").is_err());
+        // A real subshell still gets its space.
         assert_eq!(format_text("echo hi\n(echo sub)\n"), "echo hi\n(echo sub)\n");
     }
 
@@ -791,11 +798,14 @@ mod tests {
     }
 
     #[test]
-    fn a_function_keyword_def_whose_body_is_not_a_brace_group_is_left_untouched() {
-        // Out of scope: normalizing this would require wrapping the body
-        // in `{ ... }` too, a different (and riskier) transformation.
-        let src = "function foo echo hi\n";
-        assert!(BashFormatter.check(src).unwrap().is_empty());
+    fn a_function_body_that_is_not_a_compound_command_is_a_syntax_error() {
+        // It always was one in bash -- a function body is a brace group,
+        // a subshell, a loop, an `if`, a `case`, `(( ))` or `[[ ]]`, and
+        // nothing else. bish used to read this as "a function whose body
+        // is `echo`", quietly losing the `hi`; the formatter's job here
+        // is only not to touch what it cannot parse.
+        assert!(BashFormatter.check("function foo echo hi\n").is_err());
+        assert!(BashFormatter.check("foo() echo hi\n").is_err());
     }
 
     #[test]

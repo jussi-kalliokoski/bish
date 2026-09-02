@@ -1397,6 +1397,15 @@ pub struct Shell {
     // a readonly variable, and would be intolerable if it did that to
     // someone's session over a typo.
     interactive: bool,
+    // Set when expanding a *word* of the command currently being built
+    // failed: `${x!y}` and `${a[}` (no such parameter), `${x:?}` (the
+    // one whose whole purpose is to stop), and an arithmetic expansion
+    // that does not parse. bash treats all three as fatal in a
+    // non-interactive shell -- and only in a word: `(( 1+ ))` and `let
+    // '1+'` are ordinary commands that fail and are stepped over.
+    // Cleared at the checkpoints in run_single that consult it, so it
+    // never leaks into the next command.
+    expansion_failed: bool,
     // See StdioOverride's own doc comment. `None` for every ordinary
     // Shell (spawned external commands really inherit the real process's
     // fds); set by run_in_child_shell on the Shell it builds for a
@@ -1557,6 +1566,7 @@ impl Shell {
             pending_edit: None,
             pending_exit: None,
             interactive: false,
+            expansion_failed: false,
             stdio_override: None,
             debug_hook: None,
             current_line: 0,
@@ -1867,6 +1877,7 @@ impl Shell {
             pending_edit: None,
             pending_exit: None,
             interactive: self.interactive,
+            expansion_failed: false,
             stdio_override: None,
             debug_hook: self.debug_hook.clone(),
             current_line: self.current_line,
@@ -2559,7 +2570,14 @@ impl Shell {
                 body.push_str(&declare_p_quote(v));
                 body.push(' ');
             }
-            return Some(format!("declare {} {}=({})", flag_str, name, body.trim_end()));
+            // The trailing space is bash's, and only for an
+            // associative array -- an indexed one is trimmed. Confirmed
+            // against real bash, quirk and all, because `declare -p`
+            // output is meant to be re-read.
+            if body.is_empty() {
+                return Some(format!("declare {} {}", flag_str, name));
+            }
+            return Some(format!("declare {} {}=({})", flag_str, name, body));
         }
         if let Some(items) = self.arrays.get(name) {
             let mut body = String::new();
@@ -4828,7 +4846,12 @@ impl Shell {
                         let v = v.to_string();
                         out.push_str(&if *quoted { crate::regex::escape(&v) } else { v });
                     }
-                    Err(e) => sh_eprintln!(self, "bish: (({})): {}", raw, e),
+                    Err(e) => {
+                        sh_eprintln!(self, "bish: (({})): {}", raw, e);
+                        // Fatal, unlike the `(( ))` *command* -- see
+                        // expansion_failed.
+                        self.expansion_failed = true;
+                    }
                 },
                 Chunk::VarExpand { name, op, quoted } => {
                     let name = name.clone();
@@ -4916,6 +4939,14 @@ impl Shell {
                 ok &= self.apply_array_literal(name, *mode, items);
             }
             for (name, index, val) in &cmd.index_assigns {
+                // `a[]=1` names no element at all. bash calls that a
+                // bad subscript and stops; accepting it wrote to index
+                // 0, which is not what anyone typing it meant.
+                if index.trim().is_empty() {
+                    sh_eprintln!(self, "bish: {}[]: bad array subscript", name);
+                    ok = false;
+                    continue;
+                }
                 // array_set_index prints the refusal itself; this only
                 // needs to know that one is coming.
                 ok &= !self.name_is_readonly(name);
@@ -4933,6 +4964,9 @@ impl Shell {
             // neither does this.
             if !ok && !self.interactive {
                 self.pending_exit = Some(1);
+            }
+            if let Some(result) = self.take_expansion_failure() {
+                return result;
             }
             if let Some(exit) = self.take_pending_exit() {
                 return exit;
@@ -4990,6 +5024,9 @@ impl Shell {
             self.expand_words(&cmd.words)
         };
         self.current_stderr_target = saved_stderr_target;
+        if let Some(result) = self.take_expansion_failure() {
+            return result;
+        }
         if let Some(exit) = self.take_pending_exit() {
             return exit;
         }
@@ -5430,7 +5467,7 @@ impl Shell {
                 // forward by one again -- net zero, so array_literal_args
                 // (itself indexed into the *original* argv) already lines
                 // up with declare_args unchanged.
-                return ExecResult::Status(crate::builtins::vars::run_declare(self, &declare_args, array_literal_args));
+                return ExecResult::Status(crate::builtins::vars::run_declare(self, &name, &declare_args, array_literal_args));
             }
             "let" => {
                 let mut last = 0i64;
@@ -5447,7 +5484,15 @@ impl Shell {
             }
             "break" => return builtins::break_loop(&argv[1..]),
             "continue" => return builtins::continue_loop(&argv[1..]),
-            "test" => return ExecResult::Status(builtins::test(&argv[1..], false)),
+            "test" => {
+                return ExecResult::Status(match builtins::test(&argv[1..], false) {
+                    Ok(status) => status,
+                    Err(e) => {
+                        sh_eprintln!(self, "bish: test: {}", e);
+                        2
+                    }
+                });
+            }
             // `[[` is a keyword (see lexer.rs/parser.rs Command::Test), not
             // a plain command name, so it never reaches this dispatch --
             // only bracket-style `[ ... ]` (the `test` alias) does.
@@ -5459,7 +5504,13 @@ impl Shell {
                     sh_eprintln!(self, "bish: [: missing closing ]");
                     return ExecResult::Status(2);
                 }
-                return ExecResult::Status(builtins::test(&a, false));
+                return ExecResult::Status(match builtins::test(&a, false) {
+                    Ok(status) => status,
+                    Err(e) => {
+                        sh_eprintln!(self, "bish: [: {}", e);
+                        2
+                    }
+                });
             }
             "return" => {
                 let code = argv.get(1).and_then(|s| s.parse::<i32>().ok()).unwrap_or(self.last_status);
@@ -5838,12 +5889,39 @@ impl Shell {
                 }
                 let mut strip_newline = false;
                 let mut array_name = "MAPFILE".to_string();
+                // `-n`/`-O`/`-s`/`-u`/`-c` each take a count, and a
+                // count that is not a number is the command being
+                // wrong. The values themselves are still not acted on
+                // (this reads the whole source into the array); what
+                // changed is that a typo'd one is reported rather than
+                // silently becoming the array's name.
+                let mut expect_count: Option<&str> = None;
+                let mut bad_count: Option<(String, String)> = None;
                 for a in &argv[1..] {
+                    if let Some(flag) = expect_count.take() {
+                        if a.parse::<u64>().is_err() {
+                            let what = match flag {
+                                "-n" => "invalid line count",
+                                "-O" => "invalid array origin",
+                                "-s" => "invalid line count",
+                                "-u" => "invalid file descriptor specification",
+                                _ => "invalid callback quantum",
+                            };
+                            bad_count = Some((a.clone(), what.to_string()));
+                        }
+                        continue;
+                    }
                     match a.as_str() {
                         "-t" => strip_newline = true,
+                        flag @ ("-n" | "-O" | "-s" | "-u" | "-c") => expect_count = Some(flag),
+                        "-d" | "-C" => expect_count = Some("-d"),
                         other if !other.starts_with('-') => array_name = other.to_string(),
                         _ => {}
                     }
+                }
+                if let Some((value, what)) = bad_count {
+                    sh_eprintln!(self, "bish: {}: {}: {}", name, value, what);
+                    return ExecResult::Status(1);
                 }
                 let mut reader = self.read_input_source(cmd);
                 let mut map = std::collections::BTreeMap::new();
@@ -6070,7 +6148,7 @@ impl Shell {
                     .iter()
                     .filter_map(|(p, n, m, i)| p.checked_sub(1).map(|p2| (p2, n.clone(), *m, i.clone())))
                     .collect();
-                return ExecResult::Status(crate::builtins::vars::run_declare(self, &argv[1..], &shifted));
+                return ExecResult::Status(crate::builtins::vars::run_declare(self, &name, &argv[1..], &shifted));
             }
             // `readonly` is `declare -r`, the same way `export` is
             // `declare -x` -- and for the same reason: run_declare is
@@ -6080,7 +6158,7 @@ impl Shell {
             "readonly" => {
                 let mut declare_args = vec!["-r".to_string()];
                 declare_args.extend(argv[1..].iter().cloned());
-                return ExecResult::Status(crate::builtins::vars::run_declare(self, &declare_args, array_literal_args));
+                return ExecResult::Status(crate::builtins::vars::run_declare(self, &name, &declare_args, array_literal_args));
             }
             // exec CMD [args...] replaces this process image entirely (no
             // fork, no return on success) -- exactly what real bash does,
@@ -6740,7 +6818,12 @@ impl Shell {
                 Chunk::Sub { raw, .. } => s.push_str(&self.run_command_substitution(raw)),
                 Chunk::Arith { raw, .. } => match arith::eval(raw, self) {
                     Ok(v) => s.push_str(&v.to_string()),
-                    Err(e) => sh_eprintln!(self, "bish: (({})): {}", raw, e),
+                    Err(e) => {
+                        sh_eprintln!(self, "bish: (({})): {}", raw, e);
+                        // Fatal, unlike the `(( ))` *command* -- see
+                        // expansion_failed.
+                        self.expansion_failed = true;
+                    }
                 },
                 Chunk::VarExpand { name, op, .. } => {
                     let name = name.clone();
@@ -6926,6 +7009,12 @@ impl Shell {
     // apply_array_literal to know where a literal's own running
     // "next index" counter should resume after an explicit `[i]=value`
     // element.
+    // `declare 'a[0]=5'` reaches the same element assignment a bare
+    // `a[0]=5` does -- see run_declare, which is outside this module.
+    pub(crate) fn array_set_index_public(&mut self, name: &str, index: &str, value: String) {
+        self.array_set_index(name, index, value);
+    }
+
     fn array_set_index(&mut self, name: &str, index: &str, value: String) -> Option<usize> {
         if self.name_is_readonly(name) {
             sh_eprintln!(self, "bish: {}: readonly variable", name);
@@ -7085,6 +7174,7 @@ impl Shell {
                         append_parts_glob(&mut fields, &mut current, &mut patterns, &mut pattern_current, &parts);
                     } else {
                         let name = name.clone();
+                        self.check_param_name(&name);
                         self.check_nounset(&name);
                         let v = self.lookup_var(&name);
                         append_splittable_glob(&mut fields, &mut current, &mut patterns, &mut pattern_current, &v, *quoted, &ifs);
@@ -7099,6 +7189,9 @@ impl Shell {
                         Ok(n) => n.to_string(),
                         Err(e) => {
                             sh_eprintln!(self, "bish: (({})): {}", raw, e);
+                            // A `$(( ))` that does not parse is fatal
+                            // in bash, unlike the `(( ))` *command*.
+                            self.expansion_failed = true;
                             String::new()
                         }
                     };
@@ -7270,8 +7363,15 @@ impl Shell {
             VarOp::ErrorIfUnset { word, colon } => {
                 let trigger = if *colon { cur.is_empty() } else { !self.var_is_set(name) };
                 if trigger {
-                    let msg = self.expand_raw(word);
+                    // bash's own wording when `${x:?}` carries no
+                    // message of its own.
+                    let msg = match self.expand_raw(word) {
+                        m if m.is_empty() => "parameter null or not set".to_string(),
+                        m => m,
+                    };
                     sh_eprintln!(self, "bish: {}: {}", name, msg);
+                    // The whole point of `${x:?}` is to stop.
+                    self.expansion_failed = true;
                     String::new()
                 } else {
                     cur
@@ -7370,6 +7470,9 @@ impl Shell {
             Ok(items) => items,
             Err(e) => {
                 sh_eprintln!(self, "bish: {e}");
+                // A word that could not be expanded is fatal in a
+                // script -- see expansion_failed.
+                self.expansion_failed = true;
                 Vec::new()
             }
         }
@@ -7417,8 +7520,12 @@ impl Shell {
             VarOp::ErrorIfUnset { word, colon } => {
                 let trigger = if *colon { cur.is_empty() } else { !self.array_element_is_set(name, index) };
                 if trigger {
-                    let msg = self.expand_raw(word);
+                    let msg = match self.expand_raw(word) {
+                        m if m.is_empty() => "parameter null or not set".to_string(),
+                        m => m,
+                    };
                     sh_eprintln!(self, "bish: {}[{}]: {}", name, index, msg);
+                    self.expansion_failed = true;
                     String::new()
                 } else {
                     cur
@@ -7527,13 +7634,13 @@ impl Shell {
     // `*.nothing` -- and the two shopts that change that are the whole
     // reason anyone sets them.
     //
-    // `failglob` reports and yields nothing. Real bash also abandons
-    // the command; bish carries on, which is what it already does with
-    // every other expansion error (see `${x?msg}`), so the difference
-    // is one line of output rather than one of behaviour.
+    // `failglob` reports and abandons the command, as bash does -- see
+    // expansion_failed for why that is fatal in a script and merely a
+    // failed command in an interactive session.
     fn unmatched_pattern(&mut self, word: &str) -> Vec<String> {
         if self.shopt_is_on("failglob") {
             sh_eprintln!(self, "bish: no match: {word}");
+            self.expansion_failed = true;
             return Vec::new();
         }
         match self.shopt_is_on("nullglob") {
@@ -7865,6 +7972,35 @@ impl Shell {
         x ^= x << 17;
         self.rng_state = x;
         ((x >> 33) % 32768) as u32
+    }
+
+    // `${x!y}`, `${1bad}`, `${a[}`: brace content that is not a
+    // parameter name at all. The lexer hands it here as an ordinary
+    // name because that is what it looks like from outside; nothing
+    // could ever set it, so reading it as an unset variable turns a
+    // typo into an empty string. Reports it and marks the command
+    // failed, which is what bash does.
+    // Fatal in a script, the way bash has it -- `${x!y}` is a typo, and
+    // every line after it was written expecting the value it did not
+    // get. An interactive session just fails the command, as with a
+    // refused readonly write.
+    fn take_expansion_failure(&mut self) -> Option<ExecResult> {
+        if !std::mem::take(&mut self.expansion_failed) {
+            return None;
+        }
+        if self.interactive {
+            return Some(ExecResult::Status(1));
+        }
+        self.run_exit_trap();
+        Some(ExecResult::Exit(1))
+    }
+
+    fn check_param_name(&mut self, name: &str) {
+        if is_parameter_name(name) {
+            return;
+        }
+        sh_eprintln!(self, "bish: ${{{}}}: bad substitution", name);
+        self.expansion_failed = true;
     }
 
     fn check_nounset(&mut self, name: &str) {
@@ -10284,6 +10420,20 @@ pub(crate) fn all_signals() -> Vec<(&'static str, i32)> {
 
 // Accepts "INT", "SIGINT", or a bare number ("2"); "0"/"EXIT" is handled by
 // the caller separately since it isn't a real signal.
+// Everything `${NAME}` may name: an identifier, a positional
+// parameter's digits, or one of the shell's own special parameters.
+fn is_parameter_name(name: &str) -> bool {
+    if name.len() == 1 && "@*#?-$!_0".contains(name) {
+        return true;
+    }
+    if name.chars().all(|c| c.is_ascii_digit()) {
+        return !name.is_empty();
+    }
+    let mut chars = name.chars();
+    matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
 pub(crate) fn signal_number(name: &str) -> Option<i32> {
     let bare = name.strip_prefix("SIG").unwrap_or(name);
     if let Some(&(_, n)) = SIGNAL_NAMES.iter().find(|(n, _)| *n == bare) {
@@ -13491,16 +13641,20 @@ mod tests {
     }
 
     #[test]
-    fn an_unrecognized_at_transform_letter_falls_back_to_a_literal_name() {
-        // Matches every other "unrecognized operator syntax" case in
-        // parse_brace_content -- `${v@Z}` isn't one of the four
-        // implemented transform letters, so the whole `${...}` is
-        // treated as a best-effort literal (nonexistent) variable name
-        // rather than crashing or silently dropping the '@'.
+    fn an_unrecognized_at_transform_letter_is_a_expansion_failed() {
+        // `${v@Z}` isn't one of the implemented transform letters, and
+        // parse_brace_content falls back to reading the whole `${...}`
+        // as a literal variable name -- which is a name nothing can
+        // ever set, so check_param_name catches it. bash calls it a bad
+        // substitution too; expanding it to the empty string, which is
+        // what this used to do, is how the typo went unnoticed.
         let mut shell = Shell::new();
         let buf = capture_output(&mut shell);
-        shell.run_source_here(r#"v=hi; echo "[${v@Z}]""#, "<test>");
-        assert_eq!(buf.borrow().as_str(), "[]\n");
+        let result = shell.run_source_here(r#"v=hi; echo "[${v@Z}]""#, "<test>");
+        assert!(matches!(result, ExecResult::Exit(1)), "{result:?}");
+        // The capture takes stderr too -- the diagnostic is all there
+        // is; the `echo` never ran.
+        assert_eq!(buf.borrow().as_str(), "bish: ${v@Z}: bad substitution\n");
     }
 
     #[test]
@@ -13704,7 +13858,7 @@ mod tests {
     #[test]
     fn declare_p_on_an_unset_name_errors_and_exits_1() {
         let mut shell = Shell::new();
-        let status = crate::builtins::vars::run_declare(&mut shell, &strs(&["-p", "DEFINITELY_NOT_SET_XYZ"]), &[]);
+        let status = crate::builtins::vars::run_declare(&mut shell, "declare", &strs(&["-p", "DEFINITELY_NOT_SET_XYZ"]), &[]);
         assert_eq!(status, 1);
     }
 
@@ -13713,7 +13867,7 @@ mod tests {
         let mut shell = Shell::new();
         shell.run_source_here("foo() { echo hi; }", "<test>");
         let buf = capture_output(&mut shell);
-        assert_eq!(crate::builtins::vars::run_declare(&mut shell, &strs(&["-f", "foo"]), &[]), 0);
+        assert_eq!(crate::builtins::vars::run_declare(&mut shell, "declare", &strs(&["-f", "foo"]), &[]), 0);
         let printed = buf.borrow().clone();
         assert!(printed.contains("foo"), "{printed:?}");
 
@@ -13730,14 +13884,14 @@ mod tests {
         let mut shell = Shell::new();
         shell.run_source_here("foo() { echo hi; }", "<test>");
         let buf = capture_output(&mut shell);
-        crate::builtins::vars::run_declare(&mut shell, &strs(&["-F", "foo"]), &[]);
+        crate::builtins::vars::run_declare(&mut shell, "declare", &strs(&["-F", "foo"]), &[]);
         assert_eq!(buf.borrow().as_str(), "declare -f foo\n");
     }
 
     #[test]
     fn declare_f_on_an_unknown_function_errors_and_exits_1() {
         let mut shell = Shell::new();
-        assert_eq!(crate::builtins::vars::run_declare(&mut shell, &strs(&["-f", "not_a_real_function"]), &[]), 1);
+        assert_eq!(crate::builtins::vars::run_declare(&mut shell, "declare", &strs(&["-f", "not_a_real_function"]), &[]), 1);
     }
 
     #[test]

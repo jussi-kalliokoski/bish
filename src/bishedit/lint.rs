@@ -460,7 +460,7 @@ fn lint_into(text: &str, offset: usize, out: &mut Vec<Diagnostic>) {
             Tok::KwRBracket2 => bracket2_depth = bracket2_depth.saturating_sub(1),
             Tok::KwCase => case_subject = true,
             Tok::KwIn => case_subject = false,
-            Tok::Subshell(raw) => {
+            Tok::Subshell { raw, .. } => {
                 if let Some(inner) = next_span(&res.raw_capture_spans, &mut cursor) {
                     lint_into(raw, offset + inner.start, out);
                 }
