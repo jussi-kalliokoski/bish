@@ -123,6 +123,27 @@ fn content_depth(stack: &[Block]) -> usize {
     stack.last().map(|b| b.header_depth + 1).unwrap_or(0)
 }
 
+// Whether the parentheses at `real[i]` belong to the word before them
+// rather than opening a subshell of their own. Two shapes, and between
+// them they are the only ways a Word is legally followed by a Subshell
+// at all:
+//
+//     NAME()      a function definition -- the parens are empty, and a
+//                 real subshell command never is
+//     NAME=(...)  an array assignment, or `NAME+=(...)` to append
+//
+// The gap before either one has to be nothing. `f () { ...; }` is at
+// least legal and merely unidiomatic, but `arr= (a b)` is a syntax
+// error in bash -- which is what made this worth fixing: the formatter
+// was writing it, and bish's own lexer is lenient enough to keep
+// running the result, so nothing here noticed.
+fn parens_belong_to_previous_word(chars: &[char], real: &[&SpannedItem], i: usize, inner: &str) -> bool {
+    let Some(SpannedItem::Tok(Tok::Word(..), span)) = i.checked_sub(1).and_then(|j| real.get(j)).copied() else {
+        return false;
+    };
+    inner.is_empty() || span.end.checked_sub(1).and_then(|last| chars.get(last)) == Some(&'=')
+}
+
 // Whether `real[lbrace_idx]` (an LBrace) is a function body's own
 // opening brace -- `foo() {` / `function foo {` / `function foo() {`
 // -- rather than a bare `{ ... }` group command, matching
@@ -403,12 +424,12 @@ fn format_gaps(chars: &[char], real: &[&SpannedItem]) -> Vec<Diagnostic> {
                     leading_override = Some(String::new());
                     forced_next = Some(String::new());
                 }
-                // `NAME()` -- an empty Subshell right after a Word is
-                // never a real (necessarily non-empty) subshell command;
-                // it's always the parens of a function definition (see
-                // is_function_brace/Parser::looks_like_func_def), which
-                // idiomatically never has a space before them.
-                Tok::Subshell(s) if s.is_empty() && matches!(i.checked_sub(1).and_then(|j| real.get(j)), Some(SpannedItem::Tok(Tok::Word(..), _))) => {
+                // Parentheses that belong to the word in front of them
+                // rather than opening a subshell of their own -- see
+                // `parens_belong_to_previous_word`. Neither shape takes
+                // a space, and for an array assignment that is not
+                // style: `arr= (a b)` is a syntax error in bash.
+                Tok::Subshell(inner) if parens_belong_to_previous_word(chars, real, i, inner) => {
                     leading_override = Some(String::new());
                 }
                 Tok::LBrace => {
@@ -646,6 +667,23 @@ mod tests {
         let once = format_text(&src);
         assert_eq!(once, "echo a b 'c d' \"$x\" 'e=f' '2' '#g' h#i\n");
         assert_eq!(format_text(&once), once, "formatting a formatted file changes nothing");
+    }
+
+    // `arr= (a b)` is a syntax error in bash. The formatter used to
+    // write it -- the generic "a space between two items" rule does not
+    // know that these parentheses belong to the word in front of them
+    // -- and bish's own lexer is lenient enough about the space that
+    // nothing here noticed until the output was handed to bash.
+    #[test]
+    fn an_array_assignment_keeps_its_parentheses_attached() {
+        assert_eq!(format_text("arr=(a b)\n"), "arr=(a b)\n");
+        assert_eq!(format_text("arr+=(\"$y\")\n"), "arr+=(\"$y\")\n");
+        assert_eq!(format_text("declare -a x=(1 2)\n"), "declare -a x=(1 2)\n");
+        // A space that was there gets taken away, the same way the
+        // function-definition rule beside it does.
+        assert_eq!(format_text("arr= (a b)\n"), "arr=(a b)\n");
+        // ...and a real subshell still gets its space.
+        assert_eq!(format_text("echo hi\n(echo sub)\n"), "echo hi\n(echo sub)\n");
     }
 
     #[test]
