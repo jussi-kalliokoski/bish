@@ -2348,6 +2348,54 @@ impl Shell {
     // a converted foreground subshell/command-substitution/proc-sub still
     // captures an external command's output correctly even though it's no
     // longer itself a separate OS process with its own real fd 1.
+    /// A `Command` that will inherit *this shell's* environment rather
+    /// than whatever happens to be in the process's.
+    ///
+    /// Every place the shell starts a process goes through here. That
+    /// is not a convention: `every_process_the_shell_starts_goes_
+    /// through_command` reads this crate's own source and fails on a
+    /// `Command::new` anywhere that is not either this function or an
+    /// entry in its allow list -- with a reason written next to it. A
+    /// spawn that misses this gets a stale environment and says
+    /// nothing about it, which is exactly the kind of mistake that is
+    /// worth making impossible rather than remembering not to make.
+    pub(crate) fn command(&self, program: impl AsRef<std::ffi::OsStr>) -> Command {
+        let mut command = Command::new(program);
+        command.env_clear();
+        command.envs(self.exported_pairs());
+        command
+    }
+
+    /// Every exported variable and its value, as a child should see it.
+    ///
+    /// Resolved with the same precedence a `$name` gets, so an exported
+    /// `local` shadows the global of the same name. NUL-bearing names
+    /// and values are dropped rather than passed: a C environment
+    /// string cannot hold one, and the variable is worth more than the
+    /// export (see `export_to_environment`, which draws the same line).
+    fn exported_pairs(&self) -> Vec<(String, String)> {
+        self.exported_names
+            .iter()
+            .filter(|name| !name.contains('\0'))
+            .filter_map(|name| {
+                let value = self.lookup_var_for_export(name)?;
+                (!value.contains('\0')).then(|| (name.clone(), value))
+            })
+            .collect()
+    }
+
+    /// The value a child should see for `name`, or `None` if it has
+    /// none -- an exported name that is not set exports nothing, the
+    /// same as in bash.
+    fn lookup_var_for_export(&self, name: &str) -> Option<String> {
+        for scope in self.var_scopes.iter().rev() {
+            if let Some(value) = scope.get(name) {
+                return value.clone();
+            }
+        }
+        self.globals.get(name).cloned()
+    }
+
     fn spawn_stdout_stdio(&self) -> Stdio {
         match &self.stdio_override {
             Some(o) => match &o.borrow().stdout {
@@ -2700,7 +2748,15 @@ impl Shell {
             return Some(format!("declare {} {}=({})", flag_str, name, body.trim_end()));
         }
         if !self.var_is_set(name) {
-            return None;
+            // A name can carry attributes without carrying a value:
+            // `export E` on an unset `E` records that it is to be
+            // exported if it is ever set, and bash prints that as
+            // `declare -x E`, with no `=` at all. Only "no attributes
+            // either" is genuinely not found.
+            if flags.is_empty() {
+                return None;
+            }
+            return Some(format!("declare {} {}", flag_str, name));
         }
         let value = self.lookup_var(name);
         Some(format!("declare {} {}={}", flag_str, name, declare_p_quote(&value)))
@@ -4346,7 +4402,7 @@ impl Shell {
             }
         };
         let script = self.functions_preamble() + raw;
-        let mut command = Command::new(exe);
+        let mut command = self.command(exe);
         command.arg("-c").arg(script).current_dir(&self.cwd);
         // Attached to its own pty, for exactly the reason run_single's own
         // background spawn already is (see `use_pty` there): inherited
@@ -4404,7 +4460,7 @@ impl Shell {
             }
         };
         let script = self.functions_preamble() + &crate::serialize::serialize_command(body);
-        let mut command = Command::new(exe);
+        let mut command = self.command(exe);
         command.arg("-c").arg(script);
         command.current_dir(&self.cwd);
         command.stdin(Stdio::from(in_r));
@@ -4468,7 +4524,7 @@ impl Shell {
             }
         };
         let script = self.functions_preamble() + &crate::serialize::serialize_command(cmd);
-        let mut command = Command::new(exe);
+        let mut command = self.command(exe);
         command.arg("-c").arg(script);
         command.current_dir(&self.cwd);
         // Whichever of this job's own streams the redirects *didn't*
@@ -5860,7 +5916,7 @@ impl Shell {
                 if self.check_restricted_command_name(&argv[i]) {
                     return ExecResult::Status(1);
                 }
-                let mut ext = Command::new(&argv[i]);
+                let mut ext = self.command(&argv[i]);
                 ext.args(&argv[i + 1..]);
                 ext.current_dir(&self.cwd);
                 // Without these, `command foo` would always inherit the
@@ -6918,7 +6974,7 @@ impl Shell {
                 // child_shell already uses to stop just this child
                 // without touching the real process.
                 if self.subshell_depth > 0 {
-                    let mut command = Command::new(prog);
+                    let mut command = self.command(prog);
                     command.arg0(&argv0);
                     if opts.clear_env {
                         command.env_clear();
@@ -6946,7 +7002,7 @@ impl Shell {
                     self.run_exit_trap();
                     return ExecResult::Exit(status);
                 }
-                let mut command = Command::new(prog);
+                let mut command = self.command(prog);
                 command.arg0(&argv0);
                 if opts.clear_env {
                     command.env_clear();
@@ -7048,7 +7104,7 @@ impl Shell {
             }
         };
 
-        let mut command = Command::new(&name);
+        let mut command = self.command(&name);
         command.args(&argv[1..]);
         command.current_dir(&self.cwd);
         for (k, mode, val) in &cmd.assigns {
@@ -7479,11 +7535,11 @@ impl Shell {
                         };
                         let script_line: String = argv.iter().map(|a| crate::serialize::quote_literal(a)).collect::<Vec<_>>().join(" ");
                         let script = self.functions_preamble() + &script_line;
-                        let mut command = Command::new(exe);
+                        let mut command = self.command(exe);
                         command.arg("-c").arg(script);
                         command
                     } else {
-                        let mut command = Command::new(&argv[0]);
+                        let mut command = self.command(&argv[0]);
                         command.args(&argv[1..]);
                         command
                     };
@@ -7524,7 +7580,7 @@ impl Shell {
                         }
                     };
                     let script = self.functions_preamble() + &crate::serialize::serialize_command(other);
-                    let mut command = Command::new(exe);
+                    let mut command = self.command(exe);
                     command.arg("-c").arg(script);
                     command.stdin(redirs.stdin.unwrap_or(default_stdin));
                     command.stdout(redirs.stdout.unwrap_or(default_stdout));
@@ -13601,6 +13657,110 @@ pub(crate) fn write_diagnostic(target: &Option<String>, msg: &str, sink: OutputS
 // substitution/proc-sub). This is still useful as a headless, no-
 // rendering/REPL-needed exercise of the primitive itself. `cargo test`
 // needs no external crate, matching the zero-dependency stance elsewhere.
+// Every process the shell starts on a script's behalf must inherit that
+// shell's environment, which means going through `Shell::command`. This
+// is what makes that true rather than customary.
+//
+// A `Command::new` that skips the helper produces a child with a stale
+// environment and no complaint from anyone -- the failure is a wrong
+// value somewhere downstream, not a crash, which is the worst shape a
+// mistake can have. So the rule is checked rather than remembered: this
+// reads the crate's own source and fails on any occurrence outside the
+// list below.
+//
+// The list is keyed by count as well as by file, so *adding* a spawn to
+// a file that already has one trips it too. An entry is a claim that
+// those spawns are bish's own tooling rather than the script's, and it
+// has to be argued for in the `why` column.
+//
+// Test modules are not counted: a test that spawns something is not the
+// shell starting a process for a script. Everything from the first
+// `#[cfg(test)]` in a file onwards is skipped, which is where this
+// codebase puts them.
+#[cfg(test)]
+mod spawn_guard {
+    /// `(file, how many, why it is not a shell spawn)`.
+    const ALLOWED: &[(&str, usize, &str)] = &[
+        ("src/exec.rs", 1, "`Shell::command` itself, the one place that builds a child's environment"),
+        (
+            "src/git.rs",
+            7,
+            "runs `git` to answer questions the prompt and the editor ask about the repository -- bish's own tooling, inheriting bish's own environment as any of its subprocesses does",
+        ),
+        ("src/lspclient.rs", 1, "starts a language server for the editor, which is bish's, not the script's"),
+        ("src/bishedit/registers.rs", 2, "hands the system clipboard to and from the editor"),
+        (
+            "src/session.rs",
+            1,
+            "the session daemon re-execs this binary to bootstrap itself; it has no Shell yet, and the one it builds afterwards seeds from the environment it was given",
+        ),
+        (
+            "src/repl.rs",
+            1,
+            "asks a fresh bish for a language server's project root, one memoised spawn per directory -- a question about the machine rather than a command the script wrote",
+        ),
+        (
+            "src/compgen.rs",
+            1,
+            "re-execs bish to run a completion function -- the shell's variables reach that child through the preamble as source text, not through its environment",
+        ),
+    ];
+
+    #[test]
+    fn every_process_the_shell_starts_goes_through_command() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut found: Vec<(String, usize)> = Vec::new();
+        let mut stack = vec![root.clone()];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).expect("src is readable").flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().is_none_or(|e| e != "rs") {
+                    continue;
+                }
+                let source = std::fs::read_to_string(&path).expect("a source file is readable");
+                // Everything from the first test module onwards is not
+                // the shell starting anything.
+                let body = match source.find("\n#[cfg(test)]\n") {
+                    Some(cut) => &source[..cut],
+                    None => &source[..],
+                };
+                let count = body.matches("Command::new(").count();
+                if count > 0 {
+                    let relative = path.strip_prefix(env!("CARGO_MANIFEST_DIR")).unwrap_or(&path);
+                    found.push((relative.to_string_lossy().replace('\\', "/"), count));
+                }
+            }
+        }
+        found.sort();
+
+        let mut problems: Vec<String> = Vec::new();
+        for (file, count) in &found {
+            match ALLOWED.iter().find(|(f, ..)| f == file) {
+                None => problems.push(format!(
+                    "{file} starts {count} process(es) without `Shell::command`, so they would not inherit the shell's environment.\n     \
+                     Use `shell.command(..)`, or add an entry to ALLOWED saying why this one is bish's own and not the script's."
+                )),
+                Some((_, allowed, why)) if allowed != count => problems.push(format!(
+                    "{file} has {count} `Command::new` where ALLOWED says {allowed}.\n     \
+                     The existing ones are there because: {why}\n     \
+                     If the new one is a shell spawn it needs `shell.command(..)`; if it is not, update the count and extend the reason."
+                )),
+                Some(_) => {}
+            }
+        }
+        for (file, ..) in ALLOWED {
+            if !found.iter().any(|(f, _)| f == file) {
+                problems.push(format!("{file} is in ALLOWED but no longer starts anything -- remove its entry."));
+            }
+        }
+        assert!(problems.is_empty(), "\n  - {}", problems.join("\n  - "));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     // Pinned to UTC so the expected strings do not depend on where this

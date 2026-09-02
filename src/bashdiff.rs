@@ -167,6 +167,28 @@ mod tests {
         case("nested-subshell-exports-unwind-in-order", r#"export E=a; (export E=b; (export E=c); echo "$E"); echo "$E""#),
         case("subshell-export-is-visible-to-a-child-of-that-subshell", r#"(export E=inner; env | grep '^E='); echo "[${E-unset}]""#),
         case("exported-var-still-reaches-an-external-command", r#"export E=v; env | grep '^E='"#),
+        // What a child's environment is built from -- see
+        // `Shell::command`. Each of these is a way the shell's own view
+        // and the process environment can disagree.
+        case("exported-local-shadows-the-global-for-a-child", r#"export E=outer; f() { local -x E=inner; env | grep '^E='; }; f; env | grep '^E='"#),
+        case("exported-but-unset-exports-nothing", r#"export E; env | grep -c '^E=' || true"#),
+        case("exported-then-unset-is-gone-from-a-child", r#"export E=v; unset E; env | grep -c '^E=' || true"#),
+        case("export-n-removes-it-from-a-child", r#"export E=v; export -n E; env | grep -c '^E=' || true"#),
+        case("assignment-after-export-is-seen-by-a-child", r#"export E=first; E=second; env | grep '^E='"#),
+        case("a-child-sees-a-var-exported-inside-a-function", r#"f() { export E=fromfn; }; f; env | grep '^E='"#),
+        // `export` is global even inside a function; `declare` and
+        // `local -x` are not. bish stored all three as locals, which
+        // appeared to work only because the value was also written to
+        // the real process environment and read back from there.
+        case("export-in-a-function-is-global", r#"f() { export E=fromfn; }; f; echo "[$E]""#),
+        case("declare-in-a-function-is-not", r#"f() { declare Z=5; }; f; echo "[$Z]""#),
+        case("local-x-in-a-function-is-not", r#"export E=outer; f() { local -x E=inner; echo "in=[$E]"; }; f; echo "out=[$E]""#),
+        // A name can carry attributes without carrying a value.
+        case("declare-p-of-an-exported-but-unset-name", r#"export E; declare -p E"#),
+        case("declare-p-of-an-integer-but-unset-name", r#"declare -i N; declare -p N"#),
+        case("declare-p-of-a-name-with-nothing-at-all", r#"declare -p NOPE 2>/dev/null; echo "rc=$?""#),
+        case("export-name-on-an-already-set-var", r#"E=v; export E; env | grep '^E='"#),
+        case("export-name-on-a-local", r#"f() { local Z=inner; export Z; env | grep '^Z='; }; f"#),
         // The capture path: output far larger than a pipe buffer, and
         // output with no trailing newline, both through `$( )`.
         case("substitution-captures-a-lot", r#"x=$(for i in $(seq 1 4000); do echo "line $i"; done); echo "${#x}""#),

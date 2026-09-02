@@ -111,7 +111,17 @@ pub(crate) fn run_declare(sh: &mut Shell, who: &str, args: &[String], array_lite
     // real bash (confirmed: `f() { declare z=5; }; f; echo "$z"`
     // prints nothing in bash, but bish used to leak z to the global
     // scope here before this fix).
-    let mut global_flag = false;
+    //
+    // `export` is always global, which is the one place `who` matters
+    // here. bash auto-localizes `declare`/`typeset` inside a function
+    // but not `export`: `f() { export E=v; }; f` leaves `E` set and
+    // exported in the *caller*, where `f() { declare E=v; }; f` leaves
+    // nothing. bish stored it as a local either way, and it appeared to
+    // work only because `lookup_var` fell back to reading the real
+    // process environment, which `export_to_environment` had written --
+    // so the value lived nowhere but the environment, and a child built
+    // from the shell's own variables could not see it at all.
+    let mut global_flag = who == "export";
     let mut array_mode: Option<bool> = None; // Some(true)=-A, Some(false)=-a
     let mut readonly_flag = false;
     let mut integer_flag = false;
@@ -279,12 +289,20 @@ pub(crate) fn run_declare(sh: &mut Shell, who: &str, args: &[String], array_lite
                     // empty-fallback branch below wouldn't reach this
                     // case since it only fires for a name with no
                     // value at all yet.
-                    let cur = sh.lookup_var(&name);
-                    if global_flag {
-                        sh.assign_var_global(&name, cur)
-                    } else {
-                        sh.assign_var(&name, cur)
-                    };
+                    // Only when there is a value to re-assign.
+                    // `lookup_var` answers "" for a name that is not
+                    // set at all, and writing that back *created* it:
+                    // `export E` on an unset `E` put an empty `E` in
+                    // every child's environment, where bash marks the
+                    // attribute and exports nothing.
+                    if sh.var_is_set(&name) {
+                        let cur = sh.lookup_var(&name);
+                        if global_flag {
+                            sh.assign_var_global(&name, cur)
+                        } else {
+                            sh.assign_var(&name, cur)
+                        };
+                    }
                 }
                 // No `else`: `declare x` with no value records the
                 // name's attributes and leaves it *unset*, at either
