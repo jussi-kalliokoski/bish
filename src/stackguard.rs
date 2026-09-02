@@ -42,6 +42,19 @@ const ASSUMED_STACK: u64 = 8 * 1024 * 1024;
 const BUDGET_NUMERATOR: u64 = 2;
 const BUDGET_DENOMINATOR: u64 = 3;
 
+// The same idea for the arithmetic parser, which gets to keep going
+// after everything else has given up.
+//
+// Its frames are tiny next to an evaluator frame, so it is almost never
+// what filled the stack -- but it is often what is running when the
+// stack finally runs out, since a function body tends to end up
+// evaluating something. Sharing one threshold meant a runaway *function*
+// was reported as `((d+1)): expression nested too deeply`, naming the
+// innermost construct instead of the one at fault. Letting the parser
+// run further keeps the diagnostic on whoever actually recursed.
+const DEEP_NUMERATOR: u64 = 5;
+const DEEP_DENOMINATOR: u64 = 6;
+
 thread_local! {
     // Address of a local at the outermost point this thread knows
     // about. Zero until `note_base` runs; see `used` for what that
@@ -127,6 +140,13 @@ pub fn nearly_exhausted() -> bool {
     used() >= budget()
 }
 
+/// `nearly_exhausted` for the arithmetic parser, which is allowed
+/// further down than anything else -- see `DEEP_NUMERATOR`.
+pub fn deeply_exhausted() -> bool {
+    let total = budget() / BUDGET_NUMERATOR as usize * BUDGET_DENOMINATOR as usize;
+    used() >= total / DEEP_DENOMINATOR as usize * DEEP_NUMERATOR as usize
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -143,7 +163,18 @@ mod tests {
     fn a_fresh_stack_is_not_nearly_exhausted() {
         note_base();
         assert!(!nearly_exhausted());
+        assert!(!deeply_exhausted());
         assert!(used() < budget());
+    }
+
+    // The order matters, not the numbers: whatever fills the stack, the
+    // ordinary limit has to be reached first, so the construct that was
+    // actually recursing is the one named in the message.
+    #[test]
+    fn the_parsers_limit_comes_after_everyone_elses() {
+        let ordinary = budget();
+        let deep = budget() / BUDGET_NUMERATOR as usize * BUDGET_DENOMINATOR as usize / DEEP_DENOMINATOR as usize * DEEP_NUMERATOR as usize;
+        assert!(deep > ordinary, "the parser must be allowed further down than a function call: {deep} vs {ordinary}");
     }
 
     // The measurement, rather than the policy: recursing must move the

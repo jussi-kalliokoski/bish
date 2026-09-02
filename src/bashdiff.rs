@@ -124,6 +124,22 @@ mod tests {
         case("pipeline-status", r#"false | true; echo $?; set -o pipefail; false | true; echo $?"#),
         case("subshell-scope", r#"x=1; (x=2); echo $x"#),
         case("subshell-exit", r#"(exit 4); echo $?"#),
+        // The real process environment is shared by every in-process
+        // construct here, so what a foreground subshell exports must not
+        // outlive it -- a real fork gets that isolation from the kernel,
+        // and this shell has to put it back by hand. See the env journal
+        // in exec.rs.
+        case("subshell-export-does-not-escape", r#"(export E=inner); echo "[${E-unset}]""#),
+        case("subshell-export-restores-the-old-value", r#"export E=outer; (export E=inner); echo "$E""#),
+        case("subshell-unset-does-not-escape", r#"export E=outer; (unset E); echo "$E""#),
+        case("substitution-export-does-not-escape", r#"x=$(export E=inner; echo hi); echo "$x [${E-unset}]""#),
+        case("nested-subshell-exports-unwind-in-order", r#"export E=a; (export E=b; (export E=c); echo "$E"); echo "$E""#),
+        case("subshell-export-is-visible-to-a-child-of-that-subshell", r#"(export E=inner; env | grep '^E='); echo "[${E-unset}]""#),
+        case("exported-var-still-reaches-an-external-command", r#"export E=v; env | grep '^E='"#),
+        // The capture path: output far larger than a pipe buffer, and
+        // output with no trailing newline, both through `$( )`.
+        case("substitution-captures-a-lot", r#"x=$(for i in $(seq 1 4000); do echo "line $i"; done); echo "${#x}""#),
+        case("substitution-captures-without-a-trailing-newline", r#"x=$(printf 'no-newline'); echo "[$x]""#),
         case("command-subst", r#"echo "$(printf a)$(printf b)""#),
         case("command-subst-backtick", "echo \"`printf a`\""),
         case("process-subst", r#"cat <(printf 'p\n')"#),
@@ -238,6 +254,17 @@ mod tests {
         // command below does not.
         case("arith-expansion-is-fatal", r#"{ echo $((1+)); } 2>/dev/null; echo unreached"#),
         case("arith-command-is-not", r#"((1+)) 2>/dev/null; echo after"#),
+        // A parameter expansion with an operator in it, inside `$(( ))`.
+        // The plain `${x}` form was read by the arithmetic lexer itself
+        // and everything else came out as 0 -- which is how
+        // `f $((${1:-0}+1))` came to pass 1 for ever.
+        case("arith-parameter-default", r#"unset u; echo "$(( ${u:-5} + 1 ))" "$(( ${u-5} + 1 ))""#),
+        case("arith-parameter-length", r#"x=abcde; echo "$(( ${#x} ))""#),
+        case("arith-array-length", r#"a=(1 2 3); echo "$(( ${#a[@]} + 1 ))""#),
+        case("arith-parameter-strip", r#"p=12x; echo "$(( ${p%x} + 1 ))""#),
+        case("arith-positional-with-default", r#"f() { echo "$(( ${1:-0} + 1 ))"; }; f; f 5"#),
+        case("arith-unset-plain-is-zero", r#"unset u; echo "$(( ${u} ))" "$(( u ))""#),
+        case("arith-empty-is-zero", r#"echo "[$(( ))]"; (( )); echo "rc=$?""#),
         case("error-if-unset", r#": ${x:?}; echo unreached"#),
         // A NUL cannot survive into a shell word -- the word ends up as
         // an argument to `execve`, which stops at the first one -- so
@@ -571,6 +598,77 @@ y
         assert!(unlisted.is_empty(), "differing but not listed: {unlisted:?}");
     }
 
+    // Also not differential -- bash has no equivalent. A recursion that
+    // has run no command and changed no argument since the last time it
+    // entered the same function is not "probably" a loop: the whole
+    // reachable state is identical to what it was at that earlier entry,
+    // so the program is at a fixed point. That is reportable at the
+    // second call rather than after a thousand of them, which is the
+    // difference between naming the bug and naming the stack.
+    //
+    // The false-positive half matters more than the true-positive half:
+    // a recursion that does anything at all must be left alone.
+    #[test]
+    fn a_recursion_that_cannot_terminate_is_reported_as_such() {
+        let Some(bish) = bish_binary() else { return };
+        let root = std::env::temp_dir().join(format!("bish-nonproductive-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+
+        let proven: [(&str, &str); 4] = [
+            ("f() { f; }; f", "called itself"),
+            ("a() { b; }; b() { a; }; a", "cycle of 2 calls"),
+            ("a() { b; }; b() { c; }; c() { a; }; a", "cycle of 3 calls"),
+            // Looks like it does something and does not: an empty
+            // branch runs no command, so this really is a fixed point.
+            ("f() { case a in a) ;; esac; f; }; f", "called itself"),
+        ];
+        for (script, expected) in proven {
+            let out = run(bish.as_os_str(), script, &root);
+            assert!(out.contains("cannot terminate"), "{script:?} was not recognised: {out:?}");
+            assert!(out.contains(expected), "{script:?} misdescribed the cycle: {out:?}");
+        }
+
+        // Each of these recurses forever too, but *productively* -- it
+        // runs a command, assigns something, or reads a variable whose
+        // value comes from outside the shell. None is a fixed point, so
+        // none may be reported as one; they hit the stack limit instead,
+        // which says "nesting level exceeded".
+        for script in [
+            "f() { x=1; f; }; f",
+            "f() { true; f; }; f",
+            "f() { f $((${1:-0}+1)); }; f",
+            "f() { f $RANDOM; }; f",
+            "f() { f $SECONDS; }; f",
+            "f() { /bin/true; f; }; f",
+            // Arithmetic that assigns, in each of its spellings. The
+            // `(( ))` command is not a simple command and so does not
+            // pass the dispatch where effects are counted -- this was
+            // reported as a fixed point until an arithmetic assignment
+            // became an effect in its own right.
+            "f() { ((i++)); f; }; f",
+            "f() { : $(( j = j + 1 )); f; }; f",
+            "f() { x[0]=$((n++)); f; }; f",
+            "f() { shift; f; }; f",
+            "f() { unset zz; f; }; f",
+        ] {
+            let out = run(bish.as_os_str(), script, &root);
+            assert!(!out.contains("cannot terminate"), "{script:?} does something every time round and was still called a fixed point: {out:?}");
+            assert!(out.contains("nesting level exceeded"), "{script:?} should have run into the stack limit: {out:?}");
+        }
+
+        // A recursion that terminates is not touched by any of this.
+        let out = run(bish.as_os_str(), r#"f() { if [ "$1" -gt 0 ]; then f $(($1-1)); else echo done; fi; }; f 50"#, &root);
+        assert_eq!(out, "done", "a bounded recursion must simply run");
+
+        // Reported once, and the script stops there -- the same unwind
+        // `FUNCNEST` gets, since there is nothing useful to run after.
+        let out = run(bish.as_os_str(), "f() { f; }; f; echo unreached", &root);
+        assert_eq!(out.matches("cannot terminate").count(), 1, "reported once per runaway, not once per frame: {out:?}");
+        assert!(!out.contains("unreached"), "the script should have stopped: {out:?}");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     // Not a differential case: real bash dies on a signal for three of
     // these four, so there is nothing to compare against. What is being
     // asserted is only that bish does not -- an unbounded recursion is
@@ -590,11 +688,15 @@ y
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join("self.sh"), format!("source {}\n", root.join("self.sh").display())).unwrap();
         let deep = format!("echo $(( {}1{} ))", "(".repeat(4000), ")".repeat(4000));
-        let cases: [(&str, String); 4] = [
+        let cases: [(&str, String); 5] = [
             ("a function calling itself", "f() { f; }; f".to_string()),
             ("a function whose body is two self-calls", "f() { f; f; }; f".to_string()),
             ("eval calling itself", r#"f() { eval "f"; }; f"#.to_string()),
             ("a file sourcing itself", format!("source {}", root.join("self.sh").display())),
+            // A `FUNCNEST` set high enough never to be reached must not
+            // be a way back to the crash: the stack backstop applies
+            // under it, not instead of it.
+            ("a FUNCNEST too large to ever be reached", "FUNCNEST=1000000; f() { x=1; f; }; f".to_string()),
         ];
         for (what, script) in cases.iter().map(|(w, s)| (*w, s.clone())).chain([("arithmetic nested very deeply", deep)]) {
             let out = run(bish.as_os_str(), &script, &root);

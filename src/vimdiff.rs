@@ -384,13 +384,16 @@ mod tests {
     /// Runs every case through both editors and returns the ones whose
     /// files came out different.
     ///
-    /// A case that differs is run again before it is believed. Two live
-    /// editors are being typed at through a pty, and a keystroke lost
-    /// to a slow redraw shows up here as "bish did nothing" -- which
-    /// looks exactly like a real divergence and is not one. A genuine
-    /// difference is deterministic and survives the second run; timing
-    /// noise does not. The retry costs nothing on a clean run, since
-    /// only a differing case pays for it.
+    /// A case that differs is run again, twice, before it is believed.
+    /// Two live editors are being typed at through a pty, and a
+    /// keystroke lost to a slow redraw shows up here as "bish did
+    /// nothing" -- which looks exactly like a real divergence and is
+    /// not one. A genuine difference is deterministic and survives
+    /// every rerun; timing noise does not. Twice rather than once
+    /// because a single retry still let a flake through when this ran
+    /// alongside the rest of the suite, with the machine loaded enough
+    /// to lose a key on two attempts running. The reruns cost nothing
+    /// on a clean run, since only a differing case pays for them.
     fn compare(cases: &[Case], bish: &Path) -> Vec<(&'static str, String, String)> {
         let root = std::env::temp_dir().join(format!("bish-vimdiff-{}", std::process::id()));
         let mut differing = Vec::new();
@@ -415,11 +418,21 @@ mod tests {
             // leaves normal mode.
             let got = run(vec![bish.display().to_string(), "tool".into(), "edit".into(), path.display().to_string()], "\u{1b}:wq\r");
             if want != got {
-                let want_again =
-                    run(vec![VIM.into(), "-u".into(), "NONE".into(), "-i".into(), "NONE".into(), "-N".into(), path.display().to_string()], ":wq\r");
-                let got_again = run(vec![bish.display().to_string(), "tool".into(), "edit".into(), path.display().to_string()], "\u{1b}:wq\r");
-                if want_again != got_again {
-                    differing.push((c.name, want_again, got_again));
+                let mut confirmed = None;
+                for _ in 0..2 {
+                    let want_again = run(
+                        vec![VIM.into(), "-u".into(), "NONE".into(), "-i".into(), "NONE".into(), "-N".into(), path.display().to_string()],
+                        ":wq\r",
+                    );
+                    let got_again = run(vec![bish.display().to_string(), "tool".into(), "edit".into(), path.display().to_string()], "\u{1b}:wq\r");
+                    if want_again == got_again {
+                        confirmed = None;
+                        break;
+                    }
+                    confirmed = Some((want_again, got_again));
+                }
+                if let Some((want, got)) = confirmed {
+                    differing.push((c.name, want, got));
                 }
             }
             let _ = std::fs::remove_dir_all(&dir);

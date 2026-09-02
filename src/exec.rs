@@ -1487,7 +1487,13 @@ pub struct Shell {
     // path file I/O (open_out, a redirect's own `Redirect::In`, `source`,
     // ...), which does still resolve against the real process cwd; see
     // sync_real_state_in's own doc comment for how that's covered.
-    env_snapshot: std::collections::HashMap<String, String>,
+    // `Rc` rather than a plain map: `new_virtual_child` runs on every
+    // foreground `$( )`/`( )`, and a fresh `std::env::vars().collect()`
+    // there was ~18us per substitution on a 74-variable environment for
+    // a copy no in-process child ever reads (only `sync_real_state_in`,
+    // i.e. session switching, does). Shared until something writes,
+    // through `Rc::make_mut`.
+    env_snapshot: Rc<std::collections::HashMap<String, String>>,
     // Every global shell variable. Seeded at startup from the real
     // environment (a variable a shell inherits is an exported one, as
     // in bash) and the home of everything assigned since.
@@ -1505,6 +1511,18 @@ pub struct Shell {
     // is also what a spawned child inherits. BTreeMap so `declare -p`
     // and `compgen -v` enumerate in a stable order.
     globals: std::collections::BTreeMap<String, String>,
+    // A monotonic count of *effects*: every builtin or external command
+    // that ran, every assignment that was performed, every read of a
+    // deliberately-volatile variable ($RANDOM, $SECONDS, $EPOCH*).
+    //
+    // Deliberately not bumped by a shell-function call itself -- a call is
+    // not an effect, its body's commands are, and that distinction is the
+    // whole point: it lets `call_function` recognise a function that has
+    // re-entered itself having done *nothing at all* since the previous
+    // entry, which (with identical positional parameters) is a proof that
+    // the program cannot terminate rather than a guess. See
+    // `check_nonproductive_recursion`.
+    effects: u64,
     pub(crate) umask_snapshot: u32,
 }
 
@@ -1531,6 +1549,11 @@ pub(crate) struct CallFrame {
     pub(crate) called: String,
     pub(crate) call_line: usize,
     pub(crate) source: String,
+    // `Shell::effects` as it stood when this frame was entered, and a hash
+    // of the positional parameters it was entered with -- the two halves of
+    // the non-productive-recursion check in `call_function`.
+    pub(crate) effects_at_entry: u64,
+    pub(crate) args_hash: u64,
 }
 
 impl Shell {
@@ -1582,6 +1605,7 @@ impl Shell {
             // `declare -p` on a fresh shell.
             exported_names: std::env::vars().map(|(k, _)| k).collect(),
             globals: std::env::vars().collect(),
+            effects: 0,
             proc_sub_out_pending: Vec::new(),
             proc_sub_cleanup: Vec::new(),
             rng_state: fresh_rng_seed(),
@@ -1631,7 +1655,7 @@ impl Shell {
             debug_hook: None,
             current_line: 0,
             subshell_depth: 0,
-            env_snapshot: std::env::vars().collect(),
+            env_snapshot: Rc::new(std::env::vars().collect()),
             umask_snapshot: current_umask(),
         };
         // bash starts with IFS set to space/tab/newline, and scripts
@@ -1894,6 +1918,7 @@ impl Shell {
             lower_names: self.lower_names.clone(),
             exported_names: self.exported_names.clone(),
             globals: self.globals.clone(),
+            effects: self.effects,
             proc_sub_out_pending: Vec::new(),
             proc_sub_cleanup: Vec::new(),
             rng_state: fresh_rng_seed(),
@@ -1947,14 +1972,17 @@ impl Shell {
             debug_hook: self.debug_hook.clone(),
             current_line: self.current_line,
             subshell_depth: self.subshell_depth + 1,
-            // Captured fresh from the real process rather than cloning
-            // self.env_snapshot/umask_snapshot directly -- equal to it at
-            // this exact instant regardless (new_virtual_child only ever
-            // runs while `self` is the currently-synced-in session; see
-            // sync_real_state_in/out's own doc comment), but this is the
-            // more obviously-correct way to express "start identical to
-            // whatever the real state actually is right now."
-            env_snapshot: std::env::vars().collect(),
+            // Shared with the parent (Rc), not re-collected from the
+            // real process: it is equal to `self.env_snapshot` at this
+            // exact instant regardless (new_virtual_child only ever runs
+            // while `self` is the currently-synced-in session; see
+            // sync_real_state_in/out's own doc comment), and only
+            // session switching ever reads it -- a foreground `$( )`
+            // child never does, so re-collecting `std::env::vars()`
+            // here was pure cost on the hottest path in the shell.
+            // Writers (`run_cd`, `set_terminal_capability_env`) go
+            // through Rc::make_mut.
+            env_snapshot: Rc::clone(&self.env_snapshot),
             umask_snapshot: current_umask(),
         }
     }
@@ -3451,10 +3479,8 @@ impl Shell {
         std::env::set_current_dir(target).map_err(|e| os_message(&e))?;
         self.cwd = std::env::current_dir().unwrap_or_else(|_| target.to_path_buf());
         let new = self.cwd.to_string_lossy().into_owned();
-        unsafe {
-            std::env::set_var("OLDPWD", &old);
-            std::env::set_var("PWD", &new);
-        }
+        env_set("OLDPWD", &old);
+        env_set("PWD", &new);
         // ...and into the variable table, which is what `$PWD` actually
         // reads now. Both are exported in bash, so they stay in the
         // real environment too, above.
@@ -3472,8 +3498,9 @@ impl Shell {
         // command, and `sync_real_state_out` captures the real
         // environment right afterwards.) Same trap, and the same fix, as
         // `set_terminal_capability_env` below.
-        self.env_snapshot.insert("OLDPWD".to_string(), old);
-        self.env_snapshot.insert("PWD".to_string(), new);
+        let snap = Rc::make_mut(&mut self.env_snapshot);
+        snap.insert("OLDPWD".to_string(), old);
+        snap.insert("PWD".to_string(), new);
         Ok(())
     }
 
@@ -4151,7 +4178,7 @@ impl Shell {
         // and restore exactly, same technique as cwd just above: any var
         // the child added gets removed, anything it changed gets put
         // back, matching real bash's fork isolation for env/variables.
-        let env_before: Vec<(String, String)> = std::env::vars().collect();
+        env_journal_push();
         // Same reasoning, for `umask` (a real process-wide syscall, not
         // Shell-owned state either -- see current_umask's own doc
         // comment).
@@ -4187,16 +4214,7 @@ impl Shell {
         }
         unsafe { umask(umask_before) };
         restore_fd012(saved_fd012);
-        let before_keys: std::collections::HashSet<&str> = env_before.iter().map(|(k, _)| k.as_str()).collect();
-        let after_keys: Vec<String> = std::env::vars().map(|(k, _)| k).collect();
-        for k in after_keys {
-            if !before_keys.contains(k.as_str()) {
-                unsafe { std::env::remove_var(&k) };
-            }
-        }
-        for (k, v) in &env_before {
-            unsafe { std::env::set_var(k, v) };
-        }
+        env_journal_pop_and_restore();
 
         match result {
             // A subshell's own `exit`/`set -e`/`set -u` must not kill the
@@ -4531,11 +4549,16 @@ impl Shell {
             self.last_subst_status = Some(0);
             return self.strip_nuls_from_substitution(text);
         }
-        let path = proc_sub_temp_path();
-        let file = match std::fs::File::create(&path) {
-            Ok(f) => f,
-            Err(_) => return String::new(),
+        // No temp file when the kernel can give an anonymous one -- see
+        // capture_file's own doc comment. `path` stays None in that case
+        // and nothing below has a name to read back or delete.
+        let mem = capture_file();
+        let path = if mem.is_some() { None } else { Some(proc_sub_temp_path()) };
+        let file = match &path {
+            None => mem.as_ref().and_then(|f| f.try_clone().ok()),
+            Some(p) => std::fs::File::create(p).ok(),
         };
+        let Some(file) = file else { return String::new() };
         // `set -e` does not reach inside `$( )` unless
         // `shopt -s inherit_errexit` says so -- that option exists
         // precisely because it does not. A `( )` subshell is different
@@ -4548,8 +4571,15 @@ impl Shell {
         let result = self.run_in_child_shell(raw, ChildStdio { stdout: Some(file), ..Default::default() });
         self.opt_errexit = errexit;
         self.last_subst_status = Some(result.status());
-        let mut s = std::fs::read_to_string(&path).unwrap_or_default();
-        let _ = std::fs::remove_file(&path);
+        let mut s = match (&path, mem) {
+            (None, Some(f)) => read_capture(f),
+            (Some(p), _) => {
+                let text = std::fs::read_to_string(p).unwrap_or_default();
+                let _ = std::fs::remove_file(p);
+                text
+            }
+            _ => String::new(),
+        };
         while s.ends_with('\n') {
             s.pop();
         }
@@ -4609,6 +4639,62 @@ impl Shell {
         }
     }
 
+    /// `FUNCNEST`, if a script has set it to something meaningful.
+    ///
+    /// Deliberately not `lookup_var`: that ends in a `std::env::var`
+    /// fallback, i.e. a linear scan of `environ`, and this runs on every
+    /// single function call. A `FUNCNEST` inherited from the environment
+    /// is already in `globals` (seeded there at startup), so nothing is
+    /// lost by stopping short of the real environment.
+    fn funcnest_limit(&self) -> Option<usize> {
+        let raw = self
+            .var_scopes
+            .iter()
+            .rev()
+            .find_map(|s| s.get("FUNCNEST"))
+            .map(|v| v.as_deref().unwrap_or_default())
+            .or_else(|| self.globals.get("FUNCNEST").map(String::as_str))?;
+        match raw.trim().parse::<usize>() {
+            Ok(0) | Err(_) => None,
+            Ok(n) => Some(n),
+        }
+    }
+
+    /// Is this call to `name` provably a repeat of one already on the
+    /// stack, with nothing at all having happened in between?
+    ///
+    /// Not a heuristic and not a depth guess. `Shell::effects` counts every
+    /// builtin, every external command, every assignment and every read of
+    /// a volatile variable, and is deliberately *not* bumped by a function
+    /// call itself. So if some frame for this same function recorded the
+    /// same `effects` value this call sees, then between that entry and
+    /// this one the interpreter executed nothing observable -- it only
+    /// pushed frames. If the positional parameters also match, the whole
+    /// reachable state is identical to what it was at that earlier entry,
+    /// and the program is at a fixed point: it will do this forever.
+    ///
+    /// O(1) in practice. The scan walks back from the innermost frame and
+    /// stops at the first frame whose `effects_at_entry` differs, which in
+    /// any program that does anything is the very first frame examined.
+    /// It only walks far in exactly the case it is looking for -- a run of
+    /// frames entered with no effect between them, i.e. the cycle itself,
+    /// which is why mutual recursion (`a() { b; }; b() { a; }`) is caught
+    /// too without the caller having to say how deep to look.
+    ///
+    /// Returns the number of frames in the cycle when it fires.
+    fn nonproductive_recursion_depth(&self, name: &str, args_hash: u64) -> Option<usize> {
+        let here = self.effects;
+        for (back, frame) in self.call_stack.iter().rev().enumerate() {
+            if frame.effects_at_entry != here {
+                return None;
+            }
+            if frame.called == name && frame.args_hash == args_hash {
+                return Some(back + 1);
+            }
+        }
+        None
+    }
+
     /// `Some` when this call must not happen: either `FUNCNEST` says
     /// so, or there is not enough stack left to survive it.
     ///
@@ -4623,7 +4709,7 @@ impl Shell {
     /// parenthesised limit. With no `FUNCNEST` set there is no
     /// configured number to report, so it reports the depth actually
     /// reached, which is the limit that applied.
-    fn refuse_deeper_nesting(&mut self, name: &str) -> Option<ExecResult> {
+    fn refuse_deeper_nesting(&mut self, name: &str, args_hash: u64) -> Option<ExecResult> {
         // Already unwinding out of a refusal further down: every call
         // met on the way out is refused too, silently -- the message
         // has been given once, which is what bash's jump to the top
@@ -4633,16 +4719,38 @@ impl Shell {
         }
         // bash reads FUNCNEST as a number and treats anything else --
         // unset, zero, negative, `abc` -- as "no limit".
-        let configured = self.lookup_var("FUNCNEST").trim().parse::<usize>().ok().filter(|n| *n > 0);
-        let too_deep = match configured {
-            Some(limit) => self.function_depth >= limit,
-            None => crate::stackguard::nearly_exhausted(),
+        //
+        // Checked ahead of the non-terminating-recursion proof below,
+        // even though the proof is the better diagnosis and fires
+        // immediately where this waits for a depth: a script that sets
+        // `FUNCNEST` is asking for bash's mechanism by name, and gets
+        // it, message and depth included. Every script that does not --
+        // which is nearly all of them -- gets the proof.
+        let funcnest = self.funcnest_limit();
+        let proven = funcnest.is_none().then(|| self.nonproductive_recursion_depth(name, args_hash)).flatten();
+        let message = match (funcnest, proven) {
+            (Some(limit), _) if self.function_depth >= limit => {
+                format!("bish: line {}: {name}: maximum function nesting level exceeded ({limit})\n", self.current_line)
+            }
+            (_, Some(1)) => format!(
+                "bish: line {}: {name}: called itself with no command run and no argument changed -- this cannot terminate\n",
+                self.current_line
+            ),
+            (_, Some(cycle)) => format!(
+                "bish: line {}: {name}: re-entered through a cycle of {cycle} calls with no command run and no argument changed -- this cannot terminate\n",
+                self.current_line
+            ),
+            // The backstop under both of the above, and the reason a
+            // `FUNCNEST` too large to ever be reached is not a way back
+            // to a core dump. Reports the depth actually reached, since
+            // the limit that applied here is the stack rather than a
+            // configured number.
+            _ if crate::stackguard::nearly_exhausted() => {
+                format!("bish: line {}: {name}: maximum function nesting level exceeded ({})\n", self.current_line, self.function_depth)
+            }
+            _ => return None,
         };
-        if !too_deep {
-            return None;
-        }
-        let reported = configured.unwrap_or(self.function_depth);
-        self.sink_err(&format!("bish: line {}: {name}: maximum function nesting level exceeded ({reported})\n", self.current_line));
+        self.sink_err(&message);
         self.nesting_unwind = true;
         // bash stops the script outright -- nothing after the offending
         // call runs, and the shell exits 1. It does not do that to a
@@ -4656,13 +4764,20 @@ impl Shell {
     }
 
     fn call_function(&mut self, name: &str, body: &parser::Command, call_args: Vec<String>) -> ExecResult {
-        if let Some(refused) = self.refuse_deeper_nesting(name) {
+        let args_hash = args_fingerprint(&call_args);
+        if let Some(refused) = self.refuse_deeper_nesting(name, args_hash) {
             return refused;
         }
         // Recorded before the body runs, so `current_line` is still the
         // line of the call rather than of whatever the body reaches
         // first.
-        self.call_stack.push(CallFrame { called: name.to_string(), call_line: self.current_line, source: self.script_name.clone() });
+        self.call_stack.push(CallFrame {
+            called: name.to_string(),
+            call_line: self.current_line,
+            source: self.script_name.clone(),
+            effects_at_entry: self.effects,
+            args_hash,
+        });
         self.refresh_call_arrays();
         self.arg_frames.push(call_args);
         self.function_depth += 1;
@@ -5320,6 +5435,8 @@ impl Shell {
             // `set -x; x=1` prints `+ x=1`, with the *expanded* value
             // and quotes only where they are needed.
             let mut traced: Vec<String> = Vec::new();
+            // An assignment-only command is an effect too.
+            self.effects += 1;
             for (name, mode, val) in &cmd.assigns {
                 let v = self.expand_word(val);
                 if self.opt_xtrace {
@@ -5518,6 +5635,9 @@ impl Shell {
         // is the one place that knows the command is about to run and
         // that it is not a function call (bash lets an assignment
         // outlive a function, which is its own rule and not this one).
+        // Every builtin and every external command is an effect. A shell
+        // *function* call is not -- it returned above, before this point.
+        self.effects += 1;
         let restore = self.apply_prefix_assigns(cmd);
         let result = self.dispatch_builtin_or_external(&argv, name, cmd, background, false, &array_literal_args);
         self.restore_prefix_assigns(restore);
@@ -5941,9 +6061,7 @@ impl Shell {
                 if argv.get(1).map(String::as_str) == Some("-n") {
                     for name in &argv[2..] {
                         self.exported_names.remove(name);
-                        unsafe {
-                            std::env::remove_var(name);
-                        }
+                        env_unset(name);
                     }
                     return ExecResult::Status(0);
                 }
@@ -7959,8 +8077,25 @@ impl Shell {
     // `${x}` are already arith.rs's own job, and a bare `x` has to stay
     // a *name* so `x=y; y=2; echo $((x))` still resolves through to 2.
     pub(crate) fn eval_arith(&mut self, raw: &str) -> Result<i64, String> {
-        if raw.contains("$(") || raw.contains('`') {
+        // `${...}` joins `$( )` and backticks here. arith.rs reads a
+        // bare `x` and a plain `${x}` itself, but every parameter
+        // expansion with an operator in it -- `${x:-5}`, `${#x}`,
+        // `${#a[@]}` -- was reaching its lexer unexpanded and coming
+        // out as 0. That is how `f() { f $((${1:-0}+1)); }` came to
+        // recurse forever passing 1 each time: not a runaway function,
+        // an argument that could not change.
+        // Nothing to evaluate is zero, both as written (`$(( ))`) and
+        // after expanding to nothing (`$(( ${unset} ))`). bash answers
+        // 0 to both; bish used to answer 0 to neither, reporting
+        // "unexpected token in arithmetic expression: Eof".
+        if raw.trim().is_empty() {
+            return Ok(0);
+        }
+        if raw.contains("$(") || raw.contains('`') || raw.contains("${") {
             let expanded = self.expand_raw(raw);
+            if expanded.trim().is_empty() {
+                return Ok(0);
+            }
             return arith::eval(&expanded, self);
         }
         arith::eval(raw, self)
@@ -8403,9 +8538,7 @@ impl Shell {
         if name.contains('\0') || value.contains('\0') {
             return;
         }
-        unsafe {
-            std::env::set_var(name, value);
-        }
+        env_set(name, value);
     }
 
     // Removes a name from wherever it lives: the innermost local scope
@@ -8418,9 +8551,7 @@ impl Shell {
             }
         }
         self.globals.remove(name);
-        unsafe {
-            std::env::remove_var(name);
-        }
+        env_unset(name);
     }
 
     // Follows a `declare -n`/`local -n` chain to the final target name,
@@ -8467,17 +8598,32 @@ impl Shell {
             // assign_var's special-case for `SECONDS=n`).
             "$" => std::process::id().to_string(),
             "!" => self.jobs.borrow().last_bg_pid.map(|p| p.to_string()).unwrap_or_default(),
-            "RANDOM" => self.next_random().to_string(),
+            // These four read something outside the shell's own state
+            // (the RNG, the clock), so an otherwise-effectless function
+            // body that reads one is not repeating itself. Counted as
+            // effects so `check_nonproductive_recursion` cannot mistake
+            // `f() { f $SECONDS; }` for a fixed point.
+            "RANDOM" => {
+                self.effects += 1;
+                self.next_random().to_string()
+            }
             "LINENO" => self.current_line.to_string(),
             // Seconds since the epoch, and the same with microseconds.
             // bash 5's own two spellings; a script that wants a
             // timestamp should not have to spawn `date` for it.
-            "EPOCHSECONDS" => unix_now().as_secs().to_string(),
+            "EPOCHSECONDS" => {
+                self.effects += 1;
+                unix_now().as_secs().to_string()
+            }
             "EPOCHREALTIME" => {
+                self.effects += 1;
                 let now = unix_now();
                 format!("{}.{:06}", now.as_secs(), now.subsec_micros())
             }
-            "SECONDS" => (self.shell_start.elapsed().as_secs() as i64 + self.seconds_offset).to_string(),
+            "SECONDS" => {
+                self.effects += 1;
+                (self.shell_start.elapsed().as_secs() as i64 + self.seconds_offset).to_string()
+            }
             "-" => {
                 let mut s = String::new();
                 if self.opt_errexit {
@@ -8598,12 +8744,16 @@ impl Shell {
     pub fn sync_real_state_in(&self) {
         let _ = std::env::set_current_dir(&self.cwd);
         let current: std::collections::HashSet<String> = std::env::vars().map(|(k, _)| k).collect();
+        // Deliberately the raw calls, not env_set/env_unset: this is
+        // session switching, which by construction never runs inside a
+        // subshell's env journal (see env_journal_push's own comment), and
+        // it reapplies the whole snapshot on a hot path.
         for k in &current {
             if !self.env_snapshot.contains_key(k) {
                 unsafe { std::env::remove_var(k) };
             }
         }
-        for (k, v) in &self.env_snapshot {
+        for (k, v) in self.env_snapshot.iter() {
             unsafe { std::env::set_var(k, v) };
         }
         unsafe { umask(self.umask_snapshot) };
@@ -8618,7 +8768,7 @@ impl Shell {
     // here: self.cwd is already kept live-accurate by run_cd itself,
     // independently of any of this.
     pub fn sync_real_state_out(&mut self) {
-        self.env_snapshot = std::env::vars().collect();
+        self.env_snapshot = Rc::new(std::env::vars().collect());
         self.umask_snapshot = current_umask();
     }
 
@@ -8641,13 +8791,14 @@ impl Shell {
     // truecolor terminal to a plain one needs the stale truecolor
     // capability to actually go away, not linger.
     pub fn set_terminal_capability_env(&mut self, term: &str, colorterm: &str) {
+        let snap = Rc::make_mut(&mut self.env_snapshot);
         if !term.is_empty() {
-            self.env_snapshot.insert("TERM".to_string(), term.to_string());
+            snap.insert("TERM".to_string(), term.to_string());
         }
         if colorterm.is_empty() {
-            self.env_snapshot.remove("COLORTERM");
+            snap.remove("COLORTERM");
         } else {
-            self.env_snapshot.insert("COLORTERM".to_string(), colorterm.to_string());
+            snap.insert("COLORTERM".to_string(), colorterm.to_string());
         }
     }
 
@@ -9485,6 +9636,13 @@ impl arith::VarContext for Shell {
     }
 
     fn set(&mut self, name: &str, value: i64) {
+        // An arithmetic assignment is an effect wherever it appears --
+        // `(( i++ ))`, `let`, `$(( x = 1 ))`. Counted here rather than
+        // at the `(( ))` command, because only some of those are
+        // commands: `f() { ((i++)); f; }` makes progress every time
+        // round and was being reported as a fixed point, which is the
+        // one thing the recursion proof must never do.
+        self.effects += 1;
         match split_subscript(name) {
             Some((base, index)) => {
                 let base = base.to_string();
@@ -11209,6 +11367,86 @@ fn next_free_fd() -> i32 {
     (10..256).find(|fd| !UnbufferedFd::is_open(*fd)).unwrap_or(10)
 }
 
+// The real process environment is shared by every in-process construct
+// (`$( )`, `( )`, `<( )`, a redirected compound command), so a foreground
+// subshell that exports a variable must not leave it behind for the
+// enclosing shell -- a real fork got that isolation from the kernel.
+//
+// It used to be bought with a full `std::env::vars()` snapshot before and
+// a full replay after *every* in-process child, which cost O(env) to take
+// and O(env^2) to restore (glibc `setenv` scans `environ` linearly, called
+// once per variable). On a 375-variable environment that was ~1ms per
+// `$( )` -- worse than the fork it exists to avoid.
+//
+// An undo journal instead: while a child is running, the handful of places
+// that write to the real environment record the pre-image of the name they
+// are about to touch, and the restore replays that list backwards. The
+// overwhelmingly common case -- a child that exports nothing -- costs one
+// `Vec::new()` and one `is_empty()`.
+//
+// Journals nest: only the innermost frame records, which is enough,
+// because an inner frame is always fully unwound before its parent's own
+// unwind reads anything.
+// One name and what it held before the innermost child touched it --
+// `None` for a name that did not exist, which the restore removes again
+// rather than setting to empty.
+type EnvUndo = (String, Option<String>);
+
+thread_local! {
+    static ENV_JOURNAL: RefCell<Vec<Vec<EnvUndo>>> = const { RefCell::new(Vec::new()) };
+}
+
+fn env_journal_record(name: &str) {
+    ENV_JOURNAL.with(|j| {
+        let mut j = j.borrow_mut();
+        if let Some(frame) = j.last_mut() {
+            frame.push((name.to_string(), std::env::var(name).ok()));
+        }
+    });
+}
+
+fn env_journal_push() {
+    ENV_JOURNAL.with(|j| j.borrow_mut().push(Vec::new()));
+}
+
+fn env_journal_pop_and_restore() {
+    let frame = ENV_JOURNAL.with(|j| j.borrow_mut().pop()).unwrap_or_default();
+    for (name, before) in frame.into_iter().rev() {
+        match before {
+            Some(v) => unsafe { std::env::set_var(&name, v) },
+            None => unsafe { std::env::remove_var(&name) },
+        }
+    }
+}
+
+// Every write to the real process environment from the shell goes through
+// these two, so the journal above sees it.
+pub(crate) fn env_set(name: &str, value: &str) {
+    env_journal_record(name);
+    unsafe { std::env::set_var(name, value) };
+}
+
+pub(crate) fn env_unset(name: &str) {
+    env_journal_record(name);
+    unsafe { std::env::remove_var(name) };
+}
+
+// A cheap order-sensitive fingerprint of a call's positional parameters.
+// FNV-1a: no allocation, and the frames only ever compare it against
+// another fingerprint taken the same way.
+fn args_fingerprint(args: &[String]) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for a in args {
+        for b in a.as_bytes() {
+            h ^= *b as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+        h ^= 0xff;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
 fn save_fd012() -> [i32; 3] {
     unsafe extern "C" {
         fn dup(oldfd: i32) -> i32;
@@ -11766,6 +12004,49 @@ fn apply_fd_redirects(command: &mut Command, dup_stderr_to_stdout: bool, extra_f
 // Here-strings need a real Stdio for the child process; simplest portable
 // way to hand it literal content is a temp file, unlinked immediately after
 // opening (the open fd keeps the data alive on unix even once unlinked).
+
+// A capture buffer for `$( )` that never touches a filesystem.
+//
+// The child of a command substitution runs *in this process*, but it may
+// still spawn a real external command, which needs a real file descriptor
+// to write into -- so an in-memory `OutputSink` alone is not enough, and a
+// pipe would deadlock the moment the output outgrew the pipe buffer with
+// nobody on the read end. `memfd_create(2)` gives both: a real fd, backed
+// by anonymous memory, with no name, no directory entry, and no unlink.
+//
+// That replaces, per substitution, an open(O_CREAT) in $TMPDIR, the
+// directory-entry write it implies, and an unlink -- measured at ~23us of
+// a ~63us `x=$(printf hi)` on tmpfs, and considerably worse when $TMPDIR
+// is a real disk. Falls back to the old temp file where the syscall is
+// unavailable (pre-3.17 kernels, non-Linux).
+fn capture_file() -> Option<std::fs::File> {
+    unsafe extern "C" {
+        fn memfd_create(name: *const u8, flags: u32) -> i32;
+    }
+    // MFD_CLOEXEC: this fd is dup2'd onto the child's stdout explicitly
+    // where it is wanted, and must not leak into anything else spawned.
+    const MFD_CLOEXEC: u32 = 1;
+    let fd = unsafe { memfd_create(c"bish-capture".as_ptr() as *const u8, MFD_CLOEXEC) };
+    if fd < 0 {
+        return None;
+    }
+    use std::os::fd::FromRawFd;
+    Some(unsafe { std::fs::File::from_raw_fd(fd) })
+}
+
+// Reads back everything written to a `capture_file`, from the start.
+fn read_capture(mut f: std::fs::File) -> String {
+    use std::io::{Read, Seek, SeekFrom};
+    if f.seek(SeekFrom::Start(0)).is_err() {
+        return String::new();
+    }
+    let mut buf = Vec::new();
+    if f.read_to_end(&mut buf).is_err() {
+        return String::new();
+    }
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
 fn proc_sub_temp_path() -> std::path::PathBuf {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);

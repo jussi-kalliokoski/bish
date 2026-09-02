@@ -228,7 +228,7 @@ impl<'a> Parser<'a> {
         // 2000 deep is a thing bash evaluates without complaint and
         // this used to abort on -- parsing and evaluating happen in the
         // same descent, so one check covers both.
-        if crate::stackguard::nearly_exhausted() {
+        if crate::stackguard::deeply_exhausted() {
             return Err("expression nested too deeply".to_string());
         }
         let mut v = self.parse_assign()?;
