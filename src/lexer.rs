@@ -756,6 +756,43 @@ impl<'a> Lexer<'a> {
         s.parse().unwrap_or(0)
     }
 
+    // Called with the next char being the `[` that follows an
+    // identifier: is this `NAME[...]=` (or `+=`), an assignment whose
+    // subscript may hold spaces -- rather than a glob character class or
+    // the `[` builtin? Looks ahead over a clone, so nothing is consumed
+    // when the answer is no.
+    fn subscript_is_an_assignment(&self) -> bool {
+        let mut it = self.chars.clone();
+        if it.next() != Some('[') {
+            return false;
+        }
+        let mut depth = 1;
+        for c in it.by_ref() {
+            match c {
+                '[' => depth += 1,
+                ']' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                // A newline or a metacharacter means this was never a
+                // subscript -- stop rather than scanning the rest of
+                // the script for a `]` that closes something else.
+                '\n' | ';' | '|' | '&' => return false,
+                _ => {}
+            }
+        }
+        if depth != 0 {
+            return false;
+        }
+        match it.next() {
+            Some('=') => true,
+            Some('+') => it.next() == Some('='),
+            _ => false,
+        }
+    }
+
     fn peek2(&self) -> Option<char> {
         let mut it = self.chars.clone();
         it.next();
@@ -1088,9 +1125,38 @@ impl<'a> Lexer<'a> {
             }
         }
 
+        // `m[x y]=1`: an associative array's key may contain spaces, and
+        // the assignment is still one word. Set while inside those
+        // brackets so the whitespace break below does not split it --
+        // see subscript_is_an_assignment for why this cannot simply be
+        // "any `[`" (`echo m[x y]` is two words, and `[ x = y ]` is the
+        // test builtin).
+        // Depth rather than a flag, so `a[b[0]]=1` closes correctly.
+        let mut in_assign_subscript = 0u32;
+
         loop {
             match self.chars.peek().copied() {
                 None => break,
+                Some('[') if in_assign_subscript == 0 && is_ident(&buf) && self.subscript_is_an_assignment() => {
+                    in_assign_subscript = 1;
+                    buf.push(self.advance().unwrap());
+                }
+                Some('[') if in_assign_subscript > 0 => {
+                    in_assign_subscript += 1;
+                    buf.push(self.advance().unwrap());
+                }
+                Some(']') if in_assign_subscript > 0 => {
+                    in_assign_subscript -= 1;
+                    buf.push(self.advance().unwrap());
+                }
+                // Everything between the brackets goes in as raw text,
+                // expansions included: `m[$k]=1` keeps `$k` unexpanded
+                // here and array_set_index resolves it later, exactly
+                // as `${m[$k]}` already does. Expanding it here instead
+                // would field-split the key.
+                Some(_) if in_assign_subscript > 0 => {
+                    buf.push(self.advance().unwrap());
+                }
                 Some(c) if !literal_ws && (c == ' ' || c == '\t' || c == '\n') => break,
                 // extglob: @(...) !(...) +(...) *(...) ?(...) -- the '('
                 // immediately follows one of these prefix chars (already in
@@ -1492,6 +1558,14 @@ pub struct SpannedResult {
 // for arm-by-arm rationale (redirect/heredoc/brace-expansion edge cases
 // etc.), which isn't re-explained here.
 #[allow(dead_code)]
+// A plain shell identifier -- what may sit in front of a `[subscript]=`
+// in an assignment. Deliberately not `is_valid_ident` from parser.rs:
+// the lexer does not depend on the parser.
+fn is_ident(s: &str) -> bool {
+    let mut chars = s.chars();
+    matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_') && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
 pub fn tokenize_spanned(src: &str) -> SpannedResult {
     let mut lexer = Lexer::new(src);
     let mut items: Vec<SpannedItem> = Vec::new();

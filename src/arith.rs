@@ -77,6 +77,27 @@ fn tokenize(src: &str) -> Result<Vec<Tok>, String> {
             while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') {
                 i += 1;
             }
+            // `a[1]`, `a[i+1]`, `m[key]`: the subscript belongs to the
+            // name, brackets and all -- `$((a[1]))` is an ordinary way
+            // to read an element, and the VarContext is what knows how
+            // to resolve one. Nesting is counted so `a[b[0]]` works.
+            if i < chars.len() && chars[i] == '[' {
+                let mut depth = 0;
+                while i < chars.len() {
+                    match chars[i] {
+                        '[' => depth += 1,
+                        ']' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                i += 1;
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                    i += 1;
+                }
+            }
             toks.push(Tok::Ident(chars[start..i].iter().collect()));
             continue;
         }

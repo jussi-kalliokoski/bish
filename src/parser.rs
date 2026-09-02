@@ -87,7 +87,7 @@ pub struct SimpleCommand {
     // `name[index]=value` -- index is raw text (an arithmetic expression,
     // evaluated at assignment time), kept separate since it targets one
     // array element rather than the whole variable.
-    pub index_assigns: Vec<(String, String, Word)>,
+    pub index_assigns: Vec<(String, String, AssignMode, Word)>,
     pub words: Vec<Word>,
     pub redirects: Vec<Redirect>,
 }
@@ -914,8 +914,8 @@ impl Parser {
                     };
                     let w = Word { chunks, globbable };
                     if in_assign_phase {
-                        if let Some((name, index, val)) = word_as_index_assignment(&w) {
-                            index_assigns.push((name, index, val));
+                        if let Some((name, index, mode, val)) = word_as_index_assignment(&w) {
+                            index_assigns.push((name, index, mode, val));
                             continue;
                         }
                         if let Some((name, mode, items)) = self.try_array_literal_assignment(&w)? {
@@ -1143,7 +1143,7 @@ pub(crate) fn word_as_assignment(w: &Word) -> Option<(String, AssignMode, Word)>
 // its own LiteralStr chunk rather than merging into its neighbors, so the
 // leading run is flattened into one string to search across, and the split
 // point after `=` is mapped back onto real chunk boundaries for the value.
-fn word_as_index_assignment(w: &Word) -> Option<(String, String, Word)> {
+fn word_as_index_assignment(w: &Word) -> Option<(String, String, AssignMode, Word)> {
     let mut flat = String::new();
     let mut bounds: Vec<(usize, usize, bool)> = Vec::new(); // (start_in_flat, chunk_idx, is_literal)
     for (ci, c) in w.chunks.iter().enumerate() {
@@ -1160,11 +1160,35 @@ fn word_as_index_assignment(w: &Word) -> Option<(String, String, Word)> {
     if !is_valid_ident(name) {
         return None;
     }
+    // The *matching* `]`, not the first one: `a[b[0]]=9` is a real
+    // subscript with a subscript in it.
     let after_bracket = &flat[bracket + 1..];
-    let close_rel = after_bracket.find(']')?;
+    let mut depth = 1;
+    let mut close_rel = None;
+    for (i, c) in after_bracket.char_indices() {
+        match c {
+            '[' => depth += 1,
+            ']' => {
+                depth -= 1;
+                if depth == 0 {
+                    close_rel = Some(i);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let close_rel = close_rel?;
     let index = after_bracket[..close_rel].to_string();
     let close = bracket + 1 + close_rel;
-    let value_start = flat[close + 1..].strip_prefix('=')?;
+    // `m[k]+=v` appends to the element, the way `x+=v` appends to a
+    // scalar -- it was not recognised as an assignment at all before,
+    // so the whole word ran as a command.
+    let after_close = &flat[close + 1..];
+    let (mode, value_start) = match after_close.strip_prefix("+=") {
+        Some(rest) => (AssignMode::Append, rest),
+        None => (AssignMode::Set, after_close.strip_prefix('=')?),
+    };
     let value_pos = flat.len() - value_start.len();
 
     let &(start, chunk_idx, is_lit) = bounds.iter().rfind(|&&(start, _, _)| start <= value_pos)?;
@@ -1181,7 +1205,7 @@ fn word_as_index_assignment(w: &Word) -> Option<(String, String, Word)> {
     if rest_chunks.is_empty() {
         rest_chunks.push(Chunk::Str(String::new()));
     }
-    Some((name.to_string(), index, Word { chunks: rest_chunks, globbable: false }))
+    Some((name.to_string(), index, mode, Word { chunks: rest_chunks, globbable: false }))
 }
 
 fn is_empty_word(w: &Word) -> bool {

@@ -4945,7 +4945,7 @@ impl Shell {
             for (name, mode, items) in &cmd.array_assigns {
                 ok &= self.apply_array_literal(name, *mode, items);
             }
-            for (name, index, val) in &cmd.index_assigns {
+            for (name, index, mode, val) in &cmd.index_assigns {
                 // `a[]=1` names no element at all. bash calls that a
                 // bad subscript and stops; accepting it wrote to index
                 // 0, which is not what anyone typing it meant.
@@ -4958,6 +4958,12 @@ impl Shell {
                 // needs to know that one is coming.
                 ok &= !self.name_is_readonly(name);
                 let v = self.expand_word(val);
+                let v = match mode {
+                    AssignMode::Set => v,
+                    // `m[k]+=v` appends to whatever the element holds,
+                    // the same way `x+=v` does for a scalar.
+                    AssignMode::Append => self.array_element(name, index) + &v,
+                };
                 self.array_set_index(name, index, v);
             }
             if !cmd.redirects.is_empty() {
@@ -6891,7 +6897,17 @@ impl Shell {
         if resolved >= 0 { Some(resolved as usize) } else { None }
     }
 
+    // Every array accessor starts here: `declare -n r=m` makes `r` a
+    // name for `m`, and `${r[k]}` has to reach `m`'s element the same
+    // way `$r` reaches its value. Scalars were already redirected (see
+    // lookup_var/assign_var); arrays were not, so a nameref to one
+    // silently read as empty.
+    pub(crate) fn array_target(&self, name: &str) -> String {
+        if self.nameref_names.contains(name) { self.resolve_nameref(name) } else { name.to_string() }
+    }
+
     fn array_element(&mut self, name: &str, index: &str) -> String {
+        let name = &self.array_target(name);
         if index == "@" || index == "*" {
             let sep = self.ifs_join_char();
             return self.array_all(name).join(&sep);
@@ -6913,6 +6929,7 @@ impl Shell {
     // present in the (sparse) array, not just reading back empty because
     // it was never set.
     fn array_element_is_set(&mut self, name: &str, index: &str) -> bool {
+        let name = &self.array_target(name);
         if index == "@" || index == "*" {
             return !self.array_all(name).is_empty();
         }
@@ -6930,6 +6947,7 @@ impl Shell {
     }
 
     fn array_keys(&self, name: &str) -> Vec<String> {
+        let name = &self.array_target(name);
         if let Some(m) = self.assoc_arrays.get(name) {
             return m.keys().cloned().collect();
         }
@@ -6937,6 +6955,7 @@ impl Shell {
     }
 
     fn array_all(&self, name: &str) -> Vec<String> {
+        let name = &self.array_target(name);
         if let Some(m) = self.assoc_arrays.get(name) {
             return m.values().cloned().collect();
         }
@@ -6946,6 +6965,7 @@ impl Shell {
     // "@"/"*" counts only set elements (real bash arrays are sparse --
     // `arr[10]=x` alone gives a length of 1, not 11).
     fn array_length(&mut self, name: &str, index: &str) -> usize {
+        let name = &self.array_target(name);
         if index == "@" || index == "*" {
             if let Some(m) = self.assoc_arrays.get(name) {
                 return m.len();
@@ -6979,6 +6999,7 @@ impl Shell {
     }
 
     fn array_set_index(&mut self, name: &str, index: &str, value: String) -> Option<usize> {
+        let name = &self.array_target(name);
         if self.name_is_readonly(name) {
             sh_eprintln!(self, "bish: {}: readonly variable", name);
             return None;
@@ -7042,13 +7063,19 @@ impl Shell {
         for item in items {
             match item {
                 ArrayLiteralItem::Positional(w) => {
-                    let v = self.expand_word(w);
-                    if is_assoc {
-                        self.assoc_arrays.entry(name.to_string()).or_default().insert(next_index.to_string(), v);
-                    } else {
-                        self.arrays.entry(name.to_string()).or_default().insert(next_index, v);
+                    // One *field* per element, not one word of source
+                    // text: `b=("${a[@]}")` has to copy the array, and
+                    // `c=($unquoted)` has to split. Expanding the item
+                    // to a single string is what made both of those a
+                    // single element holding `1 2 3`.
+                    for v in self.expand_words(std::slice::from_ref(w)) {
+                        if is_assoc {
+                            self.assoc_arrays.entry(name.to_string()).or_default().insert(next_index.to_string(), v);
+                        } else {
+                            self.arrays.entry(name.to_string()).or_default().insert(next_index, v);
+                        }
+                        next_index += 1;
                     }
-                    next_index += 1;
                 }
                 ArrayLiteralItem::Keyed(index, w) => {
                     let v = self.expand_word(w);
@@ -7381,6 +7408,17 @@ impl Shell {
     // `None` when this is not that -- an ordinary variable, or any
     // other operator -- and the caller falls through to the text path.
     fn list_slice(&mut self, name: &str, index: Option<&str>, op: &VarOp) -> Option<Result<Vec<String>, String>> {
+        // `${a[@]@Q}` and friends transform *each element*, and the
+        // result is a list of that many words -- `"${a[@]@Q}"` is how a
+        // script re-quotes an array for `eval`. Applying the transform
+        // to the joined string instead produced one word holding
+        // `'a b'` where bash gives `'a' 'b'`.
+        if let VarOp::Transform(kind @ (TransformKind::Quote | TransformKind::Upper | TransformKind::Lower | TransformKind::Escape)) = op
+            && matches!(index, Some("@") | Some("*"))
+        {
+            let items = self.array_all(name);
+            return Some(Ok(items.iter().map(|v| apply_transform(v, *kind)).collect()));
+        }
         let VarOp::Substring { offset, length } = op else { return None };
         let items = match index {
             // `${a[@]:...}` / `${a[*]:...}` -- the elements in index
@@ -8631,12 +8669,42 @@ impl Shell {
 
 impl arith::VarContext for Shell {
     fn get(&mut self, name: &str) -> i64 {
-        self.lookup_var(name).trim().parse().unwrap_or(0)
+        let text = match split_subscript(name) {
+            Some((base, index)) => self.array_element(base, &index),
+            None => self.lookup_var(name),
+        };
+        // A name whose value is itself an expression is evaluated, not
+        // parsed: bash's `x=y; y=2; echo $((x))` is 2. A plain number
+        // takes the fast path; anything else recurses, capped by the
+        // evaluator's own depth limit.
+        match text.trim().parse::<i64>() {
+            Ok(n) => n,
+            Err(_) if text.trim().is_empty() => 0,
+            Err(_) => arith::eval(text.trim(), self).unwrap_or(0),
+        }
     }
 
     fn set(&mut self, name: &str, value: i64) {
-        self.assign_var(name, value.to_string());
+        match split_subscript(name) {
+            Some((base, index)) => {
+                let base = base.to_string();
+                self.array_set_index(&base, &index, value.to_string());
+            }
+            None => {
+                self.assign_var(name, value.to_string());
+            }
+        }
     }
+}
+
+// `a[1]` -> ("a", "1"). The subscript arrives unevaluated (it may be an
+// expression, or an associative array's key), so it is handed back as
+// text for array_element/array_set_index to resolve the way a `${a[i]}`
+// expansion already does.
+fn split_subscript(name: &str) -> Option<(&str, String)> {
+    let (base, rest) = name.split_once('[')?;
+    let index = rest.strip_suffix(']')?;
+    Some((base, index.to_string()))
 }
 
 struct ResolvedRedirs {

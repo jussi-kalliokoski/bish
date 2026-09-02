@@ -151,8 +151,9 @@ fn serialize_simple(sc: &SimpleCommand) -> String {
     for (name, mode, items) in &sc.array_assigns {
         parts.push(serialize_array_literal_assign(name, *mode, items));
     }
-    for (name, index, val) in &sc.index_assigns {
-        parts.push(format!("{}[{}]={}", name, index, serialize_word(val)));
+    for (name, index, mode, val) in &sc.index_assigns {
+        let op = if *mode == AssignMode::Append { "+=" } else { "=" };
+        parts.push(format!("{}[{}]{}{}", name, index, op, serialize_word(val)));
     }
     // array_word_assigns (a later-word declare-family array literal, e.g.
     // `declare -A m=([a]=1)`) has no placeholder in `sc.words` -- it's

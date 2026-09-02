@@ -127,7 +127,7 @@ fn scan_program(program: &Program, lines: &[&str], file: &Path, symbols: &mut Ha
                         for (name, _, _) in &sc.array_assigns {
                             record_symbol(symbols, name.clone(), SymbolKind::Variable, file, item.line, doc_comment_above(lines, item.line));
                         }
-                        for (name, _, _) in &sc.index_assigns {
+                        for (name, ..) in &sc.index_assigns {
                             record_symbol(symbols, name.clone(), SymbolKind::Variable, file, item.line, doc_comment_above(lines, item.line));
                         }
                         continue;
