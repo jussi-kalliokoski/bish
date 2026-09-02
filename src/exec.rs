@@ -1259,6 +1259,12 @@ pub struct Shell {
     // check_restricted_command_name, and open_out for what it actually
     // enforces.
     opt_restricted: bool,
+    // `set -C` / `set -o noclobber`: a plain `>` refuses to truncate an
+    // existing regular file. Enforced in open_out, the one place every
+    // output redirect opens its file (see its own doc comment), and
+    // defeated per-redirect by `>|`, which carries a `clobber` flag all
+    // the way from the lexer for exactly this.
+    opt_noclobber: bool,
     // `set -o posix`: recognized and toggleable (so a script that
     // merely checks/sets it doesn't break) but not behaviorally
     // enforced -- real POSIX mode is dozens of small, scattered parsing/
@@ -1528,6 +1534,7 @@ impl Shell {
             opt_noglob: false,
             opt_monitor: false,
             opt_restricted: false,
+            opt_noclobber: false,
             opt_posix: false,
             suppress_errexit: 0,
             current_stderr_target: None,
@@ -1836,6 +1843,7 @@ impl Shell {
             // able to shed -- matches real bash, which keeps it in every
             // descendant.
             opt_restricted: self.opt_restricted,
+            opt_noclobber: self.opt_noclobber,
             opt_posix: self.opt_posix,
             suppress_errexit: 0,
             current_stderr_target: None,
@@ -3401,6 +3409,7 @@ impl Shell {
             'x' => self.opt_xtrace = on,
             'f' => self.opt_noglob = on,
             'm' => self.opt_monitor = on,
+            'C' => self.opt_noclobber = on,
             // One-way latch: `set +r` is simply ignored rather than
             // turning it back off (see opt_restricted's own doc
             // comment). Real bash instead makes `set +r` itself a hard
@@ -3414,6 +3423,26 @@ impl Shell {
         }
     }
 
+    // The read side of apply_shell_option, for `set -o`/`set +o`'s own
+    // listing. `None` for a name this shell doesn't gate anything on --
+    // see SET_O_OPTIONS' doc comment for why that list is shorter than
+    // real bash's.
+    pub(crate) fn shell_option_enabled(&self, name: &str) -> Option<bool> {
+        Some(match name {
+            "pipefail" => self.opt_pipefail,
+            "errexit" => self.opt_errexit,
+            "functrace" => self.opt_functrace,
+            "errtrace" => self.opt_errtrace,
+            "nounset" => self.opt_nounset,
+            "xtrace" => self.opt_xtrace,
+            "noglob" => self.opt_noglob,
+            "monitor" => self.opt_monitor,
+            "noclobber" => self.opt_noclobber,
+            "posix" => self.opt_posix,
+            _ => return None,
+        })
+    }
+
     pub(crate) fn apply_shell_option(&mut self, name: &str, on: bool) {
         match name {
             "pipefail" => self.opt_pipefail = on,
@@ -3424,6 +3453,7 @@ impl Shell {
             "xtrace" => self.opt_xtrace = on,
             "noglob" => self.opt_noglob = on,
             "monitor" => self.opt_monitor = on,
+            "noclobber" => self.opt_noclobber = on,
             "posix" => self.opt_posix = on,
             _ => {}
         }
@@ -4703,6 +4733,16 @@ impl Shell {
         }
     }
 
+    // `[[ -v NAME ]]`, including `[[ -v arr[0] ]]`: is this name --
+    // scalar, array, or one element of one -- actually set, as opposed
+    // to reading back empty because it never was.
+    fn name_is_set(&mut self, name: &str) -> bool {
+        match name.split_once('[').and_then(|(base, rest)| rest.strip_suffix(']').map(|index| (base, index))) {
+            Some((base, index)) => self.array_element_is_set(base, index),
+            None => self.var_is_set(name) || !self.array_all(name).is_empty(),
+        }
+    }
+
     fn eval_simple_test(&mut self, words: &[&Word]) -> bool {
         match words {
             [] => false,
@@ -4710,7 +4750,14 @@ impl Shell {
             [op, a] => {
                 let op = self.expand_word(op);
                 let a = self.expand_word(a);
-                builtins::unary(&op, &a)
+                // `-v` asks about a *name*, where every other unary
+                // test asks about the text one expands to -- so it
+                // cannot go through `builtins::unary` with the rest,
+                // which has no shell to ask.
+                match op.as_str() {
+                    "-v" => self.name_is_set(&a),
+                    _ => builtins::unary(&op, &a),
+                }
             }
             [a, op, b] => {
                 let op = self.expand_word(op);
@@ -5322,6 +5369,24 @@ impl Shell {
             // -x's local-variable-mirroring behavior instead of the
             // simpler, env-only handling this had before.
             "export" => {
+                // `export -f NAME` marks a *function* for export.
+                // bash carries it to a child through the environment;
+                // bish's own children already inherit the function
+                // table wholesale (see `new_virtual_child`), so there
+                // is nothing to arrange -- but it has to be quiet and
+                // it has to notice a name that is not a function,
+                // rather than falling through to `declare -f`, which
+                // prints the body.
+                if argv.get(1).map(String::as_str) == Some("-f") {
+                    let mut status = 0;
+                    for name in &argv[2..] {
+                        if !self.functions.contains_key(name) {
+                            sh_eprintln!(self, "bish: export: {name}: not a function");
+                            status = 1;
+                        }
+                    }
+                    return ExecResult::Status(status);
+                }
                 let mut declare_args = vec!["-x".to_string()];
                 declare_args.extend(argv[1..].iter().cloned());
                 // Dropping argv[0] ("export") shifts every recorded
@@ -5612,6 +5677,16 @@ impl Shell {
                     }
                 }
                 if let Some(secs) = timeout_secs {
+                    // `-t 0` is a question, not a read: has the source
+                    // got something to give right now? It consumes
+                    // nothing and assigns nothing, which is what makes
+                    // it useful as a "would this block?" test.
+                    if secs == 0.0 {
+                        // A file, here-doc or here-string is always
+                        // ready -- there is nothing to wait for.
+                        let ready = !is_real_stdin || stdin_ready(0);
+                        return ExecResult::Status(i32::from(!ready));
+                    }
                     if is_real_stdin {
                         let ms = (secs * 1000.0).max(0.0) as i32;
                         if !stdin_ready(ms) {
@@ -5911,11 +5986,29 @@ impl Shell {
             // fork, no return on success) -- exactly what real bash does,
             // and available here as safe std (CommandExt::exec wraps
             // execvp, distinct from the fork() this shell avoids).
-            "exec" if argv.len() > 1 => {
+            "exec" if !matches!(parse_exec_opts(&argv), ExecOpts::RedirectsOnly) => {
+                let opts = match parse_exec_opts(&argv) {
+                    ExecOpts::Run(o) => o,
+                    ExecOpts::BadOption(msg) => {
+                        sh_eprintln!(self, "bish: exec: {}", msg);
+                        sh_eprintln!(self, "exec: usage: exec [-cl] [-a name] [command [argument ...]] [redirection ...]");
+                        return ExecResult::Status(2);
+                    }
+                    // Excluded by the guard.
+                    ExecOpts::RedirectsOnly => unreachable!(),
+                };
                 if self.opt_restricted {
                     sh_eprintln!(self, "bish: exec: restricted");
                     return ExecResult::Status(1);
                 }
+                // argv[0] as the new process will see it: `-a NAME`
+                // wins, `-l` prefixes a dash (what a login shell looks
+                // for), and otherwise it is the command word itself.
+                let argv0 = {
+                    let base = opts.arg0.clone().unwrap_or_else(|| argv[opts.first].clone());
+                    if opts.login { format!("-{}", base) } else { base }
+                };
+                let (prog, rest) = (&argv[opts.first], &argv[opts.first + 1..]);
                 let redirs = match self.resolve_redirects(cmd) {
                     Ok(r) => r,
                     Err(e) => {
@@ -5940,8 +6033,12 @@ impl Shell {
                 // child_shell already uses to stop just this child
                 // without touching the real process.
                 if self.subshell_depth > 0 {
-                    let mut command = Command::new(&argv[1]);
-                    command.args(&argv[2..]);
+                    let mut command = Command::new(prog);
+                    command.arg0(&argv0);
+                    if opts.clear_env {
+                        command.env_clear();
+                    }
+                    command.args(rest);
                     command.current_dir(&self.cwd);
                     command.stdin(redirs.stdin.unwrap_or_else(|| self.spawn_stdin_stdio()));
                     command.stdout(redirs.stdout.unwrap_or_else(|| self.spawn_stdout_stdio()));
@@ -5953,15 +6050,19 @@ impl Shell {
                         // Same "leave $? at whatever it already was"
                         // behavior as the real top-level case just below.
                         Err(e) => {
-                            sh_eprintln!(self, "bish: exec: {}: {}", argv[1], e);
+                            sh_eprintln!(self, "bish: exec: {}: {}", prog, e);
                             self.last_status
                         }
                     };
                     self.run_exit_trap();
                     return ExecResult::Exit(status);
                 }
-                let mut command = Command::new(&argv[1]);
-                command.args(&argv[2..]);
+                let mut command = Command::new(prog);
+                command.arg0(&argv0);
+                if opts.clear_env {
+                    command.env_clear();
+                }
+                command.args(rest);
                 if let Some(s) = redirs.stdin {
                     command.stdin(s);
                 }
@@ -5980,7 +6081,7 @@ impl Shell {
                     return ExecResult::Status(1);
                 }
                 let err = command.exec();
-                sh_eprintln!(self, "bish: exec: {}: {}", argv[1], err);
+                sh_eprintln!(self, "bish: exec: {}: {}", prog, err);
                 // Real bash: a non-interactive shell exits immediately when
                 // exec fails to find/run the command, and (confirmed via a
                 // clean probe against bash 5.0.17) leaves $? at whatever it
@@ -7470,6 +7571,9 @@ impl Shell {
                 if self.opt_xtrace {
                     s.push('x');
                 }
+                if self.opt_noclobber {
+                    s.push('C');
+                }
                 if self.opt_restricted {
                     s.push('r');
                 }
@@ -7809,7 +7913,10 @@ impl Shell {
         // which two separate Option fields (one per shape) couldn't
         // express correctly across a mix of both shapes.
         enum Target {
-            Path(String, bool),
+            // path, append, clobber -- the last is `>|`'s override of
+            // `set -C`, carried alongside so `resolve` can hand all
+            // three to open_out.
+            Path(String, bool, bool),
             Fd(i32),
         }
         let mut stdout_target: Option<Target> = None;
@@ -7819,28 +7926,28 @@ impl Shell {
         let mut touched = false;
         for r in redirects {
             match r {
-                Redirect::Out { word, append } => {
-                    stdout_target = Some(Target::Path(self.expand_word(word), *append));
+                Redirect::Out { word, append, clobber } => {
+                    stdout_target = Some(Target::Path(self.expand_word(word), *append, *clobber));
                     dup_out_to_err = false;
                     touched = true;
                 }
-                Redirect::FdOut { fd, word, append } if *fd == 1 => {
-                    stdout_target = Some(Target::Path(self.expand_word(word), *append));
+                Redirect::FdOut { fd, word, append, clobber } if *fd == 1 => {
+                    stdout_target = Some(Target::Path(self.expand_word(word), *append, *clobber));
                     dup_out_to_err = false;
                     touched = true;
                 }
-                Redirect::Err { word, append } => {
-                    stderr_target = Some(Target::Path(self.expand_word(word), *append));
+                Redirect::Err { word, append, clobber } => {
+                    stderr_target = Some(Target::Path(self.expand_word(word), *append, *clobber));
                     dup_err_to_out = false;
                     touched = true;
                 }
-                Redirect::FdOut { fd, word, append } if *fd == 2 => {
-                    stderr_target = Some(Target::Path(self.expand_word(word), *append));
+                Redirect::FdOut { fd, word, append, clobber } if *fd == 2 => {
+                    stderr_target = Some(Target::Path(self.expand_word(word), *append, *clobber));
                     dup_err_to_out = false;
                     touched = true;
                 }
                 Redirect::Both { word, append } => {
-                    stdout_target = Some(Target::Path(self.expand_word(word), *append));
+                    stdout_target = Some(Target::Path(self.expand_word(word), *append, false));
                     dup_err_to_out = true;
                     dup_out_to_err = false;
                     touched = true;
@@ -7880,7 +7987,9 @@ impl Shell {
         }
         let resolve = |t: &Option<Target>| -> Result<Option<Rc<RefCell<std::fs::File>>>, String> {
             match t {
-                Some(Target::Path(p, append)) => Ok(Some(Rc::new(RefCell::new(self.open_out(p, *append)?)))),
+                Some(Target::Path(p, append, clobber)) => {
+                    Ok(Some(Rc::new(RefCell::new(self.open_out(p, *append, *clobber)?))))
+                }
                 Some(Target::Fd(fd)) => Ok(dup_existing_fd(*fd).map(|f| Rc::new(RefCell::new(f)))),
                 None => Ok(None),
             }
@@ -7946,12 +8055,21 @@ impl Shell {
     // restricted mode's "cannot redirect output" check lives here so it
     // covers all of them at once, rather than duplicated at each
     // Redirect variant's own resolution site.
-    fn open_out(&self, path: &str, append: bool) -> Result<std::fs::File, String> {
+    fn open_out(&self, path: &str, append: bool, clobber: bool) -> Result<std::fs::File, String> {
         if self.opt_restricted {
             return Err(format!("{}: restricted: cannot redirect output", path));
         }
         if let Some(result) = dev_socket_file(path) {
             return result;
+        }
+        // `set -C`. Only a truncating `>` is refused, and only over an
+        // existing *regular* file -- `> /dev/null` and `> fifo` stay
+        // legal in real bash, which is what makes noclobber usable at
+        // all. Deliberately a stat-then-open rather than O_EXCL: bash
+        // does the same, and O_EXCL would also reject the /dev/null
+        // case. The race that leaves is bash's too.
+        if self.opt_noclobber && !append && !clobber && std::fs::metadata(path).is_ok_and(|m| m.is_file()) {
+            return Err(format!("{}: cannot overwrite existing file", path));
         }
         std::fs::OpenOptions::new()
             .create(true)
@@ -8032,8 +8150,9 @@ impl Shell {
         // see open_in_out's own doc comment.
         let mut stdin_path: Option<(String, bool)> = None;
         let mut here_string: Option<String> = None;
-        let mut stdout_target: Option<(String, bool)> = None;
-        let mut stderr_target: Option<(String, bool)> = None;
+        // path, append, clobber (`>|`) -- as in open_out's signature.
+        let mut stdout_target: Option<(String, bool, bool)> = None;
+        let mut stderr_target: Option<(String, bool, bool)> = None;
         for r in redirects {
             match r {
                 Redirect::In(w) => {
@@ -8054,16 +8173,16 @@ impl Shell {
                     here_string = Some(self.expand_word(w));
                     stdin_path = None;
                 }
-                Redirect::Out { word, append } => {
-                    stdout_target = Some((self.expand_word(word), *append));
+                Redirect::Out { word, append, clobber } => {
+                    stdout_target = Some((self.expand_word(word), *append, *clobber));
                 }
-                Redirect::Err { word, append } => {
-                    stderr_target = Some((self.expand_word(word), *append));
+                Redirect::Err { word, append, clobber } => {
+                    stderr_target = Some((self.expand_word(word), *append, *clobber));
                 }
                 Redirect::Both { word, append } => {
                     let p = self.expand_word(word);
-                    stdout_target = Some((p.clone(), *append));
-                    stderr_target = Some((p, *append));
+                    stdout_target = Some((p.clone(), *append, false));
+                    stderr_target = Some((p, *append, false));
                 }
                 _ => {}
             }
@@ -8078,11 +8197,11 @@ impl Shell {
             }
         };
         let stdout = match stdout_target {
-            Some((p, append)) => Some(self.open_out(&p, append)?),
+            Some((p, append, clobber)) => Some(self.open_out(&p, append, clobber)?),
             None => None,
         };
         let stderr = match stderr_target {
-            Some((p, append)) => Some(self.open_out(&p, append)?),
+            Some((p, append, clobber)) => Some(self.open_out(&p, append, clobber)?),
             None => None,
         };
         Ok((stdin, stdout, stderr))
@@ -8127,8 +8246,9 @@ impl Shell {
     // stderr overwrite each other).
     fn resolve_simple_redirects_for_compound(&mut self, redirects: &[Redirect]) -> Result<ChildStdio, String> {
         let mut stdio = ChildStdio::default();
-        let mut stdout_target: Option<(String, bool)> = None;
-        let mut stderr_target: Option<(String, bool)> = None;
+        // path, append, clobber (`>|`) -- as in open_out's signature.
+        let mut stdout_target: Option<(String, bool, bool)> = None;
+        let mut stderr_target: Option<(String, bool, bool)> = None;
         for r in redirects {
             match r {
                 Redirect::In(w) => {
@@ -8144,16 +8264,16 @@ impl Shell {
                     let content = self.expand_word(w);
                     stdio.stdin = Some(here_string_file(&content)?);
                 }
-                Redirect::Out { word, append } | Redirect::FdOut { fd: 1, word, append } => {
-                    stdout_target = Some((self.expand_word(word), *append));
+                Redirect::Out { word, append, clobber } | Redirect::FdOut { fd: 1, word, append, clobber } => {
+                    stdout_target = Some((self.expand_word(word), *append, *clobber));
                     stdio.dup_err_to_out = false;
                 }
-                Redirect::Err { word, append } | Redirect::FdOut { fd: 2, word, append } => {
-                    stderr_target = Some((self.expand_word(word), *append));
+                Redirect::Err { word, append, clobber } | Redirect::FdOut { fd: 2, word, append, clobber } => {
+                    stderr_target = Some((self.expand_word(word), *append, *clobber));
                     stdio.dup_err_to_out = false;
                 }
                 Redirect::Both { word, append } => {
-                    stdout_target = Some((self.expand_word(word), *append));
+                    stdout_target = Some((self.expand_word(word), *append, false));
                     stdio.dup_err_to_out = true;
                 }
                 Redirect::DupErrToOut | Redirect::FdDup { fd: 2, target: 1 } => stdio.dup_err_to_out = true,
@@ -8161,20 +8281,21 @@ impl Shell {
                 _ => unreachable!("compound_redirects_are_simple already filtered these out"),
             }
         }
-        if let Some((p, append)) = &stdout_target {
-            stdio.stdout = Some(self.open_out(p, *append)?);
+        if let Some((p, append, clobber)) = &stdout_target {
+            stdio.stdout = Some(self.open_out(p, *append, *clobber)?);
         }
         if !stdio.dup_err_to_out {
-            if let Some((p, append)) = &stderr_target {
-                stdio.stderr = Some(self.open_out(p, *append)?);
+            if let Some((p, append, clobber)) = &stderr_target {
+                stdio.stderr = Some(self.open_out(p, *append, *clobber)?);
             }
         }
         Ok(stdio)
     }
 
     fn resolve_redirect_list(&mut self, redirects: &[Redirect]) -> Result<ResolvedRedirs, String> {
-        let mut stdout_target: Option<(String, bool)> = None;
-        let mut stderr_target: Option<(String, bool)> = None;
+        // path, append, clobber (`>|`) -- as in open_out's signature.
+        let mut stdout_target: Option<(String, bool, bool)> = None;
+        let mut stderr_target: Option<(String, bool, bool)> = None;
         // `bool`: also opened for writing (Redirect::InOut, bare `<>`) --
         // see open_in_out's own doc comment.
         let mut stdin_path: Option<(String, bool)> = None;
@@ -8204,23 +8325,23 @@ impl Shell {
                     here_string = Some(self.expand_word(w));
                     stdin_path = None;
                 }
-                Redirect::Out { word, append } => {
-                    stdout_target = Some((self.expand_word(word), *append));
+                Redirect::Out { word, append, clobber } => {
+                    stdout_target = Some((self.expand_word(word), *append, *clobber));
                     dup_err_to_out = false;
                 }
-                Redirect::Err { word, append } => {
-                    stderr_target = Some((self.expand_word(word), *append));
+                Redirect::Err { word, append, clobber } => {
+                    stderr_target = Some((self.expand_word(word), *append, *clobber));
                     dup_err_to_out = false;
                 }
                 Redirect::Both { word, append } => {
                     let p = self.expand_word(word);
-                    stdout_target = Some((p, *append));
+                    stdout_target = Some((p, *append, false));
                     dup_err_to_out = true;
                 }
                 Redirect::DupErrToOut => dup_err_to_out = true,
-                Redirect::FdOut { fd, word, append } => {
+                Redirect::FdOut { fd, word, append, clobber } => {
                     let p = self.expand_word(word);
-                    let file = self.open_out(&p, *append)?;
+                    let file = self.open_out(&p, *append, *clobber)?;
                     extra_fds.push(ExtraFd::Open { fd: *fd as i32, file });
                 }
                 Redirect::FdIn { fd, word } => {
@@ -8259,7 +8380,7 @@ impl Shell {
             }
         };
         let stdout_file: Option<std::fs::File> = match &stdout_target {
-            Some((p, append)) => Some(self.open_out(p, *append)?),
+            Some((p, append, clobber)) => Some(self.open_out(p, *append, *clobber)?),
             None => None,
         };
         // `2>&1`'s actual fd-dup happens via dup2_stderr_to_stdout at each
@@ -8270,7 +8391,7 @@ impl Shell {
             None
         } else {
             match &stderr_target {
-                Some((p, append)) => Some(self.open_out(p, *append)?),
+                Some((p, append, clobber)) => Some(self.open_out(p, *append, *clobber)?),
                 None => None,
             }
         };
@@ -9889,6 +10010,19 @@ pub(crate) const SIGNAL_NAMES: &[(&str, i32)] = &[
     ("SYS", 31),
 ];
 
+// The two `trap` must refuse, kept out of SIGNAL_NAMES precisely so
+// that list can *be* trap's answer to "may I catch this?" -- and put
+// back by everything whose job is only to name a signal, which is what
+// `kill -l` and a job's own status line do.
+pub(crate) const UNCATCHABLE_SIGNALS: &[(&str, i32)] = &[("KILL", 9), ("STOP", 19)];
+
+/// Every signal by name and number, in numeric order.
+pub(crate) fn all_signals() -> Vec<(&'static str, i32)> {
+    let mut all: Vec<(&str, i32)> = SIGNAL_NAMES.iter().chain(UNCATCHABLE_SIGNALS.iter()).copied().collect();
+    all.sort_by_key(|(_, n)| *n);
+    all
+}
+
 // Accepts "INT", "SIGINT", or a bare number ("2"); "0"/"EXIT" is handled by
 // the caller separately since it isn't a real signal.
 pub(crate) fn signal_number(name: &str) -> Option<i32> {
@@ -9900,7 +10034,7 @@ pub(crate) fn signal_number(name: &str) -> Option<i32> {
 }
 
 fn signal_name(num: i32) -> String {
-    SIGNAL_NAMES.iter().find(|(_, n)| *n == num).map(|(name, _)| name.to_string()).unwrap_or_else(|| num.to_string())
+    all_signals().iter().find(|(_, n)| *n == num).map(|(name, _)| name.to_string()).unwrap_or_else(|| num.to_string())
 }
 
 pub(crate) fn send_signal(pid: u32, sig: i32) -> bool {
@@ -10293,6 +10427,73 @@ fn here_string_file(content: &str) -> Result<std::fs::File, String> {
 // (IntoRawFd/FromRawFd) is exactly what real bash's own C
 // implementation does under the hood too (a real socket fd, dup2'd like
 // any other).
+// `exec [-cl] [-a name] [command [argument ...]] [redirection ...]`.
+//
+// Three outcomes, because bash's own `exec` has three: run a command
+// (with argv[0] and the environment possibly rewritten), fail on a bad
+// option, or -- when no command word survives the options -- do nothing
+// but apply the redirects to this shell. That last case includes
+// `exec -a foo` with no command, which real bash accepts silently and
+// treats exactly like a bare `exec`.
+struct ExecFlags {
+    // `-a NAME`: argv[0] the new process sees, instead of the path.
+    arg0: Option<String>,
+    // `-c`: start it with an empty environment.
+    clear_env: bool,
+    // `-l`: prefix argv[0] with a dash, the convention a login shell
+    // looks for.
+    login: bool,
+    // Index in argv of the command word.
+    first: usize,
+}
+
+enum ExecOpts {
+    Run(ExecFlags),
+    BadOption(String),
+    RedirectsOnly,
+}
+
+fn parse_exec_opts(argv: &[String]) -> ExecOpts {
+    let mut flags = ExecFlags { arg0: None, clear_env: false, login: false, first: 0 };
+    let mut i = 1;
+    while i < argv.len() {
+        let a = &argv[i];
+        if a == "--" {
+            i += 1;
+            break;
+        }
+        let Some(letters) = a.strip_prefix('-').filter(|r| !r.is_empty()) else { break };
+        let mut chars = letters.chars();
+        while let Some(c) = chars.next() {
+            match c {
+                'c' => flags.clear_env = true,
+                'l' => flags.login = true,
+                // Like getopt's `a:`, the value may be glued on
+                // (`-afoo`) or the next word (`-a foo`).
+                'a' => {
+                    let glued: String = chars.by_ref().collect();
+                    if !glued.is_empty() {
+                        flags.arg0 = Some(glued);
+                    } else {
+                        i += 1;
+                        match argv.get(i) {
+                            Some(name) => flags.arg0 = Some(name.clone()),
+                            None => return ExecOpts::BadOption("-a: option requires an argument".to_string()),
+                        }
+                    }
+                }
+                other => return ExecOpts::BadOption(format!("-{}: invalid option", other)),
+            }
+        }
+        i += 1;
+    }
+    if i >= argv.len() {
+        return ExecOpts::RedirectsOnly;
+    }
+    flags.first = i;
+    ExecOpts::Run(flags)
+}
+
 fn dev_socket_file(path: &str) -> Option<Result<std::fs::File, String>> {
     let (proto, rest) = path
         .strip_prefix("/dev/tcp/")
@@ -10989,7 +11190,8 @@ pub(crate) fn shopt_default_on(name: &str) -> Option<bool> {
 // with apply_shell_option's own match arms above -- only names that
 // actually gate real bish behavior, same "don't advertise a name that
 // does nothing" principle KNOWN_BISHOPTS follows for its own registry.
-const SET_O_OPTIONS: &[&str] = &["pipefail", "errexit", "nounset", "xtrace", "noglob", "monitor", "posix"];
+pub(crate) const SET_O_OPTIONS: &[&str] =
+    &["errexit", "errtrace", "functrace", "monitor", "noclobber", "noglob", "nounset", "pipefail", "posix", "xtrace"];
 
 // A bishopt option's type, plus its own default value -- for Str and
 // Color that's the literal default text (parsed the same way a `--set`

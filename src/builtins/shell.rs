@@ -309,6 +309,20 @@ pub(crate) fn run_enable(sh: &mut Shell, args: &[String]) -> i32 {
 // also rejects e.g. `-euo pipefail` (it consumes `-o` with no argument
 // of its own, then tries to parse "pipefail"'s remaining letters as
 // further short flags and errors on the first invalid one).
+// `set -o` (a padded name/on-off table) and `set +o` (the same as
+// `set -o NAME`/`set +o NAME` commands). Only the options this shell
+// actually gates behaviour on are listed -- see SET_O_OPTIONS.
+fn list_shell_options(sh: &mut Shell, as_commands: bool) {
+    for name in crate::exec::SET_O_OPTIONS {
+        let on = sh.shell_option_enabled(name).unwrap_or(false);
+        if as_commands {
+            sh_println!(sh, "set {}o {}", if on { "-" } else { "+" }, name);
+        } else {
+            sh_println!(sh, "{:<15}\t{}", name, if on { "on" } else { "off" });
+        }
+    }
+}
+
 pub(crate) fn run_set(sh: &mut Shell, args: &[String]) -> i32 {
     let mut idx = 0;
     let mut saw_dashdash = false;
@@ -326,6 +340,9 @@ pub(crate) fn run_set(sh: &mut Shell, args: &[String]) -> i32 {
                     idx += 2;
                     continue;
                 }
+                // Bare `set -o`: the on/off table.
+                list_shell_options(sh, false);
+                return 0;
             }
             for c in rest.chars() {
                 sh.apply_shell_flag(c, true);
@@ -340,6 +357,10 @@ pub(crate) fn run_set(sh: &mut Shell, args: &[String]) -> i32 {
                     idx += 2;
                     continue;
                 }
+                // Bare `set +o`: the same state, but as commands that
+                // reproduce it -- the form `eval "$(set +o)"` restores.
+                list_shell_options(sh, true);
+                return 0;
             }
             for c in rest.chars() {
                 sh.apply_shell_flag(c, false);

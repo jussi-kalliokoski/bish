@@ -24,6 +24,10 @@ struct RLimit {
 
 const RLIM_INFINITY: u64 = u64::MAX;
 
+// Sentinel `resource` for a limit the kernel has no rlimit for -- see
+// the `-p` entry in LIMIT_SPECS.
+const RESOURCE_FIXED: i32 = -1;
+
 struct LimitSpec {
     flag: char,
     resource: i32,
@@ -34,11 +38,12 @@ struct LimitSpec {
 
 // Standard Linux/glibc RLIMIT_* numbers (stable ABI, safe to hardcode --
 // same "libc is already linked, no crate needed" reasoning used elsewhere
-// in this codebase for raw syscall numbers/signatures). No RLIMIT_PIPE
-// exists on Linux (pipe capacity is a per-pipe fcntl setting, not an
-// rlimit) so `-p`, which real bash reports as a fixed constant, is left
-// out of `-a` rather than fabricating a value.
+// in this codebase for raw syscall numbers/signatures).
+//
+// Order matches real bash's own `-a` listing: -R first, then the rest
+// alphabetically by flag.
 const LIMIT_SPECS: &[LimitSpec] = &[
+    LimitSpec { flag: 'R', resource: 15, label: "real-time non-blocking time", unit: "microseconds", div: 1 },
     LimitSpec { flag: 'c', resource: 4, label: "core file size", unit: "blocks", div: 512 },
     LimitSpec { flag: 'd', resource: 2, label: "data seg size", unit: "kbytes", div: 1024 },
     LimitSpec { flag: 'e', resource: 13, label: "scheduling priority", unit: "", div: 1 },
@@ -47,6 +52,11 @@ const LIMIT_SPECS: &[LimitSpec] = &[
     LimitSpec { flag: 'l', resource: 8, label: "max locked memory", unit: "kbytes", div: 1024 },
     LimitSpec { flag: 'm', resource: 5, label: "max memory size", unit: "kbytes", div: 1024 },
     LimitSpec { flag: 'n', resource: 7, label: "open files", unit: "", div: 1 },
+    // No RLIMIT_PIPE exists on Linux -- pipe capacity is a per-pipe
+    // fcntl setting, not an rlimit -- so bash reports a fixed 8 (i.e.
+    // POSIX's 4096-byte guarantee, in 512-byte blocks) and refuses to
+    // set it. RESOURCE_FIXED marks that; the value lives in `div`.
+    LimitSpec { flag: 'p', resource: RESOURCE_FIXED, label: "pipe size", unit: "512 bytes", div: 8 },
     LimitSpec { flag: 'q', resource: 12, label: "POSIX message queues", unit: "bytes", div: 1 },
     LimitSpec { flag: 'r', resource: 14, label: "real-time priority", unit: "", div: 1 },
     LimitSpec { flag: 's', resource: 3, label: "stack size", unit: "kbytes", div: 1024 },
@@ -55,6 +65,25 @@ const LIMIT_SPECS: &[LimitSpec] = &[
     LimitSpec { flag: 'v', resource: 9, label: "virtual memory", unit: "kbytes", div: 1024 },
     LimitSpec { flag: 'x', resource: 10, label: "file locks", unit: "", div: 1 },
 ];
+
+// Where bash puts the `)` of the `(unit, -X)` column in `ulimit -a`.
+const PAREN_COLUMN: usize = 40;
+
+// One limit's current value as `-a` and the single-limit query form both
+// want it -- including the `-p` entry, which no getrlimit can answer.
+fn read_limit(spec: &LimitSpec, hard: bool) -> String {
+    if spec.resource == RESOURCE_FIXED {
+        return spec.div.to_string();
+    }
+    unsafe extern "C" {
+        fn getrlimit(resource: i32, rlim: *mut RLimit) -> i32;
+    }
+    let mut rl = RLimit { cur: 0, max: 0 };
+    unsafe {
+        getrlimit(spec.resource, &mut rl);
+    }
+    fmt_limit(if hard { rl.max } else { rl.cur }, spec.div)
+}
 
 fn fmt_limit(v: u64, div: u64) -> String {
     if v == RLIM_INFINITY {
@@ -117,13 +146,13 @@ pub(crate) fn run_ulimit(sh: &mut Shell, args: &[String]) -> i32 {
     }
     if show_all {
         for spec in LIMIT_SPECS {
-            let mut rl = RLimit { cur: 0, max: 0 };
-            unsafe {
-                getrlimit(spec.resource, &mut rl);
-            }
-            let v = if hard { rl.max } else { rl.cur };
             let unit_part = if spec.unit.is_empty() { String::new() } else { format!("{}, ", spec.unit) };
-            sh_println!(sh, "{:<24}({}-{}) {}", spec.label, unit_part, spec.flag, fmt_limit(v, spec.div));
+            let group = format!("({}-{})", unit_part, spec.flag);
+            // bash right-aligns the closing paren at column 40, keeping
+            // at least two spaces after the label -- which is why the
+            // one over-long label (`-R`) simply pushes past it.
+            let pad = (PAREN_COLUMN.saturating_sub(spec.label.len() + group.len())).max(2);
+            sh_println!(sh, "{}{}{} {}", spec.label, " ".repeat(pad), group, read_limit(spec, hard));
         }
         return 0;
     }
@@ -136,16 +165,21 @@ pub(crate) fn run_ulimit(sh: &mut Shell, args: &[String]) -> i32 {
         }
     };
     let mut rl = RLimit { cur: 0, max: 0 };
-    unsafe {
-        getrlimit(spec.resource, &mut rl);
+    if spec.resource != RESOURCE_FIXED {
+        unsafe {
+            getrlimit(spec.resource, &mut rl);
+        }
     }
     match value {
         None => {
-            let v = if hard { rl.max } else { rl.cur };
-            sh_println!(sh, "{}", fmt_limit(v, spec.div));
+            sh_println!(sh, "{}", read_limit(spec, hard));
             0
         }
         Some(v) => {
+            if spec.resource == RESOURCE_FIXED {
+                sh_eprintln!(sh, "bish: ulimit: {}: cannot modify limit: Invalid argument", spec.label);
+                return 1;
+            }
             let new_val: u64 = if v == "unlimited" {
                 RLIM_INFINITY
             } else {

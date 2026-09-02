@@ -4,7 +4,7 @@
 
 use crate::pty;
 use crate::exec::{getpgrp, send_signal, send_signal_to_pgrp, sh_eprintln, sh_println, signal_number,
-    waitpid_untraced, ExecResult, JobWaitOutcome, SIGCONT, SIGNAL_NAMES, Shell};
+    waitpid_untraced, ExecResult, JobWaitOutcome, SIGCONT, Shell};
 
 pub(crate) fn run_jobs(sh: &mut Shell, _args: &[String]) -> i32 {
     let mut table = sh.jobs.borrow_mut();
@@ -260,7 +260,67 @@ pub(crate) fn run_bg(sh: &mut Shell, args: &[String]) -> i32 {
 // Stopped jobs (Job::stopped) are skipped rather than waited on --
 // Job::wait is a plain Child::wait, which (no WUNTRACED) would just
 // block forever on a job that's merely stopped, not exited.
+// `wait -n [id ...]`: block until the *next* of the named jobs (or of
+// every job, with none named) finishes, and report its status. 127 when
+// there is nothing left to wait for -- which is also how a script's
+// `while wait -n; do ...; done` loop knows to stop.
+//
+// A poll loop rather than a blocking `waitpid(-1)`: the children are
+// owned by `std::process::Child`, and reaping one behind its back would
+// leave every later `try_wait`/`wait` on it reporting a status that no
+// longer exists. Job::poll is the same non-blocking primitive `jobs`
+// already uses, so this stays on the one reaping path.
+fn wait_for_next(sh: &mut Shell, ids: &[String]) -> i32 {
+    // Resolved once: a job's index shifts as finished jobs are removed,
+    // but its id doesn't.
+    let watched: Option<Vec<u32>> = if ids.is_empty() {
+        None
+    } else {
+        let mut out = Vec::new();
+        for a in ids {
+            if let Some(idx) = sh.resolve_job_spec(a) {
+                out.push(sh.jobs.borrow().jobs[idx].id);
+                continue;
+            }
+            // `wait -n` has its own wording for an unusable id, distinct
+            // from plain `wait`'s "not a child of this shell" -- it
+            // rejects the *spec* before it ever looks for a process.
+            let found =
+                a.parse::<u32>().ok().and_then(|pid| sh.jobs.borrow().jobs.iter().find(|j| j.pids.contains(&pid)).map(|j| j.id));
+            match found {
+                Some(id) => out.push(id),
+                None => {
+                    sh_eprintln!(sh, "bish: wait: `{}': not a pid or valid job spec", a);
+                    return 127;
+                }
+            }
+        }
+        Some(out)
+    };
+    let eligible = |j: &crate::exec::Job| -> bool { !j.stopped && watched.as_ref().is_none_or(|w| w.contains(&j.id)) };
+    loop {
+        if !sh.jobs.borrow().jobs.iter().any(eligible) {
+            return 127;
+        }
+        let mut table = sh.jobs.borrow_mut();
+        let finished = table
+            .jobs
+            .iter_mut()
+            .position(|j| !j.stopped && watched.as_ref().is_none_or(|w| w.contains(&j.id)) && j.poll().is_some());
+        if let Some(idx) = finished {
+            let mut job = table.jobs.remove(idx);
+            drop(table);
+            return job.wait();
+        }
+        drop(table);
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
 pub(crate) fn run_wait(sh: &mut Shell, args: &[String]) -> i32 {
+    if args.first().is_some_and(|a| a == "-n") {
+        return wait_for_next(sh, &args[1..]);
+    }
     if args.is_empty() {
         loop {
             let idx = sh.jobs.borrow().jobs.iter().position(|j| !j.stopped);
@@ -308,16 +368,47 @@ pub(crate) fn run_wait(sh: &mut Shell, args: &[String]) -> i32 {
 // kill [-SIGNAME|-N] pid|%job ... Negative PIDs (process-group kill)
 // aren't specially handled -- see the `jobs` field comment on why real
 // process-group management is out of scope here.
+// `kill -l ARG`: a number becomes the bare name, a name becomes the
+// number. An exit status is accepted where a number is, so `kill -l
+// $?` after a signalled command names the signal -- 128 is subtracted
+// when it is over that, which is what makes `kill -l 137` say `KILL`.
+fn signal_name_or_number(arg: &str) -> Option<String> {
+    if let Ok(n) = arg.parse::<i32>() {
+        let n = if n > 128 { n - 128 } else { n };
+        return crate::exec::all_signals().iter().find(|(_, num)| *num == n).map(|(name, _)| (*name).to_string());
+    }
+    let bare = arg.strip_prefix("SIG").unwrap_or(arg).to_uppercase();
+    crate::exec::all_signals().iter().find(|(name, _)| *name == bare).map(|(_, num)| num.to_string())
+}
+
 pub(crate) fn run_kill(sh: &mut Shell, args: &[String]) -> i32 {
     let mut sig = 15; // SIGTERM
     let mut targets: Vec<&String> = Vec::new();
     for a in args {
         if let Some(rest) = a.strip_prefix('-') {
             if rest == "l" {
-                for (name, num) in SIGNAL_NAMES {
-                    sh_println!(sh, "{}) SIG{}", num, name);
+                // `kill -l` on its own lists them; with arguments it
+                // translates each one the other way -- a number to its
+                // name, a name to its number -- which is how a script
+                // reads `$?` back after a signal.
+                let rest_args: Vec<&String> = args.iter().skip_while(|a| a.as_str() != "-l").skip(1).collect();
+                if rest_args.is_empty() {
+                    for (name, num) in crate::exec::all_signals() {
+                        sh_println!(sh, "{num}) SIG{name}");
+                    }
+                    return 0;
                 }
-                return 0;
+                let mut status = 0;
+                for arg in rest_args {
+                    match signal_name_or_number(arg) {
+                        Some(text) => sh_println!(sh, "{text}"),
+                        None => {
+                            sh_eprintln!(sh, "bish: kill: {arg}: invalid signal specification");
+                            status = 1;
+                        }
+                    }
+                }
+                return status;
             }
             if let Some(n) = signal_number(rest) {
                 sig = n;

@@ -166,7 +166,9 @@ pub enum Tok {
     SemiAmp,
     DSemiAmp,
     Amp,
-    RedirOut { append: bool },
+    // `clobber` is `>|`: overwrite even under `set -C`. Only ever
+    // true for the plain form -- `>>|` is not a thing.
+    RedirOut { append: bool, clobber: bool },
     RedirIn,
     // `<>`: opens the target for *both* reading and writing, on fd 0 (or
     // the explicit leading digit, RedirFdInOut below). Real bash's own
@@ -176,14 +178,14 @@ pub enum Tok {
     // useless for a request/response protocol that needs one connection
     // used both ways.
     RedirInOut,
-    RedirErr { append: bool },
+    RedirErr { append: bool, clobber: bool },
     RedirBoth { append: bool },
     DupErrToOut,
     // Arbitrary-fd redirects: `N>`/`N>>`/`N<`/`N<>`/`N>&M`/`N<&M`. The fd=2
     // forms (`2>`, `2>>`, `2>&1`) stay on the dedicated tokens above -- this
     // is for every other explicit fd number, plus `2<`/`2<>`/`2>&M` (M !=
     // 1), which the fd=2 fast path above doesn't cover.
-    RedirFdOut { fd: u32, append: bool },
+    RedirFdOut { fd: u32, append: bool, clobber: bool },
     RedirFdIn { fd: u32 },
     RedirFdInOut { fd: u32 },
     RedirFdDup { fd: u32, target: u32 },
@@ -541,7 +543,13 @@ impl<'a> Lexer<'a> {
                     if append {
                         self.advance();
                     }
-                    push_tok!(Tok::RedirOut { append });
+                    // `>|` -- the escape hatch from `set -C`, and the
+                    // only reason a script writes it.
+                    let clobber = !append && self.chars.peek().copied() == Some('|');
+                    if clobber {
+                        self.advance();
+                    }
+                    push_tok!(Tok::RedirOut { append, clobber });
                 }
                 Some('<') => {
                     self.advance();
@@ -593,7 +601,11 @@ impl<'a> Lexer<'a> {
                         if append {
                             self.advance();
                         }
-                        push_tok!(Tok::RedirErr { append });
+                        let clobber = !append && self.chars.peek().copied() == Some('|');
+                        if clobber {
+                            self.advance();
+                        }
+                        push_tok!(Tok::RedirErr { append, clobber });
                     }
                 }
                 // Any other explicit fd number (0,1,3-9,...; also covers
@@ -619,7 +631,11 @@ impl<'a> Lexer<'a> {
                                 if append {
                                     self.advance();
                                 }
-                                push_tok!(Tok::RedirFdOut { fd, append });
+                                let clobber = !append && self.chars.peek().copied() == Some('|');
+                                if clobber {
+                                    self.advance();
+                                }
+                                push_tok!(Tok::RedirFdOut { fd, append, clobber });
                             }
                         }
                         Some('<') => {
@@ -1629,7 +1645,11 @@ pub fn tokenize_spanned(src: &str) -> SpannedResult {
                 if append {
                     lexer.advance();
                 }
-                items.push(SpannedItem::Tok(Tok::RedirOut { append }, start..lexer.pos));
+                let clobber = !append && lexer.chars.peek().copied() == Some('|');
+                if clobber {
+                    lexer.advance();
+                }
+                items.push(SpannedItem::Tok(Tok::RedirOut { append, clobber }, start..lexer.pos));
             }
             Some('<') => {
                 lexer.advance();
@@ -1688,7 +1708,11 @@ pub fn tokenize_spanned(src: &str) -> SpannedResult {
                     if append {
                         lexer.advance();
                     }
-                    items.push(SpannedItem::Tok(Tok::RedirErr { append }, start..lexer.pos));
+                    let clobber = !append && lexer.chars.peek().copied() == Some('|');
+                    if clobber {
+                        lexer.advance();
+                    }
+                    items.push(SpannedItem::Tok(Tok::RedirErr { append, clobber }, start..lexer.pos));
                 }
             }
             Some(c) if c.is_ascii_digit() && lexer.peek_numbered_fd_redirect().is_some() => {
@@ -1707,7 +1731,11 @@ pub fn tokenize_spanned(src: &str) -> SpannedResult {
                             if append {
                                 lexer.advance();
                             }
-                            items.push(SpannedItem::Tok(Tok::RedirFdOut { fd, append }, start..lexer.pos));
+                            let clobber = !append && lexer.chars.peek().copied() == Some('|');
+                            if clobber {
+                                lexer.advance();
+                            }
+                            items.push(SpannedItem::Tok(Tok::RedirFdOut { fd, append, clobber }, start..lexer.pos));
                         }
                     }
                     Some('<') => {

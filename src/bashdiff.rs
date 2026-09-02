@@ -203,6 +203,16 @@ mod tests {
         case("set-e", r#"set -e; (false; echo unreached); echo $?"#),
         case("set-u", r#"set -u; echo "${undefined_zz-ok}""#),
         case("and-or", r#"true && echo t; false || echo f; false && echo no; echo $?"#),
+        // -- the roadmap-9 builtin gaps -------------------------------
+        case("test-v", r#"x=1; a=(q); declare -A m; m[k]=1; [[ -v x ]] && echo x; [[ -v a[0] ]] && echo a; [[ -v m[k] ]] && echo m; [[ -v nope_zz ]] || echo no"#),
+        case("kill-l", r#"kill -l 9; kill -l TERM; kill -l SIGTERM; kill -l 137"#),
+        case("exec-a", r#"exec -a zzname /bin/sh -c 'echo $0'"#),
+        case("noclobber", "set -C; echo a > nc; echo b > nc; echo $?; echo c >| nc; cat nc; set +C"),
+        case("wait-n", r#"(exit 7) & wait -n; echo $?; wait -n; echo $?"#),
+        case("export-f", r#"f() { :; }; export -f f; echo $?; export -f nosuch_zz; echo $?"#),
+        case("read-t0", r#"read -t 0 < /dev/null; echo $?"#),
+        case("set-o", r#"set -C -o pipefail; set -o > oo; grep -E '^(noclobber|pipefail|xtrace) ' oo"#),
+        case("ulimit-p", r#"ulimit -p"#),
     ];
 
     // Cases bish does not match today, each with why. Asserted to
@@ -213,7 +223,10 @@ mod tests {
         ("expansion-error-continues", "bish reports an expansion error and carries on with an empty result; bash abandons the command"),
         ("dbracket-pattern", "quoting the right of `[[ == ]]` should make it a literal, not a glob"),
         ("shopt-failglob", "failglob reports but does not abandon the command -- see expansion-error-continues"),
-        ("builtin-gaps", "roadmap 9: [[ -v ]], wait -n, kill -l SIG, exec -a, set -C"),
+        (
+            "pipeline-stage-options",
+            "a pipeline stage that is a builtin/function/compound re-execs bish rather than forking a virtual child, so it starts with none of the shell's own `set` options",
+        ),
     ];
 
     // The cases the divergence list is about. Kept apart from `CASES`
@@ -223,7 +236,7 @@ mod tests {
         case("expansion-error-continues", r#"a=(1 2 3); printf '[%s]' "${a[@]:1:-1}"; echo"#),
         case("dbracket-pattern", r#"[[ abc == a* ]] && echo glob; [[ abc == "a*" ]] || echo literal"#),
         case("shopt-failglob", r#"shopt -s failglob; printf '%s,' zz_no_match*; echo"#),
-        case("builtin-gaps", r#"x=1; [[ -v x ]] && echo v; kill -l 9"#),
+        case("pipeline-stage-options", r#"set -Ceu; { echo "[$-]"; } | cat"#),
     ];
 
     // `target/<profile>/bish`, worked out from the test binary's own
@@ -241,14 +254,24 @@ mod tests {
         Command::new("bash").arg("-c").arg(":").status().is_ok_and(|s| s.success())
     }
 
-    // Both shells get the same empty HOME and the same scratch
-    // directory, so neither reads a config file and neither sees the
-    // other's leftovers.
+    // Both shells get the same scratch directory as HOME and cwd, so
+    // neither reads a config file and neither sees the other's
+    // leftovers -- and both get the *same, minimal* environment.
+    //
+    // env_clear matters more than it looks: these are subprocesses of
+    // the test binary, and a shell run in-process by some other test in
+    // this suite writes its exported variables straight into the real
+    // process environment (see raw_var_write). Without this, a case's
+    // result depends on which other tests happened to run first --
+    // which showed up as every glob case failing, from a leaked
+    // GLOBIGNORE, in whole-suite runs only.
     fn run(shell: &std::ffi::OsStr, script: &str, dir: &std::path::Path) -> String {
         let out = Command::new(shell)
             .arg("-c")
             .arg(script)
             .current_dir(dir)
+            .env_clear()
+            .env("PATH", std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".to_string()))
             .env("LC_ALL", "C")
             .env("HOME", dir)
             .env("PS1", "$ ")
@@ -283,20 +306,30 @@ mod tests {
     fn compare(cases: &[Case], bish: &std::path::Path) -> Vec<(&'static str, String, String)> {
         let root = std::env::temp_dir().join(format!("bish-bashdiff-{}", std::process::id()));
         let mut differing = Vec::new();
-        for (i, case) in cases.iter().enumerate() {
-            // A directory per case: several of them create files, and
-            // a glob is only predictable in a directory it owns.
-            let dir = root.join(format!("{i}"));
+        for case in cases {
+            // A directory per case, named after the case: several of
+            // them create files, and a glob is only predictable in a
+            // directory it owns. The *name* rather than an index
+            // because the two tests that call this run concurrently in
+            // one process -- indices would collide, and one test would
+            // then delete the directory the other's shell is sitting in
+            // (which shows up as bash's "getcwd: cannot access parent
+            // directories", not as anything resembling its cause).
+            let dir = root.join(case.name);
             std::fs::create_dir_all(&dir).unwrap();
             let want = run(std::ffi::OsStr::new("bash"), case.script, &dir);
             std::fs::remove_dir_all(&dir).ok();
             std::fs::create_dir_all(&dir).unwrap();
             let got = run(bish.as_os_str(), case.script, &dir);
+            std::fs::remove_dir_all(&dir).ok();
             if want != got {
                 differing.push((case.name, want, got));
             }
         }
-        std::fs::remove_dir_all(&root).ok();
+        // Not remove_dir_all: the other test may still be using its own
+        // subdirectories of this same root. Whichever finishes last
+        // finds it empty and removes it.
+        std::fs::remove_dir(&root).ok();
         differing
     }
 

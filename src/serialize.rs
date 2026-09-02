@@ -190,12 +190,22 @@ fn serialize_array_literal_assign(name: &str, mode: AssignMode, items: &[ArrayLi
     format!("{}{}({})", name, op, words.join(" "))
 }
 
+// `>`, `>>` or `>|` -- the third only exists to defeat `set -C`, so it
+// has to survive a round-trip through the formatter intact.
+fn redirect_op(append: bool, clobber: bool) -> &'static str {
+    match (append, clobber) {
+        (true, _) => ">>",
+        (false, true) => ">|",
+        (false, false) => ">",
+    }
+}
+
 pub fn serialize_redirect(r: &Redirect) -> String {
     match r {
         Redirect::In(w) => format!("<{}", serialize_word(w)),
         Redirect::InOut(w) => format!("<>{}", serialize_word(w)),
-        Redirect::Out { word, append } => format!("{}{}", if *append { ">>" } else { ">" }, serialize_word(word)),
-        Redirect::Err { word, append } => format!("2{}{}", if *append { ">>" } else { ">" }, serialize_word(word)),
+        Redirect::Out { word, append, clobber } => format!("{}{}", redirect_op(*append, *clobber), serialize_word(word)),
+        Redirect::Err { word, append, clobber } => format!("2{}{}", redirect_op(*append, *clobber), serialize_word(word)),
         Redirect::Both { word, append } => format!("&{}{}", if *append { ">>" } else { ">" }, serialize_word(word)),
         Redirect::DupErrToOut => "2>&1".to_string(),
         Redirect::HereString(w) => format!("<<<{}", serialize_word(w)),
@@ -203,8 +213,8 @@ pub fn serialize_redirect(r: &Redirect) -> String {
         // body is already fully captured, so a real <<DELIM...DELIM block
         // isn't needed to reproduce the same runtime content.
         Redirect::HereDoc(w) => format!("<<<{}", serialize_word(w)),
-        Redirect::FdOut { fd, word, append } => {
-            format!("{}{}{}", fd, if *append { ">>" } else { ">" }, serialize_word(word))
+        Redirect::FdOut { fd, word, append, clobber } => {
+            format!("{}{}{}", fd, redirect_op(*append, *clobber), serialize_word(word))
         }
         Redirect::FdIn { fd, word } => format!("{}<{}", fd, serialize_word(word)),
         Redirect::FdInOut { fd, word } => format!("{}<>{}", fd, serialize_word(word)),

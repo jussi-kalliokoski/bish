@@ -13,8 +13,8 @@ pub enum Redirect {
     // see lexer.rs's own Tok::RedirInOut doc comment for what this is
     // actually for (almost entirely /dev/tcp/HOST/PORT).
     InOut(Word),
-    Out { word: Word, append: bool },
-    Err { word: Word, append: bool },
+    Out { word: Word, append: bool, clobber: bool },
+    Err { word: Word, append: bool, clobber: bool },
     Both { word: Word, append: bool },
     DupErrToOut,
     HereString(Word),
@@ -23,7 +23,7 @@ pub enum Redirect {
     // Only per-command (not the persistent shell-level `exec N>file` form,
     // which would need fds kept open for the rest of the shell's life --
     // a documented, separate gap).
-    FdOut { fd: u32, word: Word, append: bool },
+    FdOut { fd: u32, word: Word, append: bool, clobber: bool },
     FdIn { fd: u32, word: Word },
     // `N<>file`: same as InOut above, just on an explicit fd instead of
     // the implicit 0 -- the far more common real shape in practice
@@ -493,7 +493,7 @@ impl Parser {
                     self.advance();
                     atoms.push(TestAtom::Word(Word { chunks: vec![Chunk::Str("<".to_string())], globbable: false }));
                 }
-                Some(Tok::RedirOut { append: false }) => {
+                Some(Tok::RedirOut { append: false, .. }) => {
                     self.advance();
                     atoms.push(TestAtom::Word(Word { chunks: vec![Chunk::Str(">".to_string())], globbable: false }));
                 }
@@ -764,11 +764,11 @@ impl Parser {
         let mut redirects = Vec::new();
         loop {
             match self.peek() {
-                Some(Tok::RedirOut { append }) => {
-                    let append = *append;
+                Some(Tok::RedirOut { append, clobber }) => {
+                    let (append, clobber) = (*append, *clobber);
                     self.advance();
                     let word = self.expect_word()?;
-                    redirects.push(Redirect::Out { word, append });
+                    redirects.push(Redirect::Out { word, append, clobber });
                 }
                 Some(Tok::RedirIn) => {
                     self.advance();
@@ -780,11 +780,11 @@ impl Parser {
                     let word = self.expect_word()?;
                     redirects.push(Redirect::InOut(word));
                 }
-                Some(Tok::RedirErr { append }) => {
-                    let append = *append;
+                Some(Tok::RedirErr { append, clobber }) => {
+                    let (append, clobber) = (*append, *clobber);
                     self.advance();
                     let word = self.expect_word()?;
-                    redirects.push(Redirect::Err { word, append });
+                    redirects.push(Redirect::Err { word, append, clobber });
                 }
                 Some(Tok::RedirBoth { append }) => {
                     let append = *append;
@@ -796,11 +796,11 @@ impl Parser {
                     self.advance();
                     redirects.push(Redirect::DupErrToOut);
                 }
-                Some(Tok::RedirFdOut { fd, append }) => {
-                    let (fd, append) = (*fd, *append);
+                Some(Tok::RedirFdOut { fd, append, clobber }) => {
+                    let (fd, append, clobber) = (*fd, *append, *clobber);
                     self.advance();
                     let word = self.expect_word()?;
-                    redirects.push(Redirect::FdOut { fd, word, append });
+                    redirects.push(Redirect::FdOut { fd, word, append, clobber });
                 }
                 Some(Tok::RedirFdIn { fd }) => {
                     let fd = *fd;
@@ -928,11 +928,11 @@ impl Parser {
                     in_assign_phase = false;
                     words.push(Word { chunks: vec![Chunk::Str(s)], globbable: true });
                 }
-                Some(Tok::RedirOut { append }) => {
-                    let append = *append;
+                Some(Tok::RedirOut { append, clobber }) => {
+                    let (append, clobber) = (*append, *clobber);
                     self.advance();
                     let word = self.expect_word()?;
-                    redirects.push(Redirect::Out { word, append });
+                    redirects.push(Redirect::Out { word, append, clobber });
                 }
                 Some(Tok::RedirIn) => {
                     self.advance();
@@ -944,11 +944,11 @@ impl Parser {
                     let word = self.expect_word()?;
                     redirects.push(Redirect::InOut(word));
                 }
-                Some(Tok::RedirErr { append }) => {
-                    let append = *append;
+                Some(Tok::RedirErr { append, clobber }) => {
+                    let (append, clobber) = (*append, *clobber);
                     self.advance();
                     let word = self.expect_word()?;
-                    redirects.push(Redirect::Err { word, append });
+                    redirects.push(Redirect::Err { word, append, clobber });
                 }
                 Some(Tok::RedirBoth { append }) => {
                     let append = *append;
@@ -960,11 +960,11 @@ impl Parser {
                     self.advance();
                     redirects.push(Redirect::DupErrToOut);
                 }
-                Some(Tok::RedirFdOut { fd, append }) => {
-                    let (fd, append) = (*fd, *append);
+                Some(Tok::RedirFdOut { fd, append, clobber }) => {
+                    let (fd, append, clobber) = (*fd, *append, *clobber);
                     self.advance();
                     let word = self.expect_word()?;
-                    redirects.push(Redirect::FdOut { fd, word, append });
+                    redirects.push(Redirect::FdOut { fd, word, append, clobber });
                 }
                 Some(Tok::RedirFdIn { fd }) => {
                     let fd = *fd;
