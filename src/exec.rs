@@ -8475,13 +8475,17 @@ impl Shell {
     pub fn sync_real_state_in(&self) {
         let _ = std::env::set_current_dir(&self.cwd);
         let current: std::collections::HashSet<String> = std::env::vars().map(|(k, _)| k).collect();
+        // Deliberately the raw calls, not env_set/env_unset: this is
+        // session switching, which by construction never runs inside a
+        // subshell's env journal (see env_journal_push's own comment), and
+        // it reapplies the whole snapshot on a hot path.
         for k in &current {
             if !self.env_snapshot.contains_key(k) {
-                env_unset(k);
+                unsafe { std::env::remove_var(k) };
             }
         }
         for (k, v) in self.env_snapshot.iter() {
-            env_set(k, v);
+            unsafe { std::env::set_var(k, v) };
         }
         unsafe { umask(self.umask_snapshot) };
     }
