@@ -1456,6 +1456,23 @@ pub struct Shell {
     // ...), which does still resolve against the real process cwd; see
     // sync_real_state_in's own doc comment for how that's covered.
     env_snapshot: std::collections::HashMap<String, String>,
+    // Every global shell variable. Seeded at startup from the real
+    // environment (a variable a shell inherits is an exported one, as
+    // in bash) and the home of everything assigned since.
+    //
+    // It used to be the process environment itself -- raw_var_write's
+    // fallback was `std::env::set_var`. That had three costs. Every
+    // variable was exported, so `x=1` was handed to every command bish
+    // ran, and there was no such thing as an unexported variable. A
+    // value the environment cannot hold took the shell down with it:
+    // `read -d ''` panicked on the NUL. And it is process-global, so
+    // two tests in the same process saw each other's variables.
+    //
+    // The real environment is now *derived*: a name is written there
+    // only while it is in `exported_names` (see raw_var_write), which
+    // is also what a spawned child inherits. BTreeMap so `declare -p`
+    // and `compgen -v` enumerate in a stable order.
+    globals: std::collections::BTreeMap<String, String>,
     pub(crate) umask_snapshot: u32,
 }
 
@@ -1524,7 +1541,11 @@ impl Shell {
             integer_names: std::collections::HashSet::new(),
             upper_names: std::collections::HashSet::new(),
             lower_names: std::collections::HashSet::new(),
-            exported_names: std::collections::HashSet::new(),
+            // A variable inherited from the environment is an exported
+            // variable -- bash's rule, and what makes `env` agree with
+            // `declare -p` on a fresh shell.
+            exported_names: std::env::vars().map(|(k, _)| k).collect(),
+            globals: std::env::vars().collect(),
             proc_sub_out_pending: Vec::new(),
             proc_sub_cleanup: Vec::new(),
             rng_state: fresh_rng_seed(),
@@ -1832,6 +1853,7 @@ impl Shell {
             upper_names: self.upper_names.clone(),
             lower_names: self.lower_names.clone(),
             exported_names: self.exported_names.clone(),
+            globals: self.globals.clone(),
             proc_sub_out_pending: Vec::new(),
             proc_sub_cleanup: Vec::new(),
             rng_state: fresh_rng_seed(),
@@ -3061,7 +3083,7 @@ impl Shell {
     // this only needs the names, not the whole compgen::ActionContext
     // shape.
     fn var_names_with_prefix(&self, prefix: &str) -> Vec<String> {
-        let mut names: std::collections::BTreeSet<String> = std::env::vars().map(|(k, _)| k).collect();
+        let mut names: std::collections::BTreeSet<String> = self.globals.keys().cloned().collect();
         for scope in &self.var_scopes {
             names.extend(scope.keys().cloned());
         }
@@ -3080,7 +3102,7 @@ impl Shell {
     pub(crate) fn action_context(&self) -> compgen::ActionContext {
         let mut arrays: Vec<String> = self.arrays.keys().cloned().collect();
         arrays.extend(self.assoc_arrays.keys().cloned());
-        let mut variables: Vec<String> = std::env::vars().map(|(k, _)| k).collect();
+        let mut variables: Vec<String> = self.globals.keys().cloned().collect();
         for scope in &self.var_scopes {
             variables.extend(scope.keys().cloned());
         }
@@ -3381,6 +3403,14 @@ impl Shell {
             std::env::set_var("OLDPWD", &old);
             std::env::set_var("PWD", &new);
         }
+        // ...and into the variable table, which is what `$PWD` actually
+        // reads now. Both are exported in bash, so they stay in the
+        // real environment too, above.
+        self.globals.insert("OLDPWD".to_string(), old.clone());
+        self.globals.insert("PWD".to_string(), new.clone());
+        self.exported_names.insert("OLDPWD".to_string());
+        self.exported_names.insert("PWD".to_string());
+        {}
         // ...and into this session's own remembered environment, not
         // just the real one. `sync_real_state_in` reapplies that
         // snapshot before every command, so a raw `set_var` made outside
@@ -5080,18 +5110,7 @@ impl Shell {
                 // Restored as *unset*, the same way `unset` does it:
                 // walk the local scopes first, then the real
                 // environment.
-                None => {
-                    let mut removed_local = false;
-                    for scope in self.var_scopes.iter_mut().rev() {
-                        if scope.remove(name.as_str()).is_some() {
-                            removed_local = true;
-                            break;
-                        }
-                    }
-                    if !removed_local {
-                        unsafe { std::env::remove_var(&name) };
-                    }
-                }
+                None => self.remove_var(&name),
             }
         }
     }
@@ -5434,6 +5453,19 @@ impl Shell {
                     }
                     return ExecResult::Status(status);
                 }
+                // `export -n NAME` takes the export attribute away and
+                // leaves the value. It cannot go through run_declare:
+                // `-n` there means *nameref*, so this used to turn the
+                // variable into one and lose its value entirely.
+                if argv.get(1).map(String::as_str) == Some("-n") {
+                    for name in &argv[2..] {
+                        self.exported_names.remove(name);
+                        unsafe {
+                            std::env::remove_var(name);
+                        }
+                    }
+                    return ExecResult::Status(0);
+                }
                 let mut declare_args = vec!["-x".to_string()];
                 declare_args.extend(argv[1..].iter().cloned());
                 // Dropping argv[0] ("export") shifts every recorded
@@ -5669,9 +5701,8 @@ impl Shell {
                                 v
                             };
                             if export_flag {
-                                unsafe {
-                                    std::env::set_var(&n, &v);
-                                }
+                                self.exported_names.insert(n.clone());
+                                self.export_to_environment(&n, &v);
                             }
                             self.var_scopes.last_mut().unwrap().insert(n, v);
                         }
@@ -5734,7 +5765,15 @@ impl Shell {
                             i += 2;
                         }
                         "-d" => {
-                            delim = argv.get(i + 1).and_then(|s| s.bytes().next()).unwrap_or(b'\n');
+                            // `-d ''` is bash's spelling of "delimit on
+                            // NUL", which is what `find -print0` and
+                            // `git ls-files -z` produce -- the empty
+                            // string has no first byte, so it cannot
+                            // simply fall back to a newline.
+                            delim = match argv.get(i + 1) {
+                                Some(d) => d.bytes().next().unwrap_or(0),
+                                None => b'\n',
+                            };
                             i += 2;
                         }
                         "-t" => {
@@ -7593,6 +7632,12 @@ impl Shell {
                 return v.clone();
             }
         }
+        if let Some(v) = self.globals.get(name) {
+            return v.clone();
+        }
+        // The real environment is still consulted last, for a name
+        // something outside this table set behind its back -- the
+        // session bridge's own `XDG_RUNTIME_DIR`, or `TZ` in a test.
         std::env::var(name).unwrap_or_default()
     }
 
@@ -7602,12 +7647,47 @@ impl Shell {
     pub(crate) fn raw_var_write(&mut self, name: &str, value: String) {
         for scope in self.var_scopes.iter_mut().rev() {
             if scope.contains_key(name) {
-                scope.insert(name.to_string(), value);
+                scope.insert(name.to_string(), value.clone());
+                self.export_to_environment(name, &value);
                 return;
             }
         }
+        self.globals.insert(name.to_string(), value.clone());
+        self.export_to_environment(name, &value);
+    }
+
+    // The real environment gets a name only while it is exported --
+    // that, and nothing else, is what a spawned child inherits.
+    //
+    // A value the environment cannot hold is simply not written there.
+    // `std::env::set_var` *panics* on an interior NUL, which is how
+    // `printf 'a\0b' | read -r -d "" v` used to kill the shell; a
+    // shell variable may hold one, a C environment string may not, and
+    // the variable is worth more than the export.
+    fn export_to_environment(&self, name: &str, value: &str) {
+        if !self.exported_names.contains(name) {
+            return;
+        }
+        if name.contains('\0') || value.contains('\0') {
+            return;
+        }
         unsafe {
             std::env::set_var(name, value);
+        }
+    }
+
+    // Removes a name from wherever it lives: the innermost local scope
+    // holding it, the globals, and the real environment. Shared by
+    // `unset` and by the restore half of a `FOO=bar cmd` prefix.
+    pub(crate) fn remove_var(&mut self, name: &str) {
+        for scope in self.var_scopes.iter_mut().rev() {
+            if scope.remove(name).is_some() {
+                return;
+            }
+        }
+        self.globals.remove(name);
+        unsafe {
+            std::env::remove_var(name);
         }
     }
 
@@ -7698,6 +7778,13 @@ impl Shell {
                         return v.clone();
                     }
                 }
+                if let Some(v) = self.globals.get(name) {
+                    return v.clone();
+                }
+                // The real environment last, for a name something
+                // outside the variable table set behind its back --
+                // see raw_var_lookup, which reads the same three
+                // places in the same order.
                 if let Ok(v) = std::env::var(name) {
                     return v;
                 }
@@ -7742,7 +7829,7 @@ impl Shell {
                 map.iter().map(|(k, v)| format!("[{}]={}", k, crate::serialize::quote_literal(v))).collect::<Vec<_>>().join(" ")
             ));
         }
-        std::env::var(name).ok()
+        self.globals.get(name).cloned().or_else(|| std::env::var(name).ok())
     }
 
     // pub: debugger.rs (a separate module -- see DebugHook's own doc
@@ -7945,7 +8032,7 @@ impl Shell {
                 return true;
             }
         }
-        std::env::var(name).is_ok()
+        self.globals.contains_key(name) || std::env::var(name).is_ok()
     }
 
     // Plain assignment targets the global (process-env) variable, unless it
@@ -8014,15 +8101,9 @@ impl Shell {
         if force_global {
             // Bypass any local shadow entirely -- raw_var_write would
             // just update that shadow instead, same as plain assignment.
-            unsafe {
-                std::env::set_var(name, &value);
-            }
+            self.globals.insert(name.to_string(), value.clone());
+            self.export_to_environment(name, &value);
             return true;
-        }
-        if self.exported_names.contains(name) {
-            unsafe {
-                std::env::set_var(name, &value);
-            }
         }
         self.raw_var_write(name, value);
         true
@@ -12146,7 +12227,6 @@ mod tests {
         // `cd` moves the real process, so this holds the same lock every
         // other cwd-touching test here holds, and puts it back.
         let _guard = CWD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let original = std::env::current_dir().expect("a working directory");
         let dir = std::env::temp_dir().join(format!("bish-globignore-{}", std::process::id()));
         std::fs::create_dir_all(dir.join("sub")).unwrap();
         for n in ["a.c", "a.o", "sub/x.o", "sub/y.c"] {
@@ -12164,7 +12244,7 @@ mod tests {
         // Everything ignored means the pattern matched nothing, and
         // nullglob-off leaves an unmatched pattern as its own text.
         assert_eq!(run("GLOBIGNORE='*'; r=$(echo *)"), "*");
-        std::env::set_current_dir(&original).expect("the working directory comes back");
+        restore_cwd();
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -12244,6 +12324,16 @@ mod tests {
     // own ENV_LOCK.
     static CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    // Where a cwd-moving test puts the process back. Not "wherever it
+    // was when this test started": another test that does not take
+    // CWD_LOCK may have left the process inside a temp directory it
+    // then deleted, and restoring *that* fails. The crate root is
+    // always there while the tests are running.
+    fn restore_cwd() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        std::env::set_current_dir(root).expect("the crate root is a real directory");
+    }
+
     // The bug this pins was found by driving the file browser through a
     // real pty: Ctrl-Y moved the shell correctly, and then `cd -` went
     // somewhere else entirely. `sync_real_state_in` reapplies the
@@ -12253,8 +12343,6 @@ mod tests {
     #[test]
     fn changing_directory_updates_the_session_snapshot_not_just_the_environment() {
         let _guard = CWD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let original = std::env::current_dir().expect("a working directory");
-
         let root = std::env::temp_dir().join(format!("bish-cd-test-{}", std::process::id()));
         let inner = root.join("inner");
         std::fs::create_dir_all(&inner).unwrap();
@@ -12267,16 +12355,28 @@ mod tests {
         shell.change_directory(&inner_real).expect("the inner directory is real too");
 
         assert_eq!(shell.cwd, inner_real);
-        assert_eq!(std::env::var("PWD").as_deref(), Ok(inner_real.to_string_lossy().as_ref()));
-        assert_eq!(std::env::var("OLDPWD").as_deref(), Ok(root_real.to_string_lossy().as_ref()));
+        // Asserted through the shell rather than through
+        // `std::env::var`: the real environment is process-global, and
+        // any other test running a shell concurrently reapplies its own
+        // snapshot over it (CWD_LOCK only serialises the tests that
+        // know to take it). What the bug was actually about is whether
+        // *this session* still knows where it was, which is what
+        // `lookup_var` and `env_snapshot` answer.
+        assert_eq!(shell.lookup_var("PWD"), inner_real.to_string_lossy());
+        assert_eq!(shell.lookup_var("OLDPWD"), root_real.to_string_lossy());
 
         // The part that was broken: after the session restores its own
         // remembered environment, `cd -` still has somewhere to go.
         shell.sync_real_state_in();
-        assert_eq!(std::env::var("OLDPWD").as_deref(), Ok(root_real.to_string_lossy().as_ref()), "OLDPWD must survive the snapshot being reapplied");
-        assert_eq!(std::env::var("PWD").as_deref(), Ok(inner_real.to_string_lossy().as_ref()));
+        assert_eq!(
+            shell.env_snapshot.get("OLDPWD").map(String::as_str),
+            Some(root_real.to_string_lossy().as_ref()),
+            "OLDPWD must survive the snapshot being reapplied"
+        );
+        assert_eq!(shell.env_snapshot.get("PWD").map(String::as_str), Some(inner_real.to_string_lossy().as_ref()));
+        assert_eq!(shell.lookup_var("OLDPWD"), root_real.to_string_lossy());
 
-        std::env::set_current_dir(&original).unwrap();
+        restore_cwd();
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -12286,12 +12386,13 @@ mod tests {
     #[test]
     fn a_restricted_shell_refuses_to_change_directory_at_all() {
         let _guard = CWD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let original = std::env::current_dir().expect("a working directory");
+        restore_cwd();
+        let before = std::env::current_dir().expect("a working directory");
         let mut shell = Shell::new();
         shell.run_source_here("set -r", "<test>");
         let err = shell.change_directory(std::path::Path::new("/")).unwrap_err();
         assert_eq!(err, RESTRICTED);
-        assert_eq!(std::env::current_dir().unwrap(), original, "the real process must not have moved");
+        assert_eq!(std::env::current_dir().unwrap(), before, "the real process must not have moved");
     }
 
     use super::*;
@@ -13365,12 +13466,14 @@ mod tests {
     }
 
     #[test]
-    fn compgen_variable_action_sees_both_an_env_var_and_a_local_scope_var() {
+    fn compgen_variable_action_sees_both_a_global_and_a_local_scope_var() {
         let mut shell = Shell::new();
-        // SAFETY: single-threaded test setup/teardown of an env var this
-        // test owns exclusively, same reasoning as this file's other
-        // env-mutating tests.
-        unsafe { std::env::set_var("BISH_COMPGEN_TEST_VAR", "1") };
+        // Set through the shell rather than with `std::env::set_var`:
+        // since variables moved off the process environment (see the
+        // `globals` field), a name something else puts in the real
+        // environment behind the shell's back is deliberately not one
+        // of its variables -- that cross-talk is what the move removed.
+        shell.run_source_here("export BISH_COMPGEN_TEST_VAR=1", "<test>");
         shell.var_scopes.push(HashMap::from([("local_only_var".to_string(), "x".to_string())]));
         let buf = capture_output(&mut shell);
         crate::builtins::completion::run_compgen(&mut shell, &strs(&["-A", "variable"]));
@@ -13846,6 +13949,10 @@ mod tests {
 
     #[test]
     fn a_function_shadows_a_same_named_builtin() {
+        // Moves the real process cwd (`cd` is a real chdir -- see
+        // change_directory), so it has to take the same lock every
+        // other cwd-moving test does.
+        let _guard = CWD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         // Confirmed against real bash: a user function of the same name
         // as an ordinary builtin (even a POSIX "special" one like
         // export/return/break) wins, with `builtin`/`command` as the
@@ -13858,6 +13965,10 @@ mod tests {
 
     #[test]
     fn builtin_bypasses_a_shadowing_function() {
+        // Moves the real process cwd (`cd` is a real chdir -- see
+        // change_directory), so it has to take the same lock every
+        // other cwd-moving test does.
+        let _guard = CWD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let mut shell = Shell::new();
         let buf = capture_output(&mut shell);
         shell.run_source_here(r#"cd() { echo "fake cd $1"; }; builtin cd /tmp"#, "<test>");
@@ -13883,6 +13994,10 @@ mod tests {
 
     #[test]
     fn restrict_to_builtins_still_blocks_a_shadowing_function() {
+        // Moves the real process cwd (`cd` is a real chdir -- see
+        // change_directory), so it has to take the same lock every
+        // other cwd-moving test does.
+        let _guard = CWD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         // restrict_to_builtins (command mode's colon-line) means "only
         // real builtins run here" -- unlike ordinary dispatch, it must
         // NOT let a same-named function preempt the actual builtin.
@@ -13991,6 +14106,10 @@ mod tests {
 
     #[test]
     fn restricted_mode_blocks_cd() {
+        // Moves the real process cwd (`cd` is a real chdir -- see
+        // change_directory), so it has to take the same lock every
+        // other cwd-moving test does.
+        let _guard = CWD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let mut shell = Shell::new();
         shell.run_source_here("set -r", "<test>");
         let result = shell.run_source_here("cd /tmp", "<test>");
@@ -13999,6 +14118,10 @@ mod tests {
 
     #[test]
     fn restricted_mode_is_a_one_way_latch() {
+        // Moves the real process cwd (`cd` is a real chdir -- see
+        // change_directory), so it has to take the same lock every
+        // other cwd-moving test does.
+        let _guard = CWD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let mut shell = Shell::new();
         shell.run_source_here("set -r; set +r", "<test>");
         let result = shell.run_source_here("cd /tmp", "<test>");
@@ -14519,6 +14642,10 @@ mod tests {
     // component prints; an *empty* one does not).
     #[test]
     fn cdpath_searches_and_says_where_it_landed() {
+        // Moves the real process cwd (`cd` is a real chdir -- see
+        // change_directory), so it has to take the same lock every
+        // other cwd-moving test does.
+        let _guard = CWD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         // `cd` moves the *real* process directory (see
         // `change_directory`), so this has to be put back -- otherwise
         // every later test resolving a relative path runs from a

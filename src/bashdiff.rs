@@ -249,6 +249,12 @@ mod tests {
         case("empty-if-body", "printf 'if true; then fi\\n' > s.sh; . ./s.sh 2>/dev/null; echo \"rc=$?\""),
         case("empty-loop-condition", "printf 'while; do :; done\\n' > s.sh; . ./s.sh 2>/dev/null; echo \"rc=$?\""),
         case("declare-subscript", r#"declare 'a[0]=5'; echo "${a[0]}""#),
+        // -- roadmap 11: variables are not the environment ------------
+        case("plain-assignment-is-not-exported", r#"x=1; env | grep -c '^x=1$'"#),
+        case("export-is", r#"export y=2; env | grep -c '^y=2$'"#),
+        case("export-n-keeps-the-value", r#"export z=1; export -n z; env | grep -c '^z='; echo "[$z]""#),
+        case("a-child-sees-only-exports", r#"a=1; export b=2; env | grep -cE '^(a|b)='"#),
+        case("read-nul-delimited", r#"printf 'a b ' | while read -r -d '' v; do printf '[%s]' "$v"; done; echo"#),
     ];
 
     // Cases bish does not match today, each with why. Asserted to

@@ -59,18 +59,7 @@ pub(crate) fn run_unset(sh: &mut Shell, args: &[String], stderr_target: &Option<
         sh.arrays.remove(n.as_str());
         sh.assoc_arrays.remove(n.as_str());
         sh.assoc_names.remove(n.as_str());
-        let mut removed_local = false;
-        for scope in sh.var_scopes.iter_mut().rev() {
-            if scope.remove(n.as_str()).is_some() {
-                removed_local = true;
-                break;
-            }
-        }
-        if !removed_local {
-            unsafe {
-                std::env::remove_var(n);
-            }
-        }
+        sh.remove_var(n);
         if !only_vars {
             sh.functions.remove(n.as_str());
         }
