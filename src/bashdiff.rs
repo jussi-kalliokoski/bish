@@ -52,6 +52,16 @@ mod tests {
         case("array-basic", r#"a=(1 2 3); echo "${a[0]}" "${a[@]}" "${#a[@]}" "${!a[@]}""#),
         case("array-append", r#"a=(1); a+=(2 3); echo "${a[@]}""#),
         case("array-negative", r#"a=(1 2 3); echo "${a[-1]}""#),
+        // `:off:len` counts elements for a list and characters for a
+        // string -- the one operator whose meaning changes with what it
+        // is applied to.
+        case("array-slice", r#"a=(z1 z2 z3 z4 z5); echo "${a[@]:1:2}" "${a[@]:2}" "${a[@]:0:2}" "${a[@]: -2}" "${a[@]:9}""#),
+        case("array-slice-unquoted", r#"a=(z1 z2 z3); printf '[%s]' ${a[@]:1:2}; echo"#),
+        case("array-slice-sparse", r#"b=(x y); b[5]=z; printf '[%s]' "${b[@]:1:2}"; echo"#),
+        case("array-slice-star", r#"a=(z1 z2 z3); IFS=-; echo "${a[*]:1:2}""#),
+        case("args-slice", r#"set -- p1 p2 p3 p4; printf '[%s]' "${@:2:2}" "${@:2}" "${@: -1}"; echo"#),
+        case("args-slice-zero", r#"set -- p1 p2; printf '[%s]' "${@:1:1}"; echo"#),
+        case("string-slice-negative-length", r#"x=abcdef; echo "${x:1:-1}""#),
         case("array-unset-elem", r#"a=(1 2 3); unset 'a[1]'; echo "${a[@]}" "${#a[@]}""#),
         case("assoc-basic", r#"declare -A m=([k]=v [j]=w); echo "${m[k]}" "${#m[@]}""#),
         // -- arithmetic -----------------------------------------------
@@ -147,12 +157,11 @@ mod tests {
     // *still* diverge -- fixing one fails this test until its line is
     // removed, which is the only way a list like this stays true.
     const DIVERGENCES: &[(&str, &str)] = &[
+        ("expansion-error-continues", "bish reports an expansion error and carries on with an empty result; bash abandons the command"),
         ("param-quoted-star", "roadmap 6: \"$*\" does not join on IFS"),
         ("array-star-join", "roadmap 6: \"${a[*]}\" does not join on IFS"),
         ("dbracket-pattern", "quoting the right of `[[ == ]]` should make it a literal, not a glob"),
         ("printf-octal-escape", "roadmap 8: \\nnn in a printf format is not decoded"),
-        ("array-slice-length", "roadmap 3: ${a[@]:off:len} drops the length"),
-        ("args-slice-length", "roadmap 3: ${@:off:len} drops the length"),
         ("shopt-nullglob", "roadmap 4: the globbing shopts are tracked and ignored"),
         ("shopt-dotglob", "roadmap 4: as above"),
         ("shopt-failglob", "roadmap 4: as above"),
@@ -164,12 +173,11 @@ mod tests {
     // The cases the divergence list is about. Kept apart from `CASES`
     // so that list stays a description of what works.
     const PENDING: &[Case] = &[
+        case("expansion-error-continues", r#"a=(1 2 3); printf '[%s]' "${a[@]:1:-1}"; echo"#),
         case("param-quoted-star", r#"set -- a b c; IFS=,; echo "$*"; echo "$@""#),
         case("array-star-join", r#"a=(x y); IFS=-; echo "${a[*]}""#),
         case("dbracket-pattern", r#"[[ abc == a* ]] && echo glob; [[ abc == "a*" ]] || echo literal"#),
         case("printf-octal-escape", r#"printf 'a\101b\n'"#),
-        case("array-slice-length", r#"a=(1 2 3 4); echo "${a[@]:1:2}" "${a[@]:2}""#),
-        case("args-slice-length", r#"set -- p q r s; echo "${@:2:2}""#),
         case("shopt-nullglob", r#"shopt -s nullglob; printf '%s,' zz_no_match*; echo"#),
         case("shopt-dotglob", r#": > .hidden; : > shown; shopt -s dotglob; printf '%s,' *; echo"#),
         case("shopt-failglob", r#"shopt -s failglob; printf '%s,' zz_no_match*; echo"#),

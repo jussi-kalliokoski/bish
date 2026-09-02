@@ -4698,7 +4698,10 @@ impl Shell {
                 Chunk::VarExpand { name, op, quoted } => {
                     let name = name.clone();
                     let op = op.clone();
-                    let v = self.eval_var_op(&name, &op);
+                    let v = match self.list_slice(&name, None, &op) {
+                        Some(sliced) => self.joined_slice(sliced),
+                        None => self.eval_var_op(&name, &op),
+                    };
                     out.push_str(&if *quoted { crate::regex::escape(&v) } else { v });
                 }
                 Chunk::ArrayVar { name, index, quoted } => {
@@ -4716,7 +4719,10 @@ impl Shell {
                     let name = name.clone();
                     let index = index.clone();
                     let op = op.clone();
-                    let v = self.eval_array_var_op(&name, &index, &op);
+                    let v = match self.list_slice(&name, Some(&index), &op) {
+                        Some(sliced) => self.joined_slice(sliced),
+                        None => self.eval_array_var_op(&name, &index, &op),
+                    };
                     out.push_str(&if *quoted { crate::regex::escape(&v) } else { v });
                 }
                 Chunk::Indirect { name, quoted } => {
@@ -6458,7 +6464,13 @@ impl Shell {
                 Chunk::VarExpand { name, op, .. } => {
                     let name = name.clone();
                     let op = op.clone();
-                    s.push_str(&self.eval_var_op(&name, &op));
+                    match self.list_slice(&name, None, &op) {
+                        Some(sliced) => {
+                            let joined = self.joined_slice(sliced);
+                            s.push_str(&joined);
+                        }
+                        None => s.push_str(&self.eval_var_op(&name, &op)),
+                    }
                 }
                 Chunk::ArrayVar { name, index, .. } => {
                     let name = name.clone();
@@ -6474,7 +6486,13 @@ impl Shell {
                     let name = name.clone();
                     let index = index.clone();
                     let op = op.clone();
-                    s.push_str(&self.eval_array_var_op(&name, &index, &op));
+                    match self.list_slice(&name, Some(&index), &op) {
+                        Some(sliced) => {
+                            let joined = self.joined_slice(sliced);
+                            s.push_str(&joined);
+                        }
+                        None => s.push_str(&self.eval_array_var_op(&name, &index, &op)),
+                    }
                 }
                 Chunk::Indirect { name, .. } => {
                     let target = self.lookup_var(name);
@@ -6791,6 +6809,19 @@ impl Shell {
                 Chunk::VarExpand { name, op, quoted } => {
                     let name = name.clone();
                     let op = op.clone();
+                    // A slice of `$@` is a list, and a quoted one is
+                    // one field per element -- the same rule `"$@"`
+                    // itself follows.
+                    if let Some(sliced) = self.list_slice(&name, None, &op) {
+                        let items = self.reported_slice(sliced);
+                        if name == "@" && *quoted {
+                            append_parts_glob(&mut fields, &mut current, &mut patterns, &mut pattern_current, &items);
+                        } else {
+                            let joined = items.join(&self.ifs_join_char());
+                            append_splittable_glob(&mut fields, &mut current, &mut patterns, &mut pattern_current, &joined, *quoted, &ifs);
+                        }
+                        continue;
+                    }
                     let v = self.eval_var_op(&name, &op);
                     append_splittable_glob(&mut fields, &mut current, &mut patterns, &mut pattern_current, &v, *quoted, &ifs);
                 }
@@ -6822,6 +6853,16 @@ impl Shell {
                     let name = name.clone();
                     let index = index.clone();
                     let op = op.clone();
+                    if let Some(sliced) = self.list_slice(&name, Some(&index), &op) {
+                        let items = self.reported_slice(sliced);
+                        if index == "@" && *quoted {
+                            append_parts_glob(&mut fields, &mut current, &mut patterns, &mut pattern_current, &items);
+                        } else {
+                            let joined = items.join(&self.ifs_join_char());
+                            append_splittable_glob(&mut fields, &mut current, &mut patterns, &mut pattern_current, &joined, *quoted, &ifs);
+                        }
+                        continue;
+                    }
                     let v = self.eval_array_var_op(&name, &index, &op);
                     append_splittable_glob(&mut fields, &mut current, &mut patterns, &mut pattern_current, &v, *quoted, &ifs);
                 }
@@ -6982,6 +7023,73 @@ impl Shell {
     // one array element instead of a scalar variable. "@"/"*" indices are
     // treated as the joined-all-elements string, matching how they behave
     // as a plain (non-splitting-aware) expansion elsewhere.
+    // The list `${a[@]:off:len}` and `${@:off:len}` slice.
+    //
+    // `:off:len` is the one operator whose meaning changes when what it
+    // is applied to is a list: everywhere else in `${...}` the elements
+    // are joined first and the operator works on that text, but a slice
+    // of a list counts *elements*. `${a[@]:1:2}` is two elements, not
+    // two characters of `"1 2 3 4"`.
+    //
+    // `None` when this is not that -- an ordinary variable, or any
+    // other operator -- and the caller falls through to the text path.
+    fn list_slice(&mut self, name: &str, index: Option<&str>, op: &VarOp) -> Option<Result<Vec<String>, String>> {
+        let VarOp::Substring { offset, length } = op else { return None };
+        let items = match index {
+            // `${a[@]:...}` / `${a[*]:...}` -- the elements in index
+            // order, which is also what bash slices for a sparse array
+            // (by position among the elements that exist, not by index).
+            Some("@") | Some("*") => self.array_all(name),
+            Some(_) => return None,
+            // `${@:...}` / `${*:...}` -- `$0` first, which is why
+            // `${@:0}` names the script and `${@:1}` is the first
+            // argument.
+            None if name == "@" || name == "*" => std::iter::once(self.script_name.clone())
+                .chain(self.arg_frames.last().cloned().unwrap_or_default())
+                .collect(),
+            None => return None,
+        };
+        let offset = match arith::eval(offset, self) {
+            Ok(n) => n,
+            Err(e) => return Some(Err(e.to_string())),
+        };
+        let length = match length {
+            None => None,
+            Some(raw) => match arith::eval(raw, self) {
+                Ok(n) => Some(n),
+                Err(e) => return Some(Err(e.to_string())),
+            },
+        };
+        Some(slice_elements(items, offset, length))
+    }
+
+    // A slice that failed -- a negative length -- reports and yields
+    // nothing, which is what bash does with it.
+    fn reported_slice(&mut self, sliced: Result<Vec<String>, String>) -> Vec<String> {
+        match sliced {
+            Ok(items) => items,
+            Err(e) => {
+                sh_eprintln!(self, "bish: {e}");
+                Vec::new()
+            }
+        }
+    }
+
+    fn joined_slice(&mut self, sliced: Result<Vec<String>, String>) -> String {
+        let sep = self.ifs_join_char();
+        self.reported_slice(sliced).join(&sep)
+    }
+
+    // What `"$*"` and `"${a[*]}"` put between elements: IFS's first
+    // character, a space when IFS is unset, and nothing at all when it
+    // is empty.
+    fn ifs_join_char(&mut self) -> String {
+        match self.var_is_set("IFS") {
+            false => " ".to_string(),
+            true => self.lookup_var("IFS").chars().next().map(String::from).unwrap_or_default(),
+        }
+    }
+
     fn eval_array_var_op(&mut self, name: &str, index: &str, op: &VarOp) -> String {
         let cur = self.array_element(name, index);
         match op {
@@ -9229,6 +9337,24 @@ pub(crate) fn printf_format_once(format: &str, values: &[String], idx: &mut usiz
 // 128+signum (ExitStatus::code() returns None in that case -- there's no
 // normal exit code to report -- so this falls back to the signal via
 // ExitStatusExt, matching what `$?`/`wait`/`fg` should actually show).
+// `${list:off:len}` over elements. A negative offset counts from the
+// end; a negative *length* is an error for a list, where for a string
+// bash reads it as "stop this far from the end" -- one of the few
+// places the two genuinely disagree, and this follows bash on both.
+fn slice_elements(items: Vec<String>, offset: i64, length: Option<i64>) -> Result<Vec<String>, String> {
+    let count = items.len() as i64;
+    let start = match offset < 0 {
+        true => (count + offset).max(0),
+        false => offset.min(count),
+    };
+    let end = match length {
+        None => count,
+        Some(n) if n < 0 => return Err(format!("{n}: substring expression < 0")),
+        Some(n) => (start + n).min(count),
+    };
+    Ok(items.into_iter().skip(start as usize).take((end - start).max(0) as usize).collect())
+}
+
 fn exit_code_from_status(status: std::process::ExitStatus) -> i32 {
     use std::os::unix::process::ExitStatusExt;
     status.code().unwrap_or_else(|| status.signal().map(|s| 128 + s).unwrap_or(1))
