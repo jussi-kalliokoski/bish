@@ -103,7 +103,11 @@ impl OutputSink {
             OutputSink::Real => {
                 use std::io::Write;
                 let mut out = std::io::stdout();
-                let _ = out.write_all(s.as_bytes());
+                if let Err(e) = out.write_all(s.as_bytes())
+                    && e.kind() == std::io::ErrorKind::BrokenPipe
+                {
+                    note_broken_pipe();
+                }
                 // Flushed here rather than left to the line buffer,
                 // because fd 1 is not this shell's alone: the next
                 // thing to write to it is very often a child process,
@@ -201,6 +205,13 @@ struct ChildStdio {
     stderr: Option<std::fs::File>,
     dup_err_to_out: bool,
     dup_out_to_err: bool,
+}
+
+/// What a virtual child is being asked to run: text that still has to
+/// be lexed and parsed, or a command that already has been.
+enum ChildBody<'a> {
+    Source(&'a str),
+    Parsed(&'a parser::Command),
 }
 
 struct StdioOverride {
@@ -3621,6 +3632,13 @@ impl Shell {
         for item in prog {
             self.current_line = item.line;
             self.check_pending_signals();
+            // Nothing is reading this stage's output any more. A stage
+            // that was its own process would already be dead of
+            // SIGPIPE; this is where the in-process one stops instead,
+            // with the status that signal would have given it.
+            if broken_pipe_seen() {
+                return ExecResult::Exit(128 + 13);
+            }
             // Clone the Rc (not borrow self.debug_hook directly) before
             // calling into it: on_statement takes `&Shell`, and the hook
             // itself may call back into read-only Shell methods (variable
@@ -4128,6 +4146,20 @@ impl Shell {
     // (`{ ...; } 2> file`/`&>`/`2>&1`) -- every other caller uses
     // ChildStdio::default() plus a stdout/stdin override.
     fn run_in_child_shell(&mut self, raw: &str, stdio: ChildStdio) -> ExecResult {
+        self.run_body_in_child_shell(ChildBody::Source(raw), stdio)
+    }
+
+    /// `run_in_child_shell` for something that has already been parsed.
+    ///
+    /// A pipeline stage arrives as a `parser::Command`, not as text.
+    /// Serializing it back to a string just so this could re-lex and
+    /// re-parse it would be work for nothing, and worse than nothing
+    /// where the round trip is not exact.
+    fn run_command_in_child_shell(&mut self, cmd: &parser::Command, stdio: ChildStdio) -> ExecResult {
+        self.run_body_in_child_shell(ChildBody::Parsed(cmd), stdio)
+    }
+
+    fn run_body_in_child_shell(&mut self, body: ChildBody<'_>, stdio: ChildStdio) -> ExecResult {
         let mut child = self.new_virtual_child();
 
         let effective_stdin: Option<Rc<RefCell<SharedReaderState>>> = match stdio.stdin {
@@ -4196,7 +4228,10 @@ impl Shell {
         // the real parent script -- redirected into `file` too.
         let saved_fd012 = save_fd012();
 
-        let result = child.run_source_here(raw, "subshell");
+        let result = match body {
+            ChildBody::Source(raw) => child.run_source_here(raw, "subshell"),
+            ChildBody::Parsed(cmd) => crate::builtins::shell::run_command(&mut child, cmd, false),
+        };
         // Real bash fires a subshell's own EXIT trap when it finishes
         // normally too, not just on an explicit `exit`/errexit (confirmed:
         // `(trap "echo bye" EXIT; echo hi)` prints both). The re-exec'd
@@ -7258,13 +7293,36 @@ impl Shell {
     // makes piping possible at all), so compound-command stages self-exec
     // just like Subshell already does -- this is actually the *correct*
     // bash semantics too: piped stages always fork, even in real bash.
+    /// Whether this pipeline stage needs a shell to run it at all.
+    ///
+    /// Decided syntactically, without expanding anything: expansion has
+    /// side effects (a `$( )` in a stage's own words runs a command),
+    /// and doing it here would move those side effects earlier than the
+    /// stage they belong to. A first word that is a plain literal can be
+    /// checked against the builtin and function tables directly;
+    /// anything else -- a variable, a substitution, a glob -- is assumed
+    /// to need one, which is the safe direction to be wrong in, since
+    /// running an external command through a shell still works and the
+    /// reverse does not.
+    fn stage_needs_interpreter(&self, cmd: &parser::Command) -> bool {
+        let parser::Command::Simple(sc) = cmd else { return true };
+        let Some(first) = sc.words.first() else { return true };
+        match first.chunks.as_slice() {
+            [crate::lexer::Chunk::Str(name)] => self.is_active_builtin(name) || self.functions.contains_key(name),
+            _ => true,
+        }
+    }
+
     fn run_multi(&mut self, commands: &[parser::Command], background: bool) -> i32 {
         let n = commands.len();
-        let mut children: Vec<std::process::Child> = Vec::with_capacity(n);
+        // Paired with the stage each came from: `PIPESTATUS` is in
+        // stage order, and with a stage running in this shell rather
+        // than as a child the two orders stop being the same.
+        let mut children: Vec<(usize, std::process::Child)> = Vec::with_capacity(n);
         // The previous stage's read end, kept as a `ChildStdout` rather
         // than a `Stdio`: `lastpipe` needs its fd, and only ChildStdout
         // still has one.
-        let mut prev_stdout: Option<std::process::ChildStdout> = None;
+        let mut prev_stdout: Option<std::os::fd::OwnedFd> = None;
         // Real job control isolation (see run_single's own identical
         // pre_exec/setpgid pattern) for a *backgrounded* pipeline only --
         // every stage joins the same process group, seeded from the
@@ -7300,6 +7358,39 @@ impl Shell {
         // Wired as plain fds rather than via spawn_attached, whose setsid
         // would undo the process-group isolation set up just below (and
         // which `kill %N`/`bg` need to reach every stage at once).
+        //
+        // The one stage that can run in this shell instead of as a
+        // separate process.
+        //
+        // A pipeline needs its stages to run *concurrently*, and that is
+        // the only reason each one is a process today. But when exactly
+        // one stage needs a shell, every other stage is a real command
+        // already running on the other end of a pipe -- so the
+        // concurrency is there, provided by them, and the shell stage
+        // can simply run here, after they are spawned and before they
+        // are waited for. It reads a pipe a real process is filling and
+        // writes one a real process is draining; neither can deadlock,
+        // because the other end is never this thread.
+        //
+        // Two or more shell stages would need two interpreters running
+        // at once, which is a different problem, and those still
+        // re-exec. `lastpipe` already claims the in-shell slot where it
+        // applies, and only one stage can have it: a second would run
+        // sequentially with the first, and whichever ran first would
+        // fill its pipe with nothing draining it.
+        let inproc_stage = if background || n < 2 || lastpipe {
+            None
+        } else {
+            let mut shell_stages = commands.iter().enumerate().filter(|(_, c)| self.stage_needs_interpreter(c)).map(|(i, _)| i);
+            match (shell_stages.next(), shell_stages.next()) {
+                (Some(only), None) => Some(only),
+                _ => None,
+            }
+        };
+        // Its stdin and stdout, once the loop below has worked out what
+        // they are.
+        let mut inproc_stdio: Option<(Option<std::os::fd::OwnedFd>, Option<std::os::fd::OwnedFd>)> = None;
+
         let bg_pty = if background { self.background_pty() } else { None };
         let bg_slave = |pty: &Option<pty::Pty>| -> Option<Stdio> {
             let p = pty.as_ref()?;
@@ -7310,6 +7401,28 @@ impl Shell {
             let is_last = i == n - 1;
             if is_last && lastpipe {
                 break;
+            }
+            if Some(i) == inproc_stage {
+                // Not spawned: its fds are recorded here and it runs
+                // below, once every other stage is already going.
+                let stdin_fd = prev_stdout.take();
+                let stdout_fd = if is_last {
+                    None
+                } else {
+                    match make_pipe() {
+                        Ok((read_end, write_end)) => {
+                            prev_stdout = Some(read_end);
+                            Some(write_end)
+                        }
+                        Err(e) => {
+                            sh_eprintln!(self, "bish: {}", e);
+                            kill_all(children);
+                            return 1;
+                        }
+                    }
+                };
+                inproc_stdio = Some((stdin_fd, stdout_fd));
+                continue;
             }
             // Only the first stage takes the pty as stdin -- every other
             // one reads the previous stage's pipe, exactly as before.
@@ -7448,9 +7561,9 @@ impl Shell {
                         }
                     }
                     if !is_last {
-                        prev_stdout = child.stdout.take();
+                        prev_stdout = child.stdout.take().map(std::os::fd::OwnedFd::from);
                     }
-                    children.push(child);
+                    children.push((i, child));
                 }
                 Err(e) => {
                     sh_eprintln!(self, "bish: {}", e);
@@ -7465,6 +7578,7 @@ impl Shell {
             // Both the pgid (so `kill %N`/`bg` reach every stage at once)
             // and the output pty, which push_job_full needs to record for
             // the drain to find later.
+            let children = children.into_iter().map(|(_, c)| c).collect();
             self.push_job_full(children, cmd_text, bg_pty.map(|p| p.master), pgid.map(|p| p as u32));
             return 0;
         }
@@ -7479,7 +7593,7 @@ impl Shell {
             }
             let saved = save_fd012();
             if let Some(read_end) = prev_stdout.take() {
-                let fd = std::os::fd::OwnedFd::from(read_end);
+                let fd = read_end;
                 unsafe {
                     dup2(std::os::fd::AsRawFd::as_raw_fd(&fd), 0);
                 }
@@ -7495,13 +7609,53 @@ impl Shell {
             restore_fd012(saved);
         }
 
-        let mut status = 0;
-        let mut pipefail_status = 0;
-        // Kept, not just folded down: this is exactly what `PIPESTATUS`
-        // is, and the loop was already computing every element of it on
-        // its way to one number.
-        let mut codes: Vec<i32> = Vec::with_capacity(n);
-        for mut c in children {
+        // The stage that runs here rather than as a child -- after
+        // every other stage is spawned, and before any of them is
+        // waited for. They are what drains the pipe it writes and fills
+        // the pipe it reads, so they have to be running while it does.
+        let mut inproc_code = None;
+        if let (Some(stage), Some((stdin_fd, stdout_fd))) = (inproc_stage, inproc_stdio.take()) {
+            unsafe extern "C" {
+                fn dup2(oldfd: i32, newfd: i32) -> i32;
+            }
+            use std::os::fd::AsRawFd;
+            let saved = save_fd012();
+            if let Some(fd) = &stdin_fd {
+                unsafe { dup2(fd.as_raw_fd(), 0) };
+            }
+            if let Some(fd) = &stdout_fd {
+                unsafe { dup2(fd.as_raw_fd(), 1) };
+            }
+            // A virtual child rather than `run_command` directly: every
+            // stage of a pipeline is a subshell in bash, so an
+            // assignment here must not escape. That is exactly what this
+            // already gives `( )`, and the one thing `lastpipe` above
+            // deliberately does not do.
+            // Armed only around this: an `EPIPE` anywhere else is
+            // still ignored, as it always was.
+            arm_broken_pipe();
+            let result = self.run_command_in_child_shell(&commands[stage], ChildStdio::default());
+            let broken = disarm_broken_pipe();
+            restore_fd012(saved);
+            // Dropped before anything is waited for: the stage
+            // downstream sees end-of-input when the last copy of this
+            // pipe's write end closes, and this shell is holding one.
+            drop(stdout_fd);
+            drop(stdin_fd);
+            // No `pending_exit`: this stage is a subshell, so its own
+            // `exit` ends the stage rather than the shell running it --
+            // which is what `run_command_in_child_shell` has already
+            // turned the result into. That is the one thing `lastpipe`
+            // above must do differently, since its stage is not a
+            // subshell at all.
+            inproc_code = Some(if broken { 128 + 13 } else { result.status() });
+        }
+
+        // By stage rather than in completion order: `PIPESTATUS` is
+        // positional, and a stage that ran in this shell never went
+        // through `children` at all.
+        let mut codes: Vec<Option<i32>> = vec![None; n];
+        for (stage, mut c) in children {
             let code = match c.wait() {
                 Ok(s) => exit_code_from_status(s),
                 Err(e) => {
@@ -7509,21 +7663,18 @@ impl Shell {
                     1
                 }
             };
-            codes.push(code);
-            status = code;
-            if code != 0 {
-                pipefail_status = code;
-            }
+            codes[stage] = Some(code);
+        }
+        if let (Some(stage), Some(code)) = (inproc_stage, inproc_code) {
+            codes[stage] = Some(code);
         }
         if let Some(code) = lastpipe_code {
-            codes.push(code);
-            status = code;
-            if code != 0 {
-                pipefail_status = code;
-            }
+            codes[n - 1] = Some(code);
         }
+        let codes: Vec<i32> = codes.into_iter().map(|c| c.unwrap_or(0)).collect();
         self.set_pipestatus(&codes);
-        if self.opt_pipefail { pipefail_status } else { status }
+        let status = codes.last().copied().unwrap_or(0);
+        if self.opt_pipefail { codes.iter().rev().find(|c| **c != 0).copied().unwrap_or(0) } else { status }
     }
 
     fn expand_word(&mut self, w: &Word) -> String {
@@ -11387,6 +11538,46 @@ fn next_free_fd() -> i32 {
 // Journals nest: only the innermost frame records, which is enough,
 // because an inner frame is always fully unwound before its parent's own
 // unwind reads anything.
+// Whether a write to the current pipeline stage's own stdout has failed
+// because nothing is reading it any more, and whether anyone is asking.
+//
+// A pipeline stage that is its own process gets SIGPIPE here and dies,
+// which is what makes `while true; do echo x; done | head -2` a script
+// that terminates. A stage running *inside* this shell cannot be
+// allowed to die that way -- it would take the shell with it -- and
+// Rust's runtime sets SIGPIPE to SIG_IGN anyway, so the write simply
+// returns `EPIPE` and the loop above it runs forever.
+//
+// `None` means nobody is asking: an `EPIPE` outside a pipeline stage is
+// still ignored, exactly as before. Armed only around a stage running
+// in this shell, where the death it stands in for is a stage's, not the
+// shell's.
+thread_local! {
+    static BROKEN_PIPE: RefCell<Option<bool>> = const { RefCell::new(None) };
+}
+
+fn arm_broken_pipe() {
+    BROKEN_PIPE.with(|b| *b.borrow_mut() = Some(false));
+}
+
+/// Stops watching, and says whether it happened.
+fn disarm_broken_pipe() -> bool {
+    BROKEN_PIPE.with(|b| b.borrow_mut().take()).unwrap_or(false)
+}
+
+pub(crate) fn note_broken_pipe() {
+    BROKEN_PIPE.with(|b| {
+        let mut b = b.borrow_mut();
+        if b.is_some() {
+            *b = Some(true);
+        }
+    });
+}
+
+fn broken_pipe_seen() -> bool {
+    BROKEN_PIPE.with(|b| *b.borrow() == Some(true))
+}
+
 // One name and what it held before the innermost child touched it --
 // `None` for a name that did not exist, which the restore removes again
 // rather than setting to empty.
@@ -13324,8 +13515,37 @@ pub(crate) fn command_own_redirects(cmd: &parser::Command) -> &[Redirect] {
     }
 }
 
-fn kill_all(children: Vec<std::process::Child>) {
-    for mut c in children {
+/// A plain `pipe(2)`, as two owned fds.
+///
+/// `Stdio::piped()` cannot serve here: it hands the read end back only
+/// as a spawned child's `ChildStdout`, and the stage on the writing end
+/// of this one is not a child -- it is this shell.
+fn make_pipe() -> std::io::Result<(std::os::fd::OwnedFd, std::os::fd::OwnedFd)> {
+    unsafe extern "C" {
+        fn pipe2(fds: *mut i32, flags: i32) -> i32;
+    }
+    // O_CLOEXEC, and it is load-bearing rather than hygiene. Both ends
+    // are held by this shell while the *other* stages are spawned, so
+    // without it every one of them inherits the write end -- and a
+    // reader downstream then waits forever for an end-of-input that
+    // cannot arrive, because a process that never writes is holding the
+    // pipe open. `echo x | cat` printed its `x` and hung.
+    //
+    // The two places this shell does want them inherited both go
+    // through `dup2`, which clears the flag on the new descriptor: the
+    // read end onto a spawned stage's fd 0, and the write end onto fd 1
+    // for the stage running here.
+    const O_CLOEXEC: i32 = 0o2000000;
+    let mut fds = [0i32; 2];
+    if unsafe { pipe2(fds.as_mut_ptr(), O_CLOEXEC) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    use std::os::fd::FromRawFd;
+    Ok(unsafe { (std::os::fd::OwnedFd::from_raw_fd(fds[0]), std::os::fd::OwnedFd::from_raw_fd(fds[1])) })
+}
+
+fn kill_all(children: Vec<(usize, std::process::Child)>) {
+    for (_, mut c) in children {
         let _ = c.kill();
         let _ = c.wait();
     }

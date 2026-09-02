@@ -122,6 +122,37 @@ mod tests {
         case("flush-order", r#"printf A; printf B | cat; printf C; echo"#),
         case("flush-order-stderr", r#"printf E >&2; printf F | cat; echo"#),
         case("pipeline-status", r#"false | true; echo $?; set -o pipefail; false | true; echo $?"#),
+        // A pipeline stage that needs a shell runs in this process
+        // rather than as a re-exec'd bish, when it is the only such
+        // stage -- see run_multi's own `inproc_stage`. Everything below
+        // is what must not change because of that: the stage is still a
+        // subshell, it still reports its own status positionally, and
+        // it still dies when the thing reading it goes away.
+        case("pipeline-stage-is-a-subshell", r#"x=1; { x=2; echo "in=$x"; } | cat; echo "out=$x""#),
+        // The whole of what the re-exec'd stage could not carry across.
+        // Each of these was individually fixable by adding one more
+        // thing to the preamble a re-exec'd stage is handed; none of
+        // them needed fixing once the stage stopped being a re-exec.
+        case("dirs-in-a-pipeline", r#"cd /; pushd /usr >/dev/null; dirs | cat"#),
+        case("alias-in-a-pipeline", r#"alias q=x; alias | cat"#),
+        case("trap-in-a-pipeline", r#"trap 'echo t' INT; trap -p | cat"#),
+        case("complete-in-a-pipeline", r#"complete -W 'a b' foo; complete -p foo | cat"#),
+        case("jobs-in-a-pipeline", r#"sleep 0.2 & jobs -p | grep -cE '^[0-9]+$'"#),
+        case("pipeline-stage-cd-does-not-escape", r#"cd /; { cd /usr; echo "in=$PWD"; } | cat; echo "out=$PWD""#),
+        case("pipeline-stage-export-does-not-escape", r#"{ export E=inner; echo hi; } | cat; echo "[${E-unset}]""#),
+        case("pipeline-builtin-stage-status", r#"false | cat; echo "${PIPESTATUS[*]}""#),
+        case("pipeline-stage-exit-status", r#"{ exit 3; } | cat; echo "${PIPESTATUS[*]} rc=$?""#),
+        case("pipeline-stage-pipefail", r#"set -o pipefail; { exit 3; } | cat; echo "rc=$?""#),
+        case("pipeline-stage-in-the-middle", r#"/bin/echo a b | { read x y; echo "$y $x"; } | cat"#),
+        case("pipeline-stage-through-three", r#"echo a b c | tr ' ' '\n' | wc -l"#),
+        // More than a pipe buffer's worth, so the stage has to be
+        // running at the same time as the thing draining it.
+        case("pipeline-stage-outlasts-the-pipe-buffer", r#"for i in $(seq 1 5000); do echo "line $i"; done | wc -l"#),
+        // The reader leaves first. A stage that is its own process dies
+        // of SIGPIPE here; one running in the shell has to stop anyway,
+        // with the same status, or this never terminates at all.
+        case("pipeline-stage-reader-leaves-early", r#"for i in $(seq 1 100000); do echo "l$i"; done | head -2; echo "ps=${PIPESTATUS[*]}""#),
+        case("pipeline-stage-unbounded-reader-leaves", r#"while true; do echo x; done | head -2; echo "ps=${PIPESTATUS[*]}""#),
         case("subshell-scope", r#"x=1; (x=2); echo $x"#),
         case("subshell-exit", r#"(exit 4); echo $?"#),
         // The real process environment is shared by every in-process
@@ -414,13 +445,6 @@ y
         // skip_terminators, which every construct's list parsing goes
         // through, and is not worth the blast radius on its own.
         ("empty-command-between-separators", "`;` twice in a row is skipped rather than reported"),
-        // The pipeline architecture's residue: a stage that is a
-        // builtin, function or compound command re-execs (see roadmap
-        // 13), and a re-exec carries no job table across. (The coproc
-        // entry that used to sit here was not this at all -- the
-        // descriptors were fine, `>&$word` was being dropped. See
-        // roadmap 21.)
-        ("jobs-in-a-pipeline", "`jobs` as a pipeline stage runs in a child with an empty job table"),
         // Pre-existing, and named now that the redirect simulation made
         // the rest of the list exact: `>&2` means "the enclosing
         // stderr", and OutputSink::Builtin's two booleans can only say
@@ -440,8 +464,6 @@ y
     const PENDING: &[Case] = &[
         // -- roadmap 10: parser leniency, the part still standing -----
         case("empty-command-between-separators", "echo a; ; echo b"),
-        // -- the pipeline architecture's residue ----------------------
-        case("jobs-in-a-pipeline", r#"sleep 0.2 & jobs -p | grep -cE '^[0-9]+$'"#),
         case("dup-to-stderr-that-is-itself-redirected", r#"echo e >&2 2>/dev/null; echo done"#),
     ];
 
