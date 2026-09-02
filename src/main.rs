@@ -41,6 +41,7 @@ mod repl;
 mod roff;
 mod serialize;
 mod session;
+mod stackguard;
 mod suggest;
 mod term;
 mod theme;
@@ -56,6 +57,10 @@ mod window;
 use std::io::{IsTerminal, Read};
 
 fn main() {
+    // As close to the bottom of the stack as this program has a place
+    // to stand -- everything below measures its own nesting against
+    // here. See stackguard's own doc comment.
+    stackguard::note_base();
     let args: Vec<String> = std::env::args().collect();
 
     // `bish tool <subcommand>` -- checked first, ahead of every other

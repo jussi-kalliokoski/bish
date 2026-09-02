@@ -1236,6 +1236,16 @@ pub struct Shell {
     // How many shell functions deep we are, which is the question
     // `functrace` is really about.
     function_depth: usize,
+    // Set when a call has been refused for nesting too deeply, cleared
+    // once the stack it was refused on has unwound all the way out.
+    //
+    // Refusing the one call is not enough on its own. `f() { f; }` does
+    // unwind by itself, because the refused call is the last thing in
+    // the body -- but `f() { f; f; }` would call `f` again at every
+    // level on the way out and take exponential time to get nowhere.
+    // Real bash does not have this problem because it longjmps to the
+    // top level; this flag is what stands in for that jump.
+    nesting_unwind: bool,
     // `coproc`'s pipe halves that the *shell* keeps (the coprocess's own
     // ends are handed to the child and closed here after spawn). Kept
     // alive here, keyed by raw fd number, for as long as the coprocess
@@ -1589,6 +1599,7 @@ impl Shell {
             opt_functrace: false,
             opt_errtrace: false,
             function_depth: 0,
+            nesting_unwind: false,
             coproc_fds: std::collections::HashMap::new(),
             opt_errexit: false,
             opt_nounset: false,
@@ -1900,6 +1911,7 @@ impl Shell {
             opt_functrace: self.opt_functrace,
             opt_errtrace: self.opt_errtrace,
             function_depth: 0,
+            nesting_unwind: false,
             coproc_fds: std::collections::HashMap::new(),
             opt_errexit: self.opt_errexit,
             opt_nounset: self.opt_nounset,
@@ -3932,6 +3944,19 @@ impl Shell {
     // "read then run in place" semantics for $HOME/.config/bish/
     // config.bash, not a subprocess.
     pub(crate) fn run_source_here(&mut self, src: &str, label: &str) -> ExecResult {
+        // A file that sources itself is the same crash as a function
+        // that calls itself, reached without ever making a function
+        // call -- so it needs its own check rather than
+        // `call_function`'s. No `nesting_unwind` here: each level's
+        // `source` returns as soon as the one below it fails, so this
+        // unwinds on its own. Real bash dumps core on this one.
+        if crate::stackguard::nearly_exhausted() {
+            sh_eprintln!(self, "bish: {}: maximum source nesting level exceeded", label);
+            if !self.interactive {
+                self.pending_exit = Some(1);
+            }
+            return ExecResult::Status(1);
+        }
         match crate::lexer::Lexer::new(src).tokenize() {
             Ok(toks) => match crate::parser::Parser::new(self.expand_aliases(toks)).parse_program() {
                 Ok(prog) => self.run_program(&prog),
@@ -4463,6 +4488,26 @@ impl Shell {
         }
     }
 
+    /// Drops every NUL byte from a command substitution's output,
+    /// saying so once if there were any -- bash's own handling, message
+    /// included.
+    ///
+    /// The byte cannot survive into a shell word whatever is done with
+    /// it: a word ends up as an argument to `execve`, which takes C
+    /// strings and stops at the first NUL. So the choice is between
+    /// dropping it quietly and dropping it out loud, and a command that
+    /// produced binary output where a string was expected is worth a
+    /// line on stderr. Roadmap 11 took NUL bytes out of the variable
+    /// path; this is the same byte arriving through a different door,
+    /// where it used to reach the user as a Rust `CString` error.
+    fn strip_nuls_from_substitution(&mut self, text: String) -> String {
+        if !text.contains('\0') {
+            return text;
+        }
+        sh_eprintln!(self, "bish: line {}: warning: command substitution: ignored null byte in input", self.current_line);
+        text.replace('\0', "")
+    }
+
     fn run_command_substitution(&mut self, raw: &str) -> String {
         // `$(<file)`: bash's no-fork file read, and the idiomatic way a
         // script reads a pidfile or something out of /proc. Parsed as a
@@ -4484,7 +4529,7 @@ impl Shell {
                 text.pop();
             }
             self.last_subst_status = Some(0);
-            return text;
+            return self.strip_nuls_from_substitution(text);
         }
         let path = proc_sub_temp_path();
         let file = match std::fs::File::create(&path) {
@@ -4508,7 +4553,7 @@ impl Shell {
         while s.ends_with('\n') {
             s.pop();
         }
-        s
+        self.strip_nuls_from_substitution(s)
     }
 
     // `<(cmd)`: runs cmd to completion now, capturing its stdout into a
@@ -4564,7 +4609,56 @@ impl Shell {
         }
     }
 
+    /// `Some` when this call must not happen: either `FUNCNEST` says
+    /// so, or there is not enough stack left to survive it.
+    ///
+    /// bash only has the first of those, and dies on a signal without
+    /// it -- `bish -c 'f() { f; }; f'` used to abort and dump core, and
+    /// so does bash. The stack check is what makes the limit real when
+    /// nobody has set `FUNCNEST`, which is nearly always; see
+    /// stackguard's own doc comment for why it measures the stack
+    /// rather than counting frames.
+    ///
+    /// The message is bash's, including the line number and the
+    /// parenthesised limit. With no `FUNCNEST` set there is no
+    /// configured number to report, so it reports the depth actually
+    /// reached, which is the limit that applied.
+    fn refuse_deeper_nesting(&mut self, name: &str) -> Option<ExecResult> {
+        // Already unwinding out of a refusal further down: every call
+        // met on the way out is refused too, silently -- the message
+        // has been given once, which is what bash's jump to the top
+        // level amounts to.
+        if self.nesting_unwind {
+            return Some(ExecResult::Status(1));
+        }
+        // bash reads FUNCNEST as a number and treats anything else --
+        // unset, zero, negative, `abc` -- as "no limit".
+        let configured = self.lookup_var("FUNCNEST").trim().parse::<usize>().ok().filter(|n| *n > 0);
+        let too_deep = match configured {
+            Some(limit) => self.function_depth >= limit,
+            None => crate::stackguard::nearly_exhausted(),
+        };
+        if !too_deep {
+            return None;
+        }
+        let reported = configured.unwrap_or(self.function_depth);
+        self.sink_err(&format!("bish: line {}: {name}: maximum function nesting level exceeded ({reported})\n", self.current_line));
+        self.nesting_unwind = true;
+        // bash stops the script outright -- nothing after the offending
+        // call runs, and the shell exits 1. It does not do that to a
+        // session someone is typing at, and neither does this: there
+        // the unwind flag alone gets back to the prompt. Same line the
+        // readonly-assignment error draws.
+        if !self.interactive {
+            self.pending_exit = Some(1);
+        }
+        Some(ExecResult::Status(1))
+    }
+
     fn call_function(&mut self, name: &str, body: &parser::Command, call_args: Vec<String>) -> ExecResult {
+        if let Some(refused) = self.refuse_deeper_nesting(name) {
+            return refused;
+        }
         // Recorded before the body runs, so `current_line` is still the
         // line of the call rather than of whatever the body reaches
         // first.
@@ -4614,6 +4708,11 @@ impl Shell {
         }
         self.arg_frames.pop();
         self.function_depth -= 1;
+        // Back at the top: whatever was being unwound out of is fully
+        // unwound, and the shell can run commands again.
+        if self.function_depth == 0 {
+            self.nesting_unwind = false;
+        }
         // RETURN, after the frame is gone so the trap runs in the
         // caller's scope. Only under `functrace`, per the rule above --
         // a plain `trap ... RETURN` at the top level is about *sourced

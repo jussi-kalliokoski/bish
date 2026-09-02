@@ -223,6 +223,14 @@ impl<'a> Parser<'a> {
     // parenthesized grouping (see parse_primary's Tok::LParen arm,
     // which calls this same level rather than parse_assign directly).
     fn parse_comma(&mut self) -> Result<i64, String> {
+        // Every level of `( )` comes back through here, so this is the
+        // one place the nesting has to be bounded. `$(( ((((1)))) ))`
+        // 2000 deep is a thing bash evaluates without complaint and
+        // this used to abort on -- parsing and evaluating happen in the
+        // same descent, so one check covers both.
+        if crate::stackguard::nearly_exhausted() {
+            return Err("expression nested too deeply".to_string());
+        }
         let mut v = self.parse_assign()?;
         while matches!(self.peek(), Tok::Comma) {
             self.advance();

@@ -239,6 +239,15 @@ mod tests {
         case("arith-expansion-is-fatal", r#"{ echo $((1+)); } 2>/dev/null; echo unreached"#),
         case("arith-command-is-not", r#"((1+)) 2>/dev/null; echo after"#),
         case("error-if-unset", r#": ${x:?}; echo unreached"#),
+        // A NUL cannot survive into a shell word -- the word ends up as
+        // an argument to `execve`, which stops at the first one -- so
+        // both shells drop it and say so once per substitution.
+        case("command-substitution-drops-a-nul", r#"x=$(printf 'a\0b'); printf '%s\n' "$x""#),
+        case("command-substitution-warns-once-per-nul-run", r#"x=$(printf 'a\0b\0c'); printf '%s\n' "$x""#),
+        case("command-substitution-without-a-nul-is-quiet", r#"x=$(printf 'ab'); printf '%s\n' "$x""#),
+        case("funcnest-limits-recursion", r#"FUNCNEST=5; f() { f; }; f; echo unreached"#),
+        case("funcnest-ignores-a-non-number", r#"FUNCNEST=abc; f() { echo in; }; f"#),
+        case("funcnest-zero-is-no-limit", r#"FUNCNEST=0; f() { echo in; }; f"#),
         // Sourced from a file, with stderr discarded: a syntax error
         // is reported differently by the two shells (bash echoes the
         // offending line back, bish does not), and what these are about
@@ -560,6 +569,42 @@ y
         }
         let unlisted: Vec<&str> = differing.iter().filter(|n| !DIVERGENCES.iter().any(|(d, _)| d == *n)).copied().collect();
         assert!(unlisted.is_empty(), "differing but not listed: {unlisted:?}");
+    }
+
+    // Not a differential case: real bash dies on a signal for three of
+    // these four, so there is nothing to compare against. What is being
+    // asserted is only that bish does not -- an unbounded recursion is
+    // a typo, and a typo should not dump core.
+    //
+    // Each shape reaches the stack by a different route. A function
+    // calling itself and an `eval` calling itself both go through
+    // `call_function`; a file that sources itself never makes a
+    // function call at all; and a deeply parenthesised arithmetic
+    // expression is the parser recursing, not the executor. One stack
+    // measurement covers all four -- see stackguard's own doc comment
+    // for why it is a measurement rather than a depth counter.
+    #[test]
+    fn a_runaway_recursion_is_an_error_rather_than_a_crash() {
+        let Some(bish) = bish_binary() else { return };
+        let root = std::env::temp_dir().join(format!("bish-noabort-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("self.sh"), format!("source {}\n", root.join("self.sh").display())).unwrap();
+        let deep = format!("echo $(( {}1{} ))", "(".repeat(4000), ")".repeat(4000));
+        let cases: [(&str, String); 4] = [
+            ("a function calling itself", "f() { f; }; f".to_string()),
+            ("a function whose body is two self-calls", "f() { f; f; }; f".to_string()),
+            ("eval calling itself", r#"f() { eval "f"; }; f"#.to_string()),
+            ("a file sourcing itself", format!("source {}", root.join("self.sh").display())),
+        ];
+        for (what, script) in cases.iter().map(|(w, s)| (*w, s.clone())).chain([("arithmetic nested very deeply", deep)]) {
+            let out = run(bish.as_os_str(), &script, &root);
+            assert!(
+                !out.contains("stack overflow") && !out.contains("core dumped") && !out.contains("Aborted"),
+                "{what}: bish aborted rather than reporting a limit -- {out:?}"
+            );
+            assert!(!out.is_empty(), "{what}: bish said nothing at all, so it did not report the limit either");
+        }
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
