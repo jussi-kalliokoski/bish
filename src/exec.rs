@@ -3244,7 +3244,7 @@ impl Shell {
             sh_eprintln!(self, "bish: =: usage: = EXPRESSION");
             return 2;
         }
-        match crate::arith::eval(&expr, self) {
+        match self.eval_arith(&expr) {
             Ok(value) => {
                 sh_println!(self, "{value}");
                 0
@@ -3826,7 +3826,7 @@ impl Shell {
                 ExecResult::Status(0)
             }
             parser::Command::Subshell(raw, _redirects) => ExecResult::Status(self.run_subshell(raw, background)),
-            parser::Command::Arith(raw, _redirects) => match arith::eval(raw, self) {
+            parser::Command::Arith(raw, _redirects) => match self.eval_arith(raw) {
                 Ok(v) => ExecResult::Status(if v != 0 { 0 } else { 1 }),
                 Err(e) => {
                     sh_eprintln!(self, "bish: (({})): {}", raw, e);
@@ -4425,6 +4425,28 @@ impl Shell {
     }
 
     fn run_command_substitution(&mut self, raw: &str) -> String {
+        // `$(<file)`: bash's no-fork file read, and the idiomatic way a
+        // script reads a pidfile or something out of /proc. Parsed as a
+        // command substitution containing only a redirect, which ran
+        // nothing and produced nothing.
+        if let Some(path) = raw.trim().strip_prefix('<') {
+            let path = self.expand_raw(path.trim());
+            let mut text = match std::fs::read_to_string(&path) {
+                Ok(text) => text,
+                Err(e) => {
+                    sh_eprintln!(self, "bish: {}: {}", path, os_message(&e));
+                    self.last_subst_status = Some(1);
+                    return String::new();
+                }
+            };
+            // The same trailing-newline stripping every substitution
+            // does.
+            while text.ends_with('\n') {
+                text.pop();
+            }
+            self.last_subst_status = Some(0);
+            return text;
+        }
         let path = proc_sub_temp_path();
         let file = match std::fs::File::create(&path) {
             Ok(f) => f,
@@ -4948,7 +4970,7 @@ impl Shell {
                     let v = self.run_command_substitution(raw);
                     out.push_str(&if *quoted { crate::regex::escape(&v) } else { v });
                 }
-                Chunk::Arith { raw, quoted } => match arith::eval(raw, self) {
+                Chunk::Arith { raw, quoted } => match self.eval_arith(raw) {
                     Ok(v) => {
                         let v = v.to_string();
                         out.push_str(&if *quoted { crate::regex::escape(&v) } else { v });
@@ -5387,8 +5409,19 @@ impl Shell {
                 return match ext.status() {
                     Ok(status) => ExecResult::Status(exit_code_from_status(status)),
                     Err(e) => {
-                        sh_eprintln!(self, "bish: command: {}: {}", argv[i], e);
-                        ExecResult::Status(127)
+                        // Same three answers and two statuses as an
+                        // ordinary command word -- see the Err arm in
+                        // spawn_external.
+                        let name = &argv[i];
+                        let not_found = e.kind() == std::io::ErrorKind::NotFound;
+                        let (text, status) = match (not_found, name.contains('/')) {
+                            (true, false) => ("command not found".to_string(), 127),
+                            (true, true) => (os_message(&e), 127),
+                            (false, _) if std::path::Path::new(name).is_dir() => ("Is a directory".to_string(), 126),
+                            (false, _) => (os_message(&e), 126),
+                        };
+                        sh_eprintln!(self, "bish: {}: {}", name, text);
+                        ExecResult::Status(status)
                     }
                 };
             }
@@ -5590,7 +5623,7 @@ impl Shell {
             "let" => {
                 let mut last = 0i64;
                 for a in &argv[1..] {
-                    match arith::eval(a, self) {
+                    match self.eval_arith(a) {
                         Ok(v) => last = v,
                         Err(e) => {
                             sh_eprintln!(self, "bish: let: {}", e);
@@ -6191,7 +6224,15 @@ impl Shell {
                         return result;
                     }
                     Err(e) => {
-                        sh_eprintln!(self, "bish: {}: {}", path, e);
+                        // A directory gets the builtin's own name in
+                        // front of it and bash's lowercase wording;
+                        // everything else is the bare path and the
+                        // system's message. Checked against bash 5.3.
+                        if std::path::Path::new(&path).is_dir() {
+                            sh_eprintln!(self, "bish: {}: {}: is a directory", name, path);
+                        } else {
+                            sh_eprintln!(self, "bish: {}: {}", path, os_message(&e));
+                        }
                         return ExecResult::Status(1);
                     }
                 }
@@ -6374,7 +6415,11 @@ impl Shell {
                         // Same "leave $? at whatever it already was"
                         // behavior as the real top-level case just below.
                         Err(e) => {
-                            sh_eprintln!(self, "bish: exec: {}: {}", prog, e);
+                            let text = match e.kind() == std::io::ErrorKind::NotFound {
+                                true => "not found".to_string(),
+                                false => os_message(&e),
+                            };
+                            sh_eprintln!(self, "bish: exec: {}: {}", prog, text);
                             self.last_status
                         }
                     };
@@ -6405,14 +6450,25 @@ impl Shell {
                     return ExecResult::Status(1);
                 }
                 let err = command.exec();
-                sh_eprintln!(self, "bish: exec: {}: {}", prog, err);
-                // Real bash: a non-interactive shell exits immediately when
-                // exec fails to find/run the command, and (confirmed via a
-                // clean probe against bash 5.0.17) leaves $? at whatever it
-                // already was rather than setting 127 -- surprising, but
-                // that's what it actually does.
+                // bash's own wording for this one is just "not found",
+                // shorter than the message anywhere else.
+                let text = match err.kind() == std::io::ErrorKind::NotFound {
+                    true => "not found".to_string(),
+                    false => os_message(&err),
+                };
+                sh_eprintln!(self, "bish: exec: {}: {}", prog, text);
+                // A non-interactive shell exits immediately when exec
+                // cannot run the command. An earlier comment here said
+                // bash 5.0.17 left `$?` at whatever it already was;
+                // bash 5.3 exits 127 for a name it could not find and
+                // 126 for one it found and could not run, the same two
+                // statuses an ordinary command word gets.
+                let status = match err.kind() == std::io::ErrorKind::NotFound {
+                    true => 127,
+                    false => 126,
+                };
                 self.run_exit_trap();
-                return ExecResult::Exit(self.last_status);
+                return ExecResult::Exit(status);
             }
             // Bare `exec` (no command word): persistently applies its
             // redirects -- numbered-fd (`exec 3>file`, `exec 3>&1`,
@@ -6694,14 +6750,30 @@ impl Shell {
                 // about. Only for NotFound: an EACCES on a real file is
                 // a different problem and a suggestion there would be
                 // noise on top of it.
-                let hint = match e.kind() == std::io::ErrorKind::NotFound {
+                let not_found = e.kind() == std::io::ErrorKind::NotFound;
+                let hint = match not_found {
                     true => crate::suggest::did_you_mean(&name, KNOWN_BUILTINS.iter().copied()),
                     false => String::new(),
                 };
-                let msg = format!("bish: {}: {}{}", name, e, hint);
+                // bash's three answers, and its two statuses: a bare
+                // name nothing in PATH matched is "command not found";
+                // a path that is not there says so; and a path that
+                // *is* there but cannot be run is 126, not 127 -- the
+                // distinction a script checks to tell "no such tool"
+                // from "found it, could not run it".
+                let (text, status) = match (not_found, name.contains('/')) {
+                    (true, false) => ("command not found".to_string(), 127),
+                    (true, true) => (os_message(&e), 127),
+                    // execve on a directory reports EACCES on Linux,
+                    // which is true and unhelpful; bash stats it and
+                    // says what it actually is.
+                    (false, _) if std::path::Path::new(&name).is_dir() => ("Is a directory".to_string(), 126),
+                    (false, _) => (os_message(&e), 126),
+                };
+                let msg = format!("bish: {}: {}{}", name, text, hint);
                 self.write_command_error(cmd, &msg);
                 self.drain_proc_subs();
-                ExecResult::Status(127)
+                ExecResult::Status(status)
             }
         }
     }
@@ -6989,7 +7061,7 @@ impl Shell {
                     s.push_str(&self.lookup_var(&name));
                 }
                 Chunk::Sub { raw, .. } => s.push_str(&self.run_command_substitution(raw)),
-                Chunk::Arith { raw, .. } => match arith::eval(raw, self) {
+                Chunk::Arith { raw, .. } => match self.eval_arith(raw) {
                     Ok(v) => s.push_str(&v.to_string()),
                     Err(e) => {
                         sh_eprintln!(self, "bish: (({})): {}", raw, e);
@@ -7363,7 +7435,7 @@ impl Shell {
                     append_splittable_glob(&mut fields, &mut current, &mut patterns, &mut pattern_current, &v, *quoted, &ifs);
                 }
                 Chunk::Arith { raw, quoted } => {
-                    let v = match arith::eval(raw, self) {
+                    let v = match self.eval_arith(raw) {
                         Ok(n) => n.to_string(),
                         Err(e) => {
                             sh_eprintln!(self, "bish: (({})): {}", raw, e);
@@ -7507,6 +7579,23 @@ impl Shell {
     // expansions. Parsed as a single word (see parse_expansion_word) --
     // unlike a command line, unquoted whitespace inside it is literal
     // content, not a field separator.
+    // Arithmetic over text that may contain a command substitution.
+    // bash expands `$( )` and backticks in an arithmetic context before
+    // evaluating, and arith.rs has no way to run a command -- so
+    // `$(( $(echo 2) + 3 ))` was "bad substitution in arithmetic
+    // expression".
+    //
+    // Only when there is actually a substitution to run: `$x` and
+    // `${x}` are already arith.rs's own job, and a bare `x` has to stay
+    // a *name* so `x=y; y=2; echo $((x))` still resolves through to 2.
+    pub(crate) fn eval_arith(&mut self, raw: &str) -> Result<i64, String> {
+        if raw.contains("$(") || raw.contains('`') {
+            let expanded = self.expand_raw(raw);
+            return arith::eval(&expanded, self);
+        }
+        arith::eval(raw, self)
+    }
+
     fn expand_raw(&mut self, raw: &str) -> String {
         let chunks = crate::lexer::parse_expansion_word(raw);
         self.expand_word(&Word { chunks, globbable: false })

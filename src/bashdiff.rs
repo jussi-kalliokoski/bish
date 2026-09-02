@@ -290,6 +290,20 @@ mod tests {
         case("errexit-on-a-failed-capture", r#"set -e; x=$(false); echo unreached"#),
         case("inherit-errexit", r#"set -e; x=$(false; echo reached); echo "[$x]""#),
         case("set-cluster-ending-in-o", r#"set -euo pipefail; set -o | grep -cE '^(errexit|nounset|pipefail) +on'"#),
+        // -- roadmap 16: expansions that nest, diagnostics that read --
+        case(
+            "dollar-lt-file",
+            r#"printf 'x
+y
+' > f; echo "[$(<f)]"; v=$(<f); echo "[$v]""#,
+        ),
+        case("dollar-lt-missing", r#"echo "[$(<nosuch_zz)]"; echo "rc=$?""#),
+        case("arith-with-a-substitution", r#"echo $(( $(echo 2) + 3 )); let "v=$(echo 4)+1"; echo "$v""#),
+        case("arith-name-still-resolves", r#"x=y; y=2; echo $((x))"#),
+        case("command-not-found", r#"nosuchcmd_zz; echo "rc=$?""#),
+        case("not-executable-is-126", r#"/etc/hosts; echo "rc=$?"; /etc; echo "rc=$?""#),
+        case("missing-path-is-127", r#"./nosuchpath_zz; echo "rc=$?""#),
+        case("source-a-directory", r#". /etc; echo "rc=$?"; source /nosuch_zz; echo "rc=$?""#),
     ];
 
     // Cases bish does not match today, each with why. Asserted to
