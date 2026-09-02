@@ -1,6 +1,8 @@
 mod archive;
 mod arith;
 mod bishedit;
+#[cfg(test)]
+mod bashdiff;
 mod browser;
 mod builtins;
 mod compgen;
