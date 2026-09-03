@@ -572,6 +572,27 @@ y
         case("close-an-unopened-fd", r#"{ echo a; } 3>&-; echo b 4>&-"#),
         case("dup-to-a-word-fd", r#"exec 3>&1; f=3; echo hi >&$f; echo two >&$((1+2)); exec 3>&-"#),
         case("dup-to-a-closed-fd", r#"echo x >&9; echo "rc=$?""#),
+        // The whole redirect list, in source order, for a real child as
+        // well as for a builtin. A descriptor names what it names *at
+        // that point*, which is what makes the swap idiom work -- and
+        // doing fds 0/1/2 first, through the Command builder, and the
+        // numbered ones afterwards meant `3>&1` copied stdout's final
+        // destination instead of the one it had when the dup was
+        // written. Both spellings, since a builtin and an external
+        // reach it by different routes.
+        case("fd-swap-then-redirect-external", r#"/bin/echo x 3>&1 1>&2 2>&3 3>&- 2>/dev/null"#),
+        case("fd-swap-then-redirect-compound", r#"{ echo o; echo e >&2; } 3>&1 1>&2 2>&3 3>&- 2>/dev/null"#),
+        // Every file the list names is opened, even one a later
+        // redirect supersedes: only `b` survives, and `a` is still
+        // created and truncated.
+        case("a-superseded-redirect-still-creates-its-file", r#"/bin/echo x > a > b; ls a b; echo x 2>c 2>d; ls c d"#),
+        // A construct's `2>` reaches an *external* inside it, not just
+        // the builtins: it used to reach the output sink and nothing
+        // else, so the commonest way of silencing a block did nothing
+        // for the commands it was written for.
+        case("a-compounds-stderr-reaches-externals", r#"{ /bin/ls /nosuch; } 2>/dev/null; echo done; { /bin/ls /nosuch; } 2>e; wc -l < e"#),
+        case("a-loops-stderr-reaches-externals", r#"for i in 1; do /bin/ls /nosuch; done 2>/dev/null; echo done"#),
+        case("a-functions-stderr-reaches-externals", r#"f() { /bin/ls /nosuch; }; f 2>/dev/null; echo done"#),
         // A dup names the descriptor as it stands *at that point in the
         // list*, so these two are different destinations and not one
         // rule with an exception. Both spellings, because a builtin
@@ -804,16 +825,6 @@ y
         // work; until then `type f` deliberately stops after `f is a
         // function` rather than printing a body that would differ.
         ("function-body-formatting", "`declare -f f` reconstructs the body in bish's own layout, not bash's"),
-        // The ordered redirect simulation that made a *builtin's* fd
-        // list exact has no counterpart on the path that builds a real
-        // child's descriptors, which still resolves to a fixed
-        // stdin/stdout/stderr triple plus a dup flag. That shape cannot
-        // say "fd 1 was rebound after the dup that read it", so a swap
-        // followed by a further redirect comes out wrong.
-        (
-            "compound-fd-swap-then-redirect",
-            "`{ echo o; } 3>&1 1>&2 2>&3 3>&- 2>/dev/null` writes the wrong stream; the child-fd resolver has no ordering",
-        ),
         // `cd` resolves symlinks as it goes, so the shell holds the
         // *physical* path where bash holds the logical one and only
         // resolves for `pwd -P`. Keeping the logical path means `cd`
@@ -849,7 +860,6 @@ y
     const PENDING: &[Case] = &[
         case("set-o-lists-fewer-options", r#"set -o | wc -l"#),
         case("function-body-formatting", r#"f() { :; }; declare -f f"#),
-        case("compound-fd-swap-then-redirect", r#"{ echo o; echo e >&2; } 3>&1 1>&2 2>&3 3>&- 2>/dev/null"#),
         case("cd-follows-symlinks-physically", r#"mkdir -p real; ln -s real link; cd link; pwd | sed "s|.*/||""#),
         case("indirect-expansion-of-an-unset-name", r#"echo "[${!nosuch}]"; echo "rc=$?""#),
         case("arithmetic-literal-edges", r#"( echo $((1e2)) ) 2>/dev/null; echo "rc=$?"; ( echo $((0x)) ) 2>/dev/null; echo "rc=$?""#),

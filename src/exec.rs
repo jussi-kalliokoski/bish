@@ -264,6 +264,11 @@ struct StdioOverride {
     stdin: Option<Rc<RefCell<SharedReaderState>>>,
     // `Some` => write here instead of the real stdout.
     stdout: Option<std::fs::File>,
+    // And the same for stderr. Without it a construct's `2>` reached
+    // the builtins inside it, through the output sink, and nothing
+    // else: `{ /bin/ls /nosuch; } 2>/dev/null` still printed the error,
+    // because an external command's stderr was always inherited.
+    stderr: Option<std::fs::File>,
 }
 
 // Backs a converted construct's stdin override (see StdioOverride's own
@@ -2725,6 +2730,34 @@ impl Shell {
         }
     }
 
+    /// Where an *external* command inside a redirected construct should
+    /// send its stderr -- the mirror of ChildStdio::sink_stderr, which
+    /// answers the same question for a builtin.
+    fn effective_stderr(&self, stdio: &ChildStdio, effective_stdout: &Option<std::fs::File>) -> Option<std::fs::File> {
+        let own = match stdio.err_follows_out {
+            // `2>&1` before this construct rebound fd 1: whatever fd 1
+            // is for what runs inside it.
+            Some(Follows::Outer) => effective_stdout.as_ref().and_then(|f| f.try_clone().ok()),
+            Some(Follows::OwnFile) => stdio.stdout.as_ref().and_then(|f| f.try_clone().ok()),
+            None => stdio.stderr.as_ref().and_then(|f| f.try_clone().ok()),
+        };
+        own.or_else(|| self.stdio_override.as_ref().and_then(|o| o.borrow().stderr.as_ref().and_then(|f| f.try_clone().ok())))
+    }
+
+    /// The same for stderr -- see StdioOverride::stderr.
+    fn spawn_stderr_stdio(&self) -> Stdio {
+        match &self.stdio_override {
+            Some(o) => match &o.borrow().stderr {
+                Some(f) => match f.try_clone() {
+                    Ok(f) => Stdio::from(f),
+                    Err(_) => Stdio::inherit(),
+                },
+                None => Stdio::inherit(),
+            },
+            None => Stdio::inherit(),
+        }
+    }
+
     // Same as spawn_stdout_stdio, for stdin.
     fn spawn_stdin_stdio(&self) -> Stdio {
         match &self.stdio_override {
@@ -4618,8 +4651,9 @@ impl Shell {
             Some(f) => f.try_clone().ok(),
             None => self.stdio_override.as_ref().and_then(|o| o.borrow().stdout.as_ref().and_then(|f| f.try_clone().ok())),
         };
-        child.stdio_override = if effective_stdin.is_some() || effective_stdout.is_some() {
-            Some(Rc::new(RefCell::new(StdioOverride { stdin: effective_stdin, stdout: effective_stdout })))
+        let effective_stderr = self.effective_stderr(&stdio, &effective_stdout);
+        child.stdio_override = if effective_stdin.is_some() || effective_stdout.is_some() || effective_stderr.is_some() {
+            Some(Rc::new(RefCell::new(StdioOverride { stdin: effective_stdin, stdout: effective_stdout, stderr: effective_stderr })))
         } else {
             None
         };
@@ -4740,8 +4774,9 @@ impl Shell {
             Some(f) => f.try_clone().ok(),
             None => self.stdio_override.as_ref().and_then(|o| o.borrow().stdout.as_ref().and_then(|f| f.try_clone().ok())),
         };
-        self.stdio_override = if effective_stdin.is_some() || effective_stdout.is_some() {
-            Some(Rc::new(RefCell::new(StdioOverride { stdin: effective_stdin, stdout: effective_stdout })))
+        let effective_stderr = self.effective_stderr(&stdio, &effective_stdout);
+        self.stdio_override = if effective_stdin.is_some() || effective_stdout.is_some() || effective_stderr.is_some() {
+            Some(Rc::new(RefCell::new(StdioOverride { stdin: effective_stdin, stdout: effective_stdout, stderr: effective_stderr })))
         } else {
             None
         };
@@ -4918,14 +4953,14 @@ impl Shell {
         // compound_redirects_are_simple's own doc comment) should honor a
         // converted enclosing capture.
         if background {
-            command.stdin(redirs.stdin.or_else(|| bg_slave(&bg_pty)).unwrap_or_else(Stdio::inherit));
-            command.stdout(redirs.stdout.or_else(|| bg_slave(&bg_pty)).unwrap_or_else(Stdio::inherit));
+            command.stdin(bg_slave(&bg_pty).unwrap_or_else(Stdio::inherit));
+            command.stdout(bg_slave(&bg_pty).unwrap_or_else(Stdio::inherit));
         } else {
-            command.stdin(redirs.stdin.unwrap_or_else(|| self.spawn_stdin_stdio()));
-            command.stdout(redirs.stdout.unwrap_or_else(|| self.spawn_stdout_stdio()));
+            command.stdin(self.spawn_stdin_stdio());
+            command.stdout(self.spawn_stdout_stdio());
         }
-        command.stderr(redirs.stderr.or_else(|| bg_slave(&bg_pty)).unwrap_or_else(Stdio::inherit));
-        apply_fd_redirects(&mut command, redirs.dup_stderr_to_stdout, redirs.extra_fds);
+        command.stderr(bg_slave(&bg_pty).unwrap_or_else(|| self.spawn_stderr_stdio()));
+        apply_fd_redirects(&mut command, redirs.actions);
         // Real job control isolation for a *backgrounded* redirected
         // compound command only -- same reasoning/pattern as run_single's
         // own pre_exec hook (set from both the child, here, and the
@@ -7846,10 +7881,10 @@ impl Shell {
                     }
                     command.args(rest);
                     command.current_dir(&self.cwd);
-                    command.stdin(redirs.stdin.unwrap_or_else(|| self.spawn_stdin_stdio()));
-                    command.stdout(redirs.stdout.unwrap_or_else(|| self.spawn_stdout_stdio()));
-                    command.stderr(redirs.stderr.unwrap_or_else(Stdio::inherit));
-                    apply_fd_redirects(&mut command, redirs.dup_stderr_to_stdout, redirs.extra_fds);
+                    command.stdin(self.spawn_stdin_stdio());
+                    command.stdout(self.spawn_stdout_stdio());
+                    command.stderr(self.spawn_stderr_stdio());
+                    apply_fd_redirects(&mut command, redirs.actions);
                     self.note_external_spawn();
                     let status = match command.status() {
                         Ok(status) => exit_code_from_status(status),
@@ -7873,20 +7908,11 @@ impl Shell {
                     command.env_clear();
                 }
                 command.args(rest);
-                if let Some(s) = redirs.stdin {
-                    command.stdin(s);
-                }
-                if let Some(s) = redirs.stdout {
-                    command.stdout(s);
-                }
-                if let Some(s) = redirs.stderr {
-                    command.stderr(s);
-                }
-                // Numbered-fd forms (`exec cmd 3>file`) can't go through
-                // apply_fd_redirects' pre_exec hook -- CommandExt::exec
-                // below is a direct execve of *this* process, no fork, so
-                // there's no child to install a pre_exec closure into.
-                if let Err(e) = apply_fds_to_self(redirs.dup_stderr_to_stdout, redirs.extra_fds) {
+                // The redirects can't go through apply_fd_redirects'
+                // pre_exec hook -- CommandExt::exec below is a direct
+                // execve of *this* process, no fork, so there is no
+                // child to install a pre_exec closure into.
+                if let Err(e) = apply_fds_to_self(redirs.actions) {
                     sh_eprintln!(self, "bish: exec: {}", e);
                     return ExecResult::Status(1);
                 }
@@ -7927,18 +7953,7 @@ impl Shell {
                         return ExecResult::Status(1);
                     }
                 };
-                let (stdin, stdout, stderr) = match self.resolve_plain_fd012(&cmd.redirects) {
-                    Ok(f) => f,
-                    Err(e) => {
-                        sh_eprintln!(self, "bish: {}", e);
-                        return ExecResult::Status(1);
-                    }
-                };
-                if let Err(e) = apply_fd012_to_self(stdin, stdout, stderr) {
-                    sh_eprintln!(self, "bish: exec: {}", e);
-                    return ExecResult::Status(1);
-                }
-                if let Err(e) = apply_fds_to_self(redirs.dup_stderr_to_stdout, redirs.extra_fds) {
+                if let Err(e) = apply_fds_to_self(redirs.actions) {
                     sh_eprintln!(self, "bish: exec: {}", e);
                     return ExecResult::Status(1);
                 }
@@ -7997,8 +8012,7 @@ impl Shell {
         // tcsetpgrp/waitpid_untraced treatment further below instead;
         // there's no compositor to interfere with there, so a pty would
         // just be unnecessary overhead.
-        let use_pty =
-            self.is_promoted() && redirs.stdin.is_none() && redirs.stdout.is_none() && redirs.stderr.is_none() && redirs.extra_fds.is_empty();
+        let use_pty = self.is_promoted() && redirs.actions.is_empty();
 
         if use_pty {
             if let Ok(p) = pty::open() {
@@ -8073,14 +8087,14 @@ impl Shell {
             std::fs::OpenOptions::new().read(true).write(true).open(&p.slave_path).ok().map(Stdio::from)
         };
         if background {
-            command.stdin(redirs.stdin.or_else(|| bg_slave(&bg_pty)).unwrap_or_else(Stdio::inherit));
-            command.stdout(redirs.stdout.or_else(|| bg_slave(&bg_pty)).unwrap_or_else(Stdio::inherit));
+            command.stdin(bg_slave(&bg_pty).unwrap_or_else(Stdio::inherit));
+            command.stdout(bg_slave(&bg_pty).unwrap_or_else(Stdio::inherit));
         } else {
-            command.stdin(redirs.stdin.unwrap_or_else(|| self.spawn_stdin_stdio()));
-            command.stdout(redirs.stdout.unwrap_or_else(|| self.spawn_stdout_stdio()));
+            command.stdin(self.spawn_stdin_stdio());
+            command.stdout(self.spawn_stdout_stdio());
         }
-        command.stderr(redirs.stderr.or_else(|| bg_slave(&bg_pty)).unwrap_or_else(Stdio::inherit));
-        apply_fd_redirects(&mut command, redirs.dup_stderr_to_stdout, redirs.extra_fds);
+        command.stderr(bg_slave(&bg_pty).unwrap_or_else(|| self.spawn_stderr_stdio()));
+        apply_fd_redirects(&mut command, redirs.actions);
 
         // Real job control (M11), gated on `set -m` like fg/bg already are
         // (see their own opt_monitor checks): give this single external
@@ -8566,10 +8580,10 @@ impl Shell {
                         };
                         command.env(k, v);
                     }
-                    command.stdin(redirs.stdin.unwrap_or(default_stdin));
-                    command.stdout(redirs.stdout.unwrap_or(default_stdout));
-                    command.stderr(redirs.stderr.or_else(|| default_stderr.take()).unwrap_or_else(Stdio::inherit));
-                    apply_fd_redirects(&mut command, redirs.dup_stderr_to_stdout, redirs.extra_fds);
+                    command.stdin(default_stdin);
+                    command.stdout(default_stdout);
+                    command.stderr(default_stderr.take().unwrap_or_else(|| self.spawn_stderr_stdio()));
+                    apply_fd_redirects(&mut command, redirs.actions);
                     command
                 }
                 other => {
@@ -8583,7 +8597,7 @@ impl Shell {
                     };
                     let own_redirects = command_own_redirects(other);
                     let redirs = if own_redirects.is_empty() {
-                        ResolvedRedirs { stdin: None, stdout: None, stderr: None, dup_stderr_to_stdout: false, extra_fds: Vec::new() }
+                        ResolvedRedirs { actions: Vec::new() }
                     } else {
                         match self.resolve_redirect_list(own_redirects) {
                             Ok(r) => r,
@@ -8597,10 +8611,10 @@ impl Shell {
                     let script = self.functions_preamble() + &crate::serialize::serialize_command(other);
                     let mut command = self.command(exe);
                     command.arg("-c").arg(script);
-                    command.stdin(redirs.stdin.unwrap_or(default_stdin));
-                    command.stdout(redirs.stdout.unwrap_or(default_stdout));
-                    command.stderr(redirs.stderr.or_else(|| default_stderr.take()).unwrap_or_else(Stdio::inherit));
-                    apply_fd_redirects(&mut command, redirs.dup_stderr_to_stdout, redirs.extra_fds);
+                    command.stdin(default_stdin);
+                    command.stdout(default_stdout);
+                    command.stderr(default_stderr.take().unwrap_or_else(|| self.spawn_stderr_stdio()));
+                    apply_fd_redirects(&mut command, redirs.actions);
                     command
                 }
             };
@@ -10446,9 +10460,15 @@ impl Shell {
             // >&2 2>/dev/null` prints on the terminal in bash, because
             // `>&2` names fd 2 as it stood then.
             ProcessFd(i32),
-            // path, append, clobber -- the last is `>|`'s override of
-            // `set -C`.
-            Path(String, bool, bool),
+            // Opened as the redirect is *read*, not when the sink is
+            // built at the end. A redirect creates and truncates its
+            // file whether or not anything ends up writing to it:
+            // `echo x > a > b` creates both and writes to `b`, and
+            // `echo x 3>f` creates `f` though no builtin writes to fd
+            // 3. Opening only the two destinations the sink needed
+            // meant neither happened, and an error opening a
+            // superseded path went unreported.
+            File(Rc<RefCell<std::fs::File>>),
             Closed,
         }
         let mut dests: Vec<Dest> = Vec::new();
@@ -10475,14 +10495,22 @@ impl Shell {
         }
         for r in redirects {
             match r {
-                Redirect::Out { word, append, clobber } => define!(1, Dest::Path(self.expand_word(word), *append, *clobber)),
-                Redirect::Err { word, append, clobber } => define!(2, Dest::Path(self.expand_word(word), *append, *clobber)),
+                Redirect::Out { word, append, clobber } | Redirect::FdOut { fd: 1, word, append, clobber } => {
+                    let p = self.expand_word(word);
+                    define!(1, Dest::File(Rc::new(RefCell::new(self.open_out(&p, *append, *clobber)?))))
+                }
+                Redirect::Err { word, append, clobber } | Redirect::FdOut { fd: 2, word, append, clobber } => {
+                    let p = self.expand_word(word);
+                    define!(2, Dest::File(Rc::new(RefCell::new(self.open_out(&p, *append, *clobber)?))))
+                }
                 Redirect::FdOut { fd, word, append, clobber } => {
-                    define!(*fd as i32, Dest::Path(self.expand_word(word), *append, *clobber))
+                    let p = self.expand_word(word);
+                    define!(*fd as i32, Dest::File(Rc::new(RefCell::new(self.open_out(&p, *append, *clobber)?))))
                 }
                 // `&>file`: both descriptors, one open file.
                 Redirect::Both { word, append } => {
-                    define!(1, Dest::Path(self.expand_word(word), *append, false));
+                    let p = self.expand_word(word);
+                    define!(1, Dest::File(Rc::new(RefCell::new(self.open_out(&p, *append, false)?))));
                     let id = table[&1];
                     table.insert(2, id);
                 }
@@ -10520,22 +10548,22 @@ impl Shell {
         let shared = matches!((table.get(&1), table.get(&2)), (Some(a), Some(b)) if a == b);
         let stdout = match out_dest {
             None => SinkStream::OuterOut,
-            Some(d) => open_dest(self, d, who)?,
+            Some(d) => open_dest(d, who)?,
         };
         let stderr = match err_dest {
             None => SinkStream::OuterErr,
             // One destination for both, opened once -- so the two share
             // a write position instead of overwriting each other.
             Some(_) if shared => stdout.clone(),
-            Some(d) => open_dest(self, d, who)?,
+            Some(d) => open_dest(d, who)?,
         };
         let previous = std::mem::replace(&mut self.sink, OutputSink::Real);
         self.sink = OutputSink::Builtin { previous: Box::new(previous), stdout, stderr };
         return Ok(true);
 
-        fn open_dest(sh: &mut Shell, dest: &Dest, who: &str) -> Result<SinkStream, String> {
+        fn open_dest(dest: &Dest, who: &str) -> Result<SinkStream, String> {
             match dest {
-                Dest::Path(p, append, clobber) => Ok(SinkStream::File(Rc::new(RefCell::new(sh.open_out(p, *append, *clobber)?)))),
+                Dest::File(f) => Ok(SinkStream::File(Rc::clone(f))),
                 // For a *builtin*, fd 1 and fd 2 are not the process's
                 // own: they are the enclosing sink, which may already
                 // be a capture, a grid, or an outer command's redirect.
@@ -10725,71 +10753,6 @@ impl Shell {
         }
     }
 
-    fn resolve_plain_fd012(
-        &mut self,
-        redirects: &[Redirect],
-    ) -> Result<(Option<std::fs::File>, Option<std::fs::File>, Option<std::fs::File>), String> {
-        // `bool`: also opened for writing (Redirect::InOut, bare `<>`) --
-        // see open_in_out's own doc comment.
-        let mut stdin_path: Option<(String, bool)> = None;
-        let mut here_string: Option<String> = None;
-        // path, append, clobber (`>|`) -- as in open_out's signature.
-        let mut stdout_target: Option<(String, bool, bool)> = None;
-        let mut stderr_target: Option<(String, bool, bool)> = None;
-        for r in redirects {
-            match r {
-                Redirect::In(w) => {
-                    stdin_path = Some((self.expand_word(w), false));
-                    here_string = None;
-                }
-                Redirect::InOut(w) => {
-                    stdin_path = Some((self.expand_word(w), true));
-                    here_string = None;
-                }
-                Redirect::HereString(w) => {
-                    let mut content = self.expand_word(w);
-                    content.push('\n');
-                    here_string = Some(content);
-                    stdin_path = None;
-                }
-                Redirect::HereDoc(w) => {
-                    here_string = Some(self.expand_word(w));
-                    stdin_path = None;
-                }
-                Redirect::Out { word, append, clobber } => {
-                    stdout_target = Some((self.expand_word(word), *append, *clobber));
-                }
-                Redirect::Err { word, append, clobber } => {
-                    stderr_target = Some((self.expand_word(word), *append, *clobber));
-                }
-                Redirect::Both { word, append } => {
-                    let p = self.expand_word(word);
-                    stdout_target = Some((p.clone(), *append, false));
-                    stderr_target = Some((p, *append, false));
-                }
-                _ => {}
-            }
-        }
-        let stdin = if let Some(content) = here_string {
-            Some(here_string_file(&content)?)
-        } else {
-            match stdin_path {
-                Some((p, true)) => Some(self.open_in_out(&p)?),
-                Some((p, false)) => Some(self.open_in(&p)?),
-                None => None,
-            }
-        };
-        let stdout = match stdout_target {
-            Some((p, append, clobber)) => Some(self.open_out(&p, append, clobber)?),
-            None => None,
-        };
-        let stderr = match stderr_target {
-            Some((p, append, clobber)) => Some(self.open_out(&p, append, clobber)?),
-            None => None,
-        };
-        Ok((stdin, stdout, stderr))
-    }
-
     // Pure classification, no expansion/side effects: whether every
     // redirect in `redirects` is one run_compound_redirected's in-process
     // path (resolve_simple_redirects_for_compound) can actually handle --
@@ -10883,57 +10846,69 @@ impl Shell {
         Ok(stdio)
     }
 
+    /// Every redirect this command carries, in source order, as the
+    /// actions to perform on the descriptors it has already inherited.
+    ///
+    /// Source order is the whole of it. A redirect names a descriptor
+    /// *as it stands at that point*, so `3>&1 1>&2 2>&3` swaps the two
+    /// streams -- and doing fds 0, 1 and 2 first, through the Command
+    /// builder, and only then the numbered ones meant `3>&1` copied
+    /// stdout's *final* destination rather than the one it had when the
+    /// dup was written. That is also why every file the list names is
+    /// opened, even one a later redirect supersedes: `> a > b` creates
+    /// both, and only `b` survives.
+    ///
+    /// This is what a real shell does after forking, and the reason it
+    /// can be expressed the same way here is that these all run in the
+    /// child (a `pre_exec` hook, or this process itself for `exec`),
+    /// after it has the descriptors it inherits.
     fn resolve_redirect_list(&mut self, redirects: &[Redirect]) -> Result<ResolvedRedirs, String> {
-        // path, append, clobber (`>|`) -- as in open_out's signature.
-        let mut stdout_target: Option<(String, bool, bool)> = None;
-        let mut stderr_target: Option<(String, bool, bool)> = None;
-        // `bool`: also opened for writing (Redirect::InOut, bare `<>`) --
-        // see open_in_out's own doc comment.
-        let mut stdin_path: Option<(String, bool)> = None;
-        let mut here_string: Option<String> = None;
-        let mut dup_err_to_out = false;
-        let mut extra_fds: Vec<ExtraFd> = Vec::new();
-
+        let mut actions: Vec<FdAction> = Vec::new();
         for r in redirects {
             match r {
                 Redirect::In(w) => {
-                    stdin_path = Some((self.expand_word(w), false));
-                    here_string = None;
+                    let p = self.expand_word(w);
+                    let file = self.open_in(&p)?;
+                    actions.push(FdAction::Open { fd: 0, file });
                 }
                 Redirect::InOut(w) => {
-                    stdin_path = Some((self.expand_word(w), true));
-                    here_string = None;
+                    let p = self.expand_word(w);
+                    let file = self.open_in_out(&p)?;
+                    actions.push(FdAction::Open { fd: 0, file });
                 }
                 Redirect::HereString(w) => {
                     let mut content = self.expand_word(w);
                     content.push('\n');
-                    here_string = Some(content);
-                    stdin_path = None;
+                    actions.push(FdAction::Open { fd: 0, file: here_string_file(&content)? });
                 }
                 Redirect::HereDoc(w) => {
-                    // Body already ends in '\n' from capture_heredoc_body;
-                    // reuses the same temp-file Stdio plumbing as <<<.
-                    here_string = Some(self.expand_word(w));
-                    stdin_path = None;
+                    // Body already ends in '\n' from capture_heredoc_body.
+                    let content = self.expand_word(w);
+                    actions.push(FdAction::Open { fd: 0, file: here_string_file(&content)? });
                 }
-                Redirect::Out { word, append, clobber } => {
-                    stdout_target = Some((self.expand_word(word), *append, *clobber));
-                    dup_err_to_out = false;
+                Redirect::Out { word, append, clobber } | Redirect::FdOut { fd: 1, word, append, clobber } => {
+                    let p = self.expand_word(word);
+                    let file = self.open_out(&p, *append, *clobber)?;
+                    actions.push(FdAction::Open { fd: 1, file });
                 }
-                Redirect::Err { word, append, clobber } => {
-                    stderr_target = Some((self.expand_word(word), *append, *clobber));
-                    dup_err_to_out = false;
+                Redirect::Err { word, append, clobber } | Redirect::FdOut { fd: 2, word, append, clobber } => {
+                    let p = self.expand_word(word);
+                    let file = self.open_out(&p, *append, *clobber)?;
+                    actions.push(FdAction::Open { fd: 2, file });
                 }
+                // `&>file`: one open file, both descriptors on it, so
+                // they share a write position.
                 Redirect::Both { word, append } => {
                     let p = self.expand_word(word);
-                    stdout_target = Some((p, *append, false));
-                    dup_err_to_out = true;
+                    let file = self.open_out(&p, *append, false)?;
+                    actions.push(FdAction::Open { fd: 1, file });
+                    actions.push(FdAction::Dup { fd: 2, source: 1 });
                 }
-                Redirect::DupErrToOut => dup_err_to_out = true,
+                Redirect::DupErrToOut => actions.push(FdAction::Dup { fd: 2, source: 1 }),
                 Redirect::FdOut { fd, word, append, clobber } => {
                     let p = self.expand_word(word);
                     let file = self.open_out(&p, *append, *clobber)?;
-                    extra_fds.push(ExtraFd::Open { fd: *fd as i32, file });
+                    actions.push(FdAction::Open { fd: *fd as i32, file });
                 }
                 // `{name}>file`: the descriptor is chosen here, in the
                 // shell, because the *variable* has to be set here --
@@ -10946,7 +10921,7 @@ impl Shell {
                         // N and names *that*.
                         if p.trim() == "-" {
                             match self.lookup_var(var).trim().parse::<i32>() {
-                                Ok(fd) => extra_fds.push(ExtraFd::Close(fd)),
+                                Ok(fd) => actions.push(FdAction::Close(fd)),
                                 Err(_) => return Err(format!("{}: ambiguous redirect", var)),
                             }
                         } else {
@@ -10954,7 +10929,7 @@ impl Shell {
                                 Ok(source) => {
                                     let fd = next_free_fd();
                                     self.assign_var(var, fd.to_string());
-                                    extra_fds.push(ExtraFd::Dup { fd, source });
+                                    actions.push(FdAction::Dup { fd, source });
                                 }
                                 Err(_) => return Err(format!("{}: ambiguous redirect", p)),
                             }
@@ -10969,63 +10944,33 @@ impl Shell {
                     };
                     let fd = next_free_fd();
                     self.assign_var(var, fd.to_string());
-                    extra_fds.push(ExtraFd::Open { fd, file });
+                    actions.push(FdAction::Open { fd, file });
                 }
                 Redirect::FdIn { fd, word } => {
                     let p = self.expand_word(word);
                     let file = self.open_in(&p)?;
-                    extra_fds.push(ExtraFd::Open { fd: *fd as i32, file });
+                    actions.push(FdAction::Open { fd: *fd as i32, file });
                 }
                 Redirect::FdInOut { fd, word } => {
                     let p = self.expand_word(word);
                     let file = self.open_in_out(&p)?;
-                    extra_fds.push(ExtraFd::Open { fd: *fd as i32, file });
+                    actions.push(FdAction::Open { fd: *fd as i32, file });
                 }
                 Redirect::FdDup { fd, target } => {
-                    extra_fds.push(ExtraFd::Dup { fd: *fd as i32, source: *target as i32 });
+                    actions.push(FdAction::Dup { fd: *fd as i32, source: *target as i32 });
                 }
                 Redirect::FdDupWord { fd, word } => {
                     let target_str = self.expand_word(word);
                     match target_str.trim().parse::<i32>() {
-                        Ok(source) => extra_fds.push(ExtraFd::Dup { fd: *fd as i32, source }),
+                        Ok(source) => actions.push(FdAction::Dup { fd: *fd as i32, source }),
                         Err(_) => return Err(format!("{}: ambiguous redirect", target_str)),
                     }
                 }
-                Redirect::FdClose { fd } => {
-                    extra_fds.push(ExtraFd::Close(*fd as i32));
-                }
+                Redirect::FdClose { fd } => actions.push(FdAction::Close(*fd as i32)),
             }
         }
-
-        let stdin = if let Some(content) = here_string {
-            Some(Stdio::from(here_string_file(&content)?))
-        } else {
-            match stdin_path {
-                Some((p, true)) => Some(Stdio::from(self.open_in_out(&p)?)),
-                Some((p, false)) => Some(Stdio::from(self.open_in(&p)?)),
-                None => None,
-            }
-        };
-        let stdout_file: Option<std::fs::File> = match &stdout_target {
-            Some((p, append, clobber)) => Some(self.open_out(p, *append, *clobber)?),
-            None => None,
-        };
-        // `2>&1`'s actual fd-dup happens via dup2_stderr_to_stdout at each
-        // spawn site instead of resolving a Stdio here -- see
-        // ResolvedRedirs::dup_stderr_to_stdout for why (a pipe destination
-        // can't be "opened" the way a file can).
-        let stderr_file: Option<std::fs::File> = if dup_err_to_out {
-            None
-        } else {
-            match &stderr_target {
-                Some((p, append, clobber)) => Some(self.open_out(p, *append, *clobber)?),
-                None => None,
-            }
-        };
-        let stdout = stdout_file.map(Stdio::from);
-        let stderr = stderr_file.map(Stdio::from);
-
-        Ok(ResolvedRedirs { stdin, stdout, stderr, dup_stderr_to_stdout: dup_err_to_out, extra_fds })
+        move_opened_files_out_of_the_way(&mut actions);
+        Ok(ResolvedRedirs { actions })
     }
 }
 
@@ -11077,30 +11022,59 @@ fn split_subscript(name: &str) -> Option<(&str, String)> {
 }
 
 struct ResolvedRedirs {
-    stdin: Option<Stdio>,
-    stdout: Option<Stdio>,
-    stderr: Option<Stdio>,
-    // True fd-dup of whatever stdout ends up being -- a pipe, a file, or
-    // inherited -- applied via a dup2 pre_exec hook at each spawn site
-    // (see dup2_stderr_to_stdout). Stdio has no "duplicate of a sibling
-    // fd" variant, so this is the only way `2>&1` can share stdout's
-    // *actual* destination rather than a second, independently-opened
-    // handle to it; it's what makes `cmd 2>&1 | other` correctly merge
-    // stderr into the pipe, not just the `cmd > file 2>&1` shape.
-    dup_stderr_to_stdout: bool,
-    // Arbitrary-fd redirects (`3>file`, `4<&0`, ...), applied via the same
-    // dup2-in-pre_exec approach as dup_stderr_to_stdout, in source order,
-    // *after* dup_stderr_to_stdout -- see apply_fd_redirects. Scoped gap:
-    // since these run after stdin/stdout/stderr's own Command-builder setup
-    // rather than interleaved with it, a numbered-fd redirect that's meant
-    // to capture fd 0/1/2's state *before* a later plain `>`/`<` redirect
-    // in the same command changes it (the classic `3>&1 1>log 2>&3`
-    // fd-juggling idiom) won't see the pre-redirect value. Every ordering
-    // that doesn't depend on that interleaving works correctly.
-    extra_fds: Vec<ExtraFd>,
+    /// The command's whole redirect list, in source order -- see
+    /// resolve_redirect_list. Nothing is pre-applied to the Command
+    /// builder's stdin/stdout/stderr: those carry only what the command
+    /// *inherits* (a pipeline's pipe, a capture, the shell's own), and
+    /// these run on top of it in the child.
+    actions: Vec<FdAction>,
 }
 
-enum ExtraFd {
+/// Moves every file this list opened above the descriptors the list
+/// itself rebinds.
+///
+/// The files are opened in the *shell* and inherited at whatever
+/// numbers they happened to get -- which can be numbers the list then
+/// dups over. `3>&1 1>&2 2>&3 3>&- 2>/dev/null` opens /dev/null in the
+/// shell, and if that landed on fd 3, the `3>&1` overwrote the handle
+/// before `2>/dev/null` could install it: the redirect either pointed
+/// at the wrong file or failed outright with EBADF.
+///
+/// `F_DUPFD_CLOEXEC` asks for the lowest free descriptor at or above a
+/// floor, which is exactly the primitive for this. Close-on-exec is
+/// right for the copy: it is only ever the *source* of a dup2 that
+/// happens before the exec, and the descriptor it is duplicated onto
+/// gets its own flags.
+fn move_opened_files_out_of_the_way(actions: &mut [FdAction]) {
+    unsafe extern "C" {
+        fn fcntl(fd: i32, cmd: i32, arg: i32) -> i32;
+    }
+    const F_DUPFD_CLOEXEC: i32 = 1030;
+    let mut floor = 3;
+    for a in actions.iter() {
+        let highest = match a {
+            FdAction::Open { fd, .. } | FdAction::Close(fd) => *fd,
+            FdAction::Dup { fd, source } => (*fd).max(*source),
+        };
+        floor = floor.max(highest + 1);
+    }
+    for a in actions.iter_mut() {
+        let FdAction::Open { file, .. } = a else { continue };
+        let raw = std::os::unix::io::AsRawFd::as_raw_fd(file);
+        if raw >= floor {
+            continue;
+        }
+        let moved = unsafe { fcntl(raw, F_DUPFD_CLOEXEC, floor) };
+        if moved >= 0 {
+            *file = unsafe { <std::fs::File as std::os::fd::FromRawFd>::from_raw_fd(moved) };
+        }
+    }
+}
+
+/// One step in a command's redirect list, to be performed on the
+/// descriptors a child has already inherited: point `fd` at an open
+/// file, at another descriptor as it stands right now, or close it.
+enum FdAction {
     Open { fd: i32, file: std::fs::File },
     Dup { fd: i32, source: i32 },
     Close(i32),
@@ -13404,20 +13378,14 @@ fn stdin_ready(timeout_ms: i32) -> bool {
 // 0/1/2) goes through a completely different Option<Stdio>-based resolution
 // path elsewhere in this file that isn't wired up to apply to the current
 // process, a separate, narrower remaining gap.
-fn apply_fds_to_self(dup_stderr_to_stdout: bool, extra_fds: Vec<ExtraFd>) -> Result<(), String> {
+fn apply_fds_to_self(actions: Vec<FdAction>) -> Result<(), String> {
     unsafe extern "C" {
         fn dup2(oldfd: i32, newfd: i32) -> i32;
         fn close(fd: i32) -> i32;
     }
-    if dup_stderr_to_stdout {
-        if unsafe { dup2(1, 2) } == -1 {
-            return Err(std::io::Error::last_os_error().to_string());
-        }
-        clear_cloexec(2);
-    }
-    for ef in extra_fds {
+    for ef in actions {
         match ef {
-            ExtraFd::Open { fd, file } => {
+            FdAction::Open { fd, file } => {
                 let srcfd = std::os::unix::io::AsRawFd::as_raw_fd(&file);
                 if unsafe { dup2(srcfd, fd) } == -1 {
                     return Err(std::io::Error::last_os_error().to_string());
@@ -13440,7 +13408,7 @@ fn apply_fds_to_self(dup_stderr_to_stdout: bool, extra_fds: Vec<ExtraFd>) -> Res
                     std::mem::forget(file);
                 }
             }
-            ExtraFd::Dup { fd, source } => {
+            FdAction::Dup { fd, source } => {
                 if unsafe { dup2(source, fd) } == -1 {
                     return Err(std::io::Error::last_os_error().to_string());
                 }
@@ -13450,32 +13418,9 @@ fn apply_fds_to_self(dup_stderr_to_stdout: bool, extra_fds: Vec<ExtraFd>) -> Res
             // error: `{ echo a; } 3>&-` is legal in bash whether or not
             // anything ever opened fd 3, and a script that closes
             // defensively should not have to check first.
-            ExtraFd::Close(fd) => unsafe {
+            FdAction::Close(fd) => unsafe {
                 close(fd);
             },
-        }
-    }
-    Ok(())
-}
-
-// Persists resolve_plain_fd012's raw Files onto this process's own fd
-// 0/1/2, for `exec`'s redirect-only form. Same dup2 + clear_cloexec +
-// forget-on-self-dup pattern as apply_fds_to_self, and for the same
-// reasons (no execve immediately follows to bypass Rust's normal Drop
-// glue the way the pre_exec-based spawn path is protected).
-fn apply_fd012_to_self(stdin: Option<std::fs::File>, stdout: Option<std::fs::File>, stderr: Option<std::fs::File>) -> Result<(), String> {
-    unsafe extern "C" {
-        fn dup2(oldfd: i32, newfd: i32) -> i32;
-    }
-    for (target, file) in [(0, stdin), (1, stdout), (2, stderr)] {
-        let Some(file) = file else { continue };
-        let srcfd = std::os::unix::io::AsRawFd::as_raw_fd(&file);
-        if unsafe { dup2(srcfd, target) } == -1 {
-            return Err(std::io::Error::last_os_error().to_string());
-        }
-        clear_cloexec(target);
-        if srcfd == target {
-            std::mem::forget(file);
         }
     }
     Ok(())
@@ -13491,7 +13436,7 @@ fn clear_cloexec(fd: i32) {
     }
 }
 
-fn apply_fd_redirects(command: &mut Command, dup_stderr_to_stdout: bool, extra_fds: Vec<ExtraFd>) {
+fn apply_fd_redirects(command: &mut Command, actions: Vec<FdAction>) {
     unsafe extern "C" {
         fn dup2(oldfd: i32, newfd: i32) -> i32;
         fn close(fd: i32) -> i32;
@@ -13507,18 +13452,15 @@ fn apply_fd_redirects(command: &mut Command, dup_stderr_to_stdout: bool, extra_f
             // this reset, every external child would silently inherit
             // "ignore SIGINT" too and never respond to Ctrl-C.
             sigaction_raw(2, SIG_DFL);
-            if dup_stderr_to_stdout && dup2(1, 2) == -1 {
-                return Err(std::io::Error::last_os_error());
-            }
-            for ef in &extra_fds {
+            for ef in &actions {
                 match ef {
-                    ExtraFd::Open { fd, file } => {
+                    FdAction::Open { fd, file } => {
                         if dup2(std::os::unix::io::AsRawFd::as_raw_fd(file), *fd) == -1 {
                             return Err(std::io::Error::last_os_error());
                         }
                         clear_cloexec(*fd);
                     }
-                    ExtraFd::Dup { fd, source } => {
+                    FdAction::Dup { fd, source } => {
                         if dup2(*source, *fd) == -1 {
                             return Err(std::io::Error::last_os_error());
                         }
@@ -13526,7 +13468,7 @@ fn apply_fd_redirects(command: &mut Command, dup_stderr_to_stdout: bool, extra_f
                     }
                     // See the same arm in apply_fds_to_self: closing a
                     // descriptor nothing opened is a no-op.
-                    ExtraFd::Close(fd) => {
+                    FdAction::Close(fd) => {
                         close(*fd);
                     }
                 }
