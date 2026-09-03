@@ -196,6 +196,19 @@ mod tests {
         case("unbounded-external-producer-into-a-shell-reader", r#"yes | { read v; echo "got=$v"; }"#),
         case("unbounded-producer-in-the-middle", r#"echo start | { while read l; do echo "$l"; done; } | head -1"#),
         case("reader-leaves-between-two-shell-stages", r#"while true; do echo x; done | { read a; echo "$a"; } | head -1"#),
+        // How *far* the producer got, which is the part a timeout only
+        // notices when the machine is loaded. Two stages share one
+        // thread, and a stage gives it up when it blocks -- so a
+        // producer whose reader is keeping up never blocked, and ran
+        // 32768 times, until the pipe buffer filled, before the reader
+        // took its first turn. Exactly 32768: a 64KB buffer and two
+        // bytes a line. The count is what makes this a guard rather
+        // than a race -- separate processes get fairness from the
+        // kernel, and this asks for the same bound.
+        case(
+            "a-producer-does-not-run-away-from-its-reader",
+            r#"while true; do echo x; echo p >> prod.log; done | { read a; echo "got=$a"; }; n=$(wc -l < prod.log); if [ "$n" -lt 200 ]; then echo bounded; else echo "runaway=$n"; fi"#,
+        ),
         case("both-sides-bounded-but-uneven", r#"seq 1 10000 | { read v; echo "got=$v"; }"#),
         case("subshell-scope", r#"x=1; (x=2); echo $x"#),
         case("subshell-exit", r#"(exit 4); echo $?"#),

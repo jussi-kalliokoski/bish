@@ -428,6 +428,20 @@ fn write_fd_parking(fd: i32, bytes: &[u8]) -> std::io::Result<()> {
             _ => return Err(e),
         }
     }
+    // The write succeeded, so whatever is downstream now has something
+    // to read: hand it the thread before writing more.
+    //
+    // Nothing else here ever would. A stage only gives the thread up
+    // when it *blocks*, and a producer whose reader is keeping up never
+    // blocks -- so `while true; do echo x; done | { read a; ...; }` ran
+    // the producer 32768 times, until the pipe buffer filled, before
+    // the reader got its first turn. Separate processes do not behave
+    // that way, because the kernel preempts them; a cooperative
+    // scheduler has to be told where the fair point is, and the moment
+    // the data becomes readable is it.
+    if crate::coroutine::in_coroutine() {
+        crate::scheduler::park_ready();
+    }
     Ok(())
 }
 
