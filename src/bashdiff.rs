@@ -814,6 +814,34 @@ y
             "compound-fd-swap-then-redirect",
             "`{ echo o; } 3>&1 1>&2 2>&3 3>&- 2>/dev/null` writes the wrong stream; the child-fd resolver has no ordering",
         ),
+        // `cd` resolves symlinks as it goes, so the shell holds the
+        // *physical* path where bash holds the logical one and only
+        // resolves for `pwd -P`. Keeping the logical path means `cd`
+        // tracking a path the filesystem does not agree with -- which
+        // is what bash does, and is a change to how every relative path
+        // in the shell resolves rather than to `cd` alone.
+        ("cd-follows-symlinks-physically", "`cd link; pwd` gives the resolved path; bash keeps the symlinked one until `pwd -P`"),
+        // `${!name}` where `name` is unset: bash calls it an invalid
+        // indirect expansion and stops the script. bish expands it to
+        // nothing and carries on. Matching means a new fatal-expansion
+        // path, worth doing deliberately rather than in passing -- it
+        // turns scripts that work today into scripts that abort.
+        ("indirect-expansion-of-an-unset-name", "`${!nosuch}` expands to nothing; bash reports `invalid indirect expansion` and stops"),
+        // Two arithmetic literals at the edges: bash rejects `1e2`
+        // (there are no floats) and takes a bare `0x` as zero. bish has
+        // them the other way round.
+        ("arithmetic-literal-edges", "`$((1e2))` is 1 here and an error in bash; `$((0x))` is an error here and 0 in bash"),
+        // The builtin *set* differs, legitimately: bish has builtins
+        // bash does not (`abbr`, `win`, `::bish`) and lacks `bind` and
+        // `logout`. Listed rather than fixed because the difference is
+        // the point -- the list is honest about what this shell has.
+        ("compgen-b-lists-this-shells-builtins", "`compgen -b` lists bish's own builtins and not bash's `bind`/`logout`"),
+        // `wait -n` once every job has already finished: bash still has
+        // one to report and answers with its status, bish has reaped
+        // them and answers 127. A finished job would have to stay
+        // reportable until something asks, which is a change to when
+        // jobs are retired.
+        ("wait-n-after-everything-finished", "`: & : & wait -n` gives 127; bash reports the finished job's status"),
     ];
 
     // The cases the divergence list is about. Kept apart from `CASES`
@@ -822,6 +850,11 @@ y
         case("set-o-lists-fewer-options", r#"set -o | wc -l"#),
         case("function-body-formatting", r#"f() { :; }; declare -f f"#),
         case("compound-fd-swap-then-redirect", r#"{ echo o; echo e >&2; } 3>&1 1>&2 2>&3 3>&- 2>/dev/null"#),
+        case("cd-follows-symlinks-physically", r#"mkdir -p real; ln -s real link; cd link; pwd | sed "s|.*/||""#),
+        case("indirect-expansion-of-an-unset-name", r#"echo "[${!nosuch}]"; echo "rc=$?""#),
+        case("arithmetic-literal-edges", r#"( echo $((1e2)) ) 2>/dev/null; echo "rc=$?"; ( echo $((0x)) ) 2>/dev/null; echo "rc=$?""#),
+        case("compgen-b-lists-this-shells-builtins", r#"compgen -b | sort | head -3 | tr '\n' ' '; echo"#),
+        case("wait-n-after-everything-finished", r#": & : & wait -n; echo "rc=$?""#),
         // -- roadmap 10: parser leniency, the part still standing -----
         // Also not recordable, and for the same kind of reason: a
         // signal this shell was *started* with ignored is reported by

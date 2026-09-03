@@ -6710,6 +6710,23 @@ impl Shell {
                 return ExecResult::Status(0);
             }
             "cd" => return ExecResult::Status(crate::builtins::dirs::run_cd(self, &argv[1..])),
+            // A builtin, as it is in bash, and not for tidiness: it has
+            // to report the *shell's* idea of where it is, it has to
+            // work when PATH is empty, and `type pwd` has to say so.
+            // Resolving to /usr/bin/pwd meant all three were wrong.
+            "pwd" => {
+                // `-P` is the resolved path and `-L` the one the shell
+                // holds; they are the same here, because `cd` resolves
+                // symlinks as it goes (see the divergence recorded for
+                // that in bashdiff).
+                let physical = argv[1..].iter().any(|a| a == "-P");
+                let here = match physical {
+                    true => std::fs::canonicalize(&self.cwd).unwrap_or_else(|_| self.cwd.clone()),
+                    false => self.cwd.clone(),
+                };
+                sh_println!(self, "{}", here.display());
+                return ExecResult::Status(0);
+            }
             // `e [ARG...]`: bubbles up via ExecResult::Edit -- see its
             // own doc comment, and Fg's, for why this can't just be
             // driven from here directly. The arguments are passed on
@@ -14215,6 +14232,7 @@ pub(crate) const BUILTIN_HELP: &[(&str, &str)] = &[
     ("builtin", "Run a builtin, ignoring any function or `enable -n`."),
     ("caller", "Show where the current function was called from."),
     ("cd", "Change the working directory."),
+    ("pwd", "Print the working directory."),
     ("command", "Run a command, ignoring any function of the same name."),
     ("compgen", "Generate the completions a `complete` spec would offer."),
     ("complete", "Say how a command's arguments should be completed."),
@@ -14290,6 +14308,7 @@ pub(crate) const KNOWN_BUILTINS: &[&str] = &[
     // `every_dispatched_builtin_is_known`.
     "json",
     "cd",
+    "pwd",
     "e",
     "export",
     "let",
