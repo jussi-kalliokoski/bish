@@ -800,6 +800,28 @@ y
         case("prefix-listing-finds-computed-names", r#"echo "${!BASHO*}" "${!BASHP*}" "${!BASH_SUB*}" "${!EUI*}""#),
         // BASH_VERSINFO is readonly, which `declare -p` reports.
         case("bash-versinfo-is-readonly", r#"declare -p BASH_VERSINFO | cut -c1-14"#),
+        // `&` makes a job, which means a child. Only an external and a
+        // subshell took any notice of it: a builtin, a function, a
+        // group, a loop and a bare assignment all ran in this shell,
+        // synchronously, registering nothing -- so `$!` was unset,
+        // `wait` had nothing to collect, the construct's own state
+        // leaked into the shell, and an `exit` inside one took the
+        // whole shell down.
+        //
+        // Nothing here asserts an *ordering* between what a background
+        // job prints and what the shell prints next: that is a race in
+        // both shells. `wait` first, then look.
+        case("backgrounding-a-builtin", r#": & wait -n; echo "rc=$?"; false & wait -n; echo "rc=$?""#),
+        case("backgrounding-a-function", r#"f(){ echo a; }; f & wait -n; echo "rc=$?""#),
+        case("an-exit-in-a-background-job-is-the-jobs-exit", r#"f(){ exit 5; }; f & wait -n; echo "rc=$?"; echo alive"#),
+        case("a-background-group-does-not-touch-this-shell", r#"v=0; { v=1; } & wait; echo "[$v]""#),
+        case("a-background-function-does-not-touch-this-shell", r#"v=0; f(){ v=1; }; f & wait; echo "[$v]""#),
+        case("a-background-assignment-does-not-touch-this-shell", r#"x=0; x=1 & wait; echo "[$x]""#),
+        case("backgrounding-a-loop", r#"for i in 1; do echo $i; done & wait -n; echo "rc=$?""#),
+        case("backgrounding-a-conditional", r#"if true; then echo a; fi & wait -n; echo "rc=$?""#),
+        case("a-backgrounded-builtin-sets-the-pid-variable", r#"echo "[$!]"; : & echo "[${!:+pid}]""#),
+        case("a-backgrounded-builtin-keeps-its-redirect", r#"echo a > o & wait; cat o"#),
+        case("two-background-jobs-are-both-collected", r#": & : & wait -n; echo "rc=$?"; wait -n; echo "rc=$?""#),
         // `declare -f`'s layout is this shell's own (recorded as a
         // divergence), but what the output has to *do* is the same in
         // both: define the function again when another shell reads it
@@ -878,12 +900,6 @@ y
         // `logout`. Listed rather than fixed because the difference is
         // the point -- the list is honest about what this shell has.
         ("compgen-b-lists-this-shells-builtins", "`compgen -b` lists bish's own builtins and not bash's `bind`/`logout`"),
-        // `wait -n` once every job has already finished: bash still has
-        // one to report and answers with its status, bish has reaped
-        // them and answers 127. A finished job would have to stay
-        // reportable until something asks, which is a change to when
-        // jobs are retired.
-        ("wait-n-after-everything-finished", "`: & : & wait -n` gives 127; bash reports the finished job's status"),
     ];
 
     // The cases the divergence list is about. Kept apart from `CASES`
@@ -893,7 +909,6 @@ y
         case("function-body-formatting", r#"f() { :; }; declare -f f"#),
         case("cd-follows-symlinks-physically", r#"mkdir -p real; ln -s real link; cd link; pwd | sed "s|.*/||""#),
         case("compgen-b-lists-this-shells-builtins", r#"compgen -b | sort | head -3 | tr '\n' ' '; echo"#),
-        case("wait-n-after-everything-finished", r#": & : & wait -n; echo "rc=$?""#),
         // -- roadmap 10: parser leniency, the part still standing -----
         // Also not recordable, and for the same kind of reason: a
         // signal this shell was *started* with ignored is reported by

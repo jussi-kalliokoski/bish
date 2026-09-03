@@ -423,6 +423,23 @@ pub(crate) fn run_command(sh: &mut Shell, cmd: &parser::Command, background: boo
     if !redirects.is_empty() {
         return sh.run_compound_redirected(cmd, redirects, background);
     }
+    // `&` on a compound is a job, which means a *child*. Only a simple
+    // command and a subshell took any notice of it; every other kind
+    // ran in this shell, synchronously, and registered no job -- so
+    // `{ ...; } &` finished before the next command started, `$!` was
+    // unset and `wait` had nothing to wait for. Worse, it ran in this
+    // shell's own state: `v=0; { v=1; } &` left `v` at 1 where bash
+    // leaves it at 0, and an `exit` inside one took the whole shell
+    // down with it.
+    //
+    // A compound carrying redirects already went this way; this is the
+    // same route for one that carries none. Simple commands are their
+    // own case (see dispatch_builtin_or_external), and a subshell and a
+    // coproc both already background themselves.
+    let backgrounds_itself = matches!(cmd, parser::Command::Simple(_) | parser::Command::Subshell(..) | parser::Command::Coproc { .. });
+    if background && !backgrounds_itself {
+        return sh.run_compound_redirected(cmd, &[], true);
+    }
     sh.run_command_body(cmd, background)
 }
 

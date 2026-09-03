@@ -4809,6 +4809,17 @@ impl Shell {
         if !background {
             return self.run_in_child_shell(raw, ChildStdio::default()).status();
         }
+        self.spawn_background_script(raw, format!("({})", raw))
+    }
+
+    /// Runs `raw` as a background job: a real child, with this shell's
+    /// functions in front of it, its own pty, and an entry in the job
+    /// table so `$!`, `jobs` and `wait` can all see it.
+    ///
+    /// What `( ) &` has always done, and what `&` on anything else that
+    /// runs in this shell -- a group, a loop, a builtin, a function --
+    /// now does too. `label` is what `jobs` shows.
+    fn spawn_background_script(&mut self, raw: &str, label: String) -> i32 {
         let exe = match std::env::current_exe() {
             Ok(p) => p,
             Err(e) => {
@@ -4833,7 +4844,7 @@ impl Shell {
         };
         match spawned {
             Ok((child, master)) => {
-                self.push_job_with_pty(vec![child], format!("({})", raw), master);
+                self.push_job_with_pty(vec![child], label, master);
                 0
             }
             Err(e) => {
@@ -6272,6 +6283,21 @@ impl Shell {
         // it is to see what is about to run.
         self.run_pseudo_trap(PseudoTrap::Debug);
         if cmd.words.is_empty() {
+            // An assignment-only command is still a command, so `&`
+            // makes it a job -- one whose whole effect is discarded
+            // with the child, which is exactly what bash does with
+            // `x=1 &`. Left running here it set the variable in this
+            // shell and registered nothing.
+            if background && cmd.array_assigns.is_empty() {
+                let mut script = String::new();
+                for (name, mode, val) in &cmd.assigns {
+                    let v = self.expand_word(val);
+                    let op = if *mode == AssignMode::Append { "+=" } else { "=" };
+                    script.push_str(&format!("{}{}{} ", name, op, crate::serialize::quote_literal(&v)));
+                }
+                let label = script.trim_end().to_string();
+                return ExecResult::Status(self.spawn_background_script(&script, label));
+            }
             // A refused write (readonly name) is the whole command's
             // failure, not a silent no-op -- `set -e` and an explicit
             // `|| exit` both depend on seeing it.
@@ -6429,6 +6455,39 @@ impl Shell {
             sh_eprintln!(self, "{}{}", ps4, words.join(" "));
         }
         let name = argv[0].clone();
+
+        // `&` on a builtin or a function is a job, which means a child.
+        // Only an external took any notice of it here: everything else
+        // ran in this shell, synchronously, registering no job -- so
+        // `echo a &` left `$!` unset and `wait` with nothing to collect,
+        // and `f() { exit 5; }; f &` took the whole shell down with it.
+        //
+        // The child is handed the words this shell has *already
+        // expanded*, quoted, rather than the source text: the
+        // expansions have happened, and a `$( )` among them must not
+        // run a second time. Its redirects go as written, since nothing
+        // has expanded those yet.
+        //
+        // A `declare`-family array literal is the exception. Its display
+        // text is not the source it was parsed from, so there is
+        // nothing honest to hand a child -- and backgrounding a
+        // declaration has no observable effect anyway.
+        let runs_in_this_shell = self.is_active_builtin(&name) || (!self.restrict_to_builtins && self.functions.contains_key(&name));
+        if background && runs_in_this_shell && cmd.array_assigns.is_empty() && cmd.array_word_assigns.is_empty() {
+            let mut script = String::new();
+            for (n, mode, val) in &cmd.assigns {
+                let v = self.expand_word(val);
+                let op = if *mode == AssignMode::Append { "+=" } else { "=" };
+                script.push_str(&format!("{}{}{} ", n, op, crate::serialize::quote_literal(&v)));
+            }
+            script.push_str(&argv.iter().map(|w| crate::serialize::quote_literal(w)).collect::<Vec<_>>().join(" "));
+            for r in &cmd.redirects {
+                script.push(' ');
+                script.push_str(&crate::serialize::serialize_redirect(r));
+            }
+            let label = script.clone();
+            return ExecResult::Status(self.spawn_background_script(&script, label));
+        }
 
         // Functions shadow builtins, matching real bash (confirmed: even
         // POSIX "special" builtins like `export`/`return`/`break` are
