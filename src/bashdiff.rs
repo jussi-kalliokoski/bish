@@ -524,6 +524,15 @@ y
         // Expressing it wants the sink's stdout/stderr fields to hold a
         // small enum (a file, or the enclosing out/err) rather than a
         // file plus two flags.
+        // Pre-existing, and named now that `<( )` streams and the two
+        // are visibly different mechanisms. `>( )` as an *argument*
+        // works -- `tee >(wc -l)` -- because the name is a file the
+        // enclosing command writes and the substitution reads back
+        // afterwards. As a redirect *target*, `> >(cat)`, nothing
+        // arrives: the write goes somewhere the queued reader never
+        // looks. Doing it properly is the same shape as the streaming
+        // input side, with the pipe pointing the other way.
+        ("proc-sub-out-as-a-redirect-target", "`echo hi > >(cat)` produces nothing; bash prints hi"),
         (
             "dup-to-stderr-that-is-itself-redirected",
             "`echo e >&2 2>/dev/null` writes to /dev/null; bash writes to the stderr `>&2` named, which is the one from before this command",
@@ -535,6 +544,7 @@ y
     const PENDING: &[Case] = &[
         // -- roadmap 10: parser leniency, the part still standing -----
         case("empty-command-between-separators", "echo a; ; echo b"),
+        case("proc-sub-out-as-a-redirect-target", r#"echo hi > >(cat)"#),
         case("dup-to-stderr-that-is-itself-redirected", r#"echo e >&2 2>/dev/null; echo done"#),
     ];
 
