@@ -3915,8 +3915,26 @@ impl Shell {
             return Err(RESTRICTED.to_string());
         }
         let old = self.cwd.to_string_lossy().into_owned();
-        std::env::set_current_dir(target).map_err(|e| os_message(&e))?;
-        self.cwd = std::env::current_dir().unwrap_or_else(|_| target.to_path_buf());
+        // The *logical* path, not what `getcwd` reports. A shell
+        // remembers the route you took: `cd link` leaves `$PWD` ending
+        // in `link` and a following `cd ..` goes back to where `link`
+        // sits, not to the parent of whatever it points at. Taking
+        // `current_dir()` here resolved every symlink instead, so the
+        // route was lost the moment it was walked -- `pwd` answered
+        // what only `pwd -P` should.
+        //
+        // Falling back to the resolved path if the lexical one cannot
+        // be entered: `..` is removed textually, which is the whole
+        // point, and on a path that has been rearranged underneath the
+        // shell that can name somewhere that no longer exists.
+        let logical = logical_path(&self.cwd, target);
+        match std::env::set_current_dir(&logical) {
+            Ok(()) => self.cwd = logical,
+            Err(_) => {
+                std::env::set_current_dir(target).map_err(|e| os_message(&e))?;
+                self.cwd = std::env::current_dir().unwrap_or_else(|_| target.to_path_buf());
+            }
+        }
         let new = self.cwd.to_string_lossy().into_owned();
         // Not written to the real environment: `PWD` and `OLDPWD` are
         // exported shell variables, and a child gets them the way it
@@ -14910,6 +14928,38 @@ pub(crate) fn resolve_in_path(name: &str, path_var: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// `base` and `target` joined and then normalised *textually* -- `.`
+/// dropped, `..` cancelling the component in front of it -- without
+/// asking the filesystem anything.
+///
+/// This is what makes a shell's `cd` remember the route rather than the
+/// destination. `a/link/..` is `a` here, where the kernel would answer
+/// with the parent of whatever `link` points at; both are defensible
+/// and a shell picks the first, which is why `cd -P` exists to ask for
+/// the other.
+fn logical_path(base: &std::path::Path, target: &std::path::Path) -> std::path::PathBuf {
+    use std::path::Component;
+    let joined = if target.is_absolute() { target.to_path_buf() } else { base.join(target) };
+    let mut parts: Vec<std::ffi::OsString> = Vec::new();
+    for component in joined.components() {
+        match component {
+            Component::Prefix(_) | Component::RootDir => parts.clear(),
+            Component::CurDir => {}
+            // At the root there is nothing above to go to, and bash
+            // leaves `/..` as `/`.
+            Component::ParentDir => {
+                parts.pop();
+            }
+            Component::Normal(part) => parts.push(part.to_os_string()),
+        }
+    }
+    let mut out = std::path::PathBuf::from("/");
+    for part in parts {
+        out.push(part);
+    }
+    out
 }
 
 pub(crate) fn command_own_redirects(cmd: &parser::Command) -> &[Redirect] {

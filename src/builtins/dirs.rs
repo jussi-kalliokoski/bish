@@ -6,12 +6,15 @@
 use crate::exec::{RESTRICTED, Shell, sh_eprintln, sh_println};
 
 pub(crate) fn run_cd(sh: &mut Shell, args: &[String]) -> i32 {
-    // `-L`/`-P` (follow symlinks or resolve them) are accepted and
-    // ignored: this shell has only ever had the logical behaviour, and
-    // a script that writes `cd -P` is asking for something stricter
-    // than it gets rather than for something wrong. What is *not*
-    // ignored is a second operand -- bash rejects that, and accepting
-    // it silently hid a typo'd path.
+    // `-P` resolves symlinks; `-L`, the default, keeps the route you
+    // took (see Shell::change_directory). The comment that used to sit
+    // here said this shell had "only ever had the logical behaviour"
+    // and that `-P` was therefore safe to ignore -- it was the other
+    // way round, and `-P` was the only behaviour there was.
+    //
+    // What is *not* ignored is a second operand: bash rejects that, and
+    // accepting it silently hid a typo'd path.
+    let physical = args.iter().rposition(|a| a == "-P" || a == "-L").is_some_and(|i| args[i] == "-P");
     let operands: Vec<&String> = args.iter().filter(|a| !matches!(a.as_str(), "-L" | "-P" | "-@" | "-e")).collect();
     if operands.len() > 1 {
         // 2, not 1: bash reserves 2 for a builtin's own usage error
@@ -60,7 +63,14 @@ pub(crate) fn run_cd(sh: &mut Shell, args: &[String]) -> i32 {
     // courtesy: without it, `cd bish` silently putting you somewhere
     // other than `./bish` would be the worst kind of surprise.
     let (target, from_cdpath) = sh.resolve_cdpath(target);
-    match sh.change_directory(std::path::Path::new(&target)) {
+    // `-P` asks for the destination rather than the route, which is
+    // what resolving it up front gives: the lexical normalisation
+    // inside `change_directory` then has nothing left to cancel.
+    let resolved = match physical {
+        true => std::fs::canonicalize(&target).unwrap_or_else(|_| std::path::PathBuf::from(&target)),
+        false => std::path::PathBuf::from(&target),
+    };
+    match sh.change_directory(&resolved) {
         Ok(()) => {
             if from_cdpath {
                 sh_println!(sh, "{}", sh.cwd.display());

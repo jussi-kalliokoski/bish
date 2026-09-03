@@ -635,6 +635,17 @@ y
         case("cd-uses-the-shells-home", r#"mkdir -p h; HOME=$PWD/h; cd; [ "$PWD" = "$(cd h 2>/dev/null; pwd)" ] || pwd"#),
         case("cd-dash-uses-the-shells-oldpwd", r#"mkdir -p a b; cd a; cd ../b; cd - > /dev/null; basename "$PWD""#),
         case("cd-with-no-home-fails", r#"unset HOME; cd 2>/dev/null; echo "rc=$?""#),
+        // A shell remembers the route, not the destination: `cd link`
+        // leaves `$PWD` ending in `link`, and `cd ..` from there goes
+        // back to where `link` sits rather than to the parent of what
+        // it points at. Storing what `getcwd` reported resolved every
+        // symlink instead, so `pwd` answered what only `pwd -P` should
+        // -- and `cd -P`, documented here as an accepted no-op, was in
+        // fact the only behaviour there was.
+        case("cd-keeps-the-route-it-was-given", r#"mkdir -p b/c; ln -s b/c link; cd link; echo "${PWD##*/}"; pwd -P | sed 's|.*/\(.\)$|\1|'"#),
+        case("cd-dot-dot-is-lexical", r#"mkdir -p b/c; ln -s b/c link; cd link; cd ..; echo "${PWD##*/}""#),
+        case("cd-physical-resolves-first", r#"mkdir -p b/c; ln -s b/c link; cd -P link; echo "${PWD##*/}"; cd ..; echo "${PWD##*/}""#),
+        case("cd-normalises-dots-it-was-given", r#"mkdir -p b/c; cd ./b/../b/c; echo "${PWD##*/}""#),
         case("cd-dash-with-no-oldpwd-fails", r#"unset OLDPWD; cd - 2>/dev/null; echo "rc=$?""#),
         // Unsetting a variable that came from the environment has to
         // actually unset it. The lookups ended in a real-environment
@@ -888,13 +899,6 @@ y
         // What the output has to *do* is checked in CASES: it defines
         // the function again when another shell reads it back.
         ("function-body-formatting", "`declare -f f` reconstructs the body in bish's own layout, not bash's"),
-        // `cd` resolves symlinks as it goes, so the shell holds the
-        // *physical* path where bash holds the logical one and only
-        // resolves for `pwd -P`. Keeping the logical path means `cd`
-        // tracking a path the filesystem does not agree with -- which
-        // is what bash does, and is a change to how every relative path
-        // in the shell resolves rather than to `cd` alone.
-        ("cd-follows-symlinks-physically", "`cd link; pwd` gives the resolved path; bash keeps the symlinked one until `pwd -P`"),
         // The builtin *set* differs, legitimately: bish has builtins
         // bash does not (`abbr`, `win`, `::bish`) and lacks `bind` and
         // `logout`. Listed rather than fixed because the difference is
@@ -907,7 +911,6 @@ y
     const PENDING: &[Case] = &[
         case("set-o-lists-fewer-options", r#"set -o | wc -l"#),
         case("function-body-formatting", r#"f() { :; }; declare -f f"#),
-        case("cd-follows-symlinks-physically", r#"mkdir -p real; ln -s real link; cd link; pwd | sed "s|.*/||""#),
         case("compgen-b-lists-this-shells-builtins", r#"compgen -b | sort | head -3 | tr '\n' ' '; echo"#),
         // -- roadmap 10: parser leniency, the part still standing -----
         // Also not recordable, and for the same kind of reason: a
