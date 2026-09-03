@@ -240,6 +240,12 @@ mod tests {
         case("command-subst", r#"echo "$(printf a)$(printf b)""#),
         case("command-subst-backtick", "echo \"`printf a`\""),
         case("process-subst", r#"cat <(printf 'p\n')"#),
+        // The content is right whichever way round, and only reached a
+        // builtin's redirect once every simple command drained.
+        case("proc-sub-out-to-a-builtins-redirect", r#"echo hi > >(cat)"#),
+        case("proc-sub-out-to-an-externals-redirect", r#"/bin/echo hi > >(cat)"#),
+        case("proc-sub-out-that-answers-at-eof", r#"printf 'a\nb\n' > >(wc -l)"#),
+        case("proc-sub-out-as-an-argument", r#"tee >(wc -l) < /etc/hostname > /dev/null"#),
         // `<( )` streams: the producer is a coroutine given time while
         // the shell waits for whatever is consuming it, rather than
         // being run to completion into a temp file first. The two that
@@ -547,15 +553,27 @@ y
         // Expressing it wants the sink's stdout/stderr fields to hold a
         // small enum (a file, or the enclosing out/err) rather than a
         // file plus two flags.
-        // Pre-existing, and named now that `<( )` streams and the two
-        // are visibly different mechanisms. `>( )` as an *argument*
-        // works -- `tee >(wc -l)` -- because the name is a file the
-        // enclosing command writes and the substitution reads back
-        // afterwards. As a redirect *target*, `> >(cat)`, nothing
-        // arrives: the write goes somewhere the queued reader never
-        // looks. Doing it properly is the same shape as the streaming
-        // input side, with the pipe pointing the other way.
-        ("proc-sub-out-as-a-redirect-target", "`echo hi > >(cat)` produces nothing; bash prints hi"),
+        // `>( )` produces the right bytes but at the wrong time. bish
+        // runs the body once the enclosing command has finished, over
+        // a temp file; bash runs it concurrently, so
+        // `echo hi > >(cat); echo done` prints `done hi` there and
+        // `hi done` here.
+        //
+        // Making it concurrent is the mirror of what `<( )` already
+        // does and was attempted: the machinery works, and the two
+        // traps in it are worth writing down for whoever picks it up.
+        // A body must not inherit the far end of its own pipe -- the
+        // `/dev/fd/N` name needs close-on-exec cleared, and doing that
+        // before the body is started leaves it holding its own input
+        // open, so `>(wc -l)` never reaches end-of-input and answers
+        // nothing while `>(cat)` looks fine by echoing as it reads.
+        // And a `>( )` body must not be stopped when the command ends
+        // the way a `<( )` body must: it has just been handed its
+        // input and has not written its answer, which cost `tee` its
+        // buffered file. What was not solved is an unbounded *shell*
+        // body -- `head -3 <(while true; do echo x; done)` printed its
+        // three lines and then hung.
+        ("proc-sub-out-ordering", "`echo hi > >(cat); echo done` prints `hi done`; bash prints `done hi`, running the body concurrently"),
         (
             "dup-to-stderr-that-is-itself-redirected",
             "`echo e >&2 2>/dev/null` writes to /dev/null; bash writes to the stderr `>&2` named, which is the one from before this command",
@@ -567,7 +585,7 @@ y
     const PENDING: &[Case] = &[
         // -- roadmap 10: parser leniency, the part still standing -----
         case("empty-command-between-separators", "echo a; ; echo b"),
-        case("proc-sub-out-as-a-redirect-target", r#"echo hi > >(cat)"#),
+        case("proc-sub-out-ordering", r#"echo hi > >(cat); echo done"#),
         case("dup-to-stderr-that-is-itself-redirected", r#"echo e >&2 2>/dev/null; echo done"#),
     ];
 

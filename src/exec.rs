@@ -6158,6 +6158,13 @@ impl Shell {
         let restore = self.apply_prefix_assigns(cmd);
         let result = self.dispatch_builtin_or_external(&argv, name, cmd, background, false, &array_literal_args);
         self.restore_prefix_assigns(restore);
+        // Every simple command returns through here, which is the
+        // point: the drains inside the dispatch above are all on the
+        // *external* paths, so a `>( )` used by a builtin was queued and
+        // never run at all. `echo hi > >(cat)` produced nothing while
+        // `/bin/echo hi > >(cat)` worked. Cheap when nothing is queued,
+        // and a no-op when one of those inner drains has already run.
+        self.drain_proc_subs();
         result
     }
 

@@ -66,6 +66,38 @@ pub fn park_writable(fd: RawFd) {
     crate::coroutine::yield_now();
 }
 
+thread_local! {
+    /// Whether a scheduler is already driving a coroutine on this
+    /// thread.
+    ///
+    /// Both entry points below begin by recording fd 0 and fd 1 as "the
+    /// shell's own", to install per task and to restore at the end. If
+    /// one runs while another has a task's pipes installed, it records
+    /// *those* as the shell's -- then hands them to every task with
+    /// none of its own, and restores them when it finishes. The shell
+    /// is left with a pipeline stage's pipe as its stdout, and three
+    /// descriptors on one pipe, which is what a hung shell was found
+    /// holding.
+    ///
+    /// It happens when a pipeline stage pumps: the stage is driven by
+    /// one scheduler, and `Shell::pump_coroutines` reaches for the
+    /// shared background one -- a different object, so not excluded by
+    /// borrowing. Nesting is never wanted anyway: the outer scheduler
+    /// is already giving this thread's coroutines their turns. Only
+    /// showed up under load, which is when a stage pumps often enough
+    /// to land inside one.
+    static DRIVING: Cell<bool> = const { Cell::new(false) };
+}
+
+/// `true` if this call took the guard, and so must give it back.
+fn take_driving() -> bool {
+    !DRIVING.replace(true)
+}
+
+fn release_driving() {
+    DRIVING.set(false);
+}
+
 struct Task {
     co: Box<Coroutine>,
     park: Park,
@@ -160,7 +192,7 @@ impl Scheduler {
     /// Blocking here would be wrong in a way it is not in `run`: the
     /// caller has its own reason to come back.
     pub fn step(&mut self) {
-        if self.is_idle() {
+        if self.is_idle() || !take_driving() {
             return;
         }
         let saved = crate::exec::save_fd012_for_scheduler();
@@ -182,6 +214,7 @@ impl Scheduler {
             }
         }
         crate::exec::restore_fd012_for_scheduler(saved);
+        release_driving();
     }
 
     /// Stops every task that is still running: nothing is going to read
@@ -221,12 +254,16 @@ impl Scheduler {
     /// decide about, since a panicking pipeline stage is not something
     /// this can sensibly recover from on its own.
     pub fn run(&mut self) -> bool {
+        if !take_driving() {
+            return false;
+        }
         // Restored before returning, and while sleeping in `poll`: the
         // shell that started this still owns fd 0 and fd 1 whenever no
         // task is running on them.
         let saved = crate::exec::save_fd012_for_scheduler();
         let panicked = self.run_tasks(saved);
         crate::exec::restore_fd012_for_scheduler(saved);
+        release_driving();
         panicked
     }
 
