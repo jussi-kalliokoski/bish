@@ -528,6 +528,21 @@ y
         case("close-an-unopened-fd", r#"{ echo a; } 3>&-; echo b 4>&-"#),
         case("dup-to-a-word-fd", r#"exec 3>&1; f=3; echo hi >&$f; echo two >&$((1+2)); exec 3>&-"#),
         case("dup-to-a-closed-fd", r#"echo x >&9; echo "rc=$?""#),
+        // A dup names the descriptor as it stands *at that point in the
+        // list*, so these two are different destinations and not one
+        // rule with an exception. Both spellings, because a builtin
+        // resolves its redirects through the output sink and a compound
+        // command through its child shell's -- two code paths that both
+        // used to collapse the pair into "wherever the other stream
+        // ends up", which silently sent the first case to /dev/null.
+        case("dup-to-stderr-that-is-itself-redirected", r#"echo e >&2 2>/dev/null; echo done"#),
+        case("dup-to-stderr-that-was-already-redirected", r#"echo e 2>/dev/null >&2; echo done"#),
+        case("compound-dup-to-stderr-that-is-itself-redirected", r#"{ echo e; } >&2 2>/dev/null; echo done"#),
+        case("compound-dup-to-stderr-that-was-already-redirected", r#"{ echo e; } 2>/dev/null >&2; echo done"#),
+        // Both streams on one destination share a write position --
+        // opened once, or duped, but never opened twice.
+        case("both-streams-one-file-keeps-one-position", r#"{ echo out; echo err >&2; } >f 2>&1; cat f"#),
+        case("dup-before-the-redirect-it-would-have-followed", r#"{ echo a; echo b >&2; } 2>&1 >f; cat f; echo "--""#),
         case("coproc-round-trip", r#"coproc CP { cat; }; echo hi >&"${CP[1]}"; sleep 0.2; read -r l <&"${CP[0]}"; echo "back=[$l]""#),
         // -- roadmap 20: a lone bracket is not a pattern ---------------
         case("lone-bracket-is-literal", r#"printf '%s,' [ ] '[abc'; echo; [ 1 -lt 2 ] && echo test-works"#),
@@ -565,23 +580,6 @@ y
         // empty array and does print `=()`. bish creates the (empty)
         // map at declaration and cannot tell the two apart afterwards.
         ("declare-p-of-a-declared-but-unassigned-array", "`declare -a A; declare -p A` prints `declare -a A=()`; bash prints `declare -a A`"),
-        // Pre-existing, and named now that the redirect simulation made
-        // the rest of the list exact: `>&2` means "the enclosing
-        // stderr", and OutputSink::Builtin's two booleans can only say
-        // "this sink's other stream, else the enclosing one" -- a
-        // different thing once the same command also redirects fd 2.
-        // Pre-existing, and named now that the redirect simulation made
-        // the rest of the list exact: `>&2` means "the enclosing
-        // stderr", and OutputSink::Builtin's two booleans can only say
-        // "this sink's other stream, else the enclosing one" -- a
-        // different thing once the same command also redirects fd 2.
-        // Expressing it wants the sink's stdout/stderr fields to hold a
-        // small enum (a file, or the enclosing out/err) rather than a
-        // file plus two flags.
-        (
-            "dup-to-stderr-that-is-itself-redirected",
-            "`echo e >&2 2>/dev/null` writes to /dev/null; bash writes to the stderr `>&2` named, which is the one from before this command",
-        ),
     ];
 
     // The cases the divergence list is about. Kept apart from `CASES`
@@ -596,7 +594,6 @@ y
         // there instead. Seeing it needs the shell under test invoked
         // *by path*, and both shells report `$0` as a bare name, so a
         // case cannot name the thing it is testing.
-        case("dup-to-stderr-that-is-itself-redirected", r#"echo e >&2 2>/dev/null; echo done"#),
     ];
 
     // `target/<profile>/bish`, worked out from the test binary's own

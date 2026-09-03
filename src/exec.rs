@@ -46,19 +46,35 @@ pub(crate) enum OutputSink {
     // redirects -- previously builtins ignored per-command redirects
     // entirely (see plan.md), which mattered for real activation scripts
     // (mise, nvm, ...) relying on `declare -p foo >/dev/null 2>&1`-style
-    // guards being silent. `stdout`/`stderr` are `None` when that stream
-    // has no redirect of its own, falling through to `previous`;
-    // `dup_err_to_out`/`dup_out_to_err` make one stream follow wherever
-    // the other currently resolves to (an explicit file if that stream has
-    // one, `previous`'s own stream otherwise), matching `2>&1`/`1>&2`
-    // without needing to know in advance what "wherever it goes" means.
-    Builtin {
-        previous: Box<OutputSink>,
-        stdout: Option<Rc<RefCell<std::fs::File>>>,
-        stderr: Option<Rc<RefCell<std::fs::File>>>,
-        dup_err_to_out: bool,
-        dup_out_to_err: bool,
-    },
+    // guards being silent. Each stream says where it goes; a stream with
+    // no redirect of its own says so by naming the enclosing sink's
+    // matching side.
+    Builtin { previous: Box<OutputSink>, stdout: SinkStream, stderr: SinkStream },
+}
+
+// Where one of a redirected builtin's two streams ends up.
+//
+// A dup names the descriptor *as the command found it*, which is the
+// whole reason this is three cases and not a file plus a "follows the
+// other one" flag: in
+//
+//     echo e >&2 2>/dev/null
+//
+// `>&2` copies fd 2 before the `2>` rebinds it, so the line still
+// prints on the terminal. A flag can only point at this sink's own
+// stderr field, which by then is /dev/null -- the output vanished.
+// Naming the *enclosing* sink instead keeps the two apart.
+#[derive(Clone)]
+pub(crate) enum SinkStream {
+    // The enclosing sink's stdout: no redirect of its own, or a `2>&1`
+    // whose fd 1 this command never rebound.
+    OuterOut,
+    // The enclosing sink's stderr, likewise.
+    OuterErr,
+    // A file this command's own redirects opened. Two streams that end
+    // up on one destination hold the same `Rc`, and so share a write
+    // position -- `>file 2>&1` must not have them overwrite each other.
+    File(Rc<RefCell<std::fs::File>>),
 }
 
 // Emulates the real terminal's ONLCR postprocessing (translating outgoing
@@ -128,20 +144,11 @@ impl OutputSink {
             }
             OutputSink::Grid(screen) => screen.borrow_mut().feed(onlcr(s).as_bytes()),
             OutputSink::Capture(buf) => buf.borrow_mut().push_str(s),
-            OutputSink::Builtin { previous, stdout, stderr, dup_err_to_out: _, dup_out_to_err } => {
-                if *dup_out_to_err {
-                    // `1>&2`: stdout follows wherever stderr resolves to.
-                    match stderr {
-                        Some(f) => note_write(write_all_parking(&mut f.borrow_mut(), s.as_bytes())),
-                        None => previous.write_err(s),
-                    }
-                } else {
-                    match stdout {
-                        Some(f) => note_write(write_all_parking(&mut f.borrow_mut(), s.as_bytes())),
-                        None => previous.write_out(s),
-                    }
-                }
-            }
+            OutputSink::Builtin { previous, stdout, .. } => match stdout {
+                SinkStream::OuterOut => previous.write_out(s),
+                SinkStream::OuterErr => previous.write_err(s),
+                SinkStream::File(f) => note_write(write_all_parking(&mut f.borrow_mut(), s.as_bytes())),
+            },
         }
     }
 
@@ -153,21 +160,13 @@ impl OutputSink {
             }
             OutputSink::Grid(screen) => screen.borrow_mut().feed(onlcr(s).as_bytes()),
             OutputSink::Capture(buf) => buf.borrow_mut().push_str(s),
-            OutputSink::Builtin { previous, stdout, stderr, dup_err_to_out, .. } => {
+            OutputSink::Builtin { previous, stderr, .. } => {
                 use std::io::Write;
-                if *dup_err_to_out {
-                    match stdout {
-                        Some(f) => {
-                            let _ = f.borrow_mut().write_all(s.as_bytes());
-                        }
-                        None => previous.write_out(s),
-                    }
-                } else {
-                    match stderr {
-                        Some(f) => {
-                            let _ = f.borrow_mut().write_all(s.as_bytes());
-                        }
-                        None => previous.write_err(s),
+                match stderr {
+                    SinkStream::OuterOut => previous.write_out(s),
+                    SinkStream::OuterErr => previous.write_err(s),
+                    SinkStream::File(f) => {
+                        let _ = f.borrow_mut().write_all(s.as_bytes());
                     }
                 }
             }
@@ -199,8 +198,56 @@ struct ChildStdio {
     stdout: Option<std::fs::File>,
     stdin: Option<std::fs::File>,
     stderr: Option<std::fs::File>,
-    dup_err_to_out: bool,
-    dup_out_to_err: bool,
+    // `2>&1` / `1>&2`: which stream follows the other, and what it was
+    // following at the point the dup appeared. A descriptor names what
+    // it names right then, so the two are different destinations:
+    // `{ echo e; } >&2 2>/dev/null` prints on the terminal, because
+    // `>&2` copied fd 2 before the `2>` rebound it, while
+    // `{ echo e; } 2>/dev/null >&2` prints nothing.
+    out_follows_err: Option<Follows>,
+    err_follows_out: Option<Follows>,
+}
+
+// What a `2>&1`/`1>&2` was pointing at when it appeared.
+#[derive(Clone, Copy)]
+enum Follows {
+    // The file this same command had already opened for the other
+    // stream.
+    OwnFile,
+    // The enclosing shell's descriptor for it -- the dup came first.
+    Outer,
+}
+
+impl ChildStdio {
+    // Does this construct redirect either output stream at all? When it
+    // doesn't, the child's sink should be *exactly* the parent's rather
+    // than a fresh wrapper around it.
+    fn redirects_output(&self) -> bool {
+        self.stdout.is_some() || self.stderr.is_some() || self.out_follows_err.is_some() || self.err_follows_out.is_some()
+    }
+
+    fn sink_stdout(&self) -> SinkStream {
+        match self.out_follows_err {
+            Some(Follows::Outer) => SinkStream::OuterErr,
+            Some(Follows::OwnFile) => file_stream(&self.stderr).unwrap_or(SinkStream::OuterErr),
+            None => file_stream(&self.stdout).unwrap_or(SinkStream::OuterOut),
+        }
+    }
+
+    fn sink_stderr(&self) -> SinkStream {
+        match self.err_follows_out {
+            Some(Follows::Outer) => SinkStream::OuterOut,
+            Some(Follows::OwnFile) => file_stream(&self.stdout).unwrap_or(SinkStream::OuterOut),
+            None => file_stream(&self.stderr).unwrap_or(SinkStream::OuterErr),
+        }
+    }
+}
+
+// A second handle on the same open file. `try_clone` is a dup, so the
+// two share one write position -- which is the point wherever both
+// streams land on one destination.
+fn file_stream(f: &Option<std::fs::File>) -> Option<SinkStream> {
+    f.as_ref()?.try_clone().ok().map(|f| SinkStream::File(Rc::new(RefCell::new(f))))
 }
 
 /// What a virtual child is being asked to run: text that still has to
@@ -4467,10 +4514,10 @@ impl Shell {
     /// pipeline stage needs the two halves apart: every stage has to be
     /// built and connected before *any* of them runs, because each one
     /// blocks on a pipe the others are on the far end of.
-    fn child_for_stdio(&mut self, stdio: ChildStdio) -> Shell {
+    fn child_for_stdio(&mut self, mut stdio: ChildStdio) -> Shell {
         let mut child = self.new_virtual_child();
 
-        let effective_stdin: Option<Rc<RefCell<SharedReaderState>>> = match stdio.stdin {
+        let effective_stdin: Option<Rc<RefCell<SharedReaderState>>> = match stdio.stdin.take() {
             Some(f) => {
                 Some(Rc::new(RefCell::new(SharedReaderState { file: f, pending: Vec::new(), coroutines: Rc::clone(&self.background_coroutines) })))
             }
@@ -4489,14 +4536,8 @@ impl Shell {
         // redirect of its own, so its sink should be *exactly* the
         // parent's current one (already fully resolved -- Real/Grid/
         // Capture/Builtin, whatever it is), not a fresh wrapper around it.
-        child.sink = if stdio.stdout.is_some() || stdio.stderr.is_some() || stdio.dup_err_to_out || stdio.dup_out_to_err {
-            OutputSink::Builtin {
-                previous: Box::new(self.sink.clone()),
-                stdout: stdio.stdout.as_ref().and_then(|f| f.try_clone().ok()).map(|f| Rc::new(RefCell::new(f))),
-                stderr: stdio.stderr.as_ref().and_then(|f| f.try_clone().ok()).map(|f| Rc::new(RefCell::new(f))),
-                dup_err_to_out: stdio.dup_err_to_out,
-                dup_out_to_err: stdio.dup_out_to_err,
-            }
+        child.sink = if stdio.redirects_output() {
+            OutputSink::Builtin { previous: Box::new(self.sink.clone()), stdout: stdio.sink_stdout(), stderr: stdio.sink_stderr() }
         } else {
             self.sink.clone()
         };
@@ -4594,11 +4635,11 @@ impl Shell {
     // whole body, exactly as `{ ...; } > out` does, and routing it
     // through the compound path is the only way a builtin inside the
     // body and an external inside it end up in the same place.
-    fn install_redirected_stdio(&mut self, stdio: ChildStdio) -> (OutputSink, Option<Rc<RefCell<StdioOverride>>>) {
+    fn install_redirected_stdio(&mut self, mut stdio: ChildStdio) -> (OutputSink, Option<Rc<RefCell<StdioOverride>>>) {
         let saved_sink = self.sink.clone();
         let saved_stdio_override = self.stdio_override.clone();
 
-        let effective_stdin: Option<Rc<RefCell<SharedReaderState>>> = match stdio.stdin {
+        let effective_stdin: Option<Rc<RefCell<SharedReaderState>>> = match stdio.stdin.take() {
             Some(f) => {
                 Some(Rc::new(RefCell::new(SharedReaderState { file: f, pending: Vec::new(), coroutines: Rc::clone(&self.background_coroutines) })))
             }
@@ -4613,14 +4654,8 @@ impl Shell {
         } else {
             None
         };
-        if stdio.stdout.is_some() || stdio.stderr.is_some() || stdio.dup_err_to_out || stdio.dup_out_to_err {
-            self.sink = OutputSink::Builtin {
-                previous: Box::new(saved_sink.clone()),
-                stdout: stdio.stdout.as_ref().and_then(|f| f.try_clone().ok()).map(|f| Rc::new(RefCell::new(f))),
-                stderr: stdio.stderr.as_ref().and_then(|f| f.try_clone().ok()).map(|f| Rc::new(RefCell::new(f))),
-                dup_err_to_out: stdio.dup_err_to_out,
-                dup_out_to_err: stdio.dup_out_to_err,
-            };
+        if stdio.redirects_output() {
+            self.sink = OutputSink::Builtin { previous: Box::new(saved_sink.clone()), stdout: stdio.sink_stdout(), stderr: stdio.sink_stderr() };
         }
 
         (saved_sink, saved_stdio_override)
@@ -10027,55 +10062,44 @@ impl Shell {
                 _ => {}
             }
         }
-        // For a *builtin*, fd 1 and fd 2 are not the process's own:
-        // they are the enclosing sink, which may already be a capture,
-        // a grid, or an outer command's redirect. So `ProcessFd(1)` and
-        // `ProcessFd(2)` resolve to "whatever this sink's parent does
-        // with them" rather than to a dup of the real descriptor --
-        // which is what `dup_out_to_err`/`dup_err_to_out` and a `None`
-        // field mean to OutputSink::Builtin's own write path. Any other
-        // descriptor is a real one and really is duped.
         let out_dest = table.get(&1).map(|&i| &dests[i]);
         let err_dest = table.get(&2).map(|&i| &dests[i]);
         if out_dest.is_none() && err_dest.is_none() {
             return Ok(false);
         }
         let shared = matches!((table.get(&1), table.get(&2)), (Some(a), Some(b)) if a == b);
-        let mut dup_out_to_err = false;
-        let mut dup_err_to_out = false;
         let stdout = match out_dest {
-            None | Some(Dest::ProcessFd(1)) => None,
-            Some(Dest::ProcessFd(2)) => {
-                dup_out_to_err = true;
-                None
-            }
+            None => SinkStream::OuterOut,
             Some(d) => open_dest(self, d, who)?,
         };
         let stderr = match err_dest {
-            None | Some(Dest::ProcessFd(2)) => None,
-            Some(Dest::ProcessFd(1)) => {
-                dup_err_to_out = true;
-                None
-            }
-            // One destination for both, opened once.
-            Some(_) if shared && stdout.is_some() => {
-                dup_err_to_out = true;
-                None
-            }
+            None => SinkStream::OuterErr,
+            // One destination for both, opened once -- so the two share
+            // a write position instead of overwriting each other.
+            Some(_) if shared => stdout.clone(),
             Some(d) => open_dest(self, d, who)?,
         };
         let previous = std::mem::replace(&mut self.sink, OutputSink::Real);
-        self.sink = OutputSink::Builtin { previous: Box::new(previous), stdout, stderr, dup_err_to_out, dup_out_to_err };
+        self.sink = OutputSink::Builtin { previous: Box::new(previous), stdout, stderr };
         return Ok(true);
 
-        fn open_dest(sh: &mut Shell, dest: &Dest, who: &str) -> Result<Option<Rc<RefCell<std::fs::File>>>, String> {
+        fn open_dest(sh: &mut Shell, dest: &Dest, who: &str) -> Result<SinkStream, String> {
             match dest {
-                Dest::Path(p, append, clobber) => Ok(Some(Rc::new(RefCell::new(sh.open_out(p, *append, *clobber)?)))),
+                Dest::Path(p, append, clobber) => Ok(SinkStream::File(Rc::new(RefCell::new(sh.open_out(p, *append, *clobber)?)))),
+                // For a *builtin*, fd 1 and fd 2 are not the process's
+                // own: they are the enclosing sink, which may already
+                // be a capture, a grid, or an outer command's redirect.
+                // So these resolve to "whatever this sink's parent does
+                // with them" rather than to a dup of the real
+                // descriptor. Any other descriptor is a real one and
+                // really is duped.
+                Dest::ProcessFd(1) => Ok(SinkStream::OuterOut),
+                Dest::ProcessFd(2) => Ok(SinkStream::OuterErr),
                 // A dup of a descriptor nothing has open is an error,
                 // not a silent fallback to stdout: `echo x >&9` reports
                 // and fails, the way it does for an external command.
                 Dest::ProcessFd(fd) => match dup_existing_fd(*fd) {
-                    Some(f) => Ok(Some(Rc::new(RefCell::new(f)))),
+                    Some(f) => Ok(SinkStream::File(Rc::new(RefCell::new(f)))),
                     None => Err(format!("{}: Bad file descriptor", fd)),
                 },
                 Dest::Closed => Err(format!("{}: write error: Bad file descriptor", who)),
@@ -10348,11 +10372,11 @@ impl Shell {
     // "plain fd 0/1/2" subset push_builtin_output_sink already scopes a
     // single builtin's own redirects to. Only ever called after
     // compound_redirects_are_simple has already confirmed every redirect
-    // here is one of those kinds. Mirrors resolve_redirect_list's own
-    // `Both`/`DupErrToOut` treatment (a dup_err_to_out flag, not a second
-    // independent `open()` of the same path -- two separate file opens
-    // would track their own, unshared write positions, letting stdout/
-    // stderr overwrite each other).
+    // here is one of those kinds. A stream that ends up on the other
+    // one's destination records that it follows it, rather than opening
+    // the same path a second time -- two separate opens would track
+    // their own, unshared write positions, letting stdout and stderr
+    // overwrite each other.
     fn resolve_simple_redirects_for_compound(&mut self, redirects: &[Redirect]) -> Result<ChildStdio, String> {
         let mut stdio = ChildStdio::default();
         // path, append, clobber (`>|`) -- as in open_out's signature.
@@ -10375,25 +10399,33 @@ impl Shell {
                 }
                 Redirect::Out { word, append, clobber } | Redirect::FdOut { fd: 1, word, append, clobber } => {
                     stdout_target = Some((self.expand_word(word), *append, *clobber));
-                    stdio.dup_err_to_out = false;
+                    stdio.out_follows_err = None;
                 }
                 Redirect::Err { word, append, clobber } | Redirect::FdOut { fd: 2, word, append, clobber } => {
                     stderr_target = Some((self.expand_word(word), *append, *clobber));
-                    stdio.dup_err_to_out = false;
+                    stdio.err_follows_out = None;
                 }
                 Redirect::Both { word, append } => {
                     stdout_target = Some((self.expand_word(word), *append, false));
-                    stdio.dup_err_to_out = true;
+                    stdio.out_follows_err = None;
+                    stdio.err_follows_out = Some(Follows::OwnFile);
                 }
-                Redirect::DupErrToOut | Redirect::FdDup { fd: 2, target: 1 } => stdio.dup_err_to_out = true,
-                Redirect::FdDup { fd: 1, target: 2 } => stdio.dup_out_to_err = true,
+                Redirect::DupErrToOut | Redirect::FdDup { fd: 2, target: 1 } => {
+                    stdio.err_follows_out = Some(if stdout_target.is_some() { Follows::OwnFile } else { Follows::Outer });
+                }
+                Redirect::FdDup { fd: 1, target: 2 } => {
+                    stdio.out_follows_err = Some(if stderr_target.is_some() { Follows::OwnFile } else { Follows::Outer });
+                }
                 _ => unreachable!("compound_redirects_are_simple already filtered these out"),
             }
         }
         if let Some((p, append, clobber)) = &stdout_target {
             stdio.stdout = Some(self.open_out(p, *append, *clobber)?);
         }
-        if !stdio.dup_err_to_out {
+        // A stream that follows the other one opens nothing of its own
+        // -- and a `2>file` the dup came *after* named a descriptor that
+        // has since been rebound, so its target is stale.
+        if stdio.err_follows_out.is_none() {
             if let Some((p, append, clobber)) = &stderr_target {
                 stdio.stderr = Some(self.open_out(p, *append, *clobber)?);
             }
@@ -15138,10 +15170,8 @@ mod tests {
         let file = Rc::new(RefCell::new(std::fs::File::create("/dev/null").unwrap()));
         shell.sink = OutputSink::Builtin {
             previous: Box::new(std::mem::replace(&mut shell.sink, OutputSink::Real)),
-            stdout: Some(file),
-            stderr: None,
-            dup_err_to_out: false,
-            dup_out_to_err: false,
+            stdout: SinkStream::File(file),
+            stderr: SinkStream::OuterErr,
         };
         assert!(shell.sink_grid().is_some(), "a per-command redirect sink must not hide the session's own grid");
     }
