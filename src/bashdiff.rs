@@ -782,6 +782,18 @@ y
         case("prefix-listing-finds-computed-names", r#"echo "${!BASHO*}" "${!BASHP*}" "${!BASH_SUB*}" "${!EUI*}""#),
         // BASH_VERSINFO is readonly, which `declare -p` reports.
         case("bash-versinfo-is-readonly", r#"declare -p BASH_VERSINFO | cut -c1-14"#),
+        // `declare -f`'s layout is this shell's own (recorded as a
+        // divergence), but what the output has to *do* is the same in
+        // both: define the function again when another shell reads it
+        // back, with a command straight after it. That is the idiom the
+        // output exists for -- `ssh host "$(declare -f f); f"` -- and a
+        // trailing `;` after the `}` made it `};; f`, a syntax error.
+        case("a-function-definition-can-be-shipped-to-another-shell", r#"f(){ echo hi; }; bash -c "$(declare -f f); f""#),
+        case(
+            "a-shipped-function-keeps-its-compound-commands",
+            r#"f() { local x=1; if [ "$x" = 1 ]; then echo "yes $x"; fi; for i in a b; do echo $i; done; }; bash -c "$(declare -f f); f""#,
+        ),
+        case("two-shipped-functions", r#"f(){ echo a; }; g(){ echo b; }; bash -c "$(declare -f f g); f; g""#),
         // -- roadmap 10: the last of the grammar's leniency ------------
         // A `;` where a command is expected is a syntax error, not an
         // empty statement -- in front of the first command of a list as
@@ -816,14 +828,25 @@ y
         // principle keeps `compgen -A setopt` short. Recorded because
         // it is still a difference a script can see.
         ("set-o-lists-fewer-options", "`set -o` lists 10 options; bash lists 27, most of which bish does not implement"),
-        // `type` and `declare -f` print a function's body by
-        // reconstructing it from the parse tree, and the reconstruction
-        // is bish's own shape (`f() {` on one line, each statement
-        // quoted and `;`-terminated) rather than bash's pretty-printer
-        // (`f () ` / `{ ` / four-space indent). Matching it means
-        // writing bash's printer exactly, which is its own piece of
-        // work; until then `type f` deliberately stops after `f is a
-        // function` rather than printing a body that would differ.
+        // `declare -f` prints a function by reconstructing it from the
+        // parse tree, through the serializer that exists to hand
+        // functions to a self-exec'd child -- so every word comes out
+        // maximally quoted (`'echo' 'yes '"${x}"`), because that is
+        // what guarantees it parses back to the same command, and there
+        // is no indentation.
+        //
+        // A display printer would fix the layout, which is most of the
+        // ugliness. It would still not match bash, and the reason is
+        // worth writing down: bash does *not* re-render each word from
+        // its parse tree. It keeps the original spelling -- `${x}`
+        // stays `${x}`, `a"b"c` stays `a"b"c`, `"a"'b'` stays
+        // `"a"'b'` -- while normalising the layout around them.
+        // Matching that is not a printer to be written but source spans
+        // to be carried through the lexer and parser and held on every
+        // word.
+        //
+        // What the output has to *do* is checked in CASES: it defines
+        // the function again when another shell reads it back.
         ("function-body-formatting", "`declare -f f` reconstructs the body in bish's own layout, not bash's"),
         // `cd` resolves symlinks as it goes, so the shell holds the
         // *physical* path where bash holds the logical one and only

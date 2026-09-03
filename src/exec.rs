@@ -2835,7 +2835,15 @@ impl Shell {
                             sep: Sep::Seq,
                             line: 0,
                         }]);
-                        sh_println!(self, "{}", src.trim_end());
+                        // Without the separator `serialize_program`
+                        // puts after every item. A function definition
+                        // needs no terminator, and the one idiom this
+                        // output exists for puts a command straight
+                        // after it: `sh -c "$(declare -f f); f"` became
+                        // `};; f`, which is a syntax error in either
+                        // shell. bash ends its own at the `}`.
+                        let src = src.trim_end();
+                        sh_println!(self, "{}", src.strip_suffix(';').unwrap_or(src));
                     }
                 }
                 None => {
