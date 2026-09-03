@@ -132,6 +132,23 @@ fn budget() -> usize {
     value
 }
 
+/// Points the guard at a different stack, handing back the one it was
+/// using.
+///
+/// A coroutine runs on its own mapping, nowhere near the thread's, so
+/// measuring its depth against the thread's base gives an answer that
+/// is not merely wrong but wildly wrong -- the distance between two
+/// unrelated mappings, which reads as "the stack is gone" on the
+/// coroutine's very first call. Its budget is different too: a
+/// coroutine gets a fixed allocation rather than whatever `ulimit -s`
+/// says. `Coroutine::resume` swaps both in on the way into a stage and
+/// back out on the way home.
+pub fn swap_stack(base: usize, budget_bytes: usize) -> (usize, usize) {
+    let previous_base = BASE.with(|b| b.replace(base));
+    let previous_budget = BUDGET.with(|b| b.replace(budget_bytes));
+    (previous_base, previous_budget)
+}
+
 /// Whether the stack is too far gone to recurse again.
 ///
 /// Asked *before* descending, not after, so the answer still has the

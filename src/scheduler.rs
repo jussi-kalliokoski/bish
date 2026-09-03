@@ -69,6 +69,43 @@ pub fn park_writable(fd: RawFd) {
 struct Task {
     co: Box<Coroutine>,
     park: Park,
+    /// What this task's fd 0 and fd 1 are, installed for the duration
+    /// of each of its turns.
+    ///
+    /// A pipeline stage that is its own process gets its pipes *as*
+    /// stdin and stdout, and everything downstream of that -- `exec
+    /// {fd}<&0`, an external command inheriting the rest of the input,
+    /// a builtin writing to fd 1 -- works because they are the real
+    /// descriptors. Handing a stage a side channel instead breaks all
+    /// of it, so the descriptors are swapped rather than the code that
+    /// uses them. Two `dup2`s per switch, and switches only happen when
+    /// a stage blocks.
+    stdin: Option<std::os::fd::OwnedFd>,
+    stdout: Option<std::os::fd::OwnedFd>,
+    /// This task's own broken-pipe watch, swapped in around each resume
+    /// -- see `exec::swap_broken_pipe` for why it cannot just be the
+    /// thread's.
+    broken: Option<bool>,
+}
+
+impl Task {
+    /// The descriptor a parked task actually meant.
+    ///
+    /// A stage parks on the number it was using -- 0 for its input, 1
+    /// for its output -- and those numbers mean whatever was last
+    /// installed on them, which is some *other* stage's pipe as soon as
+    /// one runs. Waiting on the number rather than on this task's own
+    /// descriptor waits for the wrong thing: sometimes one that is
+    /// always ready, which spins, and sometimes one that never will be,
+    /// which hangs. Both were observed before this existed.
+    fn own_fd(&self, parked: std::os::fd::RawFd) -> std::os::fd::RawFd {
+        use std::os::fd::AsRawFd;
+        match parked {
+            0 => self.stdin.as_ref().map(|f| f.as_raw_fd()).unwrap_or(parked),
+            1 => self.stdout.as_ref().map(|f| f.as_raw_fd()).unwrap_or(parked),
+            other => other,
+        }
+    }
 }
 
 /// A set of coroutines run to completion together.
@@ -84,7 +121,20 @@ impl Scheduler {
 
     /// Adds a coroutine. Nothing runs until `run`.
     pub fn add(&mut self, body: impl FnOnce() + 'static) -> std::io::Result<()> {
-        self.tasks.push(Task { co: Coroutine::new(body)?, park: Park::Ready });
+        self.tasks.push(Task { co: Coroutine::new(body)?, park: Park::Ready, broken: None, stdin: None, stdout: None });
+        Ok(())
+    }
+
+    /// Adds a coroutine that runs with `stdin`/`stdout` as its own fd 0
+    /// and fd 1 -- see `Task::stdin`. `None` leaves that descriptor as
+    /// whatever the shell running the scheduler had.
+    pub fn add_with_fds(
+        &mut self,
+        body: impl FnOnce() + 'static,
+        stdin: Option<std::os::fd::OwnedFd>,
+        stdout: Option<std::os::fd::OwnedFd>,
+    ) -> std::io::Result<()> {
+        self.tasks.push(Task { co: Coroutine::new(body)?, park: Park::Ready, broken: None, stdin, stdout });
         Ok(())
     }
 
@@ -94,6 +144,16 @@ impl Scheduler {
     /// decide about, since a panicking pipeline stage is not something
     /// this can sensibly recover from on its own.
     pub fn run(&mut self) -> bool {
+        // Restored before returning, and while sleeping in `poll`: the
+        // shell that started this still owns fd 0 and fd 1 whenever no
+        // task is running on them.
+        let saved = crate::exec::save_fd012_for_scheduler();
+        let panicked = self.run_tasks(saved);
+        crate::exec::restore_fd012_for_scheduler(saved);
+        panicked
+    }
+
+    fn run_tasks(&mut self, shells_own: [i32; 3]) -> bool {
         while self.tasks.iter().any(|t| t.co.state() != State::Done) {
             let mut ran_something = false;
             for index in 0..self.tasks.len() {
@@ -107,8 +167,21 @@ impl Scheduler {
                 // finishes, rather than parking, does not leave the
                 // previous reason behind for the scheduler to believe.
                 REASON.with(|r| r.set(Park::Ready));
+                let outer = crate::exec::swap_broken_pipe(self.tasks[index].broken);
+                install_fds(&self.tasks[index], shells_own);
                 self.tasks[index].co.resume();
+                self.tasks[index].broken = crate::exec::swap_broken_pipe(outer);
                 self.tasks[index].park = REASON.with(|r| r.get());
+                if self.tasks[index].co.state() == State::Done {
+                    // A finished stage must stop holding its pipes, or
+                    // the stage downstream waits for an end-of-input
+                    // that cannot arrive: this scheduler is one of the
+                    // things keeping the write end open. `install_fds`
+                    // for the next task takes fd 1 off it; these two
+                    // are the other references.
+                    self.tasks[index].stdin = None;
+                    self.tasks[index].stdout = None;
+                }
                 ran_something = true;
             }
             if ran_something {
@@ -131,10 +204,11 @@ impl Scheduler {
     }
 
     fn can_run(&self, index: usize) -> bool {
-        match self.tasks[index].park {
+        let task = &self.tasks[index];
+        match task.park {
             Park::Ready => true,
-            Park::Readable(fd) => crate::poll::poll_one(fd, 0),
-            Park::Writable(fd) => poll_writable(fd, 0),
+            Park::Readable(fd) => crate::poll::poll_readable_or_eof(task.own_fd(fd), 0),
+            Park::Writable(fd) => poll_writable(task.own_fd(fd), 0),
         }
     }
 
@@ -162,14 +236,33 @@ impl Scheduler {
         for task in self.tasks.iter().filter(|t| t.co.state() != State::Done) {
             let ready = match task.park {
                 Park::Ready => true,
-                Park::Readable(fd) => crate::poll::poll_one(fd, POLL_SLICE_MS),
-                Park::Writable(fd) => poll_writable(fd, POLL_SLICE_MS),
+                Park::Readable(fd) => crate::poll::poll_readable_or_eof(task.own_fd(fd), POLL_SLICE_MS),
+                Park::Writable(fd) => poll_writable(task.own_fd(fd), POLL_SLICE_MS),
             };
             if ready {
                 return true;
             }
         }
         true
+    }
+}
+
+/// Points fd 0 and fd 1 at this task's own pipes for the duration of
+/// its turn.
+fn install_fds(task: &Task, shells_own: [i32; 3]) {
+    unsafe extern "C" {
+        fn dup2(oldfd: i32, newfd: i32) -> i32;
+    }
+    use std::os::fd::AsRawFd;
+    // Both, every time, and `None` means the shell's own rather than
+    // "leave it alone": whatever the previous task installed is still
+    // there otherwise, so the last stage of `a | b` would write into
+    // the pipe `a` was writing to instead of to the terminal.
+    let stdin = task.stdin.as_ref().map(|f| f.as_raw_fd()).unwrap_or(shells_own[0]);
+    let stdout = task.stdout.as_ref().map(|f| f.as_raw_fd()).unwrap_or(shells_own[1]);
+    unsafe {
+        dup2(stdin, 0);
+        dup2(stdout, 1);
     }
 }
 

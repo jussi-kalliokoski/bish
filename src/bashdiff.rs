@@ -162,6 +162,32 @@ mod tests {
         // with the same status, or this never terminates at all.
         case("pipeline-stage-reader-leaves-early", r#"for i in $(seq 1 100000); do echo "l$i"; done | head -2; echo "ps=${PIPESTATUS[*]}""#),
         case("pipeline-stage-unbounded-reader-leaves", r#"while true; do echo x; done | head -2; echo "ps=${PIPESTATUS[*]}""#),
+        // Two or more stages that need a shell cannot take turns by
+        // running one of them in this shell: each would be waiting on a
+        // pipe the other is on the far end of. Those run as coroutines
+        // over one thread -- see run_multi_scheduled -- and everything
+        // below is what that has to keep true.
+        case("two-shell-stages", r#"echo x | while read l; do echo "[$l]"; done"#),
+        case("two-shell-stages-both-compound", r#"{ echo one; echo two; } | { read a; read b; echo "$b $a"; }"#),
+        case("three-shell-stages", r#"echo hi | { read v; echo "$v $v"; } | { read a b; echo "$b-$a"; }"#),
+        case("shell-stage-between-two-externals", r#"/bin/echo a b | { read x y; echo "$y $x"; } | cat"#),
+        // More than a pipe buffer, so neither stage can finish without
+        // the other running -- the thing a single-threaded shell could
+        // not do at all before.
+        case(
+            "two-shell-stages-outlast-the-pipe-buffer",
+            r#"for i in $(seq 1 5000); do echo "l$i"; done | { c=0; while read l; do c=$((c+1)); done; echo "$c"; }"#,
+        ),
+        // A stage's pipes have to be its *real* fd 0 and fd 1, or none
+        // of this works: an external inheriting the rest of the input,
+        // and `exec {fd}<&0`, both go through the descriptors.
+        case("shell-stage-hands-the-rest-to-an-external", r#"{ echo a; echo b; } | { read -r x; echo "x=$x"; cat; }"#),
+        case("shell-stage-can-dup-its-own-stdin", r#"echo x | { exec {fd}<&0; read -r -u "$fd" l; echo "[$l]"; }"#),
+        case("two-shell-stages-status", r#"{ exit 3; } | { read v; }; echo "ps=${PIPESTATUS[*]}""#),
+        case("two-shell-stages-pipefail", r#"set -o pipefail; { exit 4; } | { read v; }; echo "rc=$?""#),
+        case("two-shell-stages-are-subshells", r#"x=1; { x=2; echo "$x"; } | { read v; echo "in=$v"; }; echo "out=$x""#),
+        case("two-shell-stages-cd-does-not-escape", r#"{ echo a; } | { read v; cd /tmp; }; echo "$PWD""#),
+        case("two-shell-stages-reader-leaves-early", r#"while true; do echo x; done | { read v; echo "got=$v"; }"#),
         case("subshell-scope", r#"x=1; (x=2); echo $x"#),
         case("subshell-exit", r#"(exit 4); echo $?"#),
         // The real process environment is shared by every in-process
@@ -692,7 +718,13 @@ y
             "f() { f $((${1:-0}+1)); }; f",
             "f() { f $RANDOM; }; f",
             "f() { f $SECONDS; }; f",
-            "f() { /bin/true; f; }; f",
+            // Deliberately no case that spawns an external command
+            // per frame. Each of these recurses until the stack runs
+            // out, so that would be a thousand spawns, and the case
+            // took longer than the harness's own per-case timeout once
+            // the suite ran it under load. `true` above is a builtin
+            // and reaches the same "this ran a command" bookkeeping;
+            // an external adds a process, not coverage.
             // Arithmetic that assigns, in each of its spellings. The
             // `(( ))` command is not a simple command and so does not
             // pass the dispatch where effects are counted -- this was

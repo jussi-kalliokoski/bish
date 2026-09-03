@@ -41,6 +41,18 @@ pub fn poll_one(fd: RawFd, timeout_ms: i32) -> bool {
     unsafe { poll(&mut pfd, 1, timeout_ms) > 0 && (pfd.revents & POLLIN) != 0 }
 }
 
+/// `poll_one`, counting a closed peer as ready.
+///
+/// A pipe whose writer has gone reports `POLLHUP`, not `POLLIN` -- so
+/// anything waiting for "readable" alone waits for ever on a descriptor
+/// whose next read would return 0. That is the same reason `PollSet`
+/// below watches for it, and it is what a pipeline stage waiting for
+/// end-of-input needs.
+pub fn poll_readable_or_eof(fd: RawFd, timeout_ms: i32) -> bool {
+    let mut pfd = PollFd { fd, events: POLLIN, revents: 0 };
+    unsafe { poll(&mut pfd, 1, timeout_ms) > 0 && (pfd.revents & (POLLIN | POLLHUP | POLLERR)) != 0 }
+}
+
 // A set of fds, each watched for POLLIN (readable) plus POLLHUP/POLLERR
 // (so a closed peer -- a dead job's pty, a disconnected client socket --
 // is reported as "ready" too: the next read on it returns 0/an error,

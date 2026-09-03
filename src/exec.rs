@@ -101,13 +101,15 @@ impl OutputSink {
             // this is the one place that needs to treat a broken pipe as
             // "stop writing, not fatal" instead of crashing the process.
             OutputSink::Real => {
-                use std::io::Write;
-                let mut out = std::io::stdout();
-                if let Err(e) = out.write_all(s.as_bytes())
-                    && e.kind() == std::io::ErrorKind::BrokenPipe
-                {
-                    note_broken_pipe();
-                }
+                // Straight to the descriptor rather than through
+                // `std::io::stdout()`. Its buffering hides the one
+                // condition that matters here: a write into a pipeline
+                // stage's own full pipe returns from the buffer with
+                // `Ok`, and the `EAGAIN` surfaces later inside `flush`,
+                // where the error was dropped and the bytes with it.
+                // The sink flushes after every write anyway, so the
+                // buffer was never buying anything.
+                note_write(write_fd_parking(1, s.as_bytes()));
                 // Flushed here rather than left to the line buffer,
                 // because fd 1 is not this shell's alone: the next
                 // thing to write to it is very often a child process,
@@ -123,25 +125,19 @@ impl OutputSink {
                 // time, not the kernel's. Flushing before every spawn
                 // instead would keep the buffering, at the cost of
                 // having to find every place a child can start.
-                let _ = out.flush();
             }
             OutputSink::Grid(screen) => screen.borrow_mut().feed(onlcr(s).as_bytes()),
             OutputSink::Capture(buf) => buf.borrow_mut().push_str(s),
             OutputSink::Builtin { previous, stdout, stderr, dup_err_to_out: _, dup_out_to_err } => {
-                use std::io::Write;
                 if *dup_out_to_err {
                     // `1>&2`: stdout follows wherever stderr resolves to.
                     match stderr {
-                        Some(f) => {
-                            let _ = f.borrow_mut().write_all(s.as_bytes());
-                        }
+                        Some(f) => note_write(write_all_parking(&mut f.borrow_mut(), s.as_bytes())),
                         None => previous.write_err(s),
                     }
                 } else {
                     match stdout {
-                        Some(f) => {
-                            let _ = f.borrow_mut().write_all(s.as_bytes());
-                        }
+                        Some(f) => note_write(write_all_parking(&mut f.borrow_mut(), s.as_bytes())),
                         None => previous.write_out(s),
                     }
                 }
@@ -264,14 +260,109 @@ impl std::io::Read for SharedStdinReader {
     }
 }
 
+/// `write_all`, except that a descriptor with no room hands the thread
+/// to another pipeline stage instead of failing.
+///
+/// Only a pipe between two stages running in this process is ever
+/// non-blocking, so outside one of those this loop takes its first
+/// branch every time and behaves exactly like `write_all`. Inside one,
+/// `WouldBlock` means the reader is behind, and the reader is another
+/// coroutine -- so the answer is to let it run, not to error.
+/// Runs `op` with `fd` non-blocking, and puts the flag back.
+///
+/// `O_NONBLOCK` lives on the open file *description*, which everything
+/// that inherits the descriptor shares -- so leaving it set on a
+/// pipeline stage's pipe made every external command that stage
+/// spawned fail with `Resource temporarily unavailable`. Setting it
+/// only around this shell's own read and write means it is never set
+/// at the moment a child is forked, which is the only moment that
+/// matters. Nothing else can run in between: a stage yields at a park,
+/// never mid-syscall.
+///
+/// Only inside a coroutine, where a blocking descriptor would take the
+/// whole thread down with it. Everywhere else this is the bare `op`.
+fn briefly_nonblocking<T>(fd: i32, op: impl FnOnce() -> T) -> T {
+    if !crate::coroutine::in_coroutine() {
+        return op();
+    }
+    unsafe extern "C" {
+        fn fcntl(fd: i32, cmd: i32, arg: i32) -> i32;
+    }
+    const F_GETFL: i32 = 3;
+    const F_SETFL: i32 = 4;
+    const O_NONBLOCK: i32 = 0o4000;
+    let flags = unsafe { fcntl(fd, F_GETFL, 0) };
+    if flags < 0 {
+        return op();
+    }
+    unsafe { fcntl(fd, F_SETFL, flags | O_NONBLOCK) };
+    let out = op();
+    unsafe { fcntl(fd, F_SETFL, flags) };
+    out
+}
+
+/// A write into a redirect target that failed. A broken pipe is the
+/// one worth remembering -- it is how an in-process stage learns its
+/// reader is gone, since it cannot be told by SIGPIPE. Everything else
+/// is dropped, as it was before there was anywhere to put it.
+fn note_write(result: std::io::Result<()>) {
+    if result.is_err_and(|e| e.kind() == std::io::ErrorKind::BrokenPipe) {
+        note_broken_pipe();
+    }
+}
+
+pub(crate) fn write_all_parking(file: &mut std::fs::File, bytes: &[u8]) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    write_fd_parking(file.as_raw_fd(), bytes)
+}
+
+/// `write_all_parking` straight onto a descriptor.
+fn write_fd_parking(fd: i32, bytes: &[u8]) -> std::io::Result<()> {
+    unsafe extern "C" {
+        fn write(fd: i32, buf: *const u8, count: usize) -> isize;
+    }
+    let mut written = 0;
+    while written < bytes.len() {
+        let n = briefly_nonblocking(fd, || unsafe { write(fd, bytes[written..].as_ptr(), bytes.len() - written) });
+        if n > 0 {
+            written += n as usize;
+            continue;
+        }
+        if n == 0 {
+            return Err(std::io::Error::from(std::io::ErrorKind::WriteZero));
+        }
+        let e = std::io::Error::last_os_error();
+        match e.kind() {
+            std::io::ErrorKind::WouldBlock => crate::scheduler::park_writable(fd),
+            std::io::ErrorKind::Interrupted => {}
+            _ => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+/// `read`, with the same treatment: nothing to read yet means another
+/// stage has not written it yet, and that stage is a coroutine.
+fn read_parking(file: &mut std::fs::File, buf: &mut [u8]) -> std::io::Result<usize> {
+    use std::io::Read;
+    use std::os::fd::AsRawFd;
+    let fd = file.as_raw_fd();
+    loop {
+        match briefly_nonblocking(fd, || file.read(buf)) {
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => crate::scheduler::park_readable(fd),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            other => return other,
+        }
+    }
+}
+
 impl std::io::BufRead for SharedStdinReader {
     fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
         if self.local.is_empty() {
             let mut state = self.state.borrow_mut();
             if state.pending.is_empty() {
-                use std::io::Read;
                 let mut tmp = [0u8; 8192];
-                let n = state.file.read(&mut tmp)?;
+                let n = read_parking(&mut state.file, &mut tmp)?;
                 state.pending.extend_from_slice(&tmp[..n]);
             }
             std::mem::swap(&mut self.local, &mut state.pending);
@@ -1686,6 +1777,27 @@ impl Shell {
         // back to the default when unset, and still tells unset apart
         // from empty) -- what was missing was `$IFS` reading as anything.
         shell.assign_var("IFS", " \t\n".to_string());
+        // bash sets `PWD` at startup whether or not it inherited one,
+        // and scripts read it far more often than they call `pwd`. bish
+        // only ever had one when something upstream had exported it --
+        // so `env -i bish -c 'echo $PWD'` printed nothing, and every
+        // `cd` afterwards was updating a variable that had never been
+        // set. Exported, as bash's is.
+        // An inherited one is kept only when it names this same
+        // directory by another route -- which is the point of
+        // inheriting it, since it is how a path through a symlink
+        // survives. One that names somewhere else is stale and bash
+        // replaces it.
+        let inherited_is_here = shell
+            .globals
+            .get("PWD")
+            .map(std::path::PathBuf::from)
+            .and_then(|p| std::fs::canonicalize(p).ok())
+            .is_some_and(|p| std::fs::canonicalize(&shell.cwd).is_ok_and(|here| p == here));
+        if !inherited_is_here {
+            let here = shell.cwd.to_string_lossy().into_owned();
+            shell.export_var("PWD", here);
+        }
         shell
     }
 
@@ -2378,13 +2490,17 @@ impl Shell {
     /// and values are dropped rather than passed: a C environment
     /// string cannot hold one, and the variable is worth more than the
     /// export (see `export_to_environment`, which draws the same line).
-    fn exported_pairs(&self) -> Vec<(String, String)> {
+    /// Borrowed, not cloned: this runs on every spawn, and building it
+    /// out of owned `String`s allocated twice per exported variable
+    /// each time -- about 140 allocations to start one external
+    /// command, which is more work than starting it.
+    fn exported_pairs(&self) -> Vec<(&str, &str)> {
         self.exported_names
             .iter()
             .filter(|name| !name.contains('\0'))
             .filter_map(|name| {
                 let value = self.lookup_var_for_export(name)?;
-                (!value.contains('\0')).then(|| (name.clone(), value))
+                (!value.contains('\0')).then_some((name.as_str(), value))
             })
             .collect()
     }
@@ -2392,13 +2508,13 @@ impl Shell {
     /// The value a child should see for `name`, or `None` if it has
     /// none -- an exported name that is not set exports nothing, the
     /// same as in bash.
-    fn lookup_var_for_export(&self, name: &str) -> Option<String> {
+    fn lookup_var_for_export(&self, name: &str) -> Option<&str> {
         for scope in self.var_scopes.iter().rev() {
             if let Some(value) = scope.get(name) {
-                return value.clone();
+                return value.as_deref();
             }
         }
-        self.globals.get(name).cloned()
+        self.globals.get(name).map(String::as_str)
     }
 
     fn spawn_stdout_stdio(&self) -> Stdio {
@@ -4230,7 +4346,13 @@ impl Shell {
         self.run_body_in_child_shell(ChildBody::Parsed(cmd), stdio)
     }
 
-    fn run_body_in_child_shell(&mut self, body: ChildBody<'_>, stdio: ChildStdio) -> ExecResult {
+    /// A virtual child wired to `stdio`, handed back rather than run.
+    ///
+    /// `run_body_in_child_shell` builds one and runs it immediately. A
+    /// pipeline stage needs the two halves apart: every stage has to be
+    /// built and connected before *any* of them runs, because each one
+    /// blocks on a pipe the others are on the far end of.
+    fn child_for_stdio(&mut self, stdio: ChildStdio) -> Shell {
         let mut child = self.new_virtual_child();
 
         let effective_stdin: Option<Rc<RefCell<SharedReaderState>>> = match stdio.stdin {
@@ -4261,6 +4383,11 @@ impl Shell {
         } else {
             self.sink.clone()
         };
+        child
+    }
+
+    fn run_body_in_child_shell(&mut self, body: ChildBody<'_>, stdio: ChildStdio) -> ExecResult {
+        let mut child = self.child_for_stdio(stdio);
 
         // The real OS cwd is process-wide, shared with the real parent,
         // even though `child` is otherwise a fully independent Shell -- a
@@ -7377,6 +7504,145 @@ impl Shell {
         }
     }
 
+    /// A pipeline with two or more stages that need a shell, run without
+    /// a single extra process.
+    ///
+    /// One shell stage can simply run here, between spawning the others
+    /// and waiting for them -- the real processes on the far ends of its
+    /// pipes are what keep it from deadlocking. Two cannot: each would
+    /// block on a pipe the other is on the far end of, and there is only
+    /// one thread. So they run as coroutines, and the scheduler hands
+    /// the thread to whichever one can move (see `scheduler`).
+    ///
+    /// Stages that are real commands are still real processes. They need
+    /// no help: the kernel runs them.
+    fn run_multi_scheduled(&mut self, commands: &[parser::Command]) -> i32 {
+        let n = commands.len();
+        let is_shell_stage: Vec<bool> = commands.iter().map(|c| self.stage_needs_interpreter(c)).collect();
+
+        // Pipe `i` carries stage `i`'s output to stage `i + 1`.
+        let mut read_ends: Vec<Option<std::os::fd::OwnedFd>> = (0..n).map(|_| None).collect();
+        let mut write_ends: Vec<Option<std::os::fd::OwnedFd>> = (0..n).map(|_| None).collect();
+        for i in 0..n.saturating_sub(1) {
+            match make_pipe() {
+                Ok((read_end, write_end)) => {
+                    // Left blocking. A stage must not *actually* block
+                    // in the kernel -- it would take the thread and
+                    // every other stage with it -- but the flag that
+                    // prevents that is set only around this shell's own
+                    // reads and writes, by `briefly_nonblocking`, so
+                    // that a child spawned by a stage never inherits it.
+                    write_ends[i] = Some(write_end);
+                    read_ends[i + 1] = Some(read_end);
+                }
+                Err(e) => {
+                    sh_eprintln!(self, "bish: {}", e);
+                    return 1;
+                }
+            }
+        }
+
+        let mut scheduler = crate::scheduler::Scheduler::new();
+        let mut children: Vec<(usize, std::process::Child)> = Vec::new();
+        let mut codes: Vec<Rc<std::cell::Cell<i32>>> = (0..n).map(|_| Rc::new(std::cell::Cell::new(0))).collect();
+
+        for (i, cmd) in commands.iter().enumerate() {
+            let stdin_end = read_ends[i].take();
+            let stdout_end = write_ends[i].take();
+            if !is_shell_stage[i] {
+                let parser::Command::Simple(sc) = cmd else { unreachable!("a non-simple command always needs a shell") };
+                let argv: Vec<String> = self.expand_words(&sc.words);
+                if argv.is_empty() {
+                    continue;
+                }
+                let mut command = self.command(&argv[0]);
+                command.args(&argv[1..]);
+                for (k, mode, val) in &sc.assigns {
+                    let v = self.expand_word(val);
+                    let v = match mode {
+                        AssignMode::Set => v,
+                        AssignMode::Append => self.lookup_var(k) + &v,
+                    };
+                    command.env(k, v);
+                }
+                command.stdin(match stdin_end {
+                    Some(fd) => Stdio::from(fd),
+                    None => self.spawn_stdin_stdio(),
+                });
+                command.stdout(match stdout_end {
+                    Some(fd) => Stdio::from(fd),
+                    None => self.spawn_stdout_stdio(),
+                });
+                if i == n - 1 {
+                    self.note_external_spawn();
+                }
+                match command.spawn() {
+                    Ok(child) => children.push((i, child)),
+                    Err(e) => {
+                        sh_eprintln!(self, "bish: {}", e);
+                        kill_all(children);
+                        return 127;
+                    }
+                }
+                continue;
+            }
+
+            // A shell stage. Built and connected now, run later: every
+            // stage has to exist before any of them starts, because each
+            // blocks on a pipe another is on the far end of.
+            //
+            // An ordinary virtual child with no redirect of its own:
+            // its pipes arrive as the real fd 0 and fd 1, installed by
+            // the scheduler for the duration of each of its turns. That
+            // is what a stage running as its own process gets, and it
+            // is what keeps `exec {fd}<&0`, an external command
+            // inheriting the rest of the input, and a builtin writing
+            // to fd 1 all behaving the way they already did.
+            let mut child = self.new_virtual_child();
+            let body = cmd.clone();
+            let code = Rc::clone(&codes[i]);
+            let stage = move || {
+                // Armed here rather than by the caller: the watch is
+                // swapped per task by the scheduler, so this is the
+                // first moment this stage's own is the thread's.
+                arm_broken_pipe();
+                let result = crate::builtins::shell::run_command(&mut child, &body, false);
+                if !matches!(result, ExecResult::Exit(_)) {
+                    child.run_exit_trap();
+                }
+                // A stage whose reader left is dead the same way a
+                // separate process would have been, with the status
+                // SIGPIPE would have given it.
+                code.set(if disarm_broken_pipe() { 128 + 13 } else { result.status() });
+            };
+            if let Err(e) = scheduler.add_with_fds(stage, stdin_end, stdout_end) {
+                sh_eprintln!(self, "bish: {}", e);
+                kill_all(children);
+                return 1;
+            }
+        }
+        // Every end this shell still holds is one the reader downstream
+        // would wait on for ever.
+        drop(read_ends);
+        drop(write_ends);
+
+        scheduler.run();
+
+        let mut statuses: Vec<i32> = codes.drain(..).map(|c| c.get()).collect();
+        for (stage, mut child) in children {
+            statuses[stage] = match child.wait() {
+                Ok(s) => exit_code_from_status(s),
+                Err(e) => {
+                    sh_eprintln!(self, "bish: {}", e);
+                    1
+                }
+            };
+        }
+        self.set_pipestatus(&statuses);
+        let last = statuses.last().copied().unwrap_or(0);
+        if self.opt_pipefail { statuses.iter().rev().find(|c| **c != 0).copied().unwrap_or(0) } else { last }
+    }
+
     fn run_multi(&mut self, commands: &[parser::Command], background: bool) -> i32 {
         let n = commands.len();
         // Paired with the stage each came from: `PIPESTATUS` is in
@@ -7442,6 +7708,14 @@ impl Shell {
         // applies, and only one stage can have it: a second would run
         // sequentially with the first, and whichever ran first would
         // fill its pipe with nothing draining it.
+        // Two or more stages that need a shell: they cannot take turns
+        // by running one here between the others, because each would be
+        // waiting on a pipe the other is on the far end of. Those go to
+        // the scheduler, which is the only path that needs coroutines
+        // at all.
+        if !background && !lastpipe && n >= 2 && commands.iter().filter(|c| self.stage_needs_interpreter(c)).count() >= 2 {
+            return self.run_multi_scheduled(commands);
+        }
         let inproc_stage = if background || n < 2 || lastpipe {
             None
         } else {
@@ -11433,11 +11707,38 @@ impl std::io::BufRead for UnbufferedFd {
         if !self.filled {
             // Straight to the fd, not through `std::io::stdin()`, whose
             // own shared buffer is the thing being avoided.
-            let n = unsafe { libc_read(self.fd, self.byte.as_mut_ptr(), 1) };
-            match n {
-                1 => self.filled = true,
-                0 => return Ok(&[]),
-                _ => return Err(std::io::Error::last_os_error()),
+            loop {
+                // Asked before reading rather than made non-blocking
+                // around it. This reads exactly one byte, so "the
+                // descriptor has something" is precisely the condition
+                // under which a blocking read cannot block -- one
+                // syscall to find out instead of the three it takes to
+                // set the flag and put it back, on the hottest path
+                // there is: `while read` comes through here per byte.
+                if crate::coroutine::in_coroutine() {
+                    while !crate::poll::poll_readable_or_eof(self.fd, 0) {
+                        crate::scheduler::park_readable(self.fd);
+                    }
+                }
+                let n = unsafe { libc_read(self.fd, self.byte.as_mut_ptr(), 1) };
+                if n == 1 {
+                    self.filled = true;
+                    break;
+                }
+                if n == 0 {
+                    return Ok(&[]);
+                }
+                let e = std::io::Error::last_os_error();
+                match e.kind() {
+                    // Nothing there *yet*: the stage upstream has not
+                    // written it, and that stage is a coroutine sharing
+                    // this thread. Only a pipe between two in-process
+                    // stages is ever non-blocking, so outside one of
+                    // those this never happens.
+                    std::io::ErrorKind::WouldBlock => crate::scheduler::park_readable(self.fd),
+                    std::io::ErrorKind::Interrupted => {}
+                    _ => return Err(e),
+                }
             }
         }
         Ok(&self.byte[..1])
@@ -11684,6 +11985,18 @@ pub(crate) fn note_broken_pipe() {
     });
 }
 
+/// Swaps this thread's broken-pipe watch for another, handing back what
+/// was there.
+///
+/// The watch is per-thread, and pipeline stages share a thread -- so
+/// without this, one stage's dead reader would be reported to whichever
+/// stage happened to run next. The scheduler swaps each task's own in
+/// around every resume, which makes the thread-local a per-coroutine
+/// slot without the sink having to know that coroutines exist.
+pub(crate) fn swap_broken_pipe(state: Option<bool>) -> Option<bool> {
+    BROKEN_PIPE.with(|b| std::mem::replace(&mut *b.borrow_mut(), state))
+}
+
 fn broken_pipe_seen() -> bool {
     BROKEN_PIPE.with(|b| *b.borrow() == Some(true))
 }
@@ -11702,6 +12015,16 @@ fn args_fingerprint(args: &[String]) -> u64 {
         h = h.wrapping_mul(0x100000001b3);
     }
     h
+}
+
+/// `save_fd012`/`restore_fd012` for the scheduler, which runs pipeline
+/// stages on this shell's own fd 0 and fd 1 and has to give them back.
+pub(crate) fn save_fd012_for_scheduler() -> [i32; 3] {
+    save_fd012()
+}
+
+pub(crate) fn restore_fd012_for_scheduler(saved: [i32; 3]) {
+    restore_fd012(saved);
 }
 
 fn save_fd012() -> [i32; 3] {

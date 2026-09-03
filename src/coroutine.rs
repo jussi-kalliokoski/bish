@@ -236,6 +236,13 @@ thread_local! {
 /// A separately-stacked execution that can be stopped and restarted.
 pub struct Coroutine {
     context: Context,
+    /// The high end of this coroutine's own stack, and how much of it a
+    /// script may use -- swapped into `stackguard` for the duration of
+    /// every resume, so a runaway recursion inside a stage is measured
+    /// against the stack it is actually running on rather than against
+    /// the thread's, which is a different mapping entirely.
+    stack_top: usize,
+    stack_budget: usize,
     // Dropped last, and only once the coroutine can no longer be
     // resumed -- see `Drop`.
     stack: Option<Stack>,
@@ -255,8 +262,18 @@ impl Coroutine {
     /// first `resume` to land at the top of `body`.
     pub fn new(body: impl FnOnce() + 'static) -> std::io::Result<Box<Coroutine>> {
         let stack = Stack::new()?;
-        let mut co =
-            Box::new(Coroutine { context: Context::default(), stack: Some(stack), state: State::Fresh, body: Some(Box::new(body)), panicked: false });
+        let stack_top = stack.top() as usize;
+        let mut co = Box::new(Coroutine {
+            context: Context::default(),
+            stack_top,
+            // The same two-thirds `stackguard` leaves itself on the
+            // thread's own stack, for unwinding and reporting.
+            stack_budget: STACK_SIZE / 3 * 2,
+            stack: Some(stack),
+            state: State::Fresh,
+            body: Some(Box::new(body)),
+            panicked: false,
+        });
         co.prepare();
         Ok(co)
     }
@@ -331,9 +348,11 @@ impl Coroutine {
         let previous_return = RETURN_TO.with(|r| r.replace(&mut here as *mut Context));
         let previous_current = CURRENT.with(|c| c.replace(self as *mut Coroutine));
         self.state = State::Running;
+        let outer_stack = crate::stackguard::swap_stack(self.stack_top, self.stack_budget);
         // Everything between here and the line after is running on the
         // coroutine's own stack.
         unsafe { bish_switch_context(&mut here as *mut Context, &self.context as *const Context) };
+        crate::stackguard::swap_stack(outer_stack.0, outer_stack.1);
         RETURN_TO.with(|r| r.set(previous_return));
         CURRENT.with(|c| c.set(previous_current));
         if self.state == State::Running {
@@ -547,27 +566,46 @@ mod tests {
 mod cost {
     use super::*;
 
-    // Not an assertion about speed -- a floor check, so that a switch
-    // silently becoming a syscall would show up. `swapcontext`, the
-    // libc equivalent, is around a microsecond because it saves the
-    // signal mask; this must be nowhere near that.
+    // Not an assertion about speed -- a check that a switch has not
+    // silently become a syscall, which is what using `swapcontext`
+    // instead would cost (it makes a `sigprocmask` call every time).
+    //
+    // Measured against a real syscall in the same test rather than
+    // against a fixed number of nanoseconds: this runs alongside two
+    // thousand other tests, and an absolute threshold measures the
+    // machine's load as much as the switch. A ratio moves with both.
     #[test]
     fn a_switch_costs_far_less_than_a_syscall() {
-        const N: usize = 200_000;
+        unsafe extern "C" {
+            fn close(fd: i32) -> i32;
+        }
+        const N: usize = 100_000;
+
+        // `close(-1)` fails with EBADF without touching anything --
+        // a syscall and nothing else, and not one the vDSO answers.
+        let started = std::time::Instant::now();
+        for _ in 0..N {
+            unsafe { close(-1) };
+        }
+        let per_syscall = started.elapsed().as_nanos() as f64 / N as f64;
+
         let mut co = Coroutine::new(|| {
             loop {
                 yield_now();
             }
         })
         .unwrap();
-        let start = std::time::Instant::now();
+        let started = std::time::Instant::now();
         for _ in 0..N {
             co.resume();
         }
-        // Two switches per resume: in and back out.
-        let per_switch = start.elapsed().as_nanos() as f64 / (N * 2) as f64;
-        eprintln!("[coroutine] {per_switch:.1}ns per switch");
-        assert!(per_switch < 500.0, "a context switch should be tens of nanoseconds, not {per_switch:.1}ns");
+        // Two switches per resume: in, and back out.
+        let per_switch = started.elapsed().as_nanos() as f64 / (N * 2) as f64;
+
+        assert!(
+            per_switch < per_syscall * 3.0,
+            "a context switch ({per_switch:.0}ns) should be in the same range as a syscall ({per_syscall:.0}ns), not multiples of it"
+        );
         // Dropped while still suspended inside its loop, which is the
         // supported thing to do: the mapping goes back, and nothing on
         // that stack owns anything that needed dropping.
