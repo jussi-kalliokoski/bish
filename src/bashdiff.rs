@@ -574,6 +574,12 @@ y
         // body -- `head -3 <(while true; do echo x; done)` printed its
         // three lines and then hung.
         ("proc-sub-out-ordering", "`echo hi > >(cat); echo done` prints `hi done`; bash prints `done hi`, running the body concurrently"),
+        // A name can be declared an array without ever being assigned
+        // one, and bash prints that as `declare -a A` with no value at
+        // all -- distinct from `A=()`, which really is an assignment of
+        // an empty array and prints `=()`. bish creates the (empty) map
+        // at declaration and so cannot tell the two apart afterwards.
+        ("declare-p-of-a-declared-but-unassigned-array", "`declare -a A; declare -p A` prints `declare -a A=()`; bash prints `declare -a A`"),
         (
             "dup-to-stderr-that-is-itself-redirected",
             "`echo e >&2 2>/dev/null` writes to /dev/null; bash writes to the stderr `>&2` named, which is the one from before this command",
@@ -586,6 +592,13 @@ y
         // -- roadmap 10: parser leniency, the part still standing -----
         case("empty-command-between-separators", "echo a; ; echo b"),
         case("proc-sub-out-ordering", r#"echo hi > >(cat); echo done"#),
+        case("declare-p-of-a-declared-but-unassigned-array", r#"declare -a A; declare -p A"#),
+        // Not recordable here, and worth saying why: `SHLVL` counts one
+        // higher through two levels of `-c`, because bash decrements it
+        // before `exec`ing the last command of a `-c` and bish spawns
+        // there instead. Seeing it needs the shell under test invoked
+        // *by path*, and both shells report `$0` as a bare name, so a
+        // case cannot name the thing it is testing.
         case("dup-to-stderr-that-is-itself-redirected", r#"echo e >&2 2>/dev/null; echo done"#),
     ];
 
