@@ -683,6 +683,71 @@ y
         case("trap-p-of-a-pseudo-signal", r#"trap "echo x" RETURN; trap -p RETURN; trap "echo y" ERR; trap -p ERR"#),
         case("trap-p-names-only-what-it-was-asked", r#"trap "echo a" USR1; trap "echo b" USR2; trap -p USR2"#),
         case("trap-p-of-an-unknown-signal", r#"trap -p NOSUCH 2>/dev/null; echo "rc=$?""#),
+        // -- and a third sweep -----------------------------------------
+        // `base#digits` in bash goes up to base 64: 0-9, then a-z for
+        // 10-35, then A-Z for 36-61, then `@` and `_`. Rust's
+        // `from_str_radix` stops at 36 and *panics* past it, so
+        // `$((64#zZ))` killed the shell. Below 37 there is no room for
+        // two letter ranges and bash folds case instead, which is what
+        // makes `16#FF` 255 while `64#zZ` is 35*64+61.
+        case("arithmetic-bases-above-36", r#"echo $((64#zZ)) $((64#@)) $((64#_)) $((62#z))"#),
+        case("arithmetic-bases-fold-case-below-37", r#"echo $((16#FF)) $((16#ff)) $((36#ZZ)) $((36#zz))"#),
+        // In a subshell so the message, which each shell words its own
+        // way, is redirected away: it is emitted during *expansion*,
+        // before the command's own `2>` is in place.
+        case(
+            "arithmetic-base-out-of-range",
+            r#"( echo $((65#a)) ) 2>/dev/null; echo "rc=$?"; ( echo $((37#Z)) ) 2>/dev/null; echo "rc=$?"; ( echo $((1#a)) ) 2>/dev/null; echo "rc=$?""#,
+        ),
+        // `${a[@]OP}` applies OP to each element. Applied to the joined
+        // text instead, the ops that act at most once per string acted
+        // once for the whole array -- and the globally-acting ones came
+        // out right by accident, which is why it went unnoticed.
+        case("array-wide-replace-is-per-element", r#"a=(one two three); echo "${a[@]/o/0}"; echo "${a[@]//o/0}""#),
+        case("array-wide-strip-is-per-element", r#"a=(one two); echo "${a[@]%e}"; echo "${a[@]#o}"; a=(a.txt b.txt); echo "${a[@]%.txt}""#),
+        // POSIX character classes, in both matchers: a `[:name:]`
+        // carries its own `]`, which does not close the bracket around
+        // it. Scanning for the first `]` read `[[:space:]]` as the set
+        // `[:space:` plus a literal `]`.
+        case(
+            "character-classes-in-a-regex",
+            r#"[[ "a b" =~ [[:space:]] ]] && echo s; [[ ab =~ ^[[:alpha:]]+$ ]] && echo a; [[ 5 =~ [^[:digit:]] ]] || echo neg"#,
+        ),
+        case(
+            "character-classes-in-a-glob",
+            r#"case "a b" in *[[:space:]]*) echo s;; esac; case a] in [[:alpha:]]]) echo bracket;; esac; x="a b c"; echo "${x//[[:space:]]/_}""#,
+        ),
+        // `kill -0` is not a signal but the "is it still there" probe,
+        // and `-s`/`-n` name the signal in the next argument.
+        case("kill-signal-zero", r#"kill -0 $$ && echo alive; kill -s 0 $$ && echo alive2; kill -n 0 $$ && echo alive3"#),
+        case("kill-of-a-process-that-is-gone", r#"kill -0 999999 2>/dev/null; echo "rc=$?""#),
+        // `-o OPTNAME` is a unary test, not the OR connective -- which
+        // is what it was read as, so `test -o errexit` was "empty OR
+        // errexit" and always true. A connective needs something on its
+        // left; at the start of a clause it is the test.
+        case("test-o-asks-about-a-shell-option", r#"test -o errexit; echo "rc=$?"; set -e; test -o errexit; echo "rc=$?""#),
+        case("test-o-still-combines", r#"set -e; set -u; [ -o errexit -a -o nounset ] && echo both; [ a -o b ] && echo or"#),
+        case("test-v-in-the-bracket-form", r#"x=1; [ -v x ] && echo set; [ -v nosuch ]; echo "rc=$?""#),
+        // The xtrace line is meant to read as the command that ran.
+        case("xtrace-quotes-what-needs-it", r#"set -x; echo "a b"; echo "*"; echo ""; [ x = x ]"#),
+        // `-P` forces the PATH search past a builtin of the same name;
+        // `-p` prints a path only where `type` would say "file".
+        case("type-capital-p-forces-the-path-search", r#"type -P echo; type -p echo; f(){ :; }; type -P f; echo "rc=$?""#),
+        // `mapfile -d` was parsed and thrown away, so it read lines; and
+        // its options did not cluster, so `-d,` was rejected as `-,`.
+        case("mapfile-delimiter", r#"mapfile -t -d, arr <<< "a,b,c"; printf "[%s]" "${arr[@]}"; echo"#),
+        case("mapfile-clustered-options", r#"mapfile -td, arr <<< "a,b,c"; echo "${#arr[@]}""#),
+        // A quoted part of a `case` pattern is literal text. The whole
+        // pattern was expanded as text and then matched as a glob, so
+        // a variable holding `*` matched everything.
+        case(
+            "a-quoted-case-pattern-is-literal",
+            r#"p="*"; case abc in "$p") echo lit;; *) echo no;; esac; case abc in '*') echo sq;; *) echo no2;; esac"#,
+        ),
+        case(
+            "an-unquoted-case-pattern-is-still-a-glob",
+            r#"p="*"; case abc in $p) echo glob;; *) echo no;; esac; x=/tmp; case /tmp/f in "$x"/*) echo prefix;; esac"#,
+        ),
         // -- roadmap 10: the last of the grammar's leniency ------------
         // A `;` where a command is expected is a syntax error, not an
         // empty statement -- in front of the first command of a list as

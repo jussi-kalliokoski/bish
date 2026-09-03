@@ -2,9 +2,7 @@
 //
 // Free functions taking `&mut Shell` -- see `builtins/mod.rs`.
 
-use crate::exec::{
-    ExecResult, JobWaitOutcome, SIGCONT, Shell, getpgrp, send_signal, send_signal_to_pgrp, sh_eprintln, sh_println, signal_number, waitpid_untraced,
-};
+use crate::exec::{ExecResult, JobWaitOutcome, SIGCONT, Shell, getpgrp, send_signal, send_signal_to_pgrp, sh_eprintln, sh_println, waitpid_untraced};
 use crate::pty;
 
 // One line of `jobs` output, in bash's own columns: the job id and its
@@ -419,10 +417,25 @@ fn signal_name_or_number(arg: &str) -> Option<String> {
     crate::exec::all_signals().iter().find(|(name, _)| *name == bare).map(|(_, num)| num.to_string())
 }
 
+// `kill`'s own reading of a signal spec. Unlike `trap`'s it admits 0,
+// which is not a signal at all: it delivers nothing and only reports
+// whether the process is there, which is what makes `kill -0 $$` the
+// idiom for "is it still running". `signal_number` rejects it -- rightly,
+// for a trap -- and `kill -0` was failing with "invalid signal
+// specification".
+fn kill_signal_number(spec: &str) -> Option<i32> {
+    if spec == "0" || spec == "SIG0" {
+        return Some(0);
+    }
+    crate::exec::signal_number(spec)
+}
+
 pub(crate) fn run_kill(sh: &mut Shell, args: &[String]) -> i32 {
     let mut sig = 15; // SIGTERM
     let mut targets: Vec<&String> = Vec::new();
-    for a in args {
+    let mut i = 0;
+    while i < args.len() {
+        let a = &args[i];
         if let Some(rest) = a.strip_prefix('-') {
             if rest == "l" {
                 // `kill -l` on its own lists them; with arguments it
@@ -448,8 +461,40 @@ pub(crate) fn run_kill(sh: &mut Shell, args: &[String]) -> i32 {
                 }
                 return status;
             }
-            if let Some(n) = signal_number(rest) {
+            // `--` ends the options: what follows is a target however
+            // it starts, which is how a *process group* is named
+            // (`kill -- -$pgid`).
+            if rest == "-" {
+                i += 1;
+                while i < args.len() {
+                    targets.push(&args[i]);
+                    i += 1;
+                }
+                break;
+            }
+            // `-s SIGSPEC` and `-n SIGNUM` name the signal in the next
+            // argument rather than in this one; both were read as a
+            // signal called "s" or "n" and rejected.
+            if rest == "s" || rest == "n" {
+                let Some(spec) = args.get(i + 1) else {
+                    sh_eprintln!(sh, "bish: kill: -{rest}: option requires an argument");
+                    return 1;
+                };
+                match kill_signal_number(spec) {
+                    Some(n) => {
+                        sig = n;
+                        i += 2;
+                        continue;
+                    }
+                    None => {
+                        sh_eprintln!(sh, "bish: kill: {spec}: invalid signal specification");
+                        return 1;
+                    }
+                }
+            }
+            if let Some(n) = kill_signal_number(rest) {
                 sig = n;
+                i += 1;
                 continue;
             }
             // A `-something` that is not a signal is not a target
@@ -462,6 +507,7 @@ pub(crate) fn run_kill(sh: &mut Shell, args: &[String]) -> i32 {
             }
         }
         targets.push(a);
+        i += 1;
     }
     let mut status = 0;
     for t in targets {

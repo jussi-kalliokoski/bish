@@ -438,6 +438,12 @@ pub(crate) fn run_command(sh: &mut Shell, cmd: &parser::Command, background: boo
 // however true it reads.
 pub(crate) fn run_type(sh: &mut Shell, args: &[String]) -> i32 {
     let mut path_only = false;
+    // `-P` is not `-p`: it forces the PATH search and ignores every
+    // other way the name resolves, which is how a script gets at
+    // `/usr/bin/echo` when `echo` is a builtin. `-p` prints a path only
+    // where `type` would have said "file" at all. Both were read as
+    // `-p`, so `type -P echo` printed nothing.
+    let mut force_path = false;
     let mut kind_only = false;
     // `-a` reports *every* way the name resolves, not just the first:
     // `type -a echo` is how you find out there is a /usr/bin/echo
@@ -446,7 +452,11 @@ pub(crate) fn run_type(sh: &mut Shell, args: &[String]) -> i32 {
     let mut names: Vec<&String> = Vec::new();
     for a in args {
         match a.as_str() {
-            "-p" | "-P" => path_only = true,
+            "-p" => path_only = true,
+            "-P" => {
+                path_only = true;
+                force_path = true;
+            }
             "-t" => kind_only = true,
             "-a" => all = true,
             _ => names.push(a),
@@ -455,6 +465,13 @@ pub(crate) fn run_type(sh: &mut Shell, args: &[String]) -> i32 {
     let mut status = 0;
     for name in names {
         let mut found = false;
+        if force_path {
+            match resolve_in_path(name, &sh.lookup_var("PATH")) {
+                Some(p) => sh_println!(sh, "{}", p),
+                None => status = 1,
+            }
+            continue;
+        }
         // bash's own order, and `-a` reports every one of them: alias,
         // keyword, function, builtin, file.
         // Only when alias expansion is actually in effect: `type` says

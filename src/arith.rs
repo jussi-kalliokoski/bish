@@ -53,11 +53,11 @@ fn tokenize(src: &str) -> Result<Vec<Tok>, String> {
                 let base: u32 = chars[start..i].iter().collect::<String>().parse().unwrap_or(10);
                 i += 1;
                 let dstart = i;
-                while i < chars.len() && chars[i].is_alphanumeric() {
+                while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '@' || chars[i] == '_') {
                     i += 1;
                 }
                 let digits: String = chars[dstart..i].iter().collect();
-                let n = i64::from_str_radix(&digits, base).map_err(|_| format!("bad base-{} number in arithmetic expression", base))?;
+                let n = base_number(base, &digits)?;
                 toks.push(Tok::Num(n));
                 continue;
             }
@@ -558,6 +558,47 @@ fn ipow(base: i64, mut exp: u64) -> i64 {
         exp >>= 1;
     }
     result
+}
+
+// `base#digits`, with bash's own digit set rather than Rust's.
+//
+// `from_str_radix` accepts bases 2 to 36 and *panics* outside that
+// range, which `$((64#zZ))` -- a base bash supports -- walked straight
+// into: the shell died on an arithmetic expression.
+//
+// bash goes up to 64. Digits are 0-9, then a-z for 10-35, then A-Z for
+// 36-61, then `@` for 62 and `_` for 63. Below base 37 there is no room
+// for two letter ranges, and bash folds case there instead, which is
+// what makes `16#FF` and `16#ff` both 255 while `64#zZ` is 35*64+61.
+fn base_number(base: u32, digits: &str) -> Result<i64, String> {
+    if base == 0 {
+        return Err(format!("{}#{}: invalid number", base, digits));
+    }
+    if base == 1 || base > 64 {
+        return Err(format!("{}#{}: invalid arithmetic base", base, digits));
+    }
+    if digits.is_empty() {
+        return Err(format!("{}#: invalid integer constant", base));
+    }
+    let mut value: i64 = 0;
+    for c in digits.chars() {
+        let d = match c {
+            '0'..='9' => c as u32 - '0' as u32,
+            // Case folds together only where the two ranges would
+            // otherwise overlap the base.
+            'a'..='z' => c as u32 - 'a' as u32 + 10,
+            'A'..='Z' if base <= 36 => c as u32 - 'A' as u32 + 10,
+            'A'..='Z' => c as u32 - 'A' as u32 + 36,
+            '@' => 62,
+            '_' => 63,
+            _ => return Err(format!("{}#{}: invalid integer constant", base, digits)),
+        };
+        if d >= base {
+            return Err(format!("{}#{}: value too great for base", base, digits));
+        }
+        value = value.wrapping_mul(base as i64).wrapping_add(d as i64);
+    }
+    Ok(value)
 }
 
 pub fn eval(src: &str, ctx: &mut dyn VarContext) -> Result<i64, String> {

@@ -5801,7 +5801,15 @@ impl Shell {
             let fold_case = self.shopt_is_on("nocasematch");
             let should_run = force_run
                 || patterns.iter().any(|p| {
-                    let pat = self.expand_word(p);
+                    // A *quoted* part of a pattern is literal text, not
+                    // a pattern: `case abc in "$p")` with `p='*'` looks
+                    // for a literal asterisk, and so does `'*'`. The
+                    // whole pattern was expanded as plain text and then
+                    // matched as a glob, so both matched everything --
+                    // the same mistake `[[ =~ ]]` avoids by building
+                    // its operand chunk by chunk, which is what this
+                    // does now.
+                    let pat = self.expand_glob_pattern_operand(p);
                     glob::matches_with_case(&pat, &val, fold_case)
                 });
             if should_run {
@@ -5882,6 +5890,28 @@ impl Shell {
     // `[[ -v NAME ]]`, including `[[ -v arr[0] ]]`: is this name --
     // scalar, array, or one element of one -- actually set, as opposed
     // to reading back empty because it never was.
+    // What `[ -v NAME ]` and `[ -o OPTNAME ]` need answering, for the
+    // operands that actually appear -- see builtins::ShellFacts.
+    fn shell_test_answers(&mut self, args: &[String]) -> (HashMap<String, bool>, HashMap<String, bool>) {
+        let mut vars = HashMap::new();
+        let mut opts = HashMap::new();
+        for pair in args.windows(2) {
+            let (op, operand) = (pair[0].as_str(), pair[1].clone());
+            match op {
+                "-v" => {
+                    let answer = self.name_is_set(&operand);
+                    vars.insert(operand, answer);
+                }
+                "-o" => {
+                    let answer = self.shell_option_enabled(&operand).unwrap_or(false);
+                    opts.insert(operand, answer);
+                }
+                _ => {}
+            }
+        }
+        (vars, opts)
+    }
+
     fn name_is_set(&mut self, name: &str) -> bool {
         match name.split_once('[').and_then(|(base, rest)| rest.strip_suffix(']').map(|index| (base, index))) {
             Some((base, index)) => self.array_element_is_set(base, index),
@@ -5902,6 +5932,10 @@ impl Shell {
                 // which has no shell to ask.
                 match op.as_str() {
                     "-v" => self.name_is_set(&a),
+                    // Same reason as `-v`: it asks the shell, not the
+                    // filesystem. An option this shell does not gate
+                    // anything on is not on.
+                    "-o" => self.shell_option_enabled(&a).unwrap_or(false),
                     _ => builtins::unary(&op, &a),
                 }
             }
@@ -6296,7 +6330,14 @@ impl Shell {
         }
         if self.opt_xtrace {
             let ps4 = self.xtrace_prefix();
-            sh_eprintln!(self, "{}{}", ps4, argv.join(" "));
+            // Each word quoted if it needs it, the same way an
+            // assignment's value already was: the trace is meant to be
+            // readable *as* the command that ran, and unquoted it is
+            // not. `echo "a b"` traced as `+ echo a b`, which reads as
+            // two arguments, and `[ x = x ]` as `+ [ x = x ]`, where
+            // bash writes `+ '[' x = x ']'`.
+            let words: Vec<String> = argv.iter().map(|w| xtrace_quote_word(w)).collect();
+            sh_eprintln!(self, "{}{}", ps4, words.join(" "));
         }
         let name = argv[0].clone();
 
@@ -6833,7 +6874,9 @@ impl Shell {
             "break" => return builtins::break_loop(&argv[1..]),
             "continue" => return builtins::continue_loop(&argv[1..]),
             "test" => {
-                return ExecResult::Status(match builtins::test(&argv[1..], false) {
+                let (vars, opts) = self.shell_test_answers(&argv[1..]);
+                let outcome = builtins::test(&argv[1..], false, &builtins::ShellFacts { var_is_set: &vars, option_on: &opts });
+                return ExecResult::Status(match outcome {
                     Ok(status) => status,
                     Err(e) => {
                         sh_eprintln!(self, "bish: test: {}", e);
@@ -6852,7 +6895,9 @@ impl Shell {
                     sh_eprintln!(self, "bish: [: missing closing ]");
                     return ExecResult::Status(2);
                 }
-                return ExecResult::Status(match builtins::test(&a, false) {
+                let (vars, opts) = self.shell_test_answers(&a);
+                let outcome = builtins::test(&a, false, &builtins::ShellFacts { var_is_set: &vars, option_on: &opts });
+                return ExecResult::Status(match outcome {
                     Ok(status) => status,
                     Err(e) => {
                         sh_eprintln!(self, "bish: [: {}", e);
@@ -7301,10 +7346,6 @@ impl Shell {
             // ignored rather than erroring, a scoped subset covering the
             // overwhelmingly common `mapfile -t arr < file` usage.
             "mapfile" | "readarray" => {
-                if let Some(bad) = first_unknown_option(&argv[1..], "dnOstuCc") {
-                    let usage = format!("{} [-d delim] [-n count] [-O origin] [-s count] [-t] [-u fd] [-C callback] [-c quantum] [array]", name);
-                    return ExecResult::Status(bad_option_status(self, &name, &bad, &usage));
-                }
                 let mut strip_newline = false;
                 let mut array_name = "MAPFILE".to_string();
                 // The counted options, each acted on now rather than
@@ -7317,35 +7358,79 @@ impl Shell {
                 let mut skip = 0u64;
                 let mut origin = 0u64;
                 let mut from_fd: Option<i32> = None;
-                let mut expect_count: Option<&str> = None;
                 let mut bad_count: Option<(String, String)> = None;
-                for a in &argv[1..] {
-                    if let Some(flag) = expect_count.take() {
-                        match (flag, a.parse::<u64>()) {
-                            ("-n", Ok(v)) => max_lines = v,
-                            ("-s", Ok(v)) => skip = v,
-                            ("-O", Ok(v)) => origin = v,
-                            ("-u", Ok(v)) => from_fd = Some(v as i32),
-                            (_, Ok(_)) | ("-d", Err(_)) => {}
-                            (flag, Err(_)) => {
-                                let what = match flag {
-                                    "-O" => "invalid array origin",
-                                    "-u" => "invalid file descriptor specification",
-                                    "-n" | "-s" => "invalid line count",
-                                    _ => "invalid callback quantum",
-                                };
-                                bad_count = Some((a.clone(), what.to_string()));
-                            }
+                // What separates one element from the next. `-d` was
+                // parsed and then thrown away, so `mapfile -d, arr`
+                // read *lines* -- and the option did not cluster
+                // either, so `-d,` was rejected outright as `-,`.
+                let mut delim = b'\n';
+                let usage = format!("{} [-d delim] [-n count] [-O origin] [-s count] [-t] [-u fd] [-C callback] [-c quantum] [array]", name);
+                let mut i = 1;
+                while i < argv.len() {
+                    let a = argv[i].as_str();
+                    if a == "--" {
+                        if let Some(n) = argv.get(i + 1) {
+                            array_name = n.clone();
                         }
+                        break;
+                    }
+                    if a.len() < 2 || !a.starts_with('-') {
+                        array_name = a.to_string();
+                        i += 1;
                         continue;
                     }
-                    match a.as_str() {
-                        "-t" => strip_newline = true,
-                        flag @ ("-n" | "-O" | "-s" | "-u" | "-c") => expect_count = Some(flag),
-                        "-d" | "-C" => expect_count = Some("-d"),
-                        other if !other.starts_with('-') => array_name = other.to_string(),
-                        _ => {}
+                    let bytes = a.as_bytes();
+                    let mut ci = 1;
+                    while ci < bytes.len() {
+                        let c = bytes[ci] as char;
+                        if matches!(c, 'd' | 'n' | 'O' | 's' | 'u' | 'C' | 'c') {
+                            let value: Option<&str> = if ci + 1 < bytes.len() {
+                                Some(&a[ci + 1..])
+                            } else {
+                                i += 1;
+                                argv.get(i).map(|s| s.as_str())
+                            };
+                            let Some(value) = value else {
+                                sh_eprintln!(self, "bish: {}: -{}: option requires an argument", name, c);
+                                sh_eprintln!(self, "{}: usage: {}", name, usage);
+                                return ExecResult::Status(2);
+                            };
+                            match c {
+                                // An empty `-d ''` delimits on NUL, as
+                                // it does for `read`.
+                                'd' => delim = value.bytes().next().unwrap_or(0),
+                                'n' | 's' | 'O' | 'u' => match value.parse::<u64>() {
+                                    Ok(v) => match c {
+                                        'n' => max_lines = v,
+                                        's' => skip = v,
+                                        'O' => origin = v,
+                                        _ => from_fd = Some(v as i32),
+                                    },
+                                    Err(_) => {
+                                        let what = match c {
+                                            'O' => "invalid array origin",
+                                            'u' => "invalid file descriptor specification",
+                                            _ => "invalid line count",
+                                        };
+                                        bad_count = Some((value.to_string(), what.to_string()));
+                                    }
+                                },
+                                // `-C callback` and `-c quantum`: the
+                                // progress hook, accepted and ignored --
+                                // there is nothing to call back into.
+                                _ => {}
+                            }
+                            break;
+                        }
+                        match c {
+                            't' => strip_newline = true,
+                            _ => {
+                                return ExecResult::Status(bad_option_status(self, &name, &format!("-{c}"), &usage));
+                            }
+                        }
+                        ci += 1;
                     }
+                    i += 1;
                 }
                 if let Some((value, what)) = bad_count {
                     sh_eprintln!(self, "bish: {}: {}: {}", name, value, what);
@@ -7363,16 +7448,21 @@ impl Shell {
                     if max_lines > 0 && kept >= max_lines {
                         break;
                     }
-                    let mut line = String::new();
-                    match std::io::BufRead::read_line(&mut *reader, &mut line) {
+                    let mut raw: Vec<u8> = Vec::new();
+                    match std::io::BufRead::read_until(&mut *reader, delim, &mut raw) {
                         Ok(0) => break,
                         Ok(_) => {
+                            let mut line = String::from_utf8_lossy(&raw).into_owned();
                             seen += 1;
                             if seen <= skip {
                                 continue;
                             }
-                            if strip_newline {
-                                line = line.trim_end_matches(['\n', '\r']).to_string();
+                            // `-t` takes off the delimiter, whatever it
+                            // is -- not "trailing whitespace". With
+                            // `-d,` on `a,b,c` bash keeps the `\n` that
+                            // ends the last field.
+                            if strip_newline && raw.last() == Some(&delim) {
+                                line.pop();
                             }
                             map.insert(idx, line);
                             idx += 1;
@@ -9411,7 +9501,55 @@ impl Shell {
         }
     }
 
+    // The ops that are purely a function of one string, so they can be
+    // applied to a scalar or to each element of an array in turn.
+    fn apply_string_var_op(&mut self, cur: &str, op: &VarOp) -> String {
+        match op {
+            VarOp::RemovePrefix { pattern, longest } => {
+                let pattern = self.expand_raw(pattern);
+                strip_prefix_glob(cur, &pattern, *longest)
+            }
+            VarOp::RemoveSuffix { pattern, longest } => {
+                let pattern = self.expand_raw(pattern);
+                strip_suffix_glob(cur, &pattern, *longest)
+            }
+            VarOp::CaseConvert { pattern, upper, all } => {
+                let pattern = self.expand_raw(pattern);
+                apply_case_convert(cur, &pattern, *upper, *all)
+            }
+            VarOp::Replace { pattern, repl, global, anchor } => {
+                let pattern = self.expand_raw(pattern);
+                let repl = self.expand_raw(repl);
+                glob_replace(cur, &pattern, &repl, *global, *anchor)
+            }
+            _ => cur.to_string(),
+        }
+    }
+
     fn eval_array_var_op(&mut self, name: &str, index: &str, op: &VarOp) -> String {
+        // `${a[@]OP}` applies OP to each element and rejoins, for the
+        // ops that are about a *string*. Applied to the joined text
+        // instead, the ones that act at most once per string acted once
+        // for the whole array: `${a[@]/o/0}` on `(one two)` changed
+        // only the first element, and `${a[@]%e}` looked at whether the
+        // joined text ended in `e` rather than each element. The
+        // globally-acting ones (`//`, `^^`) came out right by accident,
+        // which is why this went unnoticed.
+        //
+        // Not every op is element-wise: `${a[@]:1:2}` slices the array,
+        // `${#a[@]}` counts it, and `${a[@]:-x}` asks whether the whole
+        // thing is empty. Those are handled elsewhere or below.
+        if index == "@" || index == "*" {
+            let element_wise =
+                matches!(op, VarOp::RemovePrefix { .. } | VarOp::RemoveSuffix { .. } | VarOp::CaseConvert { .. } | VarOp::Replace { .. });
+            if element_wise {
+                let target = self.array_target(name);
+                let elements = self.array_all(&target);
+                let mapped: Vec<String> = elements.into_iter().map(|e| self.apply_string_var_op(&e, op)).collect();
+                let sep = self.ifs_join_char();
+                return mapped.join(&sep);
+            }
+        }
         let cur = self.array_element(name, index);
         match op {
             VarOp::Length => cur.chars().count().to_string(),
@@ -13068,6 +13206,17 @@ fn xtrace_quote(value: &str) -> String {
     match safe {
         true => value.to_string(),
         false => crate::serialize::quote_literal(value),
+    }
+}
+
+// The same rule for a command *word*, where an empty one still has to
+// be quoted or it vanishes from the trace and `echo ""` reads as
+// `+ echo`. bash draws the line exactly here: `''` for an empty
+// argument, a bare `x=` for an empty assignment value.
+fn xtrace_quote_word(value: &str) -> String {
+    match value.is_empty() {
+        true => "''".to_string(),
+        false => xtrace_quote(value),
     }
 }
 

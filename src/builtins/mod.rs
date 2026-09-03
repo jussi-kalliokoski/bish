@@ -52,27 +52,50 @@ pub fn continue_loop(args: &[String]) -> crate::exec::ExecResult {
 // returns 2, distinct from the 1 that means "the expression is false",
 // and a script that checks `$?` for 1 has to be able to tell them
 // apart. The caller prints it: only it knows whether the user wrote
-// `test` or `[`.
-pub fn test(args: &[String], use_glob: bool) -> Result<i32, String> {
-    Ok(i32::from(!eval_test_expr(args, use_glob)?))
+/// The two unary tests that ask the *shell* rather than the filesystem
+/// or the text: `-v NAME` (is that variable set) and `-o OPTNAME` (is
+/// that shell option on).
+///
+/// Passed in, because this evaluator is deliberately a function of its
+/// arguments -- see `unary`, which has no shell to ask. Without them
+/// `[ -v x ]` was always false and `-o` was not a test at all: it was
+/// read as the OR connective, so `test -o errexit` came out as "empty
+/// OR errexit", which is true whatever the option is set to.
+/// Answered up front, for the operands that appear in this argument
+/// list, rather than as a callback: the answers need `&mut Shell` (an
+/// array subscript is an arithmetic expression), and the evaluator runs
+/// while the caller still needs the shell for its own diagnostics.
+pub struct ShellFacts<'a> {
+    pub var_is_set: &'a std::collections::HashMap<String, bool>,
+    pub option_on: &'a std::collections::HashMap<String, bool>,
 }
 
-fn eval_test_expr(args: &[String], use_glob: bool) -> Result<bool, String> {
+// `test` or `[`.
+pub fn test(args: &[String], use_glob: bool, facts: &ShellFacts<'_>) -> Result<i32, String> {
+    Ok(i32::from(!eval_test_expr(args, use_glob, facts)?))
+}
+
+fn eval_test_expr(args: &[String], use_glob: bool, facts: &ShellFacts<'_>) -> Result<bool, String> {
     // Split on top-level -a/-o (no parens support). Not strictly
     // POSIX-precedence-correct, but covers real-world usage.
     let mut clauses: Vec<Vec<String>> = vec![Vec::new()];
     let mut combinators: Vec<&str> = Vec::new();
     for a in args {
-        if a == "-a" || a == "-o" {
+        // Only where an operator would already have an operand to
+        // connect. `-o` is also a *unary* test, and one at the start of
+        // a clause is that one: `[ -o errexit -a -o xtrace ]` is two
+        // option tests joined by AND, not four empty clauses.
+        let connective = (a == "-a" || a == "-o") && !clauses.last().is_none_or(Vec::is_empty);
+        if connective {
             combinators.push(if a == "-a" { "-a" } else { "-o" });
             clauses.push(Vec::new());
         } else {
             clauses.last_mut().unwrap().push(a.clone());
         }
     }
-    let mut result = eval_simple(&clauses[0], use_glob)?;
+    let mut result = eval_simple(&clauses[0], use_glob, facts)?;
     for (i, comb) in combinators.iter().enumerate() {
-        let next = eval_simple(&clauses[i + 1], use_glob)?;
+        let next = eval_simple(&clauses[i + 1], use_glob, facts)?;
         result = match *comb {
             "-a" => result && next,
             "-o" => result || next,
@@ -82,13 +105,15 @@ fn eval_test_expr(args: &[String], use_glob: bool) -> Result<bool, String> {
     Ok(result)
 }
 
-fn eval_simple(args: &[String], use_glob: bool) -> Result<bool, String> {
+fn eval_simple(args: &[String], use_glob: bool, facts: &ShellFacts<'_>) -> Result<bool, String> {
     if args.first().map(|s| s.as_str()) == Some("!") {
-        return Ok(!eval_simple(&args[1..], use_glob)?);
+        return Ok(!eval_simple(&args[1..], use_glob, facts)?);
     }
     match args {
         [] => Ok(false),
         [s] => Ok(!s.is_empty()),
+        [op, a] if op == "-v" => Ok(facts.var_is_set.get(a).copied().unwrap_or(false)),
+        [op, a] if op == "-o" => Ok(facts.option_on.get(a).copied().unwrap_or(false)),
         [op, a] => Ok(unary(op, a)),
         [a, op, b] => binary_checked(a, op, b, use_glob),
         // Four or more words is no form of `test` there is. Reading it

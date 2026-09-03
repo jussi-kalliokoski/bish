@@ -134,6 +134,21 @@ impl<'a> ReParser<'a> {
                 self.pos += 1;
                 break;
             }
+            // `[[:space:]]`: a class *name*, whose own `]` does not end
+            // the bracket expression around it. Expanded into the same
+            // ranges this class is already made of -- see
+            // glob::posix_class_ranges.
+            if c == '[' {
+                let rest: String = self.chars[self.pos..].iter().collect();
+                if let Some((name, len)) = crate::glob::posix_class_at(rest.as_bytes()) {
+                    if let Some(rs) = crate::glob::posix_class_ranges(name) {
+                        ranges.extend(rs.iter().map(|(lo, hi)| (*lo as char, *hi as char)));
+                    }
+                    self.pos += len;
+                    first = false;
+                    continue;
+                }
+            }
             first = false;
             self.pos += 1;
             if self.peek() == Some('-') && self.chars.get(self.pos + 1).is_some_and(|&c2| c2 != ']') {

@@ -142,6 +142,53 @@ fn match_extglob(prefix: u8, alts: &[&[u8]], group: &[u8], rest: &[u8], text: &[
     }
 }
 
+/// The ASCII members of a POSIX character class, as byte ranges.
+///
+/// `[[:space:]]` and friends, which are a *name inside* a bracket
+/// expression rather than a nested one: the `]` that closes `[:space:]`
+/// does not close the bracket around it. Both this crate's matchers
+/// scanned for the first `]`, so `[[:space:]]` read as the set
+/// `[:space:` followed by a literal `]`, and matched neither.
+///
+/// Ranges rather than a predicate so the regex engine, whose classes
+/// are already ranges, can use the same table.
+pub(crate) fn posix_class_ranges(name: &[u8]) -> Option<&'static [(u8, u8)]> {
+    Some(match name {
+        b"alpha" => &[(b'A', b'Z'), (b'a', b'z')],
+        b"digit" => &[(b'0', b'9')],
+        b"alnum" => &[(b'0', b'9'), (b'A', b'Z'), (b'a', b'z')],
+        b"upper" => &[(b'A', b'Z')],
+        b"lower" => &[(b'a', b'z')],
+        // Tab through carriage return is 0x09..0x0d -- and includes
+        // the vertical tab, which Rust's own `is_ascii_whitespace`
+        // leaves out.
+        b"space" => &[(0x09, 0x0d), (b' ', b' ')],
+        b"blank" => &[(0x09, 0x09), (b' ', b' ')],
+        b"punct" => &[(0x21, 0x2f), (0x3a, 0x40), (0x5b, 0x60), (0x7b, 0x7e)],
+        b"print" => &[(0x20, 0x7e)],
+        b"graph" => &[(0x21, 0x7e)],
+        b"cntrl" => &[(0x00, 0x1f), (0x7f, 0x7f)],
+        b"xdigit" => &[(b'0', b'9'), (b'A', b'F'), (b'a', b'f')],
+        _ => return None,
+    })
+}
+
+/// The length of a `[:name:]` at the start of `pat`, brackets included,
+/// and the name itself.
+pub(crate) fn posix_class_at(pat: &[u8]) -> Option<(&[u8], usize)> {
+    if pat.len() < 4 || pat[0] != b'[' || pat[1] != b':' {
+        return None;
+    }
+    let mut i = 2;
+    while i + 1 < pat.len() && !(pat[i] == b':' && pat[i + 1] == b']') {
+        i += 1;
+    }
+    if i + 1 >= pat.len() {
+        return None;
+    }
+    Some((&pat[2..i], i + 2))
+}
+
 // pat[0] == b'['. Returns (did `c` match the class, remaining pattern after
 // the closing ']'), or None if the bracket expression is malformed (no
 // closing ']'), in which case '[' should be treated as a literal char.
@@ -157,6 +204,12 @@ pub(crate) fn match_class(pat: &[u8], c: Option<u8>) -> Option<(bool, &[u8])> {
         j += 1;
     }
     while j < pat.len() && pat[j] != b']' {
+        // A `[:name:]` carries its own `]`, which is not this
+        // bracket's.
+        if let Some((_, len)) = posix_class_at(&pat[j..]) {
+            j += len;
+            continue;
+        }
         j += 1;
     }
     if j >= pat.len() {
@@ -167,6 +220,13 @@ pub(crate) fn match_class(pat: &[u8], c: Option<u8>) -> Option<(bool, &[u8])> {
     let mut matched = false;
     let mut k = 0;
     while k < class.len() {
+        if let Some((name, len)) = posix_class_at(&class[k..]) {
+            if posix_class_ranges(name).is_some_and(|rs| rs.iter().any(|(lo, hi)| c >= *lo && c <= *hi)) {
+                matched = true;
+            }
+            k += len;
+            continue;
+        }
         if k + 2 < class.len() && class[k + 1] == b'-' {
             if c >= class[k] && c <= class[k + 2] {
                 matched = true;
@@ -241,6 +301,10 @@ fn closing_bracket(pat: &[u8]) -> Option<usize> {
         i += 1;
     }
     while i < pat.len() && pat[i] != b']' {
+        if let Some((_, len)) = posix_class_at(&pat[i..]) {
+            i += len;
+            continue;
+        }
         i += 1;
     }
     (i < pat.len()).then_some(i)
