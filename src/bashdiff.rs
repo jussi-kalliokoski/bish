@@ -139,6 +139,15 @@ mod tests {
         case("complete-in-a-pipeline", r#"complete -W 'a b' foo; complete -p foo | cat"#),
         case("jobs-in-a-pipeline", r#"sleep 0.2 & jobs -p | grep -cE '^[0-9]+$'"#),
         case("pipeline-stage-cd-does-not-escape", r#"cd /; { cd /usr; echo "in=$PWD"; } | cat; echo "out=$PWD""#),
+        // Paths a script names resolve against the *shell's* directory.
+        // Indistinguishable from the process's until two shells share
+        // one process, which is what an in-process pipeline stage is --
+        // so these pin the behaviour that has to survive that.
+        case("redirect-is-relative-to-the-shells-cwd", r#"mkdir -p d/e; cd d/e; echo hi > rel.txt; cat rel.txt; cd ../..; cat d/e/rel.txt"#),
+        case("source-is-relative-to-the-shells-cwd", r#"mkdir -p d; printf 'echo sourced\n' > d/s.sh; cd d; . ./s.sh"#),
+        case("glob-is-relative-to-the-shells-cwd", r#"mkdir -p d/e; : > d/e/a.rs; : > d/e/b.txt; : > top.rs; cd d/e; echo *.rs"#),
+        case("glob-with-a-directory-prefix", r#"mkdir -p d/e; : > d/e/a.rs; cd d; echo e/*.rs"#),
+        case("read-redirect-is-relative-to-the-shells-cwd", r#"mkdir -p d; printf 'x\n' > d/in.txt; cd d; read v < in.txt; echo "[$v]""#),
         case("pipeline-stage-export-does-not-escape", r#"{ export E=inner; echo hi; } | cat; echo "[${E-unset}]""#),
         case("pipeline-builtin-stage-status", r#"false | cat; echo "${PIPESTATUS[*]}""#),
         case("pipeline-stage-exit-status", r#"{ exit 3; } | cat; echo "${PIPESTATUS[*]} rc=$?""#),

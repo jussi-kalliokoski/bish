@@ -2363,6 +2363,11 @@ impl Shell {
         let mut command = Command::new(program);
         command.env_clear();
         command.envs(self.exported_pairs());
+        // The shell's cwd, for the same reason as its variables: the
+        // process's is shared, and two shells in one process can be in
+        // different directories. A caller that wants somewhere else
+        // still says so afterwards.
+        command.current_dir(&self.cwd);
         command
     }
 
@@ -6762,7 +6767,7 @@ impl Shell {
                     sh_eprintln!(self, "bish: {}: {}: restricted", name, path);
                     return ExecResult::Status(1);
                 }
-                match std::fs::read_to_string(&path) {
+                match std::fs::read_to_string(self.resolve_path(&path)) {
                     Ok(src) => {
                         // For the duration, this file *is* the script:
                         // a function defined here records it, and a
@@ -8664,7 +8669,7 @@ impl Shell {
                 // glob-check the single literal value as before.
                 let s = self.expand_word(w);
                 if !self.opt_noglob
-                    && let Some(matches) = glob::expand(&s, self.glob_options())
+                    && let Some(matches) = glob::expand(&s, self.glob_options(), &self.cwd)
                 {
                     let kept = self.apply_globignore(matches);
                     // Everything the pattern found was ignored, so it
@@ -8685,7 +8690,7 @@ impl Shell {
                     out.extend(fields);
                 } else {
                     for (field, pattern) in fields.into_iter().zip(patterns.into_iter()) {
-                        match glob::expand(&pattern, self.glob_options()).map(|m| self.apply_globignore(m)) {
+                        match glob::expand(&pattern, self.glob_options(), &self.cwd).map(|m| self.apply_globignore(m)) {
                             Some(matches) if !matches.is_empty() => out.extend(matches),
                             // A pattern that matched nothing. Not the
                             // same as a word that was never a pattern,
@@ -9464,6 +9469,18 @@ impl Shell {
     // restricted mode's "cannot redirect output" check lives here so it
     // covers all of them at once, rather than duplicated at each
     // Redirect variant's own resolution site.
+    /// A path as *this shell* sees it.
+    ///
+    /// A relative name resolves against the shell's own cwd rather than
+    /// the process's. The two agree while only one shell is running, and
+    /// stop agreeing the moment two of them share a process and one of
+    /// them runs `cd` -- which is what an in-process pipeline stage is.
+    /// Every path a script can name goes through here for that reason.
+    pub(crate) fn resolve_path(&self, path: &str) -> std::path::PathBuf {
+        let given = std::path::Path::new(path);
+        if given.is_absolute() { given.to_path_buf() } else { self.cwd.join(given) }
+    }
+
     fn open_out(&self, path: &str, append: bool, clobber: bool) -> Result<std::fs::File, String> {
         if self.opt_restricted {
             return Err(format!("{}: restricted: cannot redirect output", path));
@@ -9477,7 +9494,8 @@ impl Shell {
         // all. Deliberately a stat-then-open rather than O_EXCL: bash
         // does the same, and O_EXCL would also reject the /dev/null
         // case. The race that leaves is bash's too.
-        if self.opt_noclobber && !append && !clobber && std::fs::metadata(path).is_ok_and(|m| m.is_file()) {
+        let resolved = self.resolve_path(path);
+        if self.opt_noclobber && !append && !clobber && std::fs::metadata(&resolved).is_ok_and(|m| m.is_file()) {
             return Err(format!("{}: cannot overwrite existing file", path));
         }
         std::fs::OpenOptions::new()
@@ -9485,7 +9503,7 @@ impl Shell {
             .write(true)
             .append(append)
             .truncate(!append)
-            .open(path)
+            .open(&resolved)
             .map_err(|e| format!("{}: {}", path, os_message(&e)))
     }
 
@@ -9505,7 +9523,7 @@ impl Shell {
         if let Some(result) = dev_socket_file(path) {
             return result;
         }
-        std::fs::File::open(path).map_err(|e| format!("{}: {}", path, os_message(&e)))
+        std::fs::File::open(self.resolve_path(path)).map_err(|e| format!("{}: {}", path, os_message(&e)))
     }
 
     // The read+write counterpart to open_in/open_out -- bare `<>`/`N<>`'s
@@ -9520,7 +9538,12 @@ impl Shell {
         if let Some(result) = dev_socket_file(path) {
             return result;
         }
-        std::fs::OpenOptions::new().create(true).read(true).write(true).open(path).map_err(|e| format!("{}: {}", path, os_message(&e)))
+        std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(self.resolve_path(path))
+            .map_err(|e| format!("{}: {}", path, os_message(&e)))
     }
 
     // Restricted mode: SHELL/PATH/ENV/BASH_ENV can't be set or unset --
@@ -13737,6 +13760,11 @@ mod spawn_guard {
 
 #[cfg(test)]
 mod tests {
+    // The property the whole cwd change is for: a path a script names
+    // resolves against the *shell's* directory, and the process's is
+    // not consulted. Indistinguishable in a single shell -- the two are
+    // kept in step -- so this sets them apart deliberately, which is
+    // the state two interleaved pipeline stages are permanently in.
     // Pinned to UTC so the expected strings do not depend on where this
     // runs -- the same `TZ`+`tzset` trick git.rs's own date test uses.
     fn utc_printf(format: &str, args: &[&str]) -> String {
@@ -14078,6 +14106,35 @@ mod tests {
     }
 
     use super::*;
+
+    // The property the whole cwd change is for: a path a script names
+    // resolves against the *shell's* directory, and the process's is
+    // not consulted. Indistinguishable in a single shell -- the two are
+    // kept in step -- so this sets them apart deliberately, which is
+    // the state two interleaved pipeline stages are permanently in.
+    #[test]
+    fn a_path_resolves_against_the_shells_cwd_not_the_processs() {
+        let dir = std::env::temp_dir().join(format!("bish-cwd-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("elsewhere")).unwrap();
+        std::fs::write(dir.join("elsewhere/target.txt"), b"found me").unwrap();
+
+        let mut shell = Shell::new();
+        // The shell is told it lives in `elsewhere`; the process is not,
+        // and is never told.
+        shell.cwd = dir.join("elsewhere");
+        let process_cwd_before = std::env::current_dir().ok();
+
+        assert_eq!(shell.resolve_path("target.txt"), dir.join("elsewhere/target.txt"));
+        assert_eq!(shell.resolve_path("/absolute/stays"), std::path::Path::new("/absolute/stays"));
+
+        let mut opened = shell.open_in("target.txt").expect("a relative name resolves against the shell's cwd");
+        let mut text = String::new();
+        std::io::Read::read_to_string(&mut opened, &mut text).unwrap();
+        assert_eq!(text, "found me");
+
+        assert_eq!(std::env::current_dir().ok(), process_cwd_before, "and the process was never moved to make that work");
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn virtual_child_shares_jobs_and_promotion_but_not_vars() {

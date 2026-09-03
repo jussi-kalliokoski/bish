@@ -80,7 +80,7 @@ fn resolve_include(pattern: &str, from: &Path) -> Vec<PathBuf> {
             None => return Vec::new(),
         },
     };
-    match crate::glob::expand(&expanded, crate::glob::Options::default()) {
+    match crate::glob::expand(&expanded, crate::glob::Options::default(), std::path::Path::new(".")) {
         Some(paths) => paths.into_iter().map(PathBuf::from).collect(),
         // No matches, or no metacharacters to expand: the literal path,
         // which simply may not exist.

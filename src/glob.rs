@@ -296,7 +296,15 @@ pub struct Options {
 ///
 /// Every path component may be a pattern, and `**` (with `globstar`)
 /// stands for any number of directories, none included.
-pub fn expand(pattern: &str, options: Options) -> Option<Vec<String>> {
+/// Expands `pattern`, resolving a relative one against `root` rather
+/// than against the process's own current directory.
+///
+/// `root` is the *shell's* cwd. The two are the same until two shells
+/// share a process and one of them runs `cd`, which is what an
+/// in-process pipeline stage is. Matches come back relative, as the
+/// script wrote them -- `root` decides what they are relative *to*, not
+/// what they look like.
+pub fn expand(pattern: &str, options: Options, root: &std::path::Path) -> Option<Vec<String>> {
     if !has_meta(pattern) {
         return None;
     }
@@ -315,7 +323,7 @@ pub fn expand(pattern: &str, options: Options) -> Option<Vec<String>> {
                 // last component it also names the files it passed, so
                 // `**` on its own lists everything.
                 "**" if options.globstar => {
-                    for path in descend(base, !last) {
+                    for path in descend(base, !last, root) {
                         next.push(match (path.is_empty(), last) {
                             // No directories at all. On the end that is
                             // the base itself, which bash writes with
@@ -330,7 +338,7 @@ pub fn expand(pattern: &str, options: Options) -> Option<Vec<String>> {
                     }
                 }
                 _ => {
-                    for name in read_names(base, component, options) {
+                    for name in read_names(base, component, options, root) {
                         next.push(join(base, &name));
                     }
                 }
@@ -344,7 +352,7 @@ pub fn expand(pattern: &str, options: Options) -> Option<Vec<String>> {
     let mut found: Vec<String> = candidates
         .into_iter()
         .filter(|p| !p.is_empty())
-        .filter(|p| !trailing_slash || std::fs::metadata(p).is_ok_and(|m| m.is_dir()))
+        .filter(|p| !trailing_slash || std::fs::metadata(root.join(p)).is_ok_and(|m| m.is_dir()))
         .map(|p| match trailing_slash {
             true => format!("{p}/"),
             false => p,
@@ -358,8 +366,8 @@ pub fn expand(pattern: &str, options: Options) -> Option<Vec<String>> {
 // One component's worth of matching: the names in `base` that
 // `component` matches, or the component itself when it is not a
 // pattern (in which case only its existence matters).
-fn read_names(base: &str, component: &str, options: Options) -> Vec<String> {
-    let dir = if base.is_empty() { "." } else { base };
+fn read_names(base: &str, component: &str, options: Options, root: &std::path::Path) -> Vec<String> {
+    let dir = root.join(base);
     if !has_meta(component) {
         let literal = unescape(component);
         let path = join(base, &literal);
@@ -401,13 +409,12 @@ fn read_names(base: &str, component: &str, options: Options) -> Vec<String> {
 // `dirs_only` for a `**` that has something after it: whatever comes
 // next has to be looked up *inside*, and a file is not somewhere to
 // look.
-fn descend(base: &str, dirs_only: bool) -> Vec<String> {
-    let root = if base.is_empty() { "." } else { base };
+fn descend(base: &str, dirs_only: bool, root: &std::path::Path) -> Vec<String> {
+    let base = root.join(base);
     let mut out = vec![String::new()];
     let mut queue = vec![String::new()];
     while let Some(prefix) = queue.pop() {
-        let dir = join(root, &prefix);
-        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        let Ok(entries) = std::fs::read_dir(base.join(&prefix)) else { continue };
         let mut names: Vec<String> = entries.filter_map(|e| e.ok()).filter_map(|e| e.file_name().into_string().ok()).collect();
         names.sort();
         for name in names {
@@ -415,7 +422,7 @@ fn descend(base: &str, dirs_only: bool) -> Vec<String> {
                 continue;
             }
             let path = join(&prefix, &name);
-            let real_dir = std::fs::symlink_metadata(join(root, &path)).is_ok_and(|m| m.is_dir());
+            let real_dir = std::fs::symlink_metadata(base.join(&path)).is_ok_and(|m| m.is_dir());
             if real_dir {
                 queue.push(path.clone());
             }
