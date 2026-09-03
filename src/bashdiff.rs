@@ -231,6 +231,20 @@ mod tests {
         case("command-subst", r#"echo "$(printf a)$(printf b)""#),
         case("command-subst-backtick", "echo \"`printf a`\""),
         case("process-subst", r#"cat <(printf 'p\n')"#),
+        // `<( )` streams: the producer is a coroutine given time while
+        // the shell waits for whatever is consuming it, rather than
+        // being run to completion into a temp file first. The two that
+        // could not work the old way are the unbounded producers --
+        // running those to completion never finishes.
+        case("process-subst-streams-from-an-unbounded-producer", r#"head -2 <(yes)"#),
+        case("process-subst-streams-from-an-unbounded-shell-producer", r#"head -3 <(while true; do echo x; done)"#),
+        case("process-subst-two-at-once", r#"cat <(echo a) <(echo b)"#),
+        case("process-subst-as-a-redirect", r#"wc -l < <(printf '1\n2\n3\n')"#),
+        case("process-subst-read-by-a-builtin", r#"read v < <(echo hello); echo "[$v]""#),
+        case("process-subst-read-by-a-loop", r#"while read l; do echo "<$l>"; done < <(printf 'a\nb\n')"#),
+        case("process-subst-more-than-a-pipe-buffer", r#"wc -l < <(seq 1 20000)"#),
+        case("process-subst-producer-sees-the-shells-variables", r#"x=v; cat <(echo "$x")"#),
+        case("process-subst-does-not-leak-descriptors", r#"for i in 1 2 3 4 5; do cat <(echo $i) >/dev/null; done; ls /proc/self/fd | wc -l"#),
         case("group-command", r#"{ echo a; echo b; } | wc -l"#),
         // `time` is a reserved word, so it takes a whole pipeline and
         // a group, and `echo time` is still a word. The numbers vary,

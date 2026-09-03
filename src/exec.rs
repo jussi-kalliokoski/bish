@@ -231,6 +231,10 @@ struct StdioOverride {
 struct SharedReaderState {
     file: std::fs::File,
     pending: Vec<u8>,
+    /// So a read from here can give a live coroutine a turn instead of
+    /// blocking on bytes only this thread can produce -- `while read
+    /// ... done < <(cmd)` names a pipe whose far end is one.
+    coroutines: Rc<RefCell<crate::scheduler::Scheduler>>,
 }
 
 // A thin, freshly-built-per-call BufRead over a SharedReaderState --
@@ -316,6 +320,45 @@ pub(crate) fn write_all_parking(file: &mut std::fs::File, bytes: &[u8]) -> std::
     write_fd_parking(file.as_raw_fd(), bytes)
 }
 
+/// How many turns a `<( )` producer gets to notice that nobody is
+/// reading it any more, once the command using it has finished.
+const PROC_SUB_WINDDOWN_TURNS: usize = 8;
+
+/// A file this shell reads, which gives any live coroutine a turn
+/// rather than blocking in the kernel while one is waiting to run.
+///
+/// The case that needs it is `read v < <(echo hello)`: the name is a
+/// pipe a coroutine is on the far end of, and a plain blocking read
+/// here would wait for bytes that only this thread can produce. Where
+/// nothing is live -- every ordinary `< file` -- this is a bare read
+/// with one `poll` in front of it.
+struct PumpingFile {
+    file: std::fs::File,
+    coroutines: Rc<RefCell<crate::scheduler::Scheduler>>,
+}
+
+impl std::io::Read for PumpingFile {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        use std::os::fd::AsRawFd;
+        let fd = self.file.as_raw_fd();
+        loop {
+            if crate::poll::poll_readable_or_eof(fd, 0) {
+                return self.file.read(buf);
+            }
+            let Ok(mut scheduler) = self.coroutines.try_borrow_mut() else {
+                return self.file.read(buf);
+            };
+            if scheduler.is_idle() {
+                // Nothing can produce anything, so waiting in the
+                // kernel is right after all.
+                drop(scheduler);
+                return self.file.read(buf);
+            }
+            scheduler.step();
+        }
+    }
+}
+
 /// `write_all_parking` straight onto a descriptor.
 fn write_fd_parking(fd: i32, bytes: &[u8]) -> std::io::Result<()> {
     unsafe extern "C" {
@@ -343,16 +386,35 @@ fn write_fd_parking(fd: i32, bytes: &[u8]) -> std::io::Result<()> {
 
 /// `read`, with the same treatment: nothing to read yet means another
 /// stage has not written it yet, and that stage is a coroutine.
-fn read_parking(file: &mut std::fs::File, buf: &mut [u8]) -> std::io::Result<usize> {
+fn read_parking(file: &mut std::fs::File, buf: &mut [u8], coroutines: &Rc<RefCell<crate::scheduler::Scheduler>>) -> std::io::Result<usize> {
     use std::io::Read;
     use std::os::fd::AsRawFd;
     let fd = file.as_raw_fd();
     loop {
-        match briefly_nonblocking(fd, || file.read(buf)) {
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => crate::scheduler::park_readable(fd),
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-            other => return other,
+        // Inside a pipeline stage: hand the thread back to the
+        // scheduler, which is above this on the stack.
+        if crate::coroutine::in_coroutine() {
+            match briefly_nonblocking(fd, || file.read(buf)) {
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => crate::scheduler::park_readable(fd),
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                other => return other,
+            }
+            continue;
         }
+        // The shell itself, reading something a coroutine is feeding.
+        // Blocking here would wait for bytes only this thread can
+        // produce.
+        if crate::poll::poll_readable_or_eof(fd, 0) {
+            return file.read(buf);
+        }
+        let Ok(mut scheduler) = coroutines.try_borrow_mut() else {
+            return file.read(buf);
+        };
+        if scheduler.is_idle() {
+            drop(scheduler);
+            return file.read(buf);
+        }
+        scheduler.step();
     }
 }
 
@@ -362,7 +424,8 @@ impl std::io::BufRead for SharedStdinReader {
             let mut state = self.state.borrow_mut();
             if state.pending.is_empty() {
                 let mut tmp = [0u8; 8192];
-                let n = read_parking(&mut state.file, &mut tmp)?;
+                let state = &mut *state;
+                let n = read_parking(&mut state.file, &mut tmp, &state.coroutines)?;
                 state.pending.extend_from_slice(&tmp[..n]);
             }
             std::mem::swap(&mut self.local, &mut state.pending);
@@ -1250,6 +1313,19 @@ pub struct Shell {
     // Every proc-sub temp file created for the command currently being
     // built, deleted once it finishes (drain_proc_subs).
     proc_sub_cleanup: Vec<String>,
+    /// Coroutines that outlive the command that started them -- a
+    /// `<( )` producer, for now.
+    ///
+    /// Shared with virtual children the way the job table is: a
+    /// substitution written inside a subshell is still something this
+    /// process has to keep running. Given time wherever the shell would
+    /// otherwise be idle in the kernel; see `pump_coroutines`.
+    background_coroutines: Rc<RefCell<crate::scheduler::Scheduler>>,
+    /// Read ends of the pipes those producers are writing to, held open
+    /// until the command consuming them is done with them.
+    proc_sub_pipes: Vec<std::os::fd::OwnedFd>,
+    /// `<( )` producers that are real processes, waiting to be reaped.
+    proc_sub_children: Vec<std::process::Child>,
     // $RANDOM: xorshift64* state, reseeded from the current time at
     // startup (no external RNG crate). Advanced on every read.
     rng_state: u64,
@@ -1723,6 +1799,9 @@ impl Shell {
             shell_start: std::time::Instant::now(),
             seconds_offset: 0,
             jobs: Rc::new(RefCell::new(JobTable::new())),
+            background_coroutines: Rc::new(RefCell::new(crate::scheduler::Scheduler::new())),
+            proc_sub_pipes: Vec::new(),
+            proc_sub_children: Vec::new(),
             traps: std::collections::HashMap::new(),
             exit_trap: None,
             debug_trap: None,
@@ -2057,6 +2136,9 @@ impl Shell {
             shell_start: std::time::Instant::now(),
             seconds_offset: 0,
             jobs: self.jobs.clone(),
+            background_coroutines: Rc::clone(&self.background_coroutines),
+            proc_sub_pipes: Vec::new(),
+            proc_sub_children: Vec::new(),
             traps: self.traps.clone(),
             exit_trap: self.exit_trap.clone(),
             debug_trap: self.debug_trap.clone(),
@@ -4125,7 +4207,7 @@ impl Shell {
                 Redirect::In(w) => {
                     let p = self.expand_word(w);
                     return match self.open_in(&p) {
-                        Ok(f) => Box::new(std::io::BufReader::new(f)),
+                        Ok(f) => Box::new(std::io::BufReader::new(PumpingFile { file: f, coroutines: Rc::clone(&self.background_coroutines) })),
                         Err(e) => {
                             sh_eprintln!(self, "bish: {}", e);
                             Box::new(std::io::Cursor::new(Vec::new()))
@@ -4356,7 +4438,9 @@ impl Shell {
         let mut child = self.new_virtual_child();
 
         let effective_stdin: Option<Rc<RefCell<SharedReaderState>>> = match stdio.stdin {
-            Some(f) => Some(Rc::new(RefCell::new(SharedReaderState { file: f, pending: Vec::new() }))),
+            Some(f) => {
+                Some(Rc::new(RefCell::new(SharedReaderState { file: f, pending: Vec::new(), coroutines: Rc::clone(&self.background_coroutines) })))
+            }
             None => self.stdio_override.as_ref().and_then(|o| o.borrow().stdin.clone()),
         };
         let effective_stdout: Option<std::fs::File> = match &stdio.stdout {
@@ -4482,7 +4566,9 @@ impl Shell {
         let saved_stdio_override = self.stdio_override.clone();
 
         let effective_stdin: Option<Rc<RefCell<SharedReaderState>>> = match stdio.stdin {
-            Some(f) => Some(Rc::new(RefCell::new(SharedReaderState { file: f, pending: Vec::new() }))),
+            Some(f) => {
+                Some(Rc::new(RefCell::new(SharedReaderState { file: f, pending: Vec::new(), coroutines: Rc::clone(&self.background_coroutines) })))
+            }
             None => self.stdio_override.as_ref().and_then(|o| o.borrow().stdin.clone()),
         };
         let effective_stdout: Option<std::fs::File> = match &stdio.stdout {
@@ -4819,19 +4905,154 @@ impl Shell {
     // in lexer.rs for why this shell uses a temp file instead. The path is
     // queued for cleanup (self.proc_sub_cleanup) once the enclosing command
     // has finished reading it.
+    /// The single external command a `<( )` body is, if that is all it
+    /// is.
+    ///
+    /// `<(yes)`, `<(seq 1 10)`, `<(cat f)` -- the overwhelmingly common
+    /// shapes -- need no shell at all, and giving them one is what made
+    /// them hard: a coroutine that spawns a process has to wait for it,
+    /// and waiting is the one thing a coroutine cannot do. Spawned
+    /// directly they are exactly what bash produces, a real process
+    /// writing into the pipe, which ends by itself when the reader goes.
+    fn proc_sub_plain_command(&mut self, raw: &str) -> Option<Vec<String>> {
+        let toks = crate::lexer::Lexer::new(raw).tokenize().ok()?;
+        let prog = crate::parser::Parser::new(self.expand_aliases(toks)).parse_program().ok()?;
+        let [item] = prog.as_slice() else { return None };
+        if !item.and_or.rest.is_empty() || item.and_or.first.negate || item.and_or.first.timed.is_some() {
+            return None;
+        }
+        let [command] = item.and_or.first.commands.as_slice() else { return None };
+        if self.stage_needs_interpreter(command) {
+            return None;
+        }
+        let parser::Command::Simple(sc) = command else { return None };
+        // A redirect or an assignment prefix is the shell's business,
+        // not a bare spawn's.
+        if !sc.redirects.is_empty() || !sc.assigns.is_empty() {
+            return None;
+        }
+        let argv = self.expand_words(&sc.words);
+        (!argv.is_empty()).then_some(argv)
+    }
+
     fn run_proc_sub_in(&mut self, raw: &str) -> String {
-        let path = proc_sub_temp_path();
-        let file = match std::fs::File::create(&path) {
-            Ok(f) => f,
+        let (read_end, write_end) = match make_pipe() {
+            Ok(pair) => pair,
             Err(e) => {
                 sh_eprintln!(self, "bish: process substitution: {}", e);
                 return String::new();
             }
         };
-        self.run_in_child_shell(raw, ChildStdio { stdout: Some(file), ..Default::default() });
-        let path_str = path.to_string_lossy().into_owned();
-        self.proc_sub_cleanup.push(path_str.clone());
-        path_str
+        // The consuming command opens the name below, and for an
+        // external one that means inheriting this descriptor across
+        // `exec` -- so this end, unlike every other pipe this shell
+        // makes, must not close on it.
+        clear_cloexec(std::os::fd::AsRawFd::as_raw_fd(&read_end));
+
+        match self.proc_sub_plain_command(raw) {
+            // A real command: a real process, as in bash. Nothing to
+            // schedule, and it ends on its own when the reader goes.
+            Some(argv) => {
+                let mut command = self.command(&argv[0]);
+                command.args(&argv[1..]);
+                command.stdout(Stdio::from(write_end));
+                command.stdin(self.spawn_stdin_stdio());
+                match command.spawn() {
+                    Ok(child) => self.proc_sub_children.push(child),
+                    Err(e) => {
+                        sh_eprintln!(self, "bish: {}: {}", argv[0], os_message(&e));
+                        return String::new();
+                    }
+                }
+            }
+            // Anything that needs a shell runs as a coroutine, given
+            // time wherever this shell would otherwise be idle.
+            None => {
+                let mut child = self.new_virtual_child();
+                let body = raw.to_string();
+                let started = self.background_coroutines.borrow_mut().add_with_fds(
+                    move || {
+                        child.run_source_here(&body, "process substitution");
+                        child.run_exit_trap();
+                    },
+                    None,
+                    Some(write_end),
+                );
+                if let Err(e) = started {
+                    sh_eprintln!(self, "bish: process substitution: {}", e);
+                    return String::new();
+                }
+            }
+        }
+
+        // `/dev/fd/N` rather than a FIFO. Opening a FIFO blocks until
+        // the other end is opened too, and with one thread the other
+        // end is a coroutine that cannot run while this one is blocked
+        // in the kernel -- the deadlock is structural. `/dev/fd` names
+        // the pipe that already exists, so there is nothing to wait for.
+        let name = format!("/dev/fd/{}", std::os::fd::AsRawFd::as_raw_fd(&read_end));
+        self.proc_sub_pipes.push(read_end);
+        name
+    }
+
+    /// `child.wait()`, giving any live coroutine the time this shell
+    /// would otherwise spend blocked in the kernel.
+    ///
+    /// This is the whole reason `<( )` can stream: the command reading
+    /// the substitution is what this is waiting for, and the producer
+    /// filling it is a coroutine that has to run *while* that happens.
+    /// With nothing live it is a plain wait -- one `try_wait` more than
+    /// before, and no polling.
+    fn wait_pumping(&self, child: &mut std::process::Child) -> std::io::Result<std::process::ExitStatus> {
+        // Inside a coroutine there is no such thing as waiting: this
+        // thread is shared, and blocking in the kernel takes every
+        // other stage down with it -- including whichever one would
+        // have let this child finish. `<(yes)` deadlocked exactly
+        // there: the producer blocked waiting for `yes`, so the shell
+        // never noticed `head` had exited, so nothing ever closed the
+        // pipe `yes` was writing to.
+        if crate::coroutine::in_coroutine() {
+            loop {
+                if let Some(status) = child.try_wait()? {
+                    return Ok(status);
+                }
+                crate::scheduler::park_ready();
+            }
+        }
+        if !self.has_live_coroutines() {
+            return child.wait();
+        }
+        loop {
+            if let Some(status) = child.try_wait()? {
+                return Ok(status);
+            }
+            if !self.has_live_coroutines() {
+                // Nothing left to give time to, so go back to blocking
+                // rather than spinning on `try_wait`.
+                return child.wait();
+            }
+            self.pump_coroutines();
+        }
+    }
+
+    /// Gives any coroutine that outlives its command a turn.
+    ///
+    /// Called where the shell would otherwise be idle in the kernel --
+    /// waiting for a child, waiting for input. That is the whole of the
+    /// scheduling policy for these: they run in the gaps, which is
+    /// exactly when the thing they are feeding is not running either.
+    pub(crate) fn pump_coroutines(&self) {
+        let Ok(mut scheduler) = self.background_coroutines.try_borrow_mut() else {
+            // Already inside a step: a coroutine reached a point that
+            // pumps. It is already running; there is nothing to do.
+            return;
+        };
+        scheduler.step();
+    }
+
+    /// Whether anything is waiting for a turn.
+    pub(crate) fn has_live_coroutines(&self) -> bool {
+        self.background_coroutines.try_borrow().is_ok_and(|s| !s.is_idle())
     }
 
     // `>(cmd)`: substitutes a temp file path immediately (so the enclosing
@@ -4863,6 +5084,39 @@ impl Shell {
         }
         for path in self.proc_sub_cleanup.drain(..) {
             let _ = std::fs::remove_file(path);
+        }
+        // The read ends of any `<( )` this command used. Dropping them
+        // is what tells a producer still running that nobody is
+        // listening: its next write fails, and it ends -- which is how
+        // `head -2 <(yes)` finishes rather than producing for ever.
+        // One turn afterwards so it gets to notice; anything still
+        // going after that is left for the next pump rather than
+        // waited on, since bash does not wait for these either.
+        self.proc_sub_pipes.clear();
+        // Reaped, not waited for: the reader is gone, so each of these
+        // is either finished or about to be, and bash does not block
+        // here either.
+        for mut child in std::mem::take(&mut self.proc_sub_children) {
+            if child.try_wait().is_ok_and(|s| s.is_none()) {
+                let _ = child.kill();
+            }
+            let _ = child.wait();
+        }
+        if let Ok(mut scheduler) = self.background_coroutines.try_borrow_mut() {
+            scheduler.cancel_running();
+        }
+        // Turns, not a wait: a producer that has noticed finishes in
+        // one or two, and one that has not is left for the next pump
+        // rather than blocking the shell -- bash does not wait for
+        // these either.
+        for _ in 0..PROC_SUB_WINDDOWN_TURNS {
+            if !self.has_live_coroutines() {
+                break;
+            }
+            self.pump_coroutines();
+        }
+        if let Ok(mut scheduler) = self.background_coroutines.try_borrow_mut() {
+            scheduler.retire_finished();
         }
     }
 
@@ -7432,7 +7686,7 @@ impl Shell {
                     }
                 } else {
                     let mut child = child;
-                    let result = match child.wait() {
+                    let result = match self.wait_pumping(&mut child) {
                         Ok(status) => ExecResult::Status(exit_code_from_status(status)),
                         Err(e) => {
                             sh_eprintln!(self, "bish: {}", e);

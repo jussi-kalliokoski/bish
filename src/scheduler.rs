@@ -86,6 +86,9 @@ struct Task {
     /// -- see `exec::swap_broken_pipe` for why it cannot just be the
     /// thread's.
     broken: Option<bool>,
+    /// Set when nothing will read this task's output any more. It is
+    /// never resumed again -- see `cancel_running`.
+    cancelled: bool,
 }
 
 impl Task {
@@ -121,7 +124,7 @@ impl Scheduler {
 
     /// Adds a coroutine. Nothing runs until `run`.
     pub fn add(&mut self, body: impl FnOnce() + 'static) -> std::io::Result<()> {
-        self.tasks.push(Task { co: Coroutine::new(body)?, park: Park::Ready, broken: None, stdin: None, stdout: None });
+        self.tasks.push(Task { co: Coroutine::new(body)?, park: Park::Ready, broken: None, cancelled: false, stdin: None, stdout: None });
         Ok(())
     }
 
@@ -134,8 +137,80 @@ impl Scheduler {
         stdin: Option<std::os::fd::OwnedFd>,
         stdout: Option<std::os::fd::OwnedFd>,
     ) -> std::io::Result<()> {
-        self.tasks.push(Task { co: Coroutine::new(body)?, park: Park::Ready, broken: None, stdin, stdout });
+        self.tasks.push(Task { co: Coroutine::new(body)?, park: Park::Ready, broken: None, cancelled: false, stdin, stdout });
         Ok(())
+    }
+
+    /// Whether anything is still running.
+    pub fn is_idle(&self) -> bool {
+        self.tasks.iter().all(|t| t.co.state() == State::Done || t.cancelled)
+    }
+
+    /// Gives every runnable coroutine one turn and returns, rather than
+    /// running to completion.
+    ///
+    /// This is what a construct that outlives its command needs: a
+    /// `<( )` producer has to make progress while the shell is waiting
+    /// for the command *consuming* it, and that shell is not inside
+    /// `run`. It is called from the places the shell would otherwise
+    /// sit idle in the kernel -- see `Shell::pump_coroutines` -- so a
+    /// live coroutine costs nothing and gets time wherever there was
+    /// none being used.
+    ///
+    /// Blocking here would be wrong in a way it is not in `run`: the
+    /// caller has its own reason to come back.
+    pub fn step(&mut self) {
+        if self.is_idle() {
+            return;
+        }
+        let saved = crate::exec::save_fd012_for_scheduler();
+        for index in 0..self.tasks.len() {
+            if self.tasks[index].co.state() == State::Done || self.tasks[index].cancelled || !self.can_run(index) {
+                continue;
+            }
+            REASON.with(|r| r.set(Park::Ready));
+            let outer = crate::exec::swap_broken_pipe(self.tasks[index].broken);
+            install_fds(&self.tasks[index], saved);
+            self.tasks[index].co.resume();
+            self.tasks[index].broken = crate::exec::swap_broken_pipe(outer);
+            self.tasks[index].park = REASON.with(|r| r.get());
+            if self.tasks[index].co.state() == State::Done {
+                self.tasks[index].stdin = None;
+                self.tasks[index].stdout = None;
+            }
+        }
+        crate::exec::restore_fd012_for_scheduler(saved);
+    }
+
+    /// Stops every task that is still running: nothing is going to read
+    /// what it produces.
+    ///
+    /// What the shell does once the command consuming a `<( )` has
+    /// finished. Stopping rather than closing the descriptor, because
+    /// "no output" has no descriptor to name: leaving `stdout` as
+    /// `None` means "the shell's own", so a producer that kept going
+    /// wrote its remaining output *to the terminal* --
+    /// `head -3 <(while true; do echo x; done)` printed x's for as long
+    /// as it was pumped.
+    ///
+    /// A cancelled task is never resumed again and is dropped by
+    /// `retire_finished`, which unmaps its stack. Whatever that stack
+    /// still owned is leaked rather than dropped -- see `Coroutine`'s
+    /// own `Drop` -- which is the price of stopping something in the
+    /// middle, and is what a real shell gets for free by having the
+    /// kernel kill a process.
+    pub fn cancel_running(&mut self) {
+        for task in self.tasks.iter_mut().filter(|t| t.co.state() != State::Done) {
+            task.cancelled = true;
+            task.stdin = None;
+            task.stdout = None;
+        }
+    }
+
+    /// Drops every finished task, so a long-lived shell does not
+    /// accumulate them.
+    pub fn retire_finished(&mut self) {
+        self.tasks.retain(|t| t.co.state() != State::Done && !t.cancelled);
     }
 
     /// Runs every coroutine until all of them have finished.
@@ -154,10 +229,10 @@ impl Scheduler {
     }
 
     fn run_tasks(&mut self, shells_own: [i32; 3]) -> bool {
-        while self.tasks.iter().any(|t| t.co.state() != State::Done) {
+        while !self.is_idle() {
             let mut ran_something = false;
             for index in 0..self.tasks.len() {
-                if self.tasks[index].co.state() == State::Done {
+                if self.tasks[index].co.state() == State::Done || self.tasks[index].cancelled {
                     continue;
                 }
                 if !self.can_run(index) {
@@ -195,7 +270,7 @@ impl Scheduler {
                 // will ever become ready, so the remaining coroutines
                 // cannot proceed. Letting them run once more turns a
                 // hang into whatever they do about a closed pipe.
-                for task in self.tasks.iter_mut().filter(|t| t.co.state() != State::Done) {
+                for task in self.tasks.iter_mut().filter(|t| t.co.state() != State::Done && !t.cancelled) {
                     task.park = Park::Ready;
                 }
             }
@@ -216,7 +291,7 @@ impl Scheduler {
     /// there was nothing to wait for.
     fn wait_for_any(&self) -> bool {
         let mut any = false;
-        for task in self.tasks.iter().filter(|t| t.co.state() != State::Done) {
+        for task in self.tasks.iter().filter(|t| t.co.state() != State::Done && !t.cancelled) {
             match task.park {
                 Park::Ready => return true,
                 Park::Readable(fd) | Park::Writable(fd) => {
@@ -233,7 +308,7 @@ impl Scheduler {
         // ready or the timeout expires and the loop tries the rest.
         // A single `poll` over all of them would be better with many
         // more tasks than a pipeline ever has.
-        for task in self.tasks.iter().filter(|t| t.co.state() != State::Done) {
+        for task in self.tasks.iter().filter(|t| t.co.state() != State::Done && !t.cancelled) {
             let ready = match task.park {
                 Park::Ready => true,
                 Park::Readable(fd) => crate::poll::poll_readable_or_eof(task.own_fd(fd), POLL_SLICE_MS),
