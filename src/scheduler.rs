@@ -121,6 +121,15 @@ struct Task {
     /// Set when nothing will read this task's output any more. It is
     /// never resumed again -- see `cancel_running`.
     cancelled: bool,
+    /// Whether `cancel_running` may stop this one.
+    ///
+    /// A `<( )` producer may: once the command reading it has finished,
+    /// anything more it produces goes nowhere. A `>( )` consumer may
+    /// not -- when the enclosing command ends, the consumer has just
+    /// been *handed* its input and has not written its answer yet, so
+    /// stopping it there is the one thing that loses the output
+    /// entirely.
+    cancellable: bool,
 }
 
 impl Task {
@@ -156,7 +165,15 @@ impl Scheduler {
 
     /// Adds a coroutine. Nothing runs until `run`.
     pub fn add(&mut self, body: impl FnOnce() + 'static) -> std::io::Result<()> {
-        self.tasks.push(Task { co: Coroutine::new(body)?, park: Park::Ready, broken: None, cancelled: false, stdin: None, stdout: None });
+        self.tasks.push(Task {
+            co: Coroutine::new(body)?,
+            park: Park::Ready,
+            broken: None,
+            cancelled: false,
+            cancellable: true,
+            stdin: None,
+            stdout: None,
+        });
         Ok(())
     }
 
@@ -168,8 +185,9 @@ impl Scheduler {
         body: impl FnOnce() + 'static,
         stdin: Option<std::os::fd::OwnedFd>,
         stdout: Option<std::os::fd::OwnedFd>,
+        cancellable: bool,
     ) -> std::io::Result<()> {
-        self.tasks.push(Task { co: Coroutine::new(body)?, park: Park::Ready, broken: None, cancelled: false, stdin, stdout });
+        self.tasks.push(Task { co: Coroutine::new(body)?, park: Park::Ready, broken: None, cancelled: false, cancellable, stdin, stdout });
         Ok(())
     }
 
@@ -235,7 +253,7 @@ impl Scheduler {
     /// middle, and is what a real shell gets for free by having the
     /// kernel kill a process.
     pub fn cancel_running(&mut self) {
-        for task in self.tasks.iter_mut().filter(|t| t.co.state() != State::Done) {
+        for task in self.tasks.iter_mut().filter(|t| t.co.state() != State::Done && t.cancellable) {
             task.cancelled = true;
             task.stdin = None;
             task.stdout = None;

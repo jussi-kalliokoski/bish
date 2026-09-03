@@ -246,6 +246,20 @@ mod tests {
         case("proc-sub-out-to-an-externals-redirect", r#"/bin/echo hi > >(cat)"#),
         case("proc-sub-out-that-answers-at-eof", r#"printf 'a\nb\n' > >(wc -l)"#),
         case("proc-sub-out-as-an-argument", r#"tee >(wc -l) < /etc/hostname > /dev/null"#),
+        // `>( )` runs concurrently with the command writing to it, so
+        // the body's output lands after that command's -- and a body
+        // that answers only at end-of-input answers at all.
+        case("proc-sub-out-ordering", r#"echo hi > >(cat); echo done"#),
+        case("proc-sub-out-with-a-shell-body", r#"printf 'a\nb\n' > >(while read l; do echo "<$l>"; done)"#),
+        case("proc-sub-out-two-at-once", r#"printf 'x\n' > >(cat) 2>/dev/null; printf 'y\n' > >(cat)"#),
+        case("proc-sub-out-larger-than-a-pipe-buffer", r#"seq 1 20000 > >(wc -l)"#),
+        // A redirect target is expanded once. It used to be expanded
+        // twice for an external command -- once to build a sink that
+        // an external does not use, once for the spawn -- so a target
+        // with a side effect had it twice, and one that is not stable
+        // could name two different files.
+        case("redirect-target-is-expanded-once", r#"/bin/echo x > $(echo side >&2; echo out.txt); cat out.txt"#),
+        case("redirect-target-expanded-once-for-a-builtin", r#"echo x > $(echo side >&2; echo out.txt); cat out.txt"#),
         // `<( )` streams: the producer is a coroutine given time while
         // the shell waits for whatever is consuming it, rather than
         // being run to completion into a temp file first. The two that
@@ -545,6 +559,17 @@ y
         // skip_terminators, which every construct's list parsing goes
         // through, and is not worth the blast radius on its own.
         ("empty-command-between-separators", "`;` twice in a row is skipped rather than reported"),
+        // A name can be declared an array without ever being assigned
+        // one, and bash prints that as `declare -a A` with no value --
+        // distinct from `A=()`, which really is an assignment of an
+        // empty array and does print `=()`. bish creates the (empty)
+        // map at declaration and cannot tell the two apart afterwards.
+        ("declare-p-of-a-declared-but-unassigned-array", "`declare -a A; declare -p A` prints `declare -a A=()`; bash prints `declare -a A`"),
+        // Pre-existing, and named now that the redirect simulation made
+        // the rest of the list exact: `>&2` means "the enclosing
+        // stderr", and OutputSink::Builtin's two booleans can only say
+        // "this sink's other stream, else the enclosing one" -- a
+        // different thing once the same command also redirects fd 2.
         // Pre-existing, and named now that the redirect simulation made
         // the rest of the list exact: `>&2` means "the enclosing
         // stderr", and OutputSink::Builtin's two booleans can only say
@@ -553,33 +578,6 @@ y
         // Expressing it wants the sink's stdout/stderr fields to hold a
         // small enum (a file, or the enclosing out/err) rather than a
         // file plus two flags.
-        // `>( )` produces the right bytes but at the wrong time. bish
-        // runs the body once the enclosing command has finished, over
-        // a temp file; bash runs it concurrently, so
-        // `echo hi > >(cat); echo done` prints `done hi` there and
-        // `hi done` here.
-        //
-        // Making it concurrent is the mirror of what `<( )` already
-        // does and was attempted: the machinery works, and the two
-        // traps in it are worth writing down for whoever picks it up.
-        // A body must not inherit the far end of its own pipe -- the
-        // `/dev/fd/N` name needs close-on-exec cleared, and doing that
-        // before the body is started leaves it holding its own input
-        // open, so `>(wc -l)` never reaches end-of-input and answers
-        // nothing while `>(cat)` looks fine by echoing as it reads.
-        // And a `>( )` body must not be stopped when the command ends
-        // the way a `<( )` body must: it has just been handed its
-        // input and has not written its answer, which cost `tee` its
-        // buffered file. What was not solved is an unbounded *shell*
-        // body -- `head -3 <(while true; do echo x; done)` printed its
-        // three lines and then hung.
-        ("proc-sub-out-ordering", "`echo hi > >(cat); echo done` prints `hi done`; bash prints `done hi`, running the body concurrently"),
-        // A name can be declared an array without ever being assigned
-        // one, and bash prints that as `declare -a A` with no value at
-        // all -- distinct from `A=()`, which really is an assignment of
-        // an empty array and prints `=()`. bish creates the (empty) map
-        // at declaration and so cannot tell the two apart afterwards.
-        ("declare-p-of-a-declared-but-unassigned-array", "`declare -a A; declare -p A` prints `declare -a A=()`; bash prints `declare -a A`"),
         (
             "dup-to-stderr-that-is-itself-redirected",
             "`echo e >&2 2>/dev/null` writes to /dev/null; bash writes to the stderr `>&2` named, which is the one from before this command",
@@ -591,7 +589,6 @@ y
     const PENDING: &[Case] = &[
         // -- roadmap 10: parser leniency, the part still standing -----
         case("empty-command-between-separators", "echo a; ; echo b"),
-        case("proc-sub-out-ordering", r#"echo hi > >(cat); echo done"#),
         case("declare-p-of-a-declared-but-unassigned-array", r#"declare -a A; declare -p A"#),
         // Not recordable here, and worth saying why: `SHLVL` counts one
         // higher through two levels of `-c`, because bash decrements it

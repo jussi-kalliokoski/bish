@@ -1306,10 +1306,6 @@ pub struct Shell {
     // env for any name in this set, so child processes can see it despite
     // it living in var_scopes rather than env.
     pub(crate) exported_names: std::collections::HashSet<String>,
-    // `>(cmd)` substitutions queued by the command currently being built,
-    // to run (reading the temp file back) once it finishes; see
-    // run_proc_sub_out/drain_proc_subs.
-    proc_sub_out_pending: Vec<(String, String)>,
     // Every proc-sub temp file created for the command currently being
     // built, deleted once it finishes (drain_proc_subs).
     proc_sub_cleanup: Vec<String>,
@@ -1321,11 +1317,14 @@ pub struct Shell {
     /// process has to keep running. Given time wherever the shell would
     /// otherwise be idle in the kernel; see `pump_coroutines`.
     background_coroutines: Rc<RefCell<crate::scheduler::Scheduler>>,
-    /// Read ends of the pipes those producers are writing to, held open
-    /// until the command consuming them is done with them.
+    /// This shell's own ends of the pipes a substitution is on the far
+    /// side of, held until the command using them is done.
     proc_sub_pipes: Vec<std::os::fd::OwnedFd>,
-    /// `<( )` producers that are real processes, waiting to be reaped.
-    proc_sub_children: Vec<std::process::Child>,
+    /// Substitutions that are real processes, with whether this shell
+    /// may stop one that is still running -- a `<( )` producer may be,
+    /// a `>( )` consumer may not. Killing one of those cost `tee` its
+    /// buffered file: it had written to stdout and not yet flushed.
+    proc_sub_children: Vec<(std::process::Child, bool)>,
     // $RANDOM: xorshift64* state, reseeded from the current time at
     // startup (no external RNG crate). Advanced on every read.
     rng_state: u64,
@@ -1793,7 +1792,6 @@ impl Shell {
             exported_names: inherited.iter().map(|(k, _)| k.clone()).collect(),
             globals: inherited.iter().cloned().collect(),
             effects: 0,
-            proc_sub_out_pending: Vec::new(),
             proc_sub_cleanup: Vec::new(),
             rng_state: fresh_rng_seed(),
             shell_start: std::time::Instant::now(),
@@ -2130,7 +2128,6 @@ impl Shell {
             exported_names: self.exported_names.clone(),
             globals: self.globals.clone(),
             effects: self.effects,
-            proc_sub_out_pending: Vec::new(),
             proc_sub_cleanup: Vec::new(),
             rng_state: fresh_rng_seed(),
             shell_start: std::time::Instant::now(),
@@ -4979,12 +4976,6 @@ impl Shell {
                 return String::new();
             }
         };
-        // The consuming command opens the name below, and for an
-        // external one that means inheriting this descriptor across
-        // `exec` -- so this end, unlike every other pipe this shell
-        // makes, must not close on it.
-        clear_cloexec(std::os::fd::AsRawFd::as_raw_fd(&read_end));
-
         match self.proc_sub_plain_command(raw) {
             // A real command: a real process, as in bash. Nothing to
             // schedule, and it ends on its own when the reader goes.
@@ -4994,7 +4985,7 @@ impl Shell {
                 command.stdout(Stdio::from(write_end));
                 command.stdin(self.spawn_stdin_stdio());
                 match command.spawn() {
-                    Ok(child) => self.proc_sub_children.push(child),
+                    Ok(child) => self.proc_sub_children.push((child, true)),
                     Err(e) => {
                         sh_eprintln!(self, "bish: {}: {}", argv[0], os_message(&e));
                         return String::new();
@@ -5008,11 +4999,24 @@ impl Shell {
                 let body = raw.to_string();
                 let started = self.background_coroutines.borrow_mut().add_with_fds(
                     move || {
+                        // Armed for the same reason a pipeline stage
+                        // arms it: this body writes into a pipe whose
+                        // reader can go away, and `EPIPE` is the only
+                        // way it can find out. Without it an unbounded
+                        // producer never stops -- and since the drain
+                        // now gives bodies turns *before* cancelling
+                        // any (which a `>( )` consumer needs to write
+                        // its answer), one of those turns never
+                        // returned: the loop spun inside a single
+                        // resume with the whole thread in it.
+                        arm_broken_pipe();
                         child.run_source_here(&body, "process substitution");
                         child.run_exit_trap();
+                        disarm_broken_pipe();
                     },
                     None,
                     Some(write_end),
+                    true,
                 );
                 if let Err(e) = started {
                     sh_eprintln!(self, "bish: process substitution: {}", e);
@@ -5026,6 +5030,13 @@ impl Shell {
         // end is a coroutine that cannot run while this one is blocked
         // in the kernel -- the deadlock is structural. `/dev/fd` names
         // the pipe that already exists, so there is nothing to wait for.
+        // The consuming command opens the name below, and for an
+        // external one that means inheriting this descriptor across
+        // `exec` -- so this end, unlike every other pipe this shell
+        // makes, must not close on it. *After* the producer is started,
+        // never before: it would otherwise inherit the read end of its
+        // own output pipe and hold it open against itself.
+        clear_cloexec(std::os::fd::AsRawFd::as_raw_fd(&read_end));
         let name = format!("/dev/fd/{}", std::os::fd::AsRawFd::as_raw_fd(&read_end));
         self.proc_sub_pipes.push(read_end);
         name
@@ -5095,65 +5106,126 @@ impl Shell {
     // command can write to it like any other file), and queues cmd to run
     // reading that file back once the enclosing command finishes -- correct
     // data flow, but sequential rather than concurrent (see lexer.rs).
+    /// `>(cmd)`: the mirror of `<(cmd)`. The enclosing command writes
+    /// to the name and `cmd` reads it, concurrently -- rather than the
+    /// body being queued to run over a temp file once the command has
+    /// finished.
+    ///
+    /// The old shape had the right data flow at the wrong time:
+    /// `echo hi > >(cat); echo done` printed `hi done` where bash
+    /// prints `done hi`, and a body that needed to see output as it was
+    /// produced never could.
     fn run_proc_sub_out(&mut self, raw: &str) -> String {
-        let path = proc_sub_temp_path();
-        if let Err(e) = std::fs::File::create(&path) {
-            sh_eprintln!(self, "bish: process substitution: {}", e);
-            return String::new();
+        let (read_end, write_end) = match make_pipe() {
+            Ok(pair) => pair,
+            Err(e) => {
+                sh_eprintln!(self, "bish: process substitution: {}", e);
+                return String::new();
+            }
+        };
+        match self.proc_sub_plain_command(raw) {
+            // A real command reading the pipe, as in bash. It ends on
+            // its own when the writing end closes.
+            Some(argv) => {
+                let mut command = self.command(&argv[0]);
+                command.args(&argv[1..]);
+                command.stdin(Stdio::from(read_end));
+                command.stdout(self.spawn_stdout_stdio());
+                match command.spawn() {
+                    Ok(child) => self.proc_sub_children.push((child, false)),
+                    Err(e) => {
+                        sh_eprintln!(self, "bish: {}: {}", argv[0], os_message(&e));
+                        return String::new();
+                    }
+                }
+            }
+            None => {
+                let mut child = self.new_virtual_child();
+                let body = raw.to_string();
+                let started = self.background_coroutines.borrow_mut().add_with_fds(
+                    move || {
+                        // Armed for the same reason a pipeline stage
+                        // arms it: this body writes into a pipe whose
+                        // reader can go away, and `EPIPE` is the only
+                        // way it can find out. Without it an unbounded
+                        // producer never stops -- and since the drain
+                        // now gives bodies turns *before* cancelling
+                        // any (which a `>( )` consumer needs to write
+                        // its answer), one of those turns never
+                        // returned: the loop spun inside a single
+                        // resume with the whole thread in it.
+                        arm_broken_pipe();
+                        child.run_source_here(&body, "process substitution");
+                        child.run_exit_trap();
+                        disarm_broken_pipe();
+                    },
+                    Some(read_end),
+                    None,
+                    // Not cancellable: see `Task::cancellable`.
+                    false,
+                );
+                if let Err(e) = started {
+                    sh_eprintln!(self, "bish: process substitution: {}", e);
+                    return String::new();
+                }
+            }
         }
-        let path_str = path.to_string_lossy().into_owned();
-        self.proc_sub_out_pending.push((path_str.clone(), raw.to_string()));
-        path_str
+
+        // As in `run_proc_sub_in`, and after the body is started for
+        // the same reason -- more sharply here: a body that inherited
+        // the write end of its own *input* pipe holds it open against
+        // itself and never reaches end-of-input at all. `>(cat)` hides
+        // that by echoing as it reads; `>(wc -l)`, which answers only
+        // at end-of-input, answers nothing.
+        clear_cloexec(std::os::fd::AsRawFd::as_raw_fd(&write_end));
+        let name = format!("/dev/fd/{}", std::os::fd::AsRawFd::as_raw_fd(&write_end));
+        self.proc_sub_pipes.push(write_end);
+        name
     }
 
     // Runs any `>(cmd)` substitutions queued by the command that just
     // finished, then deletes every proc-sub temp file used this round.
     fn drain_proc_subs(&mut self) {
-        if !self.proc_sub_out_pending.is_empty() {
-            let pending = std::mem::take(&mut self.proc_sub_out_pending);
-            for (path, raw) in pending {
-                if let Ok(file) = std::fs::File::open(&path) {
-                    self.run_in_child_shell(&raw, ChildStdio { stdin: Some(file), ..Default::default() });
-                }
-                self.proc_sub_cleanup.push(path);
-            }
-        }
         for path in self.proc_sub_cleanup.drain(..) {
             let _ = std::fs::remove_file(path);
         }
-        // The read ends of any `<( )` this command used. Dropping them
-        // is what tells a producer still running that nobody is
-        // listening: its next write fails, and it ends -- which is how
-        // `head -2 <(yes)` finishes rather than producing for ever.
-        // One turn afterwards so it gets to notice; anything still
-        // going after that is left for the next pump rather than
-        // waited on, since bash does not wait for these either.
+        // Closing this shell's own ends is what tells both kinds of
+        // substitution that the command is over: a `<( )` producer's
+        // next write fails, and a `>( )` consumer sees end-of-input.
         self.proc_sub_pipes.clear();
-        // Reaped, not waited for: the reader is gone, so each of these
-        // is either finished or about to be, and bash does not block
-        // here either.
-        for mut child in std::mem::take(&mut self.proc_sub_children) {
-            if child.try_wait().is_ok_and(|s| s.is_none()) {
-                let _ = child.kill();
-            }
-            let _ = child.wait();
-        }
-        if let Ok(mut scheduler) = self.background_coroutines.try_borrow_mut() {
-            scheduler.cancel_running();
-        }
-        // Turns, not a wait: a producer that has noticed finishes in
-        // one or two, and one that has not is left for the next pump
-        // rather than blocking the shell -- bash does not wait for
-        // these either.
+        // Then let them finish. A consumer *has* to be given this --
+        // `printf x > >(wc -l)` has only just been handed its input --
+        // and a producer takes a turn or two to notice and stop.
         for _ in 0..PROC_SUB_WINDDOWN_TURNS {
             if !self.has_live_coroutines() {
                 break;
             }
             self.pump_coroutines();
         }
+        // Whatever is still going is a producer with nobody listening.
         if let Ok(mut scheduler) = self.background_coroutines.try_borrow_mut() {
+            scheduler.cancel_running();
             scheduler.retire_finished();
         }
+        // And the ones that are real processes: a producer nobody is
+        // reading is stopped, a consumer is left alone and reaped when
+        // it finishes. Waiting for a consumer would make the shell
+        // block on something it deliberately started in the background,
+        // and bash does not.
+        let mut still_running = Vec::new();
+        for (mut child, may_stop) in std::mem::take(&mut self.proc_sub_children) {
+            match child.try_wait() {
+                Ok(Some(_)) | Err(_) => continue,
+                Ok(None) => {}
+            }
+            if may_stop {
+                let _ = child.kill();
+                let _ = child.wait();
+                continue;
+            }
+            still_running.push((child, may_stop));
+        }
+        self.proc_sub_children = still_running;
     }
 
     /// `FUNCNEST`, if a script has set it to something meaningful.
@@ -6238,12 +6310,25 @@ impl Shell {
         // that unrelated, still-needed layer the moment a command with no
         // redirect of its own (push returning `Ok(false)`, doing nothing)
         // ran inside it.
-        let pushed = match self.push_builtin_output_sink(&cmd.redirects, &name) {
-            Ok(pushed) => pushed,
-            Err(e) => {
-                sh_eprintln!(self, "bish: {}", e);
-                return ExecResult::Status(1);
+        // Only for a command that will run *in* this shell. An
+        // external's redirects are applied to the spawned process by
+        // `resolve_redirects` further down, and expanding them here as
+        // well expanded every redirect target twice: `/bin/echo x >
+        // $(echo side >&2; echo f)` ran that substitution twice, so the
+        // file it created and the file it wrote could be different
+        // ones. Invisible until `>( )` started a process per expansion
+        // and a second `wc -l` answered `0`.
+        let runs_here = self.is_active_builtin(&name) || self.functions.contains_key(&name);
+        let pushed = if runs_here {
+            match self.push_builtin_output_sink(&cmd.redirects, &name) {
+                Ok(pushed) => pushed,
+                Err(e) => {
+                    sh_eprintln!(self, "bish: {}", e);
+                    return ExecResult::Status(1);
+                }
             }
+        } else {
+            false
         };
         let result = self.dispatch_builtin_or_external_impl(argv, name, cmd, background, builtin_only, array_literal_args);
         if pushed {
@@ -7921,7 +8006,10 @@ impl Shell {
                 // SIGPIPE would have given it.
                 code.set(if disarm_broken_pipe() { 128 + 13 } else { result.status() });
             };
-            if let Err(e) = scheduler.add_with_fds(stage, stdin_end, stdout_end) {
+            // Pipeline stages are run to completion by `Scheduler::run`
+            // before anything else happens, so cancellation never
+            // reaches them either way.
+            if let Err(e) = scheduler.add_with_fds(stage, stdin_end, stdout_end, true) {
                 sh_eprintln!(self, "bish: {}", e);
                 kill_all(children);
                 return 1;
