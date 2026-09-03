@@ -74,6 +74,20 @@ pub(crate) fn run_cd(sh: &mut Shell, args: &[String]) -> i32 {
 }
 
 pub(crate) fn run_pushd(sh: &mut Shell, args: &[String]) -> i32 {
+    // `-n`: add to the stack without changing directory. bash's own
+    // flag, and the only way to describe a directory stack to a shell
+    // that does not have one yet -- which is what the preamble a
+    // re-exec'd construct is handed has to do (see
+    // `Shell::functions_preamble`).
+    if args.iter().any(|a| a == "-n") {
+        let Some(dir) = args.iter().find(|a| !a.starts_with('-')) else {
+            sh_eprintln!(sh, "bish: pushd: no other directory");
+            return 1;
+        };
+        sh.dir_stack.insert(0, dir.clone());
+        sh.print_dirs(false);
+        return 0;
+    }
     let target = match args.iter().find(|a| !a.starts_with('-')) {
         Some(d) => d.clone(),
         None => match sh.dir_stack.first() {

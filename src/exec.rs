@@ -4368,6 +4368,42 @@ impl Shell {
                 line: 0,
             }]));
         }
+        // The directory stack, traps and completion specifications --
+        // the three things a re-exec'd construct could not see.
+        //
+        // This is the list the roadmap called one that "grows and is
+        // never finished", and that was the right objection to it for
+        // *pipeline stages*, which are hot and now do not re-exec at
+        // all. What is left re-execing -- a co-process, a backgrounded
+        // subshell -- starts once and lives, so the list is three items
+        // and the cost of replaying them is paid a single time. The
+        // objection was to the price, and the price is different here.
+        //
+        // Deliberately not `jobs`: bash's own co-process cannot see the
+        // job table either, and inventing entries for processes this
+        // child does not own would be worse than the gap.
+        //
+        // In reverse, because each `pushd -n` goes on the front.
+        for dir in self.dir_stack.iter().rev() {
+            s.push_str("pushd -n ");
+            s.push_str(&crate::serialize::quote_literal(dir));
+            s.push_str(" >/dev/null\n");
+        }
+        for (signal, action) in &self.traps {
+            let code = match action {
+                TrapAction::Ignore => String::new(),
+                TrapAction::Run(code) => code.clone(),
+            };
+            s.push_str("trap -- ");
+            s.push_str(&crate::serialize::quote_literal(&code));
+            s.push_str(" SIG");
+            s.push_str(&signal_name(*signal));
+            s.push('\n');
+        }
+        for (name, spec) in &self.completions {
+            s.push_str(&crate::compgen::format_spec(spec, name));
+            s.push('\n');
+        }
         // Whatever `shopt -s`/`-u` has been changed from its default.
         for (name, on) in &self.shopt_options {
             if shopt_default_on(name) == Some(*on) {
@@ -7198,6 +7234,15 @@ impl Shell {
                     let usage = "trap [-Plp] [[action] signal_spec ...]";
                     return ExecResult::Status(bad_option_status(self, "trap", &bad, usage));
                 }
+                // `--` ends the options, and this is not a nicety: it is
+                // the form `trap -p` itself prints, so without it the
+                // builtin could not read its own output back. `trap --
+                // 'echo t' USR1` set a trap whose action was `--` and
+                // then rejected `echo t` as a signal name.
+                let argv: Vec<String> = match argv.iter().position(|a| a == "--") {
+                    Some(at) => argv[..at].iter().chain(argv[at + 1..].iter()).cloned().collect(),
+                    None => argv.to_vec(),
+                };
                 if argv.len() == 1 || argv.get(1).map(|s| s == "-p").unwrap_or(false) {
                     if let Some(code) = &self.exit_trap {
                         sh_println!(self, "trap -- {} EXIT", crate::serialize::quote_literal(code));

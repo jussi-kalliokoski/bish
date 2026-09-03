@@ -323,6 +323,20 @@ mod tests {
         case("type-builtin", r#"type -t echo; type -t nosuchthing_zz; echo $?"#),
         case("getopts", r#"set -- -a -b val; while getopts "ab:" o; do echo "$o=${OPTARG-}"; done"#),
         case("trap-exit", r#"trap 'echo bye' EXIT; echo body"#),
+        // `trap -p` prints `trap -- 'code' SIG`, so the builtin has to
+        // be able to read that back -- without `--` ending the options
+        // it set a trap whose action was `--`.
+        case("trap-reads-its-own-output", r#"trap -- 'echo t' USR1; trap -p | head -1"#),
+        case("pushd-n-adds-without-moving", r#"cd /; pushd -n /usr >/dev/null; pushd -n /tmp >/dev/null; dirs; echo "cwd=$PWD""#),
+        // What a construct that still re-execs can see of the shell
+        // that started it. A co-process starts once and lives, so
+        // replaying these costs nothing per use -- unlike a pipeline
+        // stage, which is why they are carried here and the pipeline
+        // stopped re-execing instead.
+        case("coproc-sees-the-directory-stack", r#"pushd /usr >/dev/null; coproc CP { dirs; }; read -r l <&"${CP[0]}"; echo "[$l]""#),
+        case("coproc-sees-traps", r#"trap 'echo t' USR1; coproc CP { trap -p | head -1; }; read -r l <&"${CP[0]}"; echo "[$l]""#),
+        case("coproc-sees-completions", r#"complete -W 'a b' foo; coproc CP { complete -p foo; }; read -r l <&"${CP[0]}"; echo "[$l]""#),
+        case("coproc-round-trip", r#"coproc CP { cat; }; echo hi >&"${CP[1]}"; read -r l <&"${CP[0]}"; echo "[$l]""#),
         case("eval", r#"x=1; eval 'x=$((x+1))'; echo $x"#),
         case("source-file", "printf 'sourced=1\\n' > lib.sh; . ./lib.sh; echo $sourced"),
         // -- errors and status ----------------------------------------
