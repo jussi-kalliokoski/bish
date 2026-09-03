@@ -175,8 +175,10 @@ impl Scheduler {
             self.tasks[index].broken = crate::exec::swap_broken_pipe(outer);
             self.tasks[index].park = REASON.with(|r| r.get());
             if self.tasks[index].co.state() == State::Done {
+                // See `run_tasks`: the copies on fd 0 and fd 1 count too.
                 self.tasks[index].stdin = None;
                 self.tasks[index].stdout = None;
+                install_shell_fds(saved);
             }
         }
         crate::exec::restore_fd012_for_scheduler(saved);
@@ -249,13 +251,19 @@ impl Scheduler {
                 self.tasks[index].park = REASON.with(|r| r.get());
                 if self.tasks[index].co.state() == State::Done {
                     // A finished stage must stop holding its pipes, or
-                    // the stage downstream waits for an end-of-input
-                    // that cannot arrive: this scheduler is one of the
-                    // things keeping the write end open. `install_fds`
-                    // for the next task takes fd 1 off it; these two
-                    // are the other references.
+                    // the stage on the other end waits on something
+                    // this scheduler is keeping alive. Three references
+                    // to drop, not two: the task's own pair, *and* the
+                    // copies `install_fds` left on fd 0 and fd 1. Those
+                    // last are the subtle ones -- they are only
+                    // replaced when some other task is installed, and
+                    // `can_run` is asked before that happens. A
+                    // finished reader's fd 0 therefore made its pipe
+                    // still look like it had a reader, so the producer
+                    // was never woken to discover otherwise.
                     self.tasks[index].stdin = None;
                     self.tasks[index].stdout = None;
+                    install_shell_fds(shells_own);
                 }
                 ran_something = true;
             }
@@ -324,6 +332,18 @@ impl Scheduler {
 
 /// Points fd 0 and fd 1 at this task's own pipes for the duration of
 /// its turn.
+/// Puts fd 0 and fd 1 back to the shell's own, releasing whatever a
+/// task had installed on them.
+fn install_shell_fds(shells_own: [i32; 3]) {
+    unsafe extern "C" {
+        fn dup2(oldfd: i32, newfd: i32) -> i32;
+    }
+    unsafe {
+        dup2(shells_own[0], 0);
+        dup2(shells_own[1], 1);
+    }
+}
+
 fn install_fds(task: &Task, shells_own: [i32; 3]) {
     unsafe extern "C" {
         fn dup2(oldfd: i32, newfd: i32) -> i32;
@@ -360,8 +380,17 @@ fn poll_writable(fd: RawFd, timeout_ms: i32) -> bool {
         fn poll(fds: *mut PollFd, nfds: u64, timeout: i32) -> i32;
     }
     const POLLOUT: i16 = 0x004;
+    const POLLERR: i16 = 0x008;
+    const POLLHUP: i16 = 0x010;
     let mut p = PollFd { fd, events: POLLOUT, revents: 0 };
-    unsafe { poll(&mut p as *mut PollFd, 1, timeout_ms) > 0 }
+    // A pipe whose reader has gone is not `POLLOUT` -- it is `POLLERR`.
+    // Waiting for writability alone therefore waits for ever on a
+    // descriptor whose next write would return `EPIPE` immediately,
+    // which is precisely how a producer learns to stop:
+    // `while true; do echo x; done | { read v; echo "$v"; }` printed
+    // its line and then hung. The same mistake as watching for
+    // `POLLIN` without `POLLHUP` on the reading side.
+    unsafe { poll(&mut p as *mut PollFd, 1, timeout_ms) > 0 && (p.revents & (POLLOUT | POLLERR | POLLHUP)) != 0 }
 }
 
 #[cfg(test)]

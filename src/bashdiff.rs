@@ -188,6 +188,15 @@ mod tests {
         case("two-shell-stages-are-subshells", r#"x=1; { x=2; echo "$x"; } | { read v; echo "in=$v"; }; echo "out=$x""#),
         case("two-shell-stages-cd-does-not-escape", r#"{ echo a; } | { read v; cd /tmp; }; echo "$PWD""#),
         case("two-shell-stages-reader-leaves-early", r#"while true; do echo x; done | { read v; echo "got=$v"; }"#),
+        // Every shape where one side stops before the other is done.
+        // These are the cases that hang rather than answer wrongly,
+        // which is why the harness reports a timeout as its own kind of
+        // failure -- every one of them printed the right thing first.
+        case("unbounded-shell-producer-into-an-external-head", r#"while true; do echo x; done | head -1"#),
+        case("unbounded-external-producer-into-a-shell-reader", r#"yes | { read v; echo "got=$v"; }"#),
+        case("unbounded-producer-in-the-middle", r#"echo start | { while read l; do echo "$l"; done; } | head -1"#),
+        case("reader-leaves-between-two-shell-stages", r#"while true; do echo x; done | { read a; echo "$a"; } | head -1"#),
+        case("both-sides-bounded-but-uneven", r#"seq 1 10000 | { read v; echo "got=$v"; }"#),
         case("subshell-scope", r#"x=1; (x=2); echo $x"#),
         case("subshell-exit", r#"(exit 4); echo $?"#),
         // The real process environment is shared by every in-process
@@ -580,7 +589,7 @@ y
     // difference.
     const CASE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-    fn run(shell: &std::ffi::OsStr, script: &str, dir: &std::path::Path) -> String {
+    fn run(shell: &std::ffi::OsStr, script: &str, dir: &std::path::Path) -> Outcome {
         let out = Command::new(shell)
             .arg("-c")
             .arg(script)
@@ -596,12 +605,27 @@ y
             .spawn()
             .and_then(|child| wait_with_timeout(child, CASE_TIMEOUT));
         match out {
-            Ok(out) => {
+            Ok((out, timed_out)) => {
                 let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
-                normalise(&text)
+                Outcome { text: normalise(&text), timed_out }
             }
-            Err(e) => format!("<could not run: {e}>"),
+            Err(e) => Outcome { text: format!("<could not run: {e}>"), timed_out: false },
         }
+    }
+
+    /// What one shell did with one case.
+    ///
+    /// `timed_out` is separate from the text on purpose. A case that
+    /// hangs gets killed and reports whatever it managed to print,
+    /// which can easily be *the right answer* -- every hang found in
+    /// the pipeline and process-substitution work printed exactly what
+    /// bash printed and then failed to exit. Folding that into the
+    /// comparison would have called all of them passes, and did: none
+    /// of them was caught by this corpus, they were found by running
+    /// shapes by hand and noticing a stray process.
+    struct Outcome {
+        text: String,
+        timed_out: bool,
     }
 
     // Each shell names itself, and bash adds a line number, when it
@@ -626,19 +650,21 @@ y
     // blocked on, and killed if it runs out. Its output is still
     // collected afterwards, so a case that produced something before
     // hanging still reports it.
-    fn wait_with_timeout(mut child: std::process::Child, limit: std::time::Duration) -> std::io::Result<std::process::Output> {
+    fn wait_with_timeout(mut child: std::process::Child, limit: std::time::Duration) -> std::io::Result<(std::process::Output, bool)> {
         let deadline = std::time::Instant::now() + limit;
+        let mut timed_out = false;
         loop {
             if child.try_wait()?.is_some() {
                 break;
             }
             if std::time::Instant::now() >= deadline {
                 let _ = child.kill();
+                timed_out = true;
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
-        child.wait_with_output()
+        Ok((child.wait_with_output()?, timed_out))
     }
 
     fn compare(cases: &[Case], bish: &std::path::Path) -> Vec<(&'static str, String, String)> {
@@ -660,8 +686,21 @@ y
             std::fs::create_dir_all(&dir).unwrap();
             let got = run(bish.as_os_str(), case.script, &dir);
             std::fs::remove_dir_all(&dir).ok();
-            if want != got {
-                differing.push((case.name, want, got));
+            // A hang is its own kind of wrong, and not one the text can
+            // express: a case that hangs is killed and reports whatever
+            // it printed first, which is very often exactly right. Said
+            // out loud here so it cannot be mistaken for agreement.
+            if got.timed_out || want.timed_out {
+                let who = match (want.timed_out, got.timed_out) {
+                    (true, true) => "both shells hung",
+                    (true, false) => "bash hung (bish did not)",
+                    _ => "bish hung",
+                };
+                differing.push((case.name, format!("<{who}>"), format!("{}\n<killed after {CASE_TIMEOUT:?}>", got.text)));
+                continue;
+            }
+            if want.text != got.text {
+                differing.push((case.name, want.text, got.text));
             }
         }
         // Not remove_dir_all: the other test may still be using its own
@@ -727,8 +766,8 @@ y
         ];
         for (script, expected) in proven {
             let out = run(bish.as_os_str(), script, &root);
-            assert!(out.contains("cannot terminate"), "{script:?} was not recognised: {out:?}");
-            assert!(out.contains(expected), "{script:?} misdescribed the cycle: {out:?}");
+            assert!(out.text.contains("cannot terminate"), "{script:?} was not recognised: {:?}", out.text);
+            assert!(out.text.contains(expected), "{script:?} misdescribed the cycle: {:?}", out.text);
         }
 
         // Each of these recurses forever too, but *productively* -- it
@@ -761,19 +800,23 @@ y
             "f() { unset zz; f; }; f",
         ] {
             let out = run(bish.as_os_str(), script, &root);
-            assert!(!out.contains("cannot terminate"), "{script:?} does something every time round and was still called a fixed point: {out:?}");
-            assert!(out.contains("nesting level exceeded"), "{script:?} should have run into the stack limit: {out:?}");
+            assert!(
+                !out.text.contains("cannot terminate"),
+                "{script:?} does something every time round and was still called a fixed point: {:?}",
+                out.text
+            );
+            assert!(out.text.contains("nesting level exceeded"), "{script:?} should have run into the stack limit: {:?}", out.text);
         }
 
         // A recursion that terminates is not touched by any of this.
         let out = run(bish.as_os_str(), r#"f() { if [ "$1" -gt 0 ]; then f $(($1-1)); else echo done; fi; }; f 50"#, &root);
-        assert_eq!(out, "done", "a bounded recursion must simply run");
+        assert_eq!(out.text, "done", "a bounded recursion must simply run");
 
         // Reported once, and the script stops there -- the same unwind
         // `FUNCNEST` gets, since there is nothing useful to run after.
         let out = run(bish.as_os_str(), "f() { f; }; f; echo unreached", &root);
-        assert_eq!(out.matches("cannot terminate").count(), 1, "reported once per runaway, not once per frame: {out:?}");
-        assert!(!out.contains("unreached"), "the script should have stopped: {out:?}");
+        assert_eq!(out.text.matches("cannot terminate").count(), 1, "reported once per runaway, not once per frame: {:?}", out.text);
+        assert!(!out.text.contains("unreached"), "the script should have stopped: {:?}", out.text);
 
         std::fs::remove_dir_all(&root).ok();
     }
@@ -810,10 +853,11 @@ y
         for (what, script) in cases.iter().map(|(w, s)| (*w, s.clone())).chain([("arithmetic nested very deeply", deep)]) {
             let out = run(bish.as_os_str(), &script, &root);
             assert!(
-                !out.contains("stack overflow") && !out.contains("core dumped") && !out.contains("Aborted"),
-                "{what}: bish aborted rather than reporting a limit -- {out:?}"
+                !out.text.contains("stack overflow") && !out.text.contains("core dumped") && !out.text.contains("Aborted"),
+                "{what}: bish aborted rather than reporting a limit -- {:?}",
+                out.text
             );
-            assert!(!out.is_empty(), "{what}: bish said nothing at all, so it did not report the limit either");
+            assert!(!out.text.is_empty(), "{what}: bish said nothing at all, so it did not report the limit either");
         }
         std::fs::remove_dir_all(&root).ok();
     }
