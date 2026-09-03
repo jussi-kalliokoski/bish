@@ -1883,7 +1883,9 @@ impl Shell {
             pending_theme: None,
             completions: std::collections::HashMap::new(),
             default_completion: None,
-            readonly_names: std::collections::HashSet::new(),
+            // BASH_VERSINFO is readonly, as it is in bash: `declare -p`
+            // says `-ar`, and an assignment to it is refused.
+            readonly_names: std::collections::HashSet::from(["BASH_VERSINFO".to_string()]),
             integer_names: std::collections::HashSet::new(),
             upper_names: std::collections::HashSet::new(),
             lower_names: std::collections::HashSet::new(),
@@ -3552,6 +3554,12 @@ impl Shell {
         }
         names.extend(self.arrays.keys().cloned());
         names.extend(self.assoc_arrays.keys().cloned());
+        // The ones computed on demand rather than stored (see
+        // lookup_var's own tail): they are set as far as anything can
+        // tell, so `${!BASH*}` has to find them. Listing only what is
+        // in the tables found `BASH_VERSINFO`, which is an array and
+        // therefore real, and nothing else.
+        names.extend(COMPUTED_VAR_NAMES.iter().map(|n| n.to_string()));
         names.into_iter().filter(|n| n.starts_with(prefix)).collect()
     }
 
@@ -4446,6 +4454,13 @@ impl Shell {
             s.push('\n');
         }
         for (name, items) in &self.arrays {
+            // The child seeds this one itself, from the same constant,
+            // and it is readonly there -- so re-declaring it is both
+            // redundant and refused, which turned every re-exec'd
+            // construct into a "readonly variable" error.
+            if name == "BASH_VERSINFO" {
+                continue;
+            }
             s.push_str(name);
             s.push_str("=(");
             for item in items.values() {
@@ -9967,6 +9982,31 @@ impl Shell {
                     "UID" => unsafe { getuid() }.to_string(),
                     "EUID" => unsafe { geteuid() }.to_string(),
                     "HOSTNAME" => get_hostname(),
+                    // The path this shell was started from. `$0` is
+                    // what it was *called* as, which is not the same
+                    // thing and is what a script reaches for `$BASH`
+                    // to avoid.
+                    "BASH" => std::env::current_exe().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default(),
+                    // The pid of the process actually running this.
+                    // The same as `$$` here, where bash's differs
+                    // inside a subshell, because a subshell here is
+                    // not a process -- see run_in_child_shell.
+                    "BASHPID" => unsafe { getpid_raw() }.to_string(),
+                    "BASH_SUBSHELL" => self.subshell_depth.to_string(),
+                    // The `set -o` and `shopt` options currently on,
+                    // colon-separated and sorted, which is how a script
+                    // asks `[[ $SHELLOPTS == *errexit* ]]` without
+                    // running `set -o` and parsing it.
+                    "SHELLOPTS" => {
+                        let mut on: Vec<&str> = SET_O_OPTIONS.iter().copied().filter(|n| self.shell_option_enabled(n) == Some(true)).collect();
+                        on.sort_unstable();
+                        on.join(":")
+                    }
+                    "BASHOPTS" => {
+                        let mut on: Vec<String> = KNOWN_SHOPT_OPTIONS.iter().map(|(n, _)| n.to_string()).filter(|n| self.shopt_is_on(n)).collect();
+                        on.sort();
+                        on.join(":")
+                    }
                     _ => String::new(),
                 }
             }
@@ -10216,6 +10256,11 @@ impl Shell {
                 | "UID"
                 | "EUID"
                 | "HOSTNAME"
+                | "BASH"
+                | "BASHPID"
+                | "BASH_SUBSHELL"
+                | "SHELLOPTS"
+                | "BASHOPTS"
         ) || (!name.is_empty() && name.chars().all(|c| c.is_ascii_digit()));
         if is_special {
             return true;
@@ -13219,6 +13264,30 @@ fn xtrace_quote_word(value: &str) -> String {
         false => xtrace_quote(value),
     }
 }
+
+unsafe extern "C" {
+    #[link_name = "getpid"]
+    fn getpid_raw() -> i32;
+}
+
+// The variables lookup_var answers for without ever storing them.
+// Listed here so name enumeration -- `${!prefix*}`, completion -- can
+// see them too.
+const COMPUTED_VAR_NAMES: &[&str] = &[
+    "BASH",
+    "BASHPID",
+    "BASHOPTS",
+    "BASH_SUBSHELL",
+    "BASH_VERSION",
+    "EPOCHREALTIME",
+    "EPOCHSECONDS",
+    "EUID",
+    "HOSTNAME",
+    "PPID",
+    "SECONDS",
+    "SHELLOPTS",
+    "UID",
+];
 
 pub fn get_hostname() -> String {
     if let Ok(s) = std::fs::read_to_string("/proc/sys/kernel/hostname") {

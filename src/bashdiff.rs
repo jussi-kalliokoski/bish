@@ -748,6 +748,19 @@ y
             "an-unquoted-case-pattern-is-still-a-glob",
             r#"p="*"; case abc in $p) echo glob;; *) echo no;; esac; x=/tmp; case /tmp/f in "$x"/*) echo prefix;; esac"#,
         ),
+        // The variables the shell answers for without storing them.
+        // `$BASHPID` is the same as `$$` here where bash's differs
+        // inside a subshell -- a subshell is not a process here -- so
+        // the case asks only what both can agree on.
+        case("bash-subshell-counts-nesting", r#"echo "$BASH_SUBSHELL"; (echo "$BASH_SUBSHELL"; (echo "$BASH_SUBSHELL"))"#),
+        case("bashpid-at-the-top-level", r#"[ "$BASHPID" = "$$" ] && echo same"#),
+        case("shellopts-lists-what-is-on", r#"[[ $SHELLOPTS == *errexit* ]] || echo off; set -e; [[ $SHELLOPTS == *errexit* ]] && echo on"#),
+        case("bashopts-lists-what-is-on", r#"[[ $BASHOPTS == *dotglob* ]] || echo off; shopt -s dotglob; [[ $BASHOPTS == *dotglob* ]] && echo on"#),
+        // A computed variable is still a name: enumeration has to find
+        // it, or `${!SHELL*}` reports only the stored half.
+        case("prefix-listing-finds-computed-names", r#"echo "${!BASHO*}" "${!BASHP*}" "${!BASH_SUB*}" "${!EUI*}""#),
+        // BASH_VERSINFO is readonly, which `declare -p` reports.
+        case("bash-versinfo-is-readonly", r#"declare -p BASH_VERSINFO | cut -c1-14"#),
         // -- roadmap 10: the last of the grammar's leniency ------------
         // A `;` where a command is expected is a syntax error, not an
         // empty statement -- in front of the first command of a list as
