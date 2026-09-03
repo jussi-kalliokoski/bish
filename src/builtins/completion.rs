@@ -70,6 +70,7 @@ pub(crate) fn run_compgen(sh: &mut Shell, args: &[String]) -> i32 {
     let empty = candidates.is_empty();
     if let Some(var) = varname {
         sh.assoc_names.remove(&var);
+        sh.array_names.insert(var.clone());
         sh.arrays.insert(var, candidates.into_iter().enumerate().collect());
     } else {
         for c in &candidates {

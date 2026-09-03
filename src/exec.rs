@@ -1130,6 +1130,12 @@ pub(crate) fn parse_size_spec(arg: &str) -> Option<SizeSpec> {
     Some(SizeSpec::Characters(arg.parse().ok()?))
 }
 
+// One entry per name a call frame shadowed: the name, the value it
+// displaced (None if there was none), and whether the name already
+// carried the array attribute. Both halves come back on return, or
+// `local -a x` would leave `x` an array after the function returned.
+type ArrayShadowStack<V> = Vec<Vec<(String, Option<V>, bool)>>;
+
 pub struct Shell {
     pub last_status: i32,
     pub(crate) functions: HashMap<String, parser::Command>,
@@ -1165,6 +1171,14 @@ pub struct Shell {
     // in `assoc_names` is looked up here instead of `arrays` everywhere an
     // array is read or written.
     pub(crate) assoc_arrays: HashMap<String, OrderedMap>,
+    // Carrying the array attribute is not the same as having an array
+    // *value*. `declare -a A` leaves A unset -- bash prints it as
+    // `declare -a A`, where `A=()` really is an assignment and prints
+    // `declare -a A=()`. `arrays`/`assoc_arrays` hold the values, these
+    // two hold the attribute, and a name is an array if it is in either
+    // half of its pair. The attribute is what makes a later plain
+    // `A=x` mean `A[0]=x` rather than a scalar shadowing the array.
+    pub(crate) array_names: std::collections::HashSet<String>,
     pub(crate) assoc_names: std::collections::HashSet<String>,
     // `alias name=value`, expanded for real -- see
     // `lexer::expand_aliases`.
@@ -1249,13 +1263,13 @@ pub struct Shell {
     firing_hooks: bool,
     // One frame per active function call (pushed/popped alongside
     // var_scopes in call_function). `local -a`/`-A name` snapshots the
-    // array's pre-local value here (None if it didn't exist) before
-    // resetting it to empty, so returning from the function restores
+    // array's pre-local value here (None if it didn't exist) and takes
+    // the name away from it, so returning from the function restores
     // whatever the caller had -- a save/restore shadow rather than a real
     // nested scope chain, since `arrays`/`assoc_arrays` themselves stay
     // flat (see the comment on `arrays` above).
-    array_local_stack: Vec<Vec<(String, Option<std::collections::BTreeMap<usize, String>>)>>,
-    assoc_local_stack: Vec<Vec<(String, Option<OrderedMap>)>>,
+    array_local_stack: ArrayShadowStack<std::collections::BTreeMap<usize, String>>,
+    assoc_local_stack: ArrayShadowStack<OrderedMap>,
     // `declare -n`/`local -n ref=target`: ref's own stored value is the
     // *name* of the target variable, not user data -- lookup_var/assign_var/
     // var_is_set all redirect through resolve_nameref for any name in this
@@ -1803,6 +1817,7 @@ impl Shell {
             // has to exist too.
             arrays: HashMap::from([("BASH_VERSINFO".to_string(), BASH_VERSINFO.iter().enumerate().map(|(i, v)| (i, (*v).to_string())).collect())]),
             assoc_arrays: HashMap::new(),
+            array_names: std::collections::HashSet::new(),
             assoc_names: std::collections::HashSet::new(),
             aliases: Vec::new(),
             abbrs: Vec::new(),
@@ -2142,6 +2157,7 @@ impl Shell {
             running_a_script: self.running_a_script,
             arrays: self.arrays.clone(),
             assoc_arrays: self.assoc_arrays.clone(),
+            array_names: self.array_names.clone(),
             assoc_names: self.assoc_names.clone(),
             aliases: self.aliases.clone(),
             abbrs: self.abbrs.clone(),
@@ -2779,7 +2795,7 @@ impl Shell {
         let mut flags = String::new();
         if self.assoc_names.contains(name) {
             flags.push('A');
-        } else if self.arrays.contains_key(name) {
+        } else if self.arrays.contains_key(name) || self.array_names.contains(name) {
             flags.push('a');
         }
         if self.integer_names.contains(name) {
@@ -2825,7 +2841,7 @@ impl Shell {
     //   one specific element, matching bash's own `${arr[0]@A}` ->
     //   `declare -a arr='1'`.
     fn transform_attributes(&mut self, name: &str, single_element: Option<&str>) -> String {
-        let is_array = self.assoc_names.contains(name) || self.arrays.contains_key(name);
+        let is_array = self.assoc_names.contains(name) || self.arrays.contains_key(name) || self.array_names.contains(name);
         if is_array && single_element.is_none() {
             return self.declare_p_line(name).unwrap_or_default();
         }
@@ -2964,8 +2980,11 @@ impl Shell {
         let flags = self.attribute_flags_string(name);
         let flag_str = if flags.is_empty() { "--".to_string() } else { format!("-{flags}") };
 
-        if self.assoc_names.contains(name) {
-            let map = self.assoc_arrays.get(name)?;
+        // A name with the attribute and no map has been *declared* and
+        // not assigned, which bash prints with no `=` at all -- it falls
+        // through to the value-less line further down. An empty map is a
+        // different thing: `M=()` assigned it, and prints `=()`.
+        if let Some(map) = self.assoc_names.contains(name).then(|| self.assoc_arrays.get(name)).flatten() {
             let mut body = String::new();
             for (k, v) in map.iter() {
                 body.push('[');
@@ -2978,9 +2997,6 @@ impl Shell {
             // associative array -- an indexed one is trimmed. Confirmed
             // against real bash, quirk and all, because `declare -p`
             // output is meant to be re-read.
-            if body.is_empty() {
-                return Some(format!("declare {} {}", flag_str, name));
-            }
             return Some(format!("declare {} {}=({})", flag_str, name, body));
         }
         if let Some(items) = self.arrays.get(name) {
@@ -5421,27 +5437,36 @@ impl Shell {
             }
         }
         if let Some(frame) = self.array_local_stack.pop() {
-            for (name, prev) in frame.into_iter().rev() {
+            for (name, prev, was_declared) in frame.into_iter().rev() {
                 match prev {
                     Some(v) => {
-                        self.arrays.insert(name, v);
+                        self.arrays.insert(name.clone(), v);
                     }
                     None => {
                         self.arrays.remove(&name);
                     }
                 }
+                if was_declared {
+                    self.array_names.insert(name);
+                } else {
+                    self.array_names.remove(&name);
+                }
             }
         }
         if let Some(frame) = self.assoc_local_stack.pop() {
-            for (name, prev) in frame.into_iter().rev() {
+            for (name, prev, was_declared) in frame.into_iter().rev() {
                 match prev {
                     Some(v) => {
-                        self.assoc_arrays.insert(name, v);
+                        self.assoc_arrays.insert(name.clone(), v);
                     }
                     None => {
                         self.assoc_arrays.remove(&name);
-                        self.assoc_names.remove(&name);
                     }
+                }
+                if was_declared {
+                    self.assoc_names.insert(name);
+                } else {
+                    self.assoc_names.remove(&name);
                 }
             }
         }
@@ -6879,13 +6904,16 @@ impl Shell {
                         match array_mode {
                             Some(true) => {
                                 let prev = self.assoc_arrays.remove(name);
-                                self.assoc_local_stack.last_mut().unwrap().push((name.clone(), prev));
+                                let was = self.assoc_names.contains(name);
+                                self.assoc_local_stack.last_mut().unwrap().push((name.clone(), prev, was));
                                 self.assoc_names.insert(name.clone());
                                 self.assoc_arrays.insert(name.clone(), OrderedMap::default());
                             }
                             Some(false) => {
                                 let prev = self.arrays.remove(name);
-                                self.array_local_stack.last_mut().unwrap().push((name.clone(), prev));
+                                let was = self.array_names.contains(name);
+                                self.array_local_stack.last_mut().unwrap().push((name.clone(), prev, was));
+                                self.array_names.insert(name.clone());
                                 self.arrays.insert(name.clone(), std::collections::BTreeMap::new());
                             }
                             None => {}
@@ -6917,16 +6945,20 @@ impl Shell {
                         self.exported_names.insert(n.clone());
                     }
                     match array_mode {
+                        // The bare `local -a x` form declares without
+                        // assigning: the attribute is local, and there
+                        // is no value until something writes one.
                         Some(true) => {
                             let prev = self.assoc_arrays.remove(&n);
-                            self.assoc_local_stack.last_mut().unwrap().push((n.clone(), prev));
-                            self.assoc_names.insert(n.clone());
-                            self.assoc_arrays.insert(n, OrderedMap::default());
+                            let was = self.assoc_names.contains(&n);
+                            self.assoc_local_stack.last_mut().unwrap().push((n.clone(), prev, was));
+                            self.assoc_names.insert(n);
                         }
                         Some(false) => {
                             let prev = self.arrays.remove(&n);
-                            self.array_local_stack.last_mut().unwrap().push((n.clone(), prev));
-                            self.arrays.insert(n, std::collections::BTreeMap::new());
+                            let was = self.array_names.contains(&n);
+                            self.array_local_stack.last_mut().unwrap().push((n.clone(), prev, was));
+                            self.array_names.insert(n);
                         }
                         None => {
                             if global_flag {
@@ -9942,6 +9974,18 @@ impl Shell {
         } else {
             value
         };
+        // `declare -a b; b=x` writes element 0, not a scalar `b` that
+        // shadows the array -- the attribute decides, so it applies to a
+        // name that was declared and never assigned as much as to one
+        // that already holds values.
+        if self.assoc_names.contains(name) {
+            self.assoc_arrays.entry(name.to_string()).or_default().insert("0".to_string(), value);
+            return true;
+        }
+        if self.array_names.contains(name) || self.arrays.contains_key(name) {
+            self.arrays.entry(name.to_string()).or_default().insert(0, value);
+            return true;
+        }
         if force_global {
             // Bypass any local shadow entirely -- raw_var_write would
             // just update that shadow instead, same as plain assignment.

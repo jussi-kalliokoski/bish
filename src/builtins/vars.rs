@@ -58,6 +58,7 @@ pub(crate) fn run_unset(sh: &mut Shell, args: &[String], stderr_target: &Option<
         }
         sh.arrays.remove(n.as_str());
         sh.assoc_arrays.remove(n.as_str());
+        sh.array_names.remove(n.as_str());
         sh.assoc_names.remove(n.as_str());
         sh.remove_var(n);
         if !only_vars {
@@ -191,10 +192,9 @@ pub(crate) fn run_declare(sh: &mut Shell, who: &str, args: &[String], array_lite
             match array_mode {
                 Some(true) => {
                     sh.assoc_names.insert(name.clone());
-                    sh.assoc_arrays.entry(name.clone()).or_default();
                 }
                 Some(false) => {
-                    sh.arrays.entry(name.clone()).or_default();
+                    sh.array_names.insert(name.clone());
                 }
                 None => {}
             }
@@ -255,10 +255,9 @@ pub(crate) fn run_declare(sh: &mut Shell, who: &str, args: &[String], array_lite
         match array_mode {
             Some(true) => {
                 sh.assoc_names.insert(name.clone());
-                sh.assoc_arrays.entry(name.clone()).or_default();
             }
             Some(false) => {
-                sh.arrays.entry(name.clone()).or_default();
+                sh.array_names.insert(name.clone());
             }
             None => {
                 // Auto-localize, matching `local`: a plain (non-`-g`)

@@ -518,6 +518,24 @@ y
         // divergence (see jobs-in-a-pipeline).
         case("jobs-p-and-l", r#"sleep 0.2 & jobs -p > p; jobs > j; grep -cE '^[0-9]+$' p; grep -c Running j"#),
         case("type-a-lists-every-match", r#"type -a echo"#),
+        // Declaring a name an array is not assigning one to it: bash
+        // prints `declare -a A` for the first and `declare -a A=()` for
+        // the second, and the attribute is what makes a later plain
+        // `B=x` mean `B[0]=x`. All of it hangs on keeping the attribute
+        // and the value apart, which is why the empty cases are here
+        // next to the ones that carry a value.
+        case("declare-p-of-a-declared-but-unassigned-array", r#"declare -a A; declare -p A; A=(); declare -p A"#),
+        case("declare-p-of-a-declared-but-unassigned-assoc", r#"declare -A M; declare -p M; M=(); declare -p M"#),
+        case("plain-assignment-to-an-array-writes-element-zero", r#"declare -a B; B=x; declare -p B; declare -A N; N=y; declare -p N"#),
+        case("plain-assignment-to-an-array-that-has-values", r#"a=(1 2); a=x; declare -p a"#),
+        case(
+            "a-local-array-attribute-does-not-outlive-the-function",
+            r#"f() { local -a arr; declare -p arr; local -A m; declare -p m; }; f; declare -p arr; declare -p m"#,
+        ),
+        case(
+            "a-local-array-shadows-a-global-one-and-gives-it-back",
+            r#"g=(1 2); f() { local -a g; declare -p g; g=(9); declare -p g; }; f; declare -p g"#,
+        ),
         case("alias-p", r#"alias x=y; alias -p"#),
         case("dollar-quoted-string", r#"x=1; echo $"lit $x""#),
         case("source-takes-arguments", "printf 'echo \"[$1][$#]\"\\n' > s.sh; set -- outer; . ./s.sh a b; echo \"after=[$1]\""),
@@ -574,12 +592,6 @@ y
         // skip_terminators, which every construct's list parsing goes
         // through, and is not worth the blast radius on its own.
         ("empty-command-between-separators", "`;` twice in a row is skipped rather than reported"),
-        // A name can be declared an array without ever being assigned
-        // one, and bash prints that as `declare -a A` with no value --
-        // distinct from `A=()`, which really is an assignment of an
-        // empty array and does print `=()`. bish creates the (empty)
-        // map at declaration and cannot tell the two apart afterwards.
-        ("declare-p-of-a-declared-but-unassigned-array", "`declare -a A; declare -p A` prints `declare -a A=()`; bash prints `declare -a A`"),
     ];
 
     // The cases the divergence list is about. Kept apart from `CASES`
@@ -587,7 +599,6 @@ y
     const PENDING: &[Case] = &[
         // -- roadmap 10: parser leniency, the part still standing -----
         case("empty-command-between-separators", "echo a; ; echo b"),
-        case("declare-p-of-a-declared-but-unassigned-array", r#"declare -a A; declare -p A"#),
         // Not recordable here, and worth saying why: `SHLVL` counts one
         // higher through two levels of `-c`, because bash decrements it
         // before `exec`ing the last command of a `-c` and bish spawns
