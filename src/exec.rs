@@ -1464,6 +1464,14 @@ pub struct Shell {
     debug_trap: Option<String>,
     err_trap: Option<String>,
     return_trap: Option<String>,
+    // The call depth each pseudo-trap was set at. A pseudo-trap fires
+    // at the depth it was installed and nowhere else, unless the option
+    // that makes it inherited is on -- so a RETURN trap set inside a
+    // function runs when *that* function returns (no `set -T` needed),
+    // while one set at the top level does not follow calls into it.
+    // Gating on the option alone got the first case backwards and never
+    // ran it at all.
+    pseudo_trap_depth: [usize; 3],
     // Whether a trap's own body is running. A DEBUG trap whose body is a
     // command would otherwise fire DEBUG again, forever; bash guards the
     // same way.
@@ -1884,6 +1892,7 @@ impl Shell {
             debug_trap: None,
             err_trap: None,
             return_trap: None,
+            pseudo_trap_depth: [0; 3],
             in_trap: false,
             in_prompt_command: false,
             in_command_not_found: false,
@@ -2223,6 +2232,7 @@ impl Shell {
             debug_trap: self.debug_trap.clone(),
             err_trap: self.err_trap.clone(),
             return_trap: self.return_trap.clone(),
+            pseudo_trap_depth: self.pseudo_trap_depth,
             in_trap: self.in_trap,
             in_prompt_command: false,
             in_command_not_found: false,
@@ -2378,7 +2388,15 @@ impl Shell {
             PseudoTrap::Err => self.opt_errtrace,
             PseudoTrap::Debug | PseudoTrap::Return => self.opt_functrace,
         };
-        if self.function_depth > 0 && !inherited {
+        // ERR keeps the older, coarser gate. bash fires it once per
+        // failure, at the innermost level where a trap is active, and
+        // does *not* fire it again for the function call that failure
+        // propagates out of -- which the depth rule alone would do.
+        let deeper = match which {
+            PseudoTrap::Err => self.function_depth > 0,
+            PseudoTrap::Debug | PseudoTrap::Return => self.function_depth > self.pseudo_trap_depth[which as usize],
+        };
+        if deeper && !inherited {
             return;
         }
         let Some(cmd) = (match which {
@@ -5499,6 +5517,7 @@ impl Shell {
             }
         }
         self.arg_frames.pop();
+        let returning_from = self.function_depth;
         self.function_depth -= 1;
         // Back at the top: whatever was being unwound out of is fully
         // unwound, and the shell can run commands again.
@@ -5506,10 +5525,19 @@ impl Shell {
             self.nesting_unwind = false;
         }
         // RETURN, after the frame is gone so the trap runs in the
-        // caller's scope. Only under `functrace`, per the rule above --
-        // a plain `trap ... RETURN` at the top level is about *sourced
-        // scripts*, which fire it below regardless.
-        if self.opt_functrace {
+        // caller's scope. It fires for the function that set it and for
+        // every one it returns *into* -- not for calls made from there,
+        // which is what "not inherited" means and what `functrace`
+        // turns off. Four cases pin the comparison down:
+        //
+        //   trap RETURN; f() { :; }; f          set at 0, f returns at 1: no
+        //   f() { trap RETURN; :; }; f          set at 1, f returns at 1: yes
+        //   f() { trap RETURN; g; }; g          set at 1, g returns at 2: no
+        //   g() { trap RETURN; :; }; f() { g; } set at 2, f returns at 1: yes
+        //
+        // This used to be gated on `functrace` alone, so the second --
+        // the ordinary way anyone writes a RETURN trap -- never ran.
+        if self.opt_functrace || returning_from <= self.pseudo_trap_depth[PseudoTrap::Return as usize] {
             self.run_pseudo_trap(PseudoTrap::Return);
         }
         match result {
@@ -6129,8 +6157,7 @@ impl Shell {
                 ok &= match mode {
                     AssignMode::Set => self.assign_var(name, v),
                     AssignMode::Append => {
-                        let mut cur = self.lookup_var(name);
-                        cur.push_str(&v);
+                        let cur = self.appended_value(name, &v);
                         self.assign_var(name, cur)
                     }
                 };
@@ -6347,7 +6374,7 @@ impl Shell {
             let v = self.expand_word(val);
             let v = match mode {
                 AssignMode::Set => v,
-                AssignMode::Append => self.lookup_var(name) + &v,
+                AssignMode::Append => self.appended_value(name, &v),
             };
             // Only what was actually written needs putting back -- a
             // refused write (readonly name) left nothing to restore,
@@ -7060,55 +7087,85 @@ impl Shell {
                 // and only when this read isn't actually coming from a
                 // coproc fd (-u) instead of the terminal.
                 let mut silent = false;
+                // Without `-r`, a backslash escapes the next character
+                // -- and the delimiter, which continues the line.
+                let mut raw = false;
+                let mut timeout_arg: Option<&str> = None;
+                // Short options cluster, the way every other shell
+                // builtin's do: `-ra arr` is `-r -a arr`, and `-rn2` is
+                // `-r -n 2`. Matching whole argument strings meant
+                // `read -ra p` took `-ra` for a *variable name*, so the
+                // commonest spelling of the commonest idiom silently
+                // read into nothing.
                 let mut i = 1;
-                while i < argv.len() {
-                    match argv[i].as_str() {
-                        "-r" => i += 1,
-                        "-s" => {
-                            silent = true;
+                'args: while i < argv.len() {
+                    let a = argv[i].as_str();
+                    if a == "--" {
+                        i += 1;
+                        while i < argv.len() {
+                            names.push(argv[i].as_str());
                             i += 1;
                         }
-                        "-a" => {
-                            array_name = argv.get(i + 1).map(|s| s.as_str());
-                            i += 2;
-                        }
-                        "-p" => {
-                            prompt = argv.get(i + 1).map(|s| s.as_str());
-                            i += 2;
-                        }
-                        "-n" | "-N" => {
-                            nchars = argv.get(i + 1).and_then(|s| s.parse::<usize>().ok());
-                            i += 2;
-                        }
-                        "-d" => {
-                            // `-d ''` is bash's spelling of "delimit on
-                            // NUL", which is what `find -print0` and
-                            // `git ls-files -z` produce -- the empty
-                            // string has no first byte, so it cannot
-                            // simply fall back to a newline.
-                            delim = match argv.get(i + 1) {
-                                Some(d) => d.bytes().next().unwrap_or(0),
-                                None => b'\n',
-                            };
-                            i += 2;
-                        }
-                        "-t" => {
-                            // Parsed and consumed for arg-shape compatibility;
-                            // actual timeout enforcement happens below, but
-                            // only against real stdin (see is_real_stdin).
-                            i += 2;
-                        }
-                        "-u" => {
-                            read_u_flag = argv.get(i + 1).map(|s| s.as_str());
-                            i += 2;
-                        }
-                        other => {
-                            names.push(other);
-                            i += 1;
-                        }
+                        break;
                     }
+                    if a.len() < 2 || !a.starts_with('-') {
+                        names.push(a);
+                        i += 1;
+                        continue;
+                    }
+                    let bytes = a.as_bytes();
+                    let mut ci = 1;
+                    while ci < bytes.len() {
+                        let c = bytes[ci] as char;
+                        // The options that take a value take the rest of
+                        // the cluster if there is one, and the next
+                        // argument otherwise.
+                        if matches!(c, 'a' | 'd' | 'i' | 'n' | 'N' | 'p' | 't' | 'u') {
+                            let value: Option<&str> = if ci + 1 < bytes.len() {
+                                Some(&a[ci + 1..])
+                            } else {
+                                i += 1;
+                                argv.get(i).map(|s| s.as_str())
+                            };
+                            match c {
+                                'a' => array_name = value,
+                                'p' => prompt = value,
+                                'n' | 'N' => nchars = value.and_then(|v| v.parse::<usize>().ok()),
+                                // `-d ''` is bash's spelling of "delimit
+                                // on NUL", which is what `find -print0`
+                                // and `git ls-files -z` produce -- the
+                                // empty string has no first byte, so it
+                                // cannot simply fall back to a newline.
+                                'd' => delim = value.map(|v| v.bytes().next().unwrap_or(0)).unwrap_or(b'\n'),
+                                // Enforced below, and only against real
+                                // stdin (see is_real_stdin).
+                                't' => timeout_arg = value,
+                                'u' => read_u_flag = value,
+                                // `-i text` seeds the line editor, which
+                                // this read has none of: accepted and
+                                // ignored, like bash does with no tty.
+                                _ => {}
+                            }
+                            break;
+                        }
+                        match c {
+                            'r' => raw = true,
+                            's' => silent = true,
+                            // `-e`/`-E`: read through the line editor.
+                            // Accepted; there is nothing to edit with.
+                            'e' | 'E' => {}
+                            _ => {
+                                let usage = "read [-Eers] [-a array] [-d delim] [-i text] [-n nchars] [-N nchars] [-p prompt] [-t timeout] [-u fd] [name ...]";
+                                return ExecResult::Status(bad_option_status(self, "read", &format!("-{c}"), usage));
+                            }
+                        }
+                        ci += 1;
+                    }
+                    i += 1;
+                    let _ = &mut i;
+                    continue 'args;
                 }
-                let timeout_secs = argv.iter().position(|a| a == "-t").and_then(|p| argv.get(p + 1)).and_then(|s| s.parse::<f64>().ok());
+                let timeout_secs = timeout_arg.and_then(|s| s.parse::<f64>().ok());
                 let is_real_stdin = !cmd.redirects.iter().any(|r| matches!(r, Redirect::In(_) | Redirect::HereString(_) | Redirect::HereDoc(_)));
                 if let Some(p) = prompt {
                     if is_real_stdin && stdin_is_tty() {
@@ -7148,7 +7205,7 @@ impl Shell {
                     if silent && ufd.is_none() && is_real_stdin && stdin_is_tty() { crate::term::NoEchoGuard::enable(0).ok() } else { None };
                 let (got, clean): (Option<String>, bool) = if let Some(fd) = ufd {
                     match self.coproc_fds.get_mut(&fd) {
-                        Some(KeptFd::Read(r)) => read_line_or_chars(r, nchars, delim),
+                        Some(KeptFd::Read(r)) => read_line_or_chars(r, nchars, delim, raw),
                         Some(KeptFd::Write(_)) => {
                             sh_eprintln!(self, "bish: read: {}: invalid file descriptor", fd);
                             return ExecResult::Status(1);
@@ -7163,40 +7220,55 @@ impl Shell {
                         }
                         None => {
                             let mut reader = UnbufferedFd::new(fd);
-                            read_line_or_chars(&mut reader, nchars, delim)
+                            read_line_or_chars(&mut reader, nchars, delim, raw)
                         }
                     }
                 } else {
                     let mut reader = self.read_input_source(cmd);
-                    read_line_or_chars(&mut *reader, nchars, delim)
+                    read_line_or_chars(&mut *reader, nchars, delim, raw)
                 };
 
                 return match got {
                     None => ExecResult::Status(1),
                     Some(line) => {
-                        let line = line.as_str();
                         let ifs = self.get_ifs();
+                        // Without `-r` the escapes come off, and what
+                        // they protected is remembered so a separator
+                        // one of them covered stays part of its field.
+                        let (line, mask) = if raw { (line, Vec::new()) } else { unescape_read_line(&line) };
+                        let chars: Vec<char> = line.chars().collect();
+                        let mask = if raw { vec![false; chars.len()] } else { mask };
                         if let Some(arr) = array_name {
-                            let (parts, ..) = ifs_tokenize(line, &ifs);
+                            let parts = ifs_tokenize_masked(&chars, &mask, &ifs);
                             let map: std::collections::BTreeMap<usize, String> = parts.into_iter().enumerate().collect();
                             self.arrays.insert(arr.to_string(), map);
+                            self.array_names.insert(arr.to_string());
                         } else if names.is_empty() {
-                            self.assign_var("REPLY", line.to_string());
+                            self.assign_var("REPLY", line.clone());
                         } else {
-                            let is_ifs_ws = |c: char| c.is_whitespace() && ifs.contains(c);
-                            let mut rest = line.trim_start_matches(is_ifs_ws).to_string();
+                            let is_ifs_ws = |i: usize| !mask[i] && chars[i].is_whitespace() && ifs.contains(chars[i]);
+                            let mut at = 0;
+                            while at < chars.len() && is_ifs_ws(at) {
+                                at += 1;
+                            }
                             for (i, n) in names.iter().enumerate() {
                                 if i == names.len() - 1 {
-                                    self.assign_var(n, rest.trim_end_matches(is_ifs_ws).to_string());
+                                    let mut end = chars.len();
+                                    while end > at && is_ifs_ws(end - 1) {
+                                        end -= 1;
+                                    }
+                                    let rest: String = chars[at..end].iter().collect();
+                                    self.assign_var(n, rest);
                                 } else {
-                                    match ifs_next_field(&rest, &ifs) {
-                                        Some((field, remainder)) => {
+                                    match ifs_next_field_masked(&chars, &mask, &ifs, at) {
+                                        Some((field, next)) => {
                                             self.assign_var(n, field);
-                                            rest = remainder;
+                                            at = next;
                                         }
                                         None => {
-                                            self.assign_var(n, rest.clone());
-                                            rest = String::new();
+                                            let rest: String = chars[at..].iter().collect();
+                                            self.assign_var(n, rest);
+                                            at = chars.len();
                                         }
                                     }
                                 }
@@ -7437,17 +7509,49 @@ impl Shell {
                     None => argv.to_vec(),
                 };
                 if argv.len() == 1 || argv.get(1).map(|s| s == "-p").unwrap_or(false) {
-                    if let Some(code) = &self.exit_trap {
+                    // `trap -p NAME...` reports only those. Without
+                    // names every trap is reported, in bash's order:
+                    // EXIT, then the signals by number, then the three
+                    // pseudo-signals. Those three were missing from the
+                    // listing entirely, so a script could set a DEBUG
+                    // or RETURN trap and then not find it.
+                    let wanted: Vec<String> = argv[2.min(argv.len())..].to_vec();
+                    let mut bad = 0;
+                    for w in &wanted {
+                        let name = w.strip_prefix("SIG").unwrap_or(w);
+                        if !matches!(name, "EXIT" | "DEBUG" | "ERR" | "RETURN") && signal_number(name).is_none() {
+                            sh_eprintln!(self, "bish: trap: {}: invalid signal specification", w);
+                            bad = 1;
+                        }
+                    }
+                    if bad != 0 {
+                        return ExecResult::Status(bad);
+                    }
+                    let asked =
+                        |label: &str| wanted.is_empty() || wanted.iter().any(|w| w.strip_prefix("SIG").unwrap_or(w).eq_ignore_ascii_case(label));
+                    if let Some(code) = &self.exit_trap
+                        && asked("EXIT")
+                    {
                         sh_println!(self, "trap -- {} EXIT", crate::serialize::quote_literal(code));
                     }
                     let mut entries: Vec<(i32, TrapAction)> = self.traps.iter().map(|(k, v)| (*k, v.clone())).collect();
                     entries.sort_by_key(|(n, _)| *n);
                     for (n, action) in entries {
+                        if !asked(&signal_name(n)) && !asked(&n.to_string()) {
+                            continue;
+                        }
                         match action {
                             TrapAction::Run(code) => {
                                 sh_println!(self, "trap -- {} SIG{}", crate::serialize::quote_literal(&code), signal_name(n))
                             }
                             TrapAction::Ignore => sh_println!(self, "trap -- '' SIG{}", signal_name(n)),
+                        }
+                    }
+                    for (label, code) in [("DEBUG", self.debug_trap.clone()), ("ERR", self.err_trap.clone()), ("RETURN", self.return_trap.clone())] {
+                        if let Some(code) = code
+                            && asked(label)
+                        {
+                            sh_println!(self, "trap -- {} {}", crate::serialize::quote_literal(&code), label);
                         }
                     }
                     return ExecResult::Status(0);
@@ -7467,12 +7571,19 @@ impl Shell {
                     // The pseudo-signals: not signals, fired by the
                     // interpreter itself. `-` clears one, same as for a
                     // real signal.
-                    if let Some(slot) = match sig.as_str() {
-                        "DEBUG" => Some(&mut self.debug_trap),
-                        "ERR" => Some(&mut self.err_trap),
-                        "RETURN" => Some(&mut self.return_trap),
+                    if let Some(which) = match sig.as_str() {
+                        "DEBUG" => Some(PseudoTrap::Debug),
+                        "ERR" => Some(PseudoTrap::Err),
+                        "RETURN" => Some(PseudoTrap::Return),
                         _ => None,
                     } {
+                        let depth = self.function_depth;
+                        self.pseudo_trap_depth[which as usize] = depth;
+                        let slot = match which {
+                            PseudoTrap::Debug => &mut self.debug_trap,
+                            PseudoTrap::Err => &mut self.err_trap,
+                            PseudoTrap::Return => &mut self.return_trap,
+                        };
                         *slot = if cmd_str == "-" { None } else { Some(cmd_str.clone()) };
                         continue;
                     }
@@ -7729,7 +7840,7 @@ impl Shell {
             let v = self.expand_word(val);
             let v = match mode {
                 AssignMode::Set => v,
-                AssignMode::Append => self.lookup_var(k) + &v,
+                AssignMode::Append => self.appended_value(k, &v),
             };
             command.env(k, v);
         }
@@ -8053,7 +8164,7 @@ impl Shell {
                     let v = self.expand_word(val);
                     let v = match mode {
                         AssignMode::Set => v,
-                        AssignMode::Append => self.lookup_var(k) + &v,
+                        AssignMode::Append => self.appended_value(k, &v),
                     };
                     command.env(k, v);
                 }
@@ -8315,7 +8426,7 @@ impl Shell {
                         let v = self.expand_word(val);
                         let v = match mode {
                             AssignMode::Set => v,
-                            AssignMode::Append => self.lookup_var(k) + &v,
+                            AssignMode::Append => self.appended_value(k, &v),
                         };
                         command.env(k, v);
                     }
@@ -9535,7 +9646,15 @@ impl Shell {
     pub(crate) fn remove_var(&mut self, name: &str) {
         self.unset_names.insert(name.to_string());
         for scope in self.var_scopes.iter_mut().rev() {
-            if scope.remove(name).is_some() {
+            if let Some(slot) = scope.get_mut(name) {
+                // The shadow stays and becomes an *unset* one, rather
+                // than being removed. Removing it uncovered whatever
+                // the caller had, so `f() { local x=1; unset x; echo
+                // "${x-gone}"; }` with a global `x=outer` printed
+                // `outer` where bash prints `gone`: unsetting a local
+                // leaves the name unset for the rest of the function,
+                // it does not hand the enclosing one back.
+                *slot = None;
                 return;
             }
         }
@@ -9969,6 +10088,22 @@ impl Shell {
     // exit status (a bare `x=2` command, `declare`, `local`) check it.
     pub(crate) fn assign_var(&mut self, name: &str, value: String) -> bool {
         self.assign_var_impl(name, value, false)
+    }
+
+    // What `name+=v` assigns. Concatenation, except for a name carrying
+    // the integer attribute, where bash makes it addition:
+    // `declare -i n=3; n+=2` is 5, not "32". Every `+=` on a scalar
+    // goes through here -- the prefix-assignment form (`n+=2 cmd`) and
+    // the environment a child is built with included, since those read
+    // the same variable.
+    pub(crate) fn appended_value(&mut self, name: &str, v: &str) -> String {
+        if self.integer_names.contains(name) {
+            let current = self.lookup_var(name);
+            let a = arith::eval(&current, self).unwrap_or(0);
+            let b = arith::eval(v, self).unwrap_or(0);
+            return (a + b).to_string();
+        }
+        self.lookup_var(name) + v
     }
 
     /// Assigns and marks exported, the way `export NAME=value` does --
@@ -12343,7 +12478,12 @@ fn exit_code_from_status(status: std::process::ExitStatus) -> i32 {
 // seeing its delimiter (or before nchars is reached) still populates the
 // variable(s) with whatever partial data it got, but returns non-zero --
 // `clean` (the bool) tracks which case this was.
-fn read_line_or_chars(reader: &mut dyn std::io::BufRead, nchars: Option<usize>, delim: u8) -> (Option<String>, bool) {
+// `raw` is `read` *without* `-r`, where a backslash escapes the next
+// character -- including the delimiter, which then continues the line
+// rather than ending it. The escapes themselves are removed later (see
+// unescape_read_line), because the splitting has to know which
+// characters they protected.
+fn read_line_or_chars(reader: &mut dyn std::io::BufRead, nchars: Option<usize>, delim: u8, raw: bool) -> (Option<String>, bool) {
     if let Some(n) = nchars {
         let mut buf = Vec::with_capacity(n);
         let mut hit_eof = false;
@@ -12364,21 +12504,58 @@ fn read_line_or_chars(reader: &mut dyn std::io::BufRead, nchars: Option<usize>, 
         if buf.is_empty() && hit_eof { (None, false) } else { (Some(String::from_utf8_lossy(&buf).into_owned()), !hit_eof) }
     } else {
         let mut buf: Vec<u8> = Vec::new();
-        match reader.read_until(delim, &mut buf) {
-            Ok(0) => (None, false),
-            Ok(_) => {
-                let hit_delim = buf.last() == Some(&delim);
-                if hit_delim {
-                    buf.pop();
-                    if delim == b'\n' && buf.last() == Some(&b'\r') {
+        let mut any = false;
+        let mut hit_delim = false;
+        loop {
+            let before = buf.len();
+            match reader.read_until(delim, &mut buf) {
+                Ok(0) => break,
+                Ok(_) => {
+                    any = true;
+                    hit_delim = buf.last() == Some(&delim);
+                    if hit_delim {
                         buf.pop();
+                        if delim == b'\n' && buf.last() == Some(&b'\r') {
+                            buf.pop();
+                        }
                     }
+                    // A line ending in an *unescaped* backslash is not
+                    // finished: the backslash escaped the delimiter, so
+                    // both go and the next line joins this one.
+                    let trailing = buf[before..].iter().rev().take_while(|b| **b == b'\\').count();
+                    if !raw && hit_delim && trailing % 2 == 1 {
+                        buf.pop();
+                        continue;
+                    }
+                    break;
                 }
-                (Some(String::from_utf8_lossy(&buf).into_owned()), hit_delim)
+                Err(_) => break,
             }
-            Err(_) => (None, false),
         }
+        if !any { (None, false) } else { (Some(String::from_utf8_lossy(&buf).into_owned()), hit_delim) }
     }
+}
+
+// Removes `read`'s backslash escapes, and says which characters they
+// protected: `escaped[i]` is true for a character that a backslash
+// preceded, and such a character is never a field separator however it
+// looks. `read a b <<< 'x\ y z'` gives a=`x y`, b=`z`.
+fn unescape_read_line(line: &str) -> (String, Vec<bool>) {
+    let mut out = String::with_capacity(line.len());
+    let mut mask = Vec::with_capacity(line.len());
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            if let Some(next) = chars.next() {
+                out.push(next);
+                mask.push(true);
+            }
+            continue;
+        }
+        out.push(c);
+        mask.push(false);
+    }
+    (out, mask)
 }
 
 /// The three `trap` targets that are not signals -- the interpreter
@@ -12399,10 +12576,12 @@ fn unix_now() -> std::time::Duration {
 /// The three `trap` targets that are not signals -- the interpreter
 /// fires each itself, at a point it already passes through.
 #[derive(Clone, Copy, PartialEq, Eq)]
+// The discriminants index pseudo_trap_depth.
+#[repr(usize)]
 enum PseudoTrap {
-    Debug,
-    Err,
-    Return,
+    Debug = 0,
+    Err = 1,
+    Return = 2,
 }
 
 #[derive(Clone)]
@@ -13428,29 +13607,53 @@ fn ifs_tokenize(v: &str, ifs: &str) -> (Vec<String>, bool, bool) {
 // delimiter at all. Used by `read NAME1 NAME2 ...`, which needs the
 // untouched remainder text for its last variable rather than a fully
 // re-tokenized-and-rejoined value.
-fn ifs_next_field(s: &str, ifs: &str) -> Option<(String, String)> {
-    let is_ws = |c: char| c.is_whitespace() && ifs.contains(c);
-    let is_sep = |c: char| ifs.contains(c);
-    let chars: Vec<char> = s.chars().collect();
+// ifs_next_field over a line `read` has already unescaped, starting at
+// `from`. A character `escaped` marks is not a separator, whatever it
+// is. Returns the field and where the remainder starts.
+fn ifs_next_field_masked(chars: &[char], escaped: &[bool], ifs: &str, from: usize) -> Option<(String, usize)> {
+    let is_sep = |i: usize| !escaped[i] && ifs.contains(chars[i]);
+    let is_ws = |i: usize| !escaped[i] && chars[i].is_whitespace() && ifs.contains(chars[i]);
     let n = chars.len();
-    let mut i = 0;
-    while i < n && !is_sep(chars[i]) {
+    let mut i = from;
+    while i < n && !is_sep(i) {
         i += 1;
     }
     if i >= n {
         return None;
     }
-    let field: String = chars[..i].iter().collect();
-    while i < n && is_ws(chars[i]) {
+    let field: String = chars[from..i].iter().collect();
+    while i < n && is_ws(i) {
         i += 1;
     }
-    if i < n && is_sep(chars[i]) {
+    if i < n && is_sep(i) {
         i += 1;
-        while i < n && is_ws(chars[i]) {
+        while i < n && is_ws(i) {
             i += 1;
         }
     }
-    Some((field, chars[i..].iter().collect()))
+    Some((field, i))
+}
+
+// The whole line at once, for `read -a`.
+fn ifs_tokenize_masked(chars: &[char], escaped: &[bool], ifs: &str) -> Vec<String> {
+    let mut fields = Vec::new();
+    let mut i = 0;
+    while i < chars.len() && !escaped[i] && chars[i].is_whitespace() && ifs.contains(chars[i]) {
+        i += 1;
+    }
+    while i < chars.len() {
+        match ifs_next_field_masked(chars, escaped, ifs, i) {
+            Some((field, next)) => {
+                fields.push(field);
+                i = next;
+            }
+            None => {
+                fields.push(chars[i..].iter().collect());
+                break;
+            }
+        }
+    }
+    fields
 }
 
 fn append_splittable(fields: &mut Vec<String>, current: &mut Option<String>, v: &str, quoted: bool, ifs: &str) {

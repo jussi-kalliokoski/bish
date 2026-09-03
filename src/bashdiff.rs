@@ -634,6 +634,42 @@ y
         case("select-of-nothing", r#"select x in; do echo hi; done; echo "rc=$?""#),
         case("select-at-end-of-input", r#"select x in a b; do break; done < /dev/null; echo done"#),
         case("select-without-an-in-clause", r#"set -- p q; select x; do echo "[$x]"; break; done <<< "2""#),
+        // -- and what a second sweep turned up ------------------------
+        // `read`'s short options cluster like every other builtin's.
+        // Matching whole argument strings took `-ra` for a *variable
+        // name*, so the commonest spelling of the commonest idiom read
+        // into nothing at all.
+        case("read-clustered-short-options", r#"read -ra p <<< "a b c"; echo "${#p[@]}${p[2]}""#),
+        case("read-clustered-option-with-its-value", r#"read -rn2 v <<< "abcd"; echo "[$v]""#),
+        // And `-r` was parsed and then not recorded, so every read
+        // behaved as if it were given. Without it a backslash escapes
+        // the next character -- including a separator, which then stays
+        // part of its field, and the delimiter, which continues the
+        // line.
+        case("read-without-r-takes-escapes-off", r#"read v <<< 'a\tb'; echo "[$v]"; read -r v <<< 'a\tb'; echo "[$v]""#),
+        case("read-without-r-keeps-an-escaped-separator", r#"read a b <<< 'x\ y z'; echo "[$a][$b]""#),
+        case("read-without-r-continues-a-line", "printf 'a\\\\\nb\\n' | { read v; echo \"[$v]\"; }"),
+        // `+=` on a name with the integer attribute is addition.
+        case("integer-append-is-addition", r#"declare -i I=3; I+=2; echo $I; declare -i J; J+=5; echo $J; x=a; x+=b; echo $x"#),
+        // Unsetting a local leaves the name unset for the rest of the
+        // function; it does not hand the enclosing variable back.
+        case("unset-a-local-does-not-uncover-the-global", r#"f() { local x=1; unset x; echo "[${x-gone}]"; }; x=outer; f; echo "[$x]""#),
+        case("assign-after-unsetting-a-local", r#"f() { local x=1; unset x; x=2; echo "[$x]"; }; x=outer; f; echo "[$x]""#),
+        // A pseudo-trap fires at the depth it was set and in what it
+        // returns into, not in what it calls -- which is what "not
+        // inherited" means, and what `functrace` turns off. RETURN was
+        // gated on `functrace` alone, so the ordinary way of writing
+        // one never ran at all.
+        case("return-trap-set-inside-a-function", r#"f() { trap "echo RET" RETURN; :; }; f"#),
+        case("return-trap-set-at-the-top-level", r#"trap "echo RET" RETURN; f() { :; }; f; echo end"#),
+        case("return-trap-under-functrace", r#"set -T; trap "echo RET" RETURN; f() { :; }; f"#),
+        case("return-trap-does-not-follow-a-call", r#"f() { trap "echo RET" RETURN; g; }; g() { echo ing; }; f"#),
+        case("return-trap-fires-on-the-way-out", r#"g() { trap "echo RET" RETURN; :; }; f() { g; echo after; }; f"#),
+        // `trap -p` reports the three pseudo-signals too, and reports
+        // only what it was asked for.
+        case("trap-p-of-a-pseudo-signal", r#"trap "echo x" RETURN; trap -p RETURN; trap "echo y" ERR; trap -p ERR"#),
+        case("trap-p-names-only-what-it-was-asked", r#"trap "echo a" USR1; trap "echo b" USR2; trap -p USR2"#),
+        case("trap-p-of-an-unknown-signal", r#"trap -p NOSUCH 2>/dev/null; echo "rc=$?""#),
         // -- roadmap 10: the last of the grammar's leniency ------------
         // A `;` where a command is expected is a syntax error, not an
         // empty statement -- in front of the first command of a list as
@@ -677,6 +713,16 @@ y
         // work; until then `type f` deliberately stops after `f is a
         // function` rather than printing a body that would differ.
         ("function-body-formatting", "`declare -f f` reconstructs the body in bish's own layout, not bash's"),
+        // The ordered redirect simulation that made a *builtin's* fd
+        // list exact has no counterpart on the path that builds a real
+        // child's descriptors, which still resolves to a fixed
+        // stdin/stdout/stderr triple plus a dup flag. That shape cannot
+        // say "fd 1 was rebound after the dup that read it", so a swap
+        // followed by a further redirect comes out wrong.
+        (
+            "compound-fd-swap-then-redirect",
+            "`{ echo o; } 3>&1 1>&2 2>&3 3>&- 2>/dev/null` writes the wrong stream; the child-fd resolver has no ordering",
+        ),
     ];
 
     // The cases the divergence list is about. Kept apart from `CASES`
@@ -684,7 +730,15 @@ y
     const PENDING: &[Case] = &[
         case("set-o-lists-fewer-options", r#"set -o | wc -l"#),
         case("function-body-formatting", r#"f() { :; }; declare -f f"#),
+        case("compound-fd-swap-then-redirect", r#"{ echo o; echo e >&2; } 3>&1 1>&2 2>&3 3>&- 2>/dev/null"#),
         // -- roadmap 10: parser leniency, the part still standing -----
+        // Also not recordable, and for the same kind of reason: a
+        // signal this shell was *started* with ignored is reported by
+        // bash's `trap -p` as `trap -- '' SIGX`, and bish says nothing
+        // about it. Seeing the difference needs the parent to have
+        // ignored a signal first, which a case cannot arrange for the
+        // shell that runs it.
+        //
         // Not recordable here, and worth saying why: `SHLVL` counts one
         // higher through two levels of `-c`, because bash decrements it
         // before `exec`ing the last command of a `-c` and bish spawns
