@@ -22,23 +22,28 @@ pub(crate) fn run_cd(sh: &mut Shell, args: &[String]) -> i32 {
     let old = sh.cwd.to_string_lossy().into_owned();
     let target = if let Some(dir) = operands.first() {
         if dir.as_str() == "-" {
-            match std::env::var("OLDPWD") {
-                Ok(p) => {
-                    sh_println!(sh, "{}", p);
-                    p
-                }
-                Err(_) => {
-                    sh_eprintln!(sh, "bish: cd: OLDPWD not set");
-                    return 1;
-                }
+            // The shell's own `OLDPWD`, not the process environment's.
+            // `cd` is the thing that *writes* OLDPWD, and it writes it
+            // to the shell (see Shell::chdir) -- reading it back out of
+            // `environ` found whatever this process was started with,
+            // so `cd -` went somewhere the shell had never been, and
+            // `unset OLDPWD` did not stop it. Same for HOME below,
+            // which is why `HOME=/x; cd` ignored the assignment while
+            // `echo ~` honoured it.
+            if !sh.var_is_set("OLDPWD") {
+                sh_eprintln!(sh, "bish: cd: OLDPWD not set");
+                return 1;
             }
+            let p = sh.lookup_var("OLDPWD");
+            sh_println!(sh, "{}", p);
+            p
         } else {
             (*dir).clone()
         }
     } else {
-        match std::env::var("HOME") {
-            Ok(h) => h,
-            Err(_) => {
+        match sh.var_is_set("HOME").then(|| sh.lookup_var("HOME")) {
+            Some(h) => h,
+            None => {
                 sh_eprintln!(sh, "bish: cd: HOME not set");
                 return 1;
             }

@@ -593,6 +593,47 @@ y
         // from no SHLVL at all and must reach 1 -- the increment is
         // what is being checked, not the inherited value.
         case("shlvl-starts-at-one", r#"echo "$SHLVL""#),
+        // -- what a sweep of untested ground turned up ------------------
+        // `cd` reads the *shell's* HOME and OLDPWD. Reading the process
+        // environment instead meant a plain assignment was invisible to
+        // it (while `echo ~`, which does read the shell, honoured the
+        // same assignment) and `unset` did not take.
+        case("cd-uses-the-shells-home", r#"mkdir -p h; HOME=$PWD/h; cd; [ "$PWD" = "$(cd h 2>/dev/null; pwd)" ] || pwd"#),
+        case("cd-dash-uses-the-shells-oldpwd", r#"mkdir -p a b; cd a; cd ../b; cd - > /dev/null; basename "$PWD""#),
+        case("cd-with-no-home-fails", r#"unset HOME; cd 2>/dev/null; echo "rc=$?""#),
+        case("cd-dash-with-no-oldpwd-fails", r#"unset OLDPWD; cd - 2>/dev/null; echo "rc=$?""#),
+        // Unsetting a variable that came from the environment has to
+        // actually unset it. The lookups ended in a real-environment
+        // fallback, so the name came straight back -- while a child's
+        // environment, built from the shell's own tables, really had
+        // lost it. The two answers disagreed about the same variable.
+        case("unset-an-inherited-variable", r#"echo "[${HOME-gone}]"; unset HOME; echo "[${HOME-gone}]""#),
+        case("unset-an-inherited-variable-under-nounset", r#"unset HOME; set -u; echo "$HOME" 2>/dev/null; echo "rc=$?""#),
+        case("unset-then-set-again", r#"unset HOME; HOME=/x; echo "$HOME""#),
+        // `type` knows five kinds, in this order, and knew two.
+        case("type-of-a-keyword", r#"type if; type -t for; type -t "[["; type -t "!"; type -t time"#),
+        // Reported only where it would actually be expanded, which is
+        // why the case turns the shopt on: `alias -p` lists it either
+        // way, but under `-c` bash's `type` says "not found".
+        case("type-of-an-alias", r#"shopt -s expand_aliases; alias ll="ls -l"; type ll; type -t ll"#),
+        case("type-of-an-unexpanded-alias", r#"alias ll="ls -l"; alias -p; type -t ll; echo "rc=$?""#),
+        case("keyword-completions", r#"compgen -A keyword | sort | tr '\n' ' '; echo"#),
+        // Every getopts branch that does not set OPTARG leaves it unset;
+        // the argument of the *previous* option used to stay visible.
+        case("getopts-clears-optarg", r#"f(){ while getopts "ab:c" o; do echo "$o=[${OPTARG-UNSET}]"; done; }; f -a -b val -c"#),
+        case("getopts-silent-missing-argument", r#"f(){ while getopts ":ab:" o; do echo "$o=[${OPTARG-UNSET}]"; done; }; f -a -b"#),
+        // `$-` is every option letter currently on, lowercase first,
+        // then uppercase, then how the shell was invoked.
+        case("dollar-dash", r#"echo "$-""#),
+        case("dollar-dash-with-options-set", r#"set -e -f -u -x -C -m -T -E; echo "$-""#),
+        // `select` reads through the redirect on the loop, like `read`
+        // does -- it read the real stdin, so a here-string was never
+        // seen and the body never ran. And an empty list is not a menu
+        // with no entries: bash prints nothing and leaves at once.
+        case("select-reads-its-own-redirect", r#"select x in a b; do echo "[$x][$REPLY]"; break; done <<< "2""#),
+        case("select-of-nothing", r#"select x in; do echo hi; done; echo "rc=$?""#),
+        case("select-at-end-of-input", r#"select x in a b; do break; done < /dev/null; echo done"#),
+        case("select-without-an-in-clause", r#"set -- p q; select x; do echo "[$x]"; break; done <<< "2""#),
         // -- roadmap 10: the last of the grammar's leniency ------------
         // A `;` where a command is expected is a syntax error, not an
         // empty statement -- in front of the first command of a list as
@@ -618,11 +659,31 @@ y
     // found and not yet fixed belongs here with its reason, so that
     // "bish agrees with bash" never quietly means "except where it
     // doesn't".
-    const DIVERGENCES: &[(&str, &str)] = &[];
+    const DIVERGENCES: &[(&str, &str)] = &[
+        // A deliberate choice, not an oversight: bish's `set -o` lists
+        // only the ten names that gate real behaviour here, where bash
+        // lists twenty-seven. Printing `allexport off` for an option
+        // this shell does nothing with would read as support for it,
+        // and `set -o allexport` would then silently not take. The same
+        // principle keeps `compgen -A setopt` short. Recorded because
+        // it is still a difference a script can see.
+        ("set-o-lists-fewer-options", "`set -o` lists 10 options; bash lists 27, most of which bish does not implement"),
+        // `type` and `declare -f` print a function's body by
+        // reconstructing it from the parse tree, and the reconstruction
+        // is bish's own shape (`f() {` on one line, each statement
+        // quoted and `;`-terminated) rather than bash's pretty-printer
+        // (`f () ` / `{ ` / four-space indent). Matching it means
+        // writing bash's printer exactly, which is its own piece of
+        // work; until then `type f` deliberately stops after `f is a
+        // function` rather than printing a body that would differ.
+        ("function-body-formatting", "`declare -f f` reconstructs the body in bish's own layout, not bash's"),
+    ];
 
     // The cases the divergence list is about. Kept apart from `CASES`
     // so that list stays a description of what works.
     const PENDING: &[Case] = &[
+        case("set-o-lists-fewer-options", r#"set -o | wc -l"#),
+        case("function-body-formatting", r#"f() { :; }; declare -f f"#),
         // -- roadmap 10: parser leniency, the part still standing -----
         // Not recordable here, and worth saying why: `SHLVL` counts one
         // higher through two levels of `-c`, because bash decrements it

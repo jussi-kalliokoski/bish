@@ -1178,6 +1178,21 @@ pub struct Shell {
     // two hold the attribute, and a name is an array if it is in either
     // half of its pair. The attribute is what makes a later plain
     // `A=x` mean `A[0]=x` rather than a scalar shadowing the array.
+    // Names this shell has explicitly `unset`, so the real-environment
+    // fallback the three lookups end in does not hand the value back.
+    // That fallback is there for a name set behind the shell's back
+    // after startup (the session bridge's `XDG_RUNTIME_DIR`, `TZ` in a
+    // test); everything inherited is seeded into `globals` at startup
+    // instead. Without the tombstone it also answered for a name the
+    // shell had just removed, so `unset HOME` left `${HOME-gone}`
+    // saying `/home/jussi` -- and `unset` looked like it had worked,
+    // because a child's environment is built from `globals` and really
+    // had lost it.
+    // `c`, `s` or `i` -- how this shell was invoked, which is the last
+    // character of `$-`. `None` for a named script, which contributes
+    // no letter at all.
+    pub invocation_flag: Option<char>,
+    unset_names: std::collections::HashSet<String>,
     pub(crate) array_names: std::collections::HashSet<String>,
     pub(crate) assoc_names: std::collections::HashSet<String>,
     // `alias name=value`, expanded for real -- see
@@ -1200,7 +1215,7 @@ pub struct Shell {
     // Vec, not a map -- bash's own `alias` listing (and real bash's own
     // internal table) is in definition order, not sorted, and this list is
     // never large enough for linear lookup to matter.
-    aliases: Vec<(String, String)>,
+    pub(crate) aliases: Vec<(String, String)>,
     // `abbr -a NAME EXPANSION`: fish-style abbreviations -- unlike
     // `aliases` above, these *do* expand, but never here in exec.rs. The
     // trigger lives entirely in editor.rs's own read_line (Space/Enter
@@ -1817,6 +1832,8 @@ impl Shell {
             // has to exist too.
             arrays: HashMap::from([("BASH_VERSINFO".to_string(), BASH_VERSINFO.iter().enumerate().map(|(i, v)| (i, (*v).to_string())).collect())]),
             assoc_arrays: HashMap::new(),
+            invocation_flag: None,
+            unset_names: std::collections::HashSet::new(),
             array_names: std::collections::HashSet::new(),
             assoc_names: std::collections::HashSet::new(),
             aliases: Vec::new(),
@@ -2157,6 +2174,8 @@ impl Shell {
             running_a_script: self.running_a_script,
             arrays: self.arrays.clone(),
             assoc_arrays: self.assoc_arrays.clone(),
+            invocation_flag: self.invocation_flag,
+            unset_names: self.unset_names.clone(),
             array_names: self.array_names.clone(),
             assoc_names: self.assoc_names.clone(),
             aliases: self.aliases.clone(),
@@ -4294,12 +4313,21 @@ impl Shell {
                 _ => continue,
             }
         }
-        // A converted construct's own stdin (see StdioOverride's doc
-        // comment) takes precedence over the real process stdin -- e.g. a
-        // `while read` loop's `< file` redirect sits on the *enclosing*
-        // compound command, not on this individual `read`, so this
-        // command's own `cmd.redirects` above is empty even though stdin
-        // very much isn't the real terminal.
+        self.current_stdin_reader()
+    }
+
+    // Where a builtin reads when the command itself carries no `<` of
+    // its own: the enclosing construct's stdin override if there is one
+    // (see StdioOverride's doc comment) -- a `while read` loop's
+    // `< file` sits on the *loop*, not on the `read`, so the read's own
+    // redirect list is empty even though stdin is not the terminal --
+    // and otherwise the real fd 0.
+    //
+    // `select` reads through here too. It used to go straight to
+    // `std::io::stdin()`, so `select ... done <<< "1"` never saw the
+    // here-string: it read the real stdin, hit end-of-file, and gave up
+    // without ever running the body.
+    fn current_stdin_reader(&self) -> Box<dyn std::io::BufRead> {
         if let Some(o) = &self.stdio_override {
             if let Some(state) = &o.borrow().stdin {
                 return Box::new(SharedStdinReader { state: state.clone(), local: Vec::new() });
@@ -5608,6 +5636,12 @@ impl Shell {
                 sh_eprintln!(this, "{}) {}", i + 1, item);
             }
         };
+        // Nothing to choose from is not a prompt with no options: bash
+        // does not print the menu, does not prompt, and leaves the loop
+        // at once with status 0.
+        if items.is_empty() {
+            return ExecResult::Status(0);
+        }
         print_menu(self, &items);
         loop {
             let ps3 = {
@@ -5617,7 +5651,7 @@ impl Shell {
             sh_eprint!(self, "{}", ps3);
             let _ = std::io::Write::flush(&mut std::io::stderr());
             let mut line = String::new();
-            match std::io::BufRead::read_line(&mut std::io::stdin().lock(), &mut line) {
+            match std::io::BufRead::read_line(&mut self.current_stdin_reader(), &mut line) {
                 // Confirmed against real bash: on EOF, `select` prints a
                 // bare newline to *stdout* (not stderr, where the menu/
                 // prompt otherwise live) before giving up -- reproducible
@@ -9455,7 +9489,7 @@ impl Shell {
         // The real environment is still consulted last, for a name
         // something outside this table set behind its back -- the
         // session bridge's own `XDG_RUNTIME_DIR`, or `TZ` in a test.
-        std::env::var(name).unwrap_or_default()
+        self.inherited_var(name).unwrap_or_default()
     }
 
     // Writes a name's own raw value, bypassing nameref redirection -- used
@@ -9499,12 +9533,22 @@ impl Shell {
     // holding it, the globals, and the real environment. Shared by
     // `unset` and by the restore half of a `FOO=bar cmd` prefix.
     pub(crate) fn remove_var(&mut self, name: &str) {
+        self.unset_names.insert(name.to_string());
         for scope in self.var_scopes.iter_mut().rev() {
             if scope.remove(name).is_some() {
                 return;
             }
         }
         self.globals.remove(name);
+    }
+
+    // Whatever the real environment says about `name` -- unless this
+    // shell has unset it, in which case it says nothing.
+    fn inherited_var(&self, name: &str) -> Option<String> {
+        if self.unset_names.contains(name) {
+            return None;
+        }
+        std::env::var(name).ok()
     }
 
     // Follows a `declare -n`/`local -n` chain to the final target name,
@@ -9577,25 +9621,38 @@ impl Shell {
                 self.effects += 1;
                 (self.shell_start.elapsed().as_secs() as i64 + self.seconds_offset).to_string()
             }
+            // The single-letter name of every option currently on,
+            // then the letter for how the shell was invoked. bash
+            // orders them lowercase-alphabetical, then
+            // uppercase-alphabetical, then the invocation letter last:
+            // `set -e -f -u -x -C -m -T -E -a -b -v` under `-c` gives
+            // `abefhmuvxBCETc`.
+            //
+            // `h` and `B` are unconditional because they are true and
+            // not settable here: this shell hashes what it looks up on
+            // PATH and expands braces, and has no way to stop doing
+            // either. Everything else is a real option's real state.
             "-" => {
-                let mut s = String::new();
-                if self.opt_errexit {
-                    s.push('e');
+                let mut letters: Vec<char> = vec!['h', 'B'];
+                for (on, c) in [
+                    (self.opt_errexit, 'e'),
+                    (self.opt_noglob, 'f'),
+                    (self.opt_monitor, 'm'),
+                    (self.opt_nounset, 'u'),
+                    (self.opt_xtrace, 'x'),
+                    (self.opt_noclobber, 'C'),
+                    (self.opt_errtrace, 'E'),
+                    (self.opt_functrace, 'T'),
+                    (self.opt_restricted, 'r'),
+                ] {
+                    if on {
+                        letters.push(c);
+                    }
                 }
-                if self.opt_noglob {
-                    s.push('f');
-                }
-                if self.opt_nounset {
-                    s.push('u');
-                }
-                if self.opt_xtrace {
-                    s.push('x');
-                }
-                if self.opt_noclobber {
-                    s.push('C');
-                }
-                if self.opt_restricted {
-                    s.push('r');
+                letters.sort_by_key(|c| (c.is_ascii_uppercase(), *c));
+                let mut s: String = letters.into_iter().collect();
+                if let Some(c) = self.invocation_flag {
+                    s.push(c);
                 }
                 s
             }
@@ -9626,7 +9683,7 @@ impl Shell {
                 // outside the variable table set behind its back --
                 // see raw_var_lookup, which reads the same three
                 // places in the same order.
-                if let Ok(v) = std::env::var(name) {
+                if let Some(v) = self.inherited_var(name) {
                     return v;
                 }
                 // Startup-populated-in-real-bash variables: computed on
@@ -9670,7 +9727,7 @@ impl Shell {
                 map.iter().map(|(k, v)| format!("[{}]={}", k, crate::serialize::quote_literal(v))).collect::<Vec<_>>().join(" ")
             ));
         }
-        self.globals.get(name).cloned().or_else(|| std::env::var(name).ok())
+        self.globals.get(name).cloned().or_else(|| self.inherited_var(name))
     }
 
     // pub: debugger.rs (a separate module -- see DebugHook's own doc
@@ -9900,7 +9957,7 @@ impl Shell {
                 return v.is_some();
             }
         }
-        self.globals.contains_key(name) || std::env::var(name).is_ok()
+        self.globals.contains_key(name) || self.inherited_var(name).is_some()
     }
 
     // Plain assignment targets the global (process-env) variable, unless it
@@ -15863,7 +15920,7 @@ mod tests {
     }
 
     #[test]
-    fn compgen_keyword_action_lists_bish_reserved_words_only() {
+    fn compgen_keyword_action_lists_every_reserved_word() {
         let mut shell = Shell::new();
         let buf = capture_output(&mut shell);
         crate::builtins::completion::run_compgen(&mut shell, &strs(&["-A", "keyword"]));
@@ -15871,10 +15928,12 @@ mod tests {
         assert!(owned.iter().any(|n| n == "if"), "{owned:?}");
         assert!(owned.iter().any(|n| n == "done"), "{owned:?}");
         assert!(owned.iter().any(|n| n == "[["), "{owned:?}");
-        // Real bash's own list also has "!" and "time" -- not reserved
-        // words in bish's own grammar, so deliberately absent here.
-        assert!(!owned.iter().any(|n| n == "!"), "{owned:?}");
-        assert!(!owned.iter().any(|n| n == "time"), "{owned:?}");
+        // `!` and `time` were left out on the grounds that bish's
+        // grammar did not reserve them. It does -- `! false` and
+        // `time f` both parse -- and `type -t` has to answer "keyword"
+        // for them, which it does off this same list.
+        assert!(owned.iter().any(|n| n == "!"), "{owned:?}");
+        assert!(owned.iter().any(|n| n == "time"), "{owned:?}");
     }
 
     #[test]

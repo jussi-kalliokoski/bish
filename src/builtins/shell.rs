@@ -40,6 +40,12 @@ pub(crate) fn run_getopts(sh: &mut Shell, args: &[String]) -> ExecResult {
         return ExecResult::Status(1);
     }
 
+    // Every branch below that does not set `OPTARG` leaves it *unset*,
+    // so clear it once here rather than in each of them. An option that
+    // takes no argument is the common case, and leaving the previous
+    // option's argument in place made `-b val -c` report `c` with
+    // `OPTARG` still `val`.
+    sh.remove_var("OPTARG");
     let opt_char = cur.chars().nth(1).unwrap_or('?');
     let silent = optstring.starts_with(':');
     let spec = optstring.trim_start_matches(':');
@@ -449,6 +455,36 @@ pub(crate) fn run_type(sh: &mut Shell, args: &[String]) -> i32 {
     let mut status = 0;
     for name in names {
         let mut found = false;
+        // bash's own order, and `-a` reports every one of them: alias,
+        // keyword, function, builtin, file.
+        // Only when alias expansion is actually in effect: `type` says
+        // what the shell would *do* with the name, and a recorded alias
+        // that will never be expanded is not what it would do. bash
+        // reports it interactively and not under `-c`, and `alias -p`
+        // lists it either way.
+        let alias = sh.shopt_is_on("expand_aliases").then(|| sh.aliases.iter().find(|(n, _)| n == name).map(|(_, v)| v.clone())).flatten();
+        if let Some(target) = alias {
+            if kind_only {
+                sh_println!(sh, "alias");
+            } else if !path_only {
+                sh_println!(sh, "{} is aliased to `{}'", name, target);
+            }
+            found = true;
+            if !all {
+                continue;
+            }
+        }
+        if crate::compgen::KEYWORDS.contains(&name.as_str()) {
+            if kind_only {
+                sh_println!(sh, "keyword");
+            } else if !path_only {
+                sh_println!(sh, "{} is a shell keyword", name);
+            }
+            found = true;
+            if !all {
+                continue;
+            }
+        }
         if sh.functions.contains_key(name.as_str()) {
             if kind_only {
                 sh_println!(sh, "function");

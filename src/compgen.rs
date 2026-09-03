@@ -169,15 +169,17 @@ pub fn action_flag_char(action: CompgenAction) -> Option<char> {
 // produced no trailing slash, no different from without -o at all).
 pub const O_OPTIONS: &[&str] = &["bashdefault", "default", "dirnames", "filenames", "noquote", "nosort", "nospace", "plusdirs"];
 
-// `-A keyword`: every word bish's own lexer turns into a reserved-word
-// token, plus the brace/double-bracket pairs that are reserved punctuation
-// rather than word-lookup keywords in this grammar. Real bash's own list
-// also includes "!" and "time" (pipeline negation/timing) -- bish's
-// grammar doesn't reserve either as a keyword, so they're deliberately
-// left out here rather than advertised as something typeable that isn't.
+// Every word this shell's grammar reserves: the ones its lexer turns
+// into a reserved-word token, the brace/double-bracket pairs that are
+// reserved punctuation rather than word-lookup keywords here, and `!`
+// and `time`, which the pipeline rule reserves without either becoming
+// a keyword token. Shared by `compgen -A keyword` and by `type`, which
+// has to answer "keyword" for all of them -- they were left out on the
+// grounds that bish's grammar did not reserve them, but `! false` and
+// `time f` both parse, so it does.
 pub const KEYWORDS: &[&str] = &[
     "if", "then", "elif", "else", "fi", "for", "while", "until", "do", "done", "case", "esac", "select", "function", "coproc", "in", "{", "}", "[[",
-    "]]",
+    "]]", "!", "time",
 ];
 
 // Every bit of live Shell state a *contextual* action (one that isn't just

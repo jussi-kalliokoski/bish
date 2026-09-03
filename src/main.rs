@@ -149,6 +149,9 @@ fn main() {
     }
 
     if let Some(command) = &invocation.command {
+        // The last letter of `$-`: `c` here, `s` for a script read from
+        // stdin, `i` when interactive, and nothing for a named script.
+        shell.invocation_flag = Some('c');
         let script_name = invocation.operands.first().cloned().unwrap_or_else(|| "bish".to_string());
         let positional = invocation.operands.get(1..).map(<[String]>::to_vec).unwrap_or_default();
         shell.set_script_args(script_name, positional);
@@ -180,11 +183,13 @@ fn main() {
     }
 
     if invocation.interactive.unwrap_or_else(|| std::io::stdin().is_terminal()) {
+        shell.invocation_flag = Some('i');
         if !invocation.norc {
             load_config(&mut shell);
         }
         repl::run(shell, invocation.promoted);
     } else {
+        shell.invocation_flag = Some('s');
         source_bash_env(&mut shell, &invocation);
         let mut src = String::new();
         if std::io::stdin().read_to_string(&mut src).is_ok() {
