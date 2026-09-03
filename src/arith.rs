@@ -33,42 +33,53 @@ fn tokenize(src: &str) -> Result<Vec<Tok>, String> {
         }
         if c.is_ascii_digit() {
             let start = i;
-            if c == '0' && i + 1 < chars.len() && (chars[i + 1] == 'x' || chars[i + 1] == 'X') {
-                i += 2;
-                let hstart = i;
-                while i < chars.len() && chars[i].is_ascii_hexdigit() {
-                    i += 1;
-                }
-                let n = i64::from_str_radix(&chars[hstart..i].iter().collect::<String>(), 16)
-                    .map_err(|_| "bad hex number in arithmetic expression".to_string())?;
-                toks.push(Tok::Num(n));
-                continue;
+            // A numeric literal runs to the end of the run of digit-set
+            // characters, and the base is checked *afterwards*. Stopping
+            // at the first character that did not fit the base instead
+            // read `12a` as 12, `1e2` as 1 and `0b101` as 0, each with
+            // something left over that quietly went nowhere. bash reads
+            // the whole token and then rejects it.
+            let digit_char = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '@';
+            // base#digits (e.g. 16#FF, 2#101) -- the base is the plain
+            // decimal run in front of the `#`.
+            let mut scan = i;
+            while scan < chars.len() && chars[scan].is_ascii_digit() {
+                scan += 1;
             }
-            while i < chars.len() && chars[i].is_ascii_digit() {
-                i += 1;
-            }
-            // base#digits (e.g. 16#FF, 2#101) -- the base is what was just
-            // scanned as plain decimal digits.
-            if i < chars.len() && chars[i] == '#' {
-                let base: u32 = chars[start..i].iter().collect::<String>().parse().unwrap_or(10);
-                i += 1;
+            if scan < chars.len() && chars[scan] == '#' {
+                let base: u32 = chars[start..scan].iter().collect::<String>().parse().unwrap_or(10);
+                i = scan + 1;
                 let dstart = i;
-                while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '@' || chars[i] == '_') {
+                while i < chars.len() && digit_char(chars[i]) {
                     i += 1;
                 }
                 let digits: String = chars[dstart..i].iter().collect();
-                let n = base_number(base, &digits)?;
+                let n = base_number(base, &digits, &format!("{}#{}", base, digits))?;
                 toks.push(Tok::Num(n));
                 continue;
+            }
+            if c == '0' && i + 1 < chars.len() && (chars[i + 1] == 'x' || chars[i + 1] == 'X') {
+                i += 2;
+                let hstart = i;
+                while i < chars.len() && digit_char(chars[i]) {
+                    i += 1;
+                }
+                let digits: String = chars[hstart..i].iter().collect();
+                let token: String = chars[start..i].iter().collect();
+                // `0x` with nothing after it is zero, where `64#` with
+                // nothing after it is an error -- bash's own asymmetry.
+                let n = if digits.is_empty() { 0 } else { base_number(16, &digits, &token)? };
+                toks.push(Tok::Num(n));
+                continue;
+            }
+            while i < chars.len() && digit_char(chars[i]) {
+                i += 1;
             }
             let digits: String = chars[start..i].iter().collect();
             // Leading-zero octal (bash: 010 is 8, not 10); a bare "0" (or
             // "00") still just parses as 0 either way.
-            let n: i64 = if digits.len() > 1 && digits.starts_with('0') {
-                i64::from_str_radix(&digits, 8).map_err(|_| "bad octal number in arithmetic expression".to_string())?
-            } else {
-                digits.parse().map_err(|_| "bad number in arithmetic expression".to_string())?
-            };
+            let base = if digits.len() > 1 && digits.starts_with('0') { 8 } else { 10 };
+            let n = base_number(base, &digits, &digits)?;
             toks.push(Tok::Num(n));
             continue;
         }
@@ -570,15 +581,15 @@ fn ipow(base: i64, mut exp: u64) -> i64 {
 // 36-61, then `@` for 62 and `_` for 63. Below base 37 there is no room
 // for two letter ranges, and bash folds case there instead, which is
 // what makes `16#FF` and `16#ff` both 255 while `64#zZ` is 35*64+61.
-fn base_number(base: u32, digits: &str) -> Result<i64, String> {
+fn base_number(base: u32, digits: &str, token: &str) -> Result<i64, String> {
     if base == 0 {
-        return Err(format!("{}#{}: invalid number", base, digits));
+        return Err(format!("{}: invalid number", token));
     }
     if base == 1 || base > 64 {
-        return Err(format!("{}#{}: invalid arithmetic base", base, digits));
+        return Err(format!("{}: invalid arithmetic base", token));
     }
     if digits.is_empty() {
-        return Err(format!("{}#: invalid integer constant", base));
+        return Err(format!("{}: invalid integer constant", token));
     }
     let mut value: i64 = 0;
     for c in digits.chars() {
@@ -591,10 +602,10 @@ fn base_number(base: u32, digits: &str) -> Result<i64, String> {
             'A'..='Z' => c as u32 - 'A' as u32 + 36,
             '@' => 62,
             '_' => 63,
-            _ => return Err(format!("{}#{}: invalid integer constant", base, digits)),
+            _ => return Err(format!("{}: invalid integer constant", token)),
         };
         if d >= base {
-            return Err(format!("{}#{}: value too great for base", base, digits));
+            return Err(format!("{}: value too great for base", token));
         }
         value = value.wrapping_mul(base as i64).wrapping_add(d as i64);
     }

@@ -5970,6 +5970,39 @@ impl Shell {
         (vars, opts)
     }
 
+    /// `${!name}`: the variable *named by* `name`'s value.
+    ///
+    /// bash refuses this three ways, each of them fatal the way
+    /// `${x:?}` is -- `name` unset, its value empty, and its value not
+    /// a parameter name. Expanding to nothing instead meant a typo in
+    /// the indirection quietly became an empty string, which is the
+    /// one thing an indirection cannot afford.
+    ///
+    /// The value may name an array element (`x=a[1]`), a positional
+    /// (`x=1`) or a special (`x=@`); bash follows all of them, and the
+    /// element form was reaching `lookup_var("a[1]")` and finding
+    /// nothing.
+    fn indirect_var(&mut self, name: &str) -> String {
+        if !self.var_is_set(name) {
+            sh_eprintln!(self, "bish: {}: invalid indirect expansion", name);
+            self.expansion_failed = true;
+            return String::new();
+        }
+        let target = self.lookup_var(name);
+        match split_subscript(&target) {
+            Some((base, index)) if is_parameter_name(base) => {
+                let base = base.to_string();
+                self.array_element(&base, &index)
+            }
+            None if is_parameter_name(&target) => self.lookup_var(&target),
+            _ => {
+                sh_eprintln!(self, "bish: {}: invalid variable name", target);
+                self.expansion_failed = true;
+                String::new()
+            }
+        }
+    }
+
     fn name_is_set(&mut self, name: &str) -> bool {
         match name.split_once('[').and_then(|(base, rest)| rest.strip_suffix(']').map(|index| (base, index))) {
             Some((base, index)) => self.array_element_is_set(base, index),
@@ -6106,8 +6139,7 @@ impl Shell {
                     out.push_str(&if *quoted { crate::regex::escape(&v) } else { v });
                 }
                 Chunk::Indirect { name, quoted } => {
-                    let target = self.lookup_var(name);
-                    let v = self.lookup_var(&target);
+                    let v = self.indirect_var(name);
                     out.push_str(&if *quoted { crate::regex::escape(&v) } else { v });
                 }
                 Chunk::ArrayKeys { name, quoted } => {
@@ -6205,8 +6237,7 @@ impl Shell {
                     out.push_str(&if *quoted { crate::glob::escape(&v) } else { v });
                 }
                 Chunk::Indirect { name, quoted } => {
-                    let target = self.lookup_var(name);
-                    let v = self.lookup_var(&target);
+                    let v = self.indirect_var(name);
                     out.push_str(&if *quoted { crate::glob::escape(&v) } else { v });
                 }
                 Chunk::ArrayKeys { name, quoted } => {
@@ -8837,8 +8868,8 @@ impl Shell {
                     }
                 }
                 Chunk::Indirect { name, .. } => {
-                    let target = self.lookup_var(name);
-                    s.push_str(&self.lookup_var(&target));
+                    let v = self.indirect_var(name);
+                    s.push_str(&v);
                 }
                 Chunk::ArrayKeys { name, .. } => {
                     let name = name.clone();
@@ -9250,8 +9281,7 @@ impl Shell {
                     append_splittable_glob(&mut fields, &mut current, &mut patterns, &mut pattern_current, &v, *quoted, &ifs);
                 }
                 Chunk::Indirect { name, quoted } => {
-                    let target = self.lookup_var(name);
-                    let v = self.lookup_var(&target);
+                    let v = self.indirect_var(name);
                     append_splittable_glob(&mut fields, &mut current, &mut patterns, &mut pattern_current, &v, *quoted, &ifs);
                 }
                 Chunk::ArrayKeys { name, quoted } => {
@@ -15286,6 +15316,13 @@ mod tests {
     // beside anything else that reads or sets the cwd -- same shared-
     // mutex fix, and the same poisoned-lock recovery, as session.rs's
     // own ENV_LOCK.
+    // Held by every test that moves the process's directory -- and by
+    // every test that *depends* on it, which is the half that is easy
+    // to forget. A spawn carries the shell's cwd, so a test that runs
+    // an external command while a cwd-moving test is between its own
+    // `cd` and its cleanup spawns into a directory that is about to
+    // stop existing, and fails with a "No such file or directory" that
+    // names the program rather than the directory.
     static CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     // Where a cwd-moving test puts the process back. Not "wherever it
@@ -15497,6 +15534,9 @@ mod tests {
     // own hooks went straight through this path).
     #[test]
     fn command_builtin_honors_an_enclosing_command_substitution_capture() {
+        // Spawns a real program, so it needs the process's directory to
+        // stay put -- see CWD_LOCK.
+        let _guard = CWD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let mut shell = Shell::new();
         let buf = capture_output(&mut shell);
         shell.run_source_here(r#"x=$(command /bin/echo captured); echo "got:$x""#, "<test>");

@@ -712,6 +712,24 @@ y
         // two letter ranges and bash folds case instead, which is what
         // makes `16#FF` 255 while `64#zZ` is 35*64+61.
         case("arithmetic-bases-above-36", r#"echo $((64#zZ)) $((64#@)) $((64#_)) $((62#z))"#),
+        // A numeric literal runs to the end of the digit-set run and is
+        // checked against its base *afterwards*. Stopping at the first
+        // character that did not fit read `12a` as 12 and `1e2` as 1,
+        // each with something left over that quietly went nowhere.
+        case(
+            "a-literal-is-checked-after-it-is-read",
+            r#"( echo $((1e2)) ) 2>/dev/null; echo "rc=$?"; ( echo $((12a)) ) 2>/dev/null; echo "rc=$?"; ( echo $((0b101)) ) 2>/dev/null; echo "rc=$?"; ( echo $((08)) ) 2>/dev/null; echo "rc=$?""#,
+        ),
+        case("a-bare-hex-prefix-is-zero", r#"echo $((0x)) $((0X)) $((00)) $((010)) $((0x1f))"#),
+        // `${!name}` is refused three ways, each fatal the way `${x:?}`
+        // is: `name` unset, its value empty, and its value not a
+        // parameter name. Expanding to nothing meant a typo in the
+        // indirection quietly became an empty string.
+        case("indirect-expansion-of-an-unset-name", r#"echo "[${!nosuch}]"; echo after"#),
+        case("indirect-expansion-of-an-empty-name", r#"x=""; echo "[${!x}]"; echo after"#),
+        case("indirect-expansion-of-a-non-name", r#"x="1bad"; echo "[${!x}]"; echo after"#),
+        case("indirect-expansion-follows-a-subscript", r#"a=(u v); x="a[1]"; echo "[${!x}]"; declare -A m=([k]=w); y="m[k]"; echo "[${!y}]""#),
+        case("indirect-expansion-of-a-positional", r#"set -- p q; x=1; echo "[${!x}]"; x=@; echo "[${!x}]"; x=#; echo "[${!x}]""#),
         case("arithmetic-bases-fold-case-below-37", r#"echo $((16#FF)) $((16#ff)) $((36#ZZ)) $((36#zz))"#),
         // In a subshell so the message, which each shell words its own
         // way, is redirected away: it is emitted during *expansion*,
@@ -855,16 +873,6 @@ y
         // is what bash does, and is a change to how every relative path
         // in the shell resolves rather than to `cd` alone.
         ("cd-follows-symlinks-physically", "`cd link; pwd` gives the resolved path; bash keeps the symlinked one until `pwd -P`"),
-        // `${!name}` where `name` is unset: bash calls it an invalid
-        // indirect expansion and stops the script. bish expands it to
-        // nothing and carries on. Matching means a new fatal-expansion
-        // path, worth doing deliberately rather than in passing -- it
-        // turns scripts that work today into scripts that abort.
-        ("indirect-expansion-of-an-unset-name", "`${!nosuch}` expands to nothing; bash reports `invalid indirect expansion` and stops"),
-        // Two arithmetic literals at the edges: bash rejects `1e2`
-        // (there are no floats) and takes a bare `0x` as zero. bish has
-        // them the other way round.
-        ("arithmetic-literal-edges", "`$((1e2))` is 1 here and an error in bash; `$((0x))` is an error here and 0 in bash"),
         // The builtin *set* differs, legitimately: bish has builtins
         // bash does not (`abbr`, `win`, `::bish`) and lacks `bind` and
         // `logout`. Listed rather than fixed because the difference is
@@ -884,8 +892,6 @@ y
         case("set-o-lists-fewer-options", r#"set -o | wc -l"#),
         case("function-body-formatting", r#"f() { :; }; declare -f f"#),
         case("cd-follows-symlinks-physically", r#"mkdir -p real; ln -s real link; cd link; pwd | sed "s|.*/||""#),
-        case("indirect-expansion-of-an-unset-name", r#"echo "[${!nosuch}]"; echo "rc=$?""#),
-        case("arithmetic-literal-edges", r#"( echo $((1e2)) ) 2>/dev/null; echo "rc=$?"; ( echo $((0x)) ) 2>/dev/null; echo "rc=$?""#),
         case("compgen-b-lists-this-shells-builtins", r#"compgen -b | sort | head -3 | tr '\n' ' '; echo"#),
         case("wait-n-after-everything-finished", r#": & : & wait -n; echo "rc=$?""#),
         // -- roadmap 10: parser leniency, the part still standing -----
