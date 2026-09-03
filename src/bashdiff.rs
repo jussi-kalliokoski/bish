@@ -247,11 +247,24 @@ mod tests {
         case("proc-sub-out-that-answers-at-eof", r#"printf 'a\nb\n' > >(wc -l)"#),
         case("proc-sub-out-as-an-argument", r#"tee >(wc -l) < /etc/hostname > /dev/null"#),
         // `>( )` runs concurrently with the command writing to it, so
-        // the body's output lands after that command's -- and a body
-        // that answers only at end-of-input answers at all.
-        case("proc-sub-out-ordering", r#"echo hi > >(cat); echo done"#),
+        // a body that answers only at end-of-input still answers.
+        //
+        // Both of these are piped into `sort` on purpose. Where the
+        // body's output lands relative to the *next* command is a race
+        // neither shell settles: the substitution is not waited for, so
+        // it comes down to whether the body gets scheduled before the
+        // shell's next write. bash reliably wins that race because it
+        // does almost nothing between closing the pipe and the next
+        // command; bish unlinks, pumps and reaps in between, and loses
+        // it about one run in five under load. Asserted directly, the
+        // case passed four whole-suite runs and then failed one --
+        // which is worse than not asserting it, because a corpus that
+        // fails at random stops being read. `sort` makes the case about
+        // what is actually promised: the body runs, and everything it
+        // writes arrives.
+        case("proc-sub-out-body-output-all-arrives", r#"{ echo hi > >(cat); echo done; } | sort"#),
         case("proc-sub-out-with-a-shell-body", r#"printf 'a\nb\n' > >(while read l; do echo "<$l>"; done)"#),
-        case("proc-sub-out-two-at-once", r#"printf 'x\n' > >(cat) 2>/dev/null; printf 'y\n' > >(cat)"#),
+        case("proc-sub-out-two-at-once", r#"{ printf 'x\n' > >(cat) 2>/dev/null; printf 'y\n' > >(cat); } | sort"#),
         case("proc-sub-out-larger-than-a-pipe-buffer", r#"seq 1 20000 > >(wc -l)"#),
         // A redirect target is expanded once. It used to be expanded
         // twice for an external command -- once to build a sink that
@@ -580,25 +593,37 @@ y
         // from no SHLVL at all and must reach 1 -- the increment is
         // what is being checked, not the inherited value.
         case("shlvl-starts-at-one", r#"echo "$SHLVL""#),
+        // -- roadmap 10: the last of the grammar's leniency ------------
+        // A `;` where a command is expected is a syntax error, not an
+        // empty statement -- in front of the first command of a list as
+        // much as between two of them. Through `eval` so the case can
+        // check the status and keep running: a syntax error takes the
+        // whole script down otherwise, and bish's own wording for it is
+        // its own, not bash's.
+        case("empty-command-between-separators", r#"eval "echo a; ; echo b" 2>/dev/null; echo "rc=$?""#),
+        case("leading-semicolon", r#"eval "; echo a" 2>/dev/null; echo "rc=$?""#),
+        case("leading-semicolon-in-a-group", r#"eval "{ ; echo a; }" 2>/dev/null; echo "rc=$?""#),
+        case("leading-semicolon-in-a-then-branch", r#"eval "if true; then ; echo x; fi" 2>/dev/null; echo "rc=$?""#),
+        case("semicolon-after-a-background-ampersand", r#"eval "echo a &; echo b" 2>/dev/null; echo "rc=$?""#),
+        // The other side of the same rule: blank lines are skippable
+        // anywhere, and an empty case arm is still an empty case arm.
+        case("blank-lines-between-commands", "eval 'echo a\n\n\necho b' 2>/dev/null; echo \"rc=$?\""),
+        case("an-empty-case-arm-is-not-an-empty-command", r#"eval "case x in x) ;; esac" 2>/dev/null; echo "rc=$?""#),
     ];
 
     // Cases bish does not match today, each with why. Asserted to
     // *still* diverge -- fixing one fails this test until its line is
     // removed, which is the only way a list like this stays true.
-    const DIVERGENCES: &[(&str, &str)] = &[
-        // The last of the grammar's leniency: bash calls it a syntax
-        // error, bish skips the empty statement and runs the rest. The
-        // other six of this group are fixed; this one lives inside
-        // skip_terminators, which every construct's list parsing goes
-        // through, and is not worth the blast radius on its own.
-        ("empty-command-between-separators", "`;` twice in a row is skipped rather than reported"),
-    ];
+    // Empty, for now. The list is the point, not its length: anything
+    // found and not yet fixed belongs here with its reason, so that
+    // "bish agrees with bash" never quietly means "except where it
+    // doesn't".
+    const DIVERGENCES: &[(&str, &str)] = &[];
 
     // The cases the divergence list is about. Kept apart from `CASES`
     // so that list stays a description of what works.
     const PENDING: &[Case] = &[
         // -- roadmap 10: parser leniency, the part still standing -----
-        case("empty-command-between-separators", "echo a; ; echo b"),
         // Not recordable here, and worth saying why: `SHLVL` counts one
         // higher through two levels of `-c`, because bash decrements it
         // before `exec`ing the last command of a `-c` and bish spawns

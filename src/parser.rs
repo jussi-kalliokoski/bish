@@ -322,7 +322,12 @@ impl Parser {
 
     fn parse_list_until(&mut self, stops: &[Tok]) -> Result<Program, String> {
         let mut items = Vec::new();
-        self.skip_terminators();
+        // Newlines only, here and after each item: a `;` where a command
+        // is expected is a syntax error, not an empty statement. bash
+        // rejects `; echo a`, `echo a; ; echo b` and `{ ; echo a; }`
+        // alike, and each one reaches this loop with a `;` in front of
+        // it. Blank lines are the thing that really is skippable.
+        self.skip_newlines();
         while !self.at_any(stops) {
             if self.peek().is_none() {
                 if stops.is_empty() {
@@ -356,7 +361,7 @@ impl Parser {
                 }
             };
             items.push(ListItem { and_or, sep, line });
-            self.skip_terminators();
+            self.skip_newlines();
         }
         Ok(items)
     }
