@@ -24,7 +24,7 @@ const THEME_SUBCOMMANDS: &[&str] = &["begin", "end"];
 // answer would be arbitrary.
 const WINDOW_SUBCOMMANDS: &[&str] = &[
     "next", "previous", "new", "create", "close", "quit", "split", "vsplit", "left", "below", "above", "right", "zoom", "swap", "break", "join",
-    "vjoin", "layout", "move", "balance", "minimize", "sizeup", "sizedown", "size", "fg",
+    "vjoin", "layout", "move", "focus", "save", "restore", "balance", "minimize", "sizeup", "sizedown", "size", "fg",
 ];
 
 // "theme, window, hook, hl, lsp, map" -- the list as an error message
@@ -950,6 +950,21 @@ pub(crate) fn run_window_inner(sh: &mut Shell, args: &[String]) -> ExecResult {
         Some("k") | Some("above") => ExecResult::Window(WindowAction::FocusPane(PaneDirection::Up)),
         Some("l") | Some("right") => ExecResult::Window(WindowAction::FocusPane(PaneDirection::Right)),
         Some("zoom") | Some("z") => ExecResult::Window(WindowAction::Zoom),
+        Some("focus") => match args.get(1).and_then(|a| a.parse::<usize>().ok()) {
+            Some(position) if position >= 1 => ExecResult::Window(WindowAction::FocusPosition(position)),
+            _ => {
+                sh_eprintln!(sh, "bish: window: focus: usage: window focus <n> (panes count from 1)");
+                ExecResult::Status(2)
+            }
+        },
+        Some("save") => ExecResult::Window(WindowAction::Save(args.get(1).cloned())),
+        Some("restore") => match args.get(1) {
+            Some(path) => ExecResult::Window(WindowAction::Restore(path.clone())),
+            None => {
+                sh_eprintln!(sh, "bish: window: restore: usage: window restore <file>");
+                ExecResult::Status(2)
+            }
+        },
         Some("move") | Some("mv") => match args.get(1).map(String::as_str) {
             Some("left") | Some("l") => ExecResult::Window(WindowAction::MoveWindow(WindowMove::Left)),
             Some("right") | Some("r") => ExecResult::Window(WindowAction::MoveWindow(WindowMove::Right)),
@@ -1020,7 +1035,7 @@ pub(crate) fn run_window_inner(sh: &mut Shell, args: &[String]) -> ExecResult {
         None => {
             sh_eprintln!(
                 sh,
-                "bish: window: missing subcommand (next(n)/previous/new(c,create) [--name NAME] [-- CMD]/close(q,quit)/split(s) [CMD]/vsplit(v) [CMD]/h(left)/j(below)/k(above)/l(right)/zoom(z)/swap(x)/break/join <id>/vjoin <id>/layout [name|next]/move <left|right|N>/=(balance)/_(minimize)/+(sizeup)/-(sizedown)/size <N|N%,N/M>/fg <id>)"
+                "bish: window: missing subcommand (next(n)/previous/new(c,create) [--name NAME] [-- CMD]/close(q,quit)/split(s) [CMD]/vsplit(v) [CMD]/h(left)/j(below)/k(above)/l(right)/zoom(z)/swap(x)/break/join <id>/vjoin <id>/layout [name|next]/move <left|right|N>/focus <n>/save [file]/restore <file>/=(balance)/_(minimize)/+(sizeup)/-(sizedown)/size <N|N%,N/M>/fg <id>)"
             );
             ExecResult::Status(2)
         }

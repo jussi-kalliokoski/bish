@@ -398,6 +398,106 @@ impl WindowEntry {
         }
     }
 
+    /// Every pane, in layout order -- the order `::bish window focus
+    /// <n>` counts in, and the order a saved layout replays in.
+    pub(crate) fn panes_in_layout_order(&self) -> Vec<PaneId> {
+        let mut out = Vec::new();
+        leaves_of(&self.layout, &mut out);
+        out
+    }
+
+    /// Where the focused pane sits in that order, counting from 1 --
+    /// the number `window focus` would take to come back here.
+    pub(crate) fn focused_position(&self) -> usize {
+        self.panes_in_layout_order().iter().position(|id| *id == self.focused_pane).map_or(1, |at| at + 1)
+    }
+
+    /// `::bish window focus <n>`: focuses the nth pane in layout order,
+    /// counting from 1. `false` if there is no such pane.
+    pub(crate) fn focus_position(&mut self, position: usize) -> bool {
+        let panes = self.panes_in_layout_order();
+        match position.checked_sub(1).and_then(|at| panes.get(at)) {
+            Some(id) => {
+                self.unzoom();
+                self.focused_pane = *id;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The `::bish window` commands that rebuild this window's pane
+    /// tree, starting from the single pane a new window has.
+    ///
+    /// Replay works because of exactly how `insert_sibling` behaves: a
+    /// split puts the new pane immediately after the one it split, and
+    /// the new pane takes focus -- so N consecutive splits of the same
+    /// orientation, each following the last, lay N+1 panes out in
+    /// order with no focus juggling at all. Nesting is the other half:
+    /// a split whose orientation matches its parent's flattens into it,
+    /// which is why no tree here ever has two same-orientation splits
+    /// nested, and why splitting inside a subtree always nests the way
+    /// the target says it should.
+    ///
+    /// Sizes are not part of this. A pane's share is a weight, and the
+    /// commands that set one are in real rows and columns against the
+    /// terminal that was there at the time -- replaying those on a
+    /// different terminal would be worse than replaying none.
+    pub(crate) fn rebuild_commands(&self) -> Vec<String> {
+        // The replay is planned against a mirror of the real thing --
+        // the same `insert_sibling`, the same focus rule -- so the
+        // positions it emits are the positions the commands will
+        // actually find, rather than something worked out on paper.
+        struct Replay {
+            layout: PaneLayout,
+            focused: PaneId,
+            next_id: PaneId,
+            commands: Vec<String>,
+        }
+        impl Replay {
+            fn split(&mut self, horizontal: bool) -> PaneId {
+                let id = self.next_id;
+                self.next_id += 1;
+                let old = std::mem::replace(&mut self.layout, PaneLayout::Leaf(0));
+                self.layout = insert_sibling(old, self.focused, id, horizontal, None, false);
+                self.focused = id;
+                self.commands.push(match horizontal {
+                    true => "::bish window vsplit".to_string(),
+                    false => "::bish window split".to_string(),
+                });
+                id
+            }
+            fn focus(&mut self, pane: PaneId) {
+                if self.focused == pane {
+                    return;
+                }
+                let mut order = Vec::new();
+                leaves_of(&self.layout, &mut order);
+                if let Some(at) = order.iter().position(|id| *id == pane) {
+                    self.commands.push(format!("::bish window focus {}", at + 1));
+                    self.focused = pane;
+                }
+            }
+            // Builds `node` into the slot `holder` currently occupies.
+            fn build(&mut self, node: &PaneLayout, holder: PaneId) {
+                let PaneLayout::Split { horizontal, children } = node else { return };
+                self.focus(holder);
+                let mut slots = vec![holder];
+                for _ in 1..children.len() {
+                    slots.push(self.split(*horizontal));
+                }
+                for (child, slot) in children.iter().zip(slots) {
+                    self.build(&child.layout, slot);
+                }
+            }
+        }
+
+        let root = self.panes_in_layout_order().first().copied().unwrap_or(0);
+        let mut replay = Replay { layout: PaneLayout::Leaf(root), focused: root, next_id: root + 1, commands: Vec::new() };
+        replay.build(&self.layout, root);
+        replay.commands
+    }
+
     /// The pane after `from` in layout order, wrapping -- what `<C-w>x`
     /// exchanges with when nothing says which pane to pick.
     ///
@@ -2167,5 +2267,146 @@ mod named_layout_tests {
         w.toggle_zoom();
         w.apply_layout(NamedLayout::Tiled);
         assert_eq!(w.zoomed, None, "rearranging under a zoom would be invisible");
+    }
+}
+
+#[cfg(test)]
+mod layout_replay_tests {
+    use super::*;
+
+    // Applies `rebuild_commands` to a fresh single-pane window, exactly
+    // the way the saved script does when it is sourced -- so what this
+    // checks is that the commands work, not that some parallel
+    // reimplementation of them agrees.
+    fn replay(commands: &[String]) -> WindowEntry {
+        let mut w = WindowEntry::single(0, Frame::Session(0));
+        for command in commands {
+            match command.strip_prefix("::bish window ").expect("every emitted command is a window command") {
+                "split" => {
+                    let id = w.add_pane(vec![Frame::Session(0)], false, false);
+                    w.focused_pane = id;
+                }
+                "vsplit" => {
+                    let id = w.add_pane(vec![Frame::Session(0)], true, false);
+                    w.focused_pane = id;
+                }
+                rest => {
+                    let n: usize = rest.strip_prefix("focus ").expect("focus is the only other one").parse().expect("a number");
+                    assert!(w.focus_position(n), "focus {n} should name a live pane");
+                }
+            }
+        }
+        w
+    }
+
+    // The shape of a tree, with pane ids replaced by their position in
+    // layout order -- two windows built by different routes are the
+    // same arrangement if these match.
+    fn shape(w: &WindowEntry) -> String {
+        fn go(layout: &PaneLayout, order: &[PaneId], out: &mut String) {
+            match layout {
+                PaneLayout::Leaf(id) => {
+                    out.push_str(&order.iter().position(|other| other == id).expect("a leaf is in the order").to_string());
+                }
+                PaneLayout::Split { horizontal, children } => {
+                    out.push(if *horizontal { 'V' } else { 'H' });
+                    out.push('(');
+                    for (i, child) in children.iter().enumerate() {
+                        if i > 0 {
+                            out.push(' ');
+                        }
+                        go(&child.layout, order, out);
+                    }
+                    out.push(')');
+                }
+            }
+        }
+        let mut out = String::new();
+        go(&w.layout, &w.panes_in_layout_order(), &mut out);
+        out
+    }
+
+    fn assert_round_trips(w: &WindowEntry, expected: &str) {
+        assert_eq!(shape(w), expected, "the window under test is not the shape the test says it is");
+        assert_eq!(shape(&replay(&w.rebuild_commands())), expected, "replaying {:?} did not rebuild it", w.rebuild_commands());
+    }
+
+    #[test]
+    fn one_pane_needs_no_commands_at_all() {
+        let w = WindowEntry::single(0, Frame::Session(0));
+        assert!(w.rebuild_commands().is_empty());
+        assert_round_trips(&w, "0");
+    }
+
+    #[test]
+    fn a_flat_row_replays_in_order() {
+        let mut w = WindowEntry::single(0, Frame::Session(0));
+        for _ in 0..3 {
+            let id = w.add_pane(vec![Frame::Session(0)], false, false);
+            w.focused_pane = id;
+        }
+        assert_round_trips(&w, "H(0 1 2 3)");
+    }
+
+    #[test]
+    fn a_nested_split_replays_nested() {
+        // Split side by side, then stack the right-hand half.
+        let mut w = WindowEntry::single(0, Frame::Session(0));
+        let right = w.add_pane(vec![Frame::Session(0)], false, false);
+        w.focused_pane = right;
+        let lower = w.add_pane(vec![Frame::Session(0)], true, false);
+        w.focused_pane = lower;
+        assert_round_trips(&w, "H(0 V(1 2))");
+    }
+
+    #[test]
+    fn every_named_layout_replays_exactly() {
+        // The arrangements anyone is most likely to have saved, and the
+        // ones with the deepest nesting.
+        for named in NamedLayout::ALL {
+            for n in 2..7 {
+                let mut w = WindowEntry::single(0, Frame::Session(0));
+                for _ in 1..n {
+                    let id = w.add_pane(vec![Frame::Session(0)], false, false);
+                    w.focused_pane = id;
+                }
+                w.focused_pane = w.panes_in_layout_order()[0];
+                w.apply_layout(named);
+                let want = shape(&w);
+                assert_eq!(shape(&replay(&w.rebuild_commands())), want, "{} with {n} panes", named.name());
+            }
+        }
+    }
+
+    #[test]
+    fn a_deep_alternating_tree_replays() {
+        // Split, focus the new half, split the other way, and again --
+        // the shape a few minutes of real work produces.
+        let mut w = WindowEntry::single(0, Frame::Session(0));
+        for depth in 0..5 {
+            let id = w.add_pane(vec![Frame::Session(0)], depth % 2 == 0, false);
+            w.focused_pane = id;
+        }
+        let want = shape(&w);
+        assert_eq!(shape(&replay(&w.rebuild_commands())), want);
+    }
+
+    #[test]
+    fn focus_counts_panes_from_one_in_layout_order() {
+        let mut w = WindowEntry::single(0, Frame::Session(0));
+        for _ in 0..2 {
+            let id = w.add_pane(vec![Frame::Session(0)], false, false);
+            w.focused_pane = id;
+        }
+        let order = w.panes_in_layout_order();
+        assert!(w.focus_position(1));
+        assert_eq!(w.focused_pane, order[0]);
+        assert_eq!(w.focused_position(), 1);
+        assert!(w.focus_position(3));
+        assert_eq!(w.focused_pane, order[2]);
+        assert_eq!(w.focused_position(), 3);
+        assert!(!w.focus_position(4), "past the end is a miss, not a panic");
+        assert!(!w.focus_position(0), "and so is counting from zero");
+        assert_eq!(w.focused_pane, order[2], "a miss leaves focus where it was");
     }
 }

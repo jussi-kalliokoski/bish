@@ -139,21 +139,6 @@ struct SessionState {
     // mode line and, once one's just run, from normal mode's own
     // pending-overlay state (run_normal_mode_navigation).
     command_transcript: Vec<TranscriptEntry>,
-    // Commands to run in this session as if they had been typed at its
-    // prompt and submitted -- `::bish window split <cmd>` and `window
-    // new <cmd>`, tmux's `split-window`/`new-window` taking a command.
-    //
-    // Fed back in at the read that would otherwise have waited for a
-    // keystroke (see `run`'s own `pending_input` arm) rather than run
-    // directly, which is what makes them ordinary commands: history
-    // expansion, multi-line accumulation, job control and the window
-    // actions all come along for free, and an interactive program gets
-    // the same drive loop it would have had if someone had sat down and
-    // typed it.
-    //
-    // A queue rather than one slot so a caller can hand over more than
-    // one line at a time, in order.
-    pending_input: std::collections::VecDeque<String>,
 }
 
 // A window: a set of panes (only ever more than one after `window
@@ -191,6 +176,25 @@ struct SessionState {
 /// field borrow is exactly what makes that spelling work.
 struct App {
     sessions: HashMap<SessionId, SessionState>,
+    // Commands to run as if they had been typed at a prompt and
+    // submitted -- `::bish window split <cmd>`, `window new <cmd>`, and
+    // every line of a `window restore` script.
+    //
+    // Fed back in at the read that would otherwise have waited for a
+    // keystroke (see `run`'s own arm for this) rather than run
+    // directly, which is what makes them ordinary commands: history
+    // expansion, multi-line accumulation, job control and the window
+    // actions themselves all come along for free, and an interactive
+    // program gets the same drive loop it would have had if someone had
+    // sat down and typed it.
+    //
+    // On the app rather than on a session, which matters as soon as
+    // there is more than one line: a queued `window split` moves focus
+    // to the pane it just made, and the *next* line belongs there --
+    // that is exactly what "split, then cd into it" means in a layout
+    // script. A per-session queue would leave the rest of the script
+    // stranded on the session that started it.
+    pending_input: std::collections::VecDeque<String>,
     windows: Vec<WindowEntry>,
     current_window: usize,
     next_session_id: SessionId,
@@ -418,7 +422,6 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
             dir_history: vec![root_cwd],
             dir_history_index: 0,
             command_transcript: Vec::new(),
-            pending_input: std::collections::VecDeque::new(),
         },
     );
     // Everything the window manager keeps for as long as this loop runs
@@ -426,6 +429,7 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
     // below spells it the same way the callees do.
     let app = &mut App {
         sessions,
+        pending_input: std::collections::VecDeque::new(),
         windows: vec![WindowEntry::single(0, Frame::Session(0))],
         current_window: 0,
         next_session_id: 1,
@@ -698,9 +702,9 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
         // A command handed to this session by `window split <cmd>` /
         // `window new <cmd>` stands in for the read that would
         // otherwise have waited for a keystroke -- see
-        // SessionState::pending_input for why it arrives as an ordinary
-        // Line rather than being run directly.
-        let injected = app.sessions.get_mut(&session_id).unwrap().pending_input.pop_front();
+        // App::pending_input for why it arrives as an ordinary Line
+        // rather than being run directly.
+        let injected = app.pending_input.pop_front();
         let outcome = match injected {
             // No echo of the prompt and the command here: the ordinary
             // Line path already writes both into this session's grid on
@@ -1561,7 +1565,6 @@ fn run_edit_impl(targets: &[fileeditor::EditTarget], attach_debug: bool) -> i32 
             dir_history: vec![root_cwd],
             dir_history_index: 0,
             command_transcript: Vec::new(),
-            pending_input: std::collections::VecDeque::new(),
         },
     );
     // The same state the interactive shell keeps -- see `App`. `bish
@@ -1569,6 +1572,7 @@ fn run_edit_impl(targets: &[fileeditor::EditTarget], attach_debug: bool) -> i32 
     // start inside the editor, not a separate kind of program.
     let app = &mut App {
         sessions,
+        pending_input: std::collections::VecDeque::new(),
         windows: vec![WindowEntry::single(0, Frame::Session(0))],
         current_window: 0,
         next_session_id: 1,
@@ -3089,10 +3093,51 @@ fn freeze_focused_idle_prompt(app: &mut App) {
 // Hands a `window new <cmd>` / `window split <cmd>` command to the
 // session that was just created for it. Nothing happens here beyond
 // queueing: the command runs at that session's next prompt, through the
-// ordinary typed-a-line path -- see SessionState::pending_input.
-fn queue_pending_input(app: &mut App, session: SessionId, command: Option<String>) {
+// ordinary typed-a-line path -- see App::pending_input.
+// The `::bish window` script that rebuilds every window as it stands
+// now: its name, its pane tree, and each pane's directory.
+//
+// Every window is re-created rather than the first one being reused, so
+// restoring adds to what is there rather than rearranging it -- one
+// spare window is a much smaller surprise than a layout silently
+// overwritten. Sizes are deliberately absent: see
+// WindowEntry::rebuild_commands.
+fn layout_script(app: &App) -> String {
+    use crate::serialize::quote_literal;
+    let mut out = String::from("# A bish layout. `::bish window restore <this file>` rebuilds it.\n");
+    for window in &app.windows {
+        out.push('\n');
+        match &window.name {
+            Some(name) => out.push_str(&format!("::bish window new --name {}\n", quote_literal(name))),
+            None => out.push_str("::bish window new\n"),
+        }
+        for command in window.rebuild_commands() {
+            out.push_str(&command);
+            out.push('\n');
+        }
+        // Directories last, once every pane exists: a pane inherits the
+        // cwd of the one it was split from, which is rarely the one it
+        // had.
+        for (position, pane) in window.panes_in_layout_order().iter().enumerate() {
+            let sid = window.pane(*pane).owning_session();
+            let cwd = app.sessions[&sid].shell.cwd.to_string_lossy().to_string();
+            out.push_str(&format!("::bish window focus {}\n", position + 1));
+            out.push_str(&format!("cd {}\n", quote_literal(&cwd)));
+        }
+        // And leave this window on the pane that had focus.
+        out.push_str(&format!("::bish window focus {}\n", window.focused_position()));
+    }
+    // Finally, the window that was in front -- by name, the only handle
+    // that still means the same thing in a different process.
+    if let Some(name) = app.windows.get(app.current_window).and_then(|w| w.name.as_ref()) {
+        out.push_str(&format!("\n::bish window select {}\n", quote_literal(name)));
+    }
+    out
+}
+
+fn queue_pending_input(app: &mut App, command: Option<String>) {
     if let Some(command) = command {
-        app.sessions.get_mut(&session).expect("the session was just inserted").pending_input.push_back(command);
+        app.pending_input.push_back(command);
     }
 }
 
@@ -3146,7 +3191,6 @@ fn apply_window_action(app: &mut App, action: WindowAction) {
                     dir_history: vec![child_cwd],
                     dir_history_index: 0,
                     command_transcript: Vec::new(),
-                    pending_input: std::collections::VecDeque::new(),
                 },
             );
             let wid = app.next_window_id;
@@ -3155,7 +3199,7 @@ fn apply_window_action(app: &mut App, action: WindowAction) {
             window.name = name;
             app.windows.push(window);
             app.current_window = app.windows.len() - 1;
-            queue_pending_input(app, sid, command);
+            queue_pending_input(app, command);
         }
         // The three that make a workflow scriptable: something to call a
         // window, a way to see what is there, and a way to ask for one
@@ -3234,6 +3278,43 @@ fn apply_window_action(app: &mut App, action: WindowAction) {
         }
         WindowAction::Zoom => {
             app.windows[app.current_window].toggle_zoom();
+        }
+        WindowAction::FocusPosition(position) => {
+            if !app.windows[app.current_window].focus_position(position) {
+                let sid = app.windows[app.current_window].owning_session();
+                let panes = app.windows[app.current_window].panes.len();
+                app.sessions[&sid].shell.sink_err(&format!("bish: window: focus: no pane {position} (this window has {panes})\n"));
+            }
+        }
+        WindowAction::Save(path) => {
+            let script = layout_script(app);
+            let sid = app.windows[app.current_window].owning_session();
+            match path {
+                Some(path) => {
+                    if let Err(e) = std::fs::write(&path, &script) {
+                        app.sessions[&sid].shell.sink_err(&format!("bish: window: save: {path}: {e}\n"));
+                    }
+                }
+                None => app.sessions[&sid].shell.sink_out(&script),
+            }
+        }
+        WindowAction::Restore(path) => {
+            let sid = app.windows[app.current_window].owning_session();
+            match std::fs::read_to_string(&path) {
+                Ok(text) => {
+                    // Queued rather than run here: every line is an
+                    // ordinary command, and several of them move focus
+                    // to the pane the previous line made. See
+                    // App::pending_input.
+                    for line in text.lines() {
+                        let line = line.trim();
+                        if !line.is_empty() && !line.starts_with('#') {
+                            app.pending_input.push_back(line.to_string());
+                        }
+                    }
+                }
+                Err(e) => app.sessions[&sid].shell.sink_err(&format!("bish: window: restore: {path}: {e}\n")),
+            }
         }
         WindowAction::MoveWindow(where_to) => {
             let last = app.windows.len() - 1;
@@ -3328,8 +3409,8 @@ fn apply_window_action(app: &mut App, action: WindowAction) {
         // puts the split back first, which is what tmux does too.
         WindowAction::Split { horizontal, command } => {
             app.windows[app.current_window].unzoom();
-            let sid = split_focused_pane(app, horizontal);
-            queue_pending_input(app, sid, command);
+            split_focused_pane(app, horizontal);
+            queue_pending_input(app, command);
         }
         WindowAction::FocusPane(direction) => {
             app.windows[app.current_window].unzoom();
@@ -3403,7 +3484,6 @@ fn split_focused_pane(app: &mut App, horizontal: bool) -> SessionId {
             dir_history: vec![child_cwd],
             dir_history_index: 0,
             command_transcript: Vec::new(),
-            pending_input: std::collections::VecDeque::new(),
         },
     );
 
@@ -3473,7 +3553,6 @@ fn split_diagnostics_pane(app: &mut App, edit_frame_id: EditFrameId) -> PaneId {
             dir_history: vec![child_cwd],
             dir_history_index: 0,
             command_transcript: Vec::new(),
-            pending_input: std::collections::VecDeque::new(),
         },
     );
 
@@ -3520,7 +3599,6 @@ fn split_locations_pane(app: &mut App, edit_frame_id: EditFrameId) -> PaneId {
             dir_history: vec![child_cwd],
             dir_history_index: 0,
             command_transcript: Vec::new(),
-            pending_input: std::collections::VecDeque::new(),
         },
     );
     let window = &mut app.windows[app.current_window];
@@ -3616,7 +3694,6 @@ fn split_debug_run_pane(app: &mut App, edit_frame_id: EditFrameId) -> (PaneId, R
             dir_history: vec![child_cwd],
             dir_history_index: 0,
             command_transcript: Vec::new(),
-            pending_input: std::collections::VecDeque::new(),
         },
     );
 
@@ -13443,7 +13520,6 @@ mod compositor_frame_output_tests {
             dir_history: Vec::new(),
             dir_history_index: 0,
             command_transcript: Vec::new(),
-            pending_input: std::collections::VecDeque::new(),
         };
         freeze_interrupted_line(&mut session, "echo hi");
         let row0: String = (0..40).map(|c| screen.borrow().cell(0, c).ch).collect::<String>().trim_end().to_string();

@@ -1104,6 +1104,17 @@ pub enum WindowAction {
     // one, vim Ctrl-w-hjkl style. A no-op if the current window isn't
     // split, or nothing lies in that direction.
     FocusPane(PaneDirection),
+    /// `::bish window focus <n>`: focuses the nth pane of this window,
+    /// counting from 1 in layout order -- tmux's `select-pane -t`, and
+    /// what a saved layout uses to get back to a pane it made earlier.
+    FocusPosition(usize),
+    /// `::bish window save [file]`: writes the `::bish window` script
+    /// that rebuilds every window, pane and directory as they stand.
+    /// No file means print it, so it can be read or redirected.
+    Save(Option<String>),
+    /// `::bish window restore <file>`: runs such a script, line by
+    /// line, as if each had been typed.
+    Restore(String),
     /// `::bish window move <left|right|N>`: moves the *current window*
     /// within the tab bar. Windows have always been in the order they
     /// were created, with no way to change it.
