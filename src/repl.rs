@@ -3235,6 +3235,11 @@ fn apply_window_action(app: &mut App, action: WindowAction) {
         WindowAction::Zoom => {
             app.windows[app.current_window].toggle_zoom();
         }
+        WindowAction::SetLayout(named) => {
+            let window = &mut app.windows[app.current_window];
+            let named = named.unwrap_or_else(|| window.next_layout());
+            window.apply_layout(named);
+        }
         WindowAction::SwapPane => {
             let window = &mut app.windows[app.current_window];
             window.unzoom();
@@ -5774,6 +5779,7 @@ fn window_cmd_to_action(cmd: WindowCmd) -> WindowAction {
         WindowCmd::FocusUp => WindowAction::FocusPane(PaneDirection::Up),
         WindowCmd::FocusRight => WindowAction::FocusPane(PaneDirection::Right),
         WindowCmd::Zoom => WindowAction::Zoom,
+        WindowCmd::NextLayout => WindowAction::SetLayout(None),
         WindowCmd::SwapPane => WindowAction::SwapPane,
         WindowCmd::BreakPane => WindowAction::BreakPane,
         WindowCmd::Balance => WindowAction::Balance,

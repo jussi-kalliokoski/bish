@@ -526,6 +526,9 @@ pub enum WindowCmd {
     /// `<C-w>z` (tmux's letter) and `<C-w>o` (vim's) -- the focused
     /// pane fills the window until the next press puts the split back.
     Zoom,
+    /// `<C-w><Space>` -- the next named layout. tmux's own key for it
+    /// (`prefix Space`); vim has no equivalent to borrow from.
+    NextLayout,
     /// `<C-w>x` -- exchange this pane with the next one, vim's own key
     /// and vim's own meaning.
     SwapPane,
@@ -2156,6 +2159,7 @@ impl VimKeys {
             // zoom looks like, except nothing is closed and the next
             // press puts it all back.
             Key::Char('z') | Key::Char('o') => self.emit_window(WindowCmd::Zoom),
+            Key::Char(' ') => self.emit_window(WindowCmd::NextLayout),
             Key::Char('x') => self.emit_window(WindowCmd::SwapPane),
             Key::Char('T') => self.emit_window(WindowCmd::BreakPane),
             Key::Char('=') => self.emit_window(WindowCmd::Balance),
@@ -2403,6 +2407,7 @@ fn describe_window_cmd(cmd: &WindowCmd) -> &'static str {
         WindowCmd::FocusUp => "focus-up",
         WindowCmd::FocusRight => "focus-right",
         WindowCmd::Zoom => "zoom",
+        WindowCmd::NextLayout => "next-layout",
         WindowCmd::SwapPane => "swap-pane",
         WindowCmd::BreakPane => "break-pane",
         WindowCmd::Balance => "balance",
@@ -3140,6 +3145,7 @@ mod tests {
             ('o', WindowCmd::Zoom),
             ('x', WindowCmd::SwapPane),
             ('T', WindowCmd::BreakPane),
+            (' ', WindowCmd::NextLayout),
         ];
         for (ch, cmd) in cases {
             let mut vk = VimKeys::new();

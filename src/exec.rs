@@ -1091,6 +1091,11 @@ pub enum WindowAction {
     // one, vim Ctrl-w-hjkl style. A no-op if the current window isn't
     // split, or nothing lies in that direction.
     FocusPane(PaneDirection),
+    /// `::bish window layout <name>` / `layout next`, and
+    /// `<C-w><Space>`: rearranges every pane in the window into one of
+    /// the named arrangements. `None` means the next one in the cycle.
+    /// See window::NamedLayout.
+    SetLayout(Option<crate::window::NamedLayout>),
     /// `::bish window swap`/`x`, and `<C-w>x`: exchanges the focused
     /// pane with the next one in the window, wrapping. Focus follows
     /// the pane rather than the position, the way vim's own `<C-w>x`

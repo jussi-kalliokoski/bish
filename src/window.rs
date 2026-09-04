@@ -270,6 +270,14 @@ pub(crate) struct WindowEntry {
     // clears it first, matching tmux), which is what lets `pane_rect`
     // treat "not the zoomed pane" and "not visible" as the same case.
     pub(crate) zoomed: Option<PaneId>,
+    // The last named arrangement `::bish window layout` put this window
+    // into, which is only what `layout next` cycles from -- not a claim
+    // that the window still *is* that layout. A split or a resize
+    // afterwards leaves this alone: "the one after the last one I
+    // asked for" is still the useful answer for the next press, and
+    // recomputing which named layout an arbitrary tree happens to
+    // match would be both expensive and usually "none of them".
+    pub(crate) last_layout: Option<NamedLayout>,
 }
 
 // What `divider_budget` is when nothing has said otherwise -- the same
@@ -288,6 +296,7 @@ impl WindowEntry {
             next_pane_id: 1,
             divider_budget: DEFAULT_DIVIDER_BUDGET,
             zoomed: None,
+            last_layout: None,
         }
     }
 
@@ -326,6 +335,46 @@ impl WindowEntry {
         let old_layout = std::mem::replace(&mut self.layout, PaneLayout::Leaf(0));
         self.layout = insert_sibling(old_layout, focused, new_id, horizontal, None, minimized);
         new_id
+    }
+
+    /// Rebuilds the whole layout as one of the named arrangements --
+    /// `::bish window layout tiled`, tmux's `select-layout`.
+    ///
+    /// Every pane keeps its identity and its contents; only where they
+    /// sit changes, and every weight goes back to even (an arrangement
+    /// you asked for by name is not one you also want the last drag's
+    /// proportions applied to). A minimized or fixed-size pane loses
+    /// that too, for the same reason.
+    ///
+    /// Which pane is "main" for the two `Main*` layouts is the focused
+    /// one, not the first. tmux picks the first and gives you
+    /// `swap-pane` to change it; picking the focused one means the key
+    /// that arranges the window is also the key that says what it is
+    /// arranged around, which is the whole of what anyone does with
+    /// those two layouts.
+    pub(crate) fn apply_layout(&mut self, layout: NamedLayout) {
+        self.unzoom();
+        let mut panes = Vec::new();
+        leaves_of(&self.layout, &mut panes);
+        if panes.len() < 2 {
+            return;
+        }
+        // The focused pane leads, which is what the Main* layouts mean
+        // by "main" and what keeps the others' order stable around it.
+        if let Some(at) = panes.iter().position(|id| *id == self.focused_pane) {
+            panes.rotate_left(at);
+        }
+        self.layout = build_named_layout(layout, &panes);
+        self.last_layout = Some(layout);
+    }
+
+    /// What `::bish window layout next` moves to: the one after the
+    /// last named layout applied here, or the first if there is none.
+    pub(crate) fn next_layout(&self) -> NamedLayout {
+        match self.last_layout {
+            Some(current) => current.next(),
+            None => NamedLayout::ALL[0],
+        }
     }
 
     /// Exchanges two panes' places in the layout -- `<C-w>x`.
@@ -460,6 +509,95 @@ impl WindowEntry {
     // assuming that.
     pub(crate) fn owning_session(&self) -> SessionId {
         self.focused().owning_session()
+    }
+}
+
+/// The arrangements `::bish window layout` knows, by tmux's names.
+///
+/// `horizontal`/`vertical` in these names is tmux's reading -- the axis
+/// the panes are spread *along* -- which is the opposite of what
+/// `PaneLayout::Split`'s own `horizontal` field names (the divider
+/// line). `split`/`vsplit` already carry that same inversion, for the
+/// same reason: the user's word and the field's word disagree, and the
+/// user's word is the one on the outside.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(crate) enum NamedLayout {
+    /// Panes in one row, left to right.
+    EvenHorizontal,
+    /// Panes in one column, top to bottom.
+    EvenVertical,
+    /// The main pane down the left, the rest stacked to its right.
+    MainVertical,
+    /// The main pane across the top, the rest in a row beneath it.
+    MainHorizontal,
+    /// A grid, as square as the count allows.
+    Tiled,
+}
+
+impl NamedLayout {
+    /// The name `::bish window layout` takes, and prints back.
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            NamedLayout::EvenHorizontal => "even-horizontal",
+            NamedLayout::EvenVertical => "even-vertical",
+            NamedLayout::MainVertical => "main-vertical",
+            NamedLayout::MainHorizontal => "main-horizontal",
+            NamedLayout::Tiled => "tiled",
+        }
+    }
+
+    pub(crate) fn parse(name: &str) -> Option<NamedLayout> {
+        NamedLayout::ALL.iter().copied().find(|l| l.name() == name)
+    }
+
+    /// In the order `window layout next` cycles them -- tmux's own
+    /// order, so the muscle memory of holding the key down transfers.
+    pub(crate) const ALL: [NamedLayout; 5] =
+        [NamedLayout::EvenHorizontal, NamedLayout::EvenVertical, NamedLayout::MainHorizontal, NamedLayout::MainVertical, NamedLayout::Tiled];
+
+    /// The one after this in `ALL`, wrapping.
+    pub(crate) fn next(self) -> NamedLayout {
+        let at = NamedLayout::ALL.iter().position(|l| *l == self).unwrap_or(0);
+        NamedLayout::ALL[(at + 1) % NamedLayout::ALL.len()]
+    }
+}
+
+// One `Split` holding each of `parts` at even weight. A single part is
+// handed back bare rather than wrapped, since a split of one is not a
+// split -- which is what keeps `main-vertical` with two panes from
+// growing a pointless nested level around the second.
+fn even_split(horizontal: bool, parts: Vec<PaneLayout>) -> PaneLayout {
+    match parts.len() {
+        1 => parts.into_iter().next().expect("length checked"),
+        _ => PaneLayout::Split {
+            horizontal,
+            children: parts.into_iter().map(|layout| SplitChild { layout, weight: 1.0, fixed: None, minimized: false }).collect(),
+        },
+    }
+}
+
+fn leaf_row(ids: &[PaneId]) -> Vec<PaneLayout> {
+    ids.iter().map(|id| PaneLayout::Leaf(*id)).collect()
+}
+
+// `apply_layout`'s pure half: the tree a named arrangement makes out of
+// `panes`, which is always at least two long and leads with the one the
+// Main* layouts treat as main.
+fn build_named_layout(layout: NamedLayout, panes: &[PaneId]) -> PaneLayout {
+    match layout {
+        NamedLayout::EvenHorizontal => even_split(false, leaf_row(panes)),
+        NamedLayout::EvenVertical => even_split(true, leaf_row(panes)),
+        // The main pane gets half, the rest share the other half --
+        // even_split's own even weighting across the two children.
+        NamedLayout::MainVertical => even_split(false, vec![PaneLayout::Leaf(panes[0]), even_split(true, leaf_row(&panes[1..]))]),
+        NamedLayout::MainHorizontal => even_split(true, vec![PaneLayout::Leaf(panes[0]), even_split(false, leaf_row(&panes[1..]))]),
+        NamedLayout::Tiled => {
+            // As square as the count allows, filling rows left to right:
+            // 4 panes make 2x2, 5 make a row of 3 over a row of 2.
+            let columns = (1..).find(|c| c * c >= panes.len()).unwrap_or(1);
+            let rows: Vec<PaneLayout> = panes.chunks(columns).map(|row| even_split(false, leaf_row(row))).collect();
+            even_split(true, rows)
+        }
     }
 }
 
@@ -1188,6 +1326,7 @@ mod divider_drag_tests {
             divider_budget: DEFAULT_DIVIDER_BUDGET,
             next_pane_id: panes.len() as PaneId,
             zoomed: None,
+            last_layout: None,
         }
     }
 
@@ -1852,5 +1991,181 @@ mod pane_move_tests {
         assert_eq!(landed, target.next_pane_id - 1);
         assert_eq!(target.panes.len(), 2);
         assert_eq!(target.pane(landed).stack, vec![Frame::Session(2)]);
+    }
+}
+
+#[cfg(test)]
+mod named_layout_tests {
+    use super::*;
+
+    const AREA: Rect = Rect { row: 0, col: 0, rows: 24, cols: 80 };
+
+    fn window_of(n: usize) -> WindowEntry {
+        let mut w = WindowEntry::single(0, Frame::Session(0));
+        for _ in 1..n {
+            w.add_pane(vec![Frame::Session(0)], false, false);
+        }
+        w.focused_pane = 0;
+        w
+    }
+
+    fn rects(w: &WindowEntry) -> Vec<(PaneId, Rect)> {
+        let (mut out, mut dividers) = (Vec::new(), Vec::new());
+        w.regions(AREA, &mut out, &mut dividers);
+        out
+    }
+
+    // How many distinct rows and columns the panes start at -- enough
+    // to tell one row of four from a 2x2 grid without pinning exact
+    // arithmetic that divider budgets can legitimately change.
+    fn shape(w: &WindowEntry) -> (usize, usize) {
+        let r = rects(w);
+        let mut rows: Vec<usize> = r.iter().map(|(_, rect)| rect.row).collect();
+        let mut cols: Vec<usize> = r.iter().map(|(_, rect)| rect.col).collect();
+        rows.sort_unstable();
+        rows.dedup();
+        cols.sort_unstable();
+        cols.dedup();
+        (rows.len(), cols.len())
+    }
+
+    #[test]
+    fn even_horizontal_is_one_row_and_even_vertical_is_one_column() {
+        let mut w = window_of(4);
+        w.apply_layout(NamedLayout::EvenHorizontal);
+        assert_eq!(shape(&w), (1, 4), "four panes, one row");
+
+        w.apply_layout(NamedLayout::EvenVertical);
+        assert_eq!(shape(&w), (4, 1), "four panes, one column");
+    }
+
+    // How many panes sit in each row, top to bottom -- the shape of a
+    // grid, without pinning column arithmetic that a short last row
+    // legitimately changes.
+    fn rows_of(w: &WindowEntry) -> Vec<usize> {
+        let mut by_row: Vec<(usize, usize)> = Vec::new();
+        for (_, rect) in rects(w) {
+            match by_row.iter_mut().find(|(row, _)| *row == rect.row) {
+                Some((_, count)) => *count += 1,
+                None => by_row.push((rect.row, 1)),
+            }
+        }
+        by_row.sort_unstable();
+        by_row.into_iter().map(|(_, count)| count).collect()
+    }
+
+    #[test]
+    fn tiled_is_a_grid() {
+        let mut w = window_of(4);
+        w.apply_layout(NamedLayout::Tiled);
+        assert_eq!(rows_of(&w), vec![2, 2]);
+
+        // Rows fill left to right, so an odd count leaves the last row
+        // short rather than reshaping the ones above it.
+        let mut w = window_of(5);
+        w.apply_layout(NamedLayout::Tiled);
+        assert_eq!(rows_of(&w), vec![3, 2]);
+
+        let mut w = window_of(9);
+        w.apply_layout(NamedLayout::Tiled);
+        assert_eq!(rows_of(&w), vec![3, 3, 3]);
+    }
+
+    #[test]
+    fn main_vertical_gives_the_focused_pane_the_whole_left_side() {
+        let mut w = window_of(4);
+        let main = w.focused_pane;
+        w.apply_layout(NamedLayout::MainVertical);
+
+        let r = rects(&w);
+        let main_rect = r.iter().find(|(id, _)| *id == main).unwrap().1;
+        assert_eq!(main_rect.row, 0);
+        assert_eq!(main_rect.rows, AREA.rows, "full height, whatever else is beside it");
+        // And everything else starts to its right.
+        assert!(r.iter().filter(|(id, _)| *id != main).all(|(_, rect)| rect.col > main_rect.col));
+    }
+
+    #[test]
+    fn main_horizontal_gives_it_the_whole_top() {
+        let mut w = window_of(3);
+        let main = w.focused_pane;
+        w.apply_layout(NamedLayout::MainHorizontal);
+
+        let r = rects(&w);
+        let main_rect = r.iter().find(|(id, _)| *id == main).unwrap().1;
+        assert_eq!(main_rect.col, 0);
+        assert_eq!(main_rect.cols, AREA.cols);
+        assert!(r.iter().filter(|(id, _)| *id != main).all(|(_, rect)| rect.row > main_rect.row));
+    }
+
+    #[test]
+    fn main_is_whichever_pane_has_focus() {
+        // The deviation from tmux, which always makes the first pane
+        // main: here the key that arranges the window is also the key
+        // that says what it is arranged around.
+        let mut w = window_of(3);
+        w.focused_pane = 2;
+        w.apply_layout(NamedLayout::MainVertical);
+
+        let r = rects(&w);
+        let main_rect = r.iter().find(|(id, _)| *id == 2).unwrap().1;
+        assert_eq!(main_rect.rows, AREA.rows);
+        assert_eq!(main_rect.col, 0);
+    }
+
+    #[test]
+    fn a_layout_evens_out_whatever_resizing_came_before() {
+        let mut w = window_of(3);
+        w.apply_layout(NamedLayout::EvenHorizontal);
+        let even: Vec<usize> = rects(&w).iter().map(|(_, r)| r.cols).collect();
+
+        resize_focused_pane(&mut w, RESIZE_STEP);
+        assert_ne!(rects(&w).iter().map(|(_, r)| r.cols).collect::<Vec<_>>(), even, "the resize took");
+
+        w.apply_layout(NamedLayout::EvenHorizontal);
+        assert_eq!(rects(&w).iter().map(|(_, r)| r.cols).collect::<Vec<_>>(), even, "and asking for the layout again undoes it");
+    }
+
+    #[test]
+    fn next_cycles_through_all_five_and_wraps() {
+        let mut w = window_of(2);
+        let mut seen = Vec::new();
+        for _ in 0..6 {
+            let next = w.next_layout();
+            w.apply_layout(next);
+            seen.push(next.name());
+        }
+        assert_eq!(seen, vec!["even-horizontal", "even-vertical", "main-horizontal", "main-vertical", "tiled", "even-horizontal"]);
+    }
+
+    #[test]
+    fn one_pane_has_no_arrangement_to_apply() {
+        let mut w = window_of(1);
+        w.apply_layout(NamedLayout::Tiled);
+        assert_eq!(rects(&w).len(), 1);
+    }
+
+    #[test]
+    fn every_layout_keeps_every_pane_exactly_once() {
+        // A rebuild that dropped or duplicated a leaf would leave a
+        // pane with no rectangle, which every geometry caller then
+        // panics on.
+        for named in NamedLayout::ALL {
+            for n in 2..7 {
+                let mut w = window_of(n);
+                w.apply_layout(named);
+                let mut ids: Vec<PaneId> = rects(&w).into_iter().map(|(id, _)| id).collect();
+                ids.sort_unstable();
+                assert_eq!(ids, (0..n as PaneId).collect::<Vec<_>>(), "{} with {n} panes", named.name());
+            }
+        }
+    }
+
+    #[test]
+    fn a_layout_ends_a_zoom() {
+        let mut w = window_of(3);
+        w.toggle_zoom();
+        w.apply_layout(NamedLayout::Tiled);
+        assert_eq!(w.zoomed, None, "rearranging under a zoom would be invisible");
     }
 }

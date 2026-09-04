@@ -24,7 +24,7 @@ const THEME_SUBCOMMANDS: &[&str] = &["begin", "end"];
 // answer would be arbitrary.
 const WINDOW_SUBCOMMANDS: &[&str] = &[
     "next", "previous", "new", "create", "close", "quit", "split", "vsplit", "left", "below", "above", "right", "zoom", "swap", "break", "join",
-    "vjoin", "balance", "minimize", "sizeup", "sizedown", "size", "fg",
+    "vjoin", "layout", "balance", "minimize", "sizeup", "sizedown", "size", "fg",
 ];
 
 // "theme, window, hook, hl, lsp, map" -- the list as an error message
@@ -950,6 +950,21 @@ pub(crate) fn run_window_inner(sh: &mut Shell, args: &[String]) -> ExecResult {
         Some("k") | Some("above") => ExecResult::Window(WindowAction::FocusPane(PaneDirection::Up)),
         Some("l") | Some("right") => ExecResult::Window(WindowAction::FocusPane(PaneDirection::Right)),
         Some("zoom") | Some("z") => ExecResult::Window(WindowAction::Zoom),
+        Some("layout") => match args.get(1).map(String::as_str) {
+            // No name at all cycles too, so the command is usable
+            // before anyone has learned the five names.
+            None | Some("next") => ExecResult::Window(WindowAction::SetLayout(None)),
+            Some(name) => match crate::window::NamedLayout::parse(name) {
+                Some(layout) => ExecResult::Window(WindowAction::SetLayout(Some(layout))),
+                None => {
+                    let names: Vec<&str> = crate::window::NamedLayout::ALL.iter().map(|l| l.name()).collect();
+                    let hint = crate::suggest::did_you_mean(name, names.iter().copied());
+                    sh_eprintln!(sh, "bish: window: layout: unknown layout: {name}{hint}");
+                    sh_eprintln!(sh, "bish: window: layout: known layouts: {}", listed(&names));
+                    ExecResult::Status(2)
+                }
+            },
+        },
         Some("swap") | Some("x") => ExecResult::Window(WindowAction::SwapPane),
         Some("break") => ExecResult::Window(WindowAction::BreakPane),
         // `join`/`vjoin` pair with `split`/`vsplit` and mean the same
@@ -988,7 +1003,7 @@ pub(crate) fn run_window_inner(sh: &mut Shell, args: &[String]) -> ExecResult {
         None => {
             sh_eprintln!(
                 sh,
-                "bish: window: missing subcommand (next(n)/previous/new(c,create) [--name NAME] [-- CMD]/close(q,quit)/split(s) [CMD]/vsplit(v) [CMD]/h(left)/j(below)/k(above)/l(right)/zoom(z)/swap(x)/break/join <id>/vjoin <id>/=(balance)/_(minimize)/+(sizeup)/-(sizedown)/size <N|N%,N/M>/fg <id>)"
+                "bish: window: missing subcommand (next(n)/previous/new(c,create) [--name NAME] [-- CMD]/close(q,quit)/split(s) [CMD]/vsplit(v) [CMD]/h(left)/j(below)/k(above)/l(right)/zoom(z)/swap(x)/break/join <id>/vjoin <id>/layout [name|next]/=(balance)/_(minimize)/+(sizeup)/-(sizedown)/size <N|N%,N/M>/fg <id>)"
             );
             ExecResult::Status(2)
         }
