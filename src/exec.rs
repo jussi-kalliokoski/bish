@@ -6077,6 +6077,15 @@ impl Shell {
     /// element form was reaching `lookup_var("a[1]")` and finding
     /// nothing.
     fn indirect_var(&mut self, name: &str) -> String {
+        // A nameref is the one case where `${!x}` is not an
+        // indirection at all: it gives the *name* the reference points
+        // at, following a chain of them to the end. `$r` is already the
+        // target's value, so reading `${!r}` as "indirect through that
+        // value" made it a second hop -- which lands on whatever the
+        // value happens to spell, and usually on nothing.
+        if self.nameref_names.contains(name) {
+            return self.resolve_nameref(name);
+        }
         if !self.var_is_set(name) {
             sh_eprintln!(self, "bish: {}: invalid indirect expansion", name);
             self.expansion_failed = true;

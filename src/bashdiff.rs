@@ -886,6 +886,14 @@ y
         // one: `unset PS4` traces with no prefix at all.
         case("ps4-unset-is-no-prefix", r#"unset PS4; set -x; echo t"#),
         case("ps4-defaults-to-plus", r#"set -x; echo t"#),
+        // A nameref is the one case where `${!x}` is not an indirection
+        // at all: it names what the reference points at, following a
+        // chain of them to the end. Reading it as an indirection made
+        // it a second hop, which lands on whatever the target's value
+        // happens to spell -- usually nothing.
+        case("indirect-expansion-of-a-nameref", r#"declare -n r=v; v=x; echo "${!r}"; echo "$r""#),
+        case("indirect-expansion-follows-a-nameref-chain", r#"declare -n a=b; declare -n b=c; c=1; echo "${!a}""#),
+        case("a-nameref-parameter-names-its-argument", r#"f() { local -n r=$1; echo "${!r}"; }; v=x; f v"#),
         // A subshell resets the traps it caught, so a DEBUG trap does
         // not fire once per command inside a `$( )` and an ERR trap
         // does not fire both inside `( false )` and again for the
