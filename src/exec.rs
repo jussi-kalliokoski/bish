@@ -1471,6 +1471,10 @@ pub struct Shell {
     // it's run directly wherever the shell is about to terminate rather
     // than through the sigaction/PENDING_SIGNALS machinery.
     exit_trap: Option<String>,
+    // The subshell nesting depth the EXIT trap was set at. It fires for
+    // the exit of the shell that armed it and for no other -- see
+    // run_exit_trap.
+    exit_trap_depth: u32,
     // The other three pseudo-signals `trap` takes. Not signals at all --
     // the interpreter fires them itself, at three places it already
     // passes through: before each simple command, after a command fails
@@ -1910,6 +1914,7 @@ impl Shell {
             proc_sub_children: Vec::new(),
             traps: std::collections::HashMap::new(),
             exit_trap: None,
+            exit_trap_depth: 0,
             debug_trap: None,
             err_trap: None,
             return_trap: None,
@@ -2250,6 +2255,7 @@ impl Shell {
             proc_sub_children: Vec::new(),
             traps: self.traps.clone(),
             exit_trap: self.exit_trap.clone(),
+            exit_trap_depth: self.exit_trap_depth,
             debug_trap: self.debug_trap.clone(),
             err_trap: self.err_trap.clone(),
             return_trap: self.return_trap.clone(),
@@ -2319,6 +2325,24 @@ impl Shell {
     }
 
     pub fn run_exit_trap(&mut self) {
+        // Only for the exit of the shell that armed it. A subshell
+        // inherits the trap and can still see it -- `trap -p EXIT`
+        // inside one prints it, which is bash's behaviour too -- but
+        // reaching the end of a subshell is not the exit it was set
+        // for.
+        //
+        // Running it there is silently destructive, because the shape
+        // this trap is nearly always written in is a cleanup:
+        //
+        //     tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
+        //
+        // The very next command substitution ended a subshell, so the
+        // directory was removed while the script was still using it --
+        // and then again at every `( )`, every pipeline stage, and once
+        // more at the real exit.
+        if self.subshell_depth != self.exit_trap_depth {
+            return;
+        }
         if let Some(cmd) = self.exit_trap.take() {
             self.run_source_here(&cmd, "trap");
         }
@@ -7853,6 +7877,7 @@ impl Shell {
                 for sig in &argv[2..] {
                     if sig == "EXIT" || sig == "0" {
                         self.exit_trap = if cmd_str == "-" { None } else { Some(cmd_str.clone()) };
+                        self.exit_trap_depth = self.subshell_depth;
                         continue;
                     }
                     // The pseudo-signals: not signals, fired by the
@@ -10361,7 +10386,13 @@ impl Shell {
         if self.var_is_set(name) {
             return;
         }
-        sh_eprintln!(self, "bish: {}: unbound variable", name);
+        // bash names a positional with its `$`, and an ordinary
+        // variable without one.
+        let shown = match name.chars().all(|c| c.is_ascii_digit()) {
+            true => format!("${}", name),
+            false => name.to_string(),
+        };
+        sh_eprintln!(self, "bish: {}: unbound variable", shown);
         // 127, the status bash uses for an unbound variable under
         // `set -u` -- not 1. Checked against bash 5.3.
         self.pending_exit = Some(127);
@@ -10407,9 +10438,18 @@ impl Shell {
                 | "BASH_SUBSHELL"
                 | "SHELLOPTS"
                 | "BASHOPTS"
-        ) || (!name.is_empty() && name.chars().all(|c| c.is_ascii_digit()));
+        );
         if is_special {
             return true;
+        }
+        // A positional is set only when there is one at that position:
+        // `$1` with no arguments is exactly what `set -u` exists to
+        // catch, and treating every digit as always-set exempted the
+        // whole family from it. (`$0` is in the list above -- it is the
+        // shell's own name and always there.)
+        if !name.is_empty() && name.chars().all(|c| c.is_ascii_digit()) {
+            let index: usize = name.parse().unwrap_or(0);
+            return index <= self.arg_frames.last().map(Vec::len).unwrap_or(0);
         }
         // The innermost scope holding the name decides: a `local x`
         // with no value shadows as *unset*, so the search stops there

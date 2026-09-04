@@ -811,6 +811,30 @@ y
         case("prefix-listing-finds-computed-names", r#"echo "${!BASHO*}" "${!BASHP*}" "${!BASH_SUB*}" "${!EUI*}""#),
         // BASH_VERSINFO is readonly, which `declare -p` reports.
         case("bash-versinfo-is-readonly", r#"declare -p BASH_VERSINFO | cut -c1-14"#),
+        // -- roadmap 05 ------------------------------------------------
+        // An EXIT trap fires for the exit of the shell that armed it and
+        // for no other. A subshell inherits it and can still see it --
+        // `trap -p EXIT` inside one prints it -- but reaching the end of
+        // a subshell is not that exit. Running it there is silently
+        // destructive, because the shape this trap is nearly always
+        // written in is a cleanup: the first command substitution ended
+        // a subshell and removed the directory the script was still
+        // using.
+        case("an-exit-trap-does-not-fire-in-a-subshell", r#"trap "echo E" EXIT; ( echo s ); echo m"#),
+        case("an-exit-trap-does-not-fire-in-a-substitution", r#"trap "echo E" EXIT; x=$(echo s); echo "$x""#),
+        case("an-exit-trap-does-not-fire-per-pipeline-stage", r#"trap "echo E" EXIT; echo a | cat; echo m"#),
+        case("an-exit-trap-set-in-a-subshell-fires-there", r#"( trap "echo E" EXIT; echo s ); echo m; echo a | { trap "echo P" EXIT; cat; }"#),
+        case("an-inherited-exit-trap-is-still-visible", r#"trap "echo E" EXIT; ( trap -p EXIT ); echo m"#),
+        case(
+            "the-cleanup-idiom-survives-a-substitution",
+            r#"d=$(mktemp -d); trap "rmdir $d" EXIT; x=$(echo hi); [ -d "$d" ] && echo "still there: $x""#,
+        ),
+        // A positional is set only when there is one at that position,
+        // which is exactly what `set -u` is for. Every digit counted as
+        // always-set, so the whole family was exempt from it.
+        case("nounset-covers-the-positionals", r#"set -u; f() { echo "$1"; }; f"#),
+        case("nounset-leaves-the-specials-alone", r#"set -u; echo "$@$*$#"; echo "${1-d}"; f() { echo "${1:-e}"; }; f; echo ok"#),
+        case("a-positional-past-the-end-is-unset", r#"set -- a; echo "[${1+set}][${2+set}]"; set -u; echo "$2""#),
         // `&` makes a job, which means a child. Only an external and a
         // subshell took any notice of it: a builtin, a function, a
         // group, a loop and a bare assignment all ran in this shell,
