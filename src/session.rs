@@ -178,7 +178,71 @@ fn is_daemon_alive(name: &str) -> bool {
 }
 
 fn read_pid(name: &str) -> Option<i32> {
-    std::fs::read_to_string(pidfile_path(name)).ok()?.trim().parse().ok()
+    // First line only: the daemon keeps a status line underneath it
+    // (see write_status), and a pid is still the first thing anyone
+    // reading this file wants.
+    std::fs::read_to_string(pidfile_path(name)).ok()?.lines().next()?.trim().parse().ok()
+}
+
+/// How many clients are attached to `name` right now, as its daemon
+/// last reported.
+///
+/// The daemon is the only thing that can know this, so it writes it
+/// down: `ls` runs in a different process entirely and has no way to
+/// ask. Rewritten only when the number actually changes, so an idle
+/// session touches nothing. `None` means the daemon predates the status
+/// line or has not written one yet, which reads as "unknown" rather
+/// than "nobody".
+fn read_attached(name: &str) -> Option<usize> {
+    let text = std::fs::read_to_string(pidfile_path(name)).ok()?;
+    text.lines().nth(1)?.strip_prefix("attached ")?.trim().parse().ok()
+}
+
+/// Rewrites `pidfile` as the pid line plus the current attached count.
+///
+/// Through the open descriptor rather than the path, which is what
+/// makes `session rename` safe: the file can be renamed out from under
+/// a running daemon and this keeps writing to the same inode.
+fn write_status(pidfile: &mut std::fs::File, attached: usize) {
+    use std::io::{Seek, SeekFrom};
+    let text = format!("{}\nattached {}\n", std::process::id(), attached);
+    let _ = pidfile.seek(SeekFrom::Start(0));
+    let _ = pidfile.set_len(0);
+    let _ = pidfile.write_all(text.as_bytes());
+    let _ = pidfile.flush();
+}
+
+/// When this session was created, from the socket file's own mtime.
+///
+/// The socket is written once, at bind, and never again -- unlike the
+/// pidfile, which the status line rewrites. So it is the one thing in
+/// the runtime directory that still remembers when the session started.
+fn session_age(name: &str) -> Option<std::time::Duration> {
+    let created = std::fs::metadata(socket_path(name)).ok()?.modified().ok()?;
+    std::time::SystemTime::now().duration_since(created).ok()
+}
+
+/// A duration as a person would say it: the largest unit that is not
+/// zero, and nothing after it. "3h" is more useful in a list than
+/// "3h07m12s".
+fn short_duration(d: std::time::Duration) -> String {
+    let secs = d.as_secs();
+    match secs {
+        0..=59 => format!("{secs}s"),
+        60..=3599 => format!("{}m", secs / 60),
+        3600..=86399 => format!("{}h", secs / 3600),
+        _ => format!("{}d", secs / 86400),
+    }
+}
+
+/// The directory a session is in, read out of `/proc`.
+///
+/// The daemon *is* the shell process, so its own cwd is the session's
+/// -- a `cd` in the session moves it. Linux-only, like the rest of this
+/// module's syscalls (see the file header); `None` wherever /proc is
+/// not there or the link cannot be read.
+fn session_cwd(pid: i32) -> Option<std::path::PathBuf> {
+    std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
 }
 
 // Creates `socket_dir()` (and any missing parent, e.g. a not-yet-existing
@@ -491,6 +555,13 @@ pub struct SessionBridge {
     // by attach/detach, the only two places either is ever changed.
     writes: Arc<Mutex<Vec<(ClientId, UnixStream)>>>,
     next_client_id: ClientId,
+    // The daemon's own pidfile, held open for its lock and written
+    // through for the status line -- see write_status. `None` outside a
+    // real daemon (a test bridge has no pidfile to keep current).
+    pidfile: Option<std::fs::File>,
+    // What the status line currently says, so an idle session rewrites
+    // nothing.
+    reported_attached: usize,
     // The main thread's own pty-master handle -- writes only (client
     // input, `Pty::set_size`); the background thread owns the read side
     // via its own separate fd (see SessionBridge::new).
@@ -584,11 +655,47 @@ impl SessionBridge {
         let writes = Arc::new(Mutex::new(Vec::new()));
         let writes_for_thread = writes.clone();
         std::thread::spawn(move || drain_pty_master_thread(pty_master_read, writes_for_thread));
-        Ok(SessionBridge { listener, clients: Vec::new(), writes, next_client_id: 1, pty_master, just_attached: false, pending_capability: None })
+        Ok(SessionBridge {
+            listener,
+            clients: Vec::new(),
+            writes,
+            next_client_id: 1,
+            pidfile: None,
+            reported_attached: 0,
+            pty_master,
+            just_attached: false,
+            pending_capability: None,
+        })
     }
 
     pub fn is_attached(&self) -> bool {
         !self.clients.is_empty()
+    }
+
+    /// Hands the daemon's own pidfile to the bridge, so the attached
+    /// count in it can be kept current. Called once, by run_daemon.
+    pub fn watch_pidfile(&mut self, mut pidfile: std::fs::File) {
+        // Written straight out rather than through publish_attached,
+        // which only writes on a *change*: the first status line is
+        // exactly the one that has nothing to differ from, and without
+        // it a session nobody has attached to yet would read as
+        // "unknown" for its whole life instead of "detached".
+        self.reported_attached = self.clients.len();
+        write_status(&mut pidfile, self.reported_attached);
+        self.pidfile = Some(pidfile);
+    }
+
+    // Writes the attached count into the pidfile, but only when it has
+    // actually changed -- this runs on every idle tick.
+    fn publish_attached(&mut self) {
+        let attached = self.clients.len();
+        if attached == self.reported_attached {
+            return;
+        }
+        self.reported_attached = attached;
+        if let Some(pidfile) = self.pidfile.as_mut() {
+            write_status(pidfile, attached);
+        }
     }
 
     pub fn take_just_attached(&mut self) -> bool {
@@ -608,6 +715,7 @@ impl SessionBridge {
         // ordinary thing to do now, not an error.
         self.try_accept();
         self.drain_clients();
+        self.publish_attached();
     }
 
     // The pty is sized to the smallest attached client, so nothing any
@@ -845,15 +953,16 @@ pub fn run_daemon(name: &str) -> io::Result<i32> {
     daemonize();
     crate::pty::attach_self_to_pty(&slave_path)?;
 
+    // The bridge keeps the attached count in here current, which is the
+    // only way `ls` -- a different process entirely -- can know it.
+    // The lock lives on in the bridge's own copy for the rest of this
+    // process's life, exactly as it did when run_daemon held it alone.
+    let mut bridge = bridge;
+    bridge.watch_pidfile(pidfile_lock);
     install_bridge(bridge);
 
     let shell = crate::exec::Shell::new();
     crate::repl::run(shell, true);
-    // Not reached in practice (repl::run only returns by way of the
-    // whole process exiting) -- kept so a future change to repl::run's
-    // own exit story doesn't silently drop the pidfile lock early
-    // without a compiler-visible reason to reconsider this.
-    drop(pidfile_lock);
     Ok(0)
 }
 
@@ -870,33 +979,63 @@ pub fn run_ls() -> io::Result<i32> {
     let mut names: Vec<String> =
         entries.flatten().filter_map(|entry| entry.file_name().to_str().and_then(|s| s.strip_suffix(".sock")).map(str::to_string)).collect();
     names.sort();
-    let mut any = false;
-    for name in names {
-        if is_daemon_alive(&name) {
-            any = true;
-            match read_pid(&name) {
-                Some(pid) => println!("{}\t(pid {})", name, pid),
-                None => println!("{}", name),
-            }
-        }
-    }
-    if !any {
+    let live: Vec<String> = names.into_iter().filter(|name| is_daemon_alive(name)).collect();
+    if live.is_empty() {
         println!("no sessions");
+        return Ok(0);
+    }
+    // Names are the column anyone scans down, so they line up.
+    let width = live.iter().map(String::len).max().unwrap_or(0);
+    for name in live {
+        let attached = match read_attached(&name) {
+            Some(0) => "detached".to_string(),
+            Some(1) => "1 client".to_string(),
+            Some(n) => format!("{n} clients"),
+            // A daemon from before the status line existed, or one that
+            // has not written its first one yet.
+            None => "?".to_string(),
+        };
+        let age = session_age(&name).map(short_duration).unwrap_or_else(|| "?".to_string());
+        let cwd = read_pid(&name).and_then(session_cwd).map(|p| p.display().to_string()).unwrap_or_default();
+        println!("{name:width$}  {attached:<10}  {age:>4} old  {cwd}");
     }
     Ok(0)
 }
 
-// `bish session kill <name>`: verifies a live daemon actually holds
-// this name (see is_daemon_alive) immediately before signaling it --
-// narrows, though can't fully eliminate, the PID-reuse race any
-// pidfile-based scheme has (the daemon would have to exit *and* have
-// its exact PID reused by something else, both within this function's
-// own brief window) -- see acquire_pidfile_lock's own doc comment for
-// why this is still a meaningfully smaller risk than trusting a raw PID
-// with no liveness check at all. Sends SIGTERM (bish installs no
-// handler for it, so this terminates the daemon immediately) rather
-// than attempting a graceful in-shell shutdown -- matches what
-// tmux/screen's own kill-session already does, not a new tradeoff.
+/// `bish session rename <old> <new>`.
+///
+/// Renames the socket and the pidfile, which is all a session's name
+/// is. The daemon keeps both open by descriptor -- its listener is
+/// bound to the socket's inode, and its pidfile lock and status writes
+/// go through the fd it already holds -- so it carries on through the
+/// rename without noticing, and clients connecting afterwards find it
+/// under the new name.
+pub fn run_rename(from: &str, to: &str) -> io::Result<i32> {
+    check_name(from)?;
+    check_name(to)?;
+    if from == to {
+        return Ok(0);
+    }
+    if !is_daemon_alive(from) {
+        eprintln!("bish: session '{from}' is not running");
+        return Ok(1);
+    }
+    if is_daemon_alive(to) {
+        eprintln!("bish: session '{to}' already exists");
+        return Ok(1);
+    }
+    // A dead name can still have files sitting on it (a daemon killed
+    // between the SIGTERM and the sweep, say). They are nobody's, and
+    // the rename below would fail on them.
+    let _ = std::fs::remove_file(socket_path(to));
+    let _ = std::fs::remove_file(pidfile_path(to));
+    // The socket first: it is what a client connects to, so the window
+    // in which neither name works is as short as it can be.
+    std::fs::rename(socket_path(from), socket_path(to))?;
+    std::fs::rename(pidfile_path(from), pidfile_path(to))?;
+    Ok(0)
+}
+
 pub fn run_kill(name: &str) -> io::Result<i32> {
     check_name(name)?;
     if !is_daemon_alive(name) {
@@ -1237,6 +1376,51 @@ mod tests {
             ensure_socket_dir().expect("ensure_socket_dir");
             let _lock = acquire_pidfile_lock("work").expect("acquire_pidfile_lock");
             assert_eq!(read_pid("work"), Some(std::process::id() as i32));
+        });
+    }
+
+    #[test]
+    fn a_duration_reads_as_the_largest_unit_that_is_not_zero() {
+        use std::time::Duration;
+        assert_eq!(short_duration(Duration::from_secs(0)), "0s");
+        assert_eq!(short_duration(Duration::from_secs(59)), "59s");
+        assert_eq!(short_duration(Duration::from_secs(60)), "1m");
+        assert_eq!(short_duration(Duration::from_secs(3599)), "59m");
+        assert_eq!(short_duration(Duration::from_secs(3600)), "1h");
+        assert_eq!(short_duration(Duration::from_secs(86399)), "23h");
+        assert_eq!(short_duration(Duration::from_secs(86400)), "1d");
+        // Nothing after the first unit: "3h" belongs in a list,
+        // "3h07m12s" does not.
+        assert_eq!(short_duration(Duration::from_secs(3 * 3600 + 432)), "3h");
+    }
+
+    #[test]
+    fn the_status_line_sits_under_the_pid_and_does_not_disturb_it() {
+        with_isolated_runtime_dir("status-line", |_dir| {
+            ensure_socket_dir().expect("ensure_socket_dir");
+            let mut file = std::fs::OpenOptions::new().create(true).write(true).truncate(true).open(pidfile_path("s")).expect("pidfile");
+
+            write_status(&mut file, 2);
+            assert_eq!(read_pid("s"), Some(std::process::id() as i32), "the pid is still the first line");
+            assert_eq!(read_attached("s"), Some(2));
+
+            // Rewritten in place, shorter -- the old line must not show
+            // through underneath the new one.
+            write_status(&mut file, 0);
+            assert_eq!(read_attached("s"), Some(0));
+            assert_eq!(read_pid("s"), Some(std::process::id() as i32));
+        });
+    }
+
+    #[test]
+    fn a_pidfile_with_no_status_line_reads_as_unknown_not_as_nobody() {
+        // What a daemon from before the status line existed leaves.
+        // "?" in the listing is honest; "detached" would not be.
+        with_isolated_runtime_dir("old-pidfile", |_dir| {
+            ensure_socket_dir().expect("ensure_socket_dir");
+            std::fs::write(pidfile_path("old"), b"4242\n").expect("pidfile");
+            assert_eq!(read_pid("old"), Some(4242));
+            assert_eq!(read_attached("old"), None);
         });
     }
 

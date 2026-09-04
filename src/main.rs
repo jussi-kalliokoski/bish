@@ -102,11 +102,15 @@ fn main() {
                 None => Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "usage: bish session --daemon <name>")),
             },
             Some("ls") => session::run_ls(),
+            Some("rename") => match (args.get(3), args.get(4)) {
+                (Some(from), Some(to)) => session::run_rename(from, to),
+                _ => Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "usage: bish session rename <old> <new>")),
+            },
             Some("kill") => match args.get(3) {
                 Some(name) => session::run_kill(name),
                 None => Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "usage: bish session kill <name>")),
             },
-            _ => Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "usage: bish session {new|attach|ls|kill} <name>")),
+            _ => Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "usage: bish session {new|attach|ls|rename|kill} <name>")),
         };
         match code {
             Ok(c) => std::process::exit(c),
