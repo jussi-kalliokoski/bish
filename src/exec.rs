@@ -1036,6 +1036,19 @@ pub const HOOK_EVENT_HELP: &[(&str, &str)] = &[
     ("shell:cwd:change", "The working directory has changed, however it happened. Argument: the new directory."),
 ];
 
+/// Where `::bish window move` puts the current window.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum WindowMove {
+    /// One place towards the front of the tab bar, or nowhere if it is
+    /// already there.
+    Left,
+    /// One place towards the back, likewise.
+    Right,
+    /// A 1-based position in the bar, clamped -- `move 1` is "make this
+    /// the first tab" however many there are.
+    To(usize),
+}
+
 #[derive(Debug, Clone)]
 pub enum WindowAction {
     /// `window create [--name NAME] [--] [COMMAND...]`. A name is what
@@ -1091,6 +1104,15 @@ pub enum WindowAction {
     // one, vim Ctrl-w-hjkl style. A no-op if the current window isn't
     // split, or nothing lies in that direction.
     FocusPane(PaneDirection),
+    /// `::bish window move <left|right|N>`: moves the *current window*
+    /// within the tab bar. Windows have always been in the order they
+    /// were created, with no way to change it.
+    ///
+    /// No `<C-w>` chord for this one on purpose: the keys that read as
+    /// "move it left/right" under a window leader are `<`/`>`, and in
+    /// vim those already mean narrower/wider. tmux types `swap-window`
+    /// out too.
+    MoveWindow(WindowMove),
     /// `::bish window layout <name>` / `layout next`, and
     /// `<C-w><Space>`: rearranges every pane in the window into one of
     /// the named arrangements. `None` means the next one in the cycle.

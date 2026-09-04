@@ -23,7 +23,7 @@ use crate::browser;
 use crate::debugger;
 use crate::docs;
 use crate::editor::{self, Key, ReadOutcome};
-use crate::exec::{self, DebugHook, ExecResult, PaneDirection, Shell, WindowAction};
+use crate::exec::{self, DebugHook, ExecResult, PaneDirection, Shell, WindowAction, WindowMove};
 use crate::fileeditor;
 use crate::hexedit;
 use crate::history::{self, History};
@@ -3234,6 +3234,23 @@ fn apply_window_action(app: &mut App, action: WindowAction) {
         }
         WindowAction::Zoom => {
             app.windows[app.current_window].toggle_zoom();
+        }
+        WindowAction::MoveWindow(where_to) => {
+            let last = app.windows.len() - 1;
+            let from = app.current_window;
+            let to = match where_to {
+                WindowMove::Left => from.saturating_sub(1),
+                WindowMove::Right => (from + 1).min(last),
+                // Clamped rather than refused: "put it at the end" is
+                // most naturally typed as a number larger than the tab
+                // bar, and there is only one thing it can mean.
+                WindowMove::To(position) => (position - 1).min(last),
+            };
+            if to != from {
+                let window = app.windows.remove(from);
+                app.windows.insert(to, window);
+                app.current_window = to;
+            }
         }
         WindowAction::SetLayout(named) => {
             let window = &mut app.windows[app.current_window];

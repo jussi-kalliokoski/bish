@@ -5,8 +5,8 @@
 
 use crate::bishedit::snippet::{self, Abbr};
 use crate::exec::{
-    BishOptDefault, BishOptValue, ExecResult, HOOK_EVENTS, Hook, LspServer, PaneDirection, Shell, Theme, WindowAction, hook_help, lsp_help,
-    parse_size_spec, sh_eprintln, sh_println,
+    BishOptDefault, BishOptValue, ExecResult, HOOK_EVENTS, Hook, LspServer, PaneDirection, Shell, Theme, WindowAction, WindowMove, hook_help,
+    lsp_help, parse_size_spec, sh_eprintln, sh_println,
 };
 
 // The subcommand names each `::bish` family answers to. One list per
@@ -24,7 +24,7 @@ const THEME_SUBCOMMANDS: &[&str] = &["begin", "end"];
 // answer would be arbitrary.
 const WINDOW_SUBCOMMANDS: &[&str] = &[
     "next", "previous", "new", "create", "close", "quit", "split", "vsplit", "left", "below", "above", "right", "zoom", "swap", "break", "join",
-    "vjoin", "layout", "balance", "minimize", "sizeup", "sizedown", "size", "fg",
+    "vjoin", "layout", "move", "balance", "minimize", "sizeup", "sizedown", "size", "fg",
 ];
 
 // "theme, window, hook, hl, lsp, map" -- the list as an error message
@@ -950,6 +950,23 @@ pub(crate) fn run_window_inner(sh: &mut Shell, args: &[String]) -> ExecResult {
         Some("k") | Some("above") => ExecResult::Window(WindowAction::FocusPane(PaneDirection::Up)),
         Some("l") | Some("right") => ExecResult::Window(WindowAction::FocusPane(PaneDirection::Right)),
         Some("zoom") | Some("z") => ExecResult::Window(WindowAction::Zoom),
+        Some("move") | Some("mv") => match args.get(1).map(String::as_str) {
+            Some("left") | Some("l") => ExecResult::Window(WindowAction::MoveWindow(WindowMove::Left)),
+            Some("right") | Some("r") => ExecResult::Window(WindowAction::MoveWindow(WindowMove::Right)),
+            Some(n) => match n.parse::<usize>() {
+                // 1-based, because that is how a tab bar is counted out
+                // loud -- `move 1` makes this the first tab.
+                Ok(position) if position >= 1 => ExecResult::Window(WindowAction::MoveWindow(WindowMove::To(position))),
+                _ => {
+                    sh_eprintln!(sh, "bish: window: move: usage: window move <left|right|N> (N counts from 1)");
+                    ExecResult::Status(2)
+                }
+            },
+            None => {
+                sh_eprintln!(sh, "bish: window: move: usage: window move <left|right|N>");
+                ExecResult::Status(2)
+            }
+        },
         Some("layout") => match args.get(1).map(String::as_str) {
             // No name at all cycles too, so the command is usable
             // before anyone has learned the five names.
@@ -1003,7 +1020,7 @@ pub(crate) fn run_window_inner(sh: &mut Shell, args: &[String]) -> ExecResult {
         None => {
             sh_eprintln!(
                 sh,
-                "bish: window: missing subcommand (next(n)/previous/new(c,create) [--name NAME] [-- CMD]/close(q,quit)/split(s) [CMD]/vsplit(v) [CMD]/h(left)/j(below)/k(above)/l(right)/zoom(z)/swap(x)/break/join <id>/vjoin <id>/layout [name|next]/=(balance)/_(minimize)/+(sizeup)/-(sizedown)/size <N|N%,N/M>/fg <id>)"
+                "bish: window: missing subcommand (next(n)/previous/new(c,create) [--name NAME] [-- CMD]/close(q,quit)/split(s) [CMD]/vsplit(v) [CMD]/h(left)/j(below)/k(above)/l(right)/zoom(z)/swap(x)/break/join <id>/vjoin <id>/layout [name|next]/move <left|right|N>/=(balance)/_(minimize)/+(sizeup)/-(sizedown)/size <N|N%,N/M>/fg <id>)"
             );
             ExecResult::Status(2)
         }
