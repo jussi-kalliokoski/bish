@@ -835,6 +835,19 @@ y
         case("nounset-covers-the-positionals", r#"set -u; f() { echo "$1"; }; f"#),
         case("nounset-leaves-the-specials-alone", r#"set -u; echo "$@$*$#"; echo "${1-d}"; f() { echo "${1:-e}"; }; f; echo ok"#),
         case("a-positional-past-the-end-is-unset", r#"set -- a; echo "[${1+set}][${2+set}]"; set -u; echo "$2""#),
+        // The right-hand side of an array assignment is expanded before
+        // the old value is thrown away. Clearing first meant the array
+        // could not be built from itself: `a=("${a[@]/x/y}")`, the
+        // ordinary way to rewrite one in place, emptied it.
+        case("an-array-can-be-built-from-itself", r#"a=(1 2); a=("${a[@]/1/9}"); echo "${a[*]}"; b=(1 2); b=("${b[@]}" 3); echo "${b[*]}""#),
+        case("an-array-can-be-prepended-to", r#"a=(1 2); a=(0 "${a[@]}"); echo "${a[*]}"; a+=("${a[@]}"); echo "${a[*]}""#),
+        // The whole arithmetic expression is expanded before any of it
+        // is evaluated. A bare `$x` was left for the arithmetic lexer,
+        // which reads it where it stands alone and not where it is part
+        // of a larger token -- so `$((10#$x))`, the idiom for forcing
+        // base ten on a zero-padded number, failed outright.
+        case("a-base-prefix-in-front-of-an-expansion", r#"x=010; echo $((10#$x)) $((16#$x)); v=07; echo $((10#$v)) $((8#$v))"#),
+        case("an-expansion-inside-arithmetic", r#"x=1+1; echo $((x)) $(($x)); n=3; echo $(( n * $n )); echo $((2#$(echo 101)))"#),
         // `&` makes a job, which means a child. Only an external and a
         // subshell took any notice of it: a builtin, a function, a
         // group, a loop and a bare assignment all ran in this shell,

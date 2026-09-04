@@ -9177,6 +9177,29 @@ impl Shell {
             return false;
         }
         let is_assoc = self.assoc_names.contains(name);
+        // Everything on the right is expanded *before* the old value is
+        // thrown away. `a=("${a[@]}" 3)` has to see the array it is
+        // replacing, and clearing first meant it saw an empty one: the
+        // array became whatever was literal in the list, so the
+        // idiomatic `a=("${a[@]/x/y}")` emptied it outright.
+        //
+        // One *field* per element, not one word of source text:
+        // `b=("${a[@]}")` has to copy the array, and `c=($unquoted)`
+        // has to split.
+        enum Staged {
+            Positional(Vec<String>),
+            Keyed(String, String),
+        }
+        let mut staged: Vec<Staged> = Vec::with_capacity(items.len());
+        for item in items {
+            match item {
+                ArrayLiteralItem::Positional(w) => staged.push(Staged::Positional(self.expand_words(std::slice::from_ref(w)))),
+                ArrayLiteralItem::Keyed(index, w) => {
+                    let v = self.expand_word(w);
+                    staged.push(Staged::Keyed(index.clone(), v));
+                }
+            }
+        }
         if mode == AssignMode::Set {
             if is_assoc {
                 self.assoc_arrays.insert(name.to_string(), OrderedMap::default());
@@ -9188,15 +9211,10 @@ impl Shell {
             AssignMode::Append if !is_assoc => self.arrays.get(name).and_then(|m| m.keys().next_back()).map(|k| k + 1).unwrap_or(0),
             _ => 0,
         };
-        for item in items {
+        for item in staged {
             match item {
-                ArrayLiteralItem::Positional(w) => {
-                    // One *field* per element, not one word of source
-                    // text: `b=("${a[@]}")` has to copy the array, and
-                    // `c=($unquoted)` has to split. Expanding the item
-                    // to a single string is what made both of those a
-                    // single element holding `1 2 3`.
-                    for v in self.expand_words(std::slice::from_ref(w)) {
+                Staged::Positional(values) => {
+                    for v in values {
                         if is_assoc {
                             self.assoc_arrays.entry(name.to_string()).or_default().insert(next_index.to_string(), v);
                         } else {
@@ -9205,9 +9223,8 @@ impl Shell {
                         next_index += 1;
                     }
                 }
-                ArrayLiteralItem::Keyed(index, w) => {
-                    let v = self.expand_word(w);
-                    if let Some(idx) = self.array_set_index(name, index, v) {
+                Staged::Keyed(index, v) => {
+                    if let Some(idx) = self.array_set_index(name, &index, v) {
                         next_index = idx + 1;
                     }
                 }
@@ -9476,7 +9493,14 @@ impl Shell {
         if raw.trim().is_empty() {
             return Ok(0);
         }
-        if raw.contains("$(") || raw.contains('`') || raw.contains("${") {
+        // Any `$` at all, not just `$(`/`${`. A bare `$x` was left for
+        // arith.rs to read as a variable, which works where it stands
+        // alone -- and not where it is part of a larger token:
+        // `$((10#$x))`, the idiom for forcing base ten on a
+        // zero-padded number, reached the lexer as `10#$x` and failed
+        // with "invalid integer constant". bash expands the whole
+        // expression before evaluating any of it.
+        if raw.contains('$') || raw.contains('`') {
             let expanded = self.expand_raw(raw);
             if expanded.trim().is_empty() {
                 return Ok(0);
