@@ -139,6 +139,21 @@ struct SessionState {
     // mode line and, once one's just run, from normal mode's own
     // pending-overlay state (run_normal_mode_navigation).
     command_transcript: Vec<TranscriptEntry>,
+    // Commands to run in this session as if they had been typed at its
+    // prompt and submitted -- `::bish window split <cmd>` and `window
+    // new <cmd>`, tmux's `split-window`/`new-window` taking a command.
+    //
+    // Fed back in at the read that would otherwise have waited for a
+    // keystroke (see `run`'s own `pending_input` arm) rather than run
+    // directly, which is what makes them ordinary commands: history
+    // expansion, multi-line accumulation, job control and the window
+    // actions all come along for free, and an interactive program gets
+    // the same drive loop it would have had if someone had sat down and
+    // typed it.
+    //
+    // A queue rather than one slot so a caller can hand over more than
+    // one line at a time, in order.
+    pending_input: std::collections::VecDeque<String>,
 }
 
 // A window: a set of panes (only ever more than one after `window
@@ -403,6 +418,7 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
             dir_history: vec![root_cwd],
             dir_history_index: 0,
             command_transcript: Vec::new(),
+            pending_input: std::collections::VecDeque::new(),
         },
     );
     // Everything the window manager keeps for as long as this loop runs
@@ -679,45 +695,58 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
         // `app`, so an argument that reads a field of it has to have
         // been read already.
         let promoted = app.sinks_are_grid;
-        let outcome = app.with_registers(|app, registers| {
-            editor::read_line(
-                &prompt_str,
-                &session_history,
-                false,
-                app.sinks_are_grid,
-                pending_initial.take(),
-                col_origin,
-                width,
-                highlight_ctx,
-                Some(&shell_completion),
-                Some(&arith_suggestion),
-                menu_capable,
-                row_origin,
-                registers,
-                &abbrs_snapshot,
-                global_row_size,
-                // Repaints the panes when something arrived underneath this
-                // prompt (a background job's output, a session client
-                // reattaching) and tells read_line to put its own prompt line
-                // back on top -- neither half can do the other's, which is
-                // why the signal is threaded through rather than either side
-                // just redrawing everything.
-                || {
-                    let changed = service_background_jobs(app);
-                    if changed && app.sinks_are_grid {
-                        compositor_redraw(app);
-                    }
-                    changed
-                },
-                prompt_claims_mouse(mouse, promoted),
-                // The shell prompt is not one of the modes `::bish map`
-                // knows -- an inert table keeps it behaving exactly as it
-                // did before there were any mappings, and nothing can have
-                // queued keys for it.
-                Vec::new(),
-                Vec::new(),
-            )
-        });
+        // A command handed to this session by `window split <cmd>` /
+        // `window new <cmd>` stands in for the read that would
+        // otherwise have waited for a keystroke -- see
+        // SessionState::pending_input for why it arrives as an ordinary
+        // Line rather than being run directly.
+        let injected = app.sessions.get_mut(&session_id).unwrap().pending_input.pop_front();
+        let outcome = match injected {
+            // No echo of the prompt and the command here: the ordinary
+            // Line path already writes both into this session's grid on
+            // its way to running it, so a pane opened this way reads
+            // exactly like one where somebody typed it.
+            Some(line) => Ok(ReadOutcome::Line(line)),
+            None => app.with_registers(|app, registers| {
+                editor::read_line(
+                    &prompt_str,
+                    &session_history,
+                    false,
+                    app.sinks_are_grid,
+                    pending_initial.take(),
+                    col_origin,
+                    width,
+                    highlight_ctx,
+                    Some(&shell_completion),
+                    Some(&arith_suggestion),
+                    menu_capable,
+                    row_origin,
+                    registers,
+                    &abbrs_snapshot,
+                    global_row_size,
+                    // Repaints the panes when something arrived underneath this
+                    // prompt (a background job's output, a session client
+                    // reattaching) and tells read_line to put its own prompt line
+                    // back on top -- neither half can do the other's, which is
+                    // why the signal is threaded through rather than either side
+                    // just redrawing everything.
+                    || {
+                        let changed = service_background_jobs(app);
+                        if changed && app.sinks_are_grid {
+                            compositor_redraw(app);
+                        }
+                        changed
+                    },
+                    prompt_claims_mouse(mouse, promoted),
+                    // The shell prompt is not one of the modes `::bish map`
+                    // knows -- an inert table keeps it behaving exactly as it
+                    // did before there were any mappings, and nothing can have
+                    // queued keys for it.
+                    Vec::new(),
+                    Vec::new(),
+                )
+            }),
+        };
         match outcome {
             Ok(ReadOutcome::Eof) => {
                 // Whether closing *this* (window, top-frame) reference
@@ -1532,6 +1561,7 @@ fn run_edit_impl(targets: &[fileeditor::EditTarget], attach_debug: bool) -> i32 
             dir_history: vec![root_cwd],
             dir_history_index: 0,
             command_transcript: Vec::new(),
+            pending_input: std::collections::VecDeque::new(),
         },
     );
     // The same state the interactive shell keeps -- see `App`. `bish
@@ -3056,6 +3086,16 @@ fn freeze_focused_idle_prompt(app: &mut App) {
     }
 }
 
+// Hands a `window new <cmd>` / `window split <cmd>` command to the
+// session that was just created for it. Nothing happens here beyond
+// queueing: the command runs at that session's next prompt, through the
+// ordinary typed-a-line path -- see SessionState::pending_input.
+fn queue_pending_input(app: &mut App, session: SessionId, command: Option<String>) {
+    if let Some(command) = command {
+        app.sessions.get_mut(&session).expect("the session was just inserted").pending_input.push_back(command);
+    }
+}
+
 fn apply_window_action(app: &mut App, action: WindowAction) {
     ensure_promoted(&mut app.sessions, &mut app.sinks_are_grid);
     freeze_focused_idle_prompt(app);
@@ -3067,7 +3107,7 @@ fn apply_window_action(app: &mut App, action: WindowAction) {
         WindowAction::Previous => {
             app.current_window = (app.current_window + app.windows.len() - 1) % app.windows.len();
         }
-        WindowAction::New { name } => {
+        WindowAction::New { name, command } => {
             let parent_id = app.windows[app.current_window].owning_session();
             let child_history = Rc::new(RefCell::new(app.sessions[&parent_id].history.borrow().fork()));
             let mut child_shell = app.sessions[&parent_id].shell.new_virtual_child();
@@ -3106,6 +3146,7 @@ fn apply_window_action(app: &mut App, action: WindowAction) {
                     dir_history: vec![child_cwd],
                     dir_history_index: 0,
                     command_transcript: Vec::new(),
+                    pending_input: std::collections::VecDeque::new(),
                 },
             );
             let wid = app.next_window_id;
@@ -3114,6 +3155,7 @@ fn apply_window_action(app: &mut App, action: WindowAction) {
             window.name = name;
             app.windows.push(window);
             app.current_window = app.windows.len() - 1;
+            queue_pending_input(app, sid, command);
         }
         // The three that make a workflow scriptable: something to call a
         // window, a way to see what is there, and a way to ask for one
@@ -3197,9 +3239,10 @@ fn apply_window_action(app: &mut App, action: WindowAction) {
         // layout, and a zoom hides both: whatever it did would happen
         // underneath the one pane on screen, invisibly. So each of them
         // puts the split back first, which is what tmux does too.
-        WindowAction::Split { horizontal } => {
+        WindowAction::Split { horizontal, command } => {
             app.windows[app.current_window].unzoom();
-            split_focused_pane(app, horizontal);
+            let sid = split_focused_pane(app, horizontal);
+            queue_pending_input(app, sid, command);
         }
         WindowAction::FocusPane(direction) => {
             app.windows[app.current_window].unzoom();
@@ -3237,7 +3280,7 @@ fn apply_window_action(app: &mut App, action: WindowAction) {
 // how `horizontal` maps to the divider's orientation, and
 // insert_sibling for why repeated same-direction splits stay flat (N
 // evenly sized panes) rather than progressively halving.
-fn split_focused_pane(app: &mut App, horizontal: bool) {
+fn split_focused_pane(app: &mut App, horizontal: bool) -> SessionId {
     let parent_id = app.windows[app.current_window].owning_session();
     let child_history = Rc::new(RefCell::new(app.sessions[&parent_id].history.borrow().fork()));
     let mut child_shell = app.sessions[&parent_id].shell.new_virtual_child();
@@ -3273,6 +3316,7 @@ fn split_focused_pane(app: &mut App, horizontal: bool) {
             dir_history: vec![child_cwd],
             dir_history_index: 0,
             command_transcript: Vec::new(),
+            pending_input: std::collections::VecDeque::new(),
         },
     );
 
@@ -3293,6 +3337,7 @@ fn split_focused_pane(app: &mut App, horizontal: bool) {
         freeze_idle_prompt(app.sessions.get_mut(&parent_id).unwrap());
     }
     app.windows[app.current_window].focused_pane = new_pane_id;
+    sid
 }
 
 // `:diag`'s own sibling to split_focused_pane, just above -- same
@@ -3341,6 +3386,7 @@ fn split_diagnostics_pane(app: &mut App, edit_frame_id: EditFrameId) -> PaneId {
             dir_history: vec![child_cwd],
             dir_history_index: 0,
             command_transcript: Vec::new(),
+            pending_input: std::collections::VecDeque::new(),
         },
     );
 
@@ -3387,6 +3433,7 @@ fn split_locations_pane(app: &mut App, edit_frame_id: EditFrameId) -> PaneId {
             dir_history: vec![child_cwd],
             dir_history_index: 0,
             command_transcript: Vec::new(),
+            pending_input: std::collections::VecDeque::new(),
         },
     );
     let window = &mut app.windows[app.current_window];
@@ -3482,6 +3529,7 @@ fn split_debug_run_pane(app: &mut App, edit_frame_id: EditFrameId) -> (PaneId, R
             dir_history: vec![child_cwd],
             dir_history_index: 0,
             command_transcript: Vec::new(),
+            pending_input: std::collections::VecDeque::new(),
         },
     );
 
@@ -5652,10 +5700,10 @@ fn window_cmd_to_action(cmd: WindowCmd) -> WindowAction {
     match cmd {
         WindowCmd::Next => WindowAction::Next,
         WindowCmd::Previous => WindowAction::Previous,
-        WindowCmd::New => WindowAction::New { name: None },
+        WindowCmd::New => WindowAction::New { name: None, command: None },
         WindowCmd::Close => WindowAction::Close,
-        WindowCmd::Split => WindowAction::Split { horizontal: false },
-        WindowCmd::VSplit => WindowAction::Split { horizontal: true },
+        WindowCmd::Split => WindowAction::Split { horizontal: false, command: None },
+        WindowCmd::VSplit => WindowAction::Split { horizontal: true, command: None },
         WindowCmd::FocusLeft => WindowAction::FocusPane(PaneDirection::Left),
         WindowCmd::FocusDown => WindowAction::FocusPane(PaneDirection::Down),
         WindowCmd::FocusUp => WindowAction::FocusPane(PaneDirection::Up),
@@ -13275,6 +13323,7 @@ mod compositor_frame_output_tests {
             dir_history: Vec::new(),
             dir_history_index: 0,
             command_transcript: Vec::new(),
+            pending_input: std::collections::VecDeque::new(),
         };
         freeze_interrupted_line(&mut session, "echo hi");
         let row0: String = (0..40).map(|c| screen.borrow().cell(0, c).ch).collect::<String>().trim_end().to_string();

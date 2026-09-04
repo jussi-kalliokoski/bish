@@ -1038,12 +1038,15 @@ pub const HOOK_EVENT_HELP: &[(&str, &str)] = &[
 
 #[derive(Debug, Clone)]
 pub enum WindowAction {
-    /// `window create [--name NAME]`. A name is what the tab bar shows
-    /// for this window instead of its cwd, and what `window select`
-    /// finds it by -- the two halves of making a workflow scriptable:
-    /// something to call a window, and a way to ask for it back.
+    /// `window create [--name NAME] [--] [COMMAND...]`. A name is what
+    /// the tab bar shows for this window instead of its cwd, and what
+    /// `window select` finds it by -- the two halves of making a
+    /// workflow scriptable: something to call a window, and a way to
+    /// ask for it back. A command runs in the new window's shell as if
+    /// it had been typed there, tmux's `new-window <cmd>`.
     New {
         name: Option<String>,
+        command: Option<String>,
     },
     /// `window rename [NAME]` -- the current window. No name clears it
     /// back to showing the cwd, which is what an unnamed window shows.
@@ -1078,6 +1081,10 @@ pub enum WindowAction {
     // PaneLayout for how the split tree itself is represented.
     Split {
         horizontal: bool,
+        // A command to run in the new pane's shell as if it had been
+        // typed there -- tmux's `split-window <cmd>`, the invocation
+        // that makes a split worth scripting.
+        command: Option<String>,
     },
     // `window h/left`, `j/below`, `k/above`, `l/right`: move focus to
     // the nearest pane in that direction from the currently focused

@@ -819,6 +819,55 @@ pub(crate) fn run_abbr(sh: &mut Shell, args: &[String]) -> i32 {
 // actually there to act on it, since `ExecResult::Window` is a
 // signal `run_program` stops on and letting one escape from `bish
 // script.sh` would end the script for no reason.
+// `window create [--name NAME] [--] [COMMAND...]` -- the name, and the
+// command to run in the new window, either of which may be absent.
+//
+// `--name` stays greedy to the end of the arguments, so `window create
+// --name my project` still names a window "my project" the way it
+// always has; `--` is what ends it, and everything after is the
+// command. Without `--name` there is nothing to be greedy about, so a
+// bare `window create make` is simply the command -- which used to be
+// an error, so nothing that worked before means anything different now.
+fn parse_new_args(rest: &[String]) -> Result<(Option<String>, Option<String>), &'static str> {
+    match rest.first().map(String::as_str) {
+        None => Ok((None, None)),
+        Some("--") => Ok((None, joined(&rest[1..]))),
+        Some("--name") | Some("-n") => match rest[1..].iter().position(|a| a == "--") {
+            Some(at) => match joined(&rest[1..1 + at]) {
+                Some(name) => Ok((Some(name), joined(&rest[2 + at..]))),
+                None => Err("--name needs a name"),
+            },
+            None => match joined(&rest[1..]) {
+                Some(name) => Ok((Some(name), None)),
+                None => Err("--name needs a name"),
+            },
+        },
+        Some(_) => Ok((None, joined(rest))),
+    }
+}
+
+// `window split`/`vsplit [--] [COMMAND...]`. Neither took an argument
+// before, so every spelling here is new ground; `--` is accepted purely
+// so a command starting with a dash can be written without the
+// shell-flag question ever coming up.
+fn parse_split_command(rest: &[String]) -> Option<String> {
+    match rest.first().map(String::as_str) {
+        Some("--") => joined(&rest[1..]),
+        _ => joined(rest),
+    }
+}
+
+// Arguments back into one command line, the way `window rename` has
+// always rejoined a name. Quoting is lost -- `split echo "a  b"` runs
+// `echo a b` -- which is what tmux does with the same shape, and what
+// a single quoted argument (`split 'echo "a  b"'`) is for.
+fn joined(parts: &[String]) -> Option<String> {
+    match parts.is_empty() {
+        true => None,
+        false => Some(parts.join(" ")),
+    }
+}
+
 pub(crate) fn run_window(sh: &mut Shell, args: &[String]) -> ExecResult {
     let result = run_window_inner(sh, args);
     if matches!(result, ExecResult::Window(_)) && !sh.windows_available && !sh.restrict_to_builtins {
@@ -829,30 +878,16 @@ pub(crate) fn run_window(sh: &mut Shell, args: &[String]) -> ExecResult {
 }
 
 pub(crate) fn run_window_inner(sh: &mut Shell, args: &[String]) -> ExecResult {
-    fn parse_window_name(shell: &mut Shell, subcommand: &str, rest: &[String]) -> Result<Option<String>, i32> {
-        match rest.first().map(String::as_str) {
-            None => Ok(None),
-            Some("--name") | Some("-n") => match rest.len() {
-                1 => {
-                    sh_eprintln!(shell, "bish: window: {subcommand}: --name needs a name");
-                    Err(2)
-                }
-                _ => Ok(Some(rest[1..].join(" "))),
-            },
-            Some(other) => {
-                sh_eprintln!(shell, "bish: window: {subcommand}: unexpected argument '{other}' (expected --name NAME)");
-                Err(2)
-            }
-        }
-    }
-
     sh.promote_if_needed();
     match args.first().map(String::as_str) {
         Some("next") | Some("n") => ExecResult::Window(WindowAction::Next),
         Some("previous") | Some("prev") | Some("p") => ExecResult::Window(WindowAction::Previous),
-        Some("new") | Some("c") | Some("create") => match parse_window_name(sh, "create", &args[1..]) {
-            Ok(name) => ExecResult::Window(WindowAction::New { name }),
-            Err(status) => ExecResult::Status(status),
+        Some("new") | Some("c") | Some("create") => match parse_new_args(&args[1..]) {
+            Ok((name, command)) => ExecResult::Window(WindowAction::New { name, command }),
+            Err(msg) => {
+                sh_eprintln!(sh, "bish: window: create: {msg}");
+                ExecResult::Status(2)
+            }
         },
         Some("rename") | Some("ren") => match args.get(1) {
             // A bare `window rename` clears the name; anything else
@@ -908,8 +943,8 @@ pub(crate) fn run_window_inner(sh: &mut Shell, args: &[String]) -> ExecResult {
         // maps to horizontal:false (side by side) and `vsplit`/`v`
         // to horizontal:true (stacked), even though that looks
         // inverted next to the field's own name.
-        Some("split") | Some("s") => ExecResult::Window(WindowAction::Split { horizontal: false }),
-        Some("vsplit") | Some("v") => ExecResult::Window(WindowAction::Split { horizontal: true }),
+        Some("split") | Some("s") => ExecResult::Window(WindowAction::Split { horizontal: false, command: parse_split_command(&args[1..]) }),
+        Some("vsplit") | Some("v") => ExecResult::Window(WindowAction::Split { horizontal: true, command: parse_split_command(&args[1..]) }),
         Some("h") | Some("left") => ExecResult::Window(WindowAction::FocusPane(PaneDirection::Left)),
         Some("j") | Some("below") => ExecResult::Window(WindowAction::FocusPane(PaneDirection::Down)),
         Some("k") | Some("above") => ExecResult::Window(WindowAction::FocusPane(PaneDirection::Up)),
@@ -941,7 +976,7 @@ pub(crate) fn run_window_inner(sh: &mut Shell, args: &[String]) -> ExecResult {
         None => {
             sh_eprintln!(
                 sh,
-                "bish: window: missing subcommand (next(n)/previous/new(c,create)/close(q,quit)/split(s)/vsplit(v)/h(left)/j(below)/k(above)/l(right)/zoom(z)/=(balance)/_(minimize)/+(sizeup)/-(sizedown)/size <N|N%,N/M>/fg <id>)"
+                "bish: window: missing subcommand (next(n)/previous/new(c,create) [--name NAME] [-- CMD]/close(q,quit)/split(s) [CMD]/vsplit(v) [CMD]/h(left)/j(below)/k(above)/l(right)/zoom(z)/=(balance)/_(minimize)/+(sizeup)/-(sizedown)/size <N|N%,N/M>/fg <id>)"
             );
             ExecResult::Status(2)
         }
@@ -990,4 +1025,53 @@ pub(crate) fn run_bish_theme_end(sh: &mut Shell) -> i32 {
     };
     sh.themes.insert(name, pending);
     0
+}
+
+#[cfg(test)]
+mod window_argument_tests {
+    use super::*;
+
+    fn args(line: &str) -> Vec<String> {
+        line.split_whitespace().map(str::to_string).collect()
+    }
+
+    #[test]
+    fn a_bare_argument_is_the_command_to_run() {
+        assert_eq!(parse_new_args(&args("make -j8")), Ok((None, Some("make -j8".to_string()))));
+        assert_eq!(parse_split_command(&args("make -j8")), Some("make -j8".to_string()));
+    }
+
+    #[test]
+    fn nothing_at_all_is_still_a_plain_new_window() {
+        assert_eq!(parse_new_args(&[]), Ok((None, None)));
+        assert_eq!(parse_split_command(&[]), None);
+    }
+
+    #[test]
+    fn name_stays_greedy_so_an_unquoted_name_still_works() {
+        // What `window create --name my project` has always meant. A
+        // command argument that silently stole the second word would
+        // rename every window anyone had already scripted.
+        assert_eq!(parse_new_args(&args("--name my project")), Ok((Some("my project".to_string()), None)));
+    }
+
+    #[test]
+    fn a_double_dash_is_what_ends_the_name() {
+        assert_eq!(parse_new_args(&args("--name build -- make -j8")), Ok((Some("build".to_string()), Some("make -j8".to_string()))));
+        assert_eq!(parse_new_args(&args("-n build -- make")), Ok((Some("build".to_string()), Some("make".to_string()))));
+    }
+
+    #[test]
+    fn a_leading_double_dash_means_the_rest_is_all_command() {
+        // How a command that starts with a dash gets written without
+        // ever raising the question of whether it is a flag.
+        assert_eq!(parse_new_args(&args("-- ls -d /etc")), Ok((None, Some("ls -d /etc".to_string()))));
+        assert_eq!(parse_split_command(&args("-- ls -d /etc")), Some("ls -d /etc".to_string()));
+    }
+
+    #[test]
+    fn a_name_flag_with_no_name_is_an_error() {
+        assert_eq!(parse_new_args(&args("--name")), Err("--name needs a name"));
+        assert_eq!(parse_new_args(&args("--name -- make")), Err("--name needs a name"));
+    }
 }
