@@ -1451,10 +1451,11 @@ mod tests {
     // ...whereas for scp it is: either end of a copy can be local.
     #[test]
     fn scp_completes_files_as_well_as_hosts() {
-        let dir = std::env::temp_dir().join(format!("bish-completion-scp-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("zzz-local.txt"), "").unwrap();
+        // The guard owns the directory and removes it when this test
+        // returns; `dir` is just the path the provider needs.
+        let guard = crate::tempdir::TempDir::new("completion-scp-test");
+        std::fs::write(guard.join("zzz-local.txt"), "").unwrap();
+        let dir = guard.path().to_path_buf();
         let provider = ShellCompletionProvider {
             cwd: Some(&dir),
             known_functions: None,

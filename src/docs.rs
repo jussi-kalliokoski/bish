@@ -537,9 +537,10 @@ fn hover_lines_for_flag(command: &str, flag: &str) -> Vec<String> {
 mod tests {
     use super::*;
 
-    fn write_temp(name: &str, contents: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("bish-docs-tests-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
+    /// Writes one file into `dir`, which owns it: these tests used to
+    /// share a single directory named after the process and never
+    /// remove it, so every run of the suite left one behind.
+    fn write_temp(dir: &crate::tempdir::TempDir, name: &str, contents: &str) -> PathBuf {
         let path = dir.join(name);
         std::fs::write(&path, contents).unwrap();
         path
@@ -547,7 +548,8 @@ mod tests {
 
     #[test]
     fn a_comment_block_directly_above_a_function_becomes_its_doc() {
-        let path = write_temp("fn1.sh", "# greet prints a friendly greeting.\n# name: who to greet.\ngreet() {\n    echo \"hi $1\"\n}\n");
+        let dir = crate::tempdir::TempDir::new("docs-tests");
+        let path = write_temp(&dir, "fn1.sh", "# greet prints a friendly greeting.\n# name: who to greet.\ngreet() {\n    echo \"hi $1\"\n}\n");
         let index = DocIndex::build_from_source(&std::fs::read_to_string(&path).unwrap(), &path);
         let doc = index.lookup("greet").expect("greet should have a doc");
         assert!(matches!(doc.kind, SymbolKind::Function));
@@ -556,14 +558,16 @@ mod tests {
 
     #[test]
     fn a_blank_line_between_the_comment_and_the_declaration_breaks_the_attachment() {
-        let path = write_temp("fn2.sh", "# not attached, a blank line separates this from the function\n\ngreet() {\n    echo hi\n}\n");
+        let dir = crate::tempdir::TempDir::new("docs-tests");
+        let path = write_temp(&dir, "fn2.sh", "# not attached, a blank line separates this from the function\n\ngreet() {\n    echo hi\n}\n");
         let index = DocIndex::build_from_source(&std::fs::read_to_string(&path).unwrap(), &path);
         assert!(index.lookup("greet").is_none());
     }
 
     #[test]
     fn a_top_level_bare_assignment_can_have_a_doc_too() {
-        let path = write_temp("var1.sh", "# MAX_RETRIES caps how many times we retry.\nMAX_RETRIES=3\n");
+        let dir = crate::tempdir::TempDir::new("docs-tests");
+        let path = write_temp(&dir, "var1.sh", "# MAX_RETRIES caps how many times we retry.\nMAX_RETRIES=3\n");
         let index = DocIndex::build_from_source(&std::fs::read_to_string(&path).unwrap(), &path);
         let doc = index.lookup("MAX_RETRIES").expect("MAX_RETRIES should have a doc");
         assert!(matches!(doc.kind, SymbolKind::Variable));
@@ -572,17 +576,17 @@ mod tests {
 
     #[test]
     fn a_declare_form_assignment_is_recognized_too() {
-        let path = write_temp("var2.sh", "# TIMEOUT bounds how long we wait.\ndeclare -i TIMEOUT=30\n");
+        let dir = crate::tempdir::TempDir::new("docs-tests");
+        let path = write_temp(&dir, "var2.sh", "# TIMEOUT bounds how long we wait.\ndeclare -i TIMEOUT=30\n");
         let index = DocIndex::build_from_source(&std::fs::read_to_string(&path).unwrap(), &path);
         assert!(index.lookup("TIMEOUT").is_some());
     }
 
     #[test]
     fn source_with_a_static_path_is_followed_into_the_sourced_file() {
-        let dir = std::env::temp_dir().join(format!("bish-docs-tests-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
+        let dir = crate::tempdir::TempDir::new("docs-tests");
         std::fs::write(dir.join("lib.sh"), "# helper does the real work.\nhelper() {\n    echo helping\n}\n").unwrap();
-        let entry = write_temp("main1.sh", "source lib.sh\nhelper\n");
+        let entry = write_temp(&dir, "main1.sh", "source lib.sh\nhelper\n");
         let index = DocIndex::build_from_source(&std::fs::read_to_string(&entry).unwrap(), &entry);
         let doc = index.lookup("helper").expect("helper should be found via source");
         assert_eq!(doc.doc, vec!["helper does the real work.".to_string()]);
@@ -590,20 +594,18 @@ mod tests {
 
     #[test]
     fn source_with_a_dynamic_path_is_not_followed() {
-        let dir = std::env::temp_dir().join(format!("bish-docs-tests-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
+        let dir = crate::tempdir::TempDir::new("docs-tests");
         std::fs::write(dir.join("dynlib.sh"), "# helper2 also does real work.\nhelper2() {\n    echo helping\n}\n").unwrap();
-        let entry = write_temp("main2.sh", "LIB_DIR=\"$PWD\"\nsource \"$LIB_DIR/dynlib.sh\"\n");
+        let entry = write_temp(&dir, "main2.sh", "LIB_DIR=\"$PWD\"\nsource \"$LIB_DIR/dynlib.sh\"\n");
         let index = DocIndex::build_from_source(&std::fs::read_to_string(&entry).unwrap(), &entry);
         assert!(index.lookup("helper2").is_none());
     }
 
     #[test]
     fn the_entry_files_own_symbol_wins_over_a_same_named_sourced_one() {
-        let dir = std::env::temp_dir().join(format!("bish-docs-tests-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
+        let dir = crate::tempdir::TempDir::new("docs-tests");
         std::fs::write(dir.join("lib3.sh"), "# from the library.\nshared() { :; }\n").unwrap();
-        let entry = write_temp("main3.sh", "# from the entry script.\nshared() { :; }\nsource lib3.sh\n");
+        let entry = write_temp(&dir, "main3.sh", "# from the entry script.\nshared() { :; }\nsource lib3.sh\n");
         let index = DocIndex::build_from_source(&std::fs::read_to_string(&entry).unwrap(), &entry);
         assert_eq!(index.lookup("shared").unwrap().doc, vec!["from the entry script.".to_string()]);
     }

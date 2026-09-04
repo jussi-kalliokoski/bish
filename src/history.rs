@@ -990,13 +990,16 @@ mod tests {
         assert_eq!(entries[1].prev, Some("git status"));
     }
 
-    // A real file, not a $HOME override -- see load_at.
-    fn temp_history(tag: &str, contents: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("bish-hist-{}-{}", tag, std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+    /// A real file, not a $HOME override -- see load_at.
+    ///
+    /// The directory comes back with the path because it owns it: this
+    /// used to leave one behind on every run, named after the tag and
+    /// the process, and nothing ever removed them.
+    fn temp_history(tag: &str, contents: &str) -> (crate::tempdir::TempDir, PathBuf) {
+        let dir = crate::tempdir::TempDir::new(&format!("hist-{tag}"));
         let path = dir.join("history");
         std::fs::write(&path, contents).unwrap();
-        path
+        (dir, path)
     }
 
     #[test]
@@ -1005,7 +1008,7 @@ mod tests {
         // cwd-less record(): a disk entry now carries a cwd of its own,
         // so "no cwd" stopped being a stand-in for "came from disk" and
         // `live` is the real distinction.
-        let path = temp_history("first-live", " : --id 00000000000000a1 -d '/tmp/proj'; some old command\n");
+        let (_dir, path) = temp_history("first-live", " : --id 00000000000000a1 -d '/tmp/proj'; some old command\n");
         let mut h = History::load_at(Some(path), 100);
         assert_eq!(h.entries()[0].cwd, Some(Path::new("/tmp/proj")), "a loaded entry keeps its directory");
 
@@ -1022,7 +1025,7 @@ mod tests {
     fn a_reloaded_entry_keeps_the_command_it_actually_followed() {
         // The point of writing a parent id at all: this used to be
         // unrecoverable, and every reloaded entry ranked `Legacy`.
-        let path = temp_history(
+        let (_dir, path) = temp_history(
             "parents",
             " : --id 000000000000000a -d '/w'; git add -A\n : --id 000000000000000b -p 000000000000000a -d '/w'; git commit\n",
         );
@@ -1037,7 +1040,8 @@ mod tests {
         // Truncation orphans branches rather than a clean prefix, so an
         // unresolvable parent has to be ordinary. `-p ...0a` survives
         // into the kept window with nothing to point at.
-        let path = temp_history("orphan", " : --id 000000000000000a -d '/w'; oldest\n : --id 000000000000000b -p 000000000000000a -d '/w'; newest\n");
+        let (_dir, path) =
+            temp_history("orphan", " : --id 000000000000000a -d '/w'; oldest\n : --id 000000000000000b -p 000000000000000a -d '/w'; newest\n");
         let h = History::load_at(Some(path), 1);
         let entries = h.entries();
         assert_eq!(entries.len(), 1, "the bound is in entries");
@@ -1048,7 +1052,7 @@ mod tests {
     #[test]
     fn loading_past_the_bound_rewrites_the_file_to_it() {
         let lines: String = (0..10).map(|i| format!(" : --id {i:016x} -d '/w'; echo {i}\n")).collect();
-        let path = temp_history("trim", &lines);
+        let (_dir, path) = temp_history("trim", &lines);
         let h = History::load_at(Some(path.clone()), 4);
         assert_eq!(h.entries().len(), 4);
         let on_disk = std::fs::read_to_string(&path).unwrap();
@@ -1063,7 +1067,7 @@ mod tests {
         // The other half of the bound. Trimming at load covers every
         // ordinary shell; a session detached for weeks never reaches
         // one, and used to grow without limit.
-        let path = temp_history("highwater", "");
+        let (_dir, path) = temp_history("highwater", "");
         let mut h = History::load_at(Some(path.clone()), 4);
         for i in 0..12 {
             h.record(&format!("echo {i}"), Some(Path::new("/w")));
@@ -1083,7 +1087,7 @@ mod tests {
     fn a_legacy_bare_line_still_loads_as_a_command() {
         // The 1,000-odd lines already in everyone's file, and anything
         // an older bish appends to one this version has started writing.
-        let path = temp_history("legacy", "ls -la\ncargo test\n : --id 000000000000000c -d '/w'; git status\n");
+        let (_dir, path) = temp_history("legacy", "ls -la\ncargo test\n : --id 000000000000000c -d '/w'; git status\n");
         let h = History::load_at(Some(path), 100);
         let entries = h.entries();
         assert_eq!(entries.iter().map(|e| e.text).collect::<Vec<_>>(), vec!["ls -la", "cargo test", "git status"]);

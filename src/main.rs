@@ -45,6 +45,7 @@ mod serialize;
 mod session;
 mod stackguard;
 mod suggest;
+mod tempdir;
 mod term;
 mod theme;
 mod time;

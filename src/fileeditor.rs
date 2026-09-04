@@ -5618,17 +5618,18 @@ mod diagnose_tests {
     // one, so a real `.bash` temp file is what actually exercises
     // diagnose_buffer's language gate, the same way textbuffer.rs's own
     // `open_and_save_round_trip_a_real_file` test does for `open`/`save`.
-    fn temp_bash_buffer(tag: &str, text: &str) -> TextBuffer {
-        let dir = std::env::temp_dir().join(format!("bish-fileeditor-diag-test-{}-{tag}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+    /// The directory comes back with the buffer because it owns it:
+    /// the file has to outlive this call, and nothing was removing it.
+    fn temp_bash_buffer(tag: &str, text: &str) -> (crate::tempdir::TempDir, TextBuffer) {
+        let dir = crate::tempdir::TempDir::new(&format!("fileeditor-diag-test-{tag}"));
         let path = dir.join("script.bash");
         std::fs::write(&path, text).unwrap();
-        TextBuffer::open(&path, 10).unwrap()
+        (dir, TextBuffer::open(&path, 10).unwrap())
     }
 
     #[test]
     fn diagnose_buffer_runs_the_bash_linter_against_a_bash_file() {
-        let buf = temp_bash_buffer("basic", "echo $foo\n");
+        let (_dir, buf) = temp_bash_buffer("basic", "echo $foo\n");
         let diags = diagnose_buffer(&buf);
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0].code, "unquoted-expansion");
@@ -5690,7 +5691,7 @@ mod diagnose_tests {
 
     #[test]
     fn a_real_edit_clears_previously_computed_diagnostics() {
-        let mut buf = temp_bash_buffer("clears", "echo $foo\n");
+        let (_dir, mut buf) = temp_bash_buffer("clears", "echo $foo\n");
         buf.diagnostics = diagnose_buffer(&buf);
         assert!(!buf.diagnostics.is_empty());
         buf.insert_text((0, 0), "x");
