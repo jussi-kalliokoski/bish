@@ -23,8 +23,8 @@ const THEME_SUBCOMMANDS: &[&str] = &["begin", "end"];
 // mistyped single character is a near miss for most of them, so the
 // answer would be arbitrary.
 const WINDOW_SUBCOMMANDS: &[&str] = &[
-    "next", "previous", "new", "create", "close", "quit", "split", "vsplit", "left", "below", "above", "right", "balance", "minimize", "sizeup",
-    "sizedown", "size", "fg",
+    "next", "previous", "new", "create", "close", "quit", "split", "vsplit", "left", "below", "above", "right", "zoom", "balance", "minimize",
+    "sizeup", "sizedown", "size", "fg",
 ];
 
 // "theme, window, hook, hl, lsp, map" -- the list as an error message
@@ -914,6 +914,7 @@ pub(crate) fn run_window_inner(sh: &mut Shell, args: &[String]) -> ExecResult {
         Some("j") | Some("below") => ExecResult::Window(WindowAction::FocusPane(PaneDirection::Down)),
         Some("k") | Some("above") => ExecResult::Window(WindowAction::FocusPane(PaneDirection::Up)),
         Some("l") | Some("right") => ExecResult::Window(WindowAction::FocusPane(PaneDirection::Right)),
+        Some("zoom") | Some("z") => ExecResult::Window(WindowAction::Zoom),
         Some("=") | Some("balance") => ExecResult::Window(WindowAction::Balance),
         Some("_") | Some("minimize") => ExecResult::Window(WindowAction::Minimize),
         Some("+") | Some("sizeup") => ExecResult::Window(WindowAction::SizeUp),
@@ -940,7 +941,7 @@ pub(crate) fn run_window_inner(sh: &mut Shell, args: &[String]) -> ExecResult {
         None => {
             sh_eprintln!(
                 sh,
-                "bish: window: missing subcommand (next(n)/previous/new(c,create)/close(q,quit)/split(s)/vsplit(v)/h(left)/j(below)/k(above)/l(right)/=(balance)/_(minimize)/+(sizeup)/-(sizedown)/size <N|N%,N/M>/fg <id>)"
+                "bish: window: missing subcommand (next(n)/previous/new(c,create)/close(q,quit)/split(s)/vsplit(v)/h(left)/j(below)/k(above)/l(right)/zoom(z)/=(balance)/_(minimize)/+(sizeup)/-(sizedown)/size <N|N%,N/M>/fg <id>)"
             );
             ExecResult::Status(2)
         }

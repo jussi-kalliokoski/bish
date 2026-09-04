@@ -1084,6 +1084,11 @@ pub enum WindowAction {
     // one, vim Ctrl-w-hjkl style. A no-op if the current window isn't
     // split, or nothing lies in that direction.
     FocusPane(PaneDirection),
+    /// `::bish window zoom`/`z`, and `<C-w>z`/`<C-w>o`: the focused
+    /// pane fills the whole window until the next zoom toggles it back.
+    /// The split tree underneath is untouched, so unzooming restores
+    /// the arrangement exactly -- see WindowEntry::zoomed.
+    Zoom,
     // `window =`/`balance`: resets every pane's size weight throughout
     // the current window's whole layout tree back to even.
     Balance,

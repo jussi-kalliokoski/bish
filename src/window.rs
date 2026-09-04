@@ -256,6 +256,20 @@ pub(crate) struct WindowEntry {
     // lands on the next frame -- one frame's staleness for a setting
     // nobody changes mid-keystroke.
     pub(crate) divider_budget: usize,
+    // The one pane temporarily filling this whole window, if any --
+    // `<C-w>z`/`<C-w>o`, tmux's `prefix z`. Not a layout change: the
+    // split tree underneath is left exactly as it was, so unzooming
+    // restores the arrangement down to the weights, and -- because
+    // `pane_rect` keeps answering for the hidden panes out of that
+    // untouched tree -- no hidden pane's grid gets resized by a zoom it
+    // cannot be seen through. A grid resize reflows its scrollback,
+    // which is destructive; tmux saves and restores the layout for the
+    // same reason.
+    //
+    // Only ever holds the focused pane (every action that moves focus
+    // clears it first, matching tmux), which is what lets `pane_rect`
+    // treat "not the zoomed pane" and "not visible" as the same case.
+    pub(crate) zoomed: Option<PaneId>,
 }
 
 // What `divider_budget` is when nothing has said otherwise -- the same
@@ -273,7 +287,67 @@ impl WindowEntry {
             focused_pane: 0,
             next_pane_id: 1,
             divider_budget: DEFAULT_DIVIDER_BUDGET,
+            zoomed: None,
         }
+    }
+
+    /// Every pane's rectangle and every divider for this window as it
+    /// stands right now, zoom included.
+    ///
+    /// The only way to get a *window's* geometry: `compute_regions`
+    /// below is the layout-tree half and is deliberately private to
+    /// this module, so no caller outside it can lay a window out as if
+    /// it weren't zoomed by simply forgetting that zoom exists.
+    pub(crate) fn regions(&self, area: Rect, out: &mut Vec<(PaneId, Rect)>, dividers: &mut Vec<Divider>) {
+        match self.zoomed {
+            // A zoomed pane has no siblings on screen to be divided
+            // from, so there is nothing to draw a divider between.
+            Some(id) => out.push((id, area)),
+            None => compute_regions(&self.layout, area, self.focused_pane, self.divider_budget, out, dividers),
+        }
+    }
+
+    /// Adds a pane holding `stack`, splitting the focused one, and
+    /// returns its id. The new pane is deliberately *not* focused --
+    /// an ordinary split wants that and does it itself, the sibling
+    /// panes (diagnostics, locations, a debug run) explicitly don't.
+    ///
+    /// The only way a pane enters a window, which is the point: a
+    /// caller cannot forget that the window might be zoomed (a new pane
+    /// added under a zoom would be invisible, so the split goes back
+    /// first) any more than it can get the SplitChild flags wrong.
+    /// `insert_sibling` below is private for the same reason.
+    pub(crate) fn add_pane(&mut self, stack: Vec<Frame>, horizontal: bool, minimized: bool) -> PaneId {
+        self.unzoom();
+        let new_id = self.next_pane_id;
+        self.next_pane_id += 1;
+        self.panes.push(Pane { id: new_id, stack, jumps: JumpList::default() });
+        let focused = self.focused_pane;
+        let old_layout = std::mem::replace(&mut self.layout, PaneLayout::Leaf(0));
+        self.layout = insert_sibling(old_layout, focused, new_id, horizontal, None, minimized);
+        new_id
+    }
+
+    /// `<C-w>z` / `::bish window zoom`. Returns what the window is now:
+    /// true if the focused pane has just been zoomed, false if a zoom
+    /// was just undone -- or if there was nothing to zoom, since one
+    /// pane already fills its window and toggling would be a no-op
+    /// either way.
+    pub(crate) fn toggle_zoom(&mut self) -> bool {
+        self.zoomed = match self.zoomed {
+            Some(_) => None,
+            None if self.panes.len() > 1 => Some(self.focused_pane),
+            None => None,
+        };
+        self.zoomed.is_some()
+    }
+
+    /// Called by everything that moves focus or reshapes the layout --
+    /// splitting, focusing a neighbour, balancing, resizing. tmux
+    /// unzooms on all of them for the same reason: the effect would
+    /// otherwise happen invisibly, underneath the one pane on screen.
+    pub(crate) fn unzoom(&mut self) {
+        self.zoomed = None;
     }
 
     pub(crate) fn pane(&self, id: PaneId) -> &Pane {
@@ -319,14 +393,7 @@ impl WindowEntry {
 // (compute_regions splits one Split's area evenly among however many
 // children it has) rather than each new split only ever halving
 // whatever was there before.
-pub(crate) fn insert_sibling(
-    layout: PaneLayout,
-    target: PaneId,
-    new_id: PaneId,
-    horizontal: bool,
-    new_fixed: Option<usize>,
-    new_minimized: bool,
-) -> PaneLayout {
+fn insert_sibling(layout: PaneLayout, target: PaneId, new_id: PaneId, horizontal: bool, new_fixed: Option<usize>, new_minimized: bool) -> PaneLayout {
     match layout {
         PaneLayout::Leaf(id) if id == target => PaneLayout::Split {
             horizontal,
@@ -421,6 +488,12 @@ pub(crate) fn close_pane(window: &mut WindowEntry, pane_id: PaneId) {
     window.panes.retain(|p| p.id != pane_id);
     if window.focused_pane == pane_id {
         window.focused_pane = first_leaf(&window.layout);
+    }
+    // A zoom naming a pane that no longer exists would have `regions`
+    // handing out a dead id; a zoom on the last pane standing is
+    // meaningless. Both end the same way.
+    if window.zoomed == Some(pane_id) || window.panes.len() == 1 {
+        window.unzoom();
     }
 }
 
@@ -568,14 +641,7 @@ fn split_sizes(children: &[SplitChild], usable: usize) -> Vec<usize> {
 // Split trying to draw into space a child might otherwise want --
 // skipped entirely between a minimized child and its neighbor (see
 // dividers_after).
-pub(crate) fn compute_regions(
-    layout: &PaneLayout,
-    area: Rect,
-    focused: PaneId,
-    budget: usize,
-    out: &mut Vec<(PaneId, Rect)>,
-    dividers: &mut Vec<Divider>,
-) {
+fn compute_regions(layout: &PaneLayout, area: Rect, focused: PaneId, budget: usize, out: &mut Vec<(PaneId, Rect)>, dividers: &mut Vec<Divider>) {
     compute_regions_at(layout, area, focused, budget, out, dividers, &mut Vec::new());
 }
 
@@ -839,6 +905,16 @@ pub(crate) fn pane_rect(window: &WindowEntry, pane_id: PaneId, term_rows: usize,
     let area = Rect { row: 0, col: 0, rows: content_rows(term_rows), cols: term_cols };
     let mut regions = Vec::new();
     let mut dividers = Vec::new();
+    window.regions(area, &mut regions, &mut dividers);
+    if let Some((_, rect)) = regions.iter().find(|(id, _)| *id == pane_id) {
+        return *rect;
+    }
+    // Hidden behind a zoom. Its rect is what the untouched layout tree
+    // still says it is -- see WindowEntry::zoomed for why a hidden pane
+    // must keep the geometry it had rather than be told it has none:
+    // this is what its own grid stays sized to, and resizing a grid
+    // reflows scrollback.
+    regions.clear();
     compute_regions(&window.layout, area, window.focused_pane, window.divider_budget, &mut regions, &mut dividers);
     regions.into_iter().find(|(id, _)| *id == pane_id).map(|(_, r)| r).expect("pane id always present in its own window's layout")
 }
@@ -1032,6 +1108,7 @@ mod divider_drag_tests {
             focused_pane: panes[0],
             divider_budget: DEFAULT_DIVIDER_BUDGET,
             next_pane_id: panes.len() as PaneId,
+            zoomed: None,
         }
     }
 
@@ -1462,5 +1539,116 @@ mod tab_fold_tests {
         for focused in 0..10 {
             assert!(!hidden_for(focused).contains(&focused));
         }
+    }
+}
+
+#[cfg(test)]
+mod zoom_tests {
+    use super::*;
+
+    const AREA: Rect = Rect { row: 0, col: 0, rows: 24, cols: 80 };
+
+    // Three panes in a row, focus on the middle one.
+    fn three_panes() -> WindowEntry {
+        let mut w = WindowEntry::single(0, Frame::Session(0));
+        let middle = w.add_pane(vec![Frame::Session(0)], false, false);
+        w.add_pane(vec![Frame::Session(0)], false, false);
+        w.focused_pane = middle;
+        w
+    }
+
+    fn regions_of(w: &WindowEntry) -> Vec<(PaneId, Rect)> {
+        let (mut out, mut dividers) = (Vec::new(), Vec::new());
+        w.regions(AREA, &mut out, &mut dividers);
+        out
+    }
+
+    #[test]
+    fn a_zoomed_pane_is_the_only_one_on_screen_and_fills_the_window() {
+        let mut w = three_panes();
+        assert_eq!(regions_of(&w).len(), 3);
+
+        assert!(w.toggle_zoom());
+        let regions = regions_of(&w);
+        assert_eq!(regions.len(), 1, "the other two are hidden, not resized");
+        assert_eq!(regions[0].0, w.focused_pane);
+        assert_eq!(regions[0].1.rows, AREA.rows);
+        assert_eq!(regions[0].1.cols, AREA.cols);
+
+        // And no dividers: there is nothing on screen to divide from.
+        let (mut out, mut dividers) = (Vec::new(), Vec::new());
+        w.regions(AREA, &mut out, &mut dividers);
+        assert!(dividers.is_empty());
+    }
+
+    #[test]
+    fn unzooming_restores_the_layout_exactly() {
+        let mut w = three_panes();
+        // Resize first, so "restored" means more than "three panes
+        // again" -- an unzoom that rebuilt the layout would even these
+        // back out.
+        resize_focused_pane(&mut w, RESIZE_STEP);
+        let before: Vec<(PaneId, usize)> = regions_of(&w).into_iter().map(|(id, r)| (id, r.cols)).collect();
+
+        w.toggle_zoom();
+        assert!(!w.toggle_zoom(), "the second press is what puts it back");
+
+        let after: Vec<(PaneId, usize)> = regions_of(&w).into_iter().map(|(id, r)| (id, r.cols)).collect();
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn a_hidden_pane_keeps_the_rectangle_it_had() {
+        // What its own grid stays sized to -- see WindowEntry::zoomed:
+        // resizing a grid reflows its scrollback, and a pane nobody can
+        // currently see is the last thing that should be reflowed.
+        let mut w = three_panes();
+        let hidden = w.panes.iter().map(|p| p.id).find(|id| *id != w.focused_pane).expect("three panes, one focused");
+        let before = pane_rect(&w, hidden, 26, 80);
+
+        w.toggle_zoom();
+        let after = pane_rect(&w, hidden, 26, 80);
+        assert_eq!((before.row, before.col, before.rows, before.cols), (after.row, after.col, after.rows, after.cols));
+    }
+
+    #[test]
+    fn one_pane_has_nothing_to_zoom() {
+        let mut w = WindowEntry::single(0, Frame::Session(0));
+        assert!(!w.toggle_zoom());
+        assert_eq!(regions_of(&w).len(), 1);
+    }
+
+    #[test]
+    fn closing_the_zoomed_pane_ends_the_zoom() {
+        // Otherwise `regions` would hand out a pane id nothing answers
+        // to, and every caller that looks it up would panic.
+        let mut w = three_panes();
+        w.toggle_zoom();
+        let zoomed = w.focused_pane;
+        close_pane(&mut w, zoomed);
+        assert_eq!(w.zoomed, None);
+        assert_eq!(regions_of(&w).len(), 2);
+    }
+
+    #[test]
+    fn closing_down_to_one_pane_ends_the_zoom_too() {
+        let mut w = three_panes();
+        w.toggle_zoom();
+        let others: Vec<PaneId> = w.panes.iter().map(|p| p.id).filter(|id| *id != w.focused_pane).collect();
+        for id in others {
+            close_pane(&mut w, id);
+        }
+        assert_eq!(w.zoomed, None, "a zoom on the last pane standing means nothing");
+    }
+
+    #[test]
+    fn adding_a_pane_puts_the_split_back() {
+        // A new pane under a zoom would be invisible, so `add_pane`
+        // unzooms -- which is why it is the only way in.
+        let mut w = three_panes();
+        w.toggle_zoom();
+        w.add_pane(vec![Frame::Session(0)], true, false);
+        assert_eq!(w.zoomed, None);
+        assert_eq!(regions_of(&w).len(), 4);
     }
 }

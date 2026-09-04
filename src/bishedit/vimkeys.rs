@@ -523,6 +523,9 @@ pub enum WindowCmd {
     FocusDown,
     FocusUp,
     FocusRight,
+    /// `<C-w>z` (tmux's letter) and `<C-w>o` (vim's) -- the focused
+    /// pane fills the window until the next press puts the split back.
+    Zoom,
     Balance,
     /// `<C-w> _` -- shrink this pane to its divider. Focus moves to a
     /// neighbour, since a pane showing one row is not somewhere to be;
@@ -2141,6 +2144,12 @@ impl VimKeys {
             Key::Char('j') => self.emit_window(WindowCmd::FocusDown),
             Key::Char('k') => self.emit_window(WindowCmd::FocusUp),
             Key::Char('l') => self.emit_window(WindowCmd::FocusRight),
+            // Two letters, one command, because two vocabularies reach
+            // for it: `z` is what tmux binds zoom to, and `o` is what
+            // vim binds "make this the only window" to -- which is what
+            // zoom looks like, except nothing is closed and the next
+            // press puts it all back.
+            Key::Char('z') | Key::Char('o') => self.emit_window(WindowCmd::Zoom),
             Key::Char('=') => self.emit_window(WindowCmd::Balance),
             // vim spells "make this pane as small as it goes" the same way.
             Key::Char('_') => self.emit_window(WindowCmd::Minimize),
@@ -2385,6 +2394,7 @@ fn describe_window_cmd(cmd: &WindowCmd) -> &'static str {
         WindowCmd::FocusDown => "focus-down",
         WindowCmd::FocusUp => "focus-up",
         WindowCmd::FocusRight => "focus-right",
+        WindowCmd::Zoom => "zoom",
         WindowCmd::Balance => "balance",
         WindowCmd::Minimize => "minimize",
         WindowCmd::GotoFirstWindow => "goto-first",
@@ -3116,6 +3126,8 @@ mod tests {
             ('k', WindowCmd::FocusUp),
             ('l', WindowCmd::FocusRight),
             ('=', WindowCmd::Balance),
+            ('z', WindowCmd::Zoom),
+            ('o', WindowCmd::Zoom),
         ];
         for (ch, cmd) in cases {
             let mut vk = VimKeys::new();

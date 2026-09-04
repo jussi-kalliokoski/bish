@@ -35,9 +35,9 @@ use crate::session;
 use crate::term;
 use crate::vt100;
 use crate::window::{
-    Divider, EditFrameId, Frame, HexFrameId, JobFrameId, JumpEntry, JumpList, MIN_PANE_WEIGHT, Pane, PaneId, PaneLayout, RESIZE_STEP, Rect,
-    SessionId, WindowEntry, close_focused_pane, close_pane, completion_menu_rows, compute_regions, content_rows, find_parent_split_mut,
-    focused_col_origin, folded_divider_pane, insert_sibling, pane_rect, resize_focused_pane, resize_split_child_to, set_child_weight_to_fraction,
+    Divider, EditFrameId, Frame, HexFrameId, JobFrameId, JumpEntry, MIN_PANE_WEIGHT, PaneId, PaneLayout, RESIZE_STEP, Rect, SessionId, WindowEntry,
+    close_focused_pane, close_pane, completion_menu_rows, content_rows, find_parent_split_mut, focused_col_origin, folded_divider_pane, pane_rect,
+    resize_focused_pane, resize_split_child_to, set_child_weight_to_fraction,
 };
 
 // One virtual shell session -- either the original process's own session
@@ -3190,25 +3190,39 @@ fn apply_window_action(app: &mut App, action: WindowAction) {
                 }
             }
         }
+        WindowAction::Zoom => {
+            app.windows[app.current_window].toggle_zoom();
+        }
+        // Everything from here down either moves focus or reshapes the
+        // layout, and a zoom hides both: whatever it did would happen
+        // underneath the one pane on screen, invisibly. So each of them
+        // puts the split back first, which is what tmux does too.
         WindowAction::Split { horizontal } => {
+            app.windows[app.current_window].unzoom();
             split_focused_pane(app, horizontal);
         }
         WindowAction::FocusPane(direction) => {
+            app.windows[app.current_window].unzoom();
             focus_pane_direction(&mut app.windows[app.current_window], &mut app.sessions, direction, app.term_rows, app.term_cols);
         }
         WindowAction::Balance => {
+            app.windows[app.current_window].unzoom();
             balance_panes(&mut app.windows[app.current_window].layout);
         }
         WindowAction::Minimize => {
+            app.windows[app.current_window].unzoom();
             minimize_focused_pane(&mut app.windows[app.current_window]);
         }
         WindowAction::SizeUp => {
+            app.windows[app.current_window].unzoom();
             resize_focused_pane(&mut app.windows[app.current_window], RESIZE_STEP);
         }
         WindowAction::SizeDown => {
+            app.windows[app.current_window].unzoom();
             resize_focused_pane(&mut app.windows[app.current_window], -RESIZE_STEP);
         }
         WindowAction::SetSize(spec) => {
+            app.windows[app.current_window].unzoom();
             set_focused_pane_size(&mut app.windows[app.current_window], spec, app.term_rows, app.term_cols);
         }
     }
@@ -3263,13 +3277,7 @@ fn split_focused_pane(app: &mut App, horizontal: bool) {
     );
 
     let window = &mut app.windows[app.current_window];
-    let new_pane_id = window.next_pane_id;
-    window.next_pane_id += 1;
-    window.panes.push(Pane { id: new_pane_id, stack: vec![Frame::Session(sid)], jumps: JumpList::default() });
-
-    let focused_id = window.focused_pane;
-    let old_layout = std::mem::replace(&mut window.layout, PaneLayout::Leaf(0));
-    window.layout = insert_sibling(old_layout, focused_id, new_pane_id, horizontal, None, false);
+    let new_pane_id = window.add_pane(vec![Frame::Session(sid)], horizontal, false);
 
     // The pane being split is about to lose focus to its new sibling --
     // freeze its current idle prompt into its own grid first, or it'll
@@ -3337,13 +3345,7 @@ fn split_diagnostics_pane(app: &mut App, edit_frame_id: EditFrameId) -> PaneId {
     );
 
     let window = &mut app.windows[app.current_window];
-    let new_pane_id = window.next_pane_id;
-    window.next_pane_id += 1;
-    window.panes.push(Pane { id: new_pane_id, stack: vec![Frame::Session(sid), Frame::Diagnostics(edit_frame_id)], jumps: JumpList::default() });
-
-    let focused_id = window.focused_pane;
-    let old_layout = std::mem::replace(&mut window.layout, PaneLayout::Leaf(0));
-    window.layout = insert_sibling(old_layout, focused_id, new_pane_id, true, None, true);
+    let new_pane_id = window.add_pane(vec![Frame::Session(sid), Frame::Diagnostics(edit_frame_id)], true, true);
 
     new_pane_id
 }
@@ -3388,12 +3390,7 @@ fn split_locations_pane(app: &mut App, edit_frame_id: EditFrameId) -> PaneId {
         },
     );
     let window = &mut app.windows[app.current_window];
-    let new_pane_id = window.next_pane_id;
-    window.next_pane_id += 1;
-    window.panes.push(Pane { id: new_pane_id, stack: vec![Frame::Session(sid), Frame::Locations(edit_frame_id)], jumps: JumpList::default() });
-    let focused_id = window.focused_pane;
-    let old_layout = std::mem::replace(&mut window.layout, PaneLayout::Leaf(0));
-    window.layout = insert_sibling(old_layout, focused_id, new_pane_id, true, None, true);
+    let new_pane_id = window.add_pane(vec![Frame::Session(sid), Frame::Locations(edit_frame_id)], true, true);
     new_pane_id
 }
 
@@ -3489,13 +3486,7 @@ fn split_debug_run_pane(app: &mut App, edit_frame_id: EditFrameId) -> (PaneId, R
     );
 
     let window = &mut app.windows[app.current_window];
-    let new_pane_id = window.next_pane_id;
-    window.next_pane_id += 1;
-    window.panes.push(Pane { id: new_pane_id, stack: vec![Frame::Session(sid), Frame::DebugRun(edit_frame_id)], jumps: JumpList::default() });
-
-    let focused_id = window.focused_pane;
-    let old_layout = std::mem::replace(&mut window.layout, PaneLayout::Leaf(0));
-    window.layout = insert_sibling(old_layout, focused_id, new_pane_id, true, None, true);
+    let new_pane_id = window.add_pane(vec![Frame::Session(sid), Frame::DebugRun(edit_frame_id)], true, true);
 
     (new_pane_id, screen)
 }
@@ -4374,7 +4365,7 @@ fn snapshot_window(window: &WindowEntry, sessions: &HashMap<SessionId, SessionSt
     let area = Rect { row: 0, col: 0, rows: content_rows(term_rows), cols: term_cols };
     let mut regions = Vec::new();
     let mut dividers = Vec::new();
-    compute_regions(&window.layout, area, window.focused_pane, window.divider_budget, &mut regions, &mut dividers);
+    window.regions(area, &mut regions, &mut dividers);
 
     let panes = regions
         .into_iter()
@@ -4767,7 +4758,7 @@ fn focus_pane_direction(
     let area = Rect { row: 0, col: 0, rows: content_rows(term_rows), cols: term_cols };
     let mut regions = Vec::new();
     let mut dividers = Vec::new();
-    compute_regions(&window.layout, area, window.focused_pane, window.divider_budget, &mut regions, &mut dividers);
+    window.regions(area, &mut regions, &mut dividers);
     if regions.len() <= 1 {
         return;
     }
@@ -5669,6 +5660,7 @@ fn window_cmd_to_action(cmd: WindowCmd) -> WindowAction {
         WindowCmd::FocusDown => WindowAction::FocusPane(PaneDirection::Down),
         WindowCmd::FocusUp => WindowAction::FocusPane(PaneDirection::Up),
         WindowCmd::FocusRight => WindowAction::FocusPane(PaneDirection::Right),
+        WindowCmd::Zoom => WindowAction::Zoom,
         WindowCmd::Balance => WindowAction::Balance,
         WindowCmd::Minimize => WindowAction::Minimize,
         WindowCmd::GotoFirstWindow | WindowCmd::GotoLastWindow => {
@@ -7960,6 +7952,11 @@ fn tab_bar_snapshot(app: &App) -> Vec<(u32, bool, String)> {
                     prompt::shorten_path(&cwd, &home)
                 }
             };
+            // tmux's own marker for the same thing, and for the same
+            // reason: a zoomed window looks exactly like an unsplit
+            // one, so without this there is nothing on screen to say
+            // the other panes are still there.
+            let label = if w.zoomed.is_some() { format!("{label} Z") } else { label };
             (w.id, i == app.current_window, label)
         })
         .collect()
@@ -9630,14 +9627,7 @@ fn hit_test_click(app: &App, ev: editor::MouseEvent) -> Option<ClickTarget> {
     let area = Rect { row: 0, col: 0, rows: content_rows(app.term_rows), cols: app.term_cols };
     let mut regions = Vec::new();
     let mut dividers = Vec::new();
-    compute_regions(
-        &app.windows[app.current_window].layout,
-        area,
-        app.windows[app.current_window].focused_pane,
-        app.windows[app.current_window].divider_budget,
-        &mut regions,
-        &mut dividers,
-    );
+    app.windows[app.current_window].regions(area, &mut regions, &mut dividers);
     // Dividers first: they sit *between* pane rectangles, so nothing here
     // overlaps, but checking them first keeps the intent obvious -- a
     // press on the strip is a resize, never a focus change.
@@ -9706,14 +9696,7 @@ fn drag_divider(app: &mut App, divider: &Divider) {
             let area = Rect { row: 0, col: 0, rows: content_rows(app.term_rows), cols: app.term_cols };
             let mut regions = Vec::new();
             let mut dividers = Vec::new();
-            compute_regions(
-                &app.windows[app.current_window].layout,
-                area,
-                app.windows[app.current_window].focused_pane,
-                app.windows[app.current_window].divider_budget,
-                &mut regions,
-                &mut dividers,
-            );
+            app.windows[app.current_window].regions(area, &mut regions, &mut dividers);
             if let Some(fresh) = dividers.into_iter().find(|d| d.path == current.path && d.child == current.child) {
                 current = fresh;
             }
@@ -12873,10 +12856,7 @@ mod completion_menu_geometry_tests {
     // A window split top/bottom, focus on the lower pane.
     fn split_window() -> WindowEntry {
         let mut w = WindowEntry::single(0, Frame::Session(0));
-        w.layout = insert_sibling(w.layout, 0, 1, true, None, false);
-        w.panes.push(Pane { id: 1, stack: vec![Frame::Session(0)], jumps: JumpList::default() });
-        w.next_pane_id = 2;
-        w.focused_pane = 1;
+        w.focused_pane = w.add_pane(vec![Frame::Session(0)], true, false);
         w
     }
 
@@ -13257,7 +13237,6 @@ mod normal_mode_status_tests {
 mod compositor_frame_output_tests {
     use super::*;
     // Only this module builds a layout by hand.
-    use crate::window::SplitChild;
 
     #[test]
     fn a_folded_divider_draws_what_it_stands_for() {
@@ -13350,15 +13329,7 @@ mod compositor_frame_output_tests {
         // divider" from "scrolled out of view".
         let mut w = WindowEntry::single(1, Frame::Session(0));
         let top = w.focused_pane;
-        let bottom = top + 1;
-        w.panes.push(Pane { id: bottom, stack: vec![Frame::Session(0)], jumps: JumpList::default() });
-        w.layout = PaneLayout::Split {
-            horizontal: false,
-            children: vec![
-                SplitChild { layout: PaneLayout::Leaf(top), weight: 1.0, fixed: None, minimized: false },
-                SplitChild { layout: PaneLayout::Leaf(bottom), weight: 1.0, fixed: None, minimized: false },
-            ],
-        };
+        let bottom = w.add_pane(vec![Frame::Session(0)], false, false);
         w.focused_pane = bottom;
 
         minimize_focused_pane(&mut w);
