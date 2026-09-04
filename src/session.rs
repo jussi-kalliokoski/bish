@@ -832,7 +832,32 @@ pub fn run_kill(name: &str) -> io::Result<i32> {
     if unsafe { kill(pid, SIGTERM) } != 0 {
         return Err(io::Error::last_os_error());
     }
+    // A daemon killed by a signal runs no cleanup of its own, so its
+    // socket and pidfile outlive it. `ls` already ignores them (it
+    // tests the pidfile lock, not the file's existence), but leaving a
+    // pile of dead sockets in the runtime directory is nobody's idea of
+    // tidy, and a name cannot be reasoned about while its corpse is
+    // still lying there.
+    remove_dead_session_files(name, std::time::Duration::from_secs(2));
     Ok(0)
+}
+
+/// Removes a session's socket and pidfile once nothing is holding them.
+///
+/// Waits up to `grace` for the daemon to actually be gone, then checks
+/// once more immediately before unlinking: a new daemon can legitimately
+/// have claimed the same name in between, and its files are not ours to
+/// delete.
+fn remove_dead_session_files(name: &str, grace: std::time::Duration) {
+    let deadline = std::time::Instant::now() + grace;
+    while std::time::Instant::now() < deadline && is_daemon_alive(name) {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    if is_daemon_alive(name) {
+        return;
+    }
+    let _ = std::fs::remove_file(socket_path(name));
+    let _ = std::fs::remove_file(pidfile_path(name));
 }
 
 // The client loop: connects to `name`'s socket, puts the *local* real
@@ -952,8 +977,25 @@ pub fn run_client(name: &str) -> io::Result<i32> {
 // is up, attaches to it as the first client -- both in one command,
 // matching plain `tmux`'s own UX (see the implementation plan's
 // decision 1) rather than tmux's `-d`.
-pub fn run_new(name: &str) -> io::Result<i32> {
+/// `bish session new <name>`, and `new -A <name>`.
+///
+/// `attach_if_running` is `-A`: attach to the session if it is already
+/// there, create it if it is not. Without it a name already taken is an
+/// error, which it has to be -- spawning a second daemon for a live
+/// name loses the pidfile lock and dies, and the connect below then
+/// lands on the *existing* session. That looked like "new" quietly
+/// working, while actually attaching -- and since an attach replaces
+/// whoever was there, it also threw whoever was using that session off
+/// it, with no message anywhere.
+pub fn run_new(name: &str, attach_if_running: bool) -> io::Result<i32> {
     check_name(name)?;
+    if is_daemon_alive(name) {
+        if attach_if_running {
+            return run_client(name);
+        }
+        eprintln!("bish: session '{0}' already exists -- `bish session attach {0}`, or `new -A` for either", name);
+        return Ok(1);
+    }
     let exe = std::env::current_exe()?;
     std::process::Command::new(exe)
         .args(["session", "--daemon", name])
@@ -1114,6 +1156,40 @@ mod tests {
             ensure_socket_dir().expect("ensure_socket_dir");
             let _lock = acquire_pidfile_lock("work").expect("acquire_pidfile_lock");
             assert_eq!(read_pid("work"), Some(std::process::id() as i32));
+        });
+    }
+
+    #[test]
+    fn dead_session_files_are_removed_once_nothing_holds_them() {
+        with_isolated_runtime_dir("dead-files", |_dir| {
+            ensure_socket_dir().expect("ensure_socket_dir");
+            // What a daemon killed by a signal leaves behind: it runs no
+            // cleanup of its own, so both files outlive it.
+            std::fs::write(socket_path("gone"), b"").expect("socket stand-in");
+            std::fs::write(pidfile_path("gone"), b"12345\n").expect("pidfile stand-in");
+
+            remove_dead_session_files("gone", std::time::Duration::from_millis(0));
+
+            assert!(!socket_path("gone").exists(), "the socket should be gone");
+            assert!(!pidfile_path("gone").exists(), "and so should the pidfile");
+        });
+    }
+
+    #[test]
+    fn a_live_sessions_files_are_left_alone() {
+        with_isolated_runtime_dir("live-files", |_dir| {
+            ensure_socket_dir().expect("ensure_socket_dir");
+            std::fs::write(socket_path("live"), b"").expect("socket stand-in");
+            // Holding the lock is exactly what "a daemon is alive here"
+            // means (see acquire_pidfile_lock), so this stands in for
+            // one -- including the case that matters most: a *new*
+            // daemon claiming the name between the kill and the sweep.
+            let _held = acquire_pidfile_lock("live").expect("acquire");
+
+            remove_dead_session_files("live", std::time::Duration::from_millis(0));
+
+            assert!(socket_path("live").exists(), "a live session's socket is not ours to delete");
+            assert!(pidfile_path("live").exists());
         });
     }
 

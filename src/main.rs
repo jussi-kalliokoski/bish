@@ -85,9 +85,13 @@ fn main() {
     // reason, though nothing stops a user from invoking it directly.
     if args.get(1).map(String::as_str) == Some("session") {
         let code = match args.get(2).map(String::as_str) {
-            Some("new") => match args.get(3) {
-                Some(name) => session::run_new(name),
-                None => Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "usage: bish session new <name>")),
+            // `-A` is tmux's own spelling for "attach to it if it is
+            // already there, create it if it is not".
+            Some("new") => match (args.get(3).map(String::as_str), args.get(4)) {
+                (Some("-A" | "--attach"), Some(name)) => session::run_new(name, true),
+                (Some("-A" | "--attach"), None) => Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "usage: bish session new [-A] <name>")),
+                (Some(name), _) => session::run_new(name, false),
+                (None, _) => Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "usage: bish session new [-A] <name>")),
             },
             Some("attach") => match args.get(3) {
                 Some(name) => session::run_client(name),
