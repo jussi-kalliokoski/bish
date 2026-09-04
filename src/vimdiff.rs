@@ -220,8 +220,11 @@ mod tests {
     /// Runs one editor in a pty over `path`, sends `keys` one character
     /// at a time and then `:wq`, and returns what the file holds
     /// afterwards.
-    fn edit(argv: &[String], path: &Path, keys: &str, save: &str) -> String {
-        let Ok(pty) = crate::pty::open() else { return "<no pty>".to_string() };
+    /// `None` when the editor never answered the handshake, which is a
+    /// failure of this harness rather than a difference between the two
+    /// editors -- see the call site.
+    fn edit(argv: &[String], path: &Path, keys: &str, save: &str) -> Option<String> {
+        let Ok(pty) = crate::pty::open() else { return None };
         let _ = crate::pty::set_size(std::os::fd::AsRawFd::as_raw_fd(&pty.master), 24, 80);
         let mut cmd = Command::new(&argv[0]);
         cmd.args(&argv[1..]);
@@ -230,7 +233,7 @@ mod tests {
         // the machine they are on.
         cmd.env_remove("VIMINIT");
         let Ok(mut child) = crate::pty::spawn_attached(cmd, &pty.slave_path) else {
-            return "<could not spawn>".to_string();
+            return None;
         };
         let mut master = pty.master;
         let _ = crate::pty::set_nonblocking(std::os::fd::AsRawFd::as_raw_fd(&master));
@@ -255,7 +258,22 @@ mod tests {
         // Not just "until quiet": an editor that has not started yet is
         // also quiet, and a key sent before it puts the terminal in raw
         // mode is read by the line discipline instead of by the editor.
-        handshake(&mut master, &mut drain, Duration::from_secs(10));
+        // An editor that never answers is not an editor that did
+        // something unexpected. Typing at it anyway produces the file
+        // exactly as it was, which is indistinguishable from "the
+        // editor ignored every key" -- and that is what a lost
+        // handshake used to be reported as.
+        // Thirty seconds, not ten. The budget is the one guess left in
+        // here about how fast the machine is, and it costs nothing when
+        // it is wrong in this direction: the handshake returns the
+        // moment it is answered, so a healthy run never waits. A run
+        // alongside the rest of the suite, with two editors and a few
+        // thousand processes competing, is the case it has to cover.
+        if !handshake(&mut master, &mut drain, Duration::from_secs(30)) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
         for c in keys.chars().chain(save.chars()) {
             let mut buf = [0u8; 4];
             let _ = master.write_all(c.encode_utf8(&mut buf).as_bytes());
@@ -278,7 +296,7 @@ mod tests {
                 }
             }
         }
-        std::fs::read_to_string(path).unwrap_or_else(|e| format!("<unreadable: {e}>"))
+        Some(std::fs::read_to_string(path).unwrap_or_else(|e| format!("<unreadable: {e}>")))
     }
 
     /// Blocks until the editor has demonstrably read a key, by asking
@@ -305,7 +323,11 @@ mod tests {
     /// lost both its `O` and the `n` after it, and vim recorded a
     /// difference that was entirely the harness's doing. A probe that
     /// needs no cancelling cannot cause that.
-    fn handshake(master: &mut std::fs::File, drain: &mut impl FnMut(&mut std::fs::File) -> usize, limit: Duration) {
+    /// Returns whether the editor ever answered. Giving up quietly and
+    /// typing anyway is the one thing this must not do: the keys go to
+    /// the line discipline, the file comes back untouched, and the case
+    /// reports a difference that is entirely this harness's.
+    fn handshake(master: &mut std::fs::File, drain: &mut impl FnMut(&mut std::fs::File) -> usize, limit: Duration) -> bool {
         let deadline = Instant::now() + limit;
         while Instant::now() < deadline {
             settle(master, drain, Duration::from_millis(150), Duration::from_secs(2), 12);
@@ -314,11 +336,12 @@ mod tests {
             while asked.elapsed() < Duration::from_millis(300) {
                 if drain(master) > 0 {
                     settle(master, drain, Duration::from_millis(30), Duration::from_millis(500), QUIET_TICKS);
-                    return;
+                    return true;
                 }
                 std::thread::sleep(Duration::from_millis(4));
             }
         }
+        false
     }
 
     /// How long to leave an escape alone before sending the next key.
@@ -397,13 +420,21 @@ mod tests {
     fn compare(cases: &[Case], bish: &Path) -> Vec<(&'static str, String, String)> {
         let root = std::env::temp_dir().join(format!("bish-vimdiff-{}", std::process::id()));
         let mut differing = Vec::new();
+        // `BISH_VIMDIFF_ONLY=name` runs just that case. Driving two
+        // real editors through a pty takes minutes for the whole
+        // corpus, which is a long way to go to look at one case that
+        // only misbehaves sometimes.
+        let only = std::env::var("BISH_VIMDIFF_ONLY").ok();
         for c in cases {
+            if only.as_deref().is_some_and(|want| want != c.name) {
+                continue;
+            }
             // A directory per case, named after it -- same reasoning as
             // the bash corpus: two tests share this root, and an index
             // would collide.
             let dir = root.join(c.name);
             let path = dir.join("f.txt");
-            let run = |argv: Vec<String>, save: &str| -> String {
+            let run = |argv: Vec<String>, save: &str| -> Option<String> {
                 let _ = std::fs::remove_dir_all(&dir);
                 std::fs::create_dir_all(&dir).unwrap();
                 std::fs::write(&path, c.before).unwrap();
@@ -417,7 +448,11 @@ mod tests {
             // the same mistake there, and every case here already
             // leaves normal mode.
             let got = run(vec![bish.display().to_string(), "tool".into(), "edit".into(), path.display().to_string()], "\u{1b}:wq\r");
-            if want != got {
+            // `None` on either side is an editor this harness could
+            // not drive, not a difference between the two -- retried
+            // like any other, and reported in its own words if it keeps
+            // happening, so it can never be read as a divergence.
+            if want != got || want.is_none() {
                 let mut confirmed = None;
                 for _ in 0..2 {
                     let want_again = run(
@@ -425,14 +460,15 @@ mod tests {
                         ":wq\r",
                     );
                     let got_again = run(vec![bish.display().to_string(), "tool".into(), "edit".into(), path.display().to_string()], "\u{1b}:wq\r");
-                    if want_again == got_again {
+                    if want_again == got_again && want_again.is_some() {
                         confirmed = None;
                         break;
                     }
                     confirmed = Some((want_again, got_again));
                 }
                 if let Some((want, got)) = confirmed {
-                    differing.push((c.name, want, got));
+                    let unreachable = "<the editor never answered the handshake -- this harness could not drive it>";
+                    differing.push((c.name, want.unwrap_or_else(|| unreachable.to_string()), got.unwrap_or_else(|| unreachable.to_string())));
                 }
             }
             let _ = std::fs::remove_dir_all(&dir);
