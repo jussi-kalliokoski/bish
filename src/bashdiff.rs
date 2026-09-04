@@ -153,6 +153,53 @@ mod tests {
         case("pipeline-stage-exit-status", r#"{ exit 3; } | cat; echo "${PIPESTATUS[*]} rc=$?""#),
         case("pipeline-stage-pipefail", r#"set -o pipefail; { exit 3; } | cat; echo "rc=$?""#),
         case("pipeline-stage-in-the-middle", r#"/bin/echo a b | { read x y; echo "$y $x"; } | cat"#),
+        // Every pipeline case above this point ends in `cat`, and `cat`
+        // cannot tell a stage that wrote *into* the pipe from one that
+        // wrote straight past it -- both come out looking identical.
+        // That blind spot hid a real bug for the whole life of this
+        // corpus: a builtin stage writes to the shell's own output
+        // sink, and at the top level that sink *is* fd 1, so the pipe
+        // got the bytes by luck. Put the same pipeline inside `$( )`,
+        // where the sink is a capture buffer instead, and the builtin
+        // wrote into the capture while the next stage read an empty
+        // pipe -- `x=$(echo hello | wc -c)` gave "hello" for bash's 6.
+        //
+        // So: a last stage that *transforms* what it reads, and a
+        // capture around the pipeline. Both halves are needed. Either
+        // one alone still passes with the bug in place.
+        case("capture-a-pipeline-from-a-builtin", r#"x=$(echo hello | wc -c); echo "[$x]""#),
+        case("capture-a-pipeline-through-tr", r#"echo "[$(echo a b c | tr ' ' -)]""#),
+        case(
+            "capture-a-pipeline-from-printf",
+            r#"x=$(printf '%s
+' one two | grep two); echo "[$x]""#,
+        ),
+        case(
+            "capture-a-pipeline-of-three",
+            r#"x=$(echo a b c | tr ' ' '
+' | wc -l); echo "[$x]""#,
+        ),
+        case(
+            "capture-a-pipeline-of-two-builtins",
+            r#"x=$(printf 'a
+b
+' | { read v; echo "got=$v"; }); echo "[$x]""#,
+        ),
+        case("capture-a-pipeline-from-a-group", r#"x=$({ echo one; echo two; } | wc -l); echo "[$x]""#),
+        case("capture-a-pipeline-in-a-subshell", r#"x=$( (echo hi | wc -c) ); echo "[$x]""#),
+        // The same shape one level further in: a capture inside a
+        // capture, since the sink a stage must not write to is then the
+        // *inner* one.
+        case("capture-inside-a-captured-pipeline", r#"x=$(echo "$(echo hi | wc -c)" | tr -d ' '); echo "[$x]""#),
+        // Transforming last stages at the top level too -- the same
+        // pipelines with no capture around them, so a fix that broke
+        // the ordinary case would be caught here rather than in a pane.
+        case(
+            "pipeline-into-a-transforming-stage",
+            r#"echo hello | wc -c; printf 'a
+b
+' | wc -l; echo hi | tr a-z A-Z"#,
+        ),
         case("pipeline-stage-through-three", r#"echo a b c | tr ' ' '\n' | wc -l"#),
         // More than a pipe buffer's worth, so the stage has to be
         // running at the same time as the thing draining it.

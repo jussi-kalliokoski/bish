@@ -8597,7 +8597,26 @@ impl Shell {
             // is what keeps `exec {fd}<&0`, an external command
             // inheriting the rest of the input, and a builtin writing
             // to fd 1 all behaving the way they already did.
-            let mut child = self.new_virtual_child();
+            // Where this stage's output goes, which is not the same
+            // question for the last stage as for the others.
+            //
+            // A stage with a pipe on its stdout wants `Real`: the
+            // scheduler points fd 1 at that pipe for the duration of
+            // each of its turns, and `Real` is what follows fd 1. That
+            // is what `new_virtual_child` already gives, and it is why
+            // a builtin stage writes into the pipe at all.
+            //
+            // The last stage has no pipe, and `Real` is then wrong: its
+            // output belongs wherever this shell's own goes -- a `$( )`
+            // capture, a pane's grid -- and fd 1 is neither. So it
+            // inherits the sink and stdio exactly the way any other
+            // unredirected child construct does. Without this,
+            // `x=$(printf 'a\nb\n' | { read v; echo "got=$v"; })` wrote
+            // "got=a" onto the terminal and left `x` empty.
+            let mut child = match stdout_end.is_some() {
+                true => self.new_virtual_child(),
+                false => self.child_for_stdio(ChildStdio::default()),
+            };
             let body = cmd.clone();
             let code = Rc::clone(&codes[i]);
             let stage = move || {
@@ -8974,7 +8993,21 @@ impl Shell {
             // Armed only around this: an `EPIPE` anywhere else is
             // still ignored, as it always was.
             arm_broken_pipe();
-            let result = self.run_command_in_child_shell(&commands[stage], ChildStdio::default());
+            // The write end handed over as this stage's explicit
+            // stdout, not just dup2'd onto fd 1 above. fd 1 is enough
+            // for anything this stage *spawns*, but a builtin does not
+            // write to fd 1 -- it writes to the shell's own sink, which
+            // here is still the enclosing one: a `$( )` capture, or a
+            // pane's grid. So `echo hello | wc -c` had `echo` write
+            // straight past the pipe into the capture and `wc` read an
+            // empty one, giving `hello` where bash gives `6`. Handing
+            // the pipe over as a redirect is what makes the sink follow
+            // it, the same way `echo hello >file` already does.
+            let stdio = match stdout_fd.as_ref().and_then(|fd| fd.try_clone().ok()) {
+                Some(fd) => ChildStdio { stdout: Some(std::fs::File::from(fd)), ..ChildStdio::default() },
+                None => ChildStdio::default(),
+            };
+            let result = self.run_command_in_child_shell(&commands[stage], stdio);
             let broken = disarm_broken_pipe();
             restore_fd012(saved);
             // Dropped before anything is waited for: the stage
