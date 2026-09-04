@@ -75,7 +75,7 @@ pub(crate) type HexFrameId = u32;
 // across a focus change (the debugged script's own Shell, output,
 // pause/run state): a `debug_frames: HashMap<EditFrameId, debugger::
 // DebugSession>` map, alongside `job_frames`/`edit_frames`.
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 pub(crate) enum Frame {
     Session(SessionId),
     Job(JobFrameId),
@@ -328,6 +328,75 @@ impl WindowEntry {
         new_id
     }
 
+    /// Exchanges two panes' places in the layout -- `<C-w>x`.
+    ///
+    /// Only the leaf labels move, so each *position* keeps the size it
+    /// had and the panes trade places within it. That is what "exchange"
+    /// means in vim, and it is also the only version that cannot go
+    /// wrong: no subtree is rebuilt, so no weight, fold or minimized
+    /// flag can be lost on the way.
+    pub(crate) fn swap_panes(&mut self, a: PaneId, b: PaneId) {
+        fn relabel(layout: &mut PaneLayout, a: PaneId, b: PaneId) {
+            match layout {
+                PaneLayout::Leaf(id) if *id == a => *id = b,
+                PaneLayout::Leaf(id) if *id == b => *id = a,
+                PaneLayout::Leaf(_) => {}
+                PaneLayout::Split { children, .. } => children.iter_mut().for_each(|c| relabel(&mut c.layout, a, b)),
+            }
+        }
+        if a != b {
+            relabel(&mut self.layout, a, b);
+        }
+    }
+
+    /// The pane after `from` in layout order, wrapping -- what `<C-w>x`
+    /// exchanges with when nothing says which pane to pick.
+    ///
+    /// Layout order rather than anything spatial: it is the order the
+    /// tree already has, it is stable, and walking it repeatedly visits
+    /// every pane, which is the property that makes `<C-w>x` pressed
+    /// again and again cycle rather than oscillate between two.
+    pub(crate) fn pane_after(&self, from: PaneId) -> PaneId {
+        let mut leaves = Vec::new();
+        leaves_of(&self.layout, &mut leaves);
+        match leaves.iter().position(|id| *id == from) {
+            Some(at) => leaves[(at + 1) % leaves.len()],
+            None => from,
+        }
+    }
+
+    /// Takes `pane_id` out of this window, handing back everything that
+    /// made it a pane -- for `window break`, which then makes a window
+    /// out of it. `None` when it is the only pane there, since a window
+    /// with no panes is not a thing and breaking the only pane out of
+    /// its window would just rename the window.
+    pub(crate) fn detach_pane(&mut self, pane_id: PaneId) -> Option<Pane> {
+        if self.panes.len() < 2 {
+            return None;
+        }
+        let at = self.panes.iter().position(|p| p.id == pane_id)?;
+        let pane = self.panes.remove(at);
+        let old_layout = std::mem::replace(&mut self.layout, PaneLayout::Leaf(0));
+        self.layout = remove_from_layout(old_layout, pane_id).expect("removing one of >1 panes always leaves at least one behind");
+        if self.focused_pane == pane_id {
+            self.focused_pane = first_leaf(&self.layout);
+        }
+        if self.zoomed == Some(pane_id) || self.panes.len() == 1 {
+            self.unzoom();
+        }
+        Some(pane)
+    }
+
+    /// The other half of `detach_pane`: puts an existing pane into this
+    /// window beside the focused one. Its id is reassigned, since ids
+    /// are only unique within a window and the one it had belonged to a
+    /// different one.
+    pub(crate) fn attach_pane(&mut self, pane: Pane, horizontal: bool) -> PaneId {
+        let id = self.add_pane(pane.stack, horizontal, false);
+        self.pane_mut(id).jumps = pane.jumps;
+        id
+    }
+
     /// `<C-w>z` / `::bish window zoom`. Returns what the window is now:
     /// true if the focused pane has just been zoomed, false if a zoom
     /// was just undone -- or if there was nothing to zoom, since one
@@ -348,6 +417,16 @@ impl WindowEntry {
     /// otherwise happen invisibly, underneath the one pane on screen.
     pub(crate) fn unzoom(&mut self) {
         self.zoomed = None;
+    }
+
+    /// A new window whose single pane is one taken out of another --
+    /// `window break`. Keeps the whole frame stack and the jump list:
+    /// it is the same pane, it is just somewhere else now.
+    pub(crate) fn from_pane(id: u32, pane: Pane) -> WindowEntry {
+        let mut window = WindowEntry::single(id, pane.stack[0]);
+        window.panes[0].stack = pane.stack;
+        window.panes[0].jumps = pane.jumps;
+        window
     }
 
     pub(crate) fn pane(&self, id: PaneId) -> &Pane {
@@ -1650,5 +1729,128 @@ mod zoom_tests {
         w.add_pane(vec![Frame::Session(0)], true, false);
         assert_eq!(w.zoomed, None);
         assert_eq!(regions_of(&w).len(), 4);
+    }
+}
+
+#[cfg(test)]
+mod pane_move_tests {
+    use super::*;
+
+    const AREA: Rect = Rect { row: 0, col: 0, rows: 24, cols: 90 };
+
+    // Three panes side by side, focus on the first.
+    fn three() -> WindowEntry {
+        let mut w = WindowEntry::single(0, Frame::Session(0));
+        w.add_pane(vec![Frame::Session(1)], false, false);
+        w.add_pane(vec![Frame::Session(2)], false, false);
+        w
+    }
+
+    // Which pane sits in which position, left to right.
+    fn order(w: &WindowEntry) -> Vec<PaneId> {
+        let (mut out, mut dividers) = (Vec::new(), Vec::new());
+        w.regions(AREA, &mut out, &mut dividers);
+        out.sort_by_key(|(_, r)| r.col);
+        out.into_iter().map(|(id, _)| id).collect()
+    }
+
+    #[test]
+    fn swapping_moves_the_pane_and_focus_goes_with_it() {
+        let mut w = three();
+        let before = order(&w);
+        let focused = w.focused_pane;
+
+        let other = w.pane_after(focused);
+        w.swap_panes(focused, other);
+
+        let after = order(&w);
+        assert_eq!(after[0], before[1], "the two traded places");
+        assert_eq!(after[1], before[0]);
+        assert_eq!(after[2], before[2], "and nothing else moved");
+        // vim leaves the cursor in the window that moved, not in the
+        // position it left.
+        assert_eq!(w.focused_pane, focused);
+    }
+
+    #[test]
+    fn swapping_leaves_each_position_the_size_it_had() {
+        let mut w = three();
+        resize_focused_pane(&mut w, RESIZE_STEP);
+        let (mut before, mut dividers) = (Vec::new(), Vec::new());
+        w.regions(AREA, &mut before, &mut dividers);
+        before.sort_by_key(|(_, r)| r.col);
+        let widths: Vec<usize> = before.iter().map(|(_, r)| r.cols).collect();
+
+        let other = w.pane_after(w.focused_pane);
+        w.swap_panes(w.focused_pane, other);
+
+        let (mut after, mut dividers) = (Vec::new(), Vec::new());
+        w.regions(AREA, &mut after, &mut dividers);
+        after.sort_by_key(|(_, r)| r.col);
+        assert_eq!(widths, after.iter().map(|(_, r)| r.cols).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn pressing_swap_repeatedly_walks_the_pane_around_the_window() {
+        // Layout order wraps, so a held-down `<C-w>x` moves the pane on
+        // rather than oscillating between the same two positions.
+        let mut w = three();
+        let moving = w.focused_pane;
+        let mut visited = vec![order(&w).iter().position(|id| *id == moving).unwrap()];
+        for _ in 0..3 {
+            let other = w.pane_after(moving);
+            w.swap_panes(moving, other);
+            visited.push(order(&w).iter().position(|id| *id == moving).unwrap());
+        }
+        assert_eq!(visited, vec![0, 1, 2, 0], "every position, then back to the start");
+    }
+
+    #[test]
+    fn breaking_a_pane_out_takes_its_whole_stack_with_it() {
+        let mut w = three();
+        // A pane showing something on top of its session -- the frame
+        // stack has to survive the move, or the pane arrives blank.
+        w.pane_mut(1).stack.push(Frame::Job(7));
+        let taken = w.detach_pane(1).expect("three panes, so one can go");
+
+        assert_eq!(taken.stack, vec![Frame::Session(1), Frame::Job(7)]);
+        assert_eq!(w.panes.len(), 2);
+        assert_eq!(order(&w).len(), 2);
+
+        let moved = WindowEntry::from_pane(9, taken);
+        assert_eq!(moved.id, 9);
+        assert_eq!(moved.panes.len(), 1);
+        assert_eq!(moved.stack(), &vec![Frame::Session(1), Frame::Job(7)]);
+    }
+
+    #[test]
+    fn the_last_pane_cannot_be_broken_out_of_its_own_window() {
+        let mut w = WindowEntry::single(0, Frame::Session(0));
+        assert!(w.detach_pane(0).is_none());
+        assert_eq!(w.panes.len(), 1, "and the refusal leaves it alone");
+    }
+
+    #[test]
+    fn detaching_the_focused_pane_moves_focus_and_ends_a_zoom() {
+        let mut w = three();
+        w.focused_pane = 1;
+        w.toggle_zoom();
+        w.detach_pane(1).expect("three panes");
+        assert_ne!(w.focused_pane, 1);
+        assert_eq!(w.zoomed, None);
+    }
+
+    #[test]
+    fn a_joined_pane_gets_an_id_from_the_window_it_lands_in() {
+        // Ids are only unique within a window, so the one it arrived
+        // with means nothing here.
+        let mut source = three();
+        let taken = source.detach_pane(2).expect("three panes");
+
+        let mut target = WindowEntry::single(5, Frame::Session(9));
+        let landed = target.attach_pane(taken, true);
+        assert_eq!(landed, target.next_pane_id - 1);
+        assert_eq!(target.panes.len(), 2);
+        assert_eq!(target.pane(landed).stack, vec![Frame::Session(2)]);
     }
 }

@@ -1091,6 +1091,23 @@ pub enum WindowAction {
     // one, vim Ctrl-w-hjkl style. A no-op if the current window isn't
     // split, or nothing lies in that direction.
     FocusPane(PaneDirection),
+    /// `::bish window swap`/`x`, and `<C-w>x`: exchanges the focused
+    /// pane with the next one in the window, wrapping. Focus follows
+    /// the pane rather than the position, the way vim's own `<C-w>x`
+    /// leaves the cursor in the window that moved.
+    SwapPane,
+    /// `::bish window break`, and `<C-w>T` (vim's own key for moving a
+    /// window out to a tab of its own): takes the focused pane out of
+    /// its window and gives it a new window all to itself.
+    BreakPane,
+    /// `::bish window join <window-id>` / `vjoin`: the reverse. Takes
+    /// that window's focused pane and makes it a pane here, beside the
+    /// focused one; a window with nothing left in it goes away.
+    /// `horizontal` reads exactly as `Split`'s does.
+    JoinPane {
+        from: u32,
+        horizontal: bool,
+    },
     /// `::bish window zoom`/`z`, and `<C-w>z`/`<C-w>o`: the focused
     /// pane fills the whole window until the next zoom toggles it back.
     /// The split tree underneath is untouched, so unzooming restores

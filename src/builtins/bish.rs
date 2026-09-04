@@ -23,8 +23,8 @@ const THEME_SUBCOMMANDS: &[&str] = &["begin", "end"];
 // mistyped single character is a near miss for most of them, so the
 // answer would be arbitrary.
 const WINDOW_SUBCOMMANDS: &[&str] = &[
-    "next", "previous", "new", "create", "close", "quit", "split", "vsplit", "left", "below", "above", "right", "zoom", "balance", "minimize",
-    "sizeup", "sizedown", "size", "fg",
+    "next", "previous", "new", "create", "close", "quit", "split", "vsplit", "left", "below", "above", "right", "zoom", "swap", "break", "join",
+    "vjoin", "balance", "minimize", "sizeup", "sizedown", "size", "fg",
 ];
 
 // "theme, window, hook, hl, lsp, map" -- the list as an error message
@@ -950,6 +950,18 @@ pub(crate) fn run_window_inner(sh: &mut Shell, args: &[String]) -> ExecResult {
         Some("k") | Some("above") => ExecResult::Window(WindowAction::FocusPane(PaneDirection::Up)),
         Some("l") | Some("right") => ExecResult::Window(WindowAction::FocusPane(PaneDirection::Right)),
         Some("zoom") | Some("z") => ExecResult::Window(WindowAction::Zoom),
+        Some("swap") | Some("x") => ExecResult::Window(WindowAction::SwapPane),
+        Some("break") => ExecResult::Window(WindowAction::BreakPane),
+        // `join`/`vjoin` pair with `split`/`vsplit` and mean the same
+        // thing by the same names: `join` puts the pane beside this
+        // one, `vjoin` stacks it underneath.
+        Some(sub @ ("join" | "vjoin")) => match args.get(1).and_then(|a| a.parse::<u32>().ok()) {
+            Some(from) => ExecResult::Window(WindowAction::JoinPane { from, horizontal: sub == "vjoin" }),
+            None => {
+                sh_eprintln!(sh, "bish: window: {sub}: usage: window {sub} <window-id>");
+                ExecResult::Status(2)
+            }
+        },
         Some("=") | Some("balance") => ExecResult::Window(WindowAction::Balance),
         Some("_") | Some("minimize") => ExecResult::Window(WindowAction::Minimize),
         Some("+") | Some("sizeup") => ExecResult::Window(WindowAction::SizeUp),
@@ -976,7 +988,7 @@ pub(crate) fn run_window_inner(sh: &mut Shell, args: &[String]) -> ExecResult {
         None => {
             sh_eprintln!(
                 sh,
-                "bish: window: missing subcommand (next(n)/previous/new(c,create) [--name NAME] [-- CMD]/close(q,quit)/split(s) [CMD]/vsplit(v) [CMD]/h(left)/j(below)/k(above)/l(right)/zoom(z)/=(balance)/_(minimize)/+(sizeup)/-(sizedown)/size <N|N%,N/M>/fg <id>)"
+                "bish: window: missing subcommand (next(n)/previous/new(c,create) [--name NAME] [-- CMD]/close(q,quit)/split(s) [CMD]/vsplit(v) [CMD]/h(left)/j(below)/k(above)/l(right)/zoom(z)/swap(x)/break/join <id>/vjoin <id>/=(balance)/_(minimize)/+(sizeup)/-(sizedown)/size <N|N%,N/M>/fg <id>)"
             );
             ExecResult::Status(2)
         }

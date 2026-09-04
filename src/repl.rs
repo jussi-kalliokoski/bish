@@ -3235,6 +3235,71 @@ fn apply_window_action(app: &mut App, action: WindowAction) {
         WindowAction::Zoom => {
             app.windows[app.current_window].toggle_zoom();
         }
+        WindowAction::SwapPane => {
+            let window = &mut app.windows[app.current_window];
+            window.unzoom();
+            let other = window.pane_after(window.focused_pane);
+            window.swap_panes(window.focused_pane, other);
+        }
+        WindowAction::BreakPane => {
+            let window = &mut app.windows[app.current_window];
+            let focused = window.focused_pane;
+            match window.detach_pane(focused) {
+                Some(pane) => {
+                    let wid = app.next_window_id;
+                    app.next_window_id += 1;
+                    app.windows.push(WindowEntry::from_pane(wid, pane));
+                    app.current_window = app.windows.len() - 1;
+                }
+                // The pane already has a window all to itself, which is
+                // what breaking it out would give it.
+                None => {
+                    let sid = app.windows[app.current_window].owning_session();
+                    app.sessions[&sid].shell.sink_err(
+                        "bish: window: break: this window has only one pane
+",
+                    );
+                }
+            }
+        }
+        WindowAction::JoinPane { from, horizontal } => {
+            let source = app.windows.iter().position(|w| w.id == from);
+            let cur_sid = app.windows[app.current_window].owning_session();
+            match source {
+                None => app.sessions[&cur_sid].shell.sink_err(&format!(
+                    "bish: window: join: no such window: {from}
+"
+                )),
+                Some(index) if index == app.current_window => {
+                    app.sessions[&cur_sid].shell.sink_err(
+                        "bish: window: join: that is this window
+",
+                    );
+                }
+                Some(index) => {
+                    // A window down to its last pane goes away with it:
+                    // `detach_pane` refuses there (a window needs a
+                    // pane), and an empty window left behind in the tab
+                    // bar is not what "join" means.
+                    let pane = match app.windows[index].panes.len() {
+                        1 => {
+                            let mut emptied = app.windows.remove(index);
+                            if index < app.current_window {
+                                app.current_window -= 1;
+                            }
+                            emptied.panes.pop().expect("a window always has at least one pane")
+                        }
+                        _ => {
+                            let focused = app.windows[index].focused_pane;
+                            app.windows[index].detach_pane(focused).expect("more than one pane means one can be taken")
+                        }
+                    };
+                    freeze_focused_idle_prompt(app);
+                    let landed = app.windows[app.current_window].attach_pane(pane, horizontal);
+                    app.windows[app.current_window].focused_pane = landed;
+                }
+            }
+        }
         // Everything from here down either moves focus or reshapes the
         // layout, and a zoom hides both: whatever it did would happen
         // underneath the one pane on screen, invisibly. So each of them
@@ -5709,6 +5774,8 @@ fn window_cmd_to_action(cmd: WindowCmd) -> WindowAction {
         WindowCmd::FocusUp => WindowAction::FocusPane(PaneDirection::Up),
         WindowCmd::FocusRight => WindowAction::FocusPane(PaneDirection::Right),
         WindowCmd::Zoom => WindowAction::Zoom,
+        WindowCmd::SwapPane => WindowAction::SwapPane,
+        WindowCmd::BreakPane => WindowAction::BreakPane,
         WindowCmd::Balance => WindowAction::Balance,
         WindowCmd::Minimize => WindowAction::Minimize,
         WindowCmd::GotoFirstWindow | WindowCmd::GotoLastWindow => {

@@ -526,6 +526,12 @@ pub enum WindowCmd {
     /// `<C-w>z` (tmux's letter) and `<C-w>o` (vim's) -- the focused
     /// pane fills the window until the next press puts the split back.
     Zoom,
+    /// `<C-w>x` -- exchange this pane with the next one, vim's own key
+    /// and vim's own meaning.
+    SwapPane,
+    /// `<C-w>T` -- move this pane out to a tab of its own. Also vim's
+    /// key, where a tab holds windows exactly as a tab here holds panes.
+    BreakPane,
     Balance,
     /// `<C-w> _` -- shrink this pane to its divider. Focus moves to a
     /// neighbour, since a pane showing one row is not somewhere to be;
@@ -2150,6 +2156,8 @@ impl VimKeys {
             // zoom looks like, except nothing is closed and the next
             // press puts it all back.
             Key::Char('z') | Key::Char('o') => self.emit_window(WindowCmd::Zoom),
+            Key::Char('x') => self.emit_window(WindowCmd::SwapPane),
+            Key::Char('T') => self.emit_window(WindowCmd::BreakPane),
             Key::Char('=') => self.emit_window(WindowCmd::Balance),
             // vim spells "make this pane as small as it goes" the same way.
             Key::Char('_') => self.emit_window(WindowCmd::Minimize),
@@ -2395,6 +2403,8 @@ fn describe_window_cmd(cmd: &WindowCmd) -> &'static str {
         WindowCmd::FocusUp => "focus-up",
         WindowCmd::FocusRight => "focus-right",
         WindowCmd::Zoom => "zoom",
+        WindowCmd::SwapPane => "swap-pane",
+        WindowCmd::BreakPane => "break-pane",
         WindowCmd::Balance => "balance",
         WindowCmd::Minimize => "minimize",
         WindowCmd::GotoFirstWindow => "goto-first",
@@ -3128,6 +3138,8 @@ mod tests {
             ('=', WindowCmd::Balance),
             ('z', WindowCmd::Zoom),
             ('o', WindowCmd::Zoom),
+            ('x', WindowCmd::SwapPane),
+            ('T', WindowCmd::BreakPane),
         ];
         for (ch, cmd) in cases {
             let mut vk = VimKeys::new();
@@ -3147,7 +3159,9 @@ mod tests {
     fn window_leader_unrecognized_continuation_aborts() {
         let mut vk = VimKeys::new();
         assert_eq!(vk.feed(Key::CtrlW), KeyOutcome::Pending);
-        assert_eq!(vk.feed(Key::Char('x')), KeyOutcome::None);
+        // `?` is not a window command and is not likely to become one;
+        // this test used to use `x`, which then became swap-pane.
+        assert_eq!(vk.feed(Key::Char('?')), KeyOutcome::None);
         // aborted cleanly -- next key starts fresh
         assert_eq!(vk.feed(Key::Char('w')), KeyOutcome::Motion(Motion::WordForward, None));
     }
