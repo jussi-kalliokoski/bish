@@ -12049,6 +12049,21 @@ enum LineCommand {
         to: LineRef,
         dest: LineRef,
     },
+    /// `:1t$` -- `:m` that leaves the original where it is. Its other
+    /// spellings are `:copy` and `:co`.
+    Copy {
+        from: LineRef,
+        to: LineRef,
+        dest: LineRef,
+    },
+    /// `:>` and `:<`, one shift per repeated character: `:>>` shifts
+    /// twice.
+    Shift {
+        from: LineRef,
+        to: LineRef,
+        right: bool,
+        times: usize,
+    },
     Normal(String),
 }
 
@@ -12068,11 +12083,27 @@ fn parse_line_command(trimmed: &str) -> Option<LineCommand> {
         // A range and nothing after it: go to its last line. `:` alone
         // is not this -- `parse_range_prefix` found no address at all.
         (None, Some((_, to))) => Some(LineCommand::Goto(to)),
-        (Some('d'), Some((from, to))) if i + 1 == chars.len() => Some(LineCommand::Delete { from, to }),
+        // A missing range means the current line, which is what makes
+        // a bare `:d` and a bare `:>` mean anything at all.
+        (Some('d'), range) if i + 1 == chars.len() => {
+            let (from, to) = range.unwrap_or((LineRef::Current, LineRef::Current));
+            Some(LineCommand::Delete { from, to })
+        }
         (Some('m'), Some((from, to))) => {
             let mut j = i + 1;
             let dest = parse_one_line_ref(&chars, &mut j)?;
             (j == chars.len()).then_some(LineCommand::Move { from, to, dest })
+        }
+        (Some('t'), Some((from, to))) => {
+            let mut j = i + 1;
+            let dest = parse_one_line_ref(&chars, &mut j)?;
+            (j == chars.len()).then_some(LineCommand::Copy { from, to, dest })
+        }
+        (Some(&c @ ('>' | '<')), range) => {
+            let (from, to) = range.unwrap_or((LineRef::Current, LineRef::Current));
+            let right = c == '>';
+            let times = chars[i..].iter().take_while(|ch| **ch == c).count();
+            (i + times == chars.len()).then_some(LineCommand::Shift { from, to, right, times })
         }
         _ => None,
     }
@@ -12129,6 +12160,38 @@ fn run_line_command(tb: &mut TextBuffer, cmd: &LineCommand) -> Result<(), String
             let text = text.strip_suffix('\n').unwrap_or(&text).to_string();
             tb.set_cursor(row.min(tb.line_count()), 0);
             insert_lines_at(tb, row, &text);
+            Ok(())
+        }
+        LineCommand::Copy { from, to, dest } => {
+            let (a, b) = ordered(from, to, current, last);
+            let dest = match dest {
+                LineRef::Current => current + 1,
+                LineRef::Last => last + 1,
+                LineRef::Number(n) => n.min(last + 1),
+            };
+            // Nothing is lifted out, so unlike `:m` the destination
+            // needs no adjusting -- and copying a range into itself is
+            // perfectly well defined.
+            let text = crate::bishedit::motion::extract_text(
+                &*tb,
+                &crate::bishedit::motion::MotionRange { shape: crate::bishedit::motion::MotionShape::Linewise, from: (a, 0), to: (b, 0) },
+            );
+            let text = text.strip_suffix('\n').unwrap_or(&text).to_string();
+            tb.set_cursor(dest.min(tb.line_count()), 0);
+            insert_lines_at(tb, dest, &text);
+            Ok(())
+        }
+        LineCommand::Shift { from, to, right, times } => {
+            let (a, b) = ordered(from, to, current, last);
+            for row in a..=b.min(tb.line_count().saturating_sub(1)) {
+                for _ in 0..times {
+                    match right {
+                        true => crate::fileeditor::indent_rows(tb, row, row),
+                        false => crate::fileeditor::outdent_rows(tb, row, row),
+                    }
+                }
+            }
+            tb.set_cursor(b.min(tb.line_count().saturating_sub(1)), 0);
             Ok(())
         }
         LineCommand::Normal(_) => Ok(()),
@@ -13440,6 +13503,10 @@ mod substitute_command_tests {
     #[test]
     fn parse_line_command_recognizes_an_address_a_delete_a_move_and_normal() {
         use LineCommand::*;
+        assert_eq!(parse_line_command(">"), Some(Shift { from: LineRef::Current, to: LineRef::Current, right: true, times: 1 }));
+        assert_eq!(parse_line_command(">>"), Some(Shift { from: LineRef::Current, to: LineRef::Current, right: true, times: 2 }));
+        assert_eq!(parse_line_command("1,2<"), Some(Shift { from: LineRef::Number(1), to: LineRef::Number(2), right: false, times: 1 }));
+        assert_eq!(parse_line_command("1t$"), Some(Copy { from: LineRef::Number(1), to: LineRef::Number(1), dest: LineRef::Last }));
         assert_eq!(parse_line_command("2"), Some(Goto(LineRef::Number(2))));
         assert_eq!(parse_line_command("$"), Some(Goto(LineRef::Last)));
         assert_eq!(parse_line_command("2d"), Some(Delete { from: LineRef::Number(2), to: LineRef::Number(2) }));
@@ -13452,9 +13519,20 @@ mod substitute_command_tests {
 
         // Everything else still belongs to the ordinary dispatch, which
         // only ever sees it if this says no.
-        for other in ["w", "wq", "q!", "set number", "diag", "d", "2dd", "2x", "1m", "normal"] {
+        // A bare `d` and a bare `>` mean the current line, as they do
+        // in vim -- the rest still belong to the ordinary dispatch,
+        // which only ever sees them if this says no.
+        assert_eq!(parse_line_command("d"), Some(Delete { from: LineRef::Current, to: LineRef::Current }));
+        for other in ["w", "wq", "q!", "set number", "diag", "2dd", "2x", "1m", "normal"] {
             assert_eq!(parse_line_command(other), None, "{other:?}");
         }
+    }
+
+    #[test]
+    fn ex_shift_and_copy_change_the_buffer() {
+        let mut buf = buffer_of("a\nb\n");
+        run_line_command(&mut buf, &LineCommand::Shift { from: LineRef::Current, to: LineRef::Current, right: true, times: 1 }).unwrap();
+        assert_eq!(lines_of(&buf), "    a\nb\n");
     }
 
     fn buffer_of(text: &str) -> TextBuffer {

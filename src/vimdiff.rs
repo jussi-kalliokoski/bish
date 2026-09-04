@@ -183,6 +183,54 @@ mod tests {
         // -- arithmetic on the buffer ----------------------------------
         case("ctrl-a", "x 41 y\n", "\u{1}"),
         case("ctrl-x", "x 41 y\n", "\u{18}"),
+        // -- roadmap 05 item 8: a sweep of untouched editor ground ----
+        // Joining, and the shorthand operators -- the ones that are a
+        // whole command in one key.
+        case("join-lines", "a\nb\n", "J"),
+        case("join-with-count", "a\nb\nc\n", "3J"),
+        case("join-without-a-space", "a\nb\n", "gJ"),
+        case("capital-d", "abc\n", "lD"),
+        case("capital-c", "abc\n", "lCX\u{1b}"),
+        case("capital-s", "abc\ndef\n", "SX\u{1b}"),
+        case("capital-y-then-p", "a\nb\n", "Yp"),
+        case("capital-p", "a\nb\n", "yyP"),
+        case("capital-a", "ab\n", "AX\u{1b}"),
+        case("capital-i", "  ab\n", "IX\u{1b}"),
+        case("capital-o", "b\n", "OX\u{1b}"),
+        case("replace-mode", "abcd\n", "RXY\u{1b}"),
+        // The two swaps every vim tutorial teaches.
+        case("xp-swaps-two-characters", "ab\n", "xp"),
+        case("ddp-swaps-two-lines", "a\nb\n", "ddp"),
+        // Word motions that are not `w`.
+        case("b-motion", "one two\n", "$bD"),
+        case("capital-w-motion", "a.b c\n", "WD"),
+        case("capital-e-motion", "a.b c\n", "ED"),
+        case("capital-b-motion", "a.b c\n", "$BD"),
+        // Motions to a place on the screen rather than in the text.
+        case("h-motion", "a\nb\nc\n", "GHdd"),
+        case("m-motion", "a\nb\nc\n", "Mdd"),
+        case("l-motion", "a\nb\nc\n", "Ldd"),
+        case("g-with-a-count", "a\nb\nc\n", "2Gdd"),
+        // Column motions.
+        case("pipe-motion", "abcdef\n", "4|D"),
+        case("caret-motion", "  abc\n", "^D"),
+        case("dollar-motion", "abc\n", "0$x"),
+        // A brace text object, and a mark used charwise.
+        case("di-brace", "x{ab}y\n", "fadi{"),
+        case("backtick-mark", "abc\n", "lmax0d`a"),
+        // Registers: appending with an uppercase name.
+        case("uppercase-register-appends", "a\nb\n", "\"ayyj\"Ayygg\"ap"),
+        // Ex forms the corpus had not reached.
+        case("ex-copy-a-line", "a\nb\n", ":1t$\r"),
+        case("ex-invert-global", "a\nb\na\n", ":v/b/d\r"),
+        case("hash-search", "aa\nbb\naa\n", "G#dd"),
+        // Editing keys that only exist in insert mode.
+        case("ctrl-w-in-insert", "\n", "iab cd\u{17}\u{1b}"),
+        case("ctrl-u-in-insert", "\n", "iabc\u{15}X\u{1b}"),
+        // Case operators, and a count on a shift.
+        case("gu-upper-a-word", "abc\n", "gUiw"),
+        case("g-tilde-a-line", "aBc\n", "g~~"),
+        case("visual-paste-over", "ab\ncd\n", "yyjVp"),
     ];
 
     // Cases bish does not match today, each with why. Asserted to
@@ -194,14 +242,23 @@ mod tests {
             "`>>` inserts four spaces where `vim -u NONE` inserts a tab -- bish reads .editorconfig and defaults to spaces, which is a choice rather than a bug, but it is a difference and it is recorded",
         ),
         ("visual-indent", "indents with spaces where `vim -u NONE` uses a tab -- the same deliberate choice as `indent-width`"),
+        // Both of these do the right thing and reach it with the wrong
+        // character: the shift happens, on the right lines, in spaces.
+        ("ex-shift-right", "`:>` shifts with spaces where `vim -u NONE` uses a tab -- the same choice as `indent-width`"),
+        ("shift-right-with-count", "`2>>` shifts both lines, in spaces where `vim -u NONE` uses a tab -- the same choice as `indent-width`"),
         (
             "cc-keeps-the-indent",
             "`cc` leaves the line's indentation and starts the insert past it, where `vim -u NONE` (which has no autoindent) starts at column zero -- bish's `o`/`O` carry the indent too, so this is that same choice rather than a `cc` bug",
         ),
     ];
 
-    const PENDING: &[Case] =
-        &[case("indent-width", "a\nb\n", ">>"), case("visual-indent", "a\nb\n", "Vj>"), case("cc-keeps-the-indent", "  abc\ndef\n", "ccZ\u{1b}")];
+    const PENDING: &[Case] = &[
+        case("indent-width", "a\nb\n", ">>"),
+        case("visual-indent", "a\nb\n", "Vj>"),
+        case("cc-keeps-the-indent", "  abc\ndef\n", "ccZ\u{1b}"),
+        case("ex-shift-right", "a\n", ":>\r"),
+        case("shift-right-with-count", "a\nb\n", "2>>"),
+    ];
 
     fn have_vim() -> bool {
         Path::new(VIM).exists()

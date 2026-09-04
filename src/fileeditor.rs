@@ -696,7 +696,7 @@ fn outdent_chars(buf: &TextBuffer, row: usize) -> usize {
 // line range: `>`/`<` act linewise regardless of the motion/selection
 // that produced it (see `vimkeys::Op::Indent`'s own doc comment), so
 // there's no shape/column math left to do here, just the two row bounds.
-fn indent_rows(buf: &mut TextBuffer, from_row: usize, to_row: usize) {
+pub(crate) fn indent_rows(buf: &mut TextBuffer, from_row: usize, to_row: usize) {
     for row in from_row..=to_row {
         if buf.line_len(row) == 0 {
             continue;
@@ -709,7 +709,7 @@ fn indent_rows(buf: &mut TextBuffer, from_row: usize, to_row: usize) {
 // INDENT_WIDTH columns of leading whitespace from every line in range --
 // vim's own "outdent removes at most one shiftwidth's worth" rule (a
 // line indented less than that just loses whatever it has).
-fn outdent_rows(buf: &mut TextBuffer, from_row: usize, to_row: usize) {
+pub(crate) fn outdent_rows(buf: &mut TextBuffer, from_row: usize, to_row: usize) {
     for row in from_row..=to_row {
         // In *columns*, not characters: with `expandtab` off one tab is
         // a whole indent, so stripping `shiftwidth` characters would
@@ -1208,7 +1208,14 @@ pub(crate) fn resolve_insert_start(buf: &mut TextBuffer, cmd: InsertCmd) {
     match cmd {
         InsertCmd::Before => {}
         InsertCmd::After => buf.set_cursor(row, (col + 1).min(buf.line_len(row))),
-        InsertCmd::LineStart => buf.set_cursor(row, 0),
+        // `I` inserts at the first non-blank, which is where `^` goes
+        // -- not at column zero. On an indented line the two are
+        // different places, and column zero is the one nobody means:
+        // it puts the text in front of the indentation.
+        InsertCmd::LineStart => {
+            let col = motion::first_non_blank(buf, row);
+            buf.set_cursor(row, col);
+        }
         InsertCmd::LineEnd => {
             let len = buf.line_len(row);
             buf.set_cursor(row, len);
@@ -1905,6 +1912,23 @@ pub(crate) fn run_insert_mode(
             // clean way to un-accumulate.
             Key::CtrlW => {
                 if let Some(range) = motion::motion_range(buf, motion::Motion::WordBackward, None) {
+                    buf.delete_range(&range);
+                    cursors[0] = buf.cursor();
+                }
+            }
+            // Ctrl-U: back to the start of the line's text. Insert mode
+            // had no arm for it at all, so it did nothing -- while the
+            // *line* editor has always had it. Stopping at the first
+            // non-blank rather than at column zero keeps the
+            // indentation, which is what makes it usable on an indented
+            // line; from inside the indentation there is nothing left
+            // to keep, so it goes to the start.
+            Key::CtrlU => {
+                let (row, col) = buf.cursor();
+                let indent = motion::first_non_blank(buf, row);
+                let target = if col > indent { indent } else { 0 };
+                if target < col {
+                    let range = motion::MotionRange { shape: motion::MotionShape::Exclusive, from: (row, target), to: (row, col) };
                     buf.delete_range(&range);
                     cursors[0] = buf.cursor();
                 }
