@@ -2851,7 +2851,16 @@ impl Shell {
             match self.functions.get(&name).cloned() {
                 Some(body) => {
                     if names_only {
-                        sh_println!(self, "declare -f {}", name);
+                        // `declare -F name` prints the bare name;
+                        // `declare -F` with no names prints a
+                        // `declare -f NAME` line for each, which is
+                        // what makes the listing re-readable. Printing
+                        // the long form either way answered a question
+                        // about one function with a declaration of it.
+                        match names.is_empty() {
+                            true => sh_println!(self, "declare -f {}", name),
+                            false => sh_println!(self, "{}", name),
+                        }
                     } else {
                         let def = parser::Command::FuncDef { name: name.clone(), body: Box::new(body) };
                         let src = crate::serialize::serialize_program(&[ListItem {
@@ -7184,42 +7193,32 @@ impl Shell {
                 // enumeration below.
                 let shifted_array_literals: Vec<_> =
                     array_literal_args.iter().filter_map(|(p, n, m, i)| p.checked_sub(1).map(|p2| (p2, n.clone(), *m, i.clone()))).collect();
+                // `-r` was not handled at all, and the letters did not
+                // cluster: `local -ir v=1` set neither attribute, so
+                // the readonly was silently not a readonly. Same shape
+                // as `declare`'s own list -- every flag here is a
+                // single letter with no argument of its own.
+                let mut readonly_flag = false;
                 for (i, a) in argv[1..].iter().enumerate() {
-                    match a.as_str() {
-                        "-a" => {
-                            array_mode = Some(false);
-                            continue;
+                    if a.len() > 1 && a.starts_with('-') && a != "--" {
+                        for c in a.chars().skip(1) {
+                            match c {
+                                'a' => array_mode = Some(false),
+                                'A' => array_mode = Some(true),
+                                'i' => integer_flag = true,
+                                'n' => nameref_flag = true,
+                                'u' => upper_flag = true,
+                                'l' => lower_flag = true,
+                                'x' => export_flag = true,
+                                'g' => global_flag = true,
+                                'r' => readonly_flag = true,
+                                _ => {}
+                            }
                         }
-                        "-A" => {
-                            array_mode = Some(true);
-                            continue;
-                        }
-                        "-i" => {
-                            integer_flag = true;
-                            continue;
-                        }
-                        "-n" => {
-                            nameref_flag = true;
-                            continue;
-                        }
-                        "-u" => {
-                            upper_flag = true;
-                            continue;
-                        }
-                        "-l" => {
-                            lower_flag = true;
-                            continue;
-                        }
-                        "-x" => {
-                            export_flag = true;
-                            continue;
-                        }
-                        "-g" => {
-                            global_flag = true;
-                            continue;
-                        }
-                        _ if a.starts_with('-') => continue,
-                        _ => {}
+                        continue;
+                    }
+                    if a == "--" {
+                        continue;
                     }
                     // `local -A m=([a]=1 [b]=2)` -- this position is
                     // actually an array literal (`a` here is just its
@@ -7246,6 +7245,17 @@ impl Shell {
                             None => {}
                         }
                         self.apply_array_literal(name, *mode, items);
+                        for (set, table) in [
+                            (integer_flag, &mut self.integer_names),
+                            (upper_flag, &mut self.upper_names),
+                            (lower_flag, &mut self.lower_names),
+                            (export_flag, &mut self.exported_names),
+                            (readonly_flag, &mut self.readonly_names),
+                        ] {
+                            if set {
+                                table.insert(name.clone());
+                            }
+                        }
                         continue;
                     }
                     let (n, v) = match a.find('=') {
@@ -7312,6 +7322,9 @@ impl Shell {
                             if export_flag {
                                 self.exported_names.insert(n.clone());
                                 self.export_to_environment(&n, &v);
+                            }
+                            if readonly_flag {
+                                self.readonly_names.insert(n.clone());
                             }
                             self.var_scopes.last_mut().unwrap().insert(n, Some(v));
                         }
@@ -9615,7 +9628,9 @@ impl Shell {
                 TransformKind::AttributeFlags => self.attribute_flags_string(name),
                 TransformKind::KeyValue => apply_transform(&cur, TransformKind::Quote),
                 TransformKind::Prompt => self.expand_prompt_string(&cur),
-                TransformKind::Quote | TransformKind::Upper | TransformKind::Lower | TransformKind::Escape => apply_transform(&cur, *kind),
+                TransformKind::Quote | TransformKind::Upper | TransformKind::UpperFirst | TransformKind::Lower | TransformKind::Escape => {
+                    apply_transform(&cur, *kind)
+                }
             },
         }
     }
@@ -9640,7 +9655,9 @@ impl Shell {
         // script re-quotes an array for `eval`. Applying the transform
         // to the joined string instead produced one word holding
         // `'a b'` where bash gives `'a' 'b'`.
-        if let VarOp::Transform(kind @ (TransformKind::Quote | TransformKind::Upper | TransformKind::Lower | TransformKind::Escape)) = op
+        if let VarOp::Transform(
+            kind @ (TransformKind::Quote | TransformKind::Upper | TransformKind::UpperFirst | TransformKind::Lower | TransformKind::Escape),
+        ) = op
             && matches!(index, Some("@") | Some("*"))
         {
             let items = self.array_all(name);
@@ -9842,7 +9859,9 @@ impl Shell {
                     }
                 }
                 TransformKind::Prompt => self.expand_prompt_string(&cur),
-                TransformKind::Quote | TransformKind::Upper | TransformKind::Lower | TransformKind::Escape => apply_transform(&cur, *kind),
+                TransformKind::Quote | TransformKind::Upper | TransformKind::UpperFirst | TransformKind::Lower | TransformKind::Escape => {
+                    apply_transform(&cur, *kind)
+                }
             },
         }
     }
@@ -14283,6 +14302,13 @@ fn apply_transform(cur: &str, kind: TransformKind) -> String {
     match kind {
         TransformKind::Quote => crate::serialize::quote_literal(cur),
         TransformKind::Upper => cur.to_uppercase(),
+        TransformKind::UpperFirst => {
+            let mut chars = cur.chars();
+            match chars.next() {
+                Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+                None => String::new(),
+            }
+        }
         TransformKind::Lower => cur.to_lowercase(),
         TransformKind::Escape => expand_backslash_escapes(cur),
         TransformKind::Attributes | TransformKind::AttributeFlags | TransformKind::KeyValue | TransformKind::Prompt => {
@@ -17118,7 +17144,17 @@ mod tests {
         let mut shell = Shell::new();
         shell.run_source_here("foo() { echo hi; }", "<test>");
         let buf = capture_output(&mut shell);
+        // Named: the bare name, which is what this test has always been
+        // called and what bash prints. The assertion said `declare -f
+        // foo` -- the long form -- so the name described bash and the
+        // assertion pinned what bish did instead.
         crate::builtins::vars::run_declare(&mut shell, "declare", &strs(&["-F", "foo"]), &[]);
+        assert_eq!(buf.borrow().as_str(), "foo\n");
+        // Unnamed: a re-readable declaration line per function, which
+        // is the other half of bash's rule and the reason the two
+        // forms differ at all.
+        buf.borrow_mut().clear();
+        crate::builtins::vars::run_declare(&mut shell, "declare", &strs(&["-F"]), &[]);
         assert_eq!(buf.borrow().as_str(), "declare -f foo\n");
     }
 

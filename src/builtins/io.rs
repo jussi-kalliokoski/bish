@@ -119,9 +119,19 @@ pub(crate) fn run_printf(sh: &mut Shell, args: &[String]) -> i32 {
     }
 
     match var_name {
-        Some(name) => {
-            sh.assign_var(&name, out);
-        }
+        // `printf -v 'arr[0]'` writes an array *element*, which is how
+        // a loop fills an array without a subshell. It was assigning to
+        // a variable literally named `arr[0]`, which nothing can then
+        // expand.
+        Some(name) => match name.split_once('[').and_then(|(base, rest)| rest.strip_suffix(']').map(|i| (base, i))) {
+            Some((base, index)) => {
+                let (base, index) = (base.to_string(), index.to_string());
+                sh.array_set_index_public(&base, &index, out);
+            }
+            None => {
+                sh.assign_var(&name, out);
+            }
+        },
         None => sh_print!(sh, "{}", out),
     }
     status

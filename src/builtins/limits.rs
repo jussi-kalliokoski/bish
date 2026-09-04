@@ -249,7 +249,9 @@ pub(crate) fn run_times(sh: &mut Shell, args: &[String]) -> i32 {
 }
 
 pub(crate) fn run_umask(sh: &mut Shell, args: &[String]) -> i32 {
-    let symbolic = args.iter().any(|a| a == "-S");
+    // Clustered, like every other builtin's: `umask -pS` is `-p -S`.
+    let has = |want: char| args.iter().filter(|a| a.len() > 1 && a.starts_with('-')).any(|a| a.chars().skip(1).any(|c| c == want));
+    let symbolic = has('S');
     match args.iter().find(|a| !a.starts_with('-')) {
         Some(s) => match u32::from_str_radix(s, 8) {
             Ok(m) => {
@@ -270,10 +272,19 @@ pub(crate) fn run_umask(sh: &mut Shell, args: &[String]) -> i32 {
         },
         None => {
             let cur = current_umask();
+            // `-p` prints it as the command that would set it again,
+            // which is the whole point of the flag: `umask -p` into a
+            // file, source it back, same mask. It was being accepted
+            // and ignored, so the output could not be re-read.
+            let prefix = match (has('p'), symbolic) {
+                (true, true) => "umask -S ",
+                (true, false) => "umask ",
+                (false, _) => "",
+            };
             if symbolic {
-                sh_println!(sh, "{}", umask_symbolic(cur));
+                sh_println!(sh, "{}{}", prefix, umask_symbolic(cur));
             } else {
-                sh_println!(sh, "{:04o}", cur);
+                sh_println!(sh, "{}{:04o}", prefix, cur);
             }
             0
         }

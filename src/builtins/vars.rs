@@ -95,13 +95,31 @@ fn is_valid_declare_target(word: &str) -> bool {
     matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_') && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
+// The flag letters in one argument, if it is one. `declare -ir n=1`
+// carries two; matching whole strings saw neither, so the attributes
+// were silently dropped and `declare -p` reported a plain variable.
+// Every flag this family takes is a single letter with no argument of
+// its own, which is what makes the whole argument readable at once.
+//
+// `--` ends the options and is not one; a lone `-` is an operand.
+fn flag_letters(arg: &str) -> Option<impl Iterator<Item = char> + '_> {
+    match arg.len() > 1 && arg.starts_with('-') && arg != "--" {
+        true => Some(arg.chars().skip(1)),
+        false => None,
+    }
+}
+
+fn has_flag(args: &[String], want: char) -> bool {
+    args.iter().take_while(|a| *a != "--").filter_map(|a| flag_letters(a)).any(|mut cs| cs.any(|c| c == want))
+}
+
 pub(crate) fn run_declare(sh: &mut Shell, who: &str, args: &[String], array_literals: &[(usize, String, AssignMode, Vec<ArrayLiteralItem>)]) -> i32 {
-    if args.iter().any(|a| a == "-f" || a == "-F") {
-        let names_only = args.iter().any(|a| a == "-F");
+    if has_flag(args, 'f') || has_flag(args, 'F') {
+        let names_only = has_flag(args, 'F');
         let names: Vec<String> = args.iter().filter(|a| !a.starts_with('-')).cloned().collect();
         return sh.print_functions(&names, names_only);
     }
-    if args.iter().any(|a| a == "-p") {
+    if has_flag(args, 'p') {
         let names: Vec<String> = args.iter().filter(|a| !a.starts_with('-')).cloned().collect();
         return sh.print_declared(&names);
     }
@@ -140,44 +158,24 @@ pub(crate) fn run_declare(sh: &mut Shell, who: &str, args: &[String], array_lite
             after_dashdash = true;
             continue;
         }
-        match a.as_str() {
-            "-A" => {
-                array_mode = Some(true);
-                continue;
+        if !after_dashdash && let Some(letters) = flag_letters(a) {
+            for c in letters {
+                match c {
+                    'A' => array_mode = Some(true),
+                    'a' => array_mode = Some(false),
+                    'r' => readonly_flag = true,
+                    'i' => integer_flag = true,
+                    'n' => nameref_flag = true,
+                    'u' => upper_flag = true,
+                    'l' => lower_flag = true,
+                    'x' => export_flag = true,
+                    'g' => global_flag = true,
+                    // Every other letter is accepted and does nothing,
+                    // as it was before this read them one at a time.
+                    _ => {}
+                }
             }
-            "-a" => {
-                array_mode = Some(false);
-                continue;
-            }
-            "-r" => {
-                readonly_flag = true;
-                continue;
-            }
-            "-i" => {
-                integer_flag = true;
-                continue;
-            }
-            "-n" => {
-                nameref_flag = true;
-                continue;
-            }
-            "-u" => {
-                upper_flag = true;
-                continue;
-            }
-            "-l" => {
-                lower_flag = true;
-                continue;
-            }
-            "-x" => {
-                export_flag = true;
-                continue;
-            }
-            "-g" => {
-                global_flag = true;
-                continue;
-            }
-            _ => {}
+            continue;
         }
         // `declare -A m=([a]=1 [b]=2)` -- this position is actually
         // an array literal, not a plain `NAME`/`NAME=value` string
@@ -199,6 +197,21 @@ pub(crate) fn run_declare(sh: &mut Shell, who: &str, args: &[String], array_lite
                 None => {}
             }
             sh.apply_array_literal(name, *mode, items);
+            // The other attributes apply to an array too:
+            // `declare -ax a=(1)` is exported as well as indexed, and
+            // only `-r` was being recorded here.
+            if integer_flag {
+                sh.integer_names.insert(name.clone());
+            }
+            if upper_flag {
+                sh.upper_names.insert(name.clone());
+            }
+            if lower_flag {
+                sh.lower_names.insert(name.clone());
+            }
+            if export_flag {
+                sh.exported_names.insert(name.clone());
+            }
             if readonly_flag {
                 sh.readonly_names.insert(name.clone());
             }

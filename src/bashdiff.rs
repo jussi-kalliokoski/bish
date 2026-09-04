@@ -848,6 +848,28 @@ y
         // base ten on a zero-padded number, failed outright.
         case("a-base-prefix-in-front-of-an-expansion", r#"x=010; echo $((10#$x)) $((16#$x)); v=07; echo $((10#$v)) $((8#$v))"#),
         case("an-expansion-inside-arithmetic", r#"x=1+1; echo $((x)) $(($x)); n=3; echo $(( n * $n )); echo $((2#$(echo 101)))"#),
+        // The flag letters of the declare family cluster, like every
+        // other builtin's. Matching whole arguments saw neither letter
+        // of `declare -ir`, so the attributes were silently dropped --
+        // and `local` had no `-r` at all, which made a readonly local
+        // not readonly.
+        case("declare-clusters-its-flags", r#"declare -ix n=1; echo "${n@a}"; declare -ir m=1; declare -p m; declare -ax a=(1); declare -p a"#),
+        case("local-clusters-its-flags", r#"f(){ local -ir v=1; declare -p v; local -ax a=(1); declare -p a; }; f"#),
+        case("a-readonly-local-is-readonly", r#"f(){ local -r v=1; v=2; }; f 2>/dev/null; echo "rc=$?""#),
+        // `declare -F name` prints the bare name; `declare -F` with no
+        // names prints a re-readable `declare -f NAME` line for each.
+        case("declare-capital-f-with-and-without-a-name", r#"f(){ :; }; g(){ :; }; declare -F f; declare -F | head -2"#),
+        // `${v@u}` uppercases the first character.
+        case("the-upper-first-transform", r#"x=abc; echo "${x@u}${x@U}${x@L}"; a=(one two); echo "${a[@]@u}""#),
+        // `umask -p` prints the command that would set it again, which
+        // is the whole point of the flag.
+        case("umask-p-is-re-readable", r#"umask 022; umask -p; umask -S; umask -pS"#),
+        // `printf -v 'arr[0]'` writes an array element -- the way a
+        // loop fills an array without a subshell.
+        case(
+            "printf-v-into-an-array-element",
+            r#"for i in 0 1; do printf -v "a[$i]" "v$i"; done; echo "${a[*]}"; declare -A m; printf -v "m[k]" z; echo "${m[k]}""#,
+        ),
         // `&` makes a job, which means a child. Only an external and a
         // subshell took any notice of it: a builtin, a function, a
         // group, a loop and a bare assignment all ran in this shell,

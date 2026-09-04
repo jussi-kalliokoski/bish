@@ -315,6 +315,7 @@ fn serialize_var_op(name: &str, op: &VarOp) -> String {
             let letter = match kind {
                 TransformKind::Quote => "Q",
                 TransformKind::Upper => "U",
+                TransformKind::UpperFirst => "u",
                 TransformKind::Lower => "L",
                 TransformKind::Escape => "E",
                 TransformKind::Attributes => "A",

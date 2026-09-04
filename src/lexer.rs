@@ -132,8 +132,10 @@ pub enum ReplaceAnchor {
 pub enum TransformKind {
     // Shell-quoted so the result can be reused as input (`${v@Q}`).
     Quote,
-    // Upper/lowercase the entire value (`${v@U}`/`${v@L}`).
+    // Upper/lowercase the entire value (`${v@U}`/`${v@L}`), and
+    // uppercase just the first character (`${v@u}`).
     Upper,
+    UpperFirst,
     Lower,
     // Expands backslash escape sequences in the value the same way
     // `$'...'` does (`${v@E}`).
@@ -2183,6 +2185,7 @@ fn parse_operator_suffix(rest: &str) -> Option<VarOp> {
         return match spec {
             "Q" => Some(VarOp::Transform(TransformKind::Quote)),
             "U" => Some(VarOp::Transform(TransformKind::Upper)),
+            "u" => Some(VarOp::Transform(TransformKind::UpperFirst)),
             "L" => Some(VarOp::Transform(TransformKind::Lower)),
             "E" => Some(VarOp::Transform(TransformKind::Escape)),
             "A" => Some(VarOp::Transform(TransformKind::Attributes)),
