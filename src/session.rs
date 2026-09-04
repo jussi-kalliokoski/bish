@@ -436,25 +436,65 @@ impl Decoder {
 // on the main thread is what lets accept/attach/detach state
 // (`client_read`, `just_attached`) stay a single, non-atomic
 // `Option`/`bool` with no synchronization needed.
+// The size a session shared by these clients runs at: the smallest in
+// each direction, taken independently, so a tall narrow terminal beside
+// a short wide one leaves both able to see the whole screen.
+//
+// A client that has not sent its Handshake yet reports (0, 0) and is
+// skipped -- it must not shrink the session to nothing for everybody
+// else while its first message is still in flight. `None` (nobody
+// attached, or nobody who has said anything yet) means leave the pty at
+// whatever size it already has.
+fn smallest_size(sizes: &[(u16, u16)]) -> Option<(u16, u16)> {
+    let rows = sizes.iter().map(|(r, _)| *r).filter(|r| *r > 0).min()?;
+    let cols = sizes.iter().map(|(_, c)| *c).filter(|c| *c > 0).min()?;
+    Some((rows, cols))
+}
+
+// Names one attached client for as long as it is attached. Never
+// reused, so the write half the drain thread holds and the read half
+// the main thread holds can always be matched back up -- pairing them
+// by position in two separate lists would go wrong the first time a
+// client in the middle detached.
+type ClientId = u64;
+
+// One attached client, from the main thread's side.
+struct Client {
+    id: ClientId,
+    // Read from directly by drain_one_client; the matching write half
+    // lives in `writes`, where the drain thread can reach it.
+    read: UnixStream,
+    // Per client, because two clients' byte streams have nothing to do
+    // with each other: one decoder shared between them would splice
+    // half of one client's frame onto half of another's.
+    decoder: Decoder,
+    // The last size this client reported -- its Handshake, then every
+    // Resize. The pty gets the *smallest* of these, which is what makes
+    // a session shared by two differently-sized terminals legible in
+    // both. tmux's own rule.
+    size: (u16, u16),
+}
+
+// How many clients one session will hold at once. No real workflow
+// wants more than a couple; the cap is here so a runaway attach loop
+// cannot walk the daemon out of file descriptors.
+const MAX_CLIENTS: usize = 16;
+
 pub struct SessionBridge {
     listener: UnixListener,
-    // The main thread's own handle: read from directly (drain_client),
-    // written to only via a fresh try_clone() each time a new client is
-    // accepted (see try_accept) -- kept distinct from
-    // `client_write_shared` below so accept/detach only ever need to
-    // touch this field, no lock required on the hot path most on_idle
-    // ticks actually take (no new client, no new input).
-    client_read: Option<UnixStream>,
+    // The main thread's own handles, one per attached client.
+    clients: Vec<Client>,
     // Shared with the background pty-master-draining thread -- the only
-    // thing that thread ever touches. Updated (attach: Some, detach/
-    // EOF: None) by the main thread alongside `client_read` so both
-    // always agree on whether a client is currently attached.
-    client_write: Arc<Mutex<Option<UnixStream>>>,
+    // thing that thread ever touches. Every attached client's write
+    // half, each tagged with its own id so the main thread can take one
+    // away without disturbing the others. Kept in step with `clients`
+    // by attach/detach, the only two places either is ever changed.
+    writes: Arc<Mutex<Vec<(ClientId, UnixStream)>>>,
+    next_client_id: ClientId,
     // The main thread's own pty-master handle -- writes only (client
     // input, `Pty::set_size`); the background thread owns the read side
     // via its own separate fd (see SessionBridge::new).
     pty_master: std::fs::File,
-    decoder: Decoder,
     // Set true the moment a connection is accepted (a first attach *or*
     // a reattach after a prior client detached); consumed once by
     // take_just_attached below. repl.rs's on_idle hook uses this to
@@ -504,18 +544,25 @@ const MAX_READS_PER_TICK: u32 = 16;
 // forward attempt and keeps reading. Returns (ending the thread) only
 // when the pty master itself is gone, which in practice means the
 // whole daemon process is exiting.
-fn drain_pty_master_thread(mut pty_master_read: std::fs::File, client_write: Arc<Mutex<Option<UnixStream>>>) {
+fn drain_pty_master_thread(mut pty_master_read: std::fs::File, writes: Arc<Mutex<Vec<(ClientId, UnixStream)>>>) {
     let mut buf = [0u8; 4096];
     loop {
         match pty_master_read.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => {
-                let msg = Message::Bytes(buf[..n].to_vec());
-                let encoded = msg.encode();
-                if let Ok(guard) = client_write.lock()
-                    && let Some(stream) = guard.as_ref()
-                {
-                    let _ = (&*stream).write_all(&encoded);
+                let encoded = Message::Bytes(buf[..n].to_vec()).encode();
+                // Every attached client gets the same bytes: they are
+                // watching the same screen, which is the whole point of
+                // letting more than one attach. A write that fails is
+                // dropped and forgotten rather than acted on -- this
+                // thread has never been the one to decide a client is
+                // gone (the main thread's own EOF detection is), and
+                // racing it for that decision is the one way the two
+                // halves could come to disagree about who is here.
+                if let Ok(guard) = writes.lock() {
+                    for (_, stream) in guard.iter() {
+                        let _ = (&*stream).write_all(&encoded);
+                    }
                 }
             }
             Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
@@ -534,22 +581,14 @@ impl SessionBridge {
     pub fn new(pty_master: std::fs::File, listener: UnixListener) -> io::Result<SessionBridge> {
         listener.set_nonblocking(true)?;
         let pty_master_read = pty_master.try_clone()?;
-        let client_write = Arc::new(Mutex::new(None));
-        let client_write_for_thread = client_write.clone();
-        std::thread::spawn(move || drain_pty_master_thread(pty_master_read, client_write_for_thread));
-        Ok(SessionBridge {
-            listener,
-            client_read: None,
-            client_write,
-            pty_master,
-            decoder: Decoder::new(),
-            just_attached: false,
-            pending_capability: None,
-        })
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let writes_for_thread = writes.clone();
+        std::thread::spawn(move || drain_pty_master_thread(pty_master_read, writes_for_thread));
+        Ok(SessionBridge { listener, clients: Vec::new(), writes, next_client_id: 1, pty_master, just_attached: false, pending_capability: None })
     }
 
     pub fn is_attached(&self) -> bool {
-        self.client_read.is_some()
+        !self.clients.is_empty()
     }
 
     pub fn take_just_attached(&mut self) -> bool {
@@ -564,10 +603,24 @@ impl SessionBridge {
     // Never blocks -- the pty-master-draining half no longer lives
     // here at all (see drain_pty_master_thread).
     pub fn service(&mut self) {
-        if self.client_read.is_none() {
-            self.try_accept();
+        // Tried every tick, not only while nobody is attached: another
+        // terminal joining a session someone is already using is an
+        // ordinary thing to do now, not an error.
+        self.try_accept();
+        self.drain_clients();
+    }
+
+    // The pty is sized to the smallest attached client, so nothing any
+    // of them can see sits off the edge of what another one has. Called
+    // after every change to the set of clients and after every size any
+    // one of them reports. A client that has not said how big it is yet
+    // reports (0, 0) and is skipped -- it must not shrink the session
+    // to nothing for everybody else while its handshake is in flight.
+    fn resize_to_smallest_client(&mut self) {
+        let sizes: Vec<(u16, u16)> = self.clients.iter().map(|c| c.size).collect();
+        if let Some((rows, cols)) = smallest_size(&sizes) {
+            let _ = crate::pty::set_size(self.pty_master.as_raw_fd(), rows, cols);
         }
-        self.drain_client();
     }
 
     fn try_accept(&mut self) {
@@ -578,21 +631,10 @@ impl SessionBridge {
                 // the socket directory's own 0700 permissions, not a
                 // replacement for them. A mismatched UID (only reachable
                 // at all under a misconfigured/shared runtime directory)
-                // just drops the connection rather than accepting a
-                // second, unauthenticated bridge target.
+                // just drops the connection rather than accepting an
+                // unauthenticated bridge target.
                 match peer_uid(&stream) {
-                    Ok(uid) if uid == current_uid() => {
-                        let _ = stream.set_nonblocking(true);
-                        match stream.try_clone() {
-                            Ok(write_half) => {
-                                *self.client_write.lock().unwrap_or_else(|p| p.into_inner()) = Some(write_half);
-                                self.client_read = Some(stream);
-                                self.decoder = Decoder::new();
-                                self.just_attached = true;
-                            }
-                            Err(_) => { /* couldn't clone -- drop `stream`, try again next tick */ }
-                        }
-                    }
+                    Ok(uid) if uid == current_uid() => self.attach(stream),
                     _ => { /* wrong UID or the check itself failed -- drop `stream` */ }
                 }
             }
@@ -601,39 +643,69 @@ impl SessionBridge {
         }
     }
 
-    // Clears both `client_read` (this struct's own handle) and
-    // `client_write` (the background thread's shared handle) together
-    // -- the one place either is ever set back to None, so the two
-    // never disagree about whether a client is attached.
-    fn detach(&mut self) {
-        self.client_read = None;
-        *self.client_write.lock().unwrap_or_else(|p| p.into_inner()) = None;
-    }
-
-    fn drain_client(&mut self) {
-        let Some(client) = &mut self.client_read else { return };
-        let mut buf = [0u8; 4096];
-        let mut disconnected = false;
-        for _ in 0..MAX_READS_PER_TICK {
-            match client.read(&mut buf) {
-                Ok(0) => {
-                    disconnected = true;
-                    break;
-                }
-                Ok(n) => self.decoder.feed(&buf[..n]),
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                Err(_) => {
-                    disconnected = true;
-                    break;
-                }
-            }
-        }
-        if disconnected {
-            self.detach();
+    // Adds an accepted connection to the set of attached clients: the
+    // one place `clients` and `writes` both grow, which is what keeps
+    // them agreeing about who is here.
+    fn attach(&mut self, stream: UnixStream) {
+        if self.clients.len() >= MAX_CLIENTS {
+            // Dropped, so the far end sees EOF and exits, rather than
+            // sitting connected to a session that will never answer it.
             return;
         }
+        let Ok(write_half) = stream.try_clone() else { return };
+        let _ = stream.set_nonblocking(true);
+        let id = self.next_client_id;
+        self.next_client_id += 1;
+        match self.writes.lock() {
+            Ok(mut guard) => guard.push((id, write_half)),
+            Err(_) => return,
+        }
+        self.clients.push(Client { id, read: stream, decoder: Decoder::new(), size: (0, 0) });
+        self.just_attached = true;
+    }
+
+    // Drops one client from both `clients` (this struct's own handles)
+    // and `writes` (the background thread's shared ones) together --
+    // the one place either shrinks, so the two never disagree about who
+    // is attached. The pty resizes afterwards: with the smallest client
+    // gone, everyone left can have the room it was holding them to.
+    fn detach(&mut self, id: ClientId) {
+        self.clients.retain(|c| c.id != id);
+        self.writes.lock().unwrap_or_else(|p| p.into_inner()).retain(|(other, _)| *other != id);
+        self.resize_to_smallest_client();
+    }
+
+    // Every attached client's input, in turn. Each is drained and
+    // decoded on its own: one client's malformed frame or sudden
+    // departure has nothing to do with the others.
+    fn drain_clients(&mut self) {
+        let ids: Vec<ClientId> = self.clients.iter().map(|c| c.id).collect();
+        for id in ids {
+            if !self.drain_one_client(id) {
+                self.detach(id);
+            }
+        }
+    }
+
+    // Reads and acts on whatever `id` has sent. `false` means that
+    // client is gone -- EOF, a read error, or a frame this protocol
+    // cannot make sense of -- and should be detached.
+    fn drain_one_client(&mut self, id: ClientId) -> bool {
+        let Some(at) = self.clients.iter().position(|c| c.id == id) else { return true };
+        let mut buf = [0u8; 4096];
+        for _ in 0..MAX_READS_PER_TICK {
+            match self.clients[at].read.read(&mut buf) {
+                Ok(0) => return false,
+                Ok(n) => {
+                    let bytes = buf[..n].to_vec();
+                    self.clients[at].decoder.feed(&bytes);
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                Err(_) => return false,
+            }
+        }
         loop {
-            match self.decoder.next_message() {
+            match self.clients[at].decoder.next_message() {
                 Ok(Some(Message::Bytes(payload))) => {
                     // A write to the pty master's own kernel buffer --
                     // bounded by that buffer's size, same as any other
@@ -643,20 +715,31 @@ impl SessionBridge {
                     // struct's own doc comment for why the *other*
                     // direction was the one that could actually
                     // deadlock, and why this one doesn't the same way).
+                    //
+                    // Every client types into the same shell. That is
+                    // what sharing a session means.
                     let _ = self.pty_master.write_all(&payload);
                 }
                 Ok(Some(Message::Resize { rows, cols })) => {
-                    // Resizing via the master fd is what actually
-                    // delivers a real SIGWINCH to the slave's
-                    // controlling-terminal holder (this same daemon
-                    // process, via attach_self_to_pty) -- the existing
+                    // Recorded against this client and then resolved
+                    // against all of them, rather than applied straight
+                    // to the pty: a second, larger terminal must not
+                    // stretch the session out from under a smaller one
+                    // that can then only see part of it.
+                    //
+                    // Resizing via the master fd is what delivers a real
+                    // SIGWINCH to the slave's controlling-terminal
+                    // holder (this same daemon process, via
+                    // attach_self_to_pty), so the existing
                     // install_winch_handler/take_winch/
-                    // poll_and_apply_resize machinery in exec.rs/repl.rs
-                    // picks this up with zero new code.
-                    let _ = crate::pty::set_size(self.pty_master.as_raw_fd(), rows, cols);
+                    // poll_and_apply_resize machinery in exec.rs and
+                    // repl.rs picks it up with no new code.
+                    self.clients[at].size = (rows, cols);
+                    self.resize_to_smallest_client();
                 }
                 Ok(Some(Message::Handshake { rows, cols, term, colorterm })) => {
-                    let _ = crate::pty::set_size(self.pty_master.as_raw_fd(), rows, cols);
+                    self.clients[at].size = (rows, cols);
+                    self.resize_to_smallest_client();
                     // Stashed for repl.rs to apply to every session's
                     // own remembered environment (Shell::
                     // set_terminal_capability_env) -- not set directly
@@ -676,12 +759,10 @@ impl SessionBridge {
                     // treated as malformed, in case that ever changes.
                 }
                 Ok(None) => break,
-                Err(_) => {
-                    self.detach();
-                    break;
-                }
+                Err(_) => return false,
             }
         }
+        true
     }
 }
 
@@ -1157,6 +1238,25 @@ mod tests {
             let _lock = acquire_pidfile_lock("work").expect("acquire_pidfile_lock");
             assert_eq!(read_pid("work"), Some(std::process::id() as i32));
         });
+    }
+
+    #[test]
+    fn a_shared_session_runs_at_the_smallest_attached_size() {
+        // Each direction independently, so a tall narrow terminal beside
+        // a short wide one leaves both able to see the whole screen.
+        assert_eq!(smallest_size(&[(40, 100), (24, 80)]), Some((24, 80)));
+        assert_eq!(smallest_size(&[(24, 200), (60, 80)]), Some((24, 80)));
+        assert_eq!(smallest_size(&[(30, 90)]), Some((30, 90)));
+    }
+
+    #[test]
+    fn a_client_that_has_not_said_its_size_yet_does_not_shrink_the_session() {
+        // (0, 0) is what a just-accepted client reports until its
+        // Handshake arrives. Taking it literally would collapse the pty
+        // to nothing for everyone already attached.
+        assert_eq!(smallest_size(&[(40, 100), (0, 0)]), Some((40, 100)));
+        assert_eq!(smallest_size(&[(0, 0)]), None, "and with nobody sized yet, leave the pty alone");
+        assert_eq!(smallest_size(&[]), None, "same when nobody is attached at all");
     }
 
     #[test]
