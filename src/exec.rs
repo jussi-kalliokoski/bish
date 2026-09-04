@@ -1857,7 +1857,14 @@ impl Shell {
         // time it is called. That was 169us of this function's 253us on
         // a 74-variable environment, and every re-exec'd construct pays
         // it.
-        let inherited: Vec<(String, String)> = std::env::vars().collect();
+        let mut inherited: Vec<(String, String)> = std::env::vars().collect();
+        // `PS4` is a real variable with a default, not a fallback used
+        // when it is missing. The difference shows the moment a script
+        // says `unset PS4`: bash then traces with no prefix at all,
+        // where a fallback would keep printing `+ `.
+        if !inherited.iter().any(|(k, _)| k == "PS4") {
+            inherited.push(("PS4".to_string(), "+ ".to_string()));
+        }
         let mut shell = Shell {
             last_status: 0,
             functions: HashMap::new(),
@@ -9586,10 +9593,27 @@ impl Shell {
     // per level of nesting -- only the flat default is reproduced here,
     // since nothing in this shell tracks a trace depth.
     fn xtrace_prefix(&mut self) -> String {
-        match self.var_is_set("PS4") {
-            true => self.lookup_var("PS4"),
-            false => "+ ".to_string(),
+        if !self.var_is_set("PS4") {
+            return String::new();
         }
+        // Expanded, not printed as written. PS4 is nearly always set to
+        // something with an expansion in it -- `PS4='+$LINENO '` is the
+        // reason anyone sets it at all -- and printing the text meant
+        // every traced line was prefixed with a literal `+$LINENO`.
+        // bash expands parameters, command substitutions and the
+        // prompt escapes, in that order, which is what `${v@P}`
+        // already does here.
+        let raw = self.lookup_var("PS4");
+        // With tracing off for the duration. A `$( )` in PS4 runs a
+        // command, and tracing *that* command expands PS4 again to
+        // print its prefix -- which runs the substitution again. It
+        // recursed until the nesting guard stopped it, printing a few
+        // hundred traced lines on the way.
+        let tracing = std::mem::replace(&mut self.opt_xtrace, false);
+        let expanded = self.expand_raw(&raw);
+        let prefix = self.expand_prompt_string(&expanded);
+        self.opt_xtrace = tracing;
+        prefix
     }
 
     fn expand_raw(&mut self, raw: &str) -> String {

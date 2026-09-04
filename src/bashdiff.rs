@@ -877,6 +877,15 @@ y
         case("bash-command-in-an-err-trap", r#"trap "echo E:\$BASH_COMMAND" ERR; grep -q zz /dev/null"#),
         case("bash-command-in-an-err-trap-from-a-function", r#"f(){ false; }; trap "echo E:\$BASH_COMMAND" ERR; f"#),
         case("bash-command-in-a-debug-trap", r#"trap "echo D:\$BASH_COMMAND" DEBUG; true; echo two"#),
+        // PS4 is expanded before it is printed. Printed as written,
+        // every traced line carried a literal `+$LINENO` -- and that
+        // expansion is the only reason anyone sets PS4 at all.
+        case("ps4-expands-a-parameter", r#"PS4='+$LINENO '; set -x; echo t"#),
+        case("ps4-expands-a-substitution", r#"PS4='$(echo S) '; set -x; echo t"#),
+        // A real variable with a default, not a fallback for a missing
+        // one: `unset PS4` traces with no prefix at all.
+        case("ps4-unset-is-no-prefix", r#"unset PS4; set -x; echo t"#),
+        case("ps4-defaults-to-plus", r#"set -x; echo t"#),
         // A subshell resets the traps it caught, so a DEBUG trap does
         // not fire once per command inside a `$( )` and an ERR trap
         // does not fire both inside `( false )` and again for the
