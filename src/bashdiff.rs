@@ -1214,6 +1214,158 @@ y
         );
     }
 
+    /// The scripts that do *not* survive the round trip, and why.
+    ///
+    /// One cause dominates: `serialize_chunk` writes an unquoted word
+    /// and a quoted one the same way, as `'...'`. The parse tree keeps
+    /// them apart -- `Chunk::Str` is unquoted, `Chunk::LiteralStr` is
+    /// quoted -- and collapsing them makes every unquoted word literal.
+    /// So `echo *` comes back as `'echo' '*'` and prints an asterisk,
+    /// `case $x in a*)` stops matching anything but a literal `a*`, and
+    /// `[[ x =~ re ]]` loses its operator to quotes. That accounts for
+    /// the globs, the patterns and the `[[ ]]` cases here.
+    ///
+    /// The rest are their own shapes: a `time` keyword that is not
+    /// written back, a redirect on a group that is dropped, an array
+    /// literal that does not re-parse, a here-document rewritten as a
+    /// here-string with a newline the original did not have, and
+    /// process substitutions.
+    ///
+    /// This is not theoretical. Serialising is how a construct reaches
+    /// a self-exec'd child, so `{ echo *; } &` prints an asterisk today
+    /// and `{ case a in a*) echo hit;; esac; } &` prints nothing at
+    /// all. The list is here so the property is enforced for everything
+    /// else while this is fixed, and so the size of it is on the record
+    /// rather than in someone's head.
+    const ROUND_TRIP_BREAKS: &[&str] = &[
+        "a-compounds-stderr-reaches-externals",
+        "a-literal-is-checked-after-it-is-read",
+        "a-loops-stderr-reaches-externals",
+        "an-unquoted-case-pattern-is-still-a-glob",
+        "a-quoted-case-pattern-is-literal",
+        "arith-command-is-not",
+        "arith-expansion-is-fatal",
+        "arithmetic-base-out-of-range",
+        "arith-subscript",
+        "assoc-basic",
+        "bare-array-is-element-zero",
+        "bash-command-quotes-an-assignment",
+        "bashopts-lists-what-is-on",
+        "both-streams-one-file-keeps-one-position",
+        "case-fallthrough",
+        "case-patterns",
+        "character-classes-in-a-glob",
+        "character-classes-in-a-regex",
+        "compound-dup-to-stderr-that-is-itself-redirected",
+        "compound-dup-to-stderr-that-was-already-redirected",
+        "dbracket-quoted-pattern",
+        "dbracket-regex",
+        "declare-clusters-its-flags",
+        "dup-before-the-redirect-it-would-have-followed",
+        "fd-swap-then-redirect-compound",
+        "glob-class",
+        "glob-dot-literal",
+        "glob-is-relative-to-the-shells-cwd",
+        "glob-multi-component",
+        "glob-question",
+        "glob-question-component",
+        "glob-star",
+        "globstar-all",
+        "globstar-dirs-only",
+        "globstar-middle",
+        "globstar-off",
+        "globstar-prefix",
+        "globstar-suffix",
+        "globstar-symlink",
+        "glob-with-a-directory-prefix",
+        "indirect-expansion-follows-a-subscript",
+        "local-clusters-its-flags",
+        "process-subst-as-a-redirect",
+        "process-subst-more-than-a-pipe-buffer",
+        "process-subst-read-by-a-builtin",
+        "process-subst-read-by-a-loop",
+        "proc-sub-out-body-output-all-arrives",
+        "proc-sub-out-larger-than-a-pipe-buffer",
+        "proc-sub-out-that-answers-at-eof",
+        "proc-sub-out-to-a-builtins-redirect",
+        "proc-sub-out-to-an-externals-redirect",
+        "proc-sub-out-two-at-once",
+        "proc-sub-out-with-a-shell-body",
+        "ps4-expands-a-parameter",
+        "readonly-array",
+        "redir-both",
+        "redir-heredoc",
+        "redir-heredoc-quoted",
+        "redir-heredoc-tabs",
+        "redir-stderr",
+        "select-reads-its-own-redirect",
+        "select-without-an-in-clause",
+        "shellopts-lists-what-is-on",
+        "shopt-dotglob",
+        "shopt-nocaseglob",
+        "shopt-nullglob",
+        "time-format-literal",
+        "time-format-percent",
+        "time-group",
+        "time-negated",
+        "time-pipeline",
+        "time-status",
+    ];
+
+    /// Every corpus script, run as written and again after a round trip
+    /// through the serializer, must do the same thing.
+    ///
+    /// That serializer is load-bearing and had no property test. It is
+    /// how a construct reaches a self-exec'd child -- a subshell, a
+    /// command substitution, a pipeline stage, a redirected compound,
+    /// the function preamble, and now every backgrounded builtin -- so
+    /// a round trip that loses something is not a formatting bug, it is
+    /// that construct quietly doing something else. Its own header says
+    /// it "just needs to round-trip whatever a function body can
+    /// contain", which is exactly the claim this checks.
+    ///
+    /// Behaviour rather than shape: comparing ASTs would need
+    /// `PartialEq` across the whole parse tree, and would still not say
+    /// whether the text *means* the same thing. Running it does.
+    #[test]
+    fn every_corpus_script_survives_a_round_trip_through_the_serializer() {
+        let Some(bish) = bish_binary() else { return };
+        let root = std::env::temp_dir().join(format!("bish-roundtrip-{}", std::process::id()));
+        let mut broken = Vec::new();
+        for case in CASES.iter().chain(PENDING.iter()) {
+            if ROUND_TRIP_BREAKS.contains(&case.name) {
+                continue;
+            }
+            let Ok(tokens) = crate::lexer::Lexer::new(case.script).tokenize() else { continue };
+            let Ok(program) = crate::parser::Parser::new(tokens).parse_program() else { continue };
+            let round_tripped = crate::serialize::serialize_program(&program);
+            let dir = root.join(case.name);
+            let run_one = |script: &str| {
+                let _ = std::fs::remove_dir_all(&dir);
+                std::fs::create_dir_all(&dir).unwrap();
+                let out = run(bish.as_os_str(), script, &dir);
+                let _ = std::fs::remove_dir_all(&dir);
+                out
+            };
+            let direct = run_one(case.script);
+            let after = run_one(&round_tripped);
+            if direct.text != after.text || direct.timed_out != after.timed_out {
+                broken.push((case.name, round_tripped, direct.text, after.text));
+            }
+        }
+        let _ = std::fs::remove_dir(&root);
+        assert!(
+            broken.is_empty(),
+            "{} script(s) behave differently after a round trip through the serializer:\n{}",
+            broken.len(),
+            broken
+                .iter()
+                .map(|(name, text, before, after)| format!("  {name}\n    serialized: {text:?}\n    direct: {before:?}\n    after:  {after:?}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
+
     #[test]
     fn the_known_divergences_are_still_divergences() {
         let Some(bish) = bish_binary() else { return };

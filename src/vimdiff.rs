@@ -386,6 +386,22 @@ mod tests {
     /// reports a difference that is entirely this harness's.
     fn handshake(master: &mut std::fs::File, drain: &mut impl FnMut(&mut std::fs::File) -> usize, limit: Duration) -> bool {
         let deadline = Instant::now() + limit;
+        // First, wait for the editor to actually take the terminal.
+        // Asking before that is the whole hazard: the line discipline
+        // holds what is typed and the editor never sees it.
+        //
+        // This is an observation rather than an inference. The two ends
+        // of a pty share one set of line settings, so ICANON going off
+        // *is* the editor putting the terminal in raw mode -- where
+        // "it answered something" can be fooled by a startup paint that
+        // happens to have a gap in it, which is how a case could still
+        // come back with its file untouched after the handshake said
+        // yes.
+        let fd = std::os::fd::AsRawFd::as_raw_fd(&*master);
+        while Instant::now() < deadline && !crate::term::is_raw(fd) {
+            drain(master);
+            std::thread::sleep(Duration::from_millis(2));
+        }
         while Instant::now() < deadline {
             settle(master, drain, Duration::from_millis(150), Duration::from_secs(2), 12);
             let _ = master.write_all(b"\x0c");

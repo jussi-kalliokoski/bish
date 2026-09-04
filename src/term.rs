@@ -197,6 +197,23 @@ pub struct RawGuard {
     mouse: bool,
 }
 
+/// Whether the terminal on `fd` has been put into raw mode.
+///
+/// ICANON is the bit that matters: with it set, the line discipline
+/// holds typed bytes until a newline and a program reading the
+/// terminal never sees them. On a pty the two ends share one set of
+/// these settings, so `tcgetattr` on the *master* is how the side
+/// driving it can tell that the program on the slave has taken the
+/// terminal -- which the vimdiff harness needs before it types
+/// anything (see its handshake).
+pub(crate) fn is_raw(fd: i32) -> bool {
+    let mut current: Termios = unsafe { std::mem::zeroed() };
+    if unsafe { tcgetattr(fd, &mut current) } != 0 {
+        return false;
+    }
+    current.c_lflag & ICANON == 0
+}
+
 impl RawGuard {
     pub fn enable(fd: i32) -> io::Result<RawGuard> {
         Self::enable_impl(fd, false)

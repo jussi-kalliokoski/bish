@@ -8472,7 +8472,21 @@ impl Shell {
         let parser::Command::Simple(sc) = cmd else { return true };
         let Some(first) = sc.words.first() else { return true };
         match first.chunks.as_slice() {
-            [crate::lexer::Chunk::Str(name)] => self.is_active_builtin(name) || self.functions.contains_key(name),
+            // A *quoted* name is the same name: `'wc' -l` runs wc, and
+            // quoting a builtin's own name does not stop it being
+            // recognised either (see run_single's first_word_literal,
+            // which has always matched both). Reading only the unquoted
+            // form meant a quoted external was classed as needing the
+            // interpreter and run as a coroutine stage -- and a
+            // pipeline of two such stages, one of them spawning a real
+            // process on the far end of its own pipe, hangs.
+            //
+            // Which is not a hypothetical: the serializer quotes every
+            // word, so this is the shape a re-exec'd construct arrives
+            // in.
+            [crate::lexer::Chunk::Str(name)] | [crate::lexer::Chunk::LiteralStr(name)] => {
+                self.is_active_builtin(name) || self.functions.contains_key(name)
+            }
             _ => true,
         }
     }
