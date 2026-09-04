@@ -4284,6 +4284,11 @@ fn service_background_jobs(app: &mut App) -> bool {
     // wiring needed rather than a new parameter threaded through every
     // caller between here and repl::run.
     session::service_current_bridge();
+    // `bish session capture` asks what the focused pane shows; the
+    // bridge records the question and this answers it, since the grid
+    // it needs lives here. Rendered only when somebody is actually
+    // waiting.
+    session::answer_capture_requests(|| focused_pane_text(app));
     // A client just (re)connected -- force one full repaint (not the
     // ordinary incremental diff) so its own blank real terminal starts
     // correctly caught up, rather than staying empty until unrelated
@@ -4975,6 +4980,31 @@ fn rect_center(rect: &Rect) -> (usize, usize) {
 // earns its cost.
 fn prompt_claims_mouse(mouse_bishopt: bool, sinks_are_grid: bool) -> bool {
     mouse_bishopt && sinks_are_grid
+}
+
+// What the focused pane currently shows, as plain text: one line per
+// row, trailing blanks trimmed off each, and wholly blank rows at the
+// bottom dropped. No colours or attributes -- this is what `bish
+// session capture` prints, and what a script grepping it wants is the
+// words, not the SGR codes around them.
+fn focused_pane_text(app: &App) -> String {
+    let sid = app.windows[app.current_window].owning_session();
+    let screen = app.sessions[&sid].screen.borrow();
+    let (rows, cols) = screen.size();
+    let mut lines: Vec<String> = (0..rows)
+        .map(|row| {
+            let mut line: String = (0..cols).map(|col| screen.cell(row, col).ch).collect();
+            while line.ends_with(' ') {
+                line.pop();
+            }
+            line
+        })
+        .collect();
+    while lines.last().is_some_and(String::is_empty) {
+        lines.pop();
+    }
+    lines.push(String::new());
+    lines.join("\n")
 }
 
 fn render_row(out: &mut String, screen: &vt100::Screen, row: usize, cols: usize) {
@@ -13936,5 +13966,74 @@ mod substitute_command_tests {
         assert!(!starts_off_the_record(""));
         // Trailing and interior whitespace say nothing about it.
         assert!(!starts_off_the_record("echo a  b "));
+    }
+}
+
+#[cfg(test)]
+mod capture_text_tests {
+    use super::*;
+
+    fn screen_showing(lines: &[&str], rows: usize, cols: usize) -> vt100::Screen {
+        let mut screen = vt100::Screen::new(rows, cols);
+        for line in lines {
+            screen.feed(line.as_bytes());
+            screen.feed(b"\r\n");
+        }
+        screen
+    }
+
+    // focused_pane_text needs a whole App to find the focused pane; its
+    // interesting half is turning one grid into text, which this is.
+    fn text_of(screen: &vt100::Screen) -> String {
+        let (rows, cols) = screen.size();
+        let mut lines: Vec<String> = (0..rows)
+            .map(|row| {
+                let mut line: String = (0..cols).map(|col| screen.cell(row, col).ch).collect();
+                while line.ends_with(' ') {
+                    line.pop();
+                }
+                line
+            })
+            .collect();
+        while lines.last().is_some_and(String::is_empty) {
+            lines.pop();
+        }
+        lines.push(String::new());
+        lines.join("\n")
+    }
+
+    #[test]
+    fn a_captured_screen_is_its_rows_without_the_padding() {
+        // A grid is a rectangle, so every row is `cols` wide whatever is
+        // on it. A script grepping the capture wants the words, not the
+        // spaces after them.
+        let screen = screen_showing(&["$ echo hi", "hi"], 10, 40);
+        assert_eq!(text_of(&screen), "$ echo hi\nhi\n");
+    }
+
+    #[test]
+    fn the_blank_bottom_of_the_screen_is_not_part_of_the_capture() {
+        // Eight empty rows under two lines of output is what the grid
+        // holds; it is not what the pane shows.
+        let screen = screen_showing(&["one", "two"], 10, 20);
+        assert_eq!(text_of(&screen).lines().count(), 2);
+    }
+
+    #[test]
+    fn a_blank_line_between_two_lines_of_output_survives() {
+        // Only the run at the *bottom* is padding. One in the middle is
+        // something the command printed.
+        let screen = screen_showing(&["first", "", "third"], 8, 20);
+        assert_eq!(text_of(&screen), "first\n\nthird\n");
+    }
+
+    #[test]
+    fn an_empty_screen_captures_as_nothing_at_all() {
+        // Not even the trailing newline every other capture ends with:
+        // once every row has been trimmed away there is no last line
+        // for one to go after, and `capture` on a blank pane printing a
+        // stray blank line would be worse than printing nothing.
+        let screen = vt100::Screen::new(6, 20);
+        assert_eq!(text_of(&screen), "");
     }
 }

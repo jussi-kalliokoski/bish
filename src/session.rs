@@ -315,15 +315,32 @@ pub fn ensure_socket_dir() -> io::Result<PathBuf> {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Message {
     Bytes(Vec<u8>),
-    Handshake { rows: u16, cols: u16, term: String, colorterm: String },
-    Resize { rows: u16, cols: u16 },
+    Handshake {
+        rows: u16,
+        cols: u16,
+        term: String,
+        colorterm: String,
+    },
+    Resize {
+        rows: u16,
+        cols: u16,
+    },
     Passthrough(Vec<u8>),
+    /// `bish session capture <name>`: send me what the focused pane
+    /// currently shows. Client -> server.
+    CaptureRequest,
+    /// The answer, as plain text with a newline between rows. Server ->
+    /// client, and the only message a client both waits for and then
+    /// exits on.
+    CaptureReply(Vec<u8>),
 }
 
 const KIND_BYTES: u8 = 0;
 const KIND_HANDSHAKE: u8 = 1;
 const KIND_RESIZE: u8 = 2;
 const KIND_PASSTHROUGH: u8 = 3;
+const KIND_CAPTURE_REQUEST: u8 = 4;
+const KIND_CAPTURE_REPLY: u8 = 5;
 
 impl Message {
     // Header (5 bytes: 1 kind + 4 big-endian length) followed by that
@@ -340,6 +357,8 @@ impl Message {
                 (KIND_RESIZE, p)
             }
             Message::Passthrough(b) => (KIND_PASSTHROUGH, b.clone()),
+            Message::CaptureRequest => (KIND_CAPTURE_REQUEST, Vec::new()),
+            Message::CaptureReply(b) => (KIND_CAPTURE_REPLY, b.clone()),
             Message::Handshake { rows, cols, term, colorterm } => {
                 let mut p = Vec::new();
                 p.extend_from_slice(&rows.to_be_bytes());
@@ -439,6 +458,8 @@ impl Decoder {
         let msg = match kind {
             KIND_BYTES => Message::Bytes(payload),
             KIND_PASSTHROUGH => Message::Passthrough(payload),
+            KIND_CAPTURE_REQUEST => Message::CaptureRequest,
+            KIND_CAPTURE_REPLY => Message::CaptureReply(payload),
             KIND_RESIZE => {
                 if payload.len() != 4 {
                     return Err(format!("malformed Resize payload: {} bytes, expected 4", payload.len()));
@@ -562,6 +583,12 @@ pub struct SessionBridge {
     // What the status line currently says, so an idle session rewrites
     // nothing.
     reported_attached: usize,
+    // Clients that have asked what the screen currently shows and are
+    // waiting for the answer. Only recorded here: this module has no
+    // access to any session's grid, and deliberately keeps none (see
+    // the module doc comment). repl.rs, which does, answers them --
+    // see `answer_capture_requests`.
+    capture_requests: Vec<ClientId>,
     // The main thread's own pty-master handle -- writes only (client
     // input, `Pty::set_size`); the background thread owns the read side
     // via its own separate fd (see SessionBridge::new).
@@ -662,6 +689,7 @@ impl SessionBridge {
             next_client_id: 1,
             pidfile: None,
             reported_attached: 0,
+            capture_requests: Vec::new(),
             pty_master,
             just_attached: false,
             pending_capability: None,
@@ -801,15 +829,27 @@ impl SessionBridge {
     fn drain_one_client(&mut self, id: ClientId) -> bool {
         let Some(at) = self.clients.iter().position(|c| c.id == id) else { return true };
         let mut buf = [0u8; 4096];
+        // Noted rather than returned on immediately: whatever arrived in
+        // the same breath as the EOF is still in the decoder and still
+        // meant something. `bish session send` is exactly that shape --
+        // connect, write, close -- so returning early here would drop
+        // the keys it came to deliver.
+        let mut ended = false;
         for _ in 0..MAX_READS_PER_TICK {
             match self.clients[at].read.read(&mut buf) {
-                Ok(0) => return false,
+                Ok(0) => {
+                    ended = true;
+                    break;
+                }
                 Ok(n) => {
                     let bytes = buf[..n].to_vec();
                     self.clients[at].decoder.feed(&bytes);
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                Err(_) => return false,
+                Err(_) => {
+                    ended = true;
+                    break;
+                }
             }
         }
         loop {
@@ -860,17 +900,40 @@ impl SessionBridge {
                     // time any session ran a command).
                     self.pending_capability = Some((term, colorterm));
                 }
-                Ok(Some(Message::Passthrough(_))) => {
-                    // A client never sends this direction in this
-                    // protocol (server -> client only, see Message's own
-                    // doc comment) -- tolerated as a no-op rather than
-                    // treated as malformed, in case that ever changes.
+                Ok(Some(Message::CaptureRequest)) => {
+                    // Recorded, not answered: the answer lives in a
+                    // session's grid, which this module cannot reach.
+                    self.capture_requests.push(id);
+                }
+                Ok(Some(Message::Passthrough(_) | Message::CaptureReply(_))) => {
+                    // Server -> client messages (see Message's own doc
+                    // comments). A client never sends these; tolerated
+                    // as a no-op rather than treated as malformed, in
+                    // case that ever changes.
                 }
                 Ok(None) => break,
                 Err(_) => return false,
             }
         }
-        true
+        !ended
+    }
+
+    // Whether anybody is waiting to be told what the screen shows.
+    fn wants_capture(&self) -> bool {
+        !self.capture_requests.is_empty()
+    }
+
+    // Sends `text` to every client waiting for a capture, and closes
+    // each of them out: a capture client asks one question and leaves.
+    fn answer_captures(&mut self, text: &str) {
+        let encoded = Message::CaptureReply(text.as_bytes().to_vec()).encode();
+        for id in std::mem::take(&mut self.capture_requests) {
+            if let Ok(guard) = self.writes.lock()
+                && let Some((_, stream)) = guard.iter().find(|(other, _)| *other == id)
+            {
+                let _ = (&*stream).write_all(&encoded);
+            }
+        }
     }
 }
 
@@ -893,6 +956,28 @@ pub fn service_current_bridge() {
             bridge.service();
         }
     });
+}
+
+/// Answers any pending `bish session capture` with the text `screen`
+/// produces, and says whether there was one.
+///
+/// `screen` is only called when somebody is actually waiting, so the
+/// caller can render as expensively as it likes here. It is a closure
+/// rather than anything this module holds because what the screen
+/// currently shows lives in repl.rs's own session state, which this
+/// module has no access to and keeps none of -- the same shape as the
+/// `on_idle` callback every blocking loop in repl.rs already passes.
+pub fn answer_capture_requests(screen: impl FnOnce() -> String) -> bool {
+    ACTIVE_BRIDGE.with(|b| {
+        let mut guard = b.borrow_mut();
+        let Some(bridge) = guard.as_mut() else { return false };
+        if !bridge.wants_capture() {
+            return false;
+        }
+        let text = screen();
+        bridge.answer_captures(&text);
+        true
+    })
 }
 
 // True at most once per attach (a first attach or a reattach) -- lets
@@ -1000,6 +1085,124 @@ pub fn run_ls() -> io::Result<i32> {
         println!("{name:width$}  {attached:<10}  {age:>4} old  {cwd}");
     }
     Ok(0)
+}
+
+/// The bytes a `bish session send` argument stands for.
+///
+/// An argument that names a key is that key; anything else is its own
+/// literal text. tmux's `send-keys` does exactly this, and for the same
+/// reason: `send-keys make Enter` reads better than any escaping scheme
+/// anyone has come up with, and a literal word that happens to be
+/// spelled "Enter" is rare enough to be worth the ambiguity.
+fn key_bytes(arg: &str) -> Vec<u8> {
+    let named: &[u8] = match arg {
+        "Enter" | "C-m" => b"\r",
+        "Tab" | "C-i" => b"\t",
+        "Escape" | "Esc" => b"\x1b",
+        "Space" => b" ",
+        "BSpace" | "Backspace" => b"\x7f",
+        "Up" => b"\x1b[A",
+        "Down" => b"\x1b[B",
+        "Right" => b"\x1b[C",
+        "Left" => b"\x1b[D",
+        "Home" => b"\x1b[H",
+        "End" => b"\x1b[F",
+        // `C-a` through `C-z`, plus the handful above them that a
+        // terminal spells the same way.
+        _ => {
+            if let Some(rest) = arg.strip_prefix("C-")
+                && rest.chars().count() == 1
+            {
+                let c = rest.chars().next().expect("one character");
+                if c.is_ascii_alphabetic() {
+                    return vec![(c.to_ascii_lowercase() as u8) - b'a' + 1];
+                }
+                // C-Space is NUL, which is also bish's own detach key.
+                if c == '@' {
+                    return vec![0];
+                }
+            }
+            return arg.as_bytes().to_vec();
+        }
+    };
+    named.to_vec()
+}
+
+/// `bish session send <name> <arg>...`: types into a running session
+/// from outside it, tmux's `send-keys`.
+///
+/// Connects, writes, and closes -- no handshake, so it never counts
+/// towards the session's size and never becomes something the session
+/// has to redraw for. The daemon takes what arrived with the EOF (see
+/// drain_one_client), so there is nothing to wait for here.
+pub fn run_send(name: &str, args: &[String]) -> io::Result<i32> {
+    check_name(name)?;
+    if !is_daemon_alive(name) {
+        eprintln!("bish: session '{name}' is not running");
+        return Ok(1);
+    }
+    let mut payload = Vec::new();
+    for arg in args {
+        payload.extend_from_slice(&key_bytes(arg));
+    }
+    if payload.is_empty() {
+        return Ok(0);
+    }
+    let mut stream = UnixStream::connect(socket_path(name))?;
+    stream.write_all(&Message::Bytes(payload).encode())?;
+    stream.flush()?;
+    Ok(0)
+}
+
+/// `bish session capture <name>`: prints what that session's focused
+/// pane currently shows, tmux's `capture-pane -p`.
+///
+/// Asks and waits. The answer has to come from the daemon's own idle
+/// tick (see answer_capture_requests), so this blocks on the reply with
+/// a bound on how long it will wait -- a daemon wedged inside something
+/// that never yields should end as a message, not a hang.
+pub fn run_capture(name: &str) -> io::Result<i32> {
+    check_name(name)?;
+    if !is_daemon_alive(name) {
+        eprintln!("bish: session '{name}' is not running");
+        return Ok(1);
+    }
+    let mut stream = UnixStream::connect(socket_path(name))?;
+    stream.write_all(&Message::CaptureRequest.encode())?;
+    stream.flush()?;
+    stream.set_read_timeout(Some(std::time::Duration::from_millis(250)))?;
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut decoder = Decoder::new();
+    let mut buf = [0u8; 4096];
+    while std::time::Instant::now() < deadline {
+        match stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => decoder.feed(&buf[..n]),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut => continue,
+            Err(e) => return Err(e),
+        }
+        loop {
+            match decoder.next_message() {
+                Ok(Some(Message::CaptureReply(text))) => {
+                    print!("{}", String::from_utf8_lossy(&text));
+                    return Ok(0);
+                }
+                // Ordinary screen traffic: this connection is an
+                // attached client like any other for as long as it is
+                // open, so the daemon fans output to it too. Ignored --
+                // this one came to ask a question.
+                Ok(Some(_)) => {}
+                Ok(None) => break,
+                Err(e) => {
+                    eprintln!("bish: session '{name}': {e}");
+                    return Ok(1);
+                }
+            }
+        }
+    }
+    eprintln!("bish: session '{name}' did not answer in time");
+    Ok(1)
 }
 
 /// `bish session rename <old> <new>`.
@@ -1377,6 +1580,48 @@ mod tests {
             let _lock = acquire_pidfile_lock("work").expect("acquire_pidfile_lock");
             assert_eq!(read_pid("work"), Some(std::process::id() as i32));
         });
+    }
+
+    #[test]
+    fn a_key_name_is_that_key_and_anything_else_is_its_own_text() {
+        assert_eq!(key_bytes("Enter"), b"\r");
+        assert_eq!(key_bytes("Tab"), b"\t");
+        assert_eq!(key_bytes("Escape"), b"\x1b");
+        assert_eq!(key_bytes("Up"), b"\x1b[A");
+        // A word that is not a key name is the word.
+        assert_eq!(key_bytes("make"), b"make");
+        assert_eq!(key_bytes("echo hello"), b"echo hello");
+        // Including one that only looks like a key name.
+        assert_eq!(key_bytes("C-"), b"C-");
+        assert_eq!(key_bytes("C-hello"), b"C-hello");
+    }
+
+    #[test]
+    fn control_keys_are_the_control_codes_they_stand_for() {
+        assert_eq!(key_bytes("C-c"), vec![3]);
+        assert_eq!(key_bytes("C-d"), vec![4]);
+        assert_eq!(key_bytes("C-a"), vec![1]);
+        assert_eq!(key_bytes("C-z"), vec![26]);
+        // Case makes no difference to which code it is.
+        assert_eq!(key_bytes("C-C"), vec![3]);
+        // C-Space, which is also bish's own detach key.
+        assert_eq!(key_bytes("C-@"), vec![0]);
+        // The two spellings a terminal genuinely shares.
+        assert_eq!(key_bytes("C-m"), key_bytes("Enter"));
+        assert_eq!(key_bytes("C-i"), key_bytes("Tab"));
+    }
+
+    #[test]
+    fn the_capture_messages_round_trip() {
+        let request = Message::CaptureRequest;
+        let mut dec = Decoder::new();
+        dec.feed(&request.encode());
+        assert_eq!(dec.next_message().unwrap(), Some(request));
+
+        let reply = Message::CaptureReply(b"line one\nline two\n".to_vec());
+        let mut dec = Decoder::new();
+        dec.feed(&reply.encode());
+        assert_eq!(dec.next_message().unwrap(), Some(reply));
     }
 
     #[test]
