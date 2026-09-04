@@ -115,6 +115,10 @@ pub enum Key {
     // rectangle means something.
     CtrlV,
     CtrlW,
+    /// Alt-Backspace: readline's `backward-kill-word`, which stops at
+    /// the first non-alphanumeric character rather than at whitespace.
+    /// The one that deletes `bar` out of `cd foo/bar`.
+    AltBackspace,
     // Vim's insert-mode "paste this register here" -- see read_line's own
     // Key::CtrlR arm.
     CtrlR,
@@ -324,6 +328,21 @@ fn read_key() -> io::Result<Option<Key>> {
 // Escape sequence decoding. A bare Esc keypress has nothing following it;
 // poll with a short timeout at each step to tell that apart from an actual
 // sequence (whose bytes arrive back-to-back) instead of blocking forever.
+/// The key an Esc followed by `b` stands for, where `b` is not the
+/// `[`/`O` that introduces a CSI sequence.
+///
+/// Split out from `read_escape` so the mapping can be tested without a
+/// terminal to read from.
+fn decode_escape_prefixed(b: u8) -> Option<Key> {
+    match b {
+        // Alt-Backspace. Terminals disagree about which byte Backspace
+        // is, and an Alt-held key is that byte with an Esc in front, so
+        // both spellings arrive here.
+        0x7f | 0x08 => Some(Key::AltBackspace),
+        _ => None,
+    }
+}
+
 fn read_escape() -> io::Result<Key> {
     if !term::stdin_ready(ESCAPE_TIMEOUT_MS) {
         return Ok(Key::Escape);
@@ -334,7 +353,7 @@ fn read_escape() -> io::Result<Key> {
     };
     match b1 {
         b'[' | b'O' => {}
-        _ => return Ok(Key::Unknown),
+        _ => return Ok(decode_escape_prefixed(b1).unwrap_or(Key::Unknown)),
     }
     // An SGR mouse report ("\x1b[<Cb;Cx;CyM/m") starts with a '<' marker
     // right after the CSI intro -- unlike every other sequence this
@@ -576,12 +595,35 @@ impl LineEditor {
     // Matches the terminal driver's classic Ctrl-W (ERASEWORD): skip any
     // whitespace immediately before the cursor, then delete back to the
     // next whitespace boundary (or start of line).
+    /// Ctrl-W: readline's `unix-word-rubout` -- back to whitespace, so
+    /// `cd foo/bar` loses the whole path.
     fn kill_word_backward(&mut self) {
         let mut i = self.cursor;
         while i > 0 && self.buf[i - 1].is_whitespace() {
             i -= 1;
         }
         while i > 0 && !self.buf[i - 1].is_whitespace() {
+            i -= 1;
+        }
+        self.buf.drain(i..self.cursor);
+        self.cursor = i;
+    }
+
+    /// Alt-Backspace: readline's `backward-kill-word`, which is the
+    /// same walk over a different alphabet -- only letters and digits
+    /// are part of a word, so `/`, `.`, `-` and `_` all end one.
+    ///
+    /// This is the one that deletes a single path component: `cd
+    /// foo/bar` loses `bar` and keeps `foo/`. Ctrl-W deliberately does
+    /// not do that, because readline's does not and bash's does not.
+    /// Pressing it again then skips the `/` and takes `foo` with it,
+    /// which is also what bash does.
+    fn kill_word_backward_to_punctuation(&mut self) {
+        let mut i = self.cursor;
+        while i > 0 && !self.buf[i - 1].is_alphanumeric() {
+            i -= 1;
+        }
+        while i > 0 && self.buf[i - 1].is_alphanumeric() {
             i -= 1;
         }
         self.buf.drain(i..self.cursor);
@@ -1907,6 +1949,7 @@ pub fn read_line(
             Key::CtrlK => ed.kill_to_end(),
             Key::CtrlU => ed.kill_to_start(),
             Key::CtrlW => ed.kill_word_backward(),
+            Key::AltBackspace => ed.kill_word_backward_to_punctuation(),
             // Vim's insert-mode <C-r>{register}: reads exactly one more
             // key as the register name and splices that register's
             // contents in at the cursor, literally (not as a "ghost" the
@@ -3594,6 +3637,61 @@ mod tests {
     fn decode_csi_final_tilde_form_page_up_and_down() {
         assert_eq!(decode_csi_final("5", b'~'), Key::PageUp);
         assert_eq!(decode_csi_final("6", b'~'), Key::PageDown);
+    }
+
+    /// The two backward-kills are different keys with different
+    /// alphabets, which is the whole reason both exist. Checked against
+    /// a real bash through a pty before being written down here: Ctrl-W
+    /// is `unix-word-rubout` and takes `foo/bar` whole; Alt-Backspace
+    /// is `backward-kill-word` and takes one path component.
+    #[test]
+    fn the_two_backward_kills_use_different_word_boundaries() {
+        let typed = |text: &str| {
+            let mut ed = LineEditor::new();
+            for c in text.chars() {
+                ed.insert(c);
+            }
+            ed
+        };
+
+        let mut ed = typed("cd foo/bar");
+        ed.kill_word_backward();
+        assert_eq!(ed.as_string(), "cd ", "Ctrl-W stops only at whitespace");
+
+        let mut ed = typed("cd foo/bar");
+        ed.kill_word_backward_to_punctuation();
+        assert_eq!(ed.as_string(), "cd foo/", "Alt-Backspace stops at the slash");
+        // Again, and the separator goes with the component in front of
+        // it -- bash does this too.
+        ed.kill_word_backward_to_punctuation();
+        assert_eq!(ed.as_string(), "cd ");
+
+        // A trailing separator is skipped before the word is found.
+        let mut ed = typed("cd foo/bar/");
+        ed.kill_word_backward_to_punctuation();
+        assert_eq!(ed.as_string(), "cd foo/");
+
+        // `.`, `-` and `_` end a word as surely as `/` does: readline
+        // counts only letters and digits as part of one.
+        for (text, want) in [("echo a.b", "echo a."), ("echo a-b", "echo a-"), ("echo a_b", "echo a_")] {
+            let mut ed = typed(text);
+            ed.kill_word_backward_to_punctuation();
+            assert_eq!(ed.as_string(), want, "{text}");
+        }
+
+        // With no punctuation in reach the two agree.
+        let mut ed = typed("echo one two");
+        ed.kill_word_backward_to_punctuation();
+        assert_eq!(ed.as_string(), "echo one ");
+    }
+
+    #[test]
+    fn alt_backspace_decodes_from_either_backspace_byte() {
+        // A terminal may send DEL or BS for Backspace, and an Alt-held
+        // key is that byte behind an Esc.
+        assert_eq!(decode_escape_prefixed(0x7f), Some(Key::AltBackspace));
+        assert_eq!(decode_escape_prefixed(0x08), Some(Key::AltBackspace));
+        assert_eq!(decode_escape_prefixed(b'q'), None);
     }
 
     #[test]
