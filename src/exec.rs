@@ -8421,7 +8421,13 @@ impl Shell {
                 // noise on top of it.
                 let not_found = e.kind() == std::io::ErrorKind::NotFound;
                 let hint = match not_found {
-                    true => crate::suggest::did_you_mean(&name, KNOWN_BUILTINS.iter().copied()),
+                    // A bash builtin this shell deliberately answers
+                    // differently gets pointed at its equivalent; every
+                    // other unknown name gets the nearest builtin.
+                    true => match crate::suggest::instead_of(&name) {
+                        advice if !advice.is_empty() => advice,
+                        _ => crate::suggest::did_you_mean(&name, KNOWN_BUILTINS.iter().copied()),
+                    },
                     false => String::new(),
                 };
                 // bash's three answers, and its two statuses: a bare

@@ -39,6 +39,23 @@ pub(crate) fn nearest<'a>(word: &str, candidates: impl IntoIterator<Item = &'a s
 ///
 /// Empty when nothing is close, so a message can carry it
 /// unconditionally: `format!("unknown subcommand '{name}'{}", suggest::did_you_mean(name, OPTIONS))`.
+/// The bash builtins this shell answers differently, and what to reach
+/// for instead.
+///
+/// Not stubs. A `bind` that parsed its arguments and did nothing would
+/// report success for keybindings that are not in effect, which is
+/// worse than saying so: this shell's editor is not readline, and its
+/// keymap is `::bish map`. Saying where to go turns a dead end into a
+/// signpost without pretending the command ran.
+const INSTEAD: &[(&str, &str)] = &[("bind", "this shell's keymap is `::bish map`"), ("logout", "use `exit`")];
+
+pub(crate) fn instead_of(word: &str) -> String {
+    match INSTEAD.iter().find(|(name, _)| *name == word) {
+        Some((_, advice)) => format!(" -- {advice}"),
+        None => String::new(),
+    }
+}
+
 pub(crate) fn did_you_mean<'a>(word: &str, candidates: impl IntoIterator<Item = &'a str>) -> String {
     match nearest(word, candidates) {
         Some(candidate) => format!(" -- did you mean '{candidate}'?"),
