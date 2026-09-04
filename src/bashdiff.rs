@@ -870,6 +870,23 @@ y
             "printf-v-into-an-array-element",
             r#"for i in 0 1; do printf -v "a[$i]" "v$i"; done; echo "${a[*]}"; declare -A m; printf -v "m[k]" z; echo "${m[k]}""#,
         ),
+        // `$BASH_COMMAND` names the command being run, which is what a
+        // DEBUG or ERR trap reads to say what it fired for. It was
+        // unset, so the commonest error-handling idiom reported
+        // nothing at all.
+        case("bash-command-in-an-err-trap", r#"trap "echo E:\$BASH_COMMAND" ERR; grep -q zz /dev/null"#),
+        case("bash-command-in-an-err-trap-from-a-function", r#"f(){ false; }; trap "echo E:\$BASH_COMMAND" ERR; f"#),
+        case("bash-command-in-a-debug-trap", r#"trap "echo D:\$BASH_COMMAND" DEBUG; true; echo two"#),
+        // A subshell resets the traps it caught, so a DEBUG trap does
+        // not fire once per command inside a `$( )` and an ERR trap
+        // does not fire both inside `( false )` and again for the
+        // subshell. A pipeline stage is not reset that way.
+        case("a-debug-trap-does-not-follow-a-substitution", r#"trap "echo D" DEBUG; x=$(echo hi); echo done"#),
+        case(
+            "an-err-trap-does-not-fire-twice-for-a-subshell",
+            r#"trap "echo E" ERR; ( false ); echo done; trap "echo F" ERR; x=$(false); echo done"#,
+        ),
+        case("a-return-trap-does-not-follow-a-substitution", r#"trap "echo R" RETURN; x=$(echo hi); echo done"#),
         // `&` makes a job, which means a child. Only an external and a
         // subshell took any notice of it: a builtin, a function, a
         // group, a loop and a bare assignment all ran in this shell,
@@ -930,6 +947,27 @@ y
     // "bish agrees with bash" never quietly means "except where it
     // doesn't".
     const DIVERGENCES: &[(&str, &str)] = &[
+        // `$BASH_COMMAND` read *directly* rather than from inside a
+        // trap names the previous command: bish sets it once the words
+        // are expanded, where bash sets it from the source text before
+        // expanding anything. Inside a trap -- which is what the
+        // variable is for, and where the corpus checks it -- the two
+        // agree exactly, including from inside a function. Same root as
+        // `function-body-formatting`: the source text needs spans the
+        // parser does not carry, and without them setting it earlier
+        // would name the command in bish's own serialised shape.
+        ("bash-command-read-outside-a-trap", "`echo $BASH_COMMAND` names the previous command; bash names the one being run, as written"),
+        // An assignment-only command is named from the *serialised*
+        // word rather than the source, since its value has not been
+        // evaluated yet and expanding it to name it would run any
+        // `$( )` in it a second time. So `x=1` is reported as `x='1'`:
+        // bish's quoting, the same shape `declare -f` has.
+        ("bash-command-quotes-an-assignment", "`$BASH_COMMAND` for `x=1` is `x='1'`; bash gives the source text `x=1`"),
+        // A DEBUG trap fires once per pipeline *stage* in bash. Here it
+        // fires only for a stage that runs in the shell: an external
+        // one is spawned without going through the path that fires it,
+        // so `echo a | cat` traces one command rather than two.
+        ("debug-trap-misses-an-external-pipeline-stage", "`trap ... DEBUG; echo a | cat` fires once; bash fires once per stage"),
         // A deliberate choice, not an oversight: bish's `set -o` lists
         // only the ten names that gate real behaviour here, where bash
         // lists twenty-seven. Printing `allexport off` for an option
@@ -970,6 +1008,9 @@ y
     const PENDING: &[Case] = &[
         case("set-o-lists-fewer-options", r#"set -o | wc -l"#),
         case("function-body-formatting", r#"f() { :; }; declare -f f"#),
+        case("bash-command-read-outside-a-trap", r#"true; echo "[$BASH_COMMAND]""#),
+        case("bash-command-quotes-an-assignment", r#"trap "echo D:\$BASH_COMMAND" DEBUG; x=1"#),
+        case("debug-trap-misses-an-external-pipeline-stage", r#"trap "echo D" DEBUG; echo a | cat"#),
         case("compgen-b-lists-this-shells-builtins", r#"compgen -b | sort | head -3 | tr '\n' ' '; echo"#),
         // -- roadmap 10: parser leniency, the part still standing -----
         // Also not recordable, and for the same kind of reason: a

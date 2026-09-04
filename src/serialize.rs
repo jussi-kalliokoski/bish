@@ -234,7 +234,7 @@ pub fn serialize_redirect(r: &Redirect) -> String {
     }
 }
 
-fn serialize_word(w: &Word) -> String {
+pub(crate) fn serialize_word(w: &Word) -> String {
     if w.chunks.is_empty() {
         return "''".to_string();
     }

@@ -1471,6 +1471,13 @@ pub struct Shell {
     // it's run directly wherever the shell is about to terminate rather
     // than through the sigaction/PENDING_SIGNALS machinery.
     exit_trap: Option<String>,
+    // `$BASH_COMMAND`: the command being run, for a DEBUG or ERR trap
+    // to name. bash holds the *source text*, which needs spans this
+    // parser does not carry -- the same wall the
+    // `function-body-formatting` divergence describes -- so this is the
+    // command with its words expanded. It differs from bash only where
+    // the command contained an expansion, and is identical otherwise.
+    bash_command: String,
     // The subshell nesting depth the EXIT trap was set at. It fires for
     // the exit of the shell that armed it and for no other -- see
     // run_exit_trap.
@@ -1913,6 +1920,7 @@ impl Shell {
             proc_sub_pipes: Vec::new(),
             proc_sub_children: Vec::new(),
             traps: std::collections::HashMap::new(),
+            bash_command: String::new(),
             exit_trap: None,
             exit_trap_depth: 0,
             debug_trap: None,
@@ -2254,6 +2262,7 @@ impl Shell {
             proc_sub_pipes: Vec::new(),
             proc_sub_children: Vec::new(),
             traps: self.traps.clone(),
+            bash_command: self.bash_command.clone(),
             exit_trap: self.exit_trap.clone(),
             exit_trap_depth: self.exit_trap_depth,
             debug_trap: self.debug_trap.clone(),
@@ -4730,6 +4739,22 @@ impl Shell {
 
     fn run_body_in_child_shell(&mut self, body: ChildBody<'_>, stdio: ChildStdio) -> ExecResult {
         let mut child = self.child_for_stdio(stdio);
+        // A *subshell* resets the traps it caught -- `$( )` and `( )`
+        // arrive here as source text -- so a DEBUG trap does not fire
+        // once per command inside a command substitution, and an ERR
+        // trap does not fire both inside `( false )` and again for the
+        // subshell itself. bash does the same, and the EXIT trap has
+        // its own version of this rule (see run_exit_trap).
+        //
+        // A pipeline stage arrives already parsed and does *not* reset
+        // them: bash fires DEBUG for each stage of `echo a | cat`, and
+        // so does this. Neither does a redirected group, which is not a
+        // subshell at all.
+        if matches!(body, ChildBody::Source(_)) {
+            child.debug_trap = None;
+            child.err_trap = None;
+            child.return_trap = None;
+        }
 
         // The real OS cwd is process-wide, shared with the real parent,
         // even though `child` is otherwise a fully independent Shell -- a
@@ -6330,10 +6355,25 @@ impl Shell {
     }
 
     fn run_single(&mut self, cmd: &SimpleCommand, background: bool) -> ExecResult {
-        // DEBUG, before the command rather than after: the whole use of
-        // it is to see what is about to run.
-        self.run_pseudo_trap(PseudoTrap::Debug);
         if cmd.words.is_empty() {
+            // An assignment-only command is a command, and bash names
+            // it in `$BASH_COMMAND` like any other.
+            // Serialised, not expanded. The value has not been
+            // evaluated yet -- the DEBUG trap fires *before* the
+            // assignment -- and expanding it here to name it would run
+            // any `$( )` in it a second time.
+            let named: Vec<String> = cmd
+                .assigns
+                .iter()
+                .map(|(name, mode, val)| {
+                    let op = if *mode == AssignMode::Append { "+=" } else { "=" };
+                    format!("{}{}{}", name, op, crate::serialize::serialize_word(val))
+                })
+                .collect();
+            self.bash_command = named.join(" ");
+            // DEBUG, before the command rather than after: the whole
+            // use of it is to see what is about to run.
+            self.run_pseudo_trap(PseudoTrap::Debug);
             // An assignment-only command is still a command, so `&`
             // makes it a job -- one whose whole effect is discarded
             // with the child, which is exactly what bash does with
@@ -6489,6 +6529,10 @@ impl Shell {
         if let Some(exit) = self.take_pending_exit() {
             return exit;
         }
+        // Named before it runs, so a DEBUG trap sees the command it is
+        // firing for and an ERR trap sees the one that failed.
+        self.bash_command = argv.join(" ");
+        self.run_pseudo_trap(PseudoTrap::Debug);
         if argv.is_empty() {
             // Every word vanished (e.g. the command was just an unquoted
             // empty/unset variable) -- matches bash: nothing runs.
@@ -10207,6 +10251,7 @@ impl Shell {
                     // not a process -- see run_in_child_shell.
                     "BASHPID" => unsafe { getpid_raw() }.to_string(),
                     "BASH_SUBSHELL" => self.subshell_depth.to_string(),
+                    "BASH_COMMAND" => self.bash_command.clone(),
                     // The `set -o` and `shopt` options currently on,
                     // colon-separated and sorted, which is how a script
                     // asks `[[ $SHELLOPTS == *errexit* ]]` without
@@ -10479,6 +10524,7 @@ impl Shell {
                 | "BASH"
                 | "BASHPID"
                 | "BASH_SUBSHELL"
+                | "BASH_COMMAND"
                 | "SHELLOPTS"
                 | "BASHOPTS"
         );
@@ -13466,6 +13512,7 @@ const COMPUTED_VAR_NAMES: &[&str] = &[
     "BASH",
     "BASHPID",
     "BASHOPTS",
+    "BASH_COMMAND",
     "BASH_SUBSHELL",
     "BASH_VERSION",
     "EPOCHREALTIME",
