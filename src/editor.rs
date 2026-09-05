@@ -1158,6 +1158,23 @@ fn build_completion_row(state: &CompletionState) -> CompletionRow {
 /// repaints the pane wholesale, so there is nothing to clean up -- and
 /// a prompt on the pane's last row would have this writing spaces onto
 /// the tab bar after the newline scrolled.
+/// Repaints the prompt line with nothing on it but what was typed --
+/// no inline suggestion, no snippet placeholders, no mouse selection.
+///
+/// The suggestion is drawn *after* the cursor, so submitting a line
+/// left it standing and the scrollback recorded a command nobody ran:
+/// typing `echo alpha` under a history entry `echo alpha-beta-gamma`
+/// scrolled away as `echo alpha-beta-gamma`, directly above the output
+/// `alpha`. A terminal's record of what was run is the last thing that
+/// should be embellished.
+///
+/// `compose_redraw` blanks its own `width` columns before drawing, so
+/// this needs no erase of its own and stays inside the pane in grid
+/// mode exactly as every other redraw does.
+fn repaint_without_affordances(prompt: &str, ed: &LineEditor, col_origin: usize, width: usize, ctx: HighlightContext) -> String {
+    compose_redraw(prompt, ed, "", col_origin, width, ctx, &[])
+}
+
 fn erase_menu_row_under_cursor(
     menu_capable: bool,
     menu_was_shown: bool,
@@ -1918,20 +1935,20 @@ pub fn read_line(
             Key::Enter if expand_abbr_at_cursor(&mut ed, abbrs, &mut snippet) => {}
             Key::Enter => {
                 drop(guard.take());
-                print!("\r\n{}", erase_menu_row_under_cursor(menu_capable, menu_was_shown, row_origin, col_origin, width));
+                print!("{}\r\n{}", repaint_without_affordances(prompt, &ed, col_origin, width, ctx), erase_menu_row_under_cursor(menu_capable, menu_was_shown, row_origin, col_origin, width));
                 io::stdout().flush()?;
                 return Ok(ReadOutcome::Line(ed.as_string()));
             }
             Key::CtrlC => {
                 drop(guard.take());
-                print!("^C\r\n{}", erase_menu_row_under_cursor(menu_capable, menu_was_shown, row_origin, col_origin, width));
+                print!("{}^C\r\n{}", repaint_without_affordances(prompt, &ed, col_origin, width, ctx), erase_menu_row_under_cursor(menu_capable, menu_was_shown, row_origin, col_origin, width));
                 io::stdout().flush()?;
                 return Ok(ReadOutcome::Interrupted { text: ed.as_string() });
             }
             Key::CtrlD => {
                 if ed.buf.is_empty() {
                     drop(guard.take());
-                    print!("\r\n{}", erase_menu_row_under_cursor(menu_capable, menu_was_shown, row_origin, col_origin, width));
+                    print!("{}\r\n{}", repaint_without_affordances(prompt, &ed, col_origin, width, ctx), erase_menu_row_under_cursor(menu_capable, menu_was_shown, row_origin, col_origin, width));
                     io::stdout().flush()?;
                     return Ok(ReadOutcome::Eof);
                 }
@@ -1959,7 +1976,7 @@ pub fn read_line(
                 // falling through to ed.backspace() below.
                 if esc_cancels && ed.buf.is_empty() {
                     drop(guard.take());
-                    print!("\r\n{}", erase_menu_row_under_cursor(menu_capable, menu_was_shown, row_origin, col_origin, width));
+                    print!("{}\r\n{}", repaint_without_affordances(prompt, &ed, col_origin, width, ctx), erase_menu_row_under_cursor(menu_capable, menu_was_shown, row_origin, col_origin, width));
                     io::stdout().flush()?;
                     return Ok(ReadOutcome::Interrupted { text: ed.as_string() });
                 }
@@ -3677,6 +3694,26 @@ mod tests {
     /// a real bash through a pty before being written down here: Ctrl-W
     /// is `unix-word-rubout` and takes `foo/bar` whole; Alt-Backspace
     /// is `backward-kill-word` and takes one path component.
+    #[test]
+    fn a_finished_prompt_paints_what_was_typed_and_not_the_suggestion() {
+        let mut ed = LineEditor::new();
+        for c in "echo alpha".chars() {
+            ed.insert(c);
+        }
+        let ctx = HighlightContext::default();
+
+        // What the live prompt shows: the typed text plus the ghost of
+        // a history entry it might become.
+        let live = compose_redraw("$ ", &ed, "-beta-gamma", 0, 40, ctx, &[]);
+        assert!(live.contains("beta-gamma"), "the suggestion is on screen while editing");
+
+        // What gets left behind once the line is submitted. Anything
+        // else and the scrollback records a command nobody ran.
+        let finished = repaint_without_affordances("$ ", &ed, 0, 40, ctx);
+        assert!(finished.contains("echo alpha"), "what was typed stays");
+        assert!(!finished.contains("beta-gamma"), "what was only suggested does not");
+    }
+
     #[test]
     fn a_finished_prompt_blanks_the_completion_row_under_it() {
         // Only the columns this prompt drew, and the cursor ends back
