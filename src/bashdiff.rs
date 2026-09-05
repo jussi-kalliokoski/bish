@@ -1453,7 +1453,28 @@ y
         // Second, a *single* external is kept off the pty by a redirect
         // of any kind -- so `wc -l < f` sends its output to the
         // inherited terminal because its *stdin* was redirected. The
-        // gate is all-or-nothing where it should be per stream.
+        // gate is all-or-nothing where it wants to be per stream.
+        //
+        // Widening it is not the one-line change it looks like, and the
+        // attempt is worth recording so the next one starts further
+        // along. `pty::attach_on_exec` before `apply_fd_redirects`
+        // composes correctly -- `pre_exec` closures run in registration
+        // order, so each stream lands where it was told and the rest
+        // reach the pane, and `redir-basic` does pass that way. Two
+        // things break:
+        //
+        //   - A compound's redirect (`{ ...; } 2>e`) is not in the
+        //     command's own `redirs.actions` at all; it arrives as a
+        //     `stdio_override`, which the pty then overwrites. `2>e`
+        //     captured nothing and the error went to the pane instead.
+        //     Those streams have to be layered on too.
+        //   - Taking the pty means returning `ExecResult::Fg`, and that
+        //     path does not pump coroutines. `wc -l < <(seq 1 20000)`
+        //     then reads 12773 lines instead of 20000, deterministically:
+        //     the `<( )` producer fills its pipe, parks, and is never
+        //     given another turn. Silent truncation is far worse than
+        //     the invisible output being fixed, so the widening was
+        //     backed out rather than shipped.
         ("redir-basic", "`wc -l < f`: a redirect of stdin keeps the whole command off the pty, so stdout is inherited"),
         ("a-superseded-redirect-still-creates-its-file", "same shape: `wc -l < e`"),
         ("a-compounds-stderr-reaches-externals", "stderr is redirected, so stdout is inherited too"),
