@@ -338,7 +338,11 @@ impl std::io::Read for SharedStdinReader {
 /// Only inside a coroutine, where a blocking descriptor would take the
 /// whole thread down with it. Everywhere else this is the bare `op`.
 fn briefly_nonblocking<T>(fd: i32, op: impl FnOnce() -> T) -> T {
-    if !crate::coroutine::in_coroutine() {
+    // A coroutine must never block -- it would take the thread and
+    // every other stage with it. So must an in-process pipeline stage
+    // whose pane output only this thread will drain, for the same
+    // reason wearing a different hat (see PIPELINE_DRAIN).
+    if !crate::coroutine::in_coroutine() && !pipeline_drain_armed() {
         return op();
     }
     unsafe extern "C" {
@@ -355,6 +359,81 @@ fn briefly_nonblocking<T>(fd: i32, op: impl FnOnce() -> T) -> T {
     let out = op();
     unsafe { fcntl(fd, F_SETFL, flags) };
     out
+}
+
+/// The pty a pipeline in a pane writes into, and the grid its bytes
+/// belong to.
+///
+/// A pipeline is spawned as real processes, and the streams nobody
+/// redirected are inherited -- which in a pane is the real terminal
+/// underneath, the one the compositor paints over. So `ls | grep x`
+/// printed nothing at all in a split window, and had never printed
+/// anything. This is the pane's own end of the pipeline: the last
+/// stage's stdout and every stage's stderr point at the slave, and
+/// this drains the master into the grid.
+struct PaneOutput {
+    master: std::fs::File,
+    screen: Rc<RefCell<crate::vt100::Screen>>,
+    /// One slave descriptor, held open for as long as this exists and
+    /// never written to.
+    ///
+    /// Without it the master starts answering EIO the moment the last
+    /// stage exits and closes its own copy -- before anything has read
+    /// what that stage wrote. `seq 1 2 | { echo start; cat; }` lost
+    /// `cat`'s two lines exactly that way: they were sitting in the pty
+    /// and the drain that came looking for them was told the far end
+    /// had gone. Keeping one open means an empty pty reads as "nothing
+    /// yet" rather than "nothing ever".
+    _keepalive: std::fs::File,
+}
+
+impl PaneOutput {
+    /// Everything waiting right now, into the grid. Never blocks: the
+    /// master is non-blocking, and the `Err` arm covers both "nothing
+    /// yet" and the EIO Linux gives once every slave is closed.
+    fn drain(&mut self) {
+        use std::io::Read;
+        let mut buf = [0u8; 4096];
+        loop {
+            match self.master.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => self.screen.borrow_mut().feed(&buf[..n]),
+                Err(_) => break,
+            }
+        }
+    }
+}
+
+thread_local! {
+    /// Armed while this thread is running something that writes into a
+    /// pipeline it is also responsible for draining.
+    ///
+    /// The in-process stage of a pipeline runs to completion inline, so
+    /// nothing empties the pane's pty while it does. If the stage
+    /// upstream produces more than a pipe holds and the stage
+    /// downstream produces more than the pty holds, both stop: the
+    /// downstream blocked writing, so it stopped reading, so the
+    /// upstream blocked writing too. Draining from inside the write
+    /// that would otherwise block is what keeps that from being a hang.
+    static PIPELINE_DRAIN: RefCell<Option<PaneOutput>> = const { RefCell::new(None) };
+}
+
+/// Whether a write that would block should drain the pane's pty and
+/// try again rather than wait in the kernel.
+fn pipeline_drain_armed() -> bool {
+    PIPELINE_DRAIN.with(|d| d.borrow().is_some())
+}
+
+/// One pass of the armed drain. `false` if there is nothing armed, in
+/// which case the caller has to block after all.
+fn drain_pipeline_output() -> bool {
+    PIPELINE_DRAIN.with(|d| match d.borrow_mut().as_mut() {
+        Some(output) => {
+            output.drain();
+            true
+        }
+        None => false,
+    })
 }
 
 /// A write into a redirect target that failed. A broken pipe is the
@@ -428,7 +507,14 @@ fn write_fd_parking(fd: i32, bytes: &[u8]) -> std::io::Result<()> {
         }
         let e = std::io::Error::last_os_error();
         match e.kind() {
-            std::io::ErrorKind::WouldBlock => crate::scheduler::park_writable(fd),
+            // Nothing downstream can take more yet. A coroutine parks;
+            // an in-process stage empties the pane's pty, which is what
+            // the process downstream is waiting on, and tries again.
+            std::io::ErrorKind::WouldBlock => {
+                if !drain_pipeline_output() {
+                    crate::scheduler::park_writable(fd);
+                }
+            }
             std::io::ErrorKind::Interrupted => {}
             _ => return Err(e),
         }
@@ -8463,7 +8549,17 @@ impl Shell {
         // this child's stdout go", asked here before deciding to
         // override the answer.
         let stdout_already_spoken_for = self.stdio_override.as_ref().is_some_and(|o| o.borrow().stdout.is_some());
-        let use_pty = self.is_promoted() && redirs.actions.is_empty() && !stdout_already_spoken_for;
+        // ...and never inside an in-process pipeline stage, where all
+        // three descriptors are already spoken for by the pipeline
+        // itself. `pty::spawn_attached` hands a command a whole pty,
+        // stdin included, so `seq 1 2 | { echo start; cat; }` had the
+        // `cat` reading from a pty nothing would ever close instead of
+        // from the pipe -- a hang, where before it had merely been
+        // invisible. The stage's own fd 1 already points at the pane
+        // (see run_multi), so there is nothing a pty would add.
+        // PIPELINE_DRAIN being armed is exactly "this is a pipeline
+        // stage running in-process".
+        let use_pty = self.is_promoted() && redirs.actions.is_empty() && !stdout_already_spoken_for && !pipeline_drain_armed();
 
         if use_pty {
             if let Ok(p) = pty::open() {
@@ -8981,6 +9077,33 @@ impl Shell {
             std::fs::OpenOptions::new().read(true).write(true).open(&p.slave_path).ok().map(Stdio::from)
         };
 
+        // A foreground pipeline in a pane needs somewhere for its own
+        // output to go. Inherited means the real terminal underneath,
+        // which the compositor paints over -- so `ls | grep x` in a
+        // split window printed nothing, and never had. A pty rather
+        // than a pipe for the same reason a single external command
+        // gets one: the stages then see a terminal, exactly as they
+        // would have outside a pane.
+        let pane_pty = match !background && self.is_promoted() && self.stdio_override.is_none() {
+            true => self.background_pty(),
+            false => None,
+        };
+        let pane_slave = |pty: &Option<pty::Pty>| -> Option<Stdio> {
+            let p = pty.as_ref()?;
+            std::fs::OpenOptions::new().read(true).write(true).open(&p.slave_path).ok().map(Stdio::from)
+        };
+        let mut pane_output = match (&pane_pty, self.sink_grid()) {
+            (Some(p), Some(screen)) => {
+                p.master.try_clone().ok().zip(std::fs::OpenOptions::new().read(true).write(true).open(&p.slave_path).ok()).map(
+                    |(master, keepalive)| {
+                        pty::set_nonblocking(std::os::unix::io::AsRawFd::as_raw_fd(&master));
+                        PaneOutput { master, screen, _keepalive: keepalive }
+                    },
+                )
+            }
+            _ => None,
+        };
+
         for (i, cmd) in commands.iter().enumerate() {
             let is_last = i == n - 1;
             if is_last && lastpipe {
@@ -9014,8 +9137,11 @@ impl Shell {
                 Some(prev) => Stdio::from(prev),
                 None => bg_slave(&bg_pty).unwrap_or_else(|| self.spawn_stdin_stdio()),
             };
-            let default_stdout = if is_last { bg_slave(&bg_pty).unwrap_or_else(|| self.spawn_stdout_stdio()) } else { Stdio::piped() };
-            let mut default_stderr = bg_slave(&bg_pty);
+            let default_stdout = match is_last {
+                true => bg_slave(&bg_pty).or_else(|| pane_slave(&pane_pty)).unwrap_or_else(|| self.spawn_stdout_stdio()),
+                false => Stdio::piped(),
+            };
+            let mut default_stderr = bg_slave(&bg_pty).or_else(|| pane_slave(&pane_pty));
 
             let mut command = match cmd {
                 parser::Command::Simple(sc) => {
@@ -9207,6 +9333,21 @@ impl Shell {
             if let Some(fd) = &stdin_fd {
                 unsafe { dup2(fd.as_raw_fd(), 0) };
             }
+            // The last stage has no pipe to write into, so fd 1 would
+            // stay this shell's own -- the real terminal, which in a
+            // pane is painted over. That is invisible to a *builtin*
+            // here (it writes to the sink, which is the grid) but not
+            // to anything this stage spawns: `echo a | { read x; cat; }`
+            // lost the `cat` entirely. Its stderr too, which is where
+            // an external inside a compound or a loop was going.
+            let pane_slave = match (stdout_fd.is_none(), &pane_pty) {
+                (true, Some(p)) => std::fs::OpenOptions::new().read(true).write(true).open(&p.slave_path).ok(),
+                _ => None,
+            };
+            if let Some(slave) = &pane_slave {
+                unsafe { dup2(slave.as_raw_fd(), 1) };
+                unsafe { dup2(slave.as_raw_fd(), 2) };
+            }
             if let Some(fd) = &stdout_fd {
                 unsafe { dup2(fd.as_raw_fd(), 1) };
             }
@@ -9232,7 +9373,13 @@ impl Shell {
                 Some(fd) => ChildStdio { stdout: Some(std::fs::File::from(fd)), ..ChildStdio::default() },
                 None => ChildStdio::default(),
             };
+            // Armed for the duration: this stage runs to completion
+            // inline, so nothing else is emptying the pane's pty while
+            // it writes into a pipe whose reader is filling that pty.
+            // See PIPELINE_DRAIN.
+            PIPELINE_DRAIN.with(|d| *d.borrow_mut() = pane_output.take());
             let result = self.run_command_in_child_shell(&commands[stage], stdio);
+            pane_output = PIPELINE_DRAIN.with(|d| d.borrow_mut().take());
             let broken = disarm_broken_pipe();
             restore_fd012(saved);
             // Dropped before anything is waited for: the stage
@@ -9254,14 +9401,39 @@ impl Shell {
         // through `children` at all.
         let mut codes: Vec<Option<i32>> = vec![None; n];
         for (stage, mut c) in children {
-            let code = match c.wait() {
-                Ok(s) => exit_code_from_status(s),
-                Err(e) => {
-                    sh_eprintln!(self, "bish: {}", e);
-                    1
+            // Drained while waiting rather than after: a stage that
+            // fills the pty stops until something reads it, and the
+            // only reader is this thread.
+            let code = loop {
+                if let Some(output) = pane_output.as_mut() {
+                    output.drain();
+                }
+                match c.try_wait() {
+                    Ok(Some(s)) => break exit_code_from_status(s),
+                    Ok(None) => match pane_output.is_some() {
+                        true => std::thread::sleep(std::time::Duration::from_millis(1)),
+                        // Nothing to keep flowing, so the ordinary
+                        // blocking wait is right.
+                        false => match c.wait() {
+                            Ok(s) => break exit_code_from_status(s),
+                            Err(e) => {
+                                sh_eprintln!(self, "bish: {}", e);
+                                break 1;
+                            }
+                        },
+                    },
+                    Err(e) => {
+                        sh_eprintln!(self, "bish: {}", e);
+                        break 1;
+                    }
                 }
             };
             codes[stage] = Some(code);
+        }
+        // Every slave is closed now, so what is left in the master is
+        // all there will ever be.
+        if let Some(output) = pane_output.as_mut() {
+            output.drain();
         }
         if let (Some(stage), Some(code)) = (inproc_stage, inproc_code) {
             codes[stage] = Some(code);

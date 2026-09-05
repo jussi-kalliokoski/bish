@@ -1436,37 +1436,27 @@ y
     }
 
     const PANE_DIVERGENCES: &[(&str, &str)] = &[
-        // -- output that never reaches the pane's grid ---------------
+        // -- output that still never reaches the pane's grid ---------
         //
-        // The one cause behind most of this list, and the one the
-        // roadmap already has an item for. A pane's output is its vt100
-        // grid; only a *single* foreground external command gets a pty
-        // whose bytes are drained into it. Everything else -- a
-        // pipeline stage, an external with a redirect of its own, an
-        // external's stderr, a process substitution -- is spawned with
-        // fd 1 inherited, which in a real pane is the terminal
-        // underneath that the compositor paints over. So the output is
-        // not merely out of order, it is invisible.
+        // A pipeline's own output now goes to a pty this shell drains
+        // into the grid, so `ls | grep x` works and most of this group
+        // is gone. Two shapes are left.
         //
-        // Two signatures give it away here. It arrives *before* the
-        // grid's own contents, because `--promoted -c` prints the grid
-        // once at the end and anything written straight to fd 1 got
-        // there first; and it still contains tabs and trailing spaces,
-        // which a grid would have expanded and trimmed -- see
-        // `stage-sees-shell-options` and `keyword-completions`, whose
-        // only difference is that the pane's copy never met a terminal.
-        ("redir-basic", "`wc -l < f`: a redirect of its own keeps an external off the pty, so its output bypasses the grid"),
-        ("flush-order", "`printf B | cat`: a pipeline's output bypasses the grid"),
-        ("flush-order-stderr", "same, for the stderr half"),
-        ("shell-stage-hands-the-rest-to-an-external", "the external stage's output bypasses the grid"),
-        ("read-leaves-the-rest-of-the-pipe", "same"),
-        ("stage-sees-shell-options", "the stage's `shopt` output keeps its literal tab -- it never went through a grid"),
-        ("keyword-completions", "`compgen | ...`: the trailing space survives for the same reason"),
-        ("cd-keeps-the-route-it-was-given", "`pwd -P | sed`: pipeline, so it lands ahead of the grid"),
-        ("declare-capital-f-with-and-without-a-name", "`declare -F | head -2`: same"),
-        ("an-exit-trap-set-in-a-subshell-fires-there", "`echo a | { ...; cat; }`: the pipeline's `a` never reaches the grid"),
-        ("a-superseded-redirect-still-creates-its-file", "the redirected externals bypass the grid"),
-        ("a-compounds-stderr-reaches-externals", "an external's stderr bypasses the grid"),
+        // First, a pipeline of two *shell* stages runs on the
+        // coroutine scheduler rather than in-process, and that path has
+        // no pane pty yet -- `{ echo a; } | { read x; cat; }` is the
+        // shape.
+        ("shell-stage-hands-the-rest-to-an-external", "two shell stages take the scheduler path, which has no pane pty yet"),
+        ("read-leaves-the-rest-of-the-pipe", "the same case under a second name"),
+        ("an-exit-trap-set-in-a-subshell-fires-there", "`echo a | { ...; cat; }`: two shell stages again"),
+        //
+        // Second, a *single* external is kept off the pty by a redirect
+        // of any kind -- so `wc -l < f` sends its output to the
+        // inherited terminal because its *stdin* was redirected. The
+        // gate is all-or-nothing where it should be per stream.
+        ("redir-basic", "`wc -l < f`: a redirect of stdin keeps the whole command off the pty, so stdout is inherited"),
+        ("a-superseded-redirect-still-creates-its-file", "same shape: `wc -l < e`"),
+        ("a-compounds-stderr-reaches-externals", "stderr is redirected, so stdout is inherited too"),
         ("a-loops-stderr-reaches-externals", "same"),
         ("a-functions-stderr-reaches-externals", "same"),
         // -- a background job has nobody draining it -----------------
