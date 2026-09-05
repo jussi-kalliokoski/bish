@@ -106,6 +106,11 @@ mod tests {
         case("quote-forms", r#"echo 'a$b' "a$UNSET_ZZ b" a\ b"#),
         case("quote-mixed", r#"x=v; echo "$x"'lit'"$x""#),
         case("quote-ansi-c", r#"printf '%s' $'a\tb\101\x41\n'"#),
+        // `$'...'` is quoting, so what comes out of it is no more
+        // subject to globbing than what comes out of `'...'`. bish
+        // treated it as unquoted text and listed the directory.
+        case("quote-ansi-c-does-not-glob", r#"touch afile bfile; echo $'*'; echo $'a*'"#),
+        case("quote-ansi-c-keeps-its-spaces-as-one-word", r#"printf '[%s]' $'a b'; echo"#),
         case("quote-empty", r#"set -- "" a; echo "$#"; for w in "$@"; do echo "[$w]"; done"#),
         // -- redirection ----------------------------------------------
         case("redir-basic", r#"echo hi > f; cat f; echo more >> f; wc -l < f"#),
@@ -923,6 +928,7 @@ y
         // unset, so the commonest error-handling idiom reported
         // nothing at all.
         case("bash-command-in-an-err-trap", r#"trap "echo E:\$BASH_COMMAND" ERR; grep -q zz /dev/null"#),
+        case("bash-command-names-an-assignment-as-written", r#"trap "echo D:\$BASH_COMMAND" DEBUG; x=1"#),
         case("bash-command-in-an-err-trap-from-a-function", r#"f(){ false; }; trap "echo E:\$BASH_COMMAND" ERR; f"#),
         case("bash-command-in-a-debug-trap", r#"trap "echo D:\$BASH_COMMAND" DEBUG; true; echo two"#),
         // PS4 is expanded before it is printed. Printed as written,
@@ -1022,12 +1028,6 @@ y
         // parser does not carry, and without them setting it earlier
         // would name the command in bish's own serialised shape.
         ("bash-command-read-outside-a-trap", "`echo $BASH_COMMAND` names the previous command; bash names the one being run, as written"),
-        // An assignment-only command is named from the *serialised*
-        // word rather than the source, since its value has not been
-        // evaluated yet and expanding it to name it would run any
-        // `$( )` in it a second time. So `x=1` is reported as `x='1'`:
-        // bish's quoting, the same shape `declare -f` has.
-        ("bash-command-quotes-an-assignment", "`$BASH_COMMAND` for `x=1` is `x='1'`; bash gives the source text `x=1`"),
         // A DEBUG trap fires once per pipeline *stage* in bash. Here it
         // fires only for a stage that runs in the shell: an external
         // one is spawned without going through the path that fires it,
@@ -1060,6 +1060,17 @@ y
         //
         // What the output has to *do* is checked in CASES: it defines
         // the function again when another shell reads it back.
+        // Only the *layout* now. The quoting half of this went away
+        // when the serializer stopped writing unquoted words as
+        // quoted ones: `declare -f` of a body containing `echo *` or
+        // `case $x in a*)` reproduces both correctly today, where it
+        // used to reproduce something that behaved differently. What
+        // is left is genuinely presentational -- bash writes `f () `
+        // and a four-space indent, bish writes `f() ` and none, and
+        // bish prints `${x}` where the source said `$x`. That last one
+        // is the piece that really does want source spans: the shape a
+        // variable was written in is not recoverable from the parse
+        // tree.
         ("function-body-formatting", "`declare -f f` reconstructs the body in bish's own layout, not bash's"),
         // The builtin *set* differs, legitimately: bish has builtins
         // bash does not (`abbr`, `win`, `::bish`) and lacks `bind` and
@@ -1074,7 +1085,6 @@ y
         case("set-o-lists-fewer-options", r#"set -o | wc -l"#),
         case("function-body-formatting", r#"f() { :; }; declare -f f"#),
         case("bash-command-read-outside-a-trap", r#"true; echo "[$BASH_COMMAND]""#),
-        case("bash-command-quotes-an-assignment", r#"trap "echo D:\$BASH_COMMAND" DEBUG; x=1"#),
         case("debug-trap-misses-an-external-pipeline-stage", r#"trap "echo D" DEBUG; echo a | cat"#),
         case("compgen-b-lists-this-shells-builtins", r#"compgen -b | sort | head -3 | tr '\n' ' '; echo"#),
         // -- roadmap 10: parser leniency, the part still standing -----
@@ -1529,74 +1539,49 @@ y
 
     /// The scripts that do *not* survive the round trip, and why.
     ///
-    /// One cause dominates: `serialize_chunk` writes an unquoted word
-    /// and a quoted one the same way, as `'...'`. The parse tree keeps
-    /// them apart -- `Chunk::Str` is unquoted, `Chunk::LiteralStr` is
-    /// quoted -- and collapsing them makes every unquoted word literal.
-    /// So `echo *` comes back as `'echo' '*'` and prints an asterisk,
-    /// `case $x in a*)` stops matching anything but a literal `a*`, and
-    /// `[[ x =~ re ]]` loses its operator to quotes. That accounts for
-    /// the globs, the patterns and the `[[ ]]` cases here.
+    /// The cause that used to dominate this list is gone. `serialize_chunk`
+    /// wrote an unquoted word and a quoted one the same way, as
+    /// `'...'`, which made every unquoted word literal -- `echo *`
+    /// printed an asterisk, `case $x in a*)` matched only a literal
+    /// `a*`, and `[[ x < y ]]` lost its operator. The parse tree had
+    /// kept them apart all along; the serializer just had to stop
+    /// collapsing them. That took the list from 72 to 36.
     ///
-    /// The rest are their own shapes: a `time` keyword that is not
-    /// written back, a redirect on a group that is dropped, an array
-    /// literal that does not re-parse, a here-document rewritten as a
-    /// here-string with a newline the original did not have, and
-    /// process substitutions.
+    /// What is left is four separate shapes, none of them about
+    /// quoting:
     ///
-    /// This is not theoretical. Serialising is how a construct reaches
-    /// a self-exec'd child, so `{ echo *; } &` prints an asterisk today
-    /// and `{ case a in a*) echo hit;; esac; } &` prints nothing at
-    /// all. The list is here so the property is enforced for everything
-    /// else while this is fixed, and so the size of it is on the record
-    /// rather than in someone's head.
+    ///   - **Redirects and heredocs.** A `HereDoc` is re-emitted as a
+    ///     here-string (`serialize.rs`'s own note says the body is
+    ///     already captured by then), but `<<<` adds a newline of its
+    ///     own that the body already has; and the compound-redirect
+    ///     cases lose the order their descriptors were rebound in.
+    ///   - **Process substitution.** `<( )` and `>( )` come back as
+    ///     something that no longer names a running producer.
+    ///   - **`time`.** The keyword and its format are not written back
+    ///     at all.
+    ///   - **Four of their own.** Arithmetic fatality, `select` with no
+    ///     `in`, and PS4 expansion.
+    ///
+    /// The list is here so the property is enforced for everything else
+    /// while these are fixed, and so its size is on the record rather
+    /// than in someone's head. `the_known_round_trip_breaks_are_still_broken`
+    /// keeps it honest in the other direction.
     const ROUND_TRIP_BREAKS: &[&str] = &[
+        // Redirects and heredocs.
         "a-compounds-stderr-reaches-externals",
-        "a-literal-is-checked-after-it-is-read",
         "a-loops-stderr-reaches-externals",
-        "an-unquoted-case-pattern-is-still-a-glob",
-        "a-quoted-case-pattern-is-literal",
-        "arith-command-is-not",
-        "arith-expansion-is-fatal",
-        "arithmetic-base-out-of-range",
-        "arith-subscript",
-        "assoc-basic",
-        "bare-array-is-element-zero",
-        "bash-command-quotes-an-assignment",
-        "bashopts-lists-what-is-on",
         "both-streams-one-file-keeps-one-position",
-        "case-fallthrough",
-        "case-patterns",
-        "character-classes-in-a-glob",
-        "character-classes-in-a-regex",
         "compound-dup-to-stderr-that-is-itself-redirected",
         "compound-dup-to-stderr-that-was-already-redirected",
-        "dbracket-quoted-pattern",
-        "dbracket-regex",
-        "declare-clusters-its-flags",
         "dup-before-the-redirect-it-would-have-followed",
         "fd-swap-then-redirect-compound",
-        "glob-class",
-        "glob-dot-literal",
-        "glob-is-relative-to-the-shells-cwd",
-        "glob-multi-component",
-        "glob-question",
-        "glob-question-component",
-        "glob-star",
-        "globstar-all",
-        "globstar-dirs-only",
-        "globstar-middle",
-        "globstar-off",
-        "globstar-prefix",
-        "globstar-suffix",
-        "globstar-symlink",
-        "glob-with-a-directory-prefix",
-        "indirect-expansion-follows-a-subscript",
-        "local-clusters-its-flags",
-        "process-subst-as-a-redirect",
-        "process-subst-more-than-a-pipe-buffer",
-        "process-subst-read-by-a-builtin",
-        "process-subst-read-by-a-loop",
+        "redir-both",
+        "redir-heredoc",
+        "redir-heredoc-quoted",
+        "redir-heredoc-tabs",
+        "redir-stderr",
+        "select-reads-its-own-redirect",
+        // Process substitution.
         "proc-sub-out-body-output-all-arrives",
         "proc-sub-out-larger-than-a-pipe-buffer",
         "proc-sub-out-that-answers-at-eof",
@@ -1604,25 +1589,24 @@ y
         "proc-sub-out-to-an-externals-redirect",
         "proc-sub-out-two-at-once",
         "proc-sub-out-with-a-shell-body",
-        "ps4-expands-a-parameter",
-        "readonly-array",
-        "redir-both",
-        "redir-heredoc",
-        "redir-heredoc-quoted",
-        "redir-heredoc-tabs",
-        "redir-stderr",
-        "select-reads-its-own-redirect",
-        "select-without-an-in-clause",
-        "shellopts-lists-what-is-on",
-        "shopt-dotglob",
-        "shopt-nocaseglob",
-        "shopt-nullglob",
+        "process-subst-as-a-redirect",
+        "process-subst-more-than-a-pipe-buffer",
+        "process-subst-read-by-a-builtin",
+        "process-subst-read-by-a-loop",
+        // The `time` keyword.
         "time-format-literal",
         "time-format-percent",
         "time-group",
         "time-negated",
         "time-pipeline",
         "time-status",
+        // Their own shapes.
+        "a-literal-is-checked-after-it-is-read",
+        "arith-command-is-not",
+        "arith-expansion-is-fatal",
+        "arithmetic-base-out-of-range",
+        "ps4-expands-a-parameter",
+        "select-without-an-in-clause",
     ];
 
     /// Every corpus script, run as written and again after a round trip
@@ -1640,6 +1624,50 @@ y
     /// Behaviour rather than shape: comparing ASTs would need
     /// `PartialEq` across the whole parse tree, and would still not say
     /// whether the text *means* the same thing. Running it does.
+    /// The same guard the divergence lists have: a name on
+    /// `ROUND_TRIP_BREAKS` is a claim that the script *does* break, and
+    /// a claim that stops being true has to be removed rather than left
+    /// standing. Without this the list only ever grows -- it went from
+    /// 72 to 36 in one change, and nothing would have said so.
+    #[test]
+    fn the_known_round_trip_breaks_are_still_broken() {
+        let Some(bish) = bish_binary() else { return };
+        let root = std::env::temp_dir().join(format!("bish-roundtrip-guard-{}", std::process::id()));
+        let mut fixed = Vec::new();
+        for case in CASES.iter().chain(PENDING.iter()).filter(|c| ROUND_TRIP_BREAKS.contains(&c.name)) {
+            let Ok(tokens) = crate::lexer::Lexer::new(case.script).tokenize() else { continue };
+            let Ok(program) = crate::parser::Parser::new(tokens).parse_program() else { continue };
+            let round_tripped = crate::serialize::serialize_program(&program);
+            let dir = root.join(case.name);
+            let run_one = |script: &str| {
+                let _ = std::fs::remove_dir_all(&dir);
+                std::fs::create_dir_all(&dir).unwrap();
+                let out = run(bish.as_os_str(), script, &dir);
+                let _ = std::fs::remove_dir_all(&dir);
+                out
+            };
+            let direct = run_one(case.script);
+            let after = run_one(&round_tripped);
+            if direct.text == after.text && direct.timed_out == after.timed_out {
+                fixed.push(case.name);
+            }
+        }
+        let _ = std::fs::remove_dir(&root);
+        assert!(
+            fixed.is_empty(),
+            "{} script(s) survive the round trip now -- remove them from ROUND_TRIP_BREAKS:\n{}",
+            fixed.len(),
+            fixed.iter().map(|n| format!("  {n}")).collect::<Vec<_>>().join("\n")
+        );
+    }
+
+    #[test]
+    fn every_round_trip_break_names_a_real_case() {
+        for name in ROUND_TRIP_BREAKS {
+            assert!(CASES.iter().chain(PENDING.iter()).any(|c| c.name == *name), "`{name}` is listed as a round-trip break with no case to prove it");
+        }
+    }
+
     #[test]
     fn every_corpus_script_survives_a_round_trip_through_the_serializer() {
         let Some(bish) = bish_binary() else { return };

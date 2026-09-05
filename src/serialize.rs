@@ -235,10 +235,17 @@ pub fn serialize_redirect(r: &Redirect) -> String {
 }
 
 pub(crate) fn serialize_word(w: &Word) -> String {
-    if w.chunks.is_empty() {
-        return "''".to_string();
+    let text: String = w.chunks.iter().map(serialize_chunk).collect();
+    // A word that writes as nothing has to be written as `''`, or it
+    // stops being a word at all: `echo ""` would come back as `echo`,
+    // which prints a blank line where the original printed one too --
+    // but `f ""` would lose an argument. Empty chunks and a chunk that
+    // is itself empty (the parser makes `Chunk::Str("")` for the tail
+    // of some assignments) are the same case.
+    match text.is_empty() {
+        true => "''".to_string(),
+        false => text,
     }
-    w.chunks.iter().map(serialize_chunk).collect()
 }
 
 fn serialize_chunk(c: &Chunk) -> String {
@@ -246,7 +253,26 @@ fn serialize_chunk(c: &Chunk) -> String {
         // Written back as the source wrote it -- `~` is only a tilde
         // prefix at the start of a word, so it needs no quoting here.
         Chunk::Tilde { name } => format!("~{}", name),
-        Chunk::Str(s) | Chunk::LiteralStr(s) => quote_literal(s),
+        // The two are kept apart here because the parse tree keeps them
+        // apart, and collapsing them was this serializer's one real
+        // bug: `Chunk::Str` is text that was written unquoted and
+        // `Chunk::LiteralStr` is text that was quoted or escaped, so
+        // quoting both made every unquoted word literal. `echo *`
+        // came back as `'echo' '*'` and printed an asterisk; `case $x
+        // in a*)` stopped matching anything but a literal `a*`; and
+        // `[[ x < y ]]` lost its operator, since `'<'` inside `[[ ]]`
+        // is a string rather than a comparison.
+        //
+        // Emitting `Str` verbatim is safe precisely because the lexer
+        // has already done the separating. Anything that had to be
+        // escaped to survive being read -- a quoted run, a backslashed
+        // space, a backslashed glob character -- arrives as
+        // `LiteralStr`: `echo a\ b` lexes to `[Str("a"), LiteralStr(" "),
+        // Str("b")]`, and `echo \*` to `[LiteralStr("*")]` where `echo *`
+        // gives `[Str("*")]`. So what is left in `Str` is by
+        // construction text that reads back as itself.
+        Chunk::Str(s) => s.clone(),
+        Chunk::LiteralStr(s) => quote_literal(s),
         Chunk::Var { name, quoted } => wrap_quoted(format!("${{{}}}", name), *quoted),
         Chunk::Sub { raw, quoted } => wrap_quoted(format!("$({})", raw), *quoted),
         Chunk::Arith { raw, quoted } => wrap_quoted(format!("$(({}))", raw), *quoted),

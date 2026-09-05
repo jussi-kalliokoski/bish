@@ -1428,7 +1428,19 @@ impl<'a> Lexer<'a> {
                     plain = false;
                     self.advance(); // '$'
                     self.advance(); // '\''
-                    buf.push_str(&self.read_ansi_c_string()?);
+                    let lit = self.read_ansi_c_string()?;
+                    // `LiteralStr`, not `Str`: `$'...'` is *quoting*,
+                    // and what comes out of it is no more subject to
+                    // globbing than what comes out of `'...'`. Appended
+                    // to `buf` it became a `Chunk::Str`, so `echo $'*'`
+                    // listed the directory where bash prints an
+                    // asterisk. The serializer's round trip is what
+                    // caught it: `$'a\tb'` was written back out with a
+                    // real tab in it, which then read as two words.
+                    if !buf.is_empty() {
+                        chunks.push(Chunk::Str(std::mem::take(&mut buf)));
+                    }
+                    chunks.push(Chunk::LiteralStr(lit));
                 }
                 Some('$') => {
                     self.advance();
