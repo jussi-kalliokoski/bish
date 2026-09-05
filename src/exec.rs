@@ -2713,6 +2713,91 @@ impl Shell {
         table.jobs.iter().position(|j| j.cmd_text.starts_with(rest))
     }
 
+    /// Runs a job that was stashed for repl.rs to drive here instead,
+    /// and returns its exit status.
+    ///
+    /// `ExecResult::Fg` means "this command is attached to a pty and
+    /// stashed; whoever owns the terminal should render it". That works
+    /// for the last command on a line, which is where an interactive
+    /// program lives. It cannot work for a command with anything after
+    /// it: `Fg` is a control-flow escape (see `is_signal`), so bubbling
+    /// it abandons the rest of the `&&` chain and the rest of the line.
+    /// In a promoted session `cp a b && mv b c` ran `cp`, silently
+    /// skipped `mv`, and reported success -- and so did every
+    /// `make && ./run` in a split window.
+    ///
+    /// So a command with something after it has its pty drained here
+    /// instead: the output still reaches the pane, the status is still
+    /// its own, and the line carries on. What it does not get is the
+    /// interactive half repl.rs adds -- keystrokes forwarded, Ctrl-C,
+    /// resize -- which is the right trade for a command that is not the
+    /// one being sat in front of.
+    fn drive_pending_fg_inline(&mut self) -> i32 {
+        use std::io::Read;
+        use std::os::unix::io::AsRawFd;
+        let Some(mut job) = self.pending_fg.take() else { return self.last_status };
+        let screen = self.sink_grid();
+        if let Some(master) = job.pty_master.as_mut() {
+            pty::set_nonblocking(master.as_raw_fd());
+        }
+        let mut buf = [0u8; 4096];
+        // Everything waiting on the pty right now, into the pane.
+        // `Err` covers the EIO Linux gives once the child has gone and
+        // nothing holds the slave any more, which is this loop's real
+        // end condition rather than an error.
+        let mut drain = |job: &mut Job| -> bool {
+            let (Some(master), Some(screen)) = (job.pty_master.as_mut(), screen.as_ref()) else {
+                return false;
+            };
+            let mut fed = false;
+            loop {
+                match master.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        screen.borrow_mut().feed(&buf[..n]);
+                        fed = true;
+                    }
+                    Err(_) => break,
+                }
+            }
+            fed
+        };
+        loop {
+            let fed = drain(&mut job);
+            let done = match job.children.last_mut() {
+                Some(child) => matches!(child.try_wait(), Ok(Some(_)) | Err(_)),
+                None => true,
+            };
+            if done {
+                break;
+            }
+            if !fed {
+                // Nothing to read and not finished: yield rather than
+                // spin. Short enough that a chatty command still feels
+                // immediate.
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        }
+        // Whatever landed between the last read and the child exiting.
+        drain(&mut job);
+        job.wait()
+    }
+
+    /// Turns a bubbled `ExecResult::Fg` into an ordinary status by
+    /// running the job here -- for every caller that has more to do
+    /// afterwards and so cannot let the escape past. Anything else is
+    /// handed straight back.
+    fn settle_fg(&mut self, result: ExecResult) -> ExecResult {
+        match result {
+            ExecResult::Fg => {
+                let status = self.drive_pending_fg_inline();
+                self.last_status = status;
+                ExecResult::Status(status)
+            }
+            other => other,
+        }
+    }
+
     // Safety net for the one place ExecResult::Fg can arise that repl.rs
     // doesn't drive it from directly: command mode (`:fg`) has its own
     // separate, nested read-eval loop (run_command_mode) that can't hand
@@ -4192,6 +4277,7 @@ impl Shell {
 
     pub fn run_program(&mut self, prog: &Program) -> ExecResult {
         let mut result = ExecResult::Status(self.last_status);
+        let Some(last_item) = prog.last() else { return result };
         for item in prog {
             self.current_line = item.line;
             self.check_pending_signals();
@@ -4220,6 +4306,12 @@ impl Shell {
             }
             let background = matches!(item.sep, Sep::Background);
             result = self.run_and_or(&item.and_or, background);
+            // Same reasoning as the `&&` chain: `a; b` must still run
+            // `b`, so only the final statement of a program may hand a
+            // pty-backed job off to be driven somewhere else.
+            if !std::ptr::eq(item, last_item) {
+                result = self.settle_fg(result);
+            }
             self.last_status = result.status();
             // Backstop for a `set -u` violation from an expansion site
             // run_single's own check doesn't cover (a `for`/`case` list, an
@@ -4276,6 +4368,10 @@ impl Shell {
         let mut result = self.run_pipeline(&and_or.first, background);
         if last > 0 {
             self.suppress_errexit -= 1;
+            // Something follows, so a foreground pty job cannot be
+            // bubbled out to be driven elsewhere -- the rest of the
+            // chain would go with it. See settle_fg.
+            result = self.settle_fg(result);
         }
         // Set *after* the member runs, not before: a function body
         // contains and_or lists of its own, and each one writes this
@@ -4302,6 +4398,7 @@ impl Shell {
                 result = self.run_pipeline(pipeline, background);
                 if !is_last {
                     self.suppress_errexit -= 1;
+                    result = self.settle_fg(result);
                 }
                 self.errexit_exempt = !is_last;
                 self.last_status = result.status();
@@ -5784,6 +5881,11 @@ impl Shell {
             self.suppress_errexit += 1;
             let cond_result = self.run_program(cond);
             self.suppress_errexit -= 1;
+            // A condition always has a branch waiting behind it, so a
+            // foreground pty job cannot escape from one -- see
+            // settle_fg. `if cp a b; then ...` ran the `cp` and then
+            // never looked at the branch.
+            let cond_result = self.settle_fg(cond_result);
             if cond_result.is_signal() {
                 return cond_result;
             }
@@ -5811,6 +5913,9 @@ impl Shell {
             self.suppress_errexit += 1;
             let cond_result = self.run_program(cond);
             self.suppress_errexit -= 1;
+            // Same as `if`'s: the body, or the next test, always
+            // follows.
+            let cond_result = self.settle_fg(cond_result);
             if cond_result.is_signal() {
                 return cond_result;
             }
@@ -5836,7 +5941,16 @@ impl Shell {
                     self.last_status = s;
                     last_body_status = s;
                 }
-                ret @ (ExecResult::Return(_) | ExecResult::Window(_) | ExecResult::Fg | ExecResult::Edit | ExecResult::Exit(_)) => return ret,
+                // A loop body always has the next iteration behind it
+                // -- `for f in a b c; do cp "$f" d/; done` copied only
+                // `a` before this, because the first `cp` escaped with
+                // the rest of the loop still to run. See settle_fg.
+                ExecResult::Fg => {
+                    let status = self.drive_pending_fg_inline();
+                    self.last_status = status;
+                    last_body_status = status;
+                }
+                ret @ (ExecResult::Return(_) | ExecResult::Window(_) | ExecResult::Edit | ExecResult::Exit(_)) => return ret,
             }
         }
         if ran_body {
@@ -5870,7 +5984,15 @@ impl Shell {
                     continue;
                 }
                 ExecResult::Status(s) => self.last_status = s,
-                ret @ (ExecResult::Return(_) | ExecResult::Window(_) | ExecResult::Fg | ExecResult::Edit | ExecResult::Exit(_)) => return ret,
+                // A loop body always has the next iteration behind it
+                // -- `for f in a b c; do cp "$f" d/; done` copied only
+                // `a` before this, because the first `cp` escaped with
+                // the rest of the loop still to run. See settle_fg.
+                ExecResult::Fg => {
+                    let status = self.drive_pending_fg_inline();
+                    self.last_status = status;
+                }
+                ret @ (ExecResult::Return(_) | ExecResult::Window(_) | ExecResult::Edit | ExecResult::Exit(_)) => return ret,
             }
         }
         if ran_body { ExecResult::Status(self.last_status) } else { ExecResult::Status(0) }
@@ -5947,7 +6069,15 @@ impl Shell {
                     continue;
                 }
                 ExecResult::Status(s) => self.last_status = s,
-                ret @ (ExecResult::Return(_) | ExecResult::Window(_) | ExecResult::Fg | ExecResult::Edit | ExecResult::Exit(_)) => return ret,
+                // A loop body always has the next iteration behind it
+                // -- `for f in a b c; do cp "$f" d/; done` copied only
+                // `a` before this, because the first `cp` escaped with
+                // the rest of the loop still to run. See settle_fg.
+                ExecResult::Fg => {
+                    let status = self.drive_pending_fg_inline();
+                    self.last_status = status;
+                }
+                ret @ (ExecResult::Return(_) | ExecResult::Window(_) | ExecResult::Edit | ExecResult::Exit(_)) => return ret,
             }
         }
     }
@@ -5993,7 +6123,15 @@ impl Shell {
                     }
                 }
                 ExecResult::Status(s) => self.last_status = s,
-                ret @ (ExecResult::Return(_) | ExecResult::Window(_) | ExecResult::Fg | ExecResult::Edit | ExecResult::Exit(_)) => return ret,
+                // A loop body always has the next iteration behind it
+                // -- `for f in a b c; do cp "$f" d/; done` copied only
+                // `a` before this, because the first `cp` escaped with
+                // the rest of the loop still to run. See settle_fg.
+                ExecResult::Fg => {
+                    let status = self.drive_pending_fg_inline();
+                    self.last_status = status;
+                }
+                ret @ (ExecResult::Return(_) | ExecResult::Window(_) | ExecResult::Edit | ExecResult::Exit(_)) => return ret,
             }
             if !step.is_empty() {
                 if let Err(e) = arith::eval(step, self) {
@@ -18539,6 +18677,19 @@ mod promoted_capture_tests {
         shell.lookup_var(name)
     }
 
+    /// Runs `src` the way repl.rs runs a typed line: anything left in
+    /// `pending_fg` afterwards is a job the *last* command handed over
+    /// to be driven, and something has to drive it. repl.rs renders it;
+    /// a test only has to wait for it, which is what
+    /// `discard_pending_fg` already does for command mode.
+    ///
+    /// Without this a test asserting on a file the last command wrote
+    /// is racing that command's own process.
+    fn run_line(shell: &mut Shell, src: &str) {
+        shell.run_source_here(src, "test");
+        shell.discard_pending_fg();
+    }
+
     #[test]
     fn a_promoted_session_still_captures_an_external_commands_output() {
         // A promoted session gives a foreground external command its own
@@ -18547,7 +18698,7 @@ mod promoted_capture_tests {
         // capture, and a pty sends it somewhere nobody is reading.
         // `x=$(date)` came back empty in every split window.
         let mut shell = promoted_shell();
-        shell.run_source_here("x=$(/bin/echo captured)", "test");
+        run_line(&mut shell, "x=$(/bin/echo captured)");
         assert_eq!(value_of(&mut shell, "x"), "captured");
     }
 
@@ -18556,9 +18707,9 @@ mod promoted_capture_tests {
         // The bug was invisible at a plain prompt, which is why it
         // lasted: there the pty is never reached at all.
         let mut plain = Shell::new();
-        plain.run_source_here("x=$(/bin/echo same)", "test");
+        run_line(&mut plain, "x=$(/bin/echo same)");
         let mut promoted = promoted_shell();
-        promoted.run_source_here("x=$(/bin/echo same)", "test");
+        run_line(&mut promoted, "x=$(/bin/echo same)");
         assert_eq!(value_of(&mut plain, "x"), value_of(&mut promoted, "x"));
         assert_eq!(value_of(&mut promoted, "x"), "same");
     }
@@ -18568,8 +18719,80 @@ mod promoted_capture_tests {
         // What made it visible: `for i in $(seq 1 3)` ran its body zero
         // times, because the word list was empty.
         let mut shell = promoted_shell();
-        shell.run_source_here("out=; for i in $(/bin/echo a b c); do out=\"$out$i\"; done", "test");
+        run_line(&mut shell, "out=; for i in $(/bin/echo a b c); do out=\"$out$i\"; done");
         assert_eq!(value_of(&mut shell, "out"), "abc");
+    }
+
+    #[test]
+    fn a_chain_after_an_external_command_still_runs() {
+        // A promoted session hands a foreground external command to
+        // repl.rs on a pty, as `ExecResult::Fg` -- which is a
+        // control-flow escape. Bubbling it out of a `&&` abandoned the
+        // rest of the chain: `cp a b && mv b c` ran the copy, skipped
+        // the move, and reported success.
+        let dir = crate::tempdir::TempDir::new("fg-chain");
+        let (a, b) = (dir.join("a"), dir.join("b"));
+        std::fs::write(&a, b"payload").expect("seed");
+        let mut shell = promoted_shell();
+        run_line(&mut shell, &format!("/bin/cp {} {} && /bin/mv {} {}", a.display(), b.display(), b.display(), dir.join("c").display()));
+        assert!(dir.join("c").exists(), "the second half of the chain has to run");
+        assert!(!b.exists(), "and it really moved the file");
+    }
+
+    #[test]
+    fn every_statement_on_a_line_after_an_external_still_runs() {
+        let dir = crate::tempdir::TempDir::new("fg-list");
+        let seed = dir.join("seed");
+        std::fs::write(&seed, b"x").expect("seed");
+        let mut shell = promoted_shell();
+        // No `>` anywhere: a redirect of its own is what keeps a command
+        // off the pty path in the first place, so a test written with
+        // one would never reach the bug.
+        let script = format!(
+            "/bin/cp {0} {1}; /bin/cp {0} {2}; /bin/cp {0} {3}",
+            seed.display(),
+            dir.join("1").display(),
+            dir.join("2").display(),
+            dir.join("3").display()
+        );
+        run_line(&mut shell, &script);
+        for name in ["1", "2", "3"] {
+            assert!(dir.join(name).exists(), "statement {name} was dropped");
+        }
+    }
+
+    #[test]
+    fn a_loop_body_with_an_external_runs_every_iteration() {
+        // The same escape, one level in: the first iteration's command
+        // took the rest of the loop with it.
+        let dir = crate::tempdir::TempDir::new("fg-loop");
+        let seed = dir.join("seed");
+        std::fs::write(&seed, b"x").expect("seed");
+        let mut shell = promoted_shell();
+        run_line(&mut shell, &format!("for f in a b c; do /bin/cp {} {}/$f; done", seed.display(), dir.path().display()));
+        for name in ["a", "b", "c"] {
+            assert!(dir.join(name).exists(), "iteration {name} never ran");
+        }
+    }
+
+    #[test]
+    fn a_condition_that_is_an_external_command_still_picks_a_branch() {
+        let dir = crate::tempdir::TempDir::new("fg-if");
+        let mut shell = promoted_shell();
+        run_line(&mut shell, &format!("if /bin/true; then /bin/echo yes > {}; fi", dir.join("taken").display()));
+        assert!(dir.join("taken").exists(), "the branch behind the condition never ran");
+    }
+
+    #[test]
+    fn a_settled_external_reports_its_own_status() {
+        // Driving the job here rather than handing it off must not lose
+        // what it exited with -- `$?` is what the rest of the chain
+        // tests.
+        let mut shell = promoted_shell();
+        run_line(&mut shell, "/bin/false; rc=$?");
+        assert_eq!(value_of(&mut shell, "rc"), "1");
+        run_line(&mut shell, "/bin/true; rc=$?");
+        assert_eq!(value_of(&mut shell, "rc"), "0");
     }
 
     #[test]
@@ -18580,7 +18803,7 @@ mod promoted_capture_tests {
         let dir = crate::tempdir::TempDir::new("promoted-redirect");
         let path = dir.path().join("out.txt");
         let mut shell = promoted_shell();
-        shell.run_source_here(&format!("{{ /bin/echo written; }} > {}", path.display()), "test");
+        run_line(&mut shell, &format!("{{ /bin/echo written; }} > {}", path.display()));
         assert_eq!(std::fs::read_to_string(&path).unwrap_or_default().trim(), "written");
     }
 }
