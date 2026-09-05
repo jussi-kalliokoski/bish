@@ -1138,6 +1138,39 @@ fn build_completion_row(state: &CompletionState) -> CompletionRow {
     CompletionRow { chars: text.chars().collect(), bold, selected, selected_range }
 }
 
+/// Blanks the completion menu row, for a caller whose cursor has just
+/// moved onto it -- i.e. immediately after the `\r\n` that ends a
+/// prompt.
+///
+/// Everything drawn below the prompt line is the prompt's own
+/// affordance, and whatever runs next will not tidy it up: a command
+/// writes from the cursor onward and leaves standing whatever it does
+/// not happen to cover. That is how `e src/` + Tab, run and quit, could
+/// hand bash back a prompt line with a row of completion candidates
+/// still sitting in it -- the row outlived the shell that drew it.
+///
+/// Exactly the columns this prompt drew, never `\x1b[K` to the end of
+/// the real line: in a split window that reaches into the pane next
+/// door. The cursor is left back at column 0 where the newline put it,
+/// so nothing downstream has to know this happened.
+///
+/// Plain mode only. In grid mode the compositor owns the screen and
+/// repaints the pane wholesale, so there is nothing to clean up -- and
+/// a prompt on the pane's last row would have this writing spaces onto
+/// the tab bar after the newline scrolled.
+fn erase_menu_row_under_cursor(
+    menu_capable: bool,
+    menu_was_shown: bool,
+    row_origin: Option<(usize, usize)>,
+    col_origin: usize,
+    width: usize,
+) -> String {
+    match menu_capable && menu_was_shown && row_origin.is_none() {
+        true => format!("\x1b[{}G{}\r", col_origin + 1, " ".repeat(width)),
+        false => String::new(),
+    }
+}
+
 // Wraps redraw() with exactly one extra row for the completion menu,
 // positioned via relative cursor movement (down 1, then back up 1)
 // rather than absolute-row tracking or save/restore-cursor: save/
@@ -1885,20 +1918,20 @@ pub fn read_line(
             Key::Enter if expand_abbr_at_cursor(&mut ed, abbrs, &mut snippet) => {}
             Key::Enter => {
                 drop(guard.take());
-                print!("\r\n");
+                print!("\r\n{}", erase_menu_row_under_cursor(menu_capable, menu_was_shown, row_origin, col_origin, width));
                 io::stdout().flush()?;
                 return Ok(ReadOutcome::Line(ed.as_string()));
             }
             Key::CtrlC => {
                 drop(guard.take());
-                print!("^C\r\n");
+                print!("^C\r\n{}", erase_menu_row_under_cursor(menu_capable, menu_was_shown, row_origin, col_origin, width));
                 io::stdout().flush()?;
                 return Ok(ReadOutcome::Interrupted { text: ed.as_string() });
             }
             Key::CtrlD => {
                 if ed.buf.is_empty() {
                     drop(guard.take());
-                    print!("\r\n");
+                    print!("\r\n{}", erase_menu_row_under_cursor(menu_capable, menu_was_shown, row_origin, col_origin, width));
                     io::stdout().flush()?;
                     return Ok(ReadOutcome::Eof);
                 }
@@ -1926,7 +1959,7 @@ pub fn read_line(
                 // falling through to ed.backspace() below.
                 if esc_cancels && ed.buf.is_empty() {
                     drop(guard.take());
-                    print!("\r\n");
+                    print!("\r\n{}", erase_menu_row_under_cursor(menu_capable, menu_was_shown, row_origin, col_origin, width));
                     io::stdout().flush()?;
                     return Ok(ReadOutcome::Interrupted { text: ed.as_string() });
                 }
@@ -3644,6 +3677,30 @@ mod tests {
     /// a real bash through a pty before being written down here: Ctrl-W
     /// is `unix-word-rubout` and takes `foo/bar` whole; Alt-Backspace
     /// is `backward-kill-word` and takes one path component.
+    #[test]
+    fn a_finished_prompt_blanks_the_completion_row_under_it() {
+        // Only the columns this prompt drew, and the cursor ends back
+        // at column 0 where the newline left it -- so the caller's
+        // `\r\n` still means exactly what it did.
+        let out = erase_menu_row_under_cursor(true, true, None, 3, 12);
+        assert_eq!(out, "\x1b[4G            \r");
+        assert!(!out.contains("\x1b[K"), "never to the end of the real line -- a split window has a neighbour there");
+    }
+
+    #[test]
+    fn nothing_is_erased_when_no_menu_was_showing() {
+        assert_eq!(erase_menu_row_under_cursor(true, false, None, 3, 12), "");
+        assert_eq!(erase_menu_row_under_cursor(false, true, None, 3, 12), "");
+    }
+
+    #[test]
+    fn grid_mode_leaves_the_row_to_the_compositor() {
+        // There the pane is repainted wholesale, and a prompt on its
+        // last row would have this writing spaces onto the tab bar
+        // after the newline scrolled.
+        assert_eq!(erase_menu_row_under_cursor(true, true, Some((5, 20)), 3, 12), "");
+    }
+
     #[test]
     fn the_two_backward_kills_use_different_word_boundaries() {
         let typed = |text: &str| {
