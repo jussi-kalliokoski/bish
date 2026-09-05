@@ -2800,25 +2800,39 @@ mod tests {
         assert_eq!(buf.viewport_top(), 0);
     }
 
-    // One notch of the wheel moves the view by one line, which is what
-    // the terminal would have done with it before bish started
-    // handling the wheel itself. Three lines a notch turned a
-    // trackpad's stream of fine-grained notches into a lurch -- see
-    // `fileeditor::MOUSE_WHEEL_LINES`, which is the number this pins.
+    // A wheel event moves the cursor one line, and the viewport follows
+    // only when it must -- the motion the terminal itself used to send
+    // for a wheel (kitty's mouse.c fake_scroll, an arrow key per cell
+    // of travel). See `fileeditor::MOUSE_WHEEL_LINES` for the
+    // measurement; this pins the two halves of it that are pure.
     #[test]
-    fn one_wheel_notch_scrolls_exactly_one_line() {
+    fn a_wheel_event_moves_the_cursor_and_the_view_only_follows() {
         let notch = Some(crate::fileeditor::MOUSE_WHEEL_LINES);
         let mut buf = TestBuffer::new(&numbered_lines(40));
         buf.vheight = 10;
         buf.set_cursor(0, 0);
-        go(&mut buf, Motion::ScrollLineDown, notch);
-        assert_eq!(buf.viewport_top(), 1, "one notch down is one line");
-        for _ in 0..4 {
-            go(&mut buf, Motion::ScrollLineDown, notch);
+
+        // Nine events with a ten-row view: the cursor walks down, the
+        // view stays where it is. This is the half that was lost -- as
+        // a viewport scroll these nine moved the view nine lines.
+        for _ in 0..9 {
+            go(&mut buf, Motion::Down, notch);
         }
-        assert_eq!(buf.viewport_top(), 5, "and five notches are five lines, not fifteen");
-        go(&mut buf, Motion::ScrollLineUp, notch);
-        assert_eq!(buf.viewport_top(), 4);
+        assert_eq!(buf.cursor().0, 9, "the cursor moved one line per event");
+        assert_eq!(buf.viewport_top(), 0, "and the view did not move at all");
+
+        // Dragging the view along once the cursor leaves it is the
+        // caller's job, not the motion's -- `scroll_to_show_cursor`,
+        // whose own tests cover it, run after every motion by the
+        // editor and by normal mode alike. What matters here is that
+        // the wheel no longer moves the viewport itself: as a scroll
+        // these nine events moved it nine lines whatever the cursor was
+        // doing.
+        for _ in 0..9 {
+            go(&mut buf, Motion::Up, notch);
+        }
+        assert_eq!(buf.cursor().0, 0, "and back, one line per event");
+        assert_eq!(buf.viewport_top(), 0);
     }
 
     #[test]

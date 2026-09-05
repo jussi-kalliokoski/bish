@@ -6580,7 +6580,7 @@ fn run_normal_mode_navigation(
     // motion, distance and follow-up as the wheel branch inside the key
     // loop below, which handles every notch after this one.
     if let Some(ev) = entered_by_wheel {
-        let motion = if ev.is_scroll_down() { motion::Motion::ScrollLineDown } else { motion::Motion::ScrollLineUp };
+        let motion = if ev.is_scroll_down() { motion::Motion::Down } else { motion::Motion::Up };
         editor::apply_motion_or_reselect(&mut vk, &mut buf, motion, Some(fileeditor::MOUSE_WHEEL_LINES));
         let content_cols = nav_content_cols(&buf, rect);
         nav_scroll_to_show_cursor(&mut buf, content_cols);
@@ -6878,7 +6878,10 @@ fn run_normal_mode_navigation(
                     vk.end_visual(buf.cursor());
                 }
             } else if ev.is_scroll_down() || ev.is_scroll_up() {
-                let motion = if ev.is_scroll_down() { motion::Motion::ScrollLineDown } else { motion::Motion::ScrollLineUp };
+                // A cursor motion, with the view following -- see
+                // fileeditor::MOUSE_WHEEL_LINES for the measurement that
+                // says why this is not a viewport scroll.
+                let motion = if ev.is_scroll_down() { motion::Motion::Down } else { motion::Motion::Up };
                 editor::apply_motion_or_reselect(&mut vk, &mut buf, motion, Some(fileeditor::MOUSE_WHEEL_LINES));
                 let content_cols = nav_content_cols(&buf, rect);
                 nav_scroll_to_show_cursor(&mut buf, content_cols);

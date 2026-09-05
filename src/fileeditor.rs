@@ -1292,16 +1292,28 @@ pub(crate) fn resolve_insert_start(buf: &mut TextBuffer, cmd: InsertCmd) {
 // One, because the terminal has already decided how fast the wheel
 // turns. This was three on the theory that a line a notch "reads as
 // sluggish for a fast scroll"; that was a guess, and it was wrong. A
-// trackpad in kitty sends a stream of fine-grained notches, and
-// multiplying each of them by three turns a smooth scroll into a lurch
-// -- which is exactly the thing that got worse when bish started
-// handling the wheel itself instead of letting the terminal translate
-// it into arrow keys.
+// How far one wheel *event* moves the cursor. One, because a terminal
+// does not report notches -- it reports distance.
 //
-// A discrete wheel does move a line at a time this way. That is the
-// same amount its own terminal would have scrolled, so it is the
-// honest default; a multiplier belongs in the terminal's settings,
-// where a person's other applications already read it from.
+// Measured from kitty's own output: one turn of the wheel arrives as
+// two, three or four identical SGR events, varying run to run. Its
+// mouse.c divides its own `wheel_scroll_multiplier` out the moment an
+// application turns mouse reporting on (`scale /= fabs(scale)`, keeping
+// only the sign) and then writes one event per cell-height the wheel or
+// finger actually travelled. So no kitty setting changes this, and no
+// constant here can mean "one notch": the terminal has already decided
+// how far, and it says so in the number of events.
+//
+// What it must not do is *lead* the view. Before bish handled the wheel
+// itself, kitty translated it into that many arrow keys (mouse.c's
+// fake_scroll), which moved the cursor and left the viewport to follow
+// only when it had to. Measured side by side in the editor with the
+// cursor mid-screen: twelve arrow keys moved the view not at all, while
+// twelve wheel events moved it twelve lines. That is the whole of what
+// "it scrolls three lines at a time" was -- not the count, which never
+// changed, but a viewport that had started leading instead of
+// following. So the wheel is a cursor motion again, the same one the
+// terminal used to send.
 pub(crate) const MOUSE_WHEEL_LINES: usize = 1;
 
 // `extra_cursors`: every position besides `buf.cursor()` itself that
@@ -2045,18 +2057,20 @@ pub(crate) fn run_insert_mode(
                 }
             }
             Key::Mouse(ev) if buf.mouse && ev.is_release() => drag_anchor = None,
+            // The wheel moves the cursor, and the view follows it --
+            // which is what the terminal used to do for bish before it
+            // handled the wheel itself. See MOUSE_WHEEL_LINES.
             Key::Mouse(ev) if ev.is_scroll_down() => {
-                motion::apply_motion(buf, motion::Motion::ScrollLineDown, Some(MOUSE_WHEEL_LINES));
+                motion::apply_motion(buf, motion::Motion::Down, Some(MOUSE_WHEEL_LINES));
                 cursors[0] = buf.cursor();
             }
             Key::Mouse(ev) if ev.is_scroll_up() => {
-                motion::apply_motion(buf, motion::Motion::ScrollLineUp, Some(MOUSE_WHEEL_LINES));
+                motion::apply_motion(buf, motion::Motion::Up, Some(MOUSE_WHEEL_LINES));
                 cursors[0] = buf.cursor();
             }
             // The horizontal wheel, where the terminal sends one (see
-            // MouseEvent::is_scroll_left). Unlike the vertical pair this
-            // does move the cursor -- it has to, since a caret parked
-            // off-screen is not somewhere you can type.
+            // MouseEvent::is_scroll_left). It moves the cursor too -- a
+            // caret parked off-screen is not somewhere you can type.
             Key::Mouse(ev) if ev.is_scroll_left() || ev.is_scroll_right() => {
                 let columns = if ev.is_scroll_right() { MOUSE_WHEEL_COLUMNS as isize } else { -(MOUSE_WHEEL_COLUMNS as isize) };
                 scroll_horizontally(buf, columns, editor_content_cols(buf, rect));
