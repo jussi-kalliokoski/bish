@@ -433,6 +433,18 @@ fn run_source_in_a_pane(shell: &mut exec::Shell, src: &str) -> i32 {
     // here nothing else will, so it is drained now -- otherwise the
     // grid is read before the command that filled it has finished.
     shell.settle_pending_fg();
+    // A backgrounded job writes into a pty of its own, which repl.rs
+    // empties into the grid on its idle tick. There is no such loop
+    // here, so the output would still be sitting in the pty when this
+    // exits -- which is a property of `-c`, not of panes, and would
+    // have the corpus reporting a difference a live pane does not have.
+    // Twice with a breath in between: a job that has only just been
+    // waited for may not have been scheduled to write yet.
+    for _ in 0..2 {
+        shell.drain_background_output();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    shell.drain_background_output();
     print!("{}", screen.borrow().text_unwrapped());
     use std::io::Write;
     let _ = std::io::stdout().flush();

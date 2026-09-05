@@ -328,6 +328,10 @@ impl Scheduler {
             // Everything still running is waiting for a descriptor.
             // Sleeping here rather than spinning is the difference
             // between an idle process and a busy one.
+            // Everything is blocked, which may be on the pane's own
+            // pty filling up -- and this thread is the only thing that
+            // empties it. See exec::PIPELINE_DRAIN.
+            crate::exec::drain_pipeline_output();
             if !self.wait_for_any() {
                 // Nothing to wait for and nothing ran: no descriptor
                 // will ever become ready, so the remaining coroutines

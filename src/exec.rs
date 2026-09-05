@@ -142,7 +142,16 @@ impl OutputSink {
                 // instead would keep the buffering, at the cost of
                 // having to find every place a child can start.
             }
-            OutputSink::Grid(screen) => screen.borrow_mut().feed(onlcr(s).as_bytes()),
+            OutputSink::Grid(screen) => {
+                // A pipeline's pty and this shell both write into the
+                // same grid, and only one of them is synchronous. Empty
+                // the pty first so what a stage printed lands before
+                // what the shell prints next: `echo a | { trap "echo P"
+                // EXIT; cat; }` otherwise showed `P` above the `a` that
+                // was written before it.
+                drain_pipeline_output();
+                screen.borrow_mut().feed(onlcr(s).as_bytes());
+            }
             OutputSink::Capture(buf) => buf.borrow_mut().push_str(s),
             OutputSink::Builtin { previous, stdout, .. } => match stdout {
                 SinkStream::OuterOut => previous.write_out(s),
@@ -158,7 +167,11 @@ impl OutputSink {
                 use std::io::Write;
                 let _ = std::io::stderr().write_all(s.as_bytes());
             }
-            OutputSink::Grid(screen) => screen.borrow_mut().feed(onlcr(s).as_bytes()),
+            OutputSink::Grid(screen) => {
+                // Same ordering rule as write_out just above.
+                drain_pipeline_output();
+                screen.borrow_mut().feed(onlcr(s).as_bytes());
+            }
             OutputSink::Capture(buf) => buf.borrow_mut().push_str(s),
             OutputSink::Builtin { previous, stderr, .. } => {
                 use std::io::Write;
@@ -393,11 +406,16 @@ impl PaneOutput {
     /// yet" and the EIO Linux gives once every slave is closed.
     fn drain(&mut self) {
         use std::io::Read;
+        // `try_borrow_mut`, because this is called from inside the
+        // grid's own write path (see write_out): if something up the
+        // stack already holds the screen, the right answer is to leave
+        // its bytes in the pty until next time, not to panic.
+        let Ok(mut screen) = self.screen.try_borrow_mut() else { return };
         let mut buf = [0u8; 4096];
         loop {
             match self.master.read(&mut buf) {
                 Ok(0) => break,
-                Ok(n) => self.screen.borrow_mut().feed(&buf[..n]),
+                Ok(n) => screen.feed(&buf[..n]),
                 Err(_) => break,
             }
         }
@@ -426,7 +444,7 @@ fn pipeline_drain_armed() -> bool {
 
 /// One pass of the armed drain. `false` if there is nothing armed, in
 /// which case the caller has to block after all.
-fn drain_pipeline_output() -> bool {
+pub(crate) fn drain_pipeline_output() -> bool {
     PIPELINE_DRAIN.with(|d| match d.borrow_mut().as_mut() {
         Some(output) => {
             output.drain();
@@ -4414,7 +4432,16 @@ impl Shell {
             // Same reasoning as the `&&` chain: `a; b` must still run
             // `b`, so only the final statement of a program may hand a
             // pty-backed job off to be driven somewhere else.
-            if !std::ptr::eq(item, last_item) {
+            //
+            // ...and not even then, when this shell is about to ask
+            // what the status was. `Fg` reports 0 because the command
+            // has not run yet, so the ERR check below saw a success
+            // that had not happened: `trap ... ERR; grep -q zz
+            // /dev/null` never fired the trap in a pane. Where a trap
+            // or `set -e` is armed, knowing the answer matters more
+            // than the interactivity that handing the job off buys.
+            let must_know_the_status = self.err_trap.is_some() || self.opt_errexit;
+            if !std::ptr::eq(item, last_item) || must_know_the_status {
                 result = self.settle_fg(result);
             }
             self.last_status = result.status();
@@ -8613,8 +8640,10 @@ impl Shell {
                         }
                     }
                     Err(e) => {
-                        sh_eprintln!(self, "bish: {}: {}", name, e);
-                        ExecResult::Status(127)
+                        let (msg, status) = spawn_failure(&name, &e);
+                        self.write_command_error(cmd, &msg);
+                        self.drain_proc_subs();
+                        ExecResult::Status(status)
                     }
                 };
             }
@@ -8748,37 +8777,7 @@ impl Shell {
                 self.run_command_not_found_handler(&argv)
             }
             Err(e) => {
-                // A name that is nearly a builtin is worth saying so
-                // about. Only for NotFound: an EACCES on a real file is
-                // a different problem and a suggestion there would be
-                // noise on top of it.
-                let not_found = e.kind() == std::io::ErrorKind::NotFound;
-                let hint = match not_found {
-                    // A bash builtin this shell deliberately answers
-                    // differently gets pointed at its equivalent; every
-                    // other unknown name gets the nearest builtin.
-                    true => match crate::suggest::instead_of(&name) {
-                        advice if !advice.is_empty() => advice,
-                        _ => crate::suggest::did_you_mean(&name, KNOWN_BUILTINS.iter().copied()),
-                    },
-                    false => String::new(),
-                };
-                // bash's three answers, and its two statuses: a bare
-                // name nothing in PATH matched is "command not found";
-                // a path that is not there says so; and a path that
-                // *is* there but cannot be run is 126, not 127 -- the
-                // distinction a script checks to tell "no such tool"
-                // from "found it, could not run it".
-                let (text, status) = match (not_found, name.contains('/')) {
-                    (true, false) => ("command not found".to_string(), 127),
-                    (true, true) => (os_message(&e), 127),
-                    // execve on a directory reports EACCES on Linux,
-                    // which is true and unhelpful; bash stats it and
-                    // says what it actually is.
-                    (false, _) if std::path::Path::new(&name).is_dir() => ("Is a directory".to_string(), 126),
-                    (false, _) => (os_message(&e), 126),
-                };
-                let msg = format!("bish: {}: {}{}", name, text, hint);
+                let (msg, status) = spawn_failure(&name, &e);
                 self.write_command_error(cmd, &msg);
                 self.drain_proc_subs();
                 ExecResult::Status(status)
@@ -8862,6 +8861,30 @@ impl Shell {
             }
         }
 
+        // The same pane output the in-process path gets -- see
+        // run_multi. Two shell stages take this path instead of that
+        // one, and `{ echo a; } | { read x; cat; }` was as invisible in
+        // a pane as `ls | grep x` used to be.
+        let pane_pty = match self.is_promoted() && self.stdio_override.is_none() {
+            true => self.background_pty(),
+            false => None,
+        };
+        let pane_slave = |pty: &Option<pty::Pty>| -> Option<Stdio> {
+            let p = pty.as_ref()?;
+            std::fs::OpenOptions::new().read(true).write(true).open(&p.slave_path).ok().map(Stdio::from)
+        };
+        let mut pane_output = match (&pane_pty, self.sink_grid()) {
+            (Some(p), Some(screen)) => {
+                p.master.try_clone().ok().zip(std::fs::OpenOptions::new().read(true).write(true).open(&p.slave_path).ok()).map(
+                    |(master, keepalive)| {
+                        pty::set_nonblocking(std::os::unix::io::AsRawFd::as_raw_fd(&master));
+                        PaneOutput { master, screen, _keepalive: keepalive }
+                    },
+                )
+            }
+            _ => None,
+        };
+
         let mut scheduler = crate::scheduler::Scheduler::new();
         let mut children: Vec<(usize, std::process::Child)> = Vec::new();
         let mut codes: Vec<Rc<std::cell::Cell<i32>>> = (0..n).map(|_| Rc::new(std::cell::Cell::new(0))).collect();
@@ -8891,8 +8914,11 @@ impl Shell {
                 });
                 command.stdout(match stdout_end {
                     Some(fd) => Stdio::from(fd),
-                    None => self.spawn_stdout_stdio(),
+                    None => pane_slave(&pane_pty).unwrap_or_else(|| self.spawn_stdout_stdio()),
                 });
+                if let Some(slave) = pane_slave(&pane_pty) {
+                    command.stderr(slave);
+                }
                 if i == n - 1 {
                     self.note_external_spawn();
                 }
@@ -8968,17 +8994,60 @@ impl Shell {
         drop(read_ends);
         drop(write_ends);
 
+        // A shell stage with no pipe on its stdout is handed the
+        // shell's own fd 1 by `install_fds`, so pointing fd 1 and 2 at
+        // the pane for the duration of the run is what gives the last
+        // stage -- and anything it spawns -- somewhere visible to write.
+        // Armed as the drain too, so a coroutine whose write blocks
+        // empties the pty rather than parking on a descriptor that only
+        // this thread can relieve; the scheduler drains from its own
+        // idle path for the same reason.
+        let saved_fds = save_fd012();
+        let stage_slave = match &pane_pty {
+            Some(p) => std::fs::OpenOptions::new().read(true).write(true).open(&p.slave_path).ok(),
+            None => None,
+        };
+        if let Some(slave) = &stage_slave {
+            unsafe extern "C" {
+                fn dup2(oldfd: i32, newfd: i32) -> i32;
+            }
+            use std::os::fd::AsRawFd;
+            unsafe { dup2(slave.as_raw_fd(), 1) };
+            unsafe { dup2(slave.as_raw_fd(), 2) };
+        }
+        PIPELINE_DRAIN.with(|d| *d.borrow_mut() = pane_output.take());
         scheduler.run();
+        pane_output = PIPELINE_DRAIN.with(|d| d.borrow_mut().take());
+        drop(stage_slave);
+        restore_fd012(saved_fds);
 
         let mut statuses: Vec<i32> = codes.drain(..).map(|c| c.get()).collect();
         for (stage, mut child) in children {
-            statuses[stage] = match child.wait() {
-                Ok(s) => exit_code_from_status(s),
-                Err(e) => {
-                    sh_eprintln!(self, "bish: {}", e);
-                    1
+            statuses[stage] = loop {
+                if let Some(output) = pane_output.as_mut() {
+                    output.drain();
+                }
+                match child.try_wait() {
+                    Ok(Some(s)) => break exit_code_from_status(s),
+                    Ok(None) => match pane_output.is_some() {
+                        true => std::thread::sleep(std::time::Duration::from_millis(1)),
+                        false => match child.wait() {
+                            Ok(s) => break exit_code_from_status(s),
+                            Err(e) => {
+                                sh_eprintln!(self, "bish: {}", e);
+                                break 1;
+                            }
+                        },
+                    },
+                    Err(e) => {
+                        sh_eprintln!(self, "bish: {}", e);
+                        break 1;
+                    }
                 }
             };
+        }
+        if let Some(output) = pane_output.as_mut() {
+            output.drain();
         }
         self.set_pipestatus(&statuses);
         let last = statuses.last().copied().unwrap_or(0);
@@ -11998,6 +12067,62 @@ impl Job {
     }
 
     // Blocking wait for every child in the job.
+    /// Waits for this job, emptying its pty into the screen it was
+    /// started from as it goes.
+    ///
+    /// `wait` takes a job out of the table and then blocks on it, so
+    /// `drain_background_output` -- which walks the table -- can no
+    /// longer see it, and repl.rs's idle tick is not running while a
+    /// builtin blocks anyway. Either way the output was still sitting
+    /// in the pty when the job was reaped, and `f() { echo a; }; f &
+    /// wait` printed nothing in a pane. Draining here is the only
+    /// moment that covers both.
+    pub(crate) fn wait_draining(&mut self) -> i32 {
+        if self.pty_master.is_none() || self.sink_screen.is_none() {
+            return self.wait();
+        }
+        loop {
+            self.drain_into_sink();
+            match self.children.last_mut().map(std::process::Child::try_wait) {
+                Some(Ok(None)) => std::thread::sleep(std::time::Duration::from_millis(1)),
+                _ => break,
+            }
+        }
+        // Whatever landed between the last read and the child exiting.
+        self.drain_into_sink();
+        self.wait()
+    }
+
+    /// This one job's pending pty output, into the grid it belongs to
+    /// -- `drain_background_output`'s inner loop, for a job that is no
+    /// longer in the table to be walked.
+    fn drain_into_sink(&mut self) {
+        use std::io::Read;
+        use std::os::unix::io::AsRawFd;
+        let (Some(master), Some(screen)) = (&mut self.pty_master, &self.sink_screen) else {
+            return;
+        };
+        // An editor frame owns this session's screen while it is up,
+        // and that buffer is the editor's, not this job's -- the same
+        // guard drain_background_output documents.
+        let Ok(mut screen) = screen.try_borrow_mut() else { return };
+        if screen.using_alternate {
+            return;
+        }
+        if !self.nonblocking {
+            pty::set_nonblocking(master.as_raw_fd());
+            self.nonblocking = true;
+        }
+        let mut buf = [0u8; 4096];
+        loop {
+            match master.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => screen.feed(&buf[..n]),
+                Err(_) => break,
+            }
+        }
+    }
+
     pub(crate) fn wait(&mut self) -> i32 {
         let mut last_code = 0;
         for c in &mut self.children {
@@ -14174,6 +14299,47 @@ fn clear_cloexec(fd: i32) {
     unsafe {
         fcntl(fd, F_SETFD, 0);
     }
+}
+
+/// What to say and what to exit with when a command could not be
+/// spawned -- bash's three answers and its two statuses.
+///
+/// A bare name nothing in PATH matched is "command not found"; a path
+/// that is not there says so; and a path that *is* there but cannot be
+/// run is 126, not 127 -- the distinction a script checks to tell "no
+/// such tool" from "found it, could not run it".
+///
+/// Shared because there are two spawn sites. A promoted session goes
+/// out through a pty instead of the ordinary spawn, and that path used
+/// to answer every failure with the raw OS error and a flat 127: in a
+/// split window `nosuchcmd` said "No such file or directory (os error
+/// 2)" and a directory said "Permission denied" with the wrong status.
+/// One shell, one answer, whichever way the command happened to be
+/// started.
+fn spawn_failure(name: &str, e: &std::io::Error) -> (String, i32) {
+    // A name that is nearly a builtin is worth saying so about. Only
+    // for NotFound: an EACCES on a real file is a different problem and
+    // a suggestion there would be noise on top of it.
+    let not_found = e.kind() == std::io::ErrorKind::NotFound;
+    let hint = match not_found {
+        // A bash builtin this shell deliberately answers differently
+        // gets pointed at its equivalent; every other unknown name gets
+        // the nearest builtin.
+        true => match crate::suggest::instead_of(name) {
+            advice if !advice.is_empty() => advice,
+            _ => crate::suggest::did_you_mean(name, KNOWN_BUILTINS.iter().copied()),
+        },
+        false => String::new(),
+    };
+    let (text, status) = match (not_found, name.contains('/')) {
+        (true, false) => ("command not found".to_string(), 127),
+        (true, true) => (os_message(e), 127),
+        // execve on a directory reports EACCES on Linux, which is true
+        // and unhelpful; bash stats it and says what it actually is.
+        (false, _) if std::path::Path::new(name).is_dir() => ("Is a directory".to_string(), 126),
+        (false, _) => (os_message(e), 126),
+    };
+    (format!("bish: {name}: {text}{hint}"), status)
 }
 
 fn apply_fd_redirects(command: &mut Command, actions: Vec<FdAction>) {

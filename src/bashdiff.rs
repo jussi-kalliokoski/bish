@@ -1436,80 +1436,42 @@ y
     }
 
     const PANE_DIVERGENCES: &[(&str, &str)] = &[
-        // -- output that still never reaches the pane's grid ---------
+        // -- output a redirect keeps out of the pane -----------------
         //
-        // A pipeline's own output now goes to a pty this shell drains
-        // into the grid, so `ls | grep x` works and most of this group
-        // is gone. Two shapes are left.
+        // All that is left, and one cause. A single external is kept
+        // off the pane's pty by a redirect of *any* kind, so `wc -l < f`
+        // sends its output to the terminal the compositor paints over
+        // because its stdin was redirected, and an external whose
+        // stderr is redirected loses its stdout the same way. The gate
+        // is all-or-nothing where it wants to be per stream.
         //
-        // First, a pipeline of two *shell* stages runs on the
-        // coroutine scheduler rather than in-process, and that path has
-        // no pane pty yet -- `{ echo a; } | { read x; cat; }` is the
-        // shape.
-        ("shell-stage-hands-the-rest-to-an-external", "two shell stages take the scheduler path, which has no pane pty yet"),
-        ("read-leaves-the-rest-of-the-pipe", "the same case under a second name"),
-        ("an-exit-trap-set-in-a-subshell-fires-there", "`echo a | { ...; cat; }`: two shell stages again"),
+        // Composing the two is easy and does work -- `pre_exec`
+        // closures run in registration order, so attaching the pty and
+        // then applying the command's redirects puts each stream where
+        // it was told and leaves the rest on the pty. `redir-basic`
+        // passes that way. Two things do not, and both were measured
+        // before the attempt was backed out:
         //
-        // Second, a *single* external is kept off the pty by a redirect
-        // of any kind -- so `wc -l < f` sends its output to the
-        // inherited terminal because its *stdin* was redirected. The
-        // gate is all-or-nothing where it wants to be per stream.
-        //
-        // Widening it is not the one-line change it looks like, and the
-        // attempt is worth recording so the next one starts further
-        // along. `pty::attach_on_exec` before `apply_fd_redirects`
-        // composes correctly -- `pre_exec` closures run in registration
-        // order, so each stream lands where it was told and the rest
-        // reach the pane, and `redir-basic` does pass that way. Two
-        // things break:
-        //
-        //   - A compound's redirect (`{ ...; } 2>e`) is not in the
-        //     command's own `redirs.actions` at all; it arrives as a
-        //     `stdio_override`, which the pty then overwrites. `2>e`
+        //   - A compound's redirect (`{ ...; } 2>e`) is not among the
+        //     command's own actions at all. It arrives as a
+        //     `stdio_override`, which the pty then overwrites -- `2>e`
         //     captured nothing and the error went to the pane instead.
         //     Those streams have to be layered on too.
-        //   - Taking the pty means returning `ExecResult::Fg`, and that
-        //     path does not pump coroutines. `wc -l < <(seq 1 20000)`
-        //     then reads 12773 lines instead of 20000, deterministically:
-        //     the `<( )` producer fills its pipe, parks, and is never
-        //     given another turn. Silent truncation is far worse than
-        //     the invisible output being fixed, so the widening was
-        //     backed out rather than shipped.
+        //   - Taking the pty means returning `ExecResult::Fg`, and
+        //     nothing on that path resumes a `<( )` producer.
+        //     `wc -l < <(seq 1 20000)` then reads 12773 lines instead
+        //     of 20000 -- which is 65532 bytes, one 64KiB pipe buffer
+        //     to within four bytes. The producer wrote exactly one
+        //     bufferful, parked, and was never given another turn.
+        //
+        // Silent truncation is a worse failure than the invisible
+        // output it would fix, so this waits for the pumping to be
+        // sorted out first.
         ("redir-basic", "`wc -l < f`: a redirect of stdin keeps the whole command off the pty, so stdout is inherited"),
         ("a-superseded-redirect-still-creates-its-file", "same shape: `wc -l < e`"),
         ("a-compounds-stderr-reaches-externals", "stderr is redirected, so stdout is inherited too"),
         ("a-loops-stderr-reaches-externals", "same"),
         ("a-functions-stderr-reaches-externals", "same"),
-        // -- a background job has nobody draining it -----------------
-        //
-        // A backgrounded job gets a pty whose output repl.rs drains on
-        // its idle tick (`drain_background_output`). `-c` has no such
-        // loop, so the output is still sitting in the pty when the
-        // shell exits. Unlike the group above this really is peculiar
-        // to running a case this way: in a live pane the drain happens.
-        ("backgrounding-a-function", "the background job's pty is drained by repl.rs's idle tick, which `-c` has none of"),
-        ("backgrounding-a-loop", "same"),
-        ("backgrounding-a-conditional", "same"),
-        // -- what the pty spawn path reports -------------------------
-        //
-        // A promoted external goes out through `pty::spawn_attached`
-        // rather than the ordinary spawn, and that path answers a
-        // failure with the raw OS error instead of the wording and the
-        // exit status bash uses. Nothing to do with panes as such --
-        // just a second spawn site that never learned the first one's
-        // manners.
-        ("command-not-found", "\"No such file or directory (os error 2)\" for bash's \"command not found\""),
-        ("not-executable-is-126", "127 where bash says 126, and \"Permission denied\" for a directory bash calls \"Is a directory\""),
-        ("missing-path-is-127", "the raw OS error text again"),
-        // -- and one that is neither ---------------------------------
-        //
-        // Real, and not about output at all. The last command of a line
-        // hands its pty-backed job off rather than waiting (see
-        // ExecResult::Fg), so `run_program` finishes with a status of 0
-        // and the ERR check has already run by the time the command
-        // actually fails. A live pane has the same hole: an ERR trap
-        // does not fire for the last external command on a line.
-        ("bash-command-in-an-err-trap", "ERR never fires: the final external's status is settled after run_program has already checked it"),
     ];
 
     /// The same guard `DIVERGENCES` has: a name on the pane list is a

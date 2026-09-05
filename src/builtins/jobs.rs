@@ -346,7 +346,7 @@ fn wait_for_next(sh: &mut Shell, ids: &[String]) -> i32 {
         if let Some(idx) = finished {
             let mut job = table.jobs.remove(idx);
             drop(table);
-            return job.wait();
+            return job.wait_draining();
         }
         drop(table);
         std::thread::sleep(std::time::Duration::from_millis(10));
@@ -362,7 +362,7 @@ pub(crate) fn run_wait(sh: &mut Shell, args: &[String]) -> i32 {
             let idx = sh.jobs.borrow().jobs.iter().position(|j| !j.stopped);
             let Some(idx) = idx else { break };
             let mut job = sh.jobs.borrow_mut().jobs.remove(idx);
-            job.wait();
+            job.wait_draining();
         }
         return 0;
     }
@@ -375,7 +375,7 @@ pub(crate) fn run_wait(sh: &mut Shell, args: &[String]) -> i32 {
                 continue;
             }
             let mut job = sh.jobs.borrow_mut().jobs.remove(idx);
-            status = job.wait();
+            status = job.wait_draining();
             continue;
         }
         match a.parse::<u32>() {
@@ -384,7 +384,7 @@ pub(crate) fn run_wait(sh: &mut Shell, args: &[String]) -> i32 {
                 match idx {
                     Some(idx) => {
                         let mut job = sh.jobs.borrow_mut().jobs.remove(idx);
-                        status = job.wait();
+                        status = job.wait_draining();
                     }
                     None => {
                         sh_eprintln!(sh, "bish: wait: pid {} is not a child of this shell", pid);
