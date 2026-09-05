@@ -8293,7 +8293,20 @@ impl Shell {
         // tcsetpgrp/waitpid_untraced treatment further below instead;
         // there's no compositor to interfere with there, so a pty would
         // just be unnecessary overhead.
-        let use_pty = self.is_promoted() && redirs.actions.is_empty();
+        // ...and only when this command's stdout would otherwise be the
+        // inherited terminal, which is the case the compositor paints
+        // over. If something has *already* said where the output goes --
+        // a `$( )` capture's own memfd, an enclosing `{ ... } > file` --
+        // then that is where it belongs, and handing the command a pty
+        // instead sends it somewhere nobody is reading. `x=$(date)` came
+        // back empty in every promoted session for exactly that reason:
+        // a single external command inside a capture took this path, and
+        // its output went to a pty rather than into the capture. The
+        // same predicate `spawn_stdout_stdio` uses to answer "where does
+        // this child's stdout go", asked here before deciding to
+        // override the answer.
+        let stdout_already_spoken_for = self.stdio_override.as_ref().is_some_and(|o| o.borrow().stdout.is_some());
+        let use_pty = self.is_promoted() && redirs.actions.is_empty() && !stdout_already_spoken_for;
 
         if use_pty {
             if let Ok(p) = pty::open() {
@@ -18505,5 +18518,69 @@ echo "status=$?""#,
         assert!(shell.hooks_for("shell:cwd:change", "bash").is_empty(), "nothing fires while a hook runs");
         shell.set_firing_hooks(false);
         assert_eq!(shell.hooks_for("shell:cwd:change", "bash").len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod promoted_capture_tests {
+    use super::*;
+
+    // A shell in the state every split or tabbed window is in: promoted,
+    // with its output going to a pane's grid rather than the real
+    // terminal.
+    fn promoted_shell() -> Shell {
+        let mut shell = Shell::new();
+        shell.set_sink_grid(Rc::new(RefCell::new(crate::vt100::Screen::new(24, 80))));
+        shell.promoted.set(true);
+        shell
+    }
+
+    fn value_of(shell: &mut Shell, name: &str) -> String {
+        shell.lookup_var(name)
+    }
+
+    #[test]
+    fn a_promoted_session_still_captures_an_external_commands_output() {
+        // A promoted session gives a foreground external command its own
+        // pty, so the compositor does not paint over its output. Inside
+        // `$( )` that is exactly wrong: the output belongs in the
+        // capture, and a pty sends it somewhere nobody is reading.
+        // `x=$(date)` came back empty in every split window.
+        let mut shell = promoted_shell();
+        shell.run_source_here("x=$(/bin/echo captured)", "test");
+        assert_eq!(value_of(&mut shell, "x"), "captured");
+    }
+
+    #[test]
+    fn the_same_capture_works_unpromoted_and_promoted_alike() {
+        // The bug was invisible at a plain prompt, which is why it
+        // lasted: there the pty is never reached at all.
+        let mut plain = Shell::new();
+        plain.run_source_here("x=$(/bin/echo same)", "test");
+        let mut promoted = promoted_shell();
+        promoted.run_source_here("x=$(/bin/echo same)", "test");
+        assert_eq!(value_of(&mut plain, "x"), value_of(&mut promoted, "x"));
+        assert_eq!(value_of(&mut promoted, "x"), "same");
+    }
+
+    #[test]
+    fn a_captured_external_command_in_a_loop_word_list_still_iterates() {
+        // What made it visible: `for i in $(seq 1 3)` ran its body zero
+        // times, because the word list was empty.
+        let mut shell = promoted_shell();
+        shell.run_source_here("out=; for i in $(/bin/echo a b c); do out=\"$out$i\"; done", "test");
+        assert_eq!(value_of(&mut shell, "out"), "abc");
+    }
+
+    #[test]
+    fn an_enclosing_redirect_still_wins_over_the_pane() {
+        // The other case where something has already said where the
+        // output goes: a group redirected to a file. Handing the command
+        // a pty would have lost that too.
+        let dir = crate::tempdir::TempDir::new("promoted-redirect");
+        let path = dir.path().join("out.txt");
+        let mut shell = promoted_shell();
+        shell.run_source_here(&format!("{{ /bin/echo written; }} > {}", path.display()), "test");
+        assert_eq!(std::fs::read_to_string(&path).unwrap_or_default().trim(), "written");
     }
 }
