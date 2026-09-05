@@ -280,8 +280,8 @@ mod tests {
     /// `None` when the editor never answered the handshake, which is a
     /// failure of this harness rather than a difference between the two
     /// editors -- see the call site.
-    fn edit(argv: &[String], path: &Path, keys: &str, save: &str) -> Option<String> {
-        let Ok(pty) = crate::pty::open() else { return None };
+    fn edit(argv: &[String], path: &Path, keys: &str, save: &str) -> Result<String, &'static str> {
+        let Ok(pty) = crate::pty::open() else { return Err("no pty could be opened for it") };
         let _ = crate::pty::set_size(std::os::fd::AsRawFd::as_raw_fd(&pty.master), 24, 80);
         let mut cmd = Command::new(&argv[0]);
         cmd.args(&argv[1..]);
@@ -290,7 +290,7 @@ mod tests {
         // the machine they are on.
         cmd.env_remove("VIMINIT");
         let Ok(mut child) = crate::pty::spawn_attached(cmd, &pty.slave_path) else {
-            return None;
+            return Err("could not be started");
         };
         let mut master = pty.master;
         let _ = crate::pty::set_nonblocking(std::os::fd::AsRawFd::as_raw_fd(&master));
@@ -329,7 +329,7 @@ mod tests {
         if !handshake(&mut master, &mut drain, Duration::from_secs(30)) {
             let _ = child.kill();
             let _ = child.wait();
-            return None;
+            return Err("never answered the handshake");
         }
         for c in keys.chars().chain(save.chars()) {
             let mut buf = [0u8; 4];
@@ -337,11 +337,31 @@ mod tests {
             let floor = if c == '\u{1b}' { ESC_DWELL } else { Duration::from_millis(20) };
             settle(&mut master, &mut drain, floor, KEY_LIMIT, QUIET_TICKS);
         }
-        // Wait for it to finish writing, killing it if it will not.
-        let deadline = Instant::now() + Duration::from_secs(5);
+        // Wait for it to finish writing, killing it if it will not --
+        // and then say so, rather than reading the file regardless.
+        //
+        // This was the last flake. A `:wq` that has not finished is not
+        // a slower version of the answer, it is no answer: the file on
+        // disk is still the *input*, so reading it hands back the
+        // unedited text as though the editor had ignored every
+        // keystroke. That is precisely what this corpus kept reporting
+        // -- `dot-repeats-a-line-delete`, `G-then-dd` and `gv` each
+        // turned up once, always "bish kept the lines vim deleted",
+        // always passing on a rerun. And the retry could not rescue it,
+        // because a machine slow enough to miss the deadline once
+        // misses it three times.
+        //
+        // `None` is the word this harness already has for "could not
+        // drive it", so a kill returns that and the caller treats it
+        // the way it treats a handshake that never completed.
+        let mut exited = false;
+        let deadline = Instant::now() + EXIT_LIMIT;
         loop {
             match child.try_wait() {
-                Ok(Some(_)) => break,
+                Ok(Some(_)) => {
+                    exited = true;
+                    break;
+                }
                 _ if Instant::now() >= deadline => {
                     let _ = child.kill();
                     let _ = child.wait();
@@ -353,7 +373,14 @@ mod tests {
                 }
             }
         }
-        Some(std::fs::read_to_string(path).unwrap_or_else(|e| format!("<unreadable: {e}>")))
+        match exited {
+            true => Ok(std::fs::read_to_string(path).unwrap_or_else(|e| format!("<unreadable: {e}>"))),
+            // Named apart from the handshake failure on purpose: the
+            // two have different causes and different fixes, and a
+            // single message for both cost an afternoon working out
+            // which one was happening.
+            false => Err("never finished writing the file"),
+        }
     }
 
     /// Blocks until the editor has demonstrably read a key, by asking
@@ -454,6 +481,16 @@ mod tests {
     /// a loaded machine can take most of a second on one keystroke.
     const KEY_LIMIT: Duration = Duration::from_millis(2500);
 
+    /// How long `:wq` may take before the editor is given up on.
+    ///
+    /// As generous as the handshake's own budget, and for the same
+    /// reason: a debug-build editor writing a file on a machine running
+    /// the rest of this suite is slow in ways that have nothing to do
+    /// with whether it works. The old five seconds was tight enough to
+    /// lose to ordinary load, and losing meant reporting the *unedited*
+    /// file as bish's answer.
+    const EXIT_LIMIT: Duration = Duration::from_secs(30);
+
     /// Reads until the editor has produced nothing for `quiet_ticks`
     /// consecutive 4ms polls, or `limit` elapses. Adaptive rather than
     /// a fixed sleep, so a fast keystroke does not pay for a slow one.
@@ -490,9 +527,26 @@ mod tests {
     /// alongside the rest of the suite, with the machine loaded enough
     /// to lose a key on two attempts running. The reruns cost nothing
     /// on a clean run, since only a differing case pays for them.
-    fn compare(cases: &[Case], bish: &Path) -> Vec<(&'static str, String, String)> {
+    /// A case whose two editors disagreed: its name, vim's file, and
+    /// bish's.
+    type Divergence = (&'static str, String, String);
+
+    /// A case this harness could not drive: its name, and which editor
+    /// failed how.
+    type Undriveable = (&'static str, String);
+
+    /// The cases whose files came out different, and separately the
+    /// cases this harness could not drive at all.
+    ///
+    /// Two editors are being typed at through a pty, and "could not
+    /// drive it" is not a fact about either of them -- it is this
+    /// harness losing a race on a busy machine. Reporting the two
+    /// together is how a loaded run used to produce a *divergence*
+    /// naming content neither editor ever produced.
+    fn compare(cases: &[Case], bish: &Path) -> (Vec<Divergence>, Vec<Undriveable>) {
         let root = std::env::temp_dir().join(format!("bish-vimdiff-{}", std::process::id()));
         let mut differing = Vec::new();
+        let mut undriveable = Vec::new();
         // `BISH_VIMDIFF_ONLY=name` runs just that case. Driving two
         // real editors through a pty takes minutes for the whole
         // corpus, which is a long way to go to look at one case that
@@ -507,7 +561,7 @@ mod tests {
             // would collide.
             let dir = root.join(c.name);
             let path = dir.join("f.txt");
-            let run = |argv: Vec<String>, save: &str| -> Option<String> {
+            let run = |argv: Vec<String>, save: &str| -> Result<String, &'static str> {
                 let _ = std::fs::remove_dir_all(&dir);
                 std::fs::create_dir_all(&dir).unwrap();
                 std::fs::write(&path, c.before).unwrap();
@@ -521,11 +575,11 @@ mod tests {
             // the same mistake there, and every case here already
             // leaves normal mode.
             let got = run(vec![bish.display().to_string(), "tool".into(), "edit".into(), path.display().to_string()], "\u{1b}:wq\r");
-            // `None` on either side is an editor this harness could
+            // An `Err` on either side is an editor this harness could
             // not drive, not a difference between the two -- retried
-            // like any other, and reported in its own words if it keeps
-            // happening, so it can never be read as a divergence.
-            if want != got || want.is_none() {
+            // like any other, and reported separately below so it can
+            // never be read as a divergence.
+            if want != got || want.is_err() {
                 let mut confirmed = None;
                 for _ in 0..2 {
                     let want_again = run(
@@ -533,22 +587,37 @@ mod tests {
                         ":wq\r",
                     );
                     let got_again = run(vec![bish.display().to_string(), "tool".into(), "edit".into(), path.display().to_string()], "\u{1b}:wq\r");
-                    if want_again == got_again && want_again.is_some() {
+                    if want_again == got_again && want_again.is_ok() {
                         confirmed = None;
                         break;
                     }
                     confirmed = Some((want_again, got_again));
                 }
-                if let Some((want, got)) = confirmed {
-                    let unreachable = "<the editor never answered the handshake -- this harness could not drive it>";
-                    differing.push((c.name, want.unwrap_or_else(|| unreachable.to_string()), got.unwrap_or_else(|| unreachable.to_string())));
+                match confirmed {
+                    // Neither side could be driven three times running,
+                    // or one of them could not. Either way this is the
+                    // harness's own failure and is kept apart from the
+                    // divergences -- see `compare`'s return type.
+                    Some((Err(why), _)) => undriveable.push((c.name, format!("vim {why}"))),
+                    Some((_, Err(why))) => undriveable.push((c.name, format!("bish {why}"))),
+                    Some((Ok(want), Ok(got))) => differing.push((c.name, want, got)),
+                    None => {}
                 }
             }
             let _ = std::fs::remove_dir_all(&dir);
         }
         let _ = std::fs::remove_dir(&root);
-        differing
+        (differing, undriveable)
     }
+
+    /// How many cases may be undriveable before the run stops counting
+    /// as evidence.
+    ///
+    /// Not zero, because a machine running the rest of this suite does
+    /// occasionally lose one and that says nothing about the editor.
+    /// Not unbounded, because an editor that genuinely stopped
+    /// answering would otherwise report nothing at all and pass.
+    const UNDRIVEABLE_TOLERANCE: usize = 3;
 
     #[test]
     fn the_editor_agrees_with_vim() {
@@ -556,13 +625,25 @@ mod tests {
         if !have_vim() {
             return;
         }
-        let differing = compare(CASES, &bish);
+        let (differing, undriveable) = compare(CASES, &bish);
         assert!(
             differing.is_empty(),
             "{} of {} editor cases differ from vim:\n{}",
             differing.len(),
             CASES.len(),
             differing.iter().map(|(name, want, got)| format!("  {name}\n    vim : {want:?}\n    bish: {got:?}")).collect::<Vec<_>>().join("\n")
+        );
+        // Said out loud even when it is within tolerance, so a run that
+        // was quietly short of evidence cannot look like a clean one.
+        for (name, why) in &undriveable {
+            eprintln!("vimdiff: {name}: {why} -- not counted either way");
+        }
+        assert!(
+            undriveable.len() <= UNDRIVEABLE_TOLERANCE,
+            "{} of {} cases could not be driven at all, which is too many to blame on a busy machine:\n{}",
+            undriveable.len(),
+            CASES.len(),
+            undriveable.iter().map(|(name, why)| format!("  {name}: {why}")).collect::<Vec<_>>().join("\n")
         );
     }
 
@@ -572,7 +653,10 @@ mod tests {
         if !have_vim() {
             return;
         }
-        let differing: Vec<&str> = compare(PENDING, &bish).into_iter().map(|(name, _, _)| name).collect();
+        // Only the differences matter here: a case this harness could
+        // not drive is no evidence that a known divergence has been
+        // fixed, so it is neither counted nor complained about.
+        let differing: Vec<&str> = compare(PENDING, &bish).0.into_iter().map(|(name, _, _)| name).collect();
         for (name, why) in DIVERGENCES {
             assert!(differing.contains(name), "`{name}` matches vim now -- remove its line from DIVERGENCES ({why})");
         }
