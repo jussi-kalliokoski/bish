@@ -592,6 +592,46 @@ impl Screen {
     // Whether the currently-showing grid's `row` is a soft-wrap
     // continuation into `row + 1` (see Grid's own `wrapped` field doc
     // comment).
+    /// Every row as text, with a row that only exists because the one
+    /// above it ran out of width rejoined onto it.
+    ///
+    /// A grid is a rectangle and a shell's output is not: a line longer
+    /// than the screen occupies several rows here and one line
+    /// everywhere else. Rejoining by `row_wraps` is what lets what a
+    /// pane shows be compared with what the same script printed down a
+    /// pipe -- see bashdiff's pane corpus, which is the only caller.
+    ///
+    /// Trailing blanks go, on each line and at the end, for the same
+    /// reason: they are the shape of the grid, not of the output.
+    pub fn text_unwrapped(&self) -> String {
+        let (rows, cols) = self.size();
+        let mut lines: Vec<String> = Vec::new();
+        for row in 0..rows {
+            let text: String = (0..cols).map(|col| self.cell(row, col).ch).collect();
+            match lines.last_mut() {
+                // The *previous* row said it ran out of width, so this
+                // row is the rest of that same line.
+                Some(previous) if row > 0 && self.row_wraps(row - 1) => previous.push_str(&text),
+                _ => lines.push(text),
+            }
+        }
+        for line in &mut lines {
+            while line.ends_with(' ') {
+                line.pop();
+            }
+        }
+        while lines.last().is_some_and(String::is_empty) {
+            lines.pop();
+        }
+        match lines.is_empty() {
+            true => String::new(),
+            false => {
+                lines.push(String::new());
+                lines.join("\n")
+            }
+        }
+    }
+
     pub fn row_wraps(&self, row: usize) -> bool {
         self.grid().is_wrapped(row)
     }

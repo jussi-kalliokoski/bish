@@ -25,6 +25,7 @@ mod tests {
     use std::path::PathBuf;
     use std::process::Command;
 
+    #[derive(Clone, Copy)]
     struct Case {
         name: &'static str,
         script: &'static str,
@@ -1125,7 +1126,95 @@ y
     const CASE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
     fn run(shell: &std::ffi::OsStr, script: &str, dir: &std::path::Path) -> Outcome {
+        run_with(shell, &[], script, dir)
+    }
+
+    /// `run`, with both streams landing in one place in the order they
+    /// were written -- which is the only way to compare with a pane.
+    ///
+    /// The ordinary corpus reads stdout and stderr from separate pipes
+    /// and concatenates them, so its `want` is every stdout line
+    /// followed by every stderr line whatever order they happened in. A
+    /// pane has one grid and writes both into it as they come, so
+    /// anything touching both streams -- xtrace, `select`'s menu, every
+    /// diagnostic followed by an echoed `$?` -- looked like a
+    /// difference when it was only a difference in how the answer was
+    /// collected. Two descriptors onto one file share an offset, so
+    /// this is bash writing them interleaved exactly as a terminal
+    /// would receive them.
+    /// The grid `--promoted -c` runs a case in -- see main.rs's
+    /// `run_source_in_a_pane`, which has to agree with this.
+    const PANE_ROWS: usize = 400;
+    const PANE_COLS: usize = 400;
+
+    fn run_merged(shell: &std::ffi::OsStr, options: &[&str], script: &str, dir: &std::path::Path) -> Outcome {
+        // Outside the case's own directory, because several cases glob
+        // their cwd and one of them (`shopt-dotglob`) duly listed this
+        // file -- and unique per call, because the two pane tests run
+        // concurrently over the same case list, and a shared name had
+        // each truncating the other's output mid-run. That showed up as
+        // *bash* producing nothing, which is a memorable way to learn
+        // that the harness is the thing under test.
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("bish-bashdiff-merged-{}-{n}", std::process::id()));
+        let Ok(file) = std::fs::File::create(&path) else {
+            return Outcome { text: "<could not open the merged output file>".to_string(), timed_out: false };
+        };
+        let Ok(errors) = file.try_clone() else {
+            return Outcome { text: "<could not clone the merged output file>".to_string(), timed_out: false };
+        };
         let out = Command::new(shell)
+            .args(options)
+            .arg("-c")
+            .arg(script)
+            .current_dir(dir)
+            .env_clear()
+            .env("PATH", std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".to_string()))
+            .env("LC_ALL", "C")
+            .env("HOME", dir)
+            .env("PS1", "$ ")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::from(file))
+            .stderr(std::process::Stdio::from(errors))
+            .spawn()
+            .and_then(|child| wait_with_timeout(child, CASE_TIMEOUT));
+        let timed_out = match out {
+            Ok((_, timed_out)) => timed_out,
+            Err(e) => return Outcome { text: format!("<could not run: {e}>"), timed_out: false },
+        };
+        let text = std::fs::read_to_string(&path).unwrap_or_default();
+        let _ = std::fs::remove_file(&path);
+        Outcome { text: normalise(&as_a_terminal_would_show_it(&text)), timed_out }
+    }
+
+    /// What a terminal would be displaying after `text` was written to
+    /// it -- bash's bytes put through the same vt100 grid a pane's are.
+    ///
+    /// Otherwise every difference between a byte stream and a screen
+    /// reads as a difference between the shells: a grid expands tabs to
+    /// the next stop, has no trailing spaces because every row is the
+    /// full width, and wraps a long line rather than letting it run.
+    /// `set -o`'s aligned columns and `printf 'a\tb'` were both
+    /// reported as divergences on that basis alone.
+    ///
+    /// The same size as the pane the case ran in, so a line wraps in
+    /// both or neither.
+    fn as_a_terminal_would_show_it(text: &str) -> String {
+        let mut screen = crate::vt100::Screen::new(PANE_ROWS, PANE_COLS);
+        // A terminal moves down on a linefeed and left only on a
+        // carriage return; a pipe's `\n` means both. The grid sink
+        // applies exactly this to everything a shell writes into it
+        // (see exec.rs's `onlcr`), so bash's stream needs it too.
+        screen.feed(text.replace('\n', "\r\n").as_bytes());
+        screen.text_unwrapped()
+    }
+
+    // `run`, with room for an option ahead of `-c` -- which is how the
+    // pane corpus asks for `--promoted`.
+    fn run_with(shell: &std::ffi::OsStr, options: &[&str], script: &str, dir: &std::path::Path) -> Outcome {
+        let out = Command::new(shell)
+            .args(options)
             .arg("-c")
             .arg(script)
             .current_dir(dir)
@@ -1203,7 +1292,27 @@ y
     }
 
     fn compare(cases: &[Case], bish: &std::path::Path) -> Vec<(&'static str, String, String)> {
-        let root = std::env::temp_dir().join(format!("bish-bashdiff-{}", std::process::id()));
+        compare_with(cases, bish, &[])
+    }
+
+    /// `compare`, running bish with `options` ahead of `-c`.
+    ///
+    /// The pane corpus passes `--promoted`, which runs the case the way
+    /// a split or tabbed window runs one and prints the pane's own grid
+    /// afterwards -- see main.rs's `run_source_in_a_pane`. bash is run
+    /// exactly as it is for the ordinary corpus: the question is
+    /// whether a pane agrees with bash, not whether it agrees with the
+    /// other bish.
+    fn compare_with(cases: &[Case], bish: &std::path::Path, options: &[&str]) -> Vec<(&'static str, String, String)> {
+        // A root per *call*, not per process. Several of these tests run
+        // concurrently, and more than one of them now runs the same case
+        // list with the same options -- so a root shared by case name
+        // had one run deleting the directory another run's shell was
+        // sitting in. bash reports that as "getcwd: cannot access parent
+        // directories", which names neither the cause nor the culprit.
+        static NEXT_RUN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let attempt = NEXT_RUN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!("bish-bashdiff-{}-{attempt}", std::process::id()));
         let mut differing = Vec::new();
         for case in cases {
             // A directory per case, named after the case: several of
@@ -1214,12 +1323,21 @@ y
             // then delete the directory the other's shell is sitting in
             // (which shows up as bash's "getcwd: cannot access parent
             // directories", not as anything resembling its cause).
+            // A directory per case, named after the case: several of
+            // them create files, and a glob is only predictable in a
+            // directory it owns.
             let dir = root.join(case.name);
             std::fs::create_dir_all(&dir).unwrap();
-            let want = run(std::ffi::OsStr::new("bash"), case.script, &dir);
+            // A pane merges the two streams, so bash has to be read
+            // the same way for the comparison to mean anything.
+            let merged = !options.is_empty();
+            let want = match merged {
+                true => run_merged(std::ffi::OsStr::new("bash"), &[], case.script, &dir),
+                false => run(std::ffi::OsStr::new("bash"), case.script, &dir),
+            };
             std::fs::remove_dir_all(&dir).ok();
             std::fs::create_dir_all(&dir).unwrap();
-            let got = run(bish.as_os_str(), case.script, &dir);
+            let got = run_with(bish.as_os_str(), options, case.script, &dir);
             std::fs::remove_dir_all(&dir).ok();
             // A hang is its own kind of wrong, and not one the text can
             // express: a case that hangs is killed and reports whatever
@@ -1238,11 +1356,180 @@ y
                 differing.push((case.name, want.text, got.text));
             }
         }
-        // Not remove_dir_all: the other test may still be using its own
-        // subdirectories of this same root. Whichever finishes last
-        // finds it empty and removes it.
-        std::fs::remove_dir(&root).ok();
+        // This root belongs to this call alone, so it goes whole.
+        std::fs::remove_dir_all(&root).ok();
         differing
+    }
+
+    /// Every corpus case again, run the way a split or tabbed window
+    /// runs one.
+    ///
+    /// A pane is a different execution path, not a different coat of
+    /// paint: a pty per foreground external command, `ExecResult::Fg`
+    /// handed back for something else to drive, and a vt100 grid where
+    /// a pipe would otherwise be. Three separate bugs lived there
+    /// unnoticed -- a builtin pipeline stage writing past its pipe,
+    /// `$(external)` coming back empty, and every command after an
+    /// external one being dropped -- and every one of them was found by
+    /// hand, because all 488 cases ran the other way.
+    #[test]
+    fn bish_agrees_with_bash_in_a_pane() {
+        let Some(bish) = bish_binary() else { return };
+        if !have_bash() {
+            return;
+        }
+        let cases = pane_cases();
+        let differing: Vec<_> = compare_with(&cases, &bish, &["--promoted"])
+            .into_iter()
+            .filter(|(name, _, _)| !PANE_DIVERGENCES.iter().any(|(known, _)| known == name))
+            .collect();
+        assert!(
+            differing.is_empty(),
+            "{} of {} cases differ from bash when run in a pane:\n{}",
+            differing.len(),
+            cases.len(),
+            differing.iter().map(|(name, want, got)| format!("  {name}\n    bash: {want:?}\n    pane: {got:?}")).collect::<Vec<_>>().join("\n")
+        );
+    }
+
+    /// Cases whose *pane* answer differs from bash, with the reason.
+    ///
+    /// Empty is the goal. A name here is a claim that the difference is
+    /// the pane's nature rather than a bug -- and every one of those
+    /// claims has to say why, because the last three that looked like
+    /// nature turned out to be bugs.
+    /// Cases the pane corpus does not run at all, because their answer
+    /// is not stable enough to be evidence either way.
+    ///
+    /// `>( )` writes into a process the shell does not wait for, so
+    /// whether its output lands before the shell exits is a race. bash
+    /// loses that race consistently enough to print nothing; a pane
+    /// sometimes wins it. Measured across repeated runs: the *set* of
+    /// `proc-sub-out-*` cases that differ changes from run to run,
+    /// which is exactly the shape of thing that must not go on a
+    /// divergence list -- an entry that is only sometimes true makes
+    /// the guard below lie in one direction or the other, and a guard
+    /// you learn to re-run is a guard you have stopped reading.
+    ///
+    /// The ordinary corpus still runs all of them; it is only the pane
+    /// timing that is racy.
+    /// Matched as a prefix, because the race is the construct's, not
+    /// any one case's: three different `proc-sub-out-*` cases turned up
+    /// across four runs before this was widened from a list of names to
+    /// the family they all belong to.
+    const PANE_SKIPPED: &[(&str, &str)] = &[
+        ("proc-sub-out-", "a `>( )` writer races the shell's exit; four runs gave three different sets of losers"),
+        // Counts open descriptors after five `<( )` reads. On its own it
+        // answers 4 in a pane exactly as it does outside one; under the
+        // full suite it has answered 6. Two extra descriptors is the
+        // size of a pty pair, so the likeliest reading is a foreground
+        // command's pty not yet closed when the count is taken -- which
+        // would be worth chasing on its own terms. What it cannot be is
+        // a corpus case, because its answer depends on how busy the
+        // machine is.
+        ("process-subst-does-not-leak-descriptors", "the descriptor count depends on load: 4 alone, 6 under the full suite"),
+    ];
+
+    /// The cases the pane corpus actually compares.
+    fn pane_cases() -> Vec<Case> {
+        CASES.iter().filter(|c| !PANE_SKIPPED.iter().any(|(prefix, _)| c.name.starts_with(prefix))).copied().collect()
+    }
+
+    const PANE_DIVERGENCES: &[(&str, &str)] = &[
+        // -- output that never reaches the pane's grid ---------------
+        //
+        // The one cause behind most of this list, and the one the
+        // roadmap already has an item for. A pane's output is its vt100
+        // grid; only a *single* foreground external command gets a pty
+        // whose bytes are drained into it. Everything else -- a
+        // pipeline stage, an external with a redirect of its own, an
+        // external's stderr, a process substitution -- is spawned with
+        // fd 1 inherited, which in a real pane is the terminal
+        // underneath that the compositor paints over. So the output is
+        // not merely out of order, it is invisible.
+        //
+        // Two signatures give it away here. It arrives *before* the
+        // grid's own contents, because `--promoted -c` prints the grid
+        // once at the end and anything written straight to fd 1 got
+        // there first; and it still contains tabs and trailing spaces,
+        // which a grid would have expanded and trimmed -- see
+        // `stage-sees-shell-options` and `keyword-completions`, whose
+        // only difference is that the pane's copy never met a terminal.
+        ("redir-basic", "`wc -l < f`: a redirect of its own keeps an external off the pty, so its output bypasses the grid"),
+        ("flush-order", "`printf B | cat`: a pipeline's output bypasses the grid"),
+        ("flush-order-stderr", "same, for the stderr half"),
+        ("shell-stage-hands-the-rest-to-an-external", "the external stage's output bypasses the grid"),
+        ("read-leaves-the-rest-of-the-pipe", "same"),
+        ("stage-sees-shell-options", "the stage's `shopt` output keeps its literal tab -- it never went through a grid"),
+        ("keyword-completions", "`compgen | ...`: the trailing space survives for the same reason"),
+        ("cd-keeps-the-route-it-was-given", "`pwd -P | sed`: pipeline, so it lands ahead of the grid"),
+        ("declare-capital-f-with-and-without-a-name", "`declare -F | head -2`: same"),
+        ("an-exit-trap-set-in-a-subshell-fires-there", "`echo a | { ...; cat; }`: the pipeline's `a` never reaches the grid"),
+        ("a-superseded-redirect-still-creates-its-file", "the redirected externals bypass the grid"),
+        ("a-compounds-stderr-reaches-externals", "an external's stderr bypasses the grid"),
+        ("a-loops-stderr-reaches-externals", "same"),
+        ("a-functions-stderr-reaches-externals", "same"),
+        // -- a background job has nobody draining it -----------------
+        //
+        // A backgrounded job gets a pty whose output repl.rs drains on
+        // its idle tick (`drain_background_output`). `-c` has no such
+        // loop, so the output is still sitting in the pty when the
+        // shell exits. Unlike the group above this really is peculiar
+        // to running a case this way: in a live pane the drain happens.
+        ("backgrounding-a-function", "the background job's pty is drained by repl.rs's idle tick, which `-c` has none of"),
+        ("backgrounding-a-loop", "same"),
+        ("backgrounding-a-conditional", "same"),
+        // -- what the pty spawn path reports -------------------------
+        //
+        // A promoted external goes out through `pty::spawn_attached`
+        // rather than the ordinary spawn, and that path answers a
+        // failure with the raw OS error instead of the wording and the
+        // exit status bash uses. Nothing to do with panes as such --
+        // just a second spawn site that never learned the first one's
+        // manners.
+        ("command-not-found", "\"No such file or directory (os error 2)\" for bash's \"command not found\""),
+        ("not-executable-is-126", "127 where bash says 126, and \"Permission denied\" for a directory bash calls \"Is a directory\""),
+        ("missing-path-is-127", "the raw OS error text again"),
+        // -- and one that is neither ---------------------------------
+        //
+        // Real, and not about output at all. The last command of a line
+        // hands its pty-backed job off rather than waiting (see
+        // ExecResult::Fg), so `run_program` finishes with a status of 0
+        // and the ERR check has already run by the time the command
+        // actually fails. A live pane has the same hole: an ERR trap
+        // does not fire for the last external command on a line.
+        ("bash-command-in-an-err-trap", "ERR never fires: the final external's status is settled after run_program has already checked it"),
+    ];
+
+    /// The same guard `DIVERGENCES` has: a name on the pane list is a
+    /// claim that the case *does* differ, and a claim that stops being
+    /// true has to be removed rather than left standing. Fixing one of
+    /// these fails the suite until its line goes, which is the whole
+    /// reason a list like this is safe to keep.
+    #[test]
+    fn the_known_pane_divergences_are_still_divergences() {
+        let Some(bish) = bish_binary() else { return };
+        if !have_bash() {
+            return;
+        }
+        let differing: Vec<&str> = compare_with(&pane_cases(), &bish, &["--promoted"]).into_iter().map(|(name, _, _)| name).collect();
+        for (name, why) in PANE_DIVERGENCES {
+            assert!(differing.contains(name), "`{name}` agrees with bash in a pane now -- remove its line from PANE_DIVERGENCES ({why})");
+        }
+    }
+
+    #[test]
+    fn every_pane_divergence_names_a_real_case() {
+        for (name, _) in PANE_DIVERGENCES {
+            assert!(CASES.iter().any(|c| c.name == *name), "`{name}` is listed as a pane divergence with no case to prove it");
+        }
+        for (prefix, _) in PANE_SKIPPED {
+            assert!(CASES.iter().any(|c| c.name.starts_with(prefix)), "`{prefix}` skips nothing -- no case name starts with it");
+            assert!(
+                !PANE_DIVERGENCES.iter().any(|(d, _)| d.starts_with(prefix)),
+                "`{prefix}` is skipped, so nothing starting with it can also be listed as a divergence"
+            );
+        }
     }
 
     #[test]

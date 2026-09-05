@@ -173,6 +173,9 @@ fn main() {
         let positional = invocation.operands.get(1..).map(<[String]>::to_vec).unwrap_or_default();
         shell.set_script_args(script_name, positional);
         source_bash_env(&mut shell, &invocation);
+        if invocation.promoted {
+            std::process::exit(run_source_in_a_pane(&mut shell, command));
+        }
         std::process::exit(run_source(&mut shell, command));
     }
 
@@ -400,6 +403,42 @@ mod tests {
 // `$BASH_ENV` for a non-interactive shell, and the login profile for a
 // login one -- bash reads the first before running a script or `-c`
 // text, which is how a system-wide setup file reaches a script at all.
+/// `bish --promoted -c '<script>'`: runs the script the way a split or
+/// tabbed window runs one -- promoted, with output going to a pane's
+/// grid instead of fd 1 -- and prints what the pane ends up showing.
+///
+/// This exists for bashdiff's pane corpus. A pane is a genuinely
+/// different execution path: a pty per foreground external command,
+/// `ExecResult::Fg` handed back for something else to drive, and a
+/// vt100 grid where a pipe would otherwise be. Three separate bugs
+/// lived in it unnoticed -- a builtin pipeline stage writing past its
+/// pipe, `$(external)` coming back empty, and every command after an
+/// external one being dropped -- precisely because every corpus case
+/// ran the other way. Running the same script both ways, from outside,
+/// is what lets the corpus have an opinion about it.
+///
+/// The grid is deliberately far larger than any case needs: what
+/// scrolls off the top of a pane is gone, and a corpus case whose
+/// output was silently truncated would compare as a difference that
+/// has nothing to do with the shell.
+fn run_source_in_a_pane(shell: &mut exec::Shell, src: &str) -> i32 {
+    const ROWS: usize = 400;
+    const COLS: usize = 400;
+    let screen = std::rc::Rc::new(std::cell::RefCell::new(vt100::Screen::new(ROWS, COLS)));
+    shell.set_sink_grid(std::rc::Rc::clone(&screen));
+    shell.mark_promoted();
+    let status = run_source(shell, src);
+    // The last command of a line hands a pty-backed job off rather than
+    // waiting for it (see ExecResult::Fg). In a pane repl.rs drives it;
+    // here nothing else will, so it is drained now -- otherwise the
+    // grid is read before the command that filled it has finished.
+    shell.settle_pending_fg();
+    print!("{}", screen.borrow().text_unwrapped());
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+    status
+}
+
 fn source_bash_env(shell: &mut exec::Shell, invocation: &Invocation) {
     if invocation.norc {
         return;

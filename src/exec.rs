@@ -2407,6 +2407,25 @@ impl Shell {
         self.promoted.get()
     }
 
+    /// Marks this shell promoted without the screen-switching escapes
+    /// `promote_if_needed` prints -- for a caller that is capturing
+    /// output rather than showing it, which is bashdiff's pane corpus
+    /// and nothing else.
+    pub fn mark_promoted(&self) {
+        self.promoted.set(true);
+    }
+
+    /// Runs a job the last command handed off, here, and returns its
+    /// status -- what repl.rs would otherwise have driven. See
+    /// `drive_pending_fg_inline`; this is its one caller outside the
+    /// execution path itself.
+    pub fn settle_pending_fg(&mut self) -> i32 {
+        match self.pending_fg.is_some() {
+            true => self.drive_pending_fg_inline(),
+            false => self.last_status,
+        }
+    }
+
     pub fn run_exit_trap(&mut self) {
         // Only for the exit of the shell that armed it. A subshell
         // inherits the trap and can still see it -- `trap -p EXIT`
