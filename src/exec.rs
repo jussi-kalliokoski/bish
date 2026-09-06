@@ -6186,13 +6186,36 @@ impl Shell {
         }
     }
 
+    /// Names a compound's header and fires the DEBUG trap for it.
+    ///
+    /// The header is a command in its own right here, the same way a
+    /// simple command is, and it is named as written -- `for i in 1`,
+    /// not the list it expands to.
+    fn name_and_trace_header(&mut self, header: &str) {
+        if self.debug_trap.is_none() || self.in_trap {
+            return;
+        }
+        self.bash_command = header.to_string();
+        self.run_pseudo_trap(PseudoTrap::Debug);
+    }
+
     fn run_for(&mut self, var: &str, words: Option<&[Word]>, body: &Program) -> ExecResult {
         let values = match words {
             Some(words) => self.expand_words(words),
             None => self.arg_frames.last().cloned().unwrap_or_default(),
         };
+        // A loop header is a command as far as the DEBUG trap is
+        // concerned: bash fires it for `for` and `select` (and `case`),
+        // though not for `if` or `while`, whose conditions are
+        // themselves commands and fire on their own.
+        //
+        // Once per iteration, not once per loop -- `for i in a b c`
+        // traces its header three times -- and never at all when the
+        // list is empty, because then the loop is not entered.
+        let header = loop_header("for", var, words);
         let mut ran_body = false;
         for val in values {
+            self.name_and_trace_header(&header);
             ran_body = true;
             self.assign_var(var, val);
             match self.run_program(body) {
@@ -6235,6 +6258,7 @@ impl Shell {
     //  - EOF on stdin ends the loop entirely (like an implicit break),
     //    without running the body, and the loop's status is 1
     fn run_select(&mut self, var: &str, words: Option<&[Word]>, body: &Program) -> ExecResult {
+        self.name_and_trace_header(&loop_header("select", var, words));
         let items: Vec<String> = match words {
             Some(words) => self.expand_words(words),
             None => self.arg_frames.last().cloned().unwrap_or_default(),
@@ -6312,6 +6336,13 @@ impl Shell {
     // Continue arm falls through to the step evaluation below instead of
     // looping straight back like a plain `while`'s `continue` does.
     fn run_cfor(&mut self, init: &str, cond: &str, step: &str, body: &Program) -> ExecResult {
+        // Each of the three sections is its own command to a DEBUG
+        // trap, named `((expr))` -- so `for ((i=0;i<1;i++))` traces
+        // `((i=0))`, then `((i<1))` before every test and `((i++))`
+        // before every step.
+        // An omitted section is `1`, and bash names it that way rather
+        // than skipping it: `for ((;;))` traces `((1))`.
+        self.name_and_trace_header(&format!("(({}))", if init.is_empty() { "1" } else { init }));
         if !init.is_empty() {
             if let Err(e) = arith::eval(init, self) {
                 sh_eprintln!(self, "bish: ((: {}: {}", init, e);
@@ -6320,6 +6351,7 @@ impl Shell {
         }
         let mut ran_body = false;
         loop {
+            self.name_and_trace_header(&format!("(({}))", if cond.is_empty() { "1" } else { cond }));
             let keep_going = if cond.is_empty() {
                 true
             } else {
@@ -6358,6 +6390,7 @@ impl Shell {
                 }
                 ret @ (ExecResult::Return(_) | ExecResult::Window(_) | ExecResult::Edit | ExecResult::Exit(_)) => return ret,
             }
+            self.name_and_trace_header(&format!("(({}))", if step.is_empty() { "1" } else { step }));
             if !step.is_empty() {
                 if let Err(e) = arith::eval(step, self) {
                     sh_eprintln!(self, "bish: ((: {}: {}", step, e);
@@ -6369,6 +6402,8 @@ impl Shell {
     }
 
     fn run_case(&mut self, word: &Word, arms: &[(Vec<Word>, Program, parser::CaseTerm)]) -> ExecResult {
+        // Trailing space and all: bash writes this one as `case x in `.
+        self.name_and_trace_header(&format!("case {} in ", crate::serialize::serialize_word(word)));
         let val = self.expand_word(word);
         let mut i = 0;
         // Set by `;&`: run the next arm's body unconditionally, skipping
@@ -9154,6 +9189,19 @@ impl Shell {
                 true => self.new_virtual_child(),
                 false => self.child_for_stdio(ChildStdio::default()),
             };
+            // No DEBUG trap inside this stage, in the two cases where
+            // bash has none either. A simple stage was already named
+            // and traced by `run_multi` before any stage started; a
+            // compound one is a subshell, which does not inherit the
+            // trap unless `set -T` says so. It matters more here than
+            // anywhere: a stage on this path runs as a coroutine with
+            // the pipe already installed as its stdout, so a trap
+            // firing inside one wrote its own output *into the pipe*
+            // and `echo a | { read v; echo "got $v"; }` answered
+            // `got [echo a]`.
+            if matches!(cmd, parser::Command::Simple(_)) || !self.opt_functrace {
+                child.debug_trap = None;
+            }
             let body = cmd.clone();
             let code = Rc::clone(&codes[i]);
             let stage = move || {
@@ -9254,6 +9302,27 @@ impl Shell {
         // pipeline is not over because one of its commands does not
         // exist -- see the `spawn` failure arm below -- so these are
         // folded into `codes` alongside the ones that really ran.
+        // Every stage is named and traced before any of them runs, which
+        // is bash's own order -- all three traces of a three-stage
+        // pipeline arrive before its first byte of output. bish fired
+        // the trap only for the stage that runs in this shell, so
+        // `echo a | cat` traced one command and `/bin/echo a |
+        // /bin/cat` traced none at all.
+        //
+        // Only a *simple* stage. bash does not trace a compound one,
+        // nor anything inside it: `{ echo g; } | cat` traces `cat`
+        // alone, because the group is a subshell and a DEBUG trap is
+        // not inherited into one.
+        if self.debug_trap.is_some() {
+            for cmd in commands {
+                if let parser::Command::Simple(sc) = cmd
+                    && !sc.words.is_empty()
+                {
+                    self.bash_command = crate::serialize::serialize_simple(sc);
+                    self.run_pseudo_trap(PseudoTrap::Debug);
+                }
+            }
+        }
         let mut never_started: Vec<(usize, i32)> = Vec::new();
         // The previous stage's read end, kept as a `ChildStdout` rather
         // than a `Stdio`: `lastpipe` needs its fd, and only ChildStdout
@@ -9695,7 +9764,25 @@ impl Shell {
             // it writes into a pipe whose reader is filling that pty.
             // See PIPELINE_DRAIN.
             PIPELINE_DRAIN.with(|d| *d.borrow_mut() = pane_output.take());
+            // No DEBUG trap for the duration. A simple stage was
+            // already traced above, with every other stage, before any
+            // of them started; a compound stage is a subshell, and a
+            // DEBUG trap is not inherited into one -- `{ echo g; } |
+            // cat` traces `cat` and nothing else in bash. Firing it in
+            // there was not only an extra line: the stage's output is
+            // the pipe, so `echo a | { read v; ... }` had `read` take
+            // the trap's own output as its input.
+            //
+            // `set -T` is the documented exception, and says a subshell
+            // does inherit it.
+            let hushed = match self.opt_functrace {
+                true => None,
+                false => self.debug_trap.take(),
+            };
             let result = self.run_command_in_child_shell(&commands[stage], stdio);
+            if hushed.is_some() {
+                self.debug_trap = hushed;
+            }
             pane_output = PIPELINE_DRAIN.with(|d| d.borrow_mut().take());
             let broken = disarm_broken_pipe();
             restore_fd012(saved);
@@ -14591,6 +14678,19 @@ fn clear_cloexec(fd: i32) {
 /// it, so `exit -1` is 255 and `exit 300` is 44. bish handed the number
 /// back whole, which made `$?` a value no real wait status can hold --
 /// and `(exit 256); echo $?` said 256 where every other shell says 0.
+/// `for x in a b` / `select x in a b`, written the way it was written.
+///
+/// A missing list is the positional parameters, and bash prints the
+/// list it stands for rather than the shorthand -- the same choice its
+/// `declare -f` makes.
+fn loop_header(keyword: &str, var: &str, words: Option<&[Word]>) -> String {
+    let items = match words {
+        Some(words) => words.iter().map(crate::serialize::serialize_word).collect::<Vec<_>>().join(" "),
+        None => "\"$@\"".to_string(),
+    };
+    format!("{} {} in {}", keyword, var, items)
+}
+
 fn exit_status_byte(code: i32) -> i32 {
     code & 0xff
 }

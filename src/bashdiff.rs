@@ -258,6 +258,34 @@ mod tests {
         case("a-missing-command-does-not-end-the-pipeline", r#"nosuchcmd | head -1; echo "ps=(${PIPESTATUS[@]}) q=$?""#),
         case("a-missing-command-later-in-a-pipeline", r#"echo x | nosuchcmd; echo "q=$? it=${PIPESTATUS[1]}""#),
         case("a-directory-as-a-pipeline-stage", r#"/etc | cat; echo "q=${PIPESTATUS[0]}""#),
+        // The DEBUG trap fires for every stage of a pipeline, before
+        // any of them runs -- all three traces of a three-stage
+        // pipeline arrive before its first byte. bish fired only for
+        // the stage that runs in this shell, so an all-external
+        // pipeline traced nothing at all.
+        //
+        // A *compound* stage is a subshell, and a DEBUG trap is not
+        // inherited into one, so nothing inside it traces. Firing in
+        // there was not merely an extra line: a stage's stdout is the
+        // pipe, so the trap's own output became the next stage's input.
+        case("debug-trap-fires-for-every-pipeline-stage", "trap 'echo \"[$BASH_COMMAND]\"' DEBUG; /bin/echo a | /bin/cat | /bin/cat"),
+        case("debug-trap-skips-a-compound-stage", "trap 'echo \"[$BASH_COMMAND]\"' DEBUG; { echo g; } | cat"),
+        case("debug-trap-does-not-feed-the-pipe", "trap 'echo \"[$BASH_COMMAND]\"' DEBUG; echo a | { read v; echo \"got $v\"; }"),
+        case("debug-trap-with-functrace-enters-a-subshell", "set -T; trap 'echo \"[$BASH_COMMAND]\"' DEBUG; echo a | { read v; echo \"got $v\"; }"),
+        // A loop or `case` header is a command too -- for `for`,
+        // `select` and `case`, though not for `if` or `while`, whose
+        // conditions are commands and fire on their own. The `for`
+        // header fires once per iteration, and not at all when the
+        // list is empty.
+        case("debug-trap-fires-for-a-for-header", "trap 'echo \"[$BASH_COMMAND]\"' DEBUG; for i in a b; do :; done"),
+        case("debug-trap-skips-an-empty-for", "trap 'echo \"[$BASH_COMMAND]\"' DEBUG; for i in; do :; done; echo end"),
+        case("debug-trap-names-the-positional-for", "trap 'echo \"[$BASH_COMMAND]\"' DEBUG; set -- z; for i; do echo $i; done"),
+        case("debug-trap-fires-for-a-case-header", "trap 'echo \"[$BASH_COMMAND]\"' DEBUG; case x in x) echo m;; esac"),
+        case("debug-trap-fires-for-a-select-header", "trap 'echo \"[$BASH_COMMAND]\"' DEBUG; select x in a b; do break; done < /dev/null"),
+        // Each section of an arithmetic `for` is its own command, and
+        // an omitted one is named `((1))`.
+        case("debug-trap-fires-for-each-arithmetic-section", "trap 'echo \"[$BASH_COMMAND]\"' DEBUG; for ((i=0;i<2;i++)); do :; done"),
+        case("debug-trap-names-an-omitted-section-as-one", "trap 'echo \"[$BASH_COMMAND]\"' DEBUG; for ((;;)); do break; done"),
         // `$BASH_COMMAND` names the command being run, as *written*.
         // It was built from the expanded argv and assigned after the
         // expansion, so a command reading it in its own words got the
@@ -1261,7 +1289,6 @@ y
         // Reporting a made-up one would break `kill $BASHPID`, which is
         // most of what it is for.
         ("bashpid-is-the-shells-own-in-a-subshell", "`( echo $BASHPID )` names this shell; bash forks a subshell, so its BASHPID differs from `$$`"),
-        ("debug-trap-misses-an-external-pipeline-stage", "`trap ... DEBUG; echo a | cat` fires once; bash fires once per stage"),
         // A deliberate choice, not an oversight: bish's `set -o` lists
         // only the ten names that gate real behaviour here, where bash
         // lists twenty-seven. Printing `allexport off` for an option
@@ -1290,7 +1317,6 @@ y
         case("set-o-lists-fewer-options", r#"set -o | wc -l"#),
         case("bashpid-is-the-shells-own-in-a-subshell", r#"echo $(( $$ == BASHPID )); ( echo $(( $$ == BASHPID )) )"#),
         case("extglob-cannot-be-turned-off", r#"shopt extglob; shopt -u extglob; shopt -q extglob; echo "q=$?""#),
-        case("debug-trap-misses-an-external-pipeline-stage", r#"trap "echo D" DEBUG; echo a | cat"#),
         case("compgen-b-lists-this-shells-builtins", r#"compgen -b | sort | head -3 | tr '\n' ' '; echo"#),
         // -- roadmap 10: parser leniency, the part still standing -----
         // Also not recordable, and for the same kind of reason: a
