@@ -130,6 +130,79 @@ mod tests {
         // where the `;` falls, which keyword shares a line with its
         // condition, how deep an arm's body sits, which redirects take
         // a space.
+        // `-ab` is two options in one word, and OPTIND names the
+        // word -- so how far into it a scan has got has to live
+        // somewhere the script cannot see. bish read the first letter
+        // and skipped the rest of the word.
+        case(
+            "getopts-clustered-options",
+            r#"set -- -ab v x; while getopts ab: o; do echo "[$o:$OPTARG] OPTIND=$OPTIND"; done; echo "end=$OPTIND rest=${!OPTIND}""#,
+        ),
+        // POSIX `test` groups with `\( ... \)` and has no other way
+        // to; bish called it "too many arguments". And an operator it
+        // did not recognise answered *false* rather than erroring,
+        // which is the reading that lets a typo'd `-q` pass for a
+        // failed test forever.
+        case("test-groups-with-parentheses", r#"[ \( 1 -eq 1 \) -a \( 2 -eq 2 \) ] && echo y"#),
+        case("test-groups-with-or", r#"[ \( 1 -eq 2 \) -o \( 2 -eq 2 \) ] && echo y"#),
+        case("test-a-negated-group", r#"[ ! \( 1 -eq 1 -o 2 -eq 2 \) ]; echo rc=$?"#),
+        case("test-nested-groups", r#"[ \( \( 1 -eq 1 \) -a 1 \) -o 0 ] && echo y"#),
+        case("test-a-group-of-one-word", r#"[ \( x \) ] && echo y; [ ! \( x \) ]; echo rc=$?"#),
+        // Three words where the middle one is an operator are a
+        // comparison, not a group -- which is what keeps a literal
+        // parenthesis comparable.
+        case("test-a-parenthesis-is-still-a-string", r#"[ "(" = "(" ] && echo y; [ "(" = ")" ]; echo rc=$?"#),
+        case("test-an-unknown-operator-is-an-error", r#"[ x y ]; echo rc=$?"#),
+        case("test-an-unknown-dash-operator-is-an-error", r#"[ -q x ]; echo rc=$?"#),
+        case("test-unary-o-is-not-a-connective", r#"[ -o errexit -o -o xtrace ]; echo rc=$?"#),
+        case("test-file-tests-in-a-group", r#"touch g; [ \( -e g -a -f g \) -o -d g ] && echo y"#),
+        // `return` ends a sourced file and gives the `.` its status.
+        case("return-from-a-sourced-file", "printf 'echo in\\nreturn 4\\necho no\\n' > s.sh; . ./s.sh; echo rc=$?"),
+        case("return-from-a-sourced-file-with-no-argument", "printf 'false\\nreturn\\n' > s.sh; . ./s.sh; echo rc=$?"),
+        case(
+            "return-from-a-function-inside-a-sourced-file",
+            "printf 'g(){ return 7; }\\ng\\necho \"in=$?\"\\nreturn 9\\n' > s.sh; . ./s.sh; echo rc=$?",
+        ),
+        case("return-through-a-nested-source", "printf 'return 6\\n' > b.sh; printf '. ./b.sh\\necho mid=$?\\n' > a.sh; . ./a.sh; echo rc=$?"),
+        case("return-at-the-top-level-is-a-usage-error", r#"return 3; echo rc=$?"#),
+        // A `#` inside a word is a character, not the start of a
+        // comment -- there is no position inside a word where one could
+        // begin. Everything from a leading `#` used to vanish.
+        case("a-hash-in-an-expansion-word", r#"echo "[${x:-# hi}]" "[${x:-#}]""#),
+        case("a-hash-in-ps4", r#"PS4='# '; set -x; echo a"#),
+        case("a-hash-still-starts-a-comment", r#"echo a # comment"#),
+        case("a-hash-in-the-middle-of-a-word", r#"echo a#b"#),
+        // Every stage of a pipeline is traced, not just the first.
+        case("xtrace-traces-every-stage", r#"set -x; /bin/echo a | /bin/cat; set +x"#),
+        case("xtrace-traces-three-stages", r#"set -x; /bin/echo a | /bin/cat | /bin/cat; set +x"#),
+        case("xtrace-traces-a-stages-prefix-assignment", r#"set -x; x=1 /bin/cat /dev/null | /bin/cat; set +x"#),
+        case("xtrace-traces-an-appended-prefix-assignment", r#"p=x; set -x; p+=y /bin/cat /dev/null | /bin/cat; set +x"#),
+        case("getopts-cluster-with-a-glued-argument", r#"set -- -abv y; while getopts ab: o; do echo "[$o:$OPTARG]"; done; echo end=$OPTIND"#),
+        case(
+            "getopts-unknown-inside-a-cluster",
+            r#"set -- -aZb; while getopts ab: o; do echo "[$o:$OPTARG] OPTIND=$OPTIND"; done; echo end=$OPTIND"#,
+        ),
+        case("getopts-silent-mode-inside-a-cluster", r#"set -- -aZ; while getopts :ab: o; do echo "[$o:$OPTARG]"; done"#),
+        // Assigning OPTIND restarts the word, even when the value
+        // assigned is the one already there.
+        case(
+            "getopts-assigning-optind-restarts-the-word",
+            r#"set -- -ab v; getopts ab: o; echo "1:[$o] $OPTIND"; OPTIND=1; getopts ab: o; echo "2:[$o] $OPTIND""#,
+        ),
+        case("getopts-starts-at-one", r#"echo "[$OPTIND][$OPTERR]""#),
+        case("getopts-a-lone-dash-is-not-an-option", r#"set -- - x; while getopts ab: o; do echo "[$o]"; done; echo $OPTIND"#),
+        case(
+            "getopts-in-a-function-with-a-local-optind",
+            r#"f(){ local OPTIND=1; while getopts ab: o; do echo "[$o:$OPTARG]"; done; }; f -ab v; f -a"#,
+        ),
+        // A stage that will not start has exited 127; it has not ended
+        // the pipeline. Only the failing stage's own status and the
+        // last one's are asserted here: whether the stage *upstream*
+        // of a missing command finishes before its reader disappears
+        // is a race in both shells.
+        case("a-missing-command-does-not-end-the-pipeline", r#"nosuchcmd | head -1; echo "ps=(${PIPESTATUS[@]}) q=$?""#),
+        case("a-missing-command-later-in-a-pipeline", r#"echo x | nosuchcmd; echo "q=$? it=${PIPESTATUS[1]}""#),
+        case("a-directory-as-a-pipeline-stage", r#"/etc | cat; echo "q=${PIPESTATUS[0]}""#),
         case("declare-f-empty-body", r#"f() { :; }; declare -f f"#),
         case("declare-f-two-statements", r#"f() { echo a; echo b; }; declare -f f"#),
         case("declare-f-a-bare-variable-stays-bare", r#"f() { echo $x ${y}; }; declare -f f"#),
@@ -159,31 +232,6 @@ mod tests {
         // `&` does not end the line the way `;` does.
         case("declare-f-background-continues-the-line", r#"f() { echo a & ! true; echo b & echo c & }; declare -f f"#),
         case("declare-f-a-function-level-redirect", r#"f() { echo a; } 2>/dev/null; declare -f f"#),
-        // POSIX `test` groups with `\( ... \)` and has no other way
-        // to; bish called it "too many arguments". And an operator it
-        // did not recognise answered *false* rather than erroring,
-        // which is the reading that lets a typo'd `-q` pass for a
-        // failed test forever.
-        case("test-groups-with-parentheses", r#"[ \( 1 -eq 1 \) -a \( 2 -eq 2 \) ] && echo y"#),
-        case("test-groups-with-or", r#"[ \( 1 -eq 2 \) -o \( 2 -eq 2 \) ] && echo y"#),
-        case("test-a-negated-group", r#"[ ! \( 1 -eq 1 -o 2 -eq 2 \) ]; echo rc=$?"#),
-        case("test-nested-groups", r#"[ \( \( 1 -eq 1 \) -a 1 \) -o 0 ] && echo y"#),
-        case("test-a-group-of-one-word", r#"[ \( x \) ] && echo y; [ ! \( x \) ]; echo rc=$?"#),
-        // Three words where the middle one is an operator are a
-        // comparison, not a group -- which is what keeps a literal
-        // parenthesis comparable.
-        case("test-a-parenthesis-is-still-a-string", r#"[ "(" = "(" ] && echo y; [ "(" = ")" ]; echo rc=$?"#),
-        case("test-an-unknown-operator-is-an-error", r#"[ x y ]; echo rc=$?"#),
-        case("test-an-unknown-dash-operator-is-an-error", r#"[ -q x ]; echo rc=$?"#),
-        case("test-unary-o-is-not-a-connective", r#"[ -o errexit -o -o xtrace ]; echo rc=$?"#),
-        case("test-file-tests-in-a-group", r#"touch g; [ \( -e g -a -f g \) -o -d g ] && echo y"#),
-        // A `#` inside a word is a character, not the start of a
-        // comment -- there is no position inside a word where one could
-        // begin. Everything from a leading `#` used to vanish.
-        case("a-hash-in-an-expansion-word", r#"echo "[${x:-# hi}]" "[${x:-#}]""#),
-        case("a-hash-in-ps4", r#"PS4='# '; set -x; echo a"#),
-        case("a-hash-still-starts-a-comment", r#"echo a # comment"#),
-        case("a-hash-in-the-middle-of-a-word", r#"echo a#b"#),
         case("redir-heredoc-with-no-body", "wc -c <<EOF\nEOF"),
         case("redir-heredoc-with-one-empty-line", "wc -c <<EOF\n\nEOF"),
         case("redir-herestring", r#"cat <<< "here string""#),
@@ -1099,6 +1147,21 @@ y
         // fires only for a stage that runs in the shell: an external
         // one is spawned without going through the path that fires it,
         // so `echo a | cat` traces one command rather than two.
+        // A stage that runs *in* this shell is traced when it runs,
+        // which is after every other stage has been spawned. bash forks
+        // it and traces it in place. Every all-external pipeline is in
+        // stage order; this one is not, and putting it there would mean
+        // expanding that stage's words before the loop that builds the
+        // others -- which would run its command substitutions early.
+        (
+            "xtrace-traces-an-in-shell-stage-last",
+            "`set -x; echo a | cat` traces `cat` first, because `echo` runs in this shell and is traced when it runs",
+        ),
+        // `( )` and `$( )` run in this shell rather than in a forked
+        // copy of it, so there is no second process to have a pid.
+        // Reporting a made-up one would break `kill $BASHPID`, which is
+        // most of what it is for.
+        ("bashpid-is-the-shells-own-in-a-subshell", "`( echo $BASHPID )` names this shell; bash forks a subshell, so its BASHPID differs from `$$`"),
         ("debug-trap-misses-an-external-pipeline-stage", "`trap ... DEBUG; echo a | cat` fires once; bash fires once per stage"),
         // A deliberate choice, not an oversight: bish's `set -o` lists
         // only the ten names that gate real behaviour here, where bash
@@ -1155,6 +1218,8 @@ y
         case("set-o-lists-fewer-options", r#"set -o | wc -l"#),
         case("function-body-quoting", "f() { echo \"a\" 'b' c\\ d; }; declare -f f"),
         case("bash-command-read-outside-a-trap", r#"true; echo "[$BASH_COMMAND]""#),
+        case("xtrace-traces-an-in-shell-stage-last", r#"set -x; echo a | cat; set +x"#),
+        case("bashpid-is-the-shells-own-in-a-subshell", r#"echo $(( $$ == BASHPID )); ( echo $(( $$ == BASHPID )) )"#),
         case("debug-trap-misses-an-external-pipeline-stage", r#"trap "echo D" DEBUG; echo a | cat"#),
         case("compgen-b-lists-this-shells-builtins", r#"compgen -b | sort | head -3 | tr '\n' ' '; echo"#),
         // -- roadmap 10: parser leniency, the part still standing -----

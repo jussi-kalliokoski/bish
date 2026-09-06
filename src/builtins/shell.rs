@@ -46,44 +46,80 @@ pub(crate) fn run_getopts(sh: &mut Shell, args: &[String]) -> ExecResult {
     // option's argument in place made `-b val -c` report `c` with
     // `OPTARG` still `val`.
     sh.remove_var("OPTARG");
-    let opt_char = cur.chars().nth(1).unwrap_or('?');
+    // `-ab` is two options in one word. OPTIND names the word, so how
+    // far into it this scan has got lives on the shell -- 0 meaning
+    // "not started" and therefore the first character after the `-`.
+    // bash keeps the same thing out of sight, and resets it when a
+    // script assigns OPTIND (see Shell::getopts_offset).
+    let at = match sh.getopts_offset {
+        0 => 1,
+        n => n,
+    };
+    let word: Vec<char> = cur.chars().collect();
+    let opt_char = word.get(at).copied().unwrap_or('?');
+    // Whether this word still has letters after the one being read.
+    // While it does, OPTIND stays put and only the offset moves.
+    let more_in_word = at + 1 < word.len();
     let silent = optstring.starts_with(':');
     let spec = optstring.trim_start_matches(':');
+
+    // Every exit that is finished with this word advances OPTIND; the
+    // one that is not re-assigns the same value and then records where
+    // it got to. The order matters both ways round: assigning OPTIND is
+    // what clears the offset.
+    let step = |sh: &mut Shell, words: usize| {
+        sh.assign_var("OPTIND", (optind + words).to_string());
+    };
+    let stay = |sh: &mut Shell| {
+        sh.assign_var("OPTIND", optind.to_string());
+        sh.getopts_offset = at + 1;
+    };
 
     let Some(pos) = spec.find(opt_char) else {
         if silent {
             sh.assign_var(&varname, "?".to_string());
             sh.assign_var("OPTARG", opt_char.to_string());
         } else {
-            sh_eprintln!(sh, "bish: getopts: illegal option -- '{}'", opt_char);
+            // bash's own wording, which names neither the builtin nor
+            // quotes the letter.
+            sh_eprintln!(sh, "bish: illegal option -- {}", opt_char);
             sh.assign_var(&varname, "?".to_string());
         }
-        sh.assign_var("OPTIND", (optind + 1).to_string());
+        if more_in_word {
+            stay(sh)
+        } else {
+            step(sh, 1)
+        }
         return ExecResult::Status(0);
     };
 
     let needs_arg = spec.as_bytes().get(pos + 1) == Some(&b':');
     if needs_arg {
-        let rest: String = cur.chars().skip(2).collect();
+        // An argument glued to the option takes the rest of the word,
+        // however deep into a cluster it is: `-ab v` gives `b` the
+        // separate `v`, and `-abv` gives it `v` from inside the word.
+        let rest: String = word[at + 1..].iter().collect();
         if !rest.is_empty() {
             sh.assign_var("OPTARG", rest);
-            sh.assign_var("OPTIND", (optind + 1).to_string());
+            step(sh, 1);
         } else if idx + 1 < positional.len() {
             sh.assign_var("OPTARG", positional[idx + 1].clone());
-            sh.assign_var("OPTIND", (optind + 2).to_string());
+            step(sh, 2);
         } else {
             if silent {
                 sh.assign_var(&varname, ":".to_string());
                 sh.assign_var("OPTARG", opt_char.to_string());
             } else {
-                sh_eprintln!(sh, "bish: getopts: option requires an argument -- '{}'", opt_char);
+                sh_eprintln!(sh, "bish: option requires an argument -- {}", opt_char);
                 sh.assign_var(&varname, "?".to_string());
             }
-            sh.assign_var("OPTIND", (optind + 1).to_string());
+            step(sh, 1);
             return ExecResult::Status(0);
         }
+    } else if more_in_word {
+        stay(sh);
     } else {
-        sh.assign_var("OPTIND", (optind + 1).to_string());
+        step(sh, 1);
     }
     sh.assign_var(&varname, opt_char.to_string());
     ExecResult::Status(0)

@@ -1329,6 +1329,22 @@ type ArrayShadowStack<V> = Vec<Vec<(String, Option<V>, bool)>>;
 pub struct Shell {
     pub last_status: i32,
     pub(crate) functions: HashMap<String, parser::Command>,
+    /// How far into the current argument word `getopts` has read, or 0
+    /// before it has started one.
+    ///
+    /// `-ab` is two options in one word, and OPTIND names the word, so
+    /// the position within it has to live somewhere. bash keeps it out
+    /// of sight the same way; the only thing a script can do to it is
+    /// assign OPTIND, which resets it (see assign_var_impl).
+    pub(crate) getopts_offset: usize,
+    /// How many `.`/`source` calls are running right now.
+    ///
+    /// `return` is legal inside a sourced file as well as inside a
+    /// function, and it ends the *file*, not the shell -- a guard
+    /// clause at the top of a library is the usual reason. Without
+    /// this, `return` there refused to do anything, the rest of the
+    /// file ran, and the `.` reported 0.
+    pub(crate) source_depth: usize,
     // Stack of positional-parameter frames; last() is the current scope
     // ($0 is tracked separately since it's never shifted/reassigned by calls).
     pub(crate) arg_frames: Vec<Vec<String>>,
@@ -2039,6 +2055,8 @@ impl Shell {
         let mut shell = Shell {
             last_status: 0,
             functions: HashMap::new(),
+            getopts_offset: 0,
+            source_depth: 0,
             arg_frames: vec![Vec::new()],
             var_scopes: Vec::new(),
             script_name: "bish".to_string(),
@@ -2154,6 +2172,14 @@ impl Shell {
         // back to the default when unset, and still tells unset apart
         // from empty) -- what was missing was `$IFS` reading as anything.
         shell.assign_var("IFS", " \t\n".to_string());
+        // bash starts these at 1 and scripts read them: `getopts` is
+        // routinely wrapped in a function that saves and restores
+        // OPTIND, and `OPTIND=$saved` on an unset one used to restore
+        // nothing. bish had the right *default* inside `getopts` and
+        // never wrote it down, so `echo $OPTIND` before the first call
+        // printed an empty line where bash prints 1.
+        shell.assign_var("OPTIND", "1".to_string());
+        shell.assign_var("OPTERR", "1".to_string());
         // bash sets `PWD` at startup whether or not it inherited one,
         // and scripts read it far more often than they call `pwd`. bish
         // only ever had one when something upstream had exported it --
@@ -2376,6 +2402,8 @@ impl Shell {
         Shell {
             last_status: 0,
             functions: self.functions.clone(),
+            getopts_offset: 0,
+            source_depth: 0,
             // A subshell sees what the shell that made it sees: its
             // positional parameters, and whatever `local` is in scope.
             // Both used to start empty here, so `$(... "$1" ...)` was
@@ -7555,9 +7583,14 @@ impl Shell {
             }
             "return" => {
                 let code = argv.get(1).and_then(|s| s.parse::<i32>().ok()).unwrap_or(self.last_status);
-                if self.var_scopes.is_empty() {
-                    sh_eprintln!(self, "bish: return: can only 'return' from a function");
-                    return ExecResult::Status(code);
+                // A sourced file counts, and says so: bash's own
+                // wording names both places this is allowed. The status
+                // is 2 -- the usage error -- and not the argument,
+                // which `return 3` at top level was handing back as
+                // though it had worked.
+                if self.var_scopes.is_empty() && self.source_depth == 0 {
+                    sh_eprintln!(self, "bish: return: can only `return' from a function or sourced script");
+                    return ExecResult::Status(2);
                 }
                 return ExecResult::Return(code);
             }
@@ -8222,7 +8255,17 @@ impl Shell {
                             true => Some(std::mem::replace(self.arg_frames.last_mut().expect("a positional frame"), argv[2..].to_vec())),
                             false => None,
                         };
+                        self.source_depth += 1;
                         let result = self.run_source_here(&src, &path);
+                        self.source_depth -= 1;
+                        // `return` inside the file ends the file, and
+                        // its code is what the `.` reports. A `return`
+                        // inside a *function* defined here never gets
+                        // this far -- call_function catches its own.
+                        let result = match result {
+                            ExecResult::Return(code) => ExecResult::Status(code),
+                            other => other,
+                        };
                         if let Some(args) = outer_args
                             && let Some(frame) = self.arg_frames.last_mut()
                         {
@@ -9121,6 +9164,11 @@ impl Shell {
         // stage order, and with a stage running in this shell rather
         // than as a child the two orders stop being the same.
         let mut children: Vec<(usize, std::process::Child)> = Vec::with_capacity(n);
+        // Stages that never started, and the status they stand for. A
+        // pipeline is not over because one of its commands does not
+        // exist -- see the `spawn` failure arm below -- so these are
+        // folded into `codes` alongside the ones that really ran.
+        let mut never_started: Vec<(usize, i32)> = Vec::new();
         // The previous stage's read end, kept as a `ChildStdout` rather
         // than a `Stdio`: `lastpipe` needs its fd, and only ChildStdout
         // still has one.
@@ -9273,6 +9321,11 @@ impl Shell {
             };
             let mut default_stderr = bg_slave(&bg_pty).or_else(|| pane_slave(&pane_pty));
 
+            // What to call this stage if it will not start. Only a
+            // simple command has a name worth reporting; every other
+            // kind is re-exec'd as this shell, and a failure to spawn
+            // *that* is not a missing command.
+            let mut stage_name: Option<String> = None;
             let mut command = match cmd {
                 parser::Command::Simple(sc) => {
                     if sc.words.is_empty() {
@@ -9299,6 +9352,7 @@ impl Shell {
                     // argv as single-quoted literals so the child doesn't
                     // re-run any command substitution/glob/etc a second
                     // time.
+                    stage_name = Some(argv[0].clone());
                     let mut command = if self.is_active_builtin(&argv[0]) || self.functions.contains_key(&argv[0]) {
                         let exe = match std::env::current_exe() {
                             Ok(p) => p,
@@ -9318,13 +9372,43 @@ impl Shell {
                         command.args(&argv[1..]);
                         command
                     };
+                    let mut traced: Vec<String> = Vec::new();
                     for (k, mode, val) in &sc.assigns {
                         let v = self.expand_word(val);
                         let v = match mode {
                             AssignMode::Set => v,
                             AssignMode::Append => self.appended_value(k, &v),
                         };
+                        // Always `=`, and always the value that ends
+                        // up in the environment: bash traces a prefix
+                        // `p+=y` as `p=xy`, where a standalone `p+=y`
+                        // keeps its own operator. The two are different
+                        // things -- one is an assignment, the other is
+                        // part of a command -- and only the second is
+                        // reported as what the child will see.
+                        if self.opt_xtrace {
+                            traced.push(format!("{}={}", k, xtrace_quote(&v)));
+                        }
                         command.env(k, v);
+                    }
+                    // Traced here, because a pipeline stage never goes
+                    // through `run_simple` -- it is spawned straight
+                    // from this loop, so `set -x; echo a | cat` traced
+                    // only the `echo` and the trace stopped describing
+                    // the pipeline at the first `|`. A prefix
+                    // assignment gets its own line first, as it does
+                    // there. The stage that runs *in* this shell is
+                    // skipped above and traces itself when it runs,
+                    // which is later than bash traces it -- see the
+                    // `xtrace-traces-a-stage-running-in-this-shell-last`
+                    // divergence.
+                    if self.opt_xtrace {
+                        let ps4 = self.xtrace_prefix();
+                        for line in &traced {
+                            sh_eprintln!(self, "{}{}", ps4, line);
+                        }
+                        let words: Vec<String> = argv.iter().map(|w| xtrace_quote_word(w)).collect();
+                        sh_eprintln!(self, "{}{}", ps4, words.join(" "));
                     }
                     command.stdin(default_stdin);
                     command.stdout(default_stdout);
@@ -9406,9 +9490,26 @@ impl Shell {
                     children.push((i, child));
                 }
                 Err(e) => {
-                    sh_eprintln!(self, "bish: {}", e);
-                    kill_all(children);
-                    return 127;
+                    // A stage that will not start has *exited 127*; it
+                    // has not ended the pipeline. bash runs the rest --
+                    // `nosuchcmd | head -1` leaves `head` to read an
+                    // empty input and reports `(127 0)` with `$?` from
+                    // the last stage. Killing the others instead lost
+                    // all three answers at once: the message came out
+                    // as a raw `No such file or directory (os error
+                    // 2)`, `PIPESTATUS` was empty, and `$?` was 127
+                    // whichever stage had failed.
+                    let (msg, status) = match &stage_name {
+                        Some(name) => spawn_failure(name, &e),
+                        None => (format!("bish: {e}"), 127),
+                    };
+                    sh_eprintln!(self, "{}", msg);
+                    never_started.push((i, status));
+                    // Nothing will ever write to the next stage's
+                    // input, and that is exactly what it should see:
+                    // end of input, immediately.
+                    prev_stdout = None;
+                    continue;
                 }
             }
         }
@@ -9530,6 +9631,9 @@ impl Shell {
         // positional, and a stage that ran in this shell never went
         // through `children` at all.
         let mut codes: Vec<Option<i32>> = vec![None; n];
+        for (stage, status) in never_started {
+            codes[stage] = Some(status);
+        }
         for (stage, mut c) in children {
             // Drained while waiting rather than after: a stage that
             // fills the pty stops until something reads it, and the
@@ -11222,6 +11326,16 @@ impl Shell {
     }
 
     fn assign_var_impl(&mut self, name: &str, value: String, force_global: bool) -> bool {
+        // Assigning OPTIND puts `getopts` back at the start of a word,
+        // even when the value assigned is the one already there. bash
+        // resets on the assignment rather than on the value, so
+        // `OPTIND=1` restarts a scan that was halfway through `-ab`
+        // -- and there is nowhere else to notice that happening.
+        // `getopts` therefore records its own position *after* it
+        // assigns, never before. See run_getopts.
+        if name == "OPTIND" {
+            self.getopts_offset = 0;
+        }
         let resolved;
         let name = if self.nameref_names.contains(name) {
             resolved = self.resolve_nameref(name);
