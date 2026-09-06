@@ -617,7 +617,20 @@ mod tests {
     /// occasionally lose one and that says nothing about the editor.
     /// Not unbounded, because an editor that genuinely stopped
     /// answering would otherwise report nothing at all and pass.
-    const UNDRIVEABLE_TOLERANCE: usize = 3;
+    ///
+    /// It was 3, and 3 was a guess about how fast a machine is. On a
+    /// developer's own machine doing its own work -- load average
+    /// between 6 and 12, this suite taking 1850 seconds where it
+    /// normally takes 620 -- two consecutive runs lost 5 and 6, and
+    /// both were green when run again on a quiet one. A number that
+    /// turns "somebody else is compiling" into a failing suite is
+    /// noise, and noise is what a guard stops being read.
+    ///
+    /// Ten is still nowhere near the failure this exists to catch: an
+    /// editor that stopped answering loses all 156, and every
+    /// undriveable case is printed either way, so a run that was quietly
+    /// short of evidence still says so.
+    const UNDRIVEABLE_TOLERANCE: usize = 10;
 
     #[test]
     fn the_editor_agrees_with_vim() {

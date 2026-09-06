@@ -138,6 +138,31 @@ mod tests {
             "getopts-clustered-options",
             r#"set -- -ab v x; while getopts ab: o; do echo "[$o:$OPTARG] OPTIND=$OPTIND"; done; echo "end=$OPTIND rest=${!OPTIND}""#,
         ),
+        // `$_` is the last word of the command before, expanded --
+        // or that command's own name when it had no arguments. It was
+        // never set at all here, so every one of these was empty.
+        //
+        // Nothing pins its *initial* value, deliberately: bash sets it
+        // from argv[0] as invoked, and the two shells are invoked by
+        // different names, so a case reading it before anything has
+        // run would be comparing the harness rather than the shells.
+        case("underscore-is-the-last-argument", r#"true xyz; echo "[$_]""#),
+        case("underscore-is-the-name-when-there-are-no-arguments", r#"true; echo "[$_]"; :; echo "[$_]""#),
+        case("underscore-after-an-assignment-only-command", r#"true zz; x=1; echo "[$_]""#),
+        case("underscore-is-the-expanded-word", r#"v=q; true "$v"; touch zz1; true zz*; echo "[$_]""#),
+        // Set after the command, so what runs *inside* one still sees
+        // the value from before it: a function body sees its caller's,
+        // and the call itself sets `$_` only once it returns.
+        case("underscore-inside-a-function-is-the-callers", r#"f(){ echo "[$_]"; }; true zz; f arg"#),
+        case("underscore-after-a-function-is-the-calls-own", r#"f(){ true inner; }; true zz; f; echo "[$_]""#),
+        case("underscore-through-nested-functions", r#"g(){ true deep; }; f(){ g inner; echo "[$_]"; }; true zz; f arg"#),
+        case("underscore-after-a-compound", r#"if true zz; then :; fi; echo "[$_]"; for i in 1; do true loop; done; echo "[$_]""#),
+        // A pipeline stage and a subshell are not this shell, so
+        // neither touches its `$_`.
+        case("underscore-is-untouched-by-a-pipeline", r#"true zz; echo a | cat > /dev/null; true ww; echo "[$_]""#),
+        case("underscore-is-untouched-by-a-subshell", r#"true zz; ( true inner ); true ww; echo "[$_]""#),
+        case("underscore-inside-a-command-substitution", r#"x=$(true qq; echo "[$_]"); echo "$x""#),
+        case("underscore-survives-being-unset", r#"unset _; true zz; echo "[$_]""#),
         // Having *an* expression is not the same as having consumed
         // the input: the parser stopped at the first token it could
         // not use and returned what it had, so `$((1 2))` was 1 and
@@ -394,19 +419,6 @@ b
         case("unbounded-external-producer-into-a-shell-reader", r#"yes | { read v; echo "got=$v"; }"#),
         case("unbounded-producer-in-the-middle", r#"echo start | { while read l; do echo "$l"; done; } | head -1"#),
         case("reader-leaves-between-two-shell-stages", r#"while true; do echo x; done | { read a; echo "$a"; } | head -1"#),
-        // How *far* the producer got, which is the part a timeout only
-        // notices when the machine is loaded. Two stages share one
-        // thread, and a stage gives it up when it blocks -- so a
-        // producer whose reader is keeping up never blocked, and ran
-        // 32768 times, until the pipe buffer filled, before the reader
-        // took its first turn. Exactly 32768: a 64KB buffer and two
-        // bytes a line. The count is what makes this a guard rather
-        // than a race -- separate processes get fairness from the
-        // kernel, and this asks for the same bound.
-        case(
-            "a-producer-does-not-run-away-from-its-reader",
-            r#"while true; do echo x; echo p >> prod.log; done | { read a; echo "got=$a"; }; n=$(wc -l < prod.log); if [ "$n" -lt 200 ]; then echo bounded; else echo "runaway=$n"; fi"#,
-        ),
         case("both-sides-bounded-but-uneven", r#"seq 1 10000 | { read v; echo "got=$v"; }"#),
         case("subshell-scope", r#"x=1; (x=2); echo $x"#),
         case("subshell-exit", r#"(exit 4); echo $?"#),
@@ -1290,11 +1302,23 @@ y
     // result depends on which other tests happened to run first --
     // which showed up as every glob case failing, from a leaked
     // GLOBIGNORE, in whole-suite runs only.
-    // Five seconds, then killed. A case that deadlocks -- and the
-    // divergence list has one, a coproc whose descriptors go nowhere --
-    // would otherwise wedge the whole test run rather than reporting a
-    // difference.
-    const CASE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+    // Then killed. A case that deadlocks -- and the divergence list has
+    // one, a coproc whose descriptors go nowhere -- would otherwise
+    // wedge the whole test run rather than reporting a difference.
+    //
+    // Twenty seconds, and it was five. Five is a guess about how fast a
+    // machine is, and on a developer's own machine doing its own work
+    // -- load average around 8, this suite taking 1450 seconds where it
+    // normally takes 620 -- *bash* failed to get through
+    // `two-shell-stages-outlast-the-pipe-buffer` in time, and the
+    // corpus duly reported a difference between two shells that had
+    // both simply been stopped. A timeout is for catching a deadlock,
+    // not for measuring throughput, so it should be far longer than any
+    // case needs rather than close to it.
+    //
+    // The cost is paid only by cases that really do hang: one, four
+    // times over (two corpora, two shells), so fifteen seconds each.
+    const CASE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
     fn run(shell: &std::ffi::OsStr, script: &str, dir: &std::path::Path) -> Outcome {
         run_with(shell, &[], script, dir)
@@ -1836,6 +1860,39 @@ y
         }
         let unlisted: Vec<&str> = differing.iter().filter(|n| !DIVERGENCES.iter().any(|(d, _)| d == *n)).copied().collect();
         assert!(unlisted.is_empty(), "differing but not listed: {unlisted:?}");
+    }
+
+    /// How far a producer gets before its reader is given a turn.
+    ///
+    /// Not differential, and it used to be. Two stages of a pipeline
+    /// share one thread here, and a stage gives it up when it blocks --
+    /// so a producer whose reader was keeping up never blocked, and ran
+    /// 32768 times before the reader took its first turn. Exactly
+    /// 32768: a 64KB pipe buffer and two bytes a line.
+    ///
+    /// Comparing that count against bash asks the kernel a question
+    /// rather than the shell. bash forks its stages, so how far its
+    /// producer gets is scheduling: measured on an idle machine it
+    /// ranges from 1 to 93, and on a loaded one it reached 256 and
+    /// failed a case whose threshold was 200. bish is 1, every time,
+    /// because its scheduler decides rather than the kernel.
+    ///
+    /// So the bound is asserted directly. Generously -- what is being
+    /// guarded against is four orders of magnitude away, and the point
+    /// is to notice a producer running away again, not to pin a number
+    /// nobody chose.
+    #[test]
+    fn a_producer_does_not_run_away_from_its_reader() {
+        let Some(bish) = bish_binary() else { return };
+        let dir = std::env::temp_dir().join(format!("bish-runaway-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = r#"while true; do echo x; echo p >> prod.log; done | { read a; echo "got=$a"; }; wc -l < prod.log"#;
+        let out = run(bish.as_os_str(), script, &dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        let lines: Vec<&str> = out.text.lines().collect();
+        assert_eq!(lines.first().copied(), Some("got=x"), "the reader never ran: {:?}", out.text);
+        let produced: usize = lines.last().and_then(|n| n.trim().parse().ok()).unwrap_or_else(|| panic!("no count in {:?}", out.text));
+        assert!(produced < 1000, "the producer ran {produced} times before its reader had a turn");
     }
 
     // Also not differential -- bash has no equivalent. A recursion that
