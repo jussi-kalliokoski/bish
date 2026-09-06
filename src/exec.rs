@@ -1345,6 +1345,14 @@ pub struct Shell {
     /// this, `return` there refused to do anything, the rest of the
     /// file ran, and the `.` reported 0.
     pub(crate) source_depth: usize,
+    /// What `$_` becomes once the command currently running finishes.
+    ///
+    /// A stack, because a command can contain commands: `f arg` records
+    /// `arg`, its body's commands record their own on top, and each is
+    /// taken back off by the same place that put it there. Without the
+    /// nesting, a function's body would decide its caller's `$_` --
+    /// bash's is the last argument of the call, whatever the body did.
+    pub(crate) underscore_pending: Vec<String>,
     // Stack of positional-parameter frames; last() is the current scope
     // ($0 is tracked separately since it's never shifted/reassigned by calls).
     pub(crate) arg_frames: Vec<Vec<String>>,
@@ -2057,6 +2065,7 @@ impl Shell {
             functions: HashMap::new(),
             getopts_offset: 0,
             source_depth: 0,
+            underscore_pending: Vec::new(),
             arg_frames: vec![Vec::new()],
             var_scopes: Vec::new(),
             script_name: "bish".to_string(),
@@ -2178,6 +2187,14 @@ impl Shell {
         // nothing. bish had the right *default* inside `getopts` and
         // never wrote it down, so `echo $OPTIND` before the first call
         // printed an empty line where bash prints 1.
+        // `$_` before anything has run is argv[0] exactly as this
+        // shell was invoked -- bash's own rule, and the reason its
+        // value is `bash` when started by name and `/usr/bin/bash`
+        // when started by path. Nothing in the corpus can compare it
+        // for that reason: the two shells are invoked differently.
+        if let Some(argv0) = std::env::args().next() {
+            shell.assign_var("_", argv0);
+        }
         shell.assign_var("OPTIND", "1".to_string());
         shell.assign_var("OPTERR", "1".to_string());
         // bash sets `PWD` at startup whether or not it inherited one,
@@ -2404,6 +2421,7 @@ impl Shell {
             functions: self.functions.clone(),
             getopts_offset: 0,
             source_depth: 0,
+            underscore_pending: Vec::new(),
             // A subshell sees what the shell that made it sees: its
             // positional parameters, and whatever `local` is in scope.
             // Both used to start empty here, so `$(... "$1" ...)` was
@@ -4713,7 +4731,19 @@ impl Shell {
     // run_compound_redirected right back into itself, forever.
     pub(crate) fn run_command_body(&mut self, cmd: &parser::Command, background: bool) -> ExecResult {
         match cmd {
-            parser::Command::Simple(sc) => self.run_single(sc, background),
+            parser::Command::Simple(sc) => {
+                let depth = self.underscore_pending.len();
+                let result = self.run_single(sc, background);
+                // Anything the body of this command pushed has already
+                // been taken back off by its own turn through here, so
+                // whatever sits at `depth` is this command's own.
+                if self.underscore_pending.len() > depth {
+                    let value = self.underscore_pending[depth].clone();
+                    self.underscore_pending.truncate(depth);
+                    self.assign_var("_", value);
+                }
+                result
+            }
             parser::Command::If { branches, else_branch, .. } => self.run_if(branches, else_branch),
             parser::Command::While { cond, body, until, .. } => self.run_while(cond, body, *until),
             parser::Command::For { var, words, body, .. } => {
@@ -6787,6 +6817,10 @@ impl Shell {
                 })
                 .collect();
             self.bash_command = named.join(" ");
+            // An assignment-only command has no last word, and bash
+            // duly empties `$_` rather than leaving the previous one:
+            // `x=1; echo "$_"` prints nothing.
+            self.underscore_pending.push(String::new());
             // DEBUG, before the command rather than after: the whole
             // use of it is to see what is about to run.
             self.run_pseudo_trap(PseudoTrap::Debug);
@@ -6945,6 +6979,12 @@ impl Shell {
         if let Some(exit) = self.take_pending_exit() {
             return exit;
         }
+        // What `$_` will be *after* this command, which is the last
+        // word of it as expanded -- or its own name when it has no
+        // arguments, which falls out of `last()` for free. Recorded
+        // rather than assigned: the command has not run yet, and
+        // everything inside it must still see the previous value.
+        self.underscore_pending.push(argv.last().cloned().unwrap_or_default());
         // Named before it runs, so a DEBUG trap sees the command it is
         // firing for and an ERR trap sees the one that failed.
         self.bash_command = argv.join(" ");
