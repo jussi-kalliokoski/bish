@@ -1114,6 +1114,13 @@ y
     // the binary too, so it is there and current -- but the test skips
     // rather than fails if it is not, the same as when there is no
     // bash.
+    /// The built shell, which is what this corpus actually measures.
+    ///
+    /// Kept current by a file that does nothing else -- see
+    /// `tests/the_binary_under_test_is_the_one_just_built.rs`. Without
+    /// it `cargo test` leaves this binary at whatever `cargo build`
+    /// last made, and a corpus can pass against a shell that no longer
+    /// exists.
     fn bish_binary() -> Option<PathBuf> {
         let exe = std::env::current_exe().ok()?;
         let path = exe.parent()?.parent()?.join("bish");

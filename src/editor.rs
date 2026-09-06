@@ -3966,6 +3966,10 @@ mod tests {
     fn at_a_prompt(sends: &[&str]) -> Option<Vec<String>> {
         use std::io::{Read, Write};
         let exe = std::env::current_exe().ok()?;
+        // Current, rather than whatever `cargo build` last left here
+        // -- see `tests/the_binary_under_test_is_the_one_just_built.rs`,
+        // which exists because this test passed with its own fix
+        // disabled until that file did.
         let bish = exe.parent()?.parent()?.join("bish");
         if !bish.exists() {
             return None;
