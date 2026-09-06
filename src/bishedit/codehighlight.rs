@@ -535,6 +535,205 @@ fn template(s: &mut Scan) {
     }
 }
 
+// --- yaml --------------------------------------------------------------
+//
+// Line-oriented, because YAML is: what a line means is decided by its
+// indentation and its first non-space character, not by anything
+// carried over from the line before -- with one exception, a block
+// scalar, whose body is everything indented past the line that opened
+// it.
+//
+// The flow forms (`{a: 1}`, `[1, 2]`) are read the same way as the
+// block forms rather than being parsed as nested structure. At token
+// level that is the same answer: a key is a word before a colon either
+// way.
+
+/// The words YAML gives a meaning of their own. Case-insensitive
+/// because 1.1 said so and files in the wild still use `True` and `NO`.
+const YAML_CONSTANTS: &[&str] = &["true", "false", "yes", "no", "on", "off", "null", "~"];
+
+pub fn yaml(text: &str) -> Spans {
+    let mut out: Spans = Vec::new();
+    let mut at = 0usize;
+    // Set by `|` or `>` at the end of a line: everything indented
+    // further than the line that opened it is that scalar's text, and
+    // nothing in it is YAML at all -- a `#` in a shell script inside a
+    // CI file is not a comment about the CI file.
+    let mut block: Option<usize> = None;
+    for line in text.split_inclusive('\n') {
+        let end = at + line.trim_end_matches('\n').len();
+        let indent = line.len() - line.trim_start().len();
+        let trimmed = line.trim();
+
+        if let Some(opened_at) = block {
+            if trimmed.is_empty() || indent > opened_at {
+                // One span per line rather than one for the block, so
+                // that a line-at-a-time renderer sees it.
+                if !trimmed.is_empty() {
+                    out.push((at + indent..end, HighlightKind::String));
+                }
+                at += line.len();
+                continue;
+            }
+            block = None;
+        }
+
+        if trimmed.is_empty() {
+            at += line.len();
+            continue;
+        }
+        // A document marker is the whole line and nothing else.
+        if trimmed == "---" || trimmed == "..." {
+            out.push((at + indent..end, HighlightKind::Keyword));
+            at += line.len();
+            continue;
+        }
+        yaml_line(text, at + indent, end, &mut out, &mut block, indent);
+        at += line.len();
+    }
+    out
+}
+
+/// One line's worth, from its first non-space character to its end.
+fn yaml_line(text: &str, start: usize, end: usize, out: &mut Spans, block: &mut Option<usize>, indent: usize) {
+    let bytes = text.as_bytes();
+    let mut i = start;
+
+    // A sequence dash is punctuation, and what follows it is a fresh
+    // line as far as everything below is concerned.
+    while i < end && bytes[i] == b'-' && (i + 1 >= end || bytes[i + 1] == b' ') {
+        out.push((i..i + 1, HighlightKind::Operator));
+        i += 2;
+        i = i.min(end);
+        while i < end && bytes[i] == b' ' {
+            i += 1;
+        }
+    }
+
+    // A comment is only a comment at the start of a token, which after
+    // the dashes above means here.
+    if i < end && bytes[i] == b'#' {
+        out.push((i..end, HighlightKind::Comment));
+        return;
+    }
+
+    // The key, if this line has one: everything up to a `:` that is
+    // followed by a space or ends the line. A colon inside a quoted key
+    // does not count, which is the whole reason this scans rather than
+    // splitting on ':'.
+    if let Some(colon) = yaml_key_end(bytes, i, end) {
+        out.push((i..colon, HighlightKind::Key));
+        out.push((colon..colon + 1, HighlightKind::Operator));
+        i = (colon + 1).min(end);
+        while i < end && bytes[i] == b' ' {
+            i += 1;
+        }
+    }
+
+    if i >= end {
+        return;
+    }
+    // What is left is the value.
+    match bytes[i] {
+        b'#' => out.push((i..end, HighlightKind::Comment)),
+        b'|' | b'>' => {
+            out.push((i..end, HighlightKind::Operator));
+            *block = Some(indent);
+        }
+        b'&' | b'*' | b'!' => {
+            let mut j = i + 1;
+            while j < end && !bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            out.push((i..j, HighlightKind::Variable));
+            yaml_value(text, j, end, out);
+        }
+        _ => yaml_value(text, i, end, out),
+    }
+}
+
+/// Where this line's key ends, if it has one. `None` for a line that is
+/// a bare value.
+fn yaml_key_end(bytes: &[u8], from: usize, end: usize) -> Option<usize> {
+    let mut i = from;
+    let mut quote = None;
+    while i < end {
+        match bytes[i] {
+            q @ (b'"' | b'\'') if quote.is_none() => quote = Some(q),
+            q if Some(q) == quote => quote = None,
+            b':' if quote.is_none() && (i + 1 >= end || bytes[i + 1] == b' ') => return Some(i),
+            // A comment cannot be inside a key, so anything from here on
+            // is not one.
+            b'#' if quote.is_none() && i > from && bytes[i - 1] == b' ' => return None,
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// The rest of a line after its key: a scalar, and possibly a trailing
+/// comment.
+fn yaml_value(text: &str, from: usize, end: usize, out: &mut Spans) {
+    let bytes = text.as_bytes();
+    let mut i = from;
+    while i < end {
+        match bytes[i] {
+            b'#' if i > from && bytes[i - 1] == b' ' => {
+                out.push((i..end, HighlightKind::Comment));
+                return;
+            }
+            q @ (b'"' | b'\'') => {
+                let start = i;
+                i += 1;
+                while i < end {
+                    if bytes[i] == b'\\' && q == b'"' {
+                        i += 2;
+                        continue;
+                    }
+                    if bytes[i] == q {
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+                out.push((start..i.min(end), HighlightKind::String));
+            }
+            c if c.is_ascii_digit() || (c == b'-' && bytes.get(i + 1).is_some_and(u8::is_ascii_digit)) => {
+                let start = i;
+                i += 1;
+                while i < end && (bytes[i].is_ascii_alphanumeric() || matches!(bytes[i], b'.' | b'_' | b'-' | b'+')) {
+                    i += 1;
+                }
+                let word = &text[start..i];
+                // A date is not a number, and neither is `1.2.3`. Both
+                // are plain scalars, which get no colour.
+                if word.chars().all(|c| c.is_ascii_digit() || matches!(c, '.' | '-' | '+' | 'e' | 'E' | 'x' | 'b' | 'o'))
+                    && word.matches('.').count() <= 1
+                    && word.matches('-').count() <= 1
+                {
+                    out.push((start..i, HighlightKind::Number));
+                }
+            }
+            c if c.is_ascii_alphabetic() || c == b'~' => {
+                let start = i;
+                while i < end && !bytes[i].is_ascii_whitespace() && bytes[i] != b',' && bytes[i] != b'}' && bytes[i] != b']' {
+                    i += 1;
+                }
+                if YAML_CONSTANTS.contains(&text[start..i].to_ascii_lowercase().as_str()) {
+                    out.push((start..i, HighlightKind::Keyword));
+                }
+            }
+            _ => i += 1,
+        }
+        if bytes.get(i).is_some_and(|c| c.is_ascii_whitespace() || *c == b',') {
+            i += 1;
+        } else if i <= from {
+            i = from + 1;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -665,12 +864,70 @@ mod tests {
         assert!(longest < text.len() / 4, "one span covers {longest} of {} bytes", text.len());
     }
 
+    #[test]
+    fn yaml_keys_values_and_comments() {
+        let text = "# top\nname: bish   # trailing\ncount: 3\nok: true\n";
+        let spans = painted(text, yaml(text));
+        assert!(spans.contains(&("# top".to_string(), HighlightKind::Comment)), "{spans:?}");
+        assert!(spans.contains(&("name".to_string(), HighlightKind::Key)), "{spans:?}");
+        assert!(spans.contains(&("# trailing".to_string(), HighlightKind::Comment)), "{spans:?}");
+        assert!(spans.contains(&("3".to_string(), HighlightKind::Number)), "{spans:?}");
+        assert!(spans.contains(&("true".to_string(), HighlightKind::Keyword)), "{spans:?}");
+    }
+
+    // The case that makes a CI file readable rather than misleading: a
+    // block scalar's body is text, and a `#` in a shell script inside
+    // one is a comment about the script, not about the YAML.
+    #[test]
+    fn a_block_scalar_is_text_and_not_yaml() {
+        let text = "run: |\n  # not a yaml comment\n  echo hi: there\nnext: 1\n";
+        let spans = painted(text, yaml(text));
+        assert!(spans.contains(&("# not a yaml comment".to_string(), HighlightKind::String)), "{spans:?}");
+        assert!(!spans.iter().any(|(t, k)| *k == HighlightKind::Key && t == "echo hi"), "{spans:?}");
+        assert!(spans.contains(&("next".to_string(), HighlightKind::Key)), "the block ended with the indentation: {spans:?}");
+    }
+
+    #[test]
+    fn a_yaml_sequence_dash_is_not_part_of_the_key() {
+        let text = "steps:\n  - uses: actions/checkout\n  - run: make\n";
+        let spans = painted(text, yaml(text));
+        assert!(spans.contains(&("uses".to_string(), HighlightKind::Key)), "{spans:?}");
+        assert!(spans.contains(&("run".to_string(), HighlightKind::Key)), "{spans:?}");
+    }
+
+    #[test]
+    fn a_colon_inside_a_quoted_yaml_string_is_not_a_key() {
+        let text = "a: \"x: y\"\n";
+        let spans = painted(text, yaml(text));
+        assert!(spans.contains(&("a".to_string(), HighlightKind::Key)), "{spans:?}");
+        assert!(spans.contains(&("\"x: y\"".to_string(), HighlightKind::String)), "{spans:?}");
+    }
+
+    #[test]
+    fn yaml_anchors_and_document_markers() {
+        let text = "---\nbase: &defaults\n  a: 1\nuse: *defaults\n";
+        let spans = painted(text, yaml(text));
+        assert!(spans.contains(&("---".to_string(), HighlightKind::Keyword)), "{spans:?}");
+        assert!(spans.contains(&("&defaults".to_string(), HighlightKind::Variable)), "{spans:?}");
+        assert!(spans.contains(&("*defaults".to_string(), HighlightKind::Variable)), "{spans:?}");
+    }
+
+    // Dates and versions are plain scalars. Painting `1.2.3` as a
+    // number would be saying something about it that is not true.
+    #[test]
+    fn a_version_is_not_a_number() {
+        let text = "version: 1.2.3\nwhen: 2026-09-07\nport: 8080\n";
+        let spans = painted(text, yaml(text));
+        assert!(spans.contains(&("8080".to_string(), HighlightKind::Number)), "{spans:?}");
+        assert!(!spans.iter().any(|(t, k)| *k == HighlightKind::Number && (t == "1.2.3" || t.contains('-'))), "{spans:?}");
+    }
+
     // Every scanner has to make progress on every byte it sees, or a
     // buffer with the wrong character in it hangs the editor.
     #[test]
     fn every_scanner_terminates_on_arbitrary_bytes() {
         let text = "a\u{e9}'\"`#@${}/*//\\0 1.2e-3 0x_ r#\" \u{1f600}";
-        for scan in [rust, python, javascript, typescript] {
+        for scan in [rust, python, javascript, typescript, yaml] {
             let spans = scan(text);
             assert!(spans.iter().all(|(r, _)| r.start <= r.end && r.end <= text.len()));
         }
