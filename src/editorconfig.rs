@@ -63,7 +63,9 @@ pub struct Properties {
     pub indent_size: Option<IndentSize>,
     pub tab_width: Option<usize>,
     pub end_of_line: Option<Eol>,
-    /// Parsed and deliberately never applied -- see `for_file`.
+    /// The name as written, not a parsed encoding: `utf-8-bom` and
+    /// `utf-8` are one encoding and two charsets, and the difference
+    /// between them lives in the spelling. See `encoding::parse`.
     pub charset: Option<String>,
     pub trim_trailing_whitespace: Option<bool>,
     pub insert_final_newline: Option<bool>,
@@ -100,11 +102,11 @@ impl Properties {
 /// inwards so a deeper file wins. Within a file, every matching section
 /// applies in order, so a later one wins too.
 ///
-/// `charset` is read but never acted on anywhere: bish reads files as
-/// UTF-8 (`std::fs::read_to_string`), and latin-1 or UTF-16 would need
-/// real decoding, a BOM concept and an encoding to write back with.
-/// Refusing it outright is the honest answer -- half-supporting an
-/// encoding is how a file gets silently mangled on save.
+/// `charset` is applied, and names an encoding from `encoding.rs`. A
+/// name that module cannot honour -- `shift_jis`, say -- leaves the
+/// buffer with the encoding its own bytes were read as, so the file is
+/// still written back exactly as it came: not the conversion asked
+/// for, but not a mangling either.
 pub fn for_file(path: &Path) -> Properties {
     let mut files = Vec::new();
     let mut dir = path.parent();

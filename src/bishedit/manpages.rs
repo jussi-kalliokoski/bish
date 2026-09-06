@@ -219,9 +219,11 @@ const MAX_PAGE_BYTES: usize = 8 * 1024 * 1024;
 fn read_text(path: &std::path::Path) -> Option<String> {
     if path.extension().is_some_and(|e| e == "gz") {
         let (_, bytes) = crate::archive::gunzip_within(path, MAX_PAGE_BYTES).ok()?;
-        return Some(String::from_utf8_lossy(&bytes).into_owned());
+        return Some(crate::encoding::decode(&bytes).text);
     }
-    std::fs::read_to_string(path).ok()
+    // Manual pages are older than UTF-8 and plenty of them are still
+    // latin-1; one that is should render, not vanish.
+    Some(crate::encoding::decode(&std::fs::read(path).ok()?).text)
 }
 
 // Everything this module wants out of a parsed page. Public so the

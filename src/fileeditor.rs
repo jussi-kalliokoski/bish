@@ -3731,7 +3731,10 @@ pub(crate) fn toggle_git_blame(buf: &mut TextBuffer, rev: Option<&str>) -> Resul
     // `git show` would return.
     let old = match rev {
         Some(rev) => crate::git::file_at_rev(&path, Some(rev))?.unwrap_or_default(),
-        None => std::fs::read_to_string(&path).map_err(|e| format!("{}: {}", path.display(), e))?,
+        None => {
+            let bytes = std::fs::read(&path).map_err(|e| format!("{}: {}", path.display(), e))?;
+            crate::encoding::decode(&bytes).text
+        }
     };
     let blamed = crate::git::blame(&path, rev)?;
     let old_lines: Vec<&str> = old.lines().collect();
@@ -3784,7 +3787,10 @@ pub(crate) fn toggle_buffer_diff(buf: &mut TextBuffer) -> Result<bool, String> {
         return Ok(false);
     }
     let path = buf.path().ok_or_else(|| "no file name".to_string())?;
-    let on_disk = std::fs::read_to_string(path).map_err(|e| format!("{}: {}", path.display(), e))?;
+    // Decoded the same way the buffer itself was, so a latin-1 file
+    // diffs against its own text rather than failing on the first byte
+    // that is not UTF-8.
+    let on_disk = crate::encoding::decode(&std::fs::read(path).map_err(|e| format!("{}: {}", path.display(), e))?).text;
     let disk_lines: Vec<&str> = on_disk.lines().collect();
     let current = buf.text();
     let current_lines: Vec<&str> = current.lines().collect();

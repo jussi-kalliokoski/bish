@@ -216,6 +216,16 @@ pub struct TextBuffer {
     /// The line ending this file is written back with. Detected on load,
     /// so opening and saving a CRLF file leaves it a CRLF file.
     pub eol: crate::editorconfig::Eol,
+    /// What this file's bytes are written back as, detected on load for
+    /// the same reason `eol` is: a latin-1 file that came back as UTF-8
+    /// would be every accented character in it changed by an editor
+    /// that was only asked to change one line.
+    pub encoding: crate::encoding::Encoding,
+    /// Whether the file began with a byte-order mark, kept apart from
+    /// `encoding` because a UTF-8 file with one and a UTF-8 file
+    /// without one are the same encoding and different files -- and
+    /// adding or dropping one is a change to every tool that reads it.
+    pub bom: bool,
     // Which visual row of `vtop`'s own line the viewport starts at. Only
     // ever non-zero with wrapping on, and only for a line tall enough to
     // exceed the pane by itself -- without it, a minified file would
@@ -320,6 +330,8 @@ impl TextBuffer {
             final_newline: true,
             empty: false,
             eol: crate::editorconfig::Eol::Lf,
+            encoding: crate::encoding::Encoding::Utf8,
+            bom: false,
             vtop_sub: 0,
             snippet_holes: Vec::new(),
             ignorecase: false,
@@ -348,12 +360,19 @@ impl TextBuffer {
     // vim's own ":e newfile" behavior (the file is created on first
     // `:w`, not on open).
     pub fn open(path: &Path, vheight: usize) -> io::Result<TextBuffer> {
-        let text = match std::fs::read_to_string(path) {
-            Ok(text) => text,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
+        // Bytes, not a `String`: what encoding those bytes are in is
+        // this file's own property and is worked out from them, so a
+        // latin-1 file opens as text rather than as an error nobody can
+        // get past. See encoding.rs.
+        let bytes = match std::fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Vec::new(),
             Err(e) => return Err(e),
         };
-        let mut buf = TextBuffer::from_text(path, &text, vheight);
+        let decoded = crate::encoding::decode(&bytes);
+        let mut buf = TextBuffer::from_text(path, &decoded.text, vheight);
+        buf.encoding = decoded.encoding;
+        buf.bom = decoded.bom;
         buf.disk_hash = disk_hash(path);
         Ok(buf)
     }
@@ -382,11 +401,13 @@ impl TextBuffer {
     /// it -- `:e!`. The cursor is kept where it was, clamped.
     pub fn reload(&mut self) -> io::Result<()> {
         let path = self.path.clone().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "No file name"))?;
-        let text = std::fs::read_to_string(&path)?;
+        let decoded = crate::encoding::decode(&std::fs::read(&path)?);
         let (row, col) = self.cursor;
-        let fresh = TextBuffer::from_text(&path, &text, self.vheight);
+        let fresh = TextBuffer::from_text(&path, &decoded.text, self.vheight);
         self.lines = fresh.lines;
         self.eol = fresh.eol;
+        self.encoding = decoded.encoding;
+        self.bom = decoded.bom;
         self.disk_hash = disk_hash(&path);
         self.dirty = false;
         self.saved_node = self.undo.current_id();
@@ -451,6 +472,8 @@ impl TextBuffer {
             cursorshape: true,
             mouse: true,
             eol,
+            encoding: crate::encoding::Encoding::Utf8,
+            bom: false,
             final_newline,
             empty: normalized.is_empty(),
             expandtab: true,
@@ -660,7 +683,12 @@ impl TextBuffer {
         if self.readonly && Some(target) == self.path.as_deref() {
             return Err(io::Error::new(io::ErrorKind::PermissionDenied, "buffer is read-only"));
         }
-        std::fs::write(target, self.on_disk_text())?;
+        // Encoded before anything is written, so a character this
+        // file's encoding has no room for leaves the file on disk
+        // exactly as it was rather than half-replaced.
+        let bytes = crate::encoding::encode(&self.on_disk_text(), self.encoding, self.bom)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        std::fs::write(target, bytes)?;
         if self.path.is_none() {
             self.path = Some(target.to_path_buf());
         }
@@ -1116,6 +1144,8 @@ mod tests {
             final_newline: true,
             empty: false,
             eol: crate::editorconfig::Eol::Lf,
+            encoding: crate::encoding::Encoding::Utf8,
+            bom: false,
             vtop_sub: 0,
             snippet_holes: Vec::new(),
             ignorecase: false,
@@ -1387,6 +1417,84 @@ mod tests {
         buf.checkpoint_undo();
         assert!(buf.undo(), "nothing to undo -- the checkpoint above didn't take");
         assert!(buf.version() > after_delete);
+    }
+
+    // A file's encoding is its own, and an editor asked to change one
+    // line must not change every accented character in it as well.
+    // `caf\xe9` is latin-1, is not valid UTF-8, and used to make
+    // `TextBuffer::open` fail outright.
+    #[test]
+    fn a_latin1_file_opens_as_text_and_saves_as_latin1() {
+        let dir = std::env::temp_dir().join(format!("bish-encoding-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("latin1.txt");
+        std::fs::write(&path, b"caf\xe9\nna\xefve\n").unwrap();
+
+        let mut buf = TextBuffer::open(&path, 10).unwrap();
+        assert_eq!(text_of(&buf), "café\nnaïve");
+        assert_eq!(buf.encoding, crate::encoding::Encoding::Latin1);
+
+        buf.insert_text((0, 4), "s");
+        buf.save(None).unwrap();
+        let saved = std::fs::read(&path).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(saved, b"caf\xe9s\nna\xefve\n", "still latin-1, and only the edit changed");
+    }
+
+    // The save fails and the file is left as it was -- not written with
+    // a `?` where the character should be. Half a file is worse than no
+    // save, because the save is the part you can retry.
+    #[test]
+    fn a_character_the_files_encoding_cannot_hold_fails_the_save() {
+        let dir = std::env::temp_dir().join(format!("bish-encoding-refuse-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("latin1.txt");
+        std::fs::write(&path, b"caf\xe9\n").unwrap();
+
+        let mut buf = TextBuffer::open(&path, 10).unwrap();
+        buf.insert_text((0, 4), "\u{2014}");
+        let err = buf.save(None).unwrap_err();
+        let on_disk = std::fs::read(&path).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(err.to_string().contains("U+2014"), "the message names the character: {err}");
+        assert_eq!(on_disk, b"caf\xe9\n", "the file is exactly as it was");
+    }
+
+    #[test]
+    fn a_utf16_file_keeps_its_encoding_and_its_mark() {
+        let dir = std::env::temp_dir().join(format!("bish-encoding-utf16-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("wide.txt");
+        std::fs::write(&path, b"\xff\xfeh\x00i\x00\n\x00").unwrap();
+
+        let mut buf = TextBuffer::open(&path, 10).unwrap();
+        assert_eq!(text_of(&buf), "hi");
+        assert_eq!(buf.encoding, crate::encoding::Encoding::Utf16Le);
+        buf.insert_text((0, 2), "!");
+        buf.save(None).unwrap();
+        let saved = std::fs::read(&path).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(saved, b"\xff\xfeh\x00i\x00!\x00\n\x00");
+    }
+
+    // A BOM is not a character in the file, and it is not something an
+    // editor gets to drop either: whatever reads the file next may be
+    // looking for it.
+    #[test]
+    fn a_utf8_bom_survives_a_save_without_becoming_text() {
+        let dir = std::env::temp_dir().join(format!("bish-encoding-bom-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("bom.txt");
+        std::fs::write(&path, b"\xef\xbb\xbfone\n").unwrap();
+
+        let mut buf = TextBuffer::open(&path, 10).unwrap();
+        assert_eq!(text_of(&buf), "one");
+        assert!(buf.bom);
+        buf.insert_text((0, 3), "!");
+        buf.save(None).unwrap();
+        let saved = std::fs::read(&path).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(saved, b"\xef\xbb\xbfone!\n");
     }
 
     #[test]

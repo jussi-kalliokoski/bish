@@ -33,13 +33,23 @@ mod tests {
 
     struct Case {
         name: &'static str,
-        /// What the file holds before the keys are sent.
-        before: &'static str,
+        /// The file's own bytes before the keys are sent. Bytes rather
+        /// than text because what an editor does with a file that is
+        /// not UTF-8 is one of the things this corpus is here to
+        /// measure -- see `case_raw`.
+        before: &'static [u8],
         /// Sent one character at a time, in order.
         keys: &'static str,
     }
 
     const fn case(name: &'static str, before: &'static str, keys: &'static str) -> Case {
+        Case { name, before: before.as_bytes(), keys }
+    }
+
+    /// A case whose file cannot be written as Rust source text: a
+    /// latin-1 byte, a byte-order mark, anything an editor has to work
+    /// out rather than read.
+    const fn case_raw(name: &'static str, before: &'static [u8], keys: &'static str) -> Case {
         Case { name, before, keys }
     }
 
@@ -231,6 +241,19 @@ mod tests {
         case("gu-upper-a-word", "abc\n", "gUiw"),
         case("g-tilde-a-line", "aBc\n", "g~~"),
         case("visual-paste-over", "ab\ncd\n", "yyjVp"),
+        // -- encodings -------------------------------------------------
+        // A file that is not UTF-8 is still a file. These used to be
+        // unopenable here: `TextBuffer::open` was `read_to_string`, so
+        // the editor's answer to a latin-1 file was an error message.
+        // Now the question is the one that matters -- whether editing
+        // one line of it leaves the other bytes alone.
+        case_raw("latin1-file-keeps-its-bytes", b"caf\xe9\nna\xefve\n", "jx"),
+        case_raw("latin1-file-edited-on-the-accented-line", b"caf\xe9\n", "$x"),
+        // A byte-order mark is not a character in the file and not
+        // something an editor gets to drop: whatever reads the file
+        // next may be looking for it.
+        case_raw("utf8-bom-survives-an-edit", b"\xef\xbb\xbfone\ntwo\n", "jx"),
+        case_raw("utf16-file-keeps-its-encoding", b"\xff\xfeo\x00n\x00e\x00\n\x00t\x00w\x00o\x00\n\x00", "jx"),
     ];
 
     // Cases bish does not match today, each with why. Asserted to
@@ -280,6 +303,20 @@ mod tests {
     /// `None` when the editor never answered the handshake, which is a
     /// failure of this harness rather than a difference between the two
     /// editors -- see the call site.
+    /// A file's bytes, as something a failure message can print. Valid
+    /// UTF-8 prints as itself; anything else prints as escaped bytes
+    /// behind a marker, so a file of text and a file of bytes never
+    /// render alike.
+    fn render(bytes: Vec<u8>) -> String {
+        match String::from_utf8(bytes) {
+            Ok(text) => text,
+            Err(e) => {
+                let escaped: String = e.into_bytes().iter().map(|b| format!("\\x{b:02x}")).collect();
+                format!("<bytes>{escaped}")
+            }
+        }
+    }
+
     fn edit(argv: &[String], path: &Path, keys: &str, save: &str) -> Result<String, &'static str> {
         let Ok(pty) = crate::pty::open() else { return Err("no pty could be opened for it") };
         let _ = crate::pty::set_size(std::os::fd::AsRawFd::as_raw_fd(&pty.master), 24, 80);
@@ -374,7 +411,13 @@ mod tests {
             }
         }
         match exited {
-            true => Ok(std::fs::read_to_string(path).unwrap_or_else(|e| format!("<unreadable: {e}>"))),
+            // Compared as *bytes*: a case about encodings is a case
+            // about which bytes came out, and reading the result as
+            // UTF-8 would turn every latin-1 file on both sides into
+            // the same error message. Rendered readably when it is
+            // text, and escaped when it is not, with a marker so the
+            // two renderings can never be confused for each other.
+            true => Ok(std::fs::read(path).map(render).unwrap_or_else(|e| format!("<unreadable: {e}>"))),
             // Named apart from the handshake failure on purpose: the
             // two have different causes and different fixes, and a
             // single message for both cost an afternoon working out

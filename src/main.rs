@@ -14,6 +14,7 @@ mod docs;
 mod dotenv;
 mod editor;
 mod editorconfig;
+mod encoding;
 mod exec;
 mod fileeditor;
 mod git;

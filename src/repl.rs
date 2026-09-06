@@ -6394,7 +6394,13 @@ fn apply_editorconfig(shell: &exec::Shell, buf: &mut TextBuffer) {
     if let Some(max) = properties.max_line_length {
         buf.wrap.column = max.unwrap_or(0);
     }
-    // `charset` is deliberately not applied; see editorconfig::for_file.
+    // A charset this shell cannot write is left alone rather than
+    // approximated: the buffer keeps the encoding its own bytes were
+    // read as, and the file is written back as it came.
+    if let Some((charset, encoding)) = properties.charset.as_deref().and_then(|c| Some((c, crate::encoding::parse(c)?))) {
+        buf.encoding = encoding;
+        buf.bom = crate::encoding::names_a_bom(charset) || encoding.requires_bom();
+    }
 }
 
 fn apply_view_options(shell: &exec::Shell, buf: &mut TextBuffer) {
@@ -14186,5 +14192,38 @@ mod capture_text_tests {
         // stray blank line would be worse than printing nothing.
         let screen = vt100::Screen::new(6, 20);
         assert_eq!(text_of(&screen), "");
+    }
+}
+
+#[cfg(test)]
+mod editorconfig_charset_tests {
+    use super::*;
+
+    // The property that used to be parsed and then thrown away. A
+    // project that says its files are latin-1 gets latin-1 written
+    // back, and a name this shell cannot write leaves the file's own
+    // encoding in place rather than quietly converting it.
+    #[test]
+    fn charset_decides_what_a_buffer_is_written_as() {
+        let dir = std::env::temp_dir().join(format!("bish-editorconfig-charset-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let shell = exec::Shell::new();
+        let path = dir.join("f.txt");
+        std::fs::write(&path, "text\n").unwrap();
+
+        let check = |charset: &str| {
+            std::fs::write(dir.join(".editorconfig"), format!("root = true\n[*]\ncharset = {charset}\n")).unwrap();
+            let mut buf = TextBuffer::open(&path, 10).unwrap();
+            apply_editorconfig(&shell, &mut buf);
+            (buf.encoding, buf.bom)
+        };
+
+        assert_eq!(check("latin1"), (crate::encoding::Encoding::Latin1, false));
+        assert_eq!(check("utf-8"), (crate::encoding::Encoding::Utf8, false));
+        assert_eq!(check("utf-8-bom"), (crate::encoding::Encoding::Utf8, true), "the mark is the whole difference between these two");
+        assert_eq!(check("utf-16le"), (crate::encoding::Encoding::Utf16Le, true), "a UTF-16 file nothing can identify is not worth writing");
+        assert_eq!(check("shift_jis"), (crate::encoding::Encoding::Utf8, false), "left as the file's own, which is what it was read as");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
