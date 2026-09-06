@@ -6925,6 +6925,25 @@ impl Shell {
             return ExecResult::Status(self.last_subst_status.take().unwrap_or(0));
         }
 
+        // Named before anything is expanded, and named as it was
+        // *written*. Both halves were wrong: the name was built from the
+        // expanded argv further down, so `echo "$v" a*` reported itself
+        // as `echo q a*`, and it was assigned after expansion, so a
+        // command reading `$BASH_COMMAND` in its own words got the
+        // *previous* command's text. Writing the source back out is
+        // only possible now that a word remembers how it was spelled.
+        // Not while a trap is running: `$BASH_COMMAND` names the
+        // command the trap is *about*, and the trap's own body is made
+        // of commands too. Saving it around the trap does not help --
+        // the body both overwrites and reads it from the inside.
+        if !self.in_trap {
+            self.bash_command = crate::serialize::serialize_simple(cmd);
+        }
+        // And the DEBUG trap fires here for the same reason: bash runs
+        // it before the command's expansions, so a `$( )` in the
+        // command runs after the trap rather than before it.
+        self.run_pseudo_trap(PseudoTrap::Debug);
+
         let saved_stderr_target = self.current_stderr_target.take();
         self.current_stderr_target = self.peek_stderr_target(&cmd.redirects);
         let first_word_literal = match cmd.words[0].chunks.as_slice() {
@@ -7006,10 +7025,6 @@ impl Shell {
         // rather than assigned: the command has not run yet, and
         // everything inside it must still see the previous value.
         self.underscore_pending.push(argv.last().cloned().unwrap_or_default());
-        // Named before it runs, so a DEBUG trap sees the command it is
-        // firing for and an ERR trap sees the one that failed.
-        self.bash_command = argv.join(" ");
-        self.run_pseudo_trap(PseudoTrap::Debug);
         if argv.is_empty() {
             // Every word vanished (e.g. the command was just an unquoted
             // empty/unset variable) -- matches bash: nothing runs.

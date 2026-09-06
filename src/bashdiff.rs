@@ -258,6 +258,22 @@ mod tests {
         case("a-missing-command-does-not-end-the-pipeline", r#"nosuchcmd | head -1; echo "ps=(${PIPESTATUS[@]}) q=$?""#),
         case("a-missing-command-later-in-a-pipeline", r#"echo x | nosuchcmd; echo "q=$? it=${PIPESTATUS[1]}""#),
         case("a-directory-as-a-pipeline-stage", r#"/etc | cat; echo "q=${PIPESTATUS[0]}""#),
+        // `$BASH_COMMAND` names the command being run, as *written*.
+        // It was built from the expanded argv and assigned after the
+        // expansion, so a command reading it in its own words got the
+        // previous one -- and `echo "$v" a*` reported itself as
+        // `echo q a*`.
+        case("bash-command-names-the-command-being-run", r#"true; echo "[$BASH_COMMAND]""#),
+        case("bash-command-is-the-unexpanded-text", "v=q; trap 'echo \"[$BASH_COMMAND]\"' DEBUG; echo \"$v\" a*"),
+        case("bash-command-in-an-err-trap", "trap 'echo \"err=[$BASH_COMMAND]\"' ERR; false"),
+        case("bash-command-names-a-redirect", "trap 'echo \"[$BASH_COMMAND]\"' DEBUG; echo z > /dev/null; echo z 2>&1 >>f; echo z >&2"),
+        case("bash-command-keeps-backticks", "trap 'echo \"[$BASH_COMMAND]\"' DEBUG; echo `true`"),
+        // A trap's own body does not rename the command the trap is
+        // about, even though the body is made of commands too.
+        case("bash-command-survives-the-traps-own-body", "trap 'echo \"[$BASH_COMMAND]\"' DEBUG; true one; true two"),
+        // And the DEBUG trap fires before the command's expansions, so
+        // a `$( )` in it runs after the trap rather than before.
+        case("debug-trap-fires-before-expansion", "trap \"echo TRAP >&2\" DEBUG; echo $(echo SUB >&2)"),
         // A backslash before a newline is a line continuation: both
         // characters go. bish turned it into a literal newline, so a
         // wrapped command came out as two of them and `then
@@ -1236,16 +1252,6 @@ y
     // "bish agrees with bash" never quietly means "except where it
     // doesn't".
     const DIVERGENCES: &[(&str, &str)] = &[
-        // `$BASH_COMMAND` read *directly* rather than from inside a
-        // trap names the previous command: bish sets it once the words
-        // are expanded, where bash sets it from the source text before
-        // expanding anything. Inside a trap -- which is what the
-        // variable is for, and where the corpus checks it -- the two
-        // agree exactly, including from inside a function. Same root as
-        // `function-body-formatting`: the source text needs spans the
-        // parser does not carry, and without them setting it earlier
-        // would name the command in bish's own serialised shape.
-        ("bash-command-read-outside-a-trap", "`echo $BASH_COMMAND` names the previous command; bash names the one being run, as written"),
         // A DEBUG trap fires once per pipeline *stage* in bash. Here it
         // fires only for a stage that runs in the shell: an external
         // one is spawned without going through the path that fires it,
@@ -1282,7 +1288,6 @@ y
     // so that list stays a description of what works.
     const PENDING: &[Case] = &[
         case("set-o-lists-fewer-options", r#"set -o | wc -l"#),
-        case("bash-command-read-outside-a-trap", r#"true; echo "[$BASH_COMMAND]""#),
         case("bashpid-is-the-shells-own-in-a-subshell", r#"echo $(( $$ == BASHPID )); ( echo $(( $$ == BASHPID )) )"#),
         case("extglob-cannot-be-turned-off", r#"shopt extglob; shopt -u extglob; shopt -q extglob; echo "q=$?""#),
         case("debug-trap-misses-an-external-pipeline-stage", r#"trap "echo D" DEBUG; echo a | cat"#),

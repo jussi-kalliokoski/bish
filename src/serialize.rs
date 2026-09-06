@@ -228,7 +228,7 @@ fn serialize_test_atoms(atoms: &[crate::parser::TestAtom]) -> String {
         .join(" ")
 }
 
-fn serialize_simple(sc: &SimpleCommand) -> String {
+pub(crate) fn serialize_simple(sc: &SimpleCommand) -> String {
     let (line, bodies) = serialize_simple_with_heredocs(sc);
     // Inline, for the callers that want one command's text and have
     // nowhere to put a body: `$BASH_COMMAND`, a job's name. A single
@@ -315,17 +315,19 @@ fn redirect_op(append: bool, clobber: bool) -> &'static str {
     }
 }
 
-/// The word after a redirect operator, with a space when the two would
-/// otherwise run together.
+/// The word after a redirect operator, always spaced from it.
 ///
-/// Process substitution is the case: `wc -l < <(cmd)` was written back
-/// as `wc -l <<(cmd)`, where `<<` is a heredoc operator and the
-/// redirect is gone, and `cmd > >(cat)` became an append to a file
-/// named `(cat)`. Both are still valid scripts, which is why the
+/// Process substitution is why it cannot be joined: `wc -l < <(cmd)`
+/// written back as `wc -l <<(cmd)` makes `<<` a heredoc operator and
+/// the redirect disappears, and `cmd > >(cat)` becomes an append to a
+/// file named `(cat)`. Both are still valid scripts, which is why the
 /// corpus caught them by behaviour rather than the parser by error.
+///
+/// Spaced *always*, rather than only when it would collide, because
+/// that is how bash prints one -- `echo z > f`, and `$BASH_COMMAND`
+/// names a command the way bash would write it.
 fn redirect_target(w: &Word) -> String {
-    let text = serialize_word(w);
-    if text.starts_with('<') || text.starts_with('>') { format!(" {text}") } else { text }
+    format!(" {}", serialize_word(w))
 }
 
 pub fn serialize_redirect(r: &Redirect) -> String {
