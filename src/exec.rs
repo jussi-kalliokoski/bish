@@ -5344,7 +5344,12 @@ impl Shell {
                 return ExecResult::Status(1);
             }
         };
-        let script = self.functions_preamble() + &crate::serialize::serialize_command(cmd);
+        // The body only: this shell has just resolved the compound's own
+        // redirects into `redirs` and is about to apply them to the
+        // child, so writing them into the child's script as well would
+        // have it apply them a second time -- and, for a compound, take
+        // this same path again and spawn another child.
+        let script = self.functions_preamble() + &crate::serialize::serialize_command_body(cmd);
         let mut command = self.command(exe);
         command.arg("-c").arg(script);
         command.current_dir(&self.cwd);

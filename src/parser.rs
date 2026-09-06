@@ -97,9 +97,11 @@ pub struct SimpleCommand {
 }
 
 // Compound commands carry their own trailing redirects (e.g. `done < file`,
-// `{ ...; } > file`), parsed right after the closing keyword/brace. Not yet
-// applied at exec time (see exec.rs) -- parsed now so the grammar is right
-// and wiring it up later doesn't require another parser pass.
+// `{ ...; } > file`), parsed right after the closing keyword/brace. Applied
+// at exec time by way of `command_own_redirects`, and written back by
+// `serialize.rs` -- which for a long time matched this field with `..` and
+// dropped it, so a redirected compound inside a forwarded function body
+// quietly lost its redirect.
 #[derive(Debug, Clone)]
 pub enum Command {
     Simple(SimpleCommand),

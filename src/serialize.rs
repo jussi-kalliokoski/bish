@@ -34,6 +34,15 @@ fn serialize_and_or(ao: &AndOr) -> String {
 
 fn serialize_pipeline(p: &Pipeline) -> String {
     let mut s = String::new();
+    // `time` is a reserved word in front of the whole pipeline, not a
+    // command inside it, so it lives here rather than in any argv --
+    // and was simply not written back at all, which is how six corpus
+    // scripts lost their timing report on the way through.
+    match p.timed {
+        Some(crate::parser::TimeStyle::Shell) => s.push_str("time "),
+        Some(crate::parser::TimeStyle::Posix) => s.push_str("time -p "),
+        None => {}
+    }
     if p.negate {
         s.push_str("! ");
     }
@@ -42,10 +51,43 @@ fn serialize_pipeline(p: &Pipeline) -> String {
     s
 }
 
+/// A compound's own redirects, written back after its closing keyword.
+///
+/// Every arm below used to match these with `..` and drop them on the
+/// floor, so `{ cmd; } 2>e` came back as `{ cmd; }` -- the redirect
+/// silently gone rather than merely reordered, which is what its
+/// round-trip cases had been recorded as.
+fn with_redirects(mut s: String, redirects: &[Redirect]) -> String {
+    for r in redirects {
+        s.push(' ');
+        s.push_str(&serialize_redirect(r));
+    }
+    s
+}
+
 pub fn serialize_command(cmd: &Command) -> String {
+    serialize_command_inner(cmd, true)
+}
+
+/// The same text without the compound's *own* trailing redirects, for a
+/// caller that is applying those itself.
+///
+/// `run_compound_redirected` resolves `{ ...; } 3>&-`'s redirects, sets
+/// them up on a self-exec'd child, and hands that child the compound as
+/// source. Once the redirects were written back too, the child read its
+/// own `3>&-`, took the same path, and spawned another child -- forever,
+/// with the shell simply appearing to hang. Only the top level is
+/// stripped: a redirect inside the body belongs to a command the child
+/// really does have to run.
+pub fn serialize_command_body(cmd: &Command) -> String {
+    serialize_command_inner(cmd, false)
+}
+
+fn serialize_command_inner(cmd: &Command, own_redirects: bool) -> String {
+    let with_redirects = |s: String, r: &[Redirect]| if own_redirects { with_redirects(s, r) } else { s };
     match cmd {
         Command::Simple(sc) => serialize_simple(sc),
-        Command::If { branches, else_branch, .. } => {
+        Command::If { branches, else_branch, redirects } => {
             let mut s = String::new();
             for (i, (cond, body)) in branches.iter().enumerate() {
                 s.push_str(if i == 0 { "if " } else { "elif " });
@@ -58,18 +100,18 @@ pub fn serialize_command(cmd: &Command) -> String {
                 s.push_str(&serialize_program(e));
             }
             s.push_str("fi");
-            s
+            with_redirects(s, redirects)
         }
-        Command::While { cond, body, until, .. } => {
+        Command::While { cond, body, until, redirects } => {
             let mut s = String::new();
             s.push_str(if *until { "until " } else { "while " });
             s.push_str(&serialize_program(cond));
             s.push_str("do\n");
             s.push_str(&serialize_program(body));
             s.push_str("done");
-            s
+            with_redirects(s, redirects)
         }
-        Command::For { var, words, body, .. } => {
+        Command::For { var, words, body, redirects } => {
             let mut s = format!("for {} ", var);
             if let Some(words) = words {
                 s.push_str("in ");
@@ -79,16 +121,16 @@ pub fn serialize_command(cmd: &Command) -> String {
             s.push_str("do\n");
             s.push_str(&serialize_program(body));
             s.push_str("done");
-            s
+            with_redirects(s, redirects)
         }
-        Command::CFor { init, cond, step, body, .. } => {
+        Command::CFor { init, cond, step, body, redirects } => {
             let mut s = format!("for (({}; {}; {}))\n", init, cond, step);
             s.push_str("do\n");
             s.push_str(&serialize_program(body));
             s.push_str("done");
-            s
+            with_redirects(s, redirects)
         }
-        Command::Select { var, words, body, .. } => {
+        Command::Select { var, words, body, redirects } => {
             let mut s = format!("select {} ", var);
             if let Some(words) = words {
                 s.push_str("in ");
@@ -98,9 +140,9 @@ pub fn serialize_command(cmd: &Command) -> String {
             s.push_str("do\n");
             s.push_str(&serialize_program(body));
             s.push_str("done");
-            s
+            with_redirects(s, redirects)
         }
-        Command::Case { word, arms, .. } => {
+        Command::Case { word, arms, redirects } => {
             let mut s = format!("case {} in\n", serialize_word(word));
             for (patterns, body, term) in arms {
                 s.push_str(&patterns.iter().map(serialize_word).collect::<Vec<_>>().join("|"));
@@ -113,13 +155,13 @@ pub fn serialize_command(cmd: &Command) -> String {
                 });
             }
             s.push_str("esac");
-            s
+            with_redirects(s, redirects)
         }
-        Command::Group(prog, _) => format!("{{\n{}}}", serialize_program(prog)),
+        Command::Group(prog, redirects) => with_redirects(format!("{{\n{}}}", serialize_program(prog)), redirects),
         Command::FuncDef { name, body } => format!("{}() {}", name, serialize_command(body)),
-        Command::Subshell(raw, _) => format!("({})", raw),
-        Command::Arith(raw, _) => format!("(({}))", raw),
-        Command::Test(atoms, _) => format!("[[ {} ]]", serialize_test_atoms(atoms)),
+        Command::Subshell(raw, redirects) => with_redirects(format!("({})", raw), redirects),
+        Command::Arith(raw, redirects) => with_redirects(format!("(({}))", raw), redirects),
+        Command::Test(atoms, redirects) => with_redirects(format!("[[ {} ]]", serialize_test_atoms(atoms)), redirects),
         Command::Coproc { name, body } => match name {
             Some(n) => format!("coproc {} {}", n, serialize_command(body)),
             None => format!("coproc {}", serialize_command(body)),
@@ -201,19 +243,32 @@ fn redirect_op(append: bool, clobber: bool) -> &'static str {
     }
 }
 
+/// The word after a redirect operator, with a space when the two would
+/// otherwise run together.
+///
+/// Process substitution is the case: `wc -l < <(cmd)` was written back
+/// as `wc -l <<(cmd)`, where `<<` is a heredoc operator and the
+/// redirect is gone, and `cmd > >(cat)` became an append to a file
+/// named `(cat)`. Both are still valid scripts, which is why the
+/// corpus caught them by behaviour rather than the parser by error.
+fn redirect_target(w: &Word) -> String {
+    let text = serialize_word(w);
+    if text.starts_with('<') || text.starts_with('>') { format!(" {text}") } else { text }
+}
+
 pub fn serialize_redirect(r: &Redirect) -> String {
     match r {
-        Redirect::In(w) => format!("<{}", serialize_word(w)),
-        Redirect::InOut(w) => format!("<>{}", serialize_word(w)),
-        Redirect::Out { word, append, clobber } => format!("{}{}", redirect_op(*append, *clobber), serialize_word(word)),
-        Redirect::Err { word, append, clobber } => format!("2{}{}", redirect_op(*append, *clobber), serialize_word(word)),
-        Redirect::Both { word, append } => format!("&{}{}", if *append { ">>" } else { ">" }, serialize_word(word)),
+        Redirect::In(w) => format!("<{}", redirect_target(w)),
+        Redirect::InOut(w) => format!("<>{}", redirect_target(w)),
+        Redirect::Out { word, append, clobber } => format!("{}{}", redirect_op(*append, *clobber), redirect_target(word)),
+        Redirect::Err { word, append, clobber } => format!("2{}{}", redirect_op(*append, *clobber), redirect_target(word)),
+        Redirect::Both { word, append } => format!("&{}{}", if *append { ">>" } else { ">" }, redirect_target(word)),
         Redirect::DupErrToOut => "2>&1".to_string(),
-        Redirect::HereString(w) => format!("<<<{}", serialize_word(w)),
+        Redirect::HereString(w) => format!("<<<{}", redirect_target(w)),
         // Re-emit as an equivalent here-string: by serialization time the
         // body is already fully captured, so a real <<DELIM...DELIM block
         // isn't needed to reproduce the same runtime content.
-        Redirect::HereDoc(w) => format!("<<<{}", serialize_word(w)),
+        Redirect::HereDoc(w) => serialize_heredoc(w),
         Redirect::VarFd { var, kind, word } => {
             let op = match kind {
                 crate::lexer::VarFdKind::In => "<".to_string(),
@@ -221,17 +276,60 @@ pub fn serialize_redirect(r: &Redirect) -> String {
                 crate::lexer::VarFdKind::Out { append, clobber } => redirect_op(*append, *clobber).to_string(),
                 crate::lexer::VarFdKind::Dup => ">&".to_string(),
             };
-            format!("{{{}}}{}{}", var, op, serialize_word(word))
+            format!("{{{}}}{}{}", var, op, redirect_target(word))
         }
         Redirect::FdOut { fd, word, append, clobber } => {
-            format!("{}{}{}", fd, redirect_op(*append, *clobber), serialize_word(word))
+            format!("{}{}{}", fd, redirect_op(*append, *clobber), redirect_target(word))
         }
-        Redirect::FdIn { fd, word } => format!("{}<{}", fd, serialize_word(word)),
-        Redirect::FdInOut { fd, word } => format!("{}<>{}", fd, serialize_word(word)),
+        Redirect::FdIn { fd, word } => format!("{}<{}", fd, redirect_target(word)),
+        Redirect::FdInOut { fd, word } => format!("{}<>{}", fd, redirect_target(word)),
         Redirect::FdDup { fd, target } => format!("{}>&{}", fd, target),
-        Redirect::FdDupWord { fd, word } => format!("{}>&{}", fd, serialize_word(word)),
+        Redirect::FdDupWord { fd, word } => format!("{}>&{}", fd, redirect_target(word)),
         Redirect::FdClose { fd } => format!("{}>&-", fd),
     }
+}
+
+/// A heredoc, written as an equivalent `<<<`.
+///
+/// Not `serialize_word`, which writes a word back the way it was
+/// *written*: a heredoc body is not source text, it is content, and
+/// treating the two the same lost it twice over. `cat <<EOF/line
+/// $((1+1))/EOF` came back as `cat <<<line "$((1+1))"`, where the
+/// space ends the here-string's word and the sum becomes an argument
+/// to `cat`; and `cat <<'EOF'/no $expansion/EOF` came back as
+/// `cat <<<no $expansion`, with the quoting that was the whole point
+/// of the case gone. So every literal run is quoted here, whichever
+/// chunk it arrived in, and only the expansions a heredoc really does
+/// perform are written back live.
+///
+/// The trailing newline is the other half. A heredoc body ends with
+/// the newline of its last line and `<<<` appends one of its own, so
+/// the two together said `line 2\n\n`. One is dropped here, which
+/// leaves `<<<` to put it back -- and an empty body has no newline to
+/// drop, so it cannot be a here-string at all.
+fn serialize_heredoc(w: &Word) -> String {
+    // Emptiness is decided before the newline is stripped, because the
+    // two empties are different documents. `cat <<EOF/EOF` has no body
+    // and gives `cat` nothing; `cat <<EOF//EOF` has one empty line and
+    // gives it a newline, which is what a stripped `<<<''` puts back.
+    if w.chunks.iter().all(|c| matches!(c, Chunk::Str(t) | Chunk::LiteralStr(t) if t.is_empty())) {
+        return "</dev/null".to_string();
+    }
+    let mut chunks: Vec<Chunk> = w.chunks.clone();
+    if let Some(last) = chunks.last_mut()
+        && let Chunk::Str(t) | Chunk::LiteralStr(t) = last
+        && let Some(stripped) = t.strip_suffix('\n')
+    {
+        *t = stripped.to_string();
+    }
+    let text: String = chunks
+        .iter()
+        .map(|c| match c {
+            Chunk::Str(t) | Chunk::LiteralStr(t) => quote_literal(t),
+            other => serialize_chunk(other),
+        })
+        .collect();
+    format!("<<<{text}")
 }
 
 pub(crate) fn serialize_word(w: &Word) -> String {

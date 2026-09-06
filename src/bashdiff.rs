@@ -119,6 +119,12 @@ mod tests {
         case("redir-heredoc", "cat <<EOF\nline $((1+1))\nEOF"),
         case("redir-heredoc-quoted", "cat <<'EOF'\nno $expansion\nEOF"),
         case("redir-heredoc-tabs", "cat <<-EOF\n\tstripped\nEOF"),
+        // The two empty heredocs are different documents, and the
+        // serializer has to keep them apart: no body at all is no
+        // input, one empty line is a newline. `<<<''` says the second
+        // and there is no here-string that says the first.
+        case("redir-heredoc-with-no-body", "wc -c <<EOF\nEOF"),
+        case("redir-heredoc-with-one-empty-line", "wc -c <<EOF\n\nEOF"),
         case("redir-herestring", r#"cat <<< "here string""#),
         case("redir-fd", r#"exec 3> three; echo x >&3; exec 3>&-; cat three"#),
         // -- pipelines and subshells ----------------------------------
@@ -1492,75 +1498,36 @@ y
 
     /// The scripts that do *not* survive the round trip, and why.
     ///
-    /// The cause that used to dominate this list is gone. `serialize_chunk`
-    /// wrote an unquoted word and a quoted one the same way, as
-    /// `'...'`, which made every unquoted word literal -- `echo *`
-    /// printed an asterisk, `case $x in a*)` matched only a literal
-    /// `a*`, and `[[ x < y ]]` lost its operator. The parse tree had
-    /// kept them apart all along; the serializer just had to stop
-    /// collapsing them. That took the list from 72 to 36.
+    /// One, and it is the honest kind. `PS4='+$LINENO '` prints the
+    /// line a command was on, and the round trip re-lays the script
+    /// out -- so the trace is different for the same reason the source
+    /// is a different shape. Nothing to fix without carrying source
+    /// positions, which is its own piece of work.
     ///
-    /// What is left is four separate shapes, none of them about
-    /// quoting:
+    /// The other 71 are gone, in two changes. `serialize_chunk` used
+    /// to write an unquoted word and a quoted one the same way, which
+    /// made every unquoted word literal and cost 36 scripts. What was
+    /// left read as four unrelated shapes and turned out to be four
+    /// unrelated one-line omissions:
     ///
-    ///   - **Redirects and heredocs.** A `HereDoc` is re-emitted as a
-    ///     here-string (`serialize.rs`'s own note says the body is
-    ///     already captured by then), but `<<<` adds a newline of its
-    ///     own that the body already has; and the compound-redirect
-    ///     cases lose the order their descriptors were rebound in.
-    ///   - **Process substitution.** `<( )` and `>( )` come back as
-    ///     something that no longer names a running producer.
-    ///   - **`time`.** The keyword and its format are not written back
-    ///     at all.
-    ///   - **Four of their own.** Arithmetic fatality, `select` with no
-    ///     `in`, and PS4 expansion.
+    ///   - A compound's redirects were matched with `..` and dropped,
+    ///     so `{ cmd; } 2>e` came back with no redirect at all -- not
+    ///     reordered, as this list used to claim, but gone.
+    ///   - A heredoc body was written back as if it were source text,
+    ///     so it word-split and a `<<'EOF'` body's `$expansion` came
+    ///     back live. It is content, and is quoted as content now.
+    ///   - `time` sits on the pipeline rather than in an argv, and
+    ///     `serialize_pipeline` never wrote it.
+    ///   - `<` and `<(` ran together into `<<`, which is a heredoc, so
+    ///     every process substitution used as a redirect turned into
+    ///     something else that still parsed.
     ///
-    /// The list is here so the property is enforced for everything else
-    /// while these are fixed, and so its size is on the record rather
-    /// than in someone's head. `the_known_round_trip_breaks_are_still_broken`
-    /// keeps it honest in the other direction.
-    const ROUND_TRIP_BREAKS: &[&str] = &[
-        // Redirects and heredocs.
-        "a-compounds-stderr-reaches-externals",
-        "a-loops-stderr-reaches-externals",
-        "both-streams-one-file-keeps-one-position",
-        "compound-dup-to-stderr-that-is-itself-redirected",
-        "compound-dup-to-stderr-that-was-already-redirected",
-        "dup-before-the-redirect-it-would-have-followed",
-        "fd-swap-then-redirect-compound",
-        "redir-both",
-        "redir-heredoc",
-        "redir-heredoc-quoted",
-        "redir-heredoc-tabs",
-        "redir-stderr",
-        "select-reads-its-own-redirect",
-        // Process substitution.
-        "proc-sub-out-body-output-all-arrives",
-        "proc-sub-out-larger-than-a-pipe-buffer",
-        "proc-sub-out-that-answers-at-eof",
-        "proc-sub-out-to-a-builtins-redirect",
-        "proc-sub-out-to-an-externals-redirect",
-        "proc-sub-out-two-at-once",
-        "proc-sub-out-with-a-shell-body",
-        "process-subst-as-a-redirect",
-        "process-subst-more-than-a-pipe-buffer",
-        "process-subst-read-by-a-builtin",
-        "process-subst-read-by-a-loop",
-        // The `time` keyword.
-        "time-format-literal",
-        "time-format-percent",
-        "time-group",
-        "time-negated",
-        "time-pipeline",
-        "time-status",
-        // Their own shapes.
-        "a-literal-is-checked-after-it-is-read",
-        "arith-command-is-not",
-        "arith-expansion-is-fatal",
-        "arithmetic-base-out-of-range",
-        "ps4-expands-a-parameter",
-        "select-without-an-in-clause",
-    ];
+    /// The list is here so the property is enforced for everything
+    /// else, and so its size is on the record rather than in someone's
+    /// head. `the_known_round_trip_breaks_are_still_broken` keeps it
+    /// honest in the other direction -- it is what said that half the
+    /// list had been fixed by a change aimed at something else.
+    const ROUND_TRIP_BREAKS: &[&str] = &["ps4-expands-a-parameter"];
 
     /// Every corpus script, run as written and again after a round trip
     /// through the serializer, must do the same thing.
