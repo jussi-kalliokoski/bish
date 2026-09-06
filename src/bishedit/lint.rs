@@ -560,7 +560,7 @@ fn lint_word_chunks(
                 // "non-cosmetic" scope.
                 next_span(raw_spans, cursor);
             }
-            Chunk::Var { name, quoted } | Chunk::Indirect { name, quoted } | Chunk::ArrayKeys { name, quoted } => {
+            Chunk::Var { name, quoted, .. } | Chunk::Indirect { name, quoted } | Chunk::ArrayKeys { name, quoted } => {
                 if let Some(content) = next_span(raw_spans, cursor) {
                     let always_safe = matches!(chunk, Chunk::Var { .. }) && matches!(name.as_str(), "?" | "$" | "!" | "#" | "-");
                     if !exempt && !quoted && !always_safe {

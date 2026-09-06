@@ -3169,21 +3169,21 @@ impl Shell {
                             false => sh_println!(self, "{}", name),
                         }
                     } else {
-                        let def = parser::Command::FuncDef { name: name.clone(), body: Box::new(body) };
-                        let src = crate::serialize::serialize_program(&[ListItem {
-                            and_or: AndOr { first: Pipeline { commands: vec![def], negate: false, timed: None }, rest: Vec::new() },
-                            sep: Sep::Seq,
-                            line: 0,
-                        }]);
-                        // Without the separator `serialize_program`
-                        // puts after every item. A function definition
-                        // needs no terminator, and the one idiom this
-                        // output exists for puts a command straight
-                        // after it: `sh -c "$(declare -f f); f"` became
-                        // `};; f`, which is a syntax error in either
-                        // shell. bash ends its own at the `}`.
-                        let src = src.trim_end();
-                        sh_println!(self, "{}", src.strip_suffix(';').unwrap_or(src));
+                        // Laid out the way bash lays a function body
+                        // out, rather than the way the round-tripping
+                        // serializer writes one -- see
+                        // `serialize::format_function` for the shape
+                        // and for what it deliberately does not
+                        // reproduce. This output is read, and the two
+                        // jobs stopped being the same job once it had
+                        // to be read the way bash's is.
+                        //
+                        // It ends at the `}` with no terminator, which
+                        // the idiom this exists for depends on:
+                        // `sh -c "$(declare -f f); f"` used to become
+                        // `};; f` and be a syntax error in either
+                        // shell.
+                        sh_println!(self, "{}", crate::serialize::format_function(&name, &body));
                     }
                 }
                 None => {
@@ -6561,7 +6561,7 @@ impl Shell {
                 }
                 Chunk::Str(t) => out.push_str(t),
                 Chunk::LiteralStr(t) => out.push_str(&crate::regex::escape(t)),
-                Chunk::Var { name, quoted } => {
+                Chunk::Var { name, quoted, .. } => {
                     let name = name.clone();
                     self.check_nounset(&name);
                     let v = self.lookup_var(&name);
@@ -6659,7 +6659,7 @@ impl Shell {
                 }
                 Chunk::Str(t) => out.push_str(t),
                 Chunk::LiteralStr(t) => out.push_str(&crate::glob::escape(t)),
-                Chunk::Var { name, quoted } => {
+                Chunk::Var { name, quoted, .. } => {
                     let name = name.clone();
                     self.check_nounset(&name);
                     let v = self.lookup_var(&name);
@@ -9967,7 +9967,7 @@ impl Shell {
                     current.get_or_insert_with(String::new).push_str(t);
                     pattern_current.get_or_insert_with(String::new).push_str(&crate::glob::escape(t));
                 }
-                Chunk::Var { name, quoted } => {
+                Chunk::Var { name, quoted, .. } => {
                     // "$@" is a special case even when quoted: it expands
                     // to one field per positional parameter (as if each
                     // were individually double-quoted), not one joined

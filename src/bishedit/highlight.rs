@@ -1927,7 +1927,7 @@ mod tests {
         assert!(!is_assignment_prefix_word(&plain_chunks("=bar"))); // empty name
         // Not a single plain Chunk::Str -- e.g. a word containing an
         // expansion -- never counts as an assignment prefix here.
-        assert!(!is_assignment_prefix_word(&[Chunk::Var { name: "FOO".to_string(), quoted: false }]));
+        assert!(!is_assignment_prefix_word(&[Chunk::Var { name: "FOO".to_string(), quoted: false, braced: false }]));
     }
 
     #[test]

@@ -14,7 +14,14 @@ pub enum Chunk {
     // user name to look up. Resolved at expansion time, since it needs
     // the shell (and /etc/passwd).
     Tilde { name: String },
-    Var { name: String, quoted: bool },
+    // `$name` or `${name}`, and which of the two it was written as.
+    // `braced` carries no meaning at expansion time -- the two forms
+    // expand identically -- and exists so that writing the word back
+    // out says what the source said. `declare -f` is where that shows:
+    // bash reprints a function body from its own parse tree and a `$x`
+    // comes back as `$x`, where collapsing both forms onto `${x}` made
+    // every variable in every body look braced.
+    Var { name: String, quoted: bool, braced: bool },
     // Raw, not-yet-parsed source text of a $(...) or `...` command
     // substitution -- re-tokenized/parsed/run recursively at expansion time.
     Sub { raw: String, quoted: bool },
@@ -1593,7 +1600,7 @@ impl<'a> Lexer<'a> {
                         return Ok(false);
                     } else {
                         self.raw_capture_spans.push(span);
-                        chunks.push(Chunk::Var { name, quoted });
+                        chunks.push(Chunk::Var { name, quoted, braced: true });
                     }
                 }
                 BraceContent::Op(name, op) => {
@@ -1636,7 +1643,7 @@ impl<'a> Lexer<'a> {
             Ok(false)
         } else {
             self.raw_capture_spans.push(start..self.pos);
-            chunks.push(Chunk::Var { name, quoted });
+            chunks.push(Chunk::Var { name, quoted, braced: false });
             Ok(true)
         }
     }
@@ -2719,7 +2726,10 @@ mod tests {
 
     #[test]
     fn parse_expansion_word_still_expands_vars_around_literal_spaces() {
-        assert_eq!(parse_expansion_word("hello $v"), vec![Chunk::Str("hello ".to_string()), Chunk::Var { name: "v".to_string(), quoted: false }]);
+        assert_eq!(
+            parse_expansion_word("hello $v"),
+            vec![Chunk::Str("hello ".to_string()), Chunk::Var { name: "v".to_string(), quoted: false, braced: false }]
+        );
     }
 
     fn spanned_text<'a>(src: &'a str, r: &std::ops::Range<usize>) -> &'a str {

@@ -123,6 +123,42 @@ mod tests {
         // serializer has to keep them apart: no body at all is no
         // input, one empty line is a newline. `<<<''` says the second
         // and there is no here-string that says the first.
+        // `declare -f` output is read -- by people, by completion
+        // scripts, by `sh -c "$(declare -f f); f"` -- so its layout is
+        // a compatibility surface and not a formatting preference.
+        // These are bash's shape, measured one construct at a time:
+        // where the `;` falls, which keyword shares a line with its
+        // condition, how deep an arm's body sits, which redirects take
+        // a space.
+        case("declare-f-empty-body", r#"f() { :; }; declare -f f"#),
+        case("declare-f-two-statements", r#"f() { echo a; echo b; }; declare -f f"#),
+        case("declare-f-a-bare-variable-stays-bare", r#"f() { echo $x ${y}; }; declare -f f"#),
+        case("declare-f-if-then-else", r#"f() { if :; then echo a; else echo b; fi; echo c; }; declare -f f"#),
+        // bash does not print `elif` at all -- it nests the second
+        // `if` inside the first one's `else`.
+        case("declare-f-elif-becomes-a-nested-else", r#"f() { if :; then echo a; elif :; then echo b; fi; }; declare -f f"#),
+        case("declare-f-a-condition-of-two-statements", r#"f() { if a; b; then echo t; fi; }; declare -f f"#),
+        case("declare-f-while-keeps-do-on-its-line", r#"f() { while :; do break; done; }; declare -f f"#),
+        case("declare-f-until", r#"f() { until :; do echo u; done; }; declare -f f"#),
+        // ...where `for` does not, and a `for` with no list prints the
+        // one it stands for.
+        case("declare-f-for-puts-do-on-its-own-line", r#"f() { for i in 1 2; do echo $i; done; }; declare -f f"#),
+        case("declare-f-for-without-a-list", r#"f() { for x; do echo $x; done; }; declare -f f"#),
+        case("declare-f-arithmetic-for", r#"f() { for ((i=0;i<2;i++)); do echo $i; done; }; declare -f f"#),
+        case("declare-f-select", r#"f() { select x in a; do break; done; }; declare -f f"#),
+        case("declare-f-case-arms", r#"f() { case $x in a) echo a;; b|c) echo p; echo q;; esac; }; declare -f f"#),
+        case("declare-f-case-fallthrough-terminators", r#"f() { case $x in a) echo p;;& b) echo q;& esac; }; declare -f f"#),
+        case("declare-f-a-group-and-its-redirect", r#"f() { { echo g; } > /dev/null; }; declare -f f"#),
+        case("declare-f-a-group-inside-a-branch", r#"f() { if :; then { echo a; }; echo b; fi; }; declare -f f"#),
+        case("declare-f-subshell-body", r#"f() { ( echo a; echo b ); }; declare -f f"#),
+        case("declare-f-a-subshell-function-body", r#"f() ( echo x ); declare -f f"#),
+        case("declare-f-a-nested-function-says-function", r#"f() { g() { echo n; }; }; declare -f f"#),
+        case("declare-f-redirect-spacing", r#"f() { echo a >f 2>&1; echo b >&2; echo c &>d; }; declare -f f"#),
+        case("declare-f-arithmetic-and-test-commands", r#"f() { [[ -n $x ]] && (( y++ )); ((n++)); }; declare -f f"#),
+        case("declare-f-pipelines-and-connections", r#"f() { echo a | cat; echo b && echo c || echo d; }; declare -f f"#),
+        // `&` does not end the line the way `;` does.
+        case("declare-f-background-continues-the-line", r#"f() { echo a & ! true; echo b & echo c & }; declare -f f"#),
+        case("declare-f-a-function-level-redirect", r#"f() { echo a; } 2>/dev/null; declare -f f"#),
         case("redir-heredoc-with-no-body", "wc -c <<EOF\nEOF"),
         case("redir-heredoc-with-one-empty-line", "wc -c <<EOF\n\nEOF"),
         case("redir-herestring", r#"cat <<< "here string""#),
@@ -1077,7 +1113,10 @@ y
         // is the piece that really does want source spans: the shape a
         // variable was written in is not recoverable from the parse
         // tree.
-        ("function-body-formatting", "`declare -f f` reconstructs the body in bish's own layout, not bash's"),
+        (
+            "function-body-quoting",
+            "`declare -f` reproduces bash's layout but not a word's *spelling*: quote style, backticks and a heredoc's delimiter are not in the parse tree",
+        ),
         // The builtin *set* differs, legitimately: bish has builtins
         // bash does not (`abbr`, `win`, `::bish`) and lacks `bind` and
         // `logout`. Listed rather than fixed because the difference is
@@ -1089,7 +1128,7 @@ y
     // so that list stays a description of what works.
     const PENDING: &[Case] = &[
         case("set-o-lists-fewer-options", r#"set -o | wc -l"#),
-        case("function-body-formatting", r#"f() { :; }; declare -f f"#),
+        case("function-body-quoting", "f() { echo \"a\" 'b' c\\ d; }; declare -f f"),
         case("bash-command-read-outside-a-trap", r#"true; echo "[$BASH_COMMAND]""#),
         case("debug-trap-misses-an-external-pipeline-stage", r#"trap "echo D" DEBUG; echo a | cat"#),
         case("compgen-b-lists-this-shells-builtins", r#"compgen -b | sort | head -3 | tr '\n' ' '; echo"#),

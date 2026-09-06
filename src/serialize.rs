@@ -185,6 +185,19 @@ fn serialize_test_atoms(atoms: &[crate::parser::TestAtom]) -> String {
 }
 
 fn serialize_simple(sc: &SimpleCommand) -> String {
+    let mut parts = serialize_simple_parts(sc);
+    for r in &sc.redirects {
+        parts.push(serialize_redirect(r));
+    }
+    parts.join(" ")
+}
+
+/// Everything a simple command is made of *except* its redirects:
+/// assignments, then words, with a declare-family array literal spliced
+/// back in at its own recorded position. Split out because `declare -f`
+/// writes the redirects differently (see `format_redirect`) and there
+/// is no reason for it to rebuild the rest.
+fn serialize_simple_parts(sc: &SimpleCommand) -> Vec<String> {
     let mut parts: Vec<String> = Vec::new();
     for (name, mode, val) in &sc.assigns {
         let op = if *mode == AssignMode::Append { "+=" } else { "=" };
@@ -215,10 +228,7 @@ fn serialize_simple(sc: &SimpleCommand) -> String {
     for (_, name, mode, items) in pending {
         parts.push(serialize_array_literal_assign(name, *mode, items));
     }
-    for r in &sc.redirects {
-        parts.push(serialize_redirect(r));
-    }
-    parts.join(" ")
+    parts
 }
 
 fn serialize_array_literal_assign(name: &str, mode: AssignMode, items: &[ArrayLiteralItem]) -> String {
@@ -371,7 +381,13 @@ fn serialize_chunk(c: &Chunk) -> String {
         // construction text that reads back as itself.
         Chunk::Str(s) => s.clone(),
         Chunk::LiteralStr(s) => quote_literal(s),
-        Chunk::Var { name, quoted } => wrap_quoted(format!("${{{}}}", name), *quoted),
+        // Written back the way it was written: `$x` braced only if
+        // the source braced it. Both expand the same, and `declare -f`
+        // is where the difference is visible.
+        Chunk::Var { name, quoted, braced } => {
+            let text = if *braced { format!("${{{}}}", name) } else { format!("${}", name) };
+            wrap_quoted(text, *quoted)
+        }
         Chunk::Sub { raw, quoted } => wrap_quoted(format!("$({})", raw), *quoted),
         Chunk::Arith { raw, quoted } => wrap_quoted(format!("$(({}))", raw), *quoted),
         Chunk::VarExpand { name, op, quoted } => wrap_quoted(serialize_var_op(name, op), *quoted),
@@ -455,6 +471,334 @@ fn serialize_var_op(name: &str, op: &VarOp) -> String {
 fn serialize_array_var_op(name: &str, index: &str, op: &VarOp) -> String {
     let full = format!("{}[{}]", name, index);
     serialize_var_op(&full, op)
+}
+
+// ---------------------------------------------------------------------
+// `declare -f`
+// ---------------------------------------------------------------------
+//
+// A second way to write a command out, and a different job from the one
+// above. `serialize_*` exists so a construct survives a trip through a
+// child shell: what matters there is that it means the same thing, and
+// nothing looks at it. `declare -f` output is *read* -- by people, by
+// completion scripts, by `sh -c "$(declare -f f); f"` -- and bash's
+// shape for it is specific enough that anything else reads as a
+// different shell.
+//
+// The shape, measured against bash rather than guessed:
+//
+//   - `f () ` and `{ ` each keep a trailing space, on their own lines.
+//   - Four spaces per level of nesting.
+//   - Every statement ends in `;` except the last one before a `}` or a
+//     `;;`. Before `fi`, `done`, `else` and `esac` the last statement
+//     keeps its `;`.
+//   - `if C; then` and `while C; do` put the keyword on the condition's
+//     line; `for` and `select` put `do` on a line of its own.
+//   - `elif` does not survive: bash prints it as a nested `else`/`if`,
+//     and so does this.
+//   - `case W in ` has a trailing space, arms sit one level in and their
+//     bodies two, with `;;` back at the arm's level.
+//   - A redirect's target is spaced (`> f`, `2> f`, `&> f`) where a
+//     descriptor is not (`2>&1`), and `>&2` is written with its implied
+//     descriptor as `1>&2`.
+//   - A function body is always printed as a brace group, even when it
+//     was written as `f() ( ... )`.
+//
+// Two things are normalised rather than reproduced, because the parse
+// tree records what a word *means* and not how it was spelled: quoting
+// comes back in one style (`"a"` prints as `'a'`), and a heredoc prints
+// as the here-string it round-trips through. Both would need the lexer
+// to keep the source form, which is a change to the tree and not to
+// this.
+
+fn pad(indent: usize) -> String {
+    " ".repeat(indent * 4)
+}
+
+/// One function, in bash's `declare -f` shape, with no trailing newline.
+pub fn format_function(name: &str, body: &Command) -> String {
+    format_function_at(name, body, 0, false)
+}
+
+/// `nested` is bash's own asymmetry, not an option: a function defined
+/// inside another one is printed with the `function` keyword in front
+/// of it, where the outer one is not.
+fn format_function_at(name: &str, body: &Command, indent: usize, nested: bool) -> String {
+    let here = pad(indent);
+    let keyword = if nested { "function " } else { "" };
+    let mut out = format!("{}{} () \n{}{{ \n", keyword, name, here);
+    // Whatever the body was written as, it prints as a brace group:
+    // `f() ( echo x )` comes back as a group containing the subshell.
+    match body {
+        Command::Group(prog, redirects) => {
+            format_list(prog, indent + 1, false, &mut out);
+            out.push_str(&here);
+            out.push('}');
+            for r in redirects {
+                out.push(' ');
+                out.push_str(&format_redirect(r));
+            }
+        }
+        other => {
+            out.push_str(&pad(indent + 1));
+            out.push_str(&format_command(other, indent + 1));
+            out.push('\n');
+            out.push_str(&here);
+            out.push('}');
+        }
+    }
+    out
+}
+
+/// A program, one statement per line, each already indented.
+///
+/// `semi_on_last` is the whole subtlety: what follows the list decides
+/// whether its final statement keeps its separator. A `}` or a `;;`
+/// stands on its own, so the statement before it does not need one; a
+/// `fi`, `done`, `else` or `esac` does.
+fn format_list(prog: &[ListItem], indent: usize, semi_on_last: bool, out: &mut String) {
+    // `&` does not end the line the way `;` does: bash writes
+    // `echo a & echo b` on one, and only breaks when a `;` or the end
+    // of the list says to.
+    let mut at_line_start = true;
+    for (i, item) in prog.iter().enumerate() {
+        if at_line_start {
+            out.push_str(&pad(indent));
+        }
+        out.push_str(&format_and_or(&item.and_or, indent));
+        let last = i + 1 == prog.len();
+        at_line_start = true;
+        match item.sep {
+            Sep::Background if last => out.push_str(" &\n"),
+            Sep::Background => {
+                out.push_str(" & ");
+                at_line_start = false;
+            }
+            Sep::Seq if !last || semi_on_last => out.push_str(";\n"),
+            Sep::Seq => out.push('\n'),
+        }
+    }
+}
+
+/// A program written on one line, for the places bash puts one there:
+/// an `if`/`while` condition, or a subshell's body. A condition of more
+/// than one statement wraps, with the continuation at the enclosing
+/// statement's own indent -- `if a;\n    b; then`.
+fn format_list_inline(prog: &[ListItem], indent: usize) -> String {
+    let mut out = String::new();
+    for (i, item) in prog.iter().enumerate() {
+        if i > 0 {
+            out.push('\n');
+            out.push_str(&pad(indent));
+        }
+        out.push_str(&format_and_or(&item.and_or, indent));
+        if i + 1 < prog.len() {
+            out.push_str(match item.sep {
+                Sep::Background => " &",
+                Sep::Seq => ";",
+            });
+        }
+    }
+    out
+}
+
+fn format_and_or(ao: &AndOr, indent: usize) -> String {
+    let mut s = format_pipeline(&ao.first, indent);
+    for (comb, p) in &ao.rest {
+        s.push_str(match comb {
+            Combinator::And => " && ",
+            Combinator::Or => " || ",
+        });
+        s.push_str(&format_pipeline(p, indent));
+    }
+    s
+}
+
+fn format_pipeline(p: &Pipeline, indent: usize) -> String {
+    let mut s = String::new();
+    match p.timed {
+        Some(crate::parser::TimeStyle::Shell) => s.push_str("time "),
+        Some(crate::parser::TimeStyle::Posix) => s.push_str("time -p "),
+        None => {}
+    }
+    if p.negate {
+        s.push_str("! ");
+    }
+    s.push_str(&p.commands.iter().map(|c| format_command(c, indent)).collect::<Vec<_>>().join(" | "));
+    s
+}
+
+fn format_command(cmd: &Command, indent: usize) -> String {
+    let inner = pad(indent + 1);
+    let here = pad(indent);
+    match cmd {
+        Command::Simple(sc) => format_simple(sc),
+        // `elif` is not in bash's output at all: it prints the second
+        // `if` as the first one's `else` body, nested a level in. This
+        // reproduces that rather than the source, because that is what
+        // reading `declare -f` in bash shows.
+        Command::If { branches, else_branch, redirects } => {
+            let mut s = String::new();
+            for (i, (cond, body)) in branches.iter().enumerate() {
+                let at = indent + i;
+                if i > 0 {
+                    s.push_str(&pad(at - 1));
+                    s.push_str("else\n");
+                    s.push_str(&pad(at));
+                }
+                s.push_str("if ");
+                s.push_str(&format_list_inline(cond, at));
+                s.push_str("; then\n");
+                format_list(body, at + 1, true, &mut s);
+            }
+            let deepest = indent + branches.len() - 1;
+            if let Some(e) = else_branch {
+                s.push_str(&pad(deepest));
+                s.push_str("else\n");
+                format_list(e, deepest + 1, true, &mut s);
+            }
+            // Closed from the inside out, each `fi` but the outermost
+            // ending a statement that the `else` above it continues.
+            for depth in (indent..=deepest).rev() {
+                s.push_str(&pad(depth));
+                s.push_str("fi");
+                if depth > indent {
+                    s.push_str(";\n");
+                }
+            }
+            with_formatted_redirects(s, redirects)
+        }
+        Command::While { cond, body, until, redirects } => {
+            let mut s = String::new();
+            s.push_str(if *until { "until " } else { "while " });
+            s.push_str(&format_list_inline(cond, indent));
+            s.push_str("; do\n");
+            format_list(body, indent + 1, true, &mut s);
+            s.push_str(&here);
+            s.push_str("done");
+            with_formatted_redirects(s, redirects)
+        }
+        Command::For { var, words, body, redirects } => {
+            // A `for x` with no list iterates the positional parameters,
+            // and bash prints the list it stands for rather than the
+            // shorthand.
+            let items = match words {
+                Some(words) => words.iter().map(serialize_word).collect::<Vec<_>>().join(" "),
+                None => "\"$@\"".to_string(),
+            };
+            let mut s = format!("for {} in {};\n{}do\n", var, items, here);
+            format_list(body, indent + 1, true, &mut s);
+            s.push_str(&here);
+            s.push_str("done");
+            with_formatted_redirects(s, redirects)
+        }
+        Command::CFor { init, cond, step, body, redirects } => {
+            let mut s = format!("for (({}; {}; {}))\n{}do\n", init.trim(), cond.trim(), step.trim(), here);
+            format_list(body, indent + 1, true, &mut s);
+            s.push_str(&here);
+            s.push_str("done");
+            with_formatted_redirects(s, redirects)
+        }
+        Command::Select { var, words, body, redirects } => {
+            let items = match words {
+                Some(words) => words.iter().map(serialize_word).collect::<Vec<_>>().join(" "),
+                None => "\"$@\"".to_string(),
+            };
+            let mut s = format!("select {} in {};\n{}do\n", var, items, here);
+            format_list(body, indent + 1, true, &mut s);
+            s.push_str(&here);
+            s.push_str("done");
+            with_formatted_redirects(s, redirects)
+        }
+        Command::Case { word, arms, redirects } => {
+            let mut s = format!("case {} in \n", serialize_word(word));
+            for (patterns, body, term) in arms {
+                s.push_str(&inner);
+                s.push_str(&patterns.iter().map(serialize_word).collect::<Vec<_>>().join(" | "));
+                s.push_str(")\n");
+                format_list(body, indent + 2, false, &mut s);
+                s.push_str(&inner);
+                s.push_str(match term {
+                    crate::parser::CaseTerm::Stop => ";;\n",
+                    crate::parser::CaseTerm::FallThrough => ";&\n",
+                    crate::parser::CaseTerm::Continue => ";;&\n",
+                });
+            }
+            s.push_str(&here);
+            s.push_str("esac");
+            with_formatted_redirects(s, redirects)
+        }
+        Command::Group(prog, redirects) => {
+            let mut s = String::from("{ \n");
+            format_list(prog, indent + 1, false, &mut s);
+            s.push_str(&here);
+            s.push('}');
+            with_formatted_redirects(s, redirects)
+        }
+        // Held as source text rather than a tree (see Command::Subshell),
+        // so it is parsed here to be laid out. A body that will not parse
+        // is written back as it stands -- it is still what the function
+        // contains.
+        Command::Subshell(raw, redirects) => {
+            let s = match reparse(raw) {
+                Some(prog) => format!("( {} )", format_list_inline(&prog, indent)),
+                None => format!("( {} )", raw.trim()),
+            };
+            with_formatted_redirects(s, redirects)
+        }
+        // Verbatim between the parentheses, spaces and all: bash keeps
+        // whatever was written there, so `((n++))` and `(( n++ ))` each
+        // come back as themselves.
+        Command::Arith(raw, redirects) => with_formatted_redirects(format!("(({}))", raw), redirects),
+        Command::Test(atoms, redirects) => with_formatted_redirects(format!("[[ {} ]]", serialize_test_atoms(atoms)), redirects),
+        Command::FuncDef { name, body } => format_function_at(name, body, indent, true),
+        Command::Coproc { name, body } => match name {
+            Some(n) => format!("coproc {} {}", n, format_command(body, indent)),
+            None => format!("coproc {}", format_command(body, indent)),
+        },
+    }
+}
+
+fn reparse(raw: &str) -> Option<Vec<ListItem>> {
+    let tokens = crate::lexer::Lexer::new(raw).tokenize().ok()?;
+    crate::parser::Parser::new(tokens).parse_program().ok()
+}
+
+fn with_formatted_redirects(mut s: String, redirects: &[Redirect]) -> String {
+    for r in redirects {
+        s.push(' ');
+        s.push_str(&format_redirect(r));
+    }
+    s
+}
+
+fn format_simple(sc: &SimpleCommand) -> String {
+    let mut parts: Vec<String> = serialize_simple_parts(sc);
+    parts.extend(sc.redirects.iter().map(format_redirect));
+    parts.join(" ")
+}
+
+/// A redirect the way bash prints one: the operator, then a space
+/// before a *file* and none before a descriptor. `>&2` is printed with
+/// the descriptor it implies, as `1>&2`.
+fn format_redirect(r: &Redirect) -> String {
+    match r {
+        Redirect::In(w) => format!("< {}", serialize_word(w)),
+        Redirect::InOut(w) => format!("<> {}", serialize_word(w)),
+        Redirect::Out { word, append, clobber } => format!("{} {}", redirect_op(*append, *clobber), serialize_word(word)),
+        Redirect::Err { word, append, clobber } => format!("2{} {}", redirect_op(*append, *clobber), serialize_word(word)),
+        Redirect::Both { word, append } => format!("&{} {}", if *append { ">>" } else { ">" }, serialize_word(word)),
+        Redirect::DupErrToOut => "2>&1".to_string(),
+        Redirect::FdOut { fd, word, append, clobber } => format!("{}{} {}", fd, redirect_op(*append, *clobber), serialize_word(word)),
+        Redirect::FdIn { fd, word } => format!("{}< {}", fd, serialize_word(word)),
+        Redirect::FdInOut { fd, word } => format!("{}<> {}", fd, serialize_word(word)),
+        Redirect::FdDup { fd, target } => format!("{}>&{}", fd, target),
+        Redirect::FdDupWord { fd, word } => format!("{}>&{}", fd, serialize_word(word)),
+        Redirect::FdClose { fd } => format!("{}>&-", fd),
+        // The forms with nothing to normalise, or nothing bash's own
+        // layout says about them.
+        other => serialize_redirect(other),
+    }
 }
 
 #[cfg(test)]
