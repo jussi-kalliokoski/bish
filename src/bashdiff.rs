@@ -1417,24 +1417,24 @@ y
 
     /// Cases the pane corpus does not run at all.
     ///
-    /// One family, where there were two. Every `process-subst-` case --
-    /// the *reading* `<( )` direction -- used to be here as
-    /// load-dependent noise, and that was not noise: a foreground
-    /// command in a pane is stashed rather than run, so
-    /// `drain_proc_subs` tore the producer down before its reader had
-    /// started, and how much got through depended on how fast the
-    /// machine was. Deferring the teardown fixed all of them, and they
-    /// run now.
+    /// Empty, and it took two goes to get here. Both halves of process
+    /// substitution used to be on this list as load-dependent noise,
+    /// and neither was noise: a foreground command in a pane is stashed
+    /// rather than run, so `drain_proc_subs` was tearing the
+    /// substitution down before the command that needed it had started.
+    /// A `<( )` producer lost everything past one pipe buffer; a `>( )`
+    /// consumer was handed end-of-input before its writer had written.
     ///
-    /// The writing direction is a different race and is still here.
-    /// `/bin/echo hi > >(cat)` hands `cat` its input and then wants it
-    /// to have finished; the wind-down offers scheduler turns, which
-    /// help a coroutine and do nothing for a process. Waiting for
-    /// `>( )` consumers is the fix, and is its own piece of work.
-    const PANE_SKIPPED: &[(&str, &str)] = &[(
-        "proc-sub-out-",
-        "a `>( )` consumer is a process, and nothing waits for it; the wind-down spends scheduler turns, which a process does not need",
-    )];
+    /// Deferring that teardown past the pending job fixed both. The
+    /// reading half was un-skipped when the fix landed; the writing
+    /// half was held back one more round on the strength of a single
+    /// intermittent failure, which measurement did not reproduce --
+    /// nine `proc-sub-out-` cases, alone and under load, four whole
+    /// pane corpus runs, and the full suite twice. The entry it used to
+    /// have claimed nothing waits for a `>( )` consumer, which is true
+    /// and, now that the teardown happens at the right moment, not
+    /// something these cases can tell.
+    const PANE_SKIPPED: &[(&str, &str)] = &[];
 
     /// The cases the pane corpus actually compares.
     fn pane_cases() -> Vec<Case> {
