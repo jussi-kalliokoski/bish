@@ -241,6 +241,14 @@ mod tests {
         case("gu-upper-a-word", "abc\n", "gUiw"),
         case("g-tilde-a-line", "aBc\n", "g~~"),
         case("visual-paste-over", "ab\ncd\n", "yyjVp"),
+        // The editor's `/` is ERE, and now has GNU's zero-width
+        // assertions in it. `\<`, `\>`, `\w` and `\s` mean the same
+        // things to vim, so these are cases where the two surfaces
+        // agree and the corpus can say so.
+        case("search-word-start", "foobar\nfoo bar\n", "/\\<bar\rx"),
+        case("search-word-end", "barn\nfoo bar\n", "/bar\\>\rx"),
+        case("search-word-class", "  %%\nab12\n", "/\\w\\w\rx"),
+        case("search-space-class", "ab\na b\n", "/\\s\rx"),
         // -- encodings -------------------------------------------------
         // A file that is not UTF-8 is still a file. These used to be
         // unopenable here: `TextBuffer::open` was `read_to_string`, so

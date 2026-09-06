@@ -24,6 +24,15 @@ enum Re {
     Alt(Vec<Re>),
     Start,
     End,
+    /// `\b` and `\B`: a position where a word character is on exactly
+    /// one side, or on both/neither. Consumes nothing -- which is what
+    /// made it worth having a matcher that can express "a predicate on
+    /// where you are" at all.
+    WordBoundary(bool),
+    /// `\<` and `\>`: the two halves of `\b`, told apart by which side
+    /// the word is on. GNU's own extension, and bash has it.
+    WordStart,
+    WordEnd,
     // Numbered per ERE convention: by position of the opening paren, left
     // to right, regardless of nesting depth -- so `((a)(b))` is group 1 =
     // "(a)(b)" (the whole outer), group 2 = "(a)", group 3 = "(b)".
@@ -167,7 +176,7 @@ impl<'a> ReParser<'a> {
                 self.pos += 1;
                 let c = self.peek().unwrap_or('\\');
                 self.pos += 1;
-                Re::Char(c)
+                escaped_atom(c)
             }
             Some(c) => {
                 self.pos += 1;
@@ -217,6 +226,52 @@ impl<'a> ReParser<'a> {
         }
         Re::Class(ranges, negated)
     }
+}
+
+/// What a backslash escape means.
+///
+/// GNU's set, because that is what bash has: `\b`/`\B` and `\<`/`\>`
+/// for word boundaries, `\w`/`\W`/`\s`/`\S` for the two classes
+/// people reach for, and `` \` ``/`\'` for the ends of the text. Every
+/// other escape is the character itself, which is what makes `\.` a
+/// dot and `\\` a backslash.
+///
+/// `\d` is deliberately *not* here. It is Perl's, not POSIX's and not
+/// GNU's: bash matches `\d+` against `ab123` and finds nothing, because
+/// to glibc that pattern is one or more letter `d`s. Adding it would
+/// have been a silent disagreement with the shell this one is measured
+/// against -- the probe is what said so, not the guess that preceded
+/// it.
+fn escaped_atom(c: char) -> Re {
+    let class = |name: &[u8], negated: bool, extra: &[(char, char)]| {
+        let mut ranges: Vec<(char, char)> =
+            crate::glob::posix_class_ranges(name).unwrap_or(&[]).iter().map(|(lo, hi)| (*lo as char, *hi as char)).collect();
+        ranges.extend_from_slice(extra);
+        Re::Class(ranges, negated)
+    };
+    match c {
+        'b' => Re::WordBoundary(true),
+        'B' => Re::WordBoundary(false),
+        '<' => Re::WordStart,
+        '>' => Re::WordEnd,
+        // A word character is alphanumeric or an underscore -- glibc's
+        // own `[_[:alnum:]]`, which is why `a_1` is one word to both.
+        'w' => class(b"alnum", false, &[('_', '_')]),
+        'W' => class(b"alnum", true, &[('_', '_')]),
+        's' => class(b"space", false, &[]),
+        'S' => class(b"space", true, &[]),
+        // The ends of the *text*, which in this engine is what `^` and
+        // `$` already mean: there is no multi-line mode for them to
+        // differ from.
+        '`' => Re::Start,
+        '\'' => Re::End,
+        _ => Re::Char(c),
+    }
+}
+
+/// Alphanumeric or underscore -- what sits on either side of a `\b`.
+fn is_word_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
 }
 
 fn parse(pattern: &str) -> (Re, usize) {
@@ -318,6 +373,10 @@ enum Inst {
     Class(Vec<(char, char)>, bool),
     AtStart,
     AtEnd,
+    /// True for `\b`, false for `\B`.
+    AtWordBoundary(bool),
+    AtWordStart,
+    AtWordEnd,
     /// Try `0` first; `1` is the lower-priority alternative.
     Split(usize, usize),
     Jmp(usize),
@@ -351,6 +410,9 @@ fn emit(re: &Re, prog: &mut Vec<Inst>) {
         Re::Class(ranges, negated) => prog.push(Inst::Class(ranges.clone(), *negated)),
         Re::Start => prog.push(Inst::AtStart),
         Re::End => prog.push(Inst::AtEnd),
+        Re::WordBoundary(want) => prog.push(Inst::AtWordBoundary(*want)),
+        Re::WordStart => prog.push(Inst::AtWordStart),
+        Re::WordEnd => prog.push(Inst::AtWordEnd),
         Re::Concat(parts) => {
             for p in parts {
                 emit(p, prog);
@@ -472,33 +534,57 @@ impl Threads {
     }
 
     /// Follows every instruction that consumes no input -- jumps,
-    /// splits, saves and the anchors -- and adds the pcs that do.
+    /// splits, saves and the assertions -- and adds the pcs that do.
     /// Depth-first and in priority order, so the list stays ordered by
     /// the branch order the pattern was written in.
-    fn add(&mut self, prog: &[Inst], pc: usize, pos: usize, at_end: bool, slots: &Slots) {
+    ///
+    /// The whole text is here, not just the position, because an
+    /// assertion is a question about where `pos` *is*: `\b` needs the
+    /// character on either side of it. Consuming nothing and looking at
+    /// its neighbours is the entire shape of a zero-width assertion,
+    /// and it is why they belong in this walk rather than in the step
+    /// that eats a character.
+    fn add(&mut self, prog: &[Inst], pc: usize, chars: &[char], pos: usize, slots: &Slots) {
         if self.on_list[pc] {
             return;
         }
         self.on_list[pc] = true;
+        let before = pos.checked_sub(1).and_then(|i| chars.get(i)).copied().is_some_and(is_word_char);
+        let after = chars.get(pos).copied().is_some_and(is_word_char);
         match &prog[pc] {
-            Inst::Jmp(to) => self.add(prog, *to, pos, at_end, slots),
+            Inst::Jmp(to) => self.add(prog, *to, chars, pos, slots),
             Inst::Split(a, b) => {
-                self.add(prog, *a, pos, at_end, slots);
-                self.add(prog, *b, pos, at_end, slots);
+                self.add(prog, *a, chars, pos, slots);
+                self.add(prog, *b, chars, pos, slots);
             }
             Inst::Save(slot) => {
                 let mut next = slots.clone();
                 next[*slot] = Some(pos);
-                self.add(prog, pc + 1, pos, at_end, &next);
+                self.add(prog, pc + 1, chars, pos, &next);
             }
             Inst::AtStart => {
                 if pos == 0 {
-                    self.add(prog, pc + 1, pos, at_end, slots);
+                    self.add(prog, pc + 1, chars, pos, slots);
                 }
             }
             Inst::AtEnd => {
-                if at_end {
-                    self.add(prog, pc + 1, pos, at_end, slots);
+                if pos == chars.len() {
+                    self.add(prog, pc + 1, chars, pos, slots);
+                }
+            }
+            Inst::AtWordBoundary(want) => {
+                if (before != after) == *want {
+                    self.add(prog, pc + 1, chars, pos, slots);
+                }
+            }
+            Inst::AtWordStart => {
+                if !before && after {
+                    self.add(prog, pc + 1, chars, pos, slots);
+                }
+            }
+            Inst::AtWordEnd => {
+                if before && !after {
+                    self.add(prog, pc + 1, chars, pos, slots);
                 }
             }
             _ => self.dense.push((pc, slots.clone())),
@@ -550,7 +636,7 @@ fn run(prog: &Program, chars: &[char], from: usize, anchored: bool, ignore_case:
         // is what makes an earlier start outrank it. Once anything has
         // matched, no later start could win, so none is added.
         if best.is_none() && (!anchored || at == from) {
-            clist.add(insts, 0, at, at == chars.len(), &empty);
+            clist.add(insts, 0, chars, at, &empty);
         }
         for (pc, slots) in &clist.dense {
             if matches!(insts[*pc], Inst::Match) {
@@ -588,7 +674,7 @@ fn run(prog: &Program, chars: &[char], from: usize, anchored: bool, ignore_case:
                 _ => false,
             };
             if consumes {
-                nlist.add(insts, pc + 1, at + 1, at + 1 == chars.len(), slots);
+                nlist.add(insts, pc + 1, chars, at + 1, slots);
             }
         }
         std::mem::swap(&mut clist, &mut nlist);
@@ -847,5 +933,64 @@ mod tests {
         let text: String = std::iter::repeat_n('a', 20_000).collect();
         let re = Regex::compile("(a|aa)*b", false);
         assert!(re.find_at(&chars(&text), 0).is_none());
+    }
+    // Assertions consume nothing and ask about where they are, which is
+    // the one thing a matcher that only ever eats characters cannot
+    // express. The set is GNU's, because that is what bash has.
+    #[test]
+    fn word_boundaries_are_positions_not_characters() {
+        assert!(m("\\bbar", "foo bar", false));
+        assert!(!m("\\bbar", "foobar", false));
+        assert!(m("foo\\b", "foo bar", false));
+        assert!(m("\\Bar", "foo bar", false), "inside a word is where \\B holds");
+        assert!(!m("\\Bfoo", "foo", false));
+        assert!(m("\\<bar", "foo bar", false));
+        assert!(!m("\\<ar", "foo bar", false));
+        assert!(m("bar\\>", "foo bar", false));
+        assert!(!m("ba\\>", "foo bar", false));
+    }
+
+    #[test]
+    fn the_two_shorthand_classes_are_the_ones_glibc_has() {
+        assert_eq!(match_captures("a_1 %", "\\w+", false), Some(vec!["a_1".to_string()]), "a word character is alphanumeric or an underscore");
+        assert_eq!(match_captures("ab %", "\\W", false), Some(vec![" ".to_string()]));
+        assert_eq!(match_captures("ab cd", "\\s", false), Some(vec![" ".to_string()]));
+        assert_eq!(match_captures("  xy", "\\S+", false), Some(vec!["xy".to_string()]));
+    }
+
+    // `\d` is Perl's, not GNU's. bash finds nothing in `ab123` for
+    // `\d+`, because to glibc that pattern is one or more letter `d`s,
+    // and this agrees with the shell it is measured against rather than
+    // with the habit.
+    #[test]
+    fn a_perl_shorthand_this_engine_does_not_have_is_a_literal() {
+        assert!(!m("\\d+", "ab123", false));
+        assert!(m("\\d+", "add", false), "which is what a literal `d` matches");
+    }
+
+    #[test]
+    fn the_ends_of_the_text_have_their_own_spelling_too() {
+        assert!(m("\\`abc", "abc", false));
+        assert!(!m("\\`bc", "abc", false));
+        assert!(m("abc\\'", "abc", false));
+        assert!(!m("ab\\'", "abc", false));
+    }
+
+    // Every other escape is still the character itself, which is what
+    // makes `\.` a dot rather than any character.
+    #[test]
+    fn an_escape_with_no_meaning_is_the_character() {
+        assert!(m("a\\.b", "a.b", false));
+        assert!(!m("a\\.b", "axb", false));
+        assert!(m("a\\nb", "anb", false), "\\n is the letter n here, as it is in bash");
+    }
+
+    // An assertion inside a repetition still has to hold every time
+    // round, which is the case a matcher that treated it as a character
+    // would get wrong in the other direction.
+    #[test]
+    fn an_assertion_inside_a_repetition_holds_each_time() {
+        assert_eq!(match_captures("one two", "(\\w+\\s*)+", false), Some(vec!["one two".to_string(), "two".to_string()]));
+        assert!(!m("^(\\bx)+$", "xx", false), "only the first x begins a word");
     }
 }

@@ -323,6 +323,29 @@ mod tests {
         // way of splitting a run of `a`s, none of which works. Thirty
         // characters was already 2^30 of them, so four hundred settles
         // it -- either this returns at once or it never returns.
+        // Escapes that mean something other than the character after
+        // the backslash. Every one of these used to be that character:
+        // `\bbar` was `bbar`, so it matched nothing in `foo bar`, and
+        // said so without a word.
+        case(
+            "regex-word-boundaries",
+            r#"for re in '\bbar' 'foo\b' '\Bar' '\<bar' 'bar\>'; do [[ "foo bar" =~ $re ]] && echo "$re [${BASH_REMATCH[0]}]" || echo "$re no"; done"#,
+        ),
+        case(
+            "regex-shorthand-classes",
+            r#"re='\w+'; [[ 'a_1 %' =~ $re ]]; echo "[${BASH_REMATCH[0]}]"; re='\S+'; [[ '  xy' =~ $re ]]; echo "[${BASH_REMATCH[0]}]"; re='\s'; [[ 'ab cd' =~ $re ]]; echo "[${BASH_REMATCH[0]}]""#,
+        ),
+        // `\d` is Perl's and glibc does not have it, so bash reads it
+        // as a literal `d`. Recorded because agreeing with the habit
+        // instead of with the shell would have been the easy mistake.
+        case(
+            "regex-a-perl-shorthand-is-a-literal",
+            r#"re='\d+'; [[ ab123 =~ $re ]] && echo "digits [${BASH_REMATCH[0]}]" || echo none; [[ add =~ $re ]] && echo "letters [${BASH_REMATCH[0]}]""#,
+        ),
+        case(
+            "regex-the-ends-of-the-text",
+            r#"re='\`abc'; [[ abc =~ $re ]] && echo start; re="abc\\'"; [[ abc =~ $re ]] && echo end; re='\`bc'; [[ abc =~ $re ]] && echo bad || echo anchored"#,
+        ),
         case(
             "regex-a-nested-quantifier-does-not-hang",
             r#"t=$(printf 'a%.0s' {1..400}); re='^(a+)+$'; [[ $t =~ $re ]] && echo "y ${#BASH_REMATCH[0]}"; [[ ${t}b =~ $re ]] && echo bad || echo "n"; re='(a|aa)*b'; [[ $t =~ $re ]] && echo bad || echo n"#,
