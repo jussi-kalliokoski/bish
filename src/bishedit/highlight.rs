@@ -553,7 +553,28 @@ pub fn highlighter_for_language(language: &str) -> Option<Box<dyn Highlighter>> 
         "ini" => Some(Box::new(IniHighlighter)),
         "toml" => Some(Box::new(TomlHighlighter)),
         "dotenv" => Some(Box::new(DotenvHighlighter)),
+        // Token scanners rather than real parsers -- see
+        // codehighlight.rs for why that is the right depth for these.
+        "rust" => Some(Box::new(CodeHighlighter(super::codehighlight::rust))),
+        "python" => Some(Box::new(CodeHighlighter(super::codehighlight::python))),
+        "javascript" => Some(Box::new(CodeHighlighter(super::codehighlight::javascript))),
+        "typescript" => Some(Box::new(CodeHighlighter(super::codehighlight::typescript))),
         _ => None,
+    }
+}
+
+// The adapter for codehighlight.rs's scanners: each is a plain function
+// from text to (range, kind) pairs, with no use for `ctx` -- cwd, known
+// functions and command validity are shell notions with no counterpart
+// in a program in another language.
+pub struct CodeHighlighter(CodeScanner);
+
+/// What every scanner in codehighlight.rs is: text in, spans out.
+type CodeScanner = fn(&str) -> Vec<(std::ops::Range<usize>, HighlightKind)>;
+
+impl Highlighter for CodeHighlighter {
+    fn highlight(&self, text: &str, _ctx: HighlightContext) -> Vec<HighlightSpan> {
+        (self.0)(text).into_iter().map(|(range, kind)| span(range, kind)).collect()
     }
 }
 
