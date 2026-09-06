@@ -1405,46 +1405,77 @@ pub(crate) fn visible_len(s: &str) -> usize {
 // codes encountered along the way (they don't count against the
 // budget) rather than risking a mid-escape-sequence cut.
 //
-// Unlike visible_len, *not* grapheme-cluster-aware yet: this streams
-// char-by-char with only one-char lookahead (for the escape-sequence
-// check), so a truncation point could in principle land mid-cluster --
-// e.g. cutting a ZWJ emoji sequence in half. A real, deliberately
-// deferred gap (this function would need the same escapes-stripped-
-// into-a-Vec<char>-then-walked-in-clusters restructuring visible_len
-// just got, plus stitching the original escapes back into the
-// truncated result at the right points): this only ever triggers when
-// a pane is too narrow even for the prompt alone to fit -- see this
-// function's own next comment -- rare enough, and degrading to "one
-// glyph looks broken in an already-degenerate layout" rather than a
-// crash or stuck cursor, that it's not worth the complexity here yet.
-// A wide char
-// that would only *partially* fit (`max_visible` has exactly 1 column
-// left, the next char is 2 columns wide) is dropped whole rather than
-// split -- there's no such thing as half a CJK glyph, and this only
+// Grapheme-cluster-aware, as `visible_len` is, and for the same
+// reason: a cut that lands in the middle of a ZWJ sequence or between
+// a base character and its combining mark leaves half a glyph, and
+// half a glyph is not one column narrower -- it is a different
+// character. So the input is taken apart into escape sequences (no
+// width) and visible characters (some), the cluster boundaries are
+// found in the visible characters alone -- an escape between a base
+// and its mark does not break the cluster it sits in -- and a cluster
+// is then admitted or refused whole.
+//
+// A wide character that would only *partially* fit (`max_visible` has
+// exactly one column left, the next character is two wide) is dropped
+// whole rather than split -- there's no such thing as half a CJK glyph, and this only
 // ever feeds into padding/truncation math that tolerates landing one
 // column short of the budget, never one over it.
 fn truncate_visible(s: &str, max_visible: usize) -> String {
-    let mut out = String::new();
-    let mut visible = 0;
+    enum Piece {
+        /// An SGR sequence, kept as written and costing nothing.
+        Escape(String),
+        /// One visible character, and its index among the visible
+        /// characters -- which is the sequence cluster boundaries are
+        /// found in.
+        Visible(char, usize),
+    }
+
+    let mut pieces: Vec<Piece> = Vec::new();
+    let mut visible: Vec<char> = Vec::new();
     let mut chars = s.chars().peekable();
     while let Some(c) = chars.next() {
         if c == '\x1b' && chars.peek() == Some(&'[') {
-            out.push(c);
-            out.push(chars.next().unwrap());
+            let mut escape = String::from(c);
+            escape.push(chars.next().expect("peeked"));
             for c2 in chars.by_ref() {
-                out.push(c2);
+                escape.push(c2);
                 if c2 == 'm' {
                     break;
                 }
             }
+            pieces.push(Piece::Escape(escape));
             continue;
         }
-        let w = char_width(c);
-        if visible + w > max_visible {
-            break;
+        pieces.push(Piece::Visible(c, visible.len()));
+        visible.push(c);
+    }
+
+    // Where each cluster begins. A character that is not one of these
+    // is the rest of the cluster before it, and rides along with
+    // whatever was decided about that one.
+    let mut starts = vec![false; visible.len()];
+    let mut i = 0;
+    while i < visible.len() {
+        starts[i] = true;
+        i = crate::bishedit::grapheme::next_boundary(&visible, i);
+    }
+
+    let mut out = String::new();
+    let mut used = 0;
+    for piece in pieces {
+        match piece {
+            Piece::Escape(escape) => out.push_str(&escape),
+            Piece::Visible(c, at) => {
+                if starts[at] {
+                    let width = char_width(c);
+                    if used + width > max_visible {
+                        break;
+                    }
+                    used += width;
+                }
+                out.push(c);
+            }
         }
-        out.push(c);
-        visible += w;
     }
     out
 }
@@ -3847,6 +3878,35 @@ mod tests {
         // the cut" behavior -- a trailing reset code past that point
         // isn't included either).
         assert_eq!(truncate_visible("\x1b[1ma中\x1b[0m", 1), "\x1b[1ma");
+    }
+
+    // The gap this function's own comment used to flag: a cut that
+    // lands inside a cluster leaves half a glyph, which is not one
+    // column narrower -- it is a different character.
+    #[test]
+    fn truncate_visible_never_cuts_a_cluster_in_half() {
+        let family = "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}";
+        // Two columns for the whole family, so a budget of two takes it
+        // and a budget of one takes none of it -- never the first
+        // person in it.
+        assert_eq!(truncate_visible(family, 2), family);
+        assert_eq!(truncate_visible(family, 1), "");
+        assert_eq!(truncate_visible(&format!("a{family}"), 2), "a", "one column left is not enough for the family");
+        assert_eq!(truncate_visible(&format!("a{family}"), 3), format!("a{family}"));
+        // A base and its combining mark are one cluster and one
+        // column, so the mark is never left behind on its own.
+        assert_eq!(truncate_visible("e\u{301}x", 1), "e\u{301}");
+        assert_eq!(truncate_visible("ae\u{301}x", 2), "ae\u{301}");
+    }
+
+    // An SGR code inside a cluster does not break it: the colours are
+    // not part of the text, and the cluster they interrupt is still one
+    // glyph.
+    #[test]
+    fn truncate_visible_keeps_a_cluster_whole_across_a_colour_change() {
+        let coloured = "a\u{1f468}\x1b[1m\u{200d}\u{1f469}\x1b[0m";
+        assert_eq!(truncate_visible(coloured, 3), coloured);
+        assert_eq!(truncate_visible(coloured, 2), "a", "the pair does not fit, so none of it goes");
     }
 
     #[test]
