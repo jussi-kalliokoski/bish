@@ -734,6 +734,279 @@ fn yaml_value(text: &str, from: usize, end: usize, out: &mut Spans) {
     }
 }
 
+// --- css ---------------------------------------------------------------
+//
+// Three things a stylesheet is made of, and which one a token is
+// depends only on where the braces are: outside a block it is a
+// selector, inside one it is a property up to the colon and a value
+// after it. `#fff` is an id selector in the first place and a colour in
+// the second, which is the whole reason this tracks depth rather than
+// scanning words.
+
+pub fn css(text: &str) -> Spans {
+    let mut s = Scan::new(text);
+    let mut depth = 0usize;
+    // Whether the cursor has passed a `:` inside the current
+    // declaration -- what separates a property from its value.
+    let mut in_value = false;
+    let mut selector_start = None;
+    while !s.done() {
+        if s.block_comment("/*", "*/", false) {
+            continue;
+        }
+        let c = s.here();
+        // Outside a block, everything that is not blank is part of the
+        // selector until a `{` closes it -- `.card > p::before` is one
+        // name for one thing, punctuation and all. Recorded here rather
+        // than in each arm so that a selector cannot start on a space
+        // and cannot carry over a `;` from the at-rule before it.
+        if depth == 0 && !c.is_ascii_whitespace() && !matches!(c, b'@' | b';') && selector_start.is_none() {
+            selector_start = Some(s.pos);
+        }
+        match c {
+            b'"' => s.quoted(b'"', false),
+            b'\'' => s.quoted(b'\'', false),
+            b'{' => {
+                if let Some(start) = selector_start.take() {
+                    css_selector(&mut s, start);
+                }
+                s.out.push((s.pos..s.pos + 1, HighlightKind::Operator));
+                s.pos += 1;
+                depth += 1;
+                in_value = false;
+            }
+            b'}' => {
+                s.out.push((s.pos..s.pos + 1, HighlightKind::Operator));
+                s.pos += 1;
+                depth = depth.saturating_sub(1);
+                in_value = false;
+                selector_start = None;
+            }
+            b':' if depth > 0 => {
+                s.out.push((s.pos..s.pos + 1, HighlightKind::Operator));
+                s.pos += 1;
+                in_value = true;
+            }
+            b';' => {
+                s.out.push((s.pos..s.pos + 1, HighlightKind::Operator));
+                s.pos += 1;
+                in_value = false;
+                selector_start = None;
+            }
+            // An at-rule names what it is, and its prelude is a
+            // selector-shaped thing either way.
+            b'@' if ident_start(s.at(s.pos + 1)) => {
+                let start = s.pos;
+                s.pos += 1;
+                css_ident(&mut s);
+                // At the top level this names a rule; inside a value it
+                // names a colour, which is GTK's own extension and the
+                // only place a stylesheet this editor is likely to open
+                // uses one.
+                let kind = match in_value {
+                    true => HighlightKind::Variable,
+                    false => HighlightKind::Keyword,
+                };
+                s.push(start, kind);
+            }
+            b'!' if depth > 0 => {
+                let start = s.pos;
+                s.pos += 1;
+                css_ident(&mut s);
+                s.push(start, HighlightKind::Keyword);
+            }
+            // A custom property, and the `var(--x)` that reads it.
+            b'-' if s.at(s.pos + 1) == b'-' && ident_start(s.at(s.pos + 2)) => {
+                let start = s.pos;
+                s.pos += 2;
+                css_ident(&mut s);
+                s.push(start, HighlightKind::Variable);
+            }
+            b'#' if depth > 0 && in_value => {
+                let start = s.pos;
+                s.pos += 1;
+                css_ident(&mut s);
+                s.push(start, HighlightKind::Number);
+            }
+            c if c.is_ascii_digit() || (c == b'.' && s.at(s.pos + 1).is_ascii_digit()) => {
+                let start = s.pos;
+                s.number();
+                // The unit is part of the measurement: `10px` is one
+                // thing, not a number and a name.
+                if !s.done() && (ident_start(s.here()) || s.here() == b'%') {
+                    if s.here() == b'%' {
+                        s.pos += 1;
+                    } else {
+                        css_ident(&mut s);
+                    }
+                    s.out.pop();
+                    s.push(start, HighlightKind::Number);
+                }
+            }
+            c if ident_start(c) => {
+                let start = s.pos;
+                css_ident(&mut s);
+                if depth > 0 && !in_value {
+                    s.push(start, HighlightKind::Key);
+                }
+            }
+            _ => s.pos += 1,
+        }
+    }
+    s.out
+}
+
+/// A CSS identifier, which may contain hyphens: `font-family` is one
+/// property name and not two, and splitting it was the first thing a
+/// real stylesheet showed up.
+fn css_ident(s: &mut Scan) {
+    while !s.done() && (ident_char(s.here()) || s.here() == b'-') {
+        s.pos += 1;
+    }
+}
+
+/// The whole selector as one span, `.`s and `#`s and all: a selector is
+/// one thing to a reader, the same call `IniHighlighter` makes for a
+/// section header.
+fn css_selector(s: &mut Scan, start: usize) {
+    let mut end = s.pos;
+    while end > start && s.at(end - 1).is_ascii_whitespace() {
+        end -= 1;
+    }
+    if end > start {
+        s.out.push((start..end, HighlightKind::Keyword));
+    }
+}
+
+// --- html --------------------------------------------------------------
+//
+// Its own scanner rather than the WHATWG tokenizer in html/tokenizer.rs,
+// which the browser uses: that one emits tokens without source spans
+// (one `Char` at a time, positions kept privately), so it would have to
+// grow an offset on every token to be useful here -- a change to the
+// code path the browser depends on, for the benefit of colouring text.
+// A scanner that only has to be right about where a tag begins and ends
+// is a smaller thing to be sure of.
+
+pub fn html(text: &str) -> Spans {
+    let mut s = Scan::new(text);
+    while !s.done() {
+        if s.looking_at("<!--") {
+            let start = s.pos;
+            s.pos += 4;
+            while !s.done() && !s.looking_at("-->") {
+                s.pos += 1;
+            }
+            s.pos = (s.pos + 3).min(s.src.len());
+            s.push(start, HighlightKind::Comment);
+            continue;
+        }
+        if s.looking_at("<!") {
+            let start = s.pos;
+            while !s.done() && s.here() != b'>' {
+                s.pos += 1;
+            }
+            s.pos = (s.pos + 1).min(s.src.len());
+            s.push(start, HighlightKind::Keyword);
+            continue;
+        }
+        if s.here() == b'<' && (ident_start(s.at(s.pos + 1)) || (s.at(s.pos + 1) == b'/' && ident_start(s.at(s.pos + 2)))) {
+            html_tag(&mut s);
+            continue;
+        }
+        // A character reference is a piece of this text that is not
+        // literal -- the same thing a string's escape is, and the same
+        // kind.
+        if s.here() == b'&' {
+            let start = s.pos;
+            let mut at = s.pos + 1;
+            if s.at(at) == b'#' {
+                at += 1;
+            }
+            while s.at(at).is_ascii_alphanumeric() {
+                at += 1;
+            }
+            if s.at(at) == b';' && at > s.pos + 1 {
+                s.pos = at + 1;
+                s.push(start, HighlightKind::FormatSpecifier);
+                continue;
+            }
+        }
+        s.pos += 1;
+    }
+    s.out
+}
+
+/// One tag, from `<` to the matching `>`. Returns having consumed it --
+/// and, for `<script>` and `<style>`, having consumed and scanned their
+/// contents with the scanner for the language inside them.
+fn html_tag(s: &mut Scan) {
+    let open = s.pos;
+    s.pos += 1;
+    if s.here() == b'/' {
+        s.pos += 1;
+    }
+    let name = s.word();
+    let name_text = s.text(&name).to_ascii_lowercase();
+    s.out.push((open..s.pos, HighlightKind::Keyword));
+    let closing = s.at(open + 1) == b'/';
+
+    while !s.done() && s.here() != b'>' {
+        match s.here() {
+            b'"' => s.quoted(b'"', true),
+            b'\'' => s.quoted(b'\'', true),
+            b'=' => {
+                s.out.push((s.pos..s.pos + 1, HighlightKind::Operator));
+                s.pos += 1;
+            }
+            c if ident_start(c) || c == b'-' || c == b':' || c == b'@' => {
+                let start = s.pos;
+                while !s.done() && (ident_char(s.here()) || matches!(s.here(), b'-' | b':' | b'@' | b'.')) {
+                    s.pos += 1;
+                }
+                s.push(start, HighlightKind::Key);
+            }
+            // An unquoted attribute value, which HTML still allows.
+            c if !c.is_ascii_whitespace() && c != b'/' => {
+                let start = s.pos;
+                while !s.done() && !s.here().is_ascii_whitespace() && s.here() != b'>' {
+                    s.pos += 1;
+                }
+                s.push(start, HighlightKind::String);
+            }
+            _ => s.pos += 1,
+        }
+    }
+    let tag_end = (s.pos + 1).min(s.src.len());
+    s.out.push((s.pos.min(tag_end)..tag_end, HighlightKind::Keyword));
+    s.pos = tag_end;
+
+    // `<script>` and `<style>` hold another language, and this editor
+    // has a scanner for both. The raw text runs to the matching end tag
+    // and nothing inside it is markup, which is exactly what makes it
+    // safe to hand over.
+    if closing {
+        return;
+    }
+    let scan: fn(&str) -> Spans = match name_text.as_str() {
+        "script" => javascript,
+        "style" => css,
+        _ => return,
+    };
+    let body_start = s.pos;
+    let close_tag = format!("</{name_text}");
+    while !s.done() {
+        if s.src[s.pos..].len() >= close_tag.len() && s.src[s.pos..s.pos + close_tag.len()].eq_ignore_ascii_case(close_tag.as_bytes()) {
+            break;
+        }
+        s.pos += 1;
+    }
+    let body = std::str::from_utf8(&s.src[body_start..s.pos]).unwrap_or("");
+    for (range, kind) in scan(body) {
+        s.out.push((body_start + range.start..body_start + range.end, kind));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -922,12 +1195,74 @@ mod tests {
         assert!(!spans.iter().any(|(t, k)| *k == HighlightKind::Number && (t == "1.2.3" || t.contains('-'))), "{spans:?}");
     }
 
+    #[test]
+    fn css_tells_a_selector_from_a_property_from_a_value() {
+        let text = ".card > p { color: #fff; margin: 10px 0; }";
+        let spans = painted(text, css(text));
+        assert!(spans.contains(&(".card > p".to_string(), HighlightKind::Keyword)), "{spans:?}");
+        assert!(spans.contains(&("color".to_string(), HighlightKind::Key)), "{spans:?}");
+        assert!(spans.contains(&("#fff".to_string(), HighlightKind::Number)), "{spans:?}");
+        assert!(spans.contains(&("10px".to_string(), HighlightKind::Number)), "a unit belongs to its measurement: {spans:?}");
+    }
+
+    // `#fff` is an id selector outside a block and a colour inside one.
+    // Which it is depends only on the braces, which is why this tracks
+    // them rather than scanning words.
+    #[test]
+    fn a_hash_means_different_things_on_either_side_of_a_brace() {
+        let text = "#main { color: #abc; }";
+        let spans = painted(text, css(text));
+        assert!(spans.contains(&("#main".to_string(), HighlightKind::Keyword)), "{spans:?}");
+        assert!(spans.contains(&("#abc".to_string(), HighlightKind::Number)), "{spans:?}");
+    }
+
+    #[test]
+    fn css_custom_properties_and_at_rules() {
+        let text = "@media print { :root { --gap: 4px; padding: var(--gap) !important; } }";
+        let spans = painted(text, css(text));
+        assert!(spans.contains(&("@media".to_string(), HighlightKind::Keyword)), "{spans:?}");
+        assert!(spans.contains(&("--gap".to_string(), HighlightKind::Variable)), "{spans:?}");
+        assert!(spans.contains(&("!important".to_string(), HighlightKind::Keyword)), "{spans:?}");
+    }
+
+    #[test]
+    fn html_tags_attributes_and_entities() {
+        let text = "<!-- hi -->\n<a href=\"/x\" data-n=3>&amp;</a>";
+        let spans = painted(text, html(text));
+        assert!(spans.contains(&("<!-- hi -->".to_string(), HighlightKind::Comment)), "{spans:?}");
+        assert!(spans.contains(&("<a".to_string(), HighlightKind::Keyword)), "{spans:?}");
+        assert!(spans.contains(&("href".to_string(), HighlightKind::Key)), "{spans:?}");
+        assert!(spans.contains(&("\"/x\"".to_string(), HighlightKind::String)), "{spans:?}");
+        assert!(spans.contains(&("3".to_string(), HighlightKind::String)), "an unquoted value is still a value: {spans:?}");
+        assert!(spans.contains(&("&amp;".to_string(), HighlightKind::FormatSpecifier)), "{spans:?}");
+        assert!(spans.contains(&("</a".to_string(), HighlightKind::Keyword)), "{spans:?}");
+    }
+
+    // The raw-text elements hold another language, and this editor has
+    // a scanner for both of them.
+    #[test]
+    fn script_and_style_are_scanned_as_what_they_hold() {
+        let text = "<style>p { color: red }</style><script>let x = 1; // n</script>";
+        let spans = painted(text, html(text));
+        assert!(spans.contains(&("color".to_string(), HighlightKind::Key)), "the css scanner ran: {spans:?}");
+        assert!(spans.contains(&("let".to_string(), HighlightKind::Keyword)), "the js scanner ran: {spans:?}");
+        assert!(spans.contains(&("// n".to_string(), HighlightKind::Comment)), "{spans:?}");
+        assert!(spans.contains(&("</script".to_string(), HighlightKind::Keyword)), "and it stopped at the end tag: {spans:?}");
+    }
+
+    #[test]
+    fn a_doctype_is_not_a_tag() {
+        let text = "<!DOCTYPE html>\n<html>";
+        let spans = painted(text, html(text));
+        assert!(spans.contains(&("<!DOCTYPE html>".to_string(), HighlightKind::Keyword)), "{spans:?}");
+    }
+
     // Every scanner has to make progress on every byte it sees, or a
     // buffer with the wrong character in it hangs the editor.
     #[test]
     fn every_scanner_terminates_on_arbitrary_bytes() {
         let text = "a\u{e9}'\"`#@${}/*//\\0 1.2e-3 0x_ r#\" \u{1f600}";
-        for scan in [rust, python, javascript, typescript, yaml] {
+        for scan in [rust, python, javascript, typescript, yaml, css, html] {
             let spans = scan(text);
             assert!(spans.iter().all(|(r, _)| r.start <= r.end && r.end <= text.len()));
         }

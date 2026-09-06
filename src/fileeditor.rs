@@ -3049,6 +3049,7 @@ const LANGUAGE_BY_EXTENSION: &[(&str, &str)] = &[
     ("tsx", "typescript"),
     ("mts", "typescript"),
     ("cts", "typescript"),
+    ("htm", "html"),
     ("md", "markdown"),
     ("yml", "yaml"),
     ("kt", "kotlin"),
