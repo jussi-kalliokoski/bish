@@ -653,11 +653,21 @@ mod tests {
         if !have_vim() {
             return;
         }
-        // Only the differences matter here: a case this harness could
-        // not drive is no evidence that a known divergence has been
-        // fixed, so it is neither counted nor complained about.
-        let differing: Vec<&str> = compare(PENDING, &bish).0.into_iter().map(|(name, _, _)| name).collect();
+        // A case this harness could not drive is no evidence that a
+        // known divergence has been fixed -- and saying so takes both
+        // halves of `compare`'s answer, not just the first. Reading
+        // only the differences made "could not be driven" and "agrees
+        // with vim" the same observation: the case is simply absent
+        // from the list, and this test then announced that
+        // `cc-keeps-the-indent` matched vim now, on a run where the
+        // editor had never been driven far enough to disagree.
+        let (differing, undriveable) = compare(PENDING, &bish);
+        let differing: Vec<&str> = differing.into_iter().map(|(name, _, _)| name).collect();
         for (name, why) in DIVERGENCES {
+            if let Some((_, reason)) = undriveable.iter().find(|(n, _)| n == name) {
+                eprintln!("vimdiff: {name}: {reason} -- no evidence either way, so its divergence stands");
+                continue;
+            }
             assert!(differing.contains(name), "`{name}` matches vim now -- remove its line from DIVERGENCES ({why})");
         }
     }
