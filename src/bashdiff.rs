@@ -173,10 +173,17 @@ mod tests {
         case("a-hash-still-starts-a-comment", r#"echo a # comment"#),
         case("a-hash-in-the-middle-of-a-word", r#"echo a#b"#),
         // Every stage of a pipeline is traced, not just the first.
-        case("xtrace-traces-every-stage", r#"set -x; /bin/echo a | /bin/cat; set +x"#),
-        case("xtrace-traces-three-stages", r#"set -x; /bin/echo a | /bin/cat | /bin/cat; set +x"#),
-        case("xtrace-traces-a-stages-prefix-assignment", r#"set -x; x=1 /bin/cat /dev/null | /bin/cat; set +x"#),
-        case("xtrace-traces-an-appended-prefix-assignment", r#"p=x; set -x; p+=y /bin/cat /dev/null | /bin/cat; set +x"#),
+        // Sorted, because the order is not bash's to promise: bash
+        // forks each stage and each *child* prints its own trace line,
+        // so which lands first is up to the scheduler. Measured rather
+        // than assumed -- 14 of 40 runs under load put the second stage
+        // first. Asserting the order would have been asserting a race,
+        // which is what the first version of these cases did.
+        case("xtrace-traces-every-stage", r#"{ set -x; /bin/echo a | /bin/cat; set +x; } 2>t; sort t"#),
+        case("xtrace-traces-three-stages", r#"{ set -x; /bin/echo a | /bin/cat | /bin/cat; set +x; } 2>t; sort t"#),
+        case("xtrace-traces-a-stage-running-in-this-shell", r#"{ set -x; echo a | cat; set +x; } 2>t; sort t"#),
+        case("xtrace-traces-a-stages-prefix-assignment", r#"{ set -x; x=1 /bin/cat /dev/null | /bin/cat; set +x; } 2>t; sort t"#),
+        case("xtrace-traces-an-appended-prefix-assignment", r#"p=x; { set -x; p+=y /bin/cat /dev/null | /bin/cat; set +x; } 2>t; sort t"#),
         case("getopts-cluster-with-a-glued-argument", r#"set -- -abv y; while getopts ab: o; do echo "[$o:$OPTARG]"; done; echo end=$OPTIND"#),
         case(
             "getopts-unknown-inside-a-cluster",
@@ -1147,16 +1154,6 @@ y
         // fires only for a stage that runs in the shell: an external
         // one is spawned without going through the path that fires it,
         // so `echo a | cat` traces one command rather than two.
-        // A stage that runs *in* this shell is traced when it runs,
-        // which is after every other stage has been spawned. bash forks
-        // it and traces it in place. Every all-external pipeline is in
-        // stage order; this one is not, and putting it there would mean
-        // expanding that stage's words before the loop that builds the
-        // others -- which would run its command substitutions early.
-        (
-            "xtrace-traces-an-in-shell-stage-last",
-            "`set -x; echo a | cat` traces `cat` first, because `echo` runs in this shell and is traced when it runs",
-        ),
         // `( )` and `$( )` run in this shell rather than in a forked
         // copy of it, so there is no second process to have a pid.
         // Reporting a made-up one would break `kill $BASHPID`, which is
@@ -1218,7 +1215,6 @@ y
         case("set-o-lists-fewer-options", r#"set -o | wc -l"#),
         case("function-body-quoting", "f() { echo \"a\" 'b' c\\ d; }; declare -f f"),
         case("bash-command-read-outside-a-trap", r#"true; echo "[$BASH_COMMAND]""#),
-        case("xtrace-traces-an-in-shell-stage-last", r#"set -x; echo a | cat; set +x"#),
         case("bashpid-is-the-shells-own-in-a-subshell", r#"echo $(( $$ == BASHPID )); ( echo $(( $$ == BASHPID )) )"#),
         case("debug-trap-misses-an-external-pipeline-stage", r#"trap "echo D" DEBUG; echo a | cat"#),
         case("compgen-b-lists-this-shells-builtins", r#"compgen -b | sort | head -3 | tr '\n' ' '; echo"#),
