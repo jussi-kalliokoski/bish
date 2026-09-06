@@ -286,6 +286,23 @@ mod tests {
         // an omitted one is named `((1))`.
         case("debug-trap-fires-for-each-arithmetic-section", "trap 'echo \"[$BASH_COMMAND]\"' DEBUG; for ((i=0;i<2;i++)); do :; done"),
         case("debug-trap-names-an-omitted-section-as-one", "trap 'echo \"[$BASH_COMMAND]\"' DEBUG; for ((;;)); do break; done"),
+        // A redirect a builtin will never read is still a redirect,
+        // and one that cannot be performed fails the command before it
+        // runs. `echo z <nosuch` printed `z` and returned 0, and
+        // `echo z <nosuch >out` created `out` -- bash reaches neither,
+        // because it performs them in order and stops at the first
+        // that will not open.
+        case("a-builtin-fails-on-an-input-it-never-reads", r#"echo z <nosuch; echo rc=$?; : <nosuch; echo rc=$?"#),
+        case("a-numbered-input-redirect-on-a-builtin", r#"echo z 3<nosuch; echo rc=$?"#),
+        case("redirects-are-performed-in-order", r#"echo z <nosuch >out; echo rc=$?; ls out 2>&1 | head -1"#),
+        case("a-builtin-still-reads-what-it-can-open", r#"printf x > have; echo z <have; echo rc=$?; printf "L\n" > f2; read v <f2; echo "[$v]""#),
+        // Opening the target to check it must not consume it: a
+        // process substitution is a pipe with a producer already
+        // writing into it.
+        case(
+            "checking-an-input-does-not-consume-a-process-substitution",
+            r#"read v < <(echo hi); echo "[$v]"; mapfile -t a < <(printf "1\n2\n"); echo "${#a[@]}""#,
+        ),
         // Job control, probed as a whole. `jobs` accepted `-r` and
         // `-s` and ignored them, so `jobs -s` listed a job that was
         // plainly running; `disown` did not know `-h` was a flag at

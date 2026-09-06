@@ -11701,6 +11701,32 @@ impl Shell {
                     table.insert(*fd as i32, id);
                 }
                 Redirect::FdClose { fd } => define!(*fd as i32, Dest::Closed),
+                // An input redirect a builtin will never read is still
+                // a redirect, and a redirect that cannot be performed
+                // fails the command before it runs. `echo z <nosuch`
+                // printed `z` and returned 0, and `echo z <nosuch >out`
+                // created `out` -- bash reaches neither, because it
+                // performs them in order and stops at the first that
+                // will not open.
+                //
+                // Opened and dropped: nothing here wants the contents.
+                // A builtin that *does* read (`read`, `mapfile`) opens
+                // the redirect itself, when it reads -- see
+                // read_input_source.
+                Redirect::In(word) | Redirect::FdIn { word, .. } => {
+                    let p = self.expand_word(word);
+                    if opening_would_consume_it(&p) {
+                        continue;
+                    }
+                    self.open_in(&p)?;
+                }
+                Redirect::InOut(word) | Redirect::FdInOut { word, .. } => {
+                    let p = self.expand_word(word);
+                    if opening_would_consume_it(&p) {
+                        continue;
+                    }
+                    self.open_in_out(&p)?;
+                }
                 _ => {}
             }
         }
@@ -11853,6 +11879,7 @@ impl Shell {
     // unlike open_out -- restricted mode only blocks *output*
     // redirection (see open_out's own doc comment), reading a file is
     // always allowed.
+
     fn open_in(&self, path: &str) -> Result<std::fs::File, String> {
         if let Some(result) = dev_socket_file(path) {
             return result;
@@ -14737,6 +14764,17 @@ fn loop_header(keyword: &str, var: &str, words: Option<&[Word]>) -> String {
         None => "\"$@\"".to_string(),
     };
     format!("{} {} in {}", keyword, var, items)
+}
+
+/// Whether opening this redirect target for reading would do more than
+/// find out that it can be opened.
+///
+/// A process substitution is a pipe with a producer already writing
+/// into it, so a second reader takes data the command was about to
+/// get. `/dev/tcp` and `/dev/udp` are not files at all -- opening one
+/// makes a connection. Neither can be probed, so neither is.
+fn opening_would_consume_it(path: &str) -> bool {
+    path.starts_with("/dev/fd/") || path.starts_with("/proc/self/fd/") || path.starts_with("/dev/tcp/") || path.starts_with("/dev/udp/")
 }
 
 fn exit_status_byte(code: i32) -> i32 {
