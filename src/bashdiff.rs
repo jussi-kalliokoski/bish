@@ -286,6 +286,20 @@ mod tests {
         // an omitted one is named `((1))`.
         case("debug-trap-fires-for-each-arithmetic-section", "trap 'echo \"[$BASH_COMMAND]\"' DEBUG; for ((i=0;i<2;i++)); do :; done"),
         case("debug-trap-names-an-omitted-section-as-one", "trap 'echo \"[$BASH_COMMAND]\"' DEBUG; for ((;;)); do break; done"),
+        // `{n,m}` was not parsed at all, and `{` is an ordinary
+        // character to this engine -- so `a{2}` matched the literal
+        // four-character text and did not match `aa`. Wrong in both
+        // directions, and silent in both.
+        case("regex-interval-exact", r#"re="^a{2}$"; for v in a aa aaa; do [[ $v =~ $re ]] && echo "$v y" || echo "$v n"; done"#),
+        case("regex-interval-range", r#"re="^a{2,3}$"; for v in a aa aaa aaaa; do [[ $v =~ $re ]] && echo "$v y" || echo "$v n"; done"#),
+        case("regex-interval-open-ended", r#"re="^a{2,}$"; for v in a aa aaaa; do [[ $v =~ $re ]] && echo "$v y" || echo "$v n"; done"#),
+        case("regex-interval-on-a-group", r#"re="^(ab){2}$"; for v in ab abab ababab; do [[ $v =~ $re ]] && echo "$v y" || echo "$v n"; done"#),
+        case("regex-interval-on-a-class", r#"re="^[0-9]{3}$"; for v in 12 123 1234; do [[ $v =~ $re ]] && echo "$v y" || echo "$v n"; done"#),
+        case("regex-interval-captures", r#"re="^(a{2})(b{1,2})$"; [[ aabb =~ $re ]] && echo "${BASH_REMATCH[1]}-${BASH_REMATCH[2]}""#),
+        // A brace that does not open a well-formed interval stays an
+        // ordinary character, which is what every `awk '{print}'`
+        // pattern depends on.
+        case("regex-a-lone-brace-is-a-character", r#"[[ "a{" =~ ^a\{$ ]] && echo y || echo n; [[ "a{,}" =~ ^a{,}$ ]] && echo y || echo n"#),
         // A redirect a builtin will never read is still a redirect,
         // and one that cannot be performed fails the command before it
         // runs. `echo z <nosuch` printed `z` and returned 0, and

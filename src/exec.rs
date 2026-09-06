@@ -6613,6 +6613,14 @@ impl Shell {
                             true
                         }
                         None => {
+                            // A search that ran out of budget is not a
+                            // "no": it is a search that never finished
+                            // (see regex.rs's MATCH_BUDGET). Reporting
+                            // it as a failed match would be a wrong
+                            // answer nobody could see.
+                            if crate::regex::gave_up() {
+                                sh_eprintln!(self, "bish: {}: regular expression is too complex to match", pattern);
+                            }
                             self.arrays.remove("BASH_REMATCH");
                             false
                         }

@@ -15,6 +15,12 @@ enum Re {
     Star(Box<Re>),
     Plus(Box<Re>),
     Opt(Box<Re>),
+    // `{n}`, `{n,}` and `{n,m}` -- ERE's interval quantifier, with
+    // `None` for an open upper bound. It was not parsed at all, and a
+    // `{` is an ordinary character to this engine, so `a{2}` matched
+    // the four-character text `a{2}` and did not match `aa`. Both
+    // directions silently: no pattern was ever rejected for it.
+    Repeat(Box<Re>, usize, Option<usize>),
     Concat(Vec<Re>),
     Alt(Vec<Re>),
     Start,
@@ -76,7 +82,57 @@ impl<'a> ReParser<'a> {
                 self.pos += 1;
                 Re::Opt(Box::new(atom))
             }
+            // A `{` that does not open a well-formed interval is an
+            // ordinary character, which is what POSIX leaves it as and
+            // what every `awk '{print}'` pattern relies on.
+            Some('{') => match self.parse_interval() {
+                Some((min, max)) => Re::Repeat(Box::new(atom), min, max),
+                None => atom,
+            },
             _ => atom,
+        }
+    }
+
+    /// `{n}`, `{n,}`, `{n,m}` -- consumed only if the whole thing is
+    /// there and well formed, so the parser can fall back to treating
+    /// the brace as text.
+    fn parse_interval(&mut self) -> Option<(usize, Option<usize>)> {
+        let start = self.pos;
+        self.pos += 1;
+        let min = self.parse_interval_number()?;
+        let max = match self.peek() {
+            Some('}') => Some(min),
+            Some(',') => {
+                self.pos += 1;
+                match self.peek() {
+                    Some('}') => None,
+                    _ => Some(self.parse_interval_number()?),
+                }
+            }
+            _ => {
+                self.pos = start;
+                return None;
+            }
+        };
+        if self.peek() != Some('}') || max.is_some_and(|m| m < min) {
+            self.pos = start;
+            return None;
+        }
+        self.pos += 1;
+        Some((min, max))
+    }
+
+    fn parse_interval_number(&mut self) -> Option<usize> {
+        let from = self.pos;
+        while self.peek().is_some_and(|c| c.is_ascii_digit()) {
+            self.pos += 1;
+        }
+        match self.pos > from {
+            true => self.chars[from..self.pos].iter().collect::<String>().parse().ok(),
+            false => {
+                self.pos = from;
+                None
+            }
         }
     }
 
@@ -185,10 +241,36 @@ type CapSlots = Vec<Option<(usize, usize)>>;
 type Captures = RefCell<CapSlots>;
 
 // Everything the matcher carries besides the pattern and the input: the
-// capture slots, and whether comparisons fold case.
+// capture slots, whether comparisons fold case, and how much work is
+// left.
 struct MatchCtx {
     caps: Captures,
     ignore_case: bool,
+    // This is a backtracking matcher, so a pattern whose alternatives
+    // multiply takes exponential time: `^(a+)+$` against thirty a's and
+    // a `b` explored 2^30 ways to split them and never came back. bash
+    // answers instantly, because its matcher does not backtrack.
+    //
+    // Replacing the engine is the real fix and is its own piece of
+    // work. Until then the search is bounded, and running out is said
+    // out loud rather than reported as "no match" -- a wrong answer
+    // nobody can see is worse than a refusal.
+    //
+    // A million steps is far past any honest pattern: a simple one over
+    // a ten-thousand-character line is a few tens of thousands.
+    budget: std::cell::Cell<u64>,
+}
+
+const MATCH_BUDGET: u64 = 1_000_000;
+
+thread_local! {
+    static GAVE_UP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether the last search on this thread ran out of budget rather than
+/// finishing. Only meaningful straight after one.
+pub fn gave_up() -> bool {
+    GAVE_UP.with(|g| g.get())
 }
 
 // The other case(s) of `c`, for a case-insensitive comparison.
@@ -229,6 +311,14 @@ fn in_ranges(ranges: &[(char, char)], c: char) -> bool {
 // `a*a` (etc) can backtrack the star's greedy match when what follows
 // doesn't fit.
 fn match_re(re: &Re, s: &[char], pos: usize, ctx: &MatchCtx, k: &dyn Fn(usize) -> bool) -> bool {
+    // One step per node visited, which is the thing that multiplies.
+    match ctx.budget.get().checked_sub(1) {
+        Some(left) => ctx.budget.set(left),
+        None => {
+            GAVE_UP.with(|g| g.set(true));
+            return false;
+        }
+    }
     match re {
         Re::Char(c) => matches!(s.get(pos), Some(&x) if chars_equal(x, *c, ctx.ignore_case)) && k(pos + 1),
         Re::Any => pos < s.len() && k(pos + 1),
@@ -250,6 +340,7 @@ fn match_re(re: &Re, s: &[char], pos: usize, ctx: &MatchCtx, k: &dyn Fn(usize) -
         Re::Concat(parts) => match_concat(parts, s, pos, ctx, k),
         Re::Alt(branches) => branches.iter().any(|b| match_re(b, s, pos, ctx, k)),
         Re::Star(inner) => match_star(inner, s, pos, 0, ctx, k),
+        Re::Repeat(inner, min, max) => match_repeat(inner, s, pos, 0, *min, *max, ctx, k),
         Re::Plus(inner) => match_re(inner, s, pos, ctx, &|p| match_star(inner, s, p, 0, ctx, k)),
         Re::Opt(inner) => match_re(inner, s, pos, ctx, k) || k(pos),
         Re::Group(idx, inner) => {
@@ -281,6 +372,24 @@ fn match_concat(parts: &[Re], s: &[char], pos: usize, ctx: &MatchCtx, k: &dyn Fn
 // Greedy star: try consuming as many as possible first, backtracking down
 // to zero. `depth` is just a runaway-recursion guard for pathological
 // patterns on long inputs.
+/// `{n,m}`, greedily: take as many as the bound allows, then give them
+/// back one at a time.
+///
+/// The `p > pos` guard is what stops an inner expression that can match
+/// nothing (`(a*){3}`) from repeating forever -- but only *above* the
+/// minimum, because reaching the minimum is exactly when a zero-width
+/// repetition has to be allowed. Below it the count itself bounds the
+/// recursion.
+#[allow(clippy::too_many_arguments)]
+fn match_repeat(inner: &Re, s: &[char], pos: usize, done: usize, min: usize, max: Option<usize>, ctx: &MatchCtx, k: &dyn Fn(usize) -> bool) -> bool {
+    if max.is_none_or(|m| done < m)
+        && match_re(inner, s, pos, ctx, &|p| (p > pos || done < min) && match_repeat(inner, s, p, done + 1, min, max, ctx, k))
+    {
+        return true;
+    }
+    done >= min && k(pos)
+}
+
 fn match_star(inner: &Re, s: &[char], pos: usize, depth: usize, ctx: &MatchCtx, k: &dyn Fn(usize) -> bool) -> bool {
     if depth < s.len() + 1 && match_re(inner, s, pos, ctx, &|p| p > pos && match_star(inner, s, p, depth + 1, ctx, k)) {
         return true;
@@ -308,7 +417,7 @@ pub fn escape(s: &str) -> String {
 // starting at exactly `pos` (not scanning forward for the next viable
 // start)? Returns the match's own end position plus its capture slots.
 fn match_at_with_caps(re: &Re, group_count: usize, chars: &[char], pos: usize, ignore_case: bool) -> Option<(usize, CapSlots)> {
-    let ctx = MatchCtx { caps: RefCell::new(vec![None; group_count + 1]), ignore_case };
+    let ctx = MatchCtx { caps: RefCell::new(vec![None; group_count + 1]), ignore_case, budget: std::cell::Cell::new(MATCH_BUDGET) };
     let end: std::cell::Cell<Option<usize>> = std::cell::Cell::new(None);
     let matched = match_re(re, chars, pos, &ctx, &|p| {
         end.set(Some(p));
@@ -357,6 +466,7 @@ impl Regex {
     /// `chars`), ERE-style. `None` if nothing matches anywhere in
     /// `chars[from..]`.
     pub fn find_at(&self, chars: &[char], from: usize) -> Option<(usize, usize)> {
+        GAVE_UP.with(|g| g.set(false));
         (from..=chars.len()).find_map(|start| self.match_at(chars, start).map(|end| (start, end)))
     }
 
@@ -367,6 +477,7 @@ impl Regex {
     /// substitution loop, repl.rs) that needs backreferences/`&` in a
     /// replacement rather than just knowing a match happened.
     pub fn find_at_with_captures(&self, chars: &[char], from: usize) -> Option<(usize, usize, Vec<String>)> {
+        GAVE_UP.with(|g| g.set(false));
         for start in from..=chars.len() {
             if let Some((end, caps)) = match_at_with_caps(&self.re, self.group_count, chars, start, self.ignore_case) {
                 let mut out = Vec::with_capacity(self.group_count + 1);
@@ -394,6 +505,7 @@ impl Regex {
 /// the caller -- that option was registered with nothing to act on until
 /// this engine could fold case at all.
 pub fn match_captures(text: &str, pattern: &str, ignore_case: bool) -> Option<Vec<String>> {
+    GAVE_UP.with(|g| g.set(false));
     let (re, group_count) = parse(pattern);
     let chars: Vec<char> = text.chars().collect();
     for start in 0..=chars.len() {
