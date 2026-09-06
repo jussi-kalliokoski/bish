@@ -2895,15 +2895,23 @@ impl Shell {
                 break;
             }
             if !fed {
-                // Nothing to read and not finished: yield rather than
-                // spin. Short enough that a chatty command still feels
-                // immediate.
+                // Nothing to read and not finished. A `<( )` producer
+                // feeding this command is a coroutine in this process,
+                // so give it a turn before sleeping -- it is the only
+                // thing that can put bytes in the pipe this command is
+                // blocked on.
+                self.pump_coroutines();
                 std::thread::sleep(std::time::Duration::from_millis(2));
             }
         }
         // Whatever landed between the last read and the child exiting.
         drain(&mut job);
-        job.wait()
+        let status = job.wait();
+        // Now the command really has finished reading, so any `<( )`
+        // feeding it can be torn down -- deferred from wherever it was
+        // skipped while this job was pending.
+        self.drain_proc_subs();
+        status
     }
 
     /// Turns a bubbled `ExecResult::Fg` into an ordinary status by
@@ -2944,6 +2952,14 @@ impl Shell {
     // rather than exec.rs continuing to drive it internally.
     pub fn take_pending_fg(&mut self) -> Option<FgJob> {
         self.pending_fg.take().map(FgJob)
+    }
+
+    /// Called by repl.rs once the job it took with `take_pending_fg`
+    /// has finished. Any `<( )` that was feeding it was left standing
+    /// while it ran (see `drain_proc_subs`); this is the moment it can
+    /// go.
+    pub fn finished_foreground_job(&mut self) {
+        self.drain_proc_subs();
     }
 
     // See ExecResult::Edit's own doc comment. `unwrap_or_default`
@@ -5745,6 +5761,20 @@ impl Shell {
     // Runs any `>(cmd)` substitutions queued by the command that just
     // finished, then deletes every proc-sub temp file used this round.
     fn drain_proc_subs(&mut self) {
+        // Not while a foreground job is still waiting to be driven. On
+        // the pty path a command does not run here -- it is stashed as
+        // `pending_fg` and run by whoever owns the terminal -- so
+        // "the enclosing command has finished reading it" is not true
+        // yet, and tearing the substitution down closes the producer's
+        // pipe and spends its wind-down turns before the reader has
+        // started. `wc -l <(seq 1 20000)` counted 12773 lines in a
+        // pane, which is one pipe buffer: exactly what the producer had
+        // managed to write before being told to stop. Whoever drives
+        // the job calls this afterwards instead -- see
+        // `drive_pending_fg_inline` and repl.rs's own fg handling.
+        if self.pending_fg.is_some() {
+            return;
+        }
         for path in self.proc_sub_cleanup.drain(..) {
             let _ = std::fs::remove_file(path);
         }
@@ -8546,8 +8576,8 @@ impl Shell {
             };
             command.env(k, v);
         }
-        // A job spawned while promoted, with no redirects of its own,
-        // gets attached to a fresh pty instead of the real terminal's
+        // A job spawned while promoted gets attached to a fresh pty
+        // instead of the real terminal's
         // inherited fds -- see Job::pty_master's doc comment. Without
         // this, its output would go straight onto whatever the real
         // screen happens to show, which the compositor's next redraw
@@ -8562,7 +8592,10 @@ impl Shell {
         // foreground command, which gets M11's real-job-control
         // tcsetpgrp/waitpid_untraced treatment further below instead;
         // there's no compositor to interfere with there, so a pty would
-        // just be unnecessary overhead.
+        // just be unnecessary overhead. Its own redirects are no
+        // obstacle: they are layered on top of the pty below, so a
+        // command that redirects one stream still shows the others in
+        // the pane.
         // ...and only when this command's stdout would otherwise be the
         // inherited terminal, which is the case the compositor paints
         // over. If something has *already* said where the output goes --
@@ -8586,7 +8619,7 @@ impl Shell {
         // (see run_multi), so there is nothing a pty would add.
         // PIPELINE_DRAIN being armed is exactly "this is a pipeline
         // stage running in-process".
-        let use_pty = self.is_promoted() && redirs.actions.is_empty() && !stdout_already_spoken_for && !pipeline_drain_armed();
+        let use_pty = self.is_promoted() && !stdout_already_spoken_for && !pipeline_drain_armed();
 
         if use_pty {
             if let Ok(p) = pty::open() {
@@ -8597,7 +8630,30 @@ impl Shell {
                 let (rows, cols) = self.pty_size();
                 let _ = p.resize(rows, cols);
                 let slave_path = p.slave_path.clone();
-                return match pty::spawn_attached(command, &slave_path) {
+                let _ = pty::attach_on_exec(&mut command, &slave_path);
+                // The pty first, then the descriptors something
+                // else already decided, then this command's own.
+                // `pre_exec` closures run in registration order, so
+                // each layer overwrites only the descriptors it
+                // names and leaves the rest on the pty.
+                //
+                // The middle layer is the one that is easy to miss:
+                // a redirect written on an enclosing construct
+                // (`{ ...; } 2>e`) is not among this command's own
+                // actions at all -- it arrives as a
+                // `stdio_override` that `spawn_stderr_stdio` would
+                // have applied, and the pty attach overwrites that.
+                // Without this, `2>e` captured nothing and the
+                // error went to the pane instead.
+                let mut actions = Vec::new();
+                if let Some(o) = self.stdio_override.as_ref()
+                    && let Some(err) = o.borrow().stderr.as_ref().and_then(|f| f.try_clone().ok())
+                {
+                    actions.push(FdAction::Open { fd: 2, file: err });
+                }
+                actions.extend(redirs.actions);
+                apply_fd_redirects(&mut command, actions);
+                return match command.spawn() {
                     Ok(child) => {
                         let mut cmd_text = argv.join(" ");
                         for r in &cmd.redirects {

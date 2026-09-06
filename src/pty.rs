@@ -147,6 +147,19 @@ fn attach_current_process_to_pty_slave(slave_path: &CString) -> io::Result<()> {
 // Linux, but TIOCSCTTY is called explicitly here to not depend on that
 // implicit-acquisition subtlety), then dup2 it onto 0/1/2.
 pub fn spawn_attached(mut cmd: Command, slave_path: &str) -> io::Result<Child> {
+    attach_on_exec(&mut cmd, slave_path)?;
+    cmd.spawn()
+}
+
+/// `spawn_attached`'s first half: arranges for the child to take the
+/// slave as its fd 0/1/2, without spawning it.
+///
+/// Split out so a caller can put its own descriptor work after this
+/// one's. `pre_exec` closures run in the order they were registered, so
+/// registering this first and a command's redirects second gives a
+/// command in a pane the pty for the streams it did not redirect and
+/// its own targets for the streams it did.
+pub fn attach_on_exec(cmd: &mut Command, slave_path: &str) -> io::Result<()> {
     let path = CString::new(slave_path).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
     unsafe {
         cmd.pre_exec(move || {
@@ -163,7 +176,7 @@ pub fn spawn_attached(mut cmd: Command, slave_path: &str) -> io::Result<Child> {
             attach_current_process_to_pty_slave(&path)
         });
     }
-    cmd.spawn()
+    Ok(())
 }
 
 // Makes `slave_path` *this same, already-running* process's own

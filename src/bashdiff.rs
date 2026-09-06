@@ -1402,92 +1402,45 @@ y
         );
     }
 
-    /// Cases whose *pane* answer differs from bash, with the reason.
+    /// Cases the pane corpus does not run at all.
     ///
-    /// Empty is the goal. A name here is a claim that the difference is
-    /// the pane's nature rather than a bug -- and every one of those
-    /// claims has to say why, because the last three that looked like
-    /// nature turned out to be bugs.
-    /// Cases the pane corpus does not run at all, because their answer
-    /// is not stable enough to be evidence either way.
+    /// One family, where there were two. Every `process-subst-` case --
+    /// the *reading* `<( )` direction -- used to be here as
+    /// load-dependent noise, and that was not noise: a foreground
+    /// command in a pane is stashed rather than run, so
+    /// `drain_proc_subs` tore the producer down before its reader had
+    /// started, and how much got through depended on how fast the
+    /// machine was. Deferring the teardown fixed all of them, and they
+    /// run now.
     ///
-    /// `>( )` writes into a process the shell does not wait for, so
-    /// whether its output lands before the shell exits is a race. bash
-    /// loses that race consistently enough to print nothing; a pane
-    /// sometimes wins it. Measured across repeated runs: the *set* of
-    /// `proc-sub-out-*` cases that differ changes from run to run,
-    /// which is exactly the shape of thing that must not go on a
-    /// divergence list -- an entry that is only sometimes true makes
-    /// the guard below lie in one direction or the other, and a guard
-    /// you learn to re-run is a guard you have stopped reading.
-    ///
-    /// The ordinary corpus still runs all of them; it is only the pane
-    /// timing that is racy.
-    /// Matched as a prefix, because the race is the construct's, not
-    /// any one case's: three different `proc-sub-out-*` cases turned up
-    /// across four runs before this was widened from a list of names to
-    /// the family they all belong to.
-    const PANE_SKIPPED: &[(&str, &str)] = &[
-        ("proc-sub-out-", "a `>( )` writer races the shell's exit; four runs gave three different sets of losers"),
-        // The reading half of the same story. Every one of these agrees
-        // with bash when run on its own and has been seen to differ
-        // under the full suite -- `process-subst-does-not-leak-
-        // descriptors` answers 4 alone and 6 loaded (two extra being
-        // the size of a pty pair, so a foreground command's pty not yet
-        // closed when the count is taken), and `head -2 <(yes)` printed
-        // one `y` instead of two. Whatever the details, a case whose
-        // answer depends on how busy the machine is cannot be evidence
-        // about the shell.
-        //
-        // The producer's own timing is worth chasing on its own terms;
-        // see roadmap item 3's remaining group, where the same
-        // never-resumed `<( )` producer truncates at exactly one pipe
-        // buffer.
-        ("process-subst-", "a `<( )` producer's timing in a pane depends on load; every case here agrees when run alone"),
-    ];
+    /// The writing direction is a different race and is still here.
+    /// `/bin/echo hi > >(cat)` hands `cat` its input and then wants it
+    /// to have finished; the wind-down offers scheduler turns, which
+    /// help a coroutine and do nothing for a process. Waiting for
+    /// `>( )` consumers is the fix, and is its own piece of work.
+    const PANE_SKIPPED: &[(&str, &str)] = &[(
+        "proc-sub-out-",
+        "a `>( )` consumer is a process, and nothing waits for it; the wind-down spends scheduler turns, which a process does not need",
+    )];
 
     /// The cases the pane corpus actually compares.
     fn pane_cases() -> Vec<Case> {
         CASES.iter().filter(|c| !PANE_SKIPPED.iter().any(|(prefix, _)| c.name.starts_with(prefix))).copied().collect()
     }
 
+    /// Cases whose *pane* answer differs from bash, with the reason.
+    ///
+    /// Empty is the goal. A name here is a claim that the difference is
+    /// the pane's nature rather than a bug -- and every one of those
+    /// claims has to say why, because the last three that looked like
+    /// nature turned out to be bugs.
     const PANE_DIVERGENCES: &[(&str, &str)] = &[
-        // -- output a redirect keeps out of the pane -----------------
-        //
-        // All that is left, and one cause. A single external is kept
-        // off the pane's pty by a redirect of *any* kind, so `wc -l < f`
-        // sends its output to the terminal the compositor paints over
-        // because its stdin was redirected, and an external whose
-        // stderr is redirected loses its stdout the same way. The gate
-        // is all-or-nothing where it wants to be per stream.
-        //
-        // Composing the two is easy and does work -- `pre_exec`
-        // closures run in registration order, so attaching the pty and
-        // then applying the command's redirects puts each stream where
-        // it was told and leaves the rest on the pty. `redir-basic`
-        // passes that way. Two things do not, and both were measured
-        // before the attempt was backed out:
-        //
-        //   - A compound's redirect (`{ ...; } 2>e`) is not among the
-        //     command's own actions at all. It arrives as a
-        //     `stdio_override`, which the pty then overwrites -- `2>e`
-        //     captured nothing and the error went to the pane instead.
-        //     Those streams have to be layered on too.
-        //   - Taking the pty means returning `ExecResult::Fg`, and
-        //     nothing on that path resumes a `<( )` producer.
-        //     `wc -l < <(seq 1 20000)` then reads 12773 lines instead
-        //     of 20000 -- which is 65532 bytes, one 64KiB pipe buffer
-        //     to within four bytes. The producer wrote exactly one
-        //     bufferful, parked, and was never given another turn.
-        //
-        // Silent truncation is a worse failure than the invisible
-        // output it would fix, so this waits for the pumping to be
-        // sorted out first.
-        ("redir-basic", "`wc -l < f`: a redirect of stdin keeps the whole command off the pty, so stdout is inherited"),
-        ("a-superseded-redirect-still-creates-its-file", "same shape: `wc -l < e`"),
-        ("a-compounds-stderr-reaches-externals", "stderr is redirected, so stdout is inherited too"),
-        ("a-loops-stderr-reaches-externals", "same"),
-        ("a-functions-stderr-reaches-externals", "same"),
+        // A pane is a terminal, and the corpus reads bash through a
+        // pipe. `ls a b` columns its output for one and lists it one
+        // per line for the other, which is both programs behaving
+        // correctly and the only thing left on this list. Fixing it
+        // would mean making the pane *less* like a terminal.
+        ("a-superseded-redirect-still-creates-its-file", "`ls a b` columns its output, because a pane is a tty and bash's side here is a pipe"),
     ];
 
     /// The same guard `DIVERGENCES` has: a name on the pane list is a

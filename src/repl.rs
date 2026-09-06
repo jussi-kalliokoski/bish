@@ -1777,7 +1777,12 @@ fn run_fg_job_frame(app: &mut App, job_frame_id: JobFrameId, session_id: Session
         match outcome {
             FgOutcome::Exited(status) => {
                 app.windows[app.current_window].stack_mut().pop();
-                app.sessions.get_mut(&session_id).unwrap().shell.last_status = status;
+                let session = app.sessions.get_mut(&session_id).unwrap();
+                session.shell.last_status = status;
+                // The job is over, so a `<( )` that was feeding it can
+                // be torn down now -- it was deliberately left alone
+                // while the job ran. See Shell::drain_proc_subs.
+                session.shell.finished_foreground_job();
                 if app.sinks_are_grid {
                     compositor_redraw(app);
                 }
@@ -4336,6 +4341,15 @@ fn service_background_jobs(app: &mut App) -> bool {
         refresh_divider_budget(&app.sessions, window);
     }
     // ...and the window list every session's `window` builtin reads.
+    // A `<( )` producer is a coroutine in this process, and it only
+    // makes progress when something gives it a turn. Every blocking
+    // loop in this file calls this, so this is the one place that
+    // reliably does -- without it a producer fills its pipe, parks, and
+    // is never resumed while a foreground command reads it, which
+    // truncated `wc -l < <(seq 1 20000)` at exactly one pipe buffer.
+    for session in app.sessions.values() {
+        session.shell.pump_coroutines();
+    }
     // Built once from an immutable borrow, then handed to each session,
     // so `window ls`/`select` answer about the app.windows that exist right
     // now rather than about whatever they last heard.
