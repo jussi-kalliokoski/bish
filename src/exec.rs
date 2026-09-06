@@ -4743,7 +4743,7 @@ impl Shell {
             parser::Command::Arith(raw, _redirects) => match self.eval_arith(raw) {
                 Ok(v) => ExecResult::Status(if v != 0 { 0 } else { 1 }),
                 Err(e) => {
-                    sh_eprintln!(self, "bish: (({})): {}", raw, e);
+                    sh_eprintln!(self, "bish: ((: {}: {}", raw, e);
                     ExecResult::Status(1)
                 }
             },
@@ -6284,7 +6284,7 @@ impl Shell {
     fn run_cfor(&mut self, init: &str, cond: &str, step: &str, body: &Program) -> ExecResult {
         if !init.is_empty() {
             if let Err(e) = arith::eval(init, self) {
-                sh_eprintln!(self, "bish: (({})): {}", init, e);
+                sh_eprintln!(self, "bish: ((: {}: {}", init, e);
                 return ExecResult::Status(1);
             }
         }
@@ -6296,7 +6296,7 @@ impl Shell {
                 match arith::eval(cond, self) {
                     Ok(v) => v != 0,
                     Err(e) => {
-                        sh_eprintln!(self, "bish: (({})): {}", cond, e);
+                        sh_eprintln!(self, "bish: ((: {}: {}", cond, e);
                         return ExecResult::Status(1);
                     }
                 }
@@ -6330,7 +6330,7 @@ impl Shell {
             }
             if !step.is_empty() {
                 if let Err(e) = arith::eval(step, self) {
-                    sh_eprintln!(self, "bish: (({})): {}", step, e);
+                    sh_eprintln!(self, "bish: ((: {}: {}", step, e);
                     return ExecResult::Status(1);
                 }
             }
@@ -6605,7 +6605,7 @@ impl Shell {
                         out.push_str(&if *quoted { crate::regex::escape(&v) } else { v });
                     }
                     Err(e) => {
-                        sh_eprintln!(self, "bish: (({})): {}", raw, e);
+                        sh_eprintln!(self, "bish: {}: {}", raw, e);
                         // Fatal, unlike the `(( ))` *command* -- see
                         // expansion_failed.
                         self.expansion_failed = true;
@@ -6703,7 +6703,7 @@ impl Shell {
                         out.push_str(&if *quoted { crate::glob::escape(&v) } else { v });
                     }
                     Err(e) => {
-                        sh_eprintln!(self, "bish: (({})): {}", raw, e);
+                        sh_eprintln!(self, "bish: {}: {}", raw, e);
                         // Fatal, unlike the `(( ))` *command* -- see
                         // expansion_failed.
                         self.expansion_failed = true;
@@ -9699,7 +9699,7 @@ impl Shell {
                 Chunk::Arith { raw, .. } => match self.eval_arith(raw) {
                     Ok(v) => s.push_str(&v.to_string()),
                     Err(e) => {
-                        sh_eprintln!(self, "bish: (({})): {}", raw, e);
+                        sh_eprintln!(self, "bish: {}: {}", raw, e);
                         // Fatal, unlike the `(( ))` *command* -- see
                         // expansion_failed.
                         self.expansion_failed = true;
@@ -9818,7 +9818,15 @@ impl Shell {
                 Some(idx) => self.arrays.get(name).and_then(|m| m.get(&idx)).cloned().unwrap_or_default(),
                 None => String::new(),
             },
-            Err(_) => String::new(),
+            // A subscript that will not evaluate is the same failure as
+            // a `$(( ))` that will not, and gets the same treatment:
+            // said out loud and fatal. Swallowed, `${a[1/0]}` was an
+            // empty string and the command carried on with it.
+            Err(e) => {
+                sh_eprintln!(self, "bish: {}: {}", index, e);
+                self.expansion_failed = true;
+                String::new()
+            }
         }
     }
 
@@ -10098,7 +10106,7 @@ impl Shell {
                     let v = match self.eval_arith(raw) {
                         Ok(n) => n.to_string(),
                         Err(e) => {
-                            sh_eprintln!(self, "bish: (({})): {}", raw, e);
+                            sh_eprintln!(self, "bish: {}: {}", raw, e);
                             // A `$(( ))` that does not parse is fatal
                             // in bash, unlike the `(( ))` *command*.
                             self.expansion_failed = true;

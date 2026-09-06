@@ -138,6 +138,29 @@ mod tests {
             "getopts-clustered-options",
             r#"set -- -ab v x; while getopts ab: o; do echo "[$o:$OPTARG] OPTIND=$OPTIND"; done; echo "end=$OPTIND rest=${!OPTIND}""#,
         ),
+        // Having *an* expression is not the same as having consumed
+        // the input: the parser stopped at the first token it could
+        // not use and returned what it had, so `$((1 2))` was 1 and
+        // `$((sqrt 3))` was 0. Reported from real use.
+        case("arith-rejects-a-trailing-token", r#"echo $((1 2)); echo rc=$?"#),
+        case("arith-rejects-a-name-then-a-number", r#"echo $((sqrt 3)); echo rc=$?"#),
+        case("arith-in-a-for-header-rejects-it-too", r#"for ((i=1 2; i<3; i++)); do :; done"#),
+        // The diagnostics, which had all been bish's own wording.
+        case("arith-division-by-zero", r#"x=$((1/0)); echo rc=$?"#),
+        case("arith-division-by-zero-in-a-command", r#"((1/0)); echo rc=$?"#),
+        case("arith-modulo-by-zero", r#"echo $((1 % 0))"#),
+        case("arith-assigning-division-by-zero", r#"echo $((a/=0))"#),
+        case("arith-negative-exponent", r#"echo $((1**-1))"#),
+        case("arith-ternary-without-a-colon", r#"echo $((1?2))"#),
+        case("arith-a-character-that-is-not-arithmetic", r#"echo $((@))"#),
+        case("arith-operand-expected", r#"echo $((1&&)); echo $((1+))"#),
+        // `++` is only an operator when there is a name to increment;
+        // otherwise it is two unary pluses, and bash answers 5.
+        case("arith-increment-on-a-literal-is-two-signs", r#"echo $((++5)) $((--5))"#),
+        // A subscript that will not evaluate is the same failure as an
+        // expansion that will not, and was being swallowed.
+        case("arith-a-subscript-that-does-not-evaluate", r#"a=(1); echo ${a[1/0]}; echo rc=$?"#),
+        case("arith-a-subscript-with-a-trailing-token", r#"a=(1); echo ${a[1 2]}; echo rc=$?"#),
         // POSIX `test` groups with `\( ... \)` and has no other way
         // to; bish called it "too many arguments". And an operator it
         // did not recognise answered *false* rather than erroring,

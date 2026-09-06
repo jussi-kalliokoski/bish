@@ -194,10 +194,27 @@ fn tokenize(src: &str) -> Result<Vec<Tok>, String> {
             i += 1;
             continue;
         }
-        return Err(format!("bad character in arithmetic expression: {:?}", c));
+        return Err(format!("arithmetic syntax error: operand expected (error token is \"{}\")", c));
     }
     toks.push(Tok::Eof);
     Ok(toks)
+}
+
+impl Tok {
+    /// The token as it was written, for an error that has to name it.
+    fn text(&self) -> String {
+        match self {
+            Tok::Num(n) => n.to_string(),
+            Tok::Ident(name) => name.clone(),
+            Tok::Op(op) => op.clone(),
+            Tok::LParen => "(".to_string(),
+            Tok::RParen => ")".to_string(),
+            Tok::Question => "?".to_string(),
+            Tok::Colon => ":".to_string(),
+            Tok::Comma => ",".to_string(),
+            Tok::Eof => "end of expression".to_string(),
+        }
+    }
 }
 
 struct Parser<'a> {
@@ -217,6 +234,21 @@ impl<'a> Parser<'a> {
             self.pos += 1;
         }
         t
+    }
+
+    /// The token the parser had just consumed when something went
+    /// wrong, which is the one bash names in `(error token is "...")`.
+    ///
+    /// Measured against bash rather than reasoned about: `1/0` names
+    /// `0`, `1+` names `+`, `1**-1` names `1` and `1?2` names `2`. In
+    /// every one of them that is the last token taken, because the
+    /// parser only discovers the problem once it has the operand.
+    fn error_token(&self) -> String {
+        self.toks.get(self.pos.saturating_sub(1)).map(Tok::text).unwrap_or_default()
+    }
+
+    fn fail(&self, message: &str) -> String {
+        format!("{} (error token is \"{}\")", message, self.error_token())
     }
 
     fn peek_op(&self, s: &str) -> bool {
@@ -269,13 +301,13 @@ impl<'a> Parser<'a> {
                         "*=" => cur.wrapping_mul(rhs),
                         "/=" => {
                             if rhs == 0 {
-                                return Err("division by zero".to_string());
+                                return Err(self.fail("division by 0"));
                             }
                             cur / rhs
                         }
                         "%=" => {
                             if rhs == 0 {
-                                return Err("division by zero".to_string());
+                                return Err(self.fail("division by 0"));
                             }
                             cur % rhs
                         }
@@ -301,7 +333,7 @@ impl<'a> Parser<'a> {
             let a = self.parse_assign()?;
             match self.advance() {
                 Tok::Colon => {}
-                other => return Err(format!("expected ':', got {:?}", other)),
+                _ => return Err(self.fail("`:' expected for conditional expression")),
             }
             let b = self.parse_assign()?;
             Ok(if cond != 0 { a } else { b })
@@ -451,14 +483,14 @@ impl<'a> Parser<'a> {
                 self.advance();
                 let r = self.parse_pow()?;
                 if r == 0 {
-                    return Err("division by zero".to_string());
+                    return Err(self.fail("division by 0"));
                 }
                 v /= r;
             } else if self.peek_op("%") {
                 self.advance();
                 let r = self.parse_pow()?;
                 if r == 0 {
-                    return Err("division by zero".to_string());
+                    return Err(self.fail("division by 0"));
                 }
                 v %= r;
             } else {
@@ -477,7 +509,7 @@ impl<'a> Parser<'a> {
             self.advance();
             let exp = self.parse_pow()?;
             if exp < 0 {
-                return Err("exponent less than 0".to_string());
+                return Err(self.fail("exponent less than 0"));
             }
             return Ok(ipow(base, exp as u64));
         }
@@ -506,21 +538,28 @@ impl<'a> Parser<'a> {
         }
         if self.peek_op("++") {
             self.advance();
-            if let Tok::Ident(name) = self.advance() {
+            if let Tok::Ident(name) = self.peek().clone() {
+                self.advance();
                 let v = self.ctx.get(&name) + 1;
                 self.ctx.set(&name, v);
                 return Ok(v);
             }
-            return Err("'++' needs a variable".to_string());
+            // Nothing to increment, so this was never an increment:
+            // bash reads `++5` as `+(+5)` and answers 5. Only a name
+            // makes `++` an operator of its own.
+            return self.parse_unary();
         }
         if self.peek_op("--") {
             self.advance();
-            if let Tok::Ident(name) = self.advance() {
+            if let Tok::Ident(name) = self.peek().clone() {
+                self.advance();
                 let v = self.ctx.get(&name) - 1;
                 self.ctx.set(&name, v);
                 return Ok(v);
             }
-            return Err("'--' needs a variable".to_string());
+            // `--5` is `-(-5)`, for the same reason.
+            let v = self.parse_unary()?;
+            return Ok(v);
         }
         self.parse_primary()
     }
@@ -546,11 +585,11 @@ impl<'a> Parser<'a> {
                 let v = self.parse_comma()?;
                 match self.advance() {
                     Tok::RParen => {}
-                    other => return Err(format!("expected ')', got {:?}", other)),
+                    _ => return Err(self.fail("arithmetic syntax error in expression")),
                 }
                 Ok(v)
             }
-            other => Err(format!("unexpected token in arithmetic expression: {:?}", other)),
+            _ => Err(self.fail("arithmetic syntax error: operand expected")),
         }
     }
 }
@@ -615,5 +654,15 @@ fn base_number(base: u32, digits: &str, token: &str) -> Result<i64, String> {
 pub fn eval(src: &str, ctx: &mut dyn VarContext) -> Result<i64, String> {
     let toks = tokenize(src)?;
     let mut p = Parser { toks, pos: 0, ctx };
-    p.parse_expr()
+    let value = p.parse_expr()?;
+    // Having *an* expression is not the same as having consumed the
+    // input. Without this the parser stopped at the first token it
+    // could not use and returned what it had: `$((1 2))` was 1,
+    // `$((3 4))` was 3, and `$((sqrt 3))` was 0 -- an undefined name
+    // followed by a number nobody looked at. Silently answering half
+    // an expression is worse than refusing it, and bash refuses.
+    if !matches!(p.peek(), Tok::Eof) {
+        return Err(format!("arithmetic syntax error in expression (error token is \"{}\")", p.peek().text()));
+    }
+    Ok(value)
 }
