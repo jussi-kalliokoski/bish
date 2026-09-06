@@ -1336,7 +1336,7 @@ fn highlight_tok(
         | Tok::RedirDupWord { .. }
         | Tok::RedirFdClose { .. }
         | Tok::HereString
-        | Tok::HereDoc(_) => out.push(whole(HighlightKind::Redirect)),
+        | Tok::HereDoc(_, _) => out.push(whole(HighlightKind::Redirect)),
 
         Tok::Newline => {}
 
@@ -1434,7 +1434,7 @@ fn highlight_word(
         match chunk {
             Chunk::Str(_) | Chunk::Tilde { .. } => {}
 
-            Chunk::LiteralStr(_) => {
+            Chunk::LiteralStr(_, _) => {
                 if let Some(r) = next_span(raw_spans, cursor) {
                     out.push(HighlightSpan { start: offset + r.start, end: offset + r.end, kind: HighlightKind::String, link: None });
                     if let WordRole::Argument { command: Some(cmd), arg_index } = &role {

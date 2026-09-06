@@ -5,13 +5,24 @@
 // function table. Doesn't need to be a general pretty-printer: just needs
 // to round-trip whatever a function body can contain.
 
-use crate::lexer::{Chunk, ReplaceAnchor, TransformKind, VarOp};
+use crate::lexer::{Chunk, Quoting, ReplaceAnchor, TransformKind, VarOp};
 use crate::parser::{AndOr, ArrayLiteralItem, AssignMode, Combinator, Command, ListItem, Pipeline, Redirect, Sep, SimpleCommand, Word};
 
 pub fn serialize_program(prog: &[ListItem]) -> String {
     let mut s = String::new();
     for item in prog {
-        s.push_str(&serialize_and_or(&item.and_or));
+        let (line, bodies) = serialize_and_or_parts(&item.and_or);
+        s.push_str(&line);
+        // A heredoc body starts on the next line, so the separator
+        // cannot share this one -- and the newline the body brings is
+        // the separator a `;` would have been.
+        if !bodies.is_empty() {
+            s.push('\n');
+            for b in bodies {
+                s.push_str(&b);
+            }
+            continue;
+        }
         s.push_str(match item.sep {
             Sep::Seq => ";\n",
             Sep::Background => "&\n",
@@ -20,19 +31,21 @@ pub fn serialize_program(prog: &[ListItem]) -> String {
     s
 }
 
-fn serialize_and_or(ao: &AndOr) -> String {
-    let mut s = serialize_pipeline(&ao.first);
+fn serialize_and_or_parts(ao: &AndOr) -> (String, Vec<String>) {
+    let (mut s, mut bodies) = serialize_pipeline_parts(&ao.first);
     for (comb, p) in &ao.rest {
         s.push_str(match comb {
             Combinator::And => " && ",
             Combinator::Or => " || ",
         });
-        s.push_str(&serialize_pipeline(p));
+        let (text, more) = serialize_pipeline_parts(p);
+        s.push_str(&text);
+        bodies.extend(more);
     }
-    s
+    (s, bodies)
 }
 
-fn serialize_pipeline(p: &Pipeline) -> String {
+fn serialize_pipeline_parts(p: &Pipeline) -> (String, Vec<String>) {
     let mut s = String::new();
     // `time` is a reserved word in front of the whole pipeline, not a
     // command inside it, so it lives here rather than in any argv --
@@ -46,9 +59,26 @@ fn serialize_pipeline(p: &Pipeline) -> String {
     if p.negate {
         s.push_str("! ");
     }
-    let parts: Vec<String> = p.commands.iter().map(serialize_command).collect();
-    s.push_str(&parts.join(" | "));
-    s
+    // A stage's heredoc body goes between it and the `|`, exactly as
+    // bash writes one: `cat <<E |` then the body, then the next stage.
+    let mut trailing: Vec<String> = Vec::new();
+    for (i, c) in p.commands.iter().enumerate() {
+        let (text, bodies) = serialize_command_parts(c);
+        if i > 0 {
+            match trailing.is_empty() {
+                true => s.push_str(" | "),
+                false => {
+                    s.push_str(" |\n");
+                    for b in trailing.drain(..) {
+                        s.push_str(&b);
+                    }
+                }
+            }
+        }
+        s.push_str(&text);
+        trailing.extend(bodies);
+    }
+    (s, trailing)
 }
 
 /// A compound's own redirects, written back after its closing keyword.
@@ -66,7 +96,21 @@ fn with_redirects(mut s: String, redirects: &[Redirect]) -> String {
 }
 
 pub fn serialize_command(cmd: &Command) -> String {
-    serialize_command_inner(cmd, true)
+    let (line, bodies) = serialize_command_parts(cmd);
+    match bodies.is_empty() {
+        true => line,
+        false => format!("{}\n{}", line, bodies.concat()),
+    }
+}
+
+/// `serialize_command`, keeping the heredoc bodies separate so a caller
+/// that is building a *line* can put them after it -- a pipeline's `|`
+/// goes before the body, not after.
+fn serialize_command_parts(cmd: &Command) -> (String, Vec<String>) {
+    match cmd {
+        Command::Simple(sc) => serialize_simple_with_heredocs(sc),
+        other => (serialize_command_inner(other, true), Vec::new()),
+    }
 }
 
 /// The same text without the compound's *own* trailing redirects, for a
@@ -185,11 +229,29 @@ fn serialize_test_atoms(atoms: &[crate::parser::TestAtom]) -> String {
 }
 
 fn serialize_simple(sc: &SimpleCommand) -> String {
+    let (line, bodies) = serialize_simple_with_heredocs(sc);
+    // Inline, for the callers that want one command's text and have
+    // nowhere to put a body: `$BASH_COMMAND`, a job's name. A single
+    // command with its heredoc after it is still valid source.
+    match bodies.is_empty() {
+        true => line,
+        false => format!("{}\n{}", line, bodies.concat()),
+    }
+}
+
+/// The command's text and the heredoc bodies that must follow the line
+/// it lands on -- see `format_simple`, which has the same shape and the
+/// same reason.
+fn serialize_simple_with_heredocs(sc: &SimpleCommand) -> (String, Vec<String>) {
     let mut parts = serialize_simple_parts(sc);
+    let mut bodies = Vec::new();
     for r in &sc.redirects {
         parts.push(serialize_redirect(r));
+        if let Redirect::HereDoc(w, spelling) = r {
+            bodies.push(heredoc_body(w, spelling));
+        }
     }
-    parts.join(" ")
+    (parts.join(" "), bodies)
 }
 
 /// Everything a simple command is made of *except* its redirects:
@@ -275,10 +337,16 @@ pub fn serialize_redirect(r: &Redirect) -> String {
         Redirect::Both { word, append } => format!("&{}{}", if *append { ">>" } else { ">" }, redirect_target(word)),
         Redirect::DupErrToOut => "2>&1".to_string(),
         Redirect::HereString(w) => format!("<<<{}", redirect_target(w)),
-        // Re-emit as an equivalent here-string: by serialization time the
-        // body is already fully captured, so a real <<DELIM...DELIM block
-        // isn't needed to reproduce the same runtime content.
-        Redirect::HereDoc(w) => serialize_heredoc(w),
+        // A real heredoc, not the equivalent here-string it used to be.
+        // Both reproduce the same runtime content -- the body is
+        // already captured by now -- but only one of them still *looks*
+        // like a heredoc, and `declare -f` prints what a round trip
+        // left behind.
+        Redirect::HereDoc(_, spelling) => {
+            let dash = if spelling.strip_tabs { "-" } else { "" };
+            let delim = if spelling.quoted { format!("'{}'", spelling.delimiter) } else { spelling.delimiter.clone() };
+            format!("<<{}{}", dash, delim)
+        }
         Redirect::VarFd { var, kind, word } => {
             let op = match kind {
                 crate::lexer::VarFdKind::In => "<".to_string(),
@@ -299,51 +367,69 @@ pub fn serialize_redirect(r: &Redirect) -> String {
     }
 }
 
-/// A heredoc, written as an equivalent `<<<`.
+/// Whether a chunk was inside a pair of double quotes.
 ///
-/// Not `serialize_word`, which writes a word back the way it was
-/// *written*: a heredoc body is not source text, it is content, and
-/// treating the two the same lost it twice over. `cat <<EOF/line
-/// $((1+1))/EOF` came back as `cat <<<line "$((1+1))"`, where the
-/// space ends the here-string's word and the sum becomes an argument
-/// to `cat`; and `cat <<'EOF'/no $expansion/EOF` came back as
-/// `cat <<<no $expansion`, with the quoting that was the whole point
-/// of the case gone. So every literal run is quoted here, whichever
-/// chunk it arrived in, and only the expansions a heredoc really does
-/// perform are written back live.
-///
-/// The trailing newline is the other half. A heredoc body ends with
-/// the newline of its last line and `<<<` appends one of its own, so
-/// the two together said `line 2\n\n`. One is dropped here, which
-/// leaves `<<<` to put it back -- and an empty body has no newline to
-/// drop, so it cannot be a here-string at all.
-fn serialize_heredoc(w: &Word) -> String {
-    // Emptiness is decided before the newline is stripped, because the
-    // two empties are different documents. `cat <<EOF/EOF` has no body
-    // and gives `cat` nothing; `cat <<EOF//EOF` has one empty line and
-    // gives it a newline, which is what a stripped `<<<''` puts back.
-    if w.chunks.iter().all(|c| matches!(c, Chunk::Str(t) | Chunk::LiteralStr(t) if t.is_empty())) {
-        return "</dev/null".to_string();
+/// Both halves matter: a literal run knows it directly, and an
+/// expansion knows it as `quoted`, which the lexer has always
+/// recorded. A run of them is one pair of quotes in the source and is
+/// written back as one -- `"a$x b"` rather than `'a'"$x"' b'`.
+fn is_double_quoted(c: &Chunk) -> bool {
+    match c {
+        Chunk::LiteralStr(_, Quoting::Double) => true,
+        Chunk::Str(_) | Chunk::LiteralStr(..) | Chunk::Tilde { .. } => false,
+        Chunk::Var { quoted, .. }
+        | Chunk::Sub { quoted, .. }
+        | Chunk::Arith { quoted, .. }
+        | Chunk::VarExpand { quoted, .. }
+        | Chunk::ArrayVar { quoted, .. }
+        | Chunk::ArrayVarExpand { quoted, .. }
+        | Chunk::Indirect { quoted, .. }
+        | Chunk::ArrayKeys { quoted, .. }
+        | Chunk::VarNamesMatchingPrefix { quoted, .. } => *quoted,
+        _ => false,
     }
-    let mut chunks: Vec<Chunk> = w.chunks.clone();
-    if let Some(last) = chunks.last_mut()
-        && let Chunk::Str(t) | Chunk::LiteralStr(t) = last
-        && let Some(stripped) = t.strip_suffix('\n')
-    {
-        *t = stripped.to_string();
+}
+
+/// The text of a chunk as it goes *inside* a `"..."` -- so a literal
+/// run keeps its characters and only the four that mean something to
+/// double quotes are escaped.
+fn inside_double_quotes(c: &Chunk) -> String {
+    match c {
+        Chunk::LiteralStr(t, _) => t.chars().flat_map(escaped_in_double_quotes).collect(),
+        // An expansion writes itself the same either way; the quotes
+        // around the run are what make it quoted.
+        other => serialize_chunk_unquoted(other),
     }
-    let text: String = chunks
-        .iter()
-        .map(|c| match c {
-            Chunk::Str(t) | Chunk::LiteralStr(t) => quote_literal(t),
-            other => serialize_chunk(other),
-        })
-        .collect();
-    format!("<<<{text}")
+}
+
+/// The four characters that mean something inside `"..."`, and
+/// therefore the only ones that need a backslash there.
+fn escaped_in_double_quotes(c: char) -> Vec<char> {
+    match c {
+        '"' | '\\' | '$' | '`' => vec!['\\', c],
+        c => vec![c],
+    }
 }
 
 pub(crate) fn serialize_word(w: &Word) -> String {
-    let text: String = w.chunks.iter().map(serialize_chunk).collect();
+    let mut text = String::new();
+    let mut at = 0;
+    while at < w.chunks.len() {
+        if is_double_quoted(&w.chunks[at]) {
+            // The whole run, back into the one pair of quotes it came
+            // from.
+            let end = w.chunks[at..].iter().position(|c| !is_double_quoted(c)).map_or(w.chunks.len(), |n| at + n);
+            text.push('"');
+            for c in &w.chunks[at..end] {
+                text.push_str(&inside_double_quotes(c));
+            }
+            text.push('"');
+            at = end;
+            continue;
+        }
+        text.push_str(&serialize_chunk(&w.chunks[at]));
+        at += 1;
+    }
     // A word that writes as nothing has to be written as `''`, or it
     // stops being a word at all: `echo ""` would come back as `echo`,
     // which prints a blank line where the original printed one too --
@@ -357,6 +443,18 @@ pub(crate) fn serialize_word(w: &Word) -> String {
 }
 
 fn serialize_chunk(c: &Chunk) -> String {
+    serialize_chunk_inner(c, true)
+}
+
+/// The same, for a chunk that is already inside a pair of double
+/// quotes: the quotes an expansion would otherwise put around itself
+/// are the ones the run has already opened.
+fn serialize_chunk_unquoted(c: &Chunk) -> String {
+    serialize_chunk_inner(c, false)
+}
+
+fn serialize_chunk_inner(c: &Chunk, wrap: bool) -> String {
+    let wrap_quoted = |s: String, quoted: bool| if wrap { wrap_quoted(s, quoted) } else { s };
     match c {
         // Written back as the source wrote it -- `~` is only a tilde
         // prefix at the start of a word, so it needs no quoting here.
@@ -380,7 +478,20 @@ fn serialize_chunk(c: &Chunk) -> String {
         // gives `[Str("*")]`. So what is left in `Str` is by
         // construction text that reads back as itself.
         Chunk::Str(s) => s.clone(),
-        Chunk::LiteralStr(s) => quote_literal(s),
+        // Back in the spelling it was written in. `Double` reaches here
+        // only for a run of one, since `serialize_word` gathers the
+        // longer ones itself.
+        Chunk::LiteralStr(s, quoting) => match quoting {
+            Quoting::Single => quote_literal(s),
+            Quoting::Double => format!("\"{}\"", s.chars().flat_map(escaped_in_double_quotes).collect::<String>()),
+            // One backslash per character, which is how it arrived:
+            // the lexer makes a chunk of each escape.
+            Quoting::Escape => s.chars().map(|c| format!("\\{c}")).collect(),
+            // bash does not put `$'...'` back: it prints the resolved
+            // text as an ordinary literal, so `$'a\tb'` comes back as
+            // `'a<tab>b'`. Measured, not assumed.
+            Quoting::Dollar => quote_literal(s),
+        },
         // Written back the way it was written: `$x` braced only if
         // the source braced it. Both expand the same, and `declare -f`
         // is where the difference is visible.
@@ -388,7 +499,10 @@ fn serialize_chunk(c: &Chunk) -> String {
             let text = if *braced { format!("${{{}}}", name) } else { format!("${}", name) };
             wrap_quoted(text, *quoted)
         }
-        Chunk::Sub { raw, quoted } => wrap_quoted(format!("$({})", raw), *quoted),
+        Chunk::Sub { raw, quoted, backticks } => {
+            let text = if *backticks { format!("`{}`", raw) } else { format!("$({})", raw) };
+            wrap_quoted(text, *quoted)
+        }
         Chunk::Arith { raw, quoted } => wrap_quoted(format!("$(({}))", raw), *quoted),
         Chunk::VarExpand { name, op, quoted } => wrap_quoted(serialize_var_op(name, op), *quoted),
         Chunk::ArrayVar { name, index, quoted } => wrap_quoted(format!("${{{}[{}]}}", name, index), *quoted),
@@ -540,9 +654,16 @@ fn format_function_at(name: &str, body: &Command, indent: usize, nested: bool) -
             }
         }
         other => {
+            let (text, bodies) = format_command(other, indent + 1);
             out.push_str(&pad(indent + 1));
-            out.push_str(&format_command(other, indent + 1));
+            out.push_str(&text);
             out.push('\n');
+            if !bodies.is_empty() {
+                for b in bodies {
+                    out.push_str(&b);
+                }
+                out.push('\n');
+            }
             out.push_str(&here);
             out.push('}');
         }
@@ -565,9 +686,22 @@ fn format_list(prog: &[ListItem], indent: usize, semi_on_last: bool, out: &mut S
         if at_line_start {
             out.push_str(&pad(indent));
         }
-        out.push_str(&format_and_or(&item.and_or, indent));
+        let (text, bodies) = format_and_or(&item.and_or, indent);
+        out.push_str(&text);
         let last = i + 1 == prog.len();
         at_line_start = true;
+        // A heredoc body has to start on the next line, so the line it
+        // follows cannot also carry a `;` -- and bash does not put one
+        // there. The blank line after the delimiter is the body's own.
+        if !bodies.is_empty() {
+            out.push('\n');
+            for b in bodies {
+                out.push_str(&b);
+            }
+            // The blank line that ends a line carrying heredocs.
+            out.push('\n');
+            continue;
+        }
         match item.sep {
             Sep::Background if last => out.push_str(" &\n"),
             Sep::Background => {
@@ -591,7 +725,12 @@ fn format_list_inline(prog: &[ListItem], indent: usize) -> String {
             out.push('\n');
             out.push_str(&pad(indent));
         }
-        out.push_str(&format_and_or(&item.and_or, indent));
+        let (text, bodies) = format_and_or(&item.and_or, indent);
+        out.push_str(&text);
+        for b in bodies {
+            out.push('\n');
+            out.push_str(&b);
+        }
         if i + 1 < prog.len() {
             out.push_str(match item.sep {
                 Sep::Background => " &",
@@ -602,19 +741,21 @@ fn format_list_inline(prog: &[ListItem], indent: usize) -> String {
     out
 }
 
-fn format_and_or(ao: &AndOr, indent: usize) -> String {
-    let mut s = format_pipeline(&ao.first, indent);
+fn format_and_or(ao: &AndOr, indent: usize) -> (String, Vec<String>) {
+    let (mut s, mut bodies) = format_pipeline(&ao.first, indent);
     for (comb, p) in &ao.rest {
         s.push_str(match comb {
             Combinator::And => " && ",
             Combinator::Or => " || ",
         });
-        s.push_str(&format_pipeline(p, indent));
+        let (text, more) = format_pipeline(p, indent);
+        s.push_str(&text);
+        bodies.extend(more);
     }
-    s
+    (s, bodies)
 }
 
-fn format_pipeline(p: &Pipeline, indent: usize) -> String {
+fn format_pipeline(p: &Pipeline, indent: usize) -> (String, Vec<String>) {
     let mut s = String::new();
     match p.timed {
         Some(crate::parser::TimeStyle::Shell) => s.push_str("time "),
@@ -624,13 +765,35 @@ fn format_pipeline(p: &Pipeline, indent: usize) -> String {
     if p.negate {
         s.push_str("! ");
     }
-    s.push_str(&p.commands.iter().map(|c| format_command(c, indent)).collect::<Vec<_>>().join(" | "));
-    s
+    let mut trailing: Vec<String> = Vec::new();
+    for (i, c) in p.commands.iter().enumerate() {
+        let (text, bodies) = format_command(c, indent);
+        if i > 0 {
+            // A stage whose predecessor opened a heredoc starts a line
+            // of its own, because the body had to go between them. Two
+            // spaces, which is bash's own choice here and not this
+            // block's indent.
+            match trailing.is_empty() {
+                true => s.push_str(" | "),
+                false => {
+                    s.push_str(" |\n");
+                    for b in trailing.drain(..) {
+                        s.push_str(&b);
+                    }
+                    s.push_str("  ");
+                }
+            }
+        }
+        s.push_str(&text);
+        trailing.extend(bodies);
+    }
+    (s, trailing)
 }
 
-fn format_command(cmd: &Command, indent: usize) -> String {
+fn format_command(cmd: &Command, indent: usize) -> (String, Vec<String>) {
     let inner = pad(indent + 1);
     let here = pad(indent);
+    let plain = |s: String| (s, Vec::new());
     match cmd {
         Command::Simple(sc) => format_simple(sc),
         // `elif` is not in bash's output at all: it prints the second
@@ -666,7 +829,7 @@ fn format_command(cmd: &Command, indent: usize) -> String {
                     s.push_str(";\n");
                 }
             }
-            with_formatted_redirects(s, redirects)
+            plain(with_formatted_redirects(s, redirects))
         }
         Command::While { cond, body, until, redirects } => {
             let mut s = String::new();
@@ -676,7 +839,7 @@ fn format_command(cmd: &Command, indent: usize) -> String {
             format_list(body, indent + 1, true, &mut s);
             s.push_str(&here);
             s.push_str("done");
-            with_formatted_redirects(s, redirects)
+            plain(with_formatted_redirects(s, redirects))
         }
         Command::For { var, words, body, redirects } => {
             // A `for x` with no list iterates the positional parameters,
@@ -690,14 +853,14 @@ fn format_command(cmd: &Command, indent: usize) -> String {
             format_list(body, indent + 1, true, &mut s);
             s.push_str(&here);
             s.push_str("done");
-            with_formatted_redirects(s, redirects)
+            plain(with_formatted_redirects(s, redirects))
         }
         Command::CFor { init, cond, step, body, redirects } => {
             let mut s = format!("for (({}; {}; {}))\n{}do\n", init.trim(), cond.trim(), step.trim(), here);
             format_list(body, indent + 1, true, &mut s);
             s.push_str(&here);
             s.push_str("done");
-            with_formatted_redirects(s, redirects)
+            plain(with_formatted_redirects(s, redirects))
         }
         Command::Select { var, words, body, redirects } => {
             let items = match words {
@@ -708,7 +871,7 @@ fn format_command(cmd: &Command, indent: usize) -> String {
             format_list(body, indent + 1, true, &mut s);
             s.push_str(&here);
             s.push_str("done");
-            with_formatted_redirects(s, redirects)
+            plain(with_formatted_redirects(s, redirects))
         }
         Command::Case { word, arms, redirects } => {
             let mut s = format!("case {} in \n", serialize_word(word));
@@ -726,14 +889,14 @@ fn format_command(cmd: &Command, indent: usize) -> String {
             }
             s.push_str(&here);
             s.push_str("esac");
-            with_formatted_redirects(s, redirects)
+            plain(with_formatted_redirects(s, redirects))
         }
         Command::Group(prog, redirects) => {
             let mut s = String::from("{ \n");
             format_list(prog, indent + 1, false, &mut s);
             s.push_str(&here);
             s.push('}');
-            with_formatted_redirects(s, redirects)
+            plain(with_formatted_redirects(s, redirects))
         }
         // Held as source text rather than a tree (see Command::Subshell),
         // so it is parsed here to be laid out. A body that will not parse
@@ -744,18 +907,22 @@ fn format_command(cmd: &Command, indent: usize) -> String {
                 Some(prog) => format!("( {} )", format_list_inline(&prog, indent)),
                 None => format!("( {} )", raw.trim()),
             };
-            with_formatted_redirects(s, redirects)
+            plain(with_formatted_redirects(s, redirects))
         }
         // Verbatim between the parentheses, spaces and all: bash keeps
         // whatever was written there, so `((n++))` and `(( n++ ))` each
         // come back as themselves.
-        Command::Arith(raw, redirects) => with_formatted_redirects(format!("(({}))", raw), redirects),
-        Command::Test(atoms, redirects) => with_formatted_redirects(format!("[[ {} ]]", serialize_test_atoms(atoms)), redirects),
-        Command::FuncDef { name, body } => format_function_at(name, body, indent, true),
-        Command::Coproc { name, body } => match name {
-            Some(n) => format!("coproc {} {}", n, format_command(body, indent)),
-            None => format!("coproc {}", format_command(body, indent)),
-        },
+        Command::Arith(raw, redirects) => plain(with_formatted_redirects(format!("(({}))", raw), redirects)),
+        Command::Test(atoms, redirects) => plain(with_formatted_redirects(format!("[[ {} ]]", serialize_test_atoms(atoms)), redirects)),
+        Command::FuncDef { name, body } => plain(format_function_at(name, body, indent, true)),
+        Command::Coproc { name, body } => {
+            let (text, bodies) = format_command(body, indent);
+            let line = match name {
+                Some(n) => format!("coproc {} {}", n, text),
+                None => format!("coproc {}", text),
+            };
+            (line, bodies)
+        }
     }
 }
 
@@ -772,10 +939,39 @@ fn with_formatted_redirects(mut s: String, redirects: &[Redirect]) -> String {
     s
 }
 
-fn format_simple(sc: &SimpleCommand) -> String {
+/// A heredoc as bash writes one back: the body at column zero, then
+/// the delimiter. Column zero because that is where a heredoc body
+/// lives -- indenting it would change what it contains.
+///
+/// No blank line here. bash puts one after the *last* body on a line,
+/// so two heredocs on one command run together and a stage that has
+/// another after it in a pipeline gets none at all. The caller that
+/// knows the line has ended is the one that adds it.
+fn heredoc_body(w: &Word, spelling: &crate::lexer::HereDocSpelling) -> String {
+    let body: String = w
+        .chunks
+        .iter()
+        .map(|c| match c {
+            Chunk::Str(t) | Chunk::LiteralStr(t, _) => t.clone(),
+            other => serialize_chunk_unquoted(other),
+        })
+        .collect();
+    format!("{}{}\n", body, spelling.delimiter)
+}
+
+/// The command's own text, and the heredoc bodies that have to follow
+/// the line it ends up on. They are kept apart because only the caller
+/// knows where that line ends: in a pipeline the `|` goes before them.
+fn format_simple(sc: &SimpleCommand) -> (String, Vec<String>) {
     let mut parts: Vec<String> = serialize_simple_parts(sc);
-    parts.extend(sc.redirects.iter().map(format_redirect));
-    parts.join(" ")
+    let mut bodies = Vec::new();
+    for r in &sc.redirects {
+        parts.push(format_redirect(r));
+        if let Redirect::HereDoc(w, spelling) = r {
+            bodies.push(heredoc_body(w, spelling));
+        }
+    }
+    (parts.join(" "), bodies)
 }
 
 /// A redirect the way bash prints one: the operator, then a space
@@ -795,6 +991,14 @@ fn format_redirect(r: &Redirect) -> String {
         Redirect::FdDup { fd, target } => format!("{}>&{}", fd, target),
         Redirect::FdDupWord { fd, word } => format!("{}>&{}", fd, serialize_word(word)),
         Redirect::FdClose { fd } => format!("{}>&-", fd),
+        // Written as the heredoc it was, which is what the body
+        // emitted after this line completes. `<<-` and a quoted
+        // delimiter both change what the body means, so both survive.
+        Redirect::HereDoc(_, spelling) => {
+            let dash = if spelling.strip_tabs { "-" } else { "" };
+            let delim = if spelling.quoted { format!("'{}'", spelling.delimiter) } else { spelling.delimiter.clone() };
+            format!("<<{}{}", dash, delim)
+        }
         // The forms with nothing to normalise, or nothing bash's own
         // layout says about them.
         other => serialize_redirect(other),

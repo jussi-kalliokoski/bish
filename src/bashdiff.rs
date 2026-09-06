@@ -258,6 +258,36 @@ mod tests {
         case("a-missing-command-does-not-end-the-pipeline", r#"nosuchcmd | head -1; echo "ps=(${PIPESTATUS[@]}) q=$?""#),
         case("a-missing-command-later-in-a-pipeline", r#"echo x | nosuchcmd; echo "q=$? it=${PIPESTATUS[1]}""#),
         case("a-directory-as-a-pipeline-stage", r#"/etc | cat; echo "q=${PIPESTATUS[0]}""#),
+        // A word is written back the way it was *spelled*, not merely
+        // the way it means. The tree records the meaning, so every
+        // literal used to come back single-quoted: `trap "echo t" EXIT`
+        // printed as `trap 'echo t' EXIT`, and `"x${y}z"` as
+        // `'x'"${y}"'z'`.
+        case("declare-f-keeps-each-kind-of-quote", "f() { echo \"a\" 'b' c\\ d; }; declare -f f"),
+        case("declare-f-keeps-one-pair-of-double-quotes", r#"f() { echo "x${y}z" "a$x b"; }; declare -f f"#),
+        case("declare-f-escapes-inside-double-quotes", r#"f() { echo "a\"b" "a\\b" "\$x"; }; declare -f f"#),
+        // An empty pair of quotes is a word, and `a""b` is one word
+        // with a pair in the middle. Only when the quotes held nothing
+        // at all, though: `"${a[@]:9}"` holds an expansion that
+        // vanishes, and must vanish with it.
+        case("declare-f-keeps-an-empty-quoted-word", r#"f() { echo "" '' a""b ""a; }; declare -f f"#),
+        case("an-empty-expansion-in-quotes-is-not-a-word", r#"a=(1); c(){ echo $#; }; c "x" "${a[@]:9}" "y"; c "" x"#),
+        // `$'...'` is the exception bash makes: it prints the text that
+        // was resolved, as an ordinary literal.
+        case("declare-f-resolves-dollar-single-quotes", "f() { echo $'a\\tb'; }; declare -f f"),
+        case("declare-f-keeps-backticks", r#"f() { echo `pwd` "`pwd`" $(pwd); }; declare -f f"#),
+        // A heredoc comes back as a heredoc, delimiter and all -- body
+        // below the line, then a blank one. `<<-` and a quoted
+        // delimiter both change what the body means, so both survive.
+        case("declare-f-keeps-a-heredoc", "f() { cat <<EOF\nhi\nEOF\n}; declare -f f"),
+        case("declare-f-keeps-a-quoted-heredoc-delimiter", "f() { cat <<'E'\n$x\nE\n}; declare -f f"),
+        case("declare-f-keeps-a-tab-stripping-heredoc", "f() { cat <<-T\n\tx\nT\n}; declare -f f"),
+        case("declare-f-a-heredoc-with-a-command-after-it", "f() { cat <<EOF\nhi\nEOF\necho after; }; declare -f f"),
+        case("declare-f-a-heredoc-in-a-pipeline", "f() { cat <<EOF | wc -l\na\nEOF\n}; declare -f f"),
+        case("declare-f-two-heredocs-on-one-command", "f() { cat <<A <<B\n1\nA\n2\nB\n}; declare -f f"),
+        case("declare-f-a-heredoc-inside-a-branch", "f() { if :; then cat <<E\nb\nE\nfi; }; declare -f f"),
+        // The idiom this output exists for.
+        case("declare-f-output-can-be-re-sourced", "f() { cat <<E\nz\nE\n}; sh -c \"$(declare -f f); f\""),
         case("declare-f-empty-body", r#"f() { :; }; declare -f f"#),
         case("declare-f-two-statements", r#"f() { echo a; echo b; }; declare -f f"#),
         case("declare-f-a-bare-variable-stays-bare", r#"f() { echo $x ${y}; }; declare -f f"#),
@@ -1203,40 +1233,6 @@ y
         // principle keeps `compgen -A setopt` short. Recorded because
         // it is still a difference a script can see.
         ("set-o-lists-fewer-options", "`set -o` lists 10 options; bash lists 27, most of which bish does not implement"),
-        // `declare -f` prints a function by reconstructing it from the
-        // parse tree, through the serializer that exists to hand
-        // functions to a self-exec'd child -- so every word comes out
-        // maximally quoted (`'echo' 'yes '"${x}"`), because that is
-        // what guarantees it parses back to the same command, and there
-        // is no indentation.
-        //
-        // A display printer would fix the layout, which is most of the
-        // ugliness. It would still not match bash, and the reason is
-        // worth writing down: bash does *not* re-render each word from
-        // its parse tree. It keeps the original spelling -- `${x}`
-        // stays `${x}`, `a"b"c` stays `a"b"c`, `"a"'b'` stays
-        // `"a"'b'` -- while normalising the layout around them.
-        // Matching that is not a printer to be written but source spans
-        // to be carried through the lexer and parser and held on every
-        // word.
-        //
-        // What the output has to *do* is checked in CASES: it defines
-        // the function again when another shell reads it back.
-        // Only the *layout* now. The quoting half of this went away
-        // when the serializer stopped writing unquoted words as
-        // quoted ones: `declare -f` of a body containing `echo *` or
-        // `case $x in a*)` reproduces both correctly today, where it
-        // used to reproduce something that behaved differently. What
-        // is left is genuinely presentational -- bash writes `f () `
-        // and a four-space indent, bish writes `f() ` and none, and
-        // bish prints `${x}` where the source said `$x`. That last one
-        // is the piece that really does want source spans: the shape a
-        // variable was written in is not recoverable from the parse
-        // tree.
-        (
-            "function-body-quoting",
-            "`declare -f` reproduces bash's layout but not a word's *spelling*: quote style, backticks and a heredoc's delimiter are not in the parse tree",
-        ),
         // The builtin *set* differs, legitimately: bish has builtins
         // bash does not (`abbr`, `win`, `::bish`) and lacks `bind` and
         // `logout`. Listed rather than fixed because the difference is
@@ -1248,7 +1244,6 @@ y
     // so that list stays a description of what works.
     const PENDING: &[Case] = &[
         case("set-o-lists-fewer-options", r#"set -o | wc -l"#),
-        case("function-body-quoting", "f() { echo \"a\" 'b' c\\ d; }; declare -f f"),
         case("bash-command-read-outside-a-trap", r#"true; echo "[$BASH_COMMAND]""#),
         case("bashpid-is-the-shells-own-in-a-subshell", r#"echo $(( $$ == BASHPID )); ( echo $(( $$ == BASHPID )) )"#),
         case("debug-trap-misses-an-external-pipeline-stage", r#"trap "echo D" DEBUG; echo a | cat"#),

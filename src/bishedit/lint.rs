@@ -549,7 +549,7 @@ fn lint_word_chunks(
     for chunk in chunks {
         match chunk {
             Chunk::Str(_) | Chunk::Tilde { .. } => {}
-            Chunk::LiteralStr(_) => {
+            Chunk::LiteralStr(_, _) => {
                 next_span(raw_spans, cursor);
             }
             Chunk::ArrayLength { .. } => {
@@ -579,7 +579,7 @@ fn lint_word_chunks(
                     push_unquoted_expansion(chars, offset, content, out);
                 }
             }
-            Chunk::Sub { raw, quoted } => {
+            Chunk::Sub { raw, quoted, .. } => {
                 if let Some(content) = next_span(raw_spans, cursor) {
                     let inner_offset = offset + content.start;
                     if !exempt && !quoted {

@@ -4797,7 +4797,7 @@ impl Shell {
                     content.push('\n');
                     return Box::new(std::io::Cursor::new(content.into_bytes()));
                 }
-                Redirect::HereDoc(w) => {
+                Redirect::HereDoc(w, _) => {
                     let content = self.expand_word(w);
                     return Box::new(std::io::Cursor::new(content.into_bytes()));
                 }
@@ -6618,14 +6618,14 @@ impl Shell {
                     out.push_str(&crate::regex::escape(&self.expand_tilde(&name)));
                 }
                 Chunk::Str(t) => out.push_str(t),
-                Chunk::LiteralStr(t) => out.push_str(&crate::regex::escape(t)),
+                Chunk::LiteralStr(t, _) => out.push_str(&crate::regex::escape(t)),
                 Chunk::Var { name, quoted, .. } => {
                     let name = name.clone();
                     self.check_nounset(&name);
                     let v = self.lookup_var(&name);
                     out.push_str(&if *quoted { crate::regex::escape(&v) } else { v });
                 }
-                Chunk::Sub { raw, quoted } => {
+                Chunk::Sub { raw, quoted, .. } => {
                     let v = self.run_command_substitution(raw);
                     out.push_str(&if *quoted { crate::regex::escape(&v) } else { v });
                 }
@@ -6716,14 +6716,14 @@ impl Shell {
                     out.push_str(&crate::glob::escape(&self.expand_tilde(&name)));
                 }
                 Chunk::Str(t) => out.push_str(t),
-                Chunk::LiteralStr(t) => out.push_str(&crate::glob::escape(t)),
+                Chunk::LiteralStr(t, _) => out.push_str(&crate::glob::escape(t)),
                 Chunk::Var { name, quoted, .. } => {
                     let name = name.clone();
                     self.check_nounset(&name);
                     let v = self.lookup_var(&name);
                     out.push_str(&if *quoted { crate::glob::escape(&v) } else { v });
                 }
-                Chunk::Sub { raw, quoted } => {
+                Chunk::Sub { raw, quoted, .. } => {
                     let v = self.run_command_substitution(raw);
                     out.push_str(&if *quoted { crate::glob::escape(&v) } else { v });
                 }
@@ -6931,7 +6931,7 @@ impl Shell {
             // Quoting a builtin's own name doesn't stop bash from
             // recognizing it (`"export" FOO=bar` still runs export), so
             // this must match a fully-quoted name too, not just a bare one.
-            [Chunk::Str(s)] | [Chunk::LiteralStr(s)] => Some(s.as_str()),
+            [Chunk::Str(s)] | [Chunk::LiteralStr(s, _)] => Some(s.as_str()),
             _ => None,
         };
         // Only populated for the same assignment-builtin names as the argv
@@ -7950,7 +7950,7 @@ impl Shell {
                     continue 'args;
                 }
                 let timeout_secs = timeout_arg.and_then(|s| s.parse::<f64>().ok());
-                let is_real_stdin = !cmd.redirects.iter().any(|r| matches!(r, Redirect::In(_) | Redirect::HereString(_) | Redirect::HereDoc(_)));
+                let is_real_stdin = !cmd.redirects.iter().any(|r| matches!(r, Redirect::In(_) | Redirect::HereString(_) | Redirect::HereDoc(_, _)));
                 if let Some(p) = prompt {
                     if is_real_stdin && stdin_is_tty() {
                         sh_eprint!(self, "{}", p);
@@ -8960,7 +8960,7 @@ impl Shell {
             // Which is not a hypothetical: the serializer quotes every
             // word, so this is the shape a re-exec'd construct arrives
             // in.
-            [crate::lexer::Chunk::Str(name)] | [crate::lexer::Chunk::LiteralStr(name)] => {
+            [crate::lexer::Chunk::Str(name)] | [crate::lexer::Chunk::LiteralStr(name, _)] => {
                 self.is_active_builtin(name) || self.functions.contains_key(name)
             }
             _ => true,
@@ -9729,7 +9729,7 @@ impl Shell {
                     let name = name.clone();
                     s.push_str(&self.expand_tilde(&name));
                 }
-                Chunk::Str(t) | Chunk::LiteralStr(t) => s.push_str(t),
+                Chunk::Str(t) | Chunk::LiteralStr(t, _) => s.push_str(t),
                 Chunk::Var { name, .. } => {
                     let name = name.clone();
                     self.check_nounset(&name);
@@ -10112,7 +10112,7 @@ impl Shell {
                     current.get_or_insert_with(String::new).push_str(t);
                     pattern_current.get_or_insert_with(String::new).push_str(t);
                 }
-                Chunk::LiteralStr(t) => {
+                Chunk::LiteralStr(t, _) => {
                     // Quoted or backslash-escaped source text -- always
                     // escaped for the pattern copy, whatever characters it
                     // contains, so it can never itself act as a wildcard.
@@ -10138,7 +10138,7 @@ impl Shell {
                         append_splittable_glob(&mut fields, &mut current, &mut patterns, &mut pattern_current, &v, *quoted, &ifs);
                     }
                 }
-                Chunk::Sub { raw, quoted } => {
+                Chunk::Sub { raw, quoted, .. } => {
                     let v = self.run_command_substitution(raw);
                     append_splittable_glob(&mut fields, &mut current, &mut patterns, &mut pattern_current, &v, *quoted, &ifs);
                 }
@@ -11798,7 +11798,7 @@ impl Shell {
                 r,
                 Redirect::In(_)
                     | Redirect::HereString(_)
-                    | Redirect::HereDoc(_)
+                    | Redirect::HereDoc(_, _)
                     | Redirect::Out { .. }
                     | Redirect::Err { .. }
                     | Redirect::Both { .. }
@@ -11837,7 +11837,7 @@ impl Shell {
                     content.push('\n');
                     stdio.stdin = Some(here_string_file(&content)?);
                 }
-                Redirect::HereDoc(w) => {
+                Redirect::HereDoc(w, _) => {
                     let content = self.expand_word(w);
                     stdio.stdin = Some(here_string_file(&content)?);
                 }
@@ -11912,7 +11912,7 @@ impl Shell {
                     content.push('\n');
                     actions.push(FdAction::Open { fd: 0, file: here_string_file(&content)? });
                 }
-                Redirect::HereDoc(w) => {
+                Redirect::HereDoc(w, _) => {
                     // Body already ends in '\n' from capture_heredoc_body.
                     let content = self.expand_word(w);
                     actions.push(FdAction::Open { fd: 0, file: here_string_file(&content)? });

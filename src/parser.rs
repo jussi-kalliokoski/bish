@@ -1,4 +1,4 @@
-use crate::lexer::{Chunk, Lexer, Tok, VarFdKind, keyword_text};
+use crate::lexer::{Chunk, Lexer, Quoting, Tok, VarFdKind, keyword_text};
 
 #[derive(Debug, Clone)]
 pub struct Word {
@@ -18,7 +18,7 @@ pub enum Redirect {
     Both { word: Word, append: bool },
     DupErrToOut,
     HereString(Word),
-    HereDoc(Word),
+    HereDoc(Word, crate::lexer::HereDocSpelling),
     // Arbitrary-fd forms: `N>file`/`N>>file`/`N<file` and `N>&M`/`N<&M`.
     // Only per-command (not the persistent shell-level `exec N>file` form,
     // which would need fds kept open for the rest of the shell's life --
@@ -924,12 +924,12 @@ impl Parser {
                     let word = self.expect_word()?;
                     redirects.push(Redirect::HereString(word));
                 }
-                Some(Tok::HereDoc(_)) => {
-                    let chunks = match self.advance() {
-                        Some(Tok::HereDoc(c)) => c,
+                Some(Tok::HereDoc(..)) => {
+                    let (chunks, spelling) = match self.advance() {
+                        Some(Tok::HereDoc(c, spelling)) => (c, spelling),
                         _ => unreachable!(),
                     };
-                    redirects.push(Redirect::HereDoc(Word { chunks, globbable: false }));
+                    redirects.push(Redirect::HereDoc(Word { chunks, globbable: false }, spelling));
                 }
                 _ => break,
             }
@@ -1104,12 +1104,12 @@ impl Parser {
                     let word = self.expect_word()?;
                     redirects.push(Redirect::HereString(word));
                 }
-                Some(Tok::HereDoc(_)) => {
-                    let chunks = match self.advance() {
-                        Some(Tok::HereDoc(c)) => c,
+                Some(Tok::HereDoc(..)) => {
+                    let (chunks, spelling) = match self.advance() {
+                        Some(Tok::HereDoc(c, spelling)) => (c, spelling),
                         _ => unreachable!(),
                     };
-                    redirects.push(Redirect::HereDoc(Word { chunks, globbable: false }));
+                    redirects.push(Redirect::HereDoc(Word { chunks, globbable: false }, spelling));
                 }
                 _ => break,
             }
@@ -1196,7 +1196,7 @@ fn word_as_index_assignment(w: &Word) -> Option<(String, String, AssignMode, Wor
     for (ci, c) in w.chunks.iter().enumerate() {
         let (s, is_lit) = match c {
             Chunk::Str(s) => (s, false),
-            Chunk::LiteralStr(s) => (s, true),
+            Chunk::LiteralStr(s, _) => (s, true),
             _ => break,
         };
         bounds.push((flat.len(), ci, is_lit));
@@ -1239,14 +1239,17 @@ fn word_as_index_assignment(w: &Word) -> Option<(String, String, AssignMode, Wor
     let value_pos = flat.len() - value_start.len();
 
     let &(start, chunk_idx, is_lit) = bounds.iter().rfind(|&&(start, _, _)| start <= value_pos)?;
-    let chunk_text = match &w.chunks[chunk_idx] {
-        Chunk::Str(s) | Chunk::LiteralStr(s) => s,
+    // The tail of a split chunk keeps the spelling the whole one had:
+    // half of a `'...'` is still single-quoted text.
+    let (chunk_text, quoting) = match &w.chunks[chunk_idx] {
+        Chunk::Str(s) => (s, Quoting::Single),
+        Chunk::LiteralStr(s, q) => (s, *q),
         _ => unreachable!(),
     };
     let remainder = chunk_text[value_pos - start..].to_string();
     let mut rest_chunks = Vec::new();
     if !remainder.is_empty() {
-        rest_chunks.push(if is_lit { Chunk::LiteralStr(remainder) } else { Chunk::Str(remainder) });
+        rest_chunks.push(if is_lit { Chunk::LiteralStr(remainder, quoting) } else { Chunk::Str(remainder) });
     }
     rest_chunks.extend(w.chunks[chunk_idx + 1..].iter().cloned());
     if rest_chunks.is_empty() {
@@ -1299,7 +1302,7 @@ fn array_literal_item_as_index(w: &Word) -> Option<(String, Word)> {
     for (ci, c) in w.chunks.iter().enumerate() {
         let (s, is_lit) = match c {
             Chunk::Str(s) => (s, false),
-            Chunk::LiteralStr(s) => (s, true),
+            Chunk::LiteralStr(s, _) => (s, true),
             _ => break,
         };
         bounds.push((flat.len(), ci, is_lit));
@@ -1313,14 +1316,17 @@ fn array_literal_item_as_index(w: &Word) -> Option<(String, Word)> {
     let value_pos = flat.len() - value_start.len();
 
     let &(start, chunk_idx, is_lit) = bounds.iter().rfind(|&&(start, _, _)| start <= value_pos)?;
-    let chunk_text = match &w.chunks[chunk_idx] {
-        Chunk::Str(s) | Chunk::LiteralStr(s) => s,
+    // The tail of a split chunk keeps the spelling the whole one had:
+    // half of a `'...'` is still single-quoted text.
+    let (chunk_text, quoting) = match &w.chunks[chunk_idx] {
+        Chunk::Str(s) => (s, Quoting::Single),
+        Chunk::LiteralStr(s, q) => (s, *q),
         _ => unreachable!(),
     };
     let remainder = chunk_text[value_pos - start..].to_string();
     let mut rest_chunks = Vec::new();
     if !remainder.is_empty() {
-        rest_chunks.push(if is_lit { Chunk::LiteralStr(remainder) } else { Chunk::Str(remainder) });
+        rest_chunks.push(if is_lit { Chunk::LiteralStr(remainder, quoting) } else { Chunk::Str(remainder) });
     }
     rest_chunks.extend(w.chunks[chunk_idx + 1..].iter().cloned());
     if rest_chunks.is_empty() {

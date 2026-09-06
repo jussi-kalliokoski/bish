@@ -6,6 +6,39 @@
 // otherwise not subject to word-splitting) -- exec.rs's expand_word_split
 // only splits unquoted expansion results on IFS, matching bash: `"$x"`
 // never splits even if $x contains spaces, but bare `$x` does.
+/// How a literal run of text was spelled in the source.
+///
+/// The parse tree records what a word *means*; this is the one thing
+/// about how it was written that has to survive, because `declare -f`
+/// output is read by people and by other shells. Without it every
+/// literal came back single-quoted: `trap "echo t" EXIT` printed as
+/// `trap 'echo t' EXIT`, and `"x${y}z"` as `'x'"${y}"'z'`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Quoting {
+    /// `'...'` -- nothing inside is special.
+    Single,
+    /// One run of literal text inside `"..."`. A double-quoted word is
+    /// usually several chunks (the expansions between them are their
+    /// own), and they are written back as one pair of quotes again.
+    Double,
+    /// A single character behind a backslash, as in `c\ d`.
+    Escape,
+    /// `$'...'`, whose escapes were resolved at lex time and have to be
+    /// put back to be written.
+    Dollar,
+}
+
+/// How a heredoc was introduced, for writing one back out.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HereDocSpelling {
+    pub delimiter: String,
+    /// `<<'E'` or `<<"E"`: the body is literal.
+    pub quoted: bool,
+    /// `<<-`, which strips leading tabs from the body and the
+    /// delimiter line.
+    pub strip_tabs: bool,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Chunk {
     Str(String),
@@ -24,7 +57,11 @@ pub enum Chunk {
     Var { name: String, quoted: bool, braced: bool },
     // Raw, not-yet-parsed source text of a $(...) or `...` command
     // substitution -- re-tokenized/parsed/run recursively at expansion time.
-    Sub { raw: String, quoted: bool },
+    // `$( )` or `` ` ` ``, and which of the two it was written as.
+    // They run the same command; only writing the word back out can
+    // tell, and bash's `declare -f` shows a backticked substitution as
+    // it was written.
+    Sub { raw: String, quoted: bool, backticks: bool },
     // Raw source text of a $((...)) arithmetic expansion.
     Arith { raw: String, quoted: bool },
     VarExpand { name: String, op: VarOp, quoted: bool },
@@ -70,8 +107,8 @@ pub enum Chunk {
     // in exec.rs, both of which escape LiteralStr but not Chunk::Str).
     // Treated identically to Chunk::Str everywhere else that just wants
     // the plain text value (word-splitting, serialization, command-name
-    // lookup): see the `Chunk::Str(s) | Chunk::LiteralStr(s)` arms.
-    LiteralStr(String),
+    // lookup): see the `Chunk::Str(s) | Chunk::LiteralStr(s, _)` arms.
+    LiteralStr(String, Quoting),
 }
 
 // The operand ("word"/"pattern") of each variant is kept as raw source text
@@ -237,7 +274,12 @@ pub enum Tok {
     // Placeholder pushed at the `<<WORD` site; patched in place with the
     // real (already expansion-processed) body once the line's newline is
     // reached (see Lexer::pending_heredocs).
-    HereDoc(Vec<Chunk>),
+    // The body, plus how the heredoc was written: its delimiter, and
+    // whether that delimiter was quoted (`<<'E'`, no expansion) and
+    // whether `<<-` stripped the leading tabs. None of it changes what
+    // the body *is* -- that is already captured -- but `declare -f`
+    // reproduces a heredoc as a heredoc, which needs all three.
+    HereDoc(Vec<Chunk>, HereDocSpelling),
     Newline,
     LBrace,
     RBrace,
@@ -491,7 +533,8 @@ impl<'a> Lexer<'a> {
                         for (tok_idx, delim, strip_tabs, expand) in pending {
                             let body = self.capture_heredoc_body(&delim, strip_tabs);
                             let chunks = if expand { expand_heredoc_chunks(&body)? } else { vec![Chunk::Str(body)] };
-                            toks[tok_idx].0 = Tok::HereDoc(chunks);
+                            let spelling = HereDocSpelling { delimiter: delim, quoted: !expand, strip_tabs };
+                            toks[tok_idx].0 = Tok::HereDoc(chunks, spelling);
                         }
                     }
                 }
@@ -627,7 +670,7 @@ impl<'a> Lexer<'a> {
                             self.skip_spaces();
                             let (delim, expand) = self.read_heredoc_delimiter();
                             let tok_idx = toks.len();
-                            push_tok!(Tok::HereDoc(vec![Chunk::Str(String::new())]));
+                            push_tok!(Tok::HereDoc(vec![Chunk::Str(String::new())], HereDocSpelling::default()));
                             self.pending_heredocs.push((tok_idx, delim, strip_tabs, expand));
                         }
                     } else {
@@ -1330,18 +1373,37 @@ impl<'a> Lexer<'a> {
                     if !buf.is_empty() {
                         chunks.push(Chunk::Str(std::mem::take(&mut buf)));
                     }
-                    if !lit.is_empty() {
+                    {
+                        // Pushed even when empty. `''` and `""` are
+                        // words, and `a""b` is one word with a pair of
+                        // quotes in the middle of it -- bash writes all
+                        // three back exactly as they were, and dropping
+                        // the empty run left nothing to write.
+                        //
                         // pos was just bumped past the closing quote, so
                         // pos - 1 is that quote's own index -- same
                         // "excludes delimiters" convention as everywhere
                         // else in raw_capture_spans.
                         self.raw_capture_spans.push(lit_start..self.pos - 1);
-                        chunks.push(Chunk::LiteralStr(lit));
+                        chunks.push(Chunk::LiteralStr(lit, Quoting::Single));
                     }
                 }
                 Some('"') => {
                     plain = false;
                     self.advance();
+                    // What this quoted region has produced so far, so
+                    // the empty case below can tell "the quotes held
+                    // nothing" from "the quotes held an expansion and
+                    // no text". `"${a[@]:9}"` is the second, and an
+                    // empty literal there gave `echo "x" "${a[@]:9}"`
+                    // an empty argument where the expansion should
+                    // simply have vanished.
+                    // Counting the text waiting in `buf`, which the
+                    // close below flushes before it looks: `a""b` has
+                    // an `a` pending, and without allowing for it the
+                    // region looked as though it had produced
+                    // something.
+                    let region_start = chunks.len() + usize::from(!buf.is_empty());
                     let mut lit = String::new();
                     // Tracks where the *current* literal run (since the
                     // last flush) started -- unlike single quotes,
@@ -1372,7 +1434,7 @@ impl<'a> Lexer<'a> {
                                 }
                                 if !lit.is_empty() {
                                     self.raw_capture_spans.push(lit_start..dollar_pos);
-                                    chunks.push(Chunk::LiteralStr(std::mem::take(&mut lit)));
+                                    chunks.push(Chunk::LiteralStr(std::mem::take(&mut lit), Quoting::Double));
                                 }
                                 // Pass `lit` (now empty), not `buf`: if
                                 // nothing valid follows the `$`, push_var's
@@ -1398,9 +1460,9 @@ impl<'a> Lexer<'a> {
                                 }
                                 if !lit.is_empty() {
                                     self.raw_capture_spans.push(lit_start..backtick_pos);
-                                    chunks.push(Chunk::LiteralStr(std::mem::take(&mut lit)));
+                                    chunks.push(Chunk::LiteralStr(std::mem::take(&mut lit), Quoting::Double));
                                 }
-                                chunks.push(Chunk::Sub { raw: self.capture_backtick()?, quoted: true });
+                                chunks.push(Chunk::Sub { raw: self.capture_backtick()?, quoted: true, backticks: true });
                                 lit_start = self.pos;
                             }
                             Some(c) => lit.push(c),
@@ -1409,10 +1471,12 @@ impl<'a> Lexer<'a> {
                     if !buf.is_empty() {
                         chunks.push(Chunk::Str(std::mem::take(&mut buf)));
                     }
-                    if !lit.is_empty() {
+                    if !lit.is_empty() || chunks.len() == region_start {
+                        // Empty included, but only when the quotes held
+                        // nothing at all -- see the single-quoted case.
                         // pos was just bumped past the closing '"'.
                         self.raw_capture_spans.push(lit_start..self.pos - 1);
-                        chunks.push(Chunk::LiteralStr(lit));
+                        chunks.push(Chunk::LiteralStr(lit, Quoting::Double));
                     }
                 }
                 Some('\\') => {
@@ -1427,7 +1491,7 @@ impl<'a> Lexer<'a> {
                             chunks.push(Chunk::Str(std::mem::take(&mut buf)));
                         }
                         self.raw_capture_spans.push(start..self.pos);
-                        chunks.push(Chunk::LiteralStr(n.to_string()));
+                        chunks.push(Chunk::LiteralStr(n.to_string(), Quoting::Escape));
                     }
                 }
                 // `$"..."` is a *translated* string. With no message
@@ -1455,7 +1519,7 @@ impl<'a> Lexer<'a> {
                     if !buf.is_empty() {
                         chunks.push(Chunk::Str(std::mem::take(&mut buf)));
                     }
-                    chunks.push(Chunk::LiteralStr(lit));
+                    chunks.push(Chunk::LiteralStr(lit, Quoting::Dollar));
                 }
                 Some('$') => {
                     self.advance();
@@ -1472,7 +1536,7 @@ impl<'a> Lexer<'a> {
                     if !buf.is_empty() {
                         chunks.push(Chunk::Str(std::mem::take(&mut buf)));
                     }
-                    chunks.push(Chunk::Sub { raw: self.capture_backtick()?, quoted: false });
+                    chunks.push(Chunk::Sub { raw: self.capture_backtick()?, quoted: false, backticks: true });
                 }
                 Some(c) => {
                     self.advance();
@@ -1576,7 +1640,7 @@ impl<'a> Lexer<'a> {
                 self.advance();
                 chunks.push(Chunk::Arith { raw: self.capture_double_paren()?, quoted });
             } else {
-                chunks.push(Chunk::Sub { raw: self.capture_balanced_parens()?, quoted });
+                chunks.push(Chunk::Sub { raw: self.capture_balanced_parens()?, quoted, backticks: false });
             }
             return Ok(true);
         }
@@ -1774,7 +1838,7 @@ pub fn tokenize_spanned(src: &str) -> SpannedResult {
                             vec![Chunk::Str(body)]
                         };
                         if let SpannedItem::Tok(t, _) = &mut items[tok_idx] {
-                            *t = Tok::HereDoc(chunks);
+                            *t = Tok::HereDoc(chunks, HereDocSpelling { delimiter: delim, quoted: !expand, strip_tabs });
                         }
                     }
                 }
@@ -1915,7 +1979,7 @@ pub fn tokenize_spanned(src: &str) -> SpannedResult {
                         lexer.skip_spaces();
                         let (delim, expand) = lexer.read_heredoc_delimiter();
                         let tok_idx = items.len();
-                        items.push(SpannedItem::Tok(Tok::HereDoc(vec![Chunk::Str(String::new())]), start..lexer.pos));
+                        items.push(SpannedItem::Tok(Tok::HereDoc(vec![Chunk::Str(String::new())], HereDocSpelling::default()), start..lexer.pos));
                         lexer.pending_heredocs.push((tok_idx, delim, strip_tabs, expand));
                     }
                 } else if lexer.chars.peek().copied() == Some('>') {
@@ -2079,7 +2143,7 @@ fn expand_heredoc_chunks(body: &str) -> Result<Vec<Chunk>, String> {
                 if !buf.is_empty() {
                     chunks.push(Chunk::Str(std::mem::take(&mut buf)));
                 }
-                chunks.push(Chunk::Sub { raw: lexer.capture_backtick()?, quoted: true });
+                chunks.push(Chunk::Sub { raw: lexer.capture_backtick()?, quoted: true, backticks: true });
             }
             Some(c) => {
                 lexer.chars.next();
@@ -2632,7 +2696,7 @@ mod tests {
                     chunks
                         .iter()
                         .map(|c| match c {
-                            super::Chunk::Str(s) | super::Chunk::LiteralStr(s) => s.as_str(),
+                            super::Chunk::Str(s) | super::Chunk::LiteralStr(s, _) => s.as_str(),
                             _ => "",
                         })
                         .collect::<String>(),
@@ -2791,7 +2855,7 @@ mod tests {
         assert!(inner.items.iter().any(|it| matches!(
             it,
             SpannedItem::Tok(Tok::Word(w, false), _)
-                if w.iter().any(|c| matches!(c, Chunk::LiteralStr(s) if s == "hello %"))
+                if w.iter().any(|c| matches!(c, Chunk::LiteralStr(s, _) if s == "hello %"))
         )));
     }
 
@@ -2897,7 +2961,7 @@ mod tests {
             })
             .flatten()
             .filter_map(|c| match c {
-                Chunk::LiteralStr(s) => Some(s),
+                Chunk::LiteralStr(s, _) => Some(s),
                 _ => None,
             })
             .collect();
@@ -2926,7 +2990,7 @@ mod alias_tests {
             Tok::Word(chunks, _) => chunks
                 .iter()
                 .map(|c| match c {
-                    Chunk::Str(s) | Chunk::LiteralStr(s) => s.clone(),
+                    Chunk::Str(s) | Chunk::LiteralStr(s, _) => s.clone(),
                     _ => "<expansion>".to_string(),
                 })
                 .collect(),

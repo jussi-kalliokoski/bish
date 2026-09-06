@@ -307,7 +307,7 @@ fn sole_literal(chunks: &[lexer::Chunk], plain: bool) -> Option<&str> {
         // `''` and `""` both arrive as one empty `Str`, since there is
         // no literal run for the lexer to record.
         [lexer::Chunk::Str(text)] if text.is_empty() => Some(text),
-        [lexer::Chunk::LiteralStr(text)] => Some(text),
+        [lexer::Chunk::LiteralStr(text, _)] => Some(text),
         _ => None,
     }
 }

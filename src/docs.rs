@@ -217,7 +217,7 @@ fn word_as_literal(word: &Word) -> Option<String> {
     let mut s = String::new();
     for chunk in &word.chunks {
         match chunk {
-            Chunk::Str(t) | Chunk::LiteralStr(t) => s.push_str(t),
+            Chunk::Str(t) | Chunk::LiteralStr(t, _) => s.push_str(t),
             _ => return None,
         }
     }
