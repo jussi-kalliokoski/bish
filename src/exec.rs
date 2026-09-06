@@ -4014,7 +4014,7 @@ impl Shell {
             builtins: KNOWN_BUILTINS.iter().map(|s| s.to_string()).collect(),
             shopt_names: KNOWN_SHOPT_OPTIONS.iter().map(|(n, _)| n.to_string()).collect(),
             set_o_names: SET_O_OPTIONS.iter().map(|s| s.to_string()).collect(),
-            signal_names: SIGNAL_NAMES.iter().map(|(n, _)| n.to_string()).collect(),
+            signal_names: all_signals().into_iter().map(|(n, _)| n).collect(),
             jobs: jobs.jobs.iter().map(|j| j.cmd_text.clone()).collect(),
             running_jobs: jobs.jobs.iter().filter(|j| !j.stopped).map(|j| j.cmd_text.clone()).collect(),
             stopped_jobs: jobs.jobs.iter().filter(|j| j.stopped).map(|j| j.cmd_text.clone()).collect(),
@@ -4450,8 +4450,8 @@ impl Shell {
         if pending == 0 {
             return;
         }
-        for sig in 0..32 {
-            if pending & (1 << sig) == 0 {
+        for sig in 1..=64 {
+            if pending & (1u64 << (sig - 1)) == 0 {
                 continue;
             }
             if let Some(TrapAction::Run(code)) = self.traps.get(&sig).cloned() {
@@ -14179,11 +14179,17 @@ fn restore_fd012(saved: [i32; 3]) {
 // scripting-focused shell where "runs between statements" already covers
 // the overwhelmingly common trap use (cleanup-on-signal, not low-latency
 // signal response).
-static PENDING_SIGNALS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+//
+// Sixty-four bits, one per signal, with signal `n` at bit `n - 1`. It
+// was thirty-two, which fits every signal Linux had a name for in 1990
+// and none of the real-time range above 32 -- so a `trap` on one was
+// accepted, the handler was installed, and the signal arrived and was
+// silently dropped on the floor here.
+static PENDING_SIGNALS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 extern "C" fn record_pending_signal(sig: i32) {
-    if (0..32).contains(&sig) {
-        PENDING_SIGNALS.fetch_or(1 << sig, std::sync::atomic::Ordering::SeqCst);
+    if (1..=64).contains(&sig) {
+        PENDING_SIGNALS.fetch_or(1u64 << (sig - 1), std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -14260,6 +14266,7 @@ pub(crate) const SIGNAL_NAMES: &[(&str, i32)] = &[
     ("PIPE", 13),
     ("ALRM", 14),
     ("TERM", 15),
+    ("STKFLT", 16),
     ("CHLD", 17),
     ("CONT", 18),
     ("TSTP", 20),
@@ -14276,15 +14283,53 @@ pub(crate) const SIGNAL_NAMES: &[(&str, i32)] = &[
     ("SYS", 31),
 ];
 
+/// The real-time range. Linux numbers it 34..64 and reserves 32 and 33
+/// for the thread library, which is why `kill -l` has a gap there --
+/// bash's own list does the same.
+///
+/// Named rather than listed: there are thirty-one of them, bash names
+/// the lower half from the bottom and the upper half from the top, and
+/// the halves meet in the middle. `kill -l 49` is `RTMIN+15` and
+/// `kill -l 50` is `RTMAX-14`.
+pub(crate) const SIGRTMIN: i32 = 34;
+pub(crate) const SIGRTMAX: i32 = 64;
+
+fn realtime_signal_name(num: i32) -> Option<String> {
+    if !(SIGRTMIN..=SIGRTMAX).contains(&num) {
+        return None;
+    }
+    let above_min = num - SIGRTMIN;
+    let below_max = SIGRTMAX - num;
+    Some(match (above_min, below_max) {
+        (0, _) => "RTMIN".to_string(),
+        (_, 0) => "RTMAX".to_string(),
+        _ if above_min <= (SIGRTMAX - SIGRTMIN) / 2 => format!("RTMIN+{above_min}"),
+        _ => format!("RTMAX-{below_max}"),
+    })
+}
+
+fn realtime_signal_number(bare: &str) -> Option<i32> {
+    let num = match (bare.strip_prefix("RTMIN"), bare.strip_prefix("RTMAX")) {
+        (Some(""), _) => SIGRTMIN,
+        (_, Some("")) => SIGRTMAX,
+        (Some(rest), _) => SIGRTMIN + rest.strip_prefix('+')?.parse::<i32>().ok()?,
+        (_, Some(rest)) => SIGRTMAX - rest.strip_prefix('-')?.parse::<i32>().ok()?,
+        (None, None) => return None,
+    };
+    (SIGRTMIN..=SIGRTMAX).contains(&num).then_some(num)
+}
+
 // The two `trap` must refuse, kept out of SIGNAL_NAMES precisely so
 // that list can *be* trap's answer to "may I catch this?" -- and put
 // back by everything whose job is only to name a signal, which is what
 // `kill -l` and a job's own status line do.
 pub(crate) const UNCATCHABLE_SIGNALS: &[(&str, i32)] = &[("KILL", 9), ("STOP", 19)];
 
-/// Every signal by name and number, in numeric order.
-pub(crate) fn all_signals() -> Vec<(&'static str, i32)> {
-    let mut all: Vec<(&str, i32)> = SIGNAL_NAMES.iter().chain(UNCATCHABLE_SIGNALS.iter()).copied().collect();
+/// Every signal by name and number, in numeric order -- the named ones
+/// and the whole real-time range after them.
+pub(crate) fn all_signals() -> Vec<(String, i32)> {
+    let mut all: Vec<(String, i32)> = SIGNAL_NAMES.iter().chain(UNCATCHABLE_SIGNALS.iter()).map(|(name, num)| ((*name).to_string(), *num)).collect();
+    all.extend((SIGRTMIN..=SIGRTMAX).filter_map(|n| realtime_signal_name(n).map(|name| (name, n))));
     all.sort_by_key(|(_, n)| *n);
     all
 }
@@ -14309,6 +14354,9 @@ pub(crate) fn signal_number(name: &str) -> Option<i32> {
     if let Some(&(_, n)) = SIGNAL_NAMES.iter().find(|(n, _)| *n == bare) {
         return Some(n);
     }
+    if let Some(n) = realtime_signal_number(bare) {
+        return Some(n);
+    }
     // A number has to be one the kernel could actually deliver: bash
     // rejects `trap x 99999` rather than recording a trap for a signal
     // that can never arrive. 64 is Linux's highest (the real-time
@@ -14317,7 +14365,7 @@ pub(crate) fn signal_number(name: &str) -> Option<i32> {
 }
 
 fn signal_name(num: i32) -> String {
-    all_signals().iter().find(|(_, n)| *n == num).map(|(name, _)| name.to_string()).unwrap_or_else(|| num.to_string())
+    all_signals().iter().find(|(_, n)| *n == num).map(|(name, _)| name.clone()).unwrap_or_else(|| num.to_string())
 }
 
 pub(crate) fn send_signal(pid: u32, sig: i32) -> bool {

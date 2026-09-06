@@ -286,6 +286,28 @@ mod tests {
         // an omitted one is named `((1))`.
         case("debug-trap-fires-for-each-arithmetic-section", "trap 'echo \"[$BASH_COMMAND]\"' DEBUG; for ((i=0;i<2;i++)); do :; done"),
         case("debug-trap-names-an-omitted-section-as-one", "trap 'echo \"[$BASH_COMMAND]\"' DEBUG; for ((;;)); do break; done"),
+        // Job control, probed as a whole. `jobs` accepted `-r` and
+        // `-s` and ignored them, so `jobs -s` listed a job that was
+        // plainly running; `disown` did not know `-h` was a flag at
+        // all, so `disown -h %1` said "no such job" and disowned it
+        // anyway.
+        case("jobs-r-lists-only-the-running", r#"sleep 0.3 & jobs -r | wc -l; jobs -s | wc -l; jobs | wc -l; wait"#),
+        case("jobs-narrowed-after-a-job-finished", r#"true & wait; jobs -s | wc -l; jobs -r | wc -l"#),
+        case("disown-h-keeps-the-job", r#"sleep 0.2 & disown -h %1; jobs | wc -l; wait 2>/dev/null; echo done"#),
+        case("disown-h-with-no-spec", r#"sleep 0.2 & disown -h; jobs | wc -l; wait 2>/dev/null; echo done"#),
+        // The real-time signals did not exist here: `kill -l` stopped
+        // at 31, `kill -RTMIN` was an invalid specification, and a
+        // `trap` on one was accepted and then silently dropped --
+        // the pending-signal bitmask was 32 bits wide, so a signal
+        // above 32 could not be recorded when it arrived.
+        case("kill-l-lists-the-real-time-signals", r#"kill -l | wc -w; kill -l | tr -s " \t\n" "\n" | tail -4 | tr "\n" " ""#),
+        case("kill-l-names-the-real-time-range", r#"kill -l RTMIN; kill -l RTMAX; kill -l SIGRTMIN+1; kill -l RTMAX-14"#),
+        case("kill-l-numbers-the-real-time-range", r#"kill -l 34; kill -l 49; kill -l 50; kill -l 64"#),
+        case("a-real-time-signal-can-be-trapped", r#"trap "echo caught" RTMIN; kill -RTMIN $$; sleep 0.1; echo done"#),
+        case("a-real-time-signal-by-offset", r#"trap "echo caught" SIGRTMIN+3; kill -s RTMIN+3 $$; sleep 0.1; echo done"#),
+        case("a-signal-above-thirty-two-by-number", r#"trap "echo n" 40; kill -40 $$; sleep 0.1; echo done"#),
+        // 16 was missing from the named range entirely.
+        case("sigstkflt-is-a-signal", r#"kill -l 16; trap "echo s" 16; kill -16 $$; sleep 0.1; echo done"#),
         // `$BASH_COMMAND` names the command being run, as *written*.
         // It was built from the expanded argv and assigned after the
         // expansion, so a command reading it in its own words got the

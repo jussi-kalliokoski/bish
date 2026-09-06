@@ -29,6 +29,11 @@ pub(crate) fn run_jobs(sh: &mut Shell, args: &[String]) -> i32 {
     // `-l` is the normal listing with each job's pid in it.
     let pids_only = args.iter().any(|a| a == "-p");
     let long = args.iter().any(|a| a == "-l");
+    // `-r` and `-s` narrow the listing to the running or the stopped
+    // jobs. They were accepted and ignored, so `jobs -s` listed a job
+    // that was plainly running.
+    let running_only = args.iter().any(|a| a == "-r");
+    let stopped_only = args.iter().any(|a| a == "-s");
     if pids_only {
         let mut table = sh.jobs.borrow_mut();
         let mut done = Vec::new();
@@ -68,16 +73,25 @@ pub(crate) fn run_jobs(sh: &mut Shell, args: &[String]) -> i32 {
             // No trailing " &": bash only shows that for a job
             // actually launched with `&`, and a job stopped via
             // Ctrl-Z from the foreground wasn't.
-            sh_println!(sh, "{}", job_line(job, mark, long, "Stopped", ""));
+            if !running_only {
+                sh_println!(sh, "{}", job_line(job, mark, long, "Stopped", ""));
+            }
             continue;
         }
         match job.poll() {
             Some(_) => {
-                sh_println!(sh, "{}", job_line(job, mark, long, "Done", " &"));
+                // A finished job is neither running nor stopped, so a
+                // narrowed listing does not name it -- but it is still
+                // reaped, which is what the listing is also for.
+                if !running_only && !stopped_only {
+                    sh_println!(sh, "{}", job_line(job, mark, long, "Done", " &"));
+                }
                 to_remove.push(i);
             }
             None => {
-                sh_println!(sh, "{}", job_line(job, mark, long, "Running", " &"));
+                if !stopped_only {
+                    sh_println!(sh, "{}", job_line(job, mark, long, "Running", " &"));
+                }
             }
         }
     }
@@ -101,13 +115,25 @@ pub(crate) fn run_jobs(sh: &mut Shell, args: &[String]) -> i32 {
 pub(crate) fn run_disown(sh: &mut Shell, args: &[String]) -> i32 {
     let mut all = false;
     let mut running_only = false;
+    // `-h` keeps the job in the table and only marks it not to be sent
+    // SIGHUP when the shell exits. This shell sends none -- `huponexit`
+    // is listed and off, and nothing reads it -- so the mark has
+    // nothing to change and the job simply stays. What matters is that
+    // `-h` is a *flag*: it was falling through to the job specs, so
+    // `disown -h %1` reported "no such job" and then disowned %1
+    // anyway.
+    let mut keep = false;
     let mut specs: Vec<&String> = Vec::new();
     for a in args {
         match a.as_str() {
             "-a" => all = true,
             "-r" => running_only = true,
+            "-h" => keep = true,
             _ => specs.push(a),
         }
+    }
+    if keep {
+        return 0;
     }
     if all {
         sh.jobs.borrow_mut().jobs.clear();
@@ -411,10 +437,10 @@ pub(crate) fn run_wait(sh: &mut Shell, args: &[String]) -> i32 {
 fn signal_name_or_number(arg: &str) -> Option<String> {
     if let Ok(n) = arg.parse::<i32>() {
         let n = if n > 128 { n - 128 } else { n };
-        return crate::exec::all_signals().iter().find(|(_, num)| *num == n).map(|(name, _)| (*name).to_string());
+        return crate::exec::all_signals().iter().find(|(_, num)| *num == n).map(|(name, _)| name.clone());
     }
     let bare = arg.strip_prefix("SIG").unwrap_or(arg).to_uppercase();
-    crate::exec::all_signals().iter().find(|(name, _)| *name == bare).map(|(_, num)| num.to_string())
+    crate::exec::all_signals().iter().find(|(name, _)| **name == bare).map(|(_, num)| num.to_string())
 }
 
 // `kill`'s own reading of a signal spec. Unlike `trap`'s it admits 0,
