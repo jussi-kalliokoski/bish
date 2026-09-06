@@ -159,6 +159,13 @@ mod tests {
         // `&` does not end the line the way `;` does.
         case("declare-f-background-continues-the-line", r#"f() { echo a & ! true; echo b & echo c & }; declare -f f"#),
         case("declare-f-a-function-level-redirect", r#"f() { echo a; } 2>/dev/null; declare -f f"#),
+        // A `#` inside a word is a character, not the start of a
+        // comment -- there is no position inside a word where one could
+        // begin. Everything from a leading `#` used to vanish.
+        case("a-hash-in-an-expansion-word", r#"echo "[${x:-# hi}]" "[${x:-#}]""#),
+        case("a-hash-in-ps4", r#"PS4='# '; set -x; echo a"#),
+        case("a-hash-still-starts-a-comment", r#"echo a # comment"#),
+        case("a-hash-in-the-middle-of-a-word", r#"echo a#b"#),
         case("redir-heredoc-with-no-body", "wc -c <<EOF\nEOF"),
         case("redir-heredoc-with-one-empty-line", "wc -c <<EOF\n\nEOF"),
         case("redir-herestring", r#"cat <<< "here string""#),

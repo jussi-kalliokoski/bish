@@ -1298,7 +1298,15 @@ impl<'a> Lexer<'a> {
                 // -- it leaves a mid-word `#` unescaped, so a shell
                 // that broke the word there could not read back what it
                 // had just written.
-                Some('#') if !buf.is_empty() || !chunks.is_empty() => {
+                //
+                // `literal_ws` says the caller handed over something
+                // that is already *one word* rather than a line, so
+                // there is no position in it where a word could begin
+                // and no comment to open. Without that, everything from
+                // a leading `#` was silently dropped: `${x:-# hi}`
+                // expanded to nothing, and `PS4='# '` traced every line
+                // with no prefix at all.
+                Some('#') if literal_ws || !buf.is_empty() || !chunks.is_empty() => {
                     buf.push(self.advance().unwrap());
                 }
                 Some('|') | Some('&') | Some(';') | Some('<') | Some('>') | Some('#') | Some('(') | Some(')') => break,
