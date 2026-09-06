@@ -14,24 +14,22 @@
 // unicode_width::str_width now calls into cluster_range below to fix
 // exactly that case (see this file's own str_width interaction test).
 //
-// Implements the actual UAX #29 boundary rules (GB1-GB999) this
-// codebase's real-world text actually exercises: CR/LF, control
+// Implements the UAX #29 boundary rules GB1-GB999: CR/LF, control
 // characters, Hangul syllable assembly (computed arithmetically from
 // the standard Unicode Hangul decomposition formula, not a giant
-// table), combining marks/ZWJ, emoji ZWJ sequences, and regional-
-// indicator flag pairs. Deliberately does *not* implement Prepend or
-// SpacingMark (both are near-exclusively Indic/historic-script
-// phenomena bish has no other script support for either -- same
-// "practical subset, documented boundary" call unicode_width.rs's own
-// doc comment already makes for the exact same reason) -- a gap there
-// degrades to "an Indic vowel sign occasionally splits from its base,"
-// not a crash or a stuck cursor.
+// table), combining marks/ZWJ, emoji ZWJ sequences, regional-indicator
+// flag pairs, and -- since the tables stopped being written from
+// memory -- Prepend and SpacingMark as well.
 //
-// The Extended_Pictographic table below (needed for GB11, ZWJ emoji
-// sequences) is the same kind of deliberately trimmed, high-confidence
-// subset unicode_width.rs's own WIDE table already is -- covering the
-// emoji blocks that actually come up in normal use, not a byte-perfect
-// reproduction of the real (large, evolving) emoji-data.txt property.
+// Those last two used to be the documented gap here, on the grounds
+// that they are near-exclusively Indic phenomena and the property
+// tables for them would have had to be recalled rather than read. That
+// was the real obstacle, and it is gone: every table this module reads
+// now comes from `unicode_tables`, generated from the Unicode
+// character database this machine already ships (see
+// tools/gen-unicode-tables.pl). Extended_Pictographic is the clearest
+// case -- the trimmed three-range guess it replaced covered the blocks
+// a common emoji sequence needs and nothing else.
 
 fn in_ranges(c: u32, ranges: &[(u32, u32)]) -> bool {
     ranges
@@ -60,70 +58,18 @@ enum Gcb {
     T,
     Lv,
     Lvt,
+    Prepend,
+    SpacingMark,
     ExtendedPictographic,
     Other,
 }
 
-// Combining marks, variation selectors, ZWNJ, emoji skin-tone
-// modifiers -- Grapheme_Cluster_Break=Extend. Overlaps heavily with
-// (but isn't identical to) unicode_width::ZERO_WIDTH's own combining-
-// mark ranges -- kept as this module's own table rather than importing
-// that one, since the two properties aren't actually the same thing
-// (this file's own doc comment on why unicode_width and grapheme
-// segmentation are independent concerns) and this module should stay
-// self-contained the way every other hand-rolled table in this
-// codebase already is.
-// Must stay sorted ascending by `lo` -- in_ranges' binary search
-// requires it. (0xE0100 -- variation selectors *supplement* -- sorts
-// after 0x1F3FB despite "looking" earlier written out with fewer
-// leading digits; caught a real bug here from getting this wrong the
-// first time, not a hypothetical one.)
-const EXTEND: &[(u32, u32)] = &[
-    (0x0300, 0x036F),   // Combining Diacritical Marks
-    (0x0483, 0x0489),   // Cyrillic combining marks
-    (0x200C, 0x200C),   // zero-width non-joiner (200D, ZWJ, is its own class below)
-    (0x20D0, 0x20FF),   // Combining Diacritical Marks for Symbols
-    (0x3099, 0x309A),   // combining katakana-hiragana voicing marks
-    (0xFE00, 0xFE0F),   // variation selectors
-    (0xFE20, 0xFE2F),   // combining half marks
-    (0x1F3FB, 0x1F3FF), // emoji skin-tone (Fitzpatrick) modifiers
-    (0xE0100, 0xE01EF), // variation selectors supplement
-];
-
-// Invisible format/direction-control characters -- Grapheme_Cluster_
-// Break defaults to Control for these (Cf/Zl/Zp not otherwise
-// overridden to Extend/ZWJ/Prepend/RegionalIndicator). Always breaks on
-// either side (GB4/GB5), unlike Extend.
-const CONTROL: &[(u32, u32)] = &[
-    (0x0000, 0x0009), // C0 controls before Tab, excluding CR/LF (their own classes)
-    (0x000B, 0x000C),
-    (0x000E, 0x001F),
-    (0x007F, 0x009F), // DEL + C1 controls
-    (0x200B, 0x200B),
-    (0x200E, 0x200F),
-    (0x2028, 0x202E),
-    (0x2060, 0x2064),
-    (0xFEFF, 0xFEFF),
-];
+use super::unicode_tables::{CONTROL, EXTEND, EXTENDED_PICTOGRAPHIC, HANGUL_L, HANGUL_T, HANGUL_V, PREPEND, SPACING_MARK};
 
 const REGIONAL_INDICATOR: (u32, u32) = (0x1F1E6, 0x1F1FF);
 
-const HANGUL_L: &[(u32, u32)] = &[(0x1100, 0x115F), (0xA960, 0xA97C)];
-const HANGUL_V: &[(u32, u32)] = &[(0x1160, 0x11A7), (0xD7B0, 0xD7C6)];
-const HANGUL_T: &[(u32, u32)] = &[(0x11A8, 0x11FF), (0xD7CB, 0xD7FC)];
 const HANGUL_SYLLABLE: (u32, u32) = (0xAC00, 0xD7A3);
 const HANGUL_TCOUNT: u32 = 28;
-
-// Deliberately trimmed, high-confidence emoji ranges -- see this file's
-// own top doc comment. Matches unicode_width::WIDE's own main emoji
-// block, plus the Misc Symbols/Dingbats/Technical blocks a common ZWJ
-// sequence (heart U+2764 in "couple with heart", watch/hourglass, ...)
-// actually needs.
-const EXTENDED_PICTOGRAPHIC: &[(u32, u32)] = &[
-    (0x2300, 0x23FF),   // Miscellaneous Technical (watch, hourglass, ...)
-    (0x2600, 0x27BF),   // Miscellaneous Symbols + Dingbats (heart, sun, scissors, ...)
-    (0x1F300, 0x1FAFF), // main emoji blocks
-];
 
 fn gcb_class(c: char) -> Gcb {
     let c = c as u32;
@@ -138,6 +84,12 @@ fn gcb_class(c: char) -> Gcb {
     }
     if in_ranges(c, EXTEND) {
         return Gcb::Extend;
+    }
+    if in_ranges(c, PREPEND) {
+        return Gcb::Prepend;
+    }
+    if in_ranges(c, SPACING_MARK) {
+        return Gcb::SpacingMark;
     }
     if c >= REGIONAL_INDICATOR.0 && c <= REGIONAL_INDICATOR.1 {
         return Gcb::RegionalIndicator;
@@ -200,6 +152,19 @@ pub fn is_boundary(chars: &[char], i: usize) -> bool {
     }
     // GB9: x (Extend|ZWJ) -- never break before a combining mark/ZWJ.
     if matches!(after, Gcb::Extend | Gcb::ZwjClass) {
+        return false;
+    }
+    // GB9a: x SpacingMark -- a combining mark that *does* take a column
+    // of its own still belongs to the character before it. A Devanagari
+    // vowel sign is the everyday case: `कि` is one cluster the cursor
+    // steps over in one move, not two.
+    if after == Gcb::SpacingMark {
+        return false;
+    }
+    // GB9b: Prepend x -- and the mirror image, a character that belongs
+    // to whatever comes *after* it. The Arabic number sign is the one
+    // most likely to turn up.
+    if before == Gcb::Prepend {
         return false;
     }
     // GB11: emoji ZWJ sequences -- \p{Extended_Pictographic} Extend* ZWJ
@@ -496,11 +461,48 @@ mod tests {
 
     #[test]
     fn every_range_table_is_sorted_and_nonoverlapping() {
+        use crate::bishedit::unicode_tables::{SPACING_MARK, WIDE, ZERO_WIDTH};
         assert_sorted_and_nonoverlapping("EXTEND", EXTEND);
         assert_sorted_and_nonoverlapping("CONTROL", CONTROL);
         assert_sorted_and_nonoverlapping("EXTENDED_PICTOGRAPHIC", EXTENDED_PICTOGRAPHIC);
         assert_sorted_and_nonoverlapping("HANGUL_L", HANGUL_L);
         assert_sorted_and_nonoverlapping("HANGUL_V", HANGUL_V);
         assert_sorted_and_nonoverlapping("HANGUL_T", HANGUL_T);
+        assert_sorted_and_nonoverlapping("PREPEND", PREPEND);
+        assert_sorted_and_nonoverlapping("SPACING_MARK", SPACING_MARK);
+        assert_sorted_and_nonoverlapping("WIDE", WIDE);
+        assert_sorted_and_nonoverlapping("ZERO_WIDTH", ZERO_WIDTH);
+    }
+
+    // GB9a. A Devanagari vowel sign takes a column of its own, so it is
+    // not an Extend -- but it still belongs to the consonant before it,
+    // and the cursor steps over the pair in one move. This rule was
+    // left out while the property table for it would have had to be
+    // recalled rather than read.
+    #[test]
+    fn a_spacing_mark_joins_the_character_before_it() {
+        let chars: Vec<char> = "कि".chars().collect();
+        assert_eq!(chars.len(), 2, "two code points");
+        assert_eq!(cluster_range(&chars, 0), (0, 2), "and one cluster");
+        assert!(!is_boundary(&chars, 1));
+    }
+
+    // GB9b, the mirror image: a character that belongs to whatever
+    // comes after it.
+    #[test]
+    fn a_prepend_joins_the_character_after_it() {
+        let chars: Vec<char> = "\u{0600}7".chars().collect();
+        assert_eq!(cluster_range(&chars, 0), (0, 2));
+        assert!(!is_boundary(&chars, 1));
+    }
+
+    // The emoji table used to be three ranges covering the blocks a
+    // common sequence needs. A star is Extended_Pictographic and was
+    // outside all three, so this ZWJ sequence used to break in the
+    // middle.
+    #[test]
+    fn a_zwj_sequence_holds_together_outside_the_blocks_that_were_guessed_at() {
+        let chars: Vec<char> = "\u{2B50}\u{200D}\u{2B50}".chars().collect();
+        assert_eq!(cluster_range(&chars, 0), (0, 3));
     }
 }

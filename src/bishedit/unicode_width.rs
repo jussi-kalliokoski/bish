@@ -16,17 +16,16 @@
 // summed here rather than treated as one cluster... genuinely deferred
 // to a later pass"). Fixed: see `str_width`'s own doc comment.
 //
-// The range tables below are a deliberately trimmed, high-confidence
-// subset of the full Unicode East Asian Width / combining-mark
-// properties -- covering the ranges that actually come up in normal
-// use (CJK ideographs and syllables, fullwidth forms, the common
-// combining-diacritic and emoji-variation-selector blocks) rather than
-// attempting a byte-perfect reproduction of the *complete* property
-// tables (several hundred narrow ranges, many for scripts this project
-// has no other support for either) from memory. A gap here degrades to
-// "one column too many/few for an obscure script," not a crash or a
-// stuck cursor -- worth widening if a real, specific case ever shows
-// up, not attempted speculatively.
+// The range tables come from `unicode_tables`, which is generated from
+// the Unicode character database this machine already ships -- see
+// tools/gen-unicode-tables.pl. They used to be written here from
+// memory, as a "deliberately trimmed, high-confidence subset", which
+// was the one place in this codebase where correctness rested on
+// recalled data rather than something that had been read. It had
+// already produced one real bug: 0xE0100 sorted after 0x1F3FB, caught
+// only because a test asserted the tables were in order.
+
+use super::unicode_tables::{WIDE, ZERO_WIDTH};
 
 fn in_ranges(c: u32, ranges: &[(u32, u32)]) -> bool {
     ranges
@@ -41,39 +40,6 @@ fn in_ranges(c: u32, ranges: &[(u32, u32)]) -> bool {
         })
         .is_ok()
 }
-
-// Combining marks, zero-width joiners/spaces, variation selectors --
-// sorted, non-overlapping, binary-searched.
-const ZERO_WIDTH: &[(u32, u32)] = &[
-    (0x0300, 0x036F),   // Combining Diacritical Marks
-    (0x0483, 0x0489),   // Cyrillic combining marks
-    (0x200B, 0x200F),   // zero-width space/ZWNJ/ZWJ/direction marks
-    (0x2028, 0x202E),   // line/paragraph separators, direction overrides
-    (0x2060, 0x2064),   // word joiner and friends
-    (0x20D0, 0x20FF),   // Combining Diacritical Marks for Symbols
-    (0x3099, 0x309A),   // combining katakana-hiragana voicing marks
-    (0xFE00, 0xFE0F),   // variation selectors
-    (0xFE20, 0xFE2F),   // combining half marks
-    (0xFEFF, 0xFEFF),   // zero-width no-break space / BOM
-    (0xE0100, 0xE01EF), // variation selectors supplement
-];
-
-// East-Asian-Wide/Fullwidth -- same shape.
-const WIDE: &[(u32, u32)] = &[
-    (0x1100, 0x115F),   // Hangul Jamo
-    (0x2E80, 0x303E),   // CJK Radicals, Kangxi Radicals, CJK punctuation
-    (0x3041, 0x33FF),   // Hiragana, Katakana, Bopomofo, CJK compatibility
-    (0x3400, 0x4DBF),   // CJK Unified Ideographs Extension A
-    (0x4E00, 0x9FFF),   // CJK Unified Ideographs
-    (0xA000, 0xA4CF),   // Yi Syllables/Radicals
-    (0xAC00, 0xD7A3),   // Hangul Syllables
-    (0xF900, 0xFAFF),   // CJK Compatibility Ideographs
-    (0xFF00, 0xFF60),   // Fullwidth Forms
-    (0xFFE0, 0xFFE6),   // Fullwidth signs
-    (0x1F300, 0x1FAFF), // most emoji blocks
-    (0x20000, 0x2FFFD), // CJK Unified Ideographs Extension B+ (supplementary plane)
-    (0x30000, 0x3FFFD), // further CJK extension planes
-];
 
 // `\0` is the one control character worth a special case here (width
 // 0, matching wcwidth's own convention) -- every other control
@@ -318,5 +284,99 @@ mod tests {
             let back = char_at_col(&chars, col);
             assert!(back <= i, "char_at_col(col_of({i})) = {back} should never overshoot past {i}");
         }
+    }
+    // Characters the recalled tables had no room for. Each was wrong
+    // before, in the direction that puts a pane border in the wrong
+    // column or a cursor in the middle of a glyph.
+    #[test]
+    fn the_generated_table_covers_what_the_recalled_one_missed() {
+        // East_Asian_Width=Wide, and nowhere near the CJK blocks the
+        // old table listed.
+        assert_eq!(char_width('\u{231A}'), 2, "a watch is two columns wide");
+        assert_eq!(char_width('\u{2B50}'), 2, "and so is a star");
+        // Combining marks outside the Latin and Cyrillic blocks: Arabic,
+        // Thai and Hebrew all used to take a column each.
+        for mark in ['\u{064B}', '\u{0E31}', '\u{05B0}'] {
+            assert_eq!(char_width(mark), 0, "U+{:04X} is a combining mark", mark as u32);
+        }
+    }
+
+    // The one carve-out the generator makes: a soft hyphen is a format
+    // character, and every terminal gives it a column anyway.
+    #[test]
+    fn a_soft_hyphen_keeps_its_column() {
+        assert_eq!(char_width('\u{00AD}'), 1);
+    }
+
+    // A spacing mark takes a column, unlike the combining marks above
+    // -- which is exactly why grapheme segmentation needs its own rule
+    // for it rather than treating every mark as weightless.
+    #[test]
+    fn a_spacing_mark_is_not_weightless() {
+        assert_eq!(char_width('\u{093F}'), 1, "devanagari vowel sign I");
+        assert_eq!(str_width("कि"), 1, "but the cluster it belongs to is still one column");
+    }
+    // The corpus pattern, applied to a table instead of a shell: run
+    // the generator again and check the committed tables still say what
+    // this machine's own Unicode database says. Skips when there is no
+    // perl to ask, exactly as the bash corpus skips when there is no
+    // bash -- and skips when the machine has moved to a newer Unicode
+    // than the tables were generated from, since that is a difference
+    // between two databases rather than a mistake in these.
+    #[test]
+    fn the_committed_tables_still_match_the_systems_own_unicode() {
+        use crate::bishedit::unicode_tables as t;
+        let generator = concat!(env!("CARGO_MANIFEST_DIR"), "/tools/gen-unicode-tables.pl");
+        let Ok(out) = std::process::Command::new("perl").arg(generator).output() else {
+            return; // no perl on this machine
+        };
+        if !out.status.success() {
+            let why = String::from_utf8_lossy(&out.stderr);
+            assert!(why.contains("Can't locate"), "the generator failed for a reason that is not a missing module: {why}");
+            return;
+        }
+        let source = String::from_utf8(out.stdout).expect("the generator writes Rust source");
+        let version = parse_version(&source);
+        if version != t::UNICODE_VERSION {
+            return; // this machine has a different Unicode than these tables came from
+        }
+        for (name, committed) in [
+            ("WIDE", t::WIDE),
+            ("ZERO_WIDTH", t::ZERO_WIDTH),
+            ("EXTEND", t::EXTEND),
+            ("CONTROL", t::CONTROL),
+            ("PREPEND", t::PREPEND),
+            ("SPACING_MARK", t::SPACING_MARK),
+            ("HANGUL_L", t::HANGUL_L),
+            ("HANGUL_V", t::HANGUL_V),
+            ("HANGUL_T", t::HANGUL_T),
+            ("EXTENDED_PICTOGRAPHIC", t::EXTENDED_PICTOGRAPHIC),
+        ] {
+            let fresh = parse_table(&source, name);
+            assert_eq!(fresh, committed, "{name} has drifted from Unicode {version} -- regenerate it");
+        }
+    }
+
+    fn parse_version(source: &str) -> String {
+        let line = source.lines().find(|l| l.contains("UNICODE_VERSION")).expect("the generator records the version");
+        line.split('"').nth(1).expect("as a string literal").to_string()
+    }
+
+    // Deliberately a small scanner rather than anything general: the
+    // input is one program's own output, and the only shape it has is
+    // `pub const NAME` followed by `(0x.., 0x..)` pairs up to the `];`.
+    fn parse_table(source: &str, name: &str) -> Vec<(u32, u32)> {
+        let start = source.find(&format!("pub const {name}:")).unwrap_or_else(|| panic!("{name} is missing from the generator's output"));
+        let body = &source[start..];
+        let end = body.find("];").expect("every table ends");
+        let mut out = Vec::new();
+        for pair in body[..end].split('(').skip(1) {
+            let inside = pair.split(')').next().unwrap_or("");
+            let mut halves = inside.split(',').map(str::trim).filter_map(|h| h.strip_prefix("0x"));
+            if let (Some(lo), Some(hi)) = (halves.next(), halves.next()) {
+                out.push((u32::from_str_radix(lo, 16).unwrap(), u32::from_str_radix(hi, 16).unwrap()));
+            }
+        }
+        out
     }
 }
