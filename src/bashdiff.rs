@@ -258,6 +258,23 @@ mod tests {
         case("a-missing-command-does-not-end-the-pipeline", r#"nosuchcmd | head -1; echo "ps=(${PIPESTATUS[@]}) q=$?""#),
         case("a-missing-command-later-in-a-pipeline", r#"echo x | nosuchcmd; echo "q=$? it=${PIPESTATUS[1]}""#),
         case("a-directory-as-a-pipeline-stage", r#"/etc | cat; echo "q=${PIPESTATUS[0]}""#),
+        // A prefix assignment belongs to the command it prefixes --
+        // all three kinds of command. It was expanded wherever each
+        // consumer wanted it, which meant twice for an external, never
+        // for a function's body, and never in the trace.
+        case("prefix-assignment-is-expanded-once", r#"x=$(echo A >&2; echo a) /bin/echo hi"#),
+        // The words first, then the assignments: `B` before `A`.
+        case("prefix-assignment-is-expanded-after-the-words", r#"x=$(echo A >&2; echo a) /bin/echo $(echo B >&2; echo b)"#),
+        case("prefix-assignment-reaches-a-function", r#"f(){ echo "in=[$p]"; }; p=1 f; echo "after=[$p]""#),
+        case("prefix-assignment-is-restored-after-a-function", r#"p=old; f(){ echo "in=[$p]"; }; p=new f; echo "after=[$p]""#),
+        case("prefix-assignment-reaches-a-redirected-function", r#"f(){ echo "[$p]"; }; p=1 f > /dev/null; f"#),
+        case("prefix-assignment-reaches-a-builtin", r#"IFS=: read a b <<< "x:y"; echo "[$a][$b]""#),
+        // Traced before the command, in `=` form with the value the
+        // command will see -- so an appending prefix shows the result.
+        case("xtrace-traces-a-prefix-assignment", r#"set -x; p=1 /bin/true; set +x"#),
+        case("xtrace-traces-a-prefix-on-a-builtin", r#"set -x; p=1 read q < /dev/null; set +x"#),
+        case("xtrace-traces-a-prefix-on-a-function", r#"f(){ :; }; set -x; p=1 f; set +x"#),
+        case("xtrace-traces-an-appending-prefix", r#"p=x; set -x; p+=y /bin/true; set +x"#),
         // A word is written back the way it was *spelled*, not merely
         // the way it means. The tree records the meaning, so every
         // literal used to come back single-quoted: `trap "echo t" EXIT`

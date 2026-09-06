@@ -6979,6 +6979,27 @@ impl Shell {
         if let Some(exit) = self.take_pending_exit() {
             return exit;
         }
+        // Expanded once, here, and used everywhere the assignments are
+        // needed after this. They used to be expanded wherever each
+        // consumer happened to want them -- once to put them in the
+        // shell for a builtin to read, and again to build an external's
+        // environment -- so `x=$(echo a) /bin/echo hi` ran the
+        // substitution twice.
+        //
+        // After the words, because that is bash's order: `x=$(echo A
+        // >&2) cmd $(echo B >&2)` prints B before A.
+        let prefix_values: Vec<(String, String)> = cmd
+            .assigns
+            .iter()
+            .map(|(name, mode, val)| {
+                let v = self.expand_word(val);
+                let v = match mode {
+                    AssignMode::Set => v,
+                    AssignMode::Append => self.appended_value(name, &v),
+                };
+                (name.clone(), v)
+            })
+            .collect();
         // What `$_` will be *after* this command, which is the last
         // word of it as expanded -- or its own name when it has no
         // arguments, which falls out of `last()` for free. Recorded
@@ -6996,6 +7017,13 @@ impl Shell {
         }
         if self.opt_xtrace {
             let ps4 = self.xtrace_prefix();
+            // Assignments first, which is where bash puts them -- and
+            // always with `=` and the value the command will actually
+            // see, so a prefix `p+=y` traces as `p=xy` where a
+            // standalone `p+=y` keeps its own operator.
+            for (name, value) in &prefix_values {
+                sh_eprintln!(self, "{}{}={}", ps4, name, xtrace_quote(value));
+            }
             // Each word quoted if it needs it, the same way an
             // assignment's value already was: the trace is meant to be
             // readable *as* the command that ran, and unquoted it is
@@ -7026,10 +7054,8 @@ impl Shell {
         let runs_in_this_shell = self.is_active_builtin(&name) || (!self.restrict_to_builtins && self.functions.contains_key(&name));
         if background && runs_in_this_shell && cmd.array_assigns.is_empty() && cmd.array_word_assigns.is_empty() {
             let mut script = String::new();
-            for (n, mode, val) in &cmd.assigns {
-                let v = self.expand_word(val);
-                let op = if *mode == AssignMode::Append { "+=" } else { "=" };
-                script.push_str(&format!("{}{}{} ", n, op, crate::serialize::quote_literal(&v)));
+            for (n, v) in &prefix_values {
+                script.push_str(&format!("{}={} ", n, crate::serialize::quote_literal(v)));
             }
             script.push_str(&argv.iter().map(|w| crate::serialize::quote_literal(w)).collect::<Vec<_>>().join(" "));
             for r in &cmd.redirects {
@@ -7050,12 +7076,19 @@ impl Shell {
         if !self.restrict_to_builtins
             && let Some(body) = self.functions.get(&name).cloned()
         {
+            // In scope for the body: `p=1 f` lets `f` read `p`, and
+            // bash puts the old value back afterwards. Nothing applied
+            // them here at all before, so the body saw whatever was
+            // there before the call.
+            let restore = self.apply_prefix_assigns(&prefix_values);
             // A redirect on the *call* applies to the whole body:
             // `f > out` sends everything the function prints to the
             // file, builtins and external commands alike. It used to be
             // dropped entirely -- the file was never even created.
             if cmd.redirects.is_empty() {
-                return self.call_function(&name, &body, argv[1..].to_vec());
+                let result = self.call_function(&name, &body, argv[1..].to_vec());
+                self.restore_prefix_assigns(restore);
+                return result;
             }
             if !Self::compound_redirects_are_simple(&cmd.redirects) {
                 // A numbered-fd redirect on a function call has no
@@ -7073,18 +7106,21 @@ impl Shell {
                 self.arg_frames.push(argv[1..].to_vec());
                 let result = self.run_compound_redirected(&group, &cmd.redirects, background);
                 self.arg_frames.pop();
+                self.restore_prefix_assigns(restore);
                 return result;
             }
             let stdio = match self.resolve_simple_redirects_for_compound(&cmd.redirects) {
                 Ok(stdio) => stdio,
                 Err(e) => {
                     sh_eprintln!(self, "bish: {}", e);
+                    self.restore_prefix_assigns(restore);
                     return ExecResult::Status(1);
                 }
             };
             let saved = self.install_redirected_stdio(stdio);
             let result = self.call_function(&name, &body, argv[1..].to_vec());
             self.restore_redirected_stdio(saved);
+            self.restore_prefix_assigns(restore);
             return result;
         }
         // A prefix assignment (`IFS=: read a b`) is in scope for the
@@ -7102,7 +7138,7 @@ impl Shell {
         // Every builtin and every external command is an effect. A shell
         // *function* call is not -- it returned above, before this point.
         self.effects += 1;
-        let restore = self.apply_prefix_assigns(cmd);
+        let restore = self.apply_prefix_assigns(&prefix_values);
         let result = self.dispatch_builtin_or_external(&argv, name, cmd, background, false, &array_literal_args);
         self.restore_prefix_assigns(restore);
         // Every simple command returns through here, which is the
@@ -7122,14 +7158,10 @@ impl Shell {
     // *unset* rather than as empty -- `FOO=x cmd` must not leave `FOO`
     // behind set to nothing, which `${FOO-default}` and `-u` both
     // notice.
-    fn apply_prefix_assigns(&mut self, cmd: &SimpleCommand) -> Vec<(String, Option<String>)> {
+    fn apply_prefix_assigns(&mut self, values: &[(String, String)]) -> Vec<(String, Option<String>)> {
         let mut saved = Vec::new();
-        for (name, mode, val) in &cmd.assigns {
-            let v = self.expand_word(val);
-            let v = match mode {
-                AssignMode::Set => v,
-                AssignMode::Append => self.appended_value(name, &v),
-            };
+        for (name, v) in values {
+            let v = v.clone();
             // Only what was actually written needs putting back -- a
             // refused write (readonly name) left nothing to restore,
             // and restoring it would print the same refusal twice.
@@ -8656,12 +8688,11 @@ impl Shell {
         let mut command = self.command(&name);
         command.args(&argv[1..]);
         command.current_dir(&self.cwd);
-        for (k, mode, val) in &cmd.assigns {
-            let v = self.expand_word(val);
-            let v = match mode {
-                AssignMode::Set => v,
-                AssignMode::Append => self.appended_value(k, &v),
-            };
+        // Read back rather than expanded again: `apply_prefix_assigns`
+        // has already put each one in the shell, and expanding here too
+        // ran every `$( )` in an assignment a second time.
+        for (k, _, _) in &cmd.assigns {
+            let v = self.lookup_var(k);
             command.env(k, v);
         }
         // A job spawned while promoted gets attached to a fresh pty
