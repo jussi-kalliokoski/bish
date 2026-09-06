@@ -1784,36 +1784,19 @@ y
 
     /// The scripts that do *not* survive the round trip, and why.
     ///
-    /// One, and it is the honest kind. `PS4='+$LINENO '` prints the
-    /// line a command was on, and the round trip re-lays the script
-    /// out -- so the trace is different for the same reason the source
-    /// is a different shape. Nothing to fix without carrying source
-    /// positions, which is its own piece of work.
+    /// Empty. It was 72, then 36, then four unrelated one-line
+    /// omissions, then one -- `PS4='+$LINENO '`, which printed the line
+    /// a command was on and so noticed that the serializer re-laid the
+    /// script. Statements go back on the lines they came from now, so
+    /// it does not.
     ///
-    /// The other 71 are gone, in two changes. `serialize_chunk` used
-    /// to write an unquoted word and a quoted one the same way, which
-    /// made every unquoted word literal and cost 36 scripts. What was
-    /// left read as four unrelated shapes and turned out to be four
-    /// unrelated one-line omissions:
-    ///
-    ///   - A compound's redirects were matched with `..` and dropped,
-    ///     so `{ cmd; } 2>e` came back with no redirect at all -- not
-    ///     reordered, as this list used to claim, but gone.
-    ///   - A heredoc body was written back as if it were source text,
-    ///     so it word-split and a `<<'EOF'` body's `$expansion` came
-    ///     back live. It is content, and is quoted as content now.
-    ///   - `time` sits on the pipeline rather than in an argv, and
-    ///     `serialize_pipeline` never wrote it.
-    ///   - `<` and `<(` ran together into `<<`, which is a heredoc, so
-    ///     every process substitution used as a redirect turned into
-    ///     something else that still parsed.
-    ///
-    /// The list is here so the property is enforced for everything
-    /// else, and so its size is on the record rather than in someone's
-    /// head. `the_known_round_trip_breaks_are_still_broken` keeps it
-    /// honest in the other direction -- it is what said that half the
-    /// list had been fixed by a change aimed at something else.
-    const ROUND_TRIP_BREAKS: &[&str] = &["ps4-expands-a-parameter"];
+    /// Keeping it empty is the point. Every corpus script is run as
+    /// written and again after a trip through the serializer, and the
+    /// two have to do the same thing -- because that trip is how a
+    /// construct reaches a self-exec'd child, and a round trip that
+    /// loses something is not a formatting bug, it is that construct
+    /// quietly doing something else.
+    const ROUND_TRIP_BREAKS: &[&str] = &[];
 
     /// Every corpus script, run as written and again after a round trip
     /// through the serializer, must do the same thing.

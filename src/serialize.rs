@@ -10,22 +10,50 @@ use crate::parser::{AndOr, ArrayLiteralItem, AssignMode, Combinator, Command, Li
 
 pub fn serialize_program(prog: &[ListItem]) -> String {
     let mut s = String::new();
+    // Statements go back on the lines they were written on, so that a
+    // script that reads `$LINENO` says the same thing after a round
+    // trip as before it. Putting every statement on a line of its own
+    // was the last thing that broke one: `PS4='+$LINENO '; set -x;
+    // echo t` is three statements on line 1, and came back as three
+    // lines, so the trace numbered them 1, 2, 3.
+    //
+    // Relative to the first statement rather than to line 1, so a
+    // nested program -- a function body, a loop's body -- keeps the
+    // spacing it had inside itself without the enclosing text having to
+    // agree about where it starts.
+    let base = prog.iter().map(|i| i.line).find(|l| *l > 0);
+    let mut at = base.unwrap_or(0);
     for item in prog {
+        // Blank lines to reach this statement's own. A synthetic item
+        // (`declare -f`'s re-serialised body, the function preamble)
+        // has no line and simply follows the one before it.
+        if let (Some(base), true) = (base, item.line > 0) {
+            let _ = base;
+            while item.line > at {
+                s.push('\n');
+                at += 1;
+            }
+        }
         let (line, bodies) = serialize_and_or_parts(&item.and_or);
+        at += line.matches('\n').count();
         s.push_str(&line);
         // A heredoc body starts on the next line, so the separator
         // cannot share this one -- and the newline the body brings is
         // the separator a `;` would have been.
         if !bodies.is_empty() {
             s.push('\n');
+            at += 1;
             for b in bodies {
+                at += b.matches('\n').count();
                 s.push_str(&b);
             }
             continue;
         }
+        // The separator only; whether a newline follows is the next
+        // statement's business, and the last one needs none.
         s.push_str(match item.sep {
-            Sep::Seq => ";\n",
-            Sep::Background => "&\n",
+            Sep::Seq => "; ",
+            Sep::Background => "& ",
         });
     }
     s
