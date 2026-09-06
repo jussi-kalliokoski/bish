@@ -237,6 +237,19 @@ struct App {
     // session's sink is Real until then, matching today's plain
     // behavior exactly when `:`/`window` are never invoked.
     sinks_are_grid: bool,
+    // Watches the file behind whichever buffer is being looked at, so
+    // the editor can say that it changed underneath -- a formatter, a
+    // branch switch, another pane. It always could say so at `:w`
+    // (E13), but a detachable session can hold a buffer open for days,
+    // and a warning that arrives only when you try to save arrives
+    // after you have already typed into the wrong text.
+    //
+    // One watcher for the whole app rather than one per buffer: an
+    // inotify descriptor is a kernel object and the event loop has to
+    // wait on it, so having exactly one of each is the cheap
+    // arrangement. `None` on a system that would not give us one, which
+    // costs the warning and nothing else.
+    file_watcher: Option<crate::watch::Watcher>,
     term_rows: usize,
     term_cols: usize,
 }
@@ -445,6 +458,7 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
         cmd_history: History::load(".bish_cmd_history", history_size),
         registers: Registers::new(),
         sinks_are_grid: false,
+        file_watcher: crate::watch::Watcher::new().ok(),
         term_rows,
         term_cols,
     };
@@ -1631,6 +1645,7 @@ fn run_edit_impl(targets: &[fileeditor::EditTarget], attach_debug: bool) -> i32 
         cmd_history: History::load(".bish_cmd_history", history_size),
         registers: Registers::new(),
         sinks_are_grid: false,
+        file_watcher: crate::watch::Watcher::new().ok(),
         term_rows,
         term_cols,
     };
@@ -6512,10 +6527,11 @@ fn insert_idle(app: &mut App, session_id: SessionId, buf: &mut TextBuffer) -> Op
     }
     let recoloured = sync_semantic_tokens(&mut app.sessions, session_id, buf);
     let reprogressed = sync_language_server_progress(&mut app.sessions, session_id, buf);
+    let rewatched = sync_watched_file(app.file_watcher.as_mut(), buf);
     // Insert mode too: the marks follow the cursor, and typing moves it.
     let remarked = sync_document_highlights(&mut app.sessions, session_id, buf);
     let rehinted = sync_inlay_hints(&mut app.sessions, session_id, buf);
-    (repaint || diagnosed || recoloured || reprogressed || remarked || rehinted).then(|| fileeditor::IdleRedraw {
+    (repaint || diagnosed || recoloured || reprogressed || rewatched || remarked || rehinted).then(|| fileeditor::IdleRedraw {
         rect: pane_rect(&app.windows[app.current_window], app.windows[app.current_window].focused_pane, app.term_rows, app.term_cols),
         term_rows: app.term_rows,
         term_cols: app.term_cols,
@@ -6759,6 +6775,7 @@ fn run_normal_mode_navigation(
                 }
                 diagnosed |= sync_semantic_tokens(&mut app.sessions, session_id, tb);
                 diagnosed |= sync_language_server_progress(&mut app.sessions, session_id, tb);
+                diagnosed |= sync_watched_file(app.file_watcher.as_mut(), tb);
                 diagnosed |= sync_document_highlights(&mut app.sessions, session_id, tb);
                 diagnosed |= sync_inlay_hints(&mut app.sessions, session_id, tb);
             }
@@ -6811,12 +6828,12 @@ fn run_normal_mode_navigation(
         };
 
         // A key is the acknowledgement an echoed server message needs
-        // (see `TextBuffer::lsp_message`) -- the same convention vim's
+        // (see `TextBuffer::echoed_message`) -- the same convention vim's
         // own echoed messages use, and the reason they need no
         // dismissing. The redraw comes for free: whatever this key does
         // ends in one.
         if let Some(tb) = buf.as_editable_mut() {
-            tb.lsp_message = None;
+            tb.echoed_message = None;
         }
 
         // Resolve whatever PendingView is currently covering the screen
@@ -8567,6 +8584,54 @@ fn flush_language_server_document(sessions: &mut HashMap<SessionId, SessionState
 // This is the named risk of the whole feature made visible: a cold
 // server answers nothing, and until now every `K` against one cost a
 // full `lsp_timeout_ms` with no hint that waiting would have helped.
+// Keeps a watch on the file behind `buf`, and says so when it changes.
+//
+// The check itself is a hash of the file's contents, exactly as `:w`'s
+// own E13 does -- inotify says *when* to look, not what happened. That
+// matters: a `touch`, a formatter that changed nothing, or this
+// editor's own save all produce an event, and warning about any of them
+// would be crying wolf. What inotify buys is not having to hash the
+// file on a timer to find out.
+//
+// Returns true when the status line changed, the same contract every
+// other `sync_*` on this tick has.
+fn sync_watched_file(watcher: Option<&mut crate::watch::Watcher>, buf: &mut TextBuffer) -> bool {
+    let Some(watcher) = watcher else { return false };
+    let Some(path) = buf.path().map(|p| p.to_path_buf()) else { return false };
+    if !watcher.is_watching(&path) {
+        // A file whose directory has gone is not watchable and not
+        // interesting: whatever it says now, it says because it is
+        // gone, and `:w` will find that out on its own.
+        let _ = watcher.watch(&path);
+        return false;
+    }
+    let events = watcher.events();
+    if events.is_empty() {
+        return false;
+    }
+    // An overflow means the queue dropped events, so what is known is
+    // only that something happened -- which is the same thing this does
+    // with an event about the file itself: look.
+    let overflowed = events.iter().any(|e| e.change == crate::watch::Change::Overflowed);
+    if !overflowed && !events.iter().any(|e| e.path == path) {
+        return false;
+    }
+    if !buf.changed_on_disk() {
+        return false;
+    }
+    // Said once per change, not once per tick: `changed_on_disk`
+    // compares against the hash taken when the buffer last read or
+    // wrote the file, so it keeps answering yes until one of those
+    // happens again. Re-echoing it every tick would hold the status
+    // line hostage.
+    let notice = "bish: W11: file changed on disk (`:e!` to reload, `:w!` to overwrite)".to_string();
+    if buf.echoed_message.as_deref() == Some(notice.as_str()) {
+        return false;
+    }
+    buf.echoed_message = Some(notice);
+    true
+}
+
 // Costs a string comparison on a quiet tick, which is why it can run on
 // every one of them.
 //
@@ -8576,7 +8641,7 @@ fn flush_language_server_document(sessions: &mut HashMap<SessionId, SessionState
 fn sync_language_server_progress(sessions: &mut HashMap<SessionId, SessionState>, session_id: SessionId, buf: &mut TextBuffer) -> bool {
     // Anything the server asked to have *shown* is taken first and
     // holds the slot until a key clears it (see `TextBuffer::
-    // lsp_message`). Taken on the same tick either way -- leaving it
+    // echoed_message`). Taken on the same tick either way -- leaving it
     // queued while one is already displayed would mean the second of
     // two messages arrives long after whatever prompted it.
     let mut changed = false;
@@ -8587,7 +8652,7 @@ fn sync_language_server_progress(sessions: &mut HashMap<SessionId, SessionState>
         let mut table = lsp.borrow_mut();
         table.running(&target.display, &target.root)?.take_shown_message()
     })() {
-        buf.lsp_message = Some(message);
+        buf.echoed_message = Some(message);
         changed = true;
     }
     let line = (|| {
@@ -14265,5 +14330,98 @@ mod editorconfig_charset_tests {
         assert_eq!(check("shift_jis"), (crate::encoding::Encoding::Utf8, false), "left as the file's own, which is what it was read as");
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod watched_file_tests {
+    use super::*;
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("bish-watched-{}-{}", std::process::id(), name));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// The kernel delivers on its own schedule, so this waits for the
+    /// answer rather than reading once and calling the machine's mood a
+    /// result.
+    fn settle(watcher: &mut crate::watch::Watcher, buf: &mut TextBuffer) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            if sync_watched_file(Some(watcher), buf) {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        false
+    }
+
+    #[test]
+    fn a_file_rewritten_underneath_says_so_once() {
+        let dir = scratch("changed");
+        let path = dir.join("f.txt");
+        std::fs::write(&path, "one\n").unwrap();
+        let mut buf = TextBuffer::open(&path, 10).unwrap();
+        let mut watcher = crate::watch::Watcher::new().unwrap();
+        // The first call takes the watch out and reports nothing --
+        // there is nothing to report yet.
+        assert!(!sync_watched_file(Some(&mut watcher), &mut buf));
+
+        std::fs::write(&path, "two\n").unwrap();
+        assert!(settle(&mut watcher, &mut buf), "the change was never noticed");
+        assert!(buf.echoed_message.as_deref().is_some_and(|m| m.contains("W11")), "{:?}", buf.echoed_message);
+        // `changed_on_disk` keeps answering yes until the buffer reads
+        // or writes the file again, so the message must not be re-echoed
+        // on every tick from here on.
+        assert!(!sync_watched_file(Some(&mut watcher), &mut buf), "said twice");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // The reason inotify says *when* to look rather than what happened:
+    // a formatter that changed nothing, a `touch`, this editor's own
+    // save. Warning about any of those is crying wolf.
+    #[test]
+    fn a_write_that_changed_nothing_is_not_a_change() {
+        let dir = scratch("same");
+        let path = dir.join("f.txt");
+        std::fs::write(&path, "one\n").unwrap();
+        let mut buf = TextBuffer::open(&path, 10).unwrap();
+        let mut watcher = crate::watch::Watcher::new().unwrap();
+        assert!(!sync_watched_file(Some(&mut watcher), &mut buf));
+
+        std::fs::write(&path, "one\n").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(!sync_watched_file(Some(&mut watcher), &mut buf), "the content is the same");
+        assert_eq!(buf.echoed_message, None);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // The case an inode watch cannot see, and the reason watch.rs
+    // watches directories: a formatter or a branch switch replaces the
+    // file rather than writing through it.
+    #[test]
+    fn a_file_replaced_by_rename_is_noticed_too() {
+        let dir = scratch("renamed");
+        let path = dir.join("f.txt");
+        std::fs::write(&path, "one\n").unwrap();
+        let mut buf = TextBuffer::open(&path, 10).unwrap();
+        let mut watcher = crate::watch::Watcher::new().unwrap();
+        assert!(!sync_watched_file(Some(&mut watcher), &mut buf));
+
+        let temp = dir.join("f.txt.tmp");
+        std::fs::write(&temp, "two\n").unwrap();
+        std::fs::rename(&temp, &path).unwrap();
+        assert!(settle(&mut watcher, &mut buf), "a rename over the file went unnoticed");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_buffer_with_no_file_is_nothing_to_watch() {
+        let mut buf = TextBuffer::new_unnamed(10);
+        let mut watcher = crate::watch::Watcher::new().unwrap();
+        assert!(!sync_watched_file(Some(&mut watcher), &mut buf));
+        assert!(!sync_watched_file(None, &mut buf), "and no watcher at all is not an error either");
     }
 }

@@ -56,6 +56,7 @@ mod url;
 #[cfg(test)]
 mod vimdiff;
 mod vt100;
+mod watch;
 mod window;
 
 use std::io::{IsTerminal, Read};

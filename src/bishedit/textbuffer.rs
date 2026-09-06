@@ -84,12 +84,13 @@ pub struct TextBuffer {
     /// `semantic_spans`, and for the same reason: this is the one place
     /// with both the buffer and a moment to spare.
     pub lsp_progress: Option<String>,
-    /// Something the language server asked to have shown to the user
-    /// (`window/showMessage`), most often that it could not load the
-    /// project. Takes the status line's progress slot while it is set,
+    /// Something to tell the user once: a language server's
+    /// `window/showMessage` (most often that it could not load the
+    /// project), or the file on disk having changed underneath this
+    /// buffer. Takes the status line's progress slot while it is set,
     /// and is cleared by the next keypress -- vim's own convention for
     /// an echoed message, and the reason it does not need dismissing.
-    pub lsp_message: Option<String>,
+    pub echoed_message: Option<String>,
     // A language server's semantic tokens for this buffer, already
     // resolved to colours and to this buffer's own char offsets (see
     // repl::sync_semantic_tokens) -- painted as one more layer over
@@ -339,7 +340,7 @@ impl TextBuffer {
             iskeyword: "_".to_string(),
             lsp_root: None,
             lsp_progress: None,
-            lsp_message: None,
+            echoed_message: None,
             semantic_spans: Vec::new(),
             document_highlights: Vec::new(),
             inlay_hints: Vec::new(),
@@ -487,7 +488,7 @@ impl TextBuffer {
             iskeyword: "_".to_string(),
             lsp_root: None,
             lsp_progress: None,
-            lsp_message: None,
+            echoed_message: None,
             semantic_spans: Vec::new(),
             document_highlights: Vec::new(),
             inlay_hints: Vec::new(),
@@ -1153,7 +1154,7 @@ mod tests {
             iskeyword: "_".to_string(),
             lsp_root: None,
             lsp_progress: None,
-            lsp_message: None,
+            echoed_message: None,
             semantic_spans: Vec::new(),
             document_highlights: Vec::new(),
             inlay_hints: Vec::new(),
