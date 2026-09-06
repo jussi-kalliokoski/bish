@@ -1170,6 +1170,33 @@ y
     const PANE_ROWS: usize = 400;
     const PANE_COLS: usize = 400;
 
+    /// Waits for a file to stop being written to.
+    ///
+    /// Length-stability rather than a fixed sleep: a consumer that has
+    /// already finished costs one poll, and a slow one is waited for as
+    /// long as it keeps producing. The budget is generous because being
+    /// slow is what a loaded machine is, and the cost of guessing short
+    /// is a case that reports a difference between the shells when what
+    /// it saw was a difference in scheduling.
+    fn settle(path: &std::path::Path) {
+        // Five quiet polls, not one. The consumer these cases are about
+        // has typically not written anything *yet* when the shell
+        // exits, so the file is zero bytes long and stays that way
+        // across two reads taken too close together -- which reads as
+        // "finished" and is the very failure this is here to stop.
+        const QUIET: usize = 5;
+        let poll = std::time::Duration::from_millis(20);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut last = None;
+        let mut quiet = 0;
+        while std::time::Instant::now() < deadline && quiet < QUIET {
+            std::thread::sleep(poll);
+            let now = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+            quiet = if last == Some(now) { quiet + 1 } else { 0 };
+            last = Some(now);
+        }
+    }
+
     fn run_merged(shell: &std::ffi::OsStr, options: &[&str], script: &str, dir: &std::path::Path) -> Outcome {
         // Outside the case's own directory, because several cases glob
         // their cwd and one of them (`shopt-dotglob`) duly listed this
@@ -1206,6 +1233,21 @@ y
             Ok((_, timed_out)) => timed_out,
             Err(e) => return Outcome { text: format!("<could not run: {e}>"), timed_out: false },
         };
+        // The shell exiting does not mean the output is complete. A
+        // `>( )` consumer is a separate process holding this same file
+        // open, and it writes *after* the shell that started it has
+        // gone -- so reading here reads whatever happened to have
+        // landed. That is not a difference between the two shells; it
+        // is the harness measuring at the wrong moment, and it showed
+        // up as bash printing nothing for `echo hi > >(cat)` in a
+        // whole-suite run and `hi` in sixty runs of its own.
+        //
+        // So the file is given a moment to stop growing. Only for the
+        // scripts that can have a writer outliving the shell, because
+        // the wait costs real time and 500 cases do not need it.
+        if script.contains(">(") {
+            settle(&path);
+        }
         let text = std::fs::read_to_string(&path).unwrap_or_default();
         let _ = std::fs::remove_file(&path);
         Outcome { text: normalise(&as_a_terminal_would_show_it(&text)), timed_out }
