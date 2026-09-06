@@ -1693,6 +1693,7 @@ impl HexSession {
         let mut registers = std::mem::take(&mut self.registers);
         let outcome = editor::read_line(
             ":",
+            ":",
             cmd_history,
             true,
             // `ctrl_l_reports`: true, so Ctrl-L comes back here as an

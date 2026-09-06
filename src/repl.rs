@@ -588,6 +588,10 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
             let session = &app.sessions[&session_id];
             if session.buffer.is_empty() { prompt::render(&session.shell) } else { prompt::continuation() }
         };
+        // What the second and later lines of a paste get drawn under --
+        // they are continuation lines, whatever the line this read
+        // started on was.
+        let continuation_str = prompt::continuation();
         let (col_origin, width) = focused_col_origin(&app.windows[app.current_window], app.sinks_are_grid, app.term_rows, app.term_cols);
         // A standalone snapshot, not a live borrow: on_idle below needs
         // its own mutable borrow of `app.sessions` (to service other
@@ -714,6 +718,7 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
             None => app.with_registers(|app, registers| {
                 editor::read_line(
                     &prompt_str,
+                    &continuation_str,
                     &session_history,
                     false,
                     app.sinks_are_grid,
@@ -752,6 +757,44 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
             }),
         };
         match outcome {
+            // A paste's finished lines, and nothing run. They go into
+            // the same continuation buffer a typed multi-line command
+            // uses -- so the whole paste is one history entry and one
+            // execution when it finally goes -- and the line the paste
+            // ended in the middle of goes back to the prompt with the
+            // cursor where it left off.
+            //
+            // History expansion is deliberately not applied to any of
+            // them. It is a property of the start of a fresh command
+            // (see the Line arm below), and every line here is text
+            // that arrived at once: a `!` in the middle of a pasted
+            // script is a negation or a filename far more often than it
+            // is a designator, and the paste is still sitting at the
+            // prompt to be edited if it was meant as one.
+            Ok(ReadOutcome::Pasted { lines, rest, cursor }) => {
+                let session = app.sessions.get_mut(&session_id).unwrap();
+                session.warned_stopped_jobs = false;
+                for (i, line) in lines.iter().enumerate() {
+                    if session.buffer.is_empty() {
+                        session.buffer_unrecorded = starts_off_the_record(line);
+                    }
+                    if app.sinks_are_grid {
+                        // The same feed a submitted line gets, for the
+                        // same reason -- see the Line arm's own comment
+                        // on why the grid needs this and the real
+                        // screen does not.
+                        let shown = if i == 0 { &prompt_str } else { &continuation_str };
+                        let highlighted = highlight::render_line(line, highlight_ctx);
+                        let echoed = format!("\r\x1b[K{}{}\r\n", shown, highlighted);
+                        session.screen.borrow_mut().feed(echoed.as_bytes());
+                    }
+                    if !session.buffer.is_empty() {
+                        session.buffer.push('\n');
+                    }
+                    session.buffer.push_str(line);
+                }
+                pending_initial = Some((rest, cursor));
+            }
             Ok(ReadOutcome::Eof) => {
                 // Whether closing *this* (window, top-frame) reference
                 // would leave the session with no reference anywhere
@@ -10857,6 +10900,7 @@ fn run_command_mode(
         let outcome = app.with_registers(|app, registers| {
             editor::read_line(
                 &prompt_str,
+                &prompt_str,
                 &history_snapshot,
                 true,
                 true,
@@ -10930,6 +10974,20 @@ fn run_command_mode(
             // click's own target.
             Ok(ReadOutcome::Mouse { text, cursor, .. }) => {
                 pending_initial = Some((text, cursor));
+            }
+            // Command mode stitches multi-line input the same way the
+            // shell prompt does, so a paste's finished lines join the
+            // buffer here and the unfinished one goes back to the
+            // prompt. Nothing runs until the line that completes it is
+            // submitted, which is the whole point.
+            Ok(ReadOutcome::Pasted { lines, rest, cursor }) => {
+                for line in lines {
+                    if !buffer.is_empty() {
+                        buffer.push('\n');
+                    }
+                    buffer.push_str(&line);
+                }
+                pending_initial = Some((rest, cursor));
             }
             Ok(ReadOutcome::CtrlL) => {
                 transcript_visible = !transcript_visible;

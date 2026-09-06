@@ -82,6 +82,10 @@ pub enum Key {
     Escape,
     // xterm/tmux send these as "CSI 1 ; 3 <letter>" (modifier 3 = Alt)
     // rather than the plain "CSI <letter>" -- see decode_csi_final.
+    // Alt-Enter: a newline in the command, rather than the end of it.
+    // Arrives as Esc + CR/LF, the same shape every other Alt-held key
+    // does (see decode_escape_prefixed).
+    AltEnter,
     AltLeft,
     AltRight,
     AltUp,
@@ -339,6 +343,8 @@ fn decode_escape_prefixed(b: u8) -> Option<Key> {
         // is, and an Alt-held key is that byte with an Esc in front, so
         // both spellings arrive here.
         0x7f | 0x08 => Some(Key::AltBackspace),
+        // Alt-Enter, in both spellings a terminal might send.
+        b'\r' | b'\n' => Some(Key::AltEnter),
         _ => None,
     }
 }
@@ -1445,6 +1451,27 @@ fn truncate_visible(s: &str, max_visible: usize) -> String {
 
 pub enum ReadOutcome {
     Line(String),
+    /// Text that arrived with newlines in it, and must not run yet.
+    ///
+    /// A paste is the reason this exists. Without bracketed paste a
+    /// pasted block arrives as characters and Enters, indistinguishable
+    /// from typing, so the shell runs each line as it lands -- half a
+    /// script executes while the rest is still being pasted, and a
+    /// paste that was meant to be edited first never gets the chance.
+    /// With it, the newlines are text: `lines` are the complete ones,
+    /// which the caller appends to its continuation buffer and does
+    /// *not* execute, and `rest` is what is left after the last
+    /// newline, which goes back into the prompt with the cursor at
+    /// `cursor` for the next read to carry on from.
+    ///
+    /// Alt-Enter produces one of these too, with a single complete
+    /// line: it is the deliberate version of the same thing, for
+    /// adding a line to a command that would otherwise have run.
+    Pasted {
+        lines: Vec<String>,
+        rest: String,
+        cursor: usize,
+    },
     Eof,
     // Ctrl-C (and command mode's own Escape/Backspace cancel). `text` is
     // whatever had been typed at that moment -- not so the caller can
@@ -1456,7 +1483,9 @@ pub enum ReadOutcome {
     // Ctrl-C just echoed onto and then redraw a fresh prompt over it --
     // a visible flash, and a `^C` that vanishes instead of staying in
     // the scrollback the way bash leaves it.
-    Interrupted { text: String },
+    Interrupted {
+        text: String,
+    },
     // Alt+Left/Right/Up at an empty buffer -- see DirNav's own doc
     // comment. Never fires with anything typed (see read_line's own
     // handling), so there's no "what happens to the buffer" question.
@@ -1485,7 +1514,11 @@ pub enum ReadOutcome {
     // than dropped so the notch that got you here also scrolls: entering
     // a mode and not moving reads as the wheel being broken, which is
     // the complaint this whole path exists to answer.
-    NormalMode { text: String, cursor: usize, wheel: Option<MouseEvent> },
+    NormalMode {
+        text: String,
+        cursor: usize,
+        wheel: Option<MouseEvent>,
+    },
     // A qualifying left click (see MouseEvent::is_left_click) anywhere
     // during ordinary typing. Bubbled up the same way NormalMode is --
     // read_line has no idea `windows`/panes exist at all, only its own
@@ -1498,7 +1531,11 @@ pub enum ReadOutcome {
     // isn't generally what happens next -- see this outcome's own repl.rs
     // handler for why a genuine focus change instead freezes this text
     // into the losing pane's own grid.
-    Mouse { event: MouseEvent, text: String, cursor: usize },
+    Mouse {
+        event: MouseEvent,
+        text: String,
+        cursor: usize,
+    },
     // Ctrl-L, but only when the caller opted in via `ctrl_l_reports` (see
     // that parameter's own doc comment) -- command mode's own toggle for
     // showing its whole command+output transcript. Whatever was typed so
@@ -1568,8 +1605,78 @@ pub enum DirNav {
 // normal-mode navigation (see `ReadOutcome::NormalMode`'s own doc
 // comment) without losing whatever had already been typed. `None` for
 // every ordinary call (a fresh prompt has nothing to preload).
+/// What the real screen shows once a paste has been taken in: every
+/// completed line, in place, the way each would look had it been typed
+/// and submitted.
+///
+/// The first one is already on screen under the primary prompt, so it
+/// is repainted there; the rest get the continuation prompt, because
+/// that is what they are. Written straight to the real terminal like
+/// every other draw in this file -- a caller with a grid of its own
+/// feeds them into it separately (see repl.rs), exactly as it already
+/// does for a single submitted line.
+#[allow(clippy::too_many_arguments)]
+fn paste_echo(
+    prompt: &str,
+    continuation_prompt: &str,
+    lines: &[String],
+    col_origin: usize,
+    width: usize,
+    ctx: HighlightContext,
+    menu_capable: bool,
+    menu_was_shown: bool,
+    row_origin: Option<(usize, usize)>,
+) -> String {
+    let mut out = String::new();
+    for (i, line) in lines.iter().enumerate() {
+        let shown = LineEditor { buf: line.chars().collect(), cursor: 0 };
+        let prompt = if i == 0 { prompt } else { continuation_prompt };
+        out.push_str(&repaint_without_affordances(prompt, &shown, col_origin, width, ctx));
+        out.push_str("\r\n");
+    }
+    // A menu row sat directly under the first line and nothing else,
+    // so with a second line to draw it has already been written over.
+    if lines.len() == 1 {
+        out.push_str(&erase_menu_row_under_cursor(menu_capable, menu_was_shown, row_origin, col_origin, width));
+    }
+    out
+}
+
+/// Where a pasted block leaves the prompt: the lines that are finished
+/// with, and what is still being edited.
+///
+/// The paste goes in at the cursor, and only the paste can contain
+/// newlines -- the prompt's own buffer is one line by construction --
+/// so everything before the last newline is complete and everything
+/// after it is the new line-in-progress. The cursor lands at the end of
+/// what was pasted, which is where it would be if you had typed it,
+/// with any text that was to the right of the cursor still to its
+/// right.
+///
+/// Returns no lines at all when the paste has no newlines in it: that
+/// is an ordinary insertion, and the caller does it as one.
+fn splice_paste(buf: &[char], cursor: usize, paste: &str) -> (Vec<String>, String, usize) {
+    if !paste.contains('\n') {
+        return (Vec::new(), String::new(), 0);
+    }
+    let mut text: Vec<char> = buf[..cursor].to_vec();
+    text.extend(paste.chars());
+    let after_paste = text.len();
+    text.extend(buf[cursor..].iter().copied());
+    let joined: String = text.iter().collect();
+    let mut parts: Vec<String> = joined.split('\n').map(str::to_string).collect();
+    let rest = parts.pop().unwrap_or_default();
+    let before: usize = parts.iter().map(|l| l.chars().count() + 1).sum();
+    (parts, rest, after_paste.saturating_sub(before))
+}
+
 pub fn read_line(
     prompt: &str,
+    // The prompt a continuation line gets. Only ever drawn by
+    // `paste_echo` -- a line this read *starts* is always the first one
+    // -- so a caller with no such thing (command mode's colon line) can
+    // pass its ordinary prompt and never see the difference.
+    continuation_prompt: &str,
     history: &History,
     esc_cancels: bool,
     ctrl_l_reports: bool,
@@ -1648,6 +1755,15 @@ pub fn read_line(
     queued: Vec<Key>,
 ) -> io::Result<ReadOutcome> {
     let mut guard = Some(term::RawGuard::enable_maybe_mouse(0, mouse)?);
+    // Ask the terminal to bracket pasted text, for the whole of this
+    // read. Without it a paste is characters and Enters and nothing can
+    // tell it from typing, so a pasted script runs itself line by line
+    // as it arrives -- half of it executing while the rest is still in
+    // flight, and no chance to look at it first. The guard turns the
+    // mode back off down every exit from here, including the early
+    // returns, so a foreground command that knows nothing about it
+    // never inherits it.
+    let _paste = term::BracketedPasteGuard::enable();
     let mut matcher = crate::keymap::Matcher::new(mappings);
     // Keys a mapping expanded to, beyond the first -- delivered before
     // anything new is read, and never run back through the matcher,
@@ -1938,6 +2054,61 @@ pub fn read_line(
                 print!("{}\r\n{}", repaint_without_affordances(prompt, &ed, col_origin, width, ctx), erase_menu_row_under_cursor(menu_capable, menu_was_shown, row_origin, col_origin, width));
                 io::stdout().flush()?;
                 return Ok(ReadOutcome::Line(ed.as_string()));
+            }
+            // The whole paste, read here in one go rather than a key at
+            // a time through the loop above. Every affordance in this
+            // function reacts to *typing* -- abbreviations expand,
+            // completions open, a suggestion's ghost tail appears -- and
+            // all of them are wrong applied to text that was pasted; a
+            // terminal telling the two apart is the entire point of
+            // bracketed paste, so this is where the distinction gets
+            // used.
+            //
+            // Read raw, past the key-mapping layer: a mapping is
+            // something a person asked for by pressing keys, not a
+            // transformation of text that arrived from the clipboard.
+            Key::PasteStart => {
+                let mut pasted = String::new();
+                loop {
+                    match read_key_idle(&mut || {})? {
+                        // EOF mid-paste, or the closing bracket: either
+                        // way this is everything there is.
+                        None | Some(Key::PasteEnd) => break,
+                        Some(Key::Char(c)) => pasted.push(c),
+                        // Both spellings of a line ending arrive as
+                        // Enter, and inside a paste both mean a newline
+                        // in the text rather than "run this".
+                        Some(Key::Enter) => pasted.push('\n'),
+                        Some(Key::Tab) => pasted.push('\t'),
+                        // Anything else in a paste is a control sequence
+                        // the clipboard had no business carrying, and
+                        // there is no sensible text for it.
+                        Some(_) => {}
+                    }
+                }
+                let (lines, rest, cursor) = splice_paste(&ed.buf, ed.cursor, &pasted);
+                if lines.is_empty() {
+                    for c in pasted.chars() {
+                        ed.insert(c);
+                    }
+                } else {
+                    drop(guard.take());
+                    print!("{}", paste_echo(prompt, continuation_prompt, &lines, col_origin, width, ctx, menu_capable, menu_was_shown, row_origin));
+                    io::stdout().flush()?;
+                    return Ok(ReadOutcome::Pasted { lines, rest, cursor });
+                }
+            }
+            // The deliberate version of the same thing: a newline in the
+            // command rather than the end of it. `for x in 1 2; do` gets
+            // a continuation line for free because it does not parse
+            // yet; this is how you get one for a command that would
+            // otherwise have run.
+            Key::AltEnter => {
+                let (lines, rest, cursor) = splice_paste(&ed.buf, ed.cursor, "\n");
+                drop(guard.take());
+                print!("{}", paste_echo(prompt, continuation_prompt, &lines, col_origin, width, ctx, menu_capable, menu_was_shown, row_origin));
+                io::stdout().flush()?;
+                return Ok(ReadOutcome::Pasted { lines, rest, cursor });
             }
             Key::CtrlC => {
                 drop(guard.take());
@@ -2250,10 +2421,11 @@ pub fn read_line(
             // scrollback view to page through here -- that's Ctrl+Space's
             // own Normal-mode navigation's job), same as a real bash
             // readline prompt not binding them either.
-            // The paste brackets are ignored here rather than acted on:
-            // this prompt never turns DECSET 2004 on, so they only ever
-            // arrive from a terminal that had it on for someone else --
-            // and dropping them is still better than typing "200~".
+            // A closing paste bracket with no opener is a stray: this
+            // prompt reads its own paste in one go (see Key::PasteStart
+            // above), so the only way to see one here is a terminal that
+            // had the mode on for somebody else. Dropping it still beats
+            // typing "201~".
             Key::AltLeft
             | Key::AltRight
             | Key::AltUp
@@ -2262,7 +2434,6 @@ pub fn read_line(
             | Key::Mouse(_)
             | Key::PageUp
             | Key::PageDown
-            | Key::PasteStart
             | Key::PasteEnd
             // Visual block on a one-line buffer would be an ordinary
             // charwise selection, which `v` already gives -- so the
@@ -3777,6 +3948,195 @@ mod tests {
         let mut ed = typed("echo one two");
         ed.kill_word_backward_to_punctuation();
         assert_eq!(ed.as_string(), "echo one ");
+    }
+
+    /// Drives a real `bish` prompt over a pty and returns everything it
+    /// wrote.
+    ///
+    /// The unit tests above pin the arithmetic; this pins the property
+    /// that made the arithmetic worth having -- that a pasted script
+    /// does not run itself. Nothing short of a real terminal can say
+    /// that, because the distinction being tested is one only a
+    /// terminal makes.
+    ///
+    /// `None` when there is nothing to drive (no built binary) or when
+    /// the shell never got as far as a prompt, which is a busy machine
+    /// rather than a finding -- the same call the vimdiff harness makes
+    /// about an editor that never answered its handshake.
+    fn at_a_prompt(sends: &[&str]) -> Option<Vec<String>> {
+        use std::io::{Read, Write};
+        let exe = std::env::current_exe().ok()?;
+        let bish = exe.parent()?.parent()?.join("bish");
+        if !bish.exists() {
+            return None;
+        }
+        let home = std::env::temp_dir().join(format!("bish-paste-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&home);
+        let pty = crate::pty::open().ok()?;
+        let _ = crate::pty::set_size(std::os::fd::AsRawFd::as_raw_fd(&pty.master), 24, 100);
+        let mut cmd = std::process::Command::new(&bish);
+        cmd.env_clear();
+        cmd.env("TERM", "xterm-256color");
+        cmd.env("HOME", &home);
+        cmd.env("PATH", "/usr/bin:/bin");
+        cmd.current_dir(&home);
+        let mut child = crate::pty::spawn_attached(cmd, &pty.slave_path).ok()?;
+        let mut master = pty.master;
+        crate::pty::set_nonblocking(std::os::fd::AsRawFd::as_raw_fd(&master));
+        // One drained chunk per send, so a caller can say *when* a line
+        // appeared and not merely that it did -- which is the whole
+        // question here.
+        let settle = |master: &mut std::fs::File| -> String {
+            let mut seen = String::new();
+            let mut quiet = 0;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while quiet < 6 && std::time::Instant::now() < deadline {
+                let mut buf = [0u8; 4096];
+                match master.read(&mut buf) {
+                    Ok(n) if n > 0 => {
+                        seen.push_str(&String::from_utf8_lossy(&buf[..n]));
+                        quiet = 0;
+                    }
+                    _ => {
+                        quiet += 1;
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                    }
+                }
+            }
+            seen
+        };
+        if settle(&mut master).is_empty() {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+        let mut chunks = Vec::new();
+        for send in sends {
+            if master.write_all(send.as_bytes()).is_err() {
+                break;
+            }
+            chunks.push(settle(&mut master));
+        }
+        let _ = master.write_all(b"\x04");
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(&home);
+        Some(chunks)
+    }
+
+    /// Everything the terminal was told to draw, minus how to draw it.
+    fn without_escapes(s: &str) -> String {
+        let mut out = String::new();
+        let mut chars = s.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c != '\u{1b}' {
+                out.push(c);
+                continue;
+            }
+            match chars.next() {
+                // OSC: runs to a BEL or an ESC \.
+                Some(']') => {
+                    for c in chars.by_ref() {
+                        if c == '\u{7}' || c == '\u{1b}' {
+                            break;
+                        }
+                    }
+                }
+                // CSI: parameters, then one final byte.
+                Some('[') => {
+                    for c in chars.by_ref() {
+                        if c.is_ascii_alphabetic() {
+                            break;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn a_pasted_script_does_not_run_itself() {
+        // Two complete commands and the start of a third, as a paste.
+        // Before bracketed paste this ran the first two on the spot --
+        // the newlines were Enters and nothing could tell them from
+        // typing -- which is a script half-executing while the rest of
+        // it is still arriving.
+        // Each command prints something its own source text does not
+        // contain, so "it ran" and "it was echoed to the screen" cannot
+        // be confused for one another.
+        let paste = "\u{1b}[200~echo a$((1+1))\necho b$((2+2))\necho c$((3+3\u{1b}[201~";
+        let Some(chunks) = at_a_prompt(&[paste, "))\r"]) else {
+            return;
+        };
+        let during = without_escapes(&chunks[0]);
+        assert!(during.contains("echo a$((1+1))"), "the paste never arrived: {during:?}");
+        assert!(!during.contains("a2"), "the paste ran a command: {during:?}");
+        assert!(!during.contains("b4"), "the paste ran a command: {during:?}");
+        // ...and all three ran together on the Enter that finished the
+        // line the paste ended in the middle of.
+        let after = without_escapes(&chunks[1]);
+        for want in ["a2", "b4", "c6"] {
+            assert!(after.contains(want), "`{want}` never ran: {after:?}");
+        }
+    }
+
+    #[test]
+    fn alt_enter_decodes_from_either_line_ending() {
+        // Same shape as Alt-Backspace: the key's own byte behind an Esc,
+        // in whichever spelling the terminal uses for Enter.
+        assert_eq!(decode_escape_prefixed(b'\r'), Some(Key::AltEnter));
+        assert_eq!(decode_escape_prefixed(b'\n'), Some(Key::AltEnter));
+    }
+
+    #[test]
+    fn a_paste_without_newlines_is_an_ordinary_insertion() {
+        // No lines to hand back means the caller inserts it as text,
+        // which is what a paste of a single command should be.
+        let buf: Vec<char> = "echo ".chars().collect();
+        let (lines, rest, cursor) = splice_paste(&buf, 5, "hello");
+        assert!(lines.is_empty(), "{lines:?}");
+        assert_eq!((rest.as_str(), cursor), ("", 0));
+    }
+
+    #[test]
+    fn a_paste_splits_at_its_newlines_and_keeps_the_tail() {
+        let (lines, rest, cursor) = splice_paste(&[], 0, "echo one\necho two\necho thr");
+        assert_eq!(lines, vec!["echo one".to_string(), "echo two".to_string()]);
+        // The tail is still being edited, with the cursor after what
+        // was pasted -- exactly where typing it would have left it.
+        assert_eq!((rest.as_str(), cursor), ("echo thr", 8));
+    }
+
+    #[test]
+    fn a_paste_that_ends_in_a_newline_leaves_an_empty_line() {
+        // The command is complete and nothing has run: the next Enter
+        // is what submits it. That is the whole safety property.
+        let (lines, rest, cursor) = splice_paste(&[], 0, "echo x\necho y\n");
+        assert_eq!(lines, vec!["echo x".to_string(), "echo y".to_string()]);
+        assert_eq!((rest.as_str(), cursor), ("", 0));
+    }
+
+    #[test]
+    fn a_paste_goes_in_at_the_cursor() {
+        // `echo | wc` with the cursor after `echo `, pasting two lines:
+        // the text that was to the right of the cursor stays to the
+        // right of it, on the line the paste ended in.
+        let buf: Vec<char> = "echo | wc".chars().collect();
+        let (lines, rest, cursor) = splice_paste(&buf, 5, "a\nb");
+        assert_eq!(lines, vec!["echo a".to_string()]);
+        assert_eq!(rest, "b| wc");
+        assert_eq!(cursor, 1, "after the pasted `b`, before what was already there");
+    }
+
+    #[test]
+    fn alt_enter_splits_the_line_where_the_cursor_is() {
+        // The deliberate version: one newline, at the cursor.
+        let buf: Vec<char> = "echo a echo b".chars().collect();
+        let (lines, rest, cursor) = splice_paste(&buf, 7, "\n");
+        assert_eq!(lines, vec!["echo a ".to_string()]);
+        assert_eq!((rest.as_str(), cursor), ("echo b", 0));
     }
 
     #[test]
