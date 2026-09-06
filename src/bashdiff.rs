@@ -300,6 +300,33 @@ mod tests {
         // ordinary character, which is what every `awk '{print}'`
         // pattern depends on.
         case("regex-a-lone-brace-is-a-character", r#"[[ "a{" =~ ^a\{$ ]] && echo y || echo n; [[ "a{,}" =~ ^a{,}$ ]] && echo y || echo n"#),
+        // Which match a pattern finds, not merely whether it finds
+        // one. POSIX takes the longest match at the leftmost place one
+        // can start; a backtracker takes the first its own branch
+        // order reaches, and this engine was one. `(a|ab)` against
+        // `abc` is the shortest way to see the difference.
+        case(
+            "regex-takes-the-longest-match-not-the-first-branch",
+            r#"re='(a|ab)'; [[ abc =~ $re ]]; echo "[${BASH_REMATCH[0]}]"; re='x|xy'; [[ xy =~ $re ]]; echo "[${BASH_REMATCH[0]}]"; re='ab|abc'; [[ abc =~ $re ]]; echo "[${BASH_REMATCH[0]}]""#,
+        ),
+        case(
+            "regex-an-empty-branch-does-not-win-over-a-longer-one",
+            r#"re='(|a)'; [[ abc =~ $re ]]; echo "[${BASH_REMATCH[0]}][${BASH_REMATCH[1]}]"; re='(a|)x'; [[ ax =~ $re ]]; echo "[${BASH_REMATCH[0]}][${BASH_REMATCH[1]}]""#,
+        ),
+        // Leftmost still outranks longest: a shorter match that starts
+        // earlier beats a longer one that starts later.
+        case(
+            "regex-leftmost-outranks-longest",
+            r#"re='b|abc'; [[ xabc =~ $re ]]; echo "[${BASH_REMATCH[0]}]"; re='a|bcd'; [[ abcd =~ $re ]]; echo "[${BASH_REMATCH[0]}]""#,
+        ),
+        // The pattern that used to be the end of the process: every
+        // way of splitting a run of `a`s, none of which works. Thirty
+        // characters was already 2^30 of them, so four hundred settles
+        // it -- either this returns at once or it never returns.
+        case(
+            "regex-a-nested-quantifier-does-not-hang",
+            r#"t=$(printf 'a%.0s' {1..400}); re='^(a+)+$'; [[ $t =~ $re ]] && echo "y ${#BASH_REMATCH[0]}"; [[ ${t}b =~ $re ]] && echo bad || echo "n"; re='(a|aa)*b'; [[ $t =~ $re ]] && echo bad || echo n"#,
+        ),
         // A redirect a builtin will never read is still a redirect,
         // and one that cannot be performed fails the command before it
         // runs. `echo z <nosuch` printed `z` and returned 0, and
@@ -1362,6 +1389,24 @@ y
         // `logout`. Listed rather than fixed because the difference is
         // the point -- the list is honest about what this shell has.
         ("compgen-b-lists-this-shells-builtins", "`compgen -b` lists bish's own builtins and not bash's `bind`/`logout`"),
+        // Where the *whole* match lands, both shells now agree on:
+        // leftmost, then longest. What is left is which spelling of an
+        // equally long match the capture groups report. bash's answer
+        // is glibc's regexec, which is not the POSIX rule either --
+        // POSIX hands each subexpression, left to right, the longest it
+        // can take, and glibc only sometimes does. This engine breaks
+        // the tie by the pattern's own branch order, which is a rule
+        // that can be stated in one line and is right whenever the
+        // groups are not ambiguous to begin with. Matching glibc's
+        // would mean reproducing its inconsistencies: a fuzz of 3000
+        // random patterns disagreed 34 times, every one of them a
+        // pattern with two ways to spell the same match -- mostly an
+        // empty alternation branch, the rest a top-level `|` whose
+        // branches both reach the same text.
+        (
+            "regex-submatch-of-an-ambiguous-empty-branch",
+            "`(|a)(a|)` against `a` fills the first group in bash and the second here; the whole match agrees",
+        ),
     ];
 
     // The cases the divergence list is about. Kept apart from `CASES`
@@ -1371,6 +1416,7 @@ y
         case("bashpid-is-the-shells-own-in-a-subshell", r#"echo $(( $$ == BASHPID )); ( echo $(( $$ == BASHPID )) )"#),
         case("extglob-cannot-be-turned-off", r#"shopt extglob; shopt -u extglob; shopt -q extglob; echo "q=$?""#),
         case("compgen-b-lists-this-shells-builtins", r#"compgen -b | sort | head -3 | tr '\n' ' '; echo"#),
+        case("regex-submatch-of-an-ambiguous-empty-branch", r#"re='(|a)(a|)'; [[ a =~ $re ]]; echo "[${BASH_REMATCH[1]}][${BASH_REMATCH[2]}]""#),
         // -- roadmap 10: parser leniency, the part still standing -----
         // Also not recordable, and for the same kind of reason: a
         // signal this shell was *started* with ignored is reported by

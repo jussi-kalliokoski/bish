@@ -1,11 +1,10 @@
-// Small backtracking regex engine for `[[ str =~ pattern ]]`. Supports the
-// common ERE subset: literals, `.`, `*`/`+`/`?` (greedy), `^`/`$` anchors,
+// Small regex engine for `[[ str =~ pattern ]]`, and for the editor's
+// `/`, `:s` and `:g`. Supports the common ERE subset: literals, `.`,
+// `*`/`+`/`?` (greedy), `{n,m}` intervals, `^`/`$` anchors,
 // `[...]`/`[^...]` character classes (with `-` ranges), `|` alternation,
 // and `(...)` grouping, including capture extraction for BASH_REMATCH. No
-// external crate -- hand-rolled recursive-descent parser plus
-// continuation-passing backtracking matcher, same spirit as glob.rs.
-
-use std::cell::RefCell;
+// external crate -- hand-rolled recursive-descent parser plus a Pike VM,
+// same spirit as glob.rs.
 
 #[derive(Debug, Clone)]
 enum Re {
@@ -226,52 +225,11 @@ fn parse(pattern: &str) -> (Re, usize) {
     (re, p.group_count)
 }
 
-// One slot per capture group, indexed by group number (0 unused). A slot
-// holds the (start, end) char-index range of that group's last successful
-// match attempt on the path that ultimately succeeds -- backtracking
-// requires each Group arm to restore its old value when a candidate range
-// doesn't pan out, so a still-in-progress alternative doesn't see a stale
-// capture from an abandoned attempt. Shared mutable state threaded through
-// `&dyn Fn` continuations needs interior mutability; there's no way to
-// thread a plain `&mut` through this CPS backtracking shape since multiple
-// closures alias the same state at different points in the search tree.
-// Where each capture group's `(start, end)` char range lands. `None` for
-// a group the winning path never entered.
+// One slot per capture group, indexed by group number (index 0 is the
+// whole match). `None` for a group the winning match never entered --
+// distinct from a group that matched emptily, which every caller that
+// reports captures flattens back to the empty string.
 type CapSlots = Vec<Option<(usize, usize)>>;
-type Captures = RefCell<CapSlots>;
-
-// Everything the matcher carries besides the pattern and the input: the
-// capture slots, whether comparisons fold case, and how much work is
-// left.
-struct MatchCtx {
-    caps: Captures,
-    ignore_case: bool,
-    // This is a backtracking matcher, so a pattern whose alternatives
-    // multiply takes exponential time: `^(a+)+$` against thirty a's and
-    // a `b` explored 2^30 ways to split them and never came back. bash
-    // answers instantly, because its matcher does not backtrack.
-    //
-    // Replacing the engine is the real fix and is its own piece of
-    // work. Until then the search is bounded, and running out is said
-    // out loud rather than reported as "no match" -- a wrong answer
-    // nobody can see is worse than a refusal.
-    //
-    // A million steps is far past any honest pattern: a simple one over
-    // a ten-thousand-character line is a few tens of thousands.
-    budget: std::cell::Cell<u64>,
-}
-
-const MATCH_BUDGET: u64 = 1_000_000;
-
-thread_local! {
-    static GAVE_UP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-/// Whether the last search on this thread ran out of budget rather than
-/// finishing. Only meaningful straight after one.
-pub fn gave_up() -> bool {
-    GAVE_UP.with(|g| g.get())
-}
 
 // The other case(s) of `c`, for a case-insensitive comparison.
 //
@@ -306,97 +264,6 @@ fn in_ranges(ranges: &[(char, char)], c: char) -> bool {
     ranges.iter().any(|&(lo, hi)| c >= lo && c <= hi)
 }
 
-// Continuation-passing backtracking match: `k` says whether the rest of
-// the overall pattern accepts starting at the given position. Needed so
-// `a*a` (etc) can backtrack the star's greedy match when what follows
-// doesn't fit.
-fn match_re(re: &Re, s: &[char], pos: usize, ctx: &MatchCtx, k: &dyn Fn(usize) -> bool) -> bool {
-    // One step per node visited, which is the thing that multiplies.
-    match ctx.budget.get().checked_sub(1) {
-        Some(left) => ctx.budget.set(left),
-        None => {
-            GAVE_UP.with(|g| g.set(true));
-            return false;
-        }
-    }
-    match re {
-        Re::Char(c) => matches!(s.get(pos), Some(&x) if chars_equal(x, *c, ctx.ignore_case)) && k(pos + 1),
-        Re::Any => pos < s.len() && k(pos + 1),
-        // The input character is folded, not the class: folding the
-        // *ranges* would mean flipping their endpoints, which is only
-        // right for a range that stays inside one script's own
-        // alphabet. Testing the input's other cases against the ranges
-        // as written is exact -- `[a-z]` matches `A` because `a` is in
-        // it, and `[A-Z]` matches `a` for the mirror reason.
-        Re::Class(ranges, negated) => match s.get(pos) {
-            Some(&c) => {
-                let hit = in_ranges(ranges, c) || (ctx.ignore_case && case_variants(c).any(|v| in_ranges(ranges, v)));
-                (hit != *negated) && k(pos + 1)
-            }
-            None => false,
-        },
-        Re::Start => pos == 0 && k(pos),
-        Re::End => pos == s.len() && k(pos),
-        Re::Concat(parts) => match_concat(parts, s, pos, ctx, k),
-        Re::Alt(branches) => branches.iter().any(|b| match_re(b, s, pos, ctx, k)),
-        Re::Star(inner) => match_star(inner, s, pos, 0, ctx, k),
-        Re::Repeat(inner, min, max) => match_repeat(inner, s, pos, 0, *min, *max, ctx, k),
-        Re::Plus(inner) => match_re(inner, s, pos, ctx, &|p| match_star(inner, s, p, 0, ctx, k)),
-        Re::Opt(inner) => match_re(inner, s, pos, ctx, k) || k(pos),
-        Re::Group(idx, inner) => {
-            let old = ctx.caps.borrow()[*idx];
-            let result = match_re(inner, s, pos, ctx, &|p| {
-                ctx.caps.borrow_mut()[*idx] = Some((pos, p));
-                if k(p) {
-                    true
-                } else {
-                    ctx.caps.borrow_mut()[*idx] = old;
-                    false
-                }
-            });
-            if !result {
-                ctx.caps.borrow_mut()[*idx] = old;
-            }
-            result
-        }
-    }
-}
-
-fn match_concat(parts: &[Re], s: &[char], pos: usize, ctx: &MatchCtx, k: &dyn Fn(usize) -> bool) -> bool {
-    match parts.split_first() {
-        None => k(pos),
-        Some((head, rest)) => match_re(head, s, pos, ctx, &|p| match_concat(rest, s, p, ctx, k)),
-    }
-}
-
-// Greedy star: try consuming as many as possible first, backtracking down
-// to zero. `depth` is just a runaway-recursion guard for pathological
-// patterns on long inputs.
-/// `{n,m}`, greedily: take as many as the bound allows, then give them
-/// back one at a time.
-///
-/// The `p > pos` guard is what stops an inner expression that can match
-/// nothing (`(a*){3}`) from repeating forever -- but only *above* the
-/// minimum, because reaching the minimum is exactly when a zero-width
-/// repetition has to be allowed. Below it the count itself bounds the
-/// recursion.
-#[allow(clippy::too_many_arguments)]
-fn match_repeat(inner: &Re, s: &[char], pos: usize, done: usize, min: usize, max: Option<usize>, ctx: &MatchCtx, k: &dyn Fn(usize) -> bool) -> bool {
-    if max.is_none_or(|m| done < m)
-        && match_re(inner, s, pos, ctx, &|p| (p > pos || done < min) && match_repeat(inner, s, p, done + 1, min, max, ctx, k))
-    {
-        return true;
-    }
-    done >= min && k(pos)
-}
-
-fn match_star(inner: &Re, s: &[char], pos: usize, depth: usize, ctx: &MatchCtx, k: &dyn Fn(usize) -> bool) -> bool {
-    if depth < s.len() + 1 && match_re(inner, s, pos, ctx, &|p| p > pos && match_star(inner, s, p, depth + 1, ctx, k)) {
-        return true;
-    }
-    k(pos)
-}
-
 // Escapes every character `parse` treats as a metacharacter, so the result
 // -- fed back through `parse` -- matches only the literal input text. Used
 // for `[[ ]]`'s `=~` when the pattern operand was quoted/escaped in the
@@ -413,26 +280,348 @@ pub fn escape(s: &str) -> String {
     out
 }
 
-// Shared by `Regex::match_at` and `match_captures` below: does `re` match
-// starting at exactly `pos` (not scanning forward for the next viable
-// start)? Returns the match's own end position plus its capture slots.
-fn match_at_with_caps(re: &Re, group_count: usize, chars: &[char], pos: usize, ignore_case: bool) -> Option<(usize, CapSlots)> {
-    let ctx = MatchCtx { caps: RefCell::new(vec![None; group_count + 1]), ignore_case, budget: std::cell::Cell::new(MATCH_BUDGET) };
-    let end: std::cell::Cell<Option<usize>> = std::cell::Cell::new(None);
-    let matched = match_re(re, chars, pos, &ctx, &|p| {
-        end.set(Some(p));
-        true
-    });
-    matched.then(|| (end.get().unwrap(), ctx.caps.into_inner()))
+// ---------------------------------------------------------------------
+// The matcher
+// ---------------------------------------------------------------------
+//
+// A Pike VM: the pattern is compiled to a small instruction list, and
+// matching advances a *set* of threads through it one input character
+// at a time. A thread is a program counter and its capture slots;
+// two threads at the same instruction are indistinguishable from that
+// point on, so only one is kept. The live set is therefore never larger
+// than the program, and the whole match is one pass -- O(text x
+// pattern), with no path explored twice.
+//
+// It replaced a backtracker, which is the same shape as the parser and
+// is much the easier thing to write: try a branch, and on failure come
+// back and try the next. The trouble is that failure can be discovered
+// arbitrarily far away, so the branches multiply -- `^(a+)+$` against
+// thirty a's and a `b` explored every one of the 2^30 ways to split
+// them and never came back. In the editor, where this same engine backs
+// `/`, `:s` and `:g`, that is the process gone.
+//
+// The other thing that changed with it is *which* match is found.
+// POSIX wants the longest match at the leftmost position it can start,
+// and a backtracker naturally gives the first one its branch order
+// reaches instead: `(a|ab)` against `abc` matched `a` here and matches
+// `ab` in bash. A thread set has no branch order to prefer -- every
+// alternative is live at once -- so the rule falls out of letting every
+// thread run to the end and keeping the longest. Branch order survives
+// only as a tie-break between matches of the same start and the same
+// length, where all it decides is what the capture groups say -- see
+// `Threads::add` and the one divergence from bash that leaves.
+
+#[derive(Debug, Clone)]
+enum Inst {
+    Char(char),
+    Any,
+    Class(Vec<(char, char)>, bool),
+    AtStart,
+    AtEnd,
+    /// Try `0` first; `1` is the lower-priority alternative.
+    Split(usize, usize),
+    Jmp(usize),
+    /// Record the current position in capture slot `0` -- group `n`
+    /// occupies slots `2n` and `2n + 1`.
+    Save(usize),
+    Match,
 }
 
-/// A compiled pattern, reusable across many searches without reparsing --
-/// for callers (line-editor `/`/`?` search, in particular) that run the
-/// same pattern against many lines rather than matching it once against a
-/// single string the way `match_captures` below does.
-pub struct Regex {
-    re: Re,
+/// An interval's upper bound is expanded into that many copies of the
+/// body, so a large one costs program size. POSIX puts the portable
+/// limit at 255 and this is the same number: past it the pattern is
+/// compiled as though the bound were open, which matches more rather
+/// than refusing outright.
+const MAX_REPEAT_EXPANSION: usize = 255;
+
+// Slots 0 and 1 are the whole match, so the program brackets the
+// pattern with them exactly as a `Group` brackets its own.
+fn compile(re: &Re) -> Vec<Inst> {
+    let mut prog = vec![Inst::Save(0)];
+    emit(re, &mut prog);
+    prog.push(Inst::Save(1));
+    prog.push(Inst::Match);
+    prog
+}
+
+fn emit(re: &Re, prog: &mut Vec<Inst>) {
+    match re {
+        Re::Char(c) => prog.push(Inst::Char(*c)),
+        Re::Any => prog.push(Inst::Any),
+        Re::Class(ranges, negated) => prog.push(Inst::Class(ranges.clone(), *negated)),
+        Re::Start => prog.push(Inst::AtStart),
+        Re::End => prog.push(Inst::AtEnd),
+        Re::Concat(parts) => {
+            for p in parts {
+                emit(p, prog);
+            }
+        }
+        // Each branch jumps past the rest once it is done; the last
+        // needs no jump, and every jump is patched to the end.
+        Re::Alt(branches) => {
+            let mut jumps = Vec::new();
+            for (i, b) in branches.iter().enumerate() {
+                if i + 1 == branches.len() {
+                    emit(b, prog);
+                    break;
+                }
+                let split = prog.len();
+                prog.push(Inst::Jmp(0));
+                emit(b, prog);
+                jumps.push(prog.len());
+                prog.push(Inst::Jmp(0));
+                let next = prog.len();
+                prog[split] = Inst::Split(split + 1, next);
+            }
+            let end = prog.len();
+            for j in jumps {
+                prog[j] = Inst::Jmp(end);
+            }
+        }
+        Re::Star(inner) => {
+            let split = prog.len();
+            prog.push(Inst::Jmp(0));
+            emit(inner, prog);
+            prog.push(Inst::Jmp(split));
+            let end = prog.len();
+            prog[split] = Inst::Split(split + 1, end);
+        }
+        Re::Plus(inner) => {
+            let body = prog.len();
+            emit(inner, prog);
+            let split = prog.len();
+            prog.push(Inst::Jmp(0));
+            let end = prog.len();
+            prog[split] = Inst::Split(body, end);
+        }
+        Re::Opt(inner) => {
+            let split = prog.len();
+            prog.push(Inst::Jmp(0));
+            emit(inner, prog);
+            let end = prog.len();
+            prog[split] = Inst::Split(split + 1, end);
+        }
+        // `{n,m}` is n copies, then m - n optional ones; `{n,}` is n
+        // copies and a star. There is no counting instruction, and
+        // adding one would need a counter per thread -- expansion keeps
+        // a thread a program counter and its captures, which is what
+        // makes the set dedupable at all.
+        Re::Repeat(inner, min, max) => {
+            for _ in 0..*min {
+                emit(inner, prog);
+            }
+            match max {
+                None => emit(&Re::Star(inner.clone()), prog),
+                Some(m) if m - min > MAX_REPEAT_EXPANSION => emit(&Re::Star(inner.clone()), prog),
+                Some(m) => {
+                    let mut splits = Vec::new();
+                    for _ in *min..*m {
+                        splits.push(prog.len());
+                        prog.push(Inst::Jmp(0));
+                        emit(inner, prog);
+                    }
+                    let end = prog.len();
+                    for s in splits {
+                        prog[s] = Inst::Split(s + 1, end);
+                    }
+                }
+            }
+        }
+        Re::Group(idx, inner) => {
+            prog.push(Inst::Save(idx * 2));
+            emit(inner, prog);
+            prog.push(Inst::Save(idx * 2 + 1));
+        }
+    }
+}
+
+/// A thread's captures. Cloned when a thread forks, which is why they
+/// are a plain `Rc`-free vector: the slot count is twice the group
+/// count plus two, and patterns are small.
+type Slots = Vec<Option<usize>>;
+
+/// Two threads at the same instruction are indistinguishable from
+/// there on, so only one survives, and the one that got there first
+/// wins: the epsilon walk below is depth-first in the pattern's own
+/// branch order, so "first" means the branch written first.
+///
+/// That is a tie-break, and it only ever runs after leftmost-longest
+/// has already decided the extent of the match -- it settles nothing
+/// but which spelling of an equally long match the capture groups
+/// report. Bash's own answer there is glibc's, which is not the POSIX
+/// rule (POSIX would hand each subexpression, left to right, the
+/// longest it can take): `(|a)(a|)` against `a` fills the first group
+/// in bash and the second here. See `bashdiff::DIVERGENCES`.
+struct Threads {
+    /// The threads waiting on an input character, in priority order.
+    dense: Vec<(usize, Slots)>,
+    /// Which instructions this walk has already reached, counting the
+    /// ones that consume nothing. That is also what keeps the epsilon
+    /// walk finite over `(a*)*` and friends.
+    on_list: Vec<bool>,
+}
+
+impl Threads {
+    fn new(len: usize) -> Threads {
+        Threads { dense: Vec::new(), on_list: vec![false; len] }
+    }
+
+    fn clear(&mut self) {
+        self.dense.clear();
+        self.on_list.iter_mut().for_each(|f| *f = false);
+    }
+
+    /// Follows every instruction that consumes no input -- jumps,
+    /// splits, saves and the anchors -- and adds the pcs that do.
+    /// Depth-first and in priority order, so the list stays ordered by
+    /// the branch order the pattern was written in.
+    fn add(&mut self, prog: &[Inst], pc: usize, pos: usize, at_end: bool, slots: &Slots) {
+        if self.on_list[pc] {
+            return;
+        }
+        self.on_list[pc] = true;
+        match &prog[pc] {
+            Inst::Jmp(to) => self.add(prog, *to, pos, at_end, slots),
+            Inst::Split(a, b) => {
+                self.add(prog, *a, pos, at_end, slots);
+                self.add(prog, *b, pos, at_end, slots);
+            }
+            Inst::Save(slot) => {
+                let mut next = slots.clone();
+                next[*slot] = Some(pos);
+                self.add(prog, pc + 1, pos, at_end, &next);
+            }
+            Inst::AtStart => {
+                if pos == 0 {
+                    self.add(prog, pc + 1, pos, at_end, slots);
+                }
+            }
+            Inst::AtEnd => {
+                if at_end {
+                    self.add(prog, pc + 1, pos, at_end, slots);
+                }
+            }
+            _ => self.dense.push((pc, slots.clone())),
+        }
+    }
+}
+
+/// A compiled pattern: the instructions, and how many capture groups
+/// their `Save`s refer to.
+struct Program {
+    insts: Vec<Inst>,
     group_count: usize,
+}
+
+impl Program {
+    fn new(re: &Re, group_count: usize) -> Program {
+        Program { insts: compile(re), group_count }
+    }
+}
+
+/// Runs the program over `chars` from `from`, returning the match as
+/// `(start, end, slots)`.
+///
+/// `anchored` says whether the match must begin at `from` exactly.
+/// Unanchored, the search is still one pass: a fresh thread is started
+/// at every position until something matches, so the whole set of
+/// candidate starts advances together rather than the pattern being
+/// re-run from each one in turn. That is the difference between
+/// O(text x pattern) and O(text^2 x pattern), and on a 2000-character
+/// line the editor feels it.
+///
+/// Which match wins is POSIX's rule, leftmost-longest: an earlier start
+/// always beats a later one, and among matches sharing a start the
+/// longest wins. So a thread reaching `Match` does not end the search;
+/// it records a candidate, and the rest keep running. Equal starts and
+/// equal lengths keep the earlier thread -- the one the pattern's own
+/// branch order reached first -- and that is what settles the capture
+/// slots.
+fn run(prog: &Program, chars: &[char], from: usize, anchored: bool, ignore_case: bool) -> Option<(usize, usize, CapSlots)> {
+    let insts = &prog.insts;
+    let empty: Slots = vec![None; (prog.group_count + 1) * 2];
+    let mut clist = Threads::new(insts.len());
+    let mut nlist = Threads::new(insts.len());
+    let mut best: Option<(usize, usize, Slots)> = None;
+
+    let mut at = from;
+    loop {
+        // A new start goes in behind the threads already running, which
+        // is what makes an earlier start outrank it. Once anything has
+        // matched, no later start could win, so none is added.
+        if best.is_none() && (!anchored || at == from) {
+            clist.add(insts, 0, at, at == chars.len(), &empty);
+        }
+        for (pc, slots) in &clist.dense {
+            if matches!(insts[*pc], Inst::Match) {
+                let (start, end) = (slots[0].unwrap_or(from), slots[1].unwrap_or(at));
+                if best.as_ref().is_none_or(|(bs, be, _)| start < *bs || (start == *bs && end > *be)) {
+                    best = Some((start, end, slots.clone()));
+                }
+            }
+        }
+        if at >= chars.len() {
+            break;
+        }
+        let c = chars[at];
+        nlist.clear();
+        for (pc, slots) in &clist.dense {
+            // A thread that began after the best match so far can only
+            // lose; carrying it costs the rest of the line.
+            if best.as_ref().is_some_and(|(bs, _, _)| slots[0].is_some_and(|s| s > *bs)) {
+                continue;
+            }
+            let consumes = match &insts[*pc] {
+                Inst::Char(x) => chars_equal(c, *x, ignore_case),
+                Inst::Any => true,
+                // The input character is folded, not the class: folding
+                // the *ranges* would mean flipping their endpoints,
+                // which is only right for a range that stays inside one
+                // script's own alphabet. Testing the input's other
+                // cases against the ranges as written is exact --
+                // `[a-z]` matches `A` because `a` is in it, and `[A-Z]`
+                // matches `a` for the mirror reason.
+                Inst::Class(ranges, negated) => {
+                    let hit = in_ranges(ranges, c) || (ignore_case && case_variants(c).any(|v| in_ranges(ranges, v)));
+                    hit != *negated
+                }
+                _ => false,
+            };
+            if consumes {
+                nlist.add(insts, pc + 1, at + 1, at + 1 == chars.len(), slots);
+            }
+        }
+        std::mem::swap(&mut clist, &mut nlist);
+        at += 1;
+    }
+
+    let (start, end, slots) = best?;
+    let caps = (0..=prog.group_count)
+        .map(|g| match (slots[g * 2], slots[g * 2 + 1]) {
+            (Some(s), Some(e)) => Some((s, e)),
+            _ => None,
+        })
+        .collect();
+    Some((start, end, caps))
+}
+
+// A group the winning match never entered is reported as the empty
+// string rather than as absent -- BASH_REMATCH's own shape, which the
+// editor's `:s` backreferences follow.
+fn capture_texts(chars: &[char], start: usize, end: usize, caps: CapSlots) -> Vec<String> {
+    let mut out = Vec::with_capacity(caps.len());
+    out.push(chars[start..end].iter().collect());
+    for slot in caps.into_iter().skip(1) {
+        out.push(match slot {
+            Some((s, e)) => chars[s..e].iter().collect(),
+            None => String::new(),
+        });
+    }
+    out
+}
+
+pub struct Regex {
+    prog: Program,
     ignore_case: bool,
 }
 
@@ -449,7 +638,7 @@ impl Regex {
     /// same buffer by a different route, did not.
     pub fn compile(pattern: &str, ignore_case: bool) -> Regex {
         let (re, group_count) = parse(pattern);
-        Regex { re, group_count, ignore_case }
+        Regex { prog: Program::new(&re, group_count), ignore_case }
     }
 
     /// Does this pattern match starting at exactly `pos`? Returns the
@@ -459,15 +648,14 @@ impl Regex {
     /// start it cares about (e.g. scanning backward one position at a
     /// time) wants this instead.
     pub fn match_at(&self, chars: &[char], pos: usize) -> Option<usize> {
-        match_at_with_caps(&self.re, self.group_count, chars, pos, self.ignore_case).map(|(end, _)| end)
+        run(&self.prog, chars, pos, true, self.ignore_case).map(|(_, end, _)| end)
     }
 
     /// Leftmost match starting at or after `from` (char index into
     /// `chars`), ERE-style. `None` if nothing matches anywhere in
     /// `chars[from..]`.
     pub fn find_at(&self, chars: &[char], from: usize) -> Option<(usize, usize)> {
-        GAVE_UP.with(|g| g.set(false));
-        (from..=chars.len()).find_map(|start| self.match_at(chars, start).map(|end| (start, end)))
+        run(&self.prog, chars, from, false, self.ignore_case).map(|(start, end, _)| (start, end))
     }
 
     /// Same search as `find_at`, but also returns captures in
@@ -477,21 +665,8 @@ impl Regex {
     /// substitution loop, repl.rs) that needs backreferences/`&` in a
     /// replacement rather than just knowing a match happened.
     pub fn find_at_with_captures(&self, chars: &[char], from: usize) -> Option<(usize, usize, Vec<String>)> {
-        GAVE_UP.with(|g| g.set(false));
-        for start in from..=chars.len() {
-            if let Some((end, caps)) = match_at_with_caps(&self.re, self.group_count, chars, start, self.ignore_case) {
-                let mut out = Vec::with_capacity(self.group_count + 1);
-                out.push(chars[start..end].iter().collect());
-                for slot in caps.into_iter().skip(1) {
-                    out.push(match slot {
-                        Some((s0, e0)) => chars[s0..e0].iter().collect(),
-                        None => String::new(),
-                    });
-                }
-                return Some((start, end, out));
-            }
-        }
-        None
+        let (start, end, caps) = run(&self.prog, chars, from, false, self.ignore_case)?;
+        Some((start, end, capture_texts(chars, start, end, caps)))
     }
 }
 
@@ -505,23 +680,11 @@ impl Regex {
 /// the caller -- that option was registered with nothing to act on until
 /// this engine could fold case at all.
 pub fn match_captures(text: &str, pattern: &str, ignore_case: bool) -> Option<Vec<String>> {
-    GAVE_UP.with(|g| g.set(false));
     let (re, group_count) = parse(pattern);
+    let prog = Program::new(&re, group_count);
     let chars: Vec<char> = text.chars().collect();
-    for start in 0..=chars.len() {
-        if let Some((end, caps)) = match_at_with_caps(&re, group_count, &chars, start, ignore_case) {
-            let mut out = Vec::with_capacity(group_count + 1);
-            out.push(chars[start..end].iter().collect());
-            for slot in caps.into_iter().skip(1) {
-                out.push(match slot {
-                    Some((s0, e0)) => chars[s0..e0].iter().collect(),
-                    None => String::new(),
-                });
-            }
-            return Some(out);
-        }
-    }
-    None
+    let (start, end, caps) = run(&prog, &chars, 0, false, ignore_case)?;
+    Some(capture_texts(&chars, start, end, caps))
 }
 
 #[cfg(test)]
@@ -625,5 +788,64 @@ mod tests {
         let re = Regex::compile("(a)|(b)", false);
         let (_, _, caps) = re.find_at_with_captures(&chars("b"), 0).unwrap();
         assert_eq!(caps, vec!["b".to_string(), String::new(), "b".to_string()]);
+    }
+    // The pattern every backtracker dies on: thirty ways to split each
+    // run of a's, and a `b` at the end so none of them works. The old
+    // engine explored 2^30 of them; a thread set has one state per
+    // instruction and cannot.
+    #[test]
+    fn a_pattern_that_used_to_take_forever_finishes() {
+        let text: String = std::iter::repeat_n('a', 2000).collect();
+        let re = Regex::compile("^(a+)+$", false);
+        assert!(re.find_at(&chars(&text), 0).is_some());
+        assert!(re.find_at(&chars(&(text + "b")), 0).is_none());
+    }
+
+    // POSIX picks the longest match at the leftmost start, not the
+    // first one the pattern's branch order reaches. `(a|ab)` against
+    // `abc` is the discriminator: a backtracker says `a`, bash and this
+    // say `ab`.
+    #[test]
+    fn the_longest_match_wins_at_the_leftmost_start() {
+        fn whole(pattern: &str, text: &str) -> String {
+            match_captures(text, pattern, false).unwrap().remove(0)
+        }
+        assert_eq!(whole("(a|ab)", "abc"), "ab");
+        assert_eq!(whole("x|xy", "xy"), "xy");
+        assert_eq!(whole("(|a)", "abc"), "a");
+        assert_eq!(whole("ab|abc", "abc"), "abc");
+        // Leftmost still outranks longest: the shorter match starts first.
+        assert_eq!(match_captures("xabc", "b|abc", false), Some(vec!["abc".to_string()]));
+        assert_eq!(whole("a|bcd", "abcd"), "a");
+    }
+
+    // Ties in length keep the earlier branch, which is what decides
+    // where the capture groups land when both spellings match the same
+    // text.
+    #[test]
+    fn branch_order_settles_the_captures_of_equally_long_matches() {
+        assert_eq!(match_captures("ab", "(ab)|(ab)", false), Some(vec!["ab".into(), "ab".into(), String::new()]));
+        assert_eq!(match_captures("aaa", "(a*)(a*)", false), Some(vec!["aaa".into(), "aaa".into(), String::new()]));
+    }
+
+    #[test]
+    fn an_interval_repeats_its_body_that_many_times() {
+        assert!(!m("a{2}", "a", false));
+        assert!(m("a{2}", "aa", false));
+        assert!(m("a{2,}", "aaaa", false));
+        assert_eq!(match_captures("aaaa", "a{2,3}", false), Some(vec!["aaa".to_string()]));
+        // Past the expansion limit the bound is treated as open, which
+        // matches more rather than refusing.
+        assert!(m(&format!("a{{1,{}}}", MAX_REPEAT_EXPANSION + 10), "aaa", false));
+    }
+
+    // An unanchored search advances every candidate start together
+    // rather than restarting the pattern at each one, so a long line
+    // costs one pass and not one per character.
+    #[test]
+    fn a_search_that_fails_over_a_long_line_stays_linear() {
+        let text: String = std::iter::repeat_n('a', 20_000).collect();
+        let re = Regex::compile("(a|aa)*b", false);
+        assert!(re.find_at(&chars(&text), 0).is_none());
     }
 }
