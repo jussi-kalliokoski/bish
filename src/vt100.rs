@@ -40,11 +40,24 @@ pub struct Cell {
     pub fg: Color,
     pub bg: Color,
     pub attrs: CellAttrs,
+    /// The right half of the double-width character in the cell before
+    /// this one. It holds no character of its own: a terminal drawing
+    /// the wide char has already covered this column, so anything
+    /// reading the grid as text skips it and anything writing the grid
+    /// to a terminal emits nothing for it.
+    ///
+    /// A grid where one cell is one column and one character is one
+    /// cell cannot say "this character is two columns wide" any other
+    /// way, and it has to be able to: a pane border drawn at column 40
+    /// is at column 40 whatever is to the left of it, and CJK text that
+    /// counted itself one column per character put the border somewhere
+    /// else.
+    pub continuation: bool,
 }
 
 impl Default for Cell {
     fn default() -> Cell {
-        Cell { ch: ' ', fg: Color::Default, bg: Color::Default, attrs: CellAttrs::default() }
+        Cell { ch: ' ', fg: Color::Default, bg: Color::Default, attrs: CellAttrs::default(), continuation: false }
     }
 }
 
@@ -577,6 +590,18 @@ impl Screen {
         (self.grid().rows, self.grid().cols)
     }
 
+    /// One row of the grid as text, with the second column of every
+    /// double-width character left out.
+    ///
+    /// That column is not a space in the row -- it is the rest of the
+    /// character before it, and putting a space there would make a line
+    /// of CJK text come back with a space between every pair of
+    /// characters. Every reader of the grid that wants *text* wants
+    /// this; a reader that wants columns still walks `cell`.
+    pub fn row_text(&self, row: usize) -> String {
+        (0..self.grid().cols).filter(|&col| !self.cell(row, col).continuation).map(|col| self.cell(row, col).ch).collect()
+    }
+
     fn grid(&self) -> &Grid {
         if self.using_alternate { &self.alternate } else { &self.primary }
     }
@@ -604,10 +629,10 @@ impl Screen {
     /// Trailing blanks go, on each line and at the end, for the same
     /// reason: they are the shape of the grid, not of the output.
     pub fn text_unwrapped(&self) -> String {
-        let (rows, cols) = self.size();
+        let (rows, _cols) = self.size();
         let mut lines: Vec<String> = Vec::new();
         for row in 0..rows {
-            let text: String = (0..cols).map(|col| self.cell(row, col).ch).collect();
+            let text: String = self.row_text(row);
             match lines.last_mut() {
                 // The *previous* row said it ran out of width, so this
                 // row is the rest of that same line.
@@ -743,18 +768,68 @@ impl Screen {
             self.carriage_return();
             self.grid_mut().pending_wrap = false;
         }
+        // Two columns for a CJK ideograph, a Hangul syllable, a
+        // fullwidth form or most emoji -- the same table the editor
+        // measures its own lines with, so a pane and a buffer showing
+        // the same text agree about how wide it is.
+        let width = crate::bishedit::unicode_width::char_width(ch).max(1);
+        // A character that is two columns wide is not split across a
+        // line break: with one column left, the whole of it goes to the
+        // next line, which is what every terminal does with one.
+        // Without autowrap there is no next line to put it on, so the
+        // column is left as it was rather than filled with half a
+        // character.
+        let (row, col) = (self.grid().cursor_row, self.grid().cursor_col);
+        if width == 2 && col + 2 > cols {
+            if !self.autowrap {
+                return;
+            }
+            self.grid_mut().set_wrapped(row, true);
+            self.line_feed_no_scroll_check();
+            self.carriage_return();
+        }
         let (row, col) = (self.grid().cursor_row, self.grid().cursor_col);
         let fg = self.cur_fg;
         let bg = self.cur_bg;
         let attrs = self.cur_attrs;
-        *self.grid_mut().cell_mut(row, col) = Cell { ch, fg, bg, attrs };
+        // Whatever was here, its other half is now orphaned: a cell
+        // written over by something narrower leaves a wide character
+        // with one column, which draws over its neighbour. Blanking the
+        // other half is how the grid stays a grid.
+        self.split_wide_at(row, col);
+        if width == 2 {
+            self.split_wide_at(row, col + 1);
+        }
+        *self.grid_mut().cell_mut(row, col) = Cell { ch, fg, bg, attrs, continuation: false };
+        if width == 2 {
+            *self.grid_mut().cell_mut(row, col + 1) = Cell { ch: ' ', fg, bg, attrs, continuation: true };
+        }
 
-        if col + 1 >= cols {
+        if col + width >= cols {
             if self.autowrap {
                 self.grid_mut().pending_wrap = true;
             }
         } else {
-            self.grid_mut().cursor_col = col + 1;
+            self.grid_mut().cursor_col = col + width;
+        }
+    }
+
+    /// Blanks whichever half of a double-width character (row, col) is,
+    /// so what is left of it is never a lone half. Does nothing to an
+    /// ordinary cell, which is every cell in text that has no wide
+    /// characters in it.
+    fn split_wide_at(&mut self, row: usize, col: usize) {
+        let cols = self.grid().cols;
+        if col >= cols {
+            return;
+        }
+        if self.grid().cell(row, col).continuation && col > 0 {
+            let blank = Cell { continuation: false, ..self.grid().cell(row, col - 1) };
+            *self.grid_mut().cell_mut(row, col - 1) = Cell { ch: ' ', ..blank };
+        }
+        if col + 1 < cols && self.grid().cell(row, col + 1).continuation {
+            let keep = self.grid().cell(row, col + 1);
+            *self.grid_mut().cell_mut(row, col + 1) = Cell { ch: ' ', continuation: false, ..keep };
         }
     }
 
@@ -1197,7 +1272,7 @@ mod tests {
     use super::*;
 
     fn text_row(s: &Screen, row: usize) -> String {
-        (0..s.grid().cols).map(|c| s.cell(row, c).ch).collect::<String>().trim_end().to_string()
+        s.row_text(row).trim_end().to_string()
     }
 
     #[test]
@@ -1443,6 +1518,73 @@ mod tests {
         s.feed(b"\x1b[?1049l");
         assert!(!s.using_alternate);
         assert_eq!(text_row(&s, 0), "primary");
+    }
+
+    // -- double-width characters ---------------------------------------
+    //
+    // The grid used to give every character one column, so a line of
+    // CJK text was half as wide here as on the terminal drawing it --
+    // and a pane border, which is at the column it is at, ended up
+    // somewhere else entirely.
+    #[test]
+    fn a_wide_character_takes_two_columns() {
+        let mut s = Screen::new(1, 10);
+        s.feed("漢字".as_bytes());
+        assert_eq!(s.cell(0, 0).ch, '漢');
+        assert!(s.cell(0, 1).continuation, "the second column belongs to the character in the first");
+        assert_eq!(s.cell(0, 2).ch, '字');
+        assert!(s.cell(0, 3).continuation);
+        assert_eq!(s.cursor(), (0, 4), "two characters, four columns");
+    }
+
+    // The text is what was printed, not one space per column: a grid
+    // read back character by character would put a space between every
+    // pair of CJK characters.
+    #[test]
+    fn a_wide_character_reads_back_as_itself() {
+        let mut s = Screen::new(1, 10);
+        s.feed("漢字ab".as_bytes());
+        assert_eq!(text_row(&s, 0), "漢字ab");
+    }
+
+    #[test]
+    fn a_wide_character_is_not_split_across_a_wrap() {
+        let mut s = Screen::new(2, 2);
+        s.feed("a漢".as_bytes());
+        assert_eq!(text_row(&s, 0), "a", "one column left is not enough, so the whole of it moves");
+        assert_eq!(text_row(&s, 1), "漢");
+    }
+
+    #[test]
+    fn writing_over_half_a_wide_character_takes_the_other_half_with_it() {
+        let mut s = Screen::new(1, 10);
+        s.feed("漢字".as_bytes());
+        // Back to the second column -- the right half of `漢` -- and
+        // write an ordinary character there.
+        s.feed(b"\x1b[1;2H");
+        s.feed(b"x");
+        assert_eq!(text_row(&s, 0), " x字", "what is left of the wide character is a space, not half a glyph");
+        assert!(!s.cell(0, 1).continuation);
+    }
+
+    #[test]
+    fn writing_over_the_left_half_clears_the_right_one() {
+        let mut s = Screen::new(1, 10);
+        s.feed("漢字".as_bytes());
+        s.feed(b"\x1b[1;1H");
+        s.feed(b"x");
+        assert_eq!(text_row(&s, 0), "x 字");
+    }
+
+    // Combining marks are a separate gap and stay one: the grid holds
+    // one `char` per cell, so a mark has nowhere to live but a cell of
+    // its own. Asserted so the day a cell can hold a cluster, this test
+    // is what says so.
+    #[test]
+    fn a_zero_width_mark_still_takes_a_cell_of_its_own() {
+        let mut s = Screen::new(1, 10);
+        s.feed("e\u{301}x".as_bytes());
+        assert_eq!(s.cursor(), (0, 3));
     }
 
     #[test]

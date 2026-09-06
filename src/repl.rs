@@ -4772,10 +4772,20 @@ impl TerminalFrame {
             let screen = pane.screen.borrow();
             let (screen_rows, screen_cols) = screen.size();
             for r in 0..pane.rect.rows.min(screen_rows) {
-                for c in 0..pane.rect.cols.min(screen_cols) {
+                let last = pane.rect.cols.min(screen_cols);
+                for c in 0..last {
                     let (row, col) = (pane.rect.row + r, pane.rect.col + c);
                     if row < rows && col < cols {
-                        cells[row * cols + col] = screen.cell(r, c);
+                        // A wide character whose second half falls
+                        // outside this pane is drawn as a space: half
+                        // of it would still be two columns on the
+                        // terminal, and the column it took would be the
+                        // neighbouring pane's.
+                        let clipped = c + 1 == last && c + 1 < screen_cols && screen.cell(r, c + 1).continuation;
+                        cells[row * cols + col] = match clipped {
+                            true => vt100::Cell { ch: ' ', continuation: false, ..screen.cell(r, c) },
+                            false => screen.cell(r, c),
+                        };
                     }
                 }
             }
@@ -4883,6 +4893,11 @@ fn diff_frames(prev: &TerminalFrame, new: &TerminalFrame, term_rows: usize, term
             let mut last_style: Option<(vt100::Color, vt100::Color, vt100::CellAttrs)> = None;
             for c in run_start..col {
                 let cell = new.cells[row * term_cols + c];
+                // See render_row: the second half of a wide character
+                // is a column the terminal already covered.
+                if cell.continuation {
+                    continue;
+                }
                 let key = (cell.fg, cell.bg, cell.attrs);
                 if last_style != Some(key) {
                     out.push_str(&vt100::sgr_codes(cell.fg, cell.bg, cell.attrs));
@@ -5124,10 +5139,10 @@ fn prompt_claims_mouse(mouse_bishopt: bool, sinks_are_grid: bool) -> bool {
 fn focused_pane_text(app: &App) -> String {
     let sid = app.windows[app.current_window].owning_session();
     let screen = app.sessions[&sid].screen.borrow();
-    let (rows, cols) = screen.size();
+    let (rows, _cols) = screen.size();
     let mut lines: Vec<String> = (0..rows)
         .map(|row| {
-            let mut line: String = (0..cols).map(|col| screen.cell(row, col).ch).collect();
+            let mut line: String = screen.row_text(row);
             while line.ends_with(' ') {
                 line.pop();
             }
@@ -5143,8 +5158,22 @@ fn focused_pane_text(app: &App) -> String {
 
 fn render_row(out: &mut String, screen: &vt100::Screen, row: usize, cols: usize) {
     let mut last: Option<(vt100::Color, vt100::Color, vt100::CellAttrs)> = None;
+    let (_, screen_cols) = screen.size();
     for c in 0..cols {
-        let cell = screen.cell(row, c);
+        let mut cell = screen.cell(row, c);
+        // Nothing is written for the second half of a wide character:
+        // the terminal moved two columns when it drew the first half,
+        // so writing anything here would push the rest of the row one
+        // column to the right.
+        if cell.continuation {
+            continue;
+        }
+        // ...and a wide character whose second half is past the edge of
+        // what is being drawn is written as a space, for the same
+        // reason: what it draws over is not this pane's column.
+        if c + 1 == cols && c + 1 < screen_cols && screen.cell(row, c + 1).continuation {
+            cell.ch = ' ';
+        }
         let key = (cell.fg, cell.bg, cell.attrs);
         if last != Some(key) {
             out.push_str(&vt100::sgr_codes(cell.fg, cell.bg, cell.attrs));
@@ -5321,6 +5350,14 @@ impl ScreenBuffer {
         if line < sb_len { s.scrollback[line].len() } else { s.size().1 }
     }
 
+    // Addressed by *column*, not by character: moving right across a
+    // double-width character lands on its second column, which reads
+    // back as a space. That is what the column holds -- the cursor can
+    // be there and a rectangular selection can cut there -- but it does
+    // mean a search across a pane's own scrollback sees `漢 字` where
+    // the pane shows `漢字`. Fixing that means addressing this view by
+    // character while the grid underneath stays columns, which is a
+    // different piece of work than making the columns right.
     fn raw_char_at(&self, line: usize, col: usize) -> Option<char> {
         let s = self.screen.borrow();
         let sb_len = addressable_scrollback_len(&s);
@@ -5715,6 +5752,9 @@ fn render_normal_mode_row(out: &mut String, buf: &ScreenBuffer, line: usize, col
             let (rows, scols) = s.size();
             if row < rows && c < scols { s.cell(row, c) } else { vt100::Cell::default() }
         };
+        if cell.continuation {
+            continue;
+        }
         if search_matches.iter().any(|&(start, end)| c >= start && c < end) {
             cell.attrs.reverse = true;
         }
@@ -14142,10 +14182,10 @@ mod capture_text_tests {
     // focused_pane_text needs a whole App to find the focused pane; its
     // interesting half is turning one grid into text, which this is.
     fn text_of(screen: &vt100::Screen) -> String {
-        let (rows, cols) = screen.size();
+        let (rows, _cols) = screen.size();
         let mut lines: Vec<String> = (0..rows)
             .map(|row| {
-                let mut line: String = (0..cols).map(|col| screen.cell(row, col).ch).collect();
+                let mut line: String = screen.row_text(row);
                 while line.ends_with(' ') {
                     line.pop();
                 }
