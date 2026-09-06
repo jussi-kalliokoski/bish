@@ -76,8 +76,24 @@ pub fn test(args: &[String], use_glob: bool, facts: &ShellFacts<'_>) -> Result<i
 }
 
 fn eval_test_expr(args: &[String], use_glob: bool, facts: &ShellFacts<'_>) -> Result<bool, String> {
-    // Split on top-level -a/-o (no parens support). Not strictly
-    // POSIX-precedence-correct, but covers real-world usage.
+    // Five or more words go through the real grammar, which is where
+    // `\( ... \)` lives -- the only way POSIX `test` has of grouping,
+    // and `[ \( 1 -eq 1 \) -a \( 2 -eq 2 \) ]` used to be "too many
+    // arguments" here. Fewer than five keep the shortcuts below,
+    // deliberately and for the same reason bash does: at those lengths
+    // an operator is whatever position says it is, so `[ "(" = "(" ]`
+    // compares two strings rather than opening a group that never
+    // closes.
+    if args.len() >= 5 {
+        let mut p = TestParser { args, at: 0, use_glob, facts };
+        let value = p.or()?;
+        if p.at != args.len() {
+            return Err("too many arguments".to_string());
+        }
+        return Ok(value);
+    }
+    // Split on top-level -a/-o. Not strictly POSIX-precedence-correct,
+    // but covers real-world usage at these lengths.
     let mut clauses: Vec<Vec<String>> = vec![Vec::new()];
     let mut combinators: Vec<&str> = Vec::new();
     for a in args {
@@ -105,6 +121,85 @@ fn eval_test_expr(args: &[String], use_glob: bool, facts: &ShellFacts<'_>) -> Re
     Ok(result)
 }
 
+/// POSIX `test`'s own grammar, for the expressions long enough to need
+/// it: `-o` joins `-a`s, `-a` joins negations, `!` negates a primary,
+/// and a primary is either a parenthesised expression or one of the
+/// one-, two- and three-word tests `eval_simple` already knows.
+///
+/// Only reached at five words or more (see `eval_test_expr`), which is
+/// what keeps `[ "(" = "(" ]` and friends reading as the string
+/// comparisons they are.
+struct TestParser<'a> {
+    args: &'a [String],
+    at: usize,
+    use_glob: bool,
+    facts: &'a ShellFacts<'a>,
+}
+
+impl TestParser<'_> {
+    fn peek(&self) -> Option<&str> {
+        self.args.get(self.at).map(String::as_str)
+    }
+
+    fn or(&mut self) -> Result<bool, String> {
+        let mut value = self.and()?;
+        while self.peek() == Some("-o") {
+            self.at += 1;
+            // Both sides are evaluated: `test` has no short-circuit to
+            // preserve, and a right-hand side with a bad integer in it
+            // is an error whichever way the left side went.
+            let rhs = self.and()?;
+            value = value || rhs;
+        }
+        Ok(value)
+    }
+
+    fn and(&mut self) -> Result<bool, String> {
+        let mut value = self.not()?;
+        while self.peek() == Some("-a") {
+            self.at += 1;
+            let rhs = self.not()?;
+            value = value && rhs;
+        }
+        Ok(value)
+    }
+
+    fn not(&mut self) -> Result<bool, String> {
+        if self.peek() == Some("!") {
+            self.at += 1;
+            return Ok(!self.not()?);
+        }
+        self.primary()
+    }
+
+    fn primary(&mut self) -> Result<bool, String> {
+        if self.peek() == Some("(") {
+            self.at += 1;
+            let value = self.or()?;
+            if self.peek() != Some(")") {
+                return Err(format!("`)' expected, found {}", self.peek().unwrap_or("end of expression")));
+            }
+            self.at += 1;
+            return Ok(value);
+        }
+        // How wide a primary is comes from *recognising* the operator,
+        // not from looking ahead for the next connective. Greedily
+        // taking three words wherever they fit read `[ -o errexit -o
+        // -o xtrace ]` as a binary comparison whose operator was
+        // `errexit`, and answered true for two options that were both
+        // off.
+        let rest = &self.args[self.at..];
+        let width = match rest {
+            [_, op, ..] if is_binary_op(op) => 3,
+            [op, _, ..] if is_unary_op(op) => 2,
+            [_, ..] => 1,
+            [] => return Err("argument expected".to_string()),
+        };
+        self.at += width;
+        eval_simple(&rest[..width], self.use_glob, self.facts)
+    }
+}
+
 fn eval_simple(args: &[String], use_glob: bool, facts: &ShellFacts<'_>) -> Result<bool, String> {
     if args.first().map(|s| s.as_str()) == Some("!") {
         return Ok(!eval_simple(&args[1..], use_glob, facts)?);
@@ -114,14 +209,30 @@ fn eval_simple(args: &[String], use_glob: bool, facts: &ShellFacts<'_>) -> Resul
         [s] => Ok(!s.is_empty()),
         [op, a] if op == "-v" => Ok(facts.var_is_set.get(a).copied().unwrap_or(false)),
         [op, a] if op == "-o" => Ok(facts.option_on.get(a).copied().unwrap_or(false)),
+        [op, _] if !is_unary_op(op) => Err(format!("{op}: unary operator expected")),
         [op, a] => Ok(unary(op, a)),
+        // A binary operator wins over grouping, which is what keeps
+        // `[ "(" = ")" ]` a string comparison. Only when the middle
+        // word is not one does `( x )` mean the one-word test of `x`.
+        [a, op, b] if !is_binary_op(op) && a == "(" && b == ")" => eval_simple(&args[1..2], use_glob, facts),
         [a, op, b] => binary_checked(a, op, b, use_glob),
+        // Four words, opened and closed: the two in the middle, as
+        // their own test. (`! <three words>` is already handled above.)
+        [open, _, _, close] if open == "(" && close == ")" => eval_simple(&args[1..3], use_glob, facts),
         // Four or more words is no form of `test` there is. Reading it
         // as "non-empty, so true" is how `[ "$a" = "$b" = "$c" ]`, and
         // an unquoted variable that turned into two words, both passed
         // silently.
         _ => Err("too many arguments".to_string()),
     }
+}
+
+/// Whether a word is an operator that takes something on both sides.
+///
+/// Only used to tell `[ ( x ) ]` from `[ "(" = ")" ]`, where the same
+/// three words mean different things depending on the middle one.
+fn is_binary_op(op: &str) -> bool {
+    matches!(op, "=" | "==" | "!=" | "<" | ">" | "-eq" | "-ne" | "-lt" | "-le" | "-gt" | "-ge" | "-nt" | "-ot" | "-ef")
 }
 
 // `binary`, but reporting the one error it can have: a numeric
@@ -137,6 +248,20 @@ fn binary_checked(a: &str, op: &str, b: &str, use_glob: bool) -> Result<bool, St
         }
     }
     Ok(binary(a, op, b, use_glob))
+}
+
+/// The operators `unary` below actually answers for, kept next to it so
+/// the two cannot drift apart.
+///
+/// Recognition is separate from evaluation because `test` distinguishes
+/// them: an operator it does not know is an *error*, not a false. `[ x
+/// y ]` is "x: unary operator expected" with status 2 in bash, where
+/// bish used to answer 1 -- which is the reading that lets a typo'd
+/// `-q` pass for a failed test forever.
+const UNARY_OPS: &[&str] = &["-e", "-f", "-d", "-r", "-w", "-x", "-z", "-n", "-s", "-L", "-h", "-p", "-S", "-b", "-c", "-v", "-o"];
+
+pub(crate) fn is_unary_op(op: &str) -> bool {
+    UNARY_OPS.contains(&op)
 }
 
 pub(crate) fn unary(op: &str, a: &str) -> bool {

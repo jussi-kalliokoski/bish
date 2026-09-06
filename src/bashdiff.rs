@@ -159,6 +159,24 @@ mod tests {
         // `&` does not end the line the way `;` does.
         case("declare-f-background-continues-the-line", r#"f() { echo a & ! true; echo b & echo c & }; declare -f f"#),
         case("declare-f-a-function-level-redirect", r#"f() { echo a; } 2>/dev/null; declare -f f"#),
+        // POSIX `test` groups with `\( ... \)` and has no other way
+        // to; bish called it "too many arguments". And an operator it
+        // did not recognise answered *false* rather than erroring,
+        // which is the reading that lets a typo'd `-q` pass for a
+        // failed test forever.
+        case("test-groups-with-parentheses", r#"[ \( 1 -eq 1 \) -a \( 2 -eq 2 \) ] && echo y"#),
+        case("test-groups-with-or", r#"[ \( 1 -eq 2 \) -o \( 2 -eq 2 \) ] && echo y"#),
+        case("test-a-negated-group", r#"[ ! \( 1 -eq 1 -o 2 -eq 2 \) ]; echo rc=$?"#),
+        case("test-nested-groups", r#"[ \( \( 1 -eq 1 \) -a 1 \) -o 0 ] && echo y"#),
+        case("test-a-group-of-one-word", r#"[ \( x \) ] && echo y; [ ! \( x \) ]; echo rc=$?"#),
+        // Three words where the middle one is an operator are a
+        // comparison, not a group -- which is what keeps a literal
+        // parenthesis comparable.
+        case("test-a-parenthesis-is-still-a-string", r#"[ "(" = "(" ] && echo y; [ "(" = ")" ]; echo rc=$?"#),
+        case("test-an-unknown-operator-is-an-error", r#"[ x y ]; echo rc=$?"#),
+        case("test-an-unknown-dash-operator-is-an-error", r#"[ -q x ]; echo rc=$?"#),
+        case("test-unary-o-is-not-a-connective", r#"[ -o errexit -o -o xtrace ]; echo rc=$?"#),
+        case("test-file-tests-in-a-group", r#"touch g; [ \( -e g -a -f g \) -o -d g ] && echo y"#),
         // A `#` inside a word is a character, not the start of a
         // comment -- there is no position inside a word where one could
         // begin. Everything from a leading `#` used to vanish.
