@@ -206,6 +206,11 @@ pub struct RawGuard {
 /// driving it can tell that the program on the slave has taken the
 /// terminal -- which the vimdiff harness needs before it types
 /// anything (see its handshake).
+///
+/// That harness is its only caller, and it is a test, so this is one
+/// too: a release build was otherwise warning about dead code that is
+/// not dead, it just is not part of the shell.
+#[cfg(test)]
 pub(crate) fn is_raw(fd: i32) -> bool {
     let mut current: Termios = unsafe { std::mem::zeroed() };
     if unsafe { tcgetattr(fd, &mut current) } != 0 {
