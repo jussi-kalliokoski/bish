@@ -7664,7 +7664,7 @@ impl Shell {
                     sh_eprintln!(self, "bish: return: can only `return' from a function or sourced script");
                     return ExecResult::Status(2);
                 }
-                return ExecResult::Return(code);
+                return ExecResult::Return(exit_status_byte(code));
             }
             "shift" => {
                 if argv.len() > 2 {
@@ -7885,7 +7885,7 @@ impl Shell {
                     None => self.last_status,
                 };
                 self.run_exit_trap();
-                return ExecResult::Exit(code);
+                return ExecResult::Exit(exit_status_byte(code));
             }
             "read" => {
                 let mut array_name: Option<&str> = None;
@@ -14570,6 +14570,16 @@ fn clear_cloexec(fd: i32) {
 /// 2)" and a directory said "Permission denied" with the wrong status.
 /// One shell, one answer, whichever way the command happened to be
 /// started.
+/// What a status *is*: the low byte of what was asked for.
+///
+/// `exit` and `return` take an int and the kernel keeps eight bits of
+/// it, so `exit -1` is 255 and `exit 300` is 44. bish handed the number
+/// back whole, which made `$?` a value no real wait status can hold --
+/// and `(exit 256); echo $?` said 256 where every other shell says 0.
+fn exit_status_byte(code: i32) -> i32 {
+    code & 0xff
+}
+
 fn spawn_failure(name: &str, e: &std::io::Error) -> (String, i32) {
     // A name that is nearly a builtin is worth saying so about. Only
     // for NotFound: an EACCES on a real file is a different problem and

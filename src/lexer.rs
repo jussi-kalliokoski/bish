@@ -1418,9 +1418,15 @@ impl<'a> Lexer<'a> {
                             None => return Err("unterminated double quote".to_string()),
                             Some('"') => break,
                             Some('\\') => match self.chars.peek().copied() {
-                                Some(n) if n == '"' || n == '\\' || n == '$' => {
+                                Some(n) if n == '"' || n == '\\' || n == '$' || n == '`' => {
                                     self.advance();
                                     lit.push(n);
+                                }
+                                // A continuation inside the quotes,
+                                // exactly as outside them: `"a\<newline>b"`
+                                // is `"ab"`.
+                                Some('\n') => {
+                                    self.advance();
                                 }
                                 _ => lit.push('\\'),
                             },
@@ -1486,7 +1492,16 @@ impl<'a> Lexer<'a> {
                     // covers both source chars, not just the escaped one.
                     let start = self.pos;
                     self.advance();
-                    if let Some(n) = self.advance() {
+                    // A backslash before a newline is a line
+                    // continuation: both characters go and the word
+                    // carries straight on. `echo a\<newline>b` is
+                    // `echo ab`, and this produced `a`, a real newline,
+                    // and `b` instead -- so a wrapped command line came
+                    // out as two of them, and `then \<newline>echo t`
+                    // looked for a command called "<newline>echo".
+                    if self.chars.peek().copied() == Some('\n') {
+                        self.advance();
+                    } else if let Some(n) = self.advance() {
                         if !buf.is_empty() {
                             chunks.push(Chunk::Str(std::mem::take(&mut buf)));
                         }

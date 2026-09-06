@@ -258,6 +258,20 @@ mod tests {
         case("a-missing-command-does-not-end-the-pipeline", r#"nosuchcmd | head -1; echo "ps=(${PIPESTATUS[@]}) q=$?""#),
         case("a-missing-command-later-in-a-pipeline", r#"echo x | nosuchcmd; echo "q=$? it=${PIPESTATUS[1]}""#),
         case("a-directory-as-a-pipeline-stage", r#"/etc | cat; echo "q=${PIPESTATUS[0]}""#),
+        // A backslash before a newline is a line continuation: both
+        // characters go. bish turned it into a literal newline, so a
+        // wrapped command came out as two of them and `then
+        // \<newline>echo t` looked for a command called "<newline>echo".
+        case("a-backslash-newline-is-removed", "echo a\\\nb"),
+        case("a-backslash-newline-inside-double-quotes", "echo \"a\\\nb\""),
+        case("a-backslash-newline-in-an-assignment", "x=a\\\nb; echo \"[$x]\""),
+        case("a-backslash-newline-between-words", "echo one \\\ntwo"),
+        case("a-backslash-newline-before-a-command", "if true; then \\\necho t; fi"),
+        case("a-backslash-newline-is-literal-in-single-quotes", "echo 'a\\\nb'"),
+        // A status is the low byte of what was asked for: `exit -1` is
+        // 255 and `exit 300` is 44. bish handed the number back whole.
+        case("exit-status-is-one-byte", r#"(exit -1); echo $?; (exit 300); echo $?; (exit 256); echo $?"#),
+        case("return-status-is-one-byte", r#"f(){ return -1; }; f; echo $?; g(){ return 300; }; g; echo $?"#),
         // A prefix assignment belongs to the command it prefixes --
         // all three kinds of command. It was expanded wherever each
         // consumer wanted it, which meant twice for an external, never
@@ -1249,6 +1263,13 @@ y
         // and `set -o allexport` would then silently not take. The same
         // principle keeps `compgen -A setopt` short. Recorded because
         // it is still a difference a script can see.
+        // bish's extended globbing is not optional -- `@(a|b)` and its
+        // relatives always work -- so `shopt` reports `extglob` on and
+        // `shopt -u extglob` cannot turn it off. bash defaults it off.
+        // Answering "off" would be untrue of this shell, and honouring
+        // the `-u` would mean building a second, weaker matcher to
+        // switch to.
+        ("extglob-cannot-be-turned-off", "`shopt extglob` says on where bash says off, because here it is always on"),
         ("set-o-lists-fewer-options", "`set -o` lists 10 options; bash lists 27, most of which bish does not implement"),
         // The builtin *set* differs, legitimately: bish has builtins
         // bash does not (`abbr`, `win`, `::bish`) and lacks `bind` and
@@ -1263,6 +1284,7 @@ y
         case("set-o-lists-fewer-options", r#"set -o | wc -l"#),
         case("bash-command-read-outside-a-trap", r#"true; echo "[$BASH_COMMAND]""#),
         case("bashpid-is-the-shells-own-in-a-subshell", r#"echo $(( $$ == BASHPID )); ( echo $(( $$ == BASHPID )) )"#),
+        case("extglob-cannot-be-turned-off", r#"shopt extglob; shopt -u extglob; shopt -q extglob; echo "q=$?""#),
         case("debug-trap-misses-an-external-pipeline-stage", r#"trap "echo D" DEBUG; echo a | cat"#),
         case("compgen-b-lists-this-shells-builtins", r#"compgen -b | sort | head -3 | tr '\n' ' '; echo"#),
         // -- roadmap 10: parser leniency, the part still standing -----
