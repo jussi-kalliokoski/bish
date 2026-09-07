@@ -24,7 +24,7 @@
 // for hundreds of gigabytes of memory -- and the paths that get here
 // are not all interactive: manpages.rs gunzips whatever `man -w` points
 // at, on a background thread, while you type at the prompt. Same
-// precedent as lsp.rs's MAX_CONTENT_LENGTH: refuse rather than trust
+// precedent as framing.rs's MAX_CONTENT_LENGTH: refuse rather than trust
 // the size a stranger's file asks for.
 //
 // 64 MiB, the same number lsp.rs already picked for the same kind of

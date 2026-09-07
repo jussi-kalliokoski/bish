@@ -413,7 +413,7 @@ fn decode_short_string(buf: &[u8], pos: &mut usize) -> Option<String> {
 //
 // 16 MiB is far past any real frame (a full repaint of a large terminal
 // is tens of kilobytes) and far below anything that matters. Same
-// reasoning as lsp.rs's MAX_CONTENT_LENGTH, which this protocol should
+// reasoning as framing.rs's MAX_CONTENT_LENGTH, which this protocol should
 // have had from the start.
 pub const MAX_FRAME: usize = 16 * 1024 * 1024;
 

@@ -27,13 +27,8 @@
 
 use crate::json::{self, Value};
 
-// A body larger than this is refused outright rather than allocated.
-// Nothing legitimate comes close -- the biggest message in practice is a
-// `didChange` carrying a whole file, or a completion list a few hundred
-// KB wide -- and `Content-Length` arrives as text from a process that
-// may be malfunctioning, so the one number that drives an allocation
-// gets a ceiling.
-pub const MAX_CONTENT_LENGTH: usize = 64 * 1024 * 1024;
+// The framing, and the size cap that goes with it, are shared with the
+// Debug Adapter Protocol -- see framing.rs, which is where both live.
 
 // ---------------------------------------------------------------------
 // Framing
@@ -170,10 +165,7 @@ impl Message {
 /// this whole function exists to get right, since every string that
 /// reaches here has been through a `char`-based codebase.
 pub fn encode(message: &Message) -> Vec<u8> {
-    let body = json::compact_print(&message.to_value());
-    let mut out = format!("Content-Length: {}\r\n\r\n", body.len()).into_bytes();
-    out.extend_from_slice(body.as_bytes());
-    out
+    crate::framing::encode(&json::compact_print(&message.to_value()))
 }
 
 /// The receiving half: bytes in (in whatever sizes a non-blocking read
@@ -183,111 +175,46 @@ pub fn encode(message: &Message) -> Vec<u8> {
 /// there is no blocking read to hide behind -- a message can and does
 /// arrive split across reads, and half a header has to be kept until the
 /// rest of it shows up.
-#[derive(Default)]
 pub struct Decoder {
-    buf: Vec<u8>,
-    // Once the byte stream stops making sense there is no way to find
-    // the next message boundary -- the framing is the only thing that
-    // told us where one was. So a framing error is terminal for this
-    // decoder: it is reported once, and after that nothing more is
-    // decoded, rather than emitting a cascade of nonsense from a stream
-    // we have lost our place in.
-    failed: bool,
+    frames: crate::framing::Frames,
+}
+
+impl Default for Decoder {
+    fn default() -> Decoder {
+        Decoder::new()
+    }
 }
 
 impl Decoder {
     pub fn new() -> Decoder {
-        Decoder::default()
+        Decoder { frames: crate::framing::Frames::new("LSP") }
     }
 
     pub fn feed(&mut self, bytes: &[u8]) {
-        if !self.failed {
-            self.buf.extend_from_slice(bytes);
-        }
+        self.frames.feed(bytes);
     }
 
     /// The next complete message, if the bytes fed so far contain one.
     /// `None` means "not yet" -- call again after feeding more.
     pub fn take_message(&mut self) -> Option<Result<Message, String>> {
-        match self.take_body() {
-            None => None,
-            Some(Err(e)) => Some(Err(e)),
-            Some(Ok(body)) => Some(match json::parse(&body) {
-                // A body that isn't JSON is *not* a framing error: the
-                // frame itself was well-formed, so the stream is still
-                // synchronized and the next message is still findable.
-                // Report it and carry on.
+        match self.frames.take_body()? {
+            Err(e) => Some(Err(e)),
+            // A body that isn't JSON is *not* a framing error: the
+            // frame itself was well-formed, so the stream is still
+            // synchronized and the next message is still findable.
+            // Report it and carry on.
+            Ok(body) => Some(match json::parse(&body) {
                 Err(e) => Err(format!("malformed JSON body: {e}")),
                 Ok(value) => Message::from_value(&value),
             }),
         }
     }
 
-    fn take_body(&mut self) -> Option<Result<String, String>> {
-        if self.failed {
-            return None;
-        }
-        let header_end = find(&self.buf, b"\r\n\r\n")?;
-        let header = match std::str::from_utf8(&self.buf[..header_end]) {
-            Ok(h) => h,
-            Err(_) => return Some(Err(self.fail("header is not valid UTF-8"))),
-        };
-        let mut length: Option<usize> = None;
-        for line in header.split("\r\n") {
-            let Some((name, value)) = line.split_once(':') else {
-                return Some(Err(self.fail(&format!("header line without a colon: {line:?}"))));
-            };
-            // Header names are case-insensitive; every server in
-            // practice writes `Content-Length`, but the spec doesn't
-            // promise it and matching loosely costs nothing.
-            if name.trim().eq_ignore_ascii_case("content-length") {
-                match value.trim().parse::<usize>() {
-                    Ok(n) if n <= MAX_CONTENT_LENGTH => length = Some(n),
-                    Ok(n) => return Some(Err(self.fail(&format!("Content-Length {n} exceeds the {MAX_CONTENT_LENGTH}-byte limit")))),
-                    Err(_) => return Some(Err(self.fail(&format!("unparseable Content-Length: {:?}", value.trim())))),
-                }
-            }
-            // Every other header (`Content-Type`, and anything a server
-            // invents) is ignored rather than rejected.
-        }
-        let Some(length) = length else {
-            return Some(Err(self.fail("headers with no Content-Length")));
-        };
-        let body_start = header_end + 4;
-        if self.buf.len() < body_start + length {
-            // The header is complete but the body isn't. Leave
-            // everything in place and re-parse the header next time --
-            // it is a handful of bytes, and keeping no partial state
-            // between calls is what makes this correct regardless of how
-            // the reads happened to land.
-            return None;
-        }
-        let body = self.buf[body_start..body_start + length].to_vec();
-        self.buf.drain(..body_start + length);
-        Some(match String::from_utf8(body) {
-            Ok(s) => Ok(s),
-            // The frame was well-formed, so this is recoverable in the
-            // same way a malformed JSON body is -- we know exactly where
-            // the next message starts.
-            Err(_) => Err("message body is not valid UTF-8".to_string()),
-        })
-    }
-
-    fn fail(&mut self, why: &str) -> String {
-        self.failed = true;
-        self.buf.clear();
-        format!("LSP framing error, stream abandoned: {why}")
-    }
-
     /// Whether a framing error has put this decoder out of action. The
     /// owner of the server treats this as "the connection is dead."
     pub fn is_failed(&self) -> bool {
-        self.failed
+        self.frames.is_failed()
     }
-}
-
-fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack.windows(needle.len()).position(|w| w == needle)
 }
 
 // ---------------------------------------------------------------------
@@ -1621,7 +1548,7 @@ mod tests {
     fn content_length_counts_bytes_not_characters() {
         let message = Message::Notification { method: "window/logMessage".to_string(), params: Value::Str("héllo 🌍".to_string()) };
         let bytes = encode(&message);
-        let header_end = find(&bytes, b"\r\n\r\n").unwrap();
+        let header_end = bytes.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
         let header = std::str::from_utf8(&bytes[..header_end]).unwrap();
         let declared: usize = header.strip_prefix("Content-Length: ").unwrap().parse().unwrap();
         let body = &bytes[header_end + 4..];
@@ -1725,7 +1652,7 @@ mod tests {
     #[test]
     fn an_oversized_content_length_is_refused_rather_than_allocated() {
         let mut decoder = Decoder::new();
-        decoder.feed(format!("Content-Length: {}\r\n\r\n", MAX_CONTENT_LENGTH + 1).as_bytes());
+        decoder.feed(format!("Content-Length: {}\r\n\r\n", crate::framing::MAX_CONTENT_LENGTH + 1).as_bytes());
         let error = decoder.take_message().unwrap().unwrap_err();
         assert!(error.contains("exceeds"), "{error}");
         assert!(decoder.is_failed());

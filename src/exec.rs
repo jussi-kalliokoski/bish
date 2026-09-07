@@ -16341,6 +16341,11 @@ mod spawn_guard {
             "runs `git` to answer questions the prompt and the editor ask about the repository -- bish's own tooling, inheriting bish's own environment as any of its subprocesses does",
         ),
         ("src/lspclient.rs", 1, "starts a language server for the editor, which is bish's, not the script's"),
+        (
+            "src/dapclient.rs",
+            1,
+            "starts a debug adapter for the editor -- the same kind of subprocess as a language server, and bish's rather than the script's",
+        ),
         ("src/bishedit/registers.rs", 2, "hands the system clipboard to and from the editor"),
         (
             "src/session.rs",
